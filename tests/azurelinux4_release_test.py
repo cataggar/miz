@@ -784,7 +784,11 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         guide = (ROOT / "doc/qemu.md").read_text()
         section = guide.split("## Booting the release image with QEMU", 1)[1]
         self.assertIn("full image's systemd startup and login prompt", section)
-        self.assertIn("only when an explicit `*.core.qcow2` image", section)
+        self.assertIn(
+            "only when a core image is selected with `--model core` or\n"
+            "an explicit `*.core.qcow2` path",
+            section,
+        )
         self.assertNotIn(
             "default secure command line, a successful local boot reaches\n"
             "the PID 1 readiness marker",
