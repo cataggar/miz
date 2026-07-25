@@ -1,4 +1,5 @@
-//! `zvmi qemu [<image>] [--architecture auto|x86_64|aarch64]
+//! `zvmi qemu [<image>] [--model full|core]
+//!             [--architecture auto|x86_64|aarch64]
 //!             [--admin-username <name>] [--ssh-public-key <path>]
 //!             [--ssh-port <port>] [--snapshot] [--accel auto|whpx|kvm|hvf|tcg]
 //!             [--qemu <path>] [--ovmf-code <path>] [--ovmf-vars <path>]
@@ -20,6 +21,17 @@ const ProvisioningMedia = enum {
     virtio_block,
 };
 
+const ImageModel = enum {
+    full,
+    core,
+
+    fn parse(value: []const u8) ?ImageModel {
+        if (std.mem.eql(u8, value, "full")) return .full;
+        if (std.mem.eql(u8, value, "core")) return .core;
+        return null;
+    }
+};
+
 const KnownImage = struct {
     alias: []const u8,
     disk_name: []const u8,
@@ -28,6 +40,8 @@ const KnownImage = struct {
     image_sha256: []const u8,
     certificate_sha256: ?[]const u8,
     provisioning_media: ProvisioningMedia = .cdrom,
+    model: ImageModel = .full,
+    supports_model: bool = false,
 };
 
 const release_certificate_sha256 =
@@ -41,6 +55,8 @@ const known_images = [_]KnownImage{
         .architecture = .x86_64,
         .image_sha256 = "e7b79748bc994f55c20b48d07323d4fb2695703380c7a8abc068d39f46711ce3",
         .certificate_sha256 = release_certificate_sha256,
+        .model = .full,
+        .supports_model = true,
     },
     .{
         .alias = "AzureLinux-4.0-aarch64",
@@ -49,22 +65,28 @@ const known_images = [_]KnownImage{
         .architecture = .aarch64,
         .image_sha256 = "590c6eddbbbc952ff21c8d9a026ae16e10f22ad71e940dc87c10e5e8016ef544",
         .certificate_sha256 = release_certificate_sha256,
+        .model = .full,
+        .supports_model = true,
     },
     .{
-        .alias = "",
+        .alias = "AzureLinux-4.0-x86_64",
         .disk_name = "AzureLinux-4.0-x86_64.core.qcow2",
         .release_spec = "cataggar/zvmi/AzureLinux-4.0-x86_64.core.qcow2@AzureLinux-4.0-20260723",
         .architecture = .x86_64,
         .image_sha256 = "44992c857178e95b3a3d2c2c1c2008791d3e5a704f845f4500cc6e86a0baadc6",
         .certificate_sha256 = release_certificate_sha256,
+        .model = .core,
+        .supports_model = true,
     },
     .{
-        .alias = "",
+        .alias = "AzureLinux-4.0-aarch64",
         .disk_name = "AzureLinux-4.0-aarch64.core.qcow2",
         .release_spec = "cataggar/zvmi/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260723",
         .architecture = .aarch64,
         .image_sha256 = "ff294c8655ea80f890a41a7c6dc545d997da498dc5f5f03fd3aee8dea81b0f65",
         .certificate_sha256 = release_certificate_sha256,
+        .model = .core,
+        .supports_model = true,
     },
     .{
         .alias = "FreeBSD-15.1-x86_64",
@@ -94,7 +116,8 @@ const max_secure_boot_certificate_bytes: usize = 1024 * 1024;
 const local_provisioning_marker = "zvmi-local-provisioning";
 
 const help_text =
-    \\usage: zvmi qemu [<image>] [--architecture auto|x86_64|aarch64]
+    \\usage: zvmi qemu [<image>] [--model full|core]
+    \\                  [--architecture auto|x86_64|aarch64]
     \\                  [--admin-username <name>] [--ssh-public-key <path>]
     \\                  [--ssh-port <port>] [--snapshot] [--accel auto|whpx|kvm|hvf|tcg]
     \\                  [--qemu <path>] [--ovmf-code <path>] [--ovmf-vars <path>]
@@ -118,7 +141,8 @@ const help_text =
     \\
     \\Options:
     \\  --snapshot          Discard guest disk and UEFI variable changes on exit.
-    \\  --architecture <a>  Guest architecture: auto, x86_64 (default), or aarch64.
+    \\  --model <m>         AzureLinux alias model: full (default) or core.
+    \\  --architecture <a>  Guest architecture: auto, x86_64, or aarch64.
     \\  --arch <a>          Alias for --architecture.
     \\  --admin-username <n> Provision this administrator account (requires a key).
     \\  --ssh-public-key <p> Read this public key for administrator provisioning.
@@ -174,6 +198,8 @@ const ArchitectureRequest = enum {
 const Options = struct {
     image_path: []const u8 = default_image_name,
     image_was_explicit: bool = false,
+    image_model: ImageModel = .full,
+    model_was_explicit: bool = false,
     architecture_request: ArchitectureRequest = .x86_64,
     architecture_was_explicit: bool = false,
     snapshot: bool = false,
@@ -199,6 +225,7 @@ const ParseFailure = struct {
     const Kind = enum {
         missing_value,
         invalid_accel,
+        invalid_model,
         invalid_architecture,
         invalid_username,
         invalid_ssh_port,
@@ -461,7 +488,17 @@ fn runVm(
     }
 
     var image = resolveImageAlloc(gpa, options) catch |err| {
-        std.debug.print("qemu: failed to resolve image: {s}\n", .{@errorName(err)});
+        switch (err) {
+            error.ImageModelMismatch => std.debug.print(
+                "qemu: --model {s} conflicts with explicit image '{s}'\n",
+                .{ @tagName(options.image_model), options.image_path },
+            ),
+            error.ImageModelRequiresAlias => std.debug.print(
+                "qemu: --model only applies to AzureLinux aliases, not explicit image '{s}'\n",
+                .{options.image_path},
+            ),
+            else => std.debug.print("qemu: failed to resolve image: {s}\n", .{@errorName(err)}),
+        }
         return 1;
     };
     defer image.deinit(gpa);
@@ -766,6 +803,12 @@ fn parseArgs(args: []const []const u8) ParseResult {
             options.secure_boot_certificate_sha256 =
                 zvmi.artifact_pipeline.parseSha256(args[i]) catch
                     return parseFailure(.invalid_secure_boot_sha256, args[i]);
+        } else if (std.mem.eql(u8, arg, "--model")) {
+            i += 1;
+            if (i >= args.len) return parseFailure(.missing_value, arg);
+            options.image_model = ImageModel.parse(args[i]) orelse
+                return parseFailure(.invalid_model, args[i]);
+            options.model_was_explicit = true;
         } else if (std.mem.eql(u8, arg, "--architecture") or
             std.mem.eql(u8, arg, "--arch"))
         {
@@ -875,6 +918,10 @@ fn printParseFailure(failure: ParseFailure) void {
             "qemu: invalid accelerator '{s}' (expected auto, whpx, kvm, hvf, or tcg)\n",
             .{failure.arg},
         ),
+        .invalid_model => std.debug.print(
+            "qemu: invalid image model '{s}' (expected full or core)\n",
+            .{failure.arg},
+        ),
         .invalid_architecture => std.debug.print(
             "qemu: invalid architecture '{s}' (expected auto, x86_64, or aarch64)\n",
             .{failure.arg},
@@ -925,26 +972,39 @@ fn resolveImageAlloc(
     options: Options,
 ) !ResolvedImage {
     if (!options.image_was_explicit)
-        return resolvedKnownImageAlloc(allocator, known_images[0], null, true);
+        return resolvedKnownImageAlloc(
+            allocator,
+            knownImageForArchitectureAndModel(.x86_64, options.image_model),
+            null,
+            true,
+        );
 
     const argument = options.image_path;
     const basename = std.fs.path.basename(argument);
     if (std.mem.eql(u8, basename, "AzureLinux"))
         return resolvedKnownImageAlloc(
             allocator,
-            known_images[0],
+            knownImageForArchitectureAndModel(
+                catalogArchitecture(options),
+                options.image_model,
+            ),
             std.fs.path.dirname(argument),
             true,
         );
-    if (std.mem.eql(u8, basename, "FreeBSD"))
+    if (std.mem.eql(u8, basename, "FreeBSD")) {
+        if (options.model_was_explicit) return error.ImageModelRequiresAlias;
         return resolvedKnownImageAlloc(
             allocator,
-            freebsdImage(options.architecture_request),
+            freebsdImage(catalogArchitecture(options)),
             std.fs.path.dirname(argument),
             true,
         );
+    }
     for (known_images) |known| {
-        if (known.alias.len != 0 and std.mem.eql(u8, basename, known.alias))
+        if (!std.mem.eql(u8, basename, known.alias)) continue;
+        if (options.model_was_explicit and !known.supports_model)
+            return error.ImageModelRequiresAlias;
+        if (!known.supports_model or known.model == options.image_model)
             return resolvedKnownImageAlloc(
                 allocator,
                 known,
@@ -954,7 +1014,11 @@ fn resolveImageAlloc(
     }
 
     for (known_images) |known| {
-        if (std.mem.eql(u8, basename, known.disk_name))
+        if (std.mem.eql(u8, basename, known.disk_name)) {
+            if (options.model_was_explicit) {
+                if (!known.supports_model) return error.ImageModelRequiresAlias;
+                if (options.image_model != known.model) return error.ImageModelMismatch;
+            }
             return resolvedDiskImageAlloc(
                 allocator,
                 argument,
@@ -968,7 +1032,10 @@ fn resolveImageAlloc(
                 known.provisioning_media,
                 false,
             );
+        }
     }
+
+    if (options.model_was_explicit) return error.ImageModelRequiresAlias;
 
     return resolvedDiskImageAlloc(
         allocator,
@@ -980,6 +1047,55 @@ fn resolveImageAlloc(
         .cdrom,
         false,
     );
+}
+
+fn knownImageForArchitectureAndModel(
+    architecture: GuestArchitecture,
+    model: ImageModel,
+) KnownImage {
+    for (known_images) |known| {
+        if (known.supports_model and
+            known.architecture == architecture and
+            known.model == model)
+        {
+            return known;
+        }
+    }
+    unreachable;
+}
+
+fn knownImageForHostArchitecture(
+    host_arch: std.Target.Cpu.Arch,
+    model: ImageModel,
+) KnownImage {
+    const architecture: GuestArchitecture = switch (host_arch) {
+        .aarch64 => .aarch64,
+        else => .x86_64,
+    };
+    return knownImageForArchitectureAndModel(architecture, model);
+}
+
+fn hostArchitecture(host_arch: std.Target.Cpu.Arch) GuestArchitecture {
+    return switch (host_arch) {
+        .aarch64 => .aarch64,
+        else => .x86_64,
+    };
+}
+
+fn catalogArchitecture(options: Options) GuestArchitecture {
+    if (!options.architecture_was_explicit) return hostArchitecture(builtin.cpu.arch);
+    return switch (options.architecture_request) {
+        .x86_64 => .x86_64,
+        .aarch64 => .aarch64,
+        .auto => hostArchitecture(builtin.cpu.arch),
+    };
+}
+
+fn freebsdImage(architecture: GuestArchitecture) KnownImage {
+    for (known_images) |known| {
+        if (!known.supports_model and known.architecture == architecture) return known;
+    }
+    unreachable;
 }
 
 fn validateImageSelection(options: Options, image_exists: bool) !void {
@@ -1032,22 +1148,6 @@ fn resolvedKnownImageAlloc(
         known.provisioning_media,
         download_allowed,
     );
-}
-
-fn freebsdImage(request: ArchitectureRequest) KnownImage {
-    const architecture: GuestArchitecture = switch (request) {
-        .x86_64 => .x86_64,
-        .aarch64 => .aarch64,
-        .auto => if (builtin.cpu.arch == .aarch64) .aarch64 else .x86_64,
-    };
-    for (known_images) |known| {
-        if (known.architecture == architecture and
-            std.mem.startsWith(u8, known.alias, "FreeBSD-"))
-        {
-            return known;
-        }
-    }
-    unreachable;
 }
 
 fn resolvedDiskImageAlloc(
@@ -3071,6 +3171,8 @@ test "qemu parser defaults to the release image" {
     const parsed = parseArgs(&.{});
     try std.testing.expectEqualStrings(default_image_name, parsed.options.image_path);
     try std.testing.expect(!parsed.options.image_was_explicit);
+    try std.testing.expectEqual(ImageModel.full, parsed.options.image_model);
+    try std.testing.expect(!parsed.options.model_was_explicit);
 }
 
 test "qemu temporary directory fallback has exact allocation ownership" {
@@ -3139,6 +3241,8 @@ test "qemu executable preflight reports process success and failure" {
 test "qemu parser accepts every option and passthrough arguments" {
     const parsed = parseArgs(&.{
         "custom.qcow2",
+        "--model",
+        "core",
         "--snapshot",
         "--accel",
         "tcg",
@@ -3156,6 +3260,8 @@ test "qemu parser accepts every option and passthrough arguments" {
 
     try std.testing.expectEqualStrings("custom.qcow2", options.image_path);
     try std.testing.expect(options.image_was_explicit);
+    try std.testing.expectEqual(ImageModel.core, options.image_model);
+    try std.testing.expect(options.model_was_explicit);
     try std.testing.expect(options.snapshot);
     try std.testing.expectEqual(Accel.tcg, options.accel);
     try std.testing.expectEqualStrings("qemu-custom", options.qemu_path.?);
@@ -3272,6 +3378,7 @@ test "qemu parser recognizes help" {
 
 test "qemu parser reports missing values" {
     const flags = [_][]const u8{
+        "--model",
         "--accel",
         "--qemu",
         "--ovmf-code",
@@ -3284,6 +3391,12 @@ test "qemu parser reports missing values" {
         try std.testing.expectEqual(ParseFailure.Kind.missing_value, parsed.failure.kind);
         try std.testing.expectEqualStrings(flag, parsed.failure.arg);
     }
+}
+
+test "qemu parser rejects invalid image models" {
+    const parsed = parseArgs(&.{ "--model", "minimal" });
+    try std.testing.expectEqual(ParseFailure.Kind.invalid_model, parsed.failure.kind);
+    try std.testing.expectEqualStrings("minimal", parsed.failure.arg);
 }
 
 test "qemu parser rejects invalid accelerators" {
@@ -3309,22 +3422,54 @@ test "qemu resolves known aliases and explicit image paths" {
     try std.testing.expectEqualStrings(default_image_name, implicit.disk_path);
     try std.testing.expect(implicit.download_allowed);
 
+    var implicit_core = try resolveImageAlloc(allocator, .{
+        .image_model = .core,
+        .model_was_explicit = true,
+    });
+    defer implicit_core.deinit(allocator);
+    try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.core.qcow2", implicit_core.disk_path);
+    try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.core.code.fd", implicit_core.code_path);
+    try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.core.vars.fd", implicit_core.vars_path);
+    try std.testing.expect(implicit_core.download_allowed);
+
     var short_alias = try resolveImageAlloc(allocator, .{
         .image_path = "AzureLinux",
         .image_was_explicit = true,
     });
     defer short_alias.deinit(allocator);
-    try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.qcow2", short_alias.disk_path);
-    try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.code.fd", short_alias.code_path);
-    try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.vars.fd", short_alias.vars_path);
-    try std.testing.expectEqualStrings(
-        "AzureLinux-4.0-x86_64.secboot.vars.fd",
-        short_alias.secure_vars_path,
-    );
-    try std.testing.expectEqual(GuestArchitecture.x86_64, short_alias.architecture);
+    const host_image = knownImageForHostArchitecture(builtin.cpu.arch, .full);
+    try std.testing.expectEqualStrings(host_image.disk_name, short_alias.disk_path);
+    if (host_image.architecture == .aarch64) {
+        try std.testing.expectEqualStrings("AzureLinux-4.0-aarch64.code.fd", short_alias.code_path);
+        try std.testing.expectEqualStrings("AzureLinux-4.0-aarch64.vars.fd", short_alias.vars_path);
+        try std.testing.expectEqualStrings(
+            "AzureLinux-4.0-aarch64.secboot.vars.fd",
+            short_alias.secure_vars_path,
+        );
+    } else {
+        try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.code.fd", short_alias.code_path);
+        try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.vars.fd", short_alias.vars_path);
+        try std.testing.expectEqualStrings(
+            "AzureLinux-4.0-x86_64.secboot.vars.fd",
+            short_alias.secure_vars_path,
+        );
+    }
+    try std.testing.expectEqual(host_image.architecture, short_alias.architecture);
     try std.testing.expect(short_alias.expected_image_sha256 != null);
     try std.testing.expect(short_alias.expected_certificate_sha256 != null);
     try std.testing.expect(short_alias.download_allowed);
+
+    var short_core = try resolveImageAlloc(allocator, .{
+        .image_path = "AzureLinux",
+        .image_was_explicit = true,
+        .image_model = .core,
+        .model_was_explicit = true,
+    });
+    defer short_core.deinit(allocator);
+    const host_core = knownImageForHostArchitecture(builtin.cpu.arch, .core);
+    try std.testing.expectEqualStrings(host_core.disk_name, short_core.disk_path);
+    try std.testing.expectEqual(host_core.architecture, short_core.architecture);
+    try std.testing.expect(short_core.download_allowed);
 
     var freebsd_x86 = try resolveImageAlloc(allocator, .{
         .image_path = "FreeBSD",
@@ -3369,6 +3514,19 @@ test "qemu resolves known aliases and explicit image paths" {
     try std.testing.expectEqual(GuestArchitecture.aarch64, prefixed.architecture);
     try std.testing.expect(prefixed.download_allowed);
 
+    var prefixed_core = try resolveImageAlloc(allocator, .{
+        .image_path = "images/AzureLinux-4.0-aarch64",
+        .image_was_explicit = true,
+        .image_model = .core,
+        .model_was_explicit = true,
+    });
+    defer prefixed_core.deinit(allocator);
+    try std.testing.expectEqualStrings("images/AzureLinux-4.0-aarch64.core.qcow2", prefixed_core.disk_path);
+    try std.testing.expectEqualStrings("images/AzureLinux-4.0-aarch64.core.code.fd", prefixed_core.code_path);
+    try std.testing.expectEqualStrings("images/AzureLinux-4.0-aarch64.core.vars.fd", prefixed_core.vars_path);
+    try std.testing.expectEqual(GuestArchitecture.aarch64, prefixed_core.architecture);
+    try std.testing.expect(prefixed_core.download_allowed);
+
     var explicit_known = try resolveImageAlloc(allocator, .{
         .image_path = "./AzureLinux-4.0-aarch64.qcow2",
         .image_was_explicit = true,
@@ -3376,6 +3534,14 @@ test "qemu resolves known aliases and explicit image paths" {
     defer explicit_known.deinit(allocator);
     try std.testing.expectEqual(GuestArchitecture.aarch64, explicit_known.architecture);
     try std.testing.expect(!explicit_known.download_allowed);
+
+    var explicit_core = try resolveImageAlloc(allocator, .{
+        .image_path = "./AzureLinux-4.0-aarch64.core.qcow2",
+        .image_was_explicit = true,
+    });
+    defer explicit_core.deinit(allocator);
+    try std.testing.expectEqual(GuestArchitecture.aarch64, explicit_core.architecture);
+    try std.testing.expect(!explicit_core.download_allowed);
 
     var custom = try resolveImageAlloc(allocator, .{
         .image_path = "custom.vhdx",
@@ -3426,6 +3592,110 @@ test "qemu FreeBSD alias selects x86 and TCG on an ARM host" {
         .os_tag = .macos,
         .cpu_arch = .aarch64,
     }, image.architecture));
+}
+
+test "qemu rejects model selection for conflicting or custom explicit images" {
+    try std.testing.expectError(error.ImageModelMismatch, resolveImageAlloc(
+        std.testing.allocator,
+        .{
+            .image_path = "AzureLinux-4.0-aarch64.qcow2",
+            .image_was_explicit = true,
+            .image_model = .core,
+            .model_was_explicit = true,
+        },
+    ));
+    try std.testing.expectError(error.ImageModelRequiresAlias, resolveImageAlloc(
+        std.testing.allocator,
+        .{
+            .image_path = "custom.qcow2",
+            .image_was_explicit = true,
+            .image_model = .core,
+            .model_was_explicit = true,
+        },
+    ));
+}
+
+test "qemu short alias selects host-native full and core catalog images" {
+    try std.testing.expectEqualStrings(
+        "AzureLinux-4.0-x86_64.qcow2",
+        knownImageForHostArchitecture(.x86_64, .full).disk_name,
+    );
+    try std.testing.expectEqualStrings(
+        "AzureLinux-4.0-aarch64.qcow2",
+        knownImageForHostArchitecture(.aarch64, .full).disk_name,
+    );
+    try std.testing.expectEqualStrings(
+        "AzureLinux-4.0-x86_64.core.qcow2",
+        knownImageForHostArchitecture(.x86_64, .core).disk_name,
+    );
+    try std.testing.expectEqualStrings(
+        "AzureLinux-4.0-aarch64.core.qcow2",
+        knownImageForHostArchitecture(.aarch64, .core).disk_name,
+    );
+    try std.testing.expectEqual(
+        GuestArchitecture.x86_64,
+        knownImageForHostArchitecture(.x86_64, .full).architecture,
+    );
+    try std.testing.expectEqual(
+        GuestArchitecture.aarch64,
+        knownImageForHostArchitecture(.aarch64, .core).architecture,
+    );
+}
+
+test "qemu resolves FreeBSD aliases to host-native release images" {
+    const allocator = std.testing.allocator;
+
+    var short_alias = try resolveImageAlloc(allocator, .{
+        .image_path = "FreeBSD",
+        .image_was_explicit = true,
+    });
+    defer short_alias.deinit(allocator);
+    const host_image = freebsdImage(hostArchitecture(builtin.cpu.arch));
+    try std.testing.expectEqualStrings(host_image.disk_name, short_alias.disk_path);
+    try std.testing.expectEqual(host_image.architecture, short_alias.architecture);
+    try std.testing.expect(short_alias.expected_image_sha256 != null);
+    try std.testing.expect(short_alias.download_allowed);
+
+    var prefixed = try resolveImageAlloc(allocator, .{
+        .image_path = "images/FreeBSD",
+        .image_was_explicit = true,
+    });
+    defer prefixed.deinit(allocator);
+    const expected_prefixed = try std.fs.path.join(allocator, &.{ "images", host_image.disk_name });
+    defer allocator.free(expected_prefixed);
+    try std.testing.expectEqualStrings(expected_prefixed, prefixed.disk_path);
+    try std.testing.expectEqual(host_image.architecture, prefixed.architecture);
+    try std.testing.expectEqual(ProvisioningMedia.virtio_block, prefixed.provisioning_media);
+    try std.testing.expect(prefixed.download_allowed);
+
+    var exact = try resolveImageAlloc(allocator, .{
+        .image_path = "FreeBSD-15.1-aarch64",
+        .image_was_explicit = true,
+    });
+    defer exact.deinit(allocator);
+    try std.testing.expectEqualStrings("FreeBSD-15.1-aarch64.qcow2", exact.disk_path);
+    try std.testing.expectEqual(GuestArchitecture.aarch64, exact.architecture);
+    try std.testing.expect(exact.download_allowed);
+}
+
+test "qemu rejects model selection for FreeBSD aliases" {
+    try std.testing.expectError(error.ImageModelRequiresAlias, resolveImageAlloc(
+        std.testing.allocator,
+        .{
+            .image_path = "FreeBSD",
+            .image_was_explicit = true,
+            .image_model = .core,
+            .model_was_explicit = true,
+        },
+    ));
+    try std.testing.expectError(error.ImageModelRequiresAlias, resolveImageAlloc(
+        std.testing.allocator,
+        .{
+            .image_path = "FreeBSD-15.1-aarch64",
+            .image_was_explicit = true,
+            .model_was_explicit = true,
+        },
+    ));
 }
 
 test "qemu image selection keeps the implicit x86 default downloadable" {
@@ -4447,6 +4717,14 @@ test "qemu release download specs remain pinned to validated releases" {
         known_images[3].image_sha256,
     );
     try std.testing.expectEqualStrings(
+        "cataggar/zvmi/AzureLinux-4.0-x86_64.core.qcow2@AzureLinux-4.0-20260723",
+        known_images[2].release_spec,
+    );
+    try std.testing.expectEqualStrings(
+        "cataggar/zvmi/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260723",
+        known_images[3].release_spec,
+    );
+    try std.testing.expectEqualStrings(
         "cataggar/zvmi/FreeBSD-15.1-x86_64.qcow2@FreeBSD-15.1-20260724",
         known_images[4].release_spec,
     );
@@ -4482,6 +4760,48 @@ test "qemu known image download argv is exact" {
         "590c6eddbbbc952ff21c8d9a026ae16e10f22ad71e940dc87c10e5e8016ef544",
         "--output",
         "images/AzureLinux-4.0-aarch64.qcow2",
+    }, &argv);
+}
+
+test "qemu core image download argv is exact" {
+    const allocator = std.testing.allocator;
+    var image = try resolveImageAlloc(allocator, .{
+        .image_path = "images/AzureLinux-4.0-aarch64",
+        .image_was_explicit = true,
+        .image_model = .core,
+        .model_was_explicit = true,
+    });
+    defer image.deinit(allocator);
+    const digest_hex = std.fmt.bytesToHex(image.expected_image_sha256.?, .lower);
+    const argv = ghrDownloadArgv(image, &digest_hex);
+    try expectArgv(&.{
+        "ghr",
+        "download",
+        "cataggar/zvmi/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260723",
+        "--sha256",
+        "ff294c8655ea80f890a41a7c6dc545d997da498dc5f5f03fd3aee8dea81b0f65",
+        "--output",
+        "images/AzureLinux-4.0-aarch64.core.qcow2",
+    }, &argv);
+}
+
+test "qemu FreeBSD image download argv is exact" {
+    const allocator = std.testing.allocator;
+    var image = try resolveImageAlloc(allocator, .{
+        .image_path = "images/FreeBSD-15.1-aarch64",
+        .image_was_explicit = true,
+    });
+    defer image.deinit(allocator);
+    const digest_hex = std.fmt.bytesToHex(image.expected_image_sha256.?, .lower);
+    const argv = ghrDownloadArgv(image, &digest_hex);
+    try expectArgv(&.{
+        "ghr",
+        "download",
+        "cataggar/zvmi/FreeBSD-15.1-aarch64.qcow2@FreeBSD-15.1-20260724",
+        "--sha256",
+        "28f2138af20c4ede674f18922b216ad673816882e6270414f2bae5c6feff4b1e",
+        "--output",
+        "images/FreeBSD-15.1-aarch64.qcow2",
     }, &argv);
 }
 

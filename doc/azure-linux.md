@@ -207,13 +207,14 @@ cannot expose SSH until that key has been supplied through the Azure OVF
 profile. Release UKIs are trusted through the exact Artifact Signing leaf enrolled in UEFI `db`; its fingerprint is recorded in `candidate.json`, `publish-manifest.json`, release notes, local Secure Boot acceptance, and Azure acceptance together with every signing operation ID.
 
 `zvmi qemu` defaults to the full x86_64 asset pinned as
-`AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260723`. Select an AArch64 or
-core file explicitly when needed. Add `--secure-boot` to verify the cataloged
-asset and embedded release signer, enroll only that exact leaf into a separate
-Microsoft-keyed variables store, and launch with the architecture-specific
-secure firmware contract. Non-catalog images require
-`--secure-boot-certificate` and
-`--secure-boot-certificate-sha256`.
+`AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260723`. The `AzureLinux`
+alias selects the host-native architecture; add `--model core` to select its
+matching core asset, or `--arch` to override the host architecture. Explicit
+AArch64 and core filenames remain supported. Add `--secure-boot` to verify the
+cataloged asset and embedded release signer, enroll only that exact leaf into
+a separate Microsoft-keyed variables store, and launch with the
+architecture-specific secure firmware contract. Non-catalog images require
+`--secure-boot-certificate` and `--secure-boot-certificate-sha256`.
 
 The manual release workflow builds and externally signs all four candidates on
 GitHub-hosted `ubuntu-24.04` and `ubuntu-24.04-arm` runners. Hosted jobs perform
