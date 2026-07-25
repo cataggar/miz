@@ -36,7 +36,7 @@ const usage =
     \\  cosi <disk-image> -o <output.cosi>
     \\  oci copy|inspect|list-tags
     \\  build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [--skip-iso-rootfs] [--esp-size <size>] [--root-selinux-label <context>] [--boot-mode bls|uki|both] [--stub-source-path <path>] [--verity]
-    \\  qemu [<image>] [--architecture auto|x86_64|aarch64] [--admin-username <name>] [--ssh-public-key <path>] [--ssh-port <port>] [--snapshot] [--secure-boot] [--secure-boot-certificate <path> --secure-boot-certificate-sha256 <hex>] [--accel auto|whpx|kvm|hvf|tcg] [--qemu <path>] [--ovmf-code <path>] [--ovmf-vars <path>] [-- <extra-qemu-args...>]
+    \\  qemu [<image>] [--model full|core] [--architecture auto|x86_64|aarch64] [--admin-username <name>] [--ssh-public-key <path>] [--ssh-port <port>] [--snapshot] [--secure-boot] [--secure-boot-certificate <path> --secure-boot-certificate-sha256 <hex>] [--accel auto|whpx|kvm|hvf|tcg] [--qemu <path>] [--ovmf-code <path>] [--ovmf-vars <path>] [-- <extra-qemu-args...>]
     \\  uki certificate <disk-image> (--output <certificate.pem>|--output=json) [--expected-sha256 <hex>]
     \\  sign
     \\

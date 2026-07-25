@@ -2,6 +2,10 @@
 
 ## Generalized FreeBSD 15.1 QCOW2 images
 
+`zvmi qemu FreeBSD` selects the host-native FreeBSD 15.1 image from release
+`FreeBSD-15.1-20260724`; use `--arch x86_64|aarch64` to override the host
+architecture.
+
 The FreeBSD builder supports AArch64 and x86_64 UFS images. It downloads the
 matching official FreeBSD 15.1-RELEASE BASIC-CLOUDINIT QCOW2, verifies its
 pinned compressed SHA-256, and decompresses it with explicit memory and output

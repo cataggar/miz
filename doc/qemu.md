@@ -17,21 +17,31 @@ Then run the command from the directory where the VM disk should live:
 
 ```text
 zvmi qemu AzureLinux
+zvmi qemu AzureLinux --model core
 zvmi qemu AzureLinux-4.0-x86_64
+zvmi qemu FreeBSD
 zvmi qemu FreeBSD --arch x86_64
 ```
 
-If `AzureLinux-4.0-x86_64.qcow2` is absent, `zvmi` runs the verified ghr
-download for
-`cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260723`.
+The `AzureLinux` short alias selects the host-native catalog image: AArch64
+on AArch64 hosts and x86_64 otherwise. The default model is `full`;
+`--model core` selects the matching `*.core.qcow2` asset. Model selection
+applies to catalog aliases, while an explicit image path remains authoritative.
+If the selected image is absent, `zvmi` runs the verified ghr download for its
+pinned `AzureLinux-4.0-20260723` release asset.
+The `FreeBSD` alias similarly selects the host-native FreeBSD 15.1 image from
+release `FreeBSD-15.1-20260724`; on an AArch64 host it downloads
+`FreeBSD-15.1-aarch64.qcow2`.
 Existing images are never refreshed or overwritten. QEMU and its matching
 EDK2 firmware are resolved from the `cataggar/qemu` ghr installation first,
 then from a system QEMU/UEFI installation. Directory-prefixed aliases such as
+`zvmi qemu images/AzureLinux` or
 `zvmi qemu images/AzureLinux-4.0-x86_64` place the downloaded disk and
 firmware under that directory.
 
 `FreeBSD` selects the pinned FreeBSD 15.1 release asset for the requested
-architecture. For example, an ARM64 host runs the x86_64 image through TCG:
+architecture. It defaults to the host architecture; for example, an ARM64 host
+runs the x86_64 image through TCG when explicitly requested:
 
 ```text
 zvmi qemu FreeBSD --arch x86_64
@@ -74,11 +84,10 @@ Secure Boot mode so they cannot replace the machine or firmware contract.
 
 `--architecture x86_64|aarch64` selects q35/OVMF or virt/AAVMF respectively;
 `--arch` is its shorter alias. `--architecture auto` requires an unambiguous
-architecture-bearing GPT
-root/USR GUID or UKI PE header. `AzureLinux` remains the short alias for the
-x86_64 Azure Linux image. `FreeBSD` selects its architecture-specific catalog
-image from `--arch`, while exact catalog aliases select their corresponding
-architecture.
+architecture-bearing GPT root/USR GUID or UKI PE header. `AzureLinux` and
+`FreeBSD` select host-native catalog images by default; an explicit `--arch`
+selects that architecture instead. Exact catalog aliases select their
+corresponding architecture.
 
 Inside a full image, equivalent manual checks are `mokutil --sb-state`, `mokutil --db`, `mokutil --dbx`, `cat /sys/kernel/security/lockdown`, and `sudo dmesg | grep -Ei 'secure boot|lockdown|module verification'`. Release acceptance parses the EFI variables directly so the core image does not need `mokutil`.
 
@@ -164,10 +173,14 @@ exit. With the default secure command line, a successful local boot reaches
 the full image's systemd startup and login prompt. It does not emit
 `zvminit` readiness markers.
 
-Those markers apply only when an explicit `*.core.qcow2` image is selected.
-A successful unprovisioned core boot reports that automatic Azure detection is
-still pending, the diagnostic root shell is disabled, and the
-`ZVMINIT_PID1_READY supervisor loop active` marker.
+Those markers apply only when a core image is selected with `--model core` or
+an explicit `*.core.qcow2` path. A successful unprovisioned core boot reports
+that automatic Azure detection is still pending, the diagnostic root shell is
+disabled, and the `ZVMINIT_PID1_READY supervisor loop active` marker.
+
+Core images have no default login, username, or password. To log in locally,
+launch with `--admin-username <name> --ssh-public-key <path>` and SSH to that
+username through the forwarded localhost port (default `2222`).
 
 To provision an administrator at launch, supply
 `--admin-username <name> --ssh-public-key <path>` together. `--ssh-port`
@@ -176,6 +189,6 @@ short-lived hybrid `cidata` ISO containing NoCloud metadata/user-data, Azure
 `ovf-env.xml`, and the explicit `zvmi-local-provisioning` marker, then removes
 the seed and temporary launch state when QEMU exits.
 
-This command is intentionally a focused launcher for the cataloged Azure Linux
-Gen2 images plus compatible explicit disks, not a general VM configuration
-manager.
+This command is intentionally a focused launcher for cataloged Azure Linux and
+FreeBSD Gen2 images plus compatible explicit disks, not a general VM
+configuration manager.
