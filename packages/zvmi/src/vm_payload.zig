@@ -38,6 +38,7 @@ pub const Error = error{
     UnsupportedBootLayout,
     GuestDriversUndetermined,
     NoBuiltInDiskDriver,
+    NoBuiltInRootFilesystem,
 };
 
 /// How the guest's disks are attached.
@@ -74,6 +75,11 @@ pub const GuestDrivers = struct {
     network: bool,
 };
 
+/// The filesystem the guest agent mounts the target root with. It is fixed
+/// rather than probed because the agent issues exactly this mount, and a kernel
+/// that modularizes it cannot mount the target at all.
+pub const root_filesystem_module = "ext4";
+
 /// Reads the built-in driver list out of the image and reports what the guest
 /// will be able to see.
 ///
@@ -105,6 +111,13 @@ pub fn probeDrivers(
     const listing = reader.readFileAlloc(io, allocator, path) catch
         return error.GuestDriversUndetermined;
     defer allocator.free(listing);
+
+    // A modular root filesystem driver fails the same way a missing disk
+    // transport does -- the agent reaches its mount and cannot complete it --
+    // so it is settled here, where the answer is still a refusal.
+    if (!builtInContains(listing, root_filesystem_module)) {
+        return error.NoBuiltInRootFilesystem;
+    }
 
     return .{
         .disk = if (builtInContains(listing, "virtio_blk"))
@@ -892,7 +905,8 @@ test "the disk transport is read from the image rather than assumed" {
         io,
         path,
         &.{"6.12.0-1.other"},
-        "kernel/drivers/block/virtio_blk.ko\nkernel/drivers/scsi/virtio_scsi.ko\n",
+        "kernel/fs/ext4/ext4.ko\n" ++
+            "kernel/drivers/block/virtio_blk.ko\nkernel/drivers/scsi/virtio_scsi.ko\n",
     );
     const both = try probeDrivers(allocator, io, .{
         .raw_path = path,
@@ -927,9 +941,30 @@ test "an image whose kernel can drive no disk is refused rather than booted" {
         io,
         path,
         &.{"6.12.0-1.other"},
-        "kernel/drivers/block/virtio_blk_helper.ko\n",
+        "kernel/fs/ext4/ext4.ko\nkernel/drivers/block/virtio_blk_helper.ko\n",
     );
     try std.testing.expectError(error.NoBuiltInDiskDriver, probeDrivers(allocator, io, .{
+        .raw_path = path,
+        .root_partition_offset = 0,
+    }));
+}
+
+test "an image whose kernel cannot mount its own root filesystem is refused" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "test-vm-payload-nofs.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // Distributions that modularize ext4 -- Ubuntu among them -- leave an
+    // `rdinit` guest able to see the disk and unable to mount it.
+    try writeDriverProbeImage(
+        allocator,
+        io,
+        path,
+        &.{"6.12.0-1.other"},
+        "kernel/drivers/block/virtio_blk.ko\nkernel/drivers/net/virtio_net.ko\n",
+    );
+    try std.testing.expectError(error.NoBuiltInRootFilesystem, probeDrivers(allocator, io, .{
         .raw_path = path,
         .root_partition_offset = 0,
     }));
