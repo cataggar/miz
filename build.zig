@@ -397,6 +397,25 @@ pub fn build(b: *std.Build) void {
     );
     vm_backend_integration_step.dependOn(&run_vm_backend_integration.step);
 
+    const vm_real_boot_exe = b.addExecutable(.{
+        .name = "zvmi-vm-real-boot",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/vm_real_boot.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zvmi", .module = host_zvmi_mod },
+            },
+        }),
+        .linkage = .static,
+    });
+    const run_vm_real_boot = b.addRunArtifact(vm_real_boot_exe);
+    const vm_real_boot_step = b.step(
+        "test-vm-real-boot",
+        "Boot a real guest in a real emulator on a supplied kernel",
+    );
+    vm_real_boot_step.dependOn(&run_vm_real_boot.step);
+
     const host_qmp_mod = b.createModule(.{
         .root_source_file = b.path("qmp/src/qmp.zig"),
         .target = b.graph.host,
@@ -602,6 +621,14 @@ pub fn build(b: *std.Build) void {
             b.fmt("zvmi_guest_agent_{s}", .{@tagName(architecture)}),
             .{ .root_source_file = zvmiguest_exe.getEmittedBin() },
         );
+        // The real-boot test only ever boots its own architecture, so it takes
+        // the matching agent under an unqualified name.
+        if (architecture == b.graph.host.result.cpu.arch) {
+            vm_real_boot_exe.root_module.addAnonymousImport(
+                "zvmi_guest_agent",
+                .{ .root_source_file = zvmiguest_exe.getEmittedBin() },
+            );
+        }
     }
 
     const zvmiguest_tests = b.addTest(.{
