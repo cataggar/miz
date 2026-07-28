@@ -141,22 +141,40 @@ boots the image's own kernel directly (`-kernel`/`-initrd` + `rdinit=`) with a
 static agent appended to a copy of the image's initramfs, so no bootloader,
 firmware or init system is involved and a fully emulated boot costs seconds.
 
-The cost is a hard requirement on the image: because the agent is `rdinit`, no
-kernel module is ever inserted, so **`ext4` and a virtio disk driver must be
-built into the image's kernel.** The backend reads
-`lib/modules/<release>/modules.builtin` out of the image and refuses the run
-rather than guessing, since a wrong guess is not a wrong answer but a device
-that never appears.
+The cost is a hard requirement on the image: because the agent is `rdinit`, the
+guest starts with only the drivers its own kernel built in, and there is no
+`modprobe`, `udev` or module tree to reach for at that point. So **`ext4`, a
+virtio disk driver and the virtio PCI bus must either be built into the image's
+kernel or be present in the image's own `lib/modules/<release>` tree.** The
+backend reads `modules.builtin` and `modules.dep` out of the image, resolves the
+dependency closure of what the run needs, decompresses those modules host-side,
+and appends them to the initramfs beside the agent, which inserts them before it
+waits for any device. A driver that is neither built in nor in the tree refuses
+the run rather than being guessed at, since a wrong guess is not a wrong answer
+but a device that never appears.
 
-| Image kernel builds in | Result |
+Two drivers are asked for that no dependency graph names, because `modules.dep`
+records symbol dependencies and neither of these is one: `virtio_pci`, since
+every device the backend attaches is a PCI device, and `sd_mod`, since a
+virtio-scsi controller with no SCSI disk driver behind it presents no `/dev/sda`.
+
+A built-in driver is never traded for a loadable one, so an image whose kernel
+builds everything in boots exactly as it did before, with an empty module list.
+
+| Image kernel provides | Result |
 | --- | --- |
-| `ext4` + `virtio_blk` | disks attached over virtio-blk (`/dev/vd*`) |
-| `ext4` + `virtio_scsi` only (Azure Linux) | disks attached over virtio-scsi (`/dev/sd*`) |
-| `ext4` but neither | refused in preflight |
-| neither (stock Ubuntu) | refused in preflight |
+| `ext4` + `virtio_blk` built in | disks attached over virtio-blk (`/dev/vd*`) |
+| `ext4` + `virtio_scsi` + `sd_mod` built in (Azure Linux) | disks attached over virtio-scsi (`/dev/sd*`) |
+| the same drivers in `lib/modules` (Debian, Ubuntu, Fedora cloud kernels) | loaded from the image's own tree before the mount |
+| neither built in nor in the tree | refused in preflight, named for the missing driver |
 
 `virtio_net` is required only when the plan declares package repositories; an
-offline guest is given no network device at all.
+offline guest is given no network device at all, so a modular `virtio_net` is
+inserted only for a run that has somewhere to go.
+
+Every module that was loaded is recorded in provenance by name, by the path
+inside the image it came from, and by the digest of the object as the guest
+received it.
 
 Acceleration is fail-closed. Hardware acceleration requires host architecture ==
 image architecture and a readable and writable `/dev/kvm`, and is refused rather

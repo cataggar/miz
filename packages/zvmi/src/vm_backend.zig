@@ -51,10 +51,6 @@ pub const Error = error{
     /// of sealing an answer, which is a different outcome from any answer.
     VmGuestSilent,
     VmGuestFailed,
-    /// The plan declares repositories but the image's kernel cannot drive a
-    /// network device without loading a module, which an `rdinit` guest never
-    /// does. Refused rather than left to fail as an unexplained download error.
-    NoBuiltInNetworkDriver,
 };
 
 /// Reports whether this host can run the plan's VM backend.
@@ -239,16 +235,16 @@ pub fn run(
     };
 
     // Read before anything is built: every device name the guest is given,
-    // and the emulator command line that produces them, follow from what the
+    // the modules it has to insert to see those devices at all, and the
+    // emulator command line that produces them all follow from what the
     // image's kernel can actually drive.
-    const drivers = try vm_payload.probeDrivers(work, io, .{
+    var drivers = try vm_payload.probeDrivers(work, io, .{
         .raw_path = options.target.raw_path,
         .root_partition_offset = options.target.partition.offset,
         .kernel_release = requestedKernelRelease(data.initramfs),
+        .network_required = policy.network == .declared_repositories,
     });
-    if (policy.network == .declared_repositories and !drivers.network) {
-        return error.NoBuiltInNetworkDriver;
-    }
+    defer drivers.deinit(work);
 
     var stage_buffer: [16]u8 = undefined;
     var result_buffer: [16]u8 = undefined;
@@ -263,19 +259,27 @@ pub fn run(
     const control = try buildControl(work, io, options.plan, .{
         .root_device = root_device,
         .result_device = result_device,
-    });
+    }, drivers.modules);
     // The host refuses to emit a document it would refuse to read, so a
     // rejection here is a host bug rather than a guest-side surprise.
     try control.validate();
     const control_json = try std.json.Stringify.valueAlloc(work, control, .{});
 
+    // The agent and the control document first, so a module can never take
+    // the name of either, then the modules in the order they are inserted.
+    var members: std.array_list.Managed(vm_payload.Member) = .init(work);
+    try members.appendSlice(&.{
+        .{ .path = vm_control.agent_path, .bytes = options.agent },
+        .{ .path = vm_control.control_path, .bytes = control_json, .mode = 0o100600 },
+    });
+    for (drivers.modules) |module| {
+        try members.append(.{ .path = module.member_path, .bytes = module.bytes });
+    }
+
     var payload = try vm_payload.extract(work, io, .{
         .raw_path = options.target.raw_path,
         .root_partition_offset = options.target.partition.offset,
-        .members = &.{
-            .{ .path = vm_control.agent_path, .bytes = options.agent },
-            .{ .path = vm_control.control_path, .bytes = control_json, .mode = 0o100600 },
-        },
+        .members = members.items,
         .kernel_release = requestedKernelRelease(data.initramfs),
     });
     defer payload.deinit(work);
@@ -349,6 +353,7 @@ pub fn run(
         .control_json = control_json,
         .payload = &payload,
         .emulator_version = version,
+        .modules = drivers.modules,
     });
 }
 
@@ -393,13 +398,17 @@ fn buildControl(
     io: Io,
     plan: *const customize.ResolvedPlan,
     devices: Devices,
+    modules: []const vm_payload.Module,
 ) !vm_control.Control {
     const data = plan.data;
+    const members = try allocator.alloc([]const u8, modules.len);
+    for (modules, members) |module, *member| member.* = module.member_path;
     return controlFromPolicy(allocator, io, .{
         .packages = data.packages,
         .initramfs = data.initramfs,
         .network = data.execution.vm.?.network,
         .devices = devices,
+        .modules = members,
     });
 }
 
@@ -408,6 +417,7 @@ const ControlInput = struct {
     initramfs: customize.InitramfsPolicy,
     network: customize.VmNetworkPolicy,
     devices: Devices,
+    modules: []const []const u8 = &.{},
 };
 
 fn controlFromPolicy(
@@ -468,6 +478,7 @@ fn controlFromPolicy(
             .unchanged => &.{},
             .regenerate => |regenerate| regenerate.kernels,
         },
+        .modules = input.modules,
     };
 }
 
@@ -709,6 +720,7 @@ const ReportInput = struct {
     control_json: []const u8,
     payload: *const vm_payload.Payload,
     emulator_version: []const u8,
+    modules: []const vm_payload.Module,
 };
 
 fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeReport {
@@ -730,6 +742,15 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
     const packages = try owned.alloc([]const u8, input.result.installed_packages.len);
     for (input.result.installed_packages, packages) |name, *slot| {
         slot.* = try owned.dupe(u8, name);
+    }
+
+    const modules = try owned.alloc(customize.VmModuleRecord, input.modules.len);
+    for (input.modules, modules) |module, *record| {
+        record.* = .{
+            .name = try owned.dupe(u8, module.name),
+            .image_path = try owned.dupe(u8, module.image_path),
+            .sha256 = .{ .bytes = module.sha256 },
+        };
     }
 
     return .{
@@ -760,6 +781,7 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
                     .esp_path = try owned.dupe(u8, unified.esp_path),
                 } },
             },
+            .modules = modules,
         },
     };
 }

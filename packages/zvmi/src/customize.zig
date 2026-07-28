@@ -27,7 +27,7 @@ const verity = @import("verity.zig");
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
 pub const plan_schema_version: u32 = 4;
-pub const provenance_schema_version: u32 = 6;
+pub const provenance_schema_version: u32 = 7;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -4122,6 +4122,19 @@ pub const VmBootOrigin = union(enum) {
     },
 };
 
+/// A driver the image's own kernel did not build in, read out of the image's
+/// module tree and inserted by the guest agent before it touched a disk.
+///
+/// Recorded because a run that had to load drivers is a materially different
+/// run from one that did not: it names the file inside the image that was
+/// loaded, not merely the driver it provides, and the digest is of the object
+/// as the guest received it.
+pub const VmModuleRecord = struct {
+    name: []const u8,
+    image_path: []const u8,
+    sha256: Digest,
+};
+
 /// What the emulator was, how it was configured, and exactly which bytes the
 /// guest booted. `acceleration` is the accelerator that ran, not the one that
 /// was requested — the backend never degrades silently, so the two always
@@ -4142,6 +4155,9 @@ pub const VmExecutionRecord = struct {
     initrd_sha256: Digest,
     control_sha256: Digest,
     boot_origin: VmBootOrigin,
+    /// Modules the guest inserted, in insertion order. Empty says the image's
+    /// kernel needed no help, which is the case this backend started with.
+    modules: []const VmModuleRecord = &.{},
 };
 
 pub const VmRuntimeReport = struct {
@@ -4559,6 +4575,14 @@ fn buildResult(
     };
     const vm_record = if (vm_report) |report| blk: {
         const record = report.execution;
+        const modules = try result_allocator.alloc(VmModuleRecord, record.modules.len);
+        for (record.modules, modules) |source, *target| {
+            target.* = .{
+                .name = try result_allocator.dupe(u8, source.name),
+                .image_path = try result_allocator.dupe(u8, source.image_path),
+                .sha256 = source.sha256,
+            };
+        }
         break :blk VmExecutionRecord{
             .emulator_command = try result_allocator.dupe(u8, record.emulator_command),
             .emulator_version = try result_allocator.dupe(u8, record.emulator_version),
@@ -4583,6 +4607,7 @@ fn buildResult(
                     .esp_path = try result_allocator.dupe(u8, unified.esp_path),
                 } },
             },
+            .modules = modules,
         };
     } else null;
 

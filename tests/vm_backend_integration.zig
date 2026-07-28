@@ -73,9 +73,13 @@ fn runIntegration(allocator: Allocator, io: Io, self_exe: []const u8) !void {
     };
 
     // Both transports, because which one a run gets is decided by the image
-    // and getting it wrong is a root device that never appears.
-    try runSuccess(allocator, io, self_exe, architecture, .virtio_blk);
-    try runSuccess(allocator, io, self_exe, architecture, .virtio_scsi);
+    // and getting it wrong is a root device that never appears. Both driver
+    // shapes, because an image that ships its drivers rather than building
+    // them in is the one this backend used to refuse outright.
+    try runSuccess(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
+    try runSuccess(allocator, io, self_exe, architecture, .virtio_scsi, .built_in);
+    try runSuccess(allocator, io, self_exe, architecture, .virtio_blk, .modular);
+    try runSuccess(allocator, io, self_exe, architecture, .virtio_scsi, .modular);
     try runGuestFailure(allocator, io, self_exe, architecture);
     try runSilentGuest(allocator, io, self_exe, architecture);
     try runEmulatorFailure(allocator, io, self_exe, architecture);
@@ -93,8 +97,9 @@ fn runSuccess(
     self_exe: []const u8,
     architecture: zvmi.customize.Architecture,
     transport: zvmi.vm_payload.DiskTransport,
+    drivers: Drivers,
 ) !void {
-    var workspace = try Workspace.create(allocator, io, self_exe, architecture, transport);
+    var workspace = try Workspace.create(allocator, io, self_exe, architecture, transport, drivers);
     defer workspace.deinit(io);
 
     var outcome = try workspace.execute(allocator, io, .success, .software);
@@ -106,7 +111,7 @@ fn runSuccess(
         if (diagnostic.code == .cleanup_failed) return error.CleanupFailed;
     }
 
-    try ensure(result.provenance.schema_version == 6);
+    try ensure(result.provenance.schema_version == 7);
     const vm = result.provenance.execution.vm orelse
         return error.MissingVmProvenance;
     try ensure(std.mem.eql(u8, vm.emulator_command, workspace.emulator_path));
@@ -130,6 +135,31 @@ fn runSuccess(
     // provenance can be checked against the source without trusting the run.
     try ensure(std.mem.eql(u8, &vm.kernel_sha256.bytes, &sha256(kernel_bytes)));
     try ensure(!std.mem.eql(u8, &vm.initrd_sha256.bytes, &vm.control_sha256.bytes));
+
+    // A run that had to load drivers is a materially different run, and an
+    // empty list says the image's kernel needed no help.
+    switch (drivers) {
+        .built_in => try ensure(vm.modules.len == 0),
+        .modular => {
+            const expected = expectedModules(transport);
+            try ensure(vm.modules.len == expected.len);
+            for (expected, vm.modules) |name, module| {
+                try ensure(std.mem.eql(u8, module.name, name));
+                // The file inside the image, not merely the driver it
+                // provides: the record can be checked against the source.
+                try ensure(std.mem.startsWith(
+                    u8,
+                    module.image_path,
+                    "lib/modules/" ++ kernel_release ++ "/kernel/",
+                ));
+                const basename = std.fs.path.basename(module.image_path);
+                try ensure(std.mem.eql(u8, std.fs.path.stem(basename), name));
+                const object = try moduleObject(allocator, name);
+                defer allocator.free(object);
+                try ensure(std.mem.eql(u8, &module.sha256.bytes, &sha256(object)));
+            }
+        },
+    }
 
     // The guest's answer is recorded verbatim rather than re-derived.
     const preserved = result.provenance.execution.preserved orelse
@@ -161,7 +191,7 @@ fn runGuestFailure(
     self_exe: []const u8,
     architecture: zvmi.customize.Architecture,
 ) !void {
-    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk);
+    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
     defer workspace.deinit(io);
 
     var outcome = try workspace.execute(allocator, io, .guest_failure, .software);
@@ -177,7 +207,7 @@ fn runSilentGuest(
     self_exe: []const u8,
     architecture: zvmi.customize.Architecture,
 ) !void {
-    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk);
+    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
     defer workspace.deinit(io);
 
     var outcome = try workspace.execute(allocator, io, .silent, .software);
@@ -193,7 +223,7 @@ fn runEmulatorFailure(
     self_exe: []const u8,
     architecture: zvmi.customize.Architecture,
 ) !void {
-    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk);
+    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
     defer workspace.deinit(io);
 
     var outcome = try workspace.execute(allocator, io, .emulator_failure, .software);
@@ -219,7 +249,7 @@ fn runHardwareRejected(
         );
         return;
     }
-    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk);
+    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
     defer workspace.deinit(io);
 
     var resolved = try workspace.resolve(allocator, .hardware);
@@ -274,6 +304,7 @@ const Workspace = struct {
     mode_path: []const u8,
     architecture: zvmi.customize.Architecture,
     transport: zvmi.vm_payload.DiskTransport,
+    drivers: Drivers,
     source_digest: [32]u8,
     /// Set by a case that reached its last assertion. A workspace is only
     /// removed once that happens, so a failure leaves its source, its output,
@@ -286,6 +317,7 @@ const Workspace = struct {
         self_exe: []const u8,
         architecture: zvmi.customize.Architecture,
         transport: zvmi.vm_payload.DiskTransport,
+        drivers: Drivers,
     ) !Workspace {
         var random: [8]u8 = undefined;
         Io.random(io, &random);
@@ -309,7 +341,7 @@ const Workspace = struct {
             ),
         });
 
-        try createSourceDisk(allocator, io, source_path, spool_path, transport);
+        try createSourceDisk(allocator, io, source_path, spool_path, transport, drivers);
         try copyExecutable(io, self_exe, emulator_path);
 
         return .{
@@ -325,6 +357,7 @@ const Workspace = struct {
             ),
             .architecture = architecture,
             .transport = transport,
+            .drivers = drivers,
             .source_digest = try digestOfFile(io, source_path),
         };
     }
@@ -523,8 +556,10 @@ fn runStubEmulator(
 
     var agent: ?[]const u8 = null;
     var control_json: ?[]const u8 = null;
+    var members: std.StringHashMapUnmanaged([]const u8) = .empty;
     var reader = zvmi.cpio.Reader.init(initrd);
     while (try reader.next()) |entry| {
+        try members.put(allocator, entry.path, entry.content);
         if (std.mem.eql(u8, entry.path, zvmi.vm_control.agent_path)) {
             agent = entry.content;
         } else if (std.mem.eql(u8, entry.path, zvmi.vm_control.control_path)) {
@@ -563,6 +598,24 @@ fn runStubEmulator(
     try expectStub(control.initramfs_kernels.len == 1);
     try expectStub(std.mem.eql(u8, control.initramfs_kernels[0], kernel_release));
     try expectStub(control.network == .declared_repositories);
+
+    // A module the document names but the initramfs does not carry is a guest
+    // that fails at `load-modules`, so the stand-in opens each of them the way
+    // the agent would -- and checks the bytes are an object, since the host
+    // promises to have decompressed them.
+    for (control.modules, 0..) |member, index| {
+        const bytes = members.get(member) orelse return error.MissingModuleMember;
+        try expectStub(std.mem.startsWith(u8, bytes, "\x7fELF"));
+        // The member name carries its own position, so an identical run
+        // produces an identical initramfs and the insertion order the host
+        // resolved is legible in the payload rather than only in the document.
+        var prefix: [32]u8 = undefined;
+        try expectStub(std.mem.startsWith(
+            u8,
+            member,
+            try std.fmt.bufPrint(&prefix, "zvmi-module-{d:0>2}-", .{index}),
+        ));
+    }
 
     // Which drive is which is positional, so the result must be written
     // through the same ordering the guest would see.
@@ -650,6 +703,7 @@ fn createSourceDisk(
     source_path: []const u8,
     spool_path: []const u8,
     transport: zvmi.vm_payload.DiskTransport,
+    drivers: Drivers,
 ) !void {
     var image = try zvmi.Image.createExclusive(
         io,
@@ -680,26 +734,32 @@ fn createSourceDisk(
     // virtio-scsi controller presents no `/dev/sda`.
     try tree.putFileBytes(
         "lib/modules/" ++ kernel_release ++ "/modules.builtin",
-        switch (transport) {
-            .virtio_blk =>
-            \\kernel/fs/ext4/ext4.ko
-            \\kernel/drivers/virtio/virtio_pci.ko
-            \\kernel/drivers/block/virtio_blk.ko
-            \\kernel/drivers/net/virtio_net.ko
-            \\
-            ,
-            .virtio_scsi =>
-            \\kernel/fs/ext4/ext4.ko
-            \\kernel/drivers/virtio/virtio_pci.ko
-            \\kernel/drivers/scsi/scsi_mod.ko
-            \\kernel/drivers/scsi/sd_mod.ko
-            \\kernel/drivers/scsi/virtio_scsi.ko
-            \\kernel/drivers/net/virtio_net.ko
-            \\
-            ,
+        switch (drivers) {
+            // A cloud kernel that builds nothing this run needs in: its
+            // drivers are all in the tree, and the run has to load them.
+            .modular => "kernel/fs/xfs/xfs.ko\n",
+            .built_in => switch (transport) {
+                .virtio_blk =>
+                \\kernel/fs/ext4/ext4.ko
+                \\kernel/drivers/virtio/virtio_pci.ko
+                \\kernel/drivers/block/virtio_blk.ko
+                \\kernel/drivers/net/virtio_net.ko
+                \\
+                ,
+                .virtio_scsi =>
+                \\kernel/fs/ext4/ext4.ko
+                \\kernel/drivers/virtio/virtio_pci.ko
+                \\kernel/drivers/scsi/scsi_mod.ko
+                \\kernel/drivers/scsi/sd_mod.ko
+                \\kernel/drivers/scsi/virtio_scsi.ko
+                \\kernel/drivers/net/virtio_net.ko
+                \\
+                ,
+            },
         },
         .{ .mode = 0o644 },
     );
+    if (drivers == .modular) try writeModuleTree(allocator, &tree, transport);
     try tree.putFileBytes(
         "boot/vmlinuz-" ++ kernel_release,
         kernel_bytes,
@@ -717,6 +777,90 @@ fn createSourceDisk(
         .uuid = [_]u8{0x56} ** 16,
         .timestamp = 1_735_689_600,
     });
+}
+
+/// Whether the fixture image's kernel builds its drivers in or ships them in
+/// its own module tree. Both are real cloud images; only the first used to be
+/// something this backend could boot.
+const Drivers = enum { built_in, modular };
+
+const modular_dep_virtio_blk =
+    \\kernel/drivers/virtio/virtio_pci.ko:
+    \\kernel/drivers/block/virtio_blk.ko:
+    \\kernel/fs/jbd2/jbd2.ko:
+    \\kernel/fs/ext4/ext4.ko: kernel/fs/jbd2/jbd2.ko
+    \\kernel/drivers/net/virtio_net.ko:
+    \\
+;
+
+/// The same kernel with no virtio-blk at all, so the disks arrive over SCSI.
+const modular_dep_virtio_scsi =
+    \\kernel/drivers/virtio/virtio_pci.ko:
+    \\kernel/drivers/scsi/scsi_mod.ko:
+    \\kernel/drivers/scsi/sd_mod.ko: kernel/drivers/scsi/scsi_mod.ko
+    \\kernel/drivers/scsi/virtio_scsi.ko: kernel/drivers/scsi/scsi_mod.ko
+    \\kernel/fs/jbd2/jbd2.ko:
+    \\kernel/fs/ext4/ext4.ko: kernel/fs/jbd2/jbd2.ko
+    \\kernel/drivers/net/virtio_net.ko:
+    \\
+;
+
+/// The names the backend must insert, in the order it must insert them: the
+/// bus before the disk, the disk before the filesystem it carries, and every
+/// dependency before what needs it.
+fn expectedModules(transport: zvmi.vm_payload.DiskTransport) []const []const u8 {
+    return switch (transport) {
+        .virtio_blk => &.{ "virtio_pci", "virtio_blk", "jbd2", "ext4", "virtio_net" },
+        .virtio_scsi => &.{
+            "virtio_pci",
+            "scsi_mod",
+            "virtio_scsi",
+            "sd_mod",
+            "jbd2",
+            "ext4",
+            "virtio_net",
+        },
+    };
+}
+
+/// Enough of an ELF header that the host accepts the file as an object, and
+/// distinct per module so the initramfs member, the digest in provenance and
+/// the file in the image can be shown to be the same bytes.
+fn moduleObject(allocator: Allocator, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "\x7fELF\x02\x01\x01\x00integration:{s}", .{name});
+}
+
+fn writeModuleTree(
+    allocator: Allocator,
+    tree: *zvmi.root_tree.RootTree,
+    transport: zvmi.vm_payload.DiskTransport,
+) !void {
+    const prefix = "lib/modules/" ++ kernel_release;
+    const dep = switch (transport) {
+        .virtio_blk => modular_dep_virtio_blk,
+        .virtio_scsi => modular_dep_virtio_scsi,
+    };
+    try tree.putFileBytes(prefix ++ "/modules.dep", dep, .{ .mode = 0o644 });
+    inline for (.{
+        "/kernel",               "/kernel/drivers",      "/kernel/drivers/virtio",
+        "/kernel/drivers/block", "/kernel/drivers/scsi", "/kernel/drivers/net",
+        "/kernel/fs",            "/kernel/fs/ext4",      "/kernel/fs/jbd2",
+    }) |directory| {
+        try tree.putDirectory(prefix ++ directory, .{ .mode = 0o755 });
+    }
+
+    // Every path the dependency file names, and nothing else: a tree that
+    // describes a module it does not hold is a refusal, not a boot.
+    var lines = std.mem.tokenizeScalar(u8, dep, '\n');
+    while (lines.next()) |line| {
+        const module_path = line[0 .. std.mem.indexOfScalar(u8, line, ':') orelse continue];
+        const name = std.fs.path.stem(std.fs.path.basename(module_path));
+        const object = try moduleObject(allocator, name);
+        defer allocator.free(object);
+        const full = try std.fs.path.join(allocator, &.{ prefix, module_path });
+        defer allocator.free(full);
+        try tree.putFileBytes(full, object, .{ .mode = 0o644 });
+    }
 }
 
 /// A newc header for `TRAILER!!!`: 110 header bytes of constant fields, the
