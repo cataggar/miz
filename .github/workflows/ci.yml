@@ -46,10 +46,11 @@ jobs:
           ZVMI_RUN_PRIVILEGED_TEST: "1"
         run: zig build test-unsafe-chroot-integration --summary all
 
-      # The VM backend boots the image's own kernel with `rdinit=`, so the
-      # guest can only use drivers that kernel built in. Ubuntu modularizes
-      # ext4, which rules out the runner's own kernel; Azure Linux builds it
-      # in, and is what this project's images actually run.
+      # The VM backend boots the image's own kernel with `rdinit=`. Drivers it
+      # built in are there already; the rest are inserted out of the image's
+      # own module tree. Azure Linux builds ext4, virtio_scsi and virtio_net
+      # in, and is what this project's images actually run, so it is what
+      # proves the built-in path.
       - name: Cache VM boot kernels
         id: cache-vm-kernel
         uses: actions/cache@v4
@@ -113,4 +114,40 @@ jobs:
           export ZVMI_VM_ACCEL=software
           ZVMI_VM_QEMU="$(readlink -f \
             "$(command -v "qemu-system-${ZVMI_VM_CROSS_ARCH}")")" \
+            zig build test-vm-real-boot --summary all
+
+      # Azure Linux proves the built-in path and can prove nothing else: it
+      # builds every driver this backend needs in. Debian's generic kernel
+      # modularizes ext4, virtio_blk, virtio_scsi, sd_mod and virtio_pci, so a
+      # guest booted on it reaches its root only if the modules the image
+      # itself ships were resolved, appended and inserted.
+      - name: Cache modular VM boot kernel
+        id: cache-vm-modular-kernel
+        uses: actions/cache@v4
+        with:
+          path: fixtures/vm-boot-modular-kernel
+          key: vm-boot-modular-kernel-6.1.176-1-v1
+
+      - name: Fetch modular VM boot kernel
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.cache-vm-modular-kernel.outputs.cache-hit }}" != "true" ]; then
+            # `ar` unpacks the .deb and `depmod` writes the modules.dep Debian
+            # leaves to its postinst.
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends binutils kmod
+          fi
+          scripts/ci/fetch-vm-boot-modular-kernel.sh \
+            "fixtures/vm-boot-modular-kernel/$(uname -m)" "$(uname -m)" \
+            ZVMI_VM_MODULAR_ >> "$GITHUB_ENV"
+
+      - name: modular VM boot
+        env:
+          ZVMI_RUN_VM_BOOT_TEST: "1"
+        run: |
+          set -euo pipefail
+          export ZVMI_VM_BOOT_KERNEL="${ZVMI_VM_MODULAR_KERNEL}"
+          export ZVMI_VM_BOOT_MODULES_BUILTIN="${ZVMI_VM_MODULAR_MODULES_BUILTIN}"
+          export ZVMI_VM_BOOT_MODULE_TREE="${ZVMI_VM_MODULAR_MODULE_TREE}"
+          ZVMI_VM_QEMU="$(readlink -f "$(command -v "qemu-system-$(uname -m)")")" \
             zig build test-vm-real-boot --summary all

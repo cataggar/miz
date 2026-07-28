@@ -130,6 +130,17 @@ const scsi_disk_module = "sd_mod";
 
 const network_module = "virtio_net";
 
+/// `modules.dep` records symbol dependencies, and ext4 has none on a checksum
+/// driver: it asks the crypto API for "crc32c" by name while it mounts, and a
+/// guest with no module loader gets no second chance — the mount fails with
+/// "Cannot load crc32c driver" after every driver it does list loaded.
+///
+/// The first name that exists wins, and none existing is not a refusal:
+/// kernels from 6.14 on call the crc32c library directly and ship no crypto
+/// module under any of these names, so an absent provider there means an
+/// image that needs none.
+const checksum_modules = [_][]const u8{ "crc32c_generic", "crc32c" };
+
 /// Bounds on what may be appended to the initramfs. The `ext4` closure is on
 /// the order of a megabyte, so these are ceilings on a malformed tree rather
 /// than limits a real image approaches.
@@ -194,6 +205,17 @@ pub fn probeDrivers(
         .built_in => {},
         .loadable => try wanted.append(root_filesystem_module),
         .missing => return error.NoRootFilesystemDriver,
+    }
+
+    for (checksum_modules) |name| {
+        switch (availability(builtin_listing, dependencies, name)) {
+            .built_in => break,
+            .loadable => {
+                try wanted.append(name);
+                break;
+            },
+            .missing => {},
+        }
     }
 
     const network = switch (availability(builtin_listing, dependencies, network_module)) {
@@ -1294,6 +1316,83 @@ test "a kernel that modularizes its drivers is served by its own module tree" {
     }
 }
 
+test "the checksum driver ext4 asks for at mount time is loaded with it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "test-vm-payload-modular-crc32c.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // ext4 does not depend on a checksum driver by symbol -- `modules.dep`
+    // says so -- but it asks the crypto API for "crc32c" by name as it mounts,
+    // and a guest with no module loader cannot answer that later.
+    try writeDriverProbeImage(allocator, io, path, .{
+        .releases = &.{"6.1.0-cloud"},
+        .builtin = "kernel/drivers/virtio/virtio_pci.ko\nkernel/drivers/block/virtio_blk.ko\n",
+        .dep =
+        \\kernel/crypto/crc32c_generic.ko:
+        \\kernel/fs/mbcache.ko:
+        \\kernel/fs/jbd2/jbd2.ko:
+        \\kernel/fs/ext4/ext4.ko: kernel/fs/mbcache.ko kernel/fs/jbd2/jbd2.ko
+        \\
+        ,
+        .modules = &.{
+            "kernel/crypto/crc32c_generic.ko",
+            "kernel/fs/mbcache.ko",
+            "kernel/fs/jbd2/jbd2.ko",
+            "kernel/fs/ext4/ext4.ko",
+        },
+    });
+
+    var drivers = try probeDrivers(allocator, io, .{
+        .raw_path = path,
+        .root_partition_offset = 0,
+    });
+    defer drivers.deinit(allocator);
+
+    const expected = [_][]const u8{ "mbcache", "jbd2", "ext4", "crc32c_generic" };
+    try std.testing.expectEqual(expected.len, drivers.modules.len);
+    for (expected, drivers.modules) |name, module| {
+        try std.testing.expectEqualStrings(name, module.name);
+    }
+}
+
+test "a kernel with the checksum driver built in inserts nothing for it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "test-vm-payload-builtin-crc32c.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try writeDriverProbeImage(allocator, io, path, .{
+        .releases = &.{"6.1.0-cloud"},
+        .builtin =
+        \\kernel/drivers/virtio/virtio_pci.ko
+        \\kernel/drivers/block/virtio_blk.ko
+        \\kernel/crypto/crc32c_generic.ko
+        \\
+        ,
+        .dep =
+        \\kernel/crypto/crc32c_generic.ko:
+        \\kernel/fs/ext4/ext4.ko:
+        \\
+        ,
+        .modules = &.{
+            "kernel/crypto/crc32c_generic.ko",
+            "kernel/fs/ext4/ext4.ko",
+        },
+    });
+
+    var drivers = try probeDrivers(allocator, io, .{
+        .raw_path = path,
+        .root_partition_offset = 0,
+    });
+    defer drivers.deinit(allocator);
+
+    // The tree holds a module the kernel already contains; inserting it would
+    // be work that can only fail.
+    try std.testing.expectEqual(@as(usize, 1), drivers.modules.len);
+    try std.testing.expectEqualStrings("ext4", drivers.modules[0].name);
+}
+
 test "a modular virtio-scsi brings the SCSI disk driver with it" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1308,10 +1407,10 @@ test "a modular virtio-scsi brings the SCSI disk driver with it" {
         .releases = &.{"6.1.0-cloud"},
         .builtin = "kernel/fs/ext4/ext4.ko\nkernel/drivers/virtio/virtio_pci.ko\n",
         .dep =
-            \\kernel/drivers/scsi/scsi_mod.ko.gz:
-            \\kernel/drivers/scsi/sd_mod.ko.gz: kernel/drivers/scsi/scsi_mod.ko.gz
-            \\kernel/drivers/scsi/virtio_scsi.ko.gz: kernel/drivers/scsi/scsi_mod.ko.gz
-            \\
+        \\kernel/drivers/scsi/scsi_mod.ko.gz:
+        \\kernel/drivers/scsi/sd_mod.ko.gz: kernel/drivers/scsi/scsi_mod.ko.gz
+        \\kernel/drivers/scsi/virtio_scsi.ko.gz: kernel/drivers/scsi/scsi_mod.ko.gz
+        \\
         ,
         .modules = &.{
             "kernel/drivers/scsi/scsi_mod.ko.gz",

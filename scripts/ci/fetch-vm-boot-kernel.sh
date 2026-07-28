@@ -2,12 +2,15 @@
 # Fetches the kernel and built-in module list that `zig build test-vm-real-boot`
 # boots a guest with.
 #
-# The VM backend boots the image's own kernel directly with `rdinit=`, so no
-# module is ever inserted and every driver the guest needs must be built in.
-# That rules out the runner's own kernel: Ubuntu modularizes ext4, so a guest
-# booted on it can see the disk and cannot mount it. Azure Linux builds ext4,
+# The VM backend boots the image's own kernel directly with `rdinit=`, and the
+# only drivers the guest gets are the ones that kernel built in plus whatever
+# the image's own module tree can supply. That rules out the runner's own
+# kernel, which brings no such tree with it. Azure Linux builds ext4,
 # virtio_scsi and virtio_net in, which is also what this project's images
 # actually run, so the test boots the same kernel its users do.
+#
+# This is the built-in half of the boot coverage; fetch-vm-boot-modular-kernel.sh
+# fetches a kernel that modularizes the same drivers, for the other half.
 #
 # The version is pinned rather than resolved from repodata. A kernel that
 # disappears should fail this step loudly, not silently change what CI proves.

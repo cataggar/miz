@@ -11,6 +11,7 @@
 //!   ZVMI_RUN_VM_BOOT_TEST=1
 //!   ZVMI_VM_BOOT_KERNEL=/path/to/vmlinuz-<release>
 //!   ZVMI_VM_BOOT_MODULES_BUILTIN=/path/to/modules.builtin
+//!   ZVMI_VM_BOOT_MODULE_TREE=/path/to/lib/modules/<release>   (optional)
 //!   ZVMI_VM_QEMU=/path/to/qemu-system-<arch>
 //!   ZVMI_VM_ACCEL=software|hardware        (default: software)
 //!   ZVMI_VM_BOOT_ARCH=x86_64|aarch64       (default: the host's)
@@ -18,6 +19,11 @@
 //!
 //! `modules.builtin` comes from the same kernel package and is what decides
 //! how the guest's disks are attached, so it is required rather than inferred.
+//!
+//! `ZVMI_VM_BOOT_MODULE_TREE` points at a real `lib/modules/<release>`, which
+//! is staged into the image verbatim: this test computes no dependency closure
+//! of its own, so what a kernel that modularizes `ext4` or its virtio drivers
+//! boots on is the production resolver rather than a fixture agreeing with it.
 //!
 //! Naming an architecture the host does not have makes this the
 //! cross-architecture acceptance test: the kernel, the agent and the binary the
@@ -68,6 +74,9 @@ pub fn main(init: std.process.Init) !void {
 const Settings = struct {
     kernel_path: []const u8,
     modules_builtin_path: []const u8,
+    /// A real `lib/modules/<release>`, staged verbatim when given. Absent is
+    /// the case this test has always run: a kernel that needs nothing loaded.
+    module_tree_path: ?[]const u8,
     emulator_path: []const u8,
     acceleration: zvmi.customize.VmAcceleration,
     /// The guest's architecture: what the image is, what the kernel is, and
@@ -117,6 +126,7 @@ const Settings = struct {
                 std.debug.print("skipping vm real boot: ZVMI_VM_QEMU is unset\n", .{});
                 return null;
             },
+            .module_tree_path = environment.get("ZVMI_VM_BOOT_MODULE_TREE"),
             // Software emulation is the default because the runners this is
             // expected to run on have no accelerator, and a test that demands
             // one is a test that is usually skipped.
@@ -249,6 +259,18 @@ fn runBoot(
     try ensure(std.mem.eql(u8, vm.emulator_command, settings.emulator_path));
     try ensure(vm.emulator_version.len != 0);
 
+    // A kernel given a module tree is expected to have needed something out of
+    // it: a run that quietly loaded nothing would prove only that the built-in
+    // path still works, which the Azure Linux boot already proves.
+    if (settings.module_tree_path != null) {
+        try ensure(vm.modules.len != 0);
+        std.debug.print("vm real boot: guest inserted", .{});
+        for (vm.modules) |module| std.debug.print(" {s}", .{module.name});
+        std.debug.print("\n", .{});
+    } else {
+        try ensure(vm.modules.len == 0);
+    }
+
     const preserved = result.provenance.execution.preserved orelse
         return error.MissingPreservedProvenance;
     try ensure(preserved.installed_packages.len == 1);
@@ -358,6 +380,9 @@ fn createSourceDisk(
         modules_builtin,
         .{ .mode = 0o644 },
     );
+    if (settings.module_tree_path) |source| {
+        try stageModuleTree(allocator, io, &tree, module_directory, source);
+    }
     try tree.putFileBytes(
         try std.fmt.allocPrint(allocator, "boot/vmlinuz-{s}", .{release}),
         kernel,
@@ -383,6 +408,52 @@ fn createSourceDisk(
         .timestamp = 1_735_689_600,
     });
     return release;
+}
+
+/// Copies a real module tree into the image under `lib/modules/<release>`,
+/// exactly as the kernel package laid it out.
+///
+/// Nothing here selects, renames or decompresses anything: the whole point is
+/// that the backend is given a real tree and has to find its own way through
+/// it, so a resolver that agrees with a fixture but not with a distribution
+/// fails here rather than in production. A file the tree already holds --
+/// `modules.builtin` in particular -- wins over what was staged before it.
+fn stageModuleTree(
+    allocator: Allocator,
+    io: Io,
+    tree: *zvmi.root_tree.RootTree,
+    module_directory: []const u8,
+    source_path: []const u8,
+) !void {
+    var dir = try Io.Dir.cwd().openDir(io, source_path, .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+
+    var count: usize = 0;
+    while (try walker.next(io)) |entry| {
+        const destination = try std.fs.path.join(
+            allocator,
+            &.{ module_directory, entry.path },
+        );
+        defer allocator.free(destination);
+        switch (entry.kind) {
+            .directory => try tree.putDirectory(destination, .{ .mode = 0o755 }),
+            .file => {
+                const host_path = try std.fs.path.join(
+                    allocator,
+                    &.{ source_path, entry.path },
+                );
+                defer allocator.free(host_path);
+                try tree.putFileFromPath(destination, host_path, .{ .mode = 0o644 });
+                count += 1;
+            },
+            // A module tree with a symlink or a device node in it is not a
+            // tree this test was handed on purpose.
+            else => return error.UnsupportedModuleTreeEntry,
+        }
+    }
+    std.debug.print("vm real boot: staged {d} module tree files\n", .{count});
 }
 
 fn releaseFromKernelPath(path: []const u8) ?[]const u8 {

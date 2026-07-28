@@ -266,8 +266,7 @@ fn decompressGzip(allocator: Allocator, bytes: []const u8, max_bytes: usize) (Al
 fn decompressXz(allocator: Allocator, bytes: []const u8, max_bytes: usize) (Allocator.Error || Error)![]u8 {
     var input = std.Io.Reader.fixed(bytes);
     var decompressor = std.compress.xz.Decompress.init(&input, allocator, &.{}) catch |err| switch (err) {
-        error.NotXzStream, error.WrongChecksum, error.EndOfStream, error.ReadFailed => return
-            error.ModuleDecompressionFailed,
+        error.NotXzStream, error.WrongChecksum, error.EndOfStream, error.ReadFailed => return error.ModuleDecompressionFailed,
     };
     defer decompressor.deinit();
     return decompressor.reader.allocRemaining(allocator, .limited(max_bytes)) catch |err| switch (err) {

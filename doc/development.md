@@ -218,11 +218,27 @@ Three steps, cheapest first:
 Both real boots take roughly 15 seconds under pure TCG, fixture construction
 included, which is why they run in `ci.yml` rather than `boot-smoke.yml`.
 
-CI cannot use the runner's own kernel: the guest agent runs as `rdinit`, so no
-module is ever inserted, and Ubuntu modularizes `ext4` — a guest booted on it
-would see the disk and be unable to mount it. `fetch-vm-boot-kernel.sh` fetches
-a pinned Azure Linux kernel instead, which builds `ext4`, `virtio_scsi` and
-`virtio_net` in.
+CI cannot use the runner's own kernel: the guest agent runs as `rdinit`, so
+whatever the guest needs is either built into the kernel or inserted from the
+image's own `lib/modules/<release>` tree, and the runner's kernel has no such
+tree to hand. Two pinned kernels are fetched instead, and between them they
+cover both halves of that sentence:
+
+- `fetch-vm-boot-kernel.sh` fetches an Azure Linux kernel, which builds `ext4`,
+  `virtio_scsi` and `virtio_net` in. It proves the built-in path, and it is the
+  kernel this project's own images run.
+- `fetch-vm-boot-modular-kernel.sh` fetches a Debian *generic* kernel, which
+  modularizes `ext4`, `virtio_blk`, `virtio_scsi`, `sd_mod` and `virtio_pci`.
+  Pointing `ZVMI_VM_BOOT_MODULE_TREE` at the tree it prints stages that tree
+  into the synthetic image, so the guest reaches its root only if the backend
+  resolved the dependency closure, appended the modules to the initramfs and
+  inserted them in order. With the variable unset the test behaves exactly as
+  it did before, which is what keeps the built-in run an unchanged control.
+
+  Debian ships no `modules.dep` in the `.deb` — `depmod` runs from the
+  postinst — so the script runs `depmod` itself, and it prunes the 288 MiB
+  tree to the subtrees the closure can reach. It needs `binutils` (for `ar`)
+  and `kmod` (for `depmod`).
 
 `.github/workflows/boot-smoke.yml` runs `zig build test-boot-smoke` for every release tag and when manually dispatched. It installs `qemu-system-x86`/`ovmf`, downloads and caches the [Azure Linux 4.0 ISO](https://aka.ms/azurelinux-4.0-x86_64.iso), and builds the OCI fixtures used by the real-QEMU tests. The job is required (not `continue-on-error`) for release tags but is not part of universal pull-request CI.
 
