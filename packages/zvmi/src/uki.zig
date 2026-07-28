@@ -445,7 +445,7 @@ fn trimSectionName(name: *const [8]u8) []const u8 {
 }
 
 test "generate builds a structurally valid UKI with systemd-stub sections" {
-    const stub = try makeTestStubPe(std.testing.allocator, 0x8664);
+    const stub = try syntheticStubPe(std.testing.allocator, 0x8664);
     defer std.testing.allocator.free(stub);
 
     const linux = "linux payload";
@@ -504,7 +504,7 @@ test "generate builds a structurally valid UKI with systemd-stub sections" {
 }
 
 test "inspect rejects overflowing PE section bounds" {
-    const image = try makeTestStubPe(std.testing.allocator, 0x8664);
+    const image = try syntheticStubPe(std.testing.allocator, 0x8664);
     defer std.testing.allocator.free(image);
 
     const pe_offset = std.mem.readInt(u32, image[0x3C..0x40], .little);
@@ -530,7 +530,9 @@ fn expectSectionContents(inspection: *const Inspection, name: []const u8, expect
     try std.testing.expectEqualSlices(u8, expected, section.contents);
 }
 
-fn makeTestStubPe(allocator: std.mem.Allocator, machine: u16) ![]u8 {
+/// Builds a minimal, synthetic systemd-stub-shaped PE32+ image. Exposed so
+/// other modules can construct UKI fixtures without shipping a real stub.
+pub fn syntheticStubPe(allocator: std.mem.Allocator, machine: u16) ![]u8 {
     const file_alignment: u32 = 0x200;
     const section_alignment: u32 = 0x1000;
     const pe_offset: usize = 0x80;
