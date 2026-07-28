@@ -170,6 +170,7 @@ pub const PreservedBackend = enum {
     native_edit,
     rebuild,
     unsafe_chroot,
+    vm,
 };
 
 pub const PreservedPackageAction = preserved_image_wire.PackageAction;
@@ -198,6 +199,13 @@ pub const PreservedPackagePolicy = struct {
 
 pub const PreservedInitramfsPolicy = preserved_image_wire.InitramfsPolicy;
 pub const PreservedGuestExecutionPolicy = preserved_image_wire.GuestExecutionPolicy;
+pub const PreservedRunnerKind = preserved_image_wire.RunnerKind;
+pub const PreservedRunner = preserved_image_wire.Runner;
+pub const PreservedVmAcceleration = preserved_image_wire.VmAcceleration;
+pub const PreservedVmNetworkPolicy = preserved_image_wire.VmNetworkPolicy;
+pub const PreservedVmFirmware = preserved_image_wire.VmFirmware;
+pub const PreservedVmBoot = preserved_image_wire.VmBoot;
+pub const PreservedVmPolicy = preserved_image_wire.VmConfiguration;
 
 pub const PreservedOptions = struct {
     name: []const u8,
@@ -214,6 +222,11 @@ pub const PreservedOptions = struct {
     packages: PreservedPackagePolicy = .{},
     initramfs: PreservedInitramfsPolicy = .unchanged,
     guest_execution: PreservedGuestExecutionPolicy = .same_architecture,
+    /// The runner that makes a foreign guest architecture executable.
+    /// Required by, and only meaningful to, `cross_architecture` execution.
+    runner: ?PreservedRunner = null,
+    /// Required by, and only meaningful to, the `vm` backend.
+    vm: ?PreservedVmPolicy = null,
     verbose: bool = false,
 };
 
@@ -489,6 +502,7 @@ fn materializePreservedConfiguration(
             .native_edit => .native_edit,
             .rebuild => .rebuild,
             .unsafe_chroot => .unsafe_chroot,
+            .vm => .vm,
         },
         .root_partition = switch (options.root_partition) {
             .gpt_index => |index| .{ .gpt_index = index },
@@ -515,6 +529,8 @@ fn materializePreservedConfiguration(
         },
         .initramfs = options.initramfs,
         .guest_execution = options.guest_execution,
+        .runner = options.runner,
+        .vm = options.vm,
     };
     try preserved_image_wire.validate(configuration, sources.items.len);
     const json = try std.json.Stringify.valueAlloc(b.allocator, configuration, .{});

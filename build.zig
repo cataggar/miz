@@ -591,6 +591,16 @@ pub fn build(b: *std.Build) void {
     );
     build_api_preserved_diagnostics_check.setCwd(b.path("tests/build_api_consumer"));
 
+    const build_api_preserved_vm_diagnostics_check = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "build",
+        "preserved-vm-diagnostics",
+    });
+    build_api_preserved_vm_diagnostics_check.setName(
+        "check external preserved-image vm backend diagnostics",
+    );
+    build_api_preserved_vm_diagnostics_check.setCwd(b.path("tests/build_api_consumer"));
+
     // ---- scripts/build_generalized_azurelinux4.zig: generalized Azure Linux 4
     // QCOW2 builder, replacing scripts/build-generalized-azurelinux4.py.
     // Linux-specific: the full pipeline (dnf, sudo chroot, qemu-img) is only
@@ -822,4 +832,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&build_api_diagnostics_check.step);
     test_step.dependOn(&build_api_execution_diagnostics_check.step);
     test_step.dependOn(&build_api_preserved_diagnostics_check.step);
+    test_step.dependOn(&build_api_preserved_vm_diagnostics_check.step);
 }

@@ -33,6 +33,8 @@ const LoadedConfiguration = struct {
     packages: zvmi.customize.PackagePolicy,
     initramfs: zvmi.customize.InitramfsPolicy,
     guest_execution: wire.GuestExecutionPolicy,
+    runner: ?wire.Runner,
+    vm: ?zvmi.customize.VmPolicy,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -155,11 +157,24 @@ pub fn main(init: std.process.Init) !void {
         .initramfs = configuration.initramfs,
         .cross_architecture = switch (configuration.guest_execution) {
             .same_architecture => .reject,
+            .cross_architecture => .{ .runner = .{
+                .kind = switch (configuration.runner.?.kind) {
+                    .qemu_user => .qemu_user,
+                    .binfmt_misc => .binfmt_misc,
+                    .vm => .vm,
+                },
+                .guest_architecture = switch (configuration.runner.?.guest_architecture) {
+                    .x86_64 => .x86_64,
+                    .aarch64 => .aarch64,
+                },
+                .command = configuration.runner.?.command,
+            } },
         },
         .execution = .{
             .workspace_path = args.bundle_output_path,
             .backend = configuration.backend,
             .acknowledge_unsafe = configuration.acknowledge_unsafe,
+            .vm = configuration.vm,
         },
         .generalization = configuration.generalization,
         .reproducibility = .{
@@ -402,6 +417,8 @@ fn loadConfiguration(
         allocator,
         .limited(16 * 1024 * 1024),
     );
+    // Safe only because the loaders parse with `.alloc_always`; by default
+    // `std.json` returns slices into this buffer.
     defer allocator.free(bytes);
     return parseConfiguration(allocator, bytes, source_paths);
 }
@@ -442,7 +459,7 @@ fn loadV2Configuration(
         wire.ConfigurationV2,
         allocator,
         bytes,
-        .{ .ignore_unknown_fields = false },
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
     );
     try wire.validateV2(parsed.value, source_paths.len);
     const customization = try customization_loader.map(
@@ -466,6 +483,8 @@ fn loadV2Configuration(
         .packages = .{},
         .initramfs = .unchanged,
         .guest_execution = .same_architecture,
+        .runner = null,
+        .vm = null,
     };
 }
 
@@ -478,7 +497,7 @@ fn loadV3Configuration(
         wire.Configuration,
         allocator,
         bytes,
-        .{ .ignore_unknown_fields = false },
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
     );
     try wire.validate(parsed.value, source_paths.len);
     const customization = try customization_loader.map(
@@ -491,6 +510,7 @@ fn loadV3Configuration(
             .native_edit => .native_edit,
             .rebuild => .rebuild,
             .unsafe_chroot => .unsafe_chroot,
+            .vm => .vm,
         },
         .root_partition = switch (parsed.value.root_partition) {
             .gpt_index => |index| .{ .gpt_index = index },
@@ -507,6 +527,36 @@ fn loadV3Configuration(
         ),
         .initramfs = try mapInitramfsPolicy(allocator, parsed.value.initramfs),
         .guest_execution = parsed.value.guest_execution,
+        .runner = parsed.value.runner,
+        .vm = mapVmPolicy(parsed.value.vm),
+    };
+}
+
+fn mapVmPolicy(configuration: ?wire.VmConfiguration) ?zvmi.customize.VmPolicy {
+    const present = configuration orelse return null;
+    return .{
+        .emulator_command = present.emulator_command,
+        .boot = switch (present.boot) {
+            .direct_kernel => .direct_kernel,
+            .firmware => |firmware| .{ .firmware = .{
+                .code_path = firmware.code_path,
+                .vars_path = firmware.vars_path,
+            } },
+        },
+        .acceleration = switch (present.acceleration) {
+            .hardware => .hardware,
+            .software => .software,
+        },
+        .acknowledge_software_emulation = present.acknowledge_software_emulation,
+        .memory_mib = present.memory_mib,
+        .vcpus = present.vcpus,
+        .network = switch (present.network) {
+            .offline => .offline,
+            .declared_repositories => .declared_repositories,
+        },
+        .boot_timeout_seconds = present.boot_timeout_seconds,
+        .machine = present.machine,
+        .cpu = present.cpu,
     };
 }
 
@@ -1115,6 +1165,74 @@ test "configuration loader accepts v2 and v3 transport" {
     try std.testing.expectEqualStrings(
         "dracut",
         v3.initramfs.regenerate.generator.?,
+    );
+
+    // `loadConfiguration` frees the document once parsing returns, so the
+    // loaded configuration must own its strings rather than alias it.
+    const path = "test-preserved-image-configuration.json";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    {
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{});
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, v3_json, 0);
+    }
+    const from_file = try loadConfiguration(
+        allocator,
+        std.testing.io,
+        path,
+        &.{"trust-source"},
+    );
+    try std.testing.expectEqualStrings(
+        "dracut",
+        from_file.initramfs.regenerate.generator.?,
+    );
+    try std.testing.expectEqualStrings(
+        "base",
+        from_file.packages.repositories[0].id,
+    );
+}
+
+test "the vm backend and a cross-architecture runner survive the loader" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{"api_version":3,"backend":"vm","root_partition":{"gpt_index":2},"guest_execution":"cross_architecture","runner":{"kind":"vm","guest_architecture":"aarch64","command":"/usr/bin/qemu-system-aarch64"},"vm":{"emulator_command":"/usr/bin/qemu-system-aarch64","boot":{"direct_kernel":{}},"acceleration":"software"}}
+    ;
+    const loaded = try parseConfiguration(allocator, json, &.{});
+    try std.testing.expectEqual(zvmi.customize.ExecutionBackend.vm, loaded.backend);
+    try std.testing.expectEqual(
+        wire.GuestExecutionPolicy.cross_architecture,
+        loaded.guest_execution,
+    );
+    try std.testing.expectEqualStrings(
+        "/usr/bin/qemu-system-aarch64",
+        loaded.runner.?.command.?,
+    );
+    try std.testing.expectEqualStrings(
+        "/usr/bin/qemu-system-aarch64",
+        loaded.vm.?.emulator_command,
+    );
+    try std.testing.expect(loaded.vm.?.boot == .direct_kernel);
+    try std.testing.expectEqual(
+        zvmi.customize.VmAcceleration.software,
+        loaded.vm.?.acceleration,
+    );
+
+    // `loadConfiguration` frees the document after parsing, so the loaded
+    // configuration must not alias it.
+    const path = "test-preserved-vm-configuration.json";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    {
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{});
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, json, 0);
+    }
+    const from_file = try loadConfiguration(allocator, std.testing.io, path, &.{});
+    try std.testing.expectEqualStrings(
+        "/usr/bin/qemu-system-aarch64",
+        from_file.vm.?.emulator_command,
     );
 }
 
