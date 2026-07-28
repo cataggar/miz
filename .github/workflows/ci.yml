@@ -50,20 +50,29 @@ jobs:
       # guest can only use drivers that kernel built in. Ubuntu modularizes
       # ext4, which rules out the runner's own kernel; Azure Linux builds it
       # in, and is what this project's images actually run.
-      - name: Cache VM boot kernel
+      - name: Cache VM boot kernels
         id: cache-vm-kernel
         uses: actions/cache@v4
         with:
           path: fixtures/vm-boot-kernel
-          key: vm-boot-kernel-6.6.139.1-1.azl3-${{ runner.arch }}
+          key: vm-boot-kernel-6.6.139.1-1.azl3-both-v1
 
-      - name: Fetch VM boot kernel
+      - name: Fetch VM boot kernels
         run: |
           if [ "${{ steps.cache-vm-kernel.outputs.cache-hit }}" != "true" ]; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends rpm2cpio cpio
           fi
-          scripts/ci/fetch-vm-boot-kernel.sh fixtures/vm-boot-kernel >> "$GITHUB_ENV"
+          host="$(uname -m)"
+          case "$host" in
+            x86_64) guest="aarch64" ;;
+            *) guest="x86_64" ;;
+          esac
+          echo "ZVMI_VM_CROSS_ARCH=$guest" >> "$GITHUB_ENV"
+          scripts/ci/fetch-vm-boot-kernel.sh \
+            "fixtures/vm-boot-kernel/$host" "$host" >> "$GITHUB_ENV"
+          scripts/ci/fetch-vm-boot-kernel.sh \
+            "fixtures/vm-boot-kernel/$guest" "$guest" ZVMI_VM_CROSS_ >> "$GITHUB_ENV"
 
       # Hardware acceleration is probed rather than required. No hosted runner
       # class is guaranteed to expose /dev/kvm, and a test that demands one is
@@ -81,14 +90,27 @@ jobs:
           ZVMI_RUN_VM_BOOT_TEST: "1"
         run: |
           set -euo pipefail
-          # The emulator is taken from the extracted tree rather than the shim
-          # on PATH, because QEMU locates its ROMs relative to its own binary
-          # and an x86 direct-kernel boot still needs the BIOS ROM.
-          name="qemu-system-$(uname -m)"
-          emulator="$(find "${GHR_TOOL_DIR}/cataggar/qemu" -type f -name "$name" \
-            -perm -u+x 2>/dev/null | head -n 1)"
-          if [ -z "$emulator" ]; then
-            emulator="$(command -v "$name")"
-          fi
-          ZVMI_VM_QEMU="$(readlink -f "$emulator")" \
+          # `readlink -f` resolves the ghr shim to the binary inside the
+          # extracted tree, which is what QEMU needs: it locates its ROMs
+          # relative to its own path, and an x86 direct-kernel boot still
+          # loads a BIOS ROM.
+          ZVMI_VM_QEMU="$(readlink -f "$(command -v "qemu-system-$(uname -m)")")" \
+            zig build test-vm-real-boot --summary all
+
+      # The same emulator package supplies every guest architecture, so the
+      # cross-architecture run differs only in which one is asked for. This is
+      # the acceptance criterion the backend exists for.
+      - name: cross-architecture VM boot
+        env:
+          ZVMI_RUN_VM_BOOT_TEST: "1"
+        run: |
+          set -euo pipefail
+          export ZVMI_VM_BOOT_ARCH="${ZVMI_VM_CROSS_ARCH}"
+          export ZVMI_VM_BOOT_KERNEL="${ZVMI_VM_CROSS_KERNEL}"
+          export ZVMI_VM_BOOT_MODULES_BUILTIN="${ZVMI_VM_CROSS_MODULES_BUILTIN}"
+          # KVM cannot cross architectures, so this run is emulated whatever
+          # the host happens to offer.
+          export ZVMI_VM_ACCEL=software
+          ZVMI_VM_QEMU="$(readlink -f \
+            "$(command -v "qemu-system-${ZVMI_VM_CROSS_ARCH}")")" \
             zig build test-vm-real-boot --summary all

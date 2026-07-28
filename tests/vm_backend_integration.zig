@@ -680,11 +680,13 @@ fn createSourceDisk(
         "lib/modules/" ++ kernel_release ++ "/modules.builtin",
         switch (transport) {
             .virtio_blk =>
+            \\kernel/fs/ext4/ext4.ko
             \\kernel/drivers/block/virtio_blk.ko
             \\kernel/drivers/net/virtio_net.ko
             \\
             ,
             .virtio_scsi =>
+            \\kernel/fs/ext4/ext4.ko
             \\kernel/drivers/scsi/virtio_scsi.ko
             \\kernel/drivers/net/virtio_net.ko
             \\

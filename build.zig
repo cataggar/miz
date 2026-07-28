@@ -621,14 +621,27 @@ pub fn build(b: *std.Build) void {
             b.fmt("zvmi_guest_agent_{s}", .{@tagName(architecture)}),
             .{ .root_source_file = zvmiguest_exe.getEmittedBin() },
         );
-        // The real-boot test only ever boots its own architecture, so it takes
-        // the matching agent under an unqualified name.
-        if (architecture == b.graph.host.result.cpu.arch) {
-            vm_real_boot_exe.root_module.addAnonymousImport(
-                "zvmi_guest_agent",
-                .{ .root_source_file = zvmiguest_exe.getEmittedBin() },
-            );
-        }
+        vm_real_boot_exe.root_module.addAnonymousImport(
+            b.fmt("zvmi_guest_agent_{s}", .{@tagName(architecture)}),
+            .{ .root_source_file = zvmiguest_exe.getEmittedBin() },
+        );
+
+        // The stand-in for `rpm` runs inside the guest, so it is built for the
+        // guest's architecture rather than re-entered from the test binary,
+        // which a cross-architecture guest could not execute.
+        const guest_stub_exe = b.addExecutable(.{
+            .name = b.fmt("zvmi-vm-guest-stub-{s}", .{@tagName(architecture)}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/vm_guest_stub.zig"),
+                .target = guest_target,
+                .optimize = .ReleaseSmall,
+            }),
+            .linkage = .static,
+        });
+        vm_real_boot_exe.root_module.addAnonymousImport(
+            b.fmt("vm_guest_stub_{s}", .{@tagName(architecture)}),
+            .{ .root_source_file = guest_stub_exe.getEmittedBin() },
+        );
     }
 
     const zvmiguest_tests = b.addTest(.{

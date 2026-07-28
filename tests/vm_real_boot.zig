@@ -13,9 +13,15 @@
 //!   ZVMI_VM_BOOT_MODULES_BUILTIN=/path/to/modules.builtin
 //!   ZVMI_VM_QEMU=/path/to/qemu-system-<arch>
 //!   ZVMI_VM_ACCEL=software|hardware        (default: software)
+//!   ZVMI_VM_BOOT_ARCH=x86_64|aarch64       (default: the host's)
+//!   ZVMI_VM_BOOT_WORKDIR=/path             (default: /tmp)
 //!
 //! `modules.builtin` comes from the same kernel package and is what decides
 //! how the guest's disks are attached, so it is required rather than inferred.
+//!
+//! Naming an architecture the host does not have makes this the
+//! cross-architecture acceptance test: the kernel, the agent and the binary the
+//! guest executes are all the guest's, and only the emulator is the host's.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,7 +30,16 @@ const zvmi = @import("zvmi");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-const guest_agent = @embedFile("zvmi_guest_agent");
+const guest_stub = @import("vm_guest_stub.zig");
+
+const guest_agents = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "x86_64", @embedFile("zvmi_guest_agent_x86_64") },
+    .{ "aarch64", @embedFile("zvmi_guest_agent_aarch64") },
+});
+const guest_stubs = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "x86_64", @embedFile("vm_guest_stub_x86_64") },
+    .{ "aarch64", @embedFile("vm_guest_stub_aarch64") },
+});
 
 const disk_size: u64 = 512 * 1024 * 1024;
 const partition_first_lba: u32 = 2048;
@@ -35,23 +50,19 @@ const partition_length = @as(u64, partition_sectors) * zvmi.mbr.sector_size;
 /// Written by the `rpm` stub from inside the guest's chroot. Its presence in
 /// the published image is the proof that matters: the guest booted, found the
 /// root filesystem, mounted it writable, and executed a binary out of it.
-const marker_path = "/var/lib/zvmi-vm/booted";
-const marker_bytes = "guest reached the target root\n";
-const installed_nevra = "vm-boot-package-0:1.0-1.noarch";
+const marker_path = guest_stub.marker_path;
+const marker_bytes = guest_stub.marker_bytes;
+const installed_nevra = guest_stub.installed_nevra;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
-    const argv = try init.minimal.args.toSlice(allocator);
-    if (std.mem.eql(u8, std.fs.path.basename(argv[0]), "rpm")) {
-        return runGuestRpm(init.io, argv[1..]);
-    }
     if (builtin.os.tag != .linux) {
         std.debug.print("skipping vm real boot: Linux is required\n", .{});
         return;
     }
 
     const settings = Settings.fromEnvironment(init.environ_map) orelse return;
-    try runBoot(allocator, init.io, argv[0], settings);
+    try runBoot(allocator, init.io, settings);
 }
 
 const Settings = struct {
@@ -59,7 +70,10 @@ const Settings = struct {
     modules_builtin_path: []const u8,
     emulator_path: []const u8,
     acceleration: zvmi.customize.VmAcceleration,
+    /// The guest's architecture: what the image is, what the kernel is, and
+    /// what the emulator has to emulate.
     architecture: zvmi.customize.Architecture,
+    host_architecture: zvmi.customize.Architecture,
     work_root: []const u8,
 
     fn fromEnvironment(environment: *std.process.Environ.Map) ?Settings {
@@ -71,13 +85,21 @@ const Settings = struct {
             );
             return null;
         }
-        const architecture: zvmi.customize.Architecture = switch (builtin.cpu.arch) {
+        const host_architecture: zvmi.customize.Architecture = switch (builtin.cpu.arch) {
             .x86_64 => .x86_64,
             .aarch64 => .aarch64,
             else => {
-                std.debug.print("skipping vm real boot: unsupported architecture\n", .{});
+                std.debug.print("skipping vm real boot: unsupported host architecture\n", .{});
                 return null;
             },
+        };
+        const named = environment.get("ZVMI_VM_BOOT_ARCH") orelse @tagName(host_architecture);
+        const architecture = std.meta.stringToEnum(
+            zvmi.customize.Architecture,
+            named,
+        ) orelse {
+            std.debug.print("skipping vm real boot: unknown ZVMI_VM_BOOT_ARCH {s}\n", .{named});
+            return null;
         };
         return .{
             .kernel_path = environment.get("ZVMI_VM_BOOT_KERNEL") orelse {
@@ -104,6 +126,7 @@ const Settings = struct {
                 "hardware",
             )) .hardware else .software,
             .architecture = architecture,
+            .host_architecture = host_architecture,
             // A boot needs room for two copies of the image, and the default
             // temporary directory is frequently a small tmpfs, so where the
             // workspace lands has to be the caller's decision.
@@ -115,7 +138,6 @@ const Settings = struct {
 fn runBoot(
     allocator: Allocator,
     io: Io,
-    self_exe: []const u8,
     settings: Settings,
 ) !void {
     var random: [8]u8 = undefined;
@@ -140,7 +162,6 @@ fn runBoot(
     const release = try createSourceDisk(
         allocator,
         io,
-        self_exe,
         settings,
         source_path,
         spool_path,
@@ -170,13 +191,24 @@ fn runBoot(
                 .boot_timeout_seconds = 600,
             },
         },
+        // A guest that is not the host's architecture has to be declared as
+        // such: the runner is named explicitly so nothing about which emulator
+        // ran can be inferred after the fact.
+        .cross_architecture = if (settings.architecture == settings.host_architecture)
+            .reject
+        else
+            .{ .runner = .{
+                .kind = .vm,
+                .guest_architecture = settings.architecture,
+                .command = settings.emulator_path,
+            } },
         .reproducibility = .{
             .seed = .{ .bytes = [_]u8{0x57} ** 32 },
             .source_date_epoch = 1_735_689_600,
         },
     };
     var resolved = try zvmi.customize.resolve(allocator, &request, .{
-        .host_architecture = settings.architecture,
+        .host_architecture = settings.host_architecture,
     });
     defer resolved.deinit(allocator);
     const plan = &(resolved.plan orelse return error.ResolutionProducedNoPlan);
@@ -262,7 +294,9 @@ fn runVm(
         .plan = plan,
         .transaction_path = plan.data.transaction_path,
         .target = target,
-        .agent = guest_agent,
+        .agent = guest_agents.get(
+            @tagName(plan.data.architectures.runner),
+        ) orelse return error.VmGuestAgentUnavailable,
         .console = .{ .writeFn = writeConsole },
     });
 }
@@ -271,30 +305,11 @@ fn writeConsole(_: ?*anyopaque, bytes: []const u8) void {
     std.debug.print("{s}", .{bytes});
 }
 
-/// Runs inside the guest, under the agent's chroot, as `/usr/bin/rpm`.
-fn runGuestRpm(io: Io, args: []const []const u8) !void {
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--version")) {
-            std.debug.print("RPM version vm-boot-1\n", .{});
-            return;
-        }
-    }
-    Io.Dir.cwd().createDir(io, "/var/lib/zvmi-vm", .default_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    const file = try Io.Dir.cwd().createFile(io, marker_path, .{});
-    defer file.close(io);
-    try file.writePositionalAll(io, marker_bytes, 0);
-    std.debug.print("{s}\n", .{installed_nevra});
-}
-
 /// Builds a root filesystem the agent will accept, carrying the caller's
 /// kernel and that kernel's own built-in driver list.
 fn createSourceDisk(
     allocator: Allocator,
     io: Io,
-    self_exe: []const u8,
     settings: Settings,
     source_path: []const u8,
     spool_path: []const u8,
@@ -311,12 +326,6 @@ fn createSourceDisk(
         settings.modules_builtin_path,
         allocator,
         .limited(4 * 1024 * 1024),
-    );
-    const executable = try cwd.readFileAlloc(
-        io,
-        self_exe,
-        allocator,
-        .limited(128 * 1024 * 1024),
     );
     const release = releaseFromKernelPath(settings.kernel_path) orelse
         return error.KernelPathDoesNotNameARelease;
@@ -361,7 +370,11 @@ fn createSourceDisk(
         cpio_trailer,
         .{ .mode = 0o600 },
     );
-    try tree.putFileBytes("usr/bin/rpm", executable, .{ .mode = 0o755 });
+    try tree.putFileBytes(
+        "usr/bin/rpm",
+        guest_stubs.get(@tagName(settings.architecture)).?,
+        .{ .mode = 0o755 },
+    );
     _ = try zvmi.ext4.populate(io, image.file, allocator, try tree.ext4View(), .{
         .offset = partition_offset,
         .length = partition_length,

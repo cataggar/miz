@@ -12,29 +12,35 @@
 # The version is pinned rather than resolved from repodata. A kernel that
 # disappears should fail this step loudly, not silently change what CI proves.
 #
-# Usage: fetch-vm-boot-kernel.sh <destination-directory>
+# Usage: fetch-vm-boot-kernel.sh <destination-directory> [architecture] [prefix]
+#
+# The architecture defaults to the host's; naming the other one is how the
+# cross-architecture boot gets a kernel it can only run under emulation.
 #
 # Prints two lines on success:
-#   ZVMI_VM_BOOT_KERNEL=<path>
-#   ZVMI_VM_BOOT_MODULES_BUILTIN=<path>
-# which can be appended straight to "$GITHUB_ENV".
+#   <prefix>KERNEL=<path>
+#   <prefix>MODULES_BUILTIN=<path>
+# which can be appended straight to "$GITHUB_ENV". The prefix defaults to
+# `ZVMI_VM_BOOT_`.
 
 set -euo pipefail
 
 kernel_version="6.6.139.1-1.azl3"
 base_url="https://packages.microsoft.com/azurelinux/3.0/prod/base"
 
-if [ "$#" -ne 1 ]; then
-    echo "usage: $0 <destination-directory>" >&2
+if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then
+    echo "usage: $0 <destination-directory> [architecture] [prefix]" >&2
     exit 2
 fi
 destination="$1"
+requested_architecture="${2:-$(uname -m)}"
+prefix="${3:-ZVMI_VM_BOOT_}"
 
-case "$(uname -m)" in
-    x86_64) rpm_architecture="x86_64" ;;
+case "$requested_architecture" in
+    x86_64 | amd64) rpm_architecture="x86_64" ;;
     aarch64 | arm64) rpm_architecture="aarch64" ;;
     *)
-        echo "fetch-vm-boot-kernel: unsupported host architecture $(uname -m)" >&2
+        echo "fetch-vm-boot-kernel: unsupported architecture ${requested_architecture}" >&2
         exit 1
         ;;
 esac
@@ -76,5 +82,5 @@ for required in "$kernel_path" "$modules_builtin_path"; do
     fi
 done
 
-echo "ZVMI_VM_BOOT_KERNEL=$(readlink -f "$kernel_path")"
-echo "ZVMI_VM_BOOT_MODULES_BUILTIN=$(readlink -f "$modules_builtin_path")"
+echo "${prefix}KERNEL=$(readlink -f "$kernel_path")"
+echo "${prefix}MODULES_BUILTIN=$(readlink -f "$modules_builtin_path")"
