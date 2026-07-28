@@ -541,6 +541,59 @@ pub fn build(b: *std.Build) void {
     const zvminit_test_step = b.step("test-zvminit", "Run zvminit tests");
     zvminit_test_step.dependOn(&run_zvminit_tests.step);
 
+    // ---- zvmiguest: the static, libc-free PID 1 that the vm customization
+    // backend appends to the target image's own initramfs. It is built for
+    // every architecture the backend can drive a guest at, not just the host's,
+    // because cross-architecture customization is the point. ----
+    const guest_architectures = [_]std.Target.Cpu.Arch{ .x86_64, .aarch64 };
+    const zvmiguest_step = b.step(
+        "zvmiguest",
+        "Build the in-VM guest agent for every supported guest architecture",
+    );
+    for (guest_architectures) |architecture| {
+        const guest_target = b.resolveTargetQuery(.{
+            .cpu_arch = architecture,
+            .os_tag = .linux,
+        });
+        const guest_control_mod = b.createModule(.{
+            .root_source_file = b.path("packages/zvmi/src/vm_control.zig"),
+            .target = guest_target,
+            .optimize = .ReleaseSmall,
+        });
+        const zvmiguest_exe = b.addExecutable(.{
+            .name = b.fmt("zvmi-guest-agent-{s}", .{@tagName(architecture)}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("zvmiguest/main.zig"),
+                .target = guest_target,
+                .optimize = .ReleaseSmall,
+                .imports = &.{
+                    .{ .name = "vm_control", .module = guest_control_mod },
+                },
+            }),
+            .linkage = .static,
+        });
+        b.installArtifact(zvmiguest_exe);
+        zvmiguest_step.dependOn(&zvmiguest_exe.step);
+    }
+
+    const zvmiguest_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zvmiguest/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vm_control", .module = b.createModule(.{
+                    .root_source_file = b.path("packages/zvmi/src/vm_control.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }) },
+            },
+        }),
+    });
+    const run_zvmiguest_tests = b.addRunArtifact(zvmiguest_tests);
+    const zvmiguest_test_step = b.step("test-zvmiguest", "Run guest agent tests");
+    zvmiguest_test_step.dependOn(&run_zvmiguest_tests.step);
+
     const test_step = b.step("test", "Run all tests");
 
     const build_api_tests = b.addTest(.{
@@ -827,6 +880,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_qcow2_mod_tests.step);
     test_step.dependOn(&run_qcow2_exe_tests.step);
     test_step.dependOn(&run_zvminit_tests.step);
+    test_step.dependOn(&run_zvmiguest_tests.step);
+    test_step.dependOn(zvmiguest_step);
     test_step.dependOn(&run_build_api_tests.step);
     test_step.dependOn(&build_api_consumer_check.step);
     test_step.dependOn(&build_api_diagnostics_check.step);

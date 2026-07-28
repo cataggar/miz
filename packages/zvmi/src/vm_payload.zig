@@ -41,7 +41,7 @@ pub const Error = error{
 /// A file appended to the extracted initramfs. `path` is a cpio member name and
 /// so carries no leading slash; a top-level name keeps `rdinit=/<path>` valid
 /// without needing any directory members.
-pub const AgentMember = struct {
+pub const Member = struct {
     path: []const u8,
     bytes: []const u8,
     mode: u32 = 0o100755,
@@ -94,7 +94,11 @@ pub const Options = struct {
     raw_path: []const u8,
     /// Root partition geometry, already resolved by the transaction.
     root_partition_offset: u64,
-    agent: AgentMember,
+    /// Files appended to the initramfs: the guest agent and its control
+    /// document. Appending the control document here rather than putting it on
+    /// a second disk means the guest needs no filesystem driver to read its
+    /// instructions.
+    members: []const Member,
     /// Selects among several installed kernels. Extraction fails rather than
     /// guessing when more than one is present and no release is named.
     kernel_release: ?[]const u8 = null,
@@ -142,7 +146,7 @@ fn extractFromBootDirectory(allocator: Allocator, io: Io, options: Options) !?Pa
     defer allocator.free(original_initrd);
     if (original_initrd.len > options.max_initrd_bytes) return error.BootPayloadTooLarge;
 
-    const initrd = try appendAgent(allocator, original_initrd, options.agent);
+    const initrd = try appendMembers(allocator, original_initrd, options.members);
     errdefer allocator.free(initrd);
 
     const release = if (selected.release) |value|
@@ -200,7 +204,7 @@ fn extractFromUnifiedKernel(allocator: Allocator, io: Io, options: Options) !?Pa
 
     const kernel = try allocator.dupe(u8, linux_section.contents);
     errdefer allocator.free(kernel);
-    const initrd = try appendAgent(allocator, initrd_section.contents, options.agent);
+    const initrd = try appendMembers(allocator, initrd_section.contents, options.members);
     errdefer allocator.free(initrd);
 
     const release = if (inspection.findSection(".uname")) |uname|
@@ -310,36 +314,36 @@ fn selectInitrd(entries: []const ext4.DirEntry, release: ?[]const u8) ?[]const u
     return fallback;
 }
 
-/// Appends a single-member uncompressed cpio archive to `initrd`.
+/// Appends an uncompressed cpio archive of `members` to `initrd`.
 ///
 /// The kernel unpacks concatenated initramfs segments in order, sniffing each
 /// segment's compression independently, and later members replace earlier ones.
 /// So this neither needs to decompress the image's initramfs nor risks losing
 /// to a file the image already ships at the same path.
-pub fn appendAgent(
+pub fn appendMembers(
     allocator: Allocator,
     initrd: []const u8,
-    agent: AgentMember,
+    members: []const Member,
 ) ![]u8 {
     var out: std.array_list.Managed(u8) = .init(allocator);
     errdefer out.deinit();
     try out.appendSlice(initrd);
-    try writeCpioMember(&out, agent);
+    for (members) |member| try writeCpioMember(&out, member);
     try writeCpioTrailer(&out);
     return out.toOwnedSlice();
 }
 
 const cpio_header_size = 110;
 
-fn writeCpioMember(out: *std.array_list.Managed(u8), agent: AgentMember) !void {
+fn writeCpioMember(out: *std.array_list.Managed(u8), member: Member) !void {
     try writeCpioHeader(out, .{
-        .name = agent.path,
-        .mode = agent.mode,
-        .size = agent.bytes.len,
-        .mtime = agent.mtime,
+        .name = member.path,
+        .mode = member.mode,
+        .size = member.bytes.len,
+        .mtime = member.mtime,
         .nlink = 1,
     });
-    try out.appendSlice(agent.bytes);
+    try out.appendSlice(member.bytes);
     try padTo4(out);
 }
 
@@ -403,9 +407,9 @@ test "the appended agent is a readable cpio member after an existing archive" {
     try writeCpioMember(&original, .{ .path = "init", .bytes = "original-init" });
     try writeCpioTrailer(&original);
 
-    const combined = try appendAgent(allocator, original.items, .{
-        .path = "zvmi-guest-agent",
-        .bytes = "agent-program",
+    const combined = try appendMembers(allocator, original.items, &.{
+        .{ .path = "zvmi-guest-agent", .bytes = "agent-program" },
+        .{ .path = "zvmi-control.json", .bytes = "{}", .mode = 0o100600 },
     });
     defer allocator.free(combined);
 
@@ -419,11 +423,16 @@ test "the appended agent is a readable cpio member after an existing archive" {
             try std.testing.expectEqualStrings("agent-program", entry.content);
             try std.testing.expectEqual(@as(u64, "agent-program".len), entry.size);
         }
+        if (std.mem.eql(u8, entry.path, "zvmi-control.json")) {
+            try std.testing.expectEqualStrings("{}", entry.content);
+        }
     }
-    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(@as(usize, 3), count);
     try std.testing.expectEqualStrings("init", names[0]);
-    // The agent comes last, so it replaces any same-named file the image ships.
+    // The appended members come last, so they replace any same-named file the
+    // image already ships.
     try std.testing.expectEqualStrings("zvmi-guest-agent", names[1]);
+    try std.testing.expectEqualStrings("zvmi-control.json", names[2]);
 }
 
 test "appending an agent leaves the original initramfs bytes untouched" {
@@ -433,9 +442,8 @@ test "appending an agent leaves the original initramfs bytes untouched" {
     try writeCpioMember(&original, .{ .path = "init", .bytes = "original-init" });
     try writeCpioTrailer(&original);
 
-    const combined = try appendAgent(allocator, original.items, .{
-        .path = "zvmi-guest-agent",
-        .bytes = "agent",
+    const combined = try appendMembers(allocator, original.items, &.{
+        .{ .path = "zvmi-guest-agent", .bytes = "agent" },
     });
     defer allocator.free(combined);
     try std.testing.expectEqualSlices(u8, original.items, combined[0..original.items.len]);
@@ -443,10 +451,10 @@ test "appending an agent leaves the original initramfs bytes untouched" {
 
 test "an identical agent produces an identical archive" {
     const allocator = std.testing.allocator;
-    const agent = AgentMember{ .path = "zvmi-guest-agent", .bytes = "agent" };
-    const first = try appendAgent(allocator, "", agent);
+    const members = [_]Member{.{ .path = "zvmi-guest-agent", .bytes = "agent" }};
+    const first = try appendMembers(allocator, "", &members);
     defer allocator.free(first);
-    const second = try appendAgent(allocator, "", agent);
+    const second = try appendMembers(allocator, "", &members);
     defer allocator.free(second);
     try std.testing.expectEqualSlices(u8, first, second);
 }
@@ -539,7 +547,7 @@ test "a kernel and initramfs are extracted from a real ext4 boot directory" {
     var payload = try extract(allocator, io, .{
         .raw_path = path,
         .root_partition_offset = partition_offset,
-        .agent = .{ .path = "zvmi-guest-agent", .bytes = "agent-program" },
+        .members = &.{.{ .path = "zvmi-guest-agent", .bytes = "agent-program" }},
     });
     defer payload.deinit(allocator);
 
@@ -594,7 +602,7 @@ test "extraction fails rather than booting an image with no kernel" {
     try std.testing.expectError(error.BootPayloadNotFound, extract(allocator, io, .{
         .raw_path = path,
         .root_partition_offset = 0,
-        .agent = .{ .path = "zvmi-guest-agent", .bytes = "agent" },
+        .members = &.{.{ .path = "zvmi-guest-agent", .bytes = "agent" }},
     }));
 }
 
@@ -659,7 +667,7 @@ test "a unified kernel image on the ESP is used when the root has no kernel" {
     var payload = try extract(allocator, io, .{
         .raw_path = path,
         .root_partition_offset = 0,
-        .agent = .{ .path = "zvmi-guest-agent", .bytes = "agent-program" },
+        .members = &.{.{ .path = "zvmi-guest-agent", .bytes = "agent-program" }},
     });
     defer payload.deinit(allocator);
 
