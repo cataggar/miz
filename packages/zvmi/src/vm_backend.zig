@@ -28,6 +28,15 @@ pub fn available(io: Io, plan: *const customize.ResolvedPlan) customize.Capabili
 
     if (!emulatorExecutable(io, policy.emulator_command)) return .missing;
 
+    switch (policy.boot) {
+        .direct_kernel => {},
+        // Firmware boot is part of the policy surface so the configuration is
+        // stable, but no backend brings a guest up through firmware yet.
+        // Falling back to a direct-kernel boot would silently bypass the boot
+        // chain the caller asked to exercise.
+        .firmware => return .unsupported,
+    }
+
     switch (policy.acceleration) {
         .hardware => {
             if (data.architectures.runner != data.architectures.host) return .unsupported;

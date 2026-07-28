@@ -216,10 +216,31 @@ pub const VmNetworkPolicy = enum {
     declared_repositories,
 };
 
+/// UEFI firmware for a guest that boots the way real hardware would.
+pub const VmFirmware = struct {
+    /// Read-only firmware code for the runner architecture.
+    code_path: []const u8,
+    /// Template variable store. The backend works on a copy, so the file named
+    /// here is never modified.
+    vars_path: []const u8,
+};
+
+/// How the guest is brought up.
+pub const VmBoot = union(enum) {
+    /// Boot the image's own kernel and initramfs directly, with the guest
+    /// agent appended to the initramfs. No firmware, bootloader, or init
+    /// system stands between the emulator and the agent, which is what keeps
+    /// software emulation affordable and boot failures attributable.
+    direct_kernel,
+    /// Boot through UEFI firmware, exercising the image's own boot chain.
+    firmware: VmFirmware,
+};
+
 pub const VmPolicy = struct {
     /// The `qemu-system-<arch>` binary for the runner architecture. Never
     /// inferred from the host architecture.
     emulator_command: []const u8,
+    boot: VmBoot = .direct_kernel,
     acceleration: VmAcceleration = .hardware,
     /// Acknowledges software emulation for a same-architecture run, where
     /// hardware acceleration would otherwise be expected.
@@ -1155,6 +1176,33 @@ fn validateVmPolicy(
             "the emulator command must be an absolute path",
             "resolve the qemu-system binary against PATH before building the request",
         ));
+    }
+    switch (policy.boot) {
+        .direct_kernel => {},
+        .firmware => |firmware| {
+            // Firmware paths follow the same rule as the emulator: named
+            // exactly, so provenance records the files that were actually used.
+            if (firmware.code_path.len == 0 or
+                !std.fs.path.isAbsolute(firmware.code_path))
+            {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/execution/vm/boot/firmware/code_path",
+                    "firmware boot requires an absolute firmware code path",
+                    "name the firmware code file for the runner architecture",
+                ));
+            }
+            if (firmware.vars_path.len == 0 or
+                !std.fs.path.isAbsolute(firmware.vars_path))
+            {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/execution/vm/boot/firmware/vars_path",
+                    "firmware boot requires an absolute firmware variable store path",
+                    "name the firmware variable template for the runner architecture",
+                ));
+            }
+        },
     }
     if (policy.memory_mib < min_vm_memory_mib or policy.memory_mib > max_vm_memory_mib) {
         try diagnostics.append(validationError(
@@ -2475,6 +2523,13 @@ fn dupeVmPolicy(
     const present = policy orelse return null;
     return .{
         .emulator_command = try allocator.dupe(u8, present.emulator_command),
+        .boot = switch (present.boot) {
+            .direct_kernel => .direct_kernel,
+            .firmware => |firmware| .{ .firmware = .{
+                .code_path = try allocator.dupe(u8, firmware.code_path),
+                .vars_path = try allocator.dupe(u8, firmware.vars_path),
+            } },
+        },
         .acceleration = present.acceleration,
         .acknowledge_software_emulation = present.acknowledge_software_emulation,
         .memory_mib = present.memory_mib,
@@ -3136,6 +3191,14 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     if (plan.execution.vm) |vm| {
         hash.update(&.{1});
         hashString(&hash, vm.emulator_command);
+        hashInt(&hash, @intFromEnum(std.meta.activeTag(vm.boot)));
+        switch (vm.boot) {
+            .direct_kernel => {},
+            .firmware => |firmware| {
+                hashString(&hash, firmware.code_path);
+                hashString(&hash, firmware.vars_path);
+            },
+        }
         hashInt(&hash, @intFromEnum(vm.acceleration));
         hashBool(&hash, vm.acknowledge_software_emulation);
         hashInt(&hash, vm.memory_mib);
@@ -5978,6 +6041,22 @@ test "the vm backend requires an explicit and self-consistent VM policy" {
             policy.boot_timeout_seconds = max_vm_boot_timeout_seconds + 1;
             break :blk policy;
         } },
+        .{ .name = "firmware without a code path", .policy = blk: {
+            var policy = validVmPolicy();
+            policy.boot = .{ .firmware = .{
+                .code_path = "",
+                .vars_path = "/usr/share/OVMF/OVMF_VARS.fd",
+            } };
+            break :blk policy;
+        } },
+        .{ .name = "relative firmware vars path", .policy = blk: {
+            var policy = validVmPolicy();
+            policy.boot = .{ .firmware = .{
+                .code_path = "/usr/share/OVMF/OVMF_CODE.fd",
+                .vars_path = "OVMF_VARS.fd",
+            } };
+            break :blk policy;
+        } },
         .{ .name = "empty machine override", .policy = blk: {
             var policy = validVmPolicy();
             policy.machine = "";
@@ -6021,6 +6100,26 @@ test "the vm backend requires an explicit and self-consistent VM policy" {
     var accepted = try validate(std.testing.allocator, &request);
     defer accepted.deinit(std.testing.allocator);
     try std.testing.expect(!accepted.hasErrors());
+}
+
+test "firmware boot is a valid policy that no backend implements yet" {
+    var request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    request.execution.backend = .vm;
+    var policy = validVmPolicy();
+    policy.boot = .{ .firmware = .{
+        .code_path = "/usr/share/OVMF/OVMF_CODE.fd",
+        .vars_path = "/usr/share/OVMF/OVMF_VARS.fd",
+    } };
+    request.execution.vm = policy;
+
+    var diagnostics = try validate(std.testing.allocator, &request);
+    defer diagnostics.deinit(std.testing.allocator);
+    try std.testing.expect(!diagnostics.hasErrors());
+
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.plan != null);
+    try std.testing.expect(resolved.plan.?.data.execution.vm.?.boot == .firmware);
 }
 
 test "vm acceleration is resolved against the runner architecture" {
