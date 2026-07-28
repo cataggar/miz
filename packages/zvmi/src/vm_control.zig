@@ -35,6 +35,10 @@ pub const max_result_bytes: usize = 4 * 1024 * 1024;
 /// Size of the result block device. Sized well above `max_result_bytes` so a
 /// result is never truncated by the transport.
 pub const result_device_bytes: u64 = 16 * 1024 * 1024;
+/// Ceiling on how many modules a control document may ask the guest to insert.
+/// Well above any real driver closure, so it bounds a malformed document
+/// rather than a real run.
+pub const max_modules: usize = 64;
 
 pub const Error = error{
     UnsupportedVersion,
@@ -57,6 +61,8 @@ pub const Error = error{
     ResultTooLarge,
     InvalidToolRecord,
     InvalidFailureRecord,
+    InvalidModuleMember,
+    TooManyModules,
 };
 
 pub const Network = union(enum) {
@@ -156,11 +162,23 @@ pub const Control = struct {
     actions: []const Action = &.{},
     /// Kernel releases whose initramfs is regenerated. Empty leaves it alone.
     initramfs_kernels: []const []const u8 = &.{},
+    /// Initramfs members holding kernel modules the guest inserts, in
+    /// insertion order, before it waits for any device.
+    ///
+    /// Named here rather than discovered by the agent so the host's dependency
+    /// order is what the guest obeys, and so the set folds into the control
+    /// document's digest like every other instruction.
+    modules: []const []const u8 = &.{},
 
     pub fn validate(self: Control) Error!void {
         if (self.version != control_version) return error.UnsupportedVersion;
         try validateDevicePath(self.root_device);
         try validateDevicePath(self.result_device);
+
+        if (self.modules.len > max_modules) return error.TooManyModules;
+        for (self.modules) |member| {
+            if (!validModuleMember(member)) return error.InvalidModuleMember;
+        }
 
         for (self.repositories, 0..) |repository, index| {
             if (!validRepositoryId(repository.id)) return error.InvalidRepositoryId;
@@ -311,6 +329,20 @@ pub fn validKernelRelease(kernel: []const u8) bool {
     return true;
 }
 
+/// A module member is a path the guest opens in its own rootfs and a name the
+/// host chose, so it is confined to a top-level `.ko` file: no directory to
+/// traverse out of, nothing the cpio unpacker would have had to create, and
+/// nothing that could name a file the agent did not put there.
+pub fn validModuleMember(member: []const u8) bool {
+    if (member.len <= ".ko".len or member.len > 128) return false;
+    if (!std.mem.endsWith(u8, member, ".ko")) return false;
+    if (!std.ascii.isAlphanumeric(member[0])) return false;
+    for (member[1 .. member.len - ".ko".len]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return false;
+    }
+    return true;
+}
+
 fn validRepositoryUrl(url: []const u8) bool {
     if (url.len == 0 or url.len > 2048) return false;
     // The url is written into a repository file whose grammar is line-based
@@ -403,6 +435,7 @@ test "a control document round-trips and is validated on the way back in" {
         }},
         .actions = &.{.{ .install = &.{"strace"} }},
         .initramfs_kernels = &.{"6.12.0-1.azl"},
+        .modules = &.{ "zvmi-module-00-virtio_pci.ko", "zvmi-module-01-ext4.ko" },
     };
     try control.validate();
 
@@ -418,6 +451,25 @@ test "a control document round-trips and is validated on the way back in" {
     );
     try std.testing.expectEqualStrings("strace", parsed.value.actions[0].install[0]);
     try std.testing.expectEqualStrings("6.12.0-1.azl", parsed.value.initramfs_kernels[0]);
+    // Insertion order is an instruction, not a set, so it survives the trip.
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.modules.len);
+    try std.testing.expectEqualStrings("zvmi-module-00-virtio_pci.ko", parsed.value.modules[0]);
+    try std.testing.expectEqualStrings("zvmi-module-01-ext4.ko", parsed.value.modules[1]);
+}
+
+test "a document with no modules is the document this backend has always sent" {
+    const allocator = std.testing.allocator;
+    const control = Control{
+        .root_device = "/dev/vda2",
+        .result_device = "/dev/vdb",
+        .network = .offline,
+    };
+    const json = try std.json.Stringify.valueAlloc(allocator, control, .{});
+    defer allocator.free(json);
+
+    const parsed = try parseControl(allocator, json);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.modules.len);
 }
 
 test "a control document the guest could be driven by is rejected" {
@@ -459,6 +511,33 @@ test "a control document the guest could be driven by is rejected" {
                 .urls = &.{"https://example.invalid/base"},
                 .trust_base64 = &.{"a2V5"},
             }};
+            break :blk control;
+        } },
+        // A module member is a path the guest opens as PID 1, so a name that
+        // could reach outside the initramfs is refused on both sides.
+        .{ .expected = error.InvalidModuleMember, .control = blk: {
+            var control = base;
+            control.modules = &.{"../lib/modules/evil.ko"};
+            break :blk control;
+        } },
+        .{ .expected = error.InvalidModuleMember, .control = blk: {
+            var control = base;
+            control.modules = &.{"subdir/ext4.ko"};
+            break :blk control;
+        } },
+        .{ .expected = error.InvalidModuleMember, .control = blk: {
+            var control = base;
+            control.modules = &.{"zvmi-module-00-ext4.ko.xz"};
+            break :blk control;
+        } },
+        .{ .expected = error.InvalidModuleMember, .control = blk: {
+            var control = base;
+            control.modules = &.{".ko"};
+            break :blk control;
+        } },
+        .{ .expected = error.TooManyModules, .control = blk: {
+            var control = base;
+            control.modules = &([_][]const u8{"zvmi-module-00-ext4.ko"} ** (max_modules + 1));
             break :blk control;
         } },
         .{ .expected = error.DuplicateRepositoryId, .control = blk: {

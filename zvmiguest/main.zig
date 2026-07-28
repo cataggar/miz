@@ -104,6 +104,13 @@ const Session = struct {
         const control = parsed.value;
         self.result_device = control.result_device;
 
+        // Before the network and before any device is waited for: a driver
+        // that is not in the kernel yet is a device that will never appear,
+        // and waiting for it would turn a knowable failure into a timeout.
+        self.loadModules(control.modules) catch |err| {
+            return fail("load-modules", @errorName(err));
+        };
+
         switch (control.network) {
             .offline => {},
             .declared_repositories => |config| configureNetwork(self.allocator, config) catch {
@@ -144,6 +151,36 @@ const Session = struct {
             .detail = @errorName(err),
             .exit_code = self.last_exit_code,
         } };
+    }
+
+    /// Inserts the modules the control document names, in the order it names
+    /// them, which is the dependency order the host resolved out of the
+    /// image's own `modules.dep`.
+    ///
+    /// `finit_module` rather than `init_module` because the bytes are already
+    /// a file in rootfs: the kernel reads them itself instead of the agent
+    /// buffering a copy. They were decompressed on the host, so this needs no
+    /// decompressor and does not depend on the guest kernel having been built
+    /// with `CONFIG_MODULE_DECOMPRESS`.
+    fn loadModules(self: *Session, members: []const []const u8) !void {
+        for (members) |member| {
+            if (!control_mod.validModuleMember(member)) return error.InvalidModuleMember;
+            const path = try self.allocator.dupeZ(u8, member);
+            defer self.allocator.free(path);
+
+            const fd_rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+            if (linux.errno(fd_rc) != .SUCCESS) return error.ModuleMemberMissing;
+            const fd: i32 = @intCast(fd_rc);
+            defer _ = linux.close(fd);
+
+            const rc = linux.syscall3(.finit_module, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(""), 0);
+            switch (linux.errno(rc)) {
+                // Already in the kernel is the state this was asking for, and
+                // a kernel that built the driver in reports it this way.
+                .SUCCESS, .EXIST => {},
+                else => return error.ModuleInsertFailed,
+            }
+        }
     }
 
     fn mountTarget(self: *Session, device: []const u8) !void {
@@ -823,4 +860,24 @@ test "tool versions are reported as their first line only" {
     try std.testing.expectEqualStrings("tdnf 3.5.8", firstLine("tdnf 3.5.8\nlibsolv 0.7\n"));
     try std.testing.expectEqualStrings("dracut 059", firstLine("dracut 059"));
     try std.testing.expectEqualStrings("", firstLine(""));
+}
+
+test "a module member the agent will not open is refused before any syscall" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var session = Session{
+        .allocator = arena.allocator(),
+        .tools = .init(arena.allocator()),
+        .installed_packages = .init(arena.allocator()),
+    };
+
+    // The host validated this too, but a guest that trusts its control
+    // document is a guest that can be driven anywhere by whoever wrote it.
+    try std.testing.expectError(
+        error.InvalidModuleMember,
+        session.loadModules(&.{"/lib/modules/evil.ko"}),
+    );
+    // Nothing to insert is the case every image that builds its drivers in
+    // presents, and it must reach the mount unchanged.
+    try session.loadModules(&.{});
 }
