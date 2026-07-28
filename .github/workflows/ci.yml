@@ -24,6 +24,7 @@ jobs:
           ghr-version: 0.6.6
           tools: |
             cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/qemu@v11.0.91-z.15
 
       - name: zig fmt --check
         run: zig fmt --check .
@@ -44,3 +45,50 @@ jobs:
         env:
           ZVMI_RUN_PRIVILEGED_TEST: "1"
         run: zig build test-unsafe-chroot-integration --summary all
+
+      # The VM backend boots the image's own kernel with `rdinit=`, so the
+      # guest can only use drivers that kernel built in. Ubuntu modularizes
+      # ext4, which rules out the runner's own kernel; Azure Linux builds it
+      # in, and is what this project's images actually run.
+      - name: Cache VM boot kernel
+        id: cache-vm-kernel
+        uses: actions/cache@v4
+        with:
+          path: fixtures/vm-boot-kernel
+          key: vm-boot-kernel-6.6.139.1-1.azl3-${{ runner.arch }}
+
+      - name: Fetch VM boot kernel
+        run: |
+          if [ "${{ steps.cache-vm-kernel.outputs.cache-hit }}" != "true" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends rpm2cpio cpio
+          fi
+          scripts/ci/fetch-vm-boot-kernel.sh fixtures/vm-boot-kernel >> "$GITHUB_ENV"
+
+      # Hardware acceleration is probed rather than required. No hosted runner
+      # class is guaranteed to expose /dev/kvm, and a test that demands one is
+      # a test that stops running the moment that changes.
+      - name: Select QEMU accelerator
+        run: |
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "ZVMI_VM_ACCEL=hardware" >> "$GITHUB_ENV"
+          else
+            echo "ZVMI_VM_ACCEL=software" >> "$GITHUB_ENV"
+          fi
+
+      - name: real VM boot
+        env:
+          ZVMI_RUN_VM_BOOT_TEST: "1"
+        run: |
+          set -euo pipefail
+          # The emulator is taken from the extracted tree rather than the shim
+          # on PATH, because QEMU locates its ROMs relative to its own binary
+          # and an x86 direct-kernel boot still needs the BIOS ROM.
+          name="qemu-system-$(uname -m)"
+          emulator="$(find "${GHR_TOOL_DIR}/cataggar/qemu" -type f -name "$name" \
+            -perm -u+x 2>/dev/null | head -n 1)"
+          if [ -z "$emulator" ]; then
+            emulator="$(command -v "$name")"
+          fi
+          ZVMI_VM_QEMU="$(readlink -f "$emulator")" \
+            zig build test-vm-real-boot --summary all
