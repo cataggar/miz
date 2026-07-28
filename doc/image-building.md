@@ -122,6 +122,48 @@ managed-data-disk activation by stable Azure LUN at `/e` through `/z`. Managed
 disks are mount-only: existing ext4 partition 1 is mounted, while blank and
 unknown layouts are left untouched.
 
+### Preserved-image customization backends
+
+Customizing an image that already exists selects one of five backends. They are
+ordered by how much they can do, which is the same order as how much they need.
+
+| Backend | Privileges | Runs guest code | Architectures | Can do |
+| --- | --- | --- | --- | --- |
+| `native_edit` | none | no | any | overwrite, remove existing paths |
+| `rebuild` | none | no | any | full tree rebuild of one `zvmi_ext4_v1` partition |
+| `native_fresh` | none | no | any | build a new image rather than edit one |
+| `unsafe_chroot` | root + `CAP_SYS_CHROOT`/`CAP_SYS_ADMIN`/`CAP_MKNOD` | yes, on the host kernel | host's only | install/remove packages, regenerate initramfs |
+| `vm` | none | yes, in an isolated guest | any | install/remove packages, regenerate initramfs, cross-architecture |
+
+`vm` is the only backend that can customize an image the host cannot run, and
+the only one that executes guest code without executing it on the host. It
+boots the image's own kernel directly (`-kernel`/`-initrd` + `rdinit=`) with a
+static agent appended to a copy of the image's initramfs, so no bootloader,
+firmware or init system is involved and a fully emulated boot costs seconds.
+
+The cost is a hard requirement on the image: because the agent is `rdinit`, no
+kernel module is ever inserted, so **`ext4` and a virtio disk driver must be
+built into the image's kernel.** The backend reads
+`lib/modules/<release>/modules.builtin` out of the image and refuses the run
+rather than guessing, since a wrong guess is not a wrong answer but a device
+that never appears.
+
+| Image kernel builds in | Result |
+| --- | --- |
+| `ext4` + `virtio_blk` | disks attached over virtio-blk (`/dev/vd*`) |
+| `ext4` + `virtio_scsi` only (Azure Linux) | disks attached over virtio-scsi (`/dev/sd*`) |
+| `ext4` but neither | refused in preflight |
+| neither (stock Ubuntu) | refused in preflight |
+
+`virtio_net` is required only when the plan declares package repositories; an
+offline guest is given no network device at all.
+
+Acceleration is fail-closed. Hardware acceleration requires host architecture ==
+image architecture and a readable and writable `/dev/kvm`, and is refused rather
+than degraded. Software emulation must be asked for by name, and is the only
+option for a cross-architecture run, since no accelerator crosses architectures.
+Whichever ran is recorded in provenance.
+
 ## Formats and filesystem APIs
 
 `convert` skips all-zero chunks (aligned to the destination's block size for

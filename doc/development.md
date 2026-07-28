@@ -167,6 +167,9 @@ zvmi/
       make-minimal-oci-fixture.py   # builds a tiny from-scratch OCI layout
                               #   used as the boot-smoke tests' --container
                               #   fixture in CI
+      fetch-vm-boot-kernel.sh # fetches the kernel the vm backend's real-boot
+                              #   tests boot a guest with, for either
+                              #   architecture
   .github/
     workflows/
       ci.yml                 # required build + test for pushes and PRs
@@ -176,7 +179,50 @@ zvmi/
 
 ## CI
 
-`.github/workflows/ci.yml` runs the required `zig fmt --check`, `zig build`, and `zig build test` checks on every pull request and push to `main`.
+`.github/workflows/ci.yml` runs the required `zig fmt --check`, `zig build`, and `zig build test` checks on every pull request and push to `main`. It also boots a real guest through the `vm` customization backend, both same- and cross-architecture (see below).
+
+### The vm backend's tests
+
+Three steps, cheapest first:
+
+- `zig build test-vm-backend` runs `tests/vm_backend_integration.zig`, which
+  stands in for the emulator by re-entering the test binary under
+  `qemu-system-<arch>`. It needs nothing installed and is part of
+  `zig build test`.
+- `zig build test-vm-real-boot` runs `tests/vm_real_boot.zig` against a real
+  emulator and a real distribution kernel. It is the only place the guest
+  agent's mount, chroot and teardown paths execute at all, since they have to
+  be PID 1 to run. It is opt-in because it needs a kernel and an emulator that
+  no unit test can assume:
+
+  ```
+  ghr install cataggar/qemu@v11.0.91-z.15
+  scripts/ci/fetch-vm-boot-kernel.sh fixtures/vm-boot-kernel
+
+  ZVMI_RUN_VM_BOOT_TEST=1 \
+  ZVMI_VM_BOOT_KERNEL=... ZVMI_VM_BOOT_MODULES_BUILTIN=... \
+  ZVMI_VM_QEMU=$(readlink -f "$(command -v qemu-system-$(uname -m))") \
+    zig build test-vm-real-boot
+  ```
+
+  `ZVMI_VM_ACCEL` defaults to `software`, because no hosted runner class
+  guarantees `/dev/kvm` and a test that demands one is a test that quietly
+  stops running. `ZVMI_VM_BOOT_WORKDIR` (default `/tmp`) moves the workspace,
+  which needs room for two copies of the image.
+- The same test with `ZVMI_VM_BOOT_ARCH` naming the *other* architecture is the
+  cross-architecture acceptance test: the kernel, the guest agent and the
+  binary the guest executes are all the guest's, and only the emulator is the
+  host's. Pass the matching `ZVMI_VM_QEMU` and a kernel for that architecture.
+  One `cataggar/qemu` ghr install supplies every `qemu-system-*`.
+
+Both real boots take roughly 15 seconds under pure TCG, fixture construction
+included, which is why they run in `ci.yml` rather than `boot-smoke.yml`.
+
+CI cannot use the runner's own kernel: the guest agent runs as `rdinit`, so no
+module is ever inserted, and Ubuntu modularizes `ext4` — a guest booted on it
+would see the disk and be unable to mount it. `fetch-vm-boot-kernel.sh` fetches
+a pinned Azure Linux kernel instead, which builds `ext4`, `virtio_scsi` and
+`virtio_net` in.
 
 `.github/workflows/boot-smoke.yml` runs `zig build test-boot-smoke` for every release tag and when manually dispatched. It installs `qemu-system-x86`/`ovmf`, downloads and caches the [Azure Linux 4.0 ISO](https://aka.ms/azurelinux-4.0-x86_64.iso), and builds the OCI fixtures used by the real-QEMU tests. The job is required (not `continue-on-error`) for release tags but is not part of universal pull-request CI.
 
