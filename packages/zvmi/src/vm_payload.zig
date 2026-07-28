@@ -36,7 +36,133 @@ pub const Error = error{
     AmbiguousBootPayload,
     BootPayloadTooLarge,
     UnsupportedBootLayout,
+    GuestDriversUndetermined,
+    NoBuiltInDiskDriver,
 };
+
+/// How the guest's disks are attached.
+///
+/// The agent runs as `rdinit`, so no module is ever inserted: a driver the
+/// image's kernel did not build in does not exist as far as this guest is
+/// concerned, and a disk attached over it simply never appears. Azure Linux is
+/// exactly this case — it builds `virtio_scsi` in and ships `virtio_blk` as a
+/// compressed module — so the transport is read out of the image rather than
+/// assumed.
+pub const DiskTransport = enum {
+    /// `virtio-blk`, exposed as `/dev/vd*`.
+    virtio_blk,
+    /// `virtio-scsi`, exposed as `/dev/sd*` in the order the drives are
+    /// attached.
+    virtio_scsi,
+
+    /// The device path for the `index`th disk attached over this transport.
+    pub fn devicePath(self: DiskTransport, buffer: []u8, index: u8) []const u8 {
+        const prefix = switch (self) {
+            .virtio_blk => "/dev/vd",
+            .virtio_scsi => "/dev/sd",
+        };
+        return std.fmt.bufPrint(buffer, "{s}{c}", .{ prefix, 'a' + index }) catch
+            unreachable;
+    }
+};
+
+/// What the image's own kernel can drive without help.
+pub const GuestDrivers = struct {
+    disk: DiskTransport,
+    /// Whether `virtio_net` is built in. Only consulted when the plan declares
+    /// repositories, since an offline guest is given no network device at all.
+    network: bool,
+};
+
+/// Reads the built-in driver list out of the image and reports what the guest
+/// will be able to see.
+///
+/// A guess here is not a wrong answer that shows up as a wrong answer: it is a
+/// root device that never appears, which the guest can only report as a
+/// timeout. So this fails rather than guesses, and the caller refuses the run.
+pub fn probeDrivers(
+    allocator: Allocator,
+    io: Io,
+    options: ProbeOptions,
+) !GuestDrivers {
+    const file = try Io.Dir.cwd().openFile(io, options.raw_path, .{ .mode = .read_only });
+    defer file.close(io);
+
+    var reader = ext4.Reader.open(io, file, allocator, .{
+        .offset = options.root_partition_offset,
+    }) catch return error.GuestDriversUndetermined;
+    defer reader.deinit();
+
+    const release = try resolveModuleRelease(allocator, io, &reader, options.kernel_release);
+    defer allocator.free(release);
+
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "lib/modules/{s}/modules.builtin",
+        .{release},
+    );
+    defer allocator.free(path);
+    const listing = reader.readFileAlloc(io, allocator, path) catch
+        return error.GuestDriversUndetermined;
+    defer allocator.free(listing);
+
+    return .{
+        .disk = if (builtInContains(listing, "virtio_blk"))
+            .virtio_blk
+        else if (builtInContains(listing, "virtio_scsi"))
+            .virtio_scsi
+        else
+            return error.NoBuiltInDiskDriver,
+        .network = builtInContains(listing, "virtio_net"),
+    };
+}
+
+pub const ProbeOptions = struct {
+    raw_path: []const u8,
+    root_partition_offset: u64,
+    /// The release whose module tree is consulted. When absent the image must
+    /// carry exactly one, for the same reason kernel selection is unambiguous
+    /// or an error.
+    kernel_release: ?[]const u8 = null,
+};
+
+fn resolveModuleRelease(
+    allocator: Allocator,
+    io: Io,
+    reader: *ext4.Reader,
+    requested: ?[]const u8,
+) ![]u8 {
+    if (requested) |release| return allocator.dupe(u8, release);
+    const entries = reader.listDir(io, allocator, "lib/modules") catch
+        return error.GuestDriversUndetermined;
+    defer ext4.freeDirEntries(allocator, entries);
+    var found: ?[]const u8 = null;
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.name, ".") or
+            std.mem.eql(u8, entry.name, ".."))
+        {
+            continue;
+        }
+        if (found != null) return error.GuestDriversUndetermined;
+        found = entry.name;
+    }
+    return allocator.dupe(u8, found orelse return error.GuestDriversUndetermined);
+}
+
+/// `modules.builtin` holds one module path per line, e.g.
+/// `kernel/drivers/scsi/virtio_scsi.ko`. Matching on the whole file name keeps
+/// `virtio_blk` from matching a differently-named module that merely contains
+/// those characters.
+fn builtInContains(listing: []const u8, module: []const u8) bool {
+    var lines = std.mem.tokenizeAny(u8, listing, "\r\n");
+    while (lines.next()) |line| {
+        const name = std.fs.path.basename(std.mem.trim(u8, line, " \t"));
+        if (!std.mem.startsWith(u8, name, module)) continue;
+        const rest = name[module.len..];
+        if (std.mem.eql(u8, rest, ".ko")) return true;
+    }
+    return false;
+}
 
 /// A file appended to the extracted initramfs. `path` is a cpio member name and
 /// so carries no leading slash; a top-level name keeps `rdinit=/<path>` valid
@@ -686,4 +812,159 @@ test "a unified kernel image on the ESP is used when the root has no kernel" {
         if (std.mem.eql(u8, entry.path, "zvmi-guest-agent")) found_agent = true;
     }
     try std.testing.expect(found_agent);
+}
+
+/// Two lines of a real Azure Linux `modules.builtin`, which is the case that
+/// motivated reading this file at all: `virtio_scsi` is built in and
+/// `virtio_blk` is shipped as `virtio_blk.ko.xz` under the same tree.
+const azure_linux_builtin =
+    \\kernel/fs/ext4/ext4.ko
+    \\kernel/drivers/virtio/virtio.ko
+    \\kernel/drivers/virtio/virtio_pci.ko
+    \\kernel/drivers/scsi/virtio_scsi.ko
+    \\kernel/drivers/net/virtio_net.ko
+    \\
+;
+
+fn writeDriverProbeImage(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    releases: []const []const u8,
+    listing: ?[]const u8,
+) !void {
+    var tree = root_tree.RootTree.initMemory(allocator, io, .{});
+    defer tree.deinit();
+    try tree.putDirectory("lib", .{ .mode = 0o755 });
+    try tree.putDirectory("lib/modules", .{ .mode = 0o755 });
+    for (releases) |release| {
+        const directory = try std.fmt.allocPrint(allocator, "lib/modules/{s}", .{release});
+        defer allocator.free(directory);
+        try tree.putDirectory(directory, .{ .mode = 0o755 });
+        if (listing) |bytes| {
+            const file = try std.fmt.allocPrint(
+                allocator,
+                "{s}/modules.builtin",
+                .{directory},
+            );
+            defer allocator.free(file);
+            try tree.putFileBytes(file, bytes, .{ .mode = 0o644 });
+        }
+    }
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    try file.setLength(io, 16 * 1024 * 1024);
+    _ = try ext4.populate(io, file, allocator, try tree.ext4View(), .{
+        .offset = 0,
+        .length = 16 * 1024 * 1024,
+        .label = "drivers",
+        .uuid = [_]u8{0x57} ** 16,
+        .timestamp = 1_735_689_600,
+    });
+}
+
+test "the disk transport is read from the image rather than assumed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "test-vm-payload-drivers.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // Azure Linux: virtio-blk is a module, so a disk attached over it would
+    // never appear to an `rdinit` guest and virtio-scsi has to be used.
+    try writeDriverProbeImage(
+        allocator,
+        io,
+        path,
+        &.{"6.6.139.1-1.azl3"},
+        azure_linux_builtin,
+    );
+    const azure = try probeDrivers(allocator, io, .{
+        .raw_path = path,
+        .root_partition_offset = 0,
+    });
+    try std.testing.expectEqual(DiskTransport.virtio_scsi, azure.disk);
+    try std.testing.expect(azure.network);
+
+    // A kernel with virtio-blk built in gets the simpler transport.
+    try writeDriverProbeImage(
+        allocator,
+        io,
+        path,
+        &.{"6.12.0-1.other"},
+        "kernel/drivers/block/virtio_blk.ko\nkernel/drivers/scsi/virtio_scsi.ko\n",
+    );
+    const both = try probeDrivers(allocator, io, .{
+        .raw_path = path,
+        .root_partition_offset = 0,
+    });
+    try std.testing.expectEqual(DiskTransport.virtio_blk, both.disk);
+    // Nothing claimed virtio-net, so a networked run must not be attempted.
+    try std.testing.expect(!both.network);
+}
+
+test "an image whose kernel can drive no disk is refused rather than booted" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "test-vm-payload-nodisk.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try writeDriverProbeImage(
+        allocator,
+        io,
+        path,
+        &.{"6.12.0-1.other"},
+        "kernel/fs/ext4/ext4.ko\nkernel/drivers/net/virtio_net.ko\n",
+    );
+    try std.testing.expectError(error.NoBuiltInDiskDriver, probeDrivers(allocator, io, .{
+        .raw_path = path,
+        .root_partition_offset = 0,
+    }));
+
+    // A near-miss name must not be mistaken for the driver itself.
+    try writeDriverProbeImage(
+        allocator,
+        io,
+        path,
+        &.{"6.12.0-1.other"},
+        "kernel/drivers/block/virtio_blk_helper.ko\n",
+    );
+    try std.testing.expectError(error.NoBuiltInDiskDriver, probeDrivers(allocator, io, .{
+        .raw_path = path,
+        .root_partition_offset = 0,
+    }));
+}
+
+test "an image that does not say what its kernel can drive is not guessed at" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "test-vm-payload-unknown.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // No modules.builtin at all: no evidence either way.
+    try writeDriverProbeImage(allocator, io, path, &.{"6.12.0-1.other"}, null);
+    try std.testing.expectError(error.GuestDriversUndetermined, probeDrivers(allocator, io, .{
+        .raw_path = path,
+        .root_partition_offset = 0,
+    }));
+
+    // Several module trees and no release named: which kernel boots decides
+    // the answer, so the caller must say which one.
+    try writeDriverProbeImage(
+        allocator,
+        io,
+        path,
+        &.{ "6.12.0-1.other", "6.6.139.1-1.azl3" },
+        azure_linux_builtin,
+    );
+    try std.testing.expectError(error.GuestDriversUndetermined, probeDrivers(allocator, io, .{
+        .raw_path = path,
+        .root_partition_offset = 0,
+    }));
+    const named = try probeDrivers(allocator, io, .{
+        .raw_path = path,
+        .root_partition_offset = 0,
+        .kernel_release = "6.6.139.1-1.azl3",
+    });
+    try std.testing.expectEqual(DiskTransport.virtio_scsi, named.disk);
 }

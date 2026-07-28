@@ -72,7 +72,10 @@ fn runIntegration(allocator: Allocator, io: Io, self_exe: []const u8) !void {
         },
     };
 
-    try runSuccess(allocator, io, self_exe, architecture);
+    // Both transports, because which one a run gets is decided by the image
+    // and getting it wrong is a root device that never appears.
+    try runSuccess(allocator, io, self_exe, architecture, .virtio_blk);
+    try runSuccess(allocator, io, self_exe, architecture, .virtio_scsi);
     try runGuestFailure(allocator, io, self_exe, architecture);
     try runSilentGuest(allocator, io, self_exe, architecture);
     try runEmulatorFailure(allocator, io, self_exe, architecture);
@@ -89,8 +92,9 @@ fn runSuccess(
     io: Io,
     self_exe: []const u8,
     architecture: zvmi.customize.Architecture,
+    transport: zvmi.vm_payload.DiskTransport,
 ) !void {
-    var workspace = try Workspace.create(allocator, io, self_exe, architecture);
+    var workspace = try Workspace.create(allocator, io, self_exe, architecture, transport);
     defer workspace.deinit(io);
 
     var outcome = try workspace.execute(allocator, io, .success, .software);
@@ -109,7 +113,10 @@ fn runSuccess(
     try ensure(std.mem.eql(u8, vm.emulator_version, "stub-emulator 1.0"));
     try ensure(vm.acceleration == .software);
     try ensure(vm.network == .declared_repositories);
-    try ensure(std.mem.eql(u8, vm.root_device, "/dev/vda1"));
+    try ensure(std.mem.eql(u8, vm.root_device, switch (transport) {
+        .virtio_blk => "/dev/vda1",
+        .virtio_scsi => "/dev/sda1",
+    }));
     try ensure(std.mem.eql(u8, vm.kernel_release, kernel_release));
     try ensure(vm.runner_architecture == architecture);
     try ensure(vm.memory_mib == 1024);
@@ -154,7 +161,7 @@ fn runGuestFailure(
     self_exe: []const u8,
     architecture: zvmi.customize.Architecture,
 ) !void {
-    var workspace = try Workspace.create(allocator, io, self_exe, architecture);
+    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk);
     defer workspace.deinit(io);
 
     var outcome = try workspace.execute(allocator, io, .guest_failure, .software);
@@ -170,7 +177,7 @@ fn runSilentGuest(
     self_exe: []const u8,
     architecture: zvmi.customize.Architecture,
 ) !void {
-    var workspace = try Workspace.create(allocator, io, self_exe, architecture);
+    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk);
     defer workspace.deinit(io);
 
     var outcome = try workspace.execute(allocator, io, .silent, .software);
@@ -186,7 +193,7 @@ fn runEmulatorFailure(
     self_exe: []const u8,
     architecture: zvmi.customize.Architecture,
 ) !void {
-    var workspace = try Workspace.create(allocator, io, self_exe, architecture);
+    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk);
     defer workspace.deinit(io);
 
     var outcome = try workspace.execute(allocator, io, .emulator_failure, .software);
@@ -212,7 +219,7 @@ fn runHardwareRejected(
         );
         return;
     }
-    var workspace = try Workspace.create(allocator, io, self_exe, architecture);
+    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk);
     defer workspace.deinit(io);
 
     var resolved = try workspace.resolve(allocator, .hardware);
@@ -266,6 +273,7 @@ const Workspace = struct {
     emulator_path: []const u8,
     mode_path: []const u8,
     architecture: zvmi.customize.Architecture,
+    transport: zvmi.vm_payload.DiskTransport,
     source_digest: [32]u8,
     /// Set by a case that reached its last assertion. A workspace is only
     /// removed once that happens, so a failure leaves its source, its output,
@@ -277,6 +285,7 @@ const Workspace = struct {
         io: Io,
         self_exe: []const u8,
         architecture: zvmi.customize.Architecture,
+        transport: zvmi.vm_payload.DiskTransport,
     ) !Workspace {
         var random: [8]u8 = undefined;
         Io.random(io, &random);
@@ -300,7 +309,7 @@ const Workspace = struct {
             ),
         });
 
-        try createSourceDisk(allocator, io, source_path, spool_path);
+        try createSourceDisk(allocator, io, source_path, spool_path, transport);
         try copyExecutable(io, self_exe, emulator_path);
 
         return .{
@@ -315,6 +324,7 @@ const Workspace = struct {
                 .{emulator_path},
             ),
             .architecture = architecture,
+            .transport = transport,
             .source_digest = try digestOfFile(io, source_path),
         };
     }
@@ -535,8 +545,17 @@ fn runStubEmulator(
     // too: a host that emits an invalid document must fail here, not in a real
     // guest weeks later.
     try control.validate();
-    try expectStub(std.mem.eql(u8, control.root_device, "/dev/vda1"));
-    try expectStub(std.mem.eql(u8, control.result_device, zvmi.vm_backend.result_device));
+    const scsi = indexOfArgument(args, "virtio-scsi-pci,id=zvmiscsi") != null;
+    try expectStub(std.mem.eql(
+        u8,
+        control.root_device,
+        if (scsi) "/dev/sda1" else "/dev/vda1",
+    ));
+    try expectStub(std.mem.eql(
+        u8,
+        control.result_device,
+        if (scsi) "/dev/sdb" else "/dev/vdb",
+    ));
     try expectStub(control.repositories.len == 1);
     try expectStub(std.mem.eql(u8, control.repositories[0].id, "integration"));
     try expectStub(control.repositories[0].trust_base64.len == 1);
@@ -584,6 +603,13 @@ fn runStubEmulator(
     try file.writePositionalAll(io, sealed, 0);
 }
 
+fn indexOfArgument(args: []const []const u8, wanted: []const u8) ?usize {
+    for (args, 0..) |arg, index| {
+        if (std.mem.eql(u8, arg, wanted)) return index;
+    }
+    return null;
+}
+
 fn driveAt(args: []const []const u8, wanted: usize) ?[]const u8 {
     var seen: usize = 0;
     for (args, 0..) |arg, index| {
@@ -623,6 +649,7 @@ fn createSourceDisk(
     io: Io,
     source_path: []const u8,
     spool_path: []const u8,
+    transport: zvmi.vm_payload.DiskTransport,
 ) !void {
     var image = try zvmi.Image.createExclusive(
         io,
@@ -640,9 +667,31 @@ fn createSourceDisk(
 
     var tree = try zvmi.root_tree.RootTree.init(allocator, io, spool_path, .{});
     defer tree.deinit();
-    inline for (.{ "boot", "dev", "etc", "proc", "run", "sys", "usr", "var" }) |path| {
+    inline for (.{
+        "boot", "dev",         "etc",                            "lib",
+        "proc", "run",         "sys",                            "usr",
+        "var",  "lib/modules", "lib/modules/" ++ kernel_release,
+    }) |path| {
         try tree.putDirectory(path, .{ .mode = 0o755 });
     }
+    // The transport the backend picks is a fact about the image's kernel, so
+    // the fixture states it the same way a real image does.
+    try tree.putFileBytes(
+        "lib/modules/" ++ kernel_release ++ "/modules.builtin",
+        switch (transport) {
+            .virtio_blk =>
+            \\kernel/drivers/block/virtio_blk.ko
+            \\kernel/drivers/net/virtio_net.ko
+            \\
+            ,
+            .virtio_scsi =>
+            \\kernel/drivers/scsi/virtio_scsi.ko
+            \\kernel/drivers/net/virtio_net.ko
+            \\
+            ,
+        },
+        .{ .mode = 0o644 },
+    );
     try tree.putFileBytes(
         "boot/vmlinuz-" ++ kernel_release,
         kernel_bytes,

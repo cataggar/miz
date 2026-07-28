@@ -21,10 +21,11 @@ const Io = std.Io;
 /// cover the control and result disks and filesystem overhead.
 pub const workspace_overhead_bytes: u64 = 512 * 1024 * 1024;
 
-/// The guest sees the staged image as the first virtio disk and the result
-/// device as the second, because `-drive if=virtio` enumerates in argv order.
-pub const stage_device = "/dev/vda";
-pub const result_device = "/dev/vdb";
+/// The guest sees the staged image as its first disk and the result device as
+/// its second. Which names those are depends on the transport the image's own
+/// kernel can drive, which is read out of the image rather than assumed.
+pub const stage_disk_index: u8 = 0;
+pub const result_disk_index: u8 = 1;
 
 /// Trust material is embedded in the control document, so it is bounded well
 /// below the control-document limit rather than by the host's patience.
@@ -50,6 +51,10 @@ pub const Error = error{
     /// of sealing an answer, which is a different outcome from any answer.
     VmGuestSilent,
     VmGuestFailed,
+    /// The plan declares repositories but the image's kernel cannot drive a
+    /// network device without loading a module, which an `rdinit` guest never
+    /// does. Refused rather than left to fail as an unexplained download error.
+    NoBuiltInNetworkDriver,
 };
 
 /// Reports whether this host can run the plan's VM backend.
@@ -233,8 +238,32 @@ pub fn run(
         lease_active = false;
     };
 
-    const root_device = try rootDevicePath(work, data.storage.preserve.root_partition);
-    const control = try buildControl(work, io, options.plan, root_device);
+    // Read before anything is built: every device name the guest is given,
+    // and the emulator command line that produces them, follow from what the
+    // image's kernel can actually drive.
+    const drivers = try vm_payload.probeDrivers(work, io, .{
+        .raw_path = options.target.raw_path,
+        .root_partition_offset = options.target.partition.offset,
+        .kernel_release = requestedKernelRelease(data.initramfs),
+    });
+    if (policy.network == .declared_repositories and !drivers.network) {
+        return error.NoBuiltInNetworkDriver;
+    }
+
+    var stage_buffer: [16]u8 = undefined;
+    var result_buffer: [16]u8 = undefined;
+    const stage_device = drivers.disk.devicePath(&stage_buffer, stage_disk_index);
+    const result_device = drivers.disk.devicePath(&result_buffer, result_disk_index);
+
+    const root_device = try rootDevicePath(
+        work,
+        stage_device,
+        data.storage.preserve.root_partition,
+    );
+    const control = try buildControl(work, io, options.plan, .{
+        .root_device = root_device,
+        .result_device = result_device,
+    });
     // The host refuses to emit a document it would refuse to read, so a
     // rejection here is a host bug rather than a guest-side surprise.
     try control.validate();
@@ -262,7 +291,12 @@ pub fn run(
     try writeFileBytes(io, layout.initrd_path, payload.initrd);
     try createResultDevice(io, layout.result_path);
 
-    const argv = try buildArgv(work, policy, data.architectures.runner, layout);
+    const argv = try buildArgv(work, .{
+        .policy = policy,
+        .architecture = data.architectures.runner,
+        .layout = layout,
+        .disk = drivers.disk,
+    });
     const outcome = std.process.run(work, io, .{
         .argv = argv,
         .stdout_limit = .limited(max_console_bytes),
@@ -327,7 +361,11 @@ const Layout = struct {
 
 /// The guest kernel scans the partition table itself, so it is handed a
 /// partition device rather than an offset it would have to be told to honour.
-fn rootDevicePath(allocator: Allocator, selector: customize.PartitionSelector) ![]const u8 {
+fn rootDevicePath(
+    allocator: Allocator,
+    stage_device: []const u8,
+    selector: customize.PartitionSelector,
+) ![]const u8 {
     const index = switch (selector) {
         .gpt_index, .mbr_index => |value| value,
     };
@@ -345,18 +383,23 @@ fn requestedKernelRelease(initramfs: customize.InitramfsPolicy) ?[]const u8 {
     };
 }
 
+const Devices = struct {
+    root_device: []const u8,
+    result_device: []const u8,
+};
+
 fn buildControl(
     allocator: Allocator,
     io: Io,
     plan: *const customize.ResolvedPlan,
-    root_device: []const u8,
+    devices: Devices,
 ) !vm_control.Control {
     const data = plan.data;
     return controlFromPolicy(allocator, io, .{
         .packages = data.packages,
         .initramfs = data.initramfs,
         .network = data.execution.vm.?.network,
-        .root_device = root_device,
+        .devices = devices,
     });
 }
 
@@ -364,7 +407,7 @@ const ControlInput = struct {
     packages: customize.PackagePolicy,
     initramfs: customize.InitramfsPolicy,
     network: customize.VmNetworkPolicy,
-    root_device: []const u8,
+    devices: Devices,
 };
 
 fn controlFromPolicy(
@@ -413,8 +456,8 @@ fn controlFromPolicy(
     }
 
     return .{
-        .root_device = input.root_device,
-        .result_device = result_device,
+        .root_device = input.devices.root_device,
+        .result_device = input.devices.result_device,
         .network = switch (input.network) {
             .offline => .offline,
             .declared_repositories => .{ .declared_repositories = vm_control.qemu_user_network },
@@ -428,12 +471,17 @@ fn controlFromPolicy(
     };
 }
 
-fn buildArgv(
-    allocator: Allocator,
+const ArgvInput = struct {
     policy: customize.VmPolicy,
     architecture: customize.Architecture,
     layout: Layout,
-) ![]const []const u8 {
+    disk: vm_payload.DiskTransport,
+};
+
+fn buildArgv(allocator: Allocator, input: ArgvInput) ![]const []const u8 {
+    const policy = input.policy;
+    const architecture = input.architecture;
+    const layout = input.layout;
     var argv: std.array_list.Managed([]const u8) = .init(allocator);
     errdefer argv.deinit();
 
@@ -466,10 +514,7 @@ fn buildArgv(
     try argv.appendSlice(&.{ "-kernel", layout.kernel_path });
     try argv.appendSlice(&.{ "-initrd", layout.initrd_path });
     try argv.appendSlice(&.{ "-append", try kernelCommandLine(allocator, architecture) });
-    // Order fixes the guest's device names: the stage is `vda`, the result
-    // device is `vdb`, and the control document says so.
-    try argv.appendSlice(&.{ "-drive", try driveArgument(allocator, layout.raw_path) });
-    try argv.appendSlice(&.{ "-drive", try driveArgument(allocator, layout.result_path) });
+    try appendDisks(allocator, &argv, input);
     switch (policy.network) {
         .offline => try argv.appendSlice(&.{ "-nic", "none" }),
         .declared_repositories => try argv.appendSlice(&.{
@@ -480,12 +525,42 @@ fn buildArgv(
     return argv.toOwnedSlice();
 }
 
-fn driveArgument(allocator: Allocator, path: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "file={s},format=raw,if=virtio,cache=writeback",
-        .{path},
-    );
+/// Attaches the stage and the result device in that order.
+///
+/// The names the guest sees are positional either way: `if=virtio` enumerates
+/// in argv order, and `virtio-scsi` enumerates by SCSI id. Both are stated
+/// explicitly here and again in the control document, so neither side has to
+/// infer the other's ordering.
+fn appendDisks(
+    allocator: Allocator,
+    argv: *std.array_list.Managed([]const u8),
+    input: ArgvInput,
+) !void {
+    const paths = [_][]const u8{ input.layout.raw_path, input.layout.result_path };
+    switch (input.disk) {
+        .virtio_blk => for (paths) |path| {
+            try argv.appendSlice(&.{ "-drive", try std.fmt.allocPrint(
+                allocator,
+                "file={s},format=raw,if=virtio,cache=writeback",
+                .{path},
+            ) });
+        },
+        .virtio_scsi => {
+            try argv.appendSlice(&.{ "-device", "virtio-scsi-pci,id=zvmiscsi" });
+            for (paths, 0..) |path, index| {
+                try argv.appendSlice(&.{ "-drive", try std.fmt.allocPrint(
+                    allocator,
+                    "file={s},format=raw,if=none,id=zvmidisk{d},cache=writeback",
+                    .{ path, index },
+                ) });
+                try argv.appendSlice(&.{ "-device", try std.fmt.allocPrint(
+                    allocator,
+                    "scsi-hd,drive=zvmidisk{d},bus=zvmiscsi.0,channel=0,scsi-id={d},lun=0",
+                    .{ index, index },
+                ) });
+            }
+        },
+    }
 }
 
 fn machineName(policy: customize.VmPolicy, architecture: customize.Architecture) []const u8 {
@@ -737,13 +812,18 @@ test "a software-emulated x86_64 guest is offline and boots the extracted kernel
     const allocator = arena.allocator();
 
     const argv = try buildArgv(allocator, .{
-        .emulator_command = "/opt/qemu/bin/qemu-system-x86_64",
-        .acceleration = .software,
-        .acknowledge_software_emulation = true,
-        .memory_mib = 3072,
-        .vcpus = 4,
-        .network = .offline,
-    }, .x86_64, test_layout);
+        .policy = .{
+            .emulator_command = "/opt/qemu/bin/qemu-system-x86_64",
+            .acceleration = .software,
+            .acknowledge_software_emulation = true,
+            .memory_mib = 3072,
+            .vcpus = 4,
+            .network = .offline,
+        },
+        .architecture = .x86_64,
+        .layout = test_layout,
+        .disk = .virtio_blk,
+    });
 
     try std.testing.expectEqualStrings("/opt/qemu/bin/qemu-system-x86_64", argv[0]);
     try std.testing.expectEqualStrings("q35,accel=tcg", valueOfArgument(argv, "-machine").?);
@@ -770,10 +850,15 @@ test "drive order gives the stage vda and the result device vdb" {
     const allocator = arena.allocator();
 
     const argv = try buildArgv(allocator, .{
-        .emulator_command = "/opt/qemu/bin/qemu-system-x86_64",
-        .acceleration = .software,
-        .acknowledge_software_emulation = true,
-    }, .x86_64, test_layout);
+        .policy = .{
+            .emulator_command = "/opt/qemu/bin/qemu-system-x86_64",
+            .acceleration = .software,
+            .acknowledge_software_emulation = true,
+        },
+        .architecture = .x86_64,
+        .layout = test_layout,
+        .disk = .virtio_blk,
+    });
 
     const first = indexOfArgument(argv, "-drive").?;
     try std.testing.expectEqualStrings(
@@ -784,8 +869,62 @@ test "drive order gives the stage vda and the result device vdb" {
         "file=work/vm-result.raw,format=raw,if=virtio,cache=writeback",
         argv[first + 3],
     );
-    // The control document names the devices this ordering produces.
-    try std.testing.expectEqualStrings("/dev/vdb", result_device);
+
+    var buffer: [16]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "/dev/vdb",
+        vm_payload.DiskTransport.virtio_blk.devicePath(&buffer, result_disk_index),
+    );
+}
+
+test "a kernel with no built-in virtio-blk gets its disks over virtio-scsi" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = try buildArgv(allocator, .{
+        .policy = .{
+            .emulator_command = "/opt/qemu/bin/qemu-system-aarch64",
+            .acceleration = .software,
+            .acknowledge_software_emulation = true,
+        },
+        .architecture = .aarch64,
+        .layout = test_layout,
+        .disk = .virtio_scsi,
+    });
+
+    // A single controller with the stage at target 0 and the result device at
+    // target 1, which is what makes them sda and sdb.
+    try std.testing.expect(indexOfArgument(argv, "-drive") != null);
+    var saw_controller = false;
+    var saw_stage = false;
+    var saw_result = false;
+    for (argv) |argument| {
+        if (std.mem.eql(u8, argument, "virtio-scsi-pci,id=zvmiscsi")) saw_controller = true;
+        if (std.mem.eql(
+            u8,
+            argument,
+            "scsi-hd,drive=zvmidisk0,bus=zvmiscsi.0,channel=0,scsi-id=0,lun=0",
+        )) saw_stage = true;
+        if (std.mem.eql(
+            u8,
+            argument,
+            "scsi-hd,drive=zvmidisk1,bus=zvmiscsi.0,channel=0,scsi-id=1,lun=0",
+        )) saw_result = true;
+        // `if=virtio` would silently attach a disk the kernel cannot see.
+        try std.testing.expect(std.mem.indexOf(u8, argument, "if=virtio") == null);
+    }
+    try std.testing.expect(saw_controller and saw_stage and saw_result);
+
+    var buffer: [16]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "/dev/sda",
+        vm_payload.DiskTransport.virtio_scsi.devicePath(&buffer, stage_disk_index),
+    );
+    try std.testing.expectEqualStrings(
+        "/dev/sdb",
+        vm_payload.DiskTransport.virtio_scsi.devicePath(&buffer, result_disk_index),
+    );
 }
 
 test "a hardware-accelerated aarch64 guest passes the host cpu through and gets a network" {
@@ -794,10 +933,15 @@ test "a hardware-accelerated aarch64 guest passes the host cpu through and gets 
     const allocator = arena.allocator();
 
     const argv = try buildArgv(allocator, .{
-        .emulator_command = "/opt/qemu/bin/qemu-system-aarch64",
-        .acceleration = .hardware,
-        .network = .declared_repositories,
-    }, .aarch64, test_layout);
+        .policy = .{
+            .emulator_command = "/opt/qemu/bin/qemu-system-aarch64",
+            .acceleration = .hardware,
+            .network = .declared_repositories,
+        },
+        .architecture = .aarch64,
+        .layout = test_layout,
+        .disk = .virtio_blk,
+    });
 
     try std.testing.expectEqualStrings("virt,accel=kvm", valueOfArgument(argv, "-machine").?);
     try std.testing.expectEqualStrings("host", valueOfArgument(argv, "-cpu").?);
@@ -819,11 +963,16 @@ test "an explicit machine and cpu override the architecture defaults" {
     const allocator = arena.allocator();
 
     const argv = try buildArgv(allocator, .{
-        .emulator_command = "/opt/qemu/bin/qemu-system-aarch64",
-        .acceleration = .software,
-        .machine = "virt,gic-version=3",
-        .cpu = "cortex-a57",
-    }, .aarch64, test_layout);
+        .policy = .{
+            .emulator_command = "/opt/qemu/bin/qemu-system-aarch64",
+            .acceleration = .software,
+            .machine = "virt,gic-version=3",
+            .cpu = "cortex-a57",
+        },
+        .architecture = .aarch64,
+        .layout = test_layout,
+        .disk = .virtio_blk,
+    });
 
     try std.testing.expectEqualStrings(
         "virt,gic-version=3,accel=tcg",
@@ -839,15 +988,20 @@ test "the root partition selector becomes the guest's partition device" {
 
     try std.testing.expectEqualStrings(
         "/dev/vda2",
-        try rootDevicePath(allocator, .{ .gpt_index = 2 }),
+        try rootDevicePath(allocator, "/dev/vda", .{ .gpt_index = 2 }),
     );
     try std.testing.expectEqualStrings(
         "/dev/vda1",
-        try rootDevicePath(allocator, .{ .mbr_index = 1 }),
+        try rootDevicePath(allocator, "/dev/vda", .{ .mbr_index = 1 }),
+    );
+    // The transport decides the name; the selector only decides the index.
+    try std.testing.expectEqualStrings(
+        "/dev/sda3",
+        try rootDevicePath(allocator, "/dev/sda", .{ .gpt_index = 3 }),
     );
     try std.testing.expectError(
         error.UnsupportedRootPartition,
-        rootDevicePath(allocator, .{ .gpt_index = 0 }),
+        rootDevicePath(allocator, "/dev/vda", .{ .gpt_index = 0 }),
     );
 }
 
@@ -876,7 +1030,7 @@ test "trust material reaches the guest as base64 whether it was inline or a host
         },
         .initramfs = .{ .regenerate = .{ .kernels = &.{"6.12.0-1.azl"} } },
         .network = .declared_repositories,
-        .root_device = "/dev/vda2",
+        .devices = .{ .root_device = "/dev/vda2", .result_device = "/dev/vdb" },
     });
     try control.validate();
 
@@ -905,7 +1059,7 @@ test "an offline guest is never handed package actions" {
         .packages = .{ .actions = &.{.{ .install = &.{"strace"} }} },
         .initramfs = .unchanged,
         .network = .offline,
-        .root_device = "/dev/vda2",
+        .devices = .{ .root_device = "/dev/vda2", .result_device = "/dev/vdb" },
     });
     try std.testing.expectError(
         error.OfflineNetworkWithPackageActions,
@@ -924,7 +1078,7 @@ test "package actions the guest cannot perform are refused before it boots" {
             .packages = .{ .actions = &.{.update_all} },
             .initramfs = .unchanged,
             .network = .declared_repositories,
-            .root_device = "/dev/vda2",
+            .devices = .{ .root_device = "/dev/vda2", .result_device = "/dev/vdb" },
         },
     ));
 }
