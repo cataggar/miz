@@ -27,6 +27,11 @@ const max_capture_bytes = 1024 * 1024;
 const repository_directory = "/run/zvmi-repos";
 const tdnf_config = "/run/zvmi-tdnf.conf";
 const resolver_path = "/etc/resolv.conf";
+/// How long the target's block device is waited for, and how often it is
+/// checked. Generous because software emulation stretches every wall-clock
+/// interval a guest experiences.
+const device_wait_ms: u32 = 60_000;
+const device_poll_ms: u32 = 50;
 
 var console_fd: i32 = -1;
 
@@ -145,6 +150,10 @@ const Session = struct {
         try mkdirPath("/mnt");
         try mkdirPath(guest_root);
         const device_z = try self.allocator.dupeZ(u8, device);
+        // Block-device probing finishes on a kernel workqueue that can outlast
+        // the jump to `rdinit`, so the node may not exist yet even though the
+        // driver is built in and the disk is present.
+        try waitForDevice(device_z);
         try mountChecked(device_z, guest_root, "ext4", linux.MS.NOSUID | linux.MS.NODEV);
         self.root_mounted = true;
 
@@ -694,6 +703,30 @@ fn isDirectory(path: [*:0]const u8) bool {
     if (linux.errno(rc) != .SUCCESS) return false;
     _ = linux.close(@intCast(rc));
     return true;
+}
+
+/// Polls rather than waiting on uevents: a poll needs no netlink socket, no
+/// parser, and no second failure mode, and the wait it replaces is measured in
+/// milliseconds on every boot that is going to succeed at all.
+fn waitForDevice(path: [*:0]const u8) !void {
+    var waited_ms: u32 = 0;
+    while (waited_ms < device_wait_ms) : (waited_ms += device_poll_ms) {
+        const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(rc) == .SUCCESS) {
+            _ = linux.close(@intCast(rc));
+            return;
+        }
+        sleepMilliseconds(device_poll_ms);
+    }
+    return error.RootDeviceAbsent;
+}
+
+fn sleepMilliseconds(milliseconds: u32) void {
+    const request = linux.timespec{
+        .sec = @intCast(milliseconds / 1000),
+        .nsec = @intCast((milliseconds % 1000) * std.time.ns_per_ms),
+    };
+    _ = linux.nanosleep(&request, null);
 }
 
 fn readFileAlloc(allocator: Allocator, path: []const u8, limit: usize) ![]u8 {

@@ -54,6 +54,9 @@ pub const Error = error{
     FrameTooLarge,
     TruncatedFrame,
     FrameDigestMismatch,
+    ResultTooLarge,
+    InvalidToolRecord,
+    InvalidFailureRecord,
 };
 
 pub const Network = union(enum) {
@@ -226,7 +229,36 @@ pub const Result = struct {
     failure: ?Failure = null,
     tools: []const Tool = &.{},
     installed_packages: []const []const u8 = &.{},
+
+    /// The result is recorded in the host's provenance, so its shape is
+    /// bounded here for the same reason the control document's is: a document
+    /// that arrives from the other side of a trust boundary is checked before
+    /// it is believed, even when this build wrote the agent that sent it.
+    pub fn validate(self: Result) Error!void {
+        if (self.version != result_version) return error.UnsupportedVersion;
+        if (self.tools.len > max_result_tools) return error.ResultTooLarge;
+        for (self.tools) |tool| {
+            if (tool.name.len == 0 or tool.name.len > 128) return error.InvalidToolRecord;
+            if (tool.version.len > 1024) return error.InvalidToolRecord;
+            if (tool.command.len == 0 or tool.command.len > 64) {
+                return error.InvalidToolRecord;
+            }
+        }
+        if (self.installed_packages.len > max_result_packages) return error.ResultTooLarge;
+        for (self.installed_packages) |name| {
+            if (name.len == 0 or name.len > 512) return error.InvalidPackageName;
+        }
+        if (self.failure) |failure| {
+            if (failure.stage.len == 0 or failure.stage.len > 64) {
+                return error.InvalidFailureRecord;
+            }
+            if (failure.detail.len > 4096) return error.InvalidFailureRecord;
+        }
+    }
 };
+
+pub const max_result_tools: usize = 64;
+pub const max_result_packages: usize = 100_000;
 
 fn validateDevicePath(path: []const u8) Error!void {
     if (!std.mem.startsWith(u8, path, "/dev/")) return error.InvalidDevicePath;
@@ -625,4 +657,49 @@ test "dotted quads parse strictly" {
     try std.testing.expect(parseIpv4("10.0.2.-1") == null);
     try std.testing.expect(parseIpv4(" 10.0.2.15") == null);
     try std.testing.expect(parseIpv4("") == null);
+}
+
+test "a result the host would record verbatim is bounded before it is believed" {
+    const valid = Result{
+        .tools = &.{.{ .name = "tdnf", .version = "3.5.8", .command = &.{ "tdnf", "--version" } }},
+        .installed_packages = &.{"strace-6.6-1.azl3.x86_64"},
+    };
+    try valid.validate();
+
+    const failed = Result{ .failure = .{ .stage = "packages", .exit_code = 1 } };
+    try failed.validate();
+
+    const cases = [_]struct { name: []const u8, result: Result, expected: Error }{
+        .{
+            .name = "an unknown version means the guest and host disagree on the contract",
+            .result = .{ .version = result_version + 1 },
+            .expected = error.UnsupportedVersion,
+        },
+        .{
+            .name = "a nameless tool records nothing",
+            .result = .{ .tools = &.{.{ .name = "", .version = "1", .command = &.{"x"} }} },
+            .expected = error.InvalidToolRecord,
+        },
+        .{
+            .name = "a tool with no command cannot be reproduced",
+            .result = .{ .tools = &.{.{ .name = "tdnf", .version = "1", .command = &.{} }} },
+            .expected = error.InvalidToolRecord,
+        },
+        .{
+            .name = "an empty package name is not a package",
+            .result = .{ .installed_packages = &.{""} },
+            .expected = error.InvalidPackageName,
+        },
+        .{
+            .name = "a failure that names no stage explains nothing",
+            .result = .{ .failure = .{ .stage = "" } },
+            .expected = error.InvalidFailureRecord,
+        },
+    };
+    for (cases) |case| {
+        std.testing.expectError(case.expected, case.result.validate()) catch |err| {
+            std.debug.print("case: {s}\n", .{case.name});
+            return err;
+        };
+    }
 }

@@ -27,7 +27,7 @@ const verity = @import("verity.zig");
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
 pub const plan_schema_version: u32 = 4;
-pub const provenance_schema_version: u32 = 5;
+pub const provenance_schema_version: u32 = 6;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -3572,6 +3572,13 @@ pub const Platform = struct {
         io: Io,
         plan: *const ResolvedPlan,
     ) CapabilityState = null,
+    vmRunFn: ?*const fn (
+        context: ?*anyopaque,
+        allocator: Allocator,
+        io: Io,
+        plan: *const ResolvedPlan,
+        target: preserved_image.RawMutationTarget,
+    ) anyerror!VmRuntimeReport = null,
 
     pub fn system() Platform {
         return .{ .checkFn = systemCapabilityCheck };
@@ -3779,11 +3786,14 @@ fn vmCapabilityState(
         data.generalization != .none or
         data.selinux != .unchanged or
         !isDefaultBootPolicy(data.boot_security) or
+        data.packages.cache != .online or
         data.packages.lock != .unlocked)
     {
         return .unsupported;
     }
-    if (data.hooks.len != 0 and !data.execution.acknowledge_unsafe) return .unsupported;
+    // Nothing in the guest executes caller-supplied scripts, so a plan that
+    // carries hooks would silently drop them rather than run them.
+    if (data.hooks.len != 0) return .unsupported;
     if (vm.acceleration == .hardware and
         data.architectures.runner != data.architectures.host)
     {
@@ -4099,6 +4109,53 @@ pub const UnsafeChrootRuntimeReport = struct {
     }
 };
 
+/// Where the guest's kernel and initramfs were copied from. Recorded so a
+/// reader can tell which boot layout the run actually exercised without
+/// re-inspecting the published image.
+pub const VmBootOrigin = union(enum) {
+    boot_directory: struct {
+        kernel_path: []const u8,
+        initrd_path: []const u8,
+    },
+    unified_kernel: struct {
+        esp_path: []const u8,
+    },
+};
+
+/// What the emulator was, how it was configured, and exactly which bytes the
+/// guest booted. `acceleration` is the accelerator that ran, not the one that
+/// was requested — the backend never degrades silently, so the two always
+/// agree, and recording the effective value keeps that checkable.
+pub const VmExecutionRecord = struct {
+    emulator_command: []const u8,
+    emulator_version: []const u8,
+    machine: []const u8,
+    cpu: []const u8,
+    acceleration: VmAcceleration,
+    network: VmNetworkPolicy,
+    memory_mib: u32,
+    vcpus: u8,
+    runner_architecture: Architecture,
+    root_device: []const u8,
+    kernel_release: []const u8,
+    kernel_sha256: Digest,
+    initrd_sha256: Digest,
+    control_sha256: Digest,
+    boot_origin: VmBootOrigin,
+};
+
+pub const VmRuntimeReport = struct {
+    arena: std.heap.ArenaAllocator,
+    tools: []const ToolRecord,
+    installed_packages: []const []const u8,
+    execution: VmExecutionRecord,
+
+    pub fn deinit(self: *VmRuntimeReport) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const ArtifactRecord = struct {
     path: []const u8,
     format: OutputFormat,
@@ -4195,6 +4252,7 @@ pub const ExecutionRecord = struct {
     partition_style: ?PartitionStyleRecord,
     vhdx_metadata: ?VhdxMetadataRecord,
     preserved: ?PreservedExecutionRecord,
+    vm: ?VmExecutionRecord,
 };
 
 pub const Provenance = struct {
@@ -4314,6 +4372,27 @@ fn failureOutcome(allocator: Allocator, diagnostics: []const Diagnostic) Allocat
     };
 }
 
+/// Only one guest backend can have run, so the reports are alternatives rather
+/// than a merge: taking the first present one keeps provenance describing a
+/// single execution.
+fn guestPackages(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+    vm_report: ?*const VmRuntimeReport,
+) []const []const u8 {
+    if (unsafe_report) |report| return report.installed_packages;
+    if (vm_report) |report| return report.installed_packages;
+    return &.{};
+}
+
+fn guestTools(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+    vm_report: ?*const VmRuntimeReport,
+) []const ToolRecord {
+    if (unsafe_report) |report| return report.tools;
+    if (vm_report) |report| return report.tools;
+    return &.{};
+}
+
 fn buildResult(
     allocator: Allocator,
     plan: *const ResolvedPlan,
@@ -4321,6 +4400,7 @@ fn buildResult(
     preserved_report: ?*const preserved_image.Report,
     rebuild_report: ?*const preserved_image.RebuildReport,
     unsafe_report: ?*const UnsafeChrootRuntimeReport,
+    vm_report: ?*const VmRuntimeReport,
     source_digests: []const SourceRecord,
     output_digest: Digest,
     output_file_size: u64,
@@ -4447,10 +4527,7 @@ fn buildResult(
             .partition_length = partition_length,
             .flattened_backing_chain = flattened,
             .operation_count = operation_count,
-            .installed_packages = if (unsafe_report) |report|
-                try dupeStrings(result_allocator, report.installed_packages)
-            else
-                &.{},
+            .installed_packages = try dupeStrings(result_allocator, guestPackages(unsafe_report, vm_report)),
             .rebuild = if (rebuild_report) |report| .{
                 .profile = report.strict_profile,
                 .ext4_uuid = .{ .bytes = report.ext4_uuid },
@@ -4468,9 +4545,10 @@ fn buildResult(
             } else null,
         };
     } else null;
-    const tools = if (unsafe_report) |report| blk: {
-        const owned = try result_allocator.alloc(ToolRecord, report.tools.len);
-        for (report.tools, 0..) |tool, index| {
+    const tools = blk: {
+        const source = guestTools(unsafe_report, vm_report);
+        const owned = try result_allocator.alloc(ToolRecord, source.len);
+        for (source, 0..) |tool, index| {
             owned[index] = .{
                 .name = try result_allocator.dupe(u8, tool.name),
                 .version = try result_allocator.dupe(u8, tool.version),
@@ -4478,7 +4556,35 @@ fn buildResult(
             };
         }
         break :blk owned;
-    } else &.{};
+    };
+    const vm_record = if (vm_report) |report| blk: {
+        const record = report.execution;
+        break :blk VmExecutionRecord{
+            .emulator_command = try result_allocator.dupe(u8, record.emulator_command),
+            .emulator_version = try result_allocator.dupe(u8, record.emulator_version),
+            .machine = try result_allocator.dupe(u8, record.machine),
+            .cpu = try result_allocator.dupe(u8, record.cpu),
+            .acceleration = record.acceleration,
+            .network = record.network,
+            .memory_mib = record.memory_mib,
+            .vcpus = record.vcpus,
+            .runner_architecture = record.runner_architecture,
+            .root_device = try result_allocator.dupe(u8, record.root_device),
+            .kernel_release = try result_allocator.dupe(u8, record.kernel_release),
+            .kernel_sha256 = record.kernel_sha256,
+            .initrd_sha256 = record.initrd_sha256,
+            .control_sha256 = record.control_sha256,
+            .boot_origin = switch (record.boot_origin) {
+                .boot_directory => |boot| .{ .boot_directory = .{
+                    .kernel_path = try result_allocator.dupe(u8, boot.kernel_path),
+                    .initrd_path = try result_allocator.dupe(u8, boot.initrd_path),
+                } },
+                .unified_kernel => |unified| .{ .unified_kernel = .{
+                    .esp_path = try result_allocator.dupe(u8, unified.esp_path),
+                } },
+            },
+        };
+    } else null;
 
     return .{
         .arena = arena,
@@ -4527,6 +4633,7 @@ fn buildResult(
                 else
                     null,
                 .preserved = preserved_record,
+                .vm = vm_record,
             },
             .final_output = .{
                 .path = output_path,
@@ -4616,6 +4723,8 @@ pub fn execute(
     var rebuild_report: ?preserved_image.RebuildReport = null;
     var unsafe_report: ?UnsafeChrootRuntimeReport = null;
     defer if (unsafe_report) |*report| report.deinit();
+    var vm_report: ?VmRuntimeReport = null;
+    defer if (vm_report) |*report| report.deinit();
     switch (plan.data.execution.backend) {
         .native_fresh => {
             fresh_report = runPlan(allocator, io, plan, platform, event_sink, &bridge) catch |err| {
@@ -4708,17 +4817,43 @@ pub fn execute(
             };
         },
         .vm => {
-            try diagnostics.append(.{
-                .severity = .@"error",
+            if (event_sink) |sink| sink.emit(.{ .progress = .{
                 .phase = .execution,
-                .code = .execution_failed,
-                .configuration_path = "/execution/backend",
-                .message = "the selected backend has no runtime implementation",
-                .remediation = "do not override its unsupported preflight capability",
-            });
-            if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
-            emitDiagnostics(event_sink, diagnostics.items);
-            return try failureOutcome(allocator, diagnostics.items);
+                .message = "run package and initramfs policy inside an isolated virtual machine",
+            } });
+            var hook_context = VmHookContext{
+                .platform = platform,
+                .plan = plan,
+            };
+            defer if (hook_context.report) |*report| report.deinit();
+            const raw_report = preserved_image.transactRaw(allocator, io, .{
+                .source_path = plan.data.input.disk.path,
+                .output_path = plan.data.staging_output_path,
+                .output_format = plan.data.output.format.imageFormat().?,
+                .root_partition = plan.data.storage.preserve.root_partition,
+                .require_linux_partition = true,
+                .output_create_options = outputCreateOptions(plan),
+            }, .{
+                .context = &hook_context,
+                .runFn = runVmHook,
+            }) catch |err| {
+                try appendFailure(&diagnostics, .execution_failed, .execution, "/execution/backend", "virtual machine preserved-image execution failed", err);
+                if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
+                emitDiagnostics(event_sink, diagnostics.items);
+                return try failureOutcome(allocator, diagnostics.items);
+            };
+            vm_report = hook_context.report;
+            hook_context.report = null;
+            preserved_report = .{
+                .source_format = raw_report.source_format,
+                .output_format = raw_report.output_format,
+                .virtual_size = raw_report.virtual_size,
+                .partition_offset = raw_report.partition_offset,
+                .partition_length = raw_report.partition_length,
+                .flattened_backing_chain = raw_report.flattened_backing_chain,
+                .operation_count = plan.data.packages.actions.len +
+                    @intFromBool(plan.data.initramfs != .unchanged),
+            };
         },
     }
 
@@ -4784,6 +4919,7 @@ pub fn execute(
         if (preserved_report) |*report| report else null,
         if (rebuild_report) |*report| report else null,
         if (unsafe_report) |*report| report else null,
+        if (vm_report) |*report| report else null,
         source_digests_before,
         output_digest,
         output_file_size,
@@ -4849,6 +4985,29 @@ fn runUnsafeChrootHook(
     const context: *UnsafeChrootHookContext = @ptrCast(@alignCast(context_ptr.?));
     const run_fn = context.platform.unsafeChrootRunFn orelse
         return error.UnsafeChrootRunnerUnavailable;
+    context.report = try run_fn(
+        context.platform.context,
+        allocator,
+        io,
+        context.plan,
+        target,
+    );
+}
+
+const VmHookContext = struct {
+    platform: Platform,
+    plan: *const ResolvedPlan,
+    report: ?VmRuntimeReport = null,
+};
+
+fn runVmHook(
+    context_ptr: ?*anyopaque,
+    allocator: Allocator,
+    io: Io,
+    target: preserved_image.RawMutationTarget,
+) !void {
+    const context: *VmHookContext = @ptrCast(@alignCast(context_ptr.?));
+    const run_fn = context.platform.vmRunFn orelse return error.VmRunnerUnavailable;
     context.report = try run_fn(
         context.platform.context,
         allocator,

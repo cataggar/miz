@@ -574,6 +574,13 @@ pub fn build(b: *std.Build) void {
         });
         b.installArtifact(zvmiguest_exe);
         zvmiguest_step.dependOn(&zvmiguest_exe.step);
+        // The builder embeds every agent rather than locating one on disk at
+        // run time, so the bytes that boot a guest are the bytes this build
+        // produced and provenance can name them without qualification.
+        preserved_image_builder_exe.root_module.addAnonymousImport(
+            b.fmt("zvmi_guest_agent_{s}", .{@tagName(architecture)}),
+            .{ .root_source_file = zvmiguest_exe.getEmittedBin() },
+        );
     }
 
     const zvmiguest_tests = b.addTest(.{
