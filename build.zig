@@ -376,6 +376,27 @@ pub fn build(b: *std.Build) void {
         &run_unsafe_chroot_integration.step,
     );
 
+    const vm_backend_integration_exe = b.addExecutable(.{
+        .name = "zvmi-vm-backend-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/vm_backend_integration.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zvmi", .module = host_zvmi_mod },
+            },
+        }),
+        .linkage = .static,
+    });
+    const run_vm_backend_integration = b.addRunArtifact(
+        vm_backend_integration_exe,
+    );
+    const vm_backend_integration_step = b.step(
+        "test-vm-backend",
+        "Run the vm backend lifecycle against a stand-in emulator",
+    );
+    vm_backend_integration_step.dependOn(&run_vm_backend_integration.step);
+
     const host_qmp_mod = b.createModule(.{
         .root_source_file = b.path("qmp/src/qmp.zig"),
         .target = b.graph.host,
@@ -881,6 +902,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_boot_smoke_tests.step);
     test_step.dependOn(&run_freebsd_boot_tests.step);
     test_step.dependOn(&run_unsafe_chroot_integration.step);
+    test_step.dependOn(&run_vm_backend_integration.step);
     test_step.dependOn(&run_nbd_mod_tests.step);
     test_step.dependOn(&run_nbd_exe_tests.step);
     test_step.dependOn(&run_nbd_server_tests.step);
