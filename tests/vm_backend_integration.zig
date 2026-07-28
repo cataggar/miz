@@ -675,18 +675,24 @@ fn createSourceDisk(
         try tree.putDirectory(path, .{ .mode = 0o755 });
     }
     // The transport the backend picks is a fact about the image's kernel, so
-    // the fixture states it the same way a real image does.
+    // the fixture states it the same way a real image does -- including the
+    // PCI bus the devices hang off, and the SCSI disk driver without which a
+    // virtio-scsi controller presents no `/dev/sda`.
     try tree.putFileBytes(
         "lib/modules/" ++ kernel_release ++ "/modules.builtin",
         switch (transport) {
             .virtio_blk =>
             \\kernel/fs/ext4/ext4.ko
+            \\kernel/drivers/virtio/virtio_pci.ko
             \\kernel/drivers/block/virtio_blk.ko
             \\kernel/drivers/net/virtio_net.ko
             \\
             ,
             .virtio_scsi =>
             \\kernel/fs/ext4/ext4.ko
+            \\kernel/drivers/virtio/virtio_pci.ko
+            \\kernel/drivers/scsi/scsi_mod.ko
+            \\kernel/drivers/scsi/sd_mod.ko
             \\kernel/drivers/scsi/virtio_scsi.ko
             \\kernel/drivers/net/virtio_net.ko
             \\
