@@ -194,7 +194,47 @@ pub const ExecutionPolicy = struct {
     /// Required for scripts and for `unsafe_chroot`, which executes target
     /// code on the host and is not a sandbox.
     acknowledge_unsafe: bool = false,
+    /// Required by, and only meaningful to, the `vm` backend.
+    vm: ?VmPolicy = null,
 };
+
+/// How the `vm` backend executes guest instructions. There is deliberately no
+/// `auto`: a run that claims hardware acceleration and silently receives
+/// software emulation would record a false accelerator in its provenance.
+pub const VmAcceleration = enum {
+    /// Hardware virtualization. Requires the runner architecture to equal the
+    /// host architecture and an accessible accelerator device.
+    hardware,
+    /// Full software emulation. The only option across architectures.
+    software,
+};
+
+/// Whether the guest is given a network device. Package repositories are the
+/// only reason to attach one.
+pub const VmNetworkPolicy = enum {
+    offline,
+    declared_repositories,
+};
+
+pub const VmPolicy = struct {
+    /// The `qemu-system-<arch>` binary for the runner architecture. Never
+    /// inferred from the host architecture.
+    emulator_command: []const u8,
+    acceleration: VmAcceleration = .hardware,
+    /// Acknowledges software emulation for a same-architecture run, where
+    /// hardware acceleration would otherwise be expected.
+    acknowledge_software_emulation: bool = false,
+    memory_mib: u32 = 2048,
+    vcpus: u8 = 2,
+    network: VmNetworkPolicy = .offline,
+    boot_timeout_seconds: u32 = 900,
+    machine: ?[]const u8 = null,
+    cpu: ?[]const u8 = null,
+};
+
+pub const min_vm_memory_mib: u32 = 512;
+pub const max_vm_memory_mib: u32 = 1024 * 1024;
+pub const max_vm_boot_timeout_seconds: u32 = 24 * 60 * 60;
 
 pub const PackageAction = union(enum) {
     install: []const []const u8,
@@ -725,6 +765,7 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
     try validateInitramfsPolicy(&diagnostics, request.initramfs);
     try validateSelinuxPolicy(&diagnostics, request.selinux);
     try validateCrossArchitecturePolicy(&diagnostics, request.cross_architecture);
+    try validateVmPolicy(&diagnostics, request);
     if (request.packages.actions.len > std.math.maxInt(u16) - 32 or
         request.hooks.len > std.math.maxInt(u16) - 32 or
         request.packages.actions.len + request.hooks.len > std.math.maxInt(u16) - 32)
@@ -1069,6 +1110,111 @@ fn validateCrossArchitecturePolicy(
                 "/cross_architecture/runner/command",
                 "qemu_user and vm runners require an explicit command",
                 null,
+            ));
+        },
+    }
+}
+
+fn validateVmPolicy(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    request: *const Request,
+) Allocator.Error!void {
+    const policy = request.execution.vm orelse {
+        if (request.execution.backend == .vm) {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                "/execution/vm",
+                "the vm backend requires an explicit VM policy",
+                "set execution.vm with at least an emulator_command",
+            ));
+        }
+        return;
+    };
+    if (request.execution.backend != .vm) {
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/execution/vm",
+            "a VM policy is only meaningful to the vm backend",
+            "select execution.backend = vm or remove execution.vm",
+        ));
+        return;
+    }
+    if (policy.emulator_command.len == 0) {
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/execution/vm/emulator_command",
+            "the vm backend requires an explicit emulator command",
+            "set emulator_command to the qemu-system binary for the runner architecture",
+        ));
+    } else if (!std.fs.path.isAbsolute(policy.emulator_command)) {
+        // Resolving a bare name against PATH here would let the recorded
+        // emulator differ from the one that ran, so the caller must resolve it.
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/execution/vm/emulator_command",
+            "the emulator command must be an absolute path",
+            "resolve the qemu-system binary against PATH before building the request",
+        ));
+    }
+    if (policy.memory_mib < min_vm_memory_mib or policy.memory_mib > max_vm_memory_mib) {
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/execution/vm/memory_mib",
+            "guest memory is outside the supported range",
+            "select at least 512 MiB and at most 1 TiB",
+        ));
+    }
+    if (policy.vcpus == 0) {
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/execution/vm/vcpus",
+            "the guest requires at least one virtual CPU",
+            "select a vcpu count of at least 1",
+        ));
+    }
+    if (policy.boot_timeout_seconds == 0 or
+        policy.boot_timeout_seconds > max_vm_boot_timeout_seconds)
+    {
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/execution/vm/boot_timeout_seconds",
+            "the guest boot timeout is outside the supported range",
+            "select a timeout of at least 1 second and at most 86400 seconds",
+        ));
+    }
+    if (policy.machine) |machine| if (machine.len == 0) {
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/execution/vm/machine",
+            "the machine override must not be empty",
+            "remove the override or name a machine type",
+        ));
+    };
+    if (policy.cpu) |cpu| if (cpu.len == 0) {
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/execution/vm/cpu",
+            "the cpu override must not be empty",
+            "remove the override or name a cpu model",
+        ));
+    };
+    switch (policy.network) {
+        .offline => if (request.packages.actions.len != 0 and
+            request.packages.cache != .cache_only)
+        {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                "/execution/vm/network",
+                "online package actions cannot run in an offline guest",
+                "attach declared_repositories networking or select a cache_only package policy",
+            ));
+        },
+        .declared_repositories => if (request.packages.repositories.len == 0) {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                "/execution/vm/network",
+                "guest networking was requested without any declared repository",
+                "declare the repositories the guest may reach or select offline networking",
             ));
         },
     }
@@ -1773,6 +1919,32 @@ pub fn resolve(
         }
     }
 
+    if (request.execution.vm) |vm| {
+        const native_runner = resolved_runner_architecture == context.host_architecture;
+        switch (vm.acceleration) {
+            .hardware => if (!native_runner) {
+                try resolution_diagnostics.append(.{
+                    .severity = .@"error",
+                    .phase = .resolution,
+                    .code = .incompatible_architecture,
+                    .configuration_path = "/execution/vm/acceleration",
+                    .message = "hardware acceleration cannot emulate a foreign runner architecture",
+                    .remediation = "select software acceleration for a cross-architecture run",
+                });
+            },
+            .software => if (native_runner and !vm.acknowledge_software_emulation) {
+                try resolution_diagnostics.append(.{
+                    .severity = .@"error",
+                    .phase = .resolution,
+                    .code = .invalid_policy,
+                    .configuration_path = "/execution/vm/acceleration",
+                    .message = "software emulation was selected for a native runner architecture",
+                    .remediation = "select hardware acceleration or set acknowledge_software_emulation",
+                });
+            },
+        }
+    }
+
     const checked_output_path = try std.fs.path.resolve(allocator, &.{ context.base_path, request.output.path });
     defer allocator.free(checked_output_path);
     const checked_workspace_path = try std.fs.path.resolve(allocator, &.{ context.base_path, request.execution.workspace_path });
@@ -1916,6 +2088,7 @@ pub fn resolve(
         .backend = request.execution.backend,
         .overwrite = request.execution.overwrite,
         .acknowledge_unsafe = request.execution.acknowledge_unsafe,
+        .vm = try dupeVmPolicy(plan_allocator, request.execution.vm),
     };
     const resolved_input: ResolvedInput = switch (request.input) {
         .iso_oci => |input| .{ .iso_oci = .{
@@ -2292,6 +2465,24 @@ fn dupeInitramfsPolicy(
             .generator = if (regenerate.generator) |generator| try allocator.dupe(u8, generator) else null,
             .kernels = try dupeStrings(allocator, regenerate.kernels),
         } },
+    };
+}
+
+fn dupeVmPolicy(
+    allocator: Allocator,
+    policy: ?VmPolicy,
+) Allocator.Error!?VmPolicy {
+    const present = policy orelse return null;
+    return .{
+        .emulator_command = try allocator.dupe(u8, present.emulator_command),
+        .acceleration = present.acceleration,
+        .acknowledge_software_emulation = present.acknowledge_software_emulation,
+        .memory_mib = present.memory_mib,
+        .vcpus = present.vcpus,
+        .network = present.network,
+        .boot_timeout_seconds = present.boot_timeout_seconds,
+        .machine = if (present.machine) |machine| try allocator.dupe(u8, machine) else null,
+        .cpu = if (present.cpu) |cpu| try allocator.dupe(u8, cpu) else null,
     };
 }
 
@@ -2681,7 +2872,7 @@ fn buildCapabilities(
             try capabilities.append(.{ .kind = .standalone_output, .path = output.path, .reason = "publish a standalone output" });
         },
         .vm => {
-            try capabilities.append(.{ .kind = .vm, .path = "", .reason = "the VM customization backend is not implemented" });
+            try capabilities.append(.{ .kind = .vm, .path = "", .reason = "run the isolated full-system VM executor" });
             try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "execute target code in a VM" });
             try capabilities.append(.{ .kind = .standalone_output, .path = output.path, .reason = "publish a standalone output" });
         },
@@ -2942,6 +3133,20 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     hashInt(&hash, @intFromEnum(plan.execution.backend));
     hashBool(&hash, plan.execution.overwrite);
     hashBool(&hash, plan.execution.acknowledge_unsafe);
+    if (plan.execution.vm) |vm| {
+        hash.update(&.{1});
+        hashString(&hash, vm.emulator_command);
+        hashInt(&hash, @intFromEnum(vm.acceleration));
+        hashBool(&hash, vm.acknowledge_software_emulation);
+        hashInt(&hash, vm.memory_mib);
+        hashInt(&hash, vm.vcpus);
+        hashInt(&hash, @intFromEnum(vm.network));
+        hashInt(&hash, vm.boot_timeout_seconds);
+        hashOptionalString(&hash, vm.machine);
+        hashOptionalString(&hash, vm.cpu);
+    } else {
+        hash.update(&.{0});
+    }
     hash.update(&plan.reproducibility.seed.bytes);
     hashInt(&hash, plan.reproducibility.source_date_epoch);
     hashString(&hash, plan.transaction_path);
@@ -3299,6 +3504,11 @@ pub const Platform = struct {
         plan: *const ResolvedPlan,
         target: preserved_image.RawMutationTarget,
     ) anyerror!UnsafeChrootRuntimeReport = null,
+    vmCheckFn: ?*const fn (
+        context: ?*anyopaque,
+        io: Io,
+        plan: *const ResolvedPlan,
+    ) CapabilityState = null,
 
     pub fn system() Platform {
         return .{ .checkFn = systemCapabilityCheck };
@@ -3306,6 +3516,15 @@ pub const Platform = struct {
 
     fn check(self: Platform, io: Io, requirement: CapabilityRequirement) CapabilityState {
         return self.checkFn(self.context, io, requirement);
+    }
+
+    fn checkVm(
+        self: Platform,
+        io: Io,
+        plan: *const ResolvedPlan,
+    ) CapabilityState {
+        const check_fn = self.vmCheckFn orelse return .unsupported;
+        return check_fn(self.context, io, plan);
     }
 
     fn checkUnsafeChroot(
@@ -3376,22 +3595,29 @@ pub fn preflight(
             .arbitrary_filesystem_mutation,
             .generalization,
             => if (plan.data.execution.backend == .rebuild) .available else .unsupported,
-            .vm,
+            .vm => vmCapabilityState(platform, io, plan),
             .package_cache,
             .package_lock,
-            .script_execution,
             .selinux_policy,
             .selinux_relabel,
-            .cross_architecture_runner,
             .boot_policy_mutation,
             => .unsupported,
+            .script_execution,
+            .cross_architecture_runner,
+            => if (plan.data.execution.backend == .vm)
+                vmCapabilityState(platform, io, plan)
+            else
+                .unsupported,
             .unsafe_chroot,
             .package_management,
             .repository_access,
             .repository_trust,
             .guest_execution,
             .initramfs_regeneration,
-            => unsafeChrootCapabilityState(platform, io, plan),
+            => if (plan.data.execution.backend == .vm)
+                vmCapabilityState(platform, io, plan)
+            else
+                unsafeChrootCapabilityState(platform, io, plan),
             else => platform.check(io, requirement),
         };
         const owned_requirement = CapabilityRequirement{
@@ -3470,6 +3696,64 @@ fn unsafeChrootCapabilityState(
         },
     }
     return platform.checkUnsafeChroot(io, plan);
+}
+
+/// Gates the `vm` backend on the plan shape it can actually execute, then
+/// defers the host resource probe (emulator, accelerator, free space) to the
+/// platform. Every rejection here happens before any output is touched.
+fn vmCapabilityState(
+    platform: Platform,
+    io: Io,
+    plan: *const ResolvedPlan,
+) CapabilityState {
+    const data = plan.data;
+    const vm = data.execution.vm orelse return .unsupported;
+    if (data.execution.backend != .vm or
+        data.input != .disk or
+        data.storage != .preserve or
+        data.existing_path_operations.len != 0 or
+        hasOsCustomization(data.os) or
+        data.generalization != .none or
+        data.selinux != .unchanged or
+        !isDefaultBootPolicy(data.boot_security) or
+        data.packages.lock != .unlocked)
+    {
+        return .unsupported;
+    }
+    if (data.hooks.len != 0 and !data.execution.acknowledge_unsafe) return .unsupported;
+    if (vm.acceleration == .hardware and
+        data.architectures.runner != data.architectures.host)
+    {
+        return .unsupported;
+    }
+    if (data.architectures.runner != data.architectures.image) return .unsupported;
+    for (data.packages.actions) |action| {
+        const names = switch (action) {
+            .install => |values| values,
+            .remove => |values| values,
+            .update_all, .update_selected => return .unsupported,
+        };
+        if (names.len == 0) return .unsupported;
+        for (names) |name| {
+            if (!validUnsafePackageName(name)) return .unsupported;
+        }
+    }
+    for (data.packages.repositories) |repository| {
+        if (!validUnsafeRepositoryId(repository.id)) return .unsupported;
+    }
+    switch (data.initramfs) {
+        .unchanged => {},
+        .regenerate => |regenerate| {
+            if (regenerate.kernels.len == 0) return .unsupported;
+            for (regenerate.kernels) |kernel| {
+                if (!validUnsafeKernelRelease(kernel)) return .unsupported;
+            }
+            if (regenerate.generator) |generator| {
+                if (!std.mem.eql(u8, generator, "dracut")) return .unsupported;
+            }
+        },
+    }
+    return platform.checkVm(io, plan);
 }
 
 fn validUnsafeRepositoryId(id: []const u8) bool {
@@ -4023,6 +4307,7 @@ fn buildResult(
         .backend = plan.data.execution.backend,
         .overwrite = plan.data.execution.overwrite,
         .acknowledge_unsafe = plan.data.execution.acknowledge_unsafe,
+        .vm = try dupeVmPolicy(result_allocator, plan.data.execution.vm),
     };
     const resolved_boot = try dupeBootPolicy(result_allocator, plan.data.boot_security);
     const resolved_os = try dupeOsCustomization(result_allocator, plan.data.os, null);
@@ -4547,6 +4832,7 @@ fn hasValidPlanIntegrity(allocator: Allocator, plan: *const ResolvedPlan) Alloca
             }
         },
     }
+    if ((data.execution.backend == .vm) != (data.execution.vm != null)) return false;
     if (!try hasExpectedOperations(allocator, plan)) return false;
     const needs_guest_execution = data.execution.backend == .unsafe_chroot or
         data.execution.backend == .vm or
@@ -5078,6 +5364,16 @@ fn validNativeEditRequest(
     };
 }
 
+/// A VM policy that passes validation, so tests can isolate the property they
+/// are actually exercising.
+fn validVmPolicy() VmPolicy {
+    return .{
+        .emulator_command = "/usr/bin/qemu-system-x86_64",
+        .acceleration = .software,
+        .acknowledge_software_emulation = true,
+    };
+}
+
 fn hasDiagnosticCode(diagnostics: DiagnosticSet, code: DiagnosticCode) bool {
     for (diagnostics.items) |diagnostic| {
         if (diagnostic.code == code) return true;
@@ -5402,10 +5698,12 @@ test "v3 validation models the backend and unsafe execution matrix" {
     inline for (.{ ExecutionBackend.native_edit, .rebuild, .unsafe_chroot, .vm }) |backend| {
         native_edit.execution.backend = backend;
         native_edit.execution.acknowledge_unsafe = backend == .unsafe_chroot;
+        native_edit.execution.vm = if (backend == .vm) validVmPolicy() else null;
         var diagnostics = try validate(std.testing.allocator, &native_edit);
         defer diagnostics.deinit(std.testing.allocator);
         try std.testing.expect(!diagnostics.hasErrors());
     }
+    native_edit.execution.vm = null;
 
     native_edit.execution.backend = .native_fresh;
     var wrong_shape = try validate(std.testing.allocator, &native_edit);
@@ -5448,6 +5746,10 @@ test "cross-architecture guest execution requires an explicit compatible runner"
     request.target_architecture = .aarch64;
     request.execution.backend = .vm;
     request.execution.acknowledge_unsafe = true;
+    request.execution.vm = .{
+        .emulator_command = "/usr/bin/qemu-system-aarch64",
+        .acceleration = .software,
+    };
     request.hooks = &hooks;
 
     var rejected = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
@@ -5586,6 +5888,7 @@ test "unsupported guest-code backends fail preflight before workspace mutation" 
         var request = validNativeEditRequest(source_path, case.output, case.workspace, &.{});
         request.execution.backend = case.backend;
         request.execution.acknowledge_unsafe = case.backend == .unsafe_chroot;
+        request.execution.vm = if (case.backend == .vm) validVmPolicy() else null;
         var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
         defer resolved.deinit(std.testing.allocator);
         try std.testing.expect(resolved.plan != null);
@@ -5610,6 +5913,187 @@ test "unsupported guest-code backends fail preflight before workspace mutation" 
         try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, case.workspace, .{}));
         try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, case.output, .{}));
     }
+}
+
+test "the vm backend requires an explicit and self-consistent VM policy" {
+    var request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    request.execution.backend = .vm;
+
+    // A VM backend without a policy is rejected rather than given host defaults.
+    {
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(hasDiagnosticCode(diagnostics, .invalid_policy));
+    }
+
+    // A policy is equally meaningless to every other backend.
+    {
+        var stray = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+        stray.execution.vm = validVmPolicy();
+        var diagnostics = try validate(std.testing.allocator, &stray);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(hasDiagnosticCode(diagnostics, .invalid_policy));
+    }
+
+    const install = [_]PackageAction{.{ .install = &.{"vim"} }};
+    const repositories = [_]PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.com/base"},
+        .trust = &.{.{ .inline_bytes = "key" }},
+    }};
+
+    const cases = [_]struct {
+        name: []const u8,
+        policy: VmPolicy,
+        packages: PackagePolicy = .{},
+    }{
+        .{ .name = "empty emulator", .policy = .{ .emulator_command = "" } },
+        .{ .name = "relative emulator", .policy = .{
+            .emulator_command = "qemu-system-x86_64",
+            .acceleration = .software,
+            .acknowledge_software_emulation = true,
+        } },
+        .{ .name = "memory below floor", .policy = blk: {
+            var policy = validVmPolicy();
+            policy.memory_mib = min_vm_memory_mib - 1;
+            break :blk policy;
+        } },
+        .{ .name = "memory above ceiling", .policy = blk: {
+            var policy = validVmPolicy();
+            policy.memory_mib = max_vm_memory_mib + 1;
+            break :blk policy;
+        } },
+        .{ .name = "no vcpus", .policy = blk: {
+            var policy = validVmPolicy();
+            policy.vcpus = 0;
+            break :blk policy;
+        } },
+        .{ .name = "no boot timeout", .policy = blk: {
+            var policy = validVmPolicy();
+            policy.boot_timeout_seconds = 0;
+            break :blk policy;
+        } },
+        .{ .name = "boot timeout above ceiling", .policy = blk: {
+            var policy = validVmPolicy();
+            policy.boot_timeout_seconds = max_vm_boot_timeout_seconds + 1;
+            break :blk policy;
+        } },
+        .{ .name = "empty machine override", .policy = blk: {
+            var policy = validVmPolicy();
+            policy.machine = "";
+            break :blk policy;
+        } },
+        .{ .name = "empty cpu override", .policy = blk: {
+            var policy = validVmPolicy();
+            policy.cpu = "";
+            break :blk policy;
+        } },
+        .{
+            .name = "online packages in an offline guest",
+            .policy = validVmPolicy(),
+            .packages = .{ .actions = &install, .repositories = &repositories },
+        },
+        .{
+            .name = "networking without declared repositories",
+            .policy = blk: {
+                var policy = validVmPolicy();
+                policy.network = .declared_repositories;
+                break :blk policy;
+            },
+        },
+    };
+
+    for (cases) |case| {
+        request.execution.vm = case.policy;
+        request.packages = case.packages;
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        std.testing.expect(hasDiagnosticCode(diagnostics, .invalid_policy)) catch |err| {
+            std.debug.print("expected rejection for case '{s}'\n", .{case.name});
+            return err;
+        };
+    }
+
+    // The same request with a coherent policy validates, so the cases above
+    // each isolate one property rather than a shared mistake.
+    request.execution.vm = validVmPolicy();
+    request.packages = .{};
+    var accepted = try validate(std.testing.allocator, &request);
+    defer accepted.deinit(std.testing.allocator);
+    try std.testing.expect(!accepted.hasErrors());
+}
+
+test "vm acceleration is resolved against the runner architecture" {
+    var request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    request.execution.backend = .vm;
+
+    // Hardware acceleration cannot cross architectures, so it is rejected
+    // rather than quietly degraded to software emulation.
+    request.target_architecture = .aarch64;
+    request.cross_architecture = .{ .runner = .{
+        .kind = .vm,
+        .guest_architecture = .aarch64,
+        .command = "qemu-system-aarch64",
+    } };
+    request.execution.vm = .{
+        .emulator_command = "/usr/bin/qemu-system-aarch64",
+        .acceleration = .hardware,
+    };
+    var foreign = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer foreign.deinit(std.testing.allocator);
+    try std.testing.expect(foreign.plan == null);
+    try std.testing.expect(hasDiagnosticCode(foreign.diagnostics, .incompatible_architecture));
+
+    // Software emulation on a native runner is a large silent cost, so it must
+    // be acknowledged.
+    request.target_architecture = .x86_64;
+    request.cross_architecture = .reject;
+    request.execution.vm = .{
+        .emulator_command = "/usr/bin/qemu-system-x86_64",
+        .acceleration = .software,
+    };
+    var unacknowledged = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer unacknowledged.deinit(std.testing.allocator);
+    try std.testing.expect(unacknowledged.plan == null);
+    try std.testing.expect(hasDiagnosticCode(unacknowledged.diagnostics, .invalid_policy));
+
+    request.execution.vm.?.acknowledge_software_emulation = true;
+    var acknowledged = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer acknowledged.deinit(std.testing.allocator);
+    try std.testing.expect(acknowledged.plan != null);
+}
+
+test "a vm plan whose policy was stripped fails integrity before mutation" {
+    const io = std.testing.io;
+    const source_path = "test-customize-vm-integrity.raw";
+    const workspace_path = "test-customize-vm-integrity-work";
+    const output_path = workspace_path ++ "/output.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    {
+        const source = try Io.Dir.cwd().createFile(io, source_path, .{});
+        defer source.close(io);
+        try source.writePositionalAll(io, "readable-source", 0);
+    }
+
+    var request = validNativeEditRequest(source_path, output_path, workspace_path, &.{});
+    request.execution.backend = .vm;
+    request.execution.vm = validVmPolicy();
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.plan != null);
+
+    @constCast(resolved.plan.?.data).execution.vm = null;
+    var report = try preflight(std.testing.allocator, io, &resolved.plan.?, Platform.system());
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expect(!report.ready());
+    try std.testing.expectEqual(DiagnosticCode.invalid_plan, report.diagnostics.items[0].code);
+
+    var outcome = try execute(std.testing.allocator, io, &resolved.plan.?, Platform.system(), null);
+    defer outcome.deinit(std.testing.allocator);
+    try std.testing.expect(outcome.result == null);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, workspace_path, .{}));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, output_path, .{}));
 }
 
 test "rebuild rejects unsupported source profiles before workspace mutation" {

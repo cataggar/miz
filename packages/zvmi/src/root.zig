@@ -41,6 +41,7 @@ pub const os_customization = @import("os_customization.zig");
 pub const customization_wire = @import("customization_wire.zig");
 pub const preserved_image_wire = @import("preserved_image_wire.zig");
 pub const unsafe_chroot = @import("unsafe_chroot.zig");
+pub const vm_backend = @import("vm_backend.zig");
 pub const artifact_pipeline = @import("artifact_pipeline.zig");
 pub const verity = @import("verity.zig");
 pub const authenticode = @import("authenticode.zig");
