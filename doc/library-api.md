@@ -248,6 +248,17 @@ The v3 contract implements rootless `native_fresh`, constrained `native_edit`, s
 
 `zvmi.root_tree.RootTree` is the lower-level owned filesystem API. It spools bounded file and symlink content independently of ISO, SquashFS, OCI, or ext4 reader lifetimes; owns paths and POSIX metadata; applies deterministic replacement and recursive removal; and exposes a stable manifest digest. `ext4View()` adapts a validated tree to `zvmi.ext4.populate`, while `populateFat32()` either requires FAT-representable metadata or applies the caller's explicit lossy POSIX-metadata policy. Unsupported hardlinks, special files, timestamps, or metadata are rejected rather than silently discarded.
 
+`zvmi.output` is the streaming artifact writer shared by `convert`,
+`build-image`, and the customization backends. `output.Spec.parseName`
+accepts `raw`, `raw.gz`, `raw.zst`, `vhd`, `vhdx`, and `qcow2`;
+`output.validate` rejects the combinations that cannot be produced in a
+single forward pass (compression for anything but raw, and `-o -` for the
+seek-back formats) with named errors; and `output.writeImage`/`writeImageTo`
+stream an `Image` into a writer or destination, emitting sparse and all-zero
+regions as compressed zero runs and verifying the full virtual size was
+produced before reporting success. `customize.OutputFormat` gains `raw_gz`
+and `raw_zst` so bundle builds can publish a compressed artifact directly.
+
 `zvmi.preserved_image.edit` is the lower-level constrained existing-path API, while `zvmi.preserved_image.rebuild` performs the strict full-tree rebuild described above. Both accept raw, VHD, VHDX, or qcow2 disks, copy guest-visible bytes into exclusive raw staging, flatten qcow2 backing chains, operate on an explicitly selected one-based GPT or MBR partition, convert to a standalone output, and publish without replacing an existing destination. Sources and backing files are opened read-only.
 
 
