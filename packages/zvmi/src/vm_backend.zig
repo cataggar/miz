@@ -338,6 +338,12 @@ fn rootDevicePath(
 ) ![]const u8 {
     const index = switch (selector) {
         .gpt_index, .mbr_index => |value| value,
+        // The guest reaches the root through /dev/vdaN, which exists only
+        // for a partition. A logical volume would need the volume manager
+        // activated inside the guest, which this initramfs does not carry,
+        // so the request is refused rather than pointed at the partition
+        // that merely contains the volume group.
+        .logical_volume => return error.UnsupportedRootPartitionInVm,
     };
     if (index == 0 or index > 128) return error.UnsupportedRootPartition;
     return std.fmt.allocPrint(allocator, "{s}{d}", .{ stage_device, index });

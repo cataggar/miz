@@ -29,8 +29,8 @@ const verity = @import("verity.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 9;
-pub const provenance_schema_version: u32 = 12;
+pub const plan_schema_version: u32 = 10;
+pub const provenance_schema_version: u32 = 13;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -837,6 +837,14 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
                     "/storage/preserve/root_partition/mbr_index",
                     "MBR partition selectors are one-based and limited to the four primary entries",
                     "select an MBR partition index from 1 through 4",
+                ));
+            },
+            .logical_volume => |volume| if (volume.logical_volume.len == 0) {
+                try diagnostics.append(validationError(
+                    .invalid_partition_selector,
+                    "/storage/preserve/root_partition/logical_volume/logical_volume",
+                    "a logical volume selector needs the name of a logical volume",
+                    "name the logical volume, as in vg/root or just root when the disk has one volume group",
                 ));
             },
         },
@@ -2254,7 +2262,7 @@ pub fn resolve(
             .skip_iso_rootfs = storage.skip_iso_rootfs,
         } },
         .preserve => |storage| .{ .preserve = .{
-            .root_partition = storage.root_partition,
+            .root_partition = try dupePartitionSelector(plan_allocator, storage.root_partition),
             .source_profile = storage.source_profile,
             .source_mounts = try dupeSourceMounts(plan_allocator, storage.source_mounts),
             .identity_rewrite = storage.identity_rewrite,
@@ -2483,8 +2491,24 @@ fn dupeSourceMounts(
         copy.* = mount;
         copy.source_path = try allocator.dupe(u8, mount.source_path);
         copy.target = try allocator.dupe(u8, mount.target);
+        copy.partition = try dupePartitionSelector(allocator, mount.partition);
     }
     return copies;
+}
+
+/// A logical volume selector borrows the caller's names, so a plan that
+/// outlives the request has to own them like every other string it keeps.
+fn dupePartitionSelector(
+    allocator: Allocator,
+    selector: PartitionSelector,
+) Allocator.Error!PartitionSelector {
+    return switch (selector) {
+        .gpt_index, .mbr_index => selector,
+        .logical_volume => |volume| .{ .logical_volume = .{
+            .volume_group = try allocator.dupe(u8, volume.volume_group),
+            .logical_volume = try allocator.dupe(u8, volume.logical_volume),
+        } },
+    };
 }
 
 fn dupeExistingPathOperations(
@@ -3573,6 +3597,10 @@ fn hashPartitionSelector(
     switch (selector) {
         .gpt_index => |index| hashInt(hash, index),
         .mbr_index => |index| hashInt(hash, index),
+        .logical_volume => |volume| {
+            hashString(hash, volume.volume_group);
+            hashString(hash, volume.logical_volume);
+        },
     }
 }
 
@@ -7523,7 +7551,7 @@ test "plan JSON renders identifiers as stable strings" {
     defer output.deinit();
     try writePlanJson(&resolved.plan.?, &output.writer);
     const json = output.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 10") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"plan_hash\": \"") != null);
 }
 

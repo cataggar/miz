@@ -18,6 +18,7 @@ const Image = image_mod.Image;
 const mbr = @import("mbr.zig");
 const os_customization = @import("os_customization.zig");
 const output_mod = @import("output.zig");
+const lvm = @import("lvm.zig");
 const root_tree = @import("root_tree.zig");
 
 const Io = std.Io;
@@ -27,11 +28,25 @@ const Allocator = std.mem.Allocator;
 /// with the same flag, that a rebuild enforces.
 const limit_defaults = limits_mod.ImportLimits{};
 
+/// Names a logical volume inside an LVM2 volume group on the disk, for the
+/// installs that put the root filesystem there instead of straight into a
+/// partition. Read-only: the volume is located and its bytes are used, and
+/// nothing ever writes LVM metadata.
+pub const LogicalVolumeSelector = struct {
+    /// Empty names the disk's only volume group. Naming one becomes
+    /// required as soon as the disk carries more than one, because picking
+    /// between them by position would be a guess.
+    volume_group: []const u8 = "",
+    logical_volume: []const u8,
+};
+
 pub const PartitionSelector = union(enum) {
     /// One-based slot in the GPT partition entry array.
     gpt_index: u32,
     /// One-based slot in the four-entry MBR partition table.
     mbr_index: u8,
+    /// A logical volume, wherever on the disk the volume group put it.
+    logical_volume: LogicalVolumeSelector,
 };
 
 pub const FileSource = union(enum) {
@@ -1798,6 +1813,11 @@ fn partitionUuidText(
             @memcpy(buffer[0..text.len], text);
             return buffer[0..text.len];
         },
+        // A logical volume is not a partition and Linux gives it no
+        // PARTUUID, so there is genuinely no identifier to report. Callers
+        // treat null as "identify this filesystem some other way" rather
+        // than inventing a name for something the kernel will not know.
+        .logical_volume => return null,
     }
 }
 
@@ -2348,7 +2368,47 @@ fn validAbsoluteImagePath(path: []const u8) bool {
     return true;
 }
 
+/// Resolves a logical volume to the byte range it occupies on the disk.
+///
+/// Only a volume that is one unbroken run on one physical volume can be
+/// handed to a reader that takes an offset and a length; anything else is
+/// refused by `lvm.contiguousRange` rather than truncated to its first run.
+fn selectLogicalVolume(
+    allocator: Allocator,
+    io: Io,
+    image: Image,
+    selector: LogicalVolumeSelector,
+) !Partition {
+    var found = try lvm.scan(allocator, image, io);
+    defer found.deinit();
+    const selected = try found.findLogicalVolume(
+        selector.volume_group,
+        selector.logical_volume,
+    );
+    const range = try lvm.contiguousRange(selected.group, selected.volume);
+    const end = std.math.add(u64, range.offset, range.length) catch
+        return error.InvalidPartitionBounds;
+    if (range.length == 0 or end > image.virtual_size) return error.InvalidPartitionBounds;
+    return .{ .offset = range.offset, .length = range.length };
+}
+
 fn selectPartition(
+    allocator: Allocator,
+    io: Io,
+    image: Image,
+    selector: PartitionSelector,
+) !Partition {
+    // A logical volume is resolved without reading the boot record at all: a
+    // physical volume may occupy the whole disk, in which case there is no
+    // partition table, and failing for want of one would be the wrong
+    // answer.
+    return switch (selector) {
+        .logical_volume => |volume| selectLogicalVolume(allocator, io, image, volume),
+        .gpt_index, .mbr_index => selectTablePartition(allocator, io, image, selector),
+    };
+}
+
+fn selectTablePartition(
     allocator: Allocator,
     io: Io,
     image: Image,
@@ -2393,6 +2453,7 @@ fn selectPartition(
                 .length = @as(u64, partition.sector_count) * mbr.sector_size,
             };
         },
+        .logical_volume => unreachable, // routed away by `selectPartition`
     };
 }
 
@@ -2472,6 +2533,12 @@ fn selectRebuildPartition(
                 return error.UnsupportedRootPartitionType;
             }
         },
+        // A logical volume holds a filesystem directly -- there is no
+        // partition type to vet, and the volume's own run has already been
+        // checked to lie inside its physical volume. Rewriting the
+        // filesystem in place leaves every LVM structure untouched, since
+        // the range starts and ends exactly where the volume does.
+        .logical_volume => {},
     }
     return selected;
 }
@@ -3681,6 +3748,246 @@ test "preserved editor mutates a raw copy without changing source or unrelated b
     const original = try source_reader.readFileAlloc(io, std.testing.allocator, "/etc/config");
     defer std.testing.allocator.free(original);
     try std.testing.expectEqualStrings("before\n", original);
+}
+
+/// Builds a disk whose root filesystem lives on a logical volume, which is
+/// what a guided Ubuntu or Debian install produces: one MBR partition holding
+/// an LVM2 physical volume, and the filesystem inside a volume in it.
+///
+/// The physical volume is written byte by byte because `lvm2` needs root and
+/// device-mapper and cannot be run here.
+const lvm_test_disk_size: u64 = 64 * 1024 * 1024;
+const lvm_test_pv_offset: u64 = 1024 * 1024;
+const lvm_test_pv_size: u64 = 48 * 1024 * 1024;
+const lvm_test_mda_offset: u64 = 4096;
+const lvm_test_mda_size: u64 = 64 * 1024;
+const lvm_test_pe_start: u64 = 2048; // sectors
+const lvm_test_extent_sectors: u64 = 8192; // 4 MiB
+const lvm_test_extents: u64 = 4;
+const lvm_test_pv_uuid: [32]u8 = "0123456789abcdefghijklmnopqrstuv".*;
+/// The volume starts at the physical volume's first extent, so the filesystem
+/// begins pe_start bytes past where the physical volume itself begins.
+const lvm_test_root_offset: u64 = lvm_test_pv_offset + lvm_test_pe_start * lvm.sector_size;
+const lvm_test_root_length: u64 = lvm_test_extents * lvm_test_extent_sectors * lvm.sector_size;
+
+fn writeLvmTestPv(allocator: Allocator, io: Io, image: *Image, extra_lv: []const u8) !void {
+    var label = [_]u8{0} ** 512;
+    label[0..8].* = lvm.label_id;
+    std.mem.writeInt(u64, label[8..16], 1, .little);
+    std.mem.writeInt(u32, label[20..24], 32, .little);
+    label[24..32].* = lvm.label_type;
+    label[32..64].* = lvm_test_pv_uuid;
+    std.mem.writeInt(u64, label[64..72], lvm_test_pv_size, .little);
+    // One data area, then a null terminator, then one metadata area.
+    std.mem.writeInt(u64, label[72..80], lvm_test_pe_start * lvm.sector_size, .little);
+    std.mem.writeInt(u64, label[80..88], 0, .little);
+    std.mem.writeInt(u64, label[104..112], lvm_test_mda_offset, .little);
+    std.mem.writeInt(u64, label[112..120], lvm_test_mda_size, .little);
+    std.mem.writeInt(u32, label[16..20], lvm.crc(lvm.crc_initial, label[20..]), .little);
+    try image.pwrite(io, &label, lvm_test_pv_offset + 512);
+
+    const text = try std.fmt.allocPrint(allocator,
+        \\contents = "Text Format Volume Group"
+        \\version = 1
+        \\description = ""
+        \\creation_host = "preserved-image-test"
+        \\creation_time = 1735689600
+        \\
+        \\vg {{
+        \\id = "VG0000-0000-0000-0000-0000-0000-000000"
+        \\seqno = 2
+        \\format = "lvm2"
+        \\status = ["RESIZEABLE", "READ", "WRITE"]
+        \\extent_size = {d}
+        \\physical_volumes {{
+        \\pv0 {{
+        \\id = "012345-6789-abcd-efgh-ijkl-mnop-qrstuv"
+        \\device = "/dev/vda1"
+        \\status = ["ALLOCATABLE"]
+        \\dev_size = {d}
+        \\pe_start = {d}
+        \\pe_count = 8
+        \\}}
+        \\}}
+        \\logical_volumes {{
+        \\root {{
+        \\id = "LV0000-0000-0000-0000-0000-0000-000000"
+        \\status = ["READ", "WRITE", "VISIBLE"]
+        \\segment_count = 1
+        \\segment1 {{
+        \\start_extent = 0
+        \\extent_count = {d}
+        \\type = "striped"
+        \\stripe_count = 1
+        \\stripes = ["pv0", 0]
+        \\}}
+        \\}}
+        \\{s}
+        \\}}
+        \\}}
+        \\
+    , .{
+        lvm_test_extent_sectors,
+        lvm_test_pv_size / lvm.sector_size,
+        lvm_test_pe_start,
+        lvm_test_extents,
+        extra_lv,
+    });
+    defer allocator.free(text);
+
+    const area = try allocator.alloc(u8, lvm_test_mda_size);
+    defer allocator.free(area);
+    @memset(area, 0);
+    @memcpy(area[512..][0..text.len], text);
+    area[4..20].* = lvm.metadata_area_magic;
+    std.mem.writeInt(u32, area[20..24], lvm.metadata_area_version, .little);
+    std.mem.writeInt(u64, area[24..32], lvm_test_mda_offset, .little);
+    std.mem.writeInt(u64, area[32..40], lvm_test_mda_size, .little);
+    std.mem.writeInt(u64, area[40..48], 512, .little);
+    // The trailing NUL is part of the committed copy and of its checksum.
+    std.mem.writeInt(u64, area[48..56], text.len + 1, .little);
+    std.mem.writeInt(
+        u32,
+        area[56..60],
+        lvm.crc(lvm.crc_initial, area[512..][0 .. text.len + 1]),
+        .little,
+    );
+    std.mem.writeInt(u32, area[0..4], lvm.crc(lvm.crc_initial, area[4..512]), .little);
+    try image.pwrite(io, area, lvm_test_pv_offset + lvm_test_mda_offset);
+}
+
+fn createLvmTestDisk(io: Io, path: []const u8, extra_lv: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var image = try Image.createExclusive(io, path, .raw, lvm_test_disk_size, .{});
+    defer image.close(io);
+
+    var boot_record = mbr.singleLinuxPartitionMbr(
+        @intCast(lvm_test_pv_offset / mbr.sector_size),
+        @intCast(lvm_test_pv_size / mbr.sector_size),
+    );
+    boot_record.disk_signature = 0x5150_4C56;
+    const encoded_mbr = boot_record.encode();
+    try image.pwrite(io, &encoded_mbr, 0);
+
+    try writeLvmTestPv(allocator, io, &image, extra_lv);
+
+    const spool_path = "test-preserved-image-lvm-root.spool";
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try root_tree.RootTree.init(allocator, io, spool_path, .{});
+    defer tree.deinit();
+    try tree.putDirectory("etc", .{ .mode = 0o755 });
+    try tree.putFileBytes("etc/config", "before\n", .{ .mode = 0o644 });
+
+    _ = try ext4.populate(io, image.file, allocator, try tree.ext4View(), .{
+        .offset = lvm_test_root_offset,
+        .length = lvm_test_root_length,
+        .label = "lvm-root",
+        .uuid = [_]u8{0x77} ** 16,
+        .timestamp = 1_735_689_600,
+    });
+}
+
+test "a logical volume can be named wherever a partition can" {
+    const io = std.testing.io;
+    const source_path = "test-preserved-image-lvm-source.raw";
+    const output_path = "test-preserved-image-lvm-output.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path ++ ".native-edit.raw") catch {};
+    try createLvmTestDisk(io, source_path, "");
+
+    const operations = [_]Operation{
+        .{ .overwrite_file = .{
+            .path = "/etc/config",
+            .source = .{ .bytes = "after\n" },
+        } },
+    };
+    const report = try edit(std.testing.allocator, io, .{
+        .source_path = source_path,
+        .output_path = output_path,
+        .output_format = .raw,
+        .root_partition = .{ .logical_volume = .{ .logical_volume = "root" } },
+        .operations = &operations,
+    });
+    // The reported extent is the volume's, not the partition's: the
+    // filesystem starts where the volume does, one pe_start past the
+    // physical volume.
+    try std.testing.expectEqual(lvm_test_root_offset, report.partition_offset);
+    try std.testing.expectEqual(lvm_test_root_length, report.partition_length);
+
+    var output = try Image.openPathReadOnly(io, output_path);
+    defer output.close(io);
+    var reader = try ext4.open(io, output.file, std.testing.allocator, .{
+        .offset = lvm_test_root_offset,
+    });
+    defer reader.deinit();
+    const config = try reader.readFileAlloc(io, std.testing.allocator, "/etc/config");
+    defer std.testing.allocator.free(config);
+    try std.testing.expectEqualStrings("after\n", config);
+
+    // Naming the volume group explicitly reaches the same volume.
+    try std.testing.expectEqual(lvm_test_root_offset, (try selectPartition(
+        std.testing.allocator,
+        io,
+        output,
+        .{ .logical_volume = .{ .volume_group = "vg", .logical_volume = "root" } },
+    )).offset);
+}
+
+test "a logical volume selector names the volume it cannot reach" {
+    const io = std.testing.io;
+    const source_path = "test-preserved-image-lvm-refuse.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+
+    // A second volume on a thin pool, which is exactly the kind of mapping
+    // that must be refused rather than read as if it were linear.
+    try createLvmTestDisk(io, source_path,
+        \\data {
+        \\id = "LV1111-0000-0000-0000-0000-0000-000000"
+        \\status = ["READ", "WRITE", "VISIBLE"]
+        \\segment_count = 1
+        \\segment1 {
+        \\start_extent = 0
+        \\extent_count = 2
+        \\type = "thin"
+        \\stripe_count = 1
+        \\stripes = ["pv0", 4]
+        \\}
+        \\}
+    );
+
+    var image = try Image.openPathReadOnly(io, source_path);
+    defer image.close(io);
+
+    try std.testing.expectError(error.UnsupportedLvmThinSegment, selectPartition(
+        std.testing.allocator,
+        io,
+        image,
+        .{ .logical_volume = .{ .logical_volume = "data" } },
+    ));
+    try std.testing.expectError(error.LogicalVolumeNotFound, selectPartition(
+        std.testing.allocator,
+        io,
+        image,
+        .{ .logical_volume = .{ .logical_volume = "swap" } },
+    ));
+    try std.testing.expectError(error.LvmVolumeGroupNotFound, selectPartition(
+        std.testing.allocator,
+        io,
+        image,
+        .{ .logical_volume = .{ .volume_group = "other", .logical_volume = "root" } },
+    ));
+
+    // A logical volume has no PARTUUID, and inventing one would name a
+    // device the kernel will never publish.
+    var buffer: [identity_rewrite.canonical_uuid_bytes]u8 = undefined;
+    try std.testing.expectEqual(@as(?[]const u8, null), try partitionUuidText(
+        std.testing.allocator,
+        io,
+        image,
+        .{ .logical_volume = .{ .logical_volume = "root" } },
+        &buffer,
+    ));
 }
 
 test "preserved editor publishes a gzip-compressed raw artifact" {

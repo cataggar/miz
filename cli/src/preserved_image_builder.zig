@@ -498,6 +498,9 @@ fn loadV2Configuration(
         .root_partition = switch (parsed.value.root_partition) {
             .gpt_index => |index| .{ .gpt_index = index },
             .mbr_index => |index| .{ .mbr_index = index },
+            // Refused by `validateV2` above; spelled out so this switch
+            // stays exhaustive rather than silently mapping a v3 shape.
+            .logical_volume => return error.UnsupportedPartitionSelectorForApiVersion,
         },
         .source_profile = .strict,
         .source_mounts = &.{},
@@ -544,6 +547,10 @@ fn loadV3Configuration(
         .root_partition = switch (parsed.value.root_partition) {
             .gpt_index => |index| .{ .gpt_index = index },
             .mbr_index => |index| .{ .mbr_index = index },
+            .logical_volume => |volume| .{ .logical_volume = .{
+                .volume_group = volume.volume_group,
+                .logical_volume = volume.logical_volume,
+            } },
         },
         .source_profile = switch (parsed.value.source_profile) {
             .strict => .strict,
@@ -586,6 +593,10 @@ fn mapSourceMounts(
             .partition = switch (mount.partition) {
                 .gpt_index => |index| .{ .gpt_index = index },
                 .mbr_index => |index| .{ .mbr_index = index },
+                .logical_volume => |volume| .{ .logical_volume = .{
+                    .volume_group = volume.volume_group,
+                    .logical_volume = volume.logical_volume,
+                } },
             },
             .target = mount.target,
             .filesystem = switch (mount.filesystem) {
