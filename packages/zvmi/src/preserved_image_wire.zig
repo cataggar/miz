@@ -1,5 +1,6 @@
 const std = @import("std");
 const customization_wire = @import("customization_wire.zig");
+const lvm = @import("lvm.zig");
 
 pub const previous_api_version: u32 = 2;
 pub const api_version: u32 = 3;
@@ -11,9 +12,19 @@ pub const Backend = enum {
     vm,
 };
 
+/// Names a logical volume inside an LVM2 volume group on the disk.
+/// `volume_group` may be left empty when the disk carries exactly one.
+pub const LogicalVolumeSelector = struct {
+    volume_group: []const u8 = "",
+    logical_volume: []const u8,
+};
+
 pub const PartitionSelector = union(enum) {
     gpt_index: u32,
     mbr_index: u8,
+    /// Only meaningful from api_version 3 onwards; `validateV2` refuses it so
+    /// a v2 configuration accepts exactly what it always did.
+    logical_volume: LogicalVolumeSelector,
 };
 
 /// Which ext4 sources the `rebuild` backend will import. Defaulted to
@@ -253,11 +264,17 @@ pub const ValidationError = error{
     UnexpectedIdentityRewrite,
     UnexpectedJournalPolicy,
     MissingMountTarget,
+    UnsupportedPartitionSelectorForApiVersion,
 };
 
 pub fn validateV2(configuration: ConfigurationV2, source_count: usize) ValidationError!void {
     if (configuration.api_version != previous_api_version) {
         return error.UnsupportedApiVersion;
+    }
+    // Logical volume selectors arrived with v3. A v2 configuration is
+    // accepted on exactly the terms it was written against.
+    if (configuration.root_partition == .logical_volume) {
+        return error.UnsupportedPartitionSelectorForApiVersion;
     }
     try validatePartition(configuration.root_partition);
     try validateExistingSourceClosure(
@@ -338,6 +355,17 @@ fn validatePartition(partition: PartitionSelector) ValidationError!void {
         .gpt_index => |index| if (index == 0) return error.InvalidPartitionSelector,
         .mbr_index => |index| if (index == 0 or index > 4) {
             return error.InvalidPartitionSelector;
+        },
+        .logical_volume => |volume| {
+            // The volume group may be left unnamed on a disk that carries
+            // one, but a selector that names no logical volume names
+            // nothing at all.
+            if (volume.logical_volume.len == 0) return error.InvalidPartitionSelector;
+            if (volume.logical_volume.len > lvm.max_name_len or
+                volume.volume_group.len > lvm.max_name_len)
+            {
+                return error.InvalidPartitionSelector;
+            }
         },
     }
 }
@@ -506,6 +534,46 @@ test "configuration version and one-based partition are validated" {
     try std.testing.expectError(error.InvalidPartitionSelector, validate(.{
         .root_partition = .{ .mbr_index = 5 },
     }, 0));
+}
+
+test "a logical volume selector needs a volume name and only exists from v3" {
+    try validate(.{
+        .root_partition = .{ .logical_volume = .{ .logical_volume = "root" } },
+    }, 0);
+    try validate(.{
+        .root_partition = .{ .logical_volume = .{
+            .volume_group = "ubuntu-vg",
+            .logical_volume = "ubuntu-lv",
+        } },
+    }, 0);
+    // The volume group may be omitted on a disk that carries one, but a
+    // selector naming no logical volume names nothing.
+    try std.testing.expectError(error.InvalidPartitionSelector, validate(.{
+        .root_partition = .{ .logical_volume = .{ .logical_volume = "" } },
+    }, 0));
+    try std.testing.expectError(error.InvalidPartitionSelector, validate(.{
+        .root_partition = .{ .logical_volume = .{
+            .logical_volume = "x" ** (lvm.max_name_len + 1),
+        } },
+    }, 0));
+    // v2 predates logical volumes, so a v2 configuration is held to exactly
+    // what it was written against.
+    try std.testing.expectError(
+        error.UnsupportedPartitionSelectorForApiVersion,
+        validateV2(.{ .root_partition = .{ .logical_volume = .{ .logical_volume = "root" } } }, 0),
+    );
+}
+
+test "a merged source can be a logical volume too" {
+    const boot = SourceMount{
+        .partition = .{ .logical_volume = .{ .logical_volume = "boot" } },
+        .target = "/boot",
+    };
+    try validate(.{
+        .backend = .rebuild,
+        .root_partition = .{ .logical_volume = .{ .logical_volume = "root" } },
+        .source_mounts = &.{boot},
+    }, 0);
 }
 
 test "a source profile only travels with the backend that imports a filesystem" {

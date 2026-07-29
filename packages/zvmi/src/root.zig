@@ -28,6 +28,7 @@ pub const uki = @import("uki.zig");
 pub const guid = @import("guid.zig");
 pub const mbr = @import("mbr.zig");
 pub const gpt = @import("gpt.zig");
+pub const lvm = @import("lvm.zig");
 pub const azure = @import("azure.zig");
 pub const deprovision = @import("deprovision.zig");
 pub const layout = @import("layout.zig");
