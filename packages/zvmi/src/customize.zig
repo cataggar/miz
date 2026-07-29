@@ -16,6 +16,7 @@ const gpt = @import("gpt.zig");
 const guid = @import("guid.zig");
 const image_mod = @import("image.zig");
 const layout = @import("layout.zig");
+const limits_mod = @import("limits.zig");
 const mbr = @import("mbr.zig");
 const os_customization = @import("os_customization.zig");
 const output_mod = @import("output.zig");
@@ -27,8 +28,8 @@ const verity = @import("verity.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 4;
-pub const provenance_schema_version: u32 = 7;
+pub const plan_schema_version: u32 = 5;
+pub const provenance_schema_version: u32 = 8;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -411,6 +412,10 @@ pub const Request = struct {
     generalization: GeneralizationPolicy = .none,
     execution: ExecutionPolicy,
     reproducibility: Reproducibility,
+    /// Import limits, each raisable by its own flag. The defaults are
+    /// guardrails sized for a purpose-built image, not a statement about how
+    /// large a real installed root filesystem is.
+    limits: limits_mod.ImportLimits = .{},
 };
 
 pub const V2ExecutionBackend = enum {
@@ -534,6 +539,8 @@ pub const DiagnosticCode = enum {
     invalid_workspace,
     path_conflict,
     invalid_reproducibility,
+    invalid_limits,
+    limit_exceeded,
     invalid_plan,
     missing_capability,
     source_hash_failed,
@@ -944,6 +951,17 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
             "source_date_epoch exceeds the output metadata timestamp range",
             "use a value no greater than 9223372036854775807",
         ));
+    }
+
+    inline for (comptime std.enums.values(limits_mod.Limit)) |limit| {
+        if (request.limits.value(limit) == 0) {
+            try diagnostics.append(validationError(
+                .invalid_limits,
+                "/limits",
+                "a limit of zero would reject every source, including an empty one",
+                comptime "raise it with " ++ limit.flag() ++ " <value>",
+            ));
+        }
     }
 
     return .{ .items = try diagnostics.toOwnedSlice() };
@@ -1871,6 +1889,7 @@ pub const ResolvedPlanData = struct {
     generalization: GeneralizationPolicy,
     execution: ExecutionPolicy,
     reproducibility: Reproducibility,
+    limits: limits_mod.ImportLimits,
     transaction_path: []const u8,
     staging_output_path: []const u8,
     transaction_id: Uuid,
@@ -2275,6 +2294,7 @@ pub fn resolve(
         .generalization = resolved_generalization,
         .execution = resolved_execution,
         .reproducibility = request.reproducibility,
+        .limits = request.limits,
         .transaction_path = transaction_path,
         .staging_output_path = staging_output_path,
         .transaction_id = transaction_id,
@@ -3243,6 +3263,9 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     }
     hash.update(&plan.reproducibility.seed.bytes);
     hashInt(&hash, plan.reproducibility.source_date_epoch);
+    inline for (comptime std.enums.values(limits_mod.Limit)) |limit| {
+        hashInt(&hash, plan.limits.value(limit));
+    }
     hashString(&hash, plan.transaction_path);
     hashString(&hash, plan.staging_output_path);
     hash.update(&plan.transaction_id.bytes);
@@ -4008,6 +4031,7 @@ fn rebuildAvailable(io: Io, plan: *const ResolvedPlan) CapabilityState {
         .customization = plan.data.os,
         .generalization = plan.data.generalization,
         .source_date_epoch = plan.data.reproducibility.source_date_epoch,
+        .limits = plan.data.limits,
         .expected_virtual_size = null,
         .output_create_options = outputCreateOptions(plan),
     }) catch |err| switch (err) {
@@ -4300,6 +4324,10 @@ pub const ExecutionRecord = struct {
     vhdx_metadata: ?VhdxMetadataRecord,
     preserved: ?PreservedExecutionRecord,
     vm: ?VmExecutionRecord,
+    /// The largest value each limit reached during this run. A caller sizes a
+    /// larger run from these instead of guessing, and a dry run reports them
+    /// without committing to a build.
+    limit_peaks: limits_mod.Peaks,
 };
 
 pub const Provenance = struct {
@@ -4451,6 +4479,7 @@ fn buildResult(
     source_digests: []const SourceRecord,
     output_digest: Digest,
     output_file_size: u64,
+    limit_peaks: limits_mod.Peaks,
 ) Allocator.Error!Result {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -4690,6 +4719,7 @@ fn buildResult(
                     null,
                 .preserved = preserved_record,
                 .vm = vm_record,
+                .limit_peaks = limit_peaks,
             },
             .final_output = .{
                 .path = output_path,
@@ -4773,6 +4803,13 @@ pub fn execute(
         .event_sink = event_sink,
         .diagnostics = &diagnostics,
     };
+    // One sink for whichever backend runs: it collects the peak measurement
+    // of every limit for provenance, and the first breach for the diagnostic
+    // that names the flag which raises it. The message buffers live here
+    // because a diagnostic borrows its strings until the outcome owns them.
+    var limit_sink = limits_mod.Diagnostic{};
+    var limit_message: [limits_mod.Exceeded.max_message_bytes]u8 = undefined;
+    var limit_remediation: [limits_mod.Exceeded.max_remediation_bytes]u8 = undefined;
     var fresh_report: ?build_image.BuildImageReport = null;
     defer if (fresh_report) |*report| report.deinit(allocator);
     var preserved_report: ?preserved_image.Report = null;
@@ -4783,8 +4820,23 @@ pub fn execute(
     defer if (vm_report) |*report| report.deinit();
     switch (plan.data.execution.backend) {
         .native_fresh => {
-            fresh_report = runPlan(allocator, io, plan, platform, event_sink, &bridge) catch |err| {
+            fresh_report = runPlan(
+                allocator,
+                io,
+                plan,
+                platform,
+                event_sink,
+                &bridge,
+                &limit_sink,
+            ) catch |err| {
                 try appendFailure(&diagnostics, .execution_failed, .execution, "", "native-fresh execution failed", err);
+                try appendLimitFailure(
+                    &diagnostics,
+                    limit_sink,
+                    "/limits",
+                    &limit_message,
+                    &limit_remediation,
+                );
                 if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
                 emitDiagnostics(event_sink, diagnostics.items);
                 return try failureOutcome(allocator, diagnostics.items);
@@ -4803,9 +4855,18 @@ pub fn execute(
                 .root_partition = plan.data.storage.preserve.root_partition,
                 .operations = plan.data.existing_path_operations,
                 .expected_virtual_size = null,
+                .max_source_file_bytes = plan.data.limits.max_source_file_bytes,
+                .limit_diagnostic = &limit_sink,
                 .output_create_options = outputCreateOptions(plan),
             }) catch |err| {
                 try appendFailure(&diagnostics, .execution_failed, .execution, "/existing_path_operations", "native preserved-image execution failed", err);
+                try appendLimitFailure(
+                    &diagnostics,
+                    limit_sink,
+                    "/limits",
+                    &limit_message,
+                    &limit_remediation,
+                );
                 if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
                 emitDiagnostics(event_sink, diagnostics.items);
                 return try failureOutcome(allocator, diagnostics.items);
@@ -4826,10 +4887,19 @@ pub fn execute(
                 .customization = plan.data.os,
                 .generalization = plan.data.generalization,
                 .source_date_epoch = plan.data.reproducibility.source_date_epoch,
+                .limits = plan.data.limits,
+                .limit_diagnostic = &limit_sink,
                 .expected_virtual_size = null,
                 .output_create_options = outputCreateOptions(plan),
             }) catch |err| {
                 try appendFailure(&diagnostics, .execution_failed, .execution, "/execution/backend", "strict preserved-image rebuild failed", err);
+                try appendLimitFailure(
+                    &diagnostics,
+                    limit_sink,
+                    "/limits",
+                    &limit_message,
+                    &limit_remediation,
+                );
                 if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
                 emitDiagnostics(event_sink, diagnostics.items);
                 return try failureOutcome(allocator, diagnostics.items);
@@ -4983,6 +5053,7 @@ pub fn execute(
         source_digests_before,
         output_digest,
         output_file_size,
+        limit_sink.peaks,
     );
     var result_owned_by_function = true;
     errdefer if (result_owned_by_function) result.deinit(allocator);
@@ -5164,6 +5235,7 @@ fn runPlan(
     platform: Platform,
     event_sink: ?EventSink,
     bridge: *BuildEventBridge,
+    limit_sink: *limits_mod.Diagnostic,
 ) !?build_image.BuildImageReport {
     if (plan.data.execution.backend != .native_fresh) return error.InvalidBackend;
     var stage_bridge = NativeStageBridge{ .operations = plan.data.operations };
@@ -5173,7 +5245,7 @@ fn runPlan(
         if (stage_bridge.next != plan.data.operations.len) return error.InvalidOperationOrder;
         return null;
     }
-    var options = buildOptionsFromPlan(plan, bridge);
+    var options = buildOptionsFromPlan(plan, bridge, limit_sink);
     options.stage_sink = stage_sink;
     var report = try build_image.build(allocator, io, options);
     errdefer report.deinit(allocator);
@@ -5181,7 +5253,11 @@ fn runPlan(
     return report;
 }
 
-fn buildOptionsFromPlan(plan: *const ResolvedPlan, bridge: *BuildEventBridge) build_image.BuildImageOptions {
+fn buildOptionsFromPlan(
+    plan: *const ResolvedPlan,
+    bridge: *BuildEventBridge,
+    limit_sink: *limits_mod.Diagnostic,
+) build_image.BuildImageOptions {
     const generated = plan.data.generated.?;
     const input = plan.data.input.iso_oci;
     const storage = plan.data.storage.fresh;
@@ -5209,6 +5285,8 @@ fn buildOptionsFromPlan(plan: *const ResolvedPlan, bridge: *BuildEventBridge) bu
             .output_directory = plan.data.boot_security.uki.output_directory,
         },
         .architecture = plan.data.architectures.image,
+        .limits = plan.data.limits.tree(),
+        .limit_diagnostic = limit_sink,
         .deterministic = .{
             .disk_guid = generated.disk_guid.bytes,
             .esp_partition_guid = generated.esp_partition_guid.bytes,
@@ -5341,6 +5419,31 @@ fn appendFailure(
         .configuration_path = path,
         .message = message,
         .cause = .{ .error_name = @errorName(err) },
+    });
+}
+
+/// Adds the diagnostic that names the limit, the observed value, and the flag
+/// that raises it. A failure that was not a limit adds nothing, so the generic
+/// failure diagnostic stays alone. The message borrows the caller's buffers,
+/// which the outcome copies before returning.
+fn appendLimitFailure(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    limit_sink: limits_mod.Diagnostic,
+    path: []const u8,
+    message_buffer: []u8,
+    remediation_buffer: []u8,
+) Allocator.Error!void {
+    const breach = limit_sink.exceeded orelse return;
+    const message = breach.describe(message_buffer) catch return;
+    const remediation = breach.remediation(remediation_buffer) catch return;
+    try diagnostics.append(.{
+        .severity = .@"error",
+        .phase = .execution,
+        .code = .limit_exceeded,
+        .configuration_path = path,
+        .message = message,
+        .cause = .{ .error_name = @errorName(breach.limit.err()) },
+        .remediation = remediation,
     });
 }
 
@@ -6963,9 +7066,10 @@ test "custom execution platforms must advance every planned operation" {
     };
     var platform = Platform.system();
     platform.runFn = IncompleteRunner.run;
+    var limit_sink = limits_mod.Diagnostic{};
     try std.testing.expectError(
         error.InvalidOperationOrder,
-        runPlan(std.testing.allocator, std.testing.io, &resolved.plan.?, platform, null, &bridge),
+        runPlan(std.testing.allocator, std.testing.io, &resolved.plan.?, platform, null, &bridge, &limit_sink),
     );
 }
 
@@ -7261,7 +7365,7 @@ test "plan JSON renders identifiers as stable strings" {
     defer output.deinit();
     try writePlanJson(&resolved.plan.?, &output.writer);
     const json = output.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 5") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"plan_hash\": \"") != null);
 }
 

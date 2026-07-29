@@ -26,6 +26,20 @@ const help_text =
     \\                              Maximum decompressed OCI layer size (default 128M).
     \\  --max-oci-archive-size <size>
     \\                              Maximum docker/podman save archive size (default 512M).
+    \\
+    \\Import limits (guardrails on the imported root tree; raise them for a large
+    \\installed root filesystem, and size them from a --dry-run report):
+    \\  --max-nodes <count>        Imported inodes (default 1000000).
+    \\  --max-path-bytes <size>    Longest imported path (default 4096).
+    \\  --max-component-bytes <size>
+    \\                              Longest single path component (default 255).
+    \\  --max-file-bytes <size>    Largest single imported file (default 16G).
+    \\  --max-total-bytes <size>   Total imported content (default 64G).
+    \\  --max-spool-bytes <size>   Spool file holding the imported content (default 128G).
+    \\  --max-xattrs-per-node <count>
+    \\                              Extended attributes on one inode (default 256).
+    \\  --max-xattr-bytes-per-node <size>
+    \\                              Extended attribute bytes on one inode (default 1M).
     \\  --stub-source-path <path>  UKI/both only: use this systemd EFI stub path from the merged source tree.
     \\  --os-release-source-path <path>
     \\                              UKI/both only: use this os-release path from the merged source tree.
@@ -55,6 +69,10 @@ const help_text =
 const BuildImageFailureContext = struct {
     boot_mode: zvmi.bootconfig.BootMode = .bls_only,
     stub_source_path: ?[]const u8 = null,
+    /// The breach that stopped the import, when one did. It carries the
+    /// observed value, the configured limit, and the flag that raises it,
+    /// which is everything the caller needs to retry successfully.
+    limit_exceeded: ?zvmi.limits.Exceeded = null,
 };
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
@@ -82,6 +100,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var boot_mode: zvmi.bootconfig.BootMode = .bls_only;
     var dry_run = false;
     var verbose = false;
+    var limits: zvmi.limits.ImportLimits = .{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -203,11 +222,19 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             verbose = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             return fail(help_text, .{});
+        } else if (zvmi.limits.limitForFlag(arg) != null) {
+            i += 1;
+            if (i >= args.len) return fail("build-image: {s} requires a value", .{arg});
+            _ = limits.parseFlag(arg, args[i]) catch |err|
+                return fail("build-image: invalid {s} '{s}': {s}", .{ arg, args[i], @errorName(err) });
         } else {
             return fail("build-image: unexpected argument '{s}'", .{arg});
         }
     }
 
+    // The sink outlives the build so a failure can name the limit that
+    // stopped it and a success can report how close the import came.
+    var limit_sink = zvmi.limits.Diagnostic{};
     var report = blk: {
         const built = zvmi.build_image.build(gpa, io, .{
             .iso_path = iso_path orelse return fail("build-image: --iso is required", .{}),
@@ -234,12 +261,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
                 .splash_source_path = splash_source_path,
                 .output_directory = uki_output_directory,
             },
+            .limits = limits.tree(),
+            .limit_diagnostic = &limit_sink,
             .dry_run = dry_run,
             .verbose = verbose,
         }) catch |err| {
             const message = describeBuildImageFailure(gpa, err, .{
                 .boot_mode = boot_mode,
                 .stub_source_path = stub_source_path,
+                .limit_exceeded = limit_sink.exceeded,
             }) catch return fail("build-image: failed: {s}", .{@errorName(err)});
             defer gpa.free(message);
             return fail("{s}", .{message});
@@ -249,7 +279,23 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     defer report.deinit(gpa);
 
     printReport(report, dry_run);
+    printLimitPeaks(report.limit_peaks, limits);
     return 0;
+}
+
+/// Prints what the import actually needed, so the next run can be sized from a
+/// --dry-run instead of from a guess. A limit the import never touched stays
+/// at zero and is left out.
+fn printLimitPeaks(peaks: zvmi.limits.Peaks, configured: zvmi.limits.ImportLimits) void {
+    inline for (comptime std.enums.values(zvmi.limits.Limit)) |limit| {
+        const peak = peaks.value(limit);
+        if (peak != 0) {
+            std.debug.print(
+                "  peak {s}: {d} of {d} ({s})\n",
+                .{ limit.unit(), peak, configured.value(limit), limit.flag() },
+            );
+        }
+    }
 }
 
 fn parseOciLimit(value: []const u8) !usize {
@@ -314,6 +360,23 @@ fn describeBuildImageFailure(
         .bls_and_uki => "--boot-mode both",
         .bls_only => "UKI mode",
     };
+
+    if (context.limit_exceeded) |breach| {
+        // The error name alone says nothing actionable; the breach knows the
+        // value that was observed and the flag that admits it.
+        var message_buffer: [zvmi.limits.Exceeded.max_message_bytes]u8 = undefined;
+        var remediation_buffer: [zvmi.limits.Exceeded.max_remediation_bytes]u8 = undefined;
+        if (breach.limit.err() == err) {
+            return std.fmt.allocPrint(
+                allocator,
+                "build-image: failed: {s}\n{s}, or import less content.",
+                .{
+                    breach.describe(&message_buffer) catch unreachable,
+                    breach.remediation(&remediation_buffer) catch unreachable,
+                },
+            );
+        }
+    }
 
     return switch (err) {
         error.MissingUkiStub => if (context.stub_source_path) |path|
@@ -410,4 +473,32 @@ test "describeBuildImageFailure explains missing initramfs verity tooling" {
 test "OCI limit parsing accepts bounded sizes" {
     try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), try parseOciLimit("512M"));
     try std.testing.expectError(error.ZeroOciLimit, parseOciLimit("0"));
+}
+
+test "describeBuildImageFailure names the limit, the value seen, and the flag" {
+    const message = try describeBuildImageFailure(
+        std.testing.allocator,
+        error.NodeLimitExceeded,
+        .{ .limit_exceeded = .{ .limit = .nodes, .observed = 1_000_001, .configured = 1_000_000 } },
+    );
+    defer std.testing.allocator.free(message);
+
+    try std.testing.expect(std.mem.indexOf(u8, message, "NodeLimitExceeded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "1000001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "1000000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "--max-nodes") != null);
+}
+
+test "a failure unrelated to the recorded breach keeps its own explanation" {
+    // A breach recorded by an earlier probe must not relabel a later,
+    // different failure.
+    const message = try describeBuildImageFailure(
+        std.testing.allocator,
+        error.EspTooSmallForBootArtifacts,
+        .{ .limit_exceeded = .{ .limit = .nodes, .observed = 2, .configured = 1 } },
+    );
+    defer std.testing.allocator.free(message);
+
+    try std.testing.expect(std.mem.indexOf(u8, message, "--esp-size") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "--max-nodes") == null);
 }

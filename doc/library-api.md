@@ -259,6 +259,29 @@ regions as compressed zero runs and verifying the full virtual size was
 produced before reporting success. `customize.OutputFormat` gains `raw_gz`
 and `raw_zst` so bundle builds can publish a compressed artifact directly.
 
+`zvmi.limits` owns the import guardrails shared by `root_tree`, the strict
+ext4 scanner, and the preserved-image rebuild. `limits.ImportLimits` is the
+flat set every CLI flag maps onto (`limits.Limit.flag()` is the single source
+of the flag spelling), and `customize.Request.limits` carries it into a plan,
+which hashes every value. A `limits.Diagnostic` passed as `limit_diagnostic`
+collects two things: the peak each limit reached, returned as `limit_peaks` on
+`build_image.BuildImageReport`, `preserved_image.RebuildReport`,
+`preserved_image.RebuildInspection`, and provenance's `execution` record; and
+the first breach, as a `limits.Exceeded` that names the observed value, the
+configured limit, and the flag that raises it. The library never prints: the
+CLI renders the breach, and `customize.execute` emits it as a `limit_exceeded`
+diagnostic. Limits that no flag can raise stay separate errors, so
+`error.InvalidPath` still means malformed and `error.PathLimitExceeded` means
+too long.
+
+`preserved_image.rebuild` checks scratch space before it creates the spool.
+`WorkspaceSpace` reports the spool copy of the imported content, the raw
+staging image, and the artifact that coexists with it, and `isSufficient`
+treats an unknown amount of free space as sufficient rather than as too little.
+`RebuildOptions.workspace_space = .report_only` skips enforcement for a
+workspace that grows on demand. See
+[Import limits and scratch space](image-building.md#import-limits-and-scratch-space).
+
 `zvmi.preserved_image.edit` is the lower-level constrained existing-path API, while `zvmi.preserved_image.rebuild` performs the strict full-tree rebuild described above. Both accept raw, VHD, VHDX, or qcow2 disks, copy guest-visible bytes into exclusive raw staging, flatten qcow2 backing chains, operate on an explicitly selected one-based GPT or MBR partition, convert to a standalone output, and publish without replacing an existing destination. Sources and backing files are opened read-only.
 
 

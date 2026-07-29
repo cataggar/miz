@@ -7,8 +7,10 @@
 const std = @import("std");
 const ext4 = @import("ext4.zig");
 const Format = @import("formats.zig").Format;
+const free_space = @import("free_space.zig");
 const gpt = @import("gpt.zig");
 const guid = @import("guid.zig");
+const limits_mod = @import("limits.zig");
 const image_mod = @import("image.zig");
 const Image = image_mod.Image;
 const mbr = @import("mbr.zig");
@@ -18,6 +20,10 @@ const root_tree = @import("root_tree.zig");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+
+/// `edit` enforces only the replacement-file limit, but it is the same limit,
+/// with the same flag, that a rebuild enforces.
+const limit_defaults = limits_mod.ImportLimits{};
 
 pub const PartitionSelector = union(enum) {
     /// One-based slot in the GPT partition entry array.
@@ -47,7 +53,10 @@ pub const Options = struct {
     root_partition: PartitionSelector,
     operations: []const Operation,
     expected_virtual_size: ?u64 = null,
-    max_source_file_bytes: u64 = 1024 * 1024 * 1024,
+    max_source_file_bytes: u64 = limit_defaults.max_source_file_bytes,
+    /// Optional sink for the first limit breach, so a caller can name the
+    /// flag that raises it instead of only reporting an error value.
+    limit_diagnostic: ?*limits_mod.Diagnostic = null,
     output_create_options: image_mod.CreateOptions = .{},
     /// Compresses the published artifact as it is written. Only `.raw`
     /// output can be compressed: every other format amends metadata after
@@ -135,15 +144,52 @@ pub const RebuildOptions = struct {
     customization: os_customization.OsCustomization = .{},
     generalization: os_customization.GeneralizationPolicy = .none,
     source_date_epoch: u64,
-    limits: root_tree.Limits = .{},
-    max_scan_metadata_bytes: usize = 256 * 1024 * 1024,
+    /// Every limit the import enforces, each raisable by its own flag.
+    limits: limits_mod.ImportLimits = .{},
+    /// Optional sink for the peak measurements and the first limit breach.
+    /// Reports are returned by value, so a failed rebuild can only hand back
+    /// the breach through a sink the caller still owns.
+    limit_diagnostic: ?*limits_mod.Diagnostic = null,
+    /// Whether the up-front workspace free-space check may reject a rebuild.
+    /// It is a precondition rather than a discovery halfway through a long
+    /// import, and `.report_only` exists for callers whose workspace grows on
+    /// demand (a network filesystem, a thin pool) where the probe is wrong.
+    workspace_space: WorkspaceSpacePolicy = .enforce,
     expected_virtual_size: ?u64 = null,
-    max_source_file_bytes: u64 = 1024 * 1024 * 1024,
     output_create_options: image_mod.CreateOptions = .{},
     /// Compresses the published artifact as it is written. Only `.raw`
     /// output can be compressed: every other format amends metadata after
     /// the data it already wrote, which a compressor cannot revisit.
     output_compression: output_mod.Compression = .none,
+};
+
+pub const WorkspaceSpacePolicy = enum {
+    enforce,
+    report_only,
+};
+
+/// What a rebuild needs from the filesystem holding the output directory, and
+/// what that filesystem had when the rebuild started. `available_bytes` is
+/// null when the host cannot be asked; that is never treated as too little.
+pub const WorkspaceSpace = struct {
+    /// A full copy of every imported file byte. The spool is the reason a
+    /// ~35 GB source needs ~35 GB of scratch space.
+    spool_bytes: u64,
+    /// The raw staging image, which is the source's full virtual size.
+    stage_bytes: u64,
+    /// The converted or compressed artifact, which coexists with the stage
+    /// until it is published. Zero when the raw stage is itself published.
+    publish_bytes: u64,
+    required_bytes: u64,
+    available_bytes: ?u64,
+
+    /// An unknown amount of free space is not the same as too little: a host
+    /// that cannot answer the probe must not be refused a rebuild it can in
+    /// fact complete.
+    pub fn isSufficient(self: WorkspaceSpace) bool {
+        const available = self.available_bytes orelse return true;
+        return available >= self.required_bytes;
+    }
 };
 
 pub const RebuildReport = struct {
@@ -168,6 +214,10 @@ pub const RebuildReport = struct {
     existing_operation_count: usize,
     os_customization_count: usize,
     generalization_count: usize,
+    /// The largest value each limit reached. A caller sizes the next run's
+    /// flags from these instead of guessing.
+    limit_peaks: limits_mod.Peaks,
+    workspace_space: WorkspaceSpace,
 };
 
 /// Plain, allocation-independent result of `inspectRebuild`. Inspection
@@ -186,6 +236,14 @@ pub const RebuildInspection = struct {
     ext4_global_timestamp: u32,
     /// Excludes the implicit root directory.
     imported_node_count: usize,
+    /// The largest value each limit reached during the inspection, which
+    /// covers the same limits a rebuild enforces. Sizing flags from a dry run
+    /// is the point of inspecting.
+    limit_peaks: limits_mod.Peaks,
+    /// Inspection reports the scratch-space cost but never rejects a source
+    /// for it: it creates no files, so it consumes none of that space, and
+    /// the caller may free space before committing to the rebuild.
+    workspace_space: WorkspaceSpace,
 };
 
 const Partition = struct {
@@ -228,6 +286,7 @@ pub fn edit(
     var context = EditMutationContext{
         .operations = options.operations,
         .max_source_file_bytes = options.max_source_file_bytes,
+        .limit_diagnostic = options.limit_diagnostic,
     };
     const mutation = try transactRawInternal(
         allocator,
@@ -260,6 +319,7 @@ pub fn edit(
 const EditMutationContext = struct {
     operations: []const Operation,
     max_source_file_bytes: u64,
+    limit_diagnostic: ?*limits_mod.Diagnostic,
 };
 
 fn runEditMutation(
@@ -308,6 +368,7 @@ fn runEditMutation(
         &editor,
         context.operations,
         context.max_source_file_bytes,
+        context.limit_diagnostic,
     );
     for (context.operations) |operation| switch (operation) {
         .overwrite_file => |overwrite| {
@@ -316,6 +377,7 @@ fn runEditMutation(
                 io,
                 overwrite.source,
                 context.max_source_file_bytes,
+                context.limit_diagnostic,
             );
             defer allocator.free(content);
             try editor.writeFile(io, overwrite.path, content);
@@ -376,7 +438,8 @@ pub fn inspectRebuild(
         io,
         options.existing_operations,
         options.customization,
-        options.max_source_file_bytes,
+        options.limits.max_source_file_bytes,
+        options.limit_diagnostic,
     );
 
     const raw_path = try std.fmt.allocPrint(allocator, "{s}.native-rebuild.raw", .{output_path});
@@ -404,7 +467,8 @@ pub fn inspectRebuild(
         options.existing_operations,
         options.customization,
     );
-    var validation_tree = root_tree.RootTree.initMemory(allocator, io, options.limits);
+    var validation_tree = root_tree.RootTree.initMemory(allocator, io, options.limits.tree());
+    validation_tree.diagnostic = options.limit_diagnostic;
     defer validation_tree.deinit();
     try validation_tree.importExt4ViewBorrowed(scanned.fileTreeView());
     try preflightTreeOperations(&validation_tree, options.existing_operations);
@@ -412,7 +476,8 @@ pub fn inspectRebuild(
         io,
         &validation_tree,
         options.existing_operations,
-        options.max_source_file_bytes,
+        options.limits.max_source_file_bytes,
+        options.limit_diagnostic,
     );
     try os_customization.apply(
         allocator,
@@ -451,6 +516,14 @@ pub fn inspectRebuild(
         .filesystem_length = scanned.identity.filesystem_length,
         .ext4_global_timestamp = scanned.identity.global_timestamp,
         .imported_node_count = scanned.nodeCount(),
+        .limit_peaks = if (options.limit_diagnostic) |sink| sink.peaks else .{},
+        .workspace_space = workspaceSpace(
+            output_path,
+            scanned.content_bytes,
+            source.virtual_size,
+            options.output_format,
+            options.output_compression,
+        ),
     };
 }
 
@@ -510,7 +583,8 @@ pub fn rebuild(
         io,
         options.existing_operations,
         options.customization,
-        options.max_source_file_bytes,
+        options.limits.max_source_file_bytes,
+        options.limit_diagnostic,
     );
 
     const raw_path = try std.fmt.allocPrint(allocator, "{s}.native-rebuild.raw", .{output_path});
@@ -539,7 +613,22 @@ pub fn rebuild(
         options.customization,
     );
 
-    var tree = try root_tree.RootTree.init(allocator, io, spool_path, options.limits);
+    // The workspace precondition runs before the spool file exists, so a
+    // workspace that cannot hold the import fails now rather than after
+    // however long it takes to copy most of a root filesystem into it.
+    const workspace = workspaceSpace(
+        output_path,
+        scanned.content_bytes,
+        virtual_size,
+        options.output_format,
+        options.output_compression,
+    );
+    if (options.workspace_space == .enforce and !workspace.isSufficient()) {
+        return error.InsufficientWorkspaceSpace;
+    }
+
+    var tree = try root_tree.RootTree.init(allocator, io, spool_path, options.limits.tree());
+    tree.diagnostic = options.limit_diagnostic;
     defer tree.deinit();
     try tree.importExt4View(scanned.fileTreeView());
     const imported_node_count = tree.nodeCount();
@@ -551,7 +640,8 @@ pub fn rebuild(
         io,
         &tree,
         options.existing_operations,
-        options.max_source_file_bytes,
+        options.limits.max_source_file_bytes,
+        options.limit_diagnostic,
     );
     try os_customization.apply(
         allocator,
@@ -630,6 +720,8 @@ pub fn rebuild(
         .existing_operation_count = options.existing_operations.len,
         .os_customization_count = customizationCount(options.customization),
         .generalization_count = generalizationCount(options.generalization),
+        .limit_peaks = if (options.limit_diagnostic) |sink| sink.peaks else .{},
+        .workspace_space = workspace,
     };
 }
 
@@ -758,6 +850,53 @@ fn transactRawInternal(
     };
 }
 
+/// Scratch space a rebuild needs on the filesystem holding the output.
+///
+/// The spool holds a full copy of every imported file byte, the raw stage
+/// holds the source's full virtual size, and a converted or compressed
+/// artifact coexists with that stage until it is published. A raw,
+/// uncompressed output is published by renaming the stage, so it costs
+/// nothing beyond it.
+fn workspaceSpace(
+    output_path: []const u8,
+    content_bytes: u64,
+    virtual_size: u64,
+    output_format: Format,
+    output_compression: output_mod.Compression,
+) WorkspaceSpace {
+    // The output directory is the filesystem every scratch file lands on,
+    // because each one is named after the output path.
+    const probe_path = std.fs.path.dirname(output_path) orelse ".";
+    return workspaceRequirement(
+        content_bytes,
+        virtual_size,
+        output_format,
+        output_compression,
+        free_space.availableBytes(probe_path),
+    );
+}
+
+fn workspaceRequirement(
+    content_bytes: u64,
+    virtual_size: u64,
+    output_format: Format,
+    output_compression: output_mod.Compression,
+    available_bytes: ?u64,
+) WorkspaceSpace {
+    const publishes_stage_in_place = output_format == .raw and output_compression == .none;
+    const publish_bytes: u64 = if (publishes_stage_in_place) 0 else virtual_size;
+    const required = std.math.add(u64, content_bytes, virtual_size) catch
+        std.math.maxInt(u64);
+    const total = std.math.add(u64, required, publish_bytes) catch std.math.maxInt(u64);
+    return .{
+        .spool_bytes = content_bytes,
+        .stage_bytes = virtual_size,
+        .publish_bytes = publish_bytes,
+        .required_bytes = total,
+        .available_bytes = available_bytes,
+    };
+}
+
 fn strictScanOptions(options: RebuildOptions, partition_length: u64) ext4.StrictScanOptions {
     return .{
         .expected_length = partition_length,
@@ -768,7 +907,8 @@ fn strictScanOptions(options: RebuildOptions, partition_length: u64) ext4.Strict
         .max_total_bytes = options.limits.max_total_bytes,
         .max_xattrs_per_node = options.limits.max_xattrs_per_node,
         .max_xattr_bytes_per_node = options.limits.max_xattr_bytes_per_node,
-        .max_scan_metadata_bytes = options.max_scan_metadata_bytes,
+        .max_scan_metadata_bytes = options.limits.max_scan_metadata_bytes,
+        .diagnostic = options.limit_diagnostic,
     };
 }
 
@@ -959,34 +1099,72 @@ fn preflightReadOnlyDependencies(
     operations: []const Operation,
     customization: os_customization.OsCustomization,
     max_source_file_bytes: u64,
+    diagnostic: ?*limits_mod.Diagnostic,
 ) !void {
     for (operations) |operation| switch (operation) {
         .overwrite_file => |overwrite| switch (overwrite.source) {
-            .bytes => |bytes| if (bytes.len > max_source_file_bytes) {
-                return error.SourceFileTooLarge;
-            },
-            .host_path => |path| try preflightHostFile(io, path, max_source_file_bytes),
+            .bytes => |bytes| try checkSourceFileBytes(
+                bytes.len,
+                max_source_file_bytes,
+                diagnostic,
+            ),
+            .host_path => |path| try preflightHostFile(
+                io,
+                path,
+                max_source_file_bytes,
+                diagnostic,
+            ),
         },
         .remove_file, .remove_tree => {},
     };
     for (customization.filesystem) |operation| switch (operation) {
         .put_file => |file| switch (file.source) {
-            .inline_bytes => |bytes| if (bytes.len > max_source_file_bytes) {
-                return error.SourceFileTooLarge;
-            },
-            .host_path => |path| try preflightHostFile(io, path, max_source_file_bytes),
+            .inline_bytes => |bytes| try checkSourceFileBytes(
+                bytes.len,
+                max_source_file_bytes,
+                diagnostic,
+            ),
+            .host_path => |path| try preflightHostFile(
+                io,
+                path,
+                max_source_file_bytes,
+                diagnostic,
+            ),
         },
         else => {},
     };
 }
 
-fn preflightHostFile(io: Io, path: []const u8, max_bytes: u64) !void {
+/// A replacement file is loaded whole, so its size is a limit of its own
+/// rather than part of the imported tree's byte total.
+fn checkSourceFileBytes(
+    size: u64,
+    max_source_file_bytes: u64,
+    diagnostic: ?*limits_mod.Diagnostic,
+) limits_mod.Error!void {
+    limits_mod.observe(diagnostic, .source_file_bytes, size);
+    if (size > max_source_file_bytes) {
+        return limits_mod.exceeded(
+            diagnostic,
+            .source_file_bytes,
+            size,
+            max_source_file_bytes,
+        );
+    }
+}
+
+fn preflightHostFile(
+    io: Io,
+    path: []const u8,
+    max_bytes: u64,
+    diagnostic: ?*limits_mod.Diagnostic,
+) !void {
     if (path.len == 0) return error.InvalidSourcePath;
     const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
     defer file.close(io);
     const stat = try file.stat(io);
     if (stat.kind != .file) return error.SourceNotRegularFile;
-    if (stat.size > max_bytes) return error.SourceFileTooLarge;
+    try checkSourceFileBytes(stat.size, max_bytes, diagnostic);
 }
 
 fn validateRawArtifactPaths(
@@ -1130,6 +1308,7 @@ fn applyTreeOperations(
     tree: *root_tree.RootTree,
     operations: []const Operation,
     max_source_file_bytes: u64,
+    diagnostic: ?*limits_mod.Diagnostic,
 ) !void {
     for (operations) |operation| switch (operation) {
         .overwrite_file => |overwrite| {
@@ -1138,7 +1317,7 @@ fn applyTreeOperations(
             if (node.kind != .file) return error.NotRegularFile;
             switch (overwrite.source) {
                 .bytes => |content| {
-                    if (content.len > max_source_file_bytes) return error.SourceFileTooLarge;
+                    try checkSourceFileBytes(content.len, max_source_file_bytes, diagnostic);
                     try tree.putFileBytes(path, content, node.metadata);
                 },
                 .host_path => |source_path| {
@@ -1146,7 +1325,7 @@ fn applyTreeOperations(
                     defer source.close(io);
                     const stat = try source.stat(io);
                     if (stat.kind != .file) return error.SourceNotRegularFile;
-                    if (stat.size > max_source_file_bytes) return error.SourceFileTooLarge;
+                    try checkSourceFileBytes(stat.size, max_source_file_bytes, diagnostic);
                     try tree.putFileFromPath(path, source_path, node.metadata);
                 },
             }
@@ -1426,6 +1605,7 @@ fn preflightOperations(
     editor: *ext4.Editor,
     operations: []const Operation,
     max_source_file_bytes: u64,
+    diagnostic: ?*limits_mod.Diagnostic,
 ) !void {
     for (operations) |operation| {
         switch (operation) {
@@ -1433,13 +1613,21 @@ fn preflightOperations(
                 const stat = try editor.reader.statPath(io, overwrite.path);
                 if (stat.kind != .file) return error.NotRegularFile;
                 switch (overwrite.source) {
-                    .bytes => |bytes| if (bytes.len > max_source_file_bytes) return error.SourceFileTooLarge,
+                    .bytes => |bytes| try checkSourceFileBytes(
+                        bytes.len,
+                        max_source_file_bytes,
+                        diagnostic,
+                    ),
                     .host_path => |path| {
                         const file = try Io.Dir.cwd().openFile(io, path, .{});
                         defer file.close(io);
                         const source_stat = try file.stat(io);
                         if (source_stat.kind != .file) return error.SourceNotRegularFile;
-                        if (source_stat.size > max_source_file_bytes) return error.SourceFileTooLarge;
+                        try checkSourceFileBytes(
+                            source_stat.size,
+                            max_source_file_bytes,
+                            diagnostic,
+                        );
                     },
                 }
             },
@@ -1461,9 +1649,13 @@ fn loadSource(
     io: Io,
     source: FileSource,
     max_source_file_bytes: u64,
+    diagnostic: ?*limits_mod.Diagnostic,
 ) ![]u8 {
     return switch (source) {
-        .bytes => |bytes| allocator.dupe(u8, bytes),
+        .bytes => |bytes| blk: {
+            try checkSourceFileBytes(bytes.len, max_source_file_bytes, diagnostic);
+            break :blk allocator.dupe(u8, bytes);
+        },
         .host_path => |path| Io.Dir.cwd().readFileAlloc(
             io,
             path,
@@ -2780,4 +2972,54 @@ test "preserved editor rejects overlapping GPT partitions and metadata" {
         .header = permissive_header,
         .partitions = &metadata_overlap,
     }, disk_size));
+}
+
+test "workspace requirement counts the spool copy of the imported content" {
+    const space = workspaceRequirement(
+        35 * 1024 * 1024 * 1024,
+        40 * 1024 * 1024 * 1024,
+        .raw,
+        .none,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(u64, 35 * 1024 * 1024 * 1024), space.spool_bytes);
+    try std.testing.expectEqual(@as(u64, 40 * 1024 * 1024 * 1024), space.stage_bytes);
+    // A raw uncompressed artifact is the renamed stage, so it costs nothing.
+    try std.testing.expectEqual(@as(u64, 0), space.publish_bytes);
+    try std.testing.expectEqual(@as(u64, 75 * 1024 * 1024 * 1024), space.required_bytes);
+}
+
+test "a converted or compressed artifact coexists with the stage that fed it" {
+    const converted = workspaceRequirement(10, 100, .qcow2, .none, null);
+    try std.testing.expectEqual(@as(u64, 100), converted.publish_bytes);
+    try std.testing.expectEqual(@as(u64, 210), converted.required_bytes);
+
+    const compressed = workspaceRequirement(10, 100, .raw, .gzip, null);
+    try std.testing.expectEqual(@as(u64, 100), compressed.publish_bytes);
+    try std.testing.expectEqual(@as(u64, 210), compressed.required_bytes);
+}
+
+test "unknown free space is not too little free space" {
+    const unknown = workspaceRequirement(10, 100, .raw, .none, null);
+    try std.testing.expect(unknown.isSufficient());
+
+    const ample = workspaceRequirement(10, 100, .raw, .none, 110);
+    try std.testing.expect(ample.isSufficient());
+
+    const short = workspaceRequirement(10, 100, .raw, .none, 109);
+    try std.testing.expect(!short.isSufficient());
+}
+
+test "an unmeasurable workspace saturates instead of wrapping" {
+    const space = workspaceRequirement(
+        std.math.maxInt(u64),
+        std.math.maxInt(u64),
+        .qcow2,
+        .none,
+        0,
+    );
+
+    try std.testing.expectEqual(std.math.maxInt(u64), space.required_bytes);
+    try std.testing.expect(!space.isSufficient());
 }

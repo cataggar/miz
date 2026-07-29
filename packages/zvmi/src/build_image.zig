@@ -18,6 +18,7 @@ const os_customization = @import("os_customization.zig");
 const output = @import("output.zig");
 const iso9660 = @import("iso9660.zig");
 const qcow2 = @import("qcow2.zig");
+const limits_mod = @import("limits.zig");
 const root_tree_mod = @import("root_tree.zig");
 const vhdx = @import("vhdx.zig");
 const squashfs = @import("squashfs.zig");
@@ -93,6 +94,14 @@ pub const BuildImageOptions = struct {
     /// `bootconfig.populateEsp()`.
     uki: bootconfig.UkiOptions = .{},
     architecture: ?bootconfig.Architecture = null,
+    /// Limits on the owned root tree the merged ISO/squashfs/container
+    /// sources are materialized into. The defaults suit a purpose-built
+    /// image; a full installed root filesystem needs them raised.
+    limits: root_tree_mod.Limits = .{},
+    /// Optional sink for the peak measurements and the first limit breach.
+    /// The report is returned by value, so a build that fails on a limit can
+    /// only name the flag that raises it through a sink the caller owns.
+    limit_diagnostic: ?*limits_mod.Diagnostic = null,
     deterministic: ?BuildImageDeterminism = null,
     event_sink: ?EventSink = null,
     stage_sink: ?StageSink = null,
@@ -174,6 +183,8 @@ pub const BuildImageReport = struct {
     partition_style: ?azure.PartitionStyleReport = null,
     vhdx_metadata: ?VhdxMetadataReport = null,
     root_tree_digest: ?[32]u8 = null,
+    /// The largest value each limit reached while the root tree was built.
+    limit_peaks: limits_mod.Peaks = .{},
 
     pub fn deinit(self: *BuildImageReport, allocator: std.mem.Allocator) void {
         allocator.free(self.rootfs_path_in_iso);
@@ -314,7 +325,13 @@ pub fn build(
     );
     defer allocator.free(root_tree_spool_path);
     logStep(options, "materialize merged sources into owned root tree");
-    var root_tree = try root_tree_mod.RootTree.init(allocator, io, root_tree_spool_path, .{});
+    var root_tree = try root_tree_mod.RootTree.init(
+        allocator,
+        io,
+        root_tree_spool_path,
+        options.limits,
+    );
+    root_tree.diagnostic = options.limit_diagnostic;
     defer root_tree.deinit();
     try root_tree.importExt4View(&source_tree.view);
 
@@ -438,6 +455,7 @@ pub fn build(
     }
     try enterStage(options, .populate_filesystem);
     report.root_tree_digest = try root_tree.manifestDigest();
+    if (options.limit_diagnostic) |sink| report.limit_peaks = sink.peaks;
     logStep(options, "populate root ext4 filesystem");
     var root_xattr_buffer: [1]ext4.Xattr = undefined;
     var root_selinux_value: ?[]u8 = null;
