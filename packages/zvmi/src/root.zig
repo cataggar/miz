@@ -50,6 +50,7 @@ pub const artifact_pipeline = @import("artifact_pipeline.zig");
 pub const verity = @import("verity.zig");
 pub const authenticode = @import("authenticode.zig");
 pub const uki_certificate = @import("uki_certificate.zig");
+pub const block_device = @import("block_device.zig");
 const image_mod = @import("image.zig");
 const size_mod = @import("size.zig");
 
@@ -57,6 +58,8 @@ pub const Format = image_mod.Format;
 pub const Image = image_mod.Image;
 pub const Info = image_mod.Info;
 pub const CreateOptions = image_mod.CreateOptions;
+pub const OpenOptions = image_mod.OpenOptions;
+pub const DeviceInfo = image_mod.DeviceInfo;
 pub const VhdSubformat = image_mod.VhdSubformat;
 pub const copyAll = image_mod.copyAll;
 
