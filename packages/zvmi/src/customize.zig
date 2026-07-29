@@ -29,8 +29,8 @@ const verity = @import("verity.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 8;
-pub const provenance_schema_version: u32 = 11;
+pub const plan_schema_version: u32 = 9;
+pub const provenance_schema_version: u32 = 12;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -184,6 +184,11 @@ pub const PreservedStorage = struct {
     /// surviving stale one fails the build. `rebuild`-only, for the same
     /// reason again: nothing else here reads a source's tree.
     identity_rewrite: IdentityRewritePolicy = .rewrite_and_verify,
+    /// Whether the rebuilt root filesystem carries a JBD2 journal, and how
+    /// large. `rebuild`-only, for the same reason: every other backend keeps
+    /// the source's filesystem rather than writing a new one. Off by default,
+    /// so an existing plan keeps producing the bytes it always has.
+    journal: ext4.JournalOptions = .{},
 };
 pub const PreserveStorage = PreservedStorage;
 pub const RootPartitionSelector = PartitionSelector;
@@ -1887,6 +1892,7 @@ pub const ResolvedPreservedStorage = struct {
     source_profile: SourceProfilePolicy = .strict,
     source_mounts: []const SourceMount = &.{},
     identity_rewrite: IdentityRewritePolicy = .rewrite_and_verify,
+    journal: ext4.JournalOptions = .{},
 };
 
 pub const ResolvedStorage = union(enum) {
@@ -2252,6 +2258,7 @@ pub fn resolve(
             .source_profile = storage.source_profile,
             .source_mounts = try dupeSourceMounts(plan_allocator, storage.source_mounts),
             .identity_rewrite = storage.identity_rewrite,
+            .journal = storage.journal,
         } },
     };
     const resolved_os = try dupeOsCustomization(plan_allocator, request.os, context.base_path);
@@ -3277,6 +3284,12 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
                 hashInt(&hash, mount.fat_metadata.gid);
             }
             hash.update(@tagName(storage.identity_rewrite));
+            hashBool(&hash, storage.journal.enabled);
+            // The absent size is hashed as its own value rather than as zero,
+            // so "default for this filesystem size" and an explicit size that
+            // happens to match it stay distinguishable.
+            hashBool(&hash, storage.journal.size_bytes != null);
+            hashInt(&hash, storage.journal.size_bytes orelse 0);
         },
     }
     hashOsCustomization(&hash, plan.os);
@@ -4089,6 +4102,7 @@ fn rebuildAvailable(io: Io, plan: *const ResolvedPlan) CapabilityState {
         .source_profile = storage.source_profile,
         .source_mounts = storage.source_mounts,
         .identity_rewrite = storage.identity_rewrite,
+        .journal = storage.journal,
         .existing_operations = plan.data.existing_path_operations,
         .customization = plan.data.os,
         .generalization = plan.data.generalization,
@@ -4371,6 +4385,12 @@ pub const PreservedRebuildRecord = struct {
     ext4_block_size: u32,
     filesystem_length: u64,
     ext4_global_timestamp: u32,
+    /// Whether the source filesystem carried a journal, and how many blocks
+    /// the rebuilt one's journal occupies. Both recorded because a rebuild
+    /// that drops a journal, or adds one, changes what the image does after
+    /// an unclean shutdown -- and neither is visible from the tree digests.
+    source_has_journal: bool,
+    journal_block_count: u32,
     source_root_tree_digest: Digest,
     final_root_tree_digest: Digest,
     imported_node_count: usize,
@@ -4697,6 +4717,8 @@ fn buildResult(
                 .ext4_block_size = report.ext4_block_size,
                 .filesystem_length = report.filesystem_length,
                 .ext4_global_timestamp = report.ext4_global_timestamp,
+                .source_has_journal = report.source_has_journal,
+                .journal_block_count = report.journal_block_count,
                 .source_root_tree_digest = .{ .bytes = report.source_manifest_sha256 },
                 .final_root_tree_digest = .{ .bytes = report.final_manifest_sha256 },
                 .imported_node_count = report.imported_node_count,
@@ -4987,6 +5009,7 @@ pub fn execute(
                 .source_profile = plan.data.storage.preserve.source_profile,
                 .source_mounts = plan.data.storage.preserve.source_mounts,
                 .identity_rewrite = plan.data.storage.preserve.identity_rewrite,
+                .journal = plan.data.storage.preserve.journal,
                 .identity_diagnostic = &identity_sink,
                 .existing_operations = plan.data.existing_path_operations,
                 .customization = plan.data.os,
@@ -7500,7 +7523,7 @@ test "plan JSON renders identifiers as stable strings" {
     defer output.deinit();
     try writePlanJson(&resolved.plan.?, &output.writer);
     const json = output.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 9") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"plan_hash\": \"") != null);
 }
 

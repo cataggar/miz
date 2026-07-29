@@ -151,6 +151,15 @@ pub const RebuildOptions = struct {
     /// contract; `.general` exists because no filesystem a distro installer
     /// produced can ever satisfy it.
     source_profile: SourceProfilePolicy = .strict,
+    /// Whether the rebuilt root filesystem carries a JBD2 journal. Off by
+    /// default, so a rebuild keeps producing what it always has -- including
+    /// the strict profile's byte-for-byte contract, which HAS_JOURNAL is not
+    /// part of. Turn it on when the rebuilt image boots into a mutable root
+    /// filesystem: an installed system that loses power without a journal
+    /// faces a full fsck rather than a replay. Note that a journalled source
+    /// is rebuilt journal-less unless this says otherwise; `PreflightReport`
+    /// reports the source's own journal so the change is visible.
+    journal: ext4.JournalOptions = .{},
     /// Additional filesystems merged into the root tree, in order, each at
     /// its own mount point. An installed system is normally spread across an
     /// ESP, a `/boot` filesystem and a root filesystem; listing the first two
@@ -291,6 +300,12 @@ pub const RebuildReport = struct {
     ext4_block_size: u32,
     filesystem_length: u64,
     ext4_global_timestamp: u32,
+    /// Whether the *source* filesystem carried a journal. Stated because a
+    /// journal-less rebuild of a journalled source is a real change of
+    /// behaviour, and `RebuildOptions.journal` is what decides it.
+    source_has_journal: bool,
+    /// Blocks the rebuilt filesystem's own journal occupies, or 0.
+    journal_block_count: u32,
     source_manifest_sha256: [32]u8,
     final_manifest_sha256: [32]u8,
     /// RootTree node counts exclude its implicit root directory.
@@ -328,6 +343,11 @@ pub const RebuildInspection = struct {
     ext4_block_size: u32,
     filesystem_length: u64,
     ext4_global_timestamp: u32,
+    /// Whether the source filesystem carried a journal; see the same field on
+    /// `RebuildReport`.
+    source_has_journal: bool,
+    /// Blocks the rebuilt filesystem's own journal would occupy, or 0.
+    journal_block_count: u32,
     /// Excludes the implicit root directory.
     imported_node_count: usize,
     /// Filesystems merged in at a mount point, excluding the root source.
@@ -622,10 +642,10 @@ pub fn inspectRebuild(
     );
     const scanned_label = scanned.label();
     const scanned_timestamp = scanned.globalTimestamp(options.source_date_epoch);
-    _ = try ext4.preflightPopulate(
+    const preflight = try ext4.preflightPopulate(
         allocator,
         try validation_tree.ext4View(),
-        populateOptions(&validation_tree, partition.offset, scanned, &scanned_label, scanned_timestamp),
+        populateOptions(&validation_tree, partition.offset, scanned, &scanned_label, scanned_timestamp, options.journal),
     );
 
     return .{
@@ -642,6 +662,8 @@ pub fn inspectRebuild(
         .ext4_block_size = scanned.blockSize(),
         .filesystem_length = scanned.filesystemLength(),
         .ext4_global_timestamp = scanned_timestamp,
+        .source_has_journal = scanned.hasJournal(),
+        .journal_block_count = preflight.journal_block_count,
         .imported_node_count = imported_node_count,
         .merged_source_count = sources.mounts.len,
         .shadowed_node_count = sources.shadowed_nodes,
@@ -825,12 +847,12 @@ pub fn rebuild(
     source_open = false;
 
     try zeroFileRange(io, raw.file, partition.offset, partition.length);
-    _ = try ext4.populate(
+    const populated = try ext4.populate(
         io,
         raw.file,
         allocator,
         final_view,
-        populateOptions(&tree, partition.offset, scanned, &scanned_label, scanned_timestamp),
+        populateOptions(&tree, partition.offset, scanned, &scanned_label, scanned_timestamp, options.journal),
     );
     const raw_inode = (try raw.file.stat(io)).inode;
     raw.close(io);
@@ -870,6 +892,8 @@ pub fn rebuild(
         .ext4_block_size = scanned.blockSize(),
         .filesystem_length = scanned.filesystemLength(),
         .ext4_global_timestamp = scanned_timestamp,
+        .source_has_journal = scanned.hasJournal(),
+        .journal_block_count = populated.journal_block_count,
         .source_manifest_sha256 = source_manifest,
         .final_manifest_sha256 = final_manifest,
         .imported_node_count = imported_node_count,
@@ -1065,6 +1089,7 @@ fn populateOptions(
     scanned: *const ScannedSource,
     label: *const [16]u8,
     timestamp: u32,
+    journal: ext4.JournalOptions,
 ) ext4.PopulateOptions {
     const root = tree.rootMetadata();
     return .{
@@ -1074,6 +1099,7 @@ fn populateOptions(
         .label = label,
         .uuid = scanned.uuid(),
         .timestamp = timestamp,
+        .journal = journal,
         .root_mode = root.mode,
         .root_uid = root.uid,
         .root_gid = root.gid,
@@ -1173,6 +1199,15 @@ const ScannedSource = union(enum) {
         return switch (self.*) {
             .strict => |tree| tree.identity.label,
             .general => |tree| tree.identity.label,
+        };
+    }
+
+    /// The strict profile's feature set does not contain HAS_JOURNAL at all,
+    /// so a strict source never has one to report.
+    fn hasJournal(self: *const ScannedSource) bool {
+        return switch (self.*) {
+            .strict => false,
+            .general => |tree| tree.identity.has_journal,
         };
     }
 
@@ -4207,6 +4242,79 @@ test "general rebuild imports a stock mke2fs source and preserves its metadata" 
     try std.testing.expect(saw_device);
     try std.testing.expect(saw_fifo);
     try std.testing.expect(saw_symlink);
+    try std.testing.expect(saw_hostname);
+}
+
+test "a rebuild reports the source journal and only writes one when asked" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const source_path = "test-preserved-journal-source.raw";
+    const plain_path = "test-preserved-journal-plain.raw";
+    const journalled_path = "test-preserved-journal-output.raw";
+    const artifacts = [_][]const u8{
+        source_path,
+        plain_path,
+        plain_path ++ ".native-rebuild.raw",
+        plain_path ++ ".native-rebuild.output",
+        plain_path ++ ".native-rebuild.spool",
+        journalled_path,
+        journalled_path ++ ".native-rebuild.raw",
+        journalled_path ++ ".native-rebuild.output",
+        journalled_path ++ ".native-rebuild.spool",
+    };
+    defer for (artifacts) |artifact| Io.Dir.cwd().deleteFile(io, artifact) catch {};
+    createGeneralTestDisk(allocator, io, source_path) catch |err| switch (err) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const base = RebuildOptions{
+        .source_path = source_path,
+        .output_path = plain_path,
+        .expected_source_format = .raw,
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 1 },
+        .source_profile = .general,
+        .source_date_epoch = 1_735_689_600,
+        .expected_virtual_size = test_disk_size,
+    };
+
+    // `mke2fs -t ext4` journals by default, so the source has one and the
+    // default rebuild silently drops it -- which is exactly why the report
+    // has to say so.
+    const plain = try rebuild(allocator, io, base);
+    try std.testing.expect(plain.source_has_journal);
+    try std.testing.expectEqual(@as(u32, 0), plain.journal_block_count);
+
+    var journalled_options = base;
+    journalled_options.output_path = journalled_path;
+    journalled_options.journal = .{ .enabled = true };
+    const journalled = try rebuild(allocator, io, journalled_options);
+    try std.testing.expect(journalled.source_has_journal);
+    // 24 MiB of partition is 6144 blocks, the ladder's first tier.
+    try std.testing.expectEqual(@as(u32, 1024), journalled.journal_block_count);
+
+    const partition_offset = @as(u64, test_partition_first_lba) * mbr.sector_size;
+    var output = try Image.openPath(io, journalled_path);
+    defer output.close(io);
+    var reader = try ext4.openGeneral(io, output.file, allocator, .{ .offset = partition_offset });
+    defer reader.deinit();
+    var tree = try ext4.scanReadable(&reader, io, allocator, .{
+        .available_length = @as(u64, test_partition_sectors) * mbr.sector_size,
+    });
+    defer tree.deinit();
+    try std.testing.expect(tree.identity.has_journal);
+    try std.testing.expectEqual(ext4.SourceProfile.ext4_general_v1, tree.identity.profile);
+
+    // The tree itself has to survive the journal untouched.
+    var saw_hostname = false;
+    var index: usize = 0;
+    while (index < tree.nodeCount()) : (index += 1) {
+        const entry = tree.entryAt(index);
+        if (!std.mem.eql(u8, entry.path, "etc/hostname")) continue;
+        saw_hostname = true;
+        try std.testing.expectEqual(@as(u32, 1234), entry.uid);
+    }
     try std.testing.expect(saw_hostname);
 }
 
