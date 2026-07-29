@@ -67,6 +67,9 @@ zvmi/
                               #   plain single-partition)
         gpt.zig                # GPT header + partition entry array codec
                               #   (CRC-32, spec-verified layout)
+        lvm.zig                # read-only LVM2 reader for offline images:
+                              #   label, PV header, metadata area, volume
+                              #   group text, extent-to-offset mapping
         azure.zig              # 1 MiB alignment + Gen1/Gen2 partition-style
                               #   checks (backs `zvmi azure fixup`)
         deprovision.zig        # offline image generalization: resets

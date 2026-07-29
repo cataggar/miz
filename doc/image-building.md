@@ -159,6 +159,103 @@ file for writing, so inspecting a live disk cannot damage it. Consequently:
   the library. Without it, every write fails with
   `BlockDeviceWriteNotPermitted`.
 
+### Reading LVM2
+
+A guided Ubuntu or Debian install does not put the root filesystem in a
+partition. It puts an LVM2 physical volume in the partition and the filesystem
+in a logical volume inside that:
+
+```
+nvme0n1                      1.7T disk
+|-nvme0n1p1                    1G vfat          /boot/efi
+|-nvme0n1p2                    2G ext4          /boot
+`-nvme0n1p3                  1.7T LVM2_member
+  `-vg-lv                    100G ext4          /
+```
+
+`zvmi` reads that layout **offline and read-only**. There is no writer: nothing
+in `zvmi` creates, activates, resizes, or otherwise mutates LVM metadata. On a
+*running* system the volume is already published as `/dev/mapper/vg-lv`, and
+that node can be opened directly as a block device (see above) without any of
+this.
+
+`zvmi map` lists the volume groups it found after the allocation map:
+
+```
+$ zvmi map disk.img
+Offset       Length       Mapped
+0x0          0x10000000   true
+
+Volume group ubuntu-vg (seqno 3, 4 MiB extents)
+  pv pv0      0x1004400 (GPT partition)
+Offset       Length       Type         Volume
+0x1104400    0x2800000    striped      ubuntu-lv
+-            0x800000     thin         swap (UnsupportedLvmThinSegment)
+```
+
+`--output=json` emits `{"extents": [...], "volume_groups": [...]}`. (Before LVM
+support it emitted the extent array on its own; the array now lives under
+`extents`.) Each logical volume carries `start` and `length` when it has a
+single byte range on this disk, and `unmappable` naming the reason when it does
+not.
+
+Wherever a partition selector is accepted -- the preserved-image
+`root_partition`, and each `source_mounts` entry -- a logical volume can be
+named instead:
+
+```zig
+.root_partition = .{ .logical_volume = .{ .logical_volume = "ubuntu-lv" } },
+.root_partition = .{ .logical_volume = .{
+    .volume_group = "ubuntu-vg",
+    .logical_volume = "ubuntu-lv",
+} },
+```
+
+and in the preserved-image configuration JSON (api_version 3 and later; a v2
+document is refused with `UnsupportedPartitionSelectorForApiVersion`):
+
+```json
+{ "logical_volume": { "volume_group": "ubuntu-vg", "logical_volume": "ubuntu-lv" } }
+```
+
+`volume_group` may be left out when the disk carries exactly one volume group;
+on a disk with more than one, omitting it is `AmbiguousLvmVolumeGroup` rather
+than a guess between them.
+
+What is understood and what is refused:
+
+- Only a `striped` segment with a single stripe -- a plain linear mapping,
+  which is what a default install produces. Real striping is told apart from a
+  linear map only by `stripe_count`, so reading the first stripe as the whole
+  volume would silently produce data that looks right and is not.
+- Every other segment type is refused by its own error, so an operator can tell
+  what is in the way: `UnsupportedLvmStripedSegment` (multi-stripe),
+  `UnsupportedLvmMirrorSegment`, `UnsupportedLvmRaidSegment`,
+  `UnsupportedLvmThinSegment`, `UnsupportedLvmCacheSegment`,
+  `UnsupportedLvmSnapshotSegment`, and `UnsupportedLvmSegmentType` for anything
+  else. Such a volume is still listed by `zvmi map`; only its mapping fails.
+- A volume group may span several physical volumes as long as they are all in
+  the image being read. One that is not present is `LvmPhysicalVolumeMissing`.
+- A volume handed to a reader has to be one unbroken run on one physical
+  volume; anything else is `LogicalVolumeNotContiguous` rather than a silent
+  truncation to the first run.
+- The metadata area is a circular buffer holding a sequence number and a
+  checksum. The copy with the highest `seqno` wins, after its metadata-area
+  header checksum and its own checksum have both been verified; an area flagged
+  `RAW_LOCN_IGNORED` is stale by design and never competes. Every physical
+  volume in a group keeps its own copy, so choosing the wrong one would yield a
+  plausible but stale mapping.
+- A region whose first sectors hold no `LABELONE` is simply not a physical
+  volume and is passed over. One that carries a label and then does not parse
+  is corruption and is reported, because a shorter list than the disk really
+  has is the more expensive answer.
+
+Rebuilding *into* a logical volume is allowed: the run starts and ends exactly
+where the volume does, so rewriting the filesystem leaves every LVM structure
+untouched. The `vm` backend is the exception -- the guest reaches its root
+through `/dev/vdaN` and this initramfs carries no volume manager, so a logical
+volume root there is `UnsupportedRootPartitionInVm`.
+
 ### Preserved-image customization backends
 
 Customizing an image that already exists selects one of five backends. They are
