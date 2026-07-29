@@ -27,6 +27,7 @@ const ParsedArgs = struct {
     customization_source_paths: []const []const u8 = &.{},
     seed: zvmi.customize.Seed,
     source_date_epoch: u64,
+    limits: zvmi.limits.ImportLimits = .{},
     preflight_only: bool = false,
     reuse_success: bool = false,
     verbose: bool = false,
@@ -182,6 +183,7 @@ pub fn main(init: std.process.Init) !void {
             .seed = args.seed,
             .source_date_epoch = args.source_date_epoch,
         },
+        .limits = args.limits,
     };
 
     const host_architecture: zvmi.customize.Architecture = switch (builtin.cpu.arch) {
@@ -288,6 +290,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
     errdefer customization_sources.deinit();
     var seed: ?zvmi.customize.Seed = null;
     var source_date_epoch: ?u64 = null;
+    var limits: zvmi.limits.ImportLimits = .{};
     var preflight_only = false;
     var reuse_success = false;
     var verbose = false;
@@ -367,6 +370,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
             seed = .{ .bytes = bytes };
         } else if (std.mem.eql(u8, arg, "--source-date-epoch")) {
             source_date_epoch = try std.fmt.parseInt(u64, value, 10);
+        } else if (try limits.parseFlag(arg, value)) {
+            // Handled: `arg` named an import limit and `value` raised it.
         } else {
             return error.UnexpectedArgument;
         }
@@ -394,6 +399,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
         .customization_source_paths = try customization_sources.toOwnedSlice(),
         .seed = seed orelse return error.MissingSeed,
         .source_date_epoch = source_date_epoch orelse return error.MissingSourceDateEpoch,
+        .limits = limits,
         .preflight_only = preflight_only,
         .reuse_success = reuse_success,
         .verbose = verbose,

@@ -2,6 +2,7 @@ const std = @import("std");
 const customization_wire = @import("../packages/zvmi/src/customization_wire.zig");
 const customize = @import("../packages/zvmi/src/customize.zig");
 const preserved_image_wire = @import("../packages/zvmi/src/preserved_image_wire.zig");
+const limits_mod = @import("../packages/zvmi/src/limits.zig");
 
 pub const Format = enum {
     raw,
@@ -58,6 +59,23 @@ pub const UkiOptions = struct {
 };
 
 pub const Xattr = customization_wire.Xattr;
+
+/// Import guardrails, mirrored from the library so a build graph can raise
+/// them for a large installed root filesystem without reaching into the CLI.
+pub const ImportLimits = limits_mod.ImportLimits;
+
+/// Emits a flag per raised limit. A limit left at its default emits nothing,
+/// so an unchanged build graph produces the exact command line it did before
+/// and its cached results stay valid.
+fn addLimitArgs(b: *std.Build, run: *std.Build.Step.Run, limits: ImportLimits) void {
+    const defaults = ImportLimits{};
+    inline for (comptime std.enums.values(limits_mod.Limit)) |limit| {
+        const raised = limits.value(limit);
+        if (raised != defaults.value(limit)) {
+            run.addArgs(&.{ comptime limit.flag(), b.fmt("{d}", .{raised}) });
+        }
+    }
+}
 pub const Metadata = customization_wire.Metadata;
 
 pub const FileSource = union(enum) {
@@ -134,6 +152,7 @@ pub const Options = struct {
     uki: UkiOptions = .{},
     os: OsCustomization = .{},
     generalization: GeneralizationPolicy = .none,
+    limits: ImportLimits = .{},
     verbose: bool = false,
 };
 
@@ -227,6 +246,7 @@ pub const PreservedOptions = struct {
     runner: ?PreservedRunner = null,
     /// Required by, and only meaningful to, the `vm` backend.
     vm: ?PreservedVmPolicy = null,
+    limits: ImportLimits = .{},
     verbose: bool = false,
 };
 
@@ -575,6 +595,7 @@ fn configurePreservedRequest(
         "--api-version",
         b.fmt("{d}", .{customize.current_api_version}),
     });
+    addLimitArgs(b, run, options.limits);
     if (options.verbose) run.addArg("--verbose");
 }
 
@@ -612,6 +633,7 @@ fn configureRequest(
     if (!std.mem.eql(u8, options.uki.output_directory, "EFI/Linux")) {
         run.addArgs(&.{ "--uki-output-directory", options.uki.output_directory });
     }
+    addLimitArgs(b, run, options.limits);
     addCustomizationArgs(b, run, options) catch @panic("failed to materialize image customization");
     if (options.verbose) run.addArg("--verbose");
 }

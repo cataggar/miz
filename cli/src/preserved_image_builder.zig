@@ -27,6 +27,7 @@ const ParsedArgs = struct {
     format: zvmi.customize.OutputFormat,
     seed: zvmi.customize.Seed,
     source_date_epoch: u64,
+    limits: zvmi.limits.ImportLimits = .{},
     preflight_only: bool = false,
     reuse_success: bool = false,
     verbose: bool = false,
@@ -190,6 +191,7 @@ pub fn main(init: std.process.Init) !void {
             .seed = args.seed,
             .source_date_epoch = args.source_date_epoch,
         },
+        .limits = args.limits,
     };
 
     const host_architecture: zvmi.customize.Architecture = switch (builtin.cpu.arch) {
@@ -341,6 +343,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
     var format: ?zvmi.customize.OutputFormat = null;
     var seed: ?zvmi.customize.Seed = null;
     var source_date_epoch: ?u64 = null;
+    var limits: zvmi.limits.ImportLimits = .{};
     var preflight_only = false;
     var reuse_success = false;
     var verbose = false;
@@ -390,6 +393,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
             seed = .{ .bytes = bytes };
         } else if (std.mem.eql(u8, arg, "--source-date-epoch")) {
             source_date_epoch = try std.fmt.parseInt(u64, value, 10);
+        } else if (try limits.parseFlag(arg, value)) {
+            // Handled: `arg` named an import limit and `value` raised it.
         } else {
             return error.UnexpectedArgument;
         }
@@ -408,6 +413,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
         .format = format orelse return error.MissingFormat,
         .seed = seed orelse return error.MissingSeed,
         .source_date_epoch = source_date_epoch orelse return error.MissingSourceDateEpoch,
+        .limits = limits,
         .preflight_only = preflight_only,
         .reuse_success = reuse_success,
         .verbose = verbose,
@@ -1369,4 +1375,45 @@ test "dependency closure is checked before a bundle can be reset" {
         validateDependencyClosure(arena.allocator(), io, &args, lock_path),
     );
     _ = try std.Io.Dir.cwd().statFile(io, base_path, .{});
+}
+
+test "import limit flags raise the limits the request carries" {
+    const args = [_][]const u8{
+        "--architecture",          "x86_64",
+        "--disk",                  "source.raw",
+        "--configuration",         "preserved-image.json",
+        "--bundle-output",         "out",
+        "--image-basename",        "image.raw",
+        "-O",                      "raw",
+        "--seed",                  "00" ** 32,
+        "--source-date-epoch",     "0",
+        "--max-nodes",             "8M",
+        "--max-source-file-bytes", "4G",
+    };
+    const parsed = try parseArgs(std.testing.allocator, &args);
+    defer std.testing.allocator.free(parsed.dependency_paths);
+    defer std.testing.allocator.free(parsed.operation_source_paths);
+
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), parsed.limits.max_nodes);
+    try std.testing.expectEqual(@as(u64, 4 * 1024 * 1024 * 1024), parsed.limits.max_source_file_bytes);
+    // Every other limit keeps its conservative default.
+    try std.testing.expectEqual(zvmi.limits.ImportLimits{
+        .max_nodes = parsed.limits.max_nodes,
+        .max_source_file_bytes = parsed.limits.max_source_file_bytes,
+    }, parsed.limits);
+}
+
+test "a zero limit is rejected instead of silently rejecting every source" {
+    const args = [_][]const u8{
+        "--architecture",      "x86_64",
+        "--disk",              "source.raw",
+        "--configuration",     "preserved-image.json",
+        "--bundle-output",     "out",
+        "--image-basename",    "image.raw",
+        "-O",                  "raw",
+        "--seed",              "00" ** 32,
+        "--source-date-epoch", "0",
+        "--max-nodes",         "0",
+    };
+    try std.testing.expectError(error.ZeroLimit, parseArgs(std.testing.allocator, &args));
 }
