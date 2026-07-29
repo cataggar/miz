@@ -16,6 +16,7 @@ const gpt = @import("gpt.zig");
 const guid = @import("guid.zig");
 const image_mod = @import("image.zig");
 const layout = @import("layout.zig");
+const identity_rewrite = @import("identity_rewrite.zig");
 const limits_mod = @import("limits.zig");
 const mbr = @import("mbr.zig");
 const os_customization = @import("os_customization.zig");
@@ -28,8 +29,8 @@ const verity = @import("verity.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 7;
-pub const provenance_schema_version: u32 = 10;
+pub const plan_schema_version: u32 = 8;
+pub const provenance_schema_version: u32 = 11;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -164,6 +165,7 @@ pub const FreshStorage = struct {
 pub const PartitionSelector = preserved_image.PartitionSelector;
 
 pub const SourceProfilePolicy = preserved_image.SourceProfilePolicy;
+pub const IdentityRewritePolicy = identity_rewrite.Policy;
 pub const SourceMount = preserved_image.SourceMount;
 pub const SourceFilesystem = preserved_image.SourceFilesystem;
 pub const SynthesizedFatMetadata = fat32.SynthesizedMetadata;
@@ -177,6 +179,11 @@ pub const PreservedStorage = struct {
     /// Extra filesystems merged into the rebuilt root, each at its own mount
     /// point, in order. Also `rebuild`-only, for the same reason.
     source_mounts: []const SourceMount = &.{},
+    /// Whether the rebuilt tree's `/etc/fstab` and bootloader configuration
+    /// are reconciled with the identifiers the rebuild retired, and whether a
+    /// surviving stale one fails the build. `rebuild`-only, for the same
+    /// reason again: nothing else here reads a source's tree.
+    identity_rewrite: IdentityRewritePolicy = .rewrite_and_verify,
 };
 pub const PreserveStorage = PreservedStorage;
 pub const RootPartitionSelector = PartitionSelector;
@@ -553,6 +560,7 @@ pub const DiagnosticCode = enum {
     invalid_reproducibility,
     invalid_limits,
     limit_exceeded,
+    stale_filesystem_identifier,
     invalid_plan,
     missing_capability,
     source_hash_failed,
@@ -1878,6 +1886,7 @@ pub const ResolvedPreservedStorage = struct {
     root_partition: PartitionSelector,
     source_profile: SourceProfilePolicy = .strict,
     source_mounts: []const SourceMount = &.{},
+    identity_rewrite: IdentityRewritePolicy = .rewrite_and_verify,
 };
 
 pub const ResolvedStorage = union(enum) {
@@ -2242,6 +2251,7 @@ pub fn resolve(
             .root_partition = storage.root_partition,
             .source_profile = storage.source_profile,
             .source_mounts = try dupeSourceMounts(plan_allocator, storage.source_mounts),
+            .identity_rewrite = storage.identity_rewrite,
         } },
     };
     const resolved_os = try dupeOsCustomization(plan_allocator, request.os, context.base_path);
@@ -3266,6 +3276,7 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
                 hashInt(&hash, mount.fat_metadata.uid);
                 hashInt(&hash, mount.fat_metadata.gid);
             }
+            hash.update(@tagName(storage.identity_rewrite));
         },
     }
     hashOsCustomization(&hash, plan.os);
@@ -4077,6 +4088,7 @@ fn rebuildAvailable(io: Io, plan: *const ResolvedPlan) CapabilityState {
         .root_partition = storage.root_partition,
         .source_profile = storage.source_profile,
         .source_mounts = storage.source_mounts,
+        .identity_rewrite = storage.identity_rewrite,
         .existing_operations = plan.data.existing_path_operations,
         .customization = plan.data.os,
         .generalization = plan.data.generalization,
@@ -4371,6 +4383,20 @@ pub const PreservedRebuildRecord = struct {
     existing_operation_count: usize,
     os_customization_count: usize,
     generalization_count: usize,
+    /// What reconciling the imported configuration with the rebuilt image's
+    /// identifiers changed. Recorded because an fstab entry that was dropped
+    /// and a bootloader reference that was rewritten are edits nobody asked
+    /// for by name, and provenance is where edits like that are accounted
+    /// for. `identity_stale_references` is non-zero only when the operator
+    /// chose to be told rather than refused.
+    identity_retired_identifiers: usize,
+    identity_fstab_entries_rewritten: usize,
+    identity_fstab_entries_dropped: usize,
+    identity_fstab_entries_unresolved: usize,
+    identity_config_files_rewritten: usize,
+    identity_config_references_rewritten: usize,
+    identity_verified_files: usize,
+    identity_stale_references: usize,
 };
 
 pub const ExecutionRecord = struct {
@@ -4680,6 +4706,14 @@ fn buildResult(
                 .existing_operation_count = report.existing_operation_count,
                 .os_customization_count = report.os_customization_count,
                 .generalization_count = report.generalization_count,
+                .identity_retired_identifiers = report.identity_rewrite.retired_identifiers,
+                .identity_fstab_entries_rewritten = report.identity_rewrite.fstab_entries_rewritten,
+                .identity_fstab_entries_dropped = report.identity_rewrite.fstab_entries_dropped,
+                .identity_fstab_entries_unresolved = report.identity_rewrite.fstab_entries_unresolved,
+                .identity_config_files_rewritten = report.identity_rewrite.config_files_rewritten,
+                .identity_config_references_rewritten = report.identity_rewrite.config_references_rewritten,
+                .identity_verified_files = report.identity_rewrite.verified_files,
+                .identity_stale_references = report.identity_rewrite.stale_references,
             } else null,
         };
     } else null;
@@ -4872,6 +4906,11 @@ pub fn execute(
     var limit_sink = limits_mod.Diagnostic{};
     var limit_message: [limits_mod.Exceeded.max_message_bytes]u8 = undefined;
     var limit_remediation: [limits_mod.Exceeded.max_remediation_bytes]u8 = undefined;
+    // The same arrangement for the first surviving stale identifier, which
+    // only the rebuild backend can produce.
+    var identity_sink = identity_rewrite.Diagnostic{};
+    var identity_message: [identity_rewrite.Stale.max_message_bytes]u8 = undefined;
+    var identity_remediation: [identity_rewrite.Stale.max_remediation_bytes]u8 = undefined;
     var fresh_report: ?build_image.BuildImageReport = null;
     defer if (fresh_report) |*report| report.deinit(allocator);
     var preserved_report: ?preserved_image.Report = null;
@@ -4947,6 +4986,8 @@ pub fn execute(
                 .root_partition = plan.data.storage.preserve.root_partition,
                 .source_profile = plan.data.storage.preserve.source_profile,
                 .source_mounts = plan.data.storage.preserve.source_mounts,
+                .identity_rewrite = plan.data.storage.preserve.identity_rewrite,
+                .identity_diagnostic = &identity_sink,
                 .existing_operations = plan.data.existing_path_operations,
                 .customization = plan.data.os,
                 .generalization = plan.data.generalization,
@@ -4963,6 +5004,12 @@ pub fn execute(
                     "/limits",
                     &limit_message,
                     &limit_remediation,
+                );
+                try appendStaleIdentityFailure(
+                    &diagnostics,
+                    identity_sink,
+                    &identity_message,
+                    &identity_remediation,
                 );
                 if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
                 emitDiagnostics(event_sink, diagnostics.items);
@@ -5507,6 +5554,30 @@ fn appendLimitFailure(
         .configuration_path = path,
         .message = message,
         .cause = .{ .error_name = @errorName(breach.limit.err()) },
+        .remediation = remediation,
+    });
+}
+
+/// Adds the diagnostic that names the file still carrying an identifier the
+/// rebuild retired. A failure that was not a stale identifier adds nothing,
+/// so the generic failure diagnostic stays alone. The message borrows the
+/// caller's buffers, which the outcome copies before returning.
+fn appendStaleIdentityFailure(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    identity_sink: identity_rewrite.Diagnostic,
+    message_buffer: []u8,
+    remediation_buffer: []u8,
+) Allocator.Error!void {
+    const stale = identity_sink.stale orelse return;
+    const message = stale.describe(message_buffer) catch return;
+    const remediation = stale.remediation(remediation_buffer) catch return;
+    try diagnostics.append(.{
+        .severity = .@"error",
+        .phase = .execution,
+        .code = .stale_filesystem_identifier,
+        .configuration_path = "/storage/preserve/identity_rewrite",
+        .message = message,
+        .cause = .{ .error_name = @errorName(error.StaleFilesystemIdentifier) },
         .remediation = remediation,
     });
 }
@@ -7429,7 +7500,7 @@ test "plan JSON renders identifiers as stable strings" {
     defer output.deinit();
     try writePlanJson(&resolved.plan.?, &output.writer);
     const json = output.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 8") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"plan_hash\": \"") != null);
 }
 

@@ -227,6 +227,7 @@ pub const PreservedVmBoot = preserved_image_wire.VmBoot;
 pub const PreservedVmPolicy = preserved_image_wire.VmConfiguration;
 pub const PreservedSourceProfile = preserved_image_wire.SourceProfile;
 pub const PreservedSourceMount = preserved_image_wire.SourceMount;
+pub const PreservedIdentityRewrite = preserved_image_wire.IdentityRewrite;
 pub const PreservedSourceFilesystem = preserved_image_wire.SourceFilesystem;
 pub const PreservedSynthesizedFatMetadata = preserved_image_wire.SynthesizedFatMetadata;
 
@@ -260,6 +261,12 @@ pub const PreservedOptions = struct {
     /// sources before it had at its target, exactly as a real mount hides the
     /// directory underneath.
     source_mounts: []const PreservedSourceMount = &.{},
+    /// Whether the `rebuild` backend reconciles the imported `/etc/fstab` and
+    /// bootloader configuration with the identifiers it retired, and whether
+    /// a surviving stale one fails the build. Merging a `/boot` filesystem or
+    /// an ESP retires the identifiers that named them, and an image whose
+    /// configuration still names them does not boot.
+    identity_rewrite: PreservedIdentityRewrite = .rewrite_and_verify,
     verbose: bool = false,
 };
 
@@ -543,6 +550,7 @@ fn materializePreservedConfiguration(
         },
         .source_profile = options.source_profile,
         .source_mounts = options.source_mounts,
+        .identity_rewrite = options.identity_rewrite,
         .operations = operations,
         .customization = .{
             .os = .{

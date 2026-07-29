@@ -24,6 +24,17 @@ pub const SourceProfile = enum {
     general,
 };
 
+/// What the rebuild is allowed to do about the identifiers it retires.
+/// `rewrite_and_verify` is the default because the failure the verification
+/// pass prevents -- an image whose `/etc/fstab` or bootloader configuration
+/// still names a filesystem that no longer exists -- is invisible until the
+/// image is booted.
+pub const IdentityRewrite = enum {
+    rewrite_and_verify,
+    rewrite_only,
+    off,
+};
+
 /// Which reader a merged source is handed to. `detect` probes the on-disk
 /// magic and refuses anything it cannot name, so it never guesses.
 pub const SourceFilesystem = enum {
@@ -203,6 +214,12 @@ pub const Configuration = struct {
     /// tree, because only that tree knows what the targets have to exist in;
     /// restating them here would let the two drift apart.
     source_mounts: []const SourceMount = &.{},
+    /// Whether the rebuilt tree's `/etc/fstab` and bootloader configuration
+    /// are reconciled with the identifiers the rebuild retired, and whether a
+    /// surviving stale one fails the build. `rebuild`-only for the same
+    /// reason as the two fields above: every other backend keeps the source's
+    /// filesystems exactly as they are, so nothing is ever retired.
+    identity_rewrite: IdentityRewrite = .rewrite_and_verify,
 };
 
 pub const ValidationError = error{
@@ -218,6 +235,7 @@ pub const ValidationError = error{
     UnexpectedCrossArchitectureRunner,
     UnexpectedSourceProfile,
     UnexpectedSourceMounts,
+    UnexpectedIdentityRewrite,
     MissingMountTarget,
 };
 
@@ -250,6 +268,11 @@ pub fn validate(configuration: Configuration, source_count: usize) ValidationErr
     }
     if (configuration.backend != .rebuild and configuration.source_mounts.len != 0) {
         return error.UnexpectedSourceMounts;
+    }
+    if (configuration.backend != .rebuild and
+        configuration.identity_rewrite != .rewrite_and_verify)
+    {
+        return error.UnexpectedIdentityRewrite;
     }
     for (configuration.source_mounts) |mount| {
         try validatePartition(mount.partition);
@@ -508,6 +531,31 @@ test "merged sources only travel with the backend that imports a filesystem" {
         .root_partition = .{ .mbr_index = 3 },
         .source_mounts = &.{.{ .partition = .{ .mbr_index = 2 }, .target = "" }},
     }, 0));
+}
+
+test "the identity rewrite policy only travels with the backend that can retire an identifier" {
+    try validate(.{
+        .backend = .rebuild,
+        .root_partition = .{ .mbr_index = 3 },
+        .identity_rewrite = .rewrite_only,
+    }, 0);
+    try validate(.{
+        .backend = .rebuild,
+        .root_partition = .{ .mbr_index = 3 },
+        .identity_rewrite = .off,
+    }, 0);
+    // Nothing but a rebuild reads the source's tree, so nothing but a rebuild
+    // can retire an identifier; accepting the setting elsewhere would let an
+    // operator believe they had turned a safety net off that was never on.
+    try std.testing.expectError(error.UnexpectedIdentityRewrite, validate(.{
+        .backend = .native_edit,
+        .root_partition = .{ .mbr_index = 3 },
+        .identity_rewrite = .off,
+    }, 0));
+    try validate(.{
+        .backend = .native_edit,
+        .root_partition = .{ .mbr_index = 3 },
+    }, 0);
 }
 
 test "the vm backend and its configuration travel together" {

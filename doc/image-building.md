@@ -418,6 +418,135 @@ merged import too.
 `zvmi_ext4_v1` source. The output is then a function of several sources rather
 than of the one the report names, and the report says so.
 
+#### Reconciling fstab and the bootloader with the new identity
+
+Merging retires identifiers. A `/boot` filesystem folded into the root stops
+existing, so every `UUID=` and `PARTUUID=` that named it now names nothing;
+the same is true of an ESP merged in at `/boot/efi`. The imported guest still
+carries those identifiers in `/etc/fstab` and in its bootloader configuration,
+and an image where they have not been corrected does not boot -- it drops to
+an initramfs prompt with an unhelpful message. Correcting them out of band
+means mounting the result and running `grub-install` / `update-grub` in a
+chroot, which is exactly the privileged, host-dependent step this project
+exists to avoid.
+
+The `rebuild` backend therefore reconciles the tree with the identifiers the
+image actually has, after every other customization pass and before a single
+output byte is written. `identity_rewrite` selects what it may do:
+
+| Value | Behaviour |
+| --- | --- |
+| `rewrite_and_verify` (default) | rewrite, then refuse to publish an image that still names a retired identifier |
+| `rewrite_only` | rewrite and report what is still stale, for an operator who intends to finish the job in a chroot |
+| `off` | touch nothing; the caller owns the bootability of the result |
+
+The setting is `rebuild`-only. Every other backend keeps the source's
+filesystems exactly as they are, so nothing is ever retired, and offering the
+knob there would let an operator believe they had turned off a safety net that
+was never on. Stating it elsewhere is `UnexpectedIdentityRewrite`.
+
+It is spelled `identity_rewrite` on the `std.Build` helper, on
+`PreservedStorage`, and in the preserved-image configuration JSON:
+
+```json
+{ "backend": "rebuild", "identity_rewrite": "rewrite_only" }
+```
+
+##### Rewriting is surgical, never regenerative
+
+`/etc/fstab` is spliced in place. Only the identifier value of a matching
+entry is replaced, and only entries whose filesystem was merged away are
+removed; every other byte -- comments, blank lines, tabs, run-on spacing,
+CRLF line endings, an absent final newline -- survives verbatim. Emitting a
+fresh "minimal correct" fstab is not on offer: a real system's fstab carries
+bind mounts, network shares, `tmpfs` entries and the comments that explain
+them, and discarding them would be a silent, unrequested edit.
+
+| fstab entry | What happens |
+| --- | --- |
+| names a filesystem that was merged away, by `UUID=`/`PARTUUID=`/`LABEL=`/`PARTLABEL=` | removed, whole line |
+| whose mount point is exactly a merge target | removed, whole line |
+| names a filesystem whose identifier changed | that field's value replaced in place |
+| names a retired identifier with no replacement | left alone and counted in `fstab_entries_unresolved` |
+| anything else | untouched, byte for byte |
+
+A merged-away entry is removed rather than rewritten because its content is a
+plain directory inside another filesystem now, and mounting anything over that
+directory would hide the very content the merge just imported. Mount points
+are matched exactly, never by prefix, and `mount(8)`'s octal escapes (`\040`
+and friends) are decoded before the comparison, so `/boot/efi` survives `/boot`
+being merged when the ESP is still a real partition of its own.
+
+The bootloader configuration is likewise rewritten in place rather than
+regenerated. `root=UUID=`, `root=PARTUUID=`, `search --fs-uuid`,
+`search.fs_uuid`, `resume=`, `rd.luks.uuid=` and any other occurrence of a
+retired UUID as a whole token is replaced; the menu structure, the indentation
+and every unrelated line stay exactly as the distro shipped them. Reproducing
+`grub-mkconfig` output faithfully is not a fight worth picking, and a
+regenerated `grub.cfg` loses distro-specific structure that nothing here can
+put back. Labels are never rewritten in a configuration file, because an
+arbitrary word like `boot` or `EFI` appearing as a token would corrupt shell
+syntax rather than correct it.
+
+Files rewritten: `/etc/fstab`, `/etc/default/grub`, `/etc/default/grub.d/*`,
+`/etc/kernel/cmdline`, and `*.cfg` / `*.conf` under `/boot/grub/`,
+`/boot/grub2/`, `/boot/loader/` or a merged ESP.
+
+##### The verification pass
+
+Rewriting what is known about is not the same as knowing nothing was missed,
+and a miss here is invisible until the image is booted. After the rewrite, the
+tree is scanned again for any surviving occurrence of a retired identifier:
+
+| Scanned | Why |
+| --- | --- |
+| `/etc/fstab` | the mounts |
+| `/etc/crypttab` | `UUID=` sources for encrypted volumes |
+| `/etc/default/grub`, `/etc/default/grub.d/`, `/etc/kernel/cmdline` | the kernel command line |
+| `/boot/grub/`, `/boot/grub2/`, `/boot/loader/` | the bootloader, including binaries such as `core.img` and `grubenv` |
+| every merged ESP, in full | vendor `grub.cfg`, BLS entries, shim's own configuration |
+
+Matching is ASCII case-insensitive, because `blkid` prints lowercase and
+plenty of installers write uppercase and they name the same filesystem. A full
+36-character UUID is flagged even when it sits inside a longer token -- a
+stale value glued to more hex is still a stale value -- while a shorter
+identifier such as a FAT volume serial (`5A56-4D49`) is required to stand as a
+whole token, so that a coincidental hex run is not reported as a boot failure.
+
+The rest of `/boot` is deliberately not scanned. Kernels and initramfs images
+are megabytes of compressed payload in which an identifier is neither readable
+nor rewritable, and scanning them would trade a real check for a slow one.
+
+Under `rewrite_and_verify` the first surviving reference fails the build with
+`StaleFilesystemIdentifier`, and the diagnostic names the file, the kind of
+identifier, its value and the byte offset:
+
+```
+/boot/grub/i386-pc/core.img still names the retired UUID
+66666666-7777-8888-9999-aaaaaaaaaaaa at offset 6
+```
+
+`inspectRebuild` runs the same rewrite and the same verification pass over a
+throwaway tree, so a source that cannot be reconciled is refused in preflight,
+without creating a file.
+
+##### The escape hatch
+
+`core.img`, a `grubenv`, and a signed EFI binary all carry identifiers no text
+rewriter can correct without invalidating them. For those, the answer is the
+`unsafe_chroot` backend, which runs the distro's own bootloader tooling inside
+the image and is opt-in for exactly that reason. Setting
+`identity_rewrite = "rewrite_only"` gets the image built and the surviving
+references reported, so that pass can be scheduled deliberately rather than
+discovered at boot.
+
+Identifier rewriting corrects identifiers. It does not rewrite *paths*: a
+`grub.cfg` that loaded `/vmlinuz` from a separate `/boot` filesystem still says
+`/vmlinuz` after that filesystem became `/boot` inside the root. Where the
+merged layout changes what a path means, the bootloader configuration has to be
+regenerated by the distro's tooling, which is again what the escape hatch is
+for.
+
 | Image kernel provides | Result |
 | --- | --- |
 | `ext4` + `virtio_blk` built in | disks attached over virtio-blk (`/dev/vd*`) |
