@@ -37,6 +37,7 @@ const LoadedConfiguration = struct {
     backend: zvmi.customize.ExecutionBackend,
     root_partition: zvmi.customize.PartitionSelector,
     source_profile: zvmi.customize.SourceProfilePolicy,
+    source_mounts: []const zvmi.customize.SourceMount,
     operations: []const zvmi.customize.ExistingPathOperation,
     os: zvmi.customize.OsCustomization,
     generalization: zvmi.customize.GeneralizationPolicy,
@@ -162,6 +163,7 @@ pub fn main(init: std.process.Init) !void {
         .storage = .{ .preserve = .{
             .root_partition = configuration.root_partition,
             .source_profile = configuration.source_profile,
+            .source_mounts = configuration.source_mounts,
         } },
         .os = configuration.os,
         .existing_path_operations = configuration.operations,
@@ -494,6 +496,7 @@ fn loadV2Configuration(
             .mbr_index => |index| .{ .mbr_index = index },
         },
         .source_profile = .strict,
+        .source_mounts = &.{},
         .operations = try mapOperations(allocator, parsed.value.operations, source_paths),
         .os = customization.os,
         .generalization = customization.generalization,
@@ -538,6 +541,7 @@ fn loadV3Configuration(
             .strict => .strict,
             .general => .general,
         },
+        .source_mounts = try mapSourceMounts(allocator, parsed.value.source_mounts),
         .operations = try mapOperations(allocator, parsed.value.operations, source_paths),
         .os = customization.os,
         .generalization = customization.generalization,
@@ -552,6 +556,35 @@ fn loadV3Configuration(
         .runner = parsed.value.runner,
         .vm = mapVmPolicy(parsed.value.vm),
     };
+}
+
+fn mapSourceMounts(
+    allocator: std.mem.Allocator,
+    mounts: []const wire.SourceMount,
+) ![]const zvmi.customize.SourceMount {
+    const mapped = try allocator.alloc(zvmi.customize.SourceMount, mounts.len);
+    for (mounts, mapped) |mount, *slot| {
+        slot.* = .{
+            .source_path = mount.source_path,
+            .partition = switch (mount.partition) {
+                .gpt_index => |index| .{ .gpt_index = index },
+                .mbr_index => |index| .{ .mbr_index = index },
+            },
+            .target = mount.target,
+            .filesystem = switch (mount.filesystem) {
+                .detect => .detect,
+                .ext4 => .ext4,
+                .fat32 => .fat32,
+            },
+            .fat_metadata = .{
+                .directory_mode = mount.fat_metadata.directory_mode,
+                .file_mode = mount.fat_metadata.file_mode,
+                .uid = mount.fat_metadata.uid,
+                .gid = mount.fat_metadata.gid,
+            },
+        };
+    }
+    return mapped;
 }
 
 fn mapVmPolicy(configuration: ?wire.VmConfiguration) ?zvmi.customize.VmPolicy {
@@ -1423,4 +1456,82 @@ test "a zero limit is rejected instead of silently rejecting every source" {
         "--max-nodes",         "0",
     };
     try std.testing.expectError(error.ZeroLimit, parseArgs(std.testing.allocator, &args));
+}
+
+test "merged source mounts survive the loader with their synthesized metadata" {
+    const allocator = std.testing.allocator;
+    const configuration =
+        \\{
+        \\  "api_version": 3,
+        \\  "backend": "rebuild",
+        \\  "root_partition": { "mbr_index": 3 },
+        \\  "source_profile": "general",
+        \\  "source_mounts": [
+        \\    { "partition": { "mbr_index": 2 }, "target": "/boot" },
+        \\    {
+        \\      "source_path": "/dev/sdb",
+        \\      "partition": { "mbr_index": 1 },
+        \\      "target": "/boot/efi",
+        \\      "filesystem": "fat32",
+        \\      "fat_metadata": { "directory_mode": 448, "file_mode": 384, "uid": 42, "gid": 43 }
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const loaded = try loadV3Configuration(arena.allocator(), configuration, &.{});
+    try std.testing.expectEqual(@as(usize, 2), loaded.source_mounts.len);
+
+    // An unstated source path means the disk being rebuilt, which is the
+    // common case of several partitions of one disk.
+    try std.testing.expectEqualStrings("", loaded.source_mounts[0].source_path);
+    try std.testing.expectEqualStrings("/boot", loaded.source_mounts[0].target);
+    try std.testing.expectEqual(
+        @as(u8, 2),
+        loaded.source_mounts[0].partition.mbr_index,
+    );
+    try std.testing.expectEqual(
+        zvmi.customize.SourceFilesystem.detect,
+        loaded.source_mounts[0].filesystem,
+    );
+    // Unstated FAT metadata is the documented default, not an accident.
+    try std.testing.expectEqual(
+        @as(u16, 0o755),
+        loaded.source_mounts[0].fat_metadata.directory_mode,
+    );
+    try std.testing.expectEqual(
+        @as(u16, 0o644),
+        loaded.source_mounts[0].fat_metadata.file_mode,
+    );
+    try std.testing.expectEqual(@as(u32, 0), loaded.source_mounts[0].fat_metadata.uid);
+    try std.testing.expectEqual(@as(u32, 0), loaded.source_mounts[0].fat_metadata.gid);
+
+    try std.testing.expectEqualStrings("/dev/sdb", loaded.source_mounts[1].source_path);
+    try std.testing.expectEqualStrings("/boot/efi", loaded.source_mounts[1].target);
+    try std.testing.expectEqual(
+        zvmi.customize.SourceFilesystem.fat32,
+        loaded.source_mounts[1].filesystem,
+    );
+    try std.testing.expectEqual(
+        @as(u16, 0o700),
+        loaded.source_mounts[1].fat_metadata.directory_mode,
+    );
+    try std.testing.expectEqual(
+        @as(u16, 0o600),
+        loaded.source_mounts[1].fat_metadata.file_mode,
+    );
+    try std.testing.expectEqual(@as(u32, 42), loaded.source_mounts[1].fat_metadata.uid);
+    try std.testing.expectEqual(@as(u32, 43), loaded.source_mounts[1].fat_metadata.gid);
+}
+
+test "the wire's synthesized FAT metadata defaults are the library's" {
+    // Two spellings of the same policy would eventually disagree, and the
+    // disagreement would show up as an image whose ownership silently changed.
+    const wire_defaults = wire.SynthesizedFatMetadata{};
+    const library_defaults = zvmi.customize.SynthesizedFatMetadata{};
+    try std.testing.expectEqual(library_defaults.directory_mode, wire_defaults.directory_mode);
+    try std.testing.expectEqual(library_defaults.file_mode, wire_defaults.file_mode);
+    try std.testing.expectEqual(library_defaults.uid, wire_defaults.uid);
+    try std.testing.expectEqual(library_defaults.gid, wire_defaults.gid);
 }

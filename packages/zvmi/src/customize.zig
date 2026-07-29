@@ -28,8 +28,8 @@ const verity = @import("verity.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 6;
-pub const provenance_schema_version: u32 = 9;
+pub const plan_schema_version: u32 = 7;
+pub const provenance_schema_version: u32 = 10;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -164,6 +164,9 @@ pub const FreshStorage = struct {
 pub const PartitionSelector = preserved_image.PartitionSelector;
 
 pub const SourceProfilePolicy = preserved_image.SourceProfilePolicy;
+pub const SourceMount = preserved_image.SourceMount;
+pub const SourceFilesystem = preserved_image.SourceFilesystem;
+pub const SynthesizedFatMetadata = fat32.SynthesizedMetadata;
 
 pub const PreservedStorage = struct {
     root_partition: PartitionSelector,
@@ -171,6 +174,9 @@ pub const PreservedStorage = struct {
     /// that path; the others preserve the source's bytes rather than reading
     /// its tree at all.
     source_profile: SourceProfilePolicy = .strict,
+    /// Extra filesystems merged into the rebuilt root, each at its own mount
+    /// point, in order. Also `rebuild`-only, for the same reason.
+    source_mounts: []const SourceMount = &.{},
 };
 pub const PreserveStorage = PreservedStorage;
 pub const RootPartitionSelector = PartitionSelector;
@@ -1871,6 +1877,7 @@ pub const ResolvedFreshStorage = struct {
 pub const ResolvedPreservedStorage = struct {
     root_partition: PartitionSelector,
     source_profile: SourceProfilePolicy = .strict,
+    source_mounts: []const SourceMount = &.{},
 };
 
 pub const ResolvedStorage = union(enum) {
@@ -2234,6 +2241,7 @@ pub fn resolve(
         .preserve => |storage| .{ .preserve = .{
             .root_partition = storage.root_partition,
             .source_profile = storage.source_profile,
+            .source_mounts = try dupeSourceMounts(plan_allocator, storage.source_mounts),
         } },
     };
     const resolved_os = try dupeOsCustomization(plan_allocator, request.os, context.base_path);
@@ -2445,6 +2453,21 @@ fn dupeOsCustomization(
         .services = services,
         .kernel_modules = modules,
     };
+}
+
+/// Mount specifications hold borrowed paths, so a resolved plan -- which
+/// outlives the request that produced it -- has to own copies of them.
+fn dupeSourceMounts(
+    allocator: Allocator,
+    mounts: []const SourceMount,
+) Allocator.Error![]const SourceMount {
+    const copies = try allocator.alloc(SourceMount, mounts.len);
+    for (mounts, copies) |mount, *copy| {
+        copy.* = mount;
+        copy.source_path = try allocator.dupe(u8, mount.source_path);
+        copy.target = try allocator.dupe(u8, mount.target);
+    }
+    return copies;
 }
 
 fn dupeExistingPathOperations(
@@ -3229,6 +3252,20 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
         .preserve => |storage| {
             hashPartitionSelector(&hash, storage.root_partition);
             hash.update(@tagName(storage.source_profile));
+            // Order matters: a later mount shadows an earlier one, so two
+            // plans that list the same mounts in a different order describe
+            // different trees and must not share a hash.
+            hashInt(&hash, storage.source_mounts.len);
+            for (storage.source_mounts) |mount| {
+                hashString(&hash, mount.source_path);
+                hashPartitionSelector(&hash, mount.partition);
+                hashString(&hash, mount.target);
+                hash.update(@tagName(mount.filesystem));
+                hashInt(&hash, mount.fat_metadata.directory_mode);
+                hashInt(&hash, mount.fat_metadata.file_mode);
+                hashInt(&hash, mount.fat_metadata.uid);
+                hashInt(&hash, mount.fat_metadata.gid);
+            }
         },
     }
     hashOsCustomization(&hash, plan.os);
@@ -4039,6 +4076,7 @@ fn rebuildAvailable(io: Io, plan: *const ResolvedPlan) CapabilityState {
         .output_format = output_format,
         .root_partition = storage.root_partition,
         .source_profile = storage.source_profile,
+        .source_mounts = storage.source_mounts,
         .existing_operations = plan.data.existing_path_operations,
         .customization = plan.data.os,
         .generalization = plan.data.generalization,
@@ -4324,6 +4362,11 @@ pub const PreservedRebuildRecord = struct {
     source_root_tree_digest: Digest,
     final_root_tree_digest: Digest,
     imported_node_count: usize,
+    /// Filesystems merged into the root at a mount point, and how many nodes
+    /// those mount points hid. Recorded because the output tree cannot be
+    /// explained from the root source alone once either is non-zero.
+    merged_source_count: usize,
+    shadowed_node_count: usize,
     final_node_count: usize,
     existing_operation_count: usize,
     os_customization_count: usize,
@@ -4631,6 +4674,8 @@ fn buildResult(
                 .source_root_tree_digest = .{ .bytes = report.source_manifest_sha256 },
                 .final_root_tree_digest = .{ .bytes = report.final_manifest_sha256 },
                 .imported_node_count = report.imported_node_count,
+                .merged_source_count = report.merged_source_count,
+                .shadowed_node_count = report.shadowed_node_count,
                 .final_node_count = report.final_node_count,
                 .existing_operation_count = report.existing_operation_count,
                 .os_customization_count = report.os_customization_count,
@@ -4901,6 +4946,7 @@ pub fn execute(
                 .output_compression = plan.data.output.format.compression(),
                 .root_partition = plan.data.storage.preserve.root_partition,
                 .source_profile = plan.data.storage.preserve.source_profile,
+                .source_mounts = plan.data.storage.preserve.source_mounts,
                 .existing_operations = plan.data.existing_path_operations,
                 .customization = plan.data.os,
                 .generalization = plan.data.generalization,
@@ -7383,7 +7429,7 @@ test "plan JSON renders identifiers as stable strings" {
     defer output.deinit();
     try writePlanJson(&resolved.plan.?, &output.writer);
     const json = output.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 7") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"plan_hash\": \"") != null);
 }
 

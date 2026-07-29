@@ -24,6 +24,35 @@ pub const SourceProfile = enum {
     general,
 };
 
+/// Which reader a merged source is handed to. `detect` probes the on-disk
+/// magic and refuses anything it cannot name, so it never guesses.
+pub const SourceFilesystem = enum {
+    detect,
+    ext4,
+    fat32,
+};
+
+/// POSIX metadata invented for entries read from a FAT source, which stores
+/// none of its own. The defaults are the documented ones and are spelled out
+/// here so a configuration that says nothing still says what it got.
+pub const SynthesizedFatMetadata = struct {
+    directory_mode: u16 = 0o755,
+    file_mode: u16 = 0o644,
+    uid: u32 = 0,
+    gid: u32 = 0,
+};
+
+/// One extra filesystem merged into the rebuilt root. `source_path` is empty
+/// for the disk being rebuilt, which is the common case of several partitions
+/// of one disk.
+pub const SourceMount = struct {
+    source_path: []const u8 = "",
+    partition: PartitionSelector,
+    target: []const u8,
+    filesystem: SourceFilesystem = .detect,
+    fat_metadata: SynthesizedFatMetadata = .{},
+};
+
 pub const OverwriteFile = struct {
     path: []const u8,
     source_index: usize,
@@ -167,6 +196,13 @@ pub const Configuration = struct {
     /// meaningful there; `validate` rejects it elsewhere rather than letting
     /// it read as an accepted setting that silently does nothing.
     source_profile: SourceProfile = .strict,
+    /// Extra filesystems merged into the rebuilt root, in order, each at its
+    /// own mount point. Also `rebuild`-only. The full mount-target rules --
+    /// absolute, normalized, non-overlapping, reached without traversing a
+    /// symlink -- are enforced by the rebuild itself against the assembled
+    /// tree, because only that tree knows what the targets have to exist in;
+    /// restating them here would let the two drift apart.
+    source_mounts: []const SourceMount = &.{},
 };
 
 pub const ValidationError = error{
@@ -181,6 +217,8 @@ pub const ValidationError = error{
     MissingCrossArchitectureRunner,
     UnexpectedCrossArchitectureRunner,
     UnexpectedSourceProfile,
+    UnexpectedSourceMounts,
+    MissingMountTarget,
 };
 
 pub fn validateV2(configuration: ConfigurationV2, source_count: usize) ValidationError!void {
@@ -209,6 +247,13 @@ pub fn validate(configuration: Configuration, source_count: usize) ValidationErr
     }
     if (configuration.backend != .rebuild and configuration.source_profile != .strict) {
         return error.UnexpectedSourceProfile;
+    }
+    if (configuration.backend != .rebuild and configuration.source_mounts.len != 0) {
+        return error.UnexpectedSourceMounts;
+    }
+    for (configuration.source_mounts) |mount| {
+        try validatePartition(mount.partition);
+        if (mount.target.len == 0) return error.MissingMountTarget;
     }
     switch (configuration.guest_execution) {
         .same_architecture => if (configuration.runner != null) {
@@ -437,6 +482,32 @@ test "a source profile only travels with the backend that imports a filesystem" 
         .backend = .native_edit,
         .root_partition = .{ .gpt_index = 1 },
     }, 0);
+}
+
+test "merged sources only travel with the backend that imports a filesystem" {
+    const boot = SourceMount{ .partition = .{ .mbr_index = 2 }, .target = "/boot" };
+    try validate(.{
+        .backend = .rebuild,
+        .root_partition = .{ .mbr_index = 3 },
+        .source_mounts = &.{boot},
+    }, 0);
+    try std.testing.expectError(error.UnexpectedSourceMounts, validate(.{
+        .backend = .native_edit,
+        .root_partition = .{ .mbr_index = 3 },
+        .source_mounts = &.{boot},
+    }, 0));
+    // A mount's partition selector is as one-based as the root's, and a mount
+    // with nowhere to land is not a mount.
+    try std.testing.expectError(error.InvalidPartitionSelector, validate(.{
+        .backend = .rebuild,
+        .root_partition = .{ .mbr_index = 3 },
+        .source_mounts = &.{.{ .partition = .{ .mbr_index = 0 }, .target = "/boot" }},
+    }, 0));
+    try std.testing.expectError(error.MissingMountTarget, validate(.{
+        .backend = .rebuild,
+        .root_partition = .{ .mbr_index = 3 },
+        .source_mounts = &.{.{ .partition = .{ .mbr_index = 2 }, .target = "" }},
+    }, 0));
 }
 
 test "the vm backend and its configuration travel together" {

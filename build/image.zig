@@ -226,6 +226,9 @@ pub const PreservedVmFirmware = preserved_image_wire.VmFirmware;
 pub const PreservedVmBoot = preserved_image_wire.VmBoot;
 pub const PreservedVmPolicy = preserved_image_wire.VmConfiguration;
 pub const PreservedSourceProfile = preserved_image_wire.SourceProfile;
+pub const PreservedSourceMount = preserved_image_wire.SourceMount;
+pub const PreservedSourceFilesystem = preserved_image_wire.SourceFilesystem;
+pub const PreservedSynthesizedFatMetadata = preserved_image_wire.SynthesizedFatMetadata;
 
 pub const PreservedOptions = struct {
     name: []const u8,
@@ -252,6 +255,11 @@ pub const PreservedOptions = struct {
     /// the byte-for-byte reproducibility claim in exchange for being able to
     /// import a filesystem a distro installer produced.
     source_profile: PreservedSourceProfile = .strict,
+    /// Extra filesystems the `rebuild` backend merges into the root, each at
+    /// its own mount point, in order. A later mount replaces whatever the
+    /// sources before it had at its target, exactly as a real mount hides the
+    /// directory underneath.
+    source_mounts: []const PreservedSourceMount = &.{},
     verbose: bool = false,
 };
 
@@ -534,6 +542,7 @@ fn materializePreservedConfiguration(
             .mbr_index => |index| .{ .mbr_index = index },
         },
         .source_profile = options.source_profile,
+        .source_mounts = options.source_mounts,
         .operations = operations,
         .customization = .{
             .os = .{
