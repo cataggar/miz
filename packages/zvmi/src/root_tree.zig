@@ -1,20 +1,15 @@
 const std = @import("std");
 const ext4 = @import("ext4.zig");
 const fat32 = @import("fat32.zig");
+const limits_mod = @import("limits.zig");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-pub const Limits = struct {
-    max_nodes: usize = 1_000_000,
-    max_path_bytes: usize = 4096,
-    max_component_bytes: usize = 255,
-    max_file_bytes: u64 = 16 * 1024 * 1024 * 1024,
-    max_total_bytes: u64 = 64 * 1024 * 1024 * 1024,
-    max_spool_bytes: u64 = 128 * 1024 * 1024 * 1024,
-    max_xattrs_per_node: usize = 256,
-    max_xattr_bytes_per_node: usize = 1024 * 1024,
-};
+/// The tree limits and their conservative defaults live in `limits.zig`
+/// alongside the flag that raises each one and the diagnostic that reports a
+/// breach, so a limit cannot exist without a documented way out of it.
+pub const Limits = limits_mod.Limits;
 
 pub const Kind = enum {
     directory,
@@ -155,6 +150,10 @@ pub const RootTree = struct {
     spool_len: u64 = 0,
     nodes: std.array_list.Managed(Node),
     limits: Limits,
+    /// Optional sink for the peak measurements and the first limit breach.
+    /// Assigned after `init` because it is the caller's, not the tree's, and
+    /// must outlive the tree. Nothing is measured before the first node.
+    diagnostic: ?*limits_mod.Diagnostic = null,
     root_metadata: RootMetadata = .{},
     iteration_index: usize = 0,
     sorted: bool = true,
@@ -225,8 +224,15 @@ pub const RootTree = struct {
         self.root_metadata = metadata;
     }
 
+    /// The peaks and breach observed so far, for callers that did not attach
+    /// a diagnostic of their own.
+    pub fn limitDiagnostic(self: *const RootTree) ?limits_mod.Diagnostic {
+        const sink = self.diagnostic orelse return null;
+        return sink.*;
+    }
+
     pub fn setMetadata(self: *RootTree, path: []const u8, metadata: Metadata) !void {
-        try validatePath(path, self.limits);
+        try validatePath(path, self.limits, self.diagnostic);
         const index = self.findIndex(path) orelse return error.MissingNode;
         const owned_xattrs = try self.dupeXattrs(metadata.xattrs);
         freeOwnedXattrs(self.allocator, self.nodes.items[index].owned_xattrs);
@@ -310,8 +316,8 @@ pub const RootTree = struct {
         reader: ext4.FileTreeView.ContentReader,
         metadata: Metadata,
     ) !void {
-        try validatePath(path, self.limits);
-        if (size > self.limits.max_file_bytes) return error.FileLimitExceeded;
+        try validatePath(path, self.limits, self.diagnostic);
+        try self.checkFileBytes(size);
         const old_spool_len = self.spool_len;
         const content = self.spoolContent(size, reader) catch |err| {
             try self.rollbackSpool(old_spool_len);
@@ -329,8 +335,8 @@ pub const RootTree = struct {
         target: []const u8,
         metadata: Metadata,
     ) !void {
-        try validatePath(path, self.limits);
-        if (target.len > self.limits.max_file_bytes) return error.FileLimitExceeded;
+        try validatePath(path, self.limits, self.diagnostic);
+        try self.checkFileBytes(target.len);
         const old_spool_len = self.spool_len;
         var reader = BytesReader{ .bytes = target };
         const content = self.spoolContent(target.len, .{
@@ -352,7 +358,7 @@ pub const RootTree = struct {
         target: []const u8,
         metadata: Metadata,
     ) !void {
-        try validatePath(target, self.limits);
+        try validatePath(target, self.limits, self.diagnostic);
         const target_index = self.findIndex(target) orelse return error.MissingHardlinkTarget;
         if (self.nodes.items[target_index].kind != .file) return error.UnsupportedHardlinkTarget;
         if (pathEqualsOrDescendant(path, target) or pathEqualsOrDescendant(target, path)) {
@@ -382,7 +388,7 @@ pub const RootTree = struct {
     }
 
     pub fn remove(self: *RootTree, path: []const u8) !bool {
-        try validatePath(path, self.limits);
+        try validatePath(path, self.limits, self.diagnostic);
         const stable_path = try self.allocator.dupe(u8, path);
         defer self.allocator.free(stable_path);
         if (self.removalBreaksHardlinks(stable_path, true)) return error.HardlinkTargetInUse;
@@ -453,8 +459,8 @@ pub const RootTree = struct {
                 .symlink => {
                     const content = entry.content orelse return error.MissingContent;
                     if (mode == .owned) {
-                        if (entry.size > self.limits.max_file_bytes) return error.FileLimitExceeded;
-                        try validatePath(entry.path, self.limits);
+                        try self.checkFileBytes(entry.size);
+                        try validatePath(entry.path, self.limits, self.diagnostic);
                         const old_spool_len = self.spool_len;
                         const owned = self.spoolContent(entry.size, content) catch |err| {
                             try self.rollbackSpool(old_spool_len);
@@ -593,7 +599,7 @@ pub const RootTree = struct {
         metadata: Metadata,
         payload: Payload,
     ) anyerror!void {
-        try validatePath(path, self.limits);
+        try validatePath(path, self.limits, self.diagnostic);
         var payload_owned = true;
         errdefer if (payload_owned) self.freePayload(payload);
         const owned_path = try self.allocator.dupe(u8, path);
@@ -625,8 +631,24 @@ pub const RootTree = struct {
             return error.NodeLimitExceeded;
         const final_node_count = std.math.add(usize, remaining_nodes, additions) catch
             return error.NodeLimitExceeded;
-        if (final_node_count > self.limits.max_nodes) return error.NodeLimitExceeded;
-        if (final_bytes > self.limits.max_total_bytes) return error.TotalContentLimitExceeded;
+        limits_mod.observe(self.diagnostic, .nodes, final_node_count);
+        if (final_node_count > self.limits.max_nodes) {
+            return limits_mod.exceeded(
+                self.diagnostic,
+                .nodes,
+                final_node_count,
+                self.limits.max_nodes,
+            );
+        }
+        limits_mod.observe(self.diagnostic, .total_bytes, final_bytes);
+        if (final_bytes > self.limits.max_total_bytes) {
+            return limits_mod.exceeded(
+                self.diagnostic,
+                .total_bytes,
+                final_bytes,
+                self.limits.max_total_bytes,
+            );
+        }
         try self.nodes.ensureUnusedCapacity(parents.items.len + 1);
 
         for (parents.items) |*parent| {
@@ -696,6 +718,32 @@ pub const RootTree = struct {
         return parents;
     }
 
+    fn checkFileBytes(self: *RootTree, size: u64) limits_mod.Error!void {
+        limits_mod.observe(self.diagnostic, .file_bytes, size);
+        if (size > self.limits.max_file_bytes) {
+            return limits_mod.exceeded(
+                self.diagnostic,
+                .file_bytes,
+                size,
+                self.limits.max_file_bytes,
+            );
+        }
+    }
+
+    /// The spool holds a full copy of every imported byte, so this is also
+    /// the scratch space the import needs on the workspace filesystem.
+    fn checkSpoolBytes(self: *RootTree, end: u64) limits_mod.Error!void {
+        limits_mod.observe(self.diagnostic, .spool_bytes, end);
+        if (end > self.limits.max_spool_bytes) {
+            return limits_mod.exceeded(
+                self.diagnostic,
+                .spool_bytes,
+                end,
+                self.limits.max_spool_bytes,
+            );
+        }
+    }
+
     fn spoolContent(
         self: *RootTree,
         size: u64,
@@ -703,7 +751,7 @@ pub const RootTree = struct {
     ) !Content {
         const start = self.spool_len;
         const end = std.math.add(u64, start, size) catch return error.SpoolLimitExceeded;
-        if (end > self.limits.max_spool_bytes) return error.SpoolLimitExceeded;
+        try self.checkSpoolBytes(end);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         const memory = if (self.storage == .memory) memory: {
             const length = std.math.cast(usize, size) orelse return error.SpoolLimitExceeded;
@@ -751,12 +799,12 @@ pub const RootTree = struct {
         reader: ext4.FileTreeView.ContentReader,
         metadata: Metadata,
     ) !void {
-        if (size > self.limits.max_file_bytes) return error.FileLimitExceeded;
-        try validatePath(path, self.limits);
+        try self.checkFileBytes(size);
+        try validatePath(path, self.limits, self.diagnostic);
         const old_spool_len = self.spool_len;
         const end = std.math.add(u64, old_spool_len, size) catch
             return error.SpoolLimitExceeded;
-        if (end > self.limits.max_spool_bytes) return error.SpoolLimitExceeded;
+        try self.checkSpoolBytes(end);
         const digest = try hashContentReader(reader, size);
         self.spool_len = end;
         self.putNode(path, kind, metadata, .{ .content = .{
@@ -776,10 +824,10 @@ pub const RootTree = struct {
         path: []const u8,
         size: u64,
     ) !Content {
-        if (size > self.limits.max_file_bytes) return error.FileLimitExceeded;
+        try self.checkFileBytes(size);
         const end = std.math.add(u64, self.spool_len, size) catch
             return error.SpoolLimitExceeded;
-        if (end > self.limits.max_spool_bytes) return error.SpoolLimitExceeded;
+        try self.checkSpoolBytes(end);
         var file_reader = FileReader{ .io = self.io, .file = file };
         const digest = try hashContentReader(.{
             .ctx = &file_reader,
@@ -796,13 +844,29 @@ pub const RootTree = struct {
     }
 
     fn dupeXattrs(self: *RootTree, source: []const ext4.Xattr) ![]ext4.OwnedXattr {
-        if (source.len > self.limits.max_xattrs_per_node) return error.XattrLimitExceeded;
+        limits_mod.observe(self.diagnostic, .xattrs_per_node, source.len);
+        if (source.len > self.limits.max_xattrs_per_node) {
+            return limits_mod.exceeded(
+                self.diagnostic,
+                .xattrs_per_node,
+                source.len,
+                self.limits.max_xattrs_per_node,
+            );
+        }
         var total: usize = 0;
         for (source) |xattr| {
             total = std.math.add(usize, total, xattr.name.len + xattr.value.len) catch
-                return error.XattrLimitExceeded;
+                return error.XattrByteLimitExceeded;
         }
-        if (total > self.limits.max_xattr_bytes_per_node) return error.XattrLimitExceeded;
+        limits_mod.observe(self.diagnostic, .xattr_bytes_per_node, total);
+        if (total > self.limits.max_xattr_bytes_per_node) {
+            return limits_mod.exceeded(
+                self.diagnostic,
+                .xattr_bytes_per_node,
+                total,
+                self.limits.max_xattr_bytes_per_node,
+            );
+        }
 
         const out = try self.allocator.alloc(ext4.OwnedXattr, source.len);
         var initialized: usize = 0;
@@ -1037,17 +1101,36 @@ fn hashContentReader(
     return digest;
 }
 
-fn validatePath(path: []const u8, limits: Limits) !void {
-    if (path.len == 0 or path.len > limits.max_path_bytes or path[0] == '/') return error.InvalidPath;
+/// A malformed path and an over-long path are different failures: the first
+/// can never be imported, the second only needs a larger limit, so they are
+/// reported as distinct errors.
+fn validatePath(
+    path: []const u8,
+    limits: Limits,
+    diagnostic: ?*limits_mod.Diagnostic,
+) !void {
+    if (path.len == 0 or path[0] == '/') return error.InvalidPath;
+    limits_mod.observe(diagnostic, .path_bytes, path.len);
+    if (path.len > limits.max_path_bytes) {
+        return limits_mod.exceeded(diagnostic, .path_bytes, path.len, limits.max_path_bytes);
+    }
     var iterator = std.mem.splitScalar(u8, path, '/');
     while (iterator.next()) |component| {
         if (component.len == 0 or
-            component.len > limits.max_component_bytes or
             std.mem.eql(u8, component, ".") or
             std.mem.eql(u8, component, "..") or
             std.mem.indexOfScalar(u8, component, 0) != null)
         {
             return error.InvalidPath;
+        }
+        limits_mod.observe(diagnostic, .component_bytes, component.len);
+        if (component.len > limits.max_component_bytes) {
+            return limits_mod.exceeded(
+                diagnostic,
+                .component_bytes,
+                component.len,
+                limits.max_component_bytes,
+            );
         }
     }
 }
@@ -1490,4 +1573,137 @@ test "FAT32 preflight rejects semantic node loss and folded path collisions" {
         error.FatPathCollision,
         tree.preflightFat32(.{ .metadata_policy = .lossy_posix_metadata }),
     );
+}
+
+test "each limit reports the observed value and the flag that raises it" {
+    const io = std.testing.io;
+    const spool_path = "test-root-tree-limit-diagnostics.spool";
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    var diagnostic = limits_mod.Diagnostic{};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{
+        .max_nodes = 1,
+        .max_file_bytes = 4,
+    });
+    tree.diagnostic = &diagnostic;
+    defer tree.deinit();
+
+    try tree.putFileBytes("first", "ab", .{ .mode = 0o644 });
+    try std.testing.expectError(
+        error.NodeLimitExceeded,
+        tree.putFileBytes("second", "cd", .{ .mode = 0o644 }),
+    );
+
+    const breach = diagnostic.exceeded.?;
+    try std.testing.expectEqual(limits_mod.Limit.nodes, breach.limit);
+    try std.testing.expectEqual(@as(u64, 2), breach.observed);
+    try std.testing.expectEqual(@as(u64, 1), breach.configured);
+
+    var buffer: [limits_mod.Exceeded.max_message_bytes]u8 = undefined;
+    const message = try breach.describe(&buffer);
+    try std.testing.expect(std.mem.indexOf(u8, message, "NodeLimitExceeded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "--max-nodes") != null);
+}
+
+test "a limit records the peak it reached even when nothing was exceeded" {
+    const io = std.testing.io;
+    const spool_path = "test-root-tree-limit-peaks.spool";
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    var diagnostic = limits_mod.Diagnostic{};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    tree.diagnostic = &diagnostic;
+    defer tree.deinit();
+
+    try tree.putFileBytes("small", "ab", .{ .mode = 0o644 });
+    try tree.putFileBytes("large", "abcdefgh", .{
+        .mode = 0o644,
+        .xattrs = &.{.{ .name = "user.one", .value = "value" }},
+    });
+
+    const peaks = tree.limitDiagnostic().?.peaks;
+    try std.testing.expectEqual(@as(u64, 2), peaks.nodes);
+    try std.testing.expectEqual(@as(u64, 8), peaks.file_bytes);
+    try std.testing.expectEqual(@as(u64, 10), peaks.total_bytes);
+    try std.testing.expectEqual(@as(u64, 10), peaks.spool_bytes);
+    try std.testing.expectEqual(@as(u64, 1), peaks.xattrs_per_node);
+    try std.testing.expectEqual(@as(u64, 5), peaks.path_bytes);
+    try std.testing.expectEqual(@as(u64, 5), peaks.component_bytes);
+    try std.testing.expect(diagnostic.exceeded == null);
+}
+
+test "an over-long path is a raisable limit, not a malformed path" {
+    const io = std.testing.io;
+    const spool_path = "test-root-tree-path-limits.spool";
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    var diagnostic = limits_mod.Diagnostic{};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{
+        .max_path_bytes = 8,
+        .max_component_bytes = 3,
+    });
+    tree.diagnostic = &diagnostic;
+    defer tree.deinit();
+
+    try std.testing.expectError(
+        error.ComponentLimitExceeded,
+        tree.putDirectory("abcd", .{ .mode = 0o755 }),
+    );
+    try std.testing.expectEqual(limits_mod.Limit.component_bytes, diagnostic.exceeded.?.limit);
+    try std.testing.expectEqual(@as(u64, 4), diagnostic.exceeded.?.observed);
+
+    var long = limits_mod.Diagnostic{};
+    tree.diagnostic = &long;
+    try std.testing.expectError(
+        error.PathLimitExceeded,
+        tree.putDirectory("abc/abc/abc", .{ .mode = 0o755 }),
+    );
+    try std.testing.expectEqual(limits_mod.Limit.path_bytes, long.exceeded.?.limit);
+    try std.testing.expectEqual(@as(u64, 11), long.exceeded.?.observed);
+
+    // A path that is malformed rather than long stays malformed: no flag
+    // raises a limit that would admit it.
+    try std.testing.expectError(error.InvalidPath, tree.putDirectory("/abs", .{ .mode = 0o755 }));
+}
+
+test "xattr count and byte limits are distinguishable" {
+    const io = std.testing.io;
+    const spool_path = "test-root-tree-xattr-limits.spool";
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    var diagnostic = limits_mod.Diagnostic{};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{
+        .max_xattrs_per_node = 1,
+        .max_xattr_bytes_per_node = 32,
+    });
+    tree.diagnostic = &diagnostic;
+    defer tree.deinit();
+
+    try tree.putFileBytes("file", "x", .{
+        .mode = 0o644,
+        .xattrs = &.{.{ .name = "user.one", .value = "value" }},
+    });
+    try std.testing.expectError(error.XattrLimitExceeded, tree.putFileBytes("file", "x", .{
+        .mode = 0o644,
+        .xattrs = &.{
+            .{ .name = "user.one", .value = "value" },
+            .{ .name = "user.two", .value = "value" },
+        },
+    }));
+    try std.testing.expectEqual(limits_mod.Limit.xattrs_per_node, diagnostic.exceeded.?.limit);
+
+    const wide_spool_path = "test-root-tree-xattr-byte-limits.spool";
+    defer Io.Dir.cwd().deleteFile(io, wide_spool_path) catch {};
+    var bytes = limits_mod.Diagnostic{};
+    var wide = try RootTree.init(std.testing.allocator, io, wide_spool_path, .{
+        .max_xattr_bytes_per_node = 8,
+    });
+    wide.diagnostic = &bytes;
+    defer wide.deinit();
+    try std.testing.expectError(error.XattrByteLimitExceeded, wide.putFileBytes("file", "x", .{
+        .mode = 0o644,
+        .xattrs = &.{.{ .name = "user.one", .value = "a longer value" }},
+    }));
+    try std.testing.expectEqual(limits_mod.Limit.xattr_bytes_per_node, bytes.exceeded.?.limit);
+    try std.testing.expectEqual(@as(u64, 22), bytes.exceeded.?.observed);
 }

@@ -28,7 +28,12 @@
 //! ext4's separate `RESIZE_INODE` online-resize scaffolding.
 
 const std = @import("std");
+const limits_mod = @import("limits.zig");
 const Io = std.Io;
+
+/// The scan shares the importer's limit defaults so a source that scans is a
+/// source that imports.
+const limit_defaults = limits_mod.ImportLimits{};
 
 pub const default_block_size: u32 = 4096;
 pub const default_blocks_per_group: u32 = 32 * 1024;
@@ -1950,14 +1955,18 @@ pub const StrictScanOptions = struct {
     /// The selected partition must be exactly this long. Padding or trailers
     /// after the ext4 block range are rejected.
     expected_length: u64,
-    max_nodes: usize = 1_000_000,
-    max_path_bytes: usize = 4096,
-    max_component_bytes: usize = 255,
-    max_file_bytes: u64 = 16 * 1024 * 1024 * 1024,
-    max_total_bytes: u64 = 64 * 1024 * 1024 * 1024,
-    max_xattrs_per_node: usize = 256,
-    max_xattr_bytes_per_node: usize = 1024 * 1024,
-    max_scan_metadata_bytes: usize = 256 * 1024 * 1024,
+    max_nodes: usize = limit_defaults.max_nodes,
+    max_path_bytes: usize = limit_defaults.max_path_bytes,
+    max_component_bytes: usize = limit_defaults.max_component_bytes,
+    max_file_bytes: u64 = limit_defaults.max_file_bytes,
+    max_total_bytes: u64 = limit_defaults.max_total_bytes,
+    max_xattrs_per_node: usize = limit_defaults.max_xattrs_per_node,
+    max_xattr_bytes_per_node: usize = limit_defaults.max_xattr_bytes_per_node,
+    max_scan_metadata_bytes: usize = limit_defaults.max_scan_metadata_bytes,
+    /// Optional sink for the peak measurements and the first limit breach.
+    /// The scanner is torn down before `scanWriterCompatible` returns, so a
+    /// failure can only report through a sink the caller still owns.
+    diagnostic: ?*limits_mod.Diagnostic = null,
 };
 
 const StrictContent = struct {
@@ -1981,6 +1990,9 @@ pub const StrictTree = struct {
     allocator: std.mem.Allocator,
     entries: []StrictEntry,
     identity: StrictFilesystemIdentity,
+    /// Guest-visible file bytes. An importer spools a full copy of exactly
+    /// this many bytes, so it is also the scratch space an import needs.
+    content_bytes: u64,
     iteration_index: usize = 0,
     view: FileTreeView = undefined,
 
@@ -2061,6 +2073,7 @@ pub fn scanWriterCompatible(
         .allocator = allocator,
         .entries = entries,
         .identity = scanner.identity,
+        .content_bytes = scanner.total_content_bytes,
     };
 }
 
@@ -2114,8 +2127,14 @@ const StrictScanner = struct {
             bitmap_bytes,
             directory_count_bytes,
         ) catch return error.ScanMetadataLimitExceeded;
+        limits_mod.observe(options.diagnostic, .scan_metadata_bytes, scan_metadata_bytes);
         if (scan_metadata_bytes > options.max_scan_metadata_bytes) {
-            return error.ScanMetadataLimitExceeded;
+            return limits_mod.exceeded(
+                options.diagnostic,
+                .scan_metadata_bytes,
+                scan_metadata_bytes,
+                options.max_scan_metadata_bytes,
+            );
         }
         const visited = try allocator.alloc(u8, inode_bitmap_len);
         errdefer allocator.free(visited);
@@ -2367,7 +2386,15 @@ const StrictScanner = struct {
             return error.DirectoryReferencesFreeInode;
         }
         const visible_count = self.visited_inode_count - 1;
-        if (visible_count > self.options.max_nodes) return error.NodeLimitExceeded;
+        limits_mod.observe(self.options.diagnostic, .nodes, visible_count);
+        if (visible_count > self.options.max_nodes) {
+            return limits_mod.exceeded(
+                self.options.diagnostic,
+                .nodes,
+                visible_count,
+                self.options.max_nodes,
+            );
+        }
 
         const inode = try self.reader.readInode(self.io, inode_number);
         if (inode.kind != expected_kind) return error.DirectoryFileTypeMismatch;
@@ -2381,7 +2408,15 @@ const StrictScanner = struct {
         if (inode.deletion_time != 0 or inode.generation != 0) {
             return error.UnsupportedInodeMetadata;
         }
-        if (inode.size > self.options.max_file_bytes) return error.FileLimitExceeded;
+        limits_mod.observe(self.options.diagnostic, .file_bytes, inode.size);
+        if (inode.size > self.options.max_file_bytes) {
+            return limits_mod.exceeded(
+                self.options.diagnostic,
+                .file_bytes,
+                inode.size,
+                self.options.max_file_bytes,
+            );
+        }
         if (!is_root) try validateStrictPath(path, self.options);
 
         const fast_symlink = inode.kind == .symlink and inode.size < 60;
@@ -2434,8 +2469,14 @@ const StrictScanner = struct {
                 self.total_content_bytes,
                 if (inode.kind == .directory) 0 else inode.size,
             ) catch return error.TotalContentLimitExceeded;
+            limits_mod.observe(self.options.diagnostic, .total_bytes, self.total_content_bytes);
             if (self.total_content_bytes > self.options.max_total_bytes) {
-                return error.TotalContentLimitExceeded;
+                return limits_mod.exceeded(
+                    self.options.diagnostic,
+                    .total_bytes,
+                    self.total_content_bytes,
+                    self.options.max_total_bytes,
+                );
             }
             try self.appendEntry(path, inode, xattrs);
             xattrs_owned = false;
@@ -2637,7 +2678,15 @@ const StrictScanner = struct {
         );
         const xattrs = try self.reader.readInodeXattrsAlloc(self.io, self.allocator, inode);
         errdefer freeXattrs(self.allocator, xattrs);
-        if (xattrs.len > self.options.max_xattrs_per_node) return error.XattrLimitExceeded;
+        limits_mod.observe(self.options.diagnostic, .xattrs_per_node, xattrs.len);
+        if (xattrs.len > self.options.max_xattrs_per_node) {
+            return limits_mod.exceeded(
+                self.options.diagnostic,
+                .xattrs_per_node,
+                xattrs.len,
+                self.options.max_xattrs_per_node,
+            );
+        }
         var total_bytes: usize = 0;
         for (xattrs, 0..) |xattr, index| {
             _ = try splitXattrName(xattr.name);
@@ -2645,13 +2694,19 @@ const StrictScanner = struct {
                 usize,
                 total_bytes,
                 xattr.name.len + xattr.value.len,
-            ) catch return error.XattrLimitExceeded;
+            ) catch return error.XattrByteLimitExceeded;
             for (xattrs[index + 1 ..]) |other| {
                 if (std.mem.eql(u8, xattr.name, other.name)) return error.DuplicateXattr;
             }
         }
+        limits_mod.observe(self.options.diagnostic, .xattr_bytes_per_node, total_bytes);
         if (total_bytes > self.options.max_xattr_bytes_per_node) {
-            return error.XattrLimitExceeded;
+            return limits_mod.exceeded(
+                self.options.diagnostic,
+                .xattr_bytes_per_node,
+                total_bytes,
+                self.options.max_xattr_bytes_per_node,
+            );
         }
         const canonical = try buildXattrBlock(self.allocator, xattrs, self.reader.block_size);
         defer self.allocator.free(canonical);
@@ -3006,24 +3061,45 @@ fn validateStrictSuperblock(
     };
 }
 
+/// A path this profile can never represent is rejected as invalid, while a
+/// path that is merely longer than the configured limit reports the limit, so
+/// an operator can tell "impossible" from "raise this flag" apart.
 fn validateStrictPath(path: []const u8, options: StrictScanOptions) !void {
-    if (path.len == 0 or path.len > options.max_path_bytes or
-        path[0] == '/' or path[path.len - 1] == '/')
-    {
+    if (path.len == 0 or path[0] == '/' or path[path.len - 1] == '/') {
         return error.InvalidImportedPath;
+    }
+    limits_mod.observe(options.diagnostic, .path_bytes, path.len);
+    if (path.len > options.max_path_bytes) {
+        return limits_mod.exceeded(
+            options.diagnostic,
+            .path_bytes,
+            path.len,
+            options.max_path_bytes,
+        );
     }
     var components = std.mem.splitScalar(u8, path, '/');
     while (components.next()) |component| try validateStrictComponent(component, options);
 }
 
 fn validateStrictComponent(component: []const u8, options: StrictScanOptions) !void {
-    if (component.len == 0 or component.len > options.max_component_bytes or
+    if (component.len == 0 or
+        // 255 bytes is the ext4 directory-entry name field itself, which no
+        // flag can widen.
         component.len > 255 or std.mem.eql(u8, component, ".") or
         std.mem.eql(u8, component, "..") or
         std.mem.indexOfScalar(u8, component, 0) != null or
         std.mem.indexOfScalar(u8, component, '/') != null)
     {
         return error.InvalidImportedPath;
+    }
+    limits_mod.observe(options.diagnostic, .component_bytes, component.len);
+    if (component.len > options.max_component_bytes) {
+        return limits_mod.exceeded(
+            options.diagnostic,
+            .component_bytes,
+            component.len,
+            options.max_component_bytes,
+        );
     }
 }
 
@@ -6466,4 +6542,60 @@ fn expectDirNames(entries: []const DirEntry, expected: []const []const u8) !void
     for (expected, 0..) |name, index| {
         try std.testing.expectEqualSlices(u8, name, entries[index].name);
     }
+}
+
+test "a strict scan reports peaks and names the limit that stopped it" {
+    const io = std.testing.io;
+    const path = "test-ext4-strict-limits.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const attrs = [_]Xattr{.{ .name = "user.test", .value = "value" }};
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o750, .uid = 1, .gid = 2 },
+        .{ .path = "etc/file", .kind = .file, .mode = 0o640, .uid = 3, .gid = 4, .size = 4, .bytes = "test", .xattrs = &attrs },
+    });
+    tree.bind();
+
+    const length = 8 * 1024 * 1024;
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = length,
+        .uuid = [_]u8{0x21} ** 16,
+        .timestamp = 1_717_171_717,
+    });
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+
+    var measured = limits_mod.Diagnostic{};
+    var scanned = try scanWriterCompatible(&reader, io, std.testing.allocator, .{
+        .expected_length = length,
+        .diagnostic = &measured,
+    });
+    defer scanned.deinit();
+
+    try std.testing.expectEqual(@as(u64, 2), measured.peaks.nodes);
+    // The directory inode's 4 KiB size is the largest inode size seen: the
+    // scanner bounds every inode, not only regular files.
+    try std.testing.expectEqual(@as(u64, 4096), measured.peaks.file_bytes);
+    try std.testing.expectEqual(@as(u64, 4), measured.peaks.total_bytes);
+    try std.testing.expectEqual(@as(u64, 1), measured.peaks.xattrs_per_node);
+    try std.testing.expectEqual(@as(u64, 8), measured.peaks.path_bytes);
+    try std.testing.expect(measured.peaks.scan_metadata_bytes != 0);
+    try std.testing.expect(measured.exceeded == null);
+    try std.testing.expectEqual(@as(u64, 4), scanned.content_bytes);
+
+    var breached = limits_mod.Diagnostic{};
+    try std.testing.expectError(
+        error.NodeLimitExceeded,
+        scanWriterCompatible(&reader, io, std.testing.allocator, .{
+            .expected_length = length,
+            .max_nodes = 1,
+            .diagnostic = &breached,
+        }),
+    );
+    try std.testing.expectEqual(limits_mod.Limit.nodes, breached.exceeded.?.limit);
+    try std.testing.expectEqual(@as(u64, 2), breached.exceeded.?.observed);
+    try std.testing.expectEqual(@as(u64, 1), breached.exceeded.?.configured);
 }
