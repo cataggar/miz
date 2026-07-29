@@ -26,7 +26,7 @@ const usage =
     \\Commands:
     \\  create -f <format> [-o subformat=fixed|dynamic] <file> <size>
     \\  info [--output=human|json] <file>
-    \\  convert -f <src_format> -O <dst_format> [-o subformat=fixed|dynamic] <src> <dst>
+    \\  convert -f <src_format> -O <dst_format> [-o subformat=fixed|dynamic] [--compress-level <1-9>] <src> <dst|->
     \\  resize <file> [+]<size>
     \\  check <file>
     \\  map [--output=human|json] <file>
@@ -35,12 +35,15 @@ const usage =
     \\  azure deprovision [--user <username>] [--allow-device-write] <file>
     \\  cosi <disk-image> -o <output.cosi>
     \\  oci copy|inspect|list-tags
-    \\  build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [--skip-iso-rootfs] [--esp-size <size>] [--root-selinux-label <context>] [--boot-mode bls|uki|both] [--stub-source-path <path>] [--verity]
+    \\  build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}|-> [--skip-iso-rootfs] [--esp-size <size>] [--root-selinux-label <context>] [--boot-mode bls|uki|both] [--stub-source-path <path>] [--verity]
     \\  qemu [<image>] [--model full|core] [--architecture auto|x86_64|aarch64] [--admin-username <name>] [--ssh-public-key <path>] [--ssh-port <port>] [--snapshot] [--secure-boot] [--secure-boot-certificate <path> --secure-boot-certificate-sha256 <hex>] [--accel auto|whpx|kvm|hvf|tcg] [--qemu <path>] [--ovmf-code <path>] [--ovmf-vars <path>] [-- <extra-qemu-args...>]
     \\  uki certificate <disk-image> (--output <certificate.pem>|--output=json) [--expected-sha256 <hex>]
     \\  sign
     \\
     \\Formats: raw, vhd (alias: vpc), vhdx, qcow2
+    \\Compressed output: raw.gz, raw.zst -- compressed while written, and streamable
+    \\to stdout with `-o -`. Formats that amend metadata after the data (vhd, vhdx,
+    \\qcow2) cannot be compressed or streamed.
     \\Sizes accept K/M/G/T binary suffixes (e.g. 20G).
     \\
 ;

@@ -22,6 +22,8 @@ zvmi info --output=json disk.vhd
 zvmi convert -f raw -O vhd -o subformat=dynamic disk.img disk.vhd
 zvmi convert -f raw -O vhdx disk.img disk.vhdx
 zvmi convert -f vhdx -O vhd -o subformat=fixed disk.vhdx disk.vhd  # import a VHDX (e.g. Hyper-V export)
+zvmi convert -O raw.gz disk.qcow2 disk.raw.gz    # compressed while writing, never a full raw on disk
+zvmi convert -O raw.gz -o - disk.qcow2 - | ssh host 'cat > disk.raw.gz'
 zvmi resize disk.vhdx +4G
 zvmi resize disk.vhd +4G
 zvmi check disk.vhd
@@ -39,6 +41,7 @@ zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o outp
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.raw -O raw
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.vhdx -O vhdx
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.qcow2 -O qcow2
+zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.raw.gz -O raw.gz
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 384M --skip-iso-rootfs -o output-minimal.raw -O raw
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G --verity -o output.vhd
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G --boot-mode uki --esp-size 512M -o output-uki.vhd
@@ -215,6 +218,60 @@ image architecture and a readable and writable `/dev/kvm`, and is refused rather
 than degraded. Software emulation must be asked for by name, and is the only
 option for a cross-architecture run, since no accelerator crosses architectures.
 Whichever ran is recorded in provenance.
+
+## Compressed and streamed output
+
+`-O raw.gz` and `-O raw.zst` produce a compressed raw image. The compressor
+runs as the image is produced, not as a separate pass over a finished file,
+so a build never has to materialize the full uncompressed raw locally --
+which is usually the single largest cost of producing a disk image. Both
+`convert` and `build-image` accept them, as do the customization entry points
+(`zvmi.customize` and the `zvmi-image-builder`/`zvmi-preserved-image-builder`
+bundle executables) via the same `-O` spelling.
+
+`-o -` writes the artifact to stdout instead of a file, so the result can be
+piped:
+
+```
+zvmi convert -O raw.gz -o - disk.qcow2 - | ssh host 'cat > image.raw.gz'
+zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G \
+    -O raw.gz -o - > image.raw.gz
+```
+
+The published gzip artifact is directly consumable by the usual idiom:
+
+```
+curl https://example/image.raw.gz | gunzip | dd of=/dev/sdX bs=4M status=progress
+```
+
+Only `raw` can be compressed or streamed. `vhd` writes its footer after the
+data, `vhdx` amends its block allocation table, and `qcow2` amends its L1 and
+refcount tables, so all three need to seek backwards over bytes they already
+wrote. A compressor cannot revisit those bytes and stdout cannot be rewound,
+so these combinations are rejected up front -- `CompressionRequiresRawFormat`
+for `-O vhd.gz` and friends, `FormatRequiresSeekableOutput` for `-o -` with a
+seek-back format -- rather than silently producing a corrupt artifact.
+
+`--compress-level <1-9>` selects the gzip level and defaults to `1`. That
+default is deliberate: a disk image is dominated by long runs of zeros, which
+every deflate level collapses to almost nothing, so higher levels cost
+substantial wall-clock time for a very small size gain. zstd has no level
+knob here; asking for one with `-O raw.zst` is an error rather than a
+silently ignored flag.
+
+Sparse regions stay cheap. The streaming writer walks the source's extent map
+and emits unallocated regions as zero runs without reading them, and
+all-zero chunks of allocated regions are recognized and emitted the same way.
+The zeros are fed *to* the compressor rather than skipped, so the artifact is
+always exactly the image's virtual size once decompressed; the writer asserts
+that byte count before it reports success.
+
+Because `zvmi` constructs filesystems natively rather than capturing a
+running system, the usual "fill the free space with zeros before imaging so
+that it compresses" step is unnecessary. Unallocated blocks in a freshly
+built ext4 have never held anything, so they are already zero, and both the
+extent map and the all-zero chunk detection reduce them to compressed zero
+runs. Skipping that pass saves writing the full virtual size twice.
 
 ## Formats and filesystem APIs
 

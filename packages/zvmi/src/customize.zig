@@ -18,6 +18,7 @@ const image_mod = @import("image.zig");
 const layout = @import("layout.zig");
 const mbr = @import("mbr.zig");
 const os_customization = @import("os_customization.zig");
+const output_mod = @import("output.zig");
 const customization_wire = @import("customization_wire.zig");
 const preserved_image = @import("preserved_image.zig");
 const root_tree = @import("root_tree.zig");
@@ -92,6 +93,11 @@ pub const Input = union(enum) {
 
 pub const OutputFormat = enum {
     raw,
+    /// A raw image compressed as it is written. Only raw has a compressed
+    /// spelling: every other format amends metadata after the data it
+    /// already wrote, which cannot be done through a compressor.
+    raw_gz,
+    raw_zst,
     vhd,
     vhdx,
     qcow2,
@@ -99,11 +105,36 @@ pub const OutputFormat = enum {
 
     fn imageFormat(self: OutputFormat) ?Format {
         return switch (self) {
-            .raw => .raw,
+            .raw, .raw_gz, .raw_zst => .raw,
             .vhd => .vhd,
             .vhdx => .vhdx,
             .qcow2 => .qcow2,
             .cosi => null,
+        };
+    }
+
+    pub fn compression(self: OutputFormat) output_mod.Compression {
+        return switch (self) {
+            .raw_gz => .gzip,
+            .raw_zst => .zstd,
+            .raw, .vhd, .vhdx, .qcow2, .cosi => .none,
+        };
+    }
+
+    /// Parses an `-O` argument, including the compressed spellings
+    /// `raw.gz`/`raw.zst`. `cosi` is deliberately absent: it is a bundle
+    /// format selected by its own command, not a disk-image format.
+    pub fn parseName(name: []const u8) ?OutputFormat {
+        const spec = output_mod.Spec.parseName(name) orelse return null;
+        return switch (spec.compression) {
+            .none => switch (spec.format) {
+                .raw => .raw,
+                .vhd => .vhd,
+                .vhdx => .vhdx,
+                .qcow2 => .qcow2,
+            },
+            .gzip => if (spec.format == .raw) .raw_gz else null,
+            .zstd => if (spec.format == .raw) .raw_zst else null,
         };
     }
 };
@@ -4768,6 +4799,7 @@ pub fn execute(
                 .source_path = plan.data.input.disk.path,
                 .output_path = plan.data.staging_output_path,
                 .output_format = plan.data.output.format.imageFormat().?,
+                .output_compression = plan.data.output.format.compression(),
                 .root_partition = plan.data.storage.preserve.root_partition,
                 .operations = plan.data.existing_path_operations,
                 .expected_virtual_size = null,
@@ -4788,6 +4820,7 @@ pub fn execute(
                 .source_path = plan.data.input.disk.path,
                 .output_path = plan.data.staging_output_path,
                 .output_format = plan.data.output.format.imageFormat().?,
+                .output_compression = plan.data.output.format.compression(),
                 .root_partition = plan.data.storage.preserve.root_partition,
                 .existing_operations = plan.data.existing_path_operations,
                 .customization = plan.data.os,
@@ -4816,6 +4849,7 @@ pub fn execute(
                 .source_path = plan.data.input.disk.path,
                 .output_path = plan.data.staging_output_path,
                 .output_format = plan.data.output.format.imageFormat().?,
+                .output_compression = plan.data.output.format.compression(),
                 .root_partition = plan.data.storage.preserve.root_partition,
                 .require_linux_partition = true,
                 .output_create_options = outputCreateOptions(plan),
@@ -4855,6 +4889,7 @@ pub fn execute(
                 .source_path = plan.data.input.disk.path,
                 .output_path = plan.data.staging_output_path,
                 .output_format = plan.data.output.format.imageFormat().?,
+                .output_compression = plan.data.output.format.compression(),
                 .root_partition = plan.data.storage.preserve.root_partition,
                 .require_linux_partition = true,
                 .output_create_options = outputCreateOptions(plan),
@@ -5157,6 +5192,7 @@ fn buildOptionsFromPlan(plan: *const ResolvedPlan, bridge: *BuildEventBridge) bu
         .size = plan.data.output.disk_size,
         .generation = storage.generation,
         .output_format = plan.data.output.format.imageFormat().?,
+        .output_compression = plan.data.output.format.compression(),
         .rootfs_path_in_iso = input.rootfs_path_in_iso,
         .skip_iso_rootfs = storage.skip_iso_rootfs,
         .os = plan.data.os,
@@ -5626,6 +5662,21 @@ fn hasDiagnosticCode(diagnostics: DiagnosticSet, code: DiagnosticCode) bool {
         if (diagnostic.code == code) return true;
     }
     return false;
+}
+
+test "output format names cover the compressed raw spellings" {
+    try std.testing.expectEqual(OutputFormat.raw, OutputFormat.parseName("raw").?);
+    try std.testing.expectEqual(OutputFormat.raw_gz, OutputFormat.parseName("raw.gz").?);
+    try std.testing.expectEqual(OutputFormat.raw_zst, OutputFormat.parseName("raw.zst").?);
+    try std.testing.expectEqual(OutputFormat.qcow2, OutputFormat.parseName("qcow2").?);
+    // Only raw can be compressed, and `cosi` is not an `-O` disk format.
+    try std.testing.expectEqual(@as(?OutputFormat, null), OutputFormat.parseName("vhd.gz"));
+    try std.testing.expectEqual(@as(?OutputFormat, null), OutputFormat.parseName("cosi"));
+
+    try std.testing.expectEqual(Format.raw, OutputFormat.raw_gz.imageFormat().?);
+    try std.testing.expectEqual(output_mod.Compression.gzip, OutputFormat.raw_gz.compression());
+    try std.testing.expectEqual(output_mod.Compression.zstd, OutputFormat.raw_zst.compression());
+    try std.testing.expectEqual(output_mod.Compression.none, OutputFormat.raw.compression());
 }
 
 test "unsafe chroot platform executes the supported preserved subset" {

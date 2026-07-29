@@ -13,6 +13,7 @@ const image_mod = @import("image.zig");
 const Image = image_mod.Image;
 const mbr = @import("mbr.zig");
 const os_customization = @import("os_customization.zig");
+const output_mod = @import("output.zig");
 const root_tree = @import("root_tree.zig");
 
 const Io = std.Io;
@@ -48,6 +49,10 @@ pub const Options = struct {
     expected_virtual_size: ?u64 = null,
     max_source_file_bytes: u64 = 1024 * 1024 * 1024,
     output_create_options: image_mod.CreateOptions = .{},
+    /// Compresses the published artifact as it is written. Only `.raw`
+    /// output can be compressed: every other format amends metadata after
+    /// the data it already wrote, which a compressor cannot revisit.
+    output_compression: output_mod.Compression = .none,
 };
 
 pub const Report = struct {
@@ -101,6 +106,10 @@ pub const RawMutationOptions = struct {
     require_linux_partition: bool = false,
     dependency_paths: []const []const u8 = &.{},
     output_create_options: image_mod.CreateOptions = .{},
+    /// Compresses the published artifact as it is written. Only `.raw`
+    /// output can be compressed: every other format amends metadata after
+    /// the data it already wrote, which a compressor cannot revisit.
+    output_compression: output_mod.Compression = .none,
 };
 
 pub const RawMutationReport = struct {
@@ -131,6 +140,10 @@ pub const RebuildOptions = struct {
     expected_virtual_size: ?u64 = null,
     max_source_file_bytes: u64 = 1024 * 1024 * 1024,
     output_create_options: image_mod.CreateOptions = .{},
+    /// Compresses the published artifact as it is written. Only `.raw`
+    /// output can be compressed: every other format amends metadata after
+    /// the data it already wrote, which a compressor cannot revisit.
+    output_compression: output_mod.Compression = .none,
 };
 
 pub const RebuildReport = struct {
@@ -227,6 +240,7 @@ pub fn edit(
             .expected_virtual_size = options.expected_virtual_size,
             .dependency_paths = dependency_paths.items,
             .output_create_options = options.output_create_options,
+            .output_compression = options.output_compression,
         },
         .{ .context = &context, .runFn = runEditMutation },
         "native-edit",
@@ -584,6 +598,7 @@ pub fn rebuild(
         output_stage_path,
         output_path,
         options.output_format,
+        options.output_compression,
         virtual_size,
         options.output_create_options,
         raw_inode,
@@ -721,6 +736,7 @@ fn transactRawInternal(
         output_stage_path,
         output_path,
         options.output_format,
+        options.output_compression,
         virtual_size,
         options.output_create_options,
         raw_inode,
@@ -773,6 +789,7 @@ fn publishRawStaging(
     output_stage_path: []const u8,
     output_path: []const u8,
     output_format: Format,
+    output_compression: output_mod.Compression,
     virtual_size: u64,
     output_create_options: image_mod.CreateOptions,
     expected_raw_inode: Io.File.INode,
@@ -787,6 +804,19 @@ fn publishRawStaging(
         false,
     );
     defer raw_source.close(io);
+    if (output_compression != .none) {
+        if (output_format != .raw) return error.CompressionRequiresRawFormat;
+        try publishCompressedStage(
+            allocator,
+            io,
+            raw_source,
+            output_stage_path,
+            output_path,
+            output_compression,
+            output_stage_exists,
+        );
+        return;
+    }
     if (output_format == .raw) {
         try Io.Dir.cwd().renamePreserve(raw_path, Io.Dir.cwd(), output_path, io);
         raw_exists.* = false;
@@ -808,6 +838,37 @@ fn publishRawStaging(
     output_open = false;
     const pinned_output = try openPinnedStage(io, output_stage_path, output_inode);
     defer pinned_output.close(io);
+    try Io.Dir.cwd().renamePreserve(output_stage_path, Io.Dir.cwd(), output_path, io);
+    output_stage_exists.* = false;
+}
+
+/// Compresses a finished raw stage into the output stage and publishes it.
+/// The compressor is single-pass, so this deliberately reuses the same
+/// stage-then-rename discipline as a format conversion rather than writing
+/// straight to the caller-visible path.
+fn publishCompressedStage(
+    allocator: Allocator,
+    io: Io,
+    raw_source: Image,
+    output_stage_path: []const u8,
+    output_path: []const u8,
+    output_compression: output_mod.Compression,
+    output_stage_exists: *bool,
+) !void {
+    const stage = try Io.Dir.cwd().createFile(io, output_stage_path, .{ .exclusive = true });
+    output_stage_exists.* = true;
+    var stage_open = true;
+    defer if (stage_open) stage.close(io);
+    var buffer: [64 * 1024]u8 = undefined;
+    var stage_writer = stage.writer(io, &buffer);
+    try output_mod.writeImage(allocator, io, raw_source, &stage_writer.interface, .{
+        .compression = output_compression,
+    });
+    const stage_inode = (try stage.stat(io)).inode;
+    stage.close(io);
+    stage_open = false;
+    const pinned_stage = try openPinnedStage(io, output_stage_path, stage_inode);
+    defer pinned_stage.close(io);
     try Io.Dir.cwd().renamePreserve(output_stage_path, Io.Dir.cwd(), output_path, io);
     output_stage_exists.* = false;
 }
@@ -2462,6 +2523,80 @@ test "preserved editor mutates a raw copy without changing source or unrelated b
     const original = try source_reader.readFileAlloc(io, std.testing.allocator, "/etc/config");
     defer std.testing.allocator.free(original);
     try std.testing.expectEqualStrings("before\n", original);
+}
+
+test "preserved editor publishes a gzip-compressed raw artifact" {
+    const io = std.testing.io;
+    const source_path = "test-preserved-image-gzip-source.raw";
+    const plain_path = "test-preserved-image-gzip-plain.raw";
+    const output_path = "test-preserved-image-gzip-output.raw.gz";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, plain_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, plain_path ++ ".native-edit.raw") catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path ++ ".native-edit.raw") catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path ++ ".native-edit.output") catch {};
+    try createTestDisk(io, source_path);
+
+    const operations = [_]Operation{
+        .{ .overwrite_file = .{
+            .path = "/etc/config",
+            .source = .{ .bytes = "after\n" },
+        } },
+    };
+    _ = try edit(std.testing.allocator, io, .{
+        .source_path = source_path,
+        .output_path = plain_path,
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 1 },
+        .operations = &operations,
+        .expected_virtual_size = test_disk_size,
+    });
+    _ = try edit(std.testing.allocator, io, .{
+        .source_path = source_path,
+        .output_path = output_path,
+        .output_format = .raw,
+        .output_compression = .gzip,
+        .root_partition = .{ .mbr_index = 1 },
+        .operations = &operations,
+        .expected_virtual_size = test_disk_size,
+    });
+
+    // Neither staging artifact may survive a successful publication.
+    try std.testing.expectError(
+        error.FileNotFound,
+        Io.Dir.cwd().statFile(io, output_path ++ ".native-edit.raw", .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        Io.Dir.cwd().statFile(io, output_path ++ ".native-edit.output", .{}),
+    );
+
+    const expected = try Io.Dir.cwd().readFileAlloc(
+        io,
+        plain_path,
+        std.testing.allocator,
+        .limited(test_disk_size + 1),
+    );
+    defer std.testing.allocator.free(expected);
+    const compressed = try Io.Dir.cwd().readFileAlloc(
+        io,
+        output_path,
+        std.testing.allocator,
+        .limited(test_disk_size + 1),
+    );
+    defer std.testing.allocator.free(compressed);
+    try std.testing.expect(compressed.len < expected.len);
+
+    var compressed_reader: Io.Reader = .fixed(compressed);
+    var history: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress: std.compress.flate.Decompress = .init(&compressed_reader, .gzip, &history);
+    const decoded = try decompress.reader.allocRemaining(
+        std.testing.allocator,
+        .limited(test_disk_size + 1),
+    );
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, expected, decoded);
 }
 
 test "preserved editor publishes standalone qcow2 and cleans failed staging" {
