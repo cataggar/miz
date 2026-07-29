@@ -1036,6 +1036,11 @@ fn sourceFor(fixture: *Fixture, authfile: ?[]const u8) !oci.registry.Source {
 
 fn noSleep(_: ?*anyopaque, _: Io, _: u64) !void {}
 
+/// Removes a layout and its bootstrap lock. Every test that writes a layout
+/// calls this both before and after the work: a layout left behind by an
+/// interrupted run is not an empty destination, so the copy engine skips the
+/// transfers whose blobs are already present, the fixture never receives the
+/// requests it was told to expect, and the test deadlocks waiting for them.
 fn deleteLayout(io: Io, path: []const u8) void {
     Io.Dir.cwd().deleteTree(io, path) catch {};
     const parent = std.fs.path.dirname(path) orelse ".";
@@ -1062,6 +1067,7 @@ test "anonymous pull copies exact graph into a new layout with streamed blobs" {
     var source = try sourceFor(&fixture, null);
     defer source.deinit();
     const destination = "test-oci-registry-anonymous-layout";
+    deleteLayout(io, destination);
     defer deleteLayout(io, destination);
     var result = try source.copyToLayout(
         .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1106,6 +1112,7 @@ test "Basic and Bearer challenges keep credentials out of request targets" {
         var source = try sourceFor(&fixture, authfile);
         defer source.deinit();
         const destination = "test-oci-registry-bearer-layout";
+        deleteLayout(io, destination);
         defer deleteLayout(io, destination);
         var result = try source.copyToLayout(
             .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1151,6 +1158,7 @@ test "Basic and Bearer authentication rejections are bounded for metadata and bl
         var source = try sourceFor(&fixture, authfile);
         defer source.deinit();
         const destination = "test-oci-registry-basic-blob-rejection";
+        deleteLayout(io, destination);
         defer deleteLayout(io, destination);
         try std.testing.expectError(error.AuthenticationFailed, source.copyToLayout(
             .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1169,6 +1177,7 @@ test "Basic and Bearer authentication rejections are bounded for metadata and bl
         var source = try sourceFor(&fixture, authfile);
         defer source.deinit();
         const destination = "test-oci-registry-bearer-blob-rejection";
+        deleteLayout(io, destination);
         defer deleteLayout(io, destination);
         try std.testing.expectError(error.AuthenticationFailed, source.copyToLayout(
             .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1315,6 +1324,7 @@ test "registry operations require exactly 200 OK" {
         var source = try sourceFor(&fixture, null);
         defer source.deinit();
         const destination = "test-oci-registry-zero-blob-status";
+        deleteLayout(io, destination);
         defer deleteLayout(io, destination);
         try std.testing.expectError(error.RegistryRequestFailed, source.copyToLayout(
             .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1341,6 +1351,7 @@ test "cross-origin blob redirects strip registry Authorization" {
     var source = try sourceFor(&fixture, authfile);
     defer source.deinit();
     const destination = "test-oci-registry-cross-origin-layout";
+    deleteLayout(io, destination);
     defer deleteLayout(io, destination);
     var result = try source.copyToLayout(
         .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1374,6 +1385,7 @@ test "cross-origin blob authentication challenges cannot nominate token realms" 
     var source = try sourceFor(&fixture, authfile);
     defer source.deinit();
     const destination = "test-oci-registry-cross-origin-challenge-layout";
+    deleteLayout(io, destination);
     defer deleteLayout(io, destination);
     try std.testing.expectError(error.AuthenticationFailed, source.copyToLayout(
         .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1637,6 +1649,7 @@ test "authenticated HTTPS registry blob redirects strip Authorization cross-orig
     );
     defer source.deinit();
     const destination = "test-oci-registry-tls-cross-origin-layout";
+    deleteLayout(io, destination);
     defer deleteLayout(io, destination);
     var result = try source.copyToLayout(
         .{ .authority = registry.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1663,6 +1676,7 @@ test "bad blob responses do not publish a destination reference" {
             .bad_content_length => "test-oci-registry-bad-length",
             else => unreachable,
         };
+        deleteLayout(io, destination);
         defer deleteLayout(io, destination);
         const expected_error: anyerror = switch (scenario) {
             .bad_blob_digest => error.BlobVerificationFailed,
@@ -1697,6 +1711,7 @@ test "explicit selected registry copies validate config blobs rather than manife
         var source = try sourceFor(&fixture, null);
         defer source.deinit();
         const destination = "test-oci-registry-platform-copy-match";
+        deleteLayout(io, destination);
         defer deleteLayout(io, destination);
         var result = try source.copyToLayout(
             .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1717,6 +1732,7 @@ test "explicit selected registry copies validate config blobs rather than manife
         var source = try sourceFor(&fixture, null);
         defer source.deinit();
         const destination = "test-oci-registry-platform-copy-mismatch";
+        deleteLayout(io, destination);
         defer deleteLayout(io, destination);
         try std.testing.expectError(error.PlatformConfigMismatch, source.copyToLayout(
             .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -3109,6 +3125,7 @@ test "layout to registry uses the shared dependency-first graph engine" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const layout_path = "test-oci-layout-to-registry";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     var pull_fixture = try Fixture.init(allocator, io, .anonymous, 6, null);
     defer pull_fixture.deinit();
@@ -3151,6 +3168,7 @@ test "anonymous non-loopback plain HTTP registry publication is permitted explic
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const layout_path = "test-oci-anonymous-remote-http-layout";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     var pull_fixture = try Fixture.init(allocator, io, .anonymous, 6, null);
     defer pull_fixture.deinit();
@@ -3191,6 +3209,7 @@ test "authenticated cross-origin HTTPS uploads preserve signed queries and strip
     const io = std.testing.io;
     const layout_path = "test-oci-cross-origin-upload-layout";
     const authfile = "test-oci-cross-origin-upload-auth.json";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     defer Io.Dir.cwd().deleteFile(io, authfile) catch {};
 
@@ -3228,6 +3247,7 @@ test "all-mode registry publication puts child manifests before the root index" 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const layout_path = "test-oci-all-layout-to-registry";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     var pull_fixture = try Fixture.init(allocator, io, .anonymous, 6, null);
     defer pull_fixture.deinit();
@@ -3289,6 +3309,7 @@ test "selected registry publication commits only the selected leaf graph" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const layout_path = "test-oci-selected-layout-to-registry";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     var pull_fixture = try Fixture.init(allocator, io, .anonymous, 6, null);
     defer pull_fixture.deinit();
@@ -3342,6 +3363,7 @@ test "selected registry publication validates a digest destination against the s
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const layout_path = "test-oci-selected-digest-layout-to-registry";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     var pull_fixture = try Fixture.init(allocator, io, .anonymous, 6, null);
     defer pull_fixture.deinit();
@@ -3393,6 +3415,7 @@ test "all-mode registry publication retains unknown opaque index leaves as manif
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const layout_path = "test-oci-opaque-layout-to-registry";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     var pull_fixture = try Fixture.init(allocator, io, .anonymous, 6, null);
     defer pull_fixture.deinit();
@@ -3445,6 +3468,7 @@ test "registry all-mode fetches unknown index children through the manifest endp
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const layout_path = "test-oci-opaque-registry-to-layout";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     var fixture = try PublishFixture.init(allocator, io, 5);
     defer fixture.deinit();
@@ -3530,6 +3554,7 @@ test "graph depth failures occur before registry destination requests" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const layout_path = "test-oci-depth-planning-layout";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     var documents = try makeSmallPublishLayout(allocator, io, layout_path, "leaf");
     defer documents.deinit(allocator);
