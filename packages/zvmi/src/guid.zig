@@ -83,6 +83,13 @@ pub const esp: Guid = parse("C12A7328-F81F-11D2-BA4B-00A0C93EC93B");
 /// etc.): 0FC63DAF-8483-4772-8E79-3D69D8477DE4.
 pub const linux_filesystem_data: Guid = parse("0FC63DAF-8483-4772-8E79-3D69D8477DE4");
 
+/// Linux LVM physical volume type GUID, which a guided Ubuntu or Debian
+/// install puts on the partition holding the volume group:
+/// E6D6D379-F507-44C2-A23C-238F2A3DF928. Only a hint -- `lvm.scan` looks for
+/// an LVM2 label in every partition regardless of type -- but worth naming
+/// where a layout is described.
+pub const linux_lvm: Guid = parse("E6D6D379-F507-44C2-A23C-238F2A3DF928");
+
 /// Discoverable Partitions Specification root (`/`) type GUID for x86-64:
 /// 4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709.
 pub const linux_root_x86_64: Guid = parse("4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709");
