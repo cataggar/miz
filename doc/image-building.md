@@ -241,9 +241,14 @@ opt-in because giving up reproducibility should be a decision, not a fallback.
 Two limits are inherent to the writer rather than the importer. Output inodes
 are 128 bytes, so a timestamp outside 1970..2106 has nowhere to go and is
 refused with `TimestampOutOfRange` rather than wrapped into a plausible-looking
-wrong date. And the journal is never replayed: a source must be cleanly
+wrong date. And a source journal is never replayed: a source must be cleanly
 unmounted, and a superblock still marked as needing recovery or carrying orphan
-inodes is a hard error rather than a filesystem imported halfway.
+inodes is a hard error rather than a filesystem imported halfway. The source's
+own journal is never carried across either -- the rebuild writes a fresh
+filesystem, and whether that one has a journal is `journal`'s decision alone.
+The rebuild report and provenance state both `source_has_journal` and the
+output's `journal_block_count`, so dropping a journal is visible rather than
+silent.
 
 Everything outside the supported set is refused by name, because a partial
 import produces an image that looks fine and is subtly wrong:
@@ -568,6 +573,98 @@ than degraded. Software emulation must be asked for by name, and is the only
 option for a cross-architecture run, since no accelerator crosses architectures.
 Whichever ran is recorded in provenance.
 
+## Journalling the root filesystem
+
+The native ext4 writer can create a JBD2 journal. It does not by default, and
+that default is deliberate rather than an oversight.
+
+Nothing needs a journal while an image is being built. The filesystem is
+constructed offline and written atomically, so there is no half-applied
+metadata update for a log to protect. That stops being the whole story the
+moment the image becomes a running machine's root filesystem. From first boot
+onward it is an ordinary mutable ext4 volume, and an unclean shutdown or power
+loss leaves a journal-less volume with no recovery log at all: the next boot
+faces a full `fsck` with a real chance of data loss, where a journalled volume
+would replay in a moment and carry on.
+
+So: build a purpose-built, effectively read-only appliance image without a
+journal, and build an image that boots into a mutable root filesystem with one.
+
+| Surface | How to ask for it |
+| --- | --- |
+| `zvmi build-image` | `--journal`, `--no-journal` (default), `--journal-size <size>` |
+| `std.Build` helper (`image.addImage`) | `.journal = true`, `.journal_size = <bytes>` |
+| `std.Build` helper (`image.addPreservedImage`) | `.journal = .{ .enabled = true, .size_bytes = ... }` |
+| Preserved-image configuration JSON (api_version 3) | `"journal": { "enabled": true, "size_bytes": 33554432 }` |
+| `preserved_image.RebuildOptions` | `.journal = .{ .enabled = true }` |
+| `ext4.populate` / `ext4.preflightPopulate` | `PopulateOptions.journal` |
+
+`--journal-size` implies `--journal`. `--no-journal` clears only the enable
+flag, so the last of `--journal` / `--no-journal` on the command line wins.
+
+The journal is `rebuild`-only among the preserved-image backends. Every other
+backend keeps the source's filesystem rather than writing a new one, so a
+journal setting there would read as a durability choice that nothing acts on;
+stating it is `UnexpectedJournalPolicy`.
+
+`--journal` and `--verity` cannot be combined. A dm-verity root is mounted
+read-only over a hash tree computed from its exact bytes, so it is never
+written to and has nothing to journal.
+
+### Default size
+
+Left unspecified, the journal is sized on `mke2fs`'s own scale -- e2fsprogs'
+`ext2fs_default_journal_size`, reproduced exactly -- so an image gets the size
+the rest of the ext4 world would have given it. With the 4 KiB blocks this
+writer uses:
+
+| Filesystem size | Journal |
+| --- | --- |
+| below 8 MiB | refused: `FilesystemTooSmallForJournal` |
+| 8 MiB .. 128 MiB | 4 MiB |
+| 128 MiB .. 1 GiB | 16 MiB |
+| 1 GiB .. 2 GiB | 32 MiB |
+| 2 GiB .. 16 GiB | 64 MiB |
+| 16 GiB .. 32 GiB | 128 MiB |
+| 32 GiB .. 64 GiB | 256 MiB |
+| 64 GiB .. 128 GiB | 512 MiB |
+| 128 GiB and above | 1 GiB |
+
+An explicit size is bounded the same way `mke2fs -J size=` is, and each
+rejection has its own name: `UnalignedJournalSize` (not a non-zero whole number
+of 4 KiB blocks), `JournalSizeTooSmall` (below the 4 MiB JBD2 minimum),
+`JournalSizeTooLarge` (above 40 GiB, or above half the filesystem).
+
+`ext4.defaultJournalBlocks(total_blocks)` exposes the same ladder to callers
+that want to size storage before writing anything.
+
+### A journalled image is a different profile
+
+`HAS_JOURNAL` is not part of the `zvmi_ext4_v1` feature set, and the strict
+profile is defined as that exact set. A journalled image is therefore refused
+by `scanWriterCompatible` with `UnsupportedWriterProfile` and can only be
+imported through `.source_profile = .general`, as `ext4_general_v1` with
+`source_reproducible = false`.
+
+This is on purpose. `zvmi_ext4_v1` is a byte-for-byte reproducibility contract,
+and widening it would change what that contract means. A journalled output is a
+distinct profile, so a strict rebuild round-trips exactly as it always did.
+
+### What the journal is, and is not
+
+The journal this writer creates is empty. `s_start` is 0, so there is nothing
+to replay and no log record is ever written at build time; the kernel takes
+over the log on first mount, at which point it also sets
+`JBD2_FEATURE_INCOMPAT_CSUM_V3` and the journal-superblock checksum. The
+on-disk shape matches what `mke2fs` writes for the same geometry byte for byte,
+including the deliberate absence of journal feature bits and a journal
+checksum: a journal superblock the kernel trusts but computes differently is
+how a bad log gets replayed over good data.
+
+The interim workaround this replaces was `tune2fs -j <image-or-partition>`
+after the build. That works, but it puts `e2fsprogs` back on the build host,
+which is exactly what a self-contained image builder exists to avoid.
+
 ## Import limits and scratch space
 
 Every import is bounded. The defaults are guardrails sized for a purpose-built
@@ -742,9 +839,11 @@ index nodes once a directory outgrows a single root index block),
 `METADATA_CSUM` crc32c checksums on bitmaps/GDTs/superblocks/inodes/
 directory leaf blocks/xattr blocks, and extent trees (inline for small
 files, spilling into real extent/index blocks up to depth 4 for larger or
-fragmented ones); it deliberately ships without a journal or quota files,
-since the target image-build flow creates filesystems offline and writes
-them atomically. `resize()` supports offline, in-place growth. The paired
+fragmented ones); quota files are never written. A JBD2 journal is
+optional and off by default (see "Journalling the root filesystem").
+`resize()` supports offline, in-place growth of a filesystem with or
+without a journal, and refuses a `resize_inode` filesystem by name with
+`ResizeInodeNotSupported`. The paired
 reader API can `statPath`, `listDir`, `preadPath`, `readExtents`, and
 `readLinkAlloc` for round-trip verification.
 
