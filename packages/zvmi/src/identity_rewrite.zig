@@ -182,13 +182,17 @@ pub const Plan = struct {
 };
 
 /// Whether references to `kind` on this filesystem name something that no
-/// longer exists. A merge retires every identifier the filesystem had, since
-/// the filesystem itself is gone; otherwise an identifier is retired when the
-/// rebuild gave it a different value, or when the caller could not say what
-/// the new value is.
+/// longer exists. An identifier is retired when the rebuild gave it a
+/// different value, or when the caller could not say what the new value is.
+///
+/// A merge is not special-cased here on purpose. A merged filesystem's
+/// identifiers are retired because `after` names the filesystem that absorbed
+/// it, which is a different filesystem; in the degenerate case where the two
+/// carry the same identifier a reference still resolves to the right content,
+/// and calling it stale would fail a build that is in fact correct. Dropping
+/// an fstab entry, by contrast, depends on the merge and not on this.
 fn isRetired(filesystem: Filesystem, kind: Kind) bool {
     const before = filesystem.before.get(kind) orelse return false;
-    if (filesystem.merged_at != null) return true;
     const after = filesystem.after.get(kind) orelse return true;
     return !identifierEql(kind, before, after);
 }
@@ -217,6 +221,55 @@ fn identifierEql(kind: Kind, a: []const u8, b: []const u8) bool {
         std.ascii.eqlIgnoreCase(a, b)
     else
         std.mem.eql(u8, a, b);
+}
+
+/// Formats a 16-byte filesystem UUID in plain RFC 4122 byte order, which is
+/// how ext4's superblock `s_uuid`, libblkid and every `UUID=` in an fstab
+/// spell it.
+///
+/// Deliberately not `guid.formatLower`, which implements the mixed-endian
+/// Microsoft `GUID` convention GPT uses for partition GUIDs. Using that here
+/// would byte-swap the first three fields and produce a string that names no
+/// filesystem at all -- and, worse, one that looks entirely plausible.
+pub fn formatFilesystemUuid(buffer: *[canonical_uuid_bytes]u8, bytes: *const [16]u8) []const u8 {
+    _ = std.fmt.bufPrint(
+        buffer,
+        "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-" ++
+            "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}",
+        .{
+            bytes[0],  bytes[1],  bytes[2],  bytes[3],
+            bytes[4],  bytes[5],  bytes[6],  bytes[7],
+            bytes[8],  bytes[9],  bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15],
+        },
+    ) catch unreachable;
+    return buffer;
+}
+
+/// Length of a FAT volume serial in the `XXXX-XXXX` form `blkid` reports and
+/// an fstab names it by. It is not a UUID and there is no wider identifier a
+/// FAT volume could be named by, which is why it is matched as a whole token
+/// only; see `matchesAt`.
+pub const fat_serial_bytes: usize = 9;
+
+/// Formats a FAT volume serial the way `blkid` prints it: uppercase, with the
+/// high and low halves separated.
+pub fn formatFatVolumeSerial(buffer: *[fat_serial_bytes]u8, volume_id: u32) []const u8 {
+    _ = std.fmt.bufPrint(buffer, "{X:0>4}-{X:0>4}", .{
+        @as(u16, @truncate(volume_id >> 16)),
+        @as(u16, @truncate(volume_id)),
+    }) catch unreachable;
+    return buffer;
+}
+
+/// Trims a fixed-width, padded on-disk label field down to the label itself.
+/// ext4 pads with NULs and FAT with spaces, and neither padding byte is part
+/// of the name any tool prints. An all-padding field is no label at all,
+/// which is reported as null rather than as an empty identifier that would
+/// match nothing.
+pub fn trimLabel(field: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trimEnd(u8, field, " \x00");
+    return if (trimmed.len == 0) null else trimmed;
 }
 
 /// How much the rewriter changed, and how much it could not.
@@ -1363,4 +1416,28 @@ test "files outside the scanned locations are neither rewritten nor verified" {
     const report = try apply(allocator, &tree, testPlan(), .rewrite_and_verify, &diagnostic);
     try std.testing.expectEqual(@as(usize, 0), report.verified_files);
     try std.testing.expectEqual(@as(usize, 0), report.stale_references);
+}
+
+test "identifier text matches what blkid and an fstab spell" {
+    // The ext4 superblock's own byte order, not GPT's mixed-endian one.
+    var uuid_buffer: [canonical_uuid_bytes]u8 = undefined;
+    const uuid = [16]u8{
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+        0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+    };
+    try std.testing.expectEqualStrings(
+        "01234567-89ab-cdef-fedc-ba9876543210",
+        formatFilesystemUuid(&uuid_buffer, &uuid),
+    );
+
+    var serial_buffer: [fat_serial_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "5A56-4D49",
+        formatFatVolumeSerial(&serial_buffer, 0x5A56_4D49),
+    );
+
+    try std.testing.expectEqualStrings("root", trimLabel("root\x00\x00\x00").?);
+    try std.testing.expectEqualStrings("EFI", trimLabel("EFI        ").?);
+    try std.testing.expect(trimLabel("\x00\x00\x00") == null);
+    try std.testing.expect(trimLabel("           ") == null);
 }
