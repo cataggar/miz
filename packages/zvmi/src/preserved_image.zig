@@ -144,6 +144,11 @@ pub const RebuildOptions = struct {
     customization: os_customization.OsCustomization = .{},
     generalization: os_customization.GeneralizationPolicy = .none,
     source_date_epoch: u64,
+    /// Which ext4 sources the import will accept. `.strict` is the default
+    /// because it is the only one that underwrites the byte-for-byte rebuild
+    /// contract; `.general` exists because no filesystem a distro installer
+    /// produced can ever satisfy it.
+    source_profile: SourceProfilePolicy = .strict,
     /// Every limit the import enforces, each raisable by its own flag.
     limits: limits_mod.ImportLimits = .{},
     /// Optional sink for the peak measurements and the first limit breach.
@@ -166,6 +171,24 @@ pub const RebuildOptions = struct {
 pub const WorkspaceSpacePolicy = enum {
     enforce,
     report_only,
+};
+
+pub const SourceProfilePolicy = enum {
+    /// Only the exact feature and layout subset this project's ext4 writer
+    /// emits. A rebuild from it is reproducible byte for byte.
+    strict,
+    /// Any ext4 filesystem the general reader accepts, which covers a stock
+    /// distro root filesystem. Metadata is preserved in full, but the source
+    /// was not written by this project, so the output cannot be claimed to be
+    /// a reproducible function of it.
+    general,
+
+    pub fn scanned(self: SourceProfilePolicy) ext4.SourceProfile {
+        return switch (self) {
+            .strict => .zvmi_ext4_v1,
+            .general => .ext4_general_v1,
+        };
+    }
 };
 
 /// What a rebuild needs from the filesystem holding the output directory, and
@@ -199,7 +222,14 @@ pub const RebuildReport = struct {
     partition_offset: u64,
     partition_length: u64,
     flattened_backing_chain: bool,
-    strict_profile: ext4.StrictProfile,
+    /// Which importer accepted the source. Named rather than implied, because
+    /// only `zvmi_ext4_v1` makes the output a reproducible function of the
+    /// input; see `source_reproducible`.
+    source_profile: ext4.SourceProfile,
+    /// False for a general import. The source's own layout, allocation order
+    /// and journal state are not reproduced, so rebuilding the same source
+    /// twice is stable but rebuilding it from a re-created source is not.
+    source_reproducible: bool,
     ext4_uuid: [16]u8,
     /// Exact preserved ext4 volume-name field.
     ext4_label: [16]u8,
@@ -228,7 +258,8 @@ pub const RebuildInspection = struct {
     partition_offset: u64,
     partition_length: u64,
     flattened_backing_chain: bool,
-    strict_profile: ext4.StrictProfile,
+    source_profile: ext4.SourceProfile,
+    source_reproducible: bool,
     ext4_uuid: [16]u8,
     ext4_label: [16]u8,
     ext4_block_size: u32,
@@ -427,10 +458,7 @@ pub fn inspectRebuild(
         .{ .offset = partition.offset },
     );
     defer reader.deinit();
-    var scanned = try ext4.scanWriterCompatible(&reader, io, allocator, strictScanOptions(
-        options,
-        partition.length,
-    ));
+    var scanned = try ScannedSource.scan(&reader, io, allocator, options, partition.length);
     defer scanned.deinit();
     try preflightScannedOperations(scanned.fileTreeView(), options.existing_operations);
 
@@ -470,7 +498,7 @@ pub fn inspectRebuild(
     var validation_tree = root_tree.RootTree.initMemory(allocator, io, options.limits.tree());
     validation_tree.diagnostic = options.limit_diagnostic;
     defer validation_tree.deinit();
-    try validation_tree.importExt4ViewBorrowed(scanned.fileTreeView());
+    try scanned.importBorrowedInto(&validation_tree);
     try preflightTreeOperations(&validation_tree, options.existing_operations);
     try applyTreeOperations(
         io,
@@ -490,17 +518,12 @@ pub fn inspectRebuild(
         &validation_tree,
         options.generalization,
     );
+    const scanned_label = scanned.label();
+    const scanned_timestamp = scanned.globalTimestamp(options.source_date_epoch);
     _ = try ext4.preflightPopulate(
         allocator,
         try validation_tree.ext4View(),
-        .{
-            .offset = partition.offset,
-            .length = scanned.identity.filesystem_length,
-            .block_size = scanned.identity.block_size,
-            .label = &scanned.identity.label,
-            .uuid = scanned.identity.uuid,
-            .timestamp = scanned.identity.global_timestamp,
-        },
+        populateOptions(&validation_tree, partition.offset, &scanned, &scanned_label, scanned_timestamp),
     );
 
     return .{
@@ -509,17 +532,18 @@ pub fn inspectRebuild(
         .partition_offset = partition.offset,
         .partition_length = partition.length,
         .flattened_backing_chain = if (source.qcow2) |info| info.backing_depth != 0 else false,
-        .strict_profile = scanned.identity.profile,
-        .ext4_uuid = scanned.identity.uuid,
-        .ext4_label = scanned.identity.label,
-        .ext4_block_size = scanned.identity.block_size,
-        .filesystem_length = scanned.identity.filesystem_length,
-        .ext4_global_timestamp = scanned.identity.global_timestamp,
+        .source_profile = scanned.profile(),
+        .source_reproducible = scanned.profile().isByteReproducible(),
+        .ext4_uuid = scanned.uuid(),
+        .ext4_label = scanned_label,
+        .ext4_block_size = scanned.blockSize(),
+        .filesystem_length = scanned.filesystemLength(),
+        .ext4_global_timestamp = scanned_timestamp,
         .imported_node_count = scanned.nodeCount(),
         .limit_peaks = if (options.limit_diagnostic) |sink| sink.peaks else .{},
         .workspace_space = workspaceSpace(
             output_path,
-            scanned.content_bytes,
+            scanned.contentBytes(),
             source.virtual_size,
             options.output_format,
             options.output_compression,
@@ -571,13 +595,10 @@ pub fn rebuild(
         .{ .offset = partition.offset },
     );
     defer reader.deinit();
-    var scanned = try ext4.scanWriterCompatible(
-        &reader,
-        io,
-        allocator,
-        strictScanOptions(options, partition.length),
-    );
+    var scanned = try ScannedSource.scan(&reader, io, allocator, options, partition.length);
     defer scanned.deinit();
+    const scanned_label = scanned.label();
+    const scanned_timestamp = scanned.globalTimestamp(options.source_date_epoch);
 
     try preflightReadOnlyDependencies(
         io,
@@ -618,7 +639,7 @@ pub fn rebuild(
     // however long it takes to copy most of a root filesystem into it.
     const workspace = workspaceSpace(
         output_path,
-        scanned.content_bytes,
+        scanned.contentBytes(),
         virtual_size,
         options.output_format,
         options.output_compression,
@@ -630,7 +651,7 @@ pub fn rebuild(
     var tree = try root_tree.RootTree.init(allocator, io, spool_path, options.limits.tree());
     tree.diagnostic = options.limit_diagnostic;
     defer tree.deinit();
-    try tree.importExt4View(scanned.fileTreeView());
+    try scanned.importInto(&tree);
     const imported_node_count = tree.nodeCount();
     if (imported_node_count != scanned.nodeCount()) return error.ImportedNodeCountMismatch;
     const source_manifest = try tree.manifestDigest();
@@ -669,14 +690,13 @@ pub fn rebuild(
     source_open = false;
 
     try zeroFileRange(io, raw.file, partition.offset, partition.length);
-    _ = try ext4.populate(io, raw.file, allocator, final_view, .{
-        .offset = partition.offset,
-        .length = scanned.identity.filesystem_length,
-        .block_size = scanned.identity.block_size,
-        .label = &scanned.identity.label,
-        .uuid = scanned.identity.uuid,
-        .timestamp = scanned.identity.global_timestamp,
-    });
+    _ = try ext4.populate(
+        io,
+        raw.file,
+        allocator,
+        final_view,
+        populateOptions(&tree, partition.offset, &scanned, &scanned_label, scanned_timestamp),
+    );
     const raw_inode = (try raw.file.stat(io)).inode;
     raw.close(io);
     raw_open = false;
@@ -707,12 +727,13 @@ pub fn rebuild(
         .partition_offset = partition.offset,
         .partition_length = partition.length,
         .flattened_backing_chain = flattened,
-        .strict_profile = scanned.identity.profile,
-        .ext4_uuid = scanned.identity.uuid,
-        .ext4_label = scanned.identity.label,
-        .ext4_block_size = scanned.identity.block_size,
-        .filesystem_length = scanned.identity.filesystem_length,
-        .ext4_global_timestamp = scanned.identity.global_timestamp,
+        .source_profile = scanned.profile(),
+        .source_reproducible = scanned.profile().isByteReproducible(),
+        .ext4_uuid = scanned.uuid(),
+        .ext4_label = scanned_label,
+        .ext4_block_size = scanned.blockSize(),
+        .filesystem_length = scanned.filesystemLength(),
+        .ext4_global_timestamp = scanned_timestamp,
         .source_manifest_sha256 = source_manifest,
         .final_manifest_sha256 = final_manifest,
         .imported_node_count = imported_node_count,
@@ -896,6 +917,165 @@ fn workspaceRequirement(
         .available_bytes = available_bytes,
     };
 }
+
+/// The root directory has no entry in the tree view, so its own metadata has
+/// to travel beside the view rather than through it.
+fn populateOptions(
+    tree: *root_tree.RootTree,
+    offset: u64,
+    scanned: *const ScannedSource,
+    label: *const [16]u8,
+    timestamp: u32,
+) ext4.PopulateOptions {
+    const root = tree.rootMetadata();
+    return .{
+        .offset = offset,
+        .length = scanned.filesystemLength(),
+        .block_size = scanned.blockSize(),
+        .label = label,
+        .uuid = scanned.uuid(),
+        .timestamp = timestamp,
+        .root_mode = root.mode,
+        .root_uid = root.uid,
+        .root_gid = root.gid,
+        .root_atime = root.atime,
+        .root_mtime = root.mtime,
+        .root_ctime = root.ctime,
+    };
+}
+
+fn generalScanOptions(options: RebuildOptions, partition_length: u64) ext4.GeneralScanOptions {
+    return .{
+        .available_length = partition_length,
+        .max_nodes = options.limits.max_nodes,
+        .max_path_bytes = options.limits.max_path_bytes,
+        .max_component_bytes = options.limits.max_component_bytes,
+        .max_file_bytes = options.limits.max_file_bytes,
+        .max_total_bytes = options.limits.max_total_bytes,
+        .max_xattrs_per_node = options.limits.max_xattrs_per_node,
+        .max_xattr_bytes_per_node = options.limits.max_xattr_bytes_per_node,
+        .max_scan_metadata_bytes = options.limits.max_scan_metadata_bytes,
+        .diagnostic = options.limit_diagnostic,
+    };
+}
+
+/// One handle over both importers, so the rebuild pipeline downstream of the
+/// scan does not have to be written twice and cannot drift between profiles.
+const ScannedSource = union(enum) {
+    strict: ext4.StrictTree,
+    general: ext4.GeneralTree,
+
+    fn scan(
+        reader: *ext4.Reader,
+        io: Io,
+        allocator: Allocator,
+        options: RebuildOptions,
+        partition_length: u64,
+    ) !ScannedSource {
+        return switch (options.source_profile) {
+            .strict => .{ .strict = try ext4.scanWriterCompatible(
+                reader,
+                io,
+                allocator,
+                strictScanOptions(options, partition_length),
+            ) },
+            .general => .{ .general = try ext4.scanReadable(
+                reader,
+                io,
+                allocator,
+                generalScanOptions(options, partition_length),
+            ) },
+        };
+    }
+
+    fn deinit(self: *ScannedSource) void {
+        switch (self.*) {
+            .strict => |*tree| tree.deinit(),
+            .general => |*tree| tree.deinit(),
+        }
+    }
+
+    fn profile(self: *const ScannedSource) ext4.SourceProfile {
+        return switch (self.*) {
+            .strict => .zvmi_ext4_v1,
+            .general => .ext4_general_v1,
+        };
+    }
+
+    fn uuid(self: *const ScannedSource) [16]u8 {
+        return switch (self.*) {
+            .strict => |tree| tree.identity.uuid,
+            .general => |tree| tree.identity.uuid,
+        };
+    }
+
+    fn label(self: *const ScannedSource) [16]u8 {
+        return switch (self.*) {
+            .strict => |tree| tree.identity.label,
+            .general => |tree| tree.identity.label,
+        };
+    }
+
+    fn blockSize(self: *const ScannedSource) u32 {
+        return switch (self.*) {
+            .strict => |tree| tree.identity.block_size,
+            .general => |tree| tree.identity.block_size,
+        };
+    }
+
+    fn filesystemLength(self: *const ScannedSource) u64 {
+        return switch (self.*) {
+            .strict => |tree| tree.identity.filesystem_length,
+            .general => |tree| tree.identity.filesystem_length,
+        };
+    }
+
+    /// A general source carries a distinct timestamp per inode, so there is
+    /// no single source value to preserve; the caller's `source_date_epoch`
+    /// is used instead, which is the same input every other reproducible
+    /// output in this project is pinned to.
+    fn globalTimestamp(self: *const ScannedSource, source_date_epoch: u64) u32 {
+        return switch (self.*) {
+            .strict => |tree| tree.identity.global_timestamp,
+            .general => std.math.cast(u32, source_date_epoch) orelse std.math.maxInt(u32),
+        };
+    }
+
+    fn nodeCount(self: *const ScannedSource) usize {
+        return switch (self.*) {
+            .strict => |tree| tree.nodeCount(),
+            .general => |tree| tree.nodeCount(),
+        };
+    }
+
+    fn contentBytes(self: *const ScannedSource) u64 {
+        return switch (self.*) {
+            .strict => |tree| tree.content_bytes,
+            .general => |tree| tree.content_bytes,
+        };
+    }
+
+    fn fileTreeView(self: *ScannedSource) *ext4.FileTreeView {
+        return switch (self.*) {
+            .strict => |*tree| tree.fileTreeView(),
+            .general => |*tree| tree.fileTreeView(),
+        };
+    }
+
+    fn importInto(self: *ScannedSource, tree: *root_tree.RootTree) !void {
+        switch (self.*) {
+            .strict => |*scanned| try tree.importExt4View(scanned.fileTreeView()),
+            .general => |*scanned| try tree.importExt4General(scanned),
+        }
+    }
+
+    fn importBorrowedInto(self: *ScannedSource, tree: *root_tree.RootTree) !void {
+        switch (self.*) {
+            .strict => |*scanned| try tree.importExt4ViewBorrowed(scanned.fileTreeView()),
+            .general => |*scanned| try tree.importExt4GeneralBorrowed(scanned),
+        }
+    }
+};
 
 fn strictScanOptions(options: RebuildOptions, partition_length: u64) ext4.StrictScanOptions {
     return .{
@@ -1891,7 +2071,8 @@ test "rebuild inspection validates source without creating artifacts" {
         @as(u64, test_partition_sectors) * mbr.sector_size,
         inspection.partition_length,
     );
-    try std.testing.expectEqual(ext4.StrictProfile.zvmi_ext4_v1, inspection.strict_profile);
+    try std.testing.expectEqual(ext4.SourceProfile.zvmi_ext4_v1, inspection.source_profile);
+    try std.testing.expect(inspection.source_reproducible);
     try std.testing.expectEqualSlices(u8, &([_]u8{0x42} ** 16), &inspection.ext4_uuid);
     try std.testing.expectEqual(@as(u32, 1_735_689_600), inspection.ext4_global_timestamp);
     try std.testing.expectEqual(@as(usize, 8), inspection.imported_node_count);
@@ -2078,7 +2259,8 @@ test "strict raw rebuild preserves identity tree metadata and outside bytes dete
     second_options.output_path = output2_path;
     const second_report = try rebuild(std.testing.allocator, io, second_options);
 
-    try std.testing.expectEqual(ext4.StrictProfile.zvmi_ext4_v1, report.strict_profile);
+    try std.testing.expectEqual(ext4.SourceProfile.zvmi_ext4_v1, report.source_profile);
+    try std.testing.expect(report.source_reproducible);
     try std.testing.expectEqual(@as(u32, 1_735_689_600), report.ext4_global_timestamp);
     try std.testing.expectEqualSlices(u8, &([_]u8{0x42} ** 16), &report.ext4_uuid);
     try std.testing.expectEqualSlices(
@@ -3022,4 +3204,259 @@ test "an unmeasurable workspace saturates instead of wrapping" {
 
     try std.testing.expectEqual(std.math.maxInt(u64), space.required_bytes);
     try std.testing.expect(!space.isSufficient());
+}
+
+// ---------------------------------------------------------------------------
+// General-profile rebuild
+//
+// The source here is built by `mke2fs` with its own ext4 defaults, so it
+// carries the exact feature set the strict importer exists to refuse. That is
+// the only way to prove the general path end to end: a fixture this project
+// wrote would prove nothing, because the strict path already accepts it.
+// ---------------------------------------------------------------------------
+
+const general_fixture_source = "test-preserved-general-src";
+const general_fixture_image = "test-preserved-general.img";
+const general_fixture_blocks: u64 = @as(u64, test_partition_sectors) * mbr.sector_size / 4096;
+
+fn runGeneralFixtureTool(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    args: []const []const u8,
+) !void {
+    // e2fsprogs installs into `sbin`, which an unprivileged `PATH` often omits.
+    const prefixes = [_][]const u8{ "", "/sbin/", "/usr/sbin/" };
+    for (prefixes) |prefix| {
+        const binary = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, name });
+        defer allocator.free(binary);
+        const argv = try allocator.alloc([]const u8, args.len + 1);
+        defer allocator.free(argv);
+        argv[0] = binary;
+        @memcpy(argv[1..], args);
+        const result = std.process.run(allocator, std.testing.io, .{
+            .argv = argv,
+            .cwd = .{ .path = "." },
+        }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        switch (result.term) {
+            .exited => |code| if (code != 0) {
+                std.debug.print("{s} failed (exit {d}):\n{s}\n{s}\n", .{
+                    name,
+                    code,
+                    result.stdout,
+                    result.stderr,
+                });
+                return error.ExternalToolFailed;
+            },
+            else => return error.ExternalToolFailed,
+        }
+        return;
+    }
+    // Without e2fsprogs there is no honest way to run this; declining beats
+    // passing on a filesystem this project wrote itself.
+    return error.SkipZigTest;
+}
+
+fn writeGeneralFixtureFile(io: Io, path: []const u8, bytes: []const u8) !void {
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, 0);
+}
+
+fn createGeneralTestDisk(allocator: std.mem.Allocator, io: Io, path: []const u8) !void {
+    const cwd = Io.Dir.cwd();
+    cwd.deleteTree(io, general_fixture_source) catch {};
+    cwd.deleteFile(io, general_fixture_image) catch {};
+    defer cwd.deleteTree(io, general_fixture_source) catch {};
+    defer cwd.deleteFile(io, general_fixture_image) catch {};
+
+    try cwd.createDirPath(io, general_fixture_source ++ "/etc");
+    try cwd.createDirPath(io, general_fixture_source ++ "/usr/bin");
+    try cwd.createDirPath(io, general_fixture_source ++ "/dev");
+    try writeGeneralFixtureFile(io, general_fixture_source ++ "/etc/hostname", "general-root\n");
+    try writeGeneralFixtureFile(io, general_fixture_source ++ "/usr/bin/tool", "tool\n");
+    try cwd.hardLink(
+        general_fixture_source ++ "/usr/bin/tool",
+        cwd,
+        general_fixture_source ++ "/usr/bin/tool-alias",
+        io,
+        .{},
+    );
+    try cwd.symLink(io, "../usr/bin/tool", general_fixture_source ++ "/etc/tool-link", .{});
+
+    var size_text: [32]u8 = undefined;
+    try runGeneralFixtureTool(allocator, "mke2fs", &.{
+        "-q",
+        "-t",
+        "ext4",
+        "-b",
+        "4096",
+        "-I",
+        "256",
+        "-d",
+        general_fixture_source,
+        general_fixture_image,
+        try std.fmt.bufPrint(&size_text, "{d}", .{general_fixture_blocks}),
+    });
+
+    const script_path = "test-preserved-general-debugfs.txt";
+    defer cwd.deleteFile(io, script_path) catch {};
+    try writeGeneralFixtureFile(io, script_path,
+        \\sif / mode 040755
+        \\sif / uid 0
+        \\sif / gid 0
+        \\cd /dev
+        \\mknod console c 5 1
+        \\mknod initctl p
+        \\sif /dev/console mode 020600
+        \\sif /dev/initctl mode 010600
+        \\sif /etc/hostname mode 0100640
+        \\sif /etc/hostname uid 1234
+        \\sif /etc/hostname gid 5678
+        \\sif /etc/hostname mtime @1400000000
+        \\ea_set /etc/hostname security.selinux system_u:object_r:etc_t:s0
+        \\quit
+        \\
+    );
+    try runGeneralFixtureTool(allocator, "debugfs", &.{
+        "-w",
+        "-f",
+        script_path,
+        general_fixture_image,
+    });
+
+    var image = try Image.createExclusive(io, path, .raw, test_disk_size, .{});
+    defer image.close(io);
+    const boot_record = mbr.singleLinuxPartitionMbr(test_partition_first_lba, test_partition_sectors);
+    const encoded_mbr = boot_record.encode();
+    try image.pwrite(io, &encoded_mbr, 0);
+
+    const fixture = try cwd.openFile(io, general_fixture_image, .{});
+    defer fixture.close(io);
+    const buffer = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(buffer);
+    var offset: u64 = 0;
+    const total = @as(u64, test_partition_sectors) * mbr.sector_size;
+    while (offset < total) {
+        const wanted: usize = @intCast(@min(@as(u64, buffer.len), total - offset));
+        const got = try fixture.readPositionalAll(io, buffer[0..wanted], offset);
+        if (got == 0) return error.UnexpectedEndOfFile;
+        try image.pwrite(io, buffer[0..got], (@as(u64, test_partition_first_lba) * mbr.sector_size) + offset);
+        offset += got;
+    }
+}
+
+test "general rebuild imports a stock mke2fs source and preserves its metadata" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const source_path = "test-preserved-general-source.raw";
+    const output_path = "test-preserved-general-output.raw";
+    const artifacts = [_][]const u8{
+        source_path,
+        output_path,
+        output_path ++ ".native-rebuild.raw",
+        output_path ++ ".native-rebuild.output",
+        output_path ++ ".native-rebuild.spool",
+    };
+    defer for (artifacts) |artifact| Io.Dir.cwd().deleteFile(io, artifact) catch {};
+    createGeneralTestDisk(allocator, io, source_path) catch |err| switch (err) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const strict_options = RebuildOptions{
+        .source_path = source_path,
+        .output_path = output_path,
+        .expected_source_format = .raw,
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 1 },
+        .source_date_epoch = 1_735_689_600,
+        .expected_virtual_size = test_disk_size,
+    };
+    // The default profile must keep refusing exactly what it always refused.
+    // Which of its guards fires first is incidental -- a stock filesystem
+    // violates several of them at once -- so only the refusal is asserted.
+    if (rebuild(allocator, io, strict_options)) |_| {
+        return error.StrictProfileAcceptedForeignSource;
+    } else |err| switch (err) {
+        error.DivergentSuperblockTimestamp,
+        error.UnsupportedInodeSize,
+        error.UnsupportedFeatures,
+        => {},
+        else => return err,
+    }
+    try expectRebuildArtifactsMissing(io, output_path);
+
+    var general_options = strict_options;
+    general_options.source_profile = .general;
+    const report = try rebuild(allocator, io, general_options);
+    try std.testing.expectEqual(ext4.SourceProfile.ext4_general_v1, report.source_profile);
+    try std.testing.expect(!report.source_reproducible);
+
+    var output = try Image.openPath(io, output_path);
+    defer output.close(io);
+    var reader = try ext4.openGeneral(io, output.file, allocator, .{
+        .offset = @as(u64, test_partition_first_lba) * mbr.sector_size,
+    });
+    defer reader.deinit();
+    var tree = try ext4.scanReadable(&reader, io, allocator, .{
+        .available_length = @as(u64, test_partition_sectors) * mbr.sector_size,
+    });
+    defer tree.deinit();
+
+    var saw_hardlink = false;
+    var saw_device = false;
+    var saw_fifo = false;
+    var saw_symlink = false;
+    var saw_hostname = false;
+    var index: usize = 0;
+    while (index < tree.nodeCount()) : (index += 1) {
+        const entry = tree.entryAt(index);
+        if (std.mem.eql(u8, entry.path, "usr/bin/tool-alias")) {
+            saw_hardlink = true;
+            try std.testing.expectEqual(ext4.GeneralKind.hardlink, entry.kind);
+            try std.testing.expectEqualStrings("usr/bin/tool", entry.hardlink_target);
+        }
+        if (std.mem.eql(u8, entry.path, "dev/console")) {
+            saw_device = true;
+            try std.testing.expectEqual(ext4.GeneralKind.char_device, entry.kind);
+            try std.testing.expectEqual(@as(u32, 5), entry.device.major);
+            try std.testing.expectEqual(@as(u32, 1), entry.device.minor);
+            try std.testing.expectEqual(@as(u16, 0o600), entry.mode);
+        }
+        if (std.mem.eql(u8, entry.path, "dev/initctl")) {
+            saw_fifo = true;
+            try std.testing.expectEqual(ext4.GeneralKind.fifo, entry.kind);
+        }
+        if (std.mem.eql(u8, entry.path, "etc/tool-link")) {
+            saw_symlink = true;
+            try std.testing.expectEqual(ext4.GeneralKind.symlink, entry.kind);
+        }
+        if (std.mem.eql(u8, entry.path, "etc/hostname")) {
+            saw_hostname = true;
+            try std.testing.expectEqual(@as(u16, 0o640), entry.mode);
+            try std.testing.expectEqual(@as(u32, 1234), entry.uid);
+            try std.testing.expectEqual(@as(u32, 5678), entry.gid);
+            try std.testing.expectEqual(@as(i64, 1_400_000_000), entry.mtime);
+            var found = false;
+            for (entry.xattrs) |xattr| {
+                if (!std.mem.eql(u8, xattr.name, "security.selinux")) continue;
+                try std.testing.expectEqualStrings(
+                    "system_u:object_r:etc_t:s0",
+                    xattr.value,
+                );
+                found = true;
+            }
+            try std.testing.expect(found);
+        }
+    }
+    try std.testing.expect(saw_hardlink);
+    try std.testing.expect(saw_device);
+    try std.testing.expect(saw_fifo);
+    try std.testing.expect(saw_symlink);
+    try std.testing.expect(saw_hostname);
 }

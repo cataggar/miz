@@ -167,7 +167,7 @@ ordered by how much they can do, which is the same order as how much they need.
 | Backend | Privileges | Runs guest code | Architectures | Can do |
 | --- | --- | --- | --- | --- |
 | `native_edit` | none | no | any | overwrite, remove existing paths |
-| `rebuild` | none | no | any | full tree rebuild of one `zvmi_ext4_v1` partition |
+| `rebuild` | none | no | any | full tree rebuild of one ext4 partition |
 | `native_fresh` | none | no | any | build a new image rather than edit one |
 | `unsafe_chroot` | root + `CAP_SYS_CHROOT`/`CAP_SYS_ADMIN`/`CAP_MKNOD` | yes, on the host kernel | host's only | install/remove packages, regenerate initramfs |
 | `vm` | none | yes, in an isolated guest | any | install/remove packages, regenerate initramfs, cross-architecture |
@@ -197,6 +197,87 @@ virtio-scsi controller with no SCSI disk driver behind it presents no `/dev/sda`
 
 A built-in driver is never traded for a loadable one, so an image whose kernel
 builds everything in boots exactly as it did before, with an empty module list.
+
+#### Which ext4 sources `rebuild` accepts
+
+The `rebuild` backend reads a filesystem's whole tree and writes a new one, so
+it has to understand the source. It offers two profiles, selected by
+`source_profile` on the `std.Build` helper, in the preserved-image
+configuration JSON, and on `preserved_image.RebuildOptions`.
+
+| Profile | Accepts | Reproducible |
+| --- | --- | --- |
+| `strict` (default) | only `zvmi_ext4_v1`, the exact layout this project's writer emits | yes, byte for byte |
+| `general` | any ext4 the general reader accepts, including a stock distro root | no |
+
+`strict` requires 128-byte inodes, 32-byte group descriptors and exactly the
+`filetype`+`extents` incompatible feature set: no journal, no `64bit`, no
+`flex_bg`. That is deliberate rather than incidental. It is the promise that
+rebuilding the same source twice, on any host, produces the same bytes.
+
+No filesystem a distro installer produced can satisfy it. `mke2fs` defaults --
+Ubuntu 24.04, Debian 12, Azure Linux -- give you 256-byte inodes plus
+`has_journal`, `64bit`, `flex_bg`, `metadata_csum`, `metadata_csum_seed`,
+`orphan_file`, `dir_nlink`, `extra_isize` and `huge_file`. `general` exists for
+exactly those, and reports itself as `ext4_general_v1` with
+`source_reproducible = false` in the rebuild report and in provenance. It is
+opt-in because giving up reproducibility should be a decision, not a fallback.
+
+`general` preserves every metadata dimension the source carries:
+
+- regular files, directories, and symlinks, both the fast form stored inside
+  `i_block` and the slow form with its own data blocks
+- hardlinks: a regular file reached by several names is imported once and
+  re-linked, not copied, so shared identity survives `rsync -H`, package
+  managers and anything else that compares inode numbers
+- block devices, character devices and FIFOs, including device numbers wider
+  than the legacy 8:8 encoding
+- `mode`, `uid`, `gid`, and `atime`/`mtime`/`ctime` per inode
+- extended attributes, both inline in a 256-byte inode's spare space and in an
+  external xattr block; this is what carries `security.selinux` and
+  `system.posix_acl_access`/`system.posix_acl_default`, so dropping them would
+  silently break MAC policy and ACLs
+
+Two limits are inherent to the writer rather than the importer. Output inodes
+are 128 bytes, so a timestamp outside 1970..2106 has nowhere to go and is
+refused with `TimestampOutOfRange` rather than wrapped into a plausible-looking
+wrong date. And the journal is never replayed: a source must be cleanly
+unmounted, and a superblock still marked as needing recovery or carrying orphan
+inodes is a hard error rather than a filesystem imported halfway.
+
+Everything outside the supported set is refused by name, because a partial
+import produces an image that looks fine and is subtly wrong:
+
+| Feature | Error |
+| --- | --- |
+| `bigalloc` | `UnsupportedBigallocFeature` |
+| `inline_data` | `UnsupportedInlineDataFeature` |
+| `casefold` | `UnsupportedCasefoldFeature` |
+| `encrypt` | `UnsupportedEncryptFeature` |
+| `verity` | `UnsupportedVerityFeature` |
+| `mmp` | `UnsupportedMmpFeature` |
+| `fast_commit` | `UnsupportedFastCommitFeature` |
+| `quota` | `UnsupportedQuotaFeature` |
+| `project` | `UnsupportedProjectFeature` |
+| `compression` | `UnsupportedCompressionFeature` |
+| `meta_bg` | `UnsupportedMetaBlockGroupFeature` |
+| external journal | `UnsupportedExternalJournalFeature` |
+| `ea_inode` | `UnsupportedXattrInodeFeature` |
+| `large_dir` | `UnsupportedLargeDirFeature` |
+| `dirdata` | `UnsupportedDirdataFeature` |
+| `snapshot` | `UnsupportedSnapshotFeature` |
+| `replica` | `UnsupportedReplicaFeature` |
+| `shared_blocks` | `UnsupportedSharedBlocksFeature` |
+| `sparse_super2` | `UnsupportedSparseSuper2Feature` |
+| `stable_inodes` | `UnsupportedStableInodesFeature` |
+| needs journal recovery | `SourceNeedsJournalRecovery` |
+| orphan inodes pending | `SourceHasOrphanInodes` |
+| not cleanly unmounted | `SourceNotCleanlyUnmounted` |
+| missing `extents` or `filetype` | `MissingExtentsFeature`, `MissingFiletypeFeature` |
+| anything else unrecognized | `UnsupportedFilesystemFeature` |
+
+Unix domain sockets are refused with `UnsupportedSocketInode`: a socket inode
+in an image is meaningless, since the bound socket died with the process.
 
 | Image kernel provides | Result |
 | --- | --- |
@@ -237,7 +318,7 @@ Each limit is raisable on its own, and none is library-only.
 | `--max-spool-bytes` | spool file holding the imported content | 128G |
 | `--max-xattrs-per-node` | extended attributes on one inode | 256 |
 | `--max-xattr-bytes-per-node` | extended attribute bytes on one inode | 1M |
-| `--max-scan-metadata-bytes` | metadata a strict source scan may hold | 256M |
+| `--max-scan-metadata-bytes` | metadata a source scan may hold | 256M |
 | `--max-source-file-bytes` | largest host file an operation may read in | 1G |
 
 Values accept the same binary suffixes as `--size` (`4M` is 4194304), which is

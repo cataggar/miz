@@ -439,6 +439,14 @@ pub const RootTree = struct {
             };
             switch (entry.kind) {
                 .directory => try self.putDirectory(entry.path, metadata),
+                .fifo => try self.putFifo(entry.path, metadata),
+                .block_device, .char_device => try self.putDevice(
+                    entry.path,
+                    if (entry.kind == .block_device) .block_device else .char_device,
+                    .{ .major = entry.device.major, .minor = entry.device.minor },
+                    metadata,
+                ),
+                .hardlink => try self.putHardlink(entry.path, entry.hardlink_target, metadata),
                 .file => {
                     const content = entry.content orelse if (entry.size == 0)
                         emptyContentReader()
@@ -479,6 +487,97 @@ pub const RootTree = struct {
                             metadata,
                         );
                     }
+                },
+            }
+        }
+    }
+
+    /// Imports a tree produced by the general ext4 importer. `FileTreeView`
+    /// cannot carry timestamps, device numbers or hardlink targets, so the
+    /// general tree is consumed directly rather than being squeezed through
+    /// that interface and losing exactly the fidelity it exists to preserve.
+    pub fn importExt4General(self: *RootTree, source: *ext4.GeneralTree) !void {
+        try self.importExt4GeneralMode(source, .owned);
+    }
+
+    /// Imports paths and metadata while retaining read-only content readers
+    /// owned by `source`, which must outlive this tree.
+    pub fn importExt4GeneralBorrowed(self: *RootTree, source: *ext4.GeneralTree) !void {
+        if (self.storage != .memory) return error.BorrowedImportRequiresMemoryTree;
+        try self.importExt4GeneralMode(source, .borrowed);
+    }
+
+    fn importExt4GeneralMode(
+        self: *RootTree,
+        source: *ext4.GeneralTree,
+        mode: enum { owned, borrowed },
+    ) !void {
+        self.setRootMetadata(.{
+            .mode = source.root.mode,
+            .uid = source.root.uid,
+            .gid = source.root.gid,
+            .atime = source.root.atime,
+            .mtime = source.root.mtime,
+            .ctime = source.root.ctime,
+        });
+
+        var index: usize = 0;
+        while (index < source.nodeCount()) : (index += 1) {
+            const entry = source.entryAt(index);
+            const metadata = Metadata{
+                .mode = entry.mode,
+                .uid = entry.uid,
+                .gid = entry.gid,
+                .atime = entry.atime,
+                .mtime = entry.mtime,
+                .ctime = entry.ctime,
+                .xattrs = entry.xattrs,
+            };
+            switch (entry.kind) {
+                .directory => try self.putDirectory(entry.path, metadata),
+                .fifo => try self.putFifo(entry.path, metadata),
+                .block_device => try self.putDevice(entry.path, .block_device, .{
+                    .major = entry.device.major,
+                    .minor = entry.device.minor,
+                }, metadata),
+                .char_device => try self.putDevice(entry.path, .char_device, .{
+                    .major = entry.device.major,
+                    .minor = entry.device.minor,
+                }, metadata),
+                // The scanner always emits the content-bearing name before any
+                // further link to it, so the target is already present.
+                .hardlink => try self.putHardlink(entry.path, entry.hardlink_target, metadata),
+                .file, .symlink => {
+                    const kind: Kind = if (entry.kind == .file) .file else .symlink;
+                    const content = entry.content orelse if (entry.size == 0)
+                        emptyContentReader()
+                    else
+                        return error.MissingContent;
+                    if (mode == .borrowed) {
+                        try self.putBorrowedContent(
+                            entry.path,
+                            kind,
+                            entry.size,
+                            content,
+                            metadata,
+                        );
+                        continue;
+                    }
+                    if (kind == .file) {
+                        try self.putFileReader(entry.path, entry.size, content, metadata);
+                        continue;
+                    }
+                    try self.checkFileBytes(entry.size);
+                    try validatePath(entry.path, self.limits, self.diagnostic);
+                    const old_spool_len = self.spool_len;
+                    const owned = self.spoolContent(entry.size, content) catch |err| {
+                        try self.rollbackSpool(old_spool_len);
+                        return err;
+                    };
+                    self.putNode(entry.path, .symlink, metadata, .{ .content = owned }) catch |err| {
+                        try self.rollbackSpool(old_spool_len);
+                        return err;
+                    };
                 },
             }
         }
@@ -898,27 +997,28 @@ pub const RootTree = struct {
 
     fn sortAndValidate(self: *RootTree) !void {
         try self.sortAndValidateRepresentable();
-        if (self.root_metadata.mode != 0o755 or
-            self.root_metadata.uid != 0 or
-            self.root_metadata.gid != 0)
-        {
-            return error.Ext4RootMetadataUnsupported;
-        }
-        if (self.root_metadata.atime != null or
-            self.root_metadata.mtime != null or
-            self.root_metadata.ctime != null)
-        {
-            return error.Ext4TimestampsUnsupported;
-        }
+        // Only the permission and setuid/setgid/sticky bits are the tree's to
+        // choose; the file-type bits come from the kind, and a mode carrying
+        // them would silently turn the root into something else.
+        if (self.root_metadata.mode > 0o7777) return error.Ext4RootMetadataUnsupported;
+        try validateExt4Time(self.root_metadata.atime);
+        try validateExt4Time(self.root_metadata.mtime);
+        try validateExt4Time(self.root_metadata.ctime);
         for (self.nodes.items) |node| {
-            if (node.metadata.atime != null or node.metadata.mtime != null or node.metadata.ctime != null) {
-                return error.Ext4TimestampsUnsupported;
-            }
-            switch (node.kind) {
-                .directory, .file, .symlink => {},
-                .hardlink => return error.Ext4HardlinksUnsupported,
-                .block_device, .char_device, .fifo => return error.Ext4SpecialFilesUnsupported,
-            }
+            if (node.metadata.mode > 0o7777) return error.Ext4ModeUnsupported;
+            try validateExt4Time(node.metadata.atime);
+            try validateExt4Time(node.metadata.mtime);
+            try validateExt4Time(node.metadata.ctime);
+        }
+    }
+
+    /// A 128-byte inode stores each time in a bare 32-bit field, so anything
+    /// before 1970 or after 2106 has nowhere to go. Refusing is the only
+    /// honest option: a wrapped value looks like a perfectly ordinary date.
+    fn validateExt4Time(value: ?i64) !void {
+        const seconds = value orelse return;
+        if (seconds < 0 or seconds > std.math.maxInt(u32)) {
+            return error.Ext4TimestampsUnsupported;
         }
     }
 
@@ -1054,20 +1154,35 @@ pub const RootTree = struct {
             .directory => .directory,
             .file => .file,
             .symlink => .symlink,
-            else => return error.EnumerationFailed,
+            .hardlink => .hardlink,
+            .block_device => .block_device,
+            .char_device => .char_device,
+            .fifo => .fifo,
         };
+        const carries_content = kind == .file or kind == .symlink;
         return .{
             .path = node.path,
             .kind = kind,
             .mode = node.metadata.mode,
             .uid = node.metadata.uid,
             .gid = node.metadata.gid,
-            .size = node.size(),
-            .content = if (kind == .directory) null else .{
+            .size = if (carries_content) node.size() else 0,
+            .content = if (carries_content) .{
                 .ctx = &node.payload.content,
                 .read_at_fn = readExt4Content,
-            },
+            } else null,
             .xattrs = node.metadata.xattrs,
+            .device = switch (node.payload) {
+                .device => |device| .{ .major = device.major, .minor = device.minor },
+                else => .{},
+            },
+            .hardlink_target = switch (node.payload) {
+                .hardlink_target => |target| target,
+                else => "",
+            },
+            .atime = node.metadata.atime,
+            .mtime = node.metadata.mtime,
+            .ctime = node.metadata.ctime,
         };
     }
 
@@ -1359,14 +1474,33 @@ test "owned tree populates ext4 with metadata xattrs and symlinks" {
     try std.testing.expectEqualStrings("etc/hostname", target);
 }
 
-test "owned tree rejects unsupported ext4 node kinds explicitly" {
+test "owned tree offers special files and hardlinks to the ext4 writer" {
     const io = std.testing.io;
     const spool_path = "test-root-tree-special.spool";
     defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
     var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
     defer tree.deinit();
+    try tree.putDirectory("dev", .{ .mode = 0o755 });
     try tree.putDevice("dev/console", .char_device, .{ .major = 5, .minor = 1 }, .{ .mode = 0o600 });
-    try std.testing.expectError(error.Ext4SpecialFilesUnsupported, tree.ext4View());
+    try tree.putFileBytes("tool", "x", .{ .mode = 0o755 });
+    try tree.putHardlink("tool-alias", "tool", .{ .mode = 0o755 });
+
+    const view = try tree.ext4View();
+    var saw_device = false;
+    var saw_hardlink = false;
+    while (try view.next()) |entry| {
+        if (entry.kind == .char_device) {
+            saw_device = true;
+            try std.testing.expectEqual(@as(u32, 5), entry.device.major);
+            try std.testing.expectEqual(@as(u32, 1), entry.device.minor);
+        }
+        if (entry.kind == .hardlink) {
+            saw_hardlink = true;
+            try std.testing.expectEqualStrings("tool", entry.hardlink_target);
+        }
+    }
+    try std.testing.expect(saw_device);
+    try std.testing.expect(saw_hardlink);
 }
 
 test "borrowed node paths are safe overlay and removal inputs" {
@@ -1508,12 +1642,17 @@ test "root timestamps affect manifests and unsupported ext4 metadata is explicit
     tree.setRootMetadata(.{ .atime = 1 });
     const timestamped = try tree.manifestDigest();
     try std.testing.expect(!std.mem.eql(u8, &original, &timestamped));
-    try std.testing.expectError(error.Ext4TimestampsUnsupported, tree.ext4View());
+    _ = try tree.ext4View();
 
-    tree.setRootMetadata(.{});
     try tree.putFileBytes("value", "x", .{ .mode = 0o644, .mtime = 1 });
+    _ = try tree.ext4View();
+
+    // Nothing outside 1970..2106 fits a 128-byte inode's time fields.
+    tree.setRootMetadata(.{ .atime = -1 });
     try std.testing.expectError(error.Ext4TimestampsUnsupported, tree.ext4View());
-    tree.setRootMetadata(.{ .mode = 0o700 });
+    tree.setRootMetadata(.{ .atime = @as(i64, std.math.maxInt(u32)) + 1 });
+    try std.testing.expectError(error.Ext4TimestampsUnsupported, tree.ext4View());
+    tree.setRootMetadata(.{ .mode = 0o40755 });
     try std.testing.expectError(error.Ext4RootMetadataUnsupported, tree.ext4View());
 }
 

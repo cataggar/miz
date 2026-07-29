@@ -225,6 +225,7 @@ pub const PreservedVmNetworkPolicy = preserved_image_wire.VmNetworkPolicy;
 pub const PreservedVmFirmware = preserved_image_wire.VmFirmware;
 pub const PreservedVmBoot = preserved_image_wire.VmBoot;
 pub const PreservedVmPolicy = preserved_image_wire.VmConfiguration;
+pub const PreservedSourceProfile = preserved_image_wire.SourceProfile;
 
 pub const PreservedOptions = struct {
     name: []const u8,
@@ -247,6 +248,10 @@ pub const PreservedOptions = struct {
     /// Required by, and only meaningful to, the `vm` backend.
     vm: ?PreservedVmPolicy = null,
     limits: ImportLimits = .{},
+    /// Which ext4 sources the `rebuild` backend accepts. `general` gives up
+    /// the byte-for-byte reproducibility claim in exchange for being able to
+    /// import a filesystem a distro installer produced.
+    source_profile: PreservedSourceProfile = .strict,
     verbose: bool = false,
 };
 
@@ -528,6 +533,7 @@ fn materializePreservedConfiguration(
             .gpt_index => |index| .{ .gpt_index = index },
             .mbr_index => |index| .{ .mbr_index = index },
         },
+        .source_profile = options.source_profile,
         .operations = operations,
         .customization = .{
             .os = .{

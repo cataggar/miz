@@ -16,6 +16,14 @@ pub const PartitionSelector = union(enum) {
     mbr_index: u8,
 };
 
+/// Which ext4 sources the `rebuild` backend will import. Defaulted to
+/// `strict`, so a configuration written before this existed keeps the only
+/// profile that underwrites a byte-for-byte reproducible rebuild.
+pub const SourceProfile = enum {
+    strict,
+    general,
+};
+
 pub const OverwriteFile = struct {
     path: []const u8,
     source_index: usize,
@@ -155,6 +163,10 @@ pub const Configuration = struct {
     guest_execution: GuestExecutionPolicy = .same_architecture,
     runner: ?Runner = null,
     vm: ?VmConfiguration = null,
+    /// Only the `rebuild` backend imports a filesystem, so this is only
+    /// meaningful there; `validate` rejects it elsewhere rather than letting
+    /// it read as an accepted setting that silently does nothing.
+    source_profile: SourceProfile = .strict,
 };
 
 pub const ValidationError = error{
@@ -168,6 +180,7 @@ pub const ValidationError = error{
     UnexpectedVmConfiguration,
     MissingCrossArchitectureRunner,
     UnexpectedCrossArchitectureRunner,
+    UnexpectedSourceProfile,
 };
 
 pub fn validateV2(configuration: ConfigurationV2, source_count: usize) ValidationError!void {
@@ -193,6 +206,9 @@ pub fn validate(configuration: Configuration, source_count: usize) ValidationErr
         if (configuration.vm == null) return error.MissingVmConfiguration;
     } else if (configuration.vm != null) {
         return error.UnexpectedVmConfiguration;
+    }
+    if (configuration.backend != .rebuild and configuration.source_profile != .strict) {
+        return error.UnexpectedSourceProfile;
     }
     switch (configuration.guest_execution) {
         .same_architecture => if (configuration.runner != null) {
@@ -401,6 +417,26 @@ test "configuration version and one-based partition are validated" {
     try std.testing.expectError(error.InvalidPartitionSelector, validate(.{
         .root_partition = .{ .mbr_index = 5 },
     }, 0));
+}
+
+test "a source profile only travels with the backend that imports a filesystem" {
+    try validate(.{
+        .backend = .rebuild,
+        .root_partition = .{ .gpt_index = 1 },
+        .source_profile = .general,
+    }, 0);
+    // Every other backend copies the source's bytes rather than reading its
+    // tree, so a profile there would read as an accepted setting that does
+    // nothing at all.
+    try std.testing.expectError(error.UnexpectedSourceProfile, validate(.{
+        .backend = .native_edit,
+        .root_partition = .{ .gpt_index = 1 },
+        .source_profile = .general,
+    }, 0));
+    try validate(.{
+        .backend = .native_edit,
+        .root_partition = .{ .gpt_index = 1 },
+    }, 0);
 }
 
 test "the vm backend and its configuration travel together" {

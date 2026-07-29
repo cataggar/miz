@@ -1997,6 +1997,9 @@ fn collectExt4Entries(
                 xattrs_owned = false;
                 target_owned = false;
             },
+            // `ext4.Reader` classifies only these three kinds, so a nested
+            // ext4 source cannot present anything else here.
+            .hardlink, .block_device, .char_device, .fifo => return error.UnsupportedNestedEntryKind,
         }
     }
 }
@@ -2237,12 +2240,12 @@ fn collectOciEntries(
             .uid = entry.uid,
             .gid = entry.gid,
             .size = switch (kind) {
-                .directory => 0,
                 .file, .symlink => bytes.len,
+                else => 0,
             },
             .content = switch (kind) {
-                .directory => .none,
                 .file, .symlink => .{ .bytes = bytes },
+                else => .none,
             },
             .xattrs = xattrs,
         });
@@ -2404,8 +2407,9 @@ fn normalizeMode(kind: ext4.Kind, raw_mode: u32) u16 {
     if ((mode & 0o7777) != 0) return mode & 0o7777;
     return switch (kind) {
         .directory => 0o755,
-        .file => 0o644,
+        .file, .hardlink => 0o644,
         .symlink => 0o777,
+        .block_device, .char_device, .fifo => 0o600,
     };
 }
 
