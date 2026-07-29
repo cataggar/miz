@@ -46,6 +46,91 @@ const RedirectResponse = enum {
     bearer_challenge,
 };
 
+/// How long a fixture may wait for the requests a test told it to expect.
+/// Everything served here is same-process loopback traffic, so a minute is
+/// orders of magnitude more than a healthy test needs; exceeding it always
+/// means the client stopped issuing requests.
+const fixture_timeout: Io.Duration = .fromSeconds(60);
+
+/// Interrupts a fixture parked in `accept` for requests that will never come.
+///
+/// Every fixture below serves a fixed number of requests and then leaves its
+/// accept loop, and `finish` and `deinit` join the serving thread. If the code
+/// under test issues fewer requests than the fixture expects, that join never
+/// returns: the test binary hangs with no output, taking the whole build step
+/// with it. That is exactly how committed layout directories wedged CI, and it
+/// is a defect in the fixtures regardless of what triggers it.
+///
+/// The watchdog puts a deadline on that wait. On expiry it shuts the listening
+/// sockets down, which is the documented way to interrupt a blocked `accept`:
+/// the pending call fails with `error.SocketNotListening`, the serving thread
+/// unwinds, and the test reports `error.FixtureTimedOut` instead of hanging.
+const Watchdog = struct {
+    io: Io = undefined,
+    sockets: [2]?Io.net.Socket = .{ null, null },
+    finished: Io.Event = .unset,
+    thread: ?std.Thread = null,
+    expired: bool = false,
+
+    /// Arms the watchdog. Only call this once the fixture has reached its
+    /// final address, because the watchdog thread keeps a pointer to it.
+    fn arm(self: *Watchdog, io: Io, sockets: []const Io.net.Socket) !void {
+        std.debug.assert(self.thread == null);
+        std.debug.assert(sockets.len <= self.sockets.len);
+        self.io = io;
+        self.sockets = .{ null, null };
+        for (sockets, 0..) |socket, index| self.sockets[index] = socket;
+        self.finished = .unset;
+        @atomicStore(bool, &self.expired, false, .monotonic);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    /// Stops the watchdog. This has to happen before the guarded sockets are
+    /// closed, so that a late expiry can never shut down a recycled
+    /// descriptor.
+    fn disarm(self: *Watchdog) void {
+        const thread = self.thread orelse return;
+        self.finished.set(self.io);
+        thread.join();
+        self.thread = null;
+    }
+
+    /// Interrupts a pending `accept` right away, for teardown paths that
+    /// abandon a fixture whose serving thread has not stopped on its own.
+    fn interrupt(self: *Watchdog) void {
+        if (self.thread == null) return;
+        self.shutdownSockets();
+    }
+
+    fn tripped(self: *Watchdog) bool {
+        return @atomicLoad(bool, &self.expired, .acquire);
+    }
+
+    fn shutdownSockets(self: *Watchdog) void {
+        for (self.sockets) |maybe_socket| {
+            const socket = maybe_socket orelse continue;
+            const stream = Io.net.Stream{ .socket = socket };
+            stream.shutdown(self.io, .both) catch {};
+        }
+    }
+
+    fn run(self: *Watchdog) void {
+        const deadline: Io.Clock.Timestamp = .fromNow(self.io, .{ .raw = fixture_timeout, .clock = .awake });
+        while (!self.finished.isSet()) {
+            self.finished.waitTimeout(self.io, .{ .deadline = deadline }) catch |err| switch (err) {
+                // Spurious wakeups are reported as timeouts too, so the
+                // deadline itself decides when the budget is really gone.
+                error.Timeout => if (Io.Clock.Timestamp.now(self.io, .awake).compare(.lt, deadline)) continue,
+                error.Canceled => return,
+            };
+            if (self.finished.isSet()) return;
+            @atomicStore(bool, &self.expired, true, .release);
+            self.shutdownSockets();
+            return;
+        }
+    }
+};
+
 const RedirectTarget = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -54,6 +139,7 @@ const RedirectTarget = struct {
     layer: []const u8,
     digest: []const u8,
     response: RedirectResponse,
+    watchdog: Watchdog = .{},
     thread: ?std.Thread = null,
     err: ?anyerror = null,
     authorization_seen: bool = false,
@@ -81,6 +167,8 @@ const RedirectTarget = struct {
     }
 
     fn start(self: *RedirectTarget) !void {
+        try self.watchdog.arm(self.io, &.{self.listener.socket});
+        errdefer self.watchdog.disarm();
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -89,15 +177,19 @@ const RedirectTarget = struct {
             thread.join();
             self.thread = null;
         }
+        self.watchdog.disarm();
+        if (self.watchdog.tripped()) return error.FixtureTimedOut;
         if (self.err) |err| return err;
         try std.testing.expect(!self.authorization_seen);
     }
 
     fn deinit(self: *RedirectTarget) void {
         if (self.thread) |thread| {
-            self.listener.deinit(self.io);
+            self.watchdog.interrupt();
             thread.join();
-        } else self.listener.deinit(self.io);
+        }
+        self.watchdog.disarm();
+        self.listener.deinit(self.io);
         self.allocator.free(self.authority);
         self.* = undefined;
     }
@@ -142,6 +234,7 @@ const TlsFixture = struct {
     listener: Io.net.Server,
     authority: []u8,
     permit_handshake_failure: bool,
+    watchdog: Watchdog = .{},
     thread: ?std.Thread = null,
     err: ?anyerror = null,
     handled_http: bool = false,
@@ -163,6 +256,8 @@ const TlsFixture = struct {
     }
 
     fn start(self: *TlsFixture) !void {
+        try self.watchdog.arm(self.io, &.{self.listener.socket});
+        errdefer self.watchdog.disarm();
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -171,15 +266,19 @@ const TlsFixture = struct {
             thread.join();
             self.thread = null;
         }
+        self.watchdog.disarm();
+        if (self.watchdog.tripped()) return error.FixtureTimedOut;
         if (self.err) |err| return err;
         if (!self.permit_handshake_failure) try std.testing.expect(self.handled_http);
     }
 
     fn deinit(self: *TlsFixture) void {
         if (self.thread) |thread| {
-            self.listener.deinit(self.io);
+            self.watchdog.interrupt();
             thread.join();
-        } else self.listener.deinit(self.io);
+        }
+        self.watchdog.disarm();
+        self.listener.deinit(self.io);
         self.allocator.free(self.authority);
         self.* = undefined;
     }
@@ -239,6 +338,7 @@ const TlsRedirectTarget = struct {
     authority: []u8,
     layer: []const u8,
     digest: []const u8,
+    watchdog: Watchdog = .{},
     thread: ?std.Thread = null,
     err: ?anyerror = null,
     authorization_seen: bool = false,
@@ -259,6 +359,8 @@ const TlsRedirectTarget = struct {
     }
 
     fn start(self: *TlsRedirectTarget) !void {
+        try self.watchdog.arm(self.io, &.{self.listener.socket});
+        errdefer self.watchdog.disarm();
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -267,15 +369,19 @@ const TlsRedirectTarget = struct {
             thread.join();
             self.thread = null;
         }
+        self.watchdog.disarm();
+        if (self.watchdog.tripped()) return error.FixtureTimedOut;
         if (self.err) |err| return err;
         try std.testing.expect(!self.authorization_seen);
     }
 
     fn deinit(self: *TlsRedirectTarget) void {
         if (self.thread) |thread| {
-            self.listener.deinit(self.io);
+            self.watchdog.interrupt();
             thread.join();
-        } else self.listener.deinit(self.io);
+        }
+        self.watchdog.disarm();
+        self.listener.deinit(self.io);
         self.allocator.free(self.authority);
         self.* = undefined;
     }
@@ -327,6 +433,7 @@ const TlsRegistryFixture = struct {
     layer_digest: []u8,
     manifest_digest: []u8,
     redirect_blob_url: ?[]u8 = null,
+    watchdog: Watchdog = .{},
     thread: ?std.Thread = null,
     err: ?anyerror = null,
     handled: usize = 0,
@@ -381,6 +488,8 @@ const TlsRegistryFixture = struct {
     }
 
     fn start(self: *TlsRegistryFixture) !void {
+        try self.watchdog.arm(self.io, &.{self.listener.socket});
+        errdefer self.watchdog.disarm();
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -389,15 +498,19 @@ const TlsRegistryFixture = struct {
             thread.join();
             self.thread = null;
         }
+        self.watchdog.disarm();
+        if (self.watchdog.tripped()) return error.FixtureTimedOut;
         if (self.err) |err| return err;
         try std.testing.expectEqual(@as(usize, 7), self.handled);
     }
 
     fn deinit(self: *TlsRegistryFixture) void {
         if (self.thread) |thread| {
-            self.listener.deinit(self.io);
+            self.watchdog.interrupt();
             thread.join();
-        } else self.listener.deinit(self.io);
+        }
+        self.watchdog.disarm();
+        self.listener.deinit(self.io);
         self.allocator.free(self.authority);
         self.allocator.free(self.config);
         self.allocator.free(self.layer);
@@ -512,6 +625,7 @@ const Fixture = struct {
     listener: Io.net.Server,
     authority: []u8,
     expected_requests: usize,
+    watchdog: Watchdog = .{},
     thread: ?std.Thread = null,
     err: ?anyerror = null,
     handled: usize = 0,
@@ -624,6 +738,8 @@ const Fixture = struct {
     }
 
     fn start(self: *Fixture) !void {
+        try self.watchdog.arm(self.io, &.{self.listener.socket});
+        errdefer self.watchdog.disarm();
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -632,17 +748,19 @@ const Fixture = struct {
             thread.join();
             self.thread = null;
         }
+        self.watchdog.disarm();
+        if (self.watchdog.tripped()) return error.FixtureTimedOut;
         if (self.err) |err| return err;
         try std.testing.expectEqual(self.expected_requests, self.handled);
     }
 
     fn deinit(self: *Fixture) void {
         if (self.thread) |thread| {
-            self.listener.deinit(self.io);
+            self.watchdog.interrupt();
             thread.join();
-        } else {
-            self.listener.deinit(self.io);
         }
+        self.watchdog.disarm();
+        self.listener.deinit(self.io);
         for (self.logs.items) |log| self.allocator.free(log.target);
         self.logs.deinit();
         self.allocator.free(self.authority);
@@ -1036,6 +1154,11 @@ fn sourceFor(fixture: *Fixture, authfile: ?[]const u8) !oci.registry.Source {
 
 fn noSleep(_: ?*anyopaque, _: Io, _: u64) !void {}
 
+/// Removes a layout and its bootstrap lock. Every test that writes a layout
+/// calls this both before and after the work: a layout left behind by an
+/// interrupted run is not an empty destination, so the copy engine skips the
+/// transfers whose blobs are already present, the fixture never receives the
+/// requests it was told to expect, and the test deadlocks waiting for them.
 fn deleteLayout(io: Io, path: []const u8) void {
     Io.Dir.cwd().deleteTree(io, path) catch {};
     const parent = std.fs.path.dirname(path) orelse ".";
@@ -1062,6 +1185,7 @@ test "anonymous pull copies exact graph into a new layout with streamed blobs" {
     var source = try sourceFor(&fixture, null);
     defer source.deinit();
     const destination = "test-oci-registry-anonymous-layout";
+    deleteLayout(io, destination);
     defer deleteLayout(io, destination);
     var result = try source.copyToLayout(
         .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1106,6 +1230,7 @@ test "Basic and Bearer challenges keep credentials out of request targets" {
         var source = try sourceFor(&fixture, authfile);
         defer source.deinit();
         const destination = "test-oci-registry-bearer-layout";
+        deleteLayout(io, destination);
         defer deleteLayout(io, destination);
         var result = try source.copyToLayout(
             .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1151,6 +1276,7 @@ test "Basic and Bearer authentication rejections are bounded for metadata and bl
         var source = try sourceFor(&fixture, authfile);
         defer source.deinit();
         const destination = "test-oci-registry-basic-blob-rejection";
+        deleteLayout(io, destination);
         defer deleteLayout(io, destination);
         try std.testing.expectError(error.AuthenticationFailed, source.copyToLayout(
             .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1169,6 +1295,7 @@ test "Basic and Bearer authentication rejections are bounded for metadata and bl
         var source = try sourceFor(&fixture, authfile);
         defer source.deinit();
         const destination = "test-oci-registry-bearer-blob-rejection";
+        deleteLayout(io, destination);
         defer deleteLayout(io, destination);
         try std.testing.expectError(error.AuthenticationFailed, source.copyToLayout(
             .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1315,6 +1442,7 @@ test "registry operations require exactly 200 OK" {
         var source = try sourceFor(&fixture, null);
         defer source.deinit();
         const destination = "test-oci-registry-zero-blob-status";
+        deleteLayout(io, destination);
         defer deleteLayout(io, destination);
         try std.testing.expectError(error.RegistryRequestFailed, source.copyToLayout(
             .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1341,6 +1469,7 @@ test "cross-origin blob redirects strip registry Authorization" {
     var source = try sourceFor(&fixture, authfile);
     defer source.deinit();
     const destination = "test-oci-registry-cross-origin-layout";
+    deleteLayout(io, destination);
     defer deleteLayout(io, destination);
     var result = try source.copyToLayout(
         .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1374,6 +1503,7 @@ test "cross-origin blob authentication challenges cannot nominate token realms" 
     var source = try sourceFor(&fixture, authfile);
     defer source.deinit();
     const destination = "test-oci-registry-cross-origin-challenge-layout";
+    deleteLayout(io, destination);
     defer deleteLayout(io, destination);
     try std.testing.expectError(error.AuthenticationFailed, source.copyToLayout(
         .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1637,6 +1767,7 @@ test "authenticated HTTPS registry blob redirects strip Authorization cross-orig
     );
     defer source.deinit();
     const destination = "test-oci-registry-tls-cross-origin-layout";
+    deleteLayout(io, destination);
     defer deleteLayout(io, destination);
     var result = try source.copyToLayout(
         .{ .authority = registry.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1663,6 +1794,7 @@ test "bad blob responses do not publish a destination reference" {
             .bad_content_length => "test-oci-registry-bad-length",
             else => unreachable,
         };
+        deleteLayout(io, destination);
         defer deleteLayout(io, destination);
         const expected_error: anyerror = switch (scenario) {
             .bad_blob_digest => error.BlobVerificationFailed,
@@ -1697,6 +1829,7 @@ test "explicit selected registry copies validate config blobs rather than manife
         var source = try sourceFor(&fixture, null);
         defer source.deinit();
         const destination = "test-oci-registry-platform-copy-match";
+        deleteLayout(io, destination);
         defer deleteLayout(io, destination);
         var result = try source.copyToLayout(
             .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1717,6 +1850,7 @@ test "explicit selected registry copies validate config blobs rather than manife
         var source = try sourceFor(&fixture, null);
         defer source.deinit();
         const destination = "test-oci-registry-platform-copy-mismatch";
+        deleteLayout(io, destination);
         defer deleteLayout(io, destination);
         try std.testing.expectError(error.PlatformConfigMismatch, source.copyToLayout(
             .{ .authority = fixture.authority, .repository = "team/image", .selection = .{ .tag = "latest" } },
@@ -1958,6 +2092,7 @@ const PublishFixture = struct {
     listener: Io.net.Server,
     authority: []u8,
     expected_requests: usize,
+    watchdog: Watchdog = .{},
     thread: ?std.Thread = null,
     err: ?anyerror = null,
     handled: usize = 0,
@@ -2050,6 +2185,12 @@ const PublishFixture = struct {
     }
 
     fn start(self: *PublishFixture) !void {
+        if (self.cross_upload_listener) |*listener| {
+            try self.watchdog.arm(self.io, &.{ self.listener.socket, listener.socket });
+        } else {
+            try self.watchdog.arm(self.io, &.{self.listener.socket});
+        }
+        errdefer self.watchdog.disarm();
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -2058,6 +2199,8 @@ const PublishFixture = struct {
             thread.join();
             self.thread = null;
         }
+        self.watchdog.disarm();
+        if (self.watchdog.tripped()) return error.FixtureTimedOut;
         if (self.err) |err| return err;
         try std.testing.expectEqual(self.expected_requests, self.handled);
         if (self.cross_upload_authority != null) {
@@ -2067,13 +2210,12 @@ const PublishFixture = struct {
 
     fn deinit(self: *PublishFixture) void {
         if (self.thread) |thread| {
-            self.listener.deinit(self.io);
-            if (self.cross_upload_listener) |*listener| listener.deinit(self.io);
+            self.watchdog.interrupt();
             thread.join();
-        } else {
-            self.listener.deinit(self.io);
-            if (self.cross_upload_listener) |*listener| listener.deinit(self.io);
         }
+        self.watchdog.disarm();
+        self.listener.deinit(self.io);
+        if (self.cross_upload_listener) |*listener| listener.deinit(self.io);
         self.allocator.free(self.authority);
         if (self.cross_upload_authority) |value| self.allocator.free(value);
         for (self.blobs.items) |blob| {
@@ -3109,6 +3251,7 @@ test "layout to registry uses the shared dependency-first graph engine" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const layout_path = "test-oci-layout-to-registry";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     var pull_fixture = try Fixture.init(allocator, io, .anonymous, 6, null);
     defer pull_fixture.deinit();
@@ -3151,6 +3294,7 @@ test "anonymous non-loopback plain HTTP registry publication is permitted explic
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const layout_path = "test-oci-anonymous-remote-http-layout";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     var pull_fixture = try Fixture.init(allocator, io, .anonymous, 6, null);
     defer pull_fixture.deinit();
@@ -3191,6 +3335,7 @@ test "authenticated cross-origin HTTPS uploads preserve signed queries and strip
     const io = std.testing.io;
     const layout_path = "test-oci-cross-origin-upload-layout";
     const authfile = "test-oci-cross-origin-upload-auth.json";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     defer Io.Dir.cwd().deleteFile(io, authfile) catch {};
 
@@ -3228,6 +3373,7 @@ test "all-mode registry publication puts child manifests before the root index" 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const layout_path = "test-oci-all-layout-to-registry";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     var pull_fixture = try Fixture.init(allocator, io, .anonymous, 6, null);
     defer pull_fixture.deinit();
@@ -3289,6 +3435,7 @@ test "selected registry publication commits only the selected leaf graph" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const layout_path = "test-oci-selected-layout-to-registry";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     var pull_fixture = try Fixture.init(allocator, io, .anonymous, 6, null);
     defer pull_fixture.deinit();
@@ -3342,6 +3489,7 @@ test "selected registry publication validates a digest destination against the s
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const layout_path = "test-oci-selected-digest-layout-to-registry";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     var pull_fixture = try Fixture.init(allocator, io, .anonymous, 6, null);
     defer pull_fixture.deinit();
@@ -3393,6 +3541,7 @@ test "all-mode registry publication retains unknown opaque index leaves as manif
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const layout_path = "test-oci-opaque-layout-to-registry";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     var pull_fixture = try Fixture.init(allocator, io, .anonymous, 6, null);
     defer pull_fixture.deinit();
@@ -3445,6 +3594,7 @@ test "registry all-mode fetches unknown index children through the manifest endp
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const layout_path = "test-oci-opaque-registry-to-layout";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     var fixture = try PublishFixture.init(allocator, io, 5);
     defer fixture.deinit();
@@ -3530,6 +3680,7 @@ test "graph depth failures occur before registry destination requests" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const layout_path = "test-oci-depth-planning-layout";
+    deleteLayout(io, layout_path);
     defer deleteLayout(io, layout_path);
     var documents = try makeSmallPublishLayout(allocator, io, layout_path, "leaf");
     defer documents.deinit(allocator);

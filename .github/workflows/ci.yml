@@ -13,6 +13,11 @@ jobs:
   test:
     name: build + test
     runs-on: ubuntu-latest
+    # Without a cap, a step that deadlocks instead of failing runs until
+    # GitHub's own six-hour limit ends it, and every later run queues behind
+    # it. A green run of this job takes minutes; anything near this bound is
+    # already broken, and finding out in an hour beats finding out in six.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 

@@ -7,3 +7,8 @@ zig-out/
 *.qcow2
 __pycache__/
 /thoughts/
+# The test suites materialize their scratch images, OCI layouts, auth files
+# and lock files in the working directory. They are outputs, never sources,
+# and committing them feeds stale state back into the tests that create them.
+/test-*
+/.test-*.lock
