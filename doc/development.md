@@ -20,7 +20,10 @@ zvmi/
         root.zig             # public API surface
         image.zig            # format-agnostic Image (open/create/read/write,
                               #   resize/check/map; raw + fixed/dynamic vhd +
-                              #   vhdx + qcow2)
+                              #   vhdx + qcow2, file- or block-device-backed)
+        block_device.zig      # block-device geometry probing
+                              #   (BLKGETSIZE64/BLKSSZGET), since stat(2)
+                              #   reports st_size == 0 for a device node
         fat32.zig             # FAT32 formatter + directory/file read/write
                               #   for partition-sized regions inside an Image
         vhd.zig               # VHD/VPC footer + dynamic header codec
