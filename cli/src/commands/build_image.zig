@@ -1,12 +1,19 @@
-//! `zvmi build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{raw|vhd|vhdx|qcow2}> [--skip-iso-rootfs] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--stub-source-path <path>]`
+//! `zvmi build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{raw|vhd|vhdx|qcow2}|-> [-O raw.gz] [--compress-level <1-9>] [--skip-iso-rootfs] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--stub-source-path <path>]`
 
 const std = @import("std");
 const zvmi = @import("zvmi");
+const opts = @import("opts.zig");
 
 const help_text =
-    \\usage: zvmi build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [-O raw|vhd|vhdx|qcow2] [--rootfs-path <path>] [--skip-iso-rootfs] [--max-oci-blob-size <size>] [--max-oci-layer-size <size>] [--max-oci-archive-size <size>] [--esp-size <size>] [--ext4-label <label>] [--root-selinux-label <context>] [--stub-source-path <path>] [--os-release-source-path <path>] [--splash-source-path <path>] [--uki-output-directory <path>] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--dry-run] [-v]
+    \\usage: zvmi build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}|-> [-O raw|raw.gz|raw.zst|vhd|vhdx|qcow2] [--compress-level <1-9>] [--rootfs-path <path>] [--skip-iso-rootfs] [--max-oci-blob-size <size>] [--max-oci-layer-size <size>] [--max-oci-archive-size <size>] [--esp-size <size>] [--ext4-label <label>] [--root-selinux-label <context>] [--stub-source-path <path>] [--os-release-source-path <path>] [--splash-source-path <path>] [--uki-output-directory <path>] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--dry-run] [-v]
     \\
     \\Options:
+    \\  -o <path>|-                Output path, or - to stream the image to stdout.
+    \\  -O <format>                Output format. raw.gz/raw.zst compress while the image
+    \\                              is written instead of afterwards; both are streamable.
+    \\  --compress-level <1-9>     gzip level for raw.gz (default 1, the fastest). A
+    \\                              mostly-zero image is almost all runs of zeros, which
+    \\                              every level collapses, so higher levels mostly cost time.
     \\  --boot-mode bls|uki|both   Gen2 boot files: GRUB+BLS only (default), UKI only, or both.
     \\  --esp-size <size>          ESP size (default 96M). UKI/both commonly need 512M or larger.
     \\  --generation 1|2           Azure VM generation (default 2).
@@ -55,6 +62,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var container_path: ?[]const u8 = null;
     var output_path: ?[]const u8 = null;
     var output_format: ?zvmi.Format = null;
+    var output_compression: ?zvmi.output.Compression = null;
+    var compression_level: ?zvmi.output.Level = null;
+    var stream_to_stdout = false;
     var rootfs_path: ?[]const u8 = null;
     var skip_iso_rootfs = false;
     var oci_load_options = zvmi.oci.LoadOptions{};
@@ -131,12 +141,23 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
             i += 1;
             if (i >= args.len) return fail("build-image: -o/--output requires a path", .{});
-            output_path = args[i];
+            if (std.mem.eql(u8, args[i], "-")) {
+                stream_to_stdout = true;
+            } else {
+                output_path = args[i];
+            }
         } else if (std.mem.eql(u8, arg, "-O")) {
             i += 1;
             if (i >= args.len) return fail("build-image: -O requires a format", .{});
-            output_format = zvmi.Format.parseName(args[i]) orelse
+            const spec = zvmi.output.Spec.parseName(args[i]) orelse
                 return fail("build-image: unknown output format '{s}'", .{args[i]});
+            output_format = spec.format;
+            output_compression = spec.compression;
+        } else if (std.mem.eql(u8, arg, "--compress-level")) {
+            i += 1;
+            if (i >= args.len) return fail("build-image: --compress-level requires a value", .{});
+            compression_level = zvmi.output.parseLevel(args[i]) catch
+                return fail("build-image: invalid --compress-level '{s}' (expected 1 fastest through 9 smallest)", .{args[i]});
         } else if (std.mem.eql(u8, arg, "--rootfs-path")) {
             i += 1;
             if (i >= args.len) return fail("build-image: --rootfs-path requires a path", .{});
@@ -192,10 +213,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             .iso_path = iso_path orelse return fail("build-image: --iso is required", .{}),
             .container_path = container_path orelse return fail("build-image: --container is required", .{}),
             .oci_load_options = oci_load_options,
-            .output_path = output_path orelse return fail("build-image: -o/--output is required", .{}),
+            .output_path = if (stream_to_stdout) "" else output_path orelse return fail("build-image: -o/--output is required", .{}),
             .size = size orelse return fail("build-image: --size is required", .{}),
             .generation = generation,
             .output_format = output_format,
+            .output_compression = output_compression,
+            .compression_level = compression_level,
+            .stream_to_stdout = stream_to_stdout,
             .rootfs_path_in_iso = rootfs_path,
             .skip_iso_rootfs = skip_iso_rootfs,
             .esp_size = esp_size orelse zvmi.build_image.default_esp_size,
@@ -235,6 +259,10 @@ fn parseOciLimit(value: []const u8) !usize {
 }
 
 fn printReport(report: zvmi.build_image.BuildImageReport, dry_run: bool) void {
+    const output_text = (zvmi.output.Spec{
+        .format = report.output_format,
+        .compression = report.output_compression,
+    }).displayName();
     const gen_text = if (report.generation == .gen1) "Gen1" else "Gen2";
     const arch_text = switch (report.architecture) {
         .x86_64 => "x86_64",
@@ -244,12 +272,12 @@ fn printReport(report: zvmi.build_image.BuildImageReport, dry_run: bool) void {
     if (dry_run) {
         std.debug.print(
             "Dry run OK: format={s} generation={s} arch={s} size={d} rootfs={s}\n",
-            .{ report.output_format.displayName(), gen_text, arch_text, report.disk_size, report.rootfs_path_in_iso },
+            .{ output_text, gen_text, arch_text, report.disk_size, report.rootfs_path_in_iso },
         );
     } else {
         std.debug.print(
             "Built image: format={s} generation={s} arch={s} size={d} rootfs={s}\n",
-            .{ report.output_format.displayName(), gen_text, arch_text, report.disk_size, report.rootfs_path_in_iso },
+            .{ output_text, gen_text, arch_text, report.disk_size, report.rootfs_path_in_iso },
         );
     }
 
@@ -308,8 +336,35 @@ fn describeBuildImageFailure(
             u8,
             "build-image: failed: --verity was requested, but the source initramfs (boot/initrd*/boot/initramfs* in the merged ISO/squashfs/container tree) does not include dm-verity userspace tooling (systemd-veritysetup-generator, systemd-veritysetup, or veritysetup).\nWithout it, systemd-veritysetup-generator never runs and the built image will hang at boot waiting on /dev/mapper/root (see https://github.com/cataggar/zvmi/issues/77).\nRebuild the initramfs with that tooling included (e.g. dracut --add veritysetup, or the equivalent module/package for the base OS's initramfs generator) before using --verity.",
         ),
+        error.CompressionRequiresRawFormat => outputConstraintMessage(allocator, error.CompressionRequiresRawFormat),
+        error.FormatRequiresSeekableOutput => outputConstraintMessage(allocator, error.FormatRequiresSeekableOutput),
+        error.CompressionLevelNotSupportedForZstd => outputConstraintMessage(allocator, error.CompressionLevelNotSupportedForZstd),
+        error.CompressionLevelOutOfRange => outputConstraintMessage(allocator, error.CompressionLevelOutOfRange),
         else => std.fmt.allocPrint(allocator, "build-image: failed: {s}", .{@errorName(err)}),
     };
+}
+
+fn outputConstraintMessage(
+    allocator: std.mem.Allocator,
+    err: zvmi.output.SpecError,
+) std.mem.Allocator.Error![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "build-image: failed: {s}",
+        .{opts.describeOutputError(err)},
+    );
+}
+
+test "describeBuildImageFailure explains an unstreamable output format" {
+    const message = try describeBuildImageFailure(
+        std.testing.allocator,
+        error.FormatRequiresSeekableOutput,
+        .{},
+    );
+    defer std.testing.allocator.free(message);
+
+    try std.testing.expect(std.mem.indexOf(u8, message, "stdout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "raw.gz") != null);
 }
 
 test "describeBuildImageFailure explains MissingUkiStub" {

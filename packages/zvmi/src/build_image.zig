@@ -15,6 +15,7 @@ const layout = @import("layout.zig");
 const mbr = @import("mbr.zig");
 const oci = @import("oci.zig");
 const os_customization = @import("os_customization.zig");
+const output = @import("output.zig");
 const iso9660 = @import("iso9660.zig");
 const qcow2 = @import("qcow2.zig");
 const root_tree_mod = @import("root_tree.zig");
@@ -25,6 +26,11 @@ const initramfs = @import("initramfs.zig");
 
 const mib: u64 = azure.one_mib;
 pub const default_esp_size: u64 = 96 * mib;
+/// Building a filesystem is inherently random-access, so even an image that
+/// is delivered on stdout is assembled in a scratch file first. When there
+/// is no output path to hang the scratch names off, they hang off this name
+/// in the current directory instead, and are removed when the build ends.
+pub const stdout_scratch_base = "zvmi-build-image-stdout";
 const scratch_copy_chunk_size: usize = 1024 * 1024;
 const nested_filesystem_probe_len: usize = 2048;
 const ext4_magic_offset: usize = 1024 + 56;
@@ -41,6 +47,21 @@ pub const BuildImageOptions = struct {
     size: u64,
     generation: azure.Generation = .gen2,
     output_format: ?Format = null,
+    /// How the finished image is encoded. Null infers it from
+    /// `output_path`'s extensions (`image.raw.gz`), like `output_format`
+    /// does. Only `raw` can be compressed: compression happens while the
+    /// artifact is written, and every other format amends metadata it
+    /// already wrote.
+    output_compression: ?output.Compression = null,
+    /// gzip level for compressed output. Null means "not requested", which
+    /// is distinct from asking for the default: the zstd encoder has no
+    /// level to set, so an explicit level with `-O raw.zst` is an error
+    /// rather than something quietly dropped.
+    compression_level: ?output.Level = null,
+    /// Deliver the finished image on stdout instead of writing
+    /// `output_path`, which is then unused. Scratch files are still written
+    /// to disk (see `stdout_scratch_base`).
+    stream_to_stdout: bool = false,
     rootfs_path_in_iso: ?[]const u8 = null,
     /// When set, the container image becomes the effective root filesystem and
     /// the ISO/squashfs contribute only the minimum boot-critical assets
@@ -141,6 +162,7 @@ pub const VhdxMetadataReport = struct {
 
 pub const BuildImageReport = struct {
     output_format: Format,
+    output_compression: output.Compression = .none,
     generation: azure.Generation,
     architecture: bootconfig.Architecture,
     disk_size: u64,
@@ -166,7 +188,13 @@ pub fn build(
     options: BuildImageOptions,
 ) !BuildImageReport {
     try enterStage(options, .load_sources);
-    const output_format = try resolveOutputFormat(options.output_format, options.output_path);
+    const spec = resolveOutputSpec(options);
+    const output_format = spec.format;
+    const destination = outputDestination(options);
+    // Every scratch file is named after where the artifact lands, so that
+    // two concurrent builds in one directory cannot collide.
+    const scratch_base = scratchBase(options);
+    try output.validate(spec, destination, options.compression_level);
     const disk_size = if (output_format == .vhd) azure.alignSizeToMib(options.size) else options.size;
 
     if (output_format == .vhd and disk_size != options.size) {
@@ -176,7 +204,7 @@ pub fn build(
             std.debug.print("build-image: aligned requested VHD size from {d} to {d} bytes for Azure compatibility\n", .{ options.size, disk_size });
         }
     }
-    try validateBuildPathIsolation(allocator, io, options, output_format);
+    try validateBuildPathIsolation(allocator, io, options);
 
     logStep(options, "load container image");
     var container_image = try oci.load(io, allocator, options.container_path, options.oci_load_options);
@@ -215,6 +243,7 @@ pub fn build(
 
     var report = BuildImageReport{
         .output_format = output_format,
+        .output_compression = spec.compression,
         .generation = options.generation,
         .architecture = architecture,
         .disk_size = disk_size,
@@ -230,7 +259,7 @@ pub fn build(
 
     if (options.dry_run) return report;
 
-    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.build-image-rootfs.sqsh", .{options.output_path});
+    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.build-image-rootfs.sqsh", .{scratch_base});
     defer allocator.free(rootfs_scratch_path);
     var extracted_rootfs = false;
     defer if (extracted_rootfs) Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
@@ -244,7 +273,7 @@ pub fn build(
     var squash_reader_open = true;
     defer if (squash_reader_open) squash_reader.close(io);
 
-    const nested_scratch_prefix = try std.fmt.allocPrint(allocator, "{s}.build-image-nested", .{options.output_path});
+    const nested_scratch_prefix = try std.fmt.allocPrint(allocator, "{s}.build-image-nested", .{scratch_base});
     defer allocator.free(nested_scratch_prefix);
 
     logStep(options, "merge ISO, squashfs, and OCI trees");
@@ -281,7 +310,7 @@ pub fn build(
     const root_tree_spool_path = try std.fmt.allocPrint(
         allocator,
         "{s}.build-image-root-tree.spool",
-        .{options.output_path},
+        .{scratch_base},
     );
     defer allocator.free(root_tree_spool_path);
     logStep(options, "materialize merged sources into owned root tree");
@@ -329,13 +358,17 @@ pub fn build(
         try enterStage(options, .prepare_boot_configuration);
     }
 
-    const raw_build_path = if (output_format == .raw)
+    // An uncompressed raw artifact written to a real path *is* the build
+    // image, so it is assembled in place. Everything else -- another
+    // format, a compressed artifact, or a pipe -- is produced from a raw
+    // scratch file that is removed afterwards.
+    const builds_output_in_place = buildsOutputInPlace(options);
+    const raw_build_path = if (builds_output_in_place)
         options.output_path
     else
-        try std.fmt.allocPrint(allocator, "{s}.build-image.raw", .{options.output_path});
-    defer if (output_format != .raw) allocator.free(raw_build_path);
-    const remove_raw_build = output_format != .raw;
-    defer if (remove_raw_build) Io.Dir.cwd().deleteFile(io, raw_build_path) catch {};
+        try std.fmt.allocPrint(allocator, "{s}.build-image.raw", .{scratch_base});
+    defer if (!builds_output_in_place) allocator.free(raw_build_path);
+    defer if (!builds_output_in_place) Io.Dir.cwd().deleteFile(io, raw_build_path) catch {};
 
     logStep(options, "create build image");
     var raw_img = try Image.create(io, raw_build_path, .raw, disk_size, .{});
@@ -495,20 +528,29 @@ pub fn build(
     raw_img_open = false;
 
     try enterStage(options, .convert_output);
-    if (output_format != .raw) {
+    if (!builds_output_in_place and spec.compression == .none and destination == .path) {
         logStep(options, "convert raw build image to requested output format");
         try convertRawToOutput(
             allocator,
             io,
             raw_build_path,
-            options.output_path,
+            destination.path,
             output_format,
             disk_size,
             if (options.deterministic) |deterministic| deterministic.output_create_options else .{},
         );
     }
 
-    var final_img = try Image.openPath(io, options.output_path);
+    // A compressed or piped artifact is not a file the checks below can
+    // open, so they run against the raw build image instead. It holds
+    // exactly the guest-visible bytes that are about to be streamed out,
+    // and validating before publishing means a rejected image is never
+    // emitted at all.
+    const validate_in_place = builds_output_in_place or (spec.compression == .none and destination == .path);
+    var final_img = if (validate_in_place)
+        try Image.openPath(io, destination.path)
+    else
+        try Image.openPathReadOnly(io, raw_build_path);
     defer final_img.close(io);
 
     if (output_format == .vhdx) {
@@ -533,6 +575,14 @@ pub fn build(
         if (!partition_style.ok) return error.PartitionStyleCheckFailed;
     }
 
+    if (!validate_in_place) {
+        logStep(options, "stream build image to compressed output");
+        try output.writeImageTo(allocator, io, final_img, destination, .{
+            .compression = spec.compression,
+            .level = options.compression_level orelse output.default_level,
+        });
+    }
+
     return report;
 }
 
@@ -540,9 +590,8 @@ fn validateBuildPathIsolation(
     allocator: std.mem.Allocator,
     io: Io,
     options: BuildImageOptions,
-    output_format: Format,
 ) !void {
-    const output_path = try std.fs.path.resolve(allocator, &.{options.output_path});
+    const output_path = try std.fs.path.resolve(allocator, &.{scratchBase(options)});
     defer allocator.free(output_path);
     const rootfs_scratch = try std.fmt.allocPrint(allocator, "{s}.build-image-rootfs.sqsh", .{output_path});
     defer allocator.free(rootfs_scratch);
@@ -550,11 +599,12 @@ fn validateBuildPathIsolation(
     defer allocator.free(root_tree_spool);
     const nested_prefix = try std.fmt.allocPrint(allocator, "{s}.build-image-nested", .{output_path});
     defer allocator.free(nested_prefix);
-    const raw_build = if (output_format == .raw)
+    const in_place = buildsOutputInPlace(options);
+    const raw_build = if (in_place)
         output_path
     else
         try std.fmt.allocPrint(allocator, "{s}.build-image.raw", .{output_path});
-    defer if (output_format != .raw) allocator.free(raw_build);
+    defer if (!in_place) allocator.free(raw_build);
 
     for ([_][]const u8{ options.iso_path, options.container_path }) |source| {
         if (try buildSourceConflicts(
@@ -646,19 +696,35 @@ fn buildPathContains(parent: []const u8, candidate: []const u8) bool {
         (std.fs.path.isSep(parent[parent.len - 1]) and parent.len == 1);
 }
 
-fn resolveOutputFormat(explicit: ?Format, output_path: []const u8) !Format {
-    const resolved = explicit orelse blk: {
-        if (std.mem.lastIndexOfScalar(u8, output_path, '.')) |dot| {
-            const ext = output_path[dot + 1 ..];
-            if (std.ascii.eqlIgnoreCase(ext, "vhd") or std.ascii.eqlIgnoreCase(ext, "vpc")) break :blk Format.vhd;
-            if (std.ascii.eqlIgnoreCase(ext, "raw") or std.ascii.eqlIgnoreCase(ext, "img")) break :blk Format.raw;
-            if (std.ascii.eqlIgnoreCase(ext, "vhdx")) break :blk Format.vhdx;
-            if (std.ascii.eqlIgnoreCase(ext, "qcow2")) break :blk Format.qcow2;
-        }
-        break :blk Format.raw;
+/// Resolves what the artifact is and how it is encoded. Anything stated
+/// explicitly wins; the rest is inferred from the output filename's
+/// extensions (`image.vhd`, `image.raw.gz`), and what is left over is raw
+/// and uncompressed. Streaming to stdout leaves no filename to infer from,
+/// so it relies entirely on `-O`.
+fn resolveOutputSpec(options: BuildImageOptions) output.Spec {
+    const inferred: ?output.Spec = if (options.stream_to_stdout)
+        null
+    else
+        output.Spec.inferFromPath(options.output_path);
+    return .{
+        .format = options.output_format orelse
+            if (inferred) |value| value.format else .raw,
+        .compression = options.output_compression orelse
+            if (inferred) |value| value.compression else .none,
     };
+}
 
-    return resolved;
+fn outputDestination(options: BuildImageOptions) output.Destination {
+    return if (options.stream_to_stdout) .stdout else .{ .path = options.output_path };
+}
+
+fn scratchBase(options: BuildImageOptions) []const u8 {
+    return if (options.stream_to_stdout) stdout_scratch_base else options.output_path;
+}
+
+fn buildsOutputInPlace(options: BuildImageOptions) bool {
+    const spec = resolveOutputSpec(options);
+    return !options.stream_to_stdout and spec.format == .raw and spec.compression == .none;
 }
 
 fn parseArchitecture(raw_arch: ?[]const u8) ?bootconfig.Architecture {
@@ -2736,37 +2802,37 @@ test "customization sources cannot alias output or internal scratch paths" {
     };
     try std.testing.expectError(
         error.SourcePathConflict,
-        validateBuildPathIsolation(std.testing.allocator, std.testing.io, options, .qcow2),
+        validateBuildPathIsolation(std.testing.allocator, std.testing.io, options),
     );
 
     operations[0].put_file.source = .{ .host_path = "output.qcow2.build-image.raw" };
     try std.testing.expectError(
         error.SourcePathConflict,
-        validateBuildPathIsolation(std.testing.allocator, std.testing.io, options, .qcow2),
+        validateBuildPathIsolation(std.testing.allocator, std.testing.io, options),
     );
 
     operations[0].put_file.source = .{ .host_path = "output.qcow2.build-image-nested-1.img" };
     try std.testing.expectError(
         error.SourcePathConflict,
-        validateBuildPathIsolation(std.testing.allocator, std.testing.io, options, .qcow2),
+        validateBuildPathIsolation(std.testing.allocator, std.testing.io, options),
     );
 
     operations[0].put_file.source = .{ .host_path = "output.qcow2" };
     try std.testing.expectError(
         error.SourcePathConflict,
-        validateBuildPathIsolation(std.testing.allocator, std.testing.io, options, .raw),
+        validateBuildPathIsolation(std.testing.allocator, std.testing.io, options),
     );
 
     const independent = try Io.Dir.cwd().createFile(std.testing.io, "independent-input", .{});
     independent.close(std.testing.io);
     defer Io.Dir.cwd().deleteFile(std.testing.io, "independent-input") catch {};
     operations[0].put_file.source = .{ .host_path = "independent-input" };
-    try validateBuildPathIsolation(std.testing.allocator, std.testing.io, options, .raw);
+    try validateBuildPathIsolation(std.testing.allocator, std.testing.io, options);
 
     options.iso_path = "output.qcow2.build-image-root-tree.spool";
     try std.testing.expectError(
         error.SourcePathConflict,
-        validateBuildPathIsolation(std.testing.allocator, std.testing.io, options, .raw),
+        validateBuildPathIsolation(std.testing.allocator, std.testing.io, options),
     );
 }
 
