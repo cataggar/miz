@@ -997,27 +997,28 @@ pub const RootTree = struct {
 
     fn sortAndValidate(self: *RootTree) !void {
         try self.sortAndValidateRepresentable();
-        if (self.root_metadata.mode != 0o755 or
-            self.root_metadata.uid != 0 or
-            self.root_metadata.gid != 0)
-        {
-            return error.Ext4RootMetadataUnsupported;
-        }
-        if (self.root_metadata.atime != null or
-            self.root_metadata.mtime != null or
-            self.root_metadata.ctime != null)
-        {
-            return error.Ext4TimestampsUnsupported;
-        }
+        // Only the permission and setuid/setgid/sticky bits are the tree's to
+        // choose; the file-type bits come from the kind, and a mode carrying
+        // them would silently turn the root into something else.
+        if (self.root_metadata.mode > 0o7777) return error.Ext4RootMetadataUnsupported;
+        try validateExt4Time(self.root_metadata.atime);
+        try validateExt4Time(self.root_metadata.mtime);
+        try validateExt4Time(self.root_metadata.ctime);
         for (self.nodes.items) |node| {
-            if (node.metadata.atime != null or node.metadata.mtime != null or node.metadata.ctime != null) {
-                return error.Ext4TimestampsUnsupported;
-            }
-            switch (node.kind) {
-                .directory, .file, .symlink => {},
-                .hardlink => return error.Ext4HardlinksUnsupported,
-                .block_device, .char_device, .fifo => return error.Ext4SpecialFilesUnsupported,
-            }
+            if (node.metadata.mode > 0o7777) return error.Ext4ModeUnsupported;
+            try validateExt4Time(node.metadata.atime);
+            try validateExt4Time(node.metadata.mtime);
+            try validateExt4Time(node.metadata.ctime);
+        }
+    }
+
+    /// A 128-byte inode stores each time in a bare 32-bit field, so anything
+    /// before 1970 or after 2106 has nowhere to go. Refusing is the only
+    /// honest option: a wrapped value looks like a perfectly ordinary date.
+    fn validateExt4Time(value: ?i64) !void {
+        const seconds = value orelse return;
+        if (seconds < 0 or seconds > std.math.maxInt(u32)) {
+            return error.Ext4TimestampsUnsupported;
         }
     }
 
@@ -1179,6 +1180,9 @@ pub const RootTree = struct {
                 .hardlink_target => |target| target,
                 else => "",
             },
+            .atime = node.metadata.atime,
+            .mtime = node.metadata.mtime,
+            .ctime = node.metadata.ctime,
         };
     }
 
@@ -1470,14 +1474,33 @@ test "owned tree populates ext4 with metadata xattrs and symlinks" {
     try std.testing.expectEqualStrings("etc/hostname", target);
 }
 
-test "owned tree rejects unsupported ext4 node kinds explicitly" {
+test "owned tree offers special files and hardlinks to the ext4 writer" {
     const io = std.testing.io;
     const spool_path = "test-root-tree-special.spool";
     defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
     var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
     defer tree.deinit();
+    try tree.putDirectory("dev", .{ .mode = 0o755 });
     try tree.putDevice("dev/console", .char_device, .{ .major = 5, .minor = 1 }, .{ .mode = 0o600 });
-    try std.testing.expectError(error.Ext4SpecialFilesUnsupported, tree.ext4View());
+    try tree.putFileBytes("tool", "x", .{ .mode = 0o755 });
+    try tree.putHardlink("tool-alias", "tool", .{ .mode = 0o755 });
+
+    const view = try tree.ext4View();
+    var saw_device = false;
+    var saw_hardlink = false;
+    while (try view.next()) |entry| {
+        if (entry.kind == .char_device) {
+            saw_device = true;
+            try std.testing.expectEqual(@as(u32, 5), entry.device.major);
+            try std.testing.expectEqual(@as(u32, 1), entry.device.minor);
+        }
+        if (entry.kind == .hardlink) {
+            saw_hardlink = true;
+            try std.testing.expectEqualStrings("tool", entry.hardlink_target);
+        }
+    }
+    try std.testing.expect(saw_device);
+    try std.testing.expect(saw_hardlink);
 }
 
 test "borrowed node paths are safe overlay and removal inputs" {
@@ -1619,12 +1642,17 @@ test "root timestamps affect manifests and unsupported ext4 metadata is explicit
     tree.setRootMetadata(.{ .atime = 1 });
     const timestamped = try tree.manifestDigest();
     try std.testing.expect(!std.mem.eql(u8, &original, &timestamped));
-    try std.testing.expectError(error.Ext4TimestampsUnsupported, tree.ext4View());
+    _ = try tree.ext4View();
 
-    tree.setRootMetadata(.{});
     try tree.putFileBytes("value", "x", .{ .mode = 0o644, .mtime = 1 });
+    _ = try tree.ext4View();
+
+    // Nothing outside 1970..2106 fits a 128-byte inode's time fields.
+    tree.setRootMetadata(.{ .atime = -1 });
     try std.testing.expectError(error.Ext4TimestampsUnsupported, tree.ext4View());
-    tree.setRootMetadata(.{ .mode = 0o700 });
+    tree.setRootMetadata(.{ .atime = @as(i64, std.math.maxInt(u32)) + 1 });
+    try std.testing.expectError(error.Ext4TimestampsUnsupported, tree.ext4View());
+    tree.setRootMetadata(.{ .mode = 0o40755 });
     try std.testing.expectError(error.Ext4RootMetadataUnsupported, tree.ext4View());
 }
 

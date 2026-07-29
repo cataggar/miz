@@ -29,7 +29,7 @@ const verity = @import("verity.zig");
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
 pub const plan_schema_version: u32 = 5;
-pub const provenance_schema_version: u32 = 8;
+pub const provenance_schema_version: u32 = 9;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -4299,7 +4299,11 @@ pub const PreservedExecutionRecord = struct {
 };
 
 pub const PreservedRebuildRecord = struct {
-    profile: ext4.StrictProfile,
+    /// Which importer accepted the source. Recorded rather than assumed,
+    /// because `reproducible` follows from it and a provenance record that
+    /// implied reproducibility it does not have would be worse than silent.
+    profile: ext4.SourceProfile,
+    reproducible: bool,
     ext4_uuid: Uuid,
     ext4_label: [16]u8,
     ext4_block_size: u32,
@@ -4605,7 +4609,8 @@ fn buildResult(
             .operation_count = operation_count,
             .installed_packages = try dupeStrings(result_allocator, guestPackages(unsafe_report, vm_report)),
             .rebuild = if (rebuild_report) |report| .{
-                .profile = report.strict_profile,
+                .profile = report.source_profile,
+                .reproducible = report.source_reproducible,
                 .ext4_uuid = .{ .bytes = report.ext4_uuid },
                 .ext4_label = report.ext4_label,
                 .ext4_block_size = report.ext4_block_size,
@@ -7794,7 +7799,8 @@ test "rebuild execution creates paths and emits strict tree provenance" {
     try std.testing.expect(outcome.result != null);
     try std.testing.expect(!outcome.diagnostics.hasErrors());
     const rebuild_record = outcome.result.?.provenance.execution.preserved.?.rebuild.?;
-    try std.testing.expectEqual(ext4.StrictProfile.zvmi_ext4_v1, rebuild_record.profile);
+    try std.testing.expectEqual(ext4.SourceProfile.zvmi_ext4_v1, rebuild_record.profile);
+    try std.testing.expect(rebuild_record.reproducible);
     try std.testing.expectEqualSlices(u8, &([_]u8{0x63} ** 16), &rebuild_record.ext4_uuid.bytes);
     try std.testing.expectEqual(@as(usize, 1), rebuild_record.existing_operation_count);
     try std.testing.expectEqual(@as(usize, 1), rebuild_record.os_customization_count);

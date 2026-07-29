@@ -167,6 +167,16 @@ pub const PopulateOptions = struct {
     label: []const u8 = "",
     /// Extended attributes applied to the implicit root inode.
     root_xattrs: []const Xattr = &.{},
+    /// Permission bits of the implicit root inode. Defaulted rather than
+    /// derived, because the tree interface has no entry for the root.
+    root_mode: u16 = 0o755,
+    root_uid: u32 = 0,
+    root_gid: u32 = 0,
+    /// Root inode times. Null falls back to `timestamp`, which is what every
+    /// reproducible caller wants; a general import supplies the source's own.
+    root_atime: ?i64 = null,
+    root_mtime: ?i64 = null,
+    root_ctime: ?i64 = null,
     /// If omitted, a zero UUID is written.
     uuid: ?[16]u8 = null,
     /// POSIX seconds timestamp written to the superblock/inodes.
@@ -275,6 +285,12 @@ pub const FileTreeView = struct {
         /// the bytes instead would silently break every consumer that relies
         /// on shared identity, from package managers to `rsync -H`.
         hardlink_target: []const u8 = "",
+        /// POSIX seconds. Null means "use the image-wide timestamp", which is
+        /// what a reproducible build wants; an imported filesystem carrying
+        /// real per-file times supplies them so they survive the round trip.
+        atime: ?i64 = null,
+        mtime: ?i64 = null,
+        ctime: ?i64 = null,
     };
 
     pub fn reset(self: *FileTreeView) void {
@@ -304,6 +320,7 @@ pub const PopulateError = std.mem.Allocator.Error || Io.File.ReadPositionalError
     UnsupportedHardlinkTarget,
     TooManyHardlinks,
     InvalidDeviceEntry,
+    TimestampOutOfRange,
     NotEnoughSpace,
     TooManyExtents,
     TooManyInodes,
@@ -356,7 +373,39 @@ const OwnedEntry = struct {
     xattrs: []OwnedXattr,
     device: DeviceNumbers = .{},
     hardlink_target: []u8 = &.{},
+    times: InodeTimes = .{},
 };
+
+/// The three times an inode written by this module can carry. A 128-byte
+/// inode has no `i_*_extra` words, so there is nothing wider to store than
+/// the 32-bit fields, and a value that would not fit is refused rather than
+/// wrapped into a plausible-looking wrong date.
+const InodeTimes = struct {
+    atime: ?u32 = null,
+    mtime: ?u32 = null,
+    ctime: ?u32 = null,
+
+    fn from(entry: FileTreeView.Entry) PopulateError!InodeTimes {
+        return .{
+            .atime = try narrowTime(entry.atime),
+            .mtime = try narrowTime(entry.mtime),
+            .ctime = try narrowTime(entry.ctime),
+        };
+    }
+
+    fn resolve(self: InodeTimes, fallback: u32) struct { u32, u32, u32 } {
+        return .{
+            self.atime orelse fallback,
+            self.ctime orelse fallback,
+            self.mtime orelse fallback,
+        };
+    }
+};
+
+fn narrowTime(value: ?i64) PopulateError!?u32 {
+    const seconds = value orelse return null;
+    return std.math.cast(u32, seconds) orelse error.TimestampOutOfRange;
+}
 
 const Node = struct {
     path: []const u8,
@@ -371,6 +420,7 @@ const Node = struct {
     declared_size: u64,
     content: ?FileTreeView.ContentReader,
     xattrs: []OwnedXattr,
+    times: InodeTimes = .{},
     dir_bytes: ?[]u8 = null,
     xattr_block_bytes: ?[]u8 = null,
     size_on_disk: u64 = 0,
@@ -3507,6 +3557,12 @@ pub const GeneralTree = struct {
     /// Guest-visible file bytes counted once per inode, so a hardlinked file
     /// is not billed twice. This is the scratch space an import needs.
     content_bytes: u64,
+    view: FileTreeView = .{
+        .ctx = undefined,
+        .next_fn = generalViewNext,
+        .reset_fn = generalViewReset,
+    },
+    iteration_index: usize = 0,
 
     pub fn deinit(self: *GeneralTree) void {
         for (self.entries) |entry| {
@@ -3544,6 +3600,52 @@ pub const GeneralTree = struct {
                 .read_at_fn = generalContentReadAt,
             } else null,
             .xattrs = node.xattr_views,
+        };
+    }
+
+    /// A `FileTreeView` over the same entries, for callers that only need the
+    /// shape a writer consumes. It deliberately drops the per-node
+    /// timestamps: `FileTreeView` has nowhere to carry them, so anything that
+    /// must preserve them has to consume `entryAt` directly.
+    pub fn fileTreeView(self: *GeneralTree) *FileTreeView {
+        self.iteration_index = 0;
+        self.view = .{
+            .ctx = self,
+            .next_fn = generalViewNext,
+            .reset_fn = generalViewReset,
+        };
+        return &self.view;
+    }
+
+    fn generalViewReset(ctx: *anyopaque) void {
+        const self: *GeneralTree = @ptrCast(@alignCast(ctx));
+        self.iteration_index = 0;
+    }
+
+    fn generalViewNext(ctx: *anyopaque) FileTreeView.IteratorError!?FileTreeView.Entry {
+        const self: *GeneralTree = @ptrCast(@alignCast(ctx));
+        if (self.iteration_index >= self.entries.len) return null;
+        const entry = self.entryAt(self.iteration_index);
+        self.iteration_index += 1;
+        return .{
+            .path = entry.path,
+            .kind = switch (entry.kind) {
+                .directory => .directory,
+                .file => .file,
+                .symlink => .symlink,
+                .hardlink => .hardlink,
+                .block_device => .block_device,
+                .char_device => .char_device,
+                .fifo => .fifo,
+            },
+            .mode = entry.mode,
+            .uid = entry.uid,
+            .gid = entry.gid,
+            .size = entry.size,
+            .content = entry.content,
+            .xattrs = entry.xattrs,
+            .device = entry.device,
+            .hardlink_target = entry.hardlink_target,
         };
     }
 };
@@ -4578,6 +4680,7 @@ fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: Populat
             .xattrs = owned_xattrs,
             .device = entry.device,
             .hardlink_target = try allocator.dupe(u8, entry.hardlink_target),
+            .times = try InodeTimes.from(entry),
         });
     }
 
@@ -4597,12 +4700,17 @@ fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: Populat
         .parent_index = 0,
         .inode = root_inode,
         .kind = .directory,
-        .mode = 0o755,
-        .uid = 0,
-        .gid = 0,
+        .mode = options.root_mode,
+        .uid = options.root_uid,
+        .gid = options.root_gid,
         .declared_size = 0,
         .content = null,
         .xattrs = root_xattrs,
+        .times = .{
+            .atime = try narrowTime(options.root_atime),
+            .mtime = try narrowTime(options.root_mtime),
+            .ctime = try narrowTime(options.root_ctime),
+        },
     };
 
     var next_inode = first_non_reserved_inode;
@@ -4629,6 +4737,7 @@ fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: Populat
             .xattrs = entry.xattrs,
             .device = entry.device,
             .hardlink_target = entry.hardlink_target,
+            .times = entry.times,
             .owns_inode = owns_inode,
         };
         entry.xattrs = &.{};
@@ -5001,9 +5110,10 @@ fn writeInodes(io: Io, file: Io.File, nodes: []Node, layout: Layout, options: Po
         writeInt(u16, buf[0..2], inodeMode(node));
         writeInt(u16, buf[2..4], @truncate(node.uid));
         writeInt(u32, buf[4..8], @truncate(node.size_on_disk));
-        writeInt(u32, buf[8..12], options.timestamp);
-        writeInt(u32, buf[12..16], options.timestamp);
-        writeInt(u32, buf[16..20], options.timestamp);
+        const times = node.times.resolve(options.timestamp);
+        writeInt(u32, buf[8..12], times[0]);
+        writeInt(u32, buf[12..16], times[1]);
+        writeInt(u32, buf[16..20], times[2]);
         writeInt(u16, buf[24..26], @truncate(node.gid));
         writeInt(u16, buf[26..28], node.link_count);
         writeInt(u32, buf[28..32], inodeSectorCount(node));
