@@ -259,8 +259,8 @@ const TestTree = struct {
             .gid = entry.gid,
             .size = entry.size,
             .content = switch (entry.kind) {
-                .directory => null,
                 .file, .symlink => .{ .ctx = &self.entries[self.index - 1], .read_at_fn = readContent },
+                else => null,
             },
         };
     }

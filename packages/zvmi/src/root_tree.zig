@@ -439,6 +439,14 @@ pub const RootTree = struct {
             };
             switch (entry.kind) {
                 .directory => try self.putDirectory(entry.path, metadata),
+                .fifo => try self.putFifo(entry.path, metadata),
+                .block_device, .char_device => try self.putDevice(
+                    entry.path,
+                    if (entry.kind == .block_device) .block_device else .char_device,
+                    .{ .major = entry.device.major, .minor = entry.device.minor },
+                    metadata,
+                ),
+                .hardlink => try self.putHardlink(entry.path, entry.hardlink_target, metadata),
                 .file => {
                     const content = entry.content orelse if (entry.size == 0)
                         emptyContentReader()
@@ -479,6 +487,97 @@ pub const RootTree = struct {
                             metadata,
                         );
                     }
+                },
+            }
+        }
+    }
+
+    /// Imports a tree produced by the general ext4 importer. `FileTreeView`
+    /// cannot carry timestamps, device numbers or hardlink targets, so the
+    /// general tree is consumed directly rather than being squeezed through
+    /// that interface and losing exactly the fidelity it exists to preserve.
+    pub fn importExt4General(self: *RootTree, source: *ext4.GeneralTree) !void {
+        try self.importExt4GeneralMode(source, .owned);
+    }
+
+    /// Imports paths and metadata while retaining read-only content readers
+    /// owned by `source`, which must outlive this tree.
+    pub fn importExt4GeneralBorrowed(self: *RootTree, source: *ext4.GeneralTree) !void {
+        if (self.storage != .memory) return error.BorrowedImportRequiresMemoryTree;
+        try self.importExt4GeneralMode(source, .borrowed);
+    }
+
+    fn importExt4GeneralMode(
+        self: *RootTree,
+        source: *ext4.GeneralTree,
+        mode: enum { owned, borrowed },
+    ) !void {
+        self.setRootMetadata(.{
+            .mode = source.root.mode,
+            .uid = source.root.uid,
+            .gid = source.root.gid,
+            .atime = source.root.atime,
+            .mtime = source.root.mtime,
+            .ctime = source.root.ctime,
+        });
+
+        var index: usize = 0;
+        while (index < source.nodeCount()) : (index += 1) {
+            const entry = source.entryAt(index);
+            const metadata = Metadata{
+                .mode = entry.mode,
+                .uid = entry.uid,
+                .gid = entry.gid,
+                .atime = entry.atime,
+                .mtime = entry.mtime,
+                .ctime = entry.ctime,
+                .xattrs = entry.xattrs,
+            };
+            switch (entry.kind) {
+                .directory => try self.putDirectory(entry.path, metadata),
+                .fifo => try self.putFifo(entry.path, metadata),
+                .block_device => try self.putDevice(entry.path, .block_device, .{
+                    .major = entry.device.major,
+                    .minor = entry.device.minor,
+                }, metadata),
+                .char_device => try self.putDevice(entry.path, .char_device, .{
+                    .major = entry.device.major,
+                    .minor = entry.device.minor,
+                }, metadata),
+                // The scanner always emits the content-bearing name before any
+                // further link to it, so the target is already present.
+                .hardlink => try self.putHardlink(entry.path, entry.hardlink_target, metadata),
+                .file, .symlink => {
+                    const kind: Kind = if (entry.kind == .file) .file else .symlink;
+                    const content = entry.content orelse if (entry.size == 0)
+                        emptyContentReader()
+                    else
+                        return error.MissingContent;
+                    if (mode == .borrowed) {
+                        try self.putBorrowedContent(
+                            entry.path,
+                            kind,
+                            entry.size,
+                            content,
+                            metadata,
+                        );
+                        continue;
+                    }
+                    if (kind == .file) {
+                        try self.putFileReader(entry.path, entry.size, content, metadata);
+                        continue;
+                    }
+                    try self.checkFileBytes(entry.size);
+                    try validatePath(entry.path, self.limits, self.diagnostic);
+                    const old_spool_len = self.spool_len;
+                    const owned = self.spoolContent(entry.size, content) catch |err| {
+                        try self.rollbackSpool(old_spool_len);
+                        return err;
+                    };
+                    self.putNode(entry.path, .symlink, metadata, .{ .content = owned }) catch |err| {
+                        try self.rollbackSpool(old_spool_len);
+                        return err;
+                    };
                 },
             }
         }
@@ -1054,20 +1153,32 @@ pub const RootTree = struct {
             .directory => .directory,
             .file => .file,
             .symlink => .symlink,
-            else => return error.EnumerationFailed,
+            .hardlink => .hardlink,
+            .block_device => .block_device,
+            .char_device => .char_device,
+            .fifo => .fifo,
         };
+        const carries_content = kind == .file or kind == .symlink;
         return .{
             .path = node.path,
             .kind = kind,
             .mode = node.metadata.mode,
             .uid = node.metadata.uid,
             .gid = node.metadata.gid,
-            .size = node.size(),
-            .content = if (kind == .directory) null else .{
+            .size = if (carries_content) node.size() else 0,
+            .content = if (carries_content) .{
                 .ctx = &node.payload.content,
                 .read_at_fn = readExt4Content,
-            },
+            } else null,
             .xattrs = node.metadata.xattrs,
+            .device = switch (node.payload) {
+                .device => |device| .{ .major = device.major, .minor = device.minor },
+                else => .{},
+            },
+            .hardlink_target = switch (node.payload) {
+                .hardlink_target => |target| target,
+                else => "",
+            },
         };
     }
 

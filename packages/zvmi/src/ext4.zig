@@ -149,6 +149,11 @@ pub const Kind = enum(u8) {
     directory,
     file,
     symlink,
+    /// A second name for a `file` entry's inode, named by `hardlink_target`.
+    hardlink,
+    block_device,
+    char_device,
+    fifo,
 };
 
 pub const PopulateOptions = struct {
@@ -264,6 +269,12 @@ pub const FileTreeView = struct {
         content: ?ContentReader = null,
         /// Optional extended attributes such as `user.*` or `security.*`.
         xattrs: []const Xattr = &.{},
+        /// Device numbers, for `block_device` and `char_device` only.
+        device: DeviceNumbers = .{},
+        /// The already-emitted path whose inode a `hardlink` shares. Copying
+        /// the bytes instead would silently break every consumer that relies
+        /// on shared identity, from package managers to `rsync -H`.
+        hardlink_target: []const u8 = "",
     };
 
     pub fn reset(self: *FileTreeView) void {
@@ -289,6 +300,10 @@ pub const PopulateError = std.mem.Allocator.Error || Io.File.ReadPositionalError
     MissingContentReader,
     UnexpectedContentLength,
     InvalidDirectorySize,
+    MissingHardlinkTarget,
+    UnsupportedHardlinkTarget,
+    TooManyHardlinks,
+    InvalidDeviceEntry,
     NotEnoughSpace,
     TooManyExtents,
     TooManyInodes,
@@ -339,6 +354,8 @@ const OwnedEntry = struct {
     size: u64,
     content: ?FileTreeView.ContentReader,
     xattrs: []OwnedXattr,
+    device: DeviceNumbers = .{},
+    hardlink_target: []u8 = &.{},
 };
 
 const Node = struct {
@@ -363,6 +380,11 @@ const Node = struct {
     extent_tree_blocks: []ExtentTreeBlock = &.{},
     xattr_block: ?u64 = null,
     link_count: u16 = 1,
+    device: DeviceNumbers = .{},
+    hardlink_target: []const u8 = "",
+    /// False for a `hardlink`, which reuses the inode its target owns and so
+    /// must be skipped everywhere an inode is allocated, counted or written.
+    owns_inode: bool = true,
     uses_fast_symlink: bool = false,
     uses_hashed_directory: bool = false,
     hashed_directory_index_block_count: u32 = 0,
@@ -420,6 +442,9 @@ const WriterPlan = struct {
     nodes: []Node,
     feature_ro_compat: u32,
     data_blocks_needed: u32,
+    /// Nodes that own an inode, which is fewer than `nodes.len` whenever the
+    /// tree contains hardlinks.
+    inode_count: usize,
 
     fn deinit(self: *WriterPlan, allocator: std.mem.Allocator) void {
         for (self.nodes) |node| {
@@ -434,7 +459,10 @@ const WriterPlan = struct {
             allocator.free(node.xattrs);
         }
         allocator.free(self.nodes);
-        for (self.entries) |entry| allocator.free(entry.path);
+        for (self.entries) |entry| {
+            allocator.free(entry.path);
+            if (entry.hardlink_target.len > 0) allocator.free(entry.hardlink_target);
+        }
         allocator.free(self.entries);
         self.* = undefined;
     }
@@ -548,7 +576,7 @@ fn preparePopulate(
     var layout = try buildLayout(
         allocator,
         total_blocks,
-        writer.nodes.len,
+        writer.inode_count,
         writer.data_blocks_needed,
     );
     errdefer allocator.free(layout.groups);
@@ -2466,6 +2494,9 @@ const StrictScanner = struct {
             .directory => inode_flag_extents | inode_flag_index,
             .file => inode_flag_extents,
             .symlink => if (fast_symlink) 0 else inode_flag_extents,
+            // `modeToKind` never yields these, so the strict reader cannot
+            // reach them; the general importer is the path that handles them.
+            .hardlink, .block_device, .char_device, .fifo => return error.UnsupportedInodeType,
         };
         if (inode.flags & ~allowed_flags != 0 or
             (inode.flags & inode_flag_extents != 0) != !fast_symlink or
@@ -4525,6 +4556,7 @@ fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: Populat
     errdefer {
         for (entries_list.items) |entry| {
             allocator.free(entry.path);
+            if (entry.hardlink_target.len > 0) allocator.free(entry.hardlink_target);
             freeOwnedXattrSlice(allocator, entry.xattrs);
         }
         entries_list.deinit();
@@ -4544,6 +4576,8 @@ fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: Populat
             .size = entry.size,
             .content = entry.content,
             .xattrs = owned_xattrs,
+            .device = entry.device,
+            .hardlink_target = try allocator.dupe(u8, entry.hardlink_target),
         });
     }
 
@@ -4572,16 +4606,20 @@ fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: Populat
     };
 
     var next_inode = first_non_reserved_inode;
+    var inode_count: usize = 1;
     for (entries_list.items, 0..) |*entry, index| {
         const parent_path = pathParent(entry.path);
         const parent_index = findNodeIndexByPath(nodes[0 .. index + 1], parent_path) orelse return error.MissingParentDirectory;
         if (nodes[parent_index].kind != .directory) return error.ParentNotDirectory;
+        const owns_inode = entry.kind != .hardlink;
         nodes[index + 1] = .{
             .path = entry.path,
             .name = pathBase(entry.path),
             .parent_path = parent_path,
             .parent_index = parent_index,
-            .inode = next_inode,
+            // A hardlink's inode number is only known once its target has one,
+            // and the target may sort after it, so it is filled in below.
+            .inode = if (owns_inode) next_inode else 0,
             .kind = entry.kind,
             .mode = entry.mode,
             .uid = entry.uid,
@@ -4589,9 +4627,28 @@ fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: Populat
             .declared_size = entry.size,
             .content = entry.content,
             .xattrs = entry.xattrs,
+            .device = entry.device,
+            .hardlink_target = entry.hardlink_target,
+            .owns_inode = owns_inode,
         };
         entry.xattrs = &.{};
-        next_inode += 1;
+        if (owns_inode) {
+            next_inode += 1;
+            inode_count += 1;
+        }
+    }
+
+    for (nodes) |*node| {
+        if (node.owns_inode) continue;
+        const target_index = findNodeIndexByPath(nodes, node.hardlink_target) orelse
+            return error.MissingHardlinkTarget;
+        // Only a regular file may be shared. Linking a directory would create
+        // a cycle no `fsck` accepts, and every other kind carries its whole
+        // state in the inode, so a second copy of it loses nothing.
+        if (nodes[target_index].kind != .file) return error.UnsupportedHardlinkTarget;
+        node.inode = nodes[target_index].inode;
+        nodes[target_index].link_count = std.math.add(u16, nodes[target_index].link_count, 1) catch
+            return error.TooManyHardlinks;
     }
 
     try buildDirectoryPayloads(allocator, nodes, options.block_size);
@@ -4631,7 +4688,11 @@ fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: Populat
                 node.data_block_count = if (node.uses_fast_symlink) 0 else blocksForBytes(node.size_on_disk, options.block_size);
                 data_blocks_needed += node.data_block_count;
             },
+            // A device or FIFO is entirely described by its inode, and a
+            // hardlink has no inode of its own at all.
+            .block_device, .char_device, .fifo, .hardlink => {},
         }
+        if (!node.owns_inode) continue;
         if (node.xattrs.len > 0) {
             node.xattr_block_bytes = try buildXattrBlock(allocator, node.xattrs, options.block_size);
             data_blocks_needed += 1;
@@ -4643,6 +4704,7 @@ fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: Populat
         .nodes = nodes,
         .feature_ro_compat = feature_ro_compat,
         .data_blocks_needed = data_blocks_needed,
+        .inode_count = inode_count,
     };
 }
 
@@ -4742,6 +4804,7 @@ fn buildFixedLayout(
 
 fn assignInodesToGroups(nodes: []Node, groups: []GroupLayout, inodes_per_group: u32) void {
     for (nodes) |node| {
+        if (!node.owns_inode) continue;
         const group_index = (node.inode - 1) / inodes_per_group;
         groups[group_index].used_inode_count += 1;
         if (node.kind == .directory) groups[group_index].used_dir_count += 1;
@@ -4815,6 +4878,8 @@ fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions)
     const uuid = options.uuid orelse [_]u8{0} ** 16;
     for (nodes) |node| {
         switch (node.kind) {
+            // Nothing outside the inode itself, so nothing to write here.
+            .hardlink, .block_device, .char_device, .fifo => {},
             .directory => {
                 const bytes = node.dir_bytes.?;
                 const dir_bytes = try std.heap.page_allocator.dupe(u8, bytes);
@@ -4928,6 +4993,10 @@ fn writeBitmaps(io: Io, file: Io.File, layout: Layout, offset: u64) PopulateErro
 fn writeInodes(io: Io, file: Io.File, nodes: []Node, layout: Layout, options: PopulateOptions) PopulateError!void {
     const uuid = options.uuid orelse [_]u8{0} ** 16;
     for (nodes) |node| {
+        // A hardlink shares the target's inode, which the target already
+        // wrote; writing it twice would be redundant at best and would
+        // overwrite the target's own link count at worst.
+        if (!node.owns_inode) continue;
         var buf: [inode_size]u8 = [_]u8{0} ** inode_size;
         writeInt(u16, buf[0..2], inodeMode(node));
         writeInt(u16, buf[2..4], @truncate(node.uid));
@@ -4938,11 +5007,21 @@ fn writeInodes(io: Io, file: Io.File, nodes: []Node, layout: Layout, options: Po
         writeInt(u16, buf[24..26], @truncate(node.gid));
         writeInt(u16, buf[26..28], node.link_count);
         writeInt(u32, buf[28..32], inodeSectorCount(node));
-        var inode_flags: u32 = if (node.uses_fast_symlink) 0 else inode_flag_extents;
+        const inline_inode = node.uses_fast_symlink or
+            node.kind == .block_device or node.kind == .char_device or node.kind == .fifo;
+        var inode_flags: u32 = if (inline_inode) 0 else inode_flag_extents;
         if (node.uses_hashed_directory) inode_flags |= inode_flag_index;
         writeInt(u32, buf[32..36], inode_flags);
 
-        if (node.uses_fast_symlink) {
+        if (node.kind == .block_device or node.kind == .char_device) {
+            // The Linux-native encoding in the second `i_block` word covers
+            // every number a modern device can carry; the legacy first-word
+            // form is left zero so the kernel reads the wide one.
+            writeInt(u32, buf[44..48], (node.device.major << 8) |
+                (node.device.minor & 0xFF) | ((node.device.minor & 0xFFF00) << 12));
+        } else if (node.kind == .fifo) {
+            // A FIFO stores nothing at all.
+        } else if (node.uses_fast_symlink) {
             const want: usize = @intCast(node.declared_size);
             if (want > 0) {
                 const content = node.content orelse return error.MissingContentReader;
@@ -5426,6 +5505,25 @@ fn validateTreeEntry(entry: FileTreeView.Entry) PopulateError!void {
     if (entry.path[0] == '/' or entry.path[entry.path.len - 1] == '/') return error.InvalidPath;
     if (entry.kind == .directory and entry.size != 0) return error.InvalidDirectorySize;
     if ((entry.kind == .file or entry.kind == .symlink) and entry.size > 0 and entry.content == null) return error.MissingContentReader;
+    switch (entry.kind) {
+        .hardlink => {
+            if (entry.hardlink_target.len == 0) return error.MissingHardlinkTarget;
+            if (std.mem.eql(u8, entry.hardlink_target, entry.path)) return error.UnsupportedHardlinkTarget;
+            if (entry.size != 0 or entry.xattrs.len != 0) return error.UnsupportedHardlinkTarget;
+        },
+        .block_device, .char_device => {
+            // The device numbers are the entire content of the node, so a
+            // truncating write would produce a node pointing somewhere else.
+            if (entry.size != 0) return error.InvalidDeviceEntry;
+            if (entry.device.major > 0xFFF or entry.device.minor > 0xF_FFFF) {
+                return error.InvalidDeviceEntry;
+            }
+        },
+        .fifo => if (entry.size != 0) return error.InvalidDeviceEntry,
+        .directory, .file, .symlink => if (entry.hardlink_target.len != 0) {
+            return error.UnsupportedHardlinkTarget;
+        },
+    }
     if (std.mem.eql(u8, entry.path, ".") or std.mem.eql(u8, entry.path, "..")) return error.InvalidPath;
 
     var start: usize = 0;
@@ -5704,16 +5802,22 @@ fn encodeLabel(label: []const u8) [16]u8 {
 fn kindToModeBits(kind: Kind) u16 {
     return switch (kind) {
         .directory => mode_dir,
-        .file => mode_reg,
+        .file, .hardlink => mode_reg,
         .symlink => mode_symlink,
+        .block_device => mode_block_device,
+        .char_device => mode_char_device,
+        .fifo => mode_fifo,
     };
 }
 
 fn kindToDirFileType(kind: Kind) u8 {
     return switch (kind) {
         .directory => dir_ft_dir,
-        .file => dir_ft_reg,
+        .file, .hardlink => dir_ft_reg,
         .symlink => dir_ft_symlink,
+        .block_device => dir_ft_block_device,
+        .char_device => dir_ft_char_device,
+        .fifo => dir_ft_fifo,
     };
 }
 
@@ -7689,6 +7793,8 @@ const InMemoryEntry = struct {
     bytes: []const u8 = "",
     xattrs: []const Xattr = &.{},
     generator: enum { none, pattern } = .none,
+    device: DeviceNumbers = .{},
+    hardlink_target: []const u8 = "",
 };
 
 const InMemoryTree = struct {
@@ -7733,13 +7839,15 @@ const InMemoryTree = struct {
             .gid = entry.gid,
             .size = entry.size,
             .content = switch (entry.kind) {
-                .directory => null,
                 .file, .symlink => .{
                     .ctx = &self.entries[self.index - 1],
                     .read_at_fn = readContent,
                 },
+                else => null,
             },
             .xattrs = entry.xattrs,
+            .device = entry.device,
+            .hardlink_target = entry.hardlink_target,
         };
     }
 
@@ -8461,4 +8569,105 @@ test "the general importer refuses a source with orphan inodes pending" {
         error.SourceHasOrphanInodes,
         scanReadable(&reader, io, std.testing.allocator, .{ .available_length = length }),
     );
+}
+
+test "the writer emits hardlinks devices and FIFOs that fsck and the general importer accept" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-ext4-writer-special.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const attrs = [_]Xattr{.{ .name = "security.selinux", .value = "system_u:object_r:device_t:s0" }};
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "dev", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "dev/console", .kind = .char_device, .mode = 0o600, .uid = 0, .gid = 0, .device = .{ .major = 5, .minor = 1 }, .xattrs = &attrs },
+        .{ .path = "dev/initctl", .kind = .fifo, .mode = 0o600, .uid = 0, .gid = 0 },
+        .{ .path = "dev/loop0", .kind = .block_device, .mode = 0o660, .uid = 0, .gid = 6, .device = .{ .major = 7, .minor = 300 } },
+        .{ .path = "usr", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "usr/tool", .kind = .file, .mode = 0o755, .uid = 0, .gid = 0, .size = 5, .bytes = "hello" },
+        .{ .path = "usr/alias", .kind = .hardlink, .mode = 0o755, .uid = 0, .gid = 0, .hardlink_target = "usr/tool" },
+    });
+    tree.bind();
+
+    const length = 8 * 1024 * 1024;
+    {
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+        defer file.close(io);
+        _ = try populate(io, file, allocator, &tree.view, .{
+            .length = length,
+            .uuid = [_]u8{0x5a} ** 16,
+            .timestamp = 1_700_000_000,
+        });
+    }
+    try expectE2fsckClean(path);
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var reader = try openGeneral(io, file, allocator, .{});
+    defer reader.deinit();
+    var imported = try scanReadable(&reader, io, allocator, .{ .available_length = length });
+    defer imported.deinit();
+
+    const console = findGeneralEntry(&imported, "dev/console").?;
+    try std.testing.expectEqual(GeneralKind.char_device, console.kind);
+    try std.testing.expectEqual(@as(u32, 5), console.device.major);
+    try std.testing.expectEqual(@as(u32, 1), console.device.minor);
+    try expectGeneralXattr(console, "security.selinux", "system_u:object_r:device_t:s0");
+
+    const loop0 = findGeneralEntry(&imported, "dev/loop0").?;
+    try std.testing.expectEqual(GeneralKind.block_device, loop0.kind);
+    try std.testing.expectEqual(@as(u32, 7), loop0.device.major);
+    // Wider than eight bits, so this proves the Linux-native encoding is used.
+    try std.testing.expectEqual(@as(u32, 300), loop0.device.minor);
+
+    try std.testing.expectEqual(GeneralKind.fifo, findGeneralEntry(&imported, "dev/initctl").?.kind);
+
+    // The importer walks names in sorted order and gives the content to the
+    // first one it reaches, so `usr/alias` owns it and `usr/tool` links to it.
+    const alias = findGeneralEntry(&imported, "usr/alias").?;
+    const tool = findGeneralEntry(&imported, "usr/tool").?;
+    try std.testing.expectEqual(GeneralKind.file, alias.kind);
+    try std.testing.expectEqual(GeneralKind.hardlink, tool.kind);
+    try std.testing.expectEqualStrings("usr/alias", tool.hardlink_target);
+    const bytes = try readGeneralEntryAlloc(allocator, alias);
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("hello", bytes);
+}
+
+test "the writer refuses hardlink and device entries it cannot represent" {
+    const io = std.testing.io;
+    const path = "test-ext4-writer-special-reject.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const Case = struct { entries: []const InMemoryEntry, expected: anyerror };
+    const dangling = [_]InMemoryEntry{
+        .{ .path = "a", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 1, .bytes = "x" },
+        .{ .path = "b", .kind = .hardlink, .mode = 0o644, .uid = 0, .gid = 0, .hardlink_target = "missing" },
+    };
+    const to_directory = [_]InMemoryEntry{
+        .{ .path = "d", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "b", .kind = .hardlink, .mode = 0o644, .uid = 0, .gid = 0, .hardlink_target = "d" },
+    };
+    const untargeted = [_]InMemoryEntry{
+        .{ .path = "b", .kind = .hardlink, .mode = 0o644, .uid = 0, .gid = 0 },
+    };
+    const oversized_device = [_]InMemoryEntry{
+        .{ .path = "n", .kind = .char_device, .mode = 0o600, .uid = 0, .gid = 0, .device = .{ .major = 0x1_0000, .minor = 0 } },
+    };
+    const cases = [_]Case{
+        .{ .entries = &dangling, .expected = error.MissingHardlinkTarget },
+        .{ .entries = &to_directory, .expected = error.UnsupportedHardlinkTarget },
+        .{ .entries = &untargeted, .expected = error.MissingHardlinkTarget },
+        .{ .entries = &oversized_device, .expected = error.InvalidDeviceEntry },
+    };
+
+    for (cases) |case| {
+        var tree = InMemoryTree.init(case.entries);
+        tree.bind();
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+        defer file.close(io);
+        try std.testing.expectError(case.expected, populate(io, file, std.testing.allocator, &tree.view, .{
+            .length = 8 * 1024 * 1024,
+        }));
+    }
 }
