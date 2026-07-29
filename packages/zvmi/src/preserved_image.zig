@@ -1343,26 +1343,35 @@ const MountedSource = struct {
                     .{ .offset = partition.offset },
                 );
                 self.reader_open = true;
-                self.tree = .{ .ext4 = ScannedSource.scan(
+                // Scanned into a local and only then published. Assigning the
+                // union member directly would let the result location write
+                // the tag before the scan that fills the payload fails, and
+                // the cleanup path would then walk a tagged tree full of
+                // undefined pointers. Both trees are movable until
+                // `fileTreeView` hands out a pointer to one, which happens
+                // later, at mount time.
+                const scanned = ScannedSource.scan(
                     &self.reader,
                     io,
                     allocator,
                     options,
                     partition.length,
                     budget.caps(&local),
-                ) catch |err| return budget.failed(local, err) };
+                ) catch |err| return budget.failed(local, err);
+                self.tree = .{ .ext4 = scanned };
             },
             .fat32 => {
                 self.filesystem = try fat32.open(&self.image, io, .{
                     .offset = partition.offset,
                     .length = partition.length,
                 });
-                self.tree = .{ .fat = fat32.scanTree(
+                const scanned = fat32.scanTree(
                     &self.filesystem,
                     io,
                     allocator,
                     fatScanOptions(options, spec, budget.caps(&local)),
-                ) catch |err| return budget.failed(local, err) };
+                ) catch |err| return budget.failed(local, err);
+                self.tree = .{ .fat = scanned };
             },
         }
         budget.fold(local);
@@ -1406,7 +1415,12 @@ const MountedSource = struct {
         tree: *root_tree.RootTree,
         mode: enum { owned, borrowed },
     ) !root_tree.RootTree.MountReport {
-        const scanned = &(self.tree orelse return error.MountSourceNotScanned);
+        // Addressed through the field rather than through `orelse`, whose
+        // result is a copy: `fileTreeView` below hands the writer a pointer
+        // into the tree it is called on, and that pointer has to name the
+        // tree this source owns.
+        if (self.tree == null) return error.MountSourceNotScanned;
+        const scanned = &self.tree.?;
         return switch (scanned.*) {
             .ext4 => |*source| switch (source.*) {
                 // A strict source's root directory is whatever this project's
@@ -4556,4 +4570,46 @@ test "limits and peaks are accounted across every merged source, not per source"
     // flag can be raised above a number that was never configured.
     try std.testing.expectEqual(ceiling, breach.configured);
     try std.testing.expect(breach.observed > breach.configured);
+}
+
+test "a source whose scan fails leaves nothing behind for cleanup to walk" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const source_path = ".test-merge-failed-scan-cleanup.img";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    createMergeTestDisk(allocator, io, source_path) catch |err| switch (err) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const options = RebuildOptions{
+        .source_path = source_path,
+        .output_path = ".test-merge-failed-scan-cleanup.out",
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 3 },
+        .source_profile = .general,
+        .source_date_epoch = 1_735_689_600,
+    };
+
+    // Both source kinds, because each publishes its scanned tree through its
+    // own branch and each has to leave the field alone when the scan fails.
+    // A partially assigned tree is invisible until the cleanup path walks it,
+    // and what it walks then is undefined memory: the failure surfaces as a
+    // fault somewhere else entirely, if it surfaces at all.
+    const cases = [_]SourceMount{
+        .{ .partition = .{ .mbr_index = 2 }, .target = "/boot" },
+        .{ .partition = .{ .mbr_index = 1 }, .target = "/boot/efi" },
+    };
+    for (cases) |spec| {
+        var budget = CombinedBudget{ .limits = .{ .max_nodes = 1 }, .sink = null };
+        var mount = MountedSource{ .target = spec.target };
+        defer mount.deinit(io);
+        try std.testing.expectError(
+            error.NodeLimitExceeded,
+            mount.open(allocator, io, spec, options, source_path, &budget),
+        );
+        try std.testing.expect(mount.tree == null);
+        try std.testing.expectEqual(@as(usize, 0), mount.nodeCount());
+    }
 }
