@@ -24,6 +24,17 @@ pub const SourceProfile = enum {
     general,
 };
 
+/// Whether the rebuilt root filesystem carries a JBD2 journal, and how large.
+/// `rebuild`-only, like every other field that describes the filesystem the
+/// rebuild writes. Off by default so a configuration written before this
+/// existed keeps producing the same bytes.
+pub const JournalPolicy = struct {
+    enabled: bool = false,
+    /// Journal size in bytes, a whole number of filesystem blocks. Null takes
+    /// the `mke2fs`-derived default scaled to the filesystem size.
+    size_bytes: ?u64 = null,
+};
+
 /// What the rebuild is allowed to do about the identifiers it retires.
 /// `rewrite_and_verify` is the default because the failure the verification
 /// pass prevents -- an image whose `/etc/fstab` or bootloader configuration
@@ -220,6 +231,10 @@ pub const Configuration = struct {
     /// reason as the two fields above: every other backend keeps the source's
     /// filesystems exactly as they are, so nothing is ever retired.
     identity_rewrite: IdentityRewrite = .rewrite_and_verify,
+    /// Whether the rebuilt root filesystem gets a journal. `rebuild`-only:
+    /// every other backend preserves the source's filesystem rather than
+    /// writing a new one, so there is nothing here for it to decide.
+    journal: JournalPolicy = .{},
 };
 
 pub const ValidationError = error{
@@ -236,6 +251,7 @@ pub const ValidationError = error{
     UnexpectedSourceProfile,
     UnexpectedSourceMounts,
     UnexpectedIdentityRewrite,
+    UnexpectedJournalPolicy,
     MissingMountTarget,
 };
 
@@ -273,6 +289,11 @@ pub fn validate(configuration: Configuration, source_count: usize) ValidationErr
         configuration.identity_rewrite != .rewrite_and_verify)
     {
         return error.UnexpectedIdentityRewrite;
+    }
+    if (configuration.backend != .rebuild and
+        (configuration.journal.enabled or configuration.journal.size_bytes != null))
+    {
+        return error.UnexpectedJournalPolicy;
     }
     for (configuration.source_mounts) |mount| {
         try validatePartition(mount.partition);
@@ -551,6 +572,39 @@ test "the identity rewrite policy only travels with the backend that can retire 
         .backend = .native_edit,
         .root_partition = .{ .mbr_index = 3 },
         .identity_rewrite = .off,
+    }, 0));
+    try validate(.{
+        .backend = .native_edit,
+        .root_partition = .{ .mbr_index = 3 },
+    }, 0);
+}
+
+test "the journal policy only travels with the backend that writes a filesystem" {
+    try validate(.{
+        .backend = .rebuild,
+        .root_partition = .{ .mbr_index = 3 },
+        .journal = .{ .enabled = true },
+    }, 0);
+    try validate(.{
+        .backend = .rebuild,
+        .root_partition = .{ .mbr_index = 3 },
+        .journal = .{ .enabled = true, .size_bytes = 32 * 1024 * 1024 },
+    }, 0);
+    // Every other backend preserves the source's filesystem rather than
+    // writing a new one, so a journal setting there would read as an accepted
+    // durability choice that nothing acts on.
+    try std.testing.expectError(error.UnexpectedJournalPolicy, validate(.{
+        .backend = .native_edit,
+        .root_partition = .{ .mbr_index = 3 },
+        .journal = .{ .enabled = true },
+    }, 0));
+    // A size without `enabled` is refused for the same reason: it is still a
+    // journal setting, and silence about it would be the misleading part.
+    try std.testing.expectError(error.UnexpectedJournalPolicy, validate(.{
+        .backend = .vm,
+        .root_partition = .{ .mbr_index = 3 },
+        .vm = .{ .emulator_command = "qemu-system-x86_64" },
+        .journal = .{ .size_bytes = 32 * 1024 * 1024 },
     }, 0));
     try validate(.{
         .backend = .native_edit,

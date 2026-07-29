@@ -77,6 +77,11 @@ pub const BuildImageOptions = struct {
     generalization: os_customization.GeneralizationPolicy = .none,
     esp_size: u64 = default_esp_size,
     ext4_label: []const u8 = "rootfs",
+    /// Whether the root filesystem carries a JBD2 journal, and how large.
+    /// Off by default, matching every build that predates the option. Turn
+    /// it on for an image that boots into a mutable root filesystem, where
+    /// an unclean shutdown otherwise leaves nothing to replay.
+    ext4_journal: ext4.JournalOptions = .{},
     /// Optional SELinux context for the implicit ext4 root inode. The stored
     /// xattr includes the NUL terminator expected by SELinux tooling.
     root_selinux_label: ?[]const u8 = null,
@@ -414,6 +419,11 @@ pub fn build(
     }
 
     const root_partition = findRootPartition(planned_partitions, architecture) orelse return error.MissingRootPartition;
+    // A dm-verity root is mounted read-only over a hash tree computed from
+    // its exact bytes, so it is never written to and has nothing to journal.
+    // Accepting the combination would cost real space and imply a durability
+    // property the image does not have.
+    if (options.verity and options.ext4_journal.enabled) return error.JournalWithVerityRoot;
     const verity_layout = if (options.verity)
         try verity.splitPartition(root_partition.planned.length_bytes, ext4.default_block_size, ext4.default_block_size)
     else
@@ -481,6 +491,7 @@ pub fn build(
         .root_xattrs = root_xattrs,
         .uuid = root_filesystem_uuid,
         .timestamp = if (options.deterministic) |deterministic| deterministic.filesystem_timestamp else 0,
+        .journal = options.ext4_journal,
     });
 
     if (verity_layout) |layout_for_verity| {

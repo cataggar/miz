@@ -5,7 +5,7 @@ const zvmi = @import("zvmi");
 const opts = @import("opts.zig");
 
 const help_text =
-    \\usage: zvmi build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}|-> [-O raw|raw.gz|raw.zst|vhd|vhdx|qcow2] [--compress-level <1-9>] [--rootfs-path <path>] [--skip-iso-rootfs] [--max-oci-blob-size <size>] [--max-oci-layer-size <size>] [--max-oci-archive-size <size>] [--esp-size <size>] [--ext4-label <label>] [--root-selinux-label <context>] [--stub-source-path <path>] [--os-release-source-path <path>] [--splash-source-path <path>] [--uki-output-directory <path>] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--dry-run] [-v]
+    \\usage: zvmi build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}|-> [-O raw|raw.gz|raw.zst|vhd|vhdx|qcow2] [--compress-level <1-9>] [--rootfs-path <path>] [--skip-iso-rootfs] [--max-oci-blob-size <size>] [--max-oci-layer-size <size>] [--max-oci-archive-size <size>] [--esp-size <size>] [--ext4-label <label>] [--journal|--no-journal] [--journal-size <size>] [--root-selinux-label <context>] [--stub-source-path <path>] [--os-release-source-path <path>] [--splash-source-path <path>] [--uki-output-directory <path>] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--dry-run] [-v]
     \\
     \\Options:
     \\  -o <path>|-                Output path, or - to stream the image to stdout.
@@ -18,6 +18,17 @@ const help_text =
     \\  --esp-size <size>          ESP size (default 96M). UKI/both commonly need 512M or larger.
     \\  --generation 1|2           Azure VM generation (default 2).
     \\  --ext4-label <label>       Root ext4 filesystem label (default rootfs).
+    \\  --journal, --no-journal    Create a JBD2 journal on the root filesystem, or not
+    \\                              (default --no-journal, matching every earlier build).
+    \\                              Use --journal for an image that boots into a mutable
+    \\                              root filesystem: without one, an unclean shutdown
+    \\                              leaves nothing to replay and the next boot faces a
+    \\                              full fsck. Incompatible with --verity, whose root is
+    \\                              read-only and has nothing to journal.
+    \\  --journal-size <size>      Journal size, a whole number of 4K blocks between 4M
+    \\                              and half the filesystem. Implies --journal. Defaults
+    \\                              to mke2fs's own scale: 4M below 128M, 16M below 1G,
+    \\                              32M below 2G, 64M below 16G, up to 1G.
     \\  --root-selinux-label <context>
     \\                              SELinux context for the implicit root inode.
     \\  --skip-iso-rootfs          Use the container as the root filesystem; keep only boot-critical files from the ISO/squashfs.
@@ -90,6 +101,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var size: ?u64 = null;
     var esp_size: ?u64 = null;
     var ext4_label: []const u8 = "rootfs";
+    var journal = zvmi.ext4.JournalOptions{};
     var root_selinux_label: ?[]const u8 = null;
     var stub_source_path: ?[]const u8 = null;
     var os_release_source_path: ?[]const u8 = null;
@@ -137,6 +149,19 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             i += 1;
             if (i >= args.len) return fail("build-image: --ext4-label requires a value", .{});
             ext4_label = args[i];
+        } else if (std.mem.eql(u8, arg, "--journal")) {
+            journal.enabled = true;
+        } else if (std.mem.eql(u8, arg, "--no-journal")) {
+            // Only `enabled` is cleared: an explicit --journal-size that
+            // follows still means what it says, and one that preceded it was
+            // just overruled.
+            journal.enabled = false;
+        } else if (std.mem.eql(u8, arg, "--journal-size")) {
+            i += 1;
+            if (i >= args.len) return fail("build-image: --journal-size requires a value", .{});
+            journal.size_bytes = zvmi.parseSize(args[i]) catch |err|
+                return fail("build-image: invalid --journal-size '{s}': {s}", .{ args[i], @errorName(err) });
+            journal.enabled = true;
         } else if (std.mem.eql(u8, arg, "--root-selinux-label")) {
             i += 1;
             if (i >= args.len) return fail("build-image: --root-selinux-label requires a value", .{});
@@ -251,6 +276,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             .skip_iso_rootfs = skip_iso_rootfs,
             .esp_size = esp_size orelse zvmi.build_image.default_esp_size,
             .ext4_label = ext4_label,
+            .ext4_journal = journal,
             .root_selinux_label = root_selinux_label,
             .verity = enable_verity,
             .extra_kernel_options = extra_kernel_options,
@@ -399,6 +425,26 @@ fn describeBuildImageFailure(
             u8,
             "build-image: failed: --verity was requested, but the source initramfs (boot/initrd*/boot/initramfs* in the merged ISO/squashfs/container tree) does not include dm-verity userspace tooling (systemd-veritysetup-generator, systemd-veritysetup, or veritysetup).\nWithout it, systemd-veritysetup-generator never runs and the built image will hang at boot waiting on /dev/mapper/root (see https://github.com/cataggar/zvmi/issues/77).\nRebuild the initramfs with that tooling included (e.g. dracut --add veritysetup, or the equivalent module/package for the base OS's initramfs generator) before using --verity.",
         ),
+        error.JournalWithVerityRoot => allocator.dupe(
+            u8,
+            "build-image: failed: --journal and --verity cannot be combined.\nA dm-verity root is mounted read-only over a hash tree computed from its exact bytes, so it is never written to and has nothing to journal; the journal would only consume space and imply a durability property the image does not have.\nDrop --journal for a verity image, or drop --verity for a mutable journalled root.",
+        ),
+        error.FilesystemTooSmallForJournal => allocator.dupe(
+            u8,
+            "build-image: failed: --journal was requested, but the root filesystem is smaller than the 8M minimum a JBD2 journal needs.\nIncrease --size, or drop --journal.",
+        ),
+        error.JournalSizeTooSmall => allocator.dupe(
+            u8,
+            "build-image: failed: --journal-size is below the 4M JBD2 minimum that mke2fs also enforces.\nPass at least 4M, or omit --journal-size to use the default scaled to the filesystem size.",
+        ),
+        error.JournalSizeTooLarge => allocator.dupe(
+            u8,
+            "build-image: failed: --journal-size exceeds what the root filesystem can carry: a journal may be at most half the filesystem, and at most 40G.\nReduce --journal-size, increase --size, or omit --journal-size to use the default scaled to the filesystem size.",
+        ),
+        error.UnalignedJournalSize => allocator.dupe(
+            u8,
+            "build-image: failed: --journal-size must be a non-zero whole number of 4K filesystem blocks.\nRound it to a multiple of 4K, for example 32M.",
+        ),
         error.CompressionRequiresRawFormat => outputConstraintMessage(allocator, error.CompressionRequiresRawFormat),
         error.FormatRequiresSeekableOutput => outputConstraintMessage(allocator, error.FormatRequiresSeekableOutput),
         error.CompressionLevelNotSupportedForZstd => outputConstraintMessage(allocator, error.CompressionLevelNotSupportedForZstd),
@@ -428,6 +474,30 @@ test "describeBuildImageFailure explains an unstreamable output format" {
 
     try std.testing.expect(std.mem.indexOf(u8, message, "stdout") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "raw.gz") != null);
+}
+
+test "describeBuildImageFailure explains why a journal and verity cannot be combined" {
+    const message = try describeBuildImageFailure(std.testing.allocator, error.JournalWithVerityRoot, .{});
+    defer std.testing.allocator.free(message);
+
+    try std.testing.expect(std.mem.indexOf(u8, message, "--journal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "--verity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "read-only") != null);
+}
+
+test "describeBuildImageFailure names the journal size that was refused" {
+    const too_small = try describeBuildImageFailure(std.testing.allocator, error.JournalSizeTooSmall, .{});
+    defer std.testing.allocator.free(too_small);
+    try std.testing.expect(std.mem.indexOf(u8, too_small, "--journal-size") != null);
+    try std.testing.expect(std.mem.indexOf(u8, too_small, "4M") != null);
+
+    const unaligned = try describeBuildImageFailure(std.testing.allocator, error.UnalignedJournalSize, .{});
+    defer std.testing.allocator.free(unaligned);
+    try std.testing.expect(std.mem.indexOf(u8, unaligned, "4K") != null);
+
+    const too_small_fs = try describeBuildImageFailure(std.testing.allocator, error.FilesystemTooSmallForJournal, .{});
+    defer std.testing.allocator.free(too_small_fs);
+    try std.testing.expect(std.mem.indexOf(u8, too_small_fs, "--size") != null);
 }
 
 test "describeBuildImageFailure explains MissingUkiStub" {

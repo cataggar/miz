@@ -146,6 +146,14 @@ pub const Options = struct {
     skip_iso_rootfs: bool = false,
     esp_size: ?u64 = null,
     ext4_label: []const u8 = "rootfs",
+    /// Create a JBD2 journal on the root filesystem. Off by default, so an
+    /// existing image definition keeps producing the bytes it always has.
+    /// Turn it on for an image that boots into a mutable root filesystem;
+    /// it cannot be combined with `verity`, whose root is read-only.
+    journal: bool = false,
+    /// Journal size in bytes. Null takes the `mke2fs`-derived default scaled
+    /// to the filesystem size. Ignored unless `journal` is set.
+    journal_size: ?u64 = null,
     verity: bool = false,
     extra_kernel_options: []const u8 = "",
     boot_mode: BootMode = .bls,
@@ -228,6 +236,7 @@ pub const PreservedVmPolicy = preserved_image_wire.VmConfiguration;
 pub const PreservedSourceProfile = preserved_image_wire.SourceProfile;
 pub const PreservedSourceMount = preserved_image_wire.SourceMount;
 pub const PreservedIdentityRewrite = preserved_image_wire.IdentityRewrite;
+pub const PreservedJournalPolicy = preserved_image_wire.JournalPolicy;
 pub const PreservedSourceFilesystem = preserved_image_wire.SourceFilesystem;
 pub const PreservedSynthesizedFatMetadata = preserved_image_wire.SynthesizedFatMetadata;
 
@@ -267,6 +276,12 @@ pub const PreservedOptions = struct {
     /// an ESP retires the identifiers that named them, and an image whose
     /// configuration still names them does not boot.
     identity_rewrite: PreservedIdentityRewrite = .rewrite_and_verify,
+    /// Whether the `rebuild` backend gives the rebuilt root filesystem a
+    /// JBD2 journal, and how large. Off by default, so an existing image
+    /// definition keeps producing the bytes it always has. Only the
+    /// `rebuild` backend writes a filesystem, so this is meaningless -- and
+    /// refused -- for the others.
+    journal: PreservedJournalPolicy = .{},
     verbose: bool = false,
 };
 
@@ -551,6 +566,7 @@ fn materializePreservedConfiguration(
         .source_profile = options.source_profile,
         .source_mounts = options.source_mounts,
         .identity_rewrite = options.identity_rewrite,
+        .journal = options.journal,
         .operations = operations,
         .customization = .{
             .os = .{
@@ -647,6 +663,8 @@ fn configureRequest(
     if (options.skip_iso_rootfs) run.addArg("--skip-iso-rootfs");
     if (options.esp_size) |size| run.addArgs(&.{ "--esp-size", b.fmt("{d}", .{size}) });
     if (!std.mem.eql(u8, options.ext4_label, "rootfs")) run.addArgs(&.{ "--ext4-label", options.ext4_label });
+    if (options.journal) run.addArg("--journal");
+    if (options.journal_size) |size| run.addArgs(&.{ "--journal-size", b.fmt("{d}", .{size}) });
     if (options.verity) run.addArg("--verity");
     if (options.extra_kernel_options.len != 0) run.addArgs(&.{ "--extra-kernel-options", options.extra_kernel_options });
     if (options.boot_mode != .bls) run.addArgs(&.{ "--boot-mode", options.boot_mode.cliName() });
