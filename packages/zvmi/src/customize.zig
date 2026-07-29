@@ -28,7 +28,7 @@ const verity = @import("verity.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 5;
+pub const plan_schema_version: u32 = 6;
 pub const provenance_schema_version: u32 = 9;
 const mib: u64 = 1024 * 1024;
 
@@ -163,8 +163,14 @@ pub const FreshStorage = struct {
 
 pub const PartitionSelector = preserved_image.PartitionSelector;
 
+pub const SourceProfilePolicy = preserved_image.SourceProfilePolicy;
+
 pub const PreservedStorage = struct {
     root_partition: PartitionSelector,
+    /// Only the `rebuild` backend imports a filesystem, so this only reaches
+    /// that path; the others preserve the source's bytes rather than reading
+    /// its tree at all.
+    source_profile: SourceProfilePolicy = .strict,
 };
 pub const PreserveStorage = PreservedStorage;
 pub const RootPartitionSelector = PartitionSelector;
@@ -1864,6 +1870,7 @@ pub const ResolvedFreshStorage = struct {
 
 pub const ResolvedPreservedStorage = struct {
     root_partition: PartitionSelector,
+    source_profile: SourceProfilePolicy = .strict,
 };
 
 pub const ResolvedStorage = union(enum) {
@@ -2226,6 +2233,7 @@ pub fn resolve(
         } },
         .preserve => |storage| .{ .preserve = .{
             .root_partition = storage.root_partition,
+            .source_profile = storage.source_profile,
         } },
     };
     const resolved_os = try dupeOsCustomization(plan_allocator, request.os, context.base_path);
@@ -2969,7 +2977,7 @@ fn buildCapabilities(
             try capabilities.append(.{ .kind = .standalone_output, .path = output.path, .reason = "publish a standalone output with any backing chain flattened" });
         },
         .rebuild => {
-            try capabilities.append(.{ .kind = .rebuild, .path = "", .reason = "extract and rebuild the strict writer-compatible ext4 profile without guest execution" });
+            try capabilities.append(.{ .kind = .rebuild, .path = "", .reason = "extract and rebuild the selected ext4 source profile without guest execution" });
             try capabilities.append(.{ .kind = .standalone_output, .path = output.path, .reason = "publish a standalone rebuilt output" });
         },
         .unsafe_chroot => {
@@ -3218,7 +3226,10 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
             hashString(&hash, storage.ext4_label);
             hashBool(&hash, storage.skip_iso_rootfs);
         },
-        .preserve => |storage| hashPartitionSelector(&hash, storage.root_partition),
+        .preserve => |storage| {
+            hashPartitionSelector(&hash, storage.root_partition);
+            hash.update(@tagName(storage.source_profile));
+        },
     }
     hashOsCustomization(&hash, plan.os);
     hashExistingPathOperations(&hash, plan.existing_path_operations);
@@ -4027,6 +4038,7 @@ fn rebuildAvailable(io: Io, plan: *const ResolvedPlan) CapabilityState {
         .output_path = plan.data.staging_output_path,
         .output_format = output_format,
         .root_partition = storage.root_partition,
+        .source_profile = storage.source_profile,
         .existing_operations = plan.data.existing_path_operations,
         .customization = plan.data.os,
         .generalization = plan.data.generalization,
@@ -4888,6 +4900,7 @@ pub fn execute(
                 .output_format = plan.data.output.format.imageFormat().?,
                 .output_compression = plan.data.output.format.compression(),
                 .root_partition = plan.data.storage.preserve.root_partition,
+                .source_profile = plan.data.storage.preserve.source_profile,
                 .existing_operations = plan.data.existing_path_operations,
                 .customization = plan.data.os,
                 .generalization = plan.data.generalization,
@@ -4897,7 +4910,7 @@ pub fn execute(
                 .expected_virtual_size = null,
                 .output_create_options = outputCreateOptions(plan),
             }) catch |err| {
-                try appendFailure(&diagnostics, .execution_failed, .execution, "/execution/backend", "strict preserved-image rebuild failed", err);
+                try appendFailure(&diagnostics, .execution_failed, .execution, "/execution/backend", "preserved-image rebuild failed", err);
                 try appendLimitFailure(
                     &diagnostics,
                     limit_sink,
@@ -7370,7 +7383,7 @@ test "plan JSON renders identifiers as stable strings" {
     defer output.deinit();
     try writePlanJson(&resolved.plan.?, &output.writer);
     const json = output.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 6") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"plan_hash\": \"") != null);
 }
 

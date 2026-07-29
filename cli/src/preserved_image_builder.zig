@@ -36,6 +36,7 @@ const ParsedArgs = struct {
 const LoadedConfiguration = struct {
     backend: zvmi.customize.ExecutionBackend,
     root_partition: zvmi.customize.PartitionSelector,
+    source_profile: zvmi.customize.SourceProfilePolicy,
     operations: []const zvmi.customize.ExistingPathOperation,
     os: zvmi.customize.OsCustomization,
     generalization: zvmi.customize.GeneralizationPolicy,
@@ -160,6 +161,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .storage = .{ .preserve = .{
             .root_partition = configuration.root_partition,
+            .source_profile = configuration.source_profile,
         } },
         .os = configuration.os,
         .existing_path_operations = configuration.operations,
@@ -491,6 +493,7 @@ fn loadV2Configuration(
             .gpt_index => |index| .{ .gpt_index = index },
             .mbr_index => |index| .{ .mbr_index = index },
         },
+        .source_profile = .strict,
         .operations = try mapOperations(allocator, parsed.value.operations, source_paths),
         .os = customization.os,
         .generalization = customization.generalization,
@@ -530,6 +533,10 @@ fn loadV3Configuration(
         .root_partition = switch (parsed.value.root_partition) {
             .gpt_index => |index| .{ .gpt_index = index },
             .mbr_index => |index| .{ .mbr_index = index },
+        },
+        .source_profile = switch (parsed.value.source_profile) {
+            .strict => .strict,
+            .general => .general,
         },
         .operations = try mapOperations(allocator, parsed.value.operations, source_paths),
         .os = customization.os,
