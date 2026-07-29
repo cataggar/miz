@@ -11,6 +11,7 @@ const Format = @import("formats.zig").Format;
 const free_space = @import("free_space.zig");
 const gpt = @import("gpt.zig");
 const guid = @import("guid.zig");
+const identity_rewrite = @import("identity_rewrite.zig");
 const limits_mod = @import("limits.zig");
 const image_mod = @import("image.zig");
 const Image = image_mod.Image;
@@ -161,6 +162,17 @@ pub const RebuildOptions = struct {
     /// rather than merging into it, exactly as a real mount hides the
     /// directory underneath. See `root_tree.RootTree.mountExt4General`.
     source_mounts: []const SourceMount = &.{},
+    /// Whether the imported `/etc/fstab` and bootloader configuration are
+    /// reconciled with the identifiers the rebuilt image actually has, and
+    /// whether a surviving stale identifier fails the build. Merging a
+    /// `/boot` filesystem or an ESP into the root retires the identifiers
+    /// that named them, and an image whose configuration still names them
+    /// does not boot; see `identity_rewrite`.
+    identity_rewrite: identity_rewrite.Policy = .rewrite_and_verify,
+    /// Optional sink for the first surviving stale identifier. Reports are
+    /// returned by value, so a rebuild that fails on one can only hand back
+    /// the offending path through a sink the caller still owns.
+    identity_diagnostic: ?*identity_rewrite.Diagnostic = null,
     /// Every limit the import enforces, each raisable by its own flag.
     limits: limits_mod.ImportLimits = .{},
     /// Optional sink for the peak measurements and the first limit breach.
@@ -293,6 +305,8 @@ pub const RebuildReport = struct {
     existing_operation_count: usize,
     os_customization_count: usize,
     generalization_count: usize,
+    /// What the identity reconciliation changed, and what it could not.
+    identity_rewrite: identity_rewrite.Report,
     /// The largest value each limit reached. A caller sizes the next run's
     /// flags from these instead of guessing.
     limit_peaks: limits_mod.Peaks,
@@ -320,6 +334,11 @@ pub const RebuildInspection = struct {
     merged_source_count: usize,
     /// Nodes the mount points hid, summed over every merge.
     shadowed_node_count: usize,
+    /// What the identity reconciliation would change, and what it could not.
+    /// Inspection runs the same rewrite and the same verification pass over a
+    /// throwaway tree, so a source whose configuration cannot be reconciled
+    /// is refused before any file is created rather than after a full import.
+    identity_rewrite: identity_rewrite.Report,
     /// The largest value each limit reached during the inspection, which
     /// covers the same limits a rebuild enforces. Sizing flags from a dry run
     /// is the point of inspecting.
@@ -592,6 +611,15 @@ pub fn inspectRebuild(
         &validation_tree,
         options.generalization,
     );
+    var identity_plan = try buildIdentityPlan(allocator, io, options, source, &sources);
+    defer identity_plan.deinit();
+    const identity_report = try identity_rewrite.apply(
+        allocator,
+        &validation_tree,
+        identity_plan.plan,
+        options.identity_rewrite,
+        options.identity_diagnostic,
+    );
     const scanned_label = scanned.label();
     const scanned_timestamp = scanned.globalTimestamp(options.source_date_epoch);
     _ = try ext4.preflightPopulate(
@@ -617,6 +645,7 @@ pub fn inspectRebuild(
         .imported_node_count = imported_node_count,
         .merged_source_count = sources.mounts.len,
         .shadowed_node_count = sources.shadowed_nodes,
+        .identity_rewrite = identity_report,
         .limit_peaks = if (options.limit_diagnostic) |sink| sink.peaks else .{},
         .workspace_space = workspaceSpace(
             output_path,
@@ -762,6 +791,22 @@ pub fn rebuild(
     );
     try os_customization.generalize(allocator, &tree, options.generalization);
 
+    var identity_plan = try buildIdentityPlan(allocator, io, options, source, &sources);
+    defer identity_plan.deinit();
+    // Last of the tree passes on purpose: the verification pass has to have
+    // the final say on what the image contains, so a customization that
+    // reintroduced a retired identifier is caught rather than run after the
+    // check that would have caught it. Still ahead of every output file, so
+    // a stale identifier costs a rejection and not a published unbootable
+    // image.
+    const identity_report = try identity_rewrite.apply(
+        allocator,
+        &tree,
+        identity_plan.plan,
+        options.identity_rewrite,
+        options.identity_diagnostic,
+    );
+
     const final_manifest = try tree.manifestDigest();
     const final_node_count = tree.nodeCount();
     const final_view = try tree.ext4View();
@@ -834,6 +879,7 @@ pub fn rebuild(
         .existing_operation_count = options.existing_operations.len,
         .os_customization_count = customizationCount(options.customization),
         .generalization_count = generalizationCount(options.generalization),
+        .identity_rewrite = identity_report,
         .limit_peaks = if (options.limit_diagnostic) |sink| sink.peaks else .{},
         .workspace_space = workspace,
     };
@@ -1558,6 +1604,167 @@ const SourceSet = struct {
         }
     }
 };
+
+/// Which identifiers the rebuild retired, derived from what the rebuild
+/// actually did rather than from a caller's description of it.
+///
+/// `rebuild` copies the source disk verbatim and then repopulates only the
+/// root partition, so the partition table and the root filesystem's own UUID
+/// survive untouched; on their own they retire nothing. Everything retired
+/// here comes from a merge, where a filesystem stops being a filesystem and
+/// every reference that named it has to name the root instead.
+///
+/// The strings are arena-owned because they are built while the sources are
+/// open and consumed much later, after the tree has been assembled and
+/// customized, and threading a dozen individual frees through the failure
+/// paths in between buys nothing.
+const IdentityPlan = struct {
+    arena: std.heap.ArenaAllocator,
+    plan: identity_rewrite.Plan,
+
+    fn deinit(self: *IdentityPlan) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+fn buildIdentityPlan(
+    allocator: Allocator,
+    io: Io,
+    options: RebuildOptions,
+    root_image: Image,
+    sources: *SourceSet,
+) !IdentityPlan {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const scratch = arena.allocator();
+
+    var uuid_text: [identity_rewrite.canonical_uuid_bytes]u8 = undefined;
+    const root_label = sources.root.label();
+    const root_uuid = sources.root.uuid();
+    const root_identifiers = identity_rewrite.Identifiers{
+        .filesystem_uuid = try dupeFilesystemUuid(scratch, &root_uuid),
+        .filesystem_label = try dupeLabel(scratch, &root_label),
+        .partition_uuid = try dupeOptional(scratch, try partitionUuidText(
+            allocator,
+            io,
+            root_image,
+            options.root_partition,
+            &uuid_text,
+        )),
+    };
+
+    const filesystems = try scratch.alloc(identity_rewrite.Filesystem, sources.mounts.len + 1);
+    // The root is listed even though it retires nothing: it is what every
+    // merged filesystem's references have to be pointed at, and stating it
+    // once here keeps `after` from being assembled at each use site.
+    filesystems[0] = .{ .before = root_identifiers, .after = root_identifiers };
+
+    var esp_roots = try std.array_list.Managed([]const u8).initCapacity(
+        scratch,
+        sources.mounts.len,
+    );
+    for (sources.mounts, options.source_mounts, filesystems[1..]) |*mount, spec, *slot| {
+        if (mount.tree == null) return error.MountSourceNotScanned;
+        var before = identity_rewrite.Identifiers{
+            .partition_uuid = try dupeOptional(scratch, try partitionUuidText(
+                allocator,
+                io,
+                mount.image,
+                spec.partition,
+                &uuid_text,
+            )),
+        };
+        switch (mount.tree.?) {
+            .ext4 => |*scanned| {
+                const label = scanned.label();
+                const uuid = scanned.uuid();
+                before.filesystem_uuid = try dupeFilesystemUuid(scratch, &uuid);
+                before.filesystem_label = try dupeLabel(scratch, &label);
+            },
+            .fat => |*fat| {
+                before.filesystem_uuid = try dupeFatVolumeSerial(scratch, fat.volume_id);
+                before.filesystem_label = try dupeLabel(scratch, &fat.label);
+                // Every FAT filesystem anyone merges into a Linux root is an
+                // ESP, and treating one as such only widens what the
+                // verification pass reads. Guessing the other way -- looking
+                // for a directory named `EFI` -- would miss an ESP whose
+                // vendor directory an installer spelled differently.
+                esp_roots.appendAssumeCapacity(try scratch.dupe(u8, mount.target));
+            },
+        }
+        slot.* = .{
+            .before = before,
+            .after = root_identifiers,
+            .merged_at = try scratch.dupe(u8, mount.target),
+        };
+    }
+
+    const plan = identity_rewrite.Plan{
+        .filesystems = filesystems,
+        .esp_roots = try esp_roots.toOwnedSlice(),
+    };
+    // Validated here, while the caller can still be told which input was
+    // wrong, rather than deep inside `apply` after a full import.
+    try plan.validate();
+    return .{ .arena = arena, .plan = plan };
+}
+
+fn dupeFilesystemUuid(allocator: Allocator, bytes: *const [16]u8) ![]const u8 {
+    var buffer: [identity_rewrite.canonical_uuid_bytes]u8 = undefined;
+    return allocator.dupe(u8, identity_rewrite.formatFilesystemUuid(&buffer, bytes));
+}
+
+fn dupeFatVolumeSerial(allocator: Allocator, volume_id: u32) ![]const u8 {
+    var buffer: [identity_rewrite.fat_serial_bytes]u8 = undefined;
+    return allocator.dupe(u8, identity_rewrite.formatFatVolumeSerial(&buffer, volume_id));
+}
+
+fn dupeLabel(allocator: Allocator, field: []const u8) !?[]const u8 {
+    const label = identity_rewrite.trimLabel(field) orelse return null;
+    return try allocator.dupe(u8, label);
+}
+
+fn dupeOptional(allocator: Allocator, value: ?[]const u8) !?[]const u8 {
+    const text = value orelse return null;
+    return try allocator.dupe(u8, text);
+}
+
+/// The PARTUUID an fstab or a kernel command line would name this partition
+/// by, written into `buffer`, or null when the disk carries nothing to build
+/// one from. A GPT entry with a nil unique GUID and an MBR disk with a zero
+/// signature are both that second case: Linux synthesizes no PARTUUID for
+/// either, so returning one would invent an identifier naming nothing.
+fn partitionUuidText(
+    allocator: Allocator,
+    io: Io,
+    image: Image,
+    selector: PartitionSelector,
+    buffer: *[identity_rewrite.canonical_uuid_bytes]u8,
+) !?[]const u8 {
+    switch (selector) {
+        .gpt_index => |one_based| {
+            const parsed = try gpt.readGpt(image, io, allocator);
+            defer allocator.free(parsed.partitions);
+            for (parsed.partitions) |partition| {
+                if (partition.table_index + 1 != one_based) continue;
+                if (std.mem.eql(u8, &partition.unique_partition_guid, &guid.nil)) return null;
+                return guid.formatLower(buffer, partition.unique_partition_guid);
+            }
+            return error.PartitionNotFound;
+        },
+        .mbr_index => |one_based| {
+            var sector: [mbr.sector_size]u8 = undefined;
+            if (try image.pread(io, &sector, 0) != sector.len) return error.UnexpectedEndOfFile;
+            const boot_record = try mbr.Mbr.decode(&sector);
+            if (boot_record.disk_signature == 0) return null;
+            var partuuid: [mbr.partuuid_len]u8 = undefined;
+            const text = mbr.formatPartuuid(&partuuid, boot_record.disk_signature, one_based);
+            @memcpy(buffer[0..text.len], text);
+            return buffer[0..text.len];
+        },
+    }
+}
 
 /// Names the filesystem on a merged partition, either because the caller
 /// already knew or by probing the on-disk magic. Probing never falls back:
@@ -4020,11 +4227,92 @@ const merge_boot_fixture_dir = "test-preserved-merge-boot-src";
 const merge_root_fixture_image = "test-preserved-merge-root.img";
 const merge_boot_fixture_image = "test-preserved-merge-boot.img";
 
+// Pinned so the fixture's own `/etc/fstab` and `grub.cfg` can name the
+// filesystems literally. A generated UUID would force the expected text to be
+// assembled at run time, and an expectation assembled by the same code that
+// produced the output proves nothing about byte-for-byte preservation.
+const merge_root_fs_uuid = "11111111-2222-3333-4444-555555555555";
+const merge_boot_fs_uuid = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+const merge_disk_signature: u32 = 0xC0FFEE01;
+const merge_esp_partuuid = "c0ffee01-01";
+const merge_boot_partuuid = "c0ffee01-02";
+const merge_root_partuuid = "c0ffee01-03";
+/// `fat32.format`'s default volume id, as `blkid` and an fstab spell it.
+const merge_esp_serial = "5A56-4D49";
+
+// Tabs are written as escapes rather than in a `\\` literal, which Zig does
+// not allow them in -- and the exact whitespace is the point of the test.
+const merge_fstab_header =
+    "# /etc/fstab: static filesystem information.\n" ++
+    "#\n" ++
+    "# <file system>\t<mount point>\t<type>\t<options>\t<dump>\t<pass>\n" ++
+    "UUID=" ++ merge_root_fs_uuid ++ "\t/\text4\terrors=remount-ro\t0\t1\n";
+const merge_fstab_boot_entry =
+    "UUID=" ++ merge_boot_fs_uuid ++ "\t/boot\text4\tdefaults\t0\t2\n";
+const merge_fstab_esp_entry =
+    "UUID=" ++ merge_esp_serial ++ "   /boot/efi    vfat    umask=0077,shortname=mixed  0  1\n";
+const merge_fstab_tail =
+    "tmpfs\t/tmp\ttmpfs\tdefaults,nosuid,nodev\t0\t0\n" ++
+    "# The two entries below have nothing to do with the rebuild and must\n" ++
+    "# survive it exactly as written, odd spacing and all.\n" ++
+    "/swapfile     none            swap    sw              0       0\n" ++
+    "PARTUUID=" ++ merge_root_partuuid ++ "\t/srv\text4\tdefaults\t0\t2\n" ++
+    "//fileserver/share\t/mnt/share\tcifs\tguest,_netdev\t0\t0";
+const merge_fstab = merge_fstab_header ++
+    merge_fstab_boot_entry ++
+    merge_fstab_esp_entry ++
+    merge_fstab_tail;
+/// What the rewriter has to produce: the two merged-away mounts gone, and
+/// every other byte, including the missing final newline, untouched.
+const merge_fstab_expected = merge_fstab_header ++ merge_fstab_tail;
+
+const merge_default_grub =
+    "GRUB_DEFAULT=0\n" ++
+    "GRUB_TIMEOUT=5\n" ++
+    "GRUB_CMDLINE_LINUX=\"root=UUID=" ++ merge_root_fs_uuid ++ " ro\"\n";
+
+const merge_grub_cfg =
+    "set default=0\n" ++
+    "insmod ext2\n" ++
+    "set root='hd0,msdos2'\n" ++
+    "search --no-floppy --fs-uuid --set=root " ++ merge_boot_fs_uuid ++ "\n" ++
+    "menuentry 'Linux' {\n" ++
+    "\tlinux\t/vmlinuz-6.1 root=UUID=" ++ merge_root_fs_uuid ++ " ro quiet\n" ++
+    "\tinitrd\t/initrd.img-6.1\n" ++
+    "}\n";
+const merge_grub_cfg_expected =
+    "set default=0\n" ++
+    "insmod ext2\n" ++
+    "set root='hd0,msdos2'\n" ++
+    "search --no-floppy --fs-uuid --set=root " ++ merge_root_fs_uuid ++ "\n" ++
+    "menuentry 'Linux' {\n" ++
+    "\tlinux\t/vmlinuz-6.1 root=UUID=" ++ merge_root_fs_uuid ++ " ro quiet\n" ++
+    "\tinitrd\t/initrd.img-6.1\n" ++
+    "}\n";
+
+const merge_esp_grub_cfg =
+    "search.fs_uuid " ++ merge_esp_serial ++ " root\n" ++
+    "set prefix=($root)'/EFI/BOOT'\n" ++
+    "linux /vmlinuz-6.1 root=PARTUUID=" ++ merge_boot_partuuid ++ " ro\n";
+const merge_esp_grub_cfg_expected =
+    "search.fs_uuid " ++ merge_root_fs_uuid ++ " root\n" ++
+    "set prefix=($root)'/EFI/BOOT'\n" ++
+    "linux /vmlinuz-6.1 root=PARTUUID=" ++ merge_root_partuuid ++ " ro\n";
+
+const MergeFixtureOptions = struct {
+    /// Writes a `/boot/grub/i386-pc/core.img` carrying the boot filesystem's
+    /// UUID. GRUB really does embed it there, in a binary the text rewriter
+    /// deliberately will not touch, which makes it the honest way to
+    /// exercise the verification pass rather than a contrived one.
+    embed_unrewritable_uuid: bool = false,
+};
+
 fn buildMergeExt4Fixture(
     allocator: std.mem.Allocator,
     directory: []const u8,
     image_path: []const u8,
     sectors: u32,
+    uuid: []const u8,
 ) !void {
     var size_text: [32]u8 = undefined;
     const blocks = @as(u64, sectors) * mbr.sector_size / 4096;
@@ -4036,6 +4324,8 @@ fn buildMergeExt4Fixture(
         "4096",
         "-I",
         "256",
+        "-U",
+        uuid,
         "-d",
         directory,
         image_path,
@@ -4067,7 +4357,12 @@ fn copyFixtureIntoPartition(
     }
 }
 
-fn createMergeTestDisk(allocator: std.mem.Allocator, io: Io, path: []const u8) !void {
+fn createMergeTestDisk(
+    allocator: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+    fixture: MergeFixtureOptions,
+) !void {
     const cwd = Io.Dir.cwd();
     cwd.deleteTree(io, merge_root_fixture_dir) catch {};
     cwd.deleteTree(io, merge_boot_fixture_dir) catch {};
@@ -4080,10 +4375,17 @@ fn createMergeTestDisk(allocator: std.mem.Allocator, io: Io, path: []const u8) !
 
     // The root filesystem's own `/boot` is a non-empty stub, which is what
     // makes shadowing rather than merging the only correct rule.
-    try cwd.createDirPath(io, merge_root_fixture_dir ++ "/boot/grub");
+    try cwd.createDirPath(io, merge_root_fixture_dir ++ "/boot/stale-dir");
     try cwd.createDirPath(io, merge_root_fixture_dir ++ "/etc");
     try cwd.createDirPath(io, merge_root_fixture_dir ++ "/usr/bin");
     try writeGeneralFixtureFile(io, merge_root_fixture_dir ++ "/etc/hostname", "merged\n");
+    try writeGeneralFixtureFile(io, merge_root_fixture_dir ++ "/etc/fstab", merge_fstab);
+    try cwd.createDirPath(io, merge_root_fixture_dir ++ "/etc/default");
+    try writeGeneralFixtureFile(
+        io,
+        merge_root_fixture_dir ++ "/etc/default/grub",
+        merge_default_grub,
+    );
     try writeGeneralFixtureFile(io, merge_root_fixture_dir ++ "/usr/bin/tool", "tool\n");
     try cwd.hardLink(
         merge_root_fixture_dir ++ "/usr/bin/tool",
@@ -4093,23 +4395,43 @@ fn createMergeTestDisk(allocator: std.mem.Allocator, io: Io, path: []const u8) !
         .{},
     );
     try writeGeneralFixtureFile(io, merge_root_fixture_dir ++ "/boot/stale-vmlinuz", "stale\n");
-    try writeGeneralFixtureFile(io, merge_root_fixture_dir ++ "/boot/grub/grub.cfg", "stale\n");
+    try writeGeneralFixtureFile(
+        io,
+        merge_root_fixture_dir ++ "/boot/stale-dir/stale.cfg",
+        "stale\n",
+    );
     try buildMergeExt4Fixture(
         allocator,
         merge_root_fixture_dir,
         merge_root_fixture_image,
         merge_root_sectors,
+        merge_root_fs_uuid,
     );
 
     // `/boot/efi` has to exist in the boot filesystem, because that is the
     // tree the ESP is mounted onto once `/boot` is in place.
     try cwd.createDirPath(io, merge_boot_fixture_dir ++ "/efi");
+    try cwd.createDirPath(io, merge_boot_fixture_dir ++ "/grub");
     try writeGeneralFixtureFile(io, merge_boot_fixture_dir ++ "/vmlinuz-6.1", "real kernel\n");
+    try writeGeneralFixtureFile(
+        io,
+        merge_boot_fixture_dir ++ "/grub/grub.cfg",
+        merge_grub_cfg,
+    );
+    if (fixture.embed_unrewritable_uuid) {
+        try cwd.createDirPath(io, merge_boot_fixture_dir ++ "/grub/i386-pc");
+        try writeGeneralFixtureFile(
+            io,
+            merge_boot_fixture_dir ++ "/grub/i386-pc/core.img",
+            "\x7fELF\x00\x00" ++ merge_boot_fs_uuid ++ "\x00\xff\xfe",
+        );
+    }
     try buildMergeExt4Fixture(
         allocator,
         merge_boot_fixture_dir,
         merge_boot_fixture_image,
         merge_boot_sectors,
+        merge_boot_fs_uuid,
     );
 
     const script_path = "test-preserved-merge-debugfs.txt";
@@ -4133,6 +4455,9 @@ fn createMergeTestDisk(allocator: std.mem.Allocator, io: Io, path: []const u8) !
     defer image.close(io);
 
     var boot_record = mbr.Mbr{};
+    // A real disk has one, and without one Linux synthesizes no PARTUUID at
+    // all, so a zero here would quietly disable half of what is being tested.
+    boot_record.disk_signature = merge_disk_signature;
     boot_record.entries[0] = .{
         .bootable = true,
         .partition_type = esp_partition_type,
@@ -4163,6 +4488,7 @@ fn createMergeTestDisk(allocator: std.mem.Allocator, io: Io, path: []const u8) !
     var esp = try fat32.open(&image, io, .{ .offset = esp_offset, .length = esp_length });
     try esp.createDir(io, "EFI/BOOT");
     try esp.writeFile(io, "EFI/BOOT/bootx64.efi", "esp payload\n");
+    try esp.writeFile(io, "EFI/BOOT/grub.cfg", merge_esp_grub_cfg);
 
     try copyFixtureIntoPartition(
         allocator,
@@ -4224,7 +4550,7 @@ test "rebuild merges an ESP and a boot filesystem into one root filesystem" {
         output_path ++ ".native-rebuild.spool",
     };
     defer for (artifacts) |artifact| Io.Dir.cwd().deleteFile(io, artifact) catch {};
-    createMergeTestDisk(allocator, io, source_path) catch |err| switch (err) {
+    createMergeTestDisk(allocator, io, source_path, .{}) catch |err| switch (err) {
         error.SkipZigTest => return error.SkipZigTest,
         else => return err,
     };
@@ -4263,8 +4589,8 @@ test "rebuild merges an ESP and a boot filesystem into one root filesystem" {
 
     const report = try rebuild(allocator, io, options);
     try std.testing.expectEqual(@as(usize, 2), report.merged_source_count);
-    // `boot/stale-vmlinuz`, `boot/grub` and `boot/grub/grub.cfg`: the whole
-    // stub the real boot filesystem hides.
+    // `boot/stale-vmlinuz`, `boot/stale-dir` and `boot/stale-dir/stale.cfg`:
+    // the whole stub the real boot filesystem hides.
     try std.testing.expectEqual(@as(usize, 3), report.shadowed_node_count);
     try std.testing.expectEqual(inspection.shadowed_node_count, report.shadowed_node_count);
     try std.testing.expectEqual(inspection.imported_node_count, report.imported_node_count);
@@ -4310,8 +4636,8 @@ test "rebuild merges an ESP and a boot filesystem into one root filesystem" {
         // source had under `/boot` may survive the boot filesystem landing
         // on top of it.
         try std.testing.expect(!std.mem.eql(u8, entry.path, "boot/stale-vmlinuz"));
-        try std.testing.expect(!std.mem.eql(u8, entry.path, "boot/grub"));
-        try std.testing.expect(!std.mem.eql(u8, entry.path, "boot/grub/grub.cfg"));
+        try std.testing.expect(!std.mem.eql(u8, entry.path, "boot/stale-dir"));
+        try std.testing.expect(!std.mem.eql(u8, entry.path, "boot/stale-dir/stale.cfg"));
 
         if (std.mem.eql(u8, entry.path, "boot")) {
             saw_boot_dir = true;
@@ -4383,6 +4709,267 @@ test "rebuild merges an ESP and a boot filesystem into one root filesystem" {
     try runGeneralFixtureTool(allocator, "e2fsck", &.{ "-f", "-n", extracted_path });
 }
 
+/// Reads one file out of the rebuilt root filesystem of a merge fixture's
+/// output disk, which is where every identity-rewrite expectation is checked.
+fn readMergedRootFile(
+    allocator: std.mem.Allocator,
+    io: Io,
+    output_path: []const u8,
+    path: []const u8,
+) ![]u8 {
+    var output = try Image.openPath(io, output_path);
+    defer output.close(io);
+    var reader = try ext4.openGeneral(io, output.file, allocator, .{
+        .offset = @as(u64, merge_root_first_lba) * mbr.sector_size,
+    });
+    defer reader.deinit();
+    return reader.readFileAlloc(io, allocator, path);
+}
+
+test "a merged rebuild rewrites the identifiers it retired and preserves every other fstab byte" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const source_path = "test-preserved-identity-source.raw";
+    const output_path = "test-preserved-identity-output.raw";
+    const extracted_path = "test-preserved-identity-extracted.img";
+    const artifacts = [_][]const u8{
+        source_path,
+        output_path,
+        extracted_path,
+        output_path ++ ".native-rebuild.raw",
+        output_path ++ ".native-rebuild.output",
+        output_path ++ ".native-rebuild.spool",
+    };
+    defer for (artifacts) |artifact| Io.Dir.cwd().deleteFile(io, artifact) catch {};
+    createMergeTestDisk(allocator, io, source_path, .{}) catch |err| switch (err) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const mounts = [_]SourceMount{
+        .{ .partition = .{ .mbr_index = 2 }, .target = "/boot" },
+        .{ .partition = .{ .mbr_index = 1 }, .target = "/boot/efi" },
+    };
+    const options = RebuildOptions{
+        .source_path = source_path,
+        .output_path = output_path,
+        .expected_source_format = .raw,
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 3 },
+        .source_profile = .general,
+        .source_mounts = &mounts,
+        .source_date_epoch = 1_735_689_600,
+    };
+
+    // Inspection runs the same rewrite and the same verification pass, so it
+    // has to agree with the rebuild about what would happen.
+    const inspection = try inspectRebuild(allocator, io, options);
+    const report = try rebuild(allocator, io, options);
+    try std.testing.expectEqual(
+        inspection.identity_rewrite.fstab_entries_dropped,
+        report.identity_rewrite.fstab_entries_dropped,
+    );
+    try std.testing.expectEqual(
+        inspection.identity_rewrite.config_references_rewritten,
+        report.identity_rewrite.config_references_rewritten,
+    );
+
+    // `/boot` and `/boot/efi` are directories inside the root filesystem now,
+    // so both entries go; nothing is left to rewrite in an fstab.
+    try std.testing.expectEqual(@as(usize, 2), report.identity_rewrite.fstab_entries_dropped);
+    try std.testing.expectEqual(@as(usize, 0), report.identity_rewrite.fstab_entries_rewritten);
+    try std.testing.expectEqual(@as(usize, 0), report.identity_rewrite.fstab_entries_unresolved);
+    // `search --fs-uuid` in `/boot/grub/grub.cfg`, plus `search.fs_uuid` and
+    // `root=PARTUUID=` in the ESP's own configuration.
+    try std.testing.expectEqual(@as(usize, 3), report.identity_rewrite.config_references_rewritten);
+    try std.testing.expectEqual(@as(usize, 2), report.identity_rewrite.config_files_rewritten);
+    try std.testing.expectEqual(@as(usize, 0), report.identity_rewrite.stale_references);
+    try std.testing.expect(report.identity_rewrite.verified_files > 0);
+
+    // Acceptance criterion: unrelated fstab entries survive byte for byte,
+    // including the tabs, the run-on spacing, the comments and the absent
+    // final newline. The expectation is a literal, not something the
+    // rewriter's own logic produced.
+    const fstab = try readMergedRootFile(allocator, io, output_path, "/etc/fstab");
+    defer allocator.free(fstab);
+    try std.testing.expectEqualStrings(merge_fstab_expected, fstab);
+
+    // Acceptance criterion: the bootloader configuration is rewritten in
+    // place, so its menu structure, indentation and unrelated lines are the
+    // ones the distro shipped.
+    const grub_cfg = try readMergedRootFile(allocator, io, output_path, "/boot/grub/grub.cfg");
+    defer allocator.free(grub_cfg);
+    try std.testing.expectEqualStrings(merge_grub_cfg_expected, grub_cfg);
+
+    const esp_cfg = try readMergedRootFile(
+        allocator,
+        io,
+        output_path,
+        "/boot/efi/EFI/BOOT/grub.cfg",
+    );
+    defer allocator.free(esp_cfg);
+    try std.testing.expectEqualStrings(merge_esp_grub_cfg_expected, esp_cfg);
+
+    // A file in the scanned set that names nothing retired is read and left
+    // exactly alone; being in scope is not a licence to touch it.
+    const default_grub = try readMergedRootFile(allocator, io, output_path, "/etc/default/grub");
+    defer allocator.free(default_grub);
+    try std.testing.expectEqualStrings(merge_default_grub, default_grub);
+
+    var output = try Image.openPath(io, output_path);
+    defer output.close(io);
+    try extractPartition(
+        allocator,
+        io,
+        &output,
+        merge_root_first_lba,
+        merge_root_sectors,
+        extracted_path,
+    );
+    try runGeneralFixtureTool(allocator, "e2fsck", &.{ "-f", "-n", extracted_path });
+}
+
+test "a stale identifier the rewriter cannot reach fails the build and names the file" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const source_path = "test-preserved-stale-source.raw";
+    const output_path = "test-preserved-stale-output.raw";
+    const artifacts = [_][]const u8{
+        source_path,
+        output_path,
+        output_path ++ ".native-rebuild.raw",
+        output_path ++ ".native-rebuild.output",
+        output_path ++ ".native-rebuild.spool",
+    };
+    defer for (artifacts) |artifact| Io.Dir.cwd().deleteFile(io, artifact) catch {};
+    createMergeTestDisk(allocator, io, source_path, .{
+        .embed_unrewritable_uuid = true,
+    }) catch |err| switch (err) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const mounts = [_]SourceMount{
+        .{ .partition = .{ .mbr_index = 2 }, .target = "/boot" },
+        .{ .partition = .{ .mbr_index = 1 }, .target = "/boot/efi" },
+    };
+    var diagnostic = identity_rewrite.Diagnostic{};
+    var options = RebuildOptions{
+        .source_path = source_path,
+        .output_path = output_path,
+        .expected_source_format = .raw,
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 3 },
+        .source_profile = .general,
+        .source_mounts = &mounts,
+        .source_date_epoch = 1_735_689_600,
+        .identity_diagnostic = &diagnostic,
+    };
+
+    // Acceptance criterion: a retired identifier left anywhere the pass looks
+    // fails the build, and the message names the file holding it.
+    try std.testing.expectError(
+        error.StaleFilesystemIdentifier,
+        rebuild(allocator, io, options),
+    );
+    const stale = diagnostic.stale orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("boot/grub/i386-pc/core.img", stale.path());
+    try std.testing.expectEqualStrings(merge_boot_fs_uuid, stale.identifier());
+    try std.testing.expectEqual(identity_rewrite.Kind.filesystem_uuid, stale.kind);
+    var message: [identity_rewrite.Stale.max_message_bytes]u8 = undefined;
+    const described = try stale.describe(&message);
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        described,
+        1,
+        "/boot/grub/i386-pc/core.img",
+    ));
+
+    // Nothing may be left behind: the refusal happens before the first
+    // output byte is written.
+    for (artifacts[1..]) |artifact| {
+        try std.testing.expectError(
+            error.FileNotFound,
+            Io.Dir.cwd().statFile(io, artifact, .{}),
+        );
+    }
+
+    // The same source, inspected, is refused for the same reason without
+    // creating anything at all.
+    var inspect_diagnostic = identity_rewrite.Diagnostic{};
+    options.identity_diagnostic = &inspect_diagnostic;
+    try std.testing.expectError(
+        error.StaleFilesystemIdentifier,
+        inspectRebuild(allocator, io, options),
+    );
+    try std.testing.expect(inspect_diagnostic.stale != null);
+
+    // The escape hatch: an operator who intends to finish the job with the
+    // distro's own tooling gets the image and the report, not a refusal.
+    var reported = identity_rewrite.Diagnostic{};
+    options.identity_rewrite = .rewrite_only;
+    options.identity_diagnostic = &reported;
+    const report = try rebuild(allocator, io, options);
+    try std.testing.expectEqual(@as(usize, 1), report.identity_rewrite.stale_references);
+    try std.testing.expectEqualStrings(
+        "boot/grub/i386-pc/core.img",
+        (reported.stale orelse return error.TestUnexpectedResult).path(),
+    );
+    // Everything the rewriter could reach was still reached.
+    try std.testing.expectEqual(@as(usize, 2), report.identity_rewrite.fstab_entries_dropped);
+    const fstab = try readMergedRootFile(allocator, io, output_path, "/etc/fstab");
+    defer allocator.free(fstab);
+    try std.testing.expectEqualStrings(merge_fstab_expected, fstab);
+}
+
+test "identity rewriting turned off leaves the imported configuration exactly as it was" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const source_path = "test-preserved-identity-off-source.raw";
+    const output_path = "test-preserved-identity-off-output.raw";
+    const artifacts = [_][]const u8{
+        source_path,
+        output_path,
+        output_path ++ ".native-rebuild.raw",
+        output_path ++ ".native-rebuild.output",
+        output_path ++ ".native-rebuild.spool",
+    };
+    defer for (artifacts) |artifact| Io.Dir.cwd().deleteFile(io, artifact) catch {};
+    createMergeTestDisk(allocator, io, source_path, .{
+        .embed_unrewritable_uuid = true,
+    }) catch |err| switch (err) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const mounts = [_]SourceMount{
+        .{ .partition = .{ .mbr_index = 2 }, .target = "/boot" },
+        .{ .partition = .{ .mbr_index = 1 }, .target = "/boot/efi" },
+    };
+    const report = try rebuild(allocator, io, .{
+        .source_path = source_path,
+        .output_path = output_path,
+        .expected_source_format = .raw,
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 3 },
+        .source_profile = .general,
+        .source_mounts = &mounts,
+        .source_date_epoch = 1_735_689_600,
+        .identity_rewrite = .off,
+    });
+    // `.off` is not "rewrite quietly": the report says nothing happened,
+    // which is what distinguishes it from a rewrite that found nothing.
+    try std.testing.expectEqual(@as(usize, 0), report.identity_rewrite.retired_identifiers);
+    try std.testing.expectEqual(@as(usize, 0), report.identity_rewrite.verified_files);
+
+    const fstab = try readMergedRootFile(allocator, io, output_path, "/etc/fstab");
+    defer allocator.free(fstab);
+    try std.testing.expectEqualStrings(merge_fstab, fstab);
+    const grub_cfg = try readMergedRootFile(allocator, io, output_path, "/boot/grub/grub.cfg");
+    defer allocator.free(grub_cfg);
+    try std.testing.expectEqualStrings(merge_grub_cfg, grub_cfg);
+}
+
 test "merged sources are refused before anything is opened when the mounts are ambiguous" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
@@ -4396,7 +4983,7 @@ test "merged sources are refused before anything is opened when the mounts are a
         output_path ++ ".native-rebuild.spool",
     };
     defer for (artifacts) |artifact| Io.Dir.cwd().deleteFile(io, artifact) catch {};
-    createMergeTestDisk(allocator, io, source_path) catch |err| switch (err) {
+    createMergeTestDisk(allocator, io, source_path, .{}) catch |err| switch (err) {
         error.SkipZigTest => return error.SkipZigTest,
         else => return err,
     };
@@ -4512,7 +5099,7 @@ test "limits and peaks are accounted across every merged source, not per source"
     const source_path = "test-preserved-merge-limits-source.raw";
     const output_path = "test-preserved-merge-limits-output.raw";
     defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
-    createMergeTestDisk(allocator, io, source_path) catch |err| switch (err) {
+    createMergeTestDisk(allocator, io, source_path, .{}) catch |err| switch (err) {
         error.SkipZigTest => return error.SkipZigTest,
         else => return err,
     };
@@ -4578,7 +5165,7 @@ test "a source whose scan fails leaves nothing behind for cleanup to walk" {
 
     const source_path = ".test-merge-failed-scan-cleanup.img";
     defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
-    createMergeTestDisk(allocator, io, source_path) catch |err| switch (err) {
+    createMergeTestDisk(allocator, io, source_path, .{}) catch |err| switch (err) {
         error.SkipZigTest => return error.SkipZigTest,
         else => return err,
     };

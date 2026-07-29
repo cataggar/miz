@@ -40,6 +40,7 @@ pub const kernel_modules = @import("kernel_modules.zig");
 pub const limits = @import("limits.zig");
 pub const free_space = @import("free_space.zig");
 pub const root_tree = @import("root_tree.zig");
+pub const identity_rewrite = @import("identity_rewrite.zig");
 pub const preserved_image = @import("preserved_image.zig");
 pub const os_customization = @import("os_customization.zig");
 pub const customization_wire = @import("customization_wire.zig");

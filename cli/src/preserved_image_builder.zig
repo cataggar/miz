@@ -38,6 +38,7 @@ const LoadedConfiguration = struct {
     root_partition: zvmi.customize.PartitionSelector,
     source_profile: zvmi.customize.SourceProfilePolicy,
     source_mounts: []const zvmi.customize.SourceMount,
+    identity_rewrite: zvmi.customize.IdentityRewritePolicy,
     operations: []const zvmi.customize.ExistingPathOperation,
     os: zvmi.customize.OsCustomization,
     generalization: zvmi.customize.GeneralizationPolicy,
@@ -164,6 +165,7 @@ pub fn main(init: std.process.Init) !void {
             .root_partition = configuration.root_partition,
             .source_profile = configuration.source_profile,
             .source_mounts = configuration.source_mounts,
+            .identity_rewrite = configuration.identity_rewrite,
         } },
         .os = configuration.os,
         .existing_path_operations = configuration.operations,
@@ -497,6 +499,7 @@ fn loadV2Configuration(
         },
         .source_profile = .strict,
         .source_mounts = &.{},
+        .identity_rewrite = .rewrite_and_verify,
         .operations = try mapOperations(allocator, parsed.value.operations, source_paths),
         .os = customization.os,
         .generalization = customization.generalization,
@@ -542,6 +545,11 @@ fn loadV3Configuration(
             .general => .general,
         },
         .source_mounts = try mapSourceMounts(allocator, parsed.value.source_mounts),
+        .identity_rewrite = switch (parsed.value.identity_rewrite) {
+            .rewrite_and_verify => .rewrite_and_verify,
+            .rewrite_only => .rewrite_only,
+            .off => .off,
+        },
         .operations = try mapOperations(allocator, parsed.value.operations, source_paths),
         .os = customization.os,
         .generalization = customization.generalization,
@@ -1523,6 +1531,50 @@ test "merged source mounts survive the loader with their synthesized metadata" {
     );
     try std.testing.expectEqual(@as(u32, 42), loaded.source_mounts[1].fat_metadata.uid);
     try std.testing.expectEqual(@as(u32, 43), loaded.source_mounts[1].fat_metadata.gid);
+
+    // Absent from the configuration above, so it has to arrive as the safe
+    // default rather than as whatever the loader's zero value happens to be.
+    try std.testing.expectEqual(
+        zvmi.customize.IdentityRewritePolicy.rewrite_and_verify,
+        loaded.identity_rewrite,
+    );
+}
+
+test "an operator can opt out of failing on an identifier the rewriter cannot reach" {
+    const allocator = std.testing.allocator;
+    const configuration =
+        \\{
+        \\  "api_version": 3,
+        \\  "backend": "rebuild",
+        \\  "root_partition": { "mbr_index": 3 },
+        \\  "identity_rewrite": "rewrite_only"
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const loaded = try loadV3Configuration(arena.allocator(), configuration, &.{});
+    try std.testing.expectEqual(
+        zvmi.customize.IdentityRewritePolicy.rewrite_only,
+        loaded.identity_rewrite,
+    );
+}
+
+test "a version 2 configuration keeps the safe identity rewrite default" {
+    const allocator = std.testing.allocator;
+    const configuration =
+        \\{
+        \\  "api_version": 2,
+        \\  "backend": "rebuild",
+        \\  "root_partition": { "mbr_index": 3 }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const loaded = try loadV2Configuration(arena.allocator(), configuration, &.{});
+    try std.testing.expectEqual(
+        zvmi.customize.IdentityRewritePolicy.rewrite_and_verify,
+        loaded.identity_rewrite,
+    );
 }
 
 test "the wire's synthesized FAT metadata defaults are the library's" {
