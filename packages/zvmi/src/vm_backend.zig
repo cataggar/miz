@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const customize = @import("customize.zig");
+const free_space = @import("free_space.zig");
 const preserved_image = @import("preserved_image.zig");
 const transaction_guard = @import("transaction_guard.zig");
 const vm_control = @import("vm_control.zig");
@@ -131,51 +132,15 @@ fn workspaceHasFreeSpace(io: Io, workspace_path: []const u8, source_path: []cons
         workspace_path
     else
         std.fs.path.dirname(workspace_path) orelse ".";
-    const free_bytes = freeBytes(probe_path) orelse return true;
+    // A null probe means the host cannot answer, which must not fail the
+    // preflight: unknown free space is not the same as too little.
+    const free_bytes = free_space.availableBytes(probe_path) orelse return true;
     return free_bytes >= required;
 }
 
 fn pathExists(io: Io, path: []const u8) bool {
     Io.Dir.cwd().access(io, path, .{}) catch return false;
     return true;
-}
-
-/// The 64-bit Linux `struct statfs`. Zig's standard library does not expose
-/// `statfs`, and there is no portable free-space API in `std.Io`.
-const LinuxStatfs = extern struct {
-    type: i64,
-    bsize: i64,
-    blocks: u64,
-    bfree: u64,
-    bavail: u64,
-    files: u64,
-    ffree: u64,
-    fsid: [2]i32,
-    namelen: i64,
-    frsize: i64,
-    flags: i64,
-    spare: [4]i64,
-};
-
-/// Bytes available to an unprivileged writer, or null when the host offers no
-/// way to ask. A null result must not fail the preflight: an unknown amount of
-/// free space is not the same as too little.
-fn freeBytes(path: []const u8) ?u64 {
-    if (builtin.os.tag != .linux or @sizeOf(usize) != 8) return null;
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    if (path.len >= path_buffer.len) return null;
-    @memcpy(path_buffer[0..path.len], path);
-    path_buffer[path.len] = 0;
-
-    var info: LinuxStatfs = undefined;
-    const result = std.os.linux.syscall2(
-        .statfs,
-        @intFromPtr(&path_buffer),
-        @intFromPtr(&info),
-    );
-    if (std.os.linux.errno(result) != .SUCCESS) return null;
-    if (info.bsize <= 0) return null;
-    return std.math.mul(u64, info.bavail, @intCast(info.bsize)) catch null;
 }
 
 // ---- Execution --------------------------------------------------------
@@ -799,13 +764,6 @@ test "an emulator command must be an absolute path to an executable file" {
     try std.testing.expect(!emulatorExecutable(io, "/nonexistent/qemu-system-x86_64"));
     // A directory is not an emulator even though the path resolves.
     try std.testing.expect(!emulatorExecutable(io, "/tmp"));
-}
-
-test "free space is reported for an existing directory on Linux" {
-    if (builtin.os.tag != .linux or @sizeOf(usize) != 8) return error.SkipZigTest;
-    const free = freeBytes(".") orelse return error.SkipZigTest;
-    try std.testing.expect(free > 0);
-    try std.testing.expect(freeBytes("/nonexistent-zvmi-vm-backend-probe") == null);
 }
 
 fn indexOfArgument(argv: []const []const u8, name: []const u8) ?usize {
