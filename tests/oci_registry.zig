@@ -46,6 +46,91 @@ const RedirectResponse = enum {
     bearer_challenge,
 };
 
+/// How long a fixture may wait for the requests a test told it to expect.
+/// Everything served here is same-process loopback traffic, so a minute is
+/// orders of magnitude more than a healthy test needs; exceeding it always
+/// means the client stopped issuing requests.
+const fixture_timeout: Io.Duration = .fromSeconds(60);
+
+/// Interrupts a fixture parked in `accept` for requests that will never come.
+///
+/// Every fixture below serves a fixed number of requests and then leaves its
+/// accept loop, and `finish` and `deinit` join the serving thread. If the code
+/// under test issues fewer requests than the fixture expects, that join never
+/// returns: the test binary hangs with no output, taking the whole build step
+/// with it. That is exactly how committed layout directories wedged CI, and it
+/// is a defect in the fixtures regardless of what triggers it.
+///
+/// The watchdog puts a deadline on that wait. On expiry it shuts the listening
+/// sockets down, which is the documented way to interrupt a blocked `accept`:
+/// the pending call fails with `error.SocketNotListening`, the serving thread
+/// unwinds, and the test reports `error.FixtureTimedOut` instead of hanging.
+const Watchdog = struct {
+    io: Io = undefined,
+    sockets: [2]?Io.net.Socket = .{ null, null },
+    finished: Io.Event = .unset,
+    thread: ?std.Thread = null,
+    expired: bool = false,
+
+    /// Arms the watchdog. Only call this once the fixture has reached its
+    /// final address, because the watchdog thread keeps a pointer to it.
+    fn arm(self: *Watchdog, io: Io, sockets: []const Io.net.Socket) !void {
+        std.debug.assert(self.thread == null);
+        std.debug.assert(sockets.len <= self.sockets.len);
+        self.io = io;
+        self.sockets = .{ null, null };
+        for (sockets, 0..) |socket, index| self.sockets[index] = socket;
+        self.finished = .unset;
+        @atomicStore(bool, &self.expired, false, .monotonic);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    /// Stops the watchdog. This has to happen before the guarded sockets are
+    /// closed, so that a late expiry can never shut down a recycled
+    /// descriptor.
+    fn disarm(self: *Watchdog) void {
+        const thread = self.thread orelse return;
+        self.finished.set(self.io);
+        thread.join();
+        self.thread = null;
+    }
+
+    /// Interrupts a pending `accept` right away, for teardown paths that
+    /// abandon a fixture whose serving thread has not stopped on its own.
+    fn interrupt(self: *Watchdog) void {
+        if (self.thread == null) return;
+        self.shutdownSockets();
+    }
+
+    fn tripped(self: *Watchdog) bool {
+        return @atomicLoad(bool, &self.expired, .acquire);
+    }
+
+    fn shutdownSockets(self: *Watchdog) void {
+        for (self.sockets) |maybe_socket| {
+            const socket = maybe_socket orelse continue;
+            const stream = Io.net.Stream{ .socket = socket };
+            stream.shutdown(self.io, .both) catch {};
+        }
+    }
+
+    fn run(self: *Watchdog) void {
+        const deadline: Io.Clock.Timestamp = .fromNow(self.io, .{ .raw = fixture_timeout, .clock = .awake });
+        while (!self.finished.isSet()) {
+            self.finished.waitTimeout(self.io, .{ .deadline = deadline }) catch |err| switch (err) {
+                // Spurious wakeups are reported as timeouts too, so the
+                // deadline itself decides when the budget is really gone.
+                error.Timeout => if (Io.Clock.Timestamp.now(self.io, .awake).compare(.lt, deadline)) continue,
+                error.Canceled => return,
+            };
+            if (self.finished.isSet()) return;
+            @atomicStore(bool, &self.expired, true, .release);
+            self.shutdownSockets();
+            return;
+        }
+    }
+};
+
 const RedirectTarget = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -54,6 +139,7 @@ const RedirectTarget = struct {
     layer: []const u8,
     digest: []const u8,
     response: RedirectResponse,
+    watchdog: Watchdog = .{},
     thread: ?std.Thread = null,
     err: ?anyerror = null,
     authorization_seen: bool = false,
@@ -81,6 +167,8 @@ const RedirectTarget = struct {
     }
 
     fn start(self: *RedirectTarget) !void {
+        try self.watchdog.arm(self.io, &.{self.listener.socket});
+        errdefer self.watchdog.disarm();
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -89,15 +177,19 @@ const RedirectTarget = struct {
             thread.join();
             self.thread = null;
         }
+        self.watchdog.disarm();
+        if (self.watchdog.tripped()) return error.FixtureTimedOut;
         if (self.err) |err| return err;
         try std.testing.expect(!self.authorization_seen);
     }
 
     fn deinit(self: *RedirectTarget) void {
         if (self.thread) |thread| {
-            self.listener.deinit(self.io);
+            self.watchdog.interrupt();
             thread.join();
-        } else self.listener.deinit(self.io);
+        }
+        self.watchdog.disarm();
+        self.listener.deinit(self.io);
         self.allocator.free(self.authority);
         self.* = undefined;
     }
@@ -142,6 +234,7 @@ const TlsFixture = struct {
     listener: Io.net.Server,
     authority: []u8,
     permit_handshake_failure: bool,
+    watchdog: Watchdog = .{},
     thread: ?std.Thread = null,
     err: ?anyerror = null,
     handled_http: bool = false,
@@ -163,6 +256,8 @@ const TlsFixture = struct {
     }
 
     fn start(self: *TlsFixture) !void {
+        try self.watchdog.arm(self.io, &.{self.listener.socket});
+        errdefer self.watchdog.disarm();
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -171,15 +266,19 @@ const TlsFixture = struct {
             thread.join();
             self.thread = null;
         }
+        self.watchdog.disarm();
+        if (self.watchdog.tripped()) return error.FixtureTimedOut;
         if (self.err) |err| return err;
         if (!self.permit_handshake_failure) try std.testing.expect(self.handled_http);
     }
 
     fn deinit(self: *TlsFixture) void {
         if (self.thread) |thread| {
-            self.listener.deinit(self.io);
+            self.watchdog.interrupt();
             thread.join();
-        } else self.listener.deinit(self.io);
+        }
+        self.watchdog.disarm();
+        self.listener.deinit(self.io);
         self.allocator.free(self.authority);
         self.* = undefined;
     }
@@ -239,6 +338,7 @@ const TlsRedirectTarget = struct {
     authority: []u8,
     layer: []const u8,
     digest: []const u8,
+    watchdog: Watchdog = .{},
     thread: ?std.Thread = null,
     err: ?anyerror = null,
     authorization_seen: bool = false,
@@ -259,6 +359,8 @@ const TlsRedirectTarget = struct {
     }
 
     fn start(self: *TlsRedirectTarget) !void {
+        try self.watchdog.arm(self.io, &.{self.listener.socket});
+        errdefer self.watchdog.disarm();
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -267,15 +369,19 @@ const TlsRedirectTarget = struct {
             thread.join();
             self.thread = null;
         }
+        self.watchdog.disarm();
+        if (self.watchdog.tripped()) return error.FixtureTimedOut;
         if (self.err) |err| return err;
         try std.testing.expect(!self.authorization_seen);
     }
 
     fn deinit(self: *TlsRedirectTarget) void {
         if (self.thread) |thread| {
-            self.listener.deinit(self.io);
+            self.watchdog.interrupt();
             thread.join();
-        } else self.listener.deinit(self.io);
+        }
+        self.watchdog.disarm();
+        self.listener.deinit(self.io);
         self.allocator.free(self.authority);
         self.* = undefined;
     }
@@ -327,6 +433,7 @@ const TlsRegistryFixture = struct {
     layer_digest: []u8,
     manifest_digest: []u8,
     redirect_blob_url: ?[]u8 = null,
+    watchdog: Watchdog = .{},
     thread: ?std.Thread = null,
     err: ?anyerror = null,
     handled: usize = 0,
@@ -381,6 +488,8 @@ const TlsRegistryFixture = struct {
     }
 
     fn start(self: *TlsRegistryFixture) !void {
+        try self.watchdog.arm(self.io, &.{self.listener.socket});
+        errdefer self.watchdog.disarm();
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -389,15 +498,19 @@ const TlsRegistryFixture = struct {
             thread.join();
             self.thread = null;
         }
+        self.watchdog.disarm();
+        if (self.watchdog.tripped()) return error.FixtureTimedOut;
         if (self.err) |err| return err;
         try std.testing.expectEqual(@as(usize, 7), self.handled);
     }
 
     fn deinit(self: *TlsRegistryFixture) void {
         if (self.thread) |thread| {
-            self.listener.deinit(self.io);
+            self.watchdog.interrupt();
             thread.join();
-        } else self.listener.deinit(self.io);
+        }
+        self.watchdog.disarm();
+        self.listener.deinit(self.io);
         self.allocator.free(self.authority);
         self.allocator.free(self.config);
         self.allocator.free(self.layer);
@@ -512,6 +625,7 @@ const Fixture = struct {
     listener: Io.net.Server,
     authority: []u8,
     expected_requests: usize,
+    watchdog: Watchdog = .{},
     thread: ?std.Thread = null,
     err: ?anyerror = null,
     handled: usize = 0,
@@ -624,6 +738,8 @@ const Fixture = struct {
     }
 
     fn start(self: *Fixture) !void {
+        try self.watchdog.arm(self.io, &.{self.listener.socket});
+        errdefer self.watchdog.disarm();
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -632,17 +748,19 @@ const Fixture = struct {
             thread.join();
             self.thread = null;
         }
+        self.watchdog.disarm();
+        if (self.watchdog.tripped()) return error.FixtureTimedOut;
         if (self.err) |err| return err;
         try std.testing.expectEqual(self.expected_requests, self.handled);
     }
 
     fn deinit(self: *Fixture) void {
         if (self.thread) |thread| {
-            self.listener.deinit(self.io);
+            self.watchdog.interrupt();
             thread.join();
-        } else {
-            self.listener.deinit(self.io);
         }
+        self.watchdog.disarm();
+        self.listener.deinit(self.io);
         for (self.logs.items) |log| self.allocator.free(log.target);
         self.logs.deinit();
         self.allocator.free(self.authority);
@@ -1974,6 +2092,7 @@ const PublishFixture = struct {
     listener: Io.net.Server,
     authority: []u8,
     expected_requests: usize,
+    watchdog: Watchdog = .{},
     thread: ?std.Thread = null,
     err: ?anyerror = null,
     handled: usize = 0,
@@ -2066,6 +2185,12 @@ const PublishFixture = struct {
     }
 
     fn start(self: *PublishFixture) !void {
+        if (self.cross_upload_listener) |*listener| {
+            try self.watchdog.arm(self.io, &.{ self.listener.socket, listener.socket });
+        } else {
+            try self.watchdog.arm(self.io, &.{self.listener.socket});
+        }
+        errdefer self.watchdog.disarm();
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -2074,6 +2199,8 @@ const PublishFixture = struct {
             thread.join();
             self.thread = null;
         }
+        self.watchdog.disarm();
+        if (self.watchdog.tripped()) return error.FixtureTimedOut;
         if (self.err) |err| return err;
         try std.testing.expectEqual(self.expected_requests, self.handled);
         if (self.cross_upload_authority != null) {
@@ -2083,13 +2210,12 @@ const PublishFixture = struct {
 
     fn deinit(self: *PublishFixture) void {
         if (self.thread) |thread| {
-            self.listener.deinit(self.io);
-            if (self.cross_upload_listener) |*listener| listener.deinit(self.io);
+            self.watchdog.interrupt();
             thread.join();
-        } else {
-            self.listener.deinit(self.io);
-            if (self.cross_upload_listener) |*listener| listener.deinit(self.io);
         }
+        self.watchdog.disarm();
+        self.listener.deinit(self.io);
+        if (self.cross_upload_listener) |*listener| listener.deinit(self.io);
         self.allocator.free(self.authority);
         if (self.cross_upload_authority) |value| self.allocator.free(value);
         for (self.blobs.items) |blob| {
