@@ -414,49 +414,64 @@ pub const RootTree = struct {
     }
 
     pub fn importExt4View(self: *RootTree, source: *ext4.FileTreeView) !void {
-        try self.importExt4ViewMode(source, .owned);
+        _ = try self.importExt4ViewMode(source, .owned, "");
     }
 
     /// Imports only paths and metadata while retaining read-only content
     /// readers supplied by `source`. The source must outlive this tree.
     pub fn importExt4ViewBorrowed(self: *RootTree, source: *ext4.FileTreeView) !void {
         if (self.storage != .memory) return error.BorrowedImportRequiresMemoryTree;
-        try self.importExt4ViewMode(source, .borrowed);
+        _ = try self.importExt4ViewMode(source, .borrowed, "");
     }
 
     fn importExt4ViewMode(
         self: *RootTree,
         source: *ext4.FileTreeView,
-        mode: enum { owned, borrowed },
-    ) !void {
+        mode: ImportMode,
+        prefix: []const u8,
+    ) !usize {
+        var path_buffer = std.array_list.Managed(u8).init(self.allocator);
+        defer path_buffer.deinit();
+        var target_buffer = std.array_list.Managed(u8).init(self.allocator);
+        defer target_buffer.deinit();
+
+        var imported: usize = 0;
         source.reset();
         while (try source.next()) |entry| {
+            imported += 1;
             const metadata = Metadata{
                 .mode = entry.mode,
                 .uid = entry.uid,
                 .gid = entry.gid,
                 .xattrs = entry.xattrs,
             };
+            const path = try joinMountPath(&path_buffer, prefix, entry.path);
             switch (entry.kind) {
-                .directory => try self.putDirectory(entry.path, metadata),
-                .fifo => try self.putFifo(entry.path, metadata),
+                .directory => try self.putDirectory(path, metadata),
+                .fifo => try self.putFifo(path, metadata),
                 .block_device, .char_device => try self.putDevice(
-                    entry.path,
+                    path,
                     if (entry.kind == .block_device) .block_device else .char_device,
                     .{ .major = entry.device.major, .minor = entry.device.minor },
                     metadata,
                 ),
-                .hardlink => try self.putHardlink(entry.path, entry.hardlink_target, metadata),
+                // A hardlink names a path inside the same source, so the name
+                // it shares an inode with moves under the mount point too.
+                .hardlink => try self.putHardlink(
+                    path,
+                    try joinMountPath(&target_buffer, prefix, entry.hardlink_target),
+                    metadata,
+                ),
                 .file => {
                     const content = entry.content orelse if (entry.size == 0)
                         emptyContentReader()
                     else
                         return error.MissingContent;
                     if (mode == .owned) {
-                        try self.putFileReader(entry.path, entry.size, content, metadata);
+                        try self.putFileReader(path, entry.size, content, metadata);
                     } else {
                         try self.putBorrowedContent(
-                            entry.path,
+                            path,
                             .file,
                             entry.size,
                             content,
@@ -467,20 +482,10 @@ pub const RootTree = struct {
                 .symlink => {
                     const content = entry.content orelse return error.MissingContent;
                     if (mode == .owned) {
-                        try self.checkFileBytes(entry.size);
-                        try validatePath(entry.path, self.limits, self.diagnostic);
-                        const old_spool_len = self.spool_len;
-                        const owned = self.spoolContent(entry.size, content) catch |err| {
-                            try self.rollbackSpool(old_spool_len);
-                            return err;
-                        };
-                        self.putNode(entry.path, .symlink, metadata, .{ .content = owned }) catch |err| {
-                            try self.rollbackSpool(old_spool_len);
-                            return err;
-                        };
+                        try self.putOwnedContent(path, .symlink, entry.size, content, metadata);
                     } else {
                         try self.putBorrowedContent(
-                            entry.path,
+                            path,
                             .symlink,
                             entry.size,
                             content,
@@ -490,6 +495,7 @@ pub const RootTree = struct {
                 },
             }
         }
+        return imported;
     }
 
     /// Imports a tree produced by the general ext4 importer. `FileTreeView`
@@ -497,21 +503,6 @@ pub const RootTree = struct {
     /// general tree is consumed directly rather than being squeezed through
     /// that interface and losing exactly the fidelity it exists to preserve.
     pub fn importExt4General(self: *RootTree, source: *ext4.GeneralTree) !void {
-        try self.importExt4GeneralMode(source, .owned);
-    }
-
-    /// Imports paths and metadata while retaining read-only content readers
-    /// owned by `source`, which must outlive this tree.
-    pub fn importExt4GeneralBorrowed(self: *RootTree, source: *ext4.GeneralTree) !void {
-        if (self.storage != .memory) return error.BorrowedImportRequiresMemoryTree;
-        try self.importExt4GeneralMode(source, .borrowed);
-    }
-
-    fn importExt4GeneralMode(
-        self: *RootTree,
-        source: *ext4.GeneralTree,
-        mode: enum { owned, borrowed },
-    ) !void {
         self.setRootMetadata(.{
             .mode = source.root.mode,
             .uid = source.root.uid,
@@ -520,6 +511,34 @@ pub const RootTree = struct {
             .mtime = source.root.mtime,
             .ctime = source.root.ctime,
         });
+        _ = try self.importExt4GeneralMode(source, .owned, "");
+    }
+
+    /// Imports paths and metadata while retaining read-only content readers
+    /// owned by `source`, which must outlive this tree.
+    pub fn importExt4GeneralBorrowed(self: *RootTree, source: *ext4.GeneralTree) !void {
+        if (self.storage != .memory) return error.BorrowedImportRequiresMemoryTree;
+        self.setRootMetadata(.{
+            .mode = source.root.mode,
+            .uid = source.root.uid,
+            .gid = source.root.gid,
+            .atime = source.root.atime,
+            .mtime = source.root.mtime,
+            .ctime = source.root.ctime,
+        });
+        _ = try self.importExt4GeneralMode(source, .borrowed, "");
+    }
+
+    fn importExt4GeneralMode(
+        self: *RootTree,
+        source: *ext4.GeneralTree,
+        mode: ImportMode,
+        prefix: []const u8,
+    ) !usize {
+        var path_buffer = std.array_list.Managed(u8).init(self.allocator);
+        defer path_buffer.deinit();
+        var target_buffer = std.array_list.Managed(u8).init(self.allocator);
+        defer target_buffer.deinit();
 
         var index: usize = 0;
         while (index < source.nodeCount()) : (index += 1) {
@@ -533,20 +552,27 @@ pub const RootTree = struct {
                 .ctime = entry.ctime,
                 .xattrs = entry.xattrs,
             };
+            const path = try joinMountPath(&path_buffer, prefix, entry.path);
             switch (entry.kind) {
-                .directory => try self.putDirectory(entry.path, metadata),
-                .fifo => try self.putFifo(entry.path, metadata),
-                .block_device => try self.putDevice(entry.path, .block_device, .{
+                .directory => try self.putDirectory(path, metadata),
+                .fifo => try self.putFifo(path, metadata),
+                .block_device => try self.putDevice(path, .block_device, .{
                     .major = entry.device.major,
                     .minor = entry.device.minor,
                 }, metadata),
-                .char_device => try self.putDevice(entry.path, .char_device, .{
+                .char_device => try self.putDevice(path, .char_device, .{
                     .major = entry.device.major,
                     .minor = entry.device.minor,
                 }, metadata),
                 // The scanner always emits the content-bearing name before any
-                // further link to it, so the target is already present.
-                .hardlink => try self.putHardlink(entry.path, entry.hardlink_target, metadata),
+                // further link to it, so the target is already present. Both
+                // names come from the same source, so a mount moves the two of
+                // them together and the link survives the merge.
+                .hardlink => try self.putHardlink(
+                    path,
+                    try joinMountPath(&target_buffer, prefix, entry.hardlink_target),
+                    metadata,
+                ),
                 .file, .symlink => {
                     const kind: Kind = if (entry.kind == .file) .file else .symlink;
                     const content = entry.content orelse if (entry.size == 0)
@@ -554,32 +580,218 @@ pub const RootTree = struct {
                     else
                         return error.MissingContent;
                     if (mode == .borrowed) {
-                        try self.putBorrowedContent(
-                            entry.path,
-                            kind,
-                            entry.size,
-                            content,
-                            metadata,
-                        );
+                        try self.putBorrowedContent(path, kind, entry.size, content, metadata);
                         continue;
                     }
                     if (kind == .file) {
-                        try self.putFileReader(entry.path, entry.size, content, metadata);
+                        try self.putFileReader(path, entry.size, content, metadata);
                         continue;
                     }
-                    try self.checkFileBytes(entry.size);
-                    try validatePath(entry.path, self.limits, self.diagnostic);
-                    const old_spool_len = self.spool_len;
-                    const owned = self.spoolContent(entry.size, content) catch |err| {
-                        try self.rollbackSpool(old_spool_len);
-                        return err;
-                    };
-                    self.putNode(entry.path, .symlink, metadata, .{ .content = owned }) catch |err| {
-                        try self.rollbackSpool(old_spool_len);
-                        return err;
-                    };
+                    try self.putOwnedContent(path, .symlink, entry.size, content, metadata);
                 },
             }
+        }
+        return source.nodeCount();
+    }
+
+    /// Spools `content` into this tree and records it at `path`, rolling the
+    /// spool back to where it was if any part of that fails.
+    fn putOwnedContent(
+        self: *RootTree,
+        path: []const u8,
+        kind: Kind,
+        size: u64,
+        content: ext4.FileTreeView.ContentReader,
+        metadata: Metadata,
+    ) !void {
+        try self.checkFileBytes(size);
+        try validatePath(path, self.limits, self.diagnostic);
+        const old_spool_len = self.spool_len;
+        const owned = self.spoolContent(size, content) catch |err| {
+            try self.rollbackSpool(old_spool_len);
+            return err;
+        };
+        self.putNode(path, kind, metadata, .{ .content = owned }) catch |err| {
+            try self.rollbackSpool(old_spool_len);
+            return err;
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    // Mounting a second source under a path prefix
+    //
+    // A typical installed system is spread across several filesystems that a
+    // simpler image wants collapsed into one. Merging them here, before the
+    // writer runs, is what keeps hardlinks, xattrs, permissions, device nodes
+    // and timestamps intact across the merge: the writer sees one tree and
+    // cannot tell how many filesystems it came from.
+    //
+    // A mount *replaces* what the tree already had at the mount point rather
+    // than merging with it entry by entry, because that is what a real mount
+    // does. It matters: an installed root filesystem's `/boot` is a non-empty
+    // stub whose contents the boot filesystem hides, and merging the two would
+    // produce an image carrying a stale kernel or a stale bootloader
+    // configuration beside the real one -- which looks fine and can boot the
+    // wrong thing, or nothing at all.
+    // -----------------------------------------------------------------------
+
+    /// What a mount did, so a caller can state it rather than diff for it.
+    pub const MountReport = struct {
+        /// Nodes the mount point hid. Non-zero is entirely normal: a root
+        /// filesystem's `/boot` stub is exactly this.
+        shadowed_nodes: usize,
+        /// Nodes taken from the mounted source, excluding the mount point
+        /// directory itself.
+        imported_nodes: usize,
+    };
+
+    /// Mounts a strict-profile or FAT source, whose entries reach this tree
+    /// through `FileTreeView`. `root` is the mounted filesystem's own root
+    /// directory metadata, which becomes the metadata of the mount point,
+    /// exactly as a real mount makes the mounted root's mode and ownership
+    /// the ones visible at the mount point.
+    pub fn mountExt4View(
+        self: *RootTree,
+        source: *ext4.FileTreeView,
+        target: []const u8,
+        root: Metadata,
+    ) !MountReport {
+        return self.mountInternal(target, root, .owned, .{ .view = source });
+    }
+
+    pub fn mountExt4ViewBorrowed(
+        self: *RootTree,
+        source: *ext4.FileTreeView,
+        target: []const u8,
+        root: Metadata,
+    ) !MountReport {
+        if (self.storage != .memory) return error.BorrowedImportRequiresMemoryTree;
+        return self.mountInternal(target, root, .borrowed, .{ .view = source });
+    }
+
+    pub fn mountExt4General(
+        self: *RootTree,
+        source: *ext4.GeneralTree,
+        target: []const u8,
+    ) !MountReport {
+        return self.mountInternal(target, generalRootMetadata(source), .owned, .{ .general = source });
+    }
+
+    pub fn mountExt4GeneralBorrowed(
+        self: *RootTree,
+        source: *ext4.GeneralTree,
+        target: []const u8,
+    ) !MountReport {
+        if (self.storage != .memory) return error.BorrowedImportRequiresMemoryTree;
+        return self.mountInternal(
+            target,
+            generalRootMetadata(source),
+            .borrowed,
+            .{ .general = source },
+        );
+    }
+
+    /// Mounts a FAT volume. Its entries carry the metadata the scan was told
+    /// to synthesize, and so does the mount point.
+    pub fn mountFat(
+        self: *RootTree,
+        source: *fat32.Tree,
+        target: []const u8,
+    ) !MountReport {
+        return self.mountInternal(target, fatRootMetadata(source), .owned, .{
+            .view = source.fileTreeView(),
+        });
+    }
+
+    pub fn mountFatBorrowed(
+        self: *RootTree,
+        source: *fat32.Tree,
+        target: []const u8,
+    ) !MountReport {
+        if (self.storage != .memory) return error.BorrowedImportRequiresMemoryTree;
+        return self.mountInternal(target, fatRootMetadata(source), .borrowed, .{
+            .view = source.fileTreeView(),
+        });
+    }
+
+    const MountSource = union(enum) {
+        view: *ext4.FileTreeView,
+        general: *ext4.GeneralTree,
+    };
+
+    fn mountInternal(
+        self: *RootTree,
+        target: []const u8,
+        root: Metadata,
+        mode: ImportMode,
+        source: MountSource,
+    ) !MountReport {
+        const relative = try mountTargetToRelative(target);
+        try validatePath(relative, self.limits, self.diagnostic);
+        try self.validateMountPoint(relative);
+
+        // A hardlink outside the mount point whose inode-bearing name is
+        // inside it would be left pointing at nothing. That is a genuinely
+        // ambiguous merge -- the link cannot be preserved and cannot be
+        // silently turned into a copy -- so it is refused by name.
+        if (self.removalBreaksHardlinks(relative, true)) {
+            return error.MountShadowsHardlinkTarget;
+        }
+
+        // Owned separately: `removeInternal` frees the node that `relative`
+        // may currently borrow its bytes from.
+        const owned_target = try self.allocator.dupe(u8, relative);
+        defer self.allocator.free(owned_target);
+
+        var shadowed: usize = 0;
+        for (self.nodes.items) |node| {
+            if (!std.mem.eql(u8, node.path, owned_target) and
+                pathEqualsOrDescendant(owned_target, node.path))
+            {
+                shadowed += 1;
+            }
+        }
+        _ = self.removeInternal(owned_target, true);
+        try self.putDirectory(owned_target, root);
+
+        const before = self.nodes.items.len;
+        const imported = switch (source) {
+            .view => |view| try self.importExt4ViewMode(view, mode, owned_target),
+            .general => |general| try self.importExt4GeneralMode(general, mode, owned_target),
+        };
+        // Every mounted entry's parent is a directory the same source already
+        // emitted, so nothing is created implicitly and nothing may replace an
+        // earlier entry. A count that does not add up means the merge dropped
+        // or collided with something, which is precisely the silent corruption
+        // this whole path exists to avoid.
+        if (self.nodes.items.len != before + imported) return error.MountedNodeCountMismatch;
+
+        return .{ .shadowed_nodes = shadowed, .imported_nodes = imported };
+    }
+
+    /// A mount point must already exist, as a directory, reached without
+    /// traversing a symlink -- exactly the preconditions `mount(8)` enforces.
+    /// Creating a missing one would be a silent fallback that turns a typo
+    /// into a plausible-looking image.
+    fn validateMountPoint(self: *const RootTree, relative: []const u8) !void {
+        var cursor: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, relative, cursor, '/')) |slash| {
+            const ancestor = relative[0..slash];
+            const index = self.findIndex(ancestor) orelse return error.MissingMountTargetParent;
+            switch (self.nodes.items[index].kind) {
+                .directory => {},
+                // A symlink in the path means the mount point named here and
+                // the one the guest would resolve are different directories.
+                .symlink => return error.MountTargetTraversesSymlink,
+                else => return error.MountTargetTraversesNonDirectory,
+            }
+            cursor = slash + 1;
+        }
+        const index = self.findIndex(relative) orelse return error.MissingMountTarget;
+        switch (self.nodes.items[index].kind) {
+            .directory => {},
+            .symlink => return error.MountTargetIsSymlink,
+            else => return error.MountTargetNotDirectory,
         }
     }
 
@@ -1255,6 +1467,104 @@ fn pathEqualsOrDescendant(parent: []const u8, path: []const u8) bool {
         (path.len > parent.len and std.mem.startsWith(u8, path, parent) and path[parent.len] == '/');
 }
 
+const ImportMode = enum { owned, borrowed };
+
+fn generalRootMetadata(source: *const ext4.GeneralTree) Metadata {
+    return .{
+        .mode = source.root.mode,
+        .uid = source.root.uid,
+        .gid = source.root.gid,
+        .atime = source.root.atime,
+        .mtime = source.root.mtime,
+        .ctime = source.root.ctime,
+        .xattrs = source.root.xattrs,
+    };
+}
+
+fn fatRootMetadata(source: *const fat32.Tree) Metadata {
+    return .{
+        .mode = source.metadata.directory_mode,
+        .uid = source.metadata.uid,
+        .gid = source.metadata.gid,
+    };
+}
+
+fn joinMountPath(
+    buffer: *std.array_list.Managed(u8),
+    prefix: []const u8,
+    path: []const u8,
+) ![]const u8 {
+    if (prefix.len == 0) return path;
+    buffer.clearRetainingCapacity();
+    try buffer.appendSlice(prefix);
+    try buffer.append('/');
+    try buffer.appendSlice(path);
+    return buffer.items;
+}
+
+/// Errors a mount target can produce before anything is read. Each names one
+/// specific way the target was ambiguous, because "invalid mount point" tells
+/// an operator nothing about which of five different mistakes was made.
+pub const MountTargetError = error{
+    /// A mount target is a path in the resulting tree, so a relative one has
+    /// no defined meaning: relative to what?
+    MountTargetNotAbsolute,
+    /// `/` is the root source's job. Mounting a second source there would
+    /// hide the first entirely, which is a way of saying the first was never
+    /// wanted.
+    MountTargetIsRoot,
+    /// `//`, `/a/`, `/a/./b` or `/a/../b`. Normalizing silently would mean
+    /// two spellings of the same target could still fail the overlap check.
+    MountTargetNotNormalized,
+    /// Two sources mounted at the same path. Whichever won would be decided
+    /// by argument order, which is not a decision worth inferring.
+    DuplicateMountTarget,
+    /// A later mount whose target contains an earlier mount's target. The
+    /// later one would shadow the earlier one away completely, so the earlier
+    /// source would be read and then thrown out.
+    MountTargetShadowedByLaterMount,
+};
+
+/// Validates a whole mount list before any source is opened, so an
+/// unsatisfiable set of targets fails immediately rather than after however
+/// long it takes to read the first filesystem.
+///
+/// Targets may nest -- `/boot` then `/boot/efi` is the layout this exists for
+/// -- but only in that order, because each mount is applied to the tree the
+/// previous ones produced.
+pub fn validateMountTargets(targets: []const []const u8) MountTargetError!void {
+    for (targets, 0..) |target, index| {
+        _ = try mountTargetToRelative(target);
+        for (targets[index + 1 ..]) |later| {
+            const later_relative = mountTargetToRelative(later) catch continue;
+            const relative = mountTargetToRelative(target) catch unreachable;
+            if (std.mem.eql(u8, relative, later_relative)) return error.DuplicateMountTarget;
+            if (pathEqualsOrDescendant(later_relative, relative)) {
+                return error.MountTargetShadowedByLaterMount;
+            }
+        }
+    }
+}
+
+/// Converts `/boot/efi` into the `boot/efi` form the tree stores, refusing
+/// every spelling that is not already normalized and absolute.
+fn mountTargetToRelative(target: []const u8) MountTargetError![]const u8 {
+    if (target.len == 0 or target[0] != '/') return error.MountTargetNotAbsolute;
+    if (target.len == 1) return error.MountTargetIsRoot;
+    if (target[target.len - 1] == '/') return error.MountTargetNotNormalized;
+    const relative = target[1..];
+    var components = std.mem.splitScalar(u8, relative, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or
+            std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+        {
+            return error.MountTargetNotNormalized;
+        }
+    }
+    return relative;
+}
+
 fn removedByOverlay(
     existing_path: []const u8,
     destination: []const u8,
@@ -1845,4 +2155,255 @@ test "xattr count and byte limits are distinguishable" {
     }));
     try std.testing.expectEqual(limits_mod.Limit.xattr_bytes_per_node, bytes.exceeded.?.limit);
     try std.testing.expectEqual(@as(u64, 22), bytes.exceeded.?.observed);
+}
+
+test "a mount replaces what it covers instead of merging into it" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    defer Io.Dir.cwd().deleteFile(io, "test-root-tree-mount-root.spool") catch {};
+    defer Io.Dir.cwd().deleteFile(io, "test-root-tree-mount-boot.spool") catch {};
+
+    // The root source's `/boot` stub, which a real system's boot filesystem
+    // hides the moment it is mounted.
+    var root = try RootTree.init(allocator, io, "test-root-tree-mount-root.spool", .{});
+    defer root.deinit();
+    try root.putDirectory("boot", .{ .mode = 0o755 });
+    try root.putFileBytes("boot/vmlinuz", "stale kernel", .{ .mode = 0o644 });
+    try root.putDirectory("boot/grub", .{ .mode = 0o755 });
+    try root.putFileBytes("boot/grub/grub.cfg", "stale config", .{ .mode = 0o644 });
+    try root.putFileBytes("etc/hostname", "host\n", .{ .mode = 0o644 });
+
+    var boot = try RootTree.init(allocator, io, "test-root-tree-mount-boot.spool", .{});
+    defer boot.deinit();
+    try boot.putFileBytes("vmlinuz", "real kernel", .{ .mode = 0o644 });
+
+    const report = try root.mountExt4View(
+        try boot.ext4View(),
+        "/boot",
+        .{ .mode = 0o700, .uid = 7, .gid = 8 },
+    );
+    try std.testing.expectEqual(@as(usize, 3), report.shadowed_nodes);
+    try std.testing.expectEqual(@as(usize, 1), report.imported_nodes);
+
+    // Nothing from the stub survives: not the file the mount replaced, and
+    // not the subdirectory the mount had nothing to say about.
+    try std.testing.expectEqual(@as(?NodeView, null), root.findNode("boot/grub"));
+    try std.testing.expectEqual(@as(?NodeView, null), root.findNode("boot/grub/grub.cfg"));
+    var content: [11]u8 = undefined;
+    _ = try root.readNodeContent("boot/vmlinuz", &content, 0);
+    try std.testing.expectEqualStrings("real kernel", &content);
+
+    // The mount point wears the mounted filesystem's root metadata, exactly
+    // as a real mount makes it the metadata a guest sees there.
+    const mount_point = root.findNode("boot").?;
+    try std.testing.expectEqual(Kind.directory, mount_point.kind);
+    try std.testing.expectEqual(@as(u16, 0o700), mount_point.metadata.mode);
+    try std.testing.expectEqual(@as(u32, 7), mount_point.metadata.uid);
+
+    // Everything outside the mount point is untouched.
+    try std.testing.expect(root.findNode("etc/hostname") != null);
+}
+
+test "mounts nest in the order they are applied" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const spools = [_][]const u8{
+        "test-root-tree-nest-root.spool",
+        "test-root-tree-nest-boot.spool",
+        "test-root-tree-nest-esp.spool",
+    };
+    defer for (spools) |path| Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var root = try RootTree.init(allocator, io, spools[0], .{});
+    defer root.deinit();
+    try root.putDirectory("boot", .{ .mode = 0o755 });
+    try root.putFileBytes("boot/leftover", "x", .{ .mode = 0o644 });
+
+    var boot = try RootTree.init(allocator, io, spools[1], .{});
+    defer boot.deinit();
+    try boot.putFileBytes("vmlinuz", "kernel", .{ .mode = 0o644 });
+    try boot.putDirectory("efi", .{ .mode = 0o755 });
+
+    var esp = try RootTree.init(allocator, io, spools[2], .{});
+    defer esp.deinit();
+    try esp.putDirectory("EFI", .{ .mode = 0o755 });
+    try esp.putFileBytes("EFI/BOOTX64.EFI", "shim", .{ .mode = 0o644 });
+
+    _ = try root.mountExt4View(try boot.ext4View(), "/boot", .{ .mode = 0o755 });
+    const nested = try root.mountExt4View(try esp.ext4View(), "/boot/efi", .{ .mode = 0o755 });
+
+    try std.testing.expectEqual(@as(usize, 0), nested.shadowed_nodes);
+    try std.testing.expectEqual(@as(usize, 2), nested.imported_nodes);
+    try std.testing.expect(root.findNode("boot/vmlinuz") != null);
+    try std.testing.expect(root.findNode("boot/efi/EFI/BOOTX64.EFI") != null);
+    try std.testing.expectEqual(@as(?NodeView, null), root.findNode("boot/leftover"));
+}
+
+test "hardlinks travel through a mount and refuse to be severed by one" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const spools = [_][]const u8{
+        "test-root-tree-mount-link-root.spool",
+        "test-root-tree-mount-link-boot.spool",
+        "test-root-tree-mount-link-severed.spool",
+    };
+    defer for (spools) |path| Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var root = try RootTree.init(allocator, io, spools[0], .{});
+    defer root.deinit();
+    try root.putDirectory("boot", .{ .mode = 0o755 });
+    try root.putFileBytes("usr/bin/tool", "tool", .{ .mode = 0o755 });
+    try root.putHardlink("usr/bin/tool-alias", "usr/bin/tool", .{ .mode = 0o755 });
+
+    // A hardlink pair inside the mounted source moves under the mount point
+    // together, so the two names still share one inode afterwards.
+    var boot = try RootTree.init(allocator, io, spools[1], .{});
+    defer boot.deinit();
+    try boot.putFileBytes("vmlinuz", "kernel", .{ .mode = 0o644 });
+    try boot.putHardlink("vmlinuz.old", "vmlinuz", .{ .mode = 0o644 });
+
+    _ = try root.mountExt4View(try boot.ext4View(), "/boot", .{ .mode = 0o755 });
+    const link = root.findNode("boot/vmlinuz.old").?;
+    try std.testing.expectEqual(Kind.hardlink, link.kind);
+    try std.testing.expectEqualStrings("boot/vmlinuz", link.payload.hardlink_target);
+    try std.testing.expect(root.findNode("usr/bin/tool-alias") != null);
+
+    // A link outside the mount point whose inode-bearing name is inside it
+    // cannot survive and must not silently become a copy.
+    var severed = try RootTree.init(allocator, io, spools[2], .{});
+    defer severed.deinit();
+    try severed.putDirectory("boot", .{ .mode = 0o755 });
+    try severed.putFileBytes("boot/shared", "bytes", .{ .mode = 0o644 });
+    try severed.putHardlink("elsewhere", "boot/shared", .{ .mode = 0o644 });
+
+    var empty = try RootTree.init(allocator, io, "test-root-tree-mount-link-empty.spool", .{});
+    defer Io.Dir.cwd().deleteFile(io, "test-root-tree-mount-link-empty.spool") catch {};
+    defer empty.deinit();
+    try empty.putFileBytes("vmlinuz", "kernel", .{ .mode = 0o644 });
+
+    try std.testing.expectError(error.MountShadowsHardlinkTarget, severed.mountExt4View(
+        try empty.ext4View(),
+        "/boot",
+        .{ .mode = 0o755 },
+    ));
+    try std.testing.expect(severed.findNode("boot/shared") != null);
+}
+
+test "a mount target must be absolute, normalized, and a directory that exists" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const spools = [_][]const u8{
+        "test-root-tree-mount-target-root.spool",
+        "test-root-tree-mount-target-src.spool",
+    };
+    defer for (spools) |path| Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var root = try RootTree.init(allocator, io, spools[0], .{});
+    defer root.deinit();
+    try root.putDirectory("boot", .{ .mode = 0o755 });
+    try root.putFileBytes("etc/hostname", "host\n", .{ .mode = 0o644 });
+    try root.putSymlink("link", "boot", .{ .mode = 0o777 });
+    try root.putDirectory("var", .{ .mode = 0o755 });
+    try root.putSymlink("var/run", "../run", .{ .mode = 0o777 });
+
+    var source = try RootTree.init(allocator, io, spools[1], .{});
+    defer source.deinit();
+    try source.putFileBytes("payload", "x", .{ .mode = 0o644 });
+
+    const cases = [_]struct { target: []const u8, expected: anyerror }{
+        .{ .target = "boot", .expected = error.MountTargetNotAbsolute },
+        .{ .target = "", .expected = error.MountTargetNotAbsolute },
+        .{ .target = "/", .expected = error.MountTargetIsRoot },
+        .{ .target = "/boot/", .expected = error.MountTargetNotNormalized },
+        .{ .target = "//boot", .expected = error.MountTargetNotNormalized },
+        .{ .target = "/boot/./efi", .expected = error.MountTargetNotNormalized },
+        .{ .target = "/boot/../etc", .expected = error.MountTargetNotNormalized },
+        .{ .target = "/missing", .expected = error.MissingMountTarget },
+        .{ .target = "/missing/deeper", .expected = error.MissingMountTargetParent },
+        .{ .target = "/etc/hostname", .expected = error.MountTargetNotDirectory },
+        .{ .target = "/link", .expected = error.MountTargetIsSymlink },
+        .{ .target = "/var/run/deeper", .expected = error.MountTargetTraversesSymlink },
+        .{ .target = "/etc/hostname/deeper", .expected = error.MountTargetTraversesNonDirectory },
+    };
+    for (cases) |case| {
+        try std.testing.expectError(case.expected, root.mountExt4View(
+            try source.ext4View(),
+            case.target,
+            .{ .mode = 0o755 },
+        ));
+    }
+    // Every refusal left the tree exactly as it was.
+    try std.testing.expectEqual(@as(?NodeView, null), root.findNode("boot/payload"));
+}
+
+test "a mount list rejects duplicate and later-shadowing targets" {
+    try validateMountTargets(&.{ "/boot", "/boot/efi" });
+    try validateMountTargets(&.{ "/boot", "/var/lib" });
+
+    try std.testing.expectError(
+        error.DuplicateMountTarget,
+        validateMountTargets(&.{ "/boot", "/boot" }),
+    );
+    // `/boot` applied second would shadow the `/boot/efi` source away
+    // completely, so the source would be read and then discarded.
+    try std.testing.expectError(
+        error.MountTargetShadowedByLaterMount,
+        validateMountTargets(&.{ "/boot/efi", "/boot" }),
+    );
+    try std.testing.expectError(
+        error.MountTargetNotAbsolute,
+        validateMountTargets(&.{"boot"}),
+    );
+    try std.testing.expectError(
+        error.MountTargetNotNormalized,
+        validateMountTargets(&.{"/boot//efi"}),
+    );
+}
+
+test "a FAT mount carries only the metadata the scan synthesized" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const image_path = "test-root-tree-mount-esp.img";
+    const spool_path = "test-root-tree-mount-fat.spool";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    const Image = @import("image.zig").Image;
+    const partition_len: u64 = 64 * 1024 * 1024;
+    var image = try Image.create(io, image_path, .raw, partition_len, .{});
+    defer image.close(io);
+    try fat32.format(&image, io, .{ .partition_offset = 0, .partition_len = partition_len });
+    var writable = try fat32.open(&image, io, .{ .offset = 0, .length = partition_len });
+    try writable.createDir(io, "EFI/BOOT");
+    try writable.writeFile(io, "EFI/BOOT/BOOTX64.EFI", "shim");
+
+    var filesystem = try fat32.open(&image, io, .{ .offset = 0, .length = partition_len });
+    var esp = try fat32.scanTree(&filesystem, io, allocator, .{ .metadata = .{
+        .directory_mode = 0o700,
+        .file_mode = 0o600,
+        .uid = 0,
+        .gid = 0,
+    } });
+    defer esp.deinit();
+
+    var root = try RootTree.init(allocator, io, spool_path, .{});
+    defer root.deinit();
+    try root.putDirectory("boot", .{ .mode = 0o755 });
+    try root.putDirectory("boot/efi", .{ .mode = 0o755 });
+
+    const report = try root.mountFat(&esp, "/boot/efi");
+    try std.testing.expectEqual(@as(usize, 3), report.imported_nodes);
+    try std.testing.expectEqual(@as(u16, 0o700), root.findNode("boot/efi").?.metadata.mode);
+    try std.testing.expectEqual(@as(u16, 0o700), root.findNode("boot/efi/EFI").?.metadata.mode);
+
+    const binary = root.findNode("boot/efi/EFI/BOOT/BOOTX64.EFI").?;
+    try std.testing.expectEqual(@as(u16, 0o600), binary.metadata.mode);
+    try std.testing.expectEqual(@as(u32, 0), binary.metadata.uid);
+    // vfat has no timestamps and no xattrs, so neither may be invented.
+    try std.testing.expectEqual(@as(?i64, null), binary.metadata.mtime);
+    try std.testing.expectEqual(@as(usize, 0), binary.metadata.xattrs.len);
+
+    var content: [4]u8 = undefined;
+    _ = try root.readNodeContent("boot/efi/EFI/BOOT/BOOTX64.EFI", &content, 0);
+    try std.testing.expectEqualStrings("shim", &content);
 }
