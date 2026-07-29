@@ -2,13 +2,27 @@
 //!
 //! Feature flags intentionally stay within a conservative, fsck-friendly
 //! subset:
-//!   - `feature_compat = EXT_ATTR | DIR_INDEX`: external xattr blocks are
-//!     supported, and directories that outgrow a single leaf block are written
-//!     with ext4 htree indexes, including interior index nodes when a single
-//!     root index block is no longer enough. `HAS_JOURNAL`, `RESIZE_INODE`,
-//!     and quota bits remain unset; this writer deliberately ships a permanently
-//!     journal-less filesystem for now because the target image-build flow
-//!     creates filesystems offline and writes them atomically.
+//!   - `feature_compat = EXT_ATTR | DIR_INDEX`, plus `HAS_JOURNAL` when a
+//!     journal is asked for: external xattr blocks are supported, and
+//!     directories that outgrow a single leaf block are written with ext4
+//!     htree indexes, including interior index nodes when a single root index
+//!     block is no longer enough. `RESIZE_INODE` and the quota bits remain
+//!     permanently unset.
+//!
+//!     The journal is opt-in and off by default. Nothing needs one while the
+//!     image is being built -- the filesystem is created offline and written
+//!     atomically, so there is no partially applied metadata update for a log
+//!     to protect. That stops being the whole story the moment the image
+//!     becomes a running machine's mutable root filesystem: from first boot
+//!     onward an unclean shutdown leaves a journal-less volume with no
+//!     recovery log, so the next boot faces a full `fsck` rather than a fast
+//!     replay. `PopulateOptions.journal` therefore allocates the reserved
+//!     journal inode (8) with a JBD2 superblock sized on `mke2fs`'s own
+//!     ladder. It stays off by default because every existing build path
+//!     produces purpose-built images that chose journal-less output
+//!     deliberately, and because a journalled image is a different profile:
+//!     `scanWriterCompatible` refuses it, so only the general importer can
+//!     read one back.
 //!   - `feature_incompat = FILETYPE | EXTENTS`: directory entries carry the
 //!     ext4 file-type byte, and regular-file / directory payloads are mapped
 //!     with extents.
@@ -18,14 +32,15 @@
 //!     sparse-super rule, and metadata-bearing structures are checksummed with
 //!     crc32c.
 //!
-//! Deliberate phase-2 non-goals: no journal replay/log writing and no quota
-//! files. Extents stay inline for small files, but larger fragmented files now
-//! spill into standard ext4 extent/index blocks with recursive readback
-//! support. With 4 KiB blocks this writer supports extent-tree depths up to 4,
-//! which is enough to cover the filesystem's 32-bit logical-block space.
-//! Resizing is supported as an offline, in-place grow operation that rewrites
-//! the superblock/GDTs and initializes new block groups without enabling
-//! ext4's separate `RESIZE_INODE` online-resize scaffolding.
+//! Deliberate phase-2 non-goals: no journal replay or log writing (a journal
+//! this writer creates is always empty, so there is nothing to replay) and no
+//! quota files. Extents stay inline for small files, but larger fragmented
+//! files now spill into standard ext4 extent/index blocks with recursive
+//! readback support. With 4 KiB blocks this writer supports extent-tree depths
+//! up to 4, which is enough to cover the filesystem's 32-bit logical-block
+//! space. Resizing is supported as an offline, in-place grow operation that
+//! rewrites the superblock/GDTs and initializes new block groups without
+//! enabling ext4's separate `RESIZE_INODE` online-resize scaffolding.
 
 const std = @import("std");
 const limits_mod = @import("limits.zig");
@@ -38,6 +53,9 @@ const limit_defaults = limits_mod.ImportLimits{};
 pub const default_block_size: u32 = 4096;
 pub const default_blocks_per_group: u32 = 32 * 1024;
 pub const root_inode: u32 = 2;
+/// `EXT4_JOURNAL_INO`. It sits inside the 1..10 reserved range, so allocating
+/// it costs no inode the tree could otherwise have used.
+pub const journal_inode: u32 = 8;
 pub const first_non_reserved_inode: u32 = 11;
 
 const inode_size: u16 = 128;
@@ -136,6 +154,24 @@ const dir_ft_checksum: u8 = 0xDE;
 
 const extent_magic: u16 = 0xF30A;
 const ext4_xattr_magic: u32 = 0xEA02_0000;
+
+// JBD2 on-disk constants. The journal superblock is big-endian throughout,
+// unlike every other structure this module writes.
+const jbd2_magic: u32 = 0xC03B_3998;
+const jbd2_superblock_v2: u32 = 4;
+/// `JBD2_MIN_JOURNAL_BLOCKS`, and `mke2fs`'s own floor for an explicit size.
+const jbd2_min_journal_blocks: u32 = 1024;
+/// `mke2fs`'s own ceiling for an explicit `-J size=`.
+const jbd2_max_journal_blocks: u32 = 10_240_000;
+/// A filesystem smaller than this has nowhere sensible to put the 1024-block
+/// JBD2 minimum, which is why `mke2fs` refuses one too.
+const min_journalled_filesystem_blocks: u32 = 2048;
+/// `mke2fs` writes the journal inode with these bits and nothing else.
+const journal_inode_mode: u16 = 0o600;
+/// `EXT3_JNL_BACKUP_BLOCKS`: `s_jnl_blocks` holds the journal inode's
+/// `i_block` array plus its size, so `e2fsck` can find the log even if the
+/// inode itself is unreadable.
+const jnl_backup_type_blocks: u8 = 1;
 const dx_hash_half_md4: u8 = 0x1;
 const super_checksum_type_crc32c: u8 = 0x1;
 const xattr_name_user: u8 = 1;
@@ -155,6 +191,41 @@ pub const Kind = enum(u8) {
     char_device,
     fifo,
 };
+
+/// Whether the written filesystem carries a JBD2 journal, and how large.
+///
+/// `enabled` is false by default and that default is load-bearing: every
+/// caller that predates this option builds an image whose filesystem is
+/// written once, offline and atomically, and flipping the default would
+/// change the bytes of all of them. Turn it on for an image that becomes a
+/// running machine's mutable root filesystem, where an unclean shutdown
+/// otherwise leaves no recovery log behind.
+pub const JournalOptions = struct {
+    enabled: bool = false,
+    /// Journal size in bytes, which must be a whole number of blocks. Null
+    /// selects `defaultJournalBlocks`, which is `mke2fs`'s own ladder. An
+    /// explicit size is accepted between 1024 and 10,240,000 blocks and up to
+    /// half the filesystem, matching `mke2fs -J size=`.
+    size_bytes: ?u64 = null,
+};
+
+/// `mke2fs`'s default journal size in filesystem blocks, reproducing
+/// e2fsprogs 1.47's `ext2fs_default_journal_size` ladder exactly. Null means
+/// the filesystem is too small to carry a journal at all.
+///
+/// With 4 KiB blocks that is 4 MiB below 128 MiB, 16 MiB below 1 GiB, 32 MiB
+/// below 2 GiB, 64 MiB below 16 GiB, and so on up to 1 GiB of journal.
+pub fn defaultJournalBlocks(total_blocks: u32) ?u32 {
+    if (total_blocks < min_journalled_filesystem_blocks) return null;
+    if (total_blocks < 32 * 1024) return 1024;
+    if (total_blocks < 256 * 1024) return 4096;
+    if (total_blocks < 512 * 1024) return 8192;
+    if (total_blocks < 4096 * 1024) return 16384;
+    if (total_blocks < 8192 * 1024) return 32768;
+    if (total_blocks < 16384 * 1024) return 65536;
+    if (total_blocks < 32768 * 1024) return 131072;
+    return 262144;
+}
 
 pub const PopulateOptions = struct {
     /// Byte offset within `file` where the filesystem starts.
@@ -181,6 +252,8 @@ pub const PopulateOptions = struct {
     uuid: ?[16]u8 = null,
     /// POSIX seconds timestamp written to the superblock/inodes.
     timestamp: u32 = 0,
+    /// Journal creation policy. Off by default; see `JournalOptions`.
+    journal: JournalOptions = .{},
 };
 
 pub const ResizeOptions = struct {
@@ -197,6 +270,8 @@ pub const FilesystemInfo = struct {
     feature_compat: u32,
     feature_incompat: u32,
     feature_ro_compat: u32,
+    /// Blocks occupied by the journal, or 0 when the filesystem has none.
+    journal_block_count: u32 = 0,
 };
 
 pub const Stat = struct {
@@ -327,6 +402,10 @@ pub const PopulateError = std.mem.Allocator.Error || Io.File.ReadPositionalError
     FilesystemTooLarge,
     InvalidXattr,
     XattrTooLarge,
+    FilesystemTooSmallForJournal,
+    JournalSizeTooSmall,
+    JournalSizeTooLarge,
+    UnalignedJournalSize,
 };
 
 pub const OpenError = std.mem.Allocator.Error || Io.File.ReadPositionalError || error{
@@ -359,6 +438,7 @@ pub const ResizeError = PopulateError || OpenError || Io.File.ReadPositionalErro
     InvalidRange,
     ShrinkNotSupported,
     UnsupportedResizeLayout,
+    ResizeInodeNotSupported,
     FilesystemTooLarge,
 };
 
@@ -490,11 +570,22 @@ const GroupLayout = struct {
 const WriterPlan = struct {
     entries: []OwnedEntry,
     nodes: []Node,
+    /// Zero or one element. The journal is deliberately not part of `nodes`:
+    /// it owns a reserved inode and has no directory entry anywhere, so
+    /// letting it into that array would make it a child of the root, count it
+    /// as a link, and hand it a name it must never have.
+    journal: []Node,
+    feature_compat: u32,
     feature_ro_compat: u32,
     data_blocks_needed: u32,
     /// Nodes that own an inode, which is fewer than `nodes.len` whenever the
     /// tree contains hardlinks.
     inode_count: usize,
+
+    fn journalBlockCount(self: *const WriterPlan) u32 {
+        if (self.journal.len == 0) return 0;
+        return self.journal[0].data_block_count;
+    }
 
     fn deinit(self: *WriterPlan, allocator: std.mem.Allocator) void {
         for (self.nodes) |node| {
@@ -509,6 +600,11 @@ const WriterPlan = struct {
             allocator.free(node.xattrs);
         }
         allocator.free(self.nodes);
+        for (self.journal) |node| {
+            if (node.extents.len > 0) allocator.free(node.extents);
+            if (node.extent_tree_blocks.len > 0) allocator.free(node.extent_tree_blocks);
+        }
+        allocator.free(self.journal);
         for (self.entries) |entry| {
             allocator.free(entry.path);
             if (entry.hardlink_target.len > 0) allocator.free(entry.hardlink_target);
@@ -538,9 +634,10 @@ const PreparedPopulate = struct {
                 self.layout.inodes_per_group,
             ),
             .group_count = self.layout.group_count,
-            .feature_compat = writer_feature_compat,
+            .feature_compat = self.writer.feature_compat,
             .feature_incompat = writer_feature_incompat,
             .feature_ro_compat = self.writer.feature_ro_compat,
+            .journal_block_count = self.writer.journalBlockCount(),
         };
     }
 };
@@ -589,9 +686,11 @@ pub fn populate(
     }
 
     try writeNodeData(io, file, prepared.writer.nodes, options);
+    try writeJournalData(io, file, prepared.writer.journal, options);
     try zeroUnusedInodeTableBlocks(io, file, prepared.layout, options.offset);
     try writeBitmaps(io, file, prepared.layout, options.offset);
     try writeInodes(io, file, prepared.writer.nodes, prepared.layout, options);
+    try writeInodes(io, file, prepared.writer.journal, prepared.layout, options);
     try writeGroupDescriptorTables(
         io,
         file,
@@ -621,9 +720,9 @@ fn preparePopulate(
     const total_blocks = std.math.cast(u32, total_blocks64) orelse
         return error.FilesystemTooLarge;
 
-    var writer = try buildPlan(allocator, tree, options);
+    var writer = try buildPlan(allocator, tree, options, try resolveJournalBlocks(options, total_blocks));
     errdefer writer.deinit(allocator);
-    var layout = try buildLayout(
+    const layout = try buildLayout(
         allocator,
         total_blocks,
         writer.inode_count,
@@ -635,8 +734,63 @@ fn preparePopulate(
     if (writer.data_blocks_needed > countFreeBlocks(layout.groups)) {
         return error.NotEnoughSpace;
     }
-    try allocateNodeBlocks(allocator, writer.nodes, &layout);
+    // The tree is allocated first so that turning the journal on moves no
+    // file: an image built with and without a journal places every node's
+    // data in exactly the same blocks, which makes the two directly
+    // comparable.
+    var block_allocator = BlockAllocator{ .groups = layout.groups };
+    try allocateNodeBlocks(allocator, writer.nodes, &block_allocator);
+    try allocateNodeBlocks(allocator, writer.journal, &block_allocator);
     return .{ .writer = writer, .layout = layout };
+}
+
+/// Resolves the requested journal size into whole filesystem blocks, applying
+/// the same bounds `mke2fs` does. Zero means "no journal".
+fn resolveJournalBlocks(options: PopulateOptions, total_blocks: u32) PopulateError!u32 {
+    if (!options.journal.enabled) return 0;
+
+    const blocks = if (options.journal.size_bytes) |size_bytes| blk: {
+        if (size_bytes == 0 or size_bytes % options.block_size != 0) {
+            return error.UnalignedJournalSize;
+        }
+        const in_blocks = std.math.cast(u32, size_bytes / options.block_size) orelse
+            return error.JournalSizeTooLarge;
+        if (in_blocks < jbd2_min_journal_blocks) return error.JournalSizeTooSmall;
+        if (in_blocks > jbd2_max_journal_blocks) return error.JournalSizeTooLarge;
+        break :blk in_blocks;
+    } else defaultJournalBlocks(total_blocks) orelse
+        return error.FilesystemTooSmallForJournal;
+
+    // `mke2fs` refuses a journal larger than half the filesystem, and so does
+    // this: past that point the log is no longer overhead, it is the image.
+    if (blocks > total_blocks / 2) return error.JournalSizeTooLarge;
+    return blocks;
+}
+
+/// The journal's stand-in node. It carries a reserved inode and no name, so
+/// it travels beside the tree rather than inside it.
+fn buildJournalNode(allocator: std.mem.Allocator, block_count: u32) PopulateError![]Node {
+    if (block_count == 0) return allocator.alloc(Node, 0);
+    const journal = try allocator.alloc(Node, 1);
+    errdefer allocator.free(journal);
+    const size_bytes = @as(u64, block_count) * default_block_size;
+    journal[0] = .{
+        .path = "",
+        .name = "",
+        .parent_path = "",
+        .parent_index = 0,
+        .inode = journal_inode,
+        .kind = .file,
+        .mode = journal_inode_mode,
+        .uid = 0,
+        .gid = 0,
+        .declared_size = size_bytes,
+        .content = null,
+        .xattrs = &.{},
+        .size_on_disk = size_bytes,
+        .data_block_count = block_count,
+    };
+    return journal;
 }
 
 /// Grow an ext4 filesystem in place by extending the final block group or
@@ -654,10 +808,33 @@ pub fn resize(io: Io, file: Io.File, allocator: std.mem.Allocator, options: Resi
     const compat = readInt(u32, sb[0x5C..0x60]);
     const incompat = readInt(u32, sb[0x60..0x64]);
     const ro_compat = readInt(u32, sb[0x64..0x68]);
-    if (compat & ~(writer_feature_compat | feature_compat_has_journal | feature_compat_resize_inode) != 0) return error.UnsupportedFeatures;
-    if (compat & feature_compat_has_journal != 0) return error.UnsupportedResizeLayout;
+    // `RESIZE_INODE` reserves GDT blocks inside every group carrying a
+    // superblock copy, and inode 7 maps them. This path neither reads that
+    // inode nor preserves those reservations while it rebuilds the block
+    // bitmaps, so it refuses by name instead of quietly handing back a
+    // filesystem whose reserved growth room it has just handed to files.
+    if (compat & feature_compat_resize_inode != 0) return error.ResizeInodeNotSupported;
+    if (compat & ~(writer_feature_compat | feature_compat_has_journal) != 0) return error.UnsupportedFeatures;
+    // A journal needs nothing special here. Its inode and its blocks live
+    // entirely inside the old range, growing appends groups beyond them, and
+    // the bitmap rebuild below only relies on this writer's invariant that
+    // every group's used data blocks form a prefix of its data area -- which
+    // holds for the journal exactly as it does for a file.
     if (incompat != writer_feature_incompat) return error.UnsupportedFeatures;
     if (ro_compat & ~(writer_feature_ro_compat_base | feature_ro_compat_large_file) != 0) return error.UnsupportedFeatures;
+
+    // `s_jnl_blocks` is a backup of the journal inode that this path leaves
+    // exactly as it found it, which is only correct while the journal itself
+    // is untouched. Any other backup type means the filesystem was not
+    // written here, so its layout assumptions are not this writer's either.
+    const has_journal = compat & feature_compat_has_journal != 0;
+    if (has_journal and readInt(u8, sb[0xFD..0xFE]) != jnl_backup_type_blocks) {
+        return error.UnsupportedResizeLayout;
+    }
+    const journal_block_count: u32 = if (has_journal) blocksForBytes(
+        (@as(u64, readInt(u32, sb[0x148..0x14C])) << 32) | readInt(u32, sb[0x14C..0x150]),
+        default_block_size,
+    ) else 0;
 
     const old_total_blocks = readInt(u32, sb[0x04..0x08]);
     const new_total_blocks = std.math.cast(u32, options.length / default_block_size) orelse return error.FilesystemTooLarge;
@@ -672,6 +849,7 @@ pub fn resize(io: Io, file: Io.File, allocator: std.mem.Allocator, options: Resi
             .feature_compat = compat,
             .feature_incompat = incompat,
             .feature_ro_compat = ro_compat,
+            .journal_block_count = journal_block_count,
         };
     }
 
@@ -762,6 +940,7 @@ pub fn resize(io: Io, file: Io.File, allocator: std.mem.Allocator, options: Resi
         .feature_compat = compat,
         .feature_incompat = incompat,
         .feature_ro_compat = ro_compat,
+        .journal_block_count = journal_block_count,
     };
 }
 
@@ -4653,7 +4832,12 @@ fn freeStrictChildren(allocator: std.mem.Allocator, children: []StrictChild) voi
     allocator.free(children);
 }
 
-fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: PopulateOptions) PopulateError!WriterPlan {
+fn buildPlan(
+    allocator: std.mem.Allocator,
+    tree: *FileTreeView,
+    options: PopulateOptions,
+    journal_blocks: u32,
+) PopulateError!WriterPlan {
     var entries_list = std.array_list.Managed(OwnedEntry).init(allocator);
     errdefer {
         for (entries_list.items) |entry| {
@@ -4808,9 +4992,21 @@ fn buildPlan(allocator: std.mem.Allocator, tree: *FileTreeView, options: Populat
         }
     }
 
+    // The journal already owns reserved inode 8, which every layout counts as
+    // used whether or not it holds anything, so only its blocks are new.
+    const journal = try buildJournalNode(allocator, journal_blocks);
+    errdefer allocator.free(journal);
+    data_blocks_needed = std.math.add(u32, data_blocks_needed, journal_blocks) catch
+        return error.NotEnoughSpace;
+
     return .{
         .entries = try entries_list.toOwnedSlice(),
         .nodes = nodes,
+        .journal = journal,
+        .feature_compat = if (journal_blocks == 0)
+            writer_feature_compat
+        else
+            writer_feature_compat | feature_compat_has_journal,
         .feature_ro_compat = feature_ro_compat,
         .data_blocks_needed = data_blocks_needed,
         .inode_count = inode_count,
@@ -4922,19 +5118,22 @@ fn assignInodesToGroups(nodes: []Node, groups: []GroupLayout, inodes_per_group: 
     groups[0].used_inode_count += first_non_reserved_inode - 2;
 }
 
-fn allocateNodeBlocks(allocator: std.mem.Allocator, nodes: []Node, layout: *Layout) PopulateError!void {
-    var allocator_state = BlockAllocator{ .groups = layout.groups };
+fn allocateNodeBlocks(
+    allocator: std.mem.Allocator,
+    nodes: []Node,
+    block_allocator: *BlockAllocator,
+) PopulateError!void {
     for (nodes) |*node| {
         if (node.data_block_count == 0) {
             node.extents = &.{};
         } else {
-            node.extents = try allocator_state.allocate(allocator, node.data_block_count);
+            node.extents = try block_allocator.allocate(allocator, node.data_block_count);
         }
         if (!node.uses_fast_symlink) {
-            try allocateExtentTreeBlocks(allocator, &allocator_state, node, default_block_size);
+            try allocateExtentTreeBlocks(allocator, block_allocator, node, default_block_size);
         }
         if (node.xattr_block_bytes != null) {
-            node.xattr_block = try allocator_state.allocateSingle();
+            node.xattr_block = try block_allocator.allocateSingle();
         }
     }
 }
@@ -5053,6 +5252,66 @@ fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions)
             try file.writePositionalAll(io, scratch_block, options.offset + block_number * options.block_size);
         }
     }
+}
+
+/// Writes the journal's own blocks: a JBD2 superblock in logical block 0 and
+/// zeros everywhere else. Zeroing the rest is not decoration -- the range may
+/// hold whatever the output file already contained, and a stale block that
+/// happens to carry a JBD2 descriptor magic is exactly the kind of thing a
+/// recovery pass is built to believe.
+fn writeJournalData(io: Io, file: Io.File, journal: []const Node, options: PopulateOptions) PopulateError!void {
+    if (journal.len == 0) return;
+    const node = journal[0];
+    const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const block_len: usize = @intCast(options.block_size);
+
+    var block: [default_block_size]u8 = undefined;
+    encodeJournalSuperblock(&block, node.data_block_count, uuid);
+    var written_blocks: u32 = 0;
+    for (node.extents) |extent| {
+        var index: u16 = 0;
+        while (index < extent.block_count) : (index += 1) {
+            const physical = extent.start_block + index;
+            try file.writePositionalAll(io, block[0..block_len], options.offset + physical * options.block_size);
+            written_blocks += 1;
+            // Every block after the superblock is an unwritten log block.
+            if (written_blocks == 1) @memset(&block, 0);
+        }
+    }
+
+    for (node.extent_tree_blocks) |tree_block| {
+        var extent_block = tree_block.bytes;
+        setExtentBlockChecksum(extent_block[0..block_len], uuid, node.inode, 0);
+        try file.writePositionalAll(io, extent_block[0..block_len], options.offset + tree_block.block_number * options.block_size);
+    }
+}
+
+/// Encodes the JBD2 superblock exactly as `mke2fs` does for an internal
+/// journal: a V2 header, an empty log (`s_start == 0`, so nothing is ever
+/// replayed from it), and no journal feature bits at all. The absence of
+/// bits is deliberate rather than an omission -- e2fsprogs leaves
+/// `CSUM_V3` unset even on a `metadata_csum` filesystem, and the kernel sets
+/// it, together with the superblock checksum it then implies, on first mount.
+/// Writing a checksum here that the kernel would recompute differently is
+/// worse than writing none, because a journal superblock the kernel trusts
+/// and cannot verify is how a bad log gets replayed over good data.
+///
+/// Every field is big-endian, unlike the rest of ext4.
+fn encodeJournalSuperblock(block: *[default_block_size]u8, block_count: u32, uuid: [16]u8) void {
+    @memset(block, 0);
+    writeBigInt(u32, block[0x00..0x04], jbd2_magic);
+    writeBigInt(u32, block[0x04..0x08], jbd2_superblock_v2);
+    // s_header.h_sequence stays 0; only log blocks carry a sequence.
+    writeBigInt(u32, block[0x0C..0x10], default_block_size);
+    writeBigInt(u32, block[0x10..0x14], block_count);
+    // s_first: log data starts in the block after the superblock.
+    writeBigInt(u32, block[0x14..0x18], 1);
+    // s_sequence: the first commit ID the log expects. s_start stays 0, which
+    // is what marks the log empty.
+    writeBigInt(u32, block[0x18..0x1C], 1);
+    @memcpy(block[0x30..0x40], &uuid);
+    // s_nr_users: one filesystem shares this log, namely its own.
+    writeBigInt(u32, block[0x40..0x44], 1);
 }
 
 fn zeroUnusedInodeTableBlocks(io: Io, file: Io.File, layout: Layout, offset: u64) PopulateError!void {
@@ -5222,7 +5481,7 @@ fn writeSuperblocks(io: Io, file: Io.File, layout: Layout, plan: WriterPlan, opt
     writeInt(u32, sb[0x54..0x58], first_non_reserved_inode);
     writeInt(u16, sb[0x58..0x5A], inode_size);
     writeInt(u16, sb[0x5A..0x5C], 0);
-    writeInt(u32, sb[0x5C..0x60], writer_feature_compat);
+    writeInt(u32, sb[0x5C..0x60], plan.feature_compat);
     writeInt(u32, sb[0x60..0x64], writer_feature_incompat);
     writeInt(u32, sb[0x64..0x68], plan.feature_ro_compat);
     sb[0x68..0x78].* = uuid;
@@ -5235,6 +5494,19 @@ fn writeSuperblocks(io: Io, file: Io.File, layout: Layout, plan: WriterPlan, opt
     writeInt(u16, sb[0xFE..0x100], group_desc_size);
     writeInt(u32, sb[0x108..0x10C], options.timestamp);
     writeInt(u8, sb[0x175..0x176], super_checksum_type_crc32c);
+    if (plan.journal.len != 0) {
+        const journal = plan.journal[0];
+        writeInt(u32, sb[0xE0..0xE4], journal_inode);
+        // `s_journal_uuid` stays zero: that field names an *external* journal
+        // device, and a non-zero value there would send the kernel looking
+        // for a separate volume that does not exist.
+        writeInt(u8, sb[0xFD..0xFE], jnl_backup_type_blocks);
+        // `s_jnl_blocks` is the journal inode's 60-byte `i_block` array
+        // followed by the high and low halves of its size, in that order.
+        @memcpy(sb[0x10C..0x148], &journal.extent_root);
+        writeInt(u32, sb[0x148..0x14C], @as(u32, @truncate(journal.size_on_disk >> 32)));
+        writeInt(u32, sb[0x14C..0x150], @as(u32, @truncate(journal.size_on_disk)));
+    }
     setSuperblockChecksum(&sb);
 
     try file.writePositionalAll(io, &sb, options.offset + superblock_offset);
@@ -5992,6 +6264,12 @@ fn readInt(comptime T: type, buf: []const u8) T {
 
 fn writeInt(comptime T: type, buf: []u8, value: T) void {
     std.mem.writeInt(T, buf[0..@sizeOf(T)], value, .little);
+}
+
+/// JBD2 stores every field big-endian, so its encoder needs a writer of its
+/// own rather than silently reusing the little-endian one beside it.
+fn writeBigInt(comptime T: type, buf: []u8, value: T) void {
+    std.mem.writeInt(T, buf[0..@sizeOf(T)], value, .big);
 }
 
 fn divCeil(a: anytype, b: anytype) @TypeOf(a, b) {
@@ -7891,6 +8169,500 @@ test "Editor edits (deletes, recursive tree removal, and overwrite) pass a real 
     const remaining = try reader.listDir(io, std.testing.allocator, "many");
     defer freeDirEntries(std.testing.allocator, remaining);
     try std.testing.expectEqual(@as(usize, 150), remaining.len);
+}
+
+// ---------------------------------------------------------------------------
+// Journal tests
+//
+// A malformed JBD2 superblock is strictly worse than none at all: the kernel
+// trusts what it finds there and replays accordingly. So the on-disk shape is
+// checked two ways -- `e2fsck -f -n` has to call the result a clean journalled
+// filesystem, and the journal superblock itself is compared byte for byte
+// against the one `mke2fs` writes for the same geometry.
+// ---------------------------------------------------------------------------
+
+const journal_test_uuid: [16]u8 = [_]u8{0x11} ** 16;
+const journal_test_uuid_text = "11111111-1111-1111-1111-111111111111";
+
+fn journalTestTree() InMemoryTree {
+    return InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "etc/hostname", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 10, .bytes = "zvmi-test\n" },
+        .{ .path = "usr", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "usr/payload.bin", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 3 * 1024 * 1024, .generator = .pattern },
+        .{ .path = "link", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = 12, .bytes = "etc/hostname" },
+    });
+}
+
+/// Runs an e2fsprogs tool that prints what the test wants to assert on, and
+/// returns its stdout. Null means the tool is not installed anywhere this
+/// looks, which the callers decline over rather than pass vacuously.
+fn runToolCapture(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    args: []const []const u8,
+) !?[]u8 {
+    const maybe_result = try runExternalTool(allocator, name, args);
+    const result = maybe_result orelse return null;
+    defer allocator.free(result.stderr);
+    errdefer allocator.free(result.stdout);
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            std.debug.print("{s} failed (exit {d}):\n{s}\n{s}\n", .{ name, code, result.stdout, result.stderr });
+            return error.ExternalToolFailed;
+        },
+        else => return error.ExternalToolFailed,
+    }
+    return result.stdout;
+}
+
+/// Extracts a file from an image by inode number. The journal has no name, so
+/// this is the only way to read the bytes the kernel would recover from.
+fn dumpInodeAlloc(
+    allocator: std.mem.Allocator,
+    io: Io,
+    image_path: []const u8,
+    inode_number: u32,
+    scratch_path: []const u8,
+    max_bytes: usize,
+) !?[]u8 {
+    var command: [64]u8 = undefined;
+    const request = try std.fmt.bufPrint(&command, "dump <{d}> {s}", .{ inode_number, scratch_path });
+    const output = (try runToolCapture(allocator, "debugfs", &.{ "-R", request, image_path })) orelse
+        return null;
+    allocator.free(output);
+    defer Io.Dir.cwd().deleteFile(io, scratch_path) catch {};
+
+    const file = try Io.Dir.cwd().openFile(io, scratch_path, .{});
+    defer file.close(io);
+    const bytes = try allocator.alloc(u8, max_bytes);
+    errdefer allocator.free(bytes);
+    const read = try file.readPositionalAll(io, bytes, 0);
+    if (read != max_bytes) return error.UnexpectedEndOfStream;
+    return bytes;
+}
+
+test "the default journal size follows mke2fs's own ladder" {
+    // e2fsprogs 1.47 `ext2fs_default_journal_size`, tier by tier, at the
+    // boundary blocks where it changes answer.
+    try std.testing.expectEqual(@as(?u32, null), defaultJournalBlocks(2047));
+    try std.testing.expectEqual(@as(?u32, 1024), defaultJournalBlocks(2048));
+    try std.testing.expectEqual(@as(?u32, 1024), defaultJournalBlocks(32 * 1024 - 1));
+    try std.testing.expectEqual(@as(?u32, 4096), defaultJournalBlocks(32 * 1024));
+    try std.testing.expectEqual(@as(?u32, 4096), defaultJournalBlocks(256 * 1024 - 1));
+    try std.testing.expectEqual(@as(?u32, 8192), defaultJournalBlocks(256 * 1024));
+    try std.testing.expectEqual(@as(?u32, 8192), defaultJournalBlocks(512 * 1024 - 1));
+    try std.testing.expectEqual(@as(?u32, 16384), defaultJournalBlocks(512 * 1024));
+    try std.testing.expectEqual(@as(?u32, 16384), defaultJournalBlocks(4096 * 1024 - 1));
+    try std.testing.expectEqual(@as(?u32, 32768), defaultJournalBlocks(4096 * 1024));
+    try std.testing.expectEqual(@as(?u32, 65536), defaultJournalBlocks(8192 * 1024));
+    try std.testing.expectEqual(@as(?u32, 131072), defaultJournalBlocks(16384 * 1024));
+    try std.testing.expectEqual(@as(?u32, 262144), defaultJournalBlocks(32768 * 1024));
+
+    // Spelled in bytes, with 4 KiB blocks: 4 MiB below 128 MiB, 16 MiB below
+    // 1 GiB, 32 MiB below 2 GiB, 64 MiB below 16 GiB.
+    try std.testing.expectEqual(@as(?u32, 1024), defaultJournalBlocks(64 * 1024 * 1024 / default_block_size));
+    try std.testing.expectEqual(@as(?u32, 4096), defaultJournalBlocks(512 * 1024 * 1024 / default_block_size));
+    try std.testing.expectEqual(@as(?u32, 8192), defaultJournalBlocks(1024 * 1024 * 1024 / default_block_size));
+    try std.testing.expectEqual(@as(?u32, 16384), defaultJournalBlocks(4096 * 1024 * 1024 / @as(u64, default_block_size)));
+}
+
+test "the writer stays journal-less unless asked, and a journal moves no file" {
+    const io = std.testing.io;
+    const plain_path = "test-ext4-journal-absent.img";
+    const journalled_path = "test-ext4-journal-present.img";
+    defer Io.Dir.cwd().deleteFile(io, plain_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, journalled_path) catch {};
+
+    const fs_size: u64 = 64 * 1024 * 1024;
+    var plain_tree = journalTestTree();
+    plain_tree.bind();
+    var journalled_tree = journalTestTree();
+    journalled_tree.bind();
+
+    const plain_file = try Io.Dir.cwd().createFile(io, plain_path, .{ .read = true, .truncate = true });
+    defer plain_file.close(io);
+    const plain = try populate(io, plain_file, std.testing.allocator, &plain_tree.view, .{
+        .length = fs_size,
+        .uuid = journal_test_uuid,
+    });
+    try std.testing.expectEqual(writer_feature_compat, plain.feature_compat);
+    try std.testing.expectEqual(@as(u32, 0), plain.journal_block_count);
+
+    const journalled_file = try Io.Dir.cwd().createFile(io, journalled_path, .{ .read = true, .truncate = true });
+    defer journalled_file.close(io);
+    const journalled = try populate(io, journalled_file, std.testing.allocator, &journalled_tree.view, .{
+        .length = fs_size,
+        .uuid = journal_test_uuid,
+        .journal = .{ .enabled = true },
+    });
+    try std.testing.expectEqual(
+        writer_feature_compat | feature_compat_has_journal,
+        journalled.feature_compat,
+    );
+    // 64 MiB is 16384 blocks, the ladder's first tier.
+    try std.testing.expectEqual(@as(u32, 1024), journalled.journal_block_count);
+    try std.testing.expectEqual(
+        plain.free_block_count - journalled.journal_block_count,
+        journalled.free_block_count,
+    );
+    // Reserved inode 8 was already counted as used, journal or not.
+    try std.testing.expectEqual(plain.free_inode_count, journalled.free_inode_count);
+
+    // Turning the journal on must not relocate anything the tree owns, which
+    // is what makes a journalled and a journal-less build of the same tree
+    // directly comparable.
+    var plain_reader = try open(io, plain_file, std.testing.allocator, .{});
+    defer plain_reader.deinit();
+    var journalled_reader = try open(io, journalled_file, std.testing.allocator, .{});
+    defer journalled_reader.deinit();
+    for ([_][]const u8{ "etc/hostname", "usr/payload.bin", "etc" }) |path| {
+        const plain_extents = try plain_reader.readExtents(io, std.testing.allocator, path);
+        defer std.testing.allocator.free(plain_extents);
+        const journalled_extents = try journalled_reader.readExtents(io, std.testing.allocator, path);
+        defer std.testing.allocator.free(journalled_extents);
+        try std.testing.expectEqualSlices(Extent, plain_extents, journalled_extents);
+    }
+}
+
+test "a journalled filesystem passes e2fsck and reports the journal e2fsprogs expects" {
+    const io = std.testing.io;
+    const path = "test-ext4-journal-e2fsck.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = journalTestTree();
+    tree.bind();
+    const fs_size: u64 = 512 * 1024 * 1024;
+    {
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+        defer file.close(io);
+        const info = try populate(io, file, std.testing.allocator, &tree.view, .{
+            .length = fs_size,
+            .label = "zvmi-ext4",
+            .uuid = journal_test_uuid,
+            .timestamp = 1_717_171_717,
+            .journal = .{ .enabled = true },
+        });
+        // 512 MiB is 131072 blocks: the ladder's 16 MiB tier.
+        try std.testing.expectEqual(@as(u32, 4096), info.journal_block_count);
+    }
+
+    try expectE2fsckClean(path);
+
+    const report = (try runToolCapture(std.testing.allocator, "dumpe2fs", &.{ "-h", path })) orelse
+        return error.SkipZigTest;
+    defer std.testing.allocator.free(report);
+    for ([_][]const u8{
+        "has_journal",
+        "Journal inode:            8",
+        "Journal backup:           inode blocks",
+        "Total journal size:       16M",
+        "Journal sequence:         0x00000001",
+        "Journal start:            0",
+    }) |needle| {
+        if (std.mem.indexOf(u8, report, needle) == null) {
+            std.debug.print("dumpe2fs output missing {s}:\n{s}\n", .{ needle, report });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "the JBD2 superblock is byte-identical to the one mke2fs writes" {
+    const io = std.testing.io;
+    const ours_path = "test-ext4-journal-ours.img";
+    const theirs_path = "test-ext4-journal-mke2fs.img";
+    defer Io.Dir.cwd().deleteFile(io, ours_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, theirs_path) catch {};
+
+    // 64 MiB, so both writers land on the ladder's 1024-block tier without
+    // either being told a size.
+    const fs_size: u64 = 64 * 1024 * 1024;
+    var tree = journalTestTree();
+    tree.bind();
+    {
+        const file = try Io.Dir.cwd().createFile(io, ours_path, .{ .read = true, .truncate = true });
+        defer file.close(io);
+        _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+            .length = fs_size,
+            .uuid = journal_test_uuid,
+            .journal = .{ .enabled = true },
+        });
+    }
+
+    var block_text: [32]u8 = undefined;
+    runExternalToolChecked(std.testing.allocator, "mke2fs", &.{
+        "-q",
+        "-F",
+        "-t",
+        "ext4",
+        "-b",
+        "4096",
+        "-U",
+        journal_test_uuid_text,
+        theirs_path,
+        try std.fmt.bufPrint(&block_text, "{d}", .{fs_size / default_block_size}),
+    }) catch |err| switch (err) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const ours = (try dumpInodeAlloc(
+        std.testing.allocator,
+        io,
+        ours_path,
+        journal_inode,
+        "test-ext4-journal-ours.jbd2",
+        1024,
+    )) orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(ours);
+    const theirs = (try dumpInodeAlloc(
+        std.testing.allocator,
+        io,
+        theirs_path,
+        journal_inode,
+        "test-ext4-journal-mke2fs.jbd2",
+        1024,
+    )) orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(theirs);
+
+    try std.testing.expectEqualSlices(u8, theirs, ours);
+
+    // Spelled out as well, so a future divergence says which field moved
+    // rather than only that a thousand bytes differ.
+    try std.testing.expectEqual(jbd2_magic, std.mem.readInt(u32, ours[0x00..0x04], .big));
+    try std.testing.expectEqual(jbd2_superblock_v2, std.mem.readInt(u32, ours[0x04..0x08], .big));
+    try std.testing.expectEqual(default_block_size, std.mem.readInt(u32, ours[0x0C..0x10], .big));
+    try std.testing.expectEqual(@as(u32, 1024), std.mem.readInt(u32, ours[0x10..0x14], .big));
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, ours[0x14..0x18], .big));
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, ours[0x18..0x1C], .big));
+    // s_start == 0 is what says "empty log", so nothing is ever replayed from
+    // a freshly written image.
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, ours[0x1C..0x20], .big));
+    try std.testing.expectEqualSlices(u8, &journal_test_uuid, ours[0x30..0x40]);
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, ours[0x40..0x44], .big));
+}
+
+test "the journal inode carries the layout e2fsprogs and the kernel read" {
+    const io = std.testing.io;
+    const path = "test-ext4-journal-inode.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = journalTestTree();
+    tree.bind();
+    const fs_size: u64 = 64 * 1024 * 1024;
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    const info = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = fs_size,
+        .uuid = journal_test_uuid,
+        .journal = .{ .enabled = true },
+    });
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    const journal = try reader.readInode(io, journal_inode);
+    try std.testing.expectEqual(Kind.file, journal.kind);
+    try std.testing.expectEqual(@as(u16, journal_inode_mode), journal.mode);
+    try std.testing.expectEqual(@as(u64, info.journal_block_count) * default_block_size, journal.size);
+    try std.testing.expectEqual(@as(u16, 1), journal.link_count);
+
+    var sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &sb, superblock_offset);
+    try std.testing.expectEqual(journal_inode, readInt(u32, sb[0xE0..0xE4]));
+    // An external-journal device would be named here, and there is none.
+    try std.testing.expectEqual(@as(u32, 0), readInt(u32, sb[0xE4..0xE8]));
+    try std.testing.expect(allZero(sb[0xD0..0xE0]));
+    try std.testing.expectEqual(jnl_backup_type_blocks, readInt(u8, sb[0xFD..0xFE]));
+    // `s_jnl_blocks` backs up the inode's i_block array plus its size.
+    const extents = try reader.readInodeExtentsAlloc(io, std.testing.allocator, journal);
+    defer std.testing.allocator.free(extents);
+    try std.testing.expectEqual(@as(usize, 1), extents.len);
+    try std.testing.expectEqualSlices(u8, sb[0x10C..0x148], journal.block_bytes[0..60]);
+    try std.testing.expectEqual(@as(u32, 0), readInt(u32, sb[0x148..0x14C]));
+    try std.testing.expectEqual(
+        @as(u32, info.journal_block_count * default_block_size),
+        readInt(u32, sb[0x14C..0x150]),
+    );
+}
+
+test "the writer names every journal size it refuses" {
+    const io = std.testing.io;
+    const path = "test-ext4-journal-refusals.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{});
+    tree.bind();
+
+    const Case = struct {
+        length: u64,
+        journal: JournalOptions,
+        expected: anyerror,
+    };
+    for ([_]Case{
+        // Below 2048 blocks there is nowhere to put the JBD2 minimum.
+        .{
+            .length = 4 * 1024 * 1024,
+            .journal = .{ .enabled = true },
+            .expected = error.FilesystemTooSmallForJournal,
+        },
+        .{
+            .length = 64 * 1024 * 1024,
+            .journal = .{ .enabled = true, .size_bytes = 1023 * default_block_size },
+            .expected = error.JournalSizeTooSmall,
+        },
+        // Above half the filesystem the log stops being overhead.
+        .{
+            .length = 64 * 1024 * 1024,
+            .journal = .{ .enabled = true, .size_bytes = 48 * 1024 * 1024 },
+            .expected = error.JournalSizeTooLarge,
+        },
+        .{
+            .length = 64 * 1024 * 1024,
+            .journal = .{ .enabled = true, .size_bytes = 4 * 1024 * 1024 + 1 },
+            .expected = error.UnalignedJournalSize,
+        },
+        .{
+            .length = 64 * 1024 * 1024,
+            .journal = .{ .enabled = true, .size_bytes = 0 },
+            .expected = error.UnalignedJournalSize,
+        },
+    }) |case| {
+        try std.testing.expectError(case.expected, populate(
+            io,
+            file,
+            std.testing.allocator,
+            &tree.view,
+            .{ .length = case.length, .journal = case.journal },
+        ));
+    }
+}
+
+test "an explicit journal size is honoured and still passes e2fsck" {
+    const io = std.testing.io;
+    const path = "test-ext4-journal-explicit.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = journalTestTree();
+    tree.bind();
+    {
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+        defer file.close(io);
+        const info = try populate(io, file, std.testing.allocator, &tree.view, .{
+            .length = 512 * 1024 * 1024,
+            .uuid = journal_test_uuid,
+            .journal = .{ .enabled = true, .size_bytes = 8 * 1024 * 1024 },
+        });
+        // The ladder would have chosen 4096 blocks here; the explicit size wins.
+        try std.testing.expectEqual(@as(u32, 2048), info.journal_block_count);
+    }
+    try expectE2fsckClean(path);
+}
+
+test "resize grows a journalled filesystem and leaves its journal intact" {
+    const io = std.testing.io;
+    const path = "test-ext4-journal-resize.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = journalTestTree();
+    tree.bind();
+    const original_size: u64 = 64 * 1024 * 1024;
+    const grown_size: u64 = 256 * 1024 * 1024;
+    {
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+        defer file.close(io);
+        _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+            .length = original_size,
+            .uuid = journal_test_uuid,
+            .journal = .{ .enabled = true },
+        });
+
+        const grown = try resize(io, file, std.testing.allocator, .{ .length = grown_size });
+        try std.testing.expectEqual(@as(u32, grown_size / default_block_size), grown.block_count);
+        try std.testing.expectEqual(
+            writer_feature_compat | feature_compat_has_journal,
+            grown.feature_compat,
+        );
+        // The journal neither grows nor moves; it is already inside the range
+        // the grow leaves alone.
+        try std.testing.expectEqual(@as(u32, 1024), grown.journal_block_count);
+    }
+    try expectE2fsckClean(path);
+
+    const reopened = try Io.Dir.cwd().openFile(io, path, .{});
+    defer reopened.close(io);
+    var reader = try open(io, reopened, std.testing.allocator, .{});
+    defer reader.deinit();
+    const journal = try reader.readInode(io, journal_inode);
+    try std.testing.expectEqual(@as(u64, 1024) * default_block_size, journal.size);
+    const hostname = try reader.readFileAlloc(io, std.testing.allocator, "etc/hostname");
+    defer std.testing.allocator.free(hostname);
+    try std.testing.expectEqualSlices(u8, "zvmi-test\n", hostname);
+}
+
+test "resize refuses a resize_inode filesystem by name rather than by layout" {
+    const io = std.testing.io;
+    const path = "test-ext4-journal-resize-inode.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = journalTestTree();
+    tree.bind();
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = 64 * 1024 * 1024,
+        .uuid = journal_test_uuid,
+    });
+
+    // Set the bit the writer never sets, so the refusal names the feature
+    // rather than blaming an unrelated layout mismatch.
+    var sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &sb, superblock_offset);
+    writeInt(u32, sb[0x5C..0x60], readInt(u32, sb[0x5C..0x60]) | feature_compat_resize_inode);
+    setSuperblockChecksum(&sb);
+    try file.writePositionalAll(io, &sb, superblock_offset);
+
+    try std.testing.expectError(
+        error.ResizeInodeNotSupported,
+        resize(io, file, std.testing.allocator, .{ .length = 128 * 1024 * 1024 }),
+    );
+}
+
+test "a journalled image is a distinct profile the strict scan refuses" {
+    const io = std.testing.io;
+    const path = "test-ext4-journal-profile.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = journalTestTree();
+    tree.bind();
+    const fs_size: u64 = 64 * 1024 * 1024;
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = fs_size,
+        .uuid = journal_test_uuid,
+        .journal = .{ .enabled = true },
+    });
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+
+    // The strict profile is the exact feature set the byte-for-byte
+    // reproducibility promise was made about, and HAS_JOURNAL is not in it.
+    try std.testing.expectError(error.UnsupportedWriterProfile, scanWriterCompatible(
+        &reader,
+        io,
+        std.testing.allocator,
+        .{ .expected_length = fs_size },
+    ));
+
+    // The general importer reads it, and says so.
+    var general = try scanReadable(&reader, io, std.testing.allocator, .{ .available_length = fs_size });
+    defer general.deinit();
+    try std.testing.expectEqual(SourceProfile.ext4_general_v1, general.identity.profile);
+    try std.testing.expect(general.identity.has_journal);
+    try std.testing.expect(findGeneralEntry(&general, "etc/hostname") != null);
 }
 
 const InMemoryEntry = struct {
