@@ -279,6 +279,145 @@ import produces an image that looks fine and is subtly wrong:
 Unix domain sockets are refused with `UnsupportedSocketInode`: a socket inode
 in an image is meaningless, since the bound socket died with the process.
 
+#### Merging several source filesystems into one root
+
+An installed system is not one filesystem. It is normally an ESP, a separate
+`/boot`, and a root filesystem:
+
+```
+source                               target
+------                               ------
+p1  ESP        (vfat)   /boot/efi    p1  ESP  (vfat)
+p2  boot       (ext4)   /boot        p2  root (ext4)
+p3  root       (ext4)   /                 └── /boot/       (directory)
+                                          └── /boot/efi/   (mount point)
+```
+
+`source_mounts` re-images that into the simpler layout on the right: `/boot`
+and `/boot/efi` become ordinary directories inside the one root filesystem.
+That removes a partition and a mount, and it makes the resulting disk
+unambiguous for tooling that scans partitions to identify the root. The ESP
+partition itself is left on the output disk untouched -- firmware still needs
+it -- so only the extra Linux filesystem disappears.
+
+Each mount names a partition and where it lands:
+
+```zig
+.storage = .{ .preserve = .{
+    .root_partition = .{ .mbr_index = 3 },
+    .source_profile = .general,
+    .source_mounts = &.{
+        .{ .partition = .{ .mbr_index = 2 }, .target = "/boot" },
+        .{ .partition = .{ .mbr_index = 1 }, .target = "/boot/efi" },
+    },
+} },
+```
+
+The same list is spelled `source_mounts` on the `std.Build` helper and in the
+preserved-image configuration JSON, where each entry is
+
+```json
+{
+  "source_path": "",
+  "partition": { "mbr_index": 1 },
+  "target": "/boot/efi",
+  "filesystem": "detect",
+  "fat_metadata": { "directory_mode": 493, "file_mode": 420, "uid": 0, "gid": 0 }
+}
+```
+
+`source_path` is empty for the disk being rebuilt, which is the common case of
+several partitions of one disk; naming a path merges a filesystem from another
+image or block device. `filesystem` defaults to `detect`, which probes the
+ext4 superblock magic and the FAT32 boot sector: a partition that looks like
+both is `AmbiguousSourceFilesystem` and one that looks like neither is
+`UnrecognizedSourceFilesystem`, because guessing about a filesystem that is
+about to be read into a bootable image is not a service.
+
+Sources are merged into one tree **before the writer runs**, so hardlinks,
+extended attributes, permissions, device nodes and per-inode timestamps
+survive the merge itself and not merely the import.
+
+##### A mount replaces, it does not merge
+
+A later source mounted at a prefix replaces whatever the sources before it had
+at that path. It does not merge entry by entry.
+
+This mirrors a real mount, and it is the only safe rule. An installed root
+filesystem's `/boot` is a non-empty stub -- an old kernel, an old `grub.cfg` --
+that the boot filesystem hides the instant it is mounted. Merging the two would
+produce an image with a stale kernel sitting beside the real one. It looks
+fine, it passes `e2fsck`, and it can boot the wrong thing.
+`RebuildReport.shadowed_node_count`, also recorded in provenance, says how many
+nodes were hidden, so the result can be stated rather than diffed for.
+
+##### Ambiguity is refused, never resolved
+
+The target list is validated in full before any source is opened, so a bad
+mount costs a rejection rather than a scan of a filesystem it would discard.
+
+| Rejected | Error |
+| --- | --- |
+| a relative target (`boot`) | `MountTargetNotAbsolute` |
+| the root itself (`/`) | `MountTargetIsRoot` |
+| a target that is not already normalized (`/boot/`, `/a/./b`, `/a//b`, `/a/../b`) | `MountTargetNotNormalized` |
+| the same target twice | `DuplicateMountTarget` |
+| a mount an entirely later mount would shadow away | `MountTargetShadowedByLaterMount` |
+| a target that does not exist | `MissingMountTarget` |
+| a target whose parent directory does not exist | `MissingMountTargetParent` |
+| a target that exists but is not a directory | `MountTargetNotDirectory` |
+| a target that is itself a symlink | `MountTargetIsSymlink` |
+| a target reached through a symlink | `MountTargetTraversesSymlink` |
+| a target reached through a non-directory | `MountTargetTraversesNonDirectory` |
+| a mount that would strand a hardlink outside it | `MountShadowsHardlinkTarget` |
+| a merged partition on a `native_edit`/`vm`/`unsafe_chroot` backend | `UnexpectedSourceMounts` |
+
+A target is never normalized on the caller's behalf, because two spellings of
+one path would then slip past the overlap check. A missing mount point is never
+created, because that turns a typo into a plausible-looking image -- `mount(8)`
+refuses for the same reason.
+
+Overlap reduces to two cases, since these are paths in a tree: two mounts are
+either the same target or one is nested inside the other. Nesting is legal only
+outermost-first, which is the order a real system mounts in.
+
+##### Synthesized metadata for a FAT source
+
+vfat stores no owner, no permission bits, no symlinks and no extended
+attributes, so a POSIX tree built from an ESP needs those invented. That is a
+policy, and it is written down rather than assumed:
+
+| Field | Default |
+| --- | --- |
+| `directory_mode` | `0o755` |
+| `file_mode` | `0o644` |
+| `uid` | `0` |
+| `gid` | `0` |
+
+Every entry from a FAT source gets exactly these, including the mount point
+directory itself, which takes the mounted volume's root metadata just as a real
+mount does. They are per-mount (`fat_metadata`), so an ESP that should be
+`0700`/`0600` says so. A mode carrying anything beyond the permission, setuid
+and sticky bits is `InvalidSynthesizedMode`: it would change the file type, not
+the permissions.
+
+##### Limits across a merged import
+
+Limits describe the import, not any one source of it. `--max-nodes` and
+`--max-total-bytes` are charged against a running total across every source, so
+three filesystems that each fit and together do not are refused -- which is
+exactly the case the limits exist for. The reported breach always names the
+limit as configured, never an internal per-source remainder, so the remediation
+it prints is a value the flag can actually be set to. The reported peaks are
+likewise combined, so sizing the next run's flags from a dry run works for a
+merged import too.
+
+##### Reproducibility
+
+`source_reproducible` is false whenever anything was merged in, even from a
+`zvmi_ext4_v1` source. The output is then a function of several sources rather
+than of the one the report names, and the report says so.
+
 | Image kernel provides | Result |
 | --- | --- |
 | `ext4` + `virtio_blk` built in | disks attached over virtio-blk (`/dev/vd*`) |

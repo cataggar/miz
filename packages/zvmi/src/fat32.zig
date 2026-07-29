@@ -6,6 +6,8 @@
 const std = @import("std");
 const Io = std.Io;
 const Image = @import("image.zig").Image;
+const ext4 = @import("ext4.zig");
+const limits_mod = @import("limits.zig");
 
 /// Byte range inside the backing `Image` that contains the FAT32 volume.
 pub const Region = struct {
@@ -1613,6 +1615,521 @@ fn collectClusterChain(fs: *FileSystem, io: Io, allocator: std.mem.Allocator, fi
     return clusters.toOwnedSlice();
 }
 
+// ---------------------------------------------------------------------------
+// Read-only tree import
+//
+// An ESP is vfat, so merging a real installed system into one root filesystem
+// means reading a FAT volume out as a tree and handing it to the same
+// `FileTreeView` interface `bootconfig` already populates an ESP through. The
+// direction is the only new part: everything below reads, and nothing here
+// ever writes.
+//
+// vfat records none of the metadata a POSIX tree needs -- no ownership, no
+// permission bits, no symlinks, no hardlinks, no device nodes, no extended
+// attributes, and no timestamps this project would trust. Every one of those
+// therefore has to be *invented* at the boundary. That is exactly why
+// `SynthesizedMetadata` is a value the caller passes rather than a constant
+// buried in the scanner: an image whose `/boot/efi` is `root:root 0755` should
+// say so somewhere an operator can read, not have it silently assumed.
+// ---------------------------------------------------------------------------
+
+const limit_defaults = limits_mod.ImportLimits{};
+
+/// The POSIX metadata synthesized for every entry read out of a FAT volume,
+/// because the volume itself carries none of it.
+///
+/// The defaults describe an ESP as every Linux distribution mounts one: owned
+/// by root, readable by everyone, writable by nobody else.
+pub const SynthesizedMetadata = struct {
+    /// `0755`. A directory has to stay traversable, or the bootloader files
+    /// under it become unreachable to anything not running as root.
+    directory_mode: u16 = 0o755,
+    /// `0644`. The execute bit means nothing on a real vfat mount -- it comes
+    /// from the mount options, not the file -- so granting it here would be
+    /// inventing a permission the source never had.
+    file_mode: u16 = 0o644,
+    uid: u32 = 0,
+    gid: u32 = 0,
+};
+
+pub const ScanOptions = struct {
+    /// What to invent for metadata vfat cannot store. Never defaulted
+    /// silently at a call site: the caller either accepts these documented
+    /// values or states its own.
+    metadata: SynthesizedMetadata = .{},
+    max_nodes: usize = limit_defaults.max_nodes,
+    max_path_bytes: usize = limit_defaults.max_path_bytes,
+    max_component_bytes: usize = limit_defaults.max_component_bytes,
+    max_file_bytes: u64 = limit_defaults.max_file_bytes,
+    max_total_bytes: u64 = limit_defaults.max_total_bytes,
+    max_scan_metadata_bytes: usize = limit_defaults.max_scan_metadata_bytes,
+    /// Optional sink for the peak measurements and the first limit breach.
+    /// The scanner is torn down before `scanTree` returns, so a failure can
+    /// only report through a sink the caller still owns.
+    diagnostic: ?*limits_mod.Diagnostic = null,
+};
+
+pub const ScanError = Error || Image.PreadError || Image.PwriteError ||
+    std.mem.Allocator.Error || limits_mod.Error || error{
+    /// A mode carrying more than the permission/setuid/sticky bits would
+    /// turn a synthesized entry into a different file type entirely.
+    InvalidSynthesizedMode,
+    /// A directory reachable from itself. FAT stores no parent pointer worth
+    /// trusting, so a corrupt `..` or a hand-edited chain can describe an
+    /// infinitely deep tree; refusing beats walking it forever.
+    DirectoryCycle,
+    /// A name FAT permits but a POSIX tree cannot carry, such as one holding
+    /// a `/` or a NUL.
+    InvalidImportedName,
+};
+
+pub const TreeKind = enum { directory, file };
+
+pub const TreeEntry = struct {
+    /// Relative path with `/` separators and no leading `/`.
+    path: []const u8,
+    kind: TreeKind,
+    /// Synthesized; see `SynthesizedMetadata`.
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    content: ?ext4.FileTreeView.ContentReader,
+};
+
+/// A contiguous span of clusters inside one file.
+///
+/// The chain is resolved once, at scan time, and stored as runs rather than
+/// walked again per read. Walking it per read would make a sequential copy of
+/// an n-cluster file quadratic in n, and storing one entry per cluster would
+/// cost 4 bytes per 4 KiB of ESP. A file written once by a bootloader
+/// installer is almost always a single run, so runs are both the cheapest and
+/// the fastest representation for the case that actually occurs.
+const ClusterRun = struct {
+    start_cluster: u32,
+    cluster_count: u32,
+};
+
+/// Enough state to read one file's bytes without touching the directory tree
+/// again. `fs` is borrowed, so the filesystem must outlive the tree.
+const FatContent = struct {
+    fs: *FileSystem,
+    io: Io,
+    size: u64,
+    cluster_bytes: u32,
+    runs: []const ClusterRun,
+};
+
+const TreeNode = struct {
+    path: []u8,
+    kind: TreeKind,
+    size: u64,
+    runs: []ClusterRun,
+    content: FatContent,
+};
+
+/// A FAT volume read out as an ordered tree: every directory appears before
+/// its children, so an importer that creates parents implicitly never has to.
+/// File bytes stay in the volume until an importer spools them.
+pub const Tree = struct {
+    allocator: std.mem.Allocator,
+    entries: []TreeNode,
+    /// Repeated on every entry, and on the root, because vfat has no per-file
+    /// metadata to differ from it.
+    metadata: SynthesizedMetadata,
+    /// The volume's 11-byte label field, exactly as stored.
+    label: [11]u8,
+    volume_id: u32,
+    /// Guest-visible file bytes. This is the scratch space an import needs.
+    content_bytes: u64,
+    view: ext4.FileTreeView = .{
+        .ctx = undefined,
+        .next_fn = treeViewNext,
+        .reset_fn = treeViewReset,
+    },
+    iteration_index: usize = 0,
+
+    pub fn deinit(self: *Tree) void {
+        for (self.entries) |entry| {
+            self.allocator.free(entry.path);
+            self.allocator.free(entry.runs);
+        }
+        self.allocator.free(self.entries);
+        self.* = undefined;
+    }
+
+    /// Excludes the implicit root directory, matching the ext4 importers.
+    pub fn nodeCount(self: *const Tree) usize {
+        return self.entries.len;
+    }
+
+    pub fn entryAt(self: *Tree, index: usize) TreeEntry {
+        const node = &self.entries[index];
+        return .{
+            .path = node.path,
+            .kind = node.kind,
+            .mode = switch (node.kind) {
+                .directory => self.metadata.directory_mode,
+                .file => self.metadata.file_mode,
+            },
+            .uid = self.metadata.uid,
+            .gid = self.metadata.gid,
+            .size = node.size,
+            .content = if (node.kind == .file) .{
+                .ctx = &node.content,
+                .read_at_fn = treeContentReadAt,
+            } else null,
+        };
+    }
+
+    pub fn fileTreeView(self: *Tree) *ext4.FileTreeView {
+        self.iteration_index = 0;
+        self.view = .{
+            .ctx = self,
+            .next_fn = treeViewNext,
+            .reset_fn = treeViewReset,
+        };
+        return &self.view;
+    }
+
+    fn treeViewReset(ctx: *anyopaque) void {
+        const self: *Tree = @ptrCast(@alignCast(ctx));
+        self.iteration_index = 0;
+    }
+
+    fn treeViewNext(ctx: *anyopaque) ext4.FileTreeView.IteratorError!?ext4.FileTreeView.Entry {
+        const self: *Tree = @ptrCast(@alignCast(ctx));
+        if (self.iteration_index >= self.entries.len) return null;
+        const entry = self.entryAt(self.iteration_index);
+        self.iteration_index += 1;
+        return .{
+            .path = entry.path,
+            .kind = switch (entry.kind) {
+                .directory => .directory,
+                .file => .file,
+            },
+            .mode = entry.mode,
+            .uid = entry.uid,
+            .gid = entry.gid,
+            .size = entry.size,
+            .content = entry.content,
+        };
+    }
+};
+
+fn treeContentReadAt(
+    ctx: *const anyopaque,
+    buffer: []u8,
+    offset: u64,
+) ext4.FileTreeView.ContentError!usize {
+    const content: *const FatContent = @ptrCast(@alignCast(ctx));
+    return readFatContent(content, buffer, offset) catch error.ReadFailed;
+}
+
+fn readFatContent(content: *const FatContent, buffer: []u8, offset: u64) !usize {
+    if (offset >= content.size) return 0;
+    const remaining = content.size - offset;
+    const wanted: usize = @intCast(@min(@as(u64, buffer.len), remaining));
+    if (wanted == 0) return 0;
+
+    const cluster_index = offset / content.cluster_bytes;
+    const inside = offset % content.cluster_bytes;
+    var skipped: u64 = 0;
+    for (content.runs) |run| {
+        const next = skipped + run.cluster_count;
+        if (cluster_index >= next) {
+            skipped = next;
+            continue;
+        }
+        const within_run = cluster_index - skipped;
+        const cluster: u32 = @intCast(run.start_cluster + within_run);
+        // Clusters inside one run are physically adjacent, so a read may
+        // cross cluster boundaries without another chain lookup.
+        const run_tail = (@as(u64, run.cluster_count) - within_run) * content.cluster_bytes - inside;
+        const take: usize = @intCast(@min(@as(u64, wanted), run_tail));
+        const start = content.fs.clusterOffset(cluster) + inside;
+        try content.fs.readRegion(content.io, buffer[0..take], start);
+        return take;
+    }
+    return error.BadClusterChain;
+}
+
+/// Reads `fs` out as a tree. Nothing is written, and the volume is never
+/// opened for writing. `fs` must outlive the returned tree, which keeps
+/// read-only references into it for file content.
+pub fn scanTree(
+    fs: *FileSystem,
+    io: Io,
+    allocator: std.mem.Allocator,
+    options: ScanOptions,
+) ScanError!Tree {
+    if (options.metadata.directory_mode > 0o7777 or options.metadata.file_mode > 0o7777) {
+        return error.InvalidSynthesizedMode;
+    }
+    var scanner = TreeScanner{
+        .fs = fs,
+        .io = io,
+        .allocator = allocator,
+        .options = options,
+        .entries = .init(allocator),
+        .visited = .init(allocator),
+    };
+    defer scanner.deinit();
+    try scanner.walk(fs.info.root_cluster, "");
+    return scanner.finish();
+}
+
+const TreeScanner = struct {
+    fs: *FileSystem,
+    io: Io,
+    allocator: std.mem.Allocator,
+    options: ScanOptions,
+    entries: std.array_list.Managed(TreeNode),
+    /// Directory clusters already entered. FAT has no inode table to mark, so
+    /// the first cluster of a directory is its identity.
+    visited: std.AutoHashMap(u32, void),
+    content_bytes: u64 = 0,
+    metadata_bytes: usize = 0,
+    finished: bool = false,
+
+    fn deinit(self: *TreeScanner) void {
+        if (!self.finished) {
+            for (self.entries.items) |entry| {
+                self.allocator.free(entry.path);
+                self.allocator.free(entry.runs);
+            }
+        }
+        self.entries.deinit();
+        self.visited.deinit();
+    }
+
+    fn finish(self: *TreeScanner) ScanError!Tree {
+        const entries = try self.entries.toOwnedSlice();
+        self.finished = true;
+        return .{
+            .allocator = self.allocator,
+            .entries = entries,
+            .metadata = self.options.metadata,
+            .label = self.fs.info.volume_label,
+            .volume_id = self.fs.info.volume_id,
+            .content_bytes = self.content_bytes,
+        };
+    }
+
+    /// Depth needs no separate limit: every level appends at least two bytes
+    /// to `prefix`, so `max_path_bytes` already bounds the recursion.
+    fn walk(self: *TreeScanner, cluster: u32, prefix: []const u8) ScanError!void {
+        if ((try self.visited.getOrPut(cluster)).found_existing) return error.DirectoryCycle;
+
+        var children = std.array_list.Managed(Child).init(self.allocator);
+        defer {
+            for (children.items) |child| self.allocator.free(child.name);
+            children.deinit();
+        }
+
+        var iterator = try DirectoryIterator.init(self.fs, self.io, cluster);
+        while (try iterator.next(self.io, null)) |raw| {
+            if (raw.attr & attr_volume_id != 0) continue;
+            const name = try raw.nameAlloc(self.allocator);
+            var owned = true;
+            defer if (owned) self.allocator.free(name);
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            // `validateComponent` rejects the names FAT allows but a path
+            // cannot carry; the extra guard below names the two that would
+            // otherwise split or truncate a path.
+            try validateComponent(name);
+            if (std.mem.indexOfScalar(u8, name, '/') != null or
+                std.mem.indexOfScalar(u8, name, 0) != null)
+            {
+                return error.InvalidImportedName;
+            }
+            limits_mod.observe(self.options.diagnostic, .component_bytes, name.len);
+            if (name.len > self.options.max_component_bytes) {
+                return limits_mod.exceeded(
+                    self.options.diagnostic,
+                    .component_bytes,
+                    name.len,
+                    self.options.max_component_bytes,
+                );
+            }
+            for (children.items) |existing| {
+                if (std.ascii.eqlIgnoreCase(existing.name, name)) return error.DuplicateName;
+            }
+            try children.append(.{
+                .name = name,
+                .kind = raw.kind(),
+                .first_cluster = raw.first_cluster,
+                .size = raw.size,
+            });
+            owned = false;
+        }
+
+        // Pre-order, so a directory always precedes everything under it and
+        // an importer never has to invent a parent.
+        for (children.items) |child| {
+            const path = try self.joinPath(prefix, child.name);
+            var path_owned = true;
+            errdefer if (path_owned) self.allocator.free(path);
+            switch (child.kind) {
+                .directory => {
+                    try self.append(.{
+                        .path = path,
+                        .kind = .directory,
+                        .size = 0,
+                        .runs = &.{},
+                        .content = undefined,
+                    });
+                    path_owned = false;
+                    try self.walk(child.first_cluster, path);
+                },
+                .file => {
+                    limits_mod.observe(self.options.diagnostic, .file_bytes, child.size);
+                    if (child.size > self.options.max_file_bytes) {
+                        return limits_mod.exceeded(
+                            self.options.diagnostic,
+                            .file_bytes,
+                            child.size,
+                            self.options.max_file_bytes,
+                        );
+                    }
+                    self.content_bytes = std.math.add(u64, self.content_bytes, child.size) catch
+                        return error.TotalContentLimitExceeded;
+                    limits_mod.observe(self.options.diagnostic, .total_bytes, self.content_bytes);
+                    if (self.content_bytes > self.options.max_total_bytes) {
+                        return limits_mod.exceeded(
+                            self.options.diagnostic,
+                            .total_bytes,
+                            self.content_bytes,
+                            self.options.max_total_bytes,
+                        );
+                    }
+                    const runs = try self.collectRuns(child.first_cluster, child.size);
+                    errdefer self.allocator.free(runs);
+                    try self.append(.{
+                        .path = path,
+                        .kind = .file,
+                        .size = child.size,
+                        .runs = runs,
+                        .content = .{
+                            .fs = self.fs,
+                            .io = self.io,
+                            .size = child.size,
+                            .cluster_bytes = @intCast(self.fs.info.clusterSize()),
+                            .runs = runs,
+                        },
+                    });
+                    path_owned = false;
+                },
+            }
+        }
+        _ = self.visited.remove(cluster);
+    }
+
+    const Child = struct {
+        name: []u8,
+        kind: DirEntryKind,
+        first_cluster: u32,
+        size: u32,
+    };
+
+    fn append(self: *TreeScanner, node: TreeNode) ScanError!void {
+        const count = self.entries.items.len + 1;
+        limits_mod.observe(self.options.diagnostic, .nodes, count);
+        if (count > self.options.max_nodes) {
+            return limits_mod.exceeded(
+                self.options.diagnostic,
+                .nodes,
+                count,
+                self.options.max_nodes,
+            );
+        }
+        try self.entries.append(node);
+    }
+
+    fn joinPath(self: *TreeScanner, prefix: []const u8, name: []const u8) ScanError![]u8 {
+        const length = if (prefix.len == 0) name.len else prefix.len + 1 + name.len;
+        limits_mod.observe(self.options.diagnostic, .path_bytes, length);
+        if (length > self.options.max_path_bytes) {
+            return limits_mod.exceeded(
+                self.options.diagnostic,
+                .path_bytes,
+                length,
+                self.options.max_path_bytes,
+            );
+        }
+        const path = try self.allocator.alloc(u8, length);
+        errdefer self.allocator.free(path);
+        if (prefix.len == 0) {
+            @memcpy(path, name);
+        } else {
+            @memcpy(path[0..prefix.len], prefix);
+            path[prefix.len] = '/';
+            @memcpy(path[prefix.len + 1 ..], name);
+        }
+        try self.chargeMetadata(length);
+        return path;
+    }
+
+    /// The cluster chain, collapsed into contiguous runs, plus the guard that
+    /// keeps a cyclic or over-long chain from being followed forever: the
+    /// file's own size says exactly how many clusters it may occupy.
+    fn collectRuns(self: *TreeScanner, first_cluster: u32, size: u32) ScanError![]ClusterRun {
+        if (size == 0) return self.allocator.alloc(ClusterRun, 0);
+        const cluster_bytes = self.fs.info.clusterSize();
+        const needed: u64 = std.math.divCeil(u64, size, cluster_bytes) catch unreachable;
+
+        var runs = std.array_list.Managed(ClusterRun).init(self.allocator);
+        errdefer runs.deinit();
+        var cluster = first_cluster;
+        var seen: u64 = 0;
+        while (true) {
+            if (!self.fs.isDataCluster(cluster)) return error.BadClusterChain;
+            if (runs.items.len != 0) {
+                const last = &runs.items[runs.items.len - 1];
+                if (last.start_cluster + last.cluster_count == cluster) {
+                    last.cluster_count += 1;
+                } else {
+                    try self.appendRun(&runs, cluster);
+                }
+            } else {
+                try self.appendRun(&runs, cluster);
+            }
+            seen += 1;
+            if (seen == needed) break;
+            // A chain longer than the file needs is a corrupt volume, not a
+            // file with slack: reading past it would hand the guest bytes the
+            // directory entry says are not part of this file.
+            cluster = (try self.fs.nextCluster(self.io, cluster)) orelse return error.BadClusterChain;
+        }
+        return runs.toOwnedSlice();
+    }
+
+    fn appendRun(
+        self: *TreeScanner,
+        runs: *std.array_list.Managed(ClusterRun),
+        cluster: u32,
+    ) ScanError!void {
+        try self.chargeMetadata(@sizeOf(ClusterRun));
+        try runs.append(.{ .start_cluster = cluster, .cluster_count = 1 });
+    }
+
+    /// Everything the scan itself allocates and keeps, which is what the
+    /// scan-metadata limit exists to bound.
+    fn chargeMetadata(self: *TreeScanner, bytes: usize) ScanError!void {
+        self.metadata_bytes = std.math.add(usize, self.metadata_bytes, bytes) catch
+            return error.ScanMetadataLimitExceeded;
+        limits_mod.observe(self.options.diagnostic, .scan_metadata_bytes, self.metadata_bytes);
+        if (self.metadata_bytes > self.options.max_scan_metadata_bytes) {
+            return limits_mod.exceeded(
+                self.options.diagnostic,
+                .scan_metadata_bytes,
+                self.metadata_bytes,
+                self.options.max_scan_metadata_bytes,
+            );
+        }
+    }
+};
+
 test "format writes FAT32 boot sector, FSInfo, backup boot sector, and root FAT anchor" {
     const io = std.testing.io;
     const path = "test-fat32-format.img";
@@ -2163,4 +2680,226 @@ test "streaming writes match whole-buffer writes" {
     try std.testing.expectEqualSlices(u8, contents, whole);
     try std.testing.expectEqualSlices(u8, whole, streamed);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "scanTree reads a FAT volume out in parent-before-child order" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-fat32-scan-tree.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const partition_offset: u64 = 1024 * 1024;
+    const partition_len: u64 = 64 * 1024 * 1024;
+
+    var image = try Image.create(io, path, .raw, partition_offset + partition_len, .{});
+    defer image.close(io);
+    try format(&image, io, .{
+        .partition_offset = partition_offset,
+        .partition_len = partition_len,
+    });
+
+    // A file larger than one cluster proves the run walk, not just the first
+    // cluster, is what the content reader follows.
+    const payload = try allocPattern(allocator, 200 * 1024, 7);
+    defer allocator.free(payload);
+
+    var writable = try open(&image, io, .{ .offset = partition_offset, .length = partition_len });
+    try writable.createDir(io, "EFI/BOOT");
+    try writable.writeFile(io, "EFI/BOOT/BOOTX64.EFI", payload);
+    try writable.writeFile(io, "EFI/BOOT/grub.cfg", "set timeout=0\n");
+    try writable.writeFile(io, "empty", "");
+
+    var filesystem = try open(&image, io, .{ .offset = partition_offset, .length = partition_len });
+    var tree = try scanTree(&filesystem, io, allocator, .{});
+    defer tree.deinit();
+
+    try std.testing.expectEqual(@as(usize, 5), tree.nodeCount());
+    try std.testing.expectEqual(
+        @as(u64, payload.len + "set timeout=0\n".len),
+        tree.content_bytes,
+    );
+
+    // A parent always precedes everything beneath it, so an importer never
+    // has to invent a directory that the source in fact carries.
+    var index: usize = 0;
+    var seen_efi = false;
+    var seen_boot = false;
+    var checked_payload = false;
+    while (index < tree.nodeCount()) : (index += 1) {
+        const entry = tree.entryAt(index);
+        if (std.mem.eql(u8, entry.path, "EFI")) {
+            seen_efi = true;
+            try std.testing.expectEqual(TreeKind.directory, entry.kind);
+            try std.testing.expectEqual(@as(u16, 0o755), entry.mode);
+        }
+        if (std.mem.eql(u8, entry.path, "EFI/BOOT")) {
+            try std.testing.expect(seen_efi);
+            seen_boot = true;
+        }
+        if (std.mem.eql(u8, entry.path, "EFI/BOOT/BOOTX64.EFI")) {
+            try std.testing.expect(seen_boot);
+            try std.testing.expectEqual(TreeKind.file, entry.kind);
+            try std.testing.expectEqual(@as(u16, 0o644), entry.mode);
+            try std.testing.expectEqual(@as(u32, 0), entry.uid);
+            try std.testing.expectEqual(@as(u32, 0), entry.gid);
+            try std.testing.expectEqual(@as(u64, payload.len), entry.size);
+
+            const read_back = try allocator.alloc(u8, payload.len);
+            defer allocator.free(read_back);
+            var offset: u64 = 0;
+            while (offset < payload.len) {
+                const got = try entry.content.?.readAt(read_back[@intCast(offset)..], offset);
+                try std.testing.expect(got != 0);
+                offset += got;
+            }
+            try std.testing.expectEqualSlices(u8, payload, read_back);
+            checked_payload = true;
+        }
+        if (std.mem.eql(u8, entry.path, "empty")) {
+            try std.testing.expectEqual(@as(u64, 0), entry.size);
+            try std.testing.expectEqual(@as(usize, 0), try entry.content.?.readAt(&.{}, 0));
+        }
+    }
+    try std.testing.expect(checked_payload);
+}
+
+test "scanTree synthesizes exactly the metadata it is given" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-fat32-scan-metadata.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const partition_offset: u64 = 0;
+    const partition_len: u64 = 64 * 1024 * 1024;
+
+    var image = try Image.create(io, path, .raw, partition_len, .{});
+    defer image.close(io);
+    try format(&image, io, .{
+        .partition_offset = partition_offset,
+        .partition_len = partition_len,
+    });
+    var writable = try open(&image, io, .{ .offset = partition_offset, .length = partition_len });
+    try writable.createDir(io, "EFI");
+    try writable.writeFile(io, "EFI/boot.cfg", "boot\n");
+
+    var filesystem = try open(&image, io, .{ .offset = partition_offset, .length = partition_len });
+    var tree = try scanTree(&filesystem, io, allocator, .{ .metadata = .{
+        .directory_mode = 0o700,
+        .file_mode = 0o600,
+        .uid = 42,
+        .gid = 43,
+    } });
+    defer tree.deinit();
+
+    var index: usize = 0;
+    while (index < tree.nodeCount()) : (index += 1) {
+        const entry = tree.entryAt(index);
+        try std.testing.expectEqual(@as(u32, 42), entry.uid);
+        try std.testing.expectEqual(@as(u32, 43), entry.gid);
+        try std.testing.expectEqual(
+            @as(u16, switch (entry.kind) {
+                .directory => 0o700,
+                .file => 0o600,
+            }),
+            entry.mode,
+        );
+    }
+
+    // A mode with file-type bits in it would describe a different kind of
+    // file entirely, so it is refused rather than masked down.
+    try std.testing.expectError(error.InvalidSynthesizedMode, scanTree(
+        &filesystem,
+        io,
+        allocator,
+        .{ .metadata = .{ .file_mode = 0o100644 } },
+    ));
+}
+
+test "scanTree accounts every limit it enforces" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-fat32-scan-limits.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const partition_len: u64 = 64 * 1024 * 1024;
+    var image = try Image.create(io, path, .raw, partition_len, .{});
+    defer image.close(io);
+    try format(&image, io, .{ .partition_offset = 0, .partition_len = partition_len });
+    var writable = try open(&image, io, .{ .offset = 0, .length = partition_len });
+    try writable.createDir(io, "EFI/BOOT");
+    try writable.writeFile(io, "EFI/BOOT/BOOTX64.EFI", "payload");
+
+    var filesystem = try open(&image, io, .{ .offset = 0, .length = partition_len });
+
+    var diagnostic = limits_mod.Diagnostic{};
+    var tree = try scanTree(&filesystem, io, allocator, .{ .diagnostic = &diagnostic });
+    tree.deinit();
+    try std.testing.expectEqual(@as(u64, 3), diagnostic.peaks.nodes);
+    try std.testing.expectEqual(@as(u64, 7), diagnostic.peaks.total_bytes);
+    try std.testing.expect(diagnostic.peaks.scan_metadata_bytes != 0);
+    try std.testing.expectEqual(@as(?limits_mod.Exceeded, null), diagnostic.exceeded);
+
+    try std.testing.expectError(
+        error.NodeLimitExceeded,
+        scanTree(&filesystem, io, allocator, .{ .max_nodes = 2 }),
+    );
+    try std.testing.expectError(
+        error.FileLimitExceeded,
+        scanTree(&filesystem, io, allocator, .{ .max_file_bytes = 6 }),
+    );
+    try std.testing.expectError(
+        error.TotalContentLimitExceeded,
+        scanTree(&filesystem, io, allocator, .{ .max_total_bytes = 6 }),
+    );
+    try std.testing.expectError(
+        error.PathLimitExceeded,
+        scanTree(&filesystem, io, allocator, .{ .max_path_bytes = 8 }),
+    );
+    try std.testing.expectError(
+        error.ComponentLimitExceeded,
+        scanTree(&filesystem, io, allocator, .{ .max_component_bytes = 3 }),
+    );
+    try std.testing.expectError(
+        error.ScanMetadataLimitExceeded,
+        scanTree(&filesystem, io, allocator, .{ .max_scan_metadata_bytes = 4 }),
+    );
+}
+
+test "scanTree refuses a directory that contains itself" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-fat32-scan-cycle.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const partition_len: u64 = 64 * 1024 * 1024;
+    var image = try Image.create(io, path, .raw, partition_len, .{});
+    defer image.close(io);
+    try format(&image, io, .{ .partition_offset = 0, .partition_len = partition_len });
+    var writable = try open(&image, io, .{ .offset = 0, .length = partition_len });
+    try writable.createDir(io, "loop/inner");
+
+    // Point `loop/inner` back at `loop`. FAT has no parent pointer a scanner
+    // can trust, so nothing but a visited set stops this walking forever.
+    const outer = (try writable.findEntry(io, writable.info.root_cluster, "loop")).?;
+    const inner = (try writable.findEntry(io, outer.first_cluster, "inner")).?;
+    var cluster_buffer: [max_cluster_size]u8 = undefined;
+    const cluster_bytes = writable.info.clusterSize();
+    try writable.readCluster(io, outer.first_cluster, cluster_buffer[0..cluster_bytes]);
+    // A lowercase name needs long-filename slots ahead of the short entry,
+    // and only the short entry carries the cluster number.
+    const slot = (inner.first_slot + inner.slot_count - 1) * directory_entry_size;
+    const entry = cluster_buffer[slot..][0..directory_entry_size];
+    std.mem.writeInt(u16, entry[20..22], @intCast(outer.first_cluster >> 16), .little);
+    std.mem.writeInt(u16, entry[26..28], @truncate(outer.first_cluster), .little);
+    try writable.writeRegion(
+        io,
+        cluster_buffer[0..cluster_bytes],
+        writable.clusterOffset(outer.first_cluster),
+    );
+
+    var filesystem = try open(&image, io, .{ .offset = 0, .length = partition_len });
+    try std.testing.expectError(
+        error.DirectoryCycle,
+        scanTree(&filesystem, io, allocator, .{}),
+    );
 }

@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const ext4 = @import("ext4.zig");
+const fat32 = @import("fat32.zig");
 const Format = @import("formats.zig").Format;
 const free_space = @import("free_space.zig");
 const gpt = @import("gpt.zig");
@@ -149,6 +150,17 @@ pub const RebuildOptions = struct {
     /// contract; `.general` exists because no filesystem a distro installer
     /// produced can ever satisfy it.
     source_profile: SourceProfilePolicy = .strict,
+    /// Additional filesystems merged into the root tree, in order, each at
+    /// its own mount point. An installed system is normally spread across an
+    /// ESP, a `/boot` filesystem and a root filesystem; listing the first two
+    /// here collapses them into plain directories inside the one rebuilt root
+    /// filesystem. Merging happens before the writer runs, so hardlinks,
+    /// extended attributes, permissions and device nodes survive it.
+    ///
+    /// A mount replaces whatever the sources before it had at its target
+    /// rather than merging into it, exactly as a real mount hides the
+    /// directory underneath. See `root_tree.RootTree.mountExt4General`.
+    source_mounts: []const SourceMount = &.{},
     /// Every limit the import enforces, each raisable by its own flag.
     limits: limits_mod.ImportLimits = .{},
     /// Optional sink for the peak measurements and the first limit breach.
@@ -191,6 +203,35 @@ pub const SourceProfilePolicy = enum {
     }
 };
 
+/// Which reader a merged source is handed to. `.detect` is the default only
+/// because an operator naming a partition rarely knows or cares; it probes
+/// the on-disk magic and refuses anything it cannot name, so it never guesses.
+pub const SourceFilesystem = enum {
+    detect,
+    ext4,
+    fat32,
+};
+
+/// One filesystem merged into the rebuilt root at a mount point.
+pub const SourceMount = struct {
+    /// Image file or block-device node holding the filesystem. Empty means
+    /// the rebuild's own `source_path`, which is the common case: one disk,
+    /// several partitions of it.
+    source_path: []const u8 = "",
+    partition: PartitionSelector,
+    /// Where the filesystem lands in the rebuilt root: absolute, normalized,
+    /// and already an existing directory in the sources before it.
+    target: []const u8,
+    filesystem: SourceFilesystem = .detect,
+    /// POSIX metadata synthesized for entries read from a FAT source. vfat
+    /// stores no owner, no permission bits, no symlinks and no extended
+    /// attributes, so something has to be invented; inventing it silently
+    /// would bake an unstated policy into every image, so it is a documented
+    /// default (0755 directories, 0644 files, uid=gid=0) that a caller can
+    /// override. Ignored for an ext4 source, which carries its own.
+    fat_metadata: fat32.SynthesizedMetadata = .{},
+};
+
 /// What a rebuild needs from the filesystem holding the output directory, and
 /// what that filesystem had when the rebuild started. `available_bytes` is
 /// null when the host cannot be asked; that is never treated as too little.
@@ -229,6 +270,8 @@ pub const RebuildReport = struct {
     /// False for a general import. The source's own layout, allocation order
     /// and journal state are not reproduced, so rebuilding the same source
     /// twice is stable but rebuilding it from a re-created source is not.
+    /// Also false whenever anything was merged in: the output is then a
+    /// function of several sources, not of the one this report names.
     source_reproducible: bool,
     ext4_uuid: [16]u8,
     /// Exact preserved ext4 volume-name field.
@@ -240,6 +283,12 @@ pub const RebuildReport = struct {
     final_manifest_sha256: [32]u8,
     /// RootTree node counts exclude its implicit root directory.
     imported_node_count: usize,
+    /// Filesystems merged in at a mount point, excluding the root source.
+    merged_source_count: usize,
+    /// Nodes the mount points hid, summed over every merge. Stated rather
+    /// than left to be diffed for, because a stale `/boot` stub silently
+    /// surviving a merge is the failure this feature exists to prevent.
+    shadowed_node_count: usize,
     final_node_count: usize,
     existing_operation_count: usize,
     os_customization_count: usize,
@@ -267,6 +316,10 @@ pub const RebuildInspection = struct {
     ext4_global_timestamp: u32,
     /// Excludes the implicit root directory.
     imported_node_count: usize,
+    /// Filesystems merged in at a mount point, excluding the root source.
+    merged_source_count: usize,
+    /// Nodes the mount points hid, summed over every merge.
+    shadowed_node_count: usize,
     /// The largest value each limit reached during the inspection, which
     /// covers the same limits a rebuild enforces. Sizing flags from a dry run
     /// is the point of inspecting.
@@ -458,9 +511,28 @@ pub fn inspectRebuild(
         .{ .offset = partition.offset },
     );
     defer reader.deinit();
-    var scanned = try ScannedSource.scan(&reader, io, allocator, options, partition.length);
-    defer scanned.deinit();
-    try preflightScannedOperations(scanned.fileTreeView(), options.existing_operations);
+    var budget = CombinedBudget{
+        .limits = options.limits,
+        .sink = options.limit_diagnostic,
+    };
+    var sources = try SourceSet.open(
+        allocator,
+        io,
+        &reader,
+        options,
+        source_path,
+        partition.length,
+        &budget,
+    );
+    defer sources.deinit(io);
+    const scanned = &sources.root;
+    // Only the assembled tree says which paths exist once anything is merged
+    // in: the root source's view still shows what a mount hides and still
+    // lacks everything a mount brings. `preflightTreeOperations` below checks
+    // the operations there instead, against the tree the rebuild will write.
+    if (options.source_mounts.len == 0) {
+        try preflightScannedOperations(scanned.fileTreeView(), options.existing_operations);
+    }
 
     try preflightReadOnlyDependencies(
         io,
@@ -494,11 +566,13 @@ pub fn inspectRebuild(
         spool_path,
         options.existing_operations,
         options.customization,
+        options.source_mounts,
     );
     var validation_tree = root_tree.RootTree.initMemory(allocator, io, options.limits.tree());
     validation_tree.diagnostic = options.limit_diagnostic;
     defer validation_tree.deinit();
-    try scanned.importBorrowedInto(&validation_tree);
+    try sources.importBorrowedInto(&validation_tree);
+    const imported_node_count = validation_tree.nodeCount();
     try preflightTreeOperations(&validation_tree, options.existing_operations);
     try applyTreeOperations(
         io,
@@ -523,7 +597,7 @@ pub fn inspectRebuild(
     _ = try ext4.preflightPopulate(
         allocator,
         try validation_tree.ext4View(),
-        populateOptions(&validation_tree, partition.offset, &scanned, &scanned_label, scanned_timestamp),
+        populateOptions(&validation_tree, partition.offset, scanned, &scanned_label, scanned_timestamp),
     );
 
     return .{
@@ -533,17 +607,20 @@ pub fn inspectRebuild(
         .partition_length = partition.length,
         .flattened_backing_chain = if (source.qcow2) |info| info.backing_depth != 0 else false,
         .source_profile = scanned.profile(),
-        .source_reproducible = scanned.profile().isByteReproducible(),
+        .source_reproducible = scanned.profile().isByteReproducible() and
+            options.source_mounts.len == 0,
         .ext4_uuid = scanned.uuid(),
         .ext4_label = scanned_label,
         .ext4_block_size = scanned.blockSize(),
         .filesystem_length = scanned.filesystemLength(),
         .ext4_global_timestamp = scanned_timestamp,
-        .imported_node_count = scanned.nodeCount(),
+        .imported_node_count = imported_node_count,
+        .merged_source_count = sources.mounts.len,
+        .shadowed_node_count = sources.shadowed_nodes,
         .limit_peaks = if (options.limit_diagnostic) |sink| sink.peaks else .{},
         .workspace_space = workspaceSpace(
             output_path,
-            scanned.contentBytes(),
+            sources.contentBytes(),
             source.virtual_size,
             options.output_format,
             options.output_compression,
@@ -595,8 +672,21 @@ pub fn rebuild(
         .{ .offset = partition.offset },
     );
     defer reader.deinit();
-    var scanned = try ScannedSource.scan(&reader, io, allocator, options, partition.length);
-    defer scanned.deinit();
+    var budget = CombinedBudget{
+        .limits = options.limits,
+        .sink = options.limit_diagnostic,
+    };
+    var sources = try SourceSet.open(
+        allocator,
+        io,
+        &reader,
+        options,
+        source_path,
+        partition.length,
+        &budget,
+    );
+    defer sources.deinit(io);
+    const scanned = &sources.root;
     const scanned_label = scanned.label();
     const scanned_timestamp = scanned.globalTimestamp(options.source_date_epoch);
 
@@ -632,6 +722,7 @@ pub fn rebuild(
         spool_path,
         options.existing_operations,
         options.customization,
+        options.source_mounts,
     );
 
     // The workspace precondition runs before the spool file exists, so a
@@ -639,7 +730,7 @@ pub fn rebuild(
     // however long it takes to copy most of a root filesystem into it.
     const workspace = workspaceSpace(
         output_path,
-        scanned.contentBytes(),
+        sources.contentBytes(),
         virtual_size,
         options.output_format,
         options.output_compression,
@@ -651,9 +742,8 @@ pub fn rebuild(
     var tree = try root_tree.RootTree.init(allocator, io, spool_path, options.limits.tree());
     tree.diagnostic = options.limit_diagnostic;
     defer tree.deinit();
-    try scanned.importInto(&tree);
+    try sources.importInto(&tree);
     const imported_node_count = tree.nodeCount();
-    if (imported_node_count != scanned.nodeCount()) return error.ImportedNodeCountMismatch;
     const source_manifest = try tree.manifestDigest();
 
     try preflightTreeOperations(&tree, options.existing_operations);
@@ -695,7 +785,7 @@ pub fn rebuild(
         raw.file,
         allocator,
         final_view,
-        populateOptions(&tree, partition.offset, &scanned, &scanned_label, scanned_timestamp),
+        populateOptions(&tree, partition.offset, scanned, &scanned_label, scanned_timestamp),
     );
     const raw_inode = (try raw.file.stat(io)).inode;
     raw.close(io);
@@ -728,7 +818,8 @@ pub fn rebuild(
         .partition_length = partition.length,
         .flattened_backing_chain = flattened,
         .source_profile = scanned.profile(),
-        .source_reproducible = scanned.profile().isByteReproducible(),
+        .source_reproducible = scanned.profile().isByteReproducible() and
+            options.source_mounts.len == 0,
         .ext4_uuid = scanned.uuid(),
         .ext4_label = scanned_label,
         .ext4_block_size = scanned.blockSize(),
@@ -737,6 +828,8 @@ pub fn rebuild(
         .source_manifest_sha256 = source_manifest,
         .final_manifest_sha256 = final_manifest,
         .imported_node_count = imported_node_count,
+        .merged_source_count = sources.mounts.len,
+        .shadowed_node_count = sources.shadowed_nodes,
         .final_node_count = final_node_count,
         .existing_operation_count = options.existing_operations.len,
         .os_customization_count = customizationCount(options.customization),
@@ -944,21 +1037,41 @@ fn populateOptions(
     };
 }
 
-fn generalScanOptions(options: RebuildOptions, partition_length: u64) ext4.GeneralScanOptions {
+fn generalScanOptions(
+    options: RebuildOptions,
+    partition_length: u64,
+    caps: ScanCaps,
+) ext4.GeneralScanOptions {
     return .{
         .available_length = partition_length,
-        .max_nodes = options.limits.max_nodes,
+        .max_nodes = caps.max_nodes,
         .max_path_bytes = options.limits.max_path_bytes,
         .max_component_bytes = options.limits.max_component_bytes,
         .max_file_bytes = options.limits.max_file_bytes,
-        .max_total_bytes = options.limits.max_total_bytes,
+        .max_total_bytes = caps.max_total_bytes,
         .max_xattrs_per_node = options.limits.max_xattrs_per_node,
         .max_xattr_bytes_per_node = options.limits.max_xattr_bytes_per_node,
         .max_scan_metadata_bytes = options.limits.max_scan_metadata_bytes,
-        .diagnostic = options.limit_diagnostic,
+        .diagnostic = caps.diagnostic,
     };
 }
 
+fn fatScanOptions(
+    options: RebuildOptions,
+    mount: SourceMount,
+    caps: ScanCaps,
+) fat32.ScanOptions {
+    return .{
+        .metadata = mount.fat_metadata,
+        .max_nodes = caps.max_nodes,
+        .max_path_bytes = options.limits.max_path_bytes,
+        .max_component_bytes = options.limits.max_component_bytes,
+        .max_file_bytes = options.limits.max_file_bytes,
+        .max_total_bytes = caps.max_total_bytes,
+        .max_scan_metadata_bytes = options.limits.max_scan_metadata_bytes,
+        .diagnostic = caps.diagnostic,
+    };
+}
 /// One handle over both importers, so the rebuild pipeline downstream of the
 /// scan does not have to be written twice and cannot drift between profiles.
 const ScannedSource = union(enum) {
@@ -971,19 +1084,20 @@ const ScannedSource = union(enum) {
         allocator: Allocator,
         options: RebuildOptions,
         partition_length: u64,
+        caps: ScanCaps,
     ) !ScannedSource {
         return switch (options.source_profile) {
             .strict => .{ .strict = try ext4.scanWriterCompatible(
                 reader,
                 io,
                 allocator,
-                strictScanOptions(options, partition_length),
+                strictScanOptions(options, partition_length, caps),
             ) },
             .general => .{ .general = try ext4.scanReadable(
                 reader,
                 io,
                 allocator,
-                generalScanOptions(options, partition_length),
+                generalScanOptions(options, partition_length, caps),
             ) },
         };
     }
@@ -1077,19 +1191,408 @@ const ScannedSource = union(enum) {
     }
 };
 
-fn strictScanOptions(options: RebuildOptions, partition_length: u64) ext4.StrictScanOptions {
+fn strictScanOptions(
+    options: RebuildOptions,
+    partition_length: u64,
+    caps: ScanCaps,
+) ext4.StrictScanOptions {
     return .{
         .expected_length = partition_length,
-        .max_nodes = options.limits.max_nodes,
+        .max_nodes = caps.max_nodes,
         .max_path_bytes = options.limits.max_path_bytes,
         .max_component_bytes = options.limits.max_component_bytes,
         .max_file_bytes = options.limits.max_file_bytes,
-        .max_total_bytes = options.limits.max_total_bytes,
+        .max_total_bytes = caps.max_total_bytes,
         .max_xattrs_per_node = options.limits.max_xattrs_per_node,
         .max_xattr_bytes_per_node = options.limits.max_xattr_bytes_per_node,
         .max_scan_metadata_bytes = options.limits.max_scan_metadata_bytes,
-        .diagnostic = options.limit_diagnostic,
+        .diagnostic = caps.diagnostic,
     };
+}
+
+/// What one scan may still spend, and the private sink it reports to. Both
+/// come from `CombinedBudget`, which owns the totals across every source.
+const ScanCaps = struct {
+    max_nodes: usize,
+    max_total_bytes: u64,
+    diagnostic: *limits_mod.Diagnostic,
+};
+
+/// Limits describe an import, not any one source of it. Three filesystems
+/// that each fit under `--max-nodes` and together do not still describe one
+/// tree the writer has to build, so the two cumulative limits are charged
+/// against a running total across every source instead of being reset for
+/// each one. Everything else a scanner measures -- the longest path, the
+/// largest file, the widest xattr set -- is a property of a single node, so
+/// the largest value seen anywhere is already the combined peak.
+///
+/// Each scan is additionally capped at whatever the scans before it left, so
+/// a later source cannot allocate a whole limit's worth of scan metadata on
+/// top of the sources already held in memory. That remainder is an artifact
+/// of sharing the budget and not a number any flag was ever set to, so a
+/// scan that trips it is restated against the configured limit and the
+/// combined total before the error escapes: telling an operator to raise
+/// `--max-nodes` above a remainder would be advice that does not work.
+const CombinedBudget = struct {
+    limits: limits_mod.ImportLimits,
+    sink: ?*limits_mod.Diagnostic,
+    nodes: usize = 0,
+    content_bytes: u64 = 0,
+
+    fn caps(self: *const CombinedBudget, local: *limits_mod.Diagnostic) ScanCaps {
+        return .{
+            .max_nodes = self.limits.max_nodes -| self.nodes,
+            .max_total_bytes = self.limits.max_total_bytes -| self.content_bytes,
+            .diagnostic = local,
+        };
+    }
+
+    /// Folds one scan's measurements into the caller's sink, offsetting the
+    /// cumulative ones by what earlier sources already spent.
+    fn fold(self: *CombinedBudget, local: limits_mod.Diagnostic) void {
+        const sink = self.sink orelse return;
+        inline for (comptime std.enums.values(limits_mod.Limit)) |limit| {
+            const measured = local.peaks.value(limit);
+            sink.observe(limit, switch (limit) {
+                .nodes => @as(u64, self.nodes) +| measured,
+                .total_bytes => self.content_bytes +| measured,
+                else => measured,
+            });
+        }
+    }
+
+    /// Restates a breach of the reduced caps in terms of the whole import.
+    fn restate(self: *CombinedBudget, breach: limits_mod.Exceeded) limits_mod.Error {
+        const observed = switch (breach.limit) {
+            .nodes => @as(u64, self.nodes) +| breach.observed,
+            .total_bytes => self.content_bytes +| breach.observed,
+            else => breach.observed,
+        };
+        return limits_mod.exceeded(
+            self.sink,
+            breach.limit,
+            observed,
+            self.limits.value(breach.limit),
+        );
+    }
+
+    fn charge(self: *CombinedBudget, nodes: usize, content_bytes: u64) void {
+        self.nodes +|= nodes;
+        self.content_bytes +|= content_bytes;
+    }
+
+    /// Called on the failure path of every scan: the peaks are still worth
+    /// reporting, and a limit breach has to be restated before it escapes.
+    fn failed(self: *CombinedBudget, local: limits_mod.Diagnostic, err: anyerror) anyerror {
+        self.fold(local);
+        if (local.exceeded) |breach| return self.restate(breach);
+        return err;
+    }
+};
+
+/// One merged source: the image it lives on, the reader over it, and the
+/// tree scanned out of it.
+///
+/// The image and the ext4 reader are fields rather than locals because the
+/// scanned tree holds pointers straight into them, so neither may move after
+/// the scan; the slice of these is allocated once at its exact final length
+/// for the same reason.
+const MountedSource = struct {
+    target: []const u8,
+    image: Image = undefined,
+    image_open: bool = false,
+    reader: ext4.Reader = undefined,
+    reader_open: bool = false,
+    filesystem: fat32.FileSystem = undefined,
+    tree: ?MountedTree = null,
+
+    const MountedTree = union(enum) {
+        ext4: ScannedSource,
+        fat: fat32.Tree,
+    };
+
+    fn open(
+        self: *MountedSource,
+        allocator: Allocator,
+        io: Io,
+        spec: SourceMount,
+        options: RebuildOptions,
+        root_source_path: []const u8,
+        budget: *CombinedBudget,
+    ) !void {
+        const path = if (spec.source_path.len == 0) root_source_path else spec.source_path;
+        if (path.len == 0) return error.InvalidPath;
+        self.image = try Image.openPathReadOnly(io, path);
+        self.image_open = true;
+
+        const partition = try selectMountPartition(allocator, io, self.image, spec.partition);
+        const end = std.math.add(u64, partition.offset, partition.length) catch
+            return error.InvalidPartitionBounds;
+        if (partition.length == 0 or end > self.image.virtual_size) {
+            return error.InvalidPartitionBounds;
+        }
+
+        var local = limits_mod.Diagnostic{};
+        switch (try resolveFilesystem(self.image, io, partition, spec.filesystem)) {
+            .ext4 => {
+                self.reader = try ext4.openReadOnlySource(
+                    io,
+                    self.image.file,
+                    .{ .ctx = &self.image, .read_at_fn = imageReadAt },
+                    allocator,
+                    .{ .offset = partition.offset },
+                );
+                self.reader_open = true;
+                self.tree = .{ .ext4 = ScannedSource.scan(
+                    &self.reader,
+                    io,
+                    allocator,
+                    options,
+                    partition.length,
+                    budget.caps(&local),
+                ) catch |err| return budget.failed(local, err) };
+            },
+            .fat32 => {
+                self.filesystem = try fat32.open(&self.image, io, .{
+                    .offset = partition.offset,
+                    .length = partition.length,
+                });
+                self.tree = .{ .fat = fat32.scanTree(
+                    &self.filesystem,
+                    io,
+                    allocator,
+                    fatScanOptions(options, spec, budget.caps(&local)),
+                ) catch |err| return budget.failed(local, err) };
+            },
+        }
+        budget.fold(local);
+        budget.charge(self.nodeCount(), self.contentBytes());
+    }
+
+    fn deinit(self: *MountedSource, io: Io) void {
+        if (self.tree) |*tree| switch (tree.*) {
+            .ext4 => |*scanned| scanned.deinit(),
+            .fat => |*scanned| scanned.deinit(),
+        };
+        self.tree = null;
+        if (self.reader_open) {
+            self.reader.deinit();
+            self.reader_open = false;
+        }
+        if (self.image_open) {
+            self.image.close(io);
+            self.image_open = false;
+        }
+    }
+
+    fn nodeCount(self: *const MountedSource) usize {
+        const tree = self.tree orelse return 0;
+        return switch (tree) {
+            .ext4 => |scanned| scanned.nodeCount(),
+            .fat => |scanned| scanned.nodeCount(),
+        };
+    }
+
+    fn contentBytes(self: *const MountedSource) u64 {
+        const tree = self.tree orelse return 0;
+        return switch (tree) {
+            .ext4 => |scanned| scanned.contentBytes(),
+            .fat => |scanned| scanned.content_bytes,
+        };
+    }
+
+    fn mountInto(
+        self: *MountedSource,
+        tree: *root_tree.RootTree,
+        mode: enum { owned, borrowed },
+    ) !root_tree.RootTree.MountReport {
+        const scanned = &(self.tree orelse return error.MountSourceNotScanned);
+        return switch (scanned.*) {
+            .ext4 => |*source| switch (source.*) {
+                // A strict source's root directory is whatever this project's
+                // writer emits for one, which is exactly `RootMetadata`'s
+                // defaults; the strict tree deliberately carries no root entry
+                // to read it back from.
+                .strict => |*strict| switch (mode) {
+                    .owned => tree.mountExt4View(
+                        strict.fileTreeView(),
+                        self.target,
+                        strict_root_metadata,
+                    ),
+                    .borrowed => tree.mountExt4ViewBorrowed(
+                        strict.fileTreeView(),
+                        self.target,
+                        strict_root_metadata,
+                    ),
+                },
+                .general => |*general| switch (mode) {
+                    .owned => tree.mountExt4General(general, self.target),
+                    .borrowed => tree.mountExt4GeneralBorrowed(general, self.target),
+                },
+            },
+            .fat => |*fat| switch (mode) {
+                .owned => tree.mountFat(fat, self.target),
+                .borrowed => tree.mountFatBorrowed(fat, self.target),
+            },
+        };
+    }
+};
+
+/// The root directory this project's ext4 writer emits, which is the root a
+/// strict source was written with and therefore the one a strict mount point
+/// takes on.
+const strict_root_metadata: root_tree.Metadata = .{ .mode = 0o755, .uid = 0, .gid = 0 };
+
+/// Every filesystem one rebuild reads: the root source plus each merged
+/// source, opened and scanned, ready to be assembled into a single tree.
+const SourceSet = struct {
+    root: ScannedSource,
+    mounts: []MountedSource,
+    allocator: Allocator,
+    /// Nodes hidden by mount points, summed over every merge. Only meaningful
+    /// once `importInto` or `importBorrowedInto` has run.
+    shadowed_nodes: usize = 0,
+
+    fn open(
+        allocator: Allocator,
+        io: Io,
+        root_reader: *ext4.Reader,
+        options: RebuildOptions,
+        root_source_path: []const u8,
+        root_partition_length: u64,
+        budget: *CombinedBudget,
+    ) !SourceSet {
+        // Every mount target is checked against every other before a single
+        // source is opened, so a duplicate or an unreachable target costs a
+        // rejection rather than a full scan of a filesystem it would discard.
+        const targets = try allocator.alloc([]const u8, options.source_mounts.len);
+        defer allocator.free(targets);
+        for (options.source_mounts, targets) |mount, *slot| slot.* = mount.target;
+        try root_tree.validateMountTargets(targets);
+
+        var local = limits_mod.Diagnostic{};
+        var root = ScannedSource.scan(
+            root_reader,
+            io,
+            allocator,
+            options,
+            root_partition_length,
+            budget.caps(&local),
+        ) catch |err| return budget.failed(local, err);
+        errdefer root.deinit();
+        budget.fold(local);
+        budget.charge(root.nodeCount(), root.contentBytes());
+
+        const mounts = try allocator.alloc(MountedSource, options.source_mounts.len);
+        var opened: usize = 0;
+        errdefer {
+            for (mounts[0..opened]) |*mount| mount.deinit(io);
+            allocator.free(mounts);
+        }
+        for (options.source_mounts, mounts) |spec, *mount| {
+            mount.* = .{ .target = spec.target };
+            opened += 1;
+            try mount.open(allocator, io, spec, options, root_source_path, budget);
+        }
+
+        return .{ .root = root, .mounts = mounts, .allocator = allocator };
+    }
+
+    fn deinit(self: *SourceSet, io: Io) void {
+        for (self.mounts) |*mount| mount.deinit(io);
+        self.allocator.free(self.mounts);
+        self.root.deinit();
+        self.* = undefined;
+    }
+
+    /// Sum over every source, which is what the spool has to hold and what
+    /// the workspace check has to be sized against.
+    fn contentBytes(self: *const SourceSet) u64 {
+        var total = self.root.contentBytes();
+        for (self.mounts) |mount| total +|= mount.contentBytes();
+        return total;
+    }
+
+    fn importInto(self: *SourceSet, tree: *root_tree.RootTree) !void {
+        try self.assemble(tree, .owned);
+    }
+
+    fn importBorrowedInto(self: *SourceSet, tree: *root_tree.RootTree) !void {
+        try self.assemble(tree, .borrowed);
+    }
+
+    fn assemble(
+        self: *SourceSet,
+        tree: *root_tree.RootTree,
+        mode: enum { owned, borrowed },
+    ) !void {
+        switch (mode) {
+            .owned => try self.root.importInto(tree),
+            .borrowed => try self.root.importBorrowedInto(tree),
+        }
+        // The root import lands one node per scanned entry and nothing else;
+        // a mismatch here means the importer collided two source paths into
+        // one, which would silently drop a file.
+        if (tree.nodeCount() != self.root.nodeCount()) return error.ImportedNodeCountMismatch;
+        self.shadowed_nodes = 0;
+        for (self.mounts) |*mount| {
+            const report = try mount.mountInto(tree, switch (mode) {
+                .owned => .owned,
+                .borrowed => .borrowed,
+            });
+            self.shadowed_nodes +|= report.shadowed_nodes;
+        }
+    }
+};
+
+/// Names the filesystem on a merged partition, either because the caller
+/// already knew or by probing the on-disk magic. Probing never falls back:
+/// a partition that looks like both, or like neither, is refused so an
+/// operator finds out now rather than through a surprising tree.
+fn resolveFilesystem(
+    image: Image,
+    io: Io,
+    partition: Partition,
+    requested: SourceFilesystem,
+) !ResolvedFilesystem {
+    switch (requested) {
+        .ext4 => return .ext4,
+        .fat32 => return .fat32,
+        .detect => {},
+    }
+    const looks_ext4 = try hasExt4Superblock(image, io, partition);
+    const looks_fat32 = try hasFat32BootSector(image, io, partition);
+    if (looks_ext4 and looks_fat32) return error.AmbiguousSourceFilesystem;
+    if (looks_ext4) return .ext4;
+    if (looks_fat32) return .fat32;
+    return error.UnrecognizedSourceFilesystem;
+}
+
+const ResolvedFilesystem = enum { ext4, fat32 };
+
+/// The ext2/3/4 superblock lives 1024 bytes into the filesystem and carries
+/// its magic 0x38 bytes into itself.
+fn hasExt4Superblock(image: Image, io: Io, partition: Partition) !bool {
+    const magic_offset = 1024 + 0x38;
+    if (partition.length < magic_offset + 2) return false;
+    var magic: [2]u8 = undefined;
+    if (try image.pread(io, &magic, partition.offset + magic_offset) != magic.len) {
+        return error.UnexpectedEndOfFile;
+    }
+    return std.mem.readInt(u16, &magic, .little) == 0xEF53;
+}
+
+/// A FAT32 boot sector ends in the 0x55AA signature and names its type in the
+/// eight bytes at offset 82. The type string alone is advisory, so both are
+/// required before a partition is called vfat.
+fn hasFat32BootSector(image: Image, io: Io, partition: Partition) !bool {
+    if (partition.length < 512) return false;
+    var boot: [512]u8 = undefined;
+    if (try image.pread(io, &boot, partition.offset) != boot.len) {
+        return error.UnexpectedEndOfFile;
+    }
+    if (boot[510] != 0x55 or boot[511] != 0xAA) return false;
+    return std.mem.eql(u8, boot[82..90], "FAT32   ");
 }
 
 fn imageReadAt(
@@ -1386,6 +1889,7 @@ fn validateRebuildArtifactPaths(
     spool_path: []const u8,
     operations: []const Operation,
     customization: os_customization.OsCustomization,
+    source_mounts: []const SourceMount,
 ) !void {
     const artifacts = [_][]const u8{ output_path, raw_path, output_stage_path, spool_path };
     for (artifacts, 0..) |path, index| {
@@ -1393,6 +1897,13 @@ fn validateRebuildArtifactPaths(
         for (artifacts[index + 1 ..]) |other| {
             if (std.mem.eql(u8, path, other)) return error.SourceOutputConflict;
         }
+    }
+    // A merged source is read for the whole rebuild, so it must not be one of
+    // the files the rebuild is about to create or overwrite. An empty path
+    // means the root source, which the loop above already covered.
+    for (source_mounts) |mount| {
+        if (mount.source_path.len == 0) continue;
+        try validateDependencyArtifactIsolation(allocator, mount.source_path, &artifacts);
     }
     const dependencies = try source.sourceDependencyPaths(allocator);
     defer {
@@ -1627,6 +2138,23 @@ fn selectPartition(
             };
         },
     };
+}
+
+/// Locates a merged source's partition. Unlike the root partition this one
+/// is only read, never rewritten, so the MBR type is not constrained: an ESP
+/// is type 0xEF and a separate `/boot` may be anything an installer chose.
+/// Only the bounds have to hold, because a partition that runs off the end of
+/// its disk would be read as whatever happened to follow it.
+fn selectMountPartition(
+    allocator: Allocator,
+    io: Io,
+    image: Image,
+    selector: PartitionSelector,
+) !Partition {
+    if (image.virtual_size == 0 or image.virtual_size % mbr.sector_size != 0) {
+        return error.InvalidPartitionBounds;
+    }
+    return selectPartition(allocator, io, image, selector);
 }
 
 fn selectRebuildPartition(
@@ -3459,4 +3987,573 @@ test "general rebuild imports a stock mke2fs source and preserves its metadata" 
     try std.testing.expect(saw_fifo);
     try std.testing.expect(saw_symlink);
     try std.testing.expect(saw_hostname);
+}
+
+// A realistic installed layout: an ESP, a separate `/boot`, and the root
+// filesystem, all on one disk. The rebuild collapses the first two into
+// directories inside the third.
+const merge_disk_size: u64 = 96 * 1024 * 1024;
+const merge_esp_first_lba: u32 = 2048;
+const merge_esp_sectors: u32 = 48 * 2048;
+const merge_boot_first_lba: u32 = merge_esp_first_lba + merge_esp_sectors;
+const merge_boot_sectors: u32 = 8 * 2048;
+const merge_root_first_lba: u32 = merge_boot_first_lba + merge_boot_sectors;
+const merge_root_sectors: u32 = 24 * 2048;
+const esp_partition_type: mbr.PartitionType = @enumFromInt(0xEF);
+
+const merge_root_fixture_dir = "test-preserved-merge-root-src";
+const merge_boot_fixture_dir = "test-preserved-merge-boot-src";
+const merge_root_fixture_image = "test-preserved-merge-root.img";
+const merge_boot_fixture_image = "test-preserved-merge-boot.img";
+
+fn buildMergeExt4Fixture(
+    allocator: std.mem.Allocator,
+    directory: []const u8,
+    image_path: []const u8,
+    sectors: u32,
+) !void {
+    var size_text: [32]u8 = undefined;
+    const blocks = @as(u64, sectors) * mbr.sector_size / 4096;
+    try runGeneralFixtureTool(allocator, "mke2fs", &.{
+        "-q",
+        "-t",
+        "ext4",
+        "-b",
+        "4096",
+        "-I",
+        "256",
+        "-d",
+        directory,
+        image_path,
+        try std.fmt.bufPrint(&size_text, "{d}", .{blocks}),
+    });
+}
+
+fn copyFixtureIntoPartition(
+    allocator: std.mem.Allocator,
+    io: Io,
+    image: *Image,
+    fixture_path: []const u8,
+    first_lba: u32,
+    sectors: u32,
+) !void {
+    const fixture = try Io.Dir.cwd().openFile(io, fixture_path, .{});
+    defer fixture.close(io);
+    const buffer = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(buffer);
+    const total = @as(u64, sectors) * mbr.sector_size;
+    const base = @as(u64, first_lba) * mbr.sector_size;
+    var offset: u64 = 0;
+    while (offset < total) {
+        const wanted: usize = @intCast(@min(@as(u64, buffer.len), total - offset));
+        const got = try fixture.readPositionalAll(io, buffer[0..wanted], offset);
+        if (got == 0) return error.UnexpectedEndOfFile;
+        try image.pwrite(io, buffer[0..got], base + offset);
+        offset += got;
+    }
+}
+
+fn createMergeTestDisk(allocator: std.mem.Allocator, io: Io, path: []const u8) !void {
+    const cwd = Io.Dir.cwd();
+    cwd.deleteTree(io, merge_root_fixture_dir) catch {};
+    cwd.deleteTree(io, merge_boot_fixture_dir) catch {};
+    cwd.deleteFile(io, merge_root_fixture_image) catch {};
+    cwd.deleteFile(io, merge_boot_fixture_image) catch {};
+    defer cwd.deleteTree(io, merge_root_fixture_dir) catch {};
+    defer cwd.deleteTree(io, merge_boot_fixture_dir) catch {};
+    defer cwd.deleteFile(io, merge_root_fixture_image) catch {};
+    defer cwd.deleteFile(io, merge_boot_fixture_image) catch {};
+
+    // The root filesystem's own `/boot` is a non-empty stub, which is what
+    // makes shadowing rather than merging the only correct rule.
+    try cwd.createDirPath(io, merge_root_fixture_dir ++ "/boot/grub");
+    try cwd.createDirPath(io, merge_root_fixture_dir ++ "/etc");
+    try cwd.createDirPath(io, merge_root_fixture_dir ++ "/usr/bin");
+    try writeGeneralFixtureFile(io, merge_root_fixture_dir ++ "/etc/hostname", "merged\n");
+    try writeGeneralFixtureFile(io, merge_root_fixture_dir ++ "/usr/bin/tool", "tool\n");
+    try cwd.hardLink(
+        merge_root_fixture_dir ++ "/usr/bin/tool",
+        cwd,
+        merge_root_fixture_dir ++ "/usr/bin/tool-alias",
+        io,
+        .{},
+    );
+    try writeGeneralFixtureFile(io, merge_root_fixture_dir ++ "/boot/stale-vmlinuz", "stale\n");
+    try writeGeneralFixtureFile(io, merge_root_fixture_dir ++ "/boot/grub/grub.cfg", "stale\n");
+    try buildMergeExt4Fixture(
+        allocator,
+        merge_root_fixture_dir,
+        merge_root_fixture_image,
+        merge_root_sectors,
+    );
+
+    // `/boot/efi` has to exist in the boot filesystem, because that is the
+    // tree the ESP is mounted onto once `/boot` is in place.
+    try cwd.createDirPath(io, merge_boot_fixture_dir ++ "/efi");
+    try writeGeneralFixtureFile(io, merge_boot_fixture_dir ++ "/vmlinuz-6.1", "real kernel\n");
+    try buildMergeExt4Fixture(
+        allocator,
+        merge_boot_fixture_dir,
+        merge_boot_fixture_image,
+        merge_boot_sectors,
+    );
+
+    const script_path = "test-preserved-merge-debugfs.txt";
+    defer cwd.deleteFile(io, script_path) catch {};
+    try writeGeneralFixtureFile(io, script_path,
+        \\sif /vmlinuz-6.1 mode 0100640
+        \\sif /vmlinuz-6.1 uid 4242
+        \\sif /vmlinuz-6.1 gid 4343
+        \\ea_set /vmlinuz-6.1 security.selinux system_u:object_r:boot_t:s0
+        \\quit
+        \\
+    );
+    try runGeneralFixtureTool(allocator, "debugfs", &.{
+        "-w",
+        "-f",
+        script_path,
+        merge_boot_fixture_image,
+    });
+
+    var image = try Image.createExclusive(io, path, .raw, merge_disk_size, .{});
+    defer image.close(io);
+
+    var boot_record = mbr.Mbr{};
+    boot_record.entries[0] = .{
+        .bootable = true,
+        .partition_type = esp_partition_type,
+        .first_lba = merge_esp_first_lba,
+        .sector_count = merge_esp_sectors,
+    };
+    boot_record.entries[1] = .{
+        .partition_type = .linux,
+        .first_lba = merge_boot_first_lba,
+        .sector_count = merge_boot_sectors,
+    };
+    boot_record.entries[2] = .{
+        .partition_type = .linux,
+        .first_lba = merge_root_first_lba,
+        .sector_count = merge_root_sectors,
+    };
+    const encoded_mbr = boot_record.encode();
+    try image.pwrite(io, &encoded_mbr, 0);
+
+    // mkfs.vfat is not installed anywhere this runs, so the ESP is written
+    // with this project's own FAT32 writer.
+    const esp_offset = @as(u64, merge_esp_first_lba) * mbr.sector_size;
+    const esp_length = @as(u64, merge_esp_sectors) * mbr.sector_size;
+    try fat32.format(&image, io, .{
+        .partition_offset = esp_offset,
+        .partition_len = esp_length,
+    });
+    var esp = try fat32.open(&image, io, .{ .offset = esp_offset, .length = esp_length });
+    try esp.createDir(io, "EFI/BOOT");
+    try esp.writeFile(io, "EFI/BOOT/bootx64.efi", "esp payload\n");
+
+    try copyFixtureIntoPartition(
+        allocator,
+        io,
+        &image,
+        merge_boot_fixture_image,
+        merge_boot_first_lba,
+        merge_boot_sectors,
+    );
+    try copyFixtureIntoPartition(
+        allocator,
+        io,
+        &image,
+        merge_root_fixture_image,
+        merge_root_first_lba,
+        merge_root_sectors,
+    );
+}
+
+/// Copies one partition out of a disk so an external tool that only knows how
+/// to open a whole filesystem can be pointed at it.
+fn extractPartition(
+    allocator: std.mem.Allocator,
+    io: Io,
+    image: *Image,
+    first_lba: u32,
+    sectors: u32,
+    path: []const u8,
+) !void {
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+    const buffer = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(buffer);
+    const total = @as(u64, sectors) * mbr.sector_size;
+    const base = @as(u64, first_lba) * mbr.sector_size;
+    var offset: u64 = 0;
+    while (offset < total) {
+        const wanted: usize = @intCast(@min(@as(u64, buffer.len), total - offset));
+        if (try image.pread(io, buffer[0..wanted], base + offset) != wanted) {
+            return error.UnexpectedEndOfFile;
+        }
+        try file.writePositionalAll(io, buffer[0..wanted], offset);
+        offset += wanted;
+    }
+}
+
+test "rebuild merges an ESP and a boot filesystem into one root filesystem" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const source_path = "test-preserved-merge-source.raw";
+    const output_path = "test-preserved-merge-output.raw";
+    const extracted_path = "test-preserved-merge-extracted.img";
+    const artifacts = [_][]const u8{
+        source_path,
+        output_path,
+        extracted_path,
+        output_path ++ ".native-rebuild.raw",
+        output_path ++ ".native-rebuild.output",
+        output_path ++ ".native-rebuild.spool",
+    };
+    defer for (artifacts) |artifact| Io.Dir.cwd().deleteFile(io, artifact) catch {};
+    createMergeTestDisk(allocator, io, source_path) catch |err| switch (err) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return err,
+    };
+
+    // Deliberately non-default, to prove the synthesized FAT metadata is a
+    // caller's choice rather than a constant baked into the importer.
+    const esp_metadata = fat32.SynthesizedMetadata{
+        .directory_mode = 0o700,
+        .file_mode = 0o600,
+        .uid = 42,
+        .gid = 43,
+    };
+    const mounts = [_]SourceMount{
+        .{ .partition = .{ .mbr_index = 2 }, .target = "/boot" },
+        .{
+            .partition = .{ .mbr_index = 1 },
+            .target = "/boot/efi",
+            .fat_metadata = esp_metadata,
+        },
+    };
+    const options = RebuildOptions{
+        .source_path = source_path,
+        .output_path = output_path,
+        .expected_source_format = .raw,
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 3 },
+        .source_profile = .general,
+        .source_mounts = &mounts,
+        .source_date_epoch = 1_735_689_600,
+        .expected_virtual_size = merge_disk_size,
+    };
+
+    const inspection = try inspectRebuild(allocator, io, options);
+    try std.testing.expectEqual(@as(usize, 2), inspection.merged_source_count);
+    try std.testing.expect(!inspection.source_reproducible);
+
+    const report = try rebuild(allocator, io, options);
+    try std.testing.expectEqual(@as(usize, 2), report.merged_source_count);
+    // `boot/stale-vmlinuz`, `boot/grub` and `boot/grub/grub.cfg`: the whole
+    // stub the real boot filesystem hides.
+    try std.testing.expectEqual(@as(usize, 3), report.shadowed_node_count);
+    try std.testing.expectEqual(inspection.shadowed_node_count, report.shadowed_node_count);
+    try std.testing.expectEqual(inspection.imported_node_count, report.imported_node_count);
+    // Merging makes the output a function of three sources, not of the one
+    // the report names, so it can no longer be claimed reproducible from it.
+    try std.testing.expect(!report.source_reproducible);
+
+    var output = try Image.openPath(io, output_path);
+    defer output.close(io);
+
+    // Acceptance criterion: the ESP is still a partition of its own on the
+    // output disk, untouched, even though its contents are now also a
+    // directory inside the root filesystem.
+    var sector: [mbr.sector_size]u8 = undefined;
+    try std.testing.expectEqual(sector.len, try output.pread(io, &sector, 0));
+    const table = try mbr.Mbr.decode(&sector);
+    try std.testing.expectEqual(esp_partition_type, table.entries[0].partition_type);
+    try std.testing.expectEqual(merge_esp_sectors, table.entries[0].sector_count);
+    var esp_boot: [512]u8 = undefined;
+    const esp_offset = @as(u64, merge_esp_first_lba) * mbr.sector_size;
+    try std.testing.expectEqual(esp_boot.len, try output.pread(io, &esp_boot, esp_offset));
+    try std.testing.expectEqualSlices(u8, "FAT32   ", esp_boot[82..90]);
+
+    var reader = try ext4.openGeneral(io, output.file, allocator, .{
+        .offset = @as(u64, merge_root_first_lba) * mbr.sector_size,
+    });
+    defer reader.deinit();
+    var tree = try ext4.scanReadable(&reader, io, allocator, .{
+        .available_length = @as(u64, merge_root_sectors) * mbr.sector_size,
+    });
+    defer tree.deinit();
+
+    var saw_boot_dir = false;
+    var saw_efi_dir = false;
+    var saw_kernel = false;
+    var saw_payload = false;
+    var saw_esp_dir = false;
+    var saw_hardlink = false;
+    var index: usize = 0;
+    while (index < tree.nodeCount()) : (index += 1) {
+        const entry = tree.entryAt(index);
+        // Shadowing must be replacement, not a merge: nothing the root
+        // source had under `/boot` may survive the boot filesystem landing
+        // on top of it.
+        try std.testing.expect(!std.mem.eql(u8, entry.path, "boot/stale-vmlinuz"));
+        try std.testing.expect(!std.mem.eql(u8, entry.path, "boot/grub"));
+        try std.testing.expect(!std.mem.eql(u8, entry.path, "boot/grub/grub.cfg"));
+
+        if (std.mem.eql(u8, entry.path, "boot")) {
+            saw_boot_dir = true;
+            try std.testing.expectEqual(ext4.GeneralKind.directory, entry.kind);
+        }
+        if (std.mem.eql(u8, entry.path, "boot/efi")) {
+            saw_efi_dir = true;
+            try std.testing.expectEqual(ext4.GeneralKind.directory, entry.kind);
+            // The mount point takes the mounted filesystem's root metadata,
+            // exactly as a real mount does.
+            try std.testing.expectEqual(esp_metadata.directory_mode, entry.mode);
+            try std.testing.expectEqual(esp_metadata.uid, entry.uid);
+            try std.testing.expectEqual(esp_metadata.gid, entry.gid);
+        }
+        if (std.mem.eql(u8, entry.path, "boot/vmlinuz-6.1")) {
+            saw_kernel = true;
+            try std.testing.expectEqual(ext4.GeneralKind.file, entry.kind);
+            // Ownership, mode and xattrs survived being merged, not just
+            // being imported.
+            try std.testing.expectEqual(@as(u16, 0o640), entry.mode);
+            try std.testing.expectEqual(@as(u32, 4242), entry.uid);
+            try std.testing.expectEqual(@as(u32, 4343), entry.gid);
+            var found = false;
+            for (entry.xattrs) |xattr| {
+                if (!std.mem.eql(u8, xattr.name, "security.selinux")) continue;
+                try std.testing.expectEqualStrings(
+                    "system_u:object_r:boot_t:s0",
+                    xattr.value,
+                );
+                found = true;
+            }
+            try std.testing.expect(found);
+        }
+        if (std.mem.eql(u8, entry.path, "boot/efi/EFI")) {
+            saw_esp_dir = true;
+            try std.testing.expectEqual(esp_metadata.directory_mode, entry.mode);
+        }
+        if (std.mem.eql(u8, entry.path, "boot/efi/EFI/BOOT/bootx64.efi")) {
+            saw_payload = true;
+            try std.testing.expectEqual(ext4.GeneralKind.file, entry.kind);
+            try std.testing.expectEqual(esp_metadata.file_mode, entry.mode);
+            try std.testing.expectEqual(esp_metadata.uid, entry.uid);
+            try std.testing.expectEqual(esp_metadata.gid, entry.gid);
+            try std.testing.expectEqual(@as(u64, "esp payload\n".len), entry.size);
+        }
+        // Acceptance criterion: a hardlink pair wholly inside the root
+        // source is still a hardlink pair after the merge.
+        if (std.mem.eql(u8, entry.path, "usr/bin/tool-alias")) {
+            saw_hardlink = true;
+            try std.testing.expectEqual(ext4.GeneralKind.hardlink, entry.kind);
+            try std.testing.expectEqualStrings("usr/bin/tool", entry.hardlink_target);
+        }
+    }
+    try std.testing.expect(saw_boot_dir);
+    try std.testing.expect(saw_efi_dir);
+    try std.testing.expect(saw_kernel);
+    try std.testing.expect(saw_esp_dir);
+    try std.testing.expect(saw_payload);
+    try std.testing.expect(saw_hardlink);
+
+    try extractPartition(
+        allocator,
+        io,
+        &output,
+        merge_root_first_lba,
+        merge_root_sectors,
+        extracted_path,
+    );
+    try runGeneralFixtureTool(allocator, "e2fsck", &.{ "-f", "-n", extracted_path });
+}
+
+test "merged sources are refused before anything is opened when the mounts are ambiguous" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const source_path = "test-preserved-merge-reject-source.raw";
+    const output_path = "test-preserved-merge-reject-output.raw";
+    const artifacts = [_][]const u8{
+        source_path,
+        output_path,
+        output_path ++ ".native-rebuild.raw",
+        output_path ++ ".native-rebuild.output",
+        output_path ++ ".native-rebuild.spool",
+    };
+    defer for (artifacts) |artifact| Io.Dir.cwd().deleteFile(io, artifact) catch {};
+    createMergeTestDisk(allocator, io, source_path) catch |err| switch (err) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const base = RebuildOptions{
+        .source_path = source_path,
+        .output_path = output_path,
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 3 },
+        .source_profile = .general,
+        .source_date_epoch = 1_735_689_600,
+    };
+    const boot = SourceMount{ .partition = .{ .mbr_index = 2 }, .target = "/boot" };
+
+    const Case = struct {
+        mounts: []const SourceMount,
+        expected: anyerror,
+    };
+    const cases = [_]Case{
+        .{
+            .mounts = &.{ boot, .{ .partition = .{ .mbr_index = 2 }, .target = "/boot" } },
+            .expected = error.DuplicateMountTarget,
+        },
+        .{
+            .mounts = &.{
+                .{ .partition = .{ .mbr_index = 1 }, .target = "/boot/efi" },
+                boot,
+            },
+            .expected = error.MountTargetShadowedByLaterMount,
+        },
+        .{
+            .mounts = &.{.{ .partition = .{ .mbr_index = 2 }, .target = "boot" }},
+            .expected = error.MountTargetNotAbsolute,
+        },
+        .{
+            .mounts = &.{.{ .partition = .{ .mbr_index = 2 }, .target = "/boot/" }},
+            .expected = error.MountTargetNotNormalized,
+        },
+        .{
+            .mounts = &.{.{ .partition = .{ .mbr_index = 2 }, .target = "/" }},
+            .expected = error.MountTargetIsRoot,
+        },
+        // `/etc/hostname` is a file in the root source, and `/nowhere` is
+        // nothing at all. Neither is a mount point a real mount would accept.
+        .{
+            .mounts = &.{.{ .partition = .{ .mbr_index = 2 }, .target = "/etc/hostname" }},
+            .expected = error.MountTargetNotDirectory,
+        },
+        .{
+            .mounts = &.{.{ .partition = .{ .mbr_index = 2 }, .target = "/nowhere" }},
+            .expected = error.MissingMountTarget,
+        },
+        // The ESP is vfat, so the ext4 reader must not be handed it.
+        .{
+            .mounts = &.{.{
+                .partition = .{ .mbr_index = 1 },
+                .target = "/boot",
+                .filesystem = .ext4,
+            }},
+            .expected = error.BadMagic,
+        },
+    };
+    for (cases) |case| {
+        var options = base;
+        options.source_mounts = case.mounts;
+        try std.testing.expectError(case.expected, rebuild(allocator, io, options));
+        try expectRebuildArtifactsMissing(io, output_path);
+    }
+}
+
+test "filesystem detection names a merged source or refuses to guess" {
+    const io = std.testing.io;
+    const path = "test-preserved-detect.raw";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const length: u64 = 64 * 1024 * 1024;
+    var image = try Image.create(io, path, .raw, length, .{});
+    defer image.close(io);
+    const partition = Partition{ .offset = 0, .length = length };
+
+    // All zeros is neither, and a rebuild must say so rather than pick one.
+    try std.testing.expectError(
+        error.UnrecognizedSourceFilesystem,
+        resolveFilesystem(image, io, partition, .detect),
+    );
+
+    try fat32.format(&image, io, .{ .partition_offset = 0, .partition_len = length });
+    try std.testing.expectEqual(
+        ResolvedFilesystem.fat32,
+        try resolveFilesystem(image, io, partition, .detect),
+    );
+
+    // An ext4 superblock magic on top of the FAT boot sector describes two
+    // filesystems at once, which is corruption, not a preference.
+    var magic: [2]u8 = undefined;
+    std.mem.writeInt(u16, &magic, 0xEF53, .little);
+    try image.pwrite(io, &magic, 1024 + 0x38);
+    try std.testing.expectError(
+        error.AmbiguousSourceFilesystem,
+        resolveFilesystem(image, io, partition, .detect),
+    );
+
+    // A caller that already knows is never made to probe.
+    try std.testing.expectEqual(
+        ResolvedFilesystem.ext4,
+        try resolveFilesystem(image, io, partition, .ext4),
+    );
+}
+
+test "limits and peaks are accounted across every merged source, not per source" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const source_path = "test-preserved-merge-limits-source.raw";
+    const output_path = "test-preserved-merge-limits-output.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    createMergeTestDisk(allocator, io, source_path) catch |err| switch (err) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var base = RebuildOptions{
+        .source_path = source_path,
+        .output_path = output_path,
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 3 },
+        .source_profile = .general,
+        .source_date_epoch = 1_735_689_600,
+    };
+    const mounts = [_]SourceMount{
+        .{ .partition = .{ .mbr_index = 2 }, .target = "/boot" },
+        .{ .partition = .{ .mbr_index = 1 }, .target = "/boot/efi" },
+    };
+
+    var root_only = limits_mod.Diagnostic{};
+    base.limit_diagnostic = &root_only;
+    const alone = try inspectRebuild(allocator, io, base);
+
+    var combined = limits_mod.Diagnostic{};
+    var merged_options = base;
+    merged_options.source_mounts = &mounts;
+    merged_options.limit_diagnostic = &combined;
+    const merged = try inspectRebuild(allocator, io, merged_options);
+
+    // The peaks are sums over the sources, not the largest single source.
+    try std.testing.expect(combined.peaks.nodes > root_only.peaks.nodes);
+    try std.testing.expect(combined.peaks.total_bytes > root_only.peaks.total_bytes);
+    // And the spool has to hold every source's bytes, so the workspace
+    // requirement grows with them.
+    try std.testing.expect(
+        merged.workspace_space.spool_bytes > alone.workspace_space.spool_bytes,
+    );
+
+    // One below the combined total is still comfortably above what any one
+    // source needs on its own, so a per-source accounting would accept this
+    // import. A combined one must not.
+    const ceiling = combined.peaks.nodes - 1;
+    try std.testing.expect(ceiling >= root_only.peaks.nodes);
+
+    var breached = limits_mod.Diagnostic{};
+    var capped = merged_options;
+    capped.limit_diagnostic = &breached;
+    capped.limits.max_nodes = @intCast(ceiling);
+    try std.testing.expectError(
+        error.NodeLimitExceeded,
+        inspectRebuild(allocator, io, capped),
+    );
+    const breach = breached.exceeded orelse return error.MissingBreach;
+    try std.testing.expectEqual(limits_mod.Limit.nodes, breach.limit);
+    // The reported limit is the one the flag was set to. A scan that tripped
+    // the reduced per-source cap must never report the remainder, because no
+    // flag can be raised above a number that was never configured.
+    try std.testing.expectEqual(ceiling, breach.configured);
+    try std.testing.expect(breach.observed > breach.configured);
 }
