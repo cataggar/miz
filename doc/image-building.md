@@ -219,6 +219,73 @@ than degraded. Software emulation must be asked for by name, and is the only
 option for a cross-architecture run, since no accelerator crosses architectures.
 Whichever ran is recorded in provenance.
 
+## Import limits and scratch space
+
+Every import is bounded. The defaults are guardrails sized for a purpose-built
+image, not a statement about how large a real root filesystem is: a full server
+install with a desktop environment, a toolchain and vendor driver stacks
+routinely passes 1,000,000 inodes, and `--max-nodes` is the first wall it hits.
+Each limit is raisable on its own, and none is library-only.
+
+| Flag | Bounds | Default |
+| --- | --- | --- |
+| `--max-nodes` | imported inodes | 1000000 |
+| `--max-path-bytes` | longest imported path | 4096 |
+| `--max-component-bytes` | longest single path component | 255 |
+| `--max-file-bytes` | largest single imported file | 16G |
+| `--max-total-bytes` | total imported content | 64G |
+| `--max-spool-bytes` | spool file holding the imported content | 128G |
+| `--max-xattrs-per-node` | extended attributes on one inode | 256 |
+| `--max-xattr-bytes-per-node` | extended attribute bytes on one inode | 1M |
+| `--max-scan-metadata-bytes` | metadata a strict source scan may hold | 256M |
+| `--max-source-file-bytes` | largest host file an operation may read in | 1G |
+
+Values accept the same binary suffixes as `--size` (`4M` is 4194304), which is
+why a count such as `--max-nodes 8M` is accepted and means 8388608.
+
+`zvmi build-image` takes the eight that bound the tree it builds. The
+`std.Build` helpers (`zvmi_image.add`, `zvmi_image.addPreserved`) take all of
+them as `limits`, and the preserved-image builder takes all of them, including
+the two that only a source scan and an operation can reach.
+
+Exceeding one is reported with everything needed to retry:
+
+```
+build-image: failed: error.NodeLimitExceeded: 1000001 nodes exceeds the configured limit of 1000000; raise it with --max-nodes <value>
+raise the limit with --max-nodes 1000001 or higher, or import less content.
+```
+
+The same breach reaches a build graph as a `limit_exceeded` diagnostic in
+`diagnostics.json`, with the flag in its `remediation` field.
+
+Every run also reports the peak each limit actually reached, so the next run
+can be sized from a measurement instead of a guess. `zvmi build-image` prints
+them, `--dry-run` included:
+
+```
+  peak nodes: 41231 of 1000000 (--max-nodes)
+  peak bytes: 2402161 of 17179869184 (--max-file-bytes)
+```
+
+`preserved_image.rebuild` and `preserved_image.inspectRebuild` return the same
+figures as `limit_peaks`, and provenance records them under
+`execution.limit_peaks`.
+
+### Scratch space
+
+A rebuild spools a full copy of every imported file byte, so importing a 35 GB
+source needs about 35 GB of scratch space on the filesystem holding the output,
+plus the raw staging image (the source's full virtual size), plus the converted
+or compressed artifact when the output is not raw. That last one is free for an
+uncompressed raw output, which is published by renaming the stage.
+
+The check runs before the spool is created, so a workspace that cannot hold the
+import is refused with `error.InsufficientWorkspaceSpace` up front rather than
+discovered most of the way through a long copy. A host whose free space cannot
+be determined skips the check: unknown is not the same as too little.
+`inspectRebuild` reports `workspace_space` without enforcing it, since it
+creates no files and the caller may free space before committing.
+
 ## Compressed and streamed output
 
 `-O raw.gz` and `-O raw.zst` produce a compressed raw image. The compressor
