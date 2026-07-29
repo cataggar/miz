@@ -21,18 +21,24 @@ const Io = std.Io;
 const vhd = @import("vhd.zig");
 const vhdx = @import("vhdx.zig");
 const qcow2 = @import("qcow2.zig");
+const block_device = @import("block_device.zig");
 pub const Format = @import("formats.zig").Format;
 
 pub const OpenError = error{
     UnsupportedVhdDiskType,
     InvalidBlockSize,
-} || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError ||
+} || block_device.ProbeError || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError ||
     vhd.Footer.DecodeError || vhd.DynamicHeader.DecodeError || vhdx.OpenError || qcow2.OpenError;
 
 pub const CreateError = error{
     SizeNotSectorAligned,
     UnsupportedFormatForCreate,
-} || Io.File.OpenError || Io.File.WritePositionalError || Io.File.SetLengthError || vhdx.CreateError || qcow2.CreateError;
+    /// `create` never writes through a block-device node: creating an image
+    /// means laying down a fresh format from byte 0, which on a device means
+    /// destroying whatever system is installed on it.
+    BlockDeviceCreateNotSupported,
+} || Io.File.OpenError || Io.File.WritePositionalError || Io.File.SetLengthError ||
+    Io.File.StatError || vhdx.CreateError || qcow2.CreateError;
 
 pub const VhdSubformat = enum { fixed, dynamic };
 
@@ -80,6 +86,61 @@ const DynamicState = struct {
 
 const VhdxState = vhdx.Info;
 
+/// Extra state carried by images whose bytes live on a block-device node
+/// (`/dev/nvme0n1`, `/dev/sda`, `/dev/mapper/vg-lv`, ...) rather than in a
+/// regular file.
+pub const DeviceInfo = struct {
+    /// Kernel-reported geometry. `geometry.size_bytes` -- not the `stat`
+    /// size, which is always 0 for a device node -- is the authoritative
+    /// size of the image, and is what `virtual_size` reflects for a
+    /// device-backed raw image.
+    geometry: block_device.Geometry,
+    /// Whether the caller explicitly opted in to writing through the device
+    /// node. False unless `OpenOptions.allow_device_write` was set, in which
+    /// case every mutating operation fails with
+    /// `error.BlockDeviceWriteNotPermitted`.
+    write_allowed: bool,
+};
+
+pub const OpenOptions = struct {
+    /// Whether the caller intends to write through the returned image. A
+    /// regular file is opened `read_write` when this is set, `read_only`
+    /// otherwise.
+    write: bool = true,
+    /// Reject qcow2 backing and external data files instead of opening the
+    /// host paths named by the image header.
+    standalone_qcow2: bool = false,
+    /// Opt in (`zvmi --allow-device-write`) to writing through a
+    /// block-device node. Without it, a device is opened read-only even when
+    /// `write` is set, so that inspecting a live disk can never damage it by
+    /// accident.
+    allow_device_write: bool = false,
+};
+
+/// Where an image's authoritative size comes from, resolved once at open
+/// time and then used in place of the `stat` size for format sniffing.
+const Source = union(enum) {
+    /// A regular file: `stat` reports the real size.
+    file: u64,
+    /// A block-device node: `stat` reports `st_size == 0`, so the size comes
+    /// from the kernel instead.
+    device: DeviceInfo,
+
+    fn sizeBytes(self: Source) u64 {
+        return switch (self) {
+            .file => |size| size,
+            .device => |dev| dev.geometry.size_bytes,
+        };
+    }
+
+    fn deviceInfo(self: Source) ?DeviceInfo {
+        return switch (self) {
+            .file => null,
+            .device => |dev| dev,
+        };
+    }
+};
+
 pub const Image = struct {
     file: Io.File,
     format: Format,
@@ -91,33 +152,57 @@ pub const Image = struct {
     dynamic: ?DynamicState = null,
     vhdx: ?VhdxState = null,
     qcow2: ?qcow2.Info = null,
+    /// Non-null when `file` is a block-device node instead of a regular file.
+    device: ?DeviceInfo = null,
 
     pub fn openPath(io: Io, path: []const u8) OpenError!Image {
-        const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
-        errdefer file.close(io);
-        return openFileWithPath(io, file, path, false);
+        return openPathWithOptions(io, path, .{});
     }
 
     /// Opens an image and all path-relative backing files without write access.
     /// Mutating methods on the returned image fail through the underlying
     /// read-only file handle.
     pub fn openPathReadOnly(io: Io, path: []const u8) OpenError!Image {
-        const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
-        errdefer file.close(io);
-        return openFileWithPath(io, file, path, false);
+        return openPathWithOptions(io, path, .{ .write = false });
     }
 
     /// Opens an image read-only while rejecting QCOW2 backing and external
     /// data paths before they can cause host-file I/O.
     pub fn openPathReadOnlyStandalone(io: Io, path: []const u8) OpenError!Image {
-        const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+        return openPathWithOptions(io, path, .{ .write = false, .standalone_qcow2 = true });
+    }
+
+    /// Opens `path`, which may name a regular image file or a block-device
+    /// node. Devices are opened read-only unless
+    /// `options.allow_device_write` is set.
+    pub fn openPathWithOptions(io: Io, path: []const u8, options: OpenOptions) OpenError!Image {
+        // Classify the path *before* opening it so a writable descriptor
+        // onto a live disk is never created in the first place. A failure
+        // here is deliberately not diagnosed separately: the open below
+        // reports the same underlying problem with a better error.
+        const path_is_device = if (Io.Dir.cwd().statFile(io, path, .{})) |path_stat|
+            path_stat.kind == .block_device
+        else |_|
+            false;
+        const write = options.write and (!path_is_device or options.allow_device_write);
+
+        const file = try Io.Dir.cwd().openFile(io, path, .{
+            .mode = if (write) .read_write else .read_only,
+        });
         errdefer file.close(io);
-        return openFileWithPath(io, file, path, true);
+        return openFileWithPath(io, file, path, options);
     }
 
     /// Takes ownership of `file` (closing the returned `Image` closes it).
     pub fn openFile(io: Io, file: Io.File) OpenError!Image {
-        return openFileWithPath(io, file, null, false);
+        return openFileWithPath(io, file, null, .{});
+    }
+
+    /// Takes ownership of `file`, which may be an already-open block-device
+    /// handle. Only writes through a device when the caller opted in with
+    /// `options.allow_device_write` *and* opened the handle writable.
+    pub fn openFileWithOptions(io: Io, file: Io.File, options: OpenOptions) OpenError!Image {
+        return openFileWithPath(io, file, null, options);
     }
 
     /// Takes ownership of a standalone qcow2 file without resolving or
@@ -149,9 +234,47 @@ pub const Image = struct {
         io: Io,
         file: Io.File,
         path: ?[]const u8,
-        standalone_qcow2: bool,
+        options: OpenOptions,
     ) OpenError!Image {
-        const file_size = (try file.stat(io)).size;
+        const file_stat = try file.stat(io);
+        // The kind of the *opened handle* -- not of the path stat'ed before
+        // opening -- decides device treatment, so a path swapped between the
+        // two still cannot be written through without the opt-in.
+        const source: Source = switch (file_stat.kind) {
+            .block_device => .{ .device = .{
+                .geometry = try block_device.probe(file),
+                .write_allowed = options.write and options.allow_device_write,
+            } },
+            else => .{ .file = file_stat.size },
+        };
+
+        return openFileFromSource(io, file, path, options.standalone_qcow2, source);
+    }
+
+    /// Opens `file` against an already-resolved `source`, stamping the
+    /// device state onto whatever format was sniffed.
+    fn openFileFromSource(
+        io: Io,
+        file: Io.File,
+        path: ?[]const u8,
+        standalone_qcow2: bool,
+        source: Source,
+    ) OpenError!Image {
+        var image = try sniffFormat(io, file, path, standalone_qcow2, source.sizeBytes());
+        image.device = source.deviceInfo();
+        return image;
+    }
+
+    /// Sniffs the format at `source`'s authoritative size. Every read stays
+    /// within that size, so a device is never read past its end even though
+    /// the VHD probe works backwards from the last sector.
+    fn sniffFormat(
+        io: Io,
+        file: Io.File,
+        path: ?[]const u8,
+        standalone_qcow2: bool,
+        file_size: u64,
+    ) OpenError!Image {
 
         // qcow2 and VHDX signatures both live at the very start of the file
         // (unlike VHD's footer, which trails the data); sniff them first so
@@ -272,6 +395,7 @@ pub const Image = struct {
         exclusive: bool,
     ) CreateError!Image {
         try validateCreate(format, size, options);
+        try rejectDeviceTarget(existingTargetKind(io, path));
 
         const file = try Io.Dir.cwd().createFile(io, path, .{
             .read = true,
@@ -289,6 +413,7 @@ pub const Image = struct {
     pub fn createFile(io: Io, file: Io.File, format: Format, size: u64, options: CreateOptions) CreateError!Image {
         errdefer file.close(io);
         try validateCreate(format, size, options);
+        try rejectDeviceTarget((try file.stat(io)).kind);
         try file.setLength(io, 0);
         return initializeFile(io, file, format, size, options);
     }
@@ -328,6 +453,22 @@ pub const Image = struct {
                 return .{ .file = file, .format = .vhdx, .data_offset = 0, .virtual_size = size, .vhdx = vhdx_info };
             },
         }
+    }
+
+    /// Reports the kind of an existing `path`, or `.unknown` when it cannot
+    /// be classified. A stat failure is not diagnosed here -- the usual case
+    /// is a path that does not exist yet, which is exactly what `create` is
+    /// for, and any real problem resurfaces from the create call itself.
+    fn existingTargetKind(io: Io, path: []const u8) Io.File.Kind {
+        const target_stat = Io.Dir.cwd().statFile(io, path, .{}) catch return .unknown;
+        return target_stat.kind;
+    }
+
+    /// `create` lays a fresh format down from byte 0 and truncates whatever
+    /// was there, so pointing it at a device node would destroy the disk it
+    /// names. Refuse before anything is opened or written.
+    fn rejectDeviceTarget(kind: Io.File.Kind) CreateError!void {
+        if (kind == .block_device) return error.BlockDeviceCreateNotSupported;
     }
 
     fn validateCreate(format: Format, size: u64, options: CreateOptions) CreateError!void {
@@ -398,7 +539,12 @@ pub const Image = struct {
     }
 
     pub fn info(self: Image, io: Io) Io.File.StatError!Info {
-        const file_size = (try self.file.stat(io)).size;
+        // A device node's `stat` size is 0, so its occupied size is its full
+        // extent: nothing about a device is sparse.
+        const file_size = if (self.device) |dev|
+            dev.geometry.size_bytes
+        else
+            (try self.file.stat(io)).size;
         const subformat: ?VhdSubformat = if (self.format != .vhd)
             null
         else if (self.dynamic != null) .dynamic else .fixed;
@@ -437,9 +583,19 @@ pub const Image = struct {
         return self.file.readPositionalAll(io, buffer, self.data_offset + offset);
     }
 
-    pub const PwriteError = vhdx.PwriteError || qcow2.PwriteError || Io.File.ReadPositionalError || Io.File.WritePositionalError || Io.File.SetLengthError || Io.File.StatError;
+    pub const PwriteError = error{
+        /// The image is backed by a block-device node opened without the
+        /// explicit `allow_device_write` opt-in.
+        BlockDeviceWriteNotPermitted,
+    } || vhdx.PwriteError || qcow2.PwriteError || Io.File.ReadPositionalError || Io.File.WritePositionalError || Io.File.SetLengthError || Io.File.StatError;
 
     pub fn pwrite(self: *Image, io: Io, buffer: []const u8, offset: u64) PwriteError!void {
+        // Checked here rather than only at open time so that every write
+        // path -- partition tables, filesystems, customization -- is covered
+        // by the single opt-in, whatever route it took to this image.
+        if (self.device) |dev| {
+            if (!dev.write_allowed) return error.BlockDeviceWriteNotPermitted;
+        }
         if (self.vhdx) |*v| return vhdx.pwrite(self.file, io, v, buffer, offset);
         if (self.qcow2) |*q| return qcow2.pwrite(self.file, io, q, buffer, offset);
         if (self.dynamic) |*d| {
@@ -475,6 +631,10 @@ pub const Image = struct {
     pub const ResizeError = error{
         ShrinkNotSupported,
         ExceedsAllocatedBatCapacity,
+        /// A block device's size is fixed by the device itself; growing it
+        /// is the job of whatever provides it (partitioning tool, LVM,
+        /// hypervisor), not of an image writer.
+        BlockDeviceResizeNotSupported,
     } || vhdx.ResizeError || qcow2.ResizeError || Io.File.SetLengthError || Io.File.WritePositionalError || Io.File.ReadPositionalError || Io.File.StatError;
 
     /// Changes the guest-visible virtual size. Growing is supported for all
@@ -485,8 +645,13 @@ pub const Image = struct {
     /// (`error.ShrinkNotSupported`) since it requires format-specific data
     /// loss handling that qemu-img itself guards behind `--shrink`. qcow2
     /// grows its L1/refcount metadata on demand; VHDX grows its BAT region
-    /// and virtual-size metadata on demand.
+    /// and virtual-size metadata on demand. Device-backed images are
+    /// rejected outright (`error.BlockDeviceResizeNotSupported`).
     pub fn resize(self: *Image, io: Io, new_size: u64) ResizeError!void {
+        // Rejected before the no-op and shrink checks so that "resize a
+        // device" always reports the real reason, even when the requested
+        // size happens to match what the device already is.
+        if (self.device != null) return error.BlockDeviceResizeNotSupported;
         if (new_size < self.virtual_size) return error.ShrinkNotSupported;
         if (new_size == self.virtual_size) return;
 
@@ -558,7 +723,10 @@ pub const Image = struct {
             return .{ .ok = true, .message = "qcow2 header/L1/L2 checks passed" };
         }
 
-        const file_size = (try self.file.stat(io)).size;
+        const file_size = if (self.device) |dev|
+            dev.geometry.size_bytes
+        else
+            (try self.file.stat(io)).size;
         if (file_size < vhd.footer_size) return .{ .ok = false, .message = "file too small for a VHD footer" };
 
         var footer_buf: [vhd.footer_size]u8 = undefined;
@@ -1285,4 +1453,210 @@ test "Image creates, writes, resizes, and reopens VHDX images" {
     try std.testing.expectEqual(false, extents[2].allocated);
     try std.testing.expectEqual(true, extents[3].allocated);
     try std.testing.expectEqual(false, extents[4].allocated);
+}
+
+// ---- block-device-backed images ----
+//
+// A real device node can't be assumed on any test runner, so these stub out
+// the one part that genuinely needs one -- the `BLKGETSIZE64`/`BLKSSZGET`
+// probe -- and run everything downstream of it (size resolution, sniffing
+// bounds, write enforcement) through exactly the same code the `/dev/...`
+// open path uses.
+
+fn openAsSyntheticDevice(
+    io: Io,
+    file: Io.File,
+    geometry: block_device.Geometry,
+    write_allowed: bool,
+) OpenError!Image {
+    return Image.openFileFromSource(io, file, null, false, .{ .device = .{
+        .geometry = geometry,
+        .write_allowed = write_allowed,
+    } });
+}
+
+test "a device-backed image takes its size from the kernel probe, not from stat" {
+    const io = std.testing.io;
+    const path = "test-device-size.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // Deliberately larger on disk than the "device" reports: the probed size
+    // has to win, the way it does for a device node whose `stat` size is 0.
+    const device_size: u64 = 512 * 1024;
+    {
+        var img = try Image.create(io, path, .raw, 1024 * 1024, .{});
+        img.close(io);
+    }
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    var img = try openAsSyntheticDevice(io, file, .{
+        .size_bytes = device_size,
+        .logical_sector_size = 512,
+    }, false);
+    defer img.close(io);
+
+    try std.testing.expectEqual(Format.raw, img.format);
+    try std.testing.expectEqual(device_size, img.virtual_size);
+    try std.testing.expectEqual(@as(u32, 512), img.device.?.geometry.logical_sector_size);
+
+    // `stat` would report 0 for a real device node, so `info` must fall back
+    // to the probed size for the occupied size too.
+    const stat = try img.info(io);
+    try std.testing.expectEqual(device_size, stat.file_size);
+    try std.testing.expectEqual(device_size, stat.virtual_size);
+
+    const extents = try img.mapExtents(io, std.testing.allocator);
+    defer std.testing.allocator.free(extents);
+    try std.testing.expectEqual(@as(usize, 1), extents.len);
+    try std.testing.expectEqual(device_size, extents[0].length);
+}
+
+test "format sniffing still runs on a device, bounded by the reported size" {
+    const io = std.testing.io;
+    const path = "test-device-vhd-probe.vhd";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const disk_size: u64 = 512 * 1024;
+    {
+        var img = try Image.create(io, path, .vhd, disk_size, .{ .vhd_subformat = .fixed });
+        img.close(io);
+    }
+
+    {
+        // The whole fixed VHD, footer included, is inside the device: sniff
+        // it exactly as a file-backed image would be sniffed.
+        const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+        var img = try openAsSyntheticDevice(io, file, .{
+            .size_bytes = disk_size + vhd.footer_size,
+            .logical_sector_size = 512,
+        }, false);
+        defer img.close(io);
+        try std.testing.expectEqual(Format.vhd, img.format);
+        try std.testing.expectEqual(disk_size, img.virtual_size);
+    }
+
+    {
+        // The same bytes behind a device that reports a smaller size: the
+        // footer now sits past the device's end, so the probe must not see
+        // it and must not claim a virtual size the device cannot back.
+        const short_size: u64 = 64 * 1024;
+        const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+        var img = try openAsSyntheticDevice(io, file, .{
+            .size_bytes = short_size,
+            .logical_sector_size = 512,
+        }, false);
+        defer img.close(io);
+        try std.testing.expectEqual(Format.raw, img.format);
+        try std.testing.expectEqual(short_size, img.virtual_size);
+    }
+}
+
+test "a device opened without the write opt-in refuses every write" {
+    const io = std.testing.io;
+    const path = "test-device-readonly.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const device_size: u64 = 64 * 1024;
+    {
+        var img = try Image.create(io, path, .raw, device_size, .{});
+        img.close(io);
+    }
+
+    {
+        const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+        var img = try openAsSyntheticDevice(io, file, .{
+            .size_bytes = device_size,
+            .logical_sector_size = 512,
+        }, false);
+        defer img.close(io);
+
+        // The handle itself is writable here, proving the refusal comes from
+        // the missing opt-in and not merely from the open mode.
+        try std.testing.expectError(
+            error.BlockDeviceWriteNotPermitted,
+            img.pwrite(io, "installed system", 0),
+        );
+    }
+
+    {
+        const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+        var img = try openAsSyntheticDevice(io, file, .{
+            .size_bytes = device_size,
+            .logical_sector_size = 512,
+        }, false);
+        defer img.close(io);
+
+        var buf: [16]u8 = undefined;
+        _ = try img.pread(io, &buf, 0);
+        try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &buf);
+    }
+}
+
+test "a device opened with the write opt-in writes through" {
+    const io = std.testing.io;
+    const path = "test-device-writable.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const device_size: u64 = 64 * 1024;
+    {
+        var img = try Image.create(io, path, .raw, device_size, .{});
+        img.close(io);
+    }
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    var img = try openAsSyntheticDevice(io, file, .{
+        .size_bytes = device_size,
+        .logical_sector_size = 512,
+    }, true);
+    defer img.close(io);
+
+    try img.pwrite(io, "installed system", 1024);
+    var buf: [16]u8 = undefined;
+    _ = try img.pread(io, &buf, 1024);
+    try std.testing.expectEqualSlices(u8, "installed system", &buf);
+}
+
+test "resize is rejected on a device-backed image" {
+    const io = std.testing.io;
+    const path = "test-device-resize.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const device_size: u64 = 64 * 1024;
+    {
+        var img = try Image.create(io, path, .raw, device_size, .{});
+        img.close(io);
+    }
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    var img = try openAsSyntheticDevice(io, file, .{
+        .size_bytes = device_size,
+        .logical_sector_size = 512,
+    }, true);
+    defer img.close(io);
+
+    // Rejected for every direction, including the no-op, so the diagnostic
+    // is always about the device rather than about the requested size.
+    try std.testing.expectError(error.BlockDeviceResizeNotSupported, img.resize(io, device_size * 2));
+    try std.testing.expectError(error.BlockDeviceResizeNotSupported, img.resize(io, device_size));
+    try std.testing.expectError(error.BlockDeviceResizeNotSupported, img.resize(io, device_size / 2));
+    try std.testing.expectEqual(device_size, img.virtual_size);
+}
+
+test "create refuses a block-device target and accepts ordinary ones" {
+    const io = std.testing.io;
+    try std.testing.expectError(
+        error.BlockDeviceCreateNotSupported,
+        Image.rejectDeviceTarget(.block_device),
+    );
+    try Image.rejectDeviceTarget(.file);
+    try Image.rejectDeviceTarget(.unknown);
+
+    const path = "test-create-target-kind.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    try std.testing.expectEqual(Io.File.Kind.unknown, Image.existingTargetKind(io, path));
+    {
+        var img = try Image.create(io, path, .raw, 4096, .{});
+        img.close(io);
+    }
+    try std.testing.expectEqual(Io.File.Kind.file, Image.existingTargetKind(io, path));
 }

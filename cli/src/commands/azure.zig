@@ -1,6 +1,6 @@
 //! `zvmi azure derive --input-sha256 <hex> <input.qcow2> <output.vhd>`
 //! `zvmi azure fixup [--generation 1|2] <file>`
-//! `zvmi azure deprovision [--user <username>] <file>`
+//! `zvmi azure deprovision [--user <username>] [--allow-device-write] <file>`
 //!
 //! Fixed VHD inputs are updated in place. Other supported image formats are
 //! converted to a sibling fixed VHD named `<input-basename>.vhd`.
@@ -19,7 +19,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
 
 const usage = "usage: zvmi azure derive --input-sha256 <hex> [--expected-virtual-size <size>] [--max-input-size <size>] [--max-virtual-size <size>] [--max-output-size <size>] <input.qcow2> <output.vhd>\n" ++
     "       zvmi azure fixup [--generation 1|2] <file>\n" ++
-    "       zvmi azure deprovision [--user <username>] <file>";
+    "       zvmi azure deprovision [--user <username>] [--allow-device-write] <file>";
 
 fn runDerive(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
     var input_sha256: ?zvmi.artifact_pipeline.Digest = null;
@@ -270,6 +270,7 @@ fn derivedVhdPath(allocator: std.mem.Allocator, input_path: []const u8) std.mem.
 
 fn runDeprovision(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
     var username: ?[]const u8 = null;
+    var allow_device_write = false;
     var path: ?[]const u8 = null;
 
     var i: usize = 0;
@@ -279,6 +280,8 @@ fn runDeprovision(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) 
             i += 1;
             if (i >= rest.len) return fail("azure deprovision: --user requires an argument", .{});
             username = rest[i];
+        } else if (std.mem.eql(u8, a, "--allow-device-write")) {
+            allow_device_write = true;
         } else if (path == null) {
             path = a;
         } else {
@@ -286,9 +289,18 @@ fn runDeprovision(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) 
         }
     }
 
-    const file_path = path orelse return fail("usage: zvmi azure deprovision [--user <username>] <file>", .{});
+    const file_path = path orelse return fail(
+        "usage: zvmi azure deprovision [--user <username>] [--allow-device-write] <file>",
+        .{},
+    );
 
-    var img = zvmi.Image.openPath(io, file_path) catch |err|
+    // Deprovisioning an installed system in place is the one workflow here
+    // that legitimately writes to a live disk, so it is where the
+    // block-device write opt-in is offered. Without it a `/dev/...` target
+    // opens read-only and the first write fails.
+    var img = zvmi.Image.openPathWithOptions(io, file_path, .{
+        .allow_device_write = allow_device_write,
+    }) catch |err|
         return fail("azure deprovision: failed to open '{s}': {s}", .{ file_path, @errorName(err) });
     defer img.close(io);
 

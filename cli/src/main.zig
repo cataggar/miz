@@ -32,7 +32,7 @@ const usage =
     \\  map [--output=human|json] <file>
     \\  azure derive --input-sha256 <hex> [--expected-virtual-size <size>] <input.qcow2> <output.vhd>
     \\  azure fixup [--generation 1|2] <file>  # defaults to Gen2; non-VHD becomes <basename>.vhd
-    \\  azure deprovision [--user <username>] <file>
+    \\  azure deprovision [--user <username>] [--allow-device-write] <file>
     \\  cosi <disk-image> -o <output.cosi>
     \\  oci copy|inspect|list-tags
     \\  build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}> [--skip-iso-rootfs] [--esp-size <size>] [--root-selinux-label <context>] [--boot-mode bls|uki|both] [--stub-source-path <path>] [--verity]

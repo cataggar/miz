@@ -32,6 +32,8 @@ zvmi azure fixup disk.qcow2                   # converts to disk.vhd, then pads 
 zvmi azure fixup --generation 1 legacy.vhd   # explicit legacy BIOS/MBR validation
 zvmi azure deprovision disk.vhd                    # generalize: reset hostname/SSH host keys/machine-id/DHCP state
 zvmi azure deprovision --user azureuser disk.vhd   # also removes that user account + its home directory
+zvmi azure deprovision --allow-device-write /dev/sda  # generalize an installed system in place on a block device
+zvmi info /dev/sda                           # inspect a block device (Linux); devices are read-only by default
 zvmi cosi disk.img -o disk.cosi              # tar + metadata.json + per-partition raw.zst
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.vhd  # Gen2 default
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.raw -O raw
@@ -121,6 +123,38 @@ Azure still requires every generalized-VM deployment to supply an
 managed-data-disk activation by stable Azure LUN at `/e` through `/z`. Managed
 disks are mount-only: existing ext4 partition 1 is mounted, while blank and
 unknown layouts are left untouched.
+
+### Reading a block device
+
+Every command that opens an image by path also accepts a block-device node,
+so an already-installed system can be inspected without first copying it into
+an image file:
+
+```
+zvmi info /dev/sda            # physical or attached disk
+zvmi map /dev/nvme0n1
+zvmi info /dev/mapper/vg-lv   # a logical volume, read through device-mapper
+```
+
+`stat(2)` reports `st_size == 0` for a device node, so the size comes from
+the kernel (`BLKGETSIZE64`, plus `BLKSSZGET` for the logical sector size)
+instead, and that size is authoritative: format sniffing, the trailing VHD
+footer probe, and `expected_virtual_size` checks all work against it, and
+never read past the device's end. A device with no medium (an unbound loop
+device, an empty optical drive) is reported as `EmptyBlockDevice` rather than
+opened as a zero-length image. Only Linux is supported; elsewhere a device
+node is rejected with `UnsupportedBlockDevice`.
+
+Devices are opened **read-only** even when the command would open a regular
+file for writing, so inspecting a live disk cannot damage it. Consequently:
+
+- `zvmi create` refuses a device path outright.
+- `zvmi resize` refuses a device: its size belongs to whatever provides it.
+- Writing through a device requires an explicit opt-in --
+  `zvmi azure deprovision --allow-device-write /dev/sda`, or
+  `Image.openPathWithOptions(io, path, .{ .allow_device_write = true })` from
+  the library. Without it, every write fails with
+  `BlockDeviceWriteNotPermitted`.
 
 ### Preserved-image customization backends
 

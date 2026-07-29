@@ -15,6 +15,16 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         return fail("resize: failed to open '{s}': {s}", .{ path, @errorName(err) });
     defer img.close(io);
 
+    // Reported before parsing the size so the diagnostic names the real
+    // problem: a device's size comes from whatever provides the device, and
+    // no size argument could make this succeed.
+    if (img.device != null) {
+        return fail(
+            "resize: '{s}' is a block device; resize it through whatever provides it (partition table, LVM, hypervisor) instead",
+            .{path},
+        );
+    }
+
     const relative = size_arg.len > 0 and size_arg[0] == '+';
     const magnitude_str = if (relative) size_arg[1..] else size_arg;
     const magnitude = zvmi.parseSize(magnitude_str) catch |err|
