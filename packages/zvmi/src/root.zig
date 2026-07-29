@@ -51,6 +51,7 @@ pub const verity = @import("verity.zig");
 pub const authenticode = @import("authenticode.zig");
 pub const uki_certificate = @import("uki_certificate.zig");
 pub const block_device = @import("block_device.zig");
+pub const output = @import("output.zig");
 const image_mod = @import("image.zig");
 const size_mod = @import("size.zig");
 
@@ -62,6 +63,10 @@ pub const OpenOptions = image_mod.OpenOptions;
 pub const DeviceInfo = image_mod.DeviceInfo;
 pub const VhdSubformat = image_mod.VhdSubformat;
 pub const copyAll = image_mod.copyAll;
+
+pub const OutputSpec = output.Spec;
+pub const Compression = output.Compression;
+pub const OutputDestination = output.Destination;
 
 pub const parseSize = size_mod.parseSize;
 

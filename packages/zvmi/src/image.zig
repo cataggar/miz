@@ -986,7 +986,9 @@ pub fn copyAll(io: Io, src: Image, dst: *Image, allocator: std.mem.Allocator) Co
     }
 }
 
-fn isAllZero(buf: []const u8) bool {
+/// Public because the streaming output path in `output.zig` needs exactly
+/// the same "is this chunk worth writing" test that `copyAll` uses.
+pub fn isAllZero(buf: []const u8) bool {
     for (buf) |b| {
         if (b != 0) return false;
     }
