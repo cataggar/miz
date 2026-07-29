@@ -59,22 +59,49 @@ const errors_continue: u16 = 0x0001;
 const creator_os_linux: u32 = 0;
 const rev_dynamic: u32 = 1;
 
+const feature_compat_dir_prealloc: u32 = 0x0001;
+const feature_compat_imagic_inodes: u32 = 0x0002;
 const feature_compat_has_journal: u32 = 0x0004;
 const feature_compat_ext_attr: u32 = 0x0008;
 const feature_compat_resize_inode: u32 = 0x0010;
 const feature_compat_dir_index: u32 = 0x0020;
+const feature_compat_sparse_super2: u32 = 0x0200;
+const feature_compat_fast_commit: u32 = 0x0400;
+const feature_compat_stable_inodes: u32 = 0x0800;
 const feature_compat_orphan_file: u32 = 0x1000;
+const feature_incompat_compression: u32 = 0x0001;
 const feature_incompat_filetype: u32 = 0x0002;
+const feature_incompat_recover: u32 = 0x0004;
+const feature_incompat_journal_dev: u32 = 0x0008;
+const feature_incompat_meta_bg: u32 = 0x0010;
 const feature_incompat_extents: u32 = 0x0040;
 const feature_incompat_64bit: u32 = 0x0080;
+const feature_incompat_mmp: u32 = 0x0100;
 const feature_incompat_flex_bg: u32 = 0x0200;
+const feature_incompat_ea_inode: u32 = 0x0400;
+const feature_incompat_dirdata: u32 = 0x1000;
 const feature_incompat_csum_seed: u32 = 0x2000;
+const feature_incompat_largedir: u32 = 0x4000;
+const feature_incompat_inline_data: u32 = 0x8000;
+const feature_incompat_encrypt: u32 = 0x0001_0000;
+const feature_incompat_casefold: u32 = 0x0002_0000;
 const feature_ro_compat_sparse_super: u32 = 0x0001;
 const feature_ro_compat_large_file: u32 = 0x0002;
+const feature_ro_compat_btree_dir: u32 = 0x0004;
 const feature_ro_compat_huge_file: u32 = 0x0008;
+const feature_ro_compat_gdt_csum: u32 = 0x0010;
 const feature_ro_compat_dir_nlink: u32 = 0x0020;
 const feature_ro_compat_extra_isize: u32 = 0x0040;
+const feature_ro_compat_has_snapshot: u32 = 0x0080;
+const feature_ro_compat_quota: u32 = 0x0100;
+const feature_ro_compat_bigalloc: u32 = 0x0200;
 const feature_ro_compat_metadata_csum: u32 = 0x0400;
+const feature_ro_compat_replica: u32 = 0x0800;
+const feature_ro_compat_readonly: u32 = 0x1000;
+const feature_ro_compat_project: u32 = 0x2000;
+const feature_ro_compat_shared_blocks: u32 = 0x4000;
+const feature_ro_compat_verity: u32 = 0x8000;
+const feature_ro_compat_orphan_present: u32 = 0x0001_0000;
 const writer_feature_compat: u32 = feature_compat_ext_attr | feature_compat_dir_index;
 const writer_feature_incompat: u32 = feature_incompat_filetype | feature_incompat_extents;
 const writer_feature_ro_compat_base: u32 = feature_ro_compat_sparse_super | feature_ro_compat_metadata_csum;
@@ -82,16 +109,28 @@ const reader_feature_compat: u32 = writer_feature_compat | feature_compat_has_jo
 const reader_feature_incompat: u32 = writer_feature_incompat | feature_incompat_64bit | feature_incompat_flex_bg | feature_incompat_csum_seed;
 const reader_feature_ro_compat: u32 = writer_feature_ro_compat_base | feature_ro_compat_large_file | feature_ro_compat_huge_file | feature_ro_compat_dir_nlink | feature_ro_compat_extra_isize;
 
+const inode_flag_encrypt: u32 = 0x0000_0800;
 const inode_flag_index: u32 = 0x0000_1000;
 const inode_flag_extents: u32 = 0x0008_0000;
+const inode_flag_verity: u32 = 0x0010_0000;
+const inode_flag_ea_inode: u32 = 0x0020_0000;
+const inode_flag_inline_data: u32 = 0x1000_0000;
 
+const mode_fifo: u16 = 0o010000;
+const mode_char_device: u16 = 0o020000;
 const mode_dir: u16 = 0o040000;
+const mode_block_device: u16 = 0o060000;
 const mode_reg: u16 = 0o100000;
 const mode_symlink: u16 = 0o120000;
+const mode_socket: u16 = 0o140000;
 
 const dir_ft_unknown: u8 = 0;
 const dir_ft_reg: u8 = 1;
 const dir_ft_dir: u8 = 2;
+const dir_ft_char_device: u8 = 3;
+const dir_ft_block_device: u8 = 4;
+const dir_ft_fifo: u8 = 5;
+const dir_ft_socket: u8 = 6;
 const dir_ft_symlink: u8 = 7;
 const dir_ft_checksum: u8 = 0xDE;
 
@@ -100,8 +139,11 @@ const ext4_xattr_magic: u32 = 0xEA02_0000;
 const dx_hash_half_md4: u8 = 0x1;
 const super_checksum_type_crc32c: u8 = 0x1;
 const xattr_name_user: u8 = 1;
+const xattr_name_posix_acl_access: u8 = 2;
+const xattr_name_posix_acl_default: u8 = 3;
 const xattr_name_trusted: u8 = 4;
 const xattr_name_security: u8 = 6;
+const xattr_name_system: u8 = 7;
 
 pub const Kind = enum(u8) {
     directory,
@@ -3103,6 +3145,1345 @@ fn validateStrictComponent(component: []const u8, options: StrictScanOptions) !v
     }
 }
 
+// ---------------------------------------------------------------------------
+// General import
+//
+// `scanWriterCompatible` above revalidates this module's own output down to
+// the last unused byte, which is what lets a rebuild promise a byte-for-byte
+// reproducible result. A stock distro root filesystem can never satisfy that
+// contract: `mke2fs` defaults produce 256-byte inodes, a journal, `64bit`,
+// `flex_bg` and `metadata_csum_seed`, and its allocator has no reason to
+// agree with ours about where anything lives.
+//
+// The general importer below therefore validates a different, weaker thing:
+// that every guest-visible name, byte, and metadata field can be read out
+// unambiguously. It makes no claim about the source's own layout and it never
+// reconstructs it. What it does guarantee is that nothing guest-visible is
+// dropped silently -- anything it cannot represent is a named refusal, not a
+// partial import.
+// ---------------------------------------------------------------------------
+
+/// Which import path produced a tree, and therefore what a rebuild from it
+/// may promise. Reported so an operator is never left guessing whether a
+/// given output is reproducible.
+pub const SourceProfile = enum {
+    /// `scanWriterCompatible`: this module's own writer profile, revalidated
+    /// exhaustively. Rebuilding is byte-for-byte reproducible.
+    zvmi_ext4_v1,
+    /// `scanReadable`: any ext4 the general reader accepts. Content and
+    /// metadata are preserved; the source's own byte layout is not, so a
+    /// rebuild is deterministic given the imported tree but is not a
+    /// reproduction of the source image.
+    ext4_general_v1,
+
+    /// True only when re-running the import against the produced image would
+    /// yield the identical source bytes.
+    pub fn isByteReproducible(self: SourceProfile) bool {
+        return switch (self) {
+            .zvmi_ext4_v1 => true,
+            .ext4_general_v1 => false,
+        };
+    }
+
+    pub fn label(self: SourceProfile) []const u8 {
+        return switch (self) {
+            .zvmi_ext4_v1 => "zvmi_ext4_v1",
+            .ext4_general_v1 => "ext4_general_v1",
+        };
+    }
+};
+
+/// Every guest-visible node type a general ext4 source can hold. `hardlink`
+/// is not an on-disk inode type: it is how a second or later directory entry
+/// pointing at an already-imported inode is represented, so the importer
+/// neither duplicates the content nor loses the fact that the two names share
+/// storage.
+pub const GeneralKind = enum {
+    directory,
+    file,
+    symlink,
+    hardlink,
+    block_device,
+    char_device,
+    fifo,
+};
+
+pub const DeviceNumbers = struct {
+    major: u32 = 0,
+    minor: u32 = 0,
+};
+
+/// Refusals that name the exact ext4 feature responsible. A partial import is
+/// worse than no import: every one of these features changes how guest-visible
+/// data is stored, so importing "everything else" would silently produce a
+/// filesystem missing real content.
+pub const GeneralFeatureError = error{
+    UnsupportedBigallocFeature,
+    UnsupportedInlineDataFeature,
+    UnsupportedCasefoldFeature,
+    UnsupportedEncryptFeature,
+    UnsupportedVerityFeature,
+    UnsupportedMmpFeature,
+    UnsupportedFastCommitFeature,
+    UnsupportedQuotaFeature,
+    UnsupportedProjectFeature,
+    UnsupportedCompressionFeature,
+    UnsupportedMetaBlockGroupFeature,
+    UnsupportedExternalJournalFeature,
+    UnsupportedXattrInodeFeature,
+    UnsupportedLargeDirFeature,
+    UnsupportedDirdataFeature,
+    UnsupportedSnapshotFeature,
+    UnsupportedReplicaFeature,
+    UnsupportedSharedBlocksFeature,
+    UnsupportedSparseSuper2Feature,
+    UnsupportedLegacyGroupChecksumFeature,
+    UnsupportedBtreeDirectoryFeature,
+    UnsupportedImagicInodeFeature,
+    UnsupportedDirectoryPreallocFeature,
+    UnsupportedStableInodesFeature,
+    MissingExtentsFeature,
+    MissingFiletypeFeature,
+    /// The source was not cleanly unmounted. Journal contents are
+    /// deliberately never replayed, so an import would silently miss whatever
+    /// the log still holds.
+    SourceNeedsJournalRecovery,
+    /// Inodes are queued for deletion or truncation. Their on-disk state is
+    /// the pre-truncation state, which is not what the guest would see.
+    SourceHasOrphanInodes,
+    UnsupportedFilesystemFeature,
+};
+
+/// Rejects any feature outside the general importer's first-pass scope, by
+/// name. Bits the reader already understands pass through untouched.
+pub fn classifyGeneralFeatures(
+    compat: u32,
+    incompat: u32,
+    ro_compat: u32,
+) GeneralFeatureError!void {
+    const compat_named = [_]struct { bit: u32, err: GeneralFeatureError }{
+        .{ .bit = feature_compat_fast_commit, .err = error.UnsupportedFastCommitFeature },
+        .{ .bit = feature_compat_sparse_super2, .err = error.UnsupportedSparseSuper2Feature },
+        .{ .bit = feature_compat_imagic_inodes, .err = error.UnsupportedImagicInodeFeature },
+        .{ .bit = feature_compat_dir_prealloc, .err = error.UnsupportedDirectoryPreallocFeature },
+        .{ .bit = feature_compat_stable_inodes, .err = error.UnsupportedStableInodesFeature },
+    };
+    for (compat_named) |named| {
+        if (compat & named.bit != 0) return named.err;
+    }
+    const incompat_named = [_]struct { bit: u32, err: GeneralFeatureError }{
+        .{ .bit = feature_incompat_inline_data, .err = error.UnsupportedInlineDataFeature },
+        .{ .bit = feature_incompat_encrypt, .err = error.UnsupportedEncryptFeature },
+        .{ .bit = feature_incompat_casefold, .err = error.UnsupportedCasefoldFeature },
+        .{ .bit = feature_incompat_mmp, .err = error.UnsupportedMmpFeature },
+        .{ .bit = feature_incompat_compression, .err = error.UnsupportedCompressionFeature },
+        .{ .bit = feature_incompat_meta_bg, .err = error.UnsupportedMetaBlockGroupFeature },
+        .{ .bit = feature_incompat_journal_dev, .err = error.UnsupportedExternalJournalFeature },
+        .{ .bit = feature_incompat_ea_inode, .err = error.UnsupportedXattrInodeFeature },
+        .{ .bit = feature_incompat_largedir, .err = error.UnsupportedLargeDirFeature },
+        .{ .bit = feature_incompat_dirdata, .err = error.UnsupportedDirdataFeature },
+        .{ .bit = feature_incompat_recover, .err = error.SourceNeedsJournalRecovery },
+    };
+    for (incompat_named) |named| {
+        if (incompat & named.bit != 0) return named.err;
+    }
+    const ro_compat_named = [_]struct { bit: u32, err: GeneralFeatureError }{
+        .{ .bit = feature_ro_compat_bigalloc, .err = error.UnsupportedBigallocFeature },
+        .{ .bit = feature_ro_compat_verity, .err = error.UnsupportedVerityFeature },
+        .{ .bit = feature_ro_compat_quota, .err = error.UnsupportedQuotaFeature },
+        .{ .bit = feature_ro_compat_project, .err = error.UnsupportedProjectFeature },
+        .{ .bit = feature_ro_compat_has_snapshot, .err = error.UnsupportedSnapshotFeature },
+        .{ .bit = feature_ro_compat_replica, .err = error.UnsupportedReplicaFeature },
+        .{ .bit = feature_ro_compat_shared_blocks, .err = error.UnsupportedSharedBlocksFeature },
+        .{ .bit = feature_ro_compat_gdt_csum, .err = error.UnsupportedLegacyGroupChecksumFeature },
+        .{ .bit = feature_ro_compat_btree_dir, .err = error.UnsupportedBtreeDirectoryFeature },
+        .{ .bit = feature_ro_compat_orphan_present, .err = error.SourceHasOrphanInodes },
+    };
+    for (ro_compat_named) |named| {
+        if (ro_compat & named.bit != 0) return named.err;
+    }
+
+    // ext2/ext3 block-mapped inodes and type-less directory entries are both
+    // readable in principle, but neither is what a general importer is for:
+    // any filesystem worth right-sizing today is ext4.
+    if (incompat & feature_incompat_extents == 0) return error.MissingExtentsFeature;
+    if (incompat & feature_incompat_filetype == 0) return error.MissingFiletypeFeature;
+
+    // Anything still unaccounted for is genuinely unknown to this build, and
+    // an unknown feature may well change how file data is stored.
+    if (compat & ~reader_feature_compat != 0 or
+        incompat & ~reader_feature_incompat != 0 or
+        ro_compat & ~reader_feature_ro_compat != 0)
+    {
+        return error.UnsupportedFilesystemFeature;
+    }
+}
+
+pub const GeneralOpenError = OpenError || GeneralFeatureError;
+
+/// Opens a source for general import. `Reader.open` collapses every feature
+/// it does not implement into `UnsupportedFeatures`; this classifies the
+/// superblock first so a refusal names the feature that caused it.
+pub fn openGeneral(
+    io: Io,
+    file: Io.File,
+    allocator: std.mem.Allocator,
+    options: OpenOptions,
+) GeneralOpenError!Reader {
+    try classifySuperblockForGeneralImport(io, file, null, options.offset);
+    return Reader.open(io, file, allocator, options);
+}
+
+pub fn openGeneralReadOnlySource(
+    io: Io,
+    file: Io.File,
+    source: ReadOnlySource,
+    allocator: std.mem.Allocator,
+    options: OpenOptions,
+) GeneralOpenError!Reader {
+    try classifySuperblockForGeneralImport(io, file, source, options.offset);
+    return Reader.openReadOnlySource(io, file, source, allocator, options);
+}
+
+fn classifySuperblockForGeneralImport(
+    io: Io,
+    file: Io.File,
+    source: ?ReadOnlySource,
+    offset: u64,
+) GeneralOpenError!void {
+    var sb: [superblock_size]u8 = undefined;
+    try readSourceAll(io, file, source, &sb, offset + superblock_offset);
+    if (readInt(u16, sb[0x38..0x3A]) != super_magic) return error.BadMagic;
+    try classifyGeneralFeatures(
+        readInt(u32, sb[0x5C..0x60]),
+        readInt(u32, sb[0x60..0x64]),
+        readInt(u32, sb[0x64..0x68]),
+    );
+}
+
+pub const GeneralScanOptions = struct {
+    /// The bytes the source filesystem is allowed to occupy. Unlike the
+    /// strict scan this is an upper bound rather than an equality: a real
+    /// partition or block device is routinely larger than the filesystem
+    /// inside it.
+    available_length: u64,
+    max_nodes: usize = limit_defaults.max_nodes,
+    max_path_bytes: usize = limit_defaults.max_path_bytes,
+    max_component_bytes: usize = limit_defaults.max_component_bytes,
+    max_file_bytes: u64 = limit_defaults.max_file_bytes,
+    max_total_bytes: u64 = limit_defaults.max_total_bytes,
+    max_xattrs_per_node: usize = limit_defaults.max_xattrs_per_node,
+    max_xattr_bytes_per_node: usize = limit_defaults.max_xattr_bytes_per_node,
+    max_scan_metadata_bytes: usize = limit_defaults.max_scan_metadata_bytes,
+    /// Optional sink for the peak measurements and the first limit breach.
+    /// The scanner is torn down before `scanReadable` returns, so a failure
+    /// can only report through a sink the caller still owns.
+    diagnostic: ?*limits_mod.Diagnostic = null,
+};
+
+pub const GeneralFilesystemIdentity = struct {
+    profile: SourceProfile = .ext4_general_v1,
+    uuid: [16]u8,
+    /// Exact on-disk 16-byte volume-name field, including embedded/trailing
+    /// NUL bytes.
+    label: [16]u8,
+    block_size: u32,
+    /// Bytes the filesystem itself occupies, which may be less than the
+    /// partition or device holding it.
+    filesystem_length: u64,
+    inode_size: u16,
+    feature_compat: u32,
+    feature_incompat: u32,
+    feature_ro_compat: u32,
+    /// Reported because a journal-less rebuild of a journalled source is a
+    /// deliberate change of behaviour the operator should know about.
+    has_journal: bool,
+};
+
+/// Metadata of the source's own root directory. The tree formats below all
+/// model the root implicitly, so it travels beside the entries rather than
+/// as one of them.
+pub const GeneralRoot = struct {
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    atime: i64,
+    mtime: i64,
+    ctime: i64,
+    xattrs: []const Xattr,
+};
+
+pub const GeneralEntry = struct {
+    /// Relative path with `/` separators and no leading `/`.
+    path: []const u8,
+    kind: GeneralKind,
+    /// Permission/sticky bits only; the file type comes from `kind`.
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    /// Regular-file or symlink byte length; 0 for every other kind.
+    size: u64,
+    atime: i64,
+    mtime: i64,
+    ctime: i64,
+    /// Meaningful only for `.block_device` and `.char_device`.
+    device: DeviceNumbers,
+    /// Set only for `.hardlink`: the path of the first entry that shares the
+    /// source inode. Always earlier in iteration order than the link itself.
+    hardlink_target: []const u8,
+    content: ?FileTreeView.ContentReader,
+    xattrs: []const Xattr,
+};
+
+const GeneralContent = struct {
+    reader: *Reader,
+    io: Io,
+    inode_number: u32,
+    size: u64,
+    flags: u32,
+    block_bytes: [60]u8,
+};
+
+const GeneralNode = struct {
+    path: []u8,
+    kind: GeneralKind,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    atime: i64,
+    mtime: i64,
+    ctime: i64,
+    device: DeviceNumbers,
+    /// Borrowed from the earlier node that owns this inode's content.
+    hardlink_target: []const u8,
+    has_content: bool,
+    content: GeneralContent,
+    xattrs: []OwnedXattr,
+    xattr_views: []Xattr,
+};
+
+/// A general ext4 source read out as an ordered tree. Paths, xattrs, and
+/// metadata are owned; file bytes stay in the read-only source until an
+/// importer spools them.
+pub const GeneralTree = struct {
+    allocator: std.mem.Allocator,
+    entries: []GeneralNode,
+    identity: GeneralFilesystemIdentity,
+    root: GeneralRoot,
+    root_xattrs_owned: []OwnedXattr,
+    root_xattr_views: []Xattr,
+    /// Guest-visible file bytes counted once per inode, so a hardlinked file
+    /// is not billed twice. This is the scratch space an import needs.
+    content_bytes: u64,
+
+    pub fn deinit(self: *GeneralTree) void {
+        for (self.entries) |entry| {
+            self.allocator.free(entry.path);
+            freeXattrs(self.allocator, entry.xattrs);
+            self.allocator.free(entry.xattr_views);
+        }
+        self.allocator.free(self.entries);
+        freeXattrs(self.allocator, self.root_xattrs_owned);
+        self.allocator.free(self.root_xattr_views);
+        self.* = undefined;
+    }
+
+    /// Excludes the implicit root directory, matching `StrictTree`.
+    pub fn nodeCount(self: *const GeneralTree) usize {
+        return self.entries.len;
+    }
+
+    pub fn entryAt(self: *GeneralTree, index: usize) GeneralEntry {
+        const node = &self.entries[index];
+        return .{
+            .path = node.path,
+            .kind = node.kind,
+            .mode = node.mode,
+            .uid = node.uid,
+            .gid = node.gid,
+            .size = node.size,
+            .atime = node.atime,
+            .mtime = node.mtime,
+            .ctime = node.ctime,
+            .device = node.device,
+            .hardlink_target = node.hardlink_target,
+            .content = if (node.has_content) .{
+                .ctx = &node.content,
+                .read_at_fn = generalContentReadAt,
+            } else null,
+            .xattrs = node.xattr_views,
+        };
+    }
+};
+
+fn generalContentReadAt(
+    ctx: *const anyopaque,
+    buffer: []u8,
+    offset: u64,
+) FileTreeView.ContentError!usize {
+    const content: *const GeneralContent = @ptrCast(@alignCast(ctx));
+    return readGeneralContent(content, buffer, offset) catch return error.ReadFailed;
+}
+
+/// Imports any ext4 filesystem the general reader accepts. Nothing is
+/// written and the source is never opened for writing.
+/// Spelled out rather than inferred because the scanner recurses through
+/// directories, and Zig cannot infer an error set that depends on itself.
+pub const GeneralScanError = ReadError || GeneralFeatureError || limits_mod.Error || error{
+    SourceNotCleanlyUnmounted,
+    InvalidFilesystemLength,
+    UnsupportedSocketInode,
+    UnsupportedInodeType,
+    UnsupportedInodeCount,
+    UnsupportedFirstInode,
+    UnsupportedBlockMappedInode,
+    UnsupportedXattrLayout,
+    UnsupportedXattrName,
+    UnsupportedDirectoryLayout,
+    UnsupportedExtent,
+    UnsupportedExtentLayout,
+    DeletedInodeReferenced,
+    DirectoryCycle,
+    DirectoryFileTypeMismatch,
+    DuplicateDirectoryEntry,
+    DuplicateXattr,
+    FilesystemTooLargeToImport,
+    FilesystemExceedsPartition,
+    RootIsNotADirectory,
+    InvalidImportedPath,
+    InvalidInodeReference,
+};
+
+pub fn scanReadable(
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    options: GeneralScanOptions,
+) GeneralScanError!GeneralTree {
+    var scanner = try GeneralScanner.init(reader, io, allocator, options);
+    defer scanner.deinit();
+    try scanner.scan();
+    return scanner.finish();
+}
+
+const GeneralChild = struct {
+    inode: u32,
+    dir_file_type: u8,
+    name: []u8,
+};
+
+const GeneralExtent = struct {
+    logical_block: u32,
+    start_block: u64,
+    block_count: u32,
+    /// An uninitialized extent is allocated but has never been written, so
+    /// the guest reads zeros from it. Preserving that distinction is what
+    /// keeps a `fallocate`d region from importing as garbage.
+    initialized: bool,
+};
+
+const GeneralInode = struct {
+    inode: u32,
+    kind: GeneralKind,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    atime: i64,
+    mtime: i64,
+    ctime: i64,
+    link_count: u16,
+    flags: u32,
+    file_acl_block: u32,
+    device: DeviceNumbers,
+    block_bytes: [60]u8,
+
+    fn isFastSymlink(self: GeneralInode) bool {
+        return self.kind == .symlink and self.size < 60 and
+            (self.flags & inode_flag_extents) == 0;
+    }
+
+    fn hasContent(self: GeneralInode) bool {
+        return self.kind == .file or self.kind == .symlink;
+    }
+};
+
+const GeneralScanner = struct {
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    options: GeneralScanOptions,
+    identity: GeneralFilesystemIdentity,
+    entries: std.array_list.Managed(GeneralNode),
+    /// Directory inodes already entered, which is what turns a corrupt
+    /// parent pointer from an infinite walk into a named error.
+    visited_directories: []u8,
+    /// First path seen for each multiply-linked inode. Later names for the
+    /// same inode become `.hardlink` entries pointing at it.
+    hardlinks: std.AutoHashMap(u32, []const u8),
+    root: GeneralRoot,
+    root_xattrs_owned: []OwnedXattr,
+    root_xattr_views: []Xattr,
+    content_bytes: u64 = 0,
+    node_count: usize = 0,
+
+    fn init(
+        reader: *Reader,
+        io: Io,
+        allocator: std.mem.Allocator,
+        options: GeneralScanOptions,
+    ) !GeneralScanner {
+        const identity = try validateGeneralSuperblock(reader, io, options);
+        const directory_bitmap_len = bitmapByteLength(reader.total_inodes);
+        limits_mod.observe(options.diagnostic, .scan_metadata_bytes, directory_bitmap_len);
+        if (directory_bitmap_len > options.max_scan_metadata_bytes) {
+            return limits_mod.exceeded(
+                options.diagnostic,
+                .scan_metadata_bytes,
+                directory_bitmap_len,
+                options.max_scan_metadata_bytes,
+            );
+        }
+        const visited = try allocator.alloc(u8, directory_bitmap_len);
+        errdefer allocator.free(visited);
+        @memset(visited, 0);
+        return .{
+            .reader = reader,
+            .io = io,
+            .allocator = allocator,
+            .options = options,
+            .identity = identity,
+            .entries = .init(allocator),
+            .visited_directories = visited,
+            .hardlinks = .init(allocator),
+            .root = undefined,
+            .root_xattrs_owned = &.{},
+            .root_xattr_views = &.{},
+        };
+    }
+
+    fn deinit(self: *GeneralScanner) void {
+        for (self.entries.items) |entry| {
+            self.allocator.free(entry.path);
+            freeXattrs(self.allocator, entry.xattrs);
+            self.allocator.free(entry.xattr_views);
+        }
+        self.entries.deinit();
+        self.allocator.free(self.visited_directories);
+        self.hardlinks.deinit();
+        freeXattrs(self.allocator, self.root_xattrs_owned);
+        self.allocator.free(self.root_xattr_views);
+        self.root_xattrs_owned = &.{};
+        self.root_xattr_views = &.{};
+    }
+
+    fn finish(self: *GeneralScanner) !GeneralTree {
+        const entries = try self.entries.toOwnedSlice();
+        const owned_root_xattrs = self.root_xattrs_owned;
+        const owned_root_views = self.root_xattr_views;
+        self.root_xattrs_owned = &.{};
+        self.root_xattr_views = &.{};
+        return .{
+            .allocator = self.allocator,
+            .entries = entries,
+            .identity = self.identity,
+            .root = self.root,
+            .root_xattrs_owned = owned_root_xattrs,
+            .root_xattr_views = owned_root_views,
+            .content_bytes = self.content_bytes,
+        };
+    }
+
+    fn scan(self: *GeneralScanner) !void {
+        var raw: [max_supported_reader_inode_size]u8 = undefined;
+        const root = try self.readGeneralInode(root_inode, &raw);
+        if (root.kind != .directory) return error.RootIsNotADirectory;
+        const xattrs = try self.readNodeXattrs(root, &raw);
+        errdefer freeXattrs(self.allocator, xattrs);
+        const views = try self.allocator.alloc(Xattr, xattrs.len);
+        for (xattrs, 0..) |xattr, index| {
+            views[index] = .{ .name = xattr.name, .value = xattr.value };
+        }
+        self.root_xattrs_owned = xattrs;
+        self.root_xattr_views = views;
+        self.root = .{
+            .mode = root.mode,
+            .uid = root.uid,
+            .gid = root.gid,
+            .atime = root.atime,
+            .mtime = root.mtime,
+            .ctime = root.ctime,
+            .xattrs = views,
+        };
+        bitmapSet(self.visited_directories, root_inode - 1);
+        try self.scanDirectory(root, "");
+    }
+
+    fn scanDirectory(self: *GeneralScanner, directory: GeneralInode, path: []const u8) GeneralScanError!void {
+        const children = try self.readDirectory(directory);
+        defer {
+            for (children) |child| self.allocator.free(child.name);
+            self.allocator.free(children);
+        }
+        sortGeneralChildren(children);
+        if (children.len > 1) {
+            for (children[1..], children[0 .. children.len - 1]) |current, previous| {
+                if (std.mem.eql(u8, current.name, previous.name)) {
+                    return error.DuplicateDirectoryEntry;
+                }
+            }
+        }
+
+        for (children) |child| {
+            const child_path = if (path.len == 0)
+                try self.allocator.dupe(u8, child.name)
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ path, child.name });
+            defer self.allocator.free(child_path);
+            try self.scanChild(child, child_path);
+        }
+    }
+
+    fn scanChild(self: *GeneralScanner, child: GeneralChild, path: []const u8) GeneralScanError!void {
+        try validateGeneralPath(path, self.options);
+        self.node_count += 1;
+        limits_mod.observe(self.options.diagnostic, .nodes, self.node_count);
+        if (self.node_count > self.options.max_nodes) {
+            return limits_mod.exceeded(
+                self.options.diagnostic,
+                .nodes,
+                self.node_count,
+                self.options.max_nodes,
+            );
+        }
+
+        var raw: [max_supported_reader_inode_size]u8 = undefined;
+        const inode = try self.readGeneralInode(child.inode, &raw);
+        if (child.dir_file_type != dir_ft_unknown and
+            child.dir_file_type != generalKindToDirFileType(inode.kind))
+        {
+            return error.DirectoryFileTypeMismatch;
+        }
+
+        // A second name for an already-imported inode is a hardlink. It must
+        // not re-import the content, and it must not be walked again.
+        if (inode.kind != .directory and inode.link_count > 1) {
+            if (self.hardlinks.get(inode.inode)) |target| {
+                try self.appendHardlink(path, inode, target);
+                return;
+            }
+        }
+
+        if (inode.kind == .directory) {
+            if (bitmapIsSet(self.visited_directories, inode.inode - 1)) {
+                return error.DirectoryCycle;
+            }
+            bitmapSet(self.visited_directories, inode.inode - 1);
+        }
+
+        limits_mod.observe(self.options.diagnostic, .file_bytes, inode.size);
+        if (inode.size > self.options.max_file_bytes) {
+            return limits_mod.exceeded(
+                self.options.diagnostic,
+                .file_bytes,
+                inode.size,
+                self.options.max_file_bytes,
+            );
+        }
+        if (inode.hasContent()) {
+            self.content_bytes = std.math.add(u64, self.content_bytes, inode.size) catch
+                return error.TotalContentLimitExceeded;
+            limits_mod.observe(self.options.diagnostic, .total_bytes, self.content_bytes);
+            if (self.content_bytes > self.options.max_total_bytes) {
+                return limits_mod.exceeded(
+                    self.options.diagnostic,
+                    .total_bytes,
+                    self.content_bytes,
+                    self.options.max_total_bytes,
+                );
+            }
+        }
+
+        const xattrs = try self.readNodeXattrs(inode, &raw);
+        var xattrs_owned = true;
+        defer if (xattrs_owned) freeXattrs(self.allocator, xattrs);
+        const owned_path = try self.allocator.dupe(u8, path);
+        // Ownership moves into `entries` on a successful append, and the tree
+        // frees it from there; recursing into a subdirectory can still fail
+        // afterwards, so the guard has to be cancelled rather than scoped.
+        var node_owned = true;
+        errdefer if (node_owned) self.allocator.free(owned_path);
+        const views = try self.allocator.alloc(Xattr, xattrs.len);
+        errdefer if (node_owned) self.allocator.free(views);
+        for (xattrs, 0..) |xattr, index| {
+            views[index] = .{ .name = xattr.name, .value = xattr.value };
+        }
+        try self.entries.append(.{
+            .path = owned_path,
+            .kind = inode.kind,
+            .mode = inode.mode,
+            .uid = inode.uid,
+            .gid = inode.gid,
+            .size = if (inode.hasContent()) inode.size else 0,
+            .atime = inode.atime,
+            .mtime = inode.mtime,
+            .ctime = inode.ctime,
+            .device = inode.device,
+            .hardlink_target = "",
+            .has_content = inode.hasContent(),
+            .content = .{
+                .reader = self.reader,
+                .io = self.io,
+                .inode_number = inode.inode,
+                .size = inode.size,
+                .flags = inode.flags,
+                .block_bytes = inode.block_bytes,
+            },
+            .xattrs = xattrs,
+            .xattr_views = views,
+        });
+        xattrs_owned = false;
+        node_owned = false;
+
+        if (inode.kind != .directory and inode.link_count > 1) {
+            // The stored path belongs to the entry that now owns the content;
+            // it outlives the scan because the tree owns it too.
+            try self.hardlinks.put(inode.inode, self.entries.items[self.entries.items.len - 1].path);
+        }
+        if (inode.kind == .directory) try self.scanDirectory(inode, path);
+    }
+
+    fn appendHardlink(
+        self: *GeneralScanner,
+        path: []const u8,
+        inode: GeneralInode,
+        target: []const u8,
+    ) !void {
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        try self.entries.append(.{
+            .path = owned_path,
+            .kind = .hardlink,
+            .mode = inode.mode,
+            .uid = inode.uid,
+            .gid = inode.gid,
+            .size = 0,
+            .atime = inode.atime,
+            .mtime = inode.mtime,
+            .ctime = inode.ctime,
+            .device = .{},
+            .hardlink_target = target,
+            .has_content = false,
+            .content = undefined,
+            .xattrs = &.{},
+            .xattr_views = &.{},
+        });
+    }
+
+    fn readGeneralInode(
+        self: *GeneralScanner,
+        inode_number: u32,
+        raw: *[max_supported_reader_inode_size]u8,
+    ) !GeneralInode {
+        if (inode_number == 0 or inode_number > self.reader.total_inodes) {
+            return error.InvalidInodeReference;
+        }
+        @memset(raw, 0);
+        const group_index = (inode_number - 1) / self.reader.inodes_per_group;
+        const index_in_group = (inode_number - 1) % self.reader.inodes_per_group;
+        const group = self.reader.groups[group_index];
+        const offset = self.reader.blockOffset(group.inode_table_block) +
+            @as(u64, index_in_group) * self.reader.inode_size;
+        try self.reader.readAll(self.io, raw[0..self.reader.inode_size], offset);
+        return parseGeneralInode(inode_number, raw[0..self.reader.inode_size]);
+    }
+
+    fn readNodeXattrs(
+        self: *GeneralScanner,
+        inode: GeneralInode,
+        raw: *const [max_supported_reader_inode_size]u8,
+    ) ![]OwnedXattr {
+        var xattrs = std.array_list.Managed(OwnedXattr).init(self.allocator);
+        errdefer {
+            for (xattrs.items) |xattr| {
+                self.allocator.free(xattr.name);
+                self.allocator.free(xattr.value);
+            }
+            xattrs.deinit();
+        }
+
+        // A 256-byte inode carries small attributes in the space past
+        // `i_extra_isize`. SELinux labels and POSIX ACLs land there first and
+        // only spill into a block when they no longer fit, so an importer
+        // that reads only the block silently drops most real-world labels.
+        try appendInodeBodyXattrs(
+            self.allocator,
+            raw[0..self.reader.inode_size],
+            &xattrs,
+        );
+        if (inode.file_acl_block != 0) {
+            const block = try self.allocator.alloc(u8, self.reader.block_size);
+            defer self.allocator.free(block);
+            try self.reader.readAll(
+                self.io,
+                block,
+                self.reader.blockOffset(inode.file_acl_block),
+            );
+            if (readInt(u32, block[0..4]) != ext4_xattr_magic) {
+                return error.UnsupportedXattrLayout;
+            }
+            try appendXattrEntries(self.allocator, block, 32, 0, &xattrs);
+        }
+
+        limits_mod.observe(self.options.diagnostic, .xattrs_per_node, xattrs.items.len);
+        if (xattrs.items.len > self.options.max_xattrs_per_node) {
+            return limits_mod.exceeded(
+                self.options.diagnostic,
+                .xattrs_per_node,
+                xattrs.items.len,
+                self.options.max_xattrs_per_node,
+            );
+        }
+        var total_bytes: usize = 0;
+        for (xattrs.items, 0..) |xattr, index| {
+            // Checked here so an attribute the writer could never re-emit
+            // fails at import time with a name, not later inside a build.
+            _ = splitXattrName(xattr.name) catch return error.UnsupportedXattrName;
+            total_bytes = std.math.add(
+                usize,
+                total_bytes,
+                xattr.name.len + xattr.value.len,
+            ) catch return error.XattrByteLimitExceeded;
+            for (xattrs.items[index + 1 ..]) |other| {
+                if (std.mem.eql(u8, xattr.name, other.name)) return error.DuplicateXattr;
+            }
+        }
+        limits_mod.observe(self.options.diagnostic, .xattr_bytes_per_node, total_bytes);
+        if (total_bytes > self.options.max_xattr_bytes_per_node) {
+            return limits_mod.exceeded(
+                self.options.diagnostic,
+                .xattr_bytes_per_node,
+                total_bytes,
+                self.options.max_xattr_bytes_per_node,
+            );
+        }
+        return xattrs.toOwnedSlice();
+    }
+
+    fn readDirectory(self: *GeneralScanner, inode: GeneralInode) ![]GeneralChild {
+        if (inode.size == 0 or inode.size % self.reader.block_size != 0) {
+            return error.UnsupportedDirectoryLayout;
+        }
+        const size = std.math.cast(usize, inode.size) orelse return error.UnsupportedDirectoryLayout;
+        limits_mod.observe(self.options.diagnostic, .scan_metadata_bytes, size);
+        if (size > self.options.max_scan_metadata_bytes) {
+            return limits_mod.exceeded(
+                self.options.diagnostic,
+                .scan_metadata_bytes,
+                size,
+                self.options.max_scan_metadata_bytes,
+            );
+        }
+        const data = try self.allocator.alloc(u8, size);
+        defer self.allocator.free(data);
+        const content = GeneralContent{
+            .reader = self.reader,
+            .io = self.io,
+            .inode_number = inode.inode,
+            .size = inode.size,
+            .flags = inode.flags,
+            .block_bytes = inode.block_bytes,
+        };
+        var done: usize = 0;
+        while (done < data.len) {
+            const got = try readGeneralContent(&content, data[done..], done);
+            if (got == 0) return error.UnexpectedEndOfFile;
+            done += got;
+        }
+
+        var children = std.array_list.Managed(GeneralChild).init(self.allocator);
+        errdefer {
+            for (children.items) |child| self.allocator.free(child.name);
+            children.deinit();
+        }
+        var block_start: usize = 0;
+        while (block_start < data.len) : (block_start += self.reader.block_size) {
+            const block = data[block_start..][0..self.reader.block_size];
+            var offset: usize = 0;
+            while (offset + 8 <= block.len) {
+                const child_inode = readInt(u32, block[offset .. offset + 4]);
+                const rec_len = readInt(u16, block[offset + 4 .. offset + 6]);
+                const name_len = block[offset + 6];
+                const file_type = block[offset + 7];
+                if (rec_len < 8 or rec_len % dir_entry_alignment != 0 or
+                    offset + rec_len > block.len or name_len > rec_len - 8)
+                {
+                    return error.BadDirectoryEntry;
+                }
+                const name = block[offset + 8 .. offset + 8 + name_len];
+                // An htree index block and a leaf's checksum tail both
+                // masquerade as an unused entry, so skipping inode 0 covers
+                // both without needing to parse the index at all.
+                if (child_inode != 0 and file_type != dir_ft_checksum and
+                    !std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, ".."))
+                {
+                    try validateGeneralComponent(name, self.options);
+                    const owned_name = try self.allocator.dupe(u8, name);
+                    errdefer self.allocator.free(owned_name);
+                    try children.append(.{
+                        .inode = child_inode,
+                        .dir_file_type = file_type,
+                        .name = owned_name,
+                    });
+                }
+                offset += rec_len;
+            }
+        }
+        return children.toOwnedSlice();
+    }
+};
+
+fn validateGeneralSuperblock(
+    reader: *Reader,
+    io: Io,
+    options: GeneralScanOptions,
+) !GeneralFilesystemIdentity {
+    var sb: [superblock_size]u8 = undefined;
+    try reader.readAll(io, &sb, reader.offset + superblock_offset);
+    try classifyGeneralFeatures(
+        reader.feature_compat,
+        reader.feature_incompat,
+        reader.feature_ro_compat,
+    );
+
+    // A source that was not cleanly unmounted has state the journal still
+    // holds, and this importer deliberately never replays a journal.
+    if (readInt(u16, sb[0x3A..0x3C]) & state_clean == 0) {
+        return error.SourceNotCleanlyUnmounted;
+    }
+    if (readInt(u32, sb[0xE8..0xEC]) != 0) return error.SourceHasOrphanInodes;
+
+    // `s_blocks_count_hi` is the only place a 64-bit filesystem records the
+    // blocks this build cannot address, so it is checked rather than
+    // truncated.
+    if (reader.feature_incompat & feature_incompat_64bit != 0 and
+        readInt(u32, sb[0x150..0x154]) != 0)
+    {
+        return error.FilesystemTooLargeToImport;
+    }
+    if (readInt(u32, sb[0x54..0x58]) < first_non_reserved_inode) {
+        return error.UnsupportedFirstInode;
+    }
+
+    const filesystem_length = std.math.mul(
+        u64,
+        reader.total_blocks,
+        reader.block_size,
+    ) catch return error.InvalidFilesystemLength;
+    if (filesystem_length > options.available_length) {
+        return error.FilesystemExceedsPartition;
+    }
+    if (reader.total_inodes == 0 or
+        @as(u64, reader.total_inodes) > @as(u64, reader.groups.len) * reader.inodes_per_group)
+    {
+        return error.UnsupportedInodeCount;
+    }
+    try validateGeneralGroupDescriptors(reader, io);
+
+    return .{
+        .uuid = reader.uuid,
+        .label = reader.label,
+        .block_size = reader.block_size,
+        .filesystem_length = filesystem_length,
+        .inode_size = reader.inode_size,
+        .feature_compat = reader.feature_compat,
+        .feature_incompat = reader.feature_incompat,
+        .feature_ro_compat = reader.feature_ro_compat,
+        .has_journal = reader.feature_compat & feature_compat_has_journal != 0,
+    };
+}
+
+/// A 64-bit filesystem widens every group-descriptor block pointer with a
+/// high half this build ignores. Ignoring a non-zero high half would read the
+/// wrong block and call the result a filesystem, so it is refused instead.
+fn validateGeneralGroupDescriptors(reader: *Reader, io: Io) !void {
+    const desc_size: usize = if (reader.feature_incompat & feature_incompat_64bit != 0) 64 else 32;
+    if (desc_size == 32) return;
+    const gdt_bytes = reader.groups.len * desc_size;
+    const gdt_storage_bytes = @as(usize, blocksForBytes(gdt_bytes, reader.block_size)) *
+        reader.block_size;
+    const gdt = try reader.allocator.alloc(u8, gdt_storage_bytes);
+    defer reader.allocator.free(gdt);
+    try reader.readAll(io, gdt, reader.offset + reader.block_size);
+    var index: usize = 0;
+    while (index < reader.groups.len) : (index += 1) {
+        const base = index * desc_size;
+        if (readInt(u32, gdt[base + 0x20 .. base + 0x24]) != 0 or
+            readInt(u32, gdt[base + 0x24 .. base + 0x28]) != 0 or
+            readInt(u32, gdt[base + 0x28 .. base + 0x2C]) != 0)
+        {
+            return error.FilesystemTooLargeToImport;
+        }
+    }
+}
+
+fn parseGeneralInode(inode_number: u32, buf: []const u8) !GeneralInode {
+    const full_mode = readInt(u16, buf[0..2]);
+    const kind = generalModeToKind(full_mode) orelse return switch (full_mode & 0xF000) {
+        mode_socket => error.UnsupportedSocketInode,
+        else => error.UnsupportedInodeType,
+    };
+    if (readInt(u32, buf[20..24]) != 0) return error.DeletedInodeReferenced;
+    const flags = readInt(u32, buf[32..36]);
+    // Every one of these changes where the guest's bytes actually live, so an
+    // importer that ignored them would produce plausible-looking wrong data.
+    if (flags & inode_flag_inline_data != 0) return error.UnsupportedInlineDataFeature;
+    if (flags & inode_flag_encrypt != 0) return error.UnsupportedEncryptFeature;
+    if (flags & inode_flag_verity != 0) return error.UnsupportedVerityFeature;
+    if (flags & inode_flag_ea_inode != 0) return error.UnsupportedXattrInodeFeature;
+
+    var block_bytes: [60]u8 = undefined;
+    @memcpy(&block_bytes, buf[40..100]);
+    const size = readInt(u32, buf[4..8]) | (@as(u64, readInt(u32, buf[108..112])) << 32);
+    // `i_extra_isize` counts the bytes past the classic 128-byte inode that
+    // are actually present, so each `*_extra` field has to be covered
+    // individually rather than assumed from the inode size alone.
+    const extra_isize: usize = if (buf.len >= 130) readInt(u16, buf[128..130]) else 0;
+    const ctime_extra: u32 = if (buf.len >= 136 and extra_isize >= 8)
+        readInt(u32, buf[132..136])
+    else
+        0;
+    const mtime_extra: u32 = if (buf.len >= 140 and extra_isize >= 12)
+        readInt(u32, buf[136..140])
+    else
+        0;
+    const atime_extra: u32 = if (buf.len >= 144 and extra_isize >= 16)
+        readInt(u32, buf[140..144])
+    else
+        0;
+    return .{
+        .inode = inode_number,
+        .kind = kind,
+        .mode = full_mode & 0x0FFF,
+        .uid = readInt(u16, buf[2..4]) | (@as(u32, readInt(u16, buf[120..122])) << 16),
+        .gid = readInt(u16, buf[24..26]) | (@as(u32, readInt(u16, buf[122..124])) << 16),
+        .size = if (kind == .file or kind == .symlink or kind == .directory) size else 0,
+        .atime = decodeInodeTime(readInt(u32, buf[8..12]), atime_extra),
+        .ctime = decodeInodeTime(readInt(u32, buf[12..16]), ctime_extra),
+        .mtime = decodeInodeTime(readInt(u32, buf[16..20]), mtime_extra),
+        .link_count = readInt(u16, buf[26..28]),
+        .flags = flags,
+        .file_acl_block = readInt(u32, buf[104..108]),
+        .device = decodeDeviceNumbers(kind, block_bytes),
+        .block_bytes = block_bytes,
+    };
+}
+
+/// ext4 keeps seconds in a signed 32-bit field and, on inodes large enough to
+/// hold it, two extra high bits in the matching `*_extra` field. Dropping the
+/// extra bits would silently move post-2038 timestamps back by 136 years.
+fn decodeInodeTime(seconds: u32, extra: u32) i64 {
+    var value: i64 = @as(i32, @bitCast(seconds));
+    const epoch = extra & 0x3;
+    if (epoch != 0) value += @as(i64, epoch) << 32;
+    return value;
+}
+
+/// Device numbers live in `i_block`: the Linux-native encoding in the second
+/// word when either half needs more than 8 bits, and the legacy 16-bit form
+/// in the first word otherwise.
+fn decodeDeviceNumbers(kind: GeneralKind, block_bytes: [60]u8) DeviceNumbers {
+    if (kind != .block_device and kind != .char_device) return .{};
+    const legacy = readInt(u32, block_bytes[0..4]);
+    if (legacy != 0) {
+        return .{ .major = (legacy >> 8) & 0xFF, .minor = legacy & 0xFF };
+    }
+    const modern = readInt(u32, block_bytes[4..8]);
+    return .{
+        .major = (modern >> 8) & 0xFFF,
+        .minor = (modern & 0xFF) | ((modern >> 12) & 0xFFF00),
+    };
+}
+
+fn generalModeToKind(mode: u16) ?GeneralKind {
+    return switch (mode & 0xF000) {
+        mode_dir => .directory,
+        mode_reg => .file,
+        mode_symlink => .symlink,
+        mode_block_device => .block_device,
+        mode_char_device => .char_device,
+        mode_fifo => .fifo,
+        else => null,
+    };
+}
+
+fn generalKindToDirFileType(kind: GeneralKind) u8 {
+    return switch (kind) {
+        .directory => dir_ft_dir,
+        .file, .hardlink => dir_ft_reg,
+        .symlink => dir_ft_symlink,
+        .block_device => dir_ft_block_device,
+        .char_device => dir_ft_char_device,
+        .fifo => dir_ft_fifo,
+    };
+}
+
+fn generalChildLess(lhs: GeneralChild, rhs: GeneralChild) bool {
+    return std.mem.order(u8, lhs.name, rhs.name) == .lt;
+}
+
+/// Directory order on a real filesystem is an artifact of its hash and
+/// allocator. Sorting by name makes the imported tree depend only on what the
+/// source contains, not on how it happened to be laid out.
+fn sortGeneralChildren(children: []GeneralChild) void {
+    std.mem.sort(GeneralChild, children, {}, struct {
+        fn lessThan(_: void, lhs: GeneralChild, rhs: GeneralChild) bool {
+            return generalChildLess(lhs, rhs);
+        }
+    }.lessThan);
+}
+
+fn validateGeneralPath(path: []const u8, options: GeneralScanOptions) !void {
+    if (path.len == 0 or path[0] == '/' or path[path.len - 1] == '/') {
+        return error.InvalidImportedPath;
+    }
+    limits_mod.observe(options.diagnostic, .path_bytes, path.len);
+    if (path.len > options.max_path_bytes) {
+        return limits_mod.exceeded(
+            options.diagnostic,
+            .path_bytes,
+            path.len,
+            options.max_path_bytes,
+        );
+    }
+}
+
+fn validateGeneralComponent(component: []const u8, options: GeneralScanOptions) !void {
+    if (component.len == 0 or component.len > 255 or
+        std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..") or
+        std.mem.indexOfScalar(u8, component, 0) != null or
+        std.mem.indexOfScalar(u8, component, '/') != null)
+    {
+        return error.InvalidImportedPath;
+    }
+    limits_mod.observe(options.diagnostic, .component_bytes, component.len);
+    if (component.len > options.max_component_bytes) {
+        return limits_mod.exceeded(
+            options.diagnostic,
+            .component_bytes,
+            component.len,
+            options.max_component_bytes,
+        );
+    }
+}
+
+fn appendInodeBodyXattrs(
+    allocator: std.mem.Allocator,
+    inode_bytes: []const u8,
+    out: *std.array_list.Managed(OwnedXattr),
+) !void {
+    if (inode_bytes.len <= 128 + 2) return;
+    const extra_isize = readInt(u16, inode_bytes[128..130]);
+    const header_start = 128 + @as(usize, extra_isize);
+    if (extra_isize < 4 or header_start + 4 > inode_bytes.len) return;
+    if (readInt(u32, inode_bytes[header_start .. header_start + 4]) != ext4_xattr_magic) return;
+    const entries_start = header_start + 4;
+    try appendXattrEntries(allocator, inode_bytes, entries_start, entries_start, out);
+}
+
+/// Walks one ext4 attribute list. Entry offsets are block-relative in an
+/// external block and entry-area-relative inside an inode, which is the only
+/// difference between the two encodings.
+fn appendXattrEntries(
+    allocator: std.mem.Allocator,
+    region: []const u8,
+    entries_offset: usize,
+    value_base: usize,
+    out: *std.array_list.Managed(OwnedXattr),
+) !void {
+    var cursor = entries_offset;
+    while (true) {
+        if (cursor + 4 > region.len) return error.UnsupportedXattrLayout;
+        if (readInt(u32, region[cursor .. cursor + 4]) == 0) return;
+        if (cursor + 16 > region.len) return error.UnsupportedXattrLayout;
+        const name_len = region[cursor];
+        const name_index = region[cursor + 1];
+        const value_offset = readInt(u16, region[cursor + 2 .. cursor + 4]);
+        const value_inode = readInt(u32, region[cursor + 4 .. cursor + 8]);
+        const value_size = readInt(u32, region[cursor + 8 .. cursor + 12]);
+        if (value_inode != 0) return error.UnsupportedXattrInodeFeature;
+        const entry_len = alignUpUsize(16 + @as(usize, name_len), 4);
+        if (cursor + entry_len > region.len) return error.UnsupportedXattrLayout;
+        const value_start = std.math.add(usize, value_base, value_offset) catch
+            return error.UnsupportedXattrLayout;
+        const value_end = std.math.add(usize, value_start, value_size) catch
+            return error.UnsupportedXattrLayout;
+        if (value_end > region.len) return error.UnsupportedXattrLayout;
+        const short_name = region[cursor + 16 .. cursor + 16 + name_len];
+        const name = try joinXattrName(allocator, name_index, short_name);
+        errdefer allocator.free(name);
+        if (name.len == 0) return error.UnsupportedXattrLayout;
+        const value = try allocator.dupe(u8, region[value_start..value_end]);
+        errdefer allocator.free(value);
+        try out.append(.{ .name = name, .value = value });
+        cursor += entry_len;
+    }
+}
+
+fn readGeneralContent(
+    content: *const GeneralContent,
+    buffer: []u8,
+    offset: u64,
+) !usize {
+    if (offset >= content.size) return 0;
+    const remaining = std.math.cast(usize, content.size - offset) orelse
+        return error.FileTooLarge;
+    const want = @min(buffer.len, remaining);
+    if (want == 0) return 0;
+
+    const reader = content.reader;
+    if (content.flags & inode_flag_extents == 0) {
+        // The only inode without an extent tree this importer accepts is a
+        // fast symlink, whose target sits in `i_block` itself.
+        if (content.size >= 60) return error.UnsupportedBlockMappedInode;
+        const start: usize = @intCast(offset);
+        @memcpy(buffer[0..want], content.block_bytes[start .. start + want]);
+        return want;
+    }
+
+    const extents = try readGeneralExtents(
+        reader,
+        content.io,
+        reader.allocator,
+        content.block_bytes[0..],
+        content.inode_number,
+    );
+    defer reader.allocator.free(extents);
+
+    var done: usize = 0;
+    while (done < want) {
+        const logical_offset = offset + done;
+        const logical_block: u32 = std.math.cast(u32, logical_offset / reader.block_size) orelse
+            return error.FileTooLarge;
+        const within_block: usize = @intCast(logical_offset % reader.block_size);
+        const chunk = @min(want - done, @as(usize, reader.block_size) - within_block);
+        const mapping = findGeneralBlock(extents, logical_block);
+        if (mapping) |physical| {
+            try reader.readAll(
+                content.io,
+                buffer[done .. done + chunk],
+                reader.blockOffset(physical) + within_block,
+            );
+        } else {
+            // A hole, or an allocated-but-never-written extent. Both read as
+            // zeros on a live filesystem, and preserving that is the
+            // difference between importing a sparse file and importing junk.
+            @memset(buffer[done .. done + chunk], 0);
+        }
+        done += chunk;
+    }
+    return done;
+}
+
+fn findGeneralBlock(extents: []const GeneralExtent, logical_block: u32) ?u64 {
+    for (extents) |extent| {
+        if (logical_block < extent.logical_block) continue;
+        if (logical_block - extent.logical_block >= extent.block_count) continue;
+        if (!extent.initialized) return null;
+        return extent.start_block + (logical_block - extent.logical_block);
+    }
+    return null;
+}
+
+fn readGeneralExtents(
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    root_bytes: []const u8,
+    inode_number: u32,
+) ![]GeneralExtent {
+    var extents = std.array_list.Managed(GeneralExtent).init(allocator);
+    errdefer extents.deinit();
+    try appendGeneralExtentNode(
+        reader,
+        io,
+        allocator,
+        root_bytes,
+        max_inline_extents,
+        null,
+        inode_number,
+        &extents,
+    );
+    return extents.toOwnedSlice();
+}
+
+fn appendGeneralExtentNode(
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    node_bytes: []const u8,
+    capacity: usize,
+    expected_depth: ?u16,
+    inode_number: u32,
+    extents: *std.array_list.Managed(GeneralExtent),
+) !void {
+    const header = try parseExtentHeader(node_bytes[0..extent_header_size]);
+    if (expected_depth) |depth| {
+        if (header.depth != depth) return error.UnsupportedExtentLayout;
+    }
+    if (header.depth > max_supported_extent_depth) return error.UnsupportedExtentDepth;
+    if (header.entries > header.max or header.max > capacity) {
+        return error.UnsupportedExtentLayout;
+    }
+
+    if (header.depth == 0) {
+        var index: usize = 0;
+        while (index < header.entries) : (index += 1) {
+            const base = extent_header_size + index * extent_entry_size;
+            const raw_count = readInt(u16, node_bytes[base + 4 .. base + 6]);
+            const initialized = raw_count <= 32768;
+            const block_count: u32 = if (initialized) raw_count else raw_count - 32768;
+            if (block_count == 0) return error.UnsupportedExtent;
+            const decoded = decodeExtent(node_bytes[base .. base + extent_entry_size]);
+            const end = std.math.add(u64, decoded.start_block, block_count) catch
+                return error.UnsupportedExtent;
+            if (initialized and (decoded.start_block == 0 or end > reader.total_blocks)) {
+                return error.UnsupportedExtent;
+            }
+            try extents.append(.{
+                .logical_block = decoded.logical_block,
+                .start_block = decoded.start_block,
+                .block_count = block_count,
+                .initialized = initialized,
+            });
+        }
+        return;
+    }
+
+    const child_block = try allocator.alloc(u8, reader.block_size);
+    defer allocator.free(child_block);
+    var index: usize = 0;
+    while (index < header.entries) : (index += 1) {
+        const base = extent_header_size + index * extent_entry_size;
+        const child = decodeExtentIndex(node_bytes[base .. base + extent_entry_size]);
+        if (child.leaf_block == 0 or child.leaf_block >= reader.total_blocks) {
+            return error.UnsupportedExtent;
+        }
+        try reader.readAll(io, child_block, reader.blockOffset(child.leaf_block));
+        try appendGeneralExtentNode(
+            reader,
+            io,
+            allocator,
+            child_block,
+            extentEntriesPerBlock(reader.block_size),
+            header.depth - 1,
+            inode_number,
+            extents,
+        );
+    }
+}
+
 fn bitmapByteLength(bit_count: u32) usize {
     return (@as(usize, bit_count) + 7) / 8;
 }
@@ -4446,13 +5827,23 @@ fn dupXattrs(allocator: std.mem.Allocator, xattrs: []const Xattr) PopulateError!
     return owned;
 }
 
+/// ext4 stores an attribute name as a prefix index plus the remainder, and
+/// POSIX ACLs have whole-name indexes of their own rather than sharing the
+/// generic `system.` prefix. Those two names are matched first so an imported
+/// ACL is re-emitted with the same index a kernel would have written.
 fn splitXattrName(full_name: []const u8) PopulateError!struct { index: u8, short_name: []const u8 } {
     if (full_name.len == 0) return error.InvalidXattr;
+    if (std.mem.eql(u8, full_name, posix_acl_access_name)) {
+        return .{ .index = xattr_name_posix_acl_access, .short_name = "" };
+    }
+    if (std.mem.eql(u8, full_name, posix_acl_default_name)) {
+        return .{ .index = xattr_name_posix_acl_default, .short_name = "" };
+    }
     inline for (.{
         .{ .prefix = "user.", .index = xattr_name_user },
         .{ .prefix = "trusted.", .index = xattr_name_trusted },
         .{ .prefix = "security.", .index = xattr_name_security },
-        .{ .prefix = "system.", .index = @as(u8, 7) },
+        .{ .prefix = "system.", .index = xattr_name_system },
     }) |candidate| {
         if (std.mem.startsWith(u8, full_name, candidate.prefix)) {
             const short_name = full_name[candidate.prefix.len..];
@@ -4464,12 +5855,17 @@ fn splitXattrName(full_name: []const u8) PopulateError!struct { index: u8, short
     return .{ .index = 0, .short_name = full_name };
 }
 
+const posix_acl_access_name = "system.posix_acl_access";
+const posix_acl_default_name = "system.posix_acl_default";
+
 fn joinXattrName(allocator: std.mem.Allocator, index: u8, short_name: []const u8) std.mem.Allocator.Error![]u8 {
     const prefix = switch (index) {
         xattr_name_user => "user.",
+        xattr_name_posix_acl_access => posix_acl_access_name,
+        xattr_name_posix_acl_default => posix_acl_default_name,
         xattr_name_trusted => "trusted.",
         xattr_name_security => "security.",
-        7 => "system.",
+        xattr_name_system => "system.",
         else => "",
     };
     var full_name = try allocator.alloc(u8, prefix.len + short_name.len);
@@ -6598,4 +7994,471 @@ test "a strict scan reports peaks and names the limit that stopped it" {
     try std.testing.expectEqual(limits_mod.Limit.nodes, breached.exceeded.?.limit);
     try std.testing.expectEqual(@as(u64, 2), breached.exceeded.?.observed);
     try std.testing.expectEqual(@as(u64, 1), breached.exceeded.?.configured);
+}
+
+// ---------------------------------------------------------------------------
+// General import tests
+//
+// These build real filesystems with stock `mke2fs` defaults -- 256-byte
+// inodes, a journal, `64bit`, `flex_bg`, `metadata_csum` -- because the whole
+// point of the general importer is the profile this module's own writer will
+// never produce. A fixture generated from a directory needs no privileges, so
+// the coverage is real rather than synthetic; where the tool is missing the
+// tests decline instead of passing vacuously.
+// ---------------------------------------------------------------------------
+
+fn runExternalTool(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    args: []const []const u8,
+) !?std.process.RunResult {
+    const prefixes = [_][]const u8{ "", "/sbin/", "/usr/sbin/" };
+    for (prefixes) |prefix| {
+        const binary = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, name });
+        defer allocator.free(binary);
+        const argv = try allocator.alloc([]const u8, args.len + 1);
+        defer allocator.free(argv);
+        argv[0] = binary;
+        @memcpy(argv[1..], args);
+        const result = std.process.run(allocator, std.testing.io, .{
+            .argv = argv,
+            .cwd = .{ .path = "." },
+        }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        return result;
+    }
+    return null;
+}
+
+fn runExternalToolChecked(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    args: []const []const u8,
+) !void {
+    const maybe_result = try runExternalTool(allocator, name, args);
+    const result = maybe_result orelse return error.SkipZigTest;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            std.debug.print("{s} failed (exit {d}):\n{s}\n{s}\n", .{
+                name,
+                code,
+                result.stdout,
+                result.stderr,
+            });
+            return error.ExternalToolFailed;
+        },
+        else => return error.ExternalToolFailed,
+    }
+}
+
+fn writeFixtureFile(io: Io, path: []const u8, bytes: []const u8) !void {
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, 0);
+}
+
+fn findGeneralEntry(tree: *GeneralTree, path: []const u8) ?GeneralEntry {
+    var index: usize = 0;
+    while (index < tree.nodeCount()) : (index += 1) {
+        const entry = tree.entryAt(index);
+        if (std.mem.eql(u8, entry.path, path)) return entry;
+    }
+    return null;
+}
+
+fn readGeneralEntryAlloc(
+    allocator: std.mem.Allocator,
+    entry: GeneralEntry,
+) ![]u8 {
+    const bytes = try allocator.alloc(u8, @intCast(entry.size));
+    errdefer allocator.free(bytes);
+    const content = entry.content orelse return error.MissingContent;
+    var done: usize = 0;
+    while (done < bytes.len) {
+        const got = try content.readAt(bytes[done..], done);
+        if (got == 0) return error.UnexpectedEndOfStream;
+        done += got;
+    }
+    return bytes;
+}
+
+fn expectGeneralXattr(entry: GeneralEntry, name: []const u8, value: []const u8) !void {
+    for (entry.xattrs) |xattr| {
+        if (!std.mem.eql(u8, xattr.name, name)) continue;
+        try std.testing.expectEqualStrings(value, xattr.value);
+        return;
+    }
+    std.debug.print("missing xattr {s} on {s}\n", .{ name, entry.path });
+    return error.TestUnexpectedResult;
+}
+
+const stock_fixture_source = "test-ext4-general-src";
+const stock_fixture_image = "test-ext4-general.img";
+const stock_fixture_bytes: u64 = 16 * 1024 * 1024;
+const stock_long_symlink_target = "../" ++ ("deep/" ** 20) ++ "target";
+
+/// Builds a filesystem with `mke2fs`'s own ext4 defaults from a populated
+/// directory, then adds through `debugfs` the things a directory cannot carry
+/// without privileges: device nodes, a FIFO, fixed ownership and timestamps,
+/// and both inline and block-backed extended attributes.
+fn buildStockFixture(allocator: std.mem.Allocator, io: Io) !void {
+    const cwd = Io.Dir.cwd();
+    cwd.deleteTree(io, stock_fixture_source) catch {};
+    cwd.deleteFile(io, stock_fixture_image) catch {};
+    try cwd.createDirPath(io, stock_fixture_source ++ "/etc/rc.d");
+    try cwd.createDirPath(io, stock_fixture_source ++ "/usr/bin");
+    try cwd.createDirPath(io, stock_fixture_source ++ "/usr/lib");
+    try cwd.createDirPath(io, stock_fixture_source ++ "/var/empty");
+    try cwd.createDirPath(io, stock_fixture_source ++ "/dev");
+    try writeFixtureFile(io, stock_fixture_source ++ "/etc/hostname", "zvmi-general\n");
+
+    const tool_bytes = try allocator.alloc(u8, 9000);
+    defer allocator.free(tool_bytes);
+    for (tool_bytes, 0..) |*byte, index| byte.* = @truncate(index * 7 + 3);
+    try writeFixtureFile(io, stock_fixture_source ++ "/usr/bin/tool", tool_bytes);
+    try cwd.hardLink(
+        stock_fixture_source ++ "/usr/bin/tool",
+        cwd,
+        stock_fixture_source ++ "/usr/bin/tool-alias",
+        io,
+        .{},
+    );
+    try cwd.symLink(io, "../bin/tool", stock_fixture_source ++ "/usr/lib/short", .{});
+    try cwd.symLink(io, stock_long_symlink_target, stock_fixture_source ++ "/usr/lib/long", .{});
+
+    const big_xattr_path = "test-ext4-general-xattr.bin";
+    defer cwd.deleteFile(io, big_xattr_path) catch {};
+    const big_xattr = try allocator.alloc(u8, 300);
+    defer allocator.free(big_xattr);
+    @memset(big_xattr, 'x');
+    try writeFixtureFile(io, big_xattr_path, big_xattr);
+
+    var size_text: [32]u8 = undefined;
+    try runExternalToolChecked(allocator, "mke2fs", &.{
+        "-q",
+        "-t",
+        "ext4",
+        "-b",
+        "4096",
+        "-I",
+        "256",
+        "-d",
+        stock_fixture_source,
+        stock_fixture_image,
+        // mke2fs counts in filesystem blocks, which `-b 4096` just set.
+        try std.fmt.bufPrint(&size_text, "{d}", .{stock_fixture_bytes / 4096}),
+    });
+
+    const script_path = "test-ext4-general-debugfs.txt";
+    defer cwd.deleteFile(io, script_path) catch {};
+    try writeFixtureFile(io, script_path,
+        \\cd /dev
+        \\mknod console c 5 1
+        \\mknod loop0 b 7 0
+        \\mknod initctl p
+        \\sif /dev/console mode 020600
+        \\sif /dev/loop0 mode 060660
+        \\sif /dev/initctl mode 010600
+        \\sif /dev/console uid 0
+        \\sif /dev/loop0 gid 6
+        \\sif /etc/hostname mode 0100640
+        \\sif /etc/hostname uid 1234
+        \\sif /etc/hostname gid 5678
+        \\sif /etc/hostname atime @1500000000
+        \\sif /etc/hostname mtime @1400000000
+        \\sif /etc/hostname ctime @1300000000
+        \\ea_set /etc/hostname security.selinux system_u:object_r:etc_t:s0
+        \\ea_set /etc/hostname user.small inline
+        \\ea_set -f test-ext4-general-xattr.bin /usr/bin/tool user.big
+        \\quit
+        \\
+    );
+    try runExternalToolChecked(allocator, "debugfs", &.{
+        "-w",
+        "-f",
+        script_path,
+        stock_fixture_image,
+    });
+}
+
+fn removeStockFixture(io: Io) void {
+    const cwd = Io.Dir.cwd();
+    cwd.deleteTree(io, stock_fixture_source) catch {};
+    cwd.deleteFile(io, stock_fixture_image) catch {};
+}
+
+test "the general importer reads a stock mke2fs ext4 filesystem in full" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    defer removeStockFixture(io);
+    buildStockFixture(allocator, io) catch |err| switch (err) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const file = try Io.Dir.cwd().openFile(io, stock_fixture_image, .{});
+    defer file.close(io);
+    var reader = try openGeneral(io, file, allocator, .{});
+    defer reader.deinit();
+
+    // Exactly the feature set the strict importer refuses, which is the whole
+    // reason this path exists.
+    try std.testing.expect(reader.inode_size == 256);
+    try std.testing.expect(reader.feature_compat & feature_compat_has_journal != 0);
+    try std.testing.expect(reader.feature_incompat & feature_incompat_64bit != 0);
+    try std.testing.expect(reader.feature_incompat & feature_incompat_flex_bg != 0);
+    const filesystem_length = @as(u64, reader.total_blocks) * reader.block_size;
+    if (scanWriterCompatible(&reader, io, allocator, .{
+        .expected_length = filesystem_length,
+    })) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {
+        // Which strict rule fires first is not the point; that no stock
+        // filesystem can ever satisfy all of them is.
+    }
+
+    var tree = try scanReadable(&reader, io, allocator, .{
+        .available_length = stock_fixture_bytes,
+    });
+    defer tree.deinit();
+
+    try std.testing.expectEqual(SourceProfile.ext4_general_v1, tree.identity.profile);
+    try std.testing.expect(tree.identity.has_journal);
+    try std.testing.expectEqual(@as(u16, 256), tree.identity.inode_size);
+    try std.testing.expectEqual(filesystem_length, tree.identity.filesystem_length);
+
+    const hostname = findGeneralEntry(&tree, "etc/hostname").?;
+    try std.testing.expectEqual(GeneralKind.file, hostname.kind);
+    try std.testing.expectEqual(@as(u16, 0o640), hostname.mode);
+    try std.testing.expectEqual(@as(u32, 1234), hostname.uid);
+    try std.testing.expectEqual(@as(u32, 5678), hostname.gid);
+    try std.testing.expectEqual(@as(i64, 1500000000), hostname.atime);
+    try std.testing.expectEqual(@as(i64, 1400000000), hostname.mtime);
+    try std.testing.expectEqual(@as(i64, 1300000000), hostname.ctime);
+    const hostname_bytes = try readGeneralEntryAlloc(allocator, hostname);
+    defer allocator.free(hostname_bytes);
+    try std.testing.expectEqualStrings("zvmi-general\n", hostname_bytes);
+    try expectGeneralXattr(hostname, "security.selinux", "system_u:object_r:etc_t:s0");
+    try expectGeneralXattr(hostname, "user.small", "inline");
+
+    const tool = findGeneralEntry(&tree, "usr/bin/tool").?;
+    try std.testing.expectEqual(GeneralKind.file, tool.kind);
+    try std.testing.expectEqual(@as(u64, 9000), tool.size);
+    const tool_bytes = try readGeneralEntryAlloc(allocator, tool);
+    defer allocator.free(tool_bytes);
+    for (tool_bytes, 0..) |byte, index| {
+        try std.testing.expectEqual(@as(u8, @truncate(index * 7 + 3)), byte);
+    }
+    // 300 bytes cannot fit beside a 256-byte inode, so this one proves the
+    // external xattr block is read as well as the inline area.
+    var expected_big: [300]u8 = undefined;
+    @memset(&expected_big, 'x');
+    try expectGeneralXattr(tool, "user.big", &expected_big);
+
+    const alias = findGeneralEntry(&tree, "usr/bin/tool-alias").?;
+    try std.testing.expectEqual(GeneralKind.hardlink, alias.kind);
+    try std.testing.expectEqualStrings("usr/bin/tool", alias.hardlink_target);
+    try std.testing.expectEqual(@as(?FileTreeView.ContentReader, null), alias.content);
+
+    const short = findGeneralEntry(&tree, "usr/lib/short").?;
+    try std.testing.expectEqual(GeneralKind.symlink, short.kind);
+    const short_target = try readGeneralEntryAlloc(allocator, short);
+    defer allocator.free(short_target);
+    try std.testing.expectEqualStrings("../bin/tool", short_target);
+
+    // Longer than 59 bytes, so ext4 stores it in a block rather than inline.
+    const long = findGeneralEntry(&tree, "usr/lib/long").?;
+    try std.testing.expectEqual(GeneralKind.symlink, long.kind);
+    const long_target = try readGeneralEntryAlloc(allocator, long);
+    defer allocator.free(long_target);
+    try std.testing.expectEqualStrings(stock_long_symlink_target, long_target);
+
+    const console = findGeneralEntry(&tree, "dev/console").?;
+    try std.testing.expectEqual(GeneralKind.char_device, console.kind);
+    try std.testing.expectEqual(@as(u32, 5), console.device.major);
+    try std.testing.expectEqual(@as(u32, 1), console.device.minor);
+    try std.testing.expectEqual(@as(u16, 0o600), console.mode);
+
+    const loop0 = findGeneralEntry(&tree, "dev/loop0").?;
+    try std.testing.expectEqual(GeneralKind.block_device, loop0.kind);
+    try std.testing.expectEqual(@as(u32, 7), loop0.device.major);
+    try std.testing.expectEqual(@as(u32, 0), loop0.device.minor);
+    try std.testing.expectEqual(@as(u32, 6), loop0.gid);
+
+    const initctl = findGeneralEntry(&tree, "dev/initctl").?;
+    try std.testing.expectEqual(GeneralKind.fifo, initctl.kind);
+    try std.testing.expectEqual(@as(u16, 0o600), initctl.mode);
+
+    try std.testing.expectEqual(GeneralKind.directory, findGeneralEntry(&tree, "var/empty").?.kind);
+    try std.testing.expectEqual(GeneralKind.directory, findGeneralEntry(&tree, "etc/rc.d").?.kind);
+
+    // The hardlinked inode's bytes are billed once, not once per name.
+    try std.testing.expectEqual(
+        @as(u64, 9000 + "zvmi-general\n".len + "../bin/tool".len + stock_long_symlink_target.len),
+        tree.content_bytes,
+    );
+}
+
+test "the general importer names every feature it refuses" {
+    const base_incompat = feature_incompat_extents | feature_incompat_filetype;
+    const cases = [_]struct { compat: u32, incompat: u32, ro_compat: u32, expected: anyerror }{
+        .{ .compat = 0, .incompat = base_incompat, .ro_compat = feature_ro_compat_bigalloc, .expected = error.UnsupportedBigallocFeature },
+        .{ .compat = 0, .incompat = base_incompat | feature_incompat_inline_data, .ro_compat = 0, .expected = error.UnsupportedInlineDataFeature },
+        .{ .compat = 0, .incompat = base_incompat | feature_incompat_casefold, .ro_compat = 0, .expected = error.UnsupportedCasefoldFeature },
+        .{ .compat = 0, .incompat = base_incompat | feature_incompat_encrypt, .ro_compat = 0, .expected = error.UnsupportedEncryptFeature },
+        .{ .compat = 0, .incompat = base_incompat, .ro_compat = feature_ro_compat_verity, .expected = error.UnsupportedVerityFeature },
+        .{ .compat = 0, .incompat = base_incompat | feature_incompat_mmp, .ro_compat = 0, .expected = error.UnsupportedMmpFeature },
+        .{ .compat = feature_compat_fast_commit, .incompat = base_incompat, .ro_compat = 0, .expected = error.UnsupportedFastCommitFeature },
+        .{ .compat = 0, .incompat = base_incompat, .ro_compat = feature_ro_compat_quota, .expected = error.UnsupportedQuotaFeature },
+        .{ .compat = 0, .incompat = base_incompat, .ro_compat = feature_ro_compat_project, .expected = error.UnsupportedProjectFeature },
+        .{ .compat = 0, .incompat = base_incompat | feature_incompat_compression, .ro_compat = 0, .expected = error.UnsupportedCompressionFeature },
+        .{ .compat = 0, .incompat = base_incompat | feature_incompat_meta_bg, .ro_compat = 0, .expected = error.UnsupportedMetaBlockGroupFeature },
+        .{ .compat = 0, .incompat = base_incompat | feature_incompat_journal_dev, .ro_compat = 0, .expected = error.UnsupportedExternalJournalFeature },
+        .{ .compat = 0, .incompat = base_incompat | feature_incompat_ea_inode, .ro_compat = 0, .expected = error.UnsupportedXattrInodeFeature },
+        .{ .compat = 0, .incompat = base_incompat | feature_incompat_largedir, .ro_compat = 0, .expected = error.UnsupportedLargeDirFeature },
+        .{ .compat = 0, .incompat = base_incompat | feature_incompat_dirdata, .ro_compat = 0, .expected = error.UnsupportedDirdataFeature },
+        .{ .compat = 0, .incompat = base_incompat, .ro_compat = feature_ro_compat_has_snapshot, .expected = error.UnsupportedSnapshotFeature },
+        .{ .compat = 0, .incompat = base_incompat, .ro_compat = feature_ro_compat_replica, .expected = error.UnsupportedReplicaFeature },
+        // `orphan_present` says the orphan file still lists inodes to clean
+        // up, which only a mount can do.
+        .{ .compat = 0, .incompat = base_incompat, .ro_compat = feature_ro_compat_orphan_present, .expected = error.SourceHasOrphanInodes },
+        .{ .compat = 0, .incompat = base_incompat, .ro_compat = feature_ro_compat_shared_blocks, .expected = error.UnsupportedSharedBlocksFeature },
+        .{ .compat = feature_compat_sparse_super2, .incompat = base_incompat, .ro_compat = 0, .expected = error.UnsupportedSparseSuper2Feature },
+        .{ .compat = 0, .incompat = base_incompat, .ro_compat = feature_ro_compat_gdt_csum, .expected = error.UnsupportedLegacyGroupChecksumFeature },
+        .{ .compat = 0, .incompat = base_incompat, .ro_compat = feature_ro_compat_btree_dir, .expected = error.UnsupportedBtreeDirectoryFeature },
+        .{ .compat = feature_compat_imagic_inodes, .incompat = base_incompat, .ro_compat = 0, .expected = error.UnsupportedImagicInodeFeature },
+        .{ .compat = feature_compat_dir_prealloc, .incompat = base_incompat, .ro_compat = 0, .expected = error.UnsupportedDirectoryPreallocFeature },
+        .{ .compat = feature_compat_stable_inodes, .incompat = base_incompat, .ro_compat = 0, .expected = error.UnsupportedStableInodesFeature },
+        .{ .compat = 0, .incompat = feature_incompat_filetype, .ro_compat = 0, .expected = error.MissingExtentsFeature },
+        .{ .compat = 0, .incompat = feature_incompat_extents, .ro_compat = 0, .expected = error.MissingFiletypeFeature },
+        // An entirely unknown bit must still refuse rather than be ignored.
+        .{ .compat = 0, .incompat = base_incompat | 0x8000_0000, .ro_compat = 0, .expected = error.UnsupportedFilesystemFeature },
+        .{ .compat = 0x8000_0000, .incompat = base_incompat, .ro_compat = 0, .expected = error.UnsupportedFilesystemFeature },
+        .{ .compat = 0, .incompat = base_incompat, .ro_compat = 0x8000_0000, .expected = error.UnsupportedFilesystemFeature },
+    };
+    for (cases) |case| {
+        try std.testing.expectError(
+            case.expected,
+            classifyGeneralFeatures(case.compat, case.incompat, case.ro_compat),
+        );
+    }
+
+    // The stock distro feature set is exactly what must be accepted.
+    try classifyGeneralFeatures(
+        feature_compat_has_journal | feature_compat_ext_attr | feature_compat_resize_inode |
+            feature_compat_dir_index | feature_compat_orphan_file,
+        base_incompat | feature_incompat_64bit | feature_incompat_flex_bg |
+            feature_incompat_csum_seed,
+        feature_ro_compat_sparse_super | feature_ro_compat_large_file |
+            feature_ro_compat_huge_file | feature_ro_compat_dir_nlink |
+            feature_ro_compat_extra_isize | feature_ro_compat_metadata_csum,
+    );
+}
+
+fn writeGeneralFixture(io: Io, path: []const u8, length: u64) !Io.File {
+    const attrs = [_]Xattr{.{ .name = "user.test", .value = "value" }};
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o750, .uid = 1, .gid = 2 },
+        .{ .path = "etc/file", .kind = .file, .mode = 0o640, .uid = 3, .gid = 4, .size = 4, .bytes = "test", .xattrs = &attrs },
+        .{ .path = "etc/link", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = 4, .bytes = "file" },
+    });
+    tree.bind();
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    errdefer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = length,
+        .uuid = [_]u8{0x42} ** 16,
+        .timestamp = 1_717_171_717,
+    });
+    return file;
+}
+
+test "the general importer accepts this module's own output and reports its profile" {
+    const io = std.testing.io;
+    const path = "test-ext4-general-self.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    const length = 8 * 1024 * 1024;
+    const file = try writeGeneralFixture(io, path, length);
+    defer file.close(io);
+
+    var reader = try openGeneral(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+
+    var measured = limits_mod.Diagnostic{};
+    var tree = try scanReadable(&reader, io, std.testing.allocator, .{
+        .available_length = length,
+        .diagnostic = &measured,
+    });
+    defer tree.deinit();
+
+    try std.testing.expectEqual(SourceProfile.ext4_general_v1, tree.identity.profile);
+    try std.testing.expect(!SourceProfile.ext4_general_v1.isByteReproducible());
+    try std.testing.expect(SourceProfile.zvmi_ext4_v1.isByteReproducible());
+    try std.testing.expectEqual(@as(usize, 3), tree.nodeCount());
+    try std.testing.expectEqual(@as(u64, 3), measured.peaks.nodes);
+    try std.testing.expectEqual(@as(u64, 1), measured.peaks.xattrs_per_node);
+    try std.testing.expectEqual(@as(u64, 8), measured.peaks.path_bytes);
+    try std.testing.expect(measured.peaks.scan_metadata_bytes != 0);
+    try std.testing.expect(measured.exceeded == null);
+
+    const entry = findGeneralEntry(&tree, "etc/file").?;
+    try std.testing.expectEqual(@as(u16, 0o640), entry.mode);
+    try expectGeneralXattr(entry, "user.test", "value");
+
+    var breached = limits_mod.Diagnostic{};
+    try std.testing.expectError(error.NodeLimitExceeded, scanReadable(&reader, io, std.testing.allocator, .{
+        .available_length = length,
+        .max_nodes = 1,
+        .diagnostic = &breached,
+    }));
+    try std.testing.expectEqual(limits_mod.Limit.nodes, breached.exceeded.?.limit);
+}
+
+test "the general importer refuses a source the journal still owns" {
+    const io = std.testing.io;
+    const path = "test-ext4-general-dirty.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    const length = 8 * 1024 * 1024;
+    const file = try writeGeneralFixture(io, path, length);
+    defer file.close(io);
+
+    // Clearing `s_state`'s clean bit is exactly what an unclean shutdown
+    // leaves behind, and replaying the journal to recover it is out of scope.
+    var state: [2]u8 = undefined;
+    _ = try file.readPositionalAll(io, &state, superblock_offset + 0x3A);
+    writeInt(u16, &state, readInt(u16, &state) & ~@as(u16, state_clean));
+    try file.writePositionalAll(io, &state, superblock_offset + 0x3A);
+
+    var reader = try openGeneral(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    try std.testing.expectError(
+        error.SourceNotCleanlyUnmounted,
+        scanReadable(&reader, io, std.testing.allocator, .{ .available_length = length }),
+    );
+}
+
+test "the general importer refuses a source with orphan inodes pending" {
+    const io = std.testing.io;
+    const path = "test-ext4-general-orphan.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    const length = 8 * 1024 * 1024;
+    const file = try writeGeneralFixture(io, path, length);
+    defer file.close(io);
+
+    // A non-empty orphan list means inodes were unlinked while still open, so
+    // the on-disk tree is not the tree the guest last saw.
+    var orphan: [4]u8 = undefined;
+    writeInt(u32, &orphan, 11);
+    try file.writePositionalAll(io, &orphan, superblock_offset + 0xE8);
+
+    var reader = try openGeneral(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    try std.testing.expectError(
+        error.SourceHasOrphanInodes,
+        scanReadable(&reader, io, std.testing.allocator, .{ .available_length = length }),
+    );
 }
