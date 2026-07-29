@@ -407,11 +407,7 @@ fn parseArchitecture(value: []const u8) ?zvmi.customize.Architecture {
 }
 
 fn parseFormat(value: []const u8) ?zvmi.customize.OutputFormat {
-    if (std.mem.eql(u8, value, "raw")) return .raw;
-    if (std.mem.eql(u8, value, "vhd")) return .vhd;
-    if (std.mem.eql(u8, value, "vhdx")) return .vhdx;
-    if (std.mem.eql(u8, value, "qcow2")) return .qcow2;
-    return null;
+    return zvmi.customize.OutputFormat.parseName(value);
 }
 
 fn parseGeneration(value: []const u8) ?zvmi.azure.Generation {
