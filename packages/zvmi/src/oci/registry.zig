@@ -2413,7 +2413,21 @@ fn isRetryableTransportError(err: anyerror) bool {
     };
 }
 
+/// Whether the response to this request can carry a body at all.
+///
+/// `std.http.Client.Response.reader` hands back the shared `Io.Reader.ending`
+/// sentinel for methods whose responses never have one. That sentinel is a
+/// `const` the standard library `@constCast`s, so reading from it writes the
+/// seek position into constant memory: on targets where the relocated
+/// read-only data really is mapped read-only, a HEAD response is a segfault,
+/// and elsewhere it silently scribbles on a global shared by every caller.
+/// A HEAD response has no body to read either way, so never touch the reader.
+fn responseCanHaveBody(response: *const std.http.Client.Response) bool {
+    return response.request.method.responseHasBody();
+}
+
 fn discardResponse(response: *std.http.Client.Response) !void {
+    if (!responseCanHaveBody(response)) return;
     var buffer: [8192]u8 = undefined;
     const reader = response.reader(&buffer);
     var discarded: usize = 0;
@@ -2430,6 +2444,7 @@ fn readResponseBodyAlloc(
     limit: usize,
     truncate: bool,
 ) ![]u8 {
+    if (!responseCanHaveBody(response)) return allocator.alloc(u8, 0);
     var response_buffer: [16 * 1024]u8 = undefined;
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&response_buffer);
