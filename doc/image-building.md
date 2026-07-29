@@ -122,6 +122,66 @@ managed-data-disk activation by stable Azure LUN at `/e` through `/z`. Managed
 disks are mount-only: existing ext4 partition 1 is mounted, while blank and
 unknown layouts are left untouched.
 
+### Preserved-image customization backends
+
+Customizing an image that already exists selects one of five backends. They are
+ordered by how much they can do, which is the same order as how much they need.
+
+| Backend | Privileges | Runs guest code | Architectures | Can do |
+| --- | --- | --- | --- | --- |
+| `native_edit` | none | no | any | overwrite, remove existing paths |
+| `rebuild` | none | no | any | full tree rebuild of one `zvmi_ext4_v1` partition |
+| `native_fresh` | none | no | any | build a new image rather than edit one |
+| `unsafe_chroot` | root + `CAP_SYS_CHROOT`/`CAP_SYS_ADMIN`/`CAP_MKNOD` | yes, on the host kernel | host's only | install/remove packages, regenerate initramfs |
+| `vm` | none | yes, in an isolated guest | any | install/remove packages, regenerate initramfs, cross-architecture |
+
+`vm` is the only backend that can customize an image the host cannot run, and
+the only one that executes guest code without executing it on the host. It
+boots the image's own kernel directly (`-kernel`/`-initrd` + `rdinit=`) with a
+static agent appended to a copy of the image's initramfs, so no bootloader,
+firmware or init system is involved and a fully emulated boot costs seconds.
+
+The cost is a hard requirement on the image: because the agent is `rdinit`, the
+guest starts with only the drivers its own kernel built in, and there is no
+`modprobe`, `udev` or module tree to reach for at that point. So **`ext4`, a
+virtio disk driver and the virtio PCI bus must either be built into the image's
+kernel or be present in the image's own `lib/modules/<release>` tree.** The
+backend reads `modules.builtin` and `modules.dep` out of the image, resolves the
+dependency closure of what the run needs, decompresses those modules host-side,
+and appends them to the initramfs beside the agent, which inserts them before it
+waits for any device. A driver that is neither built in nor in the tree refuses
+the run rather than being guessed at, since a wrong guess is not a wrong answer
+but a device that never appears.
+
+Two drivers are asked for that no dependency graph names, because `modules.dep`
+records symbol dependencies and neither of these is one: `virtio_pci`, since
+every device the backend attaches is a PCI device, and `sd_mod`, since a
+virtio-scsi controller with no SCSI disk driver behind it presents no `/dev/sda`.
+
+A built-in driver is never traded for a loadable one, so an image whose kernel
+builds everything in boots exactly as it did before, with an empty module list.
+
+| Image kernel provides | Result |
+| --- | --- |
+| `ext4` + `virtio_blk` built in | disks attached over virtio-blk (`/dev/vd*`) |
+| `ext4` + `virtio_scsi` + `sd_mod` built in (Azure Linux) | disks attached over virtio-scsi (`/dev/sd*`) |
+| the same drivers in `lib/modules` (Debian, Ubuntu, Fedora cloud kernels) | loaded from the image's own tree before the mount |
+| neither built in nor in the tree | refused in preflight, named for the missing driver |
+
+`virtio_net` is required only when the plan declares package repositories; an
+offline guest is given no network device at all, so a modular `virtio_net` is
+inserted only for a run that has somewhere to go.
+
+Every module that was loaded is recorded in provenance by name, by the path
+inside the image it came from, and by the digest of the object as the guest
+received it.
+
+Acceleration is fail-closed. Hardware acceleration requires host architecture ==
+image architecture and a readable and writable `/dev/kvm`, and is refused rather
+than degraded. Software emulation must be asked for by name, and is the only
+option for a cross-architecture run, since no accelerator crosses architectures.
+Whichever ran is recorded in provenance.
+
 ## Formats and filesystem APIs
 
 `convert` skips all-zero chunks (aligned to the destination's block size for

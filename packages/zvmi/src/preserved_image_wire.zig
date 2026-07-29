@@ -8,6 +8,7 @@ pub const Backend = enum {
     native_edit,
     rebuild,
     unsafe_chroot,
+    vm,
 };
 
 pub const PartitionSelector = union(enum) {
@@ -75,8 +76,63 @@ pub const InitramfsPolicy = union(enum) {
     },
 };
 
+/// Whether the guest runs at the host architecture or a foreign one. This
+/// stays an enum so configurations written before cross-architecture support
+/// keep deserializing unchanged; the runner that makes a foreign architecture
+/// executable is a separate optional field.
 pub const GuestExecutionPolicy = enum {
     same_architecture,
+    cross_architecture,
+};
+
+pub const RunnerKind = enum {
+    qemu_user,
+    binfmt_misc,
+    vm,
+};
+
+pub const Architecture = enum {
+    x86_64,
+    aarch64,
+};
+
+pub const Runner = struct {
+    kind: RunnerKind,
+    guest_architecture: Architecture,
+    command: ?[]const u8 = null,
+};
+
+pub const VmAcceleration = enum {
+    hardware,
+    software,
+};
+
+pub const VmNetworkPolicy = enum {
+    offline,
+    declared_repositories,
+};
+
+pub const VmFirmware = struct {
+    code_path: []const u8,
+    vars_path: []const u8,
+};
+
+pub const VmBoot = union(enum) {
+    direct_kernel,
+    firmware: VmFirmware,
+};
+
+pub const VmConfiguration = struct {
+    emulator_command: []const u8,
+    boot: VmBoot = .direct_kernel,
+    acceleration: VmAcceleration = .hardware,
+    acknowledge_software_emulation: bool = false,
+    memory_mib: u32 = 2048,
+    vcpus: u8 = 2,
+    network: VmNetworkPolicy = .offline,
+    boot_timeout_seconds: u32 = 900,
+    machine: ?[]const u8 = null,
+    cpu: ?[]const u8 = null,
 };
 
 pub const ConfigurationV2 = struct {
@@ -97,6 +153,8 @@ pub const Configuration = struct {
     packages: PackagePolicy = .{},
     initramfs: InitramfsPolicy = .unchanged,
     guest_execution: GuestExecutionPolicy = .same_architecture,
+    runner: ?Runner = null,
+    vm: ?VmConfiguration = null,
 };
 
 pub const ValidationError = error{
@@ -106,6 +164,10 @@ pub const ValidationError = error{
     ExtraSourceArgument,
     SourceIndexOutOfBounds,
     DuplicateSourceIndex,
+    MissingVmConfiguration,
+    UnexpectedVmConfiguration,
+    MissingCrossArchitectureRunner,
+    UnexpectedCrossArchitectureRunner,
 };
 
 pub fn validateV2(configuration: ConfigurationV2, source_count: usize) ValidationError!void {
@@ -123,6 +185,23 @@ pub fn validateV2(configuration: ConfigurationV2, source_count: usize) Validatio
 pub fn validate(configuration: Configuration, source_count: usize) ValidationError!void {
     if (configuration.api_version != api_version) return error.UnsupportedApiVersion;
     try validatePartition(configuration.root_partition);
+
+    // The VM configuration and the backend that reads it travel together, so a
+    // configuration can never describe a guest that will not be built or a
+    // backend that would have to invent one.
+    if (configuration.backend == .vm) {
+        if (configuration.vm == null) return error.MissingVmConfiguration;
+    } else if (configuration.vm != null) {
+        return error.UnexpectedVmConfiguration;
+    }
+    switch (configuration.guest_execution) {
+        .same_architecture => if (configuration.runner != null) {
+            return error.UnexpectedCrossArchitectureRunner;
+        },
+        .cross_architecture => if (configuration.runner == null) {
+            return error.MissingCrossArchitectureRunner;
+        },
+    }
 
     var expected_sources: usize = 0;
     for (configuration.operations) |operation| {
@@ -322,6 +401,88 @@ test "configuration version and one-based partition are validated" {
     try std.testing.expectError(error.InvalidPartitionSelector, validate(.{
         .root_partition = .{ .mbr_index = 5 },
     }, 0));
+}
+
+test "the vm backend and its configuration travel together" {
+    const vm = VmConfiguration{ .emulator_command = "/usr/bin/qemu-system-x86_64" };
+
+    try std.testing.expectError(error.MissingVmConfiguration, validate(.{
+        .backend = .vm,
+        .root_partition = .{ .gpt_index = 1 },
+    }, 0));
+    try std.testing.expectError(error.UnexpectedVmConfiguration, validate(.{
+        .backend = .unsafe_chroot,
+        .root_partition = .{ .gpt_index = 1 },
+        .vm = vm,
+    }, 0));
+    try validate(.{
+        .backend = .vm,
+        .root_partition = .{ .gpt_index = 1 },
+        .vm = vm,
+    }, 0);
+}
+
+test "a cross-architecture guest requires exactly one declared runner" {
+    const runner = Runner{
+        .kind = .vm,
+        .guest_architecture = .aarch64,
+        .command = "/usr/bin/qemu-system-aarch64",
+    };
+
+    try std.testing.expectError(error.MissingCrossArchitectureRunner, validate(.{
+        .root_partition = .{ .gpt_index = 1 },
+        .guest_execution = .cross_architecture,
+    }, 0));
+    try std.testing.expectError(error.UnexpectedCrossArchitectureRunner, validate(.{
+        .root_partition = .{ .gpt_index = 1 },
+        .guest_execution = .same_architecture,
+        .runner = runner,
+    }, 0));
+    try validate(.{
+        .root_partition = .{ .gpt_index = 1 },
+        .guest_execution = .cross_architecture,
+        .runner = runner,
+    }, 0);
+}
+
+test "configurations written before vm support still deserialize" {
+    // `runner` and `vm` are additive, so a v3 document that predates them
+    // parses without an api_version bump. Deriving the legacy document from
+    // the serializer keeps this honest as other fields change.
+    const legacy_shape = Configuration{
+        .backend = .unsafe_chroot,
+        .root_partition = .{ .mbr_index = 1 },
+        .acknowledge_unsafe = true,
+    };
+    const full = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        legacy_shape,
+        .{},
+    );
+    defer std.testing.allocator.free(full);
+    try std.testing.expect(std.mem.indexOf(u8, full, "\"runner\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full, "\"vm\":null") != null);
+
+    const legacy = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        full,
+        ",\"runner\":null,\"vm\":null",
+        "",
+    );
+    defer std.testing.allocator.free(legacy);
+
+    const parsed = try std.json.parseFromSlice(
+        Configuration,
+        std.testing.allocator,
+        legacy,
+        .{ .ignore_unknown_fields = false },
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(Backend.unsafe_chroot, parsed.value.backend);
+    try std.testing.expect(parsed.value.runner == null);
+    try std.testing.expect(parsed.value.vm == null);
+    try validate(parsed.value, 0);
 }
 
 test "v2 configurations remain valid with their original source closure" {

@@ -178,6 +178,37 @@ pub fn build(b: *std.Build) void {
         .guest_execution = .same_architecture,
     });
 
+    // The vm backend on a foreign guest architecture, so the external consumer
+    // path covers cross-architecture execution and the VM policy end to end.
+    const preserved_vm_image = zvmi.addPreservedImage(b, foreign_dependency, .{
+        .name = "preserved-vm-fixture",
+        .input = .{ .disk = b.path("fixtures/os.iso") },
+        .root_partition = .{ .gpt_index = 2 },
+        .output = .{
+            .format = .qcow2,
+            .basename = "preserved-vm-fixture.qcow2",
+        },
+        .target_architecture = .aarch64,
+        .backend = .vm,
+        .reproducibility = .{
+            .seed = [_]u8{0x55} ** 32,
+            .source_date_epoch = 1_735_689_600,
+        },
+        .guest_execution = .cross_architecture,
+        .runner = .{
+            .kind = .vm,
+            .guest_architecture = .aarch64,
+            .command = "/usr/bin/qemu-system-aarch64",
+        },
+        .vm = .{
+            .emulator_command = "/usr/bin/qemu-system-aarch64",
+            .acceleration = .software,
+            // Set so the fixture resolves identically whether or not the
+            // builder host happens to be aarch64.
+            .acknowledge_software_emulation = true,
+        },
+    });
+
     const install_layout = b.addInstallFile(layout_image.path, "images/layout-fixture.qcow2");
     const install_archive = b.addInstallFile(archive_image.path, "images/archive-fixture.vhd");
     const install_plan = b.addInstallFile(layout_image.plan_path, "images/layout-fixture.plan.json");
@@ -212,4 +243,14 @@ pub fn build(b: *std.Build) void {
         "Exercise preserved-image preflight with a foreign dependency target",
     );
     preserved_diagnostics_step.dependOn(&install_preserved_diagnostics.step);
+
+    const install_preserved_vm_diagnostics = b.addInstallFile(
+        preserved_vm_image.preflight_diagnostics_path,
+        "images/preserved-vm-fixture.diagnostics.json",
+    );
+    const preserved_vm_diagnostics_step = b.step(
+        "preserved-vm-diagnostics",
+        "Exercise the vm backend and a cross-architecture runner through preflight",
+    );
+    preserved_vm_diagnostics_step.dependOn(&install_preserved_vm_diagnostics.step);
 }

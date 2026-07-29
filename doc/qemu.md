@@ -5,6 +5,21 @@ with architecture-matched QEMU and firmware. See
 [Azure Linux images](azure-linux.md) for the full/core image comparison and
 release security model.
 
+The same installation is what the `vm` customization backend runs guests in,
+including guests of an architecture the host cannot execute: one
+`cataggar/qemu` install supplies every `qemu-system-*` and both the OVMF and
+AAVMF firmware families. That backend needs an *absolute* emulator path rather
+than a name on `PATH`, so provenance records the exact binary that ran:
+
+```text
+ghr install cataggar/qemu@v11.0.91-z.15
+readlink -f "$(command -v qemu-system-aarch64)"
+```
+
+`readlink -f` matters: it resolves the shim ghr links into `~/.local/bin` to
+the binary inside the extracted tree, and QEMU locates its ROMs relative to its
+own path. See [Library API](library-api.md) for the backend itself.
+
 ## Booting the release image with QEMU
 
 Install QEMU once through ghr:

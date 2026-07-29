@@ -24,6 +24,7 @@ jobs:
           ghr-version: 0.6.6
           tools: |
             cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/qemu@v11.0.91-z.15
 
       - name: zig fmt --check
         run: zig fmt --check .
@@ -44,3 +45,109 @@ jobs:
         env:
           ZVMI_RUN_PRIVILEGED_TEST: "1"
         run: zig build test-unsafe-chroot-integration --summary all
+
+      # The VM backend boots the image's own kernel with `rdinit=`. Drivers it
+      # built in are there already; the rest are inserted out of the image's
+      # own module tree. Azure Linux builds ext4, virtio_scsi and virtio_net
+      # in, and is what this project's images actually run, so it is what
+      # proves the built-in path.
+      - name: Cache VM boot kernels
+        id: cache-vm-kernel
+        uses: actions/cache@v4
+        with:
+          path: fixtures/vm-boot-kernel
+          key: vm-boot-kernel-6.6.139.1-1.azl3-both-v1
+
+      - name: Fetch VM boot kernels
+        run: |
+          if [ "${{ steps.cache-vm-kernel.outputs.cache-hit }}" != "true" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends rpm2cpio cpio
+          fi
+          host="$(uname -m)"
+          case "$host" in
+            x86_64) guest="aarch64" ;;
+            *) guest="x86_64" ;;
+          esac
+          echo "ZVMI_VM_CROSS_ARCH=$guest" >> "$GITHUB_ENV"
+          scripts/ci/fetch-vm-boot-kernel.sh \
+            "fixtures/vm-boot-kernel/$host" "$host" >> "$GITHUB_ENV"
+          scripts/ci/fetch-vm-boot-kernel.sh \
+            "fixtures/vm-boot-kernel/$guest" "$guest" ZVMI_VM_CROSS_ >> "$GITHUB_ENV"
+
+      # Hardware acceleration is probed rather than required. No hosted runner
+      # class is guaranteed to expose /dev/kvm, and a test that demands one is
+      # a test that stops running the moment that changes.
+      - name: Select QEMU accelerator
+        run: |
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "ZVMI_VM_ACCEL=hardware" >> "$GITHUB_ENV"
+          else
+            echo "ZVMI_VM_ACCEL=software" >> "$GITHUB_ENV"
+          fi
+
+      - name: real VM boot
+        env:
+          ZVMI_RUN_VM_BOOT_TEST: "1"
+        run: |
+          set -euo pipefail
+          # `readlink -f` resolves the ghr shim to the binary inside the
+          # extracted tree, which is what QEMU needs: it locates its ROMs
+          # relative to its own path, and an x86 direct-kernel boot still
+          # loads a BIOS ROM.
+          ZVMI_VM_QEMU="$(readlink -f "$(command -v "qemu-system-$(uname -m)")")" \
+            zig build test-vm-real-boot --summary all
+
+      # The same emulator package supplies every guest architecture, so the
+      # cross-architecture run differs only in which one is asked for. This is
+      # the acceptance criterion the backend exists for.
+      - name: cross-architecture VM boot
+        env:
+          ZVMI_RUN_VM_BOOT_TEST: "1"
+        run: |
+          set -euo pipefail
+          export ZVMI_VM_BOOT_ARCH="${ZVMI_VM_CROSS_ARCH}"
+          export ZVMI_VM_BOOT_KERNEL="${ZVMI_VM_CROSS_KERNEL}"
+          export ZVMI_VM_BOOT_MODULES_BUILTIN="${ZVMI_VM_CROSS_MODULES_BUILTIN}"
+          # KVM cannot cross architectures, so this run is emulated whatever
+          # the host happens to offer.
+          export ZVMI_VM_ACCEL=software
+          ZVMI_VM_QEMU="$(readlink -f \
+            "$(command -v "qemu-system-${ZVMI_VM_CROSS_ARCH}")")" \
+            zig build test-vm-real-boot --summary all
+
+      # Azure Linux proves the built-in path and can prove nothing else: it
+      # builds every driver this backend needs in. Debian's generic kernel
+      # modularizes ext4, virtio_blk, virtio_scsi, sd_mod and virtio_pci, so a
+      # guest booted on it reaches its root only if the modules the image
+      # itself ships were resolved, appended and inserted.
+      - name: Cache modular VM boot kernel
+        id: cache-vm-modular-kernel
+        uses: actions/cache@v4
+        with:
+          path: fixtures/vm-boot-modular-kernel
+          key: vm-boot-modular-kernel-6.1.176-1-v1
+
+      - name: Fetch modular VM boot kernel
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.cache-vm-modular-kernel.outputs.cache-hit }}" != "true" ]; then
+            # `ar` unpacks the .deb and `depmod` writes the modules.dep Debian
+            # leaves to its postinst.
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends binutils kmod
+          fi
+          scripts/ci/fetch-vm-boot-modular-kernel.sh \
+            "fixtures/vm-boot-modular-kernel/$(uname -m)" "$(uname -m)" \
+            ZVMI_VM_MODULAR_ >> "$GITHUB_ENV"
+
+      - name: modular VM boot
+        env:
+          ZVMI_RUN_VM_BOOT_TEST: "1"
+        run: |
+          set -euo pipefail
+          export ZVMI_VM_BOOT_KERNEL="${ZVMI_VM_MODULAR_KERNEL}"
+          export ZVMI_VM_BOOT_MODULES_BUILTIN="${ZVMI_VM_MODULAR_MODULES_BUILTIN}"
+          export ZVMI_VM_BOOT_MODULE_TREE="${ZVMI_VM_MODULAR_MODULE_TREE}"
+          ZVMI_VM_QEMU="$(readlink -f "$(command -v "qemu-system-$(uname -m)")")" \
+            zig build test-vm-real-boot --summary all
