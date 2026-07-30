@@ -2,17 +2,24 @@ name: Build, validate, and publish FreeBSD 15.1 images
 
 on:
   workflow_dispatch:
+    inputs:
+      release_set:
+        description: Which FreeBSD 15.1 release set to build and publish
+        type: choice
+        required: true
+        default: ufs
+        options:
+          - ufs
+          - zfs
 
 permissions:
   contents: read
 
+# Release sets publish disjoint assets under distinct tags, so a UFS run and a
+# ZFS run may proceed independently; two runs of the same set may not.
 concurrency:
-  group: freebsd15-release-20260724
+  group: freebsd15-release-${{ inputs.release_set }}
   cancel-in-progress: false
-
-env:
-  RELEASE_TAG: FreeBSD-15.1-20260724
-  RELEASE_TITLE: FreeBSD 15.1 - 20260724
 
 jobs:
   prepare:
@@ -22,6 +29,9 @@ jobs:
     timeout-minutes: 10
     outputs:
       source_commit: ${{ steps.source.outputs.commit }}
+      matrix: ${{ steps.set.outputs.matrix }}
+      release_tag: ${{ steps.set.outputs.release_tag }}
+      release_title: ${{ steps.set.outputs.release_title }}
     steps:
       - name: Check out merged main
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -40,8 +50,21 @@ jobs:
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "Accepted source commit: \`$commit\`" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Resolve the requested release set
+        id: set
+        env:
+          RELEASE_SET: ${{ inputs.release_set }}
+        run: |
+          set -euo pipefail
+          matrix=$(python3 scripts/freebsd15_release.py matrix \
+            --release-set "$RELEASE_SET")
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          python3 scripts/freebsd15_release.py describe \
+            --release-set "$RELEASE_SET" >> "$GITHUB_OUTPUT"
+          echo "Release set: \`$RELEASE_SET\`" >> "$GITHUB_STEP_SUMMARY"
+
   build:
-    name: build and validate ${{ matrix.architecture }}
+    name: build and validate ${{ matrix.variant }}
     needs: prepare
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
@@ -50,26 +73,11 @@ jobs:
     strategy:
       fail-fast: false
       max-parallel: 2
-      matrix:
-        include:
-          - architecture: aarch64
-            runner: ubuntu-24.04-arm
-            asset_name: FreeBSD-15.1-aarch64.qcow2
-            source_name: FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz
-            source_url: https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz
-            source_sha256: 9722aea499610802de9a14bb645707fc4f6df49ff765cd9ce372b783c4693963
-            virtual_size: 6477643776
-            qemu: /usr/bin/qemu-system-aarch64
-          - architecture: x86_64
-            runner: ubuntu-24.04
-            asset_name: FreeBSD-15.1-x86_64.qcow2
-            source_name: FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz
-            source_url: https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz
-            source_sha256: e4ca4db889f8559c9b9dfcacc70405c038476f4b6d41649b152d3809a2ed9e1f
-            virtual_size: 6477709312
-            qemu: /usr/bin/qemu-system-x86_64
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
+      VARIANT: ${{ matrix.variant }}
       ARCHITECTURE: ${{ matrix.architecture }}
+      FILESYSTEM: ${{ matrix.filesystem }}
       ASSET_NAME: ${{ matrix.asset_name }}
       SOURCE_NAME: ${{ matrix.source_name }}
       SOURCE_URL: ${{ matrix.source_url }}
@@ -77,7 +85,7 @@ jobs:
       VIRTUAL_SIZE: ${{ matrix.virtual_size }}
       QEMU: ${{ matrix.qemu }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
-      WORK_DIR: .scratch/generalized-freebsd15-${{ matrix.architecture }}
+      WORK_DIR: .scratch/generalized-freebsd15-${{ matrix.variant }}
       CANDIDATE_DIR: candidate
     steps:
       - name: Check out accepted source
@@ -122,7 +130,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.WORK_DIR }}/${{ env.SOURCE_NAME }}
-          key: freebsd-15.1-${{ matrix.architecture }}-basic-cloudinit-ufs-${{ env.SOURCE_SHA256 }}
+          key: freebsd-15.1-${{ matrix.variant }}-basic-cloudinit-${{ env.SOURCE_SHA256 }}
 
       - name: Build generalized QCOW2
         run: |
@@ -130,12 +138,13 @@ jobs:
           mkdir -p "$CANDIDATE_DIR"
           zig build generalized-freebsd15 -- \
             --architecture "$ARCHITECTURE" \
+            --filesystem "$FILESYSTEM" \
             --work-dir "$GITHUB_WORKSPACE/$WORK_DIR" \
             --output "$GITHUB_WORKSPACE/$CANDIDATE_DIR/$ASSET_NAME" \
             --qemu "$QEMU" \
             --xorriso /usr/bin/xorriso \
             --timeout 3600 2>&1 |
-            tee "$RUNNER_TEMP/freebsd15-$ARCHITECTURE-build.log"
+            tee "$RUNNER_TEMP/freebsd15-$VARIANT-build.log"
 
       - name: Validate release image
         run: |
@@ -152,6 +161,7 @@ jobs:
       - name: Run dual-instance QEMU acceptance
         env:
           ZVMI_FREEBSD15_ARCHITECTURE: ${{ matrix.architecture }}
+          ZVMI_FREEBSD15_FILESYSTEM: ${{ matrix.filesystem }}
           ZVMI_FREEBSD15_IMAGE: ${{ github.workspace }}/${{ env.CANDIDATE_DIR }}/${{ env.ASSET_NAME }}
           ZVMI_FREEBSD15_QEMU: ${{ matrix.qemu }}
         run: zig build test-freebsd15-boot
@@ -167,6 +177,7 @@ jobs:
           qemu_version=$("$QEMU" --version | head -n 1)
           python3 scripts/freebsd15_release.py candidate \
             --architecture "$ARCHITECTURE" \
+            --filesystem "$FILESYSTEM" \
             --asset "$asset" \
             --validated-sha256 "$asset_sha256" \
             --virtual-size "$VIRTUAL_SIZE" \
@@ -184,14 +195,14 @@ jobs:
       - name: Upload exact validated candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: freebsd15-candidate-${{ matrix.architecture }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          name: freebsd15-candidate-${{ matrix.variant }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
           path: ${{ env.CANDIDATE_DIR }}/
           if-no-files-found: error
           compression-level: 0
           retention-days: 2
 
   publish:
-    name: verify two-asset gate and publish
+    name: verify release-set gate and publish
     needs: [prepare, build]
     if: >-
       ${{
@@ -205,6 +216,9 @@ jobs:
       contents: write
     env:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      RELEASE_SET: ${{ inputs.release_set }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+      RELEASE_TITLE: ${{ needs.prepare.outputs.release_title }}
       CANDIDATES_DIR: .release/freebsd15/candidates
       STAGING_ROOT: .release/freebsd15/staging
       REPOSITORY: ${{ github.repository }}
@@ -216,12 +230,12 @@ jobs:
           ref: ${{ needs.prepare.outputs.source_commit }}
           persist-credentials: false
 
-      - name: Download both build-validated candidates
+      - name: Download every build-validated candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: freebsd15-candidate-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
           path: ${{ env.CANDIDATES_DIR }}
           merge-multiple: false
 
-      - name: Publish only the exact two-asset release
+      - name: Publish only the exact release-set allowlist
         run: scripts/freebsd15_publish.sh

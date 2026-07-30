@@ -1,5 +1,6 @@
 //! Opt-in QEMU acceptance for generalized FreeBSD 15.1 release images.
-//! Set `ZVMI_FREEBSD15_IMAGE` and `ZVMI_FREEBSD15_ARCHITECTURE` to run it.
+//! Set `ZVMI_FREEBSD15_IMAGE`, `ZVMI_FREEBSD15_ARCHITECTURE`, and
+//! `ZVMI_FREEBSD15_FILESYSTEM` to run it.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -12,6 +13,17 @@ const Io = std.Io;
 const serial_limit: usize = 2 * 1024 * 1024;
 const serial_tail_size: usize = 256 * 1024;
 const boot_timeout_seconds: i64 = 10 * 60;
+
+/// Every release image is pinned to roughly 6.04 GiB, so each acceptance
+/// overlay is created at 12 GiB to prove first-boot growth. The size stays
+/// under growfs(8)'s 15 GB threshold for volunteering a swap partition, so a
+/// guest that grew and a guest that also gained swap remain distinguishable.
+const expanded_virtual_size: u64 = 12 * 1024 * 1024 * 1024;
+
+/// Lower bound the grown root storage must clear. The upstream root partition
+/// is 5 GiB, so anything at or above this proves the last GPT partition was
+/// resized and the filesystem or pool followed it.
+const minimum_grown_root_bytes: u64 = 8 * 1024 * 1024 * 1024;
 
 const Architecture = enum {
     aarch64,
@@ -51,6 +63,20 @@ const Architecture = enum {
 
 const Firmware = qemu_host.FirmwarePair;
 
+/// Root filesystem of the image under acceptance. The generalized guest
+/// contract is identical for both, but the way each one grows, records swap,
+/// and carries per-instance identity is not, so the checks stay separate.
+const RootFilesystem = enum {
+    ufs,
+    zfs,
+
+    fn parse(text: []const u8) ?RootFilesystem {
+        if (std.mem.eql(u8, text, "ufs")) return .ufs;
+        if (std.mem.eql(u8, text, "zfs")) return .zfs;
+        return null;
+    }
+};
+
 fn optionalEnvAlloc(
     allocator: Allocator,
     comptime name: []const u8,
@@ -68,6 +94,15 @@ fn architectureFromEnvironment(allocator: Allocator) !Architecture {
     ) orelse return .aarch64;
     defer allocator.free(value);
     return Architecture.parse(value) orelse error.InvalidArchitecture;
+}
+
+fn rootFilesystemFromEnvironment(allocator: Allocator) !RootFilesystem {
+    const value = try optionalEnvAlloc(
+        allocator,
+        "ZVMI_FREEBSD15_FILESYSTEM",
+    ) orelse return .ufs;
+    defer allocator.free(value);
+    return RootFilesystem.parse(value) orelse error.InvalidRootFilesystem;
 }
 
 fn requireImageAlloc(
@@ -440,11 +475,15 @@ fn waitForQemuExit(
     return error.QemuShutdownTimedOut;
 }
 
-const remote_checks =
+/// The generalized guest contract, which every profile must satisfy
+/// identically. Anything that depends on how the root is stored belongs in
+/// the per-filesystem checks instead.
+const shared_remote_checks =
     \\set -eu
     \\test "$(sysrc -n waagent_enable)" = YES
     \\test "$(sysrc -n sshd_enable)" = YES
     \\test "$(sysrc -n nuageinit_enable)" = YES
+    \\test "$(sysrc -n growfs_enable)" = YES
     \\test "$(sysrc -n growfs_swap_size)" = 0
     \\test "$(sysrc -n ifconfig_DEFAULT)" = "SYNCDHCP accept_rtadv"
     \\test "$(sysrc -n ifconfig_hn0)" = SYNCDHCP
@@ -462,21 +501,120 @@ const remote_checks =
     \\test "$(swapinfo -k | wc -l | tr -d ' ')" = 1
     \\grep -Fx 'Provisioning.Agent=auto' /usr/local/etc/waagent.conf
     \\grep -Fx 'ResourceDisk.SwapSizeMB=2048' /usr/local/etc/waagent.conf
+    \\disk=$(gpart show | awk '$1 == "=>" { print $4; exit }')
+    \\test -n "${disk}"
+    \\! gpart show | grep -q CORRUPT
+    \\test "$(gpart status -s "${disk}" | awk '{ print $2 }' | sort -u)" = OK
 ;
 
-const identity_command =
+/// UFS-specific state. The root is named in /etc/fstab and grows with
+/// growfs(8), so df(1) reports the enlarged filesystem directly.
+const ufs_remote_checks =
+    \\test "$(mount -p | awk '$2 == "/" { print $3 }')" = ufs
+    \\grep -Eq '^[^#]+[[:space:]]+/[[:space:]]+ufs[[:space:]]' /etc/fstab
+    \\test "$(($(df -k / | awk 'END { print $2 }') * 1024))" -ge @MINIMUM_ROOT_BYTES@
+;
+
+/// ZFS-specific state. The root has no fstab entry and grows by onlining the
+/// enlarged vdev, so the pool - not the dataset - is what must have grown.
+/// The pool must also be healthy, carry autoexpand for later enlargements,
+/// and be re-GUIDed on every boot so two clones stay distinguishable.
+const zfs_remote_checks =
+    \\test "$(mount -p | awk '$2 == "/" { print $3 }')" = zfs
+    \\root_pool=$(mount -p | awk '$2 == "/" { print $1 }' | sed 's|/.*||')
+    \\test "${root_pool}" = zroot
+    \\test "$(zpool status -x "${root_pool}")" = "pool '${root_pool}' is healthy"
+    \\test "$(sysrc -n zfs_enable)" = YES
+    \\test "$(sysrc -n zpool_reguid)" = "${root_pool}"
+    \\test "$(zpool get -H -o value autoexpand "${root_pool}")" = on
+    \\test "$(zpool list -Hp -o size "${root_pool}")" -ge @MINIMUM_ROOT_BYTES@
+    \\test -z "$(zfs list -H -o name,org.freebsd:swap -t volume | awk '$2 == "on" { print $1 }')"
+    \\! grep -Eq '[[:space:]]ufs[[:space:]]' /etc/fstab
+;
+
+fn replaceTokenAlloc(
+    allocator: Allocator,
+    template: []const u8,
+    token: []const u8,
+    value: []const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var offset: usize = 0;
+    while (std.mem.indexOfPos(u8, template, offset, token)) |index| {
+        try output.writer.writeAll(template[offset..index]);
+        try output.writer.writeAll(value);
+        offset = index + token.len;
+    }
+    try output.writer.writeAll(template[offset..]);
+    return output.toOwnedSlice();
+}
+
+fn remoteChecksAlloc(
+    allocator: Allocator,
+    root_filesystem: RootFilesystem,
+) ![]u8 {
+    const specific = switch (root_filesystem) {
+        .ufs => ufs_remote_checks,
+        .zfs => zfs_remote_checks,
+    };
+    const minimum = try std.fmt.allocPrint(
+        allocator,
+        "{d}",
+        .{minimum_grown_root_bytes},
+    );
+    defer allocator.free(minimum);
+    const rendered = try replaceTokenAlloc(
+        allocator,
+        specific,
+        "@MINIMUM_ROOT_BYTES@",
+        minimum,
+    );
+    defer allocator.free(rendered);
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}\n{s}\n",
+        .{ shared_remote_checks, rendered },
+    );
+}
+
+const shared_identity_command =
     \\/usr/bin/ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256 |
     \\  /usr/bin/awk '{ print $2 }'
     \\sysctl -n kern.hostuuid
 ;
 
+/// A ZFS root carries a third per-instance identifier that UFS has no
+/// equivalent for: the pool GUID, which `zpool_reguid` re-randomizes on every
+/// boot. Two clones sharing it would collide on simultaneous import.
+const zfs_identity_command =
+    \\/sbin/zpool get -H -o value guid zroot
+;
+
+fn identityCommandAlloc(
+    allocator: Allocator,
+    root_filesystem: RootFilesystem,
+) ![]u8 {
+    return switch (root_filesystem) {
+        .ufs => allocator.dupe(u8, shared_identity_command),
+        .zfs => std.fmt.allocPrint(
+            allocator,
+            "{s}\n{s}",
+            .{ shared_identity_command, zfs_identity_command },
+        ),
+    };
+}
+
 const GuestIdentity = struct {
     ssh_fingerprint: []u8,
     host_uuid: []u8,
+    /// Present only for a ZFS root.
+    pool_guid: ?[]u8,
 
     fn deinit(self: *GuestIdentity, allocator: Allocator) void {
         allocator.free(self.ssh_fingerprint);
         allocator.free(self.host_uuid);
+        if (self.pool_guid) |guid| allocator.free(guid);
         self.* = undefined;
     }
 };
@@ -487,14 +625,17 @@ fn readGuestIdentityAlloc(
     ssh_path: []const u8,
     key_path: []const u8,
     port: u16,
+    root_filesystem: RootFilesystem,
 ) !GuestIdentity {
+    const command = try identityCommandAlloc(allocator, root_filesystem);
+    defer allocator.free(command);
     const output = try sshOutputAlloc(
         allocator,
         io,
         ssh_path,
         key_path,
         port,
-        identity_command,
+        command,
     );
     defer allocator.free(output);
     var lines = std.mem.splitScalar(u8, output, '\n');
@@ -511,6 +652,18 @@ fn readGuestIdentityAlloc(
     if (fingerprint.len == 0 or host_uuid.len == 0) {
         return error.InvalidGuestIdentity;
     }
+    const pool_guid = switch (root_filesystem) {
+        .ufs => null,
+        .zfs => blk: {
+            const value = std.mem.trim(
+                u8,
+                lines.next() orelse return error.InvalidGuestIdentity,
+                " \t\r",
+            );
+            if (value.len == 0) return error.InvalidGuestIdentity;
+            break :blk value;
+        },
+    };
     while (lines.next()) |line| {
         if (std.mem.trim(u8, line, " \t\r").len != 0) {
             return error.InvalidGuestIdentity;
@@ -518,24 +671,119 @@ fn readGuestIdentityAlloc(
     }
     const owned_fingerprint = try allocator.dupe(u8, fingerprint);
     errdefer allocator.free(owned_fingerprint);
+    const owned_host_uuid = try allocator.dupe(u8, host_uuid);
+    errdefer allocator.free(owned_host_uuid);
+    const owned_pool_guid = if (pool_guid) |guid|
+        try allocator.dupe(u8, guid)
+    else
+        null;
     return .{
         .ssh_fingerprint = owned_fingerprint,
-        .host_uuid = try allocator.dupe(u8, host_uuid),
+        .host_uuid = owned_host_uuid,
+        .pool_guid = owned_pool_guid,
     };
+}
+
+/// Compare the parts of two guest identities that must differ between two
+/// independently provisioned instances.
+fn expectDistinctIdentities(first: GuestIdentity, second: GuestIdentity) !void {
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        first.ssh_fingerprint,
+        second.ssh_fingerprint,
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        first.host_uuid,
+        second.host_uuid,
+    ));
+    if (first.pool_guid) |first_guid| {
+        const second_guid = second.pool_guid orelse
+            return error.InconsistentIdentityShape;
+        try std.testing.expect(!std.mem.eql(u8, first_guid, second_guid));
+    } else if (second.pool_guid != null) {
+        return error.InconsistentIdentityShape;
+    }
+}
+
+test "guest identities compare every per-instance value" {
+    var first = GuestIdentity{
+        .ssh_fingerprint = try std.testing.allocator.dupe(u8, "SHA256:a"),
+        .host_uuid = try std.testing.allocator.dupe(u8, "uuid-a"),
+        .pool_guid = try std.testing.allocator.dupe(u8, "1"),
+    };
+    defer first.deinit(std.testing.allocator);
+    var second = GuestIdentity{
+        .ssh_fingerprint = try std.testing.allocator.dupe(u8, "SHA256:b"),
+        .host_uuid = try std.testing.allocator.dupe(u8, "uuid-b"),
+        .pool_guid = try std.testing.allocator.dupe(u8, "1"),
+    };
+    defer second.deinit(std.testing.allocator);
+
+    // A shared pool GUID must fail even when every other value differs.
+    try std.testing.expectError(
+        error.TestUnexpectedResult,
+        expectDistinctIdentities(first, second),
+    );
+    std.testing.allocator.free(second.pool_guid.?);
+    second.pool_guid = try std.testing.allocator.dupe(u8, "2");
+    try expectDistinctIdentities(first, second);
+
+    // A UFS guest compared against a ZFS guest is a harness mistake, not a
+    // passing acceptance run.
+    std.testing.allocator.free(second.pool_guid.?);
+    second.pool_guid = null;
+    try std.testing.expectError(
+        error.InconsistentIdentityShape,
+        expectDistinctIdentities(first, second),
+    );
+}
+
+test "remote checks stay filesystem-specific" {
+    const allocator = std.testing.allocator;
+    const ufs = try remoteChecksAlloc(allocator, .ufs);
+    defer allocator.free(ufs);
+    const zfs = try remoteChecksAlloc(allocator, .zfs);
+    defer allocator.free(zfs);
+
+    for ([_][]const u8{ ufs, zfs }) |checks| {
+        try std.testing.expect(std.mem.indexOf(u8, checks, "@") == null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            checks,
+            "pkg info -e azure-agent",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            checks,
+            "! gpart show | grep -q CORRUPT",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            checks,
+            "8589934592",
+        ) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, ufs, "zpool") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zfs, "zpool list -Hp -o size") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zfs, "df -k /") == null);
 }
 
 test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
     const allocator = std.testing.allocator;
     const architecture = try architectureFromEnvironment(allocator);
+    const root_filesystem = try rootFilesystemFromEnvironment(allocator);
     if (builtin.os.tag != .linux) {
         std.debug.print(
-            "skipping FreeBSD {s} boot acceptance: QEMU path is Linux-only\n",
-            .{@tagName(architecture)},
+            "skipping FreeBSD {s} {s} boot acceptance: QEMU path is Linux-only\n",
+            .{ @tagName(architecture), @tagName(root_filesystem) },
         );
         return error.SkipZigTest;
     }
 
     const io = std.testing.io;
+    const remote_checks = try remoteChecksAlloc(allocator, root_filesystem);
+    defer allocator.free(remote_checks);
     const image_path = try requireImageAlloc(allocator, io, architecture);
     defer allocator.free(image_path);
     const absolute_image = try Dir.cwd().realPathFileAlloc(
@@ -644,6 +892,15 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
         defer allocator.free(serial_path);
         errdefer printSerialTail(allocator, io, serial_path);
 
+        // Create the overlay larger than its backing image so first-boot
+        // growth has somewhere to expand into. This proves the release image
+        // grows on a bigger disk without ever rewriting the release asset.
+        const expanded_size_text = try std.fmt.allocPrint(
+            allocator,
+            "{d}",
+            .{expanded_virtual_size},
+        );
+        defer allocator.free(expanded_size_text);
         try runCommand(io, &.{
             qemu_img_path,
             "create",
@@ -655,6 +912,7 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             "-b",
             absolute_image,
             overlay_path,
+            expanded_size_text,
         });
         try Dir.copyFileAbsolute(firmware.vars_path, vars_path, io, .{
             .replace = false,
@@ -892,6 +1150,7 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             ssh_path,
             private_key_path,
             port,
+            root_filesystem,
         );
         var identity_owned = true;
         errdefer if (identity_owned) identity_before_reboot.deinit(allocator);
@@ -943,6 +1202,7 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             ssh_path,
             private_key_path,
             port,
+            root_filesystem,
         );
         defer identity_after_reboot.deinit(allocator);
         try std.testing.expectEqualStrings(
@@ -953,6 +1213,15 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             identity_before_reboot.host_uuid,
             identity_after_reboot.host_uuid,
         );
+        // zpoolreguid is a firstboot script, so a ZFS guest's pool GUID must
+        // stay put across a reboot just like its host UUID.
+        if (identity_before_reboot.pool_guid) |before| {
+            try std.testing.expectEqualStrings(
+                before,
+                identity_after_reboot.pool_guid orelse
+                    return error.InconsistentIdentityShape,
+            );
+        }
         identities[instance_index] = identity_before_reboot;
         identity_count += 1;
         identity_owned = false;
@@ -972,14 +1241,5 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             else => return error.QemuDidNotExitCleanly,
         }
     }
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        identities[0].ssh_fingerprint,
-        identities[1].ssh_fingerprint,
-    ));
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        identities[0].host_uuid,
-        identities[1].host_uuid,
-    ));
+    try expectDistinctIdentities(identities[0], identities[1]);
 }
