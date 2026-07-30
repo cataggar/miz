@@ -1,11 +1,12 @@
 //! Opt-in QEMU acceptance for generalized FreeBSD 15.1 release images.
-//! Set `ZVMI_FREEBSD15_IMAGE`, `ZVMI_FREEBSD15_ARCHITECTURE`, and
-//! `ZVMI_FREEBSD15_FILESYSTEM` to run it.
+//! Set `ZVMI_FREEBSD15_IMAGE`, `ZVMI_FREEBSD15_ARCHITECTURE`,
+//! `ZVMI_FREEBSD15_FILESYSTEM`, and `ZVMI_FREEBSD15_FLAVOR` to run it.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const qemu_host = @import("qemu_host");
 const qmp = @import("qmp");
+const packages = @import("packages");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -77,6 +78,12 @@ const RootFilesystem = enum {
     }
 };
 
+/// Content flavor of the image under acceptance. Every flavor must satisfy
+/// the same retained contract; the core flavor additionally has to prove the
+/// reviewed exclusions are really gone from a booted image rather than only
+/// from the manifest the builder recorded.
+const Flavor = packages.Flavor;
+
 fn optionalEnvAlloc(
     allocator: Allocator,
     comptime name: []const u8,
@@ -103,6 +110,15 @@ fn rootFilesystemFromEnvironment(allocator: Allocator) !RootFilesystem {
     ) orelse return .ufs;
     defer allocator.free(value);
     return RootFilesystem.parse(value) orelse error.InvalidRootFilesystem;
+}
+
+fn flavorFromEnvironment(allocator: Allocator) !Flavor {
+    const value = try optionalEnvAlloc(
+        allocator,
+        "ZVMI_FREEBSD15_FLAVOR",
+    ) orelse return .full;
+    defer allocator.free(value);
+    return Flavor.parse(value) orelse error.InvalidFlavor;
 }
 
 fn requireImageAlloc(
@@ -550,9 +566,46 @@ fn replaceTokenAlloc(
     return output.toOwnedSlice();
 }
 
+/// The retained package contract, checked against a booted image. Generating
+/// this from the manifest rather than restating it is what makes the
+/// contract enforceable: a package removed from the manifest stops being
+/// required here in the same diff, and nothing else can quietly drop one.
+fn contractRemoteChecksAlloc(
+    allocator: Allocator,
+    flavor: Flavor,
+) ![]u8 {
+    const manifest = packages.forFlavor(flavor);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    for (manifest.required) |package| {
+        try output.writer.print("pkg info -e {s}\n", .{package.name});
+    }
+    for (manifest.library_roots) |library| {
+        try output.writer.print("pkg info -e {s}\n", .{library});
+    }
+    for (manifest.excluded) |excluded| {
+        try output.writer.print("! pkg info -e {s}\n", .{excluded});
+    }
+    for (manifest.excluded_classes) |class| {
+        try output.writer.print(
+            "! pkg query -a '%n' | grep -Eq '^FreeBSD-.*-{s}$'\n",
+            .{class},
+        );
+    }
+    // The update path is the reason a core image stays supportable, so prove
+    // both repositories still answer rather than trusting the build log.
+    try output.writer.print(
+        "pkg update -f\npkg update -f -r {s}\n" ++
+            "pkg rquery -r {s} '%n-%v' FreeBSD-runtime >/dev/null\n",
+        .{ manifest.base_repository, manifest.base_repository },
+    );
+    return output.toOwnedSlice();
+}
+
 fn remoteChecksAlloc(
     allocator: Allocator,
     root_filesystem: RootFilesystem,
+    flavor: Flavor,
 ) ![]u8 {
     const specific = switch (root_filesystem) {
         .ufs => ufs_remote_checks,
@@ -571,10 +624,12 @@ fn remoteChecksAlloc(
         minimum,
     );
     defer allocator.free(rendered);
+    const contract = try contractRemoteChecksAlloc(allocator, flavor);
+    defer allocator.free(contract);
     return std.fmt.allocPrint(
         allocator,
-        "{s}\n{s}\n",
-        .{ shared_remote_checks, rendered },
+        "{s}\n{s}\n{s}",
+        .{ shared_remote_checks, rendered, contract },
     );
 }
 
@@ -741,9 +796,9 @@ test "guest identities compare every per-instance value" {
 
 test "remote checks stay filesystem-specific" {
     const allocator = std.testing.allocator;
-    const ufs = try remoteChecksAlloc(allocator, .ufs);
+    const ufs = try remoteChecksAlloc(allocator, .ufs, .full);
     defer allocator.free(ufs);
-    const zfs = try remoteChecksAlloc(allocator, .zfs);
+    const zfs = try remoteChecksAlloc(allocator, .zfs, .full);
     defer allocator.free(zfs);
 
     for ([_][]const u8{ ufs, zfs }) |checks| {
@@ -769,20 +824,93 @@ test "remote checks stay filesystem-specific" {
     try std.testing.expect(std.mem.indexOf(u8, zfs, "df -k /") == null);
 }
 
+test "remote checks enforce the retained contract for every flavor" {
+    const allocator = std.testing.allocator;
+    const full = try remoteChecksAlloc(allocator, .ufs, .full);
+    defer allocator.free(full);
+    const core = try remoteChecksAlloc(allocator, .ufs, .core);
+    defer allocator.free(core);
+
+    for ([_][]const u8{ full, core }) |checks| {
+        // Every clause of the retain-at-minimum list is a package the booted
+        // image must still carry, so losing one fails acceptance rather than
+        // shipping.
+        for (packages.required_packages) |package| {
+            const line = try std.fmt.allocPrint(
+                allocator,
+                "\npkg info -e {s}\n",
+                .{package.name},
+            );
+            defer allocator.free(line);
+            try std.testing.expect(
+                std.mem.indexOf(u8, checks, line) != null,
+            );
+        }
+        // The base update path is what makes a published image supportable.
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            checks,
+            "pkg update -f -r FreeBSD-base",
+        ) != null);
+    }
+
+    // Only the core flavor claims exclusions, so only it may assert them.
+    for (packages.core_excluded_packages) |excluded| {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "! pkg info -e {s}\n",
+            .{excluded},
+        );
+        defer allocator.free(line);
+        try std.testing.expect(std.mem.indexOf(u8, core, line) != null);
+        try std.testing.expect(std.mem.indexOf(u8, full, line) == null);
+    }
+    for (packages.library_roots) |library| {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "pkg info -e {s}\n",
+            .{library},
+        );
+        defer allocator.free(line);
+        try std.testing.expect(std.mem.indexOf(u8, core, line) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        core,
+        "'^FreeBSD-.*-dbg$'",
+    ) != null);
+}
+
+test "the flavor selector accepts only known flavors" {
+    try std.testing.expectEqual(Flavor.core, Flavor.parse("core").?);
+    try std.testing.expectEqual(Flavor.full, Flavor.parse("full").?);
+    try std.testing.expect(Flavor.parse("Core") == null);
+    try std.testing.expect(Flavor.parse("") == null);
+}
+
 test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
     const allocator = std.testing.allocator;
     const architecture = try architectureFromEnvironment(allocator);
     const root_filesystem = try rootFilesystemFromEnvironment(allocator);
+    const flavor = try flavorFromEnvironment(allocator);
     if (builtin.os.tag != .linux) {
         std.debug.print(
-            "skipping FreeBSD {s} {s} boot acceptance: QEMU path is Linux-only\n",
-            .{ @tagName(architecture), @tagName(root_filesystem) },
+            "skipping FreeBSD {s} {s} {s} boot acceptance: QEMU is Linux-only\n",
+            .{
+                @tagName(architecture),
+                @tagName(root_filesystem),
+                @tagName(flavor),
+            },
         );
         return error.SkipZigTest;
     }
 
     const io = std.testing.io;
-    const remote_checks = try remoteChecksAlloc(allocator, root_filesystem);
+    const remote_checks = try remoteChecksAlloc(
+        allocator,
+        root_filesystem,
+        flavor,
+    );
     defer allocator.free(remote_checks);
     const image_path = try requireImageAlloc(allocator, io, architecture);
     defer allocator.free(image_path);

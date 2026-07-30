@@ -14,6 +14,20 @@ from scripts import freebsd15_release as release
 BUILDER_SOURCE = (
     Path(release.__file__).resolve().parent / "build_generalized_freebsd15.zig"
 )
+MANIFEST_SOURCE = (
+    Path(release.__file__).resolve().parent / "freebsd15_package_manifest.zig"
+)
+
+
+def zig_string_list(source: str, name: str) -> list[str]:
+    body = re.search(
+        rf"pub const {name} = \[_\]\[\]const u8\{{(.*?)\n\}};",
+        source,
+        re.S,
+    )
+    if body is None:
+        raise AssertionError(f"{name} is missing from the Zig manifest")
+    return re.findall(r'"([^"]+)"', body.group(1))
 
 
 def capture(handler, args) -> str:
@@ -44,6 +58,8 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         arguments = dict(
             architecture=expected["architecture"],
             filesystem=expected["filesystem"],
+            flavor=expected["flavor"],
+            package_manifest=self.package_manifest(key, self.root),
             asset=self.root / expected["asset_name"],
             validated_sha256="",
             virtual_size=expected["virtual_size"],
@@ -61,6 +77,22 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         arguments.update(overrides)
         return types.SimpleNamespace(**arguments)
 
+    def package_manifest(self, key, directory, extra=(), drop=()):
+        """Write a recorded manifest the way the builder would."""
+        manifest = release.PACKAGE_MANIFESTS[release.VARIANTS[key]["flavor"]]
+        names = [
+            name
+            for name in (*manifest["required"], *manifest["library_roots"])
+            if name not in drop
+        ]
+        names.extend(extra)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{release.VARIANTS[key]['asset_name']}.packages.txt"
+        path.write_text(
+            "".join(f"{name} 15.1 1024\n" for name in names), encoding="utf-8"
+        )
+        return path
+
     def make_candidate(self, key, source_commit=None):
         expected = release.VARIANTS[key]
         candidate_dir = self.candidates / key
@@ -71,6 +103,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             self.candidate_arguments(
                 key,
                 asset=asset,
+                package_manifest=self.package_manifest(key, candidate_dir),
                 validated_sha256=release.sha256(asset),
                 source_commit=source_commit or self.source_commit,
                 output=candidate_dir / "candidate.json",
@@ -154,13 +187,13 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         self.assertIn("No checksum sidecar assets are published.", notes)
 
     def test_rejects_incomplete_matrix(self):
-        self.make_candidate("aarch64-zfs")
+        self.make_candidate("aarch64-zfs-full")
         with self.assertRaisesRegex(ValueError, "expected 2 candidate manifests"):
             self.stage("zfs")
 
     def test_rejects_candidates_from_another_release_set(self):
-        self.make_candidate("aarch64-zfs")
-        self.make_candidate("x86_64-ufs")
+        self.make_candidate("aarch64-zfs-full")
+        self.make_candidate("x86_64-ufs-full")
         with self.assertRaisesRegex(ValueError, "incomplete or unexpected"):
             self.stage("zfs")
 
@@ -175,21 +208,21 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             self.make_candidate(key)
         changed = (
             self.candidates
-            / "x86_64-zfs"
-            / release.VARIANTS["x86_64-zfs"]["asset_name"]
+            / "x86_64-zfs-full"
+            / release.VARIANTS["x86_64-zfs-full"]["asset_name"]
         )
         changed.write_bytes(b"tampered candidate\n")
         with self.assertRaisesRegex(ValueError, "candidate (size|digest) mismatch"):
             self.stage("zfs")
 
     def test_rejects_mismatched_source_commit(self):
-        self.make_candidate("aarch64-zfs")
-        self.make_candidate("x86_64-zfs", source_commit="b" * 40)
+        self.make_candidate("aarch64-zfs-full")
+        self.make_candidate("x86_64-zfs-full", source_commit="b" * 40)
         with self.assertRaisesRegex(ValueError, "source commit mismatch"):
             self.stage("zfs")
 
     def test_candidate_rejects_unpinned_sources(self):
-        key = "aarch64-zfs"
+        key = "aarch64-zfs-full"
         asset = self.root / release.VARIANTS[key]["asset_name"]
         asset.write_bytes(b"candidate\n")
         digest = release.sha256(asset)
@@ -197,7 +230,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         cases = {
             "source SHA-256 does not match": {"source_sha256": "0" * 64},
             "source filename does not match": {
-                "source_name": release.VARIANTS["aarch64-ufs"]["source_name"]
+                "source_name": release.VARIANTS["aarch64-ufs-full"]["source_name"]
             },
             "source URL does not match": {
                 "source_url": "https://example.invalid/image.qcow2.xz"
@@ -220,12 +253,12 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                     )
 
     def test_candidate_rejects_a_cross_filesystem_asset_name(self):
-        asset = self.root / release.VARIANTS["aarch64-ufs"]["asset_name"]
+        asset = self.root / release.VARIANTS["aarch64-ufs-full"]["asset_name"]
         asset.write_bytes(b"candidate\n")
         with self.assertRaisesRegex(ValueError, "asset must be"):
             release.candidate_command(
                 self.candidate_arguments(
-                    "aarch64-zfs",
+                    "aarch64-zfs-full",
                     asset=asset,
                     validated_sha256=release.sha256(asset),
                 )
@@ -286,7 +319,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         source = BUILDER_SOURCE.read_text(encoding="utf-8")
         profiles = re.findall(
             r"\.architecture = \.(\w+),\s*"
-            r"\.flavor = \.\w+,\s*"
+            r"\.flavor = \.(\w+),\s*"
             r"\.root_storage = (\w+)_root_storage,\s*"
             r'\.source_name = "([^"]+)",\s*'
             r'\.source_url = "([^"]+)",\s*'
@@ -299,6 +332,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         seen = set()
         for (
             architecture,
+            flavor,
             filesystem,
             source_name,
             url,
@@ -306,7 +340,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             virtual_size,
             output,
         ) in profiles:
-            key = release.variant_key(architecture, filesystem)
+            key = release.variant_key(architecture, filesystem, flavor)
             seen.add(key)
             variant = release.VARIANTS[key]
             self.assertEqual(source_name, variant["source_name"])
@@ -317,6 +351,239 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             )
             self.assertEqual(output, variant["asset_name"])
         self.assertEqual(seen, set(release.VARIANTS))
+
+    def test_package_manifests_match_the_zig_manifest(self):
+        source = MANIFEST_SOURCE.read_text(encoding="utf-8")
+        required = re.findall(
+            r'\.name = "([^"]+)",\s*\.source = \.\w+,', source
+        )
+        self.assertEqual(list(release.REQUIRED_PACKAGES), required)
+        self.assertEqual(
+            list(release.LIBRARY_ROOTS), zig_string_list(source, "library_roots")
+        )
+        self.assertEqual(
+            list(release.CORE_EXCLUDED_PACKAGES),
+            zig_string_list(source, "core_excluded_packages"),
+        )
+        self.assertEqual(
+            list(release.CORE_EXCLUDED_CLASSES),
+            zig_string_list(source, "core_excluded_classes"),
+        )
+        revisions = re.findall(r"\.revision = (\d+),", source)
+        self.assertTrue(revisions)
+        for revision in revisions:
+            self.assertEqual(int(revision), release.PACKAGE_MANIFEST_REVISION)
+        flavors = re.findall(r"pub fn parse.*?\}", source, re.S)[0]
+        self.assertEqual(
+            sorted(re.findall(r'"(\w+)"', flavors)),
+            sorted(release.PACKAGE_MANIFESTS),
+        )
+
+    def test_retained_contract_covers_every_required_capability(self):
+        # Each entry is a capability the issue's retain-at-minimum list names
+        # and the package that must still deliver it in a core image.
+        contract = {
+            "UEFI boot": "FreeBSD-bootloader",
+            "release kernel": "FreeBSD-kernel-generic",
+            "virtio and Hyper-V": "FreeBSD-hyperv-tools",
+            "rc": "FreeBSD-rc",
+            "user and account management": "FreeBSD-runtime",
+            "DNS": "FreeBSD-resolvconf",
+            "DHCP": "FreeBSD-dhclient",
+            "certificates": "FreeBSD-caroot",
+            "entropy and time": "FreeBSD-ntp",
+            "key-only OpenSSH": "FreeBSD-ssh",
+            "recovery tools": "FreeBSD-rescue",
+            "nuageinit provisioning": "FreeBSD-nuageinit",
+            "pkg": "pkg",
+            "FreeBSD-base updates": "FreeBSD-pkg-bootstrap",
+            "Azure Agent": "azure-agent",
+            "root growth": "FreeBSD-ufs",
+        }
+        for capability, package in contract.items():
+            with self.subTest(capability=capability):
+                self.assertIn(package, release.REQUIRED_PACKAGES)
+                for flavor, manifest in release.PACKAGE_MANIFESTS.items():
+                    self.assertIn(package, manifest["required"], flavor)
+                    self.assertNotIn(package, manifest["excluded"], flavor)
+                    with self.assertRaisesRegex(
+                        ValueError, f"missing {package}"
+                    ):
+                        release.verify_package_manifest(
+                            flavor,
+                            [
+                                {"name": name}
+                                for name in release.REQUIRED_PACKAGES
+                                if name != package
+                            ],
+                        )
+
+    def test_verify_package_manifest_rejects_excluded_content(self):
+        retained = [{"name": name} for name in release.REQUIRED_PACKAGES]
+        release.verify_package_manifest("core", retained)
+        for name in ("FreeBSD-clang", "FreeBSD-runtime-dbg", "FreeBSD-clibs-dev"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, "still carries"):
+                    release.verify_package_manifest(
+                        "core", retained + [{"name": name}]
+                    )
+        # A third-party package that merely ends in an excluded class is not a
+        # pkgbase family member, and the full flavor excludes nothing.
+        release.verify_package_manifest("core", retained + [{"name": "py312-dev"}])
+        release.verify_package_manifest(
+            "full", retained + [{"name": "FreeBSD-clang"}]
+        )
+
+    def test_parse_package_manifest_rejects_malformed_records(self):
+        path = self.root / "packages.txt"
+        for text in ("", "FreeBSD-runtime 15.1\n", "a 1 x\n", "a 1 2\na 2 3\n"):
+            with self.subTest(text=text):
+                path.write_text(text, encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    release.parse_package_manifest(path)
+        path.write_text("FreeBSD-runtime 15.1 2048\n", encoding="utf-8")
+        self.assertEqual(
+            release.parse_package_manifest(path),
+            [
+                {
+                    "name": "FreeBSD-runtime",
+                    "version": "15.1",
+                    "installed_bytes": 2048,
+                }
+            ],
+        )
+
+    def test_stages_exact_two_asset_core_release(self):
+        self.stage_set("core")
+
+        manifest = json.loads(
+            (self.output / "publish-manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["release_set"], "core")
+        self.assertEqual(manifest["release_tag"], "FreeBSD-15.1-core-20260730")
+        self.assertEqual(
+            {asset["asset_name"] for asset in manifest["assets"]},
+            {
+                "FreeBSD-15.1-aarch64.core.qcow2",
+                "FreeBSD-15.1-x86_64.core.qcow2",
+            },
+        )
+        self.assertEqual({asset["flavor"] for asset in manifest["assets"]}, {"core"})
+        # No .sha256 or .packages.txt sidecar may reach the publish allowlist.
+        self.assertEqual(
+            {path.name for path in self.output.iterdir()},
+            {
+                "FreeBSD-15.1-aarch64.core.qcow2",
+                "FreeBSD-15.1-x86_64.core.qcow2",
+                "publish-manifest.json",
+            },
+        )
+        notes = self.notes.read_text(encoding="utf-8")
+        self.assertIn("not by deleting files from a full image", notes)
+        self.assertIn("## Installed packages", notes)
+        self.assertIn("FreeBSD-openssl-lib", notes)
+        self.assertIn("No checksum sidecar assets are published.", notes)
+
+    def test_core_candidate_rejects_a_manifest_missing_the_contract(self):
+        key = "aarch64-ufs-core"
+        asset = self.root / release.VARIANTS[key]["asset_name"]
+        asset.write_bytes(b"candidate\n")
+        with self.assertRaisesRegex(ValueError, "missing FreeBSD-ssh"):
+            release.candidate_command(
+                self.candidate_arguments(
+                    key,
+                    asset=asset,
+                    validated_sha256=release.sha256(asset),
+                    package_manifest=self.package_manifest(
+                        key, self.root / "pruned", drop=("FreeBSD-ssh",)
+                    ),
+                )
+            )
+
+    def test_core_candidate_rejects_a_manifest_carrying_an_exclusion(self):
+        key = "x86_64-ufs-core"
+        asset = self.root / release.VARIANTS[key]["asset_name"]
+        asset.write_bytes(b"candidate\n")
+        with self.assertRaisesRegex(ValueError, "still carries FreeBSD-clang"):
+            release.candidate_command(
+                self.candidate_arguments(
+                    key,
+                    asset=asset,
+                    validated_sha256=release.sha256(asset),
+                    package_manifest=self.package_manifest(
+                        key, self.root / "fat", extra=("FreeBSD-clang",)
+                    ),
+                )
+            )
+
+    def test_stage_rejects_a_candidate_whose_recorded_manifest_was_edited(self):
+        for key in release.RELEASE_SETS["core"]["variants"]:
+            self.make_candidate(key)
+        manifest_path = self.candidates / "x86_64-ufs-core" / "candidate.json"
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        document["packages"]["names"].append("FreeBSD-tests")
+        document["packages"]["count"] += 1
+        manifest_path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "still carries FreeBSD-tests"):
+            self.stage("core")
+
+    def test_compare_reports_the_core_download_size_reduction(self):
+        self.stage_set("core")
+        core_manifest = self.output / "publish-manifest.json"
+        core = json.loads(core_manifest.read_text(encoding="utf-8"))
+        # A synthetic baseline: only the recorded sizes matter to the report,
+        # and building two real images is a maintainer step.
+        baseline = {
+            "schema": release.CANDIDATE_SCHEMA,
+            "type": "zvmi-freebsd15-release",
+            "release_set": "ufs",
+            "release_tag": release.RELEASE_SETS["ufs"]["release_tag"],
+            "assets": [
+                {
+                    "variant": key,
+                    "architecture": release.VARIANTS[key]["architecture"],
+                    "filesystem": release.VARIANTS[key]["filesystem"],
+                    "flavor": "full",
+                    "asset_name": release.VARIANTS[key]["asset_name"],
+                    "bytes": 1000,
+                    "sha256": "0" * 64,
+                    "packages": 499,
+                }
+                for key in release.RELEASE_SETS["ufs"]["variants"]
+            ],
+        }
+        for asset in core["assets"]:
+            asset["bytes"] = 250
+        baseline_path = self.root / "baseline.json"
+        candidate_path = self.root / "candidate-set.json"
+        baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+        candidate_path.write_text(json.dumps(core), encoding="utf-8")
+
+        report = capture(
+            release.compare_command,
+            types.SimpleNamespace(
+                baseline=baseline_path,
+                candidate=candidate_path,
+                output=self.root / "comparison.md",
+            ),
+        )
+        self.assertIn("| 1000 | 250 | 75.0% | 499 |", report)
+        self.assertIn("6477643776", report)
+        self.assertEqual(
+            (self.root / "comparison.md").read_text(encoding="utf-8"), report
+        )
+
+    def test_compare_refuses_to_compare_a_set_against_itself(self):
+        self.stage_set("core")
+        manifest_path = self.output / "publish-manifest.json"
+        with self.assertRaisesRegex(ValueError, "two different flavors"):
+            release.compare_command(
+                types.SimpleNamespace(
+                    baseline=manifest_path,
+                    candidate=manifest_path,
+                    output=None,
+                )
+            )
 
 
 if __name__ == "__main__":

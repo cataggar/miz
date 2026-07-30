@@ -428,6 +428,14 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     host_qemu_host_mod.linkLibrary(host_bzip2.artifact("bz2"));
+    // The FreeBSD package manifests are shared by the builder that realizes
+    // them and the acceptance test that verifies a booted image against them,
+    // so both import the same module rather than restating the contract.
+    const freebsd_packages_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/freebsd15_package_manifest.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
     const freebsd_boot_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/freebsd15_boot.zig"),
@@ -436,6 +444,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "qmp", .module = host_qmp_mod },
                 .{ .name = "qemu_host", .module = host_qemu_host_mod },
+                .{ .name = "packages", .module = freebsd_packages_mod },
             },
         }),
     });
