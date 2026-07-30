@@ -26,32 +26,152 @@ const qmp_connect_timeout_seconds: u32 = 10;
 const customization_result_prefix = "ZVMI_FREEBSD_CUSTOMIZATION_RESULT";
 const serial_tail_size: usize = 256 * 1024;
 
-const SourceProfile = struct {
+/// Root filesystem of the upstream BASIC-CLOUDINIT image and therefore of the
+/// published artifact. FreeBSD's UFS and ZFS VM images do not share a disk
+/// layout: the UFS image names its root in `/etc/fstab` and grows with
+/// `growfs(8)`, while the ZFS image has no root fstab entry and grows by
+/// onlining the expanded pool vdev. Selecting between them must always be an
+/// explicit profile decision rather than an assumption made by shared code.
+const RootFilesystem = enum {
+    ufs,
+    zfs,
+
+    fn parse(text: []const u8) ?RootFilesystem {
+        if (std.mem.eql(u8, text, "ufs")) return .ufs;
+        if (std.mem.eql(u8, text, "zfs")) return .zfs;
+        return null;
+    }
+};
+
+/// Content flavor of the published artifact. Only the full generalized image
+/// exists today; a `core` flavor that trims the package set reuses this same
+/// profile table instead of introducing a parallel one.
+const Flavor = enum {
+    full,
+
+    fn parse(text: []const u8) ?Flavor {
+        if (std.mem.eql(u8, text, "full")) return .full;
+        return null;
+    }
+};
+
+/// Filesystem-specific root growth and swap handling. The payloads carry the
+/// facts each path needs and nothing the other path could misread: the UFS
+/// arm knows the fstab root line that must survive swap removal, and the ZFS
+/// arm knows the root pool whose vdev is grown and whose GUID is reset.
+const RootStorage = union(RootFilesystem) {
+    ufs: struct {
+        /// Extended regular expression that the post-generalization
+        /// `/etc/fstab` must still match. Dropping the UFS root line while
+        /// stripping swap would produce an unbootable image.
+        fstab_root_pattern: []const u8,
+    },
+    zfs: struct {
+        /// Pool that carries `/`. Growth onlines this pool's vdev and
+        /// `zpool_reguid` re-randomizes its GUID on every first boot.
+        pool: []const u8,
+    },
+
+    fn filesystem(self: RootStorage) RootFilesystem {
+        return self;
+    }
+};
+
+const Profile = struct {
+    architecture: Architecture,
+    flavor: Flavor,
+    root_storage: RootStorage,
     source_name: []const u8,
     source_url: []const u8,
     source_sha256: []const u8,
     virtual_size: u64,
     output: []const u8,
     work_dir: []const u8,
+
+    fn rootFilesystem(self: *const Profile) RootFilesystem {
+        return self.root_storage.filesystem();
+    }
 };
 
-const aarch64_profile = SourceProfile{
-    .source_name = "FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz",
-    .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz",
-    .source_sha256 = "9722aea499610802de9a14bb645707fc4f6df49ff765cd9ce372b783c4693963",
-    .virtual_size = 6_477_643_776,
-    .output = "FreeBSD-15.1-aarch64.qcow2",
-    .work_dir = ".scratch/generalized-freebsd15-aarch64",
+const ufs_root_storage = RootStorage{
+    .ufs = .{
+        // FreeBSD labels the UFS root partition `rootfs` and mounts it through
+        // /dev/gpt/rootfs, so the surviving fstab line is stable across
+        // architectures.
+        .fstab_root_pattern = "^[^#]+[[:space:]]+/[[:space:]]+ufs[[:space:]]",
+    },
 };
 
-const x86_64_profile = SourceProfile{
-    .source_name = "FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz",
-    .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz",
-    .source_sha256 = "e4ca4db889f8559c9b9dfcacc70405c038476f4b6d41649b152d3809a2ed9e1f",
-    .virtual_size = 6_477_709_312,
-    .output = "FreeBSD-15.1-x86_64.qcow2",
-    .work_dir = ".scratch/generalized-freebsd15-x86_64",
+// release/tools/vmimage.subr creates the ZFS VM images with -o poolname=zroot
+// and bootfs=zroot/ROOT/default on both release architectures.
+const zfs_root_storage = RootStorage{ .zfs = .{ .pool = "zroot" } };
+
+/// Every architecture x filesystem x flavor combination this builder can
+/// produce. Keeping the pinned source metadata, virtual size, and output
+/// naming in one table makes an unsupported combination a lookup failure
+/// rather than a half-applied set of defaults.
+const profiles = [_]Profile{
+    .{
+        .architecture = .aarch64,
+        .flavor = .full,
+        .root_storage = ufs_root_storage,
+        .source_name = "FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz",
+        .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz",
+        .source_sha256 = "9722aea499610802de9a14bb645707fc4f6df49ff765cd9ce372b783c4693963",
+        .virtual_size = 6_477_643_776,
+        .output = "FreeBSD-15.1-aarch64.qcow2",
+        .work_dir = ".scratch/generalized-freebsd15-aarch64",
+    },
+    .{
+        .architecture = .x86_64,
+        .flavor = .full,
+        .root_storage = ufs_root_storage,
+        .source_name = "FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz",
+        .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz",
+        .source_sha256 = "e4ca4db889f8559c9b9dfcacc70405c038476f4b6d41649b152d3809a2ed9e1f",
+        .virtual_size = 6_477_709_312,
+        .output = "FreeBSD-15.1-x86_64.qcow2",
+        .work_dir = ".scratch/generalized-freebsd15-x86_64",
+    },
+    .{
+        .architecture = .aarch64,
+        .flavor = .full,
+        .root_storage = zfs_root_storage,
+        .source_name = "FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-zfs.qcow2.xz",
+        .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-zfs.qcow2.xz",
+        .source_sha256 = "0911a033b0a5d060486f92e534f3482c6a2ab96af6abb8a60683eeb24f6746af",
+        .virtual_size = 6_477_643_776,
+        .output = "FreeBSD-15.1-aarch64.zfs.qcow2",
+        .work_dir = ".scratch/generalized-freebsd15-aarch64-zfs",
+    },
+    .{
+        .architecture = .x86_64,
+        .flavor = .full,
+        .root_storage = zfs_root_storage,
+        .source_name = "FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-zfs.qcow2.xz",
+        .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-zfs.qcow2.xz",
+        .source_sha256 = "4159e137d4a78f46b62d3523edd9a4dc79fd0cdcf17e34e531342f52333f4131",
+        .virtual_size = 6_477_840_384,
+        .output = "FreeBSD-15.1-x86_64.zfs.qcow2",
+        .work_dir = ".scratch/generalized-freebsd15-x86_64-zfs",
+    },
 };
+
+fn findProfile(
+    architecture: Architecture,
+    root_filesystem: RootFilesystem,
+    flavor: Flavor,
+) ?*const Profile {
+    for (&profiles) |*profile| {
+        if (profile.architecture == architecture and
+            profile.rootFilesystem() == root_filesystem and
+            profile.flavor == flavor)
+        {
+            return profile;
+        }
+    }
+    return null;
+}
 
 const Architecture = enum {
     aarch64,
@@ -61,13 +181,6 @@ const Architecture = enum {
         if (std.mem.eql(u8, text, "aarch64")) return .aarch64;
         if (std.mem.eql(u8, text, "x86_64")) return .x86_64;
         return null;
-    }
-
-    fn profile(self: Architecture) *const SourceProfile {
-        return switch (self) {
-            .aarch64 => &aarch64_profile,
-            .x86_64 => &x86_64_profile,
-        };
     }
 
     fn guestArchitecture(self: Architecture) qemu_host.GuestArchitecture {
@@ -127,6 +240,9 @@ const Accel = enum {
 
 const Args = struct {
     architecture: Architecture = .aarch64,
+    root_filesystem: RootFilesystem = .ufs,
+    flavor: Flavor = .full,
+    profile: *const Profile = undefined,
     source: ?[]const u8 = null,
     source_sha256: []const u8 = "",
     output: []const u8 = "",
@@ -147,6 +263,8 @@ const help_text =
     \\Usage: build_generalized_freebsd15 [options]
     \\
     \\  --architecture <arch>    Guest architecture: aarch64 (default) or x86_64
+    \\  --filesystem <fs>        Root filesystem: ufs (default) or zfs
+    \\  --flavor <flavor>        Image flavor: full (default)
     \\  --source <path>          Local .qcow2.xz source (official image if omitted)
     \\  --source-sha256 <hex>    Expected compressed source SHA-256
     \\  --output <path>          Output QCOW2
@@ -174,6 +292,12 @@ fn parseArgs(argv: []const []const u8) !Args {
         if (std.mem.eql(u8, arg, "--architecture")) {
             args.architecture = Architecture.parse(try nextValue(argv, &i)) orelse
                 return error.InvalidArchitecture;
+        } else if (std.mem.eql(u8, arg, "--filesystem")) {
+            args.root_filesystem = RootFilesystem.parse(try nextValue(argv, &i)) orelse
+                return error.InvalidRootFilesystem;
+        } else if (std.mem.eql(u8, arg, "--flavor")) {
+            args.flavor = Flavor.parse(try nextValue(argv, &i)) orelse
+                return error.InvalidFlavor;
         } else if (std.mem.eql(u8, arg, "--source")) {
             args.source = try nextValue(argv, &i);
         } else if (std.mem.eql(u8, arg, "--source-sha256")) {
@@ -222,7 +346,12 @@ fn parseArgs(argv: []const []const u8) !Args {
     if ((args.uefi_code_path == null) != (args.uefi_vars_path == null)) {
         return error.IncompleteFirmwareOverride;
     }
-    const profile = args.architecture.profile();
+    const profile = findProfile(
+        args.architecture,
+        args.root_filesystem,
+        args.flavor,
+    ) orelse return error.UnsupportedProfile;
+    args.profile = profile;
     if (args.source_sha256.len == 0) args.source_sha256 = profile.source_sha256;
     if (args.output.len == 0) args.output = profile.output;
     if (args.work_dir.len == 0) args.work_dir = profile.work_dir;
@@ -366,8 +495,6 @@ const customization_user_data_template =
     \\      sysrc waagent_enable=YES
     \\      sysrc sshd_enable=YES
     \\      sysrc nuageinit_enable=YES
-    \\      sysrc growfs_enable=YES
-    \\      sysrc growfs_swap_size=0
     \\      sysrc dumpdev=NO
     \\      sysrc 'ifconfig_DEFAULT=SYNCDHCP accept_rtadv'
     \\      sysrc 'ifconfig_hn0=SYNCDHCP'
@@ -404,10 +531,7 @@ const customization_user_data_template =
     \\      set_agent_config ResourceDisk.SwapSizeMB 2048
     \\      set_agent_config Logs.Console n
     \\
-    \\      swapoff -a
-    \\      awk '$3 != "swap" { print }' /etc/fstab > /etc/fstab.zvmi
-    \\      chmod 0644 /etc/fstab.zvmi
-    \\      mv /etc/fstab.zvmi /etc/fstab
+    \\@ROOT_STORAGE@
     \\      if pw usershow freebsd >/dev/null 2>&1; then
     \\          pw userdel freebsd -r
     \\      fi
@@ -469,22 +593,134 @@ const customization_metadata_template =
     \\
 ;
 
-fn replaceNonceAlloc(
+/// UFS root growth and swap removal. rc.d/growfs recovers the GPT, resizes
+/// the last partition, and then runs growfs(8) against the root device named
+/// by /etc/fstab. `growfs_swap_size=0` keeps it from adding an OS-disk swap
+/// partition, because Azure supplies swap on the resource disk instead.
+const ufs_root_storage_script =
+    \\      root_fstype=$(mount -p | awk '$2 == "/" { print $3 }')
+    \\      test "${root_fstype}" = ufs
+    \\      sysrc growfs_enable=YES
+    \\      sysrc growfs_swap_size=0
+    \\      swapoff -a
+    \\      awk '$3 != "swap" { print }' /etc/fstab > /etc/fstab.zvmi
+    \\      chmod 0644 /etc/fstab.zvmi
+    \\      mv /etc/fstab.zvmi /etc/fstab
+    \\      # A UFS root is mounted from /etc/fstab, so dropping that line
+    \\      # while stripping swap would produce an unbootable image.
+    \\      grep -Eq '@FSTAB_ROOT_PATTERN@' /etc/fstab
+;
+
+/// ZFS root growth and swap removal. None of the UFS steps apply: the root
+/// dataset is not named in /etc/fstab and growfs(8) cannot grow a pool. After
+/// recovering the GPT and resizing the last partition, rc.d/growfs onlines
+/// the enlarged vdev with `zpool online -e`; `autoexpand` keeps a later vdev
+/// enlargement working without another first-boot pass.
+const zfs_root_storage_script =
+    \\      root_fstype=$(mount -p | awk '$2 == "/" { print $3 }')
+    \\      test "${root_fstype}" = zfs
+    \\      root_dataset=$(mount -p | awk '$2 == "/" { print $1 }')
+    \\      root_pool=${root_dataset%%/*}
+    \\      test "${root_pool}" = @ROOT_POOL@
+    \\      # zpool status -x exits 0 even for an unhealthy pool, so compare
+    \\      # its report instead of trusting the exit status.
+    \\      test "$(zpool status -x "${root_pool}")" = \
+    \\          "pool '${root_pool}' is healthy"
+    \\      sysrc zfs_enable=YES
+    \\      sysrc growfs_enable=YES
+    \\      sysrc growfs_swap_size=0
+    \\      zpool set autoexpand=on "${root_pool}"
+    \\      # A per-instance pool GUID is the ZFS half of identity separation.
+    \\      # UFS has no equivalent, so this must not move into shared code.
+    \\      sysrc zpool_reguid="${root_pool}"
+    \\      swapoff -a
+    \\      awk '$3 != "swap" { print }' /etc/fstab > /etc/fstab.zvmi
+    \\      chmod 0644 /etc/fstab.zvmi
+    \\      mv /etc/fstab.zvmi /etc/fstab
+    \\      # The ZFS image never names its root in /etc/fstab, so demanding a
+    \\      # root line here - as the UFS profile does - would be wrong.
+    \\      # Require instead that nothing swap-like survives, including the
+    \\      # swap zvol layouts other FreeBSD ZFS installers produce.
+    \\      ! grep -Eq '^[^#].*[[:space:]]swap[[:space:]]' /etc/fstab
+    \\      swap_volumes=$(zfs list -H -o name,org.freebsd:swap -t volume |
+    \\          awk '$2 == "on" { print $1 }')
+    \\      for volume in ${swap_volumes}; do
+    \\          zfs destroy "${volume}"
+    \\      done
+;
+
+const Substitution = struct {
+    token: []const u8,
+    value: []const u8,
+};
+
+fn renderTemplateAlloc(
     allocator: Allocator,
     template: []const u8,
-    nonce: []const u8,
+    substitutions: []const Substitution,
 ) ![]u8 {
-    const token = "@NONCE@";
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     var offset: usize = 0;
-    while (std.mem.indexOfPos(u8, template, offset, token)) |index| {
-        try output.writer.writeAll(template[offset..index]);
-        try output.writer.writeAll(nonce);
-        offset = index + token.len;
+    scan: while (offset < template.len) {
+        if (template[offset] == '@') {
+            for (substitutions) |substitution| {
+                if (std.mem.startsWith(
+                    u8,
+                    template[offset..],
+                    substitution.token,
+                )) {
+                    try output.writer.writeAll(substitution.value);
+                    offset += substitution.token.len;
+                    continue :scan;
+                }
+            }
+        }
+        try output.writer.writeByte(template[offset]);
+        offset += 1;
     }
-    try output.writer.writeAll(template[offset..]);
     return output.toOwnedSlice();
+}
+
+/// Render the filesystem-specific half of the generalization script. The two
+/// arms share no text, so a UFS assumption cannot reach the ZFS guest by
+/// accident.
+fn rootStorageScriptAlloc(
+    allocator: Allocator,
+    storage: RootStorage,
+) ![]u8 {
+    return switch (storage) {
+        .ufs => |ufs| renderTemplateAlloc(
+            allocator,
+            ufs_root_storage_script,
+            &.{.{
+                .token = "@FSTAB_ROOT_PATTERN@",
+                .value = ufs.fstab_root_pattern,
+            }},
+        ),
+        .zfs => |zfs| renderTemplateAlloc(
+            allocator,
+            zfs_root_storage_script,
+            &.{.{ .token = "@ROOT_POOL@", .value = zfs.pool }},
+        ),
+    };
+}
+
+fn customizationUserDataAlloc(
+    allocator: Allocator,
+    storage: RootStorage,
+    nonce: []const u8,
+) ![]u8 {
+    const root_storage = try rootStorageScriptAlloc(allocator, storage);
+    defer allocator.free(root_storage);
+    return renderTemplateAlloc(
+        allocator,
+        customization_user_data_template,
+        &.{
+            .{ .token = "@ROOT_STORAGE@", .value = root_storage },
+            .{ .token = "@NONCE@", .value = nonce },
+        },
+    );
 }
 
 fn resolveFirmware(
@@ -606,6 +842,7 @@ fn createSeedIso(
     io: Io,
     temporary_path: []const u8,
     xorriso_path: []const u8,
+    storage: RootStorage,
     nonce: []const u8,
 ) ![]u8 {
     const seed_dir = try std.fs.path.join(allocator, &.{ temporary_path, "seed" });
@@ -618,15 +855,15 @@ fn createSeedIso(
     const seed_iso_path = try std.fs.path.join(allocator, &.{ temporary_path, "seed.iso" });
     errdefer allocator.free(seed_iso_path);
 
-    const metadata = try replaceNonceAlloc(
+    const metadata = try renderTemplateAlloc(
         allocator,
         customization_metadata_template,
-        nonce,
+        &.{.{ .token = "@NONCE@", .value = nonce }},
     );
     defer allocator.free(metadata);
-    const user_data = try replaceNonceAlloc(
+    const user_data = try customizationUserDataAlloc(
         allocator,
-        customization_user_data_template,
+        storage,
         nonce,
     );
     defer allocator.free(user_data);
@@ -922,7 +1159,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("error: invalid --source-sha256\n", .{});
         std.process.exit(1);
     };
-    const profile = args.architecture.profile();
+    const profile = args.profile;
 
     try Dir.cwd().createDirPath(io, args.work_dir);
     if (std.fs.path.dirname(args.output)) |parent| {
@@ -1070,14 +1307,16 @@ pub fn main(init: std.process.Init) !void {
             io,
             temporary.path,
             args.xorriso_path,
+            profile.root_storage,
             &nonce_hex,
         );
         defer allocator.free(seed_iso_path);
 
         std.debug.print(
-            "Customizing FreeBSD {s} under UEFI QEMU ({s})...\n",
+            "Customizing FreeBSD {s} {s} under UEFI QEMU ({s})...\n",
             .{
                 @tagName(args.architecture),
+                @tagName(profile.rootFilesystem()),
                 @tagName(try resolveAccel(io, args.accel, args.architecture)),
             },
         );
@@ -1123,9 +1362,12 @@ pub fn main(init: std.process.Init) !void {
         finalized.artifact.sha256,
     );
     std.debug.print(
-        "Built {s} ({d} bytes, virtual size {d}, SHA-256 {s})\n",
+        "Built {s} ({s} {s} {s}, {d} bytes, virtual size {d}, SHA-256 {s})\n",
         .{
             finalized.artifact.path,
+            @tagName(profile.architecture),
+            @tagName(profile.rootFilesystem()),
+            @tagName(profile.flavor),
             finalized.artifact.size,
             finalized.virtual_size,
             &finalized_sha256,
@@ -1135,13 +1377,17 @@ pub fn main(init: std.process.Init) !void {
 
 test "FreeBSD builder defaults pin the official release source" {
     const args = try parseArgs(&.{});
+    const profile = findProfile(.aarch64, .ufs, .full).?;
     try std.testing.expect(args.source == null);
     try std.testing.expectEqual(Architecture.aarch64, args.architecture);
+    try std.testing.expectEqual(RootFilesystem.ufs, args.root_filesystem);
+    try std.testing.expectEqual(Flavor.full, args.flavor);
+    try std.testing.expectEqual(profile, args.profile);
     try std.testing.expectEqualStrings(
-        aarch64_profile.source_sha256,
+        profile.source_sha256,
         args.source_sha256,
     );
-    try std.testing.expectEqualStrings(aarch64_profile.output, args.output);
+    try std.testing.expectEqualStrings(profile.output, args.output);
     try std.testing.expectEqualStrings("curl", args.curl_path);
     try std.testing.expectEqualStrings("xz", args.xz_path);
     try std.testing.expectEqualStrings("qemu-img", args.qemu_img_path);
@@ -1158,13 +1404,14 @@ test "FreeBSD builder defaults pin the official release source" {
 
 test "FreeBSD builder selects pinned x86_64 defaults" {
     const args = try parseArgs(&.{ "--architecture", "x86_64" });
+    const profile = findProfile(.x86_64, .ufs, .full).?;
     try std.testing.expectEqual(Architecture.x86_64, args.architecture);
     try std.testing.expectEqualStrings(
-        x86_64_profile.source_sha256,
+        profile.source_sha256,
         args.source_sha256,
     );
-    try std.testing.expectEqualStrings(x86_64_profile.output, args.output);
-    try std.testing.expectEqualStrings(x86_64_profile.work_dir, args.work_dir);
+    try std.testing.expectEqualStrings(profile.output, args.output);
+    try std.testing.expectEqualStrings(profile.work_dir, args.work_dir);
     try std.testing.expectEqualStrings("qemu-system-x86_64", args.qemu_path);
     try std.testing.expectEqualStrings(
         "qemu64",
@@ -1174,6 +1421,142 @@ test "FreeBSD builder selects pinned x86_64 defaults" {
         "host",
         args.architecture.cpuArg(.kvm),
     );
+}
+
+test "FreeBSD builder selects pinned ZFS defaults per architecture" {
+    const aarch64 = try parseArgs(&.{ "--filesystem", "zfs" });
+    try std.testing.expectEqual(RootFilesystem.zfs, aarch64.root_filesystem);
+    try std.testing.expectEqualStrings(
+        "FreeBSD-15.1-aarch64.zfs.qcow2",
+        aarch64.output,
+    );
+    try std.testing.expectEqualStrings(
+        ".scratch/generalized-freebsd15-aarch64-zfs",
+        aarch64.work_dir,
+    );
+    try std.testing.expectEqualStrings(
+        "0911a033b0a5d060486f92e534f3482c6a2ab96af6abb8a60683eeb24f6746af",
+        aarch64.source_sha256,
+    );
+    try std.testing.expectEqualStrings(
+        "FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-zfs.qcow2.xz",
+        aarch64.profile.source_name,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 6_477_643_776),
+        aarch64.profile.virtual_size,
+    );
+    try std.testing.expectEqualStrings(
+        "qemu-system-aarch64",
+        aarch64.qemu_path,
+    );
+
+    const x86_64 = try parseArgs(&.{
+        "--architecture", "x86_64",
+        "--filesystem",   "zfs",
+    });
+    try std.testing.expectEqualStrings(
+        "FreeBSD-15.1-x86_64.zfs.qcow2",
+        x86_64.output,
+    );
+    try std.testing.expectEqualStrings(
+        ".scratch/generalized-freebsd15-x86_64-zfs",
+        x86_64.work_dir,
+    );
+    try std.testing.expectEqualStrings(
+        "4159e137d4a78f46b62d3523edd9a4dc79fd0cdcf17e34e531342f52333f4131",
+        x86_64.source_sha256,
+    );
+    try std.testing.expectEqualStrings(
+        "FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-zfs.qcow2.xz",
+        x86_64.profile.source_name,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 6_477_840_384),
+        x86_64.profile.virtual_size,
+    );
+}
+
+test "FreeBSD profile table is complete, unique, and pinned" {
+    var seen: usize = 0;
+    for (std.enums.values(Architecture)) |architecture| {
+        for (std.enums.values(RootFilesystem)) |root_filesystem| {
+            for (std.enums.values(Flavor)) |flavor| {
+                const profile = findProfile(
+                    architecture,
+                    root_filesystem,
+                    flavor,
+                ) orelse return error.MissingProfile;
+                try std.testing.expectEqual(architecture, profile.architecture);
+                try std.testing.expectEqual(
+                    root_filesystem,
+                    profile.rootFilesystem(),
+                );
+                try std.testing.expectEqual(flavor, profile.flavor);
+                seen += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(profiles.len, seen);
+
+    for (&profiles, 0..) |*profile, index| {
+        _ = try artifact_pipeline.parseSha256(profile.source_sha256);
+        try std.testing.expect(std.mem.startsWith(
+            u8,
+            profile.source_url,
+            "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/",
+        ));
+        try std.testing.expect(std.mem.endsWith(
+            u8,
+            profile.source_url,
+            profile.source_name,
+        ));
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            profile.source_name,
+            "BASIC-CLOUDINIT",
+        ) != null);
+        // The upstream file name has to agree with the profile's filesystem,
+        // or a ZFS build would silently generalize a UFS image.
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            profile.source_name,
+            switch (profile.rootFilesystem()) {
+                .ufs => "-ufs.qcow2.xz",
+                .zfs => "-zfs.qcow2.xz",
+            },
+        ) != null);
+        try std.testing.expectEqualStrings(
+            switch (profile.rootFilesystem()) {
+                .ufs => ".qcow2",
+                .zfs => ".zfs.qcow2",
+            },
+            profile.output[profile.output.len - switch (profile.rootFilesystem()) {
+                .ufs => ".qcow2".len,
+                .zfs => ".zfs.qcow2".len,
+            } ..],
+        );
+        // Azure fixed VHDs derived from these images require a 512-byte
+        // aligned virtual size, so a mistyped pin must fail here.
+        try std.testing.expect(profile.virtual_size > 0);
+        try std.testing.expectEqual(
+            @as(u64, 0),
+            profile.virtual_size % 512,
+        );
+        for (profiles[index + 1 ..]) |*other| {
+            try std.testing.expect(!std.mem.eql(u8, profile.output, other.output));
+            try std.testing.expect(!std.mem.eql(
+                u8,
+                profile.work_dir,
+                other.work_dir,
+            ));
+            try std.testing.expect(!std.mem.eql(
+                u8,
+                profile.source_sha256,
+                other.source_sha256,
+            ));
+        }
+    }
 }
 
 test "FreeBSD builder parses explicit source and tool paths" {
@@ -1242,6 +1625,18 @@ test "FreeBSD builder rejects malformed arguments" {
         parseArgs(&.{ "--architecture", "amd64" }),
     );
     try std.testing.expectError(
+        error.InvalidRootFilesystem,
+        parseArgs(&.{ "--filesystem", "zfs-root" }),
+    );
+    try std.testing.expectError(
+        error.InvalidFlavor,
+        parseArgs(&.{ "--flavor", "core" }),
+    );
+    try std.testing.expectError(
+        error.MissingValue,
+        parseArgs(&.{"--filesystem"}),
+    );
+    try std.testing.expectError(
         error.InvalidTimeout,
         parseArgs(&.{ "--timeout", "0" }),
     );
@@ -1261,7 +1656,7 @@ test "FreeBSD builder rejects output aliases before acquisition" {
     const root = root_buffer[0..root_length];
     const cached = try std.fs.path.join(
         allocator,
-        &.{ root, aarch64_profile.source_name },
+        &.{ root, findProfile(.aarch64, .ufs, .full).?.source_name },
     );
     defer allocator.free(cached);
     const output = try std.fs.path.join(allocator, &.{ root, "output.qcow2" });
@@ -1275,7 +1670,7 @@ test "FreeBSD builder rejects output aliases before acquisition" {
 
     try temporary.dir.symLink(
         io,
-        aarch64_profile.source_name,
+        findProfile(.aarch64, .ufs, .full).?.source_name,
         "output.qcow2",
         .{},
     );
@@ -1285,68 +1680,177 @@ test "FreeBSD builder rejects output aliases before acquisition" {
     );
 }
 
-test "FreeBSD customization seed pins secure generalization behavior" {
+/// Properties every generalized FreeBSD guest must carry regardless of
+/// profile. A ZFS image that quietly lost one of these would still boot, so
+/// the contract is asserted here instead of being re-read by hand.
+const generalized_guest_contract = [_][]const u8{
+    // Key-only SSH with no default account.
+    "ssh_pwauth: false",
+    "users: []",
+    "pw userdel freebsd -r",
+    "pw lock root",
+    "sysrc sshd_enable=YES",
+    // nuageinit provisioning and the pinned Azure Agent.
+    "azure-agent-2.15.0.1",
+    "sysrc nuageinit_enable=YES",
+    "sysrc waagent_enable=YES",
+    "set_agent_config Provisioning.Agent auto",
+    "set_agent_config Provisioning.SshHostKeyPairType ed25519",
+    "set_agent_config ResourceDisk.SwapSizeMB 2048",
+    // Generic and Hyper-V DHCP.
+    "sysrc 'ifconfig_DEFAULT=SYNCDHCP accept_rtadv'",
+    "sysrc 'ifconfig_hn0=SYNCDHCP'",
+    // Azure serial console settings.
+    "console=comconsole,efi,vidconsole",
+    "comconsole_speed=115200",
+    "boot_multicons=YES",
+    "boot_serial=YES",
+    "/dev/console /dev/ttyu0",
+    // Cleared instance identity and a clean shutdown.
+    "waagent -deprovision -force",
+    "rm -f /etc/ssh/ssh_host_*",
+    "rm -f /etc/hostid /etc/machine-id",
+    "rm -rf /var/lib/waagent /var/log/azure /var/cache/nuageinit",
+    "touch /firstboot",
+    "/usr/sbin/daemon -cf",
+    "/sbin/shutdown -p now",
+    // First-boot growth is part of the contract for both filesystems.
+    "sysrc growfs_enable=YES",
+    "sysrc growfs_swap_size=0",
+    "swapoff -a",
+};
+
+test "every FreeBSD profile seed honors the generalized guest contract" {
     const allocator = std.testing.allocator;
     const nonce = "0123456789abcdef";
-    const user_data = try replaceNonceAlloc(
+    for (&profiles) |*profile| {
+        const user_data = try customizationUserDataAlloc(
+            allocator,
+            profile.root_storage,
+            nonce,
+        );
+        defer allocator.free(user_data);
+
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            user_data,
+            "@",
+        ) == null);
+        for (&generalized_guest_contract) |required| {
+            if (std.mem.indexOf(u8, user_data, required) == null) {
+                std.debug.print(
+                    "{s} {s} seed is missing {s}\n",
+                    .{
+                        @tagName(profile.architecture),
+                        @tagName(profile.rootFilesystem()),
+                        required,
+                    },
+                );
+                return error.GuestContractViolated;
+            }
+        }
+        const expected_result =
+            customization_result_prefix ++ " " ++ nonce ++ " 0";
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            user_data,
+            expected_result,
+        ) != null);
+    }
+}
+
+test "FreeBSD root storage handling never crosses filesystems" {
+    const allocator = std.testing.allocator;
+    const ufs = try rootStorageScriptAlloc(allocator, ufs_root_storage);
+    defer allocator.free(ufs);
+    const zfs = try rootStorageScriptAlloc(allocator, zfs_root_storage);
+    defer allocator.free(zfs);
+
+    // The UFS arm grows a filesystem and must keep its fstab root line; it
+    // must never reach for pool tooling.
+    try std.testing.expect(std.mem.indexOf(u8, ufs, "= ufs") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        ufs,
+        "grep -Eq '^[^#]+[[:space:]]+/[[:space:]]+ufs[[:space:]]' /etc/fstab",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, ufs, "zpool") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ufs, "zfs ") == null);
+
+    // The ZFS arm grows a pool vdev, re-randomizes the pool GUID, and must
+    // never assert the UFS-only fstab root line.
+    try std.testing.expect(std.mem.indexOf(u8, zfs, "= zfs") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        zfs,
+        "zpool set autoexpand=on \"${root_pool}\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        zfs,
+        "sysrc zpool_reguid=\"${root_pool}\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, zfs, "test \"${root_pool}\" = zroot") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        zfs,
+        "is healthy",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, zfs, "org.freebsd:swap") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zfs, "zfs destroy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zfs, "growfs -y") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zfs, "ufs") == null);
+
+    // Both arms strip swap, and neither may leave a swap mount behind.
+    for ([_][]const u8{ ufs, zfs }) |script| {
+        try std.testing.expect(std.mem.indexOf(u8, script, "swapoff -a") != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            script,
+            "awk '$3 != \"swap\" { print }' /etc/fstab",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(u8, script, "@") == null);
+    }
+}
+
+test "FreeBSD seed embeds only the selected profile's root storage" {
+    const allocator = std.testing.allocator;
+    const nonce = "fedcba9876543210";
+    const ufs_seed = try customizationUserDataAlloc(
         allocator,
-        customization_user_data_template,
+        ufs_root_storage,
         nonce,
     );
-    defer allocator.free(user_data);
+    defer allocator.free(ufs_seed);
+    const zfs_seed = try customizationUserDataAlloc(
+        allocator,
+        zfs_root_storage,
+        nonce,
+    );
+    defer allocator.free(zfs_seed);
 
-    try std.testing.expect(std.mem.indexOf(u8, user_data, "@NONCE@") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ufs_seed, "zpool") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zfs_seed, "zpool") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
-        user_data,
-        "azure-agent-2.15.0.1",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        user_data,
-        "users: []",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        user_data,
-        "waagent -deprovision -force",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        user_data,
-        "/usr/sbin/daemon -cf",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        user_data,
-        "touch /firstboot",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        user_data,
-        "console=comconsole,efi,vidconsole",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        user_data,
-        "boot_multicons=YES",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        user_data,
-        "boot_serial=YES",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        user_data,
-        "/dev/console /dev/ttyu0",
-    ) != null);
-    const expected_result = customization_result_prefix ++ " " ++ nonce ++ " 0";
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        user_data,
-        expected_result,
-    ) != null);
+        zfs_seed,
+        "[[:space:]]+ufs[[:space:]]",
+    ) == null);
+
+    // The substituted block must stay inside the cloud-config script literal,
+    // so every rendered line keeps the six-space `content: |` indentation.
+    var lines = std.mem.splitScalar(u8, zfs_seed, '\n');
+    var inside = false;
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, line, "      set_agent_config Logs.Console n")) {
+            inside = true;
+            continue;
+        }
+        if (!inside) continue;
+        if (std.mem.startsWith(u8, line, "      if pw usershow freebsd")) break;
+        if (line.len == 0) continue;
+        try std.testing.expect(std.mem.startsWith(u8, line, "      "));
+    } else return error.RootStorageBlockNotTerminated;
 }
 
 test "QEMU drive values escape commas" {
