@@ -11,12 +11,13 @@ on:
         options:
           - ufs
           - zfs
+          - core
 
 permissions:
   contents: read
 
-# Release sets publish disjoint assets under distinct tags, so a UFS run and a
-# ZFS run may proceed independently; two runs of the same set may not.
+# Release sets publish disjoint assets under distinct tags, so UFS, ZFS, and
+# core runs may proceed independently; two runs of the same set may not.
 concurrency:
   group: freebsd15-release-${{ inputs.release_set }}
   cancel-in-progress: false
@@ -78,6 +79,7 @@ jobs:
       VARIANT: ${{ matrix.variant }}
       ARCHITECTURE: ${{ matrix.architecture }}
       FILESYSTEM: ${{ matrix.filesystem }}
+      FLAVOR: ${{ matrix.flavor }}
       ASSET_NAME: ${{ matrix.asset_name }}
       SOURCE_NAME: ${{ matrix.source_name }}
       SOURCE_URL: ${{ matrix.source_url }}
@@ -139,6 +141,7 @@ jobs:
           zig build generalized-freebsd15 -- \
             --architecture "$ARCHITECTURE" \
             --filesystem "$FILESYSTEM" \
+            --flavor "$FLAVOR" \
             --work-dir "$GITHUB_WORKSPACE/$WORK_DIR" \
             --output "$GITHUB_WORKSPACE/$CANDIDATE_DIR/$ASSET_NAME" \
             --qemu "$QEMU" \
@@ -162,6 +165,7 @@ jobs:
         env:
           ZVMI_FREEBSD15_ARCHITECTURE: ${{ matrix.architecture }}
           ZVMI_FREEBSD15_FILESYSTEM: ${{ matrix.filesystem }}
+          ZVMI_FREEBSD15_FLAVOR: ${{ matrix.flavor }}
           ZVMI_FREEBSD15_IMAGE: ${{ github.workspace }}/${{ env.CANDIDATE_DIR }}/${{ env.ASSET_NAME }}
           ZVMI_FREEBSD15_QEMU: ${{ matrix.qemu }}
         run: zig build test-freebsd15-boot
@@ -178,7 +182,9 @@ jobs:
           python3 scripts/freebsd15_release.py candidate \
             --architecture "$ARCHITECTURE" \
             --filesystem "$FILESYSTEM" \
+            --flavor "$FLAVOR" \
             --asset "$asset" \
+            --package-manifest "$asset.packages.txt" \
             --validated-sha256 "$asset_sha256" \
             --virtual-size "$VIRTUAL_SIZE" \
             --source-name "$SOURCE_NAME" \
@@ -191,6 +197,15 @@ jobs:
             --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --output "$CANDIDATE_DIR/candidate.json"
+          # Download size is the metric a core image is judged on, so record
+          # it per variant; scripts/freebsd15_release.py compare turns two
+          # staged sets into the full-versus-core table.
+          {
+            echo "### $VARIANT"
+            echo
+            echo "- Download size: $(stat --format='%s' "$asset") bytes"
+            echo "- Packages: $(wc -l < "$asset.packages.txt")"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload exact validated candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
