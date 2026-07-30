@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ -z ${CANDIDATES_DIR:-} || -z ${SOURCE_COMMIT:-} ||
-      -z ${RELEASE_TAG:-} || -z ${RELEASE_TITLE:-} ||
+      -z ${RELEASE_SET:-} || -z ${RELEASE_TAG:-} || -z ${RELEASE_TITLE:-} ||
       -z ${REPOSITORY:-} || -z ${STAGING_ROOT:-} ||
       -z ${GITHUB_STEP_SUMMARY:-} ]]; then
   echo "::error::Required publication configuration is incomplete"
@@ -15,8 +15,22 @@ for tool in gh python3 sha256sum; do
   }
 done
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-[[ "$RELEASE_TAG" == FreeBSD-15.1-20260724 ]]
 [[ "$REPOSITORY" == cataggar/zvmi ]]
+
+# The release set is the single source of truth for the tag, the title, and
+# how many assets may be published. Deriving all three from it keeps a
+# dispatch that names the wrong tag from silently publishing the wrong images.
+release_description=$(python3 scripts/freebsd15_release.py describe \
+  --release-set "$RELEASE_SET")
+expected_tag=${release_description#*release_tag=}
+expected_tag=${expected_tag%%$'\n'*}
+expected_title=${release_description#*release_title=}
+expected_title=${expected_title%%$'\n'*}
+expected_asset_count=${release_description#*asset_count=}
+expected_asset_count=${expected_asset_count%%$'\n'*}
+[[ "$RELEASE_TAG" == "$expected_tag" ]]
+[[ "$RELEASE_TITLE" == "$expected_title" ]]
+[[ "$expected_asset_count" =~ ^[0-9]+$ ]]
 
 mkdir -p "$STAGING_ROOT"
 assets_dir="$STAGING_ROOT/assets"
@@ -27,6 +41,7 @@ verify_dir="$STAGING_ROOT/remote"
 rm -rf -- "$assets_dir" "$verify_dir"
 
 python3 scripts/freebsd15_release.py stage \
+  --release-set "$RELEASE_SET" \
   --candidates "$CANDIDATES_DIR" \
   --source-commit "$SOURCE_COMMIT" \
   --release-tag "$RELEASE_TAG" \
@@ -41,7 +56,7 @@ document = json.load(open(sys.argv[1], encoding="utf-8"))
 for asset in document["assets"]:
     print(f"{asset['asset_name']}\t{asset['sha256']}\t{asset['bytes']}")
 PY
-test "$(wc -l <"$expected_file")" -eq 2
+test "$(wc -l <"$expected_file")" -eq "$expected_asset_count"
 
 tag_created=false
 release_created=false
@@ -198,6 +213,7 @@ PY
   echo "### FreeBSD 15.1 release published"
   echo
   echo "- Release: https://github.com/$REPOSITORY/releases/tag/$RELEASE_TAG"
+  echo "- Release set: \`$RELEASE_SET\`"
   echo "- Source commit: \`$SOURCE_COMMIT\`"
   while IFS=$'\t' read -r asset_name expected_sha _; do
     echo "- \`$asset_name\`: \`$expected_sha\`"
