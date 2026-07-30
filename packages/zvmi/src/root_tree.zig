@@ -823,6 +823,64 @@ pub const RootTree = struct {
         }
     }
 
+    /// The smallest FAT32 volume `populateFat32` fits this tree into.
+    ///
+    /// Derived from the tree rather than taken from a constant, because a
+    /// captured system's EFI system partition holds whatever its vendor put
+    /// there and no fixed number is right for all of them. FAT32's own floor
+    /// of 65525 clusters usually dominates the answer, which is worth
+    /// knowing rather than being surprised by: a nearly empty ESP still
+    /// costs tens of megabytes.
+    pub fn minimumFat32VolumeLength(
+        self: *RootTree,
+        options: FatPopulateOptions,
+        size_options: fat32.VolumeLengthOptions,
+    ) !u64 {
+        try self.sortAndValidateRepresentable();
+        try self.preflightFat32(options);
+
+        var file_sizes = std.array_list.Managed(u64).init(self.allocator);
+        defer file_sizes.deinit();
+        var directory_slots = std.array_list.Managed(u32).init(self.allocator);
+        defer directory_slots.deinit();
+        // Slot 0 is the root directory, which every volume has and no node
+        // names.
+        try directory_slots.append(fat32.root_directory_overhead_slots);
+
+        // Every directory is looked up by path rather than tracked on a
+        // stack of open ones. A stack would need a directory's descendants
+        // to follow it without interruption, and they do not: `/` is 0x2F,
+        // so a sibling named `entries.srel` sorts between `entries` and
+        // `entries/arch.conf` -- which is exactly the pair `bootctl` writes
+        // onto a systemd-boot ESP. What sorting does guarantee is that a
+        // directory precedes its own children, since its path is a prefix
+        // of theirs, and that is all this needs.
+        var directories = std.StringHashMap(usize).init(self.allocator);
+        defer directories.deinit();
+        try directories.put("", 0);
+
+        for (self.nodes.items) |node| {
+            const split = splitPath(node.path);
+            const parent_slot = directories.get(split.parent) orelse
+                return error.MissingParentDirectory;
+            directory_slots.items[parent_slot] += try fat32.nameSlotCount(split.name);
+            switch (node.kind) {
+                .directory => {
+                    try directory_slots.append(fat32.subdirectory_overhead_slots);
+                    try directories.put(node.path, directory_slots.items.len - 1);
+                },
+                // `preflightFat32` has already refused every other kind.
+                .file => try file_sizes.append(node.size()),
+                else => unreachable,
+            }
+        }
+
+        return fat32.minimumVolumeLength(.{
+            .file_sizes = file_sizes.items,
+            .directory_slots = directory_slots.items,
+        }, size_options);
+    }
+
     pub fn manifestDigest(self: *RootTree) ![32]u8 {
         try self.sortAndValidateRepresentable();
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1626,6 +1684,15 @@ fn lessNode(_: void, left: Node, right: Node) bool {
     return std.mem.order(u8, left.path, right.path) == .lt;
 }
 
+/// Splits a tree-relative path into its parent directory and its own name.
+/// A top-level node's parent is the empty string, which is how the root
+/// directory is named everywhere in this file.
+fn splitPath(path: []const u8) struct { parent: []const u8, name: []const u8 } {
+    const separator = std.mem.lastIndexOfScalar(u8, path, '/') orelse
+        return .{ .parent = "", .name = path };
+    return .{ .parent = path[0..separator], .name = path[separator + 1 ..] };
+}
+
 fn lessXattr(_: void, left: ext4.OwnedXattr, right: ext4.OwnedXattr) bool {
     return std.mem.order(u8, left.name, right.name) == .lt;
 }
@@ -2406,4 +2473,100 @@ test "a FAT mount carries only the metadata the scan synthesized" {
     var content: [4]u8 = undefined;
     _ = try root.readNodeContent("boot/efi/EFI/BOOT/BOOTX64.EFI", &content, 0);
     try std.testing.expectEqualStrings("shim", &content);
+}
+
+test "a tree's FAT32 size is one the tree fits in, and one byte less is not" {
+    const Image = @import("image.zig").Image;
+    const io = std.testing.io;
+    const spool_path = "test-root-tree-fat-size.spool";
+    const image_path = "test-root-tree-fat-size.img";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+    try tree.putDirectory("EFI", .{ .mode = 0o755 });
+    try tree.putDirectory("EFI/BOOT", .{ .mode = 0o755 });
+    try tree.putDirectory("EFI/a-vendor-with-a-long-directory-name", .{ .mode = 0o755 });
+    try tree.putFileBytes("EFI/BOOT/BOOTX64.EFI", "boot", .{ .mode = 0o644 });
+    try tree.putFileBytes("EFI/a-vendor-with-a-long-directory-name/grub.cfg", "cfg", .{ .mode = 0o644 });
+
+    // A kernel and an initramfs, which is what actually decides an ESP's
+    // size once it holds more than a bootloader.
+    const big = try std.testing.allocator.alloc(u8, 20 * 1024 * 1024);
+    defer std.testing.allocator.free(big);
+    @memset(big, 0x5A);
+    try tree.putFileBytes("EFI/BOOT/vmlinuz", big, .{ .mode = 0o644 });
+    try tree.putFileBytes("EFI/BOOT/initramfs.img", big, .{ .mode = 0o644 });
+
+    const length = try tree.minimumFat32VolumeLength(.{}, .{});
+
+    var img = try Image.create(io, image_path, .raw, length, .{});
+    defer img.close(io);
+    try fat32.format(&img, io, .{
+        .partition_offset = 0,
+        .partition_len = length,
+        .volume_id = 0xFEED_FACE,
+    });
+    var fs = try fat32.open(&img, io, .{ .offset = 0, .length = length });
+    try tree.populateFat32(&fs, .{});
+
+    const read_back = try fs.readFileAlloc(io, std.testing.allocator, "EFI/BOOT/vmlinuz");
+    defer std.testing.allocator.free(read_back);
+    try std.testing.expectEqualSlices(u8, big, read_back);
+
+    // The size is a minimum rather than an estimate: one alignment unit
+    // less is genuinely too small, so nothing here is padding.
+    const alignment: u64 = 1024 * 1024;
+    try std.testing.expect(length > alignment);
+    const too_small = length - alignment;
+    const short_path = "test-root-tree-fat-size-short.img";
+    defer Io.Dir.cwd().deleteFile(io, short_path) catch {};
+    var short_img = try Image.create(io, short_path, .raw, too_small, .{});
+    defer short_img.close(io);
+    try fat32.format(&short_img, io, .{
+        .partition_offset = 0,
+        .partition_len = too_small,
+        .volume_id = 0xFEED_FACE,
+    });
+    var short_fs = try fat32.open(&short_img, io, .{ .offset = 0, .length = too_small });
+    try std.testing.expectError(error.NoSpaceLeft, tree.populateFat32(&short_fs, .{}));
+}
+
+test "a FAT32 size accounts for a directory whose sibling sorts between it and its children" {
+    const io = std.testing.io;
+    const spool_path = "test-root-tree-fat-interleaved.spool";
+
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    // `/` is 0x2F, so `loader/entries.srel` sorts after `loader/entries` and
+    // before `loader/entries/arch.conf`: a directory's descendants are not
+    // contiguous in the sorted order. This exact pair is what systemd's
+    // `bootctl` writes onto every systemd-boot ESP, so it is the common
+    // case rather than a contrived one.
+    try tree.putDirectory("loader", .{ .mode = 0o755 });
+    try tree.putDirectory("loader/entries", .{ .mode = 0o755 });
+    try tree.putFileBytes("loader/entries.srel", "type1\n", .{ .mode = 0o644 });
+    try tree.putFileBytes("loader/entries/arch.conf", "title Arch\n", .{ .mode = 0o644 });
+    try tree.putFileBytes("loader/loader.conf", "timeout 3\n", .{ .mode = 0o644 });
+
+    const length = try tree.minimumFat32VolumeLength(.{}, .{});
+
+    // Sizing succeeded; check the size it produced is one the tree fits in.
+    const Image = @import("image.zig").Image;
+    const image_path = "test-root-tree-fat-interleaved.img";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    var img = try Image.create(io, image_path, .raw, length, .{});
+    defer img.close(io);
+    try fat32.format(&img, io, .{
+        .partition_offset = 0,
+        .partition_len = length,
+        .volume_id = 0x0BAD_C0DE,
+    });
+    var fs = try fat32.open(&img, io, .{ .offset = 0, .length = length });
+    try tree.populateFat32(&fs, .{});
+
+    const conf = try fs.readFileAlloc(io, std.testing.allocator, "loader/entries/arch.conf");
+    defer std.testing.allocator.free(conf);
+    try std.testing.expectEqualStrings("title Arch\n", conf);
 }

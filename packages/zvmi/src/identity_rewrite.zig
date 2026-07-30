@@ -148,6 +148,13 @@ pub const Plan = struct {
     /// initramfs images are megabytes of compressed payload in which no
     /// identifier is either readable or rewritable.
     esp_roots: []const []const u8 = &.{},
+    /// Set when the tree being reconciled *is* an EFI system partition
+    /// rather than a root filesystem that absorbed one. `esp_roots` cannot
+    /// express that: it names a subtree, and an ESP written as its own
+    /// partition has no path prefix to name. Without this, an assembled
+    /// image's ESP keeps a `grub.cfg` naming the root filesystem UUID the
+    /// source had, and nothing catches it until the image fails to boot.
+    tree_is_esp: bool = false,
 
     pub fn validate(self: Plan) Error!void {
         for (self.filesystems) |filesystem| {
@@ -440,11 +447,12 @@ fn countRetired(plan: Plan) usize {
 const Scope = struct {
     allocator: Allocator,
     esp_roots: [][]const u8,
+    whole_tree: bool,
 
     fn init(allocator: Allocator, plan: Plan) Allocator.Error!Scope {
         const roots = try allocator.alloc([]const u8, plan.esp_roots.len);
         for (plan.esp_roots, roots) |absolute, *slot| slot.* = absolute[1..];
-        return .{ .allocator = allocator, .esp_roots = roots };
+        return .{ .allocator = allocator, .esp_roots = roots, .whole_tree = plan.tree_is_esp };
     }
 
     fn deinit(self: *Scope) void {
@@ -453,6 +461,7 @@ const Scope = struct {
     }
 
     fn underEsp(self: Scope, path: []const u8) bool {
+        if (self.whole_tree) return true;
         for (self.esp_roots) |root| {
             if (pathContains(root, path)) return true;
         }
@@ -1416,6 +1425,59 @@ test "files outside the scanned locations are neither rewritten nor verified" {
     const report = try apply(allocator, &tree, testPlan(), .rewrite_and_verify, &diagnostic);
     try std.testing.expectEqual(@as(usize, 0), report.verified_files);
     try std.testing.expectEqual(@as(usize, 0), report.stale_references);
+}
+
+test "a tree that is itself an ESP is scanned without a path prefix to name it" {
+    const allocator = std.testing.allocator;
+
+    // The same content, once as a subtree of a root filesystem and once as
+    // the whole of a captured ESP written to its own partition. `esp_roots`
+    // can express the first and cannot express the second: it names an
+    // absolute path, and a partition's own root has no prefix. Both must
+    // reach the same file.
+    var merged = root_tree.RootTree.initMemory(allocator, std.testing.io, .{});
+    defer merged.deinit();
+    try putTestFile(&merged, "boot/efi/EFI/vendor/grub.cfg", "root=UUID=" ++ test_boot_uuid ++ "\n");
+
+    var standalone = root_tree.RootTree.initMemory(allocator, std.testing.io, .{});
+    defer standalone.deinit();
+    try putTestFile(&standalone, "EFI/vendor/grub.cfg", "root=UUID=" ++ test_boot_uuid ++ "\n");
+
+    const merged_report = try apply(allocator, &merged, testPlan(), .rewrite_and_verify, null);
+
+    var esp_plan = testPlan();
+    esp_plan.esp_roots = &.{};
+    esp_plan.tree_is_esp = true;
+    const standalone_report = try apply(allocator, &standalone, esp_plan, .rewrite_and_verify, null);
+
+    try std.testing.expectEqual(
+        merged_report.config_references_rewritten,
+        standalone_report.config_references_rewritten,
+    );
+    try std.testing.expect(standalone_report.config_references_rewritten > 0);
+    try std.testing.expectEqual(@as(usize, 0), standalone_report.stale_references);
+
+    const rewritten = try readTestFile(allocator, &standalone, "EFI/vendor/grub.cfg");
+    defer allocator.free(rewritten);
+    try std.testing.expectEqualStrings("root=UUID=" ++ test_root_uuid ++ "\n", rewritten);
+}
+
+test "without the ESP flag a standalone ESP tree keeps its stale identifiers" {
+    const allocator = std.testing.allocator;
+    var tree = root_tree.RootTree.initMemory(allocator, std.testing.io, .{});
+    defer tree.deinit();
+    try putTestFile(&tree, "EFI/vendor/grub.cfg", "root=UUID=" ++ test_boot_uuid ++ "\n");
+
+    // This is the failure the flag exists to prevent, pinned so that a
+    // change making `esp_roots` reach a partition root does not pass
+    // silently: the plan says the ESP lives at `/boot/efi` in some *other*
+    // tree, so nothing here is in scope and the file survives untouched.
+    const report = try apply(allocator, &tree, testPlan(), .rewrite_and_verify, null);
+    try std.testing.expectEqual(@as(usize, 0), report.config_references_rewritten);
+
+    const kept = try readTestFile(allocator, &tree, "EFI/vendor/grub.cfg");
+    defer allocator.free(kept);
+    try std.testing.expectEqualStrings("root=UUID=" ++ test_boot_uuid ++ "\n", kept);
 }
 
 test "identifier text matches what blkid and an fstab spell" {

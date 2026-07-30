@@ -57,6 +57,114 @@ pub fn freeDirEntries(allocator: std.mem.Allocator, entries: []DirEntry) void {
     allocator.free(entries);
 }
 
+/// Directory-entry slots one child name occupies inside its parent: the 8.3
+/// entry that carries the child's cluster and size, plus the long-name
+/// entries that precede it.
+///
+/// Whether a name also fits in 8.3 is not decided by the name alone -- a
+/// short name that collides with one already written picks up a `~1` tail,
+/// and the long-name entries are then what records the real name -- so this
+/// counts them for every name. That makes it an upper bound for the handful
+/// of names where it is wrong, which is the safe direction for anything
+/// choosing a volume size from it.
+pub fn nameSlotCount(name: []const u8) Error!u32 {
+    try validateComponent(name);
+    var units: [max_long_name_units]u16 = undefined;
+    const utf16 = try encodeLongName(name, &units);
+    const long_name_slots = std.math.divCeil(usize, utf16.len + 1, 13) catch unreachable;
+    return @intCast(long_name_slots + 1);
+}
+
+/// Slots a subdirectory holds before any child: its own `.` and `..`, and
+/// the empty slot that terminates the listing.
+pub const subdirectory_overhead_slots: u32 = 3;
+/// The root directory has no `.`/`..` pair, only the terminating slot.
+pub const root_directory_overhead_slots: u32 = 1;
+
+/// What a populated volume has to hold. Stated in bytes and slots rather
+/// than in clusters because cluster size is not an input: it is chosen from
+/// the volume length, which is the thing being solved for.
+pub const SpaceRequest = struct {
+    /// Byte length of every regular file, in any order.
+    file_sizes: []const u64,
+    /// Directory-entry slots each directory needs, the root's included.
+    /// Each is the sum of `nameSlotCount` over that directory's children
+    /// plus its own overhead constant above.
+    directory_slots: []const u32,
+};
+
+pub const VolumeLengthOptions = struct {
+    bytes_per_sector: u16 = default_bytes_per_sector,
+    fat_count: u8 = 2,
+    reserved_sector_count: u16 = 32,
+    /// Candidate lengths are whole multiples of this, because the answer is
+    /// normally a partition length and partitions are aligned.
+    alignment: u64 = 1024 * 1024,
+    /// Where the search gives up. An EFI system partition that will not fit
+    /// below this is not a sizing problem, so it is refused by name rather
+    /// than solved for.
+    max_length: u64 = 8 * 1024 * 1024 * 1024,
+};
+
+/// The smallest aligned volume length that `format` accepts and that holds
+/// `request`.
+///
+/// Candidate lengths are tried in order rather than solved for, because the
+/// cluster size `format` picks is a step function of the length and the
+/// cluster count a file needs is a step function of the cluster size.
+/// Neither step is expensive: the per-cluster-size totals are computed once
+/// each, so a candidate costs a layout calculation and a comparison.
+pub fn minimumVolumeLength(request: SpaceRequest, options: VolumeLengthOptions) Error!u64 {
+    if (!isSupportedBytesPerSector(options.bytes_per_sector)) return error.UnsupportedBytesPerSector;
+    if (options.alignment == 0 or options.alignment % options.bytes_per_sector != 0) {
+        return error.PartitionLengthNotAligned;
+    }
+
+    // One entry per power-of-two sectors-per-cluster value `format` may
+    // choose, so a total is computed at most once for each.
+    var needed_by_cluster_shift = [_]?u64{null} ** 8;
+    var length: u64 = options.alignment;
+    while (length <= options.max_length) : (length += options.alignment) {
+        const info = computeLayout(.{
+            .partition_offset = 0,
+            .partition_len = length,
+            .bytes_per_sector = options.bytes_per_sector,
+            .fat_count = options.fat_count,
+            .reserved_sector_count = options.reserved_sector_count,
+        }) catch |err| switch (err) {
+            error.VolumeTooSmall => continue,
+            else => |other| return other,
+        };
+        const shift = @ctz(info.sectors_per_cluster);
+        const needed = needed_by_cluster_shift[shift] orelse blk: {
+            const total = try clustersFor(request, info.clusterSize());
+            needed_by_cluster_shift[shift] = total;
+            break :blk total;
+        };
+        // `needed` counts the root directory's own cluster, which `format`
+        // hands out before the free pool exists -- hence the comparison
+        // against the whole data area rather than against
+        // `free_cluster_count`, which is that total less the root's one.
+        if (needed <= info.data_cluster_count) return length;
+    }
+    return error.VolumeTooSmall;
+}
+
+fn clustersFor(request: SpaceRequest, cluster_bytes: usize) Error!u64 {
+    var total: u64 = 0;
+    for (request.file_sizes) |size| {
+        // An empty file has no cluster chain at all; its directory entry
+        // records first cluster 0.
+        if (size > std.math.maxInt(u32)) return error.FileTooLarge;
+        total += std.math.divCeil(u64, size, cluster_bytes) catch unreachable;
+    }
+    for (request.directory_slots) |slots| {
+        const bytes = @as(u64, slots) * directory_entry_size;
+        total += @max(@as(u64, 1), std.math.divCeil(u64, bytes, cluster_bytes) catch unreachable);
+    }
+    return total;
+}
+
 pub const Error = error{
     VolumeTooSmall,
     UnsupportedBytesPerSector,
@@ -2902,4 +3010,94 @@ test "scanTree refuses a directory that contains itself" {
         error.DirectoryCycle,
         scanTree(&filesystem, io, allocator, .{}),
     );
+}
+
+test "a name's slot count covers its long-name entries and its short one" {
+    // One short entry always, plus a long-name entry per 13 UTF-16 units of
+    // name including the terminator.
+    try std.testing.expectEqual(@as(u32, 2), try nameSlotCount("A"));
+    try std.testing.expectEqual(@as(u32, 2), try nameSlotCount("BOOTX64.EFI"));
+    // Twelve characters plus the terminator still fits one long entry.
+    try std.testing.expectEqual(@as(u32, 2), try nameSlotCount("abcdefghijkl"));
+    // Thirteen does not: the terminator pushes it into a second.
+    try std.testing.expectEqual(@as(u32, 3), try nameSlotCount("abcdefghijklm"));
+    try std.testing.expectEqual(@as(u32, 3), try nameSlotCount("a" ** 25));
+    try std.testing.expectEqual(@as(u32, 4), try nameSlotCount("a" ** 26));
+}
+
+test "an empty volume is sized by FAT32's own cluster floor, not by its content" {
+    const empty = try minimumVolumeLength(.{
+        .file_sizes = &.{},
+        .directory_slots = &.{root_directory_overhead_slots},
+    }, .{});
+
+    // FAT32 is defined as having at least 65525 clusters, so the smallest
+    // legal volume is around 33.5 MiB with 512-byte clusters however little
+    // it holds. Anything that expects an ESP to shrink towards zero is
+    // expecting the wrong thing.
+    try std.testing.expect(empty >= 33 * 1024 * 1024);
+    try std.testing.expect(empty <= 40 * 1024 * 1024);
+    try std.testing.expectEqual(@as(u64, 0), empty % (1024 * 1024));
+
+    // A little content changes nothing, because the floor still dominates.
+    const small = try minimumVolumeLength(.{
+        .file_sizes = &.{ 1024, 4096 },
+        .directory_slots = &.{ root_directory_overhead_slots + 4, subdirectory_overhead_slots + 2 },
+    }, .{});
+    try std.testing.expectEqual(empty, small);
+}
+
+test "content above the cluster floor grows the volume by what it needs" {
+    const floor = try minimumVolumeLength(.{
+        .file_sizes = &.{},
+        .directory_slots = &.{root_directory_overhead_slots},
+    }, .{});
+
+    var sizes: [1]u64 = .{64 * 1024 * 1024};
+    const with_file = try minimumVolumeLength(.{
+        .file_sizes = &sizes,
+        .directory_slots = &.{root_directory_overhead_slots + 2},
+    }, .{});
+    try std.testing.expect(with_file > floor);
+    try std.testing.expect(with_file >= 64 * 1024 * 1024);
+    // The overhead over the file itself is metadata, not slack: a few
+    // percent, not a doubling.
+    try std.testing.expect(with_file < 74 * 1024 * 1024);
+}
+
+test "the length a volume is sized to is one format accepts and can be filled to" {
+    const io = std.testing.io;
+    const path = "test-fat32-minimum-round-trip.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // Two files large enough that the data area, not the 65525-cluster
+    // floor, decides the answer.
+    const file_bytes: u64 = 24 * 1024 * 1024;
+    const request = SpaceRequest{
+        .file_sizes = &.{ file_bytes, file_bytes },
+        .directory_slots = &.{ root_directory_overhead_slots + 2, subdirectory_overhead_slots + 4 },
+    };
+    const length = try minimumVolumeLength(request, .{});
+
+    var img = try Image.create(io, path, .raw, length, .{});
+    defer img.close(io);
+    try format(&img, io, .{
+        .partition_offset = 0,
+        .partition_len = length,
+        .volume_id = 0x1234_5678,
+    });
+    var fs = try open(&img, io, .{ .offset = 0, .length = length });
+
+    const payload = try std.testing.allocator.alloc(u8, @intCast(file_bytes));
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 0xA5);
+
+    try fs.createDir(io, "sub");
+    try fs.writeFile(io, "one.bin", payload);
+    try fs.writeFile(io, "sub/two.bin", payload);
+
+    // Sized to hold it, and it did.
+    const read_back = try fs.readFileAlloc(io, std.testing.allocator, "sub/two.bin");
+    defer std.testing.allocator.free(read_back);
+    try std.testing.expectEqualSlices(u8, payload, read_back);
 }

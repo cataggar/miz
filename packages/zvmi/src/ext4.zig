@@ -669,7 +669,8 @@ pub fn preflightPopulate(
 /// free_blocks == total_blocks`, exactly.
 pub const MinimumSize = struct {
     /// The smallest `PopulateOptions.length` for which `populate` of this
-    /// tree succeeds. Always a whole number of blocks.
+    /// tree succeeds, or the smallest such length at or above the floor the
+    /// caller asked for. Always a whole number of blocks.
     length: u64,
     total_blocks: u32,
     /// File, directory and slow-symlink content, plus one block for each
@@ -713,14 +714,38 @@ const max_minimum_size_rounds: u32 = 64;
 /// The result is the true minimum, with no headroom. That is right for a
 /// read-only image and wrong for a filesystem a machine will go on writing
 /// to, but how much headroom a running system wants is policy, and this is
-/// not the layer that holds it.
+/// not the layer that holds it. `minimumPopulateLengthAtLeast` is how a
+/// caller that has a headroom policy applies it.
 pub fn minimumPopulateLength(
     allocator: std.mem.Allocator,
     tree: *FileTreeView,
     options: PopulateOptions,
 ) PopulateError!MinimumSize {
+    return minimumPopulateLengthAtLeast(allocator, tree, options, 0);
+}
+
+/// The smallest filesystem `populate` would accept for `tree` that is also
+/// no smaller than `floor` bytes.
+///
+/// Adding headroom is not as simple as adding it to `minimumPopulateLength`,
+/// because "does this length work" is not monotone in the length. A
+/// filesystem is a whole number of block groups, and `buildLayout` refuses
+/// any group whose own metadata is not smaller than the blocks it spans, so
+/// the first few megabytes past a group boundary buy a group header the
+/// filesystem cannot pay for. A tree whose minimum lands just under a
+/// boundary can therefore be refused at minimum + 1 MiB and accepted again
+/// at minimum + 8 MiB. This walks past that hole rather than leaving the
+/// caller to discover it as a `NotEnoughSpace` from `populate`.
+pub fn minimumPopulateLengthAtLeast(
+    allocator: std.mem.Allocator,
+    tree: *FileTreeView,
+    options: PopulateOptions,
+    floor: u64,
+) PopulateError!MinimumSize {
     if (options.block_size != default_block_size) return error.UnsupportedBlockSize;
     if (options.label.len > 16) return error.LabelTooLong;
+    const floor_blocks = std.math.cast(u32, divCeil(floor, @as(u64, options.block_size))) orelse
+        return error.FilesystemTooLarge;
 
     // The tree is walked exactly once, here. Every candidate geometry below
     // reuses this plan: re-walking a root filesystem's worth of nodes for
@@ -747,10 +772,10 @@ pub fn minimumPopulateLength(
     // `resolveJournalBlocks` refuses a journal larger than half the
     // filesystem, and the ladder has nothing to offer below its own floor.
     // Both are lower bounds on the answer rather than reasons to fail.
-    const total_floor: u32 = if (fixed_journal) |blocks|
+    const total_floor: u32 = @max(floor_blocks, if (fixed_journal) |blocks|
         (if (blocks == 0) 1 else std.math.mul(u32, blocks, 2) catch return error.JournalSizeTooLarge)
     else
-        min_journalled_filesystem_blocks;
+        min_journalled_filesystem_blocks);
 
     var journal_blocks: u32 = fixed_journal orelse 0;
     var extent_tree_allowance: u32 = 0;
@@ -760,7 +785,7 @@ pub fn minimumPopulateLength(
     while (round < max_minimum_size_rounds) : (round += 1) {
         const needed = sumBlockCounts(content_blocks, journal_blocks, extent_tree_allowance) orelse
             return error.FilesystemTooLarge;
-        const total = @max(total_floor, try solveTotalBlocks(allocator, plan.inode_count, needed));
+        const total = try solveTotalBlocks(allocator, plan.inode_count, needed, total_floor);
 
         // The journal ladder is keyed on the size it is helping to choose,
         // so the rounds walk it upwards: a larger journal forces a larger
@@ -888,7 +913,8 @@ fn raiseExtentTreeAllowance(plan: *const WriterPlan, current: u32) PopulateError
     return std.math.add(u32, @max(observed, current), 1) catch error.FilesystemTooLarge;
 }
 
-/// The smallest `total_blocks` whose layout has room for `needed_blocks`.
+/// The smallest `total_blocks` that is at least `floor_blocks` and whose
+/// layout has room for `needed_blocks`.
 ///
 /// Candidate geometries are probed with `buildLayout` rather than by
 /// recomputing what a block group costs. That arithmetic has exactly one
@@ -897,6 +923,7 @@ fn solveTotalBlocks(
     allocator: std.mem.Allocator,
     inode_count: usize,
     needed_blocks: u32,
+    floor_blocks: u32,
 ) PopulateError!u32 {
     // Whole block groups are searched first, because "do G groups fit" is
     // monotone in G and so safe to bisect: a group brings its own blocks,
@@ -920,7 +947,13 @@ fn solveTotalBlocks(
             low = mid + 1;
         }
     }
-    return trimToLastGroup(allocator, inode_count, needed_blocks, low);
+    // A total of at least `floor_blocks` spans at least as many groups as
+    // `floor_blocks` does, and the search above says it spans at least
+    // `low`. Both are lower bounds on the same quantity, so the group count
+    // is the larger of them, and the size inside that group is what
+    // `trimToLastGroup` then resolves.
+    const floor_groups = @max(@as(u32, 1), blocksToGroups(floor_blocks, default_blocks_per_group));
+    return trimToLastGroup(allocator, inode_count, needed_blocks, @max(low, floor_groups), floor_blocks);
 }
 
 fn groupCountFits(
@@ -955,11 +988,17 @@ fn blocksForGroupCount(group_count: u32) u32 {
 /// Shrinking cannot change what any group costs -- the group count, and with
 /// it `inodes_per_group`, stays the same -- so the answer is computed rather
 /// than searched, and then confirmed against `buildLayout` once.
+///
+/// `floor_blocks` is the caller's own lower bound. It is applied here rather
+/// than by the caller because a size below the last group's own metadata is
+/// refused outright, and clamping a floor up to the first size the layout
+/// accepts is exactly the hole this function already knows how to step over.
 fn trimToLastGroup(
     allocator: std.mem.Allocator,
     inode_count: usize,
     needed_blocks: u32,
     group_count: u32,
+    floor_blocks: u32,
 ) PopulateError!u32 {
     const full_blocks = blocksForGroupCount(group_count);
     const layout = try buildLayout(allocator, full_blocks, inode_count, needed_blocks);
@@ -972,7 +1011,7 @@ fn trimToLastGroup(
     allocator.free(layout.groups);
 
     const trimmed = full_blocks - @min(spare, last_capacity);
-    const total = std.math.cast(u32, @max(@as(u64, trimmed), last_floor)) orelse
+    const total = std.math.cast(u32, @max(@max(@as(u64, trimmed), last_floor), floor_blocks)) orelse
         return error.FilesystemTooLarge;
     // The trimmed geometry is derived rather than searched, so it is
     // confirmed against the one definition of what a block group costs
@@ -8374,7 +8413,7 @@ test "Editor.flush keeps sparse-super backup superblocks and GDT copies in sync 
 /// opportunistic external-tool check is skipped gracefully instead of
 /// breaking builds/dev machines that lack it -- matching the pattern
 /// `tests/boot_smoke.zig` uses for qemu-system-x86_64.
-fn runE2fsck(allocator: std.mem.Allocator, path: []const u8) !?std.process.RunResult {
+pub fn runE2fsck(allocator: std.mem.Allocator, path: []const u8) !?std.process.RunResult {
     const candidates = [_][]const u8{ "e2fsck", "/sbin/e2fsck", "/usr/sbin/e2fsck" };
     for (candidates) |bin| {
         const result = std.process.run(allocator, std.testing.io, .{
@@ -8389,7 +8428,7 @@ fn runE2fsck(allocator: std.mem.Allocator, path: []const u8) !?std.process.RunRe
     return null;
 }
 
-fn expectE2fsckClean(path: []const u8) !void {
+pub fn expectE2fsckClean(path: []const u8) !void {
     const maybe_result = try runE2fsck(std.testing.allocator, path);
     const result = maybe_result orelse {
         std.debug.print("skipping e2fsck validation: e2fsck not found (tried PATH, /sbin, /usr/sbin)\n", .{});
@@ -8754,6 +8793,90 @@ test "a tree of many small files is bound by its inodes, not by its bytes" {
     try expectMinimalPopulateLength(&tree.view, options, minimum);
     try std.testing.expect(minimum.inode_count >= file_count + first_non_reserved_inode - 1);
     try std.testing.expect(minimum.metadata_blocks > minimum.content_blocks);
+}
+
+test "a floor raises the answer without giving up minimality above it" {
+    var tree = minimumSizeTestTree();
+    tree.bind();
+    const options: PopulateOptions = .{ .length = 0, .uuid = [_]u8{0x4A} ** 16 };
+
+    const minimum = try minimumPopulateLength(std.testing.allocator, &tree.view, options);
+    // A floor the answer already clears changes nothing at all.
+    const unchanged = try minimumPopulateLengthAtLeast(
+        std.testing.allocator,
+        &tree.view,
+        options,
+        minimum.length,
+    );
+    try std.testing.expectEqual(minimum.length, unchanged.length);
+    const below = try minimumPopulateLengthAtLeast(
+        std.testing.allocator,
+        &tree.view,
+        options,
+        minimum.length / 2,
+    );
+    try std.testing.expectEqual(minimum.length, below.length);
+
+    // A floor above it is met exactly whenever the layout accepts that size,
+    // which for a filesystem well inside its first block group it always
+    // does.
+    const raised = minimum.length + 16 * 1024 * 1024;
+    const floored = try minimumPopulateLengthAtLeast(std.testing.allocator, &tree.view, options, raised);
+    try std.testing.expectEqual(raised, floored.length);
+    try std.testing.expect(floored.free_blocks > minimum.free_blocks);
+    try std.testing.expectEqual(minimum.content_blocks, floored.content_blocks);
+
+    var accepted = options;
+    accepted.length = floored.length;
+    const info = try preflightPopulate(std.testing.allocator, &tree.view, accepted);
+    try std.testing.expectEqual(floored.total_blocks, info.block_count);
+}
+
+test "a floor lands past the block-group boundary that would have refused it" {
+    // The hole this steps over is real, and this is what it looks like. A
+    // filesystem sized to just past a group boundary owes that group a
+    // superblock copy, a group descriptor table, two bitmaps and an inode
+    // table before it may store anything, and `buildLayout` refuses a group
+    // that cannot pay. How wide the hole is depends on how many inodes the
+    // tree has, so a caller adding headroom to a minimum has no way to know
+    // where the boundaries fall or how far past one it has to reach.
+    var tree = minimumSizeTestTree();
+    tree.bind();
+    const options: PopulateOptions = .{ .length = 0, .uuid = [_]u8{0x4B} ** 16 };
+
+    const minimum = try minimumPopulateLength(std.testing.allocator, &tree.view, options);
+    const boundary = default_blocks_per_group;
+    try std.testing.expect(minimum.total_blocks < boundary);
+
+    // One block into the second group is refused outright, so a floor there
+    // has to come back with something larger.
+    var refused = options;
+    refused.length = @as(u64, boundary + 1) * default_block_size;
+    try std.testing.expectError(
+        error.NotEnoughSpace,
+        preflightPopulate(std.testing.allocator, &tree.view, refused),
+    );
+
+    const floored = try minimumPopulateLengthAtLeast(
+        std.testing.allocator,
+        &tree.view,
+        options,
+        refused.length,
+    );
+    try std.testing.expect(floored.length > refused.length);
+    try std.testing.expectEqual(@as(u32, 2), floored.group_count);
+
+    var accepted = options;
+    accepted.length = floored.length;
+    _ = try preflightPopulate(std.testing.allocator, &tree.view, accepted);
+
+    // And it is the *smallest* size past the hole, not merely one that works.
+    var one_less = options;
+    one_less.length = floored.length - default_block_size;
+    try std.testing.expectError(
+        error.NotEnoughSpace,
+        preflightPopulate(std.testing.allocator, &tree.view, one_less),
+    );
 }
 
 // ---------------------------------------------------------------------------
