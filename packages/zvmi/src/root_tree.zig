@@ -1282,12 +1282,14 @@ pub const RootTree = struct {
         }
     }
 
-    /// A 128-byte inode stores each time in a bare 32-bit field, so anything
-    /// before 1970 or after 2106 has nowhere to go. Refusing is the only
-    /// honest option: a wrapped value looks like a perfectly ordinary date.
+    /// ext4 stores each time as a signed 32-bit seconds field plus the two
+    /// epoch bits of the matching `i_*_extra` word, which together reach
+    /// 1901-12-13 through 2446-05-10. Anything outside that has nowhere to
+    /// go, and refusing is the only honest option: a wrapped value looks like
+    /// a perfectly ordinary date.
     fn validateExt4Time(value: ?i64) !void {
         const seconds = value orelse return;
-        if (seconds < 0 or seconds > std.math.maxInt(u32)) {
+        if (seconds < ext4.min_representable_time or seconds > ext4.max_representable_time) {
             return error.Ext4TimestampsUnsupported;
         }
     }
@@ -2024,10 +2026,19 @@ test "root timestamps affect manifests and unsupported ext4 metadata is explicit
     try tree.putFileBytes("value", "x", .{ .mode = 0o644, .mtime = 1 });
     _ = try tree.ext4View();
 
-    // Nothing outside 1970..2106 fits a 128-byte inode's time fields.
+    // A pre-1970 time is ordinary on an installed system -- an unset clock,
+    // or an archive restored with its original dates -- and the epoch bits
+    // reach back to 1901, so it has to be accepted rather than refused.
     tree.setRootMetadata(.{ .atime = -1 });
-    try std.testing.expectError(error.Ext4TimestampsUnsupported, tree.ext4View());
+    _ = try tree.ext4View();
     tree.setRootMetadata(.{ .atime = @as(i64, std.math.maxInt(u32)) + 1 });
+    _ = try tree.ext4View();
+
+    // Nothing outside 1901-12-13..2446-05-10 fits an ext4 inode's time
+    // fields, however wide the inode is.
+    tree.setRootMetadata(.{ .atime = -2_147_483_649 });
+    try std.testing.expectError(error.Ext4TimestampsUnsupported, tree.ext4View());
+    tree.setRootMetadata(.{ .atime = 15_032_385_536 });
     try std.testing.expectError(error.Ext4TimestampsUnsupported, tree.ext4View());
     tree.setRootMetadata(.{ .mode = 0o40755 });
     try std.testing.expectError(error.Ext4RootMetadataUnsupported, tree.ext4View());
