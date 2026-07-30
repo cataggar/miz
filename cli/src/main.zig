@@ -15,6 +15,7 @@ const map_cmd = @import("commands/map.zig");
 const azure_cmd = @import("commands/azure.zig");
 const cosi_cmd = @import("commands/cosi.zig");
 const build_image_cmd = @import("commands/build_image.zig");
+const capture_cmd = @import("commands/capture.zig");
 const qemu_cmd = @import("commands/qemu.zig");
 const sign_cmd = @import("commands/sign.zig");
 const oci_cmd = @import("commands/oci.zig");
@@ -35,6 +36,7 @@ const usage =
     \\  azure deprovision [--user <username>] [--allow-device-write] <file>
     \\  cosi <disk-image> -o <output.cosi>
     \\  oci copy|inspect|list-tags
+    \\  capture --source <device|image> [--source-root <spec>] [--source-mount <spec>=<path>]... [--source-esp <spec>] [--root-size <size>] [--esp-size <size>] [--no-journal] [--dry-run] -O <format> -o <output|->
     \\  build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}|-> [--skip-iso-rootfs] [--esp-size <size>] [--root-selinux-label <context>] [--boot-mode bls|uki|both] [--stub-source-path <path>] [--verity]
     \\  qemu [<image>] [--model full|core] [--architecture auto|x86_64|aarch64] [--admin-username <name>] [--ssh-public-key <path>] [--ssh-port <port>] [--snapshot] [--secure-boot] [--secure-boot-certificate <path> --secure-boot-certificate-sha256 <hex>] [--accel auto|whpx|kvm|hvf|tcg] [--qemu <path>] [--ovmf-code <path>] [--ovmf-vars <path>] [-- <extra-qemu-args...>]
     \\  uki certificate <disk-image> (--output <certificate.pem>|--output=json) [--expected-sha256 <hex>]
@@ -81,6 +83,7 @@ fn run(
     if (std.mem.eql(u8, command, "azure")) return azure_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "cosi")) return cosi_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "build-image")) return build_image_cmd.run(gpa, io, rest);
+    if (std.mem.eql(u8, command, "capture")) return capture_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "qemu")) return qemu_cmd.run(gpa, io, environ, rest);
     if (std.mem.eql(u8, command, "sign")) return sign_cmd.run(gpa, io, environ, rest);
     if (std.mem.eql(u8, command, "oci")) return oci_cmd.run(gpa, io, environ, rest);
@@ -103,6 +106,7 @@ test {
     _ = azure_cmd;
     _ = cosi_cmd;
     _ = build_image_cmd;
+    _ = capture_cmd;
     _ = qemu_cmd;
     _ = sign_cmd;
     _ = oci_cmd;

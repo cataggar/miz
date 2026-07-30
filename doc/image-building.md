@@ -45,6 +45,8 @@ zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o outp
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 384M --skip-iso-rootfs -o output-minimal.raw -O raw
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G --verity -o output.vhd
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G --boot-mode uki --esp-size 512M -o output-uki.vhd
+zvmi capture --source /dev/sda -O vhd -o captured.vhd   # rebuild an installed system, sized to its content
+zvmi capture --source disk.qcow2 --source-root gpt:2 -O raw -o captured.raw --dry-run
 zvmi qemu AzureLinux
 zvmi qemu AzureLinux --snapshot
 ```
@@ -670,6 +672,125 @@ than degraded. Software emulation must be asked for by name, and is the only
 option for a cross-architecture run, since no accelerator crosses architectures.
 Whichever ran is recorded in provenance.
 
+## Capturing an installed system
+
+`zvmi capture` reads an installed system — a block device, a disk image, a
+partition inside one, or an LVM logical volume — and writes a **new** disk
+image sized to the content rather than to the source. A 1 TB disk holding
+6 GB of files becomes a 6 GB image.
+
+```
+zvmi capture --source /dev/sda -O vhd -o captured.vhd
+zvmi capture --source disk.qcow2 --source-root gpt:2 -O raw -o captured.raw
+zvmi capture --source /dev/sda --source-root lvm:vg0/root -O raw -o captured.raw
+zvmi capture --source /dev/sda --source-mount /dev/sda2=/boot -O raw -o captured.raw
+zvmi capture --source /dev/sda -O raw -o captured.raw --dry-run
+zvmi capture --source /dev/sda -O raw.gz -o - | ssh host 'cat > captured.raw.gz'
+```
+
+`-o` and a format are always required, `--dry-run` included: a dry run reports
+what *that* output would have cost, and the staging it plans for depends on
+where the output was going.
+
+This is not `rebuild`. `zvmi convert` and the preserved-image backends copy a
+disk and keep its geometry; capture discards the source geometry entirely and
+assembles a fresh GPT with a fresh ESP and a fresh root filesystem from the
+*files* it read. Nothing of the source's partition table, free space, or
+fragmentation survives.
+
+### What it selects, and how
+
+The root filesystem is `--source-root` if given. Otherwise every partition of
+`--source` is probed and the one holding an ext4 filesystem **with an `/etc`**
+is the root -- provided exactly one does, which is the ordinary single-root
+install. Both halves of that are read off the disk rather than guessed at, and
+the `/etc` half matters: a separate `/boot` is ext4 on plenty of machines
+whose root is xfs or btrfs, and capturing it would produce a perfectly valid
+image of the wrong filesystem.
+
+Two candidates is `AmbiguousSourceRoot`, an ext4 with no `/etc` is
+`NoRootLikeFilesystem`, and no ext4 at all is `SourceRootRequired`. All three
+name the flag that settles it, because "the biggest Linux partition" would be
+right often enough to be trusted and wrong often enough to matter. A root
+inside LVM is never auto-detected, since the partition holding it is a
+physical volume rather than a filesystem.
+
+A spec is a path (`/dev/sda2`, `root.img`), a partition of `--source`
+(`gpt:2`, one-based), or a logical volume (`lvm:<vg>/<lv>`).
+
+The EFI system partition is found by GPT type GUID, which is definitional
+rather than a heuristic, and can be named explicitly with `--source-esp`. It
+is **copied**, not regenerated: a signed EFI binary that is re-emitted is a
+Secure Boot failure, so capture reproduces the bytes it was given.
+
+Naming the root as a partition of `--source` (`gpt:<n>`) rather than by path
+also lets the capture retire the source's PARTUUID and PARTLABEL. A root
+opened by path is just a filesystem; which partition it came from is not
+knowable from it, so a `PARTUUID=`-rooted fstab cannot be corrected. That is
+warned about rather than discovered at boot.
+
+`--source-mount <spec>=<path>` names a filesystem mounted elsewhere in the
+running system — most often a separate `/boot`. Its content is merged into the
+root tree at that path, exactly as [merging several source
+filesystems](#merging-several-source-filesystems-into-one-root) describes, and
+its `/etc/fstab` entry is *dropped*, because after the merge there is no
+separate filesystem left to mount. A real ESP is not a `--source-mount`: it
+stays a partition of its own and keeps its `/boot/efi` entry.
+
+### Sizing
+
+Both filesystems are sized from their content. `--root-size` and `--esp-size`
+override that, and are refused below the measured minimum rather than silently
+raised — the failure states the minimum so the number can be argued with:
+
+```
+capture: the smallest root filesystem holding this content is 13 MiB (14262272 bytes)
+capture: the smallest EFI system partition holding it is 33 MiB (34603008 bytes)
+capture: assembling the image failed: RootSizeBelowMinimum
+```
+
+FAT32's 65525-cluster floor means the smallest legal ESP is about 33.5 MiB
+however empty it is, so that minimum is usually about FAT32 and not about the
+content. `--dry-run` reports every one of these numbers and writes nothing.
+
+### Identity
+
+The captured filesystems get new UUIDs and a new FAT volume serial, so the
+image can be attached alongside its source without a duplicate-UUID collision.
+That would break every reference to the old ones, so the identity
+reconciliation described under [reconciling fstab and the
+bootloader](#reconciling-fstab-and-the-bootloader-with-the-new-identity) runs
+by default over both the root tree and the ESP, and what it did is reported:
+
+```
+capture: root identity rewrite: 2 fstab entries rewritten, 1 dropped, 1 references in 1 config files
+capture: ESP identity rewrite: 0 fstab entries rewritten, 0 dropped, 2 references in 1 config files
+```
+
+References it retired but could not replace, and references that survived the
+rewrite, are warned about rather than passed over: an image that builds and
+then fails to boot is the expensive outcome. `--no-identity-rewrite` keeps the
+source identifiers, which is correct only when the source will never be
+attached at the same time.
+
+### Reading the source
+
+Reading a mounted, running filesystem captures it mid-write. Capture a
+quiesced source: a stopped VM's disk, a snapshot, or a device that is not
+mounted read-write. Reading a block device generally requires root, and
+`EACCES` on `--source` says so rather than leaving the operator to infer it.
+
+Nothing is written to the source, and a failed capture leaves no partial
+image. Output to a file is created exclusively, so a capture never overwrites
+something it was not asked to and never removes a file it did not create;
+non-raw formats are assembled into a staging file beside the destination and
+converted only once that is complete.
+
+`-O` accepts the same formats as `convert`, including `raw.gz` and `-o -` for
+a stream. `-O vhd` is written *fixed*, as `build-image` writes it, because the
+reason to want a captured image as a VHD is almost always an Azure
+managed-disk upload and those refuse dynamic.
+
 ## Journalling the root filesystem
 
 The native ext4 writer can create a JBD2 journal. It does not by default, and
@@ -687,9 +808,14 @@ would replay in a moment and carry on.
 So: build a purpose-built, effectively read-only appliance image without a
 journal, and build an image that boots into a mutable root filesystem with one.
 
+`zvmi capture` is the one surface that inverts the default, because it is the
+one surface whose output is by definition a machine that was already running a
+mutable root filesystem and will go on doing so.
+
 | Surface | How to ask for it |
 | --- | --- |
 | `zvmi build-image` | `--journal`, `--no-journal` (default), `--journal-size <size>` |
+| `zvmi capture` | journalled by default; `--no-journal` to omit |
 | `std.Build` helper (`image.addImage`) | `.journal = true`, `.journal_size = <bytes>` |
 | `std.Build` helper (`image.addPreservedImage`) | `.journal = .{ .enabled = true, .size_bytes = ... }` |
 | Preserved-image configuration JSON (api_version 3) | `"journal": { "enabled": true, "size_bytes": 33554432 }` |
@@ -786,7 +912,8 @@ Each limit is raisable on its own, and none is library-only.
 Values accept the same binary suffixes as `--size` (`4M` is 4194304), which is
 why a count such as `--max-nodes 8M` is accepted and means 8388608.
 
-`zvmi build-image` takes the eight that bound the tree it builds. The
+`zvmi build-image` and `zvmi capture` take the eight that bound the tree they
+build. The
 `std.Build` helpers (`zvmi_image.add`, `zvmi_image.addPreserved`) take all of
 them as `limits`, and the preserved-image builder takes all of them, including
 the two that only a source scan and an operation can reach.
@@ -835,7 +962,7 @@ creates no files and the caller may free space before committing.
 runs as the image is produced, not as a separate pass over a finished file,
 so a build never has to materialize the full uncompressed raw locally --
 which is usually the single largest cost of producing a disk image. Both
-`convert` and `build-image` accept them, as do the customization entry points
+`convert`, `build-image` and `capture` accept them, as do the customization entry points
 (`zvmi.customize` and the `zvmi-image-builder`/`zvmi-preserved-image-builder`
 bundle executables) via the same `-O` spelling.
 
@@ -846,6 +973,7 @@ piped:
 zvmi convert -O raw.gz -o - disk.qcow2 - | ssh host 'cat > image.raw.gz'
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G \
     -O raw.gz -o - > image.raw.gz
+zvmi capture --source /dev/sda -O raw.gz -o - | ssh host 'cat > captured.raw.gz'
 ```
 
 The published gzip artifact is directly consumable by the usual idiom:
