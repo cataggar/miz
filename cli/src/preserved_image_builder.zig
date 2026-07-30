@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const customization_loader = @import("customization_loader.zig");
+const vm_firmware = @import("vm_firmware.zig");
 const zvmi = @import("zvmi");
 const wire = zvmi.preserved_image_wire;
 
@@ -49,6 +50,11 @@ const LoadedConfiguration = struct {
     guest_execution: wire.GuestExecutionPolicy,
     runner: ?wire.Runner,
     vm: ?zvmi.customize.VmPolicy,
+    /// Set when the configuration asked for a firmware boot without naming the
+    /// EDK2 files. Resolution needs the runner architecture and the filesystem,
+    /// so it happens in `main` where a failure can be reported as the
+    /// resolution failure it is rather than as an invalid configuration.
+    vm_firmware_unresolved: bool = false,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -149,6 +155,46 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
+    var vm_policy = configuration.vm;
+    if (configuration.vm_firmware_unresolved) {
+        const policy = &vm_policy.?;
+        const firmware = &policy.boot.firmware;
+        const options: vm_firmware.Options = .{
+            .architecture = switch (configuration.guest_execution) {
+                .same_architecture => args.architecture,
+                .cross_architecture => switch (configuration.runner.?.guest_architecture) {
+                    .x86_64 => .x86_64,
+                    .aarch64 => .aarch64,
+                },
+            },
+            .emulator_command = policy.emulator_command,
+            .secure_boot = firmware.secure_boot,
+            // Deterministic, because the resolved paths are hashed into the
+            // plan: a per-run directory would move the plan hash for
+            // unchanged inputs.
+            .materialize_directory = try std.fs.path.join(
+                arena,
+                &.{ args.bundle_output_path, "firmware" },
+            ),
+        };
+        const resolved_firmware = vm_firmware.resolveAlloc(arena, init.io, options) catch |err| {
+            try writeRunnerDiagnostic(
+                arena,
+                init.io,
+                diagnostics_output_path,
+                .resolution,
+                .missing_capability,
+                "/execution/vm/boot/firmware/code_path",
+                try vm_firmware.describeAlloc(arena, options, err),
+                "install cataggar/qemu with ghr, or name --firmware-code and --firmware-vars in the customization",
+                err,
+            );
+            return;
+        };
+        firmware.code_path = resolved_firmware.code_path;
+        firmware.vars_path = resolved_firmware.vars_path;
+    }
+
     const request = zvmi.customize.Request{
         .api_version = args.api_version,
         .target_architecture = args.architecture,
@@ -192,7 +238,7 @@ pub fn main(init: std.process.Init) !void {
             .workspace_path = args.bundle_output_path,
             .backend = configuration.backend,
             .acknowledge_unsafe = configuration.acknowledge_unsafe,
-            .vm = configuration.vm,
+            .vm = vm_policy,
         },
         .generalization = configuration.generalization,
         .reproducibility = .{
@@ -579,6 +625,15 @@ fn loadV3Configuration(
         .guest_execution = parsed.value.guest_execution,
         .runner = parsed.value.runner,
         .vm = mapVmPolicy(parsed.value.vm),
+        .vm_firmware_unresolved = vmFirmwareUnresolved(parsed.value.vm),
+    };
+}
+
+fn vmFirmwareUnresolved(configuration: ?wire.VmConfiguration) bool {
+    const present = configuration orelse return false;
+    return switch (present.boot) {
+        .direct_kernel => false,
+        .firmware => |firmware| firmware.code_path == null,
     };
 }
 
@@ -621,10 +676,18 @@ fn mapVmPolicy(configuration: ?wire.VmConfiguration) ?zvmi.customize.VmPolicy {
         .emulator_command = present.emulator_command,
         .boot = switch (present.boot) {
             .direct_kernel => .direct_kernel,
-            .firmware => |firmware| .{ .firmware = .{
-                .code_path = firmware.code_path,
-                .vars_path = firmware.vars_path,
-            } },
+            .firmware => |firmware| .{
+                .firmware = .{
+                    // Empty paths never reach the plan: `main` resolves them
+                    // before the request is built, and refuses the run if it
+                    // cannot. Validation would reject them anyway.
+                    .code_path = firmware.code_path orelse "",
+                    .vars_path = firmware.vars_path orelse "",
+                    .console_marker = firmware.console_marker,
+                    .secure_boot = firmware.secure_boot,
+                    .boot_timeout_seconds = firmware.boot_timeout_seconds,
+                },
+            },
         },
         .acceleration = switch (present.acceleration) {
             .hardware => .hardware,
