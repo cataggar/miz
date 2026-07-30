@@ -29,6 +29,10 @@ const partition_length = @as(u64, partition_sectors) * zvmi.mbr.sector_size;
 const kernel_release = "6.12.0-1.integration";
 const kernel_bytes = "integration-kernel-image\n";
 const agent_bytes = "integration-guest-agent\n";
+/// Stand-ins for the EDK2 pair. Their only job is to be distinct, non-empty
+/// files whose digests provenance can be checked against.
+const firmware_code_bytes = "integration-edk2-code\n";
+const firmware_vars_bytes = "integration-edk2-vars-template\n";
 
 /// What the stand-in emulator does once it has checked the contract. Each
 /// value is a distinct way a real run can end, and the host is required to
@@ -43,7 +47,20 @@ const StubMode = enum {
     silent,
     /// Exits non-zero, as an emulator that could not start would.
     emulator_failure,
+    /// Customizes as `success` does, then, in the attestation invocation the
+    /// backend makes afterwards, prints the console marker the way an image
+    /// whose own boot chain came up would.
+    firmware_success,
+    /// Customizes as `success` does, then fails the attestation the way an
+    /// image with a broken bootloader configuration does: the firmware says
+    /// so on stderr and gives up.
+    firmware_unbootable,
 };
+
+/// What the stand-in image prints once its own boot chain has control. Real
+/// plans name whatever their image says; the value only has to be something
+/// nothing else on the console would produce by accident.
+const console_marker = "zvmi-integration-guest is up";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -84,6 +101,9 @@ fn runIntegration(allocator: Allocator, io: Io, self_exe: []const u8) !void {
     try runSilentGuest(allocator, io, self_exe, architecture);
     try runEmulatorFailure(allocator, io, self_exe, architecture);
     try runHardwareRejected(allocator, io, self_exe, architecture);
+    try runFirmwareBootMatchesDirectKernel(allocator, io, self_exe, architecture);
+    try runFirmwareUnbootable(allocator, io, self_exe, architecture);
+    try runFirmwareMissing(allocator, io, self_exe, architecture);
     std.debug.print("vm backend integration passed\n", .{});
 }
 
@@ -111,7 +131,7 @@ fn runSuccess(
         if (diagnostic.code == .cleanup_failed) return error.CleanupFailed;
     }
 
-    try ensure(result.provenance.schema_version == 13);
+    try ensure(result.provenance.schema_version == 14);
     const vm = result.provenance.execution.vm orelse
         return error.MissingVmProvenance;
     try ensure(std.mem.eql(u8, vm.emulator_command, workspace.emulator_path));
@@ -272,6 +292,144 @@ fn runHardwareRejected(
     workspace.completed = true;
 }
 
+/// The point of the acceptance criterion: the same plan through a firmware
+/// boot must publish the same bytes it publishes through a direct-kernel
+/// boot. It holds by construction — the firmware boot is the same appliance
+/// customization followed by a read-only attestation — and this is where that
+/// construction is checked rather than asserted.
+fn runFirmwareBootMatchesDirectKernel(
+    allocator: Allocator,
+    io: Io,
+    self_exe: []const u8,
+    architecture: zvmi.customize.Architecture,
+) !void {
+    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
+    defer workspace.deinit(io);
+    try workspace.installFirmware(allocator, io);
+
+    var direct = try workspace.execute(allocator, io, .success, .software);
+    defer direct.deinit(allocator);
+    if (direct.result == null) return error.DirectKernelRunProducedNoResult;
+    const direct_digest = try digestOfFile(io, workspace.output_path);
+    try ensure(direct.result.?.provenance.execution.vm.?.boot == .direct_kernel);
+    try Io.Dir.cwd().deleteFile(io, workspace.output_path);
+
+    workspace.firmware_boot = true;
+    var attested = try workspace.execute(allocator, io, .firmware_success, .software);
+    defer attested.deinit(allocator);
+    if (attested.result == null) return error.FirmwareRunProducedNoResult;
+    if (attested.diagnostics.hasErrors()) return error.FirmwareRunReportedErrors;
+
+    // Byte-identical, not merely equivalent: the boot mode is an attestation,
+    // never a semantic difference in the published image.
+    try ensure(std.mem.eql(u8, &direct_digest, &try digestOfFile(io, workspace.output_path)));
+
+    const result = attested.result.?;
+    try ensure(result.provenance.schema_version == 14);
+    const vm = result.provenance.execution.vm orelse return error.MissingVmProvenance;
+    // The two modes are distinguishable in provenance, which is the whole
+    // reason the record is a union rather than a flag.
+    const firmware = switch (vm.boot) {
+        .direct_kernel => return error.FirmwareRunRecordedAsDirectKernel,
+        .firmware => |record| record,
+    };
+    try ensure(std.mem.eql(u8, firmware.code_path, workspace.firmware_code_path));
+    try ensure(std.mem.eql(u8, &firmware.code_sha256.bytes, &sha256(firmware_code_bytes)));
+    try ensure(std.mem.eql(u8, firmware.vars_template_path, workspace.firmware_vars_path));
+    try ensure(std.mem.eql(u8, &firmware.vars_template_sha256.bytes, &sha256(firmware_vars_bytes)));
+    try ensure(firmware.variable_store == .ephemeral);
+    try ensure(!firmware.secure_boot);
+    try ensure(std.mem.eql(u8, firmware.console_marker, console_marker));
+    try ensure(firmware.boot_timeout_seconds == 120);
+    // What was attested is what was published.
+    try ensure(std.mem.eql(u8, &firmware.attested_stage_sha256.bytes, &direct_digest));
+
+    // The variable store is ephemeral: the stand-in firmware writes to the
+    // store it is given, and the template the plan names is still the
+    // template afterwards.
+    try ensure(std.mem.eql(
+        u8,
+        &try digestOfFile(io, workspace.firmware_vars_path),
+        &sha256(firmware_vars_bytes),
+    ));
+
+    try expectPathAbsent(io, workspace.transaction_path);
+    try expectFileExists(io, workspace.output_path);
+    try expectSourceUnchanged(io, &workspace);
+    workspace.completed = true;
+}
+
+/// An image whose boot chain never comes up fails the run outright, and the
+/// firmware's own account of why is on the console the caller was given.
+fn runFirmwareUnbootable(
+    allocator: Allocator,
+    io: Io,
+    self_exe: []const u8,
+    architecture: zvmi.customize.Architecture,
+) !void {
+    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
+    defer workspace.deinit(io);
+    try workspace.installFirmware(allocator, io);
+    workspace.firmware_boot = true;
+
+    var console: std.array_list.Managed(u8) = .init(allocator);
+    defer console.deinit();
+    captured_console = &console;
+    defer captured_console = null;
+
+    var outcome = try workspace.execute(allocator, io, .firmware_unbootable, .software);
+    defer outcome.deinit(allocator);
+
+    try expectFailedRun(io, &workspace, &outcome);
+    // Attributable: the recorded console names the boot entry that failed, so
+    // the failure is diagnosable without re-running the boot.
+    try ensure(std.mem.indexOf(u8, console.items, "failed to load Boot0001") != null);
+    workspace.completed = true;
+}
+
+/// Firmware that is not on this host is a refusal in preflight, before
+/// anything is copied, and never a quiet direct-kernel boot in its place.
+fn runFirmwareMissing(
+    allocator: Allocator,
+    io: Io,
+    self_exe: []const u8,
+    architecture: zvmi.customize.Architecture,
+) !void {
+    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
+    defer workspace.deinit(io);
+    try workspace.installFirmware(allocator, io);
+    workspace.firmware_boot = true;
+    try Io.Dir.cwd().deleteFile(io, workspace.firmware_code_path);
+
+    var resolved = try workspace.resolve(allocator, .software);
+    defer resolved.deinit(allocator);
+    const plan = &(resolved.plan orelse return error.ResolutionProducedNoPlan);
+    try workspace.rememberTransaction(plan);
+
+    var platform = zvmi.customize.Platform.system();
+    platform.vmCheckFn = checkVm;
+    platform.vmRunFn = runVm;
+    var report = try zvmi.customize.preflight(allocator, io, plan, platform);
+    defer report.deinit(allocator);
+    if (report.ready()) return error.MissingFirmwareWasNotRefused;
+
+    // The refusal names the firmware requirement rather than the backend, so
+    // an operator is told what to install.
+    var named = false;
+    for (report.capabilities) |check| {
+        if (check.requirement.kind == .vm_firmware and check.state != .available) {
+            named = true;
+            try ensure(std.mem.eql(u8, check.requirement.path, workspace.firmware_code_path));
+        }
+    }
+    try ensure(named);
+
+    try expectPathAbsent(io, workspace.output_path);
+    try expectPathAbsent(io, workspace.transaction_path);
+    try expectSourceUnchanged(io, &workspace);
+    workspace.completed = true;
+}
+
 /// Every failing run must leave the same evidence: no output, no transaction,
 /// and a source byte-for-byte as it started. The distinction between the
 /// failures is the diagnostic, not the residue.
@@ -306,6 +464,13 @@ const Workspace = struct {
     transport: zvmi.vm_payload.DiskTransport,
     drivers: Drivers,
     source_digest: [32]u8,
+    /// The EDK2 stand-ins, written into the workspace so the plan can name
+    /// absolute paths that exist without depending on what this host has
+    /// installed. Empty until `installFirmware` runs.
+    firmware_code_path: []const u8 = "",
+    firmware_vars_path: []const u8 = "",
+    /// Selects the boot mode the next `resolve` asks for.
+    firmware_boot: bool = false,
     /// Set by a case that reached its last assertion. A workspace is only
     /// removed once that happens, so a failure leaves its source, its output,
     /// and its transaction exactly as they were for inspection.
@@ -362,6 +527,25 @@ const Workspace = struct {
         };
     }
 
+    fn installFirmware(self: *Workspace, allocator: Allocator, io: Io) !void {
+        self.firmware_code_path = try std.fs.path.join(
+            allocator,
+            &.{ self.path, "edk2-code.fd" },
+        );
+        self.firmware_vars_path = try std.fs.path.join(
+            allocator,
+            &.{ self.path, "edk2-vars.fd" },
+        );
+        try Io.Dir.cwd().writeFile(io, .{
+            .sub_path = self.firmware_code_path,
+            .data = firmware_code_bytes,
+        });
+        try Io.Dir.cwd().writeFile(io, .{
+            .sub_path = self.firmware_vars_path,
+            .data = firmware_vars_bytes,
+        });
+    }
+
     fn deinit(self: *Workspace, io: Io) void {
         if (!self.completed) {
             std.debug.print(
@@ -410,6 +594,12 @@ const Workspace = struct {
                 .backend = .vm,
                 .vm = .{
                     .emulator_command = self.emulator_path,
+                    .boot = if (self.firmware_boot) .{ .firmware = .{
+                        .code_path = self.firmware_code_path,
+                        .vars_path = self.firmware_vars_path,
+                        .console_marker = console_marker,
+                        .boot_timeout_seconds = 120,
+                    } } else .direct_kernel,
                     .acceleration = acceleration,
                     .acknowledge_software_emulation = acceleration == .software,
                     .memory_mib = 1024,
@@ -492,7 +682,18 @@ fn runVm(
         .transaction_path = plan.data.transaction_path,
         .target = target,
         .agent = agent_bytes,
+        .console = if (captured_console == null) null else .{ .writeFn = captureConsole },
     });
+}
+
+/// Where a failing run's console goes while a case is watching for it. The
+/// backend hands the console to a sink rather than a writer, so the case that
+/// wants it installs one for the duration.
+var captured_console: ?*std.array_list.Managed(u8) = null;
+
+fn captureConsole(_: ?*anyopaque, bytes: []const u8) void {
+    const sink = captured_console orelse return;
+    sink.appendSlice(bytes) catch {};
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +723,13 @@ fn runStubEmulator(
     const mode = std.meta.stringToEnum(StubMode, mode_text) orelse
         return error.UnknownStubMode;
     if (mode == .emulator_failure) return error.StubEmulatorRefused;
+
+    // The attestation invocation is the one with nothing to boot but the
+    // disk. Distinguishing on `-kernel` rather than on a flag is deliberate:
+    // it is the property the whole design turns on.
+    if (valueAfter(args, "-kernel") == null) {
+        return runStubFirmware(io, mode, args);
+    }
 
     const kernel_path = valueAfter(args, "-kernel") orelse
         return error.MissingKernelArgument;
@@ -654,6 +862,81 @@ fn runStubEmulator(
     const file = try Io.Dir.cwd().openFile(io, result_path, .{ .mode = .write_only });
     defer file.close(io);
     try file.writePositionalAll(io, sealed, 0);
+}
+
+/// The stand-in firmware. It checks that it was handed exactly the shape of
+/// guest a firmware boot means — its own code and a writable variable store on
+/// pflash, the stage behind a snapshot overlay, and nothing to boot from but
+/// the disk — and then speaks, or fails to, on the console.
+fn runStubFirmware(io: Io, mode: StubMode, args: []const []const u8) !void {
+    try expectStub(valueAfter(args, "-initrd") == null);
+    try expectStub(valueAfter(args, "-append") == null);
+    try expectStub(std.mem.eql(u8, valueAfter(args, "-nic") orelse "", "none"));
+
+    var code: ?[]const u8 = null;
+    var vars: ?[]const u8 = null;
+    var stage: ?[]const u8 = null;
+    for (args, 0..) |arg, index| {
+        if (!std.mem.eql(u8, arg, "-drive") or index + 1 >= args.len) continue;
+        const value = args[index + 1];
+        if (std.mem.indexOf(u8, value, "if=pflash") != null) {
+            if (std.mem.indexOf(u8, value, "unit=0") != null) {
+                try expectStub(std.mem.indexOf(u8, value, "readonly=on") != null);
+                code = drivePath(value);
+            } else if (std.mem.indexOf(u8, value, "unit=1") != null) {
+                try expectStub(std.mem.indexOf(u8, value, "readonly=on") == null);
+                vars = drivePath(value);
+            }
+        } else if (std.mem.indexOf(u8, value, "if=virtio") != null) {
+            // The overlay is what makes the attestation read-only, so a stage
+            // without it is a contract violation rather than a slow path.
+            try expectStub(std.mem.indexOf(u8, value, "snapshot=on") != null);
+            stage = drivePath(value);
+        }
+    }
+    const code_path = code orelse return error.MissingFirmwareCodeDrive;
+    const vars_path = vars orelse return error.MissingFirmwareVarsDrive;
+    _ = stage orelse return error.MissingStageDrive;
+
+    const code_bytes = try Io.Dir.cwd().readFileAlloc(
+        io,
+        code_path,
+        std.heap.page_allocator,
+        .limited(1024),
+    );
+    defer std.heap.page_allocator.free(code_bytes);
+    try expectStub(std.mem.eql(u8, code_bytes, firmware_code_bytes));
+
+    // A firmware writes to its variable store. Doing so here proves the store
+    // is the per-run copy rather than the template the plan named: the case
+    // checks the template afterwards.
+    const store = try Io.Dir.cwd().openFile(io, vars_path, .{ .mode = .write_only });
+    defer store.close(io);
+    try store.writePositionalAll(io, "Boot0001", 0);
+
+    if (mode == .firmware_unbootable) {
+        var stderr_buffer: [256]u8 = undefined;
+        var stderr = Io.File.stderr().writer(io, &stderr_buffer);
+        try stderr.interface.writeAll(
+            "BdsDxe: failed to load Boot0001 \"UEFI Misc Device\": Not Found\n",
+        );
+        try stderr.interface.flush();
+        return error.StubFirmwareFoundNothingBootable;
+    }
+
+    var stdout_buffer: [256]u8 = undefined;
+    var stdout = Io.File.stdout().writer(io, &stdout_buffer);
+    try stdout.interface.writeAll("UEFI firmware, stand-in build\n");
+    try stdout.interface.writeAll(console_marker ++ "\n");
+    try stdout.interface.flush();
+}
+
+fn drivePath(value: []const u8) ?[]const u8 {
+    const marker = "file=";
+    const start = std.mem.indexOf(u8, value, marker) orelse return null;
+    const rest = value[start + marker.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
+    return rest[0..end];
 }
 
 fn indexOfArgument(args: []const []const u8, wanted: []const u8) ?usize {

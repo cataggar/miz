@@ -29,8 +29,8 @@ const verity = @import("verity.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 10;
-pub const provenance_schema_version: u32 = 13;
+pub const plan_schema_version: u32 = 11;
+pub const provenance_schema_version: u32 = 14;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -272,6 +272,22 @@ pub const VmNetworkPolicy = enum {
     declared_repositories,
 };
 
+/// What happens to the UEFI variable store a firmware boot writes to.
+///
+/// Only `ephemeral` exists, and the choice is deliberate rather than pending:
+/// the run has to answer "does the image as published boot", and a preserved
+/// store would answer "does it boot on a machine a previous run already
+/// primed". A firmware that wrote a `Boot####` entry on its first pass would
+/// make the second pass of an identical plan a different experiment, which is
+/// exactly the property this backend refuses to give up. It is recorded in
+/// provenance as a value rather than assumed, so a future preserved store is a
+/// readable difference rather than a silent one.
+pub const VmVariableStorePolicy = enum {
+    /// The template is copied into the transaction, used once, and removed
+    /// with the transaction. The file the policy names is never written.
+    ephemeral,
+};
+
 /// UEFI firmware for a guest that boots the way real hardware would.
 pub const VmFirmware = struct {
     /// Read-only firmware code for the runner architecture.
@@ -279,6 +295,29 @@ pub const VmFirmware = struct {
     /// Template variable store. The backend works on a copy, so the file named
     /// here is never modified.
     vars_path: []const u8,
+    /// What the guest's own boot chain prints on the serial console once it
+    /// has taken control.
+    ///
+    /// Named by the plan rather than guessed at, because nothing on the host
+    /// knows what a given image says on its way up, and a marker the backend
+    /// invented would make a boot that never happened indistinguishable from
+    /// one that did. This is the whole contract an image has to satisfy to be
+    /// attested: emit these bytes on the console the firmware guest is given.
+    console_marker: []const u8,
+    /// Whether the named firmware pair is a Secure Boot capable one, and the
+    /// guest is therefore built with the SMM and secure-pflash wiring that
+    /// makes the variable store authenticated.
+    ///
+    /// Policy input only. Observing what the guest concluded about its own
+    /// Secure Boot state would require code running inside a guest this
+    /// backend deliberately does not enter, so a claim about it is never
+    /// recorded as an observation.
+    secure_boot: bool = false,
+    /// The attestation's own budget. A firmware boot is bounded by a full
+    /// boot chain rather than by kernel-to-agent, and under emulation that
+    /// difference is measured in tens of minutes, so it is not shared with
+    /// `VmPolicy.boot_timeout_seconds`.
+    boot_timeout_seconds: u32 = default_vm_firmware_boot_timeout_seconds,
 };
 
 /// How the guest is brought up.
@@ -288,7 +327,16 @@ pub const VmBoot = union(enum) {
     /// system stands between the emulator and the agent, which is what keeps
     /// software emulation affordable and boot failures attributable.
     direct_kernel,
-    /// Boot through UEFI firmware, exercising the image's own boot chain.
+    /// Customize exactly as `direct_kernel` does, then attest the customized
+    /// stage by booting it through UEFI firmware and its own boot chain
+    /// before anything is published.
+    ///
+    /// The agent is not carried into that boot. Getting it there would take
+    /// either modifying the image — which would mean attesting a boot chain
+    /// nobody will ever run — or a cooperating image, which is not something
+    /// a backend that customizes arbitrary images may require. So the two
+    /// jobs are split: the appliance boot mutates, the firmware boot only
+    /// watches, and the bytes it watches are proven unchanged afterwards.
     firmware: VmFirmware,
 };
 
@@ -312,6 +360,14 @@ pub const VmPolicy = struct {
 pub const min_vm_memory_mib: u32 = 512;
 pub const max_vm_memory_mib: u32 = 1024 * 1024;
 pub const max_vm_boot_timeout_seconds: u32 = 24 * 60 * 60;
+/// Twice the appliance boot's budget. A firmware guest interprets the
+/// firmware, the bootloader, the kernel and an init system where the
+/// appliance interprets a kernel and one static binary, and on a software
+/// emulator each of those is paid for one instruction at a time.
+pub const default_vm_firmware_boot_timeout_seconds: u32 = 1800;
+/// Ceiling on the console marker. Long enough for a full banner line, short
+/// enough that the marker is a marker rather than a transcript.
+pub const max_vm_console_marker_bytes: usize = 256;
 
 pub const PackageAction = union(enum) {
     install: []const []const u8,
@@ -1284,6 +1340,24 @@ fn validateVmPolicy(
                     "name the firmware variable template for the runner architecture",
                 ));
             }
+            if (!isValidConsoleMarker(firmware.console_marker)) {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/execution/vm/boot/firmware/console_marker",
+                    "firmware boot requires a printable single-line console marker",
+                    "name the bytes the image's own boot chain prints once it has taken control",
+                ));
+            }
+            if (firmware.boot_timeout_seconds == 0 or
+                firmware.boot_timeout_seconds > max_vm_boot_timeout_seconds)
+            {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/execution/vm/boot/firmware/boot_timeout_seconds",
+                    "the firmware boot timeout is outside the supported range",
+                    "select a timeout of at least 1 second and at most 86400 seconds",
+                ));
+            }
         },
     }
     if (policy.memory_mib < min_vm_memory_mib or policy.memory_mib > max_vm_memory_mib) {
@@ -1348,6 +1422,36 @@ fn validateVmPolicy(
             ));
         },
     }
+}
+
+/// A marker is matched against a byte stream a guest emits, so it must be
+/// something a guest can actually emit on one line. Control bytes are refused
+/// because a marker spanning a line break would match only if the guest's
+/// console happened to use the same line ending the plan was written with.
+fn isValidConsoleMarker(marker: []const u8) bool {
+    if (marker.len == 0 or marker.len > max_vm_console_marker_bytes) return false;
+    for (marker) |byte| {
+        if (byte < 0x20 or byte > 0x7e) return false;
+    }
+    return true;
+}
+
+/// Whether the host can read the firmware a plan's firmware boot names.
+///
+/// Separate from the rest of the `vm` probe because it is the one part whose
+/// refusal an operator fixes by installing something, and because the
+/// requirement that carries it names the exact file that was missing.
+pub fn vmFirmwareAvailable(io: Io, firmware: VmFirmware) CapabilityState {
+    if (!readableRegularFile(io, firmware.code_path)) return .missing;
+    if (!readableRegularFile(io, firmware.vars_path)) return .missing;
+    return .available;
+}
+
+fn readableRegularFile(io: Io, path: []const u8) bool {
+    const stat = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    if (stat.kind != .file or stat.size == 0) return false;
+    Io.Dir.cwd().access(io, path, .{ .read = true }) catch return false;
+    return true;
 }
 
 fn validateOsCustomization(
@@ -1830,6 +1934,10 @@ pub const CapabilityKind = enum {
     boot_policy_mutation,
     generalization,
     atomic_commit,
+    /// The EDK2 code and variable-store template a firmware boot names. Its
+    /// own requirement rather than part of `vm`, so a refusal says which file
+    /// was missing instead of only that the backend was unavailable.
+    vm_firmware,
 };
 
 pub const CapabilityRequirement = struct {
@@ -2310,6 +2418,7 @@ pub fn resolve(
         resolved_cross_architecture,
         target_architecture,
         context.host_architecture,
+        resolved_runner_architecture,
     );
 
     var data = ResolvedPlanData{
@@ -2648,10 +2757,19 @@ fn dupeVmPolicy(
         .emulator_command = try allocator.dupe(u8, present.emulator_command),
         .boot = switch (present.boot) {
             .direct_kernel => .direct_kernel,
-            .firmware => |firmware| .{ .firmware = .{
-                .code_path = try allocator.dupe(u8, firmware.code_path),
-                .vars_path = try allocator.dupe(u8, firmware.vars_path),
-            } },
+            .firmware => |firmware| blk: {
+                // Built whole before it becomes the union's payload: a
+                // half-filled firmware behind a `.firmware` tag would read as
+                // a complete policy to everything downstream.
+                const owned = VmFirmware{
+                    .code_path = try allocator.dupe(u8, firmware.code_path),
+                    .vars_path = try allocator.dupe(u8, firmware.vars_path),
+                    .console_marker = try allocator.dupe(u8, firmware.console_marker),
+                    .secure_boot = firmware.secure_boot,
+                    .boot_timeout_seconds = firmware.boot_timeout_seconds,
+                };
+                break :blk .{ .firmware = owned };
+            },
         },
         .acceleration = present.acceleration,
         .acknowledge_software_emulation = present.acknowledge_software_emulation,
@@ -2946,6 +3064,7 @@ fn buildCapabilities(
     cross_architecture: CrossArchitecturePolicy,
     target_architecture: Architecture,
     host_architecture: Architecture,
+    runner_architecture: Architecture,
 ) Allocator.Error![]CapabilityRequirement {
     var capabilities = std.array_list.Managed(CapabilityRequirement).init(allocator);
     defer capabilities.deinit();
@@ -3053,6 +3172,18 @@ fn buildCapabilities(
             try capabilities.append(.{ .kind = .vm, .path = "", .reason = "run the isolated full-system VM executor" });
             try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "execute target code in a VM" });
             try capabilities.append(.{ .kind = .standalone_output, .path = output.path, .reason = "publish a standalone output" });
+            if (execution.vm) |vm| switch (vm.boot) {
+                .direct_kernel => {},
+                .firmware => |firmware| try capabilities.append(.{
+                    .kind = .vm_firmware,
+                    .path = firmware.code_path,
+                    .related_path = firmware.vars_path,
+                    .reason = switch (runner_architecture) {
+                        .x86_64 => "read the x86_64 EDK2 firmware code and variable template the firmware boot names",
+                        .aarch64 => "read the aarch64 EDK2 firmware code and variable template the firmware boot names",
+                    },
+                }),
+            };
         },
     }
     if (execution.backend != .native_fresh and hasOsCustomization(customization)) {
@@ -3344,6 +3475,9 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
             .firmware => |firmware| {
                 hashString(&hash, firmware.code_path);
                 hashString(&hash, firmware.vars_path);
+                hashString(&hash, firmware.console_marker);
+                hashBool(&hash, firmware.secure_boot);
+                hashInt(&hash, firmware.boot_timeout_seconds);
             },
         }
         hashInt(&hash, @intFromEnum(vm.acceleration));
@@ -3820,6 +3954,10 @@ pub fn preflight(
             .generalization,
             => if (plan.data.execution.backend == .rebuild) .available else .unsupported,
             .vm => vmCapabilityState(platform, io, plan),
+            .vm_firmware => if (plan.data.execution.vm) |vm| switch (vm.boot) {
+                .direct_kernel => .unsupported,
+                .firmware => |firmware| vmFirmwareAvailable(io, firmware),
+            } else .unsupported,
             .package_cache,
             .package_lock,
             .selinux_policy,
@@ -4079,6 +4217,9 @@ fn systemCapabilityCheck(_: ?*anyopaque, io: Io, requirement: CapabilityRequirem
         .arbitrary_filesystem_mutation,
         .boot_policy_mutation,
         .generalization,
+        // Firmware is only ever probed against the plan's own policy, which
+        // a bare requirement does not carry; preflight routes it there.
+        .vm_firmware,
         => .unsupported,
     };
 }
@@ -4294,6 +4435,38 @@ pub const VmModuleRecord = struct {
     sha256: Digest,
 };
 
+/// The firmware a firmware-booted run was attested through, named by digest
+/// as well as by path so the record can be checked against the host later.
+pub const VmFirmwareRecord = struct {
+    code_path: []const u8,
+    code_sha256: Digest,
+    /// The template the per-run store was copied from. The copy itself is
+    /// gone by the time this is written, which is what `variable_store` says.
+    vars_template_path: []const u8,
+    vars_template_sha256: Digest,
+    variable_store: VmVariableStorePolicy,
+    /// What the policy asked for, not what the guest concluded: this backend
+    /// never enters the firmware-booted guest, so it has nothing to observe
+    /// Secure Boot state with and does not pretend otherwise.
+    secure_boot: bool,
+    /// The machine the attestation guest ran on, which differs from the
+    /// appliance's when Secure Boot wiring is required.
+    machine: []const u8,
+    console_marker: []const u8,
+    boot_timeout_seconds: u32,
+    /// The stage as it was published, digested after the attestation guest
+    /// exited. Equal to the digest taken before it started, or the run failed:
+    /// this is the recorded proof that the boot mode did not change the bytes.
+    attested_stage_sha256: Digest,
+};
+
+/// How the guest that performed the customization was brought up, and — for a
+/// firmware run — what the published bytes were additionally attested with.
+pub const VmBootRecord = union(enum) {
+    direct_kernel,
+    firmware: VmFirmwareRecord,
+};
+
 /// What the emulator was, how it was configured, and exactly which bytes the
 /// guest booted. `acceleration` is the accelerator that ran, not the one that
 /// was requested — the backend never degrades silently, so the two always
@@ -4314,6 +4487,10 @@ pub const VmExecutionRecord = struct {
     initrd_sha256: Digest,
     control_sha256: Digest,
     boot_origin: VmBootOrigin,
+    /// `direct_kernel` for a run that was only an appliance boot, `firmware`
+    /// for one whose published bytes also came up through their own boot
+    /// chain. The two are never the same run recorded differently.
+    boot: VmBootRecord = .direct_kernel,
     /// Modules the guest inserted, in insertion order. Empty says the image's
     /// kernel needed no help, which is the case this backend started with.
     modules: []const VmModuleRecord = &.{},
@@ -4789,6 +4966,29 @@ fn buildResult(
                 .sha256 = source.sha256,
             };
         }
+        // Assembled whole before the tag is published, so a reader can never
+        // see `.firmware` beside a record that is still being filled in.
+        const boot_record: VmBootRecord = switch (record.boot) {
+            .direct_kernel => .direct_kernel,
+            .firmware => |firmware| blk_boot: {
+                const owned_firmware = VmFirmwareRecord{
+                    .code_path = try result_allocator.dupe(u8, firmware.code_path),
+                    .code_sha256 = firmware.code_sha256,
+                    .vars_template_path = try result_allocator.dupe(
+                        u8,
+                        firmware.vars_template_path,
+                    ),
+                    .vars_template_sha256 = firmware.vars_template_sha256,
+                    .variable_store = firmware.variable_store,
+                    .secure_boot = firmware.secure_boot,
+                    .machine = try result_allocator.dupe(u8, firmware.machine),
+                    .console_marker = try result_allocator.dupe(u8, firmware.console_marker),
+                    .boot_timeout_seconds = firmware.boot_timeout_seconds,
+                    .attested_stage_sha256 = firmware.attested_stage_sha256,
+                };
+                break :blk_boot .{ .firmware = owned_firmware };
+            },
+        };
         break :blk VmExecutionRecord{
             .emulator_command = try result_allocator.dupe(u8, record.emulator_command),
             .emulator_version = try result_allocator.dupe(u8, record.emulator_version),
@@ -4804,6 +5004,7 @@ fn buildResult(
             .kernel_sha256 = record.kernel_sha256,
             .initrd_sha256 = record.initrd_sha256,
             .control_sha256 = record.control_sha256,
+            .boot = boot_record,
             .boot_origin = switch (record.boot_origin) {
                 .boot_directory => |boot| .{ .boot_directory = .{
                     .kernel_path = try result_allocator.dupe(u8, boot.kernel_path),
@@ -6570,6 +6771,7 @@ test "the vm backend requires an explicit and self-consistent VM policy" {
             policy.boot = .{ .firmware = .{
                 .code_path = "",
                 .vars_path = "/usr/share/OVMF/OVMF_VARS.fd",
+                .console_marker = "Linux version ",
             } };
             break :blk policy;
         } },
@@ -6578,6 +6780,35 @@ test "the vm backend requires an explicit and self-consistent VM policy" {
             policy.boot = .{ .firmware = .{
                 .code_path = "/usr/share/OVMF/OVMF_CODE.fd",
                 .vars_path = "OVMF_VARS.fd",
+                .console_marker = "Linux version ",
+            } };
+            break :blk policy;
+        } },
+        .{ .name = "firmware without a console marker", .policy = blk: {
+            var policy = validVmPolicy();
+            policy.boot = .{ .firmware = .{
+                .code_path = "/usr/share/OVMF/OVMF_CODE.fd",
+                .vars_path = "/usr/share/OVMF/OVMF_VARS.fd",
+                .console_marker = "",
+            } };
+            break :blk policy;
+        } },
+        .{ .name = "multi-line console marker", .policy = blk: {
+            var policy = validVmPolicy();
+            policy.boot = .{ .firmware = .{
+                .code_path = "/usr/share/OVMF/OVMF_CODE.fd",
+                .vars_path = "/usr/share/OVMF/OVMF_VARS.fd",
+                .console_marker = "reached\ntarget",
+            } };
+            break :blk policy;
+        } },
+        .{ .name = "no firmware boot timeout", .policy = blk: {
+            var policy = validVmPolicy();
+            policy.boot = .{ .firmware = .{
+                .code_path = "/usr/share/OVMF/OVMF_CODE.fd",
+                .vars_path = "/usr/share/OVMF/OVMF_VARS.fd",
+                .console_marker = "Linux version ",
+                .boot_timeout_seconds = 0,
             } };
             break :blk policy;
         } },
@@ -6626,13 +6857,15 @@ test "the vm backend requires an explicit and self-consistent VM policy" {
     try std.testing.expect(!accepted.hasErrors());
 }
 
-test "firmware boot is a valid policy that no backend implements yet" {
+test "a firmware boot names its own firmware, marker, and budget in the plan" {
     var request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
     request.execution.backend = .vm;
     var policy = validVmPolicy();
     policy.boot = .{ .firmware = .{
         .code_path = "/usr/share/OVMF/OVMF_CODE.fd",
         .vars_path = "/usr/share/OVMF/OVMF_VARS.fd",
+        .console_marker = "Linux version ",
+        .secure_boot = true,
     } };
     request.execution.vm = policy;
 
@@ -6643,7 +6876,93 @@ test "firmware boot is a valid policy that no backend implements yet" {
     var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
     defer resolved.deinit(std.testing.allocator);
     try std.testing.expect(resolved.plan != null);
-    try std.testing.expect(resolved.plan.?.data.execution.vm.?.boot == .firmware);
+    const firmware = resolved.plan.?.data.execution.vm.?.boot.firmware;
+    try std.testing.expectEqualStrings("Linux version ", firmware.console_marker);
+    try std.testing.expect(firmware.secure_boot);
+    try std.testing.expectEqual(
+        default_vm_firmware_boot_timeout_seconds,
+        firmware.boot_timeout_seconds,
+    );
+
+    // The firmware is its own preflight requirement, so a refusal names the
+    // file that was missing rather than only the backend that wanted it.
+    var saw_firmware_requirement = false;
+    for (resolved.plan.?.data.required_capabilities) |requirement| {
+        if (requirement.kind != .vm_firmware) continue;
+        saw_firmware_requirement = true;
+        try std.testing.expectEqualStrings("/usr/share/OVMF/OVMF_CODE.fd", requirement.path);
+        try std.testing.expectEqualStrings(
+            "/usr/share/OVMF/OVMF_VARS.fd",
+            requirement.related_path,
+        );
+        try std.testing.expect(std.mem.indexOf(u8, requirement.reason, "x86_64") != null);
+    }
+    try std.testing.expect(saw_firmware_requirement);
+}
+
+test "a direct-kernel plan carries no firmware requirement" {
+    var request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    request.execution.backend = .vm;
+    request.execution.vm = validVmPolicy();
+
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    for (resolved.plan.?.data.required_capabilities) |requirement| {
+        try std.testing.expect(requirement.kind != .vm_firmware);
+    }
+}
+
+test "the firmware a plan names changes its hash" {
+    var request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    request.execution.backend = .vm;
+    var policy = validVmPolicy();
+    policy.boot = .{ .firmware = .{
+        .code_path = "/usr/share/OVMF/OVMF_CODE.fd",
+        .vars_path = "/usr/share/OVMF/OVMF_VARS.fd",
+        .console_marker = "Linux version ",
+    } };
+    request.execution.vm = policy;
+
+    var base = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer base.deinit(std.testing.allocator);
+
+    // Everything about the run is identical but the bytes the attestation
+    // waits for, which is a different experiment and so a different plan.
+    policy.boot.firmware.console_marker = "systemd 255 running";
+    request.execution.vm = policy;
+    var moved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer moved.deinit(std.testing.allocator);
+
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &base.plan.?.data.plan_hash.bytes,
+        &moved.plan.?.data.plan_hash.bytes,
+    ));
+}
+
+test "firmware readability is probed as its own capability" {
+    const io = std.testing.io;
+    const cwd = Io.Dir.cwd();
+    const code_path = "test-customize-firmware-code.fd";
+    const vars_path = "test-customize-firmware-vars.fd";
+    defer cwd.deleteFile(io, code_path) catch {};
+    defer cwd.deleteFile(io, vars_path) catch {};
+
+    const absent = VmFirmware{
+        .code_path = code_path,
+        .vars_path = vars_path,
+        .console_marker = "Linux version ",
+    };
+    try std.testing.expectEqual(CapabilityState.missing, vmFirmwareAvailable(io, absent));
+
+    try cwd.writeFile(io, .{ .sub_path = code_path, .data = "code" });
+    try std.testing.expectEqual(CapabilityState.missing, vmFirmwareAvailable(io, absent));
+    try cwd.writeFile(io, .{ .sub_path = vars_path, .data = "vars" });
+    try std.testing.expectEqual(CapabilityState.available, vmFirmwareAvailable(io, absent));
+
+    // An empty file is a firmware that was never materialized, not firmware.
+    try cwd.writeFile(io, .{ .sub_path = vars_path, .data = "" });
+    try std.testing.expectEqual(CapabilityState.missing, vmFirmwareAvailable(io, absent));
 }
 
 test "vm acceleration is resolved against the runner architecture" {
@@ -7551,7 +7870,7 @@ test "plan JSON renders identifiers as stable strings" {
     defer output.deinit();
     try writePlanJson(&resolved.plan.?, &output.writer);
     const json = output.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 11") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"plan_hash\": \"") != null);
 }
 

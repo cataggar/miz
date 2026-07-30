@@ -82,6 +82,16 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
+    // Declared this early because the preserved-image builder resolves EDK2
+    // firmware through the same module `zvmi qemu` does, and that builder is
+    // constructed well before the qemu-facing part of the graph.
+    const host_qemu_host_mod = b.createModule(.{
+        .root_source_file = b.path("qemu/host.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    host_qemu_host_mod.linkLibrary(host_bzip2.artifact("bz2"));
 
     const zvmi_tests = b.addTest(.{ .root_module = zvmi_mod });
     const run_zvmi_tests = b.addRunArtifact(zvmi_tests);
@@ -228,6 +238,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zvmi", .module = host_zvmi_mod },
+                .{ .name = "qemu_host", .module = host_qemu_host_mod },
             },
         }),
     });
@@ -416,18 +427,32 @@ pub fn build(b: *std.Build) void {
     );
     vm_real_boot_step.dependOn(&run_vm_real_boot.step);
 
+    // Not part of `zig build test`: it needs a bootable image and real EDK2
+    // firmware, neither of which a test run may assume.
+    const vm_firmware_boot_exe = b.addExecutable(.{
+        .name = "zvmi-vm-firmware-boot",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/vm_firmware_boot.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zvmi", .module = host_zvmi_mod },
+                .{ .name = "qemu_host", .module = host_qemu_host_mod },
+            },
+        }),
+    });
+    const run_vm_firmware_boot = b.addRunArtifact(vm_firmware_boot_exe);
+    const vm_firmware_boot_step = b.step(
+        "test-vm-firmware-boot",
+        "Attest a supplied bootable image through real EDK2 firmware",
+    );
+    vm_firmware_boot_step.dependOn(&run_vm_firmware_boot.step);
+
     const host_qmp_mod = b.createModule(.{
         .root_source_file = b.path("qmp/src/qmp.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     });
-    const host_qemu_host_mod = b.createModule(.{
-        .root_source_file = b.path("qemu/host.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    host_qemu_host_mod.linkLibrary(host_bzip2.artifact("bz2"));
     // The FreeBSD package manifests are shared by the builder that realizes
     // them and the acceptance test that verifies a booted image against them,
     // so both import the same module rather than restating the contract.

@@ -183,8 +183,20 @@ pub const VmNetworkPolicy = enum {
 };
 
 pub const VmFirmware = struct {
-    code_path: []const u8,
-    vars_path: []const u8,
+    /// Absent asks the builder to resolve architecture-matched EDK2 firmware
+    /// the way `zvmi qemu` does, from the emulator's own `share/` directory
+    /// and then the system locations. Present names the files exactly, which
+    /// is what a build that must pin its firmware does. Both or neither: half
+    /// a pair would leave the other half resolved against a different
+    /// firmware build.
+    code_path: ?[]const u8 = null,
+    vars_path: ?[]const u8 = null,
+    /// What the image's own boot chain prints on the serial console once it
+    /// has taken control. Required: nothing on the host can know it, and a
+    /// guessed marker would attest a boot that never happened.
+    console_marker: []const u8,
+    secure_boot: bool = false,
+    boot_timeout_seconds: u32 = 1800,
 };
 
 pub const VmBoot = union(enum) {
@@ -257,6 +269,8 @@ pub const ValidationError = error{
     DuplicateSourceIndex,
     MissingVmConfiguration,
     UnexpectedVmConfiguration,
+    IncompleteFirmwareOverride,
+    MissingFirmwareConsoleMarker,
     MissingCrossArchitectureRunner,
     UnexpectedCrossArchitectureRunner,
     UnexpectedSourceProfile,
@@ -293,6 +307,17 @@ pub fn validate(configuration: Configuration, source_count: usize) ValidationErr
     // backend that would have to invent one.
     if (configuration.backend == .vm) {
         if (configuration.vm == null) return error.MissingVmConfiguration;
+        switch (configuration.vm.?.boot) {
+            .direct_kernel => {},
+            .firmware => |firmware| {
+                if ((firmware.code_path == null) != (firmware.vars_path == null)) {
+                    return error.IncompleteFirmwareOverride;
+                }
+                if (firmware.console_marker.len == 0) {
+                    return error.MissingFirmwareConsoleMarker;
+                }
+            },
+        }
     } else if (configuration.vm != null) {
         return error.UnexpectedVmConfiguration;
     }

@@ -207,3 +207,22 @@ the seed and temporary launch state when QEMU exits.
 This command is intentionally a focused launcher for cataloged Azure Linux and
 FreeBSD Gen2 images plus compatible explicit disks, not a general VM
 configuration manager.
+
+## Shared firmware resolution
+
+The same resolution this command uses (`qemu/host.zig`) is what the `vm`
+customization backend's firmware boot resolves through, rather than a second
+search that could disagree with it. `addPreservedImage` with
+`.boot = .{ .firmware = ... }` and no `code_path`/`vars_path` looks in the
+`share/` directory beside the plan's `emulator_command` first, then in the
+system locations, preferring a raw `.fd` over a `.fd.bz2` and decompressing
+the compressed pair when that is all there is. Because `cataggar/qemu` ships
+both `edk2-i386-code.fd.bz2` and `edk2-aarch64-code.fd.bz2`, one ghr install
+covers x86_64 and AArch64 guests alike.
+
+A customization run decompresses into `<bundle>/firmware/` rather than a
+temporary directory: the resolved paths are hashed into the plan, so a
+per-run path would change the plan hash for unchanged inputs. Unlike this
+command, a customization run never writes to the variable-store template — it
+works on a per-run copy that is deleted with the transaction. See
+`doc/library-api.md` for the rest of that contract.
