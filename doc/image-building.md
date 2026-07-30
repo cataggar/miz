@@ -46,7 +46,7 @@ zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 384M --ski
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G --verity -o output.vhd
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G --boot-mode uki --esp-size 512M -o output-uki.vhd
 zvmi capture --source /dev/sda -O vhd -o captured.vhd   # rebuild an installed system, sized to its content
-zvmi capture --source disk.qcow2 --source-root gpt:2 --dry-run
+zvmi capture --source disk.qcow2 --source-root gpt:2 -O raw -o captured.raw --dry-run
 zvmi qemu AzureLinux
 zvmi qemu AzureLinux --snapshot
 ```
@@ -684,9 +684,13 @@ zvmi capture --source /dev/sda -O vhd -o captured.vhd
 zvmi capture --source disk.qcow2 --source-root gpt:2 -O raw -o captured.raw
 zvmi capture --source /dev/sda --source-root lvm:vg0/root -O raw -o captured.raw
 zvmi capture --source /dev/sda --source-mount /dev/sda2=/boot -O raw -o captured.raw
-zvmi capture --source /dev/sda --dry-run
+zvmi capture --source /dev/sda -O raw -o captured.raw --dry-run
 zvmi capture --source /dev/sda -O raw.gz -o - | ssh host 'cat > captured.raw.gz'
 ```
+
+`-o` and a format are always required, `--dry-run` included: a dry run reports
+what *that* output would have cost, and the staging it plans for depends on
+where the output was going.
 
 This is not `rebuild`. `zvmi convert` and the preserved-image backends copy a
 disk and keep its geometry; capture discards the source geometry entirely and
@@ -696,9 +700,17 @@ fragmentation survives.
 
 ### What it selects, and how
 
-The root filesystem is `--source-root` if given, and otherwise the sole ext4
-filesystem the source contains. Ambiguity is refused rather than guessed. A
-spec is a path (`/dev/sda2`, `root.img`), a partition of `--source`
+The root filesystem is `--source-root` if given. Otherwise every partition of
+`--source` is probed and the one holding an ext4 filesystem is the root --
+provided exactly one does, which is the ordinary single-root install. That is
+read off the disk rather than guessed at. Two candidates is
+`AmbiguousSourceRoot` and none is `SourceRootRequired`; both name the flag
+that settles it, because "the biggest Linux partition" would be right often
+enough to be trusted and wrong often enough to matter. A root inside LVM is
+never auto-detected, since the partition holding it is a physical volume
+rather than a filesystem.
+
+A spec is a path (`/dev/sda2`, `root.img`), a partition of `--source`
 (`gpt:2`, one-based), or a logical volume (`lvm:<vg>/<lv>`).
 
 The EFI system partition is found by GPT type GUID, which is definitional
@@ -757,10 +769,15 @@ quiesced source: a stopped VM's disk, a snapshot, or a device that is not
 mounted read-write. Reading a block device generally requires root, and
 `EACCES` on `--source` says so rather than leaving the operator to infer it.
 
-Nothing is written to the source. The output is created exclusively and
-removed if the assembly fails, so a failed capture leaves neither a partial
-image nor a modified original. `-O` accepts the same formats as `convert`,
-including `raw.gz` and `-o -` for a stream.
+Nothing is written to the source, and a failed capture leaves no partial
+image: `-O raw` to a path is created exclusively and removed if the assembly
+fails, and every other format is assembled into a staging file beside the
+destination and converted only once it is complete.
+
+`-O` accepts the same formats as `convert`, including `raw.gz` and `-o -` for
+a stream. `-O vhd` is written *fixed*, as `build-image` writes it, because the
+reason to want a captured image as a VHD is almost always an Azure
+managed-disk upload and those refuse dynamic.
 
 ## Journalling the root filesystem
 

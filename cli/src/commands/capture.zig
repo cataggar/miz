@@ -153,7 +153,8 @@ pub fn describeCaptureFailure(err: anyerror) ?[]const u8 {
         error.AccessDenied, error.PermissionDenied => "reading a block device requires root, even though capture only reads it and writes nothing to it",
         error.RootSizeBelowMinimum => "--root-size is smaller than the captured content needs",
         error.EspSizeBelowMinimum => "--esp-size is smaller than the captured EFI system partition needs; note that FAT32 cannot go below about 33.5M whatever it holds",
-        error.SourceRootRequired => "--source is a partitioned disk, so name the root filesystem with --source-root (e.g. --source-root gpt:2). There is no guess at which partition is root: picking one would be right often enough to be trusted and wrong often enough to matter",
+        error.SourceRootRequired => "no partition of --source holds an ext4 filesystem, so name the root explicitly with --source-root (e.g. --source-root gpt:2, or --source-root lvm:<vg>/<lv> for a root inside LVM)",
+        error.AmbiguousSourceRoot => "--source holds more than one ext4 filesystem, so which one is the root has to be said with --source-root (e.g. --source-root gpt:2). The others can be merged in with --source-mount <spec>=<path>",
         error.SourceHasNoPartitionTable => "a gpt:<n> spec needs --source to be a disk with a GPT; name a device or image directly instead",
         error.PartitionNotFound => "--source has no partition with that number; the numbering matches lsblk and parted, from one",
         error.InvalidGptIndex => "a partition spec is gpt:<n>, numbered from one as lsblk and parted number them",
@@ -194,6 +195,11 @@ const OpenedSource = struct {
     image: *zvmi.Image,
     offset: u64,
     length: u64,
+    /// The entry this came from, when it was resolved through `--source`'s
+    /// partition table. Its GUID and name are the PARTUUID and PARTLABEL the
+    /// captured system may be referring to itself by, and they are retired
+    /// along with the filesystem UUID.
+    partition: ?zvmi.gpt.PartitionEntry = null,
 };
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
@@ -427,8 +433,11 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
         return fail("capture: out of memory", .{});
     const root_label = ownedLabel(gpa, &identifier_storage, &root_scan.identity.label) catch
         return fail("capture: out of memory", .{});
+    var root_before = zvmi.identity_rewrite.Identifiers{ .filesystem_uuid = root_uuid, .filesystem_label = root_label };
+    ownedPartition(gpa, &identifier_storage, root_source.partition, &root_before) catch
+        return fail("capture: out of memory", .{});
     sources.append(.{
-        .before = .{ .filesystem_uuid = root_uuid, .filesystem_label = root_label },
+        .before = root_before,
         .successor = .root,
     }) catch return fail("capture: out of memory", .{});
 
@@ -455,8 +464,11 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
             return fail("capture: out of memory", .{});
         const mount_label = ownedLabel(gpa, &identifier_storage, &scan.identity.label) catch
             return fail("capture: out of memory", .{});
+        var mount_before = zvmi.identity_rewrite.Identifiers{ .filesystem_uuid = uuid, .filesystem_label = mount_label };
+        ownedPartition(gpa, &identifier_storage, opened.partition, &mount_before) catch
+            return fail("capture: out of memory", .{});
         sources.append(.{
-            .before = .{ .filesystem_uuid = uuid, .filesystem_label = mount_label },
+            .before = mount_before,
             .successor = .root,
             .merged_at = mount.target,
         }) catch return fail("capture: out of memory", .{});
@@ -472,7 +484,9 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
     defer if (esp_spool) |value| std.Io.Dir.cwd().deleteFile(io, value) catch {};
 
     if (!request.no_esp) {
-        if (findEspSpec(table, request)) |esp_spec| {
+        const found = findEspSpec(table, request) catch |err|
+            return failWithHint("capture: --source-esp is not a valid spec", err);
+        if (found) |esp_spec| {
             const opened = resolveSpec(gpa, io, &disk, table, esp_spec, &scratch) catch |err|
                 return failWithHint("capture: cannot read the EFI system partition", err);
 
@@ -507,8 +521,11 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
                 return fail("capture: out of memory", .{});
             const esp_label = ownedLabel(gpa, &identifier_storage, &scan.label) catch
                 return fail("capture: out of memory", .{});
+            var esp_before = zvmi.identity_rewrite.Identifiers{ .filesystem_uuid = serial, .filesystem_label = esp_label };
+            ownedPartition(gpa, &identifier_storage, opened.partition, &esp_before) catch
+                return fail("capture: out of memory", .{});
             sources.append(.{
-                .before = .{ .filesystem_uuid = serial, .filesystem_label = esp_label },
+                .before = esp_before,
                 .successor = .esp,
             }) catch return fail("capture: out of memory", .{});
         }
@@ -519,6 +536,11 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
     // staging file this converts from and removes.
     const writes_raw_directly = request.spec.compression == .none and
         request.spec.format == .raw and request.destination == .path;
+    // `output.validate` has already refused a compressed or piped container
+    // format, so anything left that is not raw is a seekable file this has to
+    // build in the requested format rather than stream.
+    const converts_container = request.spec.compression == .none and
+        request.spec.format != .raw and request.destination == .path;
     const raw_path = if (writes_raw_directly)
         gpa.dupe(u8, request.destination.path) catch return fail("capture: out of memory", .{})
     else
@@ -569,6 +591,16 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
         return fail("capture: cannot re-open the staged image: {s}", .{@errorName(err)});
     defer staged.close(io);
 
+    if (converts_container) {
+        convertStaged(gpa, io, staged, request, report.virtual_size) catch |err| {
+            // A half-written container is worse than none: it opens, reports a
+            // plausible size, and fails somewhere the operator will not look.
+            std.Io.Dir.cwd().deleteFile(io, request.destination.path) catch {};
+            return fail("capture: writing {s} output failed: {s}", .{ request.spec.displayName(), @errorName(err) });
+        };
+        return 0;
+    }
+
     zvmi.output.writeImageTo(gpa, io, staged, request.destination, .{
         .compression = request.spec.compression,
         .level = request.level orelse zvmi.output.default_level,
@@ -576,6 +608,27 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
         return fail("capture: writing {s} output failed: {s}", .{ request.spec.displayName(), @errorName(err) });
 
     return 0;
+}
+
+/// Rewrites the staged raw disk into the requested container format.
+/// `output.writeImageTo` copies guest-visible bytes and knows nothing about a
+/// VHD footer, a VHDX block allocation table or a qcow2 L1 table, so a
+/// container has to be created as that format and copied into.
+fn convertStaged(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    staged: zvmi.Image,
+    request: CaptureRequest,
+    virtual_size: u64,
+) !void {
+    var options = zvmi.CreateOptions{};
+    // Fixed, as `build-image` does: a captured image's reason to be a VHD at
+    // all is almost always an Azure managed-disk upload, which refuses
+    // dynamic.
+    if (request.spec.format == .vhd) options.vhd_subformat = .fixed;
+    var destination = try zvmi.Image.create(io, request.destination.path, request.spec.format, virtual_size, options);
+    defer destination.close(io);
+    try zvmi.copyAll(io, staged, &destination, gpa);
 }
 
 fn scanOptions(
@@ -609,11 +662,32 @@ fn resolveRoot(
         const spec = try parseSourceSpec(text);
         return resolveSpec(gpa, io, disk, table, spec, scratch);
     }
-    // A partitioned disk with no --source-root is refused rather than
-    // guessed at: picking "the biggest Linux partition" would be right often
-    // enough to be trusted and wrong often enough to matter.
-    if (table != null) return error.SourceRootRequired;
-    return .{ .image = disk, .offset = 0, .length = disk.virtual_size };
+    // With no --source-root, the root is whichever partition holds an ext4
+    // filesystem -- provided exactly one does. That is a fact read off the
+    // disk rather than a guess, and it covers the ordinary single-root
+    // install. Ambiguity is refused, never resolved: "the biggest one" would
+    // be right often enough to be trusted and wrong often enough to matter.
+    const parsed = table orelse
+        return .{ .image = disk, .offset = 0, .length = disk.virtual_size };
+
+    var found: ?OpenedSource = null;
+    for (parsed.partitions) |entry| {
+        if (entry.isEmpty()) continue;
+        // An ESP is FAT and would never probe as ext4, but skipping it by
+        // type keeps the candidate set to partitions that could be a root.
+        if (std.mem.eql(u8, &entry.partition_type_guid, &zvmi.guid.esp)) continue;
+        const offset = entry.first_lba * zvmi.gpt.sector_size;
+        var probe = zvmi.ext4.openGeneral(io, disk.file, gpa, .{ .offset = offset }) catch continue;
+        probe.deinit();
+        if (found != null) return error.AmbiguousSourceRoot;
+        found = .{
+            .image = disk,
+            .offset = offset,
+            .length = (entry.last_lba - entry.first_lba + 1) * zvmi.gpt.sector_size,
+            .partition = entry,
+        };
+    }
+    return found orelse error.SourceRootRequired;
 }
 
 fn resolveSpec(
@@ -640,6 +714,7 @@ fn resolveSpec(
                 .image = disk,
                 .offset = entry.first_lba * zvmi.gpt.sector_size,
                 .length = (entry.last_lba - entry.first_lba + 1) * zvmi.gpt.sector_size,
+                .partition = entry,
             };
         },
         .logical_volume => |selector| {
@@ -662,8 +737,11 @@ fn findPartition(parsed: zvmi.gpt.ParsedGpt, index: u32) ?zvmi.gpt.PartitionEntr
 /// The ESP is named explicitly, or found by its type GUID. The type GUID is
 /// definitional rather than a heuristic: a partition carrying it *is* an EFI
 /// system partition, which is exactly how firmware finds one.
-fn findEspSpec(table: ?zvmi.gpt.ParsedGpt, request: CaptureRequest) ?SourceSpec {
-    if (request.esp_spec_text) |text| return parseSourceSpec(text) catch null;
+fn findEspSpec(table: ?zvmi.gpt.ParsedGpt, request: CaptureRequest) !?SourceSpec {
+    // A malformed --source-esp is a failure, not an absent ESP. Swallowing it
+    // would assemble a root-only disk and exit 0, which is a typo turning
+    // into an unbootable image with nothing said.
+    if (request.esp_spec_text) |text| return try parseSourceSpec(text);
     const parsed = table orelse return null;
     for (parsed.partitions) |entry| {
         if (std.mem.eql(u8, &entry.partition_type_guid, &zvmi.guid.esp)) {
@@ -695,6 +773,38 @@ fn ownedLabel(
     errdefer gpa.free(copy);
     try storage.append(copy);
     return copy;
+}
+
+/// The source partition's GUID and name, as `PARTUUID=` and `PARTLABEL=`
+/// spell them. Null when the filesystem was named directly rather than
+/// through `--source`'s partition table, because then there is no partition
+/// this capture is replacing and nothing to retire.
+fn ownedPartition(
+    gpa: std.mem.Allocator,
+    storage: *std.array_list.Managed([]u8),
+    entry: ?zvmi.gpt.PartitionEntry,
+    before: *zvmi.identity_rewrite.Identifiers,
+) !void {
+    const value = entry orelse return;
+
+    const buffer = try gpa.alloc(u8, 36);
+    errdefer gpa.free(buffer);
+    const text = zvmi.guid.formatLower(buffer[0..36], value.unique_partition_guid);
+    try storage.append(buffer);
+    before.partition_uuid = text;
+
+    var name: [36]u8 = undefined;
+    var length: usize = 0;
+    for (value.name_utf16le) |code_unit| {
+        if (code_unit == 0) break;
+        // A PARTLABEL outside ASCII is left alone rather than transcoded:
+        // the rewriter matches bytes, and a lossy round trip would match the
+        // wrong ones.
+        if (code_unit > 0x7f) return;
+        name[length] = @intCast(code_unit);
+        length += 1;
+    }
+    before.partition_label = try ownedLabel(gpa, storage, name[0..length]);
 }
 
 fn ownedFatSerial(
@@ -902,6 +1012,14 @@ test "the failures an operator is most likely to hit explain themselves" {
         "root",
     ) != null);
     try std.testing.expect(describeCaptureFailure(error.RootSizeBelowMinimum) != null);
+
+    // Both outcomes of root auto-detection have to name the flag that
+    // settles them, because neither is actionable as a bare error name.
+    inline for (.{ error.SourceRootRequired, error.AmbiguousSourceRoot }) |err| {
+        const message = describeCaptureFailure(err) orelse
+            return error.TestExpectedExplanation;
+        try std.testing.expect(std.mem.indexOf(u8, message, "--source-root") != null);
+    }
 
     // Every LVM refusal points at the same way out, because there is only
     // one: let device-mapper assemble the volume and capture that.
