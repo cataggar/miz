@@ -189,7 +189,7 @@ zvmi/
 
 ### The vm backend's tests
 
-Three steps, cheapest first:
+Four steps, cheapest first:
 
 - `zig build test-vm-backend` runs `tests/vm_backend_integration.zig`, which
   stands in for the emulator by re-entering the test binary under
@@ -220,6 +220,31 @@ Three steps, cheapest first:
   binary the guest executes are all the guest's, and only the emulator is the
   host's. Pass the matching `ZVMI_VM_QEMU` and a kernel for that architecture.
   One `cataggar/qemu` ghr install supplies every `qemu-system-*`.
+
+- `zig build test-vm-firmware-boot` runs `tests/vm_firmware_boot.zig`, which
+  attests a *bootable* image through real EDK2 firmware. Firmware boot is the
+  one part of the backend a synthesized fixture cannot cover: `vm_real_boot`'s
+  image has no bootloader and no ESP, so no firmware could ever boot it. It is
+  opt-in for that reason:
+
+  ```
+  ghr install cataggar/qemu@v11.0.91-z.15
+
+  ZVMI_RUN_VM_FIRMWARE_TEST=1 \
+  ZVMI_VM_FIRMWARE_IMAGE=/path/to/bootable.raw \
+  ZVMI_VM_FIRMWARE_MARKER='Welcome to Azure Linux' \
+  ZVMI_VM_QEMU=$(readlink -f "$(command -v qemu-system-$(uname -m))") \
+    zig build test-vm-firmware-boot
+  ```
+
+  With `ZVMI_VM_FIRMWARE_CODE`/`ZVMI_VM_FIRMWARE_VARS` unset, the firmware is
+  resolved through the same `qemu_host` search `zvmi qemu` uses, so the
+  resolution path a real build takes is exercised too. Set
+  `ZVMI_VM_FIRMWARE_ARCH` to the other architecture for the cross-architecture
+  case, `ZVMI_VM_FIRMWARE_SECURE_BOOT=1` for the Secure Boot wiring, and
+  `ZVMI_VM_FIRMWARE_TIMEOUT` to change the 1800-second budget. The image is
+  attested in place and the test fails if a single byte of it changed, which is
+  the read-only claim checked against a real emulator rather than a stand-in.
 
 Both real boots take roughly 15 seconds under pure TCG, fixture construction
 included, which is why they run in `ci.yml` rather than `boot-smoke.yml`.
