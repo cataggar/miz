@@ -52,6 +52,23 @@ pub const Error = error{
     /// of sealing an answer, which is a different outcome from any answer.
     VmGuestSilent,
     VmGuestFailed,
+    /// The plan asked for a firmware boot and the named EDK2 files are not
+    /// readable here. Never downgraded to a direct-kernel boot: that would
+    /// bypass the boot chain the plan asked to exercise.
+    VmFirmwareUnavailable,
+    /// The image's boot chain never printed the marker within its own budget.
+    /// The recorded console is where the boot actually stopped.
+    VmFirmwareBootTimedOut,
+    /// The emulator exited before the marker appeared. Either the firmware
+    /// found nothing to boot, or the boot chain died on the way up.
+    VmFirmwareBootFailed,
+    /// The console produced more than the attestation is willing to hold.
+    /// A guest that says this much is not booting, it is looping.
+    VmFirmwareConsoleOverflowed,
+    /// The attested stage differs from the customized stage. Attestation is
+    /// contracted to be read-only, so this means the emulator wrote through
+    /// the overlay and the published bytes would depend on the boot mode.
+    VmFirmwareStageMutated,
 };
 
 /// Reports whether this host can run the plan's VM backend.
@@ -68,11 +85,15 @@ pub fn available(io: Io, plan: *const customize.ResolvedPlan) customize.Capabili
 
     switch (policy.boot) {
         .direct_kernel => {},
-        // Firmware boot is part of the policy surface so the configuration is
-        // stable, but no backend brings a guest up through firmware yet.
-        // Falling back to a direct-kernel boot would silently bypass the boot
-        // chain the caller asked to exercise.
-        .firmware => return .unsupported,
+        // A firmware boot needs the EDK2 pair the plan names. Absence is
+        // `.missing` — the operator can install it — and never a silent
+        // downgrade to the direct-kernel boot, which would bypass the boot
+        // chain the plan exists to exercise.
+        .firmware => |firmware| switch (customize.vmFirmwareAvailable(io, firmware)) {
+            .available => {},
+            .missing => return .missing,
+            .unsupported => return .unsupported,
+        },
     }
 
     switch (policy.acceleration) {
@@ -310,6 +331,29 @@ pub fn run(
     }
 
     const version = probeEmulatorVersion(work, io, policy.emulator_command);
+
+    // The boot chain is attested after customization and before publication,
+    // because what gets published is the customized stage and that is what has
+    // to be proven bootable. A run that reaches here has already produced its
+    // result; a failed attestation withholds it rather than rewriting it.
+    var boot_record: customize.VmBootRecord = .direct_kernel;
+    switch (policy.boot) {
+        .direct_kernel => {},
+        .firmware => |firmware| {
+            const record = try attestFirmwareBoot(work, io, .{
+                .policy = policy,
+                .firmware = firmware,
+                .architecture = data.architectures.runner,
+                .transaction_path = options.transaction_path,
+                .stage_path = options.target.raw_path,
+                .console = options.console,
+            });
+            // Published whole: a half-filled record behind a set tag would
+            // read as a firmware boot nobody performed.
+            boot_record = .{ .firmware = record };
+        },
+    }
+
     return ownReport(allocator, .{
         .result = parsed.value,
         .policy = policy,
@@ -319,6 +363,7 @@ pub fn run(
         .payload = &payload,
         .emulator_version = version,
         .modules = drivers.modules,
+        .boot = boot_record,
     });
 }
 
@@ -545,6 +590,361 @@ fn appendDisks(
     }
 }
 
+// ---- Firmware boot attestation ----------------------------------------
+
+/// Ceiling on an EDK2 file. AAVMF's code and variable images are 64 MiB, which
+/// is the largest firmware either supported architecture ships.
+pub const max_firmware_bytes: usize = 128 * 1024 * 1024;
+
+/// How much of the attestation console is held while waiting for the marker.
+/// A boot chain that says more than this is not booting, and holding its
+/// output would cost the host more than the diagnosis is worth.
+pub const max_firmware_console_bytes: usize = 32 * 1024 * 1024;
+
+/// Read granularity for digesting the stage. Large enough that a multi-gigabyte
+/// image is not read a page at a time, small enough to stay off the stack.
+const stage_digest_chunk_bytes: usize = 256 * 1024;
+
+/// What `attestFirmwareBoot` needs. Public because the opt-in real-firmware
+/// test drives the attestation directly: a full customization run cannot be
+/// synthesized around an image a maintainer supplies.
+pub const AttestationInput = struct {
+    policy: customize.VmPolicy,
+    firmware: customize.VmFirmware,
+    architecture: customize.Architecture,
+    transaction_path: []const u8,
+    stage_path: []const u8,
+    console: ?ConsoleSink,
+};
+
+/// Boots the customized stage through its own firmware and bootloader and
+/// waits for the image to say, on its own console, that it took control.
+///
+/// Nothing is delivered into this guest. The agent that performed the
+/// customization is not present, no device is added for it to find, and the
+/// image is not modified to make room for one — a boot chain altered to admit
+/// an agent is not the boot chain the published image will run. The guest is
+/// therefore observed rather than driven, through the one channel every boot
+/// chain already has: the serial console.
+///
+/// The stage is attached with `snapshot=on`, so every write the guest makes
+/// lands in a host-side overlay that is discarded with the process. The
+/// digests taken either side of the boot turn that from an assumption into a
+/// checked fact.
+pub fn attestFirmwareBoot(
+    gpa: Allocator,
+    io: Io,
+    input: AttestationInput,
+) !customize.VmFirmwareRecord {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const cwd = Io.Dir.cwd();
+
+    const code_bytes = cwd.readFileAlloc(
+        io,
+        input.firmware.code_path,
+        work,
+        .limited(max_firmware_bytes),
+    ) catch return error.VmFirmwareUnavailable;
+    const vars_bytes = cwd.readFileAlloc(
+        io,
+        input.firmware.vars_path,
+        work,
+        .limited(max_firmware_bytes),
+    ) catch return error.VmFirmwareUnavailable;
+
+    // The variable store is ephemeral: the guest writes to a copy that lives
+    // and dies with the transaction, so the template the plan names is never
+    // touched and a second run of the same plan starts from the same state.
+    const vars_copy_path = try std.fs.path.join(
+        work,
+        &.{ input.transaction_path, "vm-firmware-vars.fd" },
+    );
+    try writeFileBytes(io, vars_copy_path, vars_bytes);
+    defer cwd.deleteFile(io, vars_copy_path) catch {};
+
+    const stage_before = try streamDigest(io, input.stage_path);
+
+    const argv = try buildFirmwareArgv(work, .{
+        .policy = input.policy,
+        .firmware = input.firmware,
+        .architecture = input.architecture,
+        .code_path = input.firmware.code_path,
+        .vars_path = vars_copy_path,
+        .stage_path = input.stage_path,
+    });
+
+    const outcome = try watchForConsoleMarker(work, io, .{
+        .argv = argv,
+        .marker = input.firmware.console_marker,
+        .timeout_seconds = input.firmware.boot_timeout_seconds,
+    });
+    if (!outcome.found) {
+        if (input.console) |sink| {
+            sink.write(switch (outcome.stop) {
+                .timed_out => "firmware boot did not reach the console marker within its budget\n",
+                .exited => "firmware boot ended before the console marker appeared\n",
+                .overflowed => "firmware boot produced more console output than the attestation holds\n",
+            });
+            sink.write(outcome.console);
+        }
+        return switch (outcome.stop) {
+            .timed_out => error.VmFirmwareBootTimedOut,
+            .exited => error.VmFirmwareBootFailed,
+            .overflowed => error.VmFirmwareConsoleOverflowed,
+        };
+    }
+
+    const stage_after = try streamDigest(io, input.stage_path);
+    if (!std.mem.eql(u8, &stage_before, &stage_after)) return error.VmFirmwareStageMutated;
+
+    return .{
+        .code_path = input.firmware.code_path,
+        .code_sha256 = .{ .bytes = digestOf(code_bytes) },
+        .vars_template_path = input.firmware.vars_path,
+        .vars_template_sha256 = .{ .bytes = digestOf(vars_bytes) },
+        .variable_store = .ephemeral,
+        .secure_boot = input.firmware.secure_boot,
+        .machine = firmwareMachineName(input.policy, input.firmware, input.architecture),
+        .console_marker = input.firmware.console_marker,
+        .boot_timeout_seconds = input.firmware.boot_timeout_seconds,
+        .attested_stage_sha256 = .{ .bytes = stage_after },
+    };
+}
+
+const FirmwareArgvInput = struct {
+    policy: customize.VmPolicy,
+    firmware: customize.VmFirmware,
+    architecture: customize.Architecture,
+    code_path: []const u8,
+    vars_path: []const u8,
+    stage_path: []const u8,
+};
+
+/// The attestation guest, which shares only the emulator with the appliance
+/// guest that customized the image.
+///
+/// There is no `-kernel`, no `-initrd` and no `-append`: handing the firmware
+/// anything to boot other than the disk would defeat the whole exercise. The
+/// stage is attached as virtio-blk regardless of what the image's own kernel
+/// needed for the appliance boot, because here it is the firmware that must
+/// read the disk first, and both OVMF and AAVMF carry a virtio-blk driver.
+fn buildFirmwareArgv(allocator: Allocator, input: FirmwareArgvInput) ![]const []const u8 {
+    const policy = input.policy;
+    var argv: std.array_list.Managed([]const u8) = .init(allocator);
+    errdefer argv.deinit();
+
+    try argv.appendSlice(&.{
+        policy.emulator_command,
+        "-no-user-config",
+        "-nodefaults",
+        // A firmware that finds nothing bootable resets. Letting it exit turns
+        // an unbootable image into a prompt failure rather than a full budget
+        // spent watching the same banner scroll past.
+        "-no-reboot",
+        "-display",
+        "none",
+        "-monitor",
+        "none",
+        "-serial",
+        "stdio",
+        "-rtc",
+        "base=utc",
+    });
+
+    var machine: std.array_list.Managed(u8) = .init(allocator);
+    errdefer machine.deinit();
+    try machine.appendSlice(firmwareMachineName(policy, input.firmware, input.architecture));
+    try machine.appendSlice(",accel=");
+    try machine.appendSlice(accelerationName(policy.acceleration));
+    try argv.appendSlice(&.{ "-machine", try machine.toOwnedSlice() });
+    try argv.appendSlice(&.{ "-cpu", cpuName(policy, input.architecture) });
+    try argv.appendSlice(&.{ "-smp", try std.fmt.allocPrint(allocator, "{d}", .{policy.vcpus}) });
+    try argv.appendSlice(&.{ "-m", try std.fmt.allocPrint(allocator, "{d}", .{policy.memory_mib}) });
+
+    // Unit 0 is the code, unit 1 the variable store, in that order: EDK2 reads
+    // its own layout positionally and a swapped pair simply does not boot.
+    try argv.appendSlice(&.{ "-drive", try std.fmt.allocPrint(
+        allocator,
+        "if=pflash,format=raw,unit=0,readonly=on,file={s}",
+        .{input.code_path},
+    ) });
+    try argv.appendSlice(&.{ "-drive", try std.fmt.allocPrint(
+        allocator,
+        "if=pflash,format=raw,unit=1,file={s}",
+        .{input.vars_path},
+    ) });
+    if (input.firmware.secure_boot and input.architecture == .x86_64) {
+        // Without this the variable store is writable from outside SMM and the
+        // firmware's own authentication of it means nothing.
+        try argv.appendSlice(&.{
+            "-global", "driver=cfi.pflash01,property=secure,value=on",
+            "-global", "ICH9-LPC.disable_s3=1",
+        });
+    }
+
+    // `snapshot=on` is what makes the attestation read-only. The guest boots
+    // and writes as it pleases; none of it reaches the file that is published.
+    try argv.appendSlice(&.{ "-drive", try std.fmt.allocPrint(
+        allocator,
+        "file={s},format=raw,if=virtio,snapshot=on",
+        .{input.stage_path},
+    ) });
+
+    // Always offline, whatever the customization's network policy was. The
+    // question is whether the image boots, and an answer that depends on what
+    // a network offered the guest is not an answer about the image.
+    try argv.appendSlice(&.{ "-nic", "none" });
+    return argv.toOwnedSlice();
+}
+
+/// Secure Boot needs SMM, which the appliance boot has no use for, so the
+/// machine string differs between the two guests of the same run.
+fn firmwareMachineName(
+    policy: customize.VmPolicy,
+    firmware: customize.VmFirmware,
+    architecture: customize.Architecture,
+) []const u8 {
+    const base = machineName(policy, architecture);
+    if (!firmware.secure_boot or architecture != .x86_64) return base;
+    // An explicit machine is the caller's to get right; only the default is
+    // adjusted, and silently rewriting a named one would hide the difference.
+    return if (std.mem.eql(u8, base, "q35")) "q35,smm=on" else base;
+}
+
+const MarkerStop = enum { exited, timed_out, overflowed };
+
+const MarkerOutcome = struct {
+    found: bool,
+    stop: MarkerStop,
+    console: []const u8,
+};
+
+const MarkerInput = struct {
+    argv: []const []const u8,
+    marker: []const u8,
+    timeout_seconds: u32,
+};
+
+/// Runs the emulator and returns as soon as the marker appears on its console,
+/// or when the boot chain runs out of budget or dies.
+///
+/// The marker is scanned for incrementally rather than after the fact, because
+/// a successful attestation must not wait for a guest that has already proven
+/// itself: an image that boots to a login prompt would otherwise sit there for
+/// the whole budget.
+fn watchForConsoleMarker(
+    allocator: Allocator,
+    io: Io,
+    input: MarkerInput,
+) !MarkerOutcome {
+    var child = try std.process.spawn(io, .{
+        .argv = input.argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    // `kill` both terminates and reaps, and is a no-op once the child is gone,
+    // so it is the only teardown every path needs. `wait` is deliberately not
+    // raced against the console: a cancelled wait detaches the child handle and
+    // would leave an emulator running with nothing left to kill it.
+    defer child.kill(io);
+
+    var buffer: Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: Io.File.MultiReader = undefined;
+    multi_reader.init(
+        allocator,
+        io,
+        buffer.toStreams(),
+        &.{ child.stdout.?, child.stderr.? },
+    );
+    defer multi_reader.deinit();
+    const console = multi_reader.reader(0);
+    const errors = multi_reader.reader(1);
+
+    // One deadline for the whole boot rather than one per read: the budget is
+    // the boot chain's, not any single moment of silence within it.
+    const deadline = (Io.Timeout{ .duration = .{
+        .raw = .fromSeconds(input.timeout_seconds),
+        .clock = .awake,
+    } }).toDeadline(io);
+
+    var scanned: usize = 0;
+    var stop: MarkerStop = .exited;
+    while (multi_reader.fill(4096, deadline)) |_| {
+        const buffered = console.buffered();
+        if (buffered.len > max_firmware_console_bytes or
+            errors.buffered().len > max_firmware_console_bytes)
+        {
+            stop = .overflowed;
+            break;
+        }
+        // Rescanning only the tail keeps a long boot from costing quadratic
+        // time, while the overlap keeps a marker split across two reads
+        // visible.
+        if (std.mem.indexOf(u8, buffered[scanned..], input.marker)) |_| {
+            return .{
+                .found = true,
+                .stop = .exited,
+                .console = try ownedConsole(allocator, console, errors),
+            };
+        }
+        scanned = buffered.len -| (input.marker.len -| 1);
+    } else |err| switch (err) {
+        error.EndOfStream => stop = .exited,
+        error.Timeout => stop = .timed_out,
+        else => |remaining| return remaining,
+    }
+
+    // The final buffer is checked once more: the marker may have arrived in
+    // the same read that ended the stream.
+    const found = stop != .overflowed and
+        std.mem.indexOf(u8, console.buffered(), input.marker) != null;
+    return .{
+        .found = found,
+        .stop = stop,
+        .console = try ownedConsole(allocator, console, errors),
+    };
+}
+
+/// The console as it will be reported, copied out of the reader's buffer
+/// because that buffer dies with the reader. The emulator's own stderr is
+/// appended: an image that never boots usually failed for a reason QEMU
+/// stated there rather than for one the guest printed.
+fn ownedConsole(
+    allocator: Allocator,
+    console: *Io.Reader,
+    errors: *Io.Reader,
+) ![]const u8 {
+    const out = console.buffered();
+    const err = errors.buffered();
+    const combined = try allocator.alloc(u8, out.len + err.len);
+    @memcpy(combined[0..out.len], out);
+    @memcpy(combined[out.len..], err);
+    return combined;
+}
+
+/// Digests a file without holding it in memory. The stage is the whole disk
+/// image, which is routinely larger than the host's RAM.
+fn streamDigest(io: Io, path: []const u8) ![32]u8 {
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var chunk: [stage_digest_chunk_bytes]u8 = undefined;
+    var offset: u64 = 0;
+    while (true) {
+        const filled = try file.readPositionalAll(io, &chunk, offset);
+        if (filled == 0) break;
+        hasher.update(chunk[0..filled]);
+        offset += filled;
+        if (filled < chunk.len) break;
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
 fn machineName(policy: customize.VmPolicy, architecture: customize.Architecture) []const u8 {
     if (policy.machine) |machine| return machine;
     return switch (architecture) {
@@ -692,6 +1092,7 @@ const ReportInput = struct {
     payload: *const vm_payload.Payload,
     emulator_version: []const u8,
     modules: []const vm_payload.Module,
+    boot: customize.VmBootRecord = .direct_kernel,
 };
 
 fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeReport {
@@ -714,6 +1115,27 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
     for (input.result.installed_packages, packages) |name, *slot| {
         slot.* = try owned.dupe(u8, name);
     }
+
+    // Built whole and only then published into the union, so a set tag can
+    // never be read alongside a payload that is still being filled in.
+    const boot_record: customize.VmBootRecord = switch (input.boot) {
+        .direct_kernel => .direct_kernel,
+        .firmware => |firmware| blk: {
+            const record: customize.VmFirmwareRecord = .{
+                .code_path = try owned.dupe(u8, firmware.code_path),
+                .code_sha256 = firmware.code_sha256,
+                .vars_template_path = try owned.dupe(u8, firmware.vars_template_path),
+                .vars_template_sha256 = firmware.vars_template_sha256,
+                .variable_store = firmware.variable_store,
+                .secure_boot = firmware.secure_boot,
+                .machine = try owned.dupe(u8, firmware.machine),
+                .console_marker = try owned.dupe(u8, firmware.console_marker),
+                .boot_timeout_seconds = firmware.boot_timeout_seconds,
+                .attested_stage_sha256 = firmware.attested_stage_sha256,
+            };
+            break :blk .{ .firmware = record };
+        },
+    };
 
     const modules = try owned.alloc(customize.VmModuleRecord, input.modules.len);
     for (input.modules, modules) |module, *record| {
@@ -743,6 +1165,7 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
             .kernel_sha256 = .{ .bytes = digestOf(input.payload.kernel) },
             .initrd_sha256 = .{ .bytes = digestOf(input.payload.initrd) },
             .control_sha256 = .{ .bytes = digestOf(input.control_json) },
+            .boot = boot_record,
             .boot_origin = switch (input.payload.origin) {
                 .boot_directory => |boot| .{ .boot_directory = .{
                     .kernel_path = try owned.dupe(u8, boot.kernel_path),
@@ -1106,4 +1529,235 @@ test "a kernel release is only requested when the plan names one" {
         "6.12.0-1.azl",
         requestedKernelRelease(.{ .regenerate = .{ .kernels = &.{"6.12.0-1.azl"} } }).?,
     );
+}
+
+// ---- Firmware boot tests ----------------------------------------------
+
+const test_firmware = customize.VmFirmware{
+    .code_path = "/opt/qemu/share/edk2-x86_64-code.fd",
+    .vars_path = "/opt/qemu/share/edk2-i386-vars.fd",
+    .console_marker = "Welcome to Azure Linux",
+};
+
+fn testFirmwarePolicy(command: []const u8) customize.VmPolicy {
+    return .{
+        .emulator_command = command,
+        .boot = .{ .firmware = test_firmware },
+        .acceleration = .software,
+        .acknowledge_software_emulation = true,
+        .memory_mib = 3072,
+        .vcpus = 4,
+        .network = .declared_repositories,
+    };
+}
+
+fn drivesMatching(argv: []const []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    for (argv, 0..) |argument, index| {
+        if (index == 0 or !std.mem.eql(u8, argv[index - 1], "-drive")) continue;
+        if (std.mem.indexOf(u8, argument, needle) != null) count += 1;
+    }
+    return count;
+}
+
+test "a firmware guest boots the disk through pflash and never a kernel" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = try buildFirmwareArgv(allocator, .{
+        .policy = testFirmwarePolicy("/opt/qemu/bin/qemu-system-x86_64"),
+        .firmware = test_firmware,
+        .architecture = .x86_64,
+        .code_path = test_firmware.code_path,
+        .vars_path = "work/vm-firmware-vars.fd",
+        .stage_path = "work/stage.raw",
+    });
+
+    // Handing the firmware a kernel would boot the thing the attestation
+    // exists to avoid booting.
+    try std.testing.expect(indexOfArgument(argv, "-kernel") == null);
+    try std.testing.expect(indexOfArgument(argv, "-initrd") == null);
+    try std.testing.expect(indexOfArgument(argv, "-append") == null);
+
+    try std.testing.expectEqualStrings("q35,accel=tcg", valueOfArgument(argv, "-machine").?);
+    try std.testing.expectEqual(@as(usize, 1), drivesMatching(
+        argv,
+        "if=pflash,format=raw,unit=0,readonly=on,file=/opt/qemu/share/edk2-x86_64-code.fd",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), drivesMatching(
+        argv,
+        "if=pflash,format=raw,unit=1,file=work/vm-firmware-vars.fd",
+    ));
+    // The overlay is what keeps the attestation read-only.
+    try std.testing.expectEqual(@as(usize, 1), drivesMatching(
+        argv,
+        "file=work/stage.raw,format=raw,if=virtio,snapshot=on",
+    ));
+    // The customization asked for a network; proving the image boots must not.
+    try std.testing.expectEqualStrings("none", valueOfArgument(argv, "-nic").?);
+    try std.testing.expect(indexOfArgument(argv, "-netdev") == null);
+}
+
+test "an aarch64 firmware guest uses the same pflash pair on the virt machine" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var firmware = test_firmware;
+    firmware.code_path = "/opt/qemu/share/edk2-aarch64-code.fd";
+    firmware.vars_path = "/opt/qemu/share/edk2-arm-vars.fd";
+    var policy = testFirmwarePolicy("/opt/qemu/bin/qemu-system-aarch64");
+    policy.boot = .{ .firmware = firmware };
+
+    const argv = try buildFirmwareArgv(allocator, .{
+        .policy = policy,
+        .firmware = firmware,
+        .architecture = .aarch64,
+        .code_path = firmware.code_path,
+        .vars_path = "work/vm-firmware-vars.fd",
+        .stage_path = "work/stage.raw",
+    });
+
+    try std.testing.expectEqualStrings("virt,accel=tcg", valueOfArgument(argv, "-machine").?);
+    try std.testing.expectEqualStrings("max", valueOfArgument(argv, "-cpu").?);
+    try std.testing.expectEqual(@as(usize, 1), drivesMatching(
+        argv,
+        "if=pflash,format=raw,unit=0,readonly=on,file=/opt/qemu/share/edk2-aarch64-code.fd",
+    ));
+    try std.testing.expect(indexOfArgument(argv, "-kernel") == null);
+}
+
+test "Secure Boot wires SMM on x86_64 and changes nothing on aarch64" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var firmware = test_firmware;
+    firmware.secure_boot = true;
+    var policy = testFirmwarePolicy("/opt/qemu/bin/qemu-system-x86_64");
+    policy.boot = .{ .firmware = firmware };
+
+    const x86 = try buildFirmwareArgv(allocator, .{
+        .policy = policy,
+        .firmware = firmware,
+        .architecture = .x86_64,
+        .code_path = firmware.code_path,
+        .vars_path = "work/vars.fd",
+        .stage_path = "work/stage.raw",
+    });
+    try std.testing.expectEqualStrings("q35,smm=on,accel=tcg", valueOfArgument(x86, "-machine").?);
+    try std.testing.expectEqualStrings(
+        "driver=cfi.pflash01,property=secure,value=on",
+        valueOfArgument(x86, "-global").?,
+    );
+
+    const arm = try buildFirmwareArgv(allocator, .{
+        .policy = policy,
+        .firmware = firmware,
+        .architecture = .aarch64,
+        .code_path = firmware.code_path,
+        .vars_path = "work/vars.fd",
+        .stage_path = "work/stage.raw",
+    });
+    // SMM is an x86 concept; AAVMF authenticates its store without it.
+    try std.testing.expectEqualStrings("virt,accel=tcg", valueOfArgument(arm, "-machine").?);
+    try std.testing.expect(indexOfArgument(arm, "-global") == null);
+}
+
+test "an explicitly named machine is not rewritten for Secure Boot" {
+    var firmware = test_firmware;
+    firmware.secure_boot = true;
+    var policy = testFirmwarePolicy("/opt/qemu/bin/qemu-system-x86_64");
+    policy.boot = .{ .firmware = firmware };
+    policy.machine = "pc-q35-8.2";
+
+    try std.testing.expectEqualStrings(
+        "pc-q35-8.2",
+        firmwareMachineName(policy, firmware, .x86_64),
+    );
+}
+
+test "the firmware guest is refused when the named EDK2 files are absent" {
+    const io = std.testing.io;
+    const absent = customize.VmFirmware{
+        .code_path = "/nonexistent/edk2-x86_64-code.fd",
+        .vars_path = "/nonexistent/edk2-i386-vars.fd",
+        .console_marker = "boot",
+    };
+    try std.testing.expectEqual(
+        customize.CapabilityState.missing,
+        customize.vmFirmwareAvailable(io, absent),
+    );
+}
+
+test "the console marker is found across a read boundary and ends the boot" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // `sh` stands in for an emulator: it prints in pieces, then keeps the
+    // process alive the way a booted guest sitting at a login prompt would.
+    // A marker that is only recognised after the child exits would hang here.
+    const outcome = try watchForConsoleMarker(allocator, std.testing.io, .{
+        .argv = &.{
+            "/bin/sh",
+            "-c",
+            "printf 'Welcome to '; sleep 1; printf 'Azure Linux 3.0\\n'; sleep 300",
+        },
+        .marker = "Welcome to Azure Linux",
+        .timeout_seconds = 60,
+    });
+    try std.testing.expect(outcome.found);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.console, "Azure Linux 3.0") != null);
+}
+
+test "a boot chain that dies before the marker is reported as a failure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const outcome = try watchForConsoleMarker(allocator, std.testing.io, .{
+        .argv = &.{
+            "/bin/sh",
+            "-c",
+            "printf 'BdsDxe: failed to load Boot0001\\n' >&2; exit 1",
+        },
+        .marker = "Welcome to Azure Linux",
+        .timeout_seconds = 60,
+    });
+    try std.testing.expect(!outcome.found);
+    try std.testing.expectEqual(MarkerStop.exited, outcome.stop);
+    // The reason a firmware gives is on stderr, and attribution depends on it
+    // surviving into the recorded console.
+    try std.testing.expect(std.mem.indexOf(u8, outcome.console, "failed to load Boot0001") != null);
+}
+
+test "a boot that never says anything exhausts its own budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const outcome = try watchForConsoleMarker(allocator, std.testing.io, .{
+        .argv = &.{ "/bin/sh", "-c", "printf 'UEFI firmware\\n'; sleep 300" },
+        .marker = "Welcome to Azure Linux",
+        .timeout_seconds = 1,
+    });
+    try std.testing.expect(!outcome.found);
+    try std.testing.expectEqual(MarkerStop.timed_out, outcome.stop);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.console, "UEFI firmware") != null);
+}
+
+test "digesting a stage is independent of how many reads it takes" {
+    const io = std.testing.io;
+    const cwd = Io.Dir.cwd();
+    const path = "test-vm-backend-stage-digest.raw";
+    defer cwd.deleteFile(io, path) catch {};
+
+    const bytes = try std.testing.allocator.alloc(u8, stage_digest_chunk_bytes + 4096);
+    defer std.testing.allocator.free(bytes);
+    for (bytes, 0..) |*byte, index| byte.* = @truncate(index);
+    try writeFileBytes(io, path, bytes);
+
+    try std.testing.expectEqual(digestOf(bytes), try streamDigest(io, path));
 }
