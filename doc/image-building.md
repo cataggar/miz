@@ -309,10 +309,16 @@ configuration JSON, and on `preserved_image.RebuildOptions`.
 | `strict` (default) | only `zvmi_ext4_v1`, the exact layout this project's writer emits | yes, byte for byte |
 | `general` | any ext4 the general reader accepts, including a stock distro root | no |
 
-`strict` requires 128-byte inodes, 32-byte group descriptors and exactly the
+`strict` requires 32-byte group descriptors and exactly the
 `filetype`+`extents` incompatible feature set: no journal, no `64bit`, no
 `flex_bg`. That is deliberate rather than incidental. It is the promise that
 rebuilding the same source twice, on any host, produces the same bytes.
+It also requires the 256-byte inodes this writer emits. An image built by an
+older zvmi has 128-byte ones, so it no longer matches `strict` and is read
+under `general` instead, where `source_reproducible = false` says plainly that
+rebuilding it produces a different -- larger, and correct past 2038 -- image
+rather than the same bytes. Reproducibility is a promise about a given writer,
+not across versions of one.
 
 No filesystem a distro installer produced can satisfy it. `mke2fs` defaults --
 Ubuntu 24.04, Debian 12, Azure Linux -- give you 256-byte inodes plus
@@ -337,10 +343,11 @@ opt-in because giving up reproducibility should be a decision, not a fallback.
   `system.posix_acl_access`/`system.posix_acl_default`, so dropping them would
   silently break MAC policy and ACLs
 
-Two limits are inherent to the writer rather than the importer. Output inodes
-are 128 bytes, so a timestamp outside 1970..2106 has nowhere to go and is
-refused with `TimestampOutOfRange` rather than wrapped into a plausible-looking
-wrong date. And a source journal is never replayed: a source must be cleanly
+Two limits are inherent to the writer rather than the importer. Timestamps
+are stored as ext4 stores them -- a signed 32-bit seconds field plus the two
+epoch bits in `i_*_extra` -- so a value outside 1901-12-13..2446-05-10 has
+nowhere to go and is refused with `TimestampOutOfRange` rather than wrapped
+into a plausible-looking wrong date. And a source journal is never replayed: a source must be cleanly
 unmounted, and a superblock still marked as needing recovery or carrying orphan
 inodes is a hard error rather than a filesystem imported halfway. The source's
 own journal is never carried across either -- the rebuild writes a fresh

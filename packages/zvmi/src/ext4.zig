@@ -26,11 +26,18 @@
 //!   - `feature_incompat = FILETYPE | EXTENTS`: directory entries carry the
 //!     ext4 file-type byte, and regular-file / directory payloads are mapped
 //!     with extents.
-//!   - `feature_ro_compat = SPARSE_SUPER | METADATA_CSUM` (plus `LARGE_FILE`
-//!     only when a file exceeds 2 GiB): sparse backup superblocks/group-
-//!     descriptor tables are written for groups selected by ext4's classic
-//!     sparse-super rule, and metadata-bearing structures are checksummed with
-//!     crc32c.
+//!   - `feature_ro_compat = SPARSE_SUPER | METADATA_CSUM | EXTRA_ISIZE` (plus
+//!     `LARGE_FILE` only when a file exceeds 2 GiB): sparse backup
+//!     superblocks/group-descriptor tables are written for groups selected by
+//!     ext4's classic sparse-super rule, and metadata-bearing structures are
+//!     checksummed with crc32c.
+//!   - 256-byte inodes, as `mke2fs` has written by default since 2008. The
+//!     classic 128-byte inode stops at `i_osd2`, which leaves nowhere for
+//!     `i_extra_isize` and therefore no creation time and -- the part that
+//!     silently corrupts data rather than merely losing it -- no epoch bits.
+//!     Without those the seconds field is a bare signed 32-bit count that
+//!     wraps in 2038, so a 2049 timestamp reads back as 1913. 128-byte inodes
+//!     are still read, resized and edited; they are just never written.
 //!
 //! Deliberate phase-2 non-goals: no journal replay or log writing (a journal
 //! this writer creates is always empty, so there is nothing to replay) and no
@@ -58,8 +65,18 @@ pub const root_inode: u32 = 2;
 pub const journal_inode: u32 = 8;
 pub const first_non_reserved_inode: u32 = 11;
 
-const inode_size: u16 = 128;
+/// The inode size this writer emits. `mke2fs` has defaulted to 256 since
+/// e2fsprogs 1.41 (2008). The classic 128-byte inode ends at `i_osd2` and so
+/// has nowhere to put `i_extra_isize`, which is what carries creation time,
+/// nanosecond resolution, and -- the reason this matters most -- the two
+/// epoch bits without which no timestamp past 2038 can be represented.
+const writer_inode_size: u16 = 256;
+/// The classic ext2 inode. Still read, never written.
+const min_supported_reader_inode_size: u16 = 128;
 const max_supported_reader_inode_size: u16 = 256;
+/// `i_extra_isize`: how many bytes past the classic 128 this writer fills in.
+/// 32 reaches the end of `i_projid`, which is what `mke2fs` also writes.
+const writer_extra_isize: u16 = 32;
 const group_desc_size: u16 = 32;
 const max_inline_extents: usize = 4;
 const max_supported_extent_depth: u16 = 4;
@@ -122,10 +139,25 @@ const feature_ro_compat_verity: u32 = 0x8000;
 const feature_ro_compat_orphan_present: u32 = 0x0001_0000;
 const writer_feature_compat: u32 = feature_compat_ext_attr | feature_compat_dir_index;
 const writer_feature_incompat: u32 = feature_incompat_filetype | feature_incompat_extents;
-const writer_feature_ro_compat_base: u32 = feature_ro_compat_sparse_super | feature_ro_compat_metadata_csum;
+/// Always set by this writer. `EXTRA_ISIZE` asserts that every inode has at
+/// least `s_min_extra_isize` bytes past the classic 128 already filled in,
+/// which is exactly what `writeInodes` guarantees.
+const writer_feature_ro_compat_base: u32 = feature_ro_compat_sparse_super | feature_ro_compat_metadata_csum | feature_ro_compat_extra_isize;
+/// Allowed on a filesystem this module reads back, but conditional on its
+/// contents rather than always present.
+const writer_feature_ro_compat_optional: u32 = feature_ro_compat_large_file;
 const reader_feature_compat: u32 = writer_feature_compat | feature_compat_has_journal | feature_compat_resize_inode | feature_compat_orphan_file;
 const reader_feature_incompat: u32 = writer_feature_incompat | feature_incompat_64bit | feature_incompat_flex_bg | feature_incompat_csum_seed;
 const reader_feature_ro_compat: u32 = writer_feature_ro_compat_base | feature_ro_compat_large_file | feature_ro_compat_huge_file | feature_ro_compat_dir_nlink | feature_ro_compat_extra_isize;
+
+/// Every inode size between the classic 128 and the 256 this writer emits,
+/// as a power of two. Images written by an older zvmi -- and by `mke2fs -I
+/// 128` -- still have to be readable, resizable and editable.
+fn supportedInodeSize(value: u16) bool {
+    return value >= min_supported_reader_inode_size and
+        value <= max_supported_reader_inode_size and
+        std.math.isPowerOfTwo(value);
+}
 
 const inode_flag_encrypt: u32 = 0x0000_0800;
 const inode_flag_index: u32 = 0x0000_1000;
@@ -461,35 +493,64 @@ const OwnedEntry = struct {
     times: InodeTimes = .{},
 };
 
-/// The three times an inode written by this module can carry. A 128-byte
-/// inode has no `i_*_extra` words, so there is nothing wider to store than
-/// the 32-bit fields, and a value that would not fit is refused rather than
-/// wrapped into a plausible-looking wrong date.
+/// The three times an inode written by this module can carry. On a 256-byte
+/// inode each one gets a matching `i_*_extra` word, whose low two bits push
+/// the signed 32-bit seconds field forward by whole 2^32-second epochs. That
+/// covers 1901-12-13 through 2446-05-10; anything outside it is refused
+/// rather than wrapped into a plausible-looking wrong date.
 const InodeTimes = struct {
-    atime: ?u32 = null,
-    mtime: ?u32 = null,
-    ctime: ?u32 = null,
+    atime: ?i64 = null,
+    mtime: ?i64 = null,
+    ctime: ?i64 = null,
 
     fn from(entry: FileTreeView.Entry) PopulateError!InodeTimes {
         return .{
-            .atime = try narrowTime(entry.atime),
-            .mtime = try narrowTime(entry.mtime),
-            .ctime = try narrowTime(entry.ctime),
+            .atime = try checkedTime(entry.atime),
+            .mtime = try checkedTime(entry.mtime),
+            .ctime = try checkedTime(entry.ctime),
         };
     }
 
-    fn resolve(self: InodeTimes, fallback: u32) struct { u32, u32, u32 } {
+    fn resolve(self: InodeTimes, fallback: u32) struct { i64, i64, i64 } {
+        const default: i64 = fallback;
         return .{
-            self.atime orelse fallback,
-            self.ctime orelse fallback,
-            self.mtime orelse fallback,
+            self.atime orelse default,
+            self.ctime orelse default,
+            self.mtime orelse default,
         };
     }
 };
 
-fn narrowTime(value: ?i64) PopulateError!?u32 {
+/// Rejects a timestamp at tree-walk time rather than at inode-write time, so
+/// the failure names the entry that carries it.
+fn checkedTime(value: ?i64) PopulateError!?i64 {
     const seconds = value orelse return null;
-    return std.math.cast(u32, seconds) orelse error.TimestampOutOfRange;
+    _ = try encodeInodeTime(seconds);
+    return seconds;
+}
+
+const EncodedTime = struct {
+    /// `i_atime` and friends: the low 32 bits, read back as signed.
+    seconds: u32,
+    /// The low two bits of the matching `i_*_extra` word.
+    epoch: u32,
+};
+
+/// 1901-12-13T20:45:52Z: epoch 0 with the seconds field at its most negative.
+pub const min_representable_time: i64 = std.math.minInt(i32);
+/// 2446-05-10T22:38:55Z: epoch 3 with the seconds field at its most positive.
+pub const max_representable_time: i64 = std.math.maxInt(i32) + (3 << 32);
+
+/// The inverse of `decodeInodeTime`. ext4 stores the seconds truncated to 32
+/// bits and the discarded high part as an epoch count, so the two together
+/// reach 2^34 seconds from 1901 rather than stopping dead in 2038.
+fn encodeInodeTime(value: i64) PopulateError!EncodedTime {
+    if (value < min_representable_time or value > max_representable_time) {
+        return error.TimestampOutOfRange;
+    }
+    const low: i32 = @truncate(value);
+    const epoch = @divExact(value - @as(i64, low), 1 << 32);
+    return .{ .seconds = @bitCast(low), .epoch = @intCast(epoch) };
 }
 
 const Node = struct {
@@ -1188,7 +1249,7 @@ pub fn resize(io: Io, file: Io.File, allocator: std.mem.Allocator, options: Resi
     // every group's used data blocks form a prefix of its data area -- which
     // holds for the journal exactly as it does for a file.
     if (incompat != writer_feature_incompat) return error.UnsupportedFeatures;
-    if (ro_compat & ~(writer_feature_ro_compat_base | feature_ro_compat_large_file) != 0) return error.UnsupportedFeatures;
+    if (ro_compat & ~(writer_feature_ro_compat_base | writer_feature_ro_compat_optional) != 0) return error.UnsupportedFeatures;
 
     // `s_jnl_blocks` is a backup of the journal inode that this path leaves
     // exactly as it found it, which is only correct while the journal itself
@@ -1229,14 +1290,14 @@ pub fn resize(io: Io, file: Io.File, allocator: std.mem.Allocator, options: Resi
     const blocks_per_group = readInt(u32, sb[0x20..0x24]);
     const inodes_per_group = readInt(u32, sb[0x28..0x2C]);
     const inode_size_on_disk = readInt(u16, sb[0x58..0x5A]);
-    if (blocks_per_group != default_blocks_per_group or inode_size_on_disk != inode_size) return error.UnsupportedResizeLayout;
+    if (blocks_per_group != default_blocks_per_group or !supportedInodeSize(inode_size_on_disk)) return error.UnsupportedResizeLayout;
 
     const old_group_count = blocksToGroups(old_total_blocks, blocks_per_group);
     const new_group_count = blocksToGroups(new_total_blocks, blocks_per_group);
     const old_gdt_blocks = blocksForBytes(@as(u64, old_group_count) * group_desc_size, default_block_size);
     const required_new_gdt_blocks = blocksForBytes(@as(u64, new_group_count) * group_desc_size, default_block_size);
     if (required_new_gdt_blocks > old_gdt_blocks) return error.UnsupportedResizeLayout;
-    const inode_table_blocks = divCeil(@as(u32, inodes_per_group) * inode_size, default_block_size);
+    const inode_table_blocks = divCeil(@as(u32, inodes_per_group) * inode_size_on_disk, default_block_size);
 
     const old_layout = try buildFixedLayout(allocator, old_total_blocks, blocks_per_group, inodes_per_group, inode_table_blocks, old_gdt_blocks);
     defer allocator.free(old_layout.groups);
@@ -1421,7 +1482,7 @@ pub const Reader = struct {
         const blocks_per_group = readInt(u32, sb[0x20..0x24]);
         const inodes_per_group = readInt(u32, sb[0x28..0x2C]);
         const inode_size_on_disk = readInt(u16, sb[0x58..0x5A]);
-        if (inode_size_on_disk < inode_size or inode_size_on_disk > max_supported_reader_inode_size) return error.UnsupportedInodeSize;
+        if (!supportedInodeSize(inode_size_on_disk)) return error.UnsupportedInodeSize;
         if (total_blocks == 0 or blocks_per_group == 0 or inodes_per_group == 0) {
             return error.UnsupportedFeatures;
         }
@@ -1892,11 +1953,11 @@ pub const Editor = struct {
         var reader = try Reader.open(io, file, allocator, .{ .offset = options.offset });
         errdefer reader.deinit();
 
-        if (reader.inode_size != inode_size) return error.UnsupportedEditLayout;
+        if (!supportedInodeSize(reader.inode_size)) return error.UnsupportedEditLayout;
         if (reader.blocks_per_group != default_blocks_per_group) return error.UnsupportedEditLayout;
         if (reader.feature_compat & ~writer_feature_compat != 0) return error.UnsupportedEditLayout;
         if (reader.feature_incompat != writer_feature_incompat) return error.UnsupportedEditLayout;
-        if (reader.feature_ro_compat & ~(writer_feature_ro_compat_base | feature_ro_compat_large_file) != 0) return error.UnsupportedEditLayout;
+        if (reader.feature_ro_compat & ~(writer_feature_ro_compat_base | writer_feature_ro_compat_optional) != 0) return error.UnsupportedEditLayout;
 
         var sb: [superblock_size]u8 = undefined;
         _ = try file.readPositionalAll(io, &sb, options.offset + superblock_offset);
@@ -2322,14 +2383,27 @@ pub const Editor = struct {
         return self.reader.blockOffset(rgroup.inode_table_block) + @as(u64, index_in_group) * self.reader.inode_size;
     }
 
-    fn readInodeRaw(self: Editor, io: Io, inode_number: u32) EditError![inode_size]u8 {
-        var buf: [inode_size]u8 = undefined;
-        _ = try self.reader.file.readPositionalAll(io, &buf, self.inodeLocation(inode_number));
-        return buf;
+    /// The image's own inode size decides how much of the storage is live.
+    /// Reading or writing a fixed 128 bytes would leave the extra region of
+    /// a 256-byte inode stale, and hashing the whole array would checksum
+    /// bytes that are not part of the inode.
+    const RawInode = struct {
+        storage: [max_supported_reader_inode_size]u8,
+        len: u16,
+
+        fn bytes(self: *RawInode) []u8 {
+            return self.storage[0..self.len];
+        }
+    };
+
+    fn readInodeRaw(self: Editor, io: Io, inode_number: u32) EditError!RawInode {
+        var raw: RawInode = .{ .storage = undefined, .len = self.reader.inode_size };
+        _ = try self.reader.file.readPositionalAll(io, raw.bytes(), self.inodeLocation(inode_number));
+        return raw;
     }
 
-    fn writeInodeRaw(self: Editor, io: Io, inode_number: u32, buf: *const [inode_size]u8) EditError!void {
-        try self.reader.file.writePositionalAll(io, buf, self.inodeLocation(inode_number));
+    fn writeInodeRaw(self: Editor, io: Io, inode_number: u32, raw: *RawInode) EditError!void {
+        try self.reader.file.writePositionalAll(io, raw.bytes(), self.inodeLocation(inode_number));
     }
 
     /// Decrements a regular file's or symlink's `i_links_count`. This
@@ -2340,19 +2414,20 @@ pub const Editor = struct {
     /// correctly too, only retiring the inode once its last reference is
     /// gone.
     fn decrementLinkCountAndMaybeFree(self: *Editor, io: Io, inode_number: u32, kind: Kind) EditError!void {
-        var buf = try self.readInodeRaw(io, inode_number);
+        var raw = try self.readInodeRaw(io, inode_number);
+        const buf = raw.bytes();
         const link_count = readInt(u16, buf[26..28]);
         if (link_count == 0) return;
         if (link_count == 1) {
-            const parsed = try ParsedInode.fromBytes(inode_number, &buf);
+            const parsed = try ParsedInode.fromBytes(inode_number, buf);
             try self.freeInodeAllocations(io, parsed, true);
-            @memset(&buf, 0);
-            try self.writeInodeRaw(io, inode_number, &buf);
+            @memset(buf, 0);
+            try self.writeInodeRaw(io, inode_number, &raw);
             self.freeInodeBit(inode_number, kind == .directory);
         } else {
             writeInt(u16, buf[26..28], link_count - 1);
-            setInodeChecksum(&buf, self.reader.uuid, inode_number);
-            try self.writeInodeRaw(io, inode_number, &buf);
+            setInodeChecksum(buf, self.reader.uuid, inode_number);
+            try self.writeInodeRaw(io, inode_number, &raw);
         }
     }
 
@@ -2362,21 +2437,22 @@ pub const Editor = struct {
     /// being fully removed is always safe to force-retire outright, unlike
     /// the decrement-and-maybe-free handling regular files need.
     fn forceRetireDirectory(self: *Editor, io: Io, inode_number: u32) EditError!void {
-        var buf = try self.readInodeRaw(io, inode_number);
-        const parsed = try ParsedInode.fromBytes(inode_number, &buf);
+        var raw = try self.readInodeRaw(io, inode_number);
+        const parsed = try ParsedInode.fromBytes(inode_number, raw.bytes());
         try self.freeInodeAllocations(io, parsed, true);
-        @memset(&buf, 0);
-        try self.writeInodeRaw(io, inode_number, &buf);
+        @memset(raw.bytes(), 0);
+        try self.writeInodeRaw(io, inode_number, &raw);
         self.freeInodeBit(inode_number, true);
     }
 
     fn decrementParentLinkCount(self: *Editor, io: Io, parent_inode_number: u32) EditError!void {
-        var buf = try self.readInodeRaw(io, parent_inode_number);
+        var raw = try self.readInodeRaw(io, parent_inode_number);
+        const buf = raw.bytes();
         const link_count = readInt(u16, buf[26..28]);
         if (link_count > 0) {
             writeInt(u16, buf[26..28], link_count - 1);
-            setInodeChecksum(&buf, self.reader.uuid, parent_inode_number);
-            try self.writeInodeRaw(io, parent_inode_number, &buf);
+            setInodeChecksum(buf, self.reader.uuid, parent_inode_number);
+            try self.writeInodeRaw(io, parent_inode_number, &raw);
         }
     }
 
@@ -2479,7 +2555,8 @@ pub const Editor = struct {
             }
         }
 
-        var buf = try self.readInodeRaw(io, child_inode_number);
+        var raw = try self.readInodeRaw(io, child_inode_number);
+        const buf = raw.bytes();
         writeInt(u32, buf[4..8], @truncate(content.len));
         writeInt(u32, buf[108..112], @as(u32, @truncate(@as(u64, content.len) >> 32)));
         writeInt(u32, buf[28..32], inodeBlockSectors(new_block_count, child_inode.file_acl_block != 0));
@@ -2487,8 +2564,8 @@ pub const Editor = struct {
         encodeExtentLeafNode(extent_root[0..], max_inline_extents, new_extents);
         @memcpy(buf[40..100], &extent_root);
         writeInt(u32, buf[32..36], readInt(u32, buf[32..36]) | inode_flag_extents);
-        setInodeChecksum(&buf, self.reader.uuid, child_inode_number);
-        try self.writeInodeRaw(io, child_inode_number, &buf);
+        setInodeChecksum(buf, self.reader.uuid, child_inode_number);
+        try self.writeInodeRaw(io, child_inode_number, &raw);
 
         // Match populate()'s own convention of setting the large-file
         // ro_compat bit once any file exceeds 2 GiB, for consistency with
@@ -2897,7 +2974,7 @@ const StrictScanner = struct {
             self.reader.block_size,
         ));
         const inode_table_blocks = divCeil(
-            self.reader.inodes_per_group * inode_size,
+            self.reader.inodes_per_group * @as(u32, self.reader.inode_size),
             self.reader.block_size,
         );
         var total_free_blocks: u32 = 0;
@@ -3180,19 +3257,52 @@ const StrictScanner = struct {
     }
 
     fn validateInodeRaw(self: *StrictScanner, inode: ParsedInode) !void {
-        var raw: [inode_size]u8 = undefined;
+        var storage: [max_supported_reader_inode_size]u8 = undefined;
+        const raw = storage[0..self.reader.inode_size];
         const group_index = (inode.inode - 1) / self.reader.inodes_per_group;
         const index_in_group = (inode.inode - 1) % self.reader.inodes_per_group;
         const group = self.reader.groups[group_index];
         const inode_offset = self.reader.blockOffset(group.inode_table_block) +
             @as(u64, index_in_group) * self.reader.inode_size;
-        try self.reader.readAll(self.io, &raw, inode_offset);
-        const stored_checksum = readInt(u16, raw[124..126]);
-        var checked = raw;
-        setInodeChecksum(&checked, self.reader.uuid, inode.inode);
-        if (stored_checksum != readInt(u16, checked[124..126])) return error.BadInodeChecksum;
+        try self.reader.readAll(self.io, raw, inode_offset);
+        // Both halves of the checksum have to be compared, or a corrupt
+        // high half on a 256-byte inode reads as intact.
+        const wide = raw.len >= 132 and readInt(u16, raw[128..130]) >= 4;
+        const stored_checksum = readInt(u16, raw[124..126]) |
+            (@as(u32, if (wide) readInt(u16, raw[130..132]) else 0) << 16);
+        var checked_storage: [max_supported_reader_inode_size]u8 = undefined;
+        const checked = checked_storage[0..raw.len];
+        @memcpy(checked, raw);
+        setInodeChecksum(checked, self.reader.uuid, inode.inode);
+        const computed = readInt(u16, checked[124..126]) |
+            (@as(u32, if (wide) readInt(u16, checked[130..132]) else 0) << 16);
+        if (stored_checksum != computed) return error.BadInodeChecksum;
         if (!allZero(raw[112..120]) or !allZero(raw[126..128])) {
             return error.UnsupportedInodeMetadata;
+        }
+        if (raw.len > min_supported_reader_inode_size) {
+            // Every byte of the extra region has exactly one value this
+            // writer can have produced, so all of it is checked. The epoch
+            // words matter most: `ParsedInode` reads the seconds fields as
+            // bare 32-bit values and the strict tree re-derives every time
+            // from `global_timestamp`, so an epoch this scan let through
+            // unexamined would be dropped on rebuild and move the timestamp
+            // by 136 years -- the precise failure 256-byte inodes exist to
+            // prevent.
+            const expected = encodeInodeTime(self.identity.global_timestamp) catch
+                return error.UnsupportedInodeMetadata;
+            if (readInt(u16, raw[128..130]) != writer_extra_isize or
+                readInt(u32, raw[132..136]) != expected.epoch or
+                readInt(u32, raw[136..140]) != expected.epoch or
+                readInt(u32, raw[140..144]) != expected.epoch or
+                readInt(u32, raw[144..148]) != expected.seconds or
+                readInt(u32, raw[148..152]) != expected.epoch or
+                // `i_version_hi` and `i_projid`, which this writer leaves zero.
+                !allZero(raw[152..160]) or
+                !allZero(raw[160..raw.len]))
+            {
+                return error.UnsupportedInodeMetadata;
+            }
         }
     }
 
@@ -3690,15 +3800,20 @@ fn validateStrictSuperblock(
     }
     if (reader.feature_compat != writer_feature_compat or
         reader.feature_incompat != writer_feature_incompat or
-        reader.feature_ro_compat & ~(writer_feature_ro_compat_base | feature_ro_compat_large_file) != 0 or
+        reader.feature_ro_compat & ~(writer_feature_ro_compat_base | writer_feature_ro_compat_optional) != 0 or
         reader.feature_ro_compat & writer_feature_ro_compat_base != writer_feature_ro_compat_base or
         reader.block_size != default_block_size or
         reader.blocks_per_group != default_blocks_per_group or
-        reader.inode_size != inode_size or
+        // Exactly the writer's own size, not merely one it can read. This
+        // profile's whole claim is that a rebuild reproduces the source byte
+        // for byte, and an image an older zvmi wrote with 128-byte inodes
+        // would come back out with 256-byte ones. It belongs in the general
+        // profile, which reports `source_reproducible = false` honestly.
+        reader.inode_size != writer_inode_size or
         reader.total_blocks == 0 or
         reader.inodes_per_group == 0 or
         reader.inodes_per_group > default_block_size * 8 or
-        reader.inodes_per_group % (default_block_size / inode_size) != 0 or
+        reader.inodes_per_group % (default_block_size / writer_inode_size) != 0 or
         reader.total_inodes != reader.groups.len * reader.inodes_per_group or
         readInt(u32, sb[0x08..0x0C]) != 0 or
         readInt(u32, sb[0x14..0x18]) != 0 or
@@ -5220,8 +5335,16 @@ fn buildPlan(
         try validateTreeEntry(entry);
         const owned_xattrs = try dupXattrs(allocator, entry.xattrs);
         errdefer freeOwnedXattrSlice(allocator, owned_xattrs);
+        // Each allocation is tracked on its own because a later field in the
+        // same entry can still fail -- a timestamp no inode can represent,
+        // say -- and the list's cleanup only reaches entries that made it in.
+        const owned_path = try allocator.dupe(u8, entry.path);
+        errdefer allocator.free(owned_path);
+        const owned_hardlink_target = try allocator.dupe(u8, entry.hardlink_target);
+        errdefer if (owned_hardlink_target.len > 0) allocator.free(owned_hardlink_target);
+        const times = try InodeTimes.from(entry);
         try entries_list.append(.{
-            .path = try allocator.dupe(u8, entry.path),
+            .path = owned_path,
             .kind = entry.kind,
             .mode = entry.mode,
             .uid = entry.uid,
@@ -5230,8 +5353,8 @@ fn buildPlan(
             .content = entry.content,
             .xattrs = owned_xattrs,
             .device = entry.device,
-            .hardlink_target = try allocator.dupe(u8, entry.hardlink_target),
-            .times = try InodeTimes.from(entry),
+            .hardlink_target = owned_hardlink_target,
+            .times = times,
         });
     }
 
@@ -5258,9 +5381,9 @@ fn buildPlan(
         .content = null,
         .xattrs = root_xattrs,
         .times = .{
-            .atime = try narrowTime(options.root_atime),
-            .mtime = try narrowTime(options.root_mtime),
-            .ctime = try narrowTime(options.root_ctime),
+            .atime = try checkedTime(options.root_atime),
+            .mtime = try checkedTime(options.root_mtime),
+            .ctime = try checkedTime(options.root_ctime),
         },
     };
 
@@ -5387,11 +5510,11 @@ fn buildLayout(allocator: std.mem.Allocator, total_blocks: u32, node_count: usiz
     const usable_nodes = std.math.cast(u32, node_count - 1) orelse return error.TooManyInodes;
     const total_used_inodes = first_non_reserved_inode - 1 + usable_nodes;
     var inodes_per_group = divCeil(total_used_inodes, group_count);
-    const inodes_per_block = default_block_size / inode_size;
+    const inodes_per_block = default_block_size / writer_inode_size;
     inodes_per_group = alignUpU32(@max(inodes_per_group, inodes_per_block), inodes_per_block);
     if (inodes_per_group > default_block_size * 8) return error.TooManyInodes;
 
-    const inode_table_blocks = divCeil(@as(u32, inodes_per_group) * inode_size, default_block_size);
+    const inode_table_blocks = divCeil(@as(u32, inodes_per_group) * writer_inode_size, default_block_size);
     const groups = try allocator.alloc(GroupLayout, group_count);
     errdefer allocator.free(groups);
 
@@ -5732,14 +5855,17 @@ fn writeInodes(io: Io, file: Io.File, nodes: []Node, layout: Layout, options: Po
         // wrote; writing it twice would be redundant at best and would
         // overwrite the target's own link count at worst.
         if (!node.owns_inode) continue;
-        var buf: [inode_size]u8 = [_]u8{0} ** inode_size;
+        var buf: [writer_inode_size]u8 = [_]u8{0} ** writer_inode_size;
         writeInt(u16, buf[0..2], inodeMode(node));
         writeInt(u16, buf[2..4], @truncate(node.uid));
         writeInt(u32, buf[4..8], @truncate(node.size_on_disk));
         const times = node.times.resolve(options.timestamp);
-        writeInt(u32, buf[8..12], times[0]);
-        writeInt(u32, buf[12..16], times[1]);
-        writeInt(u32, buf[16..20], times[2]);
+        const atime = try encodeInodeTime(times[0]);
+        const ctime = try encodeInodeTime(times[1]);
+        const mtime = try encodeInodeTime(times[2]);
+        writeInt(u32, buf[8..12], atime.seconds);
+        writeInt(u32, buf[12..16], ctime.seconds);
+        writeInt(u32, buf[16..20], mtime.seconds);
         writeInt(u16, buf[24..26], @truncate(node.gid));
         writeInt(u16, buf[26..28], node.link_count);
         writeInt(u32, buf[28..32], inodeSectorCount(node));
@@ -5772,12 +5898,28 @@ fn writeInodes(io: Io, file: Io.File, nodes: []Node, layout: Layout, options: Po
         writeInt(u32, buf[108..112], @as(u32, @truncate(node.size_on_disk >> 32)));
         writeInt(u16, buf[120..122], @as(u16, @truncate(node.uid >> 16)));
         writeInt(u16, buf[122..124], @as(u16, @truncate(node.gid >> 16)));
+
+        // The extra region. `i_extra_isize` has to come first: every other
+        // field here is only considered present because it covers them, and
+        // that includes `i_checksum_hi`, so it must be set before the
+        // checksum is computed.
+        writeInt(u16, buf[128..130], writer_extra_isize);
+        writeInt(u32, buf[132..136], ctime.epoch);
+        writeInt(u32, buf[136..140], mtime.epoch);
+        writeInt(u32, buf[140..144], atime.epoch);
+        // The image really is being created now, so the build timestamp is
+        // the honest answer. The source tree carries no creation time to
+        // preserve in its place.
+        const crtime = try encodeInodeTime(options.timestamp);
+        writeInt(u32, buf[144..148], crtime.seconds);
+        writeInt(u32, buf[148..152], crtime.epoch);
+
         setInodeChecksum(&buf, uuid, node.inode);
 
         const group_index = (node.inode - 1) / layout.inodes_per_group;
         const index_in_group = (node.inode - 1) % layout.inodes_per_group;
         const group = layout.groups[group_index];
-        const inode_offset = options.offset + @as(u64, group.inode_table_block) * options.block_size + @as(u64, index_in_group) * inode_size;
+        const inode_offset = options.offset + @as(u64, group.inode_table_block) * options.block_size + @as(u64, index_in_group) * writer_inode_size;
         try file.writePositionalAll(io, &buf, inode_offset);
     }
 }
@@ -5846,7 +5988,7 @@ fn writeSuperblocks(io: Io, file: Io.File, layout: Layout, plan: WriterPlan, opt
     writeInt(u16, sb[0x50..0x52], 0);
     writeInt(u16, sb[0x52..0x54], 0);
     writeInt(u32, sb[0x54..0x58], first_non_reserved_inode);
-    writeInt(u16, sb[0x58..0x5A], inode_size);
+    writeInt(u16, sb[0x58..0x5A], writer_inode_size);
     writeInt(u16, sb[0x5A..0x5C], 0);
     writeInt(u32, sb[0x5C..0x60], plan.feature_compat);
     writeInt(u32, sb[0x60..0x64], writer_feature_incompat);
@@ -5860,6 +6002,12 @@ fn writeSuperblocks(io: Io, file: Io.File, layout: Layout, plan: WriterPlan, opt
     writeInt(u8, sb[0xFD..0xFE], 0);
     writeInt(u16, sb[0xFE..0x100], group_desc_size);
     writeInt(u32, sb[0x108..0x10C], options.timestamp);
+    // `s_min_extra_isize` / `s_want_extra_isize`. The first is a promise that
+    // every inode already has that many extra bytes filled in, which is what
+    // makes `RO_COMPAT_EXTRA_ISIZE` safe to set; the second is what a kernel
+    // growing an inode should aim for. `mke2fs` writes 32 for both.
+    writeInt(u16, sb[0x15C..0x15E], writer_extra_isize);
+    writeInt(u16, sb[0x15E..0x160], writer_extra_isize);
     writeInt(u8, sb[0x175..0x176], super_checksum_type_crc32c);
     if (plan.journal.len != 0) {
         const journal = plan.journal[0];
@@ -6909,16 +7057,24 @@ fn setXattrBlockChecksum(block: []u8, uuid: [16]u8, block_number: u64) void {
     }));
 }
 
+/// crc32c over the whole raw inode with the stored checksum zeroed. On an
+/// inode wide enough for `i_checksum_hi` -- which `i_extra_isize` has to
+/// reach for the field to count as present -- the checksum is 32 bits split
+/// across two non-adjacent halves, and both must be cleared before hashing.
 fn setInodeChecksum(block: []u8, uuid: [16]u8, inode_number: u32) void {
     var inode_le = std.mem.nativeToLittle(u32, inode_number);
     var generation_le = std.mem.nativeToLittle(u32, @as(u32, 0));
+    const wide = block.len >= 132 and readInt(u16, block[128..130]) >= 4;
     writeInt(u16, block[124..126], 0);
-    writeInt(u16, block[124..126], @truncate(ext4Crc32c(&.{
+    if (wide) writeInt(u16, block[130..132], 0);
+    const checksum = ext4Crc32c(&.{
         &uuid,
         std.mem.asBytes(&inode_le),
         std.mem.asBytes(&generation_le),
         block,
-    })));
+    });
+    writeInt(u16, block[124..126], @truncate(checksum));
+    if (wide) writeInt(u16, block[130..132], @truncate(checksum >> 16));
 }
 
 fn setSuperblockChecksum(sb: []u8) void {
@@ -7476,11 +7632,12 @@ test "strict writer-compatible scan rejects divergent inode timestamps" {
     const index_in_group = (inode_number - 1) % reader.inodes_per_group;
     const inode_offset = reader.blockOffset(reader.groups[group_index].inode_table_block) +
         @as(u64, index_in_group) * reader.inode_size;
-    var raw: [inode_size]u8 = undefined;
-    _ = try file.readPositionalAll(io, &raw, inode_offset);
-    writeInt(u32, raw[8..12], 1_717_171_718);
-    setInodeChecksum(&raw, reader.uuid, inode_number);
-    try file.writePositionalAll(io, &raw, inode_offset);
+    var raw: [max_supported_reader_inode_size]u8 = undefined;
+    const raw_inode = raw[0..reader.inode_size];
+    _ = try file.readPositionalAll(io, raw_inode, inode_offset);
+    writeInt(u32, raw_inode[8..12], 1_717_171_718);
+    setInodeChecksum(raw_inode, reader.uuid, inode_number);
+    try file.writePositionalAll(io, raw_inode, inode_offset);
 
     try std.testing.expectError(
         error.DivergentInodeTimestamp,
@@ -9385,6 +9542,9 @@ const InMemoryEntry = struct {
     generator: enum { none, pattern } = .none,
     device: DeviceNumbers = .{},
     hardlink_target: []const u8 = "",
+    atime: ?i64 = null,
+    mtime: ?i64 = null,
+    ctime: ?i64 = null,
 };
 
 const InMemoryTree = struct {
@@ -9438,6 +9598,9 @@ const InMemoryTree = struct {
             .xattrs = entry.xattrs,
             .device = entry.device,
             .hardlink_target = entry.hardlink_target,
+            .atime = entry.atime,
+            .mtime = entry.mtime,
+            .ctime = entry.ctime,
         };
     }
 
@@ -9536,15 +9699,15 @@ fn expectXattrValue(xattrs: []const OwnedXattr, name: []const u8, value: []const
 
 const RawInodeForPath = struct {
     inode_number: u32,
-    bytes: [inode_size]u8,
+    bytes: [max_supported_reader_inode_size]u8,
 };
 
 fn readRawInodeForPath(io: Io, file: Io.File, reader: *const Reader, path: []const u8) !RawInodeForPath {
     const inode_number = try reader.lookupPath(io, path);
     const group = (inode_number - 1) / reader.inodes_per_group;
     const index = (inode_number - 1) % reader.inodes_per_group;
-    var bytes: [inode_size]u8 = undefined;
-    _ = try file.readPositionalAll(io, &bytes, reader.blockOffset(reader.groups[group].inode_table_block) + @as(u64, index) * inode_size);
+    var bytes: [max_supported_reader_inode_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, bytes[0..reader.inode_size], reader.blockOffset(reader.groups[group].inode_table_block) + @as(u64, index) * reader.inode_size);
     return .{
         .inode_number = inode_number,
         .bytes = bytes,
@@ -9568,7 +9731,7 @@ fn expectMetadataChecksumsValid(io: Io, file: Io.File, offset: u64, file_path: [
     @memcpy(&uuid, sb[0x68..0x78]);
     const total_blocks = readInt(u32, sb[0x04..0x08]);
     const inodes_per_group = readInt(u32, sb[0x28..0x2C]);
-    const inode_table_blocks = divCeil(@as(u32, inodes_per_group) * inode_size, default_block_size);
+    const inode_table_blocks = divCeil(@as(u32, inodes_per_group) * readInt(u16, sb[0x58..0x5A]), default_block_size);
     const group_count = blocksToGroups(total_blocks, default_blocks_per_group);
     const gdt_blocks = blocksForBytes(@as(u64, group_count) * group_desc_size, default_block_size);
 
@@ -10260,4 +10423,170 @@ test "the writer refuses hardlink and device entries it cannot represent" {
             .length = 8 * 1024 * 1024,
         }));
     }
+}
+
+test "the writer emits 256-byte inodes carrying the extra fields e2fsprogs reads" {
+    const io = std.testing.io;
+    const path = "test-ext4-inode256.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "file", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 5, .bytes = "hello" },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    const build_time: u32 = 1_700_000_000;
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = 8 * 1024 * 1024,
+        .timestamp = build_time,
+    });
+
+    var sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &sb, superblock_offset);
+    try std.testing.expectEqual(@as(u16, 256), readInt(u16, sb[0x58..0x5A]));
+    // `s_min_extra_isize` is a promise about every inode in the filesystem,
+    // so it and the feature bit have to agree with what the inodes carry.
+    try std.testing.expectEqual(@as(u16, 32), readInt(u16, sb[0x15C..0x15E]));
+    try std.testing.expectEqual(@as(u16, 32), readInt(u16, sb[0x15E..0x160]));
+    try std.testing.expect(readInt(u32, sb[0x64..0x68]) & feature_ro_compat_extra_isize != 0);
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(u16, 256), reader.inode_size);
+
+    const raw = try readRawInodeForPath(io, file, &reader, "/file");
+    try std.testing.expectEqual(@as(u16, 32), readInt(u16, raw.bytes[128..130]));
+    // The image is genuinely new, so its creation time is the build time.
+    try std.testing.expectEqual(build_time, readInt(u32, raw.bytes[144..148]));
+    try std.testing.expectEqual(@as(u32, 0), readInt(u32, raw.bytes[148..152]));
+    // Left for the kernel: this writer never sets a version or a project id.
+    try std.testing.expect(allZero(raw.bytes[152..160]));
+
+    // The checksum is split across two non-adjacent halves on a wide inode
+    // and e2fsck compares both, so a half-written one fails here.
+    try expectE2fsckClean(path);
+}
+
+test "timestamps past 2038 survive a round trip through the extra epoch bits" {
+    const io = std.testing.io;
+    const path = "test-ext4-epoch.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // One value in each representable epoch, plus one before the 1970 origin,
+    // because the seconds field is read back signed.
+    const in_2049: i64 = 2_500_000_000;
+    const in_2106: i64 = 4_300_000_000;
+    const in_1960: i64 = -300_000_000;
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "future", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .atime = in_2049, .mtime = in_2106, .ctime = in_2049 },
+        .{ .path = "past", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .atime = in_1960, .mtime = in_1960, .ctime = in_1960 },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 8 * 1024 * 1024 });
+
+    var reader = try openGeneral(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    var imported = try scanReadable(&reader, io, std.testing.allocator, .{
+        .available_length = 8 * 1024 * 1024,
+    });
+    defer imported.deinit();
+
+    const future = findGeneralEntry(&imported, "future").?;
+    try std.testing.expectEqual(in_2049, future.atime);
+    try std.testing.expectEqual(in_2106, future.mtime);
+    try std.testing.expectEqual(in_2049, future.ctime);
+
+    const past = findGeneralEntry(&imported, "past").?;
+    try std.testing.expectEqual(in_1960, past.atime);
+    try std.testing.expectEqual(in_1960, past.mtime);
+    try std.testing.expectEqual(in_1960, past.ctime);
+
+    try expectE2fsckClean(path);
+}
+
+test "the writer refuses a timestamp no inode can represent" {
+    const io = std.testing.io;
+    const path = "test-ext4-epoch-refused.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // 2446-05-10 is the last second the two epoch bits reach; 1901-12-13 is
+    // the first. A value outside that window has to be named, not wrapped.
+    for ([_]i64{ 15_032_385_536, -2_147_483_649 }) |unrepresentable| {
+        var tree = InMemoryTree.init(&[_]InMemoryEntry{
+            .{ .path = "file", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .mtime = unrepresentable },
+        });
+        tree.bind();
+
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+        defer file.close(io);
+        try std.testing.expectError(
+            error.TimestampOutOfRange,
+            populate(io, file, std.testing.allocator, &tree.view, .{ .length = 8 * 1024 * 1024 }),
+        );
+    }
+}
+
+test "encodeInodeTime inverts decodeInodeTime across every epoch boundary" {
+    const boundaries = [_]i64{
+        -2_147_483_648, -1,            0,              1,
+        2_147_483_647,  2_147_483_648, 4_294_967_295,  4_294_967_296,
+        8_589_934_591,  8_589_934_592, 15_032_385_535,
+    };
+    for (boundaries) |value| {
+        const encoded = try encodeInodeTime(value);
+        try std.testing.expectEqual(value, decodeInodeTime(encoded.seconds, encoded.epoch));
+    }
+    try std.testing.expectError(error.TimestampOutOfRange, encodeInodeTime(15_032_385_536));
+    try std.testing.expectError(error.TimestampOutOfRange, encodeInodeTime(-2_147_483_649));
+}
+
+test "strict writer-compatible scan rejects a tampered inode epoch" {
+    const io = std.testing.io;
+    const path = "test-ext4-strict-epoch.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "file", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "test" },
+    });
+    tree.bind();
+    const length = 8 * 1024 * 1024;
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = length,
+        .uuid = [_]u8{0x44} ** 16,
+        .timestamp = 1_717_171_717,
+    });
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    const inode_number = try reader.lookupPath(io, "/file");
+    const group_index = (inode_number - 1) / reader.inodes_per_group;
+    const index_in_group = (inode_number - 1) % reader.inodes_per_group;
+    const inode_offset = reader.blockOffset(reader.groups[group_index].inode_table_block) +
+        @as(u64, index_in_group) * reader.inode_size;
+    var raw: [max_supported_reader_inode_size]u8 = undefined;
+    const raw_inode = raw[0..reader.inode_size];
+    _ = try file.readPositionalAll(io, raw_inode, inode_offset);
+
+    // The seconds field is untouched, so the timestamp check that guards the
+    // strict profile still sees the value it expects. Only the epoch moves --
+    // 136 years, invisibly, because `ParsedInode` reads seconds alone.
+    try std.testing.expectEqual(@as(u32, 0), readInt(u32, raw_inode[136..140]));
+    writeInt(u32, raw_inode[136..140], 1);
+    setInodeChecksum(raw_inode, reader.uuid, inode_number);
+    try file.writePositionalAll(io, raw_inode, inode_offset);
+
+    try std.testing.expectError(
+        error.UnsupportedInodeMetadata,
+        scanWriterCompatible(&reader, io, std.testing.allocator, .{
+            .expected_length = length,
+        }),
+    );
 }
