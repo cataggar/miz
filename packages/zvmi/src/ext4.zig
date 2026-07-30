@@ -3281,10 +3281,23 @@ const StrictScanner = struct {
             return error.UnsupportedInodeMetadata;
         }
         if (raw.len > min_supported_reader_inode_size) {
-            // `i_version_hi` and `i_projid` are the tail of the region this
-            // writer fills, and it leaves both zero. Anything past
-            // `i_extra_isize` is not this writer's output.
+            // Every byte of the extra region has exactly one value this
+            // writer can have produced, so all of it is checked. The epoch
+            // words matter most: `ParsedInode` reads the seconds fields as
+            // bare 32-bit values and the strict tree re-derives every time
+            // from `global_timestamp`, so an epoch this scan let through
+            // unexamined would be dropped on rebuild and move the timestamp
+            // by 136 years -- the precise failure 256-byte inodes exist to
+            // prevent.
+            const expected = encodeInodeTime(self.identity.global_timestamp) catch
+                return error.UnsupportedInodeMetadata;
             if (readInt(u16, raw[128..130]) != writer_extra_isize or
+                readInt(u32, raw[132..136]) != expected.epoch or
+                readInt(u32, raw[136..140]) != expected.epoch or
+                readInt(u32, raw[140..144]) != expected.epoch or
+                readInt(u32, raw[144..148]) != expected.seconds or
+                readInt(u32, raw[148..152]) != expected.epoch or
+                // `i_version_hi` and `i_projid`, which this writer leaves zero.
                 !allZero(raw[152..160]) or
                 !allZero(raw[160..raw.len]))
             {
@@ -10531,4 +10544,49 @@ test "encodeInodeTime inverts decodeInodeTime across every epoch boundary" {
     }
     try std.testing.expectError(error.TimestampOutOfRange, encodeInodeTime(15_032_385_536));
     try std.testing.expectError(error.TimestampOutOfRange, encodeInodeTime(-2_147_483_649));
+}
+
+test "strict writer-compatible scan rejects a tampered inode epoch" {
+    const io = std.testing.io;
+    const path = "test-ext4-strict-epoch.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "file", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "test" },
+    });
+    tree.bind();
+    const length = 8 * 1024 * 1024;
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = length,
+        .uuid = [_]u8{0x44} ** 16,
+        .timestamp = 1_717_171_717,
+    });
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    const inode_number = try reader.lookupPath(io, "/file");
+    const group_index = (inode_number - 1) / reader.inodes_per_group;
+    const index_in_group = (inode_number - 1) % reader.inodes_per_group;
+    const inode_offset = reader.blockOffset(reader.groups[group_index].inode_table_block) +
+        @as(u64, index_in_group) * reader.inode_size;
+    var raw: [max_supported_reader_inode_size]u8 = undefined;
+    const raw_inode = raw[0..reader.inode_size];
+    _ = try file.readPositionalAll(io, raw_inode, inode_offset);
+
+    // The seconds field is untouched, so the timestamp check that guards the
+    // strict profile still sees the value it expects. Only the epoch moves --
+    // 136 years, invisibly, because `ParsedInode` reads seconds alone.
+    try std.testing.expectEqual(@as(u32, 0), readInt(u32, raw_inode[136..140]));
+    writeInt(u32, raw_inode[136..140], 1);
+    setInodeChecksum(raw_inode, reader.uuid, inode_number);
+    try file.writePositionalAll(io, raw_inode, inode_offset);
+
+    try std.testing.expectError(
+        error.UnsupportedInodeMetadata,
+        scanWriterCompatible(&reader, io, std.testing.allocator, .{
+            .expected_length = length,
+        }),
+    );
 }
