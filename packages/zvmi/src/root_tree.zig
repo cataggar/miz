@@ -847,28 +847,27 @@ pub const RootTree = struct {
         // names.
         try directory_slots.append(fat32.root_directory_overhead_slots);
 
-        // Paths sort lexicographically, so every descendant of a directory
-        // follows it without interruption and a stack of open directories is
-        // enough to say which one the current node belongs to.
-        const Frame = struct { path: []const u8, slots: usize };
-        var open = std.array_list.Managed(Frame).init(self.allocator);
-        defer open.deinit();
-        try open.append(.{ .path = "", .slots = 0 });
+        // Every directory is looked up by path rather than tracked on a
+        // stack of open ones. A stack would need a directory's descendants
+        // to follow it without interruption, and they do not: `/` is 0x2F,
+        // so a sibling named `entries.srel` sorts between `entries` and
+        // `entries/arch.conf` -- which is exactly the pair `bootctl` writes
+        // onto a systemd-boot ESP. What sorting does guarantee is that a
+        // directory precedes its own children, since its path is a prefix
+        // of theirs, and that is all this needs.
+        var directories = std.StringHashMap(usize).init(self.allocator);
+        defer directories.deinit();
+        try directories.put("", 0);
 
         for (self.nodes.items) |node| {
             const split = splitPath(node.path);
-            while (open.items.len > 1 and
-                !std.mem.eql(u8, open.items[open.items.len - 1].path, split.parent))
-            {
-                _ = open.pop();
-            }
-            const parent_slots = open.items[open.items.len - 1];
-            if (!std.mem.eql(u8, parent_slots.path, split.parent)) return error.MissingParentDirectory;
-            directory_slots.items[parent_slots.slots] += try fat32.nameSlotCount(split.name);
+            const parent_slot = directories.get(split.parent) orelse
+                return error.MissingParentDirectory;
+            directory_slots.items[parent_slot] += try fat32.nameSlotCount(split.name);
             switch (node.kind) {
                 .directory => {
                     try directory_slots.append(fat32.subdirectory_overhead_slots);
-                    try open.append(.{ .path = node.path, .slots = directory_slots.items.len - 1 });
+                    try directories.put(node.path, directory_slots.items.len - 1);
                 },
                 // `preflightFat32` has already refused every other kind.
                 .file => try file_sizes.append(node.size()),
@@ -2531,4 +2530,43 @@ test "a tree's FAT32 size is one the tree fits in, and one byte less is not" {
     });
     var short_fs = try fat32.open(&short_img, io, .{ .offset = 0, .length = too_small });
     try std.testing.expectError(error.NoSpaceLeft, tree.populateFat32(&short_fs, .{}));
+}
+
+test "a FAT32 size accounts for a directory whose sibling sorts between it and its children" {
+    const io = std.testing.io;
+    const spool_path = "test-root-tree-fat-interleaved.spool";
+
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    // `/` is 0x2F, so `loader/entries.srel` sorts after `loader/entries` and
+    // before `loader/entries/arch.conf`: a directory's descendants are not
+    // contiguous in the sorted order. This exact pair is what systemd's
+    // `bootctl` writes onto every systemd-boot ESP, so it is the common
+    // case rather than a contrived one.
+    try tree.putDirectory("loader", .{ .mode = 0o755 });
+    try tree.putDirectory("loader/entries", .{ .mode = 0o755 });
+    try tree.putFileBytes("loader/entries.srel", "type1\n", .{ .mode = 0o644 });
+    try tree.putFileBytes("loader/entries/arch.conf", "title Arch\n", .{ .mode = 0o644 });
+    try tree.putFileBytes("loader/loader.conf", "timeout 3\n", .{ .mode = 0o644 });
+
+    const length = try tree.minimumFat32VolumeLength(.{}, .{});
+
+    // Sizing succeeded; check the size it produced is one the tree fits in.
+    const Image = @import("image.zig").Image;
+    const image_path = "test-root-tree-fat-interleaved.img";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    var img = try Image.create(io, image_path, .raw, length, .{});
+    defer img.close(io);
+    try fat32.format(&img, io, .{
+        .partition_offset = 0,
+        .partition_len = length,
+        .volume_id = 0x0BAD_C0DE,
+    });
+    var fs = try fat32.open(&img, io, .{ .offset = 0, .length = length });
+    try tree.populateFat32(&fs, .{});
+
+    const conf = try fs.readFileAlloc(io, std.testing.allocator, "loader/entries/arch.conf");
+    defer std.testing.allocator.free(conf);
+    try std.testing.expectEqualStrings("title Arch\n", conf);
 }

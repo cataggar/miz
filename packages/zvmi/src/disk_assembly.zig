@@ -326,6 +326,11 @@ pub fn assemble(
     var img = try Image.createExclusive(io, options.raw_path, .raw, planned.disk_size, .{});
     var img_open = true;
     defer if (img_open) img.close(io);
+    // Creation is exclusive, so a half-written disk left behind by a failure
+    // here would make the retry fail with `PathAlreadyExists` and hide what
+    // actually went wrong. `createExclusive` only cleans up after its own
+    // failure; everything past this point is ours to undo.
+    errdefer Io.Dir.cwd().deleteFile(io, options.raw_path) catch {};
 
     try writeGpt(allocator, &img, io, identities.disk_guid, planned.partitions, esp_partition, root_partition);
 
@@ -949,6 +954,10 @@ test "two assemblies of the same tree with the same identities are byte-identica
     try testing.expectEqual(first.virtual_size, second.virtual_size);
     try testing.expectEqual(first.root.offset_bytes, second.root.offset_bytes);
     try testing.expectEqual(first.esp.?.length_bytes, second.esp.?.length_bytes);
+    // Nothing was left to rewrite the second time round, which is what makes
+    // the rewrite idempotent rather than merely repeatable.
+    try testing.expectEqual(@as(usize, 0), second.identity_rewrite.config_references_rewritten);
+    try testing.expectEqual(@as(usize, 0), second.esp_identity_rewrite.config_references_rewritten);
 
     var first_img = try Image.openPathReadOnly(io, first_path);
     defer first_img.close(io);
