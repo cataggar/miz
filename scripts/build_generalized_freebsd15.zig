@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const zvmi = @import("zvmi");
 const qmp = @import("qmp");
 const qemu_host = @import("qemu_host");
+const packages = @import("freebsd15_package_manifest.zig");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -25,6 +26,14 @@ const default_customization_timeout_seconds: u32 = 30 * 60;
 const qmp_connect_timeout_seconds: u32 = 10;
 const customization_result_prefix = "ZVMI_FREEBSD_CUSTOMIZATION_RESULT";
 const serial_tail_size: usize = 256 * 1024;
+/// Upper bound on the serial log scanned for the recorded package manifest.
+/// The manifest is emitted once near the end of a run, but boot chatter comes
+/// before it, so the whole log is scanned rather than the tail used for the
+/// result marker. The bound keeps a runaway guest from exhausting host memory.
+const serial_log_max_size: u64 = 16 * 1024 * 1024;
+/// A full base install is under 600 packages; the ceiling exists so a
+/// corrupted log cannot make the builder allocate without limit.
+const recorded_package_max_count: usize = 4096;
 
 /// Root filesystem of the upstream BASIC-CLOUDINIT image and therefore of the
 /// published artifact. FreeBSD's UFS and ZFS VM images do not share a disk
@@ -43,17 +52,10 @@ const RootFilesystem = enum {
     }
 };
 
-/// Content flavor of the published artifact. Only the full generalized image
-/// exists today; a `core` flavor that trims the package set reuses this same
-/// profile table instead of introducing a parallel one.
-const Flavor = enum {
-    full,
-
-    fn parse(text: []const u8) ?Flavor {
-        if (std.mem.eql(u8, text, "full")) return .full;
-        return null;
-    }
-};
+/// Content flavor of the published artifact. The flavor selects the package
+/// manifest the guest realizes, so it lives with the manifests rather than
+/// here; the profile table below still keys on it like any other axis.
+const Flavor = packages.Flavor;
 
 /// Filesystem-specific root growth and swap handling. The payloads carry the
 /// facts each path needs and nothing the other path could misread: the UFS
@@ -91,6 +93,13 @@ const Profile = struct {
     fn rootFilesystem(self: *const Profile) RootFilesystem {
         return self.root_storage.filesystem();
     }
+
+    /// The package manifest the guest realizes. Manifests are keyed by flavor
+    /// alone because upstream's minimal set already absorbs the architecture
+    /// differences, so a per-profile copy would only be a place to disagree.
+    fn packageManifest(self: *const Profile) *const packages.Manifest {
+        return packages.forFlavor(self.flavor);
+    }
 };
 
 const ufs_root_storage = RootStorage{
@@ -109,7 +118,10 @@ const zfs_root_storage = RootStorage{ .zfs = .{ .pool = "zroot" } };
 /// Every architecture x filesystem x flavor combination this builder can
 /// produce. Keeping the pinned source metadata, virtual size, and output
 /// naming in one table makes an unsupported combination a lookup failure
-/// rather than a half-applied set of defaults.
+/// rather than a half-applied set of defaults. The table is deliberately not
+/// a full cross product: a core ZFS image is not a supported combination, so
+/// asking for one is `UnsupportedProfile` and never a quietly substituted UFS
+/// build.
 const profiles = [_]Profile{
     .{
         .architecture = .aarch64,
@@ -154,6 +166,32 @@ const profiles = [_]Profile{
         .virtual_size = 6_477_840_384,
         .output = "FreeBSD-15.1-x86_64.zfs.qcow2",
         .work_dir = ".scratch/generalized-freebsd15-x86_64-zfs",
+    },
+    // The core profiles start from the same pinned UFS sources as the full
+    // ones. Nothing about the acquired image differs; what differs is the
+    // package manifest the guest realizes, so sharing the source digest here
+    // is the accurate statement rather than a copy waiting to drift.
+    .{
+        .architecture = .aarch64,
+        .flavor = .core,
+        .root_storage = ufs_root_storage,
+        .source_name = "FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz",
+        .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz",
+        .source_sha256 = "9722aea499610802de9a14bb645707fc4f6df49ff765cd9ce372b783c4693963",
+        .virtual_size = 6_477_643_776,
+        .output = "FreeBSD-15.1-aarch64.core.qcow2",
+        .work_dir = ".scratch/generalized-freebsd15-aarch64-core",
+    },
+    .{
+        .architecture = .x86_64,
+        .flavor = .core,
+        .root_storage = ufs_root_storage,
+        .source_name = "FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz",
+        .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz",
+        .source_sha256 = "e4ca4db889f8559c9b9dfcacc70405c038476f4b6d41649b152d3809a2ed9e1f",
+        .virtual_size = 6_477_709_312,
+        .output = "FreeBSD-15.1-x86_64.core.qcow2",
+        .work_dir = ".scratch/generalized-freebsd15-x86_64-core",
     },
 };
 
@@ -264,7 +302,7 @@ const help_text =
     \\
     \\  --architecture <arch>    Guest architecture: aarch64 (default) or x86_64
     \\  --filesystem <fs>        Root filesystem: ufs (default) or zfs
-    \\  --flavor <flavor>        Image flavor: full (default)
+    \\  --flavor <flavor>        Image flavor: full (default) or core
     \\  --source <path>          Local .qcow2.xz source (official image if omitted)
     \\  --source-sha256 <hex>    Expected compressed source SHA-256
     \\  --output <path>          Output QCOW2
@@ -532,6 +570,7 @@ const customization_user_data_template =
     \\      set_agent_config Logs.Console n
     \\
     \\@ROOT_STORAGE@
+    \\@PACKAGE_MANIFEST@
     \\      if pw usershow freebsd >/dev/null 2>&1; then
     \\          pw userdel freebsd -r
     \\      fi
@@ -540,6 +579,7 @@ const customization_user_data_template =
     \\      pkg clean -ay
     \\      rm -rf /var/cache/pkg/*
     \\      rm -f /var/db/pkg/repo-*.sqlite
+    \\@FREE_SPACE_RECLAMATION@
     \\
     \\      cat > /etc/rc.d/zvmi_generalize <<'ZVMI_SHUTDOWN'
     \\      #!/bin/sh
@@ -649,6 +689,57 @@ const zfs_root_storage_script =
     \\      done
 ;
 
+/// Swap handling shared by both root filesystems. Swap is already disabled and
+/// unreferenced by /etc/fstab at this point, but the partition still holds
+/// whatever the build paged through it, and every non-zero cluster in it is
+/// download size. Zeroing is deliberate rather than deleting the partition:
+/// see doc/freebsd.md for why removing it cannot shrink the disk.
+const swap_reclamation_script =
+    \\      swap_parts=$(gpart show -p |
+    \\          awk '$4 == "freebsd-swap" { print $3 }')
+    \\      for part in ${swap_parts}; do
+    \\          part_bytes=$(diskinfo "/dev/${part}" | awk '{ print $3 }')
+    \\          test -n "${part_bytes}"
+    \\          # diskinfo reports bytes; dd counts 1 MiB blocks. Truncating
+    \\          # the division keeps dd from ever writing past the partition,
+    \\          # which matters because sector counts are not MiB multiples.
+    \\          dd if=/dev/zero of="/dev/${part}" bs=1m \
+    \\              count=$((part_bytes / 1048576))
+    \\      done
+    \\      sync
+;
+
+/// UFS free-space reclamation. UFS has no discard of its own, so the only way
+/// to tell the host a block is unused is to write zeroes over it and let
+/// detect-zeroes=unmap punch the hole.
+const ufs_reclamation_script =
+    \\      # Leave a margin so the fill cannot starve rc, syslog or the agent
+    \\      # of the last free blocks while they are still running.
+    \\      avail_kb=$(df -k / | awk 'NR == 2 { print $4 }')
+    \\      test -n "${avail_kb}"
+    \\      fill_mb=$(((avail_kb - 262144) / 1024))
+    \\      if [ "${fill_mb}" -gt 0 ]; then
+    \\          # ENOSPC here is success, not failure: the point is to reach
+    \\          # the end of the free space, however much of it there is.
+    \\          dd if=/dev/zero of=/zvmi-reclaim.tmp bs=1m \
+    \\              count="${fill_mb}" || true
+    \\      fi
+    \\      rm -f /zvmi-reclaim.tmp
+    \\      sync
+;
+
+/// ZFS free-space reclamation. Zero-filling a compressing pool reclaims
+/// nothing - the fill compresses away and the already-freed blocks are never
+/// handed back - so the pool's own TRIM is the only correct mechanism.
+const zfs_reclamation_script =
+    \\      reclaim_dataset=$(mount -p | awk '$2 == "/" { print $1 }')
+    \\      reclaim_pool=${reclaim_dataset%%/*}
+    \\      test -n "${reclaim_pool}"
+    \\      zpool trim "${reclaim_pool}"
+    \\      zpool wait -t trim "${reclaim_pool}"
+    \\      sync
+;
+
 const Substitution = struct {
     token: []const u8,
     value: []const u8,
@@ -706,18 +797,53 @@ fn rootStorageScriptAlloc(
     };
 }
 
-fn customizationUserDataAlloc(
+/// Render the free-space reclamation half of the generalization script. The
+/// swap prologue is shared; the filesystem arms are not, because a UFS zero
+/// fill on ZFS would be useless and a TRIM on UFS is unavailable.
+fn freeSpaceReclamationScriptAlloc(
     allocator: Allocator,
     storage: RootStorage,
+) ![]u8 {
+    const filesystem_arm = switch (storage) {
+        .ufs => ufs_reclamation_script,
+        .zfs => zfs_reclamation_script,
+    };
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}\n{s}",
+        .{ swap_reclamation_script, filesystem_arm },
+    );
+}
+
+fn customizationUserDataAlloc(
+    allocator: Allocator,
+    profile: Profile,
     nonce: []const u8,
 ) ![]u8 {
+    const storage = profile.root_storage;
     const root_storage = try rootStorageScriptAlloc(allocator, storage);
     defer allocator.free(root_storage);
+    const package_manifest = try packages.guestScriptAlloc(
+        allocator,
+        profile.packageManifest(),
+        nonce,
+    );
+    defer allocator.free(package_manifest);
+    const reclamation = try freeSpaceReclamationScriptAlloc(
+        allocator,
+        storage,
+    );
+    defer allocator.free(reclamation);
     return renderTemplateAlloc(
         allocator,
         customization_user_data_template,
         &.{
             .{ .token = "@ROOT_STORAGE@", .value = root_storage },
+            .{ .token = "@PACKAGE_MANIFEST@", .value = package_manifest },
+            .{
+                .token = "@FREE_SPACE_RECLAMATION@",
+                .value = reclamation,
+            },
             .{ .token = "@NONCE@", .value = nonce },
         },
     );
@@ -842,7 +968,7 @@ fn createSeedIso(
     io: Io,
     temporary_path: []const u8,
     xorriso_path: []const u8,
-    storage: RootStorage,
+    profile: Profile,
     nonce: []const u8,
 ) ![]u8 {
     const seed_dir = try std.fs.path.join(allocator, &.{ temporary_path, "seed" });
@@ -863,7 +989,7 @@ fn createSeedIso(
     defer allocator.free(metadata);
     const user_data = try customizationUserDataAlloc(
         allocator,
-        storage,
+        profile,
         nonce,
     );
     defer allocator.free(user_data);
@@ -935,6 +1061,122 @@ fn readSerialResult(
     if (std.mem.indexOf(u8, bytes, success_marker) != null) return .success;
     if (std.mem.indexOf(u8, bytes, result_marker) != null) return .failure;
     return .none;
+}
+
+/// The package manifest an image actually shipped, parsed out of the guest's
+/// serial output. The guest writes the same lines to `/dev/console` and
+/// `/dev/ttyu0`, which are the same serial port on some machines and not on
+/// others, so duplicates are expected and collapsed by name here rather than
+/// being papered over with a "first one wins" read of the log.
+const RecordedManifest = struct {
+    packages: []packages.InstalledPackage,
+    text: []u8,
+
+    fn installedBytes(self: RecordedManifest) u64 {
+        var total: u64 = 0;
+        for (self.packages) |entry| total += entry.installed_bytes;
+        return total;
+    }
+
+    fn deinit(self: RecordedManifest, allocator: Allocator) void {
+        allocator.free(self.packages);
+        allocator.free(self.text);
+    }
+};
+
+fn parseRecordedManifest(
+    allocator: Allocator,
+    log: []const u8,
+    nonce: []const u8,
+) !RecordedManifest {
+    const marker = try std.fmt.allocPrint(
+        allocator,
+        "{s} {s} ",
+        .{ packages.record_prefix, nonce },
+    );
+    defer allocator.free(marker);
+
+    var found: std.ArrayList(packages.InstalledPackage) = .empty;
+    errdefer found.deinit(allocator);
+    // The record text is owned separately from the log buffer so the caller
+    // can keep it after the log is gone.
+    var text: std.Io.Writer.Allocating = .init(allocator);
+    errdefer text.deinit();
+
+    var lines = std.mem.splitScalar(u8, log, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, marker)) continue;
+        var fields = std.mem.tokenizeScalar(u8, line[marker.len..], ' ');
+        const name = fields.next() orelse return error.MalformedPackageRecord;
+        const version = fields.next() orelse return error.MalformedPackageRecord;
+        const size_text = fields.next() orelse return error.MalformedPackageRecord;
+        if (fields.next() != null) return error.MalformedPackageRecord;
+        const installed_bytes = std.fmt.parseInt(u64, size_text, 10) catch {
+            return error.MalformedPackageRecord;
+        };
+        for (found.items) |existing| {
+            if (std.mem.eql(u8, existing.name, name)) {
+                // The same package recorded with two different versions means
+                // the log interleaved two runs, which would make the recorded
+                // manifest a fiction.
+                if (!std.mem.eql(u8, existing.version, version)) {
+                    return error.ConflictingPackageRecord;
+                }
+                break;
+            }
+        } else {
+            if (found.items.len >= recorded_package_max_count) {
+                return error.TooManyPackageRecords;
+            }
+            try text.writer.print(
+                "{s} {s} {d}\n",
+                .{ name, version, installed_bytes },
+            );
+            try found.append(allocator, .{
+                .name = name,
+                .version = version,
+                .installed_bytes = installed_bytes,
+            });
+        }
+    }
+    if (found.items.len == 0) return error.PackageManifestNotRecorded;
+
+    // The names and versions still borrow the caller's log buffer, so
+    // re-point them into text that this struct owns before publishing it.
+    const owned_text = try text.toOwnedSlice();
+    errdefer allocator.free(owned_text);
+    const owned_packages = try found.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_packages);
+    var offset: usize = 0;
+    for (owned_packages) |*entry| {
+        const end = std.mem.indexOfScalarPos(u8, owned_text, offset, '\n').?;
+        var fields = std.mem.tokenizeScalar(u8, owned_text[offset..end], ' ');
+        entry.name = fields.next().?;
+        entry.version = fields.next().?;
+        offset = end + 1;
+    }
+    return .{ .packages = owned_packages, .text = owned_text };
+}
+
+fn readRecordedManifest(
+    allocator: Allocator,
+    io: Io,
+    serial_path: []const u8,
+    nonce: []const u8,
+) !RecordedManifest {
+    const file = try Dir.cwd().openFile(io, serial_path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size > serial_log_max_size) return error.SerialLogTooLarge;
+    const log = try allocator.alloc(u8, @intCast(stat.size));
+    defer allocator.free(log);
+    const read = try file.readPositionalAll(io, log, 0);
+    return parseRecordedManifest(allocator, log[0..read], nonce);
 }
 
 fn printSerialTail(io: Io, path: []const u8) void {
@@ -1041,7 +1283,12 @@ fn runGuestCustomization(
             "-drive",
             vars_drive,
             "-drive",
-            "file=/proc/self/fd/0,format=qcow2,if=virtio",
+            // discard=unmap lets the guest's free-space reclamation actually
+            // shrink the QCOW2, and detect-zeroes=unmap turns the UFS zero
+            // fill into hole punching instead of gigabytes of written
+            // clusters that would blow the finalized size budget.
+            "file=/proc/self/fd/0,format=qcow2,if=virtio," ++
+                "discard=unmap,detect-zeroes=unmap",
             "-drive",
             "file=/proc/self/fd/1,format=raw,if=virtio,readonly=on",
             "-netdev",
@@ -1307,7 +1554,7 @@ pub fn main(init: std.process.Init) !void {
             io,
             temporary.path,
             args.xorriso_path,
-            profile.root_storage,
+            profile.*,
             &nonce_hex,
         );
         defer allocator.free(seed_iso_path);
@@ -1338,6 +1585,43 @@ pub fn main(init: std.process.Init) !void {
             printSerialTail(io, serial_path);
             return err;
         };
+
+        // The guest checked its own manifest, but the guest is what was
+        // pruned. Re-verifying on the host means a guest whose checks
+        // silently did nothing still cannot produce a publishable artifact.
+        const recorded = try readRecordedManifest(
+            allocator,
+            io,
+            serial_path,
+            &nonce_hex,
+        );
+        defer recorded.deinit(allocator);
+        var diagnostic: packages.Diagnostic = .{};
+        packages.verifyRecordedManifest(
+            profile.packageManifest(),
+            recorded.packages,
+            &diagnostic,
+        ) catch |err| {
+            std.debug.print(
+                "error: recorded package manifest rejected: {s} ({s})\n",
+                .{ @errorName(err), diagnostic.package },
+            );
+            return err;
+        };
+        const manifest_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}.packages.txt",
+            .{args.output},
+        );
+        defer allocator.free(manifest_path);
+        try Dir.cwd().writeFile(io, .{
+            .sub_path = manifest_path,
+            .data = recorded.text,
+        });
+        std.debug.print(
+            "Recorded {d} packages ({d} installed bytes) in {s}\n",
+            .{ recorded.packages.len, recorded.installedBytes(), manifest_path },
+        );
 
         const customized = try artifact_pipeline.hashFile(io, mutable_path);
         std.debug.print("Finalizing generalized standalone zstd QCOW2...\n", .{});
@@ -1477,24 +1761,37 @@ test "FreeBSD builder selects pinned ZFS defaults per architecture" {
     );
 }
 
+/// The filesystem/flavor combinations the project supports, spelled out so
+/// that gaining or losing one is a deliberate edit rather than a side effect
+/// of the profile table. A core ZFS image is not supported: ZFS already
+/// compresses the bulk of what the core manifest removes, and a second
+/// unpublished variant would double the acceptance matrix for no download
+/// size win.
+const supported_variants = [_]struct {
+    root_filesystem: RootFilesystem,
+    flavor: Flavor,
+}{
+    .{ .root_filesystem = .ufs, .flavor = .full },
+    .{ .root_filesystem = .zfs, .flavor = .full },
+    .{ .root_filesystem = .ufs, .flavor = .core },
+};
+
 test "FreeBSD profile table is complete, unique, and pinned" {
     var seen: usize = 0;
     for (std.enums.values(Architecture)) |architecture| {
-        for (std.enums.values(RootFilesystem)) |root_filesystem| {
-            for (std.enums.values(Flavor)) |flavor| {
-                const profile = findProfile(
-                    architecture,
-                    root_filesystem,
-                    flavor,
-                ) orelse return error.MissingProfile;
-                try std.testing.expectEqual(architecture, profile.architecture);
-                try std.testing.expectEqual(
-                    root_filesystem,
-                    profile.rootFilesystem(),
-                );
-                try std.testing.expectEqual(flavor, profile.flavor);
-                seen += 1;
-            }
+        for (supported_variants) |variant| {
+            const profile = findProfile(
+                architecture,
+                variant.root_filesystem,
+                variant.flavor,
+            ) orelse return error.MissingProfile;
+            try std.testing.expectEqual(architecture, profile.architecture);
+            try std.testing.expectEqual(
+                variant.root_filesystem,
+                profile.rootFilesystem(),
+            );
+            try std.testing.expectEqual(variant.flavor, profile.flavor);
+            seen += 1;
         }
     }
     try std.testing.expectEqual(profiles.len, seen);
@@ -1550,13 +1847,50 @@ test "FreeBSD profile table is complete, unique, and pinned" {
                 profile.work_dir,
                 other.work_dir,
             ));
-            try std.testing.expect(!std.mem.eql(
+            // Flavors differ only in what the guest realizes, so two
+            // profiles sharing an architecture and filesystem must pin the
+            // same upstream image; anything else means one of them drifted.
+            // Across different architecture/filesystem pairs the sources
+            // must differ, or a build would generalize the wrong image.
+            const same_source = profile.architecture == other.architecture and
+                profile.rootFilesystem() == other.rootFilesystem();
+            try std.testing.expectEqual(same_source, std.mem.eql(
                 u8,
                 profile.source_sha256,
                 other.source_sha256,
             ));
+            try std.testing.expectEqual(same_source, std.mem.eql(
+                u8,
+                profile.source_url,
+                other.source_url,
+            ));
         }
     }
+}
+
+test "unsupported FreeBSD variants fail instead of falling back" {
+    for (std.enums.values(Architecture)) |architecture| {
+        try std.testing.expect(
+            findProfile(architecture, .zfs, .core) == null,
+        );
+    }
+    try std.testing.expectError(
+        error.UnsupportedProfile,
+        parseArgs(&.{ "--filesystem", "zfs", "--flavor", "core" }),
+    );
+}
+
+test "each FreeBSD flavor selects its own package manifest" {
+    for (&profiles) |*profile| {
+        const manifest = profile.packageManifest();
+        try std.testing.expectEqual(profile.flavor, manifest.flavor);
+        // The pinned upstream images are 15.1 release images, so a manifest
+        // written against another release would install mismatched base
+        // packages on the very first `pkg upgrade`.
+        try std.testing.expectEqualStrings("15.1", manifest.release);
+    }
+    try std.testing.expect(packages.core_manifest.prunes);
+    try std.testing.expect(!packages.full_manifest.prunes);
 }
 
 test "FreeBSD builder parses explicit source and tool paths" {
@@ -1630,7 +1964,7 @@ test "FreeBSD builder rejects malformed arguments" {
     );
     try std.testing.expectError(
         error.InvalidFlavor,
-        parseArgs(&.{ "--flavor", "core" }),
+        parseArgs(&.{ "--flavor", "minimal" }),
     );
     try std.testing.expectError(
         error.MissingValue,
@@ -1726,7 +2060,7 @@ test "every FreeBSD profile seed honors the generalized guest contract" {
     for (&profiles) |*profile| {
         const user_data = try customizationUserDataAlloc(
             allocator,
-            profile.root_storage,
+            profile.*,
             nonce,
         );
         defer allocator.free(user_data);
@@ -1813,18 +2147,44 @@ test "FreeBSD root storage handling never crosses filesystems" {
     }
 }
 
+/// Assert that every non-empty line between two markers keeps the six-space
+/// indentation the cloud-config `content: |` block requires. A substituted
+/// fragment that loses it silently truncates the script YAML instead of
+/// failing loudly, so each substitution site gets checked this way.
+fn expectIndentedBlock(
+    text: []const u8,
+    after: []const u8,
+    before: []const u8,
+) !void {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var inside = false;
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, line, after)) {
+            inside = true;
+            continue;
+        }
+        if (!inside) continue;
+        if (std.mem.startsWith(u8, line, before)) return;
+        if (line.len == 0) continue;
+        try std.testing.expect(std.mem.startsWith(u8, line, "      "));
+    }
+    return error.IndentedBlockNotTerminated;
+}
+
 test "FreeBSD seed embeds only the selected profile's root storage" {
     const allocator = std.testing.allocator;
     const nonce = "fedcba9876543210";
+    const ufs_profile = findProfile(.aarch64, .ufs, .full).?;
+    const zfs_profile = findProfile(.aarch64, .zfs, .full).?;
     const ufs_seed = try customizationUserDataAlloc(
         allocator,
-        ufs_root_storage,
+        ufs_profile.*,
         nonce,
     );
     defer allocator.free(ufs_seed);
     const zfs_seed = try customizationUserDataAlloc(
         allocator,
-        zfs_root_storage,
+        zfs_profile.*,
         nonce,
     );
     defer allocator.free(zfs_seed);
@@ -1836,21 +2196,32 @@ test "FreeBSD seed embeds only the selected profile's root storage" {
         zfs_seed,
         "[[:space:]]+ufs[[:space:]]",
     ) == null);
+    // The UFS arm zero-fills because UFS cannot discard; the ZFS arm must
+    // not, because a fill on a compressing pool reclaims nothing.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        ufs_seed,
+        "/zvmi-reclaim.tmp",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        zfs_seed,
+        "/zvmi-reclaim.tmp",
+    ) == null);
+    try std.testing.expect(std.mem.indexOf(u8, zfs_seed, "zpool trim") != null);
 
-    // The substituted block must stay inside the cloud-config script literal,
-    // so every rendered line keeps the six-space `content: |` indentation.
-    var lines = std.mem.splitScalar(u8, zfs_seed, '\n');
-    var inside = false;
-    while (lines.next()) |line| {
-        if (std.mem.eql(u8, line, "      set_agent_config Logs.Console n")) {
-            inside = true;
-            continue;
-        }
-        if (!inside) continue;
-        if (std.mem.startsWith(u8, line, "      if pw usershow freebsd")) break;
-        if (line.len == 0) continue;
-        try std.testing.expect(std.mem.startsWith(u8, line, "      "));
-    } else return error.RootStorageBlockNotTerminated;
+    for ([_][]const u8{ ufs_seed, zfs_seed }) |seed| {
+        try expectIndentedBlock(
+            seed,
+            "      set_agent_config Logs.Console n",
+            "      if pw usershow freebsd",
+        );
+        try expectIndentedBlock(
+            seed,
+            "      rm -f /var/db/pkg/repo-*.sqlite",
+            "      cat > /etc/rc.d/zvmi_generalize",
+        );
+    }
 }
 
 test "QEMU drive values escape commas" {
@@ -1893,5 +2264,73 @@ test "serial result requires the nonce and successful status" {
     try std.testing.expectEqual(
         SerialResult.success,
         try readSerialResult(io, path, success, result),
+    );
+}
+
+test "recorded package manifests are parsed, deduplicated, and owned" {
+    const allocator = std.testing.allocator;
+    const nonce = "0011223344556677";
+    const log =
+        "random boot chatter\n" ++
+        packages.record_prefix ++ " " ++ nonce ++ " FreeBSD-runtime 15.1 1024\n" ++
+        packages.record_prefix ++ " other-nonce FreeBSD-clang 15.1 8\r\n" ++
+        packages.record_prefix ++ " " ++ nonce ++ " pkg 2.4.0 512\r\n" ++
+        // The guest writes to both /dev/console and /dev/ttyu0, which may be
+        // the same device, so exact duplicates must collapse rather than
+        // double the reported size.
+        packages.record_prefix ++ " " ++ nonce ++ " FreeBSD-runtime 15.1 1024\n";
+    const recorded = try parseRecordedManifest(allocator, log, nonce);
+    defer recorded.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), recorded.packages.len);
+    try std.testing.expectEqualStrings("FreeBSD-runtime", recorded.packages[0].name);
+    try std.testing.expectEqualStrings("15.1", recorded.packages[0].version);
+    try std.testing.expectEqual(@as(u64, 1024), recorded.packages[0].installed_bytes);
+    try std.testing.expectEqualStrings("pkg", recorded.packages[1].name);
+    try std.testing.expectEqual(@as(u64, 1536), recorded.installedBytes());
+    // A record carrying another run's nonce must not enter the manifest.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        recorded.text,
+        "FreeBSD-clang",
+    ) == null);
+    // Every name must point into the manifest's own text, not the log.
+    for (recorded.packages) |entry| {
+        const inside = @intFromPtr(entry.name.ptr) >=
+            @intFromPtr(recorded.text.ptr) and
+            @intFromPtr(entry.name.ptr) <
+                @intFromPtr(recorded.text.ptr) + recorded.text.len;
+        try std.testing.expect(inside);
+    }
+}
+
+test "malformed package records fail instead of shrinking the manifest" {
+    const allocator = std.testing.allocator;
+    const nonce = "aabbccdd";
+    const prefix = packages.record_prefix ++ " " ++ nonce ++ " ";
+    try std.testing.expectError(
+        error.PackageManifestNotRecorded,
+        parseRecordedManifest(allocator, "nothing here\n", nonce),
+    );
+    try std.testing.expectError(
+        error.MalformedPackageRecord,
+        parseRecordedManifest(allocator, prefix ++ "FreeBSD-runtime 15.1\n", nonce),
+    );
+    try std.testing.expectError(
+        error.MalformedPackageRecord,
+        parseRecordedManifest(allocator, prefix ++ "a 1 x\n", nonce),
+    );
+    try std.testing.expectError(
+        error.MalformedPackageRecord,
+        parseRecordedManifest(allocator, prefix ++ "a 1 2 3\n", nonce),
+    );
+    // Two runs interleaved in one log would make the manifest a fiction.
+    try std.testing.expectError(
+        error.ConflictingPackageRecord,
+        parseRecordedManifest(
+            allocator,
+            prefix ++ "a 1 2\n" ++ prefix ++ "a 2 2\n",
+            nonce,
+        ),
     );
 }
