@@ -6112,11 +6112,17 @@ fn allocateExtentTreeBlocks(
 ) PopulateError!void {
     const shape = try extentTreeShape(node.extents.len, block_size);
     if (shape.block_count > 0) {
-        node.extent_tree_blocks = try allocator.alloc(ExtentTreeBlock, shape.block_count);
-        errdefer allocator.free(node.extent_tree_blocks);
-        for (node.extent_tree_blocks) |*block| {
+        // Published to the node only once every block number in it has been
+        // filled in. Failing part-way through must not leave the node
+        // holding a slice this function has already freed: whoever owns the
+        // node frees it again on the way out, and a double free of a
+        // half-built plan is a crash a long way from its cause.
+        const blocks = try allocator.alloc(ExtentTreeBlock, shape.block_count);
+        errdefer allocator.free(blocks);
+        for (blocks) |*block| {
             block.* = .{ .block_number = try block_allocator.allocateSingle() };
         }
+        node.extent_tree_blocks = blocks;
     } else {
         node.extent_tree_blocks = &.{};
     }
