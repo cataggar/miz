@@ -701,14 +701,19 @@ fragmentation survives.
 ### What it selects, and how
 
 The root filesystem is `--source-root` if given. Otherwise every partition of
-`--source` is probed and the one holding an ext4 filesystem is the root --
-provided exactly one does, which is the ordinary single-root install. That is
-read off the disk rather than guessed at. Two candidates is
-`AmbiguousSourceRoot` and none is `SourceRootRequired`; both name the flag
-that settles it, because "the biggest Linux partition" would be right often
-enough to be trusted and wrong often enough to matter. A root inside LVM is
-never auto-detected, since the partition holding it is a physical volume
-rather than a filesystem.
+`--source` is probed and the one holding an ext4 filesystem **with an `/etc`**
+is the root -- provided exactly one does, which is the ordinary single-root
+install. Both halves of that are read off the disk rather than guessed at, and
+the `/etc` half matters: a separate `/boot` is ext4 on plenty of machines
+whose root is xfs or btrfs, and capturing it would produce a perfectly valid
+image of the wrong filesystem.
+
+Two candidates is `AmbiguousSourceRoot`, an ext4 with no `/etc` is
+`NoRootLikeFilesystem`, and no ext4 at all is `SourceRootRequired`. All three
+name the flag that settles it, because "the biggest Linux partition" would be
+right often enough to be trusted and wrong often enough to matter. A root
+inside LVM is never auto-detected, since the partition holding it is a
+physical volume rather than a filesystem.
 
 A spec is a path (`/dev/sda2`, `root.img`), a partition of `--source`
 (`gpt:2`, one-based), or a logical volume (`lvm:<vg>/<lv>`).
@@ -717,6 +722,12 @@ The EFI system partition is found by GPT type GUID, which is definitional
 rather than a heuristic, and can be named explicitly with `--source-esp`. It
 is **copied**, not regenerated: a signed EFI binary that is re-emitted is a
 Secure Boot failure, so capture reproduces the bytes it was given.
+
+Naming the root as a partition of `--source` (`gpt:<n>`) rather than by path
+also lets the capture retire the source's PARTUUID and PARTLABEL. A root
+opened by path is just a filesystem; which partition it came from is not
+knowable from it, so a `PARTUUID=`-rooted fstab cannot be corrected. That is
+warned about rather than discovered at boot.
 
 `--source-mount <spec>=<path>` names a filesystem mounted elsewhere in the
 running system — most often a separate `/boot`. Its content is merged into the
@@ -770,9 +781,10 @@ mounted read-write. Reading a block device generally requires root, and
 `EACCES` on `--source` says so rather than leaving the operator to infer it.
 
 Nothing is written to the source, and a failed capture leaves no partial
-image: `-O raw` to a path is created exclusively and removed if the assembly
-fails, and every other format is assembled into a staging file beside the
-destination and converted only once it is complete.
+image. Output to a file is created exclusively, so a capture never overwrites
+something it was not asked to and never removes a file it did not create;
+non-raw formats are assembled into a staging file beside the destination and
+converted only once that is complete.
 
 `-O` accepts the same formats as `convert`, including `raw.gz` and `-o -` for
 a stream. `-O vhd` is written *fixed*, as `build-image` writes it, because the

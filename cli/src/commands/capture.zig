@@ -154,7 +154,8 @@ pub fn describeCaptureFailure(err: anyerror) ?[]const u8 {
         error.RootSizeBelowMinimum => "--root-size is smaller than the captured content needs",
         error.EspSizeBelowMinimum => "--esp-size is smaller than the captured EFI system partition needs; note that FAT32 cannot go below about 33.5M whatever it holds",
         error.SourceRootRequired => "no partition of --source holds an ext4 filesystem, so name the root explicitly with --source-root (e.g. --source-root gpt:2, or --source-root lvm:<vg>/<lv> for a root inside LVM)",
-        error.AmbiguousSourceRoot => "--source holds more than one ext4 filesystem, so which one is the root has to be said with --source-root (e.g. --source-root gpt:2). The others can be merged in with --source-mount <spec>=<path>",
+        error.AmbiguousSourceRoot => "--source holds more than one ext4 filesystem with an /etc, so which one is the root has to be said with --source-root (e.g. --source-root gpt:2). The others can be merged in with --source-mount <spec>=<path>",
+        error.NoRootLikeFilesystem => "--source holds an ext4 filesystem, but none with an /etc, so none of them looks like a root -- a separate /boot on a machine whose root is xfs or btrfs looks exactly like this. Name the root with --source-root, and merge the rest in with --source-mount <spec>=<path>",
         error.SourceHasNoPartitionTable => "a gpt:<n> spec needs --source to be a disk with a GPT; name a device or image directly instead",
         error.PartitionNotFound => "--source has no partition with that number; the numbering matches lsblk and parted, from one",
         error.InvalidGptIndex => "a partition spec is gpt:<n>, numbered from one as lsblk and parted number them",
@@ -399,10 +400,18 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
 
     var diagnostic = zvmi.limits.Diagnostic{};
 
-    var root_reader = zvmi.ext4.openGeneral(io, root_source.image.file, gpa, .{
-        .offset = root_source.offset,
-    }) catch |err| return failWithHint("capture: the root source is not an ext4 filesystem", err);
+    var root_reader = openSourceExt4(gpa, io, root_source) catch |err|
+        return failWithHint("capture: the root source is not an ext4 filesystem", err);
     defer root_reader.deinit();
+
+    // A root named by path rather than as a partition of --source carries no
+    // PARTUUID this can retire, so a `PARTUUID=`-rooted fstab would come
+    // through naming a disk that no longer exists -- and, since nothing was
+    // retired, the verification pass would have nothing to match and would
+    // report a clean rewrite. Silence is the failure mode worth avoiding.
+    if (request.rewrite_identities and root_source.partition == null) {
+        warnUnretirablePartitionReference(gpa, io, root_reader);
+    }
 
     var root_scan = zvmi.ext4.scanReadable(&root_reader, io, gpa, scanOptions(request.limits, root_source.length, &diagnostic)) catch |err|
         return failLimits("capture: reading the root filesystem failed", err, &diagnostic);
@@ -449,7 +458,7 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
         const opened = resolveSpec(gpa, io, &disk, table, mount.source, &scratch) catch |err|
             return failWithHint("capture: cannot read a --source-mount filesystem", err);
 
-        var reader = zvmi.ext4.openGeneral(io, opened.image.file, gpa, .{ .offset = opened.offset }) catch |err|
+        var reader = openSourceExt4(gpa, io, opened) catch |err|
             return failWithHint("capture: a --source-mount filesystem is not ext4", err);
         defer reader.deinit();
 
@@ -592,12 +601,8 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
     defer staged.close(io);
 
     if (converts_container) {
-        convertStaged(gpa, io, staged, request, report.virtual_size) catch |err| {
-            // A half-written container is worse than none: it opens, reports a
-            // plausible size, and fails somewhere the operator will not look.
-            std.Io.Dir.cwd().deleteFile(io, request.destination.path) catch {};
+        convertStaged(gpa, io, staged, request, report.virtual_size) catch |err|
             return fail("capture: writing {s} output failed: {s}", .{ request.spec.displayName(), @errorName(err) });
-        };
         return 0;
     }
 
@@ -626,9 +631,41 @@ fn convertStaged(
     // all is almost always an Azure managed-disk upload, which refuses
     // dynamic.
     if (request.spec.format == .vhd) options.vhd_subformat = .fixed;
-    var destination = try zvmi.Image.create(io, request.destination.path, request.spec.format, virtual_size, options);
+
+    // Exclusively, as the raw path already creates its output, so that a
+    // capture cannot overwrite a file it was not asked to. It also makes the
+    // cleanup below safe: what fails to be created is never deleted, so a
+    // pre-existing destination -- or a device node `Image.create` refused --
+    // survives the failure that named it.
+    var destination = try zvmi.Image.createExclusive(io, request.destination.path, request.spec.format, virtual_size, options);
+    // A half-written container is worse than none: it opens, reports a
+    // plausible size, and fails somewhere the operator will not look.
+    errdefer std.Io.Dir.cwd().deleteFile(io, request.destination.path) catch {};
     defer destination.close(io);
     try zvmi.copyAll(io, staged, &destination, gpa);
+}
+
+/// Reads through the image's guest-visible address space rather than the host
+/// file. A qcow2 or VHDX source maps guest offsets to entirely different file
+/// offsets, so an ext4 opened against the raw file would read the wrong bytes
+/// -- or, for a sparse container smaller than the offset, none at all.
+fn imageReadAt(ctx: *const anyopaque, io: std.Io, buffer: []u8, offset: u64) anyerror!usize {
+    const image: *const zvmi.Image = @ptrCast(@alignCast(ctx));
+    return image.pread(io, buffer, offset);
+}
+
+fn openSourceExt4(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    opened: OpenedSource,
+) zvmi.ext4.GeneralOpenError!zvmi.ext4.Reader {
+    return zvmi.ext4.openGeneralReadOnlySource(
+        io,
+        opened.image.file,
+        .{ .ctx = opened.image, .read_at_fn = imageReadAt },
+        gpa,
+        .{ .offset = opened.offset },
+    );
 }
 
 fn scanOptions(
@@ -671,23 +708,46 @@ fn resolveRoot(
         return .{ .image = disk, .offset = 0, .length = disk.virtual_size };
 
     var found: ?OpenedSource = null;
+    var saw_ext4 = false;
     for (parsed.partitions) |entry| {
         if (entry.isEmpty()) continue;
         // An ESP is FAT and would never probe as ext4, but skipping it by
         // type keeps the candidate set to partitions that could be a root.
         if (std.mem.eql(u8, &entry.partition_type_guid, &zvmi.guid.esp)) continue;
-        const offset = entry.first_lba * zvmi.gpt.sector_size;
-        var probe = zvmi.ext4.openGeneral(io, disk.file, gpa, .{ .offset = offset }) catch continue;
-        probe.deinit();
-        if (found != null) return error.AmbiguousSourceRoot;
-        found = .{
+        const candidate = OpenedSource{
             .image = disk,
-            .offset = offset,
+            .offset = entry.first_lba * zvmi.gpt.sector_size,
             .length = (entry.last_lba - entry.first_lba + 1) * zvmi.gpt.sector_size,
             .partition = entry,
         };
+        var probe = openSourceExt4(gpa, io, candidate) catch |err| switch (err) {
+            // Not an ext4 filesystem, or not one this can read: both mean
+            // "not a candidate". Anything else -- an unreadable disk, an
+            // exhausted allocator -- is a real failure, and reporting it as
+            // "no partition holds an ext4 filesystem" would be a false
+            // statement about the disk rather than a diagnosis.
+            error.BadMagic,
+            error.UnsupportedFilesystemFeature,
+            error.UnsupportedBlockSize,
+            error.UnexpectedEndOfFile,
+            => continue,
+            else => return err,
+        };
+        defer probe.deinit();
+        saw_ext4 = true;
+
+        // Holding an ext4 filesystem is not being the root. A separate /boot
+        // is ext4 on plenty of systems whose root is xfs or btrfs, and
+        // capturing it would produce a plausible image of the wrong thing.
+        // Every root has /etc; no /boot, /var or /home does.
+        const etc = probe.statPath(io, "/etc") catch continue;
+        if (etc.kind != .directory) continue;
+
+        if (found != null) return error.AmbiguousSourceRoot;
+        found = candidate;
     }
-    return found orelse error.SourceRootRequired;
+    if (found) |value| return value;
+    return if (saw_ext4) error.NoRootLikeFilesystem else error.SourceRootRequired;
 }
 
 fn resolveSpec(
@@ -775,6 +835,24 @@ fn ownedLabel(
     return copy;
 }
 
+/// Warns when the captured fstab names the source by an identifier this
+/// capture cannot replace. Best effort by design: an unreadable or absent
+/// fstab is not itself a problem, and this only ever adds a warning.
+fn warnUnretirablePartitionReference(gpa: std.mem.Allocator, io: std.Io, reader: zvmi.ext4.Reader) void {
+    const fstab = reader.readFileAlloc(io, gpa, "/etc/fstab") catch return;
+    defer gpa.free(fstab);
+    const kind: []const u8 = if (std.mem.indexOf(u8, fstab, "PARTUUID=") != null)
+        "PARTUUID"
+    else if (std.mem.indexOf(u8, fstab, "PARTLABEL=") != null)
+        "PARTLABEL"
+    else
+        return;
+    std.debug.print(
+        "capture: warning: /etc/fstab names the root by {s}, but the root was named by path, so this capture does not know which partition it came from and cannot replace that reference. The image will not boot. Name the root as a partition of --source instead (--source <disk> --source-root gpt:<n>)\n",
+        .{kind},
+    );
+}
+
 /// The source partition's GUID and name, as `PARTUUID=` and `PARTLABEL=`
 /// spell them. Null when the filesystem was named directly rather than
 /// through `--source`'s partition table, because then there is no partition
@@ -788,10 +866,14 @@ fn ownedPartition(
     const value = entry orelse return;
 
     const buffer = try gpa.alloc(u8, 36);
-    errdefer gpa.free(buffer);
-    const text = zvmi.guid.formatLower(buffer[0..36], value.unique_partition_guid);
-    try storage.append(buffer);
-    before.partition_uuid = text;
+    {
+        errdefer gpa.free(buffer);
+        try storage.append(buffer);
+    }
+    // `buffer` belongs to `storage` from here on, so no errdefer may free it:
+    // the label allocation below can still fail, and freeing it here would
+    // leave a dangling entry for the caller's cleanup to free again.
+    before.partition_uuid = zvmi.guid.formatLower(buffer[0..36], value.unique_partition_guid);
 
     var name: [36]u8 = undefined;
     var length: usize = 0;
@@ -1015,7 +1097,7 @@ test "the failures an operator is most likely to hit explain themselves" {
 
     // Both outcomes of root auto-detection have to name the flag that
     // settles them, because neither is actionable as a bare error name.
-    inline for (.{ error.SourceRootRequired, error.AmbiguousSourceRoot }) |err| {
+    inline for (.{ error.SourceRootRequired, error.AmbiguousSourceRoot, error.NoRootLikeFilesystem }) |err| {
         const message = describeCaptureFailure(err) orelse
             return error.TestExpectedExplanation;
         try std.testing.expect(std.mem.indexOf(u8, message, "--source-root") != null);
