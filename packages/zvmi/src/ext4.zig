@@ -8413,7 +8413,7 @@ test "Editor.flush keeps sparse-super backup superblocks and GDT copies in sync 
 /// opportunistic external-tool check is skipped gracefully instead of
 /// breaking builds/dev machines that lack it -- matching the pattern
 /// `tests/boot_smoke.zig` uses for qemu-system-x86_64.
-fn runE2fsck(allocator: std.mem.Allocator, path: []const u8) !?std.process.RunResult {
+pub fn runE2fsck(allocator: std.mem.Allocator, path: []const u8) !?std.process.RunResult {
     const candidates = [_][]const u8{ "e2fsck", "/sbin/e2fsck", "/usr/sbin/e2fsck" };
     for (candidates) |bin| {
         const result = std.process.run(allocator, std.testing.io, .{
@@ -8428,7 +8428,7 @@ fn runE2fsck(allocator: std.mem.Allocator, path: []const u8) !?std.process.RunRe
     return null;
 }
 
-fn expectE2fsckClean(path: []const u8) !void {
+pub fn expectE2fsckClean(path: []const u8) !void {
     const maybe_result = try runE2fsck(std.testing.allocator, path);
     const result = maybe_result orelse {
         std.debug.print("skipping e2fsck validation: e2fsck not found (tried PATH, /sbin, /usr/sbin)\n", .{});

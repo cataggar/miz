@@ -56,6 +56,7 @@ pub const authenticode = @import("authenticode.zig");
 pub const uki_certificate = @import("uki_certificate.zig");
 pub const block_device = @import("block_device.zig");
 pub const output = @import("output.zig");
+pub const disk_assembly = @import("disk_assembly.zig");
 const image_mod = @import("image.zig");
 const size_mod = @import("size.zig");
 
