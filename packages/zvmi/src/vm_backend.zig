@@ -10,6 +10,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const customize = @import("customize.zig");
 const free_space = @import("free_space.zig");
+const os_customization = @import("os_customization.zig");
 const preserved_image = @import("preserved_image.zig");
 const transaction_guard = @import("transaction_guard.zig");
 const vm_control = @import("vm_control.zig");
@@ -424,6 +425,7 @@ fn buildControl(
         .network = data.execution.vm.?.network,
         .devices = devices,
         .modules = members,
+        .kernel_modules = data.os.kernel_modules,
     });
 }
 
@@ -433,6 +435,7 @@ const ControlInput = struct {
     network: customize.VmNetworkPolicy,
     devices: Devices,
     modules: []const []const u8 = &.{},
+    kernel_modules: []const customize.KernelModule = &.{},
 };
 
 fn controlFromPolicy(
@@ -479,6 +482,17 @@ fn controlFromPolicy(
         };
     }
 
+    // Rendered on the host so the bytes a request produces do not depend on
+    // which backend carries it out; the guest only places them.
+    const rendered = try os_customization.renderKernelModules(
+        allocator,
+        input.kernel_modules,
+    );
+    const kernel_module_files = try allocator.alloc(vm_control.TargetFile, rendered.len);
+    for (rendered, kernel_module_files) |source, *target| {
+        target.* = .{ .path = source.path, .contents = source.contents };
+    }
+
     return .{
         .root_device = input.devices.root_device,
         .result_device = input.devices.result_device,
@@ -492,6 +506,7 @@ fn controlFromPolicy(
             .unchanged => .unchanged,
             .regenerate => |regenerate| .{ .regenerate = .{ .kernels = regenerate.kernels } },
         },
+        .kernel_module_files = kernel_module_files,
         .modules = input.modules,
     };
 }
@@ -1781,4 +1796,76 @@ test "digesting a stage is independent of how many reads it takes" {
     try writeFileBytes(io, path, bytes);
 
     try std.testing.expectEqual(digestOf(bytes), try streamDigest(io, path));
+}
+
+// `vm_control` deliberately imports nothing but `std`, so it cannot name the
+// `os_customization` constants it must agree with. This module is the one
+// place that imports both, which makes it the only place the two can be held
+// together. Without this, a renamed destination would leave the vm backend
+// writing somewhere the rebuild backend does not, and both would look right.
+test "the guest's accepted destinations are exactly what the host renders" {
+    const rendered = [_][]const u8{
+        os_customization.modules_load_path,
+        os_customization.modprobe_blacklist_path,
+        os_customization.modprobe_options_path,
+    };
+    try std.testing.expectEqual(
+        vm_control.kernel_module_config_paths.len,
+        rendered.len,
+    );
+    for (rendered, vm_control.kernel_module_config_paths) |host, guest| {
+        try std.testing.expectEqualStrings(host, guest);
+    }
+}
+
+test "rendered kernel-module configuration reaches the control document" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const modules = [_]customize.KernelModule{
+        .{ .name = "overlay", .load = true },
+        .{ .name = "floppy", .disabled = true },
+    };
+    const control = try controlFromPolicy(allocator, std.testing.io, .{
+        .packages = .{},
+        .initramfs = .unchanged,
+        .network = .offline,
+        .devices = .{
+            .root_device = "/dev/vda2",
+            .result_device = "/dev/vdb",
+        },
+        .kernel_modules = &modules,
+    });
+    // The guest is the one that validates, so the host's rendering has to
+    // survive that check rather than merely look plausible.
+    try control.validate();
+
+    try std.testing.expectEqual(@as(usize, 2), control.kernel_module_files.len);
+    try std.testing.expectEqualStrings(
+        os_customization.modules_load_path,
+        control.kernel_module_files[0].path,
+    );
+    try std.testing.expectEqualStrings("overlay\n", control.kernel_module_files[0].contents);
+    try std.testing.expectEqualStrings(
+        os_customization.modprobe_blacklist_path,
+        control.kernel_module_files[1].path,
+    );
+    try std.testing.expectEqualStrings(
+        "blacklist floppy\n",
+        control.kernel_module_files[1].contents,
+    );
+
+    // Asking for nothing plants nothing: an image that had no `modprobe.d`
+    // configuration should not come back carrying empty files.
+    const empty = try controlFromPolicy(allocator, std.testing.io, .{
+        .packages = .{},
+        .initramfs = .unchanged,
+        .network = .offline,
+        .devices = .{
+            .root_device = "/dev/vda2",
+            .result_device = "/dev/vdb",
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 0), empty.kernel_module_files.len);
 }

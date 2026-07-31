@@ -338,7 +338,28 @@ fn applyServices(tree: *RootTree, services: []const Service) !void {
     }
 }
 
-fn applyKernelModules(allocator: Allocator, tree: *RootTree, modules: []const KernelModule) !void {
+/// Where kernel-module configuration lands in the target root.
+///
+/// Closed and named here because three different executors have to agree on
+/// it: the rebuild backend writes these into an imported tree, and the
+/// `unsafe_chroot` and `vm` backends write them into a real filesystem. A
+/// request must produce the same bytes at the same paths whichever one runs.
+pub const modules_load_path = "etc/modules-load.d/zvmi.conf";
+pub const modprobe_blacklist_path = "etc/modprobe.d/zvmi-blacklist.conf";
+pub const modprobe_options_path = "etc/modprobe.d/zvmi-options.conf";
+
+/// The rendered configuration, empty-content entries omitted. Rendering is
+/// separated from placing it so a backend that has a mounted filesystem
+/// rather than a `RootTree` can use the same bytes.
+pub const RenderedFile = struct {
+    path: []const u8,
+    contents: []const u8,
+};
+
+pub fn renderKernelModules(
+    allocator: Allocator,
+    modules: []const KernelModule,
+) ![]const RenderedFile {
     var load: std.Io.Writer.Allocating = .init(allocator);
     defer load.deinit();
     var blacklist: std.Io.Writer.Allocating = .init(allocator);
@@ -351,14 +372,34 @@ fn applyKernelModules(allocator: Allocator, tree: *RootTree, modules: []const Ke
         if (module.disabled) try blacklist.writer.print("blacklist {s}\n", .{module.name});
         if (module.options) |value| try options.writer.print("options {s} {s}\n", .{ module.name, value });
     }
-    if (load.writer.end != 0) {
-        try tree.putFileBytes("etc/modules-load.d/zvmi.conf", load.written(), .{ .mode = 0o644 });
+
+    var rendered: std.array_list.Managed(RenderedFile) = .init(allocator);
+    errdefer rendered.deinit();
+    // A module list that asks for nothing writes nothing, rather than
+    // planting empty files the image did not have before.
+    inline for (.{
+        .{ modules_load_path, &load },
+        .{ modprobe_blacklist_path, &blacklist },
+        .{ modprobe_options_path, &options },
+    }) |entry| {
+        if (entry[1].writer.end != 0) {
+            try rendered.append(.{
+                .path = entry[0],
+                .contents = try allocator.dupe(u8, entry[1].written()),
+            });
+        }
     }
-    if (blacklist.writer.end != 0) {
-        try tree.putFileBytes("etc/modprobe.d/zvmi-blacklist.conf", blacklist.written(), .{ .mode = 0o644 });
+    return rendered.toOwnedSlice();
+}
+
+fn applyKernelModules(allocator: Allocator, tree: *RootTree, modules: []const KernelModule) !void {
+    const rendered = try renderKernelModules(allocator, modules);
+    defer {
+        for (rendered) |file| allocator.free(file.contents);
+        allocator.free(rendered);
     }
-    if (options.writer.end != 0) {
-        try tree.putFileBytes("etc/modprobe.d/zvmi-options.conf", options.written(), .{ .mode = 0o644 });
+    for (rendered) |file| {
+        try tree.putFileBytes(file.path, file.contents, .{ .mode = 0o644 });
     }
 }
 

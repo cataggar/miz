@@ -268,8 +268,8 @@ ordered by how much they can do, which is the same order as how much they need.
 | `native_edit` | none | no | any | overwrite, remove existing paths |
 | `rebuild` | none | no | any | full tree rebuild of one ext4 partition |
 | `native_fresh` | none | no | any | build a new image rather than edit one |
-| `unsafe_chroot` | root + `CAP_SYS_CHROOT`/`CAP_SYS_ADMIN`/`CAP_MKNOD` | yes, on the host kernel | host's only | install/remove/update packages, regenerate initramfs |
-| `vm` | none | yes, in an isolated guest | any | install/remove/update packages, regenerate initramfs, cross-architecture |
+| `unsafe_chroot` | root + `CAP_SYS_CHROOT`/`CAP_SYS_ADMIN`/`CAP_MKNOD` | yes, on the host kernel | host's only | install/remove/update packages, configure kernel modules, regenerate initramfs |
+| `vm` | none | yes, in an isolated guest | any | install/remove/update packages, configure kernel modules, regenerate initramfs, cross-architecture |
 
 `vm` is the only backend that can customize an image the host cannot run, and
 the only one that executes guest code without executing it on the host. It
