@@ -488,9 +488,9 @@ fn controlFromPolicy(
         },
         .repositories = repositories,
         .actions = actions,
-        .initramfs_kernels = switch (input.initramfs) {
-            .unchanged => &.{},
-            .regenerate => |regenerate| regenerate.kernels,
+        .initramfs = switch (input.initramfs) {
+            .unchanged => .unchanged,
+            .regenerate => |regenerate| .{ .regenerate = .{ .kernels = regenerate.kernels } },
         },
         .modules = input.modules,
     };
@@ -1454,7 +1454,10 @@ test "trust material reaches the guest as base64 whether it was inline or a host
         const expected: []const u8 = if (index == 0) "inline-key" else "\x99\x01\x0dkeyring";
         try std.testing.expectEqualStrings(expected, decoded);
     }
-    try std.testing.expectEqualStrings("6.12.0-1.azl", control.initramfs_kernels[0]);
+    try std.testing.expectEqualStrings(
+        "6.12.0-1.azl",
+        control.initramfs.regenerate.kernels[0],
+    );
 }
 
 test "an offline guest is never handed package actions" {

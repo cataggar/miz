@@ -803,8 +803,9 @@ fn runStubEmulator(
     try expectStub(std.mem.eql(u8, control.repositories[0].id, "integration"));
     try expectStub(control.repositories[0].trust_base64.len == 1);
     try expectStub(control.actions.len == 1);
-    try expectStub(control.initramfs_kernels.len == 1);
-    try expectStub(std.mem.eql(u8, control.initramfs_kernels[0], kernel_release));
+    try expectStub(control.initramfs == .regenerate);
+    try expectStub(control.initramfs.regenerate.kernels.len == 1);
+    try expectStub(std.mem.eql(u8, control.initramfs.regenerate.kernels[0], kernel_release));
     try expectStub(control.network == .declared_repositories);
 
     // A module the document names but the initramfs does not carry is a guest
