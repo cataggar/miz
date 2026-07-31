@@ -1516,20 +1516,21 @@ fn validateVmPolicy(
             ));
         },
     }
-    // A resolver the chroot backend reaches happily can be unreachable from a
-    // guest behind user-mode networking, which would make one hashed plan
-    // resolve names on one backend and fail mid-transaction on the other --
-    // the divergence a declared resolver exists to remove. Addresses outside
-    // the subnet are fine: slirp forwards their traffic out through the host.
+    // A resolver the chroot backend reaches happily can mean something else
+    // entirely from a guest behind user-mode networking, which would make one
+    // hashed plan resolve names two different ways -- the divergence a declared
+    // resolver exists to remove. Addresses outside the subnet are fine: slirp
+    // NATs their traffic out through the host to the same place a chroot would
+    // reach. Addresses inside it are aliases for the build machine.
     switch (request.packages.resolver) {
         .host_resolver => {},
         .nameservers => |nameservers| for (nameservers) |nameserver| {
-            if (vm_control.isUnreachableUserNetAddress(nameserver)) {
+            if (vm_control.isUserNetAddress(nameserver)) {
                 try diagnostics.append(validationError(
                     .invalid_policy,
                     "/packages/resolver/nameservers",
-                    "the guest's user-mode network answers on only one address in its own subnet",
-                    "name a resolver outside 10.0.2.0/24, or 10.0.2.3 for the host's own",
+                    "the guest's user-mode network aliases its own subnet to this machine",
+                    "name a resolver outside 10.0.2.0/24, or select host_resolver to state that the build machine's own is meant",
                 ));
             }
         },
@@ -3472,7 +3473,17 @@ fn buildCapabilities(
     if (packages.lock != .unlocked) {
         try capabilities.append(.{ .kind = .package_lock, .path = "", .reason = "enforce the declared package snapshot or exact-version lock" });
     }
-    if ((execution.backend == .unsafe_chroot or execution.backend == .vm) and
+    // The chroot backend unshares only mount and pid, so its transaction always
+    // resolves through the build host. A guest does so only when it is given
+    // the network that reaches it: an offline guest is started with `-nic none`,
+    // so a cache-only transaction inside one never reads the host's resolver at
+    // all and must not be made to declare that it does.
+    const resolves_through_host = switch (execution.backend) {
+        .unsafe_chroot => true,
+        .vm => if (execution.vm) |vm| vm.network == .declared_repositories else false,
+        else => false,
+    };
+    if (resolves_through_host and
         packages.actions.len != 0 and
         packages.resolver == .host_resolver)
     {
@@ -9179,6 +9190,26 @@ test "both executing backends declare inheriting the host resolver" {
         ));
     }
 
+    // An offline guest is started with `-nic none`, so it reads no resolver at
+    // all whatever the policy says. It has to be able to reach here: an offline
+    // VM refuses package actions only when the cache policy is not `cache_only`,
+    // so a cache-only transaction is a networkless run with actions in it.
+    var offline = resolverRequest(.host_resolver);
+    offline.packages.cache = .cache_only;
+    offline.execution.backend = .vm;
+    offline.execution.vm = validVmPolicy();
+    offline.execution.vm.?.network = .offline;
+    var offline_resolved = try resolve(
+        std.testing.allocator,
+        &offline,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer offline_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(!hasCapabilityKind(
+        offline_resolved.plan.?.data.required_capabilities,
+        .read_host_resolver,
+    ));
+
     // And it never gates a run, because the executors tolerate a host with no
     // resolver: a transaction that only removes packages, or whose repository
     // URLs are literal addresses, resolves no names at all.
@@ -9192,13 +9223,22 @@ test "both executing backends declare inheriting the host resolver" {
     );
 }
 
-test "a guest cannot be pointed at an address its own network swallows" {
-    // Outside 10.0.2.0/24 slirp forwards the traffic out through the host, so
-    // any real resolver works. Inside it, slirp answers ARP only for the
-    // gateway and its own forwarder, and drops the rest in silence -- which
-    // the guest can report only as a name that would not resolve, long after
-    // the plan was accepted.
-    const rejected = [_][]const u8{ "10.0.2.2", "10.0.2.15", "10.0.2.1" };
+test "a guest cannot be pointed at its own network's alias for this machine" {
+    // Outside 10.0.2.0/24 slirp NATs the traffic out through real host sockets,
+    // so a declared resolver reaches exactly what a chroot would reach. Inside
+    // it nothing does: 10.0.2.3 is answered by rewriting the packet to whatever
+    // the emulator process's own `/etc/resolv.conf` names, and every other
+    // in-subnet address is rewritten to the build host's loopback.
+    //
+    // 10.0.2.3 has to be refused rather than waved through as "what
+    // host_resolver uses anyway". `controlFromPolicy` would render a control
+    // document byte-identical to `host_resolver`'s, so accepting it would let a
+    // request shed the `read_host_resolver` capability while keeping the whole
+    // dependence on the build machine -- defeating the one consumer a declared
+    // resolver exists to serve. It is also the inverse of the loopback rule:
+    // 127.0.0.53 is refused for working on the chroot backend and failing in a
+    // guest, and this would be permitted for the reverse.
+    const rejected = [_][]const u8{ "10.0.2.2", "10.0.2.15", "10.0.2.1", "10.0.2.3" };
     for (rejected) |nameserver| {
         var request = resolverRequest(.{ .nameservers = &.{nameserver} });
         request.execution.backend = .vm;
@@ -9219,9 +9259,9 @@ test "a guest cannot be pointed at an address its own network swallows" {
         try std.testing.expect(!diagnostics.hasErrors());
     }
 
-    // The forwarder itself is exactly what `host_resolver` uses here, so
-    // naming it explicitly has to stay legal.
-    var accepted = resolverRequest(.{ .nameservers = &.{"10.0.2.3"} });
+    // The rule is the subnet and not "declared resolvers are suspect": an
+    // address slirp forwards is accepted on the same backend.
+    var accepted = resolverRequest(.{ .nameservers = &.{"10.1.2.3"} });
     accepted.execution.backend = .vm;
     accepted.execution.vm = validVmPolicy();
     accepted.execution.vm.?.network = .declared_repositories;

@@ -247,6 +247,12 @@ fn executeManifest(
     executor: Executor,
 ) !ExecutionResult {
     if (manifest.partition_length == 0) return error.InvalidPartitionBounds;
+    // Before anything is created, mounted or written. Every field this refuses
+    // is one the worker would otherwise act on as root: the declared resolver
+    // is rendered into the target root during `open`, well before `runPolicy`
+    // is reached, so a check deferred to there would run after the bytes it
+    // guards had already been placed.
+    try validateManifestPolicy(manifest);
     try prepareEmptyRoot(io, manifest.root_path);
     var session = Session{
         .allocator = allocator,
@@ -517,7 +523,6 @@ const Session = struct {
     }
 
     fn runPolicy(self: *Session) !void {
-        try validateManifestPolicy(self.manifest);
         try self.writeRepositoryFiles();
         errdefer self.removeRepositoryFiles() catch {};
         try self.importTrust();
@@ -2547,6 +2552,35 @@ test "worker installs the declared resolver and none without package actions" {
         idle_context.unmounts.items,
         root_path ++ "/run/zvmi-resolv.conf",
     ));
+
+    // A manifest the worker will not honour is refused before it creates,
+    // mounts or writes anything as root. The declared resolver is rendered into
+    // the target root while the session is opened, so a check made when the
+    // policy is *run* would arrive after the bytes it guards had been placed --
+    // and an untouched root path is the only assertion that cannot pass by
+    // accident, since every later refusal leaves one behind.
+    const refused_root = "test-unsafe-chroot-resolver-refused-root";
+    defer Io.Dir.cwd().deleteTree(io, refused_root) catch {};
+    var refused = declared;
+    refused.root_path = refused_root;
+    refused.packages.resolver = .{ .nameservers = &.{"127.0.0.53"} };
+    var refused_context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = refused_root,
+        .unmounts = .init(allocator),
+        .resolver_layout = .regular,
+    };
+    try std.testing.expectError(error.InvalidNetworkConfiguration, executeManifest(
+        allocator,
+        io,
+        refused,
+        .{ .context = &refused_context, .runFn = FakeExecutorContext.run },
+    ));
+    try std.testing.expectError(
+        error.FileNotFound,
+        Io.Dir.cwd().statFile(io, refused_root, .{}),
+    );
 }
 
 // A whitespace-carrying name reaching the renderer would silently retarget a

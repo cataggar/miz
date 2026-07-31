@@ -182,24 +182,23 @@ pub const qemu_user_network: NetworkConfig = .{
     .nameservers = &.{"10.0.2.3"},
 };
 
-/// Whether an address is inside the user-mode network's own subnet but is not
-/// the resolver it answers on.
+/// Whether an address is inside the user-mode network's own subnet.
 ///
-/// libslirp answers ARP only for the gateway, the nameserver and configured
-/// guest forwards, and silently ignores every other address in the subnet. A
-/// guest that declared one would treat it as on-link, get no reply, and report
-/// nothing beyond a name that would not resolve -- so it is refused where it
-/// is stated rather than discovered when the transaction fails.
-pub fn isUnreachableUserNetAddress(text: []const u8) bool {
+/// Every address in it is an alias for something on the build machine rather
+/// than a resolver the request chose: slirp answers `10.0.2.3` itself by
+/// forwarding to the emulator's `/etc/resolv.conf`, and rewrites traffic to
+/// any other in-subnet address to the build host's loopback. So a declared
+/// list naming one of them would state a resolver while still meaning
+/// "whatever this machine has" -- and would mean something else again on the
+/// chroot backend, where the same address is just an address on the host's
+/// LAN. `host_resolver` is how a request asks for the build machine's
+/// resolver; naming slirp's alias for it is not.
+pub fn isUserNetAddress(text: []const u8) bool {
     const octets = parseIpv4(text) orelse return false;
     const resolver = parseIpv4(qemu_user_network.nameservers[0]).?;
-    if (octets[0] != resolver[0] or
-        octets[1] != resolver[1] or
-        octets[2] != resolver[2])
-    {
-        return false;
-    }
-    return octets[3] != resolver[3];
+    return octets[0] == resolver[0] and
+        octets[1] == resolver[1] and
+        octets[2] == resolver[2];
 }
 
 pub const Repository = struct {

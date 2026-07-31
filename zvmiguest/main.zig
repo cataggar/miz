@@ -27,6 +27,10 @@ const max_capture_bytes = 1024 * 1024;
 const repository_directory = "/run/zvmi-repos";
 const tdnf_config = "/run/zvmi-tdnf.conf";
 const resolver_path = "/etc/resolv.conf";
+/// Where the image's own resolver is held while the transaction runs. Beside
+/// the original rather than under `/run`, because `/run` in the target is a
+/// separate mount and a rename cannot cross one.
+const resolver_backup_path = "/etc/.zvmi-resolv.conf";
 /// How long the target's block device is waited for, and how often it is
 /// checked. Generous because software emulation stretches every wall-clock
 /// interval a guest experiences.
@@ -85,11 +89,15 @@ const Session = struct {
     proc_mounted: bool = false,
     sys_mounted: bool = false,
     run_mounted: bool = false,
-    /// Original `/etc/resolv.conf`, held in memory so the image gets it back
-    /// byte for byte. The guest's `/run` is a tmpfs that is gone by teardown,
-    /// and a rename across filesystems would not have worked anyway.
-    saved_resolver: ?[]const u8 = null,
-    resolver_written: bool = false,
+    /// Whether the image's own `/etc/resolv.conf` was moved aside, and whether
+    /// there was one to move. It is renamed rather than copied because a copy
+    /// reads through a symlink and writes back a regular file: an image whose
+    /// resolver links into `/run` -- which is most of them -- would come out of
+    /// the transaction with the link replaced by a stale file. The same names
+    /// and the same protocol as the chroot backend, so an image cannot tell
+    /// which one ran.
+    resolver_replaced: bool = false,
+    resolver_had_original: bool = false,
     repositories_written: []const control_mod.Repository = &.{},
 
     fn run(self: *Session) Outcome {
@@ -273,27 +281,23 @@ const Session = struct {
         }
         self.repositories_written = control.repositories;
 
-        switch (control.network) {
-            .offline => {},
-            .declared_repositories => |config| try self.installResolver(config),
-        }
+        if (resolverConfigFor(control)) |config| try self.installResolver(config);
     }
 
-    /// Replaces the image's resolver for the duration of the run and keeps the
-    /// original so it can be put back. tdnf resolves names through whatever the
+    /// Replaces the image's resolver for the duration of the run and puts the
+    /// original back afterwards. tdnf resolves names through whatever the
     /// target root says, and the target root has no reason to name a resolver
     /// that exists on this synthetic link.
     fn installResolver(self: *Session, config: control_mod.NetworkConfig) !void {
-        if (readFileAlloc(self.allocator, guest_root ++ resolver_path, 64 * 1024)) |original| {
-            self.saved_resolver = original;
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        }
-
         const body = try renderResolver(self.allocator, config);
-        try writeFileBytes(self.allocator, guest_root ++ resolver_path, body);
-        self.resolver_written = true;
+        self.resolver_replaced = true;
+        errdefer self.restoreResolver();
+        self.resolver_had_original = try replaceAside(
+            self.allocator,
+            guest_root ++ resolver_path,
+            guest_root ++ resolver_backup_path,
+            body,
+        );
     }
 
     fn importTrust(self: *Session, control: control_mod.Control) !void {
@@ -521,14 +525,15 @@ const Session = struct {
     }
 
     fn restoreResolver(self: *Session) void {
-        if (!self.resolver_written) return;
-        if (self.saved_resolver) |original| {
-            writeFileBytes(self.allocator, guest_root ++ resolver_path, original) catch {
-                log("[zvmi-guest] could not restore the target resolver\n");
-            };
-        } else {
-            _ = linux.unlink(guest_root ++ resolver_path);
-        }
+        if (!self.resolver_replaced) return;
+        self.resolver_replaced = false;
+        restoreAside(
+            guest_root ++ resolver_path,
+            guest_root ++ resolver_backup_path,
+            self.resolver_had_original,
+        ) catch {
+            log("[zvmi-guest] could not restore the target resolver\n");
+        };
     }
 };
 
@@ -973,6 +978,96 @@ fn readFileAlloc(allocator: Allocator, path: []const u8, limit: usize) ![]u8 {
     return error.FileTooLarge;
 }
 
+/// The resolver configuration this transaction will actually use, or null if it
+/// will resolve no names and so must leave the image's own resolver alone.
+///
+/// Both halves matter. An offline guest has no network to resolve over, and a
+/// transaction with no package actions runs no package manager -- and replacing
+/// the resolver in either case would touch a file the run has no reason to
+/// touch, which is exactly what the chroot backend and the documentation both
+/// say does not happen.
+fn resolverConfigFor(control: control_mod.Control) ?control_mod.NetworkConfig {
+    if (control.actions.len == 0) return null;
+    return switch (control.network) {
+        .offline => null,
+        .declared_repositories => |config| config,
+    };
+}
+
+/// Moves whatever is at `path` aside to `backup` and writes `bytes` in its
+/// place, reporting whether there was anything to move.
+///
+/// A rename rather than a read-and-write-back because `/etc/resolv.conf` is a
+/// symlink into `/run` on most images: reading through one and writing the
+/// bytes back would leave a regular file where the link was, mutating the
+/// published image to record a resolver that only existed while the build ran.
+/// A rename moves the link itself, whatever it points at.
+fn replaceAside(
+    allocator: Allocator,
+    path: [:0]const u8,
+    backup: [:0]const u8,
+    bytes: []const u8,
+) !bool {
+    // Refusing an occupied backup rather than clobbering it: the only thing
+    // that puts a file there is an earlier run of this, and overwriting it
+    // would destroy the image's own file while reporting success.
+    if (pathExistsNoFollow(backup)) return error.BackupPathOccupied;
+
+    // The rename is its own probe. It reports in one atomic step both that
+    // something was there and that it has been moved, so there is no window in
+    // which a stat has answered "present" and the file has since gone.
+    var had_original = false;
+    switch (linux.errno(linux.renameat(linux.AT.FDCWD, path, linux.AT.FDCWD, backup))) {
+        .SUCCESS => had_original = true,
+        .NOENT => {},
+        else => return error.RenameFailed,
+    }
+    errdefer restoreAside(path, backup, had_original) catch {};
+
+    // Exclusive: nothing can be at the path now, and if something is, it is not
+    // what was just moved aside -- so this can never write through a symlink.
+    try writeNewFileBytes(allocator, path, bytes);
+    return had_original;
+}
+
+/// Undoes `replaceAside`. Removing the written file even when there was no
+/// original, so an image that shipped without a resolver does not gain one.
+fn restoreAside(path: [:0]const u8, backup: [:0]const u8, had_original: bool) !void {
+    _ = linux.unlink(path);
+    if (!had_original) return;
+    const rc = linux.renameat(linux.AT.FDCWD, backup, linux.AT.FDCWD, path);
+    if (linux.errno(rc) != .SUCCESS) return error.RenameFailed;
+}
+
+/// Whether anything exists at the path, without following a final symlink. The
+/// `PATH` handle is what makes that possible: `NOFOLLOW` alone fails on a
+/// symlink, which would report a dangling link as absent.
+fn pathExistsNoFollow(path: [*:0]const u8) bool {
+    const rc = linux.open(
+        path,
+        .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .PATH = true },
+        0,
+    );
+    if (linux.errno(rc) != .SUCCESS) return false;
+    _ = linux.close(@intCast(rc));
+    return true;
+}
+
+/// Creates a file that must not already exist. `EXCL` refuses a symlink at the
+/// path outright, so this cannot write through one into somewhere else.
+fn writeNewFileBytes(allocator: Allocator, path: []const u8, bytes: []const u8) !void {
+    const path_z = try allocator.dupeZ(u8, path);
+    const fd_raw = linux.open(
+        path_z,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true },
+        0o644,
+    );
+    if (linux.errno(fd_raw) != .SUCCESS) return error.OpenFailed;
+    const fd: i32 = @intCast(fd_raw);
+    defer _ = linux.close(fd);
+    try writeAll(fd, bytes);
+}
+
 fn writeFileBytes(allocator: Allocator, path: []const u8, bytes: []const u8) !void {
     const path_z = try allocator.dupeZ(u8, path);
     const fd_raw = linux.open(
@@ -983,7 +1078,10 @@ fn writeFileBytes(allocator: Allocator, path: []const u8, bytes: []const u8) !vo
     if (linux.errno(fd_raw) != .SUCCESS) return error.OpenFailed;
     const fd: i32 = @intCast(fd_raw);
     defer _ = linux.close(fd);
+    try writeAll(fd, bytes);
+}
 
+fn writeAll(fd: i32, bytes: []const u8) !void {
     var written: usize = 0;
     while (written < bytes.len) {
         const rc = linux.write(fd, bytes.ptr + written, bytes.len - written);
@@ -1153,4 +1251,112 @@ test "every directory leading to a rendered destination is created" {
     // Running it again on a chain that already exists is not an error: the
     // three destinations share their leading directories.
     try mkdirParents(allocator, path);
+}
+
+test "the image's own resolver comes back the kind of file it was" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const base = "test-zvmiguest-resolver";
+    defer cwd.deleteTree(io, base) catch {};
+    cwd.deleteTree(io, base) catch {};
+    try cwd.createDirPath(io, base ++ "/etc");
+    const path = base ++ "/etc/resolv.conf";
+    const backup = base ++ "/etc/.zvmi-resolv.conf";
+    const rendered = "nameserver 192.0.2.1\n";
+
+    // A regular file is moved aside and comes back byte for byte.
+    try cwd.writeFile(io, .{ .sub_path = path, .data = "nameserver 198.51.100.7\n" });
+    try std.testing.expect(try replaceAside(allocator, path, backup, rendered));
+    try std.testing.expectEqualStrings(
+        rendered,
+        try cwd.readFileAlloc(io, path, allocator, .unlimited),
+    );
+    try restoreAside(path, backup, true);
+    try std.testing.expectEqualStrings(
+        "nameserver 198.51.100.7\n",
+        try cwd.readFileAlloc(io, path, allocator, .unlimited),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        cwd.statFile(io, backup, .{}),
+    );
+
+    // The case that matters: nearly every distribution ships
+    // `/etc/resolv.conf` as a symlink into `/run`. Copying its bytes and
+    // writing them back would publish an image whose link had been replaced by
+    // a stale regular file naming a resolver that existed only during the
+    // build, so the link itself has to move.
+    try cwd.deleteFile(io, path);
+    try cwd.symLink(io, "../run/systemd/resolve/stub-resolv.conf", path, .{});
+    try std.testing.expect(try replaceAside(allocator, path, backup, rendered));
+    try std.testing.expectEqualStrings(
+        rendered,
+        try cwd.readFileAlloc(io, path, allocator, .unlimited),
+    );
+    try restoreAside(path, backup, true);
+    var link_buffer: [256]u8 = undefined;
+    const link_length = try cwd.readLink(io, path, &link_buffer);
+    try std.testing.expectEqualStrings(
+        "../run/systemd/resolve/stub-resolv.conf",
+        link_buffer[0..link_length],
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        cwd.statFile(io, backup, .{}),
+    );
+
+    // An image with no resolver at all does not gain one from the transaction.
+    try cwd.deleteFile(io, path);
+    try std.testing.expect(!try replaceAside(allocator, path, backup, rendered));
+    try restoreAside(path, backup, false);
+    try std.testing.expectError(
+        error.FileNotFound,
+        cwd.statFile(io, path, .{}),
+    );
+
+    // An occupied backup is a previous run's original. Clobbering it would
+    // destroy the image's own file while reporting success.
+    try cwd.writeFile(io, .{ .sub_path = path, .data = "nameserver 203.0.113.9\n" });
+    try cwd.writeFile(io, .{ .sub_path = backup, .data = "stale\n" });
+    try std.testing.expectError(
+        error.BackupPathOccupied,
+        replaceAside(allocator, path, backup, rendered),
+    );
+    try std.testing.expectEqualStrings(
+        "nameserver 203.0.113.9\n",
+        try cwd.readFileAlloc(io, path, allocator, .unlimited),
+    );
+}
+
+test "the image's resolver is touched only by a transaction that resolves names" {
+    const config = control_mod.NetworkConfig{
+        .address = "10.0.2.15",
+        .netmask = "255.255.255.0",
+        .gateway = "10.0.2.2",
+        .nameservers = &.{"10.0.2.3"},
+    };
+    const actions = [_]control_mod.Action{.{ .install = &.{"dracut"} }};
+    const base = control_mod.Control{
+        .root_device = "/dev/vda2",
+        .result_device = "/dev/vdb",
+        .network = .{ .declared_repositories = config },
+    };
+
+    var working = base;
+    working.actions = &actions;
+    try std.testing.expect(resolverConfigFor(working) != null);
+
+    // A run with repositories and no package action still starts no package
+    // manager, so there is nothing to resolve for and nothing to replace.
+    try std.testing.expect(resolverConfigFor(base) == null);
+
+    // An offline guest has no network to resolve over whatever else it does.
+    var offline = base;
+    offline.actions = &actions;
+    offline.network = .offline;
+    try std.testing.expect(resolverConfigFor(offline) == null);
 }
