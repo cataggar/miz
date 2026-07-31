@@ -26,11 +26,12 @@ const preserved_image = @import("preserved_image.zig");
 const root_tree = @import("root_tree.zig");
 const transaction_guard = @import("transaction_guard.zig");
 const verity = @import("verity.zig");
+const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 12;
-pub const provenance_schema_version: u32 = 15;
+pub const plan_schema_version: u32 = 13;
+pub const provenance_schema_version: u32 = 16;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -409,6 +410,38 @@ pub const PackagePolicy = struct {
     repositories: []const PackageRepository = &.{},
     cache: PackageCachePolicy = .online,
     lock: PackageLockPolicy = .unlocked,
+    resolver: ResolverPolicy = .host_resolver,
+};
+
+/// Where the package transaction's `/etc/resolv.conf` comes from.
+///
+/// The target root has no reason to name a resolver reachable from wherever
+/// this build runs, so something has to supply one, and until this policy
+/// existed each backend quietly supplied its own. Naming the choice puts it in
+/// the plan, under the plan hash, and into provenance, so a run that resolved
+/// names through the build machine says so.
+///
+/// Whatever is installed is removed again when the transaction ends. This is
+/// build-time configuration, not a property of the image.
+pub const ResolverPolicy = union(enum) {
+    /// The build host's resolver, however this backend reaches it.
+    ///
+    /// `unsafe_chroot` binds the host's own `/etc/resolv.conf` into the target
+    /// root read-only. The VM backend reaches the same resolver indirectly:
+    /// QEMU's user-mode networking answers on `10.0.2.3` by forwarding to
+    /// whatever the host is configured to use.
+    ///
+    /// The default, because it is what a build machine already means by "the
+    /// network", and because the alternative cannot be guessed. It is a
+    /// declared inheritance rather than a silent one: the run states that its
+    /// name resolution came from outside the plan, so two machines producing
+    /// different output is a readable difference rather than a mystery.
+    host_resolver,
+    /// Exactly these nameservers, in this order, and nothing the host knows.
+    ///
+    /// Both backends render the same bytes from the same list, so the resolver
+    /// stops being a property of where the build ran.
+    nameservers: []const []const u8,
 };
 
 pub const HookPhase = enum {
@@ -1220,6 +1253,17 @@ fn validatePackagePolicy(
             }
         },
     }
+    switch (policy.resolver) {
+        .host_resolver => {},
+        .nameservers => |nameservers| vm_control.validateNameservers(nameservers) catch {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                "/packages/resolver/nameservers",
+                "a declared resolver needs one to three dotted-quad IPv4 addresses",
+                "state at most MAXNS nameservers, each as a dotted quad",
+            ));
+        },
+    }
 }
 
 fn validateHooks(
@@ -2000,6 +2044,14 @@ pub const CapabilityKind = enum {
     repository_trust,
     package_cache,
     package_lock,
+    /// Reading the build host's own `/etc/resolv.conf` so the package
+    /// transaction can resolve repository names. Only `unsafe_chroot` needs
+    /// it: the VM backend reaches the same resolver through QEMU's user-mode
+    /// networking without opening a host file. Named separately from
+    /// `read_trust_source` and friends because it is the one input the plan
+    /// does not carry -- its content comes from the machine, not the request,
+    /// so a consumer that requires reproducible input can refuse exactly this.
+    read_host_resolver,
     script_execution,
     guest_execution,
     initramfs_regeneration,
@@ -2805,6 +2857,12 @@ fn dupePackagePolicy(
         .repositories = repositories,
         .cache = policy.cache,
         .lock = lock,
+        .resolver = switch (policy.resolver) {
+            .host_resolver => .host_resolver,
+            .nameservers => |nameservers| .{
+                .nameservers = try dupeStrings(allocator, nameservers),
+            },
+        },
     };
 }
 
@@ -3384,6 +3442,16 @@ fn buildCapabilities(
     if (packages.lock != .unlocked) {
         try capabilities.append(.{ .kind = .package_lock, .path = "", .reason = "enforce the declared package snapshot or exact-version lock" });
     }
+    if (execution.backend == .unsafe_chroot and
+        packages.actions.len != 0 and
+        packages.resolver == .host_resolver)
+    {
+        try capabilities.append(.{
+            .kind = .read_host_resolver,
+            .path = "/etc/resolv.conf",
+            .reason = "resolve package repository names through the build host's resolver",
+        });
+    }
     if (hooks.len != 0) {
         try capabilities.append(.{ .kind = .script_execution, .path = "", .reason = "execute explicitly acknowledged scripts using an unsafe-capable backend" });
         try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "execute target hook code" });
@@ -3845,6 +3913,11 @@ fn hashPackagePolicy(hash: *std.crypto.hash.sha2.Sha256, policy: PackagePolicy) 
                 hashString(hash, lock.repository_id);
             }
         },
+    }
+    hashInt(hash, @intFromEnum(std.meta.activeTag(policy.resolver)));
+    switch (policy.resolver) {
+        .host_resolver => {},
+        .nameservers => |nameservers| hashStrings(hash, nameservers),
     }
 }
 
@@ -4405,6 +4478,14 @@ fn systemCapabilityCheck(_: ?*anyopaque, io: Io, requirement: CapabilityRequirem
         .read_hook_source,
         .read_trust_source,
         => if (isReadableKind(cwd, io, requirement.path, .file)) .available else .missing,
+        // Follows symlinks where the probes above do not. `/etc/resolv.conf`
+        // is a symlink into `/run` on any systemd-resolved host, and the
+        // executor that consumes it follows too, so probing without following
+        // would refuse exactly the machines this policy is written for.
+        .read_host_resolver => if (isReadableFileFollow(cwd, io, requirement.path))
+            .available
+        else
+            .missing,
         .disk_dependencies => .unsupported,
         .write_workspace_parent => if (canCreatePath(cwd, io, requirement.path)) .available else .missing,
         .write_output_parent => if (canCreatePath(cwd, io, requirement.path)) .available else .missing,
@@ -4562,6 +4643,12 @@ fn isReadableKind(dir: Io.Dir, io: Io, path: []const u8, kind: Io.File.Kind) boo
     dir.access(io, path, .{ .read = true }) catch return false;
     const stat = dir.statFile(io, path, .{ .follow_symlinks = false }) catch return false;
     return stat.kind == kind;
+}
+
+fn isReadableFileFollow(dir: Io.Dir, io: Io, path: []const u8) bool {
+    dir.access(io, path, .{ .read = true }) catch return false;
+    const stat = dir.statFile(io, path, .{ .follow_symlinks = true }) catch return false;
+    return stat.kind == .file;
 }
 
 fn isReadablePath(dir: Io.Dir, io: Io, path: []const u8) bool {
@@ -8232,7 +8319,15 @@ test "plan JSON renders identifiers as stable strings" {
     defer output.deinit();
     try writePlanJson(&resolved.plan.?, &output.writer);
     const json = output.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 12") != null);
+    // Formatted from the constant rather than written out, so a bump that
+    // forgets this test cannot be reported as the JSON losing its version.
+    const expected_version = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "\"schema_version\": {d}",
+        .{plan_schema_version},
+    );
+    defer std.testing.allocator.free(expected_version);
+    try std.testing.expect(std.mem.indexOf(u8, json, expected_version) != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"plan_hash\": \"") != null);
 }
 
@@ -8905,5 +9000,186 @@ test "a when_needed plan is byte-identical to the explicit plan it resolves to" 
         u8,
         &explicit_resolved.plan.?.data.plan_hash.bytes,
         &derived_resolved.plan.?.data.plan_hash.bytes,
+    );
+}
+
+fn resolverRequest(resolver: ResolverPolicy) Request {
+    const actions = struct {
+        const value = [_]PackageAction{.{ .install = &.{"dracut"} }};
+    };
+    const repositories = struct {
+        const value = [_]PackageRepository{.{
+            .id = "base",
+            .urls = &.{"https://packages.example.invalid"},
+            .trust = &.{.{ .inline_bytes = "test key" }},
+        }};
+    };
+    var request = whenNeededRequest();
+    request.packages = .{
+        .actions = &actions.value,
+        .repositories = &repositories.value,
+        .resolver = resolver,
+    };
+    return request;
+}
+
+test "a declared resolver must be one to three dotted quads" {
+    // `MAXNS` is the bound because it is the bound a resolver library applies.
+    // Accepting a fourth would record a nameserver in the plan that the run
+    // demonstrably never asks, which is worse than refusing it.
+    const rejected = [_][]const []const u8{
+        &.{},
+        &.{ "192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4" },
+        &.{"resolver.example.invalid"},
+        &.{"192.0.2.256"},
+        &.{"192.0.2"},
+        &.{""},
+    };
+    for (rejected) |nameservers| {
+        var request = resolverRequest(.{ .nameservers = nameservers });
+        var resolved = try resolve(
+            std.testing.allocator,
+            &request,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer resolved.deinit(std.testing.allocator);
+        try std.testing.expect(resolved.plan == null);
+        try std.testing.expect(hasDiagnosticCode(
+            resolved.diagnostics,
+            .invalid_policy,
+        ));
+    }
+
+    var accepted = resolverRequest(.{ .nameservers = &.{ "192.0.2.1", "198.51.100.7" } });
+    var resolved = try resolve(
+        std.testing.allocator,
+        &accepted,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.plan != null);
+    try std.testing.expectEqualStrings(
+        "198.51.100.7",
+        resolved.plan.?.data.packages.resolver.nameservers[1],
+    );
+}
+
+test "the plan hash covers where name resolution came from" {
+    // The point of declaring the resolver at all. If the hash did not cover
+    // it, two runs that resolved repository names through different servers --
+    // and so could have installed different bytes -- would claim to be the
+    // same plan.
+    var inherited = resolverRequest(.host_resolver);
+    var declared = resolverRequest(.{ .nameservers = &.{"192.0.2.1"} });
+    var other = resolverRequest(.{ .nameservers = &.{"198.51.100.7"} });
+
+    var inherited_resolved = try resolve(
+        std.testing.allocator,
+        &inherited,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer inherited_resolved.deinit(std.testing.allocator);
+    var declared_resolved = try resolve(
+        std.testing.allocator,
+        &declared,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer declared_resolved.deinit(std.testing.allocator);
+    var other_resolved = try resolve(
+        std.testing.allocator,
+        &other,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer other_resolved.deinit(std.testing.allocator);
+
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &inherited_resolved.plan.?.data.plan_hash.bytes,
+        &declared_resolved.plan.?.data.plan_hash.bytes,
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &declared_resolved.plan.?.data.plan_hash.bytes,
+        &other_resolved.plan.?.data.plan_hash.bytes,
+    ));
+}
+
+test "only a chroot run that inherits the host resolver declares reading it" {
+    // The capability is the visible half of the declaration: a consumer that
+    // requires every input to come from the request can refuse exactly this
+    // one. It is backend-specific because only `unsafe_chroot` opens the host
+    // file -- the VM reaches the same resolver through QEMU's user-mode
+    // networking, without a host path to name.
+    var inherited = resolverRequest(.host_resolver);
+    var declared = resolverRequest(.{ .nameservers = &.{"192.0.2.1"} });
+
+    var inherited_resolved = try resolve(
+        std.testing.allocator,
+        &inherited,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer inherited_resolved.deinit(std.testing.allocator);
+    var declared_resolved = try resolve(
+        std.testing.allocator,
+        &declared,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer declared_resolved.deinit(std.testing.allocator);
+
+    try std.testing.expect(hasCapabilityKind(
+        inherited_resolved.plan.?.data.required_capabilities,
+        .read_host_resolver,
+    ));
+    try std.testing.expect(!hasCapabilityKind(
+        declared_resolved.plan.?.data.required_capabilities,
+        .read_host_resolver,
+    ));
+}
+
+fn hasCapabilityKind(
+    capabilities: []const CapabilityRequirement,
+    kind: CapabilityKind,
+) bool {
+    for (capabilities) |capability| {
+        if (capability.kind == kind) return true;
+    }
+    return false;
+}
+
+test "the host resolver probe follows the symlink a resolved host installs" {
+    // `/etc/resolv.conf` is a symlink into `/run` on any systemd-resolved
+    // machine, and `unsafe_chroot` follows it. The probes next to this one
+    // deliberately do not follow, because a symlinked *source* is a different
+    // file from the one the caller named; here the symlink is the interface.
+    // Probing without following would report the capability missing on
+    // exactly the hosts this policy exists for, and the run would be refused
+    // by preflight for a resolver the executor would have used happily.
+    const io = std.testing.io;
+    const cwd = Io.Dir.cwd();
+    const directory = "test-resolver-probe";
+    defer cwd.deleteTree(io, directory) catch {};
+    try cwd.createDirPath(io, directory);
+    const target = directory ++ "/stub-resolv.conf";
+    const link = directory ++ "/resolv.conf";
+    try cwd.writeFile(io, .{ .sub_path = target, .data = "nameserver 127.0.0.53\n" });
+    try cwd.symLink(io, "stub-resolv.conf", link, .{});
+
+    try std.testing.expect(!isReadableKind(cwd, io, link, .file));
+    try std.testing.expect(isReadableFileFollow(cwd, io, link));
+    try std.testing.expectEqual(
+        CapabilityState.available,
+        systemCapabilityCheck(null, io, .{
+            .kind = .read_host_resolver,
+            .path = link,
+            .reason = "",
+        }),
+    );
+    try std.testing.expectEqual(
+        CapabilityState.missing,
+        systemCapabilityCheck(null, io, .{
+            .kind = .read_host_resolver,
+            .path = directory ++ "/absent.conf",
+            .reason = "",
+        }),
     );
 }

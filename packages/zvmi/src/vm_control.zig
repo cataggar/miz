@@ -100,14 +100,46 @@ pub const NetworkConfig = struct {
         {
             return error.InvalidNetworkConfiguration;
         }
-        if (self.nameservers.len == 0 or self.nameservers.len > 4) {
-            return error.InvalidNetworkConfiguration;
-        }
-        for (self.nameservers) |nameserver| {
-            if (parseIpv4(nameserver) == null) return error.InvalidNetworkConfiguration;
-        }
+        try validateNameservers(self.nameservers);
     }
 };
+
+/// `MAXNS` -- the number of `nameserver` lines a resolver library tracks
+/// before ignoring the rest (glibc `resolv/bits/types/res_state.h`, and musl's
+/// `__res_state` matches). A longer list would be a declaration the run does
+/// not honour, so it is refused rather than silently truncated.
+pub const max_nameservers: usize = 3;
+
+/// What a declared nameserver list has to be, wherever it was declared. Shared
+/// so the two executors cannot come to differ about which lists are legal.
+pub fn validateNameservers(nameservers: []const []const u8) Error!void {
+    if (nameservers.len == 0 or nameservers.len > max_nameservers) {
+        return error.InvalidNetworkConfiguration;
+    }
+    for (nameservers) |nameserver| {
+        if (parseIpv4(nameserver) == null) return error.InvalidNetworkConfiguration;
+    }
+}
+
+/// Renders the `/etc/resolv.conf` body for a declared nameserver list.
+///
+/// Both executors call this, so the same declaration produces the same bytes
+/// whichever backend runs it. That is the whole point of declaring it: a
+/// resolver that differed between backends would make the plan a description
+/// of one of them rather than of the run.
+pub fn renderResolverBody(
+    allocator: Allocator,
+    nameservers: []const []const u8,
+) Allocator.Error![]u8 {
+    var body: std.array_list.Managed(u8) = .init(allocator);
+    errdefer body.deinit();
+    for (nameservers) |nameserver| {
+        try body.appendSlice("nameserver ");
+        try body.appendSlice(nameserver);
+        try body.append('\n');
+    }
+    return body.toOwnedSlice();
+}
 
 /// Strict dotted-quad parsing. Deliberately narrower than `std.net`, which
 /// also accepts forms no configuration here should be written in.

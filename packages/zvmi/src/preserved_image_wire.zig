@@ -131,11 +131,19 @@ pub const PackageLockPolicy = union(enum) {
     exact: []const PackageVersionLock,
 };
 
+pub const ResolverPolicy = union(enum) {
+    /// The build host's resolver, however the chosen backend reaches it.
+    host_resolver,
+    /// Exactly these nameservers, and nothing the host knows.
+    nameservers: []const []const u8,
+};
+
 pub const PackagePolicy = struct {
     actions: []const PackageAction = &.{},
     repositories: []const PackageRepository = &.{},
     cache: PackageCachePolicy = .online,
     lock: PackageLockPolicy = .unlocked,
+    resolver: ResolverPolicy = .host_resolver,
 };
 
 /// Whether an empty `kernels` list that discovers no installed kernel is an

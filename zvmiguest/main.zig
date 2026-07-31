@@ -554,11 +554,7 @@ fn renderRepositoryFile(
 }
 
 fn renderResolver(allocator: Allocator, config: control_mod.NetworkConfig) ![]const u8 {
-    var body: std.array_list.Managed(u8) = .init(allocator);
-    for (config.nameservers) |nameserver| {
-        try body.appendSlice(try std.fmt.allocPrint(allocator, "nameserver {s}\n", .{nameserver}));
-    }
-    return body.items;
+    return control_mod.renderResolverBody(allocator, config.nameservers);
 }
 
 /// The directory scan behind `Session.installedKernels`, taking its path so a

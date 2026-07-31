@@ -500,7 +500,20 @@ fn controlFromPolicy(
         .result_device = input.devices.result_device,
         .network = switch (input.network) {
             .offline => .offline,
-            .declared_repositories => .{ .declared_repositories = vm_control.qemu_user_network },
+            // The declared resolver replaces the topology's own nameserver.
+            // Everything else about the link stays QEMU's, because everything
+            // else about the link *is* QEMU's; only which resolver the guest
+            // asks is the request's to decide. `host_resolver` keeps
+            // `10.0.2.3`, slirp's forwarder to the host's own resolver, which
+            // is what that policy names on this backend.
+            .declared_repositories => .{ .declared_repositories = switch (input.packages.resolver) {
+                .host_resolver => vm_control.qemu_user_network,
+                .nameservers => |nameservers| nameservers: {
+                    var config = vm_control.qemu_user_network;
+                    config.nameservers = nameservers;
+                    break :nameservers config;
+                },
+            } },
         },
         .repositories = repositories,
         .actions = actions,
@@ -1881,4 +1894,76 @@ test "rendered kernel-module configuration reaches the control document" {
         },
     });
     try std.testing.expectEqual(@as(usize, 0), empty.kernel_module_files.len);
+}
+
+test "the declared resolver replaces the topology's nameserver and nothing else" {
+    // The two backends have to agree about what a declared list means, and
+    // they cannot share code across the guest boundary, so they share the
+    // control document instead: the host puts the declared list where the
+    // guest already reads its nameservers from. Everything else about the
+    // link stays QEMU's, because everything else about the link *is* QEMU's.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+
+    const inherited = try controlFromPolicy(allocator, io, .{
+        .packages = .{
+            .actions = &.{.{ .install = &.{"strace"} }},
+            .repositories = &.{.{
+                .id = "base",
+                .urls = &.{"https://example.invalid/base"},
+                .trust = &.{.{ .inline_bytes = "inline-key" }},
+            }},
+        },
+        .initramfs = .unchanged,
+        .network = .declared_repositories,
+        .devices = .{ .root_device = "/dev/vda2", .result_device = "/dev/vdb" },
+    });
+    try inherited.validate();
+    // `host_resolver` on this backend is slirp's forwarder to the host's own
+    // resolver, so the default topology is left exactly as it was.
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{"10.0.2.3"}),
+        inherited.network.declared_repositories.nameservers,
+    );
+
+    const declared = try controlFromPolicy(allocator, io, .{
+        .packages = .{
+            .actions = &.{.{ .install = &.{"strace"} }},
+            .repositories = &.{.{
+                .id = "base",
+                .urls = &.{"https://example.invalid/base"},
+                .trust = &.{.{ .inline_bytes = "inline-key" }},
+            }},
+            .resolver = .{ .nameservers = &.{ "192.0.2.1", "198.51.100.7" } },
+        },
+        .initramfs = .unchanged,
+        .network = .declared_repositories,
+        .devices = .{ .root_device = "/dev/vda2", .result_device = "/dev/vdb" },
+    });
+    try declared.validate();
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "192.0.2.1", "198.51.100.7" }),
+        declared.network.declared_repositories.nameservers,
+    );
+    try std.testing.expectEqualStrings(
+        "10.0.2.15",
+        declared.network.declared_repositories.address,
+    );
+    try std.testing.expectEqualStrings(
+        "10.0.2.2",
+        declared.network.declared_repositories.gateway,
+    );
+
+    // And the bytes the guest will write are the ones the chroot backend
+    // writes from the same list, because both render through one function.
+    const body = try vm_control.renderResolverBody(
+        allocator,
+        declared.network.declared_repositories.nameservers,
+    );
+    try std.testing.expectEqualStrings(
+        "nameserver 192.0.2.1\nnameserver 198.51.100.7\n",
+        body,
+    );
 }
