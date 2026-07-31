@@ -216,12 +216,14 @@ pub const PreservedPackageRepository = struct {
 pub const PreservedPackageCachePolicy = preserved_image_wire.PackageCachePolicy;
 pub const PreservedPackageVersionLock = preserved_image_wire.PackageVersionLock;
 pub const PreservedPackageLockPolicy = preserved_image_wire.PackageLockPolicy;
+pub const PreservedResolverPolicy = preserved_image_wire.ResolverPolicy;
 
 pub const PreservedPackagePolicy = struct {
     actions: []const PreservedPackageAction = &.{},
     repositories: []const PreservedPackageRepository = &.{},
     cache: PreservedPackageCachePolicy = .online,
     lock: PreservedPackageLockPolicy = .unlocked,
+    resolver: PreservedResolverPolicy = .host_resolver,
 };
 
 pub const PreservedInitramfsPolicy = preserved_image_wire.InitramfsPolicy;
@@ -585,6 +587,7 @@ fn materializePreservedConfiguration(
             .repositories = repositories,
             .cache = options.packages.cache,
             .lock = options.packages.lock,
+            .resolver = options.packages.resolver,
         },
         .initramfs = options.initramfs,
         .guest_execution = options.guest_execution,

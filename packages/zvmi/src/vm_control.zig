@@ -52,6 +52,7 @@ pub const Error = error{
     OfflineNetworkWithPackageActions,
     NoDeclaredRepositories,
     InvalidNetworkConfiguration,
+    UnusableNameserver,
     RepositoryWithoutTrust,
     DuplicateRepositoryId,
     BadFrameMagic,
@@ -100,14 +101,59 @@ pub const NetworkConfig = struct {
         {
             return error.InvalidNetworkConfiguration;
         }
-        if (self.nameservers.len == 0 or self.nameservers.len > 4) {
-            return error.InvalidNetworkConfiguration;
-        }
-        for (self.nameservers) |nameserver| {
-            if (parseIpv4(nameserver) == null) return error.InvalidNetworkConfiguration;
-        }
+        try validateNameservers(self.nameservers);
     }
 };
+
+/// `MAXNS` -- the number of `nameserver` lines a resolver library tracks
+/// before ignoring the rest (glibc `resolv/bits/types/res_state.h`, and musl's
+/// `__res_state` matches). A longer list would be a declaration the run does
+/// not honour, so it is refused rather than silently truncated.
+pub const max_nameservers: usize = 3;
+
+/// What a declared nameserver list has to be, wherever it was declared. Shared
+/// so the two executors cannot come to differ about which lists are legal.
+pub fn validateNameservers(nameservers: []const []const u8) Error!void {
+    if (nameservers.len == 0 or nameservers.len > max_nameservers) {
+        return error.InvalidNetworkConfiguration;
+    }
+    for (nameservers) |nameserver| {
+        const octets = parseIpv4(nameserver) orelse
+            return error.InvalidNetworkConfiguration;
+        // A declared resolver has to mean the same thing wherever the plan
+        // runs, and these do not. Loopback reaches the build host's own stub
+        // resolver from a chroot, which shares the host's network namespace,
+        // and reaches nothing at all from inside a guest -- and `127.0.0.53`
+        // is the likeliest value for someone to copy off their own machine
+        // while trying to pin down what `host_resolver` already gave them,
+        // quietly reintroducing the dependence they were removing. The
+        // unspecified, multicast and reserved ranges are not resolvers
+        // anywhere.
+        if (octets[0] == 0 or octets[0] == 127 or octets[0] >= 224) {
+            return error.UnusableNameserver;
+        }
+    }
+}
+
+/// Renders the `/etc/resolv.conf` body for a declared nameserver list.
+///
+/// Both executors call this, so the same declaration produces the same bytes
+/// whichever backend runs it. That is the whole point of declaring it: a
+/// resolver that differed between backends would make the plan a description
+/// of one of them rather than of the run.
+pub fn renderResolverBody(
+    allocator: Allocator,
+    nameservers: []const []const u8,
+) Allocator.Error![]u8 {
+    var body: std.array_list.Managed(u8) = .init(allocator);
+    errdefer body.deinit();
+    for (nameservers) |nameserver| {
+        try body.appendSlice("nameserver ");
+        try body.appendSlice(nameserver);
+        try body.append('\n');
+    }
+    return body.toOwnedSlice();
+}
 
 /// Strict dotted-quad parsing. Deliberately narrower than `std.net`, which
 /// also accepts forms no configuration here should be written in.
@@ -136,6 +182,25 @@ pub const qemu_user_network: NetworkConfig = .{
     .gateway = "10.0.2.2",
     .nameservers = &.{"10.0.2.3"},
 };
+
+/// Whether an address is inside the user-mode network's own subnet.
+///
+/// Every address in it is an alias for something on the build machine rather
+/// than a resolver the request chose: slirp answers `10.0.2.3` itself by
+/// forwarding to the emulator's `/etc/resolv.conf`, and rewrites traffic to
+/// any other in-subnet address to the build host's loopback. So a declared
+/// list naming one of them would state a resolver while still meaning
+/// "whatever this machine has" -- and would mean something else again on the
+/// chroot backend, where the same address is just an address on the host's
+/// LAN. `host_resolver` is how a request asks for the build machine's
+/// resolver; naming slirp's alias for it is not.
+pub fn isUserNetAddress(text: []const u8) bool {
+    const octets = parseIpv4(text) orelse return false;
+    const resolver = parseIpv4(qemu_user_network.nameservers[0]).?;
+    return octets[0] == resolver[0] and
+        octets[1] == resolver[1] and
+        octets[2] == resolver[2];
+}
 
 pub const Repository = struct {
     id: []const u8,

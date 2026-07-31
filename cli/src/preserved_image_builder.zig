@@ -791,6 +791,10 @@ fn mapPackagePolicy(
                 break :exact .{ .exact = mapped };
             },
         },
+        .resolver = switch (policy.resolver) {
+            .host_resolver => .host_resolver,
+            .nameservers => |nameservers| .{ .nameservers = nameservers },
+        },
     };
 }
 

@@ -4,6 +4,7 @@ const customize = @import("customize.zig");
 const os_customization = @import("os_customization.zig");
 const preserved_image = @import("preserved_image.zig");
 const transaction_guard = @import("transaction_guard.zig");
+const vm_control = @import("vm_control.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -246,6 +247,26 @@ fn executeManifest(
     executor: Executor,
 ) !ExecutionResult {
     if (manifest.partition_length == 0) return error.InvalidPartitionBounds;
+    // Before anything is created, mounted or written. Every field this refuses
+    // is one the worker would otherwise act on as root: the declared resolver
+    // is rendered into the target root during `open`, well before `runPolicy`
+    // is reached, so a check deferred to there would run after the bytes it
+    // guards had already been placed.
+    //
+    // Reported as a refusal with cleanup complete rather than propagated,
+    // because propagating out of `workerMain` after the started marker is
+    // written is read by the parent as `cleanup_uncertain`: the lease is
+    // abandoned rather than released, the active marker stays, the staging raw
+    // is left behind, and the run is reported as `MutationResourcesActive`.
+    // Nothing has been created, mounted or attached at this point, so saying
+    // resources may still be active would name something that never happened.
+    validateManifestPolicy(manifest) catch {
+        return .{
+            .operation_succeeded = false,
+            .cleanup_complete = true,
+            .report = .{ .tools = &.{}, .installed_packages = &.{} },
+        };
+    };
     try prepareEmptyRoot(io, manifest.root_path);
     var session = Session{
         .allocator = allocator,
@@ -429,7 +450,17 @@ const Session = struct {
             "/etc/resolv.conf",
         );
         defer self.allocator.free(resolver_path);
-        if (isRegularFileFollow(self.io, "/etc/resolv.conf")) {
+        // `host_resolver` installs nothing when the host has no resolver of
+        // its own to lend; a declared list is always installable because it
+        // does not depend on this machine. Either way a run with no package
+        // actions gets none: this is the package transaction's resolver, and
+        // a root that never resolves a name has no business carrying one.
+        const install_resolver = self.manifest.packages.actions.len != 0 and
+            switch (self.manifest.packages.resolver) {
+                .host_resolver => isRegularFileFollow(self.io, "/etc/resolv.conf"),
+                .nameservers => true,
+            };
+        if (install_resolver) {
             const resolver_backup_path = try joinGuest(
                 self.allocator,
                 self.manifest.root_path,
@@ -445,20 +476,35 @@ const Session = struct {
                 "/run/zvmi-resolv.conf",
             );
             defer self.allocator.free(resolver_run_path);
-            try writeBytesExclusive(self.io, resolver_run_path, "");
-            try self.runSuccess(&.{
-                findTool(self.io, mount_candidates).?,
-                "--bind",
-                "/etc/resolv.conf",
-                resolver_run_path,
-            });
-            self.resolver_mounted = true;
-            try self.runSuccess(&.{
-                findTool(self.io, mount_candidates).?,
-                "-o",
-                "remount,bind,ro",
-                resolver_run_path,
-            });
+            switch (self.manifest.packages.resolver) {
+                .host_resolver => {
+                    try writeBytesExclusive(self.io, resolver_run_path, "");
+                    try self.runSuccess(&.{
+                        findTool(self.io, mount_candidates).?,
+                        "--bind",
+                        "/etc/resolv.conf",
+                        resolver_run_path,
+                    });
+                    self.resolver_mounted = true;
+                    try self.runSuccess(&.{
+                        findTool(self.io, mount_candidates).?,
+                        "-o",
+                        "remount,bind,ro",
+                        resolver_run_path,
+                    });
+                },
+                // No bind mount, because there is no host file to follow: the
+                // content is the request's, so it is simply written. `/run` is
+                // the tmpfs mounted just above, so it leaves as it arrived.
+                .nameservers => |nameservers| {
+                    const body = try vm_control.renderResolverBody(
+                        self.allocator,
+                        nameservers,
+                    );
+                    defer self.allocator.free(body);
+                    try writeBytesExclusive(self.io, resolver_run_path, body);
+                },
+            }
             const resolver_stat = Io.Dir.cwd().statFile(
                 self.io,
                 resolver_path,
@@ -491,7 +537,6 @@ const Session = struct {
     }
 
     fn runPolicy(self: *Session) !void {
-        try validateManifestPolicy(self.manifest);
         try self.writeRepositoryFiles();
         errdefer self.removeRepositoryFiles() catch {};
         try self.importTrust();
@@ -1464,6 +1509,15 @@ fn validateManifestPolicy(manifest: Manifest) !void {
     // the privilege boundary and does not trust the manifest it is handed. A
     // name reaching the renderer unchecked would be a line of its own in a
     // modprobe configuration file.
+    switch (manifest.packages.resolver) {
+        .host_resolver => {},
+        // Same reasoning one field over: each entry is written verbatim as a
+        // `nameserver` line, so an unchecked value carrying a newline would
+        // add directives of its own to the resolver the transaction runs
+        // against. The guest agent re-validates the identical rule on its
+        // side of the same boundary.
+        .nameservers => |nameservers| try vm_control.validateNameservers(nameservers),
+    }
     for (manifest.kernel_modules) |module| {
         if (!validKernelModuleName(module.name)) {
             return error.InvalidKernelModuleName;
@@ -2417,6 +2471,139 @@ test "worker places kernel-module configuration after packages and before dracut
     try std.testing.expectEqual(@as(u32, 0o755), context.directory_mode_at_dracut.?);
 }
 
+// A declared resolver has to reach the package transaction as bytes the
+// request chose, with no host file involved and nothing left behind. The
+// no-actions case is the other half of the same claim: the resolver belongs to
+// the package transaction, so a run without one must not acquire a resolver at
+// all -- least of all the build machine's.
+test "worker installs the declared resolver and none without package actions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root_path = "test-unsafe-chroot-resolver-root";
+    const raw_path = "test-unsafe-chroot-resolver-stage.raw";
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+        .exclusive = true,
+        .read = true,
+    });
+    try raw_file.setLength(io, 8192);
+    const raw_inode = (try raw_file.stat(io)).inode;
+    raw_file.close(io);
+
+    const actions = [_]customize.PackageAction{.{ .install = &.{"dracut"} }};
+    const repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    const declared = Manifest{
+        .raw_path = raw_path,
+        .root_path = root_path,
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = raw_inode,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{
+            .actions = &actions,
+            .repositories = &repositories,
+            .resolver = .{ .nameservers = &.{ "192.0.2.1", "198.51.100.7" } },
+        },
+        .initramfs = .unchanged,
+    };
+
+    var declared_context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        // The host has a resolver to lend. A declared list must not touch it.
+        .resolver_layout = .regular,
+    };
+    const declared_result = try executeManifest(allocator, io, declared, .{
+        .context = &declared_context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expect(declared_result.operation_succeeded);
+    try std.testing.expect(declared_result.cleanup_complete);
+    try std.testing.expectEqualStrings(
+        "nameserver 192.0.2.1\nnameserver 198.51.100.7\n",
+        declared_context.resolver_at_tdnf.?,
+    );
+    // One fewer unmount than the `host_resolver` path: nothing was bound, so
+    // there is nothing to unbind. The list is the evidence that the run really
+    // took the other branch rather than writing over a bind mount.
+    try std.testing.expectEqual(
+        @as(usize, 5),
+        declared_context.unmounts.items.len,
+    );
+    try std.testing.expect(!containsArg(
+        declared_context.unmounts.items,
+        root_path ++ "/run/zvmi-resolv.conf",
+    ));
+
+    var idle = declared;
+    idle.packages = .{};
+    var idle_context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .resolver_layout = .regular,
+    };
+    const idle_result = try executeManifest(allocator, io, idle, .{
+        .context = &idle_context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expect(idle_result.operation_succeeded);
+    try std.testing.expect(idle_result.cleanup_complete);
+    try std.testing.expectEqual(@as(usize, 5), idle_context.unmounts.items.len);
+    try std.testing.expect(!containsArg(
+        idle_context.unmounts.items,
+        root_path ++ "/run/zvmi-resolv.conf",
+    ));
+
+    // A manifest the worker will not honour is refused before it creates,
+    // mounts or writes anything as root. The declared resolver is rendered into
+    // the target root while the session is opened, so a check made when the
+    // policy is *run* would arrive after the bytes it guards had been placed --
+    // and an untouched root path is the only assertion that cannot pass by
+    // accident, since every later refusal leaves one behind.
+    const refused_root = "test-unsafe-chroot-resolver-refused-root";
+    defer Io.Dir.cwd().deleteTree(io, refused_root) catch {};
+    var refused = declared;
+    refused.root_path = refused_root;
+    refused.packages.resolver = .{ .nameservers = &.{"127.0.0.53"} };
+    var refused_context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = refused_root,
+        .unmounts = .init(allocator),
+        .resolver_layout = .regular,
+    };
+    const refused_result = try executeManifest(
+        allocator,
+        io,
+        refused,
+        .{ .context = &refused_context, .runFn = FakeExecutorContext.run },
+    );
+    try std.testing.expect(!refused_result.operation_succeeded);
+    // Cleanup is complete because there was nothing to clean up. The parent
+    // reads a propagated error here as "the worker may have left resources
+    // attached" and abandons its lease, poisoning the transaction directory
+    // for a run that touched nothing.
+    try std.testing.expect(refused_result.cleanup_complete);
+    try std.testing.expectError(
+        error.FileNotFound,
+        Io.Dir.cwd().statFile(io, refused_root, .{}),
+    );
+    try std.testing.expectEqual(@as(usize, 0), refused_context.unmounts.items.len);
+}
+
 // A whitespace-carrying name reaching the renderer would silently retarget a
 // `modprobe.d` directive at a different module, so the worker refuses it on
 // its own side of the privilege boundary rather than trusting the request
@@ -2434,6 +2621,28 @@ test "worker refuses kernel module names it would render as two tokens" {
         .packages = .{},
         .initramfs = .unchanged,
     };
+
+    // Same boundary, one field over: an unchecked nameserver carrying a
+    // newline would add directives of its own to the resolver the transaction
+    // runs against, and the worker re-reads this manifest from JSON after
+    // re-execing as root rather than receiving it from the validator.
+    var injected = base;
+    injected.packages = .{ .resolver = .{
+        .nameservers = &.{"192.0.2.1\nsearch attacker.invalid"},
+    } };
+    try std.testing.expectError(
+        error.InvalidNetworkConfiguration,
+        validateManifestPolicy(injected),
+    );
+    // Named apart from the malformed case, because a well-formed address that
+    // means the build machine is a different mistake from one that is not an
+    // address at all, and only the caller can tell them apart from the error.
+    var loopback = base;
+    loopback.packages = .{ .resolver = .{ .nameservers = &.{"127.0.0.53"} } };
+    try std.testing.expectError(
+        error.UnusableNameserver,
+        validateManifestPolicy(loopback),
+    );
 
     var spaced = base;
     spaced.kernel_modules = &.{.{ .name = "overlay -f", .load = true }};
@@ -2512,6 +2721,12 @@ const FakeExecutorContext = struct {
     /// cleanup unmounts and removes it -- so the evidence has to be taken
     /// while the run is still standing.
     modules_present_at_tdnf: bool = false,
+    /// The resolver the package transaction actually saw, read while the run
+    /// is still standing. Null means none was installed. Under
+    /// `host_resolver` the fake never really bind-mounts, so this is the empty
+    /// placeholder the real mount would have covered; under a declared list it
+    /// is the rendered body itself.
+    resolver_at_tdnf: ?[]const u8 = null,
     modules_at_dracut: ?[]const []const u8 = null,
     file_mode_at_dracut: ?u32 = null,
     directory_mode_at_dracut: ?u32 = null,
@@ -2724,6 +2939,7 @@ const FakeExecutorContext = struct {
             self.saw_tdnf_install = true;
             self.modules_present_at_tdnf =
                 self.readTargetFile(os_customization.modprobe_blacklist_path) != null;
+            self.resolver_at_tdnf = self.readTargetFile("run/zvmi-resolv.conf");
             self.saw_repository_isolation =
                 containsArg(argv, "/run/zvmi-tdnf.conf") and
                 containsArg(argv, "--disablerepo=*") and

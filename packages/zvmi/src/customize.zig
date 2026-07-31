@@ -26,11 +26,12 @@ const preserved_image = @import("preserved_image.zig");
 const root_tree = @import("root_tree.zig");
 const transaction_guard = @import("transaction_guard.zig");
 const verity = @import("verity.zig");
+const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 12;
-pub const provenance_schema_version: u32 = 15;
+pub const plan_schema_version: u32 = 13;
+pub const provenance_schema_version: u32 = 16;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -409,6 +410,38 @@ pub const PackagePolicy = struct {
     repositories: []const PackageRepository = &.{},
     cache: PackageCachePolicy = .online,
     lock: PackageLockPolicy = .unlocked,
+    resolver: ResolverPolicy = .host_resolver,
+};
+
+/// Where the package transaction's `/etc/resolv.conf` comes from.
+///
+/// The target root has no reason to name a resolver reachable from wherever
+/// this build runs, so something has to supply one, and until this policy
+/// existed each backend quietly supplied its own. Naming the choice puts it in
+/// the plan, under the plan hash, and into provenance, so a run that resolved
+/// names through the build machine says so.
+///
+/// Whatever is installed is removed again when the transaction ends. This is
+/// build-time configuration, not a property of the image.
+pub const ResolverPolicy = union(enum) {
+    /// The build host's resolver, however this backend reaches it.
+    ///
+    /// `unsafe_chroot` binds the host's own `/etc/resolv.conf` into the target
+    /// root read-only. The VM backend reaches the same resolver indirectly:
+    /// QEMU's user-mode networking answers on `10.0.2.3` by forwarding to
+    /// whatever the host is configured to use.
+    ///
+    /// The default, because it is what a build machine already means by "the
+    /// network", and because the alternative cannot be guessed. It is a
+    /// declared inheritance rather than a silent one: the run states that its
+    /// name resolution came from outside the plan, so two machines producing
+    /// different output is a readable difference rather than a mystery.
+    host_resolver,
+    /// Exactly these nameservers, in this order, and nothing the host knows.
+    ///
+    /// Both backends render the same bytes from the same list, so the resolver
+    /// stops being a property of where the build ran.
+    nameservers: []const []const u8,
 };
 
 pub const HookPhase = enum {
@@ -1220,6 +1253,26 @@ fn validatePackagePolicy(
             }
         },
     }
+    switch (policy.resolver) {
+        .host_resolver => {},
+        // Two refusals with two messages. `127.0.0.53` is one well-formed
+        // dotted quad, so telling its author to check the count and the format
+        // names the only two things they got right.
+        .nameservers => |nameservers| vm_control.validateNameservers(nameservers) catch |err| switch (err) {
+            error.UnusableNameserver => try diagnostics.append(validationError(
+                .invalid_policy,
+                "/packages/resolver/nameservers",
+                "a declared resolver cannot be a loopback, unspecified, multicast or reserved address",
+                "name the resolver by the address other machines reach it on, or select host_resolver to state that this machine's own is meant",
+            )),
+            else => try diagnostics.append(validationError(
+                .invalid_policy,
+                "/packages/resolver/nameservers",
+                "a declared resolver needs one to three dotted-quad IPv4 addresses",
+                "state at most MAXNS nameservers, each as a dotted quad",
+            )),
+        },
+    }
 }
 
 fn validateHooks(
@@ -1470,6 +1523,25 @@ fn validateVmPolicy(
                 "guest networking was requested without any declared repository",
                 "declare the repositories the guest may reach or select offline networking",
             ));
+        },
+    }
+    // A resolver the chroot backend reaches happily can mean something else
+    // entirely from a guest behind user-mode networking, which would make one
+    // hashed plan resolve names two different ways -- the divergence a declared
+    // resolver exists to remove. Addresses outside the subnet are fine: slirp
+    // NATs their traffic out through the host to the same place a chroot would
+    // reach. Addresses inside it are aliases for the build machine.
+    switch (request.packages.resolver) {
+        .host_resolver => {},
+        .nameservers => |nameservers| for (nameservers) |nameserver| {
+            if (vm_control.isUserNetAddress(nameserver)) {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/packages/resolver/nameservers",
+                    "the guest's user-mode network aliases its own subnet to this machine",
+                    "name a resolver outside 10.0.2.0/24, or select host_resolver to state that the build machine's own is meant",
+                ));
+            }
         },
     }
 }
@@ -2000,6 +2072,26 @@ pub const CapabilityKind = enum {
     repository_trust,
     package_cache,
     package_lock,
+    /// Declares that the run's name resolution comes from the build host
+    /// rather than from the request.
+    ///
+    /// Both executing backends inherit it, by different routes.
+    /// `unsafe_chroot` binds the host's own `/etc/resolv.conf` into the target
+    /// root. The VM backend looks like it escapes this and does not: libslirp
+    /// rewrites packets addressed to `10.0.2.3` to whatever `get_dns_addr`
+    /// returns, and on Linux that reads `/etc/resolv.conf` in the emulator
+    /// process. So the guest's answers depend on the build machine exactly as
+    /// much; only the process that opens the file differs.
+    ///
+    /// It is a declaration rather than a probe -- `systemCapabilityCheck`
+    /// always reports it available -- because the executors tolerate a host
+    /// with no resolver, and rightly: a transaction whose repository URLs are
+    /// literal addresses, or that only removes packages, resolves no names at
+    /// all. Refusing those runs for a file they never read would be a false
+    /// refusal. Its job is to name the one input the plan does not carry, so a
+    /// consumer that requires every input to come from the request can refuse
+    /// exactly this.
+    read_host_resolver,
     script_execution,
     guest_execution,
     initramfs_regeneration,
@@ -2805,6 +2897,12 @@ fn dupePackagePolicy(
         .repositories = repositories,
         .cache = policy.cache,
         .lock = lock,
+        .resolver = switch (policy.resolver) {
+            .host_resolver => .host_resolver,
+            .nameservers => |nameservers| .{
+                .nameservers = try dupeStrings(allocator, nameservers),
+            },
+        },
     };
 }
 
@@ -3384,6 +3482,30 @@ fn buildCapabilities(
     if (packages.lock != .unlocked) {
         try capabilities.append(.{ .kind = .package_lock, .path = "", .reason = "enforce the declared package snapshot or exact-version lock" });
     }
+    // The chroot backend unshares only mount and pid, so its transaction always
+    // resolves through the build host. A guest does so only when it is given
+    // the network that reaches it: an offline guest is started with `-nic none`,
+    // so there is no route to a host resolver for it to take and a plan must
+    // not declare a dependence the run cannot have. Today the VM backend also
+    // refuses the cache-only policy that is the only way an offline guest could
+    // carry package actions, so the two terms overlap; the capability set has
+    // to be a function of what the run does rather than of which refusal
+    // happens to be in force.
+    const resolves_through_host = switch (execution.backend) {
+        .unsafe_chroot => true,
+        .vm => if (execution.vm) |vm| vm.network == .declared_repositories else false,
+        else => false,
+    };
+    if (resolves_through_host and
+        packages.actions.len != 0 and
+        packages.resolver == .host_resolver)
+    {
+        try capabilities.append(.{
+            .kind = .read_host_resolver,
+            .path = "/etc/resolv.conf",
+            .reason = "resolve package repository names through the build host's resolver",
+        });
+    }
     if (hooks.len != 0) {
         try capabilities.append(.{ .kind = .script_execution, .path = "", .reason = "execute explicitly acknowledged scripts using an unsafe-capable backend" });
         try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "execute target hook code" });
@@ -3845,6 +3967,11 @@ fn hashPackagePolicy(hash: *std.crypto.hash.sha2.Sha256, policy: PackagePolicy) 
                 hashString(hash, lock.repository_id);
             }
         },
+    }
+    hashInt(hash, @intFromEnum(std.meta.activeTag(policy.resolver)));
+    switch (policy.resolver) {
+        .host_resolver => {},
+        .nameservers => |nameservers| hashStrings(hash, nameservers),
     }
 }
 
@@ -4419,6 +4546,11 @@ fn systemCapabilityCheck(_: ?*anyopaque, io: Io, requirement: CapabilityRequirem
         .partition_edit,
         .standalone_output,
         .atomic_commit,
+        // A declaration, not a probe: the executors tolerate a host with no
+        // resolver because a transaction can resolve no names at all, so a
+        // `missing` here would refuse runs that never read the file. Naming
+        // it in the plan is the whole job.
+        .read_host_resolver,
         => .available,
         .rebuild,
         .unsafe_chroot,
@@ -8232,7 +8364,15 @@ test "plan JSON renders identifiers as stable strings" {
     defer output.deinit();
     try writePlanJson(&resolved.plan.?, &output.writer);
     const json = output.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 12") != null);
+    // Formatted from the constant rather than written out, so a bump that
+    // forgets this test cannot be reported as the JSON losing its version.
+    const expected_version = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "\"schema_version\": {d}",
+        .{plan_schema_version},
+    );
+    defer std.testing.allocator.free(expected_version);
+    try std.testing.expect(std.mem.indexOf(u8, json, expected_version) != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"plan_hash\": \"") != null);
 }
 
@@ -8906,4 +9046,269 @@ test "a when_needed plan is byte-identical to the explicit plan it resolves to" 
         &explicit_resolved.plan.?.data.plan_hash.bytes,
         &derived_resolved.plan.?.data.plan_hash.bytes,
     );
+}
+
+fn resolverRequest(resolver: ResolverPolicy) Request {
+    const actions = struct {
+        const value = [_]PackageAction{.{ .install = &.{"dracut"} }};
+    };
+    const repositories = struct {
+        const value = [_]PackageRepository{.{
+            .id = "base",
+            .urls = &.{"https://packages.example.invalid"},
+            .trust = &.{.{ .inline_bytes = "test key" }},
+        }};
+    };
+    var request = whenNeededRequest();
+    request.packages = .{
+        .actions = &actions.value,
+        .repositories = &repositories.value,
+        .resolver = resolver,
+    };
+    return request;
+}
+
+test "a declared resolver must be one to three dotted quads" {
+    // `MAXNS` is the bound because it is the bound a resolver library applies.
+    // Accepting a fourth would record a nameserver in the plan that the run
+    // demonstrably never asks, which is worse than refusing it.
+    const rejected = [_][]const []const u8{
+        &.{},
+        &.{ "192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4" },
+        &.{"resolver.example.invalid"},
+        &.{"192.0.2.256"},
+        &.{"192.0.2"},
+        &.{""},
+        // Loopback is the trap worth naming. `127.0.0.53` reaches the build
+        // host's own stub resolver from a chroot, which shares the host's
+        // network namespace, and reaches nothing from inside a guest -- so it
+        // is both the likeliest thing to copy off a working machine and a
+        // silent way back to the dependence the declaration removes.
+        &.{"127.0.0.53"},
+        &.{"127.0.0.1"},
+        &.{"0.0.0.0"},
+        &.{"224.0.0.1"},
+        &.{"255.255.255.255"},
+        &.{ "192.0.2.1", "127.0.0.53" },
+    };
+    for (rejected) |nameservers| {
+        var request = resolverRequest(.{ .nameservers = nameservers });
+        var resolved = try resolve(
+            std.testing.allocator,
+            &request,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer resolved.deinit(std.testing.allocator);
+        try std.testing.expect(resolved.plan == null);
+        try std.testing.expect(hasDiagnosticCode(
+            resolved.diagnostics,
+            .invalid_policy,
+        ));
+    }
+
+    // Refusing is not enough: `127.0.0.53` is one well-formed dotted quad, so
+    // a message about the count and the format would name the only two things
+    // its author got right and send them back to re-check both.
+    var loopback = resolverRequest(.{ .nameservers = &.{"127.0.0.53"} });
+    var loopback_resolved = try resolve(
+        std.testing.allocator,
+        &loopback,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer loopback_resolved.deinit(std.testing.allocator);
+    var named_loopback = false;
+    for (loopback_resolved.diagnostics.items) |diagnostic| {
+        if (std.mem.indexOf(u8, diagnostic.message, "loopback") != null) {
+            named_loopback = true;
+        }
+    }
+    try std.testing.expect(named_loopback);
+
+    var accepted = resolverRequest(.{ .nameservers = &.{ "192.0.2.1", "198.51.100.7" } });
+    var resolved = try resolve(
+        std.testing.allocator,
+        &accepted,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.plan != null);
+    try std.testing.expectEqualStrings(
+        "198.51.100.7",
+        resolved.plan.?.data.packages.resolver.nameservers[1],
+    );
+}
+
+test "the plan hash covers where name resolution came from" {
+    // The point of declaring the resolver at all. If the hash did not cover
+    // it, two runs that resolved repository names through different servers --
+    // and so could have installed different bytes -- would claim to be the
+    // same plan.
+    var inherited = resolverRequest(.host_resolver);
+    var declared = resolverRequest(.{ .nameservers = &.{"192.0.2.1"} });
+    var other = resolverRequest(.{ .nameservers = &.{"198.51.100.7"} });
+
+    var inherited_resolved = try resolve(
+        std.testing.allocator,
+        &inherited,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer inherited_resolved.deinit(std.testing.allocator);
+    var declared_resolved = try resolve(
+        std.testing.allocator,
+        &declared,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer declared_resolved.deinit(std.testing.allocator);
+    var other_resolved = try resolve(
+        std.testing.allocator,
+        &other,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer other_resolved.deinit(std.testing.allocator);
+
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &inherited_resolved.plan.?.data.plan_hash.bytes,
+        &declared_resolved.plan.?.data.plan_hash.bytes,
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &declared_resolved.plan.?.data.plan_hash.bytes,
+        &other_resolved.plan.?.data.plan_hash.bytes,
+    ));
+}
+
+test "both executing backends declare inheriting the host resolver" {
+    // The capability is the visible half of the declaration: a consumer that
+    // requires every input to come from the request can refuse exactly this
+    // one. The VM backend looks like it escapes the dependence and does not --
+    // libslirp answers `10.0.2.3` by forwarding to whatever `/etc/resolv.conf`
+    // names in the emulator process -- so declaring it for the chroot alone
+    // would let the same request shed the capability by changing backend while
+    // keeping every bit of the dependence.
+    for ([_]ExecutionBackend{ .unsafe_chroot, .vm }) |backend| {
+        var inherited = resolverRequest(.host_resolver);
+        var declared = resolverRequest(.{ .nameservers = &.{"192.0.2.1"} });
+        if (backend == .vm) {
+            inherited.execution.backend = .vm;
+            inherited.execution.vm = validVmPolicy();
+            inherited.execution.vm.?.network = .declared_repositories;
+            declared.execution.backend = .vm;
+            declared.execution.vm = validVmPolicy();
+            declared.execution.vm.?.network = .declared_repositories;
+        }
+
+        var inherited_resolved = try resolve(
+            std.testing.allocator,
+            &inherited,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer inherited_resolved.deinit(std.testing.allocator);
+        var declared_resolved = try resolve(
+            std.testing.allocator,
+            &declared,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer declared_resolved.deinit(std.testing.allocator);
+
+        try std.testing.expect(hasCapabilityKind(
+            inherited_resolved.plan.?.data.required_capabilities,
+            .read_host_resolver,
+        ));
+        try std.testing.expect(!hasCapabilityKind(
+            declared_resolved.plan.?.data.required_capabilities,
+            .read_host_resolver,
+        ));
+    }
+
+    // An offline guest is started with `-nic none`, so there is no route to a
+    // host resolver whatever the policy says. The only shape that gets package
+    // actions into one is a cache-only policy, which the VM backend separately
+    // refuses at preflight today -- so this pins the rule rather than a
+    // currently reachable run, and stops the capability from being right only
+    // for as long as that second refusal happens to stand.
+    var offline = resolverRequest(.host_resolver);
+    offline.packages.cache = .cache_only;
+    offline.execution.backend = .vm;
+    offline.execution.vm = validVmPolicy();
+    offline.execution.vm.?.network = .offline;
+    var offline_resolved = try resolve(
+        std.testing.allocator,
+        &offline,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer offline_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(!hasCapabilityKind(
+        offline_resolved.plan.?.data.required_capabilities,
+        .read_host_resolver,
+    ));
+
+    // And it never gates a run, because the executors tolerate a host with no
+    // resolver: a transaction that only removes packages, or whose repository
+    // URLs are literal addresses, resolves no names at all.
+    try std.testing.expectEqual(
+        CapabilityState.available,
+        systemCapabilityCheck(null, std.testing.io, .{
+            .kind = .read_host_resolver,
+            .path = "/no/such/resolv.conf",
+            .reason = "",
+        }),
+    );
+}
+
+test "a guest cannot be pointed at its own network's alias for this machine" {
+    // Outside 10.0.2.0/24 slirp NATs the traffic out through real host sockets,
+    // so a declared resolver reaches exactly what a chroot would reach. Inside
+    // it nothing does: 10.0.2.3 is answered by rewriting the packet to whatever
+    // the emulator process's own `/etc/resolv.conf` names, and every other
+    // in-subnet address is rewritten to the build host's loopback.
+    //
+    // 10.0.2.3 has to be refused rather than waved through as "what
+    // host_resolver uses anyway". `controlFromPolicy` would render a control
+    // document byte-identical to `host_resolver`'s, so accepting it would let a
+    // request shed the `read_host_resolver` capability while keeping the whole
+    // dependence on the build machine -- defeating the one consumer a declared
+    // resolver exists to serve. It is also the inverse of the loopback rule:
+    // 127.0.0.53 is refused for working on the chroot backend and failing in a
+    // guest, and this would be permitted for the reverse.
+    const rejected = [_][]const u8{ "10.0.2.2", "10.0.2.15", "10.0.2.1", "10.0.2.3" };
+    for (rejected) |nameserver| {
+        var request = resolverRequest(.{ .nameservers = &.{nameserver} });
+        request.execution.backend = .vm;
+        request.execution.vm = validVmPolicy();
+        request.execution.vm.?.network = .declared_repositories;
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(diagnostics.hasErrors());
+    }
+
+    // The same addresses are unremarkable on the backend that has no such
+    // network, so the refusal has to be the VM policy's rather than the
+    // resolver's.
+    for (rejected) |nameserver| {
+        var request = resolverRequest(.{ .nameservers = &.{nameserver} });
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(!diagnostics.hasErrors());
+    }
+
+    // The rule is the subnet and not "declared resolvers are suspect": an
+    // address slirp forwards is accepted on the same backend.
+    var accepted = resolverRequest(.{ .nameservers = &.{"10.1.2.3"} });
+    accepted.execution.backend = .vm;
+    accepted.execution.vm = validVmPolicy();
+    accepted.execution.vm.?.network = .declared_repositories;
+    var diagnostics = try validate(std.testing.allocator, &accepted);
+    defer diagnostics.deinit(std.testing.allocator);
+    try std.testing.expect(!diagnostics.hasErrors());
+}
+
+fn hasCapabilityKind(
+    capabilities: []const CapabilityRequirement,
+    kind: CapabilityKind,
+) bool {
+    for (capabilities) |capability| {
+        if (capability.kind == kind) return true;
+    }
+    return false;
 }
