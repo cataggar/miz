@@ -510,6 +510,10 @@ const Session = struct {
         switch (self.manifest.initramfs) {
             .unchanged => {},
             .regenerate => |regenerate| try self.regenerateInitramfs(regenerate),
+            // `validateManifestPolicy` already refused this; repeated here
+            // because the run itself must not treat an undecided policy as a
+            // decision to do nothing.
+            .when_needed => return error.UnresolvedInitramfsPolicy,
         }
     }
 
@@ -938,7 +942,16 @@ const Session = struct {
         const kernels = if (regenerate.kernels.len > 0)
             regenerate.kernels
         else
-            try self.installedKernels();
+            self.installedKernels() catch |err| switch (err) {
+                // A derived regeneration asks a question the plan could not
+                // answer, so a root with no kernel is the answer "nothing is
+                // stale" rather than an unmet instruction.
+                error.NoInstalledKernels => switch (regenerate.no_installed_kernels) {
+                    .fail => return err,
+                    .nothing_to_regenerate => return,
+                },
+                else => return err,
+            };
         defer if (regenerate.kernels.len == 0) {
             for (kernels) |kernel| self.allocator.free(kernel);
             self.allocator.free(kernels);
@@ -998,11 +1011,20 @@ const Session = struct {
         );
         defer self.allocator.free(modules_path);
 
+        // No module tree at all is the one shape that honestly means no kernel
+        // is installed. Every other failure -- a `/lib/modules` that is a
+        // file, a symlink loop, EIO, a descriptor limit -- is a failure to
+        // find out, and must not be reported as an answer: under
+        // `nothing_to_regenerate` that answer is accepted, and the build would
+        // ship the initramfs the package transaction just invalidated.
         var modules_dir = Io.Dir.cwd().openDir(
             self.io,
             modules_path,
             .{ .iterate = true },
-        ) catch return error.NoInstalledKernels;
+        ) catch |err| switch (err) {
+            error.FileNotFound => return error.NoInstalledKernels,
+            else => return err,
+        };
         defer modules_dir.close(self.io);
 
         var releases: std.array_list.Managed([]const u8) = .init(self.allocator);
@@ -1021,10 +1043,18 @@ const Session = struct {
             // Deliberately no check on the entry kind: `d_type` is `unknown`
             // on filesystems that do not carry it, and a non-directory cannot
             // be opened as one anyway, so the marker below settles it.
-            var release_dir = modules_dir.openDir(self.io, entry.name, .{}) catch continue;
+            var release_dir = modules_dir.openDir(self.io, entry.name, .{}) catch |err| switch (err) {
+                // Not a directory, or gone between the read and the open:
+                // either way this entry is not an installed kernel. Every
+                // other failure is a failure to find out, and skipping on one
+                // reaches the same silent stale initramfs the guarded open
+                // above refuses -- an empty discovered set is accepted as
+                // "nothing is stale" under `nothing_to_regenerate`.
+                error.NotDir, error.FileNotFound => continue,
+                else => return err,
+            };
             defer release_dir.close(self.io);
-            release_dir.access(self.io, "modules.dep", .{}) catch
-                release_dir.access(self.io, "modules.dep.bin", .{}) catch continue;
+            if (!try hasDepmodOutput(self.io, release_dir)) continue;
 
             try releases.append(try self.allocator.dupe(u8, entry.name));
         }
@@ -1424,6 +1454,11 @@ fn validateManifestPolicy(manifest: Manifest) !void {
                 }
             }
         },
+        // The host resolves this away before the plan is built, so a manifest
+        // carrying it did not come from a plan this worker should run. Refused
+        // by name rather than treated as either outcome: guessing here would
+        // either skip work the caller asked for or do work it did not.
+        .when_needed => return error.UnresolvedInitramfsPolicy,
     }
     // The request validator already refused these, but the worker sits across
     // the privilege boundary and does not trust the manifest it is handed. A
@@ -1500,6 +1535,26 @@ fn validPackageName(name: []const u8) bool {
 
 fn lessThanBytes(_: void, left: []const u8, right: []const u8) bool {
     return std.mem.lessThan(u8, left, right);
+}
+
+/// Whether depmod left its output beside a release, which is what separates an
+/// installed kernel from the firmware directories and stray names that share
+/// `/lib/modules` with it.
+///
+/// An absent marker is an answer: this is not a kernel. A marker that cannot
+/// be looked at is not, and returning `false` for one would drop a real kernel
+/// from the discovered set -- a set that came up empty that way is accepted as
+/// "nothing is stale" whenever the host derived the regeneration rather than
+/// being asked for it, and the run would ship the initramfs it invalidated.
+fn hasDepmodOutput(io: Io, release_dir: Io.Dir) !bool {
+    for ([_][]const u8{ "modules.dep", "modules.dep.bin" }) |marker| {
+        release_dir.access(io, marker, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        return true;
+    }
+    return false;
 }
 
 fn validKernelRelease(kernel: []const u8) bool {
@@ -2197,6 +2252,81 @@ test "worker regenerates every installed kernel when the policy names none" {
     });
     try std.testing.expect(!empty.operation_succeeded);
     try std.testing.expect(!empty_context.saw_dracut);
+
+    // Unless the host derived the regeneration rather than being asked for
+    // it, in which case an empty module tree is the answer "nothing here is
+    // stale". The same target, the same empty tree, the opposite outcome --
+    // the difference is entirely in what the plan claimed.
+    var derived_manifest = manifest;
+    derived_manifest.initramfs = .{ .regenerate = .{
+        .generator = "dracut",
+        .no_installed_kernels = .nothing_to_regenerate,
+    } };
+    var derived_context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .installed_kernels = &.{.{ .release = "firmware", .marker = null }},
+    };
+    const derived = try executeManifest(allocator, io, derived_manifest, .{
+        .context = &derived_context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expect(derived.operation_succeeded);
+    try std.testing.expect(derived.cleanup_complete);
+    try std.testing.expect(!derived_context.saw_dracut);
+
+    // Tolerating "none installed" must not extend to tolerating "could not
+    // find out". A `lib/modules` that cannot be read as a directory is not
+    // evidence that nothing is stale, and accepting it as such would ship the
+    // initramfs the package transaction had just invalidated -- silently, and
+    // only on the derived path.
+    // Its own root: the sub-cases above left a real `lib/modules` directory
+    // behind, and writing the file over it would fail in the fake's setup
+    // rather than in discovery -- the test would pass without proving
+    // anything.
+    const unreadable_root = "test-unsafe-chroot-unreadable-modules-root";
+    defer Io.Dir.cwd().deleteTree(io, unreadable_root) catch {};
+    var unreadable_manifest = derived_manifest;
+    unreadable_manifest.root_path = unreadable_root;
+    var unreadable_context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = unreadable_root,
+        .unmounts = .init(allocator),
+        .modules_path_is_file = true,
+    };
+    const unreadable = try executeManifest(allocator, io, unreadable_manifest, .{
+        .context = &unreadable_context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expect(!unreadable.operation_succeeded);
+    try std.testing.expect(!unreadable_context.saw_dracut);
+
+    // The same distinction one level in: a release directory that cannot be
+    // searched is not evidence that the kernel inside it has no modules. If
+    // the probe skipped it the set would come up empty, and an empty set is
+    // exactly what `nothing_to_regenerate` accepts.
+    const locked_root = "test-unsafe-chroot-locked-release-root";
+    defer Io.Dir.cwd().deleteTree(io, locked_root) catch {};
+    var locked_manifest = derived_manifest;
+    locked_manifest.root_path = locked_root;
+    var locked_context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = locked_root,
+        .unmounts = .init(allocator),
+        .installed_kernels = &.{
+            .{ .release = "6.12.0-locked.azl", .marker_loops = true },
+        },
+    };
+    const locked = try executeManifest(allocator, io, locked_manifest, .{
+        .context = &locked_context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expect(!locked.operation_succeeded);
+    try std.testing.expect(!locked_context.saw_dracut);
 }
 
 test "worker places kernel-module configuration after packages and before dracut" {
@@ -2343,6 +2473,11 @@ const FakeResolverLayout = enum { regular, symlink, missing };
 const FakeKernel = struct {
     release: []const u8,
     marker: ?[]const u8 = "modules.dep",
+    /// Makes the depmod marker a symlink to itself, so probing it fails with
+    /// `SymLinkLoop` rather than reporting it absent. This isolates the probe
+    /// -- an unsearchable directory would fail the directory open instead,
+    /// which is a different guard, and would also defeat cleanup.
+    marker_loops: bool = false,
 };
 
 const FakeExecutorContext = struct {
@@ -2355,6 +2490,10 @@ const FakeExecutorContext = struct {
     saw_tdnf_remove: bool = false,
     saw_dracut: bool = false,
     installed_kernels: []const FakeKernel = &.{},
+    /// Makes `lib/modules` a regular file, so discovery fails to read the tree
+    /// rather than reading an empty one. The two must not arrive as the same
+    /// answer once the host is willing to tolerate "none installed".
+    modules_path_is_file: bool = false,
     detached_loop: bool = false,
     detached_loops: usize = 0,
     fail_tdnf: bool = false,
@@ -2505,6 +2644,20 @@ const FakeExecutorContext = struct {
             }
             // Mounting is what makes the target root's contents visible, so
             // it is where a fake target grows its installed kernels.
+            if (self.modules_path_is_file) {
+                const lib = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}/lib",
+                    .{self.root_path},
+                );
+                try Io.Dir.cwd().createDirPath(self.io, lib);
+                const modules = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}/modules",
+                    .{lib},
+                );
+                try writeBytes(self.io, modules, "");
+            }
             for (self.installed_kernels) |kernel| {
                 const directory = try std.fmt.allocPrint(
                     self.allocator,
@@ -2512,13 +2665,23 @@ const FakeExecutorContext = struct {
                     .{ self.root_path, kernel.release },
                 );
                 try Io.Dir.cwd().createDirPath(self.io, directory);
-                const marker_name = kernel.marker orelse continue;
-                const marker = try std.fmt.allocPrint(
-                    self.allocator,
-                    "{s}/{s}",
-                    .{ directory, marker_name },
-                );
-                try writeBytes(self.io, marker, "");
+                if (kernel.marker) |marker_name| {
+                    const marker = try std.fmt.allocPrint(
+                        self.allocator,
+                        "{s}/{s}",
+                        .{ directory, marker_name },
+                    );
+                    if (kernel.marker_loops) {
+                        try Io.Dir.cwd().symLink(
+                            self.io,
+                            marker_name,
+                            marker,
+                            .{},
+                        );
+                    } else {
+                        try writeBytes(self.io, marker, "");
+                    }
+                }
             }
         }
         if (std.mem.endsWith(u8, argv[0], "umount")) {

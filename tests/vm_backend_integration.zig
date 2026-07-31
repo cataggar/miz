@@ -131,7 +131,7 @@ fn runSuccess(
         if (diagnostic.code == .cleanup_failed) return error.CleanupFailed;
     }
 
-    try ensure(result.provenance.schema_version == 14);
+    try ensure(result.provenance.schema_version == zvmi.customize.provenance_schema_version);
     const vm = result.provenance.execution.vm orelse
         return error.MissingVmProvenance;
     try ensure(std.mem.eql(u8, vm.emulator_command, workspace.emulator_path));
@@ -325,7 +325,7 @@ fn runFirmwareBootMatchesDirectKernel(
     try ensure(std.mem.eql(u8, &direct_digest, &try digestOfFile(io, workspace.output_path)));
 
     const result = attested.result.?;
-    try ensure(result.provenance.schema_version == 14);
+    try ensure(result.provenance.schema_version == zvmi.customize.provenance_schema_version);
     const vm = result.provenance.execution.vm orelse return error.MissingVmProvenance;
     // The two modes are distinguishable in provenance, which is the whole
     // reason the record is a union rather than a flag.

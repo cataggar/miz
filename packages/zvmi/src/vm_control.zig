@@ -153,6 +153,11 @@ pub const Action = union(enum) {
     update_selected: []const []const u8,
 };
 
+pub const NoInstalledKernelsPolicy = enum {
+    fail,
+    nothing_to_regenerate,
+};
+
 pub const Initramfs = union(enum) {
     /// The image's initramfs is left exactly as it was found.
     unchanged,
@@ -163,6 +168,11 @@ pub const Initramfs = union(enum) {
     /// document cannot express "regenerate nothing in particular".
     regenerate: struct {
         kernels: []const []const u8 = &.{},
+        /// Whether discovering no installed kernel is a failure or simply
+        /// nothing to do. The host decides this, because only the host knows
+        /// whether the regeneration was asked for or derived; the guest can
+        /// only see that the tree is empty.
+        no_installed_kernels: NoInstalledKernelsPolicy = .fail,
     },
 };
 

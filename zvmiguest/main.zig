@@ -149,7 +149,16 @@ const Session = struct {
                 const kernels = if (regenerate.kernels.len > 0)
                     regenerate.kernels
                 else
-                    self.installedKernels() catch |err| {
+                    self.installedKernels() catch |err| blk: {
+                        // A regeneration the host derived rather than was
+                        // asked for treats an empty module tree as nothing to
+                        // do; an explicit one still fails, because it named
+                        // work it then did not carry out.
+                        if (err == error.NoInstalledKernels and
+                            regenerate.no_installed_kernels == .nothing_to_regenerate)
+                        {
+                            break :blk &.{};
+                        }
                         return self.stageFailure("initramfs", err);
                     };
                 for (kernels) |kernel| {
@@ -558,7 +567,15 @@ fn discoverKernels(allocator: Allocator, modules_path: []const u8) ![]const []co
     const modules_z = try allocator.dupeZ(u8, modules_path);
     defer allocator.free(modules_z);
     const fd_raw = linux.open(modules_z, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
-    if (linux.errno(fd_raw) != .SUCCESS) return error.NoInstalledKernels;
+    switch (linux.errno(fd_raw)) {
+        .SUCCESS => {},
+        // Absent is an answer: nothing is installed. Anything else -- a
+        // `/lib/modules` that is not a directory, a symlink loop, EIO -- is a
+        // failure to find out, and the host may be tolerating "none found",
+        // in which case reporting it as none would ship a stale initramfs.
+        .NOENT => return error.NoInstalledKernels,
+        else => return error.OpenFailed,
+    }
     const fd: i32 = @intCast(fd_raw);
     defer _ = linux.close(fd);
 
@@ -588,7 +605,7 @@ fn discoverKernels(allocator: Allocator, modules_path: []const u8) ![]const []co
             // for carrying cannot become acceptable by being discovered
             // instead. This also excludes "." and "..".
             if (!control_mod.validKernelRelease(name)) continue;
-            if (!hasDepmodOutput(allocator, modules_path, name)) continue;
+            if (!try hasDepmodOutput(allocator, modules_path, name)) continue;
 
             try releases.append(try allocator.dupe(u8, name));
         }
@@ -598,16 +615,33 @@ fn discoverKernels(allocator: Allocator, modules_path: []const u8) ![]const []co
     return releases.items;
 }
 
-fn hasDepmodOutput(allocator: Allocator, modules_path: []const u8, release: []const u8) bool {
+// Fallible rather than returning a bare `false`: running out of memory while
+// building a path is not evidence that the kernel beside it has no modules,
+// and dropping a release on that basis skips an initramfs the caller asked to
+// have regenerated.
+fn hasDepmodOutput(allocator: Allocator, modules_path: []const u8, release: []const u8) !bool {
     for ([_][]const u8{ "modules.dep", "modules.dep.bin" }) |marker| {
-        const path = std.fmt.allocPrintSentinel(
+        const path = try std.fmt.allocPrintSentinel(
             allocator,
             "{s}/{s}/{s}",
             .{ modules_path, release, marker },
             0,
-        ) catch return false;
+        );
         defer allocator.free(path);
-        if (fileExists(path)) return true;
+        // Absent -- or reached through something that is not a directory --
+        // means this entry is not a kernel. Every other errno means the run
+        // does not know, and answering "not a kernel" would drop a real
+        // kernel from the set; a set emptied that way is accepted as
+        // "nothing is stale" under `nothing_to_regenerate`.
+        const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                _ = linux.close(@intCast(rc));
+                return true;
+            },
+            .NOENT, .NOTDIR => continue,
+            else => return error.OpenFailed,
+        }
     }
     return false;
 }
@@ -892,15 +926,6 @@ fn isDirectory(path: [*:0]const u8) bool {
     return true;
 }
 
-/// The counterpart to `isDirectory`, and equally layout-free: a successful
-/// read-only open is the only evidence needed.
-fn fileExists(path: [*:0]const u8) bool {
-    const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
-    if (linux.errno(rc) != .SUCCESS) return false;
-    _ = linux.close(@intCast(rc));
-    return true;
-}
-
 /// Polls rather than waiting on uevents: a poll needs no netlink socket, no
 /// parser, and no second failure mode, and the wait it replaces is measured in
 /// milliseconds on every boot that is going to succeed at all.
@@ -1078,11 +1103,36 @@ test "kernel discovery follows dracut's rule and refuses to find nothing" {
     try std.testing.expectEqualStrings("6.12.0-10.azl", found[0]);
     try std.testing.expectEqualStrings("6.12.0-2.azl", found[1]);
 
-    // A path that is not a directory at all reads as nothing installed
-    // rather than as an unhandled error out of the scan.
+    // An absent module tree is the only shape that reads as nothing
+    // installed. The host may be tolerating that answer -- a regeneration it
+    // derived rather than was asked for treats "none found" as nothing stale
+    // -- so a path that could not be read must not arrive as the same answer,
+    // or a package transaction would ship the initramfs it invalidated.
     try std.testing.expectError(
         error.NoInstalledKernels,
+        discoverKernels(allocator, modules_path ++ "/absent"),
+    );
+    try std.testing.expectError(
+        error.OpenFailed,
         discoverKernels(allocator, "/dev/null"),
+    );
+    try std.testing.expectError(
+        error.OpenFailed,
+        discoverKernels(allocator, modules_path ++ "/6.12.0-2.azl/modules.dep"),
+    );
+
+    // The same distinction one level in. A release directory that cannot be
+    // searched is not evidence that the kernel inside it has no modules, and
+    // skipping it would drop a real kernel from the set -- an empty set is
+    // accepted as "nothing is stale" whenever the host derived the
+    // regeneration, so this has to reach the caller as a failure.
+    try mkdirPath(modules_path ++ "/6.12.0-locked.azl");
+    try writeFileBytes(allocator, modules_path ++ "/6.12.0-locked.azl/modules.dep", "");
+    try setMode(allocator, modules_path ++ "/6.12.0-locked.azl", 0o000);
+    defer setMode(allocator, modules_path ++ "/6.12.0-locked.azl", 0o755) catch {};
+    try std.testing.expectError(
+        error.OpenFailed,
+        discoverKernels(allocator, modules_path),
     );
 }
 
