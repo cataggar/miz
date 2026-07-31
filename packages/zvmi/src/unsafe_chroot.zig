@@ -1041,6 +1041,42 @@ const Session = struct {
     /// No chroot and no guest binary: these are inert configuration files, so
     /// writing them directly is both simpler and the only option that works
     /// on an image whose own tooling has not been made runnable yet.
+    /// Creates a rendered file's directory, stating the mode on the
+    /// components it actually creates and leaving alone the ones the image
+    /// already had -- `/etc` belongs to the image, `/etc/modprobe.d` belongs
+    /// to whoever made it.
+    ///
+    /// `mkdir` masks the mode it is given by the umask, which for this
+    /// executor is the invoking shell's, so a stated mode is not enough on
+    /// its own: under `umask 0` an unstated `/etc/modprobe.d` comes out
+    /// `0o777`, and `modprobe` reads that directory as root at boot and
+    /// honours `install` directives, which run a shell command. The other two
+    /// backends are already deterministic here -- the guest is PID 1 under
+    /// the kernel's own `0o022`, and a rebuild writes the mode into the
+    /// filesystem with no umask in the picture -- so this is also what keeps
+    /// one request producing one result whichever backend runs it.
+    fn createConfigDirectory(self: *Session, directory: []const u8) !void {
+        var index: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, directory, index + 1, '/')) |separator| {
+            try self.createOneDirectory(directory[0..separator]);
+            index = separator;
+        }
+        try self.createOneDirectory(directory);
+    }
+
+    fn createOneDirectory(self: *Session, path: []const u8) !void {
+        Io.Dir.cwd().createDir(self.io, path, @enumFromInt(0o755)) catch |err| switch (err) {
+            error.PathAlreadyExists => return,
+            else => return err,
+        };
+        // `mkdir` masks the mode it was given, so it is set again here. The
+        // handle has to be openable for `fchmod`, which an `O_PATH` one is
+        // not -- `iterate` is what asks for a real descriptor.
+        var opened = try Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true });
+        defer opened.close(self.io);
+        try opened.setPermissions(self.io, @enumFromInt(0o755));
+    }
+
     fn writeKernelModuleFiles(self: *Session) !void {
         const rendered = try os_customization.renderKernelModules(
             self.allocator,
@@ -1057,7 +1093,7 @@ const Session = struct {
             );
             defer self.allocator.free(path);
             const directory = std.fs.path.dirname(path).?;
-            try Io.Dir.cwd().createDirPath(self.io, directory);
+            try self.createConfigDirectory(directory);
             // The mode is stated rather than inherited. `createFile` defaults
             // to `0o666` masked by whatever umask the builder was invoked
             // with, and `modprobe` parses these as root at boot -- a
@@ -2168,6 +2204,12 @@ test "worker places kernel-module configuration after packages and before dracut
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
+    // A permissive umask, restored afterwards, because the point of stating
+    // the modes is that they do not depend on the builder's umask -- and a
+    // test run under the default `0o022` cannot tell a stated mode from an
+    // inherited one.
+    const previous_umask = std.os.linux.syscall1(.umask, 0);
+    defer _ = std.os.linux.syscall1(.umask, previous_umask);
     const root_path = "test-unsafe-chroot-modules-root";
     const raw_path = "test-unsafe-chroot-modules-stage.raw";
     defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
@@ -2234,6 +2276,15 @@ test "worker places kernel-module configuration after packages and before dracut
     try std.testing.expectEqualStrings("overlay\n", at_dracut[0]);
     try std.testing.expectEqualStrings("blacklist floppy\n", at_dracut[1]);
     try std.testing.expectEqualStrings("options i915 enable_guc=2\n", at_dracut[2]);
+
+    // The modes are stated, not inherited. `mkdir` and `createFile` are both
+    // masked by the invoking shell's umask, and `modprobe` reads these as
+    // root at boot -- a world-writable `modprobe.d` lets any user in the
+    // finished image run a command as root through an `install` directive.
+    // The permissive umask is set here rather than assumed absent, since a
+    // test that only passes under the developer's umask proves nothing.
+    try std.testing.expectEqual(@as(u32, 0o644), context.file_mode_at_dracut.?);
+    try std.testing.expectEqual(@as(u32, 0o755), context.directory_mode_at_dracut.?);
 }
 
 // A whitespace-carrying name reaching the renderer would silently retarget a
@@ -2323,6 +2374,8 @@ const FakeExecutorContext = struct {
     /// while the run is still standing.
     modules_present_at_tdnf: bool = false,
     modules_at_dracut: ?[]const []const u8 = null,
+    file_mode_at_dracut: ?u32 = null,
+    directory_mode_at_dracut: ?u32 = null,
 
     fn readTargetFile(self: *FakeExecutorContext, relative: []const u8) ?[]const u8 {
         const path = std.fmt.allocPrint(
@@ -2337,6 +2390,17 @@ const FakeExecutorContext = struct {
             self.allocator,
             .unlimited,
         ) catch null;
+    }
+
+    fn modeOf(self: *FakeExecutorContext, relative: []const u8) ?u32 {
+        const path = std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}",
+            .{ self.root_path, relative },
+        ) catch return null;
+        defer self.allocator.free(path);
+        const status = Io.Dir.cwd().statFile(self.io, path, .{}) catch return null;
+        return @intFromEnum(status.permissions) & 0o7777;
     }
 
     fn snapshotKernelModuleFiles(self: *FakeExecutorContext) ![]const []const u8 {
@@ -2509,6 +2573,12 @@ const FakeExecutorContext = struct {
         if (containsArg(argv, "/usr/bin/dracut")) {
             if (self.modules_at_dracut == null) {
                 self.modules_at_dracut = try self.snapshotKernelModuleFiles();
+                self.file_mode_at_dracut = self.modeOf(
+                    os_customization.modprobe_blacklist_path,
+                );
+                self.directory_mode_at_dracut = self.modeOf(
+                    std.fs.path.dirname(os_customization.modprobe_blacklist_path).?,
+                );
             }
             self.saw_dracut = true;
         }
