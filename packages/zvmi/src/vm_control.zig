@@ -117,7 +117,20 @@ pub fn validateNameservers(nameservers: []const []const u8) Error!void {
         return error.InvalidNetworkConfiguration;
     }
     for (nameservers) |nameserver| {
-        if (parseIpv4(nameserver) == null) return error.InvalidNetworkConfiguration;
+        const octets = parseIpv4(nameserver) orelse
+            return error.InvalidNetworkConfiguration;
+        // A declared resolver has to mean the same thing wherever the plan
+        // runs, and these do not. Loopback reaches the build host's own stub
+        // resolver from a chroot, which shares the host's network namespace,
+        // and reaches nothing at all from inside a guest -- and `127.0.0.53`
+        // is the likeliest value for someone to copy off their own machine
+        // while trying to pin down what `host_resolver` already gave them,
+        // quietly reintroducing the dependence they were removing. The
+        // unspecified, multicast and reserved ranges are not resolvers
+        // anywhere.
+        if (octets[0] == 0 or octets[0] == 127 or octets[0] >= 224) {
+            return error.InvalidNetworkConfiguration;
+        }
     }
 }
 
@@ -168,6 +181,26 @@ pub const qemu_user_network: NetworkConfig = .{
     .gateway = "10.0.2.2",
     .nameservers = &.{"10.0.2.3"},
 };
+
+/// Whether an address is inside the user-mode network's own subnet but is not
+/// the resolver it answers on.
+///
+/// libslirp answers ARP only for the gateway, the nameserver and configured
+/// guest forwards, and silently ignores every other address in the subnet. A
+/// guest that declared one would treat it as on-link, get no reply, and report
+/// nothing beyond a name that would not resolve -- so it is refused where it
+/// is stated rather than discovered when the transaction fails.
+pub fn isUnreachableUserNetAddress(text: []const u8) bool {
+    const octets = parseIpv4(text) orelse return false;
+    const resolver = parseIpv4(qemu_user_network.nameservers[0]).?;
+    if (octets[0] != resolver[0] or
+        octets[1] != resolver[1] or
+        octets[2] != resolver[2])
+    {
+        return false;
+    }
+    return octets[3] != resolver[3];
+}
 
 pub const Repository = struct {
     id: []const u8,

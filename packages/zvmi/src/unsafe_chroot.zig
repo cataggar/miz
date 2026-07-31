@@ -1490,6 +1490,15 @@ fn validateManifestPolicy(manifest: Manifest) !void {
     // the privilege boundary and does not trust the manifest it is handed. A
     // name reaching the renderer unchecked would be a line of its own in a
     // modprobe configuration file.
+    switch (manifest.packages.resolver) {
+        .host_resolver => {},
+        // Same reasoning one field over: each entry is written verbatim as a
+        // `nameserver` line, so an unchecked value carrying a newline would
+        // add directives of its own to the resolver the transaction runs
+        // against. The guest agent re-validates the identical rule on its
+        // side of the same boundary.
+        .nameservers => |nameservers| try vm_control.validateNameservers(nameservers),
+    }
     for (manifest.kernel_modules) |module| {
         if (!validKernelModuleName(module.name)) {
             return error.InvalidKernelModuleName;
@@ -2557,6 +2566,25 @@ test "worker refuses kernel module names it would render as two tokens" {
         .packages = .{},
         .initramfs = .unchanged,
     };
+
+    // Same boundary, one field over: an unchecked nameserver carrying a
+    // newline would add directives of its own to the resolver the transaction
+    // runs against, and the worker re-reads this manifest from JSON after
+    // re-execing as root rather than receiving it from the validator.
+    var injected = base;
+    injected.packages = .{ .resolver = .{
+        .nameservers = &.{"192.0.2.1\nsearch attacker.invalid"},
+    } };
+    try std.testing.expectError(
+        error.InvalidNetworkConfiguration,
+        validateManifestPolicy(injected),
+    );
+    var loopback = base;
+    loopback.packages = .{ .resolver = .{ .nameservers = &.{"127.0.0.53"} } };
+    try std.testing.expectError(
+        error.InvalidNetworkConfiguration,
+        validateManifestPolicy(loopback),
+    );
 
     var spaced = base;
     spaced.kernel_modules = &.{.{ .name = "overlay -f", .load = true }};

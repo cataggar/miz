@@ -1516,6 +1516,24 @@ fn validateVmPolicy(
             ));
         },
     }
+    // A resolver the chroot backend reaches happily can be unreachable from a
+    // guest behind user-mode networking, which would make one hashed plan
+    // resolve names on one backend and fail mid-transaction on the other --
+    // the divergence a declared resolver exists to remove. Addresses outside
+    // the subnet are fine: slirp forwards their traffic out through the host.
+    switch (request.packages.resolver) {
+        .host_resolver => {},
+        .nameservers => |nameservers| for (nameservers) |nameserver| {
+            if (vm_control.isUnreachableUserNetAddress(nameserver)) {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/packages/resolver/nameservers",
+                    "the guest's user-mode network answers on only one address in its own subnet",
+                    "name a resolver outside 10.0.2.0/24, or 10.0.2.3 for the host's own",
+                ));
+            }
+        },
+    }
 }
 
 /// A marker is matched against a byte stream a guest emits, so it must be
@@ -2044,13 +2062,25 @@ pub const CapabilityKind = enum {
     repository_trust,
     package_cache,
     package_lock,
-    /// Reading the build host's own `/etc/resolv.conf` so the package
-    /// transaction can resolve repository names. Only `unsafe_chroot` needs
-    /// it: the VM backend reaches the same resolver through QEMU's user-mode
-    /// networking without opening a host file. Named separately from
-    /// `read_trust_source` and friends because it is the one input the plan
-    /// does not carry -- its content comes from the machine, not the request,
-    /// so a consumer that requires reproducible input can refuse exactly this.
+    /// Declares that the run's name resolution comes from the build host
+    /// rather than from the request.
+    ///
+    /// Both executing backends inherit it, by different routes.
+    /// `unsafe_chroot` binds the host's own `/etc/resolv.conf` into the target
+    /// root. The VM backend looks like it escapes this and does not: libslirp
+    /// rewrites packets addressed to `10.0.2.3` to whatever `get_dns_addr`
+    /// returns, and on Linux that reads `/etc/resolv.conf` in the emulator
+    /// process. So the guest's answers depend on the build machine exactly as
+    /// much; only the process that opens the file differs.
+    ///
+    /// It is a declaration rather than a probe -- `systemCapabilityCheck`
+    /// always reports it available -- because the executors tolerate a host
+    /// with no resolver, and rightly: a transaction whose repository URLs are
+    /// literal addresses, or that only removes packages, resolves no names at
+    /// all. Refusing those runs for a file they never read would be a false
+    /// refusal. Its job is to name the one input the plan does not carry, so a
+    /// consumer that requires every input to come from the request can refuse
+    /// exactly this.
     read_host_resolver,
     script_execution,
     guest_execution,
@@ -3442,7 +3472,7 @@ fn buildCapabilities(
     if (packages.lock != .unlocked) {
         try capabilities.append(.{ .kind = .package_lock, .path = "", .reason = "enforce the declared package snapshot or exact-version lock" });
     }
-    if (execution.backend == .unsafe_chroot and
+    if ((execution.backend == .unsafe_chroot or execution.backend == .vm) and
         packages.actions.len != 0 and
         packages.resolver == .host_resolver)
     {
@@ -4478,14 +4508,6 @@ fn systemCapabilityCheck(_: ?*anyopaque, io: Io, requirement: CapabilityRequirem
         .read_hook_source,
         .read_trust_source,
         => if (isReadableKind(cwd, io, requirement.path, .file)) .available else .missing,
-        // Follows symlinks where the probes above do not. `/etc/resolv.conf`
-        // is a symlink into `/run` on any systemd-resolved host, and the
-        // executor that consumes it follows too, so probing without following
-        // would refuse exactly the machines this policy is written for.
-        .read_host_resolver => if (isReadableFileFollow(cwd, io, requirement.path))
-            .available
-        else
-            .missing,
         .disk_dependencies => .unsupported,
         .write_workspace_parent => if (canCreatePath(cwd, io, requirement.path)) .available else .missing,
         .write_output_parent => if (canCreatePath(cwd, io, requirement.path)) .available else .missing,
@@ -4500,6 +4522,11 @@ fn systemCapabilityCheck(_: ?*anyopaque, io: Io, requirement: CapabilityRequirem
         .partition_edit,
         .standalone_output,
         .atomic_commit,
+        // A declaration, not a probe: the executors tolerate a host with no
+        // resolver because a transaction can resolve no names at all, so a
+        // `missing` here would refuse runs that never read the file. Naming
+        // it in the plan is the whole job.
+        .read_host_resolver,
         => .available,
         .rebuild,
         .unsafe_chroot,
@@ -4643,12 +4670,6 @@ fn isReadableKind(dir: Io.Dir, io: Io, path: []const u8, kind: Io.File.Kind) boo
     dir.access(io, path, .{ .read = true }) catch return false;
     const stat = dir.statFile(io, path, .{ .follow_symlinks = false }) catch return false;
     return stat.kind == kind;
-}
-
-fn isReadableFileFollow(dir: Io.Dir, io: Io, path: []const u8) bool {
-    dir.access(io, path, .{ .read = true }) catch return false;
-    const stat = dir.statFile(io, path, .{ .follow_symlinks = true }) catch return false;
-    return stat.kind == .file;
 }
 
 fn isReadablePath(dir: Io.Dir, io: Io, path: []const u8) bool {
@@ -9034,6 +9055,17 @@ test "a declared resolver must be one to three dotted quads" {
         &.{"192.0.2.256"},
         &.{"192.0.2"},
         &.{""},
+        // Loopback is the trap worth naming. `127.0.0.53` reaches the build
+        // host's own stub resolver from a chroot, which shares the host's
+        // network namespace, and reaches nothing from inside a guest -- so it
+        // is both the likeliest thing to copy off a working machine and a
+        // silent way back to the dependence the declaration removes.
+        &.{"127.0.0.53"},
+        &.{"127.0.0.1"},
+        &.{"0.0.0.0"},
+        &.{"224.0.0.1"},
+        &.{"255.255.255.255"},
+        &.{ "192.0.2.1", "127.0.0.53" },
     };
     for (rejected) |nameservers| {
         var request = resolverRequest(.{ .nameservers = nameservers });
@@ -9104,36 +9136,98 @@ test "the plan hash covers where name resolution came from" {
     ));
 }
 
-test "only a chroot run that inherits the host resolver declares reading it" {
+test "both executing backends declare inheriting the host resolver" {
     // The capability is the visible half of the declaration: a consumer that
     // requires every input to come from the request can refuse exactly this
-    // one. It is backend-specific because only `unsafe_chroot` opens the host
-    // file -- the VM reaches the same resolver through QEMU's user-mode
-    // networking, without a host path to name.
-    var inherited = resolverRequest(.host_resolver);
-    var declared = resolverRequest(.{ .nameservers = &.{"192.0.2.1"} });
+    // one. The VM backend looks like it escapes the dependence and does not --
+    // libslirp answers `10.0.2.3` by forwarding to whatever `/etc/resolv.conf`
+    // names in the emulator process -- so declaring it for the chroot alone
+    // would let the same request shed the capability by changing backend while
+    // keeping every bit of the dependence.
+    for ([_]ExecutionBackend{ .unsafe_chroot, .vm }) |backend| {
+        var inherited = resolverRequest(.host_resolver);
+        var declared = resolverRequest(.{ .nameservers = &.{"192.0.2.1"} });
+        if (backend == .vm) {
+            inherited.execution.backend = .vm;
+            inherited.execution.vm = validVmPolicy();
+            inherited.execution.vm.?.network = .declared_repositories;
+            declared.execution.backend = .vm;
+            declared.execution.vm = validVmPolicy();
+            declared.execution.vm.?.network = .declared_repositories;
+        }
 
-    var inherited_resolved = try resolve(
-        std.testing.allocator,
-        &inherited,
-        .{ .host_architecture = .x86_64 },
-    );
-    defer inherited_resolved.deinit(std.testing.allocator);
-    var declared_resolved = try resolve(
-        std.testing.allocator,
-        &declared,
-        .{ .host_architecture = .x86_64 },
-    );
-    defer declared_resolved.deinit(std.testing.allocator);
+        var inherited_resolved = try resolve(
+            std.testing.allocator,
+            &inherited,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer inherited_resolved.deinit(std.testing.allocator);
+        var declared_resolved = try resolve(
+            std.testing.allocator,
+            &declared,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer declared_resolved.deinit(std.testing.allocator);
 
-    try std.testing.expect(hasCapabilityKind(
-        inherited_resolved.plan.?.data.required_capabilities,
-        .read_host_resolver,
-    ));
-    try std.testing.expect(!hasCapabilityKind(
-        declared_resolved.plan.?.data.required_capabilities,
-        .read_host_resolver,
-    ));
+        try std.testing.expect(hasCapabilityKind(
+            inherited_resolved.plan.?.data.required_capabilities,
+            .read_host_resolver,
+        ));
+        try std.testing.expect(!hasCapabilityKind(
+            declared_resolved.plan.?.data.required_capabilities,
+            .read_host_resolver,
+        ));
+    }
+
+    // And it never gates a run, because the executors tolerate a host with no
+    // resolver: a transaction that only removes packages, or whose repository
+    // URLs are literal addresses, resolves no names at all.
+    try std.testing.expectEqual(
+        CapabilityState.available,
+        systemCapabilityCheck(null, std.testing.io, .{
+            .kind = .read_host_resolver,
+            .path = "/no/such/resolv.conf",
+            .reason = "",
+        }),
+    );
+}
+
+test "a guest cannot be pointed at an address its own network swallows" {
+    // Outside 10.0.2.0/24 slirp forwards the traffic out through the host, so
+    // any real resolver works. Inside it, slirp answers ARP only for the
+    // gateway and its own forwarder, and drops the rest in silence -- which
+    // the guest can report only as a name that would not resolve, long after
+    // the plan was accepted.
+    const rejected = [_][]const u8{ "10.0.2.2", "10.0.2.15", "10.0.2.1" };
+    for (rejected) |nameserver| {
+        var request = resolverRequest(.{ .nameservers = &.{nameserver} });
+        request.execution.backend = .vm;
+        request.execution.vm = validVmPolicy();
+        request.execution.vm.?.network = .declared_repositories;
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(diagnostics.hasErrors());
+    }
+
+    // The same addresses are unremarkable on the backend that has no such
+    // network, so the refusal has to be the VM policy's rather than the
+    // resolver's.
+    for (rejected) |nameserver| {
+        var request = resolverRequest(.{ .nameservers = &.{nameserver} });
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(!diagnostics.hasErrors());
+    }
+
+    // The forwarder itself is exactly what `host_resolver` uses here, so
+    // naming it explicitly has to stay legal.
+    var accepted = resolverRequest(.{ .nameservers = &.{"10.0.2.3"} });
+    accepted.execution.backend = .vm;
+    accepted.execution.vm = validVmPolicy();
+    accepted.execution.vm.?.network = .declared_repositories;
+    var diagnostics = try validate(std.testing.allocator, &accepted);
+    defer diagnostics.deinit(std.testing.allocator);
+    try std.testing.expect(!diagnostics.hasErrors());
 }
 
 fn hasCapabilityKind(
@@ -9144,42 +9238,4 @@ fn hasCapabilityKind(
         if (capability.kind == kind) return true;
     }
     return false;
-}
-
-test "the host resolver probe follows the symlink a resolved host installs" {
-    // `/etc/resolv.conf` is a symlink into `/run` on any systemd-resolved
-    // machine, and `unsafe_chroot` follows it. The probes next to this one
-    // deliberately do not follow, because a symlinked *source* is a different
-    // file from the one the caller named; here the symlink is the interface.
-    // Probing without following would report the capability missing on
-    // exactly the hosts this policy exists for, and the run would be refused
-    // by preflight for a resolver the executor would have used happily.
-    const io = std.testing.io;
-    const cwd = Io.Dir.cwd();
-    const directory = "test-resolver-probe";
-    defer cwd.deleteTree(io, directory) catch {};
-    try cwd.createDirPath(io, directory);
-    const target = directory ++ "/stub-resolv.conf";
-    const link = directory ++ "/resolv.conf";
-    try cwd.writeFile(io, .{ .sub_path = target, .data = "nameserver 127.0.0.53\n" });
-    try cwd.symLink(io, "stub-resolv.conf", link, .{});
-
-    try std.testing.expect(!isReadableKind(cwd, io, link, .file));
-    try std.testing.expect(isReadableFileFollow(cwd, io, link));
-    try std.testing.expectEqual(
-        CapabilityState.available,
-        systemCapabilityCheck(null, io, .{
-            .kind = .read_host_resolver,
-            .path = link,
-            .reason = "",
-        }),
-    );
-    try std.testing.expectEqual(
-        CapabilityState.missing,
-        systemCapabilityCheck(null, io, .{
-            .kind = .read_host_resolver,
-            .path = directory ++ "/absent.conf",
-            .reason = "",
-        }),
-    );
 }
