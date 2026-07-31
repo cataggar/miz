@@ -136,6 +136,13 @@ const Session = struct {
             };
             executed catch |err| return self.stageFailure("packages", err);
         }
+        // After the packages, so a package that ships its own modprobe
+        // configuration cannot land on top of the declared one, and before
+        // the initramfs, so a generator that reads this configuration sees
+        // the declared state rather than the one it replaced.
+        self.writeKernelModuleFiles(control.kernel_module_files) catch |err| {
+            return self.stageFailure("kernel-modules", err);
+        };
         switch (control.initramfs) {
             .unchanged => {},
             .regenerate => |regenerate| {
@@ -325,6 +332,33 @@ const Session = struct {
         try argv.appendSlice(&.{ verb, "-y" });
         try argv.appendSlice(names);
         try self.runChroot(argv.items);
+    }
+
+    /// Places kernel-module configuration the host rendered.
+    ///
+    /// The destinations are checked against the same closed set the host
+    /// validated against, because a guest that trusts its control document is
+    /// a guest that can be driven anywhere by whoever wrote it -- and this is
+    /// the one instruction that names a path inside the target root.
+    fn writeKernelModuleFiles(self: *Session, files: []const control_mod.TargetFile) !void {
+        for (files) |file| {
+            if (!control_mod.knownKernelModuleConfigPath(file.path)) {
+                return error.UnknownTargetFile;
+            }
+            const path = try std.fmt.allocPrint(
+                self.allocator,
+                guest_root ++ "/{s}",
+                .{file.path},
+            );
+            try mkdirParents(self.allocator, path);
+            try writeFileBytes(self.allocator, path, file.contents);
+            // A truncating open leaves an existing file's mode alone, so the
+            // `0o644` `writeFileBytes` asks for only applies when it creates
+            // the file. `modprobe` parses these as root at boot, so a mode
+            // inherited from whatever the image already had at this path is
+            // not something to carry forward.
+            try setMode(self.allocator, path, 0o644);
+        }
     }
 
     /// Kernel releases installed in the target root, sorted.
@@ -827,6 +861,28 @@ fn mkdirPath(path: [*:0]const u8) !void {
     if (err != .SUCCESS and err != .EXIST) return error.MkdirFailed;
 }
 
+/// Sets a file's mode outright, which a truncating open does not do for a
+/// file that already exists.
+fn setMode(allocator: Allocator, path: []const u8, mode: linux.mode_t) !void {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const err = linux.errno(linux.chmod(path_z, mode));
+    if (err != .SUCCESS) return error.ChmodFailed;
+}
+
+/// Creates every directory leading to `path`, which the destinations for
+/// rendered configuration need: an image that never had a `modprobe.d` is
+/// still an image the configuration belongs in.
+fn mkdirParents(allocator: Allocator, path: []const u8) !void {
+    var index: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, path, index + 1, '/')) |separator| {
+        const directory = try allocator.dupeZ(u8, path[0..separator]);
+        defer allocator.free(directory);
+        try mkdirPath(directory);
+        index = separator;
+    }
+}
+
 /// Opening with `O_DIRECTORY` answers the question without needing a `struct
 /// stat` whose layout varies by architecture.
 fn isDirectory(path: [*:0]const u8) bool {
@@ -1028,4 +1084,27 @@ test "kernel discovery follows dracut's rule and refuses to find nothing" {
         error.NoInstalledKernels,
         discoverKernels(allocator, "/dev/null"),
     );
+}
+
+test "every directory leading to a rendered destination is created" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // An image that never had a `modprobe.d` is still an image the declared
+    // configuration belongs in, so the walk has to create the whole chain --
+    // and must stop at the last separator rather than making a directory
+    // where the file goes.
+    const base = "test-zvmiguest-parents";
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, base) catch {};
+    const path = base ++ "/etc/modprobe.d/zvmi-blacklist.conf";
+    try mkdirParents(allocator, path);
+    try writeFileBytes(allocator, path, "blacklist floppy\n");
+
+    try std.testing.expect(isDirectory(base ++ "/etc/modprobe.d"));
+    try std.testing.expect(!isDirectory(path));
+
+    // Running it again on a chain that already exists is not an error: the
+    // three destinations share their leading directories.
+    try mkdirParents(allocator, path);
 }

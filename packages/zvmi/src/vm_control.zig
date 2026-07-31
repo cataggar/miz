@@ -63,6 +63,8 @@ pub const Error = error{
     InvalidFailureRecord,
     InvalidModuleMember,
     TooManyModules,
+    UnknownTargetFile,
+    DuplicateTargetFile,
 };
 
 pub const Network = union(enum) {
@@ -164,6 +166,27 @@ pub const Initramfs = union(enum) {
     },
 };
 
+/// A file the host rendered for the guest to place in the target root.
+///
+/// The guest accepts these only at the destinations in
+/// `kernel_module_config_paths`. A control document therefore cannot turn the
+/// agent into a general-purpose file writer, which is the whole reason the
+/// destination is carried rather than assumed: the host is the single source
+/// of what a request renders to, and a host that names a path this guest does
+/// not recognise is refused loudly instead of writing somewhere unintended.
+pub const TargetFile = struct {
+    path: []const u8,
+    contents: []const u8,
+};
+
+/// Kept byte-identical to the `os_customization` constants of the same names
+/// by a test in `vm_backend`, which is the one place that imports both.
+pub const kernel_module_config_paths = [_][]const u8{
+    "etc/modules-load.d/zvmi.conf",
+    "etc/modprobe.d/zvmi-blacklist.conf",
+    "etc/modprobe.d/zvmi-options.conf",
+};
+
 pub const Control = struct {
     version: u32 = control_version,
     /// Block device holding the target root filesystem, e.g. `/dev/vda2`.
@@ -177,6 +200,10 @@ pub const Control = struct {
     actions: []const Action = &.{},
     /// Whether, and for which kernel releases, the initramfs is regenerated.
     initramfs: Initramfs = .unchanged,
+    /// Kernel-module configuration the host rendered, placed in the target
+    /// root before the initramfs is regenerated so a generator that reads it
+    /// sees the declared state rather than the one it replaced.
+    kernel_module_files: []const TargetFile = &.{},
     /// Initramfs members holding kernel modules the guest inserts, in
     /// insertion order, before it waits for any device.
     ///
@@ -234,6 +261,17 @@ pub const Control = struct {
             .regenerate => |regenerate| for (regenerate.kernels) |kernel| {
                 if (!validKernelRelease(kernel)) return error.InvalidKernelRelease;
             },
+        }
+
+        for (self.kernel_module_files, 0..) |file, index| {
+            if (!knownKernelModuleConfigPath(file.path)) {
+                return error.UnknownTargetFile;
+            }
+            for (self.kernel_module_files[0..index]) |earlier| {
+                if (std.mem.eql(u8, earlier.path, file.path)) {
+                    return error.DuplicateTargetFile;
+                }
+            }
         }
 
         switch (self.network) {
@@ -334,6 +372,16 @@ pub fn validPackageName(name: []const u8) bool {
         }
     }
     return true;
+}
+
+/// The guest writes rendered configuration only where it recognises the
+/// destination, so a host that renders somewhere new fails loudly here rather
+/// than the two backends quietly producing different images.
+pub fn knownKernelModuleConfigPath(path: []const u8) bool {
+    for (kernel_module_config_paths) |known| {
+        if (std.mem.eql(u8, known, path)) return true;
+    }
+    return false;
 }
 
 /// Mirrors `customize.validUnsafeKernelRelease`. The release becomes both a
@@ -877,4 +925,70 @@ test "a result the host would record verbatim is bounded before it is believed" 
             return err;
         };
     }
+}
+
+test "the guest places rendered files only where it recognises the destination" {
+    const base = Control{
+        .root_device = "/dev/vda2",
+        .result_device = "/dev/vdb",
+        .network = .offline,
+    };
+
+    var accepted = base;
+    accepted.kernel_module_files = &.{
+        .{ .path = "etc/modules-load.d/zvmi.conf", .contents = "overlay\n" },
+        .{ .path = "etc/modprobe.d/zvmi-blacklist.conf", .contents = "blacklist floppy\n" },
+    };
+    try accepted.validate();
+
+    // A control document must not be usable as a general-purpose file writer,
+    // and a host that starts rendering somewhere new has to fail here rather
+    // than produce an image that differs from the rebuild backend's.
+    var unknown = base;
+    unknown.kernel_module_files = &.{
+        .{ .path = "etc/sudoers.d/zvmi.conf", .contents = "ALL ALL=(ALL) NOPASSWD: ALL\n" },
+    };
+    try std.testing.expectError(error.UnknownTargetFile, unknown.validate());
+
+    var traversal = base;
+    traversal.kernel_module_files = &.{
+        .{ .path = "../etc/modules-load.d/zvmi.conf", .contents = "overlay\n" },
+    };
+    try std.testing.expectError(error.UnknownTargetFile, traversal.validate());
+
+    // Two writes to one destination make the result depend on which came
+    // last, which is not something a document should be able to express.
+    var duplicated = base;
+    duplicated.kernel_module_files = &.{
+        .{ .path = "etc/modules-load.d/zvmi.conf", .contents = "overlay\n" },
+        .{ .path = "etc/modules-load.d/zvmi.conf", .contents = "loop\n" },
+    };
+    try std.testing.expectError(error.DuplicateTargetFile, duplicated.validate());
+}
+
+test "rendered files survive the control round trip" {
+    const allocator = std.testing.allocator;
+    var control = Control{
+        .root_device = "/dev/vda2",
+        .result_device = "/dev/vdb",
+        .network = .offline,
+    };
+    control.kernel_module_files = &.{
+        .{ .path = "etc/modprobe.d/zvmi-options.conf", .contents = "options i915 enable_guc=2\n" },
+    };
+
+    const bytes = try std.json.Stringify.valueAlloc(allocator, control, .{});
+    defer allocator.free(bytes);
+    const parsed = try parseControl(allocator, bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.kernel_module_files.len);
+    try std.testing.expectEqualStrings(
+        "etc/modprobe.d/zvmi-options.conf",
+        parsed.value.kernel_module_files[0].path,
+    );
+    try std.testing.expectEqualStrings(
+        "options i915 enable_guc=2\n",
+        parsed.value.kernel_module_files[0].contents,
+    );
 }

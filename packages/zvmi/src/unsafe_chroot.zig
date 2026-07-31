@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const customize = @import("customize.zig");
+const os_customization = @import("os_customization.zig");
 const preserved_image = @import("preserved_image.zig");
 const transaction_guard = @import("transaction_guard.zig");
 
@@ -34,6 +35,7 @@ const Manifest = struct {
     partition_length: u64,
     packages: customize.PackagePolicy,
     initramfs: customize.InitramfsPolicy,
+    kernel_modules: []const customize.KernelModule = &.{},
 };
 
 pub fn available(io: Io) customize.CapabilityState {
@@ -109,6 +111,7 @@ pub fn runParent(
         .partition_length = options.target.partition.length,
         .packages = options.plan.data.packages,
         .initramfs = options.plan.data.initramfs,
+        .kernel_modules = options.plan.data.os.kernel_modules,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, manifest, .{});
     defer allocator.free(json);
@@ -499,6 +502,11 @@ const Session = struct {
             .update_selected => |names| try self.runTdnf("update", names, true),
         };
         try self.removeRepositoryFiles();
+        // After the packages, so a package that ships its own modprobe
+        // configuration cannot land on top of the declared one, and before
+        // the initramfs, so a generator that reads this configuration sees
+        // the declared state rather than the one it replaced.
+        try self.writeKernelModuleFiles();
         switch (self.manifest.initramfs) {
             .unchanged => {},
             .regenerate => |regenerate| try self.regenerateInitramfs(regenerate),
@@ -1028,6 +1036,81 @@ const Session = struct {
         return releases.toOwnedSlice();
     }
 
+    /// Places kernel-module configuration in the mounted target root.
+    ///
+    /// No chroot and no guest binary: these are inert configuration files, so
+    /// writing them directly is both simpler and the only option that works
+    /// on an image whose own tooling has not been made runnable yet.
+    /// Creates a rendered file's directory, stating the mode on the
+    /// components it actually creates and leaving alone the ones the image
+    /// already had -- `/etc` belongs to the image, `/etc/modprobe.d` belongs
+    /// to whoever made it.
+    ///
+    /// `mkdir` masks the mode it is given by the umask, which for this
+    /// executor is the invoking shell's, so a stated mode is not enough on
+    /// its own: under `umask 0` an unstated `/etc/modprobe.d` comes out
+    /// `0o777`, and `modprobe` reads that directory as root at boot and
+    /// honours `install` directives, which run a shell command. The other two
+    /// backends are already deterministic here -- the guest is PID 1 under
+    /// the kernel's own `0o022`, and a rebuild writes the mode into the
+    /// filesystem with no umask in the picture -- so this is also what keeps
+    /// one request producing one result whichever backend runs it.
+    fn createConfigDirectory(self: *Session, directory: []const u8) !void {
+        var index: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, directory, index + 1, '/')) |separator| {
+            try self.createOneDirectory(directory[0..separator]);
+            index = separator;
+        }
+        try self.createOneDirectory(directory);
+    }
+
+    fn createOneDirectory(self: *Session, path: []const u8) !void {
+        Io.Dir.cwd().createDir(self.io, path, @enumFromInt(0o755)) catch |err| switch (err) {
+            error.PathAlreadyExists => return,
+            else => return err,
+        };
+        // `mkdir` masks the mode it was given, so it is set again here. The
+        // handle has to be openable for `fchmod`, which an `O_PATH` one is
+        // not -- `iterate` is what asks for a real descriptor.
+        var opened = try Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true });
+        defer opened.close(self.io);
+        try opened.setPermissions(self.io, @enumFromInt(0o755));
+    }
+
+    fn writeKernelModuleFiles(self: *Session) !void {
+        const rendered = try os_customization.renderKernelModules(
+            self.allocator,
+            self.manifest.kernel_modules,
+        );
+        defer {
+            for (rendered) |file| self.allocator.free(file.contents);
+            self.allocator.free(rendered);
+        }
+        for (rendered) |file| {
+            const path = try std.fs.path.join(
+                self.allocator,
+                &.{ self.manifest.root_path, file.path },
+            );
+            defer self.allocator.free(path);
+            const directory = std.fs.path.dirname(path).?;
+            try self.createConfigDirectory(directory);
+            // The mode is stated rather than inherited. `createFile` defaults
+            // to `0o666` masked by whatever umask the builder was invoked
+            // with, and `modprobe` parses these as root at boot -- a
+            // world-writable one is a way into the finished image. It would
+            // also make the same request produce a different result here than
+            // on the backends that state `0o644`. An existing file keeps its
+            // own mode through a truncating open, so it is set afterwards
+            // rather than only at creation.
+            const target = try Io.Dir.cwd().createFile(self.io, path, .{
+                .permissions = @enumFromInt(0o644),
+            });
+            defer target.close(self.io);
+            try target.writePositionalAll(self.io, file.contents, 0);
+            try target.setPermissions(self.io, @enumFromInt(0o644));
+        }
+    }
+
     fn runChroot(self: *Session, guest_argv: []const []const u8) !void {
         var argv = try std.array_list.Managed([]const u8).initCapacity(
             self.allocator,
@@ -1342,6 +1425,41 @@ fn validateManifestPolicy(manifest: Manifest) !void {
             }
         },
     }
+    // The request validator already refused these, but the worker sits across
+    // the privilege boundary and does not trust the manifest it is handed. A
+    // name reaching the renderer unchecked would be a line of its own in a
+    // modprobe configuration file.
+    for (manifest.kernel_modules) |module| {
+        if (!validKernelModuleName(module.name)) {
+            return error.InvalidKernelModuleName;
+        }
+        if (module.load and module.disabled) {
+            return error.ContradictoryKernelModule;
+        }
+        if (module.options) |options| {
+            // `\\` joins this directive to the one rendered after it.
+            if (std.mem.indexOfAny(u8, options, "\r\n\x00\\") != null) {
+                return error.InvalidKernelModuleOptions;
+            }
+        }
+    }
+}
+
+/// Mirrors `customize.validKernelModuleName`. An allowlist rather than a list
+/// of refusals, because every way out of a `modules-load.d` line or a
+/// `modprobe.d` directive's subject position is silent: whitespace retargets
+/// the directive, a trailing `\` continues the line over the next one, and a
+/// leading `#` or `;` comments the line out.
+fn validKernelModuleName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128 or !std.ascii.isAlphanumeric(name[0])) return false;
+    for (name[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            byte != '_' and byte != '-' and byte != '.')
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn validRepositoryId(id: []const u8) bool {
@@ -2081,6 +2199,142 @@ test "worker regenerates every installed kernel when the policy names none" {
     try std.testing.expect(!empty_context.saw_dracut);
 }
 
+test "worker places kernel-module configuration after packages and before dracut" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    // A permissive umask, restored afterwards, because the point of stating
+    // the modes is that they do not depend on the builder's umask -- and a
+    // test run under the default `0o022` cannot tell a stated mode from an
+    // inherited one.
+    const previous_umask = std.os.linux.syscall1(.umask, 0);
+    defer _ = std.os.linux.syscall1(.umask, previous_umask);
+    const root_path = "test-unsafe-chroot-modules-root";
+    const raw_path = "test-unsafe-chroot-modules-stage.raw";
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+        .exclusive = true,
+        .read = true,
+    });
+    try raw_file.setLength(io, 8192);
+    const raw_inode = (try raw_file.stat(io)).inode;
+    raw_file.close(io);
+
+    const actions = [_]customize.PackageAction{.{ .install = &.{"dracut"} }};
+    const repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    const modules = [_]customize.KernelModule{
+        .{ .name = "overlay", .load = true },
+        .{ .name = "floppy", .disabled = true },
+        .{ .name = "i915", .options = "enable_guc=2" },
+    };
+    const manifest = Manifest{
+        .raw_path = raw_path,
+        .root_path = root_path,
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = raw_inode,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{
+            .actions = &actions,
+            .repositories = &repositories,
+        },
+        .initramfs = .{ .regenerate = .{
+            .generator = "dracut",
+            .kernels = &.{"6.12.0-test"},
+        } },
+        .kernel_modules = &modules,
+    };
+    var context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+    };
+    const result = try executeManifest(allocator, io, manifest, .{
+        .context = &context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expect(result.operation_succeeded);
+    try std.testing.expect(result.cleanup_complete);
+
+    // A package shipping its own modprobe configuration must not land on top
+    // of the declared one, and a generator reading the configuration must see
+    // the declared state -- so the write belongs strictly between the two.
+    try std.testing.expect(context.saw_tdnf_install);
+    try std.testing.expect(context.saw_dracut);
+    try std.testing.expect(!context.modules_present_at_tdnf);
+
+    const at_dracut = context.modules_at_dracut.?;
+    try std.testing.expectEqualStrings("overlay\n", at_dracut[0]);
+    try std.testing.expectEqualStrings("blacklist floppy\n", at_dracut[1]);
+    try std.testing.expectEqualStrings("options i915 enable_guc=2\n", at_dracut[2]);
+
+    // The modes are stated, not inherited. `mkdir` and `createFile` are both
+    // masked by the invoking shell's umask, and `modprobe` reads these as
+    // root at boot -- a world-writable `modprobe.d` lets any user in the
+    // finished image run a command as root through an `install` directive.
+    // The permissive umask is set here rather than assumed absent, since a
+    // test that only passes under the developer's umask proves nothing.
+    try std.testing.expectEqual(@as(u32, 0o644), context.file_mode_at_dracut.?);
+    try std.testing.expectEqual(@as(u32, 0o755), context.directory_mode_at_dracut.?);
+}
+
+// A whitespace-carrying name reaching the renderer would silently retarget a
+// `modprobe.d` directive at a different module, so the worker refuses it on
+// its own side of the privilege boundary rather than trusting the request
+// validator that already refused it.
+test "worker refuses kernel module names it would render as two tokens" {
+    const base = Manifest{
+        .raw_path = "unused.raw",
+        .root_path = "unused-root",
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = 0,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{},
+        .initramfs = .unchanged,
+    };
+
+    var spaced = base;
+    spaced.kernel_modules = &.{.{ .name = "overlay -f", .load = true }};
+    try std.testing.expectError(
+        error.InvalidKernelModuleName,
+        validateManifestPolicy(spaced),
+    );
+
+    var contradictory = base;
+    contradictory.kernel_modules = &.{
+        .{ .name = "overlay", .load = true, .disabled = true },
+    };
+    try std.testing.expectError(
+        error.ContradictoryKernelModule,
+        validateManifestPolicy(contradictory),
+    );
+
+    var multiline = base;
+    multiline.kernel_modules = &.{
+        .{ .name = "i915", .options = "enable_guc=2\nblacklist floppy" },
+    };
+    try std.testing.expectError(
+        error.InvalidKernelModuleOptions,
+        validateManifestPolicy(multiline),
+    );
+
+    var accepted = base;
+    accepted.kernel_modules = &.{.{ .name = "overlay", .load = true }};
+    try validateManifestPolicy(accepted);
+}
+
 const FakeResolverLayout = enum { regular, symlink, missing };
 
 /// A directory under `/lib/modules` in the fake target. The marker is what
@@ -2113,6 +2367,54 @@ const FakeExecutorContext = struct {
     malformed_inventory: bool = false,
     resolver_layout: FakeResolverLayout = .regular,
     saw_repository_isolation: bool = false,
+    /// Whether the declared kernel-module configuration was already in place
+    /// when each of the neighbouring stages ran. Ordering is the whole
+    /// contract here, and the finished tree cannot be inspected afterwards --
+    /// cleanup unmounts and removes it -- so the evidence has to be taken
+    /// while the run is still standing.
+    modules_present_at_tdnf: bool = false,
+    modules_at_dracut: ?[]const []const u8 = null,
+    file_mode_at_dracut: ?u32 = null,
+    directory_mode_at_dracut: ?u32 = null,
+
+    fn readTargetFile(self: *FakeExecutorContext, relative: []const u8) ?[]const u8 {
+        const path = std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}",
+            .{ self.root_path, relative },
+        ) catch return null;
+        defer self.allocator.free(path);
+        return Io.Dir.cwd().readFileAlloc(
+            self.io,
+            path,
+            self.allocator,
+            .unlimited,
+        ) catch null;
+    }
+
+    fn modeOf(self: *FakeExecutorContext, relative: []const u8) ?u32 {
+        const path = std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}",
+            .{ self.root_path, relative },
+        ) catch return null;
+        defer self.allocator.free(path);
+        const status = Io.Dir.cwd().statFile(self.io, path, .{}) catch return null;
+        return @intFromEnum(status.permissions) & 0o7777;
+    }
+
+    fn snapshotKernelModuleFiles(self: *FakeExecutorContext) ![]const []const u8 {
+        const paths = [_][]const u8{
+            os_customization.modules_load_path,
+            os_customization.modprobe_blacklist_path,
+            os_customization.modprobe_options_path,
+        };
+        const contents = try self.allocator.alloc([]const u8, paths.len);
+        for (paths, contents) |relative, *slot| {
+            slot.* = self.readTargetFile(relative) orelse "";
+        }
+        return contents;
+    }
 
     fn run(
         context_ptr: ?*anyopaque,
@@ -2257,6 +2559,8 @@ const FakeExecutorContext = struct {
         }
         if (containsArg(argv, "/usr/bin/tdnf") and containsArg(argv, "install")) {
             self.saw_tdnf_install = true;
+            self.modules_present_at_tdnf =
+                self.readTargetFile(os_customization.modprobe_blacklist_path) != null;
             self.saw_repository_isolation =
                 containsArg(argv, "/run/zvmi-tdnf.conf") and
                 containsArg(argv, "--disablerepo=*") and
@@ -2266,7 +2570,18 @@ const FakeExecutorContext = struct {
         if (containsArg(argv, "/usr/bin/tdnf") and containsArg(argv, "remove")) {
             self.saw_tdnf_remove = true;
         }
-        if (containsArg(argv, "/usr/bin/dracut")) self.saw_dracut = true;
+        if (containsArg(argv, "/usr/bin/dracut")) {
+            if (self.modules_at_dracut == null) {
+                self.modules_at_dracut = try self.snapshotKernelModuleFiles();
+                self.file_mode_at_dracut = self.modeOf(
+                    os_customization.modprobe_blacklist_path,
+                );
+                self.directory_mode_at_dracut = self.modeOf(
+                    std.fs.path.dirname(os_customization.modprobe_blacklist_path).?,
+                );
+            }
+            self.saw_dracut = true;
+        }
         return fakeResult(allocator, "", 0);
     }
 };

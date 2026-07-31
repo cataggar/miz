@@ -1591,11 +1591,14 @@ fn validateOsCustomization(
         }
     }
     for (customization.kernel_modules) |module| {
-        if (!validConfigName(module.name) or (module.load and module.disabled)) {
+        if (!validKernelModuleName(module.name) or (module.load and module.disabled)) {
             try diagnostics.append(validationError(.invalid_customization, "/os/kernel_modules", "kernel module names must be safe and cannot be loaded and disabled simultaneously", null));
         }
         if (module.options) |options| {
-            if (std.mem.indexOfAny(u8, options, "\r\n\x00") != null) {
+            // `\\` is refused with the line terminators because `modprobe.d`
+            // continues a line ending in one, which would absorb whatever
+            // directive is rendered next into this module's parameters.
+            if (std.mem.indexOfAny(u8, options, "\r\n\x00\\") != null) {
                 try diagnostics.append(validationError(.invalid_customization, "/os/kernel_modules/options", "kernel module options must occupy one line", null));
             }
         }
@@ -1678,6 +1681,29 @@ fn validAccountName(name: []const u8) bool {
     for (name, 0..) |byte, index| {
         if (std.ascii.isLower(byte) or byte == '_' or (index != 0 and (std.ascii.isDigit(byte) or byte == '-'))) continue;
         return false;
+    }
+    return true;
+}
+
+/// Stricter than `validConfigName`, because a module name is not only a
+/// filename component: it is the whole of a `modules-load.d` line and the
+/// subject of a `modprobe.d` `blacklist` or `options` directive. Every way
+/// out of that position is silent, so this is an allowlist rather than a list
+/// of things to refuse -- whitespace retargets the directive at a different
+/// module (`overlay -f` blacklists `overlay`), a trailing `\` continues the
+/// line and swallows the directive rendered after it, and a leading `#` or
+/// `;` turns a `modules-load.d` line into a comment that loads nothing. Real
+/// module names are alphanumerics, `_`, `-` and `.`, none of which are.
+///
+/// Mirrored by `unsafe_chroot.validKernelModuleName`.
+fn validKernelModuleName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128 or !std.ascii.isAlphanumeric(name[0])) return false;
+    for (name[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            byte != '_' and byte != '-' and byte != '.')
+        {
+            return false;
+        }
     }
     return true;
 }
@@ -1936,6 +1962,12 @@ pub const CapabilityKind = enum {
     selinux_policy,
     selinux_relabel,
     cross_architecture_runner,
+    /// Placing the declared `modules-load.d`/`modprobe.d` configuration in
+    /// the target root. Separate from `arbitrary_filesystem_mutation` because
+    /// its destinations are a closed, named set rather than anywhere in the
+    /// filesystem, which is what lets the executor backends satisfy it
+    /// without being able to create files in general.
+    kernel_module_configuration,
     arbitrary_filesystem_mutation,
     boot_policy_mutation,
     generalization,
@@ -3192,7 +3224,7 @@ fn buildCapabilities(
             };
         },
     }
-    if (execution.backend != .native_fresh and hasOsCustomization(customization)) {
+    if (execution.backend != .native_fresh and hasGeneralOsCustomization(customization)) {
         try capabilities.append(.{
             .kind = .arbitrary_filesystem_mutation,
             .path = "",
@@ -3200,6 +3232,16 @@ fn buildCapabilities(
                 "apply deterministic filesystem and OS changes to the imported strict ext4 tree"
             else
                 "general preserved-filesystem creation and metadata mutation are not implemented",
+        });
+    }
+    // Excluded for `native_fresh` on the same grounds as the blanket above:
+    // a fresh build creates the whole tree, so nothing it writes into that
+    // tree is a question about what can be done to a preserved filesystem.
+    if (execution.backend != .native_fresh and customization.kernel_modules.len != 0) {
+        try capabilities.append(.{
+            .kind = .kernel_module_configuration,
+            .path = "",
+            .reason = "write the declared kernel-module configuration to its named destinations",
         });
     }
     if (packages.actions.len != 0) {
@@ -3284,13 +3326,16 @@ fn appendIsolationCapability(
     });
 }
 
-fn hasOsCustomization(customization: OsCustomization) bool {
+/// OS customization that needs the ability to create and mutate files
+/// anywhere in the target root, which is everything except kernel-module
+/// configuration -- that one has a closed set of destinations and so is
+/// requested as its own, narrower capability.
+fn hasGeneralOsCustomization(customization: OsCustomization) bool {
     return customization.filesystem.len != 0 or
         customization.hostname != null or
         customization.groups.len != 0 or
         customization.users.len != 0 or
-        customization.services.len != 0 or
-        customization.kernel_modules.len != 0;
+        customization.services.len != 0;
 }
 
 fn isDefaultBootPolicy(policy: BootSecurityPolicy) bool {
@@ -3959,6 +4004,14 @@ pub fn preflight(
             .arbitrary_filesystem_mutation,
             .generalization,
             => if (plan.data.execution.backend == .rebuild) .available else .unsupported,
+            // The rebuild backend writes it into the tree it imports; the two
+            // executor backends write it into a filesystem they have mounted.
+            .kernel_module_configuration => switch (plan.data.execution.backend) {
+                .rebuild => .available,
+                .unsafe_chroot => unsafeChrootCapabilityState(platform, io, plan),
+                .vm => vmCapabilityState(platform, io, plan),
+                else => .unsupported,
+            },
             .vm => vmCapabilityState(platform, io, plan),
             .vm_firmware => if (plan.data.execution.vm) |vm| switch (vm.boot) {
                 .direct_kernel => .unsupported,
@@ -4027,7 +4080,10 @@ fn unsafeChrootCapabilityState(
         data.input != .disk or
         data.storage != .preserve or
         data.existing_path_operations.len != 0 or
-        hasOsCustomization(data.os) or
+        // Kernel-module configuration is the one piece of the OS model these
+        // backends carry out; the rest still needs general file creation in
+        // the target root, which neither of them implements.
+        hasGeneralOsCustomization(data.os) or
         data.generalization != .none or
         data.hooks.len != 0 or
         data.selinux != .unchanged or
@@ -4052,6 +4108,9 @@ fn unsafeChrootCapabilityState(
     }
     for (data.packages.repositories) |repository| {
         if (!validUnsafeRepositoryId(repository.id)) return .unsupported;
+    }
+    for (data.os.kernel_modules) |module| {
+        if (!validKernelModuleName(module.name)) return .unsupported;
     }
     switch (data.initramfs) {
         .unchanged => {},
@@ -4085,7 +4144,10 @@ fn vmCapabilityState(
         data.input != .disk or
         data.storage != .preserve or
         data.existing_path_operations.len != 0 or
-        hasOsCustomization(data.os) or
+        // Kernel-module configuration is the one piece of the OS model these
+        // backends carry out; the rest still needs general file creation in
+        // the target root, which neither of them implements.
+        hasGeneralOsCustomization(data.os) or
         data.generalization != .none or
         data.selinux != .unchanged or
         !isDefaultBootPolicy(data.boot_security) or
@@ -4118,6 +4180,9 @@ fn vmCapabilityState(
     }
     for (data.packages.repositories) |repository| {
         if (!validUnsafeRepositoryId(repository.id)) return .unsupported;
+    }
+    for (data.os.kernel_modules) |module| {
+        if (!validKernelModuleName(module.name)) return .unsupported;
     }
     switch (data.initramfs) {
         .unchanged => {},
@@ -4230,6 +4295,7 @@ fn systemCapabilityCheck(_: ?*anyopaque, io: Io, requirement: CapabilityRequirem
         .selinux_policy,
         .selinux_relabel,
         .cross_architecture_runner,
+        .kernel_module_configuration,
         .arbitrary_filesystem_mutation,
         .boot_policy_mutation,
         .generalization,
@@ -6456,6 +6522,22 @@ test "unsafe chroot preflight accepts only the implemented policy subset" {
         try Check.state(&request, .x86_64),
     );
 
+    // Kernel-module configuration is the one part of the OS model this
+    // backend carries out. It has a closed set of destinations, so it needs
+    // none of the general file creation the rest of the model does -- and
+    // accepting it must not have widened the gate to anything else, which the
+    // hostname case above is what holds down.
+    const kernel_modules = [_]KernelModule{
+        .{ .name = "overlay", .load = true },
+        .{ .name = "floppy", .disabled = true },
+    };
+    request = baseline;
+    request.os.kernel_modules = &kernel_modules;
+    try std.testing.expectEqual(
+        CapabilityState.available,
+        try Check.state(&request, .x86_64),
+    );
+
     request = baseline;
     request.generalization = .{ .azure = .{} };
     try std.testing.expectEqual(
@@ -7253,6 +7335,106 @@ test "validation rejects unsafe customization values and plaintext-shaped passwo
         customization_errors += @intFromBool(diagnostic.code == .invalid_customization);
     }
     try std.testing.expect(customization_errors >= 6);
+}
+
+test "a kernel module name that would render as two tokens is rejected" {
+    // `validConfigName` permits spaces, which is harmless for a filename but
+    // not for a name that becomes the subject of a `modprobe.d` directive:
+    // `options overlay -f redirect_dir=on` retargets the directive at
+    // `overlay` and turns the rest into its options. The refusal belongs here
+    // rather than only in the executors, so it arrives at preflight instead
+    // of part-way through a run.
+    const cases = [_][]const u8{
+        "overlay -f",
+        "overlay\tredirect_dir=on",
+        "over lay",
+        "",
+        ".hidden",
+        "sub/dir",
+        // `modprobe.d` continues a line ending in a backslash, so this one
+        // swallows whatever directive is rendered after it -- the module
+        // named next is then silently not blacklisted at all.
+        "overlay\\",
+        // systemd ignores a `modules-load.d` line whose first non-blank
+        // character is `#` or `;`, so these load nothing and say nothing.
+        "#overlay",
+        ";overlay",
+    };
+    for (cases) |name| {
+        var request = validRequest();
+        const modules = [_]KernelModule{.{ .name = name, .load = true }};
+        request.os = .{ .kernel_modules = &modules };
+
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        var rejected = false;
+        for (diagnostics.items) |diagnostic| {
+            if (diagnostic.code == .invalid_customization and
+                std.mem.eql(u8, diagnostic.configuration_path, "/os/kernel_modules"))
+            {
+                rejected = true;
+            }
+        }
+        if (!rejected) {
+            std.debug.print("accepted kernel module name: '{s}'\n", .{name});
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // A backslash in the options is the same failure arriving by the other
+    // route: `options i915 enable_guc=2\` absorbs the next module's directive
+    // into i915's parameter string.
+    var continued = validRequest();
+    const continued_modules = [_]KernelModule{
+        .{ .name = "i915", .options = "enable_guc=2\\" },
+    };
+    continued.os = .{ .kernel_modules = &continued_modules };
+    var continued_diagnostics = try validate(std.testing.allocator, &continued);
+    defer continued_diagnostics.deinit(std.testing.allocator);
+    var refused_options = false;
+    for (continued_diagnostics.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.configuration_path, "/os/kernel_modules/options")) {
+            refused_options = true;
+        }
+    }
+    try std.testing.expect(refused_options);
+
+    var accepted = validRequest();
+    const modules = [_]KernelModule{
+        .{ .name = "overlay", .load = true },
+        .{ .name = "snd-hda-intel", .options = "power_save=1" },
+        .{ .name = "8021q", .load = true },
+        .{ .name = "nf_conntrack", .options = "nf_conntrack_max=65536" },
+    };
+    accepted.os = .{ .kernel_modules = &modules };
+    var diagnostics = try validate(std.testing.allocator, &accepted);
+    defer diagnostics.deinit(std.testing.allocator);
+    for (diagnostics.items) |diagnostic| {
+        try std.testing.expect(diagnostic.code != .invalid_customization);
+    }
+}
+
+test "a fresh build writes kernel-module configuration without asking for a capability" {
+    // `native_fresh` creates the whole tree, so nothing it writes into that
+    // tree is a question about what can be done to a preserved filesystem.
+    // Requesting the capability for it anyway would refuse in preflight a
+    // build that has always worked -- `build_image` applies the OS
+    // customization model in full.
+    var request = validRequest();
+    const modules = [_]KernelModule{.{ .name = "overlay", .load = true }};
+    request.os = .{ .kernel_modules = &modules };
+
+    var resolved = try resolve(
+        std.testing.allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.plan != null);
+    try std.testing.expectEqual(ExecutionBackend.native_fresh, resolved.plan.?.data.execution.backend);
+    for (resolved.plan.?.data.required_capabilities) |capability| {
+        try std.testing.expect(capability.kind != .kernel_module_configuration);
+    }
 }
 
 test "resolved customization deeply owns nested content and contributes to plan integrity" {
