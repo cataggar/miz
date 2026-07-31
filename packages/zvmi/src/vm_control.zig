@@ -151,6 +151,19 @@ pub const Action = union(enum) {
     update_selected: []const []const u8,
 };
 
+pub const Initramfs = union(enum) {
+    /// The image's initramfs is left exactly as it was found.
+    unchanged,
+    /// Empty `kernels` regenerates every kernel release installed in the
+    /// target root, discovered by the receiver at run time. Naming releases
+    /// explicitly overrides that. The distinction between this and
+    /// `unchanged` is carried by the tag rather than by an empty list, so a
+    /// document cannot express "regenerate nothing in particular".
+    regenerate: struct {
+        kernels: []const []const u8 = &.{},
+    },
+};
+
 pub const Control = struct {
     version: u32 = control_version,
     /// Block device holding the target root filesystem, e.g. `/dev/vda2`.
@@ -162,8 +175,8 @@ pub const Control = struct {
     network: Network,
     repositories: []const Repository = &.{},
     actions: []const Action = &.{},
-    /// Kernel releases whose initramfs is regenerated. Empty leaves it alone.
-    initramfs_kernels: []const []const u8 = &.{},
+    /// Whether, and for which kernel releases, the initramfs is regenerated.
+    initramfs: Initramfs = .unchanged,
     /// Initramfs members holding kernel modules the guest inserts, in
     /// insertion order, before it waits for any device.
     ///
@@ -216,8 +229,11 @@ pub const Control = struct {
             }
         }
 
-        for (self.initramfs_kernels) |kernel| {
-            if (!validKernelRelease(kernel)) return error.InvalidKernelRelease;
+        switch (self.initramfs) {
+            .unchanged => {},
+            .regenerate => |regenerate| for (regenerate.kernels) |kernel| {
+                if (!validKernelRelease(kernel)) return error.InvalidKernelRelease;
+            },
         }
 
         switch (self.network) {
@@ -477,7 +493,7 @@ test "a control document round-trips and is validated on the way back in" {
             .trust_base64 = &.{"a2V5"},
         }},
         .actions = &.{.{ .install = &.{"strace"} }},
-        .initramfs_kernels = &.{"6.12.0-1.azl"},
+        .initramfs = .{ .regenerate = .{ .kernels = &.{"6.12.0-1.azl"} } },
         .modules = &.{ "zvmi-module-00-virtio_pci.ko", "zvmi-module-01-ext4.ko" },
     };
     try control.validate();
@@ -493,11 +509,48 @@ test "a control document round-trips and is validated on the way back in" {
         parsed.value.network.declared_repositories.address,
     );
     try std.testing.expectEqualStrings("strace", parsed.value.actions[0].install[0]);
-    try std.testing.expectEqualStrings("6.12.0-1.azl", parsed.value.initramfs_kernels[0]);
+    try std.testing.expectEqualStrings(
+        "6.12.0-1.azl",
+        parsed.value.initramfs.regenerate.kernels[0],
+    );
     // Insertion order is an instruction, not a set, so it survives the trip.
     try std.testing.expectEqual(@as(usize, 2), parsed.value.modules.len);
     try std.testing.expectEqualStrings("zvmi-module-00-virtio_pci.ko", parsed.value.modules[0]);
     try std.testing.expectEqualStrings("zvmi-module-01-ext4.ko", parsed.value.modules[1]);
+}
+
+test "regenerating every initramfs is distinct from leaving it alone" {
+    const allocator = std.testing.allocator;
+    const base = Control{
+        .root_device = "/dev/vda2",
+        .result_device = "/dev/vdb",
+        .network = .offline,
+    };
+
+    // Naming no kernel release used to be indistinguishable from asking for
+    // nothing at all, because both were an empty list. The tag carries the
+    // difference now, so a document cannot express a contradiction and the
+    // guest never has to guess which of the two was meant.
+    var regenerate_all = base;
+    regenerate_all.initramfs = .{ .regenerate = .{} };
+    try regenerate_all.validate();
+
+    const json = try std.json.Stringify.valueAlloc(allocator, regenerate_all, .{});
+    defer allocator.free(json);
+    const parsed = try parseControl(allocator, json);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.initramfs == .regenerate);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        parsed.value.initramfs.regenerate.kernels.len,
+    );
+
+    const unchanged_json = try std.json.Stringify.valueAlloc(allocator, base, .{});
+    defer allocator.free(unchanged_json);
+    const unchanged = try parseControl(allocator, unchanged_json);
+    defer unchanged.deinit();
+    try std.testing.expect(unchanged.value.initramfs == .unchanged);
+    try std.testing.expect(!std.mem.eql(u8, json, unchanged_json));
 }
 
 test "a document with no modules is the document this backend has always sent" {
@@ -642,7 +695,7 @@ test "a control document the guest could be driven by is rejected" {
         } },
         .{ .expected = error.InvalidKernelRelease, .control = blk: {
             var control = base;
-            control.initramfs_kernels = &.{"../../../boot/vmlinuz"};
+            control.initramfs = .{ .regenerate = .{ .kernels = &.{"../../../boot/vmlinuz"} } };
             break :blk control;
         } },
         .{ .expected = error.OfflineNetworkWithPackageActions, .control = blk: {

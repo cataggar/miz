@@ -136,10 +136,21 @@ const Session = struct {
             };
             executed catch |err| return self.stageFailure("packages", err);
         }
-        for (control.initramfs_kernels) |kernel| {
-            self.regenerateInitramfs(kernel) catch |err| {
-                return self.stageFailure("initramfs", err);
-            };
+        switch (control.initramfs) {
+            .unchanged => {},
+            .regenerate => |regenerate| {
+                const kernels = if (regenerate.kernels.len > 0)
+                    regenerate.kernels
+                else
+                    self.installedKernels() catch |err| {
+                        return self.stageFailure("initramfs", err);
+                    };
+                for (kernels) |kernel| {
+                    self.regenerateInitramfs(kernel) catch |err| {
+                        return self.stageFailure("initramfs", err);
+                    };
+                }
+            },
         }
         self.loadInstalledPackages() catch |err| {
             return self.stageFailure("package-inventory", err);
@@ -316,6 +327,27 @@ const Session = struct {
         try self.runChroot(argv.items);
     }
 
+    /// Kernel releases installed in the target root, sorted.
+    ///
+    /// This runs after the package actions, which is the whole point: a
+    /// kernel that `update_all` pulled in during this very run is found here,
+    /// and its release string was not knowable when the plan was written.
+    ///
+    /// The rule is dracut's own. Its `--regenerate-all` iterates
+    /// `/lib/modules/*` and skips any entry without a `modules.dep` or
+    /// `modules.dep.bin` -- files `depmod` writes as a kernel package
+    /// installs -- which is what separates an installed kernel from a
+    /// directory that merely sits beside one. Copying that rule rather than
+    /// inventing one means this and the tool it hands the answer to cannot
+    /// disagree about what is installed.
+    ///
+    /// Finding none is an error rather than a quiet success, because a
+    /// request to regenerate every initramfs that regenerates none has not
+    /// done what it said.
+    fn installedKernels(self: *Session) ![]const []const u8 {
+        return discoverKernels(self.allocator, guest_root ++ "/lib/modules");
+    }
+
     fn regenerateInitramfs(self: *Session, kernel: []const u8) !void {
         const temporary = "/run/zvmi-initramfs.img";
         try self.runChroot(&.{
@@ -484,6 +516,66 @@ fn renderResolver(allocator: Allocator, config: control_mod.NetworkConfig) ![]co
         try body.appendSlice(try std.fmt.allocPrint(allocator, "nameserver {s}\n", .{nameserver}));
     }
     return body.items;
+}
+
+/// The directory scan behind `Session.installedKernels`, taking its path so a
+/// test can point it at a tree it built rather than at the mounted target.
+fn discoverKernels(allocator: Allocator, modules_path: []const u8) ![]const []const u8 {
+    const modules_z = try allocator.dupeZ(u8, modules_path);
+    defer allocator.free(modules_z);
+    const fd_raw = linux.open(modules_z, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    if (linux.errno(fd_raw) != .SUCCESS) return error.NoInstalledKernels;
+    const fd: i32 = @intCast(fd_raw);
+    defer _ = linux.close(fd);
+
+    var releases: std.array_list.Managed([]const u8) = .init(allocator);
+    var buffer: [8192]u8 align(@alignOf(linux.dirent64)) = undefined;
+    while (true) {
+        const rc = linux.getdents64(fd, &buffer, buffer.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return error.ReadFailed,
+        }
+        const filled: usize = @intCast(rc);
+        if (filled == 0) break;
+
+        var offset: usize = 0;
+        while (offset < filled) {
+            const record = buffer[offset..];
+            const entry: *align(1) const linux.dirent64 = @ptrCast(record.ptr);
+            // Records are variable-length and self-describing, so the length
+            // is read before the cursor moves past it.
+            offset += entry.reclen;
+
+            const name_ptr: [*:0]const u8 = @ptrCast(record.ptr + @offsetOf(linux.dirent64, "name"));
+            const name = std.mem.sliceTo(name_ptr, 0);
+            // A release string the control document would have been refused
+            // for carrying cannot become acceptable by being discovered
+            // instead. This also excludes "." and "..".
+            if (!control_mod.validKernelRelease(name)) continue;
+            if (!hasDepmodOutput(allocator, modules_path, name)) continue;
+
+            try releases.append(try allocator.dupe(u8, name));
+        }
+    }
+    if (releases.items.len == 0) return error.NoInstalledKernels;
+    std.mem.sort([]const u8, releases.items, {}, lessThanBytes);
+    return releases.items;
+}
+
+fn hasDepmodOutput(allocator: Allocator, modules_path: []const u8, release: []const u8) bool {
+    for ([_][]const u8{ "modules.dep", "modules.dep.bin" }) |marker| {
+        const path = std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}/{s}/{s}",
+            .{ modules_path, release, marker },
+            0,
+        ) catch return false;
+        defer allocator.free(path);
+        if (fileExists(path)) return true;
+    }
+    return false;
 }
 
 fn lessThanBytes(_: void, left: []const u8, right: []const u8) bool {
@@ -744,6 +836,15 @@ fn isDirectory(path: [*:0]const u8) bool {
     return true;
 }
 
+/// The counterpart to `isDirectory`, and equally layout-free: a successful
+/// read-only open is the only evidence needed.
+fn fileExists(path: [*:0]const u8) bool {
+    const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    _ = linux.close(@intCast(rc));
+    return true;
+}
+
 /// Polls rather than waiting on uevents: a poll needs no netlink socket, no
 /// parser, and no second failure mode, and the wait it replaces is measured in
 /// milliseconds on every boot that is going to succeed at all.
@@ -882,4 +983,49 @@ test "a module member the agent will not open is refused before any syscall" {
     // Nothing to insert is the case every image that builds its drivers in
     // presents, and it must reach the mount unchanged.
     try session.loadModules(&.{});
+}
+
+test "kernel discovery follows dracut's rule and refuses to find nothing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Built with the agent's own primitives, so the scan is tested against a
+    // tree made the way the agent makes trees.
+    const modules_path = "test-zvmiguest-modules";
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, modules_path) catch {};
+    try mkdirPath(modules_path);
+
+    // Nothing installed at all, which is the case a run must fail on rather
+    // than report as a policy it carried out.
+    try std.testing.expectError(
+        error.NoInstalledKernels,
+        discoverKernels(allocator, modules_path),
+    );
+
+    // Two installed kernels, deliberately out of order and distinguished by
+    // which of depmod's two outputs they carry, beside the two things that
+    // live in `/lib/modules` without being kernels: a directory depmod never
+    // touched, and a name no control document would have been allowed to
+    // carry.
+    try mkdirPath(modules_path ++ "/6.12.0-2.azl");
+    try writeFileBytes(allocator, modules_path ++ "/6.12.0-2.azl/modules.dep", "");
+    try mkdirPath(modules_path ++ "/6.12.0-10.azl");
+    try writeFileBytes(allocator, modules_path ++ "/6.12.0-10.azl/modules.dep.bin", "");
+    try mkdirPath(modules_path ++ "/firmware");
+    try mkdirPath(modules_path ++ "/6.12.0 spaced");
+    try writeFileBytes(allocator, modules_path ++ "/6.12.0 spaced/modules.dep", "");
+
+    const found = try discoverKernels(allocator, modules_path);
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    // Sorted, so the same target produces the same run twice.
+    try std.testing.expectEqualStrings("6.12.0-10.azl", found[0]);
+    try std.testing.expectEqualStrings("6.12.0-2.azl", found[1]);
+
+    // A path that is not a directory at all reads as nothing installed
+    // rather than as an unhandled error out of the scan.
+    try std.testing.expectError(
+        error.NoInstalledKernels,
+        discoverKernels(allocator, "/dev/null"),
+    );
 }

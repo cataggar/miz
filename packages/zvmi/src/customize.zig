@@ -432,6 +432,12 @@ pub const Hook = struct {
 
 pub const InitramfsPolicy = union(enum) {
     unchanged,
+    /// Leaving `kernels` empty regenerates the initramfs for every kernel
+    /// release installed in the target root, which the backend discovers
+    /// after the package actions have run. That ordering is the point: a
+    /// kernel pulled in by `update_all` has a release string the caller
+    /// could not have known when writing this policy. Naming releases
+    /// explicitly overrides discovery.
     regenerate: struct {
         generator: ?[]const u8 = null,
         kernels: []const []const u8 = &.{},
@@ -4050,7 +4056,10 @@ fn unsafeChrootCapabilityState(
     switch (data.initramfs) {
         .unchanged => {},
         .regenerate => |regenerate| {
-            if (regenerate.kernels.len == 0) return .unsupported;
+            // Naming no kernel release means every release installed in the
+            // target root, which only the backend can enumerate and only
+            // after the package actions have run. Both backends support that,
+            // so there is nothing to refuse here.
             for (regenerate.kernels) |kernel| {
                 if (!validUnsafeKernelRelease(kernel)) return .unsupported;
             }
@@ -4113,7 +4122,10 @@ fn vmCapabilityState(
     switch (data.initramfs) {
         .unchanged => {},
         .regenerate => |regenerate| {
-            if (regenerate.kernels.len == 0) return .unsupported;
+            // Naming no kernel release means every release installed in the
+            // target root, which only the backend can enumerate and only
+            // after the package actions have run. Both backends support that,
+            // so there is nothing to refuse here.
             for (regenerate.kernels) |kernel| {
                 if (!validUnsafeKernelRelease(kernel)) return .unsupported;
             }

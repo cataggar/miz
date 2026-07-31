@@ -525,11 +525,7 @@ const Session = struct {
             []const u8,
             self.installed_packages.items,
             {},
-            struct {
-                fn lessThan(_: void, left: []const u8, right: []const u8) bool {
-                    return std.mem.lessThan(u8, left, right);
-                }
-            }.lessThan,
+            lessThanBytes,
         );
     }
 
@@ -931,10 +927,15 @@ const Session = struct {
                 return error.UnsupportedInitramfsGenerator;
             }
         }
-        if (regenerate.kernels.len == 0) {
-            return error.ExplicitKernelRequired;
-        }
-        for (regenerate.kernels) |kernel| {
+        const kernels = if (regenerate.kernels.len > 0)
+            regenerate.kernels
+        else
+            try self.installedKernels();
+        defer if (regenerate.kernels.len == 0) {
+            for (kernels) |kernel| self.allocator.free(kernel);
+            self.allocator.free(kernels);
+        };
+        for (kernels) |kernel| {
             self.dracut_version = try self.runChrootCapture(&.{
                 "/usr/bin/dracut",
                 "--version",
@@ -967,6 +968,64 @@ const Session = struct {
                 output,
             });
         }
+    }
+
+    /// Kernel releases installed in the target root, sorted.
+    ///
+    /// Called after the package actions, which is the point of it: a kernel
+    /// that `update_all` pulled in during this very run is found here, and
+    /// its release string was not knowable when the plan was written.
+    ///
+    /// The rule is dracut's own. Its `--regenerate-all` iterates
+    /// `/lib/modules/*` and skips any entry without a `modules.dep` or
+    /// `modules.dep.bin`, which is what distinguishes an installed kernel
+    /// from a directory that merely sits beside one -- a firmware drop, or
+    /// the leftovers of a package that was removed. Copying that rule rather
+    /// than inventing one means this and the tool it hands the answer to
+    /// cannot disagree about what is installed.
+    fn installedKernels(self: *Session) ![]const []const u8 {
+        const modules_path = try std.fs.path.join(
+            self.allocator,
+            &.{ self.manifest.root_path, "lib", "modules" },
+        );
+        defer self.allocator.free(modules_path);
+
+        var modules_dir = Io.Dir.cwd().openDir(
+            self.io,
+            modules_path,
+            .{ .iterate = true },
+        ) catch return error.NoInstalledKernels;
+        defer modules_dir.close(self.io);
+
+        var releases: std.array_list.Managed([]const u8) = .init(self.allocator);
+        errdefer {
+            for (releases.items) |release| self.allocator.free(release);
+            releases.deinit();
+        }
+
+        var iterator = modules_dir.iterate();
+        while (try iterator.next(self.io)) |entry| {
+            // A release string the manifest would have been refused for
+            // naming cannot become acceptable by being discovered instead.
+            // This also excludes "." and "..".
+            if (!validKernelRelease(entry.name)) continue;
+
+            // Deliberately no check on the entry kind: `d_type` is `unknown`
+            // on filesystems that do not carry it, and a non-directory cannot
+            // be opened as one anyway, so the marker below settles it.
+            var release_dir = modules_dir.openDir(self.io, entry.name, .{}) catch continue;
+            defer release_dir.close(self.io);
+            release_dir.access(self.io, "modules.dep", .{}) catch
+                release_dir.access(self.io, "modules.dep.bin", .{}) catch continue;
+
+            try releases.append(try self.allocator.dupe(u8, entry.name));
+        }
+
+        // A request to regenerate every initramfs that regenerates none has
+        // not done what it said, so it fails rather than reporting success.
+        if (releases.items.len == 0) return error.NoInstalledKernels;
+        std.mem.sort([]const u8, releases.items, {}, lessThanBytes);
+        return releases.toOwnedSlice();
     }
 
     fn runChroot(self: *Session, guest_argv: []const []const u8) !void {
@@ -1266,7 +1325,11 @@ fn validateManifestPolicy(manifest: Manifest) !void {
     switch (manifest.initramfs) {
         .unchanged => {},
         .regenerate => |regenerate| {
-            if (regenerate.kernels.len == 0) return error.ExplicitKernelRequired;
+            // An empty list means "every kernel release installed in the
+            // target root", resolved at run time after the package actions.
+            // It is not refused here; a run that then discovers none fails
+            // with `NoInstalledKernels` rather than reporting a completed
+            // policy for work it did not do.
             for (regenerate.kernels) |kernel| {
                 if (!validKernelRelease(kernel)) {
                     return error.InvalidKernelRelease;
@@ -1315,6 +1378,10 @@ fn validPackageName(name: []const u8) bool {
         }
     }
     return true;
+}
+
+fn lessThanBytes(_: void, left: []const u8, right: []const u8) bool {
+    return std.mem.lessThan(u8, left, right);
 }
 
 fn validKernelRelease(kernel: []const u8) bool {
@@ -1927,7 +1994,102 @@ test "worker executes policy with strict reverse cleanup" {
     try std.testing.expect(missing_resolver.cleanup_complete);
 }
 
+test "worker regenerates every installed kernel when the policy names none" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root_path = "test-unsafe-chroot-discovery-root";
+    const raw_path = "test-unsafe-chroot-discovery-stage.raw";
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+        .exclusive = true,
+        .read = true,
+    });
+    try raw_file.setLength(io, 8192);
+    const raw_inode = (try raw_file.stat(io)).inode;
+    raw_file.close(io);
+
+    const manifest = Manifest{
+        .raw_path = raw_path,
+        .root_path = root_path,
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = raw_inode,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{},
+        .initramfs = .{ .regenerate = .{ .generator = "dracut" } },
+    };
+
+    // Deliberately out of order, and salted with the two things that live
+    // beside a kernel without being one: a firmware directory depmod never
+    // touched, and a name no manifest would have been allowed to carry.
+    var context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .installed_kernels = &.{
+            .{ .release = "6.12.0-2.azl" },
+            .{ .release = "6.12.0-10.azl", .marker = "modules.dep.bin" },
+            .{ .release = "firmware", .marker = null },
+            .{ .release = "6.12.0 spaced" },
+        },
+    };
+    const result = try executeManifest(allocator, io, manifest, .{
+        .context = &context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expect(result.operation_succeeded);
+    try std.testing.expect(result.cleanup_complete);
+
+    // The resolved releases are auditable because the recorded command is the
+    // whole argv, so discovery needs no provenance record of its own.
+    var regenerated: std.array_list.Managed([]const u8) = .init(allocator);
+    for (result.report.tools) |tool| {
+        if (!std.mem.eql(u8, tool.name, "dracut")) continue;
+        for (tool.command, 0..) |argument, index| {
+            if (!std.mem.eql(u8, argument, "--kver")) continue;
+            try regenerated.append(tool.command[index + 1]);
+        }
+    }
+    // Sorted, so the same target produces the same run twice. Lexicographic
+    // ordering puts 10 before 2; the guarantee is determinism, not version
+    // order, and dracut is handed each release whatever the order.
+    try std.testing.expectEqual(@as(usize, 2), regenerated.items.len);
+    try std.testing.expectEqualStrings("6.12.0-10.azl", regenerated.items[0]);
+    try std.testing.expectEqualStrings("6.12.0-2.azl", regenerated.items[1]);
+
+    // Regenerating every initramfs and regenerating none are different
+    // outcomes, so a target with no installed kernel fails rather than
+    // reporting a policy it did not carry out.
+    var empty_context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .installed_kernels = &.{.{ .release = "firmware", .marker = null }},
+    };
+    const empty = try executeManifest(allocator, io, manifest, .{
+        .context = &empty_context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expect(!empty.operation_succeeded);
+    try std.testing.expect(!empty_context.saw_dracut);
+}
+
 const FakeResolverLayout = enum { regular, symlink, missing };
+
+/// A directory under `/lib/modules` in the fake target. The marker is what
+/// separates an installed kernel from a directory that merely looks like one;
+/// a null marker is a directory depmod never wrote to.
+const FakeKernel = struct {
+    release: []const u8,
+    marker: ?[]const u8 = "modules.dep",
+};
 
 const FakeExecutorContext = struct {
     allocator: Allocator,
@@ -1938,6 +2100,7 @@ const FakeExecutorContext = struct {
     saw_tdnf_install: bool = false,
     saw_tdnf_remove: bool = false,
     saw_dracut: bool = false,
+    installed_kernels: []const FakeKernel = &.{},
     detached_loop: bool = false,
     detached_loops: usize = 0,
     fail_tdnf: bool = false,
@@ -2037,6 +2200,23 @@ const FakeExecutorContext = struct {
                     .{},
                 ),
                 .missing => {},
+            }
+            // Mounting is what makes the target root's contents visible, so
+            // it is where a fake target grows its installed kernels.
+            for (self.installed_kernels) |kernel| {
+                const directory = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}/lib/modules/{s}",
+                    .{ self.root_path, kernel.release },
+                );
+                try Io.Dir.cwd().createDirPath(self.io, directory);
+                const marker_name = kernel.marker orelse continue;
+                const marker = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}/{s}",
+                    .{ directory, marker_name },
+                );
+                try writeBytes(self.io, marker, "");
             }
         }
         if (std.mem.endsWith(u8, argv[0], "umount")) {
