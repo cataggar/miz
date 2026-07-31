@@ -495,7 +495,8 @@ const Session = struct {
         for (self.manifest.packages.actions) |action| switch (action) {
             .install => |names| try self.runTdnf("install", names, true),
             .remove => |names| try self.runTdnf("remove", names, false),
-            .update_all, .update_selected => return error.UnsupportedPackageAction,
+            .update_all => try self.runTdnf("update", &.{}, true),
+            .update_selected => |names| try self.runTdnf("update", names, true),
         };
         try self.removeRepositoryFiles();
         switch (self.manifest.initramfs) {
@@ -1232,16 +1233,35 @@ fn validateManifestPolicy(manifest: Manifest) !void {
     for (manifest.packages.repositories) |repository| {
         if (!validRepositoryId(repository.id)) return error.InvalidRepositoryId;
     }
+    var needs_repository = false;
     for (manifest.packages.actions) |action| {
-        const names = switch (action) {
-            .install => |values| values,
+        const names: []const []const u8 = switch (action) {
+            .install, .update_selected => |values| blk: {
+                needs_repository = true;
+                break :blk values;
+            },
             .remove => |values| values,
-            .update_all, .update_selected => return error.UnsupportedPackageAction,
+            // Naming nothing is what `update_all` means; every other action
+            // must name at least one package.
+            .update_all => {
+                needs_repository = true;
+                continue;
+            },
         };
         if (names.len == 0) return error.EmptyPackageAction;
         for (names) |name| {
             if (!validPackageName(name)) return error.InvalidPackageName;
         }
+    }
+    // An update names no package to fail on: it resolves against whatever the
+    // enabled repositories hold, so with none declared tdnf consults nothing
+    // and exits successfully having done nothing. An install without
+    // repositories fails loudly instead, but both are refused here rather than
+    // letting a no-op be reported as a completed policy. The request validator
+    // already requires this; the worker repeats it because it sits across the
+    // privilege boundary and does not trust the manifest it is handed.
+    if (needs_repository and manifest.packages.repositories.len == 0) {
+        return error.PackageActionWithoutRepositories;
     }
     switch (manifest.initramfs) {
         .unchanged => {},
@@ -1535,6 +1555,79 @@ test "worker policy identifiers are literal and package-only" {
     try std.testing.expect(!validPackageName("-y"));
     try std.testing.expect(validKernelRelease("6.12.0-1.azl4.aarch64"));
     try std.testing.expect(!validKernelRelease("../../etc/passwd"));
+}
+
+test "worker policy accepts updates and still refuses an unnamed selective update" {
+    const repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    const base = Manifest{
+        .raw_path = "/tmp/stage.raw",
+        .root_path = "/tmp/root",
+        .status_path = "/tmp/status",
+        .report_path = "/tmp/report",
+        .stage_inode = 1,
+        .virtual_size = 0,
+        .partition_offset = 0,
+        .partition_length = 0,
+        .packages = .{},
+        .initramfs = .unchanged,
+    };
+
+    var manifest = base;
+    manifest.packages = .{
+        .actions = &.{ .update_all, .{ .update_selected = &.{"kernel"} } },
+        .repositories = &repositories,
+    };
+    try validateManifestPolicy(manifest);
+
+    // An update consults repositories rather than named packages, so with none
+    // declared it would succeed having done nothing.
+    manifest.packages = .{ .actions = &.{.update_all} };
+    try std.testing.expectError(
+        error.PackageActionWithoutRepositories,
+        validateManifestPolicy(manifest),
+    );
+
+    manifest.packages = .{ .actions = &.{.{ .install = &.{"dracut"} }} };
+    try std.testing.expectError(
+        error.PackageActionWithoutRepositories,
+        validateManifestPolicy(manifest),
+    );
+
+    // Removal needs no repository, so it stays legal without one.
+    manifest.packages = .{ .actions = &.{.{ .remove = &.{"obsolete"} }} };
+    try validateManifestPolicy(manifest);
+
+    // `update_all` is the only action that legitimately names nothing.
+    manifest.packages = .{
+        .actions = &.{.{ .update_selected = &.{} }},
+        .repositories = &repositories,
+    };
+    try std.testing.expectError(error.EmptyPackageAction, validateManifestPolicy(manifest));
+
+    manifest.packages = .{
+        .actions = &.{.{ .update_selected = &.{"payload.rpm"} }},
+        .repositories = &repositories,
+    };
+    try std.testing.expectError(error.InvalidPackageName, validateManifestPolicy(manifest));
+
+    // Updating is now executable; pinning it still is not.
+    manifest.packages = .{
+        .actions = &.{.update_all},
+        .repositories = &repositories,
+        .cache = .cache_only,
+    };
+    try std.testing.expectError(error.UnsupportedPackagePolicy, validateManifestPolicy(manifest));
+
+    manifest.packages = .{
+        .actions = &.{.update_all},
+        .repositories = &repositories,
+        .lock = .{ .snapshot = "s1" },
+    };
+    try std.testing.expectError(error.UnsupportedPackagePolicy, validateManifestPolicy(manifest));
 }
 
 test "worker status distinguishes startup cleanup and operation outcomes" {

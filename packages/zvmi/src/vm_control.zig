@@ -147,6 +147,8 @@ pub const Repository = struct {
 pub const Action = union(enum) {
     install: []const []const u8,
     remove: []const []const u8,
+    update_all,
+    update_selected: []const []const u8,
 };
 
 pub const Control = struct {
@@ -202,8 +204,11 @@ pub const Control = struct {
         }
 
         for (self.actions) |action| {
-            const names = switch (action) {
-                .install, .remove => |values| values,
+            const names: []const []const u8 = switch (action) {
+                .install, .remove, .update_selected => |values| values,
+                // `update_all` names nothing by definition, so the empty-name
+                // rejection below must not reach it.
+                .update_all => continue,
             };
             if (names.len == 0) return error.EmptyAction;
             for (names) |name| {
@@ -414,12 +419,50 @@ pub fn parseResult(allocator: Allocator, bytes: []const u8) !std.json.Parsed(Res
 
 pub fn parseControl(allocator: Allocator, bytes: []const u8) !std.json.Parsed(Control) {
     if (bytes.len > max_control_bytes) return error.FrameTooLarge;
+    // The version must be read before the document is parsed into `Control`,
+    // not after it. A document written by a different build may carry fields or
+    // union tags this build has no type for, and those fail during parsing --
+    // so a version check placed after the parse never runs for the very change
+    // it exists to catch, and a version mismatch surfaces as an opaque
+    // `UnknownField` instead of a refusal naming the cause.
+    const probe = try std.json.parseFromSlice(
+        struct { version: u32 = control_version },
+        allocator,
+        bytes,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer probe.deinit();
+    if (probe.value.version != control_version) return error.UnsupportedVersion;
+
     const parsed = try std.json.parseFromSlice(Control, allocator, bytes, .{
         .allocate = .alloc_always,
     });
     errdefer parsed.deinit();
     try parsed.value.validate();
     return parsed;
+}
+
+test "a version mismatch is refused by name even when the document is otherwise unparseable" {
+    const allocator = std.testing.allocator;
+
+    // A future build's document: a newer version, and an action tag this build
+    // has no type for. The version is what the receiver can act on, so that is
+    // what it must report -- not the parse failure that happens to come first.
+    try std.testing.expectError(error.UnsupportedVersion, parseControl(
+        allocator,
+        \\{"version":2,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
+        ,
+    ));
+
+    // A document of this version carrying an unknown tag is still a parse
+    // failure: the version claimed it would be understood, and it was not.
+    try std.testing.expectError(error.UnknownField, parseControl(
+        allocator,
+        \\{"version":1,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
+        ,
+    ));
 }
 
 test "a control document round-trips and is validated on the way back in" {

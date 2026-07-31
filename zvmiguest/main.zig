@@ -131,6 +131,8 @@ const Session = struct {
             const executed = switch (action) {
                 .install => |names| self.runTdnf("install", names, control.repositories),
                 .remove => |names| self.runTdnf("remove", names, &.{}),
+                .update_all => self.runTdnf("update", &.{}, control.repositories),
+                .update_selected => |names| self.runTdnf("update", names, control.repositories),
             };
             executed catch |err| return self.stageFailure("packages", err);
         }

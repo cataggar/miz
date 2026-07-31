@@ -4032,10 +4032,12 @@ fn unsafeChrootCapabilityState(
         return .unsupported;
     }
     for (data.packages.actions) |action| {
-        const names = switch (action) {
-            .install => |values| values,
-            .remove => |values| values,
-            .update_all, .update_selected => return .unsupported,
+        const names: []const []const u8 = switch (action) {
+            .install, .remove, .update_selected => |values| values,
+            // The one action that names nothing: its subject is whatever the
+            // declared repositories hold, so an empty name list is the shape
+            // rather than an omission.
+            .update_all => continue,
         };
         if (names.len == 0) return .unsupported;
         for (names) |name| {
@@ -4093,10 +4095,12 @@ fn vmCapabilityState(
     }
     if (data.architectures.runner != data.architectures.image) return .unsupported;
     for (data.packages.actions) |action| {
-        const names = switch (action) {
-            .install => |values| values,
-            .remove => |values| values,
-            .update_all, .update_selected => return .unsupported,
+        const names: []const []const u8 = switch (action) {
+            .install, .remove, .update_selected => |values| values,
+            // The one action that names nothing: its subject is whatever the
+            // declared repositories hold, so an empty name list is the shape
+            // rather than an omission.
+            .update_all => continue,
         };
         if (names.len == 0) return .unsupported;
         for (names) |name| {
@@ -6306,6 +6310,9 @@ test "unsafe chroot preflight accepts only the implemented policy subset" {
 
     const install = [_]PackageAction{.{ .install = &.{"dracut"} }};
     const update = [_]PackageAction{.update_all};
+    const update_named = [_]PackageAction{.{ .update_selected = &.{"kernel"} }};
+    const update_nothing = [_]PackageAction{.{ .update_selected = &.{} }};
+    const update_invalid = [_]PackageAction{.{ .update_selected = &.{"payload.rpm"} }};
     const invalid_package = [_]PackageAction{.{ .install = &.{"payload.rpm"} }};
     const valid_repository = [_]PackageRepository{.{
         .id = "base",
@@ -6378,6 +6385,28 @@ test "unsafe chroot preflight accepts only the implemented policy subset" {
 
     request = baseline;
     request.packages.actions = &update;
+    try std.testing.expectEqual(
+        CapabilityState.available,
+        try Check.state(&request, .x86_64),
+    );
+
+    request = baseline;
+    request.packages.actions = &update_named;
+    try std.testing.expectEqual(
+        CapabilityState.available,
+        try Check.state(&request, .x86_64),
+    );
+
+    // `update_all` earns its empty name list; nothing else does.
+    request = baseline;
+    request.packages.actions = &update_nothing;
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        try Check.state(&request, .x86_64),
+    );
+
+    request = baseline;
+    request.packages.actions = &update_invalid;
     try std.testing.expectEqual(
         CapabilityState.unsupported,
         try Check.state(&request, .x86_64),
