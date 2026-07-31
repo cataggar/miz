@@ -44,7 +44,6 @@ pub const max_console_bytes: usize = 8 * 1024 * 1024;
 pub const Error = error{
     VmPolicyMissing,
     VmHostUnavailable,
-    UnsupportedPackageAction,
     UnsupportedRootPartition,
     VmBootTimedOut,
     VmEmulatorFailed,
@@ -475,9 +474,8 @@ fn controlFromPolicy(
         target.* = switch (source) {
             .install => |names| .{ .install = names },
             .remove => |names| .{ .remove = names },
-            // Preflight already refuses these; failing here too keeps the
-            // guest from ever receiving an action it cannot perform.
-            .update_all, .update_selected => return error.UnsupportedPackageAction,
+            .update_all => .update_all,
+            .update_selected => |names| .{ .update_selected = names },
         };
     }
 
@@ -1476,20 +1474,40 @@ test "an offline guest is never handed package actions" {
     );
 }
 
-test "package actions the guest cannot perform are refused before it boots" {
+test "update actions reach the guest, and an unnamed selective update does not" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    try std.testing.expectError(error.UnsupportedPackageAction, controlFromPolicy(
+    const control = try controlFromPolicy(
         arena.allocator(),
         std.testing.io,
         .{
-            .packages = .{ .actions = &.{.update_all} },
+            .packages = .{
+                .actions = &.{ .update_all, .{ .update_selected = &.{"kernel"} } },
+                .repositories = &.{.{
+                    .id = "base",
+                    .urls = &.{"https://packages.example.invalid"},
+                    .trust = &.{.{ .inline_bytes = "test key" }},
+                }},
+            },
             .initramfs = .unchanged,
             .network = .declared_repositories,
             .devices = .{ .root_device = "/dev/vda2", .result_device = "/dev/vdb" },
         },
-    ));
+    );
+    try control.validate();
+    try std.testing.expectEqual(@as(usize, 2), control.actions.len);
+    try std.testing.expectEqual(
+        vm_control.Action.update_all,
+        std.meta.activeTag(control.actions[0]),
+    );
+    try std.testing.expectEqualStrings("kernel", control.actions[1].update_selected[0]);
+
+    // `update_all` is the only action whose subject is implied. A selective
+    // update naming nothing would silently become a no-op in the guest.
+    var empty = control;
+    empty.actions = &.{.{ .update_selected = &.{} }};
+    try std.testing.expectError(error.EmptyAction, empty.validate());
 }
 
 test "an untouched result device is silence rather than an answer" {
