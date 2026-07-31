@@ -352,6 +352,12 @@ const Session = struct {
             );
             try mkdirParents(self.allocator, path);
             try writeFileBytes(self.allocator, path, file.contents);
+            // A truncating open leaves an existing file's mode alone, so the
+            // `0o644` `writeFileBytes` asks for only applies when it creates
+            // the file. `modprobe` parses these as root at boot, so a mode
+            // inherited from whatever the image already had at this path is
+            // not something to carry forward.
+            try setMode(self.allocator, path, 0o644);
         }
     }
 
@@ -853,6 +859,15 @@ fn unmount(target: [*:0]const u8) void {
 fn mkdirPath(path: [*:0]const u8) !void {
     const err = linux.errno(linux.mkdir(path, 0o755));
     if (err != .SUCCESS and err != .EXIST) return error.MkdirFailed;
+}
+
+/// Sets a file's mode outright, which a truncating open does not do for a
+/// file that already exists.
+fn setMode(allocator: Allocator, path: []const u8, mode: linux.mode_t) !void {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const err = linux.errno(linux.chmod(path_z, mode));
+    if (err != .SUCCESS) return error.ChmodFailed;
 }
 
 /// Creates every directory leading to `path`, which the destinations for

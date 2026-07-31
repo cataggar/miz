@@ -1058,7 +1058,20 @@ const Session = struct {
             defer self.allocator.free(path);
             const directory = std.fs.path.dirname(path).?;
             try Io.Dir.cwd().createDirPath(self.io, directory);
-            try writeBytes(self.io, path, file.contents);
+            // The mode is stated rather than inherited. `createFile` defaults
+            // to `0o666` masked by whatever umask the builder was invoked
+            // with, and `modprobe` parses these as root at boot -- a
+            // world-writable one is a way into the finished image. It would
+            // also make the same request produce a different result here than
+            // on the backends that state `0o644`. An existing file keeps its
+            // own mode through a truncating open, so it is set afterwards
+            // rather than only at creation.
+            const target = try Io.Dir.cwd().createFile(self.io, path, .{
+                .permissions = @enumFromInt(0o644),
+            });
+            defer target.close(self.io);
+            try target.writePositionalAll(self.io, file.contents, 0);
+            try target.setPermissions(self.io, @enumFromInt(0o644));
         }
     }
 
@@ -1388,20 +1401,27 @@ fn validateManifestPolicy(manifest: Manifest) !void {
             return error.ContradictoryKernelModule;
         }
         if (module.options) |options| {
-            if (std.mem.indexOfAny(u8, options, "\r\n\x00") != null) {
+            // `\\` joins this directive to the one rendered after it.
+            if (std.mem.indexOfAny(u8, options, "\r\n\x00\\") != null) {
                 return error.InvalidKernelModuleOptions;
             }
         }
     }
 }
 
-/// Matches `customize.validConfigName`, plus the whitespace rejection that
-/// matters once a name is a token in a `modules-load.d` or `modprobe.d` line
-/// rather than a filename.
+/// Mirrors `customize.validKernelModuleName`. An allowlist rather than a list
+/// of refusals, because every way out of a `modules-load.d` line or a
+/// `modprobe.d` directive's subject position is silent: whitespace retargets
+/// the directive, a trailing `\` continues the line over the next one, and a
+/// leading `#` or `;` comments the line out.
 fn validKernelModuleName(name: []const u8) bool {
-    if (name.len == 0 or name.len > 255 or name[0] == '.') return false;
-    for (name) |byte| {
-        if (byte == '/' or byte <= ' ' or byte == 0x7f) return false;
+    if (name.len == 0 or name.len > 128 or !std.ascii.isAlphanumeric(name[0])) return false;
+    for (name[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            byte != '_' and byte != '-' and byte != '.')
+        {
+            return false;
+        }
     }
     return true;
 }

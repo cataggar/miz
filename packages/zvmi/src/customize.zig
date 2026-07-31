@@ -1595,7 +1595,10 @@ fn validateOsCustomization(
             try diagnostics.append(validationError(.invalid_customization, "/os/kernel_modules", "kernel module names must be safe and cannot be loaded and disabled simultaneously", null));
         }
         if (module.options) |options| {
-            if (std.mem.indexOfAny(u8, options, "\r\n\x00") != null) {
+            // `\\` is refused with the line terminators because `modprobe.d`
+            // continues a line ending in one, which would absorb whatever
+            // directive is rendered next into this module's parameters.
+            if (std.mem.indexOfAny(u8, options, "\r\n\x00\\") != null) {
                 try diagnostics.append(validationError(.invalid_customization, "/os/kernel_modules/options", "kernel module options must occupy one line", null));
             }
         }
@@ -1683,14 +1686,24 @@ fn validAccountName(name: []const u8) bool {
 }
 
 /// Stricter than `validConfigName`, because a module name is not only a
-/// filename component: it becomes a token in a `modules-load.d` line and the
-/// subject of a `modprobe.d` `blacklist` or `options` directive. A name
-/// carrying whitespace would silently retarget the directive at a different
-/// module than the one that was declared.
+/// filename component: it is the whole of a `modules-load.d` line and the
+/// subject of a `modprobe.d` `blacklist` or `options` directive. Every way
+/// out of that position is silent, so this is an allowlist rather than a list
+/// of things to refuse -- whitespace retargets the directive at a different
+/// module (`overlay -f` blacklists `overlay`), a trailing `\` continues the
+/// line and swallows the directive rendered after it, and a leading `#` or
+/// `;` turns a `modules-load.d` line into a comment that loads nothing. Real
+/// module names are alphanumerics, `_`, `-` and `.`, none of which are.
+///
+/// Mirrored by `unsafe_chroot.validKernelModuleName`.
 fn validKernelModuleName(name: []const u8) bool {
-    if (name.len == 0 or name.len > 255 or name[0] == '.') return false;
-    for (name) |byte| {
-        if (byte == '/' or byte <= ' ' or byte == 0x7f) return false;
+    if (name.len == 0 or name.len > 128 or !std.ascii.isAlphanumeric(name[0])) return false;
+    for (name[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            byte != '_' and byte != '-' and byte != '.')
+        {
+            return false;
+        }
     }
     return true;
 }
@@ -3221,7 +3234,10 @@ fn buildCapabilities(
                 "general preserved-filesystem creation and metadata mutation are not implemented",
         });
     }
-    if (customization.kernel_modules.len != 0) {
+    // Excluded for `native_fresh` on the same grounds as the blanket above:
+    // a fresh build creates the whole tree, so nothing it writes into that
+    // tree is a question about what can be done to a preserved filesystem.
+    if (execution.backend != .native_fresh and customization.kernel_modules.len != 0) {
         try capabilities.append(.{
             .kind = .kernel_module_configuration,
             .path = "",
@@ -3308,11 +3324,6 @@ fn appendIsolationCapability(
         .related_path = source_path,
         .reason = reason,
     });
-}
-
-fn hasOsCustomization(customization: OsCustomization) bool {
-    return hasGeneralOsCustomization(customization) or
-        customization.kernel_modules.len != 0;
 }
 
 /// OS customization that needs the ability to create and mutate files
@@ -7340,6 +7351,14 @@ test "a kernel module name that would render as two tokens is rejected" {
         "",
         ".hidden",
         "sub/dir",
+        // `modprobe.d` continues a line ending in a backslash, so this one
+        // swallows whatever directive is rendered after it -- the module
+        // named next is then silently not blacklisted at all.
+        "overlay\\",
+        // systemd ignores a `modules-load.d` line whose first non-blank
+        // character is `#` or `;`, so these load nothing and say nothing.
+        "#overlay",
+        ";overlay",
     };
     for (cases) |name| {
         var request = validRequest();
@@ -7362,16 +7381,59 @@ test "a kernel module name that would render as two tokens is rejected" {
         }
     }
 
+    // A backslash in the options is the same failure arriving by the other
+    // route: `options i915 enable_guc=2\` absorbs the next module's directive
+    // into i915's parameter string.
+    var continued = validRequest();
+    const continued_modules = [_]KernelModule{
+        .{ .name = "i915", .options = "enable_guc=2\\" },
+    };
+    continued.os = .{ .kernel_modules = &continued_modules };
+    var continued_diagnostics = try validate(std.testing.allocator, &continued);
+    defer continued_diagnostics.deinit(std.testing.allocator);
+    var refused_options = false;
+    for (continued_diagnostics.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.configuration_path, "/os/kernel_modules/options")) {
+            refused_options = true;
+        }
+    }
+    try std.testing.expect(refused_options);
+
     var accepted = validRequest();
     const modules = [_]KernelModule{
         .{ .name = "overlay", .load = true },
         .{ .name = "snd-hda-intel", .options = "power_save=1" },
+        .{ .name = "8021q", .load = true },
+        .{ .name = "nf_conntrack", .options = "nf_conntrack_max=65536" },
     };
     accepted.os = .{ .kernel_modules = &modules };
     var diagnostics = try validate(std.testing.allocator, &accepted);
     defer diagnostics.deinit(std.testing.allocator);
     for (diagnostics.items) |diagnostic| {
         try std.testing.expect(diagnostic.code != .invalid_customization);
+    }
+}
+
+test "a fresh build writes kernel-module configuration without asking for a capability" {
+    // `native_fresh` creates the whole tree, so nothing it writes into that
+    // tree is a question about what can be done to a preserved filesystem.
+    // Requesting the capability for it anyway would refuse in preflight a
+    // build that has always worked -- `build_image` applies the OS
+    // customization model in full.
+    var request = validRequest();
+    const modules = [_]KernelModule{.{ .name = "overlay", .load = true }};
+    request.os = .{ .kernel_modules = &modules };
+
+    var resolved = try resolve(
+        std.testing.allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.plan != null);
+    try std.testing.expectEqual(ExecutionBackend.native_fresh, resolved.plan.?.data.execution.backend);
+    for (resolved.plan.?.data.required_capabilities) |capability| {
+        try std.testing.expect(capability.kind != .kernel_module_configuration);
     }
 }
 
