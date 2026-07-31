@@ -29,8 +29,8 @@ const verity = @import("verity.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 11;
-pub const provenance_schema_version: u32 = 14;
+pub const plan_schema_version: u32 = 12;
+pub const provenance_schema_version: u32 = 15;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -430,6 +430,22 @@ pub const Hook = struct {
     arguments: []const []const u8 = &.{},
 };
 
+/// What an empty `kernels` list means when the target root turns out to carry
+/// no kernel at all -- a question only the run can answer, since the plan
+/// cannot see inside the image.
+pub const NoInstalledKernelsPolicy = enum {
+    /// Fail the run with `NoInstalledKernels`. Right for an instruction: the
+    /// caller asked for every installed kernel's initramfs to be regenerated,
+    /// and a run that regenerated none has not done what it said.
+    fail,
+    /// Succeed having regenerated nothing. Right for a decision derived from
+    /// `when_needed`: nothing asked for a regeneration, so a root carrying no
+    /// kernel has no stale initramfs and there is nothing to do. Without this
+    /// the derived form would fail builds that the same request completes with
+    /// `unchanged`.
+    nothing_to_regenerate,
+};
+
 pub const InitramfsPolicy = union(enum) {
     unchanged,
     /// Leaving `kernels` empty regenerates the initramfs for every kernel
@@ -441,6 +457,27 @@ pub const InitramfsPolicy = union(enum) {
     regenerate: struct {
         generator: ?[]const u8 = null,
         kernels: []const []const u8 = &.{},
+        no_installed_kernels: NoInstalledKernelsPolicy = .fail,
+    },
+    /// Regenerate only if the rest of the request implies it, deciding from
+    /// the declared plan rather than from what the run turns out to do.
+    ///
+    /// This resolves to `unchanged` or to `regenerate` with no named kernels
+    /// before the plan is built, so the plan states the outcome, the plan
+    /// hash covers it, and the executors never see this tag. A request that
+    /// asks for it produces exactly the plan the equivalent explicit request
+    /// would -- it is a way of not having to know the rule, not a different
+    /// instruction.
+    ///
+    /// Declared last so the tags before it keep the values
+    /// `hashInitramfsPolicy` already gave them. The schema version moves for
+    /// this change regardless, so this buys nothing on its own; it costs
+    /// nothing either, and it keeps the two concrete outcomes reading first.
+    ///
+    /// See `initramfsNeedsRegeneration` for the rule and for what is
+    /// deliberately not part of it.
+    when_needed: struct {
+        generator: ?[]const u8 = null,
     },
 };
 
@@ -1232,6 +1269,13 @@ fn validateInitramfsPolicy(
 ) Allocator.Error!void {
     switch (policy) {
         .unchanged => {},
+        .when_needed => |when_needed| {
+            if (when_needed.generator) |generator| {
+                if (generator.len == 0 or std.mem.indexOfAny(u8, generator, "\r\n\x00") != null) {
+                    try diagnostics.append(validationError(.invalid_policy, "/initramfs/when_needed/generator", "initramfs generators must be non-empty single-line values", null));
+                }
+            }
+        },
         .regenerate => |regenerate| {
             if (regenerate.generator) |generator| {
                 if (generator.len == 0 or std.mem.indexOfAny(u8, generator, "\r\n\x00") != null) {
@@ -2423,7 +2467,11 @@ pub fn resolve(
     );
     const resolved_packages = try dupePackagePolicy(plan_allocator, request.packages, context.base_path);
     const resolved_hooks = try dupeHooks(plan_allocator, request.hooks, context.base_path);
-    const resolved_initramfs = try dupeInitramfsPolicy(plan_allocator, request.initramfs);
+    const resolved_initramfs = try resolveInitramfsPolicy(
+        plan_allocator,
+        request.initramfs,
+        resolved_packages,
+    );
     const resolved_selinux = try dupeSelinuxPolicy(plan_allocator, request.selinux);
     const resolved_cross_architecture = try dupeCrossArchitecturePolicy(plan_allocator, request.cross_architecture);
     const resolved_generalization = try dupeGeneralization(plan_allocator, request.generalization);
@@ -2528,11 +2576,21 @@ fn checkResolvedSourceIsolation(
 }
 
 fn requiresGuestExecution(request: *const Request) bool {
+    // `when_needed` is asked rather than taken at face value. It is a
+    // question, and the plan carries its answer, so a request that resolves
+    // to `unchanged` has to reach the same architecture decisions as one that
+    // stated `unchanged` outright -- otherwise `when_needed` would refuse
+    // cross-architecture builds that its own resolved plan permits.
+    const initramfs_changes = switch (request.initramfs) {
+        .unchanged => false,
+        .regenerate => true,
+        .when_needed => initramfsNeedsRegeneration(request.packages),
+    };
     return request.execution.backend == .unsafe_chroot or
         request.execution.backend == .vm or
         request.packages.actions.len != 0 or
         request.hooks.len != 0 or
-        request.initramfs != .unchanged or
+        initramfs_changes or
         request.selinux != .unchanged;
 }
 
@@ -2773,15 +2831,83 @@ fn dupeHooks(
     return owned;
 }
 
+/// Whether the declared changes make the existing initramfs wrong.
+///
+/// **Package actions are the whole rule today**, and the reason is dracut's
+/// own: an initramfs is a snapshot of a subset of the root filesystem, so a
+/// package that ships a kernel module, a udev rule, or one of the binaries
+/// dracut copies in leaves the existing image describing a root that no
+/// longer exists. `update_all` additionally may install a kernel that has no
+/// initramfs at all yet.
+///
+/// **Kernel-module configuration is deliberately not a trigger.** The
+/// intuition says it should be -- it is configuration about modules -- but
+/// zvmi runs dracut `--no-hostonly` on both executors, and every path by
+/// which dracut consults the target's own `/etc/modules-load.d` or
+/// `/etc/modprobe.d` is gated on `$hostonly`: `90kernel-modules` installs
+/// `/etc/modprobe.d/*.conf` only under `[[ $hostonly ]]`, and
+/// `01systemd-modules-load` both reads `modulesloadconfdir` and installs
+/// `/etc/modules-load.d/*.conf` only under `[[ $hostonly ]]`. So that
+/// configuration does not reach the initramfs and does not change a byte of
+/// it; it takes effect when the real root boots. Triggering on it would do
+/// minutes of work to produce an identical image and would assert a causal
+/// link that does not exist.
+///
+/// Nothing else in the request can reach here: both executor backends refuse
+/// every other part of the model -- general OS customization, existing-path
+/// operations, generalization, hooks, SELinux, and any non-default boot
+/// policy, which is where `verity` lives -- so there is no third case to get
+/// wrong. When one of those is implemented, it belongs in this function.
+fn initramfsNeedsRegeneration(packages: PackagePolicy) bool {
+    return packages.actions.len != 0;
+}
+
+/// Turns a request's policy into the one the plan carries.
+///
+/// `when_needed` is resolved away here rather than carried into the plan, so
+/// that the plan states what will happen, the plan hash covers it, provenance
+/// records it, and no executor has to learn a third tag. A resolved plan
+/// therefore never holds `when_needed`, which is why copying one uses
+/// `dupeInitramfsPolicy` instead.
+fn resolveInitramfsPolicy(
+    allocator: Allocator,
+    policy: InitramfsPolicy,
+    packages: PackagePolicy,
+) Allocator.Error!InitramfsPolicy {
+    const decided: InitramfsPolicy = switch (policy) {
+        .when_needed => |when_needed| if (initramfsNeedsRegeneration(packages)) .{
+            .regenerate = .{
+                .generator = when_needed.generator,
+                // Named by nobody, because a run that did not decide *whether* to
+                // regenerate is in no position to decide *what* -- the releases
+                // are discovered in the target root after the packages have run.
+                .kernels = &.{},
+                // A derived decision must not be stricter than the question
+                // that produced it. Nothing asked for a regeneration here, so
+                // a root with no kernel has nothing stale in it; failing would
+                // turn a build that succeeds under `unchanged` into an error
+                // purely for having asked to be told.
+                .no_installed_kernels = .nothing_to_regenerate,
+            },
+        } else .unchanged,
+        else => policy,
+    };
+    return dupeInitramfsPolicy(allocator, decided);
+}
+
 fn dupeInitramfsPolicy(
     allocator: Allocator,
     policy: InitramfsPolicy,
 ) Allocator.Error!InitramfsPolicy {
     return switch (policy) {
         .unchanged => .unchanged,
+        .when_needed => |when_needed| .{ .when_needed = .{
+            .generator = if (when_needed.generator) |generator| try allocator.dupe(u8, generator) else null,
+        } },
         .regenerate => |regenerate| .{ .regenerate = .{
             .generator = if (regenerate.generator) |generator| try allocator.dupe(u8, generator) else null,
             .kernels = try dupeStrings(allocator, regenerate.kernels),
+            .no_installed_kernels = regenerate.no_installed_kernels,
         } },
     };
 }
@@ -3743,7 +3869,12 @@ fn hashInitramfsPolicy(hash: *std.crypto.hash.sha2.Sha256, policy: InitramfsPoli
         .regenerate => |regenerate| {
             hashOptionalString(hash, regenerate.generator);
             hashStrings(hash, regenerate.kernels);
+            hashInt(hash, @intFromEnum(regenerate.no_installed_kernels));
         },
+        // Resolved away before a plan exists, so this never contributes to a
+        // plan hash. Hashed distinctly anyway rather than asserted absent:
+        // a wrong digest is a better failure than undefined behaviour.
+        .when_needed => |when_needed| hashOptionalString(hash, when_needed.generator),
     }
 }
 
@@ -4126,6 +4257,10 @@ fn unsafeChrootCapabilityState(
                 if (!std.mem.eql(u8, generator, "dracut")) return .unsupported;
             }
         },
+        // `resolve` turns this into one of the arms above, so a resolved plan
+        // cannot hold it. Declining rather than asserting keeps the failure on
+        // the safe side of the boundary if that ever stops being true.
+        .when_needed => return .unsupported,
     }
     return platform.checkUnsafeChroot(io, plan);
 }
@@ -4198,6 +4333,10 @@ fn vmCapabilityState(
                 if (!std.mem.eql(u8, generator, "dracut")) return .unsupported;
             }
         },
+        // `resolve` turns this into one of the arms above, so a resolved plan
+        // cannot hold it. Declining rather than asserting keeps the failure on
+        // the safe side of the boundary if that ever stops being true.
+        .when_needed => return .unsupported,
     }
     return platform.checkVm(io, plan);
 }
@@ -8093,7 +8232,7 @@ test "plan JSON renders identifiers as stable strings" {
     defer output.deinit();
     try writePlanJson(&resolved.plan.?, &output.writer);
     const json = output.written();
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": 12") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"plan_hash\": \"") != null);
 }
 
@@ -8555,4 +8694,216 @@ test "rebuild execution creates paths and emits strict tree provenance" {
     try std.testing.expectEqual(@as(u16, 0o600), created_stat.mode);
     try std.testing.expectEqual(@as(u32, 45), created_stat.uid);
     try std.testing.expectEqual(@as(u32, 67), created_stat.gid);
+}
+
+// A helper for the `when_needed` tests: an `unsafe_chroot` request that is
+// valid apart from whatever the caller sets on it.
+fn whenNeededRequest() Request {
+    var request = validNativeEditRequest(
+        "source.raw",
+        "when-needed-work/output.raw",
+        "when-needed-work",
+        &.{},
+    );
+    request.execution.backend = .unsafe_chroot;
+    request.execution.acknowledge_unsafe = true;
+    return request;
+}
+
+// Returns the tag only. The policy itself points into the plan's arena, which
+// this function frees before returning, so nothing but the tag may leave here.
+fn resolvedInitramfsTag(request: *const Request) !std.meta.Tag(InitramfsPolicy) {
+    var resolved = try resolve(
+        std.testing.allocator,
+        request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    for (resolved.diagnostics.items) |diagnostic| {
+        try std.testing.expect(diagnostic.code != .invalid_policy);
+    }
+    try std.testing.expect(resolved.plan != null);
+    return std.meta.activeTag(resolved.plan.?.data.initramfs);
+}
+
+test "when_needed regenerates for package actions and names no kernel" {
+    const actions = [_]PackageAction{.{ .install = &.{"dracut"} }};
+    const repositories = [_]PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    var request = whenNeededRequest();
+    request.packages = .{ .actions = &actions, .repositories = &repositories };
+    request.initramfs = .{ .when_needed = .{ .generator = "dracut" } };
+
+    var resolved = try resolve(
+        std.testing.allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.plan != null);
+    const policy = resolved.plan.?.data.initramfs;
+    try std.testing.expectEqual(
+        std.meta.Tag(InitramfsPolicy).regenerate,
+        std.meta.activeTag(policy),
+    );
+    // A run that did not decide *whether* to regenerate cannot decide *what*:
+    // an empty list is the instruction to discover the releases in the target
+    // root once the packages have run.
+    try std.testing.expectEqual(@as(usize, 0), policy.regenerate.kernels.len);
+    try std.testing.expectEqualStrings("dracut", policy.regenerate.generator.?);
+    // The derived form must not inherit the explicit form's strictness. An
+    // explicit "regenerate every installed kernel" that finds none has not
+    // done what it said and fails; a derived one has simply learned that
+    // there was nothing stale.
+    try std.testing.expectEqual(
+        NoInstalledKernelsPolicy.nothing_to_regenerate,
+        policy.regenerate.no_installed_kernels,
+    );
+}
+
+test "a derived regeneration is a different instruction from a strict one" {
+    // The counterpart to the plan-identity test: `when_needed` matches the
+    // explicit request that states the *same* thing, and must not collide
+    // with the one that states something stricter. The two differ only in
+    // what an empty module tree means, so if that field were dropped on the
+    // way into the plan these hashes would be equal.
+    const actions = [_]PackageAction{.update_all};
+    const repositories = [_]PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+
+    var derived = whenNeededRequest();
+    derived.packages = .{ .actions = &actions, .repositories = &repositories };
+    derived.initramfs = .{ .when_needed = .{} };
+
+    var strict = whenNeededRequest();
+    strict.packages = .{ .actions = &actions, .repositories = &repositories };
+    strict.initramfs = .{ .regenerate = .{ .kernels = &.{} } };
+
+    var derived_resolved = try resolve(
+        std.testing.allocator,
+        &derived,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer derived_resolved.deinit(std.testing.allocator);
+    var strict_resolved = try resolve(
+        std.testing.allocator,
+        &strict,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer strict_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(derived_resolved.plan != null);
+    try std.testing.expect(strict_resolved.plan != null);
+    try std.testing.expectEqual(
+        NoInstalledKernelsPolicy.fail,
+        strict_resolved.plan.?.data.initramfs.regenerate.no_installed_kernels,
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &strict_resolved.plan.?.data.plan_hash.bytes,
+        &derived_resolved.plan.?.data.plan_hash.bytes,
+    ));
+}
+
+test "when_needed does not refuse a cross-architecture build it resolves away" {
+    // `requiresGuestExecution` reads the request, not the plan, so a
+    // `when_needed` taken at face value would look like guest execution and
+    // refuse a cross-architecture `native_edit` build that the identical
+    // request with `unchanged` completes -- even though it resolves to
+    // exactly that.
+    var request = validNativeEditRequest(
+        "source.raw",
+        "when-needed-cross/output.raw",
+        "when-needed-cross",
+        &.{},
+    );
+    request.target_architecture = .aarch64;
+    request.initramfs = .{ .when_needed = .{} };
+
+    try std.testing.expectEqual(
+        std.meta.Tag(InitramfsPolicy).unchanged,
+        try resolvedInitramfsTag(&request),
+    );
+}
+
+test "when_needed leaves the initramfs alone when no package action is declared" {
+    var request = whenNeededRequest();
+    request.initramfs = .{ .when_needed = .{} };
+
+    try std.testing.expectEqual(
+        std.meta.Tag(InitramfsPolicy).unchanged,
+        try resolvedInitramfsTag(&request),
+    );
+}
+
+test "when_needed is not triggered by kernel-module configuration alone" {
+    // The load-bearing case for the rule. The intuition is that configuring
+    // kernel modules should rebuild the initramfs, and it is wrong here: zvmi
+    // runs dracut `--no-hostonly`, under which `90kernel-modules` and
+    // `01systemd-modules-load` both gate reading and installing the target's
+    // `/etc/modprobe.d` and `/etc/modules-load.d` on `$hostonly`. The
+    // configuration this request writes cannot reach the initramfs, so
+    // regenerating would spend minutes producing an identical image.
+    const modules = [_]KernelModule{
+        .{ .name = "overlay", .load = true },
+        .{ .name = "i915", .options = "enable_guc=2" },
+    };
+    var request = whenNeededRequest();
+    request.os = .{ .kernel_modules = &modules };
+    request.initramfs = .{ .when_needed = .{} };
+
+    try std.testing.expectEqual(
+        std.meta.Tag(InitramfsPolicy).unchanged,
+        try resolvedInitramfsTag(&request),
+    );
+}
+
+test "a when_needed plan is byte-identical to the explicit plan it resolves to" {
+    // The whole design in one assertion: `when_needed` is a way of not having
+    // to know the rule, not a different instruction. Because it resolves away
+    // before the plan is built, the plan hash -- which covers the resolved
+    // initramfs policy -- cannot tell the two requests apart.
+    const actions = [_]PackageAction{.update_all};
+    const repositories = [_]PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+
+    var derived = whenNeededRequest();
+    derived.packages = .{ .actions = &actions, .repositories = &repositories };
+    derived.initramfs = .{ .when_needed = .{ .generator = "dracut" } };
+
+    var explicit = whenNeededRequest();
+    explicit.packages = .{ .actions = &actions, .repositories = &repositories };
+    explicit.initramfs = .{ .regenerate = .{
+        .generator = "dracut",
+        .kernels = &.{},
+        .no_installed_kernels = .nothing_to_regenerate,
+    } };
+
+    var derived_resolved = try resolve(
+        std.testing.allocator,
+        &derived,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer derived_resolved.deinit(std.testing.allocator);
+    var explicit_resolved = try resolve(
+        std.testing.allocator,
+        &explicit,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer explicit_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(derived_resolved.plan != null);
+    try std.testing.expect(explicit_resolved.plan != null);
+    try std.testing.expectEqualSlices(
+        u8,
+        &explicit_resolved.plan.?.data.plan_hash.bytes,
+        &derived_resolved.plan.?.data.plan_hash.bytes,
+    );
 }

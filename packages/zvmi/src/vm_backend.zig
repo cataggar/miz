@@ -401,6 +401,8 @@ fn requestedKernelRelease(initramfs: customize.InitramfsPolicy) ?[]const u8 {
             null
         else
             regenerate.kernels[0],
+        // Resolved away on the host; names no release either way.
+        .when_needed => null,
     };
 }
 
@@ -504,7 +506,18 @@ fn controlFromPolicy(
         .actions = actions,
         .initramfs = switch (input.initramfs) {
             .unchanged => .unchanged,
-            .regenerate => |regenerate| .{ .regenerate = .{ .kernels = regenerate.kernels } },
+            .regenerate => |regenerate| .{ .regenerate = .{
+                .kernels = regenerate.kernels,
+                .no_installed_kernels = switch (regenerate.no_installed_kernels) {
+                    .fail => .fail,
+                    .nothing_to_regenerate => .nothing_to_regenerate,
+                },
+            } },
+            // `resolve` replaced this with one of the arms above before the
+            // plan existed. There is no honest mapping for it here, and the
+            // guest protocol deliberately has no tag for a policy that has
+            // not been decided yet.
+            .when_needed => return error.UnresolvedInitramfsPolicy,
         },
         .kernel_module_files = kernel_module_files,
         .modules = input.modules,

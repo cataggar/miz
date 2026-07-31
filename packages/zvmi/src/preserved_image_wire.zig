@@ -138,11 +138,24 @@ pub const PackagePolicy = struct {
     lock: PackageLockPolicy = .unlocked,
 };
 
+/// Whether an empty `kernels` list that discovers no installed kernel is an
+/// error or simply nothing to do.
+pub const NoInstalledKernelsPolicy = enum {
+    fail,
+    nothing_to_regenerate,
+};
+
 pub const InitramfsPolicy = union(enum) {
     unchanged,
     regenerate: struct {
         generator: ?[]const u8 = null,
         kernels: []const []const u8 = &.{},
+        no_installed_kernels: NoInstalledKernelsPolicy = .fail,
+    },
+    /// Let the build decide from the rest of the configuration. See
+    /// `customize.initramfsNeedsRegeneration` for what implies a rebuild.
+    when_needed: struct {
+        generator: ?[]const u8 = null,
     },
 };
 

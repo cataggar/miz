@@ -806,6 +806,16 @@ fn mapInitramfsPolicy(
             else
                 null,
             .kernels = regenerate.kernels,
+            .no_installed_kernels = switch (regenerate.no_installed_kernels) {
+                .fail => .fail,
+                .nothing_to_regenerate => .nothing_to_regenerate,
+            },
+        } },
+        .when_needed => |when_needed| .{ .when_needed = .{
+            .generator = if (when_needed.generator) |generator|
+                try allocator.dupe(u8, generator)
+            else
+                null,
         } },
     };
 }
