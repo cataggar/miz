@@ -252,7 +252,21 @@ fn executeManifest(
     // is rendered into the target root during `open`, well before `runPolicy`
     // is reached, so a check deferred to there would run after the bytes it
     // guards had already been placed.
-    try validateManifestPolicy(manifest);
+    //
+    // Reported as a refusal with cleanup complete rather than propagated,
+    // because propagating out of `workerMain` after the started marker is
+    // written is read by the parent as `cleanup_uncertain`: the lease is
+    // abandoned rather than released, the active marker stays, the staging raw
+    // is left behind, and the run is reported as `MutationResourcesActive`.
+    // Nothing has been created, mounted or attached at this point, so saying
+    // resources may still be active would name something that never happened.
+    validateManifestPolicy(manifest) catch {
+        return .{
+            .operation_succeeded = false,
+            .cleanup_complete = true,
+            .report = .{ .tools = &.{}, .installed_packages = &.{} },
+        };
+    };
     try prepareEmptyRoot(io, manifest.root_path);
     var session = Session{
         .allocator = allocator,
@@ -2571,16 +2585,23 @@ test "worker installs the declared resolver and none without package actions" {
         .unmounts = .init(allocator),
         .resolver_layout = .regular,
     };
-    try std.testing.expectError(error.InvalidNetworkConfiguration, executeManifest(
+    const refused_result = try executeManifest(
         allocator,
         io,
         refused,
         .{ .context = &refused_context, .runFn = FakeExecutorContext.run },
-    ));
+    );
+    try std.testing.expect(!refused_result.operation_succeeded);
+    // Cleanup is complete because there was nothing to clean up. The parent
+    // reads a propagated error here as "the worker may have left resources
+    // attached" and abandons its lease, poisoning the transaction directory
+    // for a run that touched nothing.
+    try std.testing.expect(refused_result.cleanup_complete);
     try std.testing.expectError(
         error.FileNotFound,
         Io.Dir.cwd().statFile(io, refused_root, .{}),
     );
+    try std.testing.expectEqual(@as(usize, 0), refused_context.unmounts.items.len);
 }
 
 // A whitespace-carrying name reaching the renderer would silently retarget a
@@ -2613,10 +2634,13 @@ test "worker refuses kernel module names it would render as two tokens" {
         error.InvalidNetworkConfiguration,
         validateManifestPolicy(injected),
     );
+    // Named apart from the malformed case, because a well-formed address that
+    // means the build machine is a different mistake from one that is not an
+    // address at all, and only the caller can tell them apart from the error.
     var loopback = base;
     loopback.packages = .{ .resolver = .{ .nameservers = &.{"127.0.0.53"} } };
     try std.testing.expectError(
-        error.InvalidNetworkConfiguration,
+        error.UnusableNameserver,
         validateManifestPolicy(loopback),
     );
 

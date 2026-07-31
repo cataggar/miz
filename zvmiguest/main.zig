@@ -89,15 +89,19 @@ const Session = struct {
     proc_mounted: bool = false,
     sys_mounted: bool = false,
     run_mounted: bool = false,
-    /// Whether the image's own `/etc/resolv.conf` was moved aside, and whether
-    /// there was one to move. It is renamed rather than copied because a copy
-    /// reads through a symlink and writes back a regular file: an image whose
-    /// resolver links into `/run` -- which is most of them -- would come out of
-    /// the transaction with the link replaced by a stale file. The same names
-    /// and the same protocol as the chroot backend, so an image cannot tell
-    /// which one ran.
-    resolver_replaced: bool = false,
-    resolver_had_original: bool = false,
+    /// What was done to the image's own `/etc/resolv.conf`. One value rather
+    /// than a "replaced" flag beside a "had an original" flag, because the two
+    /// are only ever meaningful read together and a pair that can be assigned
+    /// separately can describe a filesystem that never existed -- which is
+    /// exactly how a teardown comes to delete the file it was restoring.
+    ///
+    /// It is renamed aside rather than copied because a copy reads through a
+    /// symlink and writes back a regular file: an image whose resolver links
+    /// into `/run` -- which is most of them -- would come out of the
+    /// transaction with the link replaced by a stale file. The same names and
+    /// the same protocol as the chroot backend, so an image cannot tell which
+    /// one ran.
+    resolver_state: enum { untouched, replaced_nothing, replaced_original } = .untouched,
     repositories_written: []const control_mod.Repository = &.{},
 
     fn run(self: *Session) Outcome {
@@ -290,14 +294,18 @@ const Session = struct {
     /// that exists on this synthetic link.
     fn installResolver(self: *Session, config: control_mod.NetworkConfig) !void {
         const body = try renderResolver(self.allocator, config);
-        self.resolver_replaced = true;
-        errdefer self.restoreResolver();
-        self.resolver_had_original = try replaceAside(
+        // Nothing is recorded until this has succeeded. `replaceAside` puts
+        // back whatever it moved on every one of its own error paths, so a
+        // teardown that also acted on a flag set beforehand would either
+        // delete an original that was never moved or undo the restore that
+        // had already happened.
+        const had_original = try replaceAside(
             self.allocator,
             guest_root ++ resolver_path,
             guest_root ++ resolver_backup_path,
             body,
         );
+        self.resolver_state = if (had_original) .replaced_original else .replaced_nothing;
     }
 
     fn importTrust(self: *Session, control: control_mod.Control) !void {
@@ -525,12 +533,16 @@ const Session = struct {
     }
 
     fn restoreResolver(self: *Session) void {
-        if (!self.resolver_replaced) return;
-        self.resolver_replaced = false;
+        const had_original = switch (self.resolver_state) {
+            .untouched => return,
+            .replaced_nothing => false,
+            .replaced_original => true,
+        };
+        self.resolver_state = .untouched;
         restoreAside(
             guest_root ++ resolver_path,
             guest_root ++ resolver_backup_path,
-            self.resolver_had_original,
+            had_original,
         ) catch {
             log("[zvmi-guest] could not restore the target resolver\n");
         };

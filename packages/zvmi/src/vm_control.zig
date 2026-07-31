@@ -52,6 +52,7 @@ pub const Error = error{
     OfflineNetworkWithPackageActions,
     NoDeclaredRepositories,
     InvalidNetworkConfiguration,
+    UnusableNameserver,
     RepositoryWithoutTrust,
     DuplicateRepositoryId,
     BadFrameMagic,
@@ -129,7 +130,7 @@ pub fn validateNameservers(nameservers: []const []const u8) Error!void {
         // unspecified, multicast and reserved ranges are not resolvers
         // anywhere.
         if (octets[0] == 0 or octets[0] == 127 or octets[0] >= 224) {
-            return error.InvalidNetworkConfiguration;
+            return error.UnusableNameserver;
         }
     }
 }

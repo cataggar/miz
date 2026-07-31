@@ -1255,13 +1255,22 @@ fn validatePackagePolicy(
     }
     switch (policy.resolver) {
         .host_resolver => {},
-        .nameservers => |nameservers| vm_control.validateNameservers(nameservers) catch {
-            try diagnostics.append(validationError(
+        // Two refusals with two messages. `127.0.0.53` is one well-formed
+        // dotted quad, so telling its author to check the count and the format
+        // names the only two things they got right.
+        .nameservers => |nameservers| vm_control.validateNameservers(nameservers) catch |err| switch (err) {
+            error.UnusableNameserver => try diagnostics.append(validationError(
+                .invalid_policy,
+                "/packages/resolver/nameservers",
+                "a declared resolver cannot be a loopback, unspecified, multicast or reserved address",
+                "name the resolver by the address other machines reach it on, or select host_resolver to state that this machine's own is meant",
+            )),
+            else => try diagnostics.append(validationError(
                 .invalid_policy,
                 "/packages/resolver/nameservers",
                 "a declared resolver needs one to three dotted-quad IPv4 addresses",
                 "state at most MAXNS nameservers, each as a dotted quad",
-            ));
+            )),
         },
     }
 }
@@ -3476,8 +3485,12 @@ fn buildCapabilities(
     // The chroot backend unshares only mount and pid, so its transaction always
     // resolves through the build host. A guest does so only when it is given
     // the network that reaches it: an offline guest is started with `-nic none`,
-    // so a cache-only transaction inside one never reads the host's resolver at
-    // all and must not be made to declare that it does.
+    // so there is no route to a host resolver for it to take and a plan must
+    // not declare a dependence the run cannot have. Today the VM backend also
+    // refuses the cache-only policy that is the only way an offline guest could
+    // carry package actions, so the two terms overlap; the capability set has
+    // to be a function of what the run does rather than of which refusal
+    // happens to be in force.
     const resolves_through_host = switch (execution.backend) {
         .unsafe_chroot => true,
         .vm => if (execution.vm) |vm| vm.network == .declared_repositories else false,
@@ -9093,6 +9106,24 @@ test "a declared resolver must be one to three dotted quads" {
         ));
     }
 
+    // Refusing is not enough: `127.0.0.53` is one well-formed dotted quad, so
+    // a message about the count and the format would name the only two things
+    // its author got right and send them back to re-check both.
+    var loopback = resolverRequest(.{ .nameservers = &.{"127.0.0.53"} });
+    var loopback_resolved = try resolve(
+        std.testing.allocator,
+        &loopback,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer loopback_resolved.deinit(std.testing.allocator);
+    var named_loopback = false;
+    for (loopback_resolved.diagnostics.items) |diagnostic| {
+        if (std.mem.indexOf(u8, diagnostic.message, "loopback") != null) {
+            named_loopback = true;
+        }
+    }
+    try std.testing.expect(named_loopback);
+
     var accepted = resolverRequest(.{ .nameservers = &.{ "192.0.2.1", "198.51.100.7" } });
     var resolved = try resolve(
         std.testing.allocator,
@@ -9190,10 +9221,12 @@ test "both executing backends declare inheriting the host resolver" {
         ));
     }
 
-    // An offline guest is started with `-nic none`, so it reads no resolver at
-    // all whatever the policy says. It has to be able to reach here: an offline
-    // VM refuses package actions only when the cache policy is not `cache_only`,
-    // so a cache-only transaction is a networkless run with actions in it.
+    // An offline guest is started with `-nic none`, so there is no route to a
+    // host resolver whatever the policy says. The only shape that gets package
+    // actions into one is a cache-only policy, which the VM backend separately
+    // refuses at preflight today -- so this pins the rule rather than a
+    // currently reachable run, and stops the capability from being right only
+    // for as long as that second refusal happens to stand.
     var offline = resolverRequest(.host_resolver);
     offline.packages.cache = .cache_only;
     offline.execution.backend = .vm;
