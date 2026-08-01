@@ -30,8 +30,8 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 14;
-pub const provenance_schema_version: u32 = 17;
+pub const plan_schema_version: u32 = 15;
+pub const provenance_schema_version: u32 = 18;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -55,6 +55,23 @@ pub const Digest = struct {
     pub fn jsonStringify(self: Digest, stringify: anytype) !void {
         const hex = std.fmt.bytesToHex(self.bytes, .lower);
         try stringify.write(&hex);
+    }
+
+    /// The inverse of `jsonStringify`, so a document carrying a digest can be
+    /// read back by the same program that wrote it. The unsafe backend's
+    /// worker report crosses a process boundary as JSON; without this, the
+    /// digests in it would need a second on-the-wire representation, and two
+    /// spellings of the same value drift.
+    pub fn jsonParse(
+        allocator: Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) std.json.ParseError(@TypeOf(source.*))!Digest {
+        const hex = try std.json.innerParse([]const u8, allocator, source, options);
+        if (hex.len != 64) return error.InvalidCharacter;
+        var digest: Digest = undefined;
+        _ = std.fmt.hexToBytes(&digest.bytes, hex) catch return error.InvalidCharacter;
+        return digest;
     }
 };
 
@@ -379,6 +396,15 @@ pub const max_credential_field_bytes: usize = 256;
 /// The largest material a credential source may hold. Generous for a password,
 /// tight enough that a misnamed source cannot spool a whole file into memory.
 pub const max_credential_material_bytes: usize = 4096;
+
+/// What a hook is allowed to be, stated here rather than discovered when a
+/// read runs out of memory or an `execve` runs out of argument space. A hook
+/// is the one place a caller supplies code rather than configuration, so the
+/// bounds on it are part of the declaration and not a property of the host it
+/// happens to run on.
+pub const max_hook_script_bytes: usize = 256 * 1024;
+pub const max_hook_arguments: usize = 64;
+pub const max_hook_argument_bytes: usize = 4096;
 
 pub const PackageAction = union(enum) {
     install: []const []const u8,
@@ -1433,6 +1459,19 @@ fn isValidEnvironmentName(name: []const u8) bool {
     return true;
 }
 
+/// Whether a hook script says what should run it.
+///
+/// The kernel decides how to execute a file from its first bytes, so a script
+/// without a shebang is refused where it is written instead of failing with an
+/// unattributed `ENOEXEC` from a `chroot` several phases into a privileged
+/// run. Requiring it also makes what interprets the hook a property of the
+/// declaration rather than of whichever shell the target image happens to
+/// ship: the same request runs the same interpreter everywhere, or does not
+/// run at all.
+fn namesAnInterpreter(script: []const u8) bool {
+    return std.mem.startsWith(u8, script, "#!");
+}
+
 fn validateHooks(
     diagnostics: *std.array_list.Managed(Diagnostic),
     hooks: []const Hook,
@@ -1459,16 +1498,49 @@ fn validateHooks(
             }
         }
         switch (hook.source) {
-            .inline_script => |script| if (script.len == 0) {
-                try diagnostics.append(validationError(.invalid_policy, "/hooks/source", "inline scripts must not be empty", null));
+            .inline_script => |script| {
+                if (script.len == 0) {
+                    try diagnostics.append(validationError(.invalid_policy, "/hooks/source", "inline scripts must not be empty", null));
+                } else if (!namesAnInterpreter(script)) {
+                    try diagnostics.append(validationError(
+                        .invalid_policy,
+                        "/hooks/source/inline_script",
+                        "a hook script must name its own interpreter on its first line",
+                        "start the script with a shebang, for example #!/bin/sh",
+                    ));
+                }
+                if (script.len > max_hook_script_bytes) {
+                    try diagnostics.append(validationError(
+                        .invalid_policy,
+                        "/hooks/source/inline_script",
+                        "the hook script is larger than a hook script may be",
+                        "keep a hook under 256 KiB, or install what it needs as a package",
+                    ));
+                }
             },
             .host_path => |path| if (path.len == 0) {
                 try diagnostics.append(validationError(.invalid_policy, "/hooks/source", "hook source paths must not be empty", null));
             },
         }
+        if (hook.arguments.len > max_hook_arguments) {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                "/hooks/arguments",
+                "the hook declares more arguments than a hook may take",
+                "pass at most 64 arguments, or move the list into the script",
+            ));
+        }
         for (hook.arguments) |argument| {
             if (std.mem.indexOfScalar(u8, argument, 0) != null) {
                 try diagnostics.append(validationError(.invalid_policy, "/hooks/arguments", "hook arguments must not contain NUL", null));
+            }
+            if (argument.len > max_hook_argument_bytes) {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/hooks/arguments",
+                    "a hook argument is longer than a hook argument may be",
+                    "keep each argument under 4096 bytes",
+                ));
             }
         }
     }
@@ -1682,6 +1754,18 @@ fn validateVmPolicy(
                 "declare the repositories the guest may reach or select offline networking",
             ));
         },
+    }
+    // The guest agent has no channel that carries caller-supplied code, so a
+    // hook declared against this backend would be dropped rather than run.
+    // Named here, because a run that skipped the hook and published anyway is
+    // a run whose provenance claims work it did not do.
+    if (request.hooks.len != 0) {
+        try diagnostics.append(validationError(
+            .unsupported_execution_backend,
+            "/hooks",
+            "the vm backend has no channel that carries a hook to the guest",
+            "use the unsafe_chroot backend for hooks",
+        ));
     }
     // Credential material reaches a guest only through the control document,
     // which this slice does not carry it in. Refused where it is written
@@ -3116,6 +3200,22 @@ fn dupePackagePolicy(
     };
 }
 
+fn dupeHookRecords(
+    allocator: Allocator,
+    records: []const HookRecord,
+) Allocator.Error![]const HookRecord {
+    const owned = try allocator.alloc(HookRecord, records.len);
+    for (records, 0..) |record, index| {
+        owned[index] = .{
+            .name = try allocator.dupe(u8, record.name),
+            .phase = record.phase,
+            .source_sha256 = record.source_sha256,
+            .exit_code = record.exit_code,
+        };
+    }
+    return owned;
+}
+
 fn dupeHooks(
     allocator: Allocator,
     hooks: []const Hook,
@@ -4533,12 +4633,12 @@ pub fn preflight(
             .selinux_relabel,
             .boot_policy_mutation,
             => .unsupported,
-            .script_execution,
             .cross_architecture_runner,
             => if (plan.data.execution.backend == .vm)
                 vmCapabilityState(platform, io, plan)
             else
                 .unsupported,
+            .script_execution,
             .unsafe_chroot,
             .package_management,
             .repository_access,
@@ -4595,7 +4695,6 @@ fn unsafeChrootCapabilityState(
         // the target root, which neither of them implements.
         hasGeneralOsCustomization(data.os) or
         data.generalization != .none or
-        data.hooks.len != 0 or
         data.selinux != .unchanged or
         !isDefaultBootPolicy(data.boot_security) or
         data.packages.cache != .online or
@@ -4603,6 +4702,14 @@ fn unsafeChrootCapabilityState(
     {
         return .unsupported;
     }
+    // Nothing about `data.hooks` is checked here on purpose. `resolve` runs
+    // `validate` first, so every hook shape this backend could not execute --
+    // an empty or oversized script, one naming no interpreter, an argument
+    // vector past the declared bounds -- has already been refused by name and
+    // can never reach a plan. A second copy of those rules here would be
+    // unreachable, and an unreachable rule is one that quietly stops matching
+    // the reachable one. What the worker does not trust, it re-checks on its
+    // own side of the privilege boundary instead, in `validateManifestPolicy`.
     for (data.packages.actions) |action| {
         const names: []const []const u8 = switch (action) {
             .install, .remove, .update_selected => |values| values,
@@ -5006,10 +5113,32 @@ pub const ToolRecord = struct {
     command: []const []const u8,
 };
 
+/// What a hook was and what running it did.
+///
+/// A hook is the one input whose effect the plan cannot describe -- everything
+/// else in a request says what will be true afterwards, a hook says only that
+/// some code ran. So the record names the code by digest rather than by where
+/// it came from: an inline script and a host path that held the same bytes
+/// produced the same run, and a host path whose contents changed between two
+/// runs did not.
+pub const HookRecord = struct {
+    name: []const u8,
+    phase: HookPhase,
+    /// The bytes as they were placed in the target root and executed, not the
+    /// bytes of whatever file was named. For a `host_path` source the two are
+    /// the same read; digesting the placed copy is what makes that checkable.
+    source_sha256: Digest,
+    /// Zero in every published provenance, because a hook that exited nonzero
+    /// fails the run and nothing is published. Recorded anyway, so the record
+    /// states what was observed rather than leaving it to be assumed.
+    exit_code: u8,
+};
+
 pub const UnsafeChrootRuntimeReport = struct {
     arena: std.heap.ArenaAllocator,
     tools: []const ToolRecord,
     installed_packages: []const []const u8,
+    hooks: []const HookRecord = &.{},
 
     pub fn deinit(self: *UnsafeChrootRuntimeReport) void {
         self.arena.deinit();
@@ -5184,6 +5313,10 @@ pub const PreservedExecutionRecord = struct {
     flattened_backing_chain: bool,
     operation_count: usize,
     installed_packages: []const []const u8,
+    /// Hooks that ran, in the order they ran. Empty for a run that declared
+    /// none, which is not the same as a backend that could not have run them:
+    /// that request never reaches a provenance record at all.
+    hooks: []const HookRecord = &.{},
     rebuild: ?PreservedRebuildRecord,
 };
 
@@ -5377,6 +5510,16 @@ fn guestPackages(
     return &.{};
 }
 
+/// Hooks only ever run under the chroot backend, so there is one report that
+/// can hold them. Written as a lookup rather than read inline so the day the
+/// guest gains a script channel adds an arm here instead of a second spelling.
+fn guestHooks(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+) []const HookRecord {
+    if (unsafe_report) |report| return report.hooks;
+    return &.{};
+}
+
 fn guestTools(
     unsafe_report: ?*const UnsafeChrootRuntimeReport,
     vm_report: ?*const VmRuntimeReport,
@@ -5522,6 +5665,7 @@ fn buildResult(
             .flattened_backing_chain = flattened,
             .operation_count = operation_count,
             .installed_packages = try dupeStrings(result_allocator, guestPackages(unsafe_report, vm_report)),
+            .hooks = try dupeHookRecords(result_allocator, guestHooks(unsafe_report)),
             .rebuild = if (rebuild_report) |report| .{
                 .profile = report.source_profile,
                 .reproducible = report.source_reproducible,
@@ -7071,17 +7215,33 @@ test "unsafe chroot preflight accepts only the implemented policy subset" {
         try Check.state(&request, .x86_64),
     );
 
+    // Hooks are the one input that is caller-supplied code rather than
+    // configuration, and this backend runs them. What it still refuses is a
+    // hook it could not execute: a script that names no interpreter would
+    // reach `execve` and come back as an exit status with nothing attached to
+    // it, so it is refused where the bytes are first visible instead.
     const hooks = [_]Hook{.{
-        .name = "unsupported",
+        .name = "supported",
         .phase = .finalize,
-        .source = .{ .inline_script = "true" },
+        .source = .{ .inline_script = "#!/bin/sh\ntrue\n" },
     }};
     request = baseline;
     request.hooks = &hooks;
     try std.testing.expectEqual(
-        CapabilityState.unsupported,
+        CapabilityState.available,
         try Check.state(&request, .x86_64),
     );
+
+    const unrunnable_hooks = [_]Hook{.{
+        .name = "unrunnable",
+        .phase = .finalize,
+        .source = .{ .inline_script = "true" },
+    }};
+    request = baseline;
+    request.hooks = &unrunnable_hooks;
+    var unrunnable = try validate(std.testing.allocator, &request);
+    defer unrunnable.deinit(std.testing.allocator);
+    try std.testing.expect(hasDiagnosticCode(unrunnable, .invalid_policy));
 }
 
 test "v2 native-fresh requests require the explicit adapter" {
@@ -7174,11 +7334,10 @@ test "v3 validation models the backend and unsafe execution matrix" {
 }
 
 test "cross-architecture guest execution requires an explicit compatible runner" {
-    const hooks = [_]Hook{.{
-        .name = "guest-script",
-        .phase = .finalize,
-        .source = .{ .inline_script = "#!/bin/sh\ntrue\n" },
-    }};
+    // The vm backend is itself guest execution, so nothing else has to be
+    // declared to make the architectures matter. It used to be a hook that
+    // carried that weight here; hooks are refused on this backend now, and a
+    // test that leaned on one would be testing the refusal instead.
     var request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
     request.target_architecture = .aarch64;
     request.execution.backend = .vm;
@@ -7187,7 +7346,6 @@ test "cross-architecture guest execution requires an explicit compatible runner"
         .emulator_command = "/usr/bin/qemu-system-aarch64",
         .acceleration = .software,
     };
-    request.hooks = &hooks;
 
     var rejected = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
     defer rejected.deinit(std.testing.allocator);
@@ -7211,8 +7369,8 @@ test "cross-architecture guest execution requires an explicit compatible runner"
 
 test "hook phases remain ordered in validation and resolved operations" {
     const unordered_hooks = [_]Hook{
-        .{ .name = "final", .phase = .finalize, .source = .{ .inline_script = "true" } },
-        .{ .name = "early", .phase = .after_packages, .source = .{ .inline_script = "true" } },
+        .{ .name = "final", .phase = .finalize, .source = .{ .inline_script = "#!/bin/sh\ntrue\n" } },
+        .{ .name = "early", .phase = .after_packages, .source = .{ .inline_script = "#!/bin/sh\ntrue\n" } },
     };
     var request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
     request.execution.backend = .unsafe_chroot;
@@ -7223,10 +7381,10 @@ test "hook phases remain ordered in validation and resolved operations" {
     try std.testing.expect(hasDiagnosticCode(unordered, .invalid_policy));
 
     const ordered_hooks = [_]Hook{
-        .{ .name = "packages", .phase = .after_packages, .source = .{ .inline_script = "true" } },
-        .{ .name = "initramfs", .phase = .before_initramfs, .source = .{ .inline_script = "true" } },
-        .{ .name = "seal", .phase = .before_seal, .source = .{ .inline_script = "true" } },
-        .{ .name = "final", .phase = .finalize, .source = .{ .inline_script = "true" } },
+        .{ .name = "packages", .phase = .after_packages, .source = .{ .inline_script = "#!/bin/sh\ntrue\n" } },
+        .{ .name = "initramfs", .phase = .before_initramfs, .source = .{ .inline_script = "#!/bin/sh\ntrue\n" } },
+        .{ .name = "seal", .phase = .before_seal, .source = .{ .inline_script = "#!/bin/sh\ntrue\n" } },
+        .{ .name = "final", .phase = .finalize, .source = .{ .inline_script = "#!/bin/sh\ntrue\n" } },
     };
     request.hooks = &ordered_hooks;
     var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
@@ -9767,6 +9925,375 @@ test "a credential is refused where it could not be kept secret" {
         }
         try std.testing.expect(named);
     }
+}
+
+test "a hook is refused where it could not be run" {
+    const runnable = "#!/bin/sh\nexit 0\n";
+    const oversized = "#!" ++ ("x" ** max_hook_script_bytes);
+    const long_argument = "x" ** (max_hook_argument_bytes + 1);
+    var many_arguments: [max_hook_arguments + 1][]const u8 = undefined;
+    for (&many_arguments) |*slot| slot.* = "x";
+
+    const cases = [_]struct {
+        why: []const u8,
+        hooks: []const Hook,
+    }{
+        .{
+            .why = "a script that names no interpreter",
+            .hooks = &.{.{ .name = "bare", .phase = .finalize, .source = .{ .inline_script = "exit 0\n" } }},
+        },
+        .{
+            .why = "a script with nothing in it",
+            .hooks = &.{.{ .name = "empty", .phase = .finalize, .source = .{ .inline_script = "" } }},
+        },
+        .{
+            .why = "a script past the declared bound",
+            .hooks = &.{.{ .name = "huge", .phase = .finalize, .source = .{ .inline_script = oversized } }},
+        },
+        .{
+            .why = "a source naming no path",
+            .hooks = &.{.{ .name = "nowhere", .phase = .finalize, .source = .{ .host_path = "" } }},
+        },
+        .{
+            .why = "more arguments than a hook may take",
+            .hooks = &.{.{
+                .name = "wordy",
+                .phase = .finalize,
+                .source = .{ .inline_script = runnable },
+                .arguments = &many_arguments,
+            }},
+        },
+        .{
+            .why = "an argument past the declared bound",
+            .hooks = &.{.{
+                .name = "long",
+                .phase = .finalize,
+                .source = .{ .inline_script = runnable },
+                .arguments = &.{long_argument},
+            }},
+        },
+        .{
+            .why = "an argument that would be truncated at a NUL",
+            .hooks = &.{.{
+                .name = "truncating",
+                .phase = .finalize,
+                .source = .{ .inline_script = runnable },
+                .arguments = &.{"one\x00two"},
+            }},
+        },
+        .{
+            .why = "two hooks answering to the same name",
+            .hooks = &.{
+                .{ .name = "same", .phase = .finalize, .source = .{ .inline_script = runnable } },
+                .{ .name = "same", .phase = .finalize, .source = .{ .inline_script = runnable } },
+            },
+        },
+        .{
+            .why = "phases declared out of the order they run in",
+            .hooks = &.{
+                .{ .name = "late", .phase = .finalize, .source = .{ .inline_script = runnable } },
+                .{ .name = "early", .phase = .after_packages, .source = .{ .inline_script = runnable } },
+            },
+        },
+    };
+    for (cases) |case| {
+        var request = whenNeededRequest();
+        request.hooks = case.hooks;
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        std.testing.expect(hasDiagnosticCode(diagnostics, .invalid_policy)) catch |err| {
+            std.debug.print("accepted {s}\n", .{case.why});
+            return err;
+        };
+    }
+
+    // The shape that is refused everywhere else is accepted here, so the table
+    // above is about what each case says and not about hooks in general.
+    var accepted = whenNeededRequest();
+    accepted.hooks = &.{
+        .{
+            .name = "first",
+            .phase = .after_packages,
+            .source = .{ .inline_script = runnable },
+            .arguments = &.{"--quiet"},
+        },
+        .{ .name = "second", .phase = .finalize, .source = .{ .host_path = "hooks/second.sh" } },
+    };
+    var diagnostics = try validate(std.testing.allocator, &accepted);
+    defer diagnostics.deinit(std.testing.allocator);
+    try std.testing.expect(!diagnostics.hasErrors());
+}
+
+test "the vm backend refuses a hook it has no channel to carry" {
+    const hooks = [_]Hook{.{
+        .name = "guest-script",
+        .phase = .finalize,
+        .source = .{ .inline_script = "#!/bin/sh\nexit 0\n" },
+    }};
+    var request = whenNeededRequest();
+    request.execution.backend = .vm;
+    request.execution.vm = .{ .emulator_command = "/usr/bin/qemu-system-x86_64" };
+    request.hooks = &hooks;
+
+    var diagnostics = try validate(std.testing.allocator, &request);
+    defer diagnostics.deinit(std.testing.allocator);
+    try std.testing.expect(diagnostics.hasErrors());
+    var named = false;
+    for (diagnostics.items) |diagnostic| {
+        if (diagnostic.code == .unsupported_execution_backend and
+            std.mem.eql(u8, diagnostic.configuration_path, "/hooks"))
+        {
+            named = true;
+        }
+    }
+    // Named, and not left to a generic unsupported capability: a request whose
+    // hooks were dropped would publish an image the plan says had them.
+    try std.testing.expect(named);
+
+    // The same hook on the backend that can run it is accepted, so the refusal
+    // is about the channel rather than about the hook.
+    var chroot = request;
+    chroot.execution.backend = .unsafe_chroot;
+    chroot.execution.vm = null;
+    var accepted = try validate(std.testing.allocator, &chroot);
+    defer accepted.deinit(std.testing.allocator);
+    try std.testing.expect(!accepted.hasErrors());
+}
+
+test "a hook clears preflight on the backend that runs it" {
+    // A hook derives a `script_execution` capability, and preflight is a
+    // separate mapping from the capability state each backend publishes. The
+    // backend saying yes is therefore not the same statement as the request
+    // clearing preflight, which is why this asserts the second one.
+    const io = std.testing.io;
+    const source_path = "test-customize-hook-preflight.raw";
+    const spool_path = "test-customize-hook-preflight-spool";
+    const workspace_path = "test-customize-hook-preflight-work";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try createCustomizeTestDisk(io, source_path, spool_path);
+
+    const hooks = [_]Hook{.{
+        .name = "marker",
+        .phase = .finalize,
+        .source = .{ .inline_script = "#!/bin/sh\nexit 0\n" },
+    }};
+    var request = validNativeEditRequest(
+        source_path,
+        workspace_path ++ "/output.raw",
+        workspace_path,
+        &.{},
+    );
+    request.execution.backend = .unsafe_chroot;
+    request.execution.acknowledge_unsafe = true;
+    request.hooks = &hooks;
+
+    const Available = struct {
+        fn check(_: ?*anyopaque, _: Io, _: *const ResolvedPlan) CapabilityState {
+            return .available;
+        }
+    };
+    var platform = Platform.system();
+    platform.unsafeChrootCheckFn = Available.check;
+    var resolved = try resolve(
+        std.testing.allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(!resolved.diagnostics.hasErrors());
+    var report = try preflight(
+        std.testing.allocator,
+        io,
+        &resolved.plan.?,
+        platform,
+    );
+    defer report.deinit(std.testing.allocator);
+    var saw_script_execution = false;
+    for (report.capabilities) |check| {
+        if (check.requirement.kind != .script_execution) continue;
+        saw_script_execution = true;
+        try std.testing.expectEqual(CapabilityState.available, check.state);
+    }
+    try std.testing.expect(saw_script_execution);
+    try std.testing.expect(report.ready());
+
+    // The routing arm above sends every non-vm backend to the same function,
+    // so what keeps it from accepting a hook on a backend that cannot run one
+    // is that function's own backend guard. Asserting that means reaching
+    // preflight with such a plan, which `resolve` will not produce -- so the
+    // accepted plan is retargeted rather than a new request validated.
+    var retargeted_data = resolved.plan.?.data.*;
+    retargeted_data.execution.backend = .native_edit;
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const retargeted = ResolvedPlan{
+        .arena = scratch,
+        .data = &retargeted_data,
+    };
+    var refused = try preflight(
+        std.testing.allocator,
+        io,
+        &retargeted,
+        platform,
+    );
+    defer refused.deinit(std.testing.allocator);
+    var refused_script_execution = false;
+    for (refused.capabilities) |check| {
+        if (check.requirement.kind != .script_execution) continue;
+        refused_script_execution = true;
+        try std.testing.expectEqual(CapabilityState.unsupported, check.state);
+    }
+    try std.testing.expect(refused_script_execution);
+    try std.testing.expect(!refused.ready());
+
+    // And the request form is refused earlier still, by name, so a caller
+    // never gets as far as the plan that had to be forged above.
+    var native = request;
+    native.execution.backend = .native_edit;
+    var native_resolved = try resolve(
+        std.testing.allocator,
+        &native,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer native_resolved.deinit(std.testing.allocator);
+    var named = false;
+    for (native_resolved.diagnostics.items) |diagnostic| {
+        if (diagnostic.code == .unsupported_execution_backend and
+            std.mem.eql(u8, diagnostic.configuration_path, "/execution/backend"))
+        {
+            named = true;
+        }
+    }
+    try std.testing.expect(named);
+}
+
+test "a hook that ran is recorded by digest in provenance" {
+    const io = std.testing.io;
+    const source_path = "test-customize-hook-source.raw";
+    const spool_path = "test-customize-hook-spool";
+    const workspace_path = "test-customize-hook-work";
+    const output_path = workspace_path ++ "/output.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try createCustomizeTestDisk(io, source_path, spool_path);
+    try Io.Dir.cwd().createDirPath(io, workspace_path);
+
+    const script = "#!/bin/sh\ntouch /etc/ran\n";
+    var script_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(script, &script_digest, .{});
+    const hooks = [_]Hook{.{
+        .name = "marker",
+        .phase = .finalize,
+        .source = .{ .inline_script = script },
+    }};
+    var request = validNativeEditRequest(
+        source_path,
+        output_path,
+        workspace_path,
+        &.{},
+    );
+    request.execution.backend = .unsafe_chroot;
+    request.execution.acknowledge_unsafe = true;
+    request.hooks = &hooks;
+
+    const FakeUnsafe = struct {
+        // The report crosses back to `buildResult`, which copies it there, so
+        // the records have to outlive this call rather than be a temporary the
+        // return statement points at.
+        var records: [1]HookRecord = undefined;
+
+        fn check(_: ?*anyopaque, _: Io, _: *const ResolvedPlan) CapabilityState {
+            return .available;
+        }
+
+        fn run(
+            _: ?*anyopaque,
+            allocator: Allocator,
+            _: Io,
+            plan: *const ResolvedPlan,
+            _: preserved_image.RawMutationTarget,
+        ) !UnsafeChrootRuntimeReport {
+            try std.testing.expectEqual(@as(usize, 1), plan.data.hooks.len);
+            return .{
+                .arena = std.heap.ArenaAllocator.init(allocator),
+                .tools = &.{},
+                .installed_packages = &.{},
+                .hooks = &records,
+            };
+        }
+    };
+    FakeUnsafe.records = .{.{
+        .name = "marker",
+        .phase = .finalize,
+        .source_sha256 = .{ .bytes = script_digest },
+        .exit_code = 0,
+    }};
+
+    var platform = Platform.system();
+    platform.unsafeChrootCheckFn = FakeUnsafe.check;
+    platform.unsafeChrootRunFn = FakeUnsafe.run;
+    var resolved = try resolve(
+        std.testing.allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    var outcome = try execute(
+        std.testing.allocator,
+        io,
+        &resolved.plan.?,
+        platform,
+        null,
+    );
+    defer outcome.deinit(std.testing.allocator);
+    const result = outcome.result orelse return error.TestUnexpectedResult;
+    const preserved = result.provenance.execution.preserved orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), preserved.hooks.len);
+    try std.testing.expectEqualStrings("marker", preserved.hooks[0].name);
+    try std.testing.expectEqual(HookPhase.finalize, preserved.hooks[0].phase);
+    try std.testing.expectEqualSlices(
+        u8,
+        &script_digest,
+        &preserved.hooks[0].source_sha256.bytes,
+    );
+    try std.testing.expectEqual(@as(u8, 0), preserved.hooks[0].exit_code);
+
+    // Provenance is published as JSON, so a record that cannot be read back is
+    // a record only this program can use.
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeProvenanceJson(result.provenance, &output.writer);
+    const document = output.written();
+    const hex = std.fmt.bytesToHex(script_digest, .lower);
+    try std.testing.expect(std.mem.indexOf(u8, document, &hex) != null);
+}
+
+test "a digest survives the round trip a worker report makes" {
+    // The unsafe backend's report crosses a process boundary as JSON, so a
+    // digest that stringifies one way and parses another would arrive as a
+    // different value or not at all.
+    const original = Digest{ .bytes = [_]u8{0xa5} ** 32 };
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &output.writer };
+    try stringify.write(original);
+    const parsed = try std.json.parseFromSlice(
+        Digest,
+        std.testing.allocator,
+        output.written(),
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualSlices(u8, &original.bytes, &parsed.value.bytes);
+
+    try std.testing.expectError(
+        error.InvalidCharacter,
+        std.json.parseFromSlice(Digest, std.testing.allocator, "\"beef\"", .{}),
+    );
 }
 
 test "the vm backend refuses a credential it has no channel to carry" {

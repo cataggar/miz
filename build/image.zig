@@ -233,6 +233,25 @@ pub const PreservedPackagePolicy = struct {
     resolver: PreservedResolverPolicy = .host_resolver,
 };
 
+pub const PreservedHookPhase = preserved_image_wire.HookPhase;
+
+/// Either form is staged into the build graph and travels as a file the build
+/// system owns a copy of -- the same treatment repository trust gets, and the
+/// opposite of a credential. A hook script is code the build is accountable
+/// for, and provenance names it by digest, so a cached copy is what makes the
+/// record checkable rather than a secret left somewhere.
+pub const PreservedHookSource = union(enum) {
+    inline_script: []const u8,
+    path: std.Build.LazyPath,
+};
+
+pub const PreservedHook = struct {
+    name: []const u8,
+    phase: PreservedHookPhase,
+    source: PreservedHookSource,
+    arguments: []const []const u8 = &.{},
+};
+
 pub const PreservedInitramfsPolicy = preserved_image_wire.InitramfsPolicy;
 pub const PreservedGuestExecutionPolicy = preserved_image_wire.GuestExecutionPolicy;
 pub const PreservedRunnerKind = preserved_image_wire.RunnerKind;
@@ -262,6 +281,7 @@ pub const PreservedOptions = struct {
     generalization: GeneralizationPolicy = .none,
     acknowledge_unsafe: bool = false,
     packages: PreservedPackagePolicy = .{},
+    hooks: []const PreservedHook = &.{},
     initramfs: PreservedInitramfsPolicy = .unchanged,
     guest_execution: PreservedGuestExecutionPolicy = .same_architecture,
     /// The runner that makes a foreign guest architecture executable.
@@ -562,6 +582,27 @@ fn materializePreservedConfiguration(
         };
     }
 
+    const hooks = try b.allocator.alloc(
+        preserved_image_wire.Hook,
+        options.hooks.len,
+    );
+    for (options.hooks, 0..) |hook, hook_index| {
+        const source: std.Build.LazyPath = switch (hook.source) {
+            .path => |path| path,
+            .inline_script => |script| inline_files.add(
+                b.fmt("hook-{d}", .{hook_index}),
+                script,
+            ),
+        };
+        hooks[hook_index] = .{
+            .name = hook.name,
+            .phase = hook.phase,
+            .source = .{ .source_index = sources.items.len },
+            .arguments = hook.arguments,
+        };
+        try sources.append(source);
+    }
+
     const configuration = preserved_image_wire.Configuration{
         .backend = switch (options.backend) {
             .native_edit => .native_edit,
@@ -597,6 +638,7 @@ fn materializePreservedConfiguration(
             .lock = options.packages.lock,
             .resolver = options.packages.resolver,
         },
+        .hooks = hooks,
         .initramfs = options.initramfs,
         .guest_execution = options.guest_execution,
         .runner = options.runner,

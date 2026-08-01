@@ -39,6 +39,7 @@ const Manifest = struct {
     packages: customize.PackagePolicy,
     initramfs: customize.InitramfsPolicy,
     kernel_modules: []const customize.KernelModule = &.{},
+    hooks: []const customize.Hook = &.{},
 };
 
 pub fn available(io: Io) customize.CapabilityState {
@@ -115,6 +116,7 @@ pub fn runParent(
         .packages = options.plan.data.packages,
         .initramfs = options.plan.data.initramfs,
         .kernel_modules = options.plan.data.os.kernel_modules,
+        .hooks = options.plan.data.hooks,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, manifest, .{});
     defer allocator.free(json);
@@ -241,6 +243,7 @@ const ExecutionResult = struct {
 const WorkerReport = struct {
     tools: []const customize.ToolRecord,
     installed_packages: []const []const u8,
+    hooks: []const customize.HookRecord = &.{},
 };
 
 fn executeManifest(
@@ -267,7 +270,7 @@ fn executeManifest(
         return .{
             .operation_succeeded = false,
             .cleanup_complete = true,
-            .report = .{ .tools = &.{}, .installed_packages = &.{} },
+            .report = .{ .tools = &.{}, .installed_packages = &.{}, .hooks = &.{} },
         };
     };
     try prepareEmptyRoot(io, manifest.root_path);
@@ -279,6 +282,7 @@ fn executeManifest(
         .tools = .init(allocator),
         .installed_packages = .init(allocator),
         .preexisting_loops = .init(allocator),
+        .hook_records = .init(allocator),
     };
     const operation_result = session.openAndRun();
     const cleanup_complete = session.close();
@@ -288,6 +292,7 @@ fn executeManifest(
         .report = .{
             .tools = session.tools.items,
             .installed_packages = session.installed_packages.items,
+            .hooks = session.hook_records.items,
         },
     };
 }
@@ -312,6 +317,7 @@ const Session = struct {
     tools: std.array_list.Managed(customize.ToolRecord),
     installed_packages: std.array_list.Managed([]const u8),
     preexisting_loops: std.array_list.Managed([]const u8),
+    hook_records: std.array_list.Managed(customize.HookRecord),
     rpm_version: []const u8 = "",
     tdnf_version: []const u8 = "",
     dracut_version: []const u8 = "",
@@ -553,8 +559,15 @@ const Session = struct {
         // After the packages, so a package that ships its own modprobe
         // configuration cannot land on top of the declared one, and before
         // the initramfs, so a generator that reads this configuration sees
-        // the declared state rather than the one it replaced.
+        // the declared state rather than the one it replaced. Also before any
+        // hook, so every hook sees the declared configuration rather than a
+        // different one depending on which phase it asked for.
         try self.writeKernelModuleFiles();
+        // The four phases, in the order `buildOperations` publishes them. A
+        // run whose hooks fired in a different order from the one the plan
+        // shows would make the plan a description of something else.
+        try self.runHooks(.after_packages);
+        try self.runHooks(.before_initramfs);
         switch (self.manifest.initramfs) {
             .unchanged => {},
             .regenerate => |regenerate| try self.regenerateInitramfs(regenerate),
@@ -562,6 +575,121 @@ const Session = struct {
             // because the run itself must not treat an undecided policy as a
             // decision to do nothing.
             .when_needed => return error.UnresolvedInitramfsPolicy,
+        }
+        try self.runHooks(.before_seal);
+        try self.runHooks(.finalize);
+    }
+
+    fn runHooks(self: *Session, phase: customize.HookPhase) !void {
+        for (self.manifest.hooks, 0..) |hook, index| {
+            if (hook.phase != phase) continue;
+            try self.runHook(hook, index);
+        }
+    }
+
+    /// Runs one hook and records what ran.
+    ///
+    /// What the hook gets is stated, not inherited. Its argument vector is the
+    /// script followed by exactly the declared arguments. Its environment is
+    /// the one every command in this worker gets -- built by `baseEnvironment`
+    /// and containing nothing from the build machine, which matters more here
+    /// than anywhere else because a hook is the only place a caller supplies
+    /// code rather than configuration. Its standard input is closed; its
+    /// output goes to the builder's own, unbuffered and uncaptured, because a
+    /// hook's output is a build log rather than a value the run consumes.
+    ///
+    /// What it does not get is a wall clock. Nothing here is bounded in time,
+    /// and a hook is no exception: package scriptlets and dracut modules are
+    /// already target-supplied code running as root for as long as they like.
+    /// A deadline belongs to the whole run rather than to this one command,
+    /// and inventing one only for hooks would state a guarantee the backend
+    /// does not have.
+    fn runHook(self: *Session, hook: customize.Hook, index: usize) !void {
+        const guest_path = try std.fmt.allocPrint(
+            self.allocator,
+            "/run/zvmi-hook-{d}",
+            .{index},
+        );
+        defer self.allocator.free(guest_path);
+        const host_path = try joinGuest(
+            self.allocator,
+            self.manifest.root_path,
+            guest_path,
+        );
+        defer self.allocator.free(host_path);
+
+        // Read here, on the host side of the chroot, and never opened from
+        // inside the target root: a hook source resolved against the target
+        // would let the image being customized choose the code that customizes
+        // it.
+        const script = try self.readHookScript(hook.source);
+        defer self.allocator.free(script);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(script, &digest, .{});
+
+        try writeExecutableExclusive(self.io, host_path, script);
+        // Unconditional. The script lives on the private tmpfs at `<root>/run`
+        // for exactly the command that runs it: the next hook, the initramfs
+        // generator and anything a package scriptlet spawns must not find it,
+        // and nothing published can contain it.
+        defer Io.Dir.cwd().deleteFile(self.io, host_path) catch {};
+
+        var argv = try std.array_list.Managed([]const u8).initCapacity(
+            self.allocator,
+            hook.arguments.len + 3,
+        );
+        defer argv.deinit();
+        argv.appendAssumeCapacity(findTool(self.io, chroot_candidates).?);
+        argv.appendAssumeCapacity(self.manifest.root_path);
+        argv.appendAssumeCapacity(guest_path);
+        argv.appendSliceAssumeCapacity(hook.arguments);
+
+        var result = try self.executor.run(
+            self.allocator,
+            self.io,
+            argv.items,
+            false,
+            null,
+        );
+        defer result.deinit(self.allocator);
+        const exit_code: u8 = switch (result.term) {
+            .exited => |code| std.math.cast(u8, code) orelse return error.HookFailed,
+            // Killed by a signal, stopped, or whatever else a term can be.
+            // None of them is a hook that finished, so none of them has an
+            // exit code to record.
+            else => return error.HookFailed,
+        };
+        if (exit_code != 0) return error.HookFailed;
+
+        try self.hook_records.append(.{
+            .name = try self.allocator.dupe(u8, hook.name),
+            .phase = hook.phase,
+            .source_sha256 = .{ .bytes = digest },
+            .exit_code = exit_code,
+        });
+    }
+
+    fn readHookScript(self: *Session, source: customize.HookSource) ![]u8 {
+        switch (source) {
+            .inline_script => |script| {
+                if (!validHookScript(script)) return error.HookScriptUnusable;
+                return self.allocator.dupe(u8, script);
+            },
+            .host_path => |path| {
+                const bytes = Io.Dir.cwd().readFileAlloc(
+                    self.io,
+                    path,
+                    self.allocator,
+                    .limited(customize.max_hook_script_bytes + 1),
+                ) catch return error.HookSourceUnreadable;
+                errdefer self.allocator.free(bytes);
+                // The same rule the request validator applies to an inline
+                // script, applied to bytes it could not see. A host path is
+                // read here for the first time, so this is the first boundary
+                // that can hold it to anything.
+                if (!validHookScript(bytes)) return error.HookScriptUnusable;
+                return bytes;
+            },
         }
     }
 
@@ -1654,6 +1782,45 @@ fn validateManifestPolicy(manifest: Manifest) !void {
         // either skip work the caller asked for or do work it did not.
         .when_needed => return error.UnresolvedInitramfsPolicy,
     }
+    // A hook is caller-supplied code that this worker will run as root inside
+    // the target root, so the manifest's account of it is re-checked on this
+    // side of the privilege boundary rather than trusted. The phase order is
+    // part of that: the plan published an operation list in this order, and a
+    // worker that ran them in another would have executed something the plan
+    // does not describe.
+    var previous_phase: ?customize.HookPhase = null;
+    for (manifest.hooks, 0..) |hook, index| {
+        if (!validHookName(hook.name)) return error.InvalidHookName;
+        for (manifest.hooks[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.name, hook.name)) return error.DuplicateHookName;
+        }
+        if (previous_phase) |phase| {
+            if (@intFromEnum(hook.phase) < @intFromEnum(phase)) {
+                return error.HookPhasesOutOfOrder;
+            }
+        }
+        previous_phase = hook.phase;
+        // Only the inline form can be checked here. A `host_path` source is
+        // bytes this side has not read yet, and `readHookScript` holds it to
+        // the same rule at the moment it becomes readable.
+        switch (hook.source) {
+            .inline_script => |script| if (!validHookScript(script)) {
+                return error.HookScriptUnusable;
+            },
+            .host_path => |path| if (path.len == 0) return error.InvalidHookSource,
+        }
+        if (hook.arguments.len > customize.max_hook_arguments) {
+            return error.TooManyHookArguments;
+        }
+        for (hook.arguments) |argument| {
+            if (argument.len > customize.max_hook_argument_bytes) {
+                return error.HookArgumentTooLong;
+            }
+            if (std.mem.indexOfScalar(u8, argument, 0) != null) {
+                return error.InvalidHookArgument;
+            }
+        }
+    }
     // The request validator already refused these, but the worker sits across
     // the privilege boundary and does not trust the manifest it is handed. A
     // name reaching the renderer unchecked would be a line of its own in a
@@ -1887,6 +2054,37 @@ fn writeBytesExclusive(
     try file.writePositionalAll(io, bytes, 0);
 }
 
+/// A hook script, written where only this run can reach it and made executable
+/// by an explicit mode rather than by whatever `umask` the builder inherited.
+/// An owner-execute bit cleared by a stray umask would turn a declared hook
+/// into an `ENOEXEC` several phases into a privileged run.
+fn writeExecutableExclusive(io: Io, path: []const u8, bytes: []const u8) !void {
+    const file = try Io.Dir.cwd().createFile(io, path, .{
+        .exclusive = true,
+        .permissions = hook_script_permissions,
+    });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, 0);
+    try file.setPermissions(io, hook_script_permissions);
+}
+
+const hook_script_permissions: Io.File.Permissions = .fromMode(0o700);
+
+/// Whether these bytes are a hook this worker will run: non-empty, within the
+/// declared bound, and naming their own interpreter. The last is what makes an
+/// unrunnable hook a named refusal rather than a `chroot` that exits nonzero
+/// for a reason nothing recorded.
+fn validHookScript(bytes: []const u8) bool {
+    return bytes.len != 0 and
+        bytes.len <= customize.max_hook_script_bytes and
+        std.mem.startsWith(u8, bytes, "#!");
+}
+
+fn validHookName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 255 or name[0] == '.') return false;
+    return std.mem.indexOfAny(u8, name, "/\r\n\x00") == null;
+}
+
 fn copyFile(
     allocator: Allocator,
     io: Io,
@@ -1981,6 +2179,7 @@ fn loadParentReport(
         .arena = arena,
         .tools = parsed.value.tools,
         .installed_packages = parsed.value.installed_packages,
+        .hooks = parsed.value.hooks,
     };
 }
 
@@ -2236,6 +2435,7 @@ test "worker executes policy with strict reverse cleanup" {
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
     };
     const identity_mismatch = try executeManifest(
         allocator,
@@ -2258,6 +2458,7 @@ test "worker executes policy with strict reverse cleanup" {
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
         .malformed_inventory = true,
     };
     const malformed_inventory = try executeManifest(
@@ -2281,6 +2482,7 @@ test "worker executes policy with strict reverse cleanup" {
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
     };
     const executor = Executor{
         .context = &context,
@@ -2347,6 +2549,7 @@ test "worker executes policy with strict reverse cleanup" {
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
         .fail_tdnf = true,
     };
     const failed = try executeManifest(allocator, io, manifest, .{
@@ -2363,6 +2566,7 @@ test "worker executes policy with strict reverse cleanup" {
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
         .malformed_losetup = true,
     };
     const malformed = try executeManifest(allocator, io, manifest, .{
@@ -2379,6 +2583,7 @@ test "worker executes policy with strict reverse cleanup" {
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
         .malformed_losetup = true,
         .preexisting_loop = true,
     };
@@ -2398,6 +2603,7 @@ test "worker executes policy with strict reverse cleanup" {
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
         .fail_umount = true,
     };
     const cleanup_failure = try executeManifest(allocator, io, manifest, .{
@@ -2420,6 +2626,7 @@ test "worker executes policy with strict reverse cleanup" {
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
         .associated_loop_stuck = true,
     };
     const lazy_detach = try executeManifest(allocator, io, manifest, .{
@@ -2434,6 +2641,7 @@ test "worker executes policy with strict reverse cleanup" {
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
         .resolver_layout = .symlink,
     };
     const symlink_resolver = try executeManifest(allocator, io, manifest, .{
@@ -2448,6 +2656,7 @@ test "worker executes policy with strict reverse cleanup" {
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
         .resolver_layout = .missing,
     };
     const missing_resolver = try executeManifest(allocator, io, manifest, .{
@@ -2456,6 +2665,389 @@ test "worker executes policy with strict reverse cleanup" {
     });
     try std.testing.expect(missing_resolver.operation_succeeded);
     try std.testing.expect(missing_resolver.cleanup_complete);
+}
+
+test "hooks run where the plan says they run, and stop existing when they are done" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root_path = "test-unsafe-chroot-hook-order-root";
+    const raw_path = "test-unsafe-chroot-hook-order-stage.raw";
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+        .exclusive = true,
+        .read = true,
+    });
+    try raw_file.setLength(io, 8192);
+    const raw_inode = (try raw_file.stat(io)).inode;
+    raw_file.close(io);
+
+    const first_script = "#!/bin/sh\necho after-packages\n";
+    const hooks = [_]customize.Hook{
+        .{
+            .name = "packages",
+            .phase = .after_packages,
+            .source = .{ .inline_script = first_script },
+            .arguments = &.{ "--mode", "one" },
+        },
+        .{
+            .name = "initramfs",
+            .phase = .before_initramfs,
+            .source = .{ .inline_script = "#!/bin/sh\nexit 0\n" },
+        },
+        .{
+            .name = "seal",
+            .phase = .before_seal,
+            .source = .{ .inline_script = "#!/bin/sh\nexit 0\n" },
+        },
+        .{
+            .name = "final",
+            .phase = .finalize,
+            .source = .{ .inline_script = "#!/bin/sh\nexit 0\n" },
+        },
+    };
+    const repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    const manifest = Manifest{
+        .raw_path = raw_path,
+        .root_path = root_path,
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = raw_inode,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{
+            .actions = &.{.{ .install = &.{"dracut"} }},
+            .repositories = &repositories,
+        },
+        .initramfs = .{ .regenerate = .{
+            .generator = "dracut",
+            .kernels = &.{"6.12.0-test"},
+        } },
+        .hooks = &hooks,
+    };
+
+    var context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .timeline = .init(allocator),
+    };
+    const result = try executeManifest(allocator, io, manifest, .{
+        .context = &context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expect(result.operation_succeeded);
+    try std.testing.expect(result.cleanup_complete);
+
+    // The order the plan publishes, and no other. `buildOperations` emits
+    // packages, then the two pre-initramfs phases, then the initramfs, then
+    // the two after it -- a run that fired them in a different order would
+    // make the published operation list a description of something else.
+    try std.testing.expectEqual(@as(usize, 6), context.timeline.items.len);
+    const expected = [_][]const u8{
+        "tdnf-install",
+        "/run/zvmi-hook-0",
+        "/run/zvmi-hook-1",
+        "dracut",
+        "/run/zvmi-hook-2",
+        "/run/zvmi-hook-3",
+    };
+    for (expected, context.timeline.items) |want, got| {
+        try std.testing.expectEqualStrings(want, got);
+    }
+
+    // The argument vector is the script and exactly the declared arguments.
+    const argv = context.hook_argv orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 5), argv.len);
+    try std.testing.expectEqualStrings(root_path, argv[1]);
+    try std.testing.expectEqualStrings("/run/zvmi-hook-0", argv[2]);
+    try std.testing.expectEqualStrings("--mode", argv[3]);
+    try std.testing.expectEqualStrings("one", argv[4]);
+
+    // The bytes that ran are the bytes that were declared, in a file only
+    // their owner can read or run.
+    try std.testing.expectEqualStrings(
+        first_script,
+        context.hook_script_at_run orelse return error.TestUnexpectedResult,
+    );
+    try std.testing.expectEqual(@as(?u32, 0o700), context.hook_mode_at_run);
+
+    // And they were gone by the time the initramfs generator ran, which runs
+    // target-supplied module scripts as root against the image about to be
+    // published.
+    try std.testing.expect(!context.hook_visible_at_dracut);
+
+    try std.testing.expectEqual(@as(usize, 4), result.report.hooks.len);
+    var script_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(first_script, &script_digest, .{});
+    try std.testing.expectEqualStrings("packages", result.report.hooks[0].name);
+    try std.testing.expectEqual(customize.HookPhase.after_packages, result.report.hooks[0].phase);
+    try std.testing.expectEqualSlices(u8, &script_digest, &result.report.hooks[0].source_sha256.bytes);
+    try std.testing.expectEqual(@as(u8, 0), result.report.hooks[0].exit_code);
+    try std.testing.expectEqualStrings("final", result.report.hooks[3].name);
+    try std.testing.expectEqual(customize.HookPhase.finalize, result.report.hooks[3].phase);
+
+    // Nothing of the hook survives the run.
+    const leftover = try joinGuest(allocator, root_path, "/run/zvmi-hook-0");
+    try std.testing.expectError(
+        error.FileNotFound,
+        Io.Dir.cwd().statFile(io, leftover, .{}),
+    );
+}
+
+test "a hook that fails fails the run" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root_path = "test-unsafe-chroot-hook-failure-root";
+    const raw_path = "test-unsafe-chroot-hook-failure-stage.raw";
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+        .exclusive = true,
+        .read = true,
+    });
+    try raw_file.setLength(io, 8192);
+    const raw_inode = (try raw_file.stat(io)).inode;
+    raw_file.close(io);
+
+    const hooks = [_]customize.Hook{
+        .{
+            .name = "failing",
+            .phase = .after_packages,
+            .source = .{ .inline_script = "#!/bin/sh\nexit 3\n" },
+        },
+        .{
+            .name = "later",
+            .phase = .finalize,
+            .source = .{ .inline_script = "#!/bin/sh\nexit 0\n" },
+        },
+    };
+    const manifest = Manifest{
+        .raw_path = raw_path,
+        .root_path = root_path,
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = raw_inode,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{},
+        .initramfs = .unchanged,
+        .hooks = &hooks,
+    };
+
+    var context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .timeline = .init(allocator),
+        .fail_hook = "/run/zvmi-hook-0",
+    };
+    const result = try executeManifest(allocator, io, manifest, .{
+        .context = &context,
+        .runFn = FakeExecutorContext.run,
+    });
+    // A nonzero exit ends the run. Nothing is published, and the hook that
+    // would have run afterwards never does -- a later phase that ran anyway
+    // would be doing its work against a root an earlier phase abandoned.
+    try std.testing.expect(!result.operation_succeeded);
+    try std.testing.expect(result.cleanup_complete);
+    try std.testing.expectEqual(@as(usize, 1), context.timeline.items.len);
+    try std.testing.expectEqualStrings("/run/zvmi-hook-0", context.timeline.items[0]);
+
+    // Even the failed run leaves nothing behind.
+    const leftover = try joinGuest(allocator, root_path, "/run/zvmi-hook-0");
+    try std.testing.expectError(
+        error.FileNotFound,
+        Io.Dir.cwd().statFile(io, leftover, .{}),
+    );
+}
+
+test "a hook source is read on the host, not from inside the target" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root_path = "test-unsafe-chroot-hook-source-root";
+    const raw_path = "test-unsafe-chroot-hook-source-stage.raw";
+    const script_path = "test-unsafe-chroot-hook-source.sh";
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, script_path) catch {};
+    const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+        .exclusive = true,
+        .read = true,
+    });
+    try raw_file.setLength(io, 8192);
+    const raw_inode = (try raw_file.stat(io)).inode;
+    raw_file.close(io);
+
+    const script = "#!/bin/sh\ntouch /etc/from-a-host-path\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = script_path, .data = script });
+
+    const hooks = [_]customize.Hook{.{
+        .name = "from-host",
+        .phase = .after_packages,
+        .source = .{ .host_path = script_path },
+    }};
+    const manifest = Manifest{
+        .raw_path = raw_path,
+        .root_path = root_path,
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = raw_inode,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{},
+        .initramfs = .unchanged,
+        .hooks = &hooks,
+    };
+
+    var context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .timeline = .init(allocator),
+        // A decoy at the same relative path inside the target, holding
+        // different bytes, kept present for the whole run. If the worker
+        // opened the script through the chroot it would run this instead, and
+        // the digest would say so.
+        .plant_in_target = script_path,
+        .plant_bytes = "#!/bin/sh\nfalse\n",
+    };
+    const result = try executeManifest(allocator, io, manifest, .{
+        .context = &context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expect(result.operation_succeeded);
+    try std.testing.expectEqualStrings(
+        script,
+        context.hook_script_at_run orelse return error.TestUnexpectedResult,
+    );
+    // The record names the bytes, not where they came from: an inline script
+    // holding the same bytes would produce the same digest, and a host file
+    // that changed between two runs would not.
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(script, &digest, .{});
+    try std.testing.expectEqual(@as(usize, 1), result.report.hooks.len);
+    try std.testing.expectEqualSlices(
+        u8,
+        &digest,
+        &result.report.hooks[0].source_sha256.bytes,
+    );
+}
+
+test "the privilege boundary re-checks a hook it is handed" {
+    const base = Manifest{
+        .raw_path = "stage.raw",
+        .root_path = "root",
+        .status_path = "status",
+        .report_path = "report.json",
+        .stage_inode = 1,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{},
+        .initramfs = .unchanged,
+    };
+    const runnable = "#!/bin/sh\nexit 0\n";
+    const long_argument = "x" ** (customize.max_hook_argument_bytes + 1);
+    var many_arguments: [customize.max_hook_arguments + 1][]const u8 = undefined;
+    for (&many_arguments) |*slot| slot.* = "x";
+
+    const cases = [_]struct {
+        hooks: []const customize.Hook,
+        expected: anyerror,
+    }{
+        .{
+            .hooks = &.{.{ .name = "", .phase = .finalize, .source = .{ .inline_script = runnable } }},
+            .expected = error.InvalidHookName,
+        },
+        .{
+            .hooks = &.{.{ .name = "a/b", .phase = .finalize, .source = .{ .inline_script = runnable } }},
+            .expected = error.InvalidHookName,
+        },
+        .{
+            .hooks = &.{
+                .{ .name = "same", .phase = .finalize, .source = .{ .inline_script = runnable } },
+                .{ .name = "same", .phase = .finalize, .source = .{ .inline_script = runnable } },
+            },
+            .expected = error.DuplicateHookName,
+        },
+        .{
+            .hooks = &.{
+                .{ .name = "late", .phase = .finalize, .source = .{ .inline_script = runnable } },
+                .{ .name = "early", .phase = .after_packages, .source = .{ .inline_script = runnable } },
+            },
+            .expected = error.HookPhasesOutOfOrder,
+        },
+        .{
+            .hooks = &.{.{ .name = "no-interpreter", .phase = .finalize, .source = .{ .inline_script = "exit 0\n" } }},
+            .expected = error.HookScriptUnusable,
+        },
+        .{
+            .hooks = &.{.{ .name = "empty", .phase = .finalize, .source = .{ .inline_script = "" } }},
+            .expected = error.HookScriptUnusable,
+        },
+        .{
+            .hooks = &.{.{ .name = "nowhere", .phase = .finalize, .source = .{ .host_path = "" } }},
+            .expected = error.InvalidHookSource,
+        },
+        .{
+            .hooks = &.{.{
+                .name = "wordy",
+                .phase = .finalize,
+                .source = .{ .inline_script = runnable },
+                .arguments = &many_arguments,
+            }},
+            .expected = error.TooManyHookArguments,
+        },
+        .{
+            .hooks = &.{.{
+                .name = "long",
+                .phase = .finalize,
+                .source = .{ .inline_script = runnable },
+                .arguments = &.{long_argument},
+            }},
+            .expected = error.HookArgumentTooLong,
+        },
+        .{
+            .hooks = &.{.{
+                .name = "truncating",
+                .phase = .finalize,
+                .source = .{ .inline_script = runnable },
+                .arguments = &.{"one\x00two"},
+            }},
+            .expected = error.InvalidHookArgument,
+        },
+    };
+    for (cases) |case| {
+        var manifest = base;
+        manifest.hooks = case.hooks;
+        try std.testing.expectError(case.expected, validateManifestPolicy(manifest));
+    }
+
+    // The shape the request validator produces passes on this side too, or the
+    // two boundaries would disagree about what a valid hook is.
+    var accepted = base;
+    accepted.hooks = &.{
+        .{ .name = "first", .phase = .after_packages, .source = .{ .inline_script = runnable } },
+        .{ .name = "second", .phase = .finalize, .source = .{ .host_path = "/opt/hook.sh" } },
+    };
+    try validateManifestPolicy(accepted);
 }
 
 test "a credential reaches tdnf without reaching anything that outlives the run" {
@@ -2520,6 +3112,7 @@ test "a credential reaches tdnf without reaching anything that outlives the run"
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
     };
     const result = try executeManifest(allocator, io, manifest, .{
         .context = &context,
@@ -2885,6 +3478,7 @@ test "worker regenerates every installed kernel when the policy names none" {
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
         .installed_kernels = &.{
             .{ .release = "6.12.0-2.azl" },
             .{ .release = "6.12.0-10.azl", .marker = "modules.dep.bin" },
@@ -2924,6 +3518,7 @@ test "worker regenerates every installed kernel when the policy names none" {
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
         .installed_kernels = &.{.{ .release = "firmware", .marker = null }},
     };
     const empty = try executeManifest(allocator, io, manifest, .{
@@ -2947,6 +3542,7 @@ test "worker regenerates every installed kernel when the policy names none" {
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
         .installed_kernels = &.{.{ .release = "firmware", .marker = null }},
     };
     const derived = try executeManifest(allocator, io, derived_manifest, .{
@@ -2975,6 +3571,7 @@ test "worker regenerates every installed kernel when the policy names none" {
         .io = io,
         .root_path = unreadable_root,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
         .modules_path_is_file = true,
     };
     const unreadable = try executeManifest(allocator, io, unreadable_manifest, .{
@@ -2997,6 +3594,7 @@ test "worker regenerates every installed kernel when the policy names none" {
         .io = io,
         .root_path = locked_root,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
         .installed_kernels = &.{
             .{ .release = "6.12.0-locked.azl", .marker_loops = true },
         },
@@ -3067,6 +3665,7 @@ test "worker places kernel-module configuration after packages and before dracut
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
     };
     const result = try executeManifest(allocator, io, manifest, .{
         .context = &context,
@@ -3147,6 +3746,7 @@ test "worker installs the declared resolver and none without package actions" {
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
         // The host has a resolver to lend. A declared list must not touch it.
         .resolver_layout = .regular,
     };
@@ -3179,6 +3779,7 @@ test "worker installs the declared resolver and none without package actions" {
         .io = io,
         .root_path = root_path,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
         .resolver_layout = .regular,
     };
     const idle_result = try executeManifest(allocator, io, idle, .{
@@ -3209,6 +3810,7 @@ test "worker installs the declared resolver and none without package actions" {
         .io = io,
         .root_path = refused_root,
         .unmounts = .init(allocator),
+        .timeline = .init(allocator),
         .resolver_layout = .regular,
     };
     const refused_result = try executeManifest(
@@ -3386,6 +3988,28 @@ const FakeExecutorContext = struct {
     modules_at_dracut: ?[]const []const u8 = null,
     file_mode_at_dracut: ?u32 = null,
     directory_mode_at_dracut: ?u32 = null,
+    /// Every stage that can be ordered against another, in the order it
+    /// happened. A hook's whole contract is when it runs, and the tree it ran
+    /// against is unmounted and deleted by cleanup, so the order has to be
+    /// recorded while the run is still standing.
+    timeline: std.array_list.Managed([]const u8) = undefined,
+    /// The argument vector the first hook was invoked with, and the script and
+    /// mode it saw at that moment.
+    hook_argv: ?[]const []const u8 = null,
+    hook_script_at_run: ?[]const u8 = null,
+    hook_mode_at_run: ?u32 = null,
+    /// Whether any hook script was still present in the target root when the
+    /// initramfs generator ran. dracut runs target-supplied module scripts as
+    /// root, so a hook left behind is code from one phase reachable in another.
+    hook_visible_at_dracut: bool = false,
+    /// A guest hook path this fake refuses to run, so a failing hook can be
+    /// told apart from a failing anything-else.
+    fail_hook: ?[]const u8 = null,
+    /// Written into the target root on every command, because the executor
+    /// empties that root before it runs anything -- a decoy planted by the
+    /// test would be gone before the hook it is meant to shadow.
+    plant_in_target: ?[]const u8 = null,
+    plant_bytes: []const u8 = "",
 
     fn readTargetFile(self: *FakeExecutorContext, relative: []const u8) ?[]const u8 {
         const path = std.fmt.allocPrint(
@@ -3435,6 +4059,20 @@ const FakeExecutorContext = struct {
         _: ?Io.File,
     ) !CommandResult {
         const self: *FakeExecutorContext = @ptrCast(@alignCast(context_ptr.?));
+        if (self.plant_in_target) |relative| {
+            const path = try std.fs.path.join(
+                self.allocator,
+                &.{ self.root_path, relative },
+            );
+            defer self.allocator.free(path);
+            if (std.fs.path.dirname(path)) |parent| {
+                try Io.Dir.cwd().createDirPath(self.io, parent);
+            }
+            try Io.Dir.cwd().writeFile(self.io, .{
+                .sub_path = path,
+                .data = self.plant_bytes,
+            });
+        }
         if (std.mem.endsWith(u8, argv[0], "losetup") and
             containsArg(argv, "--associated"))
         {
@@ -3591,7 +4229,29 @@ const FakeExecutorContext = struct {
         if (containsArg(argv, "/usr/bin/rpm") and containsArg(argv, "--import")) {
             self.saw_rpm_import = true;
         }
+        if (std.mem.eql(u8, std.fs.path.basename(argv[0]), "chroot") and
+            argv.len >= 3 and
+            std.mem.startsWith(u8, argv[2], "/run/zvmi-hook-"))
+        {
+            try self.timeline.append(try self.allocator.dupe(u8, argv[2]));
+            if (self.hook_argv == null) {
+                const command = try self.allocator.alloc([]const u8, argv.len);
+                for (argv, command) |argument, *slot| {
+                    slot.* = try self.allocator.dupe(u8, argument);
+                }
+                self.hook_argv = command;
+                self.hook_script_at_run = self.readTargetFile(argv[2][1..]);
+                self.hook_mode_at_run = self.modeOf(argv[2][1..]);
+            }
+            if (self.fail_hook) |failing| {
+                if (std.mem.eql(u8, failing, argv[2])) {
+                    return fakeResult(allocator, "", 3);
+                }
+            }
+            return fakeResult(allocator, "", 0);
+        }
         if (containsArg(argv, "/usr/bin/tdnf") and containsArg(argv, "install")) {
+            try self.timeline.append("tdnf-install");
             self.saw_tdnf_install = true;
             self.modules_present_at_tdnf =
                 self.readTargetFile(os_customization.modprobe_blacklist_path) != null;
@@ -3606,6 +4266,19 @@ const FakeExecutorContext = struct {
         }
         if (containsArg(argv, "/usr/bin/tdnf") and containsArg(argv, "remove")) {
             self.saw_tdnf_remove = true;
+        }
+        if (containsArg(argv, "/usr/bin/dracut") and !containsArg(argv, "--version")) {
+            try self.timeline.append("dracut");
+            var index: usize = 0;
+            while (index < 8) : (index += 1) {
+                const relative = try std.fmt.allocPrint(
+                    self.allocator,
+                    "run/zvmi-hook-{d}",
+                    .{index},
+                );
+                defer self.allocator.free(relative);
+                if (self.modeOf(relative) != null) self.hook_visible_at_dracut = true;
+            }
         }
         if (containsArg(argv, "/usr/bin/dracut")) {
             if (self.modules_at_dracut == null) {

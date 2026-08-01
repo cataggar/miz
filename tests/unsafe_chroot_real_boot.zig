@@ -217,6 +217,44 @@ fn runIntegration(
     const actions = [_]zvmi.customize.PackageAction{
         .{ .install = &.{"nano"} },
     };
+    // The hook writes what it can see rather than a fixed marker, so the file
+    // it leaves behind states which phase it ran in and whether the package
+    // actions had already happened -- an ordering claim a passing fake cannot
+    // make on a real root.
+    const after_packages_script =
+        \\#!/bin/sh
+        \\set -e
+        \\test -x /usr/bin/nano
+        \\echo "$1" > /etc/zvmi-hook-after-packages
+        \\
+    ;
+    const finalize_script =
+        \\#!/bin/sh
+        \\set -e
+        \\test -f /etc/zvmi-hook-after-packages
+        \\ls /run/zvmi-hook-* > /etc/zvmi-hook-leftovers 2>/dev/null || true
+        \\echo finalize > /etc/zvmi-hook-finalize
+        \\
+    ;
+    const hooks = [_]zvmi.customize.Hook{
+        .{
+            .name = "after-packages",
+            .phase = .after_packages,
+            .source = .{ .inline_script = after_packages_script },
+            .arguments = &.{"argument-reached-the-hook"},
+        },
+        .{
+            .name = "finalize",
+            .phase = .finalize,
+            .source = .{ .inline_script = finalize_script },
+        },
+    };
+    var after_packages_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(
+        after_packages_script,
+        &after_packages_digest,
+        .{},
+    );
     const repositories = [_]zvmi.customize.PackageRepository{.{
         .id = "azurelinux-base",
         .urls = &.{
@@ -243,6 +281,7 @@ fn runIntegration(
             .generator = "dracut",
             .kernels = &.{kernel},
         } },
+        .hooks = &hooks,
         .execution = .{
             .workspace_path = work_path,
             .backend = .unsafe_chroot,
@@ -290,7 +329,7 @@ fn runIntegration(
             return error.RealPackageCleanupFailed;
         }
     }
-    try validateProvenance(&result.provenance, kernel);
+    try validateProvenance(&result.provenance, kernel, after_packages_digest);
     const final_source_digest = try zvmi.customize.hashSourcePath(
         allocator,
         io,
@@ -302,6 +341,40 @@ fn runIntegration(
         &final_source_digest.bytes,
     ));
     try ensureGuestPath(io, allocator, output_path, root_offset, "usr/bin/nano");
+    try ensureGuestPath(
+        io,
+        allocator,
+        output_path,
+        root_offset,
+        "etc/zvmi-hook-after-packages",
+    );
+    try ensureGuestPath(io, allocator, output_path, root_offset, "etc/zvmi-hook-finalize");
+    const hook_argument = try readGuestFile(
+        allocator,
+        io,
+        output_path,
+        root_offset,
+        "etc/zvmi-hook-after-packages",
+    );
+    defer allocator.free(hook_argument);
+    try ensure(std.mem.eql(
+        u8,
+        std.mem.trimEnd(u8, hook_argument, "\n"),
+        "argument-reached-the-hook",
+    ));
+    // The finalize hook listed the private tmpfs from inside the chroot while
+    // it was itself the running hook, so an empty listing is the strongest
+    // statement available that no earlier hook's code is still there.
+    const leftovers = try readGuestFile(
+        allocator,
+        io,
+        output_path,
+        root_offset,
+        "etc/zvmi-hook-leftovers",
+    );
+    defer allocator.free(leftovers);
+    try ensure(std.mem.indexOf(u8, leftovers, "zvmi-hook-0") == null);
+    try ensureGuestPathAbsent(io, allocator, output_path, root_offset, "run/zvmi-hook-1");
     try ensureGuestFileNonempty(
         allocator,
         io,
@@ -522,12 +595,49 @@ fn ensureGuestPath(
     _ = try reader.statPath(io, path);
 }
 
+/// The counterpart to `ensureGuestPath`. A hook's script lives on a tmpfs the
+/// executor unmounts before publishing, so this asserting nothing is only
+/// meaningful together with the finalize hook's own listing from inside the
+/// chroot -- one says the image is clean, the other says the run was.
+fn ensureGuestPathAbsent(
+    io: Io,
+    allocator: Allocator,
+    image_path: []const u8,
+    root_offset: u64,
+    path: []const u8,
+) !void {
+    var image = try zvmi.Image.openPathReadOnly(io, image_path);
+    defer image.close(io);
+    var reader = try zvmi.ext4.open(io, image.file, allocator, .{
+        .offset = root_offset,
+    });
+    defer reader.deinit();
+    if (reader.statPath(io, path)) |_| {
+        return error.GuestPathUnexpectedlyPresent;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+}
+
 fn validateProvenance(
     provenance: *const zvmi.customize.Provenance,
     kernel: []const u8,
+    after_packages_digest: [32]u8,
 ) !void {
     const preserved = provenance.execution.preserved orelse
         return error.MissingPreservedProvenance;
+    try ensure(preserved.hooks.len == 2);
+    try ensure(std.mem.eql(u8, preserved.hooks[0].name, "after-packages"));
+    try ensure(preserved.hooks[0].phase == .after_packages);
+    try ensure(std.mem.eql(
+        u8,
+        &preserved.hooks[0].source_sha256.bytes,
+        &after_packages_digest,
+    ));
+    try ensure(preserved.hooks[0].exit_code == 0);
+    try ensure(std.mem.eql(u8, preserved.hooks[1].name, "finalize"));
+    try ensure(preserved.hooks[1].phase == .finalize);
     var found_nano = false;
     for (preserved.installed_packages) |package| {
         if (std.mem.startsWith(u8, package, "nano-")) found_nano = true;
