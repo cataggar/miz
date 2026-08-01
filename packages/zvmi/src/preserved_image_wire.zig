@@ -108,10 +108,29 @@ pub const TrustSource = struct {
     source_index: usize,
 };
 
+/// Deliberately not a `source_index`. Trust material is public, so it is staged
+/// into the build graph and travels as a file the build system owns a copy of.
+/// Credential material must never be staged: a copy in the build cache is a
+/// secret written somewhere nobody deletes. Only the locator crosses this wire.
+pub const CredentialSource = union(enum) {
+    host_path: []const u8,
+    host_environment: []const u8,
+};
+
+pub const BasicCredential = struct {
+    username: []const u8,
+    password: CredentialSource,
+};
+
+pub const RepositoryCredential = union(enum) {
+    basic: BasicCredential,
+};
+
 pub const PackageRepository = struct {
     id: []const u8,
     urls: []const []const u8,
     trust: []const TrustSource = &.{},
+    credential: ?RepositoryCredential = null,
 };
 
 pub const PackageCachePolicy = enum {

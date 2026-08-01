@@ -556,7 +556,9 @@ fn renderRepositoryFile(
     allocator: Allocator,
     repository: control_mod.Repository,
 ) ![]const u8 {
-    return control_mod.renderRepositoryBody(allocator, repository.id, repository.urls);
+    // The VM backend refuses a credentialed repository at validation, so the
+    // guest has nothing to render and no channel that could have carried it.
+    return control_mod.renderRepositoryBody(allocator, repository.id, repository.urls, null);
 }
 
 fn renderResolver(allocator: Allocator, config: control_mod.NetworkConfig) ![]const u8 {

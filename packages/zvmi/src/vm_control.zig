@@ -164,10 +164,19 @@ pub fn renderResolverBody(
 /// be one. It takes the fields rather than a repository type because the host
 /// and the guest hold trust material in different shapes and neither shape
 /// reaches the body.
+/// The material a credential names, already resolved by whoever could reach it.
+/// This module reaches nothing, which is why it is the one place the host and
+/// the guest can share a renderer.
+pub const BasicMaterial = struct {
+    username: []const u8,
+    password: []const u8,
+};
+
 pub fn renderRepositoryBody(
     allocator: Allocator,
     id: []const u8,
     urls: []const []const u8,
+    credential: ?BasicMaterial,
 ) Allocator.Error![]u8 {
     var body: std.array_list.Managed(u8) = .init(allocator);
     errdefer body.deinit();
@@ -181,6 +190,13 @@ pub fn renderRepositoryBody(
         try body.appendSlice(url);
     }
     try body.append('\n');
+    if (credential) |material| {
+        try body.appendSlice("username=");
+        try body.appendSlice(material.username);
+        try body.appendSlice("\npassword=");
+        try body.appendSlice(material.password);
+        try body.append('\n');
+    }
     return body.toOwnedSlice();
 }
 
@@ -1127,6 +1143,53 @@ test "rendered files survive the control round trip" {
     try std.testing.expectEqualStrings(
         "options i915 enable_guc=2\n",
         parsed.value.kernel_module_files[0].contents,
+    );
+}
+
+test "a credential is rendered where the package manager reads it, not where it is logged" {
+    const allocator = std.testing.allocator;
+    const bare = try renderRepositoryBody(
+        allocator,
+        "base",
+        &.{"https://packages.example.invalid"},
+        null,
+    );
+    defer allocator.free(bare);
+    try std.testing.expectEqualStrings(
+        "[base]\nname=zvmi-base\nenabled=1\ngpgcheck=1\n" ++
+            "baseurl=https://packages.example.invalid\n",
+        bare,
+    );
+
+    // The credential lines come last, so a repository file is the same
+    // document with or without one and diffing the two shows only the addition.
+    const authenticated = try renderRepositoryBody(
+        allocator,
+        "base",
+        &.{ "https://a.example.invalid", "https://b.example.invalid" },
+        .{ .username = "builder", .password = "s3cr3t" },
+    );
+    defer allocator.free(authenticated);
+    try std.testing.expectEqualStrings(
+        "[base]\nname=zvmi-base\nenabled=1\ngpgcheck=1\n" ++
+            "baseurl=https://a.example.invalid https://b.example.invalid\n" ++
+            "username=builder\npassword=s3cr3t\n",
+        authenticated,
+    );
+
+    // Adding a credential adds lines and changes none, so a repository that
+    // starts needing authentication keeps resolving to the same packages.
+    const same_urls = try renderRepositoryBody(
+        allocator,
+        "base",
+        &.{"https://packages.example.invalid"},
+        .{ .username = "builder", .password = "s3cr3t" },
+    );
+    defer allocator.free(same_urls);
+    try std.testing.expect(std.mem.startsWith(u8, same_urls, bare));
+    try std.testing.expectEqualStrings(
+        "username=builder\npassword=s3cr3t\n",
+        same_urls[bare.len..],
     );
 }
 
