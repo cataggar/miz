@@ -47,6 +47,7 @@ pub const Error = error{
     InvalidPackageName,
     InvalidKernelRelease,
     InvalidRepositoryUrl,
+    RepositoryUrlCarriesCredential,
     InvalidTrustMaterial,
     EmptyAction,
     OfflineNetworkWithPackageActions,
@@ -152,6 +153,34 @@ pub fn renderResolverBody(
         try body.appendSlice(nameserver);
         try body.append('\n');
     }
+    return body.toOwnedSlice();
+}
+
+/// Renders the tdnf repository file body for one repository.
+///
+/// Shared for the same reason `renderResolverBody` is: the chroot backend and
+/// the guest agent must write byte-identical configuration for the same
+/// declaration, and the only reliable way two renderers agree is for there to
+/// be one. It takes the fields rather than a repository type because the host
+/// and the guest hold trust material in different shapes and neither shape
+/// reaches the body.
+pub fn renderRepositoryBody(
+    allocator: Allocator,
+    id: []const u8,
+    urls: []const []const u8,
+) Allocator.Error![]u8 {
+    var body: std.array_list.Managed(u8) = .init(allocator);
+    errdefer body.deinit();
+    try body.appendSlice("[");
+    try body.appendSlice(id);
+    try body.appendSlice("]\nname=zvmi-");
+    try body.appendSlice(id);
+    try body.appendSlice("\nenabled=1\ngpgcheck=1\nbaseurl=");
+    for (urls, 0..) |url, index| {
+        if (index != 0) try body.append(' ');
+        try body.appendSlice(url);
+    }
+    try body.append('\n');
     return body.toOwnedSlice();
 }
 
@@ -306,6 +335,7 @@ pub const Control = struct {
             }
             if (repository.urls.len == 0) return error.InvalidRepositoryUrl;
             for (repository.urls) |url| {
+                if (hasUserinfo(url)) return error.RepositoryUrlCarriesCredential;
                 if (!validRepositoryUrl(url)) return error.InvalidRepositoryUrl;
             }
             // gpgcheck is on unconditionally in the generated tdnf config, so a
@@ -487,16 +517,36 @@ pub fn validModuleMember(member: []const u8) bool {
     return true;
 }
 
-fn validRepositoryUrl(url: []const u8) bool {
+pub fn validRepositoryUrl(url: []const u8) bool {
     if (url.len == 0 or url.len > 2048) return false;
     // The url is written into a repository file whose grammar is line-based
     // and whose baseurl values are space-separated.
     for (url) |byte| {
         if (byte <= 0x20 or byte == 0x7F) return false;
     }
+    if (hasUserinfo(url)) return false;
     return std.mem.startsWith(u8, url, "https://") or
         std.mem.startsWith(u8, url, "http://") or
         std.mem.startsWith(u8, url, "file://");
+}
+
+/// Whether a URL carries a userinfo component -- `https://user:secret@host/`.
+///
+/// Refused rather than accepted, because everything about a repository is
+/// recorded: the URL is hashed into the plan identifier, written out verbatim
+/// by the request and plan JSON, and kept in provenance. A password smuggled in
+/// here would be published by all three. It is also the one place a secret can
+/// reach a run without being declared, which is the whole point of declaring
+/// credentials separately -- so it has to be refused rather than merely
+/// discouraged.
+///
+/// Only the authority is examined. `@` is an ordinary path character, and a
+/// repository whose path contains one is not carrying a credential.
+pub fn hasUserinfo(url: []const u8) bool {
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return false;
+    const authority = url[scheme_end + 3 ..];
+    const authority_end = std.mem.indexOfAny(u8, authority, "/?#") orelse authority.len;
+    return std.mem.indexOfScalar(u8, authority[0..authority_end], '@') != null;
 }
 
 // ---- Framing ----------------------------------------------------------
@@ -801,6 +851,18 @@ test "a control document the guest could be driven by is rejected" {
             }};
             break :blk control;
         } },
+        // Named apart from a malformed URL: this one is well-formed, and the
+        // thing wrong with it is that it is carrying a password into the field
+        // the plan hashes and provenance records verbatim.
+        .{ .expected = error.RepositoryUrlCarriesCredential, .control = blk: {
+            var control = base;
+            control.repositories = &.{.{
+                .id = "base",
+                .urls = &.{"https://builder:hunter2@example.invalid/base"},
+                .trust_base64 = &.{"a2V5"},
+            }};
+            break :blk control;
+        } },
         .{ .expected = error.InvalidPackageName, .control = blk: {
             var control = base;
             control.actions = &.{.{ .install = &.{"--setopt=tsflags=noscripts"} }};
@@ -1066,4 +1128,25 @@ test "rendered files survive the control round trip" {
         "options i915 enable_guc=2\n",
         parsed.value.kernel_module_files[0].contents,
     );
+}
+
+test "only a URL's authority can carry a credential" {
+    // The refusal has to read the authority and stop there. `@` is an ordinary
+    // path character -- a repository laid out per-account, or a mirror using a
+    // package's own name, has one and is carrying nothing.
+    try std.testing.expect(hasUserinfo("https://builder:hunter2@packages.invalid/base"));
+    try std.testing.expect(hasUserinfo("https://token@packages.invalid/base"));
+    try std.testing.expect(hasUserinfo("https://builder:hunter2@packages.invalid"));
+    try std.testing.expect(hasUserinfo("https://builder:p@ss@packages.invalid/base"));
+    try std.testing.expect(!hasUserinfo("https://packages.invalid/base/user@example/rpms"));
+    try std.testing.expect(!hasUserinfo("https://packages.invalid/base?q=user@example"));
+    try std.testing.expect(!hasUserinfo("https://packages.invalid/base#user@example"));
+    try std.testing.expect(!hasUserinfo("https://packages.invalid/base"));
+    try std.testing.expect(!hasUserinfo("not-a-url"));
+
+    // And it has to be part of the shared predicate rather than a separate
+    // check some callers remember, since every caller writes the URL somewhere
+    // that keeps it.
+    try std.testing.expect(!validRepositoryUrl("https://builder:hunter2@packages.invalid/base"));
+    try std.testing.expect(validRepositoryUrl("https://packages.invalid/base/user@example/rpms"));
 }

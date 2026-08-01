@@ -556,18 +556,7 @@ fn renderRepositoryFile(
     allocator: Allocator,
     repository: control_mod.Repository,
 ) ![]const u8 {
-    var body: std.array_list.Managed(u8) = .init(allocator);
-    try body.appendSlice(try std.fmt.allocPrint(
-        allocator,
-        "[{s}]\nname=zvmi-{s}\nenabled=1\ngpgcheck=1\nbaseurl=",
-        .{ repository.id, repository.id },
-    ));
-    for (repository.urls, 0..) |url, index| {
-        if (index != 0) try body.append(' ');
-        try body.appendSlice(url);
-    }
-    try body.append('\n');
-    return body.items;
+    return control_mod.renderRepositoryBody(allocator, repository.id, repository.urls);
 }
 
 fn renderResolver(allocator: Allocator, config: control_mod.NetworkConfig) ![]const u8 {

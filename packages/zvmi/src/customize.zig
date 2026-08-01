@@ -1223,12 +1223,22 @@ fn validatePackagePolicy(
                 ));
             }
         }
+        // The same predicate the guest applies, rather than a looser one here:
+        // a URL this accepts and the boundary refuses is a plan that resolves,
+        // hashes and then fails once the run is already under way.
         for (repository.urls) |url| {
-            if (url.len == 0 or std.mem.indexOfAny(u8, url, "\r\n\x00") != null) {
+            if (vm_control.hasUserinfo(url)) {
                 try diagnostics.append(validationError(
                     .invalid_policy,
                     "/packages/repositories/urls",
-                    "repository URLs must be non-empty single-line values",
+                    "a repository URL must not carry a userinfo component",
+                    "declare the credential under the repository instead; a URL is hashed into the plan and recorded in provenance verbatim",
+                ));
+            } else if (!vm_control.validRepositoryUrl(url)) {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/packages/repositories/urls",
+                    "repository URLs must be single-line http, https or file URLs",
                     null,
                 ));
             }
@@ -9301,6 +9311,86 @@ test "a guest cannot be pointed at its own network's alias for this machine" {
     var diagnostics = try validate(std.testing.allocator, &accepted);
     defer diagnostics.deinit(std.testing.allocator);
     try std.testing.expect(!diagnostics.hasErrors());
+}
+
+test "a repository URL cannot smuggle a credential past the declaration" {
+    // Everything about a repository is kept: the URL is hashed into the plan
+    // identifier, written out verbatim by `writeRequestJson` and
+    // `writePlanJson`, and recorded in provenance. A password in the authority
+    // would be published by all three, and would be the one way a secret could
+    // reach a run without being declared at all.
+    const smuggled = [_][]const u8{
+        "https://builder:hunter2@packages.example.invalid",
+        "https://token@packages.example.invalid",
+        "http://builder:hunter2@packages.example.invalid/base",
+    };
+    for (smuggled) |url| {
+        const repositories = [_]PackageRepository{.{
+            .id = "base",
+            .urls = &.{url},
+            .trust = &.{.{ .inline_bytes = "test key" }},
+        }};
+        var request = whenNeededRequest();
+        request.packages = .{
+            .actions = &.{.{ .install = &.{"dracut"} }},
+            .repositories = &repositories,
+        };
+        var resolved = try resolve(
+            std.testing.allocator,
+            &request,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer resolved.deinit(std.testing.allocator);
+        try std.testing.expect(resolved.plan == null);
+        var named_userinfo = false;
+        for (resolved.diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, "userinfo") != null) {
+                named_userinfo = true;
+            }
+        }
+        try std.testing.expect(named_userinfo);
+    }
+
+    // An `@` in the path is not a credential, and refusing it would refuse
+    // repositories that are laid out per-account.
+    const path_at = [_]PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid/user@example/rpms"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    var accepted = whenNeededRequest();
+    accepted.packages = .{
+        .actions = &.{.{ .install = &.{"dracut"} }},
+        .repositories = &path_at,
+    };
+    var resolved = try resolve(
+        std.testing.allocator,
+        &accepted,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.plan != null);
+
+    // The request validator and the two privilege boundaries share one
+    // predicate, so a URL cannot be accepted here and refused once the run is
+    // already under way.
+    const scheme = [_]PackageRepository{.{
+        .id = "base",
+        .urls = &.{"ftp://packages.example.invalid/base"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    var wrong_scheme = whenNeededRequest();
+    wrong_scheme.packages = .{
+        .actions = &.{.{ .install = &.{"dracut"} }},
+        .repositories = &scheme,
+    };
+    var scheme_resolved = try resolve(
+        std.testing.allocator,
+        &wrong_scheme,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer scheme_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(scheme_resolved.plan == null);
 }
 
 fn hasCapabilityKind(

@@ -863,18 +863,13 @@ const Session = struct {
                 repository.id,
             );
             defer self.allocator.free(path);
-            var output: Io.Writer.Allocating = .init(self.allocator);
-            defer output.deinit();
-            try output.writer.print(
-                "[{s}]\nname=zvmi-{s}\nenabled=1\ngpgcheck=1\nbaseurl=",
-                .{ repository.id, repository.id },
+            const body = try vm_control.renderRepositoryBody(
+                self.allocator,
+                repository.id,
+                repository.urls,
             );
-            for (repository.urls, 0..) |url, index| {
-                if (index != 0) try output.writer.writeByte(' ');
-                try output.writer.writeAll(url);
-            }
-            try output.writer.writeByte('\n');
-            try writeBytesExclusive(self.io, path, output.written());
+            defer self.allocator.free(body);
+            try writeBytesExclusive(self.io, path, body);
         }
     }
 
@@ -1449,6 +1444,15 @@ fn validateManifestPolicy(manifest: Manifest) !void {
     }
     for (manifest.packages.repositories) |repository| {
         if (!validRepositoryId(repository.id)) return error.InvalidRepositoryId;
+        // The worker re-reads this manifest from JSON after re-execing as
+        // root, so it checks the URLs on its own side of the boundary rather
+        // than trusting the validator that already did. A userinfo component
+        // is the case worth naming: it is a credential in the one field that
+        // is hashed, published and kept in provenance verbatim.
+        for (repository.urls) |url| {
+            if (vm_control.hasUserinfo(url)) return error.RepositoryUrlCarriesCredential;
+            if (!vm_control.validRepositoryUrl(url)) return error.InvalidRepositoryUrl;
+        }
     }
     var needs_repository = false;
     for (manifest.packages.actions) |action| {
@@ -2642,6 +2646,30 @@ test "worker refuses kernel module names it would render as two tokens" {
     try std.testing.expectError(
         error.UnusableNameserver,
         validateManifestPolicy(loopback),
+    );
+
+    // Same boundary, same reasoning, one field further: the URL is the field
+    // the plan hashes and provenance keeps verbatim, so a credential in its
+    // authority is refused under its own name rather than as a malformed URL.
+    var smuggled = base;
+    smuggled.packages = .{ .repositories = &.{.{
+        .id = "base",
+        .urls = &.{"https://builder:hunter2@packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }} };
+    try std.testing.expectError(
+        error.RepositoryUrlCarriesCredential,
+        validateManifestPolicy(smuggled),
+    );
+    var wrong_scheme = base;
+    wrong_scheme.packages = .{ .repositories = &.{.{
+        .id = "base",
+        .urls = &.{"ftp://packages.example.invalid/base"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }} };
+    try std.testing.expectError(
+        error.InvalidRepositoryUrl,
+        validateManifestPolicy(wrong_scheme),
     );
 
     var spaced = base;
