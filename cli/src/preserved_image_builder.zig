@@ -46,6 +46,7 @@ const LoadedConfiguration = struct {
     generalization: zvmi.customize.GeneralizationPolicy,
     acknowledge_unsafe: bool,
     packages: zvmi.customize.PackagePolicy,
+    hooks: []const zvmi.customize.Hook,
     initramfs: zvmi.customize.InitramfsPolicy,
     guest_execution: wire.GuestExecutionPolicy,
     runner: ?wire.Runner,
@@ -218,6 +219,7 @@ pub fn main(init: std.process.Init) !void {
         .os = configuration.os,
         .existing_path_operations = configuration.operations,
         .packages = configuration.packages,
+        .hooks = configuration.hooks,
         .initramfs = configuration.initramfs,
         .cross_architecture = switch (configuration.guest_execution) {
             .same_architecture => .reject,
@@ -562,6 +564,7 @@ fn loadV2Configuration(
         .generalization = customization.generalization,
         .acknowledge_unsafe = false,
         .packages = .{},
+        .hooks = &.{},
         .initramfs = .unchanged,
         .guest_execution = .same_architecture,
         .runner = null,
@@ -624,6 +627,7 @@ fn loadV3Configuration(
             parsed.value.packages,
             source_paths,
         ),
+        .hooks = try mapHooks(allocator, parsed.value.hooks, source_paths),
         .initramfs = try mapInitramfsPolicy(allocator, parsed.value.initramfs),
         .guest_execution = parsed.value.guest_execution,
         .runner = parsed.value.runner,
@@ -715,6 +719,7 @@ fn mapOperations(
     source_paths: []const []const u8,
 ) ![]const zvmi.customize.ExistingPathOperation {
     const mapped = try allocator.alloc(zvmi.customize.ExistingPathOperation, operations.len);
+    errdefer allocator.free(mapped);
     for (operations, 0..) |operation, index| {
         mapped[index] = switch (operation) {
             .overwrite_file => |overwrite| .{ .overwrite_file = .{
@@ -731,6 +736,36 @@ fn mapOperations(
     return mapped;
 }
 
+/// Hook sources arrive as indices into the staged source list, the same way
+/// repository trust does. Both forms the build API offers -- an inline script
+/// and a path -- reach here as a file the build system staged, so the CLI has
+/// one shape to map rather than two.
+fn mapHooks(
+    allocator: std.mem.Allocator,
+    hooks: []const wire.Hook,
+    source_paths: []const []const u8,
+) ![]const zvmi.customize.Hook {
+    const mapped = try allocator.alloc(zvmi.customize.Hook, hooks.len);
+    errdefer allocator.free(mapped);
+    for (hooks, mapped) |hook, *slot| {
+        if (hook.source.source_index >= source_paths.len) {
+            return error.SourceIndexOutOfBounds;
+        }
+        slot.* = .{
+            .name = hook.name,
+            .phase = switch (hook.phase) {
+                .after_packages => .after_packages,
+                .before_initramfs => .before_initramfs,
+                .before_seal => .before_seal,
+                .finalize => .finalize,
+            },
+            .source = .{ .host_path = source_paths[hook.source.source_index] },
+            .arguments = hook.arguments,
+        };
+    }
+    return mapped;
+}
+
 fn mapPackagePolicy(
     allocator: std.mem.Allocator,
     policy: wire.PackagePolicy,
@@ -740,6 +775,7 @@ fn mapPackagePolicy(
         zvmi.customize.PackageAction,
         policy.actions.len,
     );
+    errdefer allocator.free(actions);
     for (policy.actions, 0..) |action, index| {
         actions[index] = switch (action) {
             .install => |packages| .{ .install = packages },
@@ -752,19 +788,19 @@ fn mapPackagePolicy(
         zvmi.customize.PackageRepository,
         policy.repositories.len,
     );
+    errdefer allocator.free(repositories);
+    // Each repository owns a trust slice, so a refusal partway through has to
+    // free the ones already built. Recording the repository before filling its
+    // trust in is what lets a single count describe everything allocated.
+    var owned_repositories: usize = 0;
+    errdefer for (repositories[0..owned_repositories]) |built| {
+        allocator.free(built.trust);
+    };
     for (policy.repositories, 0..) |repository, index| {
         const trust = try allocator.alloc(
             zvmi.customize.TrustSource,
             repository.trust.len,
         );
-        for (repository.trust, 0..) |source, source_index| {
-            if (source.source_index >= source_paths.len) {
-                return error.SourceIndexOutOfBounds;
-            }
-            trust[source_index] = .{
-                .host_path = source_paths[source.source_index],
-            };
-        }
         repositories[index] = .{
             .id = repository.id,
             .urls = repository.urls,
@@ -779,6 +815,15 @@ fn mapPackagePolicy(
                 } },
             } else null,
         };
+        owned_repositories = index + 1;
+        for (repository.trust, 0..) |source, source_index| {
+            if (source.source_index >= source_paths.len) {
+                return error.SourceIndexOutOfBounds;
+            }
+            trust[source_index] = .{
+                .host_path = source_paths[source.source_index],
+            };
+        }
     }
     return .{
         .actions = actions,
@@ -1522,6 +1567,87 @@ test "a credential crosses the wire as a locator the build system never stages" 
         "trust-source",
         mapped.repositories[0].trust[0].host_path,
     );
+}
+
+test "a hook crosses the wire as a staged source and lands on a host path" {
+    // The opposite of the credential above: a hook script is code the build is
+    // accountable for and provenance names by digest, so the build system does
+    // stage a copy and hash it into the graph. Both forms the build API offers
+    // -- an inline script and a path -- are staged before they get here, so
+    // everything downstream sees one shape.
+    const hooks = [_]wire.Hook{
+        .{
+            .name = "early",
+            .phase = .after_packages,
+            .source = .{ .source_index = 1 },
+            .arguments = &.{ "--quiet", "/etc" },
+        },
+        .{ .name = "late", .phase = .finalize, .source = .{ .source_index = 0 } },
+    };
+    const mapped = try mapHooks(
+        std.testing.allocator,
+        &hooks,
+        &.{ "staged/late.sh", "staged/early.sh" },
+    );
+    defer std.testing.allocator.free(mapped);
+
+    try std.testing.expectEqual(@as(usize, 2), mapped.len);
+    try std.testing.expectEqualStrings("early", mapped[0].name);
+    try std.testing.expectEqual(zvmi.customize.HookPhase.after_packages, mapped[0].phase);
+    try std.testing.expectEqualStrings("staged/early.sh", mapped[0].source.host_path);
+    try std.testing.expectEqual(@as(usize, 2), mapped[0].arguments.len);
+    try std.testing.expectEqualStrings("--quiet", mapped[0].arguments[0]);
+    try std.testing.expectEqualStrings("late", mapped[1].name);
+    try std.testing.expectEqual(zvmi.customize.HookPhase.finalize, mapped[1].phase);
+    try std.testing.expectEqualStrings("staged/late.sh", mapped[1].source.host_path);
+
+    // An index the caller never staged is refused rather than silently reading
+    // whatever file happens to sit at that position.
+    try std.testing.expectError(error.SourceIndexOutOfBounds, mapHooks(
+        std.testing.allocator,
+        &hooks,
+        &.{"staged/late.sh"},
+    ));
+}
+
+test "a mapper that refuses an out-of-range source keeps nothing it allocated" {
+    // Every mapper allocates before it has finished checking, so a refusal is
+    // the one path where the caller is handed an error and cannot free what it
+    // never received. The testing allocator is what makes this assertable.
+    try std.testing.expectError(error.SourceIndexOutOfBounds, mapOperations(
+        std.testing.allocator,
+        &.{
+            .{ .remove_file = "/etc/old" },
+            .{ .overwrite_file = .{ .path = "/etc/one", .source_index = 7 } },
+        },
+        &.{"staged"},
+    ));
+    try std.testing.expectError(error.SourceIndexOutOfBounds, mapHooks(
+        std.testing.allocator,
+        &.{.{ .name = "late", .phase = .finalize, .source = .{ .source_index = 7 } }},
+        &.{"staged"},
+    ));
+    // Two repositories, so the refusal lands after a trust slice was already
+    // built for an earlier one.
+    try std.testing.expectError(error.SourceIndexOutOfBounds, mapPackagePolicy(
+        std.testing.allocator,
+        .{
+            .actions = &.{.{ .install = &.{"dracut"} }},
+            .repositories = &.{
+                .{
+                    .id = "base",
+                    .urls = &.{"https://packages.example.invalid"},
+                    .trust = &.{.{ .source_index = 0 }},
+                },
+                .{
+                    .id = "extra",
+                    .urls = &.{"https://extra.example.invalid"},
+                    .trust = &.{.{ .source_index = 7 }},
+                },
+            },
+        },
+        &.{"staged"},
+    ));
 }
 
 test "unsafe image basenames are rejected" {

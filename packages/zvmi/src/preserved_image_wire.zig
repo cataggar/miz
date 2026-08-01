@@ -133,6 +133,27 @@ pub const PackageRepository = struct {
     credential: ?RepositoryCredential = null,
 };
 
+pub const HookPhase = enum {
+    after_packages,
+    before_initramfs,
+    before_seal,
+    finalize,
+};
+
+/// A staged file, like repository trust and unlike a credential. A hook script
+/// is code the build produced and the provenance names by digest, so the build
+/// system owning a copy of it is the point rather than a leak.
+pub const HookSource = struct {
+    source_index: usize,
+};
+
+pub const Hook = struct {
+    name: []const u8,
+    phase: HookPhase,
+    source: HookSource,
+    arguments: []const []const u8 = &.{},
+};
+
 pub const PackageCachePolicy = enum {
     online,
     cache_only,
@@ -273,6 +294,7 @@ pub const Configuration = struct {
     customization: customization_wire.Configuration = .{},
     acknowledge_unsafe: bool = false,
     packages: PackagePolicy = .{},
+    hooks: []const Hook = &.{},
     initramfs: InitramfsPolicy = .unchanged,
     guest_execution: GuestExecutionPolicy = .same_architecture,
     runner: ?Runner = null,
@@ -400,6 +422,7 @@ pub fn validate(configuration: Configuration, source_count: usize) ValidationErr
     for (configuration.packages.repositories) |repository| {
         expected_sources += repository.trust.len;
     }
+    expected_sources += configuration.hooks.len;
     if (source_count < expected_sources) return error.MissingSourceArgument;
     if (source_count > expected_sources) return error.ExtraSourceArgument;
 
@@ -454,6 +477,7 @@ const SourceIndexIterator = struct {
     filesystem_index: usize = 0,
     repository_index: usize = 0,
     trust_index: usize = 0,
+    hook_index: usize = 0,
 
     fn init(configuration: Configuration) SourceIndexIterator {
         return .{ .configuration = configuration };
@@ -485,6 +509,11 @@ const SourceIndexIterator = struct {
             }
             self.repository_index += 1;
             self.trust_index = 0;
+        }
+        while (self.hook_index < self.configuration.hooks.len) {
+            const hook = self.configuration.hooks[self.hook_index];
+            self.hook_index += 1;
+            return hook.source.source_index;
         }
         return null;
     }
@@ -582,6 +611,43 @@ test "repository trust participates in the shared source closure" {
         validate(configuration, 3),
     );
     trust[0].source_index = 3;
+    try std.testing.expectError(
+        error.SourceIndexOutOfBounds,
+        validate(configuration, 3),
+    );
+}
+
+test "a hook script participates in the shared source closure" {
+    var hooks = [_]Hook{
+        .{ .name = "early", .phase = .after_packages, .source = .{ .source_index = 1 } },
+        .{ .name = "late", .phase = .finalize, .source = .{ .source_index = 2 } },
+    };
+    const configuration = Configuration{
+        .root_partition = .{ .gpt_index = 1 },
+        .operations = &.{.{ .overwrite_file = .{
+            .path = "/etc/one",
+            .source_index = 0,
+        } }},
+        .hooks = &hooks,
+    };
+    // A hook script is code the build is accountable for, so it is staged and
+    // indexed like every other byte stream rather than named by host path.
+    try validate(configuration, 3);
+    try std.testing.expectError(
+        error.MissingSourceArgument,
+        validate(configuration, 2),
+    );
+    try std.testing.expectError(
+        error.ExtraSourceArgument,
+        validate(configuration, 4),
+    );
+
+    hooks[1].source.source_index = 0;
+    try std.testing.expectError(
+        error.DuplicateSourceIndex,
+        validate(configuration, 3),
+    );
+    hooks[1].source.source_index = 3;
     try std.testing.expectError(
         error.SourceIndexOutOfBounds,
         validate(configuration, 3),
