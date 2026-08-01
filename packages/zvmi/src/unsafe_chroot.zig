@@ -946,6 +946,16 @@ const Session = struct {
                 if (!validCredentialMaterial(value)) {
                     return error.CredentialMaterialUnusable;
                 }
+                // Consumed, so it stops existing. The worker is PID 1 in the
+                // namespace and mounts a real `proc` inside the target root, so
+                // a variable left in its own environment is readable through
+                // `/proc/1/environ` by everything that runs in the chroot
+                // afterwards -- including package scriptlets and dracut
+                // modules, which are target-supplied code running as root, and
+                // which run after the repository file has been deleted. Nothing
+                // has entered the chroot yet at this point: this is the first
+                // step of `runPolicy`, and `open` ran only host binaries.
+                scrubEnvironmentValue(self.executor.environ, name);
                 return value;
             },
         }
@@ -1819,6 +1829,21 @@ fn validEnvironmentName(name: []const u8) bool {
     return true;
 }
 
+/// Overwrites a variable's value in the process's own environment block, in
+/// place. The name is left behind because it is not a secret and is already in
+/// the plan; only the material goes.
+///
+/// This narrows the window rather than making the backend safe. `unsafe_chroot`
+/// runs package scriptlets as root against the host kernel and says so: code
+/// that wants the credential can leave the chroot and read the file a
+/// `host_path` credential names. The point is that a secret should not sit in a
+/// process image for the length of a run when the run needed it once.
+fn scrubEnvironmentValue(environ: std.process.Environ, name: []const u8) void {
+    if (builtin.os.tag == .windows) return;
+    const value = std.process.Environ.getPosix(environ, name) orelse return;
+    @memset(@constCast(value), 0);
+}
+
 /// Copies the value of every variable a declared credential names into the
 /// worker's environment, and refuses now rather than after the image has been
 /// mounted and half mutated. An unset variable is a declaration the host cannot
@@ -2592,6 +2617,37 @@ test "nothing the worker runs inherits the worker's environment" {
             try std.testing.expectEqualStrings(expected, names.items[index]);
         }
     }
+}
+
+test "a consumed credential variable stops existing" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var entry = "ZVMI_TEST_CREDENTIAL=s3cr3t-from-a-variable".*;
+    var other = "PATH=/usr/bin".*;
+    const block = [_:null]?[*:0]const u8{ &entry, &other };
+    const environ = std.process.Environ{ .block = .{ .slice = &block } };
+
+    try std.testing.expectEqualStrings(
+        "s3cr3t-from-a-variable",
+        std.process.Environ.getPosix(environ, "ZVMI_TEST_CREDENTIAL").?,
+    );
+    scrubEnvironmentValue(environ, "ZVMI_TEST_CREDENTIAL");
+
+    // Gone from the block, and gone from the bytes the block points at, which
+    // is what `/proc/<pid>/environ` reads.
+    try std.testing.expectEqualStrings(
+        "",
+        std.process.Environ.getPosix(environ, "ZVMI_TEST_CREDENTIAL").?,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, &entry, "s3cr3t-from-a-variable") == null,
+    );
+
+    // And nothing else is disturbed: the worker still has to run commands.
+    try std.testing.expectEqualStrings(
+        "/usr/bin",
+        std.process.Environ.getPosix(environ, "PATH").?,
+    );
+    scrubEnvironmentValue(environ, "ZVMI_NOT_DECLARED");
 }
 
 test "a credential the host cannot resolve is a refusal, not an empty password" {
