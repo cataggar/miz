@@ -135,16 +135,13 @@ pub fn runParent(
         "--unsafe-chroot-worker",
         manifest_path,
     };
-    var environment = std.process.Environ.Map.init(allocator);
+    var environment = try baseEnvironment(allocator);
     defer environment.deinit();
-    try environment.put("HOME", "/root");
-    try environment.put("LANG", "C");
-    try environment.put("LC_ALL", "C");
-    try environment.put("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
-    try environment.put("TERM", "dumb");
     // The worker's environment is built rather than inherited, so a declared
     // credential variable has to be forwarded by name. The exception is exactly
-    // as wide as the plan says it is, and the plan hash covers the names.
+    // as wide as the plan says it is, and the plan hash covers the names. It
+    // goes no further: the worker builds a fresh environment for every command
+    // it runs, from `baseEnvironment` alone.
     try forwardCredentialVariables(allocator, options.environ, &environment, manifest);
     var child = std.process.spawn(io, .{
         .argv = &argv,
@@ -917,7 +914,10 @@ const Session = struct {
                     self.allocator,
                     .limited(customize.max_credential_material_bytes),
                 ) catch return error.CredentialSourceUnreadable;
-                errdefer {
+                // Unconditional, not an `errdefer`: the untrimmed read is a
+                // copy of the secret and does not outlive this function on
+                // either path.
+                defer {
                     @memset(bytes, 0);
                     self.allocator.free(bytes);
                 }
@@ -925,10 +925,13 @@ const Session = struct {
                 if (!validCredentialMaterial(trimmed)) {
                     return error.CredentialMaterialUnusable;
                 }
-                // Shrink in place rather than reallocating, so a trimmed copy
-                // of the secret is not left behind in a freed allocation.
-                @memset(bytes[trimmed.len..], 0);
-                return self.allocator.remap(bytes, trimmed.len) orelse bytes[0..trimmed.len];
+                // Copied to an exact allocation rather than resized in place:
+                // a shrunk slice whose length no longer matches its allocation
+                // is freed at the wrong size. The untrimmed read is zeroed, so
+                // the extra copy is not an extra copy left behind.
+                const material = try self.allocator.alloc(u8, trimmed.len);
+                @memcpy(material, trimmed);
+                return material;
             },
             .host_environment => |name| {
                 const value = std.process.Environ.getAlloc(
@@ -1373,6 +1376,25 @@ const Executor = struct {
     }
 };
 
+/// The environment the worker runs under, and the environment it hands to every
+/// command it runs. Built rather than inherited in both directions. A credential
+/// variable is forwarded into the first and deliberately not into the second:
+/// the worker consumes it, and nothing it spawns -- least of all a package
+/// scriptlet or a dracut module, which are target-supplied code running as root
+/// against the image about to be published -- ever sees it. The repository file
+/// is deleted before the initramfs is regenerated; a variable left in the
+/// environment would have outlived the channel it was meant to travel on.
+fn baseEnvironment(allocator: Allocator) !std.process.Environ.Map {
+    var environment = std.process.Environ.Map.init(allocator);
+    errdefer environment.deinit();
+    try environment.put("HOME", "/root");
+    try environment.put("LANG", "C");
+    try environment.put("LC_ALL", "C");
+    try environment.put("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+    try environment.put("TERM", "dumb");
+    return environment;
+}
+
 fn runSystem(
     _: ?*anyopaque,
     allocator: Allocator,
@@ -1381,9 +1403,12 @@ fn runSystem(
     capture_output: bool,
     stdin_file: ?Io.File,
 ) !CommandResult {
+    var environment = try baseEnvironment(allocator);
+    defer environment.deinit();
     if (!capture_output) {
         var child = try std.process.spawn(io, .{
             .argv = argv,
+            .environ_map = &environment,
             .stdin = if (stdin_file) |file| .{ .file = file } else .ignore,
             .stdout = .inherit,
             .stderr = .inherit,
@@ -1398,6 +1423,7 @@ fn runSystem(
     if (stdin_file) |file| {
         var child = try std.process.spawn(io, .{
             .argv = argv,
+            .environ_map = &environment,
             .stdin = .{ .file = file },
             .stdout = .pipe,
             .stderr = .pipe,
@@ -1438,6 +1464,7 @@ fn runSystem(
     }
     const result = try std.process.run(allocator, io, .{
         .argv = argv,
+        .environ_map = &environment,
         .stdout_limit = .limited(max_command_output),
         .stderr_limit = .limited(max_command_output),
     });
@@ -1543,12 +1570,15 @@ fn validateManifestPolicy(manifest: Manifest) !void {
         }
         if (repository.credential) |credential| switch (credential) {
             .basic => |basic| {
-                if (!validCredentialField(basic.username)) {
+                if (!validCredentialField(
+                    basic.username,
+                    customize.max_credential_field_bytes,
+                )) {
                     return error.InvalidCredentialUsername;
                 }
                 switch (basic.password) {
                     .host_path => |path| if (!std.fs.path.isAbsolute(path) or
-                        !validCredentialField(path))
+                        !validCredentialField(path, Io.Dir.max_path_bytes))
                     {
                         return error.InvalidCredentialSource;
                     },
@@ -1767,8 +1797,13 @@ fn validCredentialMaterial(bytes: []const u8) bool {
     return true;
 }
 
-fn validCredentialField(text: []const u8) bool {
-    if (text.len == 0 or text.len > customize.max_credential_field_bytes) return false;
+/// `limit` rather than one constant, because a path and a user name are bounded
+/// by different things. Both bounds are the request validator's, so this side of
+/// the privilege boundary refuses exactly what that side refuses and no more: a
+/// rule that is stricter here would accept a request and then fail it after the
+/// workspace has been copied and the image staged.
+fn validCredentialField(text: []const u8, limit: usize) bool {
+    if (text.len == 0 or text.len > limit) return false;
     for (text) |byte| {
         if (byte < 0x20 or byte == 0x7f) return false;
     }
@@ -2499,6 +2534,66 @@ test "a credential reaches tdnf without reaching anything that outlives the run"
     );
 }
 
+test "nothing the worker runs inherits the worker's environment" {
+    // The credential is forwarded into the worker and stops there. Everything
+    // the worker runs is target-supplied code executing as root against the
+    // image about to be published -- package scriptlets, dracut modules -- and
+    // the repository file is already deleted by the time the initramfs is
+    // regenerated, so a variable left in the environment would outlive the
+    // channel it was meant to travel on.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const env_tool = findTool(std.testing.io, &.{ "/usr/bin/env", "/bin/env" }) orelse
+        return error.SkipZigTest;
+    const stdin_path = "test-unsafe-chroot-environment-stdin";
+    defer Io.Dir.cwd().deleteFile(std.testing.io, stdin_path) catch {};
+    try Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = stdin_path, .data = "" });
+
+    // Both branches that can be observed: `runSystem` spawns three different
+    // ways, and an environment supplied to one of them and not the others is
+    // the shape this would most plausibly regress into.
+    for ([_]?[]const u8{ null, stdin_path }) |stdin| {
+        const stdin_file: ?Io.File = if (stdin) |path|
+            try Io.Dir.cwd().openFile(std.testing.io, path, .{})
+        else
+            null;
+        defer if (stdin_file) |file| file.close(std.testing.io);
+        const result = try runSystem(
+            null,
+            allocator,
+            std.testing.io,
+            &.{env_tool},
+            true,
+            stdin_file,
+        );
+        try std.testing.expectEqual(@as(u8, 0), result.term.exited);
+
+        // Compared as a set rather than a count: the assertion is that the
+        // child's environment is the built one and nothing else, whatever the
+        // process running these tests happens to carry.
+        var names: std.array_list.Managed([]const u8) = .init(allocator);
+        var lines = std.mem.splitScalar(
+            u8,
+            std.mem.trimEnd(u8, result.stdout, "\n"),
+            '\n',
+        );
+        while (lines.next()) |line| {
+            try names.append(line[0 .. std.mem.indexOfScalar(u8, line, '=') orelse line.len]);
+        }
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+        try std.testing.expectEqual(@as(usize, 5), names.items.len);
+        inline for (.{ "HOME", "LANG", "LC_ALL", "PATH", "TERM" }, 0..) |expected, index| {
+            try std.testing.expectEqualStrings(expected, names.items[index]);
+        }
+    }
+}
+
 test "a credential the host cannot resolve is a refusal, not an empty password" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -2627,6 +2722,25 @@ test "the privilege boundary re-checks a credential it is handed" {
         error.CredentialedRepositoryNotEncrypted,
         validateManifestPolicy(plaintext),
     );
+
+    // The bound on a credential path is the request validator's, not a tighter
+    // one: a rule stricter here would accept a request and then fail it after
+    // the workspace has been copied and the image staged.
+    var long = base;
+    var long_path: [Io.Dir.max_path_bytes]u8 = undefined;
+    long_path[0] = '/';
+    @memset(long_path[1..], 'a');
+    var long_repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{},
+        .credential = .{ .basic = .{
+            .username = "builder",
+            .password = .{ .host_path = &long_path },
+        } },
+    }};
+    long.packages = .{ .repositories = &long_repositories };
+    try validateManifestPolicy(long);
 
     var relative = base;
     var relative_repositories = [_]customize.PackageRepository{.{

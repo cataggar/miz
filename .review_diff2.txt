@@ -1,0 +1,292 @@
+diff --git a/build/image.zig b/build/image.zig
+index 53386bb..5309bdb 100644
+--- a/build/image.zig
++++ b/build/image.zig
+@@ -207,10 +207,17 @@ pub const PreservedTrustSource = union(enum) {
+     path: std.Build.LazyPath,
+ };
+ 
++pub const PreservedCredentialSource = preserved_image_wire.CredentialSource;
++pub const PreservedBasicCredential = preserved_image_wire.BasicCredential;
++pub const PreservedRepositoryCredential = preserved_image_wire.RepositoryCredential;
++
+ pub const PreservedPackageRepository = struct {
+     id: []const u8,
+     urls: []const []const u8,
+     trust: []const PreservedTrustSource = &.{},
++    /// A plain locator rather than a `LazyPath`, so the build system never
++    /// stages, hashes or caches the material a credential names.
++    credential: ?PreservedRepositoryCredential = null,
+ };
+ 
+ pub const PreservedPackageCachePolicy = preserved_image_wire.PackageCachePolicy;
+@@ -551,6 +558,7 @@ fn materializePreservedConfiguration(
+             .id = repository.id,
+             .urls = repository.urls,
+             .trust = trust,
++            .credential = repository.credential,
+         };
+     }
+ 
+diff --git a/packages/zvmi/src/preserved_image_wire.zig b/packages/zvmi/src/preserved_image_wire.zig
+index 7111d6b..a92ed22 100644
+--- a/packages/zvmi/src/preserved_image_wire.zig
++++ b/packages/zvmi/src/preserved_image_wire.zig
+@@ -108,10 +108,29 @@ pub const TrustSource = struct {
+     source_index: usize,
+ };
+ 
++/// Deliberately not a `source_index`. Trust material is public, so it is staged
++/// into the build graph and travels as a file the build system owns a copy of.
++/// Credential material must never be staged: a copy in the build cache is a
++/// secret written somewhere nobody deletes. Only the locator crosses this wire.
++pub const CredentialSource = union(enum) {
++    host_path: []const u8,
++    host_environment: []const u8,
++};
++
++pub const BasicCredential = struct {
++    username: []const u8,
++    password: CredentialSource,
++};
++
++pub const RepositoryCredential = union(enum) {
++    basic: BasicCredential,
++};
++
+ pub const PackageRepository = struct {
+     id: []const u8,
+     urls: []const []const u8,
+     trust: []const TrustSource = &.{},
++    credential: ?RepositoryCredential = null,
+ };
+ 
+ pub const PackageCachePolicy = enum {
+diff --git a/packages/zvmi/src/vm_control.zig b/packages/zvmi/src/vm_control.zig
+index 997de6d..8b044c6 100644
+--- a/packages/zvmi/src/vm_control.zig
++++ b/packages/zvmi/src/vm_control.zig
+@@ -47,6 +47,7 @@ pub const Error = error{
+     InvalidPackageName,
+     InvalidKernelRelease,
+     InvalidRepositoryUrl,
++    RepositoryUrlCarriesCredential,
+     InvalidTrustMaterial,
+     EmptyAction,
+     OfflineNetworkWithPackageActions,
+@@ -155,6 +156,50 @@ pub fn renderResolverBody(
+     return body.toOwnedSlice();
+ }
+ 
++/// Renders the tdnf repository file body for one repository.
++///
++/// Shared for the same reason `renderResolverBody` is: the chroot backend and
++/// the guest agent must write byte-identical configuration for the same
++/// declaration, and the only reliable way two renderers agree is for there to
++/// be one. It takes the fields rather than a repository type because the host
++/// and the guest hold trust material in different shapes and neither shape
++/// reaches the body.
++/// The material a credential names, already resolved by whoever could reach it.
++/// This module reaches nothing, which is why it is the one place the host and
++/// the guest can share a renderer.
++pub const BasicMaterial = struct {
++    username: []const u8,
++    password: []const u8,
++};
++
++pub fn renderRepositoryBody(
++    allocator: Allocator,
++    id: []const u8,
++    urls: []const []const u8,
++    credential: ?BasicMaterial,
++) Allocator.Error![]u8 {
++    var body: std.array_list.Managed(u8) = .init(allocator);
++    errdefer body.deinit();
++    try body.appendSlice("[");
++    try body.appendSlice(id);
++    try body.appendSlice("]\nname=zvmi-");
++    try body.appendSlice(id);
++    try body.appendSlice("\nenabled=1\ngpgcheck=1\nbaseurl=");
++    for (urls, 0..) |url, index| {
++        if (index != 0) try body.append(' ');
++        try body.appendSlice(url);
++    }
++    try body.append('\n');
++    if (credential) |material| {
++        try body.appendSlice("username=");
++        try body.appendSlice(material.username);
++        try body.appendSlice("\npassword=");
++        try body.appendSlice(material.password);
++        try body.append('\n');
++    }
++    return body.toOwnedSlice();
++}
++
+ /// Strict dotted-quad parsing. Deliberately narrower than `std.net`, which
+ /// also accepts forms no configuration here should be written in.
+ pub fn parseIpv4(text: []const u8) ?[4]u8 {
+@@ -306,6 +351,7 @@ pub const Control = struct {
+             }
+             if (repository.urls.len == 0) return error.InvalidRepositoryUrl;
+             for (repository.urls) |url| {
++                if (hasUserinfo(url)) return error.RepositoryUrlCarriesCredential;
+                 if (!validRepositoryUrl(url)) return error.InvalidRepositoryUrl;
+             }
+             // gpgcheck is on unconditionally in the generated tdnf config, so a
+@@ -487,18 +533,38 @@ pub fn validModuleMember(member: []const u8) bool {
+     return true;
+ }
+ 
+-fn validRepositoryUrl(url: []const u8) bool {
++pub fn validRepositoryUrl(url: []const u8) bool {
+     if (url.len == 0 or url.len > 2048) return false;
+     // The url is written into a repository file whose grammar is line-based
+     // and whose baseurl values are space-separated.
+     for (url) |byte| {
+         if (byte <= 0x20 or byte == 0x7F) return false;
+     }
++    if (hasUserinfo(url)) return false;
+     return std.mem.startsWith(u8, url, "https://") or
+         std.mem.startsWith(u8, url, "http://") or
+         std.mem.startsWith(u8, url, "file://");
+ }
+ 
++/// Whether a URL carries a userinfo component -- `https://user:secret@host/`.
++///
++/// Refused rather than accepted, because everything about a repository is
++/// recorded: the URL is hashed into the plan identifier, written out verbatim
++/// by the request and plan JSON, and kept in provenance. A password smuggled in
++/// here would be published by all three. It is also the one place a secret can
++/// reach a run without being declared, which is the whole point of declaring
++/// credentials separately -- so it has to be refused rather than merely
++/// discouraged.
++///
++/// Only the authority is examined. `@` is an ordinary path character, and a
++/// repository whose path contains one is not carrying a credential.
++pub fn hasUserinfo(url: []const u8) bool {
++    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return false;
++    const authority = url[scheme_end + 3 ..];
++    const authority_end = std.mem.indexOfAny(u8, authority, "/?#") orelse authority.len;
++    return std.mem.indexOfScalar(u8, authority[0..authority_end], '@') != null;
++}
++
+ // ---- Framing ----------------------------------------------------------
+ //
+ // The result device is raw storage with no filesystem, so a reader cannot tell
+@@ -801,6 +867,18 @@ test "a control document the guest could be driven by is rejected" {
+             }};
+             break :blk control;
+         } },
++        // Named apart from a malformed URL: this one is well-formed, and the
++        // thing wrong with it is that it is carrying a password into the field
++        // the plan hashes and provenance records verbatim.
++        .{ .expected = error.RepositoryUrlCarriesCredential, .control = blk: {
++            var control = base;
++            control.repositories = &.{.{
++                .id = "base",
++                .urls = &.{"https://builder:hunter2@example.invalid/base"},
++                .trust_base64 = &.{"a2V5"},
++            }};
++            break :blk control;
++        } },
+         .{ .expected = error.InvalidPackageName, .control = blk: {
+             var control = base;
+             control.actions = &.{.{ .install = &.{"--setopt=tsflags=noscripts"} }};
+@@ -1067,3 +1145,71 @@ test "rendered files survive the control round trip" {
+         parsed.value.kernel_module_files[0].contents,
+     );
+ }
++
++test "a credential is rendered where the package manager reads it, not where it is logged" {
++    const allocator = std.testing.allocator;
++    const bare = try renderRepositoryBody(
++        allocator,
++        "base",
++        &.{"https://packages.example.invalid"},
++        null,
++    );
++    defer allocator.free(bare);
++    try std.testing.expectEqualStrings(
++        "[base]\nname=zvmi-base\nenabled=1\ngpgcheck=1\n" ++
++            "baseurl=https://packages.example.invalid\n",
++        bare,
++    );
++
++    // The credential lines come last, so a repository file is the same
++    // document with or without one and diffing the two shows only the addition.
++    const authenticated = try renderRepositoryBody(
++        allocator,
++        "base",
++        &.{ "https://a.example.invalid", "https://b.example.invalid" },
++        .{ .username = "builder", .password = "s3cr3t" },
++    );
++    defer allocator.free(authenticated);
++    try std.testing.expectEqualStrings(
++        "[base]\nname=zvmi-base\nenabled=1\ngpgcheck=1\n" ++
++            "baseurl=https://a.example.invalid https://b.example.invalid\n" ++
++            "username=builder\npassword=s3cr3t\n",
++        authenticated,
++    );
++
++    // Adding a credential adds lines and changes none, so a repository that
++    // starts needing authentication keeps resolving to the same packages.
++    const same_urls = try renderRepositoryBody(
++        allocator,
++        "base",
++        &.{"https://packages.example.invalid"},
++        .{ .username = "builder", .password = "s3cr3t" },
++    );
++    defer allocator.free(same_urls);
++    try std.testing.expect(std.mem.startsWith(u8, same_urls, bare));
++    try std.testing.expectEqualStrings(
++        "username=builder\npassword=s3cr3t\n",
++        same_urls[bare.len..],
++    );
++}
++
++test "only a URL's authority can carry a credential" {
++    // The refusal has to read the authority and stop there. `@` is an ordinary
++    // path character -- a repository laid out per-account, or a mirror using a
++    // package's own name, has one and is carrying nothing.
++    try std.testing.expect(hasUserinfo("https://builder:hunter2@packages.invalid/base"));
++    try std.testing.expect(hasUserinfo("https://token@packages.invalid/base"));
++    try std.testing.expect(hasUserinfo("https://builder:hunter2@packages.invalid"));
++    try std.testing.expect(hasUserinfo("https://builder:p@ss@packages.invalid/base"));
++    try std.testing.expect(!hasUserinfo("https://packages.invalid/base/user@example/rpms"));
++    try std.testing.expect(!hasUserinfo("https://packages.invalid/base?q=user@example"));
++    try std.testing.expect(!hasUserinfo("https://packages.invalid/base#user@example"));
++    try std.testing.expect(!hasUserinfo("https://packages.invalid/base"));
++    try std.testing.expect(!hasUserinfo("not-a-url"));
++
++    // And it has to be part of the shared predicate rather than a separate
++    // check some callers remember, since every caller writes the URL somewhere
++    // that keeps it.
++    try std.testing.expect(!validRepositoryUrl("https://builder:hunter2@packages.invalid/base"));
++    try std.testing.expect(validRepositoryUrl("https://packages.invalid/base/user@example/rpms"));
++}
+diff --git a/zvmiguest/main.zig b/zvmiguest/main.zig
+index dde7d2b..214a949 100644
+--- a/zvmiguest/main.zig
++++ b/zvmiguest/main.zig
+@@ -556,18 +556,9 @@ fn renderRepositoryFile(
+     allocator: Allocator,
+     repository: control_mod.Repository,
+ ) ![]const u8 {
+-    var body: std.array_list.Managed(u8) = .init(allocator);
+-    try body.appendSlice(try std.fmt.allocPrint(
+-        allocator,
+-        "[{s}]\nname=zvmi-{s}\nenabled=1\ngpgcheck=1\nbaseurl=",
+-        .{ repository.id, repository.id },
+-    ));
+-    for (repository.urls, 0..) |url, index| {
+-        if (index != 0) try body.append(' ');
+-        try body.appendSlice(url);
+-    }
+-    try body.append('\n');
+-    return body.items;
++    // The VM backend refuses a credentialed repository at validation, so the
++    // guest has nothing to render and no channel that could have carried it.
++    return control_mod.renderRepositoryBody(allocator, repository.id, repository.urls, null);
+ }
+ 
+ fn renderResolver(allocator: Allocator, config: control_mod.NetworkConfig) ![]const u8 {
