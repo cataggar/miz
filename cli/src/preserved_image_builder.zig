@@ -272,7 +272,10 @@ pub fn main(init: std.process.Init) !void {
     });
     defer resolved.deinit(init.gpa);
     const self_exe = try std.process.executablePathAlloc(init.io, arena);
-    var unsafe_context = UnsafeRuntimeContext{ .self_exe = self_exe };
+    var unsafe_context = UnsafeRuntimeContext{
+        .self_exe = self_exe,
+        .environ = init.minimal.environ,
+    };
     const platform = unsafePlatform(&unsafe_context);
     if (resolved.plan) |*plan| try writePlan(init.gpa, init.io, plan_output_path, plan);
     if (resolved.diagnostics.hasErrors()) {
@@ -766,6 +769,15 @@ fn mapPackagePolicy(
             .id = repository.id,
             .urls = repository.urls,
             .trust = trust,
+            .credential = if (repository.credential) |credential| switch (credential) {
+                .basic => |basic| .{ .basic = .{
+                    .username = basic.username,
+                    .password = switch (basic.password) {
+                        .host_path => |path| .{ .host_path = path },
+                        .host_environment => |name| .{ .host_environment = name },
+                    },
+                } },
+            } else null,
         };
     }
     return .{
@@ -1041,6 +1053,7 @@ fn hashSource(
 
 const UnsafeRuntimeContext = struct {
     self_exe: []const u8,
+    environ: std.process.Environ = .empty,
     availability: ?zvmi.customize.CapabilityState = null,
 };
 
@@ -1079,6 +1092,7 @@ fn runUnsafeChroot(
         .transaction_path = plan.data.transaction_path,
         .plan = plan,
         .target = target,
+        .environ = context.environ,
     });
 }
 
@@ -1464,6 +1478,50 @@ test "package mapping resolves trust sources and execution policies" {
     );
     try std.testing.expectEqualStrings("obsolete", mapped.actions[1].remove[0]);
     try std.testing.expectEqualStrings("1.0-1", mapped.lock.exact[0].version);
+}
+
+test "a credential crosses the wire as a locator the build system never stages" {
+    // Trust material is a `source_index`, so the build system stages a copy of
+    // the file and hashes it into the build graph. A credential must not be:
+    // a copy of a secret in the build cache is a file nobody deletes. So it
+    // crosses as the locator alone, and this test is what keeps the two apart.
+    const policy = wire.PackagePolicy{
+        .actions = &.{.{ .install = &.{"dracut"} }},
+        .repositories = &.{.{
+            .id = "base",
+            .urls = &.{"https://packages.example.invalid"},
+            .trust = &.{.{ .source_index = 0 }},
+            .credential = .{ .basic = .{
+                .username = "builder",
+                .password = .{ .host_environment = "ZVMI_REPOSITORY_TOKEN" },
+            } },
+        }},
+    };
+    const mapped = try mapPackagePolicy(
+        std.testing.allocator,
+        policy,
+        &.{"trust-source"},
+    );
+    defer {
+        std.testing.allocator.free(mapped.actions);
+        std.testing.allocator.free(mapped.repositories[0].trust);
+        std.testing.allocator.free(mapped.repositories);
+    }
+    const credential = mapped.repositories[0].credential orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("builder", credential.basic.username);
+    try std.testing.expectEqualStrings(
+        "ZVMI_REPOSITORY_TOKEN",
+        credential.basic.password.host_environment,
+    );
+
+    // And the staged closure is unchanged by declaring one: the single source
+    // this repository has is its trust material, exactly as before.
+    try std.testing.expectEqual(@as(usize, 1), mapped.repositories[0].trust.len);
+    try std.testing.expectEqualStrings(
+        "trust-source",
+        mapped.repositories[0].trust[0].host_path,
+    );
 }
 
 test "unsafe image basenames are rejected" {

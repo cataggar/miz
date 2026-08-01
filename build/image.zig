@@ -207,10 +207,17 @@ pub const PreservedTrustSource = union(enum) {
     path: std.Build.LazyPath,
 };
 
+pub const PreservedCredentialSource = preserved_image_wire.CredentialSource;
+pub const PreservedBasicCredential = preserved_image_wire.BasicCredential;
+pub const PreservedRepositoryCredential = preserved_image_wire.RepositoryCredential;
+
 pub const PreservedPackageRepository = struct {
     id: []const u8,
     urls: []const []const u8,
     trust: []const PreservedTrustSource = &.{},
+    /// A plain locator rather than a `LazyPath`, so the build system never
+    /// stages, hashes or caches the material a credential names.
+    credential: ?PreservedRepositoryCredential = null,
 };
 
 pub const PreservedPackageCachePolicy = preserved_image_wire.PackageCachePolicy;
@@ -551,6 +558,7 @@ fn materializePreservedConfiguration(
             .id = repository.id,
             .urls = repository.urls,
             .trust = trust,
+            .credential = repository.credential,
         };
     }
 

@@ -30,8 +30,8 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 13;
-pub const provenance_schema_version: u32 = 16;
+pub const plan_schema_version: u32 = 14;
+pub const provenance_schema_version: u32 = 17;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -370,6 +370,16 @@ pub const default_vm_firmware_boot_timeout_seconds: u32 = 1800;
 /// enough that the marker is a marker rather than a transcript.
 pub const max_vm_console_marker_bytes: usize = 256;
 
+/// Bounds on the parts of a credential that are declared rather than read. A
+/// user name or variable name longer than this is a mistake, and refusing it
+/// where it is written beats writing it into a repository file and finding out
+/// from the package manager.
+pub const max_credential_field_bytes: usize = 256;
+
+/// The largest material a credential source may hold. Generous for a password,
+/// tight enough that a misnamed source cannot spool a whole file into memory.
+pub const max_credential_material_bytes: usize = 4096;
+
 pub const PackageAction = union(enum) {
     install: []const []const u8,
     remove: []const []const u8,
@@ -382,10 +392,49 @@ pub const TrustSource = union(enum) {
     host_path: []const u8,
 };
 
+/// Where a credential's material is read from, never the material itself.
+///
+/// Two reasons it is a reference. `writeRequestJson` stringifies the whole
+/// request by reflection, and `writePlanJson` and `writeProvenanceJson` do the
+/// same for what they publish, so secret bytes anywhere in these types would be
+/// emitted by a public API by default rather than by mistake. And a plan hash
+/// covering a password would verify a guess offline, turning a published plan
+/// identifier into an oracle for a low-entropy secret.
+///
+/// So the plan states where the material comes from, the hash covers that, and
+/// provenance records it. What was at the path or in the variable when the run
+/// happened is deliberately not recoverable from any output -- the same stance
+/// the repository policy already takes towards package versions, where the
+/// identifier covers the instruction and not the outcome.
+pub const CredentialSource = union(enum) {
+    /// A file on the build machine, named by absolute path. Read when the run
+    /// needs it and not before.
+    host_path: []const u8,
+    /// An environment variable of the build process, named rather than read at
+    /// request time so the value never enters a serializable type.
+    host_environment: []const u8,
+};
+
+/// HTTP basic authentication. The user name is not a secret and is stated
+/// outright, so a reader can tell which identity a build ran as; only the
+/// password is a reference.
+pub const BasicCredential = struct {
+    username: []const u8,
+    password: CredentialSource,
+};
+
+pub const RepositoryCredential = union(enum) {
+    basic: BasicCredential,
+};
+
 pub const PackageRepository = struct {
     id: []const u8,
     urls: []const []const u8,
     trust: []const TrustSource,
+    /// Authentication for every URL of this repository, or none. Declared per
+    /// repository rather than globally because a credential that applied to
+    /// whichever repository happened to ask would be sent to any of them.
+    credential: ?RepositoryCredential = null,
 };
 
 pub const PackageCachePolicy = enum {
@@ -1223,12 +1272,22 @@ fn validatePackagePolicy(
                 ));
             }
         }
+        // The same predicate the guest applies, rather than a looser one here:
+        // a URL this accepts and the boundary refuses is a plan that resolves,
+        // hashes and then fails once the run is already under way.
         for (repository.urls) |url| {
-            if (url.len == 0 or std.mem.indexOfAny(u8, url, "\r\n\x00") != null) {
+            if (vm_control.hasUserinfo(url)) {
                 try diagnostics.append(validationError(
                     .invalid_policy,
                     "/packages/repositories/urls",
-                    "repository URLs must be non-empty single-line values",
+                    "a repository URL must not carry a userinfo component",
+                    "declare the credential under the repository instead; a URL is hashed into the plan and recorded in provenance verbatim",
+                ));
+            } else if (!vm_control.validRepositoryUrl(url)) {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/packages/repositories/urls",
+                    "repository URLs must be single-line http, https or file URLs",
                     null,
                 ));
             }
@@ -1241,6 +1300,9 @@ fn validatePackagePolicy(
                 try diagnostics.append(validationError(.invalid_policy, "/packages/repositories/trust", "trust source paths must not be empty", null));
             },
         };
+        if (repository.credential) |credential| {
+            try validateRepositoryCredential(diagnostics, credential, repository.urls);
+        }
     }
     switch (policy.lock) {
         .unlocked => {},
@@ -1273,6 +1335,102 @@ fn validatePackagePolicy(
             )),
         },
     }
+}
+
+/// A credential is sent to every URL of its repository, so every URL has to be
+/// one that can carry it and one it is safe to send to.
+fn validateRepositoryCredential(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    credential: RepositoryCredential,
+    urls: []const []const u8,
+) !void {
+    switch (credential) {
+        .basic => |basic| {
+            // The user name is written as its own line in a tdnf repository
+            // file, so anything that could end the line or start a second
+            // directive would be a way to configure the package manager.
+            if (basic.username.len == 0 or
+                basic.username.len > max_credential_field_bytes or
+                !isSingleLinePrintable(basic.username))
+            {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/packages/repositories/credential/basic/username",
+                    "a user name must be a non-empty single-line printable value",
+                    null,
+                ));
+            }
+            try validateCredentialSource(
+                diagnostics,
+                basic.password,
+                "/packages/repositories/credential/basic/password",
+            );
+        },
+    }
+
+    for (urls) |url| {
+        if (std.mem.startsWith(u8, url, "https://")) continue;
+        // Basic authentication puts the password on the wire under nothing but
+        // base64, so a plaintext URL sends it to anyone on the path; a
+        // `file://` URL cannot carry it at all, and a credential declared
+        // against one would be a policy stated and never applied. Both are
+        // refused where they are written rather than discovered afterwards.
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/packages/repositories/urls",
+            "a repository with a declared credential must use https for every URL",
+            "use https, or remove the credential if the repository needs none",
+        ));
+        break;
+    }
+}
+
+fn validateCredentialSource(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    source: CredentialSource,
+    path: []const u8,
+) !void {
+    switch (source) {
+        // Absolute, because the material is read by the run rather than by the
+        // caller, and a relative path would name a different file depending on
+        // where the build happened to be started from.
+        .host_path => |file| if (file.len == 0 or
+            file.len > Io.Dir.max_path_bytes or
+            !std.fs.path.isAbsolute(file) or
+            !isSingleLinePrintable(file))
+        {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                path,
+                "a credential file must be named by an absolute single-line path",
+                null,
+            ));
+        },
+        .host_environment => |name| if (!isValidEnvironmentName(name)) {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                path,
+                "a credential environment variable must be named [A-Za-z_][A-Za-z0-9_]*",
+                null,
+            ));
+        },
+    }
+}
+
+fn isSingleLinePrintable(text: []const u8) bool {
+    for (text) |byte| {
+        if (byte < 0x20 or byte == 0x7F) return false;
+    }
+    return true;
+}
+
+fn isValidEnvironmentName(name: []const u8) bool {
+    if (name.len == 0 or name.len > max_credential_field_bytes) return false;
+    if (!std.ascii.isAlphabetic(name[0]) and name[0] != '_') return false;
+    for (name[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_') return false;
+    }
+    return true;
 }
 
 fn validateHooks(
@@ -1524,6 +1682,21 @@ fn validateVmPolicy(
                 "declare the repositories the guest may reach or select offline networking",
             ));
         },
+    }
+    // Credential material reaches a guest only through the control document,
+    // which this slice does not carry it in. Refused where it is written
+    // rather than ignored during the run: a declared credential that never
+    // reaches the package manager is an authenticated repository failing with
+    // an authentication error, and the plan would say it had one.
+    for (request.packages.repositories) |repository| {
+        if (repository.credential == null) continue;
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/packages/repositories/credential",
+            "the vm backend cannot yet carry credential material to the guest",
+            "use the unsafe_chroot backend for authenticated repositories",
+        ));
+        break;
     }
     // A resolver the chroot backend reaches happily can mean something else
     // entirely from a guest behind user-mode networking, which would make one
@@ -2092,6 +2265,21 @@ pub const CapabilityKind = enum {
     /// consumer that requires every input to come from the request can refuse
     /// exactly this.
     read_host_resolver,
+    /// A credential's material is read from the build machine -- a file it
+    /// names or a variable of the build process -- rather than carried in the
+    /// request. The plan states which, and this names it so a consumer that
+    /// requires every input to come from the request can refuse it.
+    ///
+    /// The material itself is deliberately nowhere: not in the request, not
+    /// under the plan hash, not in provenance. The `path` here is the locator,
+    /// which is the part that can be published.
+    ///
+    /// Like `read_host_resolver` this is a declaration rather than a probe. A
+    /// preflight that opened the file would make the capability a blocking
+    /// check on a secret's presence, which is a different question from
+    /// whether the plan is allowed to read one -- and would have to open it
+    /// long before the run needs it.
+    read_host_credential,
     script_execution,
     guest_execution,
     initramfs_regeneration,
@@ -2875,6 +3063,28 @@ fn dupePackagePolicy(
             .id = try allocator.dupe(u8, repository.id),
             .urls = try dupeStrings(allocator, repository.urls),
             .trust = trust,
+            .credential = if (repository.credential) |credential| switch (credential) {
+                .basic => |basic| .{
+                    .basic = .{
+                        .username = try allocator.dupe(u8, basic.username),
+                        // Not resolved against `base_path`, unlike a trust
+                        // path. Validation demands an absolute path precisely so
+                        // that it is not build-relative: trust material sits
+                        // beside the build file and is meant to, a credential
+                        // never should, and a relative one silently reading a
+                        // file out of the source tree is the mistake worth
+                        // making impossible.
+                        .password = switch (basic.password) {
+                            .host_path => |path| .{
+                                .host_path = try allocator.dupe(u8, path),
+                            },
+                            .host_environment => |name| .{
+                                .host_environment = try allocator.dupe(u8, name),
+                            },
+                        },
+                    },
+                },
+            } else null,
         };
     }
     const lock: PackageLockPolicy = switch (policy.lock) {
@@ -3506,6 +3716,31 @@ fn buildCapabilities(
             .reason = "resolve package repository names through the build host's resolver",
         });
     }
+    // One per declared source rather than one for the set, because the point
+    // is to name each thing the run will read: a consumer refusing host inputs
+    // needs to see which file or variable, not merely that there was one.
+    for (packages.repositories) |repository| {
+        const credential = repository.credential orelse continue;
+        const source = switch (credential) {
+            .basic => |basic| basic.password,
+        };
+        try capabilities.append(.{
+            .kind = .read_host_credential,
+            .path = switch (source) {
+                .host_path => |file| file,
+                .host_environment => |name| try std.fmt.allocPrint(
+                    allocator,
+                    "env:{s}",
+                    .{name},
+                ),
+            },
+            .reason = try std.fmt.allocPrint(
+                allocator,
+                "authenticate to the declared repository '{s}'",
+                .{repository.id},
+            ),
+        });
+    }
     if (hooks.len != 0) {
         try capabilities.append(.{ .kind = .script_execution, .path = "", .reason = "execute explicitly acknowledged scripts using an unsafe-capable backend" });
         try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "execute target hook code" });
@@ -3951,6 +4186,23 @@ fn hashPackagePolicy(hash: *std.crypto.hash.sha2.Sha256, policy: PackagePolicy) 
             switch (trust) {
                 .inline_bytes => |bytes| hashString(hash, bytes),
                 .host_path => |path| hashString(hash, path),
+            }
+        }
+        // Where the credential comes from, never what it is -- there is no
+        // material in these types to hash, by construction. A plan hash that
+        // covered a password would verify a guess of it offline.
+        hashInt(hash, @intFromBool(repository.credential != null));
+        if (repository.credential) |credential| {
+            hashInt(hash, @intFromEnum(std.meta.activeTag(credential)));
+            switch (credential) {
+                .basic => |basic| {
+                    hashString(hash, basic.username);
+                    hashInt(hash, @intFromEnum(std.meta.activeTag(basic.password)));
+                    switch (basic.password) {
+                        .host_path => |path| hashString(hash, path),
+                        .host_environment => |name| hashString(hash, name),
+                    }
+                },
             }
         }
     }
@@ -4551,6 +4803,9 @@ fn systemCapabilityCheck(_: ?*anyopaque, io: Io, requirement: CapabilityRequirem
         // `missing` here would refuse runs that never read the file. Naming
         // it in the plan is the whole job.
         .read_host_resolver,
+        // Same reasoning, and one more: probing would mean opening a secret to
+        // decide whether the plan may open it.
+        .read_host_credential,
         => .available,
         .rebuild,
         .unsafe_chroot,
@@ -9301,6 +9556,335 @@ test "a guest cannot be pointed at its own network's alias for this machine" {
     var diagnostics = try validate(std.testing.allocator, &accepted);
     defer diagnostics.deinit(std.testing.allocator);
     try std.testing.expect(!diagnostics.hasErrors());
+}
+
+test "a repository credential is declared by reference and never by value" {
+    // The structural guarantee the rest of this test rests on. Every writer in
+    // this module stringifies whole types by reflection, so an arm holding
+    // bytes would be published by a public API by default. Adding one has to
+    // fail here rather than in a customer's provenance document.
+    inline for (@typeInfo(CredentialSource).@"union".fields) |field| {
+        comptime std.debug.assert(
+            std.mem.eql(u8, field.name, "host_path") or
+                std.mem.eql(u8, field.name, "host_environment"),
+        );
+    }
+
+    const repositories = [_]PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+        .credential = .{ .basic = .{
+            .username = "builder",
+            .password = .{ .host_environment = "ZVMI_REPOSITORY_TOKEN" },
+        } },
+    }};
+    var request = whenNeededRequest();
+    request.packages = .{
+        .actions = &.{.{ .install = &.{"dracut"} }},
+        .repositories = &repositories,
+    };
+    var resolved = try resolve(
+        std.testing.allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    const plan = resolved.plan orelse return error.TestUnexpectedResult;
+
+    // Where the material comes from is recorded everywhere, because a reader
+    // has to be able to tell which identity a build ran as and what it read.
+    inline for (.{ "request", "plan" }) |which| {
+        var output: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        if (comptime std.mem.eql(u8, which, "request")) {
+            try writeRequestJson(request, &output.writer);
+        } else {
+            try writePlanJson(&plan, &output.writer);
+        }
+        const json = output.written();
+        try std.testing.expect(
+            std.mem.indexOf(u8, json, "ZVMI_REPOSITORY_TOKEN") != null,
+        );
+        try std.testing.expect(std.mem.indexOf(u8, json, "builder") != null);
+    }
+
+    // Reading it is a declared capability, named one source at a time so a
+    // consumer refusing host inputs can see which variable, not merely that
+    // there was one. `env:` distinguishes a variable from a path, since a
+    // relative path is refused and so cannot collide with the prefix.
+    var found: usize = 0;
+    for (plan.data.required_capabilities) |capability| {
+        if (capability.kind != .read_host_credential) continue;
+        found += 1;
+        try std.testing.expectEqualStrings("env:ZVMI_REPOSITORY_TOKEN", capability.path);
+    }
+    try std.testing.expectEqual(@as(usize, 1), found);
+
+    // The hash covers the source, so pointing a build at a different variable
+    // is a different plan -- but there is no material in these types to hash,
+    // which is what keeps a published plan identifier from verifying a guess
+    // of a low-entropy password offline.
+    var elsewhere = [_]PackageRepository{repositories[0]};
+    elsewhere[0].credential = .{ .basic = .{
+        .username = "builder",
+        .password = .{ .host_environment = "ZVMI_OTHER_TOKEN" },
+    } };
+    var moved = request;
+    moved.packages = .{
+        .actions = &.{.{ .install = &.{"dracut"} }},
+        .repositories = &elsewhere,
+    };
+    var moved_resolved = try resolve(
+        std.testing.allocator,
+        &moved,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer moved_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &plan.data.plan_hash.bytes,
+        &moved_resolved.plan.?.data.plan_hash.bytes,
+    ));
+
+    // And declaring none is a different plan again, so a credential cannot be
+    // added to a build without changing its identifier.
+    var bare = [_]PackageRepository{repositories[0]};
+    bare[0].credential = null;
+    var bare_request = request;
+    bare_request.packages = .{
+        .actions = &.{.{ .install = &.{"dracut"} }},
+        .repositories = &bare,
+    };
+    var bare_resolved = try resolve(
+        std.testing.allocator,
+        &bare_request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer bare_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &plan.data.plan_hash.bytes,
+        &bare_resolved.plan.?.data.plan_hash.bytes,
+    ));
+    for (bare_resolved.plan.?.data.required_capabilities) |capability| {
+        try std.testing.expect(capability.kind != .read_host_credential);
+    }
+}
+
+test "a credential is refused where it could not be kept secret" {
+    const Case = struct {
+        credential: RepositoryCredential,
+        url: []const u8,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        // Basic authentication puts the password on the wire, so a plaintext
+        // URL for a credentialed repository leaks it to anyone on the path.
+        .{
+            .credential = .{ .basic = .{
+                .username = "builder",
+                .password = .{ .host_environment = "ZVMI_REPOSITORY_TOKEN" },
+            } },
+            .url = "http://packages.example.invalid",
+            .expected = "https",
+        },
+        // A `file://` repository cannot carry a credential at all, so one
+        // declared against it is a mistake about what the build will do.
+        .{
+            .credential = .{ .basic = .{
+                .username = "builder",
+                .password = .{ .host_path = "/run/secrets/token" },
+            } },
+            .url = "file:///srv/packages",
+            .expected = "https",
+        },
+        // Read by the run rather than by the caller, so a relative path would
+        // name a different file depending on where the build was started.
+        .{
+            .credential = .{ .basic = .{
+                .username = "builder",
+                .password = .{ .host_path = "secrets/token" },
+            } },
+            .url = "https://packages.example.invalid",
+            .expected = "absolute",
+        },
+        .{
+            .credential = .{ .basic = .{
+                .username = "builder",
+                .password = .{ .host_environment = "2TOKEN" },
+            } },
+            .url = "https://packages.example.invalid",
+            .expected = "environment variable",
+        },
+        .{
+            .credential = .{ .basic = .{
+                .username = "builder",
+                .password = .{ .host_environment = "TOKEN=x" },
+            } },
+            .url = "https://packages.example.invalid",
+            .expected = "environment variable",
+        },
+        // A newline in the user name would end the `username=` line and let
+        // whatever followed be read back as repository configuration.
+        .{
+            .credential = .{ .basic = .{
+                .username = "builder\nenabled=0",
+                .password = .{ .host_path = "/run/secrets/token" },
+            } },
+            .url = "https://packages.example.invalid",
+            .expected = "user name",
+        },
+        .{
+            .credential = .{ .basic = .{
+                .username = "",
+                .password = .{ .host_path = "/run/secrets/token" },
+            } },
+            .url = "https://packages.example.invalid",
+            .expected = "user name",
+        },
+    };
+    for (cases) |case| {
+        const repositories = [_]PackageRepository{.{
+            .id = "base",
+            .urls = &.{case.url},
+            .trust = &.{.{ .inline_bytes = "test key" }},
+            .credential = case.credential,
+        }};
+        var request = whenNeededRequest();
+        request.packages = .{
+            .actions = &.{.{ .install = &.{"dracut"} }},
+            .repositories = &repositories,
+        };
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(diagnostics.hasErrors());
+        var named = false;
+        for (diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, case.expected) != null) {
+                named = true;
+            }
+        }
+        try std.testing.expect(named);
+    }
+}
+
+test "the vm backend refuses a credential it has no channel to carry" {
+    const repositories = [_]PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+        .credential = .{ .basic = .{
+            .username = "builder",
+            .password = .{ .host_environment = "ZVMI_REPOSITORY_TOKEN" },
+        } },
+    }};
+    var request = whenNeededRequest();
+    request.execution.backend = .vm;
+    request.execution.vm = .{ .emulator_command = "/usr/bin/qemu-system-x86_64" };
+    request.packages = .{
+        .actions = &.{.{ .install = &.{"dracut"} }},
+        .repositories = &repositories,
+    };
+    var diagnostics = try validate(std.testing.allocator, &request);
+    defer diagnostics.deinit(std.testing.allocator);
+    try std.testing.expect(diagnostics.hasErrors());
+    var named = false;
+    for (diagnostics.items) |diagnostic| {
+        if (std.mem.indexOf(u8, diagnostic.message, "credential material") != null) {
+            named = true;
+        }
+    }
+    try std.testing.expect(named);
+
+    // The same policy on the backend that can honour it is accepted, so the
+    // refusal is about the channel and not about the credential.
+    var chroot = request;
+    chroot.execution.backend = whenNeededRequest().execution.backend;
+    chroot.execution.vm = null;
+    var accepted = try validate(std.testing.allocator, &chroot);
+    defer accepted.deinit(std.testing.allocator);
+    try std.testing.expect(!accepted.hasErrors());
+}
+
+test "a repository URL cannot smuggle a credential past the declaration" {
+    // Everything about a repository is kept: the URL is hashed into the plan
+    // identifier, written out verbatim by `writeRequestJson` and
+    // `writePlanJson`, and recorded in provenance. A password in the authority
+    // would be published by all three, and would be the one way a secret could
+    // reach a run without being declared at all.
+    const smuggled = [_][]const u8{
+        "https://builder:hunter2@packages.example.invalid",
+        "https://token@packages.example.invalid",
+        "http://builder:hunter2@packages.example.invalid/base",
+    };
+    for (smuggled) |url| {
+        const repositories = [_]PackageRepository{.{
+            .id = "base",
+            .urls = &.{url},
+            .trust = &.{.{ .inline_bytes = "test key" }},
+        }};
+        var request = whenNeededRequest();
+        request.packages = .{
+            .actions = &.{.{ .install = &.{"dracut"} }},
+            .repositories = &repositories,
+        };
+        var resolved = try resolve(
+            std.testing.allocator,
+            &request,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer resolved.deinit(std.testing.allocator);
+        try std.testing.expect(resolved.plan == null);
+        var named_userinfo = false;
+        for (resolved.diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, "userinfo") != null) {
+                named_userinfo = true;
+            }
+        }
+        try std.testing.expect(named_userinfo);
+    }
+
+    // An `@` in the path is not a credential, and refusing it would refuse
+    // repositories that are laid out per-account.
+    const path_at = [_]PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid/user@example/rpms"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    var accepted = whenNeededRequest();
+    accepted.packages = .{
+        .actions = &.{.{ .install = &.{"dracut"} }},
+        .repositories = &path_at,
+    };
+    var resolved = try resolve(
+        std.testing.allocator,
+        &accepted,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.plan != null);
+
+    // The request validator and the two privilege boundaries share one
+    // predicate, so a URL cannot be accepted here and refused once the run is
+    // already under way.
+    const scheme = [_]PackageRepository{.{
+        .id = "base",
+        .urls = &.{"ftp://packages.example.invalid/base"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    var wrong_scheme = whenNeededRequest();
+    wrong_scheme.packages = .{
+        .actions = &.{.{ .install = &.{"dracut"} }},
+        .repositories = &scheme,
+    };
+    var scheme_resolved = try resolve(
+        std.testing.allocator,
+        &wrong_scheme,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer scheme_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(scheme_resolved.plan == null);
 }
 
 fn hasCapabilityKind(

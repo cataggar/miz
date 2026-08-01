@@ -23,6 +23,8 @@ pub const ParentOptions = struct {
     transaction_path: []const u8,
     plan: *const customize.ResolvedPlan,
     target: preserved_image.RawMutationTarget,
+    /// Read only for the variables a declared credential names.
+    environ: std.process.Environ = .empty,
 };
 
 const Manifest = struct {
@@ -133,13 +135,14 @@ pub fn runParent(
         "--unsafe-chroot-worker",
         manifest_path,
     };
-    var environment = std.process.Environ.Map.init(allocator);
+    var environment = try baseEnvironment(allocator);
     defer environment.deinit();
-    try environment.put("HOME", "/root");
-    try environment.put("LANG", "C");
-    try environment.put("LC_ALL", "C");
-    try environment.put("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
-    try environment.put("TERM", "dumb");
+    // The worker's environment is built rather than inherited, so a declared
+    // credential variable has to be forwarded by name. The exception is exactly
+    // as wide as the plan says it is, and the plan hash covers the names. It
+    // goes no further: the worker builds a fresh environment for every command
+    // it runs, from `baseEnvironment` alone.
+    try forwardCredentialVariables(allocator, options.environ, &environment, manifest);
     var child = std.process.spawn(io, .{
         .argv = &argv,
         .environ_map = &environment,
@@ -211,7 +214,7 @@ pub fn workerMain(init: std.process.Init, manifest_path: []const u8) !void {
         allocator,
         init.io,
         parsed.value,
-        Executor.system(),
+        Executor.system(init.minimal.environ),
     );
     if (result.cleanup_complete) {
         if (result.operation_succeeded) {
@@ -478,7 +481,7 @@ const Session = struct {
             defer self.allocator.free(resolver_run_path);
             switch (self.manifest.packages.resolver) {
                 .host_resolver => {
-                    try writeBytesExclusive(self.io, resolver_run_path, "");
+                    try writeBytesExclusive(self.io, resolver_run_path, "", default_repository_permissions);
                     try self.runSuccess(&.{
                         findTool(self.io, mount_candidates).?,
                         "--bind",
@@ -502,7 +505,7 @@ const Session = struct {
                         nameservers,
                     );
                     defer self.allocator.free(body);
-                    try writeBytesExclusive(self.io, resolver_run_path, body);
+                    try writeBytesExclusive(self.io, resolver_run_path, body, default_repository_permissions);
                 },
             }
             const resolver_stat = Io.Dir.cwd().statFile(
@@ -855,6 +858,7 @@ const Session = struct {
             self.io,
             config_path,
             "[main]\ngpgcheck=1\nreposdir=/run/zvmi-repos\n",
+            default_repository_permissions,
         );
         for (self.manifest.packages.repositories) |repository| {
             const path = try repositoryHostPath(
@@ -863,18 +867,97 @@ const Session = struct {
                 repository.id,
             );
             defer self.allocator.free(path);
-            var output: Io.Writer.Allocating = .init(self.allocator);
-            defer output.deinit();
-            try output.writer.print(
-                "[{s}]\nname=zvmi-{s}\nenabled=1\ngpgcheck=1\nbaseurl=",
-                .{ repository.id, repository.id },
-            );
-            for (repository.urls, 0..) |url, index| {
-                if (index != 0) try output.writer.writeByte(' ');
-                try output.writer.writeAll(url);
+            var material: ?vm_control.BasicMaterial = null;
+            defer if (material) |resolved| {
+                // The only copy this process makes of the material. tdnf reads
+                // it back from the file, which lives on the private tmpfs at
+                // <root>/run and is unmounted before anything is published.
+                @memset(@constCast(resolved.password), 0);
+                self.allocator.free(resolved.password);
+            };
+            if (repository.credential) |credential| {
+                material = switch (credential) {
+                    .basic => |basic| .{
+                        .username = basic.username,
+                        .password = try self.readCredentialMaterial(basic.password),
+                    },
+                };
             }
-            try output.writer.writeByte('\n');
-            try writeBytesExclusive(self.io, path, output.written());
+            const body = try vm_control.renderRepositoryBody(
+                self.allocator,
+                repository.id,
+                repository.urls,
+                material,
+            );
+            defer {
+                @memset(body, 0);
+                self.allocator.free(body);
+            }
+            try writeBytesExclusive(self.io, path, body, if (material == null)
+                default_repository_permissions
+            else
+                credentialed_repository_permissions);
+        }
+    }
+
+    /// Resolved here, in the worker, and never earlier: the material must not
+    /// exist in the parent's address space, in the manifest, or in any argv.
+    fn readCredentialMaterial(
+        self: *Session,
+        source: customize.CredentialSource,
+    ) ![]u8 {
+        switch (source) {
+            .host_path => |host_path| {
+                const bytes = Io.Dir.cwd().readFileAlloc(
+                    self.io,
+                    host_path,
+                    self.allocator,
+                    .limited(customize.max_credential_material_bytes),
+                ) catch return error.CredentialSourceUnreadable;
+                // Unconditional, not an `errdefer`: the untrimmed read is a
+                // copy of the secret and does not outlive this function on
+                // either path.
+                defer {
+                    @memset(bytes, 0);
+                    self.allocator.free(bytes);
+                }
+                const trimmed = std.mem.trimEnd(u8, bytes, "\r\n");
+                if (!validCredentialMaterial(trimmed)) {
+                    return error.CredentialMaterialUnusable;
+                }
+                // Copied to an exact allocation rather than resized in place:
+                // a shrunk slice whose length no longer matches its allocation
+                // is freed at the wrong size. The untrimmed read is zeroed, so
+                // the extra copy is not an extra copy left behind.
+                const material = try self.allocator.alloc(u8, trimmed.len);
+                @memcpy(material, trimmed);
+                return material;
+            },
+            .host_environment => |name| {
+                const value = std.process.Environ.getAlloc(
+                    self.executor.environ,
+                    self.allocator,
+                    name,
+                ) catch return error.CredentialSourceUnreadable;
+                errdefer {
+                    @memset(value, 0);
+                    self.allocator.free(value);
+                }
+                if (!validCredentialMaterial(value)) {
+                    return error.CredentialMaterialUnusable;
+                }
+                // Consumed, so it stops existing. The worker is PID 1 in the
+                // namespace and mounts a real `proc` inside the target root, so
+                // a variable left in its own environment is readable through
+                // `/proc/1/environ` by everything that runs in the chroot
+                // afterwards -- including package scriptlets and dracut
+                // modules, which are target-supplied code running as root, and
+                // which run after the repository file has been deleted. Nothing
+                // has entered the chroot yet at this point: this is the first
+                // step of `runPolicy`, and `open` ran only host binaries.
+                scrubEnvironmentValue(self.executor.environ, name);
+                return value;
+            },
         }
     }
 
@@ -1267,6 +1350,10 @@ const CommandResult = struct {
 
 const Executor = struct {
     context: ?*anyopaque = null,
+    /// Reading a variable is reaching outside this process's declared inputs,
+    /// exactly like running a command, so it belongs to the same seam. Tests
+    /// get `.empty` and so cannot accidentally read the developer's shell.
+    environ: std.process.Environ = .empty,
     runFn: *const fn (
         context: ?*anyopaque,
         allocator: Allocator,
@@ -1276,8 +1363,8 @@ const Executor = struct {
         stdin_file: ?Io.File,
     ) anyerror!CommandResult,
 
-    fn system() Executor {
-        return .{ .runFn = runSystem };
+    fn system(environ: std.process.Environ) Executor {
+        return .{ .runFn = runSystem, .environ = environ };
     }
 
     fn run(
@@ -1299,6 +1386,25 @@ const Executor = struct {
     }
 };
 
+/// The environment the worker runs under, and the environment it hands to every
+/// command it runs. Built rather than inherited in both directions. A credential
+/// variable is forwarded into the first and deliberately not into the second:
+/// the worker consumes it, and nothing it spawns -- least of all a package
+/// scriptlet or a dracut module, which are target-supplied code running as root
+/// against the image about to be published -- ever sees it. The repository file
+/// is deleted before the initramfs is regenerated; a variable left in the
+/// environment would have outlived the channel it was meant to travel on.
+fn baseEnvironment(allocator: Allocator) !std.process.Environ.Map {
+    var environment = std.process.Environ.Map.init(allocator);
+    errdefer environment.deinit();
+    try environment.put("HOME", "/root");
+    try environment.put("LANG", "C");
+    try environment.put("LC_ALL", "C");
+    try environment.put("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+    try environment.put("TERM", "dumb");
+    return environment;
+}
+
 fn runSystem(
     _: ?*anyopaque,
     allocator: Allocator,
@@ -1307,9 +1413,12 @@ fn runSystem(
     capture_output: bool,
     stdin_file: ?Io.File,
 ) !CommandResult {
+    var environment = try baseEnvironment(allocator);
+    defer environment.deinit();
     if (!capture_output) {
         var child = try std.process.spawn(io, .{
             .argv = argv,
+            .environ_map = &environment,
             .stdin = if (stdin_file) |file| .{ .file = file } else .ignore,
             .stdout = .inherit,
             .stderr = .inherit,
@@ -1324,6 +1433,7 @@ fn runSystem(
     if (stdin_file) |file| {
         var child = try std.process.spawn(io, .{
             .argv = argv,
+            .environ_map = &environment,
             .stdin = .{ .file = file },
             .stdout = .pipe,
             .stderr = .pipe,
@@ -1364,6 +1474,7 @@ fn runSystem(
     }
     const result = try std.process.run(allocator, io, .{
         .argv = argv,
+        .environ_map = &environment,
         .stdout_limit = .limited(max_command_output),
         .stderr_limit = .limited(max_command_output),
     });
@@ -1449,6 +1560,44 @@ fn validateManifestPolicy(manifest: Manifest) !void {
     }
     for (manifest.packages.repositories) |repository| {
         if (!validRepositoryId(repository.id)) return error.InvalidRepositoryId;
+        // The worker re-reads this manifest from JSON after re-execing as
+        // root, so it checks the URLs on its own side of the boundary rather
+        // than trusting the validator that already did. A userinfo component
+        // is the case worth naming: it is a credential in the one field that
+        // is hashed, published and kept in provenance verbatim.
+        for (repository.urls) |url| {
+            if (vm_control.hasUserinfo(url)) return error.RepositoryUrlCarriesCredential;
+            if (!vm_control.validRepositoryUrl(url)) return error.InvalidRepositoryUrl;
+            // Basic authentication puts the password on the wire, so a
+            // credentialed repository has to be reached over TLS. Re-checked
+            // here because the URL and the credential arrive together in a
+            // document this side of the boundary did not write.
+            if (repository.credential != null and
+                !std.mem.startsWith(u8, url, "https://"))
+            {
+                return error.CredentialedRepositoryNotEncrypted;
+            }
+        }
+        if (repository.credential) |credential| switch (credential) {
+            .basic => |basic| {
+                if (!validCredentialField(
+                    basic.username,
+                    customize.max_credential_field_bytes,
+                )) {
+                    return error.InvalidCredentialUsername;
+                }
+                switch (basic.password) {
+                    .host_path => |path| if (!std.fs.path.isAbsolute(path) or
+                        !validCredentialField(path, Io.Dir.max_path_bytes))
+                    {
+                        return error.InvalidCredentialSource;
+                    },
+                    .host_environment => |name| if (!validEnvironmentName(name)) {
+                        return error.InvalidCredentialSource;
+                    },
+                }
+            },
+        };
     }
     var needs_repository = false;
     for (manifest.packages.actions) |action| {
@@ -1642,9 +1791,97 @@ fn writeBytes(io: Io, path: []const u8, bytes: []const u8) !void {
     try file.writePositionalAll(io, bytes, 0);
 }
 
-fn writeBytesExclusive(io: Io, path: []const u8, bytes: []const u8) !void {
+const default_repository_permissions: Io.File.Permissions = .default_file;
+/// umask can only clear bits, so this is 0o600 or narrower however the caller's
+/// process is configured. It can never come out more permissive.
+const credentialed_repository_permissions: Io.File.Permissions = .fromMode(0o600);
+
+/// tdnf reads a repository file as INI, so a newline or a NUL in the material
+/// would end the `password=` line and let the rest be read as configuration.
+fn validCredentialMaterial(bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    if (bytes.len > customize.max_credential_material_bytes) return false;
+    for (bytes) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return false;
+    }
+    return true;
+}
+
+/// `limit` rather than one constant, because a path and a user name are bounded
+/// by different things. Both bounds are the request validator's, so this side of
+/// the privilege boundary refuses exactly what that side refuses and no more: a
+/// rule that is stricter here would accept a request and then fail it after the
+/// workspace has been copied and the image staged.
+fn validCredentialField(text: []const u8, limit: usize) bool {
+    if (text.len == 0 or text.len > limit) return false;
+    for (text) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return false;
+    }
+    return true;
+}
+
+fn validEnvironmentName(name: []const u8) bool {
+    if (name.len == 0 or name.len > customize.max_credential_field_bytes) return false;
+    if (std.ascii.isDigit(name[0])) return false;
+    for (name) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_') return false;
+    }
+    return true;
+}
+
+/// Overwrites a variable's value in the process's own environment block, in
+/// place. The name is left behind because it is not a secret and is already in
+/// the plan; only the material goes.
+///
+/// This narrows the window rather than making the backend safe. `unsafe_chroot`
+/// runs package scriptlets as root against the host kernel and says so: code
+/// that wants the credential can leave the chroot and read the file a
+/// `host_path` credential names. The point is that a secret should not sit in a
+/// process image for the length of a run when the run needed it once.
+fn scrubEnvironmentValue(environ: std.process.Environ, name: []const u8) void {
+    if (builtin.os.tag == .windows) return;
+    const value = std.process.Environ.getPosix(environ, name) orelse return;
+    @memset(@constCast(value), 0);
+}
+
+/// Copies the value of every variable a declared credential names into the
+/// worker's environment, and refuses now rather than after the image has been
+/// mounted and half mutated. An unset variable is a declaration the host cannot
+/// honour, which is a refusal, not an empty password.
+fn forwardCredentialVariables(
+    allocator: Allocator,
+    environ: std.process.Environ,
+    map: *std.process.Environ.Map,
+    manifest: Manifest,
+) !void {
+    for (manifest.packages.repositories) |repository| {
+        const credential = repository.credential orelse continue;
+        const name = switch (credential) {
+            .basic => |basic| switch (basic.password) {
+                .host_environment => |name| name,
+                .host_path => continue,
+            },
+        };
+        const value = std.process.Environ.getAlloc(environ, allocator, name) catch
+            return error.CredentialSourceUnreadable;
+        defer {
+            @memset(value, 0);
+            allocator.free(value);
+        }
+        if (!validCredentialMaterial(value)) return error.CredentialMaterialUnusable;
+        try map.put(name, value);
+    }
+}
+
+fn writeBytesExclusive(
+    io: Io,
+    path: []const u8,
+    bytes: []const u8,
+    permissions: Io.File.Permissions,
+) !void {
     const file = try Io.Dir.cwd().createFile(io, path, .{
         .exclusive = true,
+        .permissions = permissions,
     });
     defer file.close(io);
     try file.writePositionalAll(io, bytes, 0);
@@ -2221,6 +2458,395 @@ test "worker executes policy with strict reverse cleanup" {
     try std.testing.expect(missing_resolver.cleanup_complete);
 }
 
+test "a credential reaches tdnf without reaching anything that outlives the run" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root_path = "test-unsafe-chroot-credential-root";
+    const raw_path = "test-unsafe-chroot-credential-stage.raw";
+    const secret_path = "test-unsafe-chroot-credential-secret";
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, secret_path) catch {};
+    const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+        .exclusive = true,
+        .read = true,
+    });
+    try raw_file.setLength(io, 8192);
+    const raw_inode = (try raw_file.stat(io)).inode;
+    raw_file.close(io);
+
+    // A trailing newline, because a secret in a file almost always has one and
+    // sending it to the server would fail in a way nobody could read.
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = secret_path,
+        .data = "s3cr3t-from-a-file\n",
+    });
+    var cwd_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_length = try std.process.currentPath(io, &cwd_buffer);
+    const absolute_secret = try std.fs.path.join(
+        allocator,
+        &.{ cwd_buffer[0..cwd_length], secret_path },
+    );
+
+    const repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+        .credential = .{ .basic = .{
+            .username = "builder",
+            .password = .{ .host_path = absolute_secret },
+        } },
+    }};
+    const manifest = Manifest{
+        .raw_path = raw_path,
+        .root_path = root_path,
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = raw_inode,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{
+            .actions = &.{.{ .install = &.{"dracut"} }},
+            .repositories = &repositories,
+        },
+        .initramfs = .unchanged,
+    };
+
+    var context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+    };
+    const result = try executeManifest(allocator, io, manifest, .{
+        .context = &context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expect(result.operation_succeeded);
+    try std.testing.expect(result.cleanup_complete);
+
+    // The material arrives, trimmed of the newline the file carried.
+    const seen = context.repository_at_tdnf orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(
+        "[base]\nname=zvmi-base\nenabled=1\ngpgcheck=1\n" ++
+            "baseurl=https://packages.example.invalid\n" ++
+            "username=builder\npassword=s3cr3t-from-a-file\n",
+        seen,
+    );
+    // And arrives in a file only its owner can read, unlike every other
+    // repository file, which carries nothing worth protecting.
+    try std.testing.expectEqual(@as(?u32, 0o600), context.repository_mode_at_tdnf);
+
+    // The one place a secret would be published: the report is what provenance
+    // is built from, and every argv in it is recorded verbatim.
+    for (result.report.tools) |tool| {
+        for (tool.command) |argument| {
+            try std.testing.expect(
+                std.mem.indexOf(u8, argument, "s3cr3t-from-a-file") == null,
+            );
+        }
+    }
+
+    // Cleanup removed it. In a real run the tmpfs it sat on is unmounted too,
+    // so the material never reached a block of the image being published.
+    const leftover_path = try repositoryHostPath(allocator, root_path, "base");
+    try std.testing.expectError(
+        error.FileNotFound,
+        Io.Dir.cwd().statFile(io, leftover_path, .{ .follow_symlinks = false }),
+    );
+}
+
+test "nothing the worker runs inherits the worker's environment" {
+    // The credential is forwarded into the worker and stops there. Everything
+    // the worker runs is target-supplied code executing as root against the
+    // image about to be published -- package scriptlets, dracut modules -- and
+    // the repository file is already deleted by the time the initramfs is
+    // regenerated, so a variable left in the environment would outlive the
+    // channel it was meant to travel on.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const env_tool = findTool(std.testing.io, &.{ "/usr/bin/env", "/bin/env" }) orelse
+        return error.SkipZigTest;
+    const stdin_path = "test-unsafe-chroot-environment-stdin";
+    defer Io.Dir.cwd().deleteFile(std.testing.io, stdin_path) catch {};
+    try Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = stdin_path, .data = "" });
+
+    // Both branches that can be observed: `runSystem` spawns three different
+    // ways, and an environment supplied to one of them and not the others is
+    // the shape this would most plausibly regress into.
+    for ([_]?[]const u8{ null, stdin_path }) |stdin| {
+        const stdin_file: ?Io.File = if (stdin) |path|
+            try Io.Dir.cwd().openFile(std.testing.io, path, .{})
+        else
+            null;
+        defer if (stdin_file) |file| file.close(std.testing.io);
+        const result = try runSystem(
+            null,
+            allocator,
+            std.testing.io,
+            &.{env_tool},
+            true,
+            stdin_file,
+        );
+        try std.testing.expectEqual(@as(u8, 0), result.term.exited);
+
+        // Compared as a set rather than a count: the assertion is that the
+        // child's environment is the built one and nothing else, whatever the
+        // process running these tests happens to carry.
+        var names: std.array_list.Managed([]const u8) = .init(allocator);
+        var lines = std.mem.splitScalar(
+            u8,
+            std.mem.trimEnd(u8, result.stdout, "\n"),
+            '\n',
+        );
+        while (lines.next()) |line| {
+            try names.append(line[0 .. std.mem.indexOfScalar(u8, line, '=') orelse line.len]);
+        }
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+        try std.testing.expectEqual(@as(usize, 5), names.items.len);
+        inline for (.{ "HOME", "LANG", "LC_ALL", "PATH", "TERM" }, 0..) |expected, index| {
+            try std.testing.expectEqualStrings(expected, names.items[index]);
+        }
+    }
+}
+
+test "a consumed credential variable stops existing" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var entry = "ZVMI_TEST_CREDENTIAL=s3cr3t-from-a-variable".*;
+    var other = "PATH=/usr/bin".*;
+    const block = [_:null]?[*:0]const u8{ &entry, &other };
+    const environ = std.process.Environ{ .block = .{ .slice = &block } };
+
+    try std.testing.expectEqualStrings(
+        "s3cr3t-from-a-variable",
+        std.process.Environ.getPosix(environ, "ZVMI_TEST_CREDENTIAL").?,
+    );
+    scrubEnvironmentValue(environ, "ZVMI_TEST_CREDENTIAL");
+
+    // Gone from the block, and gone from the bytes the block points at, which
+    // is what `/proc/<pid>/environ` reads.
+    try std.testing.expectEqualStrings(
+        "",
+        std.process.Environ.getPosix(environ, "ZVMI_TEST_CREDENTIAL").?,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, &entry, "s3cr3t-from-a-variable") == null,
+    );
+
+    // And nothing else is disturbed: the worker still has to run commands.
+    try std.testing.expectEqualStrings(
+        "/usr/bin",
+        std.process.Environ.getPosix(environ, "PATH").?,
+    );
+    scrubEnvironmentValue(environ, "ZVMI_NOT_DECLARED");
+}
+
+test "a credential the host cannot resolve is a refusal, not an empty password" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var map = std.process.Environ.Map.init(allocator);
+    defer map.deinit();
+
+    const environment_credential = customize.RepositoryCredential{ .basic = .{
+        .username = "builder",
+        .password = .{ .host_environment = "ZVMI_TEST_CREDENTIAL" },
+    } };
+    var repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{},
+        .credential = environment_credential,
+    }};
+    const manifest = Manifest{
+        .raw_path = "unused.raw",
+        .root_path = "unused-root",
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = 0,
+        .virtual_size = 0,
+        .partition_offset = 0,
+        .partition_length = 0,
+        .packages = .{ .repositories = &repositories },
+        .initramfs = .unchanged,
+    };
+
+    // The parent's environment is built, not inherited, so a variable it cannot
+    // read is refused before the image is opened rather than forwarded as "".
+    try std.testing.expectError(
+        error.CredentialSourceUnreadable,
+        forwardCredentialVariables(allocator, .empty, &map, manifest),
+    );
+    try std.testing.expect(map.get("ZVMI_TEST_CREDENTIAL") == null);
+
+    const block = [_:null]?[*:0]const u8{
+        "ZVMI_TEST_CREDENTIAL=s3cr3t-from-a-variable",
+    };
+    const environ = std.process.Environ{ .block = .{ .slice = &block } };
+    try forwardCredentialVariables(allocator, environ, &map, manifest);
+    try std.testing.expectEqualStrings(
+        "s3cr3t-from-a-variable",
+        map.get("ZVMI_TEST_CREDENTIAL").?,
+    );
+
+    // A newline would end the `password=` line and let whatever followed be
+    // read back as repository configuration, so it is refused at the source.
+    const injecting = [_:null]?[*:0]const u8{
+        "ZVMI_TEST_CREDENTIAL=s3cr3t\nenabled=0",
+    };
+    var injecting_map = std.process.Environ.Map.init(allocator);
+    defer injecting_map.deinit();
+    try std.testing.expectError(
+        error.CredentialMaterialUnusable,
+        forwardCredentialVariables(
+            allocator,
+            .{ .block = .{ .slice = &injecting } },
+            &injecting_map,
+            manifest,
+        ),
+    );
+
+    // A repository whose credential is a file needs nothing forwarded: the
+    // worker reads the file itself, so nothing is put in the environment.
+    var file_repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{},
+        .credential = .{ .basic = .{
+            .username = "builder",
+            .password = .{ .host_path = "/dev/null" },
+        } },
+    }};
+    var file_manifest = manifest;
+    file_manifest.packages = .{ .repositories = &file_repositories };
+    var file_map = std.process.Environ.Map.init(allocator);
+    defer file_map.deinit();
+    try forwardCredentialVariables(allocator, .empty, &file_map, file_manifest);
+    try std.testing.expectEqual(@as(usize, 0), file_map.count());
+}
+
+test "the privilege boundary re-checks a credential it is handed" {
+    const base = Manifest{
+        .raw_path = "unused.raw",
+        .root_path = "unused-root",
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = 0,
+        .virtual_size = 0,
+        .partition_offset = 0,
+        .partition_length = 0,
+        .packages = .{},
+        .initramfs = .unchanged,
+    };
+    const credential = customize.RepositoryCredential{ .basic = .{
+        .username = "builder",
+        .password = .{ .host_path = "/run/secrets/token" },
+    } };
+
+    var accepted = base;
+    var accepted_repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{},
+        .credential = credential,
+    }};
+    accepted.packages = .{ .repositories = &accepted_repositories };
+    try validateManifestPolicy(accepted);
+
+    // Basic authentication puts the password on the wire. A plaintext URL for a
+    // credentialed repository is refused here as well as in the validator,
+    // because this side re-reads the document from JSON.
+    var plaintext = base;
+    var plaintext_repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"http://packages.example.invalid"},
+        .trust = &.{},
+        .credential = credential,
+    }};
+    plaintext.packages = .{ .repositories = &plaintext_repositories };
+    try std.testing.expectError(
+        error.CredentialedRepositoryNotEncrypted,
+        validateManifestPolicy(plaintext),
+    );
+
+    // The bound on a credential path is the request validator's, not a tighter
+    // one: a rule stricter here would accept a request and then fail it after
+    // the workspace has been copied and the image staged.
+    var long = base;
+    var long_path: [Io.Dir.max_path_bytes]u8 = undefined;
+    long_path[0] = '/';
+    @memset(long_path[1..], 'a');
+    var long_repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{},
+        .credential = .{ .basic = .{
+            .username = "builder",
+            .password = .{ .host_path = &long_path },
+        } },
+    }};
+    long.packages = .{ .repositories = &long_repositories };
+    try validateManifestPolicy(long);
+
+    var relative = base;
+    var relative_repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{},
+        .credential = .{ .basic = .{
+            .username = "builder",
+            .password = .{ .host_path = "secrets/token" },
+        } },
+    }};
+    relative.packages = .{ .repositories = &relative_repositories };
+    try std.testing.expectError(
+        error.InvalidCredentialSource,
+        validateManifestPolicy(relative),
+    );
+
+    var named = base;
+    var named_repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{},
+        .credential = .{ .basic = .{
+            .username = "builder",
+            .password = .{ .host_environment = "TOKEN; rm -rf /" },
+        } },
+    }};
+    named.packages = .{ .repositories = &named_repositories };
+    try std.testing.expectError(
+        error.InvalidCredentialSource,
+        validateManifestPolicy(named),
+    );
+
+    var blank = base;
+    var blank_repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{},
+        .credential = .{ .basic = .{
+            .username = "",
+            .password = .{ .host_path = "/run/secrets/token" },
+        } },
+    }};
+    blank.packages = .{ .repositories = &blank_repositories };
+    try std.testing.expectError(
+        error.InvalidCredentialUsername,
+        validateManifestPolicy(blank),
+    );
+}
+
 test "worker regenerates every installed kernel when the policy names none" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -2644,6 +3270,30 @@ test "worker refuses kernel module names it would render as two tokens" {
         validateManifestPolicy(loopback),
     );
 
+    // Same boundary, same reasoning, one field further: the URL is the field
+    // the plan hashes and provenance keeps verbatim, so a credential in its
+    // authority is refused under its own name rather than as a malformed URL.
+    var smuggled = base;
+    smuggled.packages = .{ .repositories = &.{.{
+        .id = "base",
+        .urls = &.{"https://builder:hunter2@packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }} };
+    try std.testing.expectError(
+        error.RepositoryUrlCarriesCredential,
+        validateManifestPolicy(smuggled),
+    );
+    var wrong_scheme = base;
+    wrong_scheme.packages = .{ .repositories = &.{.{
+        .id = "base",
+        .urls = &.{"ftp://packages.example.invalid/base"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }} };
+    try std.testing.expectError(
+        error.InvalidRepositoryUrl,
+        validateManifestPolicy(wrong_scheme),
+    );
+
     var spaced = base;
     spaced.kernel_modules = &.{.{ .name = "overlay -f", .load = true }};
     try std.testing.expectError(
@@ -2727,6 +3377,12 @@ const FakeExecutorContext = struct {
     /// placeholder the real mount would have covered; under a declared list it
     /// is the rendered body itself.
     resolver_at_tdnf: ?[]const u8 = null,
+    /// The repository file the package transaction actually saw, and its mode,
+    /// read while the run is still standing. Cleanup deletes the file and
+    /// unmounts the tmpfs it sat on, so this is the only moment the material a
+    /// credential resolved to is observable at all.
+    repository_at_tdnf: ?[]const u8 = null,
+    repository_mode_at_tdnf: ?u32 = null,
     modules_at_dracut: ?[]const []const u8 = null,
     file_mode_at_dracut: ?u32 = null,
     directory_mode_at_dracut: ?u32 = null,
@@ -2940,6 +3596,8 @@ const FakeExecutorContext = struct {
             self.modules_present_at_tdnf =
                 self.readTargetFile(os_customization.modprobe_blacklist_path) != null;
             self.resolver_at_tdnf = self.readTargetFile("run/zvmi-resolv.conf");
+            self.repository_at_tdnf = self.readTargetFile("run/zvmi-repos/base.repo");
+            self.repository_mode_at_tdnf = self.modeOf("run/zvmi-repos/base.repo");
             self.saw_repository_isolation =
                 containsArg(argv, "/run/zvmi-tdnf.conf") and
                 containsArg(argv, "--disablerepo=*") and
