@@ -233,13 +233,20 @@ const Session = struct {
         }
         var specs: std.array_list.Managed([]const u8) = .init(self.allocator);
         for (names) |name| {
-            const pin = control_mod.findPackagePin(control.package_pins, name) orelse
-                return error.UnpinnedPackageAction;
-            try specs.append(try std.fmt.allocPrint(
-                self.allocator,
-                "{s}-{s}.{s}",
-                .{ pin.name, pin.evr, pin.architecture },
-            ));
+            // Every pin sharing the name, not the first one: a lock may pin
+            // `glibc` at both `i686` and `x86_64`, and a multilib root holds
+            // both at once.
+            var matched = false;
+            for (control.package_pins) |pin| {
+                if (!std.mem.eql(u8, pin.name, name)) continue;
+                matched = true;
+                try specs.append(try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}-{s}.{s}",
+                    .{ pin.name, pin.evr, pin.architecture },
+                ));
+            }
+            if (!matched) return error.UnpinnedPackageAction;
         }
         try self.runTdnf(verb, specs.items, control.repositories);
     }
@@ -256,6 +263,7 @@ const Session = struct {
         if (control.actions.len == 0) return;
         for (self.installed_packages.items) |installed| {
             if (containsBytes(self.baseline_packages.items, installed)) continue;
+            if (control_mod.isTrustPseudoPackage(installed)) continue;
             const pin = control_mod.parseInstalledPackageRecord(installed) orelse
                 return error.InvalidInstalledPackageRecord;
             try self.emitted_lock.append(pin);
@@ -282,11 +290,13 @@ const Session = struct {
                 .{ pin.name, pin.evr, pin.architecture },
             );
             if (containsBytes(self.installed_packages.items, spec)) continue;
-            const prefix = try std.fmt.allocPrint(self.allocator, "{s}-", .{pin.name});
             for (self.installed_packages.items) |installed| {
                 // Present under the pinned name at some other identity, which
                 // is a different failure from never having been installed.
-                if (std.mem.startsWith(u8, installed, prefix)) {
+                // By parsed name rather than string prefix: `python3-libs` is
+                // not another version of `python3`.
+                const record = control_mod.parseInstalledPackageRecord(installed) orelse continue;
+                if (std.mem.eql(u8, record.name, pin.name)) {
                     return error.LockedPackageMismatch;
                 }
             }
@@ -294,6 +304,7 @@ const Session = struct {
         }
         for (self.installed_packages.items) |installed| {
             if (containsBytes(self.baseline_packages.items, installed)) continue;
+            if (control_mod.isTrustPseudoPackage(installed)) continue;
             if (!control_mod.pinsCoverRecord(pins, installed)) {
                 return error.UnlockedPackageInstalled;
             }

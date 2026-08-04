@@ -1465,6 +1465,21 @@ fn validatePackageLock(
         ));
     }
 
+    // A lock is a statement about a transaction, so a request with no package
+    // actions has nothing for it to be about. Refused here rather than left to
+    // run, because the run would compare the whole installed set against an
+    // empty transaction and fail on the first package the input image already
+    // carried -- an error naming something the request never touched, raised
+    // after the image had been staged.
+    if (policy.actions.len == 0) {
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/packages/lock/exact",
+            "an exact lock requires at least one package action to lock",
+            "select unlocked when the request declares no package actions",
+        ));
+    }
+
     for (locks, 0..) |lock, index| {
         if (!validLockField(lock.name) or
             !validLockField(lock.evr) or
@@ -11598,6 +11613,14 @@ test "an exact lock states a whole identity or is refused where it is written" {
             .lock = &.{.{ .name = "dracut", .evr = "0:059-1.azl3", .architecture = "x86_64" }},
             .expected = "must be pinned",
         },
+        // A lock with no transaction to lock. Refused here because the run
+        // would otherwise compare the whole installed set against an empty
+        // baseline and fail on the first package the input image carried.
+        .{
+            .actions = &.{},
+            .lock = &.{.{ .name = "dracut", .evr = "0:059-1.azl3", .architecture = "x86_64" }},
+            .expected = "at least one package action",
+        },
     };
     for (cases) |case| {
         var request = whenNeededRequest();
@@ -11689,4 +11712,25 @@ test "an installed-package record splits back into the lock that would state it"
     try std.testing.expect(parseInstalledPackageRecord("dracut-059-1.x86_64") == null);
     try std.testing.expect(parseInstalledPackageRecord("-0:1-1.x86_64") == null);
     try std.testing.expect(parseInstalledPackageRecord("dracut-0:059-1.azl3.") == null);
+}
+
+test "a multilib lock pins one name at two architectures" {
+    // The case that makes a name-only pin lookup wrong: `glibc` at both
+    // architectures is two packages a root holds at once, so both are legal
+    // in one lock and an executor must ask for both rather than for whichever
+    // it found first.
+    var request = whenNeededRequest();
+    request.packages = .{
+        .actions = &.{.{ .install = &.{"glibc"} }},
+        .repositories = lockTestRepositories(),
+        .lock = .{ .exact = &.{
+            .{ .name = "glibc", .evr = "0:2.38-6.azl3", .architecture = "i686" },
+            .{ .name = "glibc", .evr = "0:2.38-6.azl3", .architecture = "x86_64" },
+        } },
+    };
+    var diagnostics = try validate(std.testing.allocator, &request);
+    defer diagnostics.deinit(std.testing.allocator);
+    for (diagnostics.items) |diagnostic| {
+        try std.testing.expect(diagnostic.code != .invalid_policy);
+    }
 }

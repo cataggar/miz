@@ -402,6 +402,10 @@ pub const Control = struct {
             }
         }
         if (self.package_pins.len != 0) {
+            // Pins describe a transaction; with no actions there is none, and
+            // the guest's coverage check would compare the whole installed set
+            // against an empty baseline.
+            if (self.actions.len == 0) return error.UnpinnedPackageAction;
             for (self.actions) |action| {
                 const names: []const []const u8 = switch (action) {
                     .install, .update_selected => |values| values,
@@ -499,6 +503,19 @@ pub fn findPackagePin(pins: []const PackagePin, name: []const u8) ?PackagePin {
         if (std.mem.eql(u8, pin.name, name)) return pin;
     }
     return null;
+}
+
+/// Whether an `rpm -qa` record is one of rpm's own trust pseudo-packages
+/// rather than a package a transaction installed.
+///
+/// `rpm --import` records each trusted key as `gpg-pubkey-<keyid>-<timestamp>`
+/// with `%{ARCH}` of `(none)`. A key a package transaction imports on its own
+/// was declared by nobody and can be pinned by nobody -- `(none)` is not an
+/// architecture the pin rules accept -- so it is not part of what a run
+/// installed for the purposes of the lock.
+pub fn isTrustPseudoPackage(record: []const u8) bool {
+    return std.mem.startsWith(u8, record, "gpg-pubkey-") and
+        std.mem.endsWith(u8, record, ".(none)");
 }
 
 /// Whether a `NAME-EPOCH:VERSION-RELEASE.ARCH` record is one of these pins.

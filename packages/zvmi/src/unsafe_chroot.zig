@@ -567,15 +567,18 @@ const Session = struct {
     }
 
     fn runPolicy(self: *Session) !void {
-        // Before the first repository file exists, so the baseline is the root
-        // as it arrived rather than the root as this run had begun to arrange
-        // it. Read for any run with package actions, not only a locked one:
-        // the emitted lock is the difference between the two inventories, and
-        // a run that declares no lock is the one most likely to want one.
-        if (self.manifest.packages.actions.len != 0) try self.loadBaselinePackages();
         try self.writeRepositoryFiles();
         errdefer self.removeRepositoryFiles() catch {};
         try self.importTrust();
+        // After the trust import and before the first action, which is the
+        // same point the guest agent reads it. `rpm --import` inserts a
+        // `gpg-pubkey-<keyid>-<timestamp>` pseudo-package into the target's
+        // rpm database, so a baseline taken before it would report the
+        // declared repository key as something this transaction installed.
+        // Read for any run with package actions, not only a locked one: the
+        // emitted lock is the difference between the two inventories, and a
+        // run that declares no lock is the one most likely to want one.
+        if (self.manifest.packages.actions.len != 0) try self.loadBaselinePackages();
         for (self.manifest.packages.actions) |action| switch (action) {
             .install => |names| try self.runTdnfLocked("install", names),
             // The one verb a lock does not rewrite. A removal names what must
@@ -747,12 +750,22 @@ const Session = struct {
             specs.deinit();
         }
         for (names) |name| {
-            const pin = findPin(pins, name) orelse return error.UnlockedPackageRequested;
-            try specs.append(try std.fmt.allocPrint(
-                self.allocator,
-                "{s}-{s}.{s}",
-                .{ pin.name, pin.evr, pin.architecture },
-            ));
+            // Every pin sharing the name, not the first one. A lock may pin
+            // `glibc` at both `i686` and `x86_64`, and those are two packages
+            // a multilib root holds at once: asking for whichever happened to
+            // be listed first would install one and then fail verification on
+            // the other.
+            var matched = false;
+            for (pins) |pin| {
+                if (!std.mem.eql(u8, pin.name, name)) continue;
+                matched = true;
+                try specs.append(try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}-{s}.{s}",
+                    .{ pin.name, pin.evr, pin.architecture },
+                ));
+            }
+            if (!matched) return error.UnlockedPackageRequested;
         }
         try self.runTdnf(verb, specs.items, true);
     }
@@ -791,15 +804,13 @@ const Session = struct {
             // Distinguished because they are different failures: an absent
             // package means the transaction never installed what was pinned,
             // while a present one at another identity means it installed
-            // something else under the same name.
-            const prefix = try std.fmt.allocPrint(
-                self.allocator,
-                "{s}-",
-                .{pin.name},
-            );
-            defer self.allocator.free(prefix);
+            // something else under the same name. Compared by parsed name
+            // rather than by string prefix, because `python3-libs` starts with
+            // `python3-` and is a different package, not a different version of
+            // one.
             for (self.installed_packages.items) |installed| {
-                if (std.mem.startsWith(u8, installed, prefix)) {
+                const record = customize.parseInstalledPackageRecord(installed) orelse continue;
+                if (std.mem.eql(u8, record.name, pin.name)) {
                     return error.LockedPackageMismatch;
                 }
             }
@@ -807,6 +818,7 @@ const Session = struct {
         }
         for (self.installed_packages.items) |installed| {
             if (containsBytes(self.baseline_packages.items, installed)) continue;
+            if (isTrustPseudoPackage(installed)) continue;
             if (!pinsCover(pins, installed)) return error.UnlockedPackageInstalled;
         }
     }
@@ -825,6 +837,7 @@ const Session = struct {
         if (self.manifest.packages.actions.len == 0) return;
         for (self.installed_packages.items) |installed| {
             if (containsBytes(self.baseline_packages.items, installed)) continue;
+            if (isTrustPseudoPackage(installed)) continue;
             const pin = customize.parseInstalledPackageRecord(installed) orelse
                 return error.InvalidInstalledPackageRecord;
             try self.emitted_lock.append(pin);
@@ -1822,6 +1835,21 @@ fn tdnfConfigHostPath(
     return std.fmt.allocPrint(allocator, "{s}/run/zvmi-tdnf.conf", .{root_path});
 }
 
+/// Whether an `rpm -qa` record is one of rpm's own trust pseudo-packages
+/// rather than a package a transaction installed.
+///
+/// `rpm --import` records each trusted key as `gpg-pubkey-<keyid>-<timestamp>`
+/// with `%{ARCH}` of `(none)`, and this backend imports the declared
+/// repository trust before it runs anything. Ordering the baseline read after
+/// the import already keeps the declared keys out of the delta; this is for
+/// the ones a package transaction imports on its own, which no caller declared
+/// and no lock could pin -- `(none)` is not an architecture the pin rules
+/// accept, so a lock naming one could never be restated.
+fn isTrustPseudoPackage(record: []const u8) bool {
+    return std.mem.startsWith(u8, record, "gpg-pubkey-") and
+        std.mem.endsWith(u8, record, ".(none)");
+}
+
 /// Finds the pin for a package name, or nothing.
 ///
 /// Linear because a lock is the closure of one transaction rather than of a
@@ -1933,6 +1961,10 @@ fn validateManifestPolicy(manifest: Manifest) !void {
     // describes as pinned.
     if (manifest.packages.lock == .exact) {
         const pins = manifest.packages.lock.exact;
+        // Pins describe a transaction; with no actions there is none, and the
+        // coverage check would compare the whole installed set against an
+        // empty baseline.
+        if (manifest.packages.actions.len == 0) return error.UnsupportedPackagePolicy;
         for (manifest.packages.actions) |action| {
             const names: []const []const u8 = switch (action) {
                 .install, .update_selected => |values| values,

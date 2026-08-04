@@ -159,6 +159,17 @@ pub const PackageCachePolicy = enum {
     cache_only,
 };
 
+/// A pinned package identity.
+///
+/// These fields were `repository_id`/`name`/`version` when `api_version` 3 was
+/// introduced, and were renamed in place rather than behind a version bump.
+/// Documents are parsed with unknown fields refused, so an `api_version: 3`
+/// document written against the old spelling now fails to parse -- but no such
+/// document could ever have built an image. Every executor refused a lock other
+/// than `unlocked` for the whole life of version 3, so declaring one was a way
+/// to fail preflight, not a way to produce a result. Bumping the version to
+/// preserve documents that never worked would have cost the ability to load the
+/// version 3 documents that did.
 pub const PackageVersionLock = struct {
     name: []const u8,
     /// rpm's `EPOCH:VERSION-RELEASE`. See `customize.PackageVersionLock` for
