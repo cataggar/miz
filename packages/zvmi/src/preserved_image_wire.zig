@@ -161,8 +161,11 @@ pub const PackageCachePolicy = enum {
 
 pub const PackageVersionLock = struct {
     name: []const u8,
-    version: []const u8,
-    repository_id: []const u8,
+    /// rpm's `EPOCH:VERSION-RELEASE`. See `customize.PackageVersionLock` for
+    /// why identity is spelled this way and why no repository id travels with
+    /// it: nothing on either side of this wire can determine one.
+    evr: []const u8,
+    architecture: []const u8,
 };
 
 pub const PackageLockPolicy = union(enum) {

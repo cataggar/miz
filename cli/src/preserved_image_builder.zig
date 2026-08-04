@@ -842,8 +842,8 @@ fn mapPackagePolicy(
                 );
                 for (locks, 0..) |lock, index| mapped[index] = .{
                     .name = lock.name,
-                    .version = lock.version,
-                    .repository_id = lock.repository_id,
+                    .evr = lock.evr,
+                    .architecture = lock.architecture,
                 };
                 break :exact .{ .exact = mapped };
             },
@@ -1502,8 +1502,8 @@ test "package mapping resolves trust sources and execution policies" {
         }},
         .lock = .{ .exact = &.{.{
             .name = "dracut",
-            .version = "1.0-1",
-            .repository_id = "base",
+            .evr = "0:1.0-1.azl3",
+            .architecture = "x86_64",
         }} },
     };
     const mapped = try mapPackagePolicy(
@@ -1522,7 +1522,7 @@ test "package mapping resolves trust sources and execution policies" {
         mapped.repositories[0].trust[0].host_path,
     );
     try std.testing.expectEqualStrings("obsolete", mapped.actions[1].remove[0]);
-    try std.testing.expectEqualStrings("1.0-1", mapped.lock.exact[0].version);
+    try std.testing.expectEqualStrings("0:1.0-1.azl3", mapped.lock.exact[0].evr);
 }
 
 test "a credential crosses the wire as a locator the build system never stages" {
