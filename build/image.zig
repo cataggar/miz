@@ -9,6 +9,11 @@ pub const Format = enum {
     vhd,
     vhdx,
     qcow2,
+    /// A COSI bundle: compressed partition payloads plus metadata, built
+    /// from the disk image the backend staged. Requires gen2 storage for a
+    /// fresh image and a GPT-partitioned source for a preserved one, because
+    /// COSI describes a GPT disk.
+    cosi,
 
     fn cliName(format: Format) []const u8 {
         return @tagName(format);
