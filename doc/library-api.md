@@ -297,6 +297,24 @@ regions as compressed zero runs and verifying the full virtual size was
 produced before reporting success. `customize.OutputFormat` gains `raw_gz`
 and `raw_zst` so bundle builds can publish a compressed artifact directly.
 
+`customize.OutputFormat.cosi` publishes a COSI bundle instead of a disk
+image. Every backend can emit it -- `native_fresh`, `native_edit`, `rebuild`,
+`unsafe_chroot`, and `vm` -- because the bundle is written from the disk
+image the backend staged: the backend builds raw, and a trailing
+`write_cosi_bundle` operation describes the finished image and commits the
+bundle in its place. Two conditions are refused rather than approximated. A
+`native_fresh` gen1 request fails validation, because a gen1 image is
+MBR-partitioned and COSI describes a GPT disk; a preserved source without a
+GPT fails the `gpt_source` preflight capability for the same reason. Only a
+backend that sealed the dm-verity tree itself knows its salt and root hash,
+so the bundle's verity block is present on a `native_fresh` verity build and
+absent everywhere else. Which kind was published is recorded in
+`provenance.execution.cosi` alongside the metadata version and partition
+count, and `-O cosi` selects it from the CLI builders and from `addImage` /
+`addPreservedImage`. `output.Spec.parseName` still refuses `cosi`: it names
+disk formats that `convert` and `create` can open and write, and a bundle is
+neither.
+
 `zvmi.limits` owns the import guardrails shared by `root_tree`, the
 ext4 scanner, and the preserved-image rebuild. `limits.ImportLimits` is the
 flat set every CLI flag maps onto (`limits.Limit.flag()` is the single source

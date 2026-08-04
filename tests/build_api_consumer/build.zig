@@ -97,6 +97,25 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    _ = zvmi.addImage(b, dependency, .{
+        .name = "cosi-fixture",
+        .input = .{
+            .iso = b.path("fixtures/os.iso"),
+            .container = .{ .oci_layout = b.path("fixtures/oci-layout") },
+        },
+        .output = .{
+            .format = .cosi,
+            .basename = "cosi-fixture.cosi",
+        },
+        .size = 256 * 1024 * 1024,
+        .target_architecture = .x86_64,
+        .rootfs_path_in_iso = "images/rootfs.squashfs",
+        .reproducibility = .{
+            .seed = [_]u8{0x44} ** 32,
+            .source_date_epoch = 1_735_689_600,
+        },
+    });
+
     const execution_failure_image = zvmi.addImage(b, dependency, .{
         .name = "execution-failure-fixture",
         .input = .{

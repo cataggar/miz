@@ -40,11 +40,11 @@ pub const WriteError = std.mem.Allocator.Error || gpt.ReadError || Image.PreadEr
 };
 
 const GptImageName = "images/image_gpt.raw.zst";
-const metadata_version = "1.2";
+pub const metadata_version = "1.2";
 const file_mode = 0o400;
 
 pub fn write(img: Image, io: Io, allocator: std.mem.Allocator, output_path: []const u8) WriteError!void {
-    try writeWithOptions(img, io, allocator, output_path, .{});
+    _ = try writeWithOptions(img, io, allocator, output_path, .{});
 }
 
 pub const SystemdBootEntry = struct {
@@ -83,13 +83,25 @@ pub const WriteOptions = struct {
     compression: Compression = .{},
 };
 
+/// What the bundle says about the image it describes. Returned rather than
+/// re-derived, because a caller recording provenance would otherwise have to
+/// read the GPT a second time to learn what was written.
+pub const Report = struct {
+    metadata_version: []const u8 = metadata_version,
+    partition_count: usize,
+    /// Whether the root filesystem entry carries a dm-verity block. False
+    /// when the caller supplied no verity information, which is every path
+    /// that describes an image it did not itself seal.
+    verity_included: bool,
+};
+
 pub fn writeWithOptions(
     img: Image,
     io: Io,
     allocator: std.mem.Allocator,
     output_path: []const u8,
     options: WriteOptions,
-) WriteError!void {
+) WriteError!Report {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -108,6 +120,10 @@ pub fn writeWithOptions(
 
     const os_release = try detectOsRelease(arena, img, io, partitions, options.os_release);
     const metadata_json = try buildMetadataJson(arena, img.virtual_size, disk_guid_text, gpt_region, partitions, os_release, options);
+    var verity_included = false;
+    for (partitions) |part| {
+        if (options.root_verity != null and std.mem.eql(u8, part.mount_point, "/")) verity_included = true;
+    }
 
     const output_file = try Io.Dir.cwd().createFile(io, output_path, .{ .truncate = true });
     defer output_file.close(io);
@@ -138,6 +154,8 @@ pub fn writeWithOptions(
     }
 
     try tar_writer.finish();
+
+    return .{ .partition_count = partitions.len, .verity_included = verity_included };
 }
 
 const ArtifactImage = struct {
@@ -727,7 +745,7 @@ test "write builds a COSI tarball with GPT metadata and compressed zstd partitio
     var verity_root_hash: [verity.digest_size]u8 = undefined;
     for (&verity_salt, 0..) |*byte, index| byte.* = @intCast(index);
     for (&verity_root_hash, 0..) |*byte, index| byte.* = @intCast(index + 1);
-    try writeWithOptions(img, io, std.testing.allocator, cosi_path, .{
+    _ = try writeWithOptions(img, io, std.testing.allocator, cosi_path, .{
         .bootloader = .{
             .type = "systemd-boot",
             .systemdBoot = .{

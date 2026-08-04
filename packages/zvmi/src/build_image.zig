@@ -3658,7 +3658,7 @@ test "build-image can append a dm-verity tree and pass metadata through COSI out
     try std.testing.expect(std.mem.indexOf(u8, bls_entry, root_hash_text) != null);
     try std.testing.expect(std.mem.indexOf(u8, bls_entry, "systemd.verity_root_options=superblock=0,format=1") != null);
 
-    try cosi.writeWithOptions(img, io, allocator, cosi_path, .{
+    _ = try cosi.writeWithOptions(img, io, allocator, cosi_path, .{
         .root_verity = report.verity,
     });
 

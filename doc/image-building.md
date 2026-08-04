@@ -1118,7 +1118,9 @@ generations can optionally append a same-partition dm-verity SHA-256 hash tree
 with `--verity`, wiring the resulting `roothash=`/`systemd.verity_root_*`
 parameters through the shared PARTUUID-based cmdline path. Gen1/MBR builds use
 Linux's synthesized MBR PARTUUID form (`<8-hex-disk-signature>-<2-hex-partition-number>`);
-the matching verity metadata is also exposed through `zvmi.cosi.writeWithOptions`.
+the matching verity metadata is also exposed through `zvmi.cosi.writeWithOptions`,
+and a v3 customization request can publish that bundle directly with
+`-O cosi` (see [Library API](library-api.md) for which backends emit it).
 
 `zvmi build-image` never rebuilds the initramfs -- it copies whatever
 `boot/initramfs*`/`boot/initrd*` blob already exists in the merged

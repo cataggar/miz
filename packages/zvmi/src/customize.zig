@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const azure = @import("azure.zig");
 const bootconfig = @import("bootconfig.zig");
 const build_image = @import("build_image.zig");
+const cosi = @import("cosi.zig");
 const ext4 = @import("ext4.zig");
 const fat32 = @import("fat32.zig");
 const Format = @import("formats.zig").Format;
@@ -30,8 +31,8 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 15;
-pub const provenance_schema_version: u32 = 18;
+pub const plan_schema_version: u32 = 16;
+pub const provenance_schema_version: u32 = 19;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -123,6 +124,9 @@ pub const OutputFormat = enum {
     qcow2,
     cosi,
 
+    /// The disk format a caller receives, or `null` for a format that is not
+    /// a disk image at all. `cosi` is a bundle of compressed partition
+    /// payloads and metadata, so it has no answer here.
     fn imageFormat(self: OutputFormat) ?Format {
         return switch (self) {
             .raw, .raw_gz, .raw_zst => .raw,
@@ -131,6 +135,22 @@ pub const OutputFormat = enum {
             .qcow2 => .qcow2,
             .cosi => null,
         };
+    }
+
+    /// The disk format a backend builds before the output is published.
+    /// Every backend writes a disk image; `cosi` is produced by reading the
+    /// finished raw image back and describing it, so it stages as raw.
+    pub fn stagingImageFormat(self: OutputFormat) Format {
+        return switch (self) {
+            .cosi => .raw,
+            else => self.imageFormat().?,
+        };
+    }
+
+    /// Whether publishing this format requires a second artifact built from
+    /// the staged disk image rather than the staged image itself.
+    pub fn bundlesStagedImage(self: OutputFormat) bool {
+        return self == .cosi;
     }
 
     pub fn compression(self: OutputFormat) output_mod.Compression {
@@ -142,9 +162,11 @@ pub const OutputFormat = enum {
     }
 
     /// Parses an `-O` argument, including the compressed spellings
-    /// `raw.gz`/`raw.zst`. `cosi` is deliberately absent: it is a bundle
-    /// format selected by its own command, not a disk-image format.
+    /// `raw.gz`/`raw.zst`. `cosi` is accepted here but not by
+    /// `output.Spec.parseName`, which names disk formats a caller can open,
+    /// convert, and create -- a COSI bundle is none of those.
     pub fn parseName(name: []const u8) ?OutputFormat {
+        if (std.ascii.eqlIgnoreCase(name, "cosi")) return .cosi;
         const spec = output_mod.Spec.parseName(name) orelse return null;
         return switch (spec.compression) {
             .none => switch (spec.format) {
@@ -895,12 +917,16 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
     if (request.output.path.len == 0) {
         try diagnostics.append(validationError(.invalid_output, "/output/path", "output path must not be empty", null));
     }
-    if (request.output.format == .cosi) {
+    if (request.output.format == .cosi and
+        request.execution.backend == .native_fresh and
+        request.storage == .fresh and
+        request.storage.fresh.generation == .gen1)
+    {
         try diagnostics.append(validationError(
             .unsupported_output_format,
             "/output/format",
-            "COSI is not supported by the v3 native fresh or preserved-image executors",
-            "select raw, vhd, vhdx, or qcow2",
+            "a gen1 image is MBR-partitioned and COSI describes a GPT disk",
+            "select gen2 storage, or select raw, vhd, vhdx, or qcow2",
         ));
     }
 
@@ -2287,6 +2313,9 @@ pub const Action = enum {
     edit_existing_paths,
     populate_preserved_root,
     publish_standalone_output,
+    /// Reads the disk image a backend staged and writes the COSI bundle that
+    /// the transaction commits in its place.
+    write_cosi_bundle,
     execute_package_action,
     execute_hook,
     regenerate_initramfs,
@@ -2321,6 +2350,10 @@ pub const CapabilityKind = enum {
     native_edit,
     partition_edit,
     standalone_output,
+    /// The preserved source disk must carry a GPT, because a COSI bundle
+    /// describes a GPT disk and a preserved output keeps the partitioning it
+    /// was given.
+    gpt_source,
     rebuild,
     unsafe_chroot,
     vm,
@@ -2483,6 +2516,10 @@ pub const ResolvedPlanData = struct {
     limits: limits_mod.ImportLimits,
     transaction_path: []const u8,
     staging_output_path: []const u8,
+    /// The artifact the transaction commits to `output.path`. It is
+    /// `staging_output_path` for every disk format, and the COSI bundle built
+    /// from that image when the request asks for one.
+    staging_commit_path: []const u8,
     transaction_id: Uuid,
     output_identifiers: OutputIdentifiers,
     generated: ?GeneratedIdentifiers,
@@ -2771,6 +2808,10 @@ pub fn resolve(
     const transaction_name = try std.fmt.allocPrint(plan_allocator, ".zvmi-{s}", .{transaction_hex});
     const transaction_path = try std.fs.path.join(plan_allocator, &.{ resolved_workspace_path, transaction_name });
     const staging_output_path = try std.fs.path.join(plan_allocator, &.{ transaction_path, "output.img" });
+    const staging_commit_path = if (request.output.format.bundlesStagedImage())
+        try std.fs.path.join(plan_allocator, &.{ transaction_path, "output.cosi" })
+    else
+        staging_output_path;
 
     const resolved_execution = ExecutionPolicy{
         .workspace_path = resolved_workspace_path,
@@ -2849,6 +2890,7 @@ pub fn resolve(
         resolved_hooks,
         resolved_initramfs,
         resolved_selinux,
+        request.output.format,
     );
     const capabilities = try buildCapabilities(
         plan_allocator,
@@ -2897,6 +2939,7 @@ pub fn resolve(
         .limits = request.limits,
         .transaction_path = transaction_path,
         .staging_output_path = staging_output_path,
+        .staging_commit_path = staging_commit_path,
         .transaction_id = transaction_id,
         .output_identifiers = outputIdentifiers(derived),
         .generated = if (request.execution.backend == .native_fresh) derived else null,
@@ -3451,12 +3494,13 @@ fn buildOperations(
     hooks: []const Hook,
     initramfs: InitramfsPolicy,
     selinux: SelinuxPolicy,
+    output_format: OutputFormat,
 ) Allocator.Error![]Operation {
     var specs = std.array_list.Managed(OperationSpec).init(allocator);
     defer specs.deinit();
     try appendBackendOperationSpecs(&specs, backend, storage);
     try appendPreInitramfsOperationSpecs(&specs, packages, hooks);
-    try appendBackendFinalOperationSpecs(&specs, backend, policy, storage, hooks, initramfs, selinux);
+    try appendBackendFinalOperationSpecs(&specs, backend, policy, storage, hooks, initramfs, selinux, output_format);
 
     const operations = try allocator.alloc(Operation, specs.items.len);
     for (specs.items, 0..) |spec, index| {
@@ -3531,6 +3575,7 @@ fn appendBackendFinalOperationSpecs(
     hooks: []const Hook,
     initramfs: InitramfsPolicy,
     selinux: SelinuxPolicy,
+    output_format: OutputFormat,
 ) Allocator.Error!void {
     switch (backend) {
         .native_fresh => {
@@ -3554,6 +3599,9 @@ fn appendBackendFinalOperationSpecs(
             try appendFinalizeHookSpecs(specs, hooks);
             try specs.append(.{ .phase = .output_conversion, .action = .publish_standalone_output });
         },
+    }
+    if (output_format.bundlesStagedImage()) {
+        try specs.append(.{ .phase = .output_conversion, .action = .write_cosi_bundle });
     }
 }
 
@@ -3605,6 +3653,7 @@ fn hasExpectedOperations(allocator: Allocator, plan: *const ResolvedPlan) Alloca
         plan.data.hooks,
         plan.data.initramfs,
         plan.data.selinux,
+        plan.data.output.format,
     );
     if (plan.data.operations.len != specs.items.len) return false;
     for (plan.data.operations, specs.items, 0..) |operation, spec, index| {
@@ -3670,6 +3719,13 @@ fn buildCapabilities(
                 .reason = "read and isolate every qcow2 backing or external-data file",
             });
             try appendIsolationCapability(&capabilities, output.path, disk.path, "keep the output distinct from the preserved source disk");
+            if (output.format.bundlesStagedImage()) {
+                try capabilities.append(.{
+                    .kind = .gpt_source,
+                    .path = disk.path,
+                    .reason = "select a GPT-partitioned source, or an output format other than cosi",
+                });
+            }
         },
     }
     for (customization.filesystem) |operation| switch (operation) {
@@ -4132,6 +4188,7 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     }
     hashString(&hash, plan.transaction_path);
     hashString(&hash, plan.staging_output_path);
+    hashString(&hash, plan.staging_commit_path);
     hash.update(&plan.transaction_id.bytes);
     hashOutputIdentifiers(&hash, plan.output_identifiers);
     if (plan.generated) |generated| {
@@ -4623,6 +4680,7 @@ pub fn preflight(
                 else => .unsupported,
             },
             .vm => vmCapabilityState(platform, io, plan),
+            .gpt_source => gptSourceAvailable(io, requirement.path),
             .vm_firmware => if (plan.data.execution.vm) |vm| switch (vm.boot) {
                 .direct_kernel => .unsupported,
                 .firmware => |firmware| vmFirmwareAvailable(io, firmware),
@@ -4891,7 +4949,7 @@ fn systemCapabilityCheck(_: ?*anyopaque, io: Io, requirement: CapabilityRequirem
         .read_hook_source,
         .read_trust_source,
         => if (isReadableKind(cwd, io, requirement.path, .file)) .available else .missing,
-        .disk_dependencies => .unsupported,
+        .disk_dependencies, .gpt_source => .unsupported,
         .write_workspace_parent => if (canCreatePath(cwd, io, requirement.path)) .available else .missing,
         .write_output_parent => if (canCreatePath(cwd, io, requirement.path)) .available else .missing,
         .output_absent, .transaction_absent => if (pathAbsent(cwd, io, requirement.path)) .available else .missing,
@@ -4968,6 +5026,19 @@ fn diskDependenciesAvailable(
     return .available;
 }
 
+/// Whether a disk carries a GPT that the COSI writer can describe.
+fn gptSourceAvailable(io: Io, path: []const u8) CapabilityState {
+    var image = image_mod.Image.openPathReadOnly(io, path) catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        else => return .unsupported,
+    };
+    defer image.close(io);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    _ = gpt.readGpt(image, io, arena.allocator()) catch return .missing;
+    return .available;
+}
+
 fn rebuildAvailable(io: Io, plan: *const ResolvedPlan) CapabilityState {
     const disk = switch (plan.data.input) {
         .disk => |value| value,
@@ -4977,7 +5048,7 @@ fn rebuildAvailable(io: Io, plan: *const ResolvedPlan) CapabilityState {
         .preserve => |value| value,
         .fresh => return .unsupported,
     };
-    const output_format = plan.data.output.format.imageFormat() orelse return .unsupported;
+    const output_format = plan.data.output.format.stagingImageFormat();
     _ = preserved_image.inspectRebuild(std.heap.page_allocator, io, .{
         .source_path = disk.path,
         .output_path = plan.data.staging_output_path,
@@ -5365,6 +5436,19 @@ pub const PreservedRebuildRecord = struct {
     identity_stale_references: usize,
 };
 
+pub const CosiRecord = struct {
+    /// The COSI metadata schema the bundle declares, recorded because a
+    /// consumer reads the bundle by that number and it is not derivable from
+    /// the request.
+    metadata_version: []const u8,
+    partition_count: usize,
+    /// Whether the bundle carries dm-verity metadata for the root
+    /// filesystem. Only a backend that sealed the verity tree itself can
+    /// supply it, so this records which kind of COSI was published rather
+    /// than leaving its absence to be discovered by a consumer.
+    verity_included: bool,
+};
+
 pub const ExecutionRecord = struct {
     rootfs_path_in_iso: []const u8,
     root_tree_digest: ?Digest,
@@ -5375,6 +5459,9 @@ pub const ExecutionRecord = struct {
     vhdx_metadata: ?VhdxMetadataRecord,
     preserved: ?PreservedExecutionRecord,
     vm: ?VmExecutionRecord,
+    /// Present exactly when the output format is a bundle built from the
+    /// staged image.
+    cosi: ?CosiRecord,
     /// The largest value each limit reached during this run. A caller sizes a
     /// larger run from these instead of guessing, and a dry run reports them
     /// without committing to a build.
@@ -5537,6 +5624,7 @@ fn buildResult(
     rebuild_report: ?*const preserved_image.RebuildReport,
     unsafe_report: ?*const UnsafeChrootRuntimeReport,
     vm_report: ?*const VmRuntimeReport,
+    cosi_report: ?cosi.Report,
     source_digests: []const SourceRecord,
     output_digest: Digest,
     output_file_size: u64,
@@ -5818,6 +5906,11 @@ fn buildResult(
                     null,
                 .preserved = preserved_record,
                 .vm = vm_record,
+                .cosi = if (cosi_report) |report| .{
+                    .metadata_version = try result_allocator.dupe(u8, report.metadata_version),
+                    .partition_count = report.partition_count,
+                    .verity_included = report.verity_included,
+                } else null,
                 .limit_peaks = limit_peaks,
             },
             .final_output = .{
@@ -5954,7 +6047,7 @@ pub fn execute(
             preserved_report = preserved_image.edit(allocator, io, .{
                 .source_path = plan.data.input.disk.path,
                 .output_path = plan.data.staging_output_path,
-                .output_format = plan.data.output.format.imageFormat().?,
+                .output_format = plan.data.output.format.stagingImageFormat(),
                 .output_compression = plan.data.output.format.compression(),
                 .root_partition = plan.data.storage.preserve.root_partition,
                 .operations = plan.data.existing_path_operations,
@@ -5984,7 +6077,7 @@ pub fn execute(
             rebuild_report = preserved_image.rebuild(allocator, io, .{
                 .source_path = plan.data.input.disk.path,
                 .output_path = plan.data.staging_output_path,
-                .output_format = plan.data.output.format.imageFormat().?,
+                .output_format = plan.data.output.format.stagingImageFormat(),
                 .output_compression = plan.data.output.format.compression(),
                 .root_partition = plan.data.storage.preserve.root_partition,
                 .source_profile = plan.data.storage.preserve.source_profile,
@@ -6033,7 +6126,7 @@ pub fn execute(
             const raw_report = preserved_image.transactRaw(allocator, io, .{
                 .source_path = plan.data.input.disk.path,
                 .output_path = plan.data.staging_output_path,
-                .output_format = plan.data.output.format.imageFormat().?,
+                .output_format = plan.data.output.format.stagingImageFormat(),
                 .output_compression = plan.data.output.format.compression(),
                 .root_partition = plan.data.storage.preserve.root_partition,
                 .require_linux_partition = true,
@@ -6073,7 +6166,7 @@ pub fn execute(
             const raw_report = preserved_image.transactRaw(allocator, io, .{
                 .source_path = plan.data.input.disk.path,
                 .output_path = plan.data.staging_output_path,
-                .output_format = plan.data.output.format.imageFormat().?,
+                .output_format = plan.data.output.format.stagingImageFormat(),
                 .output_compression = plan.data.output.format.compression(),
                 .root_partition = plan.data.storage.preserve.root_partition,
                 .require_linux_partition = true,
@@ -6100,6 +6193,25 @@ pub fn execute(
                     @intFromBool(plan.data.initramfs != .unchanged),
             };
         },
+    }
+
+    // The bundle is written from the image the backend staged, so every
+    // backend reaches it by the same route: whatever produced the disk, the
+    // bundle describes the bytes that disk ended up holding. Only verity has
+    // to be carried in, because a hash tree cannot be recovered from the
+    // partition it protects.
+    var cosi_report: ?cosi.Report = null;
+    if (plan.data.output.format.bundlesStagedImage()) {
+        if (event_sink) |sink| sink.emit(.{ .progress = .{
+            .phase = .execution,
+            .message = "write COSI bundle from the staged image",
+        } });
+        cosi_report = writeCosiBundle(allocator, io, plan, fresh_report) catch |err| {
+            try appendFailure(&diagnostics, .execution_failed, .execution, "/output/format", "failed to write the COSI bundle from the staged image", err);
+            if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
+            emitDiagnostics(event_sink, diagnostics.items);
+            return try failureOutcome(allocator, diagnostics.items);
+        };
     }
 
     var commit_barrier = transaction_guard.seal(
@@ -6142,14 +6254,14 @@ pub fn execute(
         return try failureOutcome(allocator, diagnostics.items);
     }
 
-    const output_digest = hashPath(allocator, io, plan.data.staging_output_path) catch |err| {
+    const output_digest = hashPath(allocator, io, plan.data.staging_commit_path) catch |err| {
         try appendFailure(&diagnostics, .source_hash_failed, .execution, "/output/path", "failed to hash the completed output", err);
         commit_barrier.release(io);
         if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
         emitDiagnostics(event_sink, diagnostics.items);
         return try failureOutcome(allocator, diagnostics.items);
     };
-    const output_file_size = (cwd.statFile(io, plan.data.staging_output_path, .{}) catch |err| {
+    const output_file_size = (cwd.statFile(io, plan.data.staging_commit_path, .{}) catch |err| {
         try appendFailure(&diagnostics, .execution_failed, .execution, "/output/path", "failed to inspect the completed output", err);
         commit_barrier.release(io);
         if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
@@ -6165,6 +6277,7 @@ pub fn execute(
         if (rebuild_report) |*report| report else null,
         if (unsafe_report) |*report| report else null,
         if (vm_report) |*report| report else null,
+        cosi_report,
         source_digests_before,
         output_digest,
         output_file_size,
@@ -6181,9 +6294,9 @@ pub fn execute(
     errdefer if (final_diagnostics_owned_by_function) final_diagnostics.deinit(allocator);
 
     const commit_result = if (plan.data.execution.overwrite)
-        cwd.rename(plan.data.staging_output_path, cwd, plan.data.output.path, io)
+        cwd.rename(plan.data.staging_commit_path, cwd, plan.data.output.path, io)
     else
-        cwd.renamePreserve(plan.data.staging_output_path, cwd, plan.data.output.path, io);
+        cwd.renamePreserve(plan.data.staging_commit_path, cwd, plan.data.output.path, io);
     commit_result catch |err| {
         commit_barrier.release(io);
         result.deinit(allocator);
@@ -6268,7 +6381,6 @@ fn hasValidPlanIntegrity(allocator: Allocator, plan: *const ResolvedPlan) Alloca
     const computed_hash = hashPlan(data.*);
     if (data.schema_version != plan_schema_version or
         data.request_api_version != current_api_version or
-        data.output.format.imageFormat() == null or
         !std.mem.eql(u8, &computed_hash.bytes, &data.plan_hash.bytes))
     {
         return false;
@@ -6290,6 +6402,7 @@ fn hasValidPlanIntegrity(allocator: Allocator, plan: *const ResolvedPlan) Alloca
             }
             if (!std.meta.eql(data.generated.?, expected_generated)) return false;
             if (data.storage.fresh.generation == .gen1 and data.architectures.image != .x86_64) return false;
+            if (data.storage.fresh.generation == .gen1 and data.output.format == .cosi) return false;
         },
         .native_edit, .rebuild, .unsafe_chroot, .vm => {
             if (data.input != .disk or data.storage != .preserve or data.generated != null or
@@ -6339,8 +6452,14 @@ fn hasValidPlanIntegrity(allocator: Allocator, plan: *const ResolvedPlan) Alloca
     defer allocator.free(expected_transaction);
     const expected_staging = try std.fs.path.join(allocator, &.{ expected_transaction, "output.img" });
     defer allocator.free(expected_staging);
+    const expected_commit = if (data.output.format.bundlesStagedImage())
+        try std.fs.path.join(allocator, &.{ expected_transaction, "output.cosi" })
+    else
+        try allocator.dupe(u8, expected_staging);
+    defer allocator.free(expected_commit);
     return std.mem.eql(u8, expected_transaction, data.transaction_path) and
-        std.mem.eql(u8, expected_staging, data.staging_output_path);
+        std.mem.eql(u8, expected_staging, data.staging_output_path) and
+        std.mem.eql(u8, expected_commit, data.staging_commit_path);
 }
 
 fn runPlan(
@@ -6353,18 +6472,23 @@ fn runPlan(
     limit_sink: *limits_mod.Diagnostic,
 ) !?build_image.BuildImageReport {
     if (plan.data.execution.backend != .native_fresh) return error.InvalidBackend;
-    var stage_bridge = NativeStageBridge{ .operations = plan.data.operations };
+    // A bundled output ends with an operation the builder does not run: the
+    // bundle is written from the finished image after `build` returns, so the
+    // builder is only accountable for the operations before it.
+    const trailing = @intFromBool(plan.data.output.format.bundlesStagedImage());
+    const build_operations = plan.data.operations[0 .. plan.data.operations.len - trailing];
+    var stage_bridge = NativeStageBridge{ .operations = build_operations };
     const stage_sink = build_image.StageSink{ .context = &stage_bridge, .advanceFn = NativeStageBridge.advance };
     if (platform.runFn) |run| {
         try run(platform.context, allocator, io, plan, event_sink, stage_sink);
-        if (stage_bridge.next != plan.data.operations.len) return error.InvalidOperationOrder;
+        if (stage_bridge.next != build_operations.len) return error.InvalidOperationOrder;
         return null;
     }
     var options = buildOptionsFromPlan(plan, bridge, limit_sink);
     options.stage_sink = stage_sink;
     var report = try build_image.build(allocator, io, options);
     errdefer report.deinit(allocator);
-    if (stage_bridge.next != plan.data.operations.len) return error.InvalidOperationOrder;
+    if (stage_bridge.next != build_operations.len) return error.InvalidOperationOrder;
     return report;
 }
 
@@ -6382,7 +6506,7 @@ fn buildOptionsFromPlan(
         .output_path = plan.data.staging_output_path,
         .size = plan.data.output.disk_size,
         .generation = storage.generation,
-        .output_format = plan.data.output.format.imageFormat().?,
+        .output_format = plan.data.output.format.stagingImageFormat(),
         .output_compression = plan.data.output.format.compression(),
         .rootfs_path_in_iso = input.rootfs_path_in_iso,
         .skip_iso_rootfs = storage.skip_iso_rootfs,
@@ -6473,6 +6597,33 @@ fn freshStageForAction(action: Action) ?build_image.Stage {
         .check_and_close_filesystems => .check_and_close_filesystems,
         .convert_output => .convert_output,
         else => null,
+    };
+}
+
+/// Writes the COSI bundle the transaction will commit, reading back the disk
+/// image the backend staged.
+fn writeCosiBundle(
+    allocator: Allocator,
+    io: Io,
+    plan: *const ResolvedPlan,
+    fresh_report: ?build_image.BuildImageReport,
+) !cosi.Report {
+    var img = try image_mod.Image.openPathReadOnly(io, plan.data.staging_output_path);
+    defer img.close(io);
+    return try cosi.writeWithOptions(img, io, allocator, plan.data.staging_commit_path, .{
+        .os_arch = cosiOsArch(plan.data.architectures.image),
+        // Only the backend that built the hash tree knows its salt and root
+        // hash; a preserved image carries the verity partition without any
+        // record of how it was produced, so its bundle omits the block
+        // rather than describing it wrongly.
+        .root_verity = if (fresh_report) |report| report.verity else null,
+    });
+}
+
+fn cosiOsArch(architecture: Architecture) []const u8 {
+    return switch (architecture) {
+        .x86_64 => "x86_64",
+        .aarch64 => "arm64",
     };
 }
 
@@ -6860,6 +7011,60 @@ fn createCustomizeTestDisk(io: Io, path: []const u8, spool_path: []const u8) !vo
     });
 }
 
+const customize_gpt_disk_size: u64 = 24 * mib;
+const customize_gpt_esp_sectors: u32 = 2048;
+const customize_gpt_root_sectors: u32 = 16384;
+const linux_root_x86_64_partition_type = guid.parse("4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709");
+
+/// A GPT disk with an ESP and an ext4 root, which is the shape the COSI
+/// writer describes. `createCustomizeTestDisk` deliberately writes an MBR
+/// instead, so the two together cover both answers to the GPT question.
+fn createCustomizeGptTestDisk(io: Io, path: []const u8, spool_path: []const u8) !void {
+    var image = try image_mod.Image.createExclusive(io, path, .raw, customize_gpt_disk_size, .{});
+    defer image.close(io);
+
+    const specs = [_]gpt.PartitionSpec{
+        .{
+            .type_guid = guid.esp,
+            .unique_guid = guid.parse("11111111-1111-1111-1111-111111111111"),
+            .size_sectors = customize_gpt_esp_sectors,
+            .name_utf16le = gpt.asciiName("EFI System"),
+        },
+        .{
+            .type_guid = linux_root_x86_64_partition_type,
+            .unique_guid = guid.parse("22222222-2222-2222-2222-222222222222"),
+            .size_sectors = customize_gpt_root_sectors,
+            .name_utf16le = gpt.asciiName("root"),
+        },
+    };
+    var placements: [specs.len]gpt.Placement = undefined;
+    try gpt.writeGpt(
+        &image,
+        io,
+        guid.parse("33333333-3333-3333-3333-333333333333"),
+        &specs,
+        &placements,
+    );
+
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try root_tree.RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+    try tree.putDirectory("etc", .{ .mode = 0o755 });
+    try tree.putFileBytes("etc/config", "before\n", .{ .mode = 0o640 });
+    try tree.putFileBytes(
+        "etc/os-release",
+        "NAME=zvmi\nID=zvmi\nVERSION_ID=1\n",
+        .{ .mode = 0o644 },
+    );
+    _ = try ext4.populate(io, image.file, std.testing.allocator, try tree.ext4View(), .{
+        .offset = placements[1].first_lba * gpt.sector_size,
+        .length = (placements[1].last_lba - placements[1].first_lba + 1) * gpt.sector_size,
+        .label = "customize-root",
+        .uuid = [_]u8{0x64} ** 16,
+        .timestamp = 1_735_689_600,
+    });
+}
+
 fn validNativeEditRequest(
     source_path: []const u8,
     output_path: []const u8,
@@ -6911,11 +7116,18 @@ test "output format names cover the compressed raw spellings" {
     try std.testing.expectEqual(OutputFormat.raw_gz, OutputFormat.parseName("raw.gz").?);
     try std.testing.expectEqual(OutputFormat.raw_zst, OutputFormat.parseName("raw.zst").?);
     try std.testing.expectEqual(OutputFormat.qcow2, OutputFormat.parseName("qcow2").?);
-    // Only raw can be compressed, and `cosi` is not an `-O` disk format.
+    try std.testing.expectEqual(OutputFormat.cosi, OutputFormat.parseName("cosi").?);
+    // Only raw can be compressed, and a COSI bundle has no compressed
+    // spelling: its members are already compressed individually.
     try std.testing.expectEqual(@as(?OutputFormat, null), OutputFormat.parseName("vhd.gz"));
-    try std.testing.expectEqual(@as(?OutputFormat, null), OutputFormat.parseName("cosi"));
+    try std.testing.expectEqual(@as(?OutputFormat, null), OutputFormat.parseName("cosi.gz"));
 
     try std.testing.expectEqual(Format.raw, OutputFormat.raw_gz.imageFormat().?);
+    try std.testing.expectEqual(@as(?Format, null), OutputFormat.cosi.imageFormat());
+    try std.testing.expectEqual(Format.raw, OutputFormat.cosi.stagingImageFormat());
+    try std.testing.expectEqual(Format.qcow2, OutputFormat.qcow2.stagingImageFormat());
+    try std.testing.expect(OutputFormat.cosi.bundlesStagedImage());
+    try std.testing.expect(!OutputFormat.raw.bundlesStagedImage());
     try std.testing.expectEqual(output_mod.Compression.gzip, OutputFormat.raw_gz.compression());
     try std.testing.expectEqual(output_mod.Compression.zstd, OutputFormat.raw_zst.compression());
     try std.testing.expectEqual(output_mod.Compression.none, OutputFormat.raw.compression());
@@ -8577,6 +8789,222 @@ test "successful execution commits output and emits provenance" {
         outcome.result.?.provenance.sources[2].path,
         customization_path,
     ));
+}
+
+test "a fresh COSI request publishes a bundle built from the staged image" {
+    const io = std.testing.io;
+    const iso_path = "test-customize-cosi.iso";
+    const container_path = "test-customize-cosi.container";
+    const workspace_path = "test-customize-cosi-work";
+    const output_path = workspace_path ++ "/output.cosi";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, container_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, workspace_path);
+
+    {
+        var file = try Io.Dir.cwd().createFile(io, iso_path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, "source-iso", 0);
+    }
+    {
+        var file = try Io.Dir.cwd().createFile(io, container_path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, "source-container", 0);
+    }
+
+    var request = validRequest();
+    request.input = .{ .iso_oci = .{
+        .iso_path = iso_path,
+        .container_path = container_path,
+        .rootfs_path_in_iso = "rootfs.squashfs",
+    } };
+    request.output = .{ .path = output_path, .format = .cosi, .size = 128 * mib };
+    request.execution.workspace_path = workspace_path;
+
+    const StagedGptRunner = struct {
+        fn run(
+            _: ?*anyopaque,
+            _: Allocator,
+            run_io: Io,
+            plan: *const ResolvedPlan,
+            _: ?EventSink,
+            stage_sink: build_image.StageSink,
+        ) !void {
+            for (plan.data.operations) |operation| {
+                const stage = freshStageForAction(operation.action) orelse continue;
+                if (!stage_sink.advance(stage)) return error.InvalidOperationOrder;
+            }
+            try createCustomizeGptTestDisk(
+                run_io,
+                plan.data.staging_output_path,
+                "test-customize-cosi-root.spool",
+            );
+        }
+    };
+
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    const plan = resolved.plan.?;
+    const operations = plan.data.operations;
+    const last = operations[operations.len - 1];
+    try std.testing.expectEqual(Action.write_cosi_bundle, last.action);
+    try std.testing.expectEqual(Phase.output_conversion, last.phase);
+    try std.testing.expectEqual(Action.convert_output, operations[operations.len - 2].action);
+    try std.testing.expect(std.mem.endsWith(u8, plan.data.staging_output_path, "output.img"));
+    try std.testing.expect(std.mem.endsWith(u8, plan.data.staging_commit_path, "output.cosi"));
+
+    var platform = Platform.system();
+    platform.runFn = StagedGptRunner.run;
+    var outcome = try execute(std.testing.allocator, io, &resolved.plan.?, platform, null);
+    defer outcome.deinit(std.testing.allocator);
+    try std.testing.expect(!outcome.diagnostics.hasErrors());
+    try std.testing.expect(outcome.result != null);
+
+    const record = outcome.result.?.provenance.execution.cosi.?;
+    try std.testing.expectEqualStrings(cosi.metadata_version, record.metadata_version);
+    try std.testing.expectEqual(@as(usize, 2), record.partition_count);
+    // A stand-in backend seals no verity tree, so the bundle describes none.
+    try std.testing.expect(!record.verity_included);
+    try std.testing.expectEqual(OutputFormat.cosi, outcome.result.?.provenance.final_output.format);
+
+    const bundle = try Io.Dir.cwd().openFile(io, output_path, .{});
+    defer bundle.close(io);
+    const bundle_size = (try bundle.stat(io)).size;
+    const bundle_bytes = try std.testing.allocator.alloc(u8, bundle_size);
+    defer std.testing.allocator.free(bundle_bytes);
+    _ = try bundle.readPositionalAll(io, bundle_bytes, 0);
+    try std.testing.expect(std.mem.indexOf(u8, bundle_bytes, "cosi-marker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle_bytes, "metadata.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle_bytes, "images/image_gpt.raw.zst") != null);
+    // A stand-in backend seals nothing, so every filesystem entry carries an
+    // explicitly empty verity block rather than an invented one.
+    try std.testing.expect(std.mem.indexOf(u8, bundle_bytes, "\"verity\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle_bytes, "\"roothash\"") == null);
+    try std.testing.expectEqual(bundle_size, outcome.result.?.provenance.final_output.size);
+
+    // The staged disk image was an intermediate, not the artifact: only the
+    // bundle survives the transaction.
+    try std.testing.expectError(
+        error.FileNotFound,
+        Io.Dir.cwd().statFile(io, plan.data.transaction_path, .{}),
+    );
+}
+
+test "a preserved COSI request is refused on a source without a GPT" {
+    const io = std.testing.io;
+    const source_path = "test-customize-cosi-mbr-source.raw";
+    const spool_path = "test-customize-cosi-mbr-root.spool";
+    const workspace_path = "test-customize-cosi-mbr-work";
+    const output_path = workspace_path ++ "/output.cosi";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, workspace_path);
+    try createCustomizeTestDisk(io, source_path, spool_path);
+
+    var request = validNativeEditRequest(source_path, output_path, workspace_path, &.{});
+    request.output.format = .cosi;
+
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.plan != null);
+
+    var report = try preflight(std.testing.allocator, io, &resolved.plan.?, Platform.system());
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expect(!report.ready());
+    try std.testing.expect(hasDiagnosticCode(report.diagnostics, .missing_capability));
+    var saw_gpt_requirement = false;
+    for (report.capabilities) |check| {
+        if (check.requirement.kind != .gpt_source) continue;
+        saw_gpt_requirement = true;
+        try std.testing.expectEqual(CapabilityState.missing, check.state);
+    }
+    try std.testing.expect(saw_gpt_requirement);
+}
+
+test "native-edit publishes a COSI bundle from a GPT source" {
+    const io = std.testing.io;
+    const source_path = "test-customize-cosi-edit-source.raw";
+    const spool_path = "test-customize-cosi-edit-root.spool";
+    const edit_path = "test-customize-cosi-edit-content.txt";
+    const workspace_path = "test-customize-cosi-edit-work";
+    const output_path = workspace_path ++ "/output.cosi";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, edit_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, workspace_path);
+    try createCustomizeGptTestDisk(io, source_path, spool_path);
+    {
+        const edit_source = try Io.Dir.cwd().createFile(io, edit_path, .{});
+        defer edit_source.close(io);
+        try edit_source.writePositionalAll(io, "after\n", 0);
+    }
+
+    const operations = [_]ExistingPathOperation{
+        .{ .overwrite_file = .{
+            .path = "/etc/config",
+            .source = .{ .host_path = edit_path },
+        } },
+    };
+    var request = validNativeEditRequest(source_path, output_path, workspace_path, &operations);
+    request.output.format = .cosi;
+    request.storage.preserve.root_partition = .{ .gpt_index = 2 };
+
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    const operations_planned = resolved.plan.?.data.operations;
+    try std.testing.expectEqual(
+        Action.write_cosi_bundle,
+        operations_planned[operations_planned.len - 1].action,
+    );
+    try std.testing.expectEqual(
+        Action.publish_standalone_output,
+        operations_planned[operations_planned.len - 2].action,
+    );
+
+    var report = try preflight(std.testing.allocator, io, &resolved.plan.?, Platform.system());
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expect(report.ready());
+
+    var outcome = try execute(std.testing.allocator, io, &resolved.plan.?, Platform.system(), null);
+    defer outcome.deinit(std.testing.allocator);
+    try std.testing.expect(!outcome.diagnostics.hasErrors());
+    try std.testing.expect(outcome.result != null);
+
+    const record = outcome.result.?.provenance.execution.cosi.?;
+    try std.testing.expectEqual(@as(usize, 2), record.partition_count);
+    // Only the backend that sealed a hash tree can describe one, and the
+    // preserved editor seals none.
+    try std.testing.expect(!record.verity_included);
+    // The staged image is raw whatever the bundle is, and provenance says so.
+    try std.testing.expectEqual(Format.raw, outcome.result.?.provenance.execution.preserved.?.output_format);
+
+    const bundle = try Io.Dir.cwd().openFile(io, output_path, .{});
+    defer bundle.close(io);
+    const bundle_size = (try bundle.stat(io)).size;
+    const bundle_bytes = try std.testing.allocator.alloc(u8, bundle_size);
+    defer std.testing.allocator.free(bundle_bytes);
+    _ = try bundle.readPositionalAll(io, bundle_bytes, 0);
+    try std.testing.expect(std.mem.indexOf(u8, bundle_bytes, "cosi-marker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle_bytes, "\"osArch\":\"x86_64\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle_bytes, "ID=zvmi") != null);
+}
+
+test "a gen1 fresh request cannot ask for a COSI output" {
+    var request = validRequest();
+    request.output = .{ .path = "output.cosi", .format = .cosi, .size = 128 * mib };
+    request.storage.fresh.generation = .gen1;
+
+    var diagnostics = try validate(std.testing.allocator, &request);
+    defer diagnostics.deinit(std.testing.allocator);
+    try std.testing.expect(hasDiagnosticCode(diagnostics, .unsupported_output_format));
+
+    request.storage.fresh.generation = .gen2;
+    var gen2 = try validate(std.testing.allocator, &request);
+    defer gen2.deinit(std.testing.allocator);
+    try std.testing.expect(!hasDiagnosticCode(gen2, .unsupported_output_format));
 }
 
 test "execution never publishes while a backend lease remains active" {
