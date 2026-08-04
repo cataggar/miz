@@ -54,6 +54,8 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
         .allocator = allocator,
         .tools = .init(allocator),
         .installed_packages = .init(allocator),
+        .baseline_packages = .init(allocator),
+        .emitted_lock = .init(allocator),
     };
     const outcome = session.run();
     session.teardown();
@@ -62,6 +64,7 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
         .failure = outcome.failure,
         .tools = session.tools.items,
         .installed_packages = session.installed_packages.items,
+        .package_lock = session.emitted_lock.items,
     });
     powerOff();
 }
@@ -78,6 +81,13 @@ const Session = struct {
     allocator: Allocator,
     tools: std.array_list.Managed(control_mod.Tool),
     installed_packages: std.array_list.Managed([]const u8),
+    /// The installed set as it stood before the package actions ran. Read only
+    /// under a pinned control document, which is the only one with a question
+    /// to ask of it: what this transaction added.
+    baseline_packages: std.array_list.Managed([]const u8),
+    /// What the transaction added or changed, as the pins that would restate
+    /// it. Sent home whether or not the control document declared any.
+    emitted_lock: std.array_list.Managed(control_mod.PackagePin),
 
     /// Captured as soon as the control document parses, so that even a refusal
     /// to act on the rest of it still gets an answer home.
@@ -139,12 +149,23 @@ const Session = struct {
         self.importTrust(control) catch |err| {
             return self.stageFailure("repository-trust", err);
         };
+        // Before the first action, so the baseline is the root as it arrived.
+        // Read for any run with package actions, not only a pinned one: the
+        // emitted lock is the difference between the two inventories, and the
+        // run that declares no pins is the one most likely to want them.
+        if (control.actions.len != 0) {
+            self.readInstalledPackages(&self.baseline_packages) catch |err| {
+                return self.stageFailure("package-baseline", err);
+            };
+        }
         for (control.actions) |action| {
             const executed = switch (action) {
-                .install => |names| self.runTdnf("install", names, control.repositories),
+                .install => |names| self.runTdnfPinned("install", names, control),
+                // The one verb a pin does not rewrite: asking to remove one
+                // exact version would silently leave any other in place.
                 .remove => |names| self.runTdnf("remove", names, &.{}),
                 .update_all => self.runTdnf("update", &.{}, control.repositories),
-                .update_selected => |names| self.runTdnf("update", names, control.repositories),
+                .update_selected => |names| self.runTdnfPinned("update", names, control),
             };
             executed catch |err| return self.stageFailure("packages", err);
         }
@@ -183,7 +204,100 @@ const Session = struct {
         self.loadInstalledPackages() catch |err| {
             return self.stageFailure("package-inventory", err);
         };
+        // After the inventory and before the result is published: a run whose
+        // pins did not hold must come home as a failure, not as a success
+        // whose report happens to disagree with the plan that produced it.
+        self.verifyPackagePins(control.package_pins) catch |err| {
+            return self.stageFailure("package-lock", err);
+        };
+        self.emitPackageLock(control) catch |err| {
+            return self.stageFailure("package-lock", err);
+        };
         return .{};
+    }
+
+    /// Runs a package verb whose names the control document pins, substituting
+    /// each name with its exact identity.
+    ///
+    /// Asking for the pinned release outright rather than asking for the name
+    /// and complaining afterwards: the second would fail builds that could
+    /// have succeeded by asking the right question first.
+    fn runTdnfPinned(
+        self: *Session,
+        verb: []const u8,
+        names: []const []const u8,
+        control: control_mod.Control,
+    ) !void {
+        if (control.package_pins.len == 0) {
+            return self.runTdnf(verb, names, control.repositories);
+        }
+        var specs: std.array_list.Managed([]const u8) = .init(self.allocator);
+        for (names) |name| {
+            const pin = control_mod.findPackagePin(control.package_pins, name) orelse
+                return error.UnpinnedPackageAction;
+            try specs.append(try std.fmt.allocPrint(
+                self.allocator,
+                "{s}-{s}.{s}",
+                .{ pin.name, pin.evr, pin.architecture },
+            ));
+        }
+        try self.runTdnf(verb, specs.items, control.repositories);
+    }
+
+    /// Records what this transaction changed, as the pins that would reproduce
+    /// it.
+    ///
+    /// The difference between the two inventories rather than the whole final
+    /// one: the whole final one travels home beside it and is mostly the input
+    /// image, so a lock naming it would say nothing about the run. A record
+    /// that does not parse as rpm's own output fails the run rather than being
+    /// dropped, because an emitted lock with a hole in it is worse than none.
+    fn emitPackageLock(self: *Session, control: control_mod.Control) !void {
+        if (control.actions.len == 0) return;
+        for (self.installed_packages.items) |installed| {
+            if (containsBytes(self.baseline_packages.items, installed)) continue;
+            const pin = control_mod.parseInstalledPackageRecord(installed) orelse
+                return error.InvalidInstalledPackageRecord;
+            try self.emitted_lock.append(pin);
+        }
+    }
+
+    /// Holds the finished root to the pins it was built under.
+    ///
+    /// Both directions, because each catches a different failure. A pin the rpm
+    /// database does not hold at that identity means the transaction resolved
+    /// somewhere the request did not point. A package this transaction added
+    /// that no pin names means the dependencies of a pinned install were left
+    /// free -- an image pinned in one place and open in the others, published
+    /// under a plan hash that says otherwise.
+    fn verifyPackagePins(
+        self: *Session,
+        pins: []const control_mod.PackagePin,
+    ) !void {
+        if (pins.len == 0) return;
+        for (pins) |pin| {
+            const spec = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}-{s}.{s}",
+                .{ pin.name, pin.evr, pin.architecture },
+            );
+            if (containsBytes(self.installed_packages.items, spec)) continue;
+            const prefix = try std.fmt.allocPrint(self.allocator, "{s}-", .{pin.name});
+            for (self.installed_packages.items) |installed| {
+                // Present under the pinned name at some other identity, which
+                // is a different failure from never having been installed.
+                if (std.mem.startsWith(u8, installed, prefix)) {
+                    return error.LockedPackageMismatch;
+                }
+            }
+            return error.LockedPackageMissing;
+        }
+        for (self.installed_packages.items) |installed| {
+            if (containsBytes(self.baseline_packages.items, installed)) continue;
+            if (!control_mod.pinsCoverRecord(pins, installed)) {
+                return error.UnlockedPackageInstalled;
+            }
+        }
     }
 
     fn stageFailure(self: *Session, stage: []const u8, err: anyerror) Outcome {
@@ -427,6 +541,13 @@ const Session = struct {
     }
 
     fn loadInstalledPackages(self: *Session) !void {
+        try self.readInstalledPackages(&self.installed_packages);
+    }
+
+    fn readInstalledPackages(
+        self: *Session,
+        into: *std.array_list.Managed([]const u8),
+    ) !void {
         const output = try self.captureChroot(&.{
             "/usr/bin/rpm",
             "-qa",
@@ -438,9 +559,16 @@ const Session = struct {
             if (line.len == 0 or std.mem.indexOfScalar(u8, line, 0) != null) {
                 return error.InvalidInstalledPackageRecord;
             }
-            try self.installed_packages.append(line);
+            try into.append(line);
         }
-        std.mem.sort([]const u8, self.installed_packages.items, {}, lessThanBytes);
+        std.mem.sort([]const u8, into.items, {}, lessThanBytes);
+    }
+
+    fn containsBytes(haystack: []const []const u8, needle: []const u8) bool {
+        for (haystack) |candidate| {
+            if (std.mem.eql(u8, candidate, needle)) return true;
+        }
+        return false;
     }
 
     fn runChroot(self: *Session, argv: []const []const u8) !void {
@@ -1150,6 +1278,8 @@ test "a module member the agent will not open is refused before any syscall" {
         .allocator = arena.allocator(),
         .tools = .init(arena.allocator()),
         .installed_packages = .init(arena.allocator()),
+        .baseline_packages = .init(arena.allocator()),
+        .emitted_lock = .init(arena.allocator()),
     };
 
     // The host validated this too, but a guest that trusts its control

@@ -484,6 +484,26 @@ fn controlFromPolicy(
         };
     }
 
+    // Only the exact variant reaches the guest. A snapshot names a state of
+    // the repositories, which nothing inside the target root can be compared
+    // against, so it is refused here rather than carried into a run that would
+    // report it honoured.
+    const package_pins: []const vm_control.PackagePin = switch (input.packages.lock) {
+        .unlocked => &.{},
+        .snapshot => return error.UnsupportedPackagePolicy,
+        .exact => |locks| pins: {
+            const pins = try allocator.alloc(vm_control.PackagePin, locks.len);
+            for (locks, pins) |lock, *pin| {
+                pin.* = .{
+                    .name = lock.name,
+                    .evr = lock.evr,
+                    .architecture = lock.architecture,
+                };
+            }
+            break :pins pins;
+        },
+    };
+
     // Rendered on the host so the bytes a request produces do not depend on
     // which backend carries it out; the guest only places them.
     const rendered = try os_customization.renderKernelModules(
@@ -517,6 +537,7 @@ fn controlFromPolicy(
         },
         .repositories = repositories,
         .actions = actions,
+        .package_pins = package_pins,
         .initramfs = switch (input.initramfs) {
             .unchanged => .unchanged,
             .regenerate => |regenerate| .{ .regenerate = .{
@@ -1155,6 +1176,18 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
         slot.* = try owned.dupe(u8, name);
     }
 
+    const emitted_lock = try owned.alloc(
+        customize.PackageVersionLock,
+        input.result.package_lock.len,
+    );
+    for (input.result.package_lock, emitted_lock) |pin, *slot| {
+        slot.* = .{
+            .name = try owned.dupe(u8, pin.name),
+            .evr = try owned.dupe(u8, pin.evr),
+            .architecture = try owned.dupe(u8, pin.architecture),
+        };
+    }
+
     // Built whole and only then published into the union, so a set tag can
     // never be read alongside a payload that is still being filled in.
     const boot_record: customize.VmBootRecord = switch (input.boot) {
@@ -1189,6 +1222,7 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
         .arena = arena,
         .tools = tools,
         .installed_packages = packages,
+        .package_lock = emitted_lock,
         .execution = .{
             .emulator_command = try owned.dupe(u8, input.policy.emulator_command),
             .emulator_version = try owned.dupe(u8, input.emulator_version),

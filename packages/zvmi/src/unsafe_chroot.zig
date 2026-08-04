@@ -243,6 +243,12 @@ const ExecutionResult = struct {
 const WorkerReport = struct {
     tools: []const customize.ToolRecord,
     installed_packages: []const []const u8,
+    /// Every package this transaction added or changed, at the exact identity
+    /// it settled on. This is the lock a later run can state to get the same
+    /// closure, which is why it is emitted whether or not one was declared:
+    /// the run that has nothing to verify is exactly the run you want a lock
+    /// out of.
+    package_lock: []const customize.PackageVersionLock = &.{},
     hooks: []const customize.HookRecord = &.{},
 };
 
@@ -281,6 +287,8 @@ fn executeManifest(
         .manifest = manifest,
         .tools = .init(allocator),
         .installed_packages = .init(allocator),
+        .baseline_packages = .init(allocator),
+        .emitted_lock = .init(allocator),
         .preexisting_loops = .init(allocator),
         .hook_records = .init(allocator),
     };
@@ -292,6 +300,7 @@ fn executeManifest(
         .report = .{
             .tools = session.tools.items,
             .installed_packages = session.installed_packages.items,
+            .package_lock = session.emitted_lock.items,
             .hooks = session.hook_records.items,
         },
     };
@@ -316,6 +325,12 @@ const Session = struct {
     resolver_had_original: bool = false,
     tools: std.array_list.Managed(customize.ToolRecord),
     installed_packages: std.array_list.Managed([]const u8),
+    /// The installed set as it stood before the package actions ran, in the
+    /// same `NAME-EPOCH:VERSION-RELEASE.ARCH` form as `installed_packages`.
+    /// Populated only under an exact lock, which is the only policy that has a
+    /// question to ask of it: what this transaction added.
+    baseline_packages: std.array_list.Managed([]const u8),
+    emitted_lock: std.array_list.Managed(customize.PackageVersionLock),
     preexisting_loops: std.array_list.Managed([]const u8),
     hook_records: std.array_list.Managed(customize.HookRecord),
     rpm_version: []const u8 = "",
@@ -327,6 +342,12 @@ const Session = struct {
         self.open() catch return null;
         self.runPolicy() catch return null;
         self.loadInstalledPackages() catch return null;
+        // After the rpm database has been read, and before `close` publishes
+        // anything: a run whose lock did not hold must fail while the image is
+        // still staging, not after it has been committed under a plan hash
+        // that claims the versions were pinned.
+        self.verifyPackageLock() catch return null;
+        self.emitPackageLock() catch return null;
         return {};
     }
 
@@ -546,14 +567,23 @@ const Session = struct {
     }
 
     fn runPolicy(self: *Session) !void {
+        // Before the first repository file exists, so the baseline is the root
+        // as it arrived rather than the root as this run had begun to arrange
+        // it. Read for any run with package actions, not only a locked one:
+        // the emitted lock is the difference between the two inventories, and
+        // a run that declares no lock is the one most likely to want one.
+        if (self.manifest.packages.actions.len != 0) try self.loadBaselinePackages();
         try self.writeRepositoryFiles();
         errdefer self.removeRepositoryFiles() catch {};
         try self.importTrust();
         for (self.manifest.packages.actions) |action| switch (action) {
-            .install => |names| try self.runTdnf("install", names, true),
+            .install => |names| try self.runTdnfLocked("install", names),
+            // The one verb a lock does not rewrite. A removal names what must
+            // not be installed, and asking to remove one exact version would
+            // silently leave any other in place.
             .remove => |names| try self.runTdnf("remove", names, false),
             .update_all => try self.runTdnf("update", &.{}, true),
-            .update_selected => |names| try self.runTdnf("update", names, true),
+            .update_selected => |names| try self.runTdnfLocked("update", names),
         };
         try self.removeRepositoryFiles();
         // After the packages, so a package that ships its own modprobe
@@ -693,7 +723,126 @@ const Session = struct {
         }
     }
 
+    /// Runs a package verb whose names an exact lock has something to say
+    /// about, substituting each name with the pinned identity.
+    ///
+    /// The substitution is what makes the lock a lock rather than a report:
+    /// asking tdnf for `openssh` and checking afterwards that it happened to
+    /// land on the pinned release would fail a build that could have succeeded
+    /// by asking for the release in the first place. `validatePackageLock`
+    /// has already refused any action naming a package the lock omits, so
+    /// every name here resolves to exactly one pin.
+    fn runTdnfLocked(
+        self: *Session,
+        verb: []const u8,
+        names: []const []const u8,
+    ) !void {
+        const pins = switch (self.manifest.packages.lock) {
+            .exact => |pins| pins,
+            else => return self.runTdnf(verb, names, true),
+        };
+        var specs = std.array_list.Managed([]const u8).init(self.allocator);
+        defer {
+            for (specs.items) |spec| self.allocator.free(spec);
+            specs.deinit();
+        }
+        for (names) |name| {
+            const pin = findPin(pins, name) orelse return error.UnlockedPackageRequested;
+            try specs.append(try std.fmt.allocPrint(
+                self.allocator,
+                "{s}-{s}.{s}",
+                .{ pin.name, pin.evr, pin.architecture },
+            ));
+        }
+        try self.runTdnf(verb, specs.items, true);
+    }
+
+    /// Holds the finished root to the lock it was built under.
+    ///
+    /// Two questions, and both have to be asked. Every pin must name a package
+    /// the rpm database actually holds at that exact identity, or the
+    /// transaction resolved somewhere the request did not point. And every
+    /// package this transaction added must be covered by a pin, or the lock
+    /// pinned the packages the caller named and left their dependencies free
+    /// -- which is an image pinned in one place and open in the others, built
+    /// under a plan hash that says otherwise.
+    ///
+    /// The second question is why the baseline exists. Comparing the whole
+    /// installed set against the lock would demand that a lock enumerate the
+    /// hundreds of packages the input image already carried, none of which
+    /// this run chose. The delta is the part the run is answerable for.
+    fn verifyPackageLock(self: *Session) !void {
+        const pins = switch (self.manifest.packages.lock) {
+            .unlocked => return,
+            // Refused before the root was opened; repeated so that a policy
+            // this function cannot check can never be read as one it checked
+            // and found satisfied.
+            .snapshot => return error.UnsupportedPackagePolicy,
+            .exact => |pins| pins,
+        };
+        for (pins) |pin| {
+            const spec = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}-{s}.{s}",
+                .{ pin.name, pin.evr, pin.architecture },
+            );
+            defer self.allocator.free(spec);
+            if (containsBytes(self.installed_packages.items, spec)) continue;
+            // Distinguished because they are different failures: an absent
+            // package means the transaction never installed what was pinned,
+            // while a present one at another identity means it installed
+            // something else under the same name.
+            const prefix = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}-",
+                .{pin.name},
+            );
+            defer self.allocator.free(prefix);
+            for (self.installed_packages.items) |installed| {
+                if (std.mem.startsWith(u8, installed, prefix)) {
+                    return error.LockedPackageMismatch;
+                }
+            }
+            return error.LockedPackageMissing;
+        }
+        for (self.installed_packages.items) |installed| {
+            if (containsBytes(self.baseline_packages.items, installed)) continue;
+            if (!pinsCover(pins, installed)) return error.UnlockedPackageInstalled;
+        }
+    }
+
+    /// Records what this transaction changed, as the lock that would reproduce
+    /// it.
+    ///
+    /// The difference between the two inventories rather than the whole final
+    /// one, because the whole final one is already recorded beside it and is
+    /// mostly the input image: a lock naming the hundreds of packages the run
+    /// did not choose would say nothing about the run. A record that parses as
+    /// something other than rpm's own output is a refusal rather than a
+    /// skipped entry -- an emitted lock with a hole in it is worse than none,
+    /// because the next run would state it and believe it complete.
+    fn emitPackageLock(self: *Session) !void {
+        if (self.manifest.packages.actions.len == 0) return;
+        for (self.installed_packages.items) |installed| {
+            if (containsBytes(self.baseline_packages.items, installed)) continue;
+            const pin = customize.parseInstalledPackageRecord(installed) orelse
+                return error.InvalidInstalledPackageRecord;
+            try self.emitted_lock.append(pin);
+        }
+    }
+
+    fn loadBaselinePackages(self: *Session) !void {
+        try self.readInstalledPackages(&self.baseline_packages);
+    }
+
     fn loadInstalledPackages(self: *Session) !void {
+        try self.readInstalledPackages(&self.installed_packages);
+    }
+
+    fn readInstalledPackages(
+        self: *Session,
+        into: *std.array_list.Managed([]const u8),
+    ) !void {
         const output = try self.runChrootCapture(&.{
             "/usr/bin/rpm",
             "-qa",
@@ -705,16 +854,9 @@ const Session = struct {
             if (line.len == 0 or std.mem.indexOfScalar(u8, line, 0) != null) {
                 return error.InvalidInstalledPackageRecord;
             }
-            try self.installed_packages.append(
-                try self.allocator.dupe(u8, line),
-            );
+            try into.append(try self.allocator.dupe(u8, line));
         }
-        std.mem.sort(
-            []const u8,
-            self.installed_packages.items,
-            {},
-            lessThanBytes,
-        );
+        std.mem.sort([]const u8, into.items, {}, lessThanBytes);
     }
 
     fn close(self: *Session) bool {
@@ -1680,11 +1822,129 @@ fn tdnfConfigHostPath(
     return std.fmt.allocPrint(allocator, "{s}/run/zvmi-tdnf.conf", .{root_path});
 }
 
+/// Finds the pin for a package name, or nothing.
+///
+/// Linear because a lock is the closure of one transaction rather than of a
+/// distribution: tens of entries, walked a handful of times.
+fn findPin(
+    pins: []const customize.PackageVersionLock,
+    name: []const u8,
+) ?customize.PackageVersionLock {
+    for (pins) |pin| {
+        if (std.mem.eql(u8, pin.name, name)) return pin;
+    }
+    return null;
+}
+
+/// Whether any pin names the `NAME-EPOCH:VERSION-RELEASE.ARCH` record given.
+///
+/// Rebuilding the pin's own spec and comparing whole strings, rather than
+/// matching the record's name and then its version, because the record is one
+/// value with no delimiter that a name may not also contain: `foo-1:2-3.noarch`
+/// could be package `foo` or package `foo-1`, and only an equality against a
+/// candidate spec decides it without guessing.
+fn pinsCover(
+    pins: []const customize.PackageVersionLock,
+    record: []const u8,
+) bool {
+    for (pins) |pin| {
+        if (record.len != pin.name.len + 1 + pin.evr.len + 1 + pin.architecture.len) continue;
+        if (!std.mem.startsWith(u8, record, pin.name)) continue;
+        if (record[pin.name.len] != '-') continue;
+        const rest = record[pin.name.len + 1 ..];
+        if (!std.mem.startsWith(u8, rest, pin.evr)) continue;
+        if (rest[pin.evr.len] != '.') continue;
+        if (!std.mem.eql(u8, rest[pin.evr.len + 1 ..], pin.architecture)) continue;
+        return true;
+    }
+    return false;
+}
+
+fn containsBytes(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |candidate| {
+        if (std.mem.eql(u8, candidate, needle)) return true;
+    }
+    return false;
+}
+
+/// The lock rules the worker enforces on its own side of the privilege
+/// boundary.
+///
+/// `validate` already refused every lock that is not a complete identity, and
+/// `unsafeChrootCapabilityState` already refused every one whose bytes this
+/// backend could not put on a command line. Both ran in the parent. This
+/// manifest arrives as JSON read after re-execing as root, so neither of those
+/// checks covers the bytes actually in hand.
+fn validManifestLock(lock: customize.PackageLockPolicy) bool {
+    const pins = switch (lock) {
+        .unlocked => return true,
+        // Nothing in this root can be compared against a repository snapshot
+        // id, so the worker must not accept one and then run as though the
+        // policy had been honoured.
+        .snapshot => return false,
+        .exact => |pins| pins,
+    };
+    if (pins.len == 0) return false;
+    for (pins, 0..) |pin, index| {
+        if (!validPackageName(pin.name)) return false;
+        if (!validLockEvr(pin.evr)) return false;
+        if (!validKernelRelease(pin.architecture)) return false;
+        for (pins[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.name, pin.name) and
+                std.mem.eql(u8, previous.architecture, pin.architecture))
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn validLockEvr(evr: []const u8) bool {
+    if (evr.len == 0 or !std.ascii.isAlphanumeric(evr[0])) return false;
+    // The full `epoch:version-release`, for the reason `PackageVersionLock`
+    // gives: a bare version is not a pin.
+    if (std.mem.indexOfScalar(u8, evr, ':') == null) return false;
+    if (std.mem.indexOfScalar(u8, evr, '-') == null) return false;
+    for (evr[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            byte != '.' and
+            byte != '_' and
+            byte != '+' and
+            byte != '-' and
+            byte != '~' and
+            byte != '^' and
+            byte != ':')
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 fn validateManifestPolicy(manifest: Manifest) !void {
     if (manifest.packages.cache != .online or
-        manifest.packages.lock != .unlocked)
+        !validManifestLock(manifest.packages.lock))
     {
         return error.UnsupportedPackagePolicy;
+    }
+    // A locked run rewrites these names into pinned specs, so one the lock
+    // omits would silently run unpinned inside a transaction the plan hash
+    // describes as pinned.
+    if (manifest.packages.lock == .exact) {
+        const pins = manifest.packages.lock.exact;
+        for (manifest.packages.actions) |action| {
+            const names: []const []const u8 = switch (action) {
+                .install, .update_selected => |values| values,
+                .remove => continue,
+                // Its subject is whatever the repositories hold, which is the
+                // question the lock exists to close.
+                .update_all => return error.UnsupportedPackagePolicy,
+            };
+            for (names) |name| {
+                if (findPin(pins, name) == null) return error.UnsupportedPackagePolicy;
+            }
+        }
     }
     for (manifest.packages.repositories) |repository| {
         if (!validRepositoryId(repository.id)) return error.InvalidRepositoryId;
@@ -2179,6 +2439,7 @@ fn loadParentReport(
         .arena = arena,
         .tools = parsed.value.tools,
         .installed_packages = parsed.value.installed_packages,
+        .package_lock = parsed.value.package_lock,
         .hooks = parsed.value.hooks,
     };
 }

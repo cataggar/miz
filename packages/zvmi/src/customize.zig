@@ -32,8 +32,8 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 17;
-pub const provenance_schema_version: u32 = 20;
+pub const plan_schema_version: u32 = 18;
+pub const provenance_schema_version: u32 = 21;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -523,6 +523,20 @@ pub const PackageVersionLock = struct {
     /// multilib root can hold two of them at once.
     architecture: []const u8,
 };
+
+/// Splits an `rpm -qa` record of the form `NAME-EPOCH:VERSION-RELEASE.ARCH`
+/// back into the lock that would state it, or nothing if it is not one.
+///
+/// The rule itself lives in `vm_control` because the guest agent needs it too
+/// and cannot import this module. See there for why the split is decidable.
+pub fn parseInstalledPackageRecord(record: []const u8) ?PackageVersionLock {
+    const pin = vm_control.parseInstalledPackageRecord(record) orelse return null;
+    return .{
+        .name = pin.name,
+        .evr = pin.evr,
+        .architecture = pin.architecture,
+    };
+}
 
 pub const PackageLockPolicy = union(enum) {
     unlocked,
@@ -3644,6 +3658,21 @@ fn dupeStrings(allocator: Allocator, values: []const []const u8) Allocator.Error
     return owned;
 }
 
+fn dupePackageLock(
+    allocator: Allocator,
+    pins: []const PackageVersionLock,
+) Allocator.Error![]const PackageVersionLock {
+    const owned = try allocator.alloc(PackageVersionLock, pins.len);
+    for (pins, owned) |pin, *target| {
+        target.* = .{
+            .name = try allocator.dupe(u8, pin.name),
+            .evr = try allocator.dupe(u8, pin.evr),
+            .architecture = try allocator.dupe(u8, pin.architecture),
+        };
+    }
+    return owned;
+}
+
 fn dupeGeneralization(
     allocator: Allocator,
     policy: GeneralizationPolicy,
@@ -4916,11 +4945,19 @@ pub fn preflight(
                 .firmware => |firmware| vmFirmwareAvailable(io, firmware),
             } else .unsupported,
             .package_cache,
-            .package_lock,
             .selinux_policy,
             .selinux_relabel,
             .boot_policy_mutation,
             => .unsupported,
+            // Both executor backends enforce the lock now, and neither the
+            // rebuild backend nor any other runs a package transaction at all,
+            // so there is nothing for them to enforce it against.
+            .package_lock => if (plan.data.execution.backend == .vm)
+                vmCapabilityState(platform, io, plan)
+            else if (plan.data.execution.backend == .unsafe_chroot)
+                unsafeChrootCapabilityState(platform, io, plan)
+            else
+                .unsupported,
             .cross_architecture_runner,
             => if (plan.data.execution.backend == .vm)
                 vmCapabilityState(platform, io, plan)
@@ -4986,7 +5023,7 @@ fn unsafeChrootCapabilityState(
         data.selinux != .unchanged or
         !isDefaultBootPolicy(data.boot_security) or
         data.packages.cache != .online or
-        data.packages.lock != .unlocked)
+        !validUnsafePackageLock(data.packages.lock))
     {
         return .unsupported;
     }
@@ -5061,7 +5098,7 @@ fn vmCapabilityState(
         data.selinux != .unchanged or
         !isDefaultBootPolicy(data.boot_security) or
         data.packages.cache != .online or
-        data.packages.lock != .unlocked)
+        !validUnsafePackageLock(data.packages.lock))
     {
         return .unsupported;
     }
@@ -5144,6 +5181,50 @@ fn validUnsafePackageName(name: []const u8) bool {
             byte != '-' and
             byte != '~' and
             byte != '^')
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Gates the lock on what the executors can put on a package-manager command
+/// line and compare against the rpm database afterwards. `validate` has
+/// already refused every lock that is not a complete identity; this is the
+/// narrower question of whether these particular bytes are safe to hand to
+/// tdnf as a `name-epoch:version-release.arch` spec.
+fn validUnsafePackageLock(lock: PackageLockPolicy) bool {
+    const pins = switch (lock) {
+        .unlocked => return true,
+        // A snapshot names a state of the repositories, not of the target
+        // root, so there is nothing in the image for an executor to check it
+        // against. Whatever ends up honouring it belongs on the repository
+        // side of the run, and until something does, a plan that declares one
+        // must not resolve as though it were enforced.
+        .snapshot => return false,
+        .exact => |pins| pins,
+    };
+    for (pins) |pin| {
+        if (!validUnsafePackageName(pin.name)) return false;
+        if (!validUnsafeEvr(pin.evr)) return false;
+        if (!validUnsafeKernelRelease(pin.architecture)) return false;
+    }
+    return true;
+}
+
+/// An EVR carries one `:` that a package name may not, so it gets its own
+/// check rather than reusing the name rule.
+fn validUnsafeEvr(evr: []const u8) bool {
+    if (evr.len == 0 or !std.ascii.isAlphanumeric(evr[0])) return false;
+    for (evr[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            byte != '.' and
+            byte != '_' and
+            byte != '+' and
+            byte != '-' and
+            byte != '~' and
+            byte != '^' and
+            byte != ':')
         {
             return false;
         }
@@ -5455,6 +5536,7 @@ pub const UnsafeChrootRuntimeReport = struct {
     arena: std.heap.ArenaAllocator,
     tools: []const ToolRecord,
     installed_packages: []const []const u8,
+    package_lock: []const PackageVersionLock = &.{},
     hooks: []const HookRecord = &.{},
 
     pub fn deinit(self: *UnsafeChrootRuntimeReport) void {
@@ -5554,6 +5636,7 @@ pub const VmRuntimeReport = struct {
     arena: std.heap.ArenaAllocator,
     tools: []const ToolRecord,
     installed_packages: []const []const u8,
+    package_lock: []const PackageVersionLock = &.{},
     execution: VmExecutionRecord,
 
     pub fn deinit(self: *VmRuntimeReport) void {
@@ -5630,6 +5713,19 @@ pub const PreservedExecutionRecord = struct {
     flattened_backing_chain: bool,
     operation_count: usize,
     installed_packages: []const []const u8,
+    /// The lock this run would have to declare to install exactly what it
+    /// installed: every package the transaction added or changed, at the
+    /// identity it settled on, and nothing the input image already carried.
+    ///
+    /// Emitted whether or not a lock was declared. A run that verified one
+    /// restates it here, which is a tautology worth keeping because the
+    /// alternative is a provenance record whose meaning depends on the policy
+    /// beside it. A run that declared none is the interesting case: this is
+    /// where the lock for the next run comes from.
+    ///
+    /// Empty for a run with no package actions, where there is nothing to
+    /// state rather than nothing found.
+    emitted_package_lock: []const PackageVersionLock = &.{},
     /// Hooks that ran, in the order they ran. Empty for a run that declared
     /// none, which is not the same as a backend that could not have run them:
     /// that request never reaches a provenance record at all.
@@ -5860,6 +5956,16 @@ fn guestPackages(
     return &.{};
 }
 
+/// Same alternation, and for the same reason: one run, one emitted lock.
+fn guestPackageLock(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+    vm_report: ?*const VmRuntimeReport,
+) []const PackageVersionLock {
+    if (unsafe_report) |report| return report.package_lock;
+    if (vm_report) |report| return report.package_lock;
+    return &.{};
+}
+
 /// Hooks only ever run under the chroot backend, so there is one report that
 /// can hold them. Written as a lookup rather than read inline so the day the
 /// guest gains a script channel adds an arm here instead of a second spelling.
@@ -6017,6 +6123,10 @@ fn buildResult(
             .flattened_backing_chain = flattened,
             .operation_count = operation_count,
             .installed_packages = try dupeStrings(result_allocator, guestPackages(unsafe_report, vm_report)),
+            .emitted_package_lock = try dupePackageLock(
+                result_allocator,
+                guestPackageLock(unsafe_report, vm_report),
+            ),
             .hooks = try dupeHookRecords(result_allocator, guestHooks(unsafe_report)),
             .rebuild = if (rebuild_report) |report| .{
                 .profile = report.source_profile,
@@ -7753,6 +7863,30 @@ test "unsafe chroot preflight accepts only the implemented policy subset" {
 
     request = baseline;
     request.packages.lock = .{ .snapshot = "snapshot-1" };
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        try Check.state(&request, .x86_64),
+    );
+
+    // An exact lock the backend can put on a command line and check against
+    // the rpm database afterwards is one it can execute.
+    request = baseline;
+    request.packages.lock = .{ .exact = &.{
+        .{ .name = "dracut", .evr = "0:059-1.azl3", .architecture = "x86_64" },
+    } };
+    try std.testing.expectEqual(
+        CapabilityState.available,
+        try Check.state(&request, .x86_64),
+    );
+
+    // Not a validation duplicate. `validate` asks whether a lock states a
+    // whole identity; this asks the narrower question of whether these bytes
+    // are ones the backend can put on a package-manager command line. An
+    // architecture of `x86_64!` is a complete identity and still not one.
+    request = baseline;
+    request.packages.lock = .{ .exact = &.{
+        .{ .name = "dracut", .evr = "0:059-1.azl3", .architecture = "x86_64!" },
+    } };
     try std.testing.expectEqual(
         CapabilityState.unsupported,
         try Check.state(&request, .x86_64),
@@ -11512,4 +11646,47 @@ test "a lock covering the whole declared closure resolves" {
     for (removal_diagnostics.items) |diagnostic| {
         try std.testing.expect(diagnostic.code != .invalid_policy);
     }
+}
+
+test "an installed-package record splits back into the lock that would state it" {
+    const parsed = parseInstalledPackageRecord("dracut-0:059-1.azl3.x86_64").?;
+    try std.testing.expectEqualStrings("dracut", parsed.name);
+    try std.testing.expectEqualStrings("0:059-1.azl3", parsed.evr);
+    try std.testing.expectEqualStrings("x86_64", parsed.architecture);
+
+    // The case that defeats splitting on the first `-`.
+    const hyphenated = parseInstalledPackageRecord("python3-libs-0:3.12.9-1.azl3.aarch64").?;
+    try std.testing.expectEqualStrings("python3-libs", hyphenated.name);
+    try std.testing.expectEqualStrings("0:3.12.9-1.azl3", hyphenated.evr);
+    try std.testing.expectEqualStrings("aarch64", hyphenated.architecture);
+
+    // A name ending in a digit, where the character before the epoch's `-` is
+    // indistinguishable from part of a version.
+    const digits = parseInstalledPackageRecord("libstdc++6-0:13.2.0-3.noarch").?;
+    try std.testing.expectEqualStrings("libstdc++6", digits.name);
+    try std.testing.expectEqualStrings("0:13.2.0-3", digits.evr);
+    try std.testing.expectEqualStrings("noarch", digits.architecture);
+
+    // What a lock is built from has to round-trip, or the emitted lock names
+    // something other than what was installed.
+    for ([_][]const u8{
+        "dracut-0:059-1.azl3.x86_64",
+        "python3-libs-0:3.12.9-1.azl3.aarch64",
+        "libstdc++6-0:13.2.0-3.noarch",
+    }) |record| {
+        const pin = parseInstalledPackageRecord(record).?;
+        const rebuilt = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{s}-{s}.{s}",
+            .{ pin.name, pin.evr, pin.architecture },
+        );
+        defer std.testing.allocator.free(rebuilt);
+        try std.testing.expectEqualStrings(record, rebuilt);
+    }
+
+    // Not records rpm writes, and each one is a different way of not being.
+    try std.testing.expect(parseInstalledPackageRecord("dracut") == null);
+    try std.testing.expect(parseInstalledPackageRecord("dracut-059-1.x86_64") == null);
+    try std.testing.expect(parseInstalledPackageRecord("-0:1-1.x86_64") == null);
+    try std.testing.expect(parseInstalledPackageRecord("dracut-0:059-1.azl3.") == null);
 }

@@ -137,6 +137,15 @@ fn runIntegration(
         .aarch64 => .aarch64,
         else => return error.UnsupportedArchitecture,
     };
+    // The identity the stub `rpm -qa` reports, so the run has a lock that can
+    // actually hold. The install below is checked against the pinned spec
+    // rather than the bare name, which is the observable difference between a
+    // lock that is enforced and one that is merely recorded.
+    const lock = [_]zvmi.customize.PackageVersionLock{.{
+        .name = "integration-package",
+        .evr = "0:1.0-1",
+        .architecture = @tagName(builtin.cpu.arch),
+    }};
     const request = zvmi.customize.Request{
         .target_architecture = architecture,
         .input = .{ .disk = .{ .path = source_path } },
@@ -151,6 +160,7 @@ fn runIntegration(
         .packages = .{
             .actions = &actions,
             .repositories = &repositories,
+            .lock = .{ .exact = &lock },
         },
         .initramfs = .{ .regenerate = .{
             .generator = "dracut",
@@ -209,12 +219,26 @@ fn runIntegration(
     try ensure(result.provenance.tools.len == 5);
     const preserved = result.provenance.execution.preserved orelse
         return error.MissingPreservedProvenance;
-    try ensure(preserved.installed_packages.len == 1);
+    try ensure(preserved.installed_packages.len == 2);
     try ensure(std.mem.eql(
         u8,
         preserved.installed_packages[0],
-        installedNevra(),
+        preexisting_nevra,
     ));
+    try ensure(std.mem.eql(
+        u8,
+        preserved.installed_packages[1],
+        installed_nevra,
+    ));
+
+    // The emitted lock is the difference between the two inventories, so the
+    // package the root already carried must not be in it even though it is in
+    // the inventory beside it.
+    try ensure(preserved.emitted_package_lock.len == 1);
+    const emitted = preserved.emitted_package_lock[0];
+    try ensure(std.mem.eql(u8, emitted.name, "integration-package"));
+    try ensure(std.mem.eql(u8, emitted.evr, "0:1.0-1"));
+    try ensure(std.mem.eql(u8, emitted.architecture, @tagName(builtin.cpu.arch)));
 
     try expectOutputFile(
         allocator,
@@ -228,7 +252,7 @@ fn runIntegration(
         io,
         output_path,
         "/var/lib/zvmi-integration/installed",
-        "integration-package\n",
+        installed_nevra ++ "\n",
     );
     try expectOutputFile(
         allocator,
@@ -410,7 +434,13 @@ fn runGuestRpm(io: Io, args: []const []const u8) !void {
         return;
     }
     if (containsArg(args, "-qa")) {
-        std.debug.print("{s}\n", .{installedNevra()});
+        // The inventory answers differently before and after the transaction,
+        // because a stub that answered the same both times would let an
+        // emitted lock built from the difference pass while being empty.
+        std.debug.print("{s}\n", .{preexisting_nevra});
+        if (guestPathExists(io, "/var/lib/zvmi-integration/installed")) {
+            std.debug.print("{s}\n", .{installed_nevra});
+        }
         return;
     }
     return error.UnexpectedRpmInvocation;
@@ -496,12 +526,20 @@ fn writeGuestMarker(io: Io, path: []const u8, value: []const u8) !void {
     try file.writePositionalAll(io, "\n", value.len);
 }
 
-fn installedNevra() []const u8 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => "integration-package-0:1.0-1.x86_64",
-        .aarch64 => "integration-package-0:1.0-1.aarch64",
-        else => "integration-package-0:1.0-1.unknown",
-    };
+/// The one package the stub `rpm -qa` reports as installed, in the same
+/// `NAME-EPOCH:VERSION-RELEASE.ARCH` form the real command is asked for.
+/// A constant rather than a function so the pinned spec the lock produces can
+/// be spelled out at compile time beside it.
+const installed_nevra = "integration-package-0:1.0-1." ++ @tagName(builtin.cpu.arch);
+
+/// What the root already carried. Present in both inventories, so it must not
+/// appear in the emitted lock: a lock naming what the run did not choose says
+/// nothing about the run.
+const preexisting_nevra = "base-files-0:2.0-3.azl3." ++ @tagName(builtin.cpu.arch);
+
+fn guestPathExists(io: Io, path: []const u8) bool {
+    _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
+    return true;
 }
 
 fn argumentAfter(

@@ -20,7 +20,7 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
-pub const control_version: u32 = 1;
+pub const control_version: u32 = 2;
 pub const result_version: u32 = 1;
 
 /// Path the host writes the control document to inside the initramfs, and the
@@ -67,6 +67,9 @@ pub const Error = error{
     TooManyModules,
     UnknownTargetFile,
     DuplicateTargetFile,
+    InvalidPackagePin,
+    DuplicatePackagePin,
+    UnpinnedPackageAction,
 };
 
 pub const Network = union(enum) {
@@ -318,6 +321,15 @@ pub const Control = struct {
     network: Network,
     repositories: []const Repository = &.{},
     actions: []const Action = &.{},
+    /// The exact identities every package this transaction installs must end
+    /// up at, or empty for an unlocked run.
+    ///
+    /// A flat list rather than the library's `PackageLockPolicy` union because
+    /// the only variant the guest can act on is the exact one: a repository
+    /// snapshot names a state of the repositories, which nothing inside the
+    /// target root can be compared against. The host refuses the others before
+    /// a control document is written, so there is no variant left to carry.
+    package_pins: []const PackagePin = &.{},
     /// Whether, and for which kernel releases, the initramfs is regenerated.
     initramfs: Initramfs = .unchanged,
     /// Kernel-module configuration the host rendered, placed in the target
@@ -377,6 +389,37 @@ pub const Control = struct {
             }
         }
 
+        for (self.package_pins, 0..) |pin, index| {
+            if (!validPackageName(pin.name)) return error.InvalidPackagePin;
+            if (!validPackageEvr(pin.evr)) return error.InvalidPackagePin;
+            if (!validKernelRelease(pin.architecture)) return error.InvalidPackagePin;
+            for (self.package_pins[0..index]) |earlier| {
+                if (std.mem.eql(u8, earlier.name, pin.name) and
+                    std.mem.eql(u8, earlier.architecture, pin.architecture))
+                {
+                    return error.DuplicatePackagePin;
+                }
+            }
+        }
+        if (self.package_pins.len != 0) {
+            for (self.actions) |action| {
+                const names: []const []const u8 = switch (action) {
+                    .install, .update_selected => |values| values,
+                    // A removal names what must not be installed; a pin names
+                    // a version for what is.
+                    .remove => continue,
+                    // Its subject is whatever the repositories hold, which is
+                    // the question a pin exists to close.
+                    .update_all => return error.UnpinnedPackageAction,
+                };
+                for (names) |name| {
+                    if (findPackagePin(self.package_pins, name) == null) {
+                        return error.UnpinnedPackageAction;
+                    }
+                }
+            }
+        }
+
         switch (self.initramfs) {
             .unchanged => {},
             .regenerate => |regenerate| for (regenerate.kernels) |kernel| {
@@ -407,6 +450,98 @@ pub const Control = struct {
     }
 };
 
+/// One package pinned to an exact rpm identity. Mirrors
+/// `customize.PackageVersionLock`, which documents why there is no repository
+/// field and why the EVR is required in full.
+pub const PackagePin = struct {
+    name: []const u8,
+    /// rpm's `EPOCH:VERSION-RELEASE`, epoch always written.
+    evr: []const u8,
+    architecture: []const u8,
+};
+
+/// Splits an `rpm -qa` record of the form `NAME-EPOCH:VERSION-RELEASE.ARCH`
+/// back into its parts, or nothing if it is not one.
+///
+/// Unambiguous despite having no reserved delimiter, and worth stating why
+/// because the obvious readings are both wrong. Splitting on the first `-`
+/// fails for a name like `python3-libs`; splitting on the first `.` fails for
+/// a release like `1.azl3`. What makes it decidable is the epoch: it is the
+/// only field that may contain `:`, and it may not contain `-`, so the `-`
+/// immediately before the `:` is always the boundary between the name and the
+/// version. The architecture is whatever follows the last `.`, because no rpm
+/// architecture contains one while a release routinely does.
+///
+/// This is how a completed run turns its own installed set into a lock the
+/// next run can state, so it has to agree exactly with the `--qf` format both
+/// backends ask rpm for.
+pub fn parseInstalledPackageRecord(record: []const u8) ?PackagePin {
+    const architecture_dot = std.mem.lastIndexOfScalar(u8, record, '.') orelse return null;
+    const architecture = record[architecture_dot + 1 ..];
+    if (architecture.len == 0) return null;
+    const head = record[0..architecture_dot];
+    const colon = std.mem.indexOfScalar(u8, head, ':') orelse return null;
+    const name_end = std.mem.lastIndexOfScalar(u8, head[0..colon], '-') orelse return null;
+    if (name_end == 0) return null;
+    const evr = head[name_end + 1 ..];
+    // A release as well as a version: the `-` that separates them has to come
+    // after the epoch, or this is a record rpm did not write.
+    if (std.mem.indexOfScalarPos(u8, evr, colon - name_end, '-') == null) return null;
+    return .{
+        .name = head[0..name_end],
+        .evr = evr,
+        .architecture = architecture,
+    };
+}
+
+pub fn findPackagePin(pins: []const PackagePin, name: []const u8) ?PackagePin {
+    for (pins) |pin| {
+        if (std.mem.eql(u8, pin.name, name)) return pin;
+    }
+    return null;
+}
+
+/// Whether a `NAME-EPOCH:VERSION-RELEASE.ARCH` record is one of these pins.
+///
+/// Reassembles each pin and compares whole strings rather than splitting the
+/// record, because the record has no delimiter a package name may not also
+/// contain: `foo-1:2-3.noarch` could be `foo` at `1:2-3` or `foo-1` at
+/// something else, and only equality against a candidate decides it.
+pub fn pinsCoverRecord(pins: []const PackagePin, record: []const u8) bool {
+    for (pins) |pin| {
+        if (record.len != pin.name.len + pin.evr.len + pin.architecture.len + 2) continue;
+        if (!std.mem.startsWith(u8, record, pin.name)) continue;
+        if (record[pin.name.len] != '-') continue;
+        const rest = record[pin.name.len + 1 ..];
+        if (!std.mem.startsWith(u8, rest, pin.evr)) continue;
+        if (rest[pin.evr.len] != '.') continue;
+        if (!std.mem.eql(u8, rest[pin.evr.len + 1 ..], pin.architecture)) continue;
+        return true;
+    }
+    return false;
+}
+
+/// An EVR carries the one `:` a package name may not, so it gets its own rule.
+pub fn validPackageEvr(evr: []const u8) bool {
+    if (evr.len == 0 or !std.ascii.isAlphanumeric(evr[0])) return false;
+    if (std.mem.indexOfScalar(u8, evr, ':') == null) return false;
+    if (std.mem.indexOfScalar(u8, evr, '-') == null) return false;
+    for (evr[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            byte != '.' and
+            byte != '_' and
+            byte != '+' and
+            byte != '-' and
+            byte != '~' and
+            byte != '^' and
+            byte != ':')
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 pub const Tool = struct {
     name: []const u8,
     version: []const u8,
@@ -427,6 +562,10 @@ pub const Result = struct {
     failure: ?Failure = null,
     tools: []const Tool = &.{},
     installed_packages: []const []const u8 = &.{},
+    /// Every package the transaction added or changed, at the exact identity
+    /// it settled on. The lock a later run would state to get this closure,
+    /// emitted whether or not one was declared.
+    package_lock: []const PackagePin = &.{},
 
     /// The result is recorded in the host's provenance, so its shape is
     /// bounded here for the same reason the control document's is: a document
@@ -445,6 +584,16 @@ pub const Result = struct {
         if (self.installed_packages.len > max_result_packages) return error.ResultTooLarge;
         for (self.installed_packages) |name| {
             if (name.len == 0 or name.len > 512) return error.InvalidPackageName;
+        }
+        // The same bound as the inventory it is a subset of, and the same
+        // rules the control document's pins are held to: a result crosses the
+        // trust boundary in the other direction, so it is checked in its own
+        // right rather than trusted because the host wrote the agent.
+        if (self.package_lock.len > max_result_packages) return error.ResultTooLarge;
+        for (self.package_lock) |pin| {
+            if (!validPackageName(pin.name)) return error.InvalidPackagePin;
+            if (!validPackageEvr(pin.evr)) return error.InvalidPackagePin;
+            if (!validKernelRelease(pin.architecture)) return error.InvalidPackagePin;
         }
         if (self.failure) |failure| {
             if (failure.stage.len == 0 or failure.stage.len > 64) {
@@ -655,7 +804,7 @@ test "a version mismatch is refused by name even when the document is otherwise 
     // what it must report -- not the parse failure that happens to come first.
     try std.testing.expectError(error.UnsupportedVersion, parseControl(
         allocator,
-        \\{"version":2,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\{"version":3,"root_device":"/dev/vda2","result_device":"/dev/vdb",
         \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
         ,
     ));
@@ -664,7 +813,7 @@ test "a version mismatch is refused by name even when the document is otherwise 
     // failure: the version claimed it would be understood, and it was not.
     try std.testing.expectError(error.UnknownField, parseControl(
         allocator,
-        \\{"version":1,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\{"version":2,"root_device":"/dev/vda2","result_device":"/dev/vdb",
         \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
         ,
     ));
@@ -776,7 +925,7 @@ test "a control document the guest could be driven by is rejected" {
     }{
         .{ .expected = error.UnsupportedVersion, .control = blk: {
             var control = base;
-            control.version = 2;
+            control.version = 3;
             break :blk control;
         } },
         .{ .expected = error.InvalidDevicePath, .control = blk: {
