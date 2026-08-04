@@ -566,11 +566,11 @@ const preexisting_nevra = "base-files-0:2.0-3.azl3." ++ @tagName(builtin.cpu.arc
 
 /// The pseudo-package rpm records for the repository key this run declares,
 /// reported from the moment `rpm --import` has run.
-const declared_trust_nevra = "gpg-pubkey-3135ce90-5e6d6b3f.(none)";
+const declared_trust_nevra = "gpg-pubkey-0:3135ce90-5e6d6b3f.(none)";
 
 /// The pseudo-package rpm records for a key the package transaction imported
 /// on its own, which no caller declared and no lock could pin.
-const transaction_trust_nevra = "gpg-pubkey-c1b39b60-5e6d6b40.(none)";
+const transaction_trust_nevra = "gpg-pubkey-0:c1b39b60-5e6d6b40.(none)";
 
 fn guestPathExists(io: Io, path: []const u8) bool {
     _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
