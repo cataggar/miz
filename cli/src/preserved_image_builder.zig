@@ -1151,12 +1151,13 @@ fn checkVm(
 }
 
 fn runVm(
-    _: ?*anyopaque,
+    context_ptr: ?*anyopaque,
     allocator: std.mem.Allocator,
     io: std.Io,
     plan: *const zvmi.customize.ResolvedPlan,
     target: zvmi.preserved_image.RawMutationTarget,
 ) !zvmi.customize.VmRuntimeReport {
+    const context: *UnsafeRuntimeContext = @ptrCast(@alignCast(context_ptr.?));
     const agent = guest_agents.get(
         @tagName(plan.data.architectures.runner),
     ) orelse return error.VmGuestAgentUnavailable;
@@ -1166,6 +1167,11 @@ fn runVm(
         .target = target,
         .agent = agent,
         .console = .{ .writeFn = writeGuestConsole },
+        // The same environment the chroot backend reads, for the same reason:
+        // a credential declared as `host_environment` is resolved from the
+        // caller's environment, and reading the process's own would make the
+        // library's answer depend on something the caller never handed it.
+        .environ = context.environ,
     });
 }
 
