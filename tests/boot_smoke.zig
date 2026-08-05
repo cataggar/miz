@@ -483,6 +483,143 @@ test "build-image boot-smokes typed customization and generalization under Gen2 
     try std.testing.expect(std.mem.indexOf(u8, qemu.serial_output, "ZVMI customization verified") != null);
 }
 
+test "native-edit boot-smokes a kernel argument appended to an already-built image" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var prereqs = try requireQemuBootSmokePrereqs(allocator, io);
+    defer prereqs.deinit(allocator);
+    var ovmf = try requireOvmfFirmwarePairAlloc(allocator, io, prereqs.qemu_path);
+    defer ovmf.deinit(allocator);
+
+    const base_path = "test-kernel-options-qemu-base.raw";
+    const workspace_path = "test-kernel-options-qemu-work";
+    const output_path = workspace_path ++ "/output.raw";
+    const ovmf_vars_copy_path = "test-kernel-options-qemu.OVMF_VARS.fd";
+    const serial_output_path = "test-kernel-options-qemu.serial.log";
+    defer Io.Dir.cwd().deleteFile(io, base_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, ovmf_vars_copy_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, serial_output_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, workspace_path);
+
+    // The image is built without the argument, so reaching the marker can only
+    // mean the preserved-image edit put it on the command line afterwards.
+    const service_name = "zvmi-kernel-options-smoke.service";
+    const smoke_script =
+        \\#!/bin/sh
+        \\set -eu
+        \\grep -q 'zvmi.smoke=applied' /proc/cmdline
+        \\printf 'ZVMI kernel option verified\n' >/dev/ttyS0
+        \\
+    ;
+    const service_unit =
+        \\[Unit]
+        \\Description=Verify a zvmi kernel-argument change
+        \\After=local-fs.target
+        \\
+        \\[Service]
+        \\Type=oneshot
+        \\ExecStart=/usr/local/sbin/zvmi-kernel-options-smoke
+        \\
+        \\[Install]
+        \\WantedBy=multi-user.target
+        \\
+    ;
+    const filesystem = [_]zvmi.os_customization.FilesystemOperation{
+        .{ .put_file = .{
+            .path = "/usr/local/sbin/zvmi-kernel-options-smoke",
+            .source = .{ .inline_bytes = smoke_script },
+            .metadata = .{ .mode = 0o755 },
+        } },
+        .{ .put_file = .{
+            .path = "/usr/lib/systemd/system/" ++ service_name,
+            .source = .{ .inline_bytes = service_unit },
+        } },
+    };
+    const services = [_]zvmi.os_customization.Service{.{
+        .name = service_name,
+        .state = .enabled,
+    }};
+    var build_report = try zvmi.build_image.build(allocator, io, .{
+        .iso_path = prereqs.iso_path,
+        .container_path = prereqs.oci_path,
+        .output_path = base_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = qemu_boot_smoke_disk_size,
+        .extra_kernel_options = "console=tty0 console=ttyS0,115200n8 selinux=0",
+        .os = .{
+            .filesystem = &filesystem,
+            .services = &services,
+        },
+    });
+    defer build_report.deinit(allocator);
+
+    var request = zvmi.customize.Request{
+        .target_architecture = .x86_64,
+        .input = .{ .disk = .{ .path = base_path } },
+        .output = .{
+            .path = output_path,
+            .format = .raw,
+            .size_policy = .preserve_source,
+        },
+        .storage = .{ .preserve = .{ .root_partition = .{ .gpt_index = 2 } } },
+        .execution = .{
+            .workspace_path = workspace_path,
+            .backend = .native_edit,
+        },
+        .boot_security = .{ .extra_kernel_options = "zvmi.smoke=applied" },
+        .reproducibility = .{
+            .seed = .{ .bytes = [_]u8{0x5B} ** 32 },
+            .source_date_epoch = 1_735_689_600,
+        },
+    };
+    var resolved = try zvmi.customize.resolve(
+        allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(allocator);
+    try std.testing.expect(!resolved.diagnostics.hasErrors());
+
+    var outcome = try zvmi.customize.execute(
+        allocator,
+        io,
+        &resolved.plan.?,
+        zvmi.customize.Platform.system(),
+        null,
+    );
+    defer outcome.deinit(allocator);
+    try std.testing.expect(!outcome.diagnostics.hasErrors());
+    const kernel_options = outcome.result.?.provenance.execution.preserved.?.kernel_options.?;
+    try std.testing.expect(kernel_options.files_rewritten > 0);
+
+    try copyFileToPath(allocator, io, ovmf.vars_path, ovmf_vars_copy_path);
+
+    var qemu = try runQemuBootSmoke(
+        allocator,
+        io,
+        prereqs.qemu_path,
+        .{ .firmware = ovmf, .vars_copy_path = ovmf_vars_copy_path },
+        output_path,
+        serial_output_path,
+        "ZVMI kernel option verified",
+    );
+    defer qemu.deinit(allocator);
+
+    if (!serialOutputShowsKernelBoot(qemu.serial_output) or
+        std.mem.indexOf(u8, qemu.serial_output, "ZVMI kernel option verified") == null)
+    {
+        std.debug.print(
+            "QEMU kernel-option boot smoke did not reach its marker (timed_out={}, quit_acknowledged={})\nserial output:\n{s}\n",
+            .{ qemu.timed_out, qemu.quit_acknowledged, qemu.serial_output },
+        );
+    }
+    try std.testing.expect(serialOutputShowsKernelBoot(qemu.serial_output));
+    try std.testing.expect(std.mem.indexOf(u8, qemu.serial_output, "ZVMI kernel option verified") != null);
+}
+
 test "build-image opportunistically boot-smokes a provisioned Gen1 BIOS raw image under QEMU" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
