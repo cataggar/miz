@@ -20,7 +20,7 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
-pub const control_version: u32 = 3;
+pub const control_version: u32 = 4;
 pub const result_version: u32 = 2;
 
 /// Path the host writes the control document to inside the initramfs, and the
@@ -101,6 +101,12 @@ pub const Error = error{
     HookScriptsTooLarge,
     UnexecutedHook,
     UnexpectedHookOutcome,
+    TooManyCredentials,
+    CredentialMaterialTooLarge,
+    CredentialIndexOutOfRange,
+    InvalidCredentialUsername,
+    MissingCredentialDevice,
+    UnexpectedCredentialDevice,
 };
 
 pub const Network = union(enum) {
@@ -273,6 +279,20 @@ pub const qemu_user_network: NetworkConfig = .{
 /// chroot backend, where the same address is just an address on the host's
 /// LAN. `host_resolver` is how a request asks for the build machine's
 /// resolver; naming slirp's alias for it is not.
+/// A credential user name as the guest will write it into a repository file.
+///
+/// The same single-line printable rule the request-level validator applies,
+/// re-stated here because the guest must not trust a control document to have
+/// been written by a host that checked: a name carrying a newline would end the
+/// INI line and let whatever followed be read back as configuration.
+pub fn validCredentialUsername(text: []const u8) bool {
+    if (text.len == 0 or text.len > max_credential_field_bytes) return false;
+    for (text) |byte| {
+        if (byte < 0x21 or byte > 0x7e) return false;
+    }
+    return true;
+}
+
 pub fn isUserNetAddress(text: []const u8) bool {
     const octets = parseIpv4(text) orelse return false;
     const resolver = parseIpv4(qemu_user_network.nameservers[0]).?;
@@ -281,6 +301,21 @@ pub fn isUserNetAddress(text: []const u8) bool {
         octets[2] == resolver[2];
 }
 
+/// A repository's credential, as much of it as a control document may hold.
+///
+/// The user name is here because it is not a secret -- the model states it
+/// outright so a reader can tell which identity a build ran as -- and the
+/// password is not, because this document is written into an initramfs file on
+/// the build host and read back by the guest from the unpacked rootfs. What
+/// travels instead is an index into the credential device, which is memory on
+/// the host and a block device in the guest and a file nowhere.
+pub const ControlCredential = union(enum) {
+    basic: struct {
+        username: []const u8,
+        password_index: u32,
+    },
+};
+
 pub const Repository = struct {
     id: []const u8,
     urls: []const []const u8,
@@ -288,6 +323,7 @@ pub const Repository = struct {
     /// binary keyring rather than an ASCII armour, and JSON strings must be
     /// valid UTF-8, so it cannot travel raw.
     trust_base64: []const []const u8 = &.{},
+    credential: ?ControlCredential = null,
 };
 
 pub const Action = union(enum) {
@@ -390,6 +426,13 @@ pub const Control = struct {
     root_device: []const u8,
     /// Block device the sealed result is written to, e.g. `/dev/vdb`.
     result_device: []const u8,
+    /// Block device holding the framed credential material, e.g. `/dev/vdc`,
+    /// or nothing when no declared repository has a credential.
+    ///
+    /// Optional rather than always present because the device is only attached
+    /// when there is material for it: a run with no credentials must not have a
+    /// device the guest would read, and a guest handed a name must find one.
+    credential_device: ?[]const u8 = null,
     network: Network,
     repositories: []const Repository = &.{},
     actions: []const Action = &.{},
@@ -450,6 +493,34 @@ pub const Control = struct {
                 _ = std.base64.standard.Decoder.calcSizeForSlice(trust) catch
                     return error.InvalidTrustMaterial;
             }
+            const credential = repository.credential orelse continue;
+            switch (credential) {
+                .basic => |basic| {
+                    if (!validCredentialUsername(basic.username)) {
+                        return error.InvalidCredentialUsername;
+                    }
+                    if (basic.password_index >= max_credentials) {
+                        return error.CredentialIndexOutOfRange;
+                    }
+                    // A repository naming material with no device to read it
+                    // from would fail the run after the image had been opened,
+                    // and a device with nothing to read would mean the host
+                    // attached one for no declared reason. Both are refused on
+                    // both sides of the channel.
+                    if (self.credential_device == null) {
+                        return error.MissingCredentialDevice;
+                    }
+                },
+            }
+        }
+
+        if (self.credential_device) |device| {
+            try validateDevicePath(device);
+            var any = false;
+            for (self.repositories) |repository| {
+                if (repository.credential != null) any = true;
+            }
+            if (!any) return error.UnexpectedCredentialDevice;
         }
 
         for (self.actions) |action| {
@@ -923,25 +994,46 @@ pub fn seal(allocator: Allocator, result: Result) ![]u8 {
 }
 
 pub fn frame(allocator: Allocator, payload: []const u8) ![]u8 {
-    if (payload.len > max_result_bytes) return error.FrameTooLarge;
+    return frameWith(allocator, frame_magic, max_result_bytes, payload);
+}
+
+/// Returns the payload bytes of a framed result, borrowed from `bytes`.
+pub fn unframe(bytes: []const u8) Error![]const u8 {
+    return unframeWith(frame_magic, max_result_bytes, bytes);
+}
+
+/// The framing both block-device channels use, parameterized by the magic that
+/// says which one it is.
+///
+/// The magic is a parameter rather than a constant because the two channels
+/// must not be interchangeable. A credential blob that framed like a result
+/// would be accepted by `parseResult` if the devices were ever attached in the
+/// wrong order, and the failure would be a successful parse of the wrong
+/// document rather than a refusal.
+fn frameWith(
+    allocator: Allocator,
+    magic: []const u8,
+    limit: usize,
+    payload: []const u8,
+) ![]u8 {
+    if (payload.len > limit) return error.FrameTooLarge;
     const total = std.mem.alignForward(usize, frame_header_size + payload.len, sector_size);
     const buffer = try allocator.alloc(u8, total);
     errdefer allocator.free(buffer);
     @memset(buffer, 0);
 
-    @memcpy(buffer[0..frame_magic.len], frame_magic);
+    @memcpy(buffer[0..magic.len], magic);
     std.mem.writeInt(u64, buffer[8..16], payload.len, .little);
     std.crypto.hash.sha2.Sha256.hash(payload, buffer[16..48], .{});
     @memcpy(buffer[frame_header_size..][0..payload.len], payload);
     return buffer;
 }
 
-/// Returns the payload bytes of a framed result, borrowed from `bytes`.
-pub fn unframe(bytes: []const u8) Error![]const u8 {
+fn unframeWith(magic: []const u8, limit: usize, bytes: []const u8) Error![]const u8 {
     if (bytes.len < frame_header_size) return error.TruncatedFrame;
-    if (!std.mem.eql(u8, bytes[0..frame_magic.len], frame_magic)) return error.BadFrameMagic;
+    if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return error.BadFrameMagic;
     const length = std.mem.readInt(u64, bytes[8..16], .little);
-    if (length > max_result_bytes) return error.FrameTooLarge;
+    if (length > limit) return error.FrameTooLarge;
     if (frame_header_size + length > bytes.len) return error.TruncatedFrame;
     const payload = bytes[frame_header_size..][0..@intCast(length)];
 
@@ -951,6 +1043,88 @@ pub fn unframe(bytes: []const u8) Error![]const u8 {
         return error.FrameDigestMismatch;
     }
     return payload;
+}
+
+// The credential device.
+//
+// Credential material is the one thing the host has to hand the guest that
+// must not survive the run anywhere. It therefore travels on its own device
+// rather than in the control document, which the host writes into an initramfs
+// file on its own disk, and it is framed rather than serialized: JSON would
+// mean the guest parsing a password into an allocation it would then have to
+// find and scrub, where a length-prefixed record can be read in place and the
+// single device buffer zeroed once.
+
+pub const credential_magic = "ZVMIVMK1";
+/// Kept equal to `customize.max_credential_material_bytes` by a test in
+/// `vm_backend`, which is the one module that imports both.
+pub const max_credential_material_bytes: usize = 4096;
+pub const max_credentials: usize = 64;
+pub const max_credential_field_bytes: usize = 256;
+pub const max_credential_bytes: usize =
+    4 + max_credentials * (4 + max_credential_material_bytes);
+/// Size of the credential block device. A whole number of sectors, and large
+/// enough for the bound above, so the guest never has to grow a read.
+pub const credential_device_bytes: u64 = 512 * 1024;
+
+/// Frames the resolved passwords, in the order the control document indexes
+/// them, for writing to the credential device.
+///
+/// Only passwords: a user name is not a secret, is stated outright in the
+/// control document so a reader can tell which identity a build ran as, and
+/// carrying it here as well would put it in two places that could disagree.
+pub fn sealCredentials(allocator: Allocator, passwords: []const []const u8) ![]u8 {
+    if (passwords.len > max_credentials) return error.TooManyCredentials;
+    var payload: std.array_list.Managed(u8) = .init(allocator);
+    defer {
+        @memset(payload.items, 0);
+        payload.deinit();
+    }
+    var count: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count, @intCast(passwords.len), .little);
+    try payload.appendSlice(&count);
+    for (passwords) |password| {
+        if (password.len > max_credential_material_bytes) {
+            return error.CredentialMaterialTooLarge;
+        }
+        var length: [4]u8 = undefined;
+        std.mem.writeInt(u32, &length, @intCast(password.len), .little);
+        try payload.appendSlice(&length);
+        try payload.appendSlice(password);
+    }
+    return frameWith(allocator, credential_magic, max_credential_bytes, payload.items);
+}
+
+/// The passwords a credential device holds, borrowed from the buffer it was
+/// read into. Nothing here allocates, so scrubbing the material is scrubbing
+/// that one buffer.
+pub const Credentials = struct {
+    payload: []const u8,
+    count: u32,
+
+    pub fn password(self: Credentials, index: u32) Error![]const u8 {
+        if (index >= self.count) return error.CredentialIndexOutOfRange;
+        var offset: usize = 4;
+        var current: u32 = 0;
+        while (current < self.count) : (current += 1) {
+            if (offset + 4 > self.payload.len) return error.TruncatedFrame;
+            const length = std.mem.readInt(u32, self.payload[offset..][0..4], .little);
+            offset += 4;
+            if (length > max_credential_material_bytes) return error.FrameTooLarge;
+            if (offset + length > self.payload.len) return error.TruncatedFrame;
+            if (current == index) return self.payload[offset..][0..length];
+            offset += length;
+        }
+        return error.CredentialIndexOutOfRange;
+    }
+};
+
+pub fn parseCredentials(bytes: []const u8) Error!Credentials {
+    const payload = try unframeWith(credential_magic, max_credential_bytes, bytes);
+    if (payload.len < 4) return error.TruncatedFrame;
+    const count = std.mem.readInt(u32, payload[0..4], .little);
+    if (count > max_credentials) return error.TooManyCredentials;
+    return .{ .payload = payload, .count = count };
 }
 
 pub fn parseResult(allocator: Allocator, bytes: []const u8) !std.json.Parsed(Result) {
@@ -993,7 +1167,7 @@ test "a version mismatch is refused by name even when the document is otherwise 
     // what it must report -- not the parse failure that happens to come first.
     try std.testing.expectError(error.UnsupportedVersion, parseControl(
         allocator,
-        \\{"version":4,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\{"version":5,"root_device":"/dev/vda2","result_device":"/dev/vdb",
         \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
         ,
     ));
@@ -1002,7 +1176,7 @@ test "a version mismatch is refused by name even when the document is otherwise 
     // failure: the version claimed it would be understood, and it was not.
     try std.testing.expectError(error.UnknownField, parseControl(
         allocator,
-        \\{"version":3,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\{"version":4,"root_device":"/dev/vda2","result_device":"/dev/vdb",
         \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
         ,
     ));
@@ -1202,6 +1376,71 @@ test "a control document the guest could be driven by is rejected" {
                 .id = "base",
                 .urls = &.{"https://example.invalid/a b"},
                 .trust_base64 = &.{"a2V5"},
+            }};
+            break :blk control;
+        } },
+        // A credential the guest could not resolve is worse than no
+        // credential: the run would reach the package manager, fail to
+        // authenticate, and report an error about the repository rather than
+        // about the document that was wrong.
+        .{ .expected = error.MissingCredentialDevice, .control = blk: {
+            var control = base;
+            control.repositories = &.{.{
+                .id = "base",
+                .urls = &.{"https://example.invalid/base"},
+                .trust_base64 = &.{"a2V5"},
+                .credential = .{ .basic = .{ .username = "builder", .password_index = 0 } },
+            }};
+            break :blk control;
+        } },
+        // The other direction, and refused for a different reason: a device
+        // attached for nobody is material sealed and handed to the emulator
+        // with no reader, which is a host that thinks it is carrying a secret
+        // somewhere it is not.
+        .{ .expected = error.UnexpectedCredentialDevice, .control = blk: {
+            var control = base;
+            control.credential_device = "/dev/vdc";
+            break :blk control;
+        } },
+        .{ .expected = error.CredentialIndexOutOfRange, .control = blk: {
+            var control = base;
+            control.credential_device = "/dev/vdc";
+            control.repositories = &.{.{
+                .id = "base",
+                .urls = &.{"https://example.invalid/base"},
+                .trust_base64 = &.{"a2V5"},
+                .credential = .{ .basic = .{
+                    .username = "builder",
+                    .password_index = max_credentials,
+                } },
+            }};
+            break :blk control;
+        } },
+        // A user name reaches the repository file as an INI value, so a
+        // newline in it would end the line and let the rest be read as
+        // configuration the policy never asked for.
+        .{ .expected = error.InvalidCredentialUsername, .control = blk: {
+            var control = base;
+            control.credential_device = "/dev/vdc";
+            control.repositories = &.{.{
+                .id = "base",
+                .urls = &.{"https://example.invalid/base"},
+                .trust_base64 = &.{"a2V5"},
+                .credential = .{ .basic = .{
+                    .username = "builder\nproxy=http://attacker.invalid",
+                    .password_index = 0,
+                } },
+            }};
+            break :blk control;
+        } },
+        .{ .expected = error.InvalidDevicePath, .control = blk: {
+            var control = base;
+            control.credential_device = "/dev/../etc/shadow";
+            control.repositories = &.{.{
+                .id = "base",
+                .urls = &.{"https://example.invalid/base"},
+                .trust_base64 = &.{"a2V5"},
+                .credential = .{ .basic = .{ .username = "builder", .password_index = 0 } },
             }};
             break :blk control;
         } },
@@ -1742,4 +1981,77 @@ test "only a URL's authority can carry a credential" {
     // that keeps it.
     try std.testing.expect(!validRepositoryUrl("https://builder:hunter2@packages.invalid/base"));
     try std.testing.expect(validRepositoryUrl("https://packages.invalid/base/user@example/rpms"));
+}
+
+test "credential material survives the device and comes back byte for byte" {
+    const allocator = std.testing.allocator;
+
+    const passwords = [_][]const u8{ "first-secret", "", "a-much-longer-second-secret" };
+    const sealed = try sealCredentials(allocator, &passwords);
+    defer allocator.free(sealed);
+
+    const credentials = try parseCredentials(sealed);
+    try std.testing.expectEqual(@as(u32, passwords.len), credentials.count);
+    for (passwords, 0..) |expected, index| {
+        try std.testing.expectEqualStrings(
+            expected,
+            try credentials.password(@intCast(index)),
+        );
+    }
+    // An index the document never named is a document that disagrees with the
+    // device, which the guest must refuse rather than answer with whatever
+    // bytes happen to follow.
+    try std.testing.expectError(
+        error.CredentialIndexOutOfRange,
+        credentials.password(passwords.len),
+    );
+
+    // A device that was never written is not an empty credential set: the
+    // guest has to be able to tell "no material arrived" from "no material was
+    // asked for", because only the first is a failure.
+    const blank = [_]u8{0} ** 128;
+    try std.testing.expectError(error.BadFrameMagic, parseCredentials(&blank));
+}
+
+test "the credential device and the result device cannot be read as each other" {
+    const allocator = std.testing.allocator;
+
+    // Both channels are length-prefixed and digested the same way, and both
+    // are raw block devices the guest opens by path. The only thing keeping a
+    // misattached drive from being parsed as the other channel's payload is
+    // the magic, so that separation is asserted rather than assumed.
+    try std.testing.expect(!std.mem.eql(u8, credential_magic, frame_magic));
+
+    const sealed = try sealCredentials(allocator, &.{"s3cr3t"});
+    defer allocator.free(sealed);
+    try std.testing.expectError(error.BadFrameMagic, unframe(sealed));
+
+    const result = try frame(allocator, "{}");
+    defer allocator.free(result);
+    try std.testing.expectError(error.BadFrameMagic, parseCredentials(result));
+
+    // Corruption anywhere in the payload is caught, because the digest covers
+    // it. Checked on the credential channel specifically: material the guest
+    // wrote into a repository file after silently accepting a flipped bit
+    // would authenticate against nothing and look like a wrong password.
+    const damaged = try allocator.dupe(u8, sealed);
+    defer allocator.free(damaged);
+    damaged[frame_header_size] ^= 0x01;
+    try std.testing.expectError(error.FrameDigestMismatch, parseCredentials(damaged));
+}
+
+test "the sealed blob refuses more than the guest agreed to read" {
+    const allocator = std.testing.allocator;
+
+    const too_many = [_][]const u8{"x"} ** (max_credentials + 1);
+    try std.testing.expectError(
+        error.TooManyCredentials,
+        sealCredentials(allocator, &too_many),
+    );
+
+    const oversized = [_][]const u8{&([_]u8{'x'} ** (max_credential_material_bytes + 1))};
+    try std.testing.expectError(
+        error.CredentialMaterialTooLarge,
+        sealCredentials(allocator, &oversized),
+    );
 }

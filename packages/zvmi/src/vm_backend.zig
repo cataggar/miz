@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const credential_mod = @import("credential.zig");
 const customize = @import("customize.zig");
 const free_space = @import("free_space.zig");
 const os_customization = @import("os_customization.zig");
@@ -28,6 +29,9 @@ pub const workspace_overhead_bytes: u64 = 512 * 1024 * 1024;
 /// kernel can drive, which is read out of the image rather than assumed.
 pub const stage_disk_index: u8 = 0;
 pub const result_disk_index: u8 = 1;
+/// Attached only when a declared repository has a credential, so a run without
+/// one has exactly the devices it always had.
+pub const credential_disk_index: u8 = 2;
 
 /// Trust material is embedded in the control document, so it is bounded well
 /// below the control-document limit rather than by the host's patience.
@@ -178,6 +182,11 @@ pub const RunOptions = struct {
     /// that dies before it can seal a result leaves its kernel's last words
     /// here and nowhere else.
     console: ?ConsoleSink = null,
+    /// Where a credential declared as `host_environment` is read from. Reading
+    /// a variable is reaching outside the request's declared inputs, so it is a
+    /// seam the caller supplies rather than something this module reaches for;
+    /// tests get `.empty` and so cannot read the developer's shell.
+    environ: std.process.Environ = .empty,
 };
 
 /// Where a failed run's console goes. A sink rather than a writer because the
@@ -242,9 +251,37 @@ pub fn run(
         stage_device,
         data.storage.preserve.root_partition,
     );
+
+    // Resolved before the control document is built, because the document has
+    // to name the device only when there is one, and before the image is
+    // opened, because a credential the host cannot read is a refusal rather
+    // than an empty password sent to a server.
+    const sealed_credentials = try sealCredentialMaterial(
+        work,
+        io,
+        options.environ,
+        data.packages.repositories,
+    );
+    var credential_device: ?CredentialDevice = null;
+    defer if (credential_device) |device| device.close();
+    var credential_buffer: [16]u8 = undefined;
+    var credential_guest_device: ?[]const u8 = null;
+    if (sealed_credentials) |sealed| {
+        defer {
+            @memset(sealed, 0);
+            work.free(sealed);
+        }
+        credential_device = try CredentialDevice.create(work, sealed);
+        credential_guest_device = drivers.disk.devicePath(
+            &credential_buffer,
+            credential_disk_index,
+        );
+    }
+
     const control = try buildControl(work, io, options.plan, .{
         .root_device = root_device,
         .result_device = result_device,
+        .credential_device = credential_guest_device,
     }, drivers.modules);
     // The host refuses to emit a document it would refuse to read, so a
     // rejection here is a host bug rather than a guest-side surprise.
@@ -275,6 +312,7 @@ pub fn run(
         .initrd_path = try std.fs.path.join(work, &.{ options.transaction_path, "vm-initrd" }),
         .raw_path = options.target.raw_path,
         .result_path = try std.fs.path.join(work, &.{ options.transaction_path, "vm-result.raw" }),
+        .credential_path = if (credential_device) |device| device.path else null,
     };
     const cwd = Io.Dir.cwd();
     try writeFileBytes(io, layout.kernel_path, payload.kernel);
@@ -373,6 +411,12 @@ const Layout = struct {
     initrd_path: []const u8,
     raw_path: []const u8,
     result_path: []const u8,
+    /// `/proc/self/fd/<n>` for the credential memfd, or nothing when the run
+    /// declared no credential. A path into this process's own descriptor table
+    /// rather than into a filesystem: the emulator inherits the descriptor and
+    /// resolves the same name in its own `/proc`, so the material has a reader
+    /// without ever having a file.
+    credential_path: ?[]const u8 = null,
 };
 
 /// The guest kernel scans the partition table itself, so it is handed a
@@ -407,9 +451,119 @@ fn requestedKernelRelease(initramfs: customize.InitramfsPolicy) ?[]const u8 {
     };
 }
 
+/// The credential material, in anonymous memory that the emulator inherits.
+///
+/// Everything else the host hands the guest is a file: the kernel, the
+/// initramfs the control document rides in, the staged disk. Credential
+/// material must not be, because a file outlives the moment it is needed and
+/// is readable by anything with the path. `memfd_create` gives a descriptor
+/// with no name in any filesystem, and deliberately without `MFD_CLOEXEC` so
+/// it survives the fork and exec into the emulator, which then opens
+/// `/proc/self/fd/<n>` -- its own descriptor table, the same number -- and sees
+/// a raw disk. The path reaches the argv, and so provenance; the material does
+/// not exist anywhere a path could name.
+const CredentialDevice = struct {
+    fd: std.posix.fd_t,
+    path: []const u8,
+
+    fn create(allocator: Allocator, sealed: []const u8) !CredentialDevice {
+        if (builtin.os.tag != .linux) return error.UnsupportedCredentialTransport;
+        const rc = std.os.linux.memfd_create("zvmi-credential", 0);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => {},
+            else => return error.CredentialDeviceUnavailable,
+        }
+        const fd: std.posix.fd_t = @intCast(rc);
+        errdefer _ = std.os.linux.close(fd);
+
+        const size = vm_control.credential_device_bytes;
+        if (sealed.len > size) return error.CredentialMaterialTooLarge;
+        switch (std.os.linux.errno(std.os.linux.ftruncate(fd, @intCast(size)))) {
+            .SUCCESS => {},
+            else => return error.CredentialDeviceUnavailable,
+        }
+        var written: usize = 0;
+        while (written < sealed.len) {
+            const rc_write = std.os.linux.pwrite(
+                fd,
+                sealed.ptr + written,
+                sealed.len - written,
+                @intCast(written),
+            );
+            switch (std.os.linux.errno(rc_write)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return error.CredentialDeviceUnavailable,
+            }
+            if (rc_write == 0) return error.CredentialDeviceUnavailable;
+            written += rc_write;
+        }
+        return .{
+            .fd = fd,
+            .path = try std.fmt.allocPrint(allocator, "/proc/self/fd/{d}", .{fd}),
+        };
+    }
+
+    /// Overwrites the material before releasing it. Closing the last descriptor
+    /// frees the pages anyway, but a zeroed page is zeroed at a moment this
+    /// code chose rather than one the allocator did.
+    fn close(self: CredentialDevice) void {
+        const zeros = [_]u8{0} ** 4096;
+        var offset: u64 = 0;
+        while (offset < vm_control.credential_device_bytes) : (offset += zeros.len) {
+            const rc = std.os.linux.pwrite(self.fd, &zeros, zeros.len, @intCast(offset));
+            if (std.os.linux.errno(rc) != .SUCCESS) break;
+        }
+        _ = std.os.linux.close(self.fd);
+    }
+};
+
+/// Resolves every declared credential into the order the control document
+/// indexes them, and seals the result for the credential device.
+///
+/// Returns nothing when no repository declared one, which is what keeps a run
+/// without credentials free of a device, a drive argument and a device name in
+/// its control document.
+fn sealCredentialMaterial(
+    allocator: Allocator,
+    io: Io,
+    environ: std.process.Environ,
+    repositories: []const customize.PackageRepository,
+) !?[]u8 {
+    var passwords: std.array_list.Managed([]const u8) = .init(allocator);
+    // The material is in this process's heap for exactly as long as it takes
+    // to seal it into the device, and is overwritten either way.
+    defer {
+        for (passwords.items) |password| {
+            @memset(@constCast(password), 0);
+            allocator.free(password);
+        }
+        passwords.deinit();
+    }
+    for (repositories) |repository| {
+        const declared = repository.credential orelse continue;
+        const source = switch (declared) {
+            .basic => |basic| basic.password,
+        };
+        // Not scrubbed: this runs in the caller's process rather than in a
+        // worker that is PID 1 with a target `proc` mounted. See
+        // `credential.readMaterial`.
+        try passwords.append(try credential_mod.readMaterial(
+            allocator,
+            io,
+            environ,
+            source,
+            false,
+        ));
+    }
+    if (passwords.items.len == 0) return null;
+    return try vm_control.sealCredentials(allocator, passwords.items);
+}
+
 const Devices = struct {
     root_device: []const u8,
     result_device: []const u8,
+    credential_device: ?[]const u8 = null,
 };
 
 fn buildControl(
@@ -540,6 +694,7 @@ fn controlFromPolicy(
         vm_control.Repository,
         input.packages.repositories.len,
     );
+    var credential_count: u32 = 0;
     for (input.packages.repositories, repositories) |source, *target| {
         const trust = try allocator.alloc([]const u8, source.trust.len);
         for (source.trust, trust) |material, *encoded| {
@@ -562,6 +717,20 @@ fn controlFromPolicy(
             .id = source.id,
             .urls = source.urls,
             .trust_base64 = trust,
+            // The index is the repository's position among the credentialed
+            // repositories, in declaration order, which is the same order the
+            // material was sealed in. One counter rather than two lists that
+            // could disagree about which password belongs to which repository.
+            .credential = if (source.credential) |declared| switch (declared) {
+                .basic => |basic| blk: {
+                    const index = credential_count;
+                    credential_count += 1;
+                    break :blk vm_control.ControlCredential{ .basic = .{
+                        .username = basic.username,
+                        .password_index = index,
+                    } };
+                },
+            } else null,
         };
     }
 
@@ -609,6 +778,7 @@ fn controlFromPolicy(
     return .{
         .root_device = input.devices.root_device,
         .result_device = input.devices.result_device,
+        .credential_device = input.devices.credential_device,
         .network = switch (input.network) {
             .offline => .offline,
             // The declared resolver replaces the topology's own nameserver.
@@ -715,23 +885,50 @@ fn appendDisks(
     argv: *std.array_list.Managed([]const u8),
     input: ArgvInput,
 ) !void {
-    const paths = [_][]const u8{ input.layout.raw_path, input.layout.result_path };
+    var storage: [3][]const u8 = undefined;
+    storage[stage_disk_index] = input.layout.raw_path;
+    storage[result_disk_index] = input.layout.result_path;
+    var count: usize = 2;
+    // Appended last so the device indices of the two disks every run has never
+    // shift, which is what lets the control document name them from a constant.
+    if (input.layout.credential_path) |path| {
+        storage[credential_disk_index] = path;
+        count = 3;
+    }
+    const paths = storage[0..count];
+    // The guest only ever reads it, and a writable device would let a
+    // compromised guest write to memory the host still holds.
+    const readonly = "readonly=on";
     switch (input.disk) {
-        .virtio_blk => for (paths) |path| {
-            try argv.appendSlice(&.{ "-drive", try std.fmt.allocPrint(
-                allocator,
-                "file={s},format=raw,if=virtio,cache=writeback",
-                .{path},
-            ) });
+        .virtio_blk => for (paths, 0..) |path, index| {
+            try argv.appendSlice(&.{ "-drive", if (index == credential_disk_index)
+                try std.fmt.allocPrint(
+                    allocator,
+                    "file={s},format=raw,if=virtio,{s}",
+                    .{ path, readonly },
+                )
+            else
+                try std.fmt.allocPrint(
+                    allocator,
+                    "file={s},format=raw,if=virtio,cache=writeback",
+                    .{path},
+                ) });
         },
         .virtio_scsi => {
             try argv.appendSlice(&.{ "-device", "virtio-scsi-pci,id=zvmiscsi" });
             for (paths, 0..) |path, index| {
-                try argv.appendSlice(&.{ "-drive", try std.fmt.allocPrint(
-                    allocator,
-                    "file={s},format=raw,if=none,id=zvmidisk{d},cache=writeback",
-                    .{ path, index },
-                ) });
+                try argv.appendSlice(&.{ "-drive", if (index == credential_disk_index)
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "file={s},format=raw,if=none,id=zvmidisk{d},{s}",
+                        .{ path, index, readonly },
+                    )
+                else
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "file={s},format=raw,if=none,id=zvmidisk{d},cache=writeback",
+                        .{ path, index },
+                    ) });
                 try argv.appendSlice(&.{ "-device", try std.fmt.allocPrint(
                     allocator,
                     "scsi-hd,drive=zvmidisk{d},bus=zvmiscsi.0,channel=0,scsi-id={d},lun=0",
@@ -2304,4 +2501,56 @@ test "the declared resolver replaces the topology's nameserver and nothing else"
         "nameserver 192.0.2.1\nnameserver 198.51.100.7\n",
         body,
     );
+}
+
+// The same reason as the destinations above: `vm_control` may import nothing
+// but `std`, so it cannot read the request model's bound, and this is the one
+// module that holds both. A bound that drifted apart would let the host seal
+// material the guest's frame refuses, and the run would fail in the guest with
+// nothing to say about why.
+test "the credential bound the guest enforces is the one the request model states" {
+    try std.testing.expectEqual(
+        customize.max_credential_material_bytes,
+        vm_control.max_credential_material_bytes,
+    );
+    try std.testing.expectEqual(
+        customize.max_credential_field_bytes,
+        vm_control.max_credential_field_bytes,
+    );
+    // The device has to hold the worst case the bounds allow, or a request
+    // this model accepts would fail at the frame.
+    try std.testing.expect(
+        vm_control.credential_device_bytes >
+            vm_control.max_credential_bytes + vm_control.frame_header_size,
+    );
+}
+
+test "credential material reaches the emulator as a descriptor and not as a file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const sealed = try vm_control.sealCredentials(allocator, &.{"s3cr3t-from-a-memfd"});
+    const device = try CredentialDevice.create(allocator, sealed);
+    defer device.close();
+
+    // A path into this process's own descriptor table. Nothing resolves it in
+    // any filesystem, which is the whole point: `stat` on the name works only
+    // because `/proc` answers for the descriptor behind it.
+    try std.testing.expect(std.mem.startsWith(u8, device.path, "/proc/self/fd/"));
+
+    var read_back: [512]u8 = undefined;
+    const rc = std.os.linux.pread(device.fd, &read_back, read_back.len, 0);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(rc));
+    const credentials = try vm_control.parseCredentials(&read_back);
+    try std.testing.expectEqualStrings(
+        "s3cr3t-from-a-memfd",
+        try credentials.password(0),
+    );
+
+    // Released deliberately rather than incidentally: the descriptor is closed
+    // by `close`, and reading it afterwards must not still answer.
+    device.close();
+    const after = std.os.linux.pread(device.fd, &read_back, read_back.len, 0);
+    try std.testing.expect(std.os.linux.errno(after) != .SUCCESS);
 }

@@ -2128,21 +2128,6 @@ fn validateVmPolicy(
             "use the unsafe_chroot backend for a declared package cache",
         ));
     }
-    // Credential material reaches a guest only through the control document,
-    // which this slice does not carry it in. Refused where it is written
-    // rather than ignored during the run: a declared credential that never
-    // reaches the package manager is an authenticated repository failing with
-    // an authentication error, and the plan would say it had one.
-    for (request.packages.repositories) |repository| {
-        if (repository.credential == null) continue;
-        try diagnostics.append(validationError(
-            .invalid_policy,
-            "/packages/repositories/credential",
-            "the vm backend cannot yet carry credential material to the guest",
-            "use the unsafe_chroot backend for authenticated repositories",
-        ));
-        break;
-    }
     // A resolver the chroot backend reaches happily can mean something else
     // entirely from a guest behind user-mode networking, which would make one
     // hashed plan resolve names two different ways -- the divergence a declared
@@ -12061,7 +12046,7 @@ test "a digest survives the round trip a worker report makes" {
     );
 }
 
-test "the vm backend refuses a credential it has no channel to carry" {
+test "the vm backend accepts a credential and carries it off the control document" {
     const repositories = [_]PackageRepository{.{
         .id = "base",
         .urls = &.{"https://packages.example.invalid"},
@@ -12073,30 +12058,38 @@ test "the vm backend refuses a credential it has no channel to carry" {
     }};
     var request = whenNeededRequest();
     request.execution.backend = .vm;
-    request.execution.vm = .{ .emulator_command = "/usr/bin/qemu-system-x86_64" };
+    request.execution.vm = .{
+        .emulator_command = "/usr/bin/qemu-system-x86_64",
+        .network = .declared_repositories,
+    };
     request.packages = .{
         .actions = &.{.{ .install = &.{"dracut"} }},
         .repositories = &repositories,
     };
     var diagnostics = try validate(std.testing.allocator, &request);
     defer diagnostics.deinit(std.testing.allocator);
-    try std.testing.expect(diagnostics.hasErrors());
-    var named = false;
-    for (diagnostics.items) |diagnostic| {
-        if (std.mem.indexOf(u8, diagnostic.message, "credential material") != null) {
-            named = true;
-        }
-    }
-    try std.testing.expect(named);
+    try std.testing.expect(!diagnostics.hasErrors());
 
-    // The same policy on the backend that can honour it is accepted, so the
-    // refusal is about the channel and not about the credential.
+    // The same policy is accepted on the backend that has always carried it,
+    // so both backends now answer a declared credential the same way.
     var chroot = request;
     chroot.execution.backend = whenNeededRequest().execution.backend;
     chroot.execution.vm = null;
     var accepted = try validate(std.testing.allocator, &chroot);
     defer accepted.deinit(std.testing.allocator);
     try std.testing.expect(!accepted.hasErrors());
+
+    // The control document a plan produces names the device rather than the
+    // material, and the material is not representable in it: `Repository`
+    // carries a user name and an index, and there is no field a password could
+    // occupy. Asserted structurally, because a test that only checked the
+    // rendered bytes would pass again the moment someone added one.
+    const fields = @typeInfo(vm_control.ControlCredential).@"union".fields;
+    try std.testing.expectEqual(@as(usize, 1), fields.len);
+    const basic = @typeInfo(fields[0].type).@"struct".fields;
+    try std.testing.expectEqual(@as(usize, 2), basic.len);
+    try std.testing.expect(std.mem.eql(u8, basic[0].name, "username"));
+    try std.testing.expect(std.mem.eql(u8, basic[1].name, "password_index"));
 }
 
 test "a repository URL cannot smuggle a credential past the declaration" {
