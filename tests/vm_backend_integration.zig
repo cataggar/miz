@@ -70,6 +70,27 @@ const hook_scripts = [_][]const u8{
     "#!/bin/sh\necho integration hook at finalize\n",
 };
 
+/// The credential a case declares, and the bytes it resolves to. The material
+/// is a sentinel rather than anything password-shaped because the point of the
+/// case is to search for it: every artefact the run leaves behind, and every
+/// argument the emulator was handed, is scanned for these bytes and required
+/// not to contain them.
+const credential_username = "integration-builder";
+const credential_variable = "ZVMI_INTEGRATION_TOKEN";
+const credential_material = "zvmi-integration-credential-sentinel";
+
+/// The environment the backend is told to resolve `host_environment` against.
+///
+/// Deliberately not this process's own: the library reads the environment the
+/// caller hands it rather than the one it happens to be running in, and a case
+/// that set a real variable would pass even if that plumbing were dropped. It
+/// also means the stand-in emulator, which inherits the real environment,
+/// cannot see the material -- which the stand-in checks.
+fn testEnviron() std.process.Environ {
+    const entries: [:null]const ?[*:0]const u8 = &.{credential_variable ++ "=" ++ credential_material};
+    return .{ .block = .{ .slice = entries } };
+}
+
 /// What the stand-in image prints once its own boot chain has control. Real
 /// plans name whatever their image says; the value only has to be something
 /// nothing else on the console would produce by accident.
@@ -80,7 +101,13 @@ pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(allocator);
     const executable_name = std.fs.path.basename(argv[0]);
     if (std.mem.startsWith(u8, executable_name, "qemu-system-")) {
-        return runStubEmulator(allocator, init.io, argv[0], argv[1..]);
+        return runStubEmulator(
+            allocator,
+            init.io,
+            init.minimal.environ,
+            argv[0],
+            argv[1..],
+        );
     }
     if (builtin.os.tag != .linux) {
         std.debug.print("skipping vm backend integration: Linux is required\n", .{});
@@ -119,6 +146,7 @@ fn runIntegration(allocator: Allocator, io: Io, self_exe: []const u8) !void {
     try runFirmwareMissing(allocator, io, self_exe, architecture);
     try runHooksReachTheGuest(allocator, io, self_exe, architecture);
     try runDroppedHookRefused(allocator, io, self_exe, architecture);
+    try runCredential(allocator, io, self_exe, architecture);
     std.debug.print("vm backend integration passed\n", .{});
 }
 
@@ -537,6 +565,70 @@ fn runFirmwareMissing(
 /// Every failing run must leave the same evidence: no output, no transaction,
 /// and a source byte-for-byte as it started. The distinction between the
 /// failures is the diagnostic, not the residue.
+/// The credential case.
+///
+/// Everything about this one is a search. The stand-in emulator checks that the
+/// material arrived -- through the device, framed, and matching byte for byte
+/// -- and then checks that it arrived by no other route: not in the control
+/// document, not anywhere in the initramfs the host appended it to, not in the
+/// command line it was started with, and not in the environment it inherited.
+/// The host then checks the same of everything the run left on disk. A
+/// transport that worked but leaked would pass the first half and fail the
+/// second, which is the failure this case exists to catch.
+fn runCredential(
+    allocator: Allocator,
+    io: Io,
+    self_exe: []const u8,
+    architecture: zvmi.customize.Architecture,
+) !void {
+    var workspace = try Workspace.create(
+        allocator,
+        io,
+        self_exe,
+        architecture,
+        .virtio_blk,
+        .built_in,
+    );
+    defer workspace.deinit(io);
+    workspace.credentialed = true;
+
+    var outcome = try workspace.execute(allocator, io, .success, .software);
+    defer outcome.deinit(allocator);
+
+    const result = outcome.result orelse return error.ExecutionProducedNoResult;
+    if (outcome.diagnostics.hasErrors()) return error.ExecutionReportedErrors;
+
+    // Provenance is the record that outlives the run, and it is published, so
+    // it is the artefact that matters most. It has to name the source -- a run
+    // that read a secret must say that it did -- while containing nothing of
+    // what the source held.
+    var document: Io.Writer.Allocating = .init(allocator);
+    defer document.deinit();
+    try zvmi.customize.writeProvenanceJson(result.provenance, &document.writer);
+    try ensure(std.mem.indexOf(u8, document.written(), credential_material) == null);
+    try ensure(std.mem.indexOf(u8, document.written(), credential_variable) != null);
+
+    // What the emulator was actually handed. Written out by the stand-in,
+    // because the argv the backend builds is not otherwise observable from
+    // here, and it is the one place a naive implementation would put a path to
+    // a file holding the material.
+    const argv_path = try std.fmt.allocPrint(allocator, "{s}.argv", .{workspace.emulator_path});
+    defer allocator.free(argv_path);
+    const argv_text = try Io.Dir.cwd().readFileAlloc(io, argv_path, allocator, .limited(1 << 20));
+    defer allocator.free(argv_text);
+    try ensure(std.mem.indexOf(u8, argv_text, credential_material) == null);
+    // A descriptor in this process's own table, which is the whole claim: the
+    // name reaches provenance, and it names memory rather than a file.
+    try ensure(std.mem.indexOf(u8, argv_text, "/proc/self/fd/") != null);
+
+    // And nothing of the run survives, which is what makes the memfd's lack of
+    // a name matter: there is no directory left for anyone to look in.
+    try expectPathAbsent(io, workspace.transaction_path);
+    try expectFileExists(io, workspace.output_path);
+    try expectSourceUnchanged(io, &workspace);
+    workspace.completed = true;
+}
+
 fn expectFailedRun(
     io: Io,
     workspace: *const Workspace,
@@ -580,6 +672,8 @@ const Workspace = struct {
     /// rather than added to the baseline every other assertion is made
     /// against.
     hooks: []const zvmi.customize.Hook = &.{},
+    /// Whether the next `resolve` declares a credential on its repository.
+    credentialed: bool = false,
     /// Set by a case that reached its last assertion. A workspace is only
     /// removed once that happens, so a failure leaves its source, its output,
     /// and its transaction exactly as they were for inspection.
@@ -678,6 +772,10 @@ const Workspace = struct {
             .id = "integration",
             .urls = &.{"https://packages.example.invalid/base"},
             .trust = &.{.{ .inline_bytes = "integration trust\n" }},
+            .credential = if (self.credentialed) .{ .basic = .{
+                .username = credential_username,
+                .password = .{ .host_environment = credential_variable },
+            } } else null,
         }};
         const request = zvmi.customize.Request{
             .target_architecture = self.architecture,
@@ -794,6 +892,7 @@ fn runVm(
         .target = target,
         .agent = agent_bytes,
         .console = if (captured_console == null) null else .{ .writeFn = captureConsole },
+        .environ = testEnviron(),
     });
 }
 
@@ -814,6 +913,7 @@ fn captureConsole(_: ?*anyopaque, bytes: []const u8) void {
 fn runStubEmulator(
     allocator: Allocator,
     io: Io,
+    environ: std.process.Environ,
     self_path: []const u8,
     args: []const []const u8,
 ) !void {
@@ -834,6 +934,11 @@ fn runStubEmulator(
     const mode = std.meta.stringToEnum(StubMode, mode_text) orelse
         return error.UnknownStubMode;
     if (mode == .emulator_failure) return error.StubEmulatorRefused;
+
+    // The command line, written out so the case can search it. The backend
+    // controls every argument, and this is the only place from which the host
+    // side can see what it actually built.
+    try recordArgv(allocator, io, self_path, args);
 
     // The attestation invocation is the one with nothing to boot but the
     // disk. Distinguishing on `-kernel` rather than on a flag is deliberate:
@@ -919,6 +1024,8 @@ fn runStubEmulator(
     try expectStub(std.mem.eql(u8, control.initramfs.regenerate.kernels[0], kernel_release));
     try expectStub(control.network == .declared_repositories);
 
+    try checkCredential(allocator, io, environ, args, control, control_json.?, initrd);
+
     // A module the document names but the initramfs does not carry is a guest
     // that fails at `load-modules`, so the stand-in opens each of them the way
     // the agent would -- and checks the bytes are an object, since the host
@@ -996,6 +1103,91 @@ fn runStubEmulator(
     const file = try Io.Dir.cwd().openFile(io, result_path, .{ .mode = .write_only });
     defer file.close(io);
     try file.writePositionalAll(io, sealed, 0);
+}
+
+fn recordArgv(
+    allocator: Allocator,
+    io: Io,
+    self_path: []const u8,
+    args: []const []const u8,
+) !void {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    for (args) |arg| {
+        try text.appendSlice(allocator, arg);
+        try text.append(allocator, '\n');
+    }
+    const path = try std.fmt.allocPrint(allocator, "{s}.argv", .{self_path});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text.items });
+}
+
+/// The guest's half of the credential contract.
+///
+/// A run with no credential must have no device, no third drive, and no
+/// credential named in its document -- the transport has to be absent when it
+/// is not needed, or every run would be carrying an empty secret channel. A
+/// run with one must be able to read the material through that device and
+/// find it nowhere else.
+fn checkCredential(
+    allocator: Allocator,
+    io: Io,
+    environ: std.process.Environ,
+    args: []const []const u8,
+    control: zvmi.vm_control.Control,
+    control_json: []const u8,
+    initrd: []const u8,
+) !void {
+    const declared = control.repositories[0].credential;
+    if (declared == null) {
+        try expectStub(control.credential_device == null);
+        try expectStub(driveAt(args, 2) == null);
+        return;
+    }
+
+    try expectStub(std.mem.eql(u8, declared.?.basic.username, credential_username));
+
+    // The document names the device the way the guest will see it, exactly as
+    // it does for the root and result devices -- and third, because the drive
+    // is attached last so that adding it cannot have moved either of the two
+    // every run already had.
+    const scsi = indexOfArgument(args, "virtio-scsi-pci,id=zvmiscsi") != null;
+    try expectStub(std.mem.eql(
+        u8,
+        control.credential_device orelse "",
+        if (scsi) "/dev/sdc" else "/dev/vdc",
+    ));
+    const host_path = driveAt(args, 2) orelse return error.StubEmulatorContractViolated;
+    try expectStub(std.mem.startsWith(u8, host_path, "/proc/self/fd/"));
+
+    // The point of the descriptor being inherited rather than opened by name:
+    // this process resolves `/proc/self/fd/<n>` in its own descriptor table,
+    // and gets the same anonymous memory the host sealed. No name in any
+    // filesystem was involved, and there is nothing for a third process on
+    // this machine to open.
+    const sealed = try Io.Dir.cwd().readFileAlloc(
+        io,
+        host_path,
+        allocator,
+        .limited(zvmi.vm_control.credential_device_bytes + 1),
+    );
+    defer allocator.free(sealed);
+    const credentials = try zvmi.vm_control.parseCredentials(sealed);
+    const material = try credentials.password(declared.?.basic.password_index);
+    try expectStub(std.mem.eql(u8, material, credential_material));
+
+    // Everything else the emulator was handed, required not to contain it.
+    // The document is the channel a naive implementation would have used, and
+    // the initramfs is the host-side file that document is written into --
+    // which is the whole reason the material does not travel in it.
+    try expectStub(std.mem.indexOf(u8, control_json, credential_material) == null);
+    try expectStub(std.mem.indexOf(u8, initrd, credential_material) == null);
+    for (args) |arg| {
+        try expectStub(std.mem.indexOf(u8, arg, credential_material) == null);
+    }
+    // And not in the environment either. The backend resolves against the
+    // environment its caller handed it, not the one it is running in, so the
+    // variable never reaches a child process at all.
+    try expectStub(std.process.Environ.getPosix(environ, credential_variable) == null);
 }
 
 /// The stand-in firmware. It checks that it was handed exactly the shape of
