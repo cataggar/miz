@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const boot_options = @import("boot_options.zig");
+const credential_mod = @import("credential.zig");
 const customize = @import("customize.zig");
 const grub_defaults = @import("grub_defaults.zig");
 const os_customization = @import("os_customization.zig");
@@ -1302,59 +1303,16 @@ const Session = struct {
         self: *Session,
         source: customize.CredentialSource,
     ) ![]u8 {
-        switch (source) {
-            .host_path => |host_path| {
-                const bytes = Io.Dir.cwd().readFileAlloc(
-                    self.io,
-                    host_path,
-                    self.allocator,
-                    .limited(customize.max_credential_material_bytes),
-                ) catch return error.CredentialSourceUnreadable;
-                // Unconditional, not an `errdefer`: the untrimmed read is a
-                // copy of the secret and does not outlive this function on
-                // either path.
-                defer {
-                    @memset(bytes, 0);
-                    self.allocator.free(bytes);
-                }
-                const trimmed = std.mem.trimEnd(u8, bytes, "\r\n");
-                if (!validCredentialMaterial(trimmed)) {
-                    return error.CredentialMaterialUnusable;
-                }
-                // Copied to an exact allocation rather than resized in place:
-                // a shrunk slice whose length no longer matches its allocation
-                // is freed at the wrong size. The untrimmed read is zeroed, so
-                // the extra copy is not an extra copy left behind.
-                const material = try self.allocator.alloc(u8, trimmed.len);
-                @memcpy(material, trimmed);
-                return material;
-            },
-            .host_environment => |name| {
-                const value = std.process.Environ.getAlloc(
-                    self.executor.environ,
-                    self.allocator,
-                    name,
-                ) catch return error.CredentialSourceUnreadable;
-                errdefer {
-                    @memset(value, 0);
-                    self.allocator.free(value);
-                }
-                if (!validCredentialMaterial(value)) {
-                    return error.CredentialMaterialUnusable;
-                }
-                // Consumed, so it stops existing. The worker is PID 1 in the
-                // namespace and mounts a real `proc` inside the target root, so
-                // a variable left in its own environment is readable through
-                // `/proc/1/environ` by everything that runs in the chroot
-                // afterwards -- including package scriptlets and dracut
-                // modules, which are target-supplied code running as root, and
-                // which run after the repository file has been deleted. Nothing
-                // has entered the chroot yet at this point: this is the first
-                // step of `runPolicy`, and `open` ran only host binaries.
-                scrubEnvironmentValue(self.executor.environ, name);
-                return value;
-            },
-        }
+        // Scrubbing, because this worker is PID 1 in the namespace and mounts
+        // a real `proc` inside the target root. See `credential.readMaterial`
+        // for why that is a decision rather than a rule.
+        return credential_mod.readMaterial(
+            self.allocator,
+            self.io,
+            self.executor.environ,
+            source,
+            true,
+        );
     }
 
     fn removeRepositoryFiles(self: *Session) !void {
@@ -2576,15 +2534,6 @@ const credentialed_repository_permissions: Io.File.Permissions = .fromMode(0o600
 
 /// tdnf reads a repository file as INI, so a newline or a NUL in the material
 /// would end the `password=` line and let the rest be read as configuration.
-fn validCredentialMaterial(bytes: []const u8) bool {
-    if (bytes.len == 0) return false;
-    if (bytes.len > customize.max_credential_material_bytes) return false;
-    for (bytes) |byte| {
-        if (byte < 0x20 or byte == 0x7f) return false;
-    }
-    return true;
-}
-
 /// `limit` rather than one constant, because a path and a user name are bounded
 /// by different things. Both bounds are the request validator's, so this side of
 /// the privilege boundary refuses exactly what that side refuses and no more: a
@@ -2616,12 +2565,6 @@ fn validEnvironmentName(name: []const u8) bool {
 /// that wants the credential can leave the chroot and read the file a
 /// `host_path` credential names. The point is that a secret should not sit in a
 /// process image for the length of a run when the run needed it once.
-fn scrubEnvironmentValue(environ: std.process.Environ, name: []const u8) void {
-    if (builtin.os.tag == .windows) return;
-    const value = std.process.Environ.getPosix(environ, name) orelse return;
-    @memset(@constCast(value), 0);
-}
-
 /// Copies the value of every variable a declared credential names into the
 /// worker's environment, and refuses now rather than after the image has been
 /// mounted and half mutated. An unset variable is a declaration the host cannot
@@ -2646,7 +2589,7 @@ fn forwardCredentialVariables(
             @memset(value, 0);
             allocator.free(value);
         }
-        if (!validCredentialMaterial(value)) return error.CredentialMaterialUnusable;
+        if (!credential_mod.validMaterial(value)) return error.CredentialMaterialUnusable;
         try map.put(name, value);
     }
 }
@@ -3845,7 +3788,7 @@ test "a consumed credential variable stops existing" {
         "s3cr3t-from-a-variable",
         std.process.Environ.getPosix(environ, "ZVMI_TEST_CREDENTIAL").?,
     );
-    scrubEnvironmentValue(environ, "ZVMI_TEST_CREDENTIAL");
+    credential_mod.scrubEnvironmentValue(environ, "ZVMI_TEST_CREDENTIAL");
 
     // Gone from the block, and gone from the bytes the block points at, which
     // is what `/proc/<pid>/environ` reads.
@@ -3862,7 +3805,7 @@ test "a consumed credential variable stops existing" {
         "/usr/bin",
         std.process.Environ.getPosix(environ, "PATH").?,
     );
-    scrubEnvironmentValue(environ, "ZVMI_NOT_DECLARED");
+    credential_mod.scrubEnvironmentValue(environ, "ZVMI_NOT_DECLARED");
 }
 
 test "a credential the host cannot resolve is a refusal, not an empty password" {
