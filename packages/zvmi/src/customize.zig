@@ -33,8 +33,8 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 19;
-pub const provenance_schema_version: u32 = 22;
+pub const plan_schema_version: u32 = 20;
+pub const provenance_schema_version: u32 = 23;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -487,10 +487,74 @@ pub const PackageRepository = struct {
     credential: ?RepositoryCredential = null,
 };
 
-pub const PackageCachePolicy = enum {
+/// Where the package transaction's downloads and repository metadata live.
+///
+/// A cache is the difference between a build that reaches the network and one
+/// that does not, so leaving it ambient -- whatever the target image's
+/// `/var/cache/tdnf` happens to hold, or whatever a previous run left on the
+/// build machine -- makes "offline" a property of the machine rather than of
+/// the plan. Naming a directory makes the cache a declared input, and the
+/// mode says whether this run reads it or fills it.
+///
+/// The directory is a **locator**, not staged content: it is potentially
+/// enormous, the run writes to it, and its whole purpose is to be reused
+/// across builds, so a copy in the build cache would defeat it. The same
+/// reasoning that keeps credential material out of the build graph keeps a
+/// cache directory out of it, for the opposite reason.
+pub const PackageCachePolicy = union(enum) {
+    /// Resolve and download over the network, into whatever cache the target
+    /// image carries. Nothing is declared and nothing is kept.
     online,
-    cache_only,
+    /// Resolve and download over the network, into the named host directory,
+    /// so that a later `cache_only` run has something to read. The directory
+    /// is this run's output and is created when it does not exist.
+    online_populating: []const u8,
+    /// Resolve and install from the named host directory and reach no
+    /// network at all. The directory is this run's input and must exist.
+    cache_only: []const u8,
 };
+
+/// The declared cache directory, or null when the cache is ambient.
+pub fn packageCacheDirectory(cache: PackageCachePolicy) ?[]const u8 {
+    return switch (cache) {
+        .online => null,
+        .online_populating, .cache_only => |path| path,
+    };
+}
+
+/// Whether the transaction must not reach the network.
+pub fn offlinePackageCache(cache: PackageCachePolicy) bool {
+    return cache == .cache_only;
+}
+
+pub const PackageCacheError = error{
+    PackageCacheDirectoryNotAbsolute,
+    PackageCacheDirectoryIsRoot,
+    PackageCacheDirectoryNotNormalized,
+};
+
+/// Whether a declared cache directory is a path this build can bind-mount.
+///
+/// Pure and shared, because the privileged worker re-checks it on the far
+/// side of the privilege boundary: a control document names a directory that
+/// a process running as root mounts into the target, so the shape of that
+/// path is not something to trust once and hope about afterwards. `..` is
+/// refused rather than resolved for the same reason it is in a mount target
+/// -- what the path denotes must be readable from the path.
+pub fn validatePackageCacheDirectory(path: []const u8) PackageCacheError!void {
+    if (path.len == 0 or path[0] != '/') return error.PackageCacheDirectoryNotAbsolute;
+    if (path.len == 1) return error.PackageCacheDirectoryIsRoot;
+    if (path[path.len - 1] == '/') return error.PackageCacheDirectoryNotNormalized;
+    var components = std.mem.splitScalar(u8, path[1..], '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or
+            std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+        {
+            return error.PackageCacheDirectoryNotNormalized;
+        }
+    }
+}
 
 /// One package pinned to one exact identity.
 ///
@@ -1411,6 +1475,32 @@ fn validatePackagePolicy(
         }
     }
     try validatePackageLock(diagnostics, policy);
+    if (packageCacheDirectory(policy.cache)) |directory| {
+        if (validatePackageCacheDirectory(directory)) |_| {} else |err| {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                "/packages/cache",
+                switch (err) {
+                    error.PackageCacheDirectoryNotAbsolute => "a declared package cache directory must be an absolute host path",
+                    error.PackageCacheDirectoryIsRoot => "a declared package cache directory must not be the host root",
+                    error.PackageCacheDirectoryNotNormalized => "a declared package cache directory must be normalized, with no empty, `.` or `..` component",
+                },
+                "name the directory the way the build machine names it, without a trailing slash or a relative component",
+            ));
+        }
+    }
+    // An offline transaction resolves no names, so a resolver declared
+    // alongside one would be installed, unused and recorded -- a plan
+    // asserting a dependence the run cannot have. The default `host_resolver`
+    // is not refused, because it is what a caller who said nothing gets.
+    if (offlinePackageCache(policy.cache) and policy.resolver == .nameservers) {
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/packages/resolver",
+            "an offline package transaction has no name to resolve",
+            "drop the resolver policy, or select an online cache mode if the transaction really does reach a network",
+        ));
+    }
     switch (policy.resolver) {
         .host_resolver => {},
         // Two refusals with two messages. `127.0.0.53` is one well-formed
@@ -1995,7 +2085,7 @@ fn validateVmPolicy(
     };
     switch (policy.network) {
         .offline => if (request.packages.actions.len != 0 and
-            request.packages.cache != .cache_only)
+            !offlinePackageCache(request.packages.cache))
         {
             try diagnostics.append(validationError(
                 .invalid_policy,
@@ -2023,6 +2113,19 @@ fn validateVmPolicy(
             "/hooks",
             "the vm backend has no channel that carries a hook to the guest",
             "use the unsafe_chroot backend for hooks",
+        ));
+    }
+    // A cache directory is a host directory the run reads and writes through,
+    // and the control document carries rendered JSON rather than host files.
+    // Named for the same reason a hook is: a guest that quietly resolved
+    // against the network would publish an image whose plan says it was built
+    // from a declared cache.
+    if (packageCacheDirectory(request.packages.cache) != null) {
+        try diagnostics.append(validationError(
+            .unsupported_execution_backend,
+            "/packages/cache",
+            "the vm backend has no channel that carries a cache directory to the guest",
+            "use the unsafe_chroot backend for a declared package cache",
         ));
     }
     // Credential material reaches a guest only through the control document,
@@ -3476,7 +3579,13 @@ fn dupePackagePolicy(
     return .{
         .actions = actions,
         .repositories = repositories,
-        .cache = policy.cache,
+        .cache = switch (policy.cache) {
+            .online => .online,
+            .online_populating => |path| .{
+                .online_populating = try allocator.dupe(u8, path),
+            },
+            .cache_only => |path| .{ .cache_only = try allocator.dupe(u8, path) },
+        },
         .lock = lock,
         .resolver = switch (policy.resolver) {
             .host_resolver => .host_resolver,
@@ -4111,26 +4220,35 @@ fn buildCapabilities(
         try capabilities.append(.{ .kind = .repository_access, .path = "", .reason = "access only explicitly declared package repositories" });
         try capabilities.append(.{ .kind = .repository_trust, .path = "", .reason = "install explicitly declared repository trust material" });
     }
-    if (packages.cache == .cache_only) {
-        try capabilities.append(.{ .kind = .package_cache, .path = "", .reason = "satisfy package actions from the declared offline cache" });
+    if (packageCacheDirectory(packages.cache)) |directory| {
+        try capabilities.append(.{
+            .kind = .package_cache,
+            .path = directory,
+            .reason = if (offlinePackageCache(packages.cache))
+                "satisfy package actions from the declared offline cache"
+            else
+                "write the transaction's downloads into the declared cache directory",
+        });
     }
     if (packages.lock != .unlocked) {
         try capabilities.append(.{ .kind = .package_lock, .path = "", .reason = "enforce the declared package snapshot or exact-version lock" });
     }
-    // The chroot backend unshares only mount and pid, so its transaction always
-    // resolves through the build host. A guest does so only when it is given
-    // the network that reaches it: an offline guest is started with `-nic none`,
-    // so there is no route to a host resolver for it to take and a plan must
-    // not declare a dependence the run cannot have. Today the VM backend also
-    // refuses the cache-only policy that is the only way an offline guest could
-    // carry package actions, so the two terms overlap; the capability set has
-    // to be a function of what the run does rather than of which refusal
-    // happens to be in force.
-    const resolves_through_host = switch (execution.backend) {
-        .unsafe_chroot => true,
-        .vm => if (execution.vm) |vm| vm.network == .declared_repositories else false,
-        else => false,
-    };
+    // The chroot backend unshares only mount and pid, so its transaction
+    // resolves through the build host -- unless the cache policy is offline,
+    // in which case the run installs no resolver into the target at all and
+    // there is nothing to read. A guest resolves through the host only when
+    // it is given the network that reaches it: an offline guest is started
+    // with `-nic none`, so there is no route to a host resolver for it to
+    // take and a plan must not declare a dependence the run cannot have.
+    // Three terms rather than one, because the capability set has to be a
+    // function of what the run does rather than of which refusal happens to
+    // be in force.
+    const resolves_through_host = !offlinePackageCache(packages.cache) and
+        switch (execution.backend) {
+            .unsafe_chroot => true,
+            .vm => if (execution.vm) |vm| vm.network == .declared_repositories else false,
+            else => false,
+        };
     if (resolves_through_host and
         packages.actions.len != 0 and
         packages.resolver == .host_resolver)
@@ -4671,7 +4789,15 @@ fn hashPackagePolicy(hash: *std.crypto.hash.sha2.Sha256, policy: PackagePolicy) 
             }
         }
     }
-    hashInt(hash, @intFromEnum(policy.cache));
+    hashInt(hash, @intFromEnum(std.meta.activeTag(policy.cache)));
+    // The directory, not only the mode. Two runs reading different caches
+    // could install different bytes, so they are not one plan -- and hashing
+    // it here rather than relying on the `package_cache` capability's path
+    // keeps that true whatever the capability set later becomes.
+    switch (policy.cache) {
+        .online => {},
+        .online_populating, .cache_only => |path| hashString(hash, path),
+    }
     hashInt(hash, @intFromEnum(std.meta.activeTag(policy.lock)));
     switch (policy.lock) {
         .unlocked => {},
@@ -4994,7 +5120,7 @@ pub fn preflight(
                 .direct_kernel => .unsupported,
                 .firmware => |firmware| vmFirmwareAvailable(io, firmware),
             } else .unsupported,
-            .package_cache,
+            .package_cache => packageCacheAvailable(io, plan),
             .selinux_policy,
             .selinux_relabel,
             .boot_policy_mutation,
@@ -5076,7 +5202,6 @@ fn unsafeChrootCapabilityState(
         // re-runs that generator. Every other field asks for a bootloader
         // this backend does not install.
         hasUnsupportedBootPolicyChange(data.boot_security) or
-        data.packages.cache != .online or
         !validUnsafePackageLock(data.packages.lock))
     {
         return .unsupported;
@@ -5151,6 +5276,10 @@ fn vmCapabilityState(
         data.generalization != .none or
         data.selinux != .unchanged or
         !isDefaultBootPolicy(data.boot_security) or
+        // A declared cache directory is a host directory the run reads and
+        // writes, and the guest control document carries rendered JSON rather
+        // than host files. Refused by name here for the same reason hooks
+        // are, rather than accepted and quietly not honoured.
         data.packages.cache != .online or
         !validUnsafePackageLock(data.packages.lock))
     {
@@ -5391,6 +5520,31 @@ fn diskDependenciesAvailable(
     return .available;
 }
 
+/// Whether the declared package cache directory can be used as the plan
+/// says.
+///
+/// The mode decides what "can" means, because it decides whether the
+/// directory is an input or an output: `cache_only` reads it, so a directory
+/// that is not there yet is `missing` -- a run that would reach the network
+/// instead of failing is the one outcome this policy exists to prevent.
+/// `online_populating` writes it, and this run creates it, so only its parent
+/// has to exist.
+fn packageCacheAvailable(io: Io, plan: *const ResolvedPlan) CapabilityState {
+    const cache = plan.data.packages.cache;
+    const directory = packageCacheDirectory(cache) orelse return .unsupported;
+    validatePackageCacheDirectory(directory) catch return .unsupported;
+    // The backend has to be one that can carry a host directory into the
+    // target at all; the VM backend refuses this policy outright.
+    if (plan.data.execution.backend != .unsafe_chroot) return .unsupported;
+    const probed = if (offlinePackageCache(cache))
+        directory
+    else
+        std.fs.path.dirname(directory) orelse return .unsupported;
+    const stat = Io.Dir.cwd().statFile(io, probed, .{}) catch return .missing;
+    if (stat.kind != .directory) return .missing;
+    return .available;
+}
+
 /// Whether a disk carries a GPT that the COSI writer can describe.
 fn gptSourceAvailable(io: Io, path: []const u8) CapabilityState {
     var image = image_mod.Image.openPathReadOnly(io, path) catch |err| switch (err) {
@@ -5619,6 +5773,8 @@ pub const UnsafeChrootRuntimeReport = struct {
     hooks: []const HookRecord = &.{},
     /// Present exactly when the request asked for a kernel-argument change.
     boot_configuration: ?BootConfigurationRecord = null,
+    /// Present exactly when the request declared a cache directory.
+    package_cache: ?PackageCacheRecord = null,
 
     pub fn deinit(self: *UnsafeChrootRuntimeReport) void {
         self.arena.deinit();
@@ -5820,6 +5976,24 @@ pub const PreservedExecutionRecord = struct {
     /// generator. Never set at the same time as `kernel_options`: the two are
     /// different operations and the plan names which one it published.
     boot_configuration: ?BootConfigurationRecord = null,
+    /// Present exactly when the request declared a cache directory. Absent
+    /// means the transaction used whatever cache the target image carried,
+    /// which is the ambient state this record exists to distinguish itself
+    /// from.
+    package_cache: ?PackageCacheRecord = null,
+};
+
+/// What a run did with a declared package cache directory.
+///
+/// Both paths are recorded because they answer different questions: the host
+/// path says which directory on the build machine this run read or filled,
+/// and the guest path says where the transaction saw it, which is what the
+/// tdnf configuration in the run names.
+pub const PackageCacheRecord = struct {
+    /// Whether the run filled the directory or was confined to it.
+    offline: bool,
+    host_path: []const u8,
+    guest_path: []const u8,
 };
 
 pub const KernelOptionsRecord = struct {
@@ -6063,6 +6237,25 @@ fn guestHooks(
     return &.{};
 }
 
+fn guestPackageCache(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+) ?PackageCacheRecord {
+    if (unsafe_report) |report| return report.package_cache;
+    return null;
+}
+
+fn dupePackageCacheRecord(
+    allocator: Allocator,
+    record: ?PackageCacheRecord,
+) Allocator.Error!?PackageCacheRecord {
+    const resolved = record orelse return null;
+    return .{
+        .offline = resolved.offline,
+        .host_path = try allocator.dupe(u8, resolved.host_path),
+        .guest_path = try allocator.dupe(u8, resolved.guest_path),
+    };
+}
+
 fn guestBootConfiguration(
     unsafe_report: ?*const UnsafeChrootRuntimeReport,
 ) ?BootConfigurationRecord {
@@ -6222,6 +6415,10 @@ fn buildResult(
                 guestPackageLock(unsafe_report, vm_report),
             ),
             .hooks = try dupeHookRecords(result_allocator, guestHooks(unsafe_report)),
+            .package_cache = try dupePackageCacheRecord(
+                result_allocator,
+                guestPackageCache(unsafe_report),
+            ),
             .rebuild = if (rebuild_report) |report| .{
                 .profile = report.source_profile,
                 .reproducible = report.source_reproducible,
@@ -7956,10 +8153,19 @@ test "unsafe chroot preflight accepts only the implemented policy subset" {
         try Check.state(&request, .x86_64),
     );
 
+    // A declared cache directory is now executable here: this backend mounts
+    // the host filesystem, so it can bind one in.
     request = baseline;
-    request.packages.cache = .cache_only;
+    request.packages.cache = .{ .cache_only = "/var/cache/zvmi" };
     try std.testing.expectEqual(
-        CapabilityState.unsupported,
+        CapabilityState.available,
+        try Check.state(&request, .x86_64),
+    );
+
+    request = baseline;
+    request.packages.cache = .{ .online_populating = "/var/cache/zvmi" };
+    try std.testing.expectEqual(
+        CapabilityState.available,
         try Check.state(&request, .x86_64),
     );
 
@@ -8286,7 +8492,7 @@ test "unimplemented typed policies become semantic preflight requirements" {
     var request = validNativeEditRequest(source_path, "policy-output.raw", ".", &.{});
     request.packages = .{
         .actions = &package_actions,
-        .cache = .cache_only,
+        .cache = .{ .cache_only = "/var/cache/zvmi" },
         .lock = .{ .snapshot = "snapshot-2026-07-15" },
     };
     request.initramfs = .{ .regenerate = .{ .generator = "dracut" } };
@@ -10821,6 +11027,260 @@ test "a declared resolver must be one to three dotted quads" {
     );
 }
 
+fn cacheRequest(cache: PackageCachePolicy) Request {
+    var request = resolverRequest(.host_resolver);
+    request.packages.cache = cache;
+    return request;
+}
+
+test "a declared package cache directory must be an absolute normalized path" {
+    // The path is bound into a target root by a process running as root, so
+    // it is checked for shape rather than resolved: what a path denotes has
+    // to be readable from the path, which `..` destroys.
+    const rejected = [_][]const u8{
+        "",
+        "relative/cache",
+        "/",
+        "/var/cache/zvmi/",
+        "/var//cache",
+        "/var/./cache",
+        "/var/cache/../../etc",
+    };
+    for (rejected) |path| {
+        var request = cacheRequest(.{ .cache_only = path });
+        var resolved = try resolve(
+            std.testing.allocator,
+            &request,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer resolved.deinit(std.testing.allocator);
+        try std.testing.expect(resolved.plan == null);
+        try std.testing.expect(hasDiagnosticCode(resolved.diagnostics, .invalid_policy));
+
+        // The same shape is refused whichever mode declares it: the directory
+        // is mounted either way, and only the direction of the traffic differs.
+        var populating = cacheRequest(.{ .online_populating = path });
+        var populating_resolved = try resolve(
+            std.testing.allocator,
+            &populating,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer populating_resolved.deinit(std.testing.allocator);
+        try std.testing.expect(populating_resolved.plan == null);
+    }
+
+    // Three shapes, three messages: an author who wrote a relative path and
+    // an author who wrote `/` have made different mistakes.
+    const named = [_]struct { path: []const u8, needle: []const u8 }{
+        .{ .path = "relative/cache", .needle = "absolute" },
+        .{ .path = "/", .needle = "host root" },
+        .{ .path = "/var/cache/../etc", .needle = "normalized" },
+    };
+    for (named) |case| {
+        var request = cacheRequest(.{ .cache_only = case.path });
+        var resolved = try resolve(
+            std.testing.allocator,
+            &request,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer resolved.deinit(std.testing.allocator);
+        var saw = false;
+        for (resolved.diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, case.needle) != null) saw = true;
+        }
+        try std.testing.expect(saw);
+    }
+
+    var accepted = cacheRequest(.{ .cache_only = "/var/cache/zvmi" });
+    var resolved = try resolve(
+        std.testing.allocator,
+        &accepted,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.plan != null);
+    try std.testing.expectEqualStrings(
+        "/var/cache/zvmi",
+        resolved.plan.?.data.packages.cache.cache_only,
+    );
+}
+
+test "an offline package transaction refuses a declared resolver and the VM backend" {
+    // Refused rather than ignored. A plan that recorded nameservers a
+    // cache-only run never consults would assert a dependence the run cannot
+    // have, and the record is the whole point of declaring one.
+    var declared = cacheRequest(.{ .cache_only = "/var/cache/zvmi" });
+    declared.packages.resolver = .{ .nameservers = &.{"192.0.2.1"} };
+    var declared_resolved = try resolve(
+        std.testing.allocator,
+        &declared,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer declared_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(declared_resolved.plan == null);
+    var named_resolution = false;
+    for (declared_resolved.diagnostics.items) |diagnostic| {
+        if (std.mem.indexOf(u8, diagnostic.message, "no name to resolve") != null) {
+            named_resolution = true;
+        }
+    }
+    try std.testing.expect(named_resolution);
+
+    // The inherited default is not refused, because it is what an author who
+    // said nothing about resolution gets; the run simply installs none.
+    var inherited = cacheRequest(.{ .cache_only = "/var/cache/zvmi" });
+    var inherited_resolved = try resolve(
+        std.testing.allocator,
+        &inherited,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer inherited_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(inherited_resolved.plan != null);
+
+    // The guest control document carries rendered JSON, not host directories,
+    // so the VM backend refuses the policy where it is written rather than
+    // running online and calling the result a cached build.
+    var guest = cacheRequest(.{ .online_populating = "/var/cache/zvmi" });
+    guest.execution.backend = .vm;
+    guest.execution.vm = .{ .emulator_command = "/usr/bin/qemu-system-x86_64" };
+    var guest_diagnostics = try validate(std.testing.allocator, &guest);
+    defer guest_diagnostics.deinit(std.testing.allocator);
+    var named_backend = false;
+    for (guest_diagnostics.items) |diagnostic| {
+        if (diagnostic.code == .unsupported_execution_backend and
+            std.mem.eql(u8, diagnostic.configuration_path, "/packages/cache"))
+        {
+            named_backend = true;
+        }
+    }
+    try std.testing.expect(named_backend);
+
+    // The same policy on the backend that can carry it is accepted, so the
+    // refusal is about the channel rather than about the cache.
+    var chroot = guest;
+    chroot.execution.backend = .unsafe_chroot;
+    chroot.execution.vm = null;
+    var chroot_diagnostics = try validate(std.testing.allocator, &chroot);
+    defer chroot_diagnostics.deinit(std.testing.allocator);
+    try std.testing.expect(!chroot_diagnostics.hasErrors());
+}
+
+test "the plan hash covers which cache the packages came from" {
+    // Two runs reading different directories could install different bytes,
+    // so they are not one plan -- and the mode alone is not enough, because
+    // two offline runs reading different caches are the interesting case.
+    const shapes = [_]PackageCachePolicy{
+        .online,
+        .{ .online_populating = "/var/cache/zvmi" },
+        .{ .cache_only = "/var/cache/zvmi" },
+        .{ .cache_only = "/var/cache/other" },
+    };
+    var hashes: [shapes.len]Digest = undefined;
+    for (shapes, 0..) |shape, index| {
+        var request = cacheRequest(shape);
+        var resolved = try resolve(
+            std.testing.allocator,
+            &request,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer resolved.deinit(std.testing.allocator);
+        try std.testing.expect(resolved.plan != null);
+        hashes[index] = resolved.plan.?.data.plan_hash;
+    }
+    for (hashes, 0..) |left, i| {
+        for (hashes[i + 1 ..]) |right| {
+            try std.testing.expect(!std.mem.eql(u8, &left.bytes, &right.bytes));
+        }
+    }
+}
+
+test "the declared cache directory is the capability the preflight probes" {
+    const io = std.testing.io;
+    // Absolute because the policy requires it, and a probe of a relative path
+    // would be a probe of wherever the test happened to be run from.
+    const cache_path = "/tmp/test-customize-package-cache";
+    const nested_path = cache_path ++ "/rpms";
+    Io.Dir.cwd().deleteTree(io, cache_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, cache_path) catch {};
+
+    // The mode decides whether the directory is an input or an output, and so
+    // decides what the probe has to find. A cache-only run that cannot see
+    // its directory must fail rather than reach the network instead.
+    var relative = cacheRequest(.{ .cache_only = "test-customize-package-cache" });
+    var relative_resolved = try resolve(
+        std.testing.allocator,
+        &relative,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer relative_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(relative_resolved.plan == null);
+
+    const Probe = struct {
+        fn state(request: *const Request, probe_io: Io) !CapabilityState {
+            var resolved = try resolve(
+                std.testing.allocator,
+                request,
+                .{ .host_architecture = .x86_64 },
+            );
+            defer resolved.deinit(std.testing.allocator);
+            try std.testing.expect(resolved.plan != null);
+            var saw: ?[]const u8 = null;
+            for (resolved.plan.?.data.required_capabilities) |capability| {
+                if (capability.kind == .package_cache) saw = capability.path;
+            }
+            // The capability names the directory, so a preflight report says
+            // which one was missing rather than that some cache was.
+            try std.testing.expect(saw != null);
+            try std.testing.expectEqualStrings(
+                packageCacheDirectory(resolved.plan.?.data.packages.cache).?,
+                saw.?,
+            );
+            return packageCacheAvailable(probe_io, &resolved.plan.?);
+        }
+    };
+
+    var missing = cacheRequest(.{ .cache_only = nested_path });
+    try std.testing.expectEqual(
+        CapabilityState.missing,
+        try Probe.state(&missing, io),
+    );
+
+    // A populating run creates its own directory, so only the parent has to
+    // be there -- and when the parent is not, it is still missing.
+    var populating = cacheRequest(.{ .online_populating = nested_path });
+    try std.testing.expectEqual(
+        CapabilityState.missing,
+        try Probe.state(&populating, io),
+    );
+
+    try Io.Dir.cwd().createDirPath(io, cache_path);
+    try std.testing.expectEqual(
+        CapabilityState.available,
+        try Probe.state(&populating, io),
+    );
+    try std.testing.expectEqual(
+        CapabilityState.missing,
+        try Probe.state(&missing, io),
+    );
+
+    try Io.Dir.cwd().createDirPath(io, nested_path);
+    try std.testing.expectEqual(
+        CapabilityState.available,
+        try Probe.state(&missing, io),
+    );
+
+    // No other backend can carry a host directory into the target, so the
+    // probe reports the request as unsupported rather than as a directory
+    // that happens to be there.
+    var native = cacheRequest(.{ .cache_only = nested_path });
+    native.execution.backend = .native_edit;
+    native.execution.acknowledge_unsafe = false;
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        try Probe.state(&native, io),
+    );
+}
+
 test "the plan hash covers where name resolution came from" {
     // The point of declaring the resolver at all. If the hash did not cover
     // it, two runs that resolved repository names through different servers --
@@ -10904,17 +11364,13 @@ test "both executing backends declare inheriting the host resolver" {
         ));
     }
 
-    // An offline guest is started with `-nic none`, so there is no route to a
-    // host resolver whatever the policy says. The only shape that gets package
-    // actions into one is a cache-only policy, which the VM backend separately
-    // refuses at preflight today -- so this pins the rule rather than a
-    // currently reachable run, and stops the capability from being right only
-    // for as long as that second refusal happens to stand.
+    // An offline package transaction reads no resolver, on either backend and
+    // whatever the resolver policy says, because the run installs none: the
+    // chroot backend is where this is reachable, since the VM backend refuses
+    // a declared cache outright. The capability has to follow what the run
+    // does rather than which backend it runs on.
     var offline = resolverRequest(.host_resolver);
-    offline.packages.cache = .cache_only;
-    offline.execution.backend = .vm;
-    offline.execution.vm = validVmPolicy();
-    offline.execution.vm.?.network = .offline;
+    offline.packages.cache = .{ .cache_only = "/var/cache/zvmi" };
     var offline_resolved = try resolve(
         std.testing.allocator,
         &offline,
@@ -10923,6 +11379,22 @@ test "both executing backends declare inheriting the host resolver" {
     defer offline_resolved.deinit(std.testing.allocator);
     try std.testing.expect(!hasCapabilityKind(
         offline_resolved.plan.?.data.required_capabilities,
+        .read_host_resolver,
+    ));
+
+    // And the same request with a populating cache keeps it: the directory is
+    // an output, the transaction still resolves repository names, so this is
+    // about the network the run reaches and not about declaring a directory.
+    var populating = resolverRequest(.host_resolver);
+    populating.packages.cache = .{ .online_populating = "/var/cache/zvmi" };
+    var populating_resolved = try resolve(
+        std.testing.allocator,
+        &populating,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer populating_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(hasCapabilityKind(
+        populating_resolved.plan.?.data.required_capabilities,
         .read_host_resolver,
     ));
 

@@ -154,9 +154,84 @@ pub const Hook = struct {
     arguments: []const []const u8 = &.{},
 };
 
-pub const PackageCachePolicy = enum {
+/// Deliberately a locator rather than a staged input, for the same reason
+/// `CredentialSource` is: a cache directory is what a build reuses between
+/// runs, so a copy the build system owns would be a second cache that is
+/// never the one the operator meant. See `customize.PackageCachePolicy`.
+///
+/// This was an `enum { online, cache_only }` when `api_version` 3 was
+/// introduced, and gained its payload in place rather than behind a version
+/// bump, on the same grounds as `PackageVersionLock`'s field renames: every
+/// executor refused any cache policy other than `online` for the whole life
+/// of version 3, so a document declaring `cache_only` was a way to fail
+/// preflight and never a way to produce an image.
+///
+/// `"online"` is the exception, because it did produce images. A document
+/// that spelled it as the bare string it used to be is still read, so the
+/// change costs nothing to anyone who wrote down the default. There is no
+/// such concession for a bare `"cache_only"`: it now needs a directory, and
+/// a document that names none is asking for an offline build with no stated
+/// source, which is the state this policy exists to eliminate.
+pub const PackageCachePolicy = union(enum) {
     online,
-    cache_only,
+    online_populating: []const u8,
+    cache_only: []const u8,
+
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) std.json.ParseError(@TypeOf(source.*))!PackageCachePolicy {
+        if (try source.peekNextTokenType() == .string) {
+            const name = try std.json.innerParse([]const u8, allocator, source, options);
+            if (std.mem.eql(u8, name, "online")) return .online;
+            return error.UnexpectedToken;
+        }
+        if (.object_begin != try source.next()) return error.UnexpectedToken;
+        // The tag is resolved to a variant *before* the payload is parsed.
+        // `.alloc_if_needed` hands back a slice into the source's own buffer
+        // for an unescaped name, and a reader-backed source may refill that
+        // buffer while parsing the payload, so a name compared afterwards
+        // would be compared against whatever replaced it.
+        const tag: std.meta.Tag(PackageCachePolicy) = blk: {
+            const name = switch (try source.nextAlloc(allocator, .alloc_if_needed)) {
+                inline .string, .allocated_string => |field| field,
+                else => return error.UnexpectedToken,
+            };
+            inline for (@typeInfo(PackageCachePolicy).@"union".fields) |field| {
+                if (std.mem.eql(u8, name, field.name)) {
+                    break :blk @field(std.meta.Tag(PackageCachePolicy), field.name);
+                }
+            }
+            return error.UnknownField;
+        };
+        const parsed: PackageCachePolicy = switch (tag) {
+            // The generated spelling of a payload-free variant.
+            .online => value: {
+                if (.object_begin != try source.next()) return error.UnexpectedToken;
+                if (.object_end != try source.next()) return error.UnexpectedToken;
+                break :value .online;
+            },
+            .online_populating => .{
+                .online_populating = try std.json.innerParse(
+                    []const u8,
+                    allocator,
+                    source,
+                    options,
+                ),
+            },
+            .cache_only => .{
+                .cache_only = try std.json.innerParse(
+                    []const u8,
+                    allocator,
+                    source,
+                    options,
+                ),
+            },
+        };
+        if (.object_end != try source.next()) return error.UnexpectedToken;
+        return parsed;
+    }
 };
 
 /// A pinned package identity.
@@ -924,4 +999,57 @@ test "v2 configurations remain valid with their original source closure" {
             .root_partition = .{ .gpt_index = 1 },
         }, 0),
     );
+}
+
+test "the cache policy reads both its old spelling and its new one" {
+    const Holder = struct { cache: PackageCachePolicy = .online };
+    const cases = [_]struct {
+        text: []const u8,
+        expected: std.meta.Tag(PackageCachePolicy),
+        path: []const u8 = "",
+    }{
+        // The spelling a working `api_version` 3 document already has.
+        .{ .text = "{\"cache\":\"online\"}", .expected = .online },
+        // The spelling this program now writes.
+        .{ .text = "{\"cache\":{\"online\":{}}}", .expected = .online },
+        .{
+            .text = "{\"cache\":{\"cache_only\":\"/var/cache/zvmi\"}}",
+            .expected = .cache_only,
+            .path = "/var/cache/zvmi",
+        },
+        .{
+            .text = "{\"cache\":{\"online_populating\":\"/var/cache/zvmi\"}}",
+            .expected = .online_populating,
+            .path = "/var/cache/zvmi",
+        },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(
+            Holder,
+            std.testing.allocator,
+            case.text,
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.expected, std.meta.activeTag(parsed.value.cache));
+        switch (parsed.value.cache) {
+            .online => try std.testing.expectEqualStrings("", case.path),
+            .online_populating, .cache_only => |path| {
+                try std.testing.expectEqualStrings(case.path, path);
+            },
+        }
+    }
+
+    // An offline policy that names no directory is refused rather than
+    // guessed at: there is no default cache to be confined to.
+    for ([_][]const u8{
+        "{\"cache\":\"cache_only\"}",
+        "{\"cache\":\"online_populating\"}",
+        "{\"cache\":{\"offline\":\"/var/cache/zvmi\"}}",
+    }) |text| {
+        if (std.json.parseFromSlice(Holder, std.testing.allocator, text, .{})) |parsed| {
+            parsed.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
 }

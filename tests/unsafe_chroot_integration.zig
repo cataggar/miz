@@ -105,6 +105,16 @@ fn runIntegration(
         allocator,
         &.{ work_path, "output.raw" },
     );
+    const offline_output_path = try std.fs.path.join(
+        allocator,
+        &.{ work_path, "offline-output.raw" },
+    );
+    // Deliberately not created here: the populating run's whole claim is that
+    // it produces the directory a later offline run reads.
+    const cache_path = try std.fs.path.join(
+        allocator,
+        &.{ work_path, "package-cache" },
+    );
     const spool_path = try std.fs.path.join(
         allocator,
         &.{ work_path, "root.spool" },
@@ -149,7 +159,11 @@ fn runIntegration(
         .evr = "0:1.0-1",
         .architecture = @tagName(builtin.cpu.arch),
     }};
-    const request = zvmi.customize.Request{
+    // One request shape, two cache policies: the offline rebuild below differs
+    // from this run only in where its packages came from, which is what makes
+    // the comparison say something about the cache rather than about two
+    // unrelated builds.
+    var request = zvmi.customize.Request{
         .target_architecture = architecture,
         .input = .{ .disk = .{ .path = source_path } },
         .output = .{
@@ -164,6 +178,7 @@ fn runIntegration(
             .actions = &actions,
             .repositories = &repositories,
             .lock = .{ .exact = &lock },
+            .cache = .{ .online_populating = cache_path },
         },
         .initramfs = .{ .regenerate = .{
             .generator = "dracut",
@@ -364,10 +379,118 @@ fn runIntegration(
     );
 
     try expectPathAbsent(io, resolved.plan.?.data.transaction_path);
+
+    // The directory the run was told to fill exists on the host and holds
+    // what the transaction put there: the bind carried writes outwards, so
+    // the cache outlives the workspace the run mounted it into.
+    const populated = preserved.package_cache orelse
+        return error.MissingPackageCacheProvenance;
+    try ensure(!populated.offline);
+    try ensure(std.mem.eql(u8, populated.host_path, cache_path));
+    try ensure(std.mem.eql(u8, populated.guest_path, "/run/zvmi-cache"));
+    try expectHostFile(
+        allocator,
+        io,
+        cache_path,
+        integration_cache_download,
+        integration_cache_payload ++ "\n",
+    );
+
+    // The same request again, reading the directory the first run filled and
+    // reaching no network. Everything else is held constant, so a difference
+    // in the result is a difference the cache policy made.
+    request.output.path = offline_output_path;
+    request.packages.cache = .{ .cache_only = cache_path };
+    var offline_resolved = try zvmi.customize.resolve(allocator, &request, .{
+        .host_architecture = architecture,
+    });
+    defer offline_resolved.deinit(allocator);
+    if (offline_resolved.plan == null or offline_resolved.diagnostics.hasErrors()) {
+        return error.IntegrationResolutionFailed;
+    }
+    // Where the packages came from is part of what the plan says, so two runs
+    // that could have installed different bytes are not one plan.
+    try ensure(!std.mem.eql(
+        u8,
+        &resolved.plan.?.data.plan_hash.bytes,
+        &offline_resolved.plan.?.data.plan_hash.bytes,
+    ));
+    var offline_preflight = try zvmi.customize.preflight(
+        allocator,
+        io,
+        &offline_resolved.plan.?,
+        platform,
+    );
+    defer offline_preflight.deinit(allocator);
+    if (!offline_preflight.ready()) return error.IntegrationPreflightFailed;
+
+    var offline_outcome = try zvmi.customize.execute(
+        allocator,
+        io,
+        &offline_resolved.plan.?,
+        platform,
+        null,
+    );
+    defer offline_outcome.deinit(allocator);
+    const offline_result = offline_outcome.result orelse
+        return error.IntegrationExecutionFailed;
+    if (offline_outcome.diagnostics.hasErrors()) {
+        return error.IntegrationExecutionFailed;
+    }
+    for (offline_outcome.diagnostics.items) |diagnostic| {
+        if (diagnostic.code == .cleanup_failed) {
+            return error.IntegrationCleanupFailed;
+        }
+    }
+    const offline_preserved = offline_result.provenance.execution.preserved orelse
+        return error.MissingPreservedProvenance;
+    const consumed = offline_preserved.package_cache orelse
+        return error.MissingPackageCacheProvenance;
+    try ensure(consumed.offline);
+    try ensure(std.mem.eql(u8, consumed.host_path, cache_path));
+    try ensure(std.mem.eql(u8, consumed.guest_path, "/run/zvmi-cache"));
+
+    // The run that read the cache installed the same package the run that
+    // filled it did. The stub records what it was asked for, so this is the
+    // transaction being reproduced rather than the image being copied.
+    try expectOutputFile(
+        allocator,
+        io,
+        offline_output_path,
+        "/var/lib/zvmi-integration/installed",
+        installed_nevra ++ "\n",
+    );
+    try ensure(offline_preserved.emitted_package_lock.len == 1);
+    try ensure(std.mem.eql(
+        u8,
+        offline_preserved.emitted_package_lock[0].name,
+        "integration-package",
+    ));
+    // The offline run's target is left with the resolver the image shipped,
+    // untouched, because the run installed none over it.
+    try expectOutputFile(
+        allocator,
+        io,
+        offline_output_path,
+        "/etc/resolv.conf",
+        "nameserver 192.0.2.1\n",
+    );
+    // Read-only in, read-only out: nothing the offline run did reached the
+    // directory it was reproducing from.
+    try expectMissingHostFile(io, cache_path, "offline-write");
+
+    try expectPathAbsent(io, offline_resolved.plan.?.data.transaction_path);
     try Io.Dir.cwd().deleteTree(io, work_path);
     completed = true;
     std.debug.print("unsafe-chroot privileged integration passed\n", .{});
 }
+
+/// What the populating run leaves in the cache directory and the offline run
+/// finds there. Standing in for the downloaded packages `keepcache` keeps: the
+/// point under test is that one run's writes are the other run's inputs, not
+/// that the bytes are an RPM.
+const integration_cache_download = "integration-package.rpm";
+const integration_cache_payload = "integration cache payload";
 
 const integration_grub_defaults =
     "# integration defaults\n" ++
@@ -576,6 +699,47 @@ fn runGuestTdnf(io: Io, args: []const []const u8) !void {
         std.debug.print("tdnf integration-1\n", .{});
         return;
     }
+    // `--cacheonly` is what makes an offline run fail rather than fetch, so
+    // the branch below is keyed on the same argument the real tdnf would act
+    // on rather than on anything the test arranged separately.
+    const offline = containsArg(args, "--cacheonly");
+    try checkGuestCacheConfiguration(io);
+    if (offline) {
+        // The other run's download, seen from inside this one. This is the
+        // whole claim of a declared cache: one build filled a host directory
+        // and another read it.
+        try expectGuestFile(
+            io,
+            "/run/zvmi-cache/" ++ integration_cache_download,
+            integration_cache_payload ++ "\n",
+        );
+        // Bound read-only, so the run cannot change the input it is
+        // reproducing from. Left behind on the host if it ever succeeds, so
+        // the parent can say so rather than the failure being swallowed here.
+        if (Io.Dir.cwd().createFile(
+            io,
+            "/run/zvmi-cache/offline-write",
+            .{},
+        )) |file| {
+            file.close(io);
+            return error.OfflineCacheWasWritable;
+        } else |_| {}
+        // No resolver at all rather than one that resolves nothing: with no
+        // `/etc/resolv.conf` the target cannot reach a name server even if
+        // something in it tried.
+        if (guestPathExists(io, "/run/zvmi-resolv.conf")) {
+            return error.OfflineRunCarriedResolver;
+        }
+    } else {
+        if (!guestPathExists(io, "/run/zvmi-resolv.conf")) {
+            return error.OnlineRunLackedResolver;
+        }
+        try writeGuestMarker(
+            io,
+            "/run/zvmi-cache/" ++ integration_cache_download,
+            integration_cache_payload,
+        );
+    }
     if (argumentAfter(args, "install")) |package| {
         try writeGuestMarker(
             io,
@@ -707,6 +871,45 @@ fn runGuestCp(io: Io, args: []const []const u8) !void {
     });
 }
 
+/// The cache reaches tdnf as configuration rather than as a command-line
+/// flag, because the tdnf the target images ship has no flag that names one.
+/// Checked from inside the run, so the assertion is about what the package
+/// manager was actually told.
+fn checkGuestCacheConfiguration(io: Io) !void {
+    var buffer: [512]u8 = undefined;
+    const file = try Io.Dir.cwd().openFile(io, "/run/zvmi-tdnf.conf", .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer file.close(io);
+    const size = (try file.stat(io)).size;
+    if (size > buffer.len) return error.UnexpectedTdnfConfiguration;
+    const length: usize = @intCast(size);
+    const read = try file.readPositionalAll(io, buffer[0..length], 0);
+    const body = buffer[0..read];
+    if (std.mem.indexOf(u8, body, "cachedir=/run/zvmi-cache\n") == null or
+        std.mem.indexOf(u8, body, "keepcache=1\n") == null)
+    {
+        return error.UnexpectedTdnfConfiguration;
+    }
+}
+
+fn expectGuestFile(io: Io, path: []const u8, expected: []const u8) !void {
+    var buffer: [512]u8 = undefined;
+    if (expected.len > buffer.len) return error.UnexpectedGuestFile;
+    const file = Io.Dir.cwd().openFile(io, path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    }) catch return error.MissingGuestFile;
+    defer file.close(io);
+    const read = try file.readPositionalAll(io, buffer[0..expected.len], 0);
+    if (!std.mem.eql(u8, buffer[0..read], expected)) {
+        return error.UnexpectedGuestFile;
+    }
+}
+
 fn writeGuestMarker(io: Io, path: []const u8, value: []const u8) !void {
     const file = try Io.Dir.cwd().createFile(io, path, .{});
     defer file.close(io);
@@ -808,6 +1011,38 @@ fn expectMissingFile(
         else => return err,
     };
     return error.UnexpectedGuestFile;
+}
+
+/// The cache directory is on the host filesystem rather than inside an image,
+/// which is the point: it is the one thing a build leaves behind for the next
+/// one to read.
+fn expectHostFile(
+    allocator: Allocator,
+    io: Io,
+    directory: []const u8,
+    name: []const u8,
+    expected: []const u8,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ directory, name });
+    defer allocator.free(path);
+    const bytes = try Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(bytes);
+    if (!std.mem.eql(u8, bytes, expected)) return error.UnexpectedHostFile;
+}
+
+fn expectMissingHostFile(io: Io, directory: []const u8, name: []const u8) !void {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(
+        &buffer,
+        "{s}/{s}",
+        .{ directory, name },
+    ) catch return error.UnexpectedHostFile;
+    try expectPathAbsent(io, path);
 }
 
 fn isExecutable(io: Io, path: []const u8) bool {

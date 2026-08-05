@@ -67,6 +67,11 @@ const guest_generated_candidates = [_][]const u8{
     "/boot/grub/grub.cfg",
 };
 
+/// Where a declared host cache directory is bound. Under the private `/run`
+/// tmpfs, which is unmounted before anything is published, so the binding
+/// cannot reach the image even if the transaction leaves the cache dirty.
+const guest_cache_directory = "/run/zvmi-cache";
+
 const guest_grub_defaults = "/etc/default/grub";
 const guest_kernel_cmdline = "/etc/kernel/cmdline";
 const guest_fstab = "/etc/fstab";
@@ -281,6 +286,7 @@ const WorkerReport = struct {
     package_lock: []const customize.PackageVersionLock = &.{},
     hooks: []const customize.HookRecord = &.{},
     boot_configuration: ?customize.BootConfigurationRecord = null,
+    package_cache: ?customize.PackageCacheRecord = null,
 };
 
 fn executeManifest(
@@ -334,6 +340,7 @@ fn executeManifest(
             .package_lock = session.emitted_lock.items,
             .hooks = session.hook_records.items,
             .boot_configuration = session.boot_configuration,
+            .package_cache = session.package_cache,
         },
     };
 }
@@ -352,6 +359,7 @@ const Session = struct {
     proc_mounted: bool = false,
     sys_mounted: bool = false,
     run_mounted: bool = false,
+    cache_mounted: bool = false,
     resolver_mounted: bool = false,
     resolver_replaced: bool = false,
     resolver_had_original: bool = false,
@@ -371,6 +379,7 @@ const Session = struct {
     cp_version: []const u8 = "",
     generator_version: []const u8 = "",
     boot_configuration: ?customize.BootConfigurationRecord = null,
+    package_cache: ?customize.PackageCacheRecord = null,
 
     fn openAndRun(self: *Session) ?void {
         self.open() catch return null;
@@ -507,6 +516,7 @@ const Session = struct {
             run_path,
         });
         self.run_mounted = true;
+        try self.mountPackageCache();
 
         const resolver_path = try joinGuest(
             self.allocator,
@@ -519,7 +529,13 @@ const Session = struct {
         // does not depend on this machine. Either way a run with no package
         // actions gets none: this is the package transaction's resolver, and
         // a root that never resolves a name has no business carrying one.
+        // An offline transaction reaches no network, so it gets no resolver
+        // at all. That is not tidiness: with no `/etc/resolv.conf` the target
+        // cannot resolve a name even if something in it tried, so "offline"
+        // is a property of the run rather than a flag it was asked to honour.
+        // It layers with `--cacheonly` rather than replacing it.
         const install_resolver = self.manifest.packages.actions.len != 0 and
+            !customize.offlinePackageCache(self.manifest.packages.cache) and
             switch (self.manifest.packages.resolver) {
                 .host_resolver => isRegularFileFollow(self.io, "/etc/resolv.conf"),
                 .nameservers => true,
@@ -931,6 +947,7 @@ const Session = struct {
             &complete,
         );
         self.restoreResolver(&complete);
+        self.cleanupMount(umount, self.cache_mounted, guest_cache_directory, &complete);
         self.cleanupMount(umount, self.run_mounted, "/run", &complete);
         self.cleanupMount(umount, self.sys_mounted, "/sys", &complete);
         self.cleanupMount(umount, self.proc_mounted, "/proc", &complete);
@@ -1164,6 +1181,51 @@ const Session = struct {
         }
     }
 
+    /// Binds the declared host cache directory into the target.
+    ///
+    /// A bind mount rather than a copy: the directory is what makes a later
+    /// offline run possible, so it has to be the operator's own directory
+    /// that this run fills, not a copy of it that disappears with the
+    /// workspace. `cache_only` binds it read-only, so an offline run cannot
+    /// change the input it was asked to reproduce from.
+    fn mountPackageCache(self: *Session) !void {
+        const cache = self.manifest.packages.cache;
+        const host_directory = customize.packageCacheDirectory(cache) orelse return;
+        // Re-checked here rather than trusted from the control document: this
+        // process is root, and the path names what it is about to mount.
+        try customize.validatePackageCacheDirectory(host_directory);
+        const offline = customize.offlinePackageCache(cache);
+        if (offline) {
+            const stat = Io.Dir.cwd().statFile(self.io, host_directory, .{}) catch
+                return error.MissingPackageCacheDirectory;
+            if (stat.kind != .directory) return error.MissingPackageCacheDirectory;
+        } else {
+            // The populating mode declares the directory as this run's
+            // output, so creating it is doing what was asked rather than
+            // guessing.
+            try Io.Dir.cwd().createDirPath(self.io, host_directory);
+        }
+
+        const guest_path = try joinGuest(
+            self.allocator,
+            self.manifest.root_path,
+            guest_cache_directory,
+        );
+        defer self.allocator.free(guest_path);
+        try Io.Dir.cwd().createDirPath(self.io, guest_path);
+        const mount = findTool(self.io, mount_candidates).?;
+        try self.runSuccess(&.{ mount, "--bind", host_directory, guest_path });
+        self.cache_mounted = true;
+        if (offline) {
+            try self.runSuccess(&.{ mount, "-o", "remount,bind,ro", guest_path });
+        }
+        self.package_cache = .{
+            .offline = offline,
+            .host_path = host_directory,
+            .guest_path = guest_cache_directory,
+        };
+    }
+
     fn writeRepositoryFiles(self: *Session) !void {
         const directory = try repositoryHostDirectory(
             self.allocator,
@@ -1176,10 +1238,22 @@ const Session = struct {
             self.manifest.root_path,
         );
         defer self.allocator.free(config_path);
+        // `cachedir` and `keepcache` are ordinary tdnf configuration keys
+        // rather than command-line flags, which is what lets this work
+        // against the tdnf 3.x the target images ship: the 4.0 flag that
+        // would name a cache directory on the command line does not exist
+        // there. `keepcache` is what makes a populating run leave the
+        // downloaded packages behind for the offline run to install from;
+        // without it tdnf discards them once the transaction commits.
+        const config_body = if (customize.packageCacheDirectory(self.manifest.packages.cache)) |_|
+            "[main]\ngpgcheck=1\nreposdir=/run/zvmi-repos\ncachedir=" ++
+                guest_cache_directory ++ "\nkeepcache=1\n"
+        else
+            "[main]\ngpgcheck=1\nreposdir=/run/zvmi-repos\n";
         try writeBytesExclusive(
             self.io,
             config_path,
-            "[main]\ngpgcheck=1\nreposdir=/run/zvmi-repos\n",
+            config_body,
             default_repository_permissions,
         );
         for (self.manifest.packages.repositories) |repository| {
@@ -1365,6 +1439,13 @@ const Session = struct {
             "/run/zvmi-tdnf.conf",
             "--disablerepo=*",
         });
+        // tdnf's own refusal to fetch. A package the declared cache does not
+        // hold fails as `ERROR_TDNF_CACHE_DISABLED` rather than being
+        // downloaded, which is what makes the offline claim checkable instead
+        // of merely intended.
+        if (customize.offlinePackageCache(self.manifest.packages.cache)) {
+            try argv.append("--cacheonly");
+        }
         if (repositories) {
             for (self.manifest.packages.repositories) |repository| {
                 try argv.append(try std.fmt.allocPrint(
@@ -2174,10 +2255,15 @@ fn validLockEvr(evr: []const u8) bool {
 }
 
 fn validateManifestPolicy(manifest: Manifest) !void {
-    if (manifest.packages.cache != .online or
-        !validManifestLock(manifest.packages.lock))
-    {
+    if (!validManifestLock(manifest.packages.lock)) {
         return error.UnsupportedPackagePolicy;
+    }
+    // The parent validated this, and this process mounts what it names while
+    // running as root, so it is re-checked rather than trusted.
+    if (customize.packageCacheDirectory(manifest.packages.cache)) |directory| {
+        customize.validatePackageCacheDirectory(directory) catch {
+            return error.UnsupportedPackagePolicy;
+        };
     }
     // A locked run rewrites these names into pinned specs, so one the lock
     // omits would silently run unpinned inside a transaction the plan hash
@@ -2707,6 +2793,7 @@ fn loadParentReport(
         .package_lock = parsed.value.package_lock,
         .hooks = parsed.value.hooks,
         .boot_configuration = parsed.value.boot_configuration,
+        .package_cache = parsed.value.package_cache,
     };
 }
 
@@ -2871,11 +2958,19 @@ test "worker policy accepts updates and still refuses an unnamed selective updat
     };
     try std.testing.expectError(error.InvalidPackageName, validateManifestPolicy(manifest));
 
-    // Updating is now executable; pinning it still is not.
+    // A cache directory the parent could not have produced is refused on
+    // this side of the privilege boundary too: this process mounts it.
     manifest.packages = .{
-        .actions = &.{.update_all},
+        .actions = &.{.{ .install = &.{"payload"} }},
         .repositories = &repositories,
-        .cache = .cache_only,
+        .cache = .{ .cache_only = "/var/cache/../../etc" },
+    };
+    try std.testing.expectError(error.UnsupportedPackagePolicy, validateManifestPolicy(manifest));
+
+    manifest.packages = .{
+        .actions = &.{.{ .install = &.{"payload"} }},
+        .repositories = &repositories,
+        .cache = .{ .online_populating = "relative/cache" },
     };
     try std.testing.expectError(error.UnsupportedPackagePolicy, validateManifestPolicy(manifest));
 

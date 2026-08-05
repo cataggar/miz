@@ -84,7 +84,10 @@ then verifies RPM signatures and package payload checksums from that pinned
 metadata. The cached and live metadata are verified again after the
 transaction; a repository change fails the build. The newly installed, sorted
 NEVRA closure is emitted and recorded under the builder work directory's
-`provenance/` directory.
+`provenance/` directory. The typed v3 API generalizes this: `.packages.cache`
+declares the cache directory as a request input, `.packages.lock` declares the
+NEVRA closure, and `provenance.execution.preserved` records both. See
+`doc/library-api.md`.
 
 The image boots directly through `UEFI -> EFI/BOOT/BOOTX64.EFI` (x86_64) or
 `EFI/BOOT/BOOTAA64.EFI` (AArch64) `-> UKI -> kernel/initramfs -> zvminit`; it

@@ -830,7 +830,8 @@ fn mapPackagePolicy(
         .repositories = repositories,
         .cache = switch (policy.cache) {
             .online => .online,
-            .cache_only => .cache_only,
+            .online_populating => |path| .{ .online_populating = path },
+            .cache_only => |path| .{ .cache_only = path },
         },
         .lock = switch (policy.lock) {
             .unlocked => .unlocked,
