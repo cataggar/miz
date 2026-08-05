@@ -33,8 +33,8 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 20;
-pub const provenance_schema_version: u32 = 23;
+pub const plan_schema_version: u32 = 21;
+pub const provenance_schema_version: u32 = 24;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -294,6 +294,24 @@ pub const ExecutionPolicy = struct {
     acknowledge_unsafe: bool = false,
     /// Required by, and only meaningful to, the `vm` backend.
     vm: ?VmPolicy = null,
+    /// Wall-clock budget for the whole execution, from the moment the
+    /// workspace is created to the moment the output is published.
+    ///
+    /// It belongs to the run rather than to any command in it. Package
+    /// scriptlets, dracut modules and hooks are all target-supplied code
+    /// running as root with no deadline of their own, and a per-command bound
+    /// is defeated by a policy that declares more commands, so the only bound
+    /// that means anything is the one over the whole thing.
+    ///
+    /// Absent means unbounded, which is where every caller that does not set
+    /// it stands today. There is deliberately no default: one short enough to
+    /// be useful would fail slow mirrors and emulated cross-architecture
+    /// guests, and inventing a number for them is not this policy's business.
+    ///
+    /// A run that exceeds it fails with a diagnostic of its own rather than a
+    /// command failure, and the transaction is torn down rather than left
+    /// holding a mount or a loop device.
+    deadline_seconds: ?u32 = null,
 };
 
 /// How the `vm` backend executes guest instructions. There is deliberately no
@@ -402,6 +420,123 @@ pub const VmPolicy = struct {
 pub const min_vm_memory_mib: u32 = 512;
 pub const max_vm_memory_mib: u32 = 1024 * 1024;
 pub const max_vm_boot_timeout_seconds: u32 = 24 * 60 * 60;
+/// Ceiling on the whole-run deadline. The same day as the boot timeouts it has
+/// to contain: a budget larger than the longest thing it bounds would be a
+/// number rather than a bound.
+pub const max_execution_deadline_seconds: u32 = 24 * 60 * 60;
+
+/// The run's declared budget, resolved to one absolute point in time.
+///
+/// Resolved once, when execution starts, and passed down rather than
+/// recomputed. A budget that restarted at each phase, or at each command,
+/// would be defeated by a policy that declares more of them, which is the
+/// whole reason the deadline belongs to the run.
+pub const Deadline = struct {
+    /// `.none` for a run that declared no deadline, which is every run that
+    /// predates the policy.
+    timeout: Io.Timeout = .none,
+
+    pub const unbounded: Deadline = .{};
+
+    pub const Error = error{ExecutionDeadlineExceeded};
+
+    /// Starts the budget now, on the `.awake` clock the guest boot timeouts
+    /// already use, so the deadline and the budgets it contains are measured
+    /// against the same thing.
+    pub fn start(io: Io, seconds: ?u32) Deadline {
+        const budget = seconds orelse return .unbounded;
+        return .{ .timeout = (Io.Timeout{ .duration = .{
+            .raw = .fromSeconds(budget),
+            .clock = .awake,
+        } }).toDeadline(io) };
+    }
+
+    /// Fails once the budget is spent. Called at phase boundaries, where the
+    /// alternative is starting work the run has no time left to finish.
+    pub fn check(self: Deadline, io: Io) Error!void {
+        if (self.expired(io)) return error.ExecutionDeadlineExceeded;
+    }
+
+    pub fn expired(self: Deadline, io: Io) bool {
+        const remaining = self.timeout.toDurationFromNow(io) orelse return false;
+        return remaining.raw.toNanoseconds() <= 0;
+    }
+
+    /// Whole seconds left, for handing the remaining budget to a process that
+    /// takes seconds rather than a timestamp. Rounded up, so a budget with any
+    /// time left is never handed over as zero.
+    pub fn remainingSeconds(self: Deadline, io: Io) ?u32 {
+        const remaining = self.timeout.toDurationFromNow(io) orelse return null;
+        const nanoseconds = remaining.raw.toNanoseconds();
+        if (nanoseconds <= 0) return 0;
+        const seconds = @divFloor(nanoseconds + std.time.ns_per_s - 1, std.time.ns_per_s);
+        return std.math.cast(u32, seconds) orelse std.math.maxInt(u32);
+    }
+
+    /// This deadline extended by a fixed grace, for a supervisor that has to
+    /// outlive the process it is bounding: the bounded process must be the one
+    /// that reports its own expiry, or the report would say the supervisor
+    /// gave up rather than what the run did.
+    pub fn withGrace(self: Deadline, seconds: u32) Deadline {
+        return switch (self.timeout) {
+            .none => .unbounded,
+            .duration => |duration| .{ .timeout = .{ .duration = .{
+                .raw = .fromNanoseconds(
+                    duration.raw.toNanoseconds() + @as(i96, seconds) * std.time.ns_per_s,
+                ),
+                .clock = duration.clock,
+            } } },
+            .deadline => |timestamp| .{ .timeout = .{ .deadline = timestamp.addDuration(.{
+                .raw = .fromSeconds(seconds),
+                .clock = timestamp.clock,
+            }) } },
+        };
+    }
+
+    /// The earlier of this deadline and a budget starting now, and which of
+    /// the two that was. Used where a backend already has a bound of its own:
+    /// the inner budget keeps its meaning, and the run deadline still cannot
+    /// be outlived.
+    pub fn clamped(self: Deadline, io: Io, budget_seconds: u32) Clamp {
+        const budget: Io.Clock.Duration = .{
+            .raw = .fromSeconds(budget_seconds),
+            .clock = .awake,
+        };
+        const remaining = self.timeout.toDurationFromNow(io) orelse return .{
+            .timeout = (Io.Timeout{ .duration = budget }).toDeadline(io),
+            .deadline_first = false,
+        };
+        const deadline_first = remaining.raw.toNanoseconds() < budget.raw.toNanoseconds();
+        const chosen = if (deadline_first) remaining else budget;
+        return .{
+            .timeout = (Io.Timeout{ .duration = chosen }).toDeadline(io),
+            .deadline_first = deadline_first,
+        };
+    }
+
+    /// A backend's own budget after the run deadline has been applied to it.
+    ///
+    /// Which budget the timeout came from is recorded when it is chosen rather
+    /// than worked out after it fires: by the time a boot has been torn down
+    /// and its console written out, a run deadline that had time left when the
+    /// boot gave up may have passed, and the failure would be renamed after
+    /// the fact into one the caller could not have caused.
+    pub const Clamp = struct {
+        timeout: Io.Timeout,
+        deadline_first: bool,
+
+        /// The failure to report when this timeout fires: the run's, if the
+        /// run's is what it was, and otherwise whatever the backend calls its
+        /// own.
+        pub fn expiry(self: Clamp, backend_error: anyerror) anyerror {
+            return if (self.deadline_first)
+                error.ExecutionDeadlineExceeded
+            else
+                backend_error;
+        }
+    };
+};
+
 /// Twice the appliance boot's budget. A firmware guest interprets the
 /// firmware, the bootloader, the kernel and an init system where the
 /// appliance interprets a kernel and one static binary, and on a software
@@ -917,6 +1052,9 @@ pub const DiagnosticCode = enum {
     source_hash_failed,
     source_changed,
     execution_failed,
+    /// The run exceeded its declared wall-clock budget. Distinct from
+    /// `execution_failed`, which is a command that ran and did not succeed.
+    deadline_exceeded,
     commit_failed,
     cleanup_completed,
     cleanup_failed,
@@ -1208,6 +1346,7 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
     try validateSelinuxPolicy(&diagnostics, request.selinux);
     try validateCrossArchitecturePolicy(&diagnostics, request.cross_architecture);
     try validateVmPolicy(&diagnostics, request);
+    try validateExecutionDeadline(&diagnostics, request);
     if (request.packages.actions.len > std.math.maxInt(u16) - 32 or
         request.hooks.len > std.math.maxInt(u16) - 32 or
         request.packages.actions.len + request.hooks.len > std.math.maxInt(u16) - 32)
@@ -1953,6 +2092,44 @@ fn validateKernelOptionChange(
             "write the options as they should appear on the kernel command line, as in console=ttyS0 quiet",
         ));
     };
+}
+
+/// The whole-run budget, and how it composes with the budgets inside it.
+///
+/// The guest boot timeouts are not duplicated by this deadline: they bound
+/// different things, and a run deadline that could preempt them would make
+/// them unreachable. So the deadline must be strictly larger than every boot
+/// budget the run can spend in sequence. Refused here rather than resolved by
+/// clamping, because a boot timeout that can never fire is a policy the caller
+/// wrote and did not get.
+fn validateExecutionDeadline(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    request: *const Request,
+) Allocator.Error!void {
+    const deadline_seconds = request.execution.deadline_seconds orelse return;
+    if (deadline_seconds == 0 or deadline_seconds > max_execution_deadline_seconds) {
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/execution/deadline_seconds",
+            "the execution deadline is outside the supported range",
+            "select a deadline of at least 1 second and at most 86400 seconds",
+        ));
+        return;
+    }
+    if (request.execution.backend != .vm) return;
+    const policy = request.execution.vm orelse return;
+    const guest_budget: u64 = @as(u64, policy.boot_timeout_seconds) + switch (policy.boot) {
+        .direct_kernel => 0,
+        .firmware => |firmware| @as(u64, firmware.boot_timeout_seconds),
+    };
+    if (deadline_seconds <= guest_budget) {
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/execution/deadline_seconds",
+            "the execution deadline does not exceed the guest boot budget it contains",
+            "raise deadline_seconds above the sum of the vm boot timeouts, or lower those timeouts",
+        ));
+    }
 }
 
 fn validateVmPolicy(
@@ -3151,6 +3328,7 @@ pub fn resolve(
         .overwrite = request.execution.overwrite,
         .acknowledge_unsafe = request.execution.acknowledge_unsafe,
         .vm = try dupeVmPolicy(plan_allocator, request.execution.vm),
+        .deadline_seconds = request.execution.deadline_seconds,
     };
     const resolved_input: ResolvedInput = switch (request.input) {
         .iso_oci => |input| .{ .iso_oci = .{
@@ -4567,6 +4745,10 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     hashInt(&hash, @intFromEnum(plan.execution.backend));
     hashBool(&hash, plan.execution.overwrite);
     hashBool(&hash, plan.execution.acknowledge_unsafe);
+    // The absent deadline is hashed as its own value rather than as zero, so
+    // "unbounded" and a declared budget stay distinguishable.
+    hashBool(&hash, plan.execution.deadline_seconds != null);
+    hashInt(&hash, plan.execution.deadline_seconds orelse 0);
     if (plan.execution.vm) |vm| {
         hash.update(&.{1});
         hashString(&hash, vm.emulator_command);
@@ -4991,6 +5173,7 @@ pub const Platform = struct {
         io: Io,
         plan: *const ResolvedPlan,
         target: preserved_image.RawMutationTarget,
+        deadline: Deadline,
     ) anyerror!UnsafeChrootRuntimeReport = null,
     vmCheckFn: ?*const fn (
         context: ?*anyopaque,
@@ -5003,6 +5186,7 @@ pub const Platform = struct {
         io: Io,
         plan: *const ResolvedPlan,
         target: preserved_image.RawMutationTarget,
+        deadline: Deadline,
     ) anyerror!VmRuntimeReport = null,
 
     pub fn system() Platform {
@@ -6320,6 +6504,7 @@ fn buildResult(
         .overwrite = plan.data.execution.overwrite,
         .acknowledge_unsafe = plan.data.execution.acknowledge_unsafe,
         .vm = try dupeVmPolicy(result_allocator, plan.data.execution.vm),
+        .deadline_seconds = plan.data.execution.deadline_seconds,
     };
     const resolved_boot = try dupeBootPolicy(result_allocator, plan.data.boot_security);
     const resolved_os = try dupeOsCustomization(result_allocator, plan.data.os, null);
@@ -6645,6 +6830,10 @@ pub fn execute(
     defer freeSourceRecords(allocator, source_digests_before);
 
     const cwd = Io.Dir.cwd();
+    // Started before the first thing the run creates, so the budget covers
+    // the whole execution rather than the part of it a backend happens to
+    // own. Everything from here to the commit is inside it.
+    const deadline = Deadline.start(io, plan.data.execution.deadline_seconds);
     cwd.createDirPath(io, plan.data.execution.workspace_path) catch |err| {
         try appendFailure(&diagnostics, .execution_failed, .execution, "/execution/workspace_path", "failed to create the workspace", err);
         emitDiagnostics(event_sink, diagnostics.items);
@@ -6800,6 +6989,7 @@ pub fn execute(
             var hook_context = UnsafeChrootHookContext{
                 .platform = platform,
                 .plan = plan,
+                .deadline = deadline,
             };
             defer if (hook_context.report) |*report| report.deinit();
             const raw_report = preserved_image.transactRaw(allocator, io, .{
@@ -6814,7 +7004,7 @@ pub fn execute(
                 .context = &hook_context,
                 .runFn = runUnsafeChrootHook,
             }) catch |err| {
-                try appendFailure(&diagnostics, .execution_failed, .execution, "/execution/backend", "unsafe chroot preserved-image execution failed", err);
+                try appendExecutionFailure(&diagnostics, "/execution/backend", "unsafe chroot preserved-image execution failed", err);
                 if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
                 emitDiagnostics(event_sink, diagnostics.items);
                 return try failureOutcome(allocator, diagnostics.items);
@@ -6841,6 +7031,7 @@ pub fn execute(
             var hook_context = VmHookContext{
                 .platform = platform,
                 .plan = plan,
+                .deadline = deadline,
             };
             defer if (hook_context.report) |*report| report.deinit();
             const raw_report = preserved_image.transactRaw(allocator, io, .{
@@ -6855,7 +7046,7 @@ pub fn execute(
                 .context = &hook_context,
                 .runFn = runVmHook,
             }) catch |err| {
-                try appendFailure(&diagnostics, .execution_failed, .execution, "/execution/backend", "virtual machine preserved-image execution failed", err);
+                try appendExecutionFailure(&diagnostics, "/execution/backend", "virtual machine preserved-image execution failed", err);
                 if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
                 emitDiagnostics(event_sink, diagnostics.items);
                 return try failureOutcome(allocator, diagnostics.items);
@@ -6875,6 +7066,19 @@ pub fn execute(
             };
         },
     }
+
+    // Nothing is published after the budget is spent. For the backends that
+    // enforce the deadline over their own children this is the second answer
+    // to the same question; for the ones that run no target-supplied code --
+    // where the work is bounded local disk I/O and interrupting it would only
+    // corrupt a staging file -- it is the whole of it: the run finishes what
+    // it started and then refuses to commit it.
+    deadline.check(io) catch |err| {
+        try appendExecutionFailure(&diagnostics, "/execution/backend", "the run exceeded its deadline", err);
+        if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
+        emitDiagnostics(event_sink, diagnostics.items);
+        return try failureOutcome(allocator, diagnostics.items);
+    };
 
     // The bundle is written from the image the backend staged, so every
     // backend reaches it by the same route: whatever produced the disk, the
@@ -6974,6 +7178,24 @@ pub fn execute(
     var final_diagnostics_owned_by_function = true;
     errdefer if (final_diagnostics_owned_by_function) final_diagnostics.deinit(allocator);
 
+    // The last word before the rename. Everything between the backend and
+    // here -- the COSI bundle, the source re-hash, the output digest -- is
+    // work the run was still spending time on, and a budget that had run out
+    // during it must not end in a published image.
+    deadline.check(io) catch |err| {
+        result.deinit(allocator);
+        final_diagnostics.deinit(allocator);
+        final_diagnostics_owned_by_function = false;
+        result_owned_by_function = false;
+        commit_barrier.release(io);
+        const cleanup_diagnostic = cleanupTransaction(io, plan.data.transaction_path);
+        transaction_active = false;
+        try appendExecutionFailure(&diagnostics, "/output/path", "the run exceeded its deadline", err);
+        if (cleanup_diagnostic) |diagnostic| try diagnostics.append(diagnostic);
+        emitDiagnostics(event_sink, diagnostics.items);
+        return try failureOutcome(allocator, diagnostics.items);
+    };
+
     const commit_result = if (plan.data.execution.overwrite)
         cwd.rename(plan.data.staging_commit_path, cwd, plan.data.output.path, io)
     else
@@ -7013,6 +7235,7 @@ pub fn execute(
 const UnsafeChrootHookContext = struct {
     platform: Platform,
     plan: *const ResolvedPlan,
+    deadline: Deadline,
     report: ?UnsafeChrootRuntimeReport = null,
 };
 
@@ -7025,18 +7248,25 @@ fn runUnsafeChrootHook(
     const context: *UnsafeChrootHookContext = @ptrCast(@alignCast(context_ptr.?));
     const run_fn = context.platform.unsafeChrootRunFn orelse
         return error.UnsafeChrootRunnerUnavailable;
+    // Before the worker is spawned rather than after it returns: a run with no
+    // budget left must not start privileged target code it has no time to
+    // finish, and the copy that got the raw stage here is where the budget
+    // went.
+    try context.deadline.check(io);
     context.report = try run_fn(
         context.platform.context,
         allocator,
         io,
         context.plan,
         target,
+        context.deadline,
     );
 }
 
 const VmHookContext = struct {
     platform: Platform,
     plan: *const ResolvedPlan,
+    deadline: Deadline,
     report: ?VmRuntimeReport = null,
 };
 
@@ -7048,12 +7278,14 @@ fn runVmHook(
 ) !void {
     const context: *VmHookContext = @ptrCast(@alignCast(context_ptr.?));
     const run_fn = context.platform.vmRunFn orelse return error.VmRunnerUnavailable;
+    try context.deadline.check(io);
     context.report = try run_fn(
         context.platform.context,
         allocator,
         io,
         context.plan,
         target,
+        context.deadline,
     );
 }
 
@@ -7375,6 +7607,33 @@ fn appendFailure(
         .configuration_path = path,
         .message = message,
         .cause = .{ .error_name = @errorName(err) },
+    });
+}
+
+/// Names an execution failure, and says which kind it was.
+///
+/// A run that spent its budget and a command that failed are different
+/// answers to "why did this not publish", and a caller that retries the first
+/// with a larger budget would be retrying the second forever. So the deadline
+/// gets its own code and its own message rather than arriving as one more
+/// error name under `execution_failed`.
+fn appendExecutionFailure(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    path: []const u8,
+    message: []const u8,
+    err: anyerror,
+) Allocator.Error!void {
+    if (err != error.ExecutionDeadlineExceeded) {
+        return appendFailure(diagnostics, .execution_failed, .execution, path, message, err);
+    }
+    try diagnostics.append(.{
+        .severity = .@"error",
+        .phase = .execution,
+        .code = .deadline_exceeded,
+        .configuration_path = "/execution/deadline_seconds",
+        .message = "the run exceeded its declared execution deadline",
+        .cause = .{ .error_name = @errorName(err) },
+        .remediation = "raise execution.deadline_seconds, or reduce the work the run declares",
     });
 }
 
@@ -7983,6 +8242,7 @@ test "unsafe chroot platform executes the supported preserved subset" {
             _: Io,
             plan: *const ResolvedPlan,
             target: preserved_image.RawMutationTarget,
+            _: Deadline,
         ) !UnsafeChrootRuntimeReport {
             const called: *bool = @ptrCast(@alignCast(context_ptr.?));
             called.* = true;
@@ -8718,6 +8978,193 @@ test "the vm backend requires an explicit and self-consistent VM policy" {
     var accepted = try validate(std.testing.allocator, &request);
     defer accepted.deinit(std.testing.allocator);
     try std.testing.expect(!accepted.hasErrors());
+}
+
+test "the execution deadline is bounded and must contain the guest boot budgets" {
+    // Absent is the only shape with no bound to check: a run that declared no
+    // deadline is unbounded on purpose and has nothing to be inconsistent
+    // with.
+    {
+        var request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(!diagnostics.hasErrors());
+        try std.testing.expect(request.execution.deadline_seconds == null);
+    }
+
+    // Zero is not "no deadline": it is a budget nothing can be done within,
+    // and a run that declared it meant to say something else.
+    for ([_]u32{ 0, max_execution_deadline_seconds + 1 }) |seconds| {
+        var request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+        request.execution.deadline_seconds = seconds;
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(hasDiagnosticCode(diagnostics, .invalid_policy));
+    }
+
+    {
+        var request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+        request.execution.deadline_seconds = max_execution_deadline_seconds;
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(!diagnostics.hasErrors());
+    }
+
+    // A deadline no larger than the boots it contains would preempt a budget
+    // the caller declared, so the two are refused together rather than one
+    // silently winning.
+    var vm_request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    vm_request.execution.backend = .vm;
+    var policy = validVmPolicy();
+    policy.boot_timeout_seconds = 900;
+    vm_request.execution.vm = policy;
+    vm_request.execution.deadline_seconds = 900;
+    {
+        var diagnostics = try validate(std.testing.allocator, &vm_request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(hasDiagnosticCode(diagnostics, .invalid_policy));
+    }
+    vm_request.execution.deadline_seconds = 901;
+    {
+        var diagnostics = try validate(std.testing.allocator, &vm_request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(!diagnostics.hasErrors());
+    }
+
+    // A firmware boot is a second boot in sequence, so it is added to what the
+    // deadline has to exceed rather than compared against separately.
+    policy.boot = .{ .firmware = .{
+        .code_path = "/usr/share/OVMF/OVMF_CODE.fd",
+        .vars_path = "/usr/share/OVMF/OVMF_VARS.fd",
+        .console_marker = "Linux version ",
+        .boot_timeout_seconds = 600,
+    } };
+    vm_request.execution.vm = policy;
+    {
+        var diagnostics = try validate(std.testing.allocator, &vm_request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(hasDiagnosticCode(diagnostics, .invalid_policy));
+    }
+    vm_request.execution.deadline_seconds = 1501;
+    {
+        var diagnostics = try validate(std.testing.allocator, &vm_request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(!diagnostics.hasErrors());
+    }
+}
+
+test "the plan hash covers the run's declared deadline" {
+    // A run given twice the time may install what a shorter one could not
+    // finish, and an absent deadline is not the same declaration as a large
+    // one: all three have to be different plans.
+    const budgets = [_]?u32{ null, 600, 1200 };
+    var hashes: [budgets.len]Digest = undefined;
+    for (budgets, 0..) |budget, index| {
+        var request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+        request.execution.deadline_seconds = budget;
+        var resolved = try resolve(
+            std.testing.allocator,
+            &request,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer resolved.deinit(std.testing.allocator);
+        try std.testing.expect(resolved.plan != null);
+        try std.testing.expectEqual(
+            budget,
+            resolved.plan.?.data.execution.deadline_seconds,
+        );
+        hashes[index] = resolved.plan.?.data.plan_hash;
+    }
+    for (hashes, 0..) |left, i| {
+        for (hashes[i + 1 ..]) |right| {
+            try std.testing.expect(!std.mem.eql(u8, &left.bytes, &right.bytes));
+        }
+    }
+}
+
+test "a run that exceeds its deadline is reported as a deadline rather than a failure" {
+    const io = std.testing.io;
+    const source_path = "test-customize-deadline-source.raw";
+    const spool_path = "test-customize-deadline-spool";
+    const workspace_path = "test-customize-deadline-work";
+    const output_path = workspace_path ++ "/output.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try createCustomizeTestDisk(io, source_path, spool_path);
+    try Io.Dir.cwd().createDirPath(io, workspace_path);
+
+    var request = validNativeEditRequest(
+        source_path,
+        output_path,
+        workspace_path,
+        &.{},
+    );
+    request.execution.backend = .unsafe_chroot;
+    request.execution.acknowledge_unsafe = true;
+    request.execution.deadline_seconds = 600;
+
+    const FakeUnsafe = struct {
+        fn check(
+            _: ?*anyopaque,
+            _: Io,
+            _: *const ResolvedPlan,
+        ) CapabilityState {
+            return .available;
+        }
+
+        fn run(
+            _: ?*anyopaque,
+            _: Allocator,
+            io_arg: Io,
+            _: *const ResolvedPlan,
+            _: preserved_image.RawMutationTarget,
+            deadline: Deadline,
+        ) !UnsafeChrootRuntimeReport {
+            // The backend is handed a live budget, not the number that was
+            // declared: what it has to bound is whatever is left by the time
+            // it starts.
+            try std.testing.expect(deadline.remainingSeconds(io_arg) != null);
+            try std.testing.expect(deadline.remainingSeconds(io_arg).? <= 600);
+            return error.ExecutionDeadlineExceeded;
+        }
+    };
+
+    var platform = Platform.system();
+    platform.unsafeChrootCheckFn = FakeUnsafe.check;
+    platform.unsafeChrootRunFn = FakeUnsafe.run;
+    var resolved = try resolve(
+        std.testing.allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+
+    var outcome = try execute(
+        std.testing.allocator,
+        io,
+        &resolved.plan.?,
+        platform,
+        null,
+    );
+    defer outcome.deinit(std.testing.allocator);
+    try std.testing.expect(outcome.result == null);
+    // The dedicated code is the whole point: a caller that reads
+    // `execution_failed` cannot tell a run that ran out of time from one whose
+    // policy was wrong, and only one of the two is answered by more time.
+    try std.testing.expect(hasDiagnosticCode(outcome.diagnostics, .deadline_exceeded));
+    for (outcome.diagnostics.items) |diagnostic| {
+        if (diagnostic.code != .deadline_exceeded) continue;
+        try std.testing.expectEqualStrings(
+            "/execution/deadline_seconds",
+            diagnostic.configuration_path,
+        );
+    }
+    // Nothing is published by a run that ran out of time.
+    try std.testing.expectError(
+        error.FileNotFound,
+        Io.Dir.cwd().statFile(io, output_path, .{}),
+    );
 }
 
 test "a firmware boot names its own firmware, marker, and budget in the plan" {
@@ -11965,6 +12412,7 @@ test "a hook that ran is recorded by digest in provenance" {
             _: Io,
             plan: *const ResolvedPlan,
             _: preserved_image.RawMutationTarget,
+            _: Deadline,
         ) !UnsafeChrootRuntimeReport {
             try std.testing.expectEqual(@as(usize, 1), plan.data.hooks.len);
             return .{

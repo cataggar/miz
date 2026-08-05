@@ -409,6 +409,10 @@ pub const Configuration = struct {
     /// every other backend preserves the source's filesystem rather than
     /// writing a new one, so there is nothing here for it to decide.
     journal: JournalPolicy = .{},
+    /// Wall-clock budget for the whole run. Absent means unbounded, which is
+    /// what every configuration written before this field said and still
+    /// says. Applies to every backend: it bounds the run, not the backend.
+    deadline_seconds: ?u32 = null,
 };
 
 pub const ValidationError = error{

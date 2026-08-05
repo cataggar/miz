@@ -316,6 +316,11 @@ pub const PreservedOptions = struct {
     /// `rebuild` backend writes a filesystem, so this is meaningless -- and
     /// refused -- for the others.
     journal: PreservedJournalPolicy = .{},
+    /// Wall-clock budget for the whole customization run, in seconds. Absent
+    /// means unbounded, which is what every image definition written before
+    /// this field said and still says. It bounds the run rather than any one
+    /// backend, so it applies to all of them.
+    deadline_seconds: ?u32 = null,
     verbose: bool = false,
 };
 
@@ -648,6 +653,7 @@ fn materializePreservedConfiguration(
         .guest_execution = options.guest_execution,
         .runner = options.runner,
         .vm = options.vm,
+        .deadline_seconds = options.deadline_seconds,
     };
     try preserved_image_wire.validate(configuration, sources.items.len);
     const json = try std.json.Stringify.valueAlloc(b.allocator, configuration, .{});
