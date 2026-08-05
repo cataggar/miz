@@ -1106,9 +1106,14 @@ try zvmi.bootconfig.populateEsp(allocator, io, &esp_fs, &tree, .{
 ```
 
 The same `extra_kernel_options` text can also be added to an image that already
-exists: `zvmi.customize`'s `native_edit` and `rebuild` backends append it to the
-GRUB and BLS entries on the image's ESP instead of generating them, and refuse
-the guest backends and Unified Kernel Images by name. See `doc/library-api.md`.
+exists, by whichever mechanism that image's own layout supports.
+`zvmi.customize`'s `native_edit` and `rebuild` backends append it to the GRUB
+and BLS entries on the image's ESP instead of generating them. The privileged
+`unsafe_chroot` backend instead appends it to `GRUB_CMDLINE_LINUX` in the
+target's `/etc/default/grub` and runs the target's own `grub2-mkconfig`, which
+is the durable form on a distro image because the generated configuration is
+rewritten from that input on every kernel package change. The `vm` backend and
+Unified Kernel Images are refused by name. See `doc/library-api.md`.
 
 The low-level PE/COFF rewriting lives in `zvmi.uki`, which takes a prebuilt
 stub plus kernel/initrd/cmdline payloads and emits a structurally valid UKI

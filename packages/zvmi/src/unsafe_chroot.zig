@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const boot_options = @import("boot_options.zig");
 const customize = @import("customize.zig");
+const grub_defaults = @import("grub_defaults.zig");
 const os_customization = @import("os_customization.zig");
 const preserved_image = @import("preserved_image.zig");
 const transaction_guard = @import("transaction_guard.zig");
@@ -39,8 +41,35 @@ const Manifest = struct {
     packages: customize.PackagePolicy,
     initramfs: customize.InitramfsPolicy,
     kernel_modules: []const customize.KernelModule = &.{},
+    /// Kernel command-line options to add to the target's own bootloader
+    /// configuration. Empty means the run changes none.
+    kernel_options: []const u8 = "",
     hooks: []const customize.Hook = &.{},
 };
+
+/// Where the distro's own bootloader tooling is looked for inside the target
+/// root, in the order the two spellings of the same program are tried.
+/// `grub2-` is the Red Hat family's rename, `grub-` is everyone else's.
+const guest_generator_candidates = [_][]const u8{
+    "/usr/sbin/grub2-mkconfig",
+    "/usr/bin/grub2-mkconfig",
+    "/sbin/grub2-mkconfig",
+    "/usr/sbin/grub-mkconfig",
+    "/usr/bin/grub-mkconfig",
+    "/sbin/grub-mkconfig",
+};
+
+/// The configuration file the generator is asked to write, in the order the
+/// two directory layouts are tried. A target has one or the other, never
+/// both, and the one it has is where its bootloader reads from.
+const guest_generated_candidates = [_][]const u8{
+    "/boot/grub2/grub.cfg",
+    "/boot/grub/grub.cfg",
+};
+
+const guest_grub_defaults = "/etc/default/grub";
+const guest_kernel_cmdline = "/etc/kernel/cmdline";
+const guest_fstab = "/etc/fstab";
 
 pub fn available(io: Io) customize.CapabilityState {
     if (builtin.os.tag != .linux or
@@ -116,6 +145,7 @@ pub fn runParent(
         .packages = options.plan.data.packages,
         .initramfs = options.plan.data.initramfs,
         .kernel_modules = options.plan.data.os.kernel_modules,
+        .kernel_options = options.plan.data.boot_security.extra_kernel_options,
         .hooks = options.plan.data.hooks,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, manifest, .{});
@@ -250,6 +280,7 @@ const WorkerReport = struct {
     /// out of.
     package_lock: []const customize.PackageVersionLock = &.{},
     hooks: []const customize.HookRecord = &.{},
+    boot_configuration: ?customize.BootConfigurationRecord = null,
 };
 
 fn executeManifest(
@@ -302,6 +333,7 @@ fn executeManifest(
             .installed_packages = session.installed_packages.items,
             .package_lock = session.emitted_lock.items,
             .hooks = session.hook_records.items,
+            .boot_configuration = session.boot_configuration,
         },
     };
 }
@@ -337,6 +369,8 @@ const Session = struct {
     tdnf_version: []const u8 = "",
     dracut_version: []const u8 = "",
     cp_version: []const u8 = "",
+    generator_version: []const u8 = "",
+    boot_configuration: ?customize.BootConfigurationRecord = null,
 
     fn openAndRun(self: *Session) ?void {
         self.open() catch return null;
@@ -610,6 +644,11 @@ const Session = struct {
             .when_needed => return error.UnresolvedInitramfsPolicy,
         }
         try self.runHooks(.before_seal);
+        // In the phase the plan publishes as `bootloader_prepare`: after the
+        // packages that could have installed a kernel and after the initramfs
+        // the generator will reference, so the configuration it produces
+        // describes the root as the run leaves it.
+        try self.regenerateBootConfiguration();
         try self.runHooks(.finalize);
     }
 
@@ -1552,6 +1591,167 @@ const Session = struct {
         }
     }
 
+    /// Adds the declared kernel options to the target's own bootloader
+    /// configuration by editing the input the distro's generator reads and
+    /// then running that generator.
+    ///
+    /// `boot_options` edits the generated entries on the ESP directly, which
+    /// is right for an image whose command line only zvmi ever writes. A
+    /// distro-installed image regenerates its `grub.cfg` from
+    /// `/etc/default/grub` whenever a kernel package changes, so an option
+    /// written into the generated file there lasts until the next kernel
+    /// update. This is the durable half, and it is the reason this path needs
+    /// a chroot: only the target's own generator knows the target's menu.
+    fn regenerateBootConfiguration(self: *Session) !void {
+        const options = self.manifest.kernel_options;
+        if (options.len == 0) return;
+
+        // Re-checked against the file it is about to be spliced into, so the
+        // rule and the write it guards are in the same function.
+        try grub_defaults.validateOptions(options);
+        try self.refuseSeparateBootFilesystem();
+        const generator = try self.findGuestGenerator();
+        const generated = try self.findGuestGeneratedConfiguration();
+
+        const defaults_path = try self.guestPath(guest_grub_defaults);
+        defer self.allocator.free(defaults_path);
+        const before = Io.Dir.cwd().readFileAlloc(
+            self.io,
+            defaults_path,
+            self.allocator,
+            .limited(grub_defaults.max_file_bytes),
+        ) catch return error.MissingBootloaderDefaults;
+        defer self.allocator.free(before);
+
+        const outcome = try grub_defaults.append(self.allocator, before, options);
+        defer if (outcome.text) |text| self.allocator.free(text);
+        if (outcome.text) |text| {
+            // A truncating open keeps the existing file's mode, which is the
+            // distro's own and not this run's to change.
+            const file = try Io.Dir.cwd().createFile(self.io, defaults_path, .{});
+            defer file.close(self.io);
+            try file.writePositionalAll(self.io, text, 0);
+        }
+
+        self.generator_version = try self.runChrootCapture(&.{ generator, "--version" });
+        try self.runChroot(&.{ generator, "-o", generated });
+
+        // The generator is the target's program, run against the target's
+        // scripts, so nothing before this point can promise what came out of
+        // it. A configuration regenerated from a root with no kernel installed
+        // is valid, empty, and unbootable; so is one whose distro scripts
+        // ignore the variable this run edited. Both are caught here and only
+        // here.
+        const entries = try self.verifyGeneratedConfiguration(generated, options);
+        self.boot_configuration = .{
+            .defaults_path = guest_grub_defaults,
+            .generator_path = generator,
+            .generated_path = generated,
+            .entries = entries,
+            .defaults_already_current = outcome.already_current,
+            .options = options,
+        };
+    }
+
+    /// Refuses a target whose `/boot` is a filesystem of its own.
+    ///
+    /// This backend mounts the selected root partition and nothing else, so
+    /// on such an image the `/boot` the generator would read and write is an
+    /// empty stub directory: it would find no kernel, produce a configuration
+    /// with no entries, and write it where nothing reads it. Naming the case
+    /// beats regenerating into the void and reporting success.
+    fn refuseSeparateBootFilesystem(self: *Session) !void {
+        const path = try self.guestPath(guest_fstab);
+        defer self.allocator.free(path);
+        const contents = Io.Dir.cwd().readFileAlloc(
+            self.io,
+            path,
+            self.allocator,
+            .limited(grub_defaults.max_file_bytes),
+            // No `/etc/fstab` at all is a root this check cannot speak about,
+            // and the verification pass over the generated configuration is
+            // what catches the layout being wrong anyway.
+        ) catch return;
+        defer self.allocator.free(contents);
+        if (declaresSeparateBootFilesystem(contents)) {
+            return error.SeparateBootFilesystem;
+        }
+    }
+
+    fn findGuestGenerator(self: *Session) ![]const u8 {
+        for (guest_generator_candidates) |candidate| {
+            if (try self.guestFileExists(candidate)) return candidate;
+        }
+        // A systemd-managed target keeps its command line in
+        // `/etc/kernel/cmdline` and regenerates through `kernel-install`,
+        // whose verb needs a kernel version and image path this backend does
+        // not model. Named separately so the message says what the image is
+        // rather than only what it is not.
+        if (try self.guestFileExists(guest_kernel_cmdline)) {
+            return error.UnsupportedBootloaderGenerator;
+        }
+        return error.MissingBootloaderGenerator;
+    }
+
+    fn findGuestGeneratedConfiguration(self: *Session) ![]const u8 {
+        for (guest_generated_candidates) |candidate| {
+            if (try self.guestFileExists(candidate)) return candidate;
+        }
+        return error.MissingBootloaderConfiguration;
+    }
+
+    /// Reads back the regenerated configuration and counts the entries whose
+    /// command line carries the options. Zero fails the run.
+    fn verifyGeneratedConfiguration(
+        self: *Session,
+        generated: []const u8,
+        options: []const u8,
+    ) !usize {
+        const path = try self.guestPath(generated);
+        defer self.allocator.free(path);
+        const contents = try Io.Dir.cwd().readFileAlloc(
+            self.io,
+            path,
+            self.allocator,
+            .limited(boot_options.max_config_bytes),
+        );
+        defer self.allocator.free(contents);
+
+        const defaults_path = try self.guestPath(guest_grub_defaults);
+        defer self.allocator.free(defaults_path);
+        const defaults = try Io.Dir.cwd().readFileAlloc(
+            self.io,
+            defaults_path,
+            self.allocator,
+            .limited(grub_defaults.max_file_bytes),
+        );
+        defer self.allocator.free(defaults);
+        // The generator rewrites its own output but never its input, so an
+        // input that lost the options means something else edited it during
+        // the run.
+        if (!try grub_defaults.carries(defaults, options)) return error.KernelOptionsNotApplied;
+
+        const entries = boot_options.countGrubEntriesCarrying(contents, options);
+        if (entries == 0) return error.KernelOptionsNotApplied;
+        return entries;
+    }
+
+    /// Joins a guest-absolute path onto the mounted target root. Caller owns
+    /// the result.
+    fn guestPath(self: *Session, guest_absolute: []const u8) ![]u8 {
+        return std.fs.path.join(
+            self.allocator,
+            &.{ self.manifest.root_path, guest_absolute[1..] },
+        );
+    }
+
+    fn guestFileExists(self: *Session, guest_absolute: []const u8) !bool {
+        const path = try self.guestPath(guest_absolute);
+        defer self.allocator.free(path);
+        const stat = Io.Dir.cwd().statFile(self.io, path, .{}) catch return false;
+        return stat.kind == .file;
+    }
+
     fn runChroot(self: *Session, guest_argv: []const []const u8) !void {
         var argv = try std.array_list.Managed([]const u8).initCapacity(
             self.allocator,
@@ -1612,9 +1812,32 @@ const Session = struct {
         if (std.mem.endsWith(u8, guest_path, "/tdnf")) return self.tdnf_version;
         if (std.mem.endsWith(u8, guest_path, "/dracut")) return self.dracut_version;
         if (std.mem.endsWith(u8, guest_path, "/cp")) return self.cp_version;
+        if (std.mem.endsWith(u8, guest_path, "-mkconfig")) return self.generator_version;
         return "";
     }
 };
+
+/// Whether an `/etc/fstab` mounts anything at `/boot`.
+///
+/// Pure so the rule can be tested against the shapes real fstabs take --
+/// comments, `/boot/efi` which is a different mount, a trailing slash --
+/// without a privileged run to produce them.
+fn declaresSeparateBootFilesystem(contents: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |line| {
+        const body = std.mem.trim(u8, line, " \t\r");
+        if (body.len == 0 or body[0] == '#') continue;
+        var fields = std.mem.tokenizeAny(u8, body, " \t");
+        _ = fields.next() orelse continue;
+        const target = fields.next() orelse continue;
+        const trimmed = if (target.len > 1 and target[target.len - 1] == '/')
+            target[0 .. target.len - 1]
+        else
+            target;
+        if (std.mem.eql(u8, trimmed, "/boot")) return true;
+    }
+    return false;
+}
 
 const CommandResult = struct {
     term: std.process.Child.Term,
@@ -2074,6 +2297,16 @@ fn validateManifestPolicy(manifest: Manifest) !void {
         // either skip work the caller asked for or do work it did not.
         .when_needed => return error.UnresolvedInitramfsPolicy,
     }
+    // The option text is checked on this side of the privilege boundary for
+    // the same reason the package names are: it ends up inside a shell
+    // assignment in a file this worker writes as root into the target root,
+    // and the validator that already checked it is on the other side.
+    if (manifest.kernel_options.len != 0) {
+        boot_options.validateOptions(manifest.kernel_options) catch {
+            return error.InvalidKernelOptions;
+        };
+        try grub_defaults.validateOptions(manifest.kernel_options);
+    }
     // A hook is caller-supplied code that this worker will run as root inside
     // the target root, so the manifest's account of it is re-checked on this
     // side of the privilege boundary rather than trusted. The phase order is
@@ -2473,6 +2706,7 @@ fn loadParentReport(
         .installed_packages = parsed.value.installed_packages,
         .package_lock = parsed.value.package_lock,
         .hooks = parsed.value.hooks,
+        .boot_configuration = parsed.value.boot_configuration,
     };
 }
 
@@ -4606,4 +4840,30 @@ fn containsArg(argv: []const []const u8, expected: []const u8) bool {
         if (std.mem.eql(u8, arg, expected)) return true;
     }
     return false;
+}
+
+test "a separate /boot is recognized from fstab and /boot/efi is not" {
+    try std.testing.expect(declaresSeparateBootFilesystem(
+        "UUID=aaaa / ext4 defaults 0 1\n" ++
+            "UUID=bbbb /boot ext4 defaults 0 2\n",
+    ));
+    // A trailing slash names the same mount point.
+    try std.testing.expect(declaresSeparateBootFilesystem(
+        "UUID=bbbb\t/boot/\text4\tdefaults\t0 2\n",
+    ));
+    // The ESP is mounted under `/boot` on most distro images and is not a
+    // separate `/boot`: the generator still finds the kernels it needs.
+    try std.testing.expect(!declaresSeparateBootFilesystem(
+        "UUID=aaaa / ext4 defaults 0 1\n" ++
+            "UUID=cccc /boot/efi vfat umask=0077 0 2\n",
+    ));
+    // A commented-out entry mounts nothing.
+    try std.testing.expect(!declaresSeparateBootFilesystem(
+        "# UUID=bbbb /boot ext4 defaults 0 2\n",
+    ));
+    // A device whose name contains the target is not a mount at it.
+    try std.testing.expect(!declaresSeparateBootFilesystem(
+        "/dev/disk/by-label/boot / ext4 defaults 0 1\n",
+    ));
+    try std.testing.expect(!declaresSeparateBootFilesystem(""));
 }
