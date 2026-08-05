@@ -137,6 +137,15 @@ fn runIntegration(
         .aarch64 => .aarch64,
         else => return error.UnsupportedArchitecture,
     };
+    // The identity the stub `rpm -qa` reports, so the run has a lock that can
+    // actually hold. The install below is checked against the pinned spec
+    // rather than the bare name, which is the observable difference between a
+    // lock that is enforced and one that is merely recorded.
+    const lock = [_]zvmi.customize.PackageVersionLock{.{
+        .name = "integration-package",
+        .evr = "0:1.0-1",
+        .architecture = @tagName(builtin.cpu.arch),
+    }};
     const request = zvmi.customize.Request{
         .target_architecture = architecture,
         .input = .{ .disk = .{ .path = source_path } },
@@ -151,6 +160,7 @@ fn runIntegration(
         .packages = .{
             .actions = &actions,
             .repositories = &repositories,
+            .lock = .{ .exact = &lock },
         },
         .initramfs = .{ .regenerate = .{
             .generator = "dracut",
@@ -209,12 +219,43 @@ fn runIntegration(
     try ensure(result.provenance.tools.len == 5);
     const preserved = result.provenance.execution.preserved orelse
         return error.MissingPreservedProvenance;
-    try ensure(preserved.installed_packages.len == 1);
+    // The inventory is reported as rpm gives it, trust pseudo-packages and
+    // all. What they are excluded from is the lock, not the record of what
+    // the root holds.
+    try ensure(preserved.installed_packages.len == 4);
     try ensure(std.mem.eql(
         u8,
         preserved.installed_packages[0],
-        installedNevra(),
+        preexisting_nevra,
     ));
+    try ensure(std.mem.eql(
+        u8,
+        preserved.installed_packages[1],
+        declared_trust_nevra,
+    ));
+    try ensure(std.mem.eql(
+        u8,
+        preserved.installed_packages[2],
+        transaction_trust_nevra,
+    ));
+    try ensure(std.mem.eql(
+        u8,
+        preserved.installed_packages[3],
+        installed_nevra,
+    ));
+
+    // The emitted lock is the difference between the two inventories, so the
+    // package the root already carried must not be in it even though it is in
+    // the inventory beside it. Neither trust pseudo-package is in it either:
+    // the declared key was imported before the baseline was read, and the one
+    // the transaction imported is excluded by name. That this run completed
+    // at all is the other half of the assertion -- it ran under an exact
+    // lock, so a pseudo-package left in the delta would have failed it.
+    try ensure(preserved.emitted_package_lock.len == 1);
+    const emitted = preserved.emitted_package_lock[0];
+    try ensure(std.mem.eql(u8, emitted.name, "integration-package"));
+    try ensure(std.mem.eql(u8, emitted.evr, "0:1.0-1"));
+    try ensure(std.mem.eql(u8, emitted.architecture, @tagName(builtin.cpu.arch)));
 
     try expectOutputFile(
         allocator,
@@ -228,7 +269,7 @@ fn runIntegration(
         io,
         output_path,
         "/var/lib/zvmi-integration/installed",
-        "integration-package\n",
+        installed_nevra ++ "\n",
     );
     try expectOutputFile(
         allocator,
@@ -410,7 +451,23 @@ fn runGuestRpm(io: Io, args: []const []const u8) !void {
         return;
     }
     if (containsArg(args, "-qa")) {
-        std.debug.print("{s}\n", .{installedNevra()});
+        // The inventory answers differently before and after the transaction,
+        // because a stub that answered the same both times would let an
+        // emitted lock built from the difference pass while being empty.
+        std.debug.print("{s}\n", .{preexisting_nevra});
+        // Real rpm records each imported key as a `gpg-pubkey` pseudo-package
+        // and reports it here. The declared repository key appears once the
+        // trust import has run, and a second key appears once the transaction
+        // has run, standing for a key tdnf imports on its own under gpgcheck.
+        // Neither belongs in a lock: `(none)` is not an architecture the pin
+        // rules accept, so a lock naming one could never be restated.
+        if (guestPathExists(io, "/var/lib/zvmi-integration/trust")) {
+            std.debug.print("{s}\n", .{declared_trust_nevra});
+        }
+        if (guestPathExists(io, "/var/lib/zvmi-integration/installed")) {
+            std.debug.print("{s}\n", .{installed_nevra});
+            std.debug.print("{s}\n", .{transaction_trust_nevra});
+        }
         return;
     }
     return error.UnexpectedRpmInvocation;
@@ -496,12 +553,28 @@ fn writeGuestMarker(io: Io, path: []const u8, value: []const u8) !void {
     try file.writePositionalAll(io, "\n", value.len);
 }
 
-fn installedNevra() []const u8 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => "integration-package-0:1.0-1.x86_64",
-        .aarch64 => "integration-package-0:1.0-1.aarch64",
-        else => "integration-package-0:1.0-1.unknown",
-    };
+/// The one package the stub `rpm -qa` reports as installed, in the same
+/// `NAME-EPOCH:VERSION-RELEASE.ARCH` form the real command is asked for.
+/// A constant rather than a function so the pinned spec the lock produces can
+/// be spelled out at compile time beside it.
+const installed_nevra = "integration-package-0:1.0-1." ++ @tagName(builtin.cpu.arch);
+
+/// What the root already carried. Present in both inventories, so it must not
+/// appear in the emitted lock: a lock naming what the run did not choose says
+/// nothing about the run.
+const preexisting_nevra = "base-files-0:2.0-3.azl3." ++ @tagName(builtin.cpu.arch);
+
+/// The pseudo-package rpm records for the repository key this run declares,
+/// reported from the moment `rpm --import` has run.
+const declared_trust_nevra = "gpg-pubkey-0:3135ce90-5e6d6b3f.(none)";
+
+/// The pseudo-package rpm records for a key the package transaction imported
+/// on its own, which no caller declared and no lock could pin.
+const transaction_trust_nevra = "gpg-pubkey-0:c1b39b60-5e6d6b40.(none)";
+
+fn guestPathExists(io: Io, path: []const u8) bool {
+    _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
+    return true;
 }
 
 fn argumentAfter(

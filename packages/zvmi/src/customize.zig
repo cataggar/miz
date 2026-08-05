@@ -32,8 +32,8 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 17;
-pub const provenance_schema_version: u32 = 20;
+pub const plan_schema_version: u32 = 18;
+pub const provenance_schema_version: u32 = 21;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -491,15 +491,66 @@ pub const PackageCachePolicy = enum {
     cache_only,
 };
 
+/// One package pinned to one exact identity.
+///
+/// The three fields are rpm's own notion of identity, split the way rpm
+/// splits it, so a lock and the `rpm -qa` line it is checked against are the
+/// same value written two ways rather than two descriptions that have to be
+/// kept in agreement.
+///
+/// **There is deliberately no repository id.** An earlier shape of this type
+/// carried one, and nothing could have filled it honestly: rpm's database
+/// does not record which repository a package came from, and the
+/// `repoquery --installed` route to it is documented as unreliable under the
+/// DNF5 backend Azure Linux ships as tdnf -- `reponame` is answered for
+/// available packages and not for installed ones. So an emitted lock could
+/// only have copied the sole declared repository's id, or invented one, and a
+/// verifier reading it back would be checking a claim the run never made. The
+/// repositories a transaction was allowed to use are already declared in the
+/// request, hashed into the plan, and recorded in provenance; the lock's job
+/// is the part that is not, which is the exact version.
 pub const PackageVersionLock = struct {
     name: []const u8,
-    version: []const u8,
-    repository_id: []const u8,
+    /// rpm's `EPOCH:VERSION-RELEASE`, with the epoch always written even when
+    /// it is zero. Required in full rather than accepted as a bare version,
+    /// because `1.2.3` and `0:1.2.3-4.azl3` are different amounts of pinning
+    /// and only one of them is a lock -- a caller who wrote the short form and
+    /// got a silent partial match would have a build that reports itself
+    /// reproducible and is not.
+    evr: []const u8,
+    /// rpm's `%{ARCH}`. Part of identity rather than decoration: `noarch` and
+    /// `x86_64` builds of one name at one EVR are different packages, and a
+    /// multilib root can hold two of them at once.
+    architecture: []const u8,
 };
+
+/// Splits an `rpm -qa` record of the form `NAME-EPOCH:VERSION-RELEASE.ARCH`
+/// back into the lock that would state it, or nothing if it is not one.
+///
+/// The rule itself lives in `vm_control` because the guest agent needs it too
+/// and cannot import this module. See there for why the split is decidable.
+pub fn parseInstalledPackageRecord(record: []const u8) ?PackageVersionLock {
+    const pin = vm_control.parseInstalledPackageRecord(record) orelse return null;
+    return .{
+        .name = pin.name,
+        .evr = pin.evr,
+        .architecture = pin.architecture,
+    };
+}
 
 pub const PackageLockPolicy = union(enum) {
     unlocked,
     snapshot: []const u8,
+    /// Every package the transaction may leave installed, pinned by exact
+    /// identity, and checked against the target's own rpm database once the
+    /// transaction has run.
+    ///
+    /// This is the closure and not only the packages the actions name --
+    /// `install openssh` that pulls in a dependency the lock does not mention
+    /// has not been pinned, it has been pinned in one place and left free in
+    /// another. `validatePackageLock` therefore refuses an action naming a
+    /// package the lock omits, and a completed run emits the whole delta so
+    /// the next run can state it.
     exact: []const PackageVersionLock,
 };
 
@@ -1358,17 +1409,7 @@ fn validatePackagePolicy(
             try validateRepositoryCredential(diagnostics, credential, repository.urls);
         }
     }
-    switch (policy.lock) {
-        .unlocked => {},
-        .snapshot => |snapshot| if (snapshot.len == 0) {
-            try diagnostics.append(validationError(.invalid_policy, "/packages/lock/snapshot", "snapshot identifiers must not be empty", null));
-        },
-        .exact => |locks| for (locks) |lock| {
-            if (lock.name.len == 0 or lock.version.len == 0 or lock.repository_id.len == 0) {
-                try diagnostics.append(validationError(.invalid_policy, "/packages/lock/exact", "exact locks require package, version, and repository id", null));
-            }
-        },
-    }
+    try validatePackageLock(diagnostics, policy);
     switch (policy.resolver) {
         .host_resolver => {},
         // Two refusals with two messages. `127.0.0.53` is one well-formed
@@ -1389,6 +1430,143 @@ fn validatePackagePolicy(
             )),
         },
     }
+}
+
+/// Whether a package lock says something a run can act on and check.
+///
+/// The rules are all pure -- actions and locks are both in the request -- so
+/// every one of them is a refusal written where the request is written rather
+/// than a failure discovered with the target root already mounted.
+fn validatePackageLock(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    policy: PackagePolicy,
+) !void {
+    const locks = switch (policy.lock) {
+        .unlocked => return,
+        .snapshot => |snapshot| {
+            if (snapshot.len == 0) {
+                try diagnostics.append(validationError(.invalid_policy, "/packages/lock/snapshot", "snapshot identifiers must not be empty", null));
+            }
+            return;
+        },
+        .exact => |locks| locks,
+    };
+
+    // A lock that pins nothing is not a weaker lock, it is a policy that says
+    // "these are all the packages" while naming none -- and under the coverage
+    // rule below it would refuse every action it was paired with, which is a
+    // confusing way to say the request meant `unlocked`.
+    if (locks.len == 0) {
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/packages/lock/exact",
+            "an exact lock must pin at least one package",
+            "select unlocked to state that versions are not pinned",
+        ));
+    }
+
+    // A lock is a statement about a transaction, so a request with no package
+    // actions has nothing for it to be about. Refused here rather than left to
+    // run, because the run would compare the whole installed set against an
+    // empty transaction and fail on the first package the input image already
+    // carried -- an error naming something the request never touched, raised
+    // after the image had been staged.
+    if (policy.actions.len == 0) {
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/packages/lock/exact",
+            "an exact lock requires at least one package action to lock",
+            "select unlocked when the request declares no package actions",
+        ));
+    }
+
+    for (locks, 0..) |lock, index| {
+        if (!validLockField(lock.name) or
+            !validLockField(lock.evr) or
+            !validLockField(lock.architecture))
+        {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                "/packages/lock/exact",
+                "exact locks require a package name, an EVR, and an architecture, each a non-empty single-line value",
+                null,
+            ));
+            continue;
+        }
+        // `1.2.3` and `0:1.2.3-4.azl3` are different amounts of pinning, and
+        // only the second is one. Refusing the short form here is what keeps a
+        // half-written lock from reporting itself as reproducible after
+        // matching whatever release the repository happened to hold.
+        if (std.mem.indexOfScalar(u8, lock.evr, ':') == null or
+            std.mem.indexOfScalar(u8, lock.evr, '-') == null)
+        {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                "/packages/lock/exact",
+                "an exact lock's EVR must be rpm's full epoch:version-release form",
+                "write the epoch even when it is zero, as `rpm -qa --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}'` reports it",
+            ));
+        }
+        // Two locks for one name cannot both hold, and the verifier would
+        // report whichever it compared second.
+        for (locks[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.name, lock.name) and
+                std.mem.eql(u8, previous.architecture, lock.architecture))
+            {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/packages/lock/exact",
+                    "an exact lock must not pin one package and architecture twice",
+                    null,
+                ));
+            }
+        }
+    }
+
+    for (policy.actions) |action| {
+        const names: []const []const u8 = switch (action) {
+            // Removal is the one action a lock has nothing to say about: it
+            // names what must not be installed, and a lock names versions for
+            // what is.
+            .remove => continue,
+            // The one action that names nothing. Its subject is whatever the
+            // declared repositories hold at the moment it runs, which is the
+            // question an exact lock exists to close, so the two cannot be
+            // stated together -- and saying so here beats resolving a plan
+            // that could never have been reproducible.
+            .update_all => {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/packages/lock/exact",
+                    "an exact lock cannot be combined with update_all, which names its subject as whatever the repositories hold",
+                    "name the packages to update with update_selected, and pin each of them",
+                ));
+                continue;
+            },
+            .install, .update_selected => |values| values,
+        };
+        for (names) |name| {
+            if (!containsLockFor(locks, name)) {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/packages/lock/exact",
+                    "every package an action names must be pinned by the exact lock",
+                    "add the package, and the dependencies it pulls in, from the lock a completed online run emits",
+                ));
+            }
+        }
+    }
+}
+
+fn validLockField(value: []const u8) bool {
+    return value.len != 0 and std.mem.indexOfAny(u8, value, "\r\n\x00 \t") == null;
+}
+
+fn containsLockFor(locks: []const PackageVersionLock, name: []const u8) bool {
+    for (locks) |lock| {
+        if (std.mem.eql(u8, lock.name, name)) return true;
+    }
+    return false;
 }
 
 /// A credential is sent to every URL of its repository, so every URL has to be
@@ -3266,8 +3444,8 @@ fn dupePackagePolicy(
             for (locks, 0..) |lock, index| {
                 owned[index] = .{
                     .name = try allocator.dupe(u8, lock.name),
-                    .version = try allocator.dupe(u8, lock.version),
-                    .repository_id = try allocator.dupe(u8, lock.repository_id),
+                    .evr = try allocator.dupe(u8, lock.evr),
+                    .architecture = try allocator.dupe(u8, lock.architecture),
                 };
             }
             break :blk .{ .exact = owned };
@@ -3492,6 +3670,21 @@ fn dupeXattrs(allocator: Allocator, xattrs: []const ext4.Xattr) Allocator.Error!
 fn dupeStrings(allocator: Allocator, values: []const []const u8) Allocator.Error![]const []const u8 {
     const owned = try allocator.alloc([]const u8, values.len);
     for (values, 0..) |value, index| owned[index] = try allocator.dupe(u8, value);
+    return owned;
+}
+
+fn dupePackageLock(
+    allocator: Allocator,
+    pins: []const PackageVersionLock,
+) Allocator.Error![]const PackageVersionLock {
+    const owned = try allocator.alloc(PackageVersionLock, pins.len);
+    for (pins, owned) |pin, *target| {
+        target.* = .{
+            .name = try allocator.dupe(u8, pin.name),
+            .evr = try allocator.dupe(u8, pin.evr),
+            .architecture = try allocator.dupe(u8, pin.architecture),
+        };
+    }
     return owned;
 }
 
@@ -4452,8 +4645,8 @@ fn hashPackagePolicy(hash: *std.crypto.hash.sha2.Sha256, policy: PackagePolicy) 
             hashInt(hash, locks.len);
             for (locks) |lock| {
                 hashString(hash, lock.name);
-                hashString(hash, lock.version);
-                hashString(hash, lock.repository_id);
+                hashString(hash, lock.evr);
+                hashString(hash, lock.architecture);
             }
         },
     }
@@ -4767,11 +4960,19 @@ pub fn preflight(
                 .firmware => |firmware| vmFirmwareAvailable(io, firmware),
             } else .unsupported,
             .package_cache,
-            .package_lock,
             .selinux_policy,
             .selinux_relabel,
             .boot_policy_mutation,
             => .unsupported,
+            // Both executor backends enforce the lock now, and neither the
+            // rebuild backend nor any other runs a package transaction at all,
+            // so there is nothing for them to enforce it against.
+            .package_lock => if (plan.data.execution.backend == .vm)
+                vmCapabilityState(platform, io, plan)
+            else if (plan.data.execution.backend == .unsafe_chroot)
+                unsafeChrootCapabilityState(platform, io, plan)
+            else
+                .unsupported,
             .cross_architecture_runner,
             => if (plan.data.execution.backend == .vm)
                 vmCapabilityState(platform, io, plan)
@@ -4837,7 +5038,7 @@ fn unsafeChrootCapabilityState(
         data.selinux != .unchanged or
         !isDefaultBootPolicy(data.boot_security) or
         data.packages.cache != .online or
-        data.packages.lock != .unlocked)
+        !validUnsafePackageLock(data.packages.lock))
     {
         return .unsupported;
     }
@@ -4912,7 +5113,7 @@ fn vmCapabilityState(
         data.selinux != .unchanged or
         !isDefaultBootPolicy(data.boot_security) or
         data.packages.cache != .online or
-        data.packages.lock != .unlocked)
+        !validUnsafePackageLock(data.packages.lock))
     {
         return .unsupported;
     }
@@ -4995,6 +5196,50 @@ fn validUnsafePackageName(name: []const u8) bool {
             byte != '-' and
             byte != '~' and
             byte != '^')
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Gates the lock on what the executors can put on a package-manager command
+/// line and compare against the rpm database afterwards. `validate` has
+/// already refused every lock that is not a complete identity; this is the
+/// narrower question of whether these particular bytes are safe to hand to
+/// tdnf as a `name-epoch:version-release.arch` spec.
+fn validUnsafePackageLock(lock: PackageLockPolicy) bool {
+    const pins = switch (lock) {
+        .unlocked => return true,
+        // A snapshot names a state of the repositories, not of the target
+        // root, so there is nothing in the image for an executor to check it
+        // against. Whatever ends up honouring it belongs on the repository
+        // side of the run, and until something does, a plan that declares one
+        // must not resolve as though it were enforced.
+        .snapshot => return false,
+        .exact => |pins| pins,
+    };
+    for (pins) |pin| {
+        if (!validUnsafePackageName(pin.name)) return false;
+        if (!validUnsafeEvr(pin.evr)) return false;
+        if (!validUnsafeKernelRelease(pin.architecture)) return false;
+    }
+    return true;
+}
+
+/// An EVR carries one `:` that a package name may not, so it gets its own
+/// check rather than reusing the name rule.
+fn validUnsafeEvr(evr: []const u8) bool {
+    if (evr.len == 0 or !std.ascii.isAlphanumeric(evr[0])) return false;
+    for (evr[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            byte != '.' and
+            byte != '_' and
+            byte != '+' and
+            byte != '-' and
+            byte != '~' and
+            byte != '^' and
+            byte != ':')
         {
             return false;
         }
@@ -5306,6 +5551,7 @@ pub const UnsafeChrootRuntimeReport = struct {
     arena: std.heap.ArenaAllocator,
     tools: []const ToolRecord,
     installed_packages: []const []const u8,
+    package_lock: []const PackageVersionLock = &.{},
     hooks: []const HookRecord = &.{},
 
     pub fn deinit(self: *UnsafeChrootRuntimeReport) void {
@@ -5405,6 +5651,7 @@ pub const VmRuntimeReport = struct {
     arena: std.heap.ArenaAllocator,
     tools: []const ToolRecord,
     installed_packages: []const []const u8,
+    package_lock: []const PackageVersionLock = &.{},
     execution: VmExecutionRecord,
 
     pub fn deinit(self: *VmRuntimeReport) void {
@@ -5481,6 +5728,19 @@ pub const PreservedExecutionRecord = struct {
     flattened_backing_chain: bool,
     operation_count: usize,
     installed_packages: []const []const u8,
+    /// The lock this run would have to declare to install exactly what it
+    /// installed: every package the transaction added or changed, at the
+    /// identity it settled on, and nothing the input image already carried.
+    ///
+    /// Emitted whether or not a lock was declared. A run that verified one
+    /// restates it here, which is a tautology worth keeping because the
+    /// alternative is a provenance record whose meaning depends on the policy
+    /// beside it. A run that declared none is the interesting case: this is
+    /// where the lock for the next run comes from.
+    ///
+    /// Empty for a run with no package actions, where there is nothing to
+    /// state rather than nothing found.
+    emitted_package_lock: []const PackageVersionLock = &.{},
     /// Hooks that ran, in the order they ran. Empty for a run that declared
     /// none, which is not the same as a backend that could not have run them:
     /// that request never reaches a provenance record at all.
@@ -5711,6 +5971,16 @@ fn guestPackages(
     return &.{};
 }
 
+/// Same alternation, and for the same reason: one run, one emitted lock.
+fn guestPackageLock(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+    vm_report: ?*const VmRuntimeReport,
+) []const PackageVersionLock {
+    if (unsafe_report) |report| return report.package_lock;
+    if (vm_report) |report| return report.package_lock;
+    return &.{};
+}
+
 /// Hooks only ever run under the chroot backend, so there is one report that
 /// can hold them. Written as a lookup rather than read inline so the day the
 /// guest gains a script channel adds an arm here instead of a second spelling.
@@ -5868,6 +6138,10 @@ fn buildResult(
             .flattened_backing_chain = flattened,
             .operation_count = operation_count,
             .installed_packages = try dupeStrings(result_allocator, guestPackages(unsafe_report, vm_report)),
+            .emitted_package_lock = try dupePackageLock(
+                result_allocator,
+                guestPackageLock(unsafe_report, vm_report),
+            ),
             .hooks = try dupeHookRecords(result_allocator, guestHooks(unsafe_report)),
             .rebuild = if (rebuild_report) |report| .{
                 .profile = report.source_profile,
@@ -7604,6 +7878,30 @@ test "unsafe chroot preflight accepts only the implemented policy subset" {
 
     request = baseline;
     request.packages.lock = .{ .snapshot = "snapshot-1" };
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        try Check.state(&request, .x86_64),
+    );
+
+    // An exact lock the backend can put on a command line and check against
+    // the rpm database afterwards is one it can execute.
+    request = baseline;
+    request.packages.lock = .{ .exact = &.{
+        .{ .name = "dracut", .evr = "0:059-1.azl3", .architecture = "x86_64" },
+    } };
+    try std.testing.expectEqual(
+        CapabilityState.available,
+        try Check.state(&request, .x86_64),
+    );
+
+    // Not a validation duplicate. `validate` asks whether a lock states a
+    // whole identity; this asks the narrower question of whether these bytes
+    // are ones the backend can put on a package-manager command line. An
+    // architecture of `x86_64!` is a complete identity and still not one.
+    request = baseline;
+    request.packages.lock = .{ .exact = &.{
+        .{ .name = "dracut", .evr = "0:059-1.azl3", .architecture = "x86_64!" },
+    } };
     try std.testing.expectEqual(
         CapabilityState.unsupported,
         try Check.state(&request, .x86_64),
@@ -11244,4 +11542,195 @@ fn hasCapabilityKind(
         if (capability.kind == kind) return true;
     }
     return false;
+}
+
+// The repositories every lock test needs, so the cases below carry only what
+// they are about.
+fn lockTestRepositories() []const PackageRepository {
+    return &.{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+}
+
+test "an exact lock states a whole identity or is refused where it is written" {
+    const Case = struct {
+        actions: []const PackageAction,
+        lock: []const PackageVersionLock,
+        expected: []const u8,
+    };
+    const install_dracut: []const PackageAction = &.{.{ .install = &.{"dracut"} }};
+    const cases = [_]Case{
+        // A lock that pins nothing would refuse every action it was paired
+        // with under the coverage rule, which is a confusing way to say the
+        // request meant `unlocked`.
+        .{
+            .actions = install_dracut,
+            .lock = &.{},
+            .expected = "at least one package",
+        },
+        // The whole point of the type. A bare version matches whatever
+        // release the repository happens to hold, so a request that wrote one
+        // would report itself reproducible without being it.
+        .{
+            .actions = install_dracut,
+            .lock = &.{.{ .name = "dracut", .evr = "059", .architecture = "x86_64" }},
+            .expected = "epoch:version-release",
+        },
+        // An epoch and no release is the same failure, half-corrected.
+        .{
+            .actions = install_dracut,
+            .lock = &.{.{ .name = "dracut", .evr = "0:059", .architecture = "x86_64" }},
+            .expected = "epoch:version-release",
+        },
+        .{
+            .actions = install_dracut,
+            .lock = &.{.{ .name = "dracut", .evr = "0:059-1.azl3", .architecture = "" }},
+            .expected = "architecture",
+        },
+        // Two pins for one package and architecture cannot both hold, and the
+        // verifier would report whichever it happened to compare second.
+        .{
+            .actions = install_dracut,
+            .lock = &.{
+                .{ .name = "dracut", .evr = "0:059-1.azl3", .architecture = "x86_64" },
+                .{ .name = "dracut", .evr = "0:060-1.azl3", .architecture = "x86_64" },
+            },
+            .expected = "twice",
+        },
+        // `update_all`'s subject is whatever the repositories hold when it
+        // runs, which is the question an exact lock exists to close.
+        .{
+            .actions = &.{.update_all},
+            .lock = &.{.{ .name = "dracut", .evr = "0:059-1.azl3", .architecture = "x86_64" }},
+            .expected = "update_all",
+        },
+        // Pinning one package and leaving another free is pinned in one place
+        // and open in the other, which is not a locked transaction.
+        .{
+            .actions = &.{.{ .install = &.{ "dracut", "openssh" } }},
+            .lock = &.{.{ .name = "dracut", .evr = "0:059-1.azl3", .architecture = "x86_64" }},
+            .expected = "must be pinned",
+        },
+        // A lock with no transaction to lock. Refused here because the run
+        // would otherwise compare the whole installed set against an empty
+        // baseline and fail on the first package the input image carried.
+        .{
+            .actions = &.{},
+            .lock = &.{.{ .name = "dracut", .evr = "0:059-1.azl3", .architecture = "x86_64" }},
+            .expected = "at least one package action",
+        },
+    };
+    for (cases) |case| {
+        var request = whenNeededRequest();
+        request.packages = .{
+            .actions = case.actions,
+            .repositories = lockTestRepositories(),
+            .lock = .{ .exact = case.lock },
+        };
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(diagnostics.hasErrors());
+        var named = false;
+        for (diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, case.expected) != null) {
+                named = true;
+            }
+        }
+        try std.testing.expect(named);
+    }
+}
+
+test "a lock covering the whole declared closure resolves" {
+    // The positive case, and the shape a completed online run is meant to
+    // emit: every name an action mentions is pinned, including the dependency
+    // the action did not name.
+    var request = whenNeededRequest();
+    request.packages = .{
+        .actions = &.{.{ .install = &.{"dracut"} }},
+        .repositories = lockTestRepositories(),
+        .lock = .{ .exact = &.{
+            .{ .name = "dracut", .evr = "0:059-1.azl3", .architecture = "x86_64" },
+            .{ .name = "kpartx", .evr = "0:0.9.5-2.azl3", .architecture = "x86_64" },
+        } },
+    };
+    var diagnostics = try validate(std.testing.allocator, &request);
+    defer diagnostics.deinit(std.testing.allocator);
+    for (diagnostics.items) |diagnostic| {
+        try std.testing.expect(diagnostic.code != .invalid_policy);
+    }
+
+    // A removal is the one action a lock has nothing to say about: it names
+    // what must not be installed, and a lock names versions for what is.
+    request.packages.actions = &.{.{ .remove = &.{"obsolete"} }};
+    var removal_diagnostics = try validate(std.testing.allocator, &request);
+    defer removal_diagnostics.deinit(std.testing.allocator);
+    for (removal_diagnostics.items) |diagnostic| {
+        try std.testing.expect(diagnostic.code != .invalid_policy);
+    }
+}
+
+test "an installed-package record splits back into the lock that would state it" {
+    const parsed = parseInstalledPackageRecord("dracut-0:059-1.azl3.x86_64").?;
+    try std.testing.expectEqualStrings("dracut", parsed.name);
+    try std.testing.expectEqualStrings("0:059-1.azl3", parsed.evr);
+    try std.testing.expectEqualStrings("x86_64", parsed.architecture);
+
+    // The case that defeats splitting on the first `-`.
+    const hyphenated = parseInstalledPackageRecord("python3-libs-0:3.12.9-1.azl3.aarch64").?;
+    try std.testing.expectEqualStrings("python3-libs", hyphenated.name);
+    try std.testing.expectEqualStrings("0:3.12.9-1.azl3", hyphenated.evr);
+    try std.testing.expectEqualStrings("aarch64", hyphenated.architecture);
+
+    // A name ending in a digit, where the character before the epoch's `-` is
+    // indistinguishable from part of a version.
+    const digits = parseInstalledPackageRecord("libstdc++6-0:13.2.0-3.noarch").?;
+    try std.testing.expectEqualStrings("libstdc++6", digits.name);
+    try std.testing.expectEqualStrings("0:13.2.0-3", digits.evr);
+    try std.testing.expectEqualStrings("noarch", digits.architecture);
+
+    // What a lock is built from has to round-trip, or the emitted lock names
+    // something other than what was installed.
+    for ([_][]const u8{
+        "dracut-0:059-1.azl3.x86_64",
+        "python3-libs-0:3.12.9-1.azl3.aarch64",
+        "libstdc++6-0:13.2.0-3.noarch",
+    }) |record| {
+        const pin = parseInstalledPackageRecord(record).?;
+        const rebuilt = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{s}-{s}.{s}",
+            .{ pin.name, pin.evr, pin.architecture },
+        );
+        defer std.testing.allocator.free(rebuilt);
+        try std.testing.expectEqualStrings(record, rebuilt);
+    }
+
+    // Not records rpm writes, and each one is a different way of not being.
+    try std.testing.expect(parseInstalledPackageRecord("dracut") == null);
+    try std.testing.expect(parseInstalledPackageRecord("dracut-059-1.x86_64") == null);
+    try std.testing.expect(parseInstalledPackageRecord("-0:1-1.x86_64") == null);
+    try std.testing.expect(parseInstalledPackageRecord("dracut-0:059-1.azl3.") == null);
+}
+
+test "a multilib lock pins one name at two architectures" {
+    // The case that makes a name-only pin lookup wrong: `glibc` at both
+    // architectures is two packages a root holds at once, so both are legal
+    // in one lock and an executor must ask for both rather than for whichever
+    // it found first.
+    var request = whenNeededRequest();
+    request.packages = .{
+        .actions = &.{.{ .install = &.{"glibc"} }},
+        .repositories = lockTestRepositories(),
+        .lock = .{ .exact = &.{
+            .{ .name = "glibc", .evr = "0:2.38-6.azl3", .architecture = "i686" },
+            .{ .name = "glibc", .evr = "0:2.38-6.azl3", .architecture = "x86_64" },
+        } },
+    };
+    var diagnostics = try validate(std.testing.allocator, &request);
+    defer diagnostics.deinit(std.testing.allocator);
+    for (diagnostics.items) |diagnostic| {
+        try std.testing.expect(diagnostic.code != .invalid_policy);
+    }
 }
