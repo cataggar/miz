@@ -1105,6 +1105,11 @@ try zvmi.bootconfig.populateEsp(allocator, io, &esp_fs, &tree, .{
 });
 ```
 
+The same `extra_kernel_options` text can also be added to an image that already
+exists: `zvmi.customize`'s `native_edit` and `rebuild` backends append it to the
+GRUB and BLS entries on the image's ESP instead of generating them, and refuse
+the guest backends and Unified Kernel Images by name. See `doc/library-api.md`.
+
 The low-level PE/COFF rewriting lives in `zvmi.uki`, which takes a prebuilt
 stub plus kernel/initrd/cmdline payloads and emits a structurally valid UKI
 with `.linux`, `.initrd`, `.cmdline`, `.osrel`, `.uname`, and optional

@@ -5,6 +5,7 @@
 //! creating any files. Sources are always read-only.
 
 const std = @import("std");
+const boot_options = @import("boot_options.zig");
 const ext4 = @import("ext4.zig");
 const fat32 = @import("fat32.zig");
 const Format = @import("formats.zig").Format;
@@ -70,6 +71,14 @@ pub const Options = struct {
     root_partition: PartitionSelector,
     operations: []const Operation,
     expected_virtual_size: ?u64 = null,
+    /// Kernel command-line options appended to every boot entry the image
+    /// already carries, applied to the raw stage after every filesystem
+    /// change. Empty leaves the boot configuration exactly as the source
+    /// wrote it.
+    kernel_options: []const u8 = "",
+    /// Sink for the boot configuration file that stopped a kernel-option
+    /// change, so the caller can name it rather than report only an error.
+    kernel_options_diagnostic: ?*boot_options.Diagnostic = null,
     max_source_file_bytes: u64 = limit_defaults.max_source_file_bytes,
     /// Optional sink for the first limit breach, so a caller can name the
     /// flag that raises it instead of only reporting an error value.
@@ -89,6 +98,8 @@ pub const Report = struct {
     partition_length: u64,
     flattened_backing_chain: bool,
     operation_count: usize,
+    /// Present exactly when `kernel_options` asked for a change.
+    kernel_options: ?boot_options.Report,
 };
 
 pub const PartitionGeometry = struct {
@@ -130,6 +141,14 @@ pub const RawMutationOptions = struct {
     expected_source_format: ?Format = null,
     expected_virtual_size: ?u64 = null,
     require_linux_partition: bool = false,
+    /// Kernel command-line options appended to every boot entry the image
+    /// already carries, applied to the raw stage after every filesystem
+    /// change. Empty leaves the boot configuration exactly as the source
+    /// wrote it.
+    kernel_options: []const u8 = "",
+    /// Sink for the boot configuration file that stopped a kernel-option
+    /// change, so the caller can name it rather than report only an error.
+    kernel_options_diagnostic: ?*boot_options.Diagnostic = null,
     dependency_paths: []const []const u8 = &.{},
     output_create_options: image_mod.CreateOptions = .{},
     /// Compresses the published artifact as it is written. Only `.raw`
@@ -145,6 +164,8 @@ pub const RawMutationReport = struct {
     partition_offset: u64,
     partition_length: u64,
     flattened_backing_chain: bool,
+    /// Present exactly when `kernel_options` asked for a change.
+    kernel_options: ?boot_options.Report,
 };
 
 /// Options for a rootless, full-tree rebuild of the deliberately narrow
@@ -210,6 +231,13 @@ pub const RebuildOptions = struct {
     workspace_space: WorkspaceSpacePolicy = .enforce,
     expected_virtual_size: ?u64 = null,
     output_create_options: image_mod.CreateOptions = .{},
+    /// Kernel command-line options appended to every boot entry the rebuilt
+    /// image carries, applied to the raw stage after the filesystem is
+    /// populated. Empty leaves the boot configuration as the source wrote it.
+    kernel_options: []const u8 = "",
+    /// Sink for the boot configuration file that stopped a kernel-option
+    /// change, so the caller can name it rather than report only an error.
+    kernel_options_diagnostic: ?*boot_options.Diagnostic = null,
     /// Compresses the published artifact as it is written. Only `.raw`
     /// output can be compressed: every other format amends metadata after
     /// the data it already wrote, which a compressor cannot revisit.
@@ -337,6 +365,8 @@ pub const RebuildReport = struct {
     generalization_count: usize,
     /// What the identity reconciliation changed, and what it could not.
     identity_rewrite: identity_rewrite.Report,
+    /// Present exactly when `kernel_options` asked for a change.
+    kernel_options: ?boot_options.Report,
     /// The largest value each limit reached. A caller sizes the next run's
     /// flags from these instead of guessing.
     limit_peaks: limits_mod.Peaks,
@@ -435,6 +465,8 @@ pub fn edit(
             .output_format = options.output_format,
             .root_partition = options.root_partition,
             .expected_virtual_size = options.expected_virtual_size,
+            .kernel_options = options.kernel_options,
+            .kernel_options_diagnostic = options.kernel_options_diagnostic,
             .dependency_paths = dependency_paths.items,
             .output_create_options = options.output_create_options,
             .output_compression = options.output_compression,
@@ -451,6 +483,7 @@ pub fn edit(
         .partition_length = mutation.partition_length,
         .flattened_backing_chain = mutation.flattened_backing_chain,
         .operation_count = options.operations.len,
+        .kernel_options = mutation.kernel_options,
     };
 }
 
@@ -869,6 +902,20 @@ pub fn rebuild(
         final_view,
         populateOptions(&tree, partition.offset, scanned, &scanned_label, scanned_timestamp, options.journal),
     );
+    // After `populate`, because the rebuilt root filesystem is what the boot
+    // entries name, and before the stage is published, because a stage that
+    // failed the change must never become an image.
+    const kernel_options_report: ?boot_options.Report = if (options.kernel_options.len != 0)
+        try boot_options.apply(
+            allocator,
+            io,
+            &raw,
+            options.kernel_options,
+            options.kernel_options_diagnostic,
+        )
+    else
+        null;
+
     const raw_inode = (try raw.file.stat(io)).inode;
     raw.close(io);
     raw_open = false;
@@ -919,6 +966,7 @@ pub fn rebuild(
         .os_customization_count = customizationCount(options.customization),
         .generalization_count = generalizationCount(options.generalization),
         .identity_rewrite = identity_report,
+        .kernel_options = kernel_options_report,
         .limit_peaks = if (options.limit_diagnostic) |sink| sink.peaks else .{},
         .workspace_space = workspace,
     };
@@ -1020,6 +1068,26 @@ fn transactRawInternal(
         raw_exists = false;
         return err;
     };
+    // After the hook, because the mutation it just ran is allowed to replace
+    // the boot configuration, and the declared options have to survive
+    // whatever it wrote.
+    var kernel_options_report: ?boot_options.Report = null;
+    if (options.kernel_options.len != 0) {
+        kernel_options_report = applyKernelOptions(
+            allocator,
+            io,
+            raw_path,
+            virtual_size,
+            raw_inode,
+            options.kernel_options,
+            options.kernel_options_diagnostic,
+        ) catch |err| {
+            try removeStagingPathChecked(io, raw_path);
+            raw_exists = false;
+            return err;
+        };
+    }
+
     publishRawStaging(
         allocator,
         io,
@@ -1046,7 +1114,28 @@ fn transactRawInternal(
         .partition_offset = partition.offset,
         .partition_length = partition.length,
         .flattened_backing_chain = flattened,
+        .kernel_options = kernel_options_report,
     };
+}
+
+/// Reopens the finished raw stage to append the declared kernel options.
+///
+/// Reopened rather than kept open across the mutation because the hook owns
+/// the stage while it runs, and a second writable handle to a file a chroot
+/// or a guest may be writing is exactly the aliasing `openRawStage` checks
+/// for.
+fn applyKernelOptions(
+    allocator: Allocator,
+    io: Io,
+    raw_path: []const u8,
+    virtual_size: u64,
+    raw_inode: Io.File.INode,
+    options: []const u8,
+    diagnostic: ?*boot_options.Diagnostic,
+) !boot_options.Report {
+    var raw = try openRawStage(io, raw_path, virtual_size, raw_inode, true);
+    defer raw.close(io);
+    return boot_options.apply(allocator, io, &raw, options, diagnostic);
 }
 
 /// Scratch space a rebuild needs on the filesystem holding the output.

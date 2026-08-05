@@ -8,6 +8,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const azure = @import("azure.zig");
 const bootconfig = @import("bootconfig.zig");
+const boot_options = @import("boot_options.zig");
 const build_image = @import("build_image.zig");
 const cosi = @import("cosi.zig");
 const ext4 = @import("ext4.zig");
@@ -31,8 +32,8 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 16;
-pub const provenance_schema_version: u32 = 19;
+pub const plan_schema_version: u32 = 17;
+pub const provenance_schema_version: u32 = 20;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -1111,6 +1112,7 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
             "set execution.acknowledge_unsafe only after accepting unsafe host-code execution",
         ));
     }
+    try validateKernelOptionChange(&diagnostics, request);
     if (request.hooks.len != 0) {
         if (request.execution.backend != .unsafe_chroot and request.execution.backend != .vm) {
             try diagnostics.append(validationError(
@@ -1631,6 +1633,41 @@ fn validateCrossArchitecturePolicy(
             ));
         },
     }
+}
+
+/// A kernel-argument change on a preserved image is applied by rewriting the
+/// boot entries the image already carries, which is why the backends that
+/// cannot reach them are refused here rather than in preflight: the answer
+/// depends only on the request.
+fn validateKernelOptionChange(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    request: *const Request,
+) Allocator.Error!void {
+    const options = request.boot_security.extra_kernel_options;
+    if (options.len == 0) return;
+    switch (request.execution.backend) {
+        // A fresh build renders the options into the configuration it
+        // generates, so nothing has to be rewritten and nothing here applies.
+        .native_fresh => return,
+        .native_edit, .rebuild => {},
+        .unsafe_chroot, .vm => {
+            try diagnostics.append(validationError(
+                .unsupported_execution_backend,
+                "/boot_security/extra_kernel_options",
+                "these backends mount only the root partition, and a preserved image keeps its kernel command line on the ESP",
+                "select native_edit or rebuild to change kernel arguments",
+            ));
+            return;
+        },
+    }
+    boot_options.validateOptions(options) catch {
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/boot_security/extra_kernel_options",
+            "kernel options must be non-empty printable text with no surrounding whitespace",
+            "write the options as they should appear on the kernel command line, as in console=ttyS0 quiet",
+        ));
+    };
 }
 
 fn validateVmPolicy(
@@ -2313,6 +2350,9 @@ pub const Action = enum {
     edit_existing_paths,
     populate_preserved_root,
     publish_standalone_output,
+    /// Appends the declared options to the kernel command line of every boot
+    /// entry the preserved image carries.
+    change_kernel_options,
     /// Reads the disk image a backend staged and writes the COSI bundle that
     /// the transaction commits in its place.
     write_cosi_bundle,
@@ -2354,6 +2394,10 @@ pub const CapabilityKind = enum {
     /// describes a GPT disk and a preserved output keeps the partitioning it
     /// was given.
     gpt_source,
+    /// The preserved source disk must carry boot entries whose kernel command
+    /// line can be appended to. Probed against the source, because whether it
+    /// does is a property of the image and not of the request.
+    kernel_option_change,
     rebuild,
     unsafe_chroot,
     vm,
@@ -3596,6 +3640,13 @@ fn appendBackendFinalOperationSpecs(
         .native_edit, .rebuild, .unsafe_chroot, .vm => {
             try appendInitramfsPolicySpec(specs, initramfs);
             try appendBeforeSealSpecs(specs, hooks, selinux);
+            // In the phase that prepares boot configuration, after every
+            // filesystem change and before the stage is published: the
+            // declared options have to be what the published image carries,
+            // whatever else the run rewrote on the way there.
+            if (policy.extra_kernel_options.len != 0 and appendsKernelOptions(backend)) {
+                try specs.append(.{ .phase = .bootloader_prepare, .action = .change_kernel_options });
+            }
             try appendFinalizeHookSpecs(specs, hooks);
             try specs.append(.{ .phase = .output_conversion, .action = .publish_standalone_output });
         },
@@ -3915,8 +3966,20 @@ fn buildCapabilities(
             }
         },
     }
-    if (execution.backend != .native_fresh and !isDefaultBootPolicy(boot_policy)) {
-        try capabilities.append(.{ .kind = .boot_policy_mutation, .path = "", .reason = "mutate preserved boot configuration" });
+    if (execution.backend != .native_fresh) {
+        if (hasUnsupportedBootPolicyChange(boot_policy)) {
+            try capabilities.append(.{ .kind = .boot_policy_mutation, .path = "", .reason = "mutate preserved boot configuration" });
+        }
+        if (boot_policy.extra_kernel_options.len != 0 and appendsKernelOptions(execution.backend)) {
+            try capabilities.append(.{
+                .kind = .kernel_option_change,
+                .path = switch (input) {
+                    .disk => |disk| disk.path,
+                    .iso_oci => "",
+                },
+                .reason = "append the declared options to the kernel command line the image already carries",
+            });
+        }
     }
     if (execution.backend != .native_fresh and generalization_policy != .none) {
         try capabilities.append(.{
@@ -3975,6 +4038,23 @@ fn hasGeneralOsCustomization(customization: OsCustomization) bool {
         customization.groups.len != 0 or
         customization.users.len != 0 or
         customization.services.len != 0;
+}
+
+/// The backends that apply a kernel-argument change by rewriting the boot
+/// entries on the image's ESP. The rest either generate the command line
+/// themselves (`native_fresh`) or cannot reach the ESP at all.
+fn appendsKernelOptions(backend: ExecutionBackend) bool {
+    return backend == .native_edit or backend == .rebuild;
+}
+
+/// Whether the policy asks for something no preserved backend can carry out.
+/// Kernel options are excluded because they are now applied where they can
+/// be, and requested as their own, narrower capability where they cannot be
+/// assumed to apply.
+fn hasUnsupportedBootPolicyChange(policy: BootSecurityPolicy) bool {
+    var without_options = policy;
+    without_options.extra_kernel_options = "";
+    return !isDefaultBootPolicy(without_options);
 }
 
 fn isDefaultBootPolicy(policy: BootSecurityPolicy) bool {
@@ -4681,6 +4761,7 @@ pub fn preflight(
             },
             .vm => vmCapabilityState(platform, io, plan),
             .gpt_source => gptSourceAvailable(io, requirement.path),
+            .kernel_option_change => kernelOptionChangeAvailable(io, requirement.path),
             .vm_firmware => if (plan.data.execution.vm) |vm| switch (vm.boot) {
                 .direct_kernel => .unsupported,
                 .firmware => |firmware| vmFirmwareAvailable(io, firmware),
@@ -4949,7 +5030,7 @@ fn systemCapabilityCheck(_: ?*anyopaque, io: Io, requirement: CapabilityRequirem
         .read_hook_source,
         .read_trust_source,
         => if (isReadableKind(cwd, io, requirement.path, .file)) .available else .missing,
-        .disk_dependencies, .gpt_source => .unsupported,
+        .disk_dependencies, .gpt_source, .kernel_option_change => .unsupported,
         .write_workspace_parent => if (canCreatePath(cwd, io, requirement.path)) .available else .missing,
         .write_output_parent => if (canCreatePath(cwd, io, requirement.path)) .available else .missing,
         .output_absent, .transaction_absent => if (pathAbsent(cwd, io, requirement.path)) .available else .missing,
@@ -5036,6 +5117,22 @@ fn gptSourceAvailable(io: Io, path: []const u8) CapabilityState {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     _ = gpt.readGpt(image, io, arena.allocator()) catch return .missing;
+    return .available;
+}
+
+/// Whether the source image carries boot entries the declared options can be
+/// appended to. Answered by reading the source, so a request that could only
+/// fail is refused before a workspace exists, which is the difference between
+/// a named refusal and a half-built image.
+fn kernelOptionChangeAvailable(io: Io, path: []const u8) CapabilityState {
+    var image = image_mod.Image.openPathReadOnly(io, path) catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        else => return .unsupported,
+    };
+    defer image.close(io);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    _ = boot_options.inspect(arena.allocator(), io, &image, null) catch return .missing;
     return .available;
 }
 
@@ -5389,6 +5486,23 @@ pub const PreservedExecutionRecord = struct {
     /// that request never reaches a provenance record at all.
     hooks: []const HookRecord = &.{},
     rebuild: ?PreservedRebuildRecord,
+    /// Present exactly when the request asked for a kernel-argument change.
+    kernel_options: ?KernelOptionsRecord,
+};
+
+pub const KernelOptionsRecord = struct {
+    /// The text appended, recorded because the published command line is the
+    /// image's own plus this and neither half is derivable from the other.
+    appended: []const u8,
+    grub_entries: usize,
+    bls_entries: usize,
+    /// Entries that already ended with exactly this text and were left alone.
+    /// Non-zero means the source already carried the options, which is a
+    /// different image from one where they were added.
+    entries_already_current: usize,
+    files_rewritten: usize,
+    /// Entry files the verification pass read back after the rewrite.
+    verified_files: usize,
 };
 
 pub const PreservedRebuildRecord = struct {
@@ -5743,6 +5857,7 @@ fn buildResult(
         const partition_length = if (preserved_report) |report| report.partition_length else rebuild_report.?.partition_length;
         const flattened = if (preserved_report) |report| report.flattened_backing_chain else rebuild_report.?.flattened_backing_chain;
         const operation_count = if (preserved_report) |report| report.operation_count else rebuild_report.?.existing_operation_count;
+        const kernel_options = if (preserved_report) |report| report.kernel_options else rebuild_report.?.kernel_options;
         break :blk PreservedExecutionRecord{
             .source_format = source_format,
             .output_format = output_format,
@@ -5781,6 +5896,14 @@ fn buildResult(
                 .identity_config_references_rewritten = report.identity_rewrite.config_references_rewritten,
                 .identity_verified_files = report.identity_rewrite.verified_files,
                 .identity_stale_references = report.identity_rewrite.stale_references,
+            } else null,
+            .kernel_options = if (kernel_options) |report| .{
+                .appended = try result_allocator.dupe(u8, plan.data.boot_security.extra_kernel_options),
+                .grub_entries = report.grub_entries,
+                .bls_entries = report.bls_entries,
+                .entries_already_current = report.entries_already_current,
+                .files_rewritten = report.files_rewritten,
+                .verified_files = report.verified_files,
             } else null,
         };
     } else null;
@@ -6007,6 +6130,10 @@ pub fn execute(
     var identity_sink = identity_rewrite.Diagnostic{};
     var identity_message: [identity_rewrite.Stale.max_message_bytes]u8 = undefined;
     var identity_remediation: [identity_rewrite.Stale.max_remediation_bytes]u8 = undefined;
+    // And for the boot configuration file a kernel-option change could not
+    // apply to, which names the one file a caller has to look at.
+    var kernel_options_sink = boot_options.Diagnostic{};
+    var kernel_options_message: [kernel_option_message_bytes]u8 = undefined;
     var fresh_report: ?build_image.BuildImageReport = null;
     defer if (fresh_report) |*report| report.deinit(allocator);
     var preserved_report: ?preserved_image.Report = null;
@@ -6054,9 +6181,12 @@ pub fn execute(
                 .expected_virtual_size = null,
                 .max_source_file_bytes = plan.data.limits.max_source_file_bytes,
                 .limit_diagnostic = &limit_sink,
+                .kernel_options = plan.data.boot_security.extra_kernel_options,
+                .kernel_options_diagnostic = &kernel_options_sink,
                 .output_create_options = outputCreateOptions(plan),
             }) catch |err| {
                 try appendFailure(&diagnostics, .execution_failed, .execution, "/existing_path_operations", "native preserved-image execution failed", err);
+                try appendKernelOptionFailure(&diagnostics, kernel_options_sink, &kernel_options_message, err);
                 try appendLimitFailure(
                     &diagnostics,
                     limit_sink,
@@ -6091,10 +6221,13 @@ pub fn execute(
                 .source_date_epoch = plan.data.reproducibility.source_date_epoch,
                 .limits = plan.data.limits,
                 .limit_diagnostic = &limit_sink,
+                .kernel_options = plan.data.boot_security.extra_kernel_options,
+                .kernel_options_diagnostic = &kernel_options_sink,
                 .expected_virtual_size = null,
                 .output_create_options = outputCreateOptions(plan),
             }) catch |err| {
                 try appendFailure(&diagnostics, .execution_failed, .execution, "/execution/backend", "preserved-image rebuild failed", err);
+                try appendKernelOptionFailure(&diagnostics, kernel_options_sink, &kernel_options_message, err);
                 try appendLimitFailure(
                     &diagnostics,
                     limit_sink,
@@ -6151,6 +6284,7 @@ pub fn execute(
                 .flattened_backing_chain = raw_report.flattened_backing_chain,
                 .operation_count = plan.data.packages.actions.len +
                     @intFromBool(plan.data.initramfs != .unchanged),
+                .kernel_options = raw_report.kernel_options,
             };
         },
         .vm => {
@@ -6191,6 +6325,7 @@ pub fn execute(
                 .flattened_backing_chain = raw_report.flattened_backing_chain,
                 .operation_count = plan.data.packages.actions.len +
                     @intFromBool(plan.data.initramfs != .unchanged),
+                .kernel_options = raw_report.kernel_options,
             };
         },
     }
@@ -6414,6 +6549,15 @@ fn hasValidPlanIntegrity(allocator: Allocator, plan: *const ResolvedPlan) Alloca
         },
     }
     if ((data.execution.backend == .vm) != (data.execution.vm != null)) return false;
+    // Kernel arguments reach the image either at bootloader install time
+    // (native_fresh) or through a rewrite of the staged ESP (native_edit,
+    // rebuild). The guest backends never mount the ESP, so a plan that pairs
+    // them with kernel options describes an output nobody can produce.
+    if (data.boot_security.extra_kernel_options.len != 0 and
+        (data.execution.backend == .unsafe_chroot or data.execution.backend == .vm))
+    {
+        return false;
+    }
     if (!try hasExpectedOperations(allocator, plan)) return false;
     const needs_guest_execution = data.execution.backend == .unsafe_chroot or
         data.execution.backend == .vm or
@@ -6717,6 +6861,36 @@ fn appendLimitFailure(
 /// rebuild retired. A failure that was not a stale identifier adds nothing,
 /// so the generic failure diagnostic stays alone. The message borrows the
 /// caller's buffers, which the outcome copies before returning.
+/// Enough for the longest path a `boot_options.Diagnostic` carries plus the
+/// sentence around it.
+const kernel_option_message_bytes: usize = boot_options.max_path_bytes + 128;
+
+/// Names the boot configuration file a kernel-option change stopped on. The
+/// backend error alone says only that the run failed; the file is what tells
+/// a caller whether the image or the request is the thing to change.
+fn appendKernelOptionFailure(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    sink: boot_options.Diagnostic,
+    message_buffer: []u8,
+    cause: anyerror,
+) Allocator.Error!void {
+    const file = sink.file orelse return;
+    const message = std.fmt.bufPrint(
+        message_buffer,
+        "the kernel options could not be applied to the boot configuration file {s}{s}",
+        .{ file.path(), if (file.path_truncated) "..." else "" },
+    ) catch return;
+    try diagnostics.append(.{
+        .severity = .@"error",
+        .phase = .execution,
+        .code = .execution_failed,
+        .configuration_path = "/boot_security/extra_kernel_options",
+        .message = message,
+        .cause = .{ .error_name = @errorName(cause) },
+        .remediation = "change kernel arguments on an image whose boot entries carry an inline kernel command line",
+    });
+}
+
 fn appendStaleIdentityFailure(
     diagnostics: *std.array_list.Managed(Diagnostic),
     identity_sink: identity_rewrite.Diagnostic,
@@ -7063,6 +7237,98 @@ fn createCustomizeGptTestDisk(io: Io, path: []const u8, spool_path: []const u8) 
         .uuid = [_]u8{0x64} ** 16,
         .timestamp = 1_735_689_600,
     });
+}
+
+const customize_boot_esp_sectors: u32 = 64 * 2048;
+const customize_boot_root_sectors: u32 = 16384;
+const customize_boot_disk_size: u64 =
+    (2048 + @as(u64, customize_boot_esp_sectors) + customize_boot_root_sectors + 2048) * gpt.sector_size;
+
+const customize_boot_grub_cfg =
+    "set default=0\nset timeout=5\n\n" ++
+    "menuentry 'zvmi' --id 'zvmi-1' {\n" ++
+    "    linux ($kernel_root)/boot/vmlinuz root=PARTUUID=22222222-2222-2222-2222-222222222222\n" ++
+    "    initrd ($kernel_root)/boot/initrd.img\n" ++
+    "}\n";
+
+const customize_boot_bls_entry =
+    "title zvmi\nlinux /boot/vmlinuz\ninitrd /boot/initrd.img\n" ++
+    "options root=PARTUUID=22222222-2222-2222-2222-222222222222\n";
+
+/// A GPT disk whose ESP is a real FAT32 volume carrying the GRUB and BLS
+/// entries `bootconfig` generates. `createCustomizeGptTestDisk` leaves its ESP
+/// unformatted, which is the other half of the question a kernel-argument
+/// change asks of a source image.
+fn createCustomizeBootTestDisk(io: Io, path: []const u8, spool_path: []const u8) !void {
+    var image = try image_mod.Image.createExclusive(io, path, .raw, customize_boot_disk_size, .{});
+    defer image.close(io);
+
+    const specs = [_]gpt.PartitionSpec{
+        .{
+            .type_guid = guid.esp,
+            .unique_guid = guid.parse("11111111-1111-1111-1111-111111111111"),
+            .size_sectors = customize_boot_esp_sectors,
+            .name_utf16le = gpt.asciiName("EFI System"),
+        },
+        .{
+            .type_guid = linux_root_x86_64_partition_type,
+            .unique_guid = guid.parse("22222222-2222-2222-2222-222222222222"),
+            .size_sectors = customize_boot_root_sectors,
+            .name_utf16le = gpt.asciiName("root"),
+        },
+    };
+    var placements: [specs.len]gpt.Placement = undefined;
+    try gpt.writeGpt(
+        &image,
+        io,
+        guid.parse("33333333-3333-3333-3333-333333333333"),
+        &specs,
+        &placements,
+    );
+
+    const esp_offset = placements[0].first_lba * gpt.sector_size;
+    const esp_length = (placements[0].last_lba - placements[0].first_lba + 1) * gpt.sector_size;
+    try fat32.format(&image, io, .{ .partition_offset = esp_offset, .partition_len = esp_length });
+    {
+        var esp = try fat32.open(&image, io, .{ .offset = esp_offset, .length = esp_length });
+        try esp.createDir(io, "EFI");
+        try esp.createDir(io, "EFI/BOOT");
+        try esp.writeFile(io, "EFI/BOOT/grub.cfg", customize_boot_grub_cfg);
+        try esp.createDir(io, "loader");
+        try esp.createDir(io, "loader/entries");
+        try esp.writeFile(io, "loader/entries/zvmi-1.conf", customize_boot_bls_entry);
+    }
+
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try root_tree.RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+    try tree.putDirectory("etc", .{ .mode = 0o755 });
+    try tree.putFileBytes("etc/config", "before\n", .{ .mode = 0o640 });
+    _ = try ext4.populate(io, image.file, std.testing.allocator, try tree.ext4View(), .{
+        .offset = placements[1].first_lba * gpt.sector_size,
+        .length = (placements[1].last_lba - placements[1].first_lba + 1) * gpt.sector_size,
+        .label = "customize-root",
+        .uuid = [_]u8{0x65} ** 16,
+        .timestamp = 1_735_689_600,
+    });
+}
+
+/// Reads one file out of the ESP of a published raw image, which is the only
+/// way to state what a caller booting the output would actually see.
+fn readPublishedEspFile(io: Io, path: []const u8, esp_path: []const u8) ![]u8 {
+    var image = try image_mod.Image.openPathReadOnly(io, path);
+    defer image.close(io);
+    const parsed = try gpt.readGpt(image, io, std.testing.allocator);
+    defer std.testing.allocator.free(parsed.partitions);
+    for (parsed.partitions) |partition| {
+        if (!std.mem.eql(u8, &partition.partition_type_guid, &guid.esp)) continue;
+        var esp = try fat32.open(&image, io, .{
+            .offset = partition.first_lba * gpt.sector_size,
+            .length = (partition.last_lba - partition.first_lba + 1) * gpt.sector_size,
+        });
+        return esp.readFileAlloc(io, std.testing.allocator, esp_path);
+    }
+    return error.NoEsp;
 }
 
 fn validNativeEditRequest(
@@ -8990,6 +9256,134 @@ test "native-edit publishes a COSI bundle from a GPT source" {
     try std.testing.expect(std.mem.indexOf(u8, bundle_bytes, "cosi-marker") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle_bytes, "\"osArch\":\"x86_64\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle_bytes, "ID=zvmi") != null);
+}
+
+test "native-edit appends kernel options to every boot entry on the ESP" {
+    const io = std.testing.io;
+    const source_path = "test-customize-kopts-source.raw";
+    const spool_path = "test-customize-kopts-root.spool";
+    const workspace_path = "test-customize-kopts-work";
+    const output_path = workspace_path ++ "/output.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, workspace_path);
+    try createCustomizeBootTestDisk(io, source_path, spool_path);
+
+    var request = validNativeEditRequest(source_path, output_path, workspace_path, &.{});
+    request.storage.preserve.root_partition = .{ .gpt_index = 2 };
+    request.boot_security = .{ .extra_kernel_options = "console=ttyS0 quiet" };
+
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(!resolved.diagnostics.hasErrors());
+    const planned = resolved.plan.?.data.operations;
+    var planned_change = false;
+    for (planned) |operation| {
+        if (operation.action == .change_kernel_options) planned_change = true;
+    }
+    try std.testing.expect(planned_change);
+
+    var report = try preflight(std.testing.allocator, io, &resolved.plan.?, Platform.system());
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expect(report.ready());
+
+    var outcome = try execute(std.testing.allocator, io, &resolved.plan.?, Platform.system(), null);
+    defer outcome.deinit(std.testing.allocator);
+    try std.testing.expect(!outcome.diagnostics.hasErrors());
+    try std.testing.expect(outcome.result != null);
+
+    const record = outcome.result.?.provenance.execution.preserved.?.kernel_options.?;
+    try std.testing.expectEqualStrings("console=ttyS0 quiet", record.appended);
+    try std.testing.expectEqual(@as(usize, 1), record.grub_entries);
+    try std.testing.expectEqual(@as(usize, 1), record.bls_entries);
+    try std.testing.expectEqual(@as(usize, 0), record.entries_already_current);
+    try std.testing.expectEqual(@as(usize, 2), record.files_rewritten);
+    try std.testing.expectEqual(@as(usize, 2), record.verified_files);
+
+    const grub = try readPublishedEspFile(io, output_path, "EFI/BOOT/grub.cfg");
+    defer std.testing.allocator.free(grub);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        grub,
+        "root=PARTUUID=22222222-2222-2222-2222-222222222222 console=ttyS0 quiet\n",
+    ) != null);
+    // The menu around the command line is the distro's, not ours.
+    try std.testing.expect(std.mem.indexOf(u8, grub, "set timeout=5\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grub, "initrd ($kernel_root)/boot/initrd.img\n") != null);
+
+    const bls = try readPublishedEspFile(io, output_path, "loader/entries/zvmi-1.conf");
+    defer std.testing.allocator.free(bls);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        bls,
+        "options root=PARTUUID=22222222-2222-2222-2222-222222222222 console=ttyS0 quiet\n",
+    ) != null);
+}
+
+test "the guest backends refuse a kernel argument change by name" {
+    for ([_]ExecutionBackend{ .unsafe_chroot, .vm }) |backend| {
+        var request = validNativeEditRequest("source.raw", "work/output.raw", "work", &.{});
+        request.boot_security = .{ .extra_kernel_options = "console=ttyS0" };
+        request.execution.backend = backend;
+        request.execution.acknowledge_unsafe = true;
+        if (backend == .vm) request.execution.vm = validVmPolicy();
+
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(hasDiagnosticCode(diagnostics, .unsupported_execution_backend));
+
+        // The same request on the backend that can reach the ESP validates.
+        request.execution.backend = .native_edit;
+        request.execution.acknowledge_unsafe = false;
+        request.execution.vm = null;
+        var accepted = try validate(std.testing.allocator, &request);
+        defer accepted.deinit(std.testing.allocator);
+        try std.testing.expect(!accepted.hasErrors());
+    }
+}
+
+test "kernel option text that could change more than the command line is refused" {
+    var request = validNativeEditRequest("source.raw", "work/output.raw", "work", &.{});
+    request.boot_security = .{ .extra_kernel_options = "console=ttyS0\nmenuentry 'x' {" };
+
+    var diagnostics = try validate(std.testing.allocator, &request);
+    defer diagnostics.deinit(std.testing.allocator);
+    try std.testing.expect(hasDiagnosticCode(diagnostics, .invalid_policy));
+}
+
+test "a source with no boot entry to change reports the capability missing" {
+    const io = std.testing.io;
+    const source_path = "test-customize-kopts-bare-source.raw";
+    const spool_path = "test-customize-kopts-bare-root.spool";
+    const workspace_path = "test-customize-kopts-bare-work";
+    const output_path = workspace_path ++ "/output.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, workspace_path);
+    // This disk's ESP partition exists but was never formatted, so there is
+    // no command line on it to append to.
+    try createCustomizeGptTestDisk(io, source_path, spool_path);
+
+    var request = validNativeEditRequest(source_path, output_path, workspace_path, &.{});
+    request.storage.preserve.root_partition = .{ .gpt_index = 2 };
+    request.boot_security = .{ .extra_kernel_options = "console=ttyS0" };
+
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(!resolved.diagnostics.hasErrors());
+
+    var report = try preflight(std.testing.allocator, io, &resolved.plan.?, Platform.system());
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expect(!report.ready());
+    var found = false;
+    for (report.capabilities) |capability| {
+        if (capability.requirement.kind != .kernel_option_change) continue;
+        found = true;
+        try std.testing.expectEqual(CapabilityState.missing, capability.state);
+    }
+    try std.testing.expect(found);
 }
 
 test "a gen1 fresh request cannot ask for a COSI output" {
