@@ -25,6 +25,7 @@ pub const squashfs = @import("squashfs.zig");
 pub const ext4 = @import("ext4.zig");
 pub const bootconfig = @import("bootconfig.zig");
 pub const boot_options = @import("boot_options.zig");
+pub const grub_defaults = @import("grub_defaults.zig");
 pub const uki = @import("uki.zig");
 pub const guid = @import("guid.zig");
 pub const mbr = @import("mbr.zig");

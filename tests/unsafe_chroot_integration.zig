@@ -27,6 +27,9 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, executable_name, "cp")) {
         return runGuestCp(init.io, argv[1..]);
     }
+    if (std.mem.eql(u8, executable_name, "grub2-mkconfig")) {
+        return runGuestGrubMkconfig(allocator, init.io, argv[1..]);
+    }
     if (argv.len == 3 and
         std.mem.eql(u8, argv[1], "--unsafe-chroot-worker"))
     {
@@ -166,6 +169,7 @@ fn runIntegration(
             .generator = "dracut",
             .kernels = &.{"6.0-integration"},
         } },
+        .boot_security = .{ .extra_kernel_options = "console=ttyS0" },
         .execution = .{
             .workspace_path = work_path,
             .backend = .unsafe_chroot,
@@ -216,7 +220,7 @@ fn runIntegration(
             return error.IntegrationCleanupFailed;
         }
     }
-    try ensure(result.provenance.tools.len == 5);
+    try ensure(result.provenance.tools.len == 6);
     const preserved = result.provenance.execution.preserved orelse
         return error.MissingPreservedProvenance;
     // The inventory is reported as rpm gives it, trust pseudo-packages and
@@ -257,6 +261,42 @@ fn runIntegration(
     try ensure(std.mem.eql(u8, emitted.evr, "0:1.0-1"));
     try ensure(std.mem.eql(u8, emitted.architecture, @tagName(builtin.cpu.arch)));
 
+    // The generator ran as the target's own program, against the file this
+    // run edited, and produced entries carrying the options.
+    const boot_configuration = preserved.boot_configuration orelse
+        return error.MissingBootConfigurationProvenance;
+    try ensure(std.mem.eql(
+        u8,
+        boot_configuration.defaults_path,
+        "/etc/default/grub",
+    ));
+    try ensure(std.mem.eql(
+        u8,
+        boot_configuration.generator_path,
+        "/usr/sbin/grub2-mkconfig",
+    ));
+    try ensure(std.mem.eql(
+        u8,
+        boot_configuration.generated_path,
+        "/boot/grub2/grub.cfg",
+    ));
+    try ensure(std.mem.eql(u8, boot_configuration.options, "console=ttyS0"));
+    // Both the normal entry, where the options sit before
+    // `GRUB_CMDLINE_LINUX_DEFAULT`, and the recovery entry, where they end
+    // the line.
+    try ensure(boot_configuration.entries == 2);
+    try ensure(!boot_configuration.defaults_already_current);
+    var generator_recorded = false;
+    for (result.provenance.tools) |tool| {
+        if (!std.mem.eql(u8, tool.name, "grub2-mkconfig")) continue;
+        generator_recorded = true;
+        try ensure(std.mem.eql(u8, tool.version, "grub2-mkconfig integration-1"));
+        try ensure(tool.command.len == 3);
+        try ensure(std.mem.eql(u8, tool.command[1], "-o"));
+        try ensure(std.mem.eql(u8, tool.command[2], "/boot/grub2/grub.cfg"));
+    }
+    try ensure(generator_recorded);
+
     try expectOutputFile(
         allocator,
         io,
@@ -292,6 +332,30 @@ fn runIntegration(
         "/etc/resolv.conf",
         "nameserver 192.0.2.1\n",
     );
+    // The input the distro regenerates from carries the options, so the next
+    // kernel package change reproduces them rather than dropping them.
+    try expectOutputFile(
+        allocator,
+        io,
+        output_path,
+        "/etc/default/grub",
+        "# integration defaults\n" ++
+            "GRUB_TIMEOUT=5\n" ++
+            "GRUB_CMDLINE_LINUX=\"rd.auto=1 console=ttyS0\"\n" ++
+            "GRUB_CMDLINE_LINUX_DEFAULT=\"quiet\"\n",
+    );
+    try expectOutputFile(
+        allocator,
+        io,
+        output_path,
+        "/boot/grub2/grub.cfg",
+        "menuentry 'integration' {\n" ++
+            "\tlinux /vmlinuz-6.0-integration root=UUID=integration ro rd.auto=1 console=ttyS0 quiet\n" ++
+            "}\n" ++
+            "menuentry 'integration (recovery)' {\n" ++
+            "\tlinux /vmlinuz-6.0-integration root=UUID=integration ro single rd.auto=1 console=ttyS0\n" ++
+            "}\n",
+    );
     try expectMissingFile(
         allocator,
         io,
@@ -304,6 +368,12 @@ fn runIntegration(
     completed = true;
     std.debug.print("unsafe-chroot privileged integration passed\n", .{});
 }
+
+const integration_grub_defaults =
+    "# integration defaults\n" ++
+    "GRUB_TIMEOUT=5\n" ++
+    "GRUB_CMDLINE_LINUX=\"rd.auto=1\"\n" ++
+    "GRUB_CMDLINE_LINUX_DEFAULT=\"quiet\"\n";
 
 const RuntimeContext = struct {
     self_exe: []const u8,
@@ -371,13 +441,16 @@ fn createSourceDisk(
     defer tree.deinit();
     inline for (.{
         "boot",
+        "boot/grub2",
         "dev",
         "etc",
+        "etc/default",
         "proc",
         "run",
         "sys",
         "usr",
         "usr/bin",
+        "usr/sbin",
         "var",
         "var/lib",
         "var/lib/zvmi-integration",
@@ -389,6 +462,30 @@ fn createSourceDisk(
         "nameserver 192.0.2.1\n",
         .{ .mode = 0o644 },
     );
+    // A root-only fstab: the layout the chroot backend can regenerate for,
+    // as opposed to one declaring a separate `/boot` it never mounted.
+    try tree.putFileBytes(
+        "etc/fstab",
+        "UUID=integration /     ext4 defaults 0 1\n" ++
+            "UUID=swap        none  swap defaults 0 0\n",
+        .{ .mode = 0o644 },
+    );
+    // Two variables, as a distro ships: the generator puts
+    // `GRUB_CMDLINE_LINUX_DEFAULT` *after* the variable this run edits on
+    // the normal entry, so the options land mid-line there and last only on
+    // the recovery entry.
+    try tree.putFileBytes(
+        "etc/default/grub",
+        integration_grub_defaults,
+        .{ .mode = 0o644 },
+    );
+    try tree.putFileBytes(
+        "boot/grub2/grub.cfg",
+        "menuentry 'stale' {\n" ++
+            "\tlinux /vmlinuz-6.0-integration root=UUID=integration ro rd.auto=1\n" ++
+            "}\n",
+        .{ .mode = 0o644 },
+    );
     try tree.putFileBytes(
         "usr/bin/rpm",
         executable,
@@ -397,6 +494,7 @@ fn createSourceDisk(
     try tree.putSymlink("usr/bin/tdnf", "rpm", .{ .mode = 0o777 });
     try tree.putSymlink("usr/bin/dracut", "rpm", .{ .mode = 0o777 });
     try tree.putSymlink("usr/bin/cp", "rpm", .{ .mode = 0o777 });
+    try tree.putSymlink("usr/sbin/grub2-mkconfig", "../bin/rpm", .{ .mode = 0o777 });
     _ = try zvmi.ext4.populate(
         io,
         image.file,
@@ -517,6 +615,69 @@ fn runGuestDracut(io: Io, args: []const []const u8) !void {
         args[args.len - 1],
         "integration initramfs",
     );
+}
+
+/// A stand-in for the target's own `grub2-mkconfig`: it regenerates the
+/// configuration from `/etc/default/grub` the way a distro's generator does,
+/// which is what makes editing that file rather than the output the durable
+/// change. It deliberately reads the variable back out of the file instead of
+/// taking the options on its command line, so the test fails if the edit
+/// landed anywhere else.
+fn runGuestGrubMkconfig(
+    allocator: Allocator,
+    io: Io,
+    args: []const []const u8,
+) !void {
+    if (containsArg(args, "--version")) {
+        std.debug.print("grub2-mkconfig integration-1\n", .{});
+        return;
+    }
+    const output = argumentImmediatelyAfter(args, "-o") orelse
+        return error.UnexpectedGrubMkconfigInvocation;
+    const defaults = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "/etc/default/grub",
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(defaults);
+    // `/etc/grub.d/10_linux` composes the normal entry from both variables
+    // in this order and the recovery entry from the first alone. Reproducing
+    // that is what makes the test cover an option that is not the last word
+    // on the line.
+    const command_line = try guestVariable(defaults, "GRUB_CMDLINE_LINUX");
+    const default_command_line = try guestVariable(
+        defaults,
+        "GRUB_CMDLINE_LINUX_DEFAULT",
+    );
+    var buffer: [1024]u8 = undefined;
+    const generated = try std.fmt.bufPrint(
+        &buffer,
+        "menuentry 'integration' {{\n" ++
+            "\tlinux /vmlinuz-6.0-integration root=UUID=integration ro {s} {s}\n" ++
+            "}}\n" ++
+            "menuentry 'integration (recovery)' {{\n" ++
+            "\tlinux /vmlinuz-6.0-integration root=UUID=integration ro single {s}\n" ++
+            "}}\n",
+        .{ command_line, default_command_line, command_line },
+    );
+    const file = try Io.Dir.cwd().createFile(io, output, .{});
+    defer file.close(io);
+    try file.writePositionalAll(io, generated, 0);
+}
+
+fn guestVariable(defaults: []const u8, name: []const u8) ![]const u8 {
+    var lines = std.mem.splitScalar(u8, defaults, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, name)) continue;
+        const rest = line[name.len..];
+        if (!std.mem.startsWith(u8, rest, "=\"")) continue;
+        const value = rest[2..];
+        const end = std.mem.indexOfScalar(u8, value, '"') orelse
+            return error.UnterminatedGrubCommandLine;
+        return value[0..end];
+    }
+    return error.MissingGrubCommandLine;
 }
 
 fn runGuestCp(io: Io, args: []const []const u8) !void {

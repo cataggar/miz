@@ -15,6 +15,7 @@ const ext4 = @import("ext4.zig");
 const fat32 = @import("fat32.zig");
 const Format = @import("formats.zig").Format;
 const gpt = @import("gpt.zig");
+const grub_defaults = @import("grub_defaults.zig");
 const guid = @import("guid.zig");
 const image_mod = @import("image.zig");
 const layout = @import("layout.zig");
@@ -32,8 +33,8 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 18;
-pub const provenance_schema_version: u32 = 21;
+pub const plan_schema_version: u32 = 19;
+pub const provenance_schema_version: u32 = 22;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -1813,10 +1814,12 @@ fn validateCrossArchitecturePolicy(
     }
 }
 
-/// A kernel-argument change on a preserved image is applied by rewriting the
-/// boot entries the image already carries, which is why the backends that
-/// cannot reach them are refused here rather than in preflight: the answer
-/// depends only on the request.
+/// A kernel-argument change reaches a preserved image one of two ways, and
+/// which one is a property of the backend rather than of the request: an
+/// unprivileged backend rewrites the boot entries the image already carries,
+/// and `unsafe_chroot` edits the input the target's own generator reads and
+/// re-runs that generator. The backend that can do neither is refused here
+/// rather than in preflight, because the answer depends only on the request.
 fn validateKernelOptionChange(
     diagnostics: *std.array_list.Managed(Diagnostic),
     request: *const Request,
@@ -1828,12 +1831,26 @@ fn validateKernelOptionChange(
         // generates, so nothing has to be rewritten and nothing here applies.
         .native_fresh => return,
         .native_edit, .rebuild => {},
-        .unsafe_chroot, .vm => {
+        .unsafe_chroot => {
+            // `/etc/default/grub` is sourced by the shell that runs the
+            // generator as root inside the target, so this path holds the
+            // option text to a stricter rule than the entry files do.
+            grub_defaults.validateOptions(options) catch {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/boot_security/extra_kernel_options",
+                    "this backend splices the options into a shell assignment in /etc/default/grub, so they cannot carry a quote, a backslash, a dollar sign or a backtick",
+                    "write the options as plain kernel command-line words, as in console=ttyS0 quiet",
+                ));
+                return;
+            };
+        },
+        .vm => {
             try diagnostics.append(validationError(
                 .unsupported_execution_backend,
                 "/boot_security/extra_kernel_options",
-                "these backends mount only the root partition, and a preserved image keeps its kernel command line on the ESP",
-                "select native_edit or rebuild to change kernel arguments",
+                "this backend never mounts the image it customizes, so it can reach neither the boot entries on the ESP nor the target's own bootloader tooling",
+                "select native_edit, rebuild, or unsafe_chroot to change kernel arguments",
             ));
             return;
         },
@@ -2531,6 +2548,11 @@ pub const Action = enum {
     /// Appends the declared options to the kernel command line of every boot
     /// entry the preserved image carries.
     change_kernel_options,
+    /// Adds the declared options to the input the target's own bootloader
+    /// generator reads, then re-runs that generator inside the target. The
+    /// durable form of the same change, and the only one that survives the
+    /// target's next kernel update.
+    regenerate_boot_configuration,
     /// Reads the disk image a backend staged and writes the COSI bundle that
     /// the transaction commits in its place.
     write_cosi_bundle,
@@ -3840,6 +3862,9 @@ fn appendBackendFinalOperationSpecs(
             if (policy.extra_kernel_options.len != 0 and appendsKernelOptions(backend)) {
                 try specs.append(.{ .phase = .bootloader_prepare, .action = .change_kernel_options });
             }
+            if (policy.extra_kernel_options.len != 0 and regeneratesBootConfiguration(backend)) {
+                try specs.append(.{ .phase = .bootloader_prepare, .action = .regenerate_boot_configuration });
+            }
             try appendFinalizeHookSpecs(specs, hooks);
             try specs.append(.{ .phase = .output_conversion, .action = .publish_standalone_output });
         },
@@ -4236,8 +4261,18 @@ fn hasGeneralOsCustomization(customization: OsCustomization) bool {
 /// The backends that apply a kernel-argument change by rewriting the boot
 /// entries on the image's ESP. The rest either generate the command line
 /// themselves (`native_fresh`) or cannot reach the ESP at all.
+/// Whether the backend adds the options by editing the boot entries the
+/// image already carries. `unsafe_chroot` adds them too, but by regenerating
+/// from the target's own configuration, which is a different operation with a
+/// different capability and a different provenance record.
 fn appendsKernelOptions(backend: ExecutionBackend) bool {
     return backend == .native_edit or backend == .rebuild;
+}
+
+/// Whether the backend adds the options by re-running the target's own
+/// bootloader generator.
+fn regeneratesBootConfiguration(backend: ExecutionBackend) bool {
+    return backend == .unsafe_chroot;
 }
 
 /// Whether the policy asks for something no preserved backend can carry out.
@@ -5036,7 +5071,11 @@ fn unsafeChrootCapabilityState(
         hasGeneralOsCustomization(data.os) or
         data.generalization != .none or
         data.selinux != .unchanged or
-        !isDefaultBootPolicy(data.boot_security) or
+        // Kernel options are the one boot-policy field this backend carries
+        // out: it edits the input the target's own generator reads and
+        // re-runs that generator. Every other field asks for a bootloader
+        // this backend does not install.
+        hasUnsupportedBootPolicyChange(data.boot_security) or
         data.packages.cache != .online or
         !validUnsafePackageLock(data.packages.lock))
     {
@@ -5547,12 +5586,39 @@ pub const HookRecord = struct {
     exit_code: u8,
 };
 
+/// What the target's own bootloader tooling was asked to do, and what came
+/// out. A regenerated configuration is a file the run did not write itself,
+/// so the only durable account of the change is which input was edited, which
+/// program regenerated from it, and how many entries came out carrying the
+/// options.
+pub const BootConfigurationRecord = struct {
+    /// The source of truth that was edited, as an absolute guest path.
+    defaults_path: []const u8,
+    /// The generator, as an absolute guest path. `tools` carries its reported
+    /// version and the exact argv it was run with.
+    generator_path: []const u8,
+    /// The configuration the generator wrote, as an absolute guest path.
+    generated_path: []const u8,
+    /// Entries in the regenerated configuration whose command line carries the
+    /// options. Zero never reaches a record: the run fails first.
+    entries: usize,
+    /// Whether the source of truth already ended with these options, so the
+    /// run regenerated from an input it did not have to change. Distinguishes
+    /// an image that gained the options from one that already had them.
+    defaults_already_current: bool,
+    /// The text that was added, recorded because the published command line is
+    /// the target's own plus this and neither half is derivable from the other.
+    options: []const u8,
+};
+
 pub const UnsafeChrootRuntimeReport = struct {
     arena: std.heap.ArenaAllocator,
     tools: []const ToolRecord,
     installed_packages: []const []const u8,
     package_lock: []const PackageVersionLock = &.{},
     hooks: []const HookRecord = &.{},
+    /// Present exactly when the request asked for a kernel-argument change.
+    boot_configuration: ?BootConfigurationRecord = null,
 
     pub fn deinit(self: *UnsafeChrootRuntimeReport) void {
         self.arena.deinit();
@@ -5746,8 +5812,14 @@ pub const PreservedExecutionRecord = struct {
     /// that request never reaches a provenance record at all.
     hooks: []const HookRecord = &.{},
     rebuild: ?PreservedRebuildRecord,
-    /// Present exactly when the request asked for a kernel-argument change.
+    /// Present exactly when the request asked for a kernel-argument change on
+    /// a backend that applies it by rewriting the entries the image carries.
     kernel_options: ?KernelOptionsRecord,
+    /// Present exactly when the request asked for a kernel-argument change on
+    /// a backend that applies it by re-running the target's own bootloader
+    /// generator. Never set at the same time as `kernel_options`: the two are
+    /// different operations and the plan names which one it published.
+    boot_configuration: ?BootConfigurationRecord = null,
 };
 
 pub const KernelOptionsRecord = struct {
@@ -5991,6 +6063,13 @@ fn guestHooks(
     return &.{};
 }
 
+fn guestBootConfiguration(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+) ?BootConfigurationRecord {
+    if (unsafe_report) |report| return report.boot_configuration;
+    return null;
+}
+
 fn guestTools(
     unsafe_report: ?*const UnsafeChrootRuntimeReport,
     vm_report: ?*const VmRuntimeReport,
@@ -6170,6 +6249,14 @@ fn buildResult(
                 .identity_config_references_rewritten = report.identity_rewrite.config_references_rewritten,
                 .identity_verified_files = report.identity_rewrite.verified_files,
                 .identity_stale_references = report.identity_rewrite.stale_references,
+            } else null,
+            .boot_configuration = if (guestBootConfiguration(unsafe_report)) |record| .{
+                .defaults_path = try result_allocator.dupe(u8, record.defaults_path),
+                .generator_path = try result_allocator.dupe(u8, record.generator_path),
+                .generated_path = try result_allocator.dupe(u8, record.generated_path),
+                .entries = record.entries,
+                .defaults_already_current = record.defaults_already_current,
+                .options = try result_allocator.dupe(u8, record.options),
             } else null,
             .kernel_options = if (kernel_options) |report| .{
                 .appended = try result_allocator.dupe(u8, plan.data.boot_security.extra_kernel_options),
@@ -6823,13 +6910,13 @@ fn hasValidPlanIntegrity(allocator: Allocator, plan: *const ResolvedPlan) Alloca
         },
     }
     if ((data.execution.backend == .vm) != (data.execution.vm != null)) return false;
-    // Kernel arguments reach the image either at bootloader install time
-    // (native_fresh) or through a rewrite of the staged ESP (native_edit,
-    // rebuild). The guest backends never mount the ESP, so a plan that pairs
-    // them with kernel options describes an output nobody can produce.
-    if (data.boot_security.extra_kernel_options.len != 0 and
-        (data.execution.backend == .unsafe_chroot or data.execution.backend == .vm))
-    {
+    // Kernel arguments reach the image at bootloader install time
+    // (native_fresh), through a rewrite of the staged ESP (native_edit,
+    // rebuild), or by re-running the target's own generator inside it
+    // (unsafe_chroot). The VM backend never mounts the image at all, so a
+    // plan that pairs it with kernel options describes an output nobody can
+    // produce.
+    if (data.boot_security.extra_kernel_options.len != 0 and data.execution.backend == .vm) {
         return false;
     }
     if (!try hasExpectedOperations(allocator, plan)) return false;
@@ -9619,22 +9706,85 @@ test "native-edit appends kernel options to every boot entry on the ESP" {
     ) != null);
 }
 
-test "the guest backends refuse a kernel argument change by name" {
-    for ([_]ExecutionBackend{ .unsafe_chroot, .vm }) |backend| {
+test "the vm backend refuses a kernel argument change by name" {
+    var request = validNativeEditRequest("source.raw", "work/output.raw", "work", &.{});
+    request.boot_security = .{ .extra_kernel_options = "console=ttyS0" };
+    request.execution.backend = .vm;
+    request.execution.acknowledge_unsafe = true;
+    request.execution.vm = validVmPolicy();
+
+    var diagnostics = try validate(std.testing.allocator, &request);
+    defer diagnostics.deinit(std.testing.allocator);
+    try std.testing.expect(hasDiagnosticCode(diagnostics, .unsupported_execution_backend));
+
+    // The same request on the backend that can reach the ESP validates.
+    request.execution.backend = .native_edit;
+    request.execution.acknowledge_unsafe = false;
+    request.execution.vm = null;
+    var accepted = try validate(std.testing.allocator, &request);
+    defer accepted.deinit(std.testing.allocator);
+    try std.testing.expect(!accepted.hasErrors());
+}
+
+test "the chroot backend accepts a kernel argument change and plans the regeneration" {
+    var request = validNativeEditRequest("source.raw", "work/output.raw", "work", &.{});
+    request.boot_security = .{ .extra_kernel_options = "console=ttyS0 quiet" };
+    request.execution.backend = .unsafe_chroot;
+    request.execution.acknowledge_unsafe = true;
+
+    var accepted = try validate(std.testing.allocator, &request);
+    defer accepted.deinit(std.testing.allocator);
+    try std.testing.expect(!accepted.hasErrors());
+
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(resolved.plan != null);
+
+    // The regeneration is published as its own operation, and it happens
+    // during the bootloader phase rather than alongside the ESP edit the
+    // preserved-image backends perform.
+    var regenerations: usize = 0;
+    var appends: usize = 0;
+    for (resolved.plan.?.data.operations) |operation| {
+        switch (operation.action) {
+            .regenerate_boot_configuration => {
+                regenerations += 1;
+                try std.testing.expectEqual(Phase.bootloader_prepare, operation.phase);
+            },
+            .change_kernel_options => appends += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), regenerations);
+    // The chroot does not touch the ESP: the distro's generator owns the
+    // generated file, so there is nothing for zvmi to append to by hand.
+    try std.testing.expectEqual(@as(usize, 0), appends);
+}
+
+test "kernel option text the target's shell would interpret is refused on the chroot backend" {
+    // `/etc/default/grub` is sourced by the shell that runs the generator as
+    // root inside the target, so the characters that are merely awkward in a
+    // GRUB entry are a command-injection vector here.
+    for ([_][]const u8{
+        "console=ttyS0 $(id)",
+        "console=ttyS0 `id`",
+        "console=\"ttyS0\"",
+        "console='ttyS0'",
+        "console=ttyS0\\",
+    }) |options| {
         var request = validNativeEditRequest("source.raw", "work/output.raw", "work", &.{});
-        request.boot_security = .{ .extra_kernel_options = "console=ttyS0" };
-        request.execution.backend = backend;
+        request.boot_security = .{ .extra_kernel_options = options };
+        request.execution.backend = .unsafe_chroot;
         request.execution.acknowledge_unsafe = true;
-        if (backend == .vm) request.execution.vm = validVmPolicy();
 
         var diagnostics = try validate(std.testing.allocator, &request);
         defer diagnostics.deinit(std.testing.allocator);
-        try std.testing.expect(hasDiagnosticCode(diagnostics, .unsupported_execution_backend));
+        try std.testing.expect(hasDiagnosticCode(diagnostics, .invalid_policy));
 
-        // The same request on the backend that can reach the ESP validates.
+        // The preserved-image backends never hand the text to a shell, so
+        // they still accept it.
         request.execution.backend = .native_edit;
         request.execution.acknowledge_unsafe = false;
-        request.execution.vm = null;
         var accepted = try validate(std.testing.allocator, &request);
         defer accepted.deinit(std.testing.allocator);
         try std.testing.expect(!accepted.hasErrors());

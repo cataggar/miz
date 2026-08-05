@@ -497,6 +497,56 @@ fn isEntryLine(kind: EntryKind, line: []const u8) bool {
     return false;
 }
 
+/// GRUB entries in `contents` carrying `options` as a whole-word run
+/// anywhere in the command line.
+///
+/// Public because the `unsafe_chroot` backend regenerates a distro's
+/// `grub.cfg` with the distro's own tooling rather than editing it, and then
+/// has to answer the same question about the result: what a GRUB entry line
+/// looks like should have one definition in this repository, not two that
+/// drift.
+///
+/// Anywhere, rather than at the end as `apply` guarantees for the files it
+/// writes itself, because a generator composes the line from several
+/// variables: `/etc/grub.d/10_linux` emits
+/// `"${GRUB_CMDLINE_LINUX} ${GRUB_CMDLINE_LINUX_DEFAULT}"` for its normal
+/// entries, so options appended to the first variable land in the middle of
+/// the entry. Requiring a suffix there would fail a run that had applied the
+/// change correctly.
+pub fn countGrubEntriesCarrying(contents: []const u8, options: []const u8) usize {
+    if (options.len == 0) return 0;
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    var entries: usize = 0;
+    while (lines.next()) |line| {
+        const has_cr = line.len != 0 and line[line.len - 1] == '\r';
+        const body = if (has_cr) line[0 .. line.len - 1] else line;
+        if (!isEntryLine(.grub, body)) continue;
+        if (containsWordRun(body, options)) entries += 1;
+    }
+    return entries;
+}
+
+/// Whether `needle` appears in `haystack` bounded by whitespace or the ends
+/// of the text on both sides, so `quiet` is not found inside `noquiet` and
+/// `console=ttyS0` is not found inside `console=ttyS0,115200`.
+fn containsWordRun(haystack: []const u8, needle: []const u8) bool {
+    var offset: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, offset, needle)) |index| {
+        defer offset = index + 1;
+        if (index != 0) {
+            const preceding = haystack[index - 1];
+            if (preceding != ' ' and preceding != '\t') continue;
+        }
+        const end = index + needle.len;
+        if (end != haystack.len) {
+            const following = haystack[end];
+            if (following != ' ' and following != '\t') continue;
+        }
+        return true;
+    }
+    return false;
+}
+
 fn countEntryLines(kind: EntryKind, contents: []const u8) usize {
     var lines = std.mem.splitScalar(u8, contents, '\n');
     var entries: usize = 0;
@@ -744,6 +794,50 @@ test "an image with no ESP carries no command line to change" {
     try std.testing.expectError(
         error.MissingEspPartition,
         apply(std.testing.allocator, io, &image, "quiet", null),
+    );
+}
+
+test "counting regenerated entries requires the options on a word boundary" {
+    const generated =
+        "menuentry 'a' {\n" ++
+        "\tlinux /vmlinuz-6.1 root=UUID=1111 console=ttyS0 quiet\n" ++
+        "}\n" ++
+        "menuentry 'b (recovery)' {\n" ++
+        "\tlinux /vmlinuz-6.1 root=UUID=1111 console=ttyS0 quiet\n" ++
+        "}\n" ++
+        "menuentry 'c' {\n" ++
+        "\tlinux /vmlinuz-6.0 root=UUID=1111\n" ++
+        "}\n";
+    try std.testing.expectEqual(@as(usize, 2), countGrubEntriesCarrying(generated, "console=ttyS0 quiet"));
+    // `quiet` ends two of the lines, but only as the tail of the declared
+    // text, so asking for `iet` must not find it.
+    try std.testing.expectEqual(@as(usize, 2), countGrubEntriesCarrying(generated, "quiet"));
+    try std.testing.expectEqual(@as(usize, 0), countGrubEntriesCarrying(generated, "iet"));
+    try std.testing.expectEqual(@as(usize, 0), countGrubEntriesCarrying(generated, ""));
+    // Only the commands that boot a kernel count. An `initrd` line carrying
+    // the same text is not an entry.
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countGrubEntriesCarrying("\tinitrd /initramfs-6.1.img quiet\n", "quiet"),
+    );
+    // A real generator composes the line from `${GRUB_CMDLINE_LINUX}` and
+    // `${GRUB_CMDLINE_LINUX_DEFAULT}`, so options appended to the first land
+    // in the middle of the entry and still count.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countGrubEntriesCarrying(
+            "\tlinux /vmlinuz-6.1 root=UUID=1 ro quiet console=tty0\n",
+            "quiet",
+        ),
+    );
+    // A run that is only part of a longer word is not the option.
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countGrubEntriesCarrying("\tlinux /vmlinuz-6.1 ro noquiet\n", "quiet"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countGrubEntriesCarrying("\tlinux /vmlinuz-6.1 console=ttyS0,115200\n", "console=ttyS0"),
     );
 }
 
