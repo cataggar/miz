@@ -55,6 +55,19 @@ const StubMode = enum {
     /// image with a broken bootloader configuration does: the firmware says
     /// so on stderr and gives up.
     firmware_unbootable,
+    /// Runs every hook the control document carries but reports one fewer
+    /// than it was given, as a guest that quietly skipped one would. The host
+    /// is required to refuse it rather than publish an image whose provenance
+    /// would claim work that may not have happened.
+    dropped_hook,
+};
+
+/// The scripts the hook cases declare. Distinct bytes, so the digests
+/// provenance publishes can be checked against something other than each
+/// other.
+const hook_scripts = [_][]const u8{
+    "#!/bin/sh\necho integration hook after packages\n",
+    "#!/bin/sh\necho integration hook at finalize\n",
 };
 
 /// What the stand-in image prints once its own boot chain has control. Real
@@ -104,6 +117,8 @@ fn runIntegration(allocator: Allocator, io: Io, self_exe: []const u8) !void {
     try runFirmwareBootMatchesDirectKernel(allocator, io, self_exe, architecture);
     try runFirmwareUnbootable(allocator, io, self_exe, architecture);
     try runFirmwareMissing(allocator, io, self_exe, architecture);
+    try runHooksReachTheGuest(allocator, io, self_exe, architecture);
+    try runDroppedHookRefused(allocator, io, self_exe, architecture);
     std.debug.print("vm backend integration passed\n", .{});
 }
 
@@ -216,6 +231,95 @@ fn runGuestFailure(
 
     var outcome = try workspace.execute(allocator, io, .guest_failure, .software);
     defer outcome.deinit(allocator);
+
+    try expectFailedRun(io, &workspace, &outcome);
+    workspace.completed = true;
+}
+
+fn runHooksReachTheGuest(
+    allocator: Allocator,
+    io: Io,
+    self_exe: []const u8,
+    architecture: zvmi.customize.Architecture,
+) !void {
+    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
+    defer workspace.deinit(io);
+
+    const hooks = [_]zvmi.customize.Hook{
+        .{
+            .name = "after-packages",
+            .phase = .after_packages,
+            .source = .{ .inline_script = hook_scripts[0] },
+            .arguments = &.{"--check"},
+        },
+        .{
+            .name = "at-finalize",
+            .phase = .finalize,
+            .source = .{ .inline_script = hook_scripts[1] },
+        },
+    };
+    workspace.hooks = &hooks;
+
+    var outcome = try workspace.execute(allocator, io, .success, .software);
+    defer outcome.deinit(allocator);
+
+    const result = outcome.result orelse return error.ExecutionProducedNoResult;
+    if (outcome.diagnostics.hasErrors()) return error.ExecutionReportedErrors;
+
+    // The stand-in already checked the scripts arrived intact. What this side
+    // checks is that provenance says the same thing the chroot backend's
+    // does: the hook by name, phase, digest and exit code.
+    const preserved = result.provenance.execution.preserved orelse
+        return error.MissingPreservedProvenance;
+    try ensure(preserved.hooks.len == hooks.len);
+    for (preserved.hooks, hooks, hook_scripts) |record, hook, script| {
+        try ensure(std.mem.eql(u8, record.name, hook.name));
+        try ensure(record.phase == hook.phase);
+        try ensure(record.exit_code == 0);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(script, &digest, .{});
+        try ensure(std.mem.eql(u8, &record.source_sha256.bytes, &digest));
+    }
+
+    workspace.completed = true;
+}
+
+fn runDroppedHookRefused(
+    allocator: Allocator,
+    io: Io,
+    self_exe: []const u8,
+    architecture: zvmi.customize.Architecture,
+) !void {
+    var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
+    defer workspace.deinit(io);
+
+    const hooks = [_]zvmi.customize.Hook{
+        .{
+            .name = "after-packages",
+            .phase = .after_packages,
+            .source = .{ .inline_script = hook_scripts[0] },
+        },
+        .{
+            .name = "at-finalize",
+            .phase = .finalize,
+            .source = .{ .inline_script = hook_scripts[1] },
+        },
+    };
+    workspace.hooks = &hooks;
+
+    // A guest that reports fewer hooks than it was given is the failure #302
+    // shipped, seen from the other side. The run fails and publishes nothing,
+    // rather than producing an image whose provenance describes two hooks.
+    var outcome = try workspace.execute(allocator, io, .dropped_hook, .software);
+    defer outcome.deinit(allocator);
+    // The refusal names the hook that went unaccounted for, so the failure
+    // cannot be mistaken for an unrelated guest fault.
+    var named = false;
+    for (outcome.diagnostics.items) |diagnostic| {
+        const cause = diagnostic.cause orelse continue;
+        if (std.mem.eql(u8, cause.error_name, "UnexecutedHook")) named = true;
+    }
+    try ensure(named);
 
     try expectFailedRun(io, &workspace, &outcome);
     workspace.completed = true;
@@ -471,6 +575,11 @@ const Workspace = struct {
     firmware_vars_path: []const u8 = "",
     /// Selects the boot mode the next `resolve` asks for.
     firmware_boot: bool = false,
+    /// Hooks the next `resolve` declares. Empty for every case that is not
+    /// about them, so the script channel is exercised where it is the subject
+    /// rather than added to the baseline every other assertion is made
+    /// against.
+    hooks: []const zvmi.customize.Hook = &.{},
     /// Set by a case that reached its last assertion. A workspace is only
     /// removed once that happens, so a failure leaves its source, its output,
     /// and its transaction exactly as they were for inspection.
@@ -589,9 +698,11 @@ const Workspace = struct {
                 .generator = "dracut",
                 .kernels = &.{kernel_release},
             } },
+            .hooks = self.hooks,
             .execution = .{
                 .workspace_path = self.path,
                 .backend = .vm,
+                .acknowledge_unsafe = self.hooks.len != 0,
                 .vm = .{
                     .emulator_command = self.emulator_path,
                     .boot = if (self.firmware_boot) .{ .firmware = .{
@@ -826,12 +937,33 @@ fn runStubEmulator(
         ));
     }
 
+    // A hook is the one field a caller fills with code. The stand-in honours
+    // exactly what a real guest does with it: decode the script, check it
+    // names its own interpreter, and account for every one of them.
+    const hook_outcomes = try allocator.alloc(
+        zvmi.vm_control.HookOutcome,
+        control.hooks.len,
+    );
+    for (control.hooks, hook_outcomes, 0..) |hook, *outcome, index| {
+        const size = try zvmi.vm_control.hookScriptSize(hook);
+        const script = try allocator.alloc(u8, size);
+        try zvmi.vm_control.decodeHookScript(hook, script);
+        try expectStub(std.mem.startsWith(u8, script, "#!"));
+        try expectStub(std.mem.eql(u8, script, hook_scripts[index]));
+        outcome.* = .{ .index = @intCast(index), .exit_code = 0 };
+    }
+
     // Which drive is which is positional, so the result must be written
     // through the same ordering the guest would see.
     const result_path = driveAt(args, 1) orelse return error.MissingResultDrive;
     const stage_path = driveAt(args, 0) orelse return error.MissingStageDrive;
     try expectStub(!std.mem.eql(u8, stage_path, result_path));
     if (mode == .silent) return;
+
+    const reported = if (mode == .dropped_hook)
+        hook_outcomes[0 .. hook_outcomes.len - 1]
+    else
+        hook_outcomes;
 
     const result: zvmi.vm_control.Result = switch (mode) {
         .guest_failure => .{
@@ -855,6 +987,7 @@ fn runStubEmulator(
                 },
             },
             .installed_packages = &.{"integration-package-0:1.0-1.noarch"},
+            .hooks = reported,
         },
     };
     const sealed = try zvmi.vm_control.seal(allocator, result);

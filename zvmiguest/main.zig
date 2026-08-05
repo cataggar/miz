@@ -56,6 +56,7 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
         .installed_packages = .init(allocator),
         .baseline_packages = .init(allocator),
         .emitted_lock = .init(allocator),
+        .hook_outcomes = .init(allocator),
     };
     const outcome = session.run();
     session.teardown();
@@ -65,6 +66,7 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
         .tools = session.tools.items,
         .installed_packages = session.installed_packages.items,
         .package_lock = session.emitted_lock.items,
+        .hooks = session.hook_outcomes.items,
     });
     powerOff();
 }
@@ -88,6 +90,8 @@ const Session = struct {
     /// What the transaction added or changed, as the pins that would restate
     /// it. Sent home whether or not the control document declared any.
     emitted_lock: std.array_list.Managed(control_mod.PackagePin),
+    /// What each hook did, in the order it ran.
+    hook_outcomes: std.array_list.Managed(control_mod.HookOutcome),
 
     /// Captured as soon as the control document parses, so that even a refusal
     /// to act on the rest of it still gets an answer home.
@@ -176,6 +180,16 @@ const Session = struct {
         self.writeKernelModuleFiles(control.kernel_module_files) catch |err| {
             return self.stageFailure("kernel-modules", err);
         };
+        // The four phases, in the order `buildOperations` publishes them and
+        // the order the chroot backend runs them. A run whose hooks fired in a
+        // different order from the one the plan shows would make the plan a
+        // description of something else.
+        self.runHooks(control, .after_packages) catch |err| {
+            return self.stageFailure("hooks", err);
+        };
+        self.runHooks(control, .before_initramfs) catch |err| {
+            return self.stageFailure("hooks", err);
+        };
         switch (control.initramfs) {
             .unchanged => {},
             .regenerate => |regenerate| {
@@ -201,6 +215,20 @@ const Session = struct {
                 }
             },
         }
+        self.runHooks(control, .before_seal) catch |err| {
+            return self.stageFailure("hooks", err);
+        };
+        // No bootloader step separates these two on this backend: the vm
+        // backend refuses a non-default boot policy, so there is nothing
+        // between sealing and finishing for a phase to sit either side of.
+        // The phases stay distinct anyway, because which one a hook declared
+        // is what the plan published.
+        self.runHooks(control, .finalize) catch |err| {
+            return self.stageFailure("hooks", err);
+        };
+        // After every hook, so a hook that installed a package is visible in
+        // the inventory the result carries -- the same point the chroot
+        // backend reads its own.
         self.loadInstalledPackages() catch |err| {
             return self.stageFailure("package-inventory", err);
         };
@@ -582,6 +610,85 @@ const Session = struct {
         return false;
     }
 
+    fn runHooks(
+        self: *Session,
+        control: control_mod.Control,
+        phase: control_mod.HookPhase,
+    ) !void {
+        for (control.hooks, 0..) |hook, index| {
+            if (hook.phase != phase) continue;
+            try self.runHook(hook, index);
+        }
+    }
+
+    /// Runs one hook and records that it ran.
+    ///
+    /// What the hook gets is stated, not inherited, and is the same on both
+    /// backends: its argument vector is the script followed by exactly the
+    /// declared arguments, its environment is the one every command this agent
+    /// runs gets, and it executes inside the target root. Its output is a
+    /// build log rather than a value the run consumes, so it goes to the
+    /// console the host is already reading, bounded by the same capture limit
+    /// every other command's output is bounded by.
+    ///
+    /// The script is written by this agent, at a path this agent chose from
+    /// the hook's position, onto the private tmpfs mounted at `<root>/run`,
+    /// and unlinked whatever happens. The control document names no
+    /// destination, so there is none to get wrong: the next hook, the
+    /// initramfs generator, and anything a package scriptlet spawns must not
+    /// find it, and nothing published can contain it.
+    ///
+    /// What it does not get is a wall clock, for the reason the chroot backend
+    /// does not give it one either: package scriptlets and dracut modules are
+    /// already target-supplied code running as root here with no deadline, and
+    /// bounding only the hook would state a guarantee this backend does not
+    /// have. #312 covers the whole execution.
+    fn runHook(self: *Session, hook: control_mod.Hook, index: usize) !void {
+        const guest_path = try std.fmt.allocPrint(
+            self.allocator,
+            "/run/zvmi-hook-{d}",
+            .{index},
+        );
+        const size = try control_mod.hookScriptSize(hook);
+        const script = try self.allocator.alloc(u8, size);
+        try control_mod.decodeHookScript(hook, script);
+        // The rule the request validator and the control document's own
+        // validator both applied, applied once more to the bytes rather than
+        // to their encoding: this is the last point before they are made
+        // executable.
+        if (script.len < 2 or script[0] != '#' or script[1] != '!') {
+            return error.HookScriptUnusable;
+        }
+
+        try self.writeExecutableGuestFile(guest_path, script);
+        defer self.deleteGuestFile(guest_path);
+
+        var argv = try std.array_list.Managed([]const u8).initCapacity(
+            self.allocator,
+            hook.arguments.len + 1,
+        );
+        argv.appendAssumeCapacity(guest_path);
+        argv.appendSliceAssumeCapacity(hook.arguments);
+
+        // Not `runChroot`: that probes `argv[0] --version` for provenance,
+        // and a hook is caller-supplied code rather than a tool. Running it an
+        // extra time, with an argument its declaration never named, is not
+        // something a hook's contract permits.
+        const captured = try runInChroot(self.allocator, argv.items);
+        log("[zvmi-guest] hook ");
+        log(hook.name);
+        log("\n");
+        log(captured.output);
+        if (captured.exit_code != 0) {
+            self.last_exit_code = captured.exit_code;
+            return error.HookFailed;
+        }
+        try self.hook_outcomes.append(.{
+            .index = @intCast(index),
+            .exit_code = captured.exit_code,
+        });
+    }
+
     fn runChroot(self: *Session, argv: []const []const u8) !void {
         const version = self.probeVersion(argv[0]);
         const captured = try runInChroot(self.allocator, argv);
@@ -626,6 +733,34 @@ const Session = struct {
             .{guest_path},
         );
         try writeFileBytes(self.allocator, host_path, bytes);
+    }
+
+    /// Writes a file the guest is about to execute.
+    ///
+    /// Created exclusively, so a path something else already put there is a
+    /// failure rather than a file this agent silently adopts, and `0700` so
+    /// nothing in the target that is not root can read the caller's code even
+    /// for the moment it exists.
+    fn writeExecutableGuestFile(
+        self: *Session,
+        guest_path: []const u8,
+        bytes: []const u8,
+    ) !void {
+        const host_path = try std.fmt.allocPrint(
+            self.allocator,
+            guest_root ++ "{s}",
+            .{guest_path},
+        );
+        const path_z = try self.allocator.dupeZ(u8, host_path);
+        const fd_raw = linux.open(
+            path_z,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true },
+            0o700,
+        );
+        if (linux.errno(fd_raw) != .SUCCESS) return error.OpenFailed;
+        const fd: i32 = @intCast(fd_raw);
+        defer _ = linux.close(fd);
+        try writeAll(fd, bytes);
     }
 
     fn deleteGuestFile(self: *Session, guest_path: []const u8) void {
@@ -1291,6 +1426,7 @@ test "a module member the agent will not open is refused before any syscall" {
         .installed_packages = .init(arena.allocator()),
         .baseline_packages = .init(arena.allocator()),
         .emitted_lock = .init(arena.allocator()),
+        .hook_outcomes = .init(arena.allocator()),
     };
 
     // The host validated this too, but a guest that trusts its control

@@ -2103,16 +2103,16 @@ fn validateVmPolicy(
             ));
         },
     }
-    // The guest agent has no channel that carries caller-supplied code, so a
-    // hook declared against this backend would be dropped rather than run.
-    // Named here, because a run that skipped the hook and published anyway is
-    // a run whose provenance claims work it did not do.
-    if (request.hooks.len != 0) {
+    // A hook now reaches the guest through the control document's script
+    // channel, so what is left to refuse is only what the channel itself
+    // cannot carry: the document is bounded, and a request with more hooks
+    // than it holds must be told so rather than failing when it is written.
+    if (request.hooks.len > vm_control.max_hooks) {
         try diagnostics.append(validationError(
             .unsupported_execution_backend,
             "/hooks",
-            "the vm backend has no channel that carries a hook to the guest",
-            "use the unsafe_chroot backend for hooks",
+            "the vm backend carries fewer hooks than this request declares",
+            "reduce the number of hooks, or use the unsafe_chroot backend",
         ));
     }
     // A cache directory is a host directory the run reads and writes through,
@@ -5285,9 +5285,9 @@ fn vmCapabilityState(
     {
         return .unsupported;
     }
-    // Nothing in the guest executes caller-supplied scripts, so a plan that
-    // carries hooks would silently drop them rather than run them.
-    if (data.hooks.len != 0) return .unsupported;
+    // The guest runs a hook only where the whole document reaches it, so this
+    // bounds what the channel carries rather than whether it exists.
+    if (data.hooks.len > vm_control.max_hooks) return .unsupported;
     if (vm.acceleration == .hardware and
         data.architectures.runner != data.architectures.host)
     {
@@ -5874,6 +5874,7 @@ pub const VmRuntimeReport = struct {
     tools: []const ToolRecord,
     installed_packages: []const []const u8,
     package_lock: []const PackageVersionLock = &.{},
+    hooks: []const HookRecord = &.{},
     execution: VmExecutionRecord,
 
     pub fn deinit(self: *VmRuntimeReport) void {
@@ -6227,13 +6228,15 @@ fn guestPackageLock(
     return &.{};
 }
 
-/// Hooks only ever run under the chroot backend, so there is one report that
-/// can hold them. Written as a lookup rather than read inline so the day the
-/// guest gains a script channel adds an arm here instead of a second spelling.
+/// One run, one set of hooks, so whichever backend carried it out is the one
+/// that has them. Written as a lookup for the same reason `guestPackages` is:
+/// a second spelling of the alternation is a second place to forget an arm.
 fn guestHooks(
     unsafe_report: ?*const UnsafeChrootRuntimeReport,
+    vm_report: ?*const VmRuntimeReport,
 ) []const HookRecord {
     if (unsafe_report) |report| return report.hooks;
+    if (vm_report) |report| return report.hooks;
     return &.{};
 }
 
@@ -6414,7 +6417,7 @@ fn buildResult(
                 result_allocator,
                 guestPackageLock(unsafe_report, vm_report),
             ),
-            .hooks = try dupeHookRecords(result_allocator, guestHooks(unsafe_report)),
+            .hooks = try dupeHookRecords(result_allocator, guestHooks(unsafe_report, vm_report)),
             .package_cache = try dupePackageCacheRecord(
                 result_allocator,
                 guestPackageCache(unsafe_report),
@@ -8404,9 +8407,8 @@ test "v3 validation models the backend and unsafe execution matrix" {
 
 test "cross-architecture guest execution requires an explicit compatible runner" {
     // The vm backend is itself guest execution, so nothing else has to be
-    // declared to make the architectures matter. It used to be a hook that
-    // carried that weight here; hooks are refused on this backend now, and a
-    // test that leaned on one would be testing the refusal instead.
+    // declared to make the architectures matter -- a request with no hook at
+    // all still has to name a runner.
     var request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
     request.target_architecture = .aarch64;
     request.execution.backend = .vm;
@@ -11766,7 +11768,7 @@ test "a hook is refused where it could not be run" {
     try std.testing.expect(!diagnostics.hasErrors());
 }
 
-test "the vm backend refuses a hook it has no channel to carry" {
+test "the vm backend carries a hook, and refuses more than the channel holds" {
     const hooks = [_]Hook{.{
         .name = "guest-script",
         .phase = .finalize,
@@ -11777,7 +11779,30 @@ test "the vm backend refuses a hook it has no channel to carry" {
     request.execution.vm = .{ .emulator_command = "/usr/bin/qemu-system-x86_64" };
     request.hooks = &hooks;
 
-    var diagnostics = try validate(std.testing.allocator, &request);
+    // The guest has a script channel now, so the hook that was refused for
+    // having nowhere to go is accepted for the same reason.
+    var accepted = try validate(std.testing.allocator, &request);
+    defer accepted.deinit(std.testing.allocator);
+    try std.testing.expect(!accepted.hasErrors());
+
+    // What is left to refuse is what the control document cannot hold. Named
+    // rather than left to a generic unsupported capability, because a request
+    // whose hooks were dropped would publish an image the plan says had them.
+    var too_many = request;
+    const overflowing = try std.testing.allocator.alloc(Hook, vm_control.max_hooks + 1);
+    defer std.testing.allocator.free(overflowing);
+    const names = try std.testing.allocator.alloc([16]u8, overflowing.len);
+    defer std.testing.allocator.free(names);
+    for (overflowing, names, 0..) |*hook, *name, index| {
+        hook.* = .{
+            .name = std.fmt.bufPrint(name, "hook-{d}", .{index}) catch unreachable,
+            .phase = .finalize,
+            .source = .{ .inline_script = "#!/bin/sh\nexit 0\n" },
+        };
+    }
+    too_many.hooks = overflowing;
+
+    var diagnostics = try validate(std.testing.allocator, &too_many);
     defer diagnostics.deinit(std.testing.allocator);
     try std.testing.expect(diagnostics.hasErrors());
     var named = false;
@@ -11788,18 +11813,16 @@ test "the vm backend refuses a hook it has no channel to carry" {
             named = true;
         }
     }
-    // Named, and not left to a generic unsupported capability: a request whose
-    // hooks were dropped would publish an image the plan says had them.
     try std.testing.expect(named);
 
-    // The same hook on the backend that can run it is accepted, so the refusal
-    // is about the channel rather than about the hook.
-    var chroot = request;
+    // The same request on the backend whose channel is the filesystem is
+    // accepted, so the refusal is about the document rather than about hooks.
+    var chroot = too_many;
     chroot.execution.backend = .unsafe_chroot;
     chroot.execution.vm = null;
-    var accepted = try validate(std.testing.allocator, &chroot);
-    defer accepted.deinit(std.testing.allocator);
-    try std.testing.expect(!accepted.hasErrors());
+    var chroot_diagnostics = try validate(std.testing.allocator, &chroot);
+    defer chroot_diagnostics.deinit(std.testing.allocator);
+    try std.testing.expect(!chroot_diagnostics.hasErrors());
 }
 
 test "a hook clears preflight on the backend that runs it" {

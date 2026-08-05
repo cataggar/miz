@@ -248,8 +248,8 @@ pub fn run(
     }, drivers.modules);
     // The host refuses to emit a document it would refuse to read, so a
     // rejection here is a host bug rather than a guest-side surprise.
-    try control.validate();
-    const control_json = try std.json.Stringify.valueAlloc(work, control, .{});
+    try control.control.validate();
+    const control_json = try std.json.Stringify.valueAlloc(work, control.control, .{});
 
     // The agent and the control document first, so a module can never take
     // the name of either, then the modules in the order they are inserted.
@@ -364,6 +364,7 @@ pub fn run(
         .emulator_version = version,
         .modules = drivers.modules,
         .boot = boot_record,
+        .hooks = control.hooks,
     });
 }
 
@@ -417,18 +418,107 @@ fn buildControl(
     plan: *const customize.ResolvedPlan,
     devices: Devices,
     modules: []const vm_payload.Module,
-) !vm_control.Control {
+) !BuiltControl {
     const data = plan.data;
     const members = try allocator.alloc([]const u8, modules.len);
     for (modules, members) |module, *member| member.* = module.member_path;
-    return controlFromPolicy(allocator, io, .{
-        .packages = data.packages,
-        .initramfs = data.initramfs,
-        .network = data.execution.vm.?.network,
-        .devices = devices,
-        .modules = members,
-        .kernel_modules = data.os.kernel_modules,
-    });
+    const hooks = try buildHooks(allocator, io, data.hooks);
+    return .{
+        .control = try controlFromPolicy(allocator, io, .{
+            .packages = data.packages,
+            .initramfs = data.initramfs,
+            .network = data.execution.vm.?.network,
+            .devices = devices,
+            .modules = members,
+            .kernel_modules = data.os.kernel_modules,
+            .hooks = hooks.carried,
+        }),
+        .hooks = hooks.plans,
+    };
+}
+
+/// The control document, plus what the host must keep in order to read the
+/// result the guest sends back.
+///
+/// A hook's name, phase and digest are host-side facts: the guest is told the
+/// script and nothing about where it came from, and it reports only what each
+/// one did. Keeping them here is what lets provenance say the same thing on
+/// both backends without asking the guest to be believed about any of it.
+const BuiltControl = struct {
+    control: vm_control.Control,
+    hooks: []const HookPlan,
+};
+
+const HookPlan = struct {
+    name: []const u8,
+    phase: customize.HookPhase,
+    sha256: [32]u8,
+};
+
+const BuiltHooks = struct {
+    carried: []const vm_control.Hook,
+    plans: []const HookPlan,
+};
+
+/// Resolves each declared hook into the bytes the guest receives.
+///
+/// A `host_path` source is read here, on the host, exactly as the chroot
+/// backend reads it and for the same reason: a hook source resolved against
+/// the target would let the image being customized choose the code that
+/// customizes it. The guest has no host filesystem, so here or not at all.
+fn buildHooks(
+    allocator: Allocator,
+    io: Io,
+    hooks: []const customize.Hook,
+) !BuiltHooks {
+    const carried = try allocator.alloc(vm_control.Hook, hooks.len);
+    const plans = try allocator.alloc(HookPlan, hooks.len);
+    var total_script_bytes: usize = 0;
+    for (hooks, carried, plans) |hook, *target, *plan| {
+        const script = switch (hook.source) {
+            .inline_script => |bytes| bytes,
+            .host_path => |path| try Io.Dir.cwd().readFileAlloc(
+                io,
+                path,
+                allocator,
+                .limited(customize.max_hook_script_bytes + 1),
+            ),
+        };
+        // The same rule the request validator applied to an inline script,
+        // applied to bytes it could not see. A host path is read for the first
+        // time here, so this is the first boundary in a position to check it.
+        if (script.len == 0 or
+            script.len > customize.max_hook_script_bytes or
+            !std.mem.startsWith(u8, script, "#!"))
+        {
+            return error.HookScriptUnusable;
+        }
+        // Unlike every other bound on the document, this one depends on bytes
+        // that only exist once a host path has been read, so it is checked
+        // here rather than left to `Control.validate` -- where it would arrive
+        // as the host rejecting its own document.
+        total_script_bytes += script.len;
+        if (total_script_bytes > vm_control.max_hook_total_script_bytes) {
+            return error.HookScriptsTooLarge;
+        }
+
+        const size = std.base64.standard.Encoder.calcSize(script.len);
+        const buffer = try allocator.alloc(u8, size);
+        target.* = .{
+            .name = hook.name,
+            .phase = switch (hook.phase) {
+                .after_packages => .after_packages,
+                .before_initramfs => .before_initramfs,
+                .before_seal => .before_seal,
+                .finalize => .finalize,
+            },
+            .script_base64 = std.base64.standard.Encoder.encode(buffer, script),
+            .arguments = hook.arguments,
+        };
+        plan.* = .{ .name = hook.name, .phase = hook.phase, .sha256 = undefined };
+        std.crypto.hash.sha2.Sha256.hash(script, &plan.sha256, .{});
+    }
+    return .{ .carried = carried, .plans = plans };
 }
 
 const ControlInput = struct {
@@ -438,6 +528,7 @@ const ControlInput = struct {
     devices: Devices,
     modules: []const []const u8 = &.{},
     kernel_modules: []const customize.KernelModule = &.{},
+    hooks: []const vm_control.Hook = &.{},
 };
 
 fn controlFromPolicy(
@@ -555,6 +646,7 @@ fn controlFromPolicy(
         },
         .kernel_module_files = kernel_module_files,
         .modules = input.modules,
+        .hooks = input.hooks,
     };
 }
 
@@ -1153,7 +1245,44 @@ const ReportInput = struct {
     emulator_version: []const u8,
     modules: []const vm_payload.Module,
     boot: customize.VmBootRecord = .direct_kernel,
+    hooks: []const HookPlan = &.{},
 };
+
+/// Pairs what the host sent with what the guest says it did.
+///
+/// Position by position, and every one of them: a guest that skipped a hook,
+/// ran one twice, or ran one the document did not carry fails the run here
+/// rather than publishing an image whose provenance describes work that may
+/// not have happened. That is the failure #302 shipped -- a hook silently not
+/// run -- turned into something a result cannot express.
+///
+/// The name, phase and digest come from the host's own copy. The guest is
+/// asked only what it did, never what it was given.
+fn hookRecords(
+    allocator: Allocator,
+    plans: []const HookPlan,
+    outcomes: []const vm_control.HookOutcome,
+) ![]const customize.HookRecord {
+    if (outcomes.len != plans.len) return error.UnexecutedHook;
+    const records = try allocator.alloc(customize.HookRecord, plans.len);
+    for (outcomes, records, 0..) |outcome, *record, index| {
+        // `Result.validate` already held these strictly increasing, so one
+        // that is at its position is one that is in order and unique.
+        if (outcome.index != index) return error.UnexpectedHookOutcome;
+        const plan = plans[index];
+        // A hook that failed fails the run in the guest, so a result that
+        // arrives without a failure and with a nonzero exit code disagrees
+        // with itself.
+        if (outcome.exit_code != 0) return error.UnexpectedHookOutcome;
+        record.* = .{
+            .name = try allocator.dupe(u8, plan.name),
+            .phase = plan.phase,
+            .source_sha256 = .{ .bytes = plan.sha256 },
+            .exit_code = outcome.exit_code,
+        };
+    }
+    return records;
+}
 
 fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeReport {
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -1218,11 +1347,14 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
         };
     }
 
+    const hooks = try hookRecords(owned, input.hooks, input.result.hooks);
+
     return .{
         .arena = arena,
         .tools = tools,
         .installed_packages = packages,
         .package_lock = emitted_lock,
+        .hooks = hooks,
         .execution = .{
             .emulator_command = try owned.dupe(u8, input.policy.emulator_command),
             .emulator_version = try owned.dupe(u8, input.emulator_version),
@@ -1876,6 +2008,178 @@ test "the guest's accepted destinations are exactly what the host renders" {
     for (rendered, vm_control.kernel_module_config_paths) |host, guest| {
         try std.testing.expectEqualStrings(host, guest);
     }
+}
+
+test "the guest's hook bounds are exactly the library's" {
+    // Same reason as the destinations above: `vm_control` cannot name the
+    // `customize` constants it mirrors, so this is the only place the two can
+    // be held together. A library bound raised without the guest's would let a
+    // request the library accepted be refused by the document that carries it.
+    try std.testing.expectEqual(
+        customize.max_hook_script_bytes,
+        vm_control.max_hook_script_bytes,
+    );
+    try std.testing.expectEqual(
+        customize.max_hook_arguments,
+        vm_control.max_hook_arguments,
+    );
+    try std.testing.expectEqual(
+        customize.max_hook_argument_bytes,
+        vm_control.max_hook_argument_bytes,
+    );
+    // And the phases must agree in order, because both sides decide "may not
+    // move earlier than" by comparing tag values.
+    try std.testing.expectEqual(
+        @typeInfo(customize.HookPhase).@"enum".fields.len,
+        @typeInfo(vm_control.HookPhase).@"enum".fields.len,
+    );
+    inline for (
+        @typeInfo(customize.HookPhase).@"enum".fields,
+        @typeInfo(vm_control.HookPhase).@"enum".fields,
+    ) |library, guest| {
+        try std.testing.expectEqualStrings(library.name, guest.name);
+        try std.testing.expectEqual(library.value, guest.value);
+    }
+}
+
+test "a hook source is read on the host and carried to the guest verbatim" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+
+    const source_path = "test-vm-backend-hook-source.sh";
+    const script = "#!/bin/sh\necho carried\n";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    try writeFileBytes(io, source_path, script);
+
+    const hooks = [_]customize.Hook{
+        .{
+            .name = "inline",
+            .phase = .after_packages,
+            .source = .{ .inline_script = "#!/bin/sh\nexit 0\n" },
+            .arguments = &.{"--first"},
+        },
+        .{
+            .name = "from-host",
+            .phase = .finalize,
+            .source = .{ .host_path = source_path },
+        },
+    };
+    const built = try buildHooks(allocator, io, &hooks);
+    try std.testing.expectEqual(@as(usize, 2), built.carried.len);
+
+    // The bytes travel encoded, and they are the host's bytes: a hook source
+    // resolved against the target would let the image being customized choose
+    // the code that customizes it.
+    const carried = built.carried[1];
+    try std.testing.expectEqualStrings("from-host", carried.name);
+    const size = try vm_control.hookScriptSize(carried);
+    const decoded = try allocator.alloc(u8, size);
+    try vm_control.decodeHookScript(carried, decoded);
+    try std.testing.expectEqualStrings(script, decoded);
+
+    // The digest provenance will publish is computed here, from those bytes,
+    // and never asked of the guest.
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(script, &expected, .{});
+    try std.testing.expectEqualSlices(u8, &expected, &built.plans[1].sha256);
+    try std.testing.expectEqual(customize.HookPhase.finalize, built.plans[1].phase);
+
+    // The declared arguments are carried as declared, and the destination is
+    // not carried at all: the guest names the file from the hook's position,
+    // so the document has no way to say where a script lands.
+    try std.testing.expectEqualStrings("--first", built.carried[0].arguments[0]);
+    inline for (@typeInfo(vm_control.Hook).@"struct".fields) |field| {
+        try std.testing.expect(!std.mem.eql(u8, field.name, "path"));
+    }
+}
+
+test "a hook source that could not be run is refused before the guest boots" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+
+    // A host path is read for the first time here, so this is the first
+    // boundary in a position to check what it holds.
+    const source_path = "test-vm-backend-hook-no-interpreter.sh";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    try writeFileBytes(io, source_path, "echo no interpreter\n");
+    try std.testing.expectError(error.HookScriptUnusable, buildHooks(allocator, io, &.{.{
+        .name = "no-interpreter",
+        .phase = .finalize,
+        .source = .{ .host_path = source_path },
+    }}));
+
+    // The weight bound is checked here rather than in `Control.validate`,
+    // because only here have the host paths been read.
+    const oversized = try allocator.alloc(u8, customize.max_hook_script_bytes);
+    @memset(oversized, 'x');
+    oversized[0] = '#';
+    oversized[1] = '!';
+    const heavy = try allocator.alloc(
+        customize.Hook,
+        vm_control.max_hook_total_script_bytes / customize.max_hook_script_bytes + 1,
+    );
+    const names = try allocator.alloc([16]u8, heavy.len);
+    for (heavy, names, 0..) |*hook, *name, index| {
+        hook.* = .{
+            .name = std.fmt.bufPrint(name, "hook-{d}", .{index}) catch unreachable,
+            .phase = .finalize,
+            .source = .{ .inline_script = oversized },
+        };
+    }
+    try std.testing.expectError(
+        error.HookScriptsTooLarge,
+        buildHooks(allocator, io, heavy),
+    );
+}
+
+test "a result that does not account for every hook fails the run" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const plans = [_]HookPlan{
+        .{ .name = "first", .phase = .after_packages, .sha256 = @splat(1) },
+        .{ .name = "second", .phase = .finalize, .sha256 = @splat(2) },
+    };
+
+    const records = try hookRecords(allocator, &plans, &.{
+        .{ .index = 0, .exit_code = 0 },
+        .{ .index = 1, .exit_code = 0 },
+    });
+    try std.testing.expectEqual(@as(usize, 2), records.len);
+    try std.testing.expectEqualStrings("second", records[1].name);
+    try std.testing.expectEqual(customize.HookPhase.finalize, records[1].phase);
+    // The digest is the host's, not the guest's: the guest was never told it.
+    try std.testing.expectEqualSlices(
+        u8,
+        &plans[1].sha256,
+        &records[1].source_sha256.bytes,
+    );
+
+    // A hook silently not run is the failure #302 shipped. A result that
+    // reports fewer outcomes than the document carried hooks cannot be turned
+    // into provenance, so it cannot be published.
+    try std.testing.expectError(error.UnexecutedHook, hookRecords(allocator, &plans, &.{
+        .{ .index = 0, .exit_code = 0 },
+    }));
+
+    // Nor can one that ran something the document did not name at that
+    // position.
+    try std.testing.expectError(error.UnexpectedHookOutcome, hookRecords(allocator, &plans, &.{
+        .{ .index = 0, .exit_code = 0 },
+        .{ .index = 7, .exit_code = 0 },
+    }));
+
+    // A hook that failed fails the run inside the guest, so a result carrying
+    // no failure and a nonzero exit code disagrees with itself.
+    try std.testing.expectError(error.UnexpectedHookOutcome, hookRecords(allocator, &plans, &.{
+        .{ .index = 0, .exit_code = 0 },
+        .{ .index = 1, .exit_code = 3 },
+    }));
 }
 
 test "rendered kernel-module configuration reaches the control document" {

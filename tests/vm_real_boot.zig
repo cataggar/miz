@@ -60,6 +60,13 @@ const marker_path = guest_stub.marker_path;
 const marker_bytes = guest_stub.marker_bytes;
 const installed_nevra = guest_stub.installed_nevra;
 
+/// The hook the run declares: a script the host reads, carries through the
+/// control document, and the guest executes with the image's own interpreter.
+const hook_name = "records-its-arguments";
+const hook_phase: zvmi.customize.HookPhase = .after_packages;
+const hook_script = "#!" ++ guest_stub.hook_interpreter_path ++ "\n" ++
+    "# the interpreter never reads this; the kernel only needs the line above\n";
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     if (builtin.os.tag != .linux) {
@@ -189,9 +196,16 @@ fn runBoot(
         .storage = .{ .preserve = .{
             .root_partition = .{ .mbr_index = 1 },
         } },
+        .hooks = &.{.{
+            .name = hook_name,
+            .phase = hook_phase,
+            .source = .{ .inline_script = hook_script },
+            .arguments = &guest_stub.hook_arguments,
+        }},
         .execution = .{
             .workspace_path = work_path,
             .backend = .vm,
+            .acknowledge_unsafe = true,
             .vm = .{
                 .emulator_command = settings.emulator_path,
                 .acceleration = settings.acceleration,
@@ -276,10 +290,33 @@ fn runBoot(
     try ensure(preserved.installed_packages.len == 1);
     try ensure(std.mem.eql(u8, preserved.installed_packages[0], installed_nevra));
 
+    // The hook is recorded by the host's own account of what it sent: the name
+    // and phase the caller declared, and the digest of the bytes read here. The
+    // guest is never told any of the three, so agreement is not circular.
+    try ensure(preserved.hooks.len == 1);
+    const hook_record = preserved.hooks[0];
+    try ensure(std.mem.eql(u8, hook_record.name, hook_name));
+    try ensure(hook_record.phase == hook_phase);
+    try ensure(hook_record.exit_code == 0);
+    var hook_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(hook_script, &hook_digest, .{});
+    try ensure(std.mem.eql(u8, &hook_record.source_sha256.bytes, &hook_digest));
+
     // The marker is in the published image and not in the source, which is the
     // whole contract: the guest changed a copy and the original is untouched.
     try expectGuestFile(allocator, io, output_path, marker_path, marker_bytes);
     try expectMissingGuestFile(allocator, io, source_path, marker_path);
+    // And the hook's own marker, written by the guest's interpreter from the
+    // arguments the caller declared. Nothing the host runs could have produced
+    // it: on a cross-architecture run the host cannot execute that binary.
+    try expectGuestFile(
+        allocator,
+        io,
+        output_path,
+        guest_stub.hook_marker_path,
+        guest_stub.hook_marker_bytes,
+    );
+    try expectMissingGuestFile(allocator, io, source_path, guest_stub.hook_marker_path);
     const after = try digestOfFile(io, source_path);
     try ensure(std.mem.eql(u8, &after, &source_digest));
 
@@ -397,6 +434,13 @@ fn createSourceDisk(
     );
     try tree.putFileBytes(
         "usr/bin/rpm",
+        guest_stubs.get(@tagName(settings.architecture)).?,
+        .{ .mode = 0o755 },
+    );
+    // The same binary again, under the name the hook's `#!` line gives. A hook
+    // is only cross-architecture if the thing that runs it is the guest's.
+    try tree.putFileBytes(
+        std.mem.trimStart(u8, guest_stub.hook_interpreter_path, "/"),
         guest_stubs.get(@tagName(settings.architecture)).?,
         .{ .mode = 0o755 },
     );
