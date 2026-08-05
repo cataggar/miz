@@ -20,8 +20,8 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
-pub const control_version: u32 = 2;
-pub const result_version: u32 = 1;
+pub const control_version: u32 = 3;
+pub const result_version: u32 = 2;
 
 /// Path the host writes the control document to inside the initramfs, and the
 /// path the guest reads it back from once the kernel has unpacked rootfs.
@@ -39,6 +39,27 @@ pub const result_device_bytes: u64 = 16 * 1024 * 1024;
 /// Well above any real driver closure, so it bounds a malformed document
 /// rather than a real run.
 pub const max_modules: usize = 64;
+
+/// Bounds on the hooks a control document may carry. Kept equal to the
+/// `customize.max_hook_*` constants of the same names by a test in
+/// `vm_backend`, which is the one place that imports both.
+pub const max_hook_script_bytes: usize = 256 * 1024;
+pub const max_hook_arguments: usize = 64;
+pub const max_hook_argument_bytes: usize = 4096;
+
+/// How many hooks one control document may carry, and what they may weigh in
+/// total once decoded.
+///
+/// The count on its own would not bound the document. One hook may carry
+/// `max_hook_script_bytes`, so `max_hooks` of them is 16 MiB decoded and over
+/// 21 MiB base64-encoded -- past `max_control_bytes` before anything else in
+/// the document has been counted, which would turn a request the library
+/// accepted into an unexplained write failure. The total is the bound that
+/// actually holds; the count is what keeps a document of empty hooks from
+/// costing the guest an unbounded number of forks. Neither is a limit the
+/// library imposes, so both are refused by name where the document is built.
+pub const max_hooks: usize = 64;
+pub const max_hook_total_script_bytes: usize = 4 * 1024 * 1024;
 
 pub const Error = error{
     UnsupportedVersion,
@@ -70,6 +91,16 @@ pub const Error = error{
     InvalidPackagePin,
     DuplicatePackagePin,
     UnpinnedPackageAction,
+    InvalidHookName,
+    DuplicateHookName,
+    HookPhaseOutOfOrder,
+    InvalidHookScript,
+    InvalidHookArgument,
+    TooManyHookArguments,
+    TooManyHooks,
+    HookScriptsTooLarge,
+    UnexecutedHook,
+    UnexpectedHookOutcome,
 };
 
 pub const Network = union(enum) {
@@ -310,6 +341,47 @@ pub const kernel_module_config_paths = [_][]const u8{
     "etc/modprobe.d/zvmi-options.conf",
 };
 
+/// Mirrors `customize.HookPhase`, in declaration order, because the order is
+/// the meaning: a hook may not move earlier than the one declared before it,
+/// and both sides decide that by comparing tag values.
+pub const HookPhase = enum {
+    after_packages,
+    before_initramfs,
+    before_seal,
+    finalize,
+};
+
+/// Caller-supplied code the guest runs inside the target root.
+///
+/// The destination is deliberately absent. `TargetFile` carries a path because
+/// the host is the single source of what a request renders to; a hook is the
+/// opposite case -- the caller supplies the code and nothing else, so the
+/// guest names the file itself from the hook's position in this list. A
+/// control document therefore has no way to express where a script lands, and
+/// the hook channel cannot be turned into a file writer even by a host that
+/// wanted to.
+pub const Hook = struct {
+    /// Carried for diagnostics only: the guest reports failures by name so a
+    /// build log names the hook the caller declared rather than an index.
+    name: []const u8,
+    phase: HookPhase,
+    /// The script, base64-encoded. A script is whatever bytes the caller
+    /// wrote and JSON strings must be valid UTF-8, so it travels encoded for
+    /// the same reason `Repository.trust_base64` does.
+    script_base64: []const u8,
+    arguments: []const []const u8 = &.{},
+};
+
+/// What one hook did. Paired with the control document's hooks by position,
+/// which is what lets the host check that the guest ran every hook it was
+/// given and ran nothing else -- the failure #302 shipped, where a complete
+/// implementation was silently unreachable, is exactly the one an outcome
+/// list makes impossible to repeat.
+pub const HookOutcome = struct {
+    index: u32,
+    exit_code: u8,
+};
+
 pub const Control = struct {
     version: u32 = control_version,
     /// Block device holding the target root filesystem, e.g. `/dev/vda2`.
@@ -343,6 +415,10 @@ pub const Control = struct {
     /// order is what the guest obeys, and so the set folds into the control
     /// document's digest like every other instruction.
     modules: []const []const u8 = &.{},
+    /// Caller-supplied code, in the order it runs. Nondecreasing by phase, so
+    /// the guest can walk this list once per phase and still obey the order
+    /// the plan publishes.
+    hooks: []const Hook = &.{},
 
     pub fn validate(self: Control) Error!void {
         if (self.version != control_version) return error.UnsupportedVersion;
@@ -441,6 +517,8 @@ pub const Control = struct {
                 }
             }
         }
+
+        try validateHooks(self.hooks);
 
         switch (self.network) {
             .offline => if (self.actions.len != 0) {
@@ -583,6 +661,10 @@ pub const Result = struct {
     /// it settled on. The lock a later run would state to get this closure,
     /// emitted whether or not one was declared.
     package_lock: []const PackagePin = &.{},
+    /// What each hook the control document declared did, in the order they
+    /// ran. The host pairs these with the hooks it sent and refuses a result
+    /// that does not account for every one of them.
+    hooks: []const HookOutcome = &.{},
 
     /// The result is recorded in the host's provenance, so its shape is
     /// bounded here for the same reason the control document's is: a document
@@ -617,6 +699,16 @@ pub const Result = struct {
                 return error.InvalidFailureRecord;
             }
             if (failure.detail.len > 4096) return error.InvalidFailureRecord;
+        }
+        if (self.hooks.len > max_hooks) return error.ResultTooLarge;
+        for (self.hooks, 0..) |outcome, position| {
+            // Strictly increasing, so a result cannot report one hook twice to
+            // make up the count for one it skipped. Which indices those are is
+            // checked against the control document by the host, which is the
+            // only side that still has it.
+            if (position != 0 and outcome.index <= self.hooks[position - 1].index) {
+                return error.UnexpectedHookOutcome;
+            }
         }
     }
 };
@@ -697,6 +789,86 @@ pub fn validModuleMember(member: []const u8) bool {
         if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return false;
     }
     return true;
+}
+
+/// Mirrors `customize.validConfigName` as applied to a hook name, and
+/// `unsafe_chroot.validHookName`: the same value is re-checked at each
+/// privilege boundary it crosses rather than trusted because an earlier one
+/// looked at it.
+pub fn validHookName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 255 or name[0] == '.') return false;
+    return std.mem.indexOfAny(u8, name, "/\r\n\x00") == null;
+}
+
+/// Whether the encoded script names its own interpreter, decided without
+/// decoding it.
+///
+/// The first four base64 characters carry the first three bytes, which is one
+/// more than this needs. Deciding it here means `validate` enforces the rule
+/// where every other rule is enforced -- before the guest has allocated for
+/// the script, let alone written it anywhere.
+fn hookScriptNamesInterpreter(script_base64: []const u8) bool {
+    if (script_base64.len < 4) return false;
+    const head_source = script_base64[0..4];
+    const size = std.base64.standard.Decoder.calcSizeForSlice(head_source) catch return false;
+    if (size < 2) return false;
+    var head: [3]u8 = undefined;
+    std.base64.standard.Decoder.decode(head[0..size], head_source) catch return false;
+    return head[0] == '#' and head[1] == '!';
+}
+
+/// Holds a control document's hooks to the same model the library validated
+/// the request against.
+///
+/// Re-checked rather than trusted, because this runs in the guest against a
+/// document that arrived across the transport, and because the guest is about
+/// to write these bytes to an executable file and run them as root.
+fn validateHooks(hooks: []const Hook) Error!void {
+    if (hooks.len > max_hooks) return error.TooManyHooks;
+    var previous_phase: ?HookPhase = null;
+    var total_script_bytes: usize = 0;
+    for (hooks, 0..) |hook, index| {
+        if (!validHookName(hook.name)) return error.InvalidHookName;
+        for (hooks[0..index]) |earlier| {
+            if (std.mem.eql(u8, earlier.name, hook.name)) return error.DuplicateHookName;
+        }
+        if (previous_phase) |phase| {
+            if (@intFromEnum(hook.phase) < @intFromEnum(phase)) {
+                return error.HookPhaseOutOfOrder;
+            }
+        }
+        previous_phase = hook.phase;
+
+        const size = std.base64.standard.Decoder.calcSizeForSlice(hook.script_base64) catch
+            return error.InvalidHookScript;
+        if (size == 0 or size > max_hook_script_bytes) return error.InvalidHookScript;
+        if (!hookScriptNamesInterpreter(hook.script_base64)) return error.InvalidHookScript;
+        total_script_bytes += size;
+        if (total_script_bytes > max_hook_total_script_bytes) {
+            return error.HookScriptsTooLarge;
+        }
+
+        if (hook.arguments.len > max_hook_arguments) return error.TooManyHookArguments;
+        for (hook.arguments) |argument| {
+            if (argument.len > max_hook_argument_bytes) return error.InvalidHookArgument;
+            if (std.mem.indexOfScalar(u8, argument, 0) != null) {
+                return error.InvalidHookArgument;
+            }
+        }
+    }
+}
+
+/// The decoded length of a validated hook script. Separate from `validate` so
+/// the guest sizes its buffer from the same arithmetic the bound was checked
+/// against rather than from a second reading of the same string.
+pub fn hookScriptSize(hook: Hook) Error!usize {
+    return std.base64.standard.Decoder.calcSizeForSlice(hook.script_base64) catch
+        error.InvalidHookScript;
+}
+
+pub fn decodeHookScript(hook: Hook, into: []u8) Error!void {
+    std.base64.standard.Decoder.decode(into, hook.script_base64) catch
+        return error.InvalidHookScript;
 }
 
 pub fn validRepositoryUrl(url: []const u8) bool {
@@ -821,7 +993,7 @@ test "a version mismatch is refused by name even when the document is otherwise 
     // what it must report -- not the parse failure that happens to come first.
     try std.testing.expectError(error.UnsupportedVersion, parseControl(
         allocator,
-        \\{"version":3,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\{"version":4,"root_device":"/dev/vda2","result_device":"/dev/vdb",
         \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
         ,
     ));
@@ -830,7 +1002,7 @@ test "a version mismatch is refused by name even when the document is otherwise 
     // failure: the version claimed it would be understood, and it was not.
     try std.testing.expectError(error.UnknownField, parseControl(
         allocator,
-        \\{"version":2,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\{"version":3,"root_device":"/dev/vda2","result_device":"/dev/vdb",
         \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
         ,
     ));
@@ -942,7 +1114,7 @@ test "a control document the guest could be driven by is rejected" {
     }{
         .{ .expected = error.UnsupportedVersion, .control = blk: {
             var control = base;
-            control.version = 3;
+            control.version = control_version + 1;
             break :blk control;
         } },
         .{ .expected = error.InvalidDevicePath, .control = blk: {
@@ -1085,6 +1257,84 @@ test "a control document the guest could be driven by is rejected" {
             }};
             break :blk control;
         } },
+        // A hook is the one field a caller fills with code rather than
+        // configuration, and the guest is about to make these bytes executable
+        // and run them as root. Every rule the library applied to the request
+        // is applied again here, to the document that actually arrived.
+        .{ .expected = error.InvalidHookName, .control = blk: {
+            var control = base;
+            control.hooks = &.{.{
+                .name = "../../etc/cron.d/evil",
+                .phase = .finalize,
+                .script_base64 = "IyEvYmluL3NoCmV4aXQgMAo=",
+            }};
+            break :blk control;
+        } },
+        .{ .expected = error.DuplicateHookName, .control = blk: {
+            var control = base;
+            control.hooks = &.{
+                .{ .name = "same", .phase = .finalize, .script_base64 = "IyEvYmluL3NoCmV4aXQgMAo=" },
+                .{ .name = "same", .phase = .finalize, .script_base64 = "IyEvYmluL3NoCmV4aXQgMAo=" },
+            };
+            break :blk control;
+        } },
+        .{ .expected = error.HookPhaseOutOfOrder, .control = blk: {
+            var control = base;
+            control.hooks = &.{
+                .{ .name = "late", .phase = .finalize, .script_base64 = "IyEvYmluL3NoCmV4aXQgMAo=" },
+                .{ .name = "early", .phase = .after_packages, .script_base64 = "IyEvYmluL3NoCmV4aXQgMAo=" },
+            };
+            break :blk control;
+        } },
+        // No shebang: a script that does not name its own interpreter is one
+        // whose meaning depends on who runs it.
+        .{ .expected = error.InvalidHookScript, .control = blk: {
+            var control = base;
+            control.hooks = &.{.{
+                .name = "no-interpreter",
+                .phase = .finalize,
+                .script_base64 = "ZXhpdCAwCg==",
+            }};
+            break :blk control;
+        } },
+        .{ .expected = error.InvalidHookScript, .control = blk: {
+            var control = base;
+            control.hooks = &.{.{
+                .name = "not-base64",
+                .phase = .finalize,
+                .script_base64 = "not valid base64!",
+            }};
+            break :blk control;
+        } },
+        .{ .expected = error.InvalidHookScript, .control = blk: {
+            var control = base;
+            control.hooks = &.{.{
+                .name = "empty",
+                .phase = .finalize,
+                .script_base64 = "",
+            }};
+            break :blk control;
+        } },
+        .{ .expected = error.InvalidHookArgument, .control = blk: {
+            var control = base;
+            control.hooks = &.{.{
+                .name = "nul-argument",
+                .phase = .finalize,
+                .script_base64 = "IyEvYmluL3NoCmV4aXQgMAo=",
+                .arguments = &.{"first\x00second"},
+            }};
+            break :blk control;
+        } },
+        .{ .expected = error.TooManyHookArguments, .control = blk: {
+            var control = base;
+            control.hooks = &.{.{
+                .name = "wordy",
+                .phase = .finalize,
+                .script_base64 = "IyEvYmluL3NoCmV4aXQgMAo=",
+                .arguments = &([_][]const u8{"x"} ** (max_hook_arguments + 1)),
+            }};
+            break :blk control;
+        } },
     };
 
     for (cases, 0..) |case, index| {
@@ -1093,6 +1343,120 @@ test "a control document the guest could be driven by is rejected" {
             return err;
         };
     }
+}
+
+test "the hook channel is bounded by weight, not only by count" {
+    const allocator = std.testing.allocator;
+    const base = Control{
+        .root_device = "/dev/vda2",
+        .result_device = "/dev/vdb",
+        .network = .offline,
+    };
+
+    // `max_hooks` scripts of `max_hook_script_bytes` would be 16 MiB decoded
+    // and over 21 MiB encoded -- past `max_control_bytes` before the rest of
+    // the document is counted. The count bound alone would let that through,
+    // which is the whole reason the total exists.
+    const oversized = try allocator.alloc(u8, max_hook_script_bytes);
+    defer allocator.free(oversized);
+    @memset(oversized, 'x');
+    oversized[0] = '#';
+    oversized[1] = '!';
+    const encoded = try allocator.alloc(
+        u8,
+        std.base64.standard.Encoder.calcSize(oversized.len),
+    );
+    defer allocator.free(encoded);
+    const script_base64 = std.base64.standard.Encoder.encode(encoded, oversized);
+
+    const heavy = try allocator.alloc(Hook, max_hook_total_script_bytes / max_hook_script_bytes + 1);
+    defer allocator.free(heavy);
+    const names = try allocator.alloc([16]u8, heavy.len);
+    defer allocator.free(names);
+    for (heavy, names, 0..) |*hook, *name, index| {
+        hook.* = .{
+            .name = std.fmt.bufPrint(name, "hook-{d}", .{index}) catch unreachable,
+            .phase = .finalize,
+            .script_base64 = script_base64,
+        };
+    }
+    var weighty = base;
+    weighty.hooks = heavy;
+    try std.testing.expect(heavy.len <= max_hooks);
+    try std.testing.expectError(error.HookScriptsTooLarge, weighty.validate());
+
+    // And the count still bounds a document of hooks light enough that the
+    // total never fires: an empty-script hook is a fork the guest performs.
+    const many = try allocator.alloc(Hook, max_hooks + 1);
+    defer allocator.free(many);
+    const light_names = try allocator.alloc([16]u8, many.len);
+    defer allocator.free(light_names);
+    for (many, light_names, 0..) |*hook, *name, index| {
+        hook.* = .{
+            .name = std.fmt.bufPrint(name, "hook-{d}", .{index}) catch unreachable,
+            .phase = .finalize,
+            .script_base64 = "IyEvYmluL3NoCmV4aXQgMAo=",
+        };
+    }
+    var numerous = base;
+    numerous.hooks = many;
+    try std.testing.expectError(error.TooManyHooks, numerous.validate());
+}
+
+test "a hook survives the control document unchanged" {
+    const allocator = std.testing.allocator;
+    const script = "#!/bin/sh\nexit 0\n";
+
+    var control = Control{
+        .root_device = "/dev/vda2",
+        .result_device = "/dev/vdb",
+        .network = .offline,
+    };
+    control.hooks = &.{.{
+        .name = "seal-check",
+        .phase = .before_seal,
+        .script_base64 = "IyEvYmluL3NoCmV4aXQgMAo=",
+        .arguments = &.{ "--strict", "/etc" },
+    }};
+    try control.validate();
+
+    const bytes = try std.json.Stringify.valueAlloc(allocator, control, .{});
+    defer allocator.free(bytes);
+    const parsed = try parseControl(allocator, bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.hooks.len);
+    const hook = parsed.value.hooks[0];
+    try std.testing.expectEqualStrings("seal-check", hook.name);
+    try std.testing.expectEqual(HookPhase.before_seal, hook.phase);
+    try std.testing.expectEqual(@as(usize, 2), hook.arguments.len);
+
+    // The bytes the guest will make executable are the bytes the host had.
+    const size = try hookScriptSize(hook);
+    const decoded = try allocator.alloc(u8, size);
+    defer allocator.free(decoded);
+    try decodeHookScript(hook, decoded);
+    try std.testing.expectEqualStrings(script, decoded);
+}
+
+test "a result cannot account for a hook twice to cover one it skipped" {
+    const complete = Result{ .hooks = &.{
+        .{ .index = 0, .exit_code = 0 },
+        .{ .index = 1, .exit_code = 0 },
+    } };
+    try complete.validate();
+
+    const repeated = Result{ .hooks = &.{
+        .{ .index = 0, .exit_code = 0 },
+        .{ .index = 0, .exit_code = 0 },
+    } };
+    try std.testing.expectError(error.UnexpectedHookOutcome, repeated.validate());
+
+    const reordered = Result{ .hooks = &.{
+        .{ .index = 1, .exit_code = 0 },
+        .{ .index = 0, .exit_code = 0 },
+    } };
+    try std.testing.expectError(error.UnexpectedHookOutcome, reordered.validate());
 }
 
 test "a sealed result round-trips through the block-device frame" {
