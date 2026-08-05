@@ -117,6 +117,11 @@ const Session = struct {
     /// one ran.
     resolver_state: enum { untouched, replaced_nothing, replaced_original } = .untouched,
     repositories_written: []const control_mod.Repository = &.{},
+    /// The bytes read off the credential device, held so teardown can overwrite
+    /// them. Every password the run uses is a slice of this one buffer -- the
+    /// blob is read in place rather than parsed into allocations -- so this is
+    /// the only thing that has to be scrubbed.
+    credential_bytes: ?[]u8 = null,
 
     fn run(self: *Session) Outcome {
         const bytes = readFileAlloc(
@@ -143,6 +148,12 @@ const Session = struct {
                 return fail("network", "static network configuration failed");
             },
         }
+
+        // Read before the target root is mounted, so material that cannot be
+        // obtained fails the run before the image has been touched.
+        self.readCredentials(control) catch |err| {
+            return fail("read-credentials", @errorName(err));
+        };
 
         self.mountTarget(control.root_device) catch |err| {
             return fail("mount-root", @errorName(err));
@@ -420,6 +431,43 @@ const Session = struct {
         self.run_mounted = true;
     }
 
+    /// Loads the credential device the control document named, if it named
+    /// one.
+    ///
+    /// The device is a raw disk whose contents are framed and digested exactly
+    /// like the result device, so a guest that is handed the wrong device --
+    /// or a truncated one, or one written by something else -- refuses rather
+    /// than rendering whatever bytes it found into a repository file and
+    /// sending them to a server.
+    fn readCredentials(self: *Session, control: control_mod.Control) !void {
+        const device = control.credential_device orelse return;
+        const bytes = try readDeviceAlloc(
+            self.allocator,
+            device,
+            control_mod.credential_device_bytes,
+        );
+        self.credential_bytes = bytes;
+        // Parsed once here so a malformed device fails before the image is
+        // mounted rather than part-way through writing repository files.
+        _ = try control_mod.parseCredentials(bytes);
+    }
+
+    /// The material for a repository, borrowed from the device buffer.
+    fn credentialFor(
+        self: *Session,
+        repository: control_mod.Repository,
+    ) !?control_mod.BasicMaterial {
+        const declared = repository.credential orelse return null;
+        const bytes = self.credential_bytes orelse return error.MissingCredentialDevice;
+        const credentials = try control_mod.parseCredentials(bytes);
+        return switch (declared) {
+            .basic => |basic| control_mod.BasicMaterial{
+                .username = basic.username,
+                .password = try credentials.password(basic.password_index),
+            },
+        };
+    }
+
     fn writeRepositoryFiles(self: *Session, control: control_mod.Control) !void {
         if (control.repositories.len == 0) return;
         try mkdirPath(guest_root ++ repository_directory);
@@ -434,7 +482,19 @@ const Session = struct {
                 repository_directory ++ "/{s}.repo",
                 .{repository.id},
             );
-            try self.writeGuestFile(path, try renderRepositoryFile(self.allocator, repository));
+            const material = try self.credentialFor(repository);
+            const body = try renderRepositoryFile(self.allocator, repository, material);
+            // The rendered body holds the password, so it is overwritten as
+            // soon as it has been written out. The file itself lives on the
+            // private `/run` tmpfs, which is unmounted before anything is
+            // published, and is readable only by the package manager's own
+            // uid -- the same mode the chroot backend uses, for the same
+            // reason.
+            defer if (material != null) @memset(@constCast(body), 0);
+            try self.writeGuestFileMode(path, body, if (material == null)
+                0o644
+            else
+                0o600);
         }
         self.repositories_written = control.repositories;
 
@@ -525,7 +585,7 @@ const Session = struct {
                 .{file.path},
             );
             try mkdirParents(self.allocator, path);
-            try writeFileBytes(self.allocator, path, file.contents);
+            try writeFileBytes(self.allocator, path, file.contents, 0o644);
             // A truncating open leaves an existing file's mode alone, so the
             // `0o644` `writeFileBytes` asks for only applies when it creates
             // the file. `modprobe` parses these as root at boot, so a mode
@@ -727,12 +787,21 @@ const Session = struct {
     }
 
     fn writeGuestFile(self: *Session, guest_path: []const u8, bytes: []const u8) !void {
+        try self.writeGuestFileMode(guest_path, bytes, 0o644);
+    }
+
+    fn writeGuestFileMode(
+        self: *Session,
+        guest_path: []const u8,
+        bytes: []const u8,
+        mode: linux.mode_t,
+    ) !void {
         const host_path = try std.fmt.allocPrint(
             self.allocator,
             guest_root ++ "{s}",
             .{guest_path},
         );
-        try writeFileBytes(self.allocator, host_path, bytes);
+        try writeFileBytes(self.allocator, host_path, bytes, mode);
     }
 
     /// Writes a file the guest is about to execute.
@@ -777,6 +846,12 @@ const Session = struct {
     /// outcome was: a failed run must still leave the image as it found it,
     /// minus whatever the package manager itself already committed.
     fn teardown(self: *Session) void {
+        // First, and unconditionally: whatever else fails to unwind, the
+        // material must not still be in this process's memory afterwards.
+        if (self.credential_bytes) |bytes| {
+            @memset(bytes, 0);
+            self.credential_bytes = null;
+        }
         self.removeRepositoryFiles();
         self.restoreResolver();
         if (self.run_mounted) unmount(guest_root ++ "/run");
@@ -829,10 +904,16 @@ const Session = struct {
 fn renderRepositoryFile(
     allocator: Allocator,
     repository: control_mod.Repository,
+    credential: ?control_mod.BasicMaterial,
 ) ![]const u8 {
-    // The VM backend refuses a credentialed repository at validation, so the
-    // guest has nothing to render and no channel that could have carried it.
-    return control_mod.renderRepositoryBody(allocator, repository.id, repository.urls, null);
+    // The same renderer the chroot backend calls, so the same declaration
+    // produces the same bytes whichever backend carries it out.
+    return control_mod.renderRepositoryBody(
+        allocator,
+        repository.id,
+        repository.urls,
+        credential,
+    );
 }
 
 fn renderResolver(allocator: Allocator, config: control_mod.NetworkConfig) ![]const u8 {
@@ -1228,6 +1309,48 @@ fn sleepMilliseconds(milliseconds: u32) void {
     _ = linux.nanosleep(&request, null);
 }
 
+/// Reads a whole block device into one exact allocation.
+///
+/// Deliberately not `readFileAlloc`: that grows a list and reads through a
+/// stack buffer, so a secret read with it would be left behind in the stack
+/// frame and in every intermediate allocation the growth abandoned -- and this
+/// agent's arena is never reset, so abandoned is not the same as gone. One
+/// allocation read into directly is one thing to scrub.
+fn readDeviceAlloc(allocator: Allocator, device: []const u8, size: u64) ![]u8 {
+    const device_z = try allocator.dupeZ(u8, device);
+    defer allocator.free(device_z);
+    const fd_raw = linux.open(device_z, .{ .ACCMODE = .RDONLY }, 0);
+    switch (linux.errno(fd_raw)) {
+        .SUCCESS => {},
+        else => return error.OpenFailed,
+    }
+    const fd: i32 = @intCast(fd_raw);
+    defer _ = linux.close(fd);
+
+    const buffer = try allocator.alloc(u8, @intCast(size));
+    errdefer {
+        @memset(buffer, 0);
+        allocator.free(buffer);
+    }
+    @memset(buffer, 0);
+    var filled: usize = 0;
+    while (filled < buffer.len) {
+        const rc = linux.read(fd, buffer.ptr + filled, buffer.len - filled);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return error.ReadFailed,
+        }
+        const count: usize = @intCast(rc);
+        // A device shorter than the host said it would be is not fatal on its
+        // own: the frame carries its own length and digest, so a truncated
+        // read fails there, by name.
+        if (count == 0) break;
+        filled += count;
+    }
+    return buffer;
+}
+
 fn readFileAlloc(allocator: Allocator, path: []const u8, limit: usize) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
     const fd_raw = linux.open(path_z, .{ .ACCMODE = .RDONLY }, 0);
@@ -1345,12 +1468,17 @@ fn writeNewFileBytes(allocator: Allocator, path: []const u8, bytes: []const u8) 
     try writeAll(fd, bytes);
 }
 
-fn writeFileBytes(allocator: Allocator, path: []const u8, bytes: []const u8) !void {
+fn writeFileBytes(
+    allocator: Allocator,
+    path: []const u8,
+    bytes: []const u8,
+    mode: linux.mode_t,
+) !void {
     const path_z = try allocator.dupeZ(u8, path);
     const fd_raw = linux.open(
         path_z,
         .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
-        0o644,
+        mode,
     );
     if (linux.errno(fd_raw) != .SUCCESS) return error.OpenFailed;
     const fd: i32 = @intCast(fd_raw);
@@ -1381,7 +1509,7 @@ test "the generated repository file enables exactly the declared repository" {
             "https://mirror.invalid/base",
         },
         .trust_base64 = &.{"a2V5"},
-    });
+    }, null);
     try std.testing.expectEqualStrings(
         \\[azurelinux-base]
         \\name=zvmi-azurelinux-base
@@ -1390,6 +1518,26 @@ test "the generated repository file enables exactly the declared repository" {
         \\baseurl=https://packages.microsoft.com/azurelinux/3.0/prod/base/x86_64 https://mirror.invalid/base
         \\
     , rendered);
+
+    // The same declaration with material resolved for it gains the two lines
+    // tdnf reads and nothing else, so a credentialed repository differs from
+    // an anonymous one only where it has to.
+    const authenticated = try renderRepositoryFile(arena.allocator(), .{
+        .id = "azurelinux-base",
+        .urls = &.{"https://packages.microsoft.com/azurelinux/3.0/prod/base/x86_64"},
+        .trust_base64 = &.{"a2V5"},
+        .credential = .{ .basic = .{ .username = "builder", .password_index = 0 } },
+    }, .{ .username = "builder", .password = "s3cr3t" });
+    try std.testing.expectEqualStrings(
+        \\[azurelinux-base]
+        \\name=zvmi-azurelinux-base
+        \\enabled=1
+        \\gpgcheck=1
+        \\baseurl=https://packages.microsoft.com/azurelinux/3.0/prod/base/x86_64
+        \\username=builder
+        \\password=s3cr3t
+        \\
+    , authenticated);
 }
 
 test "the generated resolver names every declared nameserver" {
@@ -1464,12 +1612,12 @@ test "kernel discovery follows dracut's rule and refuses to find nothing" {
     // touched, and a name no control document would have been allowed to
     // carry.
     try mkdirPath(modules_path ++ "/6.12.0-2.azl");
-    try writeFileBytes(allocator, modules_path ++ "/6.12.0-2.azl/modules.dep", "");
+    try writeFileBytes(allocator, modules_path ++ "/6.12.0-2.azl/modules.dep", "", 0o644);
     try mkdirPath(modules_path ++ "/6.12.0-10.azl");
-    try writeFileBytes(allocator, modules_path ++ "/6.12.0-10.azl/modules.dep.bin", "");
+    try writeFileBytes(allocator, modules_path ++ "/6.12.0-10.azl/modules.dep.bin", "", 0o644);
     try mkdirPath(modules_path ++ "/firmware");
     try mkdirPath(modules_path ++ "/6.12.0 spaced");
-    try writeFileBytes(allocator, modules_path ++ "/6.12.0 spaced/modules.dep", "");
+    try writeFileBytes(allocator, modules_path ++ "/6.12.0 spaced/modules.dep", "", 0o644);
 
     const found = try discoverKernels(allocator, modules_path);
     try std.testing.expectEqual(@as(usize, 2), found.len);
@@ -1501,7 +1649,7 @@ test "kernel discovery follows dracut's rule and refuses to find nothing" {
     // accepted as "nothing is stale" whenever the host derived the
     // regeneration, so this has to reach the caller as a failure.
     try mkdirPath(modules_path ++ "/6.12.0-locked.azl");
-    try writeFileBytes(allocator, modules_path ++ "/6.12.0-locked.azl/modules.dep", "");
+    try writeFileBytes(allocator, modules_path ++ "/6.12.0-locked.azl/modules.dep", "", 0o644);
     try setMode(allocator, modules_path ++ "/6.12.0-locked.azl", 0o000);
     defer setMode(allocator, modules_path ++ "/6.12.0-locked.azl", 0o755) catch {};
     try std.testing.expectError(
@@ -1523,7 +1671,7 @@ test "every directory leading to a rendered destination is created" {
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, base) catch {};
     const path = base ++ "/etc/modprobe.d/zvmi-blacklist.conf";
     try mkdirParents(allocator, path);
-    try writeFileBytes(allocator, path, "blacklist floppy\n");
+    try writeFileBytes(allocator, path, "blacklist floppy\n", 0o644);
 
     try std.testing.expect(isDirectory(base ++ "/etc/modprobe.d"));
     try std.testing.expect(!isDirectory(path));
