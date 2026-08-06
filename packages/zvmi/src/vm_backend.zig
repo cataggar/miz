@@ -292,6 +292,17 @@ pub fn run(
     try control.control.validate();
     const control_json = try std.json.Stringify.valueAlloc(work, control.control, .{});
 
+    // Read here, in the process that is about to start the emulator, because
+    // that is the process libslirp reads it in: `10.0.2.3` is a forwarder to
+    // whatever `get_dns_addr` returns, which on Linux is `/etc/resolv.conf` of
+    // the emulator process. The guest cannot report this -- it never sees the
+    // file -- and the control document carries only slirp's own address, which
+    // says nothing about where the answers came from.
+    const host_resolver = if (resolvesThroughHost(data.packages, data.execution))
+        hashHostResolver(work, io) catch null
+    else
+        null;
+
     // The agent and the control document first, so a module can never take
     // the name of either, then the modules in the order they are inserted.
     var members: std.array_list.Managed(vm_payload.Member) = .init(work);
@@ -415,7 +426,39 @@ pub fn run(
         .modules = drivers.modules,
         .boot = boot_record,
         .hooks = control.hooks,
+        .host_resolver = host_resolver,
     });
+}
+
+/// Whether this run's package transaction resolves names through the build
+/// machine. The same condition the `read_host_resolver` capability is declared
+/// under, so the record and the declaration cannot disagree.
+fn resolvesThroughHost(
+    packages: customize.PackagePolicy,
+    execution: customize.ExecutionPolicy,
+) bool {
+    if (packages.actions.len == 0) return false;
+    if (packages.resolver != .host_resolver) return false;
+    if (customize.offlinePackageCache(packages.cache)) return false;
+    const vm = execution.vm orelse return false;
+    return vm.network == .declared_repositories;
+}
+
+/// Digests the build machine's own resolver. A host with none is not a
+/// failure: a transaction whose repository URLs are literal addresses resolves
+/// no names at all, which is why the capability is a declaration rather than a
+/// probe.
+fn hashHostResolver(allocator: Allocator, io: Io) !customize.HostResolverRecord {
+    const bytes = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "/etc/resolv.conf",
+        allocator,
+        .limited(1 << 20),
+    );
+    defer allocator.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return .{ .sha256 = .{ .bytes = digest }, .size = bytes.len };
 }
 
 const Layout = struct {
@@ -1550,6 +1593,7 @@ const ReportInput = struct {
     modules: []const vm_payload.Module,
     boot: customize.VmBootRecord = .direct_kernel,
     hooks: []const HookPlan = &.{},
+    host_resolver: ?customize.HostResolverRecord = null,
 };
 
 /// Pairs what the host sent with what the guest says it did.
@@ -1723,6 +1767,7 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
         .tools = tools,
         .installed_packages = packages,
         .imported_trust_keys = trust_keys,
+        .host_resolver = input.host_resolver,
         .package_lock = emitted_lock,
         .hooks = hooks,
         .selinux_relabel = relabel,

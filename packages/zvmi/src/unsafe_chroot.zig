@@ -383,6 +383,7 @@ const WorkerReport = struct {
     package_cache: ?customize.PackageCacheRecord = null,
     selinux_relabel: ?customize.SelinuxRelabelRecord = null,
     initramfs: ?customize.InitramfsRecord = null,
+    host_resolver: ?customize.HostResolverRecord = null,
 };
 
 fn classifyRunFailure(err: anyerror) RunOutcome {
@@ -498,6 +499,7 @@ fn executeManifest(
             .boot_configuration = session.boot_configuration,
             .package_cache = session.package_cache,
             .selinux_relabel = session.selinux_relabel,
+            .host_resolver = session.host_resolver,
             .initramfs = if (session.initramfs_regenerated) .{
                 .skipped_kernel_releases = session.skipped_kernels.items,
                 .images = session.initramfs_images.items,
@@ -554,6 +556,9 @@ const Session = struct {
     boot_configuration: ?customize.BootConfigurationRecord = null,
     package_cache: ?customize.PackageCacheRecord = null,
     selinux_relabel: ?customize.SelinuxRelabelRecord = null,
+    /// Set exactly when this run bound the build machine's own resolver into
+    /// the target for the package transaction.
+    host_resolver: ?customize.HostResolverRecord = null,
     /// Whether an initramfs regeneration was attempted at all, which is not
     /// the same as whether one produced an image: a derived regeneration that
     /// found no installed kernel is a successful run that regenerated nothing,
@@ -741,6 +746,11 @@ const Session = struct {
             defer self.allocator.free(resolver_run_path);
             switch (self.manifest.packages.resolver) {
                 .host_resolver => {
+                    // Digested before the bind, which is the only moment this
+                    // backend has the host's own file open on its own account.
+                    // The bytes, not their content: what they name is this
+                    // machine's DNS topology, which the caller never declared.
+                    try self.recordHostResolver("/etc/resolv.conf");
                     try writeBytesExclusive(self.io, resolver_run_path, "", default_repository_permissions);
                     try self.runSuccess(&.{
                         findTool(self.io, mount_candidates).?,
@@ -797,6 +807,27 @@ const Session = struct {
                 .{},
             );
         }
+    }
+
+    /// Digests the build machine's own resolver, streamed rather than read
+    /// whole: nothing bounds a file this backend did not write.
+    fn recordHostResolver(self: *Session, host_path: []const u8) !void {
+        const file = try Io.Dir.cwd().openFile(self.io, host_path, .{});
+        defer file.close(self.io);
+        const size = (try file.stat(self.io)).size;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        var offset: u64 = 0;
+        while (offset < size) {
+            const length: usize = @intCast(@min(size - offset, buffer.len));
+            const read = try file.readPositionalAll(self.io, buffer[0..length], offset);
+            if (read != length) return error.ShortResolverRead;
+            hash.update(buffer[0..length]);
+            offset += length;
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        self.host_resolver = .{ .sha256 = .{ .bytes = digest }, .size = size };
     }
 
     fn runPolicy(self: *Session) !void {
@@ -3425,6 +3456,7 @@ fn loadParentReport(
         .boot_configuration = parsed.value.boot_configuration,
         .package_cache = parsed.value.package_cache,
         .selinux_relabel = parsed.value.selinux_relabel,
+        .host_resolver = parsed.value.host_resolver,
         .initramfs = parsed.value.initramfs,
     };
 }
@@ -3818,6 +3850,34 @@ test "worker executes policy with strict reverse cleanup" {
         "zlib-0:1.3-2.aarch64",
         result.report.installed_packages[1],
     );
+    // The one input a plan cannot carry. `host_resolver` is the default, so
+    // this is the ordinary case: the transaction resolved its repository names
+    // through whatever this machine happens to be pointed at, and the run
+    // recorded nothing about it. Digest and size only -- what the file names
+    // is this machine's DNS topology, which no caller declared and no
+    // published image should carry.
+    if (isRegularFileFollow(io, "/etc/resolv.conf")) {
+        const resolver = result.report.host_resolver orelse
+            return error.TestExpectedHostResolverRecord;
+        const bytes = try Io.Dir.cwd().readFileAlloc(
+            io,
+            "/etc/resolv.conf",
+            allocator,
+            .limited(1 << 20),
+        );
+        var expected: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &expected, .{});
+        try std.testing.expectEqual(@as(u64, bytes.len), resolver.size);
+        try std.testing.expectEqualSlices(u8, &expected, &resolver.sha256.bytes);
+    } else {
+        // A build machine with no resolver of its own lends none, and the
+        // record says so rather than describing a bind that did not happen.
+        try std.testing.expectEqual(
+            @as(?customize.HostResolverRecord, null),
+            result.report.host_resolver,
+        );
+    }
+
     try std.testing.expect(context.saw_rpm_import);
     try std.testing.expect(context.saw_tdnf_install);
     try std.testing.expect(context.saw_tdnf_remove);
@@ -6081,6 +6141,8 @@ test "a relabel records the mode the target will boot under" {
         .packages = .{
             .actions = &.{.{ .install = &.{"dracut"} }},
             .repositories = &repositories,
+            // Declared, so this run inherits nothing from the build machine.
+            .resolver = .{ .nameservers = &.{"192.0.2.1"} },
         },
         .initramfs = .unchanged,
         .selinux = .relabel,
@@ -6109,6 +6171,14 @@ test "a relabel records the mode the target will boot under" {
         relabel.target_mode,
     );
     try std.testing.expectEqualStrings("targeted", relabel.discovered_policy);
+
+    // Nothing was inherited, so nothing is recorded. Absent means the plan
+    // already carries the answer -- it names the nameservers -- rather than
+    // that the question went unasked.
+    try std.testing.expectEqual(
+        @as(?customize.HostResolverRecord, null),
+        result.report.host_resolver,
+    );
 }
 
 test "a relabel a target cannot satisfy fails the run rather than skipping it" {

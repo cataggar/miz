@@ -6115,6 +6115,11 @@ pub const UnsafeChrootRuntimeReport = struct {
     tools: []const ToolRecord,
     installed_packages: []const []const u8,
     imported_trust_keys: []const []const u8 = &.{},
+    /// Present exactly when the run resolved package repository names through
+    /// this machine's own resolver. Absent when the request declared its
+    /// nameservers -- the plan carries those -- or when nothing resolved a
+    /// name at all.
+    host_resolver: ?HostResolverRecord = null,
     package_lock: []const PackageVersionLock = &.{},
     hooks: []const HookRecord = &.{},
     /// Present exactly when the request asked for a kernel-argument change.
@@ -6224,6 +6229,11 @@ pub const VmRuntimeReport = struct {
     tools: []const ToolRecord,
     installed_packages: []const []const u8,
     imported_trust_keys: []const []const u8 = &.{},
+    /// Present exactly when the run resolved package repository names through
+    /// this machine's own resolver. Absent when the request declared its
+    /// nameservers -- the plan carries those -- or when nothing resolved a
+    /// name at all.
+    host_resolver: ?HostResolverRecord = null,
     package_lock: []const PackageVersionLock = &.{},
     hooks: []const HookRecord = &.{},
     /// Present exactly when the guest relabelled the root.
@@ -6303,6 +6313,25 @@ pub const PartitionStyleRecord = struct {
 /// keeps the initramfs the package transaction just invalidated, and nothing
 /// else a run publishes distinguishes "the image had one kernel" from "it had
 /// three and two were not recognised".
+/// The build machine's own `/etc/resolv.conf`, as this run found it.
+///
+/// A digest and not the content. What the file names is this machine's
+/// internal DNS topology, which the caller never declared and a published
+/// image has no business carrying; the digest still supports the only claim
+/// worth making about it -- two runs resolved through the same thing, or they
+/// did not.
+///
+/// Not a `SourceRecord`. Sources are re-read at the end of the run and
+/// compared, and a lease renewal between the two reads would fail a build that
+/// did nothing wrong. This is an observation of an input, recorded where
+/// observations go.
+pub const HostResolverRecord = struct {
+    sha256: Digest,
+    /// Bytes, so a reader can tell an empty resolver from an absent one
+    /// without knowing the digest of nothing.
+    size: u64,
+};
+
 pub const SkippedKernelRelease = struct {
     name: []const u8,
     reason: SkippedKernelReason,
@@ -6393,6 +6422,11 @@ pub const PreservedExecutionRecord = struct {
     /// Empty for a run with no package actions, where no inventory is read at
     /// all.
     imported_trust_keys: []const []const u8 = &.{},
+    /// Present exactly when the run resolved package repository names through
+    /// this machine's own resolver. Absent when the request declared its
+    /// nameservers -- the plan carries those -- or when nothing resolved a
+    /// name at all.
+    host_resolver: ?HostResolverRecord = null,
     /// The lock this run would have to declare to install exactly what it
     /// installed: every package the transaction added or changed, at the
     /// identity it settled on, and nothing the input image already carried.
@@ -6665,6 +6699,16 @@ fn guestPackages(
     return &.{};
 }
 
+/// Same alternation, and for the same reason: one run, one inherited resolver.
+fn guestHostResolver(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+    vm_report: ?*const VmRuntimeReport,
+) ?HostResolverRecord {
+    if (unsafe_report) |report| return report.host_resolver;
+    if (vm_report) |report| return report.host_resolver;
+    return null;
+}
+
 /// Same alternation, and for the same reason: one run, one set of keys.
 fn guestTrustKeys(
     unsafe_report: ?*const UnsafeChrootRuntimeReport,
@@ -6902,6 +6946,7 @@ fn buildResult(
                 result_allocator,
                 guestTrustKeys(unsafe_report, vm_report),
             ),
+            .host_resolver = guestHostResolver(unsafe_report, vm_report),
             .emitted_package_lock = try dupePackageLock(
                 result_allocator,
                 guestPackageLock(unsafe_report, vm_report),
