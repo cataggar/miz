@@ -819,10 +819,14 @@ const integration_relabel_marker = "/var/lib/zvmi-integration/relabel";
 const integration_relabel_argv = [_][]const u8{
     "/usr/sbin/setfiles",
     "-F",
-    "-e", "/proc",
-    "-e", "/sys",
-    "-e", "/dev",
-    "-e", "/run",
+    "-e",
+    "/proc",
+    "-e",
+    "/sys",
+    "-e",
+    "/dev",
+    "-e",
+    "/run",
     "/etc/selinux/" ++ integration_selinux_policy ++ "/contexts/files/file_contexts",
     "/",
 };

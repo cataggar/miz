@@ -5501,10 +5501,14 @@ test "a relabel runs last, with the policy the target names" {
     const expected_argv = [_][]const u8{
         "/usr/sbin/setfiles",
         "-F",
-        "-e", "/proc",
-        "-e", "/sys",
-        "-e", "/dev",
-        "-e", "/run",
+        "-e",
+        "/proc",
+        "-e",
+        "/sys",
+        "-e",
+        "/dev",
+        "-e",
+        "/run",
         "/etc/selinux/targeted/contexts/files/file_contexts",
         "/",
     };
