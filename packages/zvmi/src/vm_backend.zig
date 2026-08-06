@@ -620,6 +620,11 @@ const HookPlan = struct {
     name: []const u8,
     phase: customize.HookPhase,
     sha256: [32]u8,
+    /// Taken from the host's own copy of the script, like the digest beside
+    /// it. The guest is never asked what interpreted the hook, because a guest
+    /// that answered differently would be describing bytes the host did not
+    /// send.
+    interpreter: []const u8,
 };
 
 const BuiltHooks = struct {
@@ -682,7 +687,12 @@ fn buildHooks(
             .script_base64 = std.base64.standard.Encoder.encode(buffer, script),
             .arguments = hook.arguments,
         };
-        plan.* = .{ .name = hook.name, .phase = hook.phase, .sha256 = undefined };
+        plan.* = .{
+            .name = hook.name,
+            .phase = hook.phase,
+            .sha256 = undefined,
+            .interpreter = customize.hookInterpreterLine(script),
+        };
         std.crypto.hash.sha2.Sha256.hash(script, &plan.sha256, .{});
     }
     return .{ .carried = carried, .plans = plans };
@@ -1572,6 +1582,7 @@ fn hookRecords(
             .name = try allocator.dupe(u8, plan.name),
             .phase = plan.phase,
             .source_sha256 = .{ .bytes = plan.sha256 },
+            .interpreter = try allocator.dupe(u8, plan.interpreter),
             .exit_code = outcome.exit_code,
         };
     }
@@ -1612,6 +1623,43 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
         }));
     }
     const tools = try tool_list.toOwnedSlice();
+
+    const relabel: ?customize.SelinuxRelabelRecord =
+        if (input.result.selinux_relabel) |reported| .{
+            .discovered_policy = try owned.dupe(u8, reported.policy),
+            .target_mode = reported.mode,
+        } else null;
+
+    const initramfs: ?customize.InitramfsRecord =
+        if (input.result.initramfs) |reported| blk: {
+            const images = try owned.alloc(
+                customize.InitramfsImageRecord,
+                reported.images.len,
+            );
+            for (reported.images, images) |image, *slot| {
+                slot.* = .{
+                    .kernel_release = try owned.dupe(u8, image.kernel_release),
+                    .image_path = try owned.dupe(u8, image.image_path),
+                    .size = image.size,
+                    .sha256 = .{ .bytes = image.sha256 },
+                };
+            }
+            const skipped = try owned.alloc(
+                customize.SkippedKernelRelease,
+                reported.skipped_kernel_releases.len,
+            );
+            for (reported.skipped_kernel_releases, skipped) |entry, *slot| {
+                slot.* = .{
+                    .name = try owned.dupe(u8, entry.name),
+                    .reason = switch (entry.reason) {
+                        .invalid_release_name => .invalid_release_name,
+                        .not_a_module_directory => .not_a_module_directory,
+                        .no_module_dependency_index => .no_module_dependency_index,
+                    },
+                };
+            }
+            break :blk .{ .skipped_kernel_releases = skipped, .images = images };
+        } else null;
 
     const packages = try owned.alloc([]const u8, input.result.installed_packages.len);
     for (input.result.installed_packages, packages) |name, *slot| {
@@ -1668,6 +1716,8 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
         .installed_packages = packages,
         .package_lock = emitted_lock,
         .hooks = hooks,
+        .selinux_relabel = relabel,
+        .initramfs = initramfs,
         .execution = .{
             .emulator_command = try owned.dupe(u8, input.policy.emulator_command),
             .emulator_version = try owned.dupe(u8, input.emulator_version orelse "unknown"),
@@ -2493,8 +2543,18 @@ test "a result that does not account for every hook fails the run" {
     const allocator = arena.allocator();
 
     const plans = [_]HookPlan{
-        .{ .name = "first", .phase = .after_packages, .sha256 = @splat(1) },
-        .{ .name = "second", .phase = .finalize, .sha256 = @splat(2) },
+        .{
+            .name = "first",
+            .phase = .after_packages,
+            .sha256 = @splat(1),
+            .interpreter = "/bin/sh",
+        },
+        .{
+            .name = "second",
+            .phase = .finalize,
+            .sha256 = @splat(2),
+            .interpreter = "/usr/bin/env python3",
+        },
     };
 
     const records = try hookRecords(allocator, &plans, &.{
@@ -2504,6 +2564,10 @@ test "a result that does not account for every hook fails the run" {
     try std.testing.expectEqual(@as(usize, 2), records.len);
     try std.testing.expectEqualStrings("second", records[1].name);
     try std.testing.expectEqual(customize.HookPhase.finalize, records[1].phase);
+    // The interpreter is the host's for the same reason as the digest, and it
+    // is per-hook rather than a property of the run.
+    try std.testing.expectEqualStrings("/bin/sh", records[0].interpreter);
+    try std.testing.expectEqualStrings("/usr/bin/env python3", records[1].interpreter);
     // The digest is the host's, not the guest's: the guest was never told it.
     try std.testing.expectEqualSlices(
         u8,

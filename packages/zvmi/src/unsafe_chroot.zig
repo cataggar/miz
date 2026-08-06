@@ -376,6 +376,8 @@ const WorkerReport = struct {
     hooks: []const customize.HookRecord = &.{},
     boot_configuration: ?customize.BootConfigurationRecord = null,
     package_cache: ?customize.PackageCacheRecord = null,
+    selinux_relabel: ?customize.SelinuxRelabelRecord = null,
+    initramfs: ?customize.InitramfsRecord = null,
 };
 
 fn classifyRunFailure(err: anyerror) RunOutcome {
@@ -457,6 +459,8 @@ fn executeManifest(
         .preexisting_loops = .init(allocator),
         .hook_records = .init(allocator),
         .tool_versions = .init(allocator),
+        .initramfs_images = .init(allocator),
+        .skipped_kernels = .init(allocator),
     };
     const outcome = session.openAndRun();
     // Before the teardown, and only on this path. The command that ran out of
@@ -486,9 +490,20 @@ fn executeManifest(
             .hooks = session.hook_records.items,
             .boot_configuration = session.boot_configuration,
             .package_cache = session.package_cache,
+            .selinux_relabel = session.selinux_relabel,
+            .initramfs = if (session.initramfs_regenerated) .{
+                .skipped_kernel_releases = session.skipped_kernels.items,
+                .images = session.initramfs_images.items,
+            } else null,
         },
     };
 }
+
+/// What one read of the target's `/etc/selinux/config` yielded.
+const DiscoveredSelinux = struct {
+    policy: []const u8,
+    mode: ?customize.SelinuxMode,
+};
 
 const Session = struct {
     allocator: Allocator,
@@ -527,6 +542,14 @@ const Session = struct {
     tool_versions: std.array_list.Managed(ProbedVersion),
     boot_configuration: ?customize.BootConfigurationRecord = null,
     package_cache: ?customize.PackageCacheRecord = null,
+    selinux_relabel: ?customize.SelinuxRelabelRecord = null,
+    /// Whether an initramfs regeneration was attempted at all, which is not
+    /// the same as whether one produced an image: a derived regeneration that
+    /// found no installed kernel is a successful run that regenerated nothing,
+    /// and the entries it passed over are the only account of why.
+    initramfs_regenerated: bool = false,
+    initramfs_images: std.array_list.Managed(customize.InitramfsImageRecord),
+    skipped_kernels: std.array_list.Managed(customize.SkippedKernelRelease),
 
     fn openAndRun(self: *Session) RunOutcome {
         self.open() catch |err| return classifyRunFailure(err);
@@ -843,7 +866,11 @@ const Session = struct {
             .relabel => {},
         }
         const tool = try self.findGuestLabellingTool();
-        const policy = try self.readGuestSelinuxPolicy();
+        // Read once, for the policy the relabel needs and the mode the record
+        // carries: a second read could see a different file, and provenance
+        // would describe a configuration that never existed as a whole.
+        const discovered = try self.readGuestSelinuxConfiguration();
+        const policy = discovered.policy;
         defer self.allocator.free(policy);
         var contexts_buffer: [selinux_mod.max_policy_name_bytes + 64]u8 = undefined;
         const contexts = selinux_mod.fileContextsPath(&contexts_buffer, policy) catch
@@ -868,6 +895,12 @@ const Session = struct {
         try argv.append(contexts);
         try argv.append("/");
         try self.runChroot(argv.items);
+        // After the tool succeeded, so the record describes a relabel that
+        // happened rather than one that was attempted.
+        self.selinux_relabel = .{
+            .discovered_policy = try self.allocator.dupe(u8, policy),
+            .target_mode = discovered.mode,
+        };
     }
 
     fn findGuestLabellingTool(self: *Session) ![]const u8 {
@@ -877,9 +910,14 @@ const Session = struct {
         return error.MissingSelinuxLabellingTool;
     }
 
-    /// The policy name the target's own configuration gives, duplicated
-    /// because the file it was parsed out of does not outlive this call.
-    fn readGuestSelinuxPolicy(self: *Session) ![]const u8 {
+    /// What the target's own SELinux configuration says: the policy the
+    /// relabel must use, and the mode it asks the target's kernel for.
+    ///
+    /// The policy is duplicated because the file it was parsed out of does not
+    /// outlive this call. A configuration naming no usable policy fails the
+    /// run; one naming no recognisable mode does not, because the mode is
+    /// recorded rather than acted on.
+    fn readGuestSelinuxConfiguration(self: *Session) !DiscoveredSelinux {
         const path = try self.guestPath(selinux_mod.config_path);
         defer self.allocator.free(path);
         const contents = Io.Dir.cwd().readFileAlloc(
@@ -891,7 +929,10 @@ const Session = struct {
         defer self.allocator.free(contents);
         const policy = selinux_mod.parseConfiguredPolicy(contents) orelse
             return error.MissingSelinuxConfiguration;
-        return self.allocator.dupe(u8, policy);
+        return .{
+            .policy = try self.allocator.dupe(u8, policy),
+            .mode = selinux_mod.parseConfiguredMode(contents),
+        };
     }
 
     fn runHooks(self: *Session, phase: customize.HookPhase) !void {
@@ -979,6 +1020,10 @@ const Session = struct {
             .name = try self.allocator.dupe(u8, hook.name),
             .phase = hook.phase,
             .source_sha256 = .{ .bytes = digest },
+            .interpreter = try self.allocator.dupe(
+                u8,
+                customize.hookInterpreterLine(script),
+            ),
             .exit_code = exit_code,
         });
     }
@@ -1668,6 +1713,11 @@ const Session = struct {
                 return error.UnsupportedInitramfsGenerator;
             }
         }
+        // Set before discovery, so a run that finds no usable kernel at all
+        // still publishes the entries it passed over on the way to that
+        // answer: under `nothing_to_regenerate` that is a successful run whose
+        // provenance would otherwise say nothing happened.
+        self.initramfs_regenerated = true;
         const kernels = if (regenerate.kernels.len > 0)
             regenerate.kernels
         else
@@ -1709,7 +1759,43 @@ const Session = struct {
                 temporary_output,
                 output,
             });
+            try self.recordInitramfsImage(kernel, output);
         }
+    }
+
+    /// Digests the initramfs `dracut` produced, where `cp` left it.
+    ///
+    /// Read from the mounted target rather than from the temporary, because
+    /// what a reader can check is the file the published image carries, and
+    /// the two are only the same file if the copy did what it said.
+    fn recordInitramfsImage(
+        self: *Session,
+        kernel: []const u8,
+        guest_path: []const u8,
+    ) !void {
+        const host_path = try self.guestPath(guest_path);
+        defer self.allocator.free(host_path);
+        const file = try Io.Dir.cwd().openFile(self.io, host_path, .{});
+        defer file.close(self.io);
+        const size = (try file.stat(self.io)).size;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        var offset: u64 = 0;
+        while (offset < size) {
+            const length: usize = @intCast(@min(size - offset, buffer.len));
+            const read = try file.readPositionalAll(self.io, buffer[0..length], offset);
+            if (read != length) return error.ShortInitramfsRead;
+            hash.update(buffer[0..length]);
+            offset += length;
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        try self.initramfs_images.append(.{
+            .kernel_release = try self.allocator.dupe(u8, kernel),
+            .image_path = try self.allocator.dupe(u8, guest_path),
+            .size = size,
+            .sha256 = .{ .bytes = digest },
+        });
     }
 
     /// Kernel releases installed in the target root, sorted.
@@ -1725,6 +1811,17 @@ const Session = struct {
     /// the leftovers of a package that was removed. Copying that rule rather
     /// than inventing one means this and the tool it hands the answer to
     /// cannot disagree about what is installed.
+    fn recordSkippedKernel(
+        self: *Session,
+        name: []const u8,
+        reason: customize.SkippedKernelReason,
+    ) !void {
+        try self.skipped_kernels.append(.{
+            .name = try self.allocator.dupe(u8, name),
+            .reason = reason,
+        });
+    }
+
     fn installedKernels(self: *Session) ![]const []const u8 {
         const modules_path = try std.fs.path.join(
             self.allocator,
@@ -1759,7 +1856,14 @@ const Session = struct {
             // A release string the manifest would have been refused for
             // naming cannot become acceptable by being discovered instead.
             // This also excludes "." and "..".
-            if (!validKernelRelease(entry.name)) continue;
+            // Excluded by the same rule, and not worth reporting as kernels
+            // a run passed over.
+            if (std.mem.eql(u8, entry.name, ".") or
+                std.mem.eql(u8, entry.name, "..")) continue;
+            if (!validKernelRelease(entry.name)) {
+                try self.recordSkippedKernel(entry.name, .invalid_release_name);
+                continue;
+            }
 
             // Deliberately no check on the entry kind: `d_type` is `unknown`
             // on filesystems that do not carry it, and a non-directory cannot
@@ -1771,11 +1875,17 @@ const Session = struct {
                 // reaches the same silent stale initramfs the guarded open
                 // above refuses -- an empty discovered set is accepted as
                 // "nothing is stale" under `nothing_to_regenerate`.
-                error.NotDir, error.FileNotFound => continue,
+                error.NotDir, error.FileNotFound => {
+                    try self.recordSkippedKernel(entry.name, .not_a_module_directory);
+                    continue;
+                },
                 else => return err,
             };
             defer release_dir.close(self.io);
-            if (!try hasDepmodOutput(self.io, release_dir)) continue;
+            if (!try hasDepmodOutput(self.io, release_dir)) {
+                try self.recordSkippedKernel(entry.name, .no_module_dependency_index);
+                continue;
+            }
 
             try releases.append(try self.allocator.dupe(u8, entry.name));
         }
@@ -3288,6 +3398,8 @@ fn loadParentReport(
         .hooks = parsed.value.hooks,
         .boot_configuration = parsed.value.boot_configuration,
         .package_cache = parsed.value.package_cache,
+        .selinux_relabel = parsed.value.selinux_relabel,
+        .initramfs = parsed.value.initramfs,
     };
 }
 
@@ -3886,7 +3998,9 @@ test "hooks run where the plan says they run, and stop existing when they are do
         .{
             .name = "final",
             .phase = .finalize,
-            .source = .{ .inline_script = "#!/bin/sh\nexit 0\n" },
+            // A different interpreter from the rest, because the record is a
+            // property of each hook rather than of the run.
+            .source = .{ .inline_script = "#!/usr/bin/env python3\nexit(0)\n" },
         },
     };
     const repositories = [_]customize.PackageRepository{.{
@@ -3975,6 +4089,17 @@ test "hooks run where the plan says they run, and stop existing when they are do
     try std.testing.expectEqual(@as(u8, 0), result.report.hooks[0].exit_code);
     try std.testing.expectEqualStrings("final", result.report.hooks[3].name);
     try std.testing.expectEqual(customize.HookPhase.finalize, result.report.hooks[3].phase);
+
+    // What interpreted each hook. The `chroot` argv names the throwaway path
+    // the script was written to and nothing else, and the script itself is
+    // deleted before the image is sealed -- so without this the published
+    // provenance cannot say whether a hook ran under the shell its author
+    // wrote it for.
+    try std.testing.expectEqualStrings("/bin/sh", result.report.hooks[0].interpreter);
+    try std.testing.expectEqualStrings(
+        "/usr/bin/env python3",
+        result.report.hooks[3].interpreter,
+    );
 
     // Nothing of the hook survives the run.
     const leftover = try joinGuest(allocator, root_path, "/run/zvmi-hook-0");
@@ -4129,6 +4254,9 @@ test "a hook source is read on the host, not from inside the target" {
         &digest,
         &result.report.hooks[0].source_sha256.bytes,
     );
+    // Read from the same host-side bytes as the digest, so a `host_path` hook
+    // records its interpreter on the same terms an inline one does.
+    try std.testing.expectEqualStrings("/bin/sh", result.report.hooks[0].interpreter);
 }
 
 test "the privilege boundary re-checks a hook it is handed" {
@@ -4622,6 +4750,16 @@ test "the privilege boundary re-checks a credential it is handed" {
     );
 }
 
+fn findSkippedKernel(
+    entries: []const customize.SkippedKernelRelease,
+    name: []const u8,
+) ?customize.SkippedKernelReason {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return entry.reason;
+    }
+    return null;
+}
+
 test "worker regenerates every installed kernel when the policy names none" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -4676,7 +4814,7 @@ test "worker regenerates every installed kernel when the policy names none" {
     try std.testing.expect(result.cleanup_complete);
 
     // The resolved releases are auditable because the recorded command is the
-    // whole argv, so discovery needs no provenance record of its own.
+    // whole argv.
     var regenerated: std.array_list.Managed([]const u8) = .init(allocator);
     for (result.report.tools) |tool| {
         if (!std.mem.eql(u8, tool.name, "dracut")) continue;
@@ -4691,6 +4829,51 @@ test "worker regenerates every installed kernel when the policy names none" {
     try std.testing.expectEqual(@as(usize, 2), regenerated.items.len);
     try std.testing.expectEqualStrings("6.12.0-10.azl", regenerated.items[0]);
     try std.testing.expectEqualStrings("6.12.0-2.azl", regenerated.items[1]);
+
+    // What the argv cannot say is what discovery declined to hand it. Two
+    // `--kver` arguments look the same whether the target had two kernels or
+    // four, and the difference between those is a package transaction that
+    // shipped a stale initramfs and one that did not.
+    const initramfs = result.report.initramfs orelse
+        return error.TestExpectedInitramfsRecord;
+    const skipped = initramfs.skipped_kernel_releases;
+    try std.testing.expectEqual(@as(usize, 2), skipped.len);
+    try std.testing.expectEqual(
+        customize.SkippedKernelReason.no_module_dependency_index,
+        findSkippedKernel(skipped, "firmware").?,
+    );
+    try std.testing.expectEqual(
+        customize.SkippedKernelReason.invalid_release_name,
+        findSkippedKernel(skipped, "6.12.0 spaced").?,
+    );
+
+    // And what came out. The digest is of the file in the mounted target, so
+    // it is checkable against the published image -- which is the only reason
+    // to record it, the bytes having been produced by a tool this run does
+    // not control.
+    try std.testing.expectEqual(@as(usize, 2), initramfs.images.len);
+    // The bytes `cp` left in the target, not the bytes `dracut` wrote to the
+    // temporary: the two are the same file only if the copy did what it said,
+    // and the published image carries the first. A fake that reported a
+    // successful `cp` without writing anything would fail the run here rather
+    // than publish a digest of a file that is not in the image.
+    var expected_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("fake initramfs bytes", &expected_digest, .{});
+    for (initramfs.images) |image| {
+        try std.testing.expectEqual(@as(u64, "fake initramfs bytes".len), image.size);
+        try std.testing.expectEqualSlices(u8, &expected_digest, &image.sha256.bytes);
+        // Named for the release it was built for, and where the `cp` argv put
+        // it.
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            image.image_path,
+            image.kernel_release,
+        ) != null);
+    }
+    try std.testing.expectEqualStrings(
+        "/boot/initramfs-6.12.0-10.azl.img",
+        initramfs.images[0].image_path,
+    );
 
     // Regenerating every initramfs and regenerating none are different
     // outcomes, so a target with no installed kernel fails rather than
@@ -5237,6 +5420,7 @@ const FakeExecutorContext = struct {
             .none => return,
             .no_policy_named => "SELINUX=enforcing\n",
             .targeted, .missing_contexts => "SELINUX=enforcing\nSELINUXTYPE=targeted\n",
+            .targeted_permissive => "SELINUX=permissive\nSELINUXTYPE=targeted\n",
         });
         if (layout == .missing_contexts) return;
         try self.writeTargetFile(
@@ -5483,6 +5667,19 @@ const FakeExecutorContext = struct {
                 }
             }
         }
+        // `cp` produces the file it was told to produce. A fake that reported
+        // success without writing anything would let a run claim to have
+        // published an initramfs that is not in the target root, which is the
+        // one thing the digest recorded for it exists to catch.
+        if (containsArg(argv, "/usr/bin/cp") and argv.len >= 2) {
+            const destination = argv[argv.len - 1];
+            if (std.mem.startsWith(u8, destination, "/")) {
+                self.writeTargetFile(
+                    destination[1..],
+                    "fake initramfs bytes",
+                ) catch {};
+            }
+        }
         if (std.mem.endsWith(u8, argv[0], "umount")) {
             try self.unmounts.append(try self.allocator.dupe(
                 u8,
@@ -5591,6 +5788,9 @@ const FakeSelinuxLayout = enum {
     no_policy_named,
     /// A configuration naming a policy whose file-contexts file is absent.
     missing_contexts,
+    /// A relabelled target that will nonetheless not enforce what the labels
+    /// say at boot. The relabel is identical; the resulting image is not.
+    targeted_permissive,
 };
 
 fn fakeResult(
@@ -5710,6 +5910,92 @@ test "a relabel runs last, with the policy the target names" {
         @as(?[]const u8, null),
         (try findToolRecord(result.report.tools, "setfiles")).version,
     );
+
+    // What the argv cannot say. The policy name is in there, but only as a
+    // path component of a file the run chose to pass -- indistinguishable, to
+    // a reader, from a policy the request named. The record says it was read
+    // out of the target. The mode is not in the argv at all: `setfiles` does
+    // the same work whatever `/etc/selinux/config` says it should enforce, so
+    // an image relabelled under `permissive` and one relabelled under
+    // `enforcing` produce identical commands and boot differently.
+    const relabel = result.report.selinux_relabel orelse
+        return error.TestExpectedRelabelRecord;
+    try std.testing.expectEqualStrings("targeted", relabel.discovered_policy);
+    try std.testing.expectEqual(
+        @as(?customize.SelinuxMode, .enforcing),
+        relabel.target_mode,
+    );
+    // The policy in the record is the policy in the command, not a second
+    // reading that could disagree with it.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        argv[argv.len - 2],
+        relabel.discovered_policy,
+    ) != null);
+}
+
+test "a relabel records the mode the target will boot under" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root_path = "test-unsafe-chroot-permissive-root";
+    const raw_path = "test-unsafe-chroot-permissive-stage.raw";
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+        .exclusive = true,
+        .read = true,
+    });
+    try raw_file.setLength(io, 8192);
+    const raw_inode = (try raw_file.stat(io)).inode;
+    raw_file.close(io);
+
+    const repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    const manifest = Manifest{
+        .raw_path = raw_path,
+        .root_path = root_path,
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = raw_inode,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{
+            .actions = &.{.{ .install = &.{"dracut"} }},
+            .repositories = &repositories,
+        },
+        .initramfs = .unchanged,
+        .selinux = .relabel,
+    };
+
+    var context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .timeline = .init(allocator),
+        .plant_selinux = .targeted_permissive,
+    };
+    const result = try executeManifest(allocator, io, manifest, .{
+        .context = &context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
+
+    // The same relabel, the same argv, a different image. Nothing else in the
+    // provenance distinguishes the two runs.
+    const relabel = result.report.selinux_relabel orelse
+        return error.TestExpectedRelabelRecord;
+    try std.testing.expectEqual(
+        @as(?customize.SelinuxMode, .permissive),
+        relabel.target_mode,
+    );
+    try std.testing.expectEqualStrings("targeted", relabel.discovered_policy);
 }
 
 test "a relabel a target cannot satisfy fails the run rather than skipping it" {

@@ -864,11 +864,9 @@ pub const InitramfsPolicy = union(enum) {
     },
 };
 
-pub const SelinuxMode = enum {
-    enforcing,
-    permissive,
-    disabled,
-};
+/// Aliased rather than redeclared, so the mode a request asks for and the mode
+/// a relabel found in the target are the same type and can be compared.
+pub const SelinuxMode = selinux_mod.Mode;
 
 pub const SelinuxPolicy = union(enum) {
     unchanged,
@@ -1929,6 +1927,37 @@ fn isValidEnvironmentName(name: []const u8) bool {
 /// run at all.
 fn namesAnInterpreter(script: []const u8) bool {
     return std.mem.startsWith(u8, script, "#!");
+}
+
+/// The interpreter line of a hook script, as the kernel reads it.
+///
+/// Everything after `#!` up to the first newline, with surrounding blank space
+/// removed -- which is the interpreter and, on Linux, at most one argument to
+/// it. Not parsed into a program and arguments here: the point of the record
+/// is to say what the run relied on, and splitting it would be this code's
+/// guess at what the kernel did rather than the bytes it acted on.
+///
+/// Borrows from `script`; callers that outlive those bytes must copy.
+pub fn hookInterpreterLine(script: []const u8) []const u8 {
+    if (!namesAnInterpreter(script)) return "";
+    const rest = script[2..];
+    const line = rest[0 .. std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len];
+    return std.mem.trim(u8, line, " \t\r");
+}
+
+test "the recorded interpreter is the shebang line the kernel acts on" {
+    try std.testing.expectEqualStrings("/bin/sh", hookInterpreterLine("#!/bin/sh\nexit 0\n"));
+    // Space after the marker, no trailing newline, and an argument: all three
+    // are shebangs a real script carries, and none of them is a different
+    // interpreter.
+    try std.testing.expectEqualStrings(
+        "/usr/bin/env python3",
+        hookInterpreterLine("#! /usr/bin/env python3  \r\nprint(1)\n"),
+    );
+    try std.testing.expectEqualStrings("/bin/sh", hookInterpreterLine("#!/bin/sh"));
+    // Refused before it could be recorded, so this is unreachable in a run.
+    // Answered anyway rather than left to a caller to avoid asking.
+    try std.testing.expectEqualStrings("", hookInterpreterLine("exit 0\n"));
 }
 
 fn validateHooks(
@@ -3797,6 +3826,7 @@ fn dupeHookRecords(
             .name = try allocator.dupe(u8, record.name),
             .phase = record.phase,
             .source_sha256 = record.source_sha256,
+            .interpreter = try allocator.dupe(u8, record.interpreter),
             .exit_code = record.exit_code,
         };
     }
@@ -6040,6 +6070,15 @@ pub const HookRecord = struct {
     /// bytes of whatever file was named. For a `host_path` source the two are
     /// the same read; digesting the placed copy is what makes that checkable.
     source_sha256: Digest,
+    /// The script's shebang line, without the `#!`.
+    ///
+    /// Implied by the digest only to a reader who already has the bytes, and
+    /// the bytes are the one thing a published image deliberately does not
+    /// carry -- the hook is deleted before the image is sealed. The `chroot`
+    /// argv names the script's throwaway path, never what interpreted it, so
+    /// without this the record cannot say whether a hook ran under the shell
+    /// its author wrote it for or under whatever the target image supplied.
+    interpreter: []const u8,
     /// Zero in every published provenance, because a hook that exited nonzero
     /// fails the run and nothing is published. Recorded anyway, so the record
     /// states what was observed rather than leaving it to be assumed.
@@ -6081,6 +6120,10 @@ pub const UnsafeChrootRuntimeReport = struct {
     boot_configuration: ?BootConfigurationRecord = null,
     /// Present exactly when the request declared a cache directory.
     package_cache: ?PackageCacheRecord = null,
+    /// Present exactly when the run relabelled the root.
+    selinux_relabel: ?SelinuxRelabelRecord = null,
+    /// Present exactly when the run regenerated at least one initramfs.
+    initramfs: ?InitramfsRecord = null,
 
     pub fn deinit(self: *UnsafeChrootRuntimeReport) void {
         self.arena.deinit();
@@ -6181,6 +6224,10 @@ pub const VmRuntimeReport = struct {
     installed_packages: []const []const u8,
     package_lock: []const PackageVersionLock = &.{},
     hooks: []const HookRecord = &.{},
+    /// Present exactly when the guest relabelled the root.
+    selinux_relabel: ?SelinuxRelabelRecord = null,
+    /// Present exactly when the guest regenerated at least one initramfs.
+    initramfs: ?InitramfsRecord = null,
     execution: VmExecutionRecord,
 
     pub fn deinit(self: *VmRuntimeReport) void {
@@ -6247,6 +6294,76 @@ pub const PartitionStyleRecord = struct {
     message: []const u8,
 };
 
+/// A `/lib/modules` entry the kernel discovery passed over, and why.
+///
+/// A run that regenerates "every installed initramfs" answers a question the
+/// plan could not: which kernels are installed. A release passed over here
+/// keeps the initramfs the package transaction just invalidated, and nothing
+/// else a run publishes distinguishes "the image had one kernel" from "it had
+/// three and two were not recognised".
+pub const SkippedKernelRelease = struct {
+    name: []const u8,
+    reason: SkippedKernelReason,
+};
+
+pub const SkippedKernelReason = enum {
+    /// Not a usable release string. The same rule a declared release is held
+    /// to: a name that could not be requested cannot become acceptable by
+    /// being discovered instead.
+    invalid_release_name,
+    /// Not a directory, or gone between the read and the open.
+    not_a_module_directory,
+    /// No `modules.dep` or `modules.dep.bin`. This is dracut's own rule for
+    /// telling an installed kernel from a directory that merely sits beside
+    /// one -- a firmware drop, or what a removed package left behind.
+    no_module_dependency_index,
+};
+
+/// An initramfs the run regenerated and left in the published image.
+///
+/// The `dracut --kver` argv says which release was asked for and the `cp` argv
+/// says where the result was put. Neither says what came out, and the file is
+/// the one thing a recorded tool produced that the published image boots from.
+pub const InitramfsImageRecord = struct {
+    kernel_release: []const u8,
+    /// Inside the image, as the `cp` argv names it.
+    image_path: []const u8,
+    size: u64,
+    sha256: Digest,
+};
+
+/// Present exactly when the run regenerated initramfs images.
+pub const InitramfsRecord = struct {
+    /// Empty when the releases were declared: discovery is the only thing that
+    /// can skip anything, and a declared release that does not exist fails the
+    /// run instead.
+    skipped_kernel_releases: []const SkippedKernelRelease = &.{},
+    images: []const InitramfsImageRecord = &.{},
+};
+
+/// What a relabel found in the target, as opposed to what it did.
+///
+/// The `setfiles` argv already carries what ran: the tool, the exclusions and
+/// the `file_contexts` file whose path contains the policy name. What the argv
+/// cannot say is that those values were *discovered* -- read out of the
+/// target's own configuration while the run executed -- and it cannot say
+/// anything at all about a setting the relabel does not use.
+pub const SelinuxRelabelRecord = struct {
+    /// The policy named by the target's own `/etc/selinux/config`. No request
+    /// can name it: `.relabel` carries no policy name and `.configure` never
+    /// executes, so this is always a discovered value, and a run whose
+    /// packages replaced the policy relabelled with the new one.
+    discovered_policy: []const u8,
+    /// The mode that same configuration asks for, or nothing when it names
+    /// none this can recognise.
+    ///
+    /// Recorded because it is the one way to see that a relabel was wasted: a
+    /// root configured `disabled` boots without loading a policy, so the
+    /// labels this run spent its time writing are never consulted. Nothing in
+    /// the argv, the request or the plan reveals that.
+    target_mode: ?SelinuxMode,
+};
+
 pub const PreservedExecutionRecord = struct {
     source_format: Format,
     output_format: Format,
@@ -6288,6 +6405,11 @@ pub const PreservedExecutionRecord = struct {
     /// which is the ambient state this record exists to distinguish itself
     /// from.
     package_cache: ?PackageCacheRecord = null,
+    /// Present exactly when the run relabelled the root. Both backends fill
+    /// it, because both read the same configuration out of the same target.
+    selinux_relabel: ?SelinuxRelabelRecord = null,
+    /// Present exactly when the run regenerated at least one initramfs.
+    initramfs: ?InitramfsRecord = null,
 };
 
 /// What a run did with a declared package cache directory.
@@ -6572,6 +6694,26 @@ fn guestBootConfiguration(
     return null;
 }
 
+fn backendInitramfs(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+    vm_report: ?*const VmRuntimeReport,
+) ?InitramfsRecord {
+    if (unsafe_report) |report| return report.initramfs;
+    if (vm_report) |report| return report.initramfs;
+    return null;
+}
+
+/// Unlike the boot configuration, which only the chroot backend produces, both
+/// backends relabel and both read the same file to do it.
+fn backendRelabel(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+    vm_report: ?*const VmRuntimeReport,
+) ?SelinuxRelabelRecord {
+    if (unsafe_report) |report| return report.selinux_relabel;
+    if (vm_report) |report| return report.selinux_relabel;
+    return null;
+}
+
 /// Every command the run spawned, in the order it spawned them: the backend's
 /// own host-side plumbing first, then whatever ran inside the target root.
 ///
@@ -6771,6 +6913,38 @@ fn buildResult(
                 .entries = record.entries,
                 .defaults_already_current = record.defaults_already_current,
                 .options = try result_allocator.dupe(u8, record.options),
+            } else null,
+            .selinux_relabel = if (backendRelabel(unsafe_report, vm_report)) |record| .{
+                .discovered_policy = try result_allocator.dupe(u8, record.discovered_policy),
+                .target_mode = record.target_mode,
+            } else null,
+            .initramfs = if (backendInitramfs(unsafe_report, vm_report)) |record| initramfs_blk: {
+                const skipped = try result_allocator.alloc(
+                    SkippedKernelRelease,
+                    record.skipped_kernel_releases.len,
+                );
+                for (record.skipped_kernel_releases, skipped) |source, *slot| {
+                    slot.* = .{
+                        .name = try result_allocator.dupe(u8, source.name),
+                        .reason = source.reason,
+                    };
+                }
+                const images = try result_allocator.alloc(
+                    InitramfsImageRecord,
+                    record.images.len,
+                );
+                for (record.images, images) |source, *slot| {
+                    slot.* = .{
+                        .kernel_release = try result_allocator.dupe(u8, source.kernel_release),
+                        .image_path = try result_allocator.dupe(u8, source.image_path),
+                        .size = source.size,
+                        .sha256 = source.sha256,
+                    };
+                }
+                break :initramfs_blk .{
+                    .skipped_kernel_releases = skipped,
+                    .images = images,
+                };
             } else null,
             .kernel_options = if (kernel_options) |report| .{
                 .appended = try result_allocator.dupe(u8, plan.data.boot_security.extra_kernel_options),
@@ -12801,6 +12975,7 @@ test "a hook that ran is recorded by digest in provenance" {
         .name = "marker",
         .phase = .finalize,
         .source_sha256 = .{ .bytes = script_digest },
+        .interpreter = "/bin/sh",
         .exit_code = 0,
     }};
 

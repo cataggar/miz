@@ -83,6 +83,8 @@ pub const Error = error{
     FrameDigestMismatch,
     ResultTooLarge,
     InvalidToolRecord,
+    InvalidSelinuxRecord,
+    InvalidInitramfsRecord,
     InvalidFailureRecord,
     InvalidModuleMember,
     TooManyModules,
@@ -729,6 +731,46 @@ pub const Tool = struct {
     command: []const []const u8,
 };
 
+/// A `/lib/modules` entry the guest's kernel discovery passed over, and why.
+pub const SkippedKernel = struct {
+    name: []const u8,
+    reason: SkippedKernelReason,
+};
+
+pub const SkippedKernelReason = enum {
+    invalid_release_name,
+    not_a_module_directory,
+    no_module_dependency_index,
+};
+
+/// An initramfs the guest regenerated and left in the target root.
+pub const InitramfsImage = struct {
+    kernel_release: []const u8,
+    image_path: []const u8,
+    size: u64,
+    /// Raw bytes rather than hex: the frame is already binary-safe, and a
+    /// fixed-length array is one fewer thing for the host to validate.
+    sha256: [32]u8,
+};
+
+/// What a regeneration passed over and what it produced. Named for the outcome
+/// rather than the request, because `Initramfs` above is the instruction.
+pub const InitramfsOutcome = struct {
+    skipped_kernel_releases: []const SkippedKernel = &.{},
+    images: []const InitramfsImage = &.{},
+};
+
+/// What a relabel found, as distinct from what it did. The `setfiles` argv the
+/// guest also reports says what ran; this says what the target's own
+/// configuration named, which no request and no plan can.
+pub const SelinuxRelabel = struct {
+    policy: []const u8,
+    /// The `SELINUX=` setting, absent when the configuration names none the
+    /// guest recognises. A relabelled root configured `disabled` never
+    /// consults the labels this run wrote.
+    mode: ?selinux.Mode = null,
+};
+
 pub const Failure = struct {
     /// Which stage gave up, e.g. `mount-root` or `packages`.
     stage: []const u8,
@@ -751,6 +793,12 @@ pub const Result = struct {
     /// ran. The host pairs these with the hooks it sent and refuses a result
     /// that does not account for every one of them.
     hooks: []const HookOutcome = &.{},
+    /// What the guest read out of the target's own SELinux configuration when
+    /// it relabelled. Absent when the document asked for no relabel.
+    selinux_relabel: ?SelinuxRelabel = null,
+    /// What an initramfs regeneration passed over and what it produced. Absent
+    /// when the document asked for none.
+    initramfs: ?InitramfsOutcome = null,
 
     /// The result is recorded in the host's provenance, so its shape is
     /// bounded here for the same reason the control document's is: a document
@@ -766,6 +814,40 @@ pub const Result = struct {
             }
             if (tool.command.len == 0 or tool.command.len > 64) {
                 return error.InvalidToolRecord;
+            }
+        }
+        if (self.selinux_relabel) |relabel| {
+            // Held to the same rule the guest used to build a path out of it,
+            // rather than to a length: a name that arrives from the other side
+            // of the boundary is checked before it is published.
+            if (!selinux.validPolicyName(relabel.policy)) return error.InvalidSelinuxRecord;
+        }
+        if (self.initramfs) |initramfs| {
+            // Bounded by the same limit the inventory is: both are lists the
+            // guest sizes from a directory the target controls.
+            if (initramfs.images.len > max_result_packages) return error.ResultTooLarge;
+            if (initramfs.skipped_kernel_releases.len > max_result_packages) {
+                return error.ResultTooLarge;
+            }
+            for (initramfs.images) |image| {
+                if (!validKernelRelease(image.kernel_release)) {
+                    return error.InvalidInitramfsRecord;
+                }
+                if (image.image_path.len == 0 or image.image_path.len > 512) {
+                    return error.InvalidInitramfsRecord;
+                }
+            }
+            for (initramfs.skipped_kernel_releases) |skipped| {
+                // Deliberately not held to `validKernelRelease`: the whole
+                // point of the record is that the name failed that rule. It is
+                // bounded and checked for embedded nulls instead, because it
+                // reaches a published document.
+                if (skipped.name.len == 0 or skipped.name.len > 512) {
+                    return error.InvalidInitramfsRecord;
+                }
+                if (std.mem.indexOfScalar(u8, skipped.name, 0) != null) {
+                    return error.InvalidInitramfsRecord;
+                }
             }
         }
         if (self.installed_packages.len > max_result_packages) return error.ResultTooLarge;
