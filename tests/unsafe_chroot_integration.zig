@@ -27,6 +27,11 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, executable_name, "cp")) {
         return runGuestCp(init.io, argv[1..]);
     }
+    // The interpreter the hanging hook names in its shebang. It never
+    // returns, which is the only way to observe a bound that works.
+    if (std.mem.eql(u8, executable_name, "hang")) {
+        return runGuestHangingHook(init.io);
+    }
     if (std.mem.eql(u8, executable_name, "grub2-mkconfig")) {
         return runGuestGrubMkconfig(allocator, init.io, argv[1..]);
     }
@@ -480,9 +485,125 @@ fn runIntegration(
     try expectMissingHostFile(io, cache_path, "offline-write");
 
     try expectPathAbsent(io, offline_resolved.plan.?.data.transaction_path);
+
+    try runDeadlineIntegration(
+        allocator,
+        io,
+        platform,
+        request,
+        work_path,
+        architecture,
+    );
+
     try Io.Dir.cwd().deleteTree(io, work_path);
     completed = true;
     std.debug.print("unsafe-chroot privileged integration passed\n", .{});
+}
+
+/// How long the hung hook is given before the run's budget stops it. Long
+/// enough that the copy, the package transaction and the initramfs step ahead
+/// of it are not the thing that expires -- the point is a run stopped inside a
+/// command that would never return, not a budget that was too small to reach
+/// one.
+const deadline_integration_seconds: u32 = 20;
+
+/// A run that hangs is stopped by its deadline, and stopped cleanly.
+///
+/// The hook here never returns. Nothing else in the suite can produce that:
+/// every other stub finishes, and a backend that only ever ran finishing
+/// commands would report a bounded run whether or not the bound worked. What
+/// is asserted afterwards is the part that is easy to get wrong -- the host is
+/// left holding nothing. The worker is killed mid-run, so its mounts, its loop
+/// device and its transaction directory all have to be gone anyway.
+fn runDeadlineIntegration(
+    allocator: Allocator,
+    io: Io,
+    platform: zvmi.customize.Platform,
+    base_request: zvmi.customize.Request,
+    work_path: []const u8,
+    architecture: zvmi.customize.Architecture,
+) !void {
+    const output_path = try std.fs.path.join(
+        allocator,
+        &.{ work_path, "deadline-output.raw" },
+    );
+    const loops_before = try countAttachedLoops(allocator, io);
+
+    // The hook names an interpreter this root does carry: the same test
+    // binary the package stubs are, under a name that makes it sleep. The
+    // script itself is never reached, which is the point -- what is being
+    // bounded is a command that has started and will not finish.
+    const hooks = [_]zvmi.customize.Hook{.{
+        .name = "hang",
+        .phase = .before_seal,
+        .source = .{ .inline_script = "#!/usr/bin/hang\n" },
+    }};
+    var request = base_request;
+    request.output.path = output_path;
+    request.hooks = &hooks;
+    request.execution.deadline_seconds = deadline_integration_seconds;
+
+    var resolved = try zvmi.customize.resolve(allocator, &request, .{
+        .host_architecture = architecture,
+    });
+    defer resolved.deinit(allocator);
+    if (resolved.plan == null or resolved.diagnostics.hasErrors()) {
+        return error.IntegrationResolutionFailed;
+    }
+    try ensure(resolved.plan.?.data.execution.deadline_seconds.? ==
+        deadline_integration_seconds);
+
+    var outcome = try zvmi.customize.execute(
+        allocator,
+        io,
+        &resolved.plan.?,
+        platform,
+        null,
+    );
+    defer outcome.deinit(allocator);
+    // A run that ran out of time publishes nothing and says why in the one
+    // code that means "give it more time".
+    if (outcome.result != null) return error.DeadlineRunProducedResult;
+    var reported = false;
+    for (outcome.diagnostics.items) |diagnostic| {
+        if (diagnostic.code == .cleanup_failed) return error.IntegrationCleanupFailed;
+        if (diagnostic.code != .deadline_exceeded) continue;
+        reported = true;
+    }
+    if (!reported) {
+        for (outcome.diagnostics.items) |diagnostic| {
+            std.debug.print(
+                "deadline run diagnostic: {s} {s}: {s}\n",
+                .{ @tagName(diagnostic.code), diagnostic.configuration_path, diagnostic.message },
+            );
+        }
+        return error.DeadlineNotReported;
+    }
+
+    try expectPathAbsent(io, output_path);
+    // The transaction is removed rather than abandoned, which is the whole
+    // difference between a deadline the worker enforced and a worker the
+    // parent had to kill: only the first can finish its own teardown.
+    try expectPathAbsent(io, resolved.plan.?.data.transaction_path);
+    // Loop devices are global, so a worker killed while holding one would
+    // leave it attached to a file this test is about to delete.
+    try ensure(try countAttachedLoops(allocator, io) == loops_before);
+}
+
+fn countAttachedLoops(allocator: Allocator, io: Io) !usize {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "/usr/sbin/losetup", "--list", "--output", "NAME", "--noheadings" },
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    }) catch return 0;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.trim(u8, line, " \t\r").len != 0) count += 1;
+    }
+    return count;
 }
 
 /// What the populating run leaves in the cache directory and the offline run
@@ -516,9 +637,11 @@ fn runUnsafeChroot(
     io: Io,
     plan: *const zvmi.customize.ResolvedPlan,
     target: zvmi.preserved_image.RawMutationTarget,
+    deadline: zvmi.customize.Deadline,
 ) !zvmi.customize.UnsafeChrootRuntimeReport {
     const context: *RuntimeContext = @ptrCast(@alignCast(context_ptr.?));
     return zvmi.unsafe_chroot.runParent(allocator, io, .{
+        .deadline = deadline,
         .self_exe = context.self_exe,
         .transaction_path = plan.data.transaction_path,
         .plan = plan,
@@ -617,6 +740,9 @@ fn createSourceDisk(
     try tree.putSymlink("usr/bin/tdnf", "rpm", .{ .mode = 0o777 });
     try tree.putSymlink("usr/bin/dracut", "rpm", .{ .mode = 0o777 });
     try tree.putSymlink("usr/bin/cp", "rpm", .{ .mode = 0o777 });
+    // The interpreter the deadline run's hook names. A hook has to name one,
+    // and this root carries no shell.
+    try tree.putSymlink("usr/bin/hang", "rpm", .{ .mode = 0o777 });
     try tree.putSymlink("usr/sbin/grub2-mkconfig", "../bin/rpm", .{ .mode = 0o777 });
     _ = try zvmi.ext4.populate(
         io,
@@ -631,6 +757,13 @@ fn createSourceDisk(
             .timestamp = 1_735_689_600,
         },
     );
+}
+
+/// Sleeps far past any budget a test would set, in one call rather than a
+/// loop, so the process is asleep in a syscall when it is killed -- which is
+/// where a hung `tdnf` or `dracut` would be too.
+fn runGuestHangingHook(io: Io) !void {
+    try Io.sleep(io, Io.Duration.fromSeconds(3600), .awake);
 }
 
 fn runGuestRpm(io: Io, args: []const []const u8) !void {

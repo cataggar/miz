@@ -187,6 +187,10 @@ pub const RunOptions = struct {
     /// seam the caller supplies rather than something this module reaches for;
     /// tests get `.empty` and so cannot read the developer's shell.
     environ: std.process.Environ = .empty,
+    /// The whole run's remaining budget. Every wait this backend performs is
+    /// clamped to it, so the guest's own boot budgets can only ever expire
+    /// sooner than the run's, never later.
+    deadline: customize.Deadline = .unbounded,
 };
 
 /// Where a failed run's console goes. A sink rather than a writer because the
@@ -325,17 +329,20 @@ pub fn run(
         .layout = layout,
         .disk = drivers.disk,
     });
+    // The appliance boot gets whichever budget runs out first. The two are
+    // reported apart because they ask for different fixes: a boot that
+    // exceeded its own budget is a guest that hung, while a run that exceeded
+    // the deadline may have been progressing perfectly well and simply had no
+    // time left.
+    const boot_budget = options.deadline.clamped(io, policy.boot_timeout_seconds);
     const outcome = std.process.run(work, io, .{
         .argv = argv,
         .stdout_limit = .limited(max_console_bytes),
         .stderr_limit = .limited(max_console_bytes),
-        .timeout = (Io.Timeout{ .duration = .{
-            .raw = .fromSeconds(policy.boot_timeout_seconds),
-            .clock = .awake,
-        } }).toDeadline(io),
+        .timeout = boot_budget.timeout,
     }) catch |err| {
         return switch (err) {
-            error.Timeout => error.VmBootTimedOut,
+            error.Timeout => boot_budget.expiry(error.VmBootTimedOut),
             else => err,
         };
     };
@@ -385,6 +392,7 @@ pub fn run(
                 .transaction_path = options.transaction_path,
                 .stage_path = options.target.raw_path,
                 .console = options.console,
+                .deadline = options.deadline,
             });
             // Published whole: a half-filled record behind a set tag would
             // read as a firmware boot nobody performed.
@@ -964,6 +972,11 @@ pub const AttestationInput = struct {
     transaction_path: []const u8,
     stage_path: []const u8,
     console: ?ConsoleSink,
+    /// The whole run's remaining budget, which bounds the attestation boot in
+    /// addition to the firmware's own. Defaulted because the real-firmware
+    /// test drives the attestation on its own, with no run around it to
+    /// borrow a budget from.
+    deadline: customize.Deadline = .unbounded,
 };
 
 /// Boots the customized stage through its own firmware and bootloader and
@@ -1028,6 +1041,7 @@ pub fn attestFirmwareBoot(
         .argv = argv,
         .marker = input.firmware.console_marker,
         .timeout_seconds = input.firmware.boot_timeout_seconds,
+        .deadline = input.deadline,
     });
     if (!outcome.found) {
         if (input.console) |sink| {
@@ -1039,7 +1053,11 @@ pub fn attestFirmwareBoot(
             sink.write(outcome.console);
         }
         return switch (outcome.stop) {
-            .timed_out => error.VmFirmwareBootTimedOut,
+            // Which budget ran out decides which failure this is. The
+            // attestation is the last thing a run does, so it is the most
+            // likely place for a deadline to be reached by a boot that was
+            // never in trouble itself.
+            .timed_out => outcome.expiry(error.VmFirmwareBootTimedOut),
             .exited => error.VmFirmwareBootFailed,
             .overflowed => error.VmFirmwareConsoleOverflowed,
         };
@@ -1168,12 +1186,24 @@ const MarkerOutcome = struct {
     found: bool,
     stop: MarkerStop,
     console: []const u8,
+    /// Which budget the wait was bounded by, recorded when it was chosen.
+    /// Meaningless unless `stop` is `.timed_out`.
+    deadline_first: bool = false,
+
+    /// The failure a timed-out wait should be reported as.
+    fn expiry(self: MarkerOutcome, backend_error: anyerror) anyerror {
+        return if (self.deadline_first)
+            error.ExecutionDeadlineExceeded
+        else
+            backend_error;
+    }
 };
 
 const MarkerInput = struct {
     argv: []const []const u8,
     marker: []const u8,
     timeout_seconds: u32,
+    deadline: customize.Deadline = .unbounded,
 };
 
 /// Runs the emulator and returns as soon as the marker appears on its console,
@@ -1213,11 +1243,11 @@ fn watchForConsoleMarker(
     const errors = multi_reader.reader(1);
 
     // One deadline for the whole boot rather than one per read: the budget is
-    // the boot chain's, not any single moment of silence within it.
-    const deadline = (Io.Timeout{ .duration = .{
-        .raw = .fromSeconds(input.timeout_seconds),
-        .clock = .awake,
-    } }).toDeadline(io);
+    // the boot chain's, not any single moment of silence within it. Clamped to
+    // what the run has left, so a generous per-boot budget cannot outlast the
+    // run that granted it.
+    const budget = input.deadline.clamped(io, input.timeout_seconds);
+    const deadline = budget.timeout;
 
     var scanned: usize = 0;
     var stop: MarkerStop = .exited;
@@ -1254,6 +1284,7 @@ fn watchForConsoleMarker(
         .found = found,
         .stop = stop,
         .console = try ownedConsole(allocator, console, errors),
+        .deadline_first = budget.deadline_first,
     };
 }
 

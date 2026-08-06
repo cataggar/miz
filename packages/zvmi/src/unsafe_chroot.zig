@@ -17,6 +17,25 @@ const loop_settle_attempts = 20;
 const loop_settle_interval = std.Io.Duration.fromMilliseconds(100);
 const worker_started_text = "worker-started\n";
 const cleanup_complete_text = "cleanup-complete\n";
+/// Written by a worker that stopped because the run's budget was spent, after
+/// its cleanup finished. A separate token rather than a non-zero exit, because
+/// the parent has to tell "the run ran out of time" from "a command failed"
+/// and both leave the same exit status.
+const deadline_exceeded_text = "deadline-exceeded\n";
+/// What the worker's own teardown gets after the run stops, whether it stopped
+/// by finishing, by failing or by running out of time. Shorter than the
+/// parent's grace, so a worker that cannot finish its teardown still reports
+/// that itself rather than being killed mid-report.
+const cleanup_deadline_seconds: u32 = 90;
+/// How much longer than the run's deadline the parent waits for the worker.
+///
+/// The worker enforces the deadline over its own children and then unmounts,
+/// detaches the loop device and removes the guest root; that teardown starts
+/// when the budget is already spent, so a parent that gave up at the same
+/// instant would kill the only process that can finish it. The grace exists to
+/// let the graceful path win, and the parent's own bound exists because a
+/// worker wedged in that teardown must not hang the build either.
+const worker_cleanup_grace_seconds: u32 = 120;
 
 pub const active_lease_basename = transaction_guard.active_lease_basename;
 pub const activeLeasePath = transaction_guard.activeLeasePath;
@@ -28,6 +47,9 @@ pub const ParentOptions = struct {
     target: preserved_image.RawMutationTarget,
     /// Read only for the variables a declared credential names.
     environ: std.process.Environ = .empty,
+    /// What is left of the run's budget. `.unbounded` is every caller that
+    /// declared no deadline.
+    deadline: customize.Deadline = .unbounded,
 };
 
 const Manifest = struct {
@@ -46,6 +68,11 @@ const Manifest = struct {
     /// configuration. Empty means the run changes none.
     kernel_options: []const u8 = "",
     hooks: []const customize.Hook = &.{},
+    /// What was left of the run's budget when the worker was spawned, in whole
+    /// seconds. Passed as a remainder rather than as an absolute time because
+    /// the worker is a separate process and only one of them owns the clock
+    /// the budget started on. Absent means the run declared no deadline.
+    deadline_seconds: ?u32 = null,
 };
 
 /// Where the distro's own bootloader tooling is looked for inside the target
@@ -153,6 +180,10 @@ pub fn runParent(
         .kernel_modules = options.plan.data.os.kernel_modules,
         .kernel_options = options.plan.data.boot_security.extra_kernel_options,
         .hooks = options.plan.data.hooks,
+        // What is left of the budget at the moment the worker starts, not what
+        // the run declared: the copy that produced the raw stage has already
+        // been paid for out of the same budget.
+        .deadline_seconds = options.deadline.remainingSeconds(io),
     };
     const json = try std.json.Stringify.valueAlloc(allocator, manifest, .{});
     defer allocator.free(json);
@@ -185,8 +216,12 @@ pub fn runParent(
         .argv = &argv,
         .environ_map = &environment,
         .stdin = .ignore,
-        .stdout = .inherit,
-        .stderr = .inherit,
+        // Piped rather than inherited so the parent has somewhere to enforce
+        // its own bound. `Child.wait` takes no deadline, so a parent that
+        // handed the worker its own descriptors would have nothing left to do
+        // but block forever on a worker that never returns.
+        .stdout = .pipe,
+        .stderr = .pipe,
     }) catch |err| {
         lease.release(io) catch {
             lease.abandon(io);
@@ -196,13 +231,18 @@ pub fn runParent(
         lease_active = false;
         return err;
     };
-    const term = child.wait(io) catch {
+    const supervision = superviseWorker(
+        allocator,
+        io,
+        &child,
+        options.deadline.withGrace(worker_cleanup_grace_seconds),
+    ) catch {
         lease.abandon(io);
         lease_active = false;
         return error.MutationResourcesActive;
     };
 
-    switch (classifyWorkerOutcome(io, status_path, term)) {
+    switch (classifyWorkerOutcome(io, status_path, supervision.term)) {
         .never_started => {
             lease.release(io) catch {
                 lease.abandon(io);
@@ -210,17 +250,33 @@ pub fn runParent(
                 return error.MutationResourcesActive;
             };
             lease_active = false;
-            return error.UnsafeChrootWorkerFailed;
+            return if (supervision.timed_out)
+                error.ExecutionDeadlineExceeded
+            else
+                error.UnsafeChrootWorkerFailed;
         },
         .cleanup_uncertain => {
+            // Deliberately not reported as the deadline it may also have been.
+            // Something may still hold the staging image, and that is the fact
+            // the caller has to act on: it decides whether the transaction can
+            // be removed, where the deadline only decides what to say about
+            // why the run stopped.
             lease.abandon(io);
             lease_active = false;
             return error.MutationResourcesActive;
         },
+        .cleanup_complete_deadline => {
+            try lease.release(io);
+            lease_active = false;
+            return error.ExecutionDeadlineExceeded;
+        },
         .cleanup_complete_failed => {
             try lease.release(io);
             lease_active = false;
-            return error.UnsafeChrootWorkerFailed;
+            return if (supervision.timed_out)
+                error.ExecutionDeadlineExceeded
+            else
+                error.UnsafeChrootWorkerFailed;
         },
         .cleanup_complete_success => {
             try lease.release(io);
@@ -248,14 +304,19 @@ pub fn workerMain(init: std.process.Init, manifest_path: []const u8) !void {
         .{ .ignore_unknown_fields = false },
     );
     try writeBytes(init.io, parsed.value.status_path, worker_started_text);
+    var executor = Executor.system(init.minimal.environ);
+    // The remainder the parent measured, restarted here as this process's own
+    // budget. One conversion, at the start, so every command the worker runs
+    // shares the deadline instead of each getting the whole of what is left.
+    executor.deadline = .start(init.io, parsed.value.deadline_seconds);
     const result = try executeManifest(
         allocator,
         init.io,
         parsed.value,
-        Executor.system(init.minimal.environ),
+        executor,
     );
     if (result.cleanup_complete) {
-        if (result.operation_succeeded) {
+        if (result.outcome == .succeeded) {
             const report_json = try std.json.Stringify.valueAlloc(
                 allocator,
                 result.report,
@@ -264,14 +325,32 @@ pub fn workerMain(init: std.process.Init, manifest_path: []const u8) !void {
             defer allocator.free(report_json);
             try writeBytes(init.io, parsed.value.report_path, report_json);
         }
-        try writeBytes(init.io, parsed.value.status_path, cleanup_complete_text);
+        // The deadline gets its own token, written only once the teardown it
+        // triggered has finished. The parent reads it as "the run ran out of
+        // time and nothing is still held", which no exit status can say.
+        try writeBytes(init.io, parsed.value.status_path, switch (result.outcome) {
+            .deadline_exceeded => deadline_exceeded_text,
+            else => cleanup_complete_text,
+        });
     }
     if (!result.cleanup_complete) return error.UnsafeChrootCleanupFailed;
-    if (!result.operation_succeeded) return error.UnsafeChrootOperationFailed;
+    switch (result.outcome) {
+        .succeeded => {},
+        .failed => return error.UnsafeChrootOperationFailed,
+        .deadline_exceeded => return error.ExecutionDeadlineExceeded,
+    }
 }
 
+/// Why the worker stopped. `failed` and `deadline_exceeded` both leave nothing
+/// published, but only one of them is answered by giving the run more time.
+const RunOutcome = enum {
+    succeeded,
+    failed,
+    deadline_exceeded,
+};
+
 const ExecutionResult = struct {
-    operation_succeeded: bool,
+    outcome: RunOutcome,
     cleanup_complete: bool,
     report: WorkerReport,
 };
@@ -289,6 +368,45 @@ const WorkerReport = struct {
     boot_configuration: ?customize.BootConfigurationRecord = null,
     package_cache: ?customize.PackageCacheRecord = null,
 };
+
+fn classifyRunFailure(err: anyerror) RunOutcome {
+    return if (err == error.ExecutionDeadlineExceeded)
+        .deadline_exceeded
+    else
+        .failed;
+}
+
+/// Kills and reaps everything else in this PID namespace.
+///
+/// The worker is PID 1 under `unshare --mount --pid --fork`, which is what
+/// makes this both possible and safe: a process can only signal processes in
+/// its own PID namespace, so `kill(-1)` from here reaches every descendant --
+/// including the grandchildren a scriptlet left behind, which killing the
+/// direct child does not -- and nothing outside. The guard is the whole
+/// safety argument, so it is checked rather than assumed: the same code runs
+/// in-process under the unit tests, where this must do nothing at all.
+///
+/// Reaping matters as much as killing. A signalled process still holds its
+/// mounts until it is gone, and the unmount that follows is what makes the
+/// difference between a transaction that cleaned up and one the caller has to
+/// be warned about.
+fn reapNamespace() void {
+    if (builtin.os.tag != .linux) return;
+    if (std.os.linux.getpid() != 1) return;
+    _ = std.os.linux.kill(-1, .KILL);
+    while (true) {
+        var status: u32 = undefined;
+        const rc = std.os.linux.waitpid(-1, &status, 0);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => continue,
+            .INTR => continue,
+            // No children left, which is the point at which the namespace
+            // holds nothing but this process.
+            .CHILD => return,
+            else => return,
+        }
+    }
+}
 
 fn executeManifest(
     allocator: Allocator,
@@ -312,7 +430,7 @@ fn executeManifest(
     // resources may still be active would name something that never happened.
     validateManifestPolicy(manifest) catch {
         return .{
-            .operation_succeeded = false,
+            .outcome = .failed,
             .cleanup_complete = true,
             .report = .{ .tools = &.{}, .installed_packages = &.{}, .hooks = &.{} },
         };
@@ -330,10 +448,26 @@ fn executeManifest(
         .preexisting_loops = .init(allocator),
         .hook_records = .init(allocator),
     };
-    const operation_result = session.openAndRun();
+    const outcome = session.openAndRun();
+    // Before the teardown, and only on this path. The command that ran out of
+    // time was killed, but anything it spawned was re-parented to this process
+    // -- the namespace's init -- and a scriptlet's surviving child holding the
+    // target root open is exactly what would turn an unmount into a failure.
+    // Nothing else in the run has orphans to collect: a command that returned
+    // took its own children with it or left them to this same reaper on the
+    // way out.
+    if (outcome == .deadline_exceeded) reapNamespace();
+    // Teardown gets a budget of its own rather than what is left of the run's,
+    // which on the path that matters most is nothing at all. Unmounting,
+    // detaching the loop device and removing the guest root are what keep the
+    // host from being left holding the staging image, so they must not be
+    // preempted by the very deadline that made them necessary -- while still
+    // being bounded, because a wedged unmount would otherwise hang the build
+    // in the one place there is nothing left to stop it.
+    session.executor.deadline = .start(io, cleanup_deadline_seconds);
     const cleanup_complete = session.close();
     return .{
-        .operation_succeeded = operation_result != null,
+        .outcome = outcome,
         .cleanup_complete = cleanup_complete,
         .report = .{
             .tools = session.tools.items,
@@ -382,17 +516,17 @@ const Session = struct {
     boot_configuration: ?customize.BootConfigurationRecord = null,
     package_cache: ?customize.PackageCacheRecord = null,
 
-    fn openAndRun(self: *Session) ?void {
-        self.open() catch return null;
-        self.runPolicy() catch return null;
-        self.loadInstalledPackages() catch return null;
+    fn openAndRun(self: *Session) RunOutcome {
+        self.open() catch |err| return classifyRunFailure(err);
+        self.runPolicy() catch |err| return classifyRunFailure(err);
+        self.loadInstalledPackages() catch |err| return classifyRunFailure(err);
         // After the rpm database has been read, and before `close` publishes
         // anything: a run whose lock did not hold must fail while the image is
         // still staging, not after it has been committed under a plan hash
         // that claims the versions were pinned.
-        self.verifyPackageLock() catch return null;
-        self.emitPackageLock() catch return null;
-        return {};
+        self.verifyPackageLock() catch |err| return classifyRunFailure(err);
+        self.emitPackageLock() catch |err| return classifyRunFailure(err);
+        return .succeeded;
     }
 
     fn open(self: *Session) !void {
@@ -1899,6 +2033,10 @@ const Executor = struct {
     /// exactly like running a command, so it belongs to the same seam. Tests
     /// get `.empty` and so cannot accidentally read the developer's shell.
     environ: std.process.Environ = .empty,
+    /// The run's remaining budget, resolved once. Held here rather than passed
+    /// at each call site because it is one budget for the whole worker: a
+    /// deadline every command got a fresh copy of would bound nothing.
+    deadline: customize.Deadline = .unbounded,
     runFn: *const fn (
         context: ?*anyopaque,
         allocator: Allocator,
@@ -1906,6 +2044,7 @@ const Executor = struct {
         argv: []const []const u8,
         capture_output: bool,
         stdin_file: ?Io.File,
+        deadline: customize.Deadline,
     ) anyerror!CommandResult,
 
     fn system(environ: std.process.Environ) Executor {
@@ -1927,6 +2066,7 @@ const Executor = struct {
             argv,
             capture_output,
             stdin_file,
+            self.deadline,
         );
     }
 };
@@ -1950,6 +2090,15 @@ fn baseEnvironment(allocator: Allocator) !std.process.Environ.Map {
     return environment;
 }
 
+/// Runs one command under the run's budget.
+///
+/// Every shape pipes, including the one whose output is not captured. An
+/// inherited descriptor would leave the worker blocked in `Child.wait`, which
+/// takes no deadline; reading is the only place the budget can be applied. So
+/// uncaptured output is forwarded to the worker's own streams as it arrives
+/// instead of being written to the builder's descriptors directly. It is still
+/// unbuffered and still uncaptured -- a build log rather than a value -- but it
+/// now passes through a process that can stop waiting for it.
 fn runSystem(
     _: ?*anyopaque,
     allocator: Allocator,
@@ -1957,6 +2106,7 @@ fn runSystem(
     argv: []const []const u8,
     capture_output: bool,
     stdin_file: ?Io.File,
+    deadline: customize.Deadline,
 ) !CommandResult {
     var environment = try baseEnvironment(allocator);
     defer environment.deinit();
@@ -1965,11 +2115,25 @@ fn runSystem(
             .argv = argv,
             .environ_map = &environment,
             .stdin = if (stdin_file) |file| .{ .file = file } else .ignore,
-            .stdout = .inherit,
-            .stderr = .inherit,
+            .stdout = .pipe,
+            .stderr = .pipe,
         });
+        const timed_out = forwardUntilEnd(
+            allocator,
+            io,
+            child.stdout.?,
+            child.stderr.?,
+            deadline,
+        ) catch |err| {
+            child.kill(io);
+            return err;
+        };
+        if (timed_out) {
+            child.kill(io);
+            return error.ExecutionDeadlineExceeded;
+        }
         return .{
-            .term = try child.wait(io),
+            .term = try waitBounded(io, &child, deadline),
             .stdout = &.{},
             .stderr = &.{},
             .owned_output = false,
@@ -1996,7 +2160,7 @@ fn runSystem(
         defer multi_reader.deinit();
         const stdout_reader = multi_reader.reader(0);
         const stderr_reader = multi_reader.reader(1);
-        while (multi_reader.fill(64, .none)) |_| {
+        while (multi_reader.fill(64, deadline.timeout)) |_| {
             if (stdout_reader.buffered().len > max_command_output or
                 stderr_reader.buffered().len > max_command_output)
             {
@@ -2004,10 +2168,11 @@ fn runSystem(
             }
         } else |err| switch (err) {
             error.EndOfStream => {},
+            error.Timeout => return error.ExecutionDeadlineExceeded,
             else => |read_err| return read_err,
         }
         try multi_reader.checkAnyError();
-        const term = try child.wait(io);
+        const term = try waitBounded(io, &child, deadline);
         const stdout = try multi_reader.toOwnedSlice(0);
         errdefer allocator.free(stdout);
         const stderr = try multi_reader.toOwnedSlice(1);
@@ -2017,17 +2182,86 @@ fn runSystem(
             .stderr = stderr,
         };
     }
-    const result = try std.process.run(allocator, io, .{
+    const result = std.process.run(allocator, io, .{
         .argv = argv,
         .environ_map = &environment,
         .stdout_limit = .limited(max_command_output),
         .stderr_limit = .limited(max_command_output),
-    });
+        .timeout = deadline.timeout,
+    }) catch |err| switch (err) {
+        // `std.process.run` kills the child on its way out, so the name of
+        // the failure is the only thing left to translate.
+        error.Timeout => return error.ExecutionDeadlineExceeded,
+        else => |run_err| return run_err,
+    };
     return .{
         .term = result.term,
         .stdout = result.stdout,
         .stderr = result.stderr,
     };
+}
+
+/// Reaps a child whose streams have already ended, without waiting past the
+/// run's budget.
+///
+/// `Child.wait` takes no deadline, so a command that closed its descriptors
+/// and then hung would block here until something outside gave up -- which is
+/// the one case where the worker would stop being the process that reports its
+/// own expiry. The exit is therefore waited for through a pidfd, which is
+/// pollable, and only then reaped. On a kernel too old to open one the wait
+/// falls back to the unbounded form, still backstopped by the parent.
+fn waitBounded(
+    io: Io,
+    child: *std.process.Child,
+    deadline: customize.Deadline,
+) !std.process.Child.Term {
+    if (deadline.expired(io)) {
+        child.kill(io);
+        return error.ExecutionDeadlineExceeded;
+    }
+    if (!try exitedWithinDeadline(io, child, deadline)) {
+        // `kill` both signals and reaps, so nothing is left of the command
+        // that ran out of time.
+        child.kill(io);
+        return error.ExecutionDeadlineExceeded;
+    }
+    return child.wait(io);
+}
+
+/// Whether the child ended before the budget did. True without waiting at all
+/// when there is no budget, or when the exit cannot be watched for.
+fn exitedWithinDeadline(
+    io: Io,
+    child: *std.process.Child,
+    deadline: customize.Deadline,
+) !bool {
+    if (builtin.os.tag != .linux) return true;
+    const pid = child.id orelse return true;
+    const open_rc = std.os.linux.pidfd_open(pid, 0);
+    if (std.os.linux.errno(open_rc) != .SUCCESS) return true;
+    const pidfd: i32 = @intCast(open_rc);
+    defer _ = std.os.linux.close(pidfd);
+    while (true) {
+        const remaining = deadline.remainingSeconds(io) orelse return true;
+        if (remaining == 0) return false;
+        var fds = [_]std.os.linux.pollfd{.{
+            .fd = pidfd,
+            .events = std.os.linux.POLL.IN,
+            .revents = 0,
+        }};
+        // Woken every second rather than once for the whole remainder, so the
+        // wait cannot outlive a budget measured on a clock this poll does not
+        // share.
+        const poll_rc = std.os.linux.poll(&fds, fds.len, 1000);
+        switch (std.os.linux.errno(poll_rc)) {
+            .SUCCESS => if (poll_rc != 0) return true,
+            .INTR => {},
+            // A pidfd that cannot be polled is not a reason to fail a command
+            // that may well have finished; the unbounded wait still has the
+            // parent behind it.
+            else => return true,
+        }
+    }
 }
 
 fn expectSuccess(term: std.process.Child.Term) !void {
@@ -2687,15 +2921,29 @@ const WorkerOutcome = enum {
     cleanup_uncertain,
     cleanup_complete_failed,
     cleanup_complete_success,
+    /// The worker stopped because the run's budget was spent, and finished its
+    /// own teardown before saying so.
+    cleanup_complete_deadline,
 };
 
+/// What the worker left behind, read from the status file rather than from its
+/// exit status, because the exit status cannot distinguish a worker that tore
+/// its own resources down from one that died holding them.
+///
+/// `term` is absent when the parent killed the worker on its own bound. That
+/// says nothing new about cleanup, so the status file still decides; a killed
+/// worker that had already written `cleanup-complete` really had.
 fn classifyWorkerOutcome(
     io: Io,
     status_path: []const u8,
-    term: std.process.Child.Term,
+    term: ?std.process.Child.Term,
 ) WorkerOutcome {
+    if (statusEquals(io, status_path, deadline_exceeded_text)) {
+        return .cleanup_complete_deadline;
+    }
     if (statusEquals(io, status_path, cleanup_complete_text)) {
-        return switch (term) {
+        const exit_term = term orelse return .cleanup_complete_failed;
+        return switch (exit_term) {
             .exited => |code| if (code == 0)
                 .cleanup_complete_success
             else
@@ -2707,6 +2955,103 @@ fn classifyWorkerOutcome(
         .cleanup_uncertain
     else
         .never_started;
+}
+
+const WorkerSupervision = struct {
+    /// Absent when the parent gave up on the worker and killed it.
+    term: ?std.process.Child.Term,
+    timed_out: bool,
+};
+
+/// Runs the worker to completion, forwarding what it prints, and gives up on
+/// it a fixed grace after the run's deadline.
+///
+/// The output is forwarded rather than captured because it is a build log
+/// rather than a value the run consumes: a package transaction's progress and
+/// a hook's output belong on the builder's own streams as they happen. It
+/// travels through a pipe rather than an inherited descriptor only because
+/// reading is the one place a wall clock can be applied -- `Child.wait` takes
+/// no deadline.
+fn superviseWorker(
+    allocator: Allocator,
+    io: Io,
+    child: *std.process.Child,
+    timeout: customize.Deadline,
+) !WorkerSupervision {
+    // Every path out of here that is not a clean exit leaves the worker
+    // killed. A supervisor that returned an error while the process it was
+    // supervising kept running would leave privileged target code executing
+    // with nothing left watching it.
+    errdefer child.kill(io);
+    const timed_out = try forwardUntilEnd(
+        allocator,
+        io,
+        child.stdout.?,
+        child.stderr.?,
+        timeout,
+    );
+    if (timed_out) {
+        // Kills `unshare`. The worker holds `PR_SET_PDEATHSIG` from
+        // `--kill-child`, so the PID namespace's init dies with its parent and
+        // the kernel removes every process left inside the namespace. What it
+        // cannot remove is anything global the worker had attached -- a loop
+        // device outlives the namespace -- which is why this path reports
+        // through the status file rather than as a clean stop.
+        child.kill(io);
+        return .{ .term = null, .timed_out = true };
+    }
+    return .{ .term = try child.wait(io), .timed_out = false };
+}
+
+/// Forwards a process's two output streams until both end, or until the
+/// budget is spent -- which it reports rather than raises, because the caller
+/// is the one that knows what the process it was reading is.
+///
+/// Its reader is torn down before it returns, so a caller that goes on to kill
+/// the process owning these descriptors is not cancelling a read still in
+/// flight against them.
+fn forwardUntilEnd(
+    allocator: Allocator,
+    io: Io,
+    stdout_file: Io.File,
+    stderr_file: Io.File,
+    deadline: customize.Deadline,
+) !bool {
+    var multi_reader_buffer: Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: Io.File.MultiReader = undefined;
+    multi_reader.init(
+        allocator,
+        io,
+        multi_reader_buffer.toStreams(),
+        &.{ stdout_file, stderr_file },
+    );
+    defer multi_reader.deinit();
+    var timed_out = false;
+    while (multi_reader.fill(4096, deadline.timeout)) |_| {
+        forwardWorkerOutput(io, &multi_reader);
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        error.Timeout => timed_out = true,
+        else => |read_err| return read_err,
+    }
+    forwardWorkerOutput(io, &multi_reader);
+    return timed_out;
+}
+
+/// Copies whatever has arrived to the builder's own streams and drops it, so
+/// the forwarding buffer stays a window rather than a transcript.
+fn forwardWorkerOutput(io: Io, multi_reader: *Io.File.MultiReader) void {
+    forwardStream(io, multi_reader.reader(0), Io.File.stdout());
+    forwardStream(io, multi_reader.reader(1), Io.File.stderr());
+}
+
+fn forwardStream(io: Io, reader: *Io.Reader, file: Io.File) void {
+    const bytes = reader.buffered();
+    if (bytes.len == 0) return;
+    // A builder whose own stdout has gone away is not a reason to fail a
+    // privileged run that is otherwise proceeding.
+    file.writeStreamingAll(io, bytes) catch {};
+    reader.toss(bytes.len);
 }
 
 fn loadParentReport(
@@ -2947,6 +3292,22 @@ test "worker status distinguishes startup cleanup and operation outcomes" {
         WorkerOutcome.cleanup_complete_success,
         classifyWorkerOutcome(io, status_path, .{ .exited = 0 }),
     );
+    // A worker the parent killed on its own bound reports no exit status. The
+    // status file still decides, and cleanup it had already finished stays
+    // finished.
+    try std.testing.expectEqual(
+        WorkerOutcome.cleanup_complete_failed,
+        classifyWorkerOutcome(io, status_path, null),
+    );
+    try writeBytes(io, status_path, deadline_exceeded_text);
+    try std.testing.expectEqual(
+        WorkerOutcome.cleanup_complete_deadline,
+        classifyWorkerOutcome(io, status_path, .{ .exited = 1 }),
+    );
+    try std.testing.expectEqual(
+        WorkerOutcome.cleanup_complete_deadline,
+        classifyWorkerOutcome(io, status_path, null),
+    );
 }
 
 test "worker executes policy with strict reverse cleanup" {
@@ -3011,7 +3372,7 @@ test "worker executes policy with strict reverse cleanup" {
             .runFn = FakeExecutorContext.run,
         },
     );
-    try std.testing.expect(!identity_mismatch.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.failed, identity_mismatch.outcome);
     try std.testing.expect(!identity_mismatch.cleanup_complete);
     try std.testing.expectEqual(
         @as(usize, 0),
@@ -3035,7 +3396,7 @@ test "worker executes policy with strict reverse cleanup" {
             .runFn = FakeExecutorContext.run,
         },
     );
-    try std.testing.expect(!malformed_inventory.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.failed, malformed_inventory.outcome);
     try std.testing.expect(!malformed_inventory.cleanup_complete);
     try std.testing.expectEqual(
         @as(usize, 1),
@@ -3054,7 +3415,7 @@ test "worker executes policy with strict reverse cleanup" {
         .runFn = FakeExecutorContext.run,
     };
     const result = try executeManifest(allocator, io, manifest, executor);
-    try std.testing.expect(result.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
     try std.testing.expect(result.cleanup_complete);
     try std.testing.expectEqual(@as(usize, 5), result.report.tools.len);
     try std.testing.expectEqualStrings(
@@ -3121,10 +3482,31 @@ test "worker executes policy with strict reverse cleanup" {
         .context = &failing_context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(!failed.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.failed, failed.outcome);
     try std.testing.expect(failed.cleanup_complete);
     try std.testing.expectEqual(@as(usize, 6), failing_context.unmounts.items.len);
     try std.testing.expect(failing_context.detached_loop);
+
+    // A command that ran out of time is not a command that failed. The run
+    // stops either way, but only this one is answered by more time -- and the
+    // teardown still has to finish, because the deadline is the reason the run
+    // stopped and not permission to leave the host holding a mount.
+    var expired_context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .timeline = .init(allocator),
+        .deadline_on_command = "tdnf",
+    };
+    const expired = try executeManifest(allocator, io, manifest, .{
+        .context = &expired_context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expectEqual(RunOutcome.deadline_exceeded, expired.outcome);
+    try std.testing.expect(expired.cleanup_complete);
+    try std.testing.expectEqual(@as(usize, 6), expired_context.unmounts.items.len);
+    try std.testing.expect(expired_context.detached_loop);
 
     var malformed_context = FakeExecutorContext{
         .allocator = allocator,
@@ -3138,7 +3520,7 @@ test "worker executes policy with strict reverse cleanup" {
         .context = &malformed_context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(!malformed.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.failed, malformed.outcome);
     try std.testing.expect(malformed.cleanup_complete);
     try std.testing.expect(malformed_context.queried_associated_loops);
     try std.testing.expectEqual(@as(usize, 2), malformed_context.detached_loops);
@@ -3156,7 +3538,7 @@ test "worker executes policy with strict reverse cleanup" {
         .context = &preexisting_context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(!preexisting.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.failed, preexisting.outcome);
     try std.testing.expect(!preexisting.cleanup_complete);
     try std.testing.expectEqual(
         @as(usize, 0),
@@ -3175,7 +3557,7 @@ test "worker executes policy with strict reverse cleanup" {
         .context = &cleanup_failure_context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(cleanup_failure.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.succeeded, cleanup_failure.outcome);
     try std.testing.expect(!cleanup_failure.cleanup_complete);
     try std.testing.expectEqual(
         @as(usize, 6),
@@ -3198,7 +3580,7 @@ test "worker executes policy with strict reverse cleanup" {
         .context = &lazy_detach_context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(lazy_detach.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.succeeded, lazy_detach.outcome);
     try std.testing.expect(!lazy_detach.cleanup_complete);
 
     var symlink_resolver_context = FakeExecutorContext{
@@ -3213,7 +3595,7 @@ test "worker executes policy with strict reverse cleanup" {
         .context = &symlink_resolver_context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(symlink_resolver.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.succeeded, symlink_resolver.outcome);
     try std.testing.expect(symlink_resolver.cleanup_complete);
 
     var missing_resolver_context = FakeExecutorContext{
@@ -3228,7 +3610,7 @@ test "worker executes policy with strict reverse cleanup" {
         .context = &missing_resolver_context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(missing_resolver.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.succeeded, missing_resolver.outcome);
     try std.testing.expect(missing_resolver.cleanup_complete);
 }
 
@@ -3309,7 +3691,7 @@ test "hooks run where the plan says they run, and stop existing when they are do
         .context = &context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(result.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
     try std.testing.expect(result.cleanup_complete);
 
     // The order the plan publishes, and no other. `buildOperations` emits
@@ -3426,7 +3808,7 @@ test "a hook that fails fails the run" {
     // A nonzero exit ends the run. Nothing is published, and the hook that
     // would have run afterwards never does -- a later phase that ran anyway
     // would be doing its work against a root an earlier phase abandoned.
-    try std.testing.expect(!result.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.failed, result.outcome);
     try std.testing.expect(result.cleanup_complete);
     try std.testing.expectEqual(@as(usize, 1), context.timeline.items.len);
     try std.testing.expectEqualStrings("/run/zvmi-hook-0", context.timeline.items[0]);
@@ -3497,7 +3879,7 @@ test "a hook source is read on the host, not from inside the target" {
         .context = &context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(result.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
     try std.testing.expectEqualStrings(
         script,
         context.hook_script_at_run orelse return error.TestUnexpectedResult,
@@ -3683,7 +4065,7 @@ test "a credential reaches tdnf without reaching anything that outlives the run"
         .context = &context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(result.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
     try std.testing.expect(result.cleanup_complete);
 
     // The material arrives, trimmed of the newline the file carried.
@@ -3750,6 +4132,7 @@ test "nothing the worker runs inherits the worker's environment" {
             &.{env_tool},
             true,
             stdin_file,
+            .unbounded,
         );
         try std.testing.expectEqual(@as(u8, 0), result.term.exited);
 
@@ -4055,7 +4438,7 @@ test "worker regenerates every installed kernel when the policy names none" {
         .context = &context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(result.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
     try std.testing.expect(result.cleanup_complete);
 
     // The resolved releases are auditable because the recorded command is the
@@ -4090,7 +4473,7 @@ test "worker regenerates every installed kernel when the policy names none" {
         .context = &empty_context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(!empty.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.failed, empty.outcome);
     try std.testing.expect(!empty_context.saw_dracut);
 
     // Unless the host derived the regeneration rather than being asked for
@@ -4114,7 +4497,7 @@ test "worker regenerates every installed kernel when the policy names none" {
         .context = &derived_context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(derived.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.succeeded, derived.outcome);
     try std.testing.expect(derived.cleanup_complete);
     try std.testing.expect(!derived_context.saw_dracut);
 
@@ -4143,7 +4526,7 @@ test "worker regenerates every installed kernel when the policy names none" {
         .context = &unreadable_context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(!unreadable.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.failed, unreadable.outcome);
     try std.testing.expect(!unreadable_context.saw_dracut);
 
     // The same distinction one level in: a release directory that cannot be
@@ -4168,7 +4551,7 @@ test "worker regenerates every installed kernel when the policy names none" {
         .context = &locked_context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(!locked.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.failed, locked.outcome);
     try std.testing.expect(!locked_context.saw_dracut);
 }
 
@@ -4236,7 +4619,7 @@ test "worker places kernel-module configuration after packages and before dracut
         .context = &context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(result.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
     try std.testing.expect(result.cleanup_complete);
 
     // A package shipping its own modprobe configuration must not land on top
@@ -4319,7 +4702,7 @@ test "worker installs the declared resolver and none without package actions" {
         .context = &declared_context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(declared_result.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.succeeded, declared_result.outcome);
     try std.testing.expect(declared_result.cleanup_complete);
     try std.testing.expectEqualStrings(
         "nameserver 192.0.2.1\nnameserver 198.51.100.7\n",
@@ -4351,7 +4734,7 @@ test "worker installs the declared resolver and none without package actions" {
         .context = &idle_context,
         .runFn = FakeExecutorContext.run,
     });
-    try std.testing.expect(idle_result.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.succeeded, idle_result.outcome);
     try std.testing.expect(idle_result.cleanup_complete);
     try std.testing.expectEqual(@as(usize, 5), idle_context.unmounts.items.len);
     try std.testing.expect(!containsArg(
@@ -4384,7 +4767,7 @@ test "worker installs the declared resolver and none without package actions" {
         refused,
         .{ .context = &refused_context, .runFn = FakeExecutorContext.run },
     );
-    try std.testing.expect(!refused_result.operation_succeeded);
+    try std.testing.expectEqual(RunOutcome.failed, refused_result.outcome);
     // Cleanup is complete because there was nothing to clean up. The parent
     // reads a propagated error here as "the worker may have left resources
     // attached" and abandons its lease, poisoning the transaction directory
@@ -4524,6 +4907,11 @@ const FakeExecutorContext = struct {
     detached_loops: usize = 0,
     fail_tdnf: bool = false,
     fail_umount: bool = false,
+    /// A run in which any command line mentioning this name never returns
+    /// within the run's budget. Names a command rather than a duration because
+    /// the fake has no clock: what a test is asserting about is the outcome of
+    /// a command that ran out of time, not the timing that produced it.
+    deadline_on_command: ?[]const u8 = null,
     malformed_losetup: bool = false,
     queried_associated_loops: bool = false,
     associated_loop_stuck: bool = false,
@@ -4622,8 +5010,21 @@ const FakeExecutorContext = struct {
         argv: []const []const u8,
         _: bool,
         _: ?Io.File,
+        _: customize.Deadline,
     ) !CommandResult {
         const self: *FakeExecutorContext = @ptrCast(@alignCast(context_ptr.?));
+        // Stands in for a command that outlived the run's budget, which is
+        // what `runSystem` reports after it has killed the child.
+        if (self.deadline_on_command) |name| {
+            for (argv) |arg| {
+                // Matched anywhere in the command line because the real ones
+                // run through `chroot`, where the program that would have hung
+                // is an argument rather than argv[0].
+                if (std.mem.endsWith(u8, arg, name)) {
+                    return error.ExecutionDeadlineExceeded;
+                }
+            }
+        }
         if (self.plant_in_target) |relative| {
             const path = try std.fs.path.join(
                 self.allocator,

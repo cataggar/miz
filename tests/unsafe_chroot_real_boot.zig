@@ -713,9 +713,11 @@ fn runUnsafeChroot(
     io: Io,
     plan: *const zvmi.customize.ResolvedPlan,
     target: zvmi.preserved_image.RawMutationTarget,
+    deadline: zvmi.customize.Deadline,
 ) !zvmi.customize.UnsafeChrootRuntimeReport {
     const context: *RuntimeContext = @ptrCast(@alignCast(context_ptr.?));
     return zvmi.unsafe_chroot.runParent(allocator, io, .{
+        .deadline = deadline,
         .self_exe = context.self_exe,
         .transaction_path = plan.data.transaction_path,
         .plan = plan,

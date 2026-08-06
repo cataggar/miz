@@ -51,6 +51,7 @@ const LoadedConfiguration = struct {
     guest_execution: wire.GuestExecutionPolicy,
     runner: ?wire.Runner,
     vm: ?zvmi.customize.VmPolicy,
+    deadline_seconds: ?u32 = null,
     /// Set when the configuration asked for a firmware boot without naming the
     /// EDK2 files. Resolution needs the runner architecture and the filesystem,
     /// so it happens in `main` where a failure can be reported as the
@@ -241,6 +242,7 @@ pub fn main(init: std.process.Init) !void {
             .backend = configuration.backend,
             .acknowledge_unsafe = configuration.acknowledge_unsafe,
             .vm = vm_policy,
+            .deadline_seconds = configuration.deadline_seconds,
         },
         .generalization = configuration.generalization,
         .reproducibility = .{
@@ -633,6 +635,7 @@ fn loadV3Configuration(
         .runner = parsed.value.runner,
         .vm = mapVmPolicy(parsed.value.vm),
         .vm_firmware_unresolved = vmFirmwareUnresolved(parsed.value.vm),
+        .deadline_seconds = parsed.value.deadline_seconds,
     };
 }
 
@@ -1131,6 +1134,7 @@ fn runUnsafeChroot(
     io: std.Io,
     plan: *const zvmi.customize.ResolvedPlan,
     target: zvmi.preserved_image.RawMutationTarget,
+    deadline: zvmi.customize.Deadline,
 ) !zvmi.customize.UnsafeChrootRuntimeReport {
     const context: *UnsafeRuntimeContext = @ptrCast(@alignCast(context_ptr.?));
     return zvmi.unsafe_chroot.runParent(allocator, io, .{
@@ -1139,6 +1143,7 @@ fn runUnsafeChroot(
         .plan = plan,
         .target = target,
         .environ = context.environ,
+        .deadline = deadline,
     });
 }
 
@@ -1156,6 +1161,7 @@ fn runVm(
     io: std.Io,
     plan: *const zvmi.customize.ResolvedPlan,
     target: zvmi.preserved_image.RawMutationTarget,
+    deadline: zvmi.customize.Deadline,
 ) !zvmi.customize.VmRuntimeReport {
     const context: *UnsafeRuntimeContext = @ptrCast(@alignCast(context_ptr.?));
     const agent = guest_agents.get(
@@ -1172,6 +1178,7 @@ fn runVm(
         // caller's environment, and reading the process's own would make the
         // library's answer depend on something the caller never handed it.
         .environ = context.environ,
+        .deadline = deadline,
     });
 }
 

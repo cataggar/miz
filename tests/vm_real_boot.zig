@@ -348,8 +348,10 @@ fn runVm(
     io: Io,
     plan: *const zvmi.customize.ResolvedPlan,
     target: zvmi.preserved_image.RawMutationTarget,
+    deadline: zvmi.customize.Deadline,
 ) !zvmi.customize.VmRuntimeReport {
     return zvmi.vm_backend.run(allocator, io, .{
+        .deadline = deadline,
         .plan = plan,
         .transaction_path = plan.data.transaction_path,
         .target = target,
