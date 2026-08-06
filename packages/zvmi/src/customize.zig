@@ -12661,6 +12661,55 @@ test "a repository credential is declared by reference and never by value" {
         );
     }
 
+    // A credential is reachable from published provenance, deliberately -- the
+    // repository policy is recorded whole -- so the guarantee cannot be "not
+    // there" and has to be "there only as a reference". #308 grew `Provenance`
+    // by several records and will grow it again, so the reachability is
+    // established by walking the type graph rather than by naming the one
+    // field that happens to carry it today.
+    comptime {
+        @setEvalBranchQuota(200_000);
+        const reach = struct {
+            fn reachesCredential(comptime T: type, comptime seen: []const type) bool {
+                if (T == BasicCredential or T == RepositoryCredential) return true;
+                for (seen) |already| if (already == T) return false;
+                const next = seen ++ [_]type{T};
+                return switch (@typeInfo(T)) {
+                    .@"struct" => |info| for (info.fields) |field| {
+                        if (reachesCredential(field.type, next)) break true;
+                    } else false,
+                    .@"union" => |info| for (info.fields) |field| {
+                        if (reachesCredential(field.type, next)) break true;
+                    } else false,
+                    .optional => |info| reachesCredential(info.child, next),
+                    .array => |info| reachesCredential(info.child, next),
+                    .pointer => |info| reachesCredential(info.child, next),
+                    else => false,
+                };
+            }
+        };
+        std.debug.assert(reach.reachesCredential(Provenance, &.{}));
+
+        // Which makes `BasicCredential` the whole of what provenance can say
+        // about an identity: a user name, which is not a secret, and a
+        // reference. A third field, or a password that stopped being a
+        // `CredentialSource`, would be published by `writeProvenanceJson`
+        // without anyone having to add it there.
+        const basic = @typeInfo(BasicCredential).@"struct".fields;
+        std.debug.assert(basic.len == 2);
+        std.debug.assert(std.mem.eql(u8, basic[0].name, "username"));
+        std.debug.assert(basic[0].type == []const u8);
+        std.debug.assert(std.mem.eql(u8, basic[1].name, "password"));
+        std.debug.assert(basic[1].type == CredentialSource);
+        // And a reference is a name: every arm names something on the build
+        // machine, so none of them can be holding the material itself.
+        for (@typeInfo(CredentialSource).@"union".fields) |arm| {
+            std.debug.assert(arm.type == []const u8);
+        }
+        // `basic` is the only arm, so there is no second shape to check.
+        std.debug.assert(@typeInfo(RepositoryCredential).@"union".fields.len == 1);
+    }
+
     const repositories = [_]PackageRepository{.{
         .id = "base",
         .urls = &.{"https://packages.example.invalid"},
@@ -13296,6 +13345,212 @@ test "the vm backend accepts a credential and carries it off the control documen
     try std.testing.expectEqual(@as(usize, 2), basic.len);
     try std.testing.expect(std.mem.eql(u8, basic[0].name, "username"));
     try std.testing.expect(std.mem.eql(u8, basic[1].name, "password_index"));
+}
+
+test "no credential material reaches any document a run publishes" {
+    // #308: every slice in this batch widened what provenance records --
+    // host-side commands, discovered kernels, imported trust, the host
+    // resolver -- and each of those is a new place a secret could surface. The
+    // claim is made over the whole document rather than field by field,
+    // because the next field added is the one nobody would think to check.
+    const io = std.testing.io;
+    const source_path = "test-customize-credential-source.raw";
+    const spool_path = "test-customize-credential-spool";
+    const workspace_path = "test-customize-credential-work";
+    const secret_path = "test-customize-credential-secret";
+    const output_path = workspace_path ++ "/output.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, secret_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try createCustomizeTestDisk(io, source_path, spool_path);
+    try Io.Dir.cwd().createDirPath(io, workspace_path);
+
+    // The file is real and readable by this process, so its absence from the
+    // documents is a decision not to read it rather than a failure to find it.
+    const file_material = "zvmi-sentinel-from-a-file";
+    const variable_name = "ZVMI_TEST_CREDENTIAL_SENTINEL";
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = secret_path,
+        .data = file_material ++ "\n",
+    });
+    var cwd_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_length = try std.process.currentPath(io, &cwd_buffer);
+    var absolute_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const absolute_secret = try std.fmt.bufPrint(
+        &absolute_buffer,
+        "{s}/{s}",
+        .{ cwd_buffer[0..cwd_length], secret_path },
+    );
+
+    // Both channels at once: a path and a variable resolve differently and
+    // fail differently, so a leak through one would not be caught by a test
+    // that only declared the other.
+    const repositories = [_]PackageRepository{
+        .{
+            .id = "base",
+            .urls = &.{"https://packages.example.invalid"},
+            .trust = &.{.{ .inline_bytes = "test key" }},
+            .credential = .{ .basic = .{
+                .username = "builder",
+                .password = .{ .host_path = absolute_secret },
+            } },
+        },
+        .{
+            .id = "other",
+            .urls = &.{"https://other.example.invalid"},
+            .trust = &.{.{ .inline_bytes = "test key" }},
+            .credential = .{ .basic = .{
+                .username = "builder",
+                .password = .{ .host_environment = variable_name },
+            } },
+        },
+    };
+    var request = validNativeEditRequest(
+        source_path,
+        output_path,
+        workspace_path,
+        &.{},
+    );
+    request.execution.backend = .unsafe_chroot;
+    request.execution.acknowledge_unsafe = true;
+    request.packages = .{
+        .actions = &.{.{ .install = &.{"dracut"} }},
+        .repositories = &repositories,
+    };
+
+    const FakeUnsafe = struct {
+        var tools: [1]ToolRecord = undefined;
+        var arguments: [3][]const u8 = undefined;
+
+        fn check(_: ?*anyopaque, _: Io, _: *const ResolvedPlan) CapabilityState {
+            return .available;
+        }
+
+        fn run(
+            _: ?*anyopaque,
+            allocator: Allocator,
+            _: Io,
+            _: *const ResolvedPlan,
+            _: preserved_image.RawMutationTarget,
+            _: Deadline,
+        ) !UnsafeChrootRuntimeReport {
+            return .{
+                .arena = std.heap.ArenaAllocator.init(allocator),
+                .tools = &tools,
+                .installed_packages = &.{},
+                .imported_trust_keys = &.{"gpg-pubkey-3fa2e4b1"},
+                .host_resolver = .{
+                    .sha256 = .{ .bytes = [_]u8{0x11} ** 32 },
+                    .size = 42,
+                },
+            };
+        }
+    };
+    // A recorded argv that names the repository file the material is written
+    // into, so the surface the assertion sweeps is the real one.
+    FakeUnsafe.arguments = .{ "/usr/bin/tdnf", "install", "dracut" };
+    FakeUnsafe.tools = .{.{
+        .name = "tdnf",
+        .version = "3.5.2",
+        .command = &FakeUnsafe.arguments,
+        .context = .target_root,
+    }};
+
+    var platform = Platform.system();
+    platform.unsafeChrootCheckFn = FakeUnsafe.check;
+    platform.unsafeChrootRunFn = FakeUnsafe.run;
+    var resolved = try resolve(
+        std.testing.allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    const plan = resolved.plan orelse return error.TestUnexpectedResult;
+    var outcome = try execute(
+        std.testing.allocator,
+        io,
+        &resolved.plan.?,
+        platform,
+        null,
+    );
+    defer outcome.deinit(std.testing.allocator);
+    const result = outcome.result orelse return error.TestUnexpectedResult;
+
+    // Everything this library writes out, in the order a consumer meets it.
+    const Document = struct { name: []const u8, bytes: []const u8 };
+    var request_json: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer request_json.deinit();
+    try writeRequestJson(request, &request_json.writer);
+    var plan_json: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer plan_json.deinit();
+    try writePlanJson(&plan, &plan_json.writer);
+    var provenance_json: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer provenance_json.deinit();
+    try writeProvenanceJson(result.provenance, &provenance_json.writer);
+    var diagnostics_json: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics_json.deinit();
+    try writeDiagnosticsJson(outcome.diagnostics, &diagnostics_json.writer);
+    const documents = [_]Document{
+        .{ .name = "request", .bytes = request_json.written() },
+        .{ .name = "plan", .bytes = plan_json.written() },
+        .{ .name = "provenance", .bytes = provenance_json.written() },
+        .{ .name = "diagnostics", .bytes = diagnostics_json.written() },
+    };
+    for (documents) |document| {
+        try std.testing.expect(
+            std.mem.indexOf(u8, document.bytes, file_material) == null,
+        );
+    }
+
+    // The typed surfaces too, because a leak into an argv or a message would
+    // be caught above only for as long as that field keeps stringifying.
+    for (result.provenance.tools) |tool| {
+        for (tool.command) |argument| {
+            try std.testing.expect(
+                std.mem.indexOf(u8, argument, file_material) == null,
+            );
+        }
+    }
+    for (outcome.diagnostics.items) |diagnostic| {
+        try std.testing.expect(
+            std.mem.indexOf(u8, diagnostic.message, file_material) == null,
+        );
+        const command = diagnostic.command orelse continue;
+        for (command.argv) |argument| {
+            try std.testing.expect(
+                std.mem.indexOf(u8, argument, file_material) == null,
+            );
+        }
+    }
+
+    // Not vacuous: the locators are published on purpose, so a reader can tell
+    // which identity a build ran as and which host inputs it required. If the
+    // whole credential had been dropped, these would fail instead.
+    try std.testing.expect(
+        std.mem.indexOf(u8, documents[0].bytes, absolute_secret) != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, documents[1].bytes, variable_name) != null,
+    );
+    var paths: usize = 0;
+    var variables: usize = 0;
+    for (plan.data.required_capabilities) |capability| {
+        if (capability.kind != .read_host_credential) continue;
+        if (std.mem.eql(u8, capability.path, absolute_secret)) paths += 1;
+        if (std.mem.startsWith(u8, capability.path, "env:")) variables += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), paths);
+    try std.testing.expectEqual(@as(usize, 1), variables);
+
+    // And the batch's new records are present in the document the sweep just
+    // cleared, so the sweep covered them rather than an empty execution.
+    try std.testing.expect(
+        std.mem.indexOf(u8, documents[2].bytes, "gpg-pubkey-3fa2e4b1") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, documents[2].bytes, "host_resolver") != null,
+    );
 }
 
 test "a repository URL cannot smuggle a credential past the declaration" {

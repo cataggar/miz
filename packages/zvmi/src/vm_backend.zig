@@ -2820,6 +2820,31 @@ test "credential material reaches the emulator as a descriptor and not as a file
         try credentials.password(0),
     );
 
+    // The emulator is told where the material is, never what it is -- and the
+    // whole argv is now recorded in provenance (#308), so the name has to be
+    // one that says nothing. A descriptor number is exactly that.
+    var layout = test_layout;
+    layout.credential_path = device.path;
+    const argv = try buildArgv(allocator, .{
+        .policy = .{
+            .emulator_command = "/usr/bin/qemu-system-x86_64",
+            .acceleration = .software,
+        },
+        .architecture = .x86_64,
+        .layout = layout,
+        .disk = .virtio_blk,
+    });
+    var named = false;
+    for (argv) |argument| {
+        try std.testing.expect(
+            std.mem.indexOf(u8, argument, "s3cr3t-from-a-memfd") == null,
+        );
+        if (std.mem.indexOf(u8, argument, device.path) != null) named = true;
+    }
+    // Not a vacuous absence: the device is on the command line, under a name
+    // that carries no more than "the third disk came from a descriptor".
+    try std.testing.expect(named);
+
     // Released deliberately rather than incidentally: the descriptor is closed
     // by `close`, and reading it afterwards must not still answer.
     device.close();

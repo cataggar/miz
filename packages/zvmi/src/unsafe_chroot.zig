@@ -4547,6 +4547,142 @@ test "a credential reaches tdnf without reaching anything that outlives the run"
     );
 }
 
+test "no credential material reaches anything the run publishes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root_path = "test-unsafe-chroot-sentinel-root";
+    const raw_path = "test-unsafe-chroot-sentinel-stage.raw";
+    const secret_path = "test-unsafe-chroot-sentinel-secret";
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, secret_path) catch {};
+    const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+        .exclusive = true,
+        .read = true,
+    });
+    try raw_file.setLength(io, 8192);
+    const raw_inode = (try raw_file.stat(io)).inode;
+    raw_file.close(io);
+
+    // Distinct per source, so a leak names which channel it came through
+    // rather than leaving both under suspicion.
+    const file_material = "zvmi-sentinel-from-a-file";
+    const variable_material = "zvmi-sentinel-from-a-variable";
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = secret_path,
+        .data = file_material ++ "\n",
+    });
+    var cwd_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_length = try std.process.currentPath(io, &cwd_buffer);
+    const absolute_secret = try std.fs.path.join(
+        allocator,
+        &.{ cwd_buffer[0..cwd_length], secret_path },
+    );
+
+    const repositories = [_]customize.PackageRepository{
+        .{
+            .id = "base",
+            .urls = &.{"https://packages.example.invalid"},
+            .trust = &.{.{ .inline_bytes = "test key" }},
+            .credential = .{ .basic = .{
+                .username = "builder",
+                .password = .{ .host_path = absolute_secret },
+            } },
+        },
+        .{
+            .id = "other",
+            .urls = &.{"https://other.example.invalid"},
+            .trust = &.{.{ .inline_bytes = "test key" }},
+            .credential = .{ .basic = .{
+                .username = "builder",
+                .password = .{ .host_environment = "ZVMI_TEST_SENTINEL" },
+            } },
+        },
+    };
+    const manifest = Manifest{
+        .raw_path = raw_path,
+        .root_path = root_path,
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = raw_inode,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{
+            .actions = &.{.{ .install = &.{"dracut"} }},
+            .repositories = &repositories,
+        },
+        .initramfs = .{ .regenerate = .{
+            .generator = "dracut",
+            .kernels = &.{"6.12.0-test"},
+        } },
+        .selinux = .relabel,
+    };
+
+    const block = [_:null]?[*:0]const u8{
+        "ZVMI_TEST_SENTINEL=" ++ variable_material,
+    };
+    var context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .timeline = .init(allocator),
+        .plant_selinux = .targeted,
+        .plant_trust_key = true,
+    };
+    const result = try executeManifest(allocator, io, manifest, .{
+        .context = &context,
+        .runFn = FakeExecutorContext.run,
+        .environ = .{ .block = .{ .slice = &block } },
+    });
+    try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
+
+    // Not a vacuous absence: both secrets were read and both reached the file
+    // tdnf is pointed at, which is the only place either is supposed to go.
+    // Without this the whole test would pass on a run that never resolved a
+    // credential at all.
+    const from_file = context.repository_at_tdnf orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, from_file, file_material) != null);
+    const from_variable = context.second_repository_at_tdnf orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(
+        std.mem.indexOf(u8, from_variable, variable_material) != null,
+    );
+
+    // The report is the whole of what provenance is built from, and this
+    // backend now records every command it spawns rather than only the ones
+    // that ran inside the target root -- so the surface a secret could reach
+    // grew, and the assertion has to cover it as a document rather than field
+    // by field.
+    var document: Io.Writer.Allocating = .init(allocator);
+    var stringify: std.json.Stringify = .{ .writer = &document.writer };
+    try stringify.write(result.report);
+    for ([_][]const u8{ file_material, variable_material }) |sentinel| {
+        try std.testing.expect(
+            std.mem.indexOf(u8, document.written(), sentinel) == null,
+        );
+        for (result.report.tools) |tool| {
+            for (tool.command) |argument| {
+                try std.testing.expect(
+                    std.mem.indexOf(u8, argument, sentinel) == null,
+                );
+            }
+        }
+    }
+
+    // And the absence above is an absence from something, not from nothing:
+    // this run recorded the commands it spawned, including the ones that
+    // handled the repository file the secrets were written into.
+    try std.testing.expect(result.report.tools.len > 0);
+    try std.testing.expect(
+        std.mem.indexOf(u8, document.written(), "\"tools\"") != null,
+    );
+}
+
 test "nothing the worker runs inherits the worker's environment" {
     // The credential is forwarded into the worker and stops there. Everything
     // the worker runs is target-supplied code executing as root against the
@@ -5543,6 +5679,9 @@ const FakeExecutorContext = struct {
     /// unmounts the tmpfs it sat on, so this is the only moment the material a
     /// credential resolved to is observable at all.
     repository_at_tdnf: ?[]const u8 = null,
+    /// A second declared repository's rendered file, for the cases that need
+    /// two credentials resolved from two different sources in one run.
+    second_repository_at_tdnf: ?[]const u8 = null,
     repository_mode_at_tdnf: ?u32 = null,
     modules_at_dracut: ?[]const []const u8 = null,
     file_mode_at_dracut: ?u32 = null,
@@ -5906,6 +6045,8 @@ const FakeExecutorContext = struct {
             self.resolver_at_tdnf = self.readTargetFile("run/zvmi-resolv.conf");
             self.repository_at_tdnf = self.readTargetFile("run/zvmi-repos/base.repo");
             self.repository_mode_at_tdnf = self.modeOf("run/zvmi-repos/base.repo");
+            self.second_repository_at_tdnf =
+                self.readTargetFile("run/zvmi-repos/other.repo");
             self.saw_repository_isolation =
                 containsArg(argv, "/run/zvmi-tdnf.conf") and
                 containsArg(argv, "--disablerepo=*") and
