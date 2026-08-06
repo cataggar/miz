@@ -21,7 +21,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const control_version: u32 = 5;
-pub const result_version: u32 = 2;
+pub const result_version: u32 = 3;
 
 /// Path the host writes the control document to inside the initramfs, and the
 /// path the guest reads it back from once the kernel has unpacked rootfs.
@@ -721,7 +721,11 @@ pub fn validPackageEvr(evr: []const u8) bool {
 
 pub const Tool = struct {
     name: []const u8,
-    version: []const u8,
+    /// Nothing when the guest could not learn a version. A tool that was never
+    /// successfully asked and a tool that answered with an empty string are
+    /// different facts, and provenance may not present the first as the
+    /// second.
+    version: ?[]const u8 = null,
     command: []const []const u8,
 };
 
@@ -757,7 +761,9 @@ pub const Result = struct {
         if (self.tools.len > max_result_tools) return error.ResultTooLarge;
         for (self.tools) |tool| {
             if (tool.name.len == 0 or tool.name.len > 128) return error.InvalidToolRecord;
-            if (tool.version.len > 1024) return error.InvalidToolRecord;
+            if (tool.version) |version| {
+                if (version.len == 0 or version.len > 1024) return error.InvalidToolRecord;
+            }
             if (tool.command.len == 0 or tool.command.len > 64) {
                 return error.InvalidToolRecord;
             }

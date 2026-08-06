@@ -237,10 +237,28 @@ fn runSuccess(
     for (result.provenance.tools) |tool| {
         if (std.mem.eql(u8, tool.name, "tdnf")) {
             saw_tdnf = true;
-            try ensure(std.mem.eql(u8, tool.version, "stub tdnf 4.0"));
+            try ensure(std.mem.eql(u8, tool.version orelse "", "stub tdnf 4.0"));
+            // What the guest ran, it ran inside the target root: the emulator
+            // is the host command, and the two must not read alike.
+            try ensure(tool.context == .target_root);
         }
     }
     try ensure(saw_tdnf);
+
+    // The emulator itself, first and on the host. Before #308 the tool list
+    // was whatever the guest reported, so the one command the host actually
+    // spawned -- the boot whose argv decides the machine, the acceleration and
+    // every device the guest saw -- appeared nowhere in provenance.
+    const emulator_record = result.provenance.tools[0];
+    try ensure(emulator_record.context == .host);
+    try ensure(std.mem.eql(
+        u8,
+        emulator_record.name,
+        std.fs.path.basename(workspace.emulator_path),
+    ));
+    try ensure(std.mem.eql(u8, emulator_record.version orelse "", "stub-emulator 1.0"));
+    try ensure(std.mem.eql(u8, emulator_record.command[0], workspace.emulator_path));
+    try ensure(emulator_record.command.len > 1);
 
     try expectPathAbsent(io, workspace.transaction_path);
     try expectFileExists(io, workspace.output_path);

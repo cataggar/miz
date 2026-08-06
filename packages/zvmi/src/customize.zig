@@ -5998,10 +5998,31 @@ pub const SourceRecord = struct {
     sha256: Digest,
 };
 
+/// Where a recorded command ran.
+///
+/// A `target_root` command is recorded by the argv the target saw, without the
+/// `chroot <root>` prefix the executor wrapped it in: the root is the
+/// transaction directory the plan already names, so repeating it on every
+/// record would say less than this field does. Before this existed the prefix
+/// was stripped with nothing saying so, and the recorded argv was not the argv
+/// that ran.
+pub const ToolContext = enum {
+    /// On the build machine: the emulator, and the privileged plumbing that
+    /// stages an image before anything runs inside it.
+    host,
+    /// Inside the target root, through `chroot` or through the guest agent.
+    target_root,
+};
+
 pub const ToolRecord = struct {
     name: []const u8,
-    version: []const u8,
+    /// Null when the program answered no version -- `setfiles` is the standing
+    /// example -- or when there was nothing to ask, as for the plumbing that
+    /// runs before any target program does. Distinct from an empty string,
+    /// which reads as a version that was blank rather than absent.
+    version: ?[]const u8,
     command: []const []const u8,
+    context: ToolContext,
 };
 
 /// What a hook was and what running it did.
@@ -6551,7 +6572,14 @@ fn guestBootConfiguration(
     return null;
 }
 
-fn guestTools(
+/// Every command the run spawned, in the order it spawned them: the backend's
+/// own host-side plumbing first, then whatever ran inside the target root.
+///
+/// Each backend merges its two halves itself, because only the backend knows
+/// the order they ran in -- the parent's `unshare` before the worker's mounts,
+/// the emulator before the guest agent it booted. Exactly one backend runs, so
+/// this still picks rather than interleaves.
+fn backendTools(
     unsafe_report: ?*const UnsafeChrootRuntimeReport,
     vm_report: ?*const VmRuntimeReport,
 ) []const ToolRecord {
@@ -6755,13 +6783,17 @@ fn buildResult(
         };
     } else null;
     const tools = blk: {
-        const source = guestTools(unsafe_report, vm_report);
+        const source = backendTools(unsafe_report, vm_report);
         const owned = try result_allocator.alloc(ToolRecord, source.len);
         for (source, 0..) |tool, index| {
             owned[index] = .{
                 .name = try result_allocator.dupe(u8, tool.name),
-                .version = try result_allocator.dupe(u8, tool.version),
+                .version = if (tool.version) |version|
+                    try result_allocator.dupe(u8, version)
+                else
+                    null,
                 .command = try dupeStrings(result_allocator, tool.command),
+                .context = tool.context,
             };
         }
         break :blk owned;
@@ -8423,6 +8455,7 @@ test "unsafe chroot platform executes the supported preserved subset" {
                     .name = "tdnf",
                     .version = "tdnf 3.5.0",
                     .command = &.{ "/usr/bin/tdnf", "remove", "obsolete" },
+                    .context = .target_root,
                 }},
                 .installed_packages = &.{"base-files-0:1.0-1.x86_64"},
             };
@@ -8466,7 +8499,7 @@ test "unsafe chroot platform executes the supported preserved subset" {
     );
     try std.testing.expectEqualStrings(
         "tdnf 3.5.0",
-        outcome.result.?.provenance.tools[0].version,
+        outcome.result.?.provenance.tools[0].version.?,
     );
     try std.testing.expectEqualStrings(
         "base-files-0:1.0-1.x86_64",

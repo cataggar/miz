@@ -855,11 +855,16 @@ const Session = struct {
     /// Best-effort tool version for provenance. A probe that fails is not a run
     /// that failed, so it must not leave an exit code behind for a later stage
     /// to be blamed with.
-    fn probeVersion(self: *Session, program: []const u8) []const u8 {
+    ///
+    /// Nothing, rather than an empty string, when the tool could not be asked:
+    /// the host publishes this straight into provenance, where "not probed"
+    /// and "answered with nothing" have to stay distinguishable.
+    fn probeVersion(self: *Session, program: []const u8) ?[]const u8 {
         const captured = runInChroot(self.allocator, &.{ program, "--version" }) catch
-            return "";
-        if (captured.exit_code != 0) return "";
-        return std.mem.trim(u8, firstLine(captured.output), " \t\r");
+            return null;
+        if (captured.exit_code != 0) return null;
+        const trimmed = std.mem.trim(u8, firstLine(captured.output), " \t\r");
+        return if (trimmed.len == 0) null else trimmed;
     }
 
     fn captureChroot(self: *Session, argv: []const []const u8) ![]const u8 {

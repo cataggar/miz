@@ -292,7 +292,7 @@ pub fn runParent(
             lease_active = false;
         },
     }
-    return loadParentReport(allocator, io, report_path);
+    return loadParentReport(allocator, io, report_path, &argv);
 }
 
 pub fn workerMain(init: std.process.Init, manifest_path: []const u8) !void {
@@ -456,6 +456,7 @@ fn executeManifest(
         .emitted_lock = .init(allocator),
         .preexisting_loops = .init(allocator),
         .hook_records = .init(allocator),
+        .tool_versions = .init(allocator),
     };
     const outcome = session.openAndRun();
     // Before the teardown, and only on this path. The command that ran out of
@@ -517,11 +518,13 @@ const Session = struct {
     emitted_lock: std.array_list.Managed(customize.PackageVersionLock),
     preexisting_loops: std.array_list.Managed([]const u8),
     hook_records: std.array_list.Managed(customize.HookRecord),
-    rpm_version: []const u8 = "",
-    tdnf_version: []const u8 = "",
-    dracut_version: []const u8 = "",
-    cp_version: []const u8 = "",
-    generator_version: []const u8 = "",
+    /// Versions already probed, keyed by the guest path that was probed.
+    /// Probing is per program rather than per invocation, but the answer is
+    /// still the answer for that program: what it replaced was a fixed table
+    /// of five suffixes that returned an empty string for everything else, so
+    /// `setfiles` -- the most recently added tool -- recorded no version at
+    /// all.
+    tool_versions: std.array_list.Managed(ProbedVersion),
     boot_configuration: ?customize.BootConfigurationRecord = null,
     package_cache: ?customize.PackageCacheRecord = null,
 
@@ -570,24 +573,26 @@ const Session = struct {
         const losetup = findTool(self.io, losetup_candidates).?;
         self.loop_attachment_uncertain = true;
         self.loop_inventory_safe = false;
+        const attach_argv = [_][]const u8{
+            losetup,
+            "--find",
+            "--show",
+            "--offset",
+            offset,
+            "--sizelimit",
+            length,
+            "/proc/self/fd/0",
+        };
         var result = try self.executor.run(
             self.allocator,
             self.io,
-            &.{
-                losetup,
-                "--find",
-                "--show",
-                "--offset",
-                offset,
-                "--sizelimit",
-                length,
-                "/proc/self/fd/0",
-            },
+            &attach_argv,
             true,
             raw_file,
         );
         defer result.deinit(self.allocator);
         try expectSuccess(result.term);
+        try self.recordTool(.host, &attach_argv);
         const loop_path = try parseLoopPath(self.allocator, result.stdout);
         if (self.loopWasPreexisting(loop_path)) {
             self.allocator.free(loop_path);
@@ -1255,20 +1260,28 @@ const Session = struct {
     fn queryAssociatedLoops(self: *Session) !CommandResult {
         const raw_file = self.raw_file orelse
             return error.RawStageHandleUnavailable;
-        return self.executor.run(
+        const argv = [_][]const u8{
+            findTool(self.io, losetup_candidates).?,
+            "--associated",
+            "/proc/self/fd/0",
+            "--output",
+            "NAME",
+            "--noheadings",
+        };
+        const result = try self.executor.run(
             self.allocator,
             self.io,
-            &.{
-                findTool(self.io, losetup_candidates).?,
-                "--associated",
-                "/proc/self/fd/0",
-                "--output",
-                "NAME",
-                "--noheadings",
-            },
+            &argv,
             true,
             raw_file,
         );
+        // Recorded on every call, including each attempt of the settle poll in
+        // `waitForOnlyPreexistingLoops`. A run that had to ask twenty times
+        // took two seconds to get its loop device back, which is a fact about
+        // that run; collapsing the repeats would record the executor's
+        // patience instead of what happened.
+        try self.recordTool(.host, &argv);
+        return result;
     }
 
     fn snapshotAssociatedLoops(self: *Session) !void {
@@ -1361,7 +1374,22 @@ const Session = struct {
         };
     }
 
+    /// Runs a command on the build machine and records it.
+    ///
+    /// Every host command the worker spawns goes through here, so the tool
+    /// list is complete by construction rather than by remembering to append
+    /// at each of the fourteen call sites. The mounts, the loop attachment and
+    /// its detachment, the device nodes and the final `sync` are the run's
+    /// derived work: which loop device, at which offset, over which length is
+    /// decided while the run executes and is answerable nowhere else.
     fn runSuccess(self: *Session, argv: []const []const u8) !void {
+        try self.runUnrecorded(argv);
+        try self.recordTool(.host, argv);
+    }
+
+    /// The same, for a command whose record its caller appends instead:
+    /// `runChroot` records the guest argv it wrapped, not the `chroot` call.
+    fn runUnrecorded(self: *Session, argv: []const []const u8) !void {
         var result = try self.executor.run(
             self.allocator,
             self.io,
@@ -1588,10 +1616,6 @@ const Session = struct {
                         host_path,
                     ),
                 }
-                self.rpm_version = try self.runChrootCapture(&.{
-                    "/usr/bin/rpm",
-                    "--version",
-                });
                 try self.runChroot(&.{ "/usr/bin/rpm", "--import", guest_path });
                 try Io.Dir.cwd().deleteFile(self.io, host_path);
                 trust_index += 1;
@@ -1605,10 +1629,6 @@ const Session = struct {
         names: []const []const u8,
         repositories: bool,
     ) !void {
-        self.tdnf_version = try self.runChrootCapture(&.{
-            "/usr/bin/tdnf",
-            "--version",
-        });
         var argv = std.array_list.Managed([]const u8).init(self.allocator);
         defer argv.deinit();
         try argv.appendSlice(&.{
@@ -1666,10 +1686,6 @@ const Session = struct {
             self.allocator.free(kernels);
         };
         for (kernels) |kernel| {
-            self.dracut_version = try self.runChrootCapture(&.{
-                "/usr/bin/dracut",
-                "--version",
-            });
             const output = try std.fmt.allocPrint(
                 self.allocator,
                 "/boot/initramfs-{s}.img",
@@ -1686,10 +1702,6 @@ const Session = struct {
                 "--kver",
                 kernel,
                 temporary_output,
-            });
-            self.cp_version = try self.runChrootCapture(&.{
-                "/usr/bin/cp",
-                "--version",
             });
             try self.runChroot(&.{
                 "/usr/bin/cp",
@@ -1892,7 +1904,6 @@ const Session = struct {
             try file.writePositionalAll(self.io, text, 0);
         }
 
-        self.generator_version = try self.runChrootCapture(&.{ generator, "--version" });
         try self.runChroot(&.{ generator, "-o", generated });
 
         // The generator is the target's program, run against the target's
@@ -2027,25 +2038,23 @@ const Session = struct {
         try argv.append(findTool(self.io, chroot_candidates).?);
         try argv.append(self.manifest.root_path);
         try argv.appendSlice(guest_argv);
-        try self.runSuccess(argv.items);
-        const command = try self.allocator.alloc([]const u8, guest_argv.len);
-        for (guest_argv, 0..) |argument, index| {
-            command[index] = try self.allocator.dupe(u8, argument);
-        }
-        try self.tools.append(.{
-            .name = try self.allocator.dupe(
-                u8,
-                std.fs.path.basename(guest_argv[0]),
-            ),
-            .version = try self.allocator.dupe(
-                u8,
-                self.toolVersion(guest_argv[0]),
-            ),
-            .command = command,
-        });
+        // The `chroot` wrapper is not recorded in its own right: the record
+        // this appends says `target_root`, which is what the wrapper means.
+        try self.runUnrecorded(argv.items);
+        try self.recordTool(.target_root, guest_argv);
     }
 
     fn runChrootCapture(
+        self: *Session,
+        guest_argv: []const []const u8,
+    ) ![]const u8 {
+        const captured = try self.captureUnrecorded(guest_argv);
+        errdefer self.allocator.free(captured);
+        try self.recordTool(.target_root, guest_argv);
+        return captured;
+    }
+
+    fn captureUnrecorded(
         self: *Session,
         guest_argv: []const []const u8,
     ) ![]const u8 {
@@ -2073,15 +2082,89 @@ const Session = struct {
         return self.allocator.dupe(u8, std.mem.trim(u8, bytes, " \t\r\n"));
     }
 
-    fn toolVersion(self: *const Session, guest_path: []const u8) []const u8 {
-        if (std.mem.endsWith(u8, guest_path, "/rpm")) return self.rpm_version;
-        if (std.mem.endsWith(u8, guest_path, "/tdnf")) return self.tdnf_version;
-        if (std.mem.endsWith(u8, guest_path, "/dracut")) return self.dracut_version;
-        if (std.mem.endsWith(u8, guest_path, "/cp")) return self.cp_version;
-        if (std.mem.endsWith(u8, guest_path, "-mkconfig")) return self.generator_version;
-        return "";
+    /// Appends the record for a command that has already run.
+    ///
+    /// A version probe is never recorded as a command of its own: it is
+    /// recorded as the `version` of the record it produced. Recording both
+    /// would say the run did more than it did, and the rule terminates,
+    /// because a probe does not probe.
+    fn recordTool(
+        self: *Session,
+        context: customize.ToolContext,
+        argv: []const []const u8,
+    ) !void {
+        const version = switch (context) {
+            .target_root => try self.toolVersion(argv[0]),
+            // Nothing on the host is asked its version: these are the
+            // executor's own plumbing, chosen by `findTool` from a fixed
+            // candidate list, and the path they were chosen at is already the
+            // first element of the recorded argv.
+            .host => null,
+        };
+        const command = try self.allocator.alloc([]const u8, argv.len);
+        errdefer self.allocator.free(command);
+        for (argv, 0..) |argument, index| {
+            command[index] = try self.allocator.dupe(u8, argument);
+        }
+        try self.tools.append(.{
+            .name = try self.allocator.dupe(u8, std.fs.path.basename(argv[0])),
+            .version = version,
+            .command = command,
+            .context = context,
+        });
+    }
+
+    /// The reported version of a program inside the target root, probed once
+    /// and remembered.
+    ///
+    /// Null when the program answered nothing: `setfiles` takes no
+    /// `--version`, and a run has to be able to say so rather than record an
+    /// empty string that reads like a blank version.
+    fn toolVersion(self: *Session, guest_path: []const u8) !?[]const u8 {
+        for (self.tool_versions.items) |probed| {
+            if (std.mem.eql(u8, probed.guest_path, guest_path)) return probed.version;
+        }
+        const version = self.probeToolVersion(guest_path);
+        errdefer if (version) |text| self.allocator.free(text);
+        const owned_path = try self.allocator.dupe(u8, guest_path);
+        errdefer self.allocator.free(owned_path);
+        try self.tool_versions.append(.{
+            .guest_path = owned_path,
+            .version = version,
+        });
+        return version;
+    }
+
+    /// Best-effort, and deliberately not an error: a probe that fails is not a
+    /// run that failed, and a tool that reports no version is still a tool
+    /// that ran.
+    fn probeToolVersion(self: *Session, guest_path: []const u8) ?[]const u8 {
+        const captured = self.captureUnrecorded(&.{ guest_path, "--version" }) catch
+            return null;
+        const first = std.mem.trim(u8, firstLine(captured), " \t\r");
+        if (first.len == 0) {
+            self.allocator.free(captured);
+            return null;
+        }
+        const owned = self.allocator.dupe(u8, first) catch {
+            self.allocator.free(captured);
+            return null;
+        };
+        self.allocator.free(captured);
+        return owned;
     }
 };
+
+/// A program's reported version, remembered against the path it was probed at.
+const ProbedVersion = struct {
+    guest_path: []const u8,
+    version: ?[]const u8,
+};
+
+fn firstLine(text: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    return text[0..end];
+}
 
 /// Whether an `/etc/fstab` mounts anything at `/boot`.
 ///
@@ -3151,10 +3234,18 @@ fn forwardStream(io: Io, reader: *Io.Reader, file: Io.File) void {
     reader.toss(bytes.len);
 }
 
+/// Reads the worker's report and puts the parent's own spawn at the head of
+/// it.
+///
+/// The `unshare` invocation is the only command the parent runs on the execute
+/// path, and it is the one that decides which namespaces everything after it
+/// ran in -- so it belongs first, before the mounts the worker made inside
+/// them. The worker cannot record it, because the worker is its child.
 fn loadParentReport(
     allocator: Allocator,
     io: Io,
     path: []const u8,
+    worker_argv: []const []const u8,
 ) !customize.UnsafeChrootRuntimeReport {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -3171,9 +3262,27 @@ fn loadParentReport(
         bytes,
         .{ .ignore_unknown_fields = false },
     );
+    const tools = try report_allocator.alloc(
+        customize.ToolRecord,
+        parsed.value.tools.len + 1,
+    );
+    const command = try report_allocator.alloc([]const u8, worker_argv.len);
+    for (worker_argv, 0..) |argument, index| {
+        command[index] = try report_allocator.dupe(u8, argument);
+    }
+    tools[0] = .{
+        .name = try report_allocator.dupe(
+            u8,
+            std.fs.path.basename(worker_argv[0]),
+        ),
+        .version = null,
+        .command = command,
+        .context = .host,
+    };
+    @memcpy(tools[1..], parsed.value.tools);
     return .{
         .arena = arena,
-        .tools = parsed.value.tools,
+        .tools = tools,
         .installed_packages = parsed.value.installed_packages,
         .package_lock = parsed.value.package_lock,
         .hooks = parsed.value.hooks,
@@ -3514,23 +3623,51 @@ test "worker executes policy with strict reverse cleanup" {
     const result = try executeManifest(allocator, io, manifest, executor);
     try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
     try std.testing.expect(result.cleanup_complete);
-    try std.testing.expectEqual(@as(usize, 5), result.report.tools.len);
+    // Named rather than indexed: the report is every command the run issued,
+    // in run order, so pinning a position would make any new mount a test
+    // failure while saying nothing about what was recorded.
     try std.testing.expectEqualStrings(
         "RPM version 4.18.0",
-        result.report.tools[0].version,
+        (try findToolRecord(result.report.tools, "rpm")).version.?,
     );
     try std.testing.expectEqualStrings(
         "tdnf 3.5.0",
-        result.report.tools[1].version,
+        (try findToolRecord(result.report.tools, "tdnf")).version.?,
     );
     try std.testing.expectEqualStrings(
         "dracut 102",
-        result.report.tools[3].version,
+        (try findToolRecord(result.report.tools, "dracut")).version.?,
     );
     try std.testing.expectEqualStrings(
         "cp (GNU coreutils) 9.4",
-        result.report.tools[4].version,
+        (try findToolRecord(result.report.tools, "cp")).version.?,
     );
+    // The privileged host commands the run performed on its own behalf. None
+    // of these is implied by a package transaction, and before #308 none of
+    // them was recorded at all: the report described what ran inside the
+    // target root and stayed silent about what built the target root.
+    for ([_][]const u8{ "losetup", "mount", "umount", "mknod", "sync" }) |name| {
+        const tool = try findToolRecord(result.report.tools, name);
+        try std.testing.expectEqual(customize.ToolContext.host, tool.context);
+    }
+    // Teardown is inside the published report: the worker writes the report
+    // only after cleanup completes, so the unmounts that released the target
+    // are recorded rather than lost to the write that preceded them.
+    try std.testing.expect(
+        lastToolIndex(result.report.tools, "umount").? >
+            lastToolIndex(result.report.tools, "dracut").?,
+    );
+    // A version probe is never a command of its own. It is recorded as the
+    // version of the command it describes, so `--version` must not appear as
+    // an argv in its own right -- otherwise the report doubles in size and
+    // reads as if the run had asked every tool to do nothing.
+    for (result.report.tools) |tool| {
+        try std.testing.expect(tool.name.len != 0);
+        try std.testing.expect(tool.command.len != 0);
+        for (tool.command) |argument| {
+            try std.testing.expect(!std.mem.eql(u8, argument, "--version"));
+        }
+    }
     try std.testing.expectEqual(
         @as(usize, 2),
         result.report.installed_packages.len,
@@ -4986,6 +5123,32 @@ const FakeKernel = struct {
     marker_loops: bool = false,
 };
 
+/// The first record for a tool, or a failure naming what was missing.
+///
+/// Tests look records up by name because the report is a run-ordered list of
+/// every command issued, and an index into it is a statement about how many
+/// mounts the run happened to need.
+fn findToolRecord(
+    tools: []const customize.ToolRecord,
+    name: []const u8,
+) !customize.ToolRecord {
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) return tool;
+    }
+    std.debug.print("no provenance record for tool '{s}'\n", .{name});
+    return error.ToolNotRecorded;
+}
+
+/// Where a tool ran for the last time, used to assert ordering between stages
+/// that each run more than once.
+fn lastToolIndex(tools: []const customize.ToolRecord, name: []const u8) ?usize {
+    var found: ?usize = null;
+    for (tools, 0..) |tool, index| {
+        if (std.mem.eql(u8, tool.name, name)) found = index;
+    }
+    return found;
+}
+
 const FakeExecutorContext = struct {
     allocator: Allocator,
     io: Io,
@@ -5135,6 +5298,29 @@ const FakeExecutorContext = struct {
         return contents;
     }
 
+    /// What each program answers `--version` with. A program not listed
+    /// answers nothing, which is how a real host behaves for the mount and
+    /// loop utilities and for `setfiles`, none of which take the option, and
+    /// is recorded as no version rather than an empty one.
+    fn fakeVersion(
+        self: *FakeExecutorContext,
+        allocator: Allocator,
+        argv: []const []const u8,
+    ) !CommandResult {
+        _ = self;
+        const table = [_]struct { []const u8, []const u8 }{
+            .{ "/usr/bin/rpm", "RPM version 4.18.0\n" },
+            .{ "/usr/bin/tdnf", "tdnf 3.5.0\n" },
+            .{ "/usr/bin/dracut", "dracut 102\n" },
+            .{ "/usr/bin/cp", "cp (GNU coreutils) 9.4\n" },
+            .{ "/usr/sbin/grub2-mkconfig", "grub2-mkconfig (GRUB) 2.06\n" },
+        };
+        for (table) |entry| {
+            if (containsArg(argv, entry[0])) return fakeResult(allocator, entry[1], 0);
+        }
+        return fakeResult(allocator, "", 0);
+    }
+
     fn run(
         context_ptr: ?*anyopaque,
         allocator: Allocator,
@@ -5157,6 +5343,11 @@ const FakeExecutorContext = struct {
                 }
             }
         }
+        // Version probes are answered before anything is observed, because a
+        // probe is not a stage: a fake that let `setfiles --version` fall
+        // through would record it as the relabel and a test would be asserting
+        // against a command the run never used to label anything.
+        if (containsArg(argv, "--version")) return self.fakeVersion(allocator, argv);
         if (self.plant_selinux) |layout| try self.plantSelinuxTree(layout);
         if (self.plant_in_target) |relative| {
             const path = try std.fs.path.join(
@@ -5305,18 +5496,6 @@ const FakeExecutorContext = struct {
         {
             self.detached_loop = true;
             self.detached_loops += 1;
-        }
-        if (containsArg(argv, "/usr/bin/rpm") and containsArg(argv, "--version")) {
-            return fakeResult(allocator, "RPM version 4.18.0\n", 0);
-        }
-        if (containsArg(argv, "/usr/bin/tdnf") and containsArg(argv, "--version")) {
-            return fakeResult(allocator, "tdnf 3.5.0\n", 0);
-        }
-        if (containsArg(argv, "/usr/bin/dracut") and containsArg(argv, "--version")) {
-            return fakeResult(allocator, "dracut 102\n", 0);
-        }
-        if (containsArg(argv, "/usr/bin/cp") and containsArg(argv, "--version")) {
-            return fakeResult(allocator, "cp (GNU coreutils) 9.4\n", 0);
         }
         if (containsArg(argv, "/usr/bin/rpm") and containsArg(argv, "-qa")) {
             return fakeResult(
@@ -5522,6 +5701,15 @@ test "a relabel runs last, with the policy the target names" {
     const timeline = context.timeline.items;
     try std.testing.expectEqualStrings("setfiles", timeline[timeline.len - 1]);
     try std.testing.expectEqualStrings("/run/zvmi-hook-0", timeline[timeline.len - 2]);
+
+    // `setfiles` takes no `--version`, so its record carries none. The fixed
+    // table this replaced had no entry for it either, but answered with an
+    // empty string, which published as a tool whose version was blank rather
+    // than a tool that was never able to give one.
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        (try findToolRecord(result.report.tools, "setfiles")).version,
+    );
 }
 
 test "a relabel a target cannot satisfy fails the run rather than skipping it" {

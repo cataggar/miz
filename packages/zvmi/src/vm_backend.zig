@@ -382,10 +382,11 @@ pub fn run(
     // to be proven bootable. A run that reaches here has already produced its
     // result; a failed attestation withholds it rather than rewriting it.
     var boot_record: customize.VmBootRecord = .direct_kernel;
+    var firmware_command: ?[]const []const u8 = null;
     switch (policy.boot) {
         .direct_kernel => {},
         .firmware => |firmware| {
-            const record = try attestFirmwareBoot(work, io, .{
+            const attestation = try attestFirmwareBoot(work, io, .{
                 .policy = policy,
                 .firmware = firmware,
                 .architecture = data.architectures.runner,
@@ -396,7 +397,8 @@ pub fn run(
             });
             // Published whole: a half-filled record behind a set tag would
             // read as a firmware boot nobody performed.
-            boot_record = .{ .firmware = record };
+            boot_record = .{ .firmware = attestation.record };
+            firmware_command = attestation.command;
         },
     }
 
@@ -408,6 +410,8 @@ pub fn run(
         .control_json = control_json,
         .payload = &payload,
         .emulator_version = version,
+        .emulator_command = argv,
+        .firmware_command = firmware_command,
         .modules = drivers.modules,
         .boot = boot_record,
         .hooks = control.hooks,
@@ -1008,7 +1012,7 @@ pub fn attestFirmwareBoot(
     gpa: Allocator,
     io: Io,
     input: AttestationInput,
-) !customize.VmFirmwareRecord {
+) !FirmwareAttestation {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const work = arena.allocator();
@@ -1077,19 +1081,36 @@ pub fn attestFirmwareBoot(
     const stage_after = try streamDigest(io, input.stage_path);
     if (!std.mem.eql(u8, &stage_before, &stage_after)) return error.VmFirmwareStageMutated;
 
+    // Duped out of the arena this ran in, which does not outlive the boot it
+    // describes. The attestation guest is a second emulator invocation with a
+    // different machine and no `-kernel`, so it is a command of its own rather
+    // than a detail of the first one.
+    const command = try gpa.alloc([]const u8, argv.len);
+    for (argv, command) |argument, *slot| slot.* = try gpa.dupe(u8, argument);
+
     return .{
-        .code_path = input.firmware.code_path,
-        .code_sha256 = .{ .bytes = digestOf(code_bytes) },
-        .vars_template_path = input.firmware.vars_path,
-        .vars_template_sha256 = .{ .bytes = digestOf(vars_bytes) },
-        .variable_store = .ephemeral,
-        .secure_boot = input.firmware.secure_boot,
-        .machine = firmwareMachineName(input.policy, input.firmware, input.architecture),
-        .console_marker = input.firmware.console_marker,
-        .boot_timeout_seconds = input.firmware.boot_timeout_seconds,
-        .attested_stage_sha256 = .{ .bytes = stage_after },
+        .command = command,
+        .record = .{
+            .code_path = input.firmware.code_path,
+            .code_sha256 = .{ .bytes = digestOf(code_bytes) },
+            .vars_template_path = input.firmware.vars_path,
+            .vars_template_sha256 = .{ .bytes = digestOf(vars_bytes) },
+            .variable_store = .ephemeral,
+            .secure_boot = input.firmware.secure_boot,
+            .machine = firmwareMachineName(input.policy, input.firmware, input.architecture),
+            .console_marker = input.firmware.console_marker,
+            .boot_timeout_seconds = input.firmware.boot_timeout_seconds,
+            .attested_stage_sha256 = .{ .bytes = stage_after },
+        },
     };
 }
+
+/// What a firmware attestation produced: the record, and the emulator argv
+/// that produced it, which provenance records as its own command.
+pub const FirmwareAttestation = struct {
+    record: customize.VmFirmwareRecord,
+    command: []const []const u8,
+};
 
 const FirmwareArgvInput = struct {
     policy: customize.VmPolicy,
@@ -1455,23 +1476,52 @@ fn describeFailure(allocator: Allocator, failure: vm_control.Failure) ![]const u
     return text.toOwnedSlice();
 }
 
-/// Best effort: a missing version string is worth recording as unknown, but is
-/// not worth discarding a completed customization over.
-fn probeEmulatorVersion(allocator: Allocator, io: Io, command: []const u8) []const u8 {
+/// The emulator's own version, or nothing when it could not be asked.
+///
+/// Best effort: a missing version string is worth recording as absent, but is
+/// not worth discarding a completed customization over. A probe is never a
+/// command of its own in provenance -- what it learns is recorded as the
+/// version of the invocation it describes -- so a failed probe has to be
+/// distinguishable from an emulator that reported an empty string.
+fn probeEmulatorVersion(allocator: Allocator, io: Io, command: []const u8) ?[]const u8 {
     const outcome = std.process.run(allocator, io, .{
         .argv = &.{ command, "--version" },
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(64 * 1024),
         .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } },
-    }) catch return "unknown";
+    }) catch return null;
     switch (outcome.term) {
-        .exited => |code| if (code != 0) return "unknown",
-        else => return "unknown",
+        .exited => |code| if (code != 0) return null,
+        else => return null,
     }
     var lines = std.mem.splitScalar(u8, outcome.stdout, '\n');
-    const first = lines.next() orelse return "unknown";
+    const first = lines.next() orelse return null;
     const trimmed = std.mem.trim(u8, first, " \t\r");
-    return if (trimmed.len == 0) "unknown" else trimmed;
+    return if (trimmed.len == 0) null else trimmed;
+}
+
+/// The emulator's tool name: the command as the policy named it, reduced to
+/// its basename so `/usr/bin/qemu-system-x86_64` and a `qemu-system-x86_64`
+/// found on `PATH` read as the same tool. The argv the record carries keeps
+/// the path the run actually used.
+fn emulatorName(command: []const u8) []const u8 {
+    return std.fs.path.basename(command);
+}
+
+/// Copies a tool record into the report's arena.
+///
+/// Every string a record carries is duped, because the sources are variously
+/// the run's arena, the parsed guest result and the policy, and the report
+/// outlives all three.
+fn ownTool(owned: Allocator, tool: customize.ToolRecord) !customize.ToolRecord {
+    const command = try owned.alloc([]const u8, tool.command.len);
+    for (tool.command, command) |argument, *slot| slot.* = try owned.dupe(u8, argument);
+    return .{
+        .name = try owned.dupe(u8, tool.name),
+        .version = if (tool.version) |version| try owned.dupe(u8, version) else null,
+        .command = command,
+        .context = tool.context,
+    };
 }
 
 const ReportInput = struct {
@@ -1481,7 +1531,12 @@ const ReportInput = struct {
     root_device: []const u8,
     control_json: []const u8,
     payload: *const vm_payload.Payload,
-    emulator_version: []const u8,
+    emulator_version: ?[]const u8,
+    /// The appliance boot's argv, and the attestation boot's when there was
+    /// one. Both are host commands the run performed, and neither is visible
+    /// to the guest that only reports what it ran inside the emulator.
+    emulator_command: []const []const u8,
+    firmware_command: ?[]const []const u8 = null,
     modules: []const vm_payload.Module,
     boot: customize.VmBootRecord = .direct_kernel,
     hooks: []const HookPlan = &.{},
@@ -1528,16 +1583,35 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
     errdefer arena.deinit();
     const owned = arena.allocator();
 
-    const tools = try owned.alloc(customize.ToolRecord, input.result.tools.len);
-    for (input.result.tools, tools) |tool, *record| {
-        const command = try owned.alloc([]const u8, tool.command.len);
-        for (tool.command, command) |argument, *slot| slot.* = try owned.dupe(u8, argument);
-        record.* = .{
-            .name = try owned.dupe(u8, tool.name),
-            .version = try owned.dupe(u8, tool.version),
-            .command = command,
-        };
+    // Run order, which for a VM run is host then guest then host: the
+    // appliance boot, everything the guest reported running inside it, and
+    // the attestation boot that follows customization. The guest can only
+    // ever report the middle of that, so a report built from its list alone
+    // would describe an image nobody booted.
+    var tool_list: std.array_list.Managed(customize.ToolRecord) = .init(owned);
+    try tool_list.append(try ownTool(owned, .{
+        .name = emulatorName(input.policy.emulator_command),
+        .version = input.emulator_version,
+        .command = input.emulator_command,
+        .context = .host,
+    }));
+    for (input.result.tools) |tool| {
+        try tool_list.append(try ownTool(owned, .{
+            .name = tool.name,
+            .version = tool.version,
+            .command = tool.command,
+            .context = .target_root,
+        }));
     }
+    if (input.firmware_command) |command| {
+        try tool_list.append(try ownTool(owned, .{
+            .name = emulatorName(input.policy.emulator_command),
+            .version = input.emulator_version,
+            .command = command,
+            .context = .host,
+        }));
+    }
+    const tools = try tool_list.toOwnedSlice();
 
     const packages = try owned.alloc([]const u8, input.result.installed_packages.len);
     for (input.result.installed_packages, packages) |name, *slot| {
@@ -1596,7 +1670,7 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
         .hooks = hooks,
         .execution = .{
             .emulator_command = try owned.dupe(u8, input.policy.emulator_command),
-            .emulator_version = try owned.dupe(u8, input.emulator_version),
+            .emulator_version = try owned.dupe(u8, input.emulator_version orelse "unknown"),
             .machine = try owned.dupe(u8, machineName(input.policy, input.architecture)),
             .cpu = try owned.dupe(u8, cpuName(input.policy, input.architecture)),
             .acceleration = input.policy.acceleration,
