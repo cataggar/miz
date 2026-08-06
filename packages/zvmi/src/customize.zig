@@ -35,7 +35,7 @@ const vm_control = @import("vm_control.zig");
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
 pub const plan_schema_version: u32 = 22;
-pub const provenance_schema_version: u32 = 25;
+pub const provenance_schema_version: u32 = 26;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -11375,6 +11375,21 @@ test "plan JSON renders identifiers as stable strings" {
     defer std.testing.allocator.free(expected_version);
     try std.testing.expect(std.mem.indexOf(u8, json, expected_version) != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"plan_hash\": \"") != null);
+}
+
+test "the schema versions move only when the documents do" {
+    // Written out as literals on purpose: everywhere else these constants are
+    // compared against themselves, which catches a document that lost its
+    // version but not a bump nobody meant to make. A change here is a change a
+    // consumer has to be told about, so it should be a line in a diff.
+    //
+    // Provenance is at 26 because the guest-operation policy batch -- every
+    // command a run spawns, the kernels it skipped, the initramfs images it
+    // produced, the trust it ended up holding, the resolver it inherited --
+    // spent one bump between them rather than one each. The plan did not move:
+    // none of it is an instruction, all of it is what the run turned out to be.
+    try std.testing.expectEqual(@as(u32, 22), plan_schema_version);
+    try std.testing.expectEqual(@as(u32, 26), provenance_schema_version);
 }
 
 test "native-edit resolution is deterministic, deeply owned, and integrity checked" {
