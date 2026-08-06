@@ -6114,6 +6114,7 @@ pub const UnsafeChrootRuntimeReport = struct {
     arena: std.heap.ArenaAllocator,
     tools: []const ToolRecord,
     installed_packages: []const []const u8,
+    imported_trust_keys: []const []const u8 = &.{},
     package_lock: []const PackageVersionLock = &.{},
     hooks: []const HookRecord = &.{},
     /// Present exactly when the request asked for a kernel-argument change.
@@ -6222,6 +6223,7 @@ pub const VmRuntimeReport = struct {
     arena: std.heap.ArenaAllocator,
     tools: []const ToolRecord,
     installed_packages: []const []const u8,
+    imported_trust_keys: []const []const u8 = &.{},
     package_lock: []const PackageVersionLock = &.{},
     hooks: []const HookRecord = &.{},
     /// Present exactly when the guest relabelled the root.
@@ -6374,6 +6376,23 @@ pub const PreservedExecutionRecord = struct {
     flattened_backing_chain: bool,
     operation_count: usize,
     installed_packages: []const []const u8,
+    /// The trust rpm actually ended up holding because of this run, as
+    /// `gpg-pubkey-<keyid>-<timestamp>`.
+    ///
+    /// The `rpm --import` argv names a file on a private tmpfs that no longer
+    /// exists, and the declared trust is recorded as bytes or a path -- so
+    /// neither says which key rpm derived from them and then verified every
+    /// package signature against. This is that key, read back out of the
+    /// target's own rpm database.
+    ///
+    /// It also catches trust nobody declared: a package transaction may import
+    /// a key of its own, and such a key appears here exactly like a declared
+    /// one, because from the finished image's point of view they are the same
+    /// thing.
+    ///
+    /// Empty for a run with no package actions, where no inventory is read at
+    /// all.
+    imported_trust_keys: []const []const u8 = &.{},
     /// The lock this run would have to declare to install exactly what it
     /// installed: every package the transaction added or changed, at the
     /// identity it settled on, and nothing the input image already carried.
@@ -6646,6 +6665,16 @@ fn guestPackages(
     return &.{};
 }
 
+/// Same alternation, and for the same reason: one run, one set of keys.
+fn guestTrustKeys(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+    vm_report: ?*const VmRuntimeReport,
+) []const []const u8 {
+    if (unsafe_report) |report| return report.imported_trust_keys;
+    if (vm_report) |report| return report.imported_trust_keys;
+    return &.{};
+}
+
 /// Same alternation, and for the same reason: one run, one emitted lock.
 fn guestPackageLock(
     unsafe_report: ?*const UnsafeChrootRuntimeReport,
@@ -6869,6 +6898,10 @@ fn buildResult(
             .flattened_backing_chain = flattened,
             .operation_count = operation_count,
             .installed_packages = try dupeStrings(result_allocator, guestPackages(unsafe_report, vm_report)),
+            .imported_trust_keys = try dupeStrings(
+                result_allocator,
+                guestTrustKeys(unsafe_report, vm_report),
+            ),
             .emitted_package_lock = try dupePackageLock(
                 result_allocator,
                 guestPackageLock(unsafe_report, vm_report),
@@ -8127,10 +8160,31 @@ fn hashPlanSources(
         .inline_script => {},
         .host_path => |path| try appendHashedSource(&records, allocator, io, .hook_source, path),
     };
-    for (plan.data.packages.repositories) |repository| for (repository.trust) |trust| switch (trust) {
-        .inline_bytes => {},
-        .host_path => |path| try appendHashedSource(&records, allocator, io, .trust_source, path),
-    };
+    // Trust is the one source recorded whichever form it arrives in. For
+    // every other kind, inline bytes are already covered by the plan hash --
+    // they are part of the request. Trust is different in what it buys the
+    // reader: two runs that trusted the same key are comparable only if both
+    // provenances state it the same way, and one naming a path with a digest
+    // beside a second carrying a blob are not comparable at all.
+    for (plan.data.packages.repositories) |repository| {
+        for (repository.trust, 0..) |trust, index| switch (trust) {
+            .inline_bytes => |bytes| try appendInlineSource(
+                &records,
+                allocator,
+                .trust_source,
+                repository.id,
+                index,
+                bytes,
+            ),
+            .host_path => |path| try appendHashedSource(
+                &records,
+                allocator,
+                io,
+                .trust_source,
+                path,
+            ),
+        };
+    }
     return records.toOwnedSlice();
 }
 
@@ -8150,6 +8204,37 @@ fn appendHashedSource(
         .kind = kind,
         .path = owned_path,
         .sha256 = try hashPath(allocator, io, path),
+    });
+}
+
+/// Records bytes the request carried, under a name for where it carried them.
+///
+/// The `path` is deliberately not a filesystem path and could not be mistaken
+/// for one: nothing opens it, and the re-read at the end of the run compares
+/// these records rather than reopening them -- which is what makes digesting
+/// request bytes safe. They cannot change mid-run, so this can never turn into
+/// the spurious `source_changed` failure that digesting a volatile host file
+/// would.
+fn appendInlineSource(
+    records: *std.array_list.Managed(SourceRecord),
+    allocator: Allocator,
+    kind: SourceKind,
+    repository_id: []const u8,
+    index: usize,
+    bytes: []const u8,
+) !void {
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "inline:{s}/trust/{d}",
+        .{ repository_id, index },
+    );
+    errdefer allocator.free(path);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    try records.append(.{
+        .kind = kind,
+        .path = path,
+        .sha256 = .{ .bytes = digest },
     });
 }
 
@@ -11368,6 +11453,85 @@ test "native-edit source hashing covers the disk and host edit sources" {
     defer freeSourceRecords(std.testing.allocator, after);
     try std.testing.expect(!sourceRecordsEqual(before, after));
     try std.testing.expectEqualSlices(u8, &before[0].sha256.bytes, &after[0].sha256.bytes);
+}
+
+test "declared trust is digested whichever form it arrives in" {
+    const io = std.testing.io;
+    const disk_path = "test-customize-trust-source.raw";
+    const key_path = "test-customize-trust-source.asc";
+    defer Io.Dir.cwd().deleteFile(io, disk_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, key_path) catch {};
+    for ([_]struct { path: []const u8, contents: []const u8 }{
+        .{ .path = disk_path, .contents = "disk" },
+        .{ .path = key_path, .contents = "a key on disk" },
+    }) |source| {
+        const file = try Io.Dir.cwd().createFile(io, source.path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, source.contents, 0);
+    }
+
+    const repositories = [_]PackageRepository{
+        .{
+            .id = "inline-trust",
+            .urls = &.{"https://packages.example.invalid"},
+            .trust = &.{
+                .{ .inline_bytes = "the first key" },
+                .{ .inline_bytes = "the second key" },
+            },
+        },
+        .{
+            .id = "path-trust",
+            .urls = &.{"https://packages.example.invalid"},
+            .trust = &.{.{ .host_path = key_path }},
+        },
+    };
+    var request = validNativeEditRequest(
+        disk_path,
+        "trust-source-output.raw",
+        ".",
+        &.{},
+    );
+    request.execution.backend = .unsafe_chroot;
+    request.execution.acknowledge_unsafe = true;
+    request.packages = .{
+        .actions = &.{.{ .install = &.{"zlib"} }},
+        .repositories = &repositories,
+    };
+    var resolved = try resolve(std.testing.allocator, &request, .{
+        .host_architecture = .x86_64,
+    });
+    defer resolved.deinit(std.testing.allocator);
+    const records = try hashPlanSources(std.testing.allocator, io, &resolved.plan.?);
+    defer freeSourceRecords(std.testing.allocator, records);
+
+    // A run that declared its key inline and a run that declared the same key
+    // as a path must produce provenance a reader can compare. Before this,
+    // one named a path with a digest and the other carried nothing at all.
+    try std.testing.expectEqual(@as(usize, 4), records.len);
+    try std.testing.expectEqual(SourceKind.disk, records[0].kind);
+    for (records[1..]) |record| {
+        try std.testing.expectEqual(SourceKind.trust_source, record.kind);
+    }
+    // Named for where the request carried them, per repository and per entry,
+    // so two keys under one repository are distinguishable and neither could
+    // be mistaken for a file on this machine.
+    try std.testing.expectEqualStrings("inline:inline-trust/trust/0", records[1].path);
+    try std.testing.expectEqualStrings("inline:inline-trust/trust/1", records[2].path);
+    try std.testing.expectEqualStrings(key_path, records[3].path);
+
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("the first key", &expected, .{});
+    try std.testing.expectEqualSlices(u8, &expected, &records[1].sha256.bytes);
+    std.crypto.hash.sha2.Sha256.hash("the second key", &expected, .{});
+    try std.testing.expectEqualSlices(u8, &expected, &records[2].sha256.bytes);
+
+    // Request bytes cannot change under a running build, so digesting them
+    // can never turn into the `source_changed` failure that digesting a
+    // volatile host file would. Checked rather than argued, because the
+    // re-read at the end of the run compares these records for equality.
+    const again = try hashPlanSources(std.testing.allocator, io, &resolved.plan.?);
+    defer freeSourceRecords(std.testing.allocator, again);
+    try std.testing.expect(sourceRecordsEqual(records, again));
 }
 
 test "native-edit tracks qcow2 backing files and rejects output aliases" {

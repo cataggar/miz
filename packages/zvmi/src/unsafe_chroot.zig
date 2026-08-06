@@ -373,6 +373,11 @@ const WorkerReport = struct {
     /// the run that has nothing to verify is exactly the run you want a lock
     /// out of.
     package_lock: []const customize.PackageVersionLock = &.{},
+    /// Trust rpm derived from what this run imported, as
+    /// `gpg-pubkey-<keyid>-<timestamp>`. The declared trust is recorded as
+    /// bytes or a path; this is the key rpm actually verified signatures
+    /// against, and it is also where trust nobody declared shows up.
+    imported_trust_keys: []const []const u8 = &.{},
     hooks: []const customize.HookRecord = &.{},
     boot_configuration: ?customize.BootConfigurationRecord = null,
     package_cache: ?customize.PackageCacheRecord = null,
@@ -456,6 +461,7 @@ fn executeManifest(
         .installed_packages = .init(allocator),
         .baseline_packages = .init(allocator),
         .emitted_lock = .init(allocator),
+        .imported_trust_keys = .init(allocator),
         .preexisting_loops = .init(allocator),
         .hook_records = .init(allocator),
         .tool_versions = .init(allocator),
@@ -487,6 +493,7 @@ fn executeManifest(
             .tools = session.tools.items,
             .installed_packages = session.installed_packages.items,
             .package_lock = session.emitted_lock.items,
+            .imported_trust_keys = session.imported_trust_keys.items,
             .hooks = session.hook_records.items,
             .boot_configuration = session.boot_configuration,
             .package_cache = session.package_cache,
@@ -531,6 +538,10 @@ const Session = struct {
     /// question to ask of it: what this transaction added.
     baseline_packages: std.array_list.Managed([]const u8),
     emitted_lock: std.array_list.Managed(customize.PackageVersionLock),
+    /// Trust rpm holds because of this run, collected from the same delta the
+    /// emitted lock comes from and for the same reason: the input image's own
+    /// keys are not this run's doing.
+    imported_trust_keys: std.array_list.Managed([]const u8),
     preexisting_loops: std.array_list.Managed([]const u8),
     hook_records: std.array_list.Managed(customize.HookRecord),
     /// Versions already probed, keyed by the guest path that was probed.
@@ -791,16 +802,19 @@ const Session = struct {
     fn runPolicy(self: *Session) !void {
         try self.writeRepositoryFiles();
         errdefer self.removeRepositoryFiles() catch {};
-        try self.importTrust();
-        // After the trust import and before the first action, which is the
-        // same point the guest agent reads it. `rpm --import` inserts a
-        // `gpg-pubkey-<keyid>-<timestamp>` pseudo-package into the target's
-        // rpm database, so a baseline taken before it would report the
-        // declared repository key as something this transaction installed.
+        // Before the trust import, so the baseline is the root exactly as it
+        // arrived and every `gpg-pubkey-<keyid>-<timestamp>` pseudo-package in
+        // the delta is trust this run added -- whether the request declared it
+        // or a package transaction imported one of its own. The lock is
+        // unaffected either way: both readers of the delta drop trust
+        // pseudo-packages, because `(none)` is not an architecture the pin
+        // rules accept and a lock must not pin a key.
+        //
         // Read for any run with package actions, not only a locked one: the
         // emitted lock is the difference between the two inventories, and a
         // run that declares no lock is the one most likely to want one.
         if (self.manifest.packages.actions.len != 0) try self.loadBaselinePackages();
+        try self.importTrust();
         for (self.manifest.packages.actions) |action| switch (action) {
             .install => |names| try self.runTdnfLocked("install", names),
             // The one verb a lock does not rewrite. A removal names what must
@@ -1163,7 +1177,12 @@ const Session = struct {
         if (self.manifest.packages.actions.len == 0) return;
         for (self.installed_packages.items) |installed| {
             if (containsBytes(self.baseline_packages.items, installed)) continue;
-            if (isTrustPseudoPackage(installed)) continue;
+            if (isTrustPseudoPackage(installed)) {
+                try self.imported_trust_keys.append(
+                    try self.allocator.dupe(u8, trustKeyIdentity(installed)),
+                );
+                continue;
+            }
             const pin = customize.parseInstalledPackageRecord(installed) orelse
                 return error.InvalidInstalledPackageRecord;
             try self.emitted_lock.append(pin);
@@ -2627,6 +2646,12 @@ fn tdnfConfigHostPath(
 /// the ones a package transaction imports on its own, which no caller declared
 /// and no lock could pin -- `(none)` is not an architecture the pin rules
 /// accept, so a lock naming one could never be restated.
+/// The key rpm derived from imported trust, without the constant `(none)`
+/// architecture rpm gives every one of them.
+fn trustKeyIdentity(record: []const u8) []const u8 {
+    return record[0 .. record.len - ".(none)".len];
+}
+
 fn isTrustPseudoPackage(record: []const u8) bool {
     return std.mem.startsWith(u8, record, "gpg-pubkey-") and
         std.mem.endsWith(u8, record, ".(none)");
@@ -3394,6 +3419,7 @@ fn loadParentReport(
         .arena = arena,
         .tools = tools,
         .installed_packages = parsed.value.installed_packages,
+        .imported_trust_keys = parsed.value.imported_trust_keys,
         .package_lock = parsed.value.package_lock,
         .hooks = parsed.value.hooks,
         .boot_configuration = parsed.value.boot_configuration,
@@ -4750,6 +4776,79 @@ test "the privilege boundary re-checks a credential it is handed" {
     );
 }
 
+test "the key rpm derived from imported trust is recorded, and never pinned" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root_path = "test-unsafe-chroot-trust-key-root";
+    const raw_path = "test-unsafe-chroot-trust-key-stage.raw";
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+        .exclusive = true,
+        .read = true,
+    });
+    try raw_file.setLength(io, 8192);
+    const raw_inode = (try raw_file.stat(io)).inode;
+    raw_file.close(io);
+
+    const repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    const manifest = Manifest{
+        .raw_path = raw_path,
+        .root_path = root_path,
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = raw_inode,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{
+            .actions = &.{.{ .install = &.{"zlib"} }},
+            .repositories = &repositories,
+        },
+        .initramfs = .unchanged,
+    };
+
+    var context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .timeline = .init(allocator),
+        .plant_trust_key = true,
+    };
+    const result = try executeManifest(allocator, io, manifest, .{
+        .context = &context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
+    try std.testing.expect(context.saw_rpm_import);
+
+    // The `rpm --import` argv names a file on a tmpfs that no longer exists,
+    // and the declared trust is recorded as bytes. Neither says which key rpm
+    // derived from them and then verified every signature against.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        result.report.imported_trust_keys.len,
+    );
+    try std.testing.expectEqualStrings(
+        "gpg-pubkey-3135ce90-5e6d0f1e",
+        result.report.imported_trust_keys[0],
+    );
+
+    // And it is still not a package. `(none)` is not an architecture the pin
+    // rules accept, so an emitted lock carrying one could never be restated by
+    // the run that reads it.
+    for (result.report.package_lock) |pin| {
+        try std.testing.expect(!std.mem.startsWith(u8, pin.name, "gpg-pubkey"));
+    }
+}
+
 fn findSkippedKernel(
     entries: []const customize.SkippedKernelRelease,
     name: []const u8,
@@ -5338,6 +5437,10 @@ const FakeExecutorContext = struct {
     root_path: []const u8,
     unmounts: std.array_list.Managed([]const u8) = undefined,
     saw_rpm_import: bool = false,
+    /// Whether the target's rpm database gains a trust pseudo-package once
+    /// this run has imported something into it.
+    plant_trust_key: bool = false,
+    inventory_reads: usize = 0,
     saw_tdnf_install: bool = false,
     saw_tdnf_remove: bool = false,
     saw_dracut: bool = false,
@@ -5695,9 +5798,19 @@ const FakeExecutorContext = struct {
             self.detached_loops += 1;
         }
         if (containsArg(argv, "/usr/bin/rpm") and containsArg(argv, "-qa")) {
+            self.inventory_reads += 1;
+            // The baseline is read first and before the trust import, so a key
+            // rpm derived during this run is in the second reading and not the
+            // first -- which is exactly what makes it a key this run added
+            // rather than one the input image already carried.
+            const trusted = self.plant_trust_key and self.inventory_reads > 1;
             return fakeResult(
                 allocator,
-                "zlib-0:1.3-2.aarch64\nbash-0:5.2-1.aarch64\n",
+                if (trusted)
+                    "zlib-0:1.3-2.aarch64\nbash-0:5.2-1.aarch64\n" ++
+                        "gpg-pubkey-3135ce90-5e6d0f1e.(none)\n"
+                else
+                    "zlib-0:1.3-2.aarch64\nbash-0:5.2-1.aarch64\n",
                 0,
             );
         }

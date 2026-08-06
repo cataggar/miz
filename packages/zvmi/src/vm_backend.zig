@@ -1661,6 +1661,14 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
             break :blk .{ .skipped_kernel_releases = skipped, .images = images };
         } else null;
 
+    const trust_keys = try owned.alloc(
+        []const u8,
+        input.result.imported_trust_keys.len,
+    );
+    for (input.result.imported_trust_keys, trust_keys) |key, *slot| {
+        slot.* = try owned.dupe(u8, key);
+    }
+
     const packages = try owned.alloc([]const u8, input.result.installed_packages.len);
     for (input.result.installed_packages, packages) |name, *slot| {
         slot.* = try owned.dupe(u8, name);
@@ -1714,6 +1722,7 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
         .arena = arena,
         .tools = tools,
         .installed_packages = packages,
+        .imported_trust_keys = trust_keys,
         .package_lock = emitted_lock,
         .hooks = hooks,
         .selinux_relabel = relabel,

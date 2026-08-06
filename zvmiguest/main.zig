@@ -60,6 +60,7 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
         .baseline_packages = .init(allocator),
         .emitted_lock = .init(allocator),
         .hook_outcomes = .init(allocator),
+        .imported_trust_keys = .init(allocator),
         .initramfs_images = .init(allocator),
         .skipped_kernels = .init(allocator),
     };
@@ -73,6 +74,7 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
         .package_lock = session.emitted_lock.items,
         .hooks = session.hook_outcomes.items,
         .selinux_relabel = session.selinux_relabel,
+        .imported_trust_keys = session.imported_trust_keys.items,
         .initramfs = if (session.initramfs_regenerated) .{
             .skipped_kernel_releases = session.skipped_kernels.items,
             .images = session.initramfs_images.items,
@@ -109,6 +111,7 @@ const Session = struct {
     /// Whether an initramfs regeneration was attempted at all, which is not
     /// the same as whether one produced an image.
     initramfs_regenerated: bool = false,
+    imported_trust_keys: std.array_list.Managed([]const u8),
     initramfs_images: std.array_list.Managed(control_mod.InitramfsImage),
     skipped_kernels: std.array_list.Managed(control_mod.SkippedKernel),
 
@@ -180,10 +183,12 @@ const Session = struct {
         self.writeRepositoryFiles(control) catch |err| {
             return fail("repository-configuration", @errorName(err));
         };
-        self.importTrust(control) catch |err| {
-            return self.stageFailure("repository-trust", err);
-        };
-        // Before the first action, so the baseline is the root as it arrived.
+        // Before the trust import, so the baseline is the root exactly as it
+        // arrived and every `gpg-pubkey-<keyid>-<timestamp>` in the delta is
+        // trust this run added -- declared or imported by a transaction on its
+        // own. The lock is unaffected: its reader drops trust
+        // pseudo-packages either way, because a lock must not pin a key.
+        //
         // Read for any run with package actions, not only a pinned one: the
         // emitted lock is the difference between the two inventories, and the
         // run that declares no pins is the one most likely to want them.
@@ -192,6 +197,9 @@ const Session = struct {
                 return self.stageFailure("package-baseline", err);
             };
         }
+        self.importTrust(control) catch |err| {
+            return self.stageFailure("repository-trust", err);
+        };
         for (control.actions) |action| {
             const executed = switch (action) {
                 .install => |names| self.runTdnfPinned("install", names, control),
@@ -335,7 +343,12 @@ const Session = struct {
         if (control.actions.len == 0) return;
         for (self.installed_packages.items) |installed| {
             if (containsBytes(self.baseline_packages.items, installed)) continue;
-            if (control_mod.isTrustPseudoPackage(installed)) continue;
+            if (control_mod.isTrustPseudoPackage(installed)) {
+                try self.imported_trust_keys.append(
+                    control_mod.trustKeyIdentity(installed),
+                );
+                continue;
+            }
             const pin = control_mod.parseInstalledPackageRecord(installed) orelse
                 return error.InvalidInstalledPackageRecord;
             try self.emitted_lock.append(pin);
@@ -1788,6 +1801,7 @@ test "a module member the agent will not open is refused before any syscall" {
         .baseline_packages = .init(arena.allocator()),
         .emitted_lock = .init(arena.allocator()),
         .hook_outcomes = .init(arena.allocator()),
+        .imported_trust_keys = .init(arena.allocator()),
         .initramfs_images = .init(arena.allocator()),
         .skipped_kernels = .init(arena.allocator()),
     };
