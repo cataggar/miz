@@ -35,6 +35,9 @@ const resolver_backup_path = "/etc/.zvmi-resolv.conf";
 /// checked. Generous because software emulation stretches every wall-clock
 /// interval a guest experiences.
 const device_wait_ms: u32 = 60_000;
+/// How much of the target's `/etc/selinux/config` is read to find the policy
+/// name. It is a handful of `KEY=value` lines wherever it exists.
+const max_selinux_config_bytes: usize = 64 * 1024;
 const device_poll_ms: u32 = 50;
 
 var console_fd: i32 = -1;
@@ -237,6 +240,16 @@ const Session = struct {
         self.runHooks(control, .finalize) catch |err| {
             return self.stageFailure("hooks", err);
         };
+        // Last, after every hook and every other change: a relabel is only
+        // true of the tree as it stood when the tool walked it, so anything
+        // written afterwards would be the unlabelled file it exists to
+        // prevent. The same position the chroot backend relabels from, and
+        // the phase the plan publishes last.
+        if (control.selinux_relabel) {
+            self.relabelRoot() catch |err| {
+                return self.stageFailure("selinux", err);
+            };
+        }
         // After every hook, so a hook that installed a package is visible in
         // the inventory the result carries -- the same point the chroot
         // backend reads its own.
@@ -637,6 +650,78 @@ const Session = struct {
         );
         try self.runChroot(&.{ "/usr/bin/cp", "--remove-destination", temporary, final });
         self.deleteGuestFile(temporary);
+    }
+
+    /// Relabels the target root with the policy the target itself carries.
+    ///
+    /// Reads the policy out of the target's own `/etc/selinux/config` while
+    /// the run executes rather than taking it from the control document,
+    /// because a package action in this same run can have installed or
+    /// replaced it. The argv reaches provenance like every other tool, so what
+    /// it resolved to needs no record of its own.
+    fn relabelRoot(self: *Session) !void {
+        const tool = for (control_mod.selinux.setfiles_candidates) |candidate| {
+            if (self.guestFileExists(candidate)) break candidate;
+        } else return error.MissingSelinuxLabellingTool;
+
+        const config = self.readGuestFile(
+            control_mod.selinux.config_path,
+            max_selinux_config_bytes,
+        ) catch return error.MissingSelinuxConfiguration;
+        const policy = control_mod.selinux.parseConfiguredPolicy(config) orelse
+            return error.MissingSelinuxConfiguration;
+        var contexts_buffer: [control_mod.selinux.max_policy_name_bytes + 64]u8 = undefined;
+        const contexts = control_mod.selinux.fileContextsPath(&contexts_buffer, policy) catch
+            return error.UnsupportedSelinuxPolicy;
+        if (!self.guestFileExists(contexts)) return error.MissingSelinuxFileContexts;
+
+        var argv = std.array_list.Managed([]const u8).init(self.allocator);
+        try argv.append(tool);
+        // Reset every context to what the policy says, matching how the
+        // target's own installer labels a fresh root.
+        try argv.append("-F");
+        // Only the exclusions that exist, so the argv describes the run that
+        // happened. All four are mounted by this agent for the chroot, and
+        // none of them is part of the image.
+        for (control_mod.selinux.excluded_directories) |directory| {
+            if (!self.guestDirectoryExists(directory)) continue;
+            try argv.append("-e");
+            try argv.append(directory);
+        }
+        // Duplicated because the buffer it was formatted into does not outlive
+        // this function, and the argv is kept for provenance.
+        try argv.append(try self.allocator.dupe(u8, contexts));
+        try argv.append("/");
+        try self.runChroot(argv.items);
+    }
+
+    fn guestFileExists(self: *Session, guest_path: []const u8) bool {
+        const host_path = std.fmt.allocPrintSentinel(
+            self.allocator,
+            guest_root ++ "{s}",
+            .{guest_path},
+            0,
+        ) catch return false;
+        return isRegularFile(host_path);
+    }
+
+    fn guestDirectoryExists(self: *Session, guest_path: []const u8) bool {
+        const host_path = std.fmt.allocPrintSentinel(
+            self.allocator,
+            guest_root ++ "{s}",
+            .{guest_path},
+            0,
+        ) catch return false;
+        return isDirectory(host_path);
+    }
+
+    fn readGuestFile(self: *Session, guest_path: []const u8, limit: usize) ![]u8 {
+        const host_path = try std.fmt.allocPrint(
+            self.allocator,
+            guest_root ++ "{s}",
+            .{guest_path},
+        );
+        return readFileAlloc(self.allocator, host_path, limit);
     }
 
     fn loadInstalledPackages(self: *Session) !void {
@@ -1280,6 +1365,18 @@ fn mkdirParents(allocator: Allocator, path: []const u8) !void {
 /// stat` whose layout varies by architecture.
 fn isDirectory(path: [*:0]const u8) bool {
     const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    _ = linux.close(@intCast(rc));
+    return true;
+}
+
+/// The mirror of `isDirectory` for a file: opening for reading answers the
+/// question, and fails for a directory only after `O_DIRECTORY` has already
+/// been ruled out -- so it is asked the other way round, by refusing anything
+/// that opens as a directory.
+fn isRegularFile(path: [*:0]const u8) bool {
+    if (isDirectory(path)) return false;
+    const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
     if (linux.errno(rc) != .SUCCESS) return false;
     _ = linux.close(@intCast(rc));
     return true;

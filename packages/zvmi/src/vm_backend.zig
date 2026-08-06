@@ -594,6 +594,7 @@ fn buildControl(
             .modules = members,
             .kernel_modules = data.os.kernel_modules,
             .hooks = hooks.carried,
+            .selinux = data.selinux,
         }),
         .hooks = hooks.plans,
     };
@@ -691,6 +692,7 @@ const ControlInput = struct {
     modules: []const []const u8 = &.{},
     kernel_modules: []const customize.KernelModule = &.{},
     hooks: []const vm_control.Hook = &.{},
+    selinux: customize.SelinuxPolicy = .unchanged,
 };
 
 fn controlFromPolicy(
@@ -825,6 +827,15 @@ fn controlFromPolicy(
         .kernel_module_files = kernel_module_files,
         .modules = input.modules,
         .hooks = input.hooks,
+        .selinux_relabel = switch (input.selinux) {
+            .unchanged => false,
+            .relabel => true,
+            // Preflight refuses a mode or policy change, so a plan carrying
+            // one never reaches a control document. Named rather than mapped
+            // to `false`, because writing a document that says the run does
+            // nothing would be answering a request this backend cannot serve.
+            .configure => return error.UnsupportedSelinuxPolicy,
+        },
     };
 }
 
@@ -1946,6 +1957,44 @@ test "update actions reach the guest, and an unnamed selective update does not" 
     var empty = control;
     empty.actions = &.{.{ .update_selected = &.{} }};
     try std.testing.expectError(error.EmptyAction, empty.validate());
+}
+
+test "the relabel decision reaches the guest, and a policy change does not" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const devices = Devices{ .root_device = "/dev/vda2", .result_device = "/dev/vdb" };
+
+    const unchanged = try controlFromPolicy(allocator, std.testing.io, .{
+        .packages = .{},
+        .initramfs = .unchanged,
+        .network = .offline,
+        .devices = devices,
+    });
+    try std.testing.expect(!unchanged.selinux_relabel);
+
+    const relabel = try controlFromPolicy(allocator, std.testing.io, .{
+        .packages = .{},
+        .initramfs = .unchanged,
+        .network = .offline,
+        .devices = devices,
+        .selinux = .relabel,
+    });
+    try std.testing.expect(relabel.selinux_relabel);
+
+    // A mode or policy change has no guest implementation, so it is refused
+    // here rather than composed into a control the guest would ignore.
+    try std.testing.expectError(error.UnsupportedSelinuxPolicy, controlFromPolicy(
+        allocator,
+        std.testing.io,
+        .{
+            .packages = .{},
+            .initramfs = .unchanged,
+            .network = .offline,
+            .devices = devices,
+            .selinux = .{ .configure = .{ .mode = .enforcing } },
+        },
+    ));
 }
 
 test "an untouched result device is silence rather than an answer" {

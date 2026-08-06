@@ -375,6 +375,15 @@ pub const ConfigurationV2 = struct {
     customization: customization_wire.Configuration = .{},
 };
 
+pub const Selinux = enum {
+    unchanged,
+    /// Relabel the root with the policy the target itself carries. The only
+    /// SELinux operation either executing backend implements; changing the
+    /// mode or the active policy is refused during preflight, so it has no
+    /// spelling here rather than one that would never be honoured.
+    relabel,
+};
+
 pub const Configuration = struct {
     api_version: u32 = api_version,
     backend: Backend = .native_edit,
@@ -385,6 +394,7 @@ pub const Configuration = struct {
     packages: PackagePolicy = .{},
     hooks: []const Hook = &.{},
     initramfs: InitramfsPolicy = .unchanged,
+    selinux: Selinux = .unchanged,
     guest_execution: GuestExecutionPolicy = .same_architecture,
     runner: ?Runner = null,
     vm: ?VmConfiguration = null,

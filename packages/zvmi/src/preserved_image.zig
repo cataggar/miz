@@ -560,6 +560,85 @@ fn runEditMutation(
     editor_open = false;
 }
 
+/// A read-only view of the root filesystem a preserved-image run would mutate,
+/// opened from the source image without copying or staging anything.
+///
+/// Exists so a preflight can answer questions whose answer lives inside the
+/// image -- whether the target carries the tool an operation needs, what its
+/// own configuration says -- before a workspace is created. Refusing after the
+/// source has been copied costs the whole copy and leaves a transaction to
+/// clean up; refusing from here costs a few reads.
+///
+/// Initialised in place rather than returned by value: the ext4 reader is
+/// handed a pointer to the image beside it, so the pair may not move once
+/// opened. This mirrors `MountedSource`, which is a field for the same reason.
+pub const SourceRoot = struct {
+    image: Image = undefined,
+    image_open: bool = false,
+    reader: ext4.Reader = undefined,
+    reader_open: bool = false,
+
+    pub fn open(
+        self: *SourceRoot,
+        allocator: Allocator,
+        io: Io,
+        source_path: []const u8,
+        root_partition: PartitionSelector,
+    ) !void {
+        self.* = .{};
+        errdefer self.close(io);
+        if (source_path.len == 0) return error.InvalidPath;
+        self.image = try Image.openPathReadOnly(io, source_path);
+        self.image_open = true;
+        // The read-only shape rather than the rebuild one: this view only
+        // reads, so a root that is not a Linux-typed MBR partition is still a
+        // root it can answer questions about.
+        const partition = try selectPartition(allocator, io, self.image, root_partition);
+        const end = std.math.add(u64, partition.offset, partition.length) catch
+            return error.InvalidPartitionBounds;
+        if (partition.length == 0 or end > self.image.virtual_size) {
+            return error.InvalidPartitionBounds;
+        }
+        self.reader = try ext4.openReadOnlySource(
+            io,
+            self.image.file,
+            .{ .ctx = &self.image, .read_at_fn = imageReadAt },
+            allocator,
+            .{ .offset = partition.offset },
+        );
+        self.reader_open = true;
+    }
+
+    pub fn close(self: *SourceRoot, io: Io) void {
+        if (self.reader_open) {
+            self.reader.deinit();
+            self.reader_open = false;
+        }
+        if (self.image_open) {
+            self.image.close(io);
+            self.image_open = false;
+        }
+    }
+
+    /// Whether `path` resolves to something inside the root. A question rather
+    /// than a result because every reason it could fail -- absent, unreadable,
+    /// a dangling symlink -- means the same thing to a caller deciding whether
+    /// an operation can run.
+    pub fn exists(self: *SourceRoot, io: Io, path: []const u8) bool {
+        _ = self.reader.statPath(io, path) catch return false;
+        return true;
+    }
+
+    pub fn readFileAlloc(
+        self: *SourceRoot,
+        io: Io,
+        allocator: Allocator,
+        path: []const u8,
+    ) ![]u8 {
+        return self.reader.readFileAlloc(io, allocator, path);
+    }
+};
+
 /// Performs the complete rebuild source preflight using read-only handles.
 /// No output, staging, spool, workspace, or other file is created.
 pub fn inspectRebuild(

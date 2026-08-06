@@ -20,7 +20,7 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
-pub const control_version: u32 = 4;
+pub const control_version: u32 = 5;
 pub const result_version: u32 = 2;
 
 /// Path the host writes the control document to inside the initramfs, and the
@@ -371,6 +371,10 @@ pub const TargetFile = struct {
 
 /// Kept byte-identical to the `os_customization` constants of the same names
 /// by a test in `vm_backend`, which is the one place that imports both.
+/// What relabelling a root involves, shared with the host and the privileged
+/// worker so all three carry out the same operation.
+pub const selinux = @import("selinux.zig");
+
 pub const kernel_module_config_paths = [_][]const u8{
     "etc/modules-load.d/zvmi.conf",
     "etc/modprobe.d/zvmi-blacklist.conf",
@@ -462,6 +466,13 @@ pub const Control = struct {
     /// the guest can walk this list once per phase and still obey the order
     /// the plan publishes.
     hooks: []const Hook = &.{},
+    /// Whether the guest relabels the target root before it seals the result.
+    ///
+    /// A flag rather than a policy because relabelling with the target's own
+    /// policy is the only SELinux operation either backend implements; the
+    /// host refuses a mode or policy change during preflight, so there is
+    /// nothing else for this to say.
+    selinux_relabel: bool = false,
 
     pub fn validate(self: Control) Error!void {
         if (self.version != control_version) return error.UnsupportedVersion;
@@ -1167,7 +1178,7 @@ test "a version mismatch is refused by name even when the document is otherwise 
     // what it must report -- not the parse failure that happens to come first.
     try std.testing.expectError(error.UnsupportedVersion, parseControl(
         allocator,
-        \\{"version":5,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\{"version":6,"root_device":"/dev/vda2","result_device":"/dev/vdb",
         \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
         ,
     ));
@@ -1176,7 +1187,7 @@ test "a version mismatch is refused by name even when the document is otherwise 
     // failure: the version claimed it would be understood, and it was not.
     try std.testing.expectError(error.UnknownField, parseControl(
         allocator,
-        \\{"version":4,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\{"version":5,"root_device":"/dev/vda2","result_device":"/dev/vdb",
         \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
         ,
     ));
