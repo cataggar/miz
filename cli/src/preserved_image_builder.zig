@@ -48,6 +48,7 @@ const LoadedConfiguration = struct {
     packages: zvmi.customize.PackagePolicy,
     hooks: []const zvmi.customize.Hook,
     initramfs: zvmi.customize.InitramfsPolicy,
+    selinux: zvmi.customize.SelinuxPolicy,
     guest_execution: wire.GuestExecutionPolicy,
     runner: ?wire.Runner,
     vm: ?zvmi.customize.VmPolicy,
@@ -222,6 +223,7 @@ pub fn main(init: std.process.Init) !void {
         .packages = configuration.packages,
         .hooks = configuration.hooks,
         .initramfs = configuration.initramfs,
+        .selinux = configuration.selinux,
         .cross_architecture = switch (configuration.guest_execution) {
             .same_architecture => .reject,
             .cross_architecture => .{ .runner = .{
@@ -568,6 +570,7 @@ fn loadV2Configuration(
         .packages = .{},
         .hooks = &.{},
         .initramfs = .unchanged,
+        .selinux = .unchanged,
         .guest_execution = .same_architecture,
         .runner = null,
         .vm = null,
@@ -631,6 +634,10 @@ fn loadV3Configuration(
         ),
         .hooks = try mapHooks(allocator, parsed.value.hooks, source_paths),
         .initramfs = try mapInitramfsPolicy(allocator, parsed.value.initramfs),
+        .selinux = switch (parsed.value.selinux) {
+            .unchanged => .unchanged,
+            .relabel => .relabel,
+        },
         .guest_execution = parsed.value.guest_execution,
         .runner = parsed.value.runner,
         .vm = mapVmPolicy(parsed.value.vm),

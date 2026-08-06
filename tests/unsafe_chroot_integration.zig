@@ -32,6 +32,13 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, executable_name, "hang")) {
         return runGuestHangingHook(init.io);
     }
+    // The target's own labelling tool. It records the command it was given
+    // rather than labelling anything: what is under test is that the run
+    // invokes the target's tool, with the policy the target names, at the
+    // point in the run where nothing else will write afterwards.
+    if (std.mem.eql(u8, executable_name, "setfiles")) {
+        return runGuestSetfiles(allocator, init.io, argv[1..]);
+    }
     if (std.mem.eql(u8, executable_name, "grub2-mkconfig")) {
         return runGuestGrubMkconfig(allocator, init.io, argv[1..]);
     }
@@ -190,6 +197,7 @@ fn runIntegration(
             .kernels = &.{"6.0-integration"},
         } },
         .boot_security = .{ .extra_kernel_options = "console=ttyS0" },
+        .selinux = .relabel,
         .execution = .{
             .workspace_path = work_path,
             .backend = .unsafe_chroot,
@@ -240,7 +248,7 @@ fn runIntegration(
             return error.IntegrationCleanupFailed;
         }
     }
-    try ensure(result.provenance.tools.len == 6);
+    try ensure(result.provenance.tools.len == 7);
     const preserved = result.provenance.execution.preserved orelse
         return error.MissingPreservedProvenance;
     // The inventory is reported as rpm gives it, trust pseudo-packages and
@@ -316,6 +324,29 @@ fn runIntegration(
         try ensure(std.mem.eql(u8, tool.command[2], "/boot/grub2/grub.cfg"));
     }
     try ensure(generator_recorded);
+
+    // The relabel ran the tool the target carries, against the policy the
+    // target's own configuration names -- neither was supplied by the caller.
+    // The recorded command is the audit trail the run publishes for it.
+    var relabel_recorded = false;
+    for (result.provenance.tools) |tool| {
+        if (!std.mem.eql(u8, tool.name, "setfiles")) continue;
+        relabel_recorded = true;
+        try ensure(tool.command.len == integration_relabel_argv.len);
+        for (tool.command, integration_relabel_argv) |actual, expected| {
+            try ensure(std.mem.eql(u8, actual, expected));
+        }
+    }
+    try ensure(relabel_recorded);
+    // Written by the tool from inside the chroot, so this is the command as
+    // the target saw it rather than as the parent composed it.
+    try expectOutputFile(
+        allocator,
+        io,
+        output_path,
+        integration_relabel_marker,
+        integration_relabel_command ++ "\n",
+    );
 
     try expectOutputFile(
         allocator,
@@ -691,6 +722,10 @@ fn createSourceDisk(
         "dev",
         "etc",
         "etc/default",
+        "etc/selinux",
+        "etc/selinux/" ++ integration_selinux_policy,
+        "etc/selinux/" ++ integration_selinux_policy ++ "/contexts",
+        "etc/selinux/" ++ integration_selinux_policy ++ "/contexts/files",
         "proc",
         "run",
         "sys",
@@ -744,6 +779,21 @@ fn createSourceDisk(
     // and this root carries no shell.
     try tree.putSymlink("usr/bin/hang", "rpm", .{ .mode = 0o777 });
     try tree.putSymlink("usr/sbin/grub2-mkconfig", "../bin/rpm", .{ .mode = 0o777 });
+    // The labelling tool and the policy it labels against, both carried by
+    // the target the way a real SELinux-enabled image carries them. The
+    // preflight probe reads these out of this disk before the run starts, so
+    // a root missing any of them is refused rather than half-relabelled.
+    try tree.putSymlink("usr/sbin/setfiles", "../bin/rpm", .{ .mode = 0o777 });
+    try tree.putFileBytes(
+        "etc/selinux/config",
+        "SELINUX=enforcing\nSELINUXTYPE=" ++ integration_selinux_policy ++ "\n",
+        .{ .mode = 0o644 },
+    );
+    try tree.putFileBytes(
+        "etc/selinux/" ++ integration_selinux_policy ++ "/contexts/files/file_contexts",
+        "/.*  system_u:object_r:default_t:s0\n",
+        .{ .mode = 0o644 },
+    );
     _ = try zvmi.ext4.populate(
         io,
         image.file,
@@ -757,6 +807,58 @@ fn createSourceDisk(
             .timestamp = 1_735_689_600,
         },
     );
+}
+
+/// The policy this target ships. Deliberately not `targeted`: the run has to
+/// read the name out of the target's own configuration, and a name every real
+/// image also uses would not tell a read apart from a default.
+const integration_selinux_policy = "integration";
+
+const integration_relabel_marker = "/var/lib/zvmi-integration/relabel";
+
+const integration_relabel_argv = [_][]const u8{
+    "/usr/sbin/setfiles",
+    "-F",
+    "-e",
+    "/proc",
+    "-e",
+    "/sys",
+    "-e",
+    "/dev",
+    "-e",
+    "/run",
+    "/etc/selinux/" ++ integration_selinux_policy ++ "/contexts/files/file_contexts",
+    "/",
+};
+
+const integration_relabel_command = "/usr/sbin/setfiles -F " ++
+    "-e /proc -e /sys -e /dev -e /run " ++
+    "/etc/selinux/" ++ integration_selinux_policy ++ "/contexts/files/file_contexts /";
+
+/// Stands in for the target's `setfiles`. It checks the file-contexts file it
+/// was pointed at is one this root actually carries -- a relabel against a
+/// policy that is not there is the failure the preflight probe exists to
+/// prevent -- and records the command for the run to be checked against.
+fn runGuestSetfiles(allocator: Allocator, io: Io, args: []const []const u8) !void {
+    if (args.len < 3) return error.UnexpectedSetfilesInvocation;
+    const contexts = args[args.len - 2];
+    const contexts_file = Io.Dir.cwd().openFile(io, contexts, .{
+        .mode = .read_only,
+        .allow_directory = false,
+    }) catch return error.MissingSelinuxFileContexts;
+    contexts_file.close(io);
+    if (!std.mem.eql(u8, args[args.len - 1], "/")) {
+        return error.UnexpectedSetfilesInvocation;
+    }
+    const command = try std.mem.join(allocator, " ", args);
+    defer allocator.free(command);
+    const full = try std.fmt.allocPrint(
+        allocator,
+        "/usr/sbin/setfiles {s}",
+        .{command},
+    );
+    defer allocator.free(full);
+    try writeGuestMarker(io, integration_relabel_marker, full);
 }
 
 /// Sleeps far past any budget a test would set, in one call rather than a

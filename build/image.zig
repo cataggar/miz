@@ -258,6 +258,10 @@ pub const PreservedHook = struct {
 };
 
 pub const PreservedInitramfsPolicy = preserved_image_wire.InitramfsPolicy;
+/// Whether a preserved-image run relabels the root with the SELinux policy the
+/// target carries. Relabelling is what a mutating run needs: files a package
+/// action or a hook creates are otherwise left with no label at all.
+pub const PreservedSelinuxPolicy = preserved_image_wire.Selinux;
 pub const PreservedGuestExecutionPolicy = preserved_image_wire.GuestExecutionPolicy;
 pub const PreservedRunnerKind = preserved_image_wire.RunnerKind;
 pub const PreservedRunner = preserved_image_wire.Runner;
@@ -288,6 +292,7 @@ pub const PreservedOptions = struct {
     packages: PreservedPackagePolicy = .{},
     hooks: []const PreservedHook = &.{},
     initramfs: PreservedInitramfsPolicy = .unchanged,
+    selinux: PreservedSelinuxPolicy = .unchanged,
     guest_execution: PreservedGuestExecutionPolicy = .same_architecture,
     /// The runner that makes a foreign guest architecture executable.
     /// Required by, and only meaningful to, `cross_architecture` execution.
@@ -650,6 +655,7 @@ fn materializePreservedConfiguration(
         },
         .hooks = hooks,
         .initramfs = options.initramfs,
+        .selinux = options.selinux,
         .guest_execution = options.guest_execution,
         .runner = options.runner,
         .vm = options.vm,

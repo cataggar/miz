@@ -6,6 +6,7 @@ const customize = @import("customize.zig");
 const grub_defaults = @import("grub_defaults.zig");
 const os_customization = @import("os_customization.zig");
 const preserved_image = @import("preserved_image.zig");
+const selinux_mod = @import("selinux.zig");
 const transaction_guard = @import("transaction_guard.zig");
 const vm_control = @import("vm_control.zig");
 
@@ -36,6 +37,11 @@ const cleanup_deadline_seconds: u32 = 90;
 /// let the graceful path win, and the parent's own bound exists because a
 /// worker wedged in that teardown must not hang the build either.
 const worker_cleanup_grace_seconds: u32 = 120;
+
+/// How much of the target's `/etc/selinux/config` is read to find the policy
+/// name. The file is a handful of `KEY=value` lines in every distribution that
+/// ships one, so anything past this is not the file this expects.
+const max_selinux_config_bytes: usize = 64 * 1024;
 
 pub const active_lease_basename = transaction_guard.active_lease_basename;
 pub const activeLeasePath = transaction_guard.activeLeasePath;
@@ -68,6 +74,8 @@ const Manifest = struct {
     /// configuration. Empty means the run changes none.
     kernel_options: []const u8 = "",
     hooks: []const customize.Hook = &.{},
+    /// Whether the run relabels the root filesystem before it is sealed.
+    selinux: customize.SelinuxPolicy = .unchanged,
     /// What was left of the run's budget when the worker was spawned, in whole
     /// seconds. Passed as a remainder rather than as an absolute time because
     /// the worker is a separate process and only one of them owns the clock
@@ -180,6 +188,7 @@ pub fn runParent(
         .kernel_modules = options.plan.data.os.kernel_modules,
         .kernel_options = options.plan.data.boot_security.extra_kernel_options,
         .hooks = options.plan.data.hooks,
+        .selinux = options.plan.data.selinux,
         // What is left of the budget at the moment the worker starts, not what
         // the run declared: the copy that produced the raw stage has already
         // been paid for out of the same budget.
@@ -801,6 +810,83 @@ const Session = struct {
         // describes the root as the run leaves it.
         try self.regenerateBootConfiguration();
         try self.runHooks(.finalize);
+        // Last, in the phase the plan publishes last. Everything above this
+        // line creates or rewrites files, and a relabel only describes the
+        // tree as it stood when the tool walked it.
+        try self.relabelRoot();
+    }
+
+    /// Relabels the target root with the policy the target itself carries.
+    ///
+    /// The policy is read from the target's own `/etc/selinux/config` here
+    /// rather than taken from the plan, because a package action in this same
+    /// run can have installed or replaced it -- the same reason kernel
+    /// releases are discovered after the transaction rather than declared in
+    /// advance. What it resolved to is auditable without a record of its own,
+    /// because the full argv reaches provenance like every other tool.
+    ///
+    /// `setfiles` rather than `restorecon`: it takes the file-contexts file as
+    /// an argument instead of asking libselinux for the active policy, which
+    /// needs a loaded policy and a mounted selinuxfs that an executor running
+    /// its own kernel does not have.
+    fn relabelRoot(self: *Session) !void {
+        switch (self.manifest.selinux) {
+            .unchanged => return,
+            // `validateManifestPolicy` refused this already; repeated so the
+            // run cannot treat an unimplemented policy as a completed one.
+            .configure => return error.UnsupportedSelinuxPolicy,
+            .relabel => {},
+        }
+        const tool = try self.findGuestLabellingTool();
+        const policy = try self.readGuestSelinuxPolicy();
+        defer self.allocator.free(policy);
+        var contexts_buffer: [selinux_mod.max_policy_name_bytes + 64]u8 = undefined;
+        const contexts = selinux_mod.fileContextsPath(&contexts_buffer, policy) catch
+            return error.UnsupportedSelinuxPolicy;
+        if (!try self.guestFileExists(contexts)) return error.MissingSelinuxFileContexts;
+
+        var argv = std.array_list.Managed([]const u8).init(self.allocator);
+        defer argv.deinit();
+        try argv.append(tool);
+        // Matches how the target's own installer labels a fresh root: reset
+        // every context to what the policy says, rather than only those the
+        // tool considers unset.
+        try argv.append("-F");
+        // Only the exclusions that exist. `setfiles` is given a directory it
+        // could not walk otherwise, and an argv naming a path the target does
+        // not have would describe a run that did not happen.
+        for (selinux_mod.excluded_directories) |directory| {
+            if (!try self.guestDirectoryExists(directory)) continue;
+            try argv.append("-e");
+            try argv.append(directory);
+        }
+        try argv.append(contexts);
+        try argv.append("/");
+        try self.runChroot(argv.items);
+    }
+
+    fn findGuestLabellingTool(self: *Session) ![]const u8 {
+        for (selinux_mod.setfiles_candidates) |candidate| {
+            if (try self.guestFileExists(candidate)) return candidate;
+        }
+        return error.MissingSelinuxLabellingTool;
+    }
+
+    /// The policy name the target's own configuration gives, duplicated
+    /// because the file it was parsed out of does not outlive this call.
+    fn readGuestSelinuxPolicy(self: *Session) ![]const u8 {
+        const path = try self.guestPath(selinux_mod.config_path);
+        defer self.allocator.free(path);
+        const contents = Io.Dir.cwd().readFileAlloc(
+            self.io,
+            path,
+            self.allocator,
+            .limited(max_selinux_config_bytes),
+        ) catch return error.MissingSelinuxConfiguration;
+        defer self.allocator.free(contents);
+        const policy = selinux_mod.parseConfiguredPolicy(contents) orelse
+            return error.MissingSelinuxConfiguration;
+        return self.allocator.dupe(u8, policy);
     }
 
     fn runHooks(self: *Session, phase: customize.HookPhase) !void {
@@ -1918,6 +2004,13 @@ const Session = struct {
         );
     }
 
+    fn guestDirectoryExists(self: *Session, guest_absolute: []const u8) !bool {
+        const path = try self.guestPath(guest_absolute);
+        defer self.allocator.free(path);
+        const stat = Io.Dir.cwd().statFile(self.io, path, .{}) catch return false;
+        return stat.kind == .directory;
+    }
+
     fn guestFileExists(self: *Session, guest_absolute: []const u8) !bool {
         const path = try self.guestPath(guest_absolute);
         defer self.allocator.free(path);
@@ -2575,6 +2668,10 @@ fn validateManifestPolicy(manifest: Manifest) !void {
         // either skip work the caller asked for or do work it did not.
         .when_needed => return error.UnresolvedInitramfsPolicy,
     }
+    // Only the relabel reaches this worker. The host refuses a mode or policy
+    // change during preflight, and a manifest asking for one did not come from
+    // a plan this worker should run.
+    if (manifest.selinux == .configure) return error.UnsupportedSelinuxPolicy;
     // The option text is checked on this side of the privilege boundary for
     // the same reason the package names are: it ends up inside a shell
     // assignment in a file this worker writes as root into the target root,
@@ -4963,6 +5060,41 @@ const FakeExecutorContext = struct {
     /// test would be gone before the hook it is meant to shadow.
     plant_in_target: ?[]const u8 = null,
     plant_bytes: []const u8 = "",
+    /// Whether the target root looks like one carrying an SELinux policy.
+    /// Planted on every command for the same reason `plant_in_target` is: the
+    /// executor empties the root before it runs anything, so a tree the test
+    /// laid down in advance would be gone before the relabel looked for it.
+    plant_selinux: ?FakeSelinuxLayout = null,
+    /// The argument vector `setfiles` was invoked with, without the `chroot`
+    /// prefix, and whether it ran at all.
+    relabel_argv: ?[]const []const u8 = null,
+
+    fn plantSelinuxTree(self: *FakeExecutorContext, layout: FakeSelinuxLayout) !void {
+        try self.writeTargetFile("etc/selinux/config", switch (layout) {
+            .none => return,
+            .no_policy_named => "SELINUX=enforcing\n",
+            .targeted, .missing_contexts => "SELINUX=enforcing\nSELINUXTYPE=targeted\n",
+        });
+        if (layout == .missing_contexts) return;
+        try self.writeTargetFile(
+            "etc/selinux/targeted/contexts/files/file_contexts",
+            "/.*  system_u:object_r:default_t:s0\n",
+        );
+        try self.writeTargetFile("usr/sbin/setfiles", "");
+    }
+
+    fn writeTargetFile(
+        self: *FakeExecutorContext,
+        relative: []const u8,
+        bytes: []const u8,
+    ) !void {
+        const path = try std.fs.path.join(self.allocator, &.{ self.root_path, relative });
+        defer self.allocator.free(path);
+        if (std.fs.path.dirname(path)) |parent| {
+            try Io.Dir.cwd().createDirPath(self.io, parent);
+        }
+        try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = bytes });
+    }
 
     fn readTargetFile(self: *FakeExecutorContext, relative: []const u8) ?[]const u8 {
         const path = std.fmt.allocPrint(
@@ -5025,6 +5157,7 @@ const FakeExecutorContext = struct {
                 }
             }
         }
+        if (self.plant_selinux) |layout| try self.plantSelinuxTree(layout);
         if (self.plant_in_target) |relative| {
             const path = try std.fs.path.join(
                 self.allocator,
@@ -5258,8 +5391,27 @@ const FakeExecutorContext = struct {
             }
             self.saw_dracut = true;
         }
+        if (containsArg(argv, "/usr/sbin/setfiles")) {
+            const copied = try self.allocator.alloc([]const u8, argv.len - 2);
+            for (argv[2..], copied) |argument, *slot| {
+                slot.* = try self.allocator.dupe(u8, argument);
+            }
+            self.relabel_argv = copied;
+            try self.timeline.append("setfiles");
+        }
         return fakeResult(allocator, "", 0);
     }
+};
+
+/// What the target root looks like where SELinux is concerned.
+const FakeSelinuxLayout = enum {
+    none,
+    targeted,
+    /// A configuration that names no policy: `/etc/selinux/config` exists but
+    /// has no usable `SELINUXTYPE`, so there is nothing to relabel against.
+    no_policy_named,
+    /// A configuration naming a policy whose file-contexts file is absent.
+    missing_contexts,
 };
 
 fn fakeResult(
@@ -5279,6 +5431,193 @@ fn containsArg(argv: []const []const u8, expected: []const u8) bool {
         if (std.mem.eql(u8, arg, expected)) return true;
     }
     return false;
+}
+
+test "a relabel runs last, with the policy the target names" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root_path = "test-unsafe-chroot-relabel-root";
+    const raw_path = "test-unsafe-chroot-relabel-stage.raw";
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+        .exclusive = true,
+        .read = true,
+    });
+    try raw_file.setLength(io, 8192);
+    const raw_inode = (try raw_file.stat(io)).inode;
+    raw_file.close(io);
+
+    const repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    const hooks = [_]customize.Hook{.{
+        .name = "final",
+        .phase = .finalize,
+        .source = .{ .inline_script = "#!/bin/sh\nexit 0\n" },
+    }};
+    const manifest = Manifest{
+        .raw_path = raw_path,
+        .root_path = root_path,
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = raw_inode,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{
+            .actions = &.{.{ .install = &.{"dracut"} }},
+            .repositories = &repositories,
+        },
+        .hooks = &hooks,
+        .initramfs = .unchanged,
+        .selinux = .relabel,
+    };
+
+    var context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .timeline = .init(allocator),
+        .plant_selinux = .targeted,
+    };
+    const result = try executeManifest(allocator, io, manifest, .{
+        .context = &context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
+
+    // The exact command, including the policy read out of the target's own
+    // configuration rather than out of the manifest, and an exclusion for
+    // every kernel filesystem the session mounted into the root -- those are
+    // not part of the image, so labelling them would describe a run that did
+    // not happen to the bytes being published.
+    const argv = context.relabel_argv orelse return error.TestExpectedRelabel;
+    const expected_argv = [_][]const u8{
+        "/usr/sbin/setfiles",
+        "-F",
+        "-e",
+        "/proc",
+        "-e",
+        "/sys",
+        "-e",
+        "/dev",
+        "-e",
+        "/run",
+        "/etc/selinux/targeted/contexts/files/file_contexts",
+        "/",
+    };
+    try std.testing.expectEqual(expected_argv.len, argv.len);
+    for (expected_argv, argv) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+
+    // Last, after the finalize hook. Anything written after a relabel is a
+    // file the relabel did not label.
+    const timeline = context.timeline.items;
+    try std.testing.expectEqualStrings("setfiles", timeline[timeline.len - 1]);
+    try std.testing.expectEqualStrings("/run/zvmi-hook-0", timeline[timeline.len - 2]);
+}
+
+test "a relabel a target cannot satisfy fails the run rather than skipping it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+
+    const cases = [_]struct {
+        layout: FakeSelinuxLayout,
+        root: []const u8,
+        raw: []const u8,
+    }{
+        .{
+            .layout = .none,
+            .root = "test-unsafe-chroot-relabel-none-root",
+            .raw = "test-unsafe-chroot-relabel-none-stage.raw",
+        },
+        .{
+            .layout = .no_policy_named,
+            .root = "test-unsafe-chroot-relabel-unnamed-root",
+            .raw = "test-unsafe-chroot-relabel-unnamed-stage.raw",
+        },
+        .{
+            .layout = .missing_contexts,
+            .root = "test-unsafe-chroot-relabel-contexts-root",
+            .raw = "test-unsafe-chroot-relabel-contexts-stage.raw",
+        },
+    };
+
+    for (cases) |case| {
+        defer Io.Dir.cwd().deleteTree(io, case.root) catch {};
+        defer Io.Dir.cwd().deleteFile(io, case.raw) catch {};
+        const raw_file = try Io.Dir.cwd().createFile(io, case.raw, .{
+            .exclusive = true,
+            .read = true,
+        });
+        try raw_file.setLength(io, 8192);
+        const raw_inode = (try raw_file.stat(io)).inode;
+        raw_file.close(io);
+
+        const manifest = Manifest{
+            .raw_path = case.raw,
+            .root_path = case.root,
+            .status_path = "unused.status",
+            .report_path = "unused-report.json",
+            .stage_inode = raw_inode,
+            .virtual_size = 8192,
+            .partition_offset = 1024,
+            .partition_length = 4096,
+            .packages = .{},
+            .initramfs = .unchanged,
+            .selinux = .relabel,
+        };
+        var context = FakeExecutorContext{
+            .allocator = allocator,
+            .io = io,
+            .root_path = case.root,
+            .unmounts = .init(allocator),
+            .timeline = .init(allocator),
+            .plant_selinux = case.layout,
+        };
+        const result = try executeManifest(allocator, io, manifest, .{
+            .context = &context,
+            .runFn = FakeExecutorContext.run,
+        });
+        // A relabel that could not run is a failed run: the alternative is an
+        // image published as relabelled that is not.
+        try std.testing.expectEqual(RunOutcome.failed, result.outcome);
+        try std.testing.expect(context.relabel_argv == null);
+    }
+}
+
+test "the worker refuses a policy change it has no way to carry out" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var manifest = Manifest{
+        .raw_path = "unused.raw",
+        .root_path = "unused-root",
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = 1,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{},
+        .initramfs = .unchanged,
+        .selinux = .{ .configure = .{ .mode = .permissive } },
+    };
+    try std.testing.expectError(
+        error.UnsupportedSelinuxPolicy,
+        validateManifestPolicy(manifest),
+    );
+    manifest.selinux = .relabel;
+    try validateManifestPolicy(manifest);
 }
 
 test "a separate /boot is recognized from fstab and /boot/efi is not" {
