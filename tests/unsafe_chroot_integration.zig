@@ -248,7 +248,52 @@ fn runIntegration(
             return error.IntegrationCleanupFailed;
         }
     }
-    try ensure(result.provenance.tools.len == 7);
+    // Every command the run spawned, in the order it spawned them. The count
+    // is not pinned -- a mount added later is a real change to what the run
+    // does, and a test that fails on it teaches nothing -- but the shape is:
+    // the privileged plumbing that staged the image, the work done inside the
+    // target root, and the teardown that released it, in that order.
+    try ensure(std.mem.eql(u8, result.provenance.tools[0].name, "unshare"));
+    try ensure(result.provenance.tools[0].context == .host);
+    for ([_][]const u8{
+        "losetup",
+        "mount",
+        "mknod",
+        "rpm",
+        "tdnf",
+        "dracut",
+        "cp",
+        "grub2-mkconfig",
+        "setfiles",
+        "sync",
+        "umount",
+    }) |name| {
+        try ensure(indexOfTool(result.provenance.tools, name) != null);
+    }
+    // Staging before customization before teardown. Before #308 the report
+    // held only the middle of this, so an image could not be traced back to
+    // the loop device and mounts it was built through.
+    try ensure(
+        indexOfTool(result.provenance.tools, "mount").? <
+            indexOfTool(result.provenance.tools, "tdnf").?,
+    );
+    try ensure(
+        indexOfTool(result.provenance.tools, "tdnf").? <
+            indexOfTool(result.provenance.tools, "umount").?,
+    );
+    // The relabel is the case the optional version exists for: `setfiles`
+    // takes no `--version`, and the fixed table this replaced recorded that
+    // as an empty string, indistinguishable from a tool that answered blank.
+    for (result.provenance.tools) |tool| {
+        try ensure(tool.name.len != 0);
+        try ensure(tool.command.len != 0);
+        if (std.mem.eql(u8, tool.name, "setfiles")) try ensure(tool.version == null);
+        // A probe is recorded as the version of the command it describes,
+        // never as a command of its own.
+        for (tool.command) |argument| {
+            try ensure(!std.mem.eql(u8, argument, "--version"));
+        }
+    }
     const preserved = result.provenance.execution.preserved orelse
         return error.MissingPreservedProvenance;
     // The inventory is reported as rpm gives it, trust pseudo-packages and
@@ -318,7 +363,7 @@ fn runIntegration(
     for (result.provenance.tools) |tool| {
         if (!std.mem.eql(u8, tool.name, "grub2-mkconfig")) continue;
         generator_recorded = true;
-        try ensure(std.mem.eql(u8, tool.version, "grub2-mkconfig integration-1"));
+        try ensure(std.mem.eql(u8, tool.version orelse "", "grub2-mkconfig integration-1"));
         try ensure(tool.command.len == 3);
         try ensure(std.mem.eql(u8, tool.command[1], "-o"));
         try ensure(std.mem.eql(u8, tool.command[2], "/boot/grub2/grub.cfg"));
@@ -1295,6 +1340,17 @@ fn expectPathAbsent(io: Io, path: []const u8) !void {
         else => return err,
     };
     return error.UnexpectedPath;
+}
+
+/// Where a tool first appears in the run-ordered record of every command the
+/// run spawned. Looked up by name rather than pinned to an index, because the
+/// list now includes the host plumbing and its length is a detail of how many
+/// mounts the policy needed.
+fn indexOfTool(tools: []const zvmi.customize.ToolRecord, name: []const u8) ?usize {
+    for (tools, 0..) |tool, index| {
+        if (std.mem.eql(u8, tool.name, name)) return index;
+    }
+    return null;
 }
 
 fn ensure(condition: bool) !void {

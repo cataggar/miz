@@ -89,6 +89,57 @@ pub fn parseConfiguredPolicy(contents: []const u8) ?[]const u8 {
     return null;
 }
 
+/// The SELinux mode a configuration asks the target's kernel to boot in.
+///
+/// Defined here, beside the parser, so the request type, the record and the
+/// guest agent all name one enum rather than three that agree by accident.
+pub const Mode = enum {
+    enforcing,
+    permissive,
+    disabled,
+};
+
+/// The mode `/etc/selinux/config` names, or nothing when it names none.
+///
+/// Read for the record rather than for the run: a relabel is carried out the
+/// same way whatever the mode says, but a relabel of a root whose own
+/// configuration says `disabled` did work that will never take effect, and
+/// nothing else a run publishes reveals that. Unrecognised values are reported
+/// as absent -- a mode this cannot name is not one it should claim to.
+pub fn parseConfiguredMode(contents: []const u8) ?Mode {
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const equals = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..equals], " \t");
+        if (!std.mem.eql(u8, key, "SELINUX")) continue;
+        const value = std.mem.trim(u8, line[equals + 1 ..], " \t\"");
+        return std.meta.stringToEnum(Mode, value);
+    }
+    return null;
+}
+
+test "parses the configured mode" {
+    try std.testing.expectEqual(
+        Mode.enforcing,
+        parseConfiguredMode("# comment\nSELINUX=enforcing\nSELINUXTYPE=targeted\n").?,
+    );
+    try std.testing.expectEqual(
+        Mode.permissive,
+        parseConfiguredMode("  SELINUX = \"permissive\"  \r\n").?,
+    );
+    try std.testing.expectEqual(
+        Mode.disabled,
+        parseConfiguredMode("SELINUX=disabled\n").?,
+    );
+    // `SELINUXTYPE` starts with the same eight bytes and is a different
+    // setting; a prefix match here would report a policy name as a mode.
+    try std.testing.expect(parseConfiguredMode("SELINUXTYPE=targeted\n") == null);
+    try std.testing.expect(parseConfiguredMode("#SELINUX=enforcing\n") == null);
+    try std.testing.expect(parseConfiguredMode("SELINUX=whatever\n") == null);
+}
+
 test "parses the configured policy" {
     try std.testing.expectEqualStrings("targeted", parseConfiguredPolicy(
         "# comment\nSELINUX=enforcing\nSELINUXTYPE=targeted\n",

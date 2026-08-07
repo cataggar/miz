@@ -646,11 +646,27 @@ fn validateProvenance(
     inline for (.{ "rpm", "tdnf", "dracut" }) |name| {
         var found = false;
         for (provenance.tools) |tool| {
-            if (std.mem.eql(u8, tool.name, name) and tool.version.len != 0) {
+            const version = tool.version orelse continue;
+            if (std.mem.eql(u8, tool.name, name) and version.len != 0) {
                 found = true;
             }
         }
         try ensure(found);
+    }
+    // A real run against a real host: the plumbing that staged the image is
+    // recorded alongside the programs that customized it, and every record
+    // names a command rather than a probe of one.
+    inline for (.{ "unshare", "losetup", "mount", "umount", "sync" }) |name| {
+        var found = false;
+        for (provenance.tools) |tool| {
+            if (std.mem.eql(u8, tool.name, name) and tool.context == .host) found = true;
+        }
+        try ensure(found);
+    }
+    for (provenance.tools) |tool| {
+        for (tool.command) |argument| {
+            try ensure(!std.mem.eql(u8, argument, "--version"));
+        }
     }
     var found_dracut = false;
     var expected_output_buffer: [256]u8 = undefined;
@@ -683,7 +699,7 @@ fn validateProvenance(
     for (provenance.tools) |tool| {
         if (tool.command.len == 4 and
             std.mem.eql(u8, tool.name, "cp") and
-            tool.version.len != 0 and
+            (tool.version orelse @as([]const u8, "")).len != 0 and
             std.mem.eql(u8, tool.command[0], "/usr/bin/cp") and
             std.mem.eql(u8, tool.command[1], "--remove-destination") and
             std.mem.eql(u8, tool.command[2], expected_temporary) and

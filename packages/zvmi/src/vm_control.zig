@@ -21,7 +21,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const control_version: u32 = 5;
-pub const result_version: u32 = 2;
+pub const result_version: u32 = 3;
 
 /// Path the host writes the control document to inside the initramfs, and the
 /// path the guest reads it back from once the kernel has unpacked rootfs.
@@ -83,6 +83,9 @@ pub const Error = error{
     FrameDigestMismatch,
     ResultTooLarge,
     InvalidToolRecord,
+    InvalidSelinuxRecord,
+    InvalidInitramfsRecord,
+    InvalidTrustKeyRecord,
     InvalidFailureRecord,
     InvalidModuleMember,
     TooManyModules,
@@ -673,6 +676,12 @@ pub fn findPackagePin(pins: []const PackagePin, name: []const u8) ?PackagePin {
 /// was declared by nobody and can be pinned by nobody -- `(none)` is not an
 /// architecture the pin rules accept -- so it is not part of what a run
 /// installed for the purposes of the lock.
+/// The key rpm derived from imported trust, without the constant `(none)`
+/// architecture rpm gives every one of them.
+pub fn trustKeyIdentity(record: []const u8) []const u8 {
+    return record[0 .. record.len - ".(none)".len];
+}
+
 pub fn isTrustPseudoPackage(record: []const u8) bool {
     return std.mem.startsWith(u8, record, "gpg-pubkey-") and
         std.mem.endsWith(u8, record, ".(none)");
@@ -721,8 +730,52 @@ pub fn validPackageEvr(evr: []const u8) bool {
 
 pub const Tool = struct {
     name: []const u8,
-    version: []const u8,
+    /// Nothing when the guest could not learn a version. A tool that was never
+    /// successfully asked and a tool that answered with an empty string are
+    /// different facts, and provenance may not present the first as the
+    /// second.
+    version: ?[]const u8 = null,
     command: []const []const u8,
+};
+
+/// A `/lib/modules` entry the guest's kernel discovery passed over, and why.
+pub const SkippedKernel = struct {
+    name: []const u8,
+    reason: SkippedKernelReason,
+};
+
+pub const SkippedKernelReason = enum {
+    invalid_release_name,
+    not_a_module_directory,
+    no_module_dependency_index,
+};
+
+/// An initramfs the guest regenerated and left in the target root.
+pub const InitramfsImage = struct {
+    kernel_release: []const u8,
+    image_path: []const u8,
+    size: u64,
+    /// Raw bytes rather than hex: the frame is already binary-safe, and a
+    /// fixed-length array is one fewer thing for the host to validate.
+    sha256: [32]u8,
+};
+
+/// What a regeneration passed over and what it produced. Named for the outcome
+/// rather than the request, because `Initramfs` above is the instruction.
+pub const InitramfsOutcome = struct {
+    skipped_kernel_releases: []const SkippedKernel = &.{},
+    images: []const InitramfsImage = &.{},
+};
+
+/// What a relabel found, as distinct from what it did. The `setfiles` argv the
+/// guest also reports says what ran; this says what the target's own
+/// configuration named, which no request and no plan can.
+pub const SelinuxRelabel = struct {
+    policy: []const u8,
+    /// The `SELINUX=` setting, absent when the configuration names none the
+    /// guest recognises. A relabelled root configured `disabled` never
+    /// consults the labels this run wrote.
+    mode: ?selinux.Mode = null,
 };
 
 pub const Failure = struct {
@@ -747,6 +800,14 @@ pub const Result = struct {
     /// ran. The host pairs these with the hooks it sent and refuses a result
     /// that does not account for every one of them.
     hooks: []const HookOutcome = &.{},
+    /// What the guest read out of the target's own SELinux configuration when
+    /// it relabelled. Absent when the document asked for no relabel.
+    selinux_relabel: ?SelinuxRelabel = null,
+    /// What an initramfs regeneration passed over and what it produced. Absent
+    /// when the document asked for none.
+    initramfs: ?InitramfsOutcome = null,
+    /// Trust rpm holds because of this run, as `gpg-pubkey-<keyid>-<ts>`.
+    imported_trust_keys: []const []const u8 = &.{},
 
     /// The result is recorded in the host's provenance, so its shape is
     /// bounded here for the same reason the control document's is: a document
@@ -757,10 +818,56 @@ pub const Result = struct {
         if (self.tools.len > max_result_tools) return error.ResultTooLarge;
         for (self.tools) |tool| {
             if (tool.name.len == 0 or tool.name.len > 128) return error.InvalidToolRecord;
-            if (tool.version.len > 1024) return error.InvalidToolRecord;
+            if (tool.version) |version| {
+                if (version.len == 0 or version.len > 1024) return error.InvalidToolRecord;
+            }
             if (tool.command.len == 0 or tool.command.len > 64) {
                 return error.InvalidToolRecord;
             }
+        }
+        if (self.selinux_relabel) |relabel| {
+            // Held to the same rule the guest used to build a path out of it,
+            // rather than to a length: a name that arrives from the other side
+            // of the boundary is checked before it is published.
+            if (!selinux.validPolicyName(relabel.policy)) return error.InvalidSelinuxRecord;
+        }
+        if (self.initramfs) |initramfs| {
+            // Bounded by the same limit the inventory is: both are lists the
+            // guest sizes from a directory the target controls.
+            if (initramfs.images.len > max_result_packages) return error.ResultTooLarge;
+            if (initramfs.skipped_kernel_releases.len > max_result_packages) {
+                return error.ResultTooLarge;
+            }
+            for (initramfs.images) |image| {
+                if (!validKernelRelease(image.kernel_release)) {
+                    return error.InvalidInitramfsRecord;
+                }
+                if (image.image_path.len == 0 or image.image_path.len > 512) {
+                    return error.InvalidInitramfsRecord;
+                }
+            }
+            for (initramfs.skipped_kernel_releases) |skipped| {
+                // Deliberately not held to `validKernelRelease`: the whole
+                // point of the record is that the name failed that rule. It is
+                // bounded and checked for embedded nulls instead, because it
+                // reaches a published document.
+                if (skipped.name.len == 0 or skipped.name.len > 512) {
+                    return error.InvalidInitramfsRecord;
+                }
+                if (std.mem.indexOfScalar(u8, skipped.name, 0) != null) {
+                    return error.InvalidInitramfsRecord;
+                }
+            }
+        }
+        // Bounded by the same limit the inventory it is drawn from is.
+        if (self.imported_trust_keys.len > max_result_packages) return error.ResultTooLarge;
+        for (self.imported_trust_keys) |key| {
+            if (!isTrustPseudoPackage(key) and
+                !std.mem.startsWith(u8, key, "gpg-pubkey-"))
+            {
+                return error.InvalidTrustKeyRecord;
+            }
+            if (key.len > 128) return error.InvalidTrustKeyRecord;
         }
         if (self.installed_packages.len > max_result_packages) return error.ResultTooLarge;
         for (self.installed_packages) |name| {
@@ -1819,6 +1926,21 @@ test "a result the host would record verbatim is bounded before it is believed" 
     const valid = Result{
         .tools = &.{.{ .name = "tdnf", .version = "3.5.8", .command = &.{ "tdnf", "--version" } }},
         .installed_packages = &.{"strace-6.6-1.azl3.x86_64"},
+        .imported_trust_keys = &.{"gpg-pubkey-3135ce90-5e6d0f1e"},
+        .initramfs = .{
+            // A release that failed the rule is reported under the name that
+            // failed it, which is the one thing here that is deliberately not
+            // held to `validKernelRelease`.
+            .skipped_kernel_releases = &.{
+                .{ .name = "6.12.0 spaced", .reason = .invalid_release_name },
+            },
+            .images = &.{.{
+                .kernel_release = "6.12.0-1.azl",
+                .image_path = "/boot/initramfs-6.12.0-1.azl.img",
+                .size = 4096,
+                .sha256 = @splat(0xab),
+            }},
+        },
     };
     try valid.validate();
 
@@ -1850,6 +1972,32 @@ test "a result the host would record verbatim is bounded before it is believed" 
             .name = "a failure that names no stage explains nothing",
             .result = .{ .failure = .{ .stage = "" } },
             .expected = error.InvalidFailureRecord,
+        },
+        .{
+            // The host publishes these verbatim, so a guest that put a package
+            // -- or anything else -- in the trust list would have the host
+            // state as trust something rpm never derived a key from.
+            .name = "trust is only trust if rpm named it as such",
+            .result = .{ .imported_trust_keys = &.{"strace-6.6-1.azl3.x86_64"} },
+            .expected = error.InvalidTrustKeyRecord,
+        },
+        .{
+            .name = "a regenerated image must name the release it was built for",
+            .result = .{ .initramfs = .{ .images = &.{.{
+                .kernel_release = "6.12.0 spaced",
+                .image_path = "/boot/initramfs.img",
+                .size = 1,
+                .sha256 = @splat(0),
+            }} } },
+            .expected = error.InvalidInitramfsRecord,
+        },
+        .{
+            .name = "a skipped release is bounded even though it failed the release rule",
+            .result = .{ .initramfs = .{ .skipped_kernel_releases = &.{.{
+                .name = "",
+                .reason = .invalid_release_name,
+            }} } },
+            .expected = error.InvalidInitramfsRecord,
         },
     };
     for (cases) |case| {

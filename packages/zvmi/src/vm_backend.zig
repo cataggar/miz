@@ -292,6 +292,17 @@ pub fn run(
     try control.control.validate();
     const control_json = try std.json.Stringify.valueAlloc(work, control.control, .{});
 
+    // Read here, in the process that is about to start the emulator, because
+    // that is the process libslirp reads it in: `10.0.2.3` is a forwarder to
+    // whatever `get_dns_addr` returns, which on Linux is `/etc/resolv.conf` of
+    // the emulator process. The guest cannot report this -- it never sees the
+    // file -- and the control document carries only slirp's own address, which
+    // says nothing about where the answers came from.
+    const host_resolver = if (resolvesThroughHost(data.packages, data.execution))
+        hashHostResolver(work, io) catch null
+    else
+        null;
+
     // The agent and the control document first, so a module can never take
     // the name of either, then the modules in the order they are inserted.
     var members: std.array_list.Managed(vm_payload.Member) = .init(work);
@@ -382,10 +393,11 @@ pub fn run(
     // to be proven bootable. A run that reaches here has already produced its
     // result; a failed attestation withholds it rather than rewriting it.
     var boot_record: customize.VmBootRecord = .direct_kernel;
+    var firmware_command: ?[]const []const u8 = null;
     switch (policy.boot) {
         .direct_kernel => {},
         .firmware => |firmware| {
-            const record = try attestFirmwareBoot(work, io, .{
+            const attestation = try attestFirmwareBoot(work, io, .{
                 .policy = policy,
                 .firmware = firmware,
                 .architecture = data.architectures.runner,
@@ -396,7 +408,8 @@ pub fn run(
             });
             // Published whole: a half-filled record behind a set tag would
             // read as a firmware boot nobody performed.
-            boot_record = .{ .firmware = record };
+            boot_record = .{ .firmware = attestation.record };
+            firmware_command = attestation.command;
         },
     }
 
@@ -408,10 +421,44 @@ pub fn run(
         .control_json = control_json,
         .payload = &payload,
         .emulator_version = version,
+        .emulator_command = argv,
+        .firmware_command = firmware_command,
         .modules = drivers.modules,
         .boot = boot_record,
         .hooks = control.hooks,
+        .host_resolver = host_resolver,
     });
+}
+
+/// Whether this run's package transaction resolves names through the build
+/// machine. The same condition the `read_host_resolver` capability is declared
+/// under, so the record and the declaration cannot disagree.
+fn resolvesThroughHost(
+    packages: customize.PackagePolicy,
+    execution: customize.ExecutionPolicy,
+) bool {
+    if (packages.actions.len == 0) return false;
+    if (packages.resolver != .host_resolver) return false;
+    if (customize.offlinePackageCache(packages.cache)) return false;
+    const vm = execution.vm orelse return false;
+    return vm.network == .declared_repositories;
+}
+
+/// Digests the build machine's own resolver. A host with none is not a
+/// failure: a transaction whose repository URLs are literal addresses resolves
+/// no names at all, which is why the capability is a declaration rather than a
+/// probe.
+fn hashHostResolver(allocator: Allocator, io: Io) !customize.HostResolverRecord {
+    const bytes = try Io.Dir.cwd().readFileAlloc(
+        io,
+        "/etc/resolv.conf",
+        allocator,
+        .limited(1 << 20),
+    );
+    defer allocator.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return .{ .sha256 = .{ .bytes = digest }, .size = bytes.len };
 }
 
 const Layout = struct {
@@ -616,6 +663,11 @@ const HookPlan = struct {
     name: []const u8,
     phase: customize.HookPhase,
     sha256: [32]u8,
+    /// Taken from the host's own copy of the script, like the digest beside
+    /// it. The guest is never asked what interpreted the hook, because a guest
+    /// that answered differently would be describing bytes the host did not
+    /// send.
+    interpreter: []const u8,
 };
 
 const BuiltHooks = struct {
@@ -678,7 +730,12 @@ fn buildHooks(
             .script_base64 = std.base64.standard.Encoder.encode(buffer, script),
             .arguments = hook.arguments,
         };
-        plan.* = .{ .name = hook.name, .phase = hook.phase, .sha256 = undefined };
+        plan.* = .{
+            .name = hook.name,
+            .phase = hook.phase,
+            .sha256 = undefined,
+            .interpreter = customize.hookInterpreterLine(script),
+        };
         std.crypto.hash.sha2.Sha256.hash(script, &plan.sha256, .{});
     }
     return .{ .carried = carried, .plans = plans };
@@ -1008,7 +1065,7 @@ pub fn attestFirmwareBoot(
     gpa: Allocator,
     io: Io,
     input: AttestationInput,
-) !customize.VmFirmwareRecord {
+) !FirmwareAttestation {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const work = arena.allocator();
@@ -1077,19 +1134,36 @@ pub fn attestFirmwareBoot(
     const stage_after = try streamDigest(io, input.stage_path);
     if (!std.mem.eql(u8, &stage_before, &stage_after)) return error.VmFirmwareStageMutated;
 
+    // Duped out of the arena this ran in, which does not outlive the boot it
+    // describes. The attestation guest is a second emulator invocation with a
+    // different machine and no `-kernel`, so it is a command of its own rather
+    // than a detail of the first one.
+    const command = try gpa.alloc([]const u8, argv.len);
+    for (argv, command) |argument, *slot| slot.* = try gpa.dupe(u8, argument);
+
     return .{
-        .code_path = input.firmware.code_path,
-        .code_sha256 = .{ .bytes = digestOf(code_bytes) },
-        .vars_template_path = input.firmware.vars_path,
-        .vars_template_sha256 = .{ .bytes = digestOf(vars_bytes) },
-        .variable_store = .ephemeral,
-        .secure_boot = input.firmware.secure_boot,
-        .machine = firmwareMachineName(input.policy, input.firmware, input.architecture),
-        .console_marker = input.firmware.console_marker,
-        .boot_timeout_seconds = input.firmware.boot_timeout_seconds,
-        .attested_stage_sha256 = .{ .bytes = stage_after },
+        .command = command,
+        .record = .{
+            .code_path = input.firmware.code_path,
+            .code_sha256 = .{ .bytes = digestOf(code_bytes) },
+            .vars_template_path = input.firmware.vars_path,
+            .vars_template_sha256 = .{ .bytes = digestOf(vars_bytes) },
+            .variable_store = .ephemeral,
+            .secure_boot = input.firmware.secure_boot,
+            .machine = firmwareMachineName(input.policy, input.firmware, input.architecture),
+            .console_marker = input.firmware.console_marker,
+            .boot_timeout_seconds = input.firmware.boot_timeout_seconds,
+            .attested_stage_sha256 = .{ .bytes = stage_after },
+        },
     };
 }
+
+/// What a firmware attestation produced: the record, and the emulator argv
+/// that produced it, which provenance records as its own command.
+pub const FirmwareAttestation = struct {
+    record: customize.VmFirmwareRecord,
+    command: []const []const u8,
+};
 
 const FirmwareArgvInput = struct {
     policy: customize.VmPolicy,
@@ -1455,23 +1529,52 @@ fn describeFailure(allocator: Allocator, failure: vm_control.Failure) ![]const u
     return text.toOwnedSlice();
 }
 
-/// Best effort: a missing version string is worth recording as unknown, but is
-/// not worth discarding a completed customization over.
-fn probeEmulatorVersion(allocator: Allocator, io: Io, command: []const u8) []const u8 {
+/// The emulator's own version, or nothing when it could not be asked.
+///
+/// Best effort: a missing version string is worth recording as absent, but is
+/// not worth discarding a completed customization over. A probe is never a
+/// command of its own in provenance -- what it learns is recorded as the
+/// version of the invocation it describes -- so a failed probe has to be
+/// distinguishable from an emulator that reported an empty string.
+fn probeEmulatorVersion(allocator: Allocator, io: Io, command: []const u8) ?[]const u8 {
     const outcome = std.process.run(allocator, io, .{
         .argv = &.{ command, "--version" },
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(64 * 1024),
         .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } },
-    }) catch return "unknown";
+    }) catch return null;
     switch (outcome.term) {
-        .exited => |code| if (code != 0) return "unknown",
-        else => return "unknown",
+        .exited => |code| if (code != 0) return null,
+        else => return null,
     }
     var lines = std.mem.splitScalar(u8, outcome.stdout, '\n');
-    const first = lines.next() orelse return "unknown";
+    const first = lines.next() orelse return null;
     const trimmed = std.mem.trim(u8, first, " \t\r");
-    return if (trimmed.len == 0) "unknown" else trimmed;
+    return if (trimmed.len == 0) null else trimmed;
+}
+
+/// The emulator's tool name: the command as the policy named it, reduced to
+/// its basename so `/usr/bin/qemu-system-x86_64` and a `qemu-system-x86_64`
+/// found on `PATH` read as the same tool. The argv the record carries keeps
+/// the path the run actually used.
+fn emulatorName(command: []const u8) []const u8 {
+    return std.fs.path.basename(command);
+}
+
+/// Copies a tool record into the report's arena.
+///
+/// Every string a record carries is duped, because the sources are variously
+/// the run's arena, the parsed guest result and the policy, and the report
+/// outlives all three.
+fn ownTool(owned: Allocator, tool: customize.ToolRecord) !customize.ToolRecord {
+    const command = try owned.alloc([]const u8, tool.command.len);
+    for (tool.command, command) |argument, *slot| slot.* = try owned.dupe(u8, argument);
+    return .{
+        .name = try owned.dupe(u8, tool.name),
+        .version = if (tool.version) |version| try owned.dupe(u8, version) else null,
+        .command = command,
+        .context = tool.context,
+    };
 }
 
 const ReportInput = struct {
@@ -1481,10 +1584,16 @@ const ReportInput = struct {
     root_device: []const u8,
     control_json: []const u8,
     payload: *const vm_payload.Payload,
-    emulator_version: []const u8,
+    emulator_version: ?[]const u8,
+    /// The appliance boot's argv, and the attestation boot's when there was
+    /// one. Both are host commands the run performed, and neither is visible
+    /// to the guest that only reports what it ran inside the emulator.
+    emulator_command: []const []const u8,
+    firmware_command: ?[]const []const u8 = null,
     modules: []const vm_payload.Module,
     boot: customize.VmBootRecord = .direct_kernel,
     hooks: []const HookPlan = &.{},
+    host_resolver: ?customize.HostResolverRecord = null,
 };
 
 /// Pairs what the host sent with what the guest says it did.
@@ -1517,6 +1626,7 @@ fn hookRecords(
             .name = try allocator.dupe(u8, plan.name),
             .phase = plan.phase,
             .source_sha256 = .{ .bytes = plan.sha256 },
+            .interpreter = try allocator.dupe(u8, plan.interpreter),
             .exit_code = outcome.exit_code,
         };
     }
@@ -1528,15 +1638,79 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
     errdefer arena.deinit();
     const owned = arena.allocator();
 
-    const tools = try owned.alloc(customize.ToolRecord, input.result.tools.len);
-    for (input.result.tools, tools) |tool, *record| {
-        const command = try owned.alloc([]const u8, tool.command.len);
-        for (tool.command, command) |argument, *slot| slot.* = try owned.dupe(u8, argument);
-        record.* = .{
-            .name = try owned.dupe(u8, tool.name),
-            .version = try owned.dupe(u8, tool.version),
+    // Run order, which for a VM run is host then guest then host: the
+    // appliance boot, everything the guest reported running inside it, and
+    // the attestation boot that follows customization. The guest can only
+    // ever report the middle of that, so a report built from its list alone
+    // would describe an image nobody booted.
+    var tool_list: std.array_list.Managed(customize.ToolRecord) = .init(owned);
+    try tool_list.append(try ownTool(owned, .{
+        .name = emulatorName(input.policy.emulator_command),
+        .version = input.emulator_version,
+        .command = input.emulator_command,
+        .context = .host,
+    }));
+    for (input.result.tools) |tool| {
+        try tool_list.append(try ownTool(owned, .{
+            .name = tool.name,
+            .version = tool.version,
+            .command = tool.command,
+            .context = .target_root,
+        }));
+    }
+    if (input.firmware_command) |command| {
+        try tool_list.append(try ownTool(owned, .{
+            .name = emulatorName(input.policy.emulator_command),
+            .version = input.emulator_version,
             .command = command,
-        };
+            .context = .host,
+        }));
+    }
+    const tools = try tool_list.toOwnedSlice();
+
+    const relabel: ?customize.SelinuxRelabelRecord =
+        if (input.result.selinux_relabel) |reported| .{
+            .discovered_policy = try owned.dupe(u8, reported.policy),
+            .target_mode = reported.mode,
+        } else null;
+
+    const initramfs: ?customize.InitramfsRecord =
+        if (input.result.initramfs) |reported| blk: {
+            const images = try owned.alloc(
+                customize.InitramfsImageRecord,
+                reported.images.len,
+            );
+            for (reported.images, images) |image, *slot| {
+                slot.* = .{
+                    .kernel_release = try owned.dupe(u8, image.kernel_release),
+                    .image_path = try owned.dupe(u8, image.image_path),
+                    .size = image.size,
+                    .sha256 = .{ .bytes = image.sha256 },
+                };
+            }
+            const skipped = try owned.alloc(
+                customize.SkippedKernelRelease,
+                reported.skipped_kernel_releases.len,
+            );
+            for (reported.skipped_kernel_releases, skipped) |entry, *slot| {
+                slot.* = .{
+                    .name = try owned.dupe(u8, entry.name),
+                    .reason = switch (entry.reason) {
+                        .invalid_release_name => .invalid_release_name,
+                        .not_a_module_directory => .not_a_module_directory,
+                        .no_module_dependency_index => .no_module_dependency_index,
+                    },
+                };
+            }
+            break :blk .{ .skipped_kernel_releases = skipped, .images = images };
+        } else null;
+
+    const trust_keys = try owned.alloc(
+        []const u8,
+        input.result.imported_trust_keys.len,
+    );
+    for (input.result.imported_trust_keys, trust_keys) |key, *slot| {
+        slot.* = try owned.dupe(u8, key);
     }
 
     const packages = try owned.alloc([]const u8, input.result.installed_packages.len);
@@ -1592,11 +1766,15 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
         .arena = arena,
         .tools = tools,
         .installed_packages = packages,
+        .imported_trust_keys = trust_keys,
+        .host_resolver = input.host_resolver,
         .package_lock = emitted_lock,
         .hooks = hooks,
+        .selinux_relabel = relabel,
+        .initramfs = initramfs,
         .execution = .{
             .emulator_command = try owned.dupe(u8, input.policy.emulator_command),
-            .emulator_version = try owned.dupe(u8, input.emulator_version),
+            .emulator_version = try owned.dupe(u8, input.emulator_version orelse "unknown"),
             .machine = try owned.dupe(u8, machineName(input.policy, input.architecture)),
             .cpu = try owned.dupe(u8, cpuName(input.policy, input.architecture)),
             .acceleration = input.policy.acceleration,
@@ -2419,8 +2597,18 @@ test "a result that does not account for every hook fails the run" {
     const allocator = arena.allocator();
 
     const plans = [_]HookPlan{
-        .{ .name = "first", .phase = .after_packages, .sha256 = @splat(1) },
-        .{ .name = "second", .phase = .finalize, .sha256 = @splat(2) },
+        .{
+            .name = "first",
+            .phase = .after_packages,
+            .sha256 = @splat(1),
+            .interpreter = "/bin/sh",
+        },
+        .{
+            .name = "second",
+            .phase = .finalize,
+            .sha256 = @splat(2),
+            .interpreter = "/usr/bin/env python3",
+        },
     };
 
     const records = try hookRecords(allocator, &plans, &.{
@@ -2430,6 +2618,10 @@ test "a result that does not account for every hook fails the run" {
     try std.testing.expectEqual(@as(usize, 2), records.len);
     try std.testing.expectEqualStrings("second", records[1].name);
     try std.testing.expectEqual(customize.HookPhase.finalize, records[1].phase);
+    // The interpreter is the host's for the same reason as the digest, and it
+    // is per-hook rather than a property of the run.
+    try std.testing.expectEqualStrings("/bin/sh", records[0].interpreter);
+    try std.testing.expectEqualStrings("/usr/bin/env python3", records[1].interpreter);
     // The digest is the host's, not the guest's: the guest was never told it.
     try std.testing.expectEqualSlices(
         u8,
@@ -2627,6 +2819,31 @@ test "credential material reaches the emulator as a descriptor and not as a file
         "s3cr3t-from-a-memfd",
         try credentials.password(0),
     );
+
+    // The emulator is told where the material is, never what it is -- and the
+    // whole argv is now recorded in provenance (#308), so the name has to be
+    // one that says nothing. A descriptor number is exactly that.
+    var layout = test_layout;
+    layout.credential_path = device.path;
+    const argv = try buildArgv(allocator, .{
+        .policy = .{
+            .emulator_command = "/usr/bin/qemu-system-x86_64",
+            .acceleration = .software,
+        },
+        .architecture = .x86_64,
+        .layout = layout,
+        .disk = .virtio_blk,
+    });
+    var named = false;
+    for (argv) |argument| {
+        try std.testing.expect(
+            std.mem.indexOf(u8, argument, "s3cr3t-from-a-memfd") == null,
+        );
+        if (std.mem.indexOf(u8, argument, device.path) != null) named = true;
+    }
+    // Not a vacuous absence: the device is on the command line, under a name
+    // that carries no more than "the third disk came from a descriptor".
+    try std.testing.expect(named);
 
     // Released deliberately rather than incidentally: the descriptor is closed
     // by `close`, and reading it afterwards must not still answer.

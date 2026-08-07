@@ -35,7 +35,7 @@ const vm_control = @import("vm_control.zig");
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
 pub const plan_schema_version: u32 = 22;
-pub const provenance_schema_version: u32 = 25;
+pub const provenance_schema_version: u32 = 26;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -864,11 +864,9 @@ pub const InitramfsPolicy = union(enum) {
     },
 };
 
-pub const SelinuxMode = enum {
-    enforcing,
-    permissive,
-    disabled,
-};
+/// Aliased rather than redeclared, so the mode a request asks for and the mode
+/// a relabel found in the target are the same type and can be compared.
+pub const SelinuxMode = selinux_mod.Mode;
 
 pub const SelinuxPolicy = union(enum) {
     unchanged,
@@ -1929,6 +1927,37 @@ fn isValidEnvironmentName(name: []const u8) bool {
 /// run at all.
 fn namesAnInterpreter(script: []const u8) bool {
     return std.mem.startsWith(u8, script, "#!");
+}
+
+/// The interpreter line of a hook script, as the kernel reads it.
+///
+/// Everything after `#!` up to the first newline, with surrounding blank space
+/// removed -- which is the interpreter and, on Linux, at most one argument to
+/// it. Not parsed into a program and arguments here: the point of the record
+/// is to say what the run relied on, and splitting it would be this code's
+/// guess at what the kernel did rather than the bytes it acted on.
+///
+/// Borrows from `script`; callers that outlive those bytes must copy.
+pub fn hookInterpreterLine(script: []const u8) []const u8 {
+    if (!namesAnInterpreter(script)) return "";
+    const rest = script[2..];
+    const line = rest[0 .. std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len];
+    return std.mem.trim(u8, line, " \t\r");
+}
+
+test "the recorded interpreter is the shebang line the kernel acts on" {
+    try std.testing.expectEqualStrings("/bin/sh", hookInterpreterLine("#!/bin/sh\nexit 0\n"));
+    // Space after the marker, no trailing newline, and an argument: all three
+    // are shebangs a real script carries, and none of them is a different
+    // interpreter.
+    try std.testing.expectEqualStrings(
+        "/usr/bin/env python3",
+        hookInterpreterLine("#! /usr/bin/env python3  \r\nprint(1)\n"),
+    );
+    try std.testing.expectEqualStrings("/bin/sh", hookInterpreterLine("#!/bin/sh"));
+    // Refused before it could be recorded, so this is unreachable in a run.
+    // Answered anyway rather than left to a caller to avoid asking.
+    try std.testing.expectEqualStrings("", hookInterpreterLine("exit 0\n"));
 }
 
 fn validateHooks(
@@ -3797,6 +3826,7 @@ fn dupeHookRecords(
             .name = try allocator.dupe(u8, record.name),
             .phase = record.phase,
             .source_sha256 = record.source_sha256,
+            .interpreter = try allocator.dupe(u8, record.interpreter),
             .exit_code = record.exit_code,
         };
     }
@@ -5998,10 +6028,31 @@ pub const SourceRecord = struct {
     sha256: Digest,
 };
 
+/// Where a recorded command ran.
+///
+/// A `target_root` command is recorded by the argv the target saw, without the
+/// `chroot <root>` prefix the executor wrapped it in: the root is the
+/// transaction directory the plan already names, so repeating it on every
+/// record would say less than this field does. Before this existed the prefix
+/// was stripped with nothing saying so, and the recorded argv was not the argv
+/// that ran.
+pub const ToolContext = enum {
+    /// On the build machine: the emulator, and the privileged plumbing that
+    /// stages an image before anything runs inside it.
+    host,
+    /// Inside the target root, through `chroot` or through the guest agent.
+    target_root,
+};
+
 pub const ToolRecord = struct {
     name: []const u8,
-    version: []const u8,
+    /// Null when the program answered no version -- `setfiles` is the standing
+    /// example -- or when there was nothing to ask, as for the plumbing that
+    /// runs before any target program does. Distinct from an empty string,
+    /// which reads as a version that was blank rather than absent.
+    version: ?[]const u8,
     command: []const []const u8,
+    context: ToolContext,
 };
 
 /// What a hook was and what running it did.
@@ -6019,6 +6070,15 @@ pub const HookRecord = struct {
     /// bytes of whatever file was named. For a `host_path` source the two are
     /// the same read; digesting the placed copy is what makes that checkable.
     source_sha256: Digest,
+    /// The script's shebang line, without the `#!`.
+    ///
+    /// Implied by the digest only to a reader who already has the bytes, and
+    /// the bytes are the one thing a published image deliberately does not
+    /// carry -- the hook is deleted before the image is sealed. The `chroot`
+    /// argv names the script's throwaway path, never what interpreted it, so
+    /// without this the record cannot say whether a hook ran under the shell
+    /// its author wrote it for or under whatever the target image supplied.
+    interpreter: []const u8,
     /// Zero in every published provenance, because a hook that exited nonzero
     /// fails the run and nothing is published. Recorded anyway, so the record
     /// states what was observed rather than leaving it to be assumed.
@@ -6054,12 +6114,22 @@ pub const UnsafeChrootRuntimeReport = struct {
     arena: std.heap.ArenaAllocator,
     tools: []const ToolRecord,
     installed_packages: []const []const u8,
+    imported_trust_keys: []const []const u8 = &.{},
+    /// Present exactly when the run resolved package repository names through
+    /// this machine's own resolver. Absent when the request declared its
+    /// nameservers -- the plan carries those -- or when nothing resolved a
+    /// name at all.
+    host_resolver: ?HostResolverRecord = null,
     package_lock: []const PackageVersionLock = &.{},
     hooks: []const HookRecord = &.{},
     /// Present exactly when the request asked for a kernel-argument change.
     boot_configuration: ?BootConfigurationRecord = null,
     /// Present exactly when the request declared a cache directory.
     package_cache: ?PackageCacheRecord = null,
+    /// Present exactly when the run relabelled the root.
+    selinux_relabel: ?SelinuxRelabelRecord = null,
+    /// Present exactly when the run regenerated at least one initramfs.
+    initramfs: ?InitramfsRecord = null,
 
     pub fn deinit(self: *UnsafeChrootRuntimeReport) void {
         self.arena.deinit();
@@ -6158,8 +6228,18 @@ pub const VmRuntimeReport = struct {
     arena: std.heap.ArenaAllocator,
     tools: []const ToolRecord,
     installed_packages: []const []const u8,
+    imported_trust_keys: []const []const u8 = &.{},
+    /// Present exactly when the run resolved package repository names through
+    /// this machine's own resolver. Absent when the request declared its
+    /// nameservers -- the plan carries those -- or when nothing resolved a
+    /// name at all.
+    host_resolver: ?HostResolverRecord = null,
     package_lock: []const PackageVersionLock = &.{},
     hooks: []const HookRecord = &.{},
+    /// Present exactly when the guest relabelled the root.
+    selinux_relabel: ?SelinuxRelabelRecord = null,
+    /// Present exactly when the guest regenerated at least one initramfs.
+    initramfs: ?InitramfsRecord = null,
     execution: VmExecutionRecord,
 
     pub fn deinit(self: *VmRuntimeReport) void {
@@ -6226,6 +6306,95 @@ pub const PartitionStyleRecord = struct {
     message: []const u8,
 };
 
+/// A `/lib/modules` entry the kernel discovery passed over, and why.
+///
+/// A run that regenerates "every installed initramfs" answers a question the
+/// plan could not: which kernels are installed. A release passed over here
+/// keeps the initramfs the package transaction just invalidated, and nothing
+/// else a run publishes distinguishes "the image had one kernel" from "it had
+/// three and two were not recognised".
+/// The build machine's own `/etc/resolv.conf`, as this run found it.
+///
+/// A digest and not the content. What the file names is this machine's
+/// internal DNS topology, which the caller never declared and a published
+/// image has no business carrying; the digest still supports the only claim
+/// worth making about it -- two runs resolved through the same thing, or they
+/// did not.
+///
+/// Not a `SourceRecord`. Sources are re-read at the end of the run and
+/// compared, and a lease renewal between the two reads would fail a build that
+/// did nothing wrong. This is an observation of an input, recorded where
+/// observations go.
+pub const HostResolverRecord = struct {
+    sha256: Digest,
+    /// Bytes, so a reader can tell an empty resolver from an absent one
+    /// without knowing the digest of nothing.
+    size: u64,
+};
+
+pub const SkippedKernelRelease = struct {
+    name: []const u8,
+    reason: SkippedKernelReason,
+};
+
+pub const SkippedKernelReason = enum {
+    /// Not a usable release string. The same rule a declared release is held
+    /// to: a name that could not be requested cannot become acceptable by
+    /// being discovered instead.
+    invalid_release_name,
+    /// Not a directory, or gone between the read and the open.
+    not_a_module_directory,
+    /// No `modules.dep` or `modules.dep.bin`. This is dracut's own rule for
+    /// telling an installed kernel from a directory that merely sits beside
+    /// one -- a firmware drop, or what a removed package left behind.
+    no_module_dependency_index,
+};
+
+/// An initramfs the run regenerated and left in the published image.
+///
+/// The `dracut --kver` argv says which release was asked for and the `cp` argv
+/// says where the result was put. Neither says what came out, and the file is
+/// the one thing a recorded tool produced that the published image boots from.
+pub const InitramfsImageRecord = struct {
+    kernel_release: []const u8,
+    /// Inside the image, as the `cp` argv names it.
+    image_path: []const u8,
+    size: u64,
+    sha256: Digest,
+};
+
+/// Present exactly when the run regenerated initramfs images.
+pub const InitramfsRecord = struct {
+    /// Empty when the releases were declared: discovery is the only thing that
+    /// can skip anything, and a declared release that does not exist fails the
+    /// run instead.
+    skipped_kernel_releases: []const SkippedKernelRelease = &.{},
+    images: []const InitramfsImageRecord = &.{},
+};
+
+/// What a relabel found in the target, as opposed to what it did.
+///
+/// The `setfiles` argv already carries what ran: the tool, the exclusions and
+/// the `file_contexts` file whose path contains the policy name. What the argv
+/// cannot say is that those values were *discovered* -- read out of the
+/// target's own configuration while the run executed -- and it cannot say
+/// anything at all about a setting the relabel does not use.
+pub const SelinuxRelabelRecord = struct {
+    /// The policy named by the target's own `/etc/selinux/config`. No request
+    /// can name it: `.relabel` carries no policy name and `.configure` never
+    /// executes, so this is always a discovered value, and a run whose
+    /// packages replaced the policy relabelled with the new one.
+    discovered_policy: []const u8,
+    /// The mode that same configuration asks for, or nothing when it names
+    /// none this can recognise.
+    ///
+    /// Recorded because it is the one way to see that a relabel was wasted: a
+    /// root configured `disabled` boots without loading a policy, so the
+    /// labels this run spent its time writing are never consulted. Nothing in
+    /// the argv, the request or the plan reveals that.
+    target_mode: ?SelinuxMode,
+};
+
 pub const PreservedExecutionRecord = struct {
     source_format: Format,
     output_format: Format,
@@ -6236,6 +6405,28 @@ pub const PreservedExecutionRecord = struct {
     flattened_backing_chain: bool,
     operation_count: usize,
     installed_packages: []const []const u8,
+    /// The trust rpm actually ended up holding because of this run, as
+    /// `gpg-pubkey-<keyid>-<timestamp>`.
+    ///
+    /// The `rpm --import` argv names a file on a private tmpfs that no longer
+    /// exists, and the declared trust is recorded as bytes or a path -- so
+    /// neither says which key rpm derived from them and then verified every
+    /// package signature against. This is that key, read back out of the
+    /// target's own rpm database.
+    ///
+    /// It also catches trust nobody declared: a package transaction may import
+    /// a key of its own, and such a key appears here exactly like a declared
+    /// one, because from the finished image's point of view they are the same
+    /// thing.
+    ///
+    /// Empty for a run with no package actions, where no inventory is read at
+    /// all.
+    imported_trust_keys: []const []const u8 = &.{},
+    /// Present exactly when the run resolved package repository names through
+    /// this machine's own resolver. Absent when the request declared its
+    /// nameservers -- the plan carries those -- or when nothing resolved a
+    /// name at all.
+    host_resolver: ?HostResolverRecord = null,
     /// The lock this run would have to declare to install exactly what it
     /// installed: every package the transaction added or changed, at the
     /// identity it settled on, and nothing the input image already carried.
@@ -6267,6 +6458,11 @@ pub const PreservedExecutionRecord = struct {
     /// which is the ambient state this record exists to distinguish itself
     /// from.
     package_cache: ?PackageCacheRecord = null,
+    /// Present exactly when the run relabelled the root. Both backends fill
+    /// it, because both read the same configuration out of the same target.
+    selinux_relabel: ?SelinuxRelabelRecord = null,
+    /// Present exactly when the run regenerated at least one initramfs.
+    initramfs: ?InitramfsRecord = null,
 };
 
 /// What a run did with a declared package cache directory.
@@ -6503,6 +6699,26 @@ fn guestPackages(
     return &.{};
 }
 
+/// Same alternation, and for the same reason: one run, one inherited resolver.
+fn guestHostResolver(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+    vm_report: ?*const VmRuntimeReport,
+) ?HostResolverRecord {
+    if (unsafe_report) |report| return report.host_resolver;
+    if (vm_report) |report| return report.host_resolver;
+    return null;
+}
+
+/// Same alternation, and for the same reason: one run, one set of keys.
+fn guestTrustKeys(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+    vm_report: ?*const VmRuntimeReport,
+) []const []const u8 {
+    if (unsafe_report) |report| return report.imported_trust_keys;
+    if (vm_report) |report| return report.imported_trust_keys;
+    return &.{};
+}
+
 /// Same alternation, and for the same reason: one run, one emitted lock.
 fn guestPackageLock(
     unsafe_report: ?*const UnsafeChrootRuntimeReport,
@@ -6551,7 +6767,34 @@ fn guestBootConfiguration(
     return null;
 }
 
-fn guestTools(
+fn backendInitramfs(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+    vm_report: ?*const VmRuntimeReport,
+) ?InitramfsRecord {
+    if (unsafe_report) |report| return report.initramfs;
+    if (vm_report) |report| return report.initramfs;
+    return null;
+}
+
+/// Unlike the boot configuration, which only the chroot backend produces, both
+/// backends relabel and both read the same file to do it.
+fn backendRelabel(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+    vm_report: ?*const VmRuntimeReport,
+) ?SelinuxRelabelRecord {
+    if (unsafe_report) |report| return report.selinux_relabel;
+    if (vm_report) |report| return report.selinux_relabel;
+    return null;
+}
+
+/// Every command the run spawned, in the order it spawned them: the backend's
+/// own host-side plumbing first, then whatever ran inside the target root.
+///
+/// Each backend merges its two halves itself, because only the backend knows
+/// the order they ran in -- the parent's `unshare` before the worker's mounts,
+/// the emulator before the guest agent it booted. Exactly one backend runs, so
+/// this still picks rather than interleaves.
+fn backendTools(
     unsafe_report: ?*const UnsafeChrootRuntimeReport,
     vm_report: ?*const VmRuntimeReport,
 ) []const ToolRecord {
@@ -6699,6 +6942,11 @@ fn buildResult(
             .flattened_backing_chain = flattened,
             .operation_count = operation_count,
             .installed_packages = try dupeStrings(result_allocator, guestPackages(unsafe_report, vm_report)),
+            .imported_trust_keys = try dupeStrings(
+                result_allocator,
+                guestTrustKeys(unsafe_report, vm_report),
+            ),
+            .host_resolver = guestHostResolver(unsafe_report, vm_report),
             .emitted_package_lock = try dupePackageLock(
                 result_allocator,
                 guestPackageLock(unsafe_report, vm_report),
@@ -6744,6 +6992,38 @@ fn buildResult(
                 .defaults_already_current = record.defaults_already_current,
                 .options = try result_allocator.dupe(u8, record.options),
             } else null,
+            .selinux_relabel = if (backendRelabel(unsafe_report, vm_report)) |record| .{
+                .discovered_policy = try result_allocator.dupe(u8, record.discovered_policy),
+                .target_mode = record.target_mode,
+            } else null,
+            .initramfs = if (backendInitramfs(unsafe_report, vm_report)) |record| initramfs_blk: {
+                const skipped = try result_allocator.alloc(
+                    SkippedKernelRelease,
+                    record.skipped_kernel_releases.len,
+                );
+                for (record.skipped_kernel_releases, skipped) |source, *slot| {
+                    slot.* = .{
+                        .name = try result_allocator.dupe(u8, source.name),
+                        .reason = source.reason,
+                    };
+                }
+                const images = try result_allocator.alloc(
+                    InitramfsImageRecord,
+                    record.images.len,
+                );
+                for (record.images, images) |source, *slot| {
+                    slot.* = .{
+                        .kernel_release = try result_allocator.dupe(u8, source.kernel_release),
+                        .image_path = try result_allocator.dupe(u8, source.image_path),
+                        .size = source.size,
+                        .sha256 = source.sha256,
+                    };
+                }
+                break :initramfs_blk .{
+                    .skipped_kernel_releases = skipped,
+                    .images = images,
+                };
+            } else null,
             .kernel_options = if (kernel_options) |report| .{
                 .appended = try result_allocator.dupe(u8, plan.data.boot_security.extra_kernel_options),
                 .grub_entries = report.grub_entries,
@@ -6755,13 +7035,17 @@ fn buildResult(
         };
     } else null;
     const tools = blk: {
-        const source = guestTools(unsafe_report, vm_report);
+        const source = backendTools(unsafe_report, vm_report);
         const owned = try result_allocator.alloc(ToolRecord, source.len);
         for (source, 0..) |tool, index| {
             owned[index] = .{
                 .name = try result_allocator.dupe(u8, tool.name),
-                .version = try result_allocator.dupe(u8, tool.version),
+                .version = if (tool.version) |version|
+                    try result_allocator.dupe(u8, version)
+                else
+                    null,
                 .command = try dupeStrings(result_allocator, tool.command),
+                .context = tool.context,
             };
         }
         break :blk owned;
@@ -7921,10 +8205,31 @@ fn hashPlanSources(
         .inline_script => {},
         .host_path => |path| try appendHashedSource(&records, allocator, io, .hook_source, path),
     };
-    for (plan.data.packages.repositories) |repository| for (repository.trust) |trust| switch (trust) {
-        .inline_bytes => {},
-        .host_path => |path| try appendHashedSource(&records, allocator, io, .trust_source, path),
-    };
+    // Trust is the one source recorded whichever form it arrives in. For
+    // every other kind, inline bytes are already covered by the plan hash --
+    // they are part of the request. Trust is different in what it buys the
+    // reader: two runs that trusted the same key are comparable only if both
+    // provenances state it the same way, and one naming a path with a digest
+    // beside a second carrying a blob are not comparable at all.
+    for (plan.data.packages.repositories) |repository| {
+        for (repository.trust, 0..) |trust, index| switch (trust) {
+            .inline_bytes => |bytes| try appendInlineSource(
+                &records,
+                allocator,
+                .trust_source,
+                repository.id,
+                index,
+                bytes,
+            ),
+            .host_path => |path| try appendHashedSource(
+                &records,
+                allocator,
+                io,
+                .trust_source,
+                path,
+            ),
+        };
+    }
     return records.toOwnedSlice();
 }
 
@@ -7944,6 +8249,37 @@ fn appendHashedSource(
         .kind = kind,
         .path = owned_path,
         .sha256 = try hashPath(allocator, io, path),
+    });
+}
+
+/// Records bytes the request carried, under a name for where it carried them.
+///
+/// The `path` is deliberately not a filesystem path and could not be mistaken
+/// for one: nothing opens it, and the re-read at the end of the run compares
+/// these records rather than reopening them -- which is what makes digesting
+/// request bytes safe. They cannot change mid-run, so this can never turn into
+/// the spurious `source_changed` failure that digesting a volatile host file
+/// would.
+fn appendInlineSource(
+    records: *std.array_list.Managed(SourceRecord),
+    allocator: Allocator,
+    kind: SourceKind,
+    repository_id: []const u8,
+    index: usize,
+    bytes: []const u8,
+) !void {
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "inline:{s}/trust/{d}",
+        .{ repository_id, index },
+    );
+    errdefer allocator.free(path);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    try records.append(.{
+        .kind = kind,
+        .path = path,
+        .sha256 = .{ .bytes = digest },
     });
 }
 
@@ -8423,6 +8759,7 @@ test "unsafe chroot platform executes the supported preserved subset" {
                     .name = "tdnf",
                     .version = "tdnf 3.5.0",
                     .command = &.{ "/usr/bin/tdnf", "remove", "obsolete" },
+                    .context = .target_root,
                 }},
                 .installed_packages = &.{"base-files-0:1.0-1.x86_64"},
             };
@@ -8466,7 +8803,7 @@ test "unsafe chroot platform executes the supported preserved subset" {
     );
     try std.testing.expectEqualStrings(
         "tdnf 3.5.0",
-        outcome.result.?.provenance.tools[0].version,
+        outcome.result.?.provenance.tools[0].version.?,
     );
     try std.testing.expectEqualStrings(
         "base-files-0:1.0-1.x86_64",
@@ -11040,6 +11377,21 @@ test "plan JSON renders identifiers as stable strings" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"plan_hash\": \"") != null);
 }
 
+test "the schema versions move only when the documents do" {
+    // Written out as literals on purpose: everywhere else these constants are
+    // compared against themselves, which catches a document that lost its
+    // version but not a bump nobody meant to make. A change here is a change a
+    // consumer has to be told about, so it should be a line in a diff.
+    //
+    // Provenance is at 26 because the guest-operation policy batch -- every
+    // command a run spawns, the kernels it skipped, the initramfs images it
+    // produced, the trust it ended up holding, the resolver it inherited --
+    // spent one bump between them rather than one each. The plan did not move:
+    // none of it is an instruction, all of it is what the run turned out to be.
+    try std.testing.expectEqual(@as(u32, 22), plan_schema_version);
+    try std.testing.expectEqual(@as(u32, 26), provenance_schema_version);
+}
+
 test "native-edit resolution is deterministic, deeply owned, and integrity checked" {
     var disk_path = "native-edit-source.raw".*;
     var edit_path = "native-edit-content.txt".*;
@@ -11161,6 +11513,85 @@ test "native-edit source hashing covers the disk and host edit sources" {
     defer freeSourceRecords(std.testing.allocator, after);
     try std.testing.expect(!sourceRecordsEqual(before, after));
     try std.testing.expectEqualSlices(u8, &before[0].sha256.bytes, &after[0].sha256.bytes);
+}
+
+test "declared trust is digested whichever form it arrives in" {
+    const io = std.testing.io;
+    const disk_path = "test-customize-trust-source.raw";
+    const key_path = "test-customize-trust-source.asc";
+    defer Io.Dir.cwd().deleteFile(io, disk_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, key_path) catch {};
+    for ([_]struct { path: []const u8, contents: []const u8 }{
+        .{ .path = disk_path, .contents = "disk" },
+        .{ .path = key_path, .contents = "a key on disk" },
+    }) |source| {
+        const file = try Io.Dir.cwd().createFile(io, source.path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, source.contents, 0);
+    }
+
+    const repositories = [_]PackageRepository{
+        .{
+            .id = "inline-trust",
+            .urls = &.{"https://packages.example.invalid"},
+            .trust = &.{
+                .{ .inline_bytes = "the first key" },
+                .{ .inline_bytes = "the second key" },
+            },
+        },
+        .{
+            .id = "path-trust",
+            .urls = &.{"https://packages.example.invalid"},
+            .trust = &.{.{ .host_path = key_path }},
+        },
+    };
+    var request = validNativeEditRequest(
+        disk_path,
+        "trust-source-output.raw",
+        ".",
+        &.{},
+    );
+    request.execution.backend = .unsafe_chroot;
+    request.execution.acknowledge_unsafe = true;
+    request.packages = .{
+        .actions = &.{.{ .install = &.{"zlib"} }},
+        .repositories = &repositories,
+    };
+    var resolved = try resolve(std.testing.allocator, &request, .{
+        .host_architecture = .x86_64,
+    });
+    defer resolved.deinit(std.testing.allocator);
+    const records = try hashPlanSources(std.testing.allocator, io, &resolved.plan.?);
+    defer freeSourceRecords(std.testing.allocator, records);
+
+    // A run that declared its key inline and a run that declared the same key
+    // as a path must produce provenance a reader can compare. Before this,
+    // one named a path with a digest and the other carried nothing at all.
+    try std.testing.expectEqual(@as(usize, 4), records.len);
+    try std.testing.expectEqual(SourceKind.disk, records[0].kind);
+    for (records[1..]) |record| {
+        try std.testing.expectEqual(SourceKind.trust_source, record.kind);
+    }
+    // Named for where the request carried them, per repository and per entry,
+    // so two keys under one repository are distinguishable and neither could
+    // be mistaken for a file on this machine.
+    try std.testing.expectEqualStrings("inline:inline-trust/trust/0", records[1].path);
+    try std.testing.expectEqualStrings("inline:inline-trust/trust/1", records[2].path);
+    try std.testing.expectEqualStrings(key_path, records[3].path);
+
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("the first key", &expected, .{});
+    try std.testing.expectEqualSlices(u8, &expected, &records[1].sha256.bytes);
+    std.crypto.hash.sha2.Sha256.hash("the second key", &expected, .{});
+    try std.testing.expectEqualSlices(u8, &expected, &records[2].sha256.bytes);
+
+    // Request bytes cannot change under a running build, so digesting them
+    // can never turn into the `source_changed` failure that digesting a
+    // volatile host file would. Checked rather than argued, because the
+    // re-read at the end of the run compares these records for equality.
+    const again = try hashPlanSources(std.testing.allocator, io, &resolved.plan.?);
+    defer freeSourceRecords(std.testing.allocator, again);
+    try std.testing.expect(sourceRecordsEqual(records, again));
 }
 
 test "native-edit tracks qcow2 backing files and rejects output aliases" {
@@ -12245,6 +12676,55 @@ test "a repository credential is declared by reference and never by value" {
         );
     }
 
+    // A credential is reachable from published provenance, deliberately -- the
+    // repository policy is recorded whole -- so the guarantee cannot be "not
+    // there" and has to be "there only as a reference". #308 grew `Provenance`
+    // by several records and will grow it again, so the reachability is
+    // established by walking the type graph rather than by naming the one
+    // field that happens to carry it today.
+    comptime {
+        @setEvalBranchQuota(200_000);
+        const reach = struct {
+            fn reachesCredential(comptime T: type, comptime seen: []const type) bool {
+                if (T == BasicCredential or T == RepositoryCredential) return true;
+                for (seen) |already| if (already == T) return false;
+                const next = seen ++ [_]type{T};
+                return switch (@typeInfo(T)) {
+                    .@"struct" => |info| for (info.fields) |field| {
+                        if (reachesCredential(field.type, next)) break true;
+                    } else false,
+                    .@"union" => |info| for (info.fields) |field| {
+                        if (reachesCredential(field.type, next)) break true;
+                    } else false,
+                    .optional => |info| reachesCredential(info.child, next),
+                    .array => |info| reachesCredential(info.child, next),
+                    .pointer => |info| reachesCredential(info.child, next),
+                    else => false,
+                };
+            }
+        };
+        std.debug.assert(reach.reachesCredential(Provenance, &.{}));
+
+        // Which makes `BasicCredential` the whole of what provenance can say
+        // about an identity: a user name, which is not a secret, and a
+        // reference. A third field, or a password that stopped being a
+        // `CredentialSource`, would be published by `writeProvenanceJson`
+        // without anyone having to add it there.
+        const basic = @typeInfo(BasicCredential).@"struct".fields;
+        std.debug.assert(basic.len == 2);
+        std.debug.assert(std.mem.eql(u8, basic[0].name, "username"));
+        std.debug.assert(basic[0].type == []const u8);
+        std.debug.assert(std.mem.eql(u8, basic[1].name, "password"));
+        std.debug.assert(basic[1].type == CredentialSource);
+        // And a reference is a name: every arm names something on the build
+        // machine, so none of them can be holding the material itself.
+        for (@typeInfo(CredentialSource).@"union".fields) |arm| {
+            std.debug.assert(arm.type == []const u8);
+        }
+        // `basic` is the only arm, so there is no second shape to check.
+        std.debug.assert(@typeInfo(RepositoryCredential).@"union".fields.len == 1);
+    }
+
     const repositories = [_]PackageRepository{.{
         .id = "base",
         .urls = &.{"https://packages.example.invalid"},
@@ -12768,6 +13248,7 @@ test "a hook that ran is recorded by digest in provenance" {
         .name = "marker",
         .phase = .finalize,
         .source_sha256 = .{ .bytes = script_digest },
+        .interpreter = "/bin/sh",
         .exit_code = 0,
     }};
 
@@ -12879,6 +13360,212 @@ test "the vm backend accepts a credential and carries it off the control documen
     try std.testing.expectEqual(@as(usize, 2), basic.len);
     try std.testing.expect(std.mem.eql(u8, basic[0].name, "username"));
     try std.testing.expect(std.mem.eql(u8, basic[1].name, "password_index"));
+}
+
+test "no credential material reaches any document a run publishes" {
+    // #308: every slice in this batch widened what provenance records --
+    // host-side commands, discovered kernels, imported trust, the host
+    // resolver -- and each of those is a new place a secret could surface. The
+    // claim is made over the whole document rather than field by field,
+    // because the next field added is the one nobody would think to check.
+    const io = std.testing.io;
+    const source_path = "test-customize-credential-source.raw";
+    const spool_path = "test-customize-credential-spool";
+    const workspace_path = "test-customize-credential-work";
+    const secret_path = "test-customize-credential-secret";
+    const output_path = workspace_path ++ "/output.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, secret_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try createCustomizeTestDisk(io, source_path, spool_path);
+    try Io.Dir.cwd().createDirPath(io, workspace_path);
+
+    // The file is real and readable by this process, so its absence from the
+    // documents is a decision not to read it rather than a failure to find it.
+    const file_material = "zvmi-sentinel-from-a-file";
+    const variable_name = "ZVMI_TEST_CREDENTIAL_SENTINEL";
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = secret_path,
+        .data = file_material ++ "\n",
+    });
+    var cwd_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_length = try std.process.currentPath(io, &cwd_buffer);
+    var absolute_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const absolute_secret = try std.fmt.bufPrint(
+        &absolute_buffer,
+        "{s}/{s}",
+        .{ cwd_buffer[0..cwd_length], secret_path },
+    );
+
+    // Both channels at once: a path and a variable resolve differently and
+    // fail differently, so a leak through one would not be caught by a test
+    // that only declared the other.
+    const repositories = [_]PackageRepository{
+        .{
+            .id = "base",
+            .urls = &.{"https://packages.example.invalid"},
+            .trust = &.{.{ .inline_bytes = "test key" }},
+            .credential = .{ .basic = .{
+                .username = "builder",
+                .password = .{ .host_path = absolute_secret },
+            } },
+        },
+        .{
+            .id = "other",
+            .urls = &.{"https://other.example.invalid"},
+            .trust = &.{.{ .inline_bytes = "test key" }},
+            .credential = .{ .basic = .{
+                .username = "builder",
+                .password = .{ .host_environment = variable_name },
+            } },
+        },
+    };
+    var request = validNativeEditRequest(
+        source_path,
+        output_path,
+        workspace_path,
+        &.{},
+    );
+    request.execution.backend = .unsafe_chroot;
+    request.execution.acknowledge_unsafe = true;
+    request.packages = .{
+        .actions = &.{.{ .install = &.{"dracut"} }},
+        .repositories = &repositories,
+    };
+
+    const FakeUnsafe = struct {
+        var tools: [1]ToolRecord = undefined;
+        var arguments: [3][]const u8 = undefined;
+
+        fn check(_: ?*anyopaque, _: Io, _: *const ResolvedPlan) CapabilityState {
+            return .available;
+        }
+
+        fn run(
+            _: ?*anyopaque,
+            allocator: Allocator,
+            _: Io,
+            _: *const ResolvedPlan,
+            _: preserved_image.RawMutationTarget,
+            _: Deadline,
+        ) !UnsafeChrootRuntimeReport {
+            return .{
+                .arena = std.heap.ArenaAllocator.init(allocator),
+                .tools = &tools,
+                .installed_packages = &.{},
+                .imported_trust_keys = &.{"gpg-pubkey-3fa2e4b1"},
+                .host_resolver = .{
+                    .sha256 = .{ .bytes = [_]u8{0x11} ** 32 },
+                    .size = 42,
+                },
+            };
+        }
+    };
+    // A recorded argv that names the repository file the material is written
+    // into, so the surface the assertion sweeps is the real one.
+    FakeUnsafe.arguments = .{ "/usr/bin/tdnf", "install", "dracut" };
+    FakeUnsafe.tools = .{.{
+        .name = "tdnf",
+        .version = "3.5.2",
+        .command = &FakeUnsafe.arguments,
+        .context = .target_root,
+    }};
+
+    var platform = Platform.system();
+    platform.unsafeChrootCheckFn = FakeUnsafe.check;
+    platform.unsafeChrootRunFn = FakeUnsafe.run;
+    var resolved = try resolve(
+        std.testing.allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    const plan = resolved.plan orelse return error.TestUnexpectedResult;
+    var outcome = try execute(
+        std.testing.allocator,
+        io,
+        &resolved.plan.?,
+        platform,
+        null,
+    );
+    defer outcome.deinit(std.testing.allocator);
+    const result = outcome.result orelse return error.TestUnexpectedResult;
+
+    // Everything this library writes out, in the order a consumer meets it.
+    const Document = struct { name: []const u8, bytes: []const u8 };
+    var request_json: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer request_json.deinit();
+    try writeRequestJson(request, &request_json.writer);
+    var plan_json: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer plan_json.deinit();
+    try writePlanJson(&plan, &plan_json.writer);
+    var provenance_json: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer provenance_json.deinit();
+    try writeProvenanceJson(result.provenance, &provenance_json.writer);
+    var diagnostics_json: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics_json.deinit();
+    try writeDiagnosticsJson(outcome.diagnostics, &diagnostics_json.writer);
+    const documents = [_]Document{
+        .{ .name = "request", .bytes = request_json.written() },
+        .{ .name = "plan", .bytes = plan_json.written() },
+        .{ .name = "provenance", .bytes = provenance_json.written() },
+        .{ .name = "diagnostics", .bytes = diagnostics_json.written() },
+    };
+    for (documents) |document| {
+        try std.testing.expect(
+            std.mem.indexOf(u8, document.bytes, file_material) == null,
+        );
+    }
+
+    // The typed surfaces too, because a leak into an argv or a message would
+    // be caught above only for as long as that field keeps stringifying.
+    for (result.provenance.tools) |tool| {
+        for (tool.command) |argument| {
+            try std.testing.expect(
+                std.mem.indexOf(u8, argument, file_material) == null,
+            );
+        }
+    }
+    for (outcome.diagnostics.items) |diagnostic| {
+        try std.testing.expect(
+            std.mem.indexOf(u8, diagnostic.message, file_material) == null,
+        );
+        const command = diagnostic.command orelse continue;
+        for (command.argv) |argument| {
+            try std.testing.expect(
+                std.mem.indexOf(u8, argument, file_material) == null,
+            );
+        }
+    }
+
+    // Not vacuous: the locators are published on purpose, so a reader can tell
+    // which identity a build ran as and which host inputs it required. If the
+    // whole credential had been dropped, these would fail instead.
+    try std.testing.expect(
+        std.mem.indexOf(u8, documents[0].bytes, absolute_secret) != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, documents[1].bytes, variable_name) != null,
+    );
+    var paths: usize = 0;
+    var variables: usize = 0;
+    for (plan.data.required_capabilities) |capability| {
+        if (capability.kind != .read_host_credential) continue;
+        if (std.mem.eql(u8, capability.path, absolute_secret)) paths += 1;
+        if (std.mem.startsWith(u8, capability.path, "env:")) variables += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), paths);
+    try std.testing.expectEqual(@as(usize, 1), variables);
+
+    // And the batch's new records are present in the document the sweep just
+    // cleared, so the sweep covered them rather than an empty execution.
+    try std.testing.expect(
+        std.mem.indexOf(u8, documents[2].bytes, "gpg-pubkey-3fa2e4b1") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, documents[2].bytes, "host_resolver") != null,
+    );
 }
 
 test "a repository URL cannot smuggle a credential past the declaration" {

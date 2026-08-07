@@ -183,7 +183,7 @@ fn runAttestation(allocator: Allocator, io: Io, settings: Settings) !void {
         .vcpus = 2,
     };
 
-    const record = zvmi.vm_backend.attestFirmwareBoot(allocator, io, .{
+    const attestation = zvmi.vm_backend.attestFirmwareBoot(allocator, io, .{
         .policy = policy,
         .firmware = firmware,
         .architecture = settings.architecture,
@@ -195,6 +195,11 @@ fn runAttestation(allocator: Allocator, io: Io, settings: Settings) !void {
         return err;
     };
 
+    // The attestation boot is a second emulator invocation, and provenance
+    // records it as a command of its own rather than folding it into the
+    // appliance boot that ran a different machine with a different disk.
+    try ensure(attestation.command.len > 1);
+    const record = attestation.record;
     try ensure(record.variable_store == .ephemeral);
     try ensure(record.secure_boot == settings.secure_boot);
     try ensure(std.mem.eql(u8, record.console_marker, settings.marker));

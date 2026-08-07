@@ -60,6 +60,9 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
         .baseline_packages = .init(allocator),
         .emitted_lock = .init(allocator),
         .hook_outcomes = .init(allocator),
+        .imported_trust_keys = .init(allocator),
+        .initramfs_images = .init(allocator),
+        .skipped_kernels = .init(allocator),
     };
     const outcome = session.run();
     session.teardown();
@@ -70,6 +73,12 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
         .installed_packages = session.installed_packages.items,
         .package_lock = session.emitted_lock.items,
         .hooks = session.hook_outcomes.items,
+        .selinux_relabel = session.selinux_relabel,
+        .imported_trust_keys = session.imported_trust_keys.items,
+        .initramfs = if (session.initramfs_regenerated) .{
+            .skipped_kernel_releases = session.skipped_kernels.items,
+            .images = session.initramfs_images.items,
+        } else null,
     });
     powerOff();
 }
@@ -95,6 +104,16 @@ const Session = struct {
     emitted_lock: std.array_list.Managed(control_mod.PackagePin),
     /// What each hook did, in the order it ran.
     hook_outcomes: std.array_list.Managed(control_mod.HookOutcome),
+    /// What the target's own SELinux configuration named, filled by a relabel
+    /// that succeeded. The policy is in the `setfiles` argv too; the mode is
+    /// nowhere else, and neither is marked as discovered without this.
+    selinux_relabel: ?control_mod.SelinuxRelabel = null,
+    /// Whether an initramfs regeneration was attempted at all, which is not
+    /// the same as whether one produced an image.
+    initramfs_regenerated: bool = false,
+    imported_trust_keys: std.array_list.Managed([]const u8),
+    initramfs_images: std.array_list.Managed(control_mod.InitramfsImage),
+    skipped_kernels: std.array_list.Managed(control_mod.SkippedKernel),
 
     /// Captured as soon as the control document parses, so that even a refusal
     /// to act on the rest of it still gets an answer home.
@@ -164,10 +183,12 @@ const Session = struct {
         self.writeRepositoryFiles(control) catch |err| {
             return fail("repository-configuration", @errorName(err));
         };
-        self.importTrust(control) catch |err| {
-            return self.stageFailure("repository-trust", err);
-        };
-        // Before the first action, so the baseline is the root as it arrived.
+        // Before the trust import, so the baseline is the root exactly as it
+        // arrived and every `gpg-pubkey-<keyid>-<timestamp>` in the delta is
+        // trust this run added -- declared or imported by a transaction on its
+        // own. The lock is unaffected: its reader drops trust
+        // pseudo-packages either way, because a lock must not pin a key.
+        //
         // Read for any run with package actions, not only a pinned one: the
         // emitted lock is the difference between the two inventories, and the
         // run that declares no pins is the one most likely to want them.
@@ -176,6 +197,9 @@ const Session = struct {
                 return self.stageFailure("package-baseline", err);
             };
         }
+        self.importTrust(control) catch |err| {
+            return self.stageFailure("repository-trust", err);
+        };
         for (control.actions) |action| {
             const executed = switch (action) {
                 .install => |names| self.runTdnfPinned("install", names, control),
@@ -207,6 +231,10 @@ const Session = struct {
         switch (control.initramfs) {
             .unchanged => {},
             .regenerate => |regenerate| {
+                // Before discovery, so a run that finds no usable kernel still
+                // publishes the entries it passed over on the way to that
+                // answer.
+                self.initramfs_regenerated = true;
                 const kernels = if (regenerate.kernels.len > 0)
                     regenerate.kernels
                 else
@@ -315,7 +343,12 @@ const Session = struct {
         if (control.actions.len == 0) return;
         for (self.installed_packages.items) |installed| {
             if (containsBytes(self.baseline_packages.items, installed)) continue;
-            if (control_mod.isTrustPseudoPackage(installed)) continue;
+            if (control_mod.isTrustPseudoPackage(installed)) {
+                try self.imported_trust_keys.append(
+                    control_mod.trustKeyIdentity(installed),
+                );
+                continue;
+            }
             const pin = control_mod.parseInstalledPackageRecord(installed) orelse
                 return error.InvalidInstalledPackageRecord;
             try self.emitted_lock.append(pin);
@@ -626,7 +659,11 @@ const Session = struct {
     /// request to regenerate every initramfs that regenerates none has not
     /// done what it said.
     fn installedKernels(self: *Session) ![]const []const u8 {
-        return discoverKernels(self.allocator, guest_root ++ "/lib/modules");
+        return discoverKernels(
+            self.allocator,
+            guest_root ++ "/lib/modules",
+            &self.skipped_kernels,
+        );
     }
 
     fn regenerateInitramfs(self: *Session, kernel: []const u8) !void {
@@ -650,6 +687,16 @@ const Session = struct {
         );
         try self.runChroot(&.{ "/usr/bin/cp", "--remove-destination", temporary, final });
         self.deleteGuestFile(temporary);
+        // Digested where `cp` left it rather than where dracut built it: what
+        // a reader can check is the file the published image carries, and the
+        // two are only the same file if the copy did what it said.
+        const measured = try measureGuestFile(self.allocator, final);
+        try self.initramfs_images.append(.{
+            .kernel_release = kernel,
+            .image_path = final,
+            .size = measured.size,
+            .sha256 = measured.sha256,
+        });
     }
 
     /// Relabels the target root with the policy the target itself carries.
@@ -670,6 +717,9 @@ const Session = struct {
         ) catch return error.MissingSelinuxConfiguration;
         const policy = control_mod.selinux.parseConfiguredPolicy(config) orelse
             return error.MissingSelinuxConfiguration;
+        // Taken from the same read as the policy, so the record describes one
+        // configuration rather than two glimpses of a file.
+        const mode = control_mod.selinux.parseConfiguredMode(config);
         var contexts_buffer: [control_mod.selinux.max_policy_name_bytes + 64]u8 = undefined;
         const contexts = control_mod.selinux.fileContextsPath(&contexts_buffer, policy) catch
             return error.UnsupportedSelinuxPolicy;
@@ -693,6 +743,10 @@ const Session = struct {
         try argv.append(try self.allocator.dupe(u8, contexts));
         try argv.append("/");
         try self.runChroot(argv.items);
+        // After the tool succeeded, so the record describes a relabel that
+        // happened. `policy` points into the configuration this session's
+        // arena still holds, so it outlives the result it is published in.
+        self.selinux_relabel = .{ .policy = policy, .mode = mode };
     }
 
     fn guestFileExists(self: *Session, guest_path: []const u8) bool {
@@ -855,11 +909,16 @@ const Session = struct {
     /// Best-effort tool version for provenance. A probe that fails is not a run
     /// that failed, so it must not leave an exit code behind for a later stage
     /// to be blamed with.
-    fn probeVersion(self: *Session, program: []const u8) []const u8 {
+    ///
+    /// Nothing, rather than an empty string, when the tool could not be asked:
+    /// the host publishes this straight into provenance, where "not probed"
+    /// and "answered with nothing" have to stay distinguishable.
+    fn probeVersion(self: *Session, program: []const u8) ?[]const u8 {
         const captured = runInChroot(self.allocator, &.{ program, "--version" }) catch
-            return "";
-        if (captured.exit_code != 0) return "";
-        return std.mem.trim(u8, firstLine(captured.output), " \t\r");
+            return null;
+        if (captured.exit_code != 0) return null;
+        const trimmed = std.mem.trim(u8, firstLine(captured.output), " \t\r");
+        return if (trimmed.len == 0) null else trimmed;
     }
 
     fn captureChroot(self: *Session, argv: []const []const u8) ![]const u8 {
@@ -1007,7 +1066,11 @@ fn renderResolver(allocator: Allocator, config: control_mod.NetworkConfig) ![]co
 
 /// The directory scan behind `Session.installedKernels`, taking its path so a
 /// test can point it at a tree it built rather than at the mounted target.
-fn discoverKernels(allocator: Allocator, modules_path: []const u8) ![]const []const u8 {
+fn discoverKernels(
+    allocator: Allocator,
+    modules_path: []const u8,
+    skipped: *std.array_list.Managed(control_mod.SkippedKernel),
+) ![]const []const u8 {
     const modules_z = try allocator.dupeZ(u8, modules_path);
     defer allocator.free(modules_z);
     const fd_raw = linux.open(modules_z, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
@@ -1048,8 +1111,23 @@ fn discoverKernels(allocator: Allocator, modules_path: []const u8) ![]const []co
             // A release string the control document would have been refused
             // for carrying cannot become acceptable by being discovered
             // instead. This also excludes "." and "..".
-            if (!control_mod.validKernelRelease(name)) continue;
-            if (!try hasDepmodOutput(allocator, modules_path, name)) continue;
+            // "." and ".." are excluded by the same rule, and are not worth
+            // reporting as kernels a run passed over.
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            if (!control_mod.validKernelRelease(name)) {
+                try skipped.append(.{
+                    .name = try allocator.dupe(u8, name),
+                    .reason = .invalid_release_name,
+                });
+                continue;
+            }
+            if (!try hasDepmodOutput(allocator, modules_path, name)) {
+                try skipped.append(.{
+                    .name = try allocator.dupe(u8, name),
+                    .reason = .no_module_dependency_index,
+                });
+                continue;
+            }
 
             try releases.append(try allocator.dupe(u8, name));
         }
@@ -1448,6 +1526,57 @@ fn readDeviceAlloc(allocator: Allocator, device: []const u8, size: u64) ![]u8 {
     return buffer;
 }
 
+/// The size and SHA-256 of a file inside the target root.
+///
+/// Streamed rather than read whole: an initramfs is tens of megabytes and this
+/// runs in a guest sized for the transaction, not for a copy of its output.
+fn measureGuestFile(allocator: Allocator, guest_path: []const u8) !MeasuredFile {
+    const host_path = try std.fmt.allocPrintSentinel(
+        allocator,
+        guest_root ++ "{s}",
+        .{guest_path},
+        0,
+    );
+    defer allocator.free(host_path);
+    return measureFile(host_path);
+}
+
+/// Streams a file already named from the agent's own root.
+fn measureFile(host_path: [:0]const u8) !MeasuredFile {
+    const fd_raw = linux.open(host_path, .{ .ACCMODE = .RDONLY }, 0);
+    switch (linux.errno(fd_raw)) {
+        .SUCCESS => {},
+        .NOENT => return error.FileNotFound,
+        else => return error.OpenFailed,
+    }
+    const fd: i32 = @intCast(fd_raw);
+    defer _ = linux.close(fd);
+
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var size: u64 = 0;
+    while (true) {
+        const rc = linux.read(fd, &buffer, buffer.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return error.ReadFailed,
+        }
+        const count: usize = @intCast(rc);
+        if (count == 0) break;
+        hash.update(buffer[0..count]);
+        size += count;
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return .{ .size = size, .sha256 = digest };
+}
+
+const MeasuredFile = struct {
+    size: u64,
+    sha256: [32]u8,
+};
+
 fn readFileAlloc(allocator: Allocator, path: []const u8, limit: usize) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
     const fd_raw = linux.open(path_z, .{ .ACCMODE = .RDONLY }, 0);
@@ -1672,6 +1801,9 @@ test "a module member the agent will not open is refused before any syscall" {
         .baseline_packages = .init(arena.allocator()),
         .emitted_lock = .init(arena.allocator()),
         .hook_outcomes = .init(arena.allocator()),
+        .imported_trust_keys = .init(arena.allocator()),
+        .initramfs_images = .init(arena.allocator()),
+        .skipped_kernels = .init(arena.allocator()),
     };
 
     // The host validated this too, but a guest that trusts its control
@@ -1685,10 +1817,46 @@ test "a module member the agent will not open is refused before any syscall" {
     try session.loadModules(&.{});
 }
 
+test "an initramfs is measured by streaming it, not by reading it whole" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Larger than the read buffer, so the incremental path is the one under
+    // test. A guest sized for the transaction cannot afford to hold an
+    // initramfs in its arena, so this must never become a whole-file read.
+    const path = "test-zvmiguest-initramfs.img";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const body = try allocator.alloc(u8, 150 * 1024);
+    for (body, 0..) |*byte, index| byte.* = @truncate(index * 31);
+    try writeFileBytes(allocator, path, body, 0o644);
+
+    const measured = try measureFile(path);
+    try std.testing.expectEqual(@as(u64, body.len), measured.size);
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &expected, .{});
+    try std.testing.expectEqualSlices(u8, &expected, &measured.sha256);
+
+    // A regeneration that produced no file must fail rather than publish a
+    // digest of nothing.
+    try std.testing.expectError(error.FileNotFound, measureFile("test-zvmiguest-absent.img"));
+}
+
+fn findSkipped(
+    entries: []const control_mod.SkippedKernel,
+    name: []const u8,
+) ?control_mod.SkippedKernelReason {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return entry.reason;
+    }
+    return null;
+}
+
 test "kernel discovery follows dracut's rule and refuses to find nothing" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+    var skipped: std.array_list.Managed(control_mod.SkippedKernel) = .init(allocator);
 
     // Built with the agent's own primitives, so the scan is tested against a
     // tree made the way the agent makes trees.
@@ -1700,7 +1868,7 @@ test "kernel discovery follows dracut's rule and refuses to find nothing" {
     // than report as a policy it carried out.
     try std.testing.expectError(
         error.NoInstalledKernels,
-        discoverKernels(allocator, modules_path),
+        discoverKernels(allocator, modules_path, &skipped),
     );
 
     // Two installed kernels, deliberately out of order and distinguished by
@@ -1716,11 +1884,29 @@ test "kernel discovery follows dracut's rule and refuses to find nothing" {
     try mkdirPath(modules_path ++ "/6.12.0 spaced");
     try writeFileBytes(allocator, modules_path ++ "/6.12.0 spaced/modules.dep", "", 0o644);
 
-    const found = try discoverKernels(allocator, modules_path);
+    skipped.clearRetainingCapacity();
+    const found = try discoverKernels(allocator, modules_path, &skipped);
     try std.testing.expectEqual(@as(usize, 2), found.len);
     // Sorted, so the same target produces the same run twice.
     try std.testing.expectEqualStrings("6.12.0-10.azl", found[0]);
     try std.testing.expectEqualStrings("6.12.0-2.azl", found[1]);
+
+    // What the scan passed over reaches the host too. A run that regenerated
+    // one kernel's initramfs and silently declined to regenerate another's is
+    // indistinguishable, from the report alone, from a target that only ever
+    // had the one -- and the second is a bootable image, while the first is a
+    // package transaction that shipped a stale initramfs. `.` and `..` are
+    // not reported: they fail the same rule, but no reader could mistake them
+    // for a kernel.
+    try std.testing.expectEqual(@as(usize, 2), skipped.items.len);
+    try std.testing.expectEqual(
+        control_mod.SkippedKernelReason.no_module_dependency_index,
+        findSkipped(skipped.items, "firmware").?,
+    );
+    try std.testing.expectEqual(
+        control_mod.SkippedKernelReason.invalid_release_name,
+        findSkipped(skipped.items, "6.12.0 spaced").?,
+    );
 
     // An absent module tree is the only shape that reads as nothing
     // installed. The host may be tolerating that answer -- a regeneration it
@@ -1729,15 +1915,15 @@ test "kernel discovery follows dracut's rule and refuses to find nothing" {
     // or a package transaction would ship the initramfs it invalidated.
     try std.testing.expectError(
         error.NoInstalledKernels,
-        discoverKernels(allocator, modules_path ++ "/absent"),
+        discoverKernels(allocator, modules_path ++ "/absent", &skipped),
     );
     try std.testing.expectError(
         error.OpenFailed,
-        discoverKernels(allocator, "/dev/null"),
+        discoverKernels(allocator, "/dev/null", &skipped),
     );
     try std.testing.expectError(
         error.OpenFailed,
-        discoverKernels(allocator, modules_path ++ "/6.12.0-2.azl/modules.dep"),
+        discoverKernels(allocator, modules_path ++ "/6.12.0-2.azl/modules.dep", &skipped),
     );
 
     // The same distinction one level in. A release directory that cannot be
@@ -1751,7 +1937,7 @@ test "kernel discovery follows dracut's rule and refuses to find nothing" {
     defer setMode(allocator, modules_path ++ "/6.12.0-locked.azl", 0o755) catch {};
     try std.testing.expectError(
         error.OpenFailed,
-        discoverKernels(allocator, modules_path),
+        discoverKernels(allocator, modules_path, &skipped),
     );
 }
 

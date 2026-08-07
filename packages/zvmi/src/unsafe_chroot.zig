@@ -292,7 +292,7 @@ pub fn runParent(
             lease_active = false;
         },
     }
-    return loadParentReport(allocator, io, report_path);
+    return loadParentReport(allocator, io, report_path, &argv);
 }
 
 pub fn workerMain(init: std.process.Init, manifest_path: []const u8) !void {
@@ -373,9 +373,17 @@ const WorkerReport = struct {
     /// the run that has nothing to verify is exactly the run you want a lock
     /// out of.
     package_lock: []const customize.PackageVersionLock = &.{},
+    /// Trust rpm derived from what this run imported, as
+    /// `gpg-pubkey-<keyid>-<timestamp>`. The declared trust is recorded as
+    /// bytes or a path; this is the key rpm actually verified signatures
+    /// against, and it is also where trust nobody declared shows up.
+    imported_trust_keys: []const []const u8 = &.{},
     hooks: []const customize.HookRecord = &.{},
     boot_configuration: ?customize.BootConfigurationRecord = null,
     package_cache: ?customize.PackageCacheRecord = null,
+    selinux_relabel: ?customize.SelinuxRelabelRecord = null,
+    initramfs: ?customize.InitramfsRecord = null,
+    host_resolver: ?customize.HostResolverRecord = null,
 };
 
 fn classifyRunFailure(err: anyerror) RunOutcome {
@@ -454,8 +462,12 @@ fn executeManifest(
         .installed_packages = .init(allocator),
         .baseline_packages = .init(allocator),
         .emitted_lock = .init(allocator),
+        .imported_trust_keys = .init(allocator),
         .preexisting_loops = .init(allocator),
         .hook_records = .init(allocator),
+        .tool_versions = .init(allocator),
+        .initramfs_images = .init(allocator),
+        .skipped_kernels = .init(allocator),
     };
     const outcome = session.openAndRun();
     // Before the teardown, and only on this path. The command that ran out of
@@ -482,12 +494,25 @@ fn executeManifest(
             .tools = session.tools.items,
             .installed_packages = session.installed_packages.items,
             .package_lock = session.emitted_lock.items,
+            .imported_trust_keys = session.imported_trust_keys.items,
             .hooks = session.hook_records.items,
             .boot_configuration = session.boot_configuration,
             .package_cache = session.package_cache,
+            .selinux_relabel = session.selinux_relabel,
+            .host_resolver = session.host_resolver,
+            .initramfs = if (session.initramfs_regenerated) .{
+                .skipped_kernel_releases = session.skipped_kernels.items,
+                .images = session.initramfs_images.items,
+            } else null,
         },
     };
 }
+
+/// What one read of the target's `/etc/selinux/config` yielded.
+const DiscoveredSelinux = struct {
+    policy: []const u8,
+    mode: ?customize.SelinuxMode,
+};
 
 const Session = struct {
     allocator: Allocator,
@@ -515,15 +540,32 @@ const Session = struct {
     /// question to ask of it: what this transaction added.
     baseline_packages: std.array_list.Managed([]const u8),
     emitted_lock: std.array_list.Managed(customize.PackageVersionLock),
+    /// Trust rpm holds because of this run, collected from the same delta the
+    /// emitted lock comes from and for the same reason: the input image's own
+    /// keys are not this run's doing.
+    imported_trust_keys: std.array_list.Managed([]const u8),
     preexisting_loops: std.array_list.Managed([]const u8),
     hook_records: std.array_list.Managed(customize.HookRecord),
-    rpm_version: []const u8 = "",
-    tdnf_version: []const u8 = "",
-    dracut_version: []const u8 = "",
-    cp_version: []const u8 = "",
-    generator_version: []const u8 = "",
+    /// Versions already probed, keyed by the guest path that was probed.
+    /// Probing is per program rather than per invocation, but the answer is
+    /// still the answer for that program: what it replaced was a fixed table
+    /// of five suffixes that returned an empty string for everything else, so
+    /// `setfiles` -- the most recently added tool -- recorded no version at
+    /// all.
+    tool_versions: std.array_list.Managed(ProbedVersion),
     boot_configuration: ?customize.BootConfigurationRecord = null,
     package_cache: ?customize.PackageCacheRecord = null,
+    selinux_relabel: ?customize.SelinuxRelabelRecord = null,
+    /// Set exactly when this run bound the build machine's own resolver into
+    /// the target for the package transaction.
+    host_resolver: ?customize.HostResolverRecord = null,
+    /// Whether an initramfs regeneration was attempted at all, which is not
+    /// the same as whether one produced an image: a derived regeneration that
+    /// found no installed kernel is a successful run that regenerated nothing,
+    /// and the entries it passed over are the only account of why.
+    initramfs_regenerated: bool = false,
+    initramfs_images: std.array_list.Managed(customize.InitramfsImageRecord),
+    skipped_kernels: std.array_list.Managed(customize.SkippedKernelRelease),
 
     fn openAndRun(self: *Session) RunOutcome {
         self.open() catch |err| return classifyRunFailure(err);
@@ -570,24 +612,26 @@ const Session = struct {
         const losetup = findTool(self.io, losetup_candidates).?;
         self.loop_attachment_uncertain = true;
         self.loop_inventory_safe = false;
+        const attach_argv = [_][]const u8{
+            losetup,
+            "--find",
+            "--show",
+            "--offset",
+            offset,
+            "--sizelimit",
+            length,
+            "/proc/self/fd/0",
+        };
         var result = try self.executor.run(
             self.allocator,
             self.io,
-            &.{
-                losetup,
-                "--find",
-                "--show",
-                "--offset",
-                offset,
-                "--sizelimit",
-                length,
-                "/proc/self/fd/0",
-            },
+            &attach_argv,
             true,
             raw_file,
         );
         defer result.deinit(self.allocator);
         try expectSuccess(result.term);
+        try self.recordTool(.host, &attach_argv);
         const loop_path = try parseLoopPath(self.allocator, result.stdout);
         if (self.loopWasPreexisting(loop_path)) {
             self.allocator.free(loop_path);
@@ -702,6 +746,11 @@ const Session = struct {
             defer self.allocator.free(resolver_run_path);
             switch (self.manifest.packages.resolver) {
                 .host_resolver => {
+                    // Digested before the bind, which is the only moment this
+                    // backend has the host's own file open on its own account.
+                    // The bytes, not their content: what they name is this
+                    // machine's DNS topology, which the caller never declared.
+                    try self.recordHostResolver("/etc/resolv.conf");
                     try writeBytesExclusive(self.io, resolver_run_path, "", default_repository_permissions);
                     try self.runSuccess(&.{
                         findTool(self.io, mount_candidates).?,
@@ -760,19 +809,43 @@ const Session = struct {
         }
     }
 
+    /// Digests the build machine's own resolver, streamed rather than read
+    /// whole: nothing bounds a file this backend did not write.
+    fn recordHostResolver(self: *Session, host_path: []const u8) !void {
+        const file = try Io.Dir.cwd().openFile(self.io, host_path, .{});
+        defer file.close(self.io);
+        const size = (try file.stat(self.io)).size;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        var offset: u64 = 0;
+        while (offset < size) {
+            const length: usize = @intCast(@min(size - offset, buffer.len));
+            const read = try file.readPositionalAll(self.io, buffer[0..length], offset);
+            if (read != length) return error.ShortResolverRead;
+            hash.update(buffer[0..length]);
+            offset += length;
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        self.host_resolver = .{ .sha256 = .{ .bytes = digest }, .size = size };
+    }
+
     fn runPolicy(self: *Session) !void {
         try self.writeRepositoryFiles();
         errdefer self.removeRepositoryFiles() catch {};
-        try self.importTrust();
-        // After the trust import and before the first action, which is the
-        // same point the guest agent reads it. `rpm --import` inserts a
-        // `gpg-pubkey-<keyid>-<timestamp>` pseudo-package into the target's
-        // rpm database, so a baseline taken before it would report the
-        // declared repository key as something this transaction installed.
+        // Before the trust import, so the baseline is the root exactly as it
+        // arrived and every `gpg-pubkey-<keyid>-<timestamp>` pseudo-package in
+        // the delta is trust this run added -- whether the request declared it
+        // or a package transaction imported one of its own. The lock is
+        // unaffected either way: both readers of the delta drop trust
+        // pseudo-packages, because `(none)` is not an architecture the pin
+        // rules accept and a lock must not pin a key.
+        //
         // Read for any run with package actions, not only a locked one: the
         // emitted lock is the difference between the two inventories, and a
         // run that declares no lock is the one most likely to want one.
         if (self.manifest.packages.actions.len != 0) try self.loadBaselinePackages();
+        try self.importTrust();
         for (self.manifest.packages.actions) |action| switch (action) {
             .install => |names| try self.runTdnfLocked("install", names),
             // The one verb a lock does not rewrite. A removal names what must
@@ -838,7 +911,11 @@ const Session = struct {
             .relabel => {},
         }
         const tool = try self.findGuestLabellingTool();
-        const policy = try self.readGuestSelinuxPolicy();
+        // Read once, for the policy the relabel needs and the mode the record
+        // carries: a second read could see a different file, and provenance
+        // would describe a configuration that never existed as a whole.
+        const discovered = try self.readGuestSelinuxConfiguration();
+        const policy = discovered.policy;
         defer self.allocator.free(policy);
         var contexts_buffer: [selinux_mod.max_policy_name_bytes + 64]u8 = undefined;
         const contexts = selinux_mod.fileContextsPath(&contexts_buffer, policy) catch
@@ -863,6 +940,12 @@ const Session = struct {
         try argv.append(contexts);
         try argv.append("/");
         try self.runChroot(argv.items);
+        // After the tool succeeded, so the record describes a relabel that
+        // happened rather than one that was attempted.
+        self.selinux_relabel = .{
+            .discovered_policy = try self.allocator.dupe(u8, policy),
+            .target_mode = discovered.mode,
+        };
     }
 
     fn findGuestLabellingTool(self: *Session) ![]const u8 {
@@ -872,9 +955,14 @@ const Session = struct {
         return error.MissingSelinuxLabellingTool;
     }
 
-    /// The policy name the target's own configuration gives, duplicated
-    /// because the file it was parsed out of does not outlive this call.
-    fn readGuestSelinuxPolicy(self: *Session) ![]const u8 {
+    /// What the target's own SELinux configuration says: the policy the
+    /// relabel must use, and the mode it asks the target's kernel for.
+    ///
+    /// The policy is duplicated because the file it was parsed out of does not
+    /// outlive this call. A configuration naming no usable policy fails the
+    /// run; one naming no recognisable mode does not, because the mode is
+    /// recorded rather than acted on.
+    fn readGuestSelinuxConfiguration(self: *Session) !DiscoveredSelinux {
         const path = try self.guestPath(selinux_mod.config_path);
         defer self.allocator.free(path);
         const contents = Io.Dir.cwd().readFileAlloc(
@@ -886,7 +974,10 @@ const Session = struct {
         defer self.allocator.free(contents);
         const policy = selinux_mod.parseConfiguredPolicy(contents) orelse
             return error.MissingSelinuxConfiguration;
-        return self.allocator.dupe(u8, policy);
+        return .{
+            .policy = try self.allocator.dupe(u8, policy),
+            .mode = selinux_mod.parseConfiguredMode(contents),
+        };
     }
 
     fn runHooks(self: *Session, phase: customize.HookPhase) !void {
@@ -974,6 +1065,10 @@ const Session = struct {
             .name = try self.allocator.dupe(u8, hook.name),
             .phase = hook.phase,
             .source_sha256 = .{ .bytes = digest },
+            .interpreter = try self.allocator.dupe(
+                u8,
+                customize.hookInterpreterLine(script),
+            ),
             .exit_code = exit_code,
         });
     }
@@ -1113,7 +1208,12 @@ const Session = struct {
         if (self.manifest.packages.actions.len == 0) return;
         for (self.installed_packages.items) |installed| {
             if (containsBytes(self.baseline_packages.items, installed)) continue;
-            if (isTrustPseudoPackage(installed)) continue;
+            if (isTrustPseudoPackage(installed)) {
+                try self.imported_trust_keys.append(
+                    try self.allocator.dupe(u8, trustKeyIdentity(installed)),
+                );
+                continue;
+            }
             const pin = customize.parseInstalledPackageRecord(installed) orelse
                 return error.InvalidInstalledPackageRecord;
             try self.emitted_lock.append(pin);
@@ -1255,20 +1355,28 @@ const Session = struct {
     fn queryAssociatedLoops(self: *Session) !CommandResult {
         const raw_file = self.raw_file orelse
             return error.RawStageHandleUnavailable;
-        return self.executor.run(
+        const argv = [_][]const u8{
+            findTool(self.io, losetup_candidates).?,
+            "--associated",
+            "/proc/self/fd/0",
+            "--output",
+            "NAME",
+            "--noheadings",
+        };
+        const result = try self.executor.run(
             self.allocator,
             self.io,
-            &.{
-                findTool(self.io, losetup_candidates).?,
-                "--associated",
-                "/proc/self/fd/0",
-                "--output",
-                "NAME",
-                "--noheadings",
-            },
+            &argv,
             true,
             raw_file,
         );
+        // Recorded on every call, including each attempt of the settle poll in
+        // `waitForOnlyPreexistingLoops`. A run that had to ask twenty times
+        // took two seconds to get its loop device back, which is a fact about
+        // that run; collapsing the repeats would record the executor's
+        // patience instead of what happened.
+        try self.recordTool(.host, &argv);
+        return result;
     }
 
     fn snapshotAssociatedLoops(self: *Session) !void {
@@ -1361,7 +1469,22 @@ const Session = struct {
         };
     }
 
+    /// Runs a command on the build machine and records it.
+    ///
+    /// Every host command the worker spawns goes through here, so the tool
+    /// list is complete by construction rather than by remembering to append
+    /// at each of the fourteen call sites. The mounts, the loop attachment and
+    /// its detachment, the device nodes and the final `sync` are the run's
+    /// derived work: which loop device, at which offset, over which length is
+    /// decided while the run executes and is answerable nowhere else.
     fn runSuccess(self: *Session, argv: []const []const u8) !void {
+        try self.runUnrecorded(argv);
+        try self.recordTool(.host, argv);
+    }
+
+    /// The same, for a command whose record its caller appends instead:
+    /// `runChroot` records the guest argv it wrapped, not the `chroot` call.
+    fn runUnrecorded(self: *Session, argv: []const []const u8) !void {
         var result = try self.executor.run(
             self.allocator,
             self.io,
@@ -1588,10 +1711,6 @@ const Session = struct {
                         host_path,
                     ),
                 }
-                self.rpm_version = try self.runChrootCapture(&.{
-                    "/usr/bin/rpm",
-                    "--version",
-                });
                 try self.runChroot(&.{ "/usr/bin/rpm", "--import", guest_path });
                 try Io.Dir.cwd().deleteFile(self.io, host_path);
                 trust_index += 1;
@@ -1605,10 +1724,6 @@ const Session = struct {
         names: []const []const u8,
         repositories: bool,
     ) !void {
-        self.tdnf_version = try self.runChrootCapture(&.{
-            "/usr/bin/tdnf",
-            "--version",
-        });
         var argv = std.array_list.Managed([]const u8).init(self.allocator);
         defer argv.deinit();
         try argv.appendSlice(&.{
@@ -1648,6 +1763,11 @@ const Session = struct {
                 return error.UnsupportedInitramfsGenerator;
             }
         }
+        // Set before discovery, so a run that finds no usable kernel at all
+        // still publishes the entries it passed over on the way to that
+        // answer: under `nothing_to_regenerate` that is a successful run whose
+        // provenance would otherwise say nothing happened.
+        self.initramfs_regenerated = true;
         const kernels = if (regenerate.kernels.len > 0)
             regenerate.kernels
         else
@@ -1666,10 +1786,6 @@ const Session = struct {
             self.allocator.free(kernels);
         };
         for (kernels) |kernel| {
-            self.dracut_version = try self.runChrootCapture(&.{
-                "/usr/bin/dracut",
-                "--version",
-            });
             const output = try std.fmt.allocPrint(
                 self.allocator,
                 "/boot/initramfs-{s}.img",
@@ -1687,17 +1803,49 @@ const Session = struct {
                 kernel,
                 temporary_output,
             });
-            self.cp_version = try self.runChrootCapture(&.{
-                "/usr/bin/cp",
-                "--version",
-            });
             try self.runChroot(&.{
                 "/usr/bin/cp",
                 "--remove-destination",
                 temporary_output,
                 output,
             });
+            try self.recordInitramfsImage(kernel, output);
         }
+    }
+
+    /// Digests the initramfs `dracut` produced, where `cp` left it.
+    ///
+    /// Read from the mounted target rather than from the temporary, because
+    /// what a reader can check is the file the published image carries, and
+    /// the two are only the same file if the copy did what it said.
+    fn recordInitramfsImage(
+        self: *Session,
+        kernel: []const u8,
+        guest_path: []const u8,
+    ) !void {
+        const host_path = try self.guestPath(guest_path);
+        defer self.allocator.free(host_path);
+        const file = try Io.Dir.cwd().openFile(self.io, host_path, .{});
+        defer file.close(self.io);
+        const size = (try file.stat(self.io)).size;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        var offset: u64 = 0;
+        while (offset < size) {
+            const length: usize = @intCast(@min(size - offset, buffer.len));
+            const read = try file.readPositionalAll(self.io, buffer[0..length], offset);
+            if (read != length) return error.ShortInitramfsRead;
+            hash.update(buffer[0..length]);
+            offset += length;
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        try self.initramfs_images.append(.{
+            .kernel_release = try self.allocator.dupe(u8, kernel),
+            .image_path = try self.allocator.dupe(u8, guest_path),
+            .size = size,
+            .sha256 = .{ .bytes = digest },
+        });
     }
 
     /// Kernel releases installed in the target root, sorted.
@@ -1713,6 +1861,17 @@ const Session = struct {
     /// the leftovers of a package that was removed. Copying that rule rather
     /// than inventing one means this and the tool it hands the answer to
     /// cannot disagree about what is installed.
+    fn recordSkippedKernel(
+        self: *Session,
+        name: []const u8,
+        reason: customize.SkippedKernelReason,
+    ) !void {
+        try self.skipped_kernels.append(.{
+            .name = try self.allocator.dupe(u8, name),
+            .reason = reason,
+        });
+    }
+
     fn installedKernels(self: *Session) ![]const []const u8 {
         const modules_path = try std.fs.path.join(
             self.allocator,
@@ -1747,7 +1906,14 @@ const Session = struct {
             // A release string the manifest would have been refused for
             // naming cannot become acceptable by being discovered instead.
             // This also excludes "." and "..".
-            if (!validKernelRelease(entry.name)) continue;
+            // Excluded by the same rule, and not worth reporting as kernels
+            // a run passed over.
+            if (std.mem.eql(u8, entry.name, ".") or
+                std.mem.eql(u8, entry.name, "..")) continue;
+            if (!validKernelRelease(entry.name)) {
+                try self.recordSkippedKernel(entry.name, .invalid_release_name);
+                continue;
+            }
 
             // Deliberately no check on the entry kind: `d_type` is `unknown`
             // on filesystems that do not carry it, and a non-directory cannot
@@ -1759,11 +1925,17 @@ const Session = struct {
                 // reaches the same silent stale initramfs the guarded open
                 // above refuses -- an empty discovered set is accepted as
                 // "nothing is stale" under `nothing_to_regenerate`.
-                error.NotDir, error.FileNotFound => continue,
+                error.NotDir, error.FileNotFound => {
+                    try self.recordSkippedKernel(entry.name, .not_a_module_directory);
+                    continue;
+                },
                 else => return err,
             };
             defer release_dir.close(self.io);
-            if (!try hasDepmodOutput(self.io, release_dir)) continue;
+            if (!try hasDepmodOutput(self.io, release_dir)) {
+                try self.recordSkippedKernel(entry.name, .no_module_dependency_index);
+                continue;
+            }
 
             try releases.append(try self.allocator.dupe(u8, entry.name));
         }
@@ -1892,7 +2064,6 @@ const Session = struct {
             try file.writePositionalAll(self.io, text, 0);
         }
 
-        self.generator_version = try self.runChrootCapture(&.{ generator, "--version" });
         try self.runChroot(&.{ generator, "-o", generated });
 
         // The generator is the target's program, run against the target's
@@ -2027,25 +2198,23 @@ const Session = struct {
         try argv.append(findTool(self.io, chroot_candidates).?);
         try argv.append(self.manifest.root_path);
         try argv.appendSlice(guest_argv);
-        try self.runSuccess(argv.items);
-        const command = try self.allocator.alloc([]const u8, guest_argv.len);
-        for (guest_argv, 0..) |argument, index| {
-            command[index] = try self.allocator.dupe(u8, argument);
-        }
-        try self.tools.append(.{
-            .name = try self.allocator.dupe(
-                u8,
-                std.fs.path.basename(guest_argv[0]),
-            ),
-            .version = try self.allocator.dupe(
-                u8,
-                self.toolVersion(guest_argv[0]),
-            ),
-            .command = command,
-        });
+        // The `chroot` wrapper is not recorded in its own right: the record
+        // this appends says `target_root`, which is what the wrapper means.
+        try self.runUnrecorded(argv.items);
+        try self.recordTool(.target_root, guest_argv);
     }
 
     fn runChrootCapture(
+        self: *Session,
+        guest_argv: []const []const u8,
+    ) ![]const u8 {
+        const captured = try self.captureUnrecorded(guest_argv);
+        errdefer self.allocator.free(captured);
+        try self.recordTool(.target_root, guest_argv);
+        return captured;
+    }
+
+    fn captureUnrecorded(
         self: *Session,
         guest_argv: []const []const u8,
     ) ![]const u8 {
@@ -2073,15 +2242,89 @@ const Session = struct {
         return self.allocator.dupe(u8, std.mem.trim(u8, bytes, " \t\r\n"));
     }
 
-    fn toolVersion(self: *const Session, guest_path: []const u8) []const u8 {
-        if (std.mem.endsWith(u8, guest_path, "/rpm")) return self.rpm_version;
-        if (std.mem.endsWith(u8, guest_path, "/tdnf")) return self.tdnf_version;
-        if (std.mem.endsWith(u8, guest_path, "/dracut")) return self.dracut_version;
-        if (std.mem.endsWith(u8, guest_path, "/cp")) return self.cp_version;
-        if (std.mem.endsWith(u8, guest_path, "-mkconfig")) return self.generator_version;
-        return "";
+    /// Appends the record for a command that has already run.
+    ///
+    /// A version probe is never recorded as a command of its own: it is
+    /// recorded as the `version` of the record it produced. Recording both
+    /// would say the run did more than it did, and the rule terminates,
+    /// because a probe does not probe.
+    fn recordTool(
+        self: *Session,
+        context: customize.ToolContext,
+        argv: []const []const u8,
+    ) !void {
+        const version = switch (context) {
+            .target_root => try self.toolVersion(argv[0]),
+            // Nothing on the host is asked its version: these are the
+            // executor's own plumbing, chosen by `findTool` from a fixed
+            // candidate list, and the path they were chosen at is already the
+            // first element of the recorded argv.
+            .host => null,
+        };
+        const command = try self.allocator.alloc([]const u8, argv.len);
+        errdefer self.allocator.free(command);
+        for (argv, 0..) |argument, index| {
+            command[index] = try self.allocator.dupe(u8, argument);
+        }
+        try self.tools.append(.{
+            .name = try self.allocator.dupe(u8, std.fs.path.basename(argv[0])),
+            .version = version,
+            .command = command,
+            .context = context,
+        });
+    }
+
+    /// The reported version of a program inside the target root, probed once
+    /// and remembered.
+    ///
+    /// Null when the program answered nothing: `setfiles` takes no
+    /// `--version`, and a run has to be able to say so rather than record an
+    /// empty string that reads like a blank version.
+    fn toolVersion(self: *Session, guest_path: []const u8) !?[]const u8 {
+        for (self.tool_versions.items) |probed| {
+            if (std.mem.eql(u8, probed.guest_path, guest_path)) return probed.version;
+        }
+        const version = self.probeToolVersion(guest_path);
+        errdefer if (version) |text| self.allocator.free(text);
+        const owned_path = try self.allocator.dupe(u8, guest_path);
+        errdefer self.allocator.free(owned_path);
+        try self.tool_versions.append(.{
+            .guest_path = owned_path,
+            .version = version,
+        });
+        return version;
+    }
+
+    /// Best-effort, and deliberately not an error: a probe that fails is not a
+    /// run that failed, and a tool that reports no version is still a tool
+    /// that ran.
+    fn probeToolVersion(self: *Session, guest_path: []const u8) ?[]const u8 {
+        const captured = self.captureUnrecorded(&.{ guest_path, "--version" }) catch
+            return null;
+        const first = std.mem.trim(u8, firstLine(captured), " \t\r");
+        if (first.len == 0) {
+            self.allocator.free(captured);
+            return null;
+        }
+        const owned = self.allocator.dupe(u8, first) catch {
+            self.allocator.free(captured);
+            return null;
+        };
+        self.allocator.free(captured);
+        return owned;
     }
 };
+
+/// A program's reported version, remembered against the path it was probed at.
+const ProbedVersion = struct {
+    guest_path: []const u8,
+    version: ?[]const u8,
+};
+
+fn firstLine(text: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    return text[0..end];
+}
 
 /// Whether an `/etc/fstab` mounts anything at `/boot`.
 ///
@@ -2434,6 +2677,12 @@ fn tdnfConfigHostPath(
 /// the ones a package transaction imports on its own, which no caller declared
 /// and no lock could pin -- `(none)` is not an architecture the pin rules
 /// accept, so a lock naming one could never be restated.
+/// The key rpm derived from imported trust, without the constant `(none)`
+/// architecture rpm gives every one of them.
+fn trustKeyIdentity(record: []const u8) []const u8 {
+    return record[0 .. record.len - ".(none)".len];
+}
+
 fn isTrustPseudoPackage(record: []const u8) bool {
     return std.mem.startsWith(u8, record, "gpg-pubkey-") and
         std.mem.endsWith(u8, record, ".(none)");
@@ -3151,10 +3400,18 @@ fn forwardStream(io: Io, reader: *Io.Reader, file: Io.File) void {
     reader.toss(bytes.len);
 }
 
+/// Reads the worker's report and puts the parent's own spawn at the head of
+/// it.
+///
+/// The `unshare` invocation is the only command the parent runs on the execute
+/// path, and it is the one that decides which namespaces everything after it
+/// ran in -- so it belongs first, before the mounts the worker made inside
+/// them. The worker cannot record it, because the worker is its child.
 fn loadParentReport(
     allocator: Allocator,
     io: Io,
     path: []const u8,
+    worker_argv: []const []const u8,
 ) !customize.UnsafeChrootRuntimeReport {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -3171,14 +3428,36 @@ fn loadParentReport(
         bytes,
         .{ .ignore_unknown_fields = false },
     );
+    const tools = try report_allocator.alloc(
+        customize.ToolRecord,
+        parsed.value.tools.len + 1,
+    );
+    const command = try report_allocator.alloc([]const u8, worker_argv.len);
+    for (worker_argv, 0..) |argument, index| {
+        command[index] = try report_allocator.dupe(u8, argument);
+    }
+    tools[0] = .{
+        .name = try report_allocator.dupe(
+            u8,
+            std.fs.path.basename(worker_argv[0]),
+        ),
+        .version = null,
+        .command = command,
+        .context = .host,
+    };
+    @memcpy(tools[1..], parsed.value.tools);
     return .{
         .arena = arena,
-        .tools = parsed.value.tools,
+        .tools = tools,
         .installed_packages = parsed.value.installed_packages,
+        .imported_trust_keys = parsed.value.imported_trust_keys,
         .package_lock = parsed.value.package_lock,
         .hooks = parsed.value.hooks,
         .boot_configuration = parsed.value.boot_configuration,
         .package_cache = parsed.value.package_cache,
+        .selinux_relabel = parsed.value.selinux_relabel,
+        .host_resolver = parsed.value.host_resolver,
+        .initramfs = parsed.value.initramfs,
     };
 }
 
@@ -3514,23 +3793,51 @@ test "worker executes policy with strict reverse cleanup" {
     const result = try executeManifest(allocator, io, manifest, executor);
     try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
     try std.testing.expect(result.cleanup_complete);
-    try std.testing.expectEqual(@as(usize, 5), result.report.tools.len);
+    // Named rather than indexed: the report is every command the run issued,
+    // in run order, so pinning a position would make any new mount a test
+    // failure while saying nothing about what was recorded.
     try std.testing.expectEqualStrings(
         "RPM version 4.18.0",
-        result.report.tools[0].version,
+        (try findToolRecord(result.report.tools, "rpm")).version.?,
     );
     try std.testing.expectEqualStrings(
         "tdnf 3.5.0",
-        result.report.tools[1].version,
+        (try findToolRecord(result.report.tools, "tdnf")).version.?,
     );
     try std.testing.expectEqualStrings(
         "dracut 102",
-        result.report.tools[3].version,
+        (try findToolRecord(result.report.tools, "dracut")).version.?,
     );
     try std.testing.expectEqualStrings(
         "cp (GNU coreutils) 9.4",
-        result.report.tools[4].version,
+        (try findToolRecord(result.report.tools, "cp")).version.?,
     );
+    // The privileged host commands the run performed on its own behalf. None
+    // of these is implied by a package transaction, and before #308 none of
+    // them was recorded at all: the report described what ran inside the
+    // target root and stayed silent about what built the target root.
+    for ([_][]const u8{ "losetup", "mount", "umount", "mknod", "sync" }) |name| {
+        const tool = try findToolRecord(result.report.tools, name);
+        try std.testing.expectEqual(customize.ToolContext.host, tool.context);
+    }
+    // Teardown is inside the published report: the worker writes the report
+    // only after cleanup completes, so the unmounts that released the target
+    // are recorded rather than lost to the write that preceded them.
+    try std.testing.expect(
+        lastToolIndex(result.report.tools, "umount").? >
+            lastToolIndex(result.report.tools, "dracut").?,
+    );
+    // A version probe is never a command of its own. It is recorded as the
+    // version of the command it describes, so `--version` must not appear as
+    // an argv in its own right -- otherwise the report doubles in size and
+    // reads as if the run had asked every tool to do nothing.
+    for (result.report.tools) |tool| {
+        try std.testing.expect(tool.name.len != 0);
+        try std.testing.expect(tool.command.len != 0);
+        for (tool.command) |argument| {
+            try std.testing.expect(!std.mem.eql(u8, argument, "--version"));
+        }
+    }
     try std.testing.expectEqual(
         @as(usize, 2),
         result.report.installed_packages.len,
@@ -3543,6 +3850,34 @@ test "worker executes policy with strict reverse cleanup" {
         "zlib-0:1.3-2.aarch64",
         result.report.installed_packages[1],
     );
+    // The one input a plan cannot carry. `host_resolver` is the default, so
+    // this is the ordinary case: the transaction resolved its repository names
+    // through whatever this machine happens to be pointed at, and the run
+    // recorded nothing about it. Digest and size only -- what the file names
+    // is this machine's DNS topology, which no caller declared and no
+    // published image should carry.
+    if (isRegularFileFollow(io, "/etc/resolv.conf")) {
+        const resolver = result.report.host_resolver orelse
+            return error.TestExpectedHostResolverRecord;
+        const bytes = try Io.Dir.cwd().readFileAlloc(
+            io,
+            "/etc/resolv.conf",
+            allocator,
+            .limited(1 << 20),
+        );
+        var expected: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &expected, .{});
+        try std.testing.expectEqual(@as(u64, bytes.len), resolver.size);
+        try std.testing.expectEqualSlices(u8, &expected, &resolver.sha256.bytes);
+    } else {
+        // A build machine with no resolver of its own lends none, and the
+        // record says so rather than describing a bind that did not happen.
+        try std.testing.expectEqual(
+            @as(?customize.HostResolverRecord, null),
+            result.report.host_resolver,
+        );
+    }
+
     try std.testing.expect(context.saw_rpm_import);
     try std.testing.expect(context.saw_tdnf_install);
     try std.testing.expect(context.saw_tdnf_remove);
@@ -3749,7 +4084,9 @@ test "hooks run where the plan says they run, and stop existing when they are do
         .{
             .name = "final",
             .phase = .finalize,
-            .source = .{ .inline_script = "#!/bin/sh\nexit 0\n" },
+            // A different interpreter from the rest, because the record is a
+            // property of each hook rather than of the run.
+            .source = .{ .inline_script = "#!/usr/bin/env python3\nexit(0)\n" },
         },
     };
     const repositories = [_]customize.PackageRepository{.{
@@ -3838,6 +4175,17 @@ test "hooks run where the plan says they run, and stop existing when they are do
     try std.testing.expectEqual(@as(u8, 0), result.report.hooks[0].exit_code);
     try std.testing.expectEqualStrings("final", result.report.hooks[3].name);
     try std.testing.expectEqual(customize.HookPhase.finalize, result.report.hooks[3].phase);
+
+    // What interpreted each hook. The `chroot` argv names the throwaway path
+    // the script was written to and nothing else, and the script itself is
+    // deleted before the image is sealed -- so without this the published
+    // provenance cannot say whether a hook ran under the shell its author
+    // wrote it for.
+    try std.testing.expectEqualStrings("/bin/sh", result.report.hooks[0].interpreter);
+    try std.testing.expectEqualStrings(
+        "/usr/bin/env python3",
+        result.report.hooks[3].interpreter,
+    );
 
     // Nothing of the hook survives the run.
     const leftover = try joinGuest(allocator, root_path, "/run/zvmi-hook-0");
@@ -3992,6 +4340,9 @@ test "a hook source is read on the host, not from inside the target" {
         &digest,
         &result.report.hooks[0].source_sha256.bytes,
     );
+    // Read from the same host-side bytes as the digest, so a `host_path` hook
+    // records its interpreter on the same terms an inline one does.
+    try std.testing.expectEqualStrings("/bin/sh", result.report.hooks[0].interpreter);
 }
 
 test "the privilege boundary re-checks a hook it is handed" {
@@ -4193,6 +4544,142 @@ test "a credential reaches tdnf without reaching anything that outlives the run"
     try std.testing.expectError(
         error.FileNotFound,
         Io.Dir.cwd().statFile(io, leftover_path, .{ .follow_symlinks = false }),
+    );
+}
+
+test "no credential material reaches anything the run publishes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root_path = "test-unsafe-chroot-sentinel-root";
+    const raw_path = "test-unsafe-chroot-sentinel-stage.raw";
+    const secret_path = "test-unsafe-chroot-sentinel-secret";
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, secret_path) catch {};
+    const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+        .exclusive = true,
+        .read = true,
+    });
+    try raw_file.setLength(io, 8192);
+    const raw_inode = (try raw_file.stat(io)).inode;
+    raw_file.close(io);
+
+    // Distinct per source, so a leak names which channel it came through
+    // rather than leaving both under suspicion.
+    const file_material = "zvmi-sentinel-from-a-file";
+    const variable_material = "zvmi-sentinel-from-a-variable";
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = secret_path,
+        .data = file_material ++ "\n",
+    });
+    var cwd_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_length = try std.process.currentPath(io, &cwd_buffer);
+    const absolute_secret = try std.fs.path.join(
+        allocator,
+        &.{ cwd_buffer[0..cwd_length], secret_path },
+    );
+
+    const repositories = [_]customize.PackageRepository{
+        .{
+            .id = "base",
+            .urls = &.{"https://packages.example.invalid"},
+            .trust = &.{.{ .inline_bytes = "test key" }},
+            .credential = .{ .basic = .{
+                .username = "builder",
+                .password = .{ .host_path = absolute_secret },
+            } },
+        },
+        .{
+            .id = "other",
+            .urls = &.{"https://other.example.invalid"},
+            .trust = &.{.{ .inline_bytes = "test key" }},
+            .credential = .{ .basic = .{
+                .username = "builder",
+                .password = .{ .host_environment = "ZVMI_TEST_SENTINEL" },
+            } },
+        },
+    };
+    const manifest = Manifest{
+        .raw_path = raw_path,
+        .root_path = root_path,
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = raw_inode,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{
+            .actions = &.{.{ .install = &.{"dracut"} }},
+            .repositories = &repositories,
+        },
+        .initramfs = .{ .regenerate = .{
+            .generator = "dracut",
+            .kernels = &.{"6.12.0-test"},
+        } },
+        .selinux = .relabel,
+    };
+
+    const block = [_:null]?[*:0]const u8{
+        "ZVMI_TEST_SENTINEL=" ++ variable_material,
+    };
+    var context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .timeline = .init(allocator),
+        .plant_selinux = .targeted,
+        .plant_trust_key = true,
+    };
+    const result = try executeManifest(allocator, io, manifest, .{
+        .context = &context,
+        .runFn = FakeExecutorContext.run,
+        .environ = .{ .block = .{ .slice = &block } },
+    });
+    try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
+
+    // Not a vacuous absence: both secrets were read and both reached the file
+    // tdnf is pointed at, which is the only place either is supposed to go.
+    // Without this the whole test would pass on a run that never resolved a
+    // credential at all.
+    const from_file = context.repository_at_tdnf orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, from_file, file_material) != null);
+    const from_variable = context.second_repository_at_tdnf orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(
+        std.mem.indexOf(u8, from_variable, variable_material) != null,
+    );
+
+    // The report is the whole of what provenance is built from, and this
+    // backend now records every command it spawns rather than only the ones
+    // that ran inside the target root -- so the surface a secret could reach
+    // grew, and the assertion has to cover it as a document rather than field
+    // by field.
+    var document: Io.Writer.Allocating = .init(allocator);
+    var stringify: std.json.Stringify = .{ .writer = &document.writer };
+    try stringify.write(result.report);
+    for ([_][]const u8{ file_material, variable_material }) |sentinel| {
+        try std.testing.expect(
+            std.mem.indexOf(u8, document.written(), sentinel) == null,
+        );
+        for (result.report.tools) |tool| {
+            for (tool.command) |argument| {
+                try std.testing.expect(
+                    std.mem.indexOf(u8, argument, sentinel) == null,
+                );
+            }
+        }
+    }
+
+    // And the absence above is an absence from something, not from nothing:
+    // this run recorded the commands it spawned, including the ones that
+    // handled the repository file the secrets were written into.
+    try std.testing.expect(result.report.tools.len > 0);
+    try std.testing.expect(
+        std.mem.indexOf(u8, document.written(), "\"tools\"") != null,
     );
 }
 
@@ -4485,6 +4972,89 @@ test "the privilege boundary re-checks a credential it is handed" {
     );
 }
 
+test "the key rpm derived from imported trust is recorded, and never pinned" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root_path = "test-unsafe-chroot-trust-key-root";
+    const raw_path = "test-unsafe-chroot-trust-key-stage.raw";
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+        .exclusive = true,
+        .read = true,
+    });
+    try raw_file.setLength(io, 8192);
+    const raw_inode = (try raw_file.stat(io)).inode;
+    raw_file.close(io);
+
+    const repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    const manifest = Manifest{
+        .raw_path = raw_path,
+        .root_path = root_path,
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = raw_inode,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{
+            .actions = &.{.{ .install = &.{"zlib"} }},
+            .repositories = &repositories,
+        },
+        .initramfs = .unchanged,
+    };
+
+    var context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .timeline = .init(allocator),
+        .plant_trust_key = true,
+    };
+    const result = try executeManifest(allocator, io, manifest, .{
+        .context = &context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
+    try std.testing.expect(context.saw_rpm_import);
+
+    // The `rpm --import` argv names a file on a tmpfs that no longer exists,
+    // and the declared trust is recorded as bytes. Neither says which key rpm
+    // derived from them and then verified every signature against.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        result.report.imported_trust_keys.len,
+    );
+    try std.testing.expectEqualStrings(
+        "gpg-pubkey-3135ce90-5e6d0f1e",
+        result.report.imported_trust_keys[0],
+    );
+
+    // And it is still not a package. `(none)` is not an architecture the pin
+    // rules accept, so an emitted lock carrying one could never be restated by
+    // the run that reads it.
+    for (result.report.package_lock) |pin| {
+        try std.testing.expect(!std.mem.startsWith(u8, pin.name, "gpg-pubkey"));
+    }
+}
+
+fn findSkippedKernel(
+    entries: []const customize.SkippedKernelRelease,
+    name: []const u8,
+) ?customize.SkippedKernelReason {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return entry.reason;
+    }
+    return null;
+}
+
 test "worker regenerates every installed kernel when the policy names none" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -4539,7 +5109,7 @@ test "worker regenerates every installed kernel when the policy names none" {
     try std.testing.expect(result.cleanup_complete);
 
     // The resolved releases are auditable because the recorded command is the
-    // whole argv, so discovery needs no provenance record of its own.
+    // whole argv.
     var regenerated: std.array_list.Managed([]const u8) = .init(allocator);
     for (result.report.tools) |tool| {
         if (!std.mem.eql(u8, tool.name, "dracut")) continue;
@@ -4554,6 +5124,51 @@ test "worker regenerates every installed kernel when the policy names none" {
     try std.testing.expectEqual(@as(usize, 2), regenerated.items.len);
     try std.testing.expectEqualStrings("6.12.0-10.azl", regenerated.items[0]);
     try std.testing.expectEqualStrings("6.12.0-2.azl", regenerated.items[1]);
+
+    // What the argv cannot say is what discovery declined to hand it. Two
+    // `--kver` arguments look the same whether the target had two kernels or
+    // four, and the difference between those is a package transaction that
+    // shipped a stale initramfs and one that did not.
+    const initramfs = result.report.initramfs orelse
+        return error.TestExpectedInitramfsRecord;
+    const skipped = initramfs.skipped_kernel_releases;
+    try std.testing.expectEqual(@as(usize, 2), skipped.len);
+    try std.testing.expectEqual(
+        customize.SkippedKernelReason.no_module_dependency_index,
+        findSkippedKernel(skipped, "firmware").?,
+    );
+    try std.testing.expectEqual(
+        customize.SkippedKernelReason.invalid_release_name,
+        findSkippedKernel(skipped, "6.12.0 spaced").?,
+    );
+
+    // And what came out. The digest is of the file in the mounted target, so
+    // it is checkable against the published image -- which is the only reason
+    // to record it, the bytes having been produced by a tool this run does
+    // not control.
+    try std.testing.expectEqual(@as(usize, 2), initramfs.images.len);
+    // The bytes `cp` left in the target, not the bytes `dracut` wrote to the
+    // temporary: the two are the same file only if the copy did what it said,
+    // and the published image carries the first. A fake that reported a
+    // successful `cp` without writing anything would fail the run here rather
+    // than publish a digest of a file that is not in the image.
+    var expected_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("fake initramfs bytes", &expected_digest, .{});
+    for (initramfs.images) |image| {
+        try std.testing.expectEqual(@as(u64, "fake initramfs bytes".len), image.size);
+        try std.testing.expectEqualSlices(u8, &expected_digest, &image.sha256.bytes);
+        // Named for the release it was built for, and where the `cp` argv put
+        // it.
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            image.image_path,
+            image.kernel_release,
+        ) != null);
+    }
+    try std.testing.expectEqualStrings(
+        "/boot/initramfs-6.12.0-10.azl.img",
+        initramfs.images[0].image_path,
+    );
 
     // Regenerating every initramfs and regenerating none are different
     // outcomes, so a target with no installed kernel fails rather than
@@ -4986,12 +5601,42 @@ const FakeKernel = struct {
     marker_loops: bool = false,
 };
 
+/// The first record for a tool, or a failure naming what was missing.
+///
+/// Tests look records up by name because the report is a run-ordered list of
+/// every command issued, and an index into it is a statement about how many
+/// mounts the run happened to need.
+fn findToolRecord(
+    tools: []const customize.ToolRecord,
+    name: []const u8,
+) !customize.ToolRecord {
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) return tool;
+    }
+    std.debug.print("no provenance record for tool '{s}'\n", .{name});
+    return error.ToolNotRecorded;
+}
+
+/// Where a tool ran for the last time, used to assert ordering between stages
+/// that each run more than once.
+fn lastToolIndex(tools: []const customize.ToolRecord, name: []const u8) ?usize {
+    var found: ?usize = null;
+    for (tools, 0..) |tool, index| {
+        if (std.mem.eql(u8, tool.name, name)) found = index;
+    }
+    return found;
+}
+
 const FakeExecutorContext = struct {
     allocator: Allocator,
     io: Io,
     root_path: []const u8,
     unmounts: std.array_list.Managed([]const u8) = undefined,
     saw_rpm_import: bool = false,
+    /// Whether the target's rpm database gains a trust pseudo-package once
+    /// this run has imported something into it.
+    plant_trust_key: bool = false,
+    inventory_reads: usize = 0,
     saw_tdnf_install: bool = false,
     saw_tdnf_remove: bool = false,
     saw_dracut: bool = false,
@@ -5034,6 +5679,9 @@ const FakeExecutorContext = struct {
     /// unmounts the tmpfs it sat on, so this is the only moment the material a
     /// credential resolved to is observable at all.
     repository_at_tdnf: ?[]const u8 = null,
+    /// A second declared repository's rendered file, for the cases that need
+    /// two credentials resolved from two different sources in one run.
+    second_repository_at_tdnf: ?[]const u8 = null,
     repository_mode_at_tdnf: ?u32 = null,
     modules_at_dracut: ?[]const []const u8 = null,
     file_mode_at_dracut: ?u32 = null,
@@ -5074,6 +5722,7 @@ const FakeExecutorContext = struct {
             .none => return,
             .no_policy_named => "SELINUX=enforcing\n",
             .targeted, .missing_contexts => "SELINUX=enforcing\nSELINUXTYPE=targeted\n",
+            .targeted_permissive => "SELINUX=permissive\nSELINUXTYPE=targeted\n",
         });
         if (layout == .missing_contexts) return;
         try self.writeTargetFile(
@@ -5135,6 +5784,29 @@ const FakeExecutorContext = struct {
         return contents;
     }
 
+    /// What each program answers `--version` with. A program not listed
+    /// answers nothing, which is how a real host behaves for the mount and
+    /// loop utilities and for `setfiles`, none of which take the option, and
+    /// is recorded as no version rather than an empty one.
+    fn fakeVersion(
+        self: *FakeExecutorContext,
+        allocator: Allocator,
+        argv: []const []const u8,
+    ) !CommandResult {
+        _ = self;
+        const table = [_]struct { []const u8, []const u8 }{
+            .{ "/usr/bin/rpm", "RPM version 4.18.0\n" },
+            .{ "/usr/bin/tdnf", "tdnf 3.5.0\n" },
+            .{ "/usr/bin/dracut", "dracut 102\n" },
+            .{ "/usr/bin/cp", "cp (GNU coreutils) 9.4\n" },
+            .{ "/usr/sbin/grub2-mkconfig", "grub2-mkconfig (GRUB) 2.06\n" },
+        };
+        for (table) |entry| {
+            if (containsArg(argv, entry[0])) return fakeResult(allocator, entry[1], 0);
+        }
+        return fakeResult(allocator, "", 0);
+    }
+
     fn run(
         context_ptr: ?*anyopaque,
         allocator: Allocator,
@@ -5157,6 +5829,11 @@ const FakeExecutorContext = struct {
                 }
             }
         }
+        // Version probes are answered before anything is observed, because a
+        // probe is not a stage: a fake that let `setfiles --version` fall
+        // through would record it as the relabel and a test would be asserting
+        // against a command the run never used to label anything.
+        if (containsArg(argv, "--version")) return self.fakeVersion(allocator, argv);
         if (self.plant_selinux) |layout| try self.plantSelinuxTree(layout);
         if (self.plant_in_target) |relative| {
             const path = try std.fs.path.join(
@@ -5292,6 +5969,19 @@ const FakeExecutorContext = struct {
                 }
             }
         }
+        // `cp` produces the file it was told to produce. A fake that reported
+        // success without writing anything would let a run claim to have
+        // published an initramfs that is not in the target root, which is the
+        // one thing the digest recorded for it exists to catch.
+        if (containsArg(argv, "/usr/bin/cp") and argv.len >= 2) {
+            const destination = argv[argv.len - 1];
+            if (std.mem.startsWith(u8, destination, "/")) {
+                self.writeTargetFile(
+                    destination[1..],
+                    "fake initramfs bytes",
+                ) catch {};
+            }
+        }
         if (std.mem.endsWith(u8, argv[0], "umount")) {
             try self.unmounts.append(try self.allocator.dupe(
                 u8,
@@ -5306,22 +5996,20 @@ const FakeExecutorContext = struct {
             self.detached_loop = true;
             self.detached_loops += 1;
         }
-        if (containsArg(argv, "/usr/bin/rpm") and containsArg(argv, "--version")) {
-            return fakeResult(allocator, "RPM version 4.18.0\n", 0);
-        }
-        if (containsArg(argv, "/usr/bin/tdnf") and containsArg(argv, "--version")) {
-            return fakeResult(allocator, "tdnf 3.5.0\n", 0);
-        }
-        if (containsArg(argv, "/usr/bin/dracut") and containsArg(argv, "--version")) {
-            return fakeResult(allocator, "dracut 102\n", 0);
-        }
-        if (containsArg(argv, "/usr/bin/cp") and containsArg(argv, "--version")) {
-            return fakeResult(allocator, "cp (GNU coreutils) 9.4\n", 0);
-        }
         if (containsArg(argv, "/usr/bin/rpm") and containsArg(argv, "-qa")) {
+            self.inventory_reads += 1;
+            // The baseline is read first and before the trust import, so a key
+            // rpm derived during this run is in the second reading and not the
+            // first -- which is exactly what makes it a key this run added
+            // rather than one the input image already carried.
+            const trusted = self.plant_trust_key and self.inventory_reads > 1;
             return fakeResult(
                 allocator,
-                "zlib-0:1.3-2.aarch64\nbash-0:5.2-1.aarch64\n",
+                if (trusted)
+                    "zlib-0:1.3-2.aarch64\nbash-0:5.2-1.aarch64\n" ++
+                        "gpg-pubkey-3135ce90-5e6d0f1e.(none)\n"
+                else
+                    "zlib-0:1.3-2.aarch64\nbash-0:5.2-1.aarch64\n",
                 0,
             );
         }
@@ -5357,6 +6045,8 @@ const FakeExecutorContext = struct {
             self.resolver_at_tdnf = self.readTargetFile("run/zvmi-resolv.conf");
             self.repository_at_tdnf = self.readTargetFile("run/zvmi-repos/base.repo");
             self.repository_mode_at_tdnf = self.modeOf("run/zvmi-repos/base.repo");
+            self.second_repository_at_tdnf =
+                self.readTargetFile("run/zvmi-repos/other.repo");
             self.saw_repository_isolation =
                 containsArg(argv, "/run/zvmi-tdnf.conf") and
                 containsArg(argv, "--disablerepo=*") and
@@ -5412,6 +6102,9 @@ const FakeSelinuxLayout = enum {
     no_policy_named,
     /// A configuration naming a policy whose file-contexts file is absent.
     missing_contexts,
+    /// A relabelled target that will nonetheless not enforce what the labels
+    /// say at boot. The relabel is identical; the resulting image is not.
+    targeted_permissive,
 };
 
 fn fakeResult(
@@ -5522,6 +6215,111 @@ test "a relabel runs last, with the policy the target names" {
     const timeline = context.timeline.items;
     try std.testing.expectEqualStrings("setfiles", timeline[timeline.len - 1]);
     try std.testing.expectEqualStrings("/run/zvmi-hook-0", timeline[timeline.len - 2]);
+
+    // `setfiles` takes no `--version`, so its record carries none. The fixed
+    // table this replaced had no entry for it either, but answered with an
+    // empty string, which published as a tool whose version was blank rather
+    // than a tool that was never able to give one.
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        (try findToolRecord(result.report.tools, "setfiles")).version,
+    );
+
+    // What the argv cannot say. The policy name is in there, but only as a
+    // path component of a file the run chose to pass -- indistinguishable, to
+    // a reader, from a policy the request named. The record says it was read
+    // out of the target. The mode is not in the argv at all: `setfiles` does
+    // the same work whatever `/etc/selinux/config` says it should enforce, so
+    // an image relabelled under `permissive` and one relabelled under
+    // `enforcing` produce identical commands and boot differently.
+    const relabel = result.report.selinux_relabel orelse
+        return error.TestExpectedRelabelRecord;
+    try std.testing.expectEqualStrings("targeted", relabel.discovered_policy);
+    try std.testing.expectEqual(
+        @as(?customize.SelinuxMode, .enforcing),
+        relabel.target_mode,
+    );
+    // The policy in the record is the policy in the command, not a second
+    // reading that could disagree with it.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        argv[argv.len - 2],
+        relabel.discovered_policy,
+    ) != null);
+}
+
+test "a relabel records the mode the target will boot under" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root_path = "test-unsafe-chroot-permissive-root";
+    const raw_path = "test-unsafe-chroot-permissive-stage.raw";
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+        .exclusive = true,
+        .read = true,
+    });
+    try raw_file.setLength(io, 8192);
+    const raw_inode = (try raw_file.stat(io)).inode;
+    raw_file.close(io);
+
+    const repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    const manifest = Manifest{
+        .raw_path = raw_path,
+        .root_path = root_path,
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = raw_inode,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{
+            .actions = &.{.{ .install = &.{"dracut"} }},
+            .repositories = &repositories,
+            // Declared, so this run inherits nothing from the build machine.
+            .resolver = .{ .nameservers = &.{"192.0.2.1"} },
+        },
+        .initramfs = .unchanged,
+        .selinux = .relabel,
+    };
+
+    var context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .timeline = .init(allocator),
+        .plant_selinux = .targeted_permissive,
+    };
+    const result = try executeManifest(allocator, io, manifest, .{
+        .context = &context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
+
+    // The same relabel, the same argv, a different image. Nothing else in the
+    // provenance distinguishes the two runs.
+    const relabel = result.report.selinux_relabel orelse
+        return error.TestExpectedRelabelRecord;
+    try std.testing.expectEqual(
+        @as(?customize.SelinuxMode, .permissive),
+        relabel.target_mode,
+    );
+    try std.testing.expectEqualStrings("targeted", relabel.discovered_policy);
+
+    // Nothing was inherited, so nothing is recorded. Absent means the plan
+    // already carries the answer -- it names the nameservers -- rather than
+    // that the question went unasked.
+    try std.testing.expectEqual(
+        @as(?customize.HostResolverRecord, null),
+        result.report.host_resolver,
+    );
 }
 
 test "a relabel a target cannot satisfy fails the run rather than skipping it" {
