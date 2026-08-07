@@ -29,6 +29,95 @@ selection follows CMS `SignerInfo`; extraction does not verify the signature
 or establish trust, so callers must independently pin the image and/or
 expected fingerprint.
 
+## Sign UKIs while the image is built
+
+`boot_security.signing` asks a `native_fresh` build to have every UKI it
+generates Authenticode-signed before it is written to the ESP. It is what
+turns the certificate the section above reads into something the build
+produced rather than something a later pass attached:
+
+```zig
+request.boot_security = .{
+    .boot_mode = .uki_only,
+    .signing = .{
+        .certificate = .{ .host_path = "/etc/pki/uki-signing.pem" },
+        .provider = .{ .external_command = .{
+            .executable_path = "/usr/local/bin/zvmi",
+            .argument = "sign",
+        } },
+    },
+};
+```
+
+**The key is not in the request, and there is no field it could go in.** The
+provider is a command the caller already trusts, and signing happens by
+running it: zvmi writes the unsigned UKI and the certificate into a private
+`0700` scratch directory, sets `ZVMI_UKI_UNSIGNED`, `ZVMI_UKI_SIGNED`,
+`ZVMI_UKI_CERTIFICATE`, `ZVMI_UKI_UNSIGNED_SHA256`,
+`ZVMI_UKI_CERTIFICATE_SHA256`, `ZVMI_UKI_ARCHITECTURE` and
+`ZVMI_UKI_SIGNING_METADATA`, and reads back the file the provider wrote. That
+is the same protocol `zvmi sign` already implements against Azure Artifact
+Signing, where the private key never leaves the service. Neither the
+provider's stdout nor its stderr is forwarded, since a build log is the least
+controlled output a run has and a signing service's output is the one place a
+token could appear; the single exception is a `zvmi sign: failed: <Name>`
+line, whose bare error name is repeated so an operator is told what the
+service objected to. The provider is given the build process's whole
+environment, unlike a hook, which gets a fixed one containing nothing from the
+build machine -- the difference is that a hook is target code and a provider
+is the caller's own command whose entire job is to reach a service using the
+credentials of the machine that started the build.
+
+Because the certificate is public, it is declared rather than injected: it is
+a `TrustSource`, not a `CredentialSource`, and it is hashed by value into the
+plan hash along with the provider's path and argument. Two builds that signed
+with different certificates are different builds and must not share a cache
+entry. PEM and DER are both accepted and normalized to both.
+
+**What comes back is checked, and the checks are the point.** zvmi re-derives
+the Authenticode digest of the returned image and compares it with the digest
+the embedded signature commits to, compares that with the digest of the bytes
+it sent, compares every section, and compares the signer certificate in the
+CMS with the declared one. A provider that returned its input unchanged, that
+signed a stale file, that rewrote a section, or that signed with some other
+certificate is caught by name -- `UnsignedResult`,
+`SignatureCoversOtherBytes`, `SignedImageChanged`, `SignerCertificateMismatch`
+-- rather than producing an image that only fails at boot. What is **not**
+checked is equally deliberate: the RSA signature is not verified and no
+certificate chain is built, because zvmi is not the trust root here. The
+firmware's enrolled keys are, and re-implementing that decision badly would be
+worse than not making it.
+
+Signing runs inside the plan rather than after it. `Action.sign_uki` appears
+in `Phase.uki` immediately after `generate_uki`; the provider is a
+`uki_signing_provider` capability that preflight probes for an executable file
+at the declared path, and a `host_path` certificate additionally requires
+`read_trust_source`. One signing operation covers both destinations of a
+`uki_only` image -- the named `EFI/Linux/*.efi` and the `EFI/BOOT/BOOT*.EFI`
+fallback are the same bytes, and two records for one signature would read as
+two signing operations. Because the signed bytes exist before the ESP is
+written, the ESP capacity check sees the real sizes. `provenance.execution.uki_signatures`
+records, per signature, every ESP path it landed at, the unsigned and signed
+digests, the size, the digest the signature commits to, the certificate
+fingerprint, the signer's DER subject, issuer and serial, and whatever
+non-secret identity the provider reported about the service it used.
+
+**Reproducibility is claimed on the unsigned bytes only.** An arbitrary
+provider need not be byte-stable -- a timestamp or a fresh nonce in the CMS is
+ordinary -- so a run that signs states its reproducibility for what zvmi
+generated, not for what the provider returned.
+
+The refusals are named at validation, before anything runs: signing on a
+preserved backend (`native_edit`, `rebuild`, `unsafe_chroot`, `vm`) is
+refused, because only `native_fresh` generates UKIs -- everything else carries
+forward UKIs someone else signed, and re-signing them would require editing a
+`.cmdline` section that the existing signature covers; `boot_mode = .bls_only`
+is refused, because there would be nothing to sign; and an executable path
+that is empty or relative, or a certificate with no bytes, is refused rather
+than resolved against whatever directory the build happened to start in.
+See [UKI signing certificates](uki-certificate.md) for reading back what a
+finished image was signed with.
+
 ## Use from another `build.zig`
 
 Declare zvmi as a package dependency named `zvmi`, then import its build helper and use the returned `LazyPath` like any other generated file:
@@ -177,7 +266,7 @@ The disk, every transitive qcow2 backing or external-data file, the generated op
 
 The text is held to a stricter rule on this backend than on the preserved-image ones, and this is the reason it is not merely the same feature with a different writer: `/etc/default/grub` is *sourced by the shell* that runs the generator as root inside the target, so `"`, `'`, `` ` ``, `$` and `\` -- awkward but inert in a GRUB entry -- are a command-injection vector here. All five are refused with `invalid_policy`, at request validation and again by the worker on the far side of the privilege boundary. The layout refusals are named too, and each says what the image is rather than only that something failed: `/etc/fstab` declaring a separate `/boot` is `SeparateBootFilesystem`, since this backend mounts the selected root partition and nothing else, so the generator would find an empty stub, produce a configuration with no entries and write it where nothing reads it; a target carrying `/etc/kernel/cmdline` and no grub generator is `UnsupportedBootloaderGenerator`, because `kernel-install` regenerates per kernel version and image path, which this backend does not yet model; no generator at all is `MissingBootloaderGenerator`; no `/boot/grub2/grub.cfg` or `/boot/grub/grub.cfg` to regenerate is `MissingBootloaderConfiguration`; a missing `/etc/default/grub` is `MissingBootloaderDefaults`, one without the variable is `MissingCommandLineVariable`, since planting the assignment would be guessing at a bootloader the image does not use, and one whose value is unquoted or opens a quote nothing closes is `UnquotedCommandLineValue` or `UnterminatedQuotedValue`. The generator is the target's program run against the target's scripts, so nothing before it can promise what came out: the regenerated file is read back and `KernelOptionsNotApplied` fails the run if no entry carries the options -- which is what catches a root with no kernel installed, or distro scripts that ignore the variable. The check looks for the options as a whole-word run anywhere in an entry's command line rather than at its end, because `/etc/grub.d/10_linux` composes the normal entries as `${GRUB_CMDLINE_LINUX} ${GRUB_CMDLINE_LINUX_DEFAULT}`, so on an image that sets the second variable the edit lands mid-line and a suffix test would fail a run that had done exactly what it was asked.
 
-The refusals are named before anything is written. `vm` rejects kernel options outright with `unsupported_execution_backend`: it neither reaches the ESP nor runs the target's tooling in a way this model describes, and a backend that silently did nothing would be worse than one that says so. Preflight probes the source image for the `kernel_option_change` capability -- no GPT, no ESP, or no recognized boot entry reports the capability missing rather than failing mid-run. A Unified Kernel Image is refused by name: its command line lives in a `.cmdline` PE section that may be covered by a Secure Boot signature, so editing it in place would produce an image that either ignores the change or no longer authenticates. Identifiers embedded in `core.img`, a `grubenv` or a signed EFI binary are out of scope for the same reason they are for the identity rewrite. The other boot-policy fields still raise `boot_policy_mutation` on a preserved image.
+The refusals are named before anything is written. `vm` rejects kernel options outright with `unsupported_execution_backend`: it neither reaches the ESP nor runs the target's tooling in a way this model describes, and a backend that silently did nothing would be worse than one that says so. Preflight probes the source image for the `kernel_option_change` capability -- no GPT, no ESP, or no recognized boot entry reports the capability missing rather than failing mid-run. A Unified Kernel Image is refused by name: its command line lives in a `.cmdline` PE section that may be covered by a Secure Boot signature, so editing it in place would produce an image that either ignores the change or no longer authenticates. Identifiers embedded in `core.img`, a `grubenv` or a signed EFI binary are out of scope for the same reason they are for the identity rewrite. The other boot-policy fields still raise `boot_policy_mutation` on a preserved image. `boot_security.signing` is refused on every preserved backend for a related but distinct reason: it is not a change these backends decline to make, it is a change there is nothing to make it to. Signing applies to a UKI as it is generated, and a preserved image's UKIs were generated and signed by whoever built it -- a run that re-signed them would first have to rewrite the `.cmdline` section the existing signature covers, which is the same refusal `extra_kernel_options` already carries.
 
 Select `.backend = .unsafe_chroot` with `.acknowledge_unsafe = true` to use the first privileged preserved-image executor. It is Linux-only, requires effective root plus `CAP_SYS_CHROOT`, `CAP_SYS_ADMIN`, and `CAP_MKNOD`, and supports only same-architecture execution against an explicitly selected Linux ext4 partition. The current slice accepts online unlocked package install, remove, and update actions through `/usr/bin/tdnf`, literal repository IDs with explicit trust material, and dracut regeneration with `--no-hostonly`; naming no kernel release regenerates every release installed in the target root, discovered after the package actions have run rather than declared in advance, which is what lets an `update_all` that installs a new kernel be paired with regenerating that kernel's initramfs -- a release string the caller could not have known when writing the plan; a run that discovers none fails with `NoInstalledKernels` rather than reporting a completed policy, and the releases it resolved are auditable because provenance records the full `dracut --kver` argv; `update_all` is the one action that names no packages, since its subject is whatever the declared repositories hold when it runs, and every other action must name at least one; dracut builds the replacement on the executor's private `/run` tmpfs before copying it over the existing guest initramfs, avoiding transient or duplicate persistent-space requirements. `initramfs = .when_needed` asks the build to work out whether the initramfs is stale instead of stating the answer: it resolves to `regenerate` naming no kernel release when the request declares any package action, and to `unchanged` otherwise. The decision is made while the plan is resolved rather than while it runs, so the plan states the outcome, the plan hash covers it, provenance records it, and a `when_needed` request produces the byte-identical plan its explicit equivalent would -- it is a way of not having to know the rule, not a different instruction. Package actions are the whole rule because an initramfs is a snapshot of a subset of the root filesystem, so a package shipping a kernel module, a udev rule or one of the binaries dracut copies in leaves the existing image describing a root that no longer exists. Kernel-module configuration is deliberately **not** a trigger: zvmi runs dracut `--no-hostonly`, under which dracut reads and installs the target's own `/etc/modules-load.d` and `/etc/modprobe.d` only when `hostonly` is set, so that configuration never reaches the initramfs and regenerating for it would spend minutes producing an identical image while asserting a causal link that does not exist. It takes effect when the real root boots. A derived regeneration is not merely the explicit one with the answer filled in: `regenerate.no_installed_kernels` defaults to `fail`, because an explicit instruction to regenerate every installed kernel that finds none has not done what it said, but the derived form states `nothing_to_regenerate`, because nothing asked for a regeneration and a root carrying no kernel has no stale initramfs. Without that distinction `when_needed` would fail builds that the identical request completes with `unchanged` -- and it would fail them late, after the workspace copy and the package transaction, since only the run can see the target's kernel inventory. It also applies the declared kernel-module configuration -- `os.kernel_modules` -- which is the one part of the OS customization model these executors carry out, because its destinations are a closed named set (`etc/modules-load.d/zvmi.conf`, `etc/modprobe.d/zvmi-blacklist.conf`, `etc/modprobe.d/zvmi-options.conf`) rather than anywhere in the tree, so it needs none of the general file creation the rest of that model does. The same request renders the same bytes at the same paths whichever backend carries it out, and the files are written after the package actions -- so a package shipping its own modprobe configuration cannot land on top of the declared one -- and before the initramfs, so a generator reading the configuration sees the declared state. Requesting nothing writes nothing rather than planting empty files. It rejects snapshot policies, package paths/URLs/RPM files, existing-path operations and the rest of OS customization, generalization, SELinux mode and policy changes, the boot-policy changes other than `extra_kernel_options`, and cross-architecture runners before workspace mutation. An unlocked update resolves against whatever the declared repositories hold when it runs, so two executions of one plan can produce different versions; the plan identifier covers the instruction, not the outcome. `.packages.lock = .{ .exact = ... }` is what turns that into predictability before the fact, and both executing backends carry it out.
 

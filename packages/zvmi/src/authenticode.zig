@@ -5,6 +5,12 @@
 //! This module deliberately contains no private-key operation: callers send
 //! `PreparedRsaSha256.signing_digest` to their signing provider and supply
 //! the resulting PKCS#1 v1.5 RSA signature to `finishRsaSha256Alloc`.
+//!
+//! It reads signatures as well as writing them, and the reading side is held
+//! to the same line: `embeddedSigner`, `imageSha256` and `embeddedImageSha256`
+//! say what a signature is over and who it names, never whether it is to be
+//! believed. Verifying the signature itself, or a certificate chain, is a
+//! trust decision and is somebody else's.
 
 const std = @import("std");
 
@@ -39,7 +45,12 @@ const Error = error{
     InvalidCertificate,
     InvalidCertificatePem,
     InvalidSignatureLength,
+    UnsupportedSignatureDigestAlgorithm,
+    TrailingDataAfterCertificateTable,
 };
+
+/// A SHA-256 digest, the only image digest this module produces or reads.
+pub const Digest = [Sha256.digest_length]u8;
 
 const Pe = struct {
     machine: u16,
@@ -173,52 +184,187 @@ pub fn validateX509CertificateDer(certificate_der: []const u8) !void {
 /// `SignerInfo`. This validates structure and identity binding, not the
 /// cryptographic signature or certificate chain.
 pub fn embeddedSigner(pe_bytes: []const u8) !EmbeddedSigner {
+    const table = try authenticodeCms(pe_bytes);
+    return parseAuthenticodeCms(table.machine, table.cms);
+}
+
+/// The SHA-256 an Authenticode signature covers, computed from the image
+/// itself. The PE checksum, the security data directory entry and the
+/// certificate table are excluded, which is what makes a signed image's digest
+/// equal to that of the unsigned image it was made from.
+pub fn imageSha256(pe_bytes: []const u8) Error!Digest {
     const pe = try parsePe(pe_bytes);
-    if (pe.certificate_offset == 0 and pe.certificate_size == 0)
-        return error.UnsignedPe;
+    const end = if (pe.certificate_offset == 0 and pe.certificate_size == 0)
+        pe_bytes.len
+    else blk: {
+        const table = try certificateTableRange(pe_bytes, pe);
+        // The table is the last thing in the file. Anything after it would be
+        // outside both the signature and the loader's view of the image, so it
+        // is refused rather than hashed on a guess about which side it is on.
+        if (table.end != pe_bytes.len) return error.TrailingDataAfterCertificateTable;
+        break :blk table.start;
+    };
+    var digest: Digest = undefined;
+    var hash = Sha256.init(.{});
+    hash.update(pe_bytes[0..pe.checksum_offset]);
+    hash.update(pe_bytes[pe.checksum_offset + 4 .. pe.security_directory_offset]);
+    hash.update(pe_bytes[pe.security_directory_offset + 8 .. end]);
+    hash.final(&digest);
+    return digest;
+}
+
+/// The image digest an existing signature claims to cover, read out of the
+/// CMS `SpcIndirectDataContent` rather than recomputed. Comparing it with
+/// `imageSha256` is what separates "a signature is attached" from "the
+/// signature commits to these bytes"; it is still not a trust decision, since
+/// no signature, key or certificate chain is verified.
+pub fn embeddedImageSha256(pe_bytes: []const u8) Error!Digest {
+    const table = try authenticodeCms(pe_bytes);
+    const body = table.cms;
+    const spc = try spcIndirectDataContent(body);
+    // SpcIndirectDataContent ::= SEQUENCE { data ANY, messageDigest DigestInfo }
+    const data = try parseDerElement(body, spc.content_start);
+    const digest_info = try parseDerElement(body, data.end);
+    if (digest_info.tag != 0x30 or digest_info.end != spc.end) return error.InvalidDer;
+    const algorithm = try parseDerElement(body, digest_info.content_start);
+    if (algorithm.tag != 0x30) return error.InvalidDer;
+    const algorithm_oid = try parseDerElement(body, algorithm.content_start);
+    if (algorithm_oid.tag != 0x06) return error.InvalidDer;
+    if (!std.mem.eql(u8, body[algorithm_oid.start..algorithm_oid.end], oid_sha256))
+        return error.UnsupportedSignatureDigestAlgorithm;
+    const digest_value = try parseDerElement(body, algorithm.end);
+    if (digest_value.tag != 0x04 or digest_value.end != digest_info.end)
+        return error.InvalidDer;
+    const bytes = body[digest_value.content_start..digest_value.end];
+    if (bytes.len != Sha256.digest_length) return error.UnsupportedSignatureDigestAlgorithm;
+    var digest: Digest = undefined;
+    @memcpy(&digest, bytes);
+    return digest;
+}
+
+const CertificateTableRange = struct {
+    start: usize,
+    end: usize,
+};
+
+fn certificateTableRange(pe_bytes: []const u8, pe: Pe) Error!CertificateTableRange {
     if (pe.certificate_offset == 0 or pe.certificate_size == 0 or
         pe.certificate_offset % 8 != 0)
     {
         return error.InvalidWinCertificate;
     }
-    const table_end = std.math.add(
+    if (pe.certificate_offset < pe.security_directory_offset + 8)
+        return error.InvalidWinCertificate;
+    const end = std.math.add(
         usize,
         pe.certificate_offset,
         pe.certificate_size,
     ) catch return error.InvalidWinCertificate;
-    if (table_end > pe_bytes.len) return error.InvalidWinCertificate;
+    if (end > pe_bytes.len) return error.InvalidWinCertificate;
+    return .{ .start = pe.certificate_offset, .end = end };
+}
 
-    var result: ?EmbeddedSigner = null;
-    var offset = pe.certificate_offset;
-    while (offset < table_end) {
+const AuthenticodeCms = struct {
+    machine: u16,
+    cms: []const u8,
+};
+
+/// The single WIN_CERTIFICATE entry's CMS body. More than one Authenticode
+/// signature, or an entry of any other type, is refused rather than picked
+/// between.
+fn authenticodeCms(pe_bytes: []const u8) Error!AuthenticodeCms {
+    const pe = try parsePe(pe_bytes);
+    if (pe.certificate_offset == 0 and pe.certificate_size == 0)
+        return error.UnsignedPe;
+    const table = try certificateTableRange(pe_bytes, pe);
+
+    var result: ?[]const u8 = null;
+    var offset = table.start;
+    while (offset < table.end) {
         const header_end = std.math.add(usize, offset, 8) catch
             return error.InvalidWinCertificate;
-        if (header_end > table_end) return error.InvalidWinCertificate;
+        if (header_end > table.end) return error.InvalidWinCertificate;
         const entry_length = @as(usize, readU32Le(pe_bytes[offset..][0..4]));
         if (entry_length < 8) return error.InvalidWinCertificate;
         const entry_end = std.math.add(usize, offset, entry_length) catch
             return error.InvalidWinCertificate;
-        if (entry_end > table_end) return error.InvalidWinCertificate;
+        if (entry_end > table.end) return error.InvalidWinCertificate;
         if (readU16Le(pe_bytes[offset + 4 ..][0..2]) != 0x0200 or
             readU16Le(pe_bytes[offset + 6 ..][0..2]) != 0x0002)
         {
             return error.UnsupportedWinCertificate;
         }
         if (result != null) return error.MultipleAuthenticodeSignatures;
-        result = try parseAuthenticodeCms(
-            pe.machine,
-            pe_bytes[offset + 8 .. entry_end],
-        );
+        result = pe_bytes[offset + 8 .. entry_end];
 
         const next = align8(entry_end) catch return error.InvalidWinCertificate;
-        if (next > table_end) return error.InvalidWinCertificate;
+        if (next > table.end) return error.InvalidWinCertificate;
         for (pe_bytes[entry_end..next]) |padding| {
             if (padding != 0) return error.InvalidWinCertificate;
         }
         offset = next;
     }
-    if (offset != table_end) return error.InvalidWinCertificate;
-    return result orelse error.UnsignedPe;
+    if (offset != table.end) return error.InvalidWinCertificate;
+    return .{
+        .machine = pe.machine,
+        .cms = result orelse return error.UnsignedPe,
+    };
+}
+
+/// Navigates a CMS `SignedData` to its encapsulated
+/// `SpcIndirectDataContent`, which is where an Authenticode signature states
+/// what it covers.
+fn spcIndirectDataContent(body: []const u8) Error!DerElement {
+    const content_info = try parseDerElement(body, 0);
+    if (content_info.tag != 0x30 or content_info.end != body.len)
+        return error.InvalidDer;
+    try validateDerTree(body, content_info, 0);
+
+    var index = content_info.content_start;
+    const content_type = try parseDerElement(body, index);
+    if (content_type.tag != 0x06 or
+        !std.mem.eql(u8, body[content_type.start..content_type.end], oid_signed_data))
+    {
+        return error.InvalidDer;
+    }
+    index = content_type.end;
+    const signed_data_explicit = try parseDerElement(body, index);
+    if (signed_data_explicit.tag != 0xa0 or
+        signed_data_explicit.end != content_info.end)
+    {
+        return error.InvalidDer;
+    }
+    const signed_data = try parseDerElement(body, signed_data_explicit.content_start);
+    if (signed_data.tag != 0x30 or signed_data.end != signed_data_explicit.end)
+        return error.InvalidDer;
+
+    index = signed_data.content_start;
+    const version = try parseDerElement(body, index);
+    if (version.tag != 0x02) return error.InvalidDer;
+    index = version.end;
+    const digest_algorithms = try parseDerElement(body, index);
+    if (digest_algorithms.tag != 0x31) return error.InvalidDer;
+    index = digest_algorithms.end;
+    const encap_content_info = try parseDerElement(body, index);
+    if (encap_content_info.tag != 0x30) return error.InvalidDer;
+
+    const encap_index = encap_content_info.content_start;
+    const encap_content_type = try parseDerElement(body, encap_index);
+    if (encap_content_type.tag != 0x06 or
+        !std.mem.eql(
+            u8,
+            body[encap_content_type.start..encap_content_type.end],
+            oid_spc_indirect_data,
+        ))
+    {
+        return error.InvalidDer;
+    }
+    const explicit = try parseDerElement(body, encap_content_type.end);
+    if (explicit.tag != 0xa0 or explicit.end != encap_content_info.end)
+        return error.InvalidDer;
+    const spc = try parseDerElement(body, explicit.content_start);
+    if (spc.tag != 0x30 or spc.end != explicit.end) return error.InvalidDer;
+    return spc;
 }
 
 pub fn decodePemCertificateAlloc(
@@ -1554,10 +1700,86 @@ test "alignment padding contributes to PE digest" {
     try std.testing.expect(!std.mem.eql(u8, &original, &changed));
 }
 
+test "a signature commits to the image it was made from" {
+    const allocator = std.testing.allocator;
+    const image = try makeTestPe(allocator, 393);
+    defer allocator.free(image);
+    var prepared = try prepareRsaSha256Alloc(allocator, image);
+    defer prepared.deinit(allocator);
+    const signature = [_]u8{0} ** 256;
+    const signed = try finishRsaSha256Alloc(
+        allocator,
+        prepared,
+        testCertificate(),
+        &signature,
+    );
+    defer allocator.free(signed);
+
+    // The image digest survives signing: attaching a certificate table does
+    // not change what the signature is over, which is the whole reason a
+    // signed image can be checked against the unsigned bytes it came from.
+    const unsigned_digest = try imageSha256(prepared.aligned_pe);
+    const signed_digest = try imageSha256(signed);
+    try std.testing.expectEqualSlices(u8, &unsigned_digest, &signed_digest);
+    const claimed = try embeddedImageSha256(signed);
+    try std.testing.expectEqualSlices(u8, &unsigned_digest, &claimed);
+}
+
+test "a signature over other bytes is not mistaken for one over these" {
+    const allocator = std.testing.allocator;
+    const image = try makeTestPe(allocator, 512);
+    defer allocator.free(image);
+    var prepared = try prepareRsaSha256Alloc(allocator, image);
+    defer prepared.deinit(allocator);
+    const signature = [_]u8{0} ** 256;
+    const signed = try finishRsaSha256Alloc(
+        allocator,
+        prepared,
+        testCertificate(),
+        &signature,
+    );
+    defer allocator.free(signed);
+
+    // A byte of payload changed after signing. The signature is still
+    // structurally intact and still names the same signer; only the digest
+    // comparison notices, which is why the comparison exists.
+    const table_offset = prepared.aligned_pe.len;
+    signed[table_offset - 1] = 1;
+    const recomputed = try imageSha256(signed);
+    const claimed = try embeddedImageSha256(signed);
+    try std.testing.expect(!std.mem.eql(u8, &recomputed, &claimed));
+    _ = try embeddedSigner(signed);
+}
+
+test "image digest rejects an unsigned image with trailing bytes it cannot place" {
+    const allocator = std.testing.allocator;
+    const image = try makeTestPe(allocator, 512);
+    defer allocator.free(image);
+    var prepared = try prepareRsaSha256Alloc(allocator, image);
+    defer prepared.deinit(allocator);
+    const signature = [_]u8{0} ** 256;
+    const signed = try finishRsaSha256Alloc(
+        allocator,
+        prepared,
+        testCertificate(),
+        &signature,
+    );
+    defer allocator.free(signed);
+
+    const extended = try allocator.alloc(u8, signed.len + 8);
+    defer allocator.free(extended);
+    @memcpy(extended[0..signed.len], signed);
+    @memset(extended[signed.len..], 0);
+    try std.testing.expectError(
+        error.TrailingDataAfterCertificateTable,
+        imageSha256(extended),
+    );
+    try std.testing.expectError(error.UnsignedPe, embeddedImageSha256(image));
+}
+
 fn testCertificate() []const u8 {
     return testCertificateSerial(1);
 }
-
 fn testCertificateTwo() []const u8 {
     return "\x30\x81\x93\x30\x7e\xa0\x03\x02\x01\x02\x02\x01\x02" ++
         "\x30\x0d\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b\x05\x00" ++

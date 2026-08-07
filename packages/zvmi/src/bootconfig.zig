@@ -17,6 +17,7 @@ const Image = @import("image.zig").Image;
 const mbr = @import("mbr.zig");
 const gpt = @import("gpt.zig");
 const uki = @import("uki.zig");
+const uki_signing = @import("uki_signing.zig");
 const verity = @import("verity.zig");
 
 pub const SourceTreeView = ext4.FileTreeView;
@@ -74,6 +75,9 @@ pub const PopulateStage = enum {
     prepare,
     bootloader,
     uki,
+    /// Reached once, before the first generated UKI is handed to the signer.
+    /// A run without `uki_signer` never reaches it.
+    sign_uki,
 };
 
 pub const PopulateStageSink = struct {
@@ -138,6 +142,16 @@ pub const PopulateOptions = struct {
     uki: UkiOptions = .{},
     grub_timeout_seconds: u32 = 1,
     stage_sink: ?PopulateStageSink = null,
+    /// Optional Authenticode signing step applied to every generated UKI
+    /// before it reaches the ESP.
+    ///
+    /// Injected as a function rather than a concrete signer so this module
+    /// keeps building PE images without gaining the ability to run host
+    /// commands, and so the wiring is provable without a signing service.
+    /// Signing here rather than over a finished image is what lets the ESP
+    /// capacity check, the reported sizes, and the published digests all
+    /// describe the bytes that actually boot.
+    uki_signer: ?uki_signing.Signer = null,
 };
 
 pub const PopulateReport = struct {
@@ -171,7 +185,8 @@ pub const PopulateReport = struct {
 };
 
 pub const PopulateError = std.mem.Allocator.Error || fat32.MutationError ||
-    SourceTreeView.IteratorError || SourceTreeView.ContentError || uki.GenerateError || error{
+    SourceTreeView.IteratorError || SourceTreeView.ContentError || uki.GenerateError ||
+    uki_signing.Error || error{
     AmbiguousArchitecture,
     AmbiguousRootPartition,
     FileTooLarge,
@@ -1430,6 +1445,11 @@ fn generateUkis(
     defer if (splash_bytes) |bytes| allocator.free(bytes);
 
     const output_directory = effectiveUkiOutputDirectory(options.uki.output_directory);
+    if (options.uki_signer != null) {
+        if (options.stage_sink) |sink| {
+            if (!sink.advance(.sign_uki)) return error.InvalidOperationOrder;
+        }
+    }
     for (entries, 0..) |entry, index| {
         const kernel_bytes = try readSourceFileAlloc(allocator, entry.kernel.content, entry.kernel.size);
         defer allocator.free(kernel_bytes);
@@ -1454,10 +1474,32 @@ fn generateUkis(
 
         const destination_path = try std.fmt.allocPrint(allocator, "{s}/{s}.efi", .{ output_directory, entry.id });
         defer allocator.free(destination_path);
-        try writeGeneratedFile(io, esp, destination_path, uki_bytes);
 
+        // The `uki_only` fallback is the same bytes at a second path, not a
+        // second artifact. Naming both destinations up front means one
+        // signing operation covers both, so the two copies cannot diverge
+        // and a signer cannot be asked to sign the same image twice.
+        var destinations: [2][]const u8 = undefined;
+        destinations[0] = destination_path;
+        var destination_count: usize = 1;
         if (options.boot_mode == .uki_only and index == 0) {
-            try writeGeneratedFile(io, esp, architecture.defaultBootPath(), uki_bytes);
+            destinations[1] = architecture.defaultBootPath();
+            destination_count = 2;
+        }
+        const esp_paths = destinations[0..destination_count];
+
+        const signed_bytes: ?[]u8 = if (options.uki_signer) |signer|
+            try signer.sign(allocator, .{
+                .esp_paths = esp_paths,
+                .unsigned = uki_bytes,
+            })
+        else
+            null;
+        defer if (signed_bytes) |bytes| allocator.free(bytes);
+
+        const final_bytes = signed_bytes orelse uki_bytes;
+        for (esp_paths) |path| {
+            try writeGeneratedFile(io, esp, path, final_bytes);
         }
     }
 
@@ -2455,6 +2497,185 @@ test "populateEsp can generate UKI-only ESP boot path" {
     try std.testing.expectEqualStrings("MZ", named[0..2]);
 
     try std.testing.expectError(error.PathNotFound, esp.readFileAlloc(io, std.testing.allocator, "loader/loader.conf"));
+}
+
+test "a UKI-only ESP signs once and writes the signed bytes to both destinations" {
+    const io = std.testing.io;
+    const path = "test-bootconfig-uki-signed.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const esp_len = 96 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, esp_len * 2, .{});
+    defer img.close(io);
+    try fat32.format(&img, io, .{ .partition_offset = 0, .partition_len = esp_len });
+    var esp = try fat32.open(&img, io, .{ .offset = 0, .length = esp_len });
+
+    const planned = [_]PlannedPartitionIdentity{
+        .{ .planned = .{
+            .name = "ESP",
+            .role = .esp,
+            .type_guid = guid.esp,
+            .offset_bytes = 0,
+            .length_bytes = esp_len,
+        }, .unique_guid = guid.parse("88888888-8888-8888-8888-888888888888") },
+        .{ .planned = .{
+            .name = "root",
+            .role = .root_x86_64,
+            .type_guid = guid.linux_root_x86_64,
+            .offset_bytes = esp_len,
+            .length_bytes = esp_len,
+        }, .unique_guid = guid.parse("99999999-9999-9999-9999-999999999999") },
+    };
+
+    const stub = try makeTestStubPe(std.testing.allocator, 0x8664);
+    defer std.testing.allocator.free(stub);
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "usr/lib/systemd/boot/efi/linuxx64.efi.stub", .kind = .file, .bytes = stub },
+        .{ .path = "boot/vmlinuz-test", .kind = .file, .bytes = "kernel" },
+        .{ .path = "boot/initrd-test.img", .kind = .file, .bytes = "initrd" },
+    });
+    tree.bind();
+
+    // Stands in for a signing provider without being one: it appends a marker
+    // so the written bytes are distinguishable from the generated ones, and
+    // counts its calls so a second signing operation for the fallback copy
+    // would be visible.
+    const RecordingSigner = struct {
+        calls: usize = 0,
+        // Copied rather than borrowed: `esp_paths` names paths the generator
+        // owns for the length of one iteration, so a recorded slice would
+        // dangle by the time the test reads it.
+        destination_storage: [4][64]u8 = undefined,
+        destination_lengths: [4]usize = undefined,
+        destination_count: usize = 0,
+
+        const marker = "-signed";
+
+        fn destination(self: *const @This(), index: usize) []const u8 {
+            return self.destination_storage[index][0..self.destination_lengths[index]];
+        }
+
+        fn sign(
+            context: ?*anyopaque,
+            allocator: std.mem.Allocator,
+            request: uki_signing.SignRequest,
+        ) uki_signing.Error![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            for (request.esp_paths) |esp_path| {
+                const slot = &self.destination_storage[self.destination_count];
+                @memcpy(slot[0..esp_path.len], esp_path);
+                self.destination_lengths[self.destination_count] = esp_path.len;
+                self.destination_count += 1;
+            }
+            const signed = try allocator.alloc(u8, request.unsigned.len + marker.len);
+            @memcpy(signed[0..request.unsigned.len], request.unsigned);
+            @memcpy(signed[request.unsigned.len..], marker);
+            return signed;
+        }
+    };
+    var recording = RecordingSigner{};
+
+    const StageRecorder = struct {
+        stages: [4]PopulateStage = undefined,
+        len: usize = 0,
+
+        fn advance(context: ?*anyopaque, stage: PopulateStage) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.len == self.stages.len) return false;
+            self.stages[self.len] = stage;
+            self.len += 1;
+            return true;
+        }
+    };
+    var stage_recorder = StageRecorder{};
+
+    var report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
+        .planned_partitions = &planned,
+        .boot_mode = .uki_only,
+        .uki_signer = .{ .context = &recording, .signFn = RecordingSigner.sign },
+        .stage_sink = .{ .context = &stage_recorder, .advanceFn = StageRecorder.advance },
+    });
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), report.uki_count);
+
+    // One signing operation, naming both destinations, rather than one per
+    // written file.
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(@as(usize, 2), recording.destination_count);
+    try std.testing.expectEqualStrings("EFI/Linux/vmlinuz-test.efi", recording.destination(0));
+    try std.testing.expectEqualStrings("EFI/BOOT/BOOTX64.EFI", recording.destination(1));
+
+    try std.testing.expectEqualSlices(
+        PopulateStage,
+        &.{ .prepare, .bootloader, .uki, .sign_uki },
+        stage_recorder.stages[0..stage_recorder.len],
+    );
+
+    const fallback = try esp.readFileAlloc(io, std.testing.allocator, "EFI/BOOT/BOOTX64.EFI");
+    defer std.testing.allocator.free(fallback);
+    const named = try esp.readFileAlloc(io, std.testing.allocator, "EFI/Linux/vmlinuz-test.efi");
+    defer std.testing.allocator.free(named);
+    try std.testing.expectEqualSlices(u8, named, fallback);
+    try std.testing.expectEqualStrings(
+        RecordingSigner.marker,
+        named[named.len - RecordingSigner.marker.len ..],
+    );
+}
+
+test "an unsigned UKI reaches the ESP exactly as generated" {
+    const io = std.testing.io;
+    const path = "test-bootconfig-uki-unsigned-identity.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const esp_len = 96 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, esp_len * 2, .{});
+    defer img.close(io);
+    try fat32.format(&img, io, .{ .partition_offset = 0, .partition_len = esp_len });
+    var esp = try fat32.open(&img, io, .{ .offset = 0, .length = esp_len });
+
+    const planned = [_]PlannedPartitionIdentity{
+        .{ .planned = .{
+            .name = "ESP",
+            .role = .esp,
+            .type_guid = guid.esp,
+            .offset_bytes = 0,
+            .length_bytes = esp_len,
+        }, .unique_guid = guid.parse("88888888-8888-8888-8888-888888888888") },
+        .{ .planned = .{
+            .name = "root",
+            .role = .root_x86_64,
+            .type_guid = guid.linux_root_x86_64,
+            .offset_bytes = esp_len,
+            .length_bytes = esp_len,
+        }, .unique_guid = guid.parse("99999999-9999-9999-9999-999999999999") },
+    };
+
+    const stub = try makeTestStubPe(std.testing.allocator, 0x8664);
+    defer std.testing.allocator.free(stub);
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "usr/lib/systemd/boot/efi/linuxx64.efi.stub", .kind = .file, .bytes = stub },
+        .{ .path = "boot/vmlinuz-test", .kind = .file, .bytes = "kernel" },
+        .{ .path = "boot/initrd-test.img", .kind = .file, .bytes = "initrd" },
+    });
+    tree.bind();
+
+    var report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
+        .planned_partitions = &planned,
+        .boot_mode = .uki_only,
+    });
+    defer report.deinit(std.testing.allocator);
+
+    // `uki.generate` zeroes the certificate table on purpose, and without a
+    // signer nothing fills it. This is the precondition the signing path
+    // depends on, asserted from the ESP side.
+    const named = try esp.readFileAlloc(io, std.testing.allocator, "EFI/Linux/vmlinuz-test.efi");
+    defer std.testing.allocator.free(named);
+    var inspection = try uki.inspect(std.testing.allocator, named);
+    defer inspection.deinit(std.testing.allocator);
+    try std.testing.expect(inspection.security_directory == null);
 }
 
 const ParsedBlsEntry = struct {

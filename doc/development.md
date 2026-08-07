@@ -52,6 +52,8 @@ zvmi/
                               #   certificate inspection
         uki_certificate.zig    # GPT/FAT32 fallback + named UKI signer
                               #   extraction and consistency checks
+        uki_signing.zig        # external signing-provider protocol, and
+                              #   verification of what it returns
         verity.zig             # dm-verity SHA-256 hash-tree generation +
                               #   kernel cmdline metadata helpers
         cpio.zig               # minimal read-only newc-format cpio archive

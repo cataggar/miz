@@ -74,6 +74,21 @@ for the GRUB+BLS path and is often too small for real distro UKIs. Start with
 `--esp-size 512M` and increase it further if your kernel+initrd payloads are
 especially large.
 
+`--uki-signing-certificate <path>` and `--uki-signing-command <path>` have
+every generated UKI Authenticode-signed before it is written to the ESP, with
+an optional `--uki-signing-argument <arg>` for the command's single
+subcommand argument -- `--uki-signing-command "$(command -v zvmi)"
+--uki-signing-argument sign` uses zvmi's own Azure Artifact Signing provider.
+Both halves are required together: a certificate with no command names a
+signer that never runs, and a command with no certificate has nothing to check
+its result against. The private key is never passed to zvmi and there is no
+flag that could carry one; the command is run with the unsigned UKI and the
+certificate in a private scratch directory and is expected to write the signed
+file back. What it returns is verified against the bytes that were sent before
+the image is written, and the run refuses to publish if it does not match. See
+[Library API](library-api.md) for the protocol, the checks, and what is
+recorded in provenance.
+
 UKI generation also requires a systemd EFI stub such as `linuxx64.efi.stub`
 or `linuxaa64.efi.stub`, typically from the `systemd-boot-unsigned` package,
 to exist somewhere in the merged ISO/squashfs/container source tree. If the

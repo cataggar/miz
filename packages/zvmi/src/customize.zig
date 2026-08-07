@@ -29,13 +29,14 @@ const preserved_image = @import("preserved_image.zig");
 const selinux_mod = @import("selinux.zig");
 const root_tree = @import("root_tree.zig");
 const transaction_guard = @import("transaction_guard.zig");
+const uki_signing = @import("uki_signing.zig");
 const verity = @import("verity.zig");
 const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 24;
-pub const provenance_schema_version: u32 = 27;
+pub const plan_schema_version: u32 = 25;
+pub const provenance_schema_version: u32 = 28;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -85,6 +86,30 @@ pub const Guid = struct {
     pub fn jsonStringify(self: Guid, stringify: anytype) !void {
         var buf: [36]u8 = undefined;
         try stringify.write(guid.formatLower(&buf, self.bytes));
+    }
+};
+
+/// A DER-encoded structure recorded as it appears in the document it came
+/// from, published as lowercase hex.
+///
+/// A record that reduced an X.509 name to text would be answering a different
+/// question than the one a reader has -- "is this the certificate I enrolled"
+/// is a byte comparison, and rendering loses to it. Hex rather than raw bytes
+/// because DER is not text and a JSON string is.
+pub const DerBlob = struct {
+    bytes: []const u8,
+
+    pub fn jsonStringify(self: DerBlob, stringify: anytype) !void {
+        const digits = "0123456789abcdef";
+        try stringify.beginWriteRaw();
+        const writer = stringify.writer;
+        try writer.writeByte('"');
+        for (self.bytes) |byte| {
+            try writer.writeByte(digits[byte >> 4]);
+            try writer.writeByte(digits[byte & 0xf]);
+        }
+        try writer.writeByte('"');
+        stringify.endWriteRaw();
     }
 };
 
@@ -268,11 +293,58 @@ pub const UkiOptions = struct {
     output_directory: []const u8 = "EFI/Linux",
 };
 
+/// Where the signature over a generated UKI comes from.
+///
+/// The union has one arm today because there is one honest answer: a signing
+/// service the build machine can reach through a command it declares. There
+/// is deliberately no arm holding a private key. `zvmi` never touches key
+/// material -- `authenticode.zig` is key-less by construction -- and adding a
+/// key arm here would put a secret inside the type `writeRequestJson`,
+/// `writePlanJson` and `writeProvenanceJson` all stringify by reflection.
+pub const UkiSigningProvider = union(enum) {
+    /// A command on the build machine, run once per generated UKI, that reads
+    /// the unsigned image and writes back a signed one.
+    ///
+    /// The protocol is the one `zvmi sign` already implements: the unsigned
+    /// image, the destination for the signed image, the certificate, and the
+    /// digests of the first and third are passed as `ZVMI_UKI_*` environment
+    /// variables, and the command reports failure by exiting non-zero. That
+    /// is what makes an Azure Trusted Signing account reachable from here
+    /// without this library learning anything about it.
+    external_command: struct {
+        /// Absolute path to the executable. Not a shell command line: no
+        /// interpreter is involved and nothing here is word-split.
+        executable_path: []const u8,
+        /// A single argument passed before the environment is consulted,
+        /// which is how `zvmi sign` is selected out of the `zvmi` binary.
+        argument: []const u8 = "",
+    },
+};
+
+/// How generated UKIs are signed, and which certificate the result must name.
+///
+/// The certificate is a `TrustSource` because it is exactly that: public key
+/// material stated by value or by path, the same shape the enrolled Secure
+/// Boot certificate already uses. It is not a `CredentialSource`, because a
+/// certificate is not a secret and hiding it would remove the one thing that
+/// makes a signed image checkable after the fact.
+pub const UkiSigningPolicy = struct {
+    /// The certificate the provider is told to sign with, and the one every
+    /// returned signature is checked to name. A signature naming any other
+    /// signer is refused rather than recorded.
+    certificate: TrustSource,
+    provider: UkiSigningProvider,
+};
+
 pub const BootSecurityPolicy = struct {
     boot_mode: bootconfig.BootMode = .bls_only,
     verity: bool = false,
     extra_kernel_options: []const u8 = "",
     uki: UkiOptions = .{},
+    /// Optional Authenticode signing of every generated UKI, applied before
+    /// the image reaches the ESP. Absent means the generated UKIs are
+    /// unsigned, which is what every request has produced until now.
+    signing: ?UkiSigningPolicy = null,
 };
 
 pub const AzureGeneralization = os_customization.AzureGeneralization;
@@ -1267,6 +1339,67 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
                 "preserved-image output must retain the source virtual size",
                 "set size to 0 and size_policy to preserve_source",
             ));
+        }
+    }
+
+    if (request.boot_security.signing) |signing| {
+        // Signing is applied to the UKIs this run generates, as it generates
+        // them. A preserved backend does not generate any -- it carries
+        // forward whatever the source image has -- so there is nothing here
+        // for a signer to sign, and silently doing nothing would be worse
+        // than refusing.
+        if (preserved_backend) {
+            try diagnostics.append(validationError(
+                .incompatible_boot_policy,
+                "/boot_security/signing",
+                "UKI signing applies to generated UKIs, which only native_fresh produces",
+                "select native_fresh, or sign the preserved image outside this request",
+            ));
+        }
+        if (request.boot_security.boot_mode == .bls_only) {
+            try diagnostics.append(validationError(
+                .incompatible_boot_policy,
+                "/boot_security/signing",
+                "UKI signing requires a boot mode that generates UKIs",
+                "select uki_only or bls_and_uki, or remove boot_security.signing",
+            ));
+        }
+        switch (signing.provider) {
+            .external_command => |command| {
+                if (command.executable_path.len == 0) {
+                    try diagnostics.append(validationError(
+                        .invalid_customization,
+                        "/boot_security/signing/provider/external_command/executable_path",
+                        "the signing command must be named",
+                        "set executable_path to the signing executable",
+                    ));
+                } else if (!std.fs.path.isAbsolute(command.executable_path)) {
+                    try diagnostics.append(validationError(
+                        .invalid_customization,
+                        "/boot_security/signing/provider/external_command/executable_path",
+                        "the signing command must be an absolute path",
+                        "give the full path to the signing executable",
+                    ));
+                }
+            },
+        }
+        switch (signing.certificate) {
+            .inline_bytes => |bytes| if (bytes.len == 0) {
+                try diagnostics.append(validationError(
+                    .invalid_customization,
+                    "/boot_security/signing/certificate/inline_bytes",
+                    "the signing certificate must not be empty",
+                    "supply the PEM or DER certificate the provider signs with",
+                ));
+            },
+            .host_path => |path| if (path.len == 0) {
+                try diagnostics.append(validationError(
+                    .invalid_customization,
+                    "/boot_security/signing/certificate/host_path",
+                    "the signing certificate path must not be empty",
+                    "name the certificate file on the build machine",
+                ));
+            },
         }
     }
 
@@ -2884,6 +3017,12 @@ pub const Action = enum {
     seal_verity,
     install_bootloader,
     generate_uki,
+    /// Hands each generated UKI to the declared signing provider and checks
+    /// that what comes back is the same image, signed by the declared
+    /// certificate. Separate from `generate_uki` because it is where the run
+    /// leaves the build process, and a failure here means something quite
+    /// different from a failure to assemble a PE image.
+    sign_uki,
     check_and_close_filesystems,
     convert_output,
     load_preserved_source,
@@ -2987,6 +3126,21 @@ pub const CapabilityKind = enum {
     /// whether the plan is allowed to read one -- and would have to open it
     /// long before the run needs it.
     read_host_credential,
+    /// Running the declared signing provider: a command on the build machine,
+    /// executed once per generated UKI, with the build process's environment.
+    ///
+    /// Named separately from `script_execution` because the code is the build
+    /// operator's own rather than the target image's, and it never runs
+    /// inside the target root. That is also why it is not an
+    /// `acknowledge_unsafe` case: nothing from the image being customized
+    /// gets to execute. But it is still the only way a `native_fresh` run
+    /// spawns a process at all, so a consumer that requires a run to stay
+    /// inside its own process can refuse exactly this.
+    ///
+    /// A probe: the executable must exist and be executable, because a run
+    /// that would fail at the last operation for a missing signer should say
+    /// so before it builds anything.
+    uki_signing_provider,
     script_execution,
     guest_execution,
     initramfs_regeneration,
@@ -3471,7 +3625,7 @@ pub fn resolve(
     const resolved_selinux = try dupeSelinuxPolicy(plan_allocator, request.selinux);
     const resolved_cross_architecture = try dupeCrossArchitecturePolicy(plan_allocator, request.cross_architecture);
     const resolved_generalization = try dupeGeneralization(plan_allocator, request.generalization);
-    const resolved_boot = try dupeBootPolicy(plan_allocator, request.boot_security);
+    const resolved_boot = try dupeBootPolicy(plan_allocator, request.boot_security, context.base_path);
     const operations = try buildOperations(
         plan_allocator,
         resolved_execution.backend,
@@ -3770,13 +3924,7 @@ fn dupePackagePolicy(
     for (policy.repositories, 0..) |repository, index| {
         const trust = try allocator.alloc(TrustSource, repository.trust.len);
         for (repository.trust, 0..) |source, source_index| {
-            trust[source_index] = switch (source) {
-                .inline_bytes => |bytes| .{ .inline_bytes = try allocator.dupe(u8, bytes) },
-                .host_path => |path| .{ .host_path = if (base_path) |base|
-                    try std.fs.path.resolve(allocator, &.{ base, path })
-                else
-                    try allocator.dupe(u8, path) },
-            };
+            trust[source_index] = try dupeTrustSource(allocator, source, base_path);
         }
         repositories[index] = .{
             .id = try allocator.dupe(u8, repository.id),
@@ -4088,7 +4236,11 @@ fn dupeGeneralization(
     };
 }
 
-fn dupeBootPolicy(allocator: Allocator, policy: BootSecurityPolicy) Allocator.Error!BootSecurityPolicy {
+fn dupeBootPolicy(
+    allocator: Allocator,
+    policy: BootSecurityPolicy,
+    base_path: ?[]const u8,
+) Allocator.Error!BootSecurityPolicy {
     return .{
         .boot_mode = policy.boot_mode,
         .verity = policy.verity,
@@ -4099,6 +4251,29 @@ fn dupeBootPolicy(allocator: Allocator, policy: BootSecurityPolicy) Allocator.Er
             .splash_source_path = if (policy.uki.splash_source_path) |path| try allocator.dupe(u8, path) else null,
             .output_directory = try allocator.dupe(u8, policy.uki.output_directory),
         },
+        .signing = if (policy.signing) |signing| .{
+            .certificate = try dupeTrustSource(allocator, signing.certificate, base_path),
+            .provider = switch (signing.provider) {
+                .external_command => |command| .{ .external_command = .{
+                    .executable_path = try allocator.dupe(u8, command.executable_path),
+                    .argument = try allocator.dupe(u8, command.argument),
+                } },
+            },
+        } else null,
+    };
+}
+
+fn dupeTrustSource(
+    allocator: Allocator,
+    source: TrustSource,
+    base_path: ?[]const u8,
+) Allocator.Error!TrustSource {
+    return switch (source) {
+        .inline_bytes => |bytes| .{ .inline_bytes = try allocator.dupe(u8, bytes) },
+        .host_path => |path| .{ .host_path = if (base_path) |base|
+            try std.fs.path.resolve(allocator, &.{ base, path })
+        else
+            try allocator.dupe(u8, path) },
     };
 }
 
@@ -4206,6 +4381,8 @@ fn appendBackendFinalOperationSpecs(
             if (generation == .gen2) try specs.append(.{ .phase = .bootloader_prepare, .action = .prepare_boot_configuration });
             try specs.append(.{ .phase = .bootloader_install, .action = .install_bootloader });
             if (policy.boot_mode != .bls_only) try specs.append(.{ .phase = .uki, .action = .generate_uki });
+            if (policy.boot_mode != .bls_only and policy.signing != null)
+                try specs.append(.{ .phase = .uki, .action = .sign_uki });
             try appendFinalizeHookSpecs(specs, hooks);
             try appendSelinuxSpecs(specs, selinux);
             try specs.append(.{ .phase = .filesystem_close, .action = .check_and_close_filesystems });
@@ -4400,6 +4577,22 @@ fn buildCapabilities(
             try appendIsolationCapability(&capabilities, output.path, path, "keep the output distinct from hook sources");
         },
     };
+    if (boot_policy.signing) |signing| {
+        switch (signing.certificate) {
+            .inline_bytes => {},
+            .host_path => |path| {
+                try capabilities.append(.{ .kind = .read_trust_source, .path = path, .reason = "read the declared UKI signing certificate" });
+                try appendIsolationCapability(&capabilities, output.path, path, "keep the output distinct from the signing certificate");
+            },
+        }
+        switch (signing.provider) {
+            .external_command => |command| try capabilities.append(.{
+                .kind = .uki_signing_provider,
+                .path = command.executable_path,
+                .reason = "run the declared signing provider over each generated UKI",
+            }),
+        }
+    }
     try capabilities.append(.{
         .kind = .write_workspace_parent,
         .path = execution.workspace_path,
@@ -4677,6 +4870,7 @@ fn isDefaultBootPolicy(policy: BootSecurityPolicy) bool {
         policy.uki.stub_source_path == null and
         policy.uki.os_release_source_path == null and
         policy.uki.splash_source_path == null and
+        policy.signing == null and
         std.mem.eql(u8, policy.uki.output_directory, "EFI/Linux");
 }
 
@@ -4844,6 +5038,24 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     hashOptionalString(&hash, plan.boot_security.uki.os_release_source_path);
     hashOptionalString(&hash, plan.boot_security.uki.splash_source_path);
     hashString(&hash, plan.boot_security.uki.output_directory);
+    // The certificate is public material and is hashed by value when it is
+    // given by value: two plans that pin different signers are different
+    // plans, and nothing here is a secret a hash could turn into an oracle.
+    hashInt(&hash, @intFromBool(plan.boot_security.signing != null));
+    if (plan.boot_security.signing) |signing| {
+        hashInt(&hash, @intFromEnum(std.meta.activeTag(signing.certificate)));
+        switch (signing.certificate) {
+            .inline_bytes => |bytes| hashString(&hash, bytes),
+            .host_path => |path| hashString(&hash, path),
+        }
+        hashInt(&hash, @intFromEnum(std.meta.activeTag(signing.provider)));
+        switch (signing.provider) {
+            .external_command => |command| {
+                hashString(&hash, command.executable_path);
+                hashString(&hash, command.argument);
+            },
+        }
+    }
     hashGeneralization(&hash, plan.generalization);
     hashString(&hash, plan.execution.workspace_path);
     hashInt(&hash, @intFromEnum(plan.execution.backend));
@@ -5308,6 +5520,16 @@ pub const Platform = struct {
         target: preserved_image.RawMutationTarget,
         deadline: Deadline,
     ) anyerror!VmRuntimeReport = null,
+    /// The build process's own environment, forwarded to a declared signing
+    /// provider and to nothing else.
+    ///
+    /// It sits on `Platform` because that is where the host's contributions
+    /// to a run already live, and it is a field rather than something read
+    /// from the process because `customize.zig` has no business reaching for
+    /// ambient state a caller did not hand it. A driver that wants signing to
+    /// work sets it; every other construction site keeps the empty default
+    /// and a provider that needs a variable will say so by failing.
+    signing_environ: std.process.Environ = .empty,
 
     pub fn system() Platform {
         return .{ .checkFn = systemCapabilityCheck };
@@ -5750,6 +5972,10 @@ fn systemCapabilityCheck(_: ?*anyopaque, io: Io, requirement: CapabilityRequirem
         .read_trust_source,
         => if (isReadableKind(cwd, io, requirement.path, .file)) .available else .missing,
         .disk_dependencies, .gpt_source, .kernel_option_change => .unsupported,
+        // A probe, unlike the other host-facing declarations: a run whose
+        // signer does not exist would build an entire image and then fail at
+        // the last operation, and the file's presence is not a secret.
+        .uki_signing_provider => if (isExecutableFile(cwd, io, requirement.path)) .available else .missing,
         .write_workspace_parent => if (canCreatePath(cwd, io, requirement.path)) .available else .missing,
         .write_output_parent => if (canCreatePath(cwd, io, requirement.path)) .available else .missing,
         .output_absent, .transaction_absent => if (pathAbsent(cwd, io, requirement.path)) .available else .missing,
@@ -6026,6 +6252,18 @@ fn isReadablePath(dir: Io.Dir, io: Io, path: []const u8) bool {
     dir.access(io, path, .{ .read = true }) catch return false;
     const stat = dir.statFile(io, path, .{ .follow_symlinks = false }) catch return false;
     return stat.kind == .file or stat.kind == .directory;
+}
+
+/// A file the build process could actually run. Symlinks are followed,
+/// because naming a wrapper by a symlink is ordinary and refusing it would
+/// be a false refusal.
+fn isExecutableFile(dir: Io.Dir, io: Io, path: []const u8) bool {
+    if (path.len == 0) return false;
+    dir.access(io, path, .{ .read = true }) catch return false;
+    const stat = dir.statFile(io, path, .{ .follow_symlinks = true }) catch return false;
+    if (stat.kind != .file) return false;
+    if (!Io.File.Permissions.has_executable_bit) return true;
+    return stat.permissions.toMode() & 0o111 != 0;
 }
 
 fn canWrite(dir: Io.Dir, io: Io, path: []const u8) bool {
@@ -6349,6 +6587,71 @@ pub const PartitionStyleRecord = struct {
     message: []const u8,
 };
 
+/// What the declared signing provider actually said about one signing
+/// operation, as it said it.
+///
+/// Every field is the provider's own claim, so a reader can tell which
+/// service and which identity produced a signature. It is separate from
+/// `UkiSignatureRecord`'s observed fields for exactly that reason: what a
+/// provider asserts and what the returned bytes prove are different kinds of
+/// statement, and merging them would let an assertion pass for an
+/// observation.
+pub const UkiSigningProviderRecord = struct {
+    /// The provider's own name for itself, e.g. `azure-trusted-signing`.
+    name: []const u8,
+    /// The service endpoint the signature was requested from.
+    endpoint: []const u8,
+    /// The account and certificate profile within that service.
+    account: []const u8,
+    profile: []const u8,
+    /// The provider's identifier for this operation, which is what a support
+    /// request or an audit log lookup is made with.
+    operation_id: []const u8,
+};
+
+/// One Authenticode signature over one generated UKI.
+///
+/// Every field except `provider` is re-derived from the bytes that were
+/// written to the ESP, not taken from what the provider claimed. In
+/// particular `image_sha256` is read out of the returned signature and
+/// checked against the image, so it records what the signature covers rather
+/// than what it was supposed to cover -- which is the only way to catch a
+/// provider that signed a stale file.
+///
+/// There is no key material here and none is representable. This is not a
+/// trust decision either: nothing in this run verifies the RSA signature or
+/// any certificate chain. It records who the signature names and what it is
+/// over, and leaves the question of whether that signer should be trusted to
+/// whoever enrolled the certificate.
+pub const UkiSignatureRecord = struct {
+    /// Every path in the ESP these exact signed bytes were written to.
+    ///
+    /// A list rather than a path because a `uki_only` image writes the same
+    /// bytes to the named UKI and to the default boot path, from one signing
+    /// operation. Two records would read as two signatures.
+    esp_paths: []const []const u8,
+    /// The image as generated, before it was handed over.
+    unsigned_sha256: Digest,
+    /// The image as written to the ESP.
+    signed_sha256: Digest,
+    signed_size: u64,
+    /// The Authenticode digest the signature commits to, equal for the
+    /// unsigned and the signed image because the certificate table is
+    /// excluded from it by construction.
+    image_sha256: Digest,
+    /// The certificate the run declared and the provider was told to use.
+    certificate_sha256: Digest,
+    /// The signer named by the returned signature, DER as it appears there.
+    /// Recorded rather than reduced to text so it is comparable byte for byte
+    /// with a certificate a reader holds.
+    signer_subject_der: DerBlob,
+    signer_issuer_der: DerBlob,
+    signer_serial_number: DerBlob,
+    /// Present only when the provider volunteered it. Absent means the
+    /// provider said nothing, not that nothing happened.
+    provider: ?UkiSigningProviderRecord,
+};
+
 /// A `/lib/modules` entry the kernel discovery passed over, and why.
 ///
 /// A run that regenerates "every installed initramfs" answers a question the
@@ -6627,6 +6930,9 @@ pub const ExecutionRecord = struct {
     /// Present exactly when the output format is a bundle built from the
     /// staged image.
     cosi: ?CosiRecord,
+    /// One record per generated UKI that was signed, in the order they were
+    /// generated. Empty when the run declared no signing policy.
+    uki_signatures: []const UkiSignatureRecord,
     /// The largest value each limit reached during this run. A caller sizes a
     /// larger run from these instead of guessing, and a dry run reports them
     /// without committing to a build.
@@ -6875,6 +7181,7 @@ fn buildResult(
     unsafe_report: ?*const UnsafeChrootRuntimeReport,
     vm_report: ?*const VmRuntimeReport,
     cosi_report: ?cosi.Report,
+    uki_signatures: []const uki_signing.SignatureRecord,
     source_digests: []const SourceRecord,
     output_digest: Digest,
     output_file_size: u64,
@@ -6928,7 +7235,7 @@ fn buildResult(
         .vm = try dupeVmPolicy(result_allocator, plan.data.execution.vm),
         .deadline_seconds = plan.data.execution.deadline_seconds,
     };
-    const resolved_boot = try dupeBootPolicy(result_allocator, plan.data.boot_security);
+    const resolved_boot = try dupeBootPolicy(result_allocator, plan.data.boot_security, null);
     const resolved_os = try dupeOsCustomization(result_allocator, plan.data.os, null);
     const resolved_existing_operations = try dupeExistingPathOperations(
         result_allocator,
@@ -7236,6 +7543,7 @@ fn buildResult(
                     .partition_count = report.partition_count,
                     .verity_included = report.verity_included,
                 } else null,
+                .uki_signatures = try dupeUkiSignatureRecords(result_allocator, uki_signatures),
                 .limit_peaks = limit_peaks,
             },
             .final_output = .{
@@ -7246,6 +7554,34 @@ fn buildResult(
             },
         },
     };
+}
+
+fn dupeUkiSignatureRecords(
+    allocator: Allocator,
+    records: []const uki_signing.SignatureRecord,
+) Allocator.Error![]UkiSignatureRecord {
+    const owned = try allocator.alloc(UkiSignatureRecord, records.len);
+    for (records, 0..) |record, index| {
+        owned[index] = .{
+            .esp_paths = try dupeStrings(allocator, record.esp_paths),
+            .unsigned_sha256 = .{ .bytes = record.unsigned_sha256 },
+            .signed_sha256 = .{ .bytes = record.signed_sha256 },
+            .signed_size = record.signed_size,
+            .image_sha256 = .{ .bytes = record.image_sha256 },
+            .certificate_sha256 = .{ .bytes = record.certificate_sha256 },
+            .signer_subject_der = .{ .bytes = try allocator.dupe(u8, record.signer_subject_der) },
+            .signer_issuer_der = .{ .bytes = try allocator.dupe(u8, record.signer_issuer_der) },
+            .signer_serial_number = .{ .bytes = try allocator.dupe(u8, record.signer_serial_number) },
+            .provider = if (record.provider) |provider| .{
+                .name = try allocator.dupe(u8, provider.provider),
+                .endpoint = try allocator.dupe(u8, provider.endpoint),
+                .account = try allocator.dupe(u8, provider.account),
+                .profile = try allocator.dupe(u8, provider.profile),
+                .operation_id = try allocator.dupe(u8, provider.operation_id),
+            } else null,
+        };
+    }
+    return owned;
 }
 
 fn dupeOperations(allocator: Allocator, operations: []const Operation) Allocator.Error![]Operation {
@@ -7348,6 +7684,57 @@ pub fn execute(
     defer if (unsafe_report) |*report| report.deinit();
     var vm_report: ?VmRuntimeReport = null;
     defer if (vm_report) |*report| report.deinit();
+    // The signing certificate and the signer that uses it. Both live for the
+    // whole execution because the records the signer accumulates are read
+    // after the build returns, and the certificate is borrowed by the signer
+    // rather than copied into it.
+    var signing_certificate: ?uki_signing.Certificate = null;
+    defer if (signing_certificate) |*certificate| certificate.deinit(allocator);
+    var uki_signer: ?uki_signing.ExternalSigner = null;
+    defer if (uki_signer) |*signer| signer.deinit();
+    if (plan.data.execution.backend == .native_fresh) {
+        if (plan.data.boot_security.signing) |signing| {
+            signing_certificate = loadSigningCertificate(allocator, io, signing.certificate) catch |err| {
+                try appendFailure(
+                    &diagnostics,
+                    .execution_failed,
+                    .execution,
+                    "/boot_security/signing/certificate",
+                    "failed to read the declared UKI signing certificate",
+                    err,
+                );
+                if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
+                emitDiagnostics(event_sink, diagnostics.items);
+                return try failureOutcome(allocator, diagnostics.items);
+            };
+            const scratch_path = try std.fs.path.join(allocator, &.{ plan.data.transaction_path, "uki-signing" });
+            defer allocator.free(scratch_path);
+            uki_signer = uki_signing.ExternalSigner.init(allocator, io, .{
+                .command = switch (signing.provider) {
+                    .external_command => |command| .{
+                        .executable_path = command.executable_path,
+                        .argument = command.argument,
+                    },
+                },
+                .certificate = signing_certificate.?,
+                .scratch_path = scratch_path,
+                .architecture = @tagName(plan.data.architectures.image),
+                .base_environment = .{ .environ = platform.signing_environ },
+            }) catch |err| {
+                try appendFailure(
+                    &diagnostics,
+                    .execution_failed,
+                    .execution,
+                    "/boot_security/signing",
+                    "failed to prepare the UKI signing workspace",
+                    err,
+                );
+                if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
+                emitDiagnostics(event_sink, diagnostics.items);
+                return try failureOutcome(allocator, diagnostics.items);
+            };
+        }
+    }
     switch (plan.data.execution.backend) {
         .native_fresh => {
             fresh_report = runPlan(
@@ -7358,7 +7745,23 @@ pub fn execute(
                 event_sink,
                 &bridge,
                 &limit_sink,
+                if (uki_signer) |*signer| signer else null,
             ) catch |err| {
+                // A signing failure surfaces here as whatever error the
+                // generator propagated, which says nothing about the signer.
+                // The signer kept the reason it stopped, so the diagnostic
+                // can name the operation that failed instead of the layer it
+                // was noticed in.
+                if (uki_signer) |signer| if (signer.failure) |signing_error| {
+                    try appendFailure(
+                        &diagnostics,
+                        .execution_failed,
+                        .execution,
+                        "/boot_security/signing",
+                        "UKI signing failed",
+                        signing_error,
+                    );
+                };
                 try appendFailure(&diagnostics, .execution_failed, .execution, "", "native-fresh execution failed", err);
                 try appendLimitFailure(
                     &diagnostics,
@@ -7634,6 +8037,7 @@ pub fn execute(
         if (unsafe_report) |*report| report else null,
         if (vm_report) |*report| report else null,
         cosi_report,
+        if (uki_signer) |*signer| signer.signatures() else &.{},
         source_digests_before,
         output_digest,
         output_file_size,
@@ -7863,6 +8267,7 @@ fn runPlan(
     event_sink: ?EventSink,
     bridge: *BuildEventBridge,
     limit_sink: *limits_mod.Diagnostic,
+    uki_signer: ?*uki_signing.ExternalSigner,
 ) !?build_image.BuildImageReport {
     if (plan.data.execution.backend != .native_fresh) return error.InvalidBackend;
     // A bundled output ends with an operation the builder does not run: the
@@ -7879,10 +8284,25 @@ fn runPlan(
     }
     var options = buildOptionsFromPlan(plan, bridge, limit_sink);
     options.stage_sink = stage_sink;
+    if (uki_signer) |signer| options.uki_signer = signer.signer();
     var report = try build_image.build(allocator, io, options);
     errdefer report.deinit(allocator);
     if (stage_bridge.next != build_operations.len) return error.InvalidOperationOrder;
     return report;
+}
+
+/// Reads the certificate a signing policy declares. Separate from the signer
+/// so a failure to read it is reported against the certificate rather than
+/// against the provider.
+fn loadSigningCertificate(
+    allocator: Allocator,
+    io: Io,
+    source: TrustSource,
+) uki_signing.Error!uki_signing.Certificate {
+    return uki_signing.loadCertificateAlloc(allocator, io, switch (source) {
+        .inline_bytes => |bytes| .{ .inline_bytes = bytes },
+        .host_path => |path| .{ .host_path = path },
+    });
 }
 
 fn buildOptionsFromPlan(
@@ -7971,6 +8391,7 @@ fn actionForFreshStage(stage: build_image.Stage) Action {
         .seal_verity => .seal_verity,
         .install_bootloader => .install_bootloader,
         .generate_uki => .generate_uki,
+        .sign_uki => .sign_uki,
         .check_and_close_filesystems => .check_and_close_filesystems,
         .convert_output => .convert_output,
     };
@@ -7987,6 +8408,7 @@ fn freshStageForAction(action: Action) ?build_image.Stage {
         .seal_verity => .seal_verity,
         .install_bootloader => .install_bootloader,
         .generate_uki => .generate_uki,
+        .sign_uki => .sign_uki,
         .check_and_close_filesystems => .check_and_close_filesystems,
         .convert_output => .convert_output,
         else => null,
@@ -10820,7 +11242,7 @@ test "custom execution platforms must advance every planned operation" {
     var limit_sink = limits_mod.Diagnostic{};
     try std.testing.expectError(
         error.InvalidOperationOrder,
-        runPlan(std.testing.allocator, std.testing.io, &resolved.plan.?, platform, null, &bridge, &limit_sink),
+        runPlan(std.testing.allocator, std.testing.io, &resolved.plan.?, platform, null, &bridge, &limit_sink, null),
     );
 }
 
@@ -11627,8 +12049,13 @@ test "the schema versions move only when the documents do" {
     // produced, the trust it ended up holding, the resolver it inherited --
     // spent one bump between them rather than one each. The plan did not move:
     // none of it is an instruction, all of it is what the run turned out to be.
-    try std.testing.expectEqual(@as(u32, 24), plan_schema_version);
-    try std.testing.expectEqual(@as(u32, 27), provenance_schema_version);
+    //
+    // Both moved together for UKI signing, which is the rare change that is
+    // an instruction and an outcome at once: `boot_security.signing` states
+    // which provider and certificate to use, and `execution.uki_signatures`
+    // records what each signature turned out to be over and who it named.
+    try std.testing.expectEqual(@as(u32, 25), plan_schema_version);
+    try std.testing.expectEqual(@as(u32, 28), provenance_schema_version);
 }
 
 test "native-edit resolution is deterministic, deeply owned, and integrity checked" {
@@ -14085,5 +14512,180 @@ test "a multilib lock pins one name at two architectures" {
     defer diagnostics.deinit(std.testing.allocator);
     for (diagnostics.items) |diagnostic| {
         try std.testing.expect(diagnostic.code != .invalid_policy);
+    }
+}
+
+fn ukiSigningRequest() Request {
+    var request = validRequest();
+    request.boot_security = .{
+        .boot_mode = .uki_only,
+        .signing = .{
+            .certificate = .{ .inline_bytes = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n" },
+            .provider = .{ .external_command = .{
+                .executable_path = "/usr/local/bin/zvmi",
+                .argument = "sign",
+            } },
+        },
+    };
+    return request;
+}
+
+test "UKI signing is planned as its own operation, capability, and hash input" {
+    const request = ukiSigningRequest();
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(!resolved.diagnostics.hasErrors());
+    const plan = &resolved.plan.?;
+
+    // The signature is applied to bytes `generate_uki` produced, so it comes
+    // after it and in the same phase. A signing step planned anywhere else
+    // would be describing a different image than the one that boots.
+    var generate_index: ?usize = null;
+    var sign_index: ?usize = null;
+    for (plan.data.operations, 0..) |operation, index| {
+        if (operation.action == .generate_uki) generate_index = index;
+        if (operation.action == .sign_uki) {
+            sign_index = index;
+            try std.testing.expectEqual(Phase.uki, operation.phase);
+        }
+    }
+    try std.testing.expect(generate_index != null);
+    try std.testing.expect(sign_index != null);
+    try std.testing.expect(generate_index.? < sign_index.?);
+
+    var named_provider = false;
+    for (plan.data.required_capabilities) |capability| {
+        if (capability.kind == .uki_signing_provider) {
+            named_provider = true;
+            try std.testing.expectEqualStrings("/usr/local/bin/zvmi", capability.path);
+        }
+    }
+    try std.testing.expect(named_provider);
+
+    // The provider and the certificate are instructions, so two plans that
+    // name different ones are different plans. Nothing here is secret, which
+    // is why the certificate can be hashed by value at all.
+    var other_provider = ukiSigningRequest();
+    other_provider.boot_security.signing.?.provider = .{ .external_command = .{
+        .executable_path = "/usr/local/bin/other-signer",
+        .argument = "sign",
+    } };
+    var other_provider_resolved = try resolve(std.testing.allocator, &other_provider, .{ .host_architecture = .x86_64 });
+    defer other_provider_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &plan.data.plan_hash.bytes,
+        &other_provider_resolved.plan.?.data.plan_hash.bytes,
+    ));
+
+    var other_certificate = ukiSigningRequest();
+    other_certificate.boot_security.signing.?.certificate = .{ .inline_bytes = "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n" };
+    var other_certificate_resolved = try resolve(std.testing.allocator, &other_certificate, .{ .host_architecture = .x86_64 });
+    defer other_certificate_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &plan.data.plan_hash.bytes,
+        &other_certificate_resolved.plan.?.data.plan_hash.bytes,
+    ));
+
+    // And a request without signing plans no signing operation at all, rather
+    // than one that does nothing.
+    const unsigned_request = validRequest();
+    var unsigned = try resolve(std.testing.allocator, &unsigned_request, .{ .host_architecture = .x86_64 });
+    defer unsigned.deinit(std.testing.allocator);
+    for (unsigned.plan.?.data.operations) |operation| {
+        try std.testing.expect(operation.action != .sign_uki);
+    }
+    for (unsigned.plan.?.data.required_capabilities) |capability| {
+        try std.testing.expect(capability.kind != .uki_signing_provider);
+    }
+}
+
+test "a certificate named by path is requested as a capability the run has to hold" {
+    var request = ukiSigningRequest();
+    request.boot_security.signing.?.certificate = .{ .host_path = "/etc/pki/uki-signing.pem" };
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expect(!resolved.diagnostics.hasErrors());
+
+    var named = false;
+    for (resolved.plan.?.data.required_capabilities) |capability| {
+        if (capability.kind == .read_trust_source and
+            std.mem.eql(u8, capability.path, "/etc/pki/uki-signing.pem"))
+        {
+            named = true;
+        }
+    }
+    try std.testing.expect(named);
+}
+
+test "UKI signing is refused where there would be nothing to sign" {
+    const cases = [_]struct {
+        why: []const u8,
+        mutate: *const fn (*Request) void,
+        expected: []const u8,
+    }{
+        .{
+            .why = "a boot mode that generates no UKI",
+            .mutate = struct {
+                fn apply(request: *Request) void {
+                    request.boot_security.boot_mode = .bls_only;
+                }
+            }.apply,
+            .expected = "boot mode that generates UKIs",
+        },
+        .{
+            .why = "a backend that carries UKIs forward rather than generating them",
+            .mutate = struct {
+                fn apply(request: *Request) void {
+                    request.execution.backend = .native_edit;
+                }
+            }.apply,
+            .expected = "only native_fresh produces",
+        },
+        .{
+            .why = "a provider that is not named",
+            .mutate = struct {
+                fn apply(request: *Request) void {
+                    request.boot_security.signing.?.provider = .{ .external_command = .{
+                        .executable_path = "",
+                    } };
+                }
+            }.apply,
+            .expected = "must be named",
+        },
+        .{
+            .why = "a provider named relative to wherever the build started",
+            .mutate = struct {
+                fn apply(request: *Request) void {
+                    request.boot_security.signing.?.provider = .{ .external_command = .{
+                        .executable_path = "bin/zvmi",
+                        .argument = "sign",
+                    } };
+                }
+            }.apply,
+            .expected = "absolute path",
+        },
+        .{
+            .why = "a certificate with nothing in it",
+            .mutate = struct {
+                fn apply(request: *Request) void {
+                    request.boot_security.signing.?.certificate = .{ .inline_bytes = "" };
+                }
+            }.apply,
+            .expected = "must not be empty",
+        },
+    };
+    for (cases) |case| {
+        var request = ukiSigningRequest();
+        case.mutate(&request);
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(diagnostics.hasErrors());
+        var named = false;
+        for (diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, case.expected) != null) named = true;
+        }
+        try std.testing.expect(named);
     }
 }
