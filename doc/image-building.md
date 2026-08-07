@@ -320,6 +320,34 @@ rebuilding it produces a different -- larger, and correct past 2038 -- image
 rather than the same bytes. Reproducibility is a promise about a given writer,
 not across versions of one.
 
+The writer is deliberately not parametric in inode size, and will not become
+so. It could be: threading the source's size through the layout arithmetic,
+the inode encoder, the checksum split and the superblock is mechanical work,
+and it would let an image an older zvmi wrote re-enter `strict` and round-trip
+byte for byte. The reason not to is what a 128-byte inode cannot hold. There
+is no `i_extra_isize` region there, so there are no epoch bits, so no
+timestamp outside 1970..2038 is representable at all. Restoring that path
+restores the exact defect the move to 256-byte inodes existed to remove, and
+it does not restore it quietly: the range of times the writer can store stops
+being a property of the writer and becomes a property of whichever source it
+happened to be handed. `root_tree.validateExt4Time` rejects an unrepresentable
+time against `ext4.min_representable_time` and `max_representable_time`, two
+module constants, which is what keeps the check and the encoder from drifting
+apart; a per-run range would have to be plumbed to every caller that validates
+a time, and a source whose own timestamps fell outside its own inode size's
+range would need a named refusal of its own. That is a large amount of
+machinery, and all of it exists to serve rebuilding one class of legacy image
+without changing its bytes.
+
+So `strict` is reserved for images the current writer produces. An older
+128-byte image migrates by being rebuilt once under `general`, which reports
+`source_reproducible = false` for that one rebuild and produces a 256-byte
+image that is `strict` from then on. Nothing else is lost in the meantime: a
+128-byte image still opens, resizes, edits and rebuilds, because the in-place
+paths preserve whatever inode size they find. The only thing it cannot claim
+is byte-for-byte reproducibility, and that claim would be false if it were
+made.
+
 No filesystem a distro installer produced can satisfy it. `mke2fs` defaults --
 Ubuntu 24.04, Debian 12, Azure Linux -- give you 256-byte inodes plus
 `has_journal`, `64bit`, `flex_bg`, `metadata_csum`, `metadata_csum_seed`,
