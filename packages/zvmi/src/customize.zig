@@ -35,7 +35,7 @@ const vm_control = @import("vm_control.zig");
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
 pub const plan_schema_version: u32 = 22;
-pub const provenance_schema_version: u32 = 26;
+pub const provenance_schema_version: u32 = 27;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -6556,6 +6556,26 @@ pub const ExecutionRecord = struct {
     root_tree_digest: ?Digest,
     partitions: []const PartitionRecord,
     verity: ?VerityRecord,
+    /// The kernel command line the run composed and wrote into every boot
+    /// entry it generated.
+    ///
+    /// Present exactly when the run generated the boot entries itself, which
+    /// today means `native_fresh`. The preserved backends do not compose a
+    /// command line: they append to entries the source image already carried,
+    /// and `preserved.kernel_options.appended` records the half that is
+    /// theirs to state. The other half belongs to the input image, and
+    /// restating it here would claim authorship of something this run did not
+    /// write.
+    ///
+    /// This is the one boot fact a plan cannot carry. The base is derived
+    /// from the root PARTUUID the run assigned, and for a verity image it
+    /// embeds a root hash that does not exist until the tree is sealed --
+    /// which is to say it depends on the finished filesystem, so no amount of
+    /// planning could state it in advance. The declared half is already in
+    /// the plan under `boot_security.extra_kernel_options`; what is recorded
+    /// here is the whole line, because a reader asking "what does this image
+    /// boot with" is asking about the string, not about its inputs.
+    kernel_command_line: ?[]const u8,
     vhd_alignment: ?azure.FixupResult,
     partition_style: ?PartitionStyleRecord,
     vhdx_metadata: ?VhdxMetadataRecord,
@@ -6910,6 +6930,13 @@ fn buildResult(
         } else null
     else
         null;
+    const kernel_command_line_record = if (fresh_report) |build_report|
+        if (build_report.kernel_command_line) |line|
+            try result_allocator.dupe(u8, line)
+        else
+            null
+    else
+        null;
     const partition_style = if (fresh_report) |build_report|
         if (build_report.partition_style) |style| PartitionStyleRecord{
             .ok = style.ok,
@@ -7147,6 +7174,7 @@ fn buildResult(
                     null,
                 .partitions = partitions,
                 .verity = verity_record,
+                .kernel_command_line = kernel_command_line_record,
                 .vhd_alignment = if (fresh_report) |build_report| build_report.vhd_alignment else null,
                 .partition_style = partition_style,
                 .vhdx_metadata = if (fresh_report) |build_report|
@@ -10760,6 +10788,87 @@ test "successful execution commits output and emits provenance" {
     ));
 }
 
+test "a backend that generated no boot entries records no kernel command line" {
+    const io = std.testing.io;
+    const iso_path = "test-customize-cmdline.iso";
+    const container_path = "test-customize-cmdline.container";
+    const workspace_path = "test-customize-cmdline-work";
+    const output_path = workspace_path ++ "/output.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, container_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, workspace_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, workspace_path);
+
+    {
+        var file = try Io.Dir.cwd().createFile(io, iso_path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, "source-iso", 0);
+    }
+    {
+        var file = try Io.Dir.cwd().createFile(io, container_path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, "source-container", 0);
+    }
+
+    var request = validRequest();
+    request.input = .{ .iso_oci = .{
+        .iso_path = iso_path,
+        .container_path = container_path,
+        .rootfs_path_in_iso = "rootfs.squashfs",
+    } };
+    request.output = .{ .path = output_path, .format = .raw, .size = 128 * mib };
+    request.execution.workspace_path = workspace_path;
+    // Declared, so that a record of the declared text alone would satisfy any
+    // assertion below and the absence being checked is a real absence.
+    request.boot_security = .{ .extra_kernel_options = "console=ttyS0 quiet" };
+
+    const FakeRunner = struct {
+        fn run(
+            _: ?*anyopaque,
+            _: Allocator,
+            run_io: Io,
+            plan: *const ResolvedPlan,
+            _: ?EventSink,
+            stage_sink: build_image.StageSink,
+        ) !void {
+            for (plan.data.operations) |operation| {
+                if (!stage_sink.advance(freshStageForAction(operation.action) orelse return error.InvalidOperationOrder)) {
+                    return error.InvalidOperationOrder;
+                }
+            }
+            const file = try Io.Dir.cwd().createFile(run_io, plan.data.staging_output_path, .{});
+            defer file.close(run_io);
+            try file.writePositionalAll(run_io, "completed-image", 0);
+        }
+    };
+
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    var platform = Platform.system();
+    platform.runFn = FakeRunner.run;
+    var outcome = try execute(std.testing.allocator, io, &resolved.plan.?, platform, null);
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expect(!outcome.diagnostics.hasErrors());
+    const provenance = outcome.result.?.provenance;
+
+    // The stand-in backend wrote a file and generated no boot entries, so
+    // there is no command line to record. Null is the truthful answer, and it
+    // is a different claim from recording the declared options and calling
+    // that the line the image boots with: the plan already says what was
+    // asked for, and it says so here too.
+    try std.testing.expect(provenance.execution.kernel_command_line == null);
+    try std.testing.expectEqualStrings(
+        "console=ttyS0 quiet",
+        provenance.resolved.boot_security.extra_kernel_options,
+    );
+
+    // Nor is it recorded through the preserved record: that field belongs to
+    // the backends that append to entries an input image already carried, and
+    // this run had no input image to append to.
+    try std.testing.expect(provenance.execution.preserved == null);
+}
+
 test "a fresh COSI request publishes a bundle built from the staged image" {
     const io = std.testing.io;
     const iso_path = "test-customize-cosi.iso";
@@ -11389,7 +11498,7 @@ test "the schema versions move only when the documents do" {
     // spent one bump between them rather than one each. The plan did not move:
     // none of it is an instruction, all of it is what the run turned out to be.
     try std.testing.expectEqual(@as(u32, 22), plan_schema_version);
-    try std.testing.expectEqual(@as(u32, 26), provenance_schema_version);
+    try std.testing.expectEqual(@as(u32, 27), provenance_schema_version);
 }
 
 test "native-edit resolution is deterministic, deeply owned, and integrity checked" {
