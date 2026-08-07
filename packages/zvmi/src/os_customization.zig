@@ -9,6 +9,23 @@ pub const Metadata = struct {
     mode: u16,
     uid: u32 = 0,
     gid: u32 = 0,
+    /// The modification time to stamp on the node, or null to take the
+    /// build's own deterministic default.
+    ///
+    /// A caller writing a file into an image is stating what that file is,
+    /// and its mtime is part of that statement: it is what every package
+    /// manager, `make`, `find -newer` and staleness check in the guest will
+    /// read. Left to the default, an injected file claims to have been
+    /// modified at the moment the image was built, which is a plausible
+    /// lie -- it says the bytes are as new as the image, when the caller may
+    /// be reproducing a file that has a real age, or deliberately backdating
+    /// one so a guest-side generator considers its output current.
+    ///
+    /// Only mtime is exposed. atime is meaningless in an image nothing has
+    /// read yet, and ctime is inode-change time, which no tool on a running
+    /// system can set and which therefore has no value a caller could
+    /// intend. Both continue to take the build default.
+    mtime: ?i64 = null,
     xattrs: []const ext4.Xattr = &.{},
 
     fn rootTree(self: Metadata) root_tree.Metadata {
@@ -16,6 +33,7 @@ pub const Metadata = struct {
             .mode = self.mode,
             .uid = self.uid,
             .gid = self.gid,
+            .mtime = self.mtime,
             .xattrs = self.xattrs,
         };
     }
@@ -48,6 +66,9 @@ pub const MetadataChange = struct {
     mode: ?u16 = null,
     uid: ?u32 = null,
     gid: ?u32 = null,
+    /// See `Metadata.mtime`. Null keeps the node's existing modification
+    /// time, the way the other null fields here keep theirs.
+    mtime: ?i64 = null,
     xattrs: ?[]const ext4.Xattr = null,
 };
 
@@ -235,7 +256,7 @@ fn applyFilesystemOperation(tree: *RootTree, operation: FilesystemOperation) !vo
                 .uid = change.uid orelse node.metadata.uid,
                 .gid = change.gid orelse node.metadata.gid,
                 .atime = node.metadata.atime,
-                .mtime = node.metadata.mtime,
+                .mtime = change.mtime orelse node.metadata.mtime,
                 .ctime = node.metadata.ctime,
                 .xattrs = change.xattrs orelse node.metadata.xattrs,
             });
@@ -1045,6 +1066,67 @@ test "Azure generalization resets machine-specific owned-tree state" {
     const group = try tree.readFileAlloc(std.testing.allocator, "etc/group", 4096);
     defer std.testing.allocator.free(group);
     try std.testing.expect(std.mem.indexOf(u8, group, "wheel:x:10:alice") == null);
+}
+
+test "a declared mtime is stamped on injected nodes and left to the build default otherwise" {
+    const io = std.testing.io;
+    const spool_path = "test-os-customization-mtime.spool";
+    defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    const backdated: i64 = 1_400_000_000;
+    try apply(std.testing.allocator, &tree, .{ .filesystem = &.{
+        .{ .put_directory = .{ .path = "/opt/vendor", .metadata = .{ .mode = 0o755, .mtime = backdated } } },
+        .{ .put_file = .{
+            .path = "/opt/vendor/config",
+            .source = .{ .inline_bytes = "value\n" },
+            .metadata = .{ .mode = 0o644, .mtime = backdated },
+        } },
+        .{ .put_symlink = .{
+            .path = "/opt/vendor/current",
+            .target = "config",
+            .metadata = .{ .mode = 0o777, .mtime = backdated },
+        } },
+        .{ .put_file = .{
+            .path = "/opt/vendor/undated",
+            .source = .{ .inline_bytes = "value\n" },
+            .metadata = .{ .mode = 0o644 },
+        } },
+    } }, 0);
+
+    inline for (.{ "opt/vendor", "opt/vendor/config", "opt/vendor/current" }) |path| {
+        const node = tree.findNode(path) orelse return error.MissingNode;
+        try std.testing.expectEqual(@as(?i64, backdated), node.metadata.mtime);
+    }
+    const undated = tree.findNode("opt/vendor/undated") orelse return error.MissingNode;
+    try std.testing.expectEqual(@as(?i64, null), undated.metadata.mtime);
+}
+
+test "set_metadata changes only the fields it states, mtime included" {
+    const io = std.testing.io;
+    const spool_path = "test-os-customization-mtime-change.spool";
+    defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    const original: i64 = 1_400_000_000;
+    const restamped: i64 = 1_500_000_000;
+    try tree.putFileBytes("etc/config", "value\n", .{ .mode = 0o644, .uid = 7, .mtime = original });
+
+    try apply(std.testing.allocator, &tree, .{ .filesystem = &.{
+        .{ .set_metadata = .{ .path = "/etc/config", .mtime = restamped } },
+    } }, 0);
+    const restamped_node = tree.findNode("etc/config") orelse return error.MissingNode;
+    try std.testing.expectEqual(@as(?i64, restamped), restamped_node.metadata.mtime);
+    try std.testing.expectEqual(@as(u32, 7), restamped_node.metadata.uid);
+
+    try apply(std.testing.allocator, &tree, .{ .filesystem = &.{
+        .{ .set_metadata = .{ .path = "/etc/config", .mode = 0o600 } },
+    } }, 0);
+    const kept = tree.findNode("etc/config") orelse return error.MissingNode;
+    try std.testing.expectEqual(@as(?i64, restamped), kept.metadata.mtime);
+    try std.testing.expectEqual(@as(u16, 0o600), kept.metadata.mode);
 }
 
 test "Azure generalization leaves a resolv.conf symlink pointing at the resolver" {

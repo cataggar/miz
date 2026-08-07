@@ -65,6 +65,7 @@ pub fn map(
                 .mode = change.mode,
                 .uid = change.uid,
                 .gid = change.gid,
+                .mtime = change.mtime,
                 .xattrs = if (change.xattrs) |xattrs|
                     try convertXattrs(allocator, xattrs)
                 else
@@ -143,6 +144,7 @@ fn convertMetadata(
         .mode = metadata.mode,
         .uid = metadata.uid,
         .gid = metadata.gid,
+        .mtime = metadata.mtime,
         .xattrs = try convertXattrs(allocator, metadata.xattrs),
     };
 }

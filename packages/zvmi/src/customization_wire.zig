@@ -9,6 +9,7 @@ pub const Metadata = struct {
     mode: u16,
     uid: u32 = 0,
     gid: u32 = 0,
+    mtime: ?i64 = null,
     xattrs: []const Xattr = &.{},
 };
 
@@ -34,6 +35,7 @@ pub const MetadataChange = struct {
     mode: ?u16 = null,
     uid: ?u32 = null,
     gid: ?u32 = null,
+    mtime: ?i64 = null,
     xattrs: ?[]const Xattr = null,
 };
 
