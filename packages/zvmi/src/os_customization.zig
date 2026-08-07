@@ -319,7 +319,81 @@ fn applyAccounts(
     try tree.putFileBytes("etc/group", group_file, replacementMetadata(tree, "etc/group", 0o644));
 }
 
+/// Where a system unit can live in an offline root, in the order systemd
+/// itself resolves them: an administrator's unit in `/etc` shadows a local
+/// one, which shadows the one the distribution's package shipped.
+///
+/// `/run/systemd/system` is left out on purpose. It is populated by
+/// generators at boot and by `systemctl` at runtime, so a unit found there in
+/// an image being built would be a leftover from whatever produced the image
+/// rather than something the published image will carry.
+///
+/// `lib/systemd/system` is listed separately from `usr/lib/systemd/system`
+/// because a tree is a tree: on a merged-`/usr` image `/lib` is a symlink and
+/// the node lookup does not follow it, so a unit shipped at the `lib` path in
+/// a non-merged image would otherwise be invisible.
+const system_unit_directories = [_][]const u8{
+    "etc/systemd/system",
+    "usr/local/lib/systemd/system",
+    "usr/lib/systemd/system",
+    "lib/systemd/system",
+};
+
+/// Service enablement is modelled as systemd and nothing else, and this is
+/// where that assumption is checked rather than assumed.
+///
+/// Enabling a service here means writing a `.wants` symlink, which is a thing
+/// that means something only to systemd. Writing one into an image whose init
+/// is anything else produces a file nobody reads, in a directory nobody
+/// looks in, and a run that reported success. Every other target assumption
+/// in this project refuses what it does not understand -- an unrecognised
+/// initramfs generator, bootloader generator or SELinux policy each fail by
+/// name -- and this one used to be the exception.
+fn findSystemUnitDirectory(tree: *RootTree) ?[]const u8 {
+    for (system_unit_directories) |directory| {
+        if (tree.findNode(directory)) |node| {
+            if (node.kind == .directory) return directory;
+        }
+    }
+    return null;
+}
+
+/// The absolute path of the unit fragment `name` resolves to, or null when the
+/// target carries no such unit.
+///
+/// Returned as an absolute path because that is what the symlink has to point
+/// at: `systemctl enable` links a `.wants` entry to the fragment's own
+/// location, and hard-coding `/usr/lib/systemd/system` meant a unit the caller
+/// had just injected into `/etc/systemd/system` -- the obvious way to add one
+/// -- was enabled by a symlink into a file that does not exist.
+fn resolveSystemUnitPath(
+    tree: *RootTree,
+    buffer: []u8,
+    name: []const u8,
+) error{NoSpaceLeft}!?[]const u8 {
+    for (system_unit_directories) |directory| {
+        const candidate = try std.fmt.bufPrint(buffer, "/{s}/{s}", .{ directory, name });
+        // The leading slash belongs to the symlink target, not to the lookup.
+        if (tree.findNode(candidate[1..])) |node| {
+            if (node.kind != .directory) return candidate;
+        }
+    }
+    return null;
+}
+
+pub const ServiceError = error{
+    /// The target has no systemd unit directory at all, so there is no
+    /// service manager here that a `.wants` symlink would mean anything to.
+    UnsupportedServiceManager,
+    /// The target is systemd, but carries no unit by that name. Enabling it
+    /// would write a symlink pointing at nothing.
+    MissingServiceUnit,
+};
+
 fn applyServices(tree: *RootTree, services: []const Service) !void {
+    if (services.len == 0) return;
+    if (findSystemUnitDirectory(tree) == null) return error.UnsupportedServiceManager;
+
     for (services) |service| {
         var destination_buffer: [512]u8 = undefined;
         const destination = try std.fmt.bufPrint(
@@ -330,9 +404,14 @@ fn applyServices(tree: *RootTree, services: []const Service) !void {
         switch (service.state) {
             .enabled => {
                 var target_buffer: [512]u8 = undefined;
-                const target = try std.fmt.bufPrint(&target_buffer, "/usr/lib/systemd/system/{s}", .{service.name});
+                const target = (try resolveSystemUnitPath(tree, &target_buffer, service.name)) orelse
+                    return error.MissingServiceUnit;
                 try tree.putSymlink(destination, target, .{ .mode = 0o777 });
             },
+            // No unit lookup: disabling is a desired end state, and a target
+            // that never had the unit is already in it. What is still checked
+            // is the manager, because "disable a service" asked of an image
+            // with no service manager is a request nothing can satisfy.
             .disabled => _ = try tree.remove(destination),
         }
     }
@@ -698,6 +777,11 @@ test "typed customization applies files accounts SSH services and modules" {
     try tree.putFileBytes("etc/passwd", "root:x:0:0::/root:/bin/bash\n", .{ .mode = 0o644 });
     try tree.putFileBytes("etc/shadow", "root:!:19000:0:99999:7:::\n", .{ .mode = 0o600 });
     try tree.putFileBytes("etc/group", "root:x:0:\n", .{ .mode = 0o644 });
+    try tree.putFileBytes(
+        "usr/lib/systemd/system/example.service",
+        "[Unit]\nDescription=example\n",
+        .{ .mode = 0o644 },
+    );
 
     const operations = [_]FilesystemOperation{
         .{ .put_file = .{
@@ -745,9 +829,147 @@ test "typed customization applies files accounts SSH services and modules" {
     try std.testing.expectEqualStrings("ssh-ed25519 AAAATEST alice@example\n", keys);
     try std.testing.expectEqual(@as(u32, 12), tree.findNode("etc/application.conf").?.metadata.uid);
     try std.testing.expectEqual(root_tree.Kind.symlink, tree.findNode("etc/systemd/system/multi-user.target.wants/example.service").?.kind);
+    var service_target_buffer: [512]u8 = undefined;
+    const service_target = try testSymlinkTarget(
+        &tree,
+        &service_target_buffer,
+        "etc/systemd/system/multi-user.target.wants/example.service",
+    );
+    try std.testing.expectEqualStrings("/usr/lib/systemd/system/example.service", service_target);
     const module_options = try tree.readFileAlloc(std.testing.allocator, "etc/modprobe.d/zvmi-options.conf", 4096);
     defer std.testing.allocator.free(module_options);
     try std.testing.expectEqualStrings("options hv_netvsc ring_size=256\n", module_options);
+}
+
+/// Reads a symlink's target out of the tree. `readFileAlloc` refuses a
+/// non-file node, and the target is the point of every assertion below.
+fn testSymlinkTarget(tree: *const RootTree, buffer: []u8, path: []const u8) ![]const u8 {
+    const node = tree.findNode(path) orelse return error.MissingNode;
+    try std.testing.expectEqual(root_tree.Kind.symlink, node.kind);
+    const length = try tree.readNodeContent(path, buffer, 0);
+    return buffer[0..length];
+}
+
+test "enabling a service on a target with no service manager is refused" {
+    const io = std.testing.io;
+    const spool_path = "test-os-no-service-manager.spool";
+    defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    // A plausible root that is simply not systemd: it has the directories a
+    // unit would live under the parents of, but no unit directory.
+    try tree.putDirectory("etc", .{ .mode = 0o755 });
+    try tree.putDirectory("usr/lib", .{ .mode = 0o755 });
+    try tree.putFileBytes("etc/rc.conf", "sshd_enable=\"YES\"\n", .{ .mode = 0o644 });
+
+    const services = [_]Service{.{ .name = "sshd.service", .state = .enabled }};
+    try std.testing.expectError(
+        error.UnsupportedServiceManager,
+        apply(std.testing.allocator, &tree, .{ .services = &services }, 1_735_689_600),
+    );
+
+    // The refusal has to happen before anything is written, or a failed run
+    // still leaves the meaningless symlink this check exists to prevent.
+    try std.testing.expect(tree.findNode("etc/systemd") == null);
+
+    // Disabling is refused on the same grounds. It would otherwise be
+    // vacuously satisfiable -- remove a link that was never there -- which is
+    // a run reporting that it disabled a service on an image that has no way
+    // to run services at all.
+    const disable = [_]Service{.{ .name = "sshd.service", .state = .disabled }};
+    try std.testing.expectError(
+        error.UnsupportedServiceManager,
+        apply(std.testing.allocator, &tree, .{ .services = &disable }, 1_735_689_600),
+    );
+}
+
+test "enabling a service the target does not carry is refused rather than dangling" {
+    const io = std.testing.io;
+    const spool_path = "test-os-missing-unit.spool";
+    defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    try tree.putDirectory("usr/lib/systemd/system", .{ .mode = 0o755 });
+    try tree.putFileBytes(
+        "usr/lib/systemd/system/present.service",
+        "[Unit]\nDescription=present\n",
+        .{ .mode = 0o644 },
+    );
+
+    const services = [_]Service{.{ .name = "absent.service", .state = .enabled }};
+    try std.testing.expectError(
+        error.MissingServiceUnit,
+        apply(std.testing.allocator, &tree, .{ .services = &services }, 1_735_689_600),
+    );
+
+    // Not a target that refuses everything: the unit that is there enables.
+    const present = [_]Service{.{ .name = "present.service", .state = .enabled }};
+    try apply(std.testing.allocator, &tree, .{ .services = &present }, 1_735_689_600);
+    try std.testing.expectEqual(
+        root_tree.Kind.symlink,
+        tree.findNode("etc/systemd/system/multi-user.target.wants/present.service").?.kind,
+    );
+}
+
+test "a unit in /etc is enabled by a link to /etc, not to /usr/lib" {
+    const io = std.testing.io;
+    const spool_path = "test-os-etc-unit.spool";
+    defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    // The obvious workflow: inject a unit, then enable it. Injection puts it
+    // in /etc, because that is where an administrator's unit belongs, and
+    // linking it to /usr/lib -- which is what this used to do unconditionally
+    // -- produces a symlink to a file that does not exist.
+    const operations = [_]FilesystemOperation{.{ .put_file = .{
+        .path = "/etc/systemd/system/appliance.service",
+        .source = .{ .inline_bytes = "[Unit]\nDescription=appliance\n" },
+    } }};
+    const services = [_]Service{.{ .name = "appliance.service", .state = .enabled }};
+    try apply(std.testing.allocator, &tree, .{
+        .filesystem = &operations,
+        .services = &services,
+    }, 1_735_689_600);
+
+    var target_buffer: [512]u8 = undefined;
+    const target = try testSymlinkTarget(
+        &tree,
+        &target_buffer,
+        "etc/systemd/system/multi-user.target.wants/appliance.service",
+    );
+    try std.testing.expectEqualStrings("/etc/systemd/system/appliance.service", target);
+
+    // The link resolves to a node that is actually in the tree, which is the
+    // property that was missing and the only one worth asserting.
+    try std.testing.expect(tree.findNode(target[1..]) != null);
+}
+
+test "an /etc unit shadows a /usr/lib unit of the same name" {
+    const io = std.testing.io;
+    const spool_path = "test-os-unit-precedence.spool";
+    defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    try tree.putFileBytes("usr/lib/systemd/system/agent.service", "[Unit]\nDescription=shipped\n", .{ .mode = 0o644 });
+    try tree.putFileBytes("etc/systemd/system/agent.service", "[Unit]\nDescription=override\n", .{ .mode = 0o644 });
+
+    const services = [_]Service{.{ .name = "agent.service", .state = .enabled }};
+    try apply(std.testing.allocator, &tree, .{ .services = &services }, 1_735_689_600);
+
+    var target_buffer: [512]u8 = undefined;
+    const target = try testSymlinkTarget(
+        &tree,
+        &target_buffer,
+        "etc/systemd/system/multi-user.target.wants/agent.service",
+    );
+    // systemd resolves the administrator's copy, so enabling has to link to
+    // the same file the running system would load. Both units exist here, so
+    // this distinguishes the search order rather than finding the only one.
+    try std.testing.expectEqualStrings("/etc/systemd/system/agent.service", target);
 }
 
 test "Azure generalization resets machine-specific owned-tree state" {
