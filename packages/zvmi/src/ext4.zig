@@ -70,6 +70,14 @@ pub const first_non_reserved_inode: u32 = 11;
 /// has nowhere to put `i_extra_isize`, which is what carries creation time,
 /// nanosecond resolution, and -- the reason this matters most -- the two
 /// epoch bits without which no timestamp past 2038 can be represented.
+///
+/// This is a constant rather than a parameter on purpose, and the trade is
+/// recorded in `doc/image-building.md` beside the strict-profile discussion:
+/// a writer that could also emit 128-byte inodes would make the range of
+/// representable timestamps a property of the source it was handed rather
+/// than of the writer, which is what `root_tree.validateExt4Time` relies on
+/// not being true. An image an older zvmi wrote with 128-byte inodes is
+/// therefore read under `ext4_general_v1` and migrates by being rebuilt once.
 const writer_inode_size: u16 = 256;
 /// The classic ext2 inode. Still read, never written.
 const min_supported_reader_inode_size: u16 = 128;
