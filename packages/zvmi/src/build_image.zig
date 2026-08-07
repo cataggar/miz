@@ -4151,6 +4151,10 @@ test "build-image applies typed OS customization before generalization and ext4 
         .{ .put_file = .{ .path = "/etc/group", .source = .{ .inline_bytes = "root:x:0:\n" } } },
         .{ .put_file = .{ .path = "/etc/machine-id", .source = .{ .inline_bytes = "captured-machine-id\n" }, .metadata = .{ .mode = 0o444 } } },
         .{ .put_file = .{ .path = "/etc/ssh/ssh_host_rsa_key", .source = .{ .inline_bytes = "captured-host-key" }, .metadata = .{ .mode = 0o600 } } },
+        // Injected so the service below has a unit to be enabled from.
+        // Filesystem operations are applied before services for exactly this
+        // reason: a caller adds a unit and then enables it, in one request.
+        .{ .put_file = .{ .path = "/usr/lib/systemd/system/example.service", .source = .{ .inline_bytes = "[Unit]\nDescription=example\n" } } },
     };
     const users = [_]os_customization.User{.{
         .name = "alice",
