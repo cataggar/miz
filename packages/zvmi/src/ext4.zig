@@ -288,6 +288,11 @@ pub const PopulateOptions = struct {
     root_atime: ?i64 = null,
     root_mtime: ?i64 = null,
     root_ctime: ?i64 = null,
+    root_atime_nsec: u32 = 0,
+    root_mtime_nsec: u32 = 0,
+    root_ctime_nsec: u32 = 0,
+    root_crtime: ?i64 = null,
+    root_crtime_nsec: u32 = 0,
     /// If omitted, a zero UUID is written.
     uuid: ?[16]u8 = null,
     /// POSIX seconds timestamp written to the superblock/inodes.
@@ -406,6 +411,19 @@ pub const FileTreeView = struct {
         atime: ?i64 = null,
         mtime: ?i64 = null,
         ctime: ?i64 = null,
+        /// Sub-second parts of the three times above, 0..999999999. A source
+        /// that stored whole seconds -- or a caller that does not care --
+        /// leaves these zero, which is what the writer emitted for every
+        /// inode before they existed.
+        atime_nsec: u32 = 0,
+        mtime_nsec: u32 = 0,
+        ctime_nsec: u32 = 0,
+        /// The inode's creation time. Null means the source had none to give
+        /// -- a 128-byte inode has nowhere to store one -- and the writer
+        /// falls back to the image-wide timestamp, which is the honest answer
+        /// for a node this build is genuinely creating.
+        crtime: ?i64 = null,
+        crtime_nsec: u32 = 0,
     };
 
     pub fn reset(self: *FileTreeView) void {
@@ -510,12 +528,27 @@ const InodeTimes = struct {
     atime: ?i64 = null,
     mtime: ?i64 = null,
     ctime: ?i64 = null,
+    /// The upper 30 bits of each `i_*_extra` word. Zero is both the default
+    /// and what every inode this writer emitted before carried, so a caller
+    /// that supplies nothing gets byte-identical output.
+    atime_nsec: u32 = 0,
+    mtime_nsec: u32 = 0,
+    ctime_nsec: u32 = 0,
+    /// Null means the source had no creation time to preserve, and the
+    /// image-wide timestamp is used instead.
+    crtime: ?i64 = null,
+    crtime_nsec: u32 = 0,
 
     fn from(entry: FileTreeView.Entry) PopulateError!InodeTimes {
         return .{
             .atime = try checkedTime(entry.atime),
             .mtime = try checkedTime(entry.mtime),
             .ctime = try checkedTime(entry.ctime),
+            .atime_nsec = try checkedNanoseconds(entry.atime_nsec),
+            .mtime_nsec = try checkedNanoseconds(entry.mtime_nsec),
+            .ctime_nsec = try checkedNanoseconds(entry.ctime_nsec),
+            .crtime = try checkedTime(entry.crtime),
+            .crtime_nsec = try checkedNanoseconds(entry.crtime_nsec),
         };
     }
 
@@ -535,6 +568,20 @@ fn checkedTime(value: ?i64) PopulateError!?i64 {
     const seconds = value orelse return null;
     _ = try encodeInodeTime(seconds);
     return seconds;
+}
+
+/// The `i_*_extra` words carry the sub-second part in 30 bits, so a value of
+/// a billion or more is not merely out of range -- it would silently overlap
+/// the two epoch bits below it and move the timestamp by 136 years.
+fn checkedNanoseconds(value: u32) PopulateError!u32 {
+    if (value >= 1_000_000_000) return error.TimestampOutOfRange;
+    return value;
+}
+
+/// Packs an epoch count and a sub-second part into an `i_*_extra` word, which
+/// is the two low bits and the thirty above them.
+fn encodeInodeExtra(epoch: u32, nanoseconds: u32) u32 {
+    return (epoch & 0x3) | (nanoseconds << 2);
 }
 
 const EncodedTime = struct {
@@ -4160,6 +4207,11 @@ pub const GeneralRoot = struct {
     atime: i64,
     mtime: i64,
     ctime: i64,
+    atime_nsec: u32,
+    mtime_nsec: u32,
+    ctime_nsec: u32,
+    crtime: ?i64,
+    crtime_nsec: u32,
     xattrs: []const Xattr,
 };
 
@@ -4176,6 +4228,17 @@ pub const GeneralEntry = struct {
     atime: i64,
     mtime: i64,
     ctime: i64,
+    /// Sub-second parts of the three times above. A source whose inodes are
+    /// too narrow to store them, or which simply stored whole seconds,
+    /// reports zero.
+    atime_nsec: u32,
+    mtime_nsec: u32,
+    ctime_nsec: u32,
+    /// The inode's creation time, or null when the source could not store one
+    /// -- a 128-byte inode has no extra region, and a wider one may not
+    /// declare an `i_extra_isize` that reaches this far.
+    crtime: ?i64,
+    crtime_nsec: u32,
     /// Meaningful only for `.block_device` and `.char_device`.
     device: DeviceNumbers,
     /// Set only for `.hardlink`: the path of the first entry that shares the
@@ -4204,6 +4267,11 @@ const GeneralNode = struct {
     atime: i64,
     mtime: i64,
     ctime: i64,
+    atime_nsec: u32,
+    mtime_nsec: u32,
+    ctime_nsec: u32,
+    crtime: ?i64,
+    crtime_nsec: u32,
     device: DeviceNumbers,
     /// Borrowed from the earlier node that owns this inode's content.
     hardlink_target: []const u8,
@@ -4262,6 +4330,11 @@ pub const GeneralTree = struct {
             .atime = node.atime,
             .mtime = node.mtime,
             .ctime = node.ctime,
+            .atime_nsec = node.atime_nsec,
+            .mtime_nsec = node.mtime_nsec,
+            .ctime_nsec = node.ctime_nsec,
+            .crtime = node.crtime,
+            .crtime_nsec = node.crtime_nsec,
             .device = node.device,
             .hardlink_target = node.hardlink_target,
             .content = if (node.has_content) .{
@@ -4395,6 +4468,11 @@ const GeneralInode = struct {
     atime: i64,
     mtime: i64,
     ctime: i64,
+    atime_nsec: u32,
+    mtime_nsec: u32,
+    ctime_nsec: u32,
+    crtime: ?i64,
+    crtime_nsec: u32,
     link_count: u16,
     flags: u32,
     file_acl_block: u32,
@@ -4516,6 +4594,11 @@ const GeneralScanner = struct {
             .atime = root.atime,
             .mtime = root.mtime,
             .ctime = root.ctime,
+            .atime_nsec = root.atime_nsec,
+            .mtime_nsec = root.mtime_nsec,
+            .ctime_nsec = root.ctime_nsec,
+            .crtime = root.crtime,
+            .crtime_nsec = root.crtime_nsec,
             .xattrs = views,
         };
         bitmapSet(self.visited_directories, root_inode - 1);
@@ -4631,6 +4714,11 @@ const GeneralScanner = struct {
             .atime = inode.atime,
             .mtime = inode.mtime,
             .ctime = inode.ctime,
+            .atime_nsec = inode.atime_nsec,
+            .mtime_nsec = inode.mtime_nsec,
+            .ctime_nsec = inode.ctime_nsec,
+            .crtime = inode.crtime,
+            .crtime_nsec = inode.crtime_nsec,
             .device = inode.device,
             .hardlink_target = "",
             .has_content = inode.hasContent(),
@@ -4674,6 +4762,11 @@ const GeneralScanner = struct {
             .atime = inode.atime,
             .mtime = inode.mtime,
             .ctime = inode.ctime,
+            .atime_nsec = inode.atime_nsec,
+            .mtime_nsec = inode.mtime_nsec,
+            .ctime_nsec = inode.ctime_nsec,
+            .crtime = inode.crtime,
+            .crtime_nsec = inode.crtime_nsec,
             .device = .{},
             .hardlink_target = target,
             .has_content = false,
@@ -4964,6 +5057,19 @@ fn parseGeneralInode(inode_number: u32, buf: []const u8) !GeneralInode {
         readInt(u32, buf[140..144])
     else
         0;
+    // `i_crtime` needs `i_extra_isize` to cover 128..148 and its own extra
+    // word another four bytes past that. A source that declares less has no
+    // creation time to give rather than one that happens to read as zero,
+    // and the two have to stay distinguishable: 1970-01-01 is a creation
+    // time a real file can have.
+    const crtime: ?i64 = if (buf.len >= 152 and extra_isize >= 24)
+        decodeInodeTime(readInt(u32, buf[144..148]), readInt(u32, buf[148..152]))
+    else
+        null;
+    const crtime_extra: u32 = if (buf.len >= 152 and extra_isize >= 24)
+        readInt(u32, buf[148..152])
+    else
+        0;
     return .{
         .inode = inode_number,
         .kind = kind,
@@ -4974,6 +5080,11 @@ fn parseGeneralInode(inode_number: u32, buf: []const u8) !GeneralInode {
         .atime = decodeInodeTime(readInt(u32, buf[8..12]), atime_extra),
         .ctime = decodeInodeTime(readInt(u32, buf[12..16]), ctime_extra),
         .mtime = decodeInodeTime(readInt(u32, buf[16..20]), mtime_extra),
+        .atime_nsec = decodeInodeNanoseconds(atime_extra),
+        .ctime_nsec = decodeInodeNanoseconds(ctime_extra),
+        .mtime_nsec = decodeInodeNanoseconds(mtime_extra),
+        .crtime = crtime,
+        .crtime_nsec = decodeInodeNanoseconds(crtime_extra),
         .link_count = readInt(u16, buf[26..28]),
         .flags = flags,
         .file_acl_block = readInt(u32, buf[104..108]),
@@ -4985,6 +5096,15 @@ fn parseGeneralInode(inode_number: u32, buf: []const u8) !GeneralInode {
 /// ext4 keeps seconds in a signed 32-bit field and, on inodes large enough to
 /// hold it, two extra high bits in the matching `*_extra` field. Dropping the
 /// extra bits would silently move post-2038 timestamps back by 136 years.
+/// The sub-second part of an `i_*_extra` word: everything above the two
+/// epoch bits. A source that wrote a value of a billion or more is corrupt
+/// rather than merely unusual, and reporting zero for it keeps a rebuild from
+/// propagating a number ext4 itself could not have meant.
+fn decodeInodeNanoseconds(extra: u32) u32 {
+    const nanoseconds = extra >> 2;
+    return if (nanoseconds >= 1_000_000_000) 0 else nanoseconds;
+}
+
 fn decodeInodeTime(seconds: u32, extra: u32) i64 {
     var value: i64 = @as(i32, @bitCast(seconds));
     const epoch = extra & 0x3;
@@ -5392,6 +5512,11 @@ fn buildPlan(
             .atime = try checkedTime(options.root_atime),
             .mtime = try checkedTime(options.root_mtime),
             .ctime = try checkedTime(options.root_ctime),
+            .atime_nsec = try checkedNanoseconds(options.root_atime_nsec),
+            .mtime_nsec = try checkedNanoseconds(options.root_mtime_nsec),
+            .ctime_nsec = try checkedNanoseconds(options.root_ctime_nsec),
+            .crtime = try checkedTime(options.root_crtime),
+            .crtime_nsec = try checkedNanoseconds(options.root_crtime_nsec),
         },
     };
 
@@ -5912,15 +6037,16 @@ fn writeInodes(io: Io, file: Io.File, nodes: []Node, layout: Layout, options: Po
         // that includes `i_checksum_hi`, so it must be set before the
         // checksum is computed.
         writeInt(u16, buf[128..130], writer_extra_isize);
-        writeInt(u32, buf[132..136], ctime.epoch);
-        writeInt(u32, buf[136..140], mtime.epoch);
-        writeInt(u32, buf[140..144], atime.epoch);
-        // The image really is being created now, so the build timestamp is
-        // the honest answer. The source tree carries no creation time to
-        // preserve in its place.
-        const crtime = try encodeInodeTime(options.timestamp);
+        writeInt(u32, buf[132..136], encodeInodeExtra(ctime.epoch, node.times.ctime_nsec));
+        writeInt(u32, buf[136..140], encodeInodeExtra(mtime.epoch, node.times.mtime_nsec));
+        writeInt(u32, buf[140..144], encodeInodeExtra(atime.epoch, node.times.atime_nsec));
+        // A node the source carried keeps the creation time the source gave
+        // it. A node this build is genuinely creating has none to keep, and
+        // the build timestamp is then the honest answer rather than a
+        // borrowed one.
+        const crtime = try encodeInodeTime(node.times.crtime orelse options.timestamp);
         writeInt(u32, buf[144..148], crtime.seconds);
-        writeInt(u32, buf[148..152], crtime.epoch);
+        writeInt(u32, buf[148..152], encodeInodeExtra(crtime.epoch, node.times.crtime_nsec));
 
         setInodeChecksum(&buf, uuid, node.inode);
 
@@ -9553,6 +9679,11 @@ const InMemoryEntry = struct {
     atime: ?i64 = null,
     mtime: ?i64 = null,
     ctime: ?i64 = null,
+    atime_nsec: u32 = 0,
+    mtime_nsec: u32 = 0,
+    ctime_nsec: u32 = 0,
+    crtime: ?i64 = null,
+    crtime_nsec: u32 = 0,
 };
 
 const InMemoryTree = struct {
@@ -9609,6 +9740,11 @@ const InMemoryTree = struct {
             .atime = entry.atime,
             .mtime = entry.mtime,
             .ctime = entry.ctime,
+            .atime_nsec = entry.atime_nsec,
+            .mtime_nsec = entry.mtime_nsec,
+            .ctime_nsec = entry.ctime_nsec,
+            .crtime = entry.crtime,
+            .crtime_nsec = entry.crtime_nsec,
         };
     }
 
@@ -10516,6 +10652,108 @@ test "timestamps past 2038 survive a round trip through the extra epoch bits" {
     try std.testing.expectEqual(in_1960, past.ctime);
 
     try expectE2fsckClean(path);
+}
+
+test "creation times and sub-second precision survive a round trip" {
+    const io = std.testing.io;
+    const path = "test-ext4-crtime.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const build_time: u32 = 1_717_171_717;
+    const created: i64 = 1_300_000_000;
+    // Past 2038 as well, because the creation time is stored the same way
+    // every other time is and has to carry its epoch bits alongside the
+    // nanoseconds sharing the word.
+    const created_late: i64 = 4_300_000_000;
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{
+            .path = "captured",
+            .kind = .file,
+            .mode = 0o644,
+            .uid = 0,
+            .gid = 0,
+            .atime = 1_500_000_000,
+            .mtime = 1_400_000_000,
+            .ctime = 1_450_000_000,
+            .atime_nsec = 123_456_789,
+            .mtime_nsec = 999_999_999,
+            .ctime_nsec = 1,
+            .crtime = created,
+            .crtime_nsec = 500_000_000,
+        },
+        .{
+            .path = "late",
+            .kind = .file,
+            .mode = 0o644,
+            .uid = 0,
+            .gid = 0,
+            .crtime = created_late,
+        },
+        // Carries nothing, and so must come back exactly as it always did:
+        // the build timestamp with no sub-second part at all.
+        .{ .path = "fresh", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0 },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = 8 * 1024 * 1024,
+        .timestamp = build_time,
+    });
+
+    var reader = try openGeneral(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    var imported = try scanReadable(&reader, io, std.testing.allocator, .{
+        .available_length = 8 * 1024 * 1024,
+    });
+    defer imported.deinit();
+
+    const captured = findGeneralEntry(&imported, "captured").?;
+    try std.testing.expectEqual(@as(i64, 1_500_000_000), captured.atime);
+    try std.testing.expectEqual(@as(i64, 1_400_000_000), captured.mtime);
+    try std.testing.expectEqual(@as(i64, 1_450_000_000), captured.ctime);
+    try std.testing.expectEqual(@as(u32, 123_456_789), captured.atime_nsec);
+    try std.testing.expectEqual(@as(u32, 999_999_999), captured.mtime_nsec);
+    try std.testing.expectEqual(@as(u32, 1), captured.ctime_nsec);
+    try std.testing.expectEqual(@as(?i64, created), captured.crtime);
+    try std.testing.expectEqual(@as(u32, 500_000_000), captured.crtime_nsec);
+
+    const late = findGeneralEntry(&imported, "late").?;
+    try std.testing.expectEqual(@as(?i64, created_late), late.crtime);
+    try std.testing.expectEqual(@as(u32, 0), late.crtime_nsec);
+
+    const fresh = findGeneralEntry(&imported, "fresh").?;
+    try std.testing.expectEqual(@as(?i64, build_time), fresh.crtime);
+    try std.testing.expectEqual(@as(u32, 0), fresh.atime_nsec);
+    try std.testing.expectEqual(@as(u32, 0), fresh.mtime_nsec);
+    try std.testing.expectEqual(@as(u32, 0), fresh.ctime_nsec);
+    try std.testing.expectEqual(@as(u32, 0), fresh.crtime_nsec);
+
+    try expectE2fsckClean(path);
+}
+
+test "a sub-second part that would overlap the epoch bits is refused" {
+    const io = std.testing.io;
+    const path = "test-ext4-nsec-refused.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // The `i_*_extra` word gives the nanoseconds thirty bits above the two
+    // epoch bits. A billion still fits in thirty bits, so this is not caught
+    // by truncation -- it has to be refused by name, or the value silently
+    // becomes a legal nanosecond count with the wrong epoch beneath it.
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "file", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .mtime_nsec = 1_000_000_000 },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    try std.testing.expectError(
+        error.TimestampOutOfRange,
+        populate(io, file, std.testing.allocator, &tree.view, .{ .length = 8 * 1024 * 1024 }),
+    );
 }
 
 test "the writer refuses a timestamp no inode can represent" {

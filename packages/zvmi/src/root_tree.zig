@@ -28,6 +28,17 @@ pub const Metadata = struct {
     atime: ?i64 = null,
     mtime: ?i64 = null,
     ctime: ?i64 = null,
+    /// Sub-second parts of the three times above, 0..999999999. Zero is both
+    /// the default and what every node carried before these existed, so a
+    /// caller that supplies nothing gets the bytes it always got.
+    atime_nsec: u32 = 0,
+    mtime_nsec: u32 = 0,
+    ctime_nsec: u32 = 0,
+    /// The node's creation time. Null means there is none to preserve, and
+    /// the writer stamps the image-wide timestamp instead -- the honest
+    /// answer for a node the build is genuinely creating.
+    crtime: ?i64 = null,
+    crtime_nsec: u32 = 0,
     xattrs: []const ext4.Xattr = &.{},
 };
 
@@ -130,6 +141,13 @@ pub const RootMetadata = struct {
     atime: ?i64 = null,
     mtime: ?i64 = null,
     ctime: ?i64 = null,
+    /// See `Metadata` for what these mean and why zero and null preserve the
+    /// behaviour that was there before they existed.
+    atime_nsec: u32 = 0,
+    mtime_nsec: u32 = 0,
+    ctime_nsec: u32 = 0,
+    crtime: ?i64 = null,
+    crtime_nsec: u32 = 0,
 };
 
 pub const FatMetadataPolicy = enum {
@@ -510,6 +528,11 @@ pub const RootTree = struct {
             .atime = source.root.atime,
             .mtime = source.root.mtime,
             .ctime = source.root.ctime,
+            .atime_nsec = source.root.atime_nsec,
+            .mtime_nsec = source.root.mtime_nsec,
+            .ctime_nsec = source.root.ctime_nsec,
+            .crtime = source.root.crtime,
+            .crtime_nsec = source.root.crtime_nsec,
         });
         _ = try self.importExt4GeneralMode(source, .owned, "");
     }
@@ -525,6 +548,11 @@ pub const RootTree = struct {
             .atime = source.root.atime,
             .mtime = source.root.mtime,
             .ctime = source.root.ctime,
+            .atime_nsec = source.root.atime_nsec,
+            .mtime_nsec = source.root.mtime_nsec,
+            .ctime_nsec = source.root.ctime_nsec,
+            .crtime = source.root.crtime,
+            .crtime_nsec = source.root.crtime_nsec,
         });
         _ = try self.importExt4GeneralMode(source, .borrowed, "");
     }
@@ -550,6 +578,11 @@ pub const RootTree = struct {
                 .atime = entry.atime,
                 .mtime = entry.mtime,
                 .ctime = entry.ctime,
+                .atime_nsec = entry.atime_nsec,
+                .mtime_nsec = entry.mtime_nsec,
+                .ctime_nsec = entry.ctime_nsec,
+                .crtime = entry.crtime,
+                .crtime_nsec = entry.crtime_nsec,
                 .xattrs = entry.xattrs,
             };
             const path = try joinMountPath(&path_buffer, prefix, entry.path);
@@ -891,6 +924,7 @@ pub const RootTree = struct {
         hashOptionalInt(&hash, self.root_metadata.atime);
         hashOptionalInt(&hash, self.root_metadata.mtime);
         hashOptionalInt(&hash, self.root_metadata.ctime);
+        hashSubsecondTimes(&hash, self.root_metadata);
         for (self.nodes.items) |node| {
             hashString(&hash, node.path);
             hashInt(&hash, @intFromEnum(node.kind));
@@ -900,6 +934,7 @@ pub const RootTree = struct {
             hashOptionalInt(&hash, node.metadata.atime);
             hashOptionalInt(&hash, node.metadata.mtime);
             hashOptionalInt(&hash, node.metadata.ctime);
+            hashSubsecondTimes(&hash, node.metadata);
             for (node.owned_xattrs) |xattr| {
                 hashString(&hash, xattr.name);
                 hashString(&hash, xattr.value);
@@ -1042,6 +1077,11 @@ pub const RootTree = struct {
                 .atime = metadata.atime,
                 .mtime = metadata.mtime,
                 .ctime = metadata.ctime,
+                .atime_nsec = metadata.atime_nsec,
+                .mtime_nsec = metadata.mtime_nsec,
+                .ctime_nsec = metadata.ctime_nsec,
+                .crtime = metadata.crtime,
+                .crtime_nsec = metadata.crtime_nsec,
                 .xattrs = ownedXattrsView(owned_xattrs),
             },
             .owned_xattrs = owned_xattrs,
@@ -1274,11 +1314,15 @@ pub const RootTree = struct {
         try validateExt4Time(self.root_metadata.atime);
         try validateExt4Time(self.root_metadata.mtime);
         try validateExt4Time(self.root_metadata.ctime);
+        try validateExt4Time(self.root_metadata.crtime);
+        try validateSubsecondTimes(self.root_metadata);
         for (self.nodes.items) |node| {
             if (node.metadata.mode > 0o7777) return error.Ext4ModeUnsupported;
             try validateExt4Time(node.metadata.atime);
             try validateExt4Time(node.metadata.mtime);
             try validateExt4Time(node.metadata.ctime);
+            try validateExt4Time(node.metadata.crtime);
+            try validateSubsecondTimes(node.metadata);
         }
     }
 
@@ -1287,6 +1331,21 @@ pub const RootTree = struct {
     /// 1901-12-13 through 2446-05-10. Anything outside that has nowhere to
     /// go, and refusing is the only honest option: a wrapped value looks like
     /// a perfectly ordinary date.
+    /// The `i_*_extra` words carry the sub-second part in the thirty bits
+    /// above the two epoch bits, so a value of a billion or more does not
+    /// merely fail to fit -- it overlaps the epoch and moves the whole
+    /// timestamp by 136 years.
+    fn validateSubsecondTimes(metadata: anytype) !void {
+        inline for (.{
+            metadata.atime_nsec,
+            metadata.mtime_nsec,
+            metadata.ctime_nsec,
+            metadata.crtime_nsec,
+        }) |nanoseconds| {
+            if (nanoseconds >= 1_000_000_000) return error.Ext4TimestampsUnsupported;
+        }
+    }
+
     fn validateExt4Time(value: ?i64) !void {
         const seconds = value orelse return;
         if (seconds < ext4.min_representable_time or seconds > ext4.max_representable_time) {
@@ -1455,6 +1514,11 @@ pub const RootTree = struct {
             .atime = node.metadata.atime,
             .mtime = node.metadata.mtime,
             .ctime = node.metadata.ctime,
+            .atime_nsec = node.metadata.atime_nsec,
+            .mtime_nsec = node.metadata.mtime_nsec,
+            .ctime_nsec = node.metadata.ctime_nsec,
+            .crtime = node.metadata.crtime,
+            .crtime_nsec = node.metadata.crtime_nsec,
         };
     }
 
@@ -1537,6 +1601,11 @@ fn generalRootMetadata(source: *const ext4.GeneralTree) Metadata {
         .atime = source.root.atime,
         .mtime = source.root.mtime,
         .ctime = source.root.ctime,
+        .atime_nsec = source.root.atime_nsec,
+        .mtime_nsec = source.root.mtime_nsec,
+        .ctime_nsec = source.root.ctime_nsec,
+        .crtime = source.root.crtime,
+        .crtime_nsec = source.root.crtime_nsec,
         .xattrs = source.root.xattrs,
     };
 }
@@ -1658,6 +1727,11 @@ fn hasCanonicalFatMetadata(node: Node) bool {
         node.metadata.atime == null and
         node.metadata.mtime == null and
         node.metadata.ctime == null and
+        node.metadata.crtime == null and
+        node.metadata.atime_nsec == 0 and
+        node.metadata.mtime_nsec == 0 and
+        node.metadata.ctime_nsec == 0 and
+        node.metadata.crtime_nsec == 0 and
         node.owned_xattrs.len == 0;
 }
 
@@ -1667,7 +1741,12 @@ fn hasCanonicalFatRootMetadata(metadata: RootMetadata) bool {
         metadata.gid == 0 and
         metadata.atime == null and
         metadata.mtime == null and
-        metadata.ctime == null;
+        metadata.ctime == null and
+        metadata.crtime == null and
+        metadata.atime_nsec == 0 and
+        metadata.mtime_nsec == 0 and
+        metadata.ctime_nsec == 0 and
+        metadata.crtime_nsec == 0;
 }
 
 fn fatPathEqual(left: []const u8, right: []const u8) bool {
@@ -2580,4 +2659,24 @@ test "a FAT32 size accounts for a directory whose sibling sorts between it and i
     const conf = try fs.readFileAlloc(io, std.testing.allocator, "loader/entries/arch.conf");
     defer std.testing.allocator.free(conf);
     try std.testing.expectEqualStrings("title Arch\n", conf);
+}
+
+/// Hashed as a block after the seconds fields rather than interleaved with
+/// them, so a tree carrying none of them -- which is every tree written
+/// before they existed -- still hashes to what it always did.
+fn hashSubsecondTimes(hash: *std.crypto.hash.sha2.Sha256, metadata: anytype) void {
+    if (metadata.atime_nsec == 0 and
+        metadata.mtime_nsec == 0 and
+        metadata.ctime_nsec == 0 and
+        metadata.crtime_nsec == 0 and
+        metadata.crtime == null)
+    {
+        return;
+    }
+    hash.update("nsec\x00");
+    hashInt(hash, metadata.atime_nsec);
+    hashInt(hash, metadata.mtime_nsec);
+    hashInt(hash, metadata.ctime_nsec);
+    hashInt(hash, metadata.crtime_nsec);
+    hashOptionalInt(hash, metadata.crtime);
 }

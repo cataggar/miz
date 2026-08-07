@@ -365,7 +365,15 @@ opt-in because giving up reproducibility should be a decision, not a fallback.
   managers and anything else that compares inode numbers
 - block devices, character devices and FIFOs, including device numbers wider
   than the legacy 8:8 encoding
-- `mode`, `uid`, `gid`, and `atime`/`mtime`/`ctime` per inode
+- `mode`, `uid`, `gid`, and `atime`/`mtime`/`ctime` per inode, each to
+  nanosecond precision rather than truncated to whole seconds
+- `crtime`, each file's creation time, kept as the source recorded it rather
+  than restamped with the build time. A captured system's files were created
+  when they were created, and that is the one fact `crtime` exists to hold; a
+  source too narrow to store one -- a 128-byte inode has no room, and a wider
+  one may declare an `i_extra_isize` that stops short of the field -- has none
+  to preserve, and a node this build genuinely creates gets the build
+  timestamp, which is then the honest answer rather than a borrowed one
 - extended attributes, both inline in a 256-byte inode's spare space and in an
   external xattr block; this is what carries `security.selinux` and
   `system.posix_acl_access`/`system.posix_acl_default`, so dropping them would
