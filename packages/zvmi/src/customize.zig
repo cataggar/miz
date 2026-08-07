@@ -34,7 +34,7 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 22;
+pub const plan_schema_version: u32 = 23;
 pub const provenance_schema_version: u32 = 27;
 const mib: u64 = 1024 * 1024;
 
@@ -4053,6 +4053,7 @@ fn dupeGeneralization(
             .remove_ssh_host_keys = options.remove_ssh_host_keys,
             .remove_agent_state = options.remove_agent_state,
             .remove_dhcp_leases = options.remove_dhcp_leases,
+            .remove_resolver_configuration = options.remove_resolver_configuration,
             .remove_logs = options.remove_logs,
             .remove_caches = options.remove_caches,
             .clear_random_seed = options.clear_random_seed,
@@ -5176,6 +5177,7 @@ fn hashGeneralization(hash: *std.crypto.hash.sha2.Sha256, policy: Generalization
             hashBool(hash, options.remove_ssh_host_keys);
             hashBool(hash, options.remove_agent_state);
             hashBool(hash, options.remove_dhcp_leases);
+            hashBool(hash, options.remove_resolver_configuration);
             hashBool(hash, options.remove_logs);
             hashBool(hash, options.remove_caches);
             hashBool(hash, options.clear_random_seed);
@@ -11497,7 +11499,7 @@ test "the schema versions move only when the documents do" {
     // produced, the trust it ended up holding, the resolver it inherited --
     // spent one bump between them rather than one each. The plan did not move:
     // none of it is an instruction, all of it is what the run turned out to be.
-    try std.testing.expectEqual(@as(u32, 22), plan_schema_version);
+    try std.testing.expectEqual(@as(u32, 23), plan_schema_version);
     try std.testing.expectEqual(@as(u32, 27), provenance_schema_version);
 }
 

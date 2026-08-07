@@ -4,6 +4,9 @@
 //! offline, directly on the image file via `ext4.Editor`: no running
 //! system, no network, no Python. See issue #110.
 //!
+//! One reset deliberately differs from upstream: `/etc/resolv.conf` is
+//! removed only when it is a regular file. See `deleteResolverConfiguration`.
+//!
 //! Every reset here is tolerant of the target path not existing (a
 //! from-scratch `build-image` output won't have DHCP lease files, for
 //! instance, since it's never actually been network-booted) -- this is a
@@ -86,7 +89,7 @@ pub fn deprovision(allocator: std.mem.Allocator, img: Image, io: Io, offset: u64
 
     try resetHostname(&editor, io);
     try deleteSshHostKeys(allocator, &editor, io);
-    try deleteIfExists(&editor, io, "/etc/resolv.conf");
+    try deleteResolverConfiguration(&editor, io);
     try deleteIfExists(&editor, io, "/root/.bash_history");
     try deleteTreeIfExists(&editor, io, "/var/lib/azagent");
     for (dhcp_lease_dirs) |dir| try deleteTreeIfExists(&editor, io, dir);
@@ -113,6 +116,33 @@ fn resetMachineId(editor: *ext4.Editor, io: Io) !void {
         error.NotFound => {},
         else => return err,
     };
+}
+
+/// Removes `/etc/resolv.conf` only when it is a regular file.
+///
+/// A regular file there holds nameserver addresses -- machine-specific state
+/// in exactly the way a DHCP lease is, usually written by the same DHCP
+/// client, and naming the internal DNS topology of wherever the image was
+/// last running. A symlink there is not state: it is the target's resolver
+/// wiring, pointing at `/run/systemd/resolve/stub-resolv.conf` or
+/// `/run/NetworkManager/resolv.conf`, runtime paths that no offline image
+/// carries anyway. Deleting the symlink would remove the configuration and
+/// leave the state alone, which is backwards.
+///
+/// This is the one deliberate deviation from `waagent -deprovision` in this
+/// module. Upstream's default handler deletes the path unconditionally, and
+/// that default is precisely what its per-distribution handlers exist to
+/// override -- Ubuntu 18.04's refuses to touch it and says so in a warning.
+/// Copying the default would be copying the bug rather than the behaviour,
+/// and it would put this module at odds with
+/// `os_customization.generalize`, which applies the same rule.
+fn deleteResolverConfiguration(editor: *ext4.Editor, io: Io) !void {
+    const stat = editor.reader.statPath(io, "/etc/resolv.conf") catch |err| switch (err) {
+        error.NotFound => return,
+        else => return err,
+    };
+    if (stat.kind != .file) return;
+    try deleteIfExists(editor, io, "/etc/resolv.conf");
 }
 
 fn deleteIfExists(editor: *ext4.Editor, io: Io, path: []const u8) !void {
@@ -368,4 +398,40 @@ test "findRootExt4Offset and deprovision work end to end on a partitioned disk i
     try std.testing.expect(std.mem.indexOf(u8, group_after, "azureuser") == null);
 
     try std.testing.expectError(error.NotFound, reader.statPath(io, "/home/azureuser"));
+}
+
+test "deprovision leaves a resolv.conf symlink pointing at the resolver in place" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-deprovision-resolver-link.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const partition_length: u64 = 15 * 1024 * 1024;
+    const link_target = "../run/systemd/resolve/stub-resolv.conf";
+
+    var img = try Image.create(io, path, .raw, partition_length, .{});
+    defer img.close(io);
+
+    var tree = TestTree.init(&[_]TestEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "etc/resolv.conf", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = link_target.len, .bytes = link_target },
+        .{ .path = "etc/hostname", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = "special-host\n".len, .bytes = "special-host\n" },
+    });
+    tree.bind();
+
+    _ = try ext4.populate(io, img.file, allocator, &tree.view, .{
+        .offset = 0,
+        .length = partition_length,
+        .uuid = [_]u8{0x44} ** 16,
+        .timestamp = 1_717_171_717,
+    });
+
+    try deprovision(allocator, img, io, 0, .{});
+
+    var reader = try ext4.Reader.open(io, img.file, allocator, .{ .offset = 0 });
+    defer reader.deinit();
+
+    const target_after = try reader.readLinkAlloc(io, allocator, "/etc/resolv.conf");
+    defer allocator.free(target_after);
+    try std.testing.expectEqualStrings(link_target, target_after);
 }

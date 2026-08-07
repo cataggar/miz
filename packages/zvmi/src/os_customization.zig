@@ -115,6 +115,26 @@ pub const AzureGeneralization = struct {
     remove_ssh_host_keys: bool = true,
     remove_agent_state: bool = true,
     remove_dhcp_leases: bool = true,
+    /// Removes `/etc/resolv.conf` when it is a regular file, and leaves it
+    /// alone when it is a symlink.
+    ///
+    /// The distinction is the whole point. A regular file there holds
+    /// nameserver addresses, which are machine-specific state in exactly the
+    /// way a DHCP lease is -- usually written by the same DHCP client, and
+    /// naming the internal DNS topology of wherever the image was last
+    /// running. A symlink there is not state at all: it is the target's
+    /// resolver wiring, pointing at `/run/systemd/resolve/stub-resolv.conf`
+    /// or `/run/NetworkManager/resolv.conf`, both of which are runtime paths
+    /// that no published image carries anyway. Deleting the symlink would
+    /// remove the configuration and leave the state alone, which is backwards.
+    ///
+    /// This is a deliberate deviation from `waagent -deprovision`, whose
+    /// default handler deletes the path unconditionally. That default is
+    /// precisely what upstream's per-distribution handlers exist to override
+    /// -- Ubuntu 18.04's, for one, refuses to touch it and says so in a
+    /// warning -- so following the default here would be copying the bug
+    /// rather than the behaviour.
+    remove_resolver_configuration: bool = true,
     remove_logs: bool = false,
     remove_caches: bool = false,
     clear_random_seed: bool = true,
@@ -163,6 +183,7 @@ pub fn generalize(
                     _ = try tree.remove(path);
                 }
             }
+            if (options.remove_resolver_configuration) try removeResolverConfiguration(tree);
             if (options.remove_logs) try clearDirectory(tree, "var/log");
             if (options.remove_caches) try clearDirectory(tree, "var/cache");
             if (options.clear_random_seed) {
@@ -177,6 +198,14 @@ pub fn generalize(
             for (options.remove_users) |username| try removeUser(allocator, tree, username);
         },
     }
+}
+
+/// See `AzureGeneralization.remove_resolver_configuration` for why only a
+/// regular file is removed.
+fn removeResolverConfiguration(tree: *RootTree) !void {
+    const node = tree.findNode("etc/resolv.conf") orelse return;
+    if (node.kind != .file) return;
+    _ = try tree.remove("etc/resolv.conf");
 }
 
 fn applyFilesystemOperation(tree: *RootTree, operation: FilesystemOperation) !void {
@@ -985,6 +1014,7 @@ test "Azure generalization resets machine-specific owned-tree state" {
     try tree.putFileBytes("etc/ssh/sshd_config", "keep", .{ .mode = 0o644 });
     try tree.putFileBytes("var/lib/azagent/state", "captured", .{ .mode = 0o600 });
     try tree.putFileBytes("var/lib/dhcp/lease", "captured", .{ .mode = 0o600 });
+    try tree.putFileBytes("etc/resolv.conf", "nameserver 10.0.0.1\n", .{ .mode = 0o644 });
     try tree.putFileBytes("var/lib/systemd/random-seed", "captured", .{ .mode = 0o600 });
     try tree.putFileBytes("etc/passwd", "root:x:0:0::/root:/bin/bash\ndaemon:x:2:2::/:/usr/sbin/nologin\nalice:x:1000:1000::/srv/alice:/bin/bash\n", .{ .mode = 0o644 });
     try tree.putFileBytes("etc/shadow", "root:!:19000:0:99999:7:::\nalice:!:19000:0:99999:7:::\n", .{ .mode = 0o600 });
@@ -1003,6 +1033,7 @@ test "Azure generalization resets machine-specific owned-tree state" {
     try std.testing.expect(tree.findNode("etc/ssh/sshd_config") != null);
     try std.testing.expect(tree.findNode("var/lib/azagent") == null);
     try std.testing.expect(tree.findNode("var/lib/dhcp") == null);
+    try std.testing.expect(tree.findNode("etc/resolv.conf") == null);
     const random_seed = try tree.readFileAlloc(std.testing.allocator, "var/lib/systemd/random-seed", 1024);
     defer std.testing.allocator.free(random_seed);
     try std.testing.expectEqual(@as(usize, 0), random_seed.len);
@@ -1014,6 +1045,47 @@ test "Azure generalization resets machine-specific owned-tree state" {
     const group = try tree.readFileAlloc(std.testing.allocator, "etc/group", 4096);
     defer std.testing.allocator.free(group);
     try std.testing.expect(std.mem.indexOf(u8, group, "wheel:x:10:alice") == null);
+}
+
+test "Azure generalization leaves a resolv.conf symlink pointing at the resolver" {
+    const io = std.testing.io;
+    const spool_path = "test-os-generalization-resolver-link.spool";
+    defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    try tree.putSymlink("etc/resolv.conf", "../run/systemd/resolve/stub-resolv.conf", .{ .mode = 0o777 });
+    try generalize(std.testing.allocator, &tree, .{ .azure = .{} });
+
+    var buffer: [256]u8 = undefined;
+    const target = try testSymlinkTarget(&tree, &buffer, "etc/resolv.conf");
+    try std.testing.expectEqualStrings("../run/systemd/resolve/stub-resolv.conf", target);
+}
+
+test "Azure generalization keeps a resolv.conf file when the caller opts out" {
+    const io = std.testing.io;
+    const spool_path = "test-os-generalization-resolver-kept.spool";
+    defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    try tree.putFileBytes("etc/resolv.conf", "nameserver 10.0.0.1\n", .{ .mode = 0o644 });
+    try generalize(std.testing.allocator, &tree, .{ .azure = .{ .remove_resolver_configuration = false } });
+
+    const resolver = try tree.readFileAlloc(std.testing.allocator, "etc/resolv.conf", 1024);
+    defer std.testing.allocator.free(resolver);
+    try std.testing.expectEqualStrings("nameserver 10.0.0.1\n", resolver);
+}
+
+test "Azure generalization tolerates an image with no resolv.conf at all" {
+    const io = std.testing.io;
+    const spool_path = "test-os-generalization-resolver-absent.spool";
+    defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    try generalize(std.testing.allocator, &tree, .{ .azure = .{} });
+    try std.testing.expect(tree.findNode("etc/resolv.conf") == null);
 }
 
 test "Azure generalization rejects shared home removal before mutation" {
