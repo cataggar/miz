@@ -34,7 +34,7 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 23;
+pub const plan_schema_version: u32 = 24;
 pub const provenance_schema_version: u32 = 27;
 const mib: u64 = 1024 * 1024;
 
@@ -2467,6 +2467,7 @@ fn validateOsCustomization(
                         ));
                     }
                 }
+                try validateMtime(diagnostics, change.mtime, "/os/filesystem/set_metadata/mtime");
                 if (change.xattrs) |xattrs| {
                     try validateXattrs(diagnostics, xattrs, "/os/filesystem/set_metadata/xattrs");
                 }
@@ -2580,7 +2581,30 @@ fn validateMetadata(
     if (metadata.mode & ~@as(u16, 0o7777) != 0) {
         try diagnostics.append(validationError(.invalid_customization, path, "file modes may contain only permission and special bits", null));
     }
+    try validateMtime(diagnostics, metadata.mtime, path);
     try validateXattrs(diagnostics, metadata.xattrs, path);
+}
+
+/// Refuses a modification time ext4 cannot store, at plan time.
+///
+/// The writer already refuses it with `Ext4TimestampsUnsupported`, but it
+/// does so after the workspace has been built, which turns a typo in a
+/// declared constant into a late failure with no path in it. The whole point
+/// of a plan is that a request this wrong is rejected before anything runs.
+fn validateMtime(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    mtime: ?i64,
+    path: []const u8,
+) Allocator.Error!void {
+    const seconds = mtime orelse return;
+    if (seconds < ext4.min_representable_time or seconds > ext4.max_representable_time) {
+        try diagnostics.append(validationError(
+            .invalid_customization,
+            path,
+            "modification times must be representable in ext4",
+            null,
+        ));
+    }
 }
 
 fn validateXattrs(
@@ -3602,6 +3626,7 @@ fn dupeOsCustomization(
                 .mode = change.mode,
                 .uid = change.uid,
                 .gid = change.gid,
+                .mtime = change.mtime,
                 .xattrs = if (change.xattrs) |xattrs| try dupeXattrs(allocator, xattrs) else null,
             } },
         };
@@ -4005,6 +4030,7 @@ fn dupeMetadata(allocator: Allocator, metadata: Metadata) Allocator.Error!Metada
         .mode = metadata.mode,
         .uid = metadata.uid,
         .gid = metadata.gid,
+        .mtime = metadata.mtime,
         .xattrs = try dupeXattrs(allocator, metadata.xattrs),
     };
 }
@@ -4924,6 +4950,7 @@ fn hashOsCustomization(hash: *std.crypto.hash.sha2.Sha256, customization: OsCust
                 hashOptionalInt(hash, change.mode);
                 hashOptionalInt(hash, change.uid);
                 hashOptionalInt(hash, change.gid);
+                hashOptionalTime(hash, change.mtime);
                 if (change.xattrs) |xattrs| {
                     hash.update(&.{1});
                     hashXattrs(hash, xattrs);
@@ -5151,7 +5178,21 @@ fn hashMetadata(hash: *std.crypto.hash.sha2.Sha256, metadata: Metadata) void {
     hashInt(hash, metadata.mode);
     hashInt(hash, metadata.uid);
     hashInt(hash, metadata.gid);
+    hashOptionalTime(hash, metadata.mtime);
     hashXattrs(hash, metadata.xattrs);
+}
+
+/// Hashes an optional timestamp without going through `hashOptionalInt`,
+/// which casts to `u64` and so cannot carry a pre-1970 mtime.
+fn hashOptionalTime(hash: *std.crypto.hash.sha2.Sha256, value: ?i64) void {
+    if (value) |seconds| {
+        hash.update(&.{1});
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(i64, &bytes, seconds, .big);
+        hash.update(&bytes);
+    } else {
+        hash.update(&.{0});
+    }
 }
 
 fn hashXattrs(hash: *std.crypto.hash.sha2.Sha256, xattrs: []const ext4.Xattr) void {
@@ -10232,6 +10273,93 @@ test "validation rejects unsafe customization values and plaintext-shaped passwo
     try std.testing.expect(customization_errors >= 6);
 }
 
+test "a modification time ext4 cannot store is rejected at plan time" {
+    // The writer refuses these too, but only once the workspace has been
+    // built -- by which point the failure is an `Ext4TimestampsUnsupported`
+    // with no configuration path in it. A declared constant that is out by a
+    // factor of a thousand (milliseconds where seconds were meant) is the
+    // ordinary way to arrive here, and it should cost a preflight rather
+    // than a build.
+    const cases = [_]i64{
+        1_700_000_000_000,
+        ext4.max_representable_time + 1,
+        ext4.min_representable_time - 1,
+    };
+    for (cases) |mtime| {
+        var request = validRequest();
+        const operations = [_]FilesystemOperation{
+            .{ .put_file = .{
+                .path = "/etc/example",
+                .source = .{ .inline_bytes = "value" },
+                .metadata = .{ .mode = 0o644, .mtime = mtime },
+            } },
+            .{ .set_metadata = .{ .path = "/etc/example", .mtime = mtime } },
+        };
+        request.os = .{ .filesystem = &operations };
+
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        var put_rejected = false;
+        var change_rejected = false;
+        for (diagnostics.items) |diagnostic| {
+            if (diagnostic.code != .invalid_customization) continue;
+            if (std.mem.eql(u8, diagnostic.configuration_path, "/os/filesystem/put_file/metadata")) put_rejected = true;
+            if (std.mem.eql(u8, diagnostic.configuration_path, "/os/filesystem/set_metadata/mtime")) change_rejected = true;
+        }
+        if (!put_rejected or !change_rejected) {
+            std.debug.print("accepted unrepresentable mtime: {d}\n", .{mtime});
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // A time ext4 can store is not the validator's business to second-guess:
+    // backdating is the point of the field.
+    var request = validRequest();
+    const operations = [_]FilesystemOperation{.{ .put_file = .{
+        .path = "/etc/example",
+        .source = .{ .inline_bytes = "value" },
+        .metadata = .{ .mode = 0o644, .mtime = 1_400_000_000 },
+    } }};
+    request.os = .{ .filesystem = &operations };
+    var diagnostics = try validate(std.testing.allocator, &request);
+    defer diagnostics.deinit(std.testing.allocator);
+    for (diagnostics.items) |diagnostic| {
+        try std.testing.expect(diagnostic.code != .invalid_customization);
+    }
+}
+
+test "a declared mtime changes the plan hash" {
+    // The mtime is part of what the request states the image should contain,
+    // so two requests differing only in it are not the same build and must
+    // not share a plan identifier or a cache entry.
+    var base = validRequest();
+    const undated = [_]FilesystemOperation{.{ .put_file = .{
+        .path = "/etc/example",
+        .source = .{ .inline_bytes = "value" },
+        .metadata = .{ .mode = 0o644 },
+    } }};
+    base.os = .{ .filesystem = &undated };
+
+    var dated_request = validRequest();
+    const dated = [_]FilesystemOperation{.{ .put_file = .{
+        .path = "/etc/example",
+        .source = .{ .inline_bytes = "value" },
+        .metadata = .{ .mode = 0o644, .mtime = 1_400_000_000 },
+    } }};
+    dated_request.os = .{ .filesystem = &dated };
+
+    var base_plan = try resolve(std.testing.allocator, &base, .{ .host_architecture = .x86_64 });
+    defer base_plan.deinit(std.testing.allocator);
+    var dated_plan = try resolve(std.testing.allocator, &dated_request, .{ .host_architecture = .x86_64 });
+    defer dated_plan.deinit(std.testing.allocator);
+
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &base_plan.plan.?.data.plan_hash.bytes,
+        &dated_plan.plan.?.data.plan_hash.bytes,
+    ));
+}
+
 test "a kernel module name that would render as two tokens is rejected" {
     // `validConfigName` permits spaces, which is harmless for a filename but
     // not for a name that becomes the subject of a `modprobe.d` directive:
@@ -11499,7 +11627,7 @@ test "the schema versions move only when the documents do" {
     // produced, the trust it ended up holding, the resolver it inherited --
     // spent one bump between them rather than one each. The plan did not move:
     // none of it is an instruction, all of it is what the run turned out to be.
-    try std.testing.expectEqual(@as(u32, 23), plan_schema_version);
+    try std.testing.expectEqual(@as(u32, 24), plan_schema_version);
     try std.testing.expectEqual(@as(u32, 27), provenance_schema_version);
 }
 
