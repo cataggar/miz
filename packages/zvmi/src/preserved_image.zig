@@ -1289,6 +1289,11 @@ fn populateOptions(
         .root_atime = root.atime,
         .root_mtime = root.mtime,
         .root_ctime = root.ctime,
+        .root_atime_nsec = root.atime_nsec,
+        .root_mtime_nsec = root.mtime_nsec,
+        .root_ctime_nsec = root.ctime_nsec,
+        .root_crtime = root.crtime,
+        .root_crtime_nsec = root.crtime_nsec,
     };
 }
 
@@ -4577,6 +4582,7 @@ fn createGeneralTestDisk(allocator: std.mem.Allocator, io: Io, path: []const u8)
         \\sif /etc/hostname uid 1234
         \\sif /etc/hostname gid 5678
         \\sif /etc/hostname mtime @1400000000
+        \\sif /etc/hostname crtime @1200000000
         \\ea_set /etc/hostname security.selinux system_u:object_r:etc_t:s0
         \\quit
         \\
@@ -4701,6 +4707,11 @@ test "general rebuild imports a stock mke2fs source and preserves its metadata" 
             try std.testing.expectEqual(@as(u32, 1234), entry.uid);
             try std.testing.expectEqual(@as(u32, 5678), entry.gid);
             try std.testing.expectEqual(@as(i64, 1_400_000_000), entry.mtime);
+            // The creation time is the source's, not this rebuild's. A
+            // captured system's files were created when they were created,
+            // and a rebuild that restamped them all with the build time
+            // would erase the one fact `crtime` exists to record.
+            try std.testing.expectEqual(@as(?i64, 1_200_000_000), entry.crtime);
             var found = false;
             for (entry.xattrs) |xattr| {
                 if (!std.mem.eql(u8, xattr.name, "security.selinux")) continue;
