@@ -150,6 +150,24 @@ pub const PopulateReport = struct {
     esp_partuuid: guid.Guid,
     root_partuuid: guid.Guid,
     kernel_device_partuuid: guid.Guid,
+    /// The kernel command line this call wrote into every entry it generated,
+    /// verbatim.
+    ///
+    /// Reported rather than left to be reconstructed, because it is composed
+    /// here from three things the caller holds separately -- the root
+    /// PARTUUID text, the verity superblock, and the caller's own appended
+    /// options -- by a rule that lives in this file. A caller that rebuilt it
+    /// from those parts would be a second implementation of that rule, free
+    /// to drift from the one that produced the bytes on the disk. This is the
+    /// string that was written.
+    ///
+    /// Owned by the report; release it with `deinit`.
+    kernel_command_line: []u8,
+
+    pub fn deinit(self: *PopulateReport, allocator: std.mem.Allocator) void {
+        allocator.free(self.kernel_command_line);
+        self.* = undefined;
+    }
 };
 
 pub const PopulateError = std.mem.Allocator.Error || fat32.MutationError ||
@@ -328,10 +346,16 @@ const BootPlan = struct {
 pub const GeneratedConfigFile = struct {
     path: []u8,
     bytes: []u8,
+    /// The kernel command line embedded in `bytes`, verbatim. Reported for
+    /// the same reason as `PopulateReport.kernel_command_line`: the rule that
+    /// composes it lives here, so this file states the result rather than
+    /// inviting a caller to derive it a second time.
+    kernel_command_line: []u8,
 
     pub fn deinit(self: *GeneratedConfigFile, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
         allocator.free(self.bytes);
+        allocator.free(self.kernel_command_line);
         self.* = undefined;
     }
 };
@@ -405,6 +429,18 @@ pub fn populateEsp(
     const secure_boot_plan = try buildSecureBootCopyPlan(allocator, plan.scan.secure_boot_files, copy_plan, plan.architecture, options.boot_mode);
     defer freeCopyPlan(allocator, secure_boot_plan);
 
+    // Composed once, here, and then handed to every renderer below. GRUB
+    // entries, BLS entries and UKIs all boot the same root filesystem, so a
+    // run that gave them different command lines would be publishing an image
+    // whose behaviour depended on which entry the firmware picked.
+    const kernel_command_line = try renderKernelOptions(
+        allocator,
+        plan.rootPartuuidText(),
+        options.extra_kernel_options,
+        options.verity,
+    );
+    errdefer allocator.free(kernel_command_line);
+
     if (options.stage_sink) |sink| {
         if (!sink.advance(.bootloader)) return error.InvalidOperationOrder;
     }
@@ -419,11 +455,9 @@ pub fn populateEsp(
         const grub_cfg = try renderGrubCfg(
             allocator,
             plan.boot_entries,
-            plan.rootPartuuidText(),
             plan.kernelDevicePartuuidText(),
             plan.rootFilesystemUuidText(),
-            options.extra_kernel_options,
-            options.verity,
+            kernel_command_line,
             .gpt,
             options.grub_timeout_seconds,
         );
@@ -439,7 +473,7 @@ pub fn populateEsp(
         for (vendor_cfg_paths.items) |path| try writeGeneratedFile(io, esp, path, grub_cfg);
 
         for (plan.boot_entries) |entry| {
-            const bls_text = try renderBlsEntry(allocator, entry, plan.rootPartuuidText(), options.extra_kernel_options, options.verity);
+            const bls_text = try renderBlsEntry(allocator, entry, kernel_command_line);
             defer allocator.free(bls_text);
             const bls_path = try std.fmt.allocPrint(allocator, "loader/entries/{s}.conf", .{entry.id});
             defer allocator.free(bls_path);
@@ -451,7 +485,7 @@ pub fn populateEsp(
         if (options.stage_sink) |sink| {
             if (!sink.advance(.uki)) return error.InvalidOperationOrder;
         }
-        break :blk try generateUkis(allocator, io, esp, source, plan.architecture, plan.boot_entries, plan.rootPartuuidText(), options);
+        break :blk try generateUkis(allocator, io, esp, source, plan.architecture, plan.boot_entries, kernel_command_line, options);
     } else 0;
 
     return .{
@@ -464,6 +498,7 @@ pub fn populateEsp(
         .esp_partuuid = esp_partuuid,
         .root_partuuid = root_partuuid,
         .kernel_device_partuuid = plan.kernel_device_partuuid,
+        .kernel_command_line = kernel_command_line,
     };
 }
 
@@ -549,19 +584,29 @@ pub fn generateBiosGrubCfg(
     });
     defer plan.deinit(allocator);
 
+    const kernel_command_line = try renderKernelOptions(
+        allocator,
+        plan.rootPartuuidText(),
+        options.extra_kernel_options,
+        options.verity,
+    );
+    errdefer allocator.free(kernel_command_line);
+
+    const path = try allocator.dupe(u8, config_path);
+    errdefer allocator.free(path);
+
     return .{
-        .path = try allocator.dupe(u8, config_path),
+        .path = path,
         .bytes = try renderGrubCfg(
             allocator,
             plan.boot_entries,
-            plan.rootPartuuidText(),
             plan.kernelDevicePartuuidText(),
             plan.rootFilesystemUuidText(),
-            options.extra_kernel_options,
-            options.verity,
+            kernel_command_line,
             .msdos,
             options.grub_timeout_seconds,
         ),
+        .kernel_command_line = kernel_command_line,
     };
 }
 
@@ -1361,7 +1406,7 @@ fn generateUkis(
     source: *SourceTreeView,
     architecture: Architecture,
     entries: []const BootEntry,
-    root_partuuid_text: []const u8,
+    cmdline: []const u8,
     options: PopulateOptions,
 ) PopulateError!usize {
     std.debug.assert(entries.len != 0);
@@ -1394,9 +1439,6 @@ fn generateUkis(
         else
             null;
         defer if (initrd_bytes) |bytes| allocator.free(bytes);
-
-        const cmdline = try renderKernelOptions(allocator, root_partuuid_text, options.extra_kernel_options, options.verity);
-        defer allocator.free(cmdline);
 
         const uname = kernelReleaseName(entry.kernel.source_path);
         const uki_bytes = try uki.generate(allocator, .{
@@ -1622,11 +1664,9 @@ fn renderLoaderConf(
 fn renderGrubCfg(
     allocator: std.mem.Allocator,
     entries: []const BootEntry,
-    root_partuuid_text: []const u8,
     kernel_device_partuuid_text: []const u8,
     root_filesystem_uuid_text: ?[]const u8,
-    extra_kernel_options: []const u8,
-    verity_info: ?verity.Info,
+    kernel_options: []const u8,
     partition_module: GrubPartitionModule,
     timeout_seconds: u32,
 ) std.mem.Allocator.Error![]u8 {
@@ -1652,8 +1692,6 @@ fn renderGrubCfg(
     }
 
     for (entries) |entry| {
-        const kernel_options = try renderKernelOptions(allocator, root_partuuid_text, extra_kernel_options, verity_info);
-        defer allocator.free(kernel_options);
         out.writer.print("menuentry '{s}' --id '{s}' {{\n", .{ entry.title, entry.id }) catch return error.OutOfMemory;
         out.writer.print("    linux ($kernel_root){s} {s}\n", .{ entry.kernel.config_path, kernel_options }) catch return error.OutOfMemory;
         if (entry.initrd) |initrd| {
@@ -1668,14 +1706,10 @@ fn renderGrubCfg(
 fn renderBlsEntry(
     allocator: std.mem.Allocator,
     entry: BootEntry,
-    root_partuuid_text: []const u8,
-    extra_kernel_options: []const u8,
-    verity_info: ?verity.Info,
+    kernel_options: []const u8,
 ) std.mem.Allocator.Error![]u8 {
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
-    const kernel_options = try renderKernelOptions(allocator, root_partuuid_text, extra_kernel_options, verity_info);
-    defer allocator.free(kernel_options);
 
     out.writer.print(
         "title {s}\nversion {s}\nlinux {s}\n",
@@ -1844,11 +1878,12 @@ test "populateEsp copies EFI binaries and generates grub.cfg plus BLS entries" {
     });
     tree.bind();
 
-    const report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
+    var report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
         .planned_partitions = &identities,
         .extra_kernel_options = "console=ttyS0 quiet",
         .title_prefix = "zvmi",
     });
+    defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(Architecture.x86_64, report.architecture);
     try std.testing.expectEqual(@as(usize, 4), report.copied_efi_file_count);
     try std.testing.expectEqual(@as(usize, 0), report.copied_secure_boot_file_count);
@@ -1969,7 +2004,7 @@ test "populateEsp ignores GRUB's own linux.mod and installer loader binaries as 
     });
     tree.bind();
 
-    const report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
+    var report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
         .planned_partitions = &identities,
         .title_prefix = "zvmi",
         .root_filesystem_uuid = [_]u8{
@@ -1977,6 +2012,7 @@ test "populateEsp ignores GRUB's own linux.mod and installer loader binaries as 
             0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89,
         },
     });
+    defer report.deinit(std.testing.allocator);
     // Only the real kernel should have produced a BLS entry -- not 3.
     try std.testing.expectEqual(@as(usize, 1), report.bls_entry_count);
 
@@ -2039,9 +2075,10 @@ test "populateEsp synthesizes fallback BOOTX64.EFI from shim when needed" {
     });
     tree.bind();
 
-    const report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
+    var report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
         .planned_partitions = &planned,
     });
+    defer report.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("EFI/BOOT/BOOTX64.EFI", report.default_bootloader_path);
 
     const fallback = try esp.readFileAlloc(io, std.testing.allocator, "EFI/BOOT/BOOTX64.EFI");
@@ -2094,7 +2131,7 @@ test "populateEsp appends dm-verity kernel arguments to grub.cfg and BLS entries
     });
     tree.bind();
 
-    _ = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
+    var report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
         .planned_partitions = &planned,
         .extra_kernel_options = "console=ttyS0 quiet",
         .verity = .{
@@ -2107,6 +2144,7 @@ test "populateEsp appends dm-verity kernel arguments to grub.cfg and BLS entries
             .rootHash = root_hash,
         },
     });
+    defer report.deinit(std.testing.allocator);
 
     var salt_buf: [verity.salt_size * 2]u8 = undefined;
     var root_hash_buf: [verity.digest_size * 2]u8 = undefined;
@@ -2137,6 +2175,14 @@ test "populateEsp appends dm-verity kernel arguments to grub.cfg and BLS entries
     defer std.testing.allocator.free(bls_entry);
     const parsed_bls = try parseBlsEntry(bls_entry);
     try std.testing.expectEqualStrings(expected_options, parsed_bls.options.?);
+
+    // The report is only worth having if it is the same bytes. Compared
+    // against what was read back off the ESP rather than against
+    // `expected_options` alone, so that a renderer which stopped using the
+    // reported line would fail here instead of quietly reporting a string no
+    // entry contains.
+    try std.testing.expectEqualStrings(parsed_bls.options.?, report.kernel_command_line);
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg, report.kernel_command_line) != null);
 }
 
 test "renderKernelOptions accepts synthesized MBR PARTUUID text for dm-verity" {
@@ -2323,12 +2369,13 @@ test "populateEsp copies MOK assets and emits UKIs when requested" {
         }
     };
     var stage_recorder = StageRecorder{};
-    const report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
+    var report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
         .planned_partitions = &planned,
         .boot_mode = .bls_and_uki,
         .extra_kernel_options = "quiet splash",
         .stage_sink = .{ .context = &stage_recorder, .advanceFn = StageRecorder.advance },
     });
+    defer report.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(PopulateStage, &.{ .prepare, .bootloader, .uki }, stage_recorder.stages[0..stage_recorder.len]);
     try std.testing.expectEqual(@as(usize, 4), report.copied_efi_file_count);
     try std.testing.expectEqual(@as(usize, 3), report.copied_secure_boot_file_count);
@@ -2390,10 +2437,11 @@ test "populateEsp can generate UKI-only ESP boot path" {
     });
     tree.bind();
 
-    const report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
+    var report = try populateEsp(std.testing.allocator, io, &esp, &tree.view, .{
         .planned_partitions = &planned,
         .boot_mode = .uki_only,
     });
+    defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), report.copied_efi_file_count);
     try std.testing.expectEqual(@as(usize, 0), report.bls_entry_count);
     try std.testing.expectEqual(@as(usize, 1), report.uki_count);

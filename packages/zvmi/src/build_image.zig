@@ -188,12 +188,24 @@ pub const BuildImageReport = struct {
     partition_style: ?azure.PartitionStyleReport = null,
     vhdx_metadata: ?VhdxMetadataReport = null,
     root_tree_digest: ?[32]u8 = null,
+    /// The kernel command line this build composed and wrote into the boot
+    /// entries it generated.
+    ///
+    /// Null when the build generated no boot entries at all -- a dry run, or
+    /// a layout with neither an ESP nor a BIOS GRUB chain. Otherwise this is
+    /// the line the published image boots with, which is not the line the
+    /// caller asked for: `extra_kernel_options` is appended to a base this
+    /// build derives from the root PARTUUID it assigned and, for a verity
+    /// image, from a root hash that does not exist until the tree is sealed.
+    /// A caller cannot state it in advance, so the build states it after.
+    kernel_command_line: ?[]u8 = null,
     /// The largest value each limit reached while the root tree was built.
     limit_peaks: limits_mod.Peaks = .{},
 
     pub fn deinit(self: *BuildImageReport, allocator: std.mem.Allocator) void {
         allocator.free(self.rootfs_path_in_iso);
         allocator.free(self.planned_partitions);
+        if (self.kernel_command_line) |line| allocator.free(line);
         self.* = undefined;
     }
 };
@@ -456,6 +468,7 @@ pub fn build(
             .extra_kernel_options = options.extra_kernel_options,
         });
         defer bios_grub_cfg.deinit(allocator);
+        report.kernel_command_line = try allocator.dupe(u8, bios_grub_cfg.kernel_command_line);
         const existing = root_tree.findNode(bios_grub_cfg.path);
         try root_tree.putFileBytes(
             bios_grub_cfg.path,
@@ -531,7 +544,7 @@ pub fn build(
             .length = esp_partition.planned.length_bytes,
         });
         var populate_stage_bridge = PopulateStageBridge{ .sink = options.stage_sink };
-        _ = bootconfig.populateEsp(allocator, io, &esp_fs, try root_tree.ext4View(), .{
+        var esp_report = bootconfig.populateEsp(allocator, io, &esp_fs, try root_tree.ext4View(), .{
             .planned_partitions = planned_partitions,
             .architecture = architecture,
             .verity = report.verity,
@@ -550,6 +563,14 @@ pub fn build(
                 return err,
             else => return err,
         };
+        defer esp_report.deinit(allocator);
+        // The ESP is the authority when both paths ran. A Gen1 image carries
+        // a BIOS GRUB chain and an ESP, and the two are rendered from the
+        // same inputs by the same function, so they agree; taking the ESP's
+        // copy keeps one field meaning one thing rather than "whichever
+        // renderer happened to run last".
+        if (report.kernel_command_line) |line| allocator.free(line);
+        report.kernel_command_line = try allocator.dupe(u8, esp_report.kernel_command_line);
     }
 
     try enterStage(options, .check_and_close_filesystems);
@@ -3608,6 +3629,12 @@ test "build-image installs a Gen1 BIOS GRUB chain into the post-MBR gap" {
     try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "initrd ($kernel_root)/boot/initramfs-test.img") != null);
     try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "boot/x86_64/loader/linux") == null);
     try std.testing.expect(std.mem.indexOf(u8, grub_cfg, "root=live:CDLABEL=CDROM") == null);
+
+    // A Gen1 build plans no ESP, so the BIOS GRUB config it writes into the
+    // root filesystem is the only boot configuration there is -- and the
+    // reported command line has to be the one inside it. Checked against the
+    // file read back out of the built ext4, not against a re-derivation.
+    try std.testing.expect(std.mem.indexOf(u8, grub_cfg, report.kernel_command_line.?) != null);
 }
 
 test "build-image can append a dm-verity tree and pass metadata through COSI output" {
@@ -3657,6 +3684,12 @@ test "build-image can append a dm-verity tree and pass metadata through COSI out
     try std.testing.expect(std.mem.indexOf(u8, bls_entry, "root=/dev/mapper/root") != null);
     try std.testing.expect(std.mem.indexOf(u8, bls_entry, root_hash_text) != null);
     try std.testing.expect(std.mem.indexOf(u8, bls_entry, "systemd.verity_root_options=superblock=0,format=1") != null);
+
+    // The reported line is the line in the entry. Asserted by containment in
+    // the entry text that was just read back off the ESP, so the report
+    // cannot describe a command line the image does not carry.
+    try std.testing.expect(std.mem.indexOf(u8, bls_entry, report.kernel_command_line.?) != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.kernel_command_line.?, root_hash_text) != null);
 
     _ = try cosi.writeWithOptions(img, io, allocator, cosi_path, .{
         .root_verity = report.verity,
@@ -3728,6 +3761,67 @@ test "build-image can append a dm-verity tree for Gen1 builds and synthesize an 
     try std.testing.expect(std.mem.indexOf(u8, kernel_options, "systemd.verity_root_data=PARTUUID=") != null);
     try std.testing.expect(std.mem.indexOf(u8, kernel_options, "systemd.verity_root_hash=PARTUUID=") != null);
     try std.testing.expect(std.mem.indexOf(u8, kernel_options, root_partuuid_text) != null);
+
+    // The assertions above rebuild the command line from the report's parts,
+    // which is the derivation a consumer would otherwise have to perform --
+    // and the fact that this test has to perform it is itself the finding.
+    // A Gen1 verity build writes no boot configuration at all: it plans no
+    // ESP, and the BIOS GRUB config is deliberately skipped for verity
+    // because embedding the final `roothash=` in a file that lives inside the
+    // verified root filesystem is self-referential (see the comment at the
+    // Gen1 BIOS branch in `build`). So nothing composed a command line, and
+    // the honest record is that there is none -- not a copy of the string
+    // this test derived, which no boot entry contains.
+    try std.testing.expect(report.kernel_command_line == null);
+}
+
+test "a build reports the kernel command line it composed, including what no plan could state" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-cmdline.iso";
+    const oci_root = "test-build-image-cmdline-oci";
+    const output_path = "test-build-image-cmdline.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
+    defer fixture.deinit(allocator);
+
+    var report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 256 * mib,
+        .verity = true,
+        .extra_kernel_options = "console=ttyS0 zvmi.marker=present",
+    });
+    defer report.deinit(allocator);
+
+    const line = report.kernel_command_line orelse return error.TestExpectedCommandLine;
+
+    // The caller's half. Present, and at the end, because the composition
+    // appends: an option the caller passes last must win over the base.
+    try std.testing.expect(std.mem.endsWith(u8, line, "console=ttyS0 zvmi.marker=present"));
+
+    // The half no caller could have written. The root hash is a digest of the
+    // finished root filesystem, so it does not exist at the moment the
+    // request is made -- this is the reason the line is recorded as an
+    // outcome instead of being stated in the plan and hashed with it.
+    var root_hash_buf: [verity.digest_size * 2]u8 = undefined;
+    const root_hash_text = report.verity.?.formatRootHash(&root_hash_buf);
+    try std.testing.expect(std.mem.indexOf(u8, line, root_hash_text) != null);
+
+    // Not a vacuous pass: the request text and the root hash are different
+    // strings, and neither is a substring of the other.
+    try std.testing.expect(std.mem.indexOf(u8, "console=ttyS0 zvmi.marker=present", root_hash_text) == null);
 }
 
 test "build-image --verity fails fast when the initramfs lacks dm-verity tooling" {
