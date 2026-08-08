@@ -2028,7 +2028,7 @@ const Session = struct {
             // a run passed over.
             if (std.mem.eql(u8, entry.name, ".") or
                 std.mem.eql(u8, entry.name, "..")) continue;
-            if (!validKernelRelease(entry.name)) {
+            if (!vm_control.validKernelRelease(entry.name)) {
                 try self.recordSkippedKernel(entry.name, .invalid_release_name);
                 continue;
             }
@@ -2813,7 +2813,7 @@ fn validManifestLock(lock: customize.PackageLockPolicy) bool {
     for (pins, 0..) |pin, index| {
         if (!validPackageName(pin.name)) return false;
         if (!validLockEvr(pin.evr)) return false;
-        if (!validKernelRelease(pin.architecture)) return false;
+        if (!vm_control.validKernelRelease(pin.architecture)) return false;
         for (pins[0..index]) |previous| {
             if (std.mem.eql(u8, previous.name, pin.name) and
                 std.mem.eql(u8, previous.architecture, pin.architecture))
@@ -2960,7 +2960,7 @@ fn validateManifestPolicy(manifest: Manifest) !void {
             // with `NoInstalledKernels` rather than reporting a completed
             // policy for work it did not do.
             for (regenerate.kernels) |kernel| {
-                if (!validKernelRelease(kernel)) {
+                if (!vm_control.validKernelRelease(kernel)) {
                     return error.InvalidKernelRelease;
                 }
             }
@@ -3148,22 +3148,6 @@ fn hasDepmodOutput(io: Io, release_dir: Io.Dir) !bool {
         return true;
     }
     return false;
-}
-
-fn validKernelRelease(kernel: []const u8) bool {
-    if (kernel.len == 0 or !std.ascii.isAlphanumeric(kernel[0])) return false;
-    for (kernel[1..]) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and
-            byte != '.' and
-            byte != '_' and
-            byte != '+' and
-            byte != '-' and
-            byte != '~')
-        {
-            return false;
-        }
-    }
-    return true;
 }
 
 fn joinGuest(
@@ -3635,8 +3619,8 @@ test "worker policy identifiers are literal and package-only" {
     try std.testing.expect(!validPackageName("https://example.invalid/x.rpm"));
     try std.testing.expect(!validPackageName("./x.rpm"));
     try std.testing.expect(!validPackageName("-y"));
-    try std.testing.expect(validKernelRelease("6.12.0-1.azl4.aarch64"));
-    try std.testing.expect(!validKernelRelease("../../etc/passwd"));
+    try std.testing.expect(vm_control.validKernelRelease("6.12.0-1.azl4.aarch64"));
+    try std.testing.expect(!vm_control.validKernelRelease("../../etc/passwd"));
 }
 
 test "worker policy accepts updates and still refuses an unnamed selective update" {

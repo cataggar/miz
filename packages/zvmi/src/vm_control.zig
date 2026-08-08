@@ -382,6 +382,13 @@ pub const selinux = @import("selinux.zig");
 /// privileged worker so all three enforce the same lock.
 pub const packages = @import("packages.zig");
 
+/// What regenerating an initramfs involves, shared with the host and the
+/// privileged worker so all three act on the same kernel releases.
+///
+/// Suffixed because `Result.initramfs` is captured under its own name a few
+/// hundred lines down, and a capture may not shadow a declaration.
+pub const initramfs_mod = @import("initramfs.zig");
+
 pub const kernel_module_config_paths = [_][]const u8{
     "etc/modules-load.d/zvmi.conf",
     "etc/modprobe.d/zvmi-blacklist.conf",
@@ -948,19 +955,11 @@ pub fn knownKernelModuleConfigPath(path: []const u8) bool {
     return false;
 }
 
-/// Mirrors `customize.validUnsafeKernelRelease`. The release becomes both a
-/// dracut argument and a `/boot/initramfs-<release>.img` path.
-pub fn validKernelRelease(kernel: []const u8) bool {
-    if (kernel.len == 0 or kernel.len > 128 or !std.ascii.isAlphanumeric(kernel[0])) return false;
-    for (kernel[1..]) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and
-            byte != '.' and byte != '_' and byte != '+' and byte != '-' and byte != '~')
-        {
-            return false;
-        }
-    }
-    return true;
-}
+/// Whether a string is a kernel release the backends will act on. The release
+/// becomes both a dracut argument and a `/boot/initramfs-<release>.img` path,
+/// so it is bounded as well as restricted. One rule, in `initramfs.zig`,
+/// shared with `customize` and `unsafe_chroot` rather than mirrored by them.
+pub const validKernelRelease = initramfs_mod.validKernelRelease;
 
 /// A module member is a path the guest opens in its own rootfs and a name the
 /// host chose, so it is confined to a top-level `.ko` file: no directory to
