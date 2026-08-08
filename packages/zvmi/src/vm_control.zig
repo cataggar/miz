@@ -20,8 +20,8 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
-pub const control_version: u32 = 5;
-pub const result_version: u32 = 3;
+pub const control_version: u32 = 6;
+pub const result_version: u32 = 4;
 
 /// Path the host writes the control document to inside the initramfs, and the
 /// path the guest reads it back from once the kernel has unpacked rootfs.
@@ -469,13 +469,14 @@ pub const Control = struct {
     /// the guest can walk this list once per phase and still obey the order
     /// the plan publishes.
     hooks: []const Hook = &.{},
-    /// Whether the guest relabels the target root before it seals the result.
+    /// What the guest does to the target's SELinux configuration before it
+    /// seals the result.
     ///
-    /// A flag rather than a policy because relabelling with the target's own
-    /// policy is the only SELinux operation either backend implements; the
-    /// host refuses a mode or policy change during preflight, so there is
-    /// nothing else for this to say.
-    selinux_relabel: bool = false,
+    /// A document rather than a flag, because both operations now reach the
+    /// guest: relabelling with the policy the target already carries, and
+    /// writing a declared mode and policy into the target's own
+    /// `/etc/selinux/config`. Absent means the run leaves SELinux alone.
+    selinux: ?Selinux = null,
 
     pub fn validate(self: Control) Error!void {
         if (self.version != control_version) return error.UnsupportedVersion;
@@ -770,12 +771,49 @@ pub const InitramfsOutcome = struct {
 /// What a relabel found, as distinct from what it did. The `setfiles` argv the
 /// guest also reports says what ran; this says what the target's own
 /// configuration named, which no request and no plan can.
+/// What the guest does about SELinux.
+///
+/// `relabel_only` and `configure` are the two operations rather than one with
+/// optional fields, because they are what the plan publishes as two actions
+/// and because they fail differently: a relabel needs the policy the target
+/// names, and a configuration change needs the settings the target declares.
+pub const Selinux = union(enum) {
+    /// Relabel with whatever policy the target's own configuration names,
+    /// changing nothing else. Which policy is deliberately not named here: the
+    /// guest reads it out of the target while the run executes, because a
+    /// package action in the same run can have replaced it.
+    relabel_only,
+    configure: SelinuxConfigure,
+};
+
+pub const SelinuxConfigure = struct {
+    /// The mode to write, absent to leave the target's own alone.
+    mode: ?selinux.Mode = null,
+    /// The policy to write, absent to leave the target's own alone.
+    policy: ?[]const u8 = null,
+    relabel: selinux.RelabelPolicy = .when_needed,
+};
+
 pub const SelinuxRelabel = struct {
     policy: []const u8,
     /// The `SELINUX=` setting, absent when the configuration names none the
     /// guest recognises. A relabelled root configured `disabled` never
     /// consults the labels this run wrote.
     mode: ?selinux.Mode = null,
+};
+
+/// What a configuration change found, as distinct from what it was told. The
+/// control document already carries the mode and policy that were requested,
+/// so what is left is the state the guest replaced and why it did or did not
+/// walk the tree -- which depends on that state and so is not knowable to the
+/// host that wrote the document.
+pub const SelinuxConfigureOutcome = struct {
+    previous_mode: ?selinux.Mode = null,
+    /// Absent when the configuration the guest replaced named no policy this
+    /// recognises.
+    previous_policy: ?[]const u8 = null,
+    relabelled: bool = false,
+    relabel_reason: selinux.RelabelReason,
 };
 
 pub const Failure = struct {
@@ -803,6 +841,10 @@ pub const Result = struct {
     /// What the guest read out of the target's own SELinux configuration when
     /// it relabelled. Absent when the document asked for no relabel.
     selinux_relabel: ?SelinuxRelabel = null,
+    /// What the guest found in the target's own SELinux configuration before
+    /// it rewrote it, and whether the change made it relabel. Absent when the
+    /// document asked for no configuration change.
+    selinux_configure: ?SelinuxConfigureOutcome = null,
     /// What an initramfs regeneration passed over and what it produced. Absent
     /// when the document asked for none.
     initramfs: ?InitramfsOutcome = null,
@@ -830,6 +872,20 @@ pub const Result = struct {
             // rather than to a length: a name that arrives from the other side
             // of the boundary is checked before it is published.
             if (!selinux.validPolicyName(relabel.policy)) return error.InvalidSelinuxRecord;
+        }
+        if (self.selinux_configure) |configure| {
+            // The same rule, for the same reason: this name is published in
+            // the host's provenance and arrives from the other side of the
+            // boundary.
+            if (configure.previous_policy) |name| {
+                if (!selinux.validPolicyName(name)) return error.InvalidSelinuxRecord;
+            }
+            // A run that says it relabelled for no reason, or that says it
+            // did not relabel while naming one, is describing something that
+            // did not happen.
+            if (configure.relabelled != selinux.relabels(configure.relabel_reason)) {
+                return error.InvalidSelinuxRecord;
+            }
         }
         if (self.initramfs) |initramfs| {
             // Bounded by the same limit the inventory is: both are lists the
@@ -1285,7 +1341,7 @@ test "a version mismatch is refused by name even when the document is otherwise 
     // what it must report -- not the parse failure that happens to come first.
     try std.testing.expectError(error.UnsupportedVersion, parseControl(
         allocator,
-        \\{"version":6,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\{"version":7,"root_device":"/dev/vda2","result_device":"/dev/vdb",
         \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
         ,
     ));
@@ -1294,7 +1350,7 @@ test "a version mismatch is refused by name even when the document is otherwise 
     // failure: the version claimed it would be understood, and it was not.
     try std.testing.expectError(error.UnknownField, parseControl(
         allocator,
-        \\{"version":5,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\{"version":6,"root_device":"/dev/vda2","result_device":"/dev/vdb",
         \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
         ,
     ));

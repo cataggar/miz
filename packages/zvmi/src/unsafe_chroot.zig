@@ -382,6 +382,7 @@ const WorkerReport = struct {
     boot_configuration: ?customize.BootConfigurationRecord = null,
     package_cache: ?customize.PackageCacheRecord = null,
     selinux_relabel: ?customize.SelinuxRelabelRecord = null,
+    selinux_configure: ?customize.SelinuxConfigureRecord = null,
     initramfs: ?customize.InitramfsRecord = null,
     host_resolver: ?customize.HostResolverRecord = null,
 };
@@ -499,6 +500,7 @@ fn executeManifest(
             .boot_configuration = session.boot_configuration,
             .package_cache = session.package_cache,
             .selinux_relabel = session.selinux_relabel,
+            .selinux_configure = session.selinux_configure,
             .host_resolver = session.host_resolver,
             .initramfs = if (session.initramfs_regenerated) .{
                 .skipped_kernel_releases = session.skipped_kernels.items,
@@ -508,9 +510,16 @@ fn executeManifest(
     };
 }
 
+/// The payload of `customize.SelinuxPolicy.configure`, named once here so the
+/// worker's signature follows the request type rather than restating it.
+const SelinuxConfigure = @FieldType(customize.SelinuxPolicy, "configure");
+
 /// What one read of the target's `/etc/selinux/config` yielded.
 const DiscoveredSelinux = struct {
-    policy: []const u8,
+    /// Absent when the configuration names no policy this can use. A relabel
+    /// fails on that; a mode-only `.configure` does not, so the read reports
+    /// it rather than refusing on its caller's behalf.
+    policy: ?[]const u8,
     mode: ?customize.SelinuxMode,
 };
 
@@ -556,6 +565,7 @@ const Session = struct {
     boot_configuration: ?customize.BootConfigurationRecord = null,
     package_cache: ?customize.PackageCacheRecord = null,
     selinux_relabel: ?customize.SelinuxRelabelRecord = null,
+    selinux_configure: ?customize.SelinuxConfigureRecord = null,
     /// Set exactly when this run bound the build machine's own resolver into
     /// the target for the package transaction.
     host_resolver: ?customize.HostResolverRecord = null,
@@ -886,7 +896,17 @@ const Session = struct {
         // Last, in the phase the plan publishes last. Everything above this
         // line creates or rewrites files, and a relabel only describes the
         // tree as it stood when the tool walked it.
-        try self.relabelRoot();
+        try self.applySelinuxPolicy();
+    }
+
+    /// Carries out whichever SELinux operation the plan published, in the
+    /// phase it published it in.
+    fn applySelinuxPolicy(self: *Session) !void {
+        switch (self.manifest.selinux) {
+            .unchanged => {},
+            .relabel => try self.relabelRoot(),
+            .configure => |configure| try self.configureSelinux(configure),
+        }
     }
 
     /// Relabels the target root with the policy the target itself carries.
@@ -897,26 +917,131 @@ const Session = struct {
     /// releases are discovered after the transaction rather than declared in
     /// advance. What it resolved to is auditable without a record of its own,
     /// because the full argv reaches provenance like every other tool.
+    fn relabelRoot(self: *Session) !void {
+        // Read once, for the policy the relabel needs and the mode the record
+        // carries: a second read could see a different file, and provenance
+        // would describe a configuration that never existed as a whole.
+        const discovered = try self.readGuestSelinuxConfiguration();
+        defer if (discovered.policy) |policy| self.allocator.free(policy);
+        const policy = discovered.policy orelse return error.MissingSelinuxConfiguration;
+        try self.runRelabel(policy);
+        // After the tool succeeded, so the record describes a relabel that
+        // happened rather than one that was attempted.
+        self.selinux_relabel = .{
+            .discovered_policy = try self.allocator.dupe(u8, policy),
+            .target_mode = discovered.mode,
+        };
+    }
+
+    /// Writes the declared mode and policy into the target's own
+    /// `/etc/selinux/config`, and relabels when that change makes the labels
+    /// the target already carries wrong.
+    ///
+    /// The before-state is read from the target rather than taken from the
+    /// plan, for the same reason the relabel's policy is: a package action in
+    /// this same run can have replaced the configuration. It is read once, so
+    /// the recorded before-state is a configuration that existed as a whole.
+    ///
+    /// A policy the target does not carry fails the run rather than being
+    /// installed. Installing a policy is a package action and the model
+    /// already has one; a `.configure` that quietly ran a transaction would be
+    /// doing something the plan did not say.
+    ///
+    /// `/.autorelabel` is deliberately not used, and this is the obvious
+    /// shortcut so it is written down: it defers the labelling to the target's
+    /// first boot, which means publishing an image whose first boot relabels
+    /// and reboots. zvmi's position is that an image is finished when it is
+    /// published, which is the same reason the relabel happens in the run.
+    fn configureSelinux(self: *Session, configure: SelinuxConfigure) !void {
+        if (configure.mode == null and configure.policy == null) {
+            return error.EmptySelinuxConfiguration;
+        }
+        const path = try self.guestPath(selinux_mod.config_path);
+        defer self.allocator.free(path);
+        const before = Io.Dir.cwd().readFileAlloc(
+            self.io,
+            path,
+            self.allocator,
+            .limited(max_selinux_config_bytes),
+        ) catch return error.MissingSelinuxConfiguration;
+        defer self.allocator.free(before);
+        const previous_mode = selinux_mod.parseConfiguredMode(before);
+        const previous_policy = selinux_mod.parseConfiguredPolicy(before);
+
+        // Refused before the file is rewritten, so a run that cannot finish
+        // the operation has not half-finished it: the published image would
+        // otherwise name a policy it does not carry, which is a root that
+        // fails to load a policy at boot.
+        if (configure.policy) |name| {
+            var contexts_buffer: [selinux_mod.max_policy_name_bytes + 64]u8 = undefined;
+            const contexts = selinux_mod.fileContextsPath(&contexts_buffer, name) catch
+                return error.UnsupportedSelinuxPolicy;
+            if (!try self.guestFileExists(contexts)) return error.MissingSelinuxPolicy;
+        }
+
+        const rendered = try self.allocator.alloc(
+            u8,
+            before.len + selinux_mod.max_policy_name_bytes + 32,
+        );
+        defer self.allocator.free(rendered);
+        const text = selinux_mod.renderConfig(
+            rendered,
+            before,
+            configure.mode,
+            configure.policy,
+        ) catch |err| switch (err) {
+            error.MissingSelinuxSetting => return error.MissingSelinuxSetting,
+            error.InvalidPolicy => return error.UnsupportedSelinuxPolicy,
+            error.NoChangeRequested => return error.EmptySelinuxConfiguration,
+            error.NoSpaceLeft => return error.MissingSelinuxConfiguration,
+        };
+        {
+            // A truncating open keeps the existing file's mode, which is the
+            // distro's own and not this run's to change.
+            const file = try Io.Dir.cwd().createFile(self.io, path, .{});
+            defer file.close(self.io);
+            try file.writePositionalAll(self.io, text, 0);
+        }
+
+        const reason = selinux_mod.relabelReason(
+            configure.relabel,
+            previous_mode,
+            previous_policy orelse "",
+            configure.mode,
+            configure.policy,
+        );
+        if (selinux_mod.relabels(reason)) {
+            // Against the policy this just wrote, not the one it replaced:
+            // the labels have to be the ones the published configuration
+            // names.
+            const policy = configure.policy orelse
+                previous_policy orelse return error.MissingSelinuxConfiguration;
+            try self.runRelabel(policy);
+        }
+        self.selinux_configure = .{
+            .previous_mode = previous_mode,
+            .previous_policy = if (previous_policy) |name|
+                try self.allocator.dupe(u8, name)
+            else
+                null,
+            .mode = configure.mode,
+            .policy = if (configure.policy) |name|
+                try self.allocator.dupe(u8, name)
+            else
+                null,
+            .relabelled = selinux_mod.relabels(reason),
+            .relabel_reason = reason,
+        };
+    }
+
+    /// Walks the target root with its own labelling tool, against `policy`.
     ///
     /// `setfiles` rather than `restorecon`: it takes the file-contexts file as
     /// an argument instead of asking libselinux for the active policy, which
     /// needs a loaded policy and a mounted selinuxfs that an executor running
     /// its own kernel does not have.
-    fn relabelRoot(self: *Session) !void {
-        switch (self.manifest.selinux) {
-            .unchanged => return,
-            // `validateManifestPolicy` refused this already; repeated so the
-            // run cannot treat an unimplemented policy as a completed one.
-            .configure => return error.UnsupportedSelinuxPolicy,
-            .relabel => {},
-        }
+    fn runRelabel(self: *Session, policy: []const u8) !void {
         const tool = try self.findGuestLabellingTool();
-        // Read once, for the policy the relabel needs and the mode the record
-        // carries: a second read could see a different file, and provenance
-        // would describe a configuration that never existed as a whole.
-        const discovered = try self.readGuestSelinuxConfiguration();
-        const policy = discovered.policy;
-        defer self.allocator.free(policy);
         var contexts_buffer: [selinux_mod.max_policy_name_bytes + 64]u8 = undefined;
         const contexts = selinux_mod.fileContextsPath(&contexts_buffer, policy) catch
             return error.UnsupportedSelinuxPolicy;
@@ -940,12 +1065,6 @@ const Session = struct {
         try argv.append(contexts);
         try argv.append("/");
         try self.runChroot(argv.items);
-        // After the tool succeeded, so the record describes a relabel that
-        // happened rather than one that was attempted.
-        self.selinux_relabel = .{
-            .discovered_policy = try self.allocator.dupe(u8, policy),
-            .target_mode = discovered.mode,
-        };
     }
 
     fn findGuestLabellingTool(self: *Session) ![]const u8 {
@@ -955,13 +1074,11 @@ const Session = struct {
         return error.MissingSelinuxLabellingTool;
     }
 
-    /// What the target's own SELinux configuration says: the policy the
-    /// relabel must use, and the mode it asks the target's kernel for.
+    /// What the target's own SELinux configuration says: the policy a relabel
+    /// must use, and the mode it asks the target's kernel for.
     ///
     /// The policy is duplicated because the file it was parsed out of does not
-    /// outlive this call. A configuration naming no usable policy fails the
-    /// run; one naming no recognisable mode does not, because the mode is
-    /// recorded rather than acted on.
+    /// outlive this call.
     fn readGuestSelinuxConfiguration(self: *Session) !DiscoveredSelinux {
         const path = try self.guestPath(selinux_mod.config_path);
         defer self.allocator.free(path);
@@ -972,10 +1089,11 @@ const Session = struct {
             .limited(max_selinux_config_bytes),
         ) catch return error.MissingSelinuxConfiguration;
         defer self.allocator.free(contents);
-        const policy = selinux_mod.parseConfiguredPolicy(contents) orelse
-            return error.MissingSelinuxConfiguration;
         return .{
-            .policy = try self.allocator.dupe(u8, policy),
+            .policy = if (selinux_mod.parseConfiguredPolicy(contents)) |policy|
+                try self.allocator.dupe(u8, policy)
+            else
+                null,
             .mode = selinux_mod.parseConfiguredMode(contents),
         };
     }
@@ -2917,10 +3035,25 @@ fn validateManifestPolicy(manifest: Manifest) !void {
         // either skip work the caller asked for or do work it did not.
         .when_needed => return error.UnresolvedInitramfsPolicy,
     }
-    // Only the relabel reaches this worker. The host refuses a mode or policy
-    // change during preflight, and a manifest asking for one did not come from
-    // a plan this worker should run.
-    if (manifest.selinux == .configure) return error.UnsupportedSelinuxPolicy;
+    // Re-checked on this side of the privilege boundary for the same reason
+    // the package names are: the policy name reaches a path this worker builds
+    // and an argument vector it runs as root, and the validator that already
+    // checked it is on the other side. A `.configure` that names neither
+    // setting is refused here too -- the host refuses it at validation, and a
+    // manifest carrying it did not come from a plan this worker should run.
+    switch (manifest.selinux) {
+        .unchanged, .relabel => {},
+        .configure => |configure| {
+            if (configure.mode == null and configure.policy == null) {
+                return error.EmptySelinuxConfiguration;
+            }
+            if (configure.policy) |name| {
+                if (!selinux_mod.validPolicyName(name)) {
+                    return error.UnsupportedSelinuxPolicy;
+                }
+            }
+        },
+    }
     // The option text is checked on this side of the privilege boundary for
     // the same reason the package names are: it ends up inside a shell
     // assignment in a file this worker writes as root into the target root,
@@ -5716,14 +5849,32 @@ const FakeExecutorContext = struct {
     /// The argument vector `setfiles` was invoked with, without the `chroot`
     /// prefix, and whether it ran at all.
     relabel_argv: ?[]const []const u8 = null,
+    /// The target's `/etc/selinux/config` as it stood at the start of the most
+    /// recent command.
+    selinux_config_seen: ?[]const u8 = null,
 
     fn plantSelinuxTree(self: *FakeExecutorContext, layout: FakeSelinuxLayout) !void {
+        // Planted once and then left alone. The executor rewrites this file
+        // itself for a configuration change, and a fake that put the original
+        // back on the next command would be undoing the work under test.
+        if (self.readTargetFile("etc/selinux/config")) |existing| {
+            self.allocator.free(existing);
+            return;
+        }
         try self.writeTargetFile("etc/selinux/config", switch (layout) {
             .none => return,
             .no_policy_named => "SELINUX=enforcing\n",
             .targeted, .missing_contexts => "SELINUX=enforcing\nSELINUXTYPE=targeted\n",
             .targeted_permissive => "SELINUX=permissive\nSELINUXTYPE=targeted\n",
+            .targeted_disabled => "SELINUX=disabled\nSELINUXTYPE=targeted\n",
+            .targeted_with_minimum => "SELINUX=enforcing\nSELINUXTYPE=targeted\n",
         });
+        if (layout == .targeted_with_minimum) {
+            try self.writeTargetFile(
+                "etc/selinux/minimum/contexts/files/file_contexts",
+                "/.*  system_u:object_r:default_t:s0\n",
+            );
+        }
         if (layout == .missing_contexts) return;
         try self.writeTargetFile(
             "etc/selinux/targeted/contexts/files/file_contexts",
@@ -5834,6 +5985,14 @@ const FakeExecutorContext = struct {
         // through would record it as the relabel and a test would be asserting
         // against a command the run never used to label anything.
         if (containsArg(argv, "--version")) return self.fakeVersion(allocator, argv);
+        // Sampled before anything this command does, and before the tree is
+        // planted, so the last sample is the file as the run left it. The
+        // session deletes the root during cleanup, so after the run there is
+        // nothing left to read.
+        if (self.readTargetFile("etc/selinux/config")) |seen| {
+            if (self.selinux_config_seen) |previous| self.allocator.free(previous);
+            self.selinux_config_seen = seen;
+        }
         if (self.plant_selinux) |layout| try self.plantSelinuxTree(layout);
         if (self.plant_in_target) |relative| {
             const path = try std.fs.path.join(
@@ -6105,6 +6264,14 @@ const FakeSelinuxLayout = enum {
     /// A relabelled target that will nonetheless not enforce what the labels
     /// say at boot. The relabel is identical; the resulting image is not.
     targeted_permissive,
+    /// A target with SELinux switched off, whose files therefore carry
+    /// whatever labels they were last given -- which is to say, none that any
+    /// policy has checked.
+    targeted_disabled,
+    /// A target configured for `targeted` that also carries the `minimum`
+    /// policy, so a change from one to the other is a change this run can
+    /// carry out rather than one it must refuse.
+    targeted_with_minimum,
 };
 
 fn fakeResult(
@@ -6393,7 +6560,169 @@ test "a relabel a target cannot satisfy fails the run rather than skipping it" {
     }
 }
 
-test "the worker refuses a policy change it has no way to carry out" {
+test "a configuration change decides the relabel from what the target already is" {
+    const Case = struct {
+        why: []const u8,
+        layout: FakeSelinuxLayout,
+        configure: @FieldType(customize.SelinuxPolicy, "configure"),
+        previous_mode: ?customize.SelinuxMode,
+        expected_reason: customize.SelinuxRelabelReason,
+        expect_relabel: bool,
+    };
+    const cases = [_]Case{
+        .{
+            // A root that was never enforcing carries labels no policy has
+            // checked. Booting it enforcing without relabelling is how an
+            // image reaches a login prompt it cannot get past.
+            .why = "disabled to enforcing needs the walk",
+            .layout = .targeted_disabled,
+            .configure = .{ .mode = .enforcing, .relabel = .when_needed },
+            .previous_mode = .disabled,
+            .expected_reason = .mode_raised,
+            .expect_relabel = true,
+        },
+        .{
+            // Permissive loads the policy and computes contexts; it only
+            // declines to deny. The labels are already the policy's own, so
+            // enforcing them costs nothing new.
+            .why = "permissive to enforcing does not",
+            .layout = .targeted_permissive,
+            .configure = .{ .mode = .enforcing, .relabel = .when_needed },
+            .previous_mode = .permissive,
+            .expected_reason = .not_needed,
+            .expect_relabel = false,
+        },
+        .{
+            // The caller said no, and said it about the case that would
+            // otherwise relabel. Recorded as declined rather than as not
+            // needed, because those are different facts about the image.
+            .why = "a declined relabel stays declined even when the mode is raised",
+            .layout = .targeted_disabled,
+            .configure = .{ .mode = .enforcing, .relabel = .never },
+            .previous_mode = .disabled,
+            .expected_reason = .declined,
+            .expect_relabel = false,
+        },
+        .{
+            .why = "an unconditional relabel runs even when nothing needed it",
+            .layout = .targeted_permissive,
+            .configure = .{ .mode = .permissive, .relabel = .always },
+            .previous_mode = .permissive,
+            .expected_reason = .requested,
+            .expect_relabel = true,
+        },
+        .{
+            // The labels the root carries came out of a different
+            // `file_contexts`, so they describe types the new policy may not
+            // define at all. The mode never moved, and it still needs the
+            // walk.
+            .why = "a policy change needs the walk on its own",
+            .layout = .targeted_with_minimum,
+            .configure = .{ .policy = "minimum", .relabel = .when_needed },
+            .previous_mode = .enforcing,
+            .expected_reason = .policy_changed,
+            .expect_relabel = true,
+        },
+        .{
+            .why = "the policy it already names is not a change",
+            .layout = .targeted,
+            .configure = .{ .policy = "targeted", .relabel = .when_needed },
+            .previous_mode = .enforcing,
+            .expected_reason = .not_needed,
+            .expect_relabel = false,
+        },
+    };
+
+    for (cases, 0..) |case, index| {
+        errdefer std.debug.print("case: {s}\n", .{case.why});
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const allocator = arena_state.allocator();
+        const io = std.testing.io;
+        const root_path = try std.fmt.allocPrint(
+            allocator,
+            "test-unsafe-chroot-configure-{d}-root",
+            .{index},
+        );
+        const raw_path = try std.fmt.allocPrint(
+            allocator,
+            "test-unsafe-chroot-configure-{d}-stage.raw",
+            .{index},
+        );
+        defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+        defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+        const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+            .exclusive = true,
+            .read = true,
+        });
+        try raw_file.setLength(io, 8192);
+        const raw_inode = (try raw_file.stat(io)).inode;
+        raw_file.close(io);
+
+        const manifest = Manifest{
+            .raw_path = raw_path,
+            .root_path = root_path,
+            .status_path = "unused.status",
+            .report_path = "unused-report.json",
+            .stage_inode = raw_inode,
+            .virtual_size = 8192,
+            .partition_offset = 1024,
+            .partition_length = 4096,
+            .packages = .{},
+            .initramfs = .unchanged,
+            .selinux = .{ .configure = case.configure },
+        };
+
+        var context = FakeExecutorContext{
+            .allocator = allocator,
+            .io = io,
+            .root_path = root_path,
+            .unmounts = .init(allocator),
+            .timeline = .init(allocator),
+            .plant_selinux = case.layout,
+        };
+        const result = try executeManifest(allocator, io, manifest, .{
+            .context = &context,
+            .runFn = FakeExecutorContext.run,
+        });
+        try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
+
+        const record = result.report.selinux_configure orelse
+            return error.TestExpectedConfigureRecord;
+        // The before-state is what the executor found, not what the plan
+        // asked for: a record that echoed the request back would say nothing
+        // about the image that was published.
+        try std.testing.expectEqual(case.previous_mode, record.previous_mode);
+        try std.testing.expectEqualStrings("targeted", record.previous_policy.?);
+        try std.testing.expectEqual(case.configure.mode, record.mode);
+        try std.testing.expectEqual(case.expected_reason, record.relabel_reason);
+        try std.testing.expectEqual(case.expect_relabel, record.relabelled);
+        // What the record says happened is what happened. A `setfiles` that
+        // ran without being recorded, or a record without the argv to back it,
+        // would each be provenance describing a different run.
+        try std.testing.expectEqual(case.expect_relabel, context.relabel_argv != null);
+
+        // The record describes a file, so the file has to say what the record
+        // says. Read as the teardown commands saw it, because the session
+        // deletes the root before returning.
+        const written = context.selinux_config_seen orelse
+            return error.TestExpectedSelinuxConfig;
+        if (case.configure.mode) |mode| {
+            try std.testing.expectEqual(mode, selinux_mod.parseConfiguredMode(written).?);
+        } else {
+            try std.testing.expectEqual(
+                case.previous_mode,
+                selinux_mod.parseConfiguredMode(written),
+            );
+        }
+        try std.testing.expectEqualStrings(
+            case.configure.policy orelse "targeted",
+            selinux_mod.parseConfiguredPolicy(written).?,
+        );
+    }
+}
+
+test "the worker re-checks a configuration change on its own side of the boundary" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
 
@@ -6408,12 +6737,25 @@ test "the worker refuses a policy change it has no way to carry out" {
         .partition_length = 4096,
         .packages = .{},
         .initramfs = .unchanged,
-        .selinux = .{ .configure = .{ .mode = .permissive } },
+        // A change that names nothing is a request to change nothing spelled
+        // as a request to change something. The host refuses it at
+        // validation; refused again here because what arrives across a
+        // privilege boundary is checked rather than trusted.
+        .selinux = .{ .configure = .{} },
     };
+    try std.testing.expectError(
+        error.EmptySelinuxConfiguration,
+        validateManifestPolicy(manifest),
+    );
+    // A policy name reaches a path this worker builds and an argv it runs as
+    // root, so it is held to the same rule that builds the path.
+    manifest.selinux = .{ .configure = .{ .policy = "../escape" } };
     try std.testing.expectError(
         error.UnsupportedSelinuxPolicy,
         validateManifestPolicy(manifest),
     );
+    manifest.selinux = .{ .configure = .{ .mode = .permissive } };
+    try validateManifestPolicy(manifest);
     manifest.selinux = .relabel;
     try validateManifestPolicy(manifest);
 }

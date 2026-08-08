@@ -427,6 +427,7 @@ pub fn run(
         .boot = boot_record,
         .hooks = control.hooks,
         .host_resolver = host_resolver,
+        .selinux = data.selinux,
     });
 }
 
@@ -884,14 +885,30 @@ fn controlFromPolicy(
         .kernel_module_files = kernel_module_files,
         .modules = input.modules,
         .hooks = input.hooks,
-        .selinux_relabel = switch (input.selinux) {
-            .unchanged => false,
-            .relabel => true,
-            // Preflight refuses a mode or policy change, so a plan carrying
-            // one never reaches a control document. Named rather than mapped
-            // to `false`, because writing a document that says the run does
-            // nothing would be answering a request this backend cannot serve.
-            .configure => return error.UnsupportedSelinuxPolicy,
+        .selinux = switch (input.selinux) {
+            .unchanged => null,
+            .relabel => .relabel_only,
+            .configure => |configure| blk: {
+                // Refused here rather than mapped to a document that changes
+                // nothing, for the same reason it was when the whole variant
+                // was unimplemented: writing a document that says the run does
+                // nothing would be answering a request this backend cannot
+                // serve. The host refuses this shape at validation, so a plan
+                // carrying it did not come from one this backend should run.
+                if (configure.mode == null and configure.policy == null) {
+                    return error.EmptySelinuxConfiguration;
+                }
+                if (configure.policy) |name| {
+                    if (!vm_control.selinux.validPolicyName(name)) {
+                        return error.UnsupportedSelinuxPolicy;
+                    }
+                }
+                break :blk .{ .configure = .{
+                    .mode = configure.mode,
+                    .policy = configure.policy,
+                    .relabel = configure.relabel,
+                } };
+            },
         },
     };
 }
@@ -1594,6 +1611,9 @@ const ReportInput = struct {
     boot: customize.VmBootRecord = .direct_kernel,
     hooks: []const HookPlan = &.{},
     host_resolver: ?customize.HostResolverRecord = null,
+    /// What the plan asked for. The guest reports only what it discovered, so
+    /// the requested half of the configuration record comes from here.
+    selinux: customize.SelinuxPolicy = .unchanged,
 };
 
 /// Pairs what the host sent with what the guest says it did.
@@ -1672,6 +1692,31 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
         if (input.result.selinux_relabel) |reported| .{
             .discovered_policy = try owned.dupe(u8, reported.policy),
             .target_mode = reported.mode,
+        } else null;
+
+    // The requested values come from the plan this backend was handed, and
+    // the discovered ones from the guest: neither side can supply both, which
+    // is the shape the record describes.
+    const configure: ?customize.SelinuxConfigureRecord =
+        if (input.result.selinux_configure) |reported| .{
+            .previous_mode = reported.previous_mode,
+            .previous_policy = if (reported.previous_policy) |name|
+                try owned.dupe(u8, name)
+            else
+                null,
+            .mode = switch (input.selinux) {
+                .configure => |requested| requested.mode,
+                .unchanged, .relabel => null,
+            },
+            .policy = switch (input.selinux) {
+                .configure => |requested| if (requested.policy) |name|
+                    try owned.dupe(u8, name)
+                else
+                    null,
+                .unchanged, .relabel => null,
+            },
+            .relabelled = reported.relabelled,
+            .relabel_reason = reported.relabel_reason,
         } else null;
 
     const initramfs: ?customize.InitramfsRecord =
@@ -1771,6 +1816,7 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
         .package_lock = emitted_lock,
         .hooks = hooks,
         .selinux_relabel = relabel,
+        .selinux_configure = configure,
         .initramfs = initramfs,
         .execution = .{
             .emulator_command = try owned.dupe(u8, input.policy.emulator_command),
@@ -2137,7 +2183,7 @@ test "update actions reach the guest, and an unnamed selective update does not" 
     try std.testing.expectError(error.EmptyAction, empty.validate());
 }
 
-test "the relabel decision reaches the guest, and a policy change does not" {
+test "the SELinux request reaches the guest as the shape the guest acts on" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2149,7 +2195,7 @@ test "the relabel decision reaches the guest, and a policy change does not" {
         .network = .offline,
         .devices = devices,
     });
-    try std.testing.expect(!unchanged.selinux_relabel);
+    try std.testing.expect(unchanged.selinux == null);
 
     const relabel = try controlFromPolicy(allocator, std.testing.io, .{
         .packages = .{},
@@ -2158,10 +2204,38 @@ test "the relabel decision reaches the guest, and a policy change does not" {
         .devices = devices,
         .selinux = .relabel,
     });
-    try std.testing.expect(relabel.selinux_relabel);
+    try std.testing.expectEqual(
+        vm_control.Selinux.relabel_only,
+        std.meta.activeTag(relabel.selinux.?),
+    );
 
-    // A mode or policy change has no guest implementation, so it is refused
-    // here rather than composed into a control the guest would ignore.
+    const configure = try controlFromPolicy(allocator, std.testing.io, .{
+        .packages = .{},
+        .initramfs = .unchanged,
+        .network = .offline,
+        .devices = devices,
+        .selinux = .{ .configure = .{ .mode = .enforcing, .policy = "targeted" } },
+    });
+    try configure.validate();
+    const carried = configure.selinux.?.configure;
+    try std.testing.expectEqual(customize.SelinuxMode.enforcing, carried.mode.?);
+    try std.testing.expectEqualStrings("targeted", carried.policy.?);
+    try std.testing.expectEqual(customize.SelinuxRelabelPolicy.when_needed, carried.relabel);
+
+    // A configuration that names neither half is not a change, and a policy
+    // name that is a path is not a policy name. Both are refused here rather
+    // than composed into a document the guest would have to reject.
+    try std.testing.expectError(error.EmptySelinuxConfiguration, controlFromPolicy(
+        allocator,
+        std.testing.io,
+        .{
+            .packages = .{},
+            .initramfs = .unchanged,
+            .network = .offline,
+            .devices = devices,
+            .selinux = .{ .configure = .{} },
+        },
+    ));
     try std.testing.expectError(error.UnsupportedSelinuxPolicy, controlFromPolicy(
         allocator,
         std.testing.io,
@@ -2170,7 +2244,7 @@ test "the relabel decision reaches the guest, and a policy change does not" {
             .initramfs = .unchanged,
             .network = .offline,
             .devices = devices,
-            .selinux = .{ .configure = .{ .mode = .enforcing } },
+            .selinux = .{ .configure = .{ .policy = "../targeted" } },
         },
     ));
 }

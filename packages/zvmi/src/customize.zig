@@ -35,8 +35,8 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 25;
-pub const provenance_schema_version: u32 = 28;
+pub const plan_schema_version: u32 = 26;
+pub const provenance_schema_version: u32 = 29;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -960,16 +960,38 @@ pub const SelinuxPolicy = union(enum) {
     /// while the plan is resolved, because a package action in the same run
     /// can install or replace the policy the relabel must then use.
     relabel,
-    /// Change the SELinux mode, the active policy, or both. Modelled and
-    /// validated, but no backend implements it: preflight refuses it before a
-    /// workspace exists. Nothing has asked for it, and a type that accepted it
-    /// silently would be a promise the backends do not keep.
+    /// Change the SELinux mode, the active policy, or both, in the target's
+    /// own `/etc/selinux/config`.
+    ///
+    /// Carried out by the two executing backends; every other backend refuses
+    /// it during preflight, before a workspace exists.
+    ///
+    /// Naming neither a mode nor a policy is refused at validation: it is a
+    /// request to change nothing, spelled as a request to change something.
+    /// Naming a policy the target does not carry is refused by the run with
+    /// `MissingSelinuxPolicy` rather than installed, because installing a
+    /// policy is a package action and the model already has one -- a
+    /// `.configure` that quietly ran a transaction would be doing something
+    /// the plan did not say.
     configure: struct {
-        mode: SelinuxMode,
+        /// The mode to write, or nothing to leave the mode the target
+        /// declares alone. Optional so that "change the policy, keep the
+        /// mode" is expressible.
+        mode: ?SelinuxMode = null,
+        /// The policy to write, or nothing to leave the policy the target
+        /// declares alone.
         policy: ?[]const u8 = null,
-        relabel: bool = false,
+        /// Whether the root is relabelled as part of the change. Not a
+        /// `bool`, and not defaulted to doing nothing: see
+        /// `SelinuxRelabelPolicy`.
+        relabel: SelinuxRelabelPolicy = .when_needed,
     },
 };
+
+/// Aliased rather than redeclared, for the same reason `SelinuxMode` is: the
+/// host, the privileged worker and the guest agent decide this from one enum
+/// and one rule.
+pub const SelinuxRelabelPolicy = selinux_mod.RelabelPolicy;
 
 pub const RunnerKind = enum {
     qemu_user,
@@ -2201,9 +2223,19 @@ fn validateSelinuxPolicy(
 ) Allocator.Error!void {
     switch (policy) {
         .unchanged, .relabel => {},
-        .configure => |configure| if (configure.policy) |name| {
-            if (!validConfigName(name)) {
-                try diagnostics.append(validationError(.invalid_policy, "/selinux/configure/policy", "SELinux policy names must be safe non-empty values", null));
+        .configure => |configure| {
+            // A `.configure` that names neither setting asks the run to write
+            // a configuration identical to the one it read. Refused rather
+            // than accepted as a no-op, because a caller who reached for
+            // `.configure` meant to change something, and the shape that
+            // silently changes nothing is the one that hides the mistake.
+            if (configure.mode == null and configure.policy == null) {
+                try diagnostics.append(validationError(.invalid_policy, "/selinux/configure", "a SELinux configuration change must name a mode, a policy, or both", null));
+            }
+            if (configure.policy) |name| {
+                if (!validConfigName(name) or !selinux_mod.validPolicyName(name)) {
+                    try diagnostics.append(validationError(.invalid_policy, "/selinux/configure/policy", "SELinux policy names must be safe non-empty values", null));
+                }
             }
         },
     }
@@ -3044,6 +3076,19 @@ pub const Action = enum {
     execute_package_action,
     execute_hook,
     regenerate_initramfs,
+    /// Walks the target root with its own labelling tool, assigning every file
+    /// the context the policy the target already carries says it should have.
+    relabel_filesystem,
+    /// Writes the declared mode, the declared policy, or both into the
+    /// target's own `/etc/selinux/config`.
+    ///
+    /// Separate from `relabel_filesystem` because they are different requests
+    /// with different failure modes, and because a plan that published one
+    /// action for both would state that a `.configure` relabels -- which only
+    /// the run can know, since the decision depends on the mode the target is
+    /// configured with rather than on anything the request says. A relabel a
+    /// `.configure` performs is part of this operation and appears in
+    /// provenance, not as a second published operation.
     apply_selinux_policy,
     execute_unsafe_chroot,
     execute_vm,
@@ -4433,8 +4478,10 @@ fn appendSelinuxSpecs(
     specs: *std.array_list.Managed(OperationSpec),
     selinux: SelinuxPolicy,
 ) Allocator.Error!void {
-    if (selinux != .unchanged) {
-        try specs.append(.{ .phase = .selinux, .action = .apply_selinux_policy });
+    switch (selinux) {
+        .unchanged => {},
+        .relabel => try specs.append(.{ .phase = .selinux, .action = .relabel_filesystem }),
+        .configure => try specs.append(.{ .phase = .selinux, .action = .apply_selinux_policy }),
     }
 }
 
@@ -4755,10 +4802,22 @@ fn buildCapabilities(
             try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "run the target SELinux labelling tool" });
         },
         .configure => |configure| {
-            try capabilities.append(.{ .kind = .selinux_policy, .path = "", .reason = "apply the declared SELinux policy and mode" });
+            try capabilities.append(.{ .kind = .selinux_policy, .path = "", .reason = "write the declared SELinux mode and policy into the target's own configuration" });
             try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "use target SELinux policy tooling" });
-            if (configure.relabel) {
-                try capabilities.append(.{ .kind = .selinux_relabel, .path = "", .reason = "relabel the preserved filesystem" });
+            // Derived for `when_needed` as well as `always`, because whether
+            // the walk happens is decided while the run executes, from the
+            // mode the target is configured with. A capability the run may
+            // need is one the plan declares; the alternative is discovering
+            // the labelling tool is missing halfway through a privileged run.
+            if (configure.relabel != .never) {
+                try capabilities.append(.{
+                    .kind = .selinux_relabel,
+                    .path = switch (input) {
+                        .disk => |disk| disk.path,
+                        .iso_oci => "",
+                    },
+                    .reason = "relabel the preserved filesystem for the declared configuration",
+                });
             }
         },
     }
@@ -5337,9 +5396,14 @@ fn hashSelinuxPolicy(hash: *std.crypto.hash.sha2.Sha256, policy: SelinuxPolicy) 
     switch (policy) {
         .unchanged, .relabel => {},
         .configure => |configure| {
-            hashInt(hash, @intFromEnum(configure.mode));
+            if (configure.mode) |mode| {
+                hash.update(&.{1});
+                hashInt(hash, @intFromEnum(mode));
+            } else {
+                hash.update(&.{0});
+            }
             hashOptionalString(hash, configure.policy);
-            hashBool(hash, configure.relabel);
+            hashInt(hash, @intFromEnum(configure.relabel));
         },
     }
 }
@@ -5645,9 +5709,20 @@ pub fn preflight(
                 ),
                 else => .unsupported,
             },
-            .selinux_policy,
-            .boot_policy_mutation,
-            => .unsupported,
+            .selinux_policy => switch (plan.data.execution.backend) {
+                .unsafe_chroot => selinuxPolicyAvailable(
+                    io,
+                    plan,
+                    unsafeChrootCapabilityState(platform, io, plan),
+                ),
+                .vm => selinuxPolicyAvailable(
+                    io,
+                    plan,
+                    vmCapabilityState(platform, io, plan),
+                ),
+                else => .unsupported,
+            },
+            .boot_policy_mutation => .unsupported,
             // Both executor backends enforce the lock now, and neither the
             // rebuild backend nor any other runs a package transaction at all,
             // so there is nothing for them to enforce it against.
@@ -5719,10 +5794,6 @@ fn unsafeChrootCapabilityState(
         // the target root, which neither of them implements.
         hasGeneralOsCustomization(data.os) or
         data.generalization != .none or
-        // Relabelling is the one SELinux operation these backends carry out.
-        // Changing the mode or the active policy is still refused here, so a
-        // request for it fails preflight rather than being half-honoured.
-        data.selinux == .configure or
         // Kernel options are the one boot-policy field this backend carries
         // out: it edits the input the target's own generator reads and
         // re-runs that generator. Every other field asks for a bootloader
@@ -5800,9 +5871,6 @@ fn vmCapabilityState(
         // the target root, which neither of them implements.
         hasGeneralOsCustomization(data.os) or
         data.generalization != .none or
-        // Relabelling is the one SELinux operation these backends carry out;
-        // see `unsafeChrootCapabilityState`.
-        data.selinux == .configure or
         !isDefaultBootPolicy(data.boot_security) or
         // A declared cache directory is a host directory the run reads and
         // writes, and the guest control document carries rendered JSON rather
@@ -6127,7 +6195,16 @@ fn selinuxRelabelAvailable(
     plan: *const ResolvedPlan,
     backend_state: CapabilityState,
 ) CapabilityState {
-    if (plan.data.selinux != .relabel) return .unsupported;
+    const requested_policy: ?[]const u8 = switch (plan.data.selinux) {
+        .relabel => null,
+        // A `.configure` that switches policy relabels against the policy it
+        // is about to write, so that is the one the source must carry.
+        .configure => |configure| if (configure.relabel == .never)
+            return .unsupported
+        else
+            configure.policy,
+        .unchanged => return .unsupported,
+    };
     if (backend_state != .available) return backend_state;
     const disk = switch (plan.data.input) {
         .disk => |value| value,
@@ -6151,10 +6228,64 @@ fn selinuxRelabelAvailable(
     if (!has_tool) return .missing;
 
     const config = root.readFileAlloc(io, allocator, selinux_mod.config_path) catch return .missing;
-    const policy = selinux_mod.parseConfiguredPolicy(config) orelse return .missing;
+    const policy = requested_policy orelse
+        selinux_mod.parseConfiguredPolicy(config) orelse return .missing;
     var buffer: [selinux_mod.max_policy_name_bytes + 64]u8 = undefined;
     const contexts = selinux_mod.fileContextsPath(&buffer, policy) catch return .missing;
     if (!root.exists(io, contexts)) return .missing;
+    return .available;
+}
+
+/// Whether the source root carries a configuration the declared change can be
+/// written into, and the policy that change names.
+///
+/// Answered by reading the source for the same reason `selinuxRelabelAvailable`
+/// is: a request that could only fail is refused before a workspace exists.
+/// The render is performed here against the source bytes rather than merely
+/// checked for, so that a configuration declaring no `SELINUX=` line is
+/// reported as missing by the same rule the run will apply -- one rule, run
+/// twice, rather than two that agree until one is edited.
+///
+/// A named policy that the source does not carry is `.missing` rather than
+/// something to install: installing a policy is a package action, and the
+/// model already has one.
+fn selinuxPolicyAvailable(
+    io: Io,
+    plan: *const ResolvedPlan,
+    backend_state: CapabilityState,
+) CapabilityState {
+    const configure = switch (plan.data.selinux) {
+        .configure => |value| value,
+        .unchanged, .relabel => return .unsupported,
+    };
+    if (backend_state != .available) return backend_state;
+    const disk = switch (plan.data.input) {
+        .disk => |value| value,
+        .iso_oci => return .unsupported,
+    };
+    const storage = switch (plan.data.storage) {
+        .preserve => |value| value,
+        .fresh => return .unsupported,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var root: preserved_image.SourceRoot = .{};
+    root.open(allocator, io, disk.path, storage.root_partition) catch return .missing;
+    defer root.close(io);
+
+    const config = root.readFileAlloc(io, allocator, selinux_mod.config_path) catch return .missing;
+    const rendered = allocator.alloc(u8, config.len + selinux_mod.max_policy_name_bytes + 32) catch
+        return .missing;
+    _ = selinux_mod.renderConfig(rendered, config, configure.mode, configure.policy) catch
+        return .missing;
+
+    if (configure.policy) |name| {
+        var buffer: [selinux_mod.max_policy_name_bytes + 64]u8 = undefined;
+        const contexts = selinux_mod.fileContextsPath(&buffer, name) catch return .missing;
+        if (!root.exists(io, contexts)) return .missing;
+    }
     return .available;
 }
 
@@ -6409,6 +6540,9 @@ pub const UnsafeChrootRuntimeReport = struct {
     package_cache: ?PackageCacheRecord = null,
     /// Present exactly when the run relabelled the root.
     selinux_relabel: ?SelinuxRelabelRecord = null,
+    /// Present exactly when the run changed the target's SELinux
+    /// configuration.
+    selinux_configure: ?SelinuxConfigureRecord = null,
     /// Present exactly when the run regenerated at least one initramfs.
     initramfs: ?InitramfsRecord = null,
 
@@ -6519,6 +6653,9 @@ pub const VmRuntimeReport = struct {
     hooks: []const HookRecord = &.{},
     /// Present exactly when the guest relabelled the root.
     selinux_relabel: ?SelinuxRelabelRecord = null,
+    /// Present exactly when the guest changed the target's SELinux
+    /// configuration.
+    selinux_configure: ?SelinuxConfigureRecord = null,
     /// Present exactly when the guest regenerated at least one initramfs.
     initramfs: ?InitramfsRecord = null,
     execution: VmExecutionRecord,
@@ -6741,6 +6878,47 @@ pub const SelinuxRelabelRecord = struct {
     target_mode: ?SelinuxMode,
 };
 
+/// Why a `.configure` did or did not relabel. Aliased so the host, the
+/// privileged worker and the guest agent name one enum.
+pub const SelinuxRelabelReason = selinux_mod.RelabelReason;
+
+/// What a SELinux configuration change found in the target, as opposed to what
+/// it was told.
+///
+/// The same rule `SelinuxRelabelRecord` follows: a field exists only for what
+/// the argv cannot say. The argv of the relabel this may have run names the
+/// policy it used, and the plan already carries the mode and policy that were
+/// requested -- so what is left is the state the run replaced, and why the run
+/// did or did not walk the tree. The relabel decision cannot be read anywhere
+/// else: it depends on the mode the target was configured with, which only the
+/// run can see.
+pub const SelinuxConfigureRecord = struct {
+    /// The mode the target's own `/etc/selinux/config` asked for before this
+    /// run rewrote it, or nothing when it named none this can recognise.
+    previous_mode: ?SelinuxMode,
+    /// The policy that same configuration named, or nothing when it named
+    /// none this can use. Absent is not a failure for a run that changes only
+    /// the mode and does not relabel, so it is recorded rather than refused.
+    previous_policy: ?[]const u8,
+    /// The mode written, absent when the request left the mode alone.
+    mode: ?SelinuxMode,
+    /// The policy written, absent when the request left the policy alone.
+    policy: ?[]const u8,
+    relabelled: bool,
+    relabel_reason: SelinuxRelabelReason,
+    /// Whether the published image's own kernel command line carries
+    /// `selinux=0`, or nothing when its boot entries could not be read.
+    ///
+    /// Recorded for the same reason `SelinuxRelabelRecord.target_mode` is: it
+    /// is the one way to see that the run's work will never take effect. A
+    /// root booted with `selinux=0` loads no policy at all, so a `.configure`
+    /// to `enforcing` on such an image has changed a file nothing will
+    /// consult. Editing the command line is deliberately not this operation's
+    /// job -- the model has `boot_security.extra_kernel_options` for that --
+    /// but staying silent about it would leave the fact nowhere.
+    kernel_command_line_disables_selinux: ?bool = null,
+};
+
 pub const PreservedExecutionRecord = struct {
     source_format: Format,
     output_format: Format,
@@ -6807,6 +6985,11 @@ pub const PreservedExecutionRecord = struct {
     /// Present exactly when the run relabelled the root. Both backends fill
     /// it, because both read the same configuration out of the same target.
     selinux_relabel: ?SelinuxRelabelRecord = null,
+    /// Present exactly when the run changed the target's SELinux
+    /// configuration. A relabel a `.configure` performed is reported here
+    /// rather than in `selinux_relabel`, because it is part of that operation
+    /// rather than a second one the plan published.
+    selinux_configure: ?SelinuxConfigureRecord = null,
     /// Present exactly when the run regenerated at least one initramfs.
     initramfs: ?InitramfsRecord = null,
 };
@@ -7156,6 +7339,17 @@ fn backendRelabel(
     return null;
 }
 
+/// Same shape, same reason: both backends carry out the same operation
+/// against the same file and report the same discovered values.
+fn backendConfigure(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+    vm_report: ?*const VmRuntimeReport,
+) ?SelinuxConfigureRecord {
+    if (unsafe_report) |report| return report.selinux_configure;
+    if (vm_report) |report| return report.selinux_configure;
+    return null;
+}
+
 /// Every command the run spawned, in the order it spawned them: the backend's
 /// own host-side plumbing first, then whatever ran inside the target root.
 ///
@@ -7172,6 +7366,23 @@ fn backendTools(
     return &.{};
 }
 
+/// Whether the image this run staged boots with SELinux switched off on its
+/// kernel command line.
+///
+/// Read from the staged image rather than from the source, because the answer
+/// is about what was published; read here rather than in either executor,
+/// because the boot entries live on the ESP and neither executor mounts it.
+/// Only a `.configure` asks, because it is the only operation the answer says
+/// anything about, and an image whose entries cannot be read reports nothing
+/// rather than a guess.
+fn selinuxCommandLineDisabled(allocator: Allocator, io: Io, plan: *const ResolvedPlan) ?bool {
+    if (plan.data.selinux != .configure) return null;
+    var image = image_mod.Image.openPathReadOnly(io, plan.data.staging_output_path) catch
+        return null;
+    defer image.close(io);
+    return boot_options.selinuxDisabledOnCommandLine(allocator, io, &image) catch null;
+}
+
 fn buildResult(
     allocator: Allocator,
     plan: *const ResolvedPlan,
@@ -7185,6 +7396,10 @@ fn buildResult(
     source_digests: []const SourceRecord,
     output_digest: Digest,
     output_file_size: u64,
+    /// Whether the published image boots with `selinux=0`, or nothing when
+    /// nothing asked -- only a `.configure` reads it -- or when its boot
+    /// entries could not be read.
+    selinux_command_line_disabled: ?bool,
     limit_peaks: limits_mod.Peaks,
 ) Allocator.Error!Result {
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -7372,6 +7587,24 @@ fn buildResult(
             .selinux_relabel = if (backendRelabel(unsafe_report, vm_report)) |record| .{
                 .discovered_policy = try result_allocator.dupe(u8, record.discovered_policy),
                 .target_mode = record.target_mode,
+            } else null,
+            .selinux_configure = if (backendConfigure(unsafe_report, vm_report)) |record| .{
+                .previous_mode = record.previous_mode,
+                .previous_policy = if (record.previous_policy) |name|
+                    try result_allocator.dupe(u8, name)
+                else
+                    null,
+                .mode = record.mode,
+                .policy = if (record.policy) |name|
+                    try result_allocator.dupe(u8, name)
+                else
+                    null,
+                .relabelled = record.relabelled,
+                .relabel_reason = record.relabel_reason,
+                // Filled in by the caller rather than by the backend: the
+                // boot entries live on the ESP, which neither executor mounts,
+                // and the published image is the one the answer is about.
+                .kernel_command_line_disables_selinux = selinux_command_line_disabled,
             } else null,
             .initramfs = if (backendInitramfs(unsafe_report, vm_report)) |record| initramfs_blk: {
                 const skipped = try result_allocator.alloc(
@@ -8041,6 +8274,7 @@ pub fn execute(
         source_digests_before,
         output_digest,
         output_file_size,
+        selinuxCommandLineDisabled(allocator, io, plan),
         limit_sink.peaks,
     );
     var result_owned_by_function = true;
@@ -9742,7 +9976,7 @@ test "unimplemented typed policies become semantic preflight requirements" {
     request.selinux = .{ .configure = .{
         .mode = .enforcing,
         .policy = "targeted",
-        .relabel = true,
+        .relabel = .always,
     } };
 
     var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
@@ -9895,7 +10129,7 @@ test "a relabel is published after everything that writes to the root" {
     var saw_finalize_hook = false;
     for (operations, 0..) |operation, index| {
         if (operation.phase == .selinux) {
-            try std.testing.expectEqual(Action.apply_selinux_policy, operation.action);
+            try std.testing.expectEqual(Action.relabel_filesystem, operation.action);
             try std.testing.expect(relabel_index == null);
             relabel_index = index;
         }
@@ -9945,6 +10179,233 @@ test "a relabel is a different plan from leaving the labels alone" {
         &unchanged.plan.?.data.plan_hash.bytes,
         &relabel.plan.?.data.plan_hash.bytes,
     ));
+}
+
+test "a configuration change is its own operation, and its own plan" {
+    var request = validNativeEditRequest(
+        "source.raw",
+        "selinux-configure-work/output.raw",
+        "selinux-configure-work",
+        &.{},
+    );
+    request.execution.backend = .unsafe_chroot;
+    request.execution.acknowledge_unsafe = true;
+
+    const Resolved = struct {
+        fn selinuxAction(inner: *const Request) !Action {
+            var resolved = try resolve(
+                std.testing.allocator,
+                inner,
+                .{ .host_architecture = .x86_64 },
+            );
+            defer resolved.deinit(std.testing.allocator);
+            try std.testing.expect(resolved.plan != null);
+            for (resolved.plan.?.data.operations) |operation| {
+                if (operation.phase == .selinux) return operation.action;
+            }
+            return error.NoSelinuxOperation;
+        }
+
+        fn planHash(inner: *const Request) ![32]u8 {
+            var resolved = try resolve(
+                std.testing.allocator,
+                inner,
+                .{ .host_architecture = .x86_64 },
+            );
+            defer resolved.deinit(std.testing.allocator);
+            try std.testing.expect(resolved.plan != null);
+            return resolved.plan.?.data.plan_hash.bytes;
+        }
+    };
+
+    // Relabelling and configuring are different work, so they are different
+    // operations. A plan that named them both `apply_selinux_policy` would
+    // publish an operation for a relabel that applies no policy.
+    request.selinux = .relabel;
+    try std.testing.expectEqual(Action.relabel_filesystem, try Resolved.selinuxAction(&request));
+    const relabel_hash = try Resolved.planHash(&request);
+
+    request.selinux = .{ .configure = .{ .mode = .enforcing } };
+    try std.testing.expectEqual(Action.apply_selinux_policy, try Resolved.selinuxAction(&request));
+    const configure_hash = try Resolved.planHash(&request);
+    try std.testing.expect(!std.mem.eql(u8, &relabel_hash, &configure_hash));
+
+    // The relabel policy decides whether a filesystem walk happens, which is
+    // the difference between two images, so two runs differing only in it must
+    // not share a cache entry.
+    request.selinux = .{ .configure = .{ .mode = .enforcing, .relabel = .never } };
+    const declined_hash = try Resolved.planHash(&request);
+    try std.testing.expect(!std.mem.eql(u8, &configure_hash, &declined_hash));
+
+    // Same for the settings themselves: a mode-only change and a policy-only
+    // change are not the same build.
+    request.selinux = .{ .configure = .{ .policy = "targeted" } };
+    const policy_hash = try Resolved.planHash(&request);
+    try std.testing.expect(!std.mem.eql(u8, &configure_hash, &policy_hash));
+}
+
+test "a configuration change declares every capability the run may need" {
+    const Case = struct {
+        why: []const u8,
+        configure: @FieldType(SelinuxPolicy, "configure"),
+        expect_relabel: bool,
+    };
+    const cases = [_]Case{
+        .{
+            .why = "an unconditional relabel always walks the filesystem",
+            .configure = .{ .mode = .enforcing, .relabel = .always },
+            .expect_relabel = true,
+        },
+        .{
+            // Declared because the run may need it. A capability discovered to
+            // be missing after the workspace exists is the failure preflight
+            // exists to prevent, and only the executor can see the target's
+            // current mode.
+            .why = "a conditional relabel may still walk the filesystem",
+            .configure = .{ .mode = .enforcing, .relabel = .when_needed },
+            .expect_relabel = true,
+        },
+        .{
+            .why = "a declined relabel never walks the filesystem",
+            .configure = .{ .mode = .enforcing, .relabel = .never },
+            .expect_relabel = false,
+        },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.why});
+        var request = validNativeEditRequest(
+            "source.raw",
+            "selinux-capability-work/output.raw",
+            "selinux-capability-work",
+            &.{},
+        );
+        request.execution.backend = .unsafe_chroot;
+        request.execution.acknowledge_unsafe = true;
+        request.selinux = .{ .configure = case.configure };
+
+        var resolved = try resolve(
+            std.testing.allocator,
+            &request,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer resolved.deinit(std.testing.allocator);
+        try std.testing.expect(resolved.plan != null);
+
+        var saw_policy = false;
+        var saw_guest = false;
+        var saw_relabel = false;
+        for (resolved.plan.?.data.required_capabilities) |capability| switch (capability.kind) {
+            .selinux_policy => saw_policy = true,
+            .guest_execution => saw_guest = true,
+            .selinux_relabel => saw_relabel = true,
+            else => {},
+        };
+        // Writing the configuration is code running against the target root,
+        // so it needs the same declaration every other in-target operation
+        // makes.
+        try std.testing.expect(saw_policy);
+        try std.testing.expect(saw_guest);
+        try std.testing.expectEqual(case.expect_relabel, saw_relabel);
+    }
+}
+
+test "a SELinux configuration is refused where it could not be applied" {
+    const Case = struct {
+        why: []const u8,
+        selinux: SelinuxPolicy,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            // A caller who reached for `.configure` meant to change something.
+            // Accepting the empty shape as a no-op hides the mistake behind a
+            // run that reports success and changed nothing.
+            .why = "a configuration that names neither setting",
+            .selinux = .{ .configure = .{} },
+            .expected = "must name a mode, a policy, or both",
+        },
+        .{
+            .why = "a policy name that would escape the policy directory",
+            .selinux = .{ .configure = .{ .policy = "../../etc" } },
+            .expected = "SELinux policy names",
+        },
+        .{
+            .why = "a policy name that is a path",
+            .selinux = .{ .configure = .{ .policy = "targeted/contexts" } },
+            .expected = "SELinux policy names",
+        },
+        .{
+            .why = "a policy name that is empty",
+            .selinux = .{ .configure = .{ .policy = "" } },
+            .expected = "SELinux policy names",
+        },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.why});
+        var request = whenNeededRequest();
+        request.selinux = case.selinux;
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(diagnostics.hasErrors());
+        var named = false;
+        for (diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, case.expected) != null) {
+                named = true;
+                try std.testing.expectEqual(DiagnosticCode.invalid_policy, diagnostic.code);
+            }
+        }
+        try std.testing.expect(named);
+    }
+}
+
+test "a backend that cannot configure SELinux says so before a workspace exists" {
+    const io = std.testing.io;
+    const source_path = "test-customize-selinux-backend-source.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    {
+        const source = try Io.Dir.cwd().createFile(io, source_path, .{});
+        source.close(io);
+    }
+
+    // The backends that have no way to run code against the target root, or
+    // no root to run it against. Each must refuse by name rather than build an
+    // image whose SELinux configuration is not what was asked for.
+    const backends = [_]ExecutionBackend{ .native_fresh, .native_edit, .rebuild };
+    for (backends) |backend| {
+        errdefer std.debug.print("backend: {t}\n", .{backend});
+        var request = validNativeEditRequest(
+            source_path,
+            "selinux-backend-work/output.raw",
+            "selinux-backend-work",
+            &.{},
+        );
+        request.execution.backend = backend;
+        request.selinux = .{ .configure = .{ .mode = .enforcing, .relabel = .always } };
+
+        var resolved = try resolve(
+            std.testing.allocator,
+            &request,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer resolved.deinit(std.testing.allocator);
+        if (resolved.plan == null) continue;
+
+        var report = try preflight(
+            std.testing.allocator,
+            io,
+            &resolved.plan.?,
+            Platform.system(),
+        );
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expect(!report.ready());
+        var named = false;
+        for (report.capabilities) |capability| {
+            if (capability.requirement.kind != .selinux_policy) continue;
+            named = true;
+            try std.testing.expectEqual(CapabilityState.unsupported, capability.state);
+        }
+        try std.testing.expect(named);
+    }
 }
 
 test "unsupported guest-code backends fail preflight before workspace mutation" {
@@ -12054,8 +12515,8 @@ test "the schema versions move only when the documents do" {
     // an instruction and an outcome at once: `boot_security.signing` states
     // which provider and certificate to use, and `execution.uki_signatures`
     // records what each signature turned out to be over and who it named.
-    try std.testing.expectEqual(@as(u32, 25), plan_schema_version);
-    try std.testing.expectEqual(@as(u32, 28), provenance_schema_version);
+    try std.testing.expectEqual(@as(u32, 26), plan_schema_version);
+    try std.testing.expectEqual(@as(u32, 29), provenance_schema_version);
 }
 
 test "native-edit resolution is deterministic, deeply owned, and integrity checked" {
