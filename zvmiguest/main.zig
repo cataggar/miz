@@ -74,6 +74,7 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
         .package_lock = session.emitted_lock.items,
         .hooks = session.hook_outcomes.items,
         .selinux_relabel = session.selinux_relabel,
+        .selinux_configure = session.selinux_configure,
         .imported_trust_keys = session.imported_trust_keys.items,
         .initramfs = if (session.initramfs_regenerated) .{
             .skipped_kernel_releases = session.skipped_kernels.items,
@@ -108,6 +109,11 @@ const Session = struct {
     /// that succeeded. The policy is in the `setfiles` argv too; the mode is
     /// nowhere else, and neither is marked as discovered without this.
     selinux_relabel: ?control_mod.SelinuxRelabel = null,
+    /// What the target's own SELinux configuration named before a
+    /// configuration change replaced it, and whether that change relabelled.
+    /// Neither is in any argv, and the relabel decision depends on a state
+    /// only the run can see.
+    selinux_configure: ?control_mod.SelinuxConfigureOutcome = null,
     /// Whether an initramfs regeneration was attempted at all, which is not
     /// the same as whether one produced an image.
     initramfs_regenerated: bool = false,
@@ -273,8 +279,8 @@ const Session = struct {
         // written afterwards would be the unlabelled file it exists to
         // prevent. The same position the chroot backend relabels from, and
         // the phase the plan publishes last.
-        if (control.selinux_relabel) {
-            self.relabelRoot() catch |err| {
+        if (control.selinux) |policy| {
+            self.applySelinux(policy) catch |err| {
                 return self.stageFailure("selinux", err);
             };
         }
@@ -699,6 +705,14 @@ const Session = struct {
         });
     }
 
+    /// Carries out whichever SELinux operation the control document declared.
+    fn applySelinux(self: *Session, policy: control_mod.Selinux) !void {
+        switch (policy) {
+            .relabel_only => try self.relabelRoot(),
+            .configure => |configure| try self.configureSelinux(configure),
+        }
+    }
+
     /// Relabels the target root with the policy the target itself carries.
     ///
     /// Reads the policy out of the target's own `/etc/selinux/config` while
@@ -707,10 +721,6 @@ const Session = struct {
     /// replaced it. The argv reaches provenance like every other tool, so what
     /// it resolved to needs no record of its own.
     fn relabelRoot(self: *Session) !void {
-        const tool = for (control_mod.selinux.setfiles_candidates) |candidate| {
-            if (self.guestFileExists(candidate)) break candidate;
-        } else return error.MissingSelinuxLabellingTool;
-
         const config = self.readGuestFile(
             control_mod.selinux.config_path,
             max_selinux_config_bytes,
@@ -720,6 +730,94 @@ const Session = struct {
         // Taken from the same read as the policy, so the record describes one
         // configuration rather than two glimpses of a file.
         const mode = control_mod.selinux.parseConfiguredMode(config);
+        try self.runRelabel(policy);
+        // After the tool succeeded, so the record describes a relabel that
+        // happened. `policy` points into the configuration this session's
+        // arena still holds, so it outlives the result it is published in.
+        self.selinux_relabel = .{ .policy = policy, .mode = mode };
+    }
+
+    /// Writes the declared mode and policy into the target's own
+    /// `/etc/selinux/config`, and relabels when that change makes the labels
+    /// the target already carries wrong.
+    ///
+    /// The mirror of the chroot backend's operation, reaching the same answers
+    /// through the same shared module, because the same request must produce
+    /// the same image whichever backend carries it out.
+    ///
+    /// The before-state is read once, and from the target rather than from the
+    /// control document, because a package action in this same run can have
+    /// replaced the configuration. A policy the target does not carry fails
+    /// the run rather than being installed: installing a policy is a package
+    /// action, and the model already has one. `/.autorelabel` is deliberately
+    /// not used -- it defers the labelling to the target's first boot, and an
+    /// image zvmi publishes is finished.
+    fn configureSelinux(self: *Session, configure: control_mod.SelinuxConfigure) !void {
+        if (configure.mode == null and configure.policy == null) {
+            return error.EmptySelinuxConfiguration;
+        }
+        const before = self.readGuestFile(
+            control_mod.selinux.config_path,
+            max_selinux_config_bytes,
+        ) catch return error.MissingSelinuxConfiguration;
+        const previous_mode = control_mod.selinux.parseConfiguredMode(before);
+        const previous_policy = control_mod.selinux.parseConfiguredPolicy(before);
+
+        // Refused before the file is rewritten, so a run that cannot finish
+        // the operation has not half-finished it into a root naming a policy
+        // it does not carry.
+        if (configure.policy) |name| {
+            var contexts_buffer: [control_mod.selinux.max_policy_name_bytes + 64]u8 = undefined;
+            const contexts = control_mod.selinux.fileContextsPath(&contexts_buffer, name) catch
+                return error.UnsupportedSelinuxPolicy;
+            if (!self.guestFileExists(contexts)) return error.MissingSelinuxPolicy;
+        }
+
+        const rendered = try self.allocator.alloc(
+            u8,
+            before.len + control_mod.selinux.max_policy_name_bytes + 32,
+        );
+        const text = control_mod.selinux.renderConfig(
+            rendered,
+            before,
+            configure.mode,
+            configure.policy,
+        ) catch |err| switch (err) {
+            error.MissingSelinuxSetting => return error.MissingSelinuxSetting,
+            error.InvalidPolicy => return error.UnsupportedSelinuxPolicy,
+            error.NoChangeRequested => return error.EmptySelinuxConfiguration,
+            error.NoSpaceLeft => return error.MissingSelinuxConfiguration,
+        };
+        try self.writeGuestFile(control_mod.selinux.config_path, text);
+
+        const reason = control_mod.selinux.relabelReason(
+            configure.relabel,
+            previous_mode,
+            previous_policy orelse "",
+            configure.mode,
+            configure.policy,
+        );
+        if (control_mod.selinux.relabels(reason)) {
+            // Against the policy this just wrote, so the labels are the ones
+            // the published configuration names.
+            const policy = configure.policy orelse
+                previous_policy orelse return error.MissingSelinuxConfiguration;
+            try self.runRelabel(policy);
+        }
+        self.selinux_configure = .{
+            .previous_mode = previous_mode,
+            .previous_policy = previous_policy,
+            .relabelled = control_mod.selinux.relabels(reason),
+            .relabel_reason = reason,
+        };
+    }
+
+    /// Walks the target root with its own labelling tool, against `policy`.
+    fn runRelabel(self: *Session, policy: []const u8) !void {
+        const tool = for (control_mod.selinux.setfiles_candidates) |candidate| {
+            if (self.guestFileExists(candidate)) break candidate;
+        } else return error.MissingSelinuxLabellingTool;
+
         var contexts_buffer: [control_mod.selinux.max_policy_name_bytes + 64]u8 = undefined;
         const contexts = control_mod.selinux.fileContextsPath(&contexts_buffer, policy) catch
             return error.UnsupportedSelinuxPolicy;
@@ -743,10 +841,6 @@ const Session = struct {
         try argv.append(try self.allocator.dupe(u8, contexts));
         try argv.append("/");
         try self.runChroot(argv.items);
-        // After the tool succeeded, so the record describes a relabel that
-        // happened. `policy` points into the configuration this session's
-        // arena still holds, so it outlives the result it is published in.
-        self.selinux_relabel = .{ .policy = policy, .mode = mode };
     }
 
     fn guestFileExists(self: *Session, guest_path: []const u8) bool {

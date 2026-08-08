@@ -352,6 +352,43 @@ pub fn relabels(reason: RelabelReason) bool {
     };
 }
 
+/// The kernel parameter that switches SELinux off whatever the target's
+/// `/etc/selinux/config` says. The kernel treats `selinux=0` as off and
+/// anything else as on, so this is the whole spelling rather than a prefix.
+pub const disabling_kernel_option = "selinux=0";
+
+/// Whether `contents` -- a bootloader configuration or a BLS entry file --
+/// carries `selinux=0` on a command line.
+///
+/// Read rather than edited. A root whose command line disables SELinux boots
+/// with it off however this run configured it, so a `.configure` on such an
+/// image has done nothing observable, and nothing else a run publishes reveals
+/// that. Editing the command line is a different request with its own model
+/// (`boot_security.extra_kernel_options`), and doing it silently here would
+/// change what the image boots with on the strength of an inference.
+///
+/// A whole-file scan bounded by word boundaries, rather than a parse: these
+/// files have several formats between them and the question is only whether
+/// the token is present, which every format spells the same way.
+pub fn carriesDisablingKernelOption(contents: []const u8) bool {
+    var offset: usize = 0;
+    while (std.mem.indexOfPos(u8, contents, offset, disabling_kernel_option)) |found| {
+        defer offset = found + 1;
+        if (found != 0 and !isCommandLineSeparator(contents[found - 1])) continue;
+        const after = found + disabling_kernel_option.len;
+        if (after != contents.len and !isCommandLineSeparator(contents[after])) continue;
+        return true;
+    }
+    return false;
+}
+
+fn isCommandLineSeparator(byte: u8) bool {
+    return switch (byte) {
+        ' ', '\t', '\r', '\n', '"', '\'' => true,
+        else => false,
+    };
+}
+
 test "parses the configured mode" {
     try std.testing.expectEqual(
         Mode.enforcing,
@@ -647,4 +684,21 @@ test "the relabel decision follows what the run changes" {
     try std.testing.expect(relabels(.requested));
     try std.testing.expect(!relabels(.not_needed));
     try std.testing.expect(!relabels(.declined));
+}
+
+test "a command line that switches SELinux off is recognised on a word boundary" {
+    try std.testing.expect(carriesDisablingKernelOption(
+        "linux /vmlinuz root=UUID=1 selinux=0 quiet\n",
+    ));
+    try std.testing.expect(carriesDisablingKernelOption("options selinux=0"));
+    try std.testing.expect(carriesDisablingKernelOption(
+        "GRUB_CMDLINE_LINUX=\"selinux=0\"\n",
+    ));
+    // `selinux=1` is the kernel's own spelling of leaving it on, and
+    // `enforcing=0` only asks for permissive rather than off.
+    try std.testing.expect(!carriesDisablingKernelOption("linux /vmlinuz selinux=1\n"));
+    try std.testing.expect(!carriesDisablingKernelOption("linux /vmlinuz enforcing=0\n"));
+    try std.testing.expect(!carriesDisablingKernelOption("linux /vmlinuz noselinux=0\n"));
+    try std.testing.expect(!carriesDisablingKernelOption("linux /vmlinuz selinux=00\n"));
+    try std.testing.expect(!carriesDisablingKernelOption(""));
 }

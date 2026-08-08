@@ -41,6 +41,7 @@ const fat32 = @import("fat32.zig");
 const gpt = @import("gpt.zig");
 const guid = @import("guid.zig");
 const image_mod = @import("image.zig");
+const selinux = @import("selinux.zig");
 
 const Image = image_mod.Image;
 
@@ -266,6 +267,31 @@ pub fn inspect(
         inspection.entries += entries;
     }
     return inspection;
+}
+
+/// Whether any boot entry the image carries switches SELinux off on the kernel
+/// command line.
+///
+/// Read-only, over the same entry files `inspect` reads, so a SELinux
+/// configuration change can record that the image it produced will boot with
+/// SELinux off whatever it wrote into `/etc/selinux/config`. Nothing here
+/// edits a command line: that is a different request with its own model.
+pub fn selinuxDisabledOnCommandLine(
+    allocator: std.mem.Allocator,
+    io: Io,
+    image: *Image,
+) ApplyError!bool {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var files = std.array_list.Managed(EntryFile).init(arena);
+    var filesystem = try openEntryFiles(arena, io, image, &files);
+    for (files.items) |file| {
+        const contents = try readConfig(&filesystem, io, arena, file.path);
+        if (selinux.carriesDisablingKernelOption(contents)) return true;
+    }
+    return false;
 }
 
 /// Opens the ESP and fills `files` with every boot entry file on it, refusing
