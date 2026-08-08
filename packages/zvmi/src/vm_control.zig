@@ -692,11 +692,10 @@ pub const SkippedKernel = struct {
     reason: SkippedKernelReason,
 };
 
-pub const SkippedKernelReason = enum {
-    invalid_release_name,
-    not_a_module_directory,
-    no_module_dependency_index,
-};
+/// The same type as `customize.SkippedKernelReason`, not a copy of it: both
+/// are aliases of `initramfs_mod.SkipReason`, so a reason added on one side
+/// cannot go unmapped on the other.
+pub const SkippedKernelReason = initramfs_mod.SkipReason;
 
 /// An initramfs the guest regenerated and left in the target root.
 pub const InitramfsImage = struct {
