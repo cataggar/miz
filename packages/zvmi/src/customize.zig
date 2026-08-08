@@ -5812,7 +5812,7 @@ fn unsafeChrootCapabilityState(
             // after the package actions have run. Both backends support that,
             // so there is nothing to refuse here.
             for (regenerate.kernels) |kernel| {
-                if (!validUnsafeKernelRelease(kernel)) return .unsupported;
+                if (!vm_control.validKernelRelease(kernel)) return .unsupported;
             }
             if (regenerate.generator) |generator| {
                 if (!std.mem.eql(u8, generator, "dracut")) return .unsupported;
@@ -5891,7 +5891,7 @@ fn vmCapabilityState(
             // after the package actions have run. Both backends support that,
             // so there is nothing to refuse here.
             for (regenerate.kernels) |kernel| {
-                if (!validUnsafeKernelRelease(kernel)) return .unsupported;
+                if (!vm_control.validKernelRelease(kernel)) return .unsupported;
             }
             if (regenerate.generator) |generator| {
                 if (!std.mem.eql(u8, generator, "dracut")) return .unsupported;
@@ -5960,7 +5960,7 @@ fn validUnsafePackageLock(lock: PackageLockPolicy) bool {
     for (pins) |pin| {
         if (!validUnsafePackageName(pin.name)) return false;
         if (!validUnsafeEvr(pin.evr)) return false;
-        if (!validUnsafeKernelRelease(pin.architecture)) return false;
+        if (!vm_control.validKernelRelease(pin.architecture)) return false;
     }
     return true;
 }
@@ -5978,22 +5978,6 @@ fn validUnsafeEvr(evr: []const u8) bool {
             byte != '~' and
             byte != '^' and
             byte != ':')
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn validUnsafeKernelRelease(kernel: []const u8) bool {
-    if (kernel.len == 0 or !std.ascii.isAlphanumeric(kernel[0])) return false;
-    for (kernel[1..]) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and
-            byte != '.' and
-            byte != '_' and
-            byte != '+' and
-            byte != '-' and
-            byte != '~')
         {
             return false;
         }
