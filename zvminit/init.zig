@@ -1295,8 +1295,43 @@ fn setupNetworking() NetworkResult {
 // ============================== managed children ==============================
 const azagent_path = "/usr/sbin/azagent";
 const sshd_path = "/usr/sbin/sshd";
+/// An image may replace the default access provider by shipping this binary.
+///
+/// zvminit supervises exactly one program that makes the machine reachable.
+/// By default that is OpenSSH. An appliance image whose way in is something
+/// else — a mesh VPN, a console enrollment agent, a vendor control channel —
+/// installs this path instead, and zvminit runs it *in place of* sshd rather
+/// than alongside it. An image that does not ship it is unaffected.
+const access_provider_path = "/usr/local/sbin/zvminit-access";
 const provisioning_retry_seconds: u32 = 5;
-const sshd_max_backoff_seconds: u32 = 30;
+const access_max_backoff_seconds: u32 = 30;
+
+/// Which program makes this machine reachable.
+const AccessProvider = enum {
+    /// `/usr/sbin/sshd`, the default.
+    sshd,
+    /// `/usr/local/sbin/zvminit-access`, supplied by the image.
+    override,
+
+    fn path(provider: AccessProvider) [*:0]const u8 {
+        return switch (provider) {
+            .sshd => sshd_path,
+            .override => access_provider_path,
+        };
+    }
+};
+
+/// The decision itself, separated from the probe so it can be tested on a
+/// build host: `linux.access` is a raw Linux syscall and means nothing here.
+fn accessProviderFor(override_present: bool) AccessProvider {
+    return if (override_present) .override else .sshd;
+}
+
+/// Resolved once per supervisor pass rather than cached, so an image that
+/// installs the override during provisioning is picked up without a reboot.
+fn selectAccessProvider() AccessProvider {
+    return accessProviderFor(linux.errno(linux.access(access_provider_path, linux.F_OK)) == .SUCCESS);
+}
 
 const AzagentLaunchMode = enum {
     azure,
@@ -1335,20 +1370,36 @@ fn spawnAzagent(mode: AzagentLaunchMode) ?linux.pid_t {
     return pid;
 }
 
-fn spawnSshd() ?linux.pid_t {
-    if (linux.errno(linux.access(sshd_path, linux.F_OK)) != .SUCCESS) return null;
-    mkdirIgnoreExists("/run/sshd");
-    writeStr("[zvminit] starting supervised sshd -D -e\r\n");
-    const pid = forkProcess("[zvminit] fork() for sshd failed") orelse return null;
+fn spawnAccessProvider(provider: AccessProvider) ?linux.pid_t {
+    const path = provider.path();
+    if (linux.errno(linux.access(path, linux.F_OK)) != .SUCCESS) return null;
+    switch (provider) {
+        .sshd => {
+            mkdirIgnoreExists("/run/sshd");
+            writeStr("[zvminit] starting supervised sshd -D -e\r\n");
+        },
+        .override => writeStr("[zvminit] starting supervised " ++ access_provider_path ++ "\r\n"),
+    }
+    const pid = forkProcess("[zvminit] fork() for the access provider failed") orelse return null;
     if (pid == 0) {
         attachChildLog();
-        const argv = [_:null]?[*:0]const u8{ sshd_path, "-D", "-e", null };
         const envp = [_:null]?[*:0]const u8{
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             null,
         };
-        _ = linux.execve(sshd_path, &argv, &envp);
-        writeStr("[zvminit] execve(sshd) failed\r\n");
+        switch (provider) {
+            .sshd => {
+                const argv = [_:null]?[*:0]const u8{ sshd_path, "-D", "-e", null };
+                _ = linux.execve(sshd_path, &argv, &envp);
+            },
+            .override => {
+                // No arguments: everything the provider needs comes from the
+                // image, so its configuration surface stays out of PID 1.
+                const argv = [_:null]?[*:0]const u8{ access_provider_path, null };
+                _ = linux.execve(access_provider_path, &argv, &envp);
+            },
+        }
+        writeStr("[zvminit] execve(access provider) failed\r\n");
         linux.exit(127);
     }
     return pid;
@@ -1448,16 +1499,16 @@ const Supervisor = struct {
     azagent_done: bool = false,
     azagent_retry: u32 = 0,
     azagent_missing_logged: bool = false,
-    sshd_pid: linux.pid_t = 0,
-    sshd_retry: u32 = 0,
-    sshd_backoff: u32 = 1,
+    access_pid: linux.pid_t = 0,
+    access_retry: u32 = 0,
+    access_backoff: u32 = 1,
     shell_pid: linux.pid_t = 0,
     shell_retry: u32 = 0,
     detection_retry: u32 = provisioning_retry_seconds,
 };
 
-fn nextSshdBackoff(current: u32) u32 {
-    return @min(current * 2, sshd_max_backoff_seconds);
+fn nextAccessBackoff(current: u32) u32 {
+    return @min(current * 2, access_max_backoff_seconds);
 }
 
 fn childSucceeded(status: u32) bool {
@@ -1474,11 +1525,11 @@ fn noteChildExit(supervisor: *Supervisor, pid: linux.pid_t, status: u32) void {
             supervisor.azagent_retry = provisioning_retry_seconds;
             writeStr("[zvminit] azagent failed; retrying in 5 seconds\r\n");
         }
-    } else if (pid == supervisor.sshd_pid) {
-        supervisor.sshd_pid = 0;
-        supervisor.sshd_retry = supervisor.sshd_backoff;
-        supervisor.sshd_backoff = nextSshdBackoff(supervisor.sshd_backoff);
-        writeStr("[zvminit] sshd exited unexpectedly; scheduling restart\r\n");
+    } else if (pid == supervisor.access_pid) {
+        supervisor.access_pid = 0;
+        supervisor.access_retry = supervisor.access_backoff;
+        supervisor.access_backoff = nextAccessBackoff(supervisor.access_backoff);
+        writeStr("[zvminit] access provider exited unexpectedly; scheduling restart\r\n");
     } else if (pid == supervisor.shell_pid) {
         supervisor.shell_pid = 0;
         supervisor.shell_retry = 1;
@@ -1670,8 +1721,27 @@ fn shouldRunAzagent(supervisor: *const Supervisor) bool {
         !supervisor.azagent_done and supervisor.azagent_pid == 0 and supervisor.azagent_retry == 0;
 }
 
-fn shouldStartSshd(services_allowed: bool, provisioned: bool, sshd_pid: linux.pid_t, retry: u32) bool {
-    return services_allowed and provisioned and sshd_pid == 0 and retry == 0;
+/// The default provider waits for the provisioning sentinel because
+/// provisioning is what installs the administrator's authorized key: an sshd
+/// started earlier is listening on an image nobody can authenticate to.
+///
+/// A replacement provider does not wait. It brings its own credential path —
+/// it may well *be* what enrolls the machine — so the sentinel proves nothing
+/// about it, and making it wait would mean a stalled provisioner takes the
+/// machine's only remaining way in down with it. On an appliance whose kernel
+/// command line is fixed at build time, that is unrecoverable.
+fn shouldStartAccessProvider(
+    provider: AccessProvider,
+    services_allowed: bool,
+    provisioned: bool,
+    access_pid: linux.pid_t,
+    retry: u32,
+) bool {
+    if (!services_allowed or access_pid != 0 or retry != 0) return false;
+    return switch (provider) {
+        .sshd => provisioned,
+        .override => true,
+    };
 }
 
 fn supervisorLoop(supervisor: *Supervisor) noreturn {
@@ -1706,12 +1776,19 @@ fn supervisorLoop(supervisor: *Supervisor) noreturn {
             }
         }
 
-        if (shouldStartSshd(supervisor.services_allowed, isProvisioned(), supervisor.sshd_pid, supervisor.sshd_retry)) {
-            if (spawnSshd()) |pid| {
-                supervisor.sshd_pid = pid;
+        const access_provider = selectAccessProvider();
+        if (shouldStartAccessProvider(
+            access_provider,
+            supervisor.services_allowed,
+            isProvisioned(),
+            supervisor.access_pid,
+            supervisor.access_retry,
+        )) {
+            if (spawnAccessProvider(access_provider)) |pid| {
+                supervisor.access_pid = pid;
             } else {
-                supervisor.sshd_retry = supervisor.sshd_backoff;
-                supervisor.sshd_backoff = nextSshdBackoff(supervisor.sshd_backoff);
+                supervisor.access_retry = supervisor.access_backoff;
+                supervisor.access_backoff = nextAccessBackoff(supervisor.access_backoff);
             }
         }
 
@@ -1726,7 +1803,7 @@ fn supervisorLoop(supervisor: *Supervisor) noreturn {
         const req: linux.timespec = .{ .sec = 1, .nsec = 0 };
         _ = linux.nanosleep(&req, null);
         decrementDelay(&supervisor.azagent_retry);
-        decrementDelay(&supervisor.sshd_retry);
+        decrementDelay(&supervisor.access_retry);
         decrementDelay(&supervisor.shell_retry);
         decrementDelay(&supervisor.detection_retry);
         if (supervisor.services_allowed and supervisor.detection_retry == 0) {
@@ -1853,11 +1930,11 @@ test "serial console discovery prefers the last serial cmdline entry then active
     try std.testing.expectEqualStrings("ttyAMA0", selectSerialConsole("", "", .aarch64));
 }
 
-test "sshd restart backoff is exponential and bounded" {
-    try std.testing.expectEqual(@as(u32, 2), nextSshdBackoff(1));
-    try std.testing.expectEqual(@as(u32, 16), nextSshdBackoff(8));
-    try std.testing.expectEqual(sshd_max_backoff_seconds, nextSshdBackoff(16));
-    try std.testing.expectEqual(sshd_max_backoff_seconds, nextSshdBackoff(sshd_max_backoff_seconds));
+test "access provider restart backoff is exponential and bounded" {
+    try std.testing.expectEqual(@as(u32, 2), nextAccessBackoff(1));
+    try std.testing.expectEqual(@as(u32, 16), nextAccessBackoff(8));
+    try std.testing.expectEqual(access_max_backoff_seconds, nextAccessBackoff(16));
+    try std.testing.expectEqual(access_max_backoff_seconds, nextAccessBackoff(access_max_backoff_seconds));
 }
 
 test "service gates require provisionable media for azagent and sentinel for sshd" {
@@ -1873,10 +1950,41 @@ test "service gates require provisionable media for azagent and sentinel for ssh
     supervisor.decision = .non_azure;
     try std.testing.expect(!shouldRunAzagent(&supervisor));
 
-    try std.testing.expect(!shouldStartSshd(true, false, 0, 0));
-    try std.testing.expect(shouldStartSshd(true, true, 0, 0));
-    try std.testing.expect(!shouldStartSshd(true, true, 42, 0));
-    try std.testing.expect(!shouldStartSshd(true, true, 0, 1));
+    // The default provider is unchanged: it still waits for the sentinel.
+    try std.testing.expect(!shouldStartAccessProvider(.sshd, true, false, 0, 0));
+    try std.testing.expect(shouldStartAccessProvider(.sshd, true, true, 0, 0));
+    try std.testing.expect(!shouldStartAccessProvider(.sshd, true, true, 42, 0));
+    try std.testing.expect(!shouldStartAccessProvider(.sshd, true, true, 0, 1));
+}
+
+test "a replacement access provider starts without waiting for provisioning" {
+    // The sentinel proves an authorized key was installed, which says nothing
+    // about a provider that carries its own credentials. Waiting would let a
+    // stalled provisioner remove the machine's last way in.
+    try std.testing.expect(shouldStartAccessProvider(.override, true, false, 0, 0));
+    try std.testing.expect(shouldStartAccessProvider(.override, true, true, 0, 0));
+
+    // Everything else still gates it identically to sshd.
+    try std.testing.expect(!shouldStartAccessProvider(.override, false, true, 0, 0));
+    try std.testing.expect(!shouldStartAccessProvider(.override, true, true, 42, 0));
+    try std.testing.expect(!shouldStartAccessProvider(.override, true, true, 0, 1));
+}
+
+test "each access provider runs its own binary" {
+    // A provider is supervised as itself, never as sshd with different
+    // arguments: the override takes none, and sshd needs -D -e to be
+    // supervisable at all.
+    try std.testing.expectEqualStrings(sshd_path, std.mem.span(AccessProvider.path(.sshd)));
+    try std.testing.expectEqualStrings(access_provider_path, std.mem.span(AccessProvider.path(.override)));
+    try std.testing.expect(!std.mem.eql(u8, sshd_path, access_provider_path));
+}
+
+test "an image with no override resolves to the default provider" {
+    // The whole compatibility promise of this seam: an image that ships no
+    // /usr/local/sbin/zvminit-access behaves exactly as it did before it
+    // existed, on every architecture.
+    try std.testing.expectEqual(AccessProvider.sshd, accessProviderFor(false));
+    try std.testing.expectEqual(AccessProvider.override, accessProviderFor(true));
 }
 
 test "azagent launch selects skip-ready only for explicit local media" {
