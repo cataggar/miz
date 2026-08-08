@@ -378,6 +378,10 @@ pub const TargetFile = struct {
 /// worker so all three carry out the same operation.
 pub const selinux = @import("selinux.zig");
 
+/// What pinning a package transaction involves, shared with the host and the
+/// privileged worker so all three enforce the same lock.
+pub const packages = @import("packages.zig");
+
 pub const kernel_module_config_paths = [_][]const u8{
     "etc/modules-load.d/zvmi.conf",
     "etc/modprobe.d/zvmi-blacklist.conf",
@@ -618,95 +622,31 @@ pub const Control = struct {
     }
 };
 
-/// One package pinned to an exact rpm identity. Mirrors
-/// `customize.PackageVersionLock`, which documents why there is no repository
-/// field and why the EVR is required in full.
-pub const PackagePin = struct {
-    name: []const u8,
-    /// rpm's `EPOCH:VERSION-RELEASE`, epoch always written.
-    evr: []const u8,
-    architecture: []const u8,
-};
+/// One package pinned to an exact rpm identity.
+///
+/// The same type as `customize.PackageVersionLock`, not a copy of it: both are
+/// aliases of `packages.VersionLock`. See there for why there is no repository
+/// field, why the EVR is required in full, and why one type carries two names.
+pub const PackagePin = packages.VersionLock;
 
 /// Splits an `rpm -qa` record of the form `NAME-EPOCH:VERSION-RELEASE.ARCH`
-/// back into its parts, or nothing if it is not one.
-///
-/// Unambiguous despite having no reserved delimiter, and worth stating why
-/// because the obvious readings are both wrong. Splitting on the first `-`
-/// fails for a name like `python3-libs`; splitting on the first `.` fails for
-/// a release like `1.azl3`. What makes it decidable is the epoch: it is the
-/// only field that may contain `:`, and it may not contain `-`, so the `-`
-/// immediately before the `:` is always the boundary between the name and the
-/// version. The architecture is whatever follows the last `.`, because no rpm
-/// architecture contains one while a release routinely does.
-///
-/// This is how a completed run turns its own installed set into a lock the
-/// next run can state, so it has to agree exactly with the `--qf` format both
-/// backends ask rpm for.
-pub fn parseInstalledPackageRecord(record: []const u8) ?PackagePin {
-    const architecture_dot = std.mem.lastIndexOfScalar(u8, record, '.') orelse return null;
-    const architecture = record[architecture_dot + 1 ..];
-    if (architecture.len == 0) return null;
-    const head = record[0..architecture_dot];
-    const colon = std.mem.indexOfScalar(u8, head, ':') orelse return null;
-    const name_end = std.mem.lastIndexOfScalar(u8, head[0..colon], '-') orelse return null;
-    if (name_end == 0) return null;
-    const evr = head[name_end + 1 ..];
-    // A release as well as a version: the `-` that separates them has to come
-    // after the epoch, or this is a record rpm did not write.
-    if (std.mem.indexOfScalarPos(u8, evr, colon - name_end, '-') == null) return null;
-    return .{
-        .name = head[0..name_end],
-        .evr = evr,
-        .architecture = architecture,
-    };
-}
+/// back into its parts, or nothing if it is not one. See
+/// `packages.parseInstalledRecord` for why the split is decidable.
+pub const parseInstalledPackageRecord = packages.parseInstalledRecord;
 
-pub fn findPackagePin(pins: []const PackagePin, name: []const u8) ?PackagePin {
-    for (pins) |pin| {
-        if (std.mem.eql(u8, pin.name, name)) return pin;
-    }
-    return null;
-}
+/// Finds the pin for a package name, or nothing.
+pub const findPackagePin = packages.find;
 
 /// Whether an `rpm -qa` record is one of rpm's own trust pseudo-packages
 /// rather than a package a transaction installed.
-///
-/// `rpm --import` records each trusted key as `gpg-pubkey-<keyid>-<timestamp>`
-/// with `%{ARCH}` of `(none)`. A key a package transaction imports on its own
-/// was declared by nobody and can be pinned by nobody -- `(none)` is not an
-/// architecture the pin rules accept -- so it is not part of what a run
-/// installed for the purposes of the lock.
+pub const isTrustPseudoPackage = packages.isTrustPseudoPackage;
+
 /// The key rpm derived from imported trust, without the constant `(none)`
 /// architecture rpm gives every one of them.
-pub fn trustKeyIdentity(record: []const u8) []const u8 {
-    return record[0 .. record.len - ".(none)".len];
-}
-
-pub fn isTrustPseudoPackage(record: []const u8) bool {
-    return std.mem.startsWith(u8, record, "gpg-pubkey-") and
-        std.mem.endsWith(u8, record, ".(none)");
-}
+pub const trustKeyIdentity = packages.trustKeyIdentity;
 
 /// Whether a `NAME-EPOCH:VERSION-RELEASE.ARCH` record is one of these pins.
-///
-/// Reassembles each pin and compares whole strings rather than splitting the
-/// record, because the record has no delimiter a package name may not also
-/// contain: `foo-1:2-3.noarch` could be `foo` at `1:2-3` or `foo-1` at
-/// something else, and only equality against a candidate decides it.
-pub fn pinsCoverRecord(pins: []const PackagePin, record: []const u8) bool {
-    for (pins) |pin| {
-        if (record.len != pin.name.len + pin.evr.len + pin.architecture.len + 2) continue;
-        if (!std.mem.startsWith(u8, record, pin.name)) continue;
-        if (record[pin.name.len] != '-') continue;
-        const rest = record[pin.name.len + 1 ..];
-        if (!std.mem.startsWith(u8, rest, pin.evr)) continue;
-        if (rest[pin.evr.len] != '.') continue;
-        if (!std.mem.eql(u8, rest[pin.evr.len + 1 ..], pin.architecture)) continue;
-        return true;
-    }
-    return false;
-}
+pub const pinsCoverRecord = packages.coverRecord;
 
 /// An EVR carries the one `:` a package name may not, so it gets its own rule.
 pub fn validPackageEvr(evr: []const u8) bool {
@@ -1368,6 +1308,11 @@ test "a control document round-trips and is validated on the way back in" {
             .trust_base64 = &.{"a2V5"},
         }},
         .actions = &.{.{ .install = &.{"strace"} }},
+        .package_pins = &.{.{
+            .name = "strace",
+            .evr = "0:6.8-1.azl3",
+            .architecture = "x86_64",
+        }},
         .initramfs = .{ .regenerate = .{ .kernels = &.{"6.12.0-1.azl"} } },
         .modules = &.{ "zvmi-module-00-virtio_pci.ko", "zvmi-module-01-ext4.ko" },
     };
@@ -1376,9 +1321,22 @@ test "a control document round-trips and is validated on the way back in" {
     const json = try std.json.Stringify.valueAlloc(allocator, control, .{});
     defer allocator.free(json);
 
+    // `PackagePin` is an alias of `packages.VersionLock` rather than a struct
+    // of its own, and an alias must not be visible on the wire. Asserted
+    // rather than assumed, because the document a released host writes has to
+    // stay readable by a guest agent built from a different revision.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json,
+        "\"package_pins\":[{\"name\":\"strace\",\"evr\":\"0:6.8-1.azl3\",\"architecture\":\"x86_64\"}]",
+    ) != null);
+
     const parsed = try parseControl(allocator, json);
     defer parsed.deinit();
     try std.testing.expectEqualStrings("/dev/vda2", parsed.value.root_device);
+    try std.testing.expectEqualStrings("strace", parsed.value.package_pins[0].name);
+    try std.testing.expectEqualStrings("0:6.8-1.azl3", parsed.value.package_pins[0].evr);
+    try std.testing.expectEqualStrings("x86_64", parsed.value.package_pins[0].architecture);
     try std.testing.expectEqualStrings(
         "10.0.2.15",
         parsed.value.network.declared_repositories.address,

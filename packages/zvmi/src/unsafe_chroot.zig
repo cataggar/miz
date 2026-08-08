@@ -1307,8 +1307,8 @@ const Session = struct {
         }
         for (self.installed_packages.items) |installed| {
             if (containsBytes(self.baseline_packages.items, installed)) continue;
-            if (isTrustPseudoPackage(installed)) continue;
-            if (!pinsCover(pins, installed)) return error.UnlockedPackageInstalled;
+            if (vm_control.isTrustPseudoPackage(installed)) continue;
+            if (!vm_control.pinsCoverRecord(pins, installed)) return error.UnlockedPackageInstalled;
         }
     }
 
@@ -1326,9 +1326,9 @@ const Session = struct {
         if (self.manifest.packages.actions.len == 0) return;
         for (self.installed_packages.items) |installed| {
             if (containsBytes(self.baseline_packages.items, installed)) continue;
-            if (isTrustPseudoPackage(installed)) {
+            if (vm_control.isTrustPseudoPackage(installed)) {
                 try self.imported_trust_keys.append(
-                    try self.allocator.dupe(u8, trustKeyIdentity(installed)),
+                    try self.allocator.dupe(u8, vm_control.trustKeyIdentity(installed)),
                 );
                 continue;
             }
@@ -2785,65 +2785,6 @@ fn tdnfConfigHostPath(
     return std.fmt.allocPrint(allocator, "{s}/run/zvmi-tdnf.conf", .{root_path});
 }
 
-/// Whether an `rpm -qa` record is one of rpm's own trust pseudo-packages
-/// rather than a package a transaction installed.
-///
-/// `rpm --import` records each trusted key as `gpg-pubkey-<keyid>-<timestamp>`
-/// with `%{ARCH}` of `(none)`, and this backend imports the declared
-/// repository trust before it runs anything. Ordering the baseline read after
-/// the import already keeps the declared keys out of the delta; this is for
-/// the ones a package transaction imports on its own, which no caller declared
-/// and no lock could pin -- `(none)` is not an architecture the pin rules
-/// accept, so a lock naming one could never be restated.
-/// The key rpm derived from imported trust, without the constant `(none)`
-/// architecture rpm gives every one of them.
-fn trustKeyIdentity(record: []const u8) []const u8 {
-    return record[0 .. record.len - ".(none)".len];
-}
-
-fn isTrustPseudoPackage(record: []const u8) bool {
-    return std.mem.startsWith(u8, record, "gpg-pubkey-") and
-        std.mem.endsWith(u8, record, ".(none)");
-}
-
-/// Finds the pin for a package name, or nothing.
-///
-/// Linear because a lock is the closure of one transaction rather than of a
-/// distribution: tens of entries, walked a handful of times.
-fn findPin(
-    pins: []const customize.PackageVersionLock,
-    name: []const u8,
-) ?customize.PackageVersionLock {
-    for (pins) |pin| {
-        if (std.mem.eql(u8, pin.name, name)) return pin;
-    }
-    return null;
-}
-
-/// Whether any pin names the `NAME-EPOCH:VERSION-RELEASE.ARCH` record given.
-///
-/// Rebuilding the pin's own spec and comparing whole strings, rather than
-/// matching the record's name and then its version, because the record is one
-/// value with no delimiter that a name may not also contain: `foo-1:2-3.noarch`
-/// could be package `foo` or package `foo-1`, and only an equality against a
-/// candidate spec decides it without guessing.
-fn pinsCover(
-    pins: []const customize.PackageVersionLock,
-    record: []const u8,
-) bool {
-    for (pins) |pin| {
-        if (record.len != pin.name.len + 1 + pin.evr.len + 1 + pin.architecture.len) continue;
-        if (!std.mem.startsWith(u8, record, pin.name)) continue;
-        if (record[pin.name.len] != '-') continue;
-        const rest = record[pin.name.len + 1 ..];
-        if (!std.mem.startsWith(u8, rest, pin.evr)) continue;
-        if (rest[pin.evr.len] != '.') continue;
-        if (!std.mem.eql(u8, rest[pin.evr.len + 1 ..], pin.architecture)) continue;
-        return true;
-    }
-    return false;
-}
-
 fn containsBytes(haystack: []const []const u8, needle: []const u8) bool {
     for (haystack) |candidate| {
         if (std.mem.eql(u8, candidate, needle)) return true;
@@ -2935,7 +2876,7 @@ fn validateManifestPolicy(manifest: Manifest) !void {
                 .update_all => return error.UnsupportedPackagePolicy,
             };
             for (names) |name| {
-                if (findPin(pins, name) == null) return error.UnsupportedPackagePolicy;
+                if (vm_control.findPackagePin(pins, name) == null) return error.UnsupportedPackagePolicy;
             }
         }
     }
