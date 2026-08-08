@@ -59,7 +59,7 @@ zvmi/
         cpio.zig               # minimal read-only newc-format cpio archive
                               #   reader (concatenated archives, e.g. dracut
                               #   early-cpio + main)
-        initramfs.zig           # initramfs dm-verity userspace tooling
+        verity_tooling.zig     # initramfs dm-verity userspace tooling
                               #   detection for `--verity` (issue #77)
         layout.zig             # partition-layout planner (sizing math,
                               #   alignment, DPS type GUIDs)

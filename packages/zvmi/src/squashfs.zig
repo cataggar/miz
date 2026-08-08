@@ -1121,7 +1121,7 @@ fn test86MsByte(value: u8) bool {
 fn decompressZstdAlloc(allocator: std.mem.Allocator, bytes: []const u8, max_size: usize) BlockDecompressionError![]u8 {
     var input = Io.Reader.fixed(bytes);
     // Indirect mode with an explicitly-sized window buffer -- see
-    // packages/zvmi/src/initramfs.zig's decompressZstd for why the empty-
+    // packages/zvmi/src/verity_tooling.zig's decompressZstd for why the empty-
     // buffer "direct" mode used previously is unsafe for arbitrary input
     // sizes (it happened to work for squashfs's typically-small
     // independently-compressed blocks, but relied on a fragile invariant).

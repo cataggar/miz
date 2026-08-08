@@ -3,7 +3,7 @@
 //! This only needs to enumerate entry pathnames (and expose each entry's raw
 //! content slice), so unlike `tar.zig` it doesn't attempt to support writing
 //! or any of the older cpio header formats. It exists to support inspecting
-//! initramfs images (see `initramfs.zig`) without extracting them to disk.
+//! initramfs images (see `verity_tooling.zig`) without extracting them to disk.
 //!
 //! Handles the `TRAILER!!!` end-of-archive marker and multiple **concatenated**
 //! archives: `next()` keeps scanning past a trailer (and any NUL padding
