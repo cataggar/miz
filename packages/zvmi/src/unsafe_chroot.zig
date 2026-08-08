@@ -4,6 +4,7 @@ const boot_options = @import("boot_options.zig");
 const credential_mod = @import("credential.zig");
 const customize = @import("customize.zig");
 const grub_defaults = @import("grub_defaults.zig");
+const initramfs_mod = @import("initramfs.zig");
 const os_customization = @import("os_customization.zig");
 const preserved_image = @import("preserved_image.zig");
 const selinux_mod = @import("selinux.zig");
@@ -1876,8 +1877,8 @@ const Session = struct {
         self: *Session,
         regenerate: @FieldType(customize.InitramfsPolicy, "regenerate"),
     ) !void {
-        if (regenerate.generator) |generator| {
-            if (!std.mem.eql(u8, generator, "dracut")) {
+        if (regenerate.generator) |declared| {
+            if (!std.mem.eql(u8, declared, initramfs_mod.generator)) {
                 return error.UnsupportedInitramfsGenerator;
             }
         }
@@ -1904,31 +1905,29 @@ const Session = struct {
             self.allocator.free(kernels);
         };
         for (kernels) |kernel| {
-            const output = try std.fmt.allocPrint(
-                self.allocator,
-                "/boot/initramfs-{s}.img",
-                .{kernel},
-            );
+            const output = try initramfs_mod.imagePath(self.allocator, kernel);
             defer self.allocator.free(output);
-            const temporary_output = "/run/zvmi-initramfs.img";
-            try self.runChroot(&.{
-                "/usr/bin/dracut",
-                "--force",
-                "--no-hostonly",
-                "--tmpdir",
-                "/run",
-                "--kver",
-                kernel,
-                temporary_output,
-            });
-            try self.runChroot(&.{
-                "/usr/bin/cp",
-                "--remove-destination",
-                temporary_output,
-                output,
-            });
+            try self.runChroot(&initramfs_mod.regenerateArgv(kernel));
+            try self.runChroot(&initramfs_mod.installArgv(output));
+            // The scratch image is the same file as the published one and
+            // twice the size on a tmpfs the target has to boot with. The guest
+            // agent has always removed it; leaving it here was an oversight
+            // rather than a difference with a reason.
+            self.deleteGuestFile(initramfs_mod.temporary_image_path);
             try self.recordInitramfsImage(kernel, output);
         }
+    }
+
+    /// Removes a file inside the mounted target, ignoring every reason it
+    /// might not be there.
+    ///
+    /// Best-effort by construction: the caller is tidying scratch space, and a
+    /// run that produced the artefact it was asked for must not fail because
+    /// the tidying did not take.
+    fn deleteGuestFile(self: *Session, guest_absolute: []const u8) void {
+        const host_path = self.guestPath(guest_absolute) catch return;
+        defer self.allocator.free(host_path);
+        Io.Dir.cwd().deleteFile(self.io, host_path) catch {};
     }
 
     /// Digests the initramfs `dracut` produced, where `cp` left it.
@@ -1991,10 +1990,7 @@ const Session = struct {
     }
 
     fn installedKernels(self: *Session) ![]const []const u8 {
-        const modules_path = try std.fs.path.join(
-            self.allocator,
-            &.{ self.manifest.root_path, "lib", "modules" },
-        );
+        const modules_path = try self.guestPath(initramfs_mod.modules_directory);
         defer self.allocator.free(modules_path);
 
         // No module tree at all is the one shape that honestly means no kernel
@@ -2022,15 +2018,16 @@ const Session = struct {
         var iterator = modules_dir.iterate();
         while (try iterator.next(self.io)) |entry| {
             // A release string the manifest would have been refused for
-            // naming cannot become acceptable by being discovered instead.
-            // This also excludes "." and "..".
-            // Excluded by the same rule, and not worth reporting as kernels
-            // a run passed over.
-            if (std.mem.eql(u8, entry.name, ".") or
-                std.mem.eql(u8, entry.name, "..")) continue;
-            if (!vm_control.validKernelRelease(entry.name)) {
-                try self.recordSkippedKernel(entry.name, .invalid_release_name);
-                continue;
+            // naming cannot become acceptable by being discovered instead,
+            // and the same verdict decides which entries are worth reporting
+            // as passed over at all.
+            switch (initramfs_mod.nameVerdict(entry.name)) {
+                .ignored => continue,
+                .skipped => |reason| {
+                    try self.recordSkippedKernel(entry.name, reason);
+                    continue;
+                },
+                .probe => {},
             }
 
             // Deliberately no check on the entry kind: `d_type` is `unknown`
@@ -2044,14 +2041,21 @@ const Session = struct {
                 // above refuses -- an empty discovered set is accepted as
                 // "nothing is stale" under `nothing_to_regenerate`.
                 error.NotDir, error.FileNotFound => {
-                    try self.recordSkippedKernel(entry.name, .not_a_module_directory);
+                    try self.recordSkippedKernel(
+                        entry.name,
+                        initramfs_mod.probeVerdict(.not_a_directory).?,
+                    );
                     continue;
                 },
                 else => return err,
             };
             defer release_dir.close(self.io);
-            if (!try hasDepmodOutput(self.io, release_dir)) {
-                try self.recordSkippedKernel(entry.name, .no_module_dependency_index);
+            const probe: initramfs_mod.Probe = if (try hasDepmodOutput(self.io, release_dir))
+                .module_directory
+            else
+                .no_dependency_index;
+            if (initramfs_mod.probeVerdict(probe)) |reason| {
+                try self.recordSkippedKernel(entry.name, reason);
                 continue;
             }
 
@@ -2965,7 +2969,7 @@ fn validateManifestPolicy(manifest: Manifest) !void {
                 }
             }
             if (regenerate.generator) |generator| {
-                if (!std.mem.eql(u8, generator, "dracut")) {
+                if (!std.mem.eql(u8, generator, initramfs_mod.generator)) {
                     return error.UnsupportedInitramfsGenerator;
                 }
             }
@@ -3140,7 +3144,7 @@ fn lessThanBytes(_: void, left: []const u8, right: []const u8) bool {
 /// "nothing is stale" whenever the host derived the regeneration rather than
 /// being asked for it, and the run would ship the initramfs it invalidated.
 fn hasDepmodOutput(io: Io, release_dir: Io.Dir) !bool {
-    for ([_][]const u8{ "modules.dep", "modules.dep.bin" }) |marker| {
+    for (initramfs_mod.module_dependency_markers) |marker| {
         release_dir.access(io, marker, .{}) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,

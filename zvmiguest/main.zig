@@ -21,6 +21,7 @@ const control_mod = @import("vm_control");
 
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
+const initramfs_mod = control_mod.initramfs_mod;
 
 const guest_root = "/mnt/root";
 const max_capture_bytes = 1024 * 1024;
@@ -667,32 +668,18 @@ const Session = struct {
     fn installedKernels(self: *Session) ![]const []const u8 {
         return discoverKernels(
             self.allocator,
-            guest_root ++ "/lib/modules",
+            guest_root ++ initramfs_mod.modules_directory,
             &self.skipped_kernels,
         );
     }
 
     fn regenerateInitramfs(self: *Session, kernel: []const u8) !void {
-        const temporary = "/run/zvmi-initramfs.img";
-        try self.runChroot(&.{
-            "/usr/bin/dracut",
-            "--force",
-            "--no-hostonly",
-            "--tmpdir",
-            "/run",
-            "--kver",
-            kernel,
-            temporary,
-        });
+        try self.runChroot(&initramfs_mod.regenerateArgv(kernel));
         // Built aside and copied into place so a dracut that fails partway
         // through cannot leave the image with a truncated initramfs.
-        const final = try std.fmt.allocPrint(
-            self.allocator,
-            "/boot/initramfs-{s}.img",
-            .{kernel},
-        );
-        try self.runChroot(&.{ "/usr/bin/cp", "--remove-destination", temporary, final });
-        self.deleteGuestFile(temporary);
+        const final = try initramfs_mod.imagePath(self.allocator, kernel);
+        try self.runChroot(&initramfs_mod.installArgv(final));
+        self.deleteGuestFile(initramfs_mod.temporary_image_path);
         // Digested where `cp` left it rather than where dracut built it: what
         // a reader can check is the file the published image carries, and the
         // two are only the same file if the copy did what it said.
@@ -1204,21 +1191,33 @@ fn discoverKernels(
             const name = std.mem.sliceTo(name_ptr, 0);
             // A release string the control document would have been refused
             // for carrying cannot become acceptable by being discovered
-            // instead. This also excludes "." and "..".
-            // "." and ".." are excluded by the same rule, and are not worth
-            // reporting as kernels a run passed over.
-            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-            if (!control_mod.validKernelRelease(name)) {
-                try skipped.append(.{
-                    .name = try allocator.dupe(u8, name),
-                    .reason = .invalid_release_name,
-                });
-                continue;
+            // instead, and the same verdict decides which entries are worth
+            // reporting as passed over at all.
+            switch (initramfs_mod.nameVerdict(name)) {
+                .ignored => continue,
+                .skipped => |reason| {
+                    try skipped.append(.{
+                        .name = try allocator.dupe(u8, name),
+                        .reason = reason,
+                    });
+                    continue;
+                },
+                .probe => {},
             }
-            if (!try hasDepmodOutput(allocator, modules_path, name)) {
+            // `not_a_directory` is not reachable from here: this probe cannot
+            // tell a missing marker from a missing directory, because reaching
+            // a marker through a non-directory and finding no marker are the
+            // same `continue`. The reason exists in the document for the
+            // privileged worker, which opens the entry itself and can.
+            const probe: initramfs_mod.Probe =
+                if (try hasDepmodOutput(allocator, modules_path, name))
+                    .module_directory
+                else
+                    .no_dependency_index;
+            if (initramfs_mod.probeVerdict(probe)) |reason| {
                 try skipped.append(.{
                     .name = try allocator.dupe(u8, name),
-                    .reason = .no_module_dependency_index,
+                    .reason = reason,
                 });
                 continue;
             }
@@ -1236,7 +1235,7 @@ fn discoverKernels(
 // and dropping a release on that basis skips an initramfs the caller asked to
 // have regenerated.
 fn hasDepmodOutput(allocator: Allocator, modules_path: []const u8, release: []const u8) !bool {
-    for ([_][]const u8{ "modules.dep", "modules.dep.bin" }) |marker| {
+    for (initramfs_mod.module_dependency_markers) |marker| {
         const path = try std.fmt.allocPrintSentinel(
             allocator,
             "{s}/{s}/{s}",

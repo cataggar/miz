@@ -20,6 +20,7 @@ const guid = @import("guid.zig");
 const image_mod = @import("image.zig");
 const layout = @import("layout.zig");
 const identity_rewrite = @import("identity_rewrite.zig");
+const initramfs_mod = @import("initramfs.zig");
 const limits_mod = @import("limits.zig");
 const mbr = @import("mbr.zig");
 const os_customization = @import("os_customization.zig");
@@ -6778,18 +6779,12 @@ pub const SkippedKernelRelease = struct {
     reason: SkippedKernelReason,
 };
 
-pub const SkippedKernelReason = enum {
-    /// Not a usable release string. The same rule a declared release is held
-    /// to: a name that could not be requested cannot become acceptable by
-    /// being discovered instead.
-    invalid_release_name,
-    /// Not a directory, or gone between the read and the open.
-    not_a_module_directory,
-    /// No `modules.dep` or `modules.dep.bin`. This is dracut's own rule for
-    /// telling an installed kernel from a directory that merely sits beside
-    /// one -- a firmware drop, or what a removed package left behind.
-    no_module_dependency_index,
-};
+/// Why a `/lib/modules` entry was not treated as an installed kernel.
+///
+/// The same type as `vm_control.SkippedKernelReason`, not a copy of it: both
+/// are aliases of `initramfs.SkipReason`, which is where the reasons and the
+/// rule behind each of them live.
+pub const SkippedKernelReason = initramfs_mod.SkipReason;
 
 /// An initramfs the run regenerated and left in the published image.
 ///

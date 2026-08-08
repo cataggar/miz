@@ -1738,13 +1738,12 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
                 reported.skipped_kernel_releases.len,
             );
             for (reported.skipped_kernel_releases, skipped) |entry, *slot| {
+                // The reason is carried rather than mapped: the two names are
+                // aliases of one enum, so there is no correspondence left to
+                // get wrong.
                 slot.* = .{
                     .name = try owned.dupe(u8, entry.name),
-                    .reason = switch (entry.reason) {
-                        .invalid_release_name => .invalid_release_name,
-                        .not_a_module_directory => .not_a_module_directory,
-                        .no_module_dependency_index => .no_module_dependency_index,
-                    },
+                    .reason = entry.reason,
                 };
             }
             break :blk .{ .skipped_kernel_releases = skipped, .images = images };
