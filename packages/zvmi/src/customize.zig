@@ -24,6 +24,7 @@ const limits_mod = @import("limits.zig");
 const mbr = @import("mbr.zig");
 const os_customization = @import("os_customization.zig");
 const output_mod = @import("output.zig");
+const packages_mod = @import("packages.zig");
 const customization_wire = @import("customization_wire.zig");
 const preserved_image = @import("preserved_image.zig");
 const selinux_mod = @import("selinux.zig");
@@ -771,45 +772,18 @@ pub fn validatePackageCacheDirectory(path: []const u8) PackageCacheError!void {
 /// same value written two ways rather than two descriptions that have to be
 /// kept in agreement.
 ///
-/// **There is deliberately no repository id.** An earlier shape of this type
-/// carried one, and nothing could have filled it honestly: rpm's database
-/// does not record which repository a package came from, and the
-/// `repoquery --installed` route to it is documented as unreliable under the
-/// DNF5 backend Azure Linux ships as tdnf -- `reponame` is answered for
-/// available packages and not for installed ones. So an emitted lock could
-/// only have copied the sole declared repository's id, or invented one, and a
-/// verifier reading it back would be checking a claim the run never made. The
-/// repositories a transaction was allowed to use are already declared in the
-/// request, hashed into the plan, and recorded in provenance; the lock's job
-/// is the part that is not, which is the exact version.
-pub const PackageVersionLock = struct {
-    name: []const u8,
-    /// rpm's `EPOCH:VERSION-RELEASE`, with the epoch always written even when
-    /// it is zero. Required in full rather than accepted as a bare version,
-    /// because `1.2.3` and `0:1.2.3-4.azl3` are different amounts of pinning
-    /// and only one of them is a lock -- a caller who wrote the short form and
-    /// got a silent partial match would have a build that reports itself
-    /// reproducible and is not.
-    evr: []const u8,
-    /// rpm's `%{ARCH}`. Part of identity rather than decoration: `noarch` and
-    /// `x86_64` builds of one name at one EVR are different packages, and a
-    /// multilib root can hold two of them at once.
-    architecture: []const u8,
-};
+/// The same type as `vm_control.PackagePin`, not a copy of it: both are
+/// aliases of `packages.VersionLock`, which is where the fields and the
+/// reasons for them live -- including why there is deliberately no repository
+/// id.
+pub const PackageVersionLock = packages_mod.VersionLock;
 
 /// Splits an `rpm -qa` record of the form `NAME-EPOCH:VERSION-RELEASE.ARCH`
 /// back into the lock that would state it, or nothing if it is not one.
 ///
-/// The rule itself lives in `vm_control` because the guest agent needs it too
+/// The rule itself lives in `packages.zig` because the guest agent needs it too
 /// and cannot import this module. See there for why the split is decidable.
-pub fn parseInstalledPackageRecord(record: []const u8) ?PackageVersionLock {
-    const pin = vm_control.parseInstalledPackageRecord(record) orelse return null;
-    return .{
-        .name = pin.name,
-        .evr = pin.evr,
-        .architecture = pin.architecture,
-    };
-}
+pub const parseInstalledPackageRecord = packages_mod.parseInstalledRecord;
 
 pub const PackageLockPolicy = union(enum) {
     unlocked,
