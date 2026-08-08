@@ -26,6 +26,7 @@
         "qcow2",
         "zvminit",
         "azagent",
+        "zvmiguest",
         "wireserver",
         "scripts",
         "tests",
