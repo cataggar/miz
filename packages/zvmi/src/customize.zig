@@ -640,7 +640,12 @@ pub const max_hook_script_bytes: usize = 256 * 1024;
 pub const max_hook_arguments: usize = 64;
 pub const max_hook_argument_bytes: usize = 4096;
 
-pub const PackageAction = union(enum) {
+/// Tagged with `packages.ActionKind` rather than an inferred enum, so that
+/// `packages.invocationFor` answers for this type and for
+/// `vm_control.PackageAction` at once: which tdnf verb an action becomes,
+/// whether a lock rewrites its names, and whether the declared repositories
+/// take part.
+pub const PackageAction = union(packages_mod.ActionKind) {
     install: []const []const u8,
     remove: []const []const u8,
     update_all,

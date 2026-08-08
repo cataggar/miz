@@ -14,6 +14,188 @@
 
 const std = @import("std");
 
+/// Where the package manager is looked for inside the target root. An absolute
+/// path rather than a name on `PATH`, because the command runs in a chroot the
+/// caller does not control the environment of.
+pub const tool_path = "/usr/bin/tdnf";
+
+/// Where the database tool is looked for. `rpm` rather than `tdnf` for the two
+/// operations that are about the database rather than about a transaction:
+/// reading the installed set, and importing trust.
+pub const database_tool_path = "/usr/bin/rpm";
+
+/// The configuration the transaction is run under, inside the target root.
+///
+/// The target's own `/etc/tdnf` is deliberately not used: a run must depend on
+/// the repositories the request declared and on nothing the input image
+/// happened to carry.
+pub const config_path = "/run/zvmi-tdnf.conf";
+
+/// Where the declared repositories are written, inside the target root.
+///
+/// Under `/run` because it is a tmpfs the target already has and neither
+/// backend publishes: the files carry credentials, and the run removes them
+/// before anything is sealed.
+pub const repository_directory = "/run/zvmi-repos";
+
+/// The `.repo` file for a declared repository id, inside the target root.
+///
+/// The guest-visible path and only that. The privileged worker prefixes it
+/// with the mounted root itself, because a shared module that knew about
+/// `<root>` would be a shared module with opinions about the host's
+/// filesystem.
+pub fn repositoryPath(allocator: std.mem.Allocator, id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, repository_directory ++ "/{s}.repo", .{id});
+}
+
+/// Where a repository's trust key is staged for `rpm --import`, inside the
+/// target root.
+///
+/// Numbered by the order the keys are walked in rather than by anything in the
+/// key, so that two repositories declaring the same key still get two files and
+/// neither backend has to parse a key to name the file it writes.
+pub fn trustPath(allocator: std.mem.Allocator, index: usize) ![]u8 {
+    return std.fmt.allocPrint(allocator, "/run/zvmi-trust-{d}.asc", .{index});
+}
+
+/// The `--qf` both backends ask rpm for.
+///
+/// `%{EPOCHNUM}` rather than `%{EPOCH}` because the second prints `(none)` for
+/// a package without one, and the epoch is what makes
+/// `parseInstalledRecord` decidable. It has to agree exactly with that
+/// function, so the two live beside each other.
+pub const installed_query_format = "%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n";
+
+/// The command that reads the installed set out of the target's rpm database.
+pub fn installedQueryArgv() [4][]const u8 {
+    return .{ database_tool_path, "-qa", "--qf", installed_query_format };
+}
+
+/// The command that adds a staged key to the target's rpm trust.
+pub fn importTrustArgv(staged_path: []const u8) [3][]const u8 {
+    return .{ database_tool_path, "--import", staged_path };
+}
+
+/// The exact identity, in the spelling tdnf accepts as a package spec.
+///
+/// The same string `coverRecord` reassembles and the same shape
+/// `parseInstalledRecord` splits, which is what lets a run ask for the pinned
+/// release outright instead of asking for the name and complaining afterwards.
+pub fn pinnedSpec(allocator: std.mem.Allocator, pin: VersionLock) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}-{s}.{s}",
+        .{ pin.name, pin.evr, pin.architecture },
+    );
+}
+
+/// The `[main]` section both backends write to `config_path`.
+///
+/// `cache_directory` is the guest-visible path of a declared package cache, or
+/// nothing. It is one-sided by design rather than by accident: a package cache
+/// is a *host* directory bind-mounted into the target, and the vm backend
+/// refuses `.cache` by name because the control channel carries a rendered
+/// document rather than host files. So the asymmetry is a parameter the guest
+/// passes `null` to, instead of a second body it maintains separately.
+///
+/// `cachedir` and `keepcache` are ordinary configuration keys rather than
+/// command-line flags, which is what lets this work against the tdnf 3.x the
+/// target images ship: the 4.0 flag that would name a cache directory on the
+/// command line does not exist there. `keepcache` is what makes a populating
+/// run leave the downloaded packages behind for the offline run to install
+/// from; without it tdnf discards them once the transaction commits.
+pub fn configBody(
+    allocator: std.mem.Allocator,
+    cache_directory: ?[]const u8,
+) ![]u8 {
+    const head = "[main]\ngpgcheck=1\nreposdir=" ++ repository_directory ++ "\n";
+    if (cache_directory) |directory| {
+        return std.fmt.allocPrint(
+            allocator,
+            head ++ "cachedir={s}\nkeepcache=1\n",
+            .{directory},
+        );
+    }
+    return allocator.dupe(u8, head);
+}
+
+/// What a declared package action is, independently of what either side's
+/// action type carries.
+///
+/// Both `customize.PackageAction` and `vm_control.PackageAction` are tagged
+/// with this, so `std.meta.activeTag` on either yields the same value and
+/// `invocationFor` can answer for both.
+pub const ActionKind = enum {
+    install,
+    remove,
+    update_all,
+    update_selected,
+};
+
+/// How an action reaches the package manager.
+pub const Invocation = struct {
+    /// The tdnf verb. Two of the four actions share one.
+    verb: []const u8,
+    /// Whether the names are rewritten to the exact identities the lock pins.
+    ///
+    /// False for `remove`, and that is the interesting one: a removal names
+    /// what must not be installed, so asking to remove one exact version would
+    /// silently leave any other in place.
+    pinned: bool,
+    /// Whether the declared repositories are enabled for this verb. A removal
+    /// resolves entirely against the local database and has no reason to reach
+    /// a network the run may not even have.
+    repositories: bool,
+};
+
+pub fn invocationFor(kind: ActionKind) Invocation {
+    return switch (kind) {
+        .install => .{ .verb = "install", .pinned = true, .repositories = true },
+        .remove => .{ .verb = "remove", .pinned = false, .repositories = false },
+        .update_all => .{ .verb = "update", .pinned = false, .repositories = true },
+        .update_selected => .{ .verb = "update", .pinned = true, .repositories = true },
+    };
+}
+
+/// Everything a tdnf command line varies by.
+pub const Transaction = struct {
+    verb: []const u8,
+    /// The repository ids to enable, or none. Every repository is disabled
+    /// first and the declared ones enabled by id, so a repository the input
+    /// image carried cannot take part in the transaction.
+    repository_ids: []const []const u8 = &.{},
+    /// tdnf's own refusal to fetch. A package the declared cache does not hold
+    /// fails as `ERROR_TDNF_CACHE_DISABLED` rather than being downloaded, which
+    /// is what makes an offline claim checkable instead of merely intended.
+    ///
+    /// Host-only in practice, for the reason `configBody` gives.
+    cache_only: bool = false,
+    names: []const []const u8 = &.{},
+};
+
+/// Appends the tdnf command line for a transaction.
+///
+/// Appends rather than returns, so that ownership of the `--enablerepo=`
+/// elements it allocates stays exactly where each caller already put it: the
+/// privileged worker frees its argv, the guest agent runs once and does not.
+pub fn appendTransactionArgv(
+    argv: *std.array_list.Managed([]const u8),
+    transaction: Transaction,
+) !void {
+    try argv.appendSlice(&.{ tool_path, "--config", config_path, "--disablerepo=*" });
+    if (transaction.cache_only) try argv.append("--cacheonly");
+    for (transaction.repository_ids) |id| {
+        try argv.append(try std.fmt.allocPrint(
+            argv.allocator,
+            "--enablerepo={s}",
+            .{id},
+        ));
+    }
+    try argv.appendSlice(&.{ transaction.verb, "-y" });
+    try argv.appendSlice(transaction.names);
+}
+
+
 /// One package pinned to an exact rpm identity.
 ///
 /// There is no repository field, and there could not honestly be one: rpm's
@@ -281,4 +463,211 @@ test "trust pseudo-packages are recognised by both of rpm's markers" {
         "gpg-pubkey-3135ce90-5e6f6e2f",
         trustKeyIdentity("gpg-pubkey-3135ce90-5e6f6e2f.(none)"),
     );
+}
+
+test "the transaction argv is the one both backends used to spell for themselves" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        transaction: Transaction,
+        expected: []const []const u8,
+        why: []const u8,
+    }{
+        .{
+            .transaction = .{
+                .verb = "install",
+                .repository_ids = &.{ "base", "updates" },
+                .names = &.{"strace-0:6.8-1.azl3.x86_64"},
+            },
+            .expected = &.{
+                "/usr/bin/tdnf",
+                "--config",
+                "/run/zvmi-tdnf.conf",
+                "--disablerepo=*",
+                "--enablerepo=base",
+                "--enablerepo=updates",
+                "install",
+                "-y",
+                "strace-0:6.8-1.azl3.x86_64",
+            },
+            .why = "every repository disabled first and the declared ones enabled by id, in order",
+        },
+        .{
+            .transaction = .{ .verb = "remove", .names = &.{"strace"} },
+            .expected = &.{
+                "/usr/bin/tdnf",
+                "--config",
+                "/run/zvmi-tdnf.conf",
+                "--disablerepo=*",
+                "remove",
+                "-y",
+                "strace",
+            },
+            .why = "a removal resolves against the local database, so no repository is enabled",
+        },
+        .{
+            .transaction = .{ .verb = "update", .repository_ids = &.{"base"} },
+            .expected = &.{
+                "/usr/bin/tdnf",
+                "--config",
+                "/run/zvmi-tdnf.conf",
+                "--disablerepo=*",
+                "--enablerepo=base",
+                "update",
+                "-y",
+            },
+            .why = "update_all names nothing, so the argv simply ends after -y",
+        },
+        .{
+            .transaction = .{
+                .verb = "install",
+                .repository_ids = &.{"base"},
+                .cache_only = true,
+                .names = &.{"strace"},
+            },
+            .expected = &.{
+                "/usr/bin/tdnf",
+                "--config",
+                "/run/zvmi-tdnf.conf",
+                "--disablerepo=*",
+                "--cacheonly",
+                "--enablerepo=base",
+                "install",
+                "-y",
+                "strace",
+            },
+            .why = "the offline claim, before the repositories rather than after them",
+        },
+    };
+    for (cases) |case| {
+        var argv: std.array_list.Managed([]const u8) = .init(allocator);
+        defer {
+            for (argv.items) |item| {
+                if (std.mem.startsWith(u8, item, "--enablerepo=")) allocator.free(item);
+            }
+            argv.deinit();
+        }
+        try appendTransactionArgv(&argv, case.transaction);
+        try std.testing.expectEqual(case.expected.len, argv.items.len);
+        for (case.expected, argv.items) |want, got| try std.testing.expectEqualStrings(want, got);
+    }
+}
+
+test "every action maps to one verb, and only two of them are rewritten by a lock" {
+    const cases = [_]struct {
+        kind: ActionKind,
+        verb: []const u8,
+        pinned: bool,
+        repositories: bool,
+        why: []const u8,
+    }{
+        .{
+            .kind = .install,
+            .verb = "install",
+            .pinned = true,
+            .repositories = true,
+            .why = "the ordinary case",
+        },
+        .{
+            .kind = .remove,
+            .verb = "remove",
+            .pinned = false,
+            .repositories = false,
+            .why = "a removal names what must not be installed; removing one exact version would leave any other in place",
+        },
+        .{
+            .kind = .update_all,
+            .verb = "update",
+            .pinned = false,
+            .repositories = true,
+            .why = "names nothing, so there is nothing for a pin to rewrite",
+        },
+        .{
+            .kind = .update_selected,
+            .verb = "update",
+            .pinned = true,
+            .repositories = true,
+            .why = "the same verb as update_all and a different answer to both other questions",
+        },
+    };
+    for (cases) |case| {
+        const invocation = invocationFor(case.kind);
+        try std.testing.expectEqualStrings(case.verb, invocation.verb);
+        try std.testing.expectEqual(case.pinned, invocation.pinned);
+        try std.testing.expectEqual(case.repositories, invocation.repositories);
+    }
+}
+
+test "the config body differs from itself only by a cache the guest cannot have" {
+    const allocator = std.testing.allocator;
+
+    const without = try configBody(allocator, null);
+    defer allocator.free(without);
+    try std.testing.expectEqualStrings(
+        "[main]\ngpgcheck=1\nreposdir=/run/zvmi-repos\n",
+        without,
+    );
+
+    const with = try configBody(allocator, "/run/zvmi-cache");
+    defer allocator.free(with);
+    try std.testing.expectEqualStrings(
+        "[main]\ngpgcheck=1\nreposdir=/run/zvmi-repos\ncachedir=/run/zvmi-cache\nkeepcache=1\n",
+        with,
+    );
+
+    // The asymmetry is a parameter rather than a fork: the body the guest
+    // agent writes is a prefix of the one the privileged worker writes.
+    try std.testing.expect(std.mem.startsWith(u8, with, without));
+}
+
+test "the paths and the query format are the ones the other side reads back" {
+    const allocator = std.testing.allocator;
+
+    const repository = try repositoryPath(allocator, "azurelinux-base");
+    defer allocator.free(repository);
+    try std.testing.expectEqualStrings(
+        "/run/zvmi-repos/azurelinux-base.repo",
+        repository,
+    );
+    // The `.repo` files have to be where the config says to look for them, or
+    // a transaction runs against no repository at all and says so only by
+    // failing to resolve.
+    try std.testing.expect(std.mem.startsWith(u8, repository, repository_directory));
+
+    const trust = try trustPath(allocator, 2);
+    defer allocator.free(trust);
+    try std.testing.expectEqualStrings("/run/zvmi-trust-2.asc", trust);
+
+    const query = installedQueryArgv();
+    try std.testing.expectEqualStrings("/usr/bin/rpm", query[0]);
+    try std.testing.expectEqualStrings("-qa", query[1]);
+    try std.testing.expectEqualStrings("--qf", query[2]);
+    try std.testing.expectEqualStrings(
+        "%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n",
+        query[3],
+    );
+
+    const import = importTrustArgv("/run/zvmi-trust-0.asc");
+    try std.testing.expectEqualStrings("/usr/bin/rpm", import[0]);
+    try std.testing.expectEqualStrings("--import", import[1]);
+    try std.testing.expectEqualStrings("/run/zvmi-trust-0.asc", import[2]);
+}
+
+test "a pinned spec is the string the record parser splits back" {
+    const allocator = std.testing.allocator;
+    const pin: VersionLock = .{
+        .name = "python3-libs",
+        .evr = "0:3.12.3-2.azl3",
+        .architecture = "aarch64",
+    };
+    const spec = try pinnedSpec(allocator, pin);
+    defer allocator.free(spec);
+    try std.testing.expectEqualStrings("python3-libs-0:3.12.3-2.azl3.aarch64", spec);
+
+    // The round trip is the point: what a run asks tdnf for is what it later
+    // matches the rpm database against, so the two spellings cannot drift.
+    const parsed = parseInstalledRecord(spec).?;
+    try std.testing.expectEqualStrings(pin.name, parsed.name);
+    try std.testing.expectEqualStrings(pin.evr, parsed.evr);
+    try std.testing.expectEqualStrings(pin.architecture, parsed.architecture);
+    try std.testing.expect(coverRecord(&.{pin}, spec));
 }
