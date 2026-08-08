@@ -45,11 +45,22 @@ A minimal (~160 KB), statically-linked PID 1 replacement for real-boot testing o
   #112) is present, runs it as a direct child after Azure is detected and
   retries failures every five seconds. A completed local-provisioning sentinel
   gates SSH independently from retriable WireServer Ready acknowledgement.
-- If `/usr/sbin/sshd` is present and the provisioning sentinel exists, runs
-  `/usr/sbin/sshd -D -e` as a direct child. Unexpected exits are reaped and
-  restarted with exponential backoff capped at 30 seconds. A fresh non-Azure
-  persistent image never exposes SSH. The loop manages only these fixed
-  processes and the optional shell; it is not a general service manager.
+- Supervises exactly one **access provider** — the program that makes the
+  machine reachable. By default that is `/usr/sbin/sshd`, run as
+  `/usr/sbin/sshd -D -e` once the provisioning sentinel exists, so a fresh
+  non-Azure persistent image never exposes SSH. An image that ships
+  `/usr/local/sbin/zvminit-access` replaces the default with it: zvminit runs
+  that binary *instead of* sshd, with no arguments, so an appliance whose way
+  in is a mesh VPN or a console enrollment agent needs no fork of PID 1. Only
+  one is ever supervised, and an image that ships no override behaves exactly
+  as before. Unexpected exits are reaped and restarted with exponential
+  backoff capped at 30 seconds. The loop manages only these fixed processes
+  and the optional shell; it is not a general service manager.
+- A replacement provider does **not** wait for the provisioning sentinel. The
+  sentinel proves an administrator's authorized key was installed, which says
+  nothing about a provider carrying its own credentials — and making it wait
+  would let a stalled provisioner take away the machine's only remaining way
+  in, which on an appliance with a fixed kernel command line is unrecoverable.
 - Emits `[zvminit] ZVMINIT_PID1_READY supervisor loop active` once PID 1 has
   verified its actual PID is 1, completed base initialization, and entered its
   supervisor loop. This marker does not claim that provisioning, WireServer
