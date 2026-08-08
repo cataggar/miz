@@ -352,6 +352,14 @@ pub const Initramfs = union(enum) {
     /// explicitly overrides that. The distinction between this and
     /// `unchanged` is carried by the tag rather than by an empty list, so a
     /// document cannot express "regenerate nothing in particular".
+    ///
+    /// There is deliberately no `generator` field. The host validates the
+    /// requested generator against `initramfs.generator` when it resolves
+    /// capabilities, and then does not render it, so a control document
+    /// cannot ask the guest for anything but dracut and the guest carries no
+    /// refusal for one. The `unsafe_chroot` worker does carry that refusal,
+    /// because it is handed the generator across a privilege boundary and
+    /// re-checks what it is handed; here there is no value to re-check.
     regenerate: struct {
         kernels: []const []const u8 = &.{},
         /// Whether discovering no installed kernel is a failure or simply
