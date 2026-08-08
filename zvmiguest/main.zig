@@ -22,11 +22,10 @@ const control_mod = @import("vm_control");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const initramfs_mod = control_mod.initramfs_mod;
+const packages_mod = control_mod.packages;
 
 const guest_root = "/mnt/root";
 const max_capture_bytes = 1024 * 1024;
-const repository_directory = "/run/zvmi-repos";
-const tdnf_config = "/run/zvmi-tdnf.conf";
 const resolver_path = "/etc/resolv.conf";
 /// Where the image's own resolver is held while the transaction runs. Beside
 /// the original rather than under `/run`, because `/run` in the target is a
@@ -208,14 +207,21 @@ const Session = struct {
             return self.stageFailure("repository-trust", err);
         };
         for (control.actions) |action| {
-            const executed = switch (action) {
-                .install => |names| self.runTdnfPinned("install", names, control),
-                // The one verb a pin does not rewrite: asking to remove one
-                // exact version would silently leave any other in place.
-                .remove => |names| self.runTdnf("remove", names, &.{}),
-                .update_all => self.runTdnf("update", &.{}, control.repositories),
-                .update_selected => |names| self.runTdnfPinned("update", names, control),
+            // Which verb, whether a pin rewrites the names and whether the
+            // declared repositories take part are all one table, shared with
+            // the privileged worker so the two backends cannot answer them
+            // differently.
+            const invocation = packages_mod.invocationFor(std.meta.activeTag(action));
+            const names: []const []const u8 = switch (action) {
+                .install, .remove, .update_selected => |values| values,
+                .update_all => &.{},
             };
+            const repositories: []const control_mod.Repository =
+                if (invocation.repositories) control.repositories else &.{};
+            const executed = if (invocation.pinned)
+                self.runTdnfPinned(invocation.verb, names, control)
+            else
+                self.runTdnf(invocation.verb, names, repositories);
             executed catch |err| return self.stageFailure("packages", err);
         }
         // After the packages, so a package that ships its own modprobe
@@ -327,13 +333,14 @@ const Session = struct {
             for (control.package_pins) |pin| {
                 if (!std.mem.eql(u8, pin.name, name)) continue;
                 matched = true;
-                try specs.append(try std.fmt.allocPrint(
-                    self.allocator,
-                    "{s}-{s}.{s}",
-                    .{ pin.name, pin.evr, pin.architecture },
-                ));
+                try specs.append(try packages_mod.pinnedSpec(self.allocator, pin));
             }
-            if (!matched) return error.UnpinnedPackageAction;
+            // The same name the privileged worker uses for the same refusal.
+            // Error names do not cross the wire -- a result carries a stage and
+            // a message, not an error tag -- so the two sides sharing one name
+            // costs nothing and stops a reader concluding they are two
+            // different conditions.
+            if (!matched) return error.UnlockedPackageRequested;
         }
         try self.runTdnf(verb, specs.items, control.repositories);
     }
@@ -376,11 +383,7 @@ const Session = struct {
     ) !void {
         if (pins.len == 0) return;
         for (pins) |pin| {
-            const spec = try std.fmt.allocPrint(
-                self.allocator,
-                "{s}-{s}.{s}",
-                .{ pin.name, pin.evr, pin.architecture },
-            );
+            const spec = try packages_mod.pinnedSpec(self.allocator, pin);
             if (containsBytes(self.installed_packages.items, spec)) continue;
             for (self.installed_packages.items) |installed| {
                 // Present under the pinned name at some other identity, which
@@ -523,18 +526,15 @@ const Session = struct {
 
     fn writeRepositoryFiles(self: *Session, control: control_mod.Control) !void {
         if (control.repositories.len == 0) return;
-        try mkdirPath(guest_root ++ repository_directory);
-        try self.writeGuestFile(
-            tdnf_config,
-            "[main]\ngpgcheck=1\nreposdir=" ++ repository_directory ++ "\n",
-        );
+        try mkdirPath(guest_root ++ packages_mod.repository_directory);
+        // No cache: a package cache is a host directory bind-mounted into the
+        // target, and this backend refuses `.cache` by name because the control
+        // channel carries a rendered document rather than host files.
+        const config_body = try packages_mod.configBody(self.allocator, null);
+        try self.writeGuestFile(packages_mod.config_path, config_body);
 
         for (control.repositories) |repository| {
-            const path = try std.fmt.allocPrint(
-                self.allocator,
-                repository_directory ++ "/{s}.repo",
-                .{repository.id},
-            );
+            const path = try packages_mod.repositoryPath(self.allocator, repository.id);
             const material = try self.credentialFor(repository);
             const body = try renderRepositoryFile(self.allocator, repository, material);
             // The rendered body holds the password, so it is overwritten as
@@ -583,13 +583,9 @@ const Session = struct {
                 const material = try self.allocator.alloc(u8, size);
                 try decoder.decode(material, encoded);
 
-                const guest_path = try std.fmt.allocPrint(
-                    self.allocator,
-                    "/run/zvmi-trust-{d}.asc",
-                    .{index},
-                );
+                const guest_path = try packages_mod.trustPath(self.allocator, index);
                 try self.writeGuestFile(guest_path, material);
-                try self.runChroot(&.{ "/usr/bin/rpm", "--import", guest_path });
+                try self.runChroot(&packages_mod.importTrustArgv(guest_path));
                 self.deleteGuestFile(guest_path);
                 index += 1;
             }
@@ -602,22 +598,16 @@ const Session = struct {
         names: []const []const u8,
         repositories: []const control_mod.Repository,
     ) !void {
+        var ids: std.array_list.Managed([]const u8) = .init(self.allocator);
+        for (repositories) |repository| try ids.append(repository.id);
         var argv: std.array_list.Managed([]const u8) = .init(self.allocator);
-        try argv.appendSlice(&.{
-            "/usr/bin/tdnf",
-            "--config",
-            tdnf_config,
-            "--disablerepo=*",
+        try packages_mod.appendTransactionArgv(&argv, .{
+            .verb = verb,
+            .repository_ids = ids.items,
+            // No `--cacheonly`: there is no host directory to have cached
+            // into. See `configBody`.
+            .names = names,
         });
-        for (repositories) |repository| {
-            try argv.append(try std.fmt.allocPrint(
-                self.allocator,
-                "--enablerepo={s}",
-                .{repository.id},
-            ));
-        }
-        try argv.appendSlice(&.{ verb, "-y" });
-        try argv.appendSlice(names);
         try self.runChroot(argv.items);
     }
 
@@ -867,12 +857,7 @@ const Session = struct {
         self: *Session,
         into: *std.array_list.Managed([]const u8),
     ) !void {
-        const output = try self.captureChroot(&.{
-            "/usr/bin/rpm",
-            "-qa",
-            "--qf",
-            "%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n",
-        });
+        const output = try self.captureChroot(&packages_mod.installedQueryArgv());
         var lines = std.mem.tokenizeScalar(u8, output, '\n');
         while (lines.next()) |line| {
             if (line.len == 0 or std.mem.indexOfScalar(u8, line, 0) != null) {
@@ -1092,17 +1077,21 @@ const Session = struct {
 
     fn removeRepositoryFiles(self: *Session) void {
         for (self.repositories_written) |repository| {
+            const guest_path = packages_mod.repositoryPath(
+                self.allocator,
+                repository.id,
+            ) catch continue;
             const path = std.fmt.allocPrintSentinel(
                 self.allocator,
-                guest_root ++ repository_directory ++ "/{s}.repo",
-                .{repository.id},
+                guest_root ++ "{s}",
+                .{guest_path},
                 0,
             ) catch continue;
             _ = linux.unlink(path);
         }
         if (self.repositories_written.len != 0) {
-            _ = linux.unlink(guest_root ++ tdnf_config);
-            _ = linux.rmdir(guest_root ++ repository_directory);
+            _ = linux.unlink(guest_root ++ packages_mod.config_path);
+            _ = linux.rmdir(guest_root ++ packages_mod.repository_directory);
         }
     }
 

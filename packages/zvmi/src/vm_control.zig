@@ -329,7 +329,10 @@ pub const Repository = struct {
     credential: ?ControlCredential = null,
 };
 
-pub const Action = union(enum) {
+/// Tagged with `packages.ActionKind` rather than an inferred enum, so that
+/// `packages.invocationFor` answers for this type and for
+/// `customize.PackageAction` at once.
+pub const Action = union(packages.ActionKind) {
     install: []const []const u8,
     remove: []const []const u8,
     update_all,

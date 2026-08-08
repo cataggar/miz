@@ -6,6 +6,7 @@ const customize = @import("customize.zig");
 const grub_defaults = @import("grub_defaults.zig");
 const initramfs_mod = @import("initramfs.zig");
 const os_customization = @import("os_customization.zig");
+const packages_mod = @import("packages.zig");
 const preserved_image = @import("preserved_image.zig");
 const selinux_mod = @import("selinux.zig");
 const transaction_guard = @import("transaction_guard.zig");
@@ -857,15 +858,21 @@ const Session = struct {
         // run that declares no lock is the one most likely to want one.
         if (self.manifest.packages.actions.len != 0) try self.loadBaselinePackages();
         try self.importTrust();
-        for (self.manifest.packages.actions) |action| switch (action) {
-            .install => |names| try self.runTdnfLocked("install", names),
-            // The one verb a lock does not rewrite. A removal names what must
-            // not be installed, and asking to remove one exact version would
-            // silently leave any other in place.
-            .remove => |names| try self.runTdnf("remove", names, false),
-            .update_all => try self.runTdnf("update", &.{}, true),
-            .update_selected => |names| try self.runTdnfLocked("update", names),
-        };
+        // Which verb, whether a lock rewrites the names and whether the
+        // declared repositories take part are all one table, shared with the
+        // guest agent so the two backends cannot answer them differently.
+        for (self.manifest.packages.actions) |action| {
+            const invocation = packages_mod.invocationFor(std.meta.activeTag(action));
+            const names: []const []const u8 = switch (action) {
+                .install, .remove, .update_selected => |values| values,
+                .update_all => &.{},
+            };
+            if (invocation.pinned) {
+                try self.runTdnfLocked(invocation.verb, names);
+            } else {
+                try self.runTdnf(invocation.verb, names, invocation.repositories);
+            }
+        }
         try self.removeRepositoryFiles();
         // After the packages, so a package that ships its own modprobe
         // configuration cannot land on top of the declared one, and before
@@ -1249,11 +1256,7 @@ const Session = struct {
             for (pins) |pin| {
                 if (!std.mem.eql(u8, pin.name, name)) continue;
                 matched = true;
-                try specs.append(try std.fmt.allocPrint(
-                    self.allocator,
-                    "{s}-{s}.{s}",
-                    .{ pin.name, pin.evr, pin.architecture },
-                ));
+                try specs.append(try packages_mod.pinnedSpec(self.allocator, pin));
             }
             if (!matched) return error.UnlockedPackageRequested;
         }
@@ -1351,12 +1354,7 @@ const Session = struct {
         self: *Session,
         into: *std.array_list.Managed([]const u8),
     ) !void {
-        const output = try self.runChrootCapture(&.{
-            "/usr/bin/rpm",
-            "-qa",
-            "--qf",
-            "%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n",
-        });
+        const output = try self.runChrootCapture(&packages_mod.installedQueryArgv());
         var lines = std.mem.tokenizeScalar(u8, output, '\n');
         while (lines.next()) |line| {
             if (line.len == 0 or std.mem.indexOfScalar(u8, line, 0) != null) {
@@ -1701,18 +1699,18 @@ const Session = struct {
             self.manifest.root_path,
         );
         defer self.allocator.free(config_path);
-        // `cachedir` and `keepcache` are ordinary tdnf configuration keys
-        // rather than command-line flags, which is what lets this work
-        // against the tdnf 3.x the target images ship: the 4.0 flag that
-        // would name a cache directory on the command line does not exist
-        // there. `keepcache` is what makes a populating run leave the
-        // downloaded packages behind for the offline run to install from;
-        // without it tdnf discards them once the transaction commits.
-        const config_body = if (customize.packageCacheDirectory(self.manifest.packages.cache)) |_|
-            "[main]\ngpgcheck=1\nreposdir=/run/zvmi-repos\ncachedir=" ++
-                guest_cache_directory ++ "\nkeepcache=1\n"
-        else
-            "[main]\ngpgcheck=1\nreposdir=/run/zvmi-repos\n";
+        // The cache is the one thing this body carries that the guest agent's
+        // cannot, so it is a parameter rather than a second body: a package
+        // cache is a host directory, and the vm backend refuses `.cache` by
+        // name.
+        const config_body = try packages_mod.configBody(
+            self.allocator,
+            if (customize.packageCacheDirectory(self.manifest.packages.cache)) |_|
+                guest_cache_directory
+            else
+                null,
+        );
+        defer self.allocator.free(config_body);
         try writeBytesExclusive(
             self.io,
             config_path,
@@ -1809,11 +1807,7 @@ const Session = struct {
         var trust_index: usize = 0;
         for (self.manifest.packages.repositories) |repository| {
             for (repository.trust) |trust| {
-                const guest_path = try std.fmt.allocPrint(
-                    self.allocator,
-                    "/run/zvmi-trust-{d}.asc",
-                    .{trust_index},
-                );
+                const guest_path = try packages_mod.trustPath(self.allocator, trust_index);
                 defer self.allocator.free(guest_path);
                 const host_path = try joinGuest(
                     self.allocator,
@@ -1830,7 +1824,7 @@ const Session = struct {
                         host_path,
                     ),
                 }
-                try self.runChroot(&.{ "/usr/bin/rpm", "--import", guest_path });
+                try self.runChroot(&packages_mod.importTrustArgv(guest_path));
                 try Io.Dir.cwd().deleteFile(self.io, host_path);
                 trust_index += 1;
             }
@@ -1845,31 +1839,19 @@ const Session = struct {
     ) !void {
         var argv = std.array_list.Managed([]const u8).init(self.allocator);
         defer argv.deinit();
-        try argv.appendSlice(&.{
-            "/usr/bin/tdnf",
-            "--config",
-            "/run/zvmi-tdnf.conf",
-            "--disablerepo=*",
-        });
-        // tdnf's own refusal to fetch. A package the declared cache does not
-        // hold fails as `ERROR_TDNF_CACHE_DISABLED` rather than being
-        // downloaded, which is what makes the offline claim checkable instead
-        // of merely intended.
-        if (customize.offlinePackageCache(self.manifest.packages.cache)) {
-            try argv.append("--cacheonly");
-        }
+        var ids = std.array_list.Managed([]const u8).init(self.allocator);
+        defer ids.deinit();
         if (repositories) {
             for (self.manifest.packages.repositories) |repository| {
-                try argv.append(try std.fmt.allocPrint(
-                    self.allocator,
-                    "--enablerepo={s}",
-                    .{repository.id},
-                ));
+                try ids.append(repository.id);
             }
         }
-        try argv.append(verb);
-        try argv.append("-y");
-        try argv.appendSlice(names);
+        try packages_mod.appendTransactionArgv(&argv, .{
+            .verb = verb,
+            .repository_ids = ids.items,
+            .cache_only = customize.offlinePackageCache(self.manifest.packages.cache),
+            .names = names,
+        });
         try self.runChroot(argv.items);
     }
 
@@ -2763,30 +2745,42 @@ fn validateGuestMountpoints(io: Io, root_path: []const u8) !void {
     }
 }
 
+/// The three paths above, prefixed with the mounted target root.
+///
+/// The guest-visible half of each comes from `packages.zig`, because that is
+/// the half the guest agent writes and the package manager reads. Only the
+/// `<root>` prefix is this backend's business: a shared module that knew about
+/// it would be a shared module with opinions about the host's filesystem.
 fn repositoryHostPath(
     allocator: Allocator,
     root_path: []const u8,
     id: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}/run/zvmi-repos/{s}.repo",
-        .{ root_path, id },
-    );
+    const guest_path = try packages_mod.repositoryPath(allocator, id);
+    defer allocator.free(guest_path);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ root_path, guest_path });
 }
 
 fn repositoryHostDirectory(
     allocator: Allocator,
     root_path: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/run/zvmi-repos", .{root_path});
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}" ++ packages_mod.repository_directory,
+        .{root_path},
+    );
 }
 
 fn tdnfConfigHostPath(
     allocator: Allocator,
     root_path: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/run/zvmi-tdnf.conf", .{root_path});
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}" ++ packages_mod.config_path,
+        .{root_path},
+    );
 }
 
 fn containsBytes(haystack: []const []const u8, needle: []const u8) bool {
