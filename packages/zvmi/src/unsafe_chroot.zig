@@ -5849,14 +5849,32 @@ const FakeExecutorContext = struct {
     /// The argument vector `setfiles` was invoked with, without the `chroot`
     /// prefix, and whether it ran at all.
     relabel_argv: ?[]const []const u8 = null,
+    /// The target's `/etc/selinux/config` as it stood at the start of the most
+    /// recent command.
+    selinux_config_seen: ?[]const u8 = null,
 
     fn plantSelinuxTree(self: *FakeExecutorContext, layout: FakeSelinuxLayout) !void {
+        // Planted once and then left alone. The executor rewrites this file
+        // itself for a configuration change, and a fake that put the original
+        // back on the next command would be undoing the work under test.
+        if (self.readTargetFile("etc/selinux/config")) |existing| {
+            self.allocator.free(existing);
+            return;
+        }
         try self.writeTargetFile("etc/selinux/config", switch (layout) {
             .none => return,
             .no_policy_named => "SELINUX=enforcing\n",
             .targeted, .missing_contexts => "SELINUX=enforcing\nSELINUXTYPE=targeted\n",
             .targeted_permissive => "SELINUX=permissive\nSELINUXTYPE=targeted\n",
+            .targeted_disabled => "SELINUX=disabled\nSELINUXTYPE=targeted\n",
+            .targeted_with_minimum => "SELINUX=enforcing\nSELINUXTYPE=targeted\n",
         });
+        if (layout == .targeted_with_minimum) {
+            try self.writeTargetFile(
+                "etc/selinux/minimum/contexts/files/file_contexts",
+                "/.*  system_u:object_r:default_t:s0\n",
+            );
+        }
         if (layout == .missing_contexts) return;
         try self.writeTargetFile(
             "etc/selinux/targeted/contexts/files/file_contexts",
@@ -5967,6 +5985,14 @@ const FakeExecutorContext = struct {
         // through would record it as the relabel and a test would be asserting
         // against a command the run never used to label anything.
         if (containsArg(argv, "--version")) return self.fakeVersion(allocator, argv);
+        // Sampled before anything this command does, and before the tree is
+        // planted, so the last sample is the file as the run left it. The
+        // session deletes the root during cleanup, so after the run there is
+        // nothing left to read.
+        if (self.readTargetFile("etc/selinux/config")) |seen| {
+            if (self.selinux_config_seen) |previous| self.allocator.free(previous);
+            self.selinux_config_seen = seen;
+        }
         if (self.plant_selinux) |layout| try self.plantSelinuxTree(layout);
         if (self.plant_in_target) |relative| {
             const path = try std.fs.path.join(
@@ -6238,6 +6264,14 @@ const FakeSelinuxLayout = enum {
     /// A relabelled target that will nonetheless not enforce what the labels
     /// say at boot. The relabel is identical; the resulting image is not.
     targeted_permissive,
+    /// A target with SELinux switched off, whose files therefore carry
+    /// whatever labels they were last given -- which is to say, none that any
+    /// policy has checked.
+    targeted_disabled,
+    /// A target configured for `targeted` that also carries the `minimum`
+    /// policy, so a change from one to the other is a change this run can
+    /// carry out rather than one it must refuse.
+    targeted_with_minimum,
 };
 
 fn fakeResult(
@@ -6523,6 +6557,168 @@ test "a relabel a target cannot satisfy fails the run rather than skipping it" {
         // image published as relabelled that is not.
         try std.testing.expectEqual(RunOutcome.failed, result.outcome);
         try std.testing.expect(context.relabel_argv == null);
+    }
+}
+
+test "a configuration change decides the relabel from what the target already is" {
+    const Case = struct {
+        why: []const u8,
+        layout: FakeSelinuxLayout,
+        configure: @FieldType(customize.SelinuxPolicy, "configure"),
+        previous_mode: ?customize.SelinuxMode,
+        expected_reason: customize.SelinuxRelabelReason,
+        expect_relabel: bool,
+    };
+    const cases = [_]Case{
+        .{
+            // A root that was never enforcing carries labels no policy has
+            // checked. Booting it enforcing without relabelling is how an
+            // image reaches a login prompt it cannot get past.
+            .why = "disabled to enforcing needs the walk",
+            .layout = .targeted_disabled,
+            .configure = .{ .mode = .enforcing, .relabel = .when_needed },
+            .previous_mode = .disabled,
+            .expected_reason = .mode_raised,
+            .expect_relabel = true,
+        },
+        .{
+            // Permissive loads the policy and computes contexts; it only
+            // declines to deny. The labels are already the policy's own, so
+            // enforcing them costs nothing new.
+            .why = "permissive to enforcing does not",
+            .layout = .targeted_permissive,
+            .configure = .{ .mode = .enforcing, .relabel = .when_needed },
+            .previous_mode = .permissive,
+            .expected_reason = .not_needed,
+            .expect_relabel = false,
+        },
+        .{
+            // The caller said no, and said it about the case that would
+            // otherwise relabel. Recorded as declined rather than as not
+            // needed, because those are different facts about the image.
+            .why = "a declined relabel stays declined even when the mode is raised",
+            .layout = .targeted_disabled,
+            .configure = .{ .mode = .enforcing, .relabel = .never },
+            .previous_mode = .disabled,
+            .expected_reason = .declined,
+            .expect_relabel = false,
+        },
+        .{
+            .why = "an unconditional relabel runs even when nothing needed it",
+            .layout = .targeted_permissive,
+            .configure = .{ .mode = .permissive, .relabel = .always },
+            .previous_mode = .permissive,
+            .expected_reason = .requested,
+            .expect_relabel = true,
+        },
+        .{
+            // The labels the root carries came out of a different
+            // `file_contexts`, so they describe types the new policy may not
+            // define at all. The mode never moved, and it still needs the
+            // walk.
+            .why = "a policy change needs the walk on its own",
+            .layout = .targeted_with_minimum,
+            .configure = .{ .policy = "minimum", .relabel = .when_needed },
+            .previous_mode = .enforcing,
+            .expected_reason = .policy_changed,
+            .expect_relabel = true,
+        },
+        .{
+            .why = "the policy it already names is not a change",
+            .layout = .targeted,
+            .configure = .{ .policy = "targeted", .relabel = .when_needed },
+            .previous_mode = .enforcing,
+            .expected_reason = .not_needed,
+            .expect_relabel = false,
+        },
+    };
+
+    for (cases, 0..) |case, index| {
+        errdefer std.debug.print("case: {s}\n", .{case.why});
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const allocator = arena_state.allocator();
+        const io = std.testing.io;
+        const root_path = try std.fmt.allocPrint(
+            allocator,
+            "test-unsafe-chroot-configure-{d}-root",
+            .{index},
+        );
+        const raw_path = try std.fmt.allocPrint(
+            allocator,
+            "test-unsafe-chroot-configure-{d}-stage.raw",
+            .{index},
+        );
+        defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+        defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+        const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+            .exclusive = true,
+            .read = true,
+        });
+        try raw_file.setLength(io, 8192);
+        const raw_inode = (try raw_file.stat(io)).inode;
+        raw_file.close(io);
+
+        const manifest = Manifest{
+            .raw_path = raw_path,
+            .root_path = root_path,
+            .status_path = "unused.status",
+            .report_path = "unused-report.json",
+            .stage_inode = raw_inode,
+            .virtual_size = 8192,
+            .partition_offset = 1024,
+            .partition_length = 4096,
+            .packages = .{},
+            .initramfs = .unchanged,
+            .selinux = .{ .configure = case.configure },
+        };
+
+        var context = FakeExecutorContext{
+            .allocator = allocator,
+            .io = io,
+            .root_path = root_path,
+            .unmounts = .init(allocator),
+            .timeline = .init(allocator),
+            .plant_selinux = case.layout,
+        };
+        const result = try executeManifest(allocator, io, manifest, .{
+            .context = &context,
+            .runFn = FakeExecutorContext.run,
+        });
+        try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
+
+        const record = result.report.selinux_configure orelse
+            return error.TestExpectedConfigureRecord;
+        // The before-state is what the executor found, not what the plan
+        // asked for: a record that echoed the request back would say nothing
+        // about the image that was published.
+        try std.testing.expectEqual(case.previous_mode, record.previous_mode);
+        try std.testing.expectEqualStrings("targeted", record.previous_policy.?);
+        try std.testing.expectEqual(case.configure.mode, record.mode);
+        try std.testing.expectEqual(case.expected_reason, record.relabel_reason);
+        try std.testing.expectEqual(case.expect_relabel, record.relabelled);
+        // What the record says happened is what happened. A `setfiles` that
+        // ran without being recorded, or a record without the argv to back it,
+        // would each be provenance describing a different run.
+        try std.testing.expectEqual(case.expect_relabel, context.relabel_argv != null);
+
+        // The record describes a file, so the file has to say what the record
+        // says. Read as the teardown commands saw it, because the session
+        // deletes the root before returning.
+        const written = context.selinux_config_seen orelse
+            return error.TestExpectedSelinuxConfig;
+        if (case.configure.mode) |mode| {
+            try std.testing.expectEqual(mode, selinux_mod.parseConfiguredMode(written).?);
+        } else {
+            try std.testing.expectEqual(
+                case.previous_mode,
+                selinux_mod.parseConfiguredMode(written),
+            );
+        }
+        try std.testing.expectEqualStrings(
+            case.configure.policy orelse "targeted",
+            selinux_mod.parseConfiguredPolicy(written).?,
+        );
     }
 }
 

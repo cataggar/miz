@@ -10181,6 +10181,233 @@ test "a relabel is a different plan from leaving the labels alone" {
     ));
 }
 
+test "a configuration change is its own operation, and its own plan" {
+    var request = validNativeEditRequest(
+        "source.raw",
+        "selinux-configure-work/output.raw",
+        "selinux-configure-work",
+        &.{},
+    );
+    request.execution.backend = .unsafe_chroot;
+    request.execution.acknowledge_unsafe = true;
+
+    const Resolved = struct {
+        fn selinuxAction(inner: *const Request) !Action {
+            var resolved = try resolve(
+                std.testing.allocator,
+                inner,
+                .{ .host_architecture = .x86_64 },
+            );
+            defer resolved.deinit(std.testing.allocator);
+            try std.testing.expect(resolved.plan != null);
+            for (resolved.plan.?.data.operations) |operation| {
+                if (operation.phase == .selinux) return operation.action;
+            }
+            return error.NoSelinuxOperation;
+        }
+
+        fn planHash(inner: *const Request) ![32]u8 {
+            var resolved = try resolve(
+                std.testing.allocator,
+                inner,
+                .{ .host_architecture = .x86_64 },
+            );
+            defer resolved.deinit(std.testing.allocator);
+            try std.testing.expect(resolved.plan != null);
+            return resolved.plan.?.data.plan_hash.bytes;
+        }
+    };
+
+    // Relabelling and configuring are different work, so they are different
+    // operations. A plan that named them both `apply_selinux_policy` would
+    // publish an operation for a relabel that applies no policy.
+    request.selinux = .relabel;
+    try std.testing.expectEqual(Action.relabel_filesystem, try Resolved.selinuxAction(&request));
+    const relabel_hash = try Resolved.planHash(&request);
+
+    request.selinux = .{ .configure = .{ .mode = .enforcing } };
+    try std.testing.expectEqual(Action.apply_selinux_policy, try Resolved.selinuxAction(&request));
+    const configure_hash = try Resolved.planHash(&request);
+    try std.testing.expect(!std.mem.eql(u8, &relabel_hash, &configure_hash));
+
+    // The relabel policy decides whether a filesystem walk happens, which is
+    // the difference between two images, so two runs differing only in it must
+    // not share a cache entry.
+    request.selinux = .{ .configure = .{ .mode = .enforcing, .relabel = .never } };
+    const declined_hash = try Resolved.planHash(&request);
+    try std.testing.expect(!std.mem.eql(u8, &configure_hash, &declined_hash));
+
+    // Same for the settings themselves: a mode-only change and a policy-only
+    // change are not the same build.
+    request.selinux = .{ .configure = .{ .policy = "targeted" } };
+    const policy_hash = try Resolved.planHash(&request);
+    try std.testing.expect(!std.mem.eql(u8, &configure_hash, &policy_hash));
+}
+
+test "a configuration change declares every capability the run may need" {
+    const Case = struct {
+        why: []const u8,
+        configure: @FieldType(SelinuxPolicy, "configure"),
+        expect_relabel: bool,
+    };
+    const cases = [_]Case{
+        .{
+            .why = "an unconditional relabel always walks the filesystem",
+            .configure = .{ .mode = .enforcing, .relabel = .always },
+            .expect_relabel = true,
+        },
+        .{
+            // Declared because the run may need it. A capability discovered to
+            // be missing after the workspace exists is the failure preflight
+            // exists to prevent, and only the executor can see the target's
+            // current mode.
+            .why = "a conditional relabel may still walk the filesystem",
+            .configure = .{ .mode = .enforcing, .relabel = .when_needed },
+            .expect_relabel = true,
+        },
+        .{
+            .why = "a declined relabel never walks the filesystem",
+            .configure = .{ .mode = .enforcing, .relabel = .never },
+            .expect_relabel = false,
+        },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.why});
+        var request = validNativeEditRequest(
+            "source.raw",
+            "selinux-capability-work/output.raw",
+            "selinux-capability-work",
+            &.{},
+        );
+        request.execution.backend = .unsafe_chroot;
+        request.execution.acknowledge_unsafe = true;
+        request.selinux = .{ .configure = case.configure };
+
+        var resolved = try resolve(
+            std.testing.allocator,
+            &request,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer resolved.deinit(std.testing.allocator);
+        try std.testing.expect(resolved.plan != null);
+
+        var saw_policy = false;
+        var saw_guest = false;
+        var saw_relabel = false;
+        for (resolved.plan.?.data.required_capabilities) |capability| switch (capability.kind) {
+            .selinux_policy => saw_policy = true,
+            .guest_execution => saw_guest = true,
+            .selinux_relabel => saw_relabel = true,
+            else => {},
+        };
+        // Writing the configuration is code running against the target root,
+        // so it needs the same declaration every other in-target operation
+        // makes.
+        try std.testing.expect(saw_policy);
+        try std.testing.expect(saw_guest);
+        try std.testing.expectEqual(case.expect_relabel, saw_relabel);
+    }
+}
+
+test "a SELinux configuration is refused where it could not be applied" {
+    const Case = struct {
+        why: []const u8,
+        selinux: SelinuxPolicy,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            // A caller who reached for `.configure` meant to change something.
+            // Accepting the empty shape as a no-op hides the mistake behind a
+            // run that reports success and changed nothing.
+            .why = "a configuration that names neither setting",
+            .selinux = .{ .configure = .{} },
+            .expected = "must name a mode, a policy, or both",
+        },
+        .{
+            .why = "a policy name that would escape the policy directory",
+            .selinux = .{ .configure = .{ .policy = "../../etc" } },
+            .expected = "SELinux policy names",
+        },
+        .{
+            .why = "a policy name that is a path",
+            .selinux = .{ .configure = .{ .policy = "targeted/contexts" } },
+            .expected = "SELinux policy names",
+        },
+        .{
+            .why = "a policy name that is empty",
+            .selinux = .{ .configure = .{ .policy = "" } },
+            .expected = "SELinux policy names",
+        },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.why});
+        var request = whenNeededRequest();
+        request.selinux = case.selinux;
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(diagnostics.hasErrors());
+        var named = false;
+        for (diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, case.expected) != null) {
+                named = true;
+                try std.testing.expectEqual(DiagnosticCode.invalid_policy, diagnostic.code);
+            }
+        }
+        try std.testing.expect(named);
+    }
+}
+
+test "a backend that cannot configure SELinux says so before a workspace exists" {
+    const io = std.testing.io;
+    const source_path = "test-customize-selinux-backend-source.raw";
+    defer Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    {
+        const source = try Io.Dir.cwd().createFile(io, source_path, .{});
+        source.close(io);
+    }
+
+    // The backends that have no way to run code against the target root, or
+    // no root to run it against. Each must refuse by name rather than build an
+    // image whose SELinux configuration is not what was asked for.
+    const backends = [_]ExecutionBackend{ .native_fresh, .native_edit, .rebuild };
+    for (backends) |backend| {
+        errdefer std.debug.print("backend: {t}\n", .{backend});
+        var request = validNativeEditRequest(
+            source_path,
+            "selinux-backend-work/output.raw",
+            "selinux-backend-work",
+            &.{},
+        );
+        request.execution.backend = backend;
+        request.selinux = .{ .configure = .{ .mode = .enforcing, .relabel = .always } };
+
+        var resolved = try resolve(
+            std.testing.allocator,
+            &request,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer resolved.deinit(std.testing.allocator);
+        if (resolved.plan == null) continue;
+
+        var report = try preflight(
+            std.testing.allocator,
+            io,
+            &resolved.plan.?,
+            Platform.system(),
+        );
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expect(!report.ready());
+        var named = false;
+        for (report.capabilities) |capability| {
+            if (capability.requirement.kind != .selinux_policy) continue;
+            named = true;
+            try std.testing.expectEqual(CapabilityState.unsupported, capability.state);
+        }
+        try std.testing.expect(named);
+    }
+}
+
 test "unsupported guest-code backends fail preflight before workspace mutation" {
     const io = std.testing.io;
     const source_path = "test-customize-unsupported-source.raw";
