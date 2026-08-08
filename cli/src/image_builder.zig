@@ -23,6 +23,7 @@ const ParsedArgs = struct {
     extra_kernel_options: []const u8 = "",
     boot_mode: zvmi.bootconfig.BootMode = .bls_only,
     uki: zvmi.customize.UkiOptions = .{},
+    uki_signing: ?zvmi.customize.UkiSigningPolicy = null,
     customization_path: ?[]const u8 = null,
     customization_source_paths: []const []const u8 = &.{},
     seed: zvmi.customize.Seed,
@@ -175,6 +176,7 @@ pub fn main(init: std.process.Init) !void {
             .verity = args.verity,
             .extra_kernel_options = args.extra_kernel_options,
             .uki = args.uki,
+            .signing = args.uki_signing,
         },
         .os = customization.os,
         .generalization = customization.generalization,
@@ -217,8 +219,15 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // The build process's own environment, forwarded only to a declared UKI
+    // signing provider. `zvmi sign` reaches Azure Trusted Signing with a
+    // GitHub OIDC request URL and token it finds there, so a signer handed a
+    // curated environment is a signer that cannot sign.
+    var platform = zvmi.customize.Platform.system();
+    platform.signing_environ = init.minimal.environ;
+
     if (args.preflight_only) {
-        var report = try zvmi.customize.preflight(init.gpa, init.io, &resolved.plan.?, zvmi.customize.Platform.system());
+        var report = try zvmi.customize.preflight(init.gpa, init.io, &resolved.plan.?, platform);
         defer report.deinit(init.gpa);
         try writeDiagnostics(init.gpa, init.io, diagnostics_output_path, report.diagnostics, false);
         try writeBytes(init.io, status_output_path, if (report.ready()) "success\n" else "failure\n");
@@ -230,7 +239,7 @@ pub fn main(init: std.process.Init) !void {
         init.gpa,
         init.io,
         &resolved.plan.?,
-        zvmi.customize.Platform.system(),
+        platform,
         .{ .context = &console, .emitFn = ConsoleEvents.emit },
     ) catch |err| {
         std.debug.print("zvmi-image-builder: execution setup failed: {t}\n", .{err});
@@ -285,6 +294,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
     var extra_kernel_options: []const u8 = "";
     var boot_mode: zvmi.bootconfig.BootMode = .bls_only;
     var uki: zvmi.customize.UkiOptions = .{};
+    var uki_signing_certificate_path: ?[]const u8 = null;
+    var uki_signing_command: ?[]const u8 = null;
+    var uki_signing_argument: []const u8 = "";
     var customization_path: ?[]const u8 = null;
     var customization_sources = std.array_list.Managed([]const u8).init(allocator);
     errdefer customization_sources.deinit();
@@ -358,6 +370,12 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
             uki.splash_source_path = value;
         } else if (std.mem.eql(u8, arg, "--uki-output-directory")) {
             uki.output_directory = value;
+        } else if (std.mem.eql(u8, arg, "--uki-signing-certificate")) {
+            uki_signing_certificate_path = value;
+        } else if (std.mem.eql(u8, arg, "--uki-signing-command")) {
+            uki_signing_command = value;
+        } else if (std.mem.eql(u8, arg, "--uki-signing-argument")) {
+            uki_signing_argument = value;
         } else if (std.mem.eql(u8, arg, "--customization")) {
             customization_path = value;
         } else if (std.mem.eql(u8, arg, "--customization-source")) {
@@ -375,6 +393,13 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
         } else {
             return error.UnexpectedArgument;
         }
+    }
+
+    // Both halves or neither: a certificate with no provider names a signer
+    // that never runs, and a provider with no certificate has nothing to
+    // check its result against.
+    if ((uki_signing_certificate_path == null) != (uki_signing_command == null)) {
+        return error.IncompleteUkiSigning;
     }
 
     return .{
@@ -395,6 +420,13 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
         .extra_kernel_options = extra_kernel_options,
         .boot_mode = boot_mode,
         .uki = uki,
+        .uki_signing = if (uki_signing_certificate_path) |certificate_path| .{
+            .certificate = .{ .host_path = certificate_path },
+            .provider = .{ .external_command = .{
+                .executable_path = uki_signing_command.?,
+                .argument = uki_signing_argument,
+            } },
+        } else null,
         .customization_path = customization_path,
         .customization_source_paths = try customization_sources.toOwnedSlice(),
         .seed = seed orelse return error.MissingSeed,

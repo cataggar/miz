@@ -22,6 +22,7 @@ const limits_mod = @import("limits.zig");
 const root_tree_mod = @import("root_tree.zig");
 const vhdx = @import("vhdx.zig");
 const squashfs = @import("squashfs.zig");
+const uki_signing = @import("uki_signing.zig");
 const verity = @import("verity.zig");
 const initramfs = @import("initramfs.zig");
 
@@ -98,6 +99,10 @@ pub const BuildImageOptions = struct {
     /// Additional UKI discovery/output controls forwarded to
     /// `bootconfig.populateEsp()`.
     uki: bootconfig.UkiOptions = .{},
+    /// Optional Authenticode signer applied to each generated UKI before it
+    /// is written to the ESP, forwarded to `bootconfig.populateEsp()`. Only
+    /// meaningful when `boot_mode` generates UKIs.
+    uki_signer: ?uki_signing.Signer = null,
     architecture: ?bootconfig.Architecture = null,
     /// Limits on the owned root tree the merged ISO/squashfs/container
     /// sources are materialized into. The defaults suit a purpose-built
@@ -154,6 +159,7 @@ pub const Stage = enum {
     seal_verity,
     install_bootloader,
     generate_uki,
+    sign_uki,
     check_and_close_filesystems,
     convert_output,
 };
@@ -552,6 +558,7 @@ pub fn build(
             .boot_mode = options.boot_mode,
             .extra_kernel_options = options.extra_kernel_options,
             .uki = options.uki,
+            .uki_signer = options.uki_signer,
             .stage_sink = if (options.stage_sink != null)
                 .{ .context = &populate_stage_bridge, .advanceFn = PopulateStageBridge.advance }
             else
@@ -963,6 +970,7 @@ const PopulateStageBridge = struct {
             .prepare => .prepare_boot_configuration,
             .bootloader => .install_bootloader,
             .uki => .generate_uki,
+            .sign_uki => .sign_uki,
         });
     }
 };

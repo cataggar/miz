@@ -183,6 +183,65 @@ pub fn signUkiAlloc(
     flavor: []const u8,
     unsigned_bytes: []const u8,
 ) !SignedUki {
+    const signed_bytes = switch (config.mode) {
+        .local_key => |local| try signWithLocalKeyAlloc(
+            allocator,
+            io,
+            config,
+            local.private_key_path,
+            local.sbsign_path,
+            scratch_path,
+            index,
+            unsigned_bytes,
+        ),
+        .external_command => |external| try signWithProviderAlloc(
+            allocator,
+            io,
+            config,
+            external,
+            scratch_path,
+            base_environ,
+            index,
+            architecture,
+            flavor,
+            unsigned_bytes,
+        ),
+    };
+    errdefer allocator.free(signed_bytes.bytes);
+
+    // `sbverify` is the cross-check: the library established that these bytes
+    // carry a signature over this image by the declared certificate, and this
+    // says an independent implementation agrees. Neither check subsumes the
+    // other, which is the point of running both.
+    try verifyBytes(allocator, io, config, scratch_path, index, signed_bytes.bytes);
+
+    return .{
+        .bytes = signed_bytes.bytes,
+        .unsigned_sha256 = zvmi.artifact_pipeline.sha256Bytes(unsigned_bytes),
+        .signed_sha256 = zvmi.artifact_pipeline.sha256Bytes(signed_bytes.bytes),
+        .provider_metadata = signed_bytes.provider_metadata,
+    };
+}
+
+const SignedBytes = struct {
+    bytes: []u8,
+    provider_metadata: ?ProviderMetadata = null,
+};
+
+/// Signs with a private key on this machine, which is what a development or
+/// self-signed build does. The library has no equivalent and should not grow
+/// one: it would mean a key on the build host, which is the arrangement
+/// production signing exists to avoid.
+fn signWithLocalKeyAlloc(
+    allocator: Allocator,
+    io: Io,
+    config: Config,
+    private_key_path: []const u8,
+    sbsign_path: []const u8,
+    scratch_path: []const u8,
+    index: usize,
+    unsigned_bytes: []const u8,
+) !SignedBytes {
     const unsigned_path = try std.fmt.allocPrint(
         allocator,
         "{s}/unsigned-{d}.efi",
@@ -195,15 +254,10 @@ pub fn signUkiAlloc(
         .{ scratch_path, index },
     );
     defer allocator.free(signed_path);
-    const metadata_path = try std.fmt.allocPrint(
-        allocator,
-        "{s}/metadata-{d}.json",
-        .{ scratch_path, index },
-    );
-    defer allocator.free(metadata_path);
     Dir.cwd().deleteFile(io, unsigned_path) catch {};
     Dir.cwd().deleteFile(io, signed_path) catch {};
-    Dir.cwd().deleteFile(io, metadata_path) catch {};
+    defer Dir.cwd().deleteFile(io, unsigned_path) catch {};
+    defer Dir.cwd().deleteFile(io, signed_path) catch {};
     try Dir.cwd().writeFile(io, .{
         .sub_path = unsigned_path,
         .data = unsigned_bytes,
@@ -212,51 +266,17 @@ pub fn signUkiAlloc(
             .permissions = .fromMode(0o600),
         },
     });
+    try runSanitizedNoOutput(allocator, io, &.{
+        sbsign_path,
+        "--key",
+        private_key_path,
+        "--cert",
+        config.certificate_path,
+        "--output",
+        signed_path,
+        unsigned_path,
+    });
 
-    const unsigned_sha256 = zvmi.artifact_pipeline.sha256Bytes(unsigned_bytes);
-    const unsigned_sha256_hex = zvmi.artifact_pipeline.formatSha256(unsigned_sha256);
-    const certificate_sha256_hex = zvmi.artifact_pipeline.formatSha256(
-        config.expected_certificate_sha256,
-    );
-    switch (config.mode) {
-        .local_key => |local| try runSanitizedNoOutput(allocator, io, &.{
-            local.sbsign_path,
-            "--key",
-            local.private_key_path,
-            "--cert",
-            config.certificate_path,
-            "--output",
-            signed_path,
-            unsigned_path,
-        }),
-        .external_command => |external| {
-            var environment = try base_environ.clone(allocator);
-            defer environment.deinit();
-            try environment.put("ZVMI_UKI_UNSIGNED", unsigned_path);
-            try environment.put("ZVMI_UKI_SIGNED", signed_path);
-            try environment.put("ZVMI_UKI_CERTIFICATE", config.certificate_path);
-            try environment.put("ZVMI_UKI_ARCHITECTURE", architecture);
-            try environment.put("ZVMI_UKI_FLAVOR", flavor);
-            try environment.put("ZVMI_UKI_SIGNING_METADATA", metadata_path);
-            try environment.put("ZVMI_UKI_UNSIGNED_SHA256", &unsigned_sha256_hex);
-            try environment.put(
-                "ZVMI_UKI_CERTIFICATE_SHA256",
-                &certificate_sha256_hex,
-            );
-            var command = std.array_list.Managed([]const u8).init(allocator);
-            defer command.deinit();
-            try command.append(external.executable_path);
-            if (external.argument) |argument| try command.append(argument);
-            try runSanitizedWithEnvironment(
-                allocator,
-                io,
-                command.items,
-                &environment,
-            );
-        },
-    }
-
-    try verifyFile(allocator, io, config, signed_path);
     const signed_bytes = try Dir.cwd().readFileAlloc(
         io,
         signed_path,
@@ -265,58 +285,96 @@ pub fn signUkiAlloc(
     );
     errdefer allocator.free(signed_bytes);
     try verifyPayloads(allocator, unsigned_bytes, signed_bytes);
-    var provider_metadata = try readProviderMetadataAlloc(
-        allocator,
-        io,
-        metadata_path,
-        config.expected_certificate_sha256,
-    );
-    errdefer if (provider_metadata) |*metadata| metadata.deinit(allocator);
-
-    return .{
-        .bytes = signed_bytes,
-        .unsigned_sha256 = unsigned_sha256,
-        .signed_sha256 = zvmi.artifact_pipeline.sha256Bytes(signed_bytes),
-        .provider_metadata = provider_metadata,
-    };
+    return .{ .bytes = signed_bytes };
 }
 
-fn readProviderMetadataAlloc(
+/// Runs the external provider protocol, which the library owns.
+///
+/// Everything about the exchange -- the variables, the scratch files, and the
+/// check that what came back is a signature over the bytes that went out --
+/// is `zvmi.uki_signing`'s, so that a release built by this script and an
+/// image built by the library are signed by the same code. What stays here is
+/// what a release builder knows and a library does not: the flavor it is
+/// building, and which signing service it is willing to accept.
+fn signWithProviderAlloc(
     allocator: Allocator,
     io: Io,
-    path: []const u8,
-    expected_enrolled_certificate_sha256: Digest,
-) !?ProviderMetadata {
-    const bytes = Dir.cwd().readFileAlloc(
+    config: Config,
+    external: anytype,
+    scratch_path: []const u8,
+    base_environ: *const std.process.Environ.Map,
+    index: usize,
+    architecture: []const u8,
+    flavor: []const u8,
+    unsigned_bytes: []const u8,
+) !SignedBytes {
+    var certificate = zvmi.uki_signing.loadCertificateAlloc(
+        allocator,
         io,
-        path,
+        .{ .host_path = config.certificate_path },
+    ) catch return error.InvalidSigningCertificate;
+    defer certificate.deinit(allocator);
+    if (!std.mem.eql(u8, &certificate.sha256, &config.expected_certificate_sha256))
+        return error.CertificateFingerprintMismatch;
+
+    var environment = try base_environ.clone(allocator);
+    defer environment.deinit();
+    try environment.put("ZVMI_UKI_FLAVOR", flavor);
+
+    const provider_scratch = try std.fmt.allocPrint(
         allocator,
-        .limited(max_provider_metadata_bytes),
-    ) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer allocator.free(bytes);
-    const Wire = struct {
-        schema: u32,
-        provider: []const u8,
-        endpoint: []const u8,
-        account: []const u8,
-        profile: []const u8,
-        operation_id: []const u8,
-        signing_certificate_sha256: []const u8,
-        enrolled_certificate_sha256: []const u8,
-    };
-    const parsed = try std.json.parseFromSlice(
-        Wire,
-        allocator,
-        bytes,
-        .{ .ignore_unknown_fields = false },
+        "{s}/provider-{d}",
+        .{ scratch_path, index },
     );
-    defer parsed.deinit();
-    const value = parsed.value;
-    if (value.schema != 1 or
-        !std.mem.eql(u8, value.provider, "azure-artifact-signing") or
+    defer allocator.free(provider_scratch);
+    defer Dir.cwd().deleteTree(io, provider_scratch) catch {};
+
+    var signer = try zvmi.uki_signing.ExternalSigner.init(allocator, io, .{
+        .command = .{
+            .executable_path = external.executable_path,
+            .argument = external.argument,
+        },
+        .certificate = certificate,
+        .scratch_path = provider_scratch,
+        .architecture = architecture,
+        .base_environment = .{ .map = &environment },
+    });
+    defer signer.deinit();
+
+    // No ESP path: this script signs bytes it read out of a finished image and
+    // writes them back itself, so the library has nothing to record here.
+    const signed_bytes = signer.signer().sign(allocator, .{
+        .esp_paths = &.{},
+        .unsigned = unsigned_bytes,
+    }) catch |err| {
+        if (signer.provider_error) |name|
+            std.debug.print("signing command failed: {s}\n", .{name});
+        return err;
+    };
+    errdefer allocator.free(signed_bytes);
+
+    const records = signer.signatures();
+    if (records.len != 1) return error.SigningCommandFailed;
+    const metadata = if (records[0].provider) |value|
+        try acceptProviderMetadata(allocator, value)
+    else
+        null;
+    return .{ .bytes = signed_bytes, .provider_metadata = metadata };
+}
+
+/// Checks that the provider that answered is one a release may be signed by,
+/// and copies what it said.
+///
+/// The library already refused metadata that is malformed or names a
+/// certificate other than the declared one. This adds the part that is a
+/// release policy rather than a protocol rule: that the service was Azure
+/// Artifact Signing, reached at an endpoint that is one, and that the account,
+/// profile, and operation identify a real operation there.
+fn acceptProviderMetadata(
+    allocator: Allocator,
+    value: zvmi.uki_signing.ProviderMetadata,
+) !ProviderMetadata {
+    if (!std.mem.eql(u8, value.provider, "azure-artifact-signing") or
         !validArtifactSigningEndpoint(value.endpoint) or
         !validProviderResourceName(value.account) or
         !validProviderResourceName(value.profile) or
@@ -324,20 +382,6 @@ fn readProviderMetadataAlloc(
     {
         return error.InvalidSigningProviderMetadata;
     }
-    const signing_certificate_sha256 = parseFingerprint(
-        value.signing_certificate_sha256,
-    ) catch return error.InvalidSigningProviderMetadata;
-    const enrolled_certificate_sha256 = parseFingerprint(
-        value.enrolled_certificate_sha256,
-    ) catch return error.InvalidSigningProviderMetadata;
-    if (!std.mem.eql(
-        u8,
-        &enrolled_certificate_sha256,
-        &expected_enrolled_certificate_sha256,
-    )) {
-        return error.SigningProviderEnrolledCertificateMismatch;
-    }
-
     const provider = try allocator.dupe(u8, value.provider);
     errdefer allocator.free(provider);
     const endpoint = try allocator.dupe(u8, value.endpoint);
@@ -347,15 +391,14 @@ fn readProviderMetadataAlloc(
     const profile = try allocator.dupe(u8, value.profile);
     errdefer allocator.free(profile);
     const operation_id = try allocator.dupe(u8, value.operation_id);
-    errdefer allocator.free(operation_id);
     return .{
         .provider = provider,
         .endpoint = endpoint,
         .account = account,
         .profile = profile,
         .operation_id = operation_id,
-        .signing_certificate_sha256 = signing_certificate_sha256,
-        .enrolled_certificate_sha256 = enrolled_certificate_sha256,
+        .signing_certificate_sha256 = value.signing_certificate_sha256,
+        .enrolled_certificate_sha256 = value.enrolled_certificate_sha256,
     };
 }
 
@@ -517,46 +560,6 @@ fn runSanitizedNoOutput(
     allocator.free(stdout);
 }
 
-fn runSanitizedWithEnvironment(
-    allocator: Allocator,
-    io: Io,
-    argv: []const []const u8,
-    environ_map: *const std.process.Environ.Map,
-) !void {
-    const result = try std.process.run(allocator, io, .{
-        .argv = argv,
-        .environ_map = environ_map,
-        .stdout_limit = .limited(max_command_output_bytes),
-        .stderr_limit = .limited(max_command_output_bytes),
-        .timeout = .{ .duration = .{
-            .raw = .fromSeconds(5 * 60),
-            .clock = .awake,
-        } },
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code == 0) return,
-        else => {},
-    }
-    if (signerErrorName(result.stderr)) |error_name| {
-        std.debug.print("signing command failed: {s}\n", .{error_name});
-    }
-    return error.SigningCommandFailed;
-}
-
-fn signerErrorName(stderr: []const u8) ?[]const u8 {
-    const prefix = "zvmi sign: failed: ";
-    var line = std.mem.trimEnd(u8, stderr, "\r\n");
-    if (!std.mem.startsWith(u8, line, prefix)) return null;
-    line = line[prefix.len..];
-    if (line.len == 0 or line.len > 128) return null;
-    for (line) |byte| {
-        if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return null;
-    }
-    return line;
-}
-
 test "signing mode names are stable provenance values" {
     try std.testing.expectEqualStrings("local-key", (Mode{ .local_key = .{
         .private_key_path = "test.key",
@@ -565,19 +568,6 @@ test "signing mode names are stable provenance values" {
         .executable_path = "/test/signer",
         .argument = "sign",
     } }).name());
-}
-
-test "only safe built-in signer error names are reported" {
-    try std.testing.expectEqualStrings(
-        "ArtifactSigningSubmitFailed",
-        signerErrorName(
-            "zvmi sign: failed: ArtifactSigningSubmitFailed\n",
-        ).?,
-    );
-    try std.testing.expect(signerErrorName("secret output") == null);
-    try std.testing.expect(
-        signerErrorName("zvmi sign: failed: Bad\nInjected") == null,
-    );
 }
 
 test "certificate fingerprints accept canonical SHA-256 forms" {
