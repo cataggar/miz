@@ -168,7 +168,6 @@ pub fn probeVerdict(probe: Probe) ?SkipReason {
     };
 }
 
-
 /// The longest kernel release either backend will act on.
 ///
 /// A release is not free-form text that happens to be echoed back: it becomes
