@@ -535,7 +535,7 @@ fn decompressZstd(allocator: Allocator, bytes: []const u8, max_size: usize) Load
     // Indirect mode with an explicitly-sized window buffer -- the empty-
     // buffer "direct" mode used previously silently produced truncated/
     // corrupted output for some real, large zstd-compressed layers (see
-    // packages/zvmi/src/initramfs.zig's decompressZstd, where the identical
+    // packages/zvmi/src/verity_tooling.zig's decompressZstd, where the identical
     // pattern was found to misparse a real ~50+ MiB dracut-produced
     // initramfs while appearing to succeed).
     const window_len = std.compress.zstd.default_window_len;

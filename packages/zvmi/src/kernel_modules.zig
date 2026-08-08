@@ -286,7 +286,7 @@ fn decompressZstd(allocator: Allocator, bytes: []const u8, max_bytes: usize) (Al
     // Indirect mode with an explicitly sized window: the direct mode requires
     // the destination to already have window-sized capacity on every read,
     // which `allocRemaining`'s growing buffer does not guarantee and which
-    // silently truncated large streams when `initramfs.zig` relied on it.
+    // silently truncated large streams when `verity_tooling.zig` relied on it.
     const window_len = std.compress.zstd.default_window_len;
     const window = try allocator.alloc(u8, window_len + std.compress.zstd.block_size_max);
     defer allocator.free(window);

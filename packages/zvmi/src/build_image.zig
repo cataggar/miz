@@ -24,7 +24,7 @@ const vhdx = @import("vhdx.zig");
 const squashfs = @import("squashfs.zig");
 const uki_signing = @import("uki_signing.zig");
 const verity = @import("verity.zig");
-const initramfs = @import("initramfs.zig");
+const verity_tooling = @import("verity_tooling.zig");
 
 const mib: u64 = azure.one_mib;
 pub const default_esp_size: u64 = 96 * mib;
@@ -2195,7 +2195,7 @@ fn isInitramfsSourcePath(path: []const u8) bool {
 
 /// Reads every `boot/initrd*`/`boot/initramfs*` file in the merged source
 /// tree and checks each for dm-verity userspace tooling (see
-/// `initramfs.zig`), returning the most conservative combined status: any
+/// `verity_tooling.zig`), returning the most conservative combined status: any
 /// match anywhere is `.present`; otherwise `.absent` only if every candidate
 /// was fully and conclusively parsed with no match, and `.inconclusive`
 /// (including when no initramfs candidate was found at all) whenever any
@@ -2204,7 +2204,7 @@ fn isInitramfsSourcePath(path: []const u8) bool {
 fn checkInitramfsVerityTooling(
     allocator: std.mem.Allocator,
     view: *ext4.FileTreeView,
-) !initramfs.VerityToolingStatus {
+) !verity_tooling.VerityToolingStatus {
     view.reset();
 
     var found_any_candidate = false;
@@ -2219,7 +2219,7 @@ fn checkInitramfsVerityTooling(
         const bytes = try readViewFileAlloc(allocator, content, entry.size);
         defer allocator.free(bytes);
 
-        switch (try initramfs.checkVerityTooling(allocator, bytes)) {
+        switch (try verity_tooling.checkVerityTooling(allocator, bytes)) {
             .present => return .present,
             .absent => saw_absent = true,
             .inconclusive => saw_inconclusive = true,
@@ -4683,7 +4683,7 @@ fn makeSyntheticBiosCoreImg(allocator: std.mem.Allocator) ![]u8 {
 
 /// Builds a minimal newc-format cpio archive (see `cpio.zig`) containing a
 /// single entry followed by a `TRAILER!!!`, for exercising
-/// `initramfs.checkVerityTooling` end-to-end through `build()`'s
+/// `verity_tooling.checkVerityTooling` end-to-end through `build()`'s
 /// `--verity` initramfs check (see issue #77).
 fn makeSyntheticInitramfsCpio(allocator: std.mem.Allocator, entry_path: []const u8) ![]u8 {
     var list = std.array_list.Managed(u8).init(allocator);
