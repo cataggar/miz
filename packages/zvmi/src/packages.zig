@@ -195,7 +195,6 @@ pub fn appendTransactionArgv(
     try argv.appendSlice(transaction.names);
 }
 
-
 /// One package pinned to an exact rpm identity.
 ///
 /// There is no repository field, and there could not honestly be one: rpm's
