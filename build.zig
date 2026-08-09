@@ -224,6 +224,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(image_builder_exe);
+    const image_builder_tests = b.addTest(.{
+        .root_module = image_builder_exe.root_module,
+    });
+    const run_image_builder_tests = b.addRunArtifact(image_builder_tests);
+    const image_builder_test_step = b.step(
+        "test-image-builder",
+        "Run the host image builder's argument tests",
+    );
+    image_builder_test_step.dependOn(&run_image_builder_tests.step);
 
     const preserved_image_wire_mod = b.createModule(.{
         .root_source_file = b.path("packages/zvmi/src/preserved_image_wire.zig"),
@@ -965,6 +974,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_qemu_host_tests.step);
     test_step.dependOn(&run_azagent_tests.step);
     test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_image_builder_tests.step);
     test_step.dependOn(&run_preserved_image_builder_tests.step);
     test_step.dependOn(&run_preserved_image_wire_tests.step);
     test_step.dependOn(&run_input_validator_tests.step);

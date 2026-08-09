@@ -129,6 +129,20 @@ A single manifest also reports the platform its image configuration states.
 `--json` prints `schema_version`, `requested`, `reference`, `media_type`,
 `digest`, `size`, `kind`, and `platform`.
 
+An image build that names a registry image does its own pinning, so the
+two-step workflow is one step for anyone who does not need it to be two.
+`--container docker://registry.example/team/image:stable` resolves the tag
+before the request is built and prints what it resolved to:
+
+```console
+zvmi-image-builder: pinned docker://registry.example/team/image:stable to docker://registry.example/team/image@sha256:...
+```
+
+The digest is still stated out loud rather than followed silently, which is
+the point of the request refusing a tag in the first place. Committing the
+digest-form reference is still better: it makes the build say in the source
+which bytes it wants, rather than asking the registry each time.
+
 ## Registry options and authentication
 
 HTTPS with system trust and hostname verification is the default. `--tls-ca <pem>` adds certificates to system trust. There is no certificate-verification bypass. `--plain-http` is intended for development registries; credentials and bearer tokens are rejected over non-loopback HTTP.
@@ -151,6 +165,19 @@ helper they name, is consulted. A registry that needs authentication then fails
 as an authentication error naming the reference rather than succeeding because
 the machine happened to be logged in. The `zvmi oci` commands do not state a
 credential and keep the discovery behaviour above.
+
+**An image build reads none of those six locations.** A customize run does not
+read `~/.docker/config.json`, `$REGISTRY_AUTH_FILE`,
+`$XDG_RUNTIME_DIR/containers/auth.json` or any credential helper they name,
+and it does not read them even when no credential was declared:
+`registry.Options.discover_credential` is off for that path. A build that
+declares no credential authenticates as nobody and fails plainly against a
+private registry, rather than succeeding on whichever machine happened to be
+logged in and failing on the next one. State the credential instead, with
+`--registry-username` and one of `--registry-password-file` or
+`--registry-password-env`; the plan hash then covers *where* the password
+comes from, and never what it is, so a rotation does not change the plan.
+There is deliberately no `--registry-authfile` for a build.
 
 The client supports `auths`, per-registry `credHelpers`, global `credsStore`, Basic challenges, and Bearer token challenges. The `auth` field is Base64 encoding, not encryption. Credential helpers receive the registry key on stdin, never as a command argument. Credentials, bearer tokens, challenge values, and signed upload URLs are not included in diagnostics.
 

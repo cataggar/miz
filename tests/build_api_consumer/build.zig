@@ -31,6 +31,33 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // A registry image named by the request itself, rather than pulled beside
+    // it by addOciPull.  Only configured, never built: the point is that the
+    // exported API accepts it and emits the flags.
+    _ = zvmi.addImage(b, dependency, .{
+        .name = "registry-image-fixture",
+        .input = .{
+            .iso = b.path("fixtures/os.iso"),
+            .container = .{ .registry = .{
+                .reference = "docker://registry.example/team/image@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                .username = "builder",
+                .password_file = b.path("fixtures/registry-password"),
+                .tls_ca = b.path("fixtures/registry-ca.pem"),
+            } },
+        },
+        .output = .{
+            .format = .qcow2,
+            .basename = "registry-image-fixture.qcow2",
+        },
+        .size = 256 * 1024 * 1024,
+        .target_architecture = .x86_64,
+        .rootfs_path_in_iso = "images/rootfs.squashfs",
+        .reproducibility = .{
+            .seed = [_]u8{0x77} ** 32,
+            .source_date_epoch = 1_735_689_600,
+        },
+    });
+
     const layout_image = zvmi.addImage(b, dependency, .{
         .name = "layout-fixture",
         .input = .{

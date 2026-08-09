@@ -5,11 +5,54 @@ const builtin = @import("builtin");
 const customization_loader = @import("customization_loader.zig");
 const zvmi = @import("zvmi");
 
+/// What `--container` named, before the run has decided anything about it.
+///
+/// A local path and a registry reference are not the same kind of thing --
+/// one can be hashed and checked for overlap with the output, the other
+/// cannot -- so they are distinguished at parse time rather than by asking
+/// the same string different questions later.
+const ContainerArg = union(enum) {
+    host_path: []const u8,
+    registry: RegistryArg,
+};
+
+/// A declared registry image, as the command line stated it.
+///
+/// There is deliberately no `--registry-authfile` here. An authfile is a
+/// discovery mechanism, and a customize run does not discover: the request
+/// states its credential so the plan hash can cover where the password comes
+/// from, and a `~/.docker/config.json` is exactly the ambient dependency that
+/// makes a build mean different things on different machines. `zvmi oci pull`
+/// still honours one, because a person at a terminal expects their login to
+/// work.
+const RegistryArg = struct {
+    reference: []const u8,
+    username: ?[]const u8 = null,
+    password: ?zvmi.customize.CredentialSource = null,
+    tls_ca: ?[]const u8 = null,
+    plain_http: bool = false,
+
+    fn access(self: RegistryArg) !zvmi.customize.RegistryAccess {
+        // Both halves or neither: a user name with no password names an
+        // identity that cannot authenticate, and a password with no user name
+        // has no identity to authenticate as.
+        const credential: ?zvmi.customize.BasicCredential = if (self.username) |name| .{
+            .username = name,
+            .password = self.password orelse return error.IncompleteRegistryCredential,
+        } else if (self.password != null) return error.IncompleteRegistryCredential else null;
+        return .{
+            .credential = credential,
+            .tls_ca = self.tls_ca,
+            .plain_http = self.plain_http,
+        };
+    }
+};
+
 const ParsedArgs = struct {
     api_version: u32 = zvmi.customize.current_api_version,
     architecture: zvmi.customize.Architecture,
     iso_path: []const u8,
-    container_path: []const u8,
+    container: ContainerArg,
     rootfs_path: []const u8,
     bundle_output_path: []const u8,
     image_basename: []const u8,
@@ -37,10 +80,28 @@ const ParsedArgs = struct {
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(arena);
-    const args = parseArgs(arena, argv[1..]) catch |err| {
+    var args = parseArgs(arena, argv[1..]) catch |err| {
         std.debug.print("zvmi-image-builder: invalid arguments: {t}\n", .{err});
         std.process.exit(2);
     };
+    // Resolved here rather than left to `validate`, because a person holding
+    // a tag has to be told the digest it named to be able to commit to it.
+    // Printed on stderr, not just used: a build that silently followed a tag
+    // would be the ambiguity the digest requirement exists to remove.
+    if (args.container == .registry) {
+        args.container.registry.reference = pinIfTagged(
+            arena,
+            init.io,
+            init.minimal.environ,
+            args.container.registry,
+        ) catch |err| {
+            std.debug.print(
+                "zvmi-image-builder: cannot pin '{s}': {t}\n",
+                .{ args.container.registry.reference, err },
+            );
+            std.process.exit(1);
+        };
+    }
     if (!isBasename(args.image_basename) or isReservedBasename(args.image_basename)) {
         std.debug.print("zvmi-image-builder: image output must be a non-reserved basename\n", .{});
         std.process.exit(2);
@@ -48,9 +109,14 @@ pub fn main(init: std.process.Init) !void {
     const overlaps_source = pathsOverlapCanonically(arena, init.io, args.bundle_output_path, args.iso_path) catch |err| {
         std.debug.print("zvmi-image-builder: cannot isolate result bundle from ISO source: {t}\n", .{err});
         std.process.exit(1);
-    } or pathsOverlapCanonically(arena, init.io, args.bundle_output_path, args.container_path) catch |err| {
-        std.debug.print("zvmi-image-builder: cannot isolate result bundle from container source: {t}\n", .{err});
-        std.process.exit(1);
+    } or switch (args.container) {
+        // A registry image is not a path on this machine, so there is nothing
+        // for the output to overlap with.
+        .registry => false,
+        .host_path => |path| pathsOverlapCanonically(arena, init.io, args.bundle_output_path, path) catch |err| {
+            std.debug.print("zvmi-image-builder: cannot isolate result bundle from container source: {t}\n", .{err});
+            std.process.exit(1);
+        },
     };
     if (overlaps_source) {
         std.debug.print("zvmi-image-builder: result bundle and source paths must be distinct\n", .{});
@@ -78,9 +144,12 @@ pub fn main(init: std.process.Init) !void {
     const lock_overlaps_source = pathsOverlapCanonically(arena, init.io, lock_path, args.iso_path) catch |err| {
         std.debug.print("zvmi-image-builder: cannot isolate result lock from ISO source: {t}\n", .{err});
         std.process.exit(1);
-    } or pathsOverlapCanonically(arena, init.io, lock_path, args.container_path) catch |err| {
-        std.debug.print("zvmi-image-builder: cannot isolate result lock from container source: {t}\n", .{err});
-        std.process.exit(1);
+    } or switch (args.container) {
+        .registry => false,
+        .host_path => |path| pathsOverlapCanonically(arena, init.io, lock_path, path) catch |err| {
+            std.debug.print("zvmi-image-builder: cannot isolate result lock from container source: {t}\n", .{err});
+            std.process.exit(1);
+        },
     };
     if (lock_overlaps_source) {
         std.debug.print("zvmi-image-builder: result lock and source paths must be distinct\n", .{});
@@ -112,7 +181,7 @@ pub fn main(init: std.process.Init) !void {
         arena,
         argv,
         args.iso_path,
-        args.container_path,
+        args.container,
         args.bundle_output_path,
         args.image_basename,
         args.customization_path,
@@ -123,7 +192,7 @@ pub fn main(init: std.process.Init) !void {
         init.io,
         argv,
         args.iso_path,
-        args.container_path,
+        args.container,
         args.customization_path,
         args.customization_source_paths,
     );
@@ -157,7 +226,13 @@ pub fn main(init: std.process.Init) !void {
         .target_architecture = args.architecture,
         .input = .{ .iso_oci = .{
             .iso_path = args.iso_path,
-            .container = .{ .host_path = args.container_path },
+            .container = switch (args.container) {
+                .host_path => |path| .{ .host_path = path },
+                .registry => |declared| .{ .registry = .{
+                    .reference = declared.reference,
+                    .access = declared.access() catch unreachable,
+                } },
+            },
             .rootfs_path_in_iso = args.rootfs_path,
         } },
         .output = .{
@@ -225,6 +300,10 @@ pub fn main(init: std.process.Init) !void {
     // curated environment is a signer that cannot sign.
     var platform = zvmi.customize.Platform.system();
     platform.signing_environ = init.minimal.environ;
+    // The same environment, granted separately, because a request that names
+    // `--registry-password-env` has said out loud which variable it wants
+    // read and a plan that names none reads nothing from here.
+    platform.registry_environ = init.minimal.environ;
 
     if (args.preflight_only) {
         var report = try zvmi.customize.preflight(init.gpa, init.io, &resolved.plan.?, platform);
@@ -260,7 +339,7 @@ pub fn main(init: std.process.Init) !void {
         init.io,
         argv,
         args.iso_path,
-        args.container_path,
+        args.container,
         args.customization_path,
         args.customization_source_paths,
     );
@@ -276,11 +355,49 @@ pub fn main(init: std.process.Init) !void {
     try writeBytes(init.io, status_output_path, "success\n");
 }
 
+/// Returns the digest-form reference for a declared image, resolving a tag
+/// against the registry if that is what was named.
+///
+/// A request may only hold a digest, and a person holds a tag. Resolving it
+/// here rather than refusing means the two-step workflow is one step for
+/// anyone who does not need it to be two, and reporting what it resolved to
+/// on stderr means the digest is still stated out loud rather than followed
+/// silently -- which is the whole reason the request wants one.
+fn pinIfTagged(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+    declared: RegistryArg,
+) ![]const u8 {
+    const parsed = try zvmi.oci.reference.parse(declared.reference, .source);
+    const selection = switch (parsed) {
+        .registry => |value| value.selection,
+        .layout => return error.NotARegistryReference,
+    };
+    if (selection) |value| {
+        if (value == .digest) return declared.reference;
+    }
+    var pin = try zvmi.customize.pinDeclaredImage(
+        allocator,
+        io,
+        environ,
+        declared.reference,
+        try declared.access(),
+    );
+    defer pin.deinit();
+    std.debug.print(
+        "zvmi-image-builder: pinned {s} to {s}\n",
+        .{ declared.reference, pin.reference },
+    );
+    return allocator.dupe(u8, pin.reference);
+}
+
 fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs {
     var api_version: u32 = zvmi.customize.current_api_version;
     var architecture: ?zvmi.customize.Architecture = null;
     var iso_path: ?[]const u8 = null;
-    var container_path: ?[]const u8 = null;
+    var container: ?ContainerArg = null;
+    var registry = RegistryArg{ .reference = "" };
     var rootfs_path: ?[]const u8 = null;
     var bundle_output_path: ?[]const u8 = null;
     var image_basename: ?[]const u8 = null;
@@ -330,6 +447,10 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
             reuse_success = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--registry-plain-http")) {
+            registry.plain_http = true;
+            continue;
+        }
 
         i += 1;
         if (i >= args.len) return error.MissingArgumentValue;
@@ -341,7 +462,25 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
         } else if (std.mem.eql(u8, arg, "--iso")) {
             iso_path = value;
         } else if (std.mem.eql(u8, arg, "--container")) {
-            container_path = value;
+            // A `docker://` reference and a path are told apart by the scheme
+            // and by nothing else, so no existing path can be reinterpreted
+            // as a registry by accident.
+            if (std.mem.startsWith(u8, value, "docker://")) {
+                registry.reference = value;
+                container = .{ .registry = registry };
+            } else {
+                container = .{ .host_path = value };
+            }
+        } else if (std.mem.eql(u8, arg, "--registry-username")) {
+            registry.username = value;
+        } else if (std.mem.eql(u8, arg, "--registry-password-file")) {
+            if (registry.password != null) return error.ConflictingRegistryPassword;
+            registry.password = .{ .host_path = value };
+        } else if (std.mem.eql(u8, arg, "--registry-password-env")) {
+            if (registry.password != null) return error.ConflictingRegistryPassword;
+            registry.password = .{ .host_environment = value };
+        } else if (std.mem.eql(u8, arg, "--registry-tls-ca")) {
+            registry.tls_ca = value;
         } else if (std.mem.eql(u8, arg, "--rootfs-path")) {
             rootfs_path = value;
         } else if (std.mem.eql(u8, arg, "--bundle-output")) {
@@ -402,11 +541,32 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
         return error.IncompleteUkiSigning;
     }
 
+    // Order-independent: the registry options are collected as they are seen
+    // and applied here, so `--registry-username x --container docker://...`
+    // and the reverse order mean the same thing.
+    const resolved_container = container orelse return error.MissingContainer;
+    switch (resolved_container) {
+        .registry => {
+            _ = try registry.access();
+            container = .{ .registry = registry };
+        },
+        // Refused rather than ignored: a registry flag beside a local layout
+        // is a request nobody can satisfy, and silently dropping it would
+        // make a build that reads no credential look like one that did.
+        .host_path => {
+            if (registry.username != null or registry.password != null or
+                registry.tls_ca != null or registry.plain_http)
+            {
+                return error.RegistryOptionsWithoutRegistry;
+            }
+        },
+    }
+
     return .{
         .api_version = api_version,
         .architecture = architecture orelse return error.MissingArchitecture,
         .iso_path = iso_path orelse return error.MissingIso,
-        .container_path = container_path orelse return error.MissingContainer,
+        .container = container.?,
         .rootfs_path = rootfs_path orelse return error.MissingRootfsPath,
         .bundle_output_path = bundle_output_path orelse return error.MissingBundleOutput,
         .image_basename = image_basename orelse return error.MissingImageBasename,
@@ -528,7 +688,7 @@ fn hasReusableSuccess(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
     iso_path: []const u8,
-    container_path: []const u8,
+    container: ContainerArg,
     bundle_path: []const u8,
     image_basename: []const u8,
     customization_path: ?[]const u8,
@@ -551,7 +711,7 @@ fn hasReusableSuccess(
         io,
         argv,
         iso_path,
-        container_path,
+        container,
         customization_path,
         customization_source_paths,
     ) catch return false;
@@ -599,13 +759,12 @@ fn computeReuseKey(
     io: std.Io,
     argv: []const []const u8,
     iso_path: []const u8,
-    container_path: []const u8,
+    container: ContainerArg,
     customization_path: ?[]const u8,
     customization_source_paths: []const []const u8,
 ) ![32]u8 {
     const executable_digest = try zvmi.customize.hashSourcePath(allocator, io, argv[0]);
     const iso_digest = try zvmi.customize.hashSourcePath(allocator, io, iso_path);
-    const container_digest = try zvmi.customize.hashSourcePath(allocator, io, container_path);
 
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("zvmi-image-builder-reuse-v2\x00");
@@ -617,7 +776,18 @@ fn computeReuseKey(
     }
     hash.update(&executable_digest.bytes);
     hash.update(&iso_digest.bytes);
-    hash.update(&container_digest.bytes);
+    switch (container) {
+        .host_path => |path| {
+            const digest = try zvmi.customize.hashSourcePath(allocator, io, path);
+            hash.update(&digest.bytes);
+        },
+        // The pinned reference *is* the content digest, so hashing it says
+        // exactly what hashing a local layout's bytes would say, and says it
+        // without a network request. It is hashed rather than the raw
+        // argument because a tag on the command line was pinned above, and
+        // reusing a build across a tag that moved would be wrong.
+        .registry => |declared| hash.update(declared.reference),
+    }
     if (customization_path) |path| {
         const digest = try zvmi.customize.hashSourcePath(allocator, io, path);
         hash.update(&digest.bytes);
@@ -681,3 +851,135 @@ const ConsoleEvents = struct {
         }
     }
 };
+
+// The arguments the exported build helper generates, as a baseline every test
+// below changes one thing in.
+fn testArgs(extra: []const []const u8, buffer: [][]const u8) []const []const u8 {
+    const base = [_][]const u8{
+        "--architecture",      "x86_64",
+        "--iso",               "input.iso",
+        "--rootfs-path",       "rootfs.img",
+        "--bundle-output",     "result",
+        "--image-basename",    "image.vhd",
+        "-O",                  "vhd",
+        "--size",              "4G",
+        "--seed",              "00" ** 32,
+        "--source-date-epoch", "0",
+    };
+    @memcpy(buffer[0..base.len], &base);
+    @memcpy(buffer[base.len..][0..extra.len], extra);
+    return buffer[0 .. base.len + extra.len];
+}
+
+test "a docker reference is a registry container and a path is not" {
+    var buffer: [40][]const u8 = undefined;
+    const registry_parsed = try parseArgs(std.testing.allocator, testArgs(
+        &.{ "--container", "docker://registry.example/team/image:stable" },
+        &buffer,
+    ));
+    try std.testing.expect(registry_parsed.container == .registry);
+    try std.testing.expectEqualStrings(
+        "docker://registry.example/team/image:stable",
+        registry_parsed.container.registry.reference,
+    );
+
+    var path_buffer: [40][]const u8 = undefined;
+    const path_parsed = try parseArgs(std.testing.allocator, testArgs(
+        &.{ "--container", "./oci-layout" },
+        &path_buffer,
+    ));
+    try std.testing.expect(path_parsed.container == .host_path);
+    try std.testing.expectEqualStrings("./oci-layout", path_parsed.container.host_path);
+}
+
+test "a registry option beside a local layout is refused rather than ignored" {
+    var buffer: [40][]const u8 = undefined;
+    try std.testing.expectError(error.RegistryOptionsWithoutRegistry, parseArgs(
+        std.testing.allocator,
+        testArgs(&.{
+            "--container",         "./oci-layout",
+            "--registry-username", "builder",
+        }, &buffer),
+    ));
+}
+
+test "a registry credential needs both halves" {
+    var name_only: [40][]const u8 = undefined;
+    try std.testing.expectError(error.IncompleteRegistryCredential, parseArgs(
+        std.testing.allocator,
+        testArgs(&.{
+            "--container",         "docker://registry.example/team/image:stable",
+            "--registry-username", "builder",
+        }, &name_only),
+    ));
+
+    var password_only: [40][]const u8 = undefined;
+    try std.testing.expectError(error.IncompleteRegistryCredential, parseArgs(
+        std.testing.allocator,
+        testArgs(&.{
+            "--container",              "docker://registry.example/team/image:stable",
+            "--registry-password-file", "secret",
+        }, &password_only),
+    ));
+}
+
+test "a registry password comes from a file or the environment, not both" {
+    var buffer: [40][]const u8 = undefined;
+    try std.testing.expectError(error.ConflictingRegistryPassword, parseArgs(
+        std.testing.allocator,
+        testArgs(&.{
+            "--container",              "docker://registry.example/team/image:stable",
+            "--registry-username",      "builder",
+            "--registry-password-file", "secret",
+            "--registry-password-env",  "REGISTRY_PASSWORD",
+        }, &buffer),
+    ));
+}
+
+test "registry options apply whichever side of --container they are given" {
+    var before: [40][]const u8 = undefined;
+    const parsed_before = try parseArgs(std.testing.allocator, testArgs(&.{
+        "--registry-username",     "builder",
+        "--registry-password-env", "REGISTRY_PASSWORD",
+        "--registry-plain-http",
+        "--container",             "docker://127.0.0.1:5000/team/image:stable",
+    }, &before));
+    const access_before = try parsed_before.container.registry.access();
+    try std.testing.expect(access_before.plain_http);
+    try std.testing.expectEqualStrings("builder", access_before.credential.?.username);
+    try std.testing.expectEqualStrings(
+        "REGISTRY_PASSWORD",
+        access_before.credential.?.password.host_environment,
+    );
+
+    var after: [40][]const u8 = undefined;
+    const parsed_after = try parseArgs(std.testing.allocator, testArgs(&.{
+        "--container",             "docker://127.0.0.1:5000/team/image:stable",
+        "--registry-username",     "builder",
+        "--registry-password-env", "REGISTRY_PASSWORD",
+        "--registry-plain-http",
+    }, &after));
+    const access_after = try parsed_after.container.registry.access();
+    try std.testing.expectEqual(access_before.plain_http, access_after.plain_http);
+    try std.testing.expectEqualStrings(
+        access_before.credential.?.username,
+        access_after.credential.?.username,
+    );
+}
+
+// The password is a name of somewhere the password lives. A test that only
+// checked both halves were present would pass on a version that carried the
+// material, which is the mistake worth fencing.
+test "a registry password is a locator and never material" {
+    var buffer: [40][]const u8 = undefined;
+    const parsed = try parseArgs(std.testing.allocator, testArgs(&.{
+        "--container",              "docker://registry.example/team/image:stable",
+        "--registry-username",      "builder",
+        "--registry-password-file", "/run/secrets/registry",
+    }, &buffer));
+    const access = try parsed.container.registry.access();
+    try std.testing.expectEqualStrings(
+        "/run/secrets/registry",
+        access.credential.?.password.host_path,
+    );
+}
