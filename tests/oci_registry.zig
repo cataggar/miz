@@ -1246,6 +1246,107 @@ test "a supplied credential authenticates and suppresses credential discovery" {
     }
 }
 
+test "pinning names the digest a tag points at now, and the platform it resolves to" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try Fixture.init(allocator, io, .anonymous, 3, null);
+    defer fixture.deinit();
+    try fixture.start();
+    var source = try sourceFor(&fixture, null);
+    defer source.deinit();
+    var result = try source.pin(.{
+        .authority = fixture.authority,
+        .repository = "team/image",
+        .selection = .{ .tag = "latest" },
+    });
+    defer result.deinit();
+    try fixture.finish();
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "docker://{s}/team/image@{s}",
+        .{ fixture.authority, fixture.manifest_digest },
+    );
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, result.reference);
+    try std.testing.expectEqualStrings(fixture.manifest_digest, result.digest);
+    try std.testing.expectEqualStrings(oci.model.media_type_oci_manifest, result.media_type);
+    try std.testing.expectEqual(fixture.manifest.len, result.size);
+    try std.testing.expectEqual(oci.registry.InspectKind.manifest, result.kind);
+    try std.testing.expectEqualStrings("linux", result.platform.?.os);
+    try std.testing.expectEqualStrings("amd64", result.platform.?.architecture);
+    try std.testing.expect(result.platform.?.variant == null);
+}
+
+test "pinning a digest confirms it and reports the variant the configuration states" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try Fixture.init(allocator, io, .inspect_annotated_variant, 3, null);
+    defer fixture.deinit();
+    try fixture.start();
+    var source = try sourceFor(&fixture, null);
+    defer source.deinit();
+    var result = try source.pin(.{
+        .authority = fixture.authority,
+        .repository = "team/image",
+        .selection = .{ .digest = try oci.content.Digest.parse(fixture.manifest_digest) },
+    });
+    defer result.deinit();
+    try fixture.finish();
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "docker://{s}/team/image@{s}",
+        .{ fixture.authority, fixture.manifest_digest },
+    );
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, result.reference);
+    try std.testing.expectEqual(oci.registry.InspectKind.manifest, result.kind);
+    try std.testing.expectEqualStrings("v8", result.platform.?.variant.?);
+}
+
+// An index covers many platforms, so it pins to an index and to no platform.
+// Walking its children to say more would be a request per platform to learn
+// something the pin does not record, and the choice among them belongs to the
+// load that consumes the image.
+test "pinning an index reports an index and no platform without walking children" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try Fixture.init(allocator, io, .inspect_index_all, 2, null);
+    defer fixture.deinit();
+    try fixture.start();
+    var source = try sourceFor(&fixture, null);
+    defer source.deinit();
+    var result = try source.pin(.{
+        .authority = fixture.authority,
+        .repository = "team/image",
+        .selection = .{ .tag = "latest" },
+    });
+    defer result.deinit();
+    try fixture.finish();
+    try std.testing.expectEqualStrings(fixture.index_digest.?, result.digest);
+    try std.testing.expectEqualStrings(oci.model.media_type_oci_index, result.media_type);
+    try std.testing.expectEqual(oci.registry.InspectKind.index, result.kind);
+    try std.testing.expect(result.platform == null);
+}
+
+test "pinning refuses a reference that names no image" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    try std.testing.expectError(oci.reference.Error.MissingSelection, oci.pinRegistryImage(
+        io,
+        allocator,
+        std.process.Environ.empty,
+        "docker://127.0.0.1:1/team/image",
+        .{ .plain_http = true },
+    ));
+    try std.testing.expectError(error.InvalidRegistryUrl, oci.pinRegistryImage(
+        io,
+        allocator,
+        std.process.Environ.empty,
+        "oci:some-layout:latest",
+        .{},
+    ));
+}
+
 test "anonymous pull copies exact graph into a new layout with streamed blobs" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

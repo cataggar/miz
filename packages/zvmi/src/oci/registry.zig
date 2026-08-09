@@ -171,6 +171,36 @@ pub const InspectOptions = struct {
     max_depth: usize = 32,
 };
 
+/// An immutable name for what a mutable one pointed at, and what that name was
+/// found to be.
+pub const Pin = struct {
+    allocator: Allocator,
+    /// The digest-form reference, ready to be written where an immutable name
+    /// is wanted: `docker://<authority>/<repository>@sha256:<hex>`.
+    reference: []u8,
+    /// The digest of the document the selection named at the moment of pinning.
+    digest: []u8,
+    /// The media type of that document.
+    media_type: []u8,
+    /// The size in bytes of that document.
+    size: u64,
+    /// What the digest names.
+    kind: InspectKind,
+    /// The platform of the pinned image, present only when the digest names a
+    /// single manifest whose image configuration states one. An index covers
+    /// many platforms and pins to none of them: which one a build uses is
+    /// settled when the image is loaded, not when it is pinned.
+    platform: ?Platform = null,
+
+    pub fn deinit(self: *Pin) void {
+        self.allocator.free(self.reference);
+        self.allocator.free(self.digest);
+        self.allocator.free(self.media_type);
+        if (self.platform) |*value| value.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
 pub const Source = struct {
     io: Io,
     allocator: Allocator,
@@ -655,8 +685,64 @@ pub const Source = struct {
         );
     }
 
-    fn addCertificateAuthority(self: *Source, path: []const u8) !void {
-        const now = Io.Clock.real.now(self.io);
+    /// Resolves a reference to the digest it names *right now*, so a caller can
+    /// record an immutable name for a mutable one.
+    ///
+    /// This is deliberately impure and deliberately not part of any plan: two
+    /// calls against the same tag may disagree, because the tag may have moved
+    /// between them. That is what makes pinning something a person does once
+    /// and commits, the way a lock file is written once and committed, rather
+    /// than something a build repeats and hopes stays still.
+    ///
+    /// A reference that already names a digest pins to itself and the round
+    /// trip confirms the registry serves it.
+    ///
+    /// The platform is reported only for a single manifest, whose image
+    /// configuration states one. An index is pinned as an index: it covers many
+    /// platforms, and choosing among them belongs to the load that consumes it.
+    pub fn pin(self: *Source, source: reference.RegistryReference) !Pin {
+        var resolved = try self.resolve(source);
+        defer resolved.deinit();
+        var active = std.StringHashMap(void).init(self.allocator);
+        defer active.deinit();
+        var inspector = Inspector{ .allocator = self.allocator, .source = self.asTransport() };
+        // Depth zero and no recursion: the pinned document is the only one that
+        // matters, and walking an index's children would be a request per
+        // platform to learn nothing the pin records.
+        var node = try inspector.inspectDocument(resolved.descriptor, resolved.bytes, 0, 0, &active, false);
+        defer node.deinit(self.allocator);
+        const reference_text = try std.fmt.allocPrint(
+            self.allocator,
+            "docker://{s}/{s}@{s}",
+            .{ self.authority, self.repository, resolved.descriptor.digest },
+        );
+        errdefer self.allocator.free(reference_text);
+        const digest_text = try self.allocator.dupe(u8, resolved.descriptor.digest);
+        errdefer self.allocator.free(digest_text);
+        const media_type = try self.allocator.dupe(u8, resolved.descriptor.mediaType orelse return error.InvalidManifest);
+        errdefer self.allocator.free(media_type);
+        var platform: ?Platform = null;
+        if (node.kind == .manifest) {
+            if (node.descriptor.platform) |*found| {
+                platform = try ownedPlatform(self.allocator, .{
+                    .os = found.os,
+                    .architecture = found.architecture,
+                    .variant = found.variant,
+                });
+            }
+        }
+        return .{
+            .allocator = self.allocator,
+            .reference = reference_text,
+            .digest = digest_text,
+            .media_type = media_type,
+            .size = resolved.descriptor.size,
+            .kind = node.kind,
+            .platform = platform,
+        };
+    }
+
+    fn addCertificateAuthority(self: *Source, path: []const u8) !void {        const now = Io.Clock.real.now(self.io);
         self.client.ca_bundle.rescan(self.allocator, self.io, now) catch return error.CertificateAuthorityLoadFailed;
         var file = if (std.fs.path.isAbsolute(path))
             Io.Dir.openFileAbsolute(self.io, path, .{}) catch return error.CertificateAuthorityLoadFailed
@@ -2169,6 +2255,26 @@ pub fn copyLayoutToRegistry(
     var target = try Destination.init(io, allocator, environ, destination, destination_options);
     defer target.deinit();
     return target.copyFromLayout(source, options);
+}
+
+/// Convenience high-level API for pinning a registry reference to a digest.
+/// The reference text is parsed in `.source` mode, so a selection is required
+/// and a bare repository is refused.
+pub fn pinReference(
+    io: Io,
+    allocator: Allocator,
+    environ: std.process.Environ,
+    reference_text: []const u8,
+    options: Options,
+) !Pin {
+    const parsed = try reference.parse(reference_text, .source);
+    const source = switch (parsed) {
+        .registry => |value| value,
+        .layout => return error.InvalidRegistryUrl,
+    };
+    var client = try Source.init(io, allocator, environ, source, options);
+    defer client.deinit();
+    return client.pin(source);
 }
 
 const manifest_accept =

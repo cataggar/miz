@@ -9,18 +9,19 @@ zvmi oci copy --override-os linux --override-arch arm64 oci:./layout:stable dock
 zvmi oci copy --all docker://registry.example/team/image:stable oci:./complete:stable
 zvmi oci inspect oci:./layout:stable
 zvmi oci list-tags docker://registry.example/team/image
+zvmi oci pin docker://registry.example/team/image:stable
 zvmi oci unpack --image oci:./layout:stable ./bundle
 zvmi oci repack --image oci:./layout:edited ./bundle
 zvmi oci config --image oci:./layout:edited
 ```
 
 `copy`, `unpack`, and `repack` print the committed or selected root digest.
-`inspect`, `list-tags`, and `config` print JSON. Diagnostics are written to
-stderr.
+`pin` prints a digest-form reference, or JSON with `--json`. `inspect`,
+`list-tags`, and `config` print JSON. Diagnostics are written to stderr.
 
 ## References
 
-Registry references are explicit: `docker://host[:port]/repository:tag` or `docker://host[:port]/repository@sha256:<hex>`. Copy and inspect require a tag or digest; list-tags requires a repository with neither. There is no implicit Docker Hub, `latest`, or unqualified-name search.
+Registry references are explicit: `docker://host[:port]/repository:tag` or `docker://host[:port]/repository@sha256:<hex>`. Copy, inspect, and pin require a tag or digest; list-tags requires a repository with neither. There is no implicit Docker Hub, `latest`, or unqualified-name search.
 
 Local references are `oci:<path>[:name]` or `oci:<path>@sha256:<hex>`. A source without a selector is accepted only when `index.json` has one unambiguous descriptor. A name is the top-level `org.opencontainers.image.ref.name` annotation. A destination without a name creates an unannotated root descriptor.
 
@@ -104,11 +105,35 @@ layout garbage collection.
 `config --image ...` resolves the same selected image and prints its verified
 image-configuration JSON without rewriting extension fields.
 
+## Pinning a tag to a digest
+
+```console
+zvmi oci pin docker://registry.example/team/image:stable
+docker://registry.example/team/image@sha256:...
+```
+
+`pin` resolves a reference to the digest it names *right now* and prints the
+digest-form reference. It is deliberately impure: two runs against the same tag
+may disagree, because the tag may have moved between them. Pinning is therefore
+something a person does once and commits, the way a lock file is written once
+and committed -- not something a build repeats and hopes stays still.
+
+A reference that already names a digest pins to itself, and the round trip
+confirms the registry serves it.
+
+An index pins to the index. It covers many platforms and pins to none of them:
+choosing among them belongs to the load that consumes the image, and walking
+the children would be a request per platform to learn nothing the pin records.
+A single manifest also reports the platform its image configuration states.
+
+`--json` prints `schema_version`, `requested`, `reference`, `media_type`,
+`digest`, `size`, `kind`, and `platform`.
+
 ## Registry options and authentication
 
 HTTPS with system trust and hostname verification is the default. `--tls-ca <pem>` adds certificates to system trust. There is no certificate-verification bypass. `--plain-http` is intended for development registries; credentials and bearer tokens are rejected over non-loopback HTTP.
 
-Copy has separate `--src-authfile`, `--src-tls-ca`, `--src-plain-http`, `--dest-authfile`, `--dest-tls-ca`, and `--dest-plain-http` options. Inspect and list-tags use `--authfile`, `--tls-ca`, and `--plain-http`. Supplying registry options for a local layout is an error.
+Copy has separate `--src-authfile`, `--src-tls-ca`, `--src-plain-http`, `--dest-authfile`, `--dest-tls-ca`, and `--dest-plain-http` options. Inspect, list-tags, and pin use `--authfile`, `--tls-ca`, and `--plain-http`. Supplying registry options for a local layout is an error.
 
 Credential lookup order is:
 
@@ -136,6 +161,8 @@ Responses use identity encoding. Metadata is bounded to 16 MiB, response headers
 Inspect output has `schema_version`, `reference`, `media_type`, `digest`, `size`, `kind`, `annotations`, `platform`, `config`, `layers`, and `manifests`. Descriptors include media type, digest, size, annotations, and platform where applicable. Selected-platform inspection returns a manifest; `--all` returns the recursive index graph.
 
 Tag output has `schema_version`, `repository`, and a deduplicated, lexically sorted `tags` array. Pagination is automatic and bounded.
+
+Pin output has `schema_version`, `requested`, `reference`, `media_type`, `digest`, `size`, `kind`, and `platform`. `platform` is null for an index.
 
 ## Current limits
 
