@@ -127,6 +127,42 @@ pub const Container = union(enum) {
     oci_layout: std.Build.LazyPath,
     /// A docker/podman save archive.
     archive: std.Build.LazyPath,
+    /// An image the run fetches for itself.
+    ///
+    /// Different from pulling with `addOciPull` and passing the layout: that
+    /// acquires the image outside the request, so the plan says "a directory"
+    /// and the provenance records a path in the build cache. This puts the
+    /// acquisition inside the request, so the plan names the image, the pull
+    /// is a published operation with a capability behind it, and provenance
+    /// records the digest. Use `addOciPull` when other steps also need the
+    /// layout; use this when the image is an input to one build.
+    registry: Registry,
+};
+
+/// A registry image an image build declares as its container input.
+///
+/// There is no `authfile` here, unlike `addOciPull`. A customize run states
+/// its credential rather than discovering one, so that the plan hash covers
+/// where the password comes from; an authfile is the discovery mechanism that
+/// makes a build depend on the machine it ran on.
+pub const Registry = struct {
+    /// A `docker://<authority>/<repository>` reference. A tag is resolved to
+    /// the digest it names when the build runs, and the build prints what it
+    /// resolved to; a digest is used as given.
+    reference: []const u8,
+    /// The identity to authenticate as, or none to authenticate as nobody.
+    username: ?[]const u8 = null,
+    /// A file holding the password, tracked like any other build input. The
+    /// build reads it when the pull needs it, and never puts its contents in
+    /// the plan or the provenance.
+    password_file: ?std.Build.LazyPath = null,
+    /// A variable of the build's own environment holding the password. Named
+    /// rather than read here, so the value never enters the build graph.
+    password_environment_variable: ?[]const u8 = null,
+    /// A PEM file of additional certificate authorities for this registry.
+    tls_ca: ?std.Build.LazyPath = null,
+    /// Speak plain HTTP. For a development registry on loopback only.
+    plain_http: bool = false,
 };
 
 pub const Input = struct {
@@ -354,6 +390,7 @@ pub const Result = struct {
 const TrackedContainer = union(enum) {
     oci_layout: std.Build.LazyPath,
     archive: std.Build.LazyPath,
+    registry: Registry,
 };
 
 pub fn add(
@@ -376,6 +413,26 @@ pub fn add(
             break :blk .{ .oci_layout = tracked_layout };
         },
         .archive => |archive| .{ .archive = archive },
+        // Nothing to validate or snapshot: there is no directory on this
+        // machine yet, and the request itself refuses a reference that names
+        // anything but exact bytes.
+        .registry => |declared| blk: {
+            if (declared.username == null and
+                (declared.password_file != null or declared.password_environment_variable != null))
+            {
+                @panic("a registry password needs a registry user name");
+            }
+            if (declared.username != null and
+                declared.password_file == null and
+                declared.password_environment_variable == null)
+            {
+                @panic("a registry user name needs a registry password");
+            }
+            if (declared.password_file != null and declared.password_environment_variable != null) {
+                @panic("a registry password comes from a file or from the environment, not both");
+            }
+            break :blk .{ .registry = declared };
+        },
     };
 
     const preflight = b.addRunArtifact(dependency.artifact("zvmi-image-builder"));
@@ -732,6 +789,22 @@ fn configureRequest(
     switch (container) {
         .oci_layout => |layout| run.addDirectoryArg(layout),
         .archive => |archive| run.addFileArg(archive),
+        .registry => |declared| {
+            run.addArg(declared.reference);
+            if (declared.username) |name| run.addArgs(&.{ "--registry-username", name });
+            if (declared.password_file) |path| {
+                run.addArg("--registry-password-file");
+                run.addFileArg(path);
+            }
+            if (declared.password_environment_variable) |name| {
+                run.addArgs(&.{ "--registry-password-env", name });
+            }
+            if (declared.tls_ca) |path| {
+                run.addArg("--registry-tls-ca");
+                run.addFileArg(path);
+            }
+            if (declared.plain_http) run.addArg("--registry-plain-http");
+        },
     }
     run.addArgs(&.{ "--generation", options.generation.cliName() });
     run.addArgs(&.{ "--size", b.fmt("{d}", .{options.size}) });

@@ -204,6 +204,29 @@ const image = zvmi.addImage(b, dependency, .{
 
 `addOciPull` requires a fully qualified `docker://` SHA-256 digest reference and rejects mutable tags while constructing the build graph. Its selected platform defaults to the build host and may be overridden explicitly; all-platform pulls are intentionally not representable because `addImage` consumes a leaf manifest. `authfile` and `tls_ca` are tracked `LazyPath` inputs, and `plain_http` is an explicit development-registry opt-in. The result exposes `layout` and the underlying run `step`; the network request runs only when a dependent build step needs the layout. `zvmi oci pin docker://…:tag` prints the digest-form reference this option requires, so the tag is resolved once by a person and committed rather than resolved again by every build.
 
+`addImage` also accepts a registry image directly, which acquires it *inside* the request rather than beside it:
+
+```zig
+const image = zvmi.addImage(b, dependency, .{
+    .name = "appliance",
+    .input = .{
+        .iso = b.path("inputs/azurelinux.iso"),
+        .container = .{ .registry = .{
+            .reference = "docker://registry.example/team/appliance@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            // Optional, and both halves or neither:
+            // .username = "builder",
+            // .password_file = b.path("registry-password"),
+            // or .password_environment_variable = "REGISTRY_PASSWORD",
+        } },
+    },
+    // Remaining image options...
+});
+```
+
+The difference from `addOciPull` is where the acquisition lives. `addOciPull` produces a layout directory, so the request that consumes it says "a directory" and the provenance it produces records a path in the build cache. `.registry` puts the image in the request: the plan names it, the pull is a published `pull_container_image` operation with a `registry_access` capability behind it, and provenance records the manifest digest, media type and platform rather than a path that is gone by the time anyone reads the record. Use `addOciPull` when several steps need the same layout; use `.registry` when the image is an input to one image build.
+
+A tag is accepted here and resolved before the request is built, with the resolved digest printed on stderr; the request itself still only ever holds a digest. Unlike `addOciPull` there is no `authfile`: a build states its credential so the plan hash can cover where the password comes from, and it reads none of the six ambient credential locations even when it declares none. See [Registry options and authentication](oci.md#registry-options-and-authentication).
+
 `addImage` also accepts `.journal` and `.journal_size` for the root ext4 filesystem. Both default to journal-less output, which suits a purpose-built appliance whose root is effectively read-only; set `.journal = true` for an image that boots into a mutable root filesystem, where an unclean shutdown would otherwise leave nothing to replay and force a full `fsck`. Left unset, `.journal_size` follows `mke2fs`'s own scale (4 MiB below 128 MiB, 16 MiB below 1 GiB, 32 MiB below 2 GiB, 64 MiB below 16 GiB, up to 1 GiB). It cannot be combined with `.verity`, whose root is mounted read-only over a hash tree and has nothing to journal. See [Journalling the root filesystem](image-building.md#journalling-the-root-filesystem).
 
 `addImage` accepts ordered file/directory/symlink/removal/metadata operations, hostname, groups, users and SSH keys, systemd service state, kernel-module settings, and Azure generalization. File inputs may be inline bytes or tracked `LazyPath` values; plaintext passwords are intentionally not representable, so callers must lock an account or provide a crypt-style pre-hashed value. The helper also returns `plan_path`, `diagnostics_path`, and `provenance_path` from image execution, plus `preflight_plan_path`, `preflight_diagnostics_path`, and `preflight_provenance_path` from a separate non-cacheable capability check. The preflight artifacts remain consumable even when its status gate blocks image execution; unavailable plan or provenance documents contain JSON `null`, while diagnostics explains the failure. Preflight and execution use separate build-cache bundle paths, so their plan hashes intentionally differ; execution repeats preflight against its exact resolved plan before mutation. Successful execution bundles are reused only when a content key covering the host builder, complete request arguments, ISO, container, customization document, and tracked files still matches; failed or stale bundles are cleared and retried instead of becoming permanent cache hits. The target architecture, rootfs path, deterministic seed, and source timestamp are explicit inputs; the resolved plan records generated identifiers and operation ordering, while provenance records source, final root-tree, and output SHA-256 hashes.

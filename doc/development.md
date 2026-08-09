@@ -87,9 +87,17 @@ zvmi/
         build_image.zig        # ISO + OCI -> raw/fixed-VHD orchestration
         formats.zig           # Format enum (raw, vhd, vhdx, qcow2)
         size.zig              # qemu-img-style size suffix parsing (K/M/G/T)
+  build/
+    image.zig               # `addImage`: the exported std.Build helper that
+                              #   declares an image build, including the
+                              #   registry image an input may name
+    oci.zig                 # `addOciPull`: pull a layout beside a build
   cli/
     src/
       main.zig               # `zvmi` executable entry point
+      image_builder.zig      # `zvmi-image-builder`: turns declared arguments
+                              #   into a customize request; pins a registry
+                              #   tag before the request is built
       commands/
         create.zig            # `zvmi create`
         info.zig              # `zvmi info`

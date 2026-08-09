@@ -9049,6 +9049,65 @@ pub const RegistryPull = struct {
     }
 };
 
+/// Opens a registry client for a declared image, on the terms the request
+/// declared and no others.
+///
+/// One function rather than one per caller, so that pinning a reference and
+/// pulling it cannot disagree about which identity they used or about whether
+/// they were allowed to look for one.
+fn openDeclaredRegistry(
+    allocator: Allocator,
+    io: Io,
+    environ: std.process.Environ,
+    source_reference: oci.reference.RegistryReference,
+    access: RegistryAccess,
+) !oci.registry.Source {
+    var material: ?[]u8 = null;
+    // `Source.init` takes its own copy of a supplied credential, so the
+    // material this frame read is dead the moment it returns -- successfully
+    // or not.
+    defer if (material) |bytes| {
+        std.crypto.secureZero(u8, bytes);
+        allocator.free(bytes);
+    };
+    var supplied: ?oci.auth.SuppliedCredential = null;
+    if (access.credential) |declared| {
+        material = try credential_mod.readMaterial(allocator, io, environ, declared.password, false);
+        supplied = .{ .username = declared.username, .secret = material.? };
+    }
+    return oci.registry.Source.init(io, allocator, environ, source_reference, .{
+        .plain_http = access.plain_http,
+        .tls_ca = access.tls_ca,
+        .credential = supplied,
+        .discover_credential = false,
+    });
+}
+
+/// Resolves a reference to the digest it names right now, on a declared
+/// registry's terms.
+///
+/// For the step before a request exists: a person holds a tag, and a request
+/// may only hold a digest. Separate from `oci.pinRegistryImage`, which a
+/// command-line tool uses and which still discovers a credential the way a
+/// person at a terminal expects, because a build that is about to commit to
+/// this digest should reach the registry as the identity it declared.
+pub fn pinDeclaredImage(
+    allocator: Allocator,
+    io: Io,
+    environ: std.process.Environ,
+    reference_text: []const u8,
+    access: RegistryAccess,
+) !oci.registry.Pin {
+    const parsed = try oci.reference.parse(reference_text, .source);
+    const source_reference = switch (parsed) {
+        .registry => |value| value,
+        .layout => return error.InvalidRegistryReference,
+    };
+    var source = try openDeclaredRegistry(allocator, io, environ, source_reference, access);
+    defer source.deinit();
+    return source.pin(source_reference);
+}
+
 /// Copies the digest-pinned image an input names into the run's transaction
 /// directory, and reports what it found there.
 ///
@@ -9078,26 +9137,7 @@ pub fn pullRegistryImage(
         .layout => return error.InvalidRegistryReference,
     };
 
-    var material: ?[]u8 = null;
-    defer if (material) |bytes| {
-        std.crypto.secureZero(u8, bytes);
-        allocator.free(bytes);
-    };
-    var supplied: ?oci.auth.SuppliedCredential = null;
-    if (image.access.credential) |declared| {
-        // Read as late as possible and never retained: the bytes live in this
-        // frame, are handed to the client by reference, and are zeroed on the
-        // way out whether the pull succeeded or not.
-        material = try credential_mod.readMaterial(allocator, io, environ, declared.password, false);
-        supplied = .{ .username = declared.username, .secret = material.? };
-    }
-
-    var source = try oci.registry.Source.init(io, allocator, environ, source_reference, .{
-        .plain_http = image.access.plain_http,
-        .tls_ca = image.access.tls_ca,
-        .credential = supplied,
-        .discover_credential = false,
-    });
+    var source = try openDeclaredRegistry(allocator, io, environ, source_reference, image.access);
     defer source.deinit();
 
     var pin = try source.pin(source_reference);
