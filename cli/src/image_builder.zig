@@ -157,7 +157,7 @@ pub fn main(init: std.process.Init) !void {
         .target_architecture = args.architecture,
         .input = .{ .iso_oci = .{
             .iso_path = args.iso_path,
-            .container_path = args.container_path,
+            .container = .{ .host_path = args.container_path },
             .rootfs_path_in_iso = args.rootfs_path,
         } },
         .output = .{

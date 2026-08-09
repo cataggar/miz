@@ -124,9 +124,29 @@ pub const Uuid = struct {
     }
 };
 
+/// Where the container half of an `iso_oci` input comes from.
+///
+/// A union rather than a path beside an optional alternative: "both set" and
+/// "neither set" would otherwise be expressible, and every caller would have to
+/// be told which one wins.
+pub const ContainerSource = union(enum) {
+    /// An OCI image-layout directory or a docker/podman save archive on the
+    /// build machine.
+    host_path: []const u8,
+
+    /// The build-machine path this source reads, when it reads one. Used by the
+    /// checks that keep a build from writing into its own input; a source that
+    /// is not a local path gives them nothing to guard.
+    pub fn hostPath(self: ContainerSource) ?[]const u8 {
+        return switch (self) {
+            .host_path => |path| if (path.len == 0) null else path,
+        };
+    }
+};
+
 pub const IsoOciInput = struct {
     iso_path: []const u8,
-    container_path: []const u8,
+    container: ContainerSource,
     rootfs_path_in_iso: ?[]const u8,
 };
 
@@ -1223,8 +1243,10 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
             if (input.iso_path.len == 0) {
                 try diagnostics.append(validationError(.missing_input_path, "/input/iso_oci/iso_path", "ISO path must not be empty", null));
             }
-            if (input.container_path.len == 0) {
-                try diagnostics.append(validationError(.missing_input_path, "/input/iso_oci/container_path", "container path must not be empty", null));
+            switch (input.container) {
+                .host_path => |path| if (path.len == 0) {
+                    try diagnostics.append(validationError(.missing_input_path, "/input/iso_oci/container/host_path", "container path must not be empty", null));
+                },
             }
             if (input.rootfs_path_in_iso == null or input.rootfs_path_in_iso.?.len == 0) {
                 try diagnostics.append(validationError(
@@ -1570,7 +1592,7 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
             .iso_oci => |input| {
                 const iso_path = if (input.iso_path.len != 0) try std.fs.path.resolve(allocator, &.{input.iso_path}) else null;
                 defer if (iso_path) |path| allocator.free(path);
-                const container_path = if (input.container_path.len != 0) try std.fs.path.resolve(allocator, &.{input.container_path}) else null;
+                const container_path = if (input.container.hostPath()) |path| try std.fs.path.resolve(allocator, &.{path}) else null;
                 defer if (container_path) |path| allocator.free(path);
                 if ((iso_path != null and std.mem.eql(u8, output_path, iso_path.?)) or
                     (container_path != null and
@@ -3222,7 +3244,7 @@ pub const OutputIdentifiers = struct {
 
 pub const ResolvedIsoOciInput = struct {
     iso_path: []const u8,
-    container_path: []const u8,
+    container: ContainerSource,
     rootfs_path_in_iso: []const u8,
 };
 
@@ -3461,11 +3483,15 @@ pub fn resolve(
         .iso_oci => |input| {
             const checked_iso_path = try std.fs.path.resolve(allocator, &.{ context.base_path, input.iso_path });
             defer allocator.free(checked_iso_path);
-            const checked_container_path = try std.fs.path.resolve(allocator, &.{ context.base_path, input.container_path });
-            defer allocator.free(checked_container_path);
+            const checked_container_path = if (input.container.hostPath()) |path|
+                try std.fs.path.resolve(allocator, &.{ context.base_path, path })
+            else
+                null;
+            defer if (checked_container_path) |path| allocator.free(path);
             if (std.mem.eql(u8, checked_output_path, checked_iso_path) or
-                std.mem.eql(u8, checked_output_path, checked_container_path) or
-                pathContains(checked_container_path, checked_output_path))
+                (checked_container_path != null and
+                    (std.mem.eql(u8, checked_output_path, checked_container_path.?) or
+                        pathContains(checked_container_path.?, checked_output_path))))
             {
                 try resolution_diagnostics.append(.{
                     .severity = .@"error",
@@ -3593,7 +3619,11 @@ pub fn resolve(
     const resolved_input: ResolvedInput = switch (request.input) {
         .iso_oci => |input| .{ .iso_oci = .{
             .iso_path = try std.fs.path.resolve(plan_allocator, &.{ context.base_path, input.iso_path }),
-            .container_path = try std.fs.path.resolve(plan_allocator, &.{ context.base_path, input.container_path }),
+            .container = switch (input.container) {
+                .host_path => |path| .{
+                    .host_path = try std.fs.path.resolve(plan_allocator, &.{ context.base_path, path }),
+                },
+            },
             .rootfs_path_in_iso = try plan_allocator.dupe(u8, input.rootfs_path_in_iso.?),
         } },
         .disk => |input| .{ .disk = .{
@@ -4530,10 +4560,15 @@ fn buildCapabilities(
 
     switch (input) {
         .iso_oci => |iso_oci| {
+            const container_path = iso_oci.container.hostPath();
             try capabilities.append(.{ .kind = .read_iso, .path = iso_oci.iso_path, .reason = "read the source ISO" });
-            try capabilities.append(.{ .kind = .read_container, .path = iso_oci.container_path, .reason = "read the source OCI layout or archive" });
+            if (container_path) |path| {
+                try capabilities.append(.{ .kind = .read_container, .path = path, .reason = "read the source OCI layout or archive" });
+            }
             try appendIsolationCapability(&capabilities, output.path, iso_oci.iso_path, "keep the output distinct from the source ISO");
-            try appendIsolationCapability(&capabilities, output.path, iso_oci.container_path, "keep the output outside the source container");
+            if (container_path) |path| {
+                try appendIsolationCapability(&capabilities, output.path, path, "keep the output outside the source container");
+            }
         },
         .disk => |disk| {
             try capabilities.append(.{ .kind = .read_disk, .path = disk.path, .reason = "read the preserved source disk without write access" });
@@ -5004,7 +5039,7 @@ fn deriveNonzeroU32(seed: Seed, label: []const u8) u32 {
 
 fn hashPlan(plan: ResolvedPlanData) Digest {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("zvmi-resolved-plan-v3\x00");
+    hash.update("zvmi-resolved-plan-v4\x00");
     hashInt(&hash, plan.schema_version);
     hashInt(&hash, plan.request_api_version);
     hashInt(&hash, @intFromEnum(plan.architectures.host));
@@ -5016,7 +5051,10 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     switch (plan.input) {
         .iso_oci => |input| {
             hashString(&hash, input.iso_path);
-            hashString(&hash, input.container_path);
+            hashInt(&hash, @intFromEnum(std.meta.activeTag(input.container)));
+            switch (input.container) {
+                .host_path => |path| hashString(&hash, path),
+            }
             hashString(&hash, input.rootfs_path_in_iso);
         },
         .disk => |input| {
@@ -7368,7 +7406,9 @@ fn buildResult(
     const input: ResolvedInput = switch (plan.data.input) {
         .iso_oci => |value| .{ .iso_oci = .{
             .iso_path = try result_allocator.dupe(u8, value.iso_path),
-            .container_path = try result_allocator.dupe(u8, value.container_path),
+            .container = switch (value.container) {
+                .host_path => |path| .{ .host_path = try result_allocator.dupe(u8, path) },
+            },
             .rootfs_path_in_iso = try result_allocator.dupe(u8, value.rootfs_path_in_iso),
         } },
         .disk => |value| .{ .disk = .{
@@ -8507,7 +8547,9 @@ fn buildOptionsFromPlan(
     const storage = plan.data.storage.fresh;
     return .{
         .iso_path = input.iso_path,
-        .container_path = input.container_path,
+        .container_path = switch (input.container) {
+            .host_path => |path| path,
+        },
         .output_path = plan.data.staging_output_path,
         .size = plan.data.output.disk_size,
         .generation = storage.generation,
@@ -8860,7 +8902,9 @@ fn hashPlanSources(
     switch (plan.data.input) {
         .iso_oci => |input| {
             try appendHashedSource(&records, allocator, io, .iso, input.iso_path);
-            try appendHashedSource(&records, allocator, io, .container, input.container_path);
+            switch (input.container) {
+                .host_path => |path| try appendHashedSource(&records, allocator, io, .container, path),
+            }
         },
         .disk => |input| {
             if (diskDependenciesAvailable(io, input, plan.data.output.path) != .available) {
@@ -9079,7 +9123,7 @@ fn validRequest() Request {
         .target_architecture = .x86_64,
         .input = .{ .iso_oci = .{
             .iso_path = "source.iso",
-            .container_path = "oci-layout",
+            .container = .{ .host_path = "oci-layout" },
             .rootfs_path_in_iso = "images/rootfs.squashfs",
         } },
         .output = .{
@@ -9754,7 +9798,7 @@ test "v2 native-fresh requests require the explicit adapter" {
         .target_architecture = .x86_64,
         .input = .{ .iso_oci = .{
             .iso_path = "source.iso",
-            .container_path = "oci-layout",
+            .container = .{ .host_path = "oci-layout" },
             .rootfs_path_in_iso = "images/rootfs.squashfs",
         } },
         .output = .{
@@ -11001,6 +11045,47 @@ test "validation reports multiple problems without mutating the request" {
     try std.testing.expect(std.meta.eql(before, request));
 }
 
+test "a host-path container keeps the diagnostics, capabilities and plan it always had" {
+    {
+        var request = validRequest();
+        request.input.iso_oci.container = .{ .host_path = "" };
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        var found = false;
+        for (diagnostics.items) |diagnostic| {
+            if (diagnostic.code != .missing_input_path) continue;
+            if (!std.mem.eql(u8, diagnostic.configuration_path, "/input/iso_oci/container/host_path")) continue;
+            found = true;
+        }
+        try std.testing.expect(found);
+    }
+
+    var request = validRequest();
+    var resolved = try resolve(
+        std.testing.allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    const plan = resolved.plan orelse return error.TestUnexpectedResult;
+
+    const container = plan.data.input.iso_oci.container;
+    try std.testing.expect(container == .host_path);
+    const expected_container = try std.fs.path.resolve(std.testing.allocator, &.{ ".", "oci-layout" });
+    defer std.testing.allocator.free(expected_container);
+    try std.testing.expectEqualStrings(expected_container, container.host_path);
+
+    var read_container_path: ?[]const u8 = null;
+    var isolation_paths: usize = 0;
+    for (plan.data.required_capabilities) |capability| switch (capability.kind) {
+        .read_container => read_container_path = capability.path,
+        .path_isolation => isolation_paths += 1,
+        else => {},
+    };
+    try std.testing.expectEqualStrings(container.host_path, read_container_path.?);
+    try std.testing.expectEqual(@as(usize, 2), isolation_paths);
+}
+
 test "validation rejects normalized source aliases and unsupported aarch64 BIOS" {
     var request = validRequest();
     request.input.iso_oci.iso_path = "./output.qcow2";
@@ -11532,7 +11617,7 @@ test "preflight accepts a missing but creatable output directory" {
 
     var request = validRequest();
     request.input.iso_oci.iso_path = iso_path;
-    request.input.iso_oci.container_path = container_path;
+    request.input.iso_oci.container = .{ .host_path = container_path };
     request.output.path = workspace_path ++ "/output.raw";
     request.output.format = .raw;
     request.execution.workspace_path = workspace_path;
@@ -11615,7 +11700,7 @@ test "failed execution leaves no final output and removes its transaction" {
     var request = validRequest();
     request.input = .{ .iso_oci = .{
         .iso_path = iso_path,
-        .container_path = container_path,
+        .container = .{ .host_path = container_path },
         .rootfs_path_in_iso = "rootfs.squashfs",
     } };
     request.output = .{ .path = output_path, .format = .raw, .size = 128 * mib };
@@ -11704,7 +11789,7 @@ test "successful execution commits output and emits provenance" {
     };
     request.input = .{ .iso_oci = .{
         .iso_path = iso_path,
-        .container_path = container_path,
+        .container = .{ .host_path = container_path },
         .rootfs_path_in_iso = "rootfs.squashfs",
     } };
     request.output = .{ .path = output_path, .format = .raw, .size = 128 * mib };
@@ -11784,7 +11869,7 @@ test "a backend that generated no boot entries records no kernel command line" {
     var request = validRequest();
     request.input = .{ .iso_oci = .{
         .iso_path = iso_path,
-        .container_path = container_path,
+        .container = .{ .host_path = container_path },
         .rootfs_path_in_iso = "rootfs.squashfs",
     } };
     request.output = .{ .path = output_path, .format = .raw, .size = 128 * mib };
@@ -11865,7 +11950,7 @@ test "a fresh COSI request publishes a bundle built from the staged image" {
     var request = validRequest();
     request.input = .{ .iso_oci = .{
         .iso_path = iso_path,
-        .container_path = container_path,
+        .container = .{ .host_path = container_path },
         .rootfs_path_in_iso = "rootfs.squashfs",
     } };
     request.output = .{ .path = output_path, .format = .cosi, .size = 128 * mib };
@@ -12270,7 +12355,7 @@ test "execution never publishes while a backend lease remains active" {
     var request = validRequest();
     request.input = .{ .iso_oci = .{
         .iso_path = iso_path,
-        .container_path = container_path,
+        .container = .{ .host_path = container_path },
         .rootfs_path_in_iso = "rootfs.squashfs",
     } };
     request.output = .{ .path = output_path, .format = .raw, .size = 128 * mib };
@@ -12382,7 +12467,7 @@ test "execution rejects a customization source changed during the build" {
     var request = validRequest();
     request.input = .{ .iso_oci = .{
         .iso_path = iso_path,
-        .container_path = container_path,
+        .container = .{ .host_path = container_path },
         .rootfs_path_in_iso = "rootfs.squashfs",
     } };
     request.output = .{ .path = output_path, .format = .raw, .size = 128 * mib };
