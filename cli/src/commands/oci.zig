@@ -12,6 +12,7 @@ const usage =
     \\  zvmi oci copy [options] <source> <destination>
     \\  zvmi oci inspect [options] <source>
     \\  zvmi oci list-tags [options] docker://<registry>/<repository>
+    \\  zvmi oci pin [options] docker://<registry>/<repository>:<tag>
     \\  zvmi oci unpack [options] --image oci:<layout>[:tag] <bundle>
     \\  zvmi oci repack --image oci:<layout>:<tag> <bundle>
     \\  zvmi oci config [options] --image oci:<layout>[:tag]
@@ -38,6 +39,12 @@ const usage =
     \\  --authfile <path>
     \\  --tls-ca <path>
     \\  --plain-http
+    \\
+    \\pin options:
+    \\  --authfile <path>
+    \\  --tls-ca <path>
+    \\  --plain-http
+    \\  --json
     \\
     \\unpack options:
     \\  --image <reference>
@@ -163,6 +170,12 @@ const TagsArgs = struct {
     endpoint: EndpointOptions,
 };
 
+const PinArgs = struct {
+    source: []const u8,
+    endpoint: EndpointOptions,
+    json: bool,
+};
+
 const UnpackArgs = struct {
     source: []const u8,
     destination: []const u8,
@@ -207,6 +220,11 @@ pub fn run(
         const parsed = parseTags(args[1..]) catch |err|
             return argumentFailure("list-tags", err);
         return runTags(allocator, io, environ, parsed);
+    }
+    if (std.mem.eql(u8, args[0], "pin")) {
+        const parsed = parsePin(args[1..]) catch |err|
+            return argumentFailure("pin", err);
+        return runPin(allocator, io, environ, parsed);
     }
     if (std.mem.eql(u8, args[0], "unpack")) {
         const parsed = parseUnpack(args[1..]) catch |err|
@@ -627,8 +645,98 @@ fn runTags(
     return 0;
 }
 
-fn parseCopy(args: []const []const u8) ParseError!CopyArgs {
-    var source_options: EndpointOptions = .{};
+fn runPin(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: std.process.Environ,
+    args: PinArgs,
+) u8 {
+    const parsed = oci.reference.parse(args.source, .source) catch |err|
+        return fail("zvmi oci pin: invalid source '{s}': {s}", .{ args.source, @errorName(err) });
+    const source = switch (parsed) {
+        .registry => |value| value,
+        .layout => return fail(
+            "zvmi oci pin: source must be a registry reference: '{s}'",
+            .{args.source},
+        ),
+    };
+    var client = oci.registry.Source.init(
+        io,
+        allocator,
+        environ,
+        source,
+        args.endpoint.registry(),
+    ) catch |err| return fail(
+        "zvmi oci pin: '{s}' failed: {s}",
+        .{ args.source, @errorName(err) },
+    );
+    defer client.deinit();
+    var result = client.pin(source) catch |err| {
+        if (client.lastError()) |status| {
+            return failRegistry("pin", args.source, status, err);
+        }
+        return fail("zvmi oci pin: '{s}' failed: {s}", .{ args.source, @errorName(err) });
+    };
+    defer result.deinit();
+    if (!args.json) {
+        writeLine(io, result.reference) catch |err|
+            return fail("zvmi oci pin: failed to write output: {s}", .{@errorName(err)});
+        return 0;
+    }
+    writeJson(io, .{
+        .schema_version = @as(u32, 1),
+        .requested = args.source,
+        .reference = result.reference,
+        .media_type = result.media_type,
+        .digest = result.digest,
+        .size = result.size,
+        .kind = result.kind,
+        .platform = if (result.platform) |value| JsonPlatform{
+            .os = value.os,
+            .architecture = value.architecture,
+            .variant = value.variant,
+        } else null,
+    }) catch |err| return fail(
+        "zvmi oci pin: failed to write output: {s}",
+        .{@errorName(err)},
+    );
+    return 0;
+}
+
+fn parsePin(args: []const []const u8) ParseError!PinArgs {
+    var endpoint: EndpointOptions = .{};
+    var source: ?[]const u8 = null;
+    var json = false;
+    var json_set = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const argument = args[i];
+        if (std.mem.eql(u8, argument, "--authfile")) {
+            endpoint.authfile = try uniqueValue(args, &i, endpoint.authfile);
+        } else if (std.mem.eql(u8, argument, "--tls-ca")) {
+            endpoint.tls_ca = try uniqueValue(args, &i, endpoint.tls_ca);
+        } else if (std.mem.eql(u8, argument, "--plain-http")) {
+            try setPlainHttp(&endpoint);
+        } else if (std.mem.eql(u8, argument, "--json")) {
+            if (json_set) return error.DuplicateOption;
+            json = true;
+            json_set = true;
+        } else if (std.mem.startsWith(u8, argument, "-")) {
+            return error.InvalidOption;
+        } else if (source == null) {
+            source = argument;
+        } else {
+            return error.InvalidArguments;
+        }
+    }
+    return .{
+        .source = source orelse return error.InvalidArguments,
+        .endpoint = endpoint,
+        .json = json,
+    };
+}
+
+fn parseCopy(args: []const []const u8) ParseError!CopyArgs {    var source_options: EndpointOptions = .{};
     var destination_options: EndpointOptions = .{};
     var platform: PlatformOptions = .{};
     var positional: [2][]const u8 = undefined;
@@ -1110,6 +1218,28 @@ test "inspect and list-tags parsers enforce their option sets" {
         error.InvalidTransportOption,
         validateEndpoint(local, .{ .plain_http = true, .plain_http_set = true }),
     );
+}
+
+test "pin parser accepts registry options and refuses platform selection" {
+    const parsed = try parsePin(&.{
+        "--authfile",
+        "auth.json",
+        "--json",
+        "docker://registry.example/team/image:latest",
+    });
+    try std.testing.expectEqualStrings("docker://registry.example/team/image:latest", parsed.source);
+    try std.testing.expectEqualStrings("auth.json", parsed.endpoint.authfile.?);
+    try std.testing.expect(parsed.json);
+    try std.testing.expectError(error.DuplicateOption, parsePin(&.{
+        "--json",
+        "--json",
+        "docker://registry.example/team/image:latest",
+    }));
+    try std.testing.expectError(error.InvalidOption, parsePin(&.{
+        "--all",
+        "docker://registry.example/team/image:latest",
+    }));
+    try std.testing.expectError(error.InvalidArguments, parsePin(&.{"--plain-http"}));
 }
 
 test "unpack parser accepts image platform and rootless options" {
