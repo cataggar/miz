@@ -382,7 +382,7 @@ pub fn main(init: std.process.Init) !void {
         .target_architecture = .x86_64,
         .input = .{ .iso_oci = .{
             .iso_path = "azurelinux.iso",
-            .container_path = "oci-layout",
+            .container = .{ .host_path = "oci-layout" },
             .rootfs_path_in_iso = "images/rootfs.squashfs",
         } },
         .output = .{ .path = "appliance.qcow2", .format = .qcow2, .size = 4 * 1024 * 1024 * 1024 },
