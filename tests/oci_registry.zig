@@ -1176,6 +1176,76 @@ fn writeAuthfile(allocator: std.mem.Allocator, io: Io, path: []const u8, authori
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = content });
 }
 
+/// Writes an authfile naming a credential the fixture rejects, so that any
+/// consultation of it is a test failure rather than an invisible fallback.
+fn writeRejectedAuthfile(allocator: std.mem.Allocator, io: Io, path: []const u8, authority: []const u8) !void {
+    const content = try std.fmt.allocPrint(allocator, "{{\"auths\":{{\"{s}\":{{\"auth\":\"d3Jvbmc6d3Jvbmc=\"}}}}}}", .{authority});
+    defer allocator.free(content);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = content });
+}
+
+fn sourceForSuppliedCredential(
+    fixture: *Fixture,
+    authfile: ?[]const u8,
+    credential: ?oci.auth.SuppliedCredential,
+) !oci.registry.Source {
+    return oci.registry.Source.init(
+        fixture.io,
+        fixture.allocator,
+        std.process.Environ.empty,
+        .{
+            .authority = fixture.authority,
+            .repository = "team/image",
+            .selection = .{ .tag = "latest" },
+        },
+        .{
+            .plain_http = true,
+            .authfile = authfile,
+            .credential = credential,
+            .sleep = .{ .context = null, .call = noSleep },
+        },
+    );
+}
+
+test "a supplied credential authenticates and suppresses credential discovery" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const authfile = "test-oci-registry-supplied-auth.json";
+    defer Io.Dir.cwd().deleteFile(io, authfile) catch {};
+    {
+        var fixture = try Fixture.init(allocator, io, .basic, 3, null);
+        defer fixture.deinit();
+        try writeRejectedAuthfile(allocator, io, authfile, fixture.authority);
+        try fixture.start();
+        var source = try sourceForSuppliedCredential(&fixture, authfile, .{ .username = "user", .secret = "secret" });
+        defer source.deinit();
+        var resolved = try source.resolve(.{
+            .authority = fixture.authority,
+            .repository = "team/image",
+            .selection = .{ .tag = "latest" },
+        });
+        defer resolved.deinit();
+        try fixture.finish();
+        try std.testing.expectEqual(AuthKind.basic, fixture.logs.items[1].auth);
+        try std.testing.expectEqualStrings(fixture.manifest, resolved.bytes);
+    }
+
+    {
+        var fixture = try Fixture.init(allocator, io, .basic, 1, null);
+        defer fixture.deinit();
+        try fixture.start();
+        var source = try sourceForSuppliedCredential(&fixture, null, null);
+        defer source.deinit();
+        try std.testing.expectError(error.AuthenticationFailed, source.resolve(.{
+            .authority = fixture.authority,
+            .repository = "team/image",
+            .selection = .{ .tag = "latest" },
+        }));
+        try fixture.finish();
+        try std.testing.expectEqual(AuthKind.none, fixture.logs.items[0].auth);
+    }
+}
+
 test "anonymous pull copies exact graph into a new layout with streamed blobs" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

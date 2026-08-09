@@ -56,7 +56,21 @@ pub const Sleep = struct {
 
 pub const Options = struct {
     plain_http: bool = false,
+    /// A credential file to search before the ambient locations. Ignored when
+    /// `credential` is supplied, because nothing is searched at all then.
     authfile: ?[]const u8 = null,
+    /// The credential to authenticate with, stated rather than discovered.
+    ///
+    /// Supplying one **disables ambient discovery entirely**: `authfile`,
+    /// `REGISTRY_AUTH_FILE`, `$XDG_RUNTIME_DIR/containers/auth.json`, the
+    /// `containers` and Docker configuration files under `$HOME`, and any
+    /// credential helper they name are never consulted. A caller that must
+    /// account for every input it depends on can therefore state this one and
+    /// know that a registry needing authentication fails as an authentication
+    /// error rather than succeeding because the machine happened to be logged
+    /// in. Leaving it `null` keeps the discovery behaviour a command-line tool
+    /// wants.
+    credential: ?auth.SuppliedCredential = null,
     tls_ca: ?[]const u8 = null,
     metadata_limit: usize = metadata_limit_default,
     sleep: ?Sleep = null,
@@ -214,6 +228,10 @@ pub const Source = struct {
             .token_cache = auth.TokenCache.init(allocator),
         };
         errdefer result.deinit();
+        if (options.credential) |supplied| {
+            result.credential = try supplied.toOwned(allocator);
+            result.credential_loaded = true;
+        }
         if (options.tls_ca) |ca_path| try result.addCertificateAuthority(ca_path);
         return result;
     }
@@ -1187,6 +1205,10 @@ pub const Source = struct {
         try self.establishAuthorization(challenges, false);
     }
 
+    /// Returns the credential to authenticate with, discovering one on first
+    /// use. A credential supplied through `Options.credential` was installed at
+    /// `init` with `credential_loaded` already set, so discovery is skipped
+    /// entirely rather than merely overridden.
     fn credentialForAuth(self: *Source) !?*const auth.Credential {
         if (!self.credential_loaded) {
             self.credential = try auth.findCredential(

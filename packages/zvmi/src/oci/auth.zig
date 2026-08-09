@@ -313,6 +313,26 @@ pub const Credential = struct {
     }
 };
 
+/// A credential a caller states rather than one discovery found. The bytes are
+/// borrowed for the duration of the call that receives it, exactly like the
+/// other borrowed option fields beside it, so a caller that holds a secret in
+/// memory it already owns never hands ownership away to learn whether it was
+/// accepted. `Credential` remains the owned form the receiver keeps.
+pub const SuppliedCredential = struct {
+    username: []const u8,
+    secret: []const u8,
+
+    /// Copies the borrowed bytes into allocator-owned memory. The result is
+    /// wiped by `Credential.deinit`; the borrowed original is not, and wiping
+    /// it stays the caller's business.
+    pub fn toOwned(self: SuppliedCredential, allocator: Allocator) Allocator.Error!Credential {
+        const username = try allocator.dupe(u8, self.username);
+        errdefer allocator.free(username);
+        const secret = try allocator.dupe(u8, self.secret);
+        return .{ .username = username, .secret = secret };
+    }
+};
+
 pub const ProcessResult = struct {
     stdout: []u8,
 

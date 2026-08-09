@@ -119,6 +119,14 @@ Credential lookup order is:
 5. `$HOME/.docker/config.json`
 6. `$HOME/.dockercfg`
 
+That order applies whenever a credential is discovered. A library caller may
+instead state one directly through `registry.Options.credential`, which
+disables discovery entirely: none of the six locations above, and no credential
+helper they name, is consulted. A registry that needs authentication then fails
+as an authentication error naming the reference rather than succeeding because
+the machine happened to be logged in. The `zvmi oci` commands do not state a
+credential and keep the discovery behaviour above.
+
 The client supports `auths`, per-registry `credHelpers`, global `credsStore`, Basic challenges, and Bearer token challenges. The `auth` field is Base64 encoding, not encryption. Credential helpers receive the registry key on stdin, never as a command argument. Credentials, bearer tokens, challenge values, and signed upload URLs are not included in diagnostics.
 
 Responses use identity encoding. Metadata is bounded to 16 MiB, response headers to 64 KiB, and blob streaming uses a 64 KiB buffer. GET and HEAD requests make at most three attempts for transient connection/status failures, with bounded `Retry-After` handling, and follow at most five redirects. HTTPS downgrade is rejected. Registry authorization is stripped from cross-origin blob and signed HTTPS upload requests; token redirects cannot cross origin.
