@@ -146,6 +146,7 @@ fn runIntegration(
         self_exe,
         source_path,
         spool_path,
+        .{},
     );
 
     const actions = [_]zvmi.customize.PackageAction{
@@ -571,6 +572,16 @@ fn runIntegration(
         architecture,
     );
 
+    try runForeignRootIntegration(
+        allocator,
+        io,
+        self_exe,
+        platform,
+        request,
+        work_path,
+        architecture,
+    );
+
     try Io.Dir.cwd().deleteTree(io, work_path);
     completed = true;
     std.debug.print("unsafe-chroot privileged integration passed\n", .{});
@@ -666,6 +677,137 @@ fn runDeadlineIntegration(
     try ensure(try countAttachedLoops(allocator, io) == loops_before);
 }
 
+/// A root with no `/usr/bin/tdnf` and an `/usr/bin/apt-get` instead is refused
+/// by name, before the run writes anything into it.
+///
+/// This is the behaviour the documentation already claimed and the code did
+/// not have: the tool paths were plain `runChroot` argv, so this root used to
+/// fail with a generic non-zero exit from a chroot that could not exec a path,
+/// partway through a run that had already placed credential-bearing repository
+/// files in the image.
+fn runForeignRootIntegration(
+    allocator: Allocator,
+    io: Io,
+    self_exe: []const u8,
+    platform: zvmi.customize.Platform,
+    base_request: zvmi.customize.Request,
+    work_path: []const u8,
+    architecture: zvmi.customize.Architecture,
+) !void {
+    const foreign_source_path = try std.fs.path.join(
+        allocator,
+        &.{ work_path, "foreign-source.raw" },
+    );
+    const foreign_spool_path = try std.fs.path.join(
+        allocator,
+        &.{ work_path, "foreign-root.spool" },
+    );
+    const output_path = try std.fs.path.join(
+        allocator,
+        &.{ work_path, "foreign-output.raw" },
+    );
+    try createSourceDisk(
+        allocator,
+        io,
+        self_exe,
+        foreign_source_path,
+        foreign_spool_path,
+        .{ .package_manager = false, .foreign_package_manager = true },
+    );
+
+    var request = base_request;
+    request.input = .{ .disk = .{ .path = foreign_source_path } };
+    request.output.path = output_path;
+    // The cache policy of the base request names a directory the populating
+    // run created. This run must fail before it would have been consulted.
+    request.packages.cache = .online;
+
+    var resolved = try zvmi.customize.resolve(allocator, &request, .{
+        .host_architecture = architecture,
+    });
+    defer resolved.deinit(allocator);
+    // The refusal is a run failure by design, not a plan-time one: for an
+    // ISO+container input the root does not exist until the run assembles it,
+    // so nothing before the run could have answered this.
+    if (resolved.plan == null or resolved.diagnostics.hasErrors()) {
+        return error.ForeignRootResolutionFailed;
+    }
+
+    var outcome = try zvmi.customize.execute(
+        allocator,
+        io,
+        &resolved.plan.?,
+        platform,
+        null,
+    );
+    defer outcome.deinit(allocator);
+    if (outcome.result != null) return error.ForeignRootProducedResult;
+
+    // The worker's own error name is not asserted here, and cannot be: the
+    // privilege boundary is a status file carrying two tokens, so every
+    // worker-side failure reaches the parent as `execution_failed`. What this
+    // scenario establishes is that the root is refused rather than half
+    // customized; that the refusal is `UnsupportedPackageManagerFamily`
+    // rather than a generic exec failure is established by the unit tests
+    // over `packages.toolVerdict` and by the guest agent, whose channel does
+    // carry the name.
+    var failed = false;
+    for (outcome.diagnostics.items) |diagnostic| {
+        if (diagnostic.code == .cleanup_failed) return error.IntegrationCleanupFailed;
+        if (diagnostic.code == .execution_failed) failed = true;
+    }
+    if (!failed) return error.ForeignRootNotRefused;
+
+    // Refused before anything was written: no output, and the transaction the
+    // run would have built in is gone.
+    try expectPathAbsent(io, output_path);
+    try expectPathAbsent(io, resolved.plan.?.data.transaction_path);
+
+    // The gating fence, and the part of this change most likely to break
+    // something that worked: the *same* root, with a request that asks for no
+    // package transaction and no trust, must still customize. A root with no
+    // package manager is a legitimate thing to build from as long as nothing
+    // needs one -- the rule `os_customization.applyServices` already follows
+    // when it returns on an empty service list before refusing anything.
+    const quiet_output_path = try std.fs.path.join(
+        allocator,
+        &.{ work_path, "foreign-quiet-output.raw" },
+    );
+    var quiet = base_request;
+    quiet.input = .{ .disk = .{ .path = foreign_source_path } };
+    quiet.output.path = quiet_output_path;
+    quiet.packages = .{};
+    quiet.initramfs = .unchanged;
+    quiet.selinux = .unchanged;
+    quiet.boot_security = .{};
+
+    var quiet_resolved = try zvmi.customize.resolve(allocator, &quiet, .{
+        .host_architecture = architecture,
+    });
+    defer quiet_resolved.deinit(allocator);
+    if (quiet_resolved.plan == null or quiet_resolved.diagnostics.hasErrors()) {
+        return error.QuietRootResolutionFailed;
+    }
+
+    var quiet_outcome = try zvmi.customize.execute(
+        allocator,
+        io,
+        &quiet_resolved.plan.?,
+        platform,
+        null,
+    );
+    defer quiet_outcome.deinit(allocator);
+    if (quiet_outcome.result == null) {
+        for (quiet_outcome.diagnostics.items) |diagnostic| {
+            std.debug.print(
+                "quiet-root diagnostic: {s} {s}: {s}\n",
+                .{ @tagName(diagnostic.code), diagnostic.configuration_path, diagnostic.message },
+            );
+        }
+        return error.QuietRootRefused;
+    }
+}
+
 fn countAttachedLoops(allocator: Allocator, io: Io) !usize {
     const result = std.process.run(allocator, io, .{
         .argv = &.{ "/usr/sbin/losetup", "--list", "--output", "NAME", "--noheadings" },
@@ -725,12 +867,26 @@ fn runUnsafeChroot(
     });
 }
 
+/// How the staged root differs from the supported one.
+///
+/// Only ever used to build a root this backend must *refuse*: the supported
+/// shape is the default and every existing scenario takes it.
+const SourceDiskShape = struct {
+    /// Stage `/usr/bin/tdnf`. A root without it is one no package transaction
+    /// can run in.
+    package_manager: bool = true,
+    /// Stage `/usr/bin/apt-get` as well, so the root carries evidence of a
+    /// family this project does not target.
+    foreign_package_manager: bool = false,
+};
+
 fn createSourceDisk(
     allocator: Allocator,
     io: Io,
     self_exe: []const u8,
     source_path: []const u8,
     spool_path: []const u8,
+    shape: SourceDiskShape,
 ) !void {
     const executable = try Io.Dir.cwd().readFileAlloc(
         io,
@@ -817,7 +973,12 @@ fn createSourceDisk(
         executable,
         .{ .mode = 0o755 },
     );
-    try tree.putSymlink("usr/bin/tdnf", "rpm", .{ .mode = 0o777 });
+    if (shape.package_manager) {
+        try tree.putSymlink("usr/bin/tdnf", "rpm", .{ .mode = 0o777 });
+    }
+    if (shape.foreign_package_manager) {
+        try tree.putSymlink("usr/bin/apt-get", "rpm", .{ .mode = 0o777 });
+    }
     try tree.putSymlink("usr/bin/dracut", "rpm", .{ .mode = 0o777 });
     try tree.putSymlink("usr/bin/cp", "rpm", .{ .mode = 0o777 });
     // The interpreter the deadline run's hook names. A hook has to name one,

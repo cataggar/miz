@@ -186,6 +186,19 @@ const Session = struct {
         self.mountTarget(control.root_device) catch |err| {
             return fail("mount-root", @errorName(err));
         };
+        // Before anything is written into the target, so a root this backend
+        // cannot run a transaction against is refused while it is still
+        // untouched rather than after the repository files -- which carry
+        // credentials -- have been placed in it.
+        //
+        // The guest checks this on its own account rather than trusting the
+        // host to have done it. On this backend the host never mounts the
+        // target root, so the guest is the only side that *can*: the probe is
+        // not a re-validation of something already checked, it is the only
+        // check there is.
+        self.requirePackageTools(control) catch |err| {
+            return fail("package-tools", @errorName(err));
+        };
         self.writeRepositoryFiles(control) catch |err| {
             return fail("repository-configuration", @errorName(err));
         };
@@ -818,6 +831,51 @@ const Session = struct {
         try argv.append(try self.allocator.dupe(u8, contexts));
         try argv.append("/");
         try self.runChroot(argv.items);
+    }
+
+    /// Refuses a target root that has no package manager, by name.
+    ///
+    /// The same check the privileged worker makes, and stated in both places
+    /// for the reason the guest re-checks everything: here it is not even a
+    /// re-check. The host never mounts the target root on this backend, so
+    /// nothing on the host side could have answered this.
+    ///
+    /// Probed only for what the control document actually uses. A root with
+    /// no package manager is a legitimate thing to customize as long as
+    /// nothing asks it to install.
+    fn requirePackageTools(self: *Session, control: control_mod.Control) !void {
+        const need = packages_mod.toolNeed(
+            control.actions.len != 0,
+            declaresPackageTrust(control),
+        );
+        if (need.none()) return;
+
+        const verdict = packages_mod.toolVerdict(
+            need,
+            if (need.manager) self.guestFileExists(packages_mod.tool_path) else true,
+            if (need.database) self.guestFileExists(packages_mod.database_tool_path) else true,
+        );
+        switch (verdict) {
+            .satisfied => return,
+            .missing_manager => {
+                try self.refuseForeignPackageManager();
+                return error.MissingPackageManager;
+            },
+            .missing_database => {
+                try self.refuseForeignPackageManager();
+                return error.MissingPackageDatabase;
+            },
+        }
+    }
+
+    /// Names the family when the root carries evidence of a different one, so
+    /// the failure says what the image is rather than only what it is not.
+    fn refuseForeignPackageManager(self: *Session) !void {
+        for (packages_mod.foreign_tool_paths) |candidate| {
+            if (self.guestFileExists(candidate)) {
+                return error.UnsupportedPackageManagerFamily;
+            }
+        }
     }
 
     fn guestFileExists(self: *Session, guest_path: []const u8) bool {
@@ -1523,6 +1581,13 @@ fn mkdirParents(allocator: Allocator, path: []const u8) !void {
 
 /// Opening with `O_DIRECTORY` answers the question without needing a `struct
 /// stat` whose layout varies by architecture.
+fn declaresPackageTrust(control: control_mod.Control) bool {
+    for (control.repositories) |repository| {
+        if (repository.trust_base64.len != 0) return true;
+    }
+    return false;
+}
+
 fn isDirectory(path: [*:0]const u8) bool {
     const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
     if (linux.errno(rc) != .SUCCESS) return false;
