@@ -71,6 +71,15 @@ pub const Options = struct {
     /// in. Leaving it `null` keeps the discovery behaviour a command-line tool
     /// wants.
     credential: ?auth.SuppliedCredential = null,
+    /// Whether to look for a credential when none is supplied.
+    ///
+    /// Set false by a caller that accounts for every input it depends on: it
+    /// makes "this request declared no credential" mean the request has none,
+    /// rather than whichever login the machine happens to hold. Supplying
+    /// `credential` disables discovery on its own, so this exists for the
+    /// other half of the same guarantee -- the case where the answer is that
+    /// there is no credential at all.
+    discover_credential: bool = true,
     tls_ca: ?[]const u8 = null,
     metadata_limit: usize = metadata_limit_default,
     sleep: ?Sleep = null,
@@ -246,6 +255,7 @@ pub const Source = struct {
             .repository = repository,
             .plain_http = options.plain_http,
             .authfile = authfile,
+            .credential_loaded = !options.discover_credential,
             .metadata_limit = options.metadata_limit,
             .sleep_callback = options.sleep,
             .process_runner = options.process_runner,

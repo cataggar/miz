@@ -23,6 +23,7 @@ const identity_rewrite = @import("identity_rewrite.zig");
 const initramfs_mod = @import("initramfs.zig");
 const limits_mod = @import("limits.zig");
 const mbr = @import("mbr.zig");
+const credential_mod = @import("credential.zig");
 const oci = @import("oci.zig");
 const os_customization = @import("os_customization.zig");
 const output_mod = @import("output.zig");
@@ -38,8 +39,8 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 27;
-pub const provenance_schema_version: u32 = 30;
+pub const plan_schema_version: u32 = 28;
+pub const provenance_schema_version: u32 = 31;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -182,6 +183,23 @@ pub const RegistryAccess = struct {
     /// machine in the clear.
     plain_http: bool = false,
 };
+
+/// The directory a pulled registry image lands in, relative to the run's own
+/// transaction directory.
+pub const container_pull_directory = "oci-pull";
+
+/// The registry image an input names, or null for anything else. One helper
+/// rather than a switch at each site, because `Input` and `ResolvedInput` ask
+/// the same question and a second copy of the answer could drift.
+fn registryContainer(input: anytype) ?RegistryImage {
+    return switch (input) {
+        .iso_oci => |iso_oci| switch (iso_oci.container) {
+            .host_path => null,
+            .registry => |image| image,
+        },
+        else => null,
+    };
+}
 
 pub const IsoOciInput = struct {
     iso_path: []const u8,
@@ -3186,6 +3204,11 @@ pub const ArchitectureSet = struct {
 };
 
 pub const Phase = enum {
+    /// Fetching the container image the request named, before anything else
+    /// happens. First because a registry that cannot be reached should cost
+    /// the run nothing else, and published rather than hidden inside
+    /// `prepare` because it is the one phase that touches the network.
+    acquire_container,
     prepare,
     filesystem_changes,
     generalization_cleanup,
@@ -3211,6 +3234,10 @@ pub const Phase = enum {
 };
 
 pub const Action = enum {
+    /// Copies the digest-pinned image the request declared into the run's own
+    /// transaction directory. The backend is handed a local layout either
+    /// way, so this is the only step that speaks to a registry.
+    pull_container_image,
     load_sources,
     apply_filesystem_changes,
     generalize_and_cleanup,
@@ -3486,6 +3513,12 @@ pub const ResolvedPlanData = struct {
     reproducibility: Reproducibility,
     limits: limits_mod.ImportLimits,
     transaction_path: []const u8,
+    /// Where a declared registry image is pulled to, or null when the request
+    /// named a layout on this machine. In the plan rather than computed at
+    /// execution time so that a caller reading the plan can see every path the
+    /// run will write, and so the step that hands it to the backend allocates
+    /// nothing.
+    container_pull_path: ?[]const u8,
     staging_output_path: []const u8,
     /// The artifact the transaction commits to `output.path`. It is
     /// `staging_output_path` for every disk format, and the COSI bundle built
@@ -3783,6 +3816,13 @@ pub fn resolve(
     const transaction_name = try std.fmt.allocPrint(plan_allocator, ".zvmi-{s}", .{transaction_hex});
     const transaction_path = try std.fs.path.join(plan_allocator, &.{ resolved_workspace_path, transaction_name });
     const staging_output_path = try std.fs.path.join(plan_allocator, &.{ transaction_path, "output.img" });
+    // Inside the transaction directory so the cleanup that already removes a
+    // partial image removes a partial pull too: no second lifecycle to get
+    // wrong, and nothing left on the machine after a failed run.
+    const container_pull_path = if (registryContainer(request.input)) |_|
+        try std.fs.path.join(plan_allocator, &.{ transaction_path, container_pull_directory })
+    else
+        null;
     const staging_commit_path = if (request.output.format.bundlesStagedImage())
         try std.fs.path.join(plan_allocator, &.{ transaction_path, "output.cosi" })
     else
@@ -3867,6 +3907,7 @@ pub fn resolve(
     const resolved_boot = try dupeBootPolicy(plan_allocator, request.boot_security, context.base_path);
     const operations = try buildOperations(
         plan_allocator,
+        resolved_input,
         resolved_execution.backend,
         resolved_boot,
         resolved_storage,
@@ -3922,6 +3963,7 @@ pub fn resolve(
         .reproducibility = request.reproducibility,
         .limits = request.limits,
         .transaction_path = transaction_path,
+        .container_pull_path = container_pull_path,
         .staging_output_path = staging_output_path,
         .staging_commit_path = staging_commit_path,
         .transaction_id = transaction_id,
@@ -4581,6 +4623,7 @@ fn dupeTrustSource(
 
 fn buildOperations(
     allocator: Allocator,
+    input: ResolvedInput,
     backend: ExecutionBackend,
     policy: BootSecurityPolicy,
     storage: ResolvedStorage,
@@ -4592,6 +4635,12 @@ fn buildOperations(
 ) Allocator.Error![]Operation {
     var specs = std.array_list.Managed(OperationSpec).init(allocator);
     defer specs.deinit();
+    // Ahead of everything, so that a caller reading the plan sees the network
+    // access before any local work and a run that cannot reach the registry
+    // stops before it has touched anything.
+    if (registryContainer(input) != null) {
+        try specs.append(.{ .phase = .acquire_container, .action = .pull_container_image });
+    }
     try appendBackendOperationSpecs(&specs, backend, storage);
     try appendPreInitramfsOperationSpecs(&specs, packages, hooks);
     try appendBackendFinalOperationSpecs(&specs, backend, policy, storage, hooks, initramfs, selinux, output_format);
@@ -5334,6 +5383,8 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("zvmi-resolved-plan-v4\x00");
     hashInt(&hash, plan.schema_version);
+    hashInt(&hash, @intFromBool(plan.container_pull_path != null));
+    if (plan.container_pull_path) |path| hashString(&hash, path);
     hashInt(&hash, plan.request_api_version);
     hashInt(&hash, @intFromEnum(plan.architectures.host));
     hashInt(&hash, @intFromEnum(plan.architectures.image));
@@ -5930,6 +5981,16 @@ pub const Platform = struct {
     /// work sets it; every other construction site keeps the empty default
     /// and a provider that needs a variable will say so by failing.
     signing_environ: std.process.Environ = .empty,
+
+    /// The environment a registry credential may be read from.
+    ///
+    /// Separate from `signing_environ` because giving a signing command the
+    /// environment and letting a registry password be read out of it are two
+    /// different consents, and a caller should be able to grant one without
+    /// the other. Empty by default, so a request naming
+    /// `credential.host_environment` fails plainly on a driver that never
+    /// offered its environment rather than silently reading it.
+    registry_environ: std.process.Environ = .empty,
 
     pub fn system() Platform {
         return .{ .checkFn = systemCapabilityCheck };
@@ -7445,6 +7506,43 @@ pub const ExecutionRecord = struct {
     /// larger run from these instead of guessing, and a dry run reports them
     /// without committing to a build.
     limit_peaks: limits_mod.Peaks,
+    /// What the run pulled from a registry, or null when the container came
+    /// from a layout already on this machine.
+    container_pull: ?RegistryPullRecord,
+};
+
+/// The platform an image states for itself, as the registry reported it.
+pub const ImagePlatform = struct {
+    os: []const u8,
+    architecture: []const u8,
+    variant: ?[]const u8,
+};
+
+/// What a run fetched from a registry.
+///
+/// Provenance for a registry input names the image, not a directory on the
+/// build machine: `/var/tmp/oci-layout` tells a reader nothing about what was
+/// in it, and the directory is gone by the time anyone reads the record. The
+/// digest names the same bytes on any machine forever.
+pub const RegistryPullRecord = struct {
+    /// The canonical `docker://<authority>/<repository>@sha256:<hex>` the
+    /// plan named.
+    reference: []const u8,
+    /// The manifest or index the digest resolved to. Equal to the digest in
+    /// `reference`; recorded separately so a reader has it without parsing.
+    manifest_digest: []const u8,
+    /// The media type of that document, which says whether what was pulled
+    /// was a single image or an index of them.
+    media_type: []const u8,
+    /// The platform the image declares, when it declares one. Recorded
+    /// because an image whose architecture disagrees with the run's is a
+    /// thing a reader wants to be able to notice afterwards.
+    platform: ?ImagePlatform,
+    /// Bytes moved over the network and bytes the destination already had.
+    /// Not a property of the image, but a property of this run: the same
+    /// image pulled twice transfers nothing the second time.
+    transferred_bytes: usize,
+    reused_bytes: usize,
 };
 
 pub const Provenance = struct {
@@ -7726,6 +7824,10 @@ fn buildResult(
     /// entries could not be read.
     selinux_command_line_disabled: ?bool,
     limit_peaks: limits_mod.Peaks,
+    /// What the run pulled from a registry, or null when it pulled nothing.
+    /// Borrowed: the record is copied into the result's own arena, because
+    /// the pull's arena is released when the run leaves `execute`.
+    container_pull: ?RegistryPullRecord,
 ) Allocator.Error!Result {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -8110,6 +8212,21 @@ fn buildResult(
                 } else null,
                 .uki_signatures = try dupeUkiSignatureRecords(result_allocator, uki_signatures),
                 .limit_peaks = limit_peaks,
+                .container_pull = if (container_pull) |record| .{
+                    .reference = try result_allocator.dupe(u8, record.reference),
+                    .manifest_digest = try result_allocator.dupe(u8, record.manifest_digest),
+                    .media_type = try result_allocator.dupe(u8, record.media_type),
+                    .platform = if (record.platform) |value| .{
+                        .os = try result_allocator.dupe(u8, value.os),
+                        .architecture = try result_allocator.dupe(u8, value.architecture),
+                        .variant = if (value.variant) |variant|
+                            try result_allocator.dupe(u8, variant)
+                        else
+                            null,
+                    } else null,
+                    .transferred_bytes = record.transferred_bytes,
+                    .reused_bytes = record.reused_bytes,
+                } else null,
             },
             .final_output = .{
                 .path = output_path,
@@ -8186,24 +8303,6 @@ pub fn execute(
         return try failureOutcome(allocator, diagnostics.items);
     }
 
-    // Refused here rather than at validation or resolution, because a plan
-    // naming a registry image is a correct plan: it says exactly which bytes
-    // the run would read. Only the fetch that would read them is missing, and
-    // that is an execution fact, so a caller can still resolve such a plan,
-    // hash it, and inspect its capabilities today.
-    if (plan.data.input == .iso_oci and plan.data.input.iso_oci.container == .registry) {
-        try diagnostics.append(.{
-            .severity = .@"error",
-            .phase = .execution,
-            .code = .unsupported_input,
-            .configuration_path = "/input/iso_oci/container/registry",
-            .message = "fetching a container image from a registry is not implemented in this build",
-            .remediation = "pull the image into an OCI layout and declare it as container.host_path",
-        });
-        emitDiagnostics(event_sink, diagnostics.items);
-        return try failureOutcome(allocator, diagnostics.items);
-    }
-
     var preflight_report = try preflight(allocator, io, plan, platform);
     defer preflight_report.deinit(allocator);
     try diagnostics.appendSlice(preflight_report.diagnostics.items);
@@ -8238,6 +8337,40 @@ pub fn execute(
     errdefer if (transaction_active) {
         _ = cleanupTransaction(io, plan.data.transaction_path);
     };
+
+    // The first thing the run does with the transaction directory it just
+    // made. Ahead of everything else because a registry that cannot be
+    // reached should fail before the ISO is read, and inside the transaction
+    // because a partial pull is then removed by the mechanism that already
+    // removes a partial image: no new lifecycle and no new cleanup.
+    var container_pull: ?RegistryPull = null;
+    defer if (container_pull) |*pull| pull.deinit();
+    if (registryContainer(plan.data.input)) |image| {
+        if (event_sink) |sink| sink.emit(.{ .progress = .{
+            .phase = .execution,
+            .message = "pull the declared container image",
+        } });
+        container_pull = pullRegistryImage(
+            allocator,
+            io,
+            platform.registry_environ,
+            image,
+            plan.data.container_pull_path.?,
+        ) catch |err| {
+            try appendFailure(
+                &diagnostics,
+                .execution_failed,
+                .execution,
+                "/input/iso_oci/container/registry",
+                "failed to pull the declared container image",
+                err,
+            );
+            if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
+            transaction_active = false;
+            emitDiagnostics(event_sink, diagnostics.items);
+            return try failureOutcome(allocator, diagnostics.items);
+        };
+    }
 
     var bridge = BuildEventBridge{
         .event_sink = event_sink,
@@ -8627,6 +8760,7 @@ pub fn execute(
         output_file_size,
         selinuxCommandLineDisabled(allocator, io, plan),
         limit_sink.peaks,
+        if (container_pull) |pull| pull.record else null,
     );
     var result_owned_by_function = true;
     errdefer if (result_owned_by_function) result.deinit(allocator);
@@ -8834,6 +8968,15 @@ fn hasValidPlanIntegrity(allocator: Allocator, plan: *const ResolvedPlan) Alloca
     defer allocator.free(expected_transaction);
     const expected_staging = try std.fs.path.join(allocator, &.{ expected_transaction, "output.img" });
     defer allocator.free(expected_staging);
+    const expected_pull = if (registryContainer(data.input) != null)
+        try std.fs.path.join(allocator, &.{ expected_transaction, container_pull_directory })
+    else
+        null;
+    defer if (expected_pull) |path| allocator.free(path);
+    if (expected_pull) |expected| {
+        const actual = data.container_pull_path orelse return false;
+        if (!std.mem.eql(u8, expected, actual)) return false;
+    } else if (data.container_pull_path != null) return false;
     const expected_commit = if (data.output.format.bundlesStagedImage())
         try std.fs.path.join(allocator, &.{ expected_transaction, "output.cosi" })
     else
@@ -8859,8 +9002,13 @@ fn runPlan(
     // bundle is written from the finished image after `build` returns, so the
     // builder is only accountable for the operations before it.
     const trailing = @intFromBool(plan.data.output.format.bundlesStagedImage());
-    const build_operations = plan.data.operations[0 .. plan.data.operations.len - trailing];
-    var stage_bridge = NativeStageBridge{ .operations = build_operations };
+    // A registry input begins with an operation the builder does not run
+    // either: `execute` pulled the image before the backend started, and what
+    // the builder receives is the local layout that pull produced.
+    const leading = @intFromBool(plan.data.operations.len != 0 and
+        plan.data.operations[0].action == .pull_container_image);
+    const build_operations = plan.data.operations[leading .. plan.data.operations.len - trailing];
+    var stage_bridge = NativeStageBridge{ .operations = build_operations, .base = leading };
     const stage_sink = build_image.StageSink{ .context = &stage_bridge, .advanceFn = NativeStageBridge.advance };
     if (platform.runFn) |run| {
         try run(platform.context, allocator, io, plan, event_sink, stage_sink);
@@ -8890,6 +9038,111 @@ fn loadSigningCertificate(
     });
 }
 
+/// Owns everything a pull produced for as long as the run needs it.
+pub const RegistryPull = struct {
+    arena: std.heap.ArenaAllocator,
+    record: RegistryPullRecord,
+
+    pub fn deinit(self: *RegistryPull) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Copies the digest-pinned image an input names into the run's transaction
+/// directory, and reports what it found there.
+///
+/// Ambient credential discovery is off in both directions: the declared
+/// credential, if there is one, is handed in directly, and if there is none
+/// then there is none -- `discover_credential` stops the client falling back
+/// to `$HOME/.docker/config.json` and the five other places it would look. A
+/// private registry that a request declared no credential for therefore fails
+/// as an authentication error naming the reference, rather than succeeding
+/// because the build machine happened to be logged in. What the run depended
+/// on stays what the request said it depended on.
+///
+/// The pin before the copy costs one extra metadata request and buys the
+/// platform the image states for itself, which is a property of the run that
+/// nothing else records. Re-deriving it from the pulled layout afterwards
+/// would mean a second copy of the selection rules.
+pub fn pullRegistryImage(
+    allocator: Allocator,
+    io: Io,
+    environ: std.process.Environ,
+    image: RegistryImage,
+    destination_path: []const u8,
+) !RegistryPull {
+    const parsed = try oci.reference.parse(image.reference, .source);
+    const source_reference = switch (parsed) {
+        .registry => |value| value,
+        .layout => return error.InvalidRegistryReference,
+    };
+
+    var material: ?[]u8 = null;
+    defer if (material) |bytes| {
+        std.crypto.secureZero(u8, bytes);
+        allocator.free(bytes);
+    };
+    var supplied: ?oci.auth.SuppliedCredential = null;
+    if (image.access.credential) |declared| {
+        // Read as late as possible and never retained: the bytes live in this
+        // frame, are handed to the client by reference, and are zeroed on the
+        // way out whether the pull succeeded or not.
+        material = try credential_mod.readMaterial(allocator, io, environ, declared.password, false);
+        supplied = .{ .username = declared.username, .secret = material.? };
+    }
+
+    var source = try oci.registry.Source.init(io, allocator, environ, source_reference, .{
+        .plain_http = image.access.plain_http,
+        .tls_ca = image.access.tls_ca,
+        .credential = supplied,
+        .discover_credential = false,
+    });
+    defer source.deinit();
+
+    var pin = try source.pin(source_reference);
+    defer pin.deinit();
+    var copied = try source.copyToLayout(
+        source_reference,
+        .{ .path = destination_path, .selection = null },
+        .{},
+    );
+    defer copied.deinit(allocator);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const record_allocator = arena.allocator();
+    // Built before the arena is moved into the result, because moving an
+    // arena copies its bookkeeping: anything allocated after the copy would
+    // belong to a list the returned arena has never heard of.
+    const record: RegistryPullRecord = .{
+        .reference = try record_allocator.dupe(u8, image.reference),
+        .manifest_digest = try record_allocator.dupe(u8, pin.digest),
+        .media_type = try record_allocator.dupe(u8, pin.media_type),
+        .platform = if (pin.platform) |value| .{
+            .os = try record_allocator.dupe(u8, value.os),
+            .architecture = try record_allocator.dupe(u8, value.architecture),
+            .variant = if (value.variant) |variant|
+                try record_allocator.dupe(u8, variant)
+            else
+                null,
+        } else null,
+        .transferred_bytes = copied.transferred,
+        .reused_bytes = copied.reused,
+    };
+    return .{ .arena = arena, .record = record };
+}
+
+/// The `sha256:<hex>` substring of a canonical registry reference.
+///
+/// Total on anything `resolve` produced, because validation refused every
+/// spelling that has no digest in it; an empty answer would name no manifest,
+/// and is what a caller gets if that ever stops being true.
+fn registryReferenceDigestText(reference_text: []const u8) []const u8 {
+    const at = std.mem.lastIndexOfScalar(u8, reference_text, '@') orelse return &.{};
+    return reference_text[at + 1 ..];
+}
+
 fn buildOptionsFromPlan(
     plan: *const ResolvedPlan,
     bridge: *BuildEventBridge,
@@ -8900,12 +9153,22 @@ fn buildOptionsFromPlan(
     const storage = plan.data.storage.fresh;
     return .{
         .iso_path = input.iso_path,
+        // A registry image was pulled into the transaction directory before
+        // the backend started, so what the builder receives is a local layout
+        // either way: the registry never reaches `build_image.zig`.
         .container_path = switch (input.container) {
             .host_path => |path| path,
-            // `execute` refuses a registry input before it reaches a backend,
-            // so this arm is reachable only if that refusal is removed without
-            // implementing the fetch that replaces it.
-            .registry => unreachable,
+            .registry => plan.data.container_pull_path.?,
+        },
+        // The pulled layout holds exactly the graph the digest names, but that
+        // graph may be an index, and an index has no single manifest to load.
+        // Naming the digest selects the same document the plan hashed rather
+        // than whichever entry happens to come first.
+        .oci_load_options = switch (input.container) {
+            .host_path => .{},
+            .registry => |image| .{
+                .manifest_digest = registryReferenceDigestText(image.reference),
+            },
         },
         .output_path = plan.data.staging_output_path,
         .size = plan.data.output.disk_size,
@@ -8956,6 +9219,10 @@ fn buildOptionsFromPlan(
 
 const NativeStageBridge = struct {
     operations: []const Operation,
+    /// The plan index this slice starts at. Operation ids and `depends_on`
+    /// are absolute, so a slice that skips a leading pull has to add its own
+    /// offset back before it can compare the two.
+    base: usize = 0,
     next: usize = 0,
 
     fn advance(context: ?*anyopaque, stage: build_image.Stage) bool {
@@ -8964,7 +9231,7 @@ const NativeStageBridge = struct {
         const operation = self.operations[self.next];
         if (operation.action != actionForFreshStage(stage)) return false;
         for (operation.depends_on) |dependency| {
-            if (dependency >= self.next) return false;
+            if (dependency >= self.base + self.next) return false;
         }
         self.next += 1;
         return true;
@@ -11824,28 +12091,35 @@ test "the source record for a registry image is the image, not a path" {
     for (before) |record| try std.testing.expect(record.kind != .container);
 }
 
-test "executing a registry input refuses by name until the fetch exists" {
+test "a registry input plans a pull operation into the transaction directory" {
     var request = registryRequest(test_registry_reference);
     var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
     defer resolved.deinit(std.testing.allocator);
     const plan = resolved.plan orelse return error.TestUnexpectedResult;
-    try std.testing.expect(plan.data.input.iso_oci.container == .registry);
 
-    var outcome = try execute(
-        std.testing.allocator,
-        std.testing.io,
-        &resolved.plan.?,
-        Platform.system(),
-        null,
-    );
-    defer outcome.deinit(std.testing.allocator);
-    try std.testing.expect(outcome.result == null);
-    const diagnostic = registryDiagnostic(
-        outcome.diagnostics,
-        "/input/iso_oci/container/registry",
-    ) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(DiagnosticCode.unsupported_input, diagnostic.code);
-    try std.testing.expectEqual(DiagnosticPhase.execution, diagnostic.phase);
+    // Published as an operation, so a caller reading the plan sees the network
+    // access before anything runs, and sees it first.
+    try std.testing.expectEqual(Phase.acquire_container, plan.data.operations[0].phase);
+    try std.testing.expectEqual(Action.pull_container_image, plan.data.operations[0].action);
+    try std.testing.expectEqual(@as(usize, 0), plan.data.operations[0].depends_on.len);
+
+    // And the plan names where the image lands, under the transaction
+    // directory so the existing cleanup removes a partial pull.
+    const pull_path = plan.data.container_pull_path orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.startsWith(u8, pull_path, plan.data.transaction_path));
+    try std.testing.expect(std.mem.endsWith(u8, pull_path, container_pull_directory));
+}
+
+test "a host path input plans no pull and names no pull directory" {
+    var request = validRequest();
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    const plan = resolved.plan orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(@as(?[]const u8, null), plan.data.container_pull_path);
+    for (plan.data.operations) |operation| {
+        try std.testing.expect(operation.action != .pull_container_image);
+    }
 }
 
 test "validation rejects normalized source aliases and unsupported aarch64 BIOS" {
@@ -13327,8 +13601,8 @@ test "the schema versions move only when the documents do" {
     // The counts are recorded unconditionally rather than only when a ratio
     // was asked for, because shipping an image with three free inodes is
     // precisely the case where nobody asked for anything.
-    try std.testing.expectEqual(@as(u32, 27), plan_schema_version);
-    try std.testing.expectEqual(@as(u32, 30), provenance_schema_version);
+    try std.testing.expectEqual(@as(u32, 28), plan_schema_version);
+    try std.testing.expectEqual(@as(u32, 31), provenance_schema_version);
 }
 
 test "native-edit resolution is deterministic, deeply owned, and integrity checked" {
