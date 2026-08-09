@@ -946,6 +946,83 @@ The interim workaround this replaces was `tune2fs -j <image-or-partition>`
 after the build. That works, but it puts `e2fsprogs` back on the build host,
 which is exactly what a self-contained image builder exists to avoid.
 
+## Sizing the inode table
+
+An ext4 filesystem's inode table is fixed at creation. `mke2fs` sizes it from a
+bytes-per-inode ratio -- 16384 by default, so a 16 GiB filesystem gets about a
+million inodes -- and the resulting count bounds how many files the filesystem
+can *ever* hold, no matter how many blocks are free.
+
+This writer instead sizes the table to the tree it is given: one inode per
+node, and nothing spare. For a purpose-built appliance image that is exactly
+right. Every byte of an inode table is a byte the image ships, the tree is
+known in full before anything is written, and the reproducibility contract
+wants the count to be a function of the content rather than of a ratio nobody
+recorded.
+
+It is wrong the moment the image becomes a running machine's root filesystem.
+
+### The failure this exists to prevent
+
+A preserved rebuild inherits its `length` from the partition it overwrites, so
+a 667 MiB partition holding 450 MiB of content is rebuilt as a 667 MiB
+filesystem with 213 MiB free -- and **3 free inodes out of 11808**, because
+11805 nodes went in. The first boot then fails to create a single file while a
+`df` shows a third of the disk free. What that looks like in practice is a
+service reporting `ENOSPC` from somewhere that has nothing to do with space:
+
+```
+store.New failed: open /var/lib/tailscale/tailscaled.state: no space left on device
+```
+
+`df -i` is the diagnosis, and nothing in the build output would have hinted at
+it, which is why the rebuild report and provenance now state `inode_count` and
+`free_inode_count` outright.
+
+### Asking for room
+
+`bytes_per_inode` sets the same ratio `mke2fs -i` does: the table is sized to
+`filesystem_length / bytes_per_inode` inodes, or to the node count, whichever
+is larger. A tree that needs more inodes than the ratio allows still gets them;
+the ratio is a floor, not a cap.
+
+| Surface | Spelling |
+| --- | --- |
+| `std.Build` helper (`image.addPreservedImage`) | `.inodes = .{ .bytes_per_inode = 16384 }` |
+| Preserved-image configuration JSON (api_version 3) | `"inodes": { "bytes_per_inode": 16384 }` |
+| `preserved_image.RebuildOptions` | `.inodes = .{ .bytes_per_inode = 16384 }` |
+| `ext4.populate` / `ext4.preflightPopulate` | `PopulateOptions.inodes` |
+
+16384 is what `mke2fs`, and so a distro installer, would have used. There is no
+CLI flag: the ratio only means anything for a preserved rebuild, which is
+configured by file rather than by argument.
+
+**The default is unchanged and stays unchanged.** Defaults here are
+load-bearing -- they decide the bytes an existing image definition produces --
+so an image that never sets this keeps getting the content-derived count it has
+always had.
+
+A ratio raises the filesystem's minimum size, since the table has to fit
+alongside the content; `ext4.minimumPopulateLength` accounts for it, so a
+caller that sizes storage from that number does not have to. `0` is
+`InvalidInodeRatio` rather than a synonym for the default, and a ratio that
+demands more inodes than the geometry can hold is `TooManyInodes` rather than a
+silent clamp.
+
+Like the journal, this is `rebuild`-only among the preserved-image backends --
+every other backend keeps the source's filesystem rather than writing a new one
+-- and stating it elsewhere is `UnexpectedInodePolicy`.
+
+### Why this is not simply the default
+
+Growing the filesystem is the other answer, and on a cloud image it is the one
+that usually runs first: `zvmi`'s Azure agent resizes the root partition to the
+OS disk on first boot, and `resize2fs` adds block groups, each bringing
+`inodes_per_group` more inodes with it. That masks the problem on Azure while
+leaving it fully present anywhere the image boots at its built size -- a local
+QEMU run, a fixed-size disk, a first boot that fails before the resize. An
+image should not depend on being grown to be able to create a file.
+
 ## Import limits and scratch space
 
 Every import is bounded. The defaults are guardrails sized for a purpose-built

@@ -274,6 +274,7 @@ pub const PreservedSourceProfile = preserved_image_wire.SourceProfile;
 pub const PreservedSourceMount = preserved_image_wire.SourceMount;
 pub const PreservedIdentityRewrite = preserved_image_wire.IdentityRewrite;
 pub const PreservedJournalPolicy = preserved_image_wire.JournalPolicy;
+pub const PreservedInodePolicy = preserved_image_wire.InodePolicy;
 pub const PreservedSourceFilesystem = preserved_image_wire.SourceFilesystem;
 pub const PreservedSynthesizedFatMetadata = preserved_image_wire.SynthesizedFatMetadata;
 
@@ -321,6 +322,16 @@ pub const PreservedOptions = struct {
     /// `rebuild` backend writes a filesystem, so this is meaningless -- and
     /// refused -- for the others.
     journal: PreservedJournalPolicy = .{},
+    /// How many inodes the rebuilt root filesystem gets. Content-derived by
+    /// default, so an existing image definition keeps producing the bytes it
+    /// always has. Set `bytes_per_inode` for an image that becomes a running
+    /// machine's root filesystem: without it the rebuilt filesystem has room
+    /// for exactly the files it was built from, and the first thing the
+    /// machine tries to create fails with `ENOSPC` while gigabytes are free.
+    /// 16384 is what `mke2fs`, and so a distro installer, would have used.
+    /// Only the `rebuild` backend writes a filesystem, so this is meaningless
+    /// -- and refused -- for the others.
+    inodes: PreservedInodePolicy = .{},
     /// Wall-clock budget for the whole customization run, in seconds. Absent
     /// means unbounded, which is what every image definition written before
     /// this field said and still says. It bounds the run rather than any one
@@ -633,6 +644,7 @@ fn materializePreservedConfiguration(
         .source_mounts = options.source_mounts,
         .identity_rewrite = options.identity_rewrite,
         .journal = options.journal,
+        .inodes = options.inodes,
         .operations = operations,
         .customization = .{
             .os = .{

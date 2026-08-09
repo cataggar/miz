@@ -37,8 +37,8 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 26;
-pub const provenance_schema_version: u32 = 29;
+pub const plan_schema_version: u32 = 27;
+pub const provenance_schema_version: u32 = 30;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -279,6 +279,9 @@ pub const PreservedStorage = struct {
     /// the source's filesystem rather than writing a new one. Off by default,
     /// so an existing plan keeps producing the bytes it always has.
     journal: ext4.JournalOptions = .{},
+    /// How many inodes the rebuilt root filesystem gets. `rebuild`-only and
+    /// content-derived by default, for the same two reasons as `journal`.
+    inodes: ext4.InodeOptions = .{},
 };
 pub const PreserveStorage = PreservedStorage;
 pub const RootPartitionSelector = PartitionSelector;
@@ -3279,6 +3282,7 @@ pub const ResolvedPreservedStorage = struct {
     source_mounts: []const SourceMount = &.{},
     identity_rewrite: IdentityRewritePolicy = .rewrite_and_verify,
     journal: ext4.JournalOptions = .{},
+    inodes: ext4.InodeOptions = .{},
 };
 
 pub const ResolvedStorage = union(enum) {
@@ -3662,6 +3666,7 @@ pub fn resolve(
             .source_mounts = try dupeSourceMounts(plan_allocator, storage.source_mounts),
             .identity_rewrite = storage.identity_rewrite,
             .journal = storage.journal,
+            .inodes = storage.inodes,
         } },
     };
     const resolved_os = try dupeOsCustomization(plan_allocator, request.os, context.base_path);
@@ -5099,6 +5104,10 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
             // happens to match it stay distinguishable.
             hashBool(&hash, storage.journal.size_bytes != null);
             hashInt(&hash, storage.journal.size_bytes orelse 0);
+            // Same reasoning: an absent ratio and a ratio that happens to
+            // produce the content-derived count are different requests.
+            hashBool(&hash, storage.inodes.bytes_per_inode != null);
+            hashInt(&hash, storage.inodes.bytes_per_inode orelse 0);
         },
     }
     hashOsCustomization(&hash, plan.os);
@@ -6310,6 +6319,7 @@ fn rebuildAvailable(io: Io, plan: *const ResolvedPlan) CapabilityState {
         .source_mounts = storage.source_mounts,
         .identity_rewrite = storage.identity_rewrite,
         .journal = storage.journal,
+        .inodes = storage.inodes,
         .existing_operations = plan.data.existing_path_operations,
         .customization = plan.data.os,
         .generalization = plan.data.generalization,
@@ -7035,6 +7045,11 @@ pub const PreservedRebuildRecord = struct {
     /// an unclean shutdown -- and neither is visible from the tree digests.
     source_has_journal: bool,
     journal_block_count: u32,
+    /// Inodes the rebuilt filesystem has, and how many are still free.
+    /// Recorded because an image can ship with free blocks and no free inode,
+    /// which no digest or byte count in this record would reveal.
+    inode_count: u32,
+    free_inode_count: u32,
     source_root_tree_digest: Digest,
     final_root_tree_digest: Digest,
     imported_node_count: usize,
@@ -7556,6 +7571,8 @@ fn buildResult(
                 .ext4_global_timestamp = report.ext4_global_timestamp,
                 .source_has_journal = report.source_has_journal,
                 .journal_block_count = report.journal_block_count,
+                .inode_count = report.inode_count,
+                .free_inode_count = report.free_inode_count,
                 .source_root_tree_digest = .{ .bytes = report.source_manifest_sha256 },
                 .final_root_tree_digest = .{ .bytes = report.final_manifest_sha256 },
                 .imported_node_count = report.imported_node_count,
@@ -8054,6 +8071,7 @@ pub fn execute(
                 .source_mounts = plan.data.storage.preserve.source_mounts,
                 .identity_rewrite = plan.data.storage.preserve.identity_rewrite,
                 .journal = plan.data.storage.preserve.journal,
+                .inodes = plan.data.storage.preserve.inodes,
                 .identity_diagnostic = &identity_sink,
                 .existing_operations = plan.data.existing_path_operations,
                 .customization = plan.data.os,
@@ -12558,8 +12576,15 @@ test "the schema versions move only when the documents do" {
     // an instruction and an outcome at once: `boot_security.signing` states
     // which provider and certificate to use, and `execution.uki_signatures`
     // records what each signature turned out to be over and who it named.
-    try std.testing.expectEqual(@as(u32, 26), plan_schema_version);
-    try std.testing.expectEqual(@as(u32, 29), provenance_schema_version);
+    //
+    // Both moved together again for the inode ratio, for the same reason:
+    // `storage.preserve.inodes` is the instruction, and the rebuilt
+    // filesystem's `inode_count` and `free_inode_count` are what came of it.
+    // The counts are recorded unconditionally rather than only when a ratio
+    // was asked for, because shipping an image with three free inodes is
+    // precisely the case where nobody asked for anything.
+    try std.testing.expectEqual(@as(u32, 27), plan_schema_version);
+    try std.testing.expectEqual(@as(u32, 30), provenance_schema_version);
 }
 
 test "native-edit resolution is deterministic, deeply owned, and integrity checked" {

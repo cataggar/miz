@@ -196,6 +196,13 @@ pub const RebuildOptions = struct {
     /// is rebuilt journal-less unless this says otherwise; `PreflightReport`
     /// reports the source's own journal so the change is visible.
     journal: ext4.JournalOptions = .{},
+    /// How many inodes the rebuilt root filesystem gets. Content-derived by
+    /// default, which is right for an image that is never written to and
+    /// wrong for one that becomes a running machine's root: the rebuilt
+    /// filesystem is as large as the partition it replaces, but its inode
+    /// table is only as large as the tree it was built from, so the image
+    /// boots with free blocks and no room to create a file.
+    inodes: ext4.InodeOptions = .{},
     /// Additional filesystems merged into the root tree, in order, each at
     /// its own mount point. An installed system is normally spread across an
     /// ESP, a `/boot` filesystem and a root filesystem; listing the first two
@@ -349,6 +356,12 @@ pub const RebuildReport = struct {
     source_has_journal: bool,
     /// Blocks the rebuilt filesystem's own journal occupies, or 0.
     journal_block_count: u32,
+    /// Inodes the rebuilt filesystem has, and how many of them are still
+    /// free. Reported because a rebuild sized to the source's file count can
+    /// finish with gigabytes free and no inode left to create a file with,
+    /// and nothing else in this report would show it.
+    inode_count: u32,
+    free_inode_count: u32,
     source_manifest_sha256: [32]u8,
     final_manifest_sha256: [32]u8,
     /// RootTree node counts exclude its implicit root directory.
@@ -393,6 +406,10 @@ pub const RebuildInspection = struct {
     source_has_journal: bool,
     /// Blocks the rebuilt filesystem's own journal would occupy, or 0.
     journal_block_count: u32,
+    /// Inodes the rebuilt filesystem would have, and how many would be free;
+    /// see the same fields on `RebuildReport`.
+    inode_count: u32,
+    free_inode_count: u32,
     /// Excludes the implicit root directory.
     imported_node_count: usize,
     /// Filesystems merged in at a mount point, excluding the root source.
@@ -772,7 +789,15 @@ pub fn inspectRebuild(
     const preflight = try ext4.preflightPopulate(
         allocator,
         try validation_tree.ext4View(),
-        populateOptions(&validation_tree, partition.offset, scanned, &scanned_label, scanned_timestamp, options.journal),
+        populateOptions(
+            &validation_tree,
+            partition.offset,
+            scanned,
+            &scanned_label,
+            scanned_timestamp,
+            options.journal,
+            options.inodes,
+        ),
     );
 
     return .{
@@ -791,6 +816,8 @@ pub fn inspectRebuild(
         .ext4_global_timestamp = scanned_timestamp,
         .source_has_journal = scanned.hasJournal(),
         .journal_block_count = preflight.journal_block_count,
+        .inode_count = preflight.inode_count,
+        .free_inode_count = preflight.free_inode_count,
         .imported_node_count = imported_node_count,
         .merged_source_count = sources.mounts.len,
         .shadowed_node_count = sources.shadowed_nodes,
@@ -979,7 +1006,15 @@ pub fn rebuild(
         raw.file,
         allocator,
         final_view,
-        populateOptions(&tree, partition.offset, scanned, &scanned_label, scanned_timestamp, options.journal),
+        populateOptions(
+            &tree,
+            partition.offset,
+            scanned,
+            &scanned_label,
+            scanned_timestamp,
+            options.journal,
+            options.inodes,
+        ),
     );
     // After `populate`, because the rebuilt root filesystem is what the boot
     // entries name, and before the stage is published, because a stage that
@@ -1035,6 +1070,8 @@ pub fn rebuild(
         .ext4_global_timestamp = scanned_timestamp,
         .source_has_journal = scanned.hasJournal(),
         .journal_block_count = populated.journal_block_count,
+        .inode_count = populated.inode_count,
+        .free_inode_count = populated.free_inode_count,
         .source_manifest_sha256 = source_manifest,
         .final_manifest_sha256 = final_manifest,
         .imported_node_count = imported_node_count,
@@ -1273,6 +1310,7 @@ fn populateOptions(
     label: *const [16]u8,
     timestamp: u32,
     journal: ext4.JournalOptions,
+    inodes: ext4.InodeOptions,
 ) ext4.PopulateOptions {
     const root = tree.rootMetadata();
     return .{
@@ -1283,6 +1321,7 @@ fn populateOptions(
         .uuid = scanned.uuid(),
         .timestamp = timestamp,
         .journal = journal,
+        .inodes = inodes,
         .root_mode = root.mode,
         .root_uid = root.uid,
         .root_gid = root.gid,
@@ -4802,6 +4841,62 @@ test "a rebuild reports the source journal and only writes one when asked" {
         try std.testing.expectEqual(@as(u32, 1234), entry.uid);
     }
     try std.testing.expect(saw_hostname);
+}
+
+test "a rebuild sizes the inode table from content unless given a ratio" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const source_path = "test-preserved-inode-source.raw";
+    const default_path = "test-preserved-inode-default.raw";
+    const ratio_path = "test-preserved-inode-ratio.raw";
+    const artifacts = [_][]const u8{
+        source_path,
+        default_path,
+        default_path ++ ".native-rebuild.raw",
+        default_path ++ ".native-rebuild.output",
+        default_path ++ ".native-rebuild.spool",
+        ratio_path,
+        ratio_path ++ ".native-rebuild.raw",
+        ratio_path ++ ".native-rebuild.output",
+        ratio_path ++ ".native-rebuild.spool",
+    };
+    defer for (artifacts) |artifact| Io.Dir.cwd().deleteFile(io, artifact) catch {};
+    createGeneralTestDisk(allocator, io, source_path) catch |err| switch (err) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const base = RebuildOptions{
+        .source_path = source_path,
+        .output_path = default_path,
+        .expected_source_format = .raw,
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 1 },
+        .source_profile = .general,
+        .source_date_epoch = 1_735_689_600,
+        .expected_virtual_size = test_disk_size,
+    };
+
+    // The default sizes the table to the tree, so the image it produces has
+    // room for almost nothing beyond the files it was built from. That is the
+    // behaviour every existing image definition already depends on.
+    const content_sized = try rebuild(allocator, io, base);
+
+    var ratio_options = base;
+    ratio_options.output_path = ratio_path;
+    ratio_options.inodes = .{ .bytes_per_inode = 16384 };
+    const ratio_sized = try rebuild(allocator, io, ratio_options);
+
+    try std.testing.expect(ratio_sized.inode_count > content_sized.inode_count);
+    try std.testing.expect(ratio_sized.free_inode_count > content_sized.free_inode_count);
+    // The tree is identical either way; only the room left for the next file
+    // differs. Same node count, same digest.
+    try std.testing.expectEqual(content_sized.final_node_count, ratio_sized.final_node_count);
+    try std.testing.expectEqualSlices(
+        u8,
+        &content_sized.final_manifest_sha256,
+        &ratio_sized.final_manifest_sha256,
+    );
 }
 
 // A realistic installed layout: an ESP, a separate `/boot`, and the root

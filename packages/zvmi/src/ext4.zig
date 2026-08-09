@@ -232,6 +232,30 @@ pub const Kind = enum(u8) {
     fifo,
 };
 
+/// How many inodes the written filesystem gets.
+///
+/// `buildLayout` derives the inode count from the tree it is handed, so a
+/// filesystem written with no policy here has room for exactly the files it
+/// was built from, rounded up to a whole block group. That is right for a
+/// read-only image and wrong for anything a running machine writes to: a
+/// preserved image rebuilt into the partition it came from ends up with
+/// hundreds of megabytes of free blocks and single-digit free inodes, and
+/// every attempt to create a file fails with `ENOSPC` -- naming the disk
+/// rather than the inode table, which is the part that is actually full.
+///
+/// Null is the default for the same reason `JournalOptions.enabled` is false:
+/// the inode count is part of the bytes a caller written before this option
+/// existed produces.
+pub const InodeOptions = struct {
+    /// Bytes of filesystem per inode, `mke2fs -i` style. Null keeps the
+    /// content-derived count. `mke2fs` defaults to 16384 for a filesystem of
+    /// image size, which is what a distro-installed root filesystem has.
+    ///
+    /// This is a floor, never a ceiling: content that needs more inodes than
+    /// the ratio allows for still gets them.
+    bytes_per_inode: ?u32 = null,
+};
+
 /// Whether the written filesystem carries a JBD2 journal, and how large.
 ///
 /// `enabled` is false by default and that default is load-bearing: every
@@ -299,6 +323,9 @@ pub const PopulateOptions = struct {
     timestamp: u32 = 0,
     /// Journal creation policy. Off by default; see `JournalOptions`.
     journal: JournalOptions = .{},
+    /// Inode table sizing policy. Content-derived by default; see
+    /// `InodeOptions`.
+    inodes: InodeOptions = .{},
 };
 
 pub const ResizeOptions = struct {
@@ -464,6 +491,8 @@ pub const PopulateError = std.mem.Allocator.Error || Io.File.ReadPositionalError
     JournalSizeTooSmall,
     JournalSizeTooLarge,
     UnalignedJournalSize,
+    /// `InodeOptions.bytes_per_inode` was zero, which describes no filesystem.
+    InvalidInodeRatio,
     /// `minimumPopulateLength` kept revising its own answer without settling
     /// on one. Named rather than papered over with a larger guess: the two
     /// things it revises for both converge, so failing to converge means one
@@ -901,7 +930,13 @@ pub fn minimumPopulateLengthAtLeast(
     while (round < max_minimum_size_rounds) : (round += 1) {
         const needed = sumBlockCounts(content_blocks, journal_blocks, extent_tree_allowance) orelse
             return error.FilesystemTooLarge;
-        const total = try solveTotalBlocks(allocator, plan.inode_count, needed, total_floor);
+        const total = try solveTotalBlocks(
+            allocator,
+            plan.inode_count,
+            needed,
+            total_floor,
+            options.inodes.bytes_per_inode,
+        );
 
         // The journal ladder is keyed on the size it is helping to choose,
         // so the rounds walk it upwards: a larger journal forces a larger
@@ -918,7 +953,14 @@ pub fn minimumPopulateLengthAtLeast(
             }
         }
 
-        const layout = layOutTrial(allocator, &plan, needed, total, journal_blocks) catch |err| switch (err) {
+        const layout = layOutTrial(
+            allocator,
+            &plan,
+            needed,
+            total,
+            journal_blocks,
+            options.inodes.bytes_per_inode,
+        ) catch |err| switch (err) {
             // The allowance was too small for the extent-tree blocks the
             // allocator actually needed. That is the one cost the search
             // cannot see in advance, so it is fed back in and retried --
@@ -982,6 +1024,7 @@ fn layOutTrial(
     needed_blocks: u32,
     total_blocks: u32,
     journal_blocks: u32,
+    bytes_per_inode: ?u32,
 ) PopulateError!Layout {
     releaseNodeAllocations(allocator, plan.nodes);
     releaseNodeAllocations(allocator, plan.journal);
@@ -990,7 +1033,7 @@ fn layOutTrial(
     plan.journal = try buildJournalNode(allocator, journal_blocks);
     plan.data_blocks_needed = needed_blocks;
 
-    const layout = try buildLayout(allocator, total_blocks, plan.inode_count, needed_blocks);
+    const layout = try buildLayout(allocator, total_blocks, plan.inode_count, needed_blocks, bytes_per_inode);
     errdefer allocator.free(layout.groups);
     assignInodesToGroups(plan.nodes, layout.groups, layout.inodes_per_group);
     var block_allocator = BlockAllocator{ .groups = layout.groups };
@@ -1040,6 +1083,7 @@ fn solveTotalBlocks(
     inode_count: usize,
     needed_blocks: u32,
     floor_blocks: u32,
+    bytes_per_inode: ?u32,
 ) PopulateError!u32 {
     // Whole block groups are searched first, because "do G groups fit" is
     // monotone in G and so safe to bisect: a group brings its own blocks,
@@ -1050,14 +1094,14 @@ fn solveTotalBlocks(
     const max_groups = blocksToGroups(std.math.maxInt(u32), default_blocks_per_group);
     var low: u32 = 1;
     var high: u32 = 1;
-    while (!try groupCountFits(allocator, inode_count, needed_blocks, high)) {
+    while (!try groupCountFits(allocator, inode_count, needed_blocks, high, bytes_per_inode)) {
         if (high >= max_groups) return error.FilesystemTooLarge;
         low = high + 1;
         high = if (high > max_groups / 2) max_groups else high * 2;
     }
     while (low < high) {
         const mid = low + (high - low) / 2;
-        if (try groupCountFits(allocator, inode_count, needed_blocks, mid)) {
+        if (try groupCountFits(allocator, inode_count, needed_blocks, mid, bytes_per_inode)) {
             high = mid;
         } else {
             low = mid + 1;
@@ -1069,7 +1113,14 @@ fn solveTotalBlocks(
     // is the larger of them, and the size inside that group is what
     // `trimToLastGroup` then resolves.
     const floor_groups = @max(@as(u32, 1), blocksToGroups(floor_blocks, default_blocks_per_group));
-    return trimToLastGroup(allocator, inode_count, needed_blocks, @max(low, floor_groups), floor_blocks);
+    return trimToLastGroup(
+        allocator,
+        inode_count,
+        needed_blocks,
+        @max(low, floor_groups),
+        floor_blocks,
+        bytes_per_inode,
+    );
 }
 
 fn groupCountFits(
@@ -1077,12 +1128,14 @@ fn groupCountFits(
     inode_count: usize,
     needed_blocks: u32,
     group_count: u32,
+    bytes_per_inode: ?u32,
 ) PopulateError!bool {
     const layout = buildLayout(
         allocator,
         blocksForGroupCount(group_count),
         inode_count,
         needed_blocks,
+        bytes_per_inode,
     ) catch |err| switch (err) {
         // Both mean "this geometry is too small", which is exactly what the
         // search exists to walk past. Every other failure is real.
@@ -1115,9 +1168,10 @@ fn trimToLastGroup(
     needed_blocks: u32,
     group_count: u32,
     floor_blocks: u32,
+    bytes_per_inode: ?u32,
 ) PopulateError!u32 {
     const full_blocks = blocksForGroupCount(group_count);
-    const layout = try buildLayout(allocator, full_blocks, inode_count, needed_blocks);
+    const layout = try buildLayout(allocator, full_blocks, inode_count, needed_blocks, bytes_per_inode);
     const spare = countFreeBlocks(layout.groups) - needed_blocks;
     const last = layout.groups[layout.groups.len - 1];
     const last_capacity = last.data_capacity;
@@ -1132,7 +1186,7 @@ fn trimToLastGroup(
     // The trimmed geometry is derived rather than searched, so it is
     // confirmed against the one definition of what a block group costs
     // before it is handed back as an answer.
-    const confirmed = try buildLayout(allocator, total, inode_count, needed_blocks);
+    const confirmed = try buildLayout(allocator, total, inode_count, needed_blocks, bytes_per_inode);
     allocator.free(confirmed.groups);
     return total;
 }
@@ -1210,6 +1264,7 @@ fn preparePopulate(
         total_blocks,
         writer.inode_count,
         writer.data_blocks_needed,
+        options.inodes.bytes_per_inode,
     );
     errdefer allocator.free(layout.groups);
 
@@ -5636,7 +5691,13 @@ fn buildPlan(
     };
 }
 
-fn buildLayout(allocator: std.mem.Allocator, total_blocks: u32, node_count: usize, data_blocks_needed: u32) PopulateError!Layout {
+fn buildLayout(
+    allocator: std.mem.Allocator,
+    total_blocks: u32,
+    node_count: usize,
+    data_blocks_needed: u32,
+    bytes_per_inode: ?u32,
+) PopulateError!Layout {
     const group_count = blocksToGroups(total_blocks, default_blocks_per_group);
     const gdt_blocks = @max(@as(u32, 1), blocksForBytes(@as(u64, group_count) * group_desc_size, default_block_size));
 
@@ -5645,6 +5706,18 @@ fn buildLayout(allocator: std.mem.Allocator, total_blocks: u32, node_count: usiz
     var inodes_per_group = divCeil(total_used_inodes, group_count);
     const inodes_per_block = default_block_size / writer_inode_size;
     inodes_per_group = alignUpU32(@max(inodes_per_group, inodes_per_block), inodes_per_block);
+    // A ratio is a floor on top of what the content needs, so filesystems
+    // larger than their content get spare inodes and content that needs more
+    // than the ratio allows for still gets them. Exceeding the per-group
+    // ceiling here is refused rather than clamped: a ratio that cannot be
+    // honoured is a configuration error, not something to silently round away.
+    if (bytes_per_inode) |ratio| {
+        if (ratio == 0) return error.InvalidInodeRatio;
+        const by_size = @as(u64, total_blocks) * default_block_size / ratio;
+        const per_group = std.math.cast(u32, divCeil(by_size, @as(u64, group_count))) orelse
+            return error.TooManyInodes;
+        inodes_per_group = alignUpU32(@max(inodes_per_group, per_group), inodes_per_block);
+    }
     if (inodes_per_group > default_block_size * 8) return error.TooManyInodes;
 
     const inode_table_blocks = divCeil(@as(u32, inodes_per_group) * writer_inode_size, default_block_size);
@@ -9536,6 +9609,103 @@ test "the writer names every journal size it refuses" {
             .{ .length = case.length, .journal = case.journal },
         ));
     }
+}
+
+test "without an inode ratio a filesystem gets only the inodes its content needs" {
+    const io = std.testing.io;
+    const path = "test-ext4-inodes-content.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = journalTestTree();
+    tree.bind();
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    const info = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = 64 * 1024 * 1024,
+    });
+    // Five entries plus the root, on top of the reserved inodes, rounded up
+    // to a whole inode block. A 64 MiB filesystem that mke2fs formatted would
+    // have 4096 of them; this has enough for the tree and nothing else.
+    try std.testing.expectEqual(@as(u32, 16), info.inode_count);
+}
+
+test "an inode ratio gives a filesystem the inodes its size warrants" {
+    const io = std.testing.io;
+    const path = "test-ext4-inodes-ratio.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = journalTestTree();
+    tree.bind();
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    const info = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = 64 * 1024 * 1024,
+        .inodes = .{ .bytes_per_inode = 16384 },
+    });
+    // 64 MiB at mke2fs's own default ratio is 4096 inodes, and the tree
+    // occupies a handful of them.
+    try std.testing.expectEqual(@as(u32, 4096), info.inode_count);
+    try std.testing.expect(info.free_inode_count > 4000);
+}
+
+test "an inode ratio is a floor, so content that needs more inodes still gets them" {
+    const io = std.testing.io;
+    const path = "test-ext4-inodes-floor.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // Far more files than a 16 MiB filesystem's ratio would allow for: at
+    // 16384 bytes per inode that budget is 1024, and this needs more.
+    var entries: [1500]InMemoryEntry = undefined;
+    var name_storage: [1500][16]u8 = undefined;
+    for (&entries, 0..) |*entry, index| {
+        const name = std.fmt.bufPrint(&name_storage[index], "f{d:0>6}", .{index}) catch unreachable;
+        entry.* = .{ .path = name, .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 0 };
+    }
+    var tree = InMemoryTree.init(&entries);
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    const info = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = 16 * 1024 * 1024,
+        .inodes = .{ .bytes_per_inode = 16384 },
+    });
+    try std.testing.expect(info.inode_count >= 1500);
+}
+
+test "an inode ratio of zero is refused rather than dividing by it" {
+    const io = std.testing.io;
+    const path = "test-ext4-inodes-zero.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = journalTestTree();
+    tree.bind();
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    try std.testing.expectError(error.InvalidInodeRatio, populate(
+        io,
+        file,
+        std.testing.allocator,
+        &tree.view,
+        .{ .length = 64 * 1024 * 1024, .inodes = .{ .bytes_per_inode = 0 } },
+    ));
+}
+
+test "an inode ratio raises the minimum size, because the inode table is bigger" {
+    var plain_tree = journalTestTree();
+    plain_tree.bind();
+    const plain = try minimumPopulateLength(std.testing.allocator, &plain_tree.view, .{
+        .length = 0,
+    });
+
+    var dense_tree = journalTestTree();
+    dense_tree.bind();
+    const dense = try minimumPopulateLength(std.testing.allocator, &dense_tree.view, .{
+        .length = 0,
+        .inodes = .{ .bytes_per_inode = 16384 },
+    });
+
+    try std.testing.expect(dense.length >= plain.length);
 }
 
 test "an explicit journal size is honoured and still passes e2fsck" {

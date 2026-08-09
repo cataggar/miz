@@ -43,7 +43,8 @@ zvmi/
                               #   layouts, registry/auth, and copy engine
         ext4.zig              # native ext4 writer + readback helper (htree
                               #   dirs, metadata checksums, extent trees,
-                              #   offline resize; opt-in JBD2 journal)
+                              #   offline resize; opt-in JBD2 journal and
+                              #   inode ratio)
         bootconfig.zig         # ESP bootloader population (copy EFI binaries
                               #   + Secure Boot MOK/UKI orchestration)
         uki.zig                # low-level UKI/systemd-stub PE section
