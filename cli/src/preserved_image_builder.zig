@@ -41,6 +41,7 @@ const LoadedConfiguration = struct {
     source_mounts: []const zvmi.customize.SourceMount,
     identity_rewrite: zvmi.customize.IdentityRewritePolicy,
     journal: zvmi.ext4.JournalOptions,
+    inodes: zvmi.ext4.InodeOptions,
     operations: []const zvmi.customize.ExistingPathOperation,
     os: zvmi.customize.OsCustomization,
     generalization: zvmi.customize.GeneralizationPolicy,
@@ -217,6 +218,7 @@ pub fn main(init: std.process.Init) !void {
             .source_mounts = configuration.source_mounts,
             .identity_rewrite = configuration.identity_rewrite,
             .journal = configuration.journal,
+            .inodes = configuration.inodes,
         } },
         .os = configuration.os,
         .existing_path_operations = configuration.operations,
@@ -560,9 +562,10 @@ fn loadV2Configuration(
         .source_profile = .strict,
         .source_mounts = &.{},
         .identity_rewrite = .rewrite_and_verify,
-        // The v2 wire format has no journal field, so a v2 configuration
-        // keeps producing exactly what it always has.
+        // The v2 wire format has neither a journal nor an inode field, so a
+        // v2 configuration keeps producing exactly what it always has.
         .journal = .{},
+        .inodes = .{},
         .operations = try mapOperations(allocator, parsed.value.operations, source_paths),
         .os = customization.os,
         .generalization = customization.generalization,
@@ -623,6 +626,7 @@ fn loadV3Configuration(
             .enabled = parsed.value.journal.enabled,
             .size_bytes = parsed.value.journal.size_bytes,
         },
+        .inodes = .{ .bytes_per_inode = parsed.value.inodes.bytes_per_inode },
         .operations = try mapOperations(allocator, parsed.value.operations, source_paths),
         .os = customization.os,
         .generalization = customization.generalization,

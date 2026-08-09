@@ -46,6 +46,25 @@ pub const JournalPolicy = struct {
     size_bytes: ?u64 = null,
 };
 
+/// How many inodes the rebuilt root filesystem gets. `rebuild`-only, like
+/// every other field that describes the filesystem the rebuild writes.
+///
+/// The rebuild sizes its inode table from the tree it assembled, so by
+/// default a filesystem gets room for exactly the files it was built from.
+/// For a preserved image that is almost always wrong: the partition is
+/// whatever the source had, the content is smaller, and the result boots with
+/// free blocks and no free inodes. Every attempt to create a file then fails
+/// with `ENOSPC`, which names the disk rather than the inode table.
+///
+/// Null keeps that historical behaviour, so a configuration written before
+/// this existed keeps producing the same bytes.
+pub const InodePolicy = struct {
+    /// Bytes of filesystem per inode, `mke2fs -i` style, applied as a floor on
+    /// top of what the content needs. 16384 is `mke2fs`'s own default at image
+    /// sizes and is what a distro-installed root filesystem has.
+    bytes_per_inode: ?u32 = null,
+};
+
 /// What the rebuild is allowed to do about the identifiers it retires.
 /// `rewrite_and_verify` is the default because the failure the verification
 /// pass prevents -- an image whose `/etc/fstab` or bootloader configuration
@@ -419,6 +438,9 @@ pub const Configuration = struct {
     /// every other backend preserves the source's filesystem rather than
     /// writing a new one, so there is nothing here for it to decide.
     journal: JournalPolicy = .{},
+    /// How many inodes the rebuilt root filesystem gets. `rebuild`-only for
+    /// the same reason as `journal`.
+    inodes: InodePolicy = .{},
     /// Wall-clock budget for the whole run. Absent means unbounded, which is
     /// what every configuration written before this field said and still
     /// says. Applies to every backend: it bounds the run, not the backend.
@@ -442,6 +464,7 @@ pub const ValidationError = error{
     UnexpectedSourceMounts,
     UnexpectedIdentityRewrite,
     UnexpectedJournalPolicy,
+    UnexpectedInodePolicy,
     MissingMountTarget,
     UnsupportedPartitionSelectorForApiVersion,
 };
@@ -501,6 +524,9 @@ pub fn validate(configuration: Configuration, source_count: usize) ValidationErr
         (configuration.journal.enabled or configuration.journal.size_bytes != null))
     {
         return error.UnexpectedJournalPolicy;
+    }
+    if (configuration.backend != .rebuild and configuration.inodes.bytes_per_inode != null) {
+        return error.UnexpectedInodePolicy;
     }
     for (configuration.source_mounts) |mount| {
         try validatePartition(mount.partition);
@@ -907,6 +933,26 @@ test "the journal policy only travels with the backend that writes a filesystem"
         .root_partition = .{ .mbr_index = 3 },
         .vm = .{ .emulator_command = "qemu-system-x86_64" },
         .journal = .{ .size_bytes = 32 * 1024 * 1024 },
+    }, 0));
+    try validate(.{
+        .backend = .native_edit,
+        .root_partition = .{ .mbr_index = 3 },
+    }, 0);
+}
+
+test "an inode policy is accepted only by the backend that writes a filesystem" {
+    try validate(.{
+        .backend = .rebuild,
+        .root_partition = .{ .mbr_index = 3 },
+        .inodes = .{ .bytes_per_inode = 16384 },
+    }, 0);
+    // Every other backend keeps the source's filesystem, inode table
+    // included, so a ratio there would read as an accepted setting that
+    // nothing acts on.
+    try std.testing.expectError(error.UnexpectedInodePolicy, validate(.{
+        .backend = .native_edit,
+        .root_partition = .{ .mbr_index = 3 },
+        .inodes = .{ .bytes_per_inode = 16384 },
     }, 0));
     try validate(.{
         .backend = .native_edit,
