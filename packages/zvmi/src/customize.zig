@@ -23,6 +23,7 @@ const identity_rewrite = @import("identity_rewrite.zig");
 const initramfs_mod = @import("initramfs.zig");
 const limits_mod = @import("limits.zig");
 const mbr = @import("mbr.zig");
+const oci = @import("oci.zig");
 const os_customization = @import("os_customization.zig");
 const output_mod = @import("output.zig");
 const packages_mod = @import("packages.zig");
@@ -133,6 +134,8 @@ pub const ContainerSource = union(enum) {
     /// An OCI image-layout directory or a docker/podman save archive on the
     /// build machine.
     host_path: []const u8,
+    /// An image the run fetches from an OCI registry.
+    registry: RegistryImage,
 
     /// The build-machine path this source reads, when it reads one. Used by the
     /// checks that keep a build from writing into its own input; a source that
@@ -140,8 +143,44 @@ pub const ContainerSource = union(enum) {
     pub fn hostPath(self: ContainerSource) ?[]const u8 {
         return switch (self) {
             .host_path => |path| if (path.len == 0) null else path,
+            .registry => null,
         };
     }
+};
+
+/// An image named in a registry, to be fetched during the run.
+///
+/// The reference is the whole identity: a plan that names one of these says
+/// which bytes the run will read as exactly as a path does, because validation
+/// refuses anything but a digest. What a tag points at is a property of the
+/// registry at the moment of the fetch, and a plan whose meaning could change
+/// under it without the plan changing is not a plan. `zvmi oci pin` turns a tag
+/// into the digest it names now, so the caller resolves that ambiguity once, in
+/// the open, instead of the run resolving it silently on every build.
+pub const RegistryImage = struct {
+    /// A `docker://<authority>/<repository>@sha256:<hex>` reference.
+    reference: []const u8,
+    /// How the run reaches the registry.
+    access: RegistryAccess = .{},
+};
+
+/// Everything about reaching a registry that is not the image's name.
+///
+/// Stated rather than discovered. The registry client can find a credential in
+/// six ambient locations, and it is exactly that search which makes a build
+/// depend on the machine it ran on; a request that names its credential names
+/// its identity too, and one that names none authenticates as nobody.
+pub const RegistryAccess = struct {
+    /// Authentication for this registry, or none. The password is a reference
+    /// to material, never the material -- see `CredentialSource`.
+    credential: ?BasicCredential = null,
+    /// A PEM file of additional certificate authorities to trust for this
+    /// registry, or none for the host's default trust store.
+    tls_ca: ?[]const u8 = null,
+    /// Speak plain HTTP instead of HTTPS. For a development registry on
+    /// loopback; validation refuses it anywhere a credential could leave the
+    /// machine in the clear.
+    plain_http: bool = false,
 };
 
 pub const IsoOciInput = struct {
@@ -1250,6 +1289,7 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
                 .host_path => |path| if (path.len == 0) {
                     try diagnostics.append(validationError(.missing_input_path, "/input/iso_oci/container/host_path", "container path must not be empty", null));
                 },
+                .registry => |image| try validateRegistryImage(&diagnostics, image),
             }
             if (input.rootfs_path_in_iso == null or input.rootfs_path_in_iso.?.len == 0) {
                 try diagnostics.append(validationError(
@@ -2026,6 +2066,132 @@ fn validateRepositoryCredential(
         ));
         break;
     }
+}
+
+/// A registry image is checked for everything that can be decided from the
+/// request alone, which is more than it looks: the reference's shape, that it
+/// names bytes rather than a moving label, and that a declared credential
+/// cannot leave the machine in the clear. None of it opens a socket or a file,
+/// so `validate` stays pure and a caller learns of a mistake before a build
+/// starts rather than partway through one.
+fn validateRegistryImage(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    image: RegistryImage,
+) !void {
+    const parsed = oci.reference.parse(image.reference, .source) catch {
+        try diagnostics.append(validationError(
+            .invalid_policy,
+            "/input/iso_oci/container/registry/reference",
+            "a registry image must be named by a docker://<authority>/<repository>@sha256:<hex> reference",
+            "write the reference in full; there is no implicit registry, namespace, or tag",
+        ));
+        // Nothing further can be said about a reference that did not parse,
+        // and guessing at its authority to check the transport would be a
+        // second diagnostic about the same one mistake.
+        return;
+    };
+    const registry_reference = switch (parsed) {
+        .registry => |value| value,
+        .layout => {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                "/input/iso_oci/container/registry/reference",
+                "a registry image must use a docker:// reference",
+                "declare an oci: image layout as container.host_path instead",
+            ));
+            return;
+        },
+    };
+    switch (registry_reference.selection orelse oci.reference.Selection{ .tag = "latest" }) {
+        .digest => {},
+        // The one rule that makes this input worth having. A tag is a label the
+        // registry may repoint at any moment, so a plan naming one would mean
+        // different bytes on different days while hashing the same -- and the
+        // provenance it produced would record a name rather than a thing.
+        .tag => try diagnostics.append(validationError(
+            .invalid_policy,
+            "/input/iso_oci/container/registry/reference",
+            "a registry image must be named by digest, not by tag",
+            "run `zvmi oci pin <reference>` and declare the digest it prints",
+        )),
+    }
+
+    if (image.access.credential) |credential| {
+        if (credential.username.len == 0 or
+            credential.username.len > max_credential_field_bytes or
+            !isSingleLinePrintable(credential.username))
+        {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                "/input/iso_oci/container/registry/access/credential/basic/username",
+                "a user name must be a non-empty single-line printable value",
+                null,
+            ));
+        }
+        try validateCredentialSource(
+            diagnostics,
+            credential.password,
+            "/input/iso_oci/container/registry/access/credential/basic/password",
+        );
+        // Basic authentication puts the password on the wire under nothing but
+        // base64. Loopback is exempt because the wire is the machine itself,
+        // which is what makes a local development registry usable; anywhere
+        // else this would hand the secret to whoever is on the path.
+        if (image.access.plain_http and !isLoopbackAuthority(registry_reference.authority)) {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                "/input/iso_oci/container/registry/access/plain_http",
+                "a registry image with a declared credential must use https unless the registry is on loopback",
+                "use https, or remove the credential if the registry needs none",
+            ));
+        }
+    }
+
+    if (image.access.tls_ca) |path| {
+        if (path.len == 0 or path.len > Io.Dir.max_path_bytes or !isSingleLinePrintable(path)) {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                "/input/iso_oci/container/registry/access/tls_ca",
+                "a certificate authority file must be named by a non-empty single-line path",
+                null,
+            ));
+        }
+        // Trust material for a transport that will not be used is a policy
+        // stated and never applied, which is worse than either alternative
+        // because it reads as protection.
+        if (image.access.plain_http) {
+            try diagnostics.append(validationError(
+                .invalid_policy,
+                "/input/iso_oci/container/registry/access/tls_ca",
+                "a certificate authority cannot apply to a plain-HTTP registry",
+                "drop plain_http to use the declared authority, or drop tls_ca",
+            ));
+        }
+    }
+}
+
+/// Whether an OCI authority (`host` or `host:port`) names the build machine.
+fn isLoopbackAuthority(authority: []const u8) bool {
+    const host = if (std.mem.startsWith(u8, authority, "["))
+        authority[0 .. (std.mem.indexOfScalar(u8, authority, ']') orelse return false) + 1]
+    else if (std.mem.indexOfScalar(u8, authority, ':')) |colon|
+        authority[0..colon]
+    else
+        authority;
+    if (std.ascii.eqlIgnoreCase(host, "localhost") or
+        std.mem.eql(u8, host, "::1") or
+        std.mem.eql(u8, host, "[::1]"))
+    {
+        return true;
+    }
+    var parts = std.mem.splitScalar(u8, host, '.');
+    if (!std.mem.eql(u8, parts.next() orelse return false, "127")) return false;
+    var count: usize = 1;
+    while (parts.next()) |part| {
+        _ = std.fmt.parseInt(u8, part, 10) catch return false;
+        count += 1;
+    }
+    return count == 4;
 }
 
 fn validateCredentialSource(
@@ -3141,6 +3307,16 @@ pub const CapabilityKind = enum {
     repository_trust,
     package_cache,
     package_lock,
+    /// Declares that the run fetches a container image from a registry named
+    /// by the request.
+    ///
+    /// A declaration, not a probe, for the same reason `read_host_resolver` is
+    /// one and for a sharper one besides: the only preflight worth the name
+    /// would be a request to the remote host, so probing would make deciding
+    /// whether a plan may talk to a registry require talking to it. What this
+    /// states is that the run reaches off the build machine at all, which is
+    /// exactly what a consumer refusing network inputs needs to see.
+    registry_access,
     /// Declares that the run's name resolution comes from the build host
     /// rather than from the request.
     ///
@@ -3626,6 +3802,9 @@ pub fn resolve(
             .container = switch (input.container) {
                 .host_path => |path| .{
                     .host_path = try std.fs.path.resolve(plan_allocator, &.{ context.base_path, path }),
+                },
+                .registry => |image| .{
+                    .registry = try resolveRegistryImage(plan_allocator, context.base_path, image),
                 },
             },
             .rootfs_path_in_iso = try plan_allocator.dupe(u8, input.rootfs_path_in_iso.?),
@@ -4323,6 +4502,69 @@ fn dupeBootPolicy(
     };
 }
 
+/// Puts a registry reference into the one spelling that names its image.
+///
+/// The digest is re-rendered from its bytes rather than copied, so a plan is
+/// the same whichever way a caller spelled the hex; the credential is copied by
+/// reference, never read, so no material enters the plan. A path to a
+/// certificate authority is resolved against the build file like other trust
+/// material, and unlike a credential file, which validation already demands be
+/// absolute.
+fn resolveRegistryImage(
+    allocator: Allocator,
+    base_path: ?[]const u8,
+    image: RegistryImage,
+) Allocator.Error!RegistryImage {
+    const reference = canonicalRegistryReference(allocator, image.reference) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Unreachable in practice: `resolve` returns before this on any
+        // validation error, and an unparseable reference is one. Copying the
+        // text keeps that a wrong plan rather than a crash.
+        error.InvalidReference => try allocator.dupe(u8, image.reference),
+    };
+    return .{
+        .reference = reference,
+        .access = .{
+            .credential = if (image.access.credential) |credential| .{
+                .username = try allocator.dupe(u8, credential.username),
+                .password = switch (credential.password) {
+                    .host_path => |path| .{ .host_path = try allocator.dupe(u8, path) },
+                    .host_environment => |name| .{ .host_environment = try allocator.dupe(u8, name) },
+                },
+            } else null,
+            .tls_ca = if (image.access.tls_ca) |path|
+                if (base_path) |base|
+                    try std.fs.path.resolve(allocator, &.{ base, path })
+                else
+                    try allocator.dupe(u8, path)
+            else
+                null,
+            .plain_http = image.access.plain_http,
+        },
+    };
+}
+
+fn canonicalRegistryReference(
+    allocator: Allocator,
+    text: []const u8,
+) (Allocator.Error || error{InvalidReference})!  []const u8 {
+    const parsed = oci.reference.parse(text, .source) catch return error.InvalidReference;
+    const registry_reference = switch (parsed) {
+        .registry => |value| value,
+        .layout => return error.InvalidReference,
+    };
+    const selection = registry_reference.selection orelse return error.InvalidReference;
+    const digest = switch (selection) {
+        .digest => |value| value,
+        .tag => return error.InvalidReference,
+    };
+    return std.fmt.allocPrint(allocator, "docker://{s}/{s}@{s}", .{
+        registry_reference.authority,
+        registry_reference.repository,
+        &digest.format(),
+    });
+}
+
 fn dupeTrustSource(
     allocator: Allocator,
     source: TrustSource,
@@ -4573,6 +4815,10 @@ fn buildCapabilities(
             try appendIsolationCapability(&capabilities, output.path, iso_oci.iso_path, "keep the output distinct from the source ISO");
             if (container_path) |path| {
                 try appendIsolationCapability(&capabilities, output.path, path, "keep the output outside the source container");
+            }
+            switch (iso_oci.container) {
+                .host_path => {},
+                .registry => |image| try appendRegistryCapabilities(&capabilities, allocator, output, image),
             }
         },
         .disk => |disk| {
@@ -4889,6 +5135,48 @@ fn buildCapabilities(
     return try capabilities.toOwnedSlice();
 }
 
+/// Names what a registry input reaches off the build machine for.
+///
+/// One capability for the fetch, one per declared credential, and one per
+/// declared certificate authority -- the same shape the package repositories
+/// use, and for the same reason: a consumer refusing host inputs needs to see
+/// which file or variable, not merely that there was one.
+fn appendRegistryCapabilities(
+    capabilities: *std.array_list.Managed(CapabilityRequirement),
+    allocator: Allocator,
+    output: ResolvedOutput,
+    image: RegistryImage,
+) Allocator.Error!void {
+    try capabilities.append(.{
+        .kind = .registry_access,
+        .path = image.reference,
+        .reason = "fetch the declared container image from its registry",
+    });
+    if (image.access.credential) |credential| {
+        try capabilities.append(.{
+            .kind = .read_host_credential,
+            .path = switch (credential.password) {
+                .host_path => |file| file,
+                .host_environment => |name| try std.fmt.allocPrint(allocator, "env:{s}", .{name}),
+            },
+            .reason = "authenticate to the declared container registry",
+        });
+    }
+    if (image.access.tls_ca) |path| {
+        try capabilities.append(.{
+            .kind = .read_trust_source,
+            .path = path,
+            .reason = "read the declared registry certificate authority",
+        });
+        try appendIsolationCapability(
+            capabilities,
+            output.path,
+            path,
+            "keep the output distinct from the registry certificate authority",
+        );
+    }
+}
+
 fn appendIsolationCapability(
     capabilities: *std.array_list.Managed(CapabilityRequirement),
     output_path: []const u8,
@@ -5059,6 +5347,27 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
             hashInt(&hash, @intFromEnum(std.meta.activeTag(input.container)));
             switch (input.container) {
                 .host_path => |path| hashString(&hash, path),
+                // The canonical reference covers the authority, the repository
+                // and the digest at once, so the hash covers the image itself.
+                // The credential is covered only by where it comes from, never
+                // by what it is: a plan hash over a password would verify a
+                // guess of it offline. Which file holds it is part of the plan;
+                // what is in that file today is not.
+                .registry => |image| {
+                    hashString(&hash, image.reference);
+                    hashInt(&hash, @intFromBool(image.access.credential != null));
+                    if (image.access.credential) |credential| {
+                        hashString(&hash, credential.username);
+                        hashInt(&hash, @intFromEnum(std.meta.activeTag(credential.password)));
+                        switch (credential.password) {
+                            .host_path => |path| hashString(&hash, path),
+                            .host_environment => |name| hashString(&hash, name),
+                        }
+                    }
+                    hashInt(&hash, @intFromBool(image.access.tls_ca != null));
+                    if (image.access.tls_ca) |path| hashString(&hash, path);
+                    hashInt(&hash, @intFromBool(image.access.plain_http));
+                },
             }
             hashString(&hash, input.rootfs_path_in_iso);
         },
@@ -6076,6 +6385,9 @@ fn systemCapabilityCheck(_: ?*anyopaque, io: Io, requirement: CapabilityRequirem
         // Same reasoning, and one more: probing would mean opening a secret to
         // decide whether the plan may open it.
         .read_host_credential,
+        // Same reasoning again, and the probe would itself be the network
+        // access being decided about.
+        .registry_access,
         => .available,
         .rebuild,
         .unsafe_chroot,
@@ -6438,6 +6750,8 @@ fn pathAbsent(dir: Io.Dir, io: Io, path: []const u8) bool {
 pub const SourceKind = enum {
     iso,
     container,
+    /// A container image fetched from a registry rather than read from disk.
+    registry_image,
     customization_file,
     disk,
     disk_dependency,
@@ -7423,6 +7737,9 @@ fn buildResult(
             .iso_path = try result_allocator.dupe(u8, value.iso_path),
             .container = switch (value.container) {
                 .host_path => |path| .{ .host_path = try result_allocator.dupe(u8, path) },
+                // Already canonical and already free of material, so there is
+                // nothing to resolve here -- only ownership to move.
+                .registry => |image| .{ .registry = try resolveRegistryImage(result_allocator, null, image) },
             },
             .rootfs_path_in_iso = try result_allocator.dupe(u8, value.rootfs_path_in_iso),
         } },
@@ -7864,6 +8181,24 @@ pub fn execute(
             .configuration_path = "/",
             .message = "the resolved plan failed its integrity or backend invariant checks",
             .remediation = "execute the immutable plan returned by resolve without modification",
+        });
+        emitDiagnostics(event_sink, diagnostics.items);
+        return try failureOutcome(allocator, diagnostics.items);
+    }
+
+    // Refused here rather than at validation or resolution, because a plan
+    // naming a registry image is a correct plan: it says exactly which bytes
+    // the run would read. Only the fetch that would read them is missing, and
+    // that is an execution fact, so a caller can still resolve such a plan,
+    // hash it, and inspect its capabilities today.
+    if (plan.data.input == .iso_oci and plan.data.input.iso_oci.container == .registry) {
+        try diagnostics.append(.{
+            .severity = .@"error",
+            .phase = .execution,
+            .code = .unsupported_input,
+            .configuration_path = "/input/iso_oci/container/registry",
+            .message = "fetching a container image from a registry is not implemented in this build",
+            .remediation = "pull the image into an OCI layout and declare it as container.host_path",
         });
         emitDiagnostics(event_sink, diagnostics.items);
         return try failureOutcome(allocator, diagnostics.items);
@@ -8567,6 +8902,10 @@ fn buildOptionsFromPlan(
         .iso_path = input.iso_path,
         .container_path = switch (input.container) {
             .host_path => |path| path,
+            // `execute` refuses a registry input before it reaches a backend,
+            // so this arm is reachable only if that refusal is removed without
+            // implementing the fetch that replaces it.
+            .registry => unreachable,
         },
         .output_path = plan.data.staging_output_path,
         .size = plan.data.output.disk_size,
@@ -8922,6 +9261,7 @@ fn hashPlanSources(
             try appendHashedSource(&records, allocator, io, .iso, input.iso_path);
             switch (input.container) {
                 .host_path => |path| try appendHashedSource(&records, allocator, io, .container, path),
+                .registry => |image| try appendRegistryImageSource(&records, allocator, image),
             }
         },
         .disk => |input| {
@@ -9027,6 +9367,42 @@ fn appendInlineSource(
         .kind = kind,
         .path = path,
         .sha256 = .{ .bytes = digest },
+    });
+}
+
+/// Records the image a registry input names, by the digest that names it.
+///
+/// Like `appendInlineSource`, the `path` is deliberately not a filesystem path
+/// and nothing opens it. The digest is not computed from anything either -- it
+/// *is* the reference, taken apart. That is what makes the record safe against
+/// the re-read at the end of the run: the pull already verified the fetched
+/// bytes against this digest, so a record that could differ between the two
+/// reads would mean the reference itself had changed, which cannot happen
+/// inside one run. Hashing the fetched layout instead would record where the
+/// bytes landed rather than which bytes they were, and would report a
+/// `source_changed` failure for a directory the run itself wrote.
+fn appendRegistryImageSource(
+    records: *std.array_list.Managed(SourceRecord),
+    allocator: Allocator,
+    image: RegistryImage,
+) !void {
+    const parsed = oci.reference.parse(image.reference, .source) catch return error.InvalidRegistryReference;
+    const digest = switch (parsed) {
+        .registry => |value| switch (value.selection orelse return error.InvalidRegistryReference) {
+            .digest => |value_digest| value_digest,
+            .tag => return error.InvalidRegistryReference,
+        },
+        .layout => return error.InvalidRegistryReference,
+    };
+    for (records.items) |record| {
+        if (record.kind == .registry_image and std.mem.eql(u8, record.path, image.reference)) return;
+    }
+    const owned_path = try allocator.dupe(u8, image.reference);
+    errdefer allocator.free(owned_path);
+    try records.append(.{
+        .kind = .registry_image,
+        .path = owned_path,
+        .sha256 = .{ .bytes = digest.bytes },
     });
 }
 
@@ -11102,6 +11478,374 @@ test "a host-path container keeps the diagnostics, capabilities and plan it alwa
     };
     try std.testing.expectEqualStrings(container.host_path, read_container_path.?);
     try std.testing.expectEqual(@as(usize, 2), isolation_paths);
+}
+
+const test_registry_digest = "sha256:" ++ ("ab" ** 32);
+const test_registry_other_digest = "sha256:" ++ ("cd" ** 32);
+const test_registry_reference = "docker://registry.example.invalid/base/image@" ++ test_registry_digest;
+
+fn registryRequest(reference: []const u8) Request {
+    var request = validRequest();
+    request.input.iso_oci.container = .{ .registry = .{ .reference = reference } };
+    return request;
+}
+
+fn registryDiagnostic(
+    diagnostics: DiagnosticSet,
+    path: []const u8,
+) ?Diagnostic {
+    for (diagnostics.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.configuration_path, path)) return diagnostic;
+    }
+    return null;
+}
+
+// The rule the whole input exists for. A tag is a label the registry may
+// repoint, so accepting one would make a plan mean different bytes on
+// different days while hashing the same.
+test "a registry image named by tag is refused where it is written" {
+    var request = registryRequest("docker://registry.example.invalid/base/image:latest");
+    var diagnostics = try validate(std.testing.allocator, &request);
+    defer diagnostics.deinit(std.testing.allocator);
+
+    const diagnostic = registryDiagnostic(
+        diagnostics,
+        "/input/iso_oci/container/registry/reference",
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(DiagnosticCode.invalid_policy, diagnostic.code);
+    try std.testing.expectEqualStrings(
+        "a registry image must be named by digest, not by tag",
+        diagnostic.message,
+    );
+    // The remediation names the command that turns the one into the other,
+    // because a caller told only that tags are refused has to guess how.
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.remediation.?, "zvmi oci pin") != null);
+}
+
+test "a registry reference that is not a digest-selected docker reference is refused" {
+    const cases = [_][]const u8{
+        "registry.example.invalid/base/image@" ++ test_registry_digest,
+        "oci:layout@" ++ test_registry_digest,
+        "docker://registry.example.invalid/base/image",
+        "",
+    };
+    for (cases) |reference| {
+        var request = registryRequest(reference);
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        const diagnostic = registryDiagnostic(
+            diagnostics,
+            "/input/iso_oci/container/registry/reference",
+        ) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(DiagnosticCode.invalid_policy, diagnostic.code);
+    }
+}
+
+test "a digest-named registry image validates and resolves to a canonical reference" {
+    var request = registryRequest(test_registry_reference);
+    {
+        var diagnostics = try validate(std.testing.allocator, &request);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expect(!diagnostics.hasErrors());
+    }
+
+    var resolved = try resolve(
+        std.testing.allocator,
+        &request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer resolved.deinit(std.testing.allocator);
+    const plan = resolved.plan orelse return error.TestUnexpectedResult;
+    const container = plan.data.input.iso_oci.container;
+    try std.testing.expect(container == .registry);
+    try std.testing.expectEqualStrings(test_registry_reference, container.registry.reference);
+    // Nothing about a registry image is a build-machine path, so the guards
+    // that keep a build from writing into its own input have nothing to guard.
+    try std.testing.expectEqual(@as(?[]const u8, null), container.hostPath());
+}
+
+test "resolving a registry input twice produces the same plan" {
+    var request = registryRequest(test_registry_reference);
+    request.input.iso_oci.container.registry.access = .{
+        .credential = .{
+            .username = "builder",
+            .password = .{ .host_environment = "ZVMI_TEST_REGISTRY_TOKEN" },
+        },
+    };
+
+    var first = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer first.deinit(std.testing.allocator);
+    var second = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer second.deinit(std.testing.allocator);
+
+    const first_plan = first.plan orelse return error.TestUnexpectedResult;
+    const second_plan = second.plan orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(
+        u8,
+        &first_plan.data.plan_hash.bytes,
+        &second_plan.data.plan_hash.bytes,
+    );
+
+    var first_json: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer first_json.deinit();
+    try writePlanJson(&first_plan, &first_json.writer);
+    var second_json: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer second_json.deinit();
+    try writePlanJson(&second_plan, &second_json.writer);
+    try std.testing.expectEqualStrings(first_json.written(), second_json.written());
+}
+
+fn registryPlanHash(request: *const Request) !Digest {
+    var resolved = try resolve(std.testing.allocator, request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    const plan = resolved.plan orelse return error.TestUnexpectedResult;
+    return plan.data.plan_hash;
+}
+
+test "the plan hash covers the image and where its credential comes from" {
+    var base = registryRequest(test_registry_reference);
+    const base_hash = try registryPlanHash(&base);
+
+    var other_image = registryRequest("docker://registry.example.invalid/base/image@" ++ test_registry_other_digest);
+    try std.testing.expect(!std.mem.eql(u8, &base_hash.bytes, &(try registryPlanHash(&other_image)).bytes));
+
+    var other_repository = registryRequest("docker://registry.example.invalid/other/image@" ++ test_registry_digest);
+    try std.testing.expect(!std.mem.eql(u8, &base_hash.bytes, &(try registryPlanHash(&other_repository)).bytes));
+
+    var other_authority = registryRequest("docker://other.example.invalid/base/image@" ++ test_registry_digest);
+    try std.testing.expect(!std.mem.eql(u8, &base_hash.bytes, &(try registryPlanHash(&other_authority)).bytes));
+
+    var credentialed = registryRequest(test_registry_reference);
+    credentialed.input.iso_oci.container.registry.access.credential = .{
+        .username = "builder",
+        .password = .{ .host_environment = "ZVMI_TEST_REGISTRY_TOKEN" },
+    };
+    const credentialed_hash = try registryPlanHash(&credentialed);
+    try std.testing.expect(!std.mem.eql(u8, &base_hash.bytes, &credentialed_hash.bytes));
+
+    var other_variable = credentialed;
+    other_variable.input.iso_oci.container.registry.access.credential = .{
+        .username = "builder",
+        .password = .{ .host_environment = "ZVMI_TEST_OTHER_TOKEN" },
+    };
+    try std.testing.expect(!std.mem.eql(u8, &credentialed_hash.bytes, &(try registryPlanHash(&other_variable)).bytes));
+
+    var other_user = credentialed;
+    other_user.input.iso_oci.container.registry.access.credential = .{
+        .username = "someone-else",
+        .password = .{ .host_environment = "ZVMI_TEST_REGISTRY_TOKEN" },
+    };
+    try std.testing.expect(!std.mem.eql(u8, &credentialed_hash.bytes, &(try registryPlanHash(&other_user)).bytes));
+}
+
+// The other half of the claim above, and the one that would be quietly wrong
+// if the hash ever started reading the material: two runs on either side of a
+// password rotation are the same plan, because the instruction did not change.
+test "the plan hash does not change when the credential file's contents change" {
+    const io = std.testing.io;
+    const secret_path = "test-customize-registry-secret";
+    defer Io.Dir.cwd().deleteFile(io, secret_path) catch {};
+    var cwd_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_length = try std.process.currentPath(io, &cwd_buffer);
+    var absolute_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const absolute_secret = try std.fmt.bufPrint(
+        &absolute_buffer,
+        "{s}/{s}",
+        .{ cwd_buffer[0..cwd_length], secret_path },
+    );
+
+    var request = registryRequest(test_registry_reference);
+    request.input.iso_oci.container.registry.access.credential = .{
+        .username = "builder",
+        .password = .{ .host_path = absolute_secret },
+    };
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = secret_path, .data = "first-password\n" });
+    const before = try registryPlanHash(&request);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = secret_path, .data = "second-password\n" });
+    const after = try registryPlanHash(&request);
+    try std.testing.expectEqualSlices(u8, &before.bytes, &after.bytes);
+}
+
+test "a registry input declares registry access instead of a container read" {
+    var request = registryRequest(test_registry_reference);
+    request.input.iso_oci.container.registry.access.credential = .{
+        .username = "builder",
+        .password = .{ .host_environment = "ZVMI_TEST_REGISTRY_TOKEN" },
+    };
+
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    const plan = resolved.plan orelse return error.TestUnexpectedResult;
+
+    var registry_paths: usize = 0;
+    var credential_paths: usize = 0;
+    var container_reads: usize = 0;
+    for (plan.data.required_capabilities) |capability| switch (capability.kind) {
+        .registry_access => {
+            try std.testing.expectEqualStrings(test_registry_reference, capability.path);
+            registry_paths += 1;
+        },
+        .read_host_credential => {
+            try std.testing.expectEqualStrings("env:ZVMI_TEST_REGISTRY_TOKEN", capability.path);
+            credential_paths += 1;
+        },
+        // The point of the whole change: there is no local container to read,
+        // so a capability claiming there is would be a lie a consumer acts on.
+        .read_container => container_reads += 1,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), registry_paths);
+    try std.testing.expectEqual(@as(usize, 1), credential_paths);
+    try std.testing.expectEqual(@as(usize, 0), container_reads);
+
+    // Declared, not probed: a preflight that answered `missing` here would
+    // have had to reach the registry to find out.
+    var report = try preflight(std.testing.allocator, std.testing.io, &plan, Platform.system());
+    defer report.deinit(std.testing.allocator);
+    for (report.capabilities) |capability| {
+        if (capability.requirement.kind != .registry_access) continue;
+        try std.testing.expectEqual(CapabilityState.available, capability.state);
+    }
+}
+
+test "a registry image with no credential declares no credential capability" {
+    var request = registryRequest(test_registry_reference);
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    const plan = resolved.plan orelse return error.TestUnexpectedResult;
+    for (plan.data.required_capabilities) |capability| {
+        try std.testing.expect(capability.kind != .read_host_credential);
+    }
+}
+
+test "a registry credential must not travel in the clear off the machine" {
+    var remote = registryRequest(test_registry_reference);
+    remote.input.iso_oci.container.registry.access = .{
+        .credential = .{
+            .username = "builder",
+            .password = .{ .host_environment = "ZVMI_TEST_REGISTRY_TOKEN" },
+        },
+        .plain_http = true,
+    };
+    var remote_diagnostics = try validate(std.testing.allocator, &remote);
+    defer remote_diagnostics.deinit(std.testing.allocator);
+    const diagnostic = registryDiagnostic(
+        remote_diagnostics,
+        "/input/iso_oci/container/registry/access/plain_http",
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(DiagnosticCode.invalid_policy, diagnostic.code);
+
+    // Loopback is the exemption, because the wire is the machine itself. A
+    // development registry is the only reason plain HTTP exists here at all.
+    var local = registryRequest("docker://127.0.0.1:5000/base/image@" ++ test_registry_digest);
+    local.input.iso_oci.container.registry.access = remote.input.iso_oci.container.registry.access;
+    var local_diagnostics = try validate(std.testing.allocator, &local);
+    defer local_diagnostics.deinit(std.testing.allocator);
+    try std.testing.expect(!local_diagnostics.hasErrors());
+}
+
+test "a certificate authority declared for a plain-HTTP registry is refused" {
+    var request = registryRequest("docker://127.0.0.1:5000/base/image@" ++ test_registry_digest);
+    request.input.iso_oci.container.registry.access = .{
+        .tls_ca = "ca.pem",
+        .plain_http = true,
+    };
+    var diagnostics = try validate(std.testing.allocator, &request);
+    defer diagnostics.deinit(std.testing.allocator);
+    const diagnostic = registryDiagnostic(
+        diagnostics,
+        "/input/iso_oci/container/registry/access/tls_ca",
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(DiagnosticCode.invalid_policy, diagnostic.code);
+}
+
+test "a declared registry certificate authority is resolved and declared as trust material" {
+    var request = registryRequest(test_registry_reference);
+    request.input.iso_oci.container.registry.access.tls_ca = "ca.pem";
+
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    const plan = resolved.plan orelse return error.TestUnexpectedResult;
+
+    const expected = try std.fs.path.resolve(std.testing.allocator, &.{ ".", "ca.pem" });
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(
+        expected,
+        plan.data.input.iso_oci.container.registry.access.tls_ca.?,
+    );
+    var found = false;
+    for (plan.data.required_capabilities) |capability| {
+        if (capability.kind != .read_trust_source) continue;
+        if (!std.mem.eql(u8, capability.path, expected)) continue;
+        found = true;
+    }
+    try std.testing.expect(found);
+}
+
+// A registry image is recorded by the digest that names it, so the re-read at
+// the end of a run compares the same value it started with by construction.
+// Hashing the fetched layout instead would record where the bytes landed
+// rather than which bytes they were.
+test "the source record for a registry image is the image, not a path" {
+    // The ISO half is still a file, and `hashPlanSources` opens it, so the
+    // record this test is about is produced beside a real one rather than in
+    // a plan that has nothing else to hash.
+    const io = std.testing.io;
+    const iso_path = "test-customize-registry-source.iso";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = iso_path, .data = "not really an iso" });
+
+    var request = registryRequest(test_registry_reference);
+    request.input.iso_oci.iso_path = iso_path;
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    const plan = resolved.plan orelse return error.TestUnexpectedResult;
+
+    const before = try hashPlanSources(std.testing.allocator, io, &plan);
+    defer freeSourceRecords(std.testing.allocator, before);
+    const after = try hashPlanSources(std.testing.allocator, io, &plan);
+    defer freeSourceRecords(std.testing.allocator, after);
+    try std.testing.expect(sourceRecordsEqual(before, after));
+
+    var found = false;
+    for (before) |record| {
+        if (record.kind != .registry_image) continue;
+        found = true;
+        try std.testing.expectEqualStrings(test_registry_reference, record.path);
+        var digest_text: [71]u8 = undefined;
+        @memcpy(digest_text[0.."sha256:".len], "sha256:");
+        const hex = std.fmt.bytesToHex(record.sha256.bytes, .lower);
+        @memcpy(digest_text["sha256:".len..], &hex);
+        try std.testing.expectEqualStrings(test_registry_digest, &digest_text);
+    }
+    try std.testing.expect(found);
+    // And no filesystem container record, because there is no file to open.
+    for (before) |record| try std.testing.expect(record.kind != .container);
+}
+
+test "executing a registry input refuses by name until the fetch exists" {
+    var request = registryRequest(test_registry_reference);
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    const plan = resolved.plan orelse return error.TestUnexpectedResult;
+    try std.testing.expect(plan.data.input.iso_oci.container == .registry);
+
+    var outcome = try execute(
+        std.testing.allocator,
+        std.testing.io,
+        &resolved.plan.?,
+        Platform.system(),
+        null,
+    );
+    defer outcome.deinit(std.testing.allocator);
+    try std.testing.expect(outcome.result == null);
+    const diagnostic = registryDiagnostic(
+        outcome.diagnostics,
+        "/input/iso_oci/container/registry",
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(DiagnosticCode.unsupported_input, diagnostic.code);
+    try std.testing.expectEqual(DiagnosticPhase.execution, diagnostic.phase);
 }
 
 test "validation rejects normalized source aliases and unsupported aarch64 BIOS" {
@@ -14701,11 +15445,53 @@ test "no credential material reaches any document a run publishes" {
     var diagnostics_json: Io.Writer.Allocating = .init(std.testing.allocator);
     defer diagnostics_json.deinit();
     try writeDiagnosticsJson(outcome.diagnostics, &diagnostics_json.writer);
+
+    // The same sweep over a registry input, which declares its credential the
+    // same way and through a different part of the request. Its execution
+    // refuses rather than builds, so what it contributes is the request, the
+    // plan and the refusal -- which is every document such a run can produce
+    // today, and the three a caller reads before deciding to run one at all.
+    var registry_request = validRequest();
+    registry_request.input.iso_oci.container = .{ .registry = .{
+        .reference = test_registry_reference,
+        .access = .{ .credential = .{
+            .username = "builder",
+            .password = .{ .host_path = absolute_secret },
+        } },
+    } };
+    var registry_resolved = try resolve(
+        std.testing.allocator,
+        &registry_request,
+        .{ .host_architecture = .x86_64 },
+    );
+    defer registry_resolved.deinit(std.testing.allocator);
+    const registry_plan = registry_resolved.plan orelse return error.TestUnexpectedResult;
+    var registry_outcome = try execute(
+        std.testing.allocator,
+        io,
+        &registry_resolved.plan.?,
+        Platform.system(),
+        null,
+    );
+    defer registry_outcome.deinit(std.testing.allocator);
+    var registry_request_json: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer registry_request_json.deinit();
+    try writeRequestJson(registry_request, &registry_request_json.writer);
+    var registry_plan_json: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer registry_plan_json.deinit();
+    try writePlanJson(&registry_plan, &registry_plan_json.writer);
+    var registry_diagnostics_json: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer registry_diagnostics_json.deinit();
+    try writeDiagnosticsJson(registry_outcome.diagnostics, &registry_diagnostics_json.writer);
+
     const documents = [_]Document{
         .{ .name = "request", .bytes = request_json.written() },
         .{ .name = "plan", .bytes = plan_json.written() },
         .{ .name = "provenance", .bytes = provenance_json.written() },
         .{ .name = "diagnostics", .bytes = diagnostics_json.written() },
+        .{ .name = "registry request", .bytes = registry_request_json.written() },
+        .{ .name = "registry plan", .bytes = registry_plan_json.written() },
+        .{ .name = "registry diagnostics", .bytes = registry_diagnostics_json.written() },
     };
     for (documents) |document| {
         try std.testing.expect(
@@ -14752,6 +15538,20 @@ test "no credential material reaches any document a run publishes" {
     }
     try std.testing.expectEqual(@as(usize, 1), paths);
     try std.testing.expectEqual(@as(usize, 1), variables);
+
+    // Not vacuous for the registry half either: it published the locator and
+    // raised the capability naming it, so the sweep above cleared a document
+    // that had a credential in it rather than one that had dropped it.
+    try std.testing.expect(
+        std.mem.indexOf(u8, documents[4].bytes, absolute_secret) != null,
+    );
+    var registry_credential_paths: usize = 0;
+    for (registry_plan.data.required_capabilities) |capability| {
+        if (capability.kind != .read_host_credential) continue;
+        try std.testing.expectEqualStrings(absolute_secret, capability.path);
+        registry_credential_paths += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), registry_credential_paths);
 
     // And the batch's new records are present in the document the sweep just
     // cleared, so the sweep covered them rather than an empty execution.
