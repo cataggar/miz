@@ -24,6 +24,77 @@ pub const tool_path = "/usr/bin/tdnf";
 /// reading the installed set, and importing trust.
 pub const database_tool_path = "/usr/bin/rpm";
 
+/// Package managers recognised **in order to be refused**, not in order to be
+/// used.
+///
+/// This is not a dispatch table and must not become one. Nothing reads it to
+/// decide what to run; it exists so that a run against a root this project
+/// does not support can say what the image is rather than only what it is not
+/// -- the same distinction `unsafe_chroot.findGuestGenerator` already draws
+/// between a systemd-managed target and a target with no bootloader generator
+/// at all.
+///
+/// The difference matters to whoever pointed a build at the wrong image. "No
+/// `/usr/bin/tdnf` here" leaves them wondering whether the image is broken;
+/// "this looks like a dpkg root, and both executing backends target the RPM
+/// family" tells them what happened in one line.
+pub const foreign_tool_paths = [_][]const u8{
+    "/usr/bin/apt-get",
+    "/usr/bin/dpkg",
+    "/usr/bin/zypper",
+    "/usr/bin/pacman",
+    "/sbin/apk",
+};
+
+/// Which of the two tools a run actually needs, given what it was asked to do.
+///
+/// A root with no package manager is a legitimate thing to customize as long
+/// as nothing asks it to install, so a run that needs neither must behave
+/// exactly as it did before this check existed -- the same rule
+/// `os_customization.applyServices` follows when it returns on an empty
+/// service list before refusing anything.
+///
+/// The database tool is needed more often than the manager. Trust import is
+/// `rpm --import` and runs for a request that declares repository trust and no
+/// actions at all, while the installed-set inventory a transaction reads is
+/// `rpm -qa`. So a transaction needs both and a bare trust import needs only
+/// the second.
+pub const ToolNeed = struct {
+    manager: bool,
+    database: bool,
+
+    pub fn none(self: ToolNeed) bool {
+        return !self.manager and !self.database;
+    }
+};
+
+pub fn toolNeed(runs_transaction: bool, imports_trust: bool) ToolNeed {
+    return .{
+        .manager = runs_transaction,
+        .database = runs_transaction or imports_trust,
+    };
+}
+
+/// What a target root can and cannot satisfy. Deliberately not an error: the
+/// two executors raise their own, and this module answers the question rather
+/// than deciding how a backend reports it.
+pub const ToolVerdict = enum {
+    satisfied,
+    missing_manager,
+    missing_database,
+};
+
+/// Decided here rather than twice, so the host worker and the guest agent
+/// cannot disagree about which root is customizable.
+///
+/// Presence is passed in rather than probed: this module reads no filesystem,
+/// and on the `vm` backend the host cannot stat the target root at all.
+pub fn toolVerdict(need: ToolNeed, manager_present: bool, database_present: bool) ToolVerdict {
+    if (need.manager and !manager_present) return .missing_manager;
+    if (need.database and !database_present) return .missing_database;
+    return .satisfied;
+}
+
 /// The configuration the transaction is run under, inside the target root.
 ///
 /// The target's own `/etc/tdnf` is deliberately not used: a run must depend on
@@ -669,4 +740,44 @@ test "a pinned spec is the string the record parser splits back" {
     try std.testing.expectEqualStrings(pin.evr, parsed.evr);
     try std.testing.expectEqualStrings(pin.architecture, parsed.architecture);
     try std.testing.expect(coverRecord(&.{pin}, spec));
+}
+
+test "a run that installs nothing and imports no trust needs no tool at all" {
+    // The regression fence for the whole check: a minimal root with no package
+    // manager stays customizable, and behaves exactly as it did before the
+    // probe existed.
+    const need = toolNeed(false, false);
+    try std.testing.expect(need.none());
+    try std.testing.expectEqual(ToolVerdict.satisfied, toolVerdict(need, false, false));
+}
+
+test "importing trust needs the database tool and not the manager" {
+    // `rpm --import` runs for a request that declares repository trust and no
+    // actions, so a root with rpm and no tdnf can still satisfy it.
+    const need = toolNeed(false, true);
+    try std.testing.expect(!need.manager);
+    try std.testing.expect(need.database);
+    try std.testing.expectEqual(ToolVerdict.satisfied, toolVerdict(need, false, true));
+    try std.testing.expectEqual(ToolVerdict.missing_database, toolVerdict(need, true, false));
+}
+
+test "a transaction needs both tools, and the manager is reported first" {
+    const need = toolNeed(true, false);
+    try std.testing.expect(need.manager);
+    // Reported first because it is the one the request named: a root with
+    // neither is a root with no package manager, which is the more useful
+    // half of the answer.
+    try std.testing.expectEqual(ToolVerdict.missing_manager, toolVerdict(need, false, false));
+    try std.testing.expectEqual(ToolVerdict.missing_database, toolVerdict(need, true, false));
+    try std.testing.expectEqual(ToolVerdict.satisfied, toolVerdict(need, true, true));
+}
+
+test "the foreign table names other families and never this one" {
+    // It exists to refuse, not to dispatch. A path this project actually runs
+    // appearing here would turn a supported root into a refused one.
+    for (foreign_tool_paths) |candidate| {
+        try std.testing.expect(!std.mem.eql(u8, candidate, tool_path));
+        try std.testing.expect(!std.mem.eql(u8, candidate, database_tool_path));
+        try std.testing.expect(candidate[0] == '/');
+    }
 }

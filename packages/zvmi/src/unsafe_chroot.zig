@@ -843,6 +843,11 @@ const Session = struct {
     }
 
     fn runPolicy(self: *Session) !void {
+        // Before anything is written into the target. A root this backend
+        // cannot run a transaction against is refused while it is still
+        // untouched, rather than after the repository files -- which carry
+        // credentials -- have been placed in it.
+        try self.requirePackageTools();
         try self.writeRepositoryFiles();
         errdefer self.removeRepositoryFiles() catch {};
         // Before the trust import, so the baseline is the root exactly as it
@@ -1801,6 +1806,74 @@ const Session = struct {
         } else {
             try Io.Dir.cwd().deleteDir(self.io, directory);
         }
+    }
+
+    /// Refuses a target root that has no package manager, by name, before the
+    /// run writes anything into it.
+    ///
+    /// Every other target assumption this backend makes is a refusal --
+    /// an unrecognised initramfs generator, bootloader generator or SELinux
+    /// policy each fail by name -- and the package manager used to be the
+    /// exception: `/usr/bin/tdnf` and `/usr/bin/rpm` were plain `runChroot`
+    /// argv, so a Debian root failed with a generic non-zero exit from a
+    /// chroot that could not exec a path, partway through a run that had
+    /// already modified the image.
+    ///
+    /// This cannot be a preflight capability. `preflight` decides about the
+    /// build machine, and for an ISO+container input the target root does not
+    /// exist until the run assembles it -- the same reason `registry_access`
+    /// is a declaration rather than a probe.
+    ///
+    /// Probed only for what the request actually uses, the way `applyServices`
+    /// returns on an empty list before it refuses anything: a minimal root
+    /// with no package manager is a legitimate thing to customize as long as
+    /// nothing asks it to install.
+    fn requirePackageTools(self: *Session) !void {
+        const need = packages_mod.toolNeed(
+            self.manifest.packages.actions.len != 0,
+            self.declaresPackageTrust(),
+        );
+        if (need.none()) return;
+
+        // Probed only for what is needed: a request that imports trust and
+        // runs no transaction must not be refused for a manager it will never
+        // invoke.
+        const verdict = packages_mod.toolVerdict(
+            need,
+            if (need.manager) try self.guestFileExists(packages_mod.tool_path) else true,
+            if (need.database) try self.guestFileExists(packages_mod.database_tool_path) else true,
+        );
+        switch (verdict) {
+            .satisfied => return,
+            // The foreign-family table is consulted only once something is
+            // already missing, so a supported root pays for none of it.
+            .missing_manager => {
+                try self.refuseForeignPackageManager();
+                return error.MissingPackageManager;
+            },
+            .missing_database => {
+                try self.refuseForeignPackageManager();
+                return error.MissingPackageDatabase;
+            },
+        }
+    }
+
+    /// Names the family when the root carries evidence of a different one, so
+    /// the message says what the image is rather than only what it is not.
+    /// The same shape `findGuestGenerator` uses for `/etc/kernel/cmdline`.
+    fn refuseForeignPackageManager(self: *Session) !void {
+        for (packages_mod.foreign_tool_paths) |candidate| {
+            if (try self.guestFileExists(candidate)) {
+                return error.UnsupportedPackageManagerFamily;
+            }
+        }
+    }
+
+    fn declaresPackageTrust(self: *Session) bool {
+        for (self.manifest.packages.repositories) |repository| {
+            if (repository.trust.len != 0) return true;
+        }
+        return false;
     }
 
     fn importTrust(self: *Session) !void {
@@ -5412,6 +5485,101 @@ test "worker places kernel-module configuration after packages and before dracut
     try std.testing.expectEqual(@as(u32, 0o755), context.directory_mode_at_dracut.?);
 }
 
+// The two executing backends target the RPM family. A root outside it is
+// refused by name, before the run writes the repository files -- those carry
+// the caller's registry and repository credentials, and a root that will never
+// run a transaction has no business receiving them. The refusal is scoped to
+// what the request actually asks for: a manifest that runs no transaction and
+// imports no trust never probes, so a root with no package manager at all
+// remains a legal target for the rest of the model.
+test "worker refuses a target root outside the package family it can drive" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root_path = "test-unsafe-chroot-family-root";
+    const raw_path = "test-unsafe-chroot-family-stage.raw";
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+        .exclusive = true,
+        .read = true,
+    });
+    try raw_file.setLength(io, 8192);
+    const raw_inode = (try raw_file.stat(io)).inode;
+    raw_file.close(io);
+
+    const actions = [_]customize.PackageAction{.{ .install = &.{"dracut"} }};
+    const repositories = [_]customize.PackageRepository{.{
+        .id = "base",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+    }};
+    const base = Manifest{
+        .raw_path = raw_path,
+        .root_path = root_path,
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = raw_inode,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{ .actions = &actions, .repositories = &repositories },
+        .initramfs = .unchanged,
+    };
+    const repository_path = try repositoryHostPath(allocator, root_path, "base");
+
+    for ([_]FakePackageTools{
+        .manager_missing,
+        .database_missing,
+        .foreign,
+    }) |tools| {
+        var context = FakeExecutorContext{
+            .allocator = allocator,
+            .io = io,
+            .root_path = root_path,
+            .unmounts = .init(allocator),
+            .timeline = .init(allocator),
+            .package_tools = tools,
+        };
+        const result = try executeManifest(allocator, io, base, .{
+            .context = &context,
+            .runFn = FakeExecutorContext.run,
+        });
+        try std.testing.expectEqual(RunOutcome.failed, result.outcome);
+        // Refused, not merely unsuccessful: no transaction ran, and the
+        // credential-bearing repository file never reached the target root.
+        try std.testing.expect(!context.saw_tdnf_install);
+        try std.testing.expectError(
+            error.FileNotFound,
+            Io.Dir.cwd().statFile(io, repository_path, .{}),
+        );
+        // The run still unwinds cleanly, which is what separates a refusal
+        // from a crash: the parent must be able to reuse its lease.
+        try std.testing.expect(result.cleanup_complete);
+    }
+
+    // The same unsupported root, for a manifest that asks nothing of a package
+    // manager. This is the fence: probing unconditionally would turn every
+    // Debian root into an image this tool cannot resize, relabel or sign.
+    var quiet = base;
+    quiet.packages = .{};
+    var quiet_context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .timeline = .init(allocator),
+        .package_tools = .foreign,
+    };
+    const quiet_result = try executeManifest(allocator, io, quiet, .{
+        .context = &quiet_context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expectEqual(RunOutcome.succeeded, quiet_result.outcome);
+    try std.testing.expect(quiet_result.cleanup_complete);
+}
+
 // A declared resolver has to reach the package transaction as bytes the
 // request chose, with no host file involved and nothing left behind. The
 // no-actions case is the other half of the same claim: the resolver belongs to
@@ -5644,6 +5812,24 @@ test "worker refuses kernel module names it would render as two tokens" {
 
 const FakeResolverLayout = enum { regular, symlink, missing };
 
+/// Which package tooling the fake target root turns out to have. The default
+/// is the family both executing backends support, because that is what almost
+/// every test is about. The other three exist so a test can stand up a root
+/// the backend must refuse, which is otherwise unreachable: the fake executor
+/// intercepts every command, so a root with no package manager would still
+/// appear to install packages successfully.
+const FakePackageTools = enum {
+    rpm_family,
+    /// `rpm` without `tdnf`: a root that can verify and query packages but
+    /// has nothing to run a transaction with.
+    manager_missing,
+    /// `tdnf` without `rpm`: the database the manager is a front end for is
+    /// not there.
+    database_missing,
+    /// A Debian root. Recognised only so the refusal can name the family.
+    foreign,
+};
+
 /// A directory under `/lib/modules` in the fake target. The marker is what
 /// separates an installed kernel from a directory that merely looks like one;
 /// a null marker is a directory depmod never wrote to.
@@ -5717,6 +5903,7 @@ const FakeExecutorContext = struct {
     preexisting_loop: bool = false,
     malformed_inventory: bool = false,
     resolver_layout: FakeResolverLayout = .regular,
+    package_tools: FakePackageTools = .rpm_family,
     saw_repository_isolation: bool = false,
     /// Whether the declared kernel-module configuration was already in place
     /// when each of the neighbouring stages ran. Ordering is the whole
@@ -5989,6 +6176,31 @@ const FakeExecutorContext = struct {
                     .{ self.root_path, suffix },
                 );
                 try Io.Dir.cwd().createDirPath(self.io, path);
+            }
+            // A root's package tooling is visible from the moment it is
+            // mounted, which is also the first moment the backend can probe
+            // for it.
+            {
+                const binaries: []const []const u8 = switch (self.package_tools) {
+                    .rpm_family => &.{ "/usr/bin/tdnf", "/usr/bin/rpm" },
+                    .manager_missing => &.{"/usr/bin/rpm"},
+                    .database_missing => &.{"/usr/bin/tdnf"},
+                    .foreign => &.{ "/usr/bin/apt-get", "/usr/bin/dpkg" },
+                };
+                const binary_directory = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}/usr/bin",
+                    .{self.root_path},
+                );
+                try Io.Dir.cwd().createDirPath(self.io, binary_directory);
+                for (binaries) |binary| {
+                    const path = try std.fmt.allocPrint(
+                        self.allocator,
+                        "{s}{s}",
+                        .{ self.root_path, binary },
+                    );
+                    try writeBytes(self.io, path, "");
+                }
             }
             const resolver = try std.fmt.allocPrint(
                 self.allocator,
