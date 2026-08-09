@@ -4236,3 +4236,94 @@ fn lastPublishEvent(fixture: *const PublishFixture, expected: PublishEvent) ?usi
     }
     return result;
 }
+
+// The `pull_container_image` operation a customize plan publishes, exercised
+// against the loopback registry. These live beside the fixture rather than in
+// customize.zig's own test block: the fixture is a private four-thousand-line
+// struct in this file whose module has the TLS dependency, and lifting it out
+// would make every build of the library's unit tests depend on it.
+
+/// A `docker://` reference naming the exact manifest the fixture serves. The
+/// customize path refuses anything but a digest, so a tag will not do here.
+fn pinnedReferenceFor(allocator: std.mem.Allocator, fixture: *const Fixture) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "docker://{s}/team/image@{s}",
+        .{ fixture.authority, fixture.manifest_digest },
+    );
+}
+
+test "a declared registry image is pulled into the layout the plan named" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try Fixture.init(allocator, io, .anonymous, 8, null);
+    defer fixture.deinit();
+    try fixture.start();
+    const destination = "test-oci-registry-customize-pull";
+    deleteLayout(io, destination);
+    defer deleteLayout(io, destination);
+    const reference = try pinnedReferenceFor(allocator, &fixture);
+    defer allocator.free(reference);
+
+    var pull = try zvmi.customize.pullRegistryImage(
+        allocator,
+        io,
+        std.process.Environ.empty,
+        .{ .reference = reference, .access = .{ .plain_http = true } },
+        destination,
+    );
+    defer pull.deinit();
+    try fixture.finish();
+
+    // The layout holds the manifest the reference pinned, reachable by that
+    // digest, which is what the builder is then pointed at.
+    const digest = try oci.content.Digest.parse(fixture.manifest_digest);
+    var resolved = try oci.layout.Source.init(io, allocator, destination).resolve(.{
+        .path = destination,
+        .selection = .{ .digest = digest },
+    });
+    defer resolved.deinit();
+    try std.testing.expectEqualStrings(fixture.manifest, resolved.bytes);
+
+    // And provenance records the image, not a path on this machine.
+    try std.testing.expectEqualStrings(reference, pull.record.reference);
+    try std.testing.expectEqualStrings(fixture.manifest_digest, pull.record.manifest_digest);
+    try std.testing.expectEqualStrings(oci.model.media_type_oci_manifest, pull.record.media_type);
+    const platform = pull.record.platform orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("linux", platform.os);
+    try std.testing.expectEqualStrings("amd64", platform.architecture);
+    try std.testing.expectEqual(@as(?[]const u8, null), platform.variant);
+}
+
+test "a registry needing a credential the request did not declare fails to authenticate" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const home = "test-oci-registry-customize-home";
+    defer Io.Dir.cwd().deleteTree(io, home) catch {};
+    var fixture = try Fixture.init(allocator, io, .basic, 1, null);
+    defer fixture.deinit();
+    try fixture.start();
+    const destination = "test-oci-registry-customize-denied";
+    deleteLayout(io, destination);
+    defer deleteLayout(io, destination);
+
+    // A login this machine already has, in the place the ambient tooling looks
+    // for one. If the pull ever consults it, this test goes green for the
+    // wrong reason, so it must stay red.
+    try Io.Dir.cwd().createDir(io, home, .default_dir);
+    try Io.Dir.cwd().createDir(io, home ++ "/.docker", .default_dir);
+    try writeAuthfile(allocator, io, home ++ "/.docker/config.json", fixture.authority);
+    const entries: [:null]const ?[*:0]const u8 = &.{"HOME=" ++ home};
+    const environment: std.process.Environ = .{ .block = .{ .slice = entries } };
+
+    const reference = try pinnedReferenceFor(allocator, &fixture);
+    defer allocator.free(reference);
+    try std.testing.expectError(error.AuthenticationFailed, zvmi.customize.pullRegistryImage(
+        allocator,
+        io,
+        environment,
+        .{ .reference = reference, .access = .{ .plain_http = true } },
+        destination,
+    ));
+    try fixture.finish();
+}
