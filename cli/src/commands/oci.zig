@@ -736,7 +736,8 @@ fn parsePin(args: []const []const u8) ParseError!PinArgs {
     };
 }
 
-fn parseCopy(args: []const []const u8) ParseError!CopyArgs {    var source_options: EndpointOptions = .{};
+fn parseCopy(args: []const []const u8) ParseError!CopyArgs {
+    var source_options: EndpointOptions = .{};
     var destination_options: EndpointOptions = .{};
     var platform: PlatformOptions = .{};
     var positional: [2][]const u8 = undefined;

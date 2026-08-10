@@ -752,7 +752,8 @@ pub const Source = struct {
         };
     }
 
-    fn addCertificateAuthority(self: *Source, path: []const u8) !void {        const now = Io.Clock.real.now(self.io);
+    fn addCertificateAuthority(self: *Source, path: []const u8) !void {
+        const now = Io.Clock.real.now(self.io);
         self.client.ca_bundle.rescan(self.allocator, self.io, now) catch return error.CertificateAuthorityLoadFailed;
         var file = if (std.fs.path.isAbsolute(path))
             Io.Dir.openFileAbsolute(self.io, path, .{}) catch return error.CertificateAuthorityLoadFailed
