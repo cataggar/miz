@@ -296,3 +296,76 @@ SHA-256 values appear in release notes and job summaries only: **checksum
 sidecar assets are not published**.
 
 Artifact Signing leaf rotation is release-scoped: each gallery version enrolls the exact leaf used for that version, and all four candidates must finish under one leaf. Retain old public leaf certificates and release-to-fingerprint mappings through the rollback window. On compromise, stop publication, revoke or rotate immediately, add the compromised leaf or hash to `dbx` in future gallery versions, and require reimage/redeployment; existing image versions and VM firmware state are not assumed to inherit later `db`/`dbx` changes. `NoSignatureTemplate` is not used because it would replace Microsoft/Azure trust anchors.
+
+## Loading kernel modules from inside a core guest
+
+A core image has no `udev` and no `modprobe`, and that shapes what a guest
+process must do for itself once it is running. `init_module(2)` is the only way
+in, and it performs **no dependency resolution**: it links the module it is
+given against the symbols currently exported, and if any are missing it fails.
+
+The failure is unhelpfully shaped. A module loaded before its dependency
+returns `ENOENT` and logs a wall of `Unknown symbol` lines, which reads as *this
+kernel does not have that feature* rather than as an ordering mistake. KVM is
+the case where this bites, because the dependency is not obvious from the
+name:
+
+```text
+kernel/arch/x86/kvm/kvm.ko.xz: kernel/virt/lib/irqbypass.ko.xz
+kernel/arch/x86/kvm/kvm-amd.ko.xz: kernel/drivers/crypto/ccp/ccp.ko.xz kernel/arch/x86/kvm/kvm.ko.xz kernel/virt/lib/irqbypass.ko.xz
+```
+
+`modules.dep` in the image is the authority — the same file the emulated
+executor already reads to resolve its own closure — so a guest-side loader
+should mirror it explicitly rather than hard-code an order that happens to work
+on one kernel.
+
+Two errno values are worth telling apart, because they lead opposite ways:
+
+- **`ENOENT`** after `Unknown symbol` is a missing dependency. Load the
+  dependency first.
+- **`EOPNOTSUPP`** is the module working correctly and declining: the CPU
+  genuinely lacks the feature. `kvm_intel` returns this under TCG, where the
+  emulated CPU has no VMX. It is the expected result of a local emulated boot
+  and the cheapest way to prove a dependency-ordering fix without hardware that
+  supports the feature.
+
+A third case looks like failure and is not: **a driver built into the kernel
+has no `.ko` to load, so `init_module` always fails for it.** On Azure Linux 4
+`tun` and `hv_utils` are built in. `modules.builtin` says so, and the only
+authority on what the driver can actually do is the device — opening
+`/dev/net/tun` answers the question that a module load cannot.
+
+### Device nodes a core image will not create for you
+
+devtmpfs creates `/dev/kvm` as `0600 root:root`. On a distro with udev the
+matching rule immediately relaxes that to `0660 root:kvm`; with no udev present
+it simply stays root-only, and every hypervisor front end needs `sudo` for the
+rest of the image's life.
+
+The `kvm` group already exists in the base image, so the fix is the one udev
+would have applied — `chown` the node to that group, `chmod` it to `0660`, and
+add the operator account to the group. Read the gid out of `/etc/group` rather
+than assuming the conventional value; a hard-coded gid that disagrees with the
+image leaves the device owned by a group nobody is in, which fails exactly as
+confusingly as the original mode.
+
+`/dev/net/tun` is worth creating explicitly for a different reason: devtmpfs
+does make it when the driver is available, but only if the directory exists, and
+a missing node surfaces as a userspace daemon failing to bring up an interface
+— a long way from the actual cause.
+
+### Nested virtualization
+
+Nested virtualization works on Azure sizes that expose it, and the guest says so
+in a way worth recognizing:
+
+```text
+kvm_intel: Using Hyper-V Enlightened VMCS
+```
+
+The enlightened path is what makes it usable rather than merely present: the L1
+hypervisor talks to Hyper-V directly instead of trapping every VMCS access. A
+nested guest booted with `-accel kvm` then reports `Hypervisor detected: KVM`
+and `Booting paravirtualized kernel on KVM`, and reaches power-off in seconds
+rather than the minutes a TCG boot of the same kernel takes.
