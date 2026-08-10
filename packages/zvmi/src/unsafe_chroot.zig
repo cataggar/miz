@@ -1959,6 +1959,19 @@ const Session = struct {
             for (kernels) |kernel| self.allocator.free(kernel);
             self.allocator.free(kernels);
         };
+        // Probed here rather than on entry: discovery above is what decides
+        // whether the generator is going to be invoked at all, and a run whose
+        // every candidate was passed over asks nothing of dracut. Refusing
+        // such a run would be refusing a root for work it was not going to do.
+        //
+        // No emptiness guard: reaching this line means at least one kernel is
+        // going to be regenerated, because an explicit list is non-empty by
+        // construction and discovery raises `NoInstalledKernels` rather than
+        // returning nothing. The guest agent needs the guard, because there
+        // an accepted empty set is a value rather than an early return.
+        if (!try self.guestFileExists(initramfs_mod.tool_path)) {
+            return error.MissingInitramfsGenerator;
+        }
         for (kernels) |kernel| {
             const output = try initramfs_mod.imagePath(self.allocator, kernel);
             defer self.allocator.free(output);
@@ -5184,6 +5197,113 @@ fn findSkippedKernel(
     return null;
 }
 
+// A root that has no dracut is refused when, and only when, the run was
+// actually going to invoke it. The distinction this test exists to hold is
+// between two refusals that read alike and mean opposite things:
+// `UnsupportedInitramfsGenerator` is about the *request* naming a generator
+// this tool cannot drive, and `MissingInitramfsGenerator` is about the
+// *target* not having the one generator it can. Collapsing them would tell a
+// caller to change a field that is already correct.
+test "worker separates a generator it cannot drive from a target that lacks one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root_path = "test-unsafe-chroot-generator-root";
+    const raw_path = "test-unsafe-chroot-generator-stage.raw";
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+        .exclusive = true,
+        .read = true,
+    });
+    try raw_file.setLength(io, 8192);
+    const raw_inode = (try raw_file.stat(io)).inode;
+    raw_file.close(io);
+
+    const base = Manifest{
+        .raw_path = raw_path,
+        .root_path = root_path,
+        .status_path = "unused.status",
+        .report_path = "unused-report.json",
+        .stage_inode = raw_inode,
+        .virtual_size = 8192,
+        .partition_offset = 1024,
+        .partition_length = 4096,
+        .packages = .{},
+        .initramfs = .{ .regenerate = .{ .generator = "dracut" } },
+    };
+    const installed: []const FakeKernel = &.{.{ .release = "6.12.0-2.azl" }};
+
+    // The target has a kernel to regenerate for and nothing to regenerate
+    // with.
+    var missing_context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .timeline = .init(allocator),
+        .installed_kernels = installed,
+        .initramfs_generator_present = false,
+    };
+    const missing = try executeManifest(allocator, io, base, .{
+        .context = &missing_context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expectEqual(RunOutcome.failed, missing.outcome);
+    try std.testing.expect(missing.cleanup_complete);
+    // Refused before it ran, not after it failed: nothing was handed to a
+    // generator that is not there, so no image can have been published.
+    try std.testing.expect(!missing_context.saw_dracut);
+
+    // The other refusal, against a target that has dracut. Same policy shape,
+    // different field at fault -- and it must still be reached, which it only
+    // is if the new probe did not take over the case.
+    var unsupported = base;
+    unsupported.initramfs = .{ .regenerate = .{ .generator = "mkinitcpio" } };
+    var unsupported_context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .timeline = .init(allocator),
+        .installed_kernels = installed,
+    };
+    const refused = try executeManifest(allocator, io, unsupported, .{
+        .context = &unsupported_context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expectEqual(RunOutcome.failed, refused.outcome);
+    try std.testing.expect(!unsupported_context.saw_dracut);
+
+    // The fence for scoping the probe to work actually planned: a root with
+    // no dracut whose every candidate is passed over by discovery is not
+    // refused, because nothing was going to run. `firmware` carries no
+    // dependency marker, so discovery declines it and the run has nothing
+    // left to do.
+    var skipped = base;
+    skipped.initramfs = .{ .regenerate = .{
+        .generator = "dracut",
+        .no_installed_kernels = .nothing_to_regenerate,
+    } };
+    var skipped_context = FakeExecutorContext{
+        .allocator = allocator,
+        .io = io,
+        .root_path = root_path,
+        .unmounts = .init(allocator),
+        .timeline = .init(allocator),
+        .installed_kernels = &.{.{ .release = "firmware", .marker = null }},
+        .initramfs_generator_present = false,
+    };
+    const quiet = try executeManifest(allocator, io, skipped, .{
+        .context = &skipped_context,
+        .runFn = FakeExecutorContext.run,
+    });
+    try std.testing.expectEqual(RunOutcome.succeeded, quiet.outcome);
+    try std.testing.expect(quiet.cleanup_complete);
+    try std.testing.expect(!skipped_context.saw_dracut);
+}
+
 test "worker regenerates every installed kernel when the policy names none" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -5904,6 +6024,10 @@ const FakeExecutorContext = struct {
     malformed_inventory: bool = false,
     resolver_layout: FakeResolverLayout = .regular,
     package_tools: FakePackageTools = .rpm_family,
+    /// Whether the fake target root has the one generator either backend
+    /// drives. Separate from `package_tools` because a root can be squarely
+    /// inside the RPM family and still not have dracut installed.
+    initramfs_generator_present: bool = true,
     saw_repository_isolation: bool = false,
     /// Whether the declared kernel-module configuration was already in place
     /// when each of the neighbouring stages ran. Ordering is the whole
@@ -6193,6 +6317,14 @@ const FakeExecutorContext = struct {
                     .{self.root_path},
                 );
                 try Io.Dir.cwd().createDirPath(self.io, binary_directory);
+                if (self.initramfs_generator_present) {
+                    const generator = try std.fmt.allocPrint(
+                        self.allocator,
+                        "{s}{s}",
+                        .{ self.root_path, initramfs_mod.tool_path },
+                    );
+                    try writeBytes(self.io, generator, "");
+                }
                 for (binaries) |binary| {
                     const path = try std.fmt.allocPrint(
                         self.allocator,

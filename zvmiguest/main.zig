@@ -276,6 +276,18 @@ const Session = struct {
                         }
                         return self.stageFailure("initramfs", err);
                     };
+                // After discovery, which is what decides whether the
+                // generator is invoked at all: a run that passed over every
+                // kernel it found asks nothing of dracut, and refusing it
+                // would be refusing a root for work it was not going to do.
+                if (kernels.len != 0 and
+                    !self.guestFileExists(initramfs_mod.tool_path))
+                {
+                    return self.stageFailure(
+                        "initramfs",
+                        error.MissingInitramfsGenerator,
+                    );
+                }
                 for (kernels) |kernel| {
                     self.regenerateInitramfs(kernel) catch |err| {
                         return self.stageFailure("initramfs", err);
