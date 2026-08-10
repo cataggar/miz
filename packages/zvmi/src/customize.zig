@@ -4589,7 +4589,7 @@ fn resolveRegistryImage(
 fn canonicalRegistryReference(
     allocator: Allocator,
     text: []const u8,
-) (Allocator.Error || error{InvalidReference})!  []const u8 {
+) (Allocator.Error || error{InvalidReference})![]const u8 {
     const parsed = oci.reference.parse(text, .source) catch return error.InvalidReference;
     const registry_reference = switch (parsed) {
         .registry => |value| value,
@@ -7835,16 +7835,18 @@ fn buildResult(
 
     const output_path = try result_allocator.dupe(u8, plan.data.output.path);
     const input: ResolvedInput = switch (plan.data.input) {
-        .iso_oci => |value| .{ .iso_oci = .{
-            .iso_path = try result_allocator.dupe(u8, value.iso_path),
-            .container = switch (value.container) {
-                .host_path => |path| .{ .host_path = try result_allocator.dupe(u8, path) },
-                // Already canonical and already free of material, so there is
-                // nothing to resolve here -- only ownership to move.
-                .registry => |image| .{ .registry = try resolveRegistryImage(result_allocator, null, image) },
+        .iso_oci => |value| .{
+            .iso_oci = .{
+                .iso_path = try result_allocator.dupe(u8, value.iso_path),
+                .container = switch (value.container) {
+                    .host_path => |path| .{ .host_path = try result_allocator.dupe(u8, path) },
+                    // Already canonical and already free of material, so there is
+                    // nothing to resolve here -- only ownership to move.
+                    .registry => |image| .{ .registry = try resolveRegistryImage(result_allocator, null, image) },
+                },
+                .rootfs_path_in_iso = try result_allocator.dupe(u8, value.rootfs_path_in_iso),
             },
-            .rootfs_path_in_iso = try result_allocator.dupe(u8, value.rootfs_path_in_iso),
-        } },
+        },
         .disk => |value| .{ .disk = .{
             .path = try result_allocator.dupe(u8, value.path),
             .dependencies = try dupeStrings(result_allocator, value.dependencies),

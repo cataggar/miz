@@ -939,10 +939,10 @@ test "a registry password comes from a file or the environment, not both" {
 test "registry options apply whichever side of --container they are given" {
     var before: [40][]const u8 = undefined;
     const parsed_before = try parseArgs(std.testing.allocator, testArgs(&.{
-        "--registry-username",     "builder",
-        "--registry-password-env", "REGISTRY_PASSWORD",
-        "--registry-plain-http",
-        "--container",             "docker://127.0.0.1:5000/team/image:stable",
+        "--registry-username",                       "builder",
+        "--registry-password-env",                   "REGISTRY_PASSWORD",
+        "--registry-plain-http",                     "--container",
+        "docker://127.0.0.1:5000/team/image:stable",
     }, &before));
     const access_before = try parsed_before.container.registry.access();
     try std.testing.expect(access_before.plain_http);
