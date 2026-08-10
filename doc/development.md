@@ -85,8 +85,44 @@ zvmi/
         zstd.zig               # minimal private raw-block zstd codec for COSI
         cosi.zig               # COSI writer (tar + metadata.json + raw.zst parts)
         build_image.zig        # ISO + OCI -> raw/fixed-VHD orchestration
+        customize.zig          # the image-customization request: versioned
+                              #   public types, planning, preflight, backend
+                              #   selection, execution and provenance
+        preserved_image.zig    # transactional mutation/rebuild of an existing
+                              #   image through a full raw staging copy
+        preserved_image_wire.zig # the versioned wire types the above
+                              #   serializes, split out so the version can be
+                              #   read without pulling in the engine
+        unsafe_chroot.zig      # the privileged executing backend: mounts the
+                              #   target root on the build machine and runs
+                              #   the policy in a chroot, as a re-execed
+                              #   worker that is PID 1 in its own namespaces
+        vm_backend.zig         # host capability probe for the `vm` backend
+        vm_control.zig         # the control and result documents exchanged
+                              #   with the in-VM guest agent; the only route
+                              #   by which shared modules reach the guest
+        vm_payload.zig         # direct-kernel boot payload extraction from a
+                              #   staged raw image
+        packages.zig           # what both executing backends must agree on
+        initramfs.zig          #   about package transactions, initramfs
+        selinux.zig            #   regeneration and relabelling: tool paths,
+                              #   argv shapes, configuration bodies and the
+                              #   family probes' decision rules. These read no
+                              #   filesystem and import only `std`, because
+                              #   they are compiled into the guest agent as
+                              #   well as the host -- each backend does its
+                              #   own looking, since on `vm` only the guest
+                              #   can see the target root
         formats.zig           # Format enum (raw, vhd, vhdx, qcow2)
         size.zig              # qemu-img-style size suffix parsing (K/M/G/T)
+  zvmiguest/
+    main.zig                # the guest agent: a static, libc-free PID 1 that
+                              #   runs inside the image's own initramfs on the
+                              #   `vm` backend, applies the control document
+                              #   and reports the result. It imports exactly
+                              #   two things -- `std` and `vm_control` -- and
+                              #   reaches the shared modules above only as
+                              #   re-exports of the latter
   build/
     image.zig               # `addImage`: the exported std.Build helper that
                               #   declares an image build, including the
