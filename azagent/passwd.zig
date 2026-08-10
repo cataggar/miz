@@ -169,6 +169,20 @@ test "userExists finds an existing user by the first field only" {
     try std.testing.expect(!userExists(passwd, "nobody-here"));
 }
 
+test "lookupIds resolves an existing account and reports a missing one as null" {
+    const passwd = "root:x:0:0::/root:/bin/bash\ng:x:1000:1000::/home/g:/bin/bash\n";
+    const found = (try lookupIds(passwd, "g")).?;
+    try std.testing.expectEqual(@as(u32, 1000), found.uid);
+    try std.testing.expectEqual(@as(u32, 1000), found.gid);
+
+    const root_ids = (try lookupIds(passwd, "root")).?;
+    try std.testing.expectEqual(@as(u32, 0), root_ids.uid);
+
+    // A ResourceDisk.Owner naming an account that was never created is a
+    // warning, not an error, so this has to be distinguishable from uid 0.
+    try std.testing.expect(try lookupIds(passwd, "nobody-here") == null);
+}
+
 test "nextFreeId picks min_id when nothing at or above it is in use" {
     const passwd = "root:x:0:0::/root:/bin/bash\ndaemon:x:1:1::/:/usr/sbin/nologin\n";
     try std.testing.expectEqual(@as(u32, 1000), try nextFreeId(passwd, 1000));
@@ -259,7 +273,7 @@ test "lockRootPassword fails when there is no root entry" {
 // `/etc`/`/home`.
 // ---------------------------------------------------------------------
 
-const read_limit: std.Io.Limit = .limited(4 * 1024 * 1024);
+pub const read_limit: std.Io.Limit = .limited(4 * 1024 * 1024);
 
 pub const CreateUserResult = struct {
     uid: u32,
@@ -320,6 +334,22 @@ pub fn createUserIfMissing(
     try new_home_dir.setOwner(io, uid, gid);
 
     return .{ .uid = uid, .gid = gid, .home = home, .already_existed = false };
+}
+
+/// A resolved account's numeric ids, as `chown(2)` wants them.
+pub const Ids = struct { uid: u32, gid: u32 };
+
+/// Resolves an existing account's uid/gid out of `/etc/passwd` content,
+/// returning `null` when there is no such account. Callers that treat a
+/// missing account as recoverable (`main.zig`'s `ResourceDisk.Owner`
+/// handling warns and leaves the mount root-owned) want this rather than
+/// `findExistingIds`, whose `error.UserNotFound` is a genuine inconsistency
+/// in the one place it is used -- `createUserIfMissing` only calls it after
+/// `userExists` has already said yes.
+pub fn lookupIds(passwd_content: []const u8, username: []const u8) !?Ids {
+    if (!userExists(passwd_content, username)) return null;
+    const uid, const gid = try findExistingIds(passwd_content, username);
+    return .{ .uid = uid, .gid = gid };
 }
 
 fn findExistingIds(passwd_content: []const u8, username: []const u8) !struct { u32, u32 } {

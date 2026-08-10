@@ -144,6 +144,17 @@ managed-data-disk activation by stable Azure LUN at `/e` through `/z`. Managed
 disks are mount-only: existing ext4 partition 1 is mounted, while blank and
 unknown layouts are left untouched.
 
+`ResourceDisk.Owner` (a zvmi extension, not an upstream `waagent` key) names an
+account to `chown` the resource disk's mount point to once it is mounted;
+leaving it unset keeps upstream's root-owned mount point. It is applied on
+every boot rather than once at provisioning time because a mount point's
+ownership lives in the mounted filesystem's root inode, so it is discarded
+whenever Azure hands back a blank or resized resource disk and `azagent`
+reformats it. An account named here that does not exist is reported and
+otherwise ignored, leaving the disk mounted and root-owned. Only the resource
+disk is affected: managed data disks are never formatted by `azagent`, so
+their ownership is left as whoever formatted them set it.
+
 ### Reading a block device
 
 Every command that opens an image by path also accepts a block-device node,
