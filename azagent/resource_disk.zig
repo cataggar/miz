@@ -485,6 +485,15 @@ pub const SetupOptions = struct {
     /// `resourcedisk_mount_point`); `setup` null-terminates its own copy
     /// internally before any real syscall that needs one.
     mount_point: []const u8 = default_mount_point,
+    /// When set, `chown`s the mount point to these ids after mounting, so
+    /// the disk is usable as scratch space without `sudo`.
+    ///
+    /// Has to be reapplied on every boot rather than done once at
+    /// provisioning time: ownership of a mount point lives in the mounted
+    /// filesystem's root inode, not the host's, so a reformat (which this
+    /// module performs whenever Azure hands back a blank or resized
+    /// resource disk) discards it along with everything else on the disk.
+    owner: ?Owner = null,
     enable_swap: bool = false,
     swap_size_mb: u32 = default_swap_size_mb,
 };
@@ -494,6 +503,10 @@ pub const FormatPolicy = enum {
     mount_existing,
 };
 
+/// Numeric ids for the mount point's owner, resolved from `/etc/passwd` by
+/// the caller (`main.zig`) so this module stays free of account lookups.
+pub const Owner = struct { uid: u32, gid: u32 };
+
 pub const SetupDeviceOptions = struct {
     allocator: Allocator,
     io: std.Io,
@@ -501,6 +514,9 @@ pub const SetupDeviceOptions = struct {
     now_unix_seconds: i64,
     mount_point: []const u8,
     format_policy: FormatPolicy,
+    /// When set, `chown`s the mount point to these ids once mounted. See
+    /// `SetupOptions.owner`.
+    owner: ?Owner = null,
     write_dataloss_warning: bool = false,
     enable_swap: bool = false,
     swap_size_mb: u32 = default_swap_size_mb,
@@ -537,6 +553,7 @@ pub fn setupDevice(options: SetupDeviceOptions) !void {
 
     var mount_dir = try std.Io.Dir.cwd().openDir(options.io, mount_point, .{});
     defer mount_dir.close(options.io);
+    if (options.owner) |owner| try mount_dir.setOwner(options.io, owner.uid, owner.gid);
     if (options.write_dataloss_warning) try writeDataLossWarning(mount_dir, options.io);
     if (options.enable_swap) {
         try enableSwap(options.allocator, options.io, mount_dir, mount_point, options.swap_size_mb);
@@ -561,6 +578,7 @@ pub fn setup(options: SetupOptions) !void {
         .now_unix_seconds = options.now_unix_seconds,
         .mount_point = options.mount_point,
         .format_policy = .replace_invalid,
+        .owner = options.owner,
         .write_dataloss_warning = true,
         .enable_swap = options.enable_swap,
         .swap_size_mb = options.swap_size_mb,

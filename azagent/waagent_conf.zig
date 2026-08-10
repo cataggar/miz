@@ -35,6 +35,12 @@ pub const WaagentConf = struct {
     /// ignored by whatever consumes this field (#113), not honored.
     resourcedisk_filesystem: []const u8 = "ext4",
     resourcedisk_mount_point: []const u8 = "/d",
+    /// Account that should own the resource disk's mount point, or `""` to
+    /// leave it `root:root` (upstream `waagent`'s behavior, and the default
+    /// here). Not an upstream key: the resource disk is scratch space for
+    /// whoever is logged in, and a root-owned mount root means every write
+    /// to it needs `sudo`.
+    resourcedisk_owner: []const u8 = "",
     resourcedisk_enable_swap: bool = false,
     resourcedisk_swap_size_mb: u32 = 0,
     /// `azagent` extension: mount existing ext4 managed-data-disk
@@ -70,6 +76,8 @@ pub const WaagentConf = struct {
                 if (kv.value) |v| result.resourcedisk_filesystem = v;
             } else if (std.mem.eql(u8, kv.key, "ResourceDisk.MountPoint")) {
                 if (kv.value) |v| result.resourcedisk_mount_point = v;
+            } else if (std.mem.eql(u8, kv.key, "ResourceDisk.Owner")) {
+                if (kv.value) |v| result.resourcedisk_owner = v;
             } else if (std.mem.eql(u8, kv.key, "ResourceDisk.EnableSwap")) {
                 if (parseSwitch(kv.value)) |v| result.resourcedisk_enable_swap = v;
             } else if (std.mem.eql(u8, kv.key, "ResourceDisk.SwapSizeMB")) {
@@ -181,6 +189,7 @@ test "WaagentConf.parse returns defaults for an empty document" {
     try std.testing.expectEqual(false, conf.resourcedisk_format);
     try std.testing.expectEqualStrings("ext4", conf.resourcedisk_filesystem);
     try std.testing.expectEqualStrings("/d", conf.resourcedisk_mount_point);
+    try std.testing.expectEqualStrings("", conf.resourcedisk_owner);
     try std.testing.expectEqual(false, conf.resourcedisk_enable_swap);
     try std.testing.expectEqual(@as(u32, 0), conf.resourcedisk_swap_size_mb);
     try std.testing.expectEqual(false, conf.datadisk_mount);
@@ -199,6 +208,7 @@ test "WaagentConf.parse applies every recognized key from a realistic document, 
         \\ResourceDisk.Format=y
         \\ResourceDisk.Filesystem=ext4
         \\ResourceDisk.MountPoint=/mnt/resource
+        \\ResourceDisk.Owner=g
         \\ResourceDisk.EnableSwap=y
         \\ResourceDisk.SwapSizeMB=2048
         \\DataDisk.Mount=y
@@ -207,6 +217,7 @@ test "WaagentConf.parse applies every recognized key from a realistic document, 
     try std.testing.expectEqual(true, conf.resourcedisk_format);
     try std.testing.expectEqualStrings("ext4", conf.resourcedisk_filesystem);
     try std.testing.expectEqualStrings("/mnt/resource", conf.resourcedisk_mount_point);
+    try std.testing.expectEqualStrings("g", conf.resourcedisk_owner);
     try std.testing.expectEqual(true, conf.resourcedisk_enable_swap);
     try std.testing.expectEqual(@as(u32, 2048), conf.resourcedisk_swap_size_mb);
     try std.testing.expectEqual(true, conf.datadisk_mount);

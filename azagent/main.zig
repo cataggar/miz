@@ -258,6 +258,30 @@ fn driveMountSetupBestEffort(allocator: std.mem.Allocator, io: std.Io, now_unix_
     };
 }
 
+/// Resolves `ResourceDisk.Owner` to numeric ids against the live
+/// `/etc/passwd`. An unset key means "leave it `root:root`". A set but
+/// unknown account is a misconfiguration worth reporting, but not worth
+/// failing the whole disk activation over -- the disk still mounts, just
+/// root-owned, which is exactly what the default does.
+fn resourceDiskOwner(allocator: std.mem.Allocator, io: std.Io, username: []const u8) ?resource_disk.Owner {
+    if (username.len == 0) return null;
+
+    const passwd_content = std.Io.Dir.cwd().readFileAlloc(io, "/etc/passwd", allocator, passwd.read_limit) catch |err| {
+        std.debug.print("azagent: warning: cannot read /etc/passwd to resolve ResourceDisk.Owner={s}: {t}\n", .{ username, err });
+        return null;
+    };
+    defer allocator.free(passwd_content);
+
+    const ids = passwd.lookupIds(passwd_content, username) catch |err| {
+        std.debug.print("azagent: warning: malformed /etc/passwd entry for ResourceDisk.Owner={s}: {t}\n", .{ username, err });
+        return null;
+    };
+    if (ids) |resolved| return .{ .uid = resolved.uid, .gid = resolved.gid };
+
+    std.debug.print("azagent: warning: ResourceDisk.Owner={s} is not an account; leaving the mount point root-owned\n", .{username});
+    return null;
+}
+
 fn driveMountSetup(allocator: std.mem.Allocator, io: std.Io, now_unix_seconds: i64, conf: waagent_conf.WaagentConf) !void {
     if (!conf.resourcedisk_format and !conf.datadisk_mount) return;
     if (conf.resourcedisk_format and !std.mem.eql(u8, conf.resourcedisk_filesystem, "ext4")) {
@@ -297,6 +321,7 @@ fn driveMountSetup(allocator: std.mem.Allocator, io: std.Io, now_unix_seconds: i
         .now_unix_seconds = now_unix_seconds,
         .resource_enabled = conf.resourcedisk_format,
         .resource_mount_point = conf.resourcedisk_mount_point,
+        .resource_owner = resourceDiskOwner(allocator, io, conf.resourcedisk_owner),
         .resource_enable_swap = conf.resourcedisk_enable_swap,
         .resource_swap_size_mb = if (conf.resourcedisk_swap_size_mb > 0) conf.resourcedisk_swap_size_mb else resource_disk.default_swap_size_mb,
         .data_disks_enabled = conf.datadisk_mount and root != null,
