@@ -4327,3 +4327,406 @@ test "a registry needing a credential the request did not declare fails to authe
     ));
     try fixture.finish();
 }
+
+// ---- cosign signature discovery ----
+//
+// The fixture below is a replica of a real artifact rather than an invention:
+// the payload, the two signature annotations and the image digest they name
+// are the ones cosign published for its own v2.4.1 release image,
+// `ghcr.io/sigstore/cosign/cosign`. Serving those exact bytes over loopback is
+// what makes these tests evidence that discovery finds what cosign actually
+// writes, and not merely that it finds what this test writes.
+
+const cosign_image_digest =
+    "sha256:b03690aa52bfe94054187142fba24dc54137650682810633901767d8a3e15b31";
+
+const cosign_payload =
+    \\{"critical":{"identity":{"docker-reference":"gcr.io/projectsigstore/cosign"},"image":{"docker-manifest-digest":"sha256:b03690aa52bfe94054187142fba24dc54137650682810633901767d8a3e15b31"},"type":"cosign container image signature"},"optional":{"GIT_HASH":"9a4cfe1aae777984c07ce373d97a65428bbff734","GIT_VERSION":"v2.4.1"}}
+;
+
+/// The signature made with cosign's own release key pair.
+const cosign_key_pair_signature =
+    "MEUCIFLs3FPY+a//a0beXlXkprM08va4Y3YKdI9nxKG9l6pmAiEAr7IU2KP4BxcRt0IQxq57MXFIEqoK8SR3Ieuo5HI488Q=";
+
+/// The keyless signature over the same payload, made with an ephemeral Fulcio
+/// key this repository has no way to check.
+const cosign_keyless_signature =
+    "MEUCIQCyQa8YLemst1vMlQaPTFzMKjDJiIXTQtvH3omkEJqRIAIgNOLg0oawizFcGJX/IKdFI6TNULfAwUGnUtRAsyln/0k=";
+
+const cosign_release_public_key =
+    \\-----BEGIN PUBLIC KEY-----
+    \\MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEhyQCx0E9wQWSFI9ULGwy3BuRklnt
+    \\IqozONbbdbqz11hlRJy9c7SG+hdcFl9jE9uE/dwtuwU2MqU9T/cN0YkWww==
+    \\-----END PUBLIC KEY-----
+    \\
+;
+
+const SignatureScenario = enum {
+    /// Two layers over one payload, exactly as the real artifact is shaped.
+    signed,
+    /// Nothing published at the signature tag.
+    unsigned,
+    /// Something published at the signature tag that is not a signature.
+    foreign_artifact,
+    /// A refusal that hides whether a signature exists.
+    forbidden,
+    /// A payload blob that is not the blob its descriptor names.
+    tampered_payload,
+    /// More candidate layers than are worth fetching.
+    crowded,
+};
+
+const SignatureFixture = struct {
+    allocator: std.mem.Allocator,
+    io: Io,
+    scenario: SignatureScenario,
+    listener: Io.net.Server,
+    authority: []u8,
+    expected_requests: usize,
+    watchdog: Watchdog = .{},
+    thread: ?std.Thread = null,
+    err: ?anyerror = null,
+    handled: usize = 0,
+    payload_digest: []u8,
+    manifest: []u8,
+    manifest_digest: []u8,
+    signature_target: []u8,
+    payload_target: []u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: Io,
+        scenario: SignatureScenario,
+        expected_requests: usize,
+    ) !SignatureFixture {
+        var address = Io.net.IpAddress{ .ip4 = .loopback(0) };
+        var listener = try address.listen(io, .{ .reuse_address = true });
+        errdefer listener.deinit(io);
+        const port = try listenerPort(&listener);
+        const authority = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{port});
+        errdefer allocator.free(authority);
+        const payload_digest = try digestText(allocator, cosign_payload);
+        errdefer allocator.free(payload_digest);
+
+        var layers = std.Io.Writer.Allocating.init(allocator);
+        defer layers.deinit();
+        switch (scenario) {
+            // Carries a signature annotation so that the media type is the only
+            // thing that keeps it from being read as a signature. An attestation
+            // or SBOM attached alongside a signature looks exactly like this.
+            .foreign_artifact => try layers.writer.print(
+                "{{\"mediaType\":\"application/vnd.example.attestation.v1+json\",\"digest\":\"{s}\"," ++
+                    "\"size\":{d},\"annotations\":{{\"{s}\":\"{s}\"}}}}",
+                .{
+                    payload_digest,
+                    cosign_payload.len,
+                    zvmi.oci.cosign.signature_annotation,
+                    cosign_key_pair_signature,
+                },
+            ),
+            .crowded => for (0..zvmi.oci.cosign_discovery.max_candidates + 1) |index| {
+                if (index != 0) try layers.writer.writeByte(',');
+                try layers.writer.print(
+                    "{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"{s}\":\"{s}\"}}}}",
+                    .{
+                        zvmi.oci.cosign.payload_media_type,
+                        payload_digest,
+                        cosign_payload.len,
+                        zvmi.oci.cosign.signature_annotation,
+                        cosign_key_pair_signature,
+                    },
+                );
+            },
+            else => try layers.writer.print(
+                "{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"{s}\":\"{s}\"}}}}," ++
+                    "{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"{s}\":\"{s}\"}}}}",
+                .{
+                    zvmi.oci.cosign.payload_media_type,
+                    payload_digest,
+                    cosign_payload.len,
+                    zvmi.oci.cosign.signature_annotation,
+                    cosign_key_pair_signature,
+                    zvmi.oci.cosign.payload_media_type,
+                    payload_digest,
+                    cosign_payload.len,
+                    zvmi.oci.cosign.signature_annotation,
+                    cosign_keyless_signature,
+                },
+            ),
+        }
+
+        const manifest = try std.fmt.allocPrint(
+            allocator,
+            "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{s}]}}",
+            .{ oci.model.media_type_oci_manifest, payload_digest, cosign_payload.len, layers.written() },
+        );
+        errdefer allocator.free(manifest);
+        const manifest_digest = try digestText(allocator, manifest);
+        errdefer allocator.free(manifest_digest);
+
+        const image = try oci.content.Digest.parse(cosign_image_digest);
+        const tag = zvmi.oci.cosign_discovery.signatureTag(image);
+        const signature_target = try std.fmt.allocPrint(
+            allocator,
+            "/v2/team/image/manifests/{s}",
+            .{&tag},
+        );
+        errdefer allocator.free(signature_target);
+        const payload_target = try std.fmt.allocPrint(
+            allocator,
+            "/v2/team/image/blobs/{s}",
+            .{payload_digest},
+        );
+        errdefer allocator.free(payload_target);
+
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .scenario = scenario,
+            .listener = listener,
+            .authority = authority,
+            .expected_requests = expected_requests,
+            .payload_digest = payload_digest,
+            .manifest = manifest,
+            .manifest_digest = manifest_digest,
+            .signature_target = signature_target,
+            .payload_target = payload_target,
+        };
+    }
+
+    fn start(self: *SignatureFixture) !void {
+        try self.watchdog.arm(self.io, &.{self.listener.socket});
+        errdefer self.watchdog.disarm();
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn finish(self: *SignatureFixture) !void {
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+        self.watchdog.disarm();
+        if (self.watchdog.tripped()) return error.FixtureTimedOut;
+        if (self.err) |err| return err;
+        try std.testing.expectEqual(self.expected_requests, self.handled);
+    }
+
+    fn deinit(self: *SignatureFixture) void {
+        if (self.thread) |thread| {
+            self.watchdog.interrupt();
+            thread.join();
+        }
+        self.watchdog.disarm();
+        self.listener.deinit(self.io);
+        self.allocator.free(self.authority);
+        self.allocator.free(self.payload_digest);
+        self.allocator.free(self.manifest);
+        self.allocator.free(self.manifest_digest);
+        self.allocator.free(self.signature_target);
+        self.allocator.free(self.payload_target);
+        self.* = undefined;
+    }
+
+    fn run(self: *SignatureFixture) void {
+        self.serve() catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn serve(self: *SignatureFixture) !void {
+        while (self.handled < self.expected_requests) {
+            var stream = try self.listener.accept(self.io);
+            defer stream.close(self.io);
+            var input_buffer: [response_head_buffer_size]u8 = undefined;
+            var output_buffer: [response_head_buffer_size]u8 = undefined;
+            var stream_reader = stream.reader(self.io, &input_buffer);
+            var stream_writer = stream.writer(self.io, &output_buffer);
+            var server = std.http.Server.init(&stream_reader.interface, &stream_writer.interface);
+            var request = try server.receiveHead();
+            try self.respond(&request);
+            self.handled += 1;
+        }
+    }
+
+    fn respond(self: *SignatureFixture, request: *std.http.Server.Request) !void {
+        const target = request.head.target;
+        if (std.mem.eql(u8, target, "/v2/")) return request.respond("", .{});
+        if (std.mem.eql(u8, target, self.signature_target)) {
+            return switch (self.scenario) {
+                .unsigned => request.respond(
+                    "{\"errors\":[{\"code\":\"MANIFEST_UNKNOWN\",\"message\":\"manifest unknown\"}]}",
+                    .{ .status = .not_found },
+                ),
+                .forbidden => request.respond(
+                    "{\"errors\":[{\"code\":\"DENIED\",\"message\":\"requested access to the resource is denied\"}]}",
+                    .{ .status = .forbidden },
+                ),
+                else => request.respond(self.manifest, .{ .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = oci.model.media_type_oci_manifest },
+                    .{ .name = "Docker-Content-Digest", .value = self.manifest_digest },
+                } }),
+            };
+        }
+        if (std.mem.eql(u8, target, self.payload_target)) {
+            if (self.scenario == .tampered_payload) {
+                const tampered = try self.allocator.dupe(u8, cosign_payload);
+                defer self.allocator.free(tampered);
+                tampered[tampered.len - 2] = ' ';
+                return request.respond(tampered, .{ .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "application/octet-stream" },
+                } });
+            }
+            return request.respond(cosign_payload, .{ .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "application/octet-stream" },
+                .{ .name = "Docker-Content-Digest", .value = self.payload_digest },
+            } });
+        }
+        return error.UnexpectedRequestTarget;
+    }
+};
+
+fn signatureSourceFor(fixture: *SignatureFixture) !oci.registry.Source {
+    return oci.registry.Source.init(
+        fixture.io,
+        fixture.allocator,
+        std.process.Environ.empty,
+        .{
+            .authority = fixture.authority,
+            .repository = "team/image",
+            .selection = .{ .digest = try oci.content.Digest.parse(cosign_image_digest) },
+        },
+        .{
+            .plain_http = true,
+            .sleep = .{ .context = null, .call = noSleep },
+        },
+    );
+}
+
+fn discoverSignatures(fixture: *SignatureFixture) !zvmi.oci.cosign_discovery.Outcome {
+    var source = try signatureSourceFor(fixture);
+    defer source.deinit();
+    const image = try oci.content.Digest.parse(cosign_image_digest);
+    return zvmi.oci.cosign_discovery.discover(&source, image);
+}
+
+test "discovery finds every signature cosign attached to an image digest" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try SignatureFixture.init(allocator, io, .signed, 3);
+    defer fixture.deinit();
+    try fixture.start();
+    var outcome = try discoverSignatures(&fixture);
+    defer outcome.deinit();
+    try fixture.finish();
+
+    // Three requests, not four: the ping, the signature manifest, and the
+    // payload blob once even though two layers name it.
+    try std.testing.expectEqual(@as(usize, 3), fixture.handled);
+    const found = outcome.found;
+    try std.testing.expectEqual(@as(usize, 2), found.candidates.len);
+    try std.testing.expectEqualStrings(
+        "sha256-b03690aa52bfe94054187142fba24dc54137650682810633901767d8a3e15b31.sig",
+        &found.tag,
+    );
+    try std.testing.expectEqualStrings(
+        fixture.manifest_digest,
+        &found.manifest_digest.format(),
+    );
+    for (found.candidates) |candidate| {
+        try std.testing.expectEqualStrings(cosign_payload, candidate.payload);
+    }
+    try std.testing.expectEqualStrings(cosign_key_pair_signature, found.candidates[0].signature);
+    try std.testing.expectEqualStrings(cosign_keyless_signature, found.candidates[1].signature);
+}
+
+test "what discovery returns is what verification accepts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try SignatureFixture.init(allocator, io, .signed, 3);
+    defer fixture.deinit();
+    try fixture.start();
+    var outcome = try discoverSignatures(&fixture);
+    defer outcome.deinit();
+    try fixture.finish();
+
+    const key = try zvmi.oci.cosign.parsePublicKeyPem(cosign_release_public_key);
+    const image = try oci.content.Digest.parse(cosign_image_digest);
+    const candidates = outcome.found.candidates;
+
+    // The first candidate is the signature cosign made with the release key
+    // pair, so it verifies. The second is a keyless signature over the same
+    // payload, made with an ephemeral certificate this repository cannot
+    // check, so it does not -- which is why one candidate verifying is what
+    // matters and not all of them.
+    try zvmi.oci.cosign.verify(allocator, .{
+        .payload = candidates[0].payload,
+        .signature = candidates[0].signature,
+    }, key, image);
+    try std.testing.expectError(error.SignatureMismatch, zvmi.oci.cosign.verify(allocator, .{
+        .payload = candidates[1].payload,
+        .signature = candidates[1].signature,
+    }, key, image));
+}
+
+test "an image with no signature artifact is unsigned, not a failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try SignatureFixture.init(allocator, io, .unsigned, 2);
+    defer fixture.deinit();
+    try fixture.start();
+    var outcome = try discoverSignatures(&fixture);
+    defer outcome.deinit();
+    try fixture.finish();
+    try std.testing.expectEqual(
+        zvmi.oci.cosign_discovery.Absence.no_artifact,
+        outcome.absent,
+    );
+}
+
+test "an artifact carrying no simple-signing layer is unsigned, not a parse failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try SignatureFixture.init(allocator, io, .foreign_artifact, 2);
+    defer fixture.deinit();
+    try fixture.start();
+    var outcome = try discoverSignatures(&fixture);
+    defer outcome.deinit();
+    try fixture.finish();
+    try std.testing.expectEqual(
+        zvmi.oci.cosign_discovery.Absence.no_signature_layer,
+        outcome.absent,
+    );
+}
+
+test "a refusal that hides whether a signature exists stays an error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try SignatureFixture.init(allocator, io, .forbidden, 2);
+    defer fixture.deinit();
+    try fixture.start();
+    // A registry that will not say is not a registry that said no. Reporting
+    // this as "unsigned" would turn an access failure into a silent pass for
+    // any policy that treats an unsigned image as acceptable.
+    try std.testing.expectError(error.RegistryRequestFailed, discoverSignatures(&fixture));
+    try fixture.finish();
+}
+
+test "a payload blob that is not the blob its descriptor names is refused" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try SignatureFixture.init(allocator, io, .tampered_payload, 3);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expectError(error.DescriptorMismatch, discoverSignatures(&fixture));
+    try fixture.finish();
+}
+
+test "a signature manifest with more candidates than are worth fetching is refused" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try SignatureFixture.init(allocator, io, .crowded, 3);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expectError(error.TooManySignatures, discoverSignatures(&fixture));
+    try fixture.finish();
+}
