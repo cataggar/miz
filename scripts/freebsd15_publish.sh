@@ -8,6 +8,13 @@ if [[ -z ${CANDIDATES_DIR:-} || -z ${SOURCE_COMMIT:-} ||
   echo "::error::Required publication configuration is incomplete"
   exit 1
 fi
+# ZFS releases require Azure acceptance results.
+if [[ "$RELEASE_SET" == "zfs" ]]; then
+  if [[ -z ${AZURE_RESULTS_DIR:-} ]]; then
+    echo "::error::ZFS releases require AZURE_RESULTS_DIR"
+    exit 1
+  fi
+fi
 for tool in gh python3 sha256sum; do
   command -v "$tool" >/dev/null || {
     echo "::error::Required publication tool $tool is unavailable"
@@ -40,11 +47,17 @@ release_file="$STAGING_ROOT/release.json"
 verify_dir="$STAGING_ROOT/remote"
 rm -rf -- "$assets_dir" "$verify_dir"
 
+azure_results_arg=""
+if [[ "$RELEASE_SET" == "zfs" ]]; then
+  azure_results_arg="--azure-results $AZURE_RESULTS_DIR"
+fi
+
 python3 scripts/freebsd15_release.py stage \
   --release-set "$RELEASE_SET" \
   --candidates "$CANDIDATES_DIR" \
   --source-commit "$SOURCE_COMMIT" \
   --release-tag "$RELEASE_TAG" \
+  $azure_results_arg \
   --output "$assets_dir" \
   --notes "$notes_file"
 

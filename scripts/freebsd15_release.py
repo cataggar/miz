@@ -289,6 +289,20 @@ RELEASE_SETS = {
     },
 }
 
+AZURE_CONTRACTS = (
+    "matching-architecture-gen2",
+    "key-only-ssh",
+    "agent-ready",
+    "hn0-dhcp",
+    "serial-console",
+    "zfs-root",
+    "zpool-healthy",
+    "root-growth",
+    "gpt-healthy",
+    "reboot-reconnect",
+    "instance-identity",
+)
+
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 CANDIDATE_SCHEMA = 2
@@ -394,6 +408,12 @@ def require_sha256(value: str, label: str) -> None:
         raise ValueError(f"{label} must be a lowercase SHA-256")
 
 
+def require_non_empty(value: str, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be non-empty")
+    return value.strip()
+
+
 def matrix_command(args: argparse.Namespace) -> None:
     selected = release_set(args.release_set)
     include = []
@@ -492,6 +512,68 @@ def candidate_command(args: argparse.Namespace) -> None:
     )
 
 
+def azure_result_command(args: argparse.Namespace) -> None:
+    manifest_path = args.manifest.resolve(strict=True)
+    candidate, asset_path = validate_candidate(manifest_path, args.source_commit)
+    if candidate["variant"] != args.key:
+        raise ValueError("candidate variant does not match --key")
+    if candidate["filesystem"] != "zfs":
+        raise ValueError("azure-result requires a zfs candidate")
+    # Independently verify the asset the caller points to is the same file the
+    # candidate manifest describes — the harness may pass a path that differs
+    # from the one validate_candidate resolved (same file, different argument).
+    asset = args.asset.resolve(strict=True)
+    if asset != asset_path.resolve():
+        actual_asset_sha256 = sha256(asset)
+        if actual_asset_sha256 != candidate["asset_sha256"]:
+            raise ValueError("--asset does not match the candidate digest")
+    require_sha256(args.vhd_sha256, "VHD SHA-256")
+    if args.vhd_bytes <= 0:
+        raise ValueError("VHD size must be positive")
+    # Validate contracts passed as a comma-separated string.
+    provided_contracts = [c.strip() for c in args.contracts.split(",")]
+    if provided_contracts != list(AZURE_CONTRACTS):
+        raise ValueError(
+            "contracts do not match required Azure contracts"
+        )
+    location = require_non_empty(args.location, "location")
+    vm_size = require_non_empty(args.vm_size, "vm_size")
+    resource_group = require_non_empty(args.resource_group, "resource_group")
+    workflow_run_id = require_non_empty(str(args.run_id), "run_id")
+    workflow_run_attempt = require_non_empty(
+        str(args.run_attempt),
+        "run_attempt",
+    )
+
+    document = {
+        "schema": 1,
+        "type": "zvmi-freebsd15-azure-acceptance",
+        "variant": candidate["variant"],
+        "architecture": candidate["architecture"],
+        "filesystem": candidate["filesystem"],
+        "flavor": candidate["flavor"],
+        "asset_name": candidate["asset_name"],
+        "source_commit": args.source_commit,
+        "qcow_sha256": candidate["asset_sha256"],
+        "derived_vhd_sha256": args.vhd_sha256,
+        "derived_vhd_bytes": args.vhd_bytes,
+        "status": "success",
+        "location": location,
+        "vm_size": vm_size,
+        "resource_group": resource_group,
+        "contracts": list(AZURE_CONTRACTS),
+        "workflow": {
+            "run_id": workflow_run_id,
+            "run_attempt": workflow_run_attempt,
+        },
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(
+        json.dumps(document, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def validate_candidate(
     manifest_path: Path,
     source_commit: str,
@@ -549,6 +631,7 @@ def release_notes(
     selected: dict,
     candidates: list[dict],
     source_commit: str,
+    azure_results: dict[str, dict] | None = None,
 ) -> str:
     lines = [selected["summary"], "", "## Highlights", ""]
     lines.extend(f"- {highlight}" for highlight in selected["highlights"])
@@ -628,13 +711,49 @@ def release_notes(
                 f"`{validation['runner']}`",
             ]
         )
+    if azure_results is not None:
+        lines.extend(
+            [
+                "",
+                "## Azure validation",
+                "",
+                "- Exact-candidate matching-architecture Gen2 validation is "
+                "complete for every ZFS release asset.",
+            ]
+        )
+        for candidate in candidates:
+            azure = azure_results[candidate["variant"]]
+            lines.extend(
+                [
+                    f"- {candidate['variant']}: `{azure['location']}` / "
+                    f"`{azure['vm_size']}`",
+                    f"  - Derived VHD SHA-256: "
+                    f"`{azure['derived_vhd_sha256']}`",
+                    f"  - Derived VHD size: "
+                    f"{azure['derived_vhd_bytes']} bytes",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "The QCOW2 assets are not directly uploadable to Azure. "
+                "Validation was completed on aligned fixed VHDs derived with "
+                "`zvmi azure derive` from these exact release candidates.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "The QCOW2 assets are not directly uploadable to Azure. "
+                "Derive an aligned fixed VHD with `zvmi azure derive` before "
+                "upload. The exact release candidates were validated under "
+                "UEFI QEMU; this release does not claim exact-candidate Azure "
+                "validation.",
+            ]
+        )
     lines.extend(
         [
-            "",
-            "The QCOW2 assets are not directly uploadable to Azure. Derive an "
-            "aligned fixed VHD with `zvmi azure derive` before upload. The exact "
-            "release candidates were validated under UEFI QEMU; this release "
-            "does not claim exact-candidate Azure validation.",
             "",
             "No checksum sidecar assets are published.",
             "",
@@ -652,6 +771,12 @@ def stage_command(args: argparse.Namespace) -> None:
             f"{args.release_set} releases must be tagged "
             f"{selected['release_tag']}"
         )
+    if args.release_set == "zfs":
+        if args.azure_results is None:
+            raise ValueError("zfs releases require --azure-results")
+    elif args.azure_results is not None:
+        raise ValueError("azure results are not applicable to this release set")
+
     wanted = selected["variants"]
     manifests = sorted(args.candidates.rglob("candidate.json"))
     if len(manifests) != len(wanted):
@@ -671,6 +796,80 @@ def stage_command(args: argparse.Namespace) -> None:
             f"{args.release_set} candidate matrix is incomplete or unexpected"
         )
 
+    azure_by_variant = None
+    if args.release_set == "zfs":
+        azure_manifests = sorted(args.azure_results.rglob("azure-result.json"))
+        if len(azure_manifests) != len(wanted):
+            raise ValueError(f"expected {len(wanted)} azure result manifests")
+        azure_by_variant = {}
+        for azure_manifest in azure_manifests:
+            document = json.loads(azure_manifest.read_text(encoding="utf-8"))
+            if document.get("schema") != 1:
+                raise ValueError(f"{azure_manifest}: unsupported schema")
+            if document.get("type") != "zvmi-freebsd15-azure-acceptance":
+                raise ValueError(f"{azure_manifest}: unexpected azure result type")
+            key = document.get("variant")
+            if key not in wanted:
+                raise ValueError(f"{azure_manifest}: unexpected variant")
+            if key in azure_by_variant:
+                raise ValueError(f"duplicate {key} azure result")
+            candidate = by_variant[key]
+            expected = VARIANTS[key]
+            for profile_key in (
+                "architecture",
+                "filesystem",
+                "flavor",
+                "asset_name",
+            ):
+                if document.get(profile_key) != expected[profile_key]:
+                    raise ValueError(
+                        f"{azure_manifest}: {profile_key} does not match profile"
+                    )
+            if document.get("filesystem") != "zfs":
+                raise ValueError(f"{azure_manifest}: filesystem must be zfs")
+            if document.get("flavor") != "full":
+                raise ValueError(f"{azure_manifest}: flavor must be full")
+            if document.get("source_commit") != args.source_commit:
+                raise ValueError(f"{azure_manifest}: source commit mismatch")
+            if document.get("qcow_sha256") != candidate["asset_sha256"]:
+                raise ValueError(
+                    f"{azure_manifest}: QCOW SHA-256 does not match candidate"
+                )
+            if document.get("status") != "success":
+                raise ValueError(f"{azure_manifest}: status is not success")
+            derived_vhd_bytes = document.get("derived_vhd_bytes")
+            if not isinstance(derived_vhd_bytes, int) or derived_vhd_bytes <= 0:
+                raise ValueError(
+                    f"{azure_manifest}: derived VHD size must be positive"
+                )
+            require_sha256(
+                document.get("derived_vhd_sha256", ""),
+                "derived VHD SHA-256",
+            )
+            require_non_empty(document.get("location", ""), "location")
+            require_non_empty(document.get("vm_size", ""), "vm_size")
+            require_non_empty(
+                document.get("resource_group", ""),
+                "resource_group",
+            )
+            if document.get("contracts") != list(AZURE_CONTRACTS):
+                raise ValueError(
+                    f"{azure_manifest}: contracts do not match required Azure contracts"
+                )
+            workflow = document.get("workflow")
+            if not isinstance(workflow, dict):
+                raise ValueError(f"{azure_manifest}: workflow is missing")
+            require_non_empty(str(workflow.get("run_id", "")), "run_id")
+            require_non_empty(
+                str(workflow.get("run_attempt", "")),
+                "run_attempt",
+            )
+            azure_by_variant[key] = document
+        if set(azure_by_variant) != set(wanted):
+            raise ValueError(
+                f"{args.release_set} azure result matrix is incomplete or unexpected"
+            )
+
     args.output.mkdir(parents=True, exist_ok=True)
     candidates = [by_variant[key] for key in wanted]
     for candidate in candidates:
@@ -681,32 +880,48 @@ def stage_command(args: argparse.Namespace) -> None:
         if sha256(destination) != candidate["asset_sha256"]:
             raise ValueError("staged asset digest mismatch")
 
+    manifest_assets = []
+    for candidate in candidates:
+        asset_manifest = {
+            "variant": candidate["variant"],
+            "architecture": candidate["architecture"],
+            "filesystem": candidate["filesystem"],
+            "flavor": candidate["flavor"],
+            "asset_name": candidate["asset_name"],
+            "bytes": candidate["asset_bytes"],
+            "sha256": candidate["asset_sha256"],
+            "packages": candidate["packages"]["count"],
+        }
+        if azure_by_variant is not None:
+            azure = azure_by_variant[candidate["variant"]]
+            asset_manifest["azure"] = {
+                "location": azure["location"],
+                "vm_size": azure["vm_size"],
+                "derived_vhd_sha256": azure["derived_vhd_sha256"],
+                "derived_vhd_bytes": azure["derived_vhd_bytes"],
+                "contracts": azure["contracts"],
+            }
+        manifest_assets.append(asset_manifest)
+
     manifest = {
         "schema": CANDIDATE_SCHEMA,
         "type": "zvmi-freebsd15-release",
         "release_set": args.release_set,
         "release_tag": args.release_tag,
         "source_commit": args.source_commit,
-        "assets": [
-            {
-                "variant": candidate["variant"],
-                "architecture": candidate["architecture"],
-                "filesystem": candidate["filesystem"],
-                "flavor": candidate["flavor"],
-                "asset_name": candidate["asset_name"],
-                "bytes": candidate["asset_bytes"],
-                "sha256": candidate["asset_sha256"],
-                "packages": candidate["packages"]["count"],
-            }
-            for candidate in candidates
-        ],
+        "assets": manifest_assets,
     }
     (args.output / "publish-manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     args.notes.write_text(
-        release_notes(selected, candidates, args.source_commit),
+        release_notes(
+            selected,
+            candidates,
+            args.source_commit,
+            azure_results=azure_by_variant,
+        ),
         encoding="utf-8",
     )
 
@@ -807,11 +1022,28 @@ def parser() -> argparse.ArgumentParser:
     candidate.add_argument("--output", type=Path, required=True)
     candidate.set_defaults(handler=candidate_command)
 
+    azure_result = commands.add_parser("azure-result")
+    azure_result.add_argument("--manifest", type=Path, required=True)
+    azure_result.add_argument("--asset", type=Path, required=True)
+    azure_result.add_argument("--key", required=True)
+    azure_result.add_argument("--source-commit", required=True)
+    azure_result.add_argument("--vhd-sha256", required=True)
+    azure_result.add_argument("--vhd-bytes", type=int, required=True)
+    azure_result.add_argument("--contracts", required=True)
+    azure_result.add_argument("--location", required=True)
+    azure_result.add_argument("--vm-size", required=True)
+    azure_result.add_argument("--resource-group", required=True)
+    azure_result.add_argument("--run-id", required=True)
+    azure_result.add_argument("--run-attempt", required=True)
+    azure_result.add_argument("--output", type=Path, required=True)
+    azure_result.set_defaults(handler=azure_result_command)
+
     stage = commands.add_parser("stage")
     stage.add_argument("--release-set", choices=RELEASE_SETS, required=True)
     stage.add_argument("--candidates", type=Path, required=True)
     stage.add_argument("--source-commit", required=True)
     stage.add_argument("--release-tag", required=True)
+    stage.add_argument("--azure-results", type=Path, default=None)
     stage.add_argument("--output", type=Path, required=True)
     stage.add_argument("--notes", type=Path, required=True)
     stage.set_defaults(handler=stage_command)
