@@ -31,6 +31,7 @@ const RegistryArg = struct {
     password: ?zvmi.customize.CredentialSource = null,
     tls_ca: ?[]const u8 = null,
     plain_http: bool = false,
+    signature_key: ?[]const u8 = null,
 
     fn access(self: RegistryArg) !zvmi.customize.RegistryAccess {
         // Both halves or neither: a user name with no password names an
@@ -45,6 +46,14 @@ const RegistryArg = struct {
             .tls_ca = self.tls_ca,
             .plain_http = self.plain_http,
         };
+    }
+
+    /// The key is named by path and not read here. `parseArgs` runs before
+    /// the run has decided it may read trust material at all, so reading it
+    /// now would be reading a file the capability check has not yet allowed.
+    fn signature(self: RegistryArg) ?zvmi.customize.RegistrySignaturePolicy {
+        const path = self.signature_key orelse return null;
+        return .{ .key = .{ .host_path = path } };
     }
 };
 
@@ -231,6 +240,7 @@ pub fn main(init: std.process.Init) !void {
                 .registry => |declared| .{ .registry = .{
                     .reference = declared.reference,
                     .access = declared.access() catch unreachable,
+                    .signature = declared.signature(),
                 } },
             },
             .rootfs_path_in_iso = args.rootfs_path,
@@ -481,6 +491,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
             registry.password = .{ .host_environment = value };
         } else if (std.mem.eql(u8, arg, "--registry-tls-ca")) {
             registry.tls_ca = value;
+        } else if (std.mem.eql(u8, arg, "--registry-signature-key")) {
+            registry.signature_key = value;
         } else if (std.mem.eql(u8, arg, "--rootfs-path")) {
             rootfs_path = value;
         } else if (std.mem.eql(u8, arg, "--bundle-output")) {
@@ -555,7 +567,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
         // make a build that reads no credential look like one that did.
         .host_path => {
             if (registry.username != null or registry.password != null or
-                registry.tls_ca != null or registry.plain_http)
+                registry.tls_ca != null or registry.plain_http or
+                registry.signature_key != null)
             {
                 return error.RegistryOptionsWithoutRegistry;
             }
@@ -982,4 +995,36 @@ test "a registry password is a locator and never material" {
         "/run/secrets/registry",
         access.credential.?.password.host_path,
     );
+}
+
+test "a signature key is carried as a path and not read here" {
+    var buffer: [40][]const u8 = undefined;
+    const parsed = try parseArgs(std.testing.allocator, testArgs(&.{
+        "--container",              "docker://registry.example/team/image:stable",
+        "--registry-signature-key", "/etc/zvmi/cosign.pub",
+    }, &buffer));
+    try std.testing.expectEqualStrings(
+        "/etc/zvmi/cosign.pub",
+        parsed.container.registry.signature().?.key.host_path,
+    );
+}
+
+test "an image with no declared key asks for no signature at all" {
+    var buffer: [40][]const u8 = undefined;
+    const parsed = try parseArgs(std.testing.allocator, testArgs(
+        &.{ "--container", "docker://registry.example/team/image:stable" },
+        &buffer,
+    ));
+    try std.testing.expect(parsed.container.registry.signature() == null);
+}
+
+test "a signature key beside a local layout is refused rather than ignored" {
+    var buffer: [40][]const u8 = undefined;
+    try std.testing.expectError(error.RegistryOptionsWithoutRegistry, parseArgs(
+        std.testing.allocator,
+        testArgs(&.{
+            "--container",              "./oci-layout",
+            "--registry-signature-key", "/etc/zvmi/cosign.pub",
+        }, &buffer),
+    ));
 }

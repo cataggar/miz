@@ -40,7 +40,7 @@ const vm_control = @import("vm_control.zig");
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
 pub const plan_schema_version: u32 = 29;
-pub const provenance_schema_version: u32 = 31;
+pub const provenance_schema_version: u32 = 32;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -7649,6 +7649,42 @@ pub const RegistryPullRecord = struct {
     /// image pulled twice transfers nothing the second time.
     transferred_bytes: usize,
     reused_bytes: usize,
+    /// Whether anything vouched for the image, and if so what.
+    signature: RegistrySignatureRecord,
+};
+
+/// What the run established about who stands behind a registry image.
+///
+/// A tagged union rather than an optional or a defaulted bool, and that is the
+/// whole point of the type. A reader asking "was this verified" must not be
+/// able to get "yes" out of a run that never asked, and the shapes a record can
+/// take are what stops that: `not_requested` says the question was not put, and
+/// it does not resemble an answer to it. There is no third state for "asked and
+/// failed" because a run whose signature check failed publishes no provenance
+/// at all -- it does not build.
+///
+/// The verified arm carries what was actually read rather than what was
+/// declared. A reader can go back to the registry and find the same manifest at
+/// the same tag; a reader given only "true" can check nothing.
+pub const RegistrySignatureRecord = union(enum) {
+    /// The request declared no signature policy. Nothing was checked, and
+    /// nothing about the image's authenticity is claimed here.
+    not_requested,
+    /// A signature over this image's digest verified under the declared key.
+    verified: VerifiedSignature,
+};
+
+pub const VerifiedSignature = struct {
+    /// The digest of the cosign signature manifest the signature came from.
+    /// Re-derived from the bytes that were read, not taken from a header.
+    signature_manifest_digest: []const u8,
+    /// The tag it was found under, which is where a reader looks to find the
+    /// same artifact again.
+    signature_tag: []const u8,
+    /// How the verifying key was named, and the key itself when the request
+    /// gave it by value. Public material, recorded so that a reader can tell
+    /// which of several trusted signers this run actually required.
+    key: TrustSource,
 };
 
 pub const Provenance = struct {
@@ -8334,6 +8370,10 @@ fn buildResult(
                     } else null,
                     .transferred_bytes = record.transferred_bytes,
                     .reused_bytes = record.reused_bytes,
+                    .signature = try dupeRegistrySignatureRecord(
+                        result_allocator,
+                        record.signature,
+                    ),
                 } else null,
             },
             .final_output = .{
@@ -8343,6 +8383,25 @@ fn buildResult(
                 .sha256 = output_digest,
             },
         },
+    };
+}
+
+/// Copied arm by arm rather than by assignment, so a new arm carrying its own
+/// slices cannot be silently republished pointing into a freed arena.
+fn dupeRegistrySignatureRecord(
+    allocator: Allocator,
+    record: RegistrySignatureRecord,
+) Allocator.Error!RegistrySignatureRecord {
+    return switch (record) {
+        .not_requested => .not_requested,
+        .verified => |found| .{ .verified = .{
+            .signature_manifest_digest = try allocator.dupe(
+                u8,
+                found.signature_manifest_digest,
+            ),
+            .signature_tag = try allocator.dupe(u8, found.signature_tag),
+            .key = try dupeTrustSource(allocator, found.key, null),
+        } },
     };
 }
 
@@ -9207,10 +9266,11 @@ fn loadSignatureKey(
 fn verifyRegistrySignature(
     allocator: Allocator,
     io: Io,
+    record_allocator: Allocator,
     source: *oci.registry.Source,
     policy: RegistrySignaturePolicy,
     manifest_digest: []const u8,
-) !void {
+) !VerifiedSignature {
     const digest = oci.Digest.parse(manifest_digest) catch return error.InvalidRegistryReference;
 
     const key_bytes = try loadSignatureKey(allocator, io, policy.key);
@@ -9233,7 +9293,17 @@ fn verifyRegistrySignature(
                     .signature = candidate.signature,
                 };
                 oci.cosign.verify(allocator, signed, key, digest) catch continue;
-                return;
+                // Copied out here rather than borrowed: `outcome` is freed on
+                // the way out of this frame, and `Digest.format` returns an
+                // array by value whose address dies with the expression.
+                return .{
+                    .signature_manifest_digest = try record_allocator.dupe(
+                        u8,
+                        &signatures.manifest_digest.format(),
+                    ),
+                    .signature_tag = try record_allocator.dupe(u8, &signatures.tag),
+                    .key = try dupeTrustSource(record_allocator, policy.key, null),
+                };
             }
             // Signatures exist and none of them is this key's. That is a
             // stronger statement than "unsigned" and gets its own error: an
@@ -9353,9 +9423,18 @@ pub fn pullRegistryImage(
     // Between resolving what the digest names and reading any of it. The pin
     // is what gets verified rather than the reference text, so what the run
     // vouches for is the document it is about to copy.
-    if (image.signature) |policy| {
-        try verifyRegistrySignature(allocator, io, &source, policy, pin.digest);
-    }
+    // Created before the verification so that what the verification found can
+    // be recorded where the rest of the record lives. Nothing is copied out of
+    // this arena until it is moved into the result, so allocating into it
+    // early is safe in a way that allocating into it *after* the move is not.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const record_allocator = arena.allocator();
+
+    const verified: ?VerifiedSignature = if (image.signature) |policy|
+        try verifyRegistrySignature(allocator, io, record_allocator, &source, policy, pin.digest)
+    else
+        null;
 
     var copied = try source.copyToLayout(
         source_reference,
@@ -9364,9 +9443,6 @@ pub fn pullRegistryImage(
     );
     defer copied.deinit(allocator);
 
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const record_allocator = arena.allocator();
     // Built before the arena is moved into the result, because moving an
     // arena copies its bookkeeping: anything allocated after the copy would
     // belong to a list the returned arena has never heard of.
@@ -9384,6 +9460,7 @@ pub fn pullRegistryImage(
         } else null,
         .transferred_bytes = copied.transferred,
         .reused_bytes = copied.reused,
+        .signature = if (verified) |found| .{ .verified = found } else .not_requested,
     };
     return .{ .arena = arena, .record = record };
 }
@@ -14059,7 +14136,7 @@ test "the schema versions move only when the documents do" {
     // was asked for, because shipping an image with three free inodes is
     // precisely the case where nobody asked for anything.
     try std.testing.expectEqual(@as(u32, 29), plan_schema_version);
-    try std.testing.expectEqual(@as(u32, 31), provenance_schema_version);
+    try std.testing.expectEqual(@as(u32, 32), provenance_schema_version);
 }
 
 test "native-edit resolution is deterministic, deeply owned, and integrity checked" {

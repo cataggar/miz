@@ -163,6 +163,15 @@ pub const Registry = struct {
     tls_ca: ?std.Build.LazyPath = null,
     /// Speak plain HTTP. For a development registry on loopback only.
     plain_http: bool = false,
+    /// A PEM public key a cosign signature over this image's digest must
+    /// verify under, checked before any layer is copied. Declaring one turns
+    /// an unsigned image, or one signed by anybody else, into a refusal.
+    ///
+    /// Tracked like any other build input, so a build whose trusted signer
+    /// changes is a different build. Naming it raises `read_trust_source`,
+    /// the same way `tls_ca` does; a public key is not a secret, and unlike
+    /// the password it is never hidden from the plan.
+    signature_key: ?std.Build.LazyPath = null,
 };
 
 pub const Input = struct {
@@ -801,6 +810,10 @@ fn configureRequest(
             }
             if (declared.tls_ca) |path| {
                 run.addArg("--registry-tls-ca");
+                run.addFileArg(path);
+            }
+            if (declared.signature_key) |path| {
+                run.addArg("--registry-signature-key");
                 run.addFileArg(path);
             }
             if (declared.plain_http) run.addArg("--registry-plain-http");
