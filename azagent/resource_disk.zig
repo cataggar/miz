@@ -14,6 +14,7 @@
 //! offset/length, so no library changes were needed to point them at
 //! `/dev/sdb` instead of a disk-image file.
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
 const zvmi = @import("zvmi");
@@ -551,13 +552,31 @@ pub fn setupDevice(options: SetupDeviceOptions) !void {
 
     try mountAt(options.io, part_path, mount_point);
 
-    var mount_dir = try std.Io.Dir.cwd().openDir(options.io, mount_point, .{});
+    var mount_dir = try openMountDir(std.Io.Dir.cwd(), options.io, mount_point);
     defer mount_dir.close(options.io);
     if (options.owner) |owner| try mount_dir.setOwner(options.io, owner.uid, owner.gid);
     if (options.write_dataloss_warning) try writeDataLossWarning(mount_dir, options.io);
     if (options.enable_swap) {
         try enableSwap(options.allocator, options.io, mount_dir, mount_point, options.swap_size_mb);
     }
+}
+
+fn openMountDir(parent: std.Io.Dir, io: std.Io, path: []const u8) !std.Io.Dir {
+    return parent.openDir(io, path, .{ .iterate = true });
+}
+
+test "mount directory handle supports ownership updates" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var mount_dir = try openMountDir(tmp.dir, io, ".");
+    defer mount_dir.close(io);
+
+    // A no-op fchown still proves the descriptor is not an O_PATH handle.
+    try mount_dir.setOwner(io, null, null);
 }
 
 /// Runs the full resource-disk activation sequence: locate the device,
