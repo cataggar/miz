@@ -40,7 +40,8 @@ zvmi/
         oci.zig                # local OCI/docker-save image ingestion
                               #   plus shared OCI transport exports
         oci/                   # references/models, verified content, local
-                              #   layouts, registry/auth, and copy engine
+                              #   layouts, registry/auth, copy engine, and
+                              #   cosign signature verification
         ext4.zig              # native ext4 writer + readback helper (htree
                               #   dirs, metadata checksums, extent trees,
                               #   offline resize; opt-in JBD2 journal and
