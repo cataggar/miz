@@ -227,6 +227,33 @@ pub fn validateManifest(manifest: Manifest) ValidationError!void {
     if (manifest.subject) |descriptor| try validateDescriptorMediaType(descriptor);
 }
 
+/// Validates a manifest that carries artifact layers rather than image
+/// layers.
+///
+/// `validateManifest` refuses a layer media type outside the image set, and
+/// that is right for a manifest something is about to be unpacked from: a
+/// pull that met an unknown layer type would otherwise carry on and produce a
+/// root filesystem missing whatever it could not read. The image
+/// specification places no such restriction, though, and artifacts depend on
+/// it not doing so -- a cosign signature manifest's layers are JSON payloads
+/// typed `application/vnd.dev.cosign.simplesigning.v1+json`, and every one of
+/// them would be refused here.
+///
+/// So an artifact is validated for everything except what its layers are: the
+/// schema version, well-formed media types, and a document media type that is
+/// a manifest and not an index. Nothing about a manifest read this way makes
+/// it eligible for the pull path, which keeps using `validateManifest`.
+pub fn validateArtifactManifest(manifest: Manifest) ValidationError!void {
+    if (manifest.schemaVersion != 2) return error.InvalidSchemaVersion;
+    if (manifest.mediaType) |media_type| {
+        try validateMediaType(media_type);
+        if (!classifyMediaType(media_type).isManifest()) return error.UnsupportedDocumentMediaType;
+    }
+    try validateDescriptorMediaType(manifest.config);
+    for (manifest.layers) |layer| try validateDescriptorMediaType(layer);
+    if (manifest.subject) |descriptor| try validateDescriptorMediaType(descriptor);
+}
+
 pub fn platformMatches(candidate: Platform, requested: Platform) bool {
     if (!std.mem.eql(u8, candidate.os, requested.os) or
         !std.mem.eql(u8, candidate.architecture, requested.architecture)) return false;

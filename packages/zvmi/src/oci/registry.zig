@@ -210,6 +210,23 @@ pub const Pin = struct {
     }
 };
 
+/// An artifact manifest and the bytes it was parsed from, kept together
+/// because a caller that re-serialised the JSON would be reasoning about
+/// different bytes than the ones the digest covers.
+pub const ResolvedArtifact = struct {
+    allocator: Allocator,
+    /// Re-derived from `bytes`, never taken from a response header.
+    digest: content.Digest,
+    media_type: []u8,
+    bytes: []u8,
+
+    pub fn deinit(self: *ResolvedArtifact) void {
+        self.allocator.free(self.media_type);
+        self.allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
 pub const Source = struct {
     io: Io,
     allocator: Allocator,
@@ -375,6 +392,62 @@ pub const Source = struct {
             .descriptor_json = descriptor_json,
             .descriptor_parsed = descriptor_parsed,
             .allocator = self.allocator,
+        };
+    }
+
+    /// Resolves a tag or digest into an artifact manifest: an OCI image
+    /// manifest whose layers are payloads rather than image layers.
+    ///
+    /// `resolve` is the wrong door for one of these. It validates what it
+    /// fetches as something a build could be unpacked from, and a cosign
+    /// signature manifest is not that -- its layers are typed
+    /// `application/vnd.dev.cosign.simplesigning.v1+json`, which
+    /// `validateManifest` refuses on purpose. Loosening `resolve` would
+    /// loosen the pull path with it, so an artifact gets its own door and the
+    /// pull path keeps its strictness. Everything else is the same: the same
+    /// session, the same bounded fetch, the same content negotiation, and the
+    /// digest re-derived from the bytes rather than believed from a header.
+    ///
+    /// A manifest read this way is not an image and cannot become one; the
+    /// caller gets bytes and a media type, and decides what they mean.
+    pub fn resolveArtifact(self: *Source, selector: []const u8) !ResolvedArtifact {
+        try self.ping();
+        const url = try self.manifestUrl(selector);
+        defer self.allocator.free(url);
+        var response = try self.fetchBounded(.GET, url, .{
+            .class = .registry,
+            .accept = manifest_accept,
+            .limit = self.metadata_limit,
+        });
+        errdefer response.deinit(self.allocator);
+        const digest = content.digestBytes(response.body);
+        if (response.content_digest) |value| {
+            const header_digest = content.Digest.parse(value) catch return error.InvalidContentDigest;
+            if (!std.mem.eql(u8, &header_digest.bytes, &digest.bytes)) return error.InvalidContentDigest;
+        }
+        const response_media_type = response.content_type orelse return error.InvalidManifest;
+        model.validateMediaType(response_media_type) catch return error.InvalidManifest;
+        if (!model.classifyMediaType(response_media_type).isManifest()) return error.InvalidManifest;
+        var parsed = std.json.parseFromSlice(
+            model.Manifest,
+            self.allocator,
+            response.body,
+            .{ .ignore_unknown_fields = true },
+        ) catch return error.InvalidManifest;
+        defer parsed.deinit();
+        model.validateArtifactManifest(parsed.value) catch return error.InvalidManifest;
+        if (parsed.value.mediaType) |document_media_type| {
+            if (!std.mem.eql(u8, document_media_type, response_media_type)) return error.InvalidManifest;
+        }
+        const media_type = try self.allocator.dupe(u8, response_media_type);
+        errdefer self.allocator.free(media_type);
+        const bytes = response.takeBody();
+        response.deinit(self.allocator);
+        return .{
+            .allocator = self.allocator,
+            .digest = digest,
+            .media_type = media_type,
+            .bytes = bytes,
         };
     }
 

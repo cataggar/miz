@@ -34,6 +34,7 @@ pub const repack = @import("oci/repack.zig");
 pub const auth = @import("oci/auth.zig");
 pub const registry = @import("oci/registry.zig");
 pub const cosign = @import("oci/cosign.zig");
+pub const cosign_discovery = @import("oci/cosign_discovery.zig");
 pub const Digest = content.Digest;
 pub const ContentVerifier = content.Verifier;
 pub const Descriptor = model.Descriptor;
