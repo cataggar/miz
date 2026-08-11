@@ -5190,3 +5190,75 @@ test "a pull with no signature policy asks the registry nothing about signatures
     try fixture.finish();
     try std.testing.expectEqualStrings(fixture.manifest_digest, pull.record.manifest_digest);
 }
+
+test "provenance for a verified pull is a different value from one that was never checked" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try PolicyFixture.init(allocator, io, .by_declared_key, 10);
+    defer fixture.deinit();
+    try fixture.start();
+    const destination = "test-oci-registry-signature-provenance";
+    deleteLayout(io, destination);
+    defer deleteLayout(io, destination);
+    const image_reference = try fixture.reference(allocator);
+    defer allocator.free(image_reference);
+
+    var pull = try zvmi.customize.pullRegistryImage(
+        allocator,
+        io,
+        std.process.Environ.empty,
+        .{
+            .reference = image_reference,
+            .access = .{ .plain_http = true },
+            .signature = .{ .key = .{ .inline_bytes = policy_public_key_pem } },
+        },
+        destination,
+    );
+    defer pull.deinit();
+    try fixture.finish();
+
+    // The record names what was read, not what was declared: a reader can go
+    // back to this tag and find this artifact.
+    const verified = pull.record.signature.verified;
+    try std.testing.expectEqualStrings(
+        fixture.signature_manifest_digest,
+        verified.signature_manifest_digest,
+    );
+    const image = try oci.content.Digest.parse(fixture.manifest_digest);
+    try std.testing.expectEqualStrings(
+        &zvmi.oci.cosign_discovery.signatureTag(image),
+        verified.signature_tag,
+    );
+    try std.testing.expectEqualStrings(policy_public_key_pem, verified.key.inline_bytes);
+}
+
+test "provenance for an unchecked pull does not read as verified" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try PolicyFixture.init(allocator, io, .by_declared_key, 8);
+    defer fixture.deinit();
+    try fixture.start();
+    const destination = "test-oci-registry-signature-unchecked";
+    deleteLayout(io, destination);
+    defer deleteLayout(io, destination);
+    const image_reference = try fixture.reference(allocator);
+    defer allocator.free(image_reference);
+
+    var pull = try zvmi.customize.pullRegistryImage(
+        allocator,
+        io,
+        std.process.Environ.empty,
+        .{ .reference = image_reference, .access = .{ .plain_http = true } },
+        destination,
+    );
+    defer pull.deinit();
+    try fixture.finish();
+
+    // The whole reason this is a union and not a `?bool` or a defaulted bool:
+    // there is no reading of this value under which a run that never asked
+    // the question comes back as having answered it.
+    try std.testing.expectEqual(
+        std.meta.Tag(zvmi.customize.RegistrySignatureRecord).not_requested,
+        std.meta.activeTag(pull.record.signature),
+    );
+}
