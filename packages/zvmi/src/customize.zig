@@ -39,7 +39,7 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 28;
+pub const plan_schema_version: u32 = 29;
 pub const provenance_schema_version: u32 = 31;
 const mib: u64 = 1024 * 1024;
 
@@ -163,6 +163,40 @@ pub const RegistryImage = struct {
     reference: []const u8,
     /// How the run reaches the registry.
     access: RegistryAccess = .{},
+    /// What the run requires of the image's authenticity, or none. Absent
+    /// means the digest is the only thing checked, which is what every
+    /// request has meant until now.
+    signature: ?RegistrySignaturePolicy = null,
+};
+
+/// What the run requires of a registry image's authenticity.
+///
+/// A digest says the bytes are the bytes that were named. It does not say who
+/// named them: whoever wrote the plan could have pinned a digest they were
+/// handed. A signature is the other half -- it says a holder of a particular
+/// key asserted that this digest is theirs -- and this policy is where a
+/// caller states which key that has to be.
+///
+/// It hangs off the image rather than off `RegistryAccess` because the two
+/// answer different questions. `RegistryAccess` is about *reaching* the
+/// registry: credentials, TLS, plain HTTP. This is about *trusting what came
+/// back*, which is a property of the image and stays true of it whichever
+/// registry served it.
+///
+/// Absent is not "unsigned is fine" stated -- it is the question not asked.
+/// A request that wants an unsigned image refused declares a key; there is no
+/// mode that demands a signature without saying whose.
+pub const RegistrySignaturePolicy = struct {
+    /// The public key every signature is checked against.
+    ///
+    /// A `TrustSource` rather than a `CredentialSource` because this is public
+    /// material and the plan is better for holding it: a plan that names a key
+    /// by path says "whatever is in that file at run time", which is exactly
+    /// the ambiguity pinning a digest exists to remove. Given inline, the plan
+    /// hash covers the key itself, so two plans that trust different signers
+    /// are different plans. Nothing here is a secret a hash could turn into an
+    /// oracle -- see `CredentialSource` for the case where it would be.
+    key: TrustSource,
 };
 
 /// Everything about reaching a registry that is not the image's name.
@@ -706,6 +740,9 @@ pub const max_vm_console_marker_bytes: usize = 256;
 /// where it is written beats writing it into a repository file and finding out
 /// from the package manager.
 pub const max_credential_field_bytes: usize = 256;
+
+/// Enough for a `sha256:<hex>` digest, a path, and the sentence around them.
+const max_signature_message_bytes: usize = 512;
 
 /// The largest material a credential source may hold. Generous for a password,
 /// tight enough that a misnamed source cannot spool a whole file into memory.
@@ -2184,6 +2221,37 @@ fn validateRegistryImage(
                 "a certificate authority cannot apply to a plain-HTTP registry",
                 "drop plain_http to use the declared authority, or drop tls_ca",
             ));
+        }
+    }
+
+    if (image.signature) |signature| {
+        switch (signature.key) {
+            .inline_bytes => |bytes| if (bytes.len == 0) {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/input/iso_oci/container/registry/signature/key/inline_bytes",
+                    "the signature verification key must not be empty",
+                    "supply the PEM public key the image is signed with",
+                ));
+            } else if (bytes.len > oci.cosign.max_public_key_pem_bytes) {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/input/iso_oci/container/registry/signature/key/inline_bytes",
+                    "the signature verification key is larger than any public key needs to be",
+                    "supply a single PEM public key, not a chain or a bundle",
+                ));
+            },
+            .host_path => |path| if (path.len == 0 or
+                path.len > Io.Dir.max_path_bytes or
+                !isSingleLinePrintable(path))
+            {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/input/iso_oci/container/registry/signature/key/host_path",
+                    "the signature verification key must be named by a non-empty single-line path",
+                    "name the PEM public key file on the build machine",
+                ));
+            },
         }
     }
 }
@@ -4583,6 +4651,9 @@ fn resolveRegistryImage(
                 null,
             .plain_http = image.access.plain_http,
         },
+        .signature = if (image.signature) |signature| .{
+            .key = try dupeTrustSource(allocator, signature.key, base_path),
+        } else null,
     };
 }
 
@@ -5224,6 +5295,28 @@ fn appendRegistryCapabilities(
             "keep the output distinct from the registry certificate authority",
         );
     }
+    // No capability of its own. A consumer that refuses `registry_access`
+    // has already refused this whole path, and one that permits it is not
+    // made worse off by the run checking a signature -- verification only
+    // ever refuses images the run would otherwise have accepted. What a key
+    // given by path does add is a file read, and that is the same permission
+    // the certificate authority above needs, so it is stated the same way.
+    if (image.signature) |signature| switch (signature.key) {
+        .inline_bytes => {},
+        .host_path => |path| {
+            try capabilities.append(.{
+                .kind = .read_trust_source,
+                .path = path,
+                .reason = "read the declared registry image signature verification key",
+            });
+            try appendIsolationCapability(
+                capabilities,
+                output.path,
+                path,
+                "keep the output distinct from the signature verification key",
+            );
+        },
+    };
 }
 
 fn appendIsolationCapability(
@@ -5418,6 +5511,19 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
                     hashInt(&hash, @intFromBool(image.access.tls_ca != null));
                     if (image.access.tls_ca) |path| hashString(&hash, path);
                     hashInt(&hash, @intFromBool(image.access.plain_http));
+                    // The verification key is public material and is hashed by
+                    // value when it is given by value, for the same reason the
+                    // signing certificate is: two plans that trust different
+                    // signers are different plans, and a hash over a public key
+                    // is an oracle for nothing.
+                    hashInt(&hash, @intFromBool(image.signature != null));
+                    if (image.signature) |signature| {
+                        hashInt(&hash, @intFromEnum(std.meta.activeTag(signature.key)));
+                        switch (signature.key) {
+                            .inline_bytes => |bytes| hashString(&hash, bytes),
+                            .host_path => |path| hashString(&hash, path),
+                        }
+                    }
                 },
             }
             hashString(&hash, input.rootfs_path_in_iso);
@@ -8347,6 +8453,10 @@ pub fn execute(
     // removes a partial image: no new lifecycle and no new cleanup.
     var container_pull: ?RegistryPull = null;
     defer if (container_pull) |*pull| pull.deinit();
+    // Lives across the pull because a signature diagnostic borrows its
+    // message until the outcome owns it, the same arrangement the limit and
+    // identity diagnostics below use.
+    var signature_message: [max_signature_message_bytes]u8 = undefined;
     if (registryContainer(plan.data.input)) |image| {
         if (event_sink) |sink| sink.emit(.{ .progress = .{
             .phase = .execution,
@@ -8359,14 +8469,29 @@ pub fn execute(
             image,
             plan.data.container_pull_path.?,
         ) catch |err| {
-            try appendFailure(
-                &diagnostics,
-                .execution_failed,
-                .execution,
-                "/input/iso_oci/container/registry",
-                "failed to pull the declared container image",
-                err,
-            );
+            // A signature failure gets its own diagnostic rather than
+            // arriving as one more error name under "failed to pull". The
+            // registry was reached and the image was there; what failed is
+            // the claim that it is the declared signer's. A caller told only
+            // that the pull failed would go and check the network.
+            if (signatureFailurePath(err)) |path| {
+                try appendSignatureFailure(
+                    &diagnostics,
+                    &signature_message,
+                    path,
+                    image,
+                    err,
+                );
+            } else {
+                try appendFailure(
+                    &diagnostics,
+                    .execution_failed,
+                    .execution,
+                    "/input/iso_oci/container/registry",
+                    "failed to pull the declared container image",
+                    err,
+                );
+            }
             if (cleanupTransaction(io, plan.data.transaction_path)) |diagnostic| try diagnostics.append(diagnostic);
             transaction_active = false;
             emitDiagnostics(event_sink, diagnostics.items);
@@ -9040,6 +9165,86 @@ fn loadSigningCertificate(
     });
 }
 
+/// Reads the public key a signature policy declares.
+///
+/// Separate from the verification so a key that could not be read is reported
+/// against the key rather than against the image: "we could not open the file
+/// you named" and "this image is not signed by you" are different answers, and
+/// a caller that confused them would go looking in the wrong place.
+fn loadSignatureKey(
+    allocator: Allocator,
+    io: Io,
+    source: TrustSource,
+) ![]u8 {
+    return switch (source) {
+        .inline_bytes => |bytes| blk: {
+            if (bytes.len == 0) return error.InvalidSignatureKey;
+            break :blk try allocator.dupe(u8, bytes);
+        },
+        .host_path => |path| Io.Dir.cwd().readFileAlloc(
+            io,
+            path,
+            allocator,
+            .limited(oci.cosign.max_public_key_pem_bytes),
+        ) catch return error.InvalidSignatureKey,
+    };
+}
+
+/// Checks that the image the pin resolved to is signed by the declared key.
+///
+/// Runs before a single layer is copied. A signature that will refuse the
+/// image refuses it just as well before the transfer as after, and doing it
+/// first means a run that was going to fail does not spend the bandwidth --
+/// nor leave a directory of blobs from an image nobody vouched for lying in
+/// the transaction directory for the cleanup path to deal with.
+///
+/// The verdict is "at least one signature over this digest verifies under this
+/// key". Several signatures on an image is normal -- cosign's own release
+/// image carries two -- and they are alternatives, not conditions: one is a
+/// key pair, one is keyless, and requiring all of them to verify under one key
+/// would refuse every image signed more than one way. Requiring one is what
+/// "signed by this key" means.
+fn verifyRegistrySignature(
+    allocator: Allocator,
+    io: Io,
+    source: *oci.registry.Source,
+    policy: RegistrySignaturePolicy,
+    manifest_digest: []const u8,
+) !void {
+    const digest = oci.Digest.parse(manifest_digest) catch return error.InvalidRegistryReference;
+
+    const key_bytes = try loadSignatureKey(allocator, io, policy.key);
+    defer allocator.free(key_bytes);
+    const key = oci.cosign.parsePublicKeyPem(key_bytes) catch return error.InvalidSignatureKey;
+
+    var outcome = try oci.cosign_discovery.discover(source, digest);
+    defer outcome.deinit();
+
+    switch (outcome) {
+        // Both absences mean the same thing to a policy that demanded a
+        // signature: there is none. They stay distinct in discovery because
+        // they tell an operator different things, and this is the one place
+        // that difference does not change the answer.
+        .absent => return error.RegistryImageUnsigned,
+        .found => |signatures| {
+            for (signatures.candidates) |candidate| {
+                const signed: oci.cosign.SignedPayload = .{
+                    .payload = candidate.payload,
+                    .signature = candidate.signature,
+                };
+                oci.cosign.verify(allocator, signed, key, digest) catch continue;
+                return;
+            }
+            // Signatures exist and none of them is this key's. That is a
+            // stronger statement than "unsigned" and gets its own error: an
+            // image signed by somebody else is a different situation from an
+            // image signed by nobody, and only one of them is plausibly a
+            // misconfigured key.
+            return error.RegistrySignatureRejected;
+        },
+    }
+}
+
 /// Owns everything a pull produced for as long as the run needs it.
 pub const RegistryPull = struct {
     arena: std.heap.ArenaAllocator,
@@ -9144,6 +9349,14 @@ pub fn pullRegistryImage(
 
     var pin = try source.pin(source_reference);
     defer pin.deinit();
+
+    // Between resolving what the digest names and reading any of it. The pin
+    // is what gets verified rather than the reference text, so what the run
+    // vouches for is the document it is about to copy.
+    if (image.signature) |policy| {
+        try verifyRegistrySignature(allocator, io, &source, policy, pin.digest);
+    }
+
     var copied = try source.copyToLayout(
         source_reference,
         .{ .path = destination_path, .selection = null },
@@ -9384,6 +9597,62 @@ const BuildEventBridge = struct {
         }
     }
 };
+
+/// The configuration path a signature failure belongs to, or null when the
+/// error is not one.
+///
+/// Two paths, because they are two mistakes. A key that could not be read or
+/// parsed is a fault in what the request declared, and points at the key. An
+/// image that is unsigned or signed by somebody else is a fact about the
+/// image, and points at the policy that refused it.
+fn signatureFailurePath(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.InvalidSignatureKey => "/input/iso_oci/container/registry/signature/key",
+        error.RegistryImageUnsigned,
+        error.RegistrySignatureRejected,
+        => "/input/iso_oci/container/registry/signature",
+        else => null,
+    };
+}
+
+/// Names the digest that was checked and the key it was checked against.
+///
+/// Both, because either alone leaves the reader guessing. The digest without
+/// the key does not say which of several trusted signers was demanded; the key
+/// without the digest does not say which image failed, and a plan may name a
+/// different one than the reader expects once a pin has been updated.
+fn appendSignatureFailure(
+    diagnostics: *std.array_list.Managed(Diagnostic),
+    buffer: []u8,
+    path: []const u8,
+    image: RegistryImage,
+    err: anyerror,
+) Allocator.Error!void {
+    const key_text = if (image.signature) |signature| switch (signature.key) {
+        // The key itself is public, but a PEM block in a diagnostic is noise
+        // where a description is an answer, and `describePublicKey` names what
+        // was actually parsed rather than what the caller meant to supply.
+        .inline_bytes => |bytes| oci.cosign.describePublicKey(bytes) orelse "an unrecognised inline key",
+        .host_path => |file| file,
+    } else "no key";
+    // The buffer is sized for both, but a pathological path could still
+    // overrun it, and a diagnostic that fails to render is worse than one that
+    // renders generically.
+    const message = std.fmt.bufPrint(
+        buffer,
+        "the declared container image {s} is not signed by {s}",
+        .{ registryReferenceDigestText(image.reference), key_text },
+    ) catch "the declared container image is not signed by the declared key";
+    try diagnostics.append(.{
+        .severity = .@"error",
+        .phase = .execution,
+        .code = .execution_failed,
+        .configuration_path = path,
+        .message = message,
+        .cause = .{ .error_name = @errorName(err) },
+        .remediation = "sign the image with the declared key, or remove input.iso_oci.container.registry.signature to accept it unverified",
+    });
+}
 
 fn appendFailure(
     diagnostics: *std.array_list.Managed(Diagnostic),
@@ -11947,6 +12216,152 @@ test "the plan hash covers the image and where its credential comes from" {
     try std.testing.expect(!std.mem.eql(u8, &credentialed_hash.bytes, &(try registryPlanHash(&other_user)).bytes));
 }
 
+test "the plan hash covers which key an image must be signed by" {
+    var base = registryRequest(test_registry_reference);
+    const base_hash = try registryPlanHash(&base);
+
+    var by_path = registryRequest(test_registry_reference);
+    by_path.input.iso_oci.container.registry.signature = .{
+        .key = .{ .host_path = "/etc/zvmi/cosign.pub" },
+    };
+    const by_path_hash = try registryPlanHash(&by_path);
+    try std.testing.expect(!std.mem.eql(u8, &base_hash.bytes, &by_path_hash.bytes));
+
+    var other_path = registryRequest(test_registry_reference);
+    other_path.input.iso_oci.container.registry.signature = .{
+        .key = .{ .host_path = "/etc/zvmi/other.pub" },
+    };
+    try std.testing.expect(!std.mem.eql(u8, &by_path_hash.bytes, &(try registryPlanHash(&other_path)).bytes));
+
+    // The public key is hashed by value when it is given by value, so two
+    // plans trusting different signers are different plans even though neither
+    // names a file. This is the opposite of the credential rule directly
+    // below, and deliberately so: a hash over a public key is an oracle for
+    // nothing, while a hash over a password would verify a guess of it.
+    var inline_key = registryRequest(test_registry_reference);
+    inline_key.input.iso_oci.container.registry.signature = .{
+        .key = .{ .inline_bytes = "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n" },
+    };
+    const inline_hash = try registryPlanHash(&inline_key);
+    try std.testing.expect(!std.mem.eql(u8, &by_path_hash.bytes, &inline_hash.bytes));
+
+    var other_inline = registryRequest(test_registry_reference);
+    other_inline.input.iso_oci.container.registry.signature = .{
+        .key = .{ .inline_bytes = "-----BEGIN PUBLIC KEY-----\nBBBB\n-----END PUBLIC KEY-----\n" },
+    };
+    try std.testing.expect(!std.mem.eql(u8, &inline_hash.bytes, &(try registryPlanHash(&other_inline)).bytes));
+}
+
+test "a signature key given by path is a capability the plan states" {
+    var request = registryRequest(test_registry_reference);
+    request.input.iso_oci.container.registry.signature = .{
+        .key = .{ .host_path = "/etc/zvmi/cosign.pub" },
+    };
+    var resolved = try resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+    defer resolved.deinit(std.testing.allocator);
+    const plan = resolved.plan orelse return error.TestUnexpectedResult;
+
+    var found = false;
+    for (plan.data.required_capabilities) |capability| {
+        if (capability.kind == .read_trust_source and
+            std.mem.eql(u8, capability.path, "/etc/zvmi/cosign.pub")) found = true;
+        // No capability of its own: a consumer that permitted the registry
+        // access has already permitted everything verification does.
+        try std.testing.expect(capability.kind != .registry_access or
+            std.mem.eql(u8, capability.path, plan.data.input.iso_oci.container.registry.reference));
+    }
+    try std.testing.expect(found);
+
+    // An inline key reads no file, so it asks for no file-reading permission.
+    var inline_request = registryRequest(test_registry_reference);
+    inline_request.input.iso_oci.container.registry.signature = .{
+        .key = .{ .inline_bytes = "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n" },
+    };
+    var inline_resolved = try resolve(std.testing.allocator, &inline_request, .{ .host_architecture = .x86_64 });
+    defer inline_resolved.deinit(std.testing.allocator);
+    const inline_plan = inline_resolved.plan orelse return error.TestUnexpectedResult;
+    for (inline_plan.data.required_capabilities) |capability| {
+        try std.testing.expect(capability.kind != .read_trust_source);
+    }
+}
+
+test "a refused signature is reported against the signature, naming the digest and the key" {
+    var diagnostics = std.array_list.Managed(Diagnostic).init(std.testing.allocator);
+    defer diagnostics.deinit();
+    var buffer: [max_signature_message_bytes]u8 = undefined;
+
+    // A key by path is named by its path: that is the thing an operator has
+    // to go and look at.
+    const by_path: RegistryImage = .{
+        .reference = test_registry_reference,
+        .signature = .{ .key = .{ .host_path = "/etc/zvmi/cosign.pub" } },
+    };
+    const path = signatureFailurePath(error.RegistryImageUnsigned) orelse
+        return error.TestUnexpectedResult;
+    try appendSignatureFailure(&diagnostics, &buffer, path, by_path, error.RegistryImageUnsigned);
+
+    // A sibling of the pull diagnostic, not a replacement for it: the pull
+    // itself succeeded, so pointing at the registry would send the reader to
+    // check a network that is working.
+    try std.testing.expectEqualStrings(
+        "/input/iso_oci/container/registry/signature",
+        diagnostics.items[0].configuration_path,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, test_registry_digest) != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "/etc/zvmi/cosign.pub") != null);
+    try std.testing.expectEqualStrings(
+        "RegistryImageUnsigned",
+        diagnostics.items[0].cause.?.error_name,
+    );
+
+    // An inline key has no path to name, so the message says what it is
+    // instead of dumping a PEM block into a diagnostic.
+    diagnostics.clearRetainingCapacity();
+    const inline_image: RegistryImage = .{
+        .reference = test_registry_reference,
+        .signature = .{ .key = .{ .inline_bytes = test_signature_public_key } },
+    };
+    try appendSignatureFailure(&diagnostics, &buffer, path, inline_image, error.RegistrySignatureRejected);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "ECDSA P-256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "BEGIN PUBLIC KEY") == null);
+
+    // A key that could not be read is a fault in the request, and points at
+    // the key rather than at the image.
+    try std.testing.expectEqualStrings(
+        "/input/iso_oci/container/registry/signature/key",
+        signatureFailurePath(error.InvalidSignatureKey).?,
+    );
+    // Everything else stays the pull's own diagnostic.
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        signatureFailurePath(error.ConnectionRefused),
+    );
+}
+
+const test_signature_public_key =
+    \\-----BEGIN PUBLIC KEY-----
+    \\MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE4eYfcdG/pp/NDtr2xlkibI+RQ0Gn
+    \\mkDaUXez3kPvDrtoWDA/cjreFgyYjJFr7fZOR16DqNogpDuzAdXBfoUSJA==
+    \\-----END PUBLIC KEY-----
+    \\
+;
+
+test "a signature policy naming no usable key is refused before the run starts" {
+    var empty_inline = registryRequest(test_registry_reference);
+    empty_inline.input.iso_oci.container.registry.signature = .{ .key = .{ .inline_bytes = "" } };
+    var empty_resolved = try resolve(std.testing.allocator, &empty_inline, .{ .host_architecture = .x86_64 });
+    defer empty_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(empty_resolved.plan == null);
+    try std.testing.expect(hasDiagnosticCode(empty_resolved.diagnostics, .invalid_policy));
+
+    var empty_path = registryRequest(test_registry_reference);
+    empty_path.input.iso_oci.container.registry.signature = .{ .key = .{ .host_path = "" } };
+    var path_resolved = try resolve(std.testing.allocator, &empty_path, .{ .host_architecture = .x86_64 });
+    defer path_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(path_resolved.plan == null);
+    try std.testing.expect(hasDiagnosticCode(path_resolved.diagnostics, .invalid_policy));
+}
+
 // The other half of the claim above, and the one that would be quietly wrong
 // if the hash ever started reading the material: two runs on either side of a
 // password rotation are the same plan, because the instruction did not change.
@@ -13643,7 +14058,7 @@ test "the schema versions move only when the documents do" {
     // The counts are recorded unconditionally rather than only when a ratio
     // was asked for, because shipping an image with three free inodes is
     // precisely the case where nobody asked for anything.
-    try std.testing.expectEqual(@as(u32, 28), plan_schema_version);
+    try std.testing.expectEqual(@as(u32, 29), plan_schema_version);
     try std.testing.expectEqual(@as(u32, 31), provenance_schema_version);
 }
 
