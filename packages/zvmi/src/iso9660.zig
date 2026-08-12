@@ -2,26 +2,45 @@
 //! and Joliet support to enumerate directory trees, read file extents, and
 //! resolve symbolic links without shelling out to external tooling.
 //!
+//! Two distinct support levels apply, and they must not be conflated:
+//!
+//!  - **Ingestion support** is what `build-image`/`build-iso` need to *read*
+//!    a source image: enumerate the tree, resolve names/symlinks, and stream
+//!    file content. The reader tolerates constructs it cannot regenerate as
+//!    long as it can still read the supported subset.
+//!  - **Strict rewrite support** is what a recustomizer needs before it may
+//!    regenerate an image and claim it preserved the source. `inspectForRewrite`
+//!    / `requireRewriteSupported` model the volume metadata and El Torito boot
+//!    catalog and return an explicit, precise list of source features the
+//!    writer cannot preserve, so a lossy rewrite is refused rather than
+//!    silently performed. Nothing about the source is dropped without a
+//!    diagnostic.
+//!
 //! Scope / limitations:
 //!  - The reader is read-only; the writer (`writeImage`/`writeImagePath`)
 //!    emits a deterministic ISO9660 image from a generic pull-based
 //!    `TreeSource`, streaming file content so large files never load into
 //!    memory whole. It writes directories, regular files, and symlinks with
-//!    POSIX mode/uid/gid via Rock Ridge, both-endian path tables, a primary
-//!    volume descriptor and terminator, and optional El Torito boot support
-//!    (no-emulation BIOS and/or UEFI entries with a validation entry and boot
-//!    catalog). Joliet emission and arbitrary-source El Torito preservation
-//!    (reading back an existing catalog into a new image) are out of scope for
-//!    this pass.
+//!    POSIX mode/uid/gid and per-entry modification time via Rock Ridge,
+//!    both-endian path tables, a primary volume descriptor (with volume,
+//!    system, volume-set, publisher, preparer, and application identifiers)
+//!    and terminator, and optional El Torito boot support (no-emulation BIOS
+//!    and/or UEFI entries with a validation entry and boot catalog). Joliet
+//!    emission is out of scope for this pass.
 //!  - Rock Ridge support covers the SUSP/RRIP records needed for real Linux
-//!    install media navigation: `SP`, `ST`, `RR`, `PX`, `NM`, `SL`, and `CE`.
-//!    Directory relocation (`CL`/`PL`/`RE`) is not implemented.
+//!    install media navigation: `SP`, `ST`, `RR`, `PX`, `NM`, `SL`, `TF`, and
+//!    `CE`. Directory relocation (`CL`/`PL`/`RE`) is neither followed nor
+//!    regeneratable; the reader flags it (and other unmodeled SUSP records such
+//!    as `PN` device nodes and `SF` sparse files) as an explicit rewrite
+//!    blocker via `inspectForRewrite` rather than mis-modeling the namespace.
 //!  - Joliet support decodes UCS-2BE names from a supplementary volume
 //!    descriptor and prefers Rock Ridge names when both are present, matching
 //!    common Unix reader behavior.
-//!  - File reading currently assumes each directory record describes a single
-//!    contiguous extent, which is the common case for installer/live-media
-//!    ISOs and for the synthetic fixtures used here.
+//!  - Multi-extent regular files (consecutive directory records for the same
+//!    file, all but the last carrying the multi-extent flag) are combined into
+//!    a single `Entry.extents` array. Interleaved files, extended attribute
+//!    record lengths, and multi-extent directories are not modeled and are
+//!    surfaced as rewrite blockers.
 
 const std = @import("std");
 const Io = std.Io;
@@ -61,6 +80,10 @@ pub const Entry = struct {
     mode: u32,
     uid: u32,
     gid: u32,
+    /// Modification time in epoch seconds, decoded from the directory record's
+    /// 7-byte recording date (or the Rock Ridge `TF` modify time when present).
+    /// The native writer stamps this back verbatim, so it round-trips.
+    mtime: i64,
     extents: []Extent,
     symlink_target: ?[]const u8,
 
@@ -75,6 +98,86 @@ pub const NameSource = enum {
     joliet,
 };
 
+/// A source feature the reader can ingest (or partially ingest) but the writer
+/// cannot regenerate. `inspectForRewrite` returns these so a recustomizer can
+/// refuse a lossy rewrite with a precise, structured reason instead of silently
+/// dropping the construct.
+pub const UnsupportedFeature = enum {
+    /// Rock Ridge `CL`/`PL`/`RE` directory relocation (deep-tree workaround).
+    rock_ridge_relocation,
+    /// Rock Ridge `PN` POSIX device number (block/char device node).
+    rock_ridge_device_node,
+    /// Rock Ridge `SF` sparse-file record.
+    rock_ridge_sparse_file,
+    /// A SUSP/RRIP System Use entry whose signature the reader does not model,
+    /// so its namespace/metadata effect cannot be preserved.
+    unknown_susp_record,
+    /// A directory record with a non-zero File Unit Size / Interleave Gap Size
+    /// (an interleaved file). The writer only emits contiguous extents.
+    interleaved_file,
+    /// A directory record carrying an Extended Attribute Record (non-zero
+    /// extended attribute record length). The writer emits none.
+    extended_attribute_record,
+    /// A directory whose content spans multiple extents. The writer emits each
+    /// directory as a single extent.
+    multi_extent_directory,
+    /// Two entries in one directory decode to the same name, so a regenerated
+    /// tree would be ambiguous.
+    duplicate_directory_entry,
+    /// An El Torito boot entry using floppy/hard-disk emulation. The writer
+    /// only emits no-emulation entries.
+    boot_media_emulation,
+    /// An El Torito section entry that declares a following selection-criteria
+    /// extension record (`0x44`). The writer emits none.
+    boot_section_extension,
+    /// An El Torito boot image whose LBA does not fall inside any modeled file,
+    /// so the writer cannot re-derive it from a tree node.
+    boot_image_unmapped,
+};
+
+pub fn unsupportedFeatureName(feature: UnsupportedFeature) []const u8 {
+    return switch (feature) {
+        .rock_ridge_relocation => "rock-ridge directory relocation (CL/PL/RE)",
+        .rock_ridge_device_node => "rock-ridge device node (PN)",
+        .rock_ridge_sparse_file => "rock-ridge sparse file (SF)",
+        .unknown_susp_record => "unmodeled SUSP/RRIP system-use record",
+        .interleaved_file => "interleaved file (non-zero file unit / interleave gap)",
+        .extended_attribute_record => "extended attribute record length",
+        .multi_extent_directory => "multi-extent directory",
+        .duplicate_directory_entry => "ambiguous duplicate directory entry",
+        .boot_media_emulation => "el torito floppy/hard-disk emulation",
+        .boot_section_extension => "el torito selection-criteria extension record",
+        .boot_image_unmapped => "el torito boot image outside modeled files",
+    };
+}
+
+/// One precise rewrite blocker: the feature plus optional locating context (an
+/// affected path and a short note such as a SUSP signature or extent LBA).
+pub const UnsupportedDetail = struct {
+    feature: UnsupportedFeature,
+    /// Affected path, or empty when not tied to a single tree entry. Borrowed
+    /// from the owning `RewriteInspection` arena.
+    path: []const u8 = &.{},
+    /// Short human-readable note (SUSP tag, media type, extent LBA, ...) or
+    /// empty. Borrowed from the owning `RewriteInspection` arena.
+    note: []const u8 = &.{},
+};
+
+// A rewrite blocker discovered while the tree is built, stored compactly on the
+// Reader (no owned strings) and materialized into an `UnsupportedDetail` on
+// demand. `entry_index` points at the nearest relevant tree entry so the path
+// can be reconstructed lazily; `note` is a tiny inline buffer.
+const BuildDiagnostic = struct {
+    feature: UnsupportedFeature,
+    entry_index: ?usize = null,
+    note_buf: [8]u8 = [_]u8{0} ** 8,
+    note_len: u8 = 0,
+
+    fn note(self: *const BuildDiagnostic) []const u8 {
+        return self.note_buf[0..self.note_len];
+    }
+};
+
 pub const OpenError = error{
     BadVolumeDescriptor,
     MissingPrimaryVolumeDescriptor,
@@ -83,6 +186,7 @@ pub const OpenError = error{
     TooManyRockRidgeContinuations,
     UnsupportedRockRidgeRelocation,
     InvalidDirectoryRecord,
+    InvalidMultiExtent,
     InvalidJolietName,
 } || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError || std.mem.Allocator.Error;
 
@@ -99,6 +203,10 @@ pub const Reader = struct {
     has_rock_ridge: bool,
     has_joliet: bool,
     name_source: NameSource,
+    /// Rewrite blockers discovered while building the tree (relocation,
+    /// interleaved files, duplicate names, ...). Empty for the writer's own
+    /// deterministic output. Surfaced through `inspectForRewrite`.
+    build_diagnostics: []BuildDiagnostic,
 
     pub fn openPath(allocator: std.mem.Allocator, io: Io, path: []const u8) OpenError!Reader {
         const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
@@ -115,6 +223,8 @@ pub const Reader = struct {
         errdefer primary_tree.deinit(allocator);
 
         if (primary_tree.has_rock_ridge or descriptors.joliet == null) {
+            const diagnostics = try primary_tree.diagnostics.toOwnedSlice();
+            errdefer allocator.free(diagnostics);
             return .{
                 .allocator = allocator,
                 .file = file,
@@ -125,6 +235,7 @@ pub const Reader = struct {
                 .has_rock_ridge = primary_tree.has_rock_ridge,
                 .has_joliet = descriptors.joliet != null,
                 .name_source = if (primary_tree.has_rock_ridge) .rock_ridge else .iso9660,
+                .build_diagnostics = diagnostics,
             };
         }
 
@@ -133,6 +244,8 @@ pub const Reader = struct {
         var joliet_tree = try buildTree(allocator, io, file, descriptors.joliet.?, true);
         errdefer joliet_tree.deinit(allocator);
 
+        const diagnostics = try joliet_tree.diagnostics.toOwnedSlice();
+        errdefer allocator.free(diagnostics);
         return .{
             .allocator = allocator,
             .file = file,
@@ -143,18 +256,47 @@ pub const Reader = struct {
             .has_rock_ridge = false,
             .has_joliet = true,
             .name_source = .joliet,
+            .build_diagnostics = diagnostics,
         };
     }
 
     pub fn close(self: *Reader, io: Io) void {
         freeEntries(self.allocator, self.entries);
         freePathTable(self.allocator, self.path_table);
+        self.allocator.free(self.build_diagnostics);
         self.file.close(io);
         self.* = undefined;
     }
 
     pub fn getEntry(self: Reader, index: usize) *const Entry {
         return &self.entries[index];
+    }
+
+    /// Reconstructs the absolute '/'-separated path of `index` by walking
+    /// parents. The root is "/". Caller owns the returned slice.
+    pub fn pathAlloc(self: Reader, allocator: std.mem.Allocator, index: usize) std.mem.Allocator.Error![]u8 {
+        if (index == self.root_index) return allocator.dupe(u8, "/");
+
+        var parts = std.array_list.Managed([]const u8).init(allocator);
+        defer parts.deinit();
+        var cur = index;
+        var guard: usize = 0;
+        while (cur != self.root_index) {
+            guard += 1;
+            if (guard > self.entries.len) break;
+            try parts.append(self.entries[cur].name);
+            cur = self.entries[cur].parent orelse break;
+        }
+
+        var out = std.array_list.Managed(u8).init(allocator);
+        errdefer out.deinit();
+        var i: usize = parts.items.len;
+        while (i > 0) {
+            i -= 1;
+            try out.append('/');
+            try out.appendSlice(parts.items[i]);
+        }
+        return out.toOwnedSlice();
     }
 
     pub fn lookup(self: Reader, path: []const u8) LookupError!usize {
@@ -245,6 +387,113 @@ pub const Reader = struct {
         }
         return null;
     }
+
+    fn findFileByExtentLba(self: Reader, lba: u32) ?usize {
+        for (self.entries, 0..) |entry, idx| {
+            if (entry.kind != .file) continue;
+            // A boot image is only a mapped file when it starts at the file's
+            // leading extent. Matching an interior extent of a multi-extent
+            // file would misrepresent a mid-file offset as the whole file, so
+            // such a boot LBA stays raw/unmapped (and thus unsupported).
+            if (entry.extents.len == 0) continue;
+            if (entry.extents[0].lba == lba) return idx;
+        }
+        return null;
+    }
+
+    /// Models the writer-preservable metadata (volume identifiers, El Torito
+    /// boot catalog with each image mapped to a tree file or an explicit raw
+    /// extent) and returns every source construct the writer cannot preserve.
+    /// An empty `RewriteInspection.unsupported` list means a regeneration is
+    /// lossless within the supported model. Genuinely malformed structures
+    /// (bad checksum/signature/bounds) fail precisely rather than being listed.
+    /// Caller owns the returned inspection and must `deinit` it.
+    pub fn inspectForRewrite(self: Reader, allocator: std.mem.Allocator, io: Io) InspectError!RewriteInspection {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+
+        const volume = try readVolumeMetadataAlloc(a, io, self.file);
+
+        var unsupported = std.array_list.Managed(UnsupportedDetail).init(a);
+
+        // Structural (tree) blockers first, in discovery order.
+        for (self.build_diagnostics) |diag| {
+            try unsupported.append(.{
+                .feature = diag.feature,
+                .path = if (diag.entry_index) |idx| try self.pathAlloc(a, idx) else &.{},
+                .note = try a.dupe(u8, diag.note()),
+            });
+        }
+
+        // El Torito boot state and its blockers. A malformed catalog is a hard,
+        // precise failure; a missing boot record simply leaves `boot` null.
+        var boot: ?BootModel = null;
+        const maybe_cat: ?BootCatalog = readBootCatalog(a, io, self.file) catch |err| blk: {
+            if (err == error.NoBootRecord) break :blk null;
+            return @as(InspectError, @errorCast(err));
+        };
+        if (maybe_cat) |cat| {
+            const inspected = try a.alloc(InspectedBootEntry, cat.entries.len);
+            for (cat.entries, 0..) |entry, idx| {
+                const mapping: BootImageMapping = if (self.findFileByExtentLba(entry.image_lba)) |file_idx| .{
+                    .mapped = .{ .entry_index = file_idx, .path = try self.pathAlloc(a, file_idx) },
+                } else .{
+                    .raw_extent = .{ .lba = entry.image_lba, .sectors = entry.load_sectors },
+                };
+                inspected[idx] = .{ .entry = entry, .image = mapping };
+
+                if (entry.media != .no_emulation) {
+                    try unsupported.append(.{
+                        .feature = .boot_media_emulation,
+                        .note = try std.fmt.allocPrint(a, "media {d}", .{entry.media_type & 0x0F}),
+                    });
+                }
+                if (entry.has_extension) {
+                    try unsupported.append(.{ .feature = .boot_section_extension });
+                }
+                if (mapping == .raw_extent) {
+                    try unsupported.append(.{
+                        .feature = .boot_image_unmapped,
+                        .note = try std.fmt.allocPrint(a, "lba {d}", .{entry.image_lba}),
+                    });
+                }
+            }
+            boot = .{
+                .validation = cat.validation,
+                .headers = cat.headers,
+                .entries = inspected,
+                .has_extension_records = cat.has_extension_records,
+            };
+        }
+
+        return .{
+            .arena = arena,
+            .volume = volume,
+            .boot = boot,
+            .unsupported = try unsupported.toOwnedSlice(),
+        };
+    }
+
+    /// Strict gate for a recustomizer: returns normally only when the source is
+    /// losslessly rewritable within the supported model. Otherwise returns
+    /// `error.SourceNotRewritable`; when `out_detail` is non-null it receives
+    /// the first precise blocker with `path`/`note` duplicated into `allocator`
+    /// (free them with `freeUnsupportedDetail`).
+    pub fn requireRewriteSupported(self: Reader, allocator: std.mem.Allocator, io: Io, out_detail: ?*UnsupportedDetail) RewriteSupportError!void {
+        var inspection = try self.inspectForRewrite(allocator, io);
+        defer inspection.deinit();
+        if (inspection.firstUnsupported()) |first| {
+            if (out_detail) |slot| {
+                slot.* = .{
+                    .feature = first.feature,
+                    .path = if (first.path.len > 0) try allocator.dupe(u8, first.path) else &.{},
+                    .note = if (first.note.len > 0) try allocator.dupe(u8, first.note) else &.{},
+                };
+            }
+            return error.SourceNotRewritable;
+        }
+    }
 };
 
 const DescriptorRef = struct {
@@ -261,11 +510,25 @@ const ScannedDescriptors = struct {
 
 const DirectoryRecord = struct {
     length: u8,
+    ext_attr_length: u8,
     extent_lba: u32,
     data_length: u32,
+    /// Modification time decoded from the 7-byte recording date field.
+    recorded_at: i64,
     flags: u8,
+    file_unit_size: u8,
+    interleave_gap: u8,
     file_identifier: []const u8,
     system_use: []const u8,
+
+    /// ISO9660 multi-extent flag (bit 7): another record continues this file.
+    fn isMultiExtent(self: DirectoryRecord) bool {
+        return self.flags & 0x80 != 0;
+    }
+
+    fn isDirectory(self: DirectoryRecord) bool {
+        return self.flags & 0x02 != 0;
+    }
 };
 
 const RockRidgeInfo = struct {
@@ -274,6 +537,12 @@ const RockRidgeInfo = struct {
     mode: ?u32 = null,
     uid: ?u32 = null,
     gid: ?u32 = null,
+    mtime: ?i64 = null,
+    /// A rewrite-blocking SUSP/RRIP construct was seen on this record.
+    unsupported: ?UnsupportedFeature = null,
+    /// Signature of the offending record (for diagnostics), when applicable.
+    unsupported_tag: [4]u8 = [_]u8{0} ** 4,
+    unsupported_tag_len: u8 = 0,
 
     fn deinit(self: *RockRidgeInfo, allocator: std.mem.Allocator) void {
         if (self.name) |name| allocator.free(name);
@@ -284,6 +553,7 @@ const RockRidgeInfo = struct {
 
 const TreeBuilder = struct {
     entries: std.array_list.Managed(Entry),
+    diagnostics: std.array_list.Managed(BuildDiagnostic),
     root_index: usize,
     has_rock_ridge: bool = false,
     logical_block_size: u16,
@@ -297,12 +567,22 @@ const TreeBuilder = struct {
             if (entry.symlink_target) |target| allocator.free(target);
         }
         self.entries.deinit();
+        self.diagnostics.deinit();
+    }
+
+    fn note(self: *TreeBuilder, feature: UnsupportedFeature, entry_index: ?usize, tag: []const u8) std.mem.Allocator.Error!void {
+        var diag = BuildDiagnostic{ .feature = feature, .entry_index = entry_index };
+        const n = @min(tag.len, diag.note_buf.len);
+        @memcpy(diag.note_buf[0..n], tag[0..n]);
+        diag.note_len = @intCast(n);
+        try self.diagnostics.append(diag);
     }
 };
 
 fn buildTree(allocator: std.mem.Allocator, io: Io, file: Io.File, descriptor: DescriptorRef, joliet: bool) OpenError!TreeBuilder {
     var builder = TreeBuilder{
         .entries = std.array_list.Managed(Entry).init(allocator),
+        .diagnostics = std.array_list.Managed(BuildDiagnostic).init(allocator),
         .root_index = 0,
         .logical_block_size = descriptor.logical_block_size,
         .joliet = joliet,
@@ -310,12 +590,15 @@ fn buildTree(allocator: std.mem.Allocator, io: Io, file: Io.File, descriptor: De
     errdefer builder.deinit(allocator);
 
     const root_name = try allocator.dupe(u8, "/");
-    errdefer allocator.free(root_name);
-    const root_extents = try allocator.alloc(Extent, 1);
-    errdefer allocator.free(root_extents);
+    const root_extents = allocator.alloc(Extent, 1) catch |err| {
+        allocator.free(root_name);
+        return err;
+    };
     root_extents[0] = .{ .lba = descriptor.root_record.extent_lba, .size = descriptor.root_record.data_length };
 
-    try builder.entries.append(.{
+    // On failure free the parts; once appended the builder owns them and its
+    // deinit frees them exactly once (so no standalone errdefer for them).
+    builder.entries.append(.{
         .name = root_name,
         .parent = null,
         .kind = .directory,
@@ -323,10 +606,26 @@ fn buildTree(allocator: std.mem.Allocator, io: Io, file: Io.File, descriptor: De
         .mode = 0o040755,
         .uid = 0,
         .gid = 0,
+        .mtime = descriptor.root_record.recorded_at,
         .extents = root_extents,
         .symlink_target = null,
-    });
+    }) catch |err| {
+        allocator.free(root_name);
+        allocator.free(root_extents);
+        return err;
+    };
     builder.root_index = 0;
+
+    // The PVD root directory record is subject to the same rewrite blockers as
+    // any other directory record: an extended attribute record length, a
+    // File Unit Size / Interleave Gap (interleaving), or the multi-extent flag
+    // (a directory spanning multiple extents) cannot be regenerated verbatim.
+    if (descriptor.root_record.ext_attr_length != 0)
+        try builder.note(.extended_attribute_record, 0, "");
+    if (descriptor.root_record.file_unit_size != 0 or descriptor.root_record.interleave_gap != 0)
+        try builder.note(.interleaved_file, 0, "");
+    if (descriptor.root_record.isMultiExtent())
+        try builder.note(.multi_extent_directory, 0, "");
 
     try parseDirectory(allocator, io, file, &builder, 0, descriptor.root_record, 0);
     return builder;
@@ -339,6 +638,14 @@ fn parseDirectory(allocator: std.mem.Allocator, io: Io, file: Io.File, builder: 
     defer allocator.free(dir_buf);
     _ = try file.readPositionalAll(io, dir_buf, @as(u64, record.extent_lba) * builder.logical_block_size);
 
+    // Names already seen in this directory, for ambiguous-duplicate detection.
+    var seen_names = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = seen_names.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        seen_names.deinit();
+    }
+
     var offset: usize = 0;
     while (offset < dir_buf.len) {
         const length = dir_buf[offset];
@@ -350,7 +657,6 @@ fn parseDirectory(allocator: std.mem.Allocator, io: Io, file: Io.File, builder: 
         if (offset + length > dir_buf.len) return error.InvalidDirectoryRecord;
 
         const child_record = try parseDirectoryRecord(dir_buf[offset .. offset + length]);
-        defer if (child_record.file_identifier.len == 0) {};
 
         const is_special = child_record.file_identifier.len == 1 and (child_record.file_identifier[0] == 0 or child_record.file_identifier[0] == 1);
 
@@ -365,9 +671,52 @@ fn parseDirectory(allocator: std.mem.Allocator, io: Io, file: Io.File, builder: 
                 if (rr.mode) |mode| builder.entries.items[parent_index].mode = mode;
                 if (rr.uid) |uid| builder.entries.items[parent_index].uid = uid;
                 if (rr.gid) |gid| builder.entries.items[parent_index].gid = gid;
+                if (rr.mtime) |mtime| builder.entries.items[parent_index].mtime = mtime;
             }
             offset += child_record.length;
             continue;
+        }
+
+        const kind: EntryKind = if (rr.symlink_target != null)
+            .symlink
+        else if (child_record.isDirectory())
+            .directory
+        else
+            .file;
+
+        var saw_ext_attr = child_record.ext_attr_length != 0;
+        var saw_interleave = child_record.file_unit_size != 0 or child_record.interleave_gap != 0;
+
+        // Gather extents. A regular file may span several consecutive directory
+        // records (multi-extent), all but the last carrying the multi-extent
+        // flag and repeating the same File Identifier.
+        var extent_list = std.array_list.Managed(Extent).init(allocator);
+        defer extent_list.deinit();
+        try extent_list.append(.{ .lba = child_record.extent_lba, .size = child_record.data_length });
+        var total_size: u64 = child_record.data_length;
+        const multi_extent = child_record.isMultiExtent();
+
+        offset += child_record.length;
+        if (multi_extent) {
+            while (true) {
+                if (offset >= dir_buf.len) return error.InvalidMultiExtent;
+                const nlen = dir_buf[offset];
+                if (nlen == 0) {
+                    const sector_off = offset % builder.logical_block_size;
+                    offset += builder.logical_block_size - sector_off;
+                    continue;
+                }
+                if (offset + nlen > dir_buf.len) return error.InvalidDirectoryRecord;
+                const next = try parseDirectoryRecord(dir_buf[offset .. offset + nlen]);
+                if (!std.mem.eql(u8, next.file_identifier, child_record.file_identifier)) return error.InvalidMultiExtent;
+                if (next.isDirectory() != child_record.isDirectory()) return error.InvalidMultiExtent;
+                if (next.ext_attr_length != 0) saw_ext_attr = true;
+                if (next.file_unit_size != 0 or next.interleave_gap != 0) saw_interleave = true;
+                try extent_list.append(.{ .lba = next.extent_lba, .size = next.data_length });
+                total_size = std.math.add(u64, total_size, next.data_length) catch return error.InvalidMultiExtent;
+                offset += next.length;
+                if (!next.isMultiExtent()) break;
+            }
         }
 
         const decoded_name = if (rr.name) |name|
@@ -376,21 +725,17 @@ fn parseDirectory(allocator: std.mem.Allocator, io: Io, file: Io.File, builder: 
             try decodeJolietName(allocator, child_record.file_identifier)
         else
             try decodeIsoName(allocator, child_record.file_identifier);
-        errdefer allocator.free(decoded_name);
 
-        const extents = try allocator.alloc(Extent, 1);
-        errdefer allocator.free(extents);
-        extents[0] = .{ .lba = child_record.extent_lba, .size = child_record.data_length };
+        const target: ?[]u8 = if (rr.symlink_target) |link| (allocator.dupe(u8, link) catch |err| {
+            allocator.free(decoded_name);
+            return err;
+        }) else null;
 
-        const kind: EntryKind = if (rr.symlink_target != null)
-            .symlink
-        else if (child_record.flags & 0x02 != 0)
-            .directory
-        else
-            .file;
-
-        const target = if (rr.symlink_target) |link| try allocator.dupe(u8, link) else null;
-        errdefer if (target) |link| allocator.free(link);
+        const extents = extent_list.toOwnedSlice() catch |err| {
+            allocator.free(decoded_name);
+            if (target) |t| allocator.free(t);
+            return err;
+        };
 
         const entry_mode: u32 = rr.mode orelse switch (kind) {
             .directory => @as(u32, 0o040755),
@@ -398,24 +743,51 @@ fn parseDirectory(allocator: std.mem.Allocator, io: Io, file: Io.File, builder: 
             .symlink => @as(u32, 0o120777),
         };
 
-        try builder.entries.append(.{
+        const entry_size: u64 = switch (kind) {
+            .symlink => if (target) |t| t.len else 0,
+            else => total_size,
+        };
+
+        builder.entries.append(.{
             .name = decoded_name,
             .parent = parent_index,
             .kind = kind,
-            .size = child_record.data_length,
+            .size = entry_size,
             .mode = entry_mode,
             .uid = rr.uid orelse 0,
             .gid = rr.gid orelse 0,
+            .mtime = rr.mtime orelse child_record.recorded_at,
             .extents = extents,
             .symlink_target = target,
-        });
+        }) catch |err| {
+            allocator.free(decoded_name);
+            allocator.free(extents);
+            if (target) |t| allocator.free(t);
+            return err;
+        };
+        // From here the builder owns name/extents/target; on later error the
+        // builder's deinit frees them exactly once.
         const child_index = builder.entries.items.len - 1;
+
+        if (saw_ext_attr) try builder.note(.extended_attribute_record, child_index, "");
+        if (saw_interleave) try builder.note(.interleaved_file, child_index, "");
+        if (multi_extent and kind == .directory) try builder.note(.multi_extent_directory, child_index, "");
+        if (rr.unsupported) |feature| try builder.note(feature, child_index, rr.unsupported_tag[0..rr.unsupported_tag_len]);
+
+        const name = builder.entries.items[child_index].name;
+        if (seen_names.contains(name)) {
+            try builder.note(.duplicate_directory_entry, child_index, "");
+        } else {
+            const key = try allocator.dupe(u8, name);
+            seen_names.put(key, {}) catch |err| {
+                allocator.free(key);
+                return err;
+            };
+        }
 
         if (kind == .directory) {
             try parseDirectory(allocator, io, file, builder, child_index, child_record, depth + 1);
         }
-
-        offset += child_record.length;
     }
 }
 
@@ -512,12 +884,47 @@ fn parseDirectoryRecord(buf: []const u8) OpenError!DirectoryRecord {
 
     return .{
         .length = length,
+        .ext_attr_length = buf[1],
         .extent_lba = read733(buf[2..10]),
         .data_length = read733(buf[10..18]),
+        .recorded_at = parseRecordDate(buf[18..25]),
         .flags = buf[25],
+        .file_unit_size = buf[26],
+        .interleave_gap = buf[27],
         .file_identifier = buf[name_start..name_end],
         .system_use = buf[system_use_start..length],
     };
+}
+
+/// Decodes the 7-byte directory-record recording date (ECMA-119 9.1.5) into
+/// epoch seconds. Byte 6 is the offset from GMT in 15-minute intervals (signed).
+fn parseRecordDate(bytes: []const u8) i64 {
+    const year: i64 = @as(i64, bytes[0]) + 1900;
+    const month: i64 = bytes[1];
+    const day: i64 = bytes[2];
+    const hour: i64 = bytes[3];
+    const minute: i64 = bytes[4];
+    const second: i64 = bytes[5];
+    const gmt_offset: i8 = @bitCast(bytes[6]);
+
+    if (month < 1 or month > 12 or day < 1 or day > 31) return 0;
+    var epoch = epochFromCivil(year, @intCast(month), @intCast(day));
+    epoch += hour * 3600 + minute * 60 + second;
+    epoch -= @as(i64, gmt_offset) * 15 * 60;
+    return if (epoch < 0) 0 else epoch;
+}
+
+/// Days-from-civil (Howard Hinnant), then to epoch seconds at 00:00:00 UTC.
+fn epochFromCivil(year: i64, month: u8, day: u8) i64 {
+    const y = if (month <= 2) year - 1 else year;
+    const era = @divFloor(if (y >= 0) y else y - 399, 400);
+    const yoe = y - era * 400;
+    const m: i64 = month;
+    const d: i64 = day;
+    const doy = @divFloor(153 * (if (m > 2) m - 3 else m + 9) + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    const days = era * 146097 + doe - 719468;
+    return days * 86400;
 }
 
 fn parseRockRidge(allocator: std.mem.Allocator, io: Io, file: Io.File, builder: *TreeBuilder, system_use: []const u8) OpenError!RockRidgeInfo {
@@ -591,6 +998,26 @@ fn parseRockRidge(allocator: std.mem.Allocator, io: Io, file: Io.File, builder: 
                     try appendSymlinkComponents(&link_buf, entry[5..]);
                     builder.has_rock_ridge = true;
                 }
+            } else if (std.mem.eql(u8, sig, "TF")) {
+                if (parseTimeFlags(entry)) |mtime| info.mtime = mtime;
+                builder.has_rock_ridge = true;
+            } else if (std.mem.eql(u8, sig, "CL") or std.mem.eql(u8, sig, "PL") or std.mem.eql(u8, sig, "RE")) {
+                // Directory relocation (deep-tree workaround). The reader neither
+                // follows nor regenerates it, so mark it as a rewrite blocker.
+                markUnsupported(&info, .rock_ridge_relocation, sig);
+                builder.has_rock_ridge = true;
+            } else if (std.mem.eql(u8, sig, "PN")) {
+                markUnsupported(&info, .rock_ridge_device_node, sig);
+                builder.has_rock_ridge = true;
+            } else if (std.mem.eql(u8, sig, "SF")) {
+                markUnsupported(&info, .rock_ridge_sparse_file, sig);
+                builder.has_rock_ridge = true;
+            } else if (std.mem.eql(u8, sig, "ES") or std.mem.eql(u8, sig, "PD")) {
+                // Extension-sourcing / padding: benign SUSP framing, ignored.
+            } else if (builder.susp_skip != null and isSuspSignature(sig)) {
+                // A SUSP-framed image carried a system-use record whose semantics
+                // the reader does not model; its effect cannot be preserved.
+                markUnsupported(&info, .unknown_susp_record, sig);
             }
         }
 
@@ -616,6 +1043,35 @@ const Continuation = struct {
     offset: u32,
     size: u32,
 };
+
+fn markUnsupported(info: *RockRidgeInfo, feature: UnsupportedFeature, sig: []const u8) void {
+    if (info.unsupported != null) return;
+    info.unsupported = feature;
+    const n = @min(sig.len, info.unsupported_tag.len);
+    @memcpy(info.unsupported_tag[0..n], sig[0..n]);
+    info.unsupported_tag_len = @intCast(n);
+}
+
+fn isSuspSignature(sig: []const u8) bool {
+    return sig.len == 2 and
+        sig[0] >= 'A' and sig[0] <= 'Z' and
+        sig[1] >= 'A' and sig[1] <= 'Z';
+}
+
+/// Parses a Rock Ridge `TF` (timestamps) record and returns the modify time in
+/// epoch seconds when present. Only the 7-byte short form is decoded; the rare
+/// 17-byte long form is ignored (the directory-record date is used instead).
+fn parseTimeFlags(entry: []const u8) ?i64 {
+    if (entry.len < 5) return null;
+    const flags = entry[4];
+    if (flags & 0x80 != 0) return null; // long form: not decoded
+    if (flags & 0x02 == 0) return null; // no modify time present
+    var offset: usize = 5;
+    // The modify bit is bit 1; only the creation bit (0) precedes it.
+    if (flags & 0x01 != 0) offset += 7;
+    if (offset + 7 > entry.len) return null;
+    return parseRecordDate(entry[offset .. offset + 7]);
+}
 
 fn appendSymlinkComponents(buf: *std.array_list.Managed(u8), payload: []const u8) std.mem.Allocator.Error!void {
     var rest = payload;
@@ -1099,32 +1555,87 @@ test "iso9660 reader falls back to joliet unicode names" {
 }
 
 // ===========================================================================
-// El Torito boot catalog readback
+// El Torito boot catalog modeling
 // ===========================================================================
 
 pub const boot_platform_bios: u8 = 0x00;
+pub const boot_platform_ppc: u8 = 0x01;
+pub const boot_platform_mac: u8 = 0x02;
 pub const boot_platform_uefi: u8 = 0xEF;
 
-/// A single El Torito boot entry as recovered from a boot catalog. The reader
-/// only reproduces what the writer in this module emits: no-emulation entries
-/// for one or both firmware platforms.
-pub const BootCatalogEntry = struct {
+/// El Torito boot media / emulation type (initial/section entry byte 1, low
+/// nibble). The native writer only emits `no_emulation`.
+pub const BootMediaType = enum(u8) {
+    no_emulation = 0,
+    diskette_1_2m = 1,
+    diskette_1_44m = 2,
+    diskette_2_88m = 3,
+    hard_disk = 4,
+    _,
+};
+
+/// Whether an entry is the catalog's initial/default entry or belongs to a
+/// section introduced by a section header.
+pub const BootEntryKind = enum { default, section };
+
+/// The catalog validation entry (El Torito §2.1): platform id plus the 24-byte
+/// developer id string. A parsed catalog always has a verified checksum and
+/// `0x55AA` key signature.
+pub const BootValidationEntry = struct {
     platform: u8,
-    media_type: u8,
+    id_string: [24]u8,
+};
+
+/// A section header (0x90 = more headers follow, 0x91 = final header).
+pub const BootSectionHeader = struct {
+    platform: u8,
+    entry_count: u16,
+    /// True for the final header (0x91).
+    final: bool,
+    id_string: [28]u8,
+};
+
+/// A single El Torito boot entry as recovered from the catalog. Every field the
+/// writer can preserve is captured; `selection_criteria` bytes are retained for
+/// section entries even though the current writer emits none.
+pub const BootCatalogEntry = struct {
+    kind: BootEntryKind,
+    /// Platform id inherited from the validation entry (default entry) or the
+    /// governing section header (section entries).
+    platform: u8,
     bootable: bool,
+    /// Raw boot indicator byte (0x88 bootable, 0x00 not bootable).
+    boot_indicator: u8,
+    /// Raw media byte (low nibble is media type, upper bits are flags).
+    media_type: u8,
+    /// Decoded media/emulation type.
+    media: BootMediaType,
     load_segment: u16,
     system_type: u8,
     load_sectors: u16,
     image_lba: u32,
+    /// Selection-criteria type byte (section entries only; 0 otherwise).
+    selection_criteria_type: u8,
+    /// Vendor selection-criteria bytes (section entries only).
+    selection_criteria: [19]u8,
+    /// A selection-criteria extension record (0x44) follows this entry.
+    has_extension: bool,
 };
 
 pub const BootCatalog = struct {
-    /// Platform id declared by the catalog validation entry.
+    /// Platform id declared by the catalog validation entry. Retained as a
+    /// convenience for callers that only need the primary platform.
     validation_platform: u8,
+    validation: BootValidationEntry,
+    /// Section headers in catalog order (empty for a default-entry-only image).
+    headers: []BootSectionHeader,
     entries: []BootCatalogEntry,
+    /// True when any section entry declared a following extension record.
+    has_extension_records: bool,
 
     pub fn deinit(self: *BootCatalog, allocator: std.mem.Allocator) void {
         allocator.free(self.entries);
+        allocator.free(self.headers);
         self.* = undefined;
     }
 };
@@ -1133,13 +1644,16 @@ pub const BootCatalogError = error{
     NoBootRecord,
     InvalidBootCatalog,
     BadBootCatalogChecksum,
-} || Io.File.ReadPositionalError || std.mem.Allocator.Error;
+} || Io.File.ReadPositionalError || Io.File.StatError || std.mem.Allocator.Error;
 
 /// Locates the El Torito boot record volume descriptor, follows it to the boot
-/// catalog, validates the validation-entry checksum, and returns the boot
-/// entries. Returns `error.NoBootRecord` when the image carries no El Torito
-/// boot record. Caller owns the returned catalog.
+/// catalog, validates the validation-entry signature/checksum and every entry's
+/// indicators, media type, and referenced extent against the source file, and
+/// returns the modeled catalog. Returns `error.NoBootRecord` when the image
+/// carries no El Torito boot record. Caller owns the returned catalog.
 pub fn readBootCatalog(allocator: std.mem.Allocator, io: Io, file: Io.File) BootCatalogError!BootCatalog {
+    const file_size = (try file.stat(io)).size;
+
     var sector: [descriptor_size]u8 = undefined;
     var lba: u32 = volume_descriptor_lba;
     var catalog_lba: ?u32 = null;
@@ -1158,6 +1672,7 @@ pub fn readBootCatalog(allocator: std.mem.Allocator, io: Io, file: Io.File) Boot
     }
 
     const cat_lba = catalog_lba orelse return error.NoBootRecord;
+    if (@as(u64, cat_lba) * descriptor_size + descriptor_size > file_size) return error.InvalidBootCatalog;
     var catalog: [descriptor_size]u8 = undefined;
     _ = try file.readPositionalAll(io, &catalog, @as(u64, cat_lba) * descriptor_size);
 
@@ -1170,12 +1685,18 @@ pub fn readBootCatalog(allocator: std.mem.Allocator, io: Io, file: Io.File) Boot
     if (sum != 0) return error.BadBootCatalogChecksum;
     const validation_platform = catalog[1];
 
+    var validation = BootValidationEntry{ .platform = validation_platform, .id_string = undefined };
+    @memcpy(&validation.id_string, catalog[4..28]);
+
     var entries = std.array_list.Managed(BootCatalogEntry).init(allocator);
     errdefer entries.deinit();
+    var headers = std.array_list.Managed(BootSectionHeader).init(allocator);
+    errdefer headers.deinit();
+    var has_extension_records = false;
 
     // Default/initial entry immediately follows the validation entry and
     // inherits the validation entry's platform id.
-    try parseBootEntry(&entries, catalog[32..64], validation_platform);
+    try entries.append(try parseBootEntry(catalog[32..64], validation_platform, .default, file_size));
 
     // Section headers (0x90/0x91) each introduce a run of section entries for a
     // possibly different platform.
@@ -1185,28 +1706,150 @@ pub fn readBootCatalog(allocator: std.mem.Allocator, io: Io, file: Io.File) Boot
         if (header_id != 0x90 and header_id != 0x91) break;
         const section_platform = catalog[offset + 1];
         const count = std.mem.readInt(u16, catalog[offset + 2 ..][0..2], .little);
+        var header = BootSectionHeader{
+            .platform = section_platform,
+            .entry_count = count,
+            .final = header_id == 0x91,
+            .id_string = undefined,
+        };
+        @memcpy(&header.id_string, catalog[offset + 4 .. offset + 32]);
+        try headers.append(header);
         offset += 32;
         var seen: u16 = 0;
-        while (seen < count and offset + 32 <= catalog.len) : (seen += 1) {
-            try parseBootEntry(&entries, catalog[offset .. offset + 32], section_platform);
+        while (seen < count) : (seen += 1) {
+            if (offset + 32 > catalog.len) return error.InvalidBootCatalog;
+            const entry = try parseBootEntry(catalog[offset .. offset + 32], section_platform, .section, file_size);
             offset += 32;
+            if (entry.has_extension) {
+                has_extension_records = true;
+                // A selection-criteria extension record (0x44) must follow.
+                if (offset + 32 > catalog.len or catalog[offset] != 0x44) return error.InvalidBootCatalog;
+                offset += 32;
+            }
+            try entries.append(entry);
         }
         if (header_id == 0x91) break;
     }
 
-    return .{ .validation_platform = validation_platform, .entries = try entries.toOwnedSlice() };
+    return .{
+        .validation_platform = validation_platform,
+        .validation = validation,
+        .headers = try headers.toOwnedSlice(),
+        .entries = try entries.toOwnedSlice(),
+        .has_extension_records = has_extension_records,
+    };
 }
 
-fn parseBootEntry(list: *std.array_list.Managed(BootCatalogEntry), entry: []const u8, platform: u8) std.mem.Allocator.Error!void {
-    try list.append(.{
+fn parseBootEntry(entry: []const u8, platform: u8, kind: BootEntryKind, file_size: u64) BootCatalogError!BootCatalogEntry {
+    const boot_indicator = entry[0];
+    if (boot_indicator != 0x88 and boot_indicator != 0x00) return error.InvalidBootCatalog;
+    const media_byte = entry[1];
+    if (media_byte & 0x0F > 4) return error.InvalidBootCatalog;
+    const image_lba = std.mem.readInt(u32, entry[8..12], .little);
+    if (@as(u64, image_lba) * descriptor_size >= file_size) return error.InvalidBootCatalog;
+
+    var result = BootCatalogEntry{
+        .kind = kind,
         .platform = platform,
-        .media_type = entry[1],
-        .bootable = entry[0] == 0x88,
+        .bootable = boot_indicator == 0x88,
+        .boot_indicator = boot_indicator,
+        .media_type = media_byte,
+        .media = @enumFromInt(media_byte & 0x0F),
         .load_segment = std.mem.readInt(u16, entry[2..4], .little),
         .system_type = entry[4],
         .load_sectors = std.mem.readInt(u16, entry[6..8], .little),
-        .image_lba = std.mem.readInt(u32, entry[8..12], .little),
-    });
+        .image_lba = image_lba,
+        .selection_criteria_type = 0,
+        .selection_criteria = [_]u8{0} ** 19,
+        // A section entry declares a following extension record via bit 5
+        // (0x20) of the media byte.
+        .has_extension = kind == .section and (media_byte & 0x20 != 0),
+    };
+    if (kind == .section) {
+        result.selection_criteria_type = entry[12];
+        @memcpy(&result.selection_criteria, entry[13..32]);
+    }
+    return result;
+}
+
+// ===========================================================================
+// Rewrite preservation preflight
+// ===========================================================================
+
+/// How a boot image's LBA relates to the modeled ISO tree.
+pub const BootImageMapping = union(enum) {
+    /// The boot image begins at a modeled regular file's extent. A recustomizer
+    /// can re-derive the image from that tree node during regeneration.
+    mapped: struct {
+        entry_index: usize,
+        /// Absolute path, owned by the enclosing `RewriteInspection` arena.
+        path: []const u8,
+    },
+    /// The boot image LBA falls outside every modeled file. There is no path to
+    /// re-derive it from, so the recustomizer must treat the extent as opaque
+    /// raw bytes (or refuse). Never invents a path.
+    raw_extent: struct {
+        lba: u32,
+        sectors: u16,
+    },
+};
+
+/// A boot catalog entry paired with its resolved image mapping.
+pub const InspectedBootEntry = struct {
+    entry: BootCatalogEntry,
+    image: BootImageMapping,
+};
+
+/// Modeled El Torito boot state for a rewrite: the validation entry, section
+/// headers, and every entry with its image mapping resolved against the tree.
+pub const BootModel = struct {
+    validation: BootValidationEntry,
+    headers: []BootSectionHeader,
+    entries: []InspectedBootEntry,
+    has_extension_records: bool,
+};
+
+/// Result of `Reader.inspectForRewrite`: the writer-preservable metadata plus an
+/// explicit, ordered list of every source construct the writer cannot preserve.
+/// An empty `unsupported` list means a regeneration is lossless within the
+/// supported model. Owns an arena; release with `deinit`.
+pub const RewriteInspection = struct {
+    arena: std.heap.ArenaAllocator,
+    volume: VolumeMetadata,
+    /// El Torito state, or null when the image carries no boot record.
+    boot: ?BootModel,
+    unsupported: []UnsupportedDetail,
+
+    pub fn deinit(self: *RewriteInspection) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    /// True when nothing blocks a lossless regeneration.
+    pub fn losslessWithinModel(self: RewriteInspection) bool {
+        return self.unsupported.len == 0;
+    }
+
+    /// The first (most structural) blocker, or null when lossless.
+    pub fn firstUnsupported(self: RewriteInspection) ?UnsupportedDetail {
+        return if (self.unsupported.len > 0) self.unsupported[0] else null;
+    }
+};
+
+pub const InspectError = error{
+    InvalidBootCatalog,
+    BadBootCatalogChecksum,
+    BadVolumeDescriptor,
+    MissingPrimaryVolumeDescriptor,
+} || Io.File.ReadPositionalError || Io.File.StatError || std.mem.Allocator.Error;
+
+pub const RewriteSupportError = error{SourceNotRewritable} || InspectError;
+
+/// Frees the `path`/`note` copies returned through `requireRewriteSupported`'s
+/// out-parameter.
+pub fn freeUnsupportedDetail(allocator: std.mem.Allocator, detail: UnsupportedDetail) void {
+    if (detail.path.len > 0) allocator.free(detail.path);
+    if (detail.note.len > 0) allocator.free(detail.note);
 }
 
 pub const VolumeIdError = error{
@@ -1236,6 +1879,70 @@ pub fn readVolumeIdAlloc(allocator: std.mem.Allocator, io: Io, file: Io.File) Vo
         }
     }
     return error.MissingPrimaryVolumeDescriptor;
+}
+
+/// Primary-volume-descriptor identifier strings worth preserving across a
+/// regeneration. Each field is trimmed of trailing spaces and NULs; an unset
+/// field decodes to an empty slice. All slices are owned by the struct and
+/// released together by `deinit`. The native writer can emit every field, so a
+/// round-trip through `WriteOptions` is lossless.
+pub const VolumeMetadata = struct {
+    volume_id: []u8,
+    system_id: []u8,
+    volume_set_id: []u8,
+    publisher_id: []u8,
+    preparer_id: []u8,
+    application_id: []u8,
+
+    pub fn deinit(self: *VolumeMetadata, allocator: std.mem.Allocator) void {
+        allocator.free(self.volume_id);
+        allocator.free(self.system_id);
+        allocator.free(self.volume_set_id);
+        allocator.free(self.publisher_id);
+        allocator.free(self.preparer_id);
+        allocator.free(self.application_id);
+        self.* = undefined;
+    }
+};
+
+/// Reads the primary volume descriptor's identifier strings. Caller owns the
+/// returned metadata and must `deinit` it.
+pub fn readVolumeMetadataAlloc(allocator: std.mem.Allocator, io: Io, file: Io.File) VolumeIdError!VolumeMetadata {
+    var sector: [descriptor_size]u8 = undefined;
+    var lba: u32 = volume_descriptor_lba;
+    while (true) : (lba += 1) {
+        _ = try file.readPositionalAll(io, &sector, @as(u64, lba) * descriptor_size);
+        if (!std.mem.eql(u8, sector[1..6], &standard_id)) return error.BadVolumeDescriptor;
+        switch (sector[0]) {
+            1 => {
+                var meta = VolumeMetadata{
+                    .volume_id = &.{},
+                    .system_id = &.{},
+                    .volume_set_id = &.{},
+                    .publisher_id = &.{},
+                    .preparer_id = &.{},
+                    .application_id = &.{},
+                };
+                errdefer meta.deinit(allocator);
+                meta.system_id = try dupeTrimmed(allocator, sector[8..40]);
+                meta.volume_id = try dupeTrimmed(allocator, sector[40..72]);
+                meta.volume_set_id = try dupeTrimmed(allocator, sector[190..318]);
+                meta.publisher_id = try dupeTrimmed(allocator, sector[318..446]);
+                meta.preparer_id = try dupeTrimmed(allocator, sector[446..574]);
+                meta.application_id = try dupeTrimmed(allocator, sector[574..702]);
+                return meta;
+            },
+            255 => break,
+            else => {},
+        }
+    }
+    return error.MissingPrimaryVolumeDescriptor;
+}
+
+fn dupeTrimmed(allocator: std.mem.Allocator, raw: []const u8) std.mem.Allocator.Error![]u8 {
+    var end: usize = raw.len;
+    while (end > 0 and (raw[end - 1] == ' ' or raw[end - 1] == 0)) end -= 1;
+    return allocator.dupe(u8, raw[0..end]);
 }
 
 // ===========================================================================
@@ -1335,6 +2042,14 @@ pub const WriteOptions = struct {
     volume_id: []const u8 = "ISOIMAGE",
     /// System identifier (a-chars, truncated/space-padded to 32 bytes).
     system_id: []const u8 = "",
+    /// Volume set identifier (d-chars, truncated/space-padded to 128 bytes).
+    volume_set_id: []const u8 = "",
+    /// Publisher identifier (a-chars, truncated/space-padded to 128 bytes).
+    publisher_id: []const u8 = "",
+    /// Data preparer identifier (a-chars, truncated/space-padded to 128 bytes).
+    preparer_id: []const u8 = "",
+    /// Application identifier (a-chars, truncated/space-padded to 128 bytes).
+    application_id: []const u8 = "",
     /// El Torito boot entries. Empty means a plain (non-bootable) ISO. At most
     /// one entry per platform is supported.
     boot_entries: []const BootEntry = &.{},
@@ -1814,6 +2529,10 @@ const IsoWriter = struct {
         write732(pvd[152..156], 0);
         const root_record = self.makeRootRecord();
         @memcpy(pvd[156 .. 156 + root_record.len], &root_record);
+        setDField(pvd[190..318], self.options.volume_set_id);
+        setAField(pvd[318..446], self.options.publisher_id);
+        setAField(pvd[446..574], self.options.preparer_id);
+        setAField(pvd[574..702], self.options.application_id);
         // Volume descriptor date/time fields left as zeros for determinism.
         pvd[881] = 1; // file structure version
         try self.writeSector(self.pvd_lba, &pvd);
@@ -2820,4 +3539,851 @@ test "iso writer rejects a missing boot image" {
     try std.testing.expectError(error.BootImageNotFound, writeImagePath(allocator, io, path, ts.source(), .{
         .boot_entries = &.{.{ .platform = .bios, .image_path = "does/not/exist" }},
     }));
+}
+
+// ===========================================================================
+// Reader model + rewrite-preflight tests
+// ===========================================================================
+
+const synth_root_lba: u32 = 20;
+const synth_path_table_lba: u32 = 19;
+
+const SynthOptions = struct {
+    total_sectors: u32 = 48,
+    volume_id: []const u8 = "SYNTH",
+    rr_root: bool = false,
+    /// When set, a valid El Torito boot record volume descriptor and boot
+    /// catalog are emitted so a test can exercise boot-image mapping.
+    boot: ?SynthBoot = null,
+};
+
+const SynthBoot = struct {
+    catalog_lba: u32,
+    image_lba: u32,
+    load_sectors: u16 = 4,
+};
+
+// Writes a minimal, checksum-correct El Torito boot catalog (validation entry
+// plus a single no-emulation default entry) whose default entry references
+// `image_lba` for `load_sectors` sectors.
+fn writeBootCatalog(sector: []u8, image_lba: u32, load_sectors: u16) void {
+    @memset(sector[0..descriptor_size], 0);
+    sector[0] = 0x01; // validation entry header id
+    sector[1] = 0x00; // platform: x86
+    sector[30] = 0x55;
+    sector[31] = 0xAA;
+    var sum: u16 = 0;
+    var i: usize = 0;
+    while (i < 32) : (i += 2) sum +%= std.mem.readInt(u16, sector[i..][0..2], .little);
+    std.mem.writeInt(u16, sector[28..30], 0 -% sum, .little); // checksum word
+
+    sector[32] = 0x88; // default entry: bootable
+    sector[33] = 0x00; // no emulation
+    std.mem.writeInt(u16, sector[38..40], load_sectors, .little);
+    std.mem.writeInt(u32, sector[40..44], image_lba, .little);
+}
+
+// Assembles a minimal ISO9660 image (PVD, terminator, one-entry path table,
+// root directory of `.`/`..` plus caller-supplied child record bytes) so a test
+// can inject exactly the directory records it needs. The returned buffer is
+// owned by the caller; file-data sectors can be filled before writing it out.
+fn synthIsoAlloc(allocator: std.mem.Allocator, opts: SynthOptions, child_records: []const u8) ![]u8 {
+    const image = try allocator.alloc(u8, opts.total_sectors * descriptor_size);
+    errdefer allocator.free(image);
+    @memset(image, 0);
+
+    var pvd = [_]u8{0} ** descriptor_size;
+    pvd[0] = 1;
+    pvd[1..6].* = standard_id;
+    pvd[6] = 1;
+    setDField(pvd[40..72], opts.volume_id);
+    write733(pvd[80..88], opts.total_sectors);
+    write723(pvd[120..124], 1);
+    write723(pvd[124..128], 1);
+    write723(pvd[128..132], descriptor_size);
+    write733(pvd[132..140], 8);
+    std.mem.writeInt(u32, pvd[140..144], synth_path_table_lba, .little);
+    const root_rec = makeDirectoryRecord(&.{0}, synth_root_lba, descriptor_size, 0x02, &.{});
+    @memcpy(pvd[156 .. 156 + root_rec[0]], root_rec[0..root_rec[0]]);
+    @memcpy(image[volume_descriptor_lba * descriptor_size ..][0..descriptor_size], &pvd);
+
+    // Optionally emit an El Torito boot record VD, shifting the terminator down
+    // one sector to keep the descriptor sequence contiguous.
+    var terminator_lba = volume_descriptor_lba + 1;
+    if (opts.boot) |boot| {
+        var brvd = [_]u8{0} ** descriptor_size;
+        brvd[0] = 0; // boot record volume descriptor
+        brvd[1..6].* = standard_id;
+        brvd[6] = 1;
+        @memcpy(brvd[7..][0.."EL TORITO SPECIFICATION".len], "EL TORITO SPECIFICATION");
+        std.mem.writeInt(u32, brvd[71..75], boot.catalog_lba, .little);
+        @memcpy(image[terminator_lba * descriptor_size ..][0..descriptor_size], &brvd);
+        terminator_lba += 1;
+
+        var cat = [_]u8{0} ** descriptor_size;
+        writeBootCatalog(&cat, boot.image_lba, boot.load_sectors);
+        @memcpy(image[boot.catalog_lba * descriptor_size ..][0..descriptor_size], &cat);
+    }
+
+    var term = [_]u8{0} ** descriptor_size;
+    term[0] = 255;
+    term[1..6].* = standard_id;
+    term[6] = 1;
+    @memcpy(image[terminator_lba * descriptor_size ..][0..descriptor_size], &term);
+
+    var pt = [_]u8{0} ** 8;
+    pt[0] = 1;
+    write731(pt[2..6], synth_root_lba);
+    write721(pt[6..8], 1);
+    @memcpy(image[synth_path_table_lba * descriptor_size ..][0..8], &pt);
+
+    var dir = std.array_list.Managed(u8).init(allocator);
+    defer dir.deinit();
+    var dot_su = std.array_list.Managed(u8).init(allocator);
+    defer dot_su.deinit();
+    if (opts.rr_root) {
+        try dot_su.appendSlice(&buildSpSystemUse());
+        try dot_su.appendSlice(&buildErSystemUse());
+    }
+    const dot = makeDirectoryRecord(&.{0}, synth_root_lba, descriptor_size, 0x02, dot_su.items);
+    try dir.appendSlice(dot[0..dot[0]]);
+    const dotdot = makeDirectoryRecord(&.{1}, synth_root_lba, descriptor_size, 0x02, &.{});
+    try dir.appendSlice(dotdot[0..dotdot[0]]);
+    try dir.appendSlice(child_records);
+    @memcpy(image[synth_root_lba * descriptor_size ..][0..dir.items.len], dir.items);
+
+    return image;
+}
+
+fn buildClSystemUse(child_lba: u32) [12]u8 {
+    var out: [12]u8 = [_]u8{0} ** 12;
+    out[0] = 'C';
+    out[1] = 'L';
+    out[2] = 12;
+    out[3] = 1;
+    write733(out[4..12], child_lba);
+    return out;
+}
+
+fn inspectionHasFeature(inspection: RewriteInspection, feature: UnsupportedFeature) bool {
+    for (inspection.unsupported) |detail| {
+        if (detail.feature == feature) return true;
+    }
+    return false;
+}
+
+test "iso9660 reader combines multi-extent file records and reads across them" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-iso9660-multiextent.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const first_lba: u32 = 21;
+    const second_lba: u32 = 22;
+    const second_len: u32 = 100;
+
+    var children = std.array_list.Managed(u8).init(allocator);
+    defer children.deinit();
+    // First record carries the multi-extent flag (0x80); the second finalizes.
+    var rec0 = makeDirectoryRecord("BIG.BIN;1", first_lba, descriptor_size, 0x80, &.{});
+    try children.appendSlice(rec0[0..rec0[0]]);
+    var rec1 = makeDirectoryRecord("BIG.BIN;1", second_lba, second_len, 0x00, &.{});
+    try children.appendSlice(rec1[0..rec1[0]]);
+
+    const image = try synthIsoAlloc(allocator, .{}, children.items);
+    defer allocator.free(image);
+    @memset(image[first_lba * descriptor_size ..][0..descriptor_size], 'A');
+    @memset(image[second_lba * descriptor_size ..][0..second_len], 'B');
+    try writeIsoFile(path, image);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+
+    const idx = try reader.lookup("/BIG.BIN");
+    const entry = reader.getEntry(idx);
+    try std.testing.expectEqual(@as(usize, 2), entry.extents.len);
+    try std.testing.expectEqual(@as(u64, descriptor_size + second_len), entry.size);
+    try std.testing.expectEqual(first_lba, entry.extents[0].lba);
+    try std.testing.expectEqual(second_lba, entry.extents[1].lba);
+
+    const bytes = try reader.readFileAlloc(allocator, io, idx);
+    defer allocator.free(bytes);
+    try std.testing.expectEqual(@as(usize, descriptor_size + second_len), bytes.len);
+    try std.testing.expect(std.mem.allEqual(u8, bytes[0..descriptor_size], 'A'));
+    try std.testing.expect(std.mem.allEqual(u8, bytes[descriptor_size..], 'B'));
+
+    // A well-formed multi-extent file is fully rewritable.
+    var inspection = try reader.inspectForRewrite(allocator, io);
+    defer inspection.deinit();
+    try std.testing.expect(inspection.losslessWithinModel());
+}
+
+test "iso9660 reader keeps a boot image pointing mid-file unmapped" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-iso9660-boot-mid-extent.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const first_lba: u32 = 21;
+    const second_lba: u32 = 22;
+    const second_len: u32 = 100;
+    const catalog_lba: u32 = 23;
+
+    var children = std.array_list.Managed(u8).init(allocator);
+    defer children.deinit();
+    // A two-extent file: the leading record carries the multi-extent flag.
+    var rec0 = makeDirectoryRecord("BIG.BIN;1", first_lba, descriptor_size, 0x80, &.{});
+    try children.appendSlice(rec0[0..rec0[0]]);
+    var rec1 = makeDirectoryRecord("BIG.BIN;1", second_lba, second_len, 0x00, &.{});
+    try children.appendSlice(rec1[0..rec1[0]]);
+
+    // The boot catalog references the file's SECOND extent, not its leading
+    // one. That is a mid-file offset, so it must never be reported as a mapped
+    // file (which would misrepresent the offset as the whole file).
+    const image = try synthIsoAlloc(allocator, .{ .boot = .{
+        .catalog_lba = catalog_lba,
+        .image_lba = second_lba,
+    } }, children.items);
+    defer allocator.free(image);
+    try writeIsoFile(path, image);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+
+    // The internal mapper must not resolve an interior extent to the file.
+    try std.testing.expect(reader.findFileByExtentLba(second_lba) == null);
+    // The leading extent still maps.
+    try std.testing.expect(reader.findFileByExtentLba(first_lba) != null);
+
+    var inspection = try reader.inspectForRewrite(allocator, io);
+    defer inspection.deinit();
+    try std.testing.expect(!inspection.losslessWithinModel());
+    try std.testing.expect(inspectionHasFeature(inspection, .boot_image_unmapped));
+    try std.testing.expect(inspection.boot != null);
+    switch (inspection.boot.?.entries[0].image) {
+        .raw_extent => |raw| try std.testing.expectEqual(second_lba, raw.lba),
+        .mapped => return error.TestUnexpectedResult,
+    }
+
+    // The strict gate must refuse this source rather than call it lossless.
+    var detail: UnsupportedDetail = undefined;
+    try std.testing.expectError(error.SourceNotRewritable, reader.requireRewriteSupported(allocator, io, &detail));
+    freeUnsupportedDetail(allocator, detail);
+}
+
+test "iso9660 reader rejects a truncated multi-extent chain" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-iso9660-badmultiextent.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var children = std.array_list.Managed(u8).init(allocator);
+    defer children.deinit();
+    // A lone record with the multi-extent flag set but no continuation record.
+    var rec0 = makeDirectoryRecord("BIG.BIN;1", 21, descriptor_size, 0x80, &.{});
+    try children.appendSlice(rec0[0..rec0[0]]);
+
+    const image = try synthIsoAlloc(allocator, .{}, children.items);
+    defer allocator.free(image);
+    try writeIsoFile(path, image);
+
+    try std.testing.expectError(error.InvalidMultiExtent, Reader.openPath(allocator, io, path));
+}
+
+test "iso9660 reader flags an interleaved file for rewrite" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-iso9660-interleaved.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var children = std.array_list.Managed(u8).init(allocator);
+    defer children.deinit();
+    var rec = makeDirectoryRecord("INTER.BIN;1", 21, 512, 0x00, &.{});
+    rec[26] = 1; // non-zero File Unit Size => interleaved
+    try children.appendSlice(rec[0..rec[0]]);
+
+    const image = try synthIsoAlloc(allocator, .{}, children.items);
+    defer allocator.free(image);
+    try writeIsoFile(path, image);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    var inspection = try reader.inspectForRewrite(allocator, io);
+    defer inspection.deinit();
+    try std.testing.expect(!inspection.losslessWithinModel());
+    try std.testing.expect(inspectionHasFeature(inspection, .interleaved_file));
+}
+
+test "iso9660 reader flags an extended attribute record for rewrite" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-iso9660-ealen.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var children = std.array_list.Managed(u8).init(allocator);
+    defer children.deinit();
+    var rec = makeDirectoryRecord("EA.BIN;1", 21, 512, 0x00, &.{});
+    rec[1] = 1; // non-zero Extended Attribute Record Length
+    try children.appendSlice(rec[0..rec[0]]);
+
+    const image = try synthIsoAlloc(allocator, .{}, children.items);
+    defer allocator.free(image);
+    try writeIsoFile(path, image);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    var inspection = try reader.inspectForRewrite(allocator, io);
+    defer inspection.deinit();
+    try std.testing.expect(inspectionHasFeature(inspection, .extended_attribute_record));
+}
+
+// Offset of the PVD root directory record within the synthesized image, and the
+// byte offsets of the fields exercised by the root-record mutation tests.
+const synth_root_record_off: usize = volume_descriptor_lba * descriptor_size + 156;
+
+test "iso9660 reader flags a root record extended attribute for rewrite" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-iso9660-root-ealen.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const image = try synthIsoAlloc(allocator, .{}, &.{});
+    defer allocator.free(image);
+    image[synth_root_record_off + 1] = 1; // root record Extended Attribute Record Length
+    try writeIsoFile(path, image);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    var inspection = try reader.inspectForRewrite(allocator, io);
+    defer inspection.deinit();
+    try std.testing.expect(inspectionHasFeature(inspection, .extended_attribute_record));
+
+    var detail: UnsupportedDetail = undefined;
+    try std.testing.expectError(error.SourceNotRewritable, reader.requireRewriteSupported(allocator, io, &detail));
+    freeUnsupportedDetail(allocator, detail);
+}
+
+test "iso9660 reader flags a root record interleave for rewrite" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-iso9660-root-interleave.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const image = try synthIsoAlloc(allocator, .{}, &.{});
+    defer allocator.free(image);
+    image[synth_root_record_off + 26] = 1; // root record File Unit Size => interleaved
+    try writeIsoFile(path, image);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    var inspection = try reader.inspectForRewrite(allocator, io);
+    defer inspection.deinit();
+    try std.testing.expect(inspectionHasFeature(inspection, .interleaved_file));
+
+    var detail: UnsupportedDetail = undefined;
+    try std.testing.expectError(error.SourceNotRewritable, reader.requireRewriteSupported(allocator, io, &detail));
+    freeUnsupportedDetail(allocator, detail);
+}
+
+test "iso9660 reader flags a multi-extent root record for rewrite" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-iso9660-root-multiextent.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const image = try synthIsoAlloc(allocator, .{}, &.{});
+    defer allocator.free(image);
+    image[synth_root_record_off + 25] |= 0x80; // set the multi-extent flag on the root record
+    try writeIsoFile(path, image);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    var inspection = try reader.inspectForRewrite(allocator, io);
+    defer inspection.deinit();
+    try std.testing.expect(inspectionHasFeature(inspection, .multi_extent_directory));
+
+    var detail: UnsupportedDetail = undefined;
+    try std.testing.expectError(error.SourceNotRewritable, reader.requireRewriteSupported(allocator, io, &detail));
+    freeUnsupportedDetail(allocator, detail);
+}
+
+test "iso9660 reader flags ambiguous duplicate names for rewrite" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-iso9660-dupnames.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var children = std.array_list.Managed(u8).init(allocator);
+    defer children.deinit();
+    var a = makeDirectoryRecord("DUP.TXT;1", 21, 16, 0x00, &.{});
+    try children.appendSlice(a[0..a[0]]);
+    var b = makeDirectoryRecord("DUP.TXT;1", 22, 16, 0x00, &.{});
+    try children.appendSlice(b[0..b[0]]);
+
+    const image = try synthIsoAlloc(allocator, .{}, children.items);
+    defer allocator.free(image);
+    try writeIsoFile(path, image);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    var inspection = try reader.inspectForRewrite(allocator, io);
+    defer inspection.deinit();
+    try std.testing.expect(inspectionHasFeature(inspection, .duplicate_directory_entry));
+}
+
+test "iso9660 reader flags rock ridge relocation and requireRewriteSupported reports it" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-iso9660-relocation.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var su = std.array_list.Managed(u8).init(allocator);
+    defer su.deinit();
+    // Non-dot records carry the 7-byte SUSP skip prefix declared by the root SP.
+    try su.appendSlice(&[_]u8{0} ** 7);
+    try su.appendSlice(&buildRrSystemUse(0x80)); // RR flags: CL present
+    try su.appendSlice(&buildClSystemUse(23));
+
+    var children = std.array_list.Managed(u8).init(allocator);
+    defer children.deinit();
+    var rec = makeDirectoryRecord("GONE.;1", 21, 0, 0x00, su.items);
+    try children.appendSlice(rec[0..rec[0]]);
+
+    const image = try synthIsoAlloc(allocator, .{ .rr_root = true }, children.items);
+    defer allocator.free(image);
+    try writeIsoFile(path, image);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+
+    var inspection = try reader.inspectForRewrite(allocator, io);
+    defer inspection.deinit();
+    try std.testing.expect(inspectionHasFeature(inspection, .rock_ridge_relocation));
+
+    var detail: UnsupportedDetail = undefined;
+    try std.testing.expectError(error.SourceNotRewritable, reader.requireRewriteSupported(allocator, io, &detail));
+    defer freeUnsupportedDetail(allocator, detail);
+    try std.testing.expectEqual(UnsupportedFeature.rock_ridge_relocation, detail.feature);
+}
+
+test "iso9660 reader parses per-entry timestamps written by the native writer" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-iso9660-timestamps.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const stamp: i64 = 1_700_000_000; // 2023-11-14T22:13:20Z
+    const nodes = [_]TestNode{
+        .{ .path = "stamped.txt", .kind = .file, .mode = 0o644, .mtime = stamp, .bytes = "hi\n" },
+    };
+    const ts = TestSource{ .nodes = &nodes };
+    _ = try writeImagePath(allocator, io, path, ts.source(), .{});
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    const idx = try reader.lookup("/stamped.txt");
+    try std.testing.expectEqual(stamp, reader.getEntry(idx).mtime);
+}
+
+test "iso9660 writer round-trips volume identifier metadata" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-iso9660-volmeta.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const nodes = [_]TestNode{.{ .path = "f", .kind = .file, .mode = 0o644, .bytes = "x" }};
+    const ts = TestSource{ .nodes = &nodes };
+    _ = try writeImagePath(allocator, io, path, ts.source(), .{
+        .volume_id = "MYVOL",
+        .system_id = "MYSYS",
+        .volume_set_id = "MYSET",
+        .publisher_id = "ACME PUBLISHER",
+        .preparer_id = "ACME PREPARER",
+        .application_id = "ZVMI ISO WRITER",
+    });
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    var meta = try readVolumeMetadataAlloc(allocator, io, file);
+    defer meta.deinit(allocator);
+    try std.testing.expectEqualStrings("MYVOL", meta.volume_id);
+    try std.testing.expectEqualStrings("MYSYS", meta.system_id);
+    try std.testing.expectEqualStrings("MYSET", meta.volume_set_id);
+    try std.testing.expectEqualStrings("ACME PUBLISHER", meta.publisher_id);
+    try std.testing.expectEqualStrings("ACME PREPARER", meta.preparer_id);
+    try std.testing.expectEqualStrings("ZVMI ISO WRITER", meta.application_id);
+}
+
+// ===========================================================================
+// El Torito modeling + rewrite-preflight tests
+// ===========================================================================
+
+fn synthCatalogLba(io: Io, file: Io.File) !u32 {
+    var sector: [descriptor_size]u8 = undefined;
+    var lba: u32 = volume_descriptor_lba;
+    while (true) : (lba += 1) {
+        _ = try file.readPositionalAll(io, &sector, @as(u64, lba) * descriptor_size);
+        if (sector[0] == 0 and std.mem.startsWith(u8, sector[7..], "EL TORITO SPECIFICATION"))
+            return read731(sector[71..75]);
+        if (sector[0] == 255) break;
+    }
+    return error.NoBootRecord;
+}
+
+fn readCatalogSector(io: Io, path: []const u8, out: *[descriptor_size]u8) !u32 {
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    const cat_lba = try synthCatalogLba(io, file);
+    _ = try file.readPositionalAll(io, out, @as(u64, cat_lba) * descriptor_size);
+    return cat_lba;
+}
+
+fn writeCatalogSector(io: Io, path: []const u8, cat_lba: u32, bytes: *const [descriptor_size]u8) !void {
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, @as(u64, cat_lba) * descriptor_size);
+}
+
+fn dualBootTestSource() TestSource {
+    const nodes = struct {
+        const list = [_]TestNode{
+            .{ .path = "boot", .kind = .directory, .mode = 0o755 },
+            .{ .path = "boot/bios.img", .kind = .file, .mode = 0o644, .bytes = "BIOS" ** 200 },
+            .{ .path = "EFI", .kind = .directory, .mode = 0o755 },
+            .{ .path = "EFI/efiboot.img", .kind = .file, .mode = 0o644, .bytes = "UEFI" ** 200 },
+        };
+    };
+    return .{ .nodes = &nodes.list };
+}
+
+test "el torito reader preserves entry fields and maps boot images to paths" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-el-torito-fields.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const nodes = [_]TestNode{
+        .{ .path = "boot", .kind = .directory, .mode = 0o755 },
+        .{ .path = "boot/isolinux.bin", .kind = .file, .mode = 0o644, .bytes = "BIOSBOOT" ** 100 },
+    };
+    const ts = TestSource{ .nodes = &nodes };
+    _ = try writeImagePath(allocator, io, path, ts.source(), .{
+        .boot_entries = &.{
+            .{ .platform = .bios, .image_path = "boot/isolinux.bin", .load_segment = 0x7C0, .system_type = 0x12, .load_sectors = 4 },
+        },
+    });
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    var catalog = try readBootCatalog(allocator, io, file);
+    defer catalog.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), catalog.entries.len);
+    const entry = catalog.entries[0];
+    try std.testing.expectEqual(BootEntryKind.default, entry.kind);
+    try std.testing.expectEqual(BootMediaType.no_emulation, entry.media);
+    try std.testing.expect(entry.bootable);
+    try std.testing.expectEqual(@as(u16, 0x7C0), entry.load_segment);
+    try std.testing.expectEqual(@as(u8, 0x12), entry.system_type);
+    try std.testing.expectEqual(@as(u16, 4), entry.load_sectors);
+    try std.testing.expectEqual(@as(usize, 0), catalog.headers.len);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    var inspection = try reader.inspectForRewrite(allocator, io);
+    defer inspection.deinit();
+    try std.testing.expect(inspection.losslessWithinModel());
+    try std.testing.expect(inspection.boot != null);
+    try std.testing.expectEqual(@as(usize, 1), inspection.boot.?.entries.len);
+    switch (inspection.boot.?.entries[0].image) {
+        .mapped => |m| try std.testing.expectEqualStrings("/boot/isolinux.bin", m.path),
+        .raw_extent => return error.TestUnexpectedResult,
+    }
+}
+
+test "el torito reader rejects a corrupted validation checksum" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-el-torito-badsum.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const ts = dualBootTestSource();
+    _ = try writeImagePath(allocator, io, path, ts.source(), .{
+        .boot_entries = &.{.{ .platform = .bios, .image_path = "boot/bios.img" }},
+    });
+
+    var cat: [descriptor_size]u8 = undefined;
+    const cat_lba = try readCatalogSector(io, path, &cat);
+    cat[4] +%= 1; // perturb the validation entry id => checksum no longer zero
+    try writeCatalogSector(io, path, cat_lba, &cat);
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    try std.testing.expectError(error.BadBootCatalogChecksum, readBootCatalog(allocator, io, file));
+}
+
+test "el torito reader rejects a corrupted key signature" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-el-torito-badsig.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const ts = dualBootTestSource();
+    _ = try writeImagePath(allocator, io, path, ts.source(), .{
+        .boot_entries = &.{.{ .platform = .bios, .image_path = "boot/bios.img" }},
+    });
+
+    var cat: [descriptor_size]u8 = undefined;
+    const cat_lba = try readCatalogSector(io, path, &cat);
+    cat[30] = 0x00; // was 0x55
+    try writeCatalogSector(io, path, cat_lba, &cat);
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    try std.testing.expectError(error.InvalidBootCatalog, readBootCatalog(allocator, io, file));
+}
+
+test "el torito reader rejects an out-of-bounds boot image extent" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-el-torito-badbounds.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const ts = dualBootTestSource();
+    _ = try writeImagePath(allocator, io, path, ts.source(), .{
+        .boot_entries = &.{.{ .platform = .bios, .image_path = "boot/bios.img" }},
+    });
+
+    var cat: [descriptor_size]u8 = undefined;
+    const cat_lba = try readCatalogSector(io, path, &cat);
+    std.mem.writeInt(u32, cat[40..44], 0x00FF_FFFF, .little); // default entry image LBA
+    try writeCatalogSector(io, path, cat_lba, &cat);
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    try std.testing.expectError(error.InvalidBootCatalog, readBootCatalog(allocator, io, file));
+}
+
+test "el torito reader rejects an invalid media type" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-el-torito-badmedia.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const ts = dualBootTestSource();
+    _ = try writeImagePath(allocator, io, path, ts.source(), .{
+        .boot_entries = &.{.{ .platform = .bios, .image_path = "boot/bios.img" }},
+    });
+
+    var cat: [descriptor_size]u8 = undefined;
+    const cat_lba = try readCatalogSector(io, path, &cat);
+    cat[33] = 0x07; // default entry media byte low nibble 7 (reserved)
+    try writeCatalogSector(io, path, cat_lba, &cat);
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    try std.testing.expectError(error.InvalidBootCatalog, readBootCatalog(allocator, io, file));
+}
+
+test "el torito inspection flags floppy/hard-disk emulation" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-el-torito-emul.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const ts = dualBootTestSource();
+    _ = try writeImagePath(allocator, io, path, ts.source(), .{
+        .boot_entries = &.{.{ .platform = .bios, .image_path = "boot/bios.img" }},
+    });
+
+    var cat: [descriptor_size]u8 = undefined;
+    const cat_lba = try readCatalogSector(io, path, &cat);
+    cat[33] = 0x04; // hard-disk emulation on the default entry
+    try writeCatalogSector(io, path, cat_lba, &cat);
+
+    // The catalog is still valid El Torito; only rewrite preservation fails.
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    var catalog = try readBootCatalog(allocator, io, file);
+    defer catalog.deinit(allocator);
+    try std.testing.expectEqual(BootMediaType.hard_disk, catalog.entries[0].media);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    var inspection = try reader.inspectForRewrite(allocator, io);
+    defer inspection.deinit();
+    try std.testing.expect(!inspection.losslessWithinModel());
+    try std.testing.expect(inspectionHasFeature(inspection, .boot_media_emulation));
+}
+
+test "el torito inspection flags an unmapped boot image as a raw extent" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-el-torito-unmapped.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const ts = dualBootTestSource();
+    _ = try writeImagePath(allocator, io, path, ts.source(), .{
+        .boot_entries = &.{.{ .platform = .bios, .image_path = "boot/bios.img" }},
+    });
+
+    var cat: [descriptor_size]u8 = undefined;
+    const cat_lba = try readCatalogSector(io, path, &cat);
+    // Point the default entry at the PVD sector: in-bounds, but no modeled file.
+    std.mem.writeInt(u32, cat[40..44], volume_descriptor_lba, .little);
+    try writeCatalogSector(io, path, cat_lba, &cat);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    var inspection = try reader.inspectForRewrite(allocator, io);
+    defer inspection.deinit();
+    try std.testing.expect(inspectionHasFeature(inspection, .boot_image_unmapped));
+    try std.testing.expect(inspection.boot != null);
+    switch (inspection.boot.?.entries[0].image) {
+        .raw_extent => |raw| try std.testing.expectEqual(volume_descriptor_lba, raw.lba),
+        .mapped => return error.TestUnexpectedResult,
+    }
+}
+
+test "el torito reader models a multi-section catalog and its final indicator" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-el-torito-multisection.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const ts = dualBootTestSource();
+    _ = try writeImagePath(allocator, io, path, ts.source(), .{
+        .boot_entries = &.{
+            .{ .platform = .bios, .image_path = "boot/bios.img" },
+            .{ .platform = .uefi, .image_path = "EFI/efiboot.img" },
+        },
+    });
+
+    var cat: [descriptor_size]u8 = undefined;
+    const cat_lba = try readCatalogSector(io, path, &cat);
+
+    const bios_lba = std.mem.readInt(u32, cat[40..44], .little);
+    const uefi_sectors = std.mem.readInt(u16, cat[102..104], .little);
+
+    // Rebuild the section region: header 0x90 (UEFI, more follow) + the existing
+    // UEFI entry, then header 0x91 (BIOS, final) + a second BIOS entry.
+    cat[64] = 0x90;
+    cat[65] = boot_platform_uefi;
+    std.mem.writeInt(u16, cat[66..68], 1, .little);
+    // UEFI section entry already occupies cat[96..128].
+    cat[128] = 0x91;
+    cat[129] = boot_platform_bios;
+    std.mem.writeInt(u16, cat[130..132], 1, .little);
+    @memset(cat[160..192], 0);
+    cat[160] = 0x88; // bootable
+    cat[161] = 0x00; // no emulation
+    std.mem.writeInt(u16, cat[166..168], uefi_sectors, .little);
+    std.mem.writeInt(u32, cat[168..172], bios_lba, .little);
+    try writeCatalogSector(io, path, cat_lba, &cat);
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    var catalog = try readBootCatalog(allocator, io, file);
+    defer catalog.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), catalog.headers.len);
+    try std.testing.expect(!catalog.headers[0].final);
+    try std.testing.expect(catalog.headers[1].final);
+    try std.testing.expectEqual(@as(usize, 3), catalog.entries.len); // default + 2 sections
+    try std.testing.expectEqual(BootEntryKind.default, catalog.entries[0].kind);
+    try std.testing.expectEqual(BootEntryKind.section, catalog.entries[1].kind);
+    try std.testing.expectEqual(boot_platform_uefi, catalog.entries[1].platform);
+    try std.testing.expectEqual(boot_platform_bios, catalog.entries[2].platform);
+
+    // Both section images map back to real files, so the catalog is rewritable.
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    var inspection = try reader.inspectForRewrite(allocator, io);
+    defer inspection.deinit();
+    try std.testing.expect(inspection.losslessWithinModel());
+}
+
+test "el torito reader models a section extension record and inspection rejects it" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-el-torito-extension.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const ts = dualBootTestSource();
+    _ = try writeImagePath(allocator, io, path, ts.source(), .{
+        .boot_entries = &.{
+            .{ .platform = .bios, .image_path = "boot/bios.img" },
+            .{ .platform = .uefi, .image_path = "EFI/efiboot.img" },
+        },
+    });
+
+    var cat: [descriptor_size]u8 = undefined;
+    const cat_lba = try readCatalogSector(io, path, &cat);
+    // Declare a selection-criteria extension on the UEFI section entry, and
+    // supply the following 0x44 extension record.
+    cat[97] |= 0x20;
+    @memset(cat[128..160], 0);
+    cat[128] = 0x44;
+    try writeCatalogSector(io, path, cat_lba, &cat);
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    var catalog = try readBootCatalog(allocator, io, file);
+    defer catalog.deinit(allocator);
+    try std.testing.expect(catalog.has_extension_records);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    var inspection = try reader.inspectForRewrite(allocator, io);
+    defer inspection.deinit();
+    try std.testing.expect(inspectionHasFeature(inspection, .boot_section_extension));
+}
+
+test "el torito reader rejects a declared extension with no following record" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-el-torito-badextension.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const ts = dualBootTestSource();
+    _ = try writeImagePath(allocator, io, path, ts.source(), .{
+        .boot_entries = &.{
+            .{ .platform = .bios, .image_path = "boot/bios.img" },
+            .{ .platform = .uefi, .image_path = "EFI/efiboot.img" },
+        },
+    });
+
+    var cat: [descriptor_size]u8 = undefined;
+    const cat_lba = try readCatalogSector(io, path, &cat);
+    cat[97] |= 0x20; // extension declared, but cat[128..160] stays zero (no 0x44)
+    try writeCatalogSector(io, path, cat_lba, &cat);
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    try std.testing.expectError(error.InvalidBootCatalog, readBootCatalog(allocator, io, file));
+}
+
+test "iso9660 reader flags an unmodeled SUSP record for rewrite" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-iso9660-unknownsusp.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var su = std.array_list.Managed(u8).init(allocator);
+    defer su.deinit();
+    try su.appendSlice(&[_]u8{0} ** 7); // SUSP skip prefix declared by the root SP
+    try su.appendSlice(&[_]u8{ 'X', 'Z', 4, 1 }); // an unmodeled system-use record
+
+    var children = std.array_list.Managed(u8).init(allocator);
+    defer children.deinit();
+    var rec = makeDirectoryRecord("FILE.;1", 21, 8, 0x00, su.items);
+    try children.appendSlice(rec[0..rec[0]]);
+
+    const image = try synthIsoAlloc(allocator, .{ .rr_root = true }, children.items);
+    defer allocator.free(image);
+    try writeIsoFile(path, image);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    var inspection = try reader.inspectForRewrite(allocator, io);
+    defer inspection.deinit();
+    try std.testing.expect(inspectionHasFeature(inspection, .unknown_susp_record));
 }
