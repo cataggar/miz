@@ -60,6 +60,21 @@ mix. Its kernel and kernel-modules package requests are pinned to the release
 inside the checksum-pinned ISO's nested `LiveOS` rootfs, and the builder mounts
 that nested rootfs to verify the exact release before image assembly.
 
+`zvmi build-iso` honors the same `--skip-iso-rootfs` publication policy, in the
+optical form. A generated LiveOS ISO always *replaces* the source ISO's LiveOS
+payload -- the original live/Anaconda `LiveOS/squashfs.img` is never published;
+what ships is the regenerated SquashFS wrapping the customized ext4
+`rootfs.img`. With `--skip-iso-rootfs`, that customized root tree is the
+container plus only the boot-critical assets carried over from the ISO/squashfs
+(kernel, initramfs, EFI binaries, `/lib/modules/<version>`), exactly as the
+QCOW2 recipe assembles its root partition; the live/installer userspace is left
+out of the nested `rootfs.img` rather than merged into it. Without the flag, the
+full merged distro rootfs becomes the nested `rootfs.img`. Either way the
+source ISO's boot loaders and boot configuration are retained verbatim so the
+regenerated media still boots, and the El Torito catalog is recreated
+explicitly -- the ISO's *directory tree and boot catalog* are regenerated
+filesystem contents, not preserved byte regions of the original image.
+
 The recipe creates bounded flavor-specific OCI layers, validates rootfs
 identity cleanup, GPT/root GUIDs, fallback EFI, UKI PE sections/cmdline,
 partition geometry, free space, and OCI architecture/provenance before

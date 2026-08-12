@@ -14,9 +14,13 @@ XZ/zstd-compressed squashfs blocks) paired with a native squashfs **writer**
 automatic unwrapping of nested ext4 or
 squashfs rootfs images discovered inside squashfs payloads (matching LiveOS
 media such as Azure Linux 4.0), local OCI container image ingestion, a minimal
-native ext4 writer/readback library API, COSI output packaging, and a first
+native ext4 writer/readback library API, COSI output packaging, a
 `zvmi build-image` orchestration path that builds `raw`, fixed-`vhd`, `vhdx`,
-and `qcow2` disk images from an ISO + local OCI layout:
+and `qcow2` disk images from an ISO + local OCI layout, and a `zvmi build-iso`
+path that regenerates a customized **LiveOS ISO** from an ISO + local OCI
+layout (a deterministic ext4 `rootfs.img` wrapped in a native SquashFS at the
+LiveOS payload path, folded back into a regenerated ISO with recreated El
+Torito boot entries):
 
 ```
 zvmi create -f vhd disk.vhd 32M                          # dynamic by default (matches qemu-img)
@@ -49,6 +53,9 @@ zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o outp
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 384M --skip-iso-rootfs -o output-minimal.raw -O raw
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G --verity -o output.vhd
 zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G --boot-mode uki --esp-size 512M -o output-uki.vhd
+zvmi build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G -o output-live.iso                 # regenerate a customized LiveOS ISO
+zvmi build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --uefi-boot-image boot/grub2/efiboot.img -o output-live.iso
+zvmi build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --source-date-epoch 1735689600 -o output-live.iso   # byte-for-byte reproducible
 zvmi capture --source /dev/sda -O vhd -o captured.vhd   # rebuild an installed system, sized to its content
 zvmi capture --source disk.qcow2 --source-root gpt:2 -O raw -o captured.raw --dry-run
 zvmi qemu AzureLinux
@@ -158,6 +165,88 @@ reformats it. An account named here that does not exist is reported and
 otherwise ignored, leaving the disk mounted and root-owned. Only the resource
 disk is affected: managed data disks are never formatted by `azagent`, so
 their ownership is left as whoever formatted them set it.
+
+## Generating a LiveOS ISO (`build-iso`)
+
+`zvmi build-iso` produces a *generated* LiveOS ISO. It is stacked on the same
+ISO + OCI ingestion, nested-LiveOS flattening, and OS customization pipeline as
+`build-image`: it builds the identical customized owned root tree
+(`build_image.materializeCustomizedRootTree`) up to the point before
+`build-image` would populate a disk, then keeps the optical layout instead of
+flattening it onto a partition.
+
+Concretely, `build-iso`:
+
+1. writes the customized root tree to a **deterministic ext4 `rootfs.img`** of
+   the size you name with `--rootfs-size` (rounded up to the 4 KiB block size),
+   honoring `--ext4-label`, `--journal`/`--journal-size`, and
+   `--root-selinux-label` exactly as `build-image`'s root filesystem does;
+2. wraps that image in a **native zstd SquashFS** (`--squashfs-compression
+   zstd|none`) whose single nested member is `rootfs.img`
+   (`--nested-rootfs-path`, default `LiveOS/rootfs.img`);
+3. rebuilds the ISO from the **source ISO's own directory tree**, replacing only
+   the discovered or `--rootfs-path`-configured LiveOS payload
+   (default the best-scoring `squashfs`/`rootfs` candidate, e.g.
+   `LiveOS/squashfs.img`) with that regenerated SquashFS, and retaining every
+   other file -- boot loaders, `grub.cfg`, `isolinux`, EFI binaries -- verbatim;
+4. recreates the **El Torito boot catalog** with the native writer.
+
+An ISO is an optical artifact, not a disk block format, so `.iso` is *not* an
+`-O` output format and there is no disk `--size`, generation, or partition
+plan. Generated output means filesystem contents -- the directory tree, the
+replaced payload, and the boot catalog -- not arbitrary preserved byte regions
+of the original image. Constructs that live only outside the directory tree
+(hidden El Torito images referenced solely by the source catalog, embedded
+partition tables for hybrid USB boot, etc.) are not silently carried over.
+
+```
+zvmi build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G -o live.iso
+zvmi build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G \
+    --uefi-boot-image boot/grub2/efiboot.img --bios-boot-image boot/grub2/i386-pc/eltorito.img -o live.iso
+zvmi build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G \
+    --volume-id CDROM --squashfs-compression zstd --source-date-epoch 1735689600 -o live.iso
+zvmi build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 512M --skip-iso-rootfs -o live-minimal.iso
+zvmi build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --dry-run -o live.iso
+```
+
+### Boot entries
+
+El Torito entries are explicit and reliable. `--uefi-boot-image <path>` and
+`--bios-boot-image <path>` name boot image files that must already exist as
+regular files in the output ISO tree (i.e. present in the source ISO's
+directory tree); a requested path that does not resolve is a precise
+preflight/build error (`error.BootImageNotFound`) that publishes nothing. When
+neither is given, `build-iso` probes a small set of common source layouts
+(`boot/grub2/efiboot.img`, `images/efiboot.img`, ... for UEFI;
+`boot/grub2/i386-pc/eltorito.img`, `isolinux/isolinux.bin`, ... for BIOS) and
+uses the first that resolves. At least one entry must resolve; **UEFI-only
+output is always supported**, and BIOS and dual-boot output are supported when
+the source layout or your options make them available. The source ISO's
+volume identifier is reused by default (so a `root=live:CDLABEL=<id>` boot line
+still finds the volume) and can be overridden with `--volume-id`.
+
+### Reproducibility, isolation, and cleanup
+
+`--source-date-epoch <seconds>` stamps that timestamp into the ext4
+superblock/inodes, the SquashFS superblock, and the ISO recording dates, and
+derives a fixed root filesystem UUID from it, so two runs of the same inputs
+produce a byte-for-byte identical ISO (the report prints the ISO's SHA-256 and
+the root tree digest). The build streams `rootfs.img`, the SquashFS payload,
+and the ISO through scratch files alongside the output path, refuses inputs
+that alias the output or a scratch path (`error.SourcePathConflict`), publishes
+the finished ISO with an atomic rename, and removes every scratch file on
+success. There is no runtime dependency on `xorriso` or `mksquashfs`.
+
+### `--skip-iso-rootfs` and the nested rootfs
+
+`--skip-iso-rootfs` has the same meaning as in `build-image`: the container
+becomes the effective root filesystem and only boot-critical assets are kept
+from the ISO/squashfs (see the `build-image` discussion above). The difference
+is only where that customized tree lands -- inside the nested `rootfs.img` of
+the regenerated SquashFS payload, rather than on a disk partition. Structural
+tests confirm the source boot files survive, the old payload is replaced, and
+the nested `rootfs.img` opens as ext4 carrying the customized and OCI-overlay
+files; they do **not** assert bootability, which only a real firmware boot can.
 
 ### Reading a block device
 

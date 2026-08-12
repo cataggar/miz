@@ -1,7 +1,7 @@
 //! `zvmi`: a qemu-img-like CLI over the `zvmi` library. Supports `create`,
-//! `info`, `convert`, `resize`, `check`, `map`, `build-image`, `azure`,
-//! `cosi`, `oci`, `qemu`, and release signing over `raw`, `vhd`, `vhdx`, and
-//! `qcow2`.
+//! `info`, `convert`, `resize`, `check`, `map`, `build-image`, `build-iso`,
+//! `azure`, `cosi`, `oci`, `qemu`, and release signing over `raw`, `vhd`,
+//! `vhdx`, and `qcow2`.
 
 const std = @import("std");
 const zvmi = @import("zvmi");
@@ -15,6 +15,7 @@ const map_cmd = @import("commands/map.zig");
 const azure_cmd = @import("commands/azure.zig");
 const cosi_cmd = @import("commands/cosi.zig");
 const build_image_cmd = @import("commands/build_image.zig");
+const build_iso_cmd = @import("commands/build_iso.zig");
 const capture_cmd = @import("commands/capture.zig");
 const qemu_cmd = @import("commands/qemu.zig");
 const sign_cmd = @import("commands/sign.zig");
@@ -38,6 +39,7 @@ const usage =
     \\  oci copy|inspect|list-tags|pin
     \\  capture --source <device|image> [--source-root <spec>] [--source-mount <spec>=<path>]... [--source-esp <spec>] [--root-size <size>] [--esp-size <size>] [--no-journal] [--dry-run] -O <format> -o <output|->
     \\  build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}|-> [--skip-iso-rootfs] [--esp-size <size>] [--root-selinux-label <context>] [--boot-mode bls|uki|both] [--stub-source-path <path>] [--verity] [--uki-signing-certificate <path> --uki-signing-command <path> [--uki-signing-argument <arg>]]
+    \\  build-iso --iso <file.iso> --container <oci-layout> --rootfs-size <size> -o <output.iso> [--rootfs-path <path>] [--volume-id <id>] [--uefi-boot-image <path>] [--bios-boot-image <path>] [--squashfs-compression zstd|none] [--skip-iso-rootfs] [--source-date-epoch <seconds>]
     \\  qemu [<image>] [--model full|core] [--architecture auto|x86_64|aarch64] [--admin-username <name>] [--ssh-public-key <path>] [--ssh-port <port>] [--snapshot] [--secure-boot] [--secure-boot-certificate <path> --secure-boot-certificate-sha256 <hex>] [--accel auto|whpx|kvm|hvf|tcg] [--qemu <path>] [--ovmf-code <path>] [--ovmf-vars <path>] [-- <extra-qemu-args...>]
     \\  uki certificate <disk-image> (--output <certificate.pem>|--output=json) [--expected-sha256 <hex>]
     \\  sign
@@ -83,6 +85,7 @@ fn run(
     if (std.mem.eql(u8, command, "azure")) return azure_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "cosi")) return cosi_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "build-image")) return build_image_cmd.run(gpa, io, rest);
+    if (std.mem.eql(u8, command, "build-iso")) return build_iso_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "capture")) return capture_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "qemu")) return qemu_cmd.run(gpa, io, environ, rest);
     if (std.mem.eql(u8, command, "sign")) return sign_cmd.run(gpa, io, environ, rest);
@@ -106,6 +109,7 @@ test {
     _ = azure_cmd;
     _ = cosi_cmd;
     _ = build_image_cmd;
+    _ = build_iso_cmd;
     _ = capture_cmd;
     _ = qemu_cmd;
     _ = sign_cmd;

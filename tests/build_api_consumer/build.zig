@@ -124,6 +124,29 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // A LiveOS ISO product, configured through the exported `addIso` helper.
+    // Only configured, never built here: this verifies the ISO build API wires
+    // and typechecks in an external consumer, alongside the disk-image helpers.
+    _ = zvmi.addIso(b, dependency, .{
+        .name = "liveos-fixture",
+        .iso = b.path("fixtures/os.iso"),
+        .container = .{ .oci_layout = pull.layout },
+        .rootfs_size = 256 * 1024 * 1024,
+        .output_basename = "liveos-fixture.iso",
+        .rootfs_path_in_iso = "LiveOS/squashfs.img",
+        .boot_images = &.{
+            .{ .platform = .uefi, .image_path = "boot/grub2/efiboot.img" },
+            .{ .platform = .bios, .image_path = "boot/grub2/i386-pc/eltorito.img" },
+        },
+        .squashfs_compression = .zstd,
+        .source_date_epoch = 1_735_689_600,
+        .os = .{
+            .hostname = "liveos",
+            .users = &.{.{ .name = "admin", .password = .locked }},
+        },
+        .generalization = .{ .azure = .{ .reset_hostname = false } },
+    });
+
     _ = zvmi.addImage(b, dependency, .{
         .name = "cosi-fixture",
         .input = .{
