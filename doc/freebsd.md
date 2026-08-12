@@ -193,10 +193,18 @@ investigated and rejected:
 
 ## Size reporting
 
-Download size is the primary core-image metric. Each build records its asset
-size and package count in the workflow run summary, and every candidate carries
-its recorded package manifest. Given two staged release sets, the comparison
-table of full against core is produced by:
+Every schema-3 candidate records three distinct measures: the pinned virtual
+size, qemu-img's `actual-size` (the allocated QCOW2 size), and the
+compressed/download file size. Allocated size comes from the trusted
+`qemu-img info --output=json` validation result, not filesystem block counts.
+The workflow persists that exact JSON beside the candidate; schema 3 records
+its digest and normalized values, and staging re-reads and re-hashes it before
+preserving all three measures. Schema-2 candidates and staging manifests are
+intentionally rejected rather than guessed or migrated; build artifacts are
+short-lived and must be regenerated with complete size metadata.
+
+Given two staged release sets, the comparison table of full against core is
+produced by:
 
 ```text
 python3 scripts/freebsd15_release.py compare \
@@ -205,9 +213,28 @@ python3 scripts/freebsd15_release.py compare \
   --output comparison.md
 ```
 
-The report leads with download size and reduction percentage, reports package
-counts alongside, and refuses to compare a set against itself or two variants
-that do not share a pinned virtual size.
+The report shows full and core virtual, allocated, and compressed/download
+sizes and reductions for both architectures. Argument roles are strict:
+`--baseline` must be the two-architecture full UFS release and `--candidate`
+must be the corresponding core UFS release, so reversing the comparison cannot
+turn a regression into an apparent improvement.
+
+Core staging is also the publication size gate. Both architectures must reduce
+both allocated and compressed/download size by at least 10% relative to their
+matching full UFS baselines, while virtual size may not increase. The reviewed
+default is `CORE_MINIMUM_REDUCTION_PERCENT = 10`; maintainers may set
+`stage --minimum-core-reduction-percent` explicitly for a release review.
+The exact boundary is inclusive. A full UFS staging manifest is mandatory via
+`stage --baseline`; missing, incomplete, cross-filesystem, wrong-flavor, or
+wrong-architecture baselines fail closed.
+
+For a core dispatch, the same source commit builds four candidates: the two
+core assets plus full UFS candidates for both architectures. Publication
+stages and validates the full candidates locally to create the baseline
+manifest, then passes that manifest into core staging. The baseline JSON is
+therefore derived from digest-, package-, provenance-, and qemu-info-bound
+artifacts from the same run; an external baseline JSON is never trusted. Only
+the two core assets enter the publication allowlist.
 
 Root storage handling is the one part that is deliberately *not* shared. The
 UFS and ZFS seeds embed disjoint shell fragments:
@@ -314,16 +341,18 @@ publish:
 | `core` | `FreeBSD-15.1-core-20260730` | `FreeBSD-15.1-aarch64.core.qcow2`, `FreeBSD-15.1-x86_64.core.qcow2` |
 
 `scripts/freebsd15_release.py matrix` expands the selected set into the build
-matrix and `describe` resolves its tag, title, and asset count, so the tag, the
-allowlist, and the built variants can never disagree. Each candidate builds on
-a native GitHub-hosted runner, caches its digest-pinned upstream source,
-validates the standalone QCOW2, and runs dual-instance acceptance. A separate
-publication job requires every candidate in the set, refuses candidates from
-another set or another source commit, stages a draft, uploads exactly the
-set's assets, verifies GitHub's asset digests and a fresh download, and then
-publishes the non-Latest release. SHA-256 values and complete source/build
-provenance are recorded in the release notes; checksum sidecar assets are not
-published.
+matrix and `describe` resolves its tag, title, asset count, and reviewed size
+threshold, so the tag, allowlist, and built variants cannot disagree. Core
+adds the two full UFS baseline builds described above; its published asset
+count remains two. Each candidate builds on a native GitHub-hosted runner,
+caches its digest-pinned upstream source, persists its exact qemu-img
+validation JSON, validates the standalone QCOW2, and runs dual-instance
+acceptance. A separate publication job requires every needed candidate,
+refuses candidates from another set or source commit, stages a draft, uploads
+exactly the release set's assets, verifies GitHub's asset digests and a fresh
+download, and then publishes the non-Latest release. SHA-256 values and
+complete source/build provenance are recorded in the release notes; checksum
+sidecar assets are not published.
 
 The released QCOW2 files are not directly uploadable to Azure. Derive aligned
 fixed VHDs without changing their partitions:
@@ -353,8 +382,11 @@ shared Gen2, provisioning, network, serial, reboot, identity, GPT, growth, and
 shutdown checks are combined with disjoint storage contracts: UFS proves root
 partition and filesystem growth without invoking ZFS, while ZFS preserves pool
 health, autoexpand, and GUID stability checks. The current workflow remains
-wired only for the established ZFS release gate; UFS/core workflow and release
-metadata integration is tracked separately.
+wired only for the established ZFS release gate, but every supported harness
+path now emits the canonical schema-3 result through
+`freebsd15_release.py azure-result`, binding the candidate's virtual,
+allocated, compressed, digest, package, provenance, and workflow identity
+metadata.
 
 See [Image building](image-building.md) for the shared image-format and Azure
 VHD tooling.

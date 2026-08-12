@@ -153,12 +153,13 @@ jobs:
         run: |
           set -euo pipefail
           asset="$CANDIDATE_DIR/$ASSET_NAME"
+          image_info="$CANDIDATE_DIR/qemu-img-info.json"
           qemu-img check "$asset"
-          image_info=$(qemu-img info --output=json "$asset")
-          test "$(jq -r '.format' <<<"$image_info")" = qcow2
-          test "$(jq -r '."virtual-size"' <<<"$image_info")" = "$VIRTUAL_SIZE"
-          test "$(jq -r '."backing-filename" // ""' <<<"$image_info")" = ""
-          test "$(jq -r '."format-specific".data."compression-type"' <<<"$image_info")" = zstd
+          qemu-img info --output=json "$asset" > "$image_info"
+          test "$(jq -r '.format' "$image_info")" = qcow2
+          test "$(jq -r '."virtual-size"' "$image_info")" = "$VIRTUAL_SIZE"
+          test "$(jq -r '."backing-filename" // ""' "$image_info")" = ""
+          test "$(jq -r '."format-specific".data."compression-type"' "$image_info")" = zstd
           zig build run -- check "$asset"
 
       - name: Run dual-instance QEMU acceptance
@@ -187,6 +188,7 @@ jobs:
             --package-manifest "$asset.packages.txt" \
             --validated-sha256 "$asset_sha256" \
             --virtual-size "$VIRTUAL_SIZE" \
+            --qemu-info "$CANDIDATE_DIR/qemu-img-info.json" \
             --source-name "$SOURCE_NAME" \
             --source-url "$SOURCE_URL" \
             --source-sha256 "$source_sha256" \
@@ -197,13 +199,12 @@ jobs:
             --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --output "$CANDIDATE_DIR/candidate.json"
-          # Download size is the metric a core image is judged on, so record
-          # it per variant; scripts/freebsd15_release.py compare turns two
-          # staged sets into the full-versus-core table.
           {
             echo "### $VARIANT"
             echo
-            echo "- Download size: $(stat --format='%s' "$asset") bytes"
+            echo "- Virtual size: $VIRTUAL_SIZE bytes"
+            echo "- Allocated size: $(jq -r '."actual-size"' "$CANDIDATE_DIR/qemu-img-info.json") bytes"
+            echo "- Compressed/download size: $(stat --format='%s' "$asset") bytes"
             echo "- Packages: $(wc -l < "$asset.packages.txt")"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -416,6 +417,7 @@ jobs:
       RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
       RELEASE_TITLE: ${{ needs.prepare.outputs.release_title }}
       CANDIDATES_DIR: .release/freebsd15/candidates
+      BASELINE_CANDIDATES_DIR: .release/freebsd15/baseline-candidates
       STAGING_ROOT: .release/freebsd15/staging
       REPOSITORY: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
@@ -428,11 +430,28 @@ jobs:
           ref: ${{ needs.prepare.outputs.source_commit }}
           persist-credentials: false
 
-      - name: Download every build-validated candidate
+      - name: Download every non-core build-validated candidate
+        if: inputs.release_set != 'core'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: freebsd15-candidate-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
           path: ${{ env.CANDIDATES_DIR }}
+          merge-multiple: false
+
+      - name: Download exact core publication candidates
+        if: inputs.release_set == 'core'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: freebsd15-candidate-*-ufs-core-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.CANDIDATES_DIR }}
+          merge-multiple: false
+
+      - name: Download exact full UFS baseline candidates
+        if: inputs.release_set == 'core'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: freebsd15-candidate-*-ufs-full-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.BASELINE_CANDIDATES_DIR }}
           merge-multiple: false
 
       - name: Download Azure acceptance results

@@ -289,29 +289,51 @@ RELEASE_SETS = {
     },
 }
 
-AZURE_CONTRACTS = (
+AZURE_SHARED_CONTRACTS_BEFORE_STORAGE = (
     "matching-architecture-gen2",
     "key-only-ssh",
     "agent-ready",
     "hn0-dhcp",
     "serial-console",
-    "zfs-root",
-    "zpool-healthy",
+)
+AZURE_FILESYSTEM_CONTRACTS = {
+    "ufs": (
+        "ufs-root",
+        "ufs-root-partition-growth",
+        "ufs-root-filesystem-growth",
+        "no-os-disk-swap",
+    ),
+    "zfs": (
+        "zfs-root",
+        "zpool-healthy",
+    ),
+}
+AZURE_SHARED_CONTRACTS_AFTER_STORAGE = (
     "root-growth",
     "gpt-healthy",
     "reboot-reconnect",
     "instance-identity",
 )
+AZURE_CONTRACTS = (
+    *AZURE_SHARED_CONTRACTS_BEFORE_STORAGE,
+    *AZURE_FILESYSTEM_CONTRACTS["zfs"],
+    *AZURE_SHARED_CONTRACTS_AFTER_STORAGE,
+)
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
-CANDIDATE_SCHEMA = 2
+CANDIDATE_SCHEMA = 3
+# Core publication requires at least this reduction in both qemu-img's
+# allocated size and the downloadable compressed file size. Ten percent is a
+# conservative default: large enough to reject noise from QCOW2 metadata and
+# compression variance, while leaving the reviewed package manifest—not an
+# aggressive size target—as the primary definition of "core".
+CORE_MINIMUM_REDUCTION_PERCENT = 10
 PROFILE_KEYS = (
     "architecture",
     "filesystem",
     "flavor",
     "asset_name",
-    "virtual_size",
 )
 PACKAGE_RECORD_RE = re.compile(r"^(\S+) (\S+) (\d+)$")
 
@@ -387,6 +409,23 @@ def release_set(name: str) -> dict:
     return RELEASE_SETS[name]
 
 
+def build_variants(name: str) -> tuple[str, ...]:
+    selected = release_set(name)
+    if name == "core":
+        return (*selected["variants"], *RELEASE_SETS["ufs"]["variants"])
+    return selected["variants"]
+
+
+def azure_contracts(filesystem: str) -> tuple[str, ...]:
+    if filesystem not in AZURE_FILESYSTEM_CONTRACTS:
+        raise ValueError(f"unsupported Azure filesystem contract: {filesystem}")
+    return (
+        *AZURE_SHARED_CONTRACTS_BEFORE_STORAGE,
+        *AZURE_FILESYSTEM_CONTRACTS[filesystem],
+        *AZURE_SHARED_CONTRACTS_AFTER_STORAGE,
+    )
+
+
 def source_url(key: str) -> str:
     variant = VARIANTS[key]
     return (
@@ -414,10 +453,57 @@ def require_non_empty(value: str, label: str) -> str:
     return value.strip()
 
 
+def require_positive_int(value: object, label: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def require_reduction_percent(value: object) -> int:
+    if type(value) is not int or not 1 <= value <= 99:
+        raise ValueError("minimum core reduction percent must be from 1 to 99")
+    return value
+
+
+def load_qemu_image_info(path: Path, expected_virtual_size: int) -> dict:
+    """Load the trusted qemu-img validation result used for size metadata."""
+    document = json.loads(path.resolve(strict=True).read_text(encoding="utf-8"))
+    if document.get("format") != "qcow2":
+        raise ValueError("qemu-img validation format must be qcow2")
+    virtual_size = require_positive_int(
+        document.get("virtual-size"),
+        "qemu-img virtual size",
+    )
+    if virtual_size != expected_virtual_size:
+        raise ValueError("qemu-img virtual size does not match the pinned profile")
+    allocated_size = require_positive_int(
+        document.get("actual-size"),
+        "qemu-img allocated size",
+    )
+    if allocated_size > virtual_size:
+        raise ValueError("qemu-img allocated size exceeds virtual size")
+    if document.get("backing-filename") not in (None, ""):
+        raise ValueError("qemu-img validation reports a backing file")
+    compression_type = (
+        document.get("format-specific", {})
+        .get("data", {})
+        .get("compression-type")
+    )
+    if compression_type != "zstd":
+        raise ValueError("qemu-img validation compression type must be zstd")
+    return {
+        "format": "qcow2",
+        "virtual_size": virtual_size,
+        "allocated_size": allocated_size,
+        "compression_type": compression_type,
+        "has_backing_file": False,
+    }
+
+
 def matrix_command(args: argparse.Namespace) -> None:
     selected = release_set(args.release_set)
     include = []
-    for key in selected["variants"]:
+    for key in build_variants(args.release_set):
         variant = VARIANTS[key]
         include.append(
             {
@@ -432,6 +518,9 @@ def matrix_command(args: argparse.Namespace) -> None:
                 "virtual_size": variant["virtual_size"],
                 "runner": variant["runner"],
                 "qemu": variant["qemu"],
+                "release_role": (
+                    "release" if key in selected["variants"] else "baseline"
+                ),
             }
         )
     print(json.dumps({"include": include}, sort_keys=True))
@@ -442,6 +531,10 @@ def describe_command(args: argparse.Namespace) -> None:
     print(f"release_tag={selected['release_tag']}")
     print(f"release_title={selected['release_title']}")
     print(f"asset_count={len(selected['variants'])}")
+    print(
+        "core_minimum_reduction_percent="
+        f"{CORE_MINIMUM_REDUCTION_PERCENT}"
+    )
 
 
 def candidate_command(args: argparse.Namespace) -> None:
@@ -456,6 +549,10 @@ def candidate_command(args: argparse.Namespace) -> None:
         raise ValueError("validated SHA-256 does not match the candidate")
     if args.virtual_size != expected["virtual_size"]:
         raise ValueError("candidate virtual size does not match the pinned profile")
+    qemu_info_path = args.qemu_info.resolve(strict=True)
+    if qemu_info_path.parent != asset.parent:
+        raise ValueError("qemu-img validation input must be beside the candidate")
+    qemu_image = load_qemu_image_info(qemu_info_path, args.virtual_size)
     if args.source_name != expected["source_name"]:
         raise ValueError("source filename does not match the pinned profile")
     if args.source_sha256 != expected["source_sha256"]:
@@ -480,7 +577,8 @@ def candidate_command(args: argparse.Namespace) -> None:
         "filesystem": expected["filesystem"],
         "flavor": expected["flavor"],
         "asset_name": asset.name,
-        "asset_bytes": asset.stat().st_size,
+        "compressed_size": asset.stat().st_size,
+        "allocated_size": qemu_image["allocated_size"],
         "asset_sha256": actual_sha256,
         "virtual_size": args.virtual_size,
         "packages": {
@@ -500,6 +598,11 @@ def candidate_command(args: argparse.Namespace) -> None:
         "source_commit": args.source_commit,
         "validation": {
             "qemu_version": args.qemu_version.strip(),
+            "qemu_image": qemu_image,
+            "qemu_info": {
+                "name": qemu_info_path.name,
+                "sha256": sha256(qemu_info_path),
+            },
             "runner": args.runner.strip(),
             "run_id": str(args.run_id),
             "run_attempt": str(args.run_attempt),
@@ -517,8 +620,7 @@ def azure_result_command(args: argparse.Namespace) -> None:
     candidate, asset_path = validate_candidate(manifest_path, args.source_commit)
     if candidate["variant"] != args.key:
         raise ValueError("candidate variant does not match --key")
-    if candidate["filesystem"] != "zfs":
-        raise ValueError("azure-result requires a zfs candidate")
+    expected_contracts = list(azure_contracts(candidate["filesystem"]))
     # Independently verify the asset the caller points to is the same file the
     # candidate manifest describes — the harness may pass a path that differs
     # from the one validate_candidate resolved (same file, different argument).
@@ -532,7 +634,7 @@ def azure_result_command(args: argparse.Namespace) -> None:
         raise ValueError("VHD size must be positive")
     # Validate contracts passed as a comma-separated string.
     provided_contracts = [c.strip() for c in args.contracts.split(",")]
-    if provided_contracts != list(AZURE_CONTRACTS):
+    if provided_contracts != expected_contracts:
         raise ValueError(
             "contracts do not match required Azure contracts"
         )
@@ -544,9 +646,17 @@ def azure_result_command(args: argparse.Namespace) -> None:
         str(args.run_attempt),
         "run_attempt",
     )
+    candidate_workflow = candidate["validation"]
+    if (
+        workflow_run_id != candidate_workflow["run_id"]
+        or workflow_run_attempt != candidate_workflow["run_attempt"]
+    ):
+        raise ValueError(
+            "Azure result workflow identity does not match candidate validation"
+        )
 
     document = {
-        "schema": 1,
+        "schema": CANDIDATE_SCHEMA,
         "type": "zvmi-freebsd15-azure-acceptance",
         "variant": candidate["variant"],
         "architecture": candidate["architecture"],
@@ -555,13 +665,16 @@ def azure_result_command(args: argparse.Namespace) -> None:
         "asset_name": candidate["asset_name"],
         "source_commit": args.source_commit,
         "qcow_sha256": candidate["asset_sha256"],
+        "qcow_virtual_size": candidate["virtual_size"],
+        "qcow_allocated_size": candidate["allocated_size"],
+        "qcow_compressed_size": candidate["compressed_size"],
         "derived_vhd_sha256": args.vhd_sha256,
         "derived_vhd_bytes": args.vhd_bytes,
         "status": "success",
         "location": location,
         "vm_size": vm_size,
         "resource_group": resource_group,
-        "contracts": list(AZURE_CONTRACTS),
+        "contracts": expected_contracts,
         "workflow": {
             "run_id": workflow_run_id,
             "run_attempt": workflow_run_attempt,
@@ -592,6 +705,57 @@ def validate_candidate(
             raise ValueError(
                 f"{manifest_path}: {profile_key} does not match profile"
             )
+    if document.get("virtual_size") != expected["virtual_size"]:
+        raise ValueError(f"{manifest_path}: virtual_size does not match profile")
+    compressed_size = require_positive_int(
+        document.get("compressed_size"),
+        f"{manifest_path}: compressed size",
+    )
+    allocated_size = require_positive_int(
+        document.get("allocated_size"),
+        f"{manifest_path}: allocated size",
+    )
+    if allocated_size > document["virtual_size"]:
+        raise ValueError(f"{manifest_path}: allocated size exceeds virtual size")
+    validation = document.get("validation")
+    if not isinstance(validation, dict):
+        raise ValueError(f"{manifest_path}: validation metadata is missing")
+    qemu_image = validation.get("qemu_image")
+    if not isinstance(qemu_image, dict):
+        raise ValueError(f"{manifest_path}: qemu-img validation metadata is missing")
+    expected_qemu_image = {
+        "format": "qcow2",
+        "virtual_size": document["virtual_size"],
+        "allocated_size": allocated_size,
+        "compression_type": "zstd",
+        "has_backing_file": False,
+    }
+    if qemu_image != expected_qemu_image:
+        raise ValueError(f"{manifest_path}: qemu-img size metadata mismatch")
+    qemu_info = validation.get("qemu_info")
+    if not isinstance(qemu_info, dict):
+        raise ValueError(f"{manifest_path}: qemu-img validation input is missing")
+    qemu_info_name = qemu_info.get("name")
+    if (
+        not isinstance(qemu_info_name, str)
+        or not qemu_info_name
+        or Path(qemu_info_name).name != qemu_info_name
+    ):
+        raise ValueError(f"{manifest_path}: invalid qemu-img validation input name")
+    require_sha256(
+        qemu_info.get("sha256", ""),
+        f"{manifest_path}: qemu-img validation input SHA-256",
+    )
+    qemu_info_path = manifest_path.parent / qemu_info_name
+    if not qemu_info_path.is_file():
+        raise ValueError(f"{manifest_path}: qemu-img validation input is missing")
+    if sha256(qemu_info_path) != qemu_info["sha256"]:
+        raise ValueError(f"{manifest_path}: qemu-img validation input mismatch")
+    if load_qemu_image_info(
+        qemu_info_path,
+        document["virtual_size"],
+    ) != qemu_image:
+        raise ValueError(f"{manifest_path}: qemu-img validation input changed")
     for source_key in ("name", "sha256"):
         if document["source"][source_key] != expected[f"source_{source_key}"]:
             raise ValueError(
@@ -604,7 +768,7 @@ def validate_candidate(
     asset = manifest_path.parent / document["asset_name"]
     if not asset.is_file():
         raise ValueError(f"{manifest_path}: candidate asset is missing")
-    if asset.stat().st_size != document.get("asset_bytes"):
+    if asset.stat().st_size != compressed_size:
         raise ValueError(f"{manifest_path}: candidate size mismatch")
     if sha256(asset) != document.get("asset_sha256"):
         raise ValueError(f"{manifest_path}: candidate digest mismatch")
@@ -632,6 +796,7 @@ def release_notes(
     candidates: list[dict],
     source_commit: str,
     azure_results: dict[str, dict] | None = None,
+    minimum_core_reduction_percent: int | None = None,
 ) -> str:
     lines = [selected["summary"], "", "## Highlights", ""]
     lines.extend(f"- {highlight}" for highlight in selected["highlights"])
@@ -645,17 +810,31 @@ def release_notes(
             "",
             "## Assets",
             "",
-            "| Architecture | Root | Flavor | Asset | File size | "
-            "Virtual size | SHA-256 |",
-            "| --- | --- | --- | --- | ---: | ---: | --- |",
+            "| Architecture | Root | Flavor | Asset | Virtual size | "
+            "Allocated size | Compressed/download size | SHA-256 |",
+            "| --- | --- | --- | --- | ---: | ---: | ---: | --- |",
         ]
     )
     for candidate in candidates:
         lines.append(
             "| {architecture} | {filesystem} | {flavor} | `{asset_name}` "
-            "| {asset_bytes} | {virtual_size} | `{asset_sha256}` |".format(
+            "| {virtual_size} | {allocated_size} | {compressed_size} "
+            "| `{asset_sha256}` |".format(
                 **candidate
             )
+        )
+    if minimum_core_reduction_percent is not None:
+        lines.extend(
+            [
+                "",
+                "## Core size gate",
+                "",
+                f"Both architectures reduced qemu-img allocated size and "
+                f"compressed/download size by at least "
+                f"{minimum_core_reduction_percent}% versus the corresponding "
+                "full UFS release assets. Virtual size is reported above and "
+                "may not regress.",
+            ]
         )
     lines.extend(
         [
@@ -796,6 +975,31 @@ def stage_command(args: argparse.Namespace) -> None:
             f"{args.release_set} candidate matrix is incomplete or unexpected"
         )
 
+    minimum_reduction = require_reduction_percent(
+        getattr(
+            args,
+            "minimum_core_reduction_percent",
+            CORE_MINIMUM_REDUCTION_PERCENT,
+        )
+    )
+    if args.release_set == "core":
+        if getattr(args, "baseline", None) is None:
+            raise ValueError("core releases require a full UFS --baseline")
+        baseline = load_publish_manifest(args.baseline)
+        core_rows = full_core_rows(baseline, {
+            "schema": CANDIDATE_SCHEMA,
+            "type": "zvmi-freebsd15-release",
+            "release_set": "core",
+            "release_tag": selected["release_tag"],
+            "source_commit": args.source_commit,
+            "assets": [
+                candidate_release_asset(by_variant[key]) for key in wanted
+            ],
+        })
+        enforce_core_size_gate(core_rows, minimum_reduction)
+    elif getattr(args, "baseline", None) is not None:
+        raise ValueError("a size baseline is only applicable to core releases")
+
     azure_by_variant = None
     if args.release_set == "zfs":
         azure_manifests = sorted(args.azure_results.rglob("azure-result.json"))
@@ -804,7 +1008,7 @@ def stage_command(args: argparse.Namespace) -> None:
         azure_by_variant = {}
         for azure_manifest in azure_manifests:
             document = json.loads(azure_manifest.read_text(encoding="utf-8"))
-            if document.get("schema") != 1:
+            if document.get("schema") != CANDIDATE_SCHEMA:
                 raise ValueError(f"{azure_manifest}: unsupported schema")
             if document.get("type") != "zvmi-freebsd15-azure-acceptance":
                 raise ValueError(f"{azure_manifest}: unexpected azure result type")
@@ -835,6 +1039,11 @@ def stage_command(args: argparse.Namespace) -> None:
                 raise ValueError(
                     f"{azure_manifest}: QCOW SHA-256 does not match candidate"
                 )
+            for field in ("virtual_size", "allocated_size", "compressed_size"):
+                if document.get(f"qcow_{field}") != candidate[field]:
+                    raise ValueError(
+                        f"{azure_manifest}: QCOW {field} does not match candidate"
+                    )
             if document.get("status") != "success":
                 raise ValueError(f"{azure_manifest}: status is not success")
             derived_vhd_bytes = document.get("derived_vhd_bytes")
@@ -852,18 +1061,31 @@ def stage_command(args: argparse.Namespace) -> None:
                 document.get("resource_group", ""),
                 "resource_group",
             )
-            if document.get("contracts") != list(AZURE_CONTRACTS):
+            if document.get("contracts") != list(
+                azure_contracts(candidate["filesystem"])
+            ):
                 raise ValueError(
                     f"{azure_manifest}: contracts do not match required Azure contracts"
                 )
             workflow = document.get("workflow")
             if not isinstance(workflow, dict):
                 raise ValueError(f"{azure_manifest}: workflow is missing")
-            require_non_empty(str(workflow.get("run_id", "")), "run_id")
-            require_non_empty(
+            workflow_run_id = require_non_empty(
+                str(workflow.get("run_id", "")),
+                "run_id",
+            )
+            workflow_run_attempt = require_non_empty(
                 str(workflow.get("run_attempt", "")),
                 "run_attempt",
             )
+            candidate_workflow = candidate["validation"]
+            if (
+                workflow_run_id != candidate_workflow["run_id"]
+                or workflow_run_attempt != candidate_workflow["run_attempt"]
+            ):
+                raise ValueError(
+                    f"{azure_manifest}: workflow identity does not match candidate"
+                )
             azure_by_variant[key] = document
         if set(azure_by_variant) != set(wanted):
             raise ValueError(
@@ -882,16 +1104,7 @@ def stage_command(args: argparse.Namespace) -> None:
 
     manifest_assets = []
     for candidate in candidates:
-        asset_manifest = {
-            "variant": candidate["variant"],
-            "architecture": candidate["architecture"],
-            "filesystem": candidate["filesystem"],
-            "flavor": candidate["flavor"],
-            "asset_name": candidate["asset_name"],
-            "bytes": candidate["asset_bytes"],
-            "sha256": candidate["asset_sha256"],
-            "packages": candidate["packages"]["count"],
-        }
+        asset_manifest = candidate_release_asset(candidate)
         if azure_by_variant is not None:
             azure = azure_by_variant[candidate["variant"]]
             asset_manifest["azure"] = {
@@ -921,9 +1134,31 @@ def stage_command(args: argparse.Namespace) -> None:
             candidates,
             args.source_commit,
             azure_results=azure_by_variant,
+            minimum_core_reduction_percent=(
+                minimum_reduction if args.release_set == "core" else None
+            ),
         ),
         encoding="utf-8",
     )
+
+
+def candidate_release_asset(candidate: dict) -> dict:
+    return {
+        "variant": candidate["variant"],
+        "architecture": candidate["architecture"],
+        "filesystem": candidate["filesystem"],
+        "flavor": candidate["flavor"],
+        "asset_name": candidate["asset_name"],
+        # `bytes` remains the publisher-facing download size field. Schema 3
+        # also names it explicitly so comparisons cannot confuse it with the
+        # qemu-img allocated size.
+        "bytes": candidate["compressed_size"],
+        "compressed_size": candidate["compressed_size"],
+        "allocated_size": candidate["allocated_size"],
+        "virtual_size": candidate["virtual_size"],
+        "sha256": candidate["asset_sha256"],
+        "packages": candidate["packages"]["count"],
+    }
 
 
 def load_publish_manifest(path: Path) -> dict:
@@ -932,54 +1167,145 @@ def load_publish_manifest(path: Path) -> dict:
         raise ValueError(f"{path}: not a publish manifest")
     if document.get("schema") != CANDIDATE_SCHEMA:
         raise ValueError(f"{path}: unsupported schema")
+    release_set_name = document.get("release_set")
+    if release_set_name not in RELEASE_SETS:
+        raise ValueError(f"{path}: unexpected release set")
+    selected = RELEASE_SETS[release_set_name]
+    if document.get("release_tag") != selected["release_tag"]:
+        raise ValueError(f"{path}: release tag does not match release set")
+    assets = document.get("assets")
+    if not isinstance(assets, list) or not assets:
+        raise ValueError(f"{path}: release assets are missing")
+    by_variant = {}
+    for asset in assets:
+        if not isinstance(asset, dict):
+            raise ValueError(f"{path}: invalid release asset")
+        key = asset.get("variant")
+        if key not in VARIANTS or key in by_variant:
+            raise ValueError(f"{path}: unexpected or duplicate release variant")
+        expected = VARIANTS[key]
+        for profile_key in PROFILE_KEYS:
+            if asset.get(profile_key) != expected[profile_key]:
+                raise ValueError(
+                    f"{path}: {key} {profile_key} does not match profile"
+                )
+        virtual_size = require_positive_int(
+            asset.get("virtual_size"),
+            f"{path}: {key} virtual size",
+        )
+        if virtual_size != expected["virtual_size"]:
+            raise ValueError(f"{path}: {key} virtual size does not match profile")
+        allocated_size = require_positive_int(
+            asset.get("allocated_size"),
+            f"{path}: {key} allocated size",
+        )
+        if allocated_size > virtual_size:
+            raise ValueError(f"{path}: {key} allocated size exceeds virtual size")
+        compressed_size = require_positive_int(
+            asset.get("compressed_size"),
+            f"{path}: {key} compressed size",
+        )
+        if asset.get("bytes") != compressed_size:
+            raise ValueError(f"{path}: {key} download size does not match")
+        require_sha256(asset.get("sha256", ""), f"{path}: {key} SHA-256")
+        require_positive_int(asset.get("packages"), f"{path}: {key} package count")
+        by_variant[key] = asset
+    if set(by_variant) != set(selected["variants"]):
+        raise ValueError(f"{path}: release asset matrix is incomplete or unexpected")
     return document
+
+
+def full_core_rows(baseline: dict, candidate: dict) -> list[tuple[dict, dict]]:
+    """Return architecture pairs in the only allowed comparison direction."""
+    if baseline.get("release_set") != "ufs":
+        raise ValueError("size baseline must be the full UFS release set")
+    if candidate.get("release_set") != "core":
+        raise ValueError("size candidate must be the core UFS release set")
+    baseline_by_architecture = {
+        asset["architecture"]: asset for asset in baseline["assets"]
+    }
+    rows = []
+    for key in RELEASE_SETS["core"]["variants"]:
+        core = next(asset for asset in candidate["assets"] if asset["variant"] == key)
+        full = baseline_by_architecture.get(core["architecture"])
+        if full is None:
+            raise ValueError(
+                f"no {core['architecture']} full UFS baseline asset"
+            )
+        expected_full = f"{core['architecture']}-ufs-full"
+        if (
+            full["variant"] != expected_full
+            or full["filesystem"] != "ufs"
+            or full["flavor"] != "full"
+        ):
+            raise ValueError(
+                f"{core['architecture']} baseline must be full UFS"
+            )
+        if core["filesystem"] != "ufs" or core["flavor"] != "core":
+            raise ValueError(
+                f"{core['architecture']} candidate must be core UFS"
+            )
+        rows.append((full, core))
+    return rows
+
+
+def size_reduction_percent(baseline: int, candidate: int) -> float:
+    return 100.0 * (baseline - candidate) / baseline
+
+
+def enforce_core_size_gate(
+    rows: list[tuple[dict, dict]],
+    minimum_reduction_percent: int,
+) -> None:
+    threshold = require_reduction_percent(minimum_reduction_percent)
+    if len(rows) != len(RELEASE_SETS["core"]["variants"]):
+        raise ValueError("core size gate requires both architectures")
+    for full, core in rows:
+        architecture = core["architecture"]
+        if core["virtual_size"] > full["virtual_size"]:
+            raise ValueError(f"{architecture} core virtual size regressed")
+        for field, label in (
+            ("allocated_size", "allocated"),
+            ("compressed_size", "compressed/download"),
+        ):
+            # Integer cross-multiplication makes the inclusive threshold
+            # boundary exact and keeps the direction visibly full -> core.
+            if core[field] * 100 > full[field] * (100 - threshold):
+                raise ValueError(
+                    f"{architecture} core {label} size reduction is below "
+                    f"{threshold}%"
+                )
 
 
 def compare_command(args: argparse.Namespace) -> None:
     """Report the full-versus-core size comparison for two staged sets.
 
-    Download size is the metric a core image is judged on, so it leads the
-    table; virtual size is reported alongside because it deliberately does not
-    change - the pinned virtual size is what Azure VHD derivation depends on.
+    The argument roles are intentional and validated: baseline is full UFS,
+    candidate is core UFS. This prevents an accidental reversal from turning a
+    regression into a positive reduction.
     """
     baseline = load_publish_manifest(args.baseline)
     candidate = load_publish_manifest(args.candidate)
-    by_pair = {}
-    for asset in baseline["assets"]:
-        by_pair[(asset["architecture"], asset["filesystem"])] = asset
-    rows = []
-    for asset in candidate["assets"]:
-        pair = (asset["architecture"], asset["filesystem"])
-        other = by_pair.get(pair)
-        if other is None:
-            raise ValueError(
-                f"no {pair[0]} {pair[1]} baseline asset to compare against"
-            )
-        if other["flavor"] == asset["flavor"]:
-            raise ValueError("comparison requires two different flavors")
-        rows.append((other, asset))
-    if not rows:
-        raise ValueError("no assets to compare")
+    rows = full_core_rows(baseline, candidate)
 
     lines = [
-        f"| Architecture | Root | {baseline['release_set']} download | "
-        f"{candidate['release_set']} download | Reduction | "
-        f"{baseline['release_set']} packages | "
-        f"{candidate['release_set']} packages | Virtual size |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Architecture | Full virtual | Core virtual | Virtual reduction | "
+        "Full allocated | Core allocated | Allocated reduction | "
+        "Full compressed/download | Core compressed/download | "
+        "Compressed reduction | Full packages | Core packages |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+        "| ---: | ---: | ---: |",
     ]
-    for other, asset in rows:
-        reduction = 100.0 * (other["bytes"] - asset["bytes"]) / other["bytes"]
-        virtual_size = VARIANTS[asset["variant"]]["virtual_size"]
-        # The two flavors share an upstream image, so an unequal virtual size
-        # would mean one of them was built from something else entirely.
-        if VARIANTS[other["variant"]]["virtual_size"] != virtual_size:
-            raise ValueError("compared variants do not share a virtual size")
+    for full, core in rows:
         lines.append(
-            f"| {asset['architecture']} | {asset['filesystem']} "
-            f"| {other['bytes']} | {asset['bytes']} | {reduction:.1f}% "
-            f"| {other['packages']} | {asset['packages']} "
-            f"| {virtual_size} |"
+            f"| {core['architecture']} "
+            f"| {full['virtual_size']} | {core['virtual_size']} "
+            f"| {size_reduction_percent(full['virtual_size'], core['virtual_size']):.1f}% "
+            f"| {full['allocated_size']} | {core['allocated_size']} "
+            f"| {size_reduction_percent(full['allocated_size'], core['allocated_size']):.1f}% "
+            f"| {full['compressed_size']} | {core['compressed_size']} "
+            f"| {size_reduction_percent(full['compressed_size'], core['compressed_size']):.1f}% "
+            f"| {full['packages']} | {core['packages']} |"
         )
     text = "\n".join(lines) + "\n"
     if args.output is not None:
@@ -1010,6 +1336,12 @@ def parser() -> argparse.ArgumentParser:
     candidate.add_argument("--asset", type=Path, required=True)
     candidate.add_argument("--validated-sha256", required=True)
     candidate.add_argument("--virtual-size", type=int, required=True)
+    candidate.add_argument(
+        "--qemu-info",
+        type=Path,
+        required=True,
+        help="trusted qemu-img info --output=json from candidate validation",
+    )
     candidate.add_argument("--source-name", required=True)
     candidate.add_argument("--source-url", required=True)
     candidate.add_argument("--source-sha256", required=True)
@@ -1044,6 +1376,20 @@ def parser() -> argparse.ArgumentParser:
     stage.add_argument("--source-commit", required=True)
     stage.add_argument("--release-tag", required=True)
     stage.add_argument("--azure-results", type=Path, default=None)
+    stage.add_argument(
+        "--baseline",
+        type=Path,
+        help="staged full UFS publish manifest; required for core",
+    )
+    stage.add_argument(
+        "--minimum-core-reduction-percent",
+        type=int,
+        default=CORE_MINIMUM_REDUCTION_PERCENT,
+        help=(
+            "minimum allocated and compressed reduction required for each "
+            f"core architecture (default: {CORE_MINIMUM_REDUCTION_PERCENT})"
+        ),
+    )
     stage.add_argument("--output", type=Path, required=True)
     stage.add_argument("--notes", type=Path, required=True)
     stage.set_defaults(handler=stage_command)

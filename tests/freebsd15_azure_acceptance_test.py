@@ -86,6 +86,8 @@ def test_candidate_manifest_uses_canonical_validation():
     assert 'doc.get("flavor") != flavor' in content
     assert '("ufs", "core")' in content
     assert '("zfs", "full")' in content
+    assert "candidate compressed size is missing or invalid" in content
+    assert "candidate allocated size is missing or invalid" in content
     assert "candidate source size is missing or invalid" in content
     assert "candidate package manifest is missing" in content
     assert "candidate package installed size is missing or invalid" in content
@@ -107,8 +109,9 @@ def test_candidate_is_revalidated_before_result_generation():
     assert "readarray -t result_candidate" in content
     assert 'test "${result_candidate[0]}" = "$qcow_sha256"' in content
     assert 'test "${result_candidate[1]}" = "$qcow_bytes"' in content
-    assert 'test "${result_candidate[2]}" = "$virtual_size"' in content
-    assert 'test "${result_candidate[3]}" = "$candidate_architecture"' in content
+    assert 'test "${result_candidate[2]}" = "$qcow_allocated_size"' in content
+    assert 'test "${result_candidate[3]}" = "$virtual_size"' in content
+    assert 'test "${result_candidate[4]}" = "$candidate_architecture"' in content
 
 
 def test_ownership_tags_use_freebsd15():
@@ -289,12 +292,13 @@ def test_clean_shutdown_is_observed():
     assert "PowerState/stopped|PowerState/deallocated" in content
 
 
-def test_ufs_result_uses_deterministic_shared_schema():
+def test_all_results_use_canonical_schema3_writer():
     with open(SCRIPT) as f:
         content = f.read()
-    assert '"type": "zvmi-freebsd15-azure-acceptance"' in content
-    assert '"contracts": contracts.split(",")' in content
-    assert "json.dump(document, output, indent=2, sort_keys=True)" in content
+    assert content.count("freebsd15_release.py azure-result") == 1
+    assert "UFS result writer" not in content
+    assert "qcow_allocated_size" in content
+    assert "qcow_bytes" in content
 
 
 def test_no_default_freebsd_account():
@@ -418,3 +422,23 @@ def test_workflow_artifact_naming_consistent():
     for ref in artifact_refs:
         assert "${{ needs.prepare.outputs.source_commit }}" in ref or \
             "source_commit" in ref
+
+
+def test_workflow_persists_exact_qemu_info_for_candidate_metadata():
+    content = _workflow_content()
+    assert (
+        'qemu-img info --output=json "$asset" > "$image_info"'
+        in content
+    )
+    assert '--qemu-info "$CANDIDATE_DIR/qemu-img-info.json"' in content
+    assert 'jq -r \'.\"actual-size\"\' "$CANDIDATE_DIR/qemu-img-info.json"' in content
+
+
+def test_core_workflow_builds_and_separates_full_ufs_baselines():
+    content = _workflow_content()
+    assert "BASELINE_CANDIDATES_DIR" in content
+    assert "freebsd15-candidate-*-ufs-core-" in content
+    assert "freebsd15-candidate-*-ufs-full-" in content
+    assert "Download exact core publication candidates" in content
+    assert "Download exact full UFS baseline candidates" in content
+    assert "merge-multiple: false" in content

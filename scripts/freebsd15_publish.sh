@@ -15,6 +15,13 @@ if [[ "$RELEASE_SET" == "zfs" ]]; then
     exit 1
   fi
 fi
+# Core releases require locally staged, same-run full UFS candidates. The
+# publisher derives the baseline manifest from those validated artifacts; it
+# never accepts an external JSON baseline.
+if [[ "$RELEASE_SET" == "core" && -z ${BASELINE_CANDIDATES_DIR:-} ]]; then
+  echo "::error::Core releases require BASELINE_CANDIDATES_DIR"
+  exit 1
+fi
 for tool in gh python3 sha256sum; do
   command -v "$tool" >/dev/null || {
     echo "::error::Required publication tool $tool is unavailable"
@@ -35,9 +42,12 @@ expected_title=${release_description#*release_title=}
 expected_title=${expected_title%%$'\n'*}
 expected_asset_count=${release_description#*asset_count=}
 expected_asset_count=${expected_asset_count%%$'\n'*}
+minimum_core_reduction=${release_description#*core_minimum_reduction_percent=}
+minimum_core_reduction=${minimum_core_reduction%%$'\n'*}
 [[ "$RELEASE_TAG" == "$expected_tag" ]]
 [[ "$RELEASE_TITLE" == "$expected_title" ]]
 [[ "$expected_asset_count" =~ ^[0-9]+$ ]]
+[[ "$minimum_core_reduction" =~ ^[0-9]+$ ]]
 
 mkdir -p "$STAGING_ROOT"
 assets_dir="$STAGING_ROOT/assets"
@@ -45,11 +55,32 @@ notes_file="$STAGING_ROOT/release-notes.md"
 expected_file="$STAGING_ROOT/expected.tsv"
 release_file="$STAGING_ROOT/release.json"
 verify_dir="$STAGING_ROOT/remote"
-rm -rf -- "$assets_dir" "$verify_dir"
+baseline_dir="$STAGING_ROOT/full-ufs-baseline"
+baseline_notes="$STAGING_ROOT/full-ufs-baseline-notes.md"
+rm -rf -- "$assets_dir" "$verify_dir" "$baseline_dir"
 
-azure_results_arg=""
+azure_results_args=()
 if [[ "$RELEASE_SET" == "zfs" ]]; then
-  azure_results_arg="--azure-results $AZURE_RESULTS_DIR"
+  azure_results_args=(--azure-results "$AZURE_RESULTS_DIR")
+fi
+
+baseline_args=()
+if [[ "$RELEASE_SET" == "core" ]]; then
+  ufs_description=$(python3 scripts/freebsd15_release.py describe \
+    --release-set ufs)
+  ufs_tag=${ufs_description#*release_tag=}
+  ufs_tag=${ufs_tag%%$'\n'*}
+  python3 scripts/freebsd15_release.py stage \
+    --release-set ufs \
+    --candidates "$BASELINE_CANDIDATES_DIR" \
+    --source-commit "$SOURCE_COMMIT" \
+    --release-tag "$ufs_tag" \
+    --output "$baseline_dir" \
+    --notes "$baseline_notes"
+  baseline_args=(
+    --baseline "$baseline_dir/publish-manifest.json"
+    --minimum-core-reduction-percent "$minimum_core_reduction"
+  )
 fi
 
 python3 scripts/freebsd15_release.py stage \
@@ -57,7 +88,8 @@ python3 scripts/freebsd15_release.py stage \
   --candidates "$CANDIDATES_DIR" \
   --source-commit "$SOURCE_COMMIT" \
   --release-tag "$RELEASE_TAG" \
-  $azure_results_arg \
+  "${azure_results_args[@]}" \
+  "${baseline_args[@]}" \
   --output "$assets_dir" \
   --notes "$notes_file"
 
