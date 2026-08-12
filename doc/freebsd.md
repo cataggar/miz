@@ -67,7 +67,7 @@ mapping is enforced by tests rather than by careful reading:
 | --- | --- |
 | UEFI boot | `FreeBSD-bootloader`, `FreeBSD-efi-tools` |
 | Release kernel and virtual hardware | `FreeBSD-kernel-generic`, `FreeBSD-hyperv-tools`, `FreeBSD-devd` |
-| rc and account management | `FreeBSD-rc`, `FreeBSD-runtime`, `FreeBSD-pam` |
+| rc, `sysrc`, and account management | `FreeBSD-rc`, `FreeBSD-bsdconfig`, `FreeBSD-runtime`, `FreeBSD-pam` |
 | DNS and DHCP | `FreeBSD-dhclient`, `FreeBSD-resolvconf` |
 | Certificates | `FreeBSD-caroot`, `FreeBSD-certctl`, `FreeBSD-openssl` |
 | Entropy and time | `FreeBSD-rc` (`rc.d/random`), `FreeBSD-ntp` |
@@ -97,6 +97,11 @@ a retained package or shared-library consumer actually requires an exclusion,
 the solver leaves it installed and the build reports its automatic, vital, and
 locked state, reverse package dependencies, and shared-library consumers before
 failing.
+
+The shared retained manifest names the exact pkgbase provider
+`FreeBSD-bsdconfig` for `sysrc(8)`. The core flavor does not retain
+`FreeBSD-set-base`, `FreeBSD-set-devel`, or `FreeBSD-set-optional` to obtain
+it; those broad sets remain reviewed exclusions.
 
 ### Exclusions
 

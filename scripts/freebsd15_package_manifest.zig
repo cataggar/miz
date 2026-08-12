@@ -57,6 +57,7 @@ pub const Clause = enum {
     azure_agent,
     root_growth,
     serial_console,
+    system_configuration,
 };
 
 /// Which repository a required package comes from. Only pkgbase packages are
@@ -97,6 +98,12 @@ pub const required_packages = [_]RequiredPackage{
         .source = .pkgbase,
         .clauses = &.{ .rc_services, .entropy, .root_growth },
         .why = "rc.d, including rc.d/random and rc.d/growfs.",
+    },
+    .{
+        .name = "FreeBSD-bsdconfig",
+        .source = .pkgbase,
+        .clauses = &.{.system_configuration},
+        .why = "sysrc(8), used to inspect and safely edit rc.conf settings.",
     },
     .{
         .name = "FreeBSD-pam",
@@ -342,7 +349,7 @@ pub const Manifest = struct {
 
 pub const full_manifest = Manifest{
     .flavor = .full,
-    .revision = 1,
+    .revision = 2,
     .release = "15.1",
     .base_repository = "FreeBSD-base",
     .required = &required_packages,
@@ -357,7 +364,7 @@ pub const full_manifest = Manifest{
 
 pub const core_manifest = Manifest{
     .flavor = .core,
-    .revision = 1,
+    .revision = 2,
     .release = "15.1",
     .base_repository = "FreeBSD-base",
     .required = &required_packages,
@@ -810,6 +817,8 @@ test "manifests are versioned, disjoint, and internally consistent" {
     try std.testing.expect(core.revision > 0);
     try std.testing.expectEqualStrings("15.1", core.release);
     try std.testing.expectEqualStrings("FreeBSD-base", core.base_repository);
+    try std.testing.expectEqual(@as(u32, 2), full.revision);
+    try std.testing.expectEqual(full.revision, core.revision);
     // Both flavors carry the same contract; only the core flavor prunes.
     try std.testing.expectEqual(full.required.len, core.required.len);
     try std.testing.expectEqual(@as(usize, 0), full.excluded.len);
@@ -841,6 +850,28 @@ test "manifests are versioned, disjoint, and internally consistent" {
         }
         try std.testing.expect(std.mem.startsWith(u8, excluded, "FreeBSD-"));
     }
+
+    var retains_sysrc_provider = false;
+    for (core.required) |package| {
+        if (std.mem.eql(u8, package.name, "FreeBSD-bsdconfig")) {
+            retains_sysrc_provider = true;
+        }
+    }
+    try std.testing.expect(retains_sysrc_provider);
+    for ([_][]const u8{
+        "FreeBSD-set-base",
+        "FreeBSD-set-devel",
+        "FreeBSD-set-optional",
+    }) |broad_set| {
+        var excludes_broad_set = false;
+        for (core.excluded) |excluded| {
+            if (std.mem.eql(u8, excluded, broad_set)) {
+                excludes_broad_set = true;
+            }
+        }
+        try std.testing.expect(excludes_broad_set);
+    }
+
     for (core.excluded_classes) |class| {
         for (core.required) |package| {
             try std.testing.expect(!hasNameClass(package.name, class));

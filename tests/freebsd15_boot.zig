@@ -269,6 +269,7 @@ const SshCommandResult = struct {
     term: std.process.Child.Term,
     stdout: []u8,
     stderr: []u8,
+    timeout_evidence: TimeoutEvidence,
 
     fn deinit(self: *SshCommandResult, allocator: Allocator) void {
         allocator.free(self.stdout);
@@ -277,6 +278,8 @@ const SshCommandResult = struct {
     }
 
     fn succeeded(self: SshCommandResult) bool {
+        if (self.timeout_evidence.timedOut(self.term)) return false;
+        if (self.timeout_evidence.completed_status != 0) return false;
         return switch (self.term) {
             .exited => |code| code == 0,
             else => false,
@@ -284,16 +287,176 @@ const SshCommandResult = struct {
     }
 
     fn timedOut(self: SshCommandResult) bool {
-        return switch (self.term) {
-            .exited => |code| code == 124,
-            else => false,
-        };
+        return self.timeout_evidence.timedOut(self.term);
     }
 };
 
 const ssh_capture_script =
     "exec \"$@\" > >(/usr/bin/tail -c 65536) " ++
     "2> >(/usr/bin/tail -c 65536 >&2)";
+
+const timeout_wrapper_script =
+    "completion_file=$1; started_file=$2; timeout_file=$3; shift 3; " ++
+    ": > \"$started_file\" || exit 125; timed_out=; " ++
+    "trap 'timed_out=1; : > \"$timeout_file\"' TERM; " ++
+    "\"$@\"; status=$?; trap - TERM; " ++
+    "if [ -z \"$timed_out\" ]; then " ++
+    "printf '%s\\n' \"$status\" > \"$completion_file\" || exit 125; fi; " ++
+    "exit \"$status\"";
+
+const TimeoutEvidence = struct {
+    wrapper_started: bool,
+    timeout_marked: bool,
+    completed_status: ?u8,
+
+    fn completed(status: u8) TimeoutEvidence {
+        return .{
+            .wrapper_started = true,
+            .timeout_marked = false,
+            .completed_status = status,
+        };
+    }
+
+    fn timedOut(self: TimeoutEvidence, term: std.process.Child.Term) bool {
+        if (self.completed_status) |status| {
+            if (shellStatus(term) == status) return false;
+        }
+        if (self.timeout_marked) return true;
+        if (!self.wrapper_started) return false;
+        const status = shellStatus(term) orelse return false;
+        return status == 124 or status == 137;
+    }
+};
+
+fn shellStatus(term: std.process.Child.Term) ?u8 {
+    return switch (term) {
+        .exited => |code| code,
+        .signal => |signal| std.math.add(
+            u8,
+            128,
+            @intCast(@intFromEnum(signal)),
+        ) catch null,
+        else => null,
+    };
+}
+
+fn readMarkerExists(io: Io, dir: Dir, name: []const u8) !bool {
+    dir.access(io, name, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn readCompletionStatus(
+    allocator: Allocator,
+    io: Io,
+    dir: Dir,
+) !?u8 {
+    const raw = dir.readFileAlloc(
+        io,
+        "completed",
+        allocator,
+        .limited(16),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(raw);
+    const text = std.mem.trim(u8, raw, " \t\r\n");
+    if (text.len == 0) return error.InvalidTimeoutCompletionStatus;
+    return std.fmt.parseInt(u8, text, 10) catch
+        return error.InvalidTimeoutCompletionStatus;
+}
+
+fn runTimedCommandAlloc(
+    allocator: Allocator,
+    io: Io,
+    operation: SshOperation,
+    timeout_text: []const u8,
+    kill_after_text: []const u8,
+    command_argv: []const []const u8,
+) !SshCommandResult {
+    var marker_dir = std.testing.tmpDir(.{});
+    defer marker_dir.cleanup();
+    var marker_path_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const marker_path_length = try marker_dir.dir.realPath(
+        io,
+        &marker_path_buffer,
+    );
+    const marker_path = marker_path_buffer[0..marker_path_length];
+    const completion_path = try std.fs.path.join(
+        allocator,
+        &.{ marker_path, "completed" },
+    );
+    defer allocator.free(completion_path);
+    const started_path = try std.fs.path.join(
+        allocator,
+        &.{ marker_path, "started" },
+    );
+    defer allocator.free(started_path);
+    const timeout_path = try std.fs.path.join(
+        allocator,
+        &.{ marker_path, "timed-out" },
+    );
+    defer allocator.free(timeout_path);
+    const kill_after_arg = try std.fmt.allocPrint(
+        allocator,
+        "--kill-after={s}",
+        .{kill_after_text},
+    );
+    defer allocator.free(kill_after_arg);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{
+        "/bin/bash",
+        "-c",
+        ssh_capture_script,
+        "zvmi-ssh-capture",
+        "/usr/bin/timeout",
+        kill_after_arg,
+        timeout_text,
+        "/bin/bash",
+        "-c",
+        timeout_wrapper_script,
+        "zvmi-timeout-wrapper",
+        completion_path,
+        started_path,
+        timeout_path,
+    });
+    try argv.appendSlice(allocator, command_argv);
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv.items,
+        .stdout_limit = .limited(ssh_diagnostic_limit_bytes),
+        .stderr_limit = .limited(ssh_diagnostic_limit_bytes),
+    });
+    errdefer allocator.free(result.stdout);
+    errdefer allocator.free(result.stderr);
+    return .{
+        .operation = operation,
+        .term = result.term,
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+        .timeout_evidence = .{
+            .wrapper_started = try readMarkerExists(
+                io,
+                marker_dir.dir,
+                "started",
+            ),
+            .timeout_marked = try readMarkerExists(
+                io,
+                marker_dir.dir,
+                "timed-out",
+            ),
+            .completed_status = try readCompletionStatus(
+                allocator,
+                io,
+                marker_dir.dir,
+            ),
+        },
+    };
+}
 
 fn runSshCommandAlloc(
     allocator: Allocator,
@@ -312,16 +475,13 @@ fn runSshCommandAlloc(
         .{operation.timeoutSeconds()},
     );
     defer allocator.free(timeout_text);
-    const result = try std.process.run(allocator, io, .{
-        .argv = &.{
-            "/bin/bash",
-            "-c",
-            ssh_capture_script,
-            "zvmi-ssh-capture",
-            "/usr/bin/timeout",
-            "--foreground",
-            "--kill-after=5s",
-            timeout_text,
+    return runTimedCommandAlloc(
+        allocator,
+        io,
+        operation,
+        timeout_text,
+        "5s",
+        &.{
             ssh_path,
             "-i",
             key_path,
@@ -340,15 +500,7 @@ fn runSshCommandAlloc(
             "zvmitest@127.0.0.1",
             command,
         },
-        .stdout_limit = .limited(ssh_diagnostic_limit_bytes),
-        .stderr_limit = .limited(ssh_diagnostic_limit_bytes),
-    });
-    return .{
-        .operation = operation,
-        .term = result.term,
-        .stdout = result.stdout,
-        .stderr = result.stderr,
-    };
+    );
 }
 
 fn diagnosticTail(bytes: []const u8) []const u8 {
@@ -662,19 +814,17 @@ fn waitForQemuExit(
 
 /// The generalized guest contract, which every profile must satisfy
 /// identically. Anything that depends on how the root is stored belongs in
-/// the per-filesystem checks instead. Source rc.conf directly because sysrc(8)
-/// is not part of the retained core contract.
+/// the per-filesystem checks instead.
 const shared_remote_checks =
     \\set -eu
-    \\. /etc/rc.conf
-    \\test "${waagent_enable-}" = YES
-    \\test "${sshd_enable-}" = YES
-    \\test "${nuageinit_enable-}" = YES
-    \\test "${growfs_enable-}" = YES
-    \\test "${growfs_swap_size-}" = 0
-    \\test "${ifconfig_DEFAULT-}" = "SYNCDHCP accept_rtadv"
-    \\test "${ifconfig_hn0-}" = SYNCDHCP
-    \\test "${firstboot_pkg_upgrade_enable-}" = NO
+    \\test "$(/usr/sbin/sysrc -n waagent_enable)" = YES
+    \\test "$(/usr/sbin/sysrc -n sshd_enable)" = YES
+    \\test "$(/usr/sbin/sysrc -n nuageinit_enable)" = YES
+    \\test "$(/usr/sbin/sysrc -n growfs_enable)" = YES
+    \\test "$(/usr/sbin/sysrc -n growfs_swap_size)" = 0
+    \\test "$(/usr/sbin/sysrc -n ifconfig_DEFAULT)" = "SYNCDHCP accept_rtadv"
+    \\test "$(/usr/sbin/sysrc -n ifconfig_hn0)" = SYNCDHCP
+    \\test "$(/usr/sbin/sysrc -n firstboot_pkg_upgrade_enable)" = NO
     \\/usr/local/sbin/pkg info -e azure-agent
     \\! /usr/sbin/pw usershow freebsd >/dev/null 2>&1
     \\/usr/local/bin/sudo -n /usr/bin/awk -F: '$1 == "root" && $2 == "*LOCKED*" { ok=1 } END { exit !ok }' /etc/master.passwd
@@ -711,8 +861,8 @@ const zfs_remote_checks =
     \\root_pool=$(/sbin/mount -p | /usr/bin/awk '$2 == "/" { print $1 }' | /usr/bin/sed 's|/.*||')
     \\test "${root_pool}" = zroot
     \\test "$(/sbin/zpool status -x "${root_pool}")" = "pool '${root_pool}' is healthy"
-    \\test "${zfs_enable-}" = YES
-    \\test "${zpool_reguid-}" = "${root_pool}"
+    \\test "$(/usr/sbin/sysrc -n zfs_enable)" = YES
+    \\test "$(/usr/sbin/sysrc -n zpool_reguid)" = "${root_pool}"
     \\test "$(/sbin/zpool get -H -o value autoexpand "${root_pool}")" = on
     \\test "$(/sbin/zpool list -Hp -o size "${root_pool}")" -ge @MINIMUM_ROOT_BYTES@
     \\test -z "$(/sbin/zfs list -H -o name,org.freebsd:swap -t volume | /usr/bin/awk '$2 == "on" { print $1 }')"
@@ -1076,8 +1226,12 @@ test "static remote checks stay filesystem-specific" {
             checks,
             "8589934592",
         ) != null);
-        try std.testing.expect(std.mem.indexOf(u8, checks, ". /etc/rc.conf") != null);
-        try std.testing.expect(std.mem.indexOf(u8, checks, "sysrc") == null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            checks,
+            "/usr/sbin/sysrc -n waagent_enable",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(u8, checks, ". /etc/rc.conf") == null);
     }
     try std.testing.expect(std.mem.indexOf(u8, ufs, "zpool") == null);
     try std.testing.expect(std.mem.indexOf(u8, zfs, "zpool list -Hp -o size") != null);
@@ -1217,6 +1371,7 @@ test "SSH failure diagnostics identify exit and timeout with bounded streams" {
         .term = .{ .exited = 7 },
         .stdout = try allocator.dupe(u8, "static stdout"),
         .stderr = try allocator.dupe(u8, "static stderr"),
+        .timeout_evidence = .completed(7),
     };
     defer exited.deinit(allocator);
     const exit_diagnostic = try sshFailureDiagnosticAlloc(allocator, exited);
@@ -1234,6 +1389,11 @@ test "SSH failure diagnostics identify exit and timeout with bounded streams" {
         .term = .{ .exited = 124 },
         .stdout = try allocator.alloc(u8, ssh_diagnostic_limit_bytes + 4),
         .stderr = try allocator.dupe(u8, "update stderr"),
+        .timeout_evidence = .{
+            .wrapper_started = true,
+            .timeout_marked = true,
+            .completed_status = null,
+        },
     };
     defer timed_out.deinit(allocator);
     @memset(timed_out.stdout, 'x');
@@ -1249,6 +1409,118 @@ test "SSH failure diagnostics identify exit and timeout with bounded streams" {
     try std.testing.expect(std.mem.indexOf(u8, timeout_diagnostic, "drop") == null);
     try std.testing.expect(std.mem.indexOf(u8, timeout_diagnostic, "keep") != null);
     try std.testing.expect(std.mem.indexOf(u8, timeout_diagnostic, "update stderr") != null);
+}
+
+test "timeout wrapper distinguishes completion, expiry, and SIGKILL escalation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var completed = try runTimedCommandAlloc(
+        allocator,
+        io,
+        .readiness,
+        "2s",
+        "1s",
+        &.{ "/bin/bash", "-c", "exit 0" },
+    );
+    defer completed.deinit(allocator);
+    try std.testing.expect(completed.succeeded());
+    try std.testing.expect(!completed.timedOut());
+    try std.testing.expectEqual(@as(?u8, 0), completed.timeout_evidence.completed_status);
+
+    for ([_]u8{ 124, 137 }) |child_status| {
+        const command = try std.fmt.allocPrint(
+            allocator,
+            "exit {d}",
+            .{child_status},
+        );
+        defer allocator.free(command);
+        var child_exit = try runTimedCommandAlloc(
+            allocator,
+            io,
+            .readiness,
+            "2s",
+            "1s",
+            &.{ "/bin/bash", "-c", command },
+        );
+        defer child_exit.deinit(allocator);
+        try std.testing.expect(!child_exit.succeeded());
+        try std.testing.expect(!child_exit.timedOut());
+        try std.testing.expectEqual(
+            @as(?u8, child_status),
+            child_exit.timeout_evidence.completed_status,
+        );
+        const diagnostic = try sshFailureDiagnosticAlloc(
+            allocator,
+            child_exit,
+        );
+        defer allocator.free(diagnostic);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            diagnostic,
+            "timed out",
+        ) == null);
+        if (child_status == 137) {
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                diagnostic,
+                "failed with exit code 137",
+            ) != null);
+        }
+    }
+
+    var expired = try runTimedCommandAlloc(
+        allocator,
+        io,
+        .readiness,
+        "0.1s",
+        "1s",
+        &.{ "/bin/sleep", "10" },
+    );
+    defer expired.deinit(allocator);
+    try std.testing.expect(expired.timedOut());
+    try std.testing.expect(expired.timeout_evidence.completed_status == null);
+    try std.testing.expectEqual(
+        std.process.Child.Term{ .exited = 124 },
+        expired.term,
+    );
+    const expired_diagnostic = try sshFailureDiagnosticAlloc(
+        allocator,
+        expired,
+    );
+    defer allocator.free(expired_diagnostic);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        expired_diagnostic,
+        "timed out after 15 seconds",
+    ) != null);
+
+    var escalated = try runTimedCommandAlloc(
+        allocator,
+        io,
+        .readiness,
+        "0.1s",
+        "0.1s",
+        &.{
+            "/bin/bash",
+            "-c",
+            "trap '' TERM; while :; do /bin/sleep 1; done",
+        },
+    );
+    defer escalated.deinit(allocator);
+    try std.testing.expect(escalated.timedOut());
+    try std.testing.expect(escalated.timeout_evidence.completed_status == null);
+    try std.testing.expectEqual(@as(?u8, 137), shellStatus(escalated.term));
+    const escalated_diagnostic = try sshFailureDiagnosticAlloc(
+        allocator,
+        escalated,
+    );
+    defer allocator.free(escalated_diagnostic);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        escalated_diagnostic,
+        "timed out after 15 seconds",
+    ) != null);
 }
 
 test "expensive package contract runs once while static evidence repeats" {

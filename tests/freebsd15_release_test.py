@@ -1114,6 +1114,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             "release kernel": "FreeBSD-kernel-generic",
             "virtio and Hyper-V": "FreeBSD-hyperv-tools",
             "rc": "FreeBSD-rc",
+            "sysrc configuration": "FreeBSD-bsdconfig",
             "user and account management": "FreeBSD-runtime",
             "DNS": "FreeBSD-resolvconf",
             "DHCP": "FreeBSD-dhclient",
@@ -1144,6 +1145,18 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                                 if name != package
                             ],
                         )
+
+    def test_core_retains_exact_sysrc_provider_without_broad_sets(self):
+        core = release.PACKAGE_MANIFESTS["core"]
+        self.assertEqual(release.PACKAGE_MANIFEST_REVISION, 2)
+        self.assertIn("FreeBSD-bsdconfig", core["required"])
+        for broad_set in (
+            "FreeBSD-set-base",
+            "FreeBSD-set-devel",
+            "FreeBSD-set-optional",
+        ):
+            self.assertNotIn(broad_set, core["required"])
+            self.assertIn(broad_set, core["excluded"])
 
     def test_verify_package_manifest_rejects_excluded_content(self):
         retained = [{"name": name} for name in release.REQUIRED_PACKAGES]
