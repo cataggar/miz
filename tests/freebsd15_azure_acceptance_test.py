@@ -75,14 +75,40 @@ def test_candidate_key_rejects_unsupported_profiles_fail_closed():
         assert _preflight(key).returncode == 1
 
 
-def test_candidate_manifest_binds_requested_profile():
+def test_candidate_manifest_uses_canonical_validation():
     with open(SCRIPT) as f:
         content = f.read()
+    assert "release.validate_candidate(" in content
+    assert "candidate asset path does not match manifest" in content
+    assert "candidate asset name mismatch" in content
     assert 'doc.get("architecture") != architecture' in content
     assert 'doc.get("filesystem") != filesystem' in content
     assert 'doc.get("flavor") != flavor' in content
     assert '("ufs", "core")' in content
     assert '("zfs", "full")' in content
+    assert "candidate source size is missing or invalid" in content
+    assert "candidate package manifest is missing" in content
+    assert "candidate package installed size is missing or invalid" in content
+    assert 'Path(f"{requested_asset}.packages.txt").resolve(strict=True)' in content
+    assert "release.parse_package_manifest(package_manifest_path)" in content
+    assert "release.verify_package_manifest(flavor, installed_packages)" in content
+    assert "candidate package manifest content does not match" in content
+    assert "candidate package manifest count does not match" in content
+    assert "candidate package manifest installed size does not match" in content
+    assert "candidate validation metadata is missing" in content
+    assert "candidate validation runner does not match profile" in content
+    assert "candidate validation workflow identity mismatch" in content
+
+
+def test_candidate_is_revalidated_before_result_generation():
+    with open(SCRIPT) as f:
+        content = f.read()
+    assert content.count("validate_candidate_binding") >= 3
+    assert "readarray -t result_candidate" in content
+    assert 'test "${result_candidate[0]}" = "$qcow_sha256"' in content
+    assert 'test "${result_candidate[1]}" = "$qcow_bytes"' in content
+    assert 'test "${result_candidate[2]}" = "$virtual_size"' in content
+    assert 'test "${result_candidate[3]}" = "$candidate_architecture"' in content
 
 
 def test_ownership_tags_use_freebsd15():
@@ -190,7 +216,23 @@ def test_gpt_health_and_no_os_disk_swap():
         content = f.read()
     assert '! gpart show "$disk" | grep -q CORRUPT' in content
     assert 'gpart status -s "$disk"' in content
-    assert 'swap found on OS disk: $swap_device' in content
+    assert "require_resource_disk_provider" in content
+    assert '"$resource_disk" = "$disk"' in content
+    assert "swap provider is not positively identified as resource-disk-backed" in content
+
+
+def test_md_backed_root_swap_file_is_rejected():
+    with open(SCRIPT) as f:
+        content = f.read()
+    start = content.index("    md[0-9]*)")
+    end = content.index("      ;;", start)
+    md_checks = content[start:end]
+    assert 'mdconfig -lv -u "$md_unit"' in md_checks
+    assert 'md_backing_mount=$(df -k "$md_backing"' in md_checks
+    assert 'md_backing_device=$(df -k "$md_backing"' in md_checks
+    assert '[ "$md_backing_mount" = / ]' in md_checks
+    assert "swap vnode is backed by the OS/root filesystem" in md_checks
+    assert 'require_resource_disk_provider "$md_backing_provider"' in md_checks
 
 
 def test_clean_shutdown_is_observed():

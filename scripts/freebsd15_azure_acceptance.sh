@@ -242,13 +242,13 @@ mkdir -p "$RESULT_DIR"
 manifest="$CANDIDATE_DIR/candidate.json"
 asset="$CANDIDATE_DIR/$ASSET_NAME"
 
-# Validate candidate binding — architecture, filesystem, flavor, source commit
-readarray -t candidate < <(
+validate_candidate_binding() {
   python3 - "$manifest" "$asset" "$CANDIDATE_KEY" "$SOURCE_COMMIT" \
-    "$ARCHITECTURE" "$FILESYSTEM" "$FLAVOR" <<'PY'
-import json
-import hashlib
+    "$ARCHITECTURE" "$FILESYSTEM" "$FLAVOR" "$ASSET_NAME" \
+    "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" scripts/freebsd15_release.py <<'PY'
+import importlib.util
 import sys
+from pathlib import Path
 
 (
     manifest_path,
@@ -258,12 +258,28 @@ import sys
     architecture,
     filesystem,
     flavor,
+    asset_name,
+    run_id,
+    run_attempt,
+    helper_path,
 ) = sys.argv[1:]
-doc = json.load(open(manifest_path, encoding="utf-8"))
-if doc.get("schema") != 2:
-    raise SystemExit("unsupported candidate schema")
-if doc.get("type") != "zvmi-freebsd15-candidate":
-    raise SystemExit("unexpected candidate type")
+
+helper = Path(helper_path).resolve(strict=True)
+spec = importlib.util.spec_from_file_location("freebsd15_release", helper)
+if spec is None or spec.loader is None:
+    raise SystemExit("could not load canonical candidate validator")
+release = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(release)
+
+doc, canonical_asset = release.validate_candidate(
+    Path(manifest_path).resolve(strict=True),
+    source_commit,
+)
+requested_asset = Path(asset_path).resolve(strict=True)
+if requested_asset != canonical_asset.resolve():
+    raise SystemExit("candidate asset path does not match manifest")
+if requested_asset.name != asset_name or doc.get("asset_name") != asset_name:
+    raise SystemExit("candidate asset name mismatch")
 if doc.get("variant") != key:
     raise SystemExit(f"candidate variant mismatch: expected {key}")
 if doc.get("architecture") != architecture:
@@ -278,21 +294,50 @@ if (filesystem, flavor) not in {
     ("zfs", "full"),
 }:
     raise SystemExit("unsupported candidate filesystem/flavor combination")
-if doc.get("source_commit") != source_commit:
-    raise SystemExit("source commit mismatch")
-# Verify the asset digest
-with open(asset_path, "rb") as f:
-    h = hashlib.sha256()
-    while chunk := f.read(1 << 20):
-        h.update(chunk)
-actual_sha256 = h.hexdigest()
-if actual_sha256 != doc.get("asset_sha256"):
-    raise SystemExit("candidate asset SHA-256 mismatch")
+if not isinstance(doc.get("asset_bytes"), int) or doc["asset_bytes"] <= 0:
+    raise SystemExit("candidate asset size is missing or invalid")
+if not isinstance(doc.get("virtual_size"), int) or doc["virtual_size"] <= 0:
+    raise SystemExit("candidate virtual size is missing or invalid")
+source = doc.get("source")
+if not isinstance(source, dict):
+    raise SystemExit("candidate source metadata is missing")
+if not isinstance(source.get("bytes"), int) or source["bytes"] <= 0:
+    raise SystemExit("candidate source size is missing or invalid")
+packages = doc.get("packages")
+if not isinstance(packages, dict):
+    raise SystemExit("candidate package manifest is missing")
+if not isinstance(packages.get("installed_bytes"), int) or packages["installed_bytes"] <= 0:
+    raise SystemExit("candidate package installed size is missing or invalid")
+package_manifest_path = Path(f"{requested_asset}.packages.txt").resolve(strict=True)
+installed_packages = release.parse_package_manifest(package_manifest_path)
+release.verify_package_manifest(flavor, installed_packages)
+if [package["name"] for package in installed_packages] != packages.get("names"):
+    raise SystemExit("candidate package manifest content does not match")
+if len(installed_packages) != packages.get("count"):
+    raise SystemExit("candidate package manifest count does not match")
+if sum(package["installed_bytes"] for package in installed_packages) != packages["installed_bytes"]:
+    raise SystemExit("candidate package manifest installed size does not match")
+validation = doc.get("validation")
+if not isinstance(validation, dict):
+    raise SystemExit("candidate validation metadata is missing")
+for field in ("qemu_version", "runner", "run_id", "run_attempt"):
+    value = validation.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"candidate validation metadata is missing {field}")
+if validation["runner"] != release.VARIANTS[key]["runner"]:
+    raise SystemExit("candidate validation runner does not match profile")
+if validation["run_id"] != run_id or validation["run_attempt"] != run_attempt:
+    raise SystemExit("candidate validation workflow identity mismatch")
 print(doc["asset_sha256"])
 print(doc["asset_bytes"])
 print(doc["virtual_size"])
 print(doc["architecture"])
 PY
+}
+
+# Canonically validate every candidate field before creating Azure resources.
+readarray -t candidate < <(
+  validate_candidate_binding
 )
 test "${#candidate[@]}" -eq 4
 qcow_sha256=${candidate[0]}
@@ -700,13 +745,48 @@ test -n "$disk"
 ! gpart show "$disk" | grep -q CORRUPT
 test "$(gpart status -s "$disk" | awk '{ print $2 }' | sort -u)" = OK
 
-# no-os-disk-swap: a resource-disk swap is allowed, but never an OS-disk one.
+# no-os-disk-swap: positively identify every swap as resource-disk-backed.
+require_resource_disk_provider() {
+  provider=$1
+  resource_disk=$(printf '%s\n' "$provider" | sed -E 's/p[0-9]+$//')
+  if [ "$resource_disk" = "$provider" ] || [ "$resource_disk" = "$disk" ]; then
+    echo "swap is not backed by a resource-disk partition: $provider" >&2
+    return 1
+  fi
+  diskinfo "/dev/$resource_disk" >/dev/null
+}
+
 swapinfo -k | awk 'NR > 1 { print $1 }' | while IFS= read -r swap_device; do
   test -n "$swap_device" || continue
   swap_provider=$(basename "$(realpath "$swap_device")")
   case "$swap_provider" in
-    "$disk"p[0-9]*)
-      echo "swap found on OS disk: $swap_device" >&2
+    md[0-9]*)
+      md_unit=${swap_provider#md}
+      md_backing=$(mdconfig -lv -u "$md_unit" |
+        awk '$2 == "vnode" {
+          $1 = $2 = $3 = ""
+          sub(/^[[:space:]]+/, "")
+          print
+          exit
+        }')
+      if [ -z "$md_backing" ] || [ ! -f "$md_backing" ]; then
+        echo "swap md provider is not a resolvable vnode: $swap_device" >&2
+        exit 1
+      fi
+      md_backing_mount=$(df -k "$md_backing" | awk 'END { print $6 }')
+      md_backing_device=$(df -k "$md_backing" | awk 'END { print $1 }')
+      if [ "$md_backing_mount" = / ] || [ "${md_backing_device#/dev/}" = "$md_backing_device" ]; then
+        echo "swap vnode is backed by the OS/root filesystem: $md_backing" >&2
+        exit 1
+      fi
+      md_backing_provider=$(basename "$(realpath "$md_backing_device")")
+      require_resource_disk_provider "$md_backing_provider"
+      ;;
+    *p[0-9]*)
+      require_resource_disk_provider "$swap_provider"
+      ;;
+    *)
+      echo "swap provider is not positively identified as resource-disk-backed: $swap_device" >&2
       exit 1
       ;;
   esac
@@ -759,6 +839,14 @@ wait_for_poweroff
 # --- Generate result ---
 azure_accepted_sha256=$(sha256sum "$asset" | awk '{print $1}')
 test "$azure_accepted_sha256" = "$qcow_sha256"
+readarray -t result_candidate < <(
+  validate_candidate_binding
+)
+test "${#result_candidate[@]}" -eq 4
+test "${result_candidate[0]}" = "$qcow_sha256"
+test "${result_candidate[1]}" = "$qcow_bytes"
+test "${result_candidate[2]}" = "$virtual_size"
+test "${result_candidate[3]}" = "$candidate_architecture"
 
 shared_contracts_before_storage="matching-architecture-gen2,key-only-ssh,agent-ready,hn0-dhcp,serial-console"
 shared_contracts_after_storage="root-growth,gpt-healthy,reboot-reconnect,instance-identity"
@@ -793,15 +881,22 @@ else
   # gate. Emit the same deterministic schema for UFS until release integration
   # teaches the helper to validate the filesystem-specific contract list.
   python3 - \
-    "$manifest" "$SOURCE_COMMIT" "$vhd_sha256" "$vhd_bytes" "$AZURE_LOCATION" \
-    "$AZURE_VM_SIZE" "$resource_group" "$contracts" "$GITHUB_RUN_ID" \
-    "$GITHUB_RUN_ATTEMPT" "$RESULT_DIR/azure-result.json" <<'PY'
+    "$CANDIDATE_KEY" "$ARCHITECTURE" "$FILESYSTEM" "$FLAVOR" "$ASSET_NAME" \
+    "$SOURCE_COMMIT" "$qcow_sha256" "$vhd_sha256" "$vhd_bytes" \
+    "$AZURE_LOCATION" "$AZURE_VM_SIZE" "$resource_group" "$contracts" \
+    "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+    "$RESULT_DIR/azure-result.json" <<'PY'
 import json
 import sys
 
 (
-    manifest_path,
+    variant,
+    architecture,
+    filesystem,
+    flavor,
+    asset_name,
     source_commit,
+    qcow_sha256,
     vhd_sha256,
     vhd_bytes,
     location,
@@ -812,21 +907,20 @@ import sys
     run_attempt,
     output_path,
 ) = sys.argv[1:]
-candidate = json.load(open(manifest_path, encoding="utf-8"))
-if candidate.get("filesystem") != "ufs":
+if filesystem != "ufs":
     raise SystemExit("UFS result writer received a non-UFS candidate")
-if candidate.get("flavor") not in {"full", "core"}:
+if flavor not in {"full", "core"}:
     raise SystemExit("UFS result writer received an unsupported flavor")
 document = {
     "schema": 1,
     "type": "zvmi-freebsd15-azure-acceptance",
-    "variant": candidate["variant"],
-    "architecture": candidate["architecture"],
-    "filesystem": candidate["filesystem"],
-    "flavor": candidate["flavor"],
-    "asset_name": candidate["asset_name"],
+    "variant": variant,
+    "architecture": architecture,
+    "filesystem": filesystem,
+    "flavor": flavor,
+    "asset_name": asset_name,
     "source_commit": source_commit,
-    "qcow_sha256": candidate["asset_sha256"],
+    "qcow_sha256": qcow_sha256,
     "derived_vhd_sha256": vhd_sha256,
     "derived_vhd_bytes": int(vhd_bytes),
     "status": "success",
