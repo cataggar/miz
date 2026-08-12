@@ -748,7 +748,7 @@ test "$(gpart status -s "$disk" | awk '{ print $2 }' | sort -u)" = OK
 # no-os-disk-swap: positively identify every swap as resource-disk-backed.
 require_resource_disk_provider() {
   provider=$1
-  resource_disk=$(printf '%s\n' "$provider" | sed -E 's/p[0-9]+$//')
+  resource_disk=$(printf '%s\n' "$provider" | sed -E 's/(p|s)[0-9]+$//')
   if [ "$resource_disk" = "$provider" ] || [ "$resource_disk" = "$disk" ]; then
     echo "swap is not backed by a resource-disk partition: $provider" >&2
     return 1
@@ -763,12 +763,7 @@ swapinfo -k | awk 'NR > 1 { print $1 }' | while IFS= read -r swap_device; do
     md[0-9]*)
       md_unit=${swap_provider#md}
       md_backing=$(mdconfig -lv -u "$md_unit" |
-        awk '$2 == "vnode" {
-          $1 = $2 = $3 = ""
-          sub(/^[[:space:]]+/, "")
-          print
-          exit
-        }')
+        awk -F '	' '$2 == "vnode" { print $4; exit }')
       if [ -z "$md_backing" ] || [ ! -f "$md_backing" ]; then
         echo "swap md provider is not a resolvable vnode: $swap_device" >&2
         exit 1
@@ -782,7 +777,7 @@ swapinfo -k | awk 'NR > 1 { print $1 }' | while IFS= read -r swap_device; do
       md_backing_provider=$(basename "$(realpath "$md_backing_device")")
       require_resource_disk_provider "$md_backing_provider"
       ;;
-    *p[0-9]*)
+    *p[0-9]*|*s[0-9]*)
       require_resource_disk_provider "$swap_provider"
       ;;
     *)

@@ -228,11 +228,58 @@ def test_md_backed_root_swap_file_is_rejected():
     end = content.index("      ;;", start)
     md_checks = content[start:end]
     assert 'mdconfig -lv -u "$md_unit"' in md_checks
+    assert '$2 == "vnode" { print $4; exit }' in md_checks
     assert 'md_backing_mount=$(df -k "$md_backing"' in md_checks
     assert 'md_backing_device=$(df -k "$md_backing"' in md_checks
     assert '[ "$md_backing_mount" = / ]' in md_checks
     assert "swap vnode is backed by the OS/root filesystem" in md_checks
     assert 'require_resource_disk_provider "$md_backing_provider"' in md_checks
+
+
+def test_mdconfig_verbose_parser_uses_only_backing_file_field():
+    fixtures = (
+        (
+            "md0\tvnode\t 2.0G\t/swapfile\troot-swap\tasync,cache,compress\n",
+            "/swapfile",
+        ),
+        (
+            "md7\tvnode\t 1.0G\t/mnt/resource/swap file\tazure swap\t"
+            "cache,readonly,verify\n",
+            "/mnt/resource/swap file",
+        ),
+    )
+    for row, expected in fixtures:
+        result = subprocess.run(
+            ["awk", "-F", "\t", '$2 == "vnode" { print $4; exit }'],
+            input=row,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stdout.rstrip("\n") == expected
+
+
+def test_resource_disk_provider_parser_supports_gpt_and_mbr():
+    fixtures = (
+        ("da1p1", "da1"),
+        ("nda2p3", "nda2"),
+        ("da1s1", "da1"),
+        ("ada2s4", "ada2"),
+    )
+    for provider, expected_disk in fixtures:
+        result = subprocess.run(
+            ["sed", "-E", "s/(p|s)[0-9]+$//"],
+            input=f"{provider}\n",
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stdout.strip() == expected_disk
+
+    with open(SCRIPT) as f:
+        content = f.read()
+    assert "sed -E 's/(p|s)[0-9]+$//'" in content
+    assert "*p[0-9]*|*s[0-9]*)" in content
 
 
 def test_clean_shutdown_is_observed():
