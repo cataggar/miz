@@ -7,8 +7,15 @@ native FAT32 filesystem read/write for ESP-style partitions, native ESP
 bootloader population (copy prebuilt EFI binaries + generate `grub.cfg`/BLS
 text), an Azure-readiness check, an ISO9660 (+Rock Ridge/Joliet) reader paired
 with a native ISO9660 **writer** (deterministic Rock Ridge images with
-both-endian path tables and optional El Torito BIOS/UEFI boot support), and a
-squashfs reader (including
+both-endian path tables and optional El Torito BIOS/UEFI boot support). The ISO
+reader additionally models an existing image well enough for a future
+recustomization to be *safe*: it combines multi-extent file records, parses
+directory-record timestamps and the volume/system/publisher/preparer/application
+identifiers, reads back the El Torito boot record and catalog in full
+(validation entry, default entry, section headers, per-entry fields, image
+extent-to-path mapping), and exposes a **rewrite preflight** that returns a
+precise list of any source construct the writer cannot preserve. There is also
+a squashfs reader (including
 XZ/zstd-compressed squashfs blocks) paired with a native squashfs **writer**
 (deterministic zstd or uncompressed images built from a pull-based tree),
 automatic unwrapping of nested ext4 or
@@ -208,6 +215,42 @@ zvmi build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G \
 zvmi build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 512M --skip-iso-rootfs -o live-minimal.iso
 zvmi build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --dry-run -o live.iso
 ```
+
+### ISO ingestion vs. strict rewrite preservation
+
+The ISO9660 reader operates at two clearly separated support levels, and it is
+worth stating which one a caller relies on:
+
+- **Ingestion support** is what `build-image` and `build-iso` need to *read* a
+  source image: enumerate the tree, resolve Rock Ridge/Joliet names and
+  symlinks, and stream file content (including multi-extent regular files, whose
+  extents are combined transparently so `readFileAlloc`/read-at consume them
+  all). Ingestion tolerates constructs it cannot regenerate as long as the
+  supported subset is still readable.
+- **Strict rewrite support** is what a *recustomizer* (ISO in -> modified ISO
+  out) needs before it may regenerate an image and claim it preserved the
+  source. `Reader.inspectForRewrite` models the writer-preservable metadata --
+  the volume/system/publisher/preparer/application identifiers, per-entry
+  timestamps, and the full El Torito boot catalog with each boot image mapped
+  either to a modeled file path or to an explicit *raw/unmapped extent* -- and
+  returns an ordered, precise list of every source construct the writer cannot
+  preserve. `Reader.requireRewriteSupported` is the strict gate that fails with
+  the first such blocker for CLI diagnostics. Nothing is silently dropped.
+
+  Blockers currently reported include Rock Ridge directory relocation
+  (`CL`/`PL`/`RE`), unmodeled SUSP/RRIP records (device nodes `PN`, sparse files
+  `SF`, and any signature the reader does not model), interleaved files,
+  extended attribute record lengths, multi-extent directories, ambiguous
+  duplicate names, El Torito floppy/hard-disk emulation, El Torito
+  selection-criteria extension records, and boot images that fall outside every
+  modeled file. Genuinely malformed structures (bad El Torito
+  checksum/signature/bounds, invalid media type, a truncated multi-extent chain)
+  are rejected as hard errors rather than listed as features.
+
+The recustomization command itself is not yet wired up; this release lands only
+the reader modeling and the preflight API it will depend on. `build-iso` remains
+a *generated* ISO path (it re-emits the supported subset of the source tree),
+not a byte-preserving rewrite.
 
 ### Boot entries
 
