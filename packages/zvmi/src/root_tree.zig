@@ -3,6 +3,7 @@ const ext4 = @import("ext4.zig");
 const fat32 = @import("fat32.zig");
 const limits_mod = @import("limits.zig");
 const squashfs = @import("squashfs.zig");
+const iso9660 = @import("iso9660.zig");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -1064,6 +1065,68 @@ pub const RootTree = struct {
 
     fn squashfsRead(context: *const anyopaque, index: usize, buffer: []u8, offset: u64) anyerror!usize {
         return squashfsCtx(context).readNodeContentByIndex(index, buffer, offset);
+    }
+
+    /// Adapts this tree to the generic ISO9660 `TreeSource`, so the ISO writer
+    /// can pull nodes without depending on `RootTree` itself. Sort the tree
+    /// (`sortNodes`) beforehand if a specific enumeration order matters; the
+    /// writer re-sorts by path regardless. Node kinds the ISO writer cannot
+    /// represent (hardlink, device, fifo) and metadata it does not model
+    /// (extended attributes) are reported as precise errors rather than being
+    /// silently dropped.
+    pub fn iso9660Source(self: *const RootTree) iso9660.TreeSource {
+        return .{ .context = self, .vtable = &iso9660_vtable };
+    }
+
+    const iso9660_vtable = iso9660.TreeSource.VTable{
+        .root = iso9660Root,
+        .count = iso9660Count,
+        .node = iso9660Node,
+        .read = iso9660Read,
+    };
+
+    fn iso9660Ctx(context: *const anyopaque) *const RootTree {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn iso9660Root(context: *const anyopaque) iso9660.SourceRoot {
+        const self = iso9660Ctx(context);
+        return .{
+            .mode = self.root_metadata.mode,
+            .uid = self.root_metadata.uid,
+            .gid = self.root_metadata.gid,
+            .mtime = self.root_metadata.mtime orelse 0,
+        };
+    }
+
+    fn iso9660Count(context: *const anyopaque) usize {
+        return iso9660Ctx(context).nodes.items.len;
+    }
+
+    fn iso9660Node(context: *const anyopaque, index: usize) anyerror!iso9660.SourceNode {
+        const self = iso9660Ctx(context);
+        const node = self.nodes.items[index];
+        if (node.metadata.xattrs.len != 0) return error.UnsupportedXattrs;
+        const kind: iso9660.SourceKind = switch (node.kind) {
+            .directory => .directory,
+            .file => .file,
+            .symlink => .symlink,
+            .hardlink, .block_device, .char_device, .fifo => return error.UnsupportedNodeKind,
+        };
+        return .{
+            .path = node.path,
+            .kind = kind,
+            .mode = node.metadata.mode,
+            .uid = node.metadata.uid,
+            .gid = node.metadata.gid,
+            .mtime = node.metadata.mtime orelse 0,
+            .size = node.size(),
+            .symlink_target = &.{},
+        };
+    }
+
+    fn iso9660Read(context: *const anyopaque, index: usize, buffer: []u8, offset: u64) anyerror!usize {
+        return iso9660Ctx(context).readNodeContentByIndex(index, buffer, offset);
     }
 
     fn putNode(
@@ -2827,6 +2890,80 @@ test "root tree squashfs adapter rejects node kinds and metadata it cannot repre
         io,
         image_path,
         xattr_tree.squashfsSource(),
+        .{},
+    ));
+}
+
+test "root tree adapts to the iso9660 writer and round-trips through the reader" {
+    const io = std.testing.io;
+    const spool_path = "test-root-tree-iso.spool";
+    const image_path = "test-root-tree-iso.iso";
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+    try tree.putDirectory("boot", .{ .mode = 0o755 });
+    try tree.putFileBytes("boot/grub.cfg", "set timeout=0\n", .{ .mode = 0o644, .uid = 7, .gid = 8 });
+    try tree.putSymlink("boot/alias", "grub.cfg", .{ .mode = 0o777 });
+    try tree.sortNodes();
+
+    _ = try iso9660.writeImagePath(
+        std.testing.allocator,
+        io,
+        image_path,
+        tree.iso9660Source(),
+        .{ .volume_id = "ROOTTREE" },
+    );
+
+    var reader = try iso9660.Reader.openPath(std.testing.allocator, io, image_path);
+    defer reader.close(io);
+    try std.testing.expect(reader.has_rock_ridge);
+
+    const file_index = try reader.lookup("/boot/grub.cfg");
+    const file_entry = reader.getEntry(file_index);
+    try std.testing.expectEqual(@as(u32, 7), file_entry.uid);
+    try std.testing.expectEqual(@as(u32, 8), file_entry.gid);
+    const bytes = try reader.readFileAlloc(std.testing.allocator, io, file_index);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("set timeout=0\n", bytes);
+
+    const link_index = try reader.lookup("/boot/alias");
+    try std.testing.expectEqual(iso9660.EntryKind.symlink, reader.getEntry(link_index).kind);
+    try std.testing.expectEqualStrings("grub.cfg", try reader.readLink(link_index));
+}
+
+test "root tree iso9660 adapter rejects node kinds and metadata it cannot represent" {
+    const io = std.testing.io;
+    const spool_path = "test-root-tree-iso-reject.spool";
+    const image_path = "test-root-tree-iso-reject.iso";
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+    try tree.putFifo("pipe", .{ .mode = 0o644 });
+    try tree.sortNodes();
+
+    try std.testing.expectError(error.UnsupportedNodeKind, iso9660.writeImagePath(
+        std.testing.allocator,
+        io,
+        image_path,
+        tree.iso9660Source(),
+        .{},
+    ));
+
+    var xattr_tree = try RootTree.init(std.testing.allocator, io, spool_path ++ ".x", .{});
+    defer xattr_tree.deinit();
+    defer Io.Dir.cwd().deleteFile(io, spool_path ++ ".x") catch {};
+    const xattrs = [_]ext4.Xattr{.{ .name = "user.test", .value = "v" }};
+    try xattr_tree.putFileBytes("f", "data", .{ .mode = 0o644, .xattrs = &xattrs });
+    try xattr_tree.sortNodes();
+    try std.testing.expectError(error.UnsupportedXattrs, iso9660.writeImagePath(
+        std.testing.allocator,
+        io,
+        image_path,
+        xattr_tree.iso9660Source(),
         .{},
     ));
 }

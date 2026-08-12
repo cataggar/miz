@@ -5,8 +5,10 @@
 Supports `raw`, fixed `vhd`, dynamic `vhd`, `vhdx`, `qcow2`, MBR/GPT partition tables,
 native FAT32 filesystem read/write for ESP-style partitions, native ESP
 bootloader population (copy prebuilt EFI binaries + generate `grub.cfg`/BLS
-text), an Azure-readiness check, **read-only** ISO9660
-(+Rock Ridge/Joliet) and a squashfs reader (including
+text), an Azure-readiness check, an ISO9660 (+Rock Ridge/Joliet) reader paired
+with a native ISO9660 **writer** (deterministic Rock Ridge images with
+both-endian path tables and optional El Torito BIOS/UEFI boot support), and a
+squashfs reader (including
 XZ/zstd-compressed squashfs blocks) paired with a native squashfs **writer**
 (deterministic zstd or uncompressed images built from a pull-based tree),
 automatic unwrapping of nested ext4 or

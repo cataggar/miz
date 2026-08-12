@@ -32,8 +32,10 @@ zvmi/
                               #   BAT, create/pwrite/resize -- QEMU-verified)
         qcow2.zig              # qcow2 codec (header, L1/L2 cluster mapping,
                               #   create/pwrite/resize)
-        iso9660.zig            # ISO9660 **read-only** codec (PVD, Rock
-                              #   Ridge, Joliet)
+        iso9660.zig            # ISO9660 read/write codec (PVD, Rock Ridge,
+                              #   Joliet reader; writer emits deterministic
+                              #   Rock Ridge images with both-endian path
+                              #   tables and optional El Torito boot support)
         squashfs.zig           # squashfs read/write codec (superblock,
                               #   inode/directory/fragment tables, XZ/zstd
                               #   compressed blocks; writer emits zstd or
