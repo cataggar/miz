@@ -204,10 +204,11 @@ fn enterStage(options: BuildIsoOptions, stage: Stage) !void {
 /// runs). Only the two materialization stages build-iso declares are forwarded;
 /// `load_sources` stays emitted directly by `build`, and any unrelated
 /// `build_image` stage is rejected so it cannot leak into build-iso's sequence.
-const MaterializeStageBridge = struct {
+/// `recustomize-iso` shares it (its stage set is identical).
+pub const MaterializeStageBridge = struct {
     sink: StageSink,
 
-    fn advance(context: ?*anyopaque, stage: build_image.Stage) bool {
+    pub fn advance(context: ?*anyopaque, stage: build_image.Stage) bool {
         const self: *MaterializeStageBridge = @ptrCast(@alignCast(context.?));
         const mapped: Stage = switch (stage) {
             .apply_filesystem_changes => .apply_filesystem_changes,
@@ -351,7 +352,14 @@ pub fn build(
     var rootfs_written = false;
     defer if (rootfs_written) Io.Dir.cwd().deleteFile(io, rootfs_scratch) catch {};
     logStep(options, "write ext4 rootfs.img");
-    try writeRootfsImage(allocator, io, rootfs_scratch, &root_tree, report.rootfs_size, options, timestamp);
+    try writeRootfsImage(allocator, io, rootfs_scratch, &root_tree, .{
+        .length = report.rootfs_size,
+        .ext4_label = options.ext4_label,
+        .ext4_journal = options.ext4_journal,
+        .root_selinux_label = options.root_selinux_label,
+        .uuid = resolveRootUuid(io, options.determinism),
+        .timestamp = timestamp,
+    });
     rootfs_written = true;
 
     // 2. Wrap rootfs.img in a native SquashFS at the LiveOS payload path.
@@ -382,6 +390,7 @@ pub fn build(
         rootfs_path_in_iso,
         payload_file,
         payload_size,
+        .{ .uniform = timestamp },
         timestamp,
     );
     defer output_tree.deinit();
@@ -421,14 +430,30 @@ pub fn build(
     return report;
 }
 
-fn writeRootfsImage(
+/// Inputs `writeRootfsImage` needs, independent of any one product's option
+/// struct so `build-iso` and `recustomize-iso` share one ext4 rootfs writer.
+pub const RootfsImageOptions = struct {
+    /// ext4 image length in bytes (already rounded to the block size).
+    length: u64,
+    ext4_label: []const u8,
+    ext4_journal: ext4.JournalOptions,
+    /// SELinux context for the ext4 root inode (a trailing NUL is added), or
+    /// null. An empty or NUL-bearing label is `error.InvalidRootSelinuxLabel`.
+    root_selinux_label: ?[]const u8,
+    /// ext4 filesystem UUID.
+    uuid: [16]u8,
+    /// POSIX-seconds timestamp stamped into the superblock/inodes.
+    timestamp: u32,
+};
+
+/// Writes `root_tree` to a deterministic ext4 image at `path`. Shared by both
+/// ISO pipelines.
+pub fn writeRootfsImage(
     allocator: std.mem.Allocator,
     io: Io,
     path: []const u8,
     root_tree: *root_tree_mod.RootTree,
-    length: u64,
-    options: BuildIsoOptions,
-    timestamp: u32,
+    options: RootfsImageOptions,
 ) !void {
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
@@ -448,24 +473,31 @@ fn writeRootfsImage(
         break :blk &root_xattr_buffer;
     } else &.{};
 
-    const uuid: [16]u8 = if (options.determinism) |d| d.root_filesystem_uuid else blk: {
-        var random_uuid: [16]u8 = undefined;
-        Io.random(io, &random_uuid);
-        break :blk random_uuid;
-    };
-
     _ = try ext4.populate(io, file, allocator, try root_tree.ext4View(), .{
         .offset = 0,
-        .length = length,
+        .length = options.length,
         .label = options.ext4_label,
         .root_xattrs = root_xattrs,
-        .uuid = uuid,
-        .timestamp = timestamp,
+        .uuid = options.uuid,
+        .timestamp = options.timestamp,
         .journal = options.ext4_journal,
     });
 }
 
-fn wrapSquashfsPayload(
+/// Resolves the ext4 root filesystem UUID: the deterministic one when a
+/// `Determinism` is supplied, else a fresh random UUID. Shared so both ISO
+/// pipelines derive it identically.
+pub fn resolveRootUuid(io: Io, determinism: ?Determinism) [16]u8 {
+    if (determinism) |d| return d.root_filesystem_uuid;
+    var random_uuid: [16]u8 = undefined;
+    Io.random(io, &random_uuid);
+    return random_uuid;
+}
+
+/// Wraps a completed ext4 rootfs image in a native SquashFS whose single member
+/// is the ext4 image at `nested_rootfs_path`. Returns the SquashFS byte length.
+/// Shared by both ISO pipelines.
+pub fn wrapSquashfsPayload(
     allocator: std.mem.Allocator,
     io: Io,
     rootfs_path: []const u8,
@@ -488,12 +520,14 @@ fn wrapSquashfsPayload(
     return result.bytes_written;
 }
 
-const FileDigest = struct {
+pub const FileDigest = struct {
     size: u64,
     sha256: [32]u8,
 };
 
-fn hashFile(allocator: std.mem.Allocator, io: Io, path: []const u8) !FileDigest {
+/// Streams `path` and returns its byte length and SHA-256. Shared by both ISO
+/// pipelines to hash sources and outputs.
+pub fn hashFile(allocator: std.mem.Allocator, io: Io, path: []const u8) !FileDigest {
     const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
     defer file.close(io);
 
@@ -631,11 +665,11 @@ fn validateBuildPathIsolation(allocator: std.mem.Allocator, io: Io, options: Bui
     };
 }
 
-fn trimLeadingSlash(path: []const u8) []const u8 {
+pub fn trimLeadingSlash(path: []const u8) []const u8 {
     return if (std.mem.startsWith(u8, path, "/")) path[1..] else path;
 }
 
-fn alignUp(value: u64, alignment: u64) u64 {
+pub fn alignUp(value: u64, alignment: u64) u64 {
     if (alignment == 0) return value;
     const remainder = value % alignment;
     return if (remainder == 0) value else value + (alignment - remainder);
@@ -727,16 +761,31 @@ const NestedRootfsSource = struct {
     }
 };
 
+/// Timestamp policy for a regenerated ISO tree.
+pub const TimestampPolicy = union(enum) {
+    /// Stamp `mtime` into every preserved node and the root. `build-iso` uses
+    /// this (its determinism timestamp, or 0).
+    uniform: i64,
+    /// Preserve each source node's modeled modification time, and the source
+    /// root's. `recustomize-iso` uses this so timestamps survive a rewrite.
+    preserve_source,
+};
+
 /// ISO9660 `TreeSource` over a source ISO's directory tree, with the LiveOS
 /// payload node replaced by the regenerated SquashFS. Boot files and every
 /// other ordinary entry are re-emitted verbatim; the payload's bytes come from
 /// the regenerated SquashFS scratch file instead of the source image.
-const OutputIsoTree = struct {
+///
+/// Shared by `build-iso` (uniform timestamp) and `recustomize-iso` (source
+/// timestamps preserved) so there is one implementation of the tree rewrite.
+pub const OutputIsoTree = struct {
     io: Io,
     reader: *iso9660.Reader,
     payload_file: Io.File,
     payload_size: u64,
-    mtime: i64,
+    policy: TimestampPolicy,
+    root_mtime: i64,
+    replacement_mtime: i64,
     arena: std.heap.ArenaAllocator,
     nodes: []Node,
     payload_index: usize,
@@ -753,19 +802,21 @@ const OutputIsoTree = struct {
         mode: u16,
         uid: u32,
         gid: u32,
+        mtime: i64,
         size: u64,
         symlink_target: []const u8,
         content: Content,
     };
 
-    fn init(
+    pub fn init(
         allocator: std.mem.Allocator,
         io: Io,
         reader: *iso9660.Reader,
         payload_path: []const u8,
         payload_file: Io.File,
         payload_size: u64,
-        timestamp: u32,
+        policy: TimestampPolicy,
+        replacement_mtime: i64,
     ) !OutputIsoTree {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
@@ -784,6 +835,7 @@ const OutputIsoTree = struct {
             .mode = 0o444,
             .uid = 0,
             .gid = 0,
+            .mtime = replacement_mtime,
             .size = payload_size,
             .symlink_target = &.{},
             .content = .replacement,
@@ -794,11 +846,19 @@ const OutputIsoTree = struct {
             .reader = reader,
             .payload_file = payload_file,
             .payload_size = payload_size,
-            .mtime = timestamp,
+            .policy = policy,
+            .root_mtime = reader.getEntry(reader.root_index).mtime,
+            .replacement_mtime = replacement_mtime,
             .arena = arena,
             .nodes = try nodes.toOwnedSlice(),
             .payload_index = payload_index,
         };
+    }
+
+    /// Number of preserved source nodes (every emitted node except the one
+    /// replacement payload node).
+    pub fn preservedNodeCount(self: *const OutputIsoTree) usize {
+        return self.nodes.len - 1;
     }
 
     fn collect(
@@ -828,6 +888,7 @@ const OutputIsoTree = struct {
                         .mode = @truncate(entry.mode & 0o7777),
                         .uid = entry.uid,
                         .gid = entry.gid,
+                        .mtime = entry.mtime,
                         .size = 0,
                         .symlink_target = &.{},
                         .content = .none,
@@ -841,6 +902,7 @@ const OutputIsoTree = struct {
                         .mode = @truncate(entry.mode & 0o7777),
                         .uid = entry.uid,
                         .gid = entry.gid,
+                        .mtime = entry.mtime,
                         .size = entry.size,
                         .symlink_target = &.{},
                         .content = .{ .iso = child.index },
@@ -854,6 +916,7 @@ const OutputIsoTree = struct {
                         .mode = @truncate(entry.mode & 0o7777),
                         .uid = entry.uid,
                         .gid = entry.gid,
+                        .mtime = entry.mtime,
                         .size = target.len,
                         .symlink_target = try a.dupe(u8, target),
                         .content = .none,
@@ -863,12 +926,18 @@ const OutputIsoTree = struct {
         }
     }
 
-    fn deinit(self: *OutputIsoTree) void {
+    pub fn deinit(self: *OutputIsoTree) void {
         self.arena.deinit();
     }
 
     fn source(self: *const OutputIsoTree) iso9660.TreeSource {
         return .{ .context = self, .vtable = &vtable };
+    }
+
+    /// The public `iso9660.TreeSource` view of this rewritten tree, for callers
+    /// (like `recustomize-iso`) that live in another module.
+    pub fn treeSource(self: *const OutputIsoTree) iso9660.TreeSource {
+        return self.source();
     }
 
     const vtable = iso9660.TreeSource.VTable{
@@ -882,7 +951,12 @@ const OutputIsoTree = struct {
         return @ptrCast(@alignCast(context));
     }
     fn rootFn(context: *const anyopaque) iso9660.SourceRoot {
-        return .{ .mode = 0o755, .mtime = ctx(context).mtime };
+        const self = ctx(context);
+        const mtime: i64 = switch (self.policy) {
+            .uniform => |t| t,
+            .preserve_source => self.root_mtime,
+        };
+        return .{ .mode = 0o755, .mtime = mtime };
     }
     fn countFn(context: *const anyopaque) usize {
         return ctx(context).nodes.len;
@@ -890,13 +964,19 @@ const OutputIsoTree = struct {
     fn nodeFn(context: *const anyopaque, index: usize) anyerror!iso9660.SourceNode {
         const self = ctx(context);
         const node = self.nodes[index];
+        const mtime: i64 = if (index == self.payload_index)
+            self.replacement_mtime
+        else switch (self.policy) {
+            .uniform => |t| t,
+            .preserve_source => node.mtime,
+        };
         return .{
             .path = node.path,
             .kind = node.kind,
             .mode = node.mode,
             .uid = node.uid,
             .gid = node.gid,
-            .mtime = self.mtime,
+            .mtime = mtime,
             .size = node.size,
             .symlink_target = node.symlink_target,
         };
@@ -915,6 +995,51 @@ const OutputIsoTree = struct {
         };
     }
 };
+
+/// Counts the source filesystem nodes a rewrite preserves: every node in the
+/// source tree except the single replaced payload at `payload_path` (and the
+/// root, which the writer never counts). This is exactly the value
+/// `OutputIsoTree.preservedNodeCount` reports for the same source and payload,
+/// computed without materializing the replacement so a dry run can report the
+/// real number ahead of building anything. `payload_path` must be given in the
+/// same form passed to `OutputIsoTree.init` (root-relative, no leading slash).
+pub fn countPreservedNodes(
+    allocator: std.mem.Allocator,
+    io: Io,
+    reader: *iso9660.Reader,
+    payload_path: []const u8,
+) !usize {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    return countPreservedNodesRec(arena.allocator(), io, reader, reader.root_index, "", payload_path);
+}
+
+fn countPreservedNodesRec(
+    a: std.mem.Allocator,
+    io: Io,
+    reader: *iso9660.Reader,
+    parent_index: usize,
+    prefix: []const u8,
+    payload_path: []const u8,
+) !usize {
+    var count: usize = 0;
+    const children = try reader.listDirAlloc(a, parent_index);
+    for (children) |child| {
+        const full_path = if (prefix.len == 0)
+            try a.dupe(u8, child.name)
+        else
+            try std.fmt.allocPrint(a, "{s}/{s}", .{ prefix, child.name });
+
+        // Mirror `OutputIsoTree.collect`: skip the replaced payload, count every
+        // other node, and recurse into directories.
+        if (std.ascii.eqlIgnoreCase(full_path, payload_path)) continue;
+        count += 1;
+        if (reader.getEntry(child.index).kind == .directory) {
+            count += try countPreservedNodesRec(a, io, reader, child.index, full_path, payload_path);
+        }
+    }
+    return count;
+}
 
 test {
     std.testing.refAllDecls(@This());

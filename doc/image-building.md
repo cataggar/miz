@@ -23,11 +23,15 @@ squashfs rootfs images discovered inside squashfs payloads (matching LiveOS
 media such as Azure Linux 4.0), local OCI container image ingestion, a minimal
 native ext4 writer/readback library API, COSI output packaging, a
 `zvmi build-image` orchestration path that builds `raw`, fixed-`vhd`, `vhdx`,
-and `qcow2` disk images from an ISO + local OCI layout, and a `zvmi build-iso`
+and `qcow2` disk images from an ISO + local OCI layout, a `zvmi build-iso`
 path that regenerates a customized **LiveOS ISO** from an ISO + local OCI
 layout (a deterministic ext4 `rootfs.img` wrapped in a native SquashFS at the
 LiveOS payload path, folded back into a regenerated ISO with recreated El
-Torito boot entries):
+Torito boot entries), and a strict `zvmi recustomize-iso` path that takes the
+source ISO as authoritative -- preserving its directory tree, node
+metadata/timestamps, volume metadata, and El Torito catalog and replacing only
+the LiveOS payload, or refusing with a precise diagnostic when the source uses
+a feature the native writer cannot losslessly reproduce:
 
 ```
 zvmi create -f vhd disk.vhd 32M                          # dynamic by default (matches qemu-img)
@@ -63,6 +67,8 @@ zvmi build-image --iso azurelinux.iso --container ./oci-layout --size 4G --boot-
 zvmi build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G -o output-live.iso                 # regenerate a customized LiveOS ISO
 zvmi build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --uefi-boot-image boot/grub2/efiboot.img -o output-live.iso
 zvmi build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --source-date-epoch 1735689600 -o output-live.iso   # byte-for-byte reproducible
+zvmi recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G -o recustomized.iso                          # strict preserve-or-refuse ISO rewrite
+zvmi recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --source-date-epoch 1735689600 -o recustomized.iso  # reproducible; source catalog/volume preserved
 zvmi capture --source /dev/sda -O vhd -o captured.vhd   # rebuild an installed system, sized to its content
 zvmi capture --source disk.qcow2 --source-root gpt:2 -O raw -o captured.raw --dry-run
 zvmi qemu AzureLinux
@@ -247,10 +253,12 @@ worth stating which one a caller relies on:
   checksum/signature/bounds, invalid media type, a truncated multi-extent chain)
   are rejected as hard errors rather than listed as features.
 
-The recustomization command itself is not yet wired up; this release lands only
-the reader modeling and the preflight API it will depend on. `build-iso` remains
-a *generated* ISO path (it re-emits the supported subset of the source tree),
-not a byte-preserving rewrite.
+The strict rewrite gate is what `zvmi recustomize-iso` (below) enforces before
+it creates any scratch: a source with any listed blocker is refused with a
+structured diagnostic rather than losslessly rewritten. `build-iso` remains a
+*generated* ISO path (it re-emits the supported subset of the source tree and
+authors a fresh catalog from discovered/`--*-boot-image` paths), whereas
+`recustomize-iso` treats the source ISO as authoritative and preserves it.
 
 ### Boot entries
 
@@ -290,6 +298,94 @@ the regenerated SquashFS payload, rather than on a disk partition. Structural
 tests confirm the source boot files survive, the old payload is replaced, and
 the nested `rootfs.img` opens as ext4 carrying the customized and OCI-overlay
 files; they do **not** assert bootability, which only a real firmware boot can.
+
+## Recustomizing a LiveOS ISO (`recustomize-iso`)
+
+`zvmi recustomize-iso` is the strict **ISO in -> customized ISO out**
+recustomization product. Where `build-iso` *generates* an ISO (re-emitting the
+supported subset of the source tree and authoring a fresh El Torito catalog
+from discovered or `--*-boot-image` paths), `recustomize-iso` treats the source
+ISO as **authoritative** and preserves it. It reuses the exact same customized
+root-tree pipeline (`build_image.materializeCustomizedRootTree`) and the same
+ext4 `rootfs.img` -> SquashFS -> ISO rewrite mechanics as `build-iso`; the
+difference is what it preserves and what it refuses.
+
+```
+zvmi recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G -o recustomized.iso
+zvmi recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --source-date-epoch 1735689600 -o recustomized.iso
+zvmi recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 512M --skip-iso-rootfs -o recustomized-minimal.iso
+zvmi recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --dry-run -o recustomized.iso
+```
+
+### Strict preflight, then preserve-or-refuse
+
+Before any mutation or scratch artifact is created (beyond opening and
+inspecting the source), `recustomize-iso` runs the strict
+`iso9660.Reader.inspectForRewrite` gate. If the source carries **any** feature
+the native writer cannot losslessly reproduce, the command refuses with a
+structured diagnostic naming the blocker's *kind*, affected *path*, boot
+*catalog index*, and *detail* -- and writes no output and no scratch. There is
+no best-effort or silent fallback mode.
+
+The refusal boundaries are exactly the strict-rewrite blockers listed above,
+surfaced through the public API and CLI:
+
+- Rock Ridge directory relocation (`CL`/`PL`/`RE`);
+- unmodeled SUSP/RRIP records (device nodes `PN`, sparse files `SF`, and any
+  unknown signature);
+- interleaved files, extended attribute record lengths, multi-extent
+  directories, and ambiguous duplicate names;
+- El Torito floppy/hard-disk emulation, selection-criteria extension records,
+  and boot images that fall outside every modeled file (an unmapped extent);
+- plus the writer-model boot-catalog mapping limits this product enforces: a
+  boot platform other than BIOS/UEFI, more than one entry per platform, and
+  selection criteria the writer cannot emit.
+
+Genuinely malformed structures (bad El Torito checksum/signature/bounds,
+invalid media type, a truncated multi-extent chain) fail as hard errors.
+
+### What is preserved
+
+When the source is losslessly rewritable, `recustomize-iso`:
+
+1. preserves **every modeled source filesystem node** other than the replaced
+   LiveOS payload -- path/name, file and symlink bytes, POSIX mode/uid/gid, and
+   modeled timestamps;
+2. preserves the **primary volume metadata** (volume/system/volume-set/
+   publisher/preparer/application identifiers) through the writer options, and
+   re-reads them from the completed scratch image to confirm the round-trip
+   *before* it is atomically published (a mismatch fails the build and leaves no
+   output);
+3. reproduces the **supported El Torito catalog exactly** from the inspected
+   source -- the validation entry's platform assignment and 24-byte id string,
+   each section header's platform, order, final-vs-more indicator and 28-byte id
+   string, and every entry's bootable flag, no-emulation type, load segment,
+   system type, and sector count -- mapping each boot entry back to its source
+   tree path, so you never re-specify a boot image and the source layout is
+   preserved rather than normalized; and
+4. replaces **only** the discovered (or `--rootfs-path`-named) LiveOS payload
+   with a native zstd SquashFS wrapping the customized ext4 `rootfs.img`. Source
+   boot and configuration files are untouched unless one of them *is* the
+   payload path.
+
+Because it preserves the source catalog and volume metadata, `recustomize-iso`
+deliberately exposes **no** `--uefi-boot-image`/`--bios-boot-image` or
+`--volume-id` overrides. Everything else `build-iso` exposes -- `--rootfs-path`,
+`--nested-rootfs-path`, `--skip-iso-rootfs`, `--squashfs-compression`,
+`--architecture`, the ext4 options (`--ext4-label`, `--journal`/`--journal-size`,
+`--root-selinux-label`), the OCI and import limits, `--source-date-epoch`,
+`--dry-run`, and `-v` -- is available. Deterministic options produce identical
+bytes from identical source + OCI + options; the output need not be byte-for-byte
+identical to the source, but the preservation is semantically testable.
+
+The machine-readable report (printed by the CLI and emitted as JSON by the
+`addRecustomizeIso` build helper) states the source hash, the output hash and
+size, the source and output volume metadata, the replaced payload path, the
+customized root-tree digest, the preserved node count, the preserved boot
+entry count and platforms, and whether the strict inspection was clean.
+
+**PXE is out of scope** for this feature: `recustomize-iso` only reads an
+optical ISO and writes an optical ISO.
 
 ### Reading a block device
 

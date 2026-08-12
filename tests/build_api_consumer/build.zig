@@ -147,6 +147,26 @@ pub fn build(b: *std.Build) void {
         .generalization = .{ .azure = .{ .reset_hostname = false } },
     });
 
+    // A strict recustomized LiveOS ISO product, configured through the exported
+    // `addRecustomizeIso` helper. Only configured, never built here: this
+    // verifies the preserve-or-refuse API wires and typechecks in an external
+    // consumer, and that it exposes no boot-image/volume-id overrides.
+    _ = zvmi.addRecustomizeIso(b, dependency, .{
+        .name = "recustomized-liveos-fixture",
+        .iso = b.path("fixtures/os.iso"),
+        .container = .{ .oci_layout = pull.layout },
+        .rootfs_size = 256 * 1024 * 1024,
+        .output_basename = "recustomized-liveos-fixture.iso",
+        .rootfs_path_in_iso = "LiveOS/squashfs.img",
+        .squashfs_compression = .zstd,
+        .source_date_epoch = 1_735_689_600,
+        .os = .{
+            .hostname = "recustomized",
+            .users = &.{.{ .name = "admin", .password = .locked }},
+        },
+        .generalization = .{ .azure = .{ .reset_hostname = false } },
+    });
+
     _ = zvmi.addImage(b, dependency, .{
         .name = "cosi-fixture",
         .input = .{
