@@ -16,6 +16,11 @@ on:
         description: Explicit reviewed YYYYMMDD date for a core release; leave blank for UFS/ZFS
         type: string
         required: false
+      validation_only:
+        description: Validate the core release without creating a tag or mutating a GitHub release
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: read
@@ -61,8 +66,20 @@ jobs:
         env:
           RELEASE_SET: ${{ inputs.release_set }}
           CORE_RELEASE_DATE: ${{ inputs.core_release_date }}
+          VALIDATION_ONLY: ${{ inputs.validation_only }}
         run: |
           set -euo pipefail
+          case "$VALIDATION_ONLY" in
+            true|false) ;;
+            *)
+              echo "::error::validation_only must be an explicit boolean"
+              exit 1
+              ;;
+          esac
+          if [[ "$VALIDATION_ONLY" == true && "$RELEASE_SET" != core ]]; then
+            echo "::error::validation_only is only supported for release_set=core"
+            exit 1
+          fi
           matrix=$(python3 scripts/freebsd15_release.py matrix \
             --release-set "$RELEASE_SET")
           azure_matrix=$(python3 scripts/freebsd15_release.py azure-matrix \
@@ -399,8 +416,8 @@ jobs:
         if: always()
         run: rm -rf -- ".release/azure/$CANDIDATE_KEY" "$RESULT_DIR"
 
-  publish:
-    name: verify release-set gate and publish
+  stage:
+    name: verify release-set gate and stage
     needs: [prepare, build, azure_acceptance]
     if: >-
       ${{
@@ -415,7 +432,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
-      contents: write
+      actions: read
+      contents: read
     env:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       RELEASE_SET: ${{ inputs.release_set }}
@@ -425,8 +443,6 @@ jobs:
       CANDIDATES_DIR: .release/freebsd15/candidates
       BASELINE_CANDIDATES_DIR: .release/freebsd15/baseline-candidates
       STAGING_ROOT: .release/freebsd15/staging
-      REPOSITORY: ${{ github.repository }}
-      GH_TOKEN: ${{ github.token }}
       AZURE_RESULTS_DIR: ${{ inputs.release_set != 'ufs' && '.release/freebsd15/azure-results' || '' }}
       AZURE_RESULT: ${{ needs.azure_acceptance.result }}
     steps:
@@ -477,5 +493,105 @@ jobs:
           count=$(find "$AZURE_RESULTS_DIR" -name 'azure-result.json' | wc -l)
           test "$count" -eq 2
 
-      - name: Publish only the exact release-set allowlist
+      - name: Stage and verify only the exact release-set allowlist
+        run: scripts/freebsd15_stage_release.sh
+
+      - name: Upload short-lived validation evidence
+        if: inputs.validation_only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: freebsd15-validation-evidence-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.STAGING_ROOT }}/evidence/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload short-lived publication plan
+        if: inputs.validation_only == false
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: freebsd15-publication-plan-${{ inputs.release_set }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.STAGING_ROOT }}/evidence/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: publish verified release plan
+    needs: [prepare, stage]
+    if: >-
+      ${{
+        always() &&
+        inputs.validation_only == false &&
+        needs.prepare.result == 'success' &&
+        needs.stage.result == 'success'
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: write
+    env:
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      RELEASE_SET: ${{ inputs.release_set }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+      RELEASE_TITLE: ${{ needs.prepare.outputs.release_title }}
+      RELEASE_DATE: ${{ inputs.core_release_date }}
+      CANDIDATES_DIR: .release/freebsd15/candidates
+      BASELINE_CANDIDATES_DIR: .release/freebsd15/baseline-candidates
+      STAGING_ROOT: .release/freebsd15/publication-staging
+      PLAN_DIR: .release/freebsd15/publication-plan
+      REPOSITORY: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      AZURE_RESULTS_DIR: ${{ inputs.release_set != 'ufs' && '.release/freebsd15/azure-results' || '' }}
+    steps:
+      - name: Check out accepted source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Download every non-core build-validated candidate
+        if: inputs.release_set != 'core'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: freebsd15-candidate-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.CANDIDATES_DIR }}
+          merge-multiple: false
+
+      - name: Download exact core publication candidates
+        if: inputs.release_set == 'core'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: freebsd15-candidate-*-ufs-core-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.CANDIDATES_DIR }}
+          merge-multiple: false
+
+      - name: Download exact full UFS baseline candidates
+        if: inputs.release_set == 'core'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: freebsd15-candidate-*-ufs-full-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.BASELINE_CANDIDATES_DIR }}
+          merge-multiple: false
+
+      - name: Download Azure acceptance results
+        if: inputs.release_set == 'zfs' || inputs.release_set == 'core'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: freebsd15-azure-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.AZURE_RESULTS_DIR }}
+          merge-multiple: false
+
+      - name: Download verified publication plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: freebsd15-publication-plan-${{ inputs.release_set }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.PLAN_DIR }}
+
+      - name: Reproduce the verified release plan
+        run: |
+          set -euo pipefail
+          scripts/freebsd15_stage_release.sh
+          diff --recursive --brief "$PLAN_DIR" "$STAGING_ROOT/evidence"
+
+      - name: Mutate the GitHub release from the verified plan
         run: scripts/freebsd15_publish.sh

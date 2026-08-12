@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import types
 import unittest
 from pathlib import Path
@@ -1560,13 +1561,13 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         self.assertEqual(workflow_args, parser_args)
         self.assertIn("--qemu-info", invocation.group(1))
 
-    def test_publish_script_passes_azure_results_for_gated_sets(self):
-        """Static assertion: freebsd15_publish.sh passes --azure-results for
-        ZFS/core and validates AZURE_RESULTS_DIR only when needed."""
-        publish = (
-            Path(release.__file__).resolve().parent / "freebsd15_publish.sh"
+    def test_stage_script_passes_azure_results_for_gated_sets(self):
+        """The mutation-free staging script binds exact Azure results."""
+        stage = (
+            Path(release.__file__).resolve().parent
+            / "freebsd15_stage_release.sh"
         )
-        source = publish.read_text(encoding="utf-8")
+        source = stage.read_text(encoding="utf-8")
         self.assertIn("AZURE_RESULTS_DIR", source)
         self.assertIn("--azure-results", source)
         self.assertIn(
@@ -1574,11 +1575,12 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             source,
         )
 
-    def test_publish_script_builds_and_binds_trusted_core_baseline(self):
-        publish = (
-            Path(release.__file__).resolve().parent / "freebsd15_publish.sh"
+    def test_stage_script_builds_and_binds_trusted_core_baseline(self):
+        stage = (
+            Path(release.__file__).resolve().parent
+            / "freebsd15_stage_release.sh"
         )
-        source = publish.read_text(encoding="utf-8")
+        source = stage.read_text(encoding="utf-8")
         self.assertIn("BASELINE_CANDIDATES_DIR", source)
         self.assertIn("--release-set ufs", source)
         self.assertIn('--candidates "$BASELINE_CANDIDATES_DIR"', source)
@@ -1589,15 +1591,142 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             source,
         )
 
+    def test_staging_and_publish_scripts_have_disjoint_responsibilities(self):
+        scripts = Path(release.__file__).resolve().parent
+        stage = scripts / "freebsd15_stage_release.sh"
+        publish = scripts / "freebsd15_publish.sh"
+        stage_source = stage.read_text(encoding="utf-8")
+        publish_source = publish.read_text(encoding="utf-8")
+        self.assertNotRegex(stage_source, r"\bgh\b")
+        self.assertNotIn("freebsd15_publish.sh", stage_source)
+        self.assertIn("freebsd15_release.py stage", stage_source)
+        self.assertIn("freebsd15_release.py compare", stage_source)
+        self.assertIn("validation evidence allowlist mismatch", stage_source)
+        self.assertIn('gh release create "$RELEASE_TAG"', publish_source)
+        self.assertIn('gh release upload "$RELEASE_TAG"', publish_source)
+        self.assertIn('gh release edit "$RELEASE_TAG"', publish_source)
+        self.assertIn('gh release download "$RELEASE_TAG"', publish_source)
+
+    def test_core_staging_evidence_has_an_exact_bounded_allowlist(self):
+        core_candidates = self.candidates
+        baseline_candidates = self.root / "baseline-candidates"
+        for key in release.RELEASE_SETS["core"]["variants"]:
+            self.make_candidate(key, allocated_size=800, compressed_size=800)
+            self.make_azure_result(key)
+        self.candidates = baseline_candidates
+        try:
+            for key in release.RELEASE_SETS["ufs"]["variants"]:
+                self.make_candidate(
+                    key,
+                    allocated_size=1000,
+                    compressed_size=1000,
+                )
+        finally:
+            self.candidates = core_candidates
+
+        scripts = Path(release.__file__).resolve().parent
+        repository = scripts.parent
+        staging_root = self.root / "staging"
+        summary = self.root / "summary.md"
+        release_tag, release_title = release.release_identity(
+            "core",
+            self.core_release_date,
+        )
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "CANDIDATES_DIR": str(core_candidates),
+                "BASELINE_CANDIDATES_DIR": str(baseline_candidates),
+                "AZURE_RESULTS_DIR": str(self.azure_results),
+                "SOURCE_COMMIT": self.source_commit,
+                "RELEASE_SET": "core",
+                "RELEASE_TAG": release_tag,
+                "RELEASE_TITLE": release_title,
+                "RELEASE_DATE": self.core_release_date,
+                "STAGING_ROOT": str(staging_root),
+                "GITHUB_STEP_SUMMARY": str(summary),
+            }
+        )
+        subprocess.run(
+            [str(scripts / "freebsd15_stage_release.sh")],
+            cwd=repository,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        evidence = staging_root / "evidence"
+        actual = {
+            path.relative_to(evidence).as_posix()
+            for path in evidence.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(
+            actual,
+            {
+                "publish-manifest.json",
+                "release-notes.md",
+                "size-comparison.md",
+                "azure-results/aarch64-ufs-core/azure-result.json",
+                "azure-results/x86_64-ufs-core/azure-result.json",
+            },
+        )
+        self.assertFalse(any(evidence.rglob("*.qcow2")))
+        comparison = (evidence / "size-comparison.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("| aarch64 |", comparison)
+        self.assertIn("| x86_64 |", comparison)
+
+    def test_workflow_validation_mode_cannot_reach_release_mutation(self):
+        workflow = (
+            Path(release.__file__).resolve().parent.parent
+            / ".github"
+            / "workflows"
+            / "freebsd15-release.yml"
+        )
+        source = workflow.read_text(encoding="utf-8")
+        stage_block = source.split("\n  stage:\n", 1)[1].split(
+            "\n  publish:\n", 1
+        )[0]
+        publish_block = source.split("\n  publish:\n", 1)[1]
+        self.assertRegex(
+            source,
+            r"validation_only:\n"
+            r"(?:        .*\n)*?"
+            r"        type: boolean\n"
+            r"        required: true\n"
+            r"        default: false",
+        )
+        self.assertIn(
+            "validation_only is only supported for release_set=core",
+            source,
+        )
+        self.assertIn("needs: [prepare, build, azure_acceptance]", stage_block)
+        self.assertIn("environment: freebsd15-release", source)
+        self.assertIn("scripts/freebsd15_stage_release.sh", stage_block)
+        self.assertIn("if: inputs.validation_only", stage_block)
+        self.assertIn("freebsd15-validation-evidence-", stage_block)
+        self.assertIn("path: ${{ env.STAGING_ROOT }}/evidence/", stage_block)
+        self.assertIn("retention-days: 1", stage_block)
+        self.assertNotIn("contents: write", stage_block)
+        self.assertNotIn("freebsd15_publish.sh", stage_block)
+        self.assertIn("inputs.validation_only == false", publish_block)
+        self.assertIn("needs.stage.result == 'success'", publish_block)
+        self.assertIn("contents: write", publish_block)
+        self.assertIn("scripts/freebsd15_stage_release.sh", publish_block)
+        self.assertIn("scripts/freebsd15_publish.sh", publish_block)
+
     def test_publish_script_requires_reviewed_core_date_and_exact_assets(self):
         publish = (
             Path(release.__file__).resolve().parent / "freebsd15_publish.sh"
         )
         source = publish.read_text(encoding="utf-8")
-        self.assertNotIn("20260730", source)
+        self.assertNotIn("20260812", source)
         self.assertIn("explicit reviewed RELEASE_DATE", source)
         self.assertIn('--release-date "$RELEASE_DATE"', source)
-        self.assertIn('for asset in document["assets"]', source)
+        self.assertIn("for asset in assets", source)
         self.assertIn('gh release create "$RELEASE_TAG"', source)
         self.assertIn("--draft", source)
         self.assertIn("--latest=false", source)

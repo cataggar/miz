@@ -1,25 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -z ${CANDIDATES_DIR:-} || -z ${SOURCE_COMMIT:-} ||
-      -z ${RELEASE_SET:-} || -z ${RELEASE_TAG:-} || -z ${RELEASE_TITLE:-} ||
+if [[ -z ${SOURCE_COMMIT:-} || -z ${RELEASE_SET:-} ||
+      -z ${RELEASE_TAG:-} || -z ${RELEASE_TITLE:-} ||
       -z ${REPOSITORY:-} || -z ${STAGING_ROOT:-} ||
       -z ${GITHUB_STEP_SUMMARY:-} ]]; then
   echo "::error::Required publication configuration is incomplete"
-  exit 1
-fi
-# ZFS and core releases require exact-candidate Azure acceptance results.
-if [[ "$RELEASE_SET" == "zfs" || "$RELEASE_SET" == "core" ]]; then
-  if [[ -z ${AZURE_RESULTS_DIR:-} ]]; then
-    echo "::error::$RELEASE_SET releases require AZURE_RESULTS_DIR"
-    exit 1
-  fi
-fi
-# Core releases require locally staged, same-run full UFS candidates. The
-# publisher derives the baseline manifest from those validated artifacts; it
-# never accepts an external JSON baseline.
-if [[ "$RELEASE_SET" == "core" && -z ${BASELINE_CANDIDATES_DIR:-} ]]; then
-  echo "::error::Core releases require BASELINE_CANDIDATES_DIR"
   exit 1
 fi
 if [[ "$RELEASE_SET" == "core" ]]; then
@@ -40,14 +26,9 @@ done
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
 [[ "$REPOSITORY" == cataggar/zvmi ]]
 
-# The release set is the single source of truth for the tag, the title, and
-# how many assets may be published. Deriving all three from it keeps a
-# dispatch that names the wrong tag from silently publishing the wrong images.
 describe_args=(--release-set "$RELEASE_SET")
-stage_release_date_args=()
 if [[ "$RELEASE_SET" == "core" ]]; then
   describe_args+=(--release-date "$RELEASE_DATE")
-  stage_release_date_args=(--release-date "$RELEASE_DATE")
 fi
 release_description=$(python3 scripts/freebsd15_release.py describe \
   "${describe_args[@]}")
@@ -57,67 +38,77 @@ expected_title=${release_description#*release_title=}
 expected_title=${expected_title%%$'\n'*}
 expected_asset_count=${release_description#*asset_count=}
 expected_asset_count=${expected_asset_count%%$'\n'*}
-minimum_core_reduction=${release_description#*core_minimum_reduction_percent=}
-minimum_core_reduction=${minimum_core_reduction%%$'\n'*}
 [[ "$RELEASE_TAG" == "$expected_tag" ]]
 [[ "$RELEASE_TITLE" == "$expected_title" ]]
 [[ "$expected_asset_count" =~ ^[0-9]+$ ]]
-[[ "$minimum_core_reduction" =~ ^[0-9]+$ ]]
 
-mkdir -p "$STAGING_ROOT"
 assets_dir="$STAGING_ROOT/assets"
 notes_file="$STAGING_ROOT/release-notes.md"
 expected_file="$STAGING_ROOT/expected.tsv"
 release_file="$STAGING_ROOT/release.json"
 verify_dir="$STAGING_ROOT/remote"
-baseline_dir="$STAGING_ROOT/full-ufs-baseline"
-baseline_notes="$STAGING_ROOT/full-ufs-baseline-notes.md"
-rm -rf -- "$assets_dir" "$verify_dir" "$baseline_dir"
+manifest_file="$assets_dir/publish-manifest.json"
+test -d "$assets_dir"
+test -s "$notes_file"
+test -s "$manifest_file"
+rm -rf -- "$verify_dir"
 
-azure_results_args=()
-if [[ "$RELEASE_SET" == "zfs" || "$RELEASE_SET" == "core" ]]; then
-  azure_results_args=(--azure-results "$AZURE_RESULTS_DIR")
-fi
-
-baseline_args=()
-if [[ "$RELEASE_SET" == "core" ]]; then
-  ufs_description=$(python3 scripts/freebsd15_release.py describe \
-    --release-set ufs)
-  ufs_tag=${ufs_description#*release_tag=}
-  ufs_tag=${ufs_tag%%$'\n'*}
-  python3 scripts/freebsd15_release.py stage \
-    --release-set ufs \
-    --candidates "$BASELINE_CANDIDATES_DIR" \
-    --source-commit "$SOURCE_COMMIT" \
-    --release-tag "$ufs_tag" \
-    --output "$baseline_dir" \
-    --notes "$baseline_notes"
-  baseline_args=(
-    --baseline "$baseline_dir/publish-manifest.json"
-    --minimum-core-reduction-percent "$minimum_core_reduction"
-  )
-fi
-
-python3 scripts/freebsd15_release.py stage \
-  --release-set "$RELEASE_SET" \
-  --candidates "$CANDIDATES_DIR" \
-  --source-commit "$SOURCE_COMMIT" \
-  --release-tag "$RELEASE_TAG" \
-  "${stage_release_date_args[@]}" \
-  "${azure_results_args[@]}" \
-  "${baseline_args[@]}" \
-  --output "$assets_dir" \
-  --notes "$notes_file"
-
-python3 - "$assets_dir/publish-manifest.json" >"$expected_file" <<'PY'
+python3 - \
+  "$manifest_file" \
+  "$assets_dir" \
+  "$RELEASE_SET" \
+  "$RELEASE_TAG" \
+  "$SOURCE_COMMIT" \
+  "$expected_asset_count" >"$expected_file" <<'PY'
 import json
+import re
 import sys
+from pathlib import Path
 
-document = json.load(open(sys.argv[1], encoding="utf-8"))
-for asset in document["assets"]:
-    print(f"{asset['asset_name']}\t{asset['sha256']}\t{asset['bytes']}")
+manifest_path, assets_root, release_set, release_tag, source_commit, count = (
+    sys.argv[1:]
+)
+document = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+if document.get("type") != "zvmi-freebsd15-release":
+    raise SystemExit("unexpected publish manifest type")
+if document.get("release_set") != release_set:
+    raise SystemExit("publish manifest release set mismatch")
+if document.get("release_tag") != release_tag:
+    raise SystemExit("publish manifest release tag mismatch")
+if document.get("source_commit") != source_commit:
+    raise SystemExit("publish manifest source commit mismatch")
+assets = document.get("assets")
+if not isinstance(assets, list) or len(assets) != int(count):
+    raise SystemExit("publish manifest asset count mismatch")
+expected_names = set()
+for asset in assets:
+    name = asset.get("asset_name")
+    digest = asset.get("sha256")
+    size = asset.get("bytes")
+    if (
+        not isinstance(name, str)
+        or Path(name).name != name
+        or name in expected_names
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or not isinstance(size, int)
+        or size <= 0
+    ):
+        raise SystemExit("invalid publish manifest asset")
+    expected_names.add(name)
+    print(f"{name}\t{digest}\t{size}")
+actual_names = {
+    path.name for path in Path(assets_root).iterdir() if path.is_file()
+}
+if actual_names != expected_names | {"publish-manifest.json"}:
+    raise SystemExit(f"staged release allowlist mismatch: {actual_names!r}")
 PY
 test "$(wc -l <"$expected_file")" -eq "$expected_asset_count"
+
+while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
+  test "$(sha256sum "$assets_dir/$asset_name" | awk '{print $1}')" = "$expected_sha"
+  test "$(stat --format='%s' "$assets_dir/$asset_name")" = "$expected_bytes"
+done <"$expected_file"
 
 tag_created=false
 release_created=false

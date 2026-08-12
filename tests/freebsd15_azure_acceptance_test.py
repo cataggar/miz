@@ -447,30 +447,31 @@ def test_workflow_azure_acceptance_for_zfs_and_core_only():
 def test_workflow_azure_acceptance_uses_release_set_matrix():
     content = _workflow_content()
     idx = content.index("azure_acceptance:")
-    section = content[idx : content.index("\n  publish:", idx)]
+    section = content[idx : content.index("\n  stage:", idx)]
     assert "fromJSON(needs.prepare.outputs.azure_matrix)" in section
     assert "CANDIDATE_KEY: ${{ matrix.key }}" in section
     assert "AZURE_LOCATION: ${{ vars[matrix.location_variable] }}" in section
     assert "AZURE_VM_SIZE: ${{ vars[matrix.size_variable] }}" in section
 
 
-def test_workflow_publish_depends_on_azure_acceptance():
+def test_workflow_staging_depends_on_azure_and_publish_depends_on_staging():
     content = _workflow_content()
-    idx = content.index("\n  publish:")
-    section = content[idx : idx + 400]
-    assert "azure_acceptance" in section
+    stage = content[content.index("\n  stage:") : content.index("\n  publish:")]
+    publish = content[content.index("\n  publish:") :]
+    assert "needs: [prepare, build, azure_acceptance]" in stage
+    assert "needs: [prepare, stage]" in publish
 
 
-def test_workflow_publish_requires_azure_success_for_gated_sets():
+def test_workflow_staging_requires_azure_success_for_gated_sets():
     content = _workflow_content()
-    idx = content.index("\n  publish:")
+    idx = content.index("\n  stage:")
     section = content[idx : idx + 600]
     assert "needs.azure_acceptance.result == 'success'" in section
 
 
-def test_workflow_publish_allows_skipped_azure_for_non_zfs():
+def test_workflow_staging_allows_skipped_azure_for_ufs():
     content = _workflow_content()
-    idx = content.index("\n  publish:")
+    idx = content.index("\n  stage:")
     section = content[idx : idx + 600]
     assert "inputs.release_set == 'ufs'" in section
 
@@ -478,7 +479,7 @@ def test_workflow_publish_allows_skipped_azure_for_non_zfs():
 def test_workflow_azure_acceptance_uses_oidc():
     content = _workflow_content()
     idx = content.index("azure_acceptance:")
-    section = content[idx : content.index("\n  publish:", idx)]
+    section = content[idx : content.index("\n  stage:", idx)]
     assert "id-token: write" in section
     assert "azure/login@" in section
     assert "environment: freebsd15-release" in section
@@ -488,7 +489,7 @@ def test_workflow_azure_acceptance_uses_oidc():
 def test_workflow_azure_acceptance_uses_harness():
     content = _workflow_content()
     idx = content.index("azure_acceptance:")
-    section = content[idx : content.index("\n  publish:", idx)]
+    section = content[idx : content.index("\n  stage:", idx)]
     assert "scripts/freebsd15_azure_acceptance.sh run" in section
     assert "scripts/freebsd15_azure_acceptance.sh cleanup" in section
 
@@ -502,10 +503,11 @@ def test_workflow_publish_downloads_azure_results_for_zfs_and_core():
     assert "inputs.release_set == 'zfs' || inputs.release_set == 'core'" in section
 
 
-def test_workflow_publish_fail_closed_check():
+def test_workflow_staging_fail_closed_check():
     content = _workflow_content()
-    idx = content.index("\n  publish:")
-    section = content[idx:]
+    section = content[
+        content.index("\n  stage:") : content.index("\n  publish:")
+    ]
     assert 'test "$AZURE_RESULT" = success' in section
     assert 'test "$count" -eq 2' in section
 
@@ -558,6 +560,6 @@ def test_core_release_date_is_explicit_and_not_stale():
 
 def test_ufs_full_does_not_require_azure_results():
     content = _workflow_content()
-    publish = content[content.index("\n  publish:") :]
-    assert "inputs.release_set == 'ufs' ||" in publish
-    assert "inputs.release_set != 'ufs' && '.release/freebsd15/azure-results'" in publish
+    stage = content[content.index("\n  stage:") : content.index("\n  publish:")]
+    assert "inputs.release_set == 'ufs' ||" in stage
+    assert "inputs.release_set != 'ufs' && '.release/freebsd15/azure-results'" in stage
