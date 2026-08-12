@@ -76,8 +76,8 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             source_commit=self.source_commit,
             qemu_version="QEMU emulator version 10.0.2",
             runner=expected["runner"],
-            run_id="1",
-            run_attempt="1",
+            run_id="5001",
+            run_attempt="7",
             output=self.root / "candidate.json",
         )
         arguments.update(overrides)
@@ -197,7 +197,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         candidate_path = self.make_candidate(key)
         candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
         document = {
-            "schema": 1,
+            "schema": release.CANDIDATE_SCHEMA,
             "type": "zvmi-freebsd15-azure-acceptance",
             "variant": key,
             "architecture": release.VARIANTS[key]["architecture"],
@@ -206,14 +206,22 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             "asset_name": release.VARIANTS[key]["asset_name"],
             "source_commit": source_commit or self.source_commit,
             "qcow_sha256": candidate["asset_sha256"],
+            "qcow_virtual_size": candidate["virtual_size"],
+            "qcow_allocated_size": candidate["allocated_size"],
+            "qcow_compressed_size": candidate["compressed_size"],
             "derived_vhd_sha256": "d" * 64,
             "derived_vhd_bytes": 7_340_032,
             "status": "success",
             "location": "eastus2",
             "vm_size": "Standard_D2s_v5",
             "resource_group": "rg-zvmi-release",
-            "contracts": list(release.AZURE_CONTRACTS),
-            "workflow": {"run_id": "101", "run_attempt": "3"},
+            "contracts": list(
+                release.azure_contracts(candidate["filesystem"])
+            ),
+            "workflow": {
+                "run_id": candidate["validation"]["run_id"],
+                "run_attempt": candidate["validation"]["run_attempt"],
+            },
         }
         document.update(overrides)
         result_path = self.azure_results / key / "azure-result.json"
@@ -242,6 +250,12 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         self.assertEqual(
             document["validation"]["qemu_image"]["allocated_size"],
             700,
+        )
+        qemu_info = document["validation"]["qemu_info"]
+        self.assertEqual(qemu_info["name"], "aarch64-ufs-core-qemu-info.json")
+        self.assertEqual(
+            qemu_info["sha256"],
+            release.sha256(path.parent / qemu_info["name"]),
         )
 
     def stage(
@@ -383,7 +397,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         )
 
         document = json.loads(output.read_text(encoding="utf-8"))
-        self.assertEqual(document["schema"], 1)
+        self.assertEqual(document["schema"], release.CANDIDATE_SCHEMA)
         self.assertEqual(document["type"], "zvmi-freebsd15-azure-acceptance")
         self.assertEqual(document["variant"], "x86_64-zfs-full")
         self.assertEqual(document["architecture"], "x86_64")
@@ -395,6 +409,18 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         )
         self.assertEqual(document["source_commit"], self.source_commit)
         self.assertEqual(document["qcow_sha256"], candidate["asset_sha256"])
+        self.assertEqual(
+            document["qcow_virtual_size"],
+            candidate["virtual_size"],
+        )
+        self.assertEqual(
+            document["qcow_allocated_size"],
+            candidate["allocated_size"],
+        )
+        self.assertEqual(
+            document["qcow_compressed_size"],
+            candidate["compressed_size"],
+        )
         self.assertNotIn("azure_accepted_sha256", document)
         self.assertEqual(document["derived_vhd_sha256"], vhd_sha256)
         self.assertEqual(document["derived_vhd_bytes"], vhd_bytes)
@@ -407,11 +433,46 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             document["workflow"], {"run_id": "5001", "run_attempt": "7"}
         )
 
-    def test_azure_result_rejects_non_zfs_variant(self):
+    def test_azure_result_supports_ufs_full_and_core_contracts(self):
+        for key in ("x86_64-ufs-full", "aarch64-ufs-core"):
+            with self.subTest(key=key):
+                candidate_path = self.make_candidate(key)
+                candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+                asset = candidate_path.parent / candidate["asset_name"]
+                output = self.root / f"{key}-azure-result.json"
+                contracts = release.azure_contracts("ufs")
+                release.azure_result_command(
+                    types.SimpleNamespace(
+                        manifest=candidate_path,
+                        asset=asset,
+                        key=key,
+                        source_commit=self.source_commit,
+                        vhd_sha256="f" * 64,
+                        vhd_bytes=1024,
+                        contracts=",".join(contracts),
+                        location="westus3",
+                        vm_size="Standard_D4s_v5",
+                        resource_group="rg-acceptance",
+                        run_id="5001",
+                        run_attempt="7",
+                        output=output,
+                    )
+                )
+                document = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(document["schema"], release.CANDIDATE_SCHEMA)
+                self.assertEqual(document["filesystem"], "ufs")
+                self.assertEqual(document["flavor"], candidate["flavor"])
+                self.assertEqual(document["contracts"], list(contracts))
+                self.assertEqual(
+                    document["qcow_allocated_size"],
+                    candidate["allocated_size"],
+                )
+
+    def test_azure_result_rejects_cross_filesystem_contracts(self):
         candidate_path = self.make_candidate("x86_64-ufs-full")
         candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
         asset = candidate_path.parent / candidate["asset_name"]
-        with self.assertRaisesRegex(ValueError, "zfs"):
+        with self.assertRaisesRegex(ValueError, "contracts"):
             release.azure_result_command(
                 types.SimpleNamespace(
                     manifest=candidate_path,
@@ -572,6 +633,16 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "source commit mismatch"):
             self.stage("zfs")
 
+    def test_zfs_stage_rejects_cross_workflow_azure_result(self):
+        for key in release.RELEASE_SETS["zfs"]["variants"]:
+            self.make_azure_result(key)
+        path = self.azure_results / "x86_64-zfs-full" / "azure-result.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["workflow"]["run_attempt"] = "8"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "workflow identity"):
+            self.stage("zfs")
+
     def test_zfs_stage_rejects_tampered_qcow_digest(self):
         for key in release.RELEASE_SETS["zfs"]["variants"]:
             self.make_azure_result(key)
@@ -581,6 +652,24 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         path.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "QCOW SHA-256"):
             self.stage("zfs")
+
+    def test_zfs_stage_rejects_tampered_qcow_size_binding(self):
+        for field in ("qcow_allocated_size", "qcow_compressed_size"):
+            with self.subTest(field=field):
+                shutil.rmtree(self.candidates, ignore_errors=True)
+                shutil.rmtree(self.azure_results, ignore_errors=True)
+                for key in release.RELEASE_SETS["zfs"]["variants"]:
+                    self.make_azure_result(key)
+                path = (
+                    self.azure_results
+                    / "x86_64-zfs-full"
+                    / "azure-result.json"
+                )
+                document = json.loads(path.read_text(encoding="utf-8"))
+                document[field] += 1
+                path.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "does not match candidate"):
+                    self.stage("zfs")
 
     def test_zfs_stage_rejects_incomplete_contracts(self):
         self.make_azure_result("aarch64-zfs-full")
@@ -705,6 +794,21 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "qemu-img size metadata mismatch"):
             self.stage("core")
 
+    def test_stage_rejects_tampered_qemu_info_input(self):
+        for key in release.RELEASE_SETS["core"]["variants"]:
+            self.make_candidate(key)
+        manifest_path = self.candidates / "aarch64-ufs-core" / "candidate.json"
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        qemu_info = manifest_path.parent / document["validation"]["qemu_info"]["name"]
+        qemu_document = json.loads(qemu_info.read_text(encoding="utf-8"))
+        qemu_document["actual-size"] += 1
+        qemu_info.write_text(json.dumps(qemu_document), encoding="utf-8")
+        with self.assertRaisesRegex(
+            ValueError,
+            "qemu-img validation input mismatch",
+        ):
+            self.stage("core")
+
     def test_stage_rejects_legacy_candidate_schema(self):
         for key in release.RELEASE_SETS["core"]["variants"]:
             self.make_candidate(key)
@@ -727,7 +831,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                 )
             )
 
-    def test_matrix_covers_only_the_selected_release_set(self):
+    def test_matrix_covers_release_assets_and_core_baselines(self):
         for name, selected in release.RELEASE_SETS.items():
             with self.subTest(release_set=name):
                 matrix = json.loads(
@@ -738,7 +842,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     [entry["variant"] for entry in matrix["include"]],
-                    list(selected["variants"]),
+                    list(release.build_variants(name)),
                 )
                 for entry in matrix["include"]:
                     variant = release.VARIANTS[entry["variant"]]
@@ -755,6 +859,12 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                     self.assertTrue(
                         entry["source_url"].endswith("/" + entry["source_name"])
                     )
+                    expected_role = (
+                        "release"
+                        if entry["variant"] in selected["variants"]
+                        else "baseline"
+                    )
+                    self.assertEqual(entry["release_role"], expected_role)
 
     def test_describe_reports_the_selected_release_set(self):
         output = capture(
@@ -763,6 +873,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         self.assertIn("release_tag=FreeBSD-15.1-zfs-20260729\n", output)
         self.assertIn("release_title=FreeBSD 15.1 ZFS - 20260729\n", output)
         self.assertIn("asset_count=2\n", output)
+        self.assertIn("core_minimum_reduction_percent=10\n", output)
 
     def test_release_sets_partition_every_variant_exactly_once(self):
         claimed = [
@@ -953,6 +1064,54 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         self.assertIn("## Installed packages", notes)
         self.assertIn("FreeBSD-openssl-lib", notes)
         self.assertIn("No checksum sidecar assets are published.", notes)
+
+    def test_core_stages_against_same_commit_validated_full_candidates(self):
+        core_candidates = self.candidates
+        baseline_candidates = self.root / "baseline-candidates"
+        baseline_output = self.root / "baseline-output"
+        baseline_notes = self.root / "baseline-notes.md"
+        self.candidates = baseline_candidates
+        try:
+            for key in release.RELEASE_SETS["ufs"]["variants"]:
+                self.make_candidate(
+                    key,
+                    allocated_size=1000,
+                    compressed_size=1000,
+                )
+            release.stage_command(
+                types.SimpleNamespace(
+                    release_set="ufs",
+                    candidates=baseline_candidates,
+                    source_commit=self.source_commit,
+                    release_tag=release.RELEASE_SETS["ufs"]["release_tag"],
+                    azure_results=None,
+                    baseline=None,
+                    minimum_core_reduction_percent=(
+                        release.CORE_MINIMUM_REDUCTION_PERCENT
+                    ),
+                    output=baseline_output,
+                    notes=baseline_notes,
+                )
+            )
+        finally:
+            self.candidates = core_candidates
+        for key in release.RELEASE_SETS["core"]["variants"]:
+            self.make_candidate(
+                key,
+                allocated_size=900,
+                compressed_size=900,
+            )
+        self.stage(
+            "core",
+            baseline=baseline_output / "publish-manifest.json",
+        )
+        manifest = json.loads(
+            (self.output / "publish-manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            [asset["variant"] for asset in manifest["assets"]],
+            list(release.RELEASE_SETS["core"]["variants"]),
+        )
 
     def test_core_candidate_rejects_a_manifest_missing_the_contract(self):
         key = "aarch64-ufs-core"
@@ -1177,6 +1336,40 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         )
         self.assertEqual(harness_args, parser_args)
 
+    def test_workflow_candidate_invocation_matches_parser(self):
+        workflow = (
+            Path(release.__file__).resolve().parent.parent
+            / ".github"
+            / "workflows"
+            / "freebsd15-release.yml"
+        )
+        source = workflow.read_text(encoding="utf-8")
+        invocation = re.search(
+            r"python3 scripts/freebsd15_release\.py candidate\b"
+            r"(.*?)(?:\n          \{|\n\n)",
+            source,
+            re.S,
+        )
+        self.assertIsNotNone(invocation, "candidate invocation not found")
+        workflow_args = sorted(
+            re.findall(
+                r"^\s+--([a-z][-a-z0-9]*)",
+                invocation.group(1),
+                re.M,
+            )
+        )
+        parser_args = sorted(
+            opt.lstrip("-")
+            for action in release.parser()
+            ._subparsers._actions[1]
+            .choices["candidate"]
+            ._actions
+            for opt in action.option_strings
+            if opt.startswith("--") and opt != "--help"
+        )
+        self.assertEqual(workflow_args, parser_args)
+        self.assertIn("--qemu-info", invocation.group(1))
+
     def test_publish_script_passes_azure_results_for_zfs(self):
         """Static assertion: freebsd15_publish.sh passes --azure-results for
         ZFS and validates AZURE_RESULTS_DIR only when needed."""
@@ -1188,6 +1381,21 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         self.assertIn("--azure-results", source)
         # The ZFS conditional must gate the env check.
         self.assertIn('RELEASE_SET" == "zfs"', source)
+
+    def test_publish_script_builds_and_binds_trusted_core_baseline(self):
+        publish = (
+            Path(release.__file__).resolve().parent / "freebsd15_publish.sh"
+        )
+        source = publish.read_text(encoding="utf-8")
+        self.assertIn("BASELINE_CANDIDATES_DIR", source)
+        self.assertIn("--release-set ufs", source)
+        self.assertIn('--candidates "$BASELINE_CANDIDATES_DIR"', source)
+        self.assertIn('--source-commit "$SOURCE_COMMIT"', source)
+        self.assertIn('--baseline "$baseline_dir/publish-manifest.json"', source)
+        self.assertIn(
+            '--minimum-core-reduction-percent "$minimum_core_reduction"',
+            source,
+        )
 
 
 if __name__ == "__main__":

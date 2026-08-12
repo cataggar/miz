@@ -289,18 +289,35 @@ RELEASE_SETS = {
     },
 }
 
-AZURE_CONTRACTS = (
+AZURE_SHARED_CONTRACTS_BEFORE_STORAGE = (
     "matching-architecture-gen2",
     "key-only-ssh",
     "agent-ready",
     "hn0-dhcp",
     "serial-console",
-    "zfs-root",
-    "zpool-healthy",
+)
+AZURE_FILESYSTEM_CONTRACTS = {
+    "ufs": (
+        "ufs-root",
+        "ufs-root-partition-growth",
+        "ufs-root-filesystem-growth",
+        "no-os-disk-swap",
+    ),
+    "zfs": (
+        "zfs-root",
+        "zpool-healthy",
+    ),
+}
+AZURE_SHARED_CONTRACTS_AFTER_STORAGE = (
     "root-growth",
     "gpt-healthy",
     "reboot-reconnect",
     "instance-identity",
+)
+AZURE_CONTRACTS = (
+    *AZURE_SHARED_CONTRACTS_BEFORE_STORAGE,
+    *AZURE_FILESYSTEM_CONTRACTS["zfs"],
+    *AZURE_SHARED_CONTRACTS_AFTER_STORAGE,
 )
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -392,6 +409,23 @@ def release_set(name: str) -> dict:
     return RELEASE_SETS[name]
 
 
+def build_variants(name: str) -> tuple[str, ...]:
+    selected = release_set(name)
+    if name == "core":
+        return (*selected["variants"], *RELEASE_SETS["ufs"]["variants"])
+    return selected["variants"]
+
+
+def azure_contracts(filesystem: str) -> tuple[str, ...]:
+    if filesystem not in AZURE_FILESYSTEM_CONTRACTS:
+        raise ValueError(f"unsupported Azure filesystem contract: {filesystem}")
+    return (
+        *AZURE_SHARED_CONTRACTS_BEFORE_STORAGE,
+        *AZURE_FILESYSTEM_CONTRACTS[filesystem],
+        *AZURE_SHARED_CONTRACTS_AFTER_STORAGE,
+    )
+
+
 def source_url(key: str) -> str:
     variant = VARIANTS[key]
     return (
@@ -469,7 +503,7 @@ def load_qemu_image_info(path: Path, expected_virtual_size: int) -> dict:
 def matrix_command(args: argparse.Namespace) -> None:
     selected = release_set(args.release_set)
     include = []
-    for key in selected["variants"]:
+    for key in build_variants(args.release_set):
         variant = VARIANTS[key]
         include.append(
             {
@@ -484,6 +518,9 @@ def matrix_command(args: argparse.Namespace) -> None:
                 "virtual_size": variant["virtual_size"],
                 "runner": variant["runner"],
                 "qemu": variant["qemu"],
+                "release_role": (
+                    "release" if key in selected["variants"] else "baseline"
+                ),
             }
         )
     print(json.dumps({"include": include}, sort_keys=True))
@@ -494,6 +531,10 @@ def describe_command(args: argparse.Namespace) -> None:
     print(f"release_tag={selected['release_tag']}")
     print(f"release_title={selected['release_title']}")
     print(f"asset_count={len(selected['variants'])}")
+    print(
+        "core_minimum_reduction_percent="
+        f"{CORE_MINIMUM_REDUCTION_PERCENT}"
+    )
 
 
 def candidate_command(args: argparse.Namespace) -> None:
@@ -508,7 +549,10 @@ def candidate_command(args: argparse.Namespace) -> None:
         raise ValueError("validated SHA-256 does not match the candidate")
     if args.virtual_size != expected["virtual_size"]:
         raise ValueError("candidate virtual size does not match the pinned profile")
-    qemu_image = load_qemu_image_info(args.qemu_info, args.virtual_size)
+    qemu_info_path = args.qemu_info.resolve(strict=True)
+    if qemu_info_path.parent != asset.parent:
+        raise ValueError("qemu-img validation input must be beside the candidate")
+    qemu_image = load_qemu_image_info(qemu_info_path, args.virtual_size)
     if args.source_name != expected["source_name"]:
         raise ValueError("source filename does not match the pinned profile")
     if args.source_sha256 != expected["source_sha256"]:
@@ -555,6 +599,10 @@ def candidate_command(args: argparse.Namespace) -> None:
         "validation": {
             "qemu_version": args.qemu_version.strip(),
             "qemu_image": qemu_image,
+            "qemu_info": {
+                "name": qemu_info_path.name,
+                "sha256": sha256(qemu_info_path),
+            },
             "runner": args.runner.strip(),
             "run_id": str(args.run_id),
             "run_attempt": str(args.run_attempt),
@@ -572,8 +620,7 @@ def azure_result_command(args: argparse.Namespace) -> None:
     candidate, asset_path = validate_candidate(manifest_path, args.source_commit)
     if candidate["variant"] != args.key:
         raise ValueError("candidate variant does not match --key")
-    if candidate["filesystem"] != "zfs":
-        raise ValueError("azure-result requires a zfs candidate")
+    expected_contracts = list(azure_contracts(candidate["filesystem"]))
     # Independently verify the asset the caller points to is the same file the
     # candidate manifest describes — the harness may pass a path that differs
     # from the one validate_candidate resolved (same file, different argument).
@@ -587,7 +634,7 @@ def azure_result_command(args: argparse.Namespace) -> None:
         raise ValueError("VHD size must be positive")
     # Validate contracts passed as a comma-separated string.
     provided_contracts = [c.strip() for c in args.contracts.split(",")]
-    if provided_contracts != list(AZURE_CONTRACTS):
+    if provided_contracts != expected_contracts:
         raise ValueError(
             "contracts do not match required Azure contracts"
         )
@@ -599,9 +646,17 @@ def azure_result_command(args: argparse.Namespace) -> None:
         str(args.run_attempt),
         "run_attempt",
     )
+    candidate_workflow = candidate["validation"]
+    if (
+        workflow_run_id != candidate_workflow["run_id"]
+        or workflow_run_attempt != candidate_workflow["run_attempt"]
+    ):
+        raise ValueError(
+            "Azure result workflow identity does not match candidate validation"
+        )
 
     document = {
-        "schema": 1,
+        "schema": CANDIDATE_SCHEMA,
         "type": "zvmi-freebsd15-azure-acceptance",
         "variant": candidate["variant"],
         "architecture": candidate["architecture"],
@@ -610,13 +665,16 @@ def azure_result_command(args: argparse.Namespace) -> None:
         "asset_name": candidate["asset_name"],
         "source_commit": args.source_commit,
         "qcow_sha256": candidate["asset_sha256"],
+        "qcow_virtual_size": candidate["virtual_size"],
+        "qcow_allocated_size": candidate["allocated_size"],
+        "qcow_compressed_size": candidate["compressed_size"],
         "derived_vhd_sha256": args.vhd_sha256,
         "derived_vhd_bytes": args.vhd_bytes,
         "status": "success",
         "location": location,
         "vm_size": vm_size,
         "resource_group": resource_group,
-        "contracts": list(AZURE_CONTRACTS),
+        "contracts": expected_contracts,
         "workflow": {
             "run_id": workflow_run_id,
             "run_attempt": workflow_run_attempt,
@@ -674,6 +732,30 @@ def validate_candidate(
     }
     if qemu_image != expected_qemu_image:
         raise ValueError(f"{manifest_path}: qemu-img size metadata mismatch")
+    qemu_info = validation.get("qemu_info")
+    if not isinstance(qemu_info, dict):
+        raise ValueError(f"{manifest_path}: qemu-img validation input is missing")
+    qemu_info_name = qemu_info.get("name")
+    if (
+        not isinstance(qemu_info_name, str)
+        or not qemu_info_name
+        or Path(qemu_info_name).name != qemu_info_name
+    ):
+        raise ValueError(f"{manifest_path}: invalid qemu-img validation input name")
+    require_sha256(
+        qemu_info.get("sha256", ""),
+        f"{manifest_path}: qemu-img validation input SHA-256",
+    )
+    qemu_info_path = manifest_path.parent / qemu_info_name
+    if not qemu_info_path.is_file():
+        raise ValueError(f"{manifest_path}: qemu-img validation input is missing")
+    if sha256(qemu_info_path) != qemu_info["sha256"]:
+        raise ValueError(f"{manifest_path}: qemu-img validation input mismatch")
+    if load_qemu_image_info(
+        qemu_info_path,
+        document["virtual_size"],
+    ) != qemu_image:
+        raise ValueError(f"{manifest_path}: qemu-img validation input changed")
     for source_key in ("name", "sha256"):
         if document["source"][source_key] != expected[f"source_{source_key}"]:
             raise ValueError(
@@ -926,7 +1008,7 @@ def stage_command(args: argparse.Namespace) -> None:
         azure_by_variant = {}
         for azure_manifest in azure_manifests:
             document = json.loads(azure_manifest.read_text(encoding="utf-8"))
-            if document.get("schema") != 1:
+            if document.get("schema") != CANDIDATE_SCHEMA:
                 raise ValueError(f"{azure_manifest}: unsupported schema")
             if document.get("type") != "zvmi-freebsd15-azure-acceptance":
                 raise ValueError(f"{azure_manifest}: unexpected azure result type")
@@ -957,6 +1039,11 @@ def stage_command(args: argparse.Namespace) -> None:
                 raise ValueError(
                     f"{azure_manifest}: QCOW SHA-256 does not match candidate"
                 )
+            for field in ("virtual_size", "allocated_size", "compressed_size"):
+                if document.get(f"qcow_{field}") != candidate[field]:
+                    raise ValueError(
+                        f"{azure_manifest}: QCOW {field} does not match candidate"
+                    )
             if document.get("status") != "success":
                 raise ValueError(f"{azure_manifest}: status is not success")
             derived_vhd_bytes = document.get("derived_vhd_bytes")
@@ -974,18 +1061,31 @@ def stage_command(args: argparse.Namespace) -> None:
                 document.get("resource_group", ""),
                 "resource_group",
             )
-            if document.get("contracts") != list(AZURE_CONTRACTS):
+            if document.get("contracts") != list(
+                azure_contracts(candidate["filesystem"])
+            ):
                 raise ValueError(
                     f"{azure_manifest}: contracts do not match required Azure contracts"
                 )
             workflow = document.get("workflow")
             if not isinstance(workflow, dict):
                 raise ValueError(f"{azure_manifest}: workflow is missing")
-            require_non_empty(str(workflow.get("run_id", "")), "run_id")
-            require_non_empty(
+            workflow_run_id = require_non_empty(
+                str(workflow.get("run_id", "")),
+                "run_id",
+            )
+            workflow_run_attempt = require_non_empty(
                 str(workflow.get("run_attempt", "")),
                 "run_attempt",
             )
+            candidate_workflow = candidate["validation"]
+            if (
+                workflow_run_id != candidate_workflow["run_id"]
+                or workflow_run_attempt != candidate_workflow["run_attempt"]
+            ):
+                raise ValueError(
+                    f"{azure_manifest}: workflow identity does not match candidate"
+                )
             azure_by_variant[key] = document
         if set(azure_by_variant) != set(wanted):
             raise ValueError(

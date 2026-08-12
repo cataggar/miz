@@ -294,8 +294,10 @@ if (filesystem, flavor) not in {
     ("zfs", "full"),
 }:
     raise SystemExit("unsupported candidate filesystem/flavor combination")
-if not isinstance(doc.get("asset_bytes"), int) or doc["asset_bytes"] <= 0:
-    raise SystemExit("candidate asset size is missing or invalid")
+if not isinstance(doc.get("compressed_size"), int) or doc["compressed_size"] <= 0:
+    raise SystemExit("candidate compressed size is missing or invalid")
+if not isinstance(doc.get("allocated_size"), int) or doc["allocated_size"] <= 0:
+    raise SystemExit("candidate allocated size is missing or invalid")
 if not isinstance(doc.get("virtual_size"), int) or doc["virtual_size"] <= 0:
     raise SystemExit("candidate virtual size is missing or invalid")
 source = doc.get("source")
@@ -329,7 +331,8 @@ if validation["runner"] != release.VARIANTS[key]["runner"]:
 if validation["run_id"] != run_id or validation["run_attempt"] != run_attempt:
     raise SystemExit("candidate validation workflow identity mismatch")
 print(doc["asset_sha256"])
-print(doc["asset_bytes"])
+print(doc["compressed_size"])
+print(doc["allocated_size"])
 print(doc["virtual_size"])
 print(doc["architecture"])
 PY
@@ -339,13 +342,15 @@ PY
 readarray -t candidate < <(
   validate_candidate_binding
 )
-test "${#candidate[@]}" -eq 4
+test "${#candidate[@]}" -eq 5
 qcow_sha256=${candidate[0]}
 qcow_bytes=${candidate[1]}
-virtual_size=${candidate[2]}
-candidate_architecture=${candidate[3]}
+qcow_allocated_size=${candidate[2]}
+virtual_size=${candidate[3]}
+candidate_architecture=${candidate[4]}
 [[ "$qcow_sha256" =~ ^[0-9a-f]{64}$ ]]
 [[ "$qcow_bytes" =~ ^[0-9]+$ ]]
+[[ "$qcow_allocated_size" =~ ^[0-9]+$ ]]
 [[ "$virtual_size" =~ ^[0-9]+$ ]]
 [[ "$candidate_architecture" == "$ARCHITECTURE" ]]
 
@@ -837,11 +842,12 @@ test "$azure_accepted_sha256" = "$qcow_sha256"
 readarray -t result_candidate < <(
   validate_candidate_binding
 )
-test "${#result_candidate[@]}" -eq 4
+test "${#result_candidate[@]}" -eq 5
 test "${result_candidate[0]}" = "$qcow_sha256"
 test "${result_candidate[1]}" = "$qcow_bytes"
-test "${result_candidate[2]}" = "$virtual_size"
-test "${result_candidate[3]}" = "$candidate_architecture"
+test "${result_candidate[2]}" = "$qcow_allocated_size"
+test "${result_candidate[3]}" = "$virtual_size"
+test "${result_candidate[4]}" = "$candidate_architecture"
 
 shared_contracts_before_storage="matching-architecture-gen2,key-only-ssh,agent-ready,hn0-dhcp,serial-console"
 shared_contracts_after_storage="root-growth,gpt-healthy,reboot-reconnect,instance-identity"
@@ -856,83 +862,20 @@ case "$FILESYSTEM" in
 esac
 contracts="$shared_contracts_before_storage,$filesystem_contracts,$shared_contracts_after_storage"
 
-if [[ "$FILESYSTEM" == zfs ]]; then
-  python3 scripts/freebsd15_release.py azure-result \
-    --manifest "$manifest" \
-    --asset "$asset" \
-    --key "$CANDIDATE_KEY" \
-    --source-commit "$SOURCE_COMMIT" \
-    --location "$AZURE_LOCATION" \
-    --vm-size "$AZURE_VM_SIZE" \
-    --resource-group "$resource_group" \
-    --vhd-sha256 "$vhd_sha256" \
-    --vhd-bytes "$vhd_bytes" \
-    --contracts "$contracts" \
-    --run-id "$GITHUB_RUN_ID" \
-    --run-attempt "$GITHUB_RUN_ATTEMPT" \
-    --output "$RESULT_DIR/azure-result.json"
-else
-  # The shared release helper currently accepts only the already-wired ZFS
-  # gate. Emit the same deterministic schema for UFS until release integration
-  # teaches the helper to validate the filesystem-specific contract list.
-  python3 - \
-    "$CANDIDATE_KEY" "$ARCHITECTURE" "$FILESYSTEM" "$FLAVOR" "$ASSET_NAME" \
-    "$SOURCE_COMMIT" "$qcow_sha256" "$vhd_sha256" "$vhd_bytes" \
-    "$AZURE_LOCATION" "$AZURE_VM_SIZE" "$resource_group" "$contracts" \
-    "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
-    "$RESULT_DIR/azure-result.json" <<'PY'
-import json
-import sys
-
-(
-    variant,
-    architecture,
-    filesystem,
-    flavor,
-    asset_name,
-    source_commit,
-    qcow_sha256,
-    vhd_sha256,
-    vhd_bytes,
-    location,
-    vm_size,
-    resource_group,
-    contracts,
-    run_id,
-    run_attempt,
-    output_path,
-) = sys.argv[1:]
-if filesystem != "ufs":
-    raise SystemExit("UFS result writer received a non-UFS candidate")
-if flavor not in {"full", "core"}:
-    raise SystemExit("UFS result writer received an unsupported flavor")
-document = {
-    "schema": 1,
-    "type": "zvmi-freebsd15-azure-acceptance",
-    "variant": variant,
-    "architecture": architecture,
-    "filesystem": filesystem,
-    "flavor": flavor,
-    "asset_name": asset_name,
-    "source_commit": source_commit,
-    "qcow_sha256": qcow_sha256,
-    "derived_vhd_sha256": vhd_sha256,
-    "derived_vhd_bytes": int(vhd_bytes),
-    "status": "success",
-    "location": location,
-    "vm_size": vm_size,
-    "resource_group": resource_group,
-    "contracts": contracts.split(","),
-    "workflow": {
-        "run_id": run_id,
-        "run_attempt": run_attempt,
-    },
-}
-with open(output_path, "w", encoding="utf-8") as output:
-    json.dump(document, output, indent=2, sort_keys=True)
-    output.write("\n")
-PY
-fi
+python3 scripts/freebsd15_release.py azure-result \
+  --manifest "$manifest" \
+  --asset "$asset" \
+  --key "$CANDIDATE_KEY" \
+  --source-commit "$SOURCE_COMMIT" \
+  --location "$AZURE_LOCATION" \
+  --vm-size "$AZURE_VM_SIZE" \
+  --resource-group "$resource_group" \
+  --vhd-sha256 "$vhd_sha256" \
+  --vhd-bytes "$vhd_bytes" \
+  --contracts "$contracts" \
+  --run-id "$GITHUB_RUN_ID" \
+  --run-attempt "$GITHUB_RUN_ATTEMPT" \
+  --output "$RESULT_DIR/azure-result.json"
 
 # Final source-digest assertion
 test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
