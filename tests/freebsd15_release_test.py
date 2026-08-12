@@ -236,7 +236,8 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             "qcow_allocated_size": candidate["allocated_size"],
             "qcow_compressed_size": candidate["compressed_size"],
             "derived_vhd_sha256": "d" * 64,
-            "derived_vhd_bytes": 7_340_032,
+            "derived_vhd_bytes": 7_340_544,
+            "derived_vhd_current_size": 7_340_032,
             "status": "success",
             "location": "eastus2",
             "vm_size": "Standard_D2s_v5",
@@ -387,6 +388,11 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             self.assertEqual(asset["azure"]["vm_size"], "Standard_D2s_v5")
             self.assertGreater(asset["azure"]["derived_vhd_bytes"], 0)
             self.assertEqual(
+                asset["azure"]["derived_vhd_bytes"],
+                asset["azure"]["derived_vhd_current_size"]
+                + release.VHD_FOOTER_BYTES,
+            )
+            self.assertEqual(
                 asset["azure"]["contracts"],
                 list(release.AZURE_CONTRACTS),
             )
@@ -414,7 +420,8 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         asset = candidate_path.parent / candidate["asset_name"]
         output = self.root / "azure-result.json"
         vhd_sha256 = "f" * 64
-        vhd_bytes = 8_388_608
+        vhd_current_size = 8 * release.AZURE_VHD_ALIGNMENT
+        vhd_bytes = vhd_current_size + release.VHD_FOOTER_BYTES
         contracts = ",".join(release.AZURE_CONTRACTS)
 
         release.azure_result_command(
@@ -425,6 +432,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                 source_commit=self.source_commit,
                 vhd_sha256=vhd_sha256,
                 vhd_bytes=vhd_bytes,
+                vhd_current_size=vhd_current_size,
                 contracts=contracts,
                 location="westus3",
                 vm_size="Standard_D4s_v5",
@@ -463,6 +471,10 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         self.assertNotIn("azure_accepted_sha256", document)
         self.assertEqual(document["derived_vhd_sha256"], vhd_sha256)
         self.assertEqual(document["derived_vhd_bytes"], vhd_bytes)
+        self.assertEqual(
+            document["derived_vhd_current_size"],
+            vhd_current_size,
+        )
         self.assertEqual(document["status"], "success")
         self.assertEqual(document["location"], "westus3")
         self.assertEqual(document["vm_size"], "Standard_D4s_v5")
@@ -487,7 +499,9 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                         key=key,
                         source_commit=self.source_commit,
                         vhd_sha256="f" * 64,
-                        vhd_bytes=1024,
+                        vhd_bytes=release.AZURE_VHD_ALIGNMENT
+                        + release.VHD_FOOTER_BYTES,
+                        vhd_current_size=release.AZURE_VHD_ALIGNMENT,
                         contracts=",".join(contracts),
                         location="westus3",
                         vm_size="Standard_D4s_v5",
@@ -519,7 +533,9 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                     key="x86_64-ufs-full",
                     source_commit=self.source_commit,
                     vhd_sha256="f" * 64,
-                    vhd_bytes=1024,
+                    vhd_bytes=release.AZURE_VHD_ALIGNMENT
+                    + release.VHD_FOOTER_BYTES,
+                    vhd_current_size=release.AZURE_VHD_ALIGNMENT,
                     contracts=",".join(release.AZURE_CONTRACTS),
                     location="westus3",
                     vm_size="Standard_D4s_v5",
@@ -542,7 +558,9 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                     key="aarch64-zfs-full",
                     source_commit=self.source_commit,
                     vhd_sha256="f" * 64,
-                    vhd_bytes=1024,
+                    vhd_bytes=release.AZURE_VHD_ALIGNMENT
+                    + release.VHD_FOOTER_BYTES,
+                    vhd_current_size=release.AZURE_VHD_ALIGNMENT,
                     contracts=",".join(release.AZURE_CONTRACTS),
                     location="westus3",
                     vm_size="Standard_D4s_v5",
@@ -565,7 +583,9 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                     key="x86_64-zfs-full",
                     source_commit=self.source_commit,
                     vhd_sha256="not-a-sha",
-                    vhd_bytes=1024,
+                    vhd_bytes=release.AZURE_VHD_ALIGNMENT
+                    + release.VHD_FOOTER_BYTES,
+                    vhd_current_size=release.AZURE_VHD_ALIGNMENT,
                     contracts=",".join(release.AZURE_CONTRACTS),
                     location="westus3",
                     vm_size="Standard_D4s_v5",
@@ -588,7 +608,9 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                     key="x86_64-zfs-full",
                     source_commit=self.source_commit,
                     vhd_sha256="f" * 64,
-                    vhd_bytes=1024,
+                    vhd_bytes=release.AZURE_VHD_ALIGNMENT
+                    + release.VHD_FOOTER_BYTES,
+                    vhd_current_size=release.AZURE_VHD_ALIGNMENT,
                     contracts="key-only-ssh,agent-ready",
                     location="westus3",
                     vm_size="Standard_D4s_v5",
@@ -611,7 +633,9 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                     key="x86_64-zfs-full",
                     source_commit=self.source_commit,
                     vhd_sha256="f" * 64,
-                    vhd_bytes=1024,
+                    vhd_bytes=release.AZURE_VHD_ALIGNMENT
+                    + release.VHD_FOOTER_BYTES,
+                    vhd_current_size=release.AZURE_VHD_ALIGNMENT,
                     contracts=",".join(release.AZURE_CONTRACTS),
                     location="",
                     vm_size="Standard_D4s_v5",
@@ -638,6 +662,11 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             self.assertEqual(asset["azure"]["location"], "eastus2")
             self.assertEqual(asset["azure"]["vm_size"], "Standard_D2s_v5")
             self.assertGreater(asset["azure"]["derived_vhd_bytes"], 0)
+            self.assertEqual(
+                asset["azure"]["derived_vhd_bytes"],
+                asset["azure"]["derived_vhd_current_size"]
+                + release.VHD_FOOTER_BYTES,
+            )
             self.assertEqual(
                 asset["azure"]["contracts"],
                 list(release.AZURE_CONTRACTS),
@@ -670,6 +699,16 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         document["source_commit"] = "b" * 40
         path.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "source commit mismatch"):
+            self.stage("zfs")
+
+    def test_zfs_stage_rejects_inconsistent_vhd_current_size_evidence(self):
+        for key in release.RELEASE_SETS["zfs"]["variants"]:
+            self.make_azure_result(key)
+        path = self.azure_results / "x86_64-zfs-full" / "azure-result.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["derived_vhd_current_size"] += release.AZURE_VHD_ALIGNMENT
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "size evidence"):
             self.stage("zfs")
 
     def test_zfs_stage_rejects_cross_workflow_azure_result(self):

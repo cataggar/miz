@@ -8,6 +8,11 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
+try:
+    from scripts.azure_vhd import AZURE_VHD_ALIGNMENT, VHD_FOOTER_BYTES
+except ModuleNotFoundError:
+    from azure_vhd import AZURE_VHD_ALIGNMENT, VHD_FOOTER_BYTES
+
 
 # One entry per architecture x root filesystem x flavor the FreeBSD builder
 # can produce. These values duplicate the Zig builder's profile table on
@@ -710,8 +715,12 @@ def azure_result_command(args: argparse.Namespace) -> None:
         if actual_asset_sha256 != candidate["asset_sha256"]:
             raise ValueError("--asset does not match the candidate digest")
     require_sha256(args.vhd_sha256, "VHD SHA-256")
-    if args.vhd_bytes <= 0:
-        raise ValueError("VHD size must be positive")
+    if (
+        args.vhd_current_size <= 0
+        or args.vhd_current_size % AZURE_VHD_ALIGNMENT != 0
+        or args.vhd_bytes != args.vhd_current_size + VHD_FOOTER_BYTES
+    ):
+        raise ValueError("VHD size evidence is inconsistent")
     # Validate contracts passed as a comma-separated string.
     provided_contracts = [c.strip() for c in args.contracts.split(",")]
     if provided_contracts != expected_contracts:
@@ -750,6 +759,7 @@ def azure_result_command(args: argparse.Namespace) -> None:
         "qcow_compressed_size": candidate["compressed_size"],
         "derived_vhd_sha256": args.vhd_sha256,
         "derived_vhd_bytes": args.vhd_bytes,
+        "derived_vhd_current_size": args.vhd_current_size,
         "status": "success",
         "location": location,
         "vm_size": vm_size,
@@ -1082,6 +1092,8 @@ def release_notes(
                     f"`{azure['derived_vhd_sha256']}`",
                     f"  - Derived VHD size: "
                     f"{azure['derived_vhd_bytes']} bytes",
+                    f"  - Derived VHD current size: "
+                    f"{azure['derived_vhd_current_size']} bytes",
                     "  - Passed contracts: "
                     + ", ".join(
                         f"`{contract}`" for contract in azure["contracts"]
@@ -1226,9 +1238,19 @@ def stage_command(args: argparse.Namespace) -> None:
             if document.get("status") != "success":
                 raise ValueError(f"{azure_manifest}: status is not success")
             derived_vhd_bytes = document.get("derived_vhd_bytes")
-            if not isinstance(derived_vhd_bytes, int) or derived_vhd_bytes <= 0:
+            derived_vhd_current_size = document.get(
+                "derived_vhd_current_size"
+            )
+            if (
+                not isinstance(derived_vhd_bytes, int)
+                or not isinstance(derived_vhd_current_size, int)
+                or derived_vhd_current_size <= 0
+                or derived_vhd_current_size % AZURE_VHD_ALIGNMENT != 0
+                or derived_vhd_bytes
+                != derived_vhd_current_size + VHD_FOOTER_BYTES
+            ):
                 raise ValueError(
-                    f"{azure_manifest}: derived VHD size must be positive"
+                    f"{azure_manifest}: derived VHD size evidence is inconsistent"
                 )
             require_sha256(
                 document.get("derived_vhd_sha256", ""),
@@ -1291,6 +1313,9 @@ def stage_command(args: argparse.Namespace) -> None:
                 "vm_size": azure["vm_size"],
                 "derived_vhd_sha256": azure["derived_vhd_sha256"],
                 "derived_vhd_bytes": azure["derived_vhd_bytes"],
+                "derived_vhd_current_size": azure[
+                    "derived_vhd_current_size"
+                ],
                 "contracts": azure["contracts"],
             }
         manifest_assets.append(asset_manifest)
@@ -1595,6 +1620,7 @@ def parser() -> argparse.ArgumentParser:
     azure_result.add_argument("--source-commit", required=True)
     azure_result.add_argument("--vhd-sha256", required=True)
     azure_result.add_argument("--vhd-bytes", type=int, required=True)
+    azure_result.add_argument("--vhd-current-size", type=int, required=True)
     azure_result.add_argument("--contracts", required=True)
     azure_result.add_argument("--location", required=True)
     azure_result.add_argument("--vm-size", required=True)

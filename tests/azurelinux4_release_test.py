@@ -162,7 +162,9 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         azure_dir = self.azure / key
         azure_dir.mkdir(parents=True)
         vhd = azure_dir / "temporary.vhd"
-        vhd.write_bytes((key + "-vhd\n").encode())
+        vhd_current_size = release.AZURE_VHD_ALIGNMENT
+        with vhd.open("wb") as stream:
+            stream.truncate(vhd_current_size + release.VHD_FOOTER_BYTES)
         uefi_settings = {
             "signatureTemplateNames": [
                 "MicrosoftUefiCertificateAuthorityTemplate"
@@ -186,6 +188,7 @@ class AzureLinuxReleaseTest(unittest.TestCase):
                 manifest=manifest,
                 asset=asset,
                 vhd=vhd,
+                vhd_current_size=vhd_current_size,
                 key=key,
                 source_commit=self.source_commit,
                 location="eastus2",
@@ -237,6 +240,12 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             manifest["signing_certificate_sha256"],
             TEST_SIGNING_CERTIFICATE_SHA256,
         )
+        for asset in manifest["assets"]:
+            self.assertEqual(
+                asset["derived_vhd_bytes"],
+                asset["derived_vhd_current_size"]
+                + release.VHD_FOOTER_BYTES,
+            )
         self.assertTrue(
             all(item["fallback_uki_sha256"] == "3" * 64 for item in manifest["assets"])
         )
@@ -253,6 +262,15 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         path = self.azure / "x86_64-full" / "azure-result.json"
         document = json.loads(path.read_text())
         document["azure_accepted_sha256"] = "0" * 64
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            self.stage()
+
+    def test_stage_rejects_inconsistent_vhd_current_size_evidence(self):
+        self.make_all_bundles()
+        path = self.azure / "x86_64-full" / "azure-result.json"
+        document = json.loads(path.read_text())
+        document["derived_vhd_current_size"] += release.AZURE_VHD_ALIGNMENT
         path.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaises(SystemExit):
             self.stage()
@@ -427,6 +445,54 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             virtual_size,
         )
 
+    def test_fixed_vhd_accepts_live_run_legacy_chs_rounding(self):
+        current_size = 6_478_102_528
+        reported_size = 6_478_036_992
+        self.assertEqual(current_size, 6178 * release.AZURE_VHD_ALIGNMENT)
+        self.assertEqual(
+            qemu_reported_vhd_size(current_size),
+            reported_size,
+        )
+        self.assertEqual(
+            release.validate_azure_vhd_info(
+                {"format": "vpc", "virtual-size": reported_size},
+                current_size + release.VHD_FOOTER_BYTES,
+                fixed_vhd_footer(current_size),
+            ),
+            current_size,
+        )
+
+    def test_fixed_vhd_inspection_reads_live_run_footer_at_eof(self):
+        current_size = 6_478_102_528
+        reported_size = 6_478_036_992
+        vhd = self.root / "live-run.vhd"
+        with vhd.open("wb") as stream:
+            stream.seek(current_size)
+            stream.write(fixed_vhd_footer(current_size))
+        info = self.root / "live-run-info.json"
+        info.write_text(
+            json.dumps({"format": "vpc", "virtual-size": reported_size}),
+            encoding="utf-8",
+        )
+        geometry = release.inspect_azure_vhd(info, vhd)
+        self.assertEqual(geometry.current_size, current_size)
+        self.assertEqual(
+            geometry.file_size,
+            current_size + release.VHD_FOOTER_BYTES,
+        )
+        self.assertEqual(geometry.qemu_virtual_size, reported_size)
+
+    def test_fixed_vhd_accepts_qemu_current_size_without_chs_rounding(self):
+        current_size = 2 * release.AZURE_VHD_ALIGNMENT
+        self.assertEqual(
+            release.validate_azure_vhd_info(
+                {"format": "vpc", "virtual-size": current_size},
+                current_size + release.VHD_FOOTER_BYTES,
+                fixed_vhd_footer(current_size),
+            ),
+            current_size,
+        )
+
     def test_fixed_vhd_rejects_unaligned_virtual_size(self):
         virtual_size = 2 * release.AZURE_VHD_ALIGNMENT + 512
         info = {
@@ -475,6 +541,51 @@ class AzureLinuxReleaseTest(unittest.TestCase):
                 info,
                 virtual_size + release.VHD_FOOTER_BYTES,
                 fixed_vhd_footer(virtual_size, disk_type=3),
+            )
+
+    def test_fixed_vhd_rejects_wrong_footer_cookie(self):
+        virtual_size = 2 * release.AZURE_VHD_ALIGNMENT
+        footer = bytearray(fixed_vhd_footer(virtual_size))
+        footer[:8] = b"not-vhd!"
+        footer[64:68] = b"\0" * 4
+        struct.pack_into(">I", footer, 64, (~sum(footer)) & 0xFFFFFFFF)
+        with self.assertRaisesRegex(SystemExit, "cookie"):
+            release.validate_azure_vhd_info(
+                {
+                    "format": "vpc",
+                    "virtual-size": qemu_reported_vhd_size(virtual_size),
+                },
+                virtual_size + release.VHD_FOOTER_BYTES,
+                bytes(footer),
+            )
+
+    def test_fixed_vhd_rejects_wrong_footer_current_size(self):
+        virtual_size = 2 * release.AZURE_VHD_ALIGNMENT
+        footer = bytearray(fixed_vhd_footer(virtual_size))
+        wrong_size = virtual_size + release.AZURE_VHD_ALIGNMENT
+        struct.pack_into(">QQ", footer, 40, wrong_size, wrong_size)
+        footer[64:68] = b"\0" * 4
+        struct.pack_into(">I", footer, 64, (~sum(footer)) & 0xFFFFFFFF)
+        with self.assertRaisesRegex(SystemExit, "current size plus footer"):
+            release.validate_azure_vhd_info(
+                {
+                    "format": "vpc",
+                    "virtual-size": qemu_reported_vhd_size(virtual_size),
+                },
+                virtual_size + release.VHD_FOOTER_BYTES,
+                bytes(footer),
+            )
+
+    def test_fixed_vhd_rejects_truncated_footer(self):
+        virtual_size = 2 * release.AZURE_VHD_ALIGNMENT
+        with self.assertRaisesRegex(SystemExit, "truncated"):
+            release.validate_azure_vhd_info(
+                {
+                    "format": "vpc",
+                    "virtual-size": qemu_reported_vhd_size(virtual_size),
+                },
+                virtual_size + release.VHD_FOOTER_BYTES,
+                fixed_vhd_footer(virtual_size)[:-1],
             )
 
     def test_fixed_vhd_rejects_corrupt_footer_checksum(self):
@@ -667,6 +778,17 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertNotIn("qemu-img check -f vpc", script)
         self.assertIn('qemu-img info -f vpc --output=json "$vhd"', script)
         self.assertIn("azurelinux4_release.py verify-vhd", script)
+        self.assertIn('vhd_current_size=${vhd_geometry[0]}', script)
+        self.assertIn(
+            'test "$vhd_bytes" -eq "$((vhd_current_size + 512))"',
+            script,
+        )
+        self.assertIn(
+            "expanded_size_gib=$(((vhd_current_size + 1073741823) "
+            "/ 1073741824 + 2))",
+            script,
+        )
+        self.assertIn('--vhd-current-size "$vhd_current_size"', script)
 
     def test_publisher_verifies_drafts_by_release_id(self):
         script = (ROOT / "scripts/azurelinux4_publish.sh").read_text()

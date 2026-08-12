@@ -11,8 +11,24 @@ import json
 import os
 import re
 import shutil
-import struct
 from pathlib import Path
+
+try:
+    from scripts.azure_vhd import (
+        AZURE_VHD_ALIGNMENT,
+        VHD_FOOTER_BYTES,
+        VHD_MAX_CHS_SECTORS,
+        inspect_azure_vhd,
+        validate_azure_vhd_info,
+    )
+except ModuleNotFoundError:
+    from azure_vhd import (
+        AZURE_VHD_ALIGNMENT,
+        VHD_FOOTER_BYTES,
+        VHD_MAX_CHS_SECTORS,
+        inspect_azure_vhd,
+        validate_azure_vhd_info,
+    )
 
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -49,9 +65,6 @@ AZURE_CONTRACTS = {
     "reboot-reconnect",
     "runtime-flavor-identity",
 }
-AZURE_VHD_ALIGNMENT = 1024 * 1024
-VHD_FOOTER_BYTES = 512
-VHD_MAX_CHS_SECTORS = 65535 * 16 * 255
 PRIVATE_KEY_PEM_MARKERS = (
     b"-----BEGIN PRIVATE KEY-----",
     b"-----BEGIN ENCRYPTED PRIVATE KEY-----",
@@ -154,89 +167,6 @@ def validate_azure_gallery_uefi_settings(
         fail("Azure gallery version returned different custom UEFI settings")
     validate_azure_uefi_settings(request_uefi, certificate_sha256)
     return request_uefi
-
-
-def validate_azure_vhd_info(
-    info: dict[str, object], file_size: int, footer: bytes
-) -> int:
-    if info.get("format") != "vpc":
-        fail("derived upload image is not VHD/VPC")
-    reported_size = info.get("virtual-size")
-    if type(reported_size) is not int or reported_size <= 0:
-        fail("derived upload VHD reported virtual size is invalid")
-    if len(footer) != VHD_FOOTER_BYTES or footer[:8] != b"conectix":
-        fail("derived upload VHD footer is invalid")
-
-    stored_checksum = struct.unpack_from(">I", footer, 64)[0]
-    checked = bytearray(footer)
-    checked[64:68] = b"\0" * 4
-    expected_checksum = (~sum(checked)) & 0xFFFFFFFF
-    if stored_checksum != expected_checksum:
-        fail("derived upload VHD footer checksum is invalid")
-
-    features, version = struct.unpack_from(">II", footer, 8)
-    data_offset = struct.unpack_from(">Q", footer, 16)[0]
-    creator_version = struct.unpack_from(">I", footer, 32)[0]
-    original_size, virtual_size = struct.unpack_from(">QQ", footer, 40)
-    cylinders, heads, sectors_per_track = struct.unpack_from(">HBB", footer, 56)
-    disk_type = struct.unpack_from(">I", footer, 60)[0]
-    if features != 2 or version != 0x00010000:
-        fail("derived upload VHD footer version is invalid")
-    if (
-        footer[28:32] != b"zvmi"
-        or creator_version != 0x00010000
-        or footer[36:40] != b"\0" * 4
-    ):
-        fail("derived upload VHD creator identity is invalid")
-    if data_offset != 0xFFFFFFFFFFFFFFFF or disk_type != 2:
-        fail("derived upload VHD is not fixed")
-    if original_size != virtual_size:
-        fail("derived upload VHD original and current sizes differ")
-    if footer[84] != 0 or any(footer[85:]):
-        fail("derived upload VHD footer state or reserved bytes are invalid")
-    if virtual_size <= 0 or virtual_size % AZURE_VHD_ALIGNMENT != 0:
-        fail("derived upload VHD virtual size is not 1 MiB aligned")
-
-    total_sectors = min(virtual_size // 512, VHD_MAX_CHS_SECTORS)
-    if total_sectors >= 65535 * 16 * 63:
-        expected_sectors_per_track = 255
-        expected_heads = 16
-        cylinders_times_heads = total_sectors // expected_sectors_per_track
-    else:
-        expected_sectors_per_track = 17
-        cylinders_times_heads = total_sectors // expected_sectors_per_track
-        expected_heads = (cylinders_times_heads + 1023) // 1024
-        expected_heads = max(expected_heads, 4)
-        if (
-            cylinders_times_heads >= expected_heads * 1024
-            or expected_heads > 16
-        ):
-            expected_sectors_per_track = 31
-            expected_heads = 16
-            cylinders_times_heads = total_sectors // expected_sectors_per_track
-        if cylinders_times_heads >= expected_heads * 1024:
-            expected_sectors_per_track = 63
-            expected_heads = 16
-            cylinders_times_heads = total_sectors // expected_sectors_per_track
-    expected_cylinders = cylinders_times_heads // expected_heads
-    expected_geometry = (
-        expected_cylinders,
-        expected_heads,
-        expected_sectors_per_track,
-    )
-    if (cylinders, heads, sectors_per_track) != expected_geometry:
-        fail("derived upload VHD CHS geometry is invalid")
-    geometry_sectors = cylinders * heads * sectors_per_track
-    expected_reported_size = (
-        virtual_size
-        if geometry_sectors == VHD_MAX_CHS_SECTORS
-        else geometry_sectors * 512
-    )
-    if reported_size != expected_reported_size:
-        fail("derived upload VHD reported virtual size is inconsistent")
-    if file_size != virtual_size + VHD_FOOTER_BYTES:
-        fail("derived upload VHD file size does not equal virtual size plus footer")
-    return virtual_size
 
 
 def read_json(path: Path) -> dict[str, object]:
@@ -634,19 +564,9 @@ def verify_candidate_command(args: argparse.Namespace) -> None:
 
 
 def verify_vhd_command(args: argparse.Namespace) -> None:
-    vhd = args.vhd.resolve()
-    if not vhd.is_file():
-        fail(f"derived VHD is missing: {vhd}")
-    file_size = vhd.stat().st_size
-    try:
-        with vhd.open("rb") as stream:
-            stream.seek(-VHD_FOOTER_BYTES, os.SEEK_END)
-            footer = stream.read(VHD_FOOTER_BYTES)
-    except OSError as error:
-        fail(f"cannot read derived VHD footer: {error}")
-    virtual_size = validate_azure_vhd_info(read_json(args.info), file_size, footer)
-    print(virtual_size)
-    print(file_size)
+    geometry = inspect_azure_vhd(args.info, args.vhd)
+    print(geometry.current_size)
+    print(geometry.file_size)
 
 
 def azure_result_command(args: argparse.Namespace) -> None:
@@ -659,6 +579,13 @@ def azure_result_command(args: argparse.Namespace) -> None:
     vhd = args.vhd.resolve()
     if not vhd.is_file():
         fail(f"derived VHD is missing: {vhd}")
+    if (
+        type(args.vhd_current_size) is not int
+        or args.vhd_current_size <= 0
+        or args.vhd_current_size % AZURE_VHD_ALIGNMENT != 0
+        or vhd.stat().st_size != args.vhd_current_size + VHD_FOOTER_BYTES
+    ):
+        fail("derived VHD current-size evidence is inconsistent")
     request = read_json(args.uefi_request)
     response = read_json(args.uefi_response)
     request_uefi = validate_azure_gallery_uefi_settings(
@@ -680,6 +607,7 @@ def azure_result_command(args: argparse.Namespace) -> None:
             "azure_accepted_sha256": sha256(args.asset),
             "derived_vhd_sha256": sha256(vhd),
             "derived_vhd_bytes": vhd.stat().st_size,
+            "derived_vhd_current_size": args.vhd_current_size,
             "certificate_sha256": candidate["uki_signing"]["certificate_sha256"],
             "signing_certificate_sha256": candidate["uki_signing"][
                 "signing_certificate_sha256"
@@ -814,7 +742,15 @@ def stage_command(args: argparse.Namespace) -> None:
         contracts = azure.get("contracts")
         if not has_exact_contracts(contracts, AZURE_CONTRACTS):
             fail(f"{key}: Azure contract results are absent")
-        if not isinstance(azure.get("derived_vhd_bytes"), int) or azure["derived_vhd_bytes"] <= 0:
+        derived_vhd_bytes = azure.get("derived_vhd_bytes")
+        derived_vhd_current_size = azure.get("derived_vhd_current_size")
+        if (
+            not isinstance(derived_vhd_bytes, int)
+            or not isinstance(derived_vhd_current_size, int)
+            or derived_vhd_current_size <= 0
+            or derived_vhd_current_size % AZURE_VHD_ALIGNMENT != 0
+            or derived_vhd_bytes != derived_vhd_current_size + VHD_FOOTER_BYTES
+        ):
             fail(f"{key}: derived VHD size binding is absent")
         if not isinstance(azure.get("location"), str) or not azure["location"]:
             fail(f"{key}: Azure location is absent")
@@ -849,6 +785,8 @@ def stage_command(args: argparse.Namespace) -> None:
                 "azure_location": azure.get("location"),
                 "azure_vm_size": azure.get("vm_size"),
                 "derived_vhd_sha256": azure.get("derived_vhd_sha256"),
+                "derived_vhd_bytes": derived_vhd_bytes,
+                "derived_vhd_current_size": derived_vhd_current_size,
                 "azure_image_version_id": azure.get("image_version_id"),
             }
         )
@@ -874,14 +812,16 @@ def stage_command(args: argparse.Namespace) -> None:
         f"All UKIs are trusted through enrolled leaf SHA-256 `{release_certificate_sha256}`.",
         f"Artifact Signing leaf certificate SHA-256: `{release_signing_certificate_sha256}`.",
         "",
-        "| Asset | SHA-256 | UKI SHA-256 | Bytes | Azure validation | Derived VHD SHA-256 (not published) |",
+        "| Asset | SHA-256 | UKI SHA-256 | Bytes | Azure validation | Derived VHD evidence (not published) |",
         "| --- | --- | --- | ---: | --- | --- |",
     ]
     for item in staged:
         lines.append(
             f"| `{item['asset_name']}` | `{item['sha256']}` | `{item['fallback_uki_sha256']}` | {item['bytes']} | "
             f"`{item['azure_location']}` / `{item['azure_vm_size']}` | "
-            f"`{item['derived_vhd_sha256']}` |"
+            f"`{item['derived_vhd_sha256']}`; current "
+            f"{item['derived_vhd_current_size']} bytes; file "
+            f"{item['derived_vhd_bytes']} bytes |"
         )
     lines.extend(
         [
@@ -946,6 +886,7 @@ def parser() -> argparse.ArgumentParser:
     azure.add_argument("--manifest", type=Path, required=True)
     azure.add_argument("--asset", type=Path, required=True)
     azure.add_argument("--vhd", type=Path, required=True)
+    azure.add_argument("--vhd-current-size", type=int, required=True)
     azure.add_argument("--key", required=True)
     azure.add_argument("--source-commit", required=True)
     azure.add_argument("--location", required=True)
