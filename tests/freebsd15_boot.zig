@@ -592,12 +592,43 @@ fn contractRemoteChecksAlloc(
             .{class},
         );
     }
-    // The update path is the reason a core image stays supportable, so prove
-    // both repositories still answer rather than trusting the build log.
+    // The update path is the reason an image stays supportable. Exercise it
+    // again as the key-only, non-root acceptance user, using sudo only for
+    // catalogue or package-database writes. The base upgrade is a dry run so
+    // acceptance succeeds whether or not upstream has published an update.
     try output.writer.print(
-        "sudo -n pkg update -f\nsudo -n pkg update -f -r {s}\n" ++
-            "pkg rquery -r {s} '%n-%v' FreeBSD-runtime >/dev/null\n",
-        .{ manifest.base_repository, manifest.base_repository },
+        "package_state_before=$(pkg query -a '%n %v %a' | sort | sha256 -q)\n" ++
+            "sudo -n pkg update -f\n" ++
+            "sudo -n pkg update -f -r {s}\n" ++
+            "pkg rquery -r {s} '%n-%v' FreeBSD-runtime >/dev/null\n" ++
+            "sudo -n pkg upgrade -n -U -r {s}\n" ++
+            "test \"$(pkg query -a '%n %v %a' | sort | sha256 -q)\" = " ++
+            "\"${{package_state_before}}\"\n",
+        .{
+            manifest.base_repository,
+            manifest.base_repository,
+            manifest.base_repository,
+        },
+    );
+    try output.writer.print(
+        "! pkg info -e {s}\n" ++
+            "pkg rquery '%n-%v' {s} >/dev/null\n" ++
+            "package_state_before=$(pkg query -a '%n %v %a' | sort | sha256 -q)\n" ++
+            "sudo -n pkg install -y {s}\n" ++
+            "pkg info -e {s}\n" ++
+            "sudo -n pkg delete -y {s}\n" ++
+            "! pkg info -e {s}\n" ++
+            "test \"$(pkg query -a '%n %v %a' | sort | sha256 -q)\" = " ++
+            "\"${{package_state_before}}\"\n" ++
+            "sudo -n pkg clean -ay\n",
+        .{
+            packages.representative_package,
+            packages.representative_package,
+            packages.representative_package,
+            packages.representative_package,
+            packages.representative_package,
+            packages.representative_package,
+        },
     );
     return output.toOwnedSlice();
 }
@@ -852,6 +883,36 @@ test "remote checks enforce the retained contract for every flavor" {
             checks,
             "sudo -n pkg update -f -r FreeBSD-base",
         ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            checks,
+            "sudo -n pkg upgrade -n -U -r FreeBSD-base",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            checks,
+            "sudo -n pkg install -y tree",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            checks,
+            "sudo -n pkg delete -y tree",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            checks,
+            "! pkg info -e tree",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            checks,
+            "sudo -n pkg clean -ay",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            checks,
+            "pkg upgrade -r FreeBSD-base",
+        ) == null);
     }
 
     // Only the core flavor claims exclusions, so only it may assert them.

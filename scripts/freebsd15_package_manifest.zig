@@ -378,6 +378,7 @@ pub fn forFlavor(flavor: Flavor) *const Manifest {
 /// of what it actually ships to the console so the host can verify it against
 /// this file instead of trusting the guest's own checks.
 pub const record_prefix = "ZVMI_FREEBSD_PACKAGE";
+pub const update_validation_prefix = "ZVMI_FREEBSD_UPDATE_VALIDATION";
 
 /// Shared package handling: identify which installed packages came from
 /// pkgbase, and prove both repositories and the install path still work.
@@ -408,16 +409,29 @@ const shared_package_script =
     \\      for required in @REQUIRED_PACKAGES@; do
     \\          pkg info -e "${required}"
     \\      done
-    \\      # A pruned system that cannot reach its repositories or install a
-    \\      # package is a broken image, so prove all three here rather than
-    \\      # discovering it on a user's first boot.
+    \\      zvmi_package_state()
+    \\      {
+    \\          pkg query -a '%n %v %a' | sort | sha256 -q
+    \\      }
+    \\      # A system that cannot refresh both catalogues, solve a base
+    \\      # upgrade, or install a ports package is not supportable. The
+    \\      # upgrade is deliberately a dry run: it exercises repository and
+    \\      # dependency solving without making release output depend on
+    \\      # whether an update happens to exist today.
     \\      pkg update -f
     \\      pkg update -f -r @BASE_REPOSITORY@
     \\      pkg rquery -r @BASE_REPOSITORY@ '%n-%v' FreeBSD-runtime
+    \\      package_state_before=$(zvmi_package_state)
+    \\      pkg upgrade -n -U -r @BASE_REPOSITORY@
+    \\      test "$(zvmi_package_state)" = "${package_state_before}"
+    \\      ! pkg info -e @REPRESENTATIVE_PACKAGE@
+    \\      pkg rquery '%n-%v' @REPRESENTATIVE_PACKAGE@
+    \\      package_state_before=$(zvmi_package_state)
     \\      pkg install -y @REPRESENTATIVE_PACKAGE@
     \\      pkg info -e @REPRESENTATIVE_PACKAGE@
     \\      pkg delete -y @REPRESENTATIVE_PACKAGE@
     \\      ! pkg info -e @REPRESENTATIVE_PACKAGE@
+    \\      test "$(zvmi_package_state)" = "${package_state_before}"
 ;
 
 /// Core prune. pkg computes the closure; the manifest only names the roots.
@@ -479,6 +493,14 @@ const package_prune_script =
 const package_record_script =
     \\      for output in /dev/console /dev/ttyu0; do
     \\          if [ -w "${output}" ]; then
+    \\              printf '@UPDATE_PREFIX@ @NONCE@ ports-metadata-ok\n' \
+    \\                  >"${output}" || true
+    \\              printf '@UPDATE_PREFIX@ @NONCE@ base-metadata-ok\n' \
+    \\                  >"${output}" || true
+    \\              printf '@UPDATE_PREFIX@ @NONCE@ base-solver-dry-run-ok\n' \
+    \\                  >"${output}" || true
+    \\              printf '@UPDATE_PREFIX@ @NONCE@ ports-lifecycle-ok\n' \
+    \\                  >"${output}" || true
     \\              pkg query -a \
     \\                  '@RECORD_PREFIX@ @NONCE@ %n %v %sb' \
     \\                  >"${output}" || true
@@ -613,6 +635,7 @@ pub fn guestScriptAlloc(
     defer allocator.free(shared);
     const record = try renderAlloc(allocator, package_record_script, &.{
         .{ .token = "@RECORD_PREFIX@", .value = record_prefix },
+        .{ .token = "@UPDATE_PREFIX@", .value = update_validation_prefix },
         .{ .token = "@NONCE@", .value = nonce },
     });
     defer allocator.free(record);
@@ -662,6 +685,10 @@ pub fn verifyRecordedManifest(
         }
     }
     for (installed) |entry| {
+        if (std.mem.eql(u8, entry.name, representative_package)) {
+            if (diagnostic) |out| out.package = entry.name;
+            return error.RepresentativePackagePresent;
+        }
         for (manifest.excluded) |excluded| {
             if (std.mem.eql(u8, entry.name, excluded)) {
                 if (diagnostic) |out| out.package = entry.name;
@@ -799,10 +826,29 @@ test "the core guest script prunes from the manifest and audits the result" {
         script,
         "grep -Eq '^FreeBSD-.*-(dbg|dev|lib32)$'",
     ) != null);
-    // The update path and a real installation are proven in the guest.
+    // The update path, a non-destructive base solver run, and a real ports
+    // package lifecycle are proven in the guest.
+    try std.testing.expect(std.mem.indexOf(u8, script, "pkg update -f\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "pkg update -f -r FreeBSD-base") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "pkg upgrade -n -U -r FreeBSD-base",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "test \"$(zvmi_package_state)\" = \"${package_state_before}\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "! pkg info -e tree") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "pkg rquery '%n-%v' tree") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "pkg install -y tree") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "pkg delete -y tree") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "ZVMI_FREEBSD_UPDATE_VALIDATION 0123456789abcdef base-solver-dry-run-ok",
+    ) != null);
     // The shipped manifest is recorded under the run's nonce.
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -831,7 +877,14 @@ test "the full guest script verifies the contract without pruning" {
         try std.testing.expect(std.mem.indexOf(u8, script, package.name) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, script, "pkg update -f -r FreeBSD-base") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "pkg upgrade -n -U -r FreeBSD-base",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "pkg install -y tree") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "pkg delete -y tree") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "! pkg info -e tree") != null);
 }
 
 test "a recorded manifest is verified against the reviewed one" {
@@ -858,6 +911,18 @@ test "a recorded manifest is verified against the reviewed one" {
         core.required[0].name,
         diagnostic.package,
     );
+
+    try installed.append(std.testing.allocator, .{
+        .name = representative_package,
+        .version = "2.2.1",
+        .installed_bytes = 1,
+    });
+    try std.testing.expectError(
+        error.RepresentativePackagePresent,
+        verifyRecordedManifest(core, installed.items, &diagnostic),
+    );
+    try std.testing.expectEqualStrings(representative_package, diagnostic.package);
+    _ = installed.pop();
 
     try installed.append(std.testing.allocator, .{
         .name = "FreeBSD-clang",

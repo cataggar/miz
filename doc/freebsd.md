@@ -122,10 +122,29 @@ source image happened to arrive with.
 
 The guest proves, for both flavors, that every required package is present,
 that `pkg update` works against both the ports and `FreeBSD-base` repositories,
-that `pkg rquery -r FreeBSD-base` resolves a base package, and that installing
-and removing a representative third-party package (`tree`) still works. The
-core flavor additionally proves every exclusion is gone and that the
-shared-library audit is clean.
+and that `pkg rquery -r FreeBSD-base` resolves a base package. It then runs
+`pkg upgrade -n -U -r FreeBSD-base`: this invokes the real upgrade solver
+against the freshly downloaded base catalogue and fails on repository or
+dependency errors, but cannot modify the source image and succeeds whether or
+not upstream happens to have published an update. A package-state digest before
+and after the dry run proves the installed set did not change.
+
+The same validation installs and removes the dependency-free ports package
+`tree`, requires it to be absent both before and after the check, and requires
+the package-state digest to return to its original value. The core flavor
+additionally proves every exclusion is gone and that the shared-library audit
+is clean. Nonce-bound serial records identify successful ports metadata, base
+metadata, base solver, and third-party lifecycle checks. The package manifest
+is recorded only after `tree` is removed; host-side validation also rejects a
+recorded manifest containing it. Package archives, caches, and repository
+catalogues are then removed before free-space reclamation.
+
+QEMU acceptance repeats the metadata refresh, dry-run base solver, and
+`tree` install/remove cycle on both instances before and after reboot. These
+commands run through the provisioned key-only, non-root account and use
+`sudo -n` for every catalogue or package-database write, so acceptance also
+proves the published administrative path rather than relying on root console
+access.
 
 The guest then writes the manifest it actually shipped to the serial console.
 The builder parses those records, re-verifies them against the reviewed
