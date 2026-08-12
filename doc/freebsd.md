@@ -338,21 +338,28 @@ publish:
 | --- | --- | --- |
 | `ufs` | `FreeBSD-15.1-20260724` | `FreeBSD-15.1-aarch64.qcow2`, `FreeBSD-15.1-x86_64.qcow2` |
 | `zfs` | `FreeBSD-15.1-zfs-20260729` | `FreeBSD-15.1-aarch64.zfs.qcow2`, `FreeBSD-15.1-x86_64.zfs.qcow2` |
-| `core` | `FreeBSD-15.1-core-20260730` | `FreeBSD-15.1-aarch64.core.qcow2`, `FreeBSD-15.1-x86_64.core.qcow2` |
+| `core` | `FreeBSD-15.1-core-<reviewed YYYYMMDD>` | `FreeBSD-15.1-aarch64.core.qcow2`, `FreeBSD-15.1-x86_64.core.qcow2` |
 
 `scripts/freebsd15_release.py matrix` expands the selected set into the build
 matrix and `describe` resolves its tag, title, asset count, and reviewed size
 threshold, so the tag, allowlist, and built variants cannot disagree. Core
-adds the two full UFS baseline builds described above; its published asset
-count remains two. Each candidate builds on a native GitHub-hosted runner,
-caches its digest-pinned upstream source, persists its exact qemu-img
-validation JSON, validates the standalone QCOW2, and runs dual-instance
-acceptance. A separate publication job requires every needed candidate,
-refuses candidates from another set or source commit, stages a draft, uploads
-exactly the release set's assets, verifies GitHub's asset digests and a fresh
-download, and then publishes the non-Latest release. SHA-256 values and
-complete source/build provenance are recorded in the release notes; checksum
-sidecar assets are not published.
+requires the dispatcher to enter `core_release_date` explicitly as a valid
+calendar `YYYYMMDD`; there is no preselected proposed publication date. Core
+adds the two full UFS baseline builds described above from the same source
+commit and architecture-specific pinned UFS sources; its published asset count
+remains two. Each candidate builds on a native GitHub-hosted runner, caches its
+digest-pinned upstream source, persists its exact qemu-img validation JSON,
+validates the standalone QCOW2, and runs dual-instance acceptance. Core staging
+requires both architectures to pass the reviewed full-versus-core allocated
+and compressed/download reduction threshold and records virtual, allocated,
+compressed, and package-count evidence for both sides. A separate publication
+job requires every needed candidate, refuses candidates from another set or
+source commit, stages a draft, uploads exactly the release set's assets,
+verifies GitHub's asset digests and a fresh exact-allowlist download, and then
+publishes the non-Latest release. SHA-256 values, package manifests, retained
+and excluded core package contracts, all size evidence, and complete
+source/build/QEMU/Azure provenance are recorded in the release notes; baseline
+images, checksum files, and package-manifest sidecars are not published.
 
 The released QCOW2 files are not directly uploadable to Azure. Derive aligned
 fixed VHDs without changing their partitions:
@@ -365,14 +372,13 @@ zvmi azure derive \
   FreeBSD-15.1-aarch64.vhd
 ```
 
-The previous AArch64 build path was validated on an Azure Arm64 Gen2
-`Standard_D2pls_v5` VM. Provisioning, `waagent`, injected-key SSH, `hn0` DHCP,
-locked root, disabled swap, reboot identity, and managed serial output all
-passed. The ZFS release workflow now enforces exact-candidate Azure acceptance
-as a required gate before publication: both architectures must pass a protected
-Azure boot-and-contract validation run (using `scripts/freebsd15_azure_acceptance.sh`)
-against the same build artifacts accepted by the QEMU step, and the publication
-script refuses to proceed unless both `azure-result.json` files are present.
+The ZFS and core release workflows enforce exact-candidate Azure acceptance as
+a required gate before publication: both architectures must pass a protected
+Azure boot-and-contract validation run (using
+`scripts/freebsd15_azure_acceptance.sh`) against the same build artifacts
+accepted by the QEMU step, and the publication script refuses to proceed unless
+both `azure-result.json` files are present. Full UFS publication retains its
+existing QEMU-only behavior and rejects accidental Azure-result input.
 The Azure acceptance job uses a protected GitHub environment with OIDC
 credentials and architecture-specific `AZURE_LOCATION_X64`/`AZURE_VM_SIZE_X64`
 and `AZURE_LOCATION_ARM64`/`AZURE_VM_SIZE_ARM64` configuration variables.
@@ -381,12 +387,11 @@ subscription configuration and temporary-resource-group ownership model. Its
 shared Gen2, provisioning, network, serial, reboot, identity, GPT, growth, and
 shutdown checks are combined with disjoint storage contracts: UFS proves root
 partition and filesystem growth without invoking ZFS, while ZFS preserves pool
-health, autoexpand, and GUID stability checks. The current workflow remains
-wired only for the established ZFS release gate, but every supported harness
-path now emits the canonical schema-3 result through
+health, autoexpand, and GUID stability checks. Every supported harness path
+emits the canonical schema-3 result through
 `freebsd15_release.py azure-result`, binding the candidate's virtual,
-allocated, compressed, digest, package, provenance, and workflow identity
-metadata.
+allocated, compressed, digest, source commit, deterministic storage contract,
+and workflow identity metadata.
 
 See [Image building](image-building.md) for the shared image-format and Azure
 VHD tooling.

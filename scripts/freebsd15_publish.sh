@@ -8,10 +8,10 @@ if [[ -z ${CANDIDATES_DIR:-} || -z ${SOURCE_COMMIT:-} ||
   echo "::error::Required publication configuration is incomplete"
   exit 1
 fi
-# ZFS releases require Azure acceptance results.
-if [[ "$RELEASE_SET" == "zfs" ]]; then
+# ZFS and core releases require exact-candidate Azure acceptance results.
+if [[ "$RELEASE_SET" == "zfs" || "$RELEASE_SET" == "core" ]]; then
   if [[ -z ${AZURE_RESULTS_DIR:-} ]]; then
-    echo "::error::ZFS releases require AZURE_RESULTS_DIR"
+    echo "::error::$RELEASE_SET releases require AZURE_RESULTS_DIR"
     exit 1
   fi
 fi
@@ -20,6 +20,15 @@ fi
 # never accepts an external JSON baseline.
 if [[ "$RELEASE_SET" == "core" && -z ${BASELINE_CANDIDATES_DIR:-} ]]; then
   echo "::error::Core releases require BASELINE_CANDIDATES_DIR"
+  exit 1
+fi
+if [[ "$RELEASE_SET" == "core" ]]; then
+  if [[ -z ${RELEASE_DATE:-} || ! "$RELEASE_DATE" =~ ^[0-9]{8}$ ]]; then
+    echo "::error::Core releases require an explicit reviewed RELEASE_DATE"
+    exit 1
+  fi
+elif [[ -n ${RELEASE_DATE:-} ]]; then
+  echo "::error::RELEASE_DATE is only applicable to core releases"
   exit 1
 fi
 for tool in gh python3 sha256sum; do
@@ -34,8 +43,14 @@ done
 # The release set is the single source of truth for the tag, the title, and
 # how many assets may be published. Deriving all three from it keeps a
 # dispatch that names the wrong tag from silently publishing the wrong images.
+describe_args=(--release-set "$RELEASE_SET")
+stage_release_date_args=()
+if [[ "$RELEASE_SET" == "core" ]]; then
+  describe_args+=(--release-date "$RELEASE_DATE")
+  stage_release_date_args=(--release-date "$RELEASE_DATE")
+fi
 release_description=$(python3 scripts/freebsd15_release.py describe \
-  --release-set "$RELEASE_SET")
+  "${describe_args[@]}")
 expected_tag=${release_description#*release_tag=}
 expected_tag=${expected_tag%%$'\n'*}
 expected_title=${release_description#*release_title=}
@@ -60,7 +75,7 @@ baseline_notes="$STAGING_ROOT/full-ufs-baseline-notes.md"
 rm -rf -- "$assets_dir" "$verify_dir" "$baseline_dir"
 
 azure_results_args=()
-if [[ "$RELEASE_SET" == "zfs" ]]; then
+if [[ "$RELEASE_SET" == "zfs" || "$RELEASE_SET" == "core" ]]; then
   azure_results_args=(--azure-results "$AZURE_RESULTS_DIR")
 fi
 
@@ -88,6 +103,7 @@ python3 scripts/freebsd15_release.py stage \
   --candidates "$CANDIDATES_DIR" \
   --source-commit "$SOURCE_COMMIT" \
   --release-tag "$RELEASE_TAG" \
+  "${stage_release_date_args[@]}" \
   "${azure_results_args[@]}" \
   "${baseline_args[@]}" \
   --output "$assets_dir" \
@@ -264,7 +280,7 @@ PY
     echo "- \`$asset_name\`: \`$expected_sha\`"
   done <"$expected_file"
   echo
-  echo "No checksum sidecar assets were published."
+  echo "No checksum or package-manifest sidecar assets were published."
 } >>"$GITHUB_STEP_SUMMARY"
 
 release_created=false

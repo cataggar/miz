@@ -632,6 +632,35 @@ wait_for_poweroff() {
   return 1
 }
 
+require_serial_console_log() {
+  local attempt saw_nonempty=false
+  rm -f -- "$boot_log"
+  for attempt in {1..6}; do
+    if az vm boot-diagnostics get-boot-log \
+      --resource-group "$resource_group" \
+      --name "$vm_name" >"$boot_log" 2>/dev/null
+    then
+      if [[ -s "$boot_log" ]]; then
+        saw_nonempty=true
+        if grep -iq 'FreeBSD' "$boot_log"; then
+          return
+        fi
+      fi
+    fi
+    if [[ "$attempt" -lt 6 ]]; then
+      sleep 5
+    fi
+  done
+  if $saw_nonempty; then
+    echo "::error::Azure serial log is missing expected FreeBSD output" >&2
+  else
+    echo "::error::Azure managed boot diagnostics did not return a nonempty" \
+      "serial log after 6 attempts" \
+      >&2
+  fi
+  return 1
+}
+
 # --- CONTRACT: matching-architecture-gen2 ---
 # (Gen2 enforced by disk hyper-v-generation V2)
 
@@ -794,21 +823,7 @@ done
 GUEST
 
 # --- CONTRACT: serial-console ---
-rm -f -- "$boot_log"
-for _ in {1..6}; do
-  if az vm boot-diagnostics get-boot-log \
-    --resource-group "$resource_group" \
-    --name "$vm_name" >"$boot_log" 2>/dev/null && [[ -s "$boot_log" ]]; then
-    break
-  fi
-  sleep 5
-done
-if [[ -s "$boot_log" ]]; then
-  # FreeBSD serial output should contain kernel boot messages
-  grep -iq 'FreeBSD' "$boot_log"
-else
-  echo "::warning::Azure managed boot diagnostics did not return a serial log"
-fi
+require_serial_console_log
 
 # --- CONTRACT: reboot-reconnect ---
 reboot_and_reconnect
