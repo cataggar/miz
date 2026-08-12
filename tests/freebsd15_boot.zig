@@ -595,7 +595,7 @@ fn contractRemoteChecksAlloc(
     // The update path is the reason a core image stays supportable, so prove
     // both repositories still answer rather than trusting the build log.
     try output.writer.print(
-        "pkg update -f\npkg update -f -r {s}\n" ++
+        "sudo -n pkg update -f\nsudo -n pkg update -f -r {s}\n" ++
             "pkg rquery -r {s} '%n-%v' FreeBSD-runtime >/dev/null\n",
         .{ manifest.base_repository, manifest.base_repository },
     );
@@ -850,7 +850,7 @@ test "remote checks enforce the retained contract for every flavor" {
         try std.testing.expect(std.mem.indexOf(
             u8,
             checks,
-            "pkg update -f -r FreeBSD-base",
+            "sudo -n pkg update -f -r FreeBSD-base",
         ) != null);
     }
 
