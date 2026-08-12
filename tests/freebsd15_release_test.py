@@ -47,6 +47,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         self.candidates = self.root / "candidates"
         self.output = self.root / "output"
         self.notes = self.root / "notes.md"
+        self.azure_results = self.root / "azure-results"
         self.source_commit = "a" * 40
         self.root.mkdir(parents=True)
 
@@ -96,7 +97,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
     def make_candidate(self, key, source_commit=None):
         expected = release.VARIANTS[key]
         candidate_dir = self.candidates / key
-        candidate_dir.mkdir(parents=True)
+        candidate_dir.mkdir(parents=True, exist_ok=True)
         asset = candidate_dir / expected["asset_name"]
         asset.write_bytes(f"{key} candidate\n".encode())
         release.candidate_command(
@@ -111,14 +112,48 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         )
         return candidate_dir / "candidate.json"
 
-    def stage(self, release_set, release_tag=None):
+    def make_azure_result(self, key, source_commit=None, **overrides):
+        candidate_path = self.make_candidate(key)
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        document = {
+            "schema": 1,
+            "type": "zvmi-freebsd15-azure-acceptance",
+            "variant": key,
+            "architecture": release.VARIANTS[key]["architecture"],
+            "filesystem": release.VARIANTS[key]["filesystem"],
+            "flavor": release.VARIANTS[key]["flavor"],
+            "asset_name": release.VARIANTS[key]["asset_name"],
+            "source_commit": source_commit or self.source_commit,
+            "qcow_sha256": candidate["asset_sha256"],
+            "derived_vhd_sha256": "d" * 64,
+            "derived_vhd_bytes": 7_340_032,
+            "status": "success",
+            "location": "eastus2",
+            "vm_size": "Standard_D2s_v5",
+            "resource_group": "rg-zvmi-release",
+            "contracts": list(release.AZURE_CONTRACTS),
+            "workflow": {"run_id": "101", "run_attempt": "3"},
+        }
+        document.update(overrides)
+        result_path = self.azure_results / key / "azure-result.json"
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return result_path
+
+    def stage(self, release_set, release_tag=None, azure_results=...):
         selected = release.RELEASE_SETS[release_set]
+        if azure_results is ...:
+            azure_results = self.azure_results if release_set == "zfs" else None
         release.stage_command(
             types.SimpleNamespace(
                 release_set=release_set,
                 candidates=self.candidates,
                 source_commit=self.source_commit,
                 release_tag=release_tag or selected["release_tag"],
+                azure_results=azure_results,
                 output=self.output,
                 notes=self.notes,
             )
@@ -126,7 +161,10 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
 
     def stage_set(self, release_set):
         for key in release.RELEASE_SETS[release_set]["variants"]:
-            self.make_candidate(key)
+            if release_set == "zfs":
+                self.make_azure_result(key)
+            else:
+                self.make_candidate(key)
         self.stage(release_set)
 
     def test_stages_exact_two_asset_ufs_release(self):
@@ -171,6 +209,14 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         self.assertEqual(
             {asset["filesystem"] for asset in manifest["assets"]}, {"zfs"}
         )
+        for asset in manifest["assets"]:
+            self.assertEqual(asset["azure"]["location"], "eastus2")
+            self.assertEqual(asset["azure"]["vm_size"], "Standard_D2s_v5")
+            self.assertGreater(asset["azure"]["derived_vhd_bytes"], 0)
+            self.assertEqual(
+                asset["azure"]["contracts"],
+                list(release.AZURE_CONTRACTS),
+            )
         # The staging tree is the publish allowlist, so nothing but the two
         # assets and the manifest may appear in it.
         self.assertEqual(
@@ -184,7 +230,256 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         notes = self.notes.read_text(encoding="utf-8")
         self.assertIn("ZFS-root", notes)
         self.assertIn("zpool_reguid", notes)
+        self.assertIn("Exact-candidate matching-architecture Gen2 validation", notes)
+        self.assertNotIn("does not claim exact-candidate Azure validation", notes)
         self.assertIn("No checksum sidecar assets are published.", notes)
+
+
+    def test_azure_result_command_emits_valid_document(self):
+        candidate_path = self.make_candidate("x86_64-zfs-full")
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        asset = candidate_path.parent / candidate["asset_name"]
+        output = self.root / "azure-result.json"
+        vhd_sha256 = "f" * 64
+        vhd_bytes = 8_388_608
+        contracts = ",".join(release.AZURE_CONTRACTS)
+
+        release.azure_result_command(
+            types.SimpleNamespace(
+                manifest=candidate_path,
+                asset=asset,
+                key="x86_64-zfs-full",
+                source_commit=self.source_commit,
+                vhd_sha256=vhd_sha256,
+                vhd_bytes=vhd_bytes,
+                contracts=contracts,
+                location="westus3",
+                vm_size="Standard_D4s_v5",
+                resource_group="rg-acceptance",
+                run_id="5001",
+                run_attempt="7",
+                output=output,
+            )
+        )
+
+        document = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(document["schema"], 1)
+        self.assertEqual(document["type"], "zvmi-freebsd15-azure-acceptance")
+        self.assertEqual(document["variant"], "x86_64-zfs-full")
+        self.assertEqual(document["architecture"], "x86_64")
+        self.assertEqual(document["filesystem"], "zfs")
+        self.assertEqual(document["flavor"], "full")
+        self.assertEqual(
+            document["asset_name"],
+            release.VARIANTS["x86_64-zfs-full"]["asset_name"],
+        )
+        self.assertEqual(document["source_commit"], self.source_commit)
+        self.assertEqual(document["qcow_sha256"], candidate["asset_sha256"])
+        self.assertNotIn("azure_accepted_sha256", document)
+        self.assertEqual(document["derived_vhd_sha256"], vhd_sha256)
+        self.assertEqual(document["derived_vhd_bytes"], vhd_bytes)
+        self.assertEqual(document["status"], "success")
+        self.assertEqual(document["location"], "westus3")
+        self.assertEqual(document["vm_size"], "Standard_D4s_v5")
+        self.assertEqual(document["resource_group"], "rg-acceptance")
+        self.assertEqual(document["contracts"], list(release.AZURE_CONTRACTS))
+        self.assertEqual(
+            document["workflow"], {"run_id": "5001", "run_attempt": "7"}
+        )
+
+    def test_azure_result_rejects_non_zfs_variant(self):
+        candidate_path = self.make_candidate("x86_64-ufs-full")
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        asset = candidate_path.parent / candidate["asset_name"]
+        with self.assertRaisesRegex(ValueError, "zfs"):
+            release.azure_result_command(
+                types.SimpleNamespace(
+                    manifest=candidate_path,
+                    asset=asset,
+                    key="x86_64-ufs-full",
+                    source_commit=self.source_commit,
+                    vhd_sha256="f" * 64,
+                    vhd_bytes=1024,
+                    contracts=",".join(release.AZURE_CONTRACTS),
+                    location="westus3",
+                    vm_size="Standard_D4s_v5",
+                    resource_group="rg-acceptance",
+                    run_id="5001",
+                    run_attempt="7",
+                    output=self.root / "azure-result.json",
+                )
+            )
+
+    def test_azure_result_rejects_variant_mismatch(self):
+        candidate_path = self.make_candidate("x86_64-zfs-full")
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        asset = candidate_path.parent / candidate["asset_name"]
+        with self.assertRaisesRegex(ValueError, "variant"):
+            release.azure_result_command(
+                types.SimpleNamespace(
+                    manifest=candidate_path,
+                    asset=asset,
+                    key="aarch64-zfs-full",
+                    source_commit=self.source_commit,
+                    vhd_sha256="f" * 64,
+                    vhd_bytes=1024,
+                    contracts=",".join(release.AZURE_CONTRACTS),
+                    location="westus3",
+                    vm_size="Standard_D4s_v5",
+                    resource_group="rg-acceptance",
+                    run_id="5001",
+                    run_attempt="7",
+                    output=self.root / "azure-result.json",
+                )
+            )
+
+    def test_azure_result_rejects_invalid_vhd_sha256(self):
+        candidate_path = self.make_candidate("x86_64-zfs-full")
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        asset = candidate_path.parent / candidate["asset_name"]
+        with self.assertRaisesRegex(ValueError, "VHD SHA-256"):
+            release.azure_result_command(
+                types.SimpleNamespace(
+                    manifest=candidate_path,
+                    asset=asset,
+                    key="x86_64-zfs-full",
+                    source_commit=self.source_commit,
+                    vhd_sha256="not-a-sha",
+                    vhd_bytes=1024,
+                    contracts=",".join(release.AZURE_CONTRACTS),
+                    location="westus3",
+                    vm_size="Standard_D4s_v5",
+                    resource_group="rg-acceptance",
+                    run_id="5001",
+                    run_attempt="7",
+                    output=self.root / "azure-result.json",
+                )
+            )
+
+    def test_azure_result_rejects_invalid_contracts(self):
+        candidate_path = self.make_candidate("x86_64-zfs-full")
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        asset = candidate_path.parent / candidate["asset_name"]
+        with self.assertRaisesRegex(ValueError, "contracts"):
+            release.azure_result_command(
+                types.SimpleNamespace(
+                    manifest=candidate_path,
+                    asset=asset,
+                    key="x86_64-zfs-full",
+                    source_commit=self.source_commit,
+                    vhd_sha256="f" * 64,
+                    vhd_bytes=1024,
+                    contracts="key-only-ssh,agent-ready",
+                    location="westus3",
+                    vm_size="Standard_D4s_v5",
+                    resource_group="rg-acceptance",
+                    run_id="5001",
+                    run_attempt="7",
+                    output=self.root / "azure-result.json",
+                )
+            )
+
+    def test_azure_result_rejects_empty_location(self):
+        candidate_path = self.make_candidate("x86_64-zfs-full")
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        asset = candidate_path.parent / candidate["asset_name"]
+        with self.assertRaisesRegex(ValueError, "location"):
+            release.azure_result_command(
+                types.SimpleNamespace(
+                    manifest=candidate_path,
+                    asset=asset,
+                    key="x86_64-zfs-full",
+                    source_commit=self.source_commit,
+                    vhd_sha256="f" * 64,
+                    vhd_bytes=1024,
+                    contracts=",".join(release.AZURE_CONTRACTS),
+                    location="",
+                    vm_size="Standard_D4s_v5",
+                    resource_group="rg-acceptance",
+                    run_id="5001",
+                    run_attempt="7",
+                    output=self.root / "azure-result.json",
+                )
+            )
+
+    def test_zfs_stage_requires_azure_results(self):
+        for key in release.RELEASE_SETS["zfs"]["variants"]:
+            self.make_candidate(key)
+        with self.assertRaisesRegex(ValueError, "azure-results"):
+            self.stage("zfs", azure_results=None)
+
+    def test_zfs_stage_with_valid_azure_results(self):
+        self.stage_set("zfs")
+
+        manifest = json.loads(
+            (self.output / "publish-manifest.json").read_text(encoding="utf-8")
+        )
+        for asset in manifest["assets"]:
+            self.assertEqual(asset["azure"]["location"], "eastus2")
+            self.assertEqual(asset["azure"]["vm_size"], "Standard_D2s_v5")
+            self.assertGreater(asset["azure"]["derived_vhd_bytes"], 0)
+            self.assertEqual(
+                asset["azure"]["contracts"],
+                list(release.AZURE_CONTRACTS),
+            )
+        notes = self.notes.read_text(encoding="utf-8")
+        self.assertIn("## Azure validation", notes)
+        self.assertIn("Exact-candidate matching-architecture Gen2 validation", notes)
+        self.assertIn("eastus2", notes)
+        self.assertIn("Standard_D2s_v5", notes)
+        self.assertNotIn("does not claim exact-candidate Azure validation", notes)
+
+    def test_zfs_stage_rejects_missing_azure_result(self):
+        for key in release.RELEASE_SETS["zfs"]["variants"]:
+            self.make_candidate(key)
+        self.make_azure_result("aarch64-zfs-full")
+        with self.assertRaisesRegex(ValueError, "expected 2 azure result"):
+            self.stage("zfs")
+
+    def test_zfs_stage_rejects_cross_variant_azure_result(self):
+        self.make_azure_result("aarch64-zfs-full")
+        self.make_azure_result("x86_64-zfs-full", variant="aarch64-zfs-full")
+        with self.assertRaisesRegex(ValueError, "duplicate aarch64-zfs-full"):
+            self.stage("zfs")
+
+    def test_zfs_stage_rejects_cross_commit_azure_result(self):
+        for key in release.RELEASE_SETS["zfs"]["variants"]:
+            self.make_azure_result(key)
+        path = self.azure_results / "x86_64-zfs-full" / "azure-result.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["source_commit"] = "b" * 40
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "source commit mismatch"):
+            self.stage("zfs")
+
+    def test_zfs_stage_rejects_tampered_qcow_digest(self):
+        for key in release.RELEASE_SETS["zfs"]["variants"]:
+            self.make_azure_result(key)
+        path = self.azure_results / "x86_64-zfs-full" / "azure-result.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["qcow_sha256"] = "0" * 64
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "QCOW SHA-256"):
+            self.stage("zfs")
+
+    def test_zfs_stage_rejects_incomplete_contracts(self):
+        self.make_azure_result("aarch64-zfs-full")
+        self.make_azure_result(
+            "x86_64-zfs-full",
+            contracts=list(release.AZURE_CONTRACTS[:-1]),
+        )
+        with self.assertRaisesRegex(ValueError, "contracts"):
+            self.stage("zfs")
+
+    def test_ufs_stage_rejects_azure_results_argument(self):
+        self.stage_set("ufs")
+        with self.assertRaisesRegex(ValueError, "not applicable"):
+            self.stage("ufs", azure_results=self.azure_results)
+
+    def test_core_stage_rejects_azure_results_argument(self):
+        self.stage_set("core")
+        with self.assertRaisesRegex(ValueError, "not applicable"):
+            self.stage("core", azure_results=self.azure_results)
 
     def test_rejects_incomplete_matrix(self):
         self.make_candidate("aarch64-zfs-full")
@@ -584,6 +879,55 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                     output=None,
                 )
             )
+
+
+    def test_azure_acceptance_harness_invocation_matches_parser(self):
+        """Static assertion: the shell harness calls azure-result with exactly
+        the arguments the Python parser expects."""
+        harness = (
+            Path(release.__file__).resolve().parent
+            / "freebsd15_azure_acceptance.sh"
+        )
+        source = harness.read_text(encoding="utf-8")
+        # Extract the argument names from the harness invocation block.
+        invocation = re.search(
+            r"python3 scripts/freebsd15_release\.py azure-result\b(.*?)(?:\n\n|\n[a-z#])",
+            source,
+            re.S,
+        )
+        self.assertIsNotNone(invocation, "azure-result invocation not found")
+        harness_args = sorted(
+            re.findall(r"--([a-z][-a-z0-9]*)", invocation.group(1))
+        )
+        # Extract the argument names from the parser.
+        p = release.parser()
+        azure_result_parser = None
+        for action in p._subparsers._actions:
+            if hasattr(action, "_parser_class"):
+                for name, subparser in action.choices.items():
+                    if name == "azure-result":
+                        azure_result_parser = subparser
+                        break
+        self.assertIsNotNone(azure_result_parser)
+        parser_args = sorted(
+            opt.lstrip("-")
+            for action in azure_result_parser._actions
+            for opt in action.option_strings
+            if opt.startswith("--") and opt != "--help"
+        )
+        self.assertEqual(harness_args, parser_args)
+
+    def test_publish_script_passes_azure_results_for_zfs(self):
+        """Static assertion: freebsd15_publish.sh passes --azure-results for
+        ZFS and validates AZURE_RESULTS_DIR only when needed."""
+        publish = (
+            Path(release.__file__).resolve().parent / "freebsd15_publish.sh"
+        )
+        source = publish.read_text(encoding="utf-8")
+        self.assertIn("AZURE_RESULTS_DIR", source)
+        self.assertIn("--azure-results", source)
+        # The ZFS conditional must gate the env check.
+        self.assertIn('RELEASE_SET" == "zfs"', source)
 
 
 if __name__ == "__main__":
