@@ -193,10 +193,17 @@ investigated and rejected:
 
 ## Size reporting
 
-Download size is the primary core-image metric. Each build records its asset
-size and package count in the workflow run summary, and every candidate carries
-its recorded package manifest. Given two staged release sets, the comparison
-table of full against core is produced by:
+Every schema-3 candidate records three distinct measures: the pinned virtual
+size, qemu-img's `actual-size` (the allocated QCOW2 size), and the
+compressed/download file size. Allocated size comes from the trusted
+`qemu-img info --output=json` validation result, not filesystem block counts.
+The staging manifest preserves all three measures. Schema-2 candidates and
+staging manifests are intentionally rejected rather than guessed or migrated;
+build artifacts are short-lived and must be regenerated with complete size
+metadata.
+
+Given two staged release sets, the comparison table of full against core is
+produced by:
 
 ```text
 python3 scripts/freebsd15_release.py compare \
@@ -205,9 +212,20 @@ python3 scripts/freebsd15_release.py compare \
   --output comparison.md
 ```
 
-The report leads with download size and reduction percentage, reports package
-counts alongside, and refuses to compare a set against itself or two variants
-that do not share a pinned virtual size.
+The report shows full and core virtual, allocated, and compressed/download
+sizes and reductions for both architectures. Argument roles are strict:
+`--baseline` must be the two-architecture full UFS release and `--candidate`
+must be the corresponding core UFS release, so reversing the comparison cannot
+turn a regression into an apparent improvement.
+
+Core staging is also the publication size gate. Both architectures must reduce
+both allocated and compressed/download size by at least 10% relative to their
+matching full UFS baselines, while virtual size may not increase. The reviewed
+default is `CORE_MINIMUM_REDUCTION_PERCENT = 10`; maintainers may set
+`stage --minimum-core-reduction-percent` explicitly for a release review.
+The exact boundary is inclusive. A full UFS staging manifest is mandatory via
+`stage --baseline`; missing, incomplete, cross-filesystem, wrong-flavor, or
+wrong-architecture baselines fail closed.
 
 Root storage handling is the one part that is deliberately *not* shared. The
 UFS and ZFS seeds embed disjoint shell fragments:
@@ -323,7 +341,9 @@ another set or another source commit, stages a draft, uploads exactly the
 set's assets, verifies GitHub's asset digests and a fresh download, and then
 publishes the non-Latest release. SHA-256 values and complete source/build
 provenance are recorded in the release notes; checksum sidecar assets are not
-published.
+published. Core publication additionally requires the reviewed full UFS
+baseline and enforces the size gate described above before creating the staging
+allowlist.
 
 The released QCOW2 files are not directly uploadable to Azure. Derive aligned
 fixed VHDs without changing their partitions:
