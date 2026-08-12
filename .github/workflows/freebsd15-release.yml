@@ -216,14 +216,195 @@ jobs:
           compression-level: 0
           retention-days: 2
 
-  publish:
-    name: verify release-set gate and publish
+  azure_acceptance:
+    name: Azure ${{ matrix.key }}
     needs: [prepare, build]
     if: >-
       ${{
         always() &&
         needs.prepare.result == 'success' &&
-        needs.build.result == 'success'
+        needs.build.result == 'success' &&
+        inputs.release_set == 'zfs'
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    environment: freebsd15-release
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: x86_64-zfs-full
+            architecture: x86_64
+            filesystem: zfs
+            flavor: full
+            asset_name: FreeBSD-15.1-x86_64.zfs.qcow2
+            location_variable: AZURE_LOCATION_X64
+            size_variable: AZURE_VM_SIZE_X64
+          - key: aarch64-zfs-full
+            architecture: aarch64
+            filesystem: zfs
+            flavor: full
+            asset_name: FreeBSD-15.1-aarch64.zfs.qcow2
+            location_variable: AZURE_LOCATION_ARM64
+            size_variable: AZURE_VM_SIZE_ARM64
+    env:
+      CANDIDATE_KEY: ${{ matrix.key }}
+      ARCHITECTURE: ${{ matrix.architecture }}
+      FILESYSTEM: ${{ matrix.filesystem }}
+      FLAVOR: ${{ matrix.flavor }}
+      ASSET_NAME: ${{ matrix.asset_name }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      CANDIDATE_DIR: .release/azure/${{ matrix.key }}/candidate
+      RESULT_DIR: artifact-staging/azure-results/${{ matrix.key }}
+      STATE_FILE: .release/azure/${{ matrix.key }}/resource-group
+      AZURE_LOCATION: ${{ vars[matrix.location_variable] }}
+      AZURE_VM_SIZE: ${{ vars[matrix.size_variable] }}
+    steps:
+      - name: Check out acceptance harness
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Check out accepted source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: release-source
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Download exact build-validated candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: freebsd15-candidate-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.CANDIDATE_DIR }}
+
+      - name: Fail closed on missing protected configuration
+        env:
+          AZURE_CLIENT_ID_VALUE: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID_VALUE: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID_VALUE: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          uuid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          [[ "$AZURE_CLIENT_ID_VALUE" =~ $uuid ]]
+          [[ "$AZURE_TENANT_ID_VALUE" =~ $uuid ]]
+          [[ "$AZURE_SUBSCRIPTION_ID_VALUE" =~ $uuid ]]
+          [[ "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ ]]
+          [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
+
+      - name: Log in to Azure with protected-environment OIDC
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Require Azure acceptance tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssh-client qemu-utils
+          for tool in az azcopy qemu-img ssh ssh-keygen python3; do
+            command -v "$tool" >/dev/null
+          done
+          az version --output json > /dev/null
+
+      - name: Build accepted-source zvmi
+        working-directory: release-source
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build --fetch \
+            --build-file "$GITHUB_WORKSPACE/vendor/zig-bzip2/build.zig" \
+            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build -Doptimize=ReleaseSafe
+          test -x zig-out/bin/zvmi
+
+      - name: Run exact-artifact Azure acceptance
+        env:
+          ZVMI: ${{ github.workspace }}/release-source/zig-out/bin/zvmi
+          RUN_ID_VALUE: ${{ github.run_id }}
+          RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
+        run: |
+          export GITHUB_RUN_ID=$RUN_ID_VALUE
+          export GITHUB_RUN_ATTEMPT=$RUN_ATTEMPT_VALUE
+          scripts/freebsd15_azure_acceptance.sh run
+
+      - name: Refresh Azure OIDC credential for unconditional cleanup
+        if: always()
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete only owned temporary Azure resources
+        if: always()
+        env:
+          RUN_ID_VALUE: ${{ github.run_id }}
+          RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
+        run: |
+          export GITHUB_RUN_ID=$RUN_ID_VALUE
+          export GITHUB_RUN_ATTEMPT=$RUN_ATTEMPT_VALUE
+          if [[ -x scripts/freebsd15_azure_acceptance.sh ]]; then
+            scripts/freebsd15_azure_acceptance.sh cleanup
+          elif [[ -s "$STATE_FILE" ]]; then
+            echo "::error::Cleanup script is absent while Azure state exists"
+            exit 1
+          fi
+
+      - name: Upload failed Azure acceptance diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: freebsd15-azure-failure-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.RESULT_DIR }}/*.json
+            ${{ env.RESULT_DIR }}/boot.log
+            ${{ env.RESULT_DIR }}/uefi-db.bin
+          if-no-files-found: warn
+          retention-days: 2
+
+      - name: Upload exact Azure acceptance result
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: freebsd15-azure-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.RESULT_DIR }}/azure-result.json
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Remove derived VHD and local credentials
+        if: always()
+        run: rm -rf -- ".release/azure/$CANDIDATE_KEY" "$RESULT_DIR"
+
+  publish:
+    name: verify release-set gate and publish
+    needs: [prepare, build, azure_acceptance]
+    if: >-
+      ${{
+        always() &&
+        needs.prepare.result == 'success' &&
+        needs.build.result == 'success' &&
+        (
+          inputs.release_set != 'zfs' ||
+          needs.azure_acceptance.result == 'success'
+        )
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -238,6 +419,8 @@ jobs:
       STAGING_ROOT: .release/freebsd15/staging
       REPOSITORY: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
+      AZURE_RESULTS_DIR: ${{ inputs.release_set == 'zfs' && '.release/freebsd15/azure-results' || '' }}
+      AZURE_RESULT: ${{ needs.azure_acceptance.result }}
     steps:
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -251,6 +434,23 @@ jobs:
           pattern: freebsd15-candidate-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
           path: ${{ env.CANDIDATES_DIR }}
           merge-multiple: false
+
+      - name: Download Azure acceptance results
+        if: inputs.release_set == 'zfs'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: freebsd15-azure-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.AZURE_RESULTS_DIR }}
+          merge-multiple: false
+
+      - name: Fail closed on incomplete Azure gate
+        if: inputs.release_set == 'zfs'
+        run: |
+          set -euo pipefail
+          test "$AZURE_RESULT" = success
+          test -d "$AZURE_RESULTS_DIR"
+          count=$(find "$AZURE_RESULTS_DIR" -name 'azure-result.json' | wc -l)
+          test "$count" -eq 2
 
       - name: Publish only the exact release-set allowlist
         run: scripts/freebsd15_publish.sh

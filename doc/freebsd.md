@@ -320,8 +320,15 @@ zvmi azure derive \
 The previous AArch64 build path was validated on an Azure Arm64 Gen2
 `Standard_D2pls_v5` VM. Provisioning, `waagent`, injected-key SSH, `hn0` DHCP,
 locked root, disabled swap, reboot identity, and managed serial output all
-passed. Exact-candidate Azure validation for future multi-architecture releases
-should be recorded separately from QEMU acceptance.
+passed. The ZFS release workflow now enforces exact-candidate Azure acceptance
+as a required gate before publication: both architectures must pass a protected
+Azure boot-and-contract validation run (using `scripts/freebsd15_azure_acceptance.sh`)
+against the same build artifacts accepted by the QEMU step, and the publication
+script refuses to proceed unless both `azure-result.json` files are present.
+The Azure acceptance job uses a protected GitHub environment with OIDC
+credentials and architecture-specific `AZURE_LOCATION_X64`/`AZURE_VM_SIZE_X64`
+and `AZURE_LOCATION_ARM64`/`AZURE_VM_SIZE_ARM64` configuration variables.
+UFS and core release sets skip Azure acceptance entirely.
 
 See [Image building](image-building.md) for the shared image-format and Azure
 VHD tooling.
