@@ -962,6 +962,19 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                     self.assertEqual(entry["filesystem"], profile["filesystem"])
                     self.assertEqual(entry["flavor"], profile["flavor"])
                     self.assertEqual(entry["asset_name"], profile["asset_name"])
+                    suffix = (
+                        "ARM64"
+                        if profile["architecture"] == "aarch64"
+                        else "X64"
+                    )
+                    self.assertEqual(
+                        entry["location_variable"],
+                        f"AZURE_LOCATION_{suffix}",
+                    )
+                    self.assertEqual(
+                        entry["size_variable"],
+                        f"AZURE_VM_SIZE_{suffix}",
+                    )
 
     def test_core_and_full_profiles_share_pinned_ufs_sources(self):
         for architecture in ("aarch64", "x86_64"):
@@ -1717,7 +1730,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             source,
         )
         self.assertIn("needs: [prepare, build, azure_acceptance]", stage_block)
-        self.assertIn("environment: freebsd15-release", source)
+        self.assertIn("environment: azurelinux4-release", source)
         self.assertIn("scripts/freebsd15_stage_release.sh", stage_block)
         self.assertIn("if: inputs.validation_only", stage_block)
         self.assertIn("freebsd15-validation-evidence-", stage_block)

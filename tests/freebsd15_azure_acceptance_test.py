@@ -482,8 +482,26 @@ def test_workflow_azure_acceptance_uses_oidc():
     section = content[idx : content.index("\n  stage:", idx)]
     assert "id-token: write" in section
     assert "azure/login@" in section
-    assert "environment: freebsd15-release" in section
-    assert "secrets.AZURE_SUBSCRIPTION_ID" in section
+    assert "environment: azurelinux4-release" in section
+    assert section.count("secrets.AZURE_CLIENT_ID") == 3
+    assert section.count("secrets.AZURE_TENANT_ID") == 3
+    assert section.count("secrets.AZURE_SUBSCRIPTION_ID") == 3
+    assert "AZURE_CLIENT_SECRET" not in section
+    assert "client-secret:" not in section
+
+
+def test_workflow_only_azure_acceptance_uses_protected_azure_configuration():
+    content = _workflow_content()
+    idx = content.index("azure_acceptance:")
+    section = content[idx : content.index("\n  stage:", idx)]
+    outside = content[:idx] + content[content.index("\n  stage:", idx) :]
+    assert content.count("environment: azurelinux4-release") == 1
+    assert "environment: freebsd15-release" not in content
+    assert "secrets.AZURE_" not in outside
+    assert "vars[matrix.location_variable]" not in outside
+    assert "vars[matrix.size_variable]" not in outside
+    assert "AZURE_LOCATION: ${{ vars[matrix.location_variable] }}" in section
+    assert "AZURE_VM_SIZE: ${{ vars[matrix.size_variable] }}" in section
 
 
 def test_workflow_azure_acceptance_uses_harness():

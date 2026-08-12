@@ -266,7 +266,9 @@ jobs:
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: 240
-    environment: freebsd15-release
+    # Reuse the established OIDC subscription and architecture-specific
+    # location/VM configuration used by Azure Linux acceptance.
+    environment: azurelinux4-release
     permissions:
       actions: read
       contents: read
