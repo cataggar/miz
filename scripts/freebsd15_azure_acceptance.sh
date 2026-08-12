@@ -65,6 +65,21 @@ PY
     echo "::error::Failed to delete owned temporary resource group"
     return 1
   fi
+  if ! group_exists=$(az group exists --name "$resource_group" --output tsv); then
+    echo "::error::Could not verify temporary resource-group deletion"
+    return 1
+  fi
+  case "$group_exists" in
+    false) ;;
+    true)
+      echo "::error::Owned temporary resource group still exists after deletion"
+      return 1
+      ;;
+    *)
+      echo "::error::Azure returned an invalid post-cleanup resource-group result"
+      return 1
+      ;;
+  esac
 }
 
 if [[ "$command_name" == cleanup ]]; then
@@ -360,12 +375,16 @@ short_arch=${ARCHITECTURE/x86_64/x64}
 short_arch=${short_arch/aarch64/arm64}
 name_seed="${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}${short_arch}"
 disk_name="zvmi-os-${name_seed}"
+image_name="zvmi-image-${name_seed}"
 vm_name="zvmi-vm-${name_seed}"
 admin_username=zvmitest
 vhd="$RESULT_DIR/${CANDIDATE_KEY}.vhd"
 private_key="$RESULT_DIR/id_ed25519"
 boot_log="$RESULT_DIR/boot.log"
 sku_json="$RESULT_DIR/sku.json"
+disk_json="$RESULT_DIR/disk.json"
+image_json="$RESULT_DIR/image.json"
+vm_json="$RESULT_DIR/vm.json"
 mkdir -p "$(dirname -- "$STATE_FILE")"
 rm -f -- "$STATE_FILE" "${STATE_FILE}.group.json" "$vhd" "$private_key" "$private_key.pub"
 
@@ -496,12 +515,16 @@ az disk create \
   --hyper-v-generation V2 \
   --architecture "$azure_image_architecture" \
   --output json >/dev/null
+subscription_id=$(az account show --query id --output tsv)
+[[ "$subscription_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+expected_disk_id="/subscriptions/$subscription_id/resourceGroups/$resource_group"
+expected_disk_id+="/providers/Microsoft.Compute/disks/$disk_name"
 disk_id=$(az disk show \
   --resource-group "$resource_group" \
   --name "$disk_name" \
   --query id \
   --output tsv)
-[[ "$disk_id" == /subscriptions/* ]]
+test "${disk_id,,}" = "${expected_disk_id,,}"
 upload_sas=$(grant_disk_write_access "$disk_id" 7200)
 [[ "$upload_sas" == https://* ]]
 echo "::add-mask::$upload_sas"
@@ -520,15 +543,161 @@ az disk update \
   --size-gb "$expanded_size_gib" \
   --output json >/dev/null
 
-# Create VM with key-only SSH
+# Validate the imported disk identity and matching architecture before using it.
+az disk show \
+  --resource-group "$resource_group" \
+  --name "$disk_name" \
+  --output json >"$disk_json"
+disk_id=$(
+  python3 - "$disk_json" "$expected_disk_id" "$disk_name" "$resource_group" \
+    "$AZURE_LOCATION" "$azure_image_architecture" "$expanded_size_gib" <<'PY'
+import json
+import sys
+
+(
+    path,
+    expected_id,
+    expected_name,
+    expected_group,
+    expected_location,
+    expected_architecture,
+    expected_size_gib,
+) = sys.argv[1:]
+document = json.load(open(path, encoding="utf-8"))
+
+
+def same(left, right):
+    return isinstance(left, str) and left.casefold() == right.casefold()
+
+
+if not same(document.get("id"), expected_id):
+    raise SystemExit("Azure returned a different managed disk identity")
+if document.get("name") != expected_name:
+    raise SystemExit("Azure returned a different managed disk name")
+resource_group = document.get("resourceGroup")
+if resource_group not in (None, "") and not same(resource_group, expected_group):
+    raise SystemExit("managed disk is outside the owned temporary resource group")
+if not same(document.get("location"), expected_location):
+    raise SystemExit("managed disk location mismatch")
+if not same(document.get("type"), "Microsoft.Compute/disks"):
+    raise SystemExit("Azure returned a non-disk resource")
+if document.get("osType") != "Linux":
+    raise SystemExit("managed disk OS type mismatch")
+if document.get("hyperVGeneration") != "V2":
+    raise SystemExit("managed disk is not Gen2")
+supported = document.get("supportedCapabilities")
+if not isinstance(supported, dict) or supported.get("architecture") != expected_architecture:
+    raise SystemExit("managed disk architecture mismatch")
+if document.get("diskState") != "Unattached":
+    raise SystemExit("managed disk is not safely detached after upload")
+if document.get("provisioningState") != "Succeeded":
+    raise SystemExit("managed disk provisioning did not succeed")
+if document.get("diskSizeGb") != int(expected_size_gib):
+    raise SystemExit("managed disk expansion size mismatch")
+print(document["id"])
+PY
+)
+test "${disk_id,,}" = "${expected_disk_id,,}"
+test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
+test "$(sha256sum "$vhd" | awk '{print $1}')" = "$vhd_sha256"
+
+# Create a private, temporary generalized Gen2 image from the exact managed disk.
+az image create \
+  --resource-group "$resource_group" \
+  --name "$image_name" \
+  --location "$AZURE_LOCATION" \
+  --source "$disk_id" \
+  --os-type Linux \
+  --hyper-v-generation V2 \
+  --storage-sku Standard_LRS \
+  --output json >/dev/null
+az image show \
+  --resource-group "$resource_group" \
+  --name "$image_name" \
+  --output json >"$image_json"
+expected_image_id="/subscriptions/$subscription_id/resourceGroups/$resource_group"
+expected_image_id+="/providers/Microsoft.Compute/images/$image_name"
+image_id=$(
+  python3 - "$image_json" "$expected_image_id" "$image_name" "$resource_group" \
+    "$AZURE_LOCATION" "$disk_id" "$azure_image_architecture" \
+    "$expanded_size_gib" <<'PY'
+import json
+import sys
+
+(
+    path,
+    expected_id,
+    expected_name,
+    expected_group,
+    expected_location,
+    expected_disk_id,
+    expected_architecture,
+    expected_size_gib,
+) = sys.argv[1:]
+document = json.load(open(path, encoding="utf-8"))
+
+
+def same(left, right):
+    return isinstance(left, str) and left.casefold() == right.casefold()
+
+
+if not same(document.get("id"), expected_id):
+    raise SystemExit("Azure returned a different image identity")
+if document.get("name") != expected_name:
+    raise SystemExit("Azure returned a different image name")
+resource_group = document.get("resourceGroup")
+if resource_group not in (None, "") and not same(resource_group, expected_group):
+    raise SystemExit("image is outside the owned temporary resource group")
+if not same(document.get("location"), expected_location):
+    raise SystemExit("image location mismatch")
+if not same(document.get("type"), "Microsoft.Compute/images"):
+    raise SystemExit("Azure returned a non-image resource")
+if document.get("hyperVGeneration") != "V2":
+    raise SystemExit("temporary image is not Gen2")
+if document.get("provisioningState") != "Succeeded":
+    raise SystemExit("temporary image provisioning did not succeed")
+
+storage = document.get("storageProfile")
+if not isinstance(storage, dict):
+    raise SystemExit("temporary image storage profile is missing")
+os_disk = storage.get("osDisk")
+if not isinstance(os_disk, dict):
+    raise SystemExit("temporary image OS disk metadata is missing")
+if os_disk.get("osType") != "Linux":
+    raise SystemExit("temporary image OS type mismatch")
+if os_disk.get("osState") != "Generalized":
+    raise SystemExit("temporary image is not generalized")
+image_size_gib = os_disk.get("diskSizeGb")
+if image_size_gib is not None and image_size_gib != int(expected_size_gib):
+    raise SystemExit("temporary image OS disk size mismatch")
+storage_account_type = os_disk.get("storageAccountType")
+if storage_account_type not in (None, "Standard_LRS"):
+    raise SystemExit("temporary image OS disk storage type mismatch")
+managed_disk = os_disk.get("managedDisk")
+if not isinstance(managed_disk, dict) or not same(
+    managed_disk.get("id"), expected_disk_id
+):
+    raise SystemExit("temporary image is not sourced from the exact managed disk")
+if storage.get("dataDisks") not in (None, []):
+    raise SystemExit("temporary image unexpectedly contains data disks")
+
+for owner in (document, os_disk):
+    architecture = owner.get("architecture")
+    if architecture not in (None, "") and architecture != expected_architecture:
+        raise SystemExit("temporary image architecture mismatch")
+print(document["id"])
+PY
+)
+test "${image_id,,}" = "${expected_image_id,,}"
+
+# Create the matching-architecture VM from the generalized image with key-only SSH.
 ssh-keygen -q -t ed25519 -N '' -C zvmi-azure-acceptance -f "$private_key"
 az vm create \
   --resource-group "$resource_group" \
   --name "$vm_name" \
   --location "$AZURE_LOCATION" \
   --size "$AZURE_VM_SIZE" \
-  --attach-os-disk "$disk_name" \
-  --os-type Linux \
+  --image "$image_id" \
   --admin-username "$admin_username" \
   --authentication-type ssh \
   --ssh-key-values "$private_key.pub" \
@@ -538,6 +707,120 @@ az vm create \
   --nsg-rule SSH \
   --boot-diagnostics-storage "" \
   --output json >/dev/null
+az vm show \
+  --resource-group "$resource_group" \
+  --name "$vm_name" \
+  --output json >"$vm_json"
+expected_vm_id="/subscriptions/$subscription_id/resourceGroups/$resource_group"
+expected_vm_id+="/providers/Microsoft.Compute/virtualMachines/$vm_name"
+vm_id=$(
+  python3 - "$vm_json" "$expected_vm_id" "$vm_name" "$resource_group" \
+    "$AZURE_LOCATION" "$AZURE_VM_SIZE" "$image_id" "$admin_username" \
+    "$azure_image_architecture" <<'PY'
+import json
+import re
+import sys
+
+(
+    path,
+    expected_id,
+    expected_name,
+    expected_group,
+    expected_location,
+    expected_size,
+    expected_image_id,
+    expected_admin,
+    expected_architecture,
+) = sys.argv[1:]
+document = json.load(open(path, encoding="utf-8"))
+
+
+def same(left, right):
+    return isinstance(left, str) and left.casefold() == right.casefold()
+
+
+if not same(document.get("id"), expected_id):
+    raise SystemExit("Azure returned a different VM identity")
+if document.get("name") != expected_name:
+    raise SystemExit("Azure returned a different VM name")
+resource_group = document.get("resourceGroup")
+if resource_group not in (None, "") and not same(resource_group, expected_group):
+    raise SystemExit("VM is outside the owned temporary resource group")
+if not same(document.get("location"), expected_location):
+    raise SystemExit("VM location mismatch")
+if not same(document.get("type"), "Microsoft.Compute/virtualMachines"):
+    raise SystemExit("Azure returned a non-VM resource")
+if document.get("provisioningState") != "Succeeded":
+    raise SystemExit("VM provisioning did not succeed")
+if not re.fullmatch(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+    document.get("vmId", ""),
+):
+    raise SystemExit("Azure returned an invalid VM instance identity")
+
+hardware = document.get("hardwareProfile")
+if not isinstance(hardware, dict) or hardware.get("vmSize") != expected_size:
+    raise SystemExit("VM size mismatch")
+storage = document.get("storageProfile")
+if not isinstance(storage, dict):
+    raise SystemExit("VM storage profile is missing")
+image_reference = storage.get("imageReference")
+if not isinstance(image_reference, dict) or not same(
+    image_reference.get("id"), expected_image_id
+):
+    raise SystemExit("VM is not bound to the exact temporary image")
+os_disk = storage.get("osDisk")
+if not isinstance(os_disk, dict):
+    raise SystemExit("VM OS disk metadata is missing")
+if os_disk.get("osType") != "Linux" or os_disk.get("createOption") != "FromImage":
+    raise SystemExit("VM OS disk was not created as Linux from the image")
+vm_os_disk_id = (os_disk.get("managedDisk") or {}).get("id")
+disk_prefix = (
+    expected_id.rsplit("/providers/", 1)[0]
+    + "/providers/Microsoft.Compute/disks/"
+)
+if not isinstance(vm_os_disk_id, str) or not vm_os_disk_id.casefold().startswith(
+    disk_prefix.casefold()
+):
+    raise SystemExit("VM OS disk is outside the owned temporary resource group")
+
+os_profile = document.get("osProfile")
+if not isinstance(os_profile, dict) or os_profile.get("adminUsername") != expected_admin:
+    raise SystemExit("VM administrator identity mismatch")
+linux = os_profile.get("linuxConfiguration")
+if not isinstance(linux, dict):
+    raise SystemExit("VM Linux provisioning policy is missing")
+if linux.get("disablePasswordAuthentication") is not True:
+    raise SystemExit("VM does not require key-only authentication")
+if linux.get("provisionVMAgent") is not False:
+    raise SystemExit("VM agent policy mismatch")
+
+security = document.get("securityProfile") or {}
+security_type = security.get("securityType")
+if security_type not in (None, "Standard"):
+    raise SystemExit("VM security type mismatch")
+boot = (document.get("diagnosticsProfile") or {}).get("bootDiagnostics") or {}
+if boot.get("enabled") is not True or boot.get("storageUri") not in (None, ""):
+    raise SystemExit("VM managed boot diagnostics policy mismatch")
+interfaces = (document.get("networkProfile") or {}).get("networkInterfaces")
+if not isinstance(interfaces, list) or len(interfaces) != 1:
+    raise SystemExit("VM network interface metadata is missing or ambiguous")
+nic_prefix = (
+    expected_id.rsplit("/providers/", 1)[0]
+    + "/providers/Microsoft.Network/networkInterfaces/"
+)
+if not same(interfaces[0].get("id", "")[: len(nic_prefix)], nic_prefix):
+    raise SystemExit("VM network interface is outside the owned temporary resource group")
+
+for owner in (document, hardware, os_disk):
+    architecture = owner.get("architecture")
+    if architecture not in (None, "") and architecture != expected_architecture:
+        raise SystemExit("VM architecture mismatch")
+print(document["id"])
+PY
+)
+test "${vm_id,,}" = "${expected_vm_id,,}"
 public_ip=$(az vm show \
   --resource-group "$resource_group" \
   --name "$vm_name" \
@@ -545,6 +828,11 @@ public_ip=$(az vm show \
   --query publicIps \
   --output tsv)
 [[ "$public_ip" =~ ^[0-9a-fA-F:.]+$ ]]
+test "$(az vm get-instance-view \
+  --resource-group "$resource_group" \
+  --name "$vm_name" \
+  --query "instanceView.statuses[?code=='ProvisioningState/succeeded'].code | [0]" \
+  --output tsv)" = ProvisioningState/succeeded
 test "$(az vm get-instance-view \
   --resource-group "$resource_group" \
   --name "$vm_name" \
@@ -637,7 +925,7 @@ require_serial_console_log() {
 }
 
 # --- CONTRACT: matching-architecture-gen2 ---
-# (Gen2 enforced by disk hyper-v-generation V2)
+# (Gen2 and architecture are validated across SKU, source disk, image, and VM.)
 
 # --- CONTRACT: key-only-ssh ---
 wait_for_ssh
@@ -870,6 +1158,7 @@ python3 scripts/freebsd15_release.py azure-result \
 
 # Final source-digest assertion
 test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
+test "$(sha256sum "$vhd" | awk '{print $1}')" = "$vhd_sha256"
 
 {
   echo "### Azure acceptance: $ASSET_NAME"
@@ -878,6 +1167,7 @@ test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
   echo "- Derived VHD: \`$vhd_sha256\`; current $vhd_current_size bytes;" \
     "file $vhd_bytes bytes (not retained or published)"
   echo "- Azure: \`$AZURE_LOCATION\` / \`$AZURE_VM_SIZE\`"
+  echo "- Temporary managed disk, generalized image, and VM: owned resource-group cleanup"
   echo "- Contracts: $contracts"
   echo "- Status: success"
 } >>"$GITHUB_STEP_SUMMARY"

@@ -292,6 +292,63 @@ def test_gen2_disk():
     assert "--hyper-v-generation V2" in content
 
 
+def test_generalized_gen2_image_precedes_provisioned_vm():
+    content = Path(SCRIPT).read_text(encoding="utf-8")
+    image_create = content.index("az image create")
+    vm_create = content.index("az vm create", image_create)
+    image_block = content[image_create:vm_create]
+    vm_end = content.index("\naz vm show", vm_create)
+    vm_block = content[vm_create:vm_end]
+
+    assert image_create < vm_create
+    assert '--source "$disk_id"' in image_block
+    assert "--os-type Linux" in image_block
+    assert "--hyper-v-generation V2" in image_block
+    assert 'os_disk.get("osState") != "Generalized"' in image_block
+    assert '--image "$image_id"' in vm_block
+    assert '--admin-username "$admin_username"' in vm_block
+    assert "--authentication-type ssh" in vm_block
+    assert '--ssh-key-values "$private_key.pub"' in vm_block
+    assert "--enable-agent false" in vm_block
+    assert "--security-type Standard" in vm_block
+    assert '--size "$AZURE_VM_SIZE"' in vm_block
+    assert '--location "$AZURE_LOCATION"' in vm_block
+    assert "--public-ip-sku Standard" in vm_block
+    assert "--nsg-rule SSH" in vm_block
+    assert '--boot-diagnostics-storage ""' in vm_block
+    assert "--attach-os-disk" not in content
+
+
+def test_disk_image_and_vm_source_identities_fail_closed():
+    content = Path(SCRIPT).read_text(encoding="utf-8")
+    assert 'expected_disk_id="/subscriptions/$subscription_id/' in content
+    assert 'test "${disk_id,,}" = "${expected_disk_id,,}"' in content
+    assert "managed disk architecture mismatch" in content
+    assert "temporary image is not sourced from the exact managed disk" in content
+    assert 'expected_image_id="/subscriptions/$subscription_id/' in content
+    assert 'test "${image_id,,}" = "${expected_image_id,,}"' in content
+    assert "VM is not bound to the exact temporary image" in content
+    assert 'expected_vm_id="/subscriptions/$subscription_id/' in content
+    assert 'test "${vm_id,,}" = "${expected_vm_id,,}"' in content
+    assert "VM architecture mismatch" in content
+    assert content.count(
+        'test "$(sha256sum "$asset" | awk \'{print $1}\')" = "$qcow_sha256"'
+    ) >= 3
+    assert content.count(
+        'test "$(sha256sum "$vhd" | awk \'{print $1}\')" = "$vhd_sha256"'
+    ) == 2
+
+
+def test_owned_resource_group_cleanup_removes_private_image_and_vm():
+    content = Path(SCRIPT).read_text(encoding="utf-8")
+    assert 'image_name="zvmi-image-${name_seed}"' in content
+    assert 'trap cleanup_on_exit EXIT' in content
+    assert 'az group delete --name "$resource_group" --yes' in content
+    assert "Owned temporary resource group still exists after deletion" in content
+    assert "az image delete" not in content
+    assert "az vm delete" not in content
+
+
 def test_expanded_disk():
     with open(SCRIPT) as f:
         content = f.read()
