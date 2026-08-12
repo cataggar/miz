@@ -401,9 +401,13 @@ Azure boot-and-contract validation run (using
 accepted by the QEMU step, and the publication script refuses to proceed unless
 both `azure-result.json` files are present. Full UFS publication retains its
 existing QEMU-only behavior and rejects accidental Azure-result input.
-The Azure acceptance job uses a protected GitHub environment with OIDC
-credentials and architecture-specific `AZURE_LOCATION_X64`/`AZURE_VM_SIZE_X64`
-and `AZURE_LOCATION_ARM64`/`AZURE_VM_SIZE_ARM64` configuration variables.
+The Azure acceptance job reuses the existing protected
+`azurelinux4-release` GitHub environment so FreeBSD validation runs in the
+same Azure subscription as Azure Linux validation. It authenticates only with
+OIDC through the `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and
+`AZURE_SUBSCRIPTION_ID` secrets and selects the architecture-specific
+`AZURE_LOCATION_X64`/`AZURE_VM_SIZE_X64` or
+`AZURE_LOCATION_ARM64`/`AZURE_VM_SIZE_ARM64` configuration variables.
 The harness also accepts UFS full and core candidates, using the same protected
 subscription configuration and temporary-resource-group ownership model. Its
 shared Gen2, provisioning, network, serial, reboot, identity, GPT, growth, and
