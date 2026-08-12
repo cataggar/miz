@@ -272,6 +272,20 @@ def test_never_retains_vhd():
     assert 'rm -f -- "$vhd"' in content
 
 
+def test_fixed_vhd_validation_uses_footer_current_size():
+    content = Path(SCRIPT).read_text(encoding="utf-8")
+    assert "python3 scripts/azure_vhd.py verify" in content
+    assert 'vhd_current_size=${vhd_geometry[0]}' in content
+    assert 'test "$vhd_bytes" -eq "$((vhd_current_size + 512))"' in content
+    assert "f.seek(virtual_size)" not in content
+    assert "file size == virtual size + 512" not in content
+    assert (
+        'expanded_size_gib=$(((vhd_current_size + 1073741823) '
+        "/ 1073741824 + 2))"
+    ) in content
+    assert '--vhd-current-size "$vhd_current_size"' in content
+
+
 def test_gen2_disk():
     with open(SCRIPT) as f:
         content = f.read()

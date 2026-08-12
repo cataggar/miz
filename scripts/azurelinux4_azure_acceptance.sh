@@ -404,10 +404,11 @@ readarray -t vhd_geometry < <(
     --vhd "$vhd"
 )
 test "${#vhd_geometry[@]}" -eq 2
-vhd_virtual_size=${vhd_geometry[0]}
+vhd_current_size=${vhd_geometry[0]}
 vhd_bytes=${vhd_geometry[1]}
-expected_vhd_virtual_size=$(((virtual_size + 1048575) / 1048576 * 1048576))
-test "$vhd_virtual_size" -eq "$expected_vhd_virtual_size"
+expected_vhd_current_size=$(((virtual_size + 1048575) / 1048576 * 1048576))
+test "$vhd_current_size" -eq "$expected_vhd_current_size"
+test "$vhd_bytes" -eq "$((vhd_current_size + 512))"
 vhd_sha256=$(sha256sum "$vhd" | awk '{print $1}')
 [[ "$vhd_sha256" =~ ^[0-9a-f]{64}$ ]]
 
@@ -438,7 +439,7 @@ az disk revoke-access \
   --output json >/dev/null
 upload_sas=
 
-expanded_size_gib=$(((virtual_size + 1073741823) / 1073741824 + 2))
+expanded_size_gib=$(((vhd_current_size + 1073741823) / 1073741824 + 2))
 az disk update \
   --resource-group "$resource_group" \
   --name "$disk_name" \
@@ -681,7 +682,7 @@ if ssh \
 fi
 
 ssh "${ssh_options[@]}" "$ssh_target" \
-  "/usr/bin/bash -s -- '$virtual_size' '$runtime_architecture' '$ARCHITECTURE'" <<'GUEST'
+  "/usr/bin/bash -s -- '$vhd_current_size' '$runtime_architecture' '$ARCHITECTURE'" <<'GUEST'
 set -Eeuo pipefail
 guest_error() {
   status=$1
@@ -923,6 +924,7 @@ python3 scripts/azurelinux4_release.py azure-result \
   --manifest "$manifest" \
   --asset "$asset" \
   --vhd "$vhd" \
+  --vhd-current-size "$vhd_current_size" \
   --key "$CANDIDATE_KEY" \
   --source-commit "$SOURCE_COMMIT" \
   --location "$AZURE_LOCATION" \
@@ -940,7 +942,8 @@ test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
   echo "### Azure acceptance: $ASSET_NAME"
   echo
   echo "- QCOW2 SHA-256: \`$qcow_sha256\`"
-  echo "- Temporary VHD SHA-256: \`$vhd_sha256\` (not retained or published)"
+  echo "- Temporary VHD: \`$vhd_sha256\`; current $vhd_current_size bytes;" \
+    "file $vhd_bytes bytes (not retained or published)"
   echo "- UKI SHA-256: \`$fallback_uki_sha256\`"
   echo "- Signing certificate SHA-256: \`$certificate_sha256\`"
   echo "- Azure: \`$AZURE_LOCATION\` / \`$AZURE_VM_SIZE\`"

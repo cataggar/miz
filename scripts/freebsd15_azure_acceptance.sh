@@ -400,41 +400,16 @@ test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
 # Structural VHD inspection
 qemu-img info -f vpc --output=json "$vhd" >"$RESULT_DIR/vhd-info.json"
 readarray -t vhd_geometry < <(
-  python3 - "$RESULT_DIR/vhd-info.json" "$vhd" <<'PY'
-import json
-import os
-import struct
-import sys
-
-info = json.load(open(sys.argv[1], encoding="utf-8"))
-vhd_path = sys.argv[2]
-vhd_size = os.path.getsize(vhd_path)
-virtual_size = info["virtual-size"]
-# Fixed VHD: file size == virtual size + 512 byte footer
-if vhd_size != virtual_size + 512:
-    raise SystemExit(f"VHD is not a fixed-size image: file={vhd_size} virtual={virtual_size}")
-# Validate footer magic
-with open(vhd_path, "rb") as f:
-    f.seek(virtual_size)
-    footer = f.read(512)
-if footer[:8] != b"conectix":
-    raise SystemExit("VHD footer magic is missing")
-# Disk type field at offset 60: must be 2 (Fixed)
-disk_type = struct.unpack(">I", footer[60:64])[0]
-if disk_type != 2:
-    raise SystemExit(f"VHD disk type is {disk_type}, expected 2 (Fixed)")
-# Virtual size must be 1 MiB aligned for Azure
-if virtual_size % (1024 * 1024) != 0:
-    raise SystemExit(f"VHD virtual size {virtual_size} is not 1 MiB aligned")
-print(virtual_size)
-print(vhd_size)
-PY
+  python3 scripts/azure_vhd.py verify \
+    --info "$RESULT_DIR/vhd-info.json" \
+    --vhd "$vhd"
 )
 test "${#vhd_geometry[@]}" -eq 2
-vhd_virtual_size=${vhd_geometry[0]}
+vhd_current_size=${vhd_geometry[0]}
 vhd_bytes=${vhd_geometry[1]}
-expected_vhd_virtual_size=$(((virtual_size + 1048575) / 1048576 * 1048576))
-test "$vhd_virtual_size" -eq "$expected_vhd_virtual_size"
+expected_vhd_current_size=$(((virtual_size + 1048575) / 1048576 * 1048576))
+test "$vhd_current_size" -eq "$expected_vhd_current_size"
+test "$vhd_bytes" -eq "$((vhd_current_size + 512))"
 vhd_sha256=$(sha256sum "$vhd" | awk '{print $1}')
 [[ "$vhd_sha256" =~ ^[0-9a-f]{64}$ ]]
 
@@ -538,7 +513,7 @@ az disk revoke-access \
 upload_sas=
 
 # Expand the OS disk to exercise root partition/pool growth
-expanded_size_gib=$(((virtual_size + 1073741823) / 1073741824 + 2))
+expanded_size_gib=$(((vhd_current_size + 1073741823) / 1073741824 + 2))
 az disk update \
   --resource-group "$resource_group" \
   --name "$disk_name" \
@@ -694,7 +669,7 @@ fi
 # --- SHARED CONTRACTS: agent-ready, hn0-dhcp, root-growth, gpt-healthy ---
 # --- FILESYSTEM CONTRACTS: ufs-root / zfs-root and their growth/health state ---
 ssh "${ssh_options[@]}" "$ssh_target" \
-  "/bin/sh -s -- '$virtual_size' '$runtime_architecture' '$FILESYSTEM'" <<'GUEST'
+  "/bin/sh -s -- '$vhd_current_size' '$runtime_architecture' '$FILESYSTEM'" <<'GUEST'
 set -eu
 original_size=$1
 runtime_arch=$2
@@ -887,6 +862,7 @@ python3 scripts/freebsd15_release.py azure-result \
   --resource-group "$resource_group" \
   --vhd-sha256 "$vhd_sha256" \
   --vhd-bytes "$vhd_bytes" \
+  --vhd-current-size "$vhd_current_size" \
   --contracts "$contracts" \
   --run-id "$GITHUB_RUN_ID" \
   --run-attempt "$GITHUB_RUN_ATTEMPT" \
@@ -899,7 +875,8 @@ test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
   echo "### Azure acceptance: $ASSET_NAME"
   echo
   echo "- QCOW2 SHA-256: \`$qcow_sha256\`"
-  echo "- Derived VHD SHA-256: \`$vhd_sha256\` (not retained or published)"
+  echo "- Derived VHD: \`$vhd_sha256\`; current $vhd_current_size bytes;" \
+    "file $vhd_bytes bytes (not retained or published)"
   echo "- Azure: \`$AZURE_LOCATION\` / \`$AZURE_VM_SIZE\`"
   echo "- Contracts: $contracts"
   echo "- Status: success"
