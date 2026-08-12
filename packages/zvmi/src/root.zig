@@ -9,7 +9,9 @@
 //! bootloader population (copy EFI binaries + generate grub.cfg/BLS),
 //! Secure Boot MOK asset plumbing, UKI generation, dm-verity hash-tree
 //! generation + kernel cmdline/COSI metadata wiring,
-//! qcow2 read/write, VHDX read/write, ISO9660 **read-only** and SquashFS
+//! qcow2 read/write, VHDX read/write, ISO9660 read/write (reader handles
+//! Rock Ridge/Joliet; writer emits deterministic Rock Ridge images with
+//! optional El Torito boot support from a pull-based tree) and SquashFS
 //! read/write (reader handles XZ/zstd-compressed blocks; writer emits zstd
 //! or uncompressed images from a pull-based tree), local OCI image ingestion, a minimal native ext4
 //! writer/readback helper, COSI output packaging, and the initial

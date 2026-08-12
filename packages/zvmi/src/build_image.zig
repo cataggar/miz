@@ -4706,22 +4706,63 @@ fn appendCpioTestEntry(list: *std.array_list.Managed(u8), name: []const u8, cont
     while (list.items.len % 4 != 0) try list.append(0);
 }
 
-fn appendU16Le(list: *std.array_list.Managed(u8), value: u16) !void {
-    var buf: [2]u8 = undefined;
-    std.mem.writeInt(u16, &buf, value, .little);
-    try list.appendSlice(&buf);
-}
+// Minimal in-memory adapter to the production ISO9660 writer, used only by the
+// test fixtures below so they emit real Rock Ridge images through the same code
+// path the library ships rather than duplicating a hand-rolled byte emitter.
+const FixtureIsoNode = struct {
+    path: []const u8,
+    kind: iso9660.SourceKind,
+    bytes: []const u8 = &.{},
+};
 
-fn appendU32Le(list: *std.array_list.Managed(u8), value: u32) !void {
-    var buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &buf, value, .little);
-    try list.appendSlice(&buf);
-}
+const FixtureIsoSource = struct {
+    nodes: []const FixtureIsoNode,
 
-fn appendU64Le(list: *std.array_list.Managed(u8), value: u64) !void {
-    var buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &buf, value, .little);
-    try list.appendSlice(&buf);
+    fn source(self: *const FixtureIsoSource) iso9660.TreeSource {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    const vtable = iso9660.TreeSource.VTable{
+        .root = rootFn,
+        .count = countFn,
+        .node = nodeFn,
+        .read = readFn,
+    };
+
+    fn ctx(context: *const anyopaque) *const FixtureIsoSource {
+        return @ptrCast(@alignCast(context));
+    }
+    fn rootFn(_: *const anyopaque) iso9660.SourceRoot {
+        return .{ .mode = 0o755 };
+    }
+    fn countFn(context: *const anyopaque) usize {
+        return ctx(context).nodes.len;
+    }
+    fn nodeFn(context: *const anyopaque, index: usize) anyerror!iso9660.SourceNode {
+        const n = ctx(context).nodes[index];
+        return .{
+            .path = n.path,
+            .kind = n.kind,
+            .mode = if (n.kind == .directory) 0o755 else 0o644,
+            .size = n.bytes.len,
+        };
+    }
+    fn readFn(context: *const anyopaque, index: usize, buffer: []u8, offset: u64) anyerror!usize {
+        const data = ctx(context).nodes[index].bytes;
+        if (offset >= data.len) return 0;
+        const start: usize = @intCast(offset);
+        const n = @min(buffer.len, data.len - start);
+        @memcpy(buffer[0..n], data[start..][0..n]);
+        return n;
+    }
+};
+
+// ISO9660 identifiers historically carried a `;1` version suffix; the writer
+// derives its own identifiers, so strip it to recover the POSIX name the tree
+// should expose through Rock Ridge.
+fn stripVersionSuffix(name: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, name, ";1")) return name[0 .. name.len - 2];
+    return name;
 }
 
 fn writeMinimalIsoWithFile(
@@ -4731,58 +4772,11 @@ fn writeMinimalIsoWithFile(
     iso_file_name: []const u8,
     bytes: []const u8,
 ) !void {
-    const root_lba: u32 = 20;
-    const file_lba: u32 = 21;
-
-    var image = std.array_list.Managed(u8).init(allocator);
-    defer image.deinit();
-    try image.resize((file_lba + @as(u32, @intCast(std.math.divCeil(u64, bytes.len, iso9660.descriptor_size) catch unreachable))) * iso9660.descriptor_size);
-    @memset(image.items, 0);
-
-    var pvd: [iso9660.descriptor_size]u8 = [_]u8{0} ** iso9660.descriptor_size;
-    pvd[0] = 1;
-    pvd[1..6].* = iso9660.standard_id;
-    pvd[6] = 1;
-    write733(pvd[80..88], @intCast(image.items.len / iso9660.descriptor_size));
-    write723(pvd[128..132], iso9660.descriptor_size);
-    write733(pvd[132..140], 0);
-    std.mem.writeInt(u32, pvd[140..144], 19, .little);
-    const root_record = makeDirectoryRecord(&.{0}, root_lba, iso9660.descriptor_size, 0x02, &.{});
-    @memcpy(pvd[156 .. 156 + root_record[0]], root_record[0..root_record[0]]);
-    image.items[iso9660.volume_descriptor_lba * iso9660.descriptor_size .. (iso9660.volume_descriptor_lba + 1) * iso9660.descriptor_size].* = pvd;
-
-    var terminator: [iso9660.descriptor_size]u8 = [_]u8{0} ** iso9660.descriptor_size;
-    terminator[0] = 255;
-    terminator[1..6].* = iso9660.standard_id;
-    terminator[6] = 1;
-    image.items[(iso9660.volume_descriptor_lba + 1) * iso9660.descriptor_size .. (iso9660.volume_descriptor_lba + 2) * iso9660.descriptor_size].* = terminator;
-
-    var path_table = std.array_list.Managed(u8).init(allocator);
-    defer path_table.deinit();
-    try path_table.append(1);
-    try path_table.append(0);
-    try appendU32Le(&path_table, root_lba);
-    try appendU16Le(&path_table, 1);
-    try path_table.append(0);
-    try path_table.append(0);
-    write733(image.items[16 * iso9660.descriptor_size + 132 .. 16 * iso9660.descriptor_size + 140], @intCast(path_table.items.len));
-    @memcpy(image.items[19 * iso9660.descriptor_size ..][0..path_table.items.len], path_table.items);
-
-    var root_dir = std.array_list.Managed(u8).init(allocator);
-    defer root_dir.deinit();
-    const dot = makeDirectoryRecord(&.{0}, root_lba, iso9660.descriptor_size, 0x02, &.{});
-    try root_dir.appendSlice(dot[0..dot[0]]);
-    const dotdot = makeDirectoryRecord(&.{1}, root_lba, iso9660.descriptor_size, 0x02, &.{});
-    try root_dir.appendSlice(dotdot[0..dotdot[0]]);
-    const file_record = makeDirectoryRecord(iso_file_name, file_lba, bytes.len, 0, &.{});
-    try root_dir.appendSlice(file_record[0..file_record[0]]);
-    @memcpy(image.items[root_lba * iso9660.descriptor_size ..][0..root_dir.items.len], root_dir.items);
-
-    @memcpy(image.items[file_lba * iso9660.descriptor_size ..][0..bytes.len], bytes);
-
-    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
-    defer file.close(io);
-    try file.writePositionalAll(io, image.items, 0);
+    const nodes = [_]FixtureIsoNode{
+        .{ .path = stripVersionSuffix(iso_file_name), .kind = .file, .bytes = bytes },
+    };
+    const src = FixtureIsoSource{ .nodes = &nodes };
+    _ = try iso9660.writeImagePath(allocator, io, path, src.source(), .{});
 }
 
 fn writeMinimalIsoWithBootPayloads(
@@ -4796,124 +4790,17 @@ fn writeMinimalIsoWithBootPayloads(
     initrd_name: []const u8,
     initrd_bytes: []const u8,
 ) !void {
-    const root_lba: u32 = 20;
-    const boot_dir_lba: u32 = 21;
-    const rootfs_lba: u32 = 22;
-    const rootfs_blocks: u32 = @intCast(std.math.divCeil(u64, rootfs_bytes.len, iso9660.descriptor_size) catch unreachable);
-    const kernel_lba = rootfs_lba + rootfs_blocks;
-    const kernel_blocks: u32 = @intCast(std.math.divCeil(u64, kernel_bytes.len, iso9660.descriptor_size) catch unreachable);
-    const initrd_lba = kernel_lba + kernel_blocks;
-    const initrd_blocks: u32 = @intCast(std.math.divCeil(u64, initrd_bytes.len, iso9660.descriptor_size) catch unreachable);
-    const image_blocks = initrd_lba + initrd_blocks;
+    const kernel_path = try std.fmt.allocPrint(allocator, "boot/{s}", .{stripVersionSuffix(kernel_name)});
+    defer allocator.free(kernel_path);
+    const initrd_path = try std.fmt.allocPrint(allocator, "boot/{s}", .{stripVersionSuffix(initrd_name)});
+    defer allocator.free(initrd_path);
 
-    var image = std.array_list.Managed(u8).init(allocator);
-    defer image.deinit();
-    try image.resize(image_blocks * iso9660.descriptor_size);
-    @memset(image.items, 0);
-
-    var pvd: [iso9660.descriptor_size]u8 = [_]u8{0} ** iso9660.descriptor_size;
-    pvd[0] = 1;
-    pvd[1..6].* = iso9660.standard_id;
-    pvd[6] = 1;
-    write733(pvd[80..88], @intCast(image.items.len / iso9660.descriptor_size));
-    write723(pvd[128..132], iso9660.descriptor_size);
-    write733(pvd[132..140], 0);
-    std.mem.writeInt(u32, pvd[140..144], 19, .little);
-    const root_record = makeDirectoryRecord(&.{0}, root_lba, iso9660.descriptor_size, 0x02, &.{});
-    @memcpy(pvd[156 .. 156 + root_record[0]], root_record[0..root_record[0]]);
-    image.items[iso9660.volume_descriptor_lba * iso9660.descriptor_size .. (iso9660.volume_descriptor_lba + 1) * iso9660.descriptor_size].* = pvd;
-
-    var terminator: [iso9660.descriptor_size]u8 = [_]u8{0} ** iso9660.descriptor_size;
-    terminator[0] = 255;
-    terminator[1..6].* = iso9660.standard_id;
-    terminator[6] = 1;
-    image.items[(iso9660.volume_descriptor_lba + 1) * iso9660.descriptor_size .. (iso9660.volume_descriptor_lba + 2) * iso9660.descriptor_size].* = terminator;
-
-    var path_table = std.array_list.Managed(u8).init(allocator);
-    defer path_table.deinit();
-    try path_table.append(1);
-    try path_table.append(0);
-    try appendU32Le(&path_table, root_lba);
-    try appendU16Le(&path_table, 1);
-    try path_table.append(0);
-    try path_table.append(0);
-    try path_table.append(bootPathSegment.len);
-    try path_table.append(0);
-    try appendU32Le(&path_table, boot_dir_lba);
-    try appendU16Le(&path_table, 1);
-    try path_table.appendSlice(bootPathSegment);
-    if (bootPathSegment.len % 2 != 0) try path_table.append(0);
-    write733(image.items[16 * iso9660.descriptor_size + 132 .. 16 * iso9660.descriptor_size + 140], @intCast(path_table.items.len));
-    @memcpy(image.items[19 * iso9660.descriptor_size ..][0..path_table.items.len], path_table.items);
-
-    var root_dir = std.array_list.Managed(u8).init(allocator);
-    defer root_dir.deinit();
-    const dot = makeDirectoryRecord(&.{0}, root_lba, iso9660.descriptor_size, 0x02, &.{});
-    try root_dir.appendSlice(dot[0..dot[0]]);
-    const dotdot = makeDirectoryRecord(&.{1}, root_lba, iso9660.descriptor_size, 0x02, &.{});
-    try root_dir.appendSlice(dotdot[0..dotdot[0]]);
-    const rootfs_record = makeDirectoryRecord(rootfs_name, rootfs_lba, rootfs_bytes.len, 0, &.{});
-    try root_dir.appendSlice(rootfs_record[0..rootfs_record[0]]);
-    const boot_record = makeDirectoryRecord(bootPathSegment, boot_dir_lba, iso9660.descriptor_size, 0x02, &.{});
-    try root_dir.appendSlice(boot_record[0..boot_record[0]]);
-    @memcpy(image.items[root_lba * iso9660.descriptor_size ..][0..root_dir.items.len], root_dir.items);
-
-    var boot_dir = std.array_list.Managed(u8).init(allocator);
-    defer boot_dir.deinit();
-    const boot_dot = makeDirectoryRecord(&.{0}, boot_dir_lba, iso9660.descriptor_size, 0x02, &.{});
-    try boot_dir.appendSlice(boot_dot[0..boot_dot[0]]);
-    const boot_dotdot = makeDirectoryRecord(&.{1}, root_lba, iso9660.descriptor_size, 0x02, &.{});
-    try boot_dir.appendSlice(boot_dotdot[0..boot_dotdot[0]]);
-    const kernel_record = makeDirectoryRecord(kernel_name, kernel_lba, kernel_bytes.len, 0, &.{});
-    try boot_dir.appendSlice(kernel_record[0..kernel_record[0]]);
-    const initrd_record = makeDirectoryRecord(initrd_name, initrd_lba, initrd_bytes.len, 0, &.{});
-    try boot_dir.appendSlice(initrd_record[0..initrd_record[0]]);
-    @memcpy(image.items[boot_dir_lba * iso9660.descriptor_size ..][0..boot_dir.items.len], boot_dir.items);
-
-    @memcpy(image.items[rootfs_lba * iso9660.descriptor_size ..][0..rootfs_bytes.len], rootfs_bytes);
-    @memcpy(image.items[kernel_lba * iso9660.descriptor_size ..][0..kernel_bytes.len], kernel_bytes);
-    @memcpy(image.items[initrd_lba * iso9660.descriptor_size ..][0..initrd_bytes.len], initrd_bytes);
-
-    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
-    defer file.close(io);
-    try file.writePositionalAll(io, image.items, 0);
-}
-
-const bootPathSegment = "boot";
-
-fn makeDirectoryRecord(
-    file_identifier: []const u8,
-    extent_lba: u32,
-    data_length: usize,
-    flags: u8,
-    system_use: []const u8,
-) [256]u8 {
-    var record: [256]u8 = [_]u8{0} ** 256;
-    const identifier_len = file_identifier.len;
-    const padding: usize = if (identifier_len % 2 == 0) 1 else 0;
-    const record_len = 33 + identifier_len + padding + system_use.len;
-    record[0] = @intCast(record_len);
-    record[1] = 0;
-    write733(record[2..10], extent_lba);
-    write733(record[10..18], @intCast(data_length));
-    record[25] = flags;
-    record[28] = 1;
-    record[29] = 0;
-    record[30] = 1;
-    record[31] = 0;
-    record[32] = @intCast(identifier_len);
-    @memcpy(record[33 .. 33 + identifier_len], file_identifier);
-    if (padding == 1) record[33 + identifier_len] = 0;
-    @memcpy(record[33 + identifier_len + padding .. 33 + identifier_len + padding + system_use.len], system_use);
-    return record;
-}
-
-fn write723(bytes: []u8, value: u16) void {
-    std.mem.writeInt(u16, bytes[0..2], value, .little);
-    std.mem.writeInt(u16, bytes[2..4], value, .big);
-}
-
-fn write733(bytes: []u8, value: u32) void {
-    std.mem.writeInt(u32, bytes[0..4], value, .little);
-    std.mem.writeInt(u32, bytes[4..8], value, .big);
+    const nodes = [_]FixtureIsoNode{
+        .{ .path = stripVersionSuffix(rootfs_name), .kind = .file, .bytes = rootfs_bytes },
+        .{ .path = "boot", .kind = .directory },
+        .{ .path = kernel_path, .kind = .file, .bytes = kernel_bytes },
+        .{ .path = initrd_path, .kind = .file, .bytes = initrd_bytes },
+    };
+    const src = FixtureIsoSource{ .nodes = &nodes };
+    _ = try iso9660.writeImagePath(allocator, io, path, src.source(), .{});
 }
