@@ -14,8 +14,11 @@
 //! optional El Torito boot support from a pull-based tree) and SquashFS
 //! read/write (reader handles XZ/zstd-compressed blocks; writer emits zstd
 //! or uncompressed images from a pull-based tree), local OCI image ingestion, a minimal native ext4
-//! writer/readback helper, COSI output packaging, and the initial
-//! `build-image` orchestration pipeline for ISO + OCI -> raw/fixed-VHD/VHDX/qcow2.
+//! writer/readback helper, COSI output packaging, the `build-image`
+//! orchestration pipeline for ISO + OCI -> raw/fixed-VHD/VHDX/qcow2, and the
+//! `build-iso` pipeline that regenerates a customized LiveOS ISO (ext4
+//! rootfs.img wrapped in SquashFS at the LiveOS payload path, with recreated
+//! El Torito boot entries).
 
 const std = @import("std");
 
@@ -41,6 +44,7 @@ pub const layout = @import("layout.zig");
 pub const oci = @import("oci.zig");
 pub const cosi = @import("cosi.zig");
 pub const build_image = @import("build_image.zig");
+pub const build_iso = @import("build_iso.zig");
 pub const customize = @import("customize.zig");
 pub const cpio = @import("cpio.zig");
 pub const kernel_modules = @import("kernel_modules.zig");

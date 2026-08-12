@@ -144,7 +144,7 @@ pub const EventSink = struct {
     context: ?*anyopaque = null,
     emitFn: *const fn (context: ?*anyopaque, event: Event) void,
 
-    fn emit(self: EventSink, event: Event) void {
+    pub fn emit(self: EventSink, event: Event) void {
         self.emitFn(self.context, event);
     }
 };
@@ -215,6 +215,173 @@ pub const BuildImageReport = struct {
         self.* = undefined;
     }
 };
+
+/// Progress and stage reporting for `materializeCustomizedRootTree`, so the
+/// shared materialization pipeline can report without depending on the full
+/// `BuildImageOptions`. `build` forwards its own sinks through this.
+pub const MaterializeReporting = struct {
+    event_sink: ?EventSink = null,
+    stage_sink: ?StageSink = null,
+    verbose: bool = false,
+    /// Prefix for the verbose fallback print, so a `build-iso` run's shared
+    /// materialization steps read as "build-iso:" rather than "build-image:".
+    label: []const u8 = "build-image",
+
+    fn logStep(self: MaterializeReporting, message: []const u8) void {
+        if (self.event_sink) |sink| {
+            sink.emit(.{ .progress = message });
+        } else if (self.verbose) {
+            std.debug.print("{s}: {s}\n", .{ self.label, message });
+        }
+    }
+
+    fn enterStage(self: MaterializeReporting, stage: Stage) !void {
+        if (self.stage_sink) |sink| {
+            if (!sink.advance(stage)) return error.InvalidOperationOrder;
+        }
+    }
+};
+
+pub const MaterializeOptions = struct {
+    /// When set, the container image becomes the effective root filesystem and
+    /// the ISO/squashfs contribute only boot-critical assets. Mirrors
+    /// `BuildImageOptions.skip_iso_rootfs`.
+    skip_iso_rootfs: bool = false,
+    /// Retain architecture-matching UKI stub assets during the skip-iso-rootfs
+    /// prune. `build` passes `boot_mode != .bls_only`.
+    retain_uki_boot_assets: bool = false,
+    os: os_customization.OsCustomization = .{},
+    generalization: os_customization.GeneralizationPolicy = .none,
+    limits: root_tree_mod.Limits = .{},
+    limit_diagnostic: ?*limits_mod.Diagnostic = null,
+    /// POSIX-seconds epoch stamped into inodes that customization creates.
+    customization_epoch: u64,
+    /// Base name every scratch file is derived from, so two concurrent builds
+    /// in one directory cannot collide (see `build`).
+    scratch_base: []const u8,
+    /// Infix distinguishing this pipeline's scratch files. `build` uses
+    /// "build-image"; `build-iso` uses "build-iso".
+    scratch_infix: []const u8 = "build-image",
+    reporting: MaterializeReporting = .{},
+};
+
+/// Loads the LiveOS squashfs payload named by `rootfs_path_in_iso` from
+/// `iso_reader`, flattens its nested rootfs, merges the ISO directory tree with
+/// the `container_image` OCI layers, materializes the union into an owned
+/// `RootTree`, then applies OS customization and generalization -- exactly the
+/// pipeline `build` runs up to the point before it populates a disk filesystem.
+/// `build_iso` reuses it to obtain the same customized root tree.
+///
+/// Takes ownership of releasing `iso_reader` and `container_image`: both are
+/// closed (and their `*_open` flags cleared) once the merged tree has been
+/// copied into the owned `RootTree`, before the memory-heavy customization
+/// step. On an error before that release the flags are left set so the
+/// caller's own deferred close still runs. The returned tree is the caller's
+/// to `deinit`.
+pub fn materializeCustomizedRootTree(
+    allocator: std.mem.Allocator,
+    io: Io,
+    iso_reader: *iso9660.Reader,
+    iso_reader_open: *bool,
+    rootfs_path_in_iso: []const u8,
+    container_image: *oci.Image,
+    container_image_open: *bool,
+    architecture: bootconfig.Architecture,
+    options: MaterializeOptions,
+) !root_tree_mod.RootTree {
+    const reporting = options.reporting;
+
+    const rootfs_scratch_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}-rootfs.sqsh",
+        .{ options.scratch_base, options.scratch_infix },
+    );
+    defer allocator.free(rootfs_scratch_path);
+    var extracted_rootfs = false;
+    defer if (extracted_rootfs) Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
+
+    reporting.logStep("extract squashfs payload from ISO");
+    try extractIsoEntryToPath(allocator, io, iso_reader, rootfs_path_in_iso, rootfs_scratch_path);
+    extracted_rootfs = true;
+
+    reporting.logStep("open squashfs rootfs");
+    var squash_reader = try squashfs.Reader.openPath(allocator, io, rootfs_scratch_path);
+    var squash_reader_open = true;
+    defer if (squash_reader_open) squash_reader.close(io);
+
+    const nested_scratch_prefix = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}-nested",
+        .{ options.scratch_base, options.scratch_infix },
+    );
+    defer allocator.free(nested_scratch_prefix);
+
+    reporting.logStep("merge ISO, squashfs, and OCI trees");
+    var source_tree = try MergedSourceTree.init(allocator, io, iso_reader, rootfs_path_in_iso, &squash_reader, container_image, nested_scratch_prefix);
+    source_tree.bind();
+    var source_tree_open = true;
+    defer if (source_tree_open) source_tree.deinit(allocator);
+
+    try reporting.enterStage(.apply_filesystem_changes);
+    if (options.skip_iso_rootfs) {
+        reporting.logStep("prune merged tree to container rootfs + boot assets");
+        try source_tree.pruneToContainerRootfsAndBootAssets(
+            allocator,
+            container_image,
+            architecture,
+            options.retain_uki_boot_assets,
+        );
+    }
+
+    if (!options.skip_iso_rootfs) {
+        // Only for the full-rootfs path: the merged tree there always brings
+        // its own systemd (from the distro ISO/squashfs), so a systemd unit
+        // is guaranteed to actually be usable. A --skip-iso-rootfs image's
+        // rootfs *is* the given container -- there's no guarantee it has
+        // systemd at all (its PID 1 is whatever /sbin/init the container
+        // provides, e.g. zvminit), so wiring in a systemd unit there wouldn't
+        // do anything; it's that from-scratch init's own job to invoke
+        // azagent if it wants to (see zvminit/README.md).
+        reporting.logStep("install azagent systemd unit if present in the source tree");
+        try installAzagentSystemdUnitIfPresent(allocator, &source_tree);
+    }
+
+    const root_tree_spool_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}-root-tree.spool",
+        .{ options.scratch_base, options.scratch_infix },
+    );
+    defer allocator.free(root_tree_spool_path);
+    reporting.logStep("materialize merged sources into owned root tree");
+    var root_tree = try root_tree_mod.RootTree.init(
+        allocator,
+        io,
+        root_tree_spool_path,
+        options.limits,
+    );
+    root_tree.diagnostic = options.limit_diagnostic;
+    errdefer root_tree.deinit();
+    try root_tree.importExt4View(&source_tree.view);
+
+    // RootTree owns every path, xattr, and content byte from this point on.
+    // Release all format readers and their scratch files before customization.
+    source_tree.deinit(allocator);
+    source_tree_open = false;
+    squash_reader.close(io);
+    squash_reader_open = false;
+    Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch |err| return err;
+    extracted_rootfs = false;
+    iso_reader.close(io);
+    iso_reader_open.* = false;
+    container_image.deinit();
+    container_image_open.* = false;
+
+    try os_customization.apply(allocator, &root_tree, options.os, options.customization_epoch);
+    try reporting.enterStage(.generalize_and_cleanup);
+    try os_customization.generalize(allocator, &root_tree, options.generalization);
+
+    return root_tree;
+}
 
 pub fn build(
     allocator: std.mem.Allocator,
@@ -293,84 +460,6 @@ pub fn build(
 
     if (options.dry_run) return report;
 
-    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.build-image-rootfs.sqsh", .{scratch_base});
-    defer allocator.free(rootfs_scratch_path);
-    var extracted_rootfs = false;
-    defer if (extracted_rootfs) Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
-
-    logStep(options, "extract squashfs payload from ISO");
-    try extractIsoEntryToPath(allocator, io, &iso_reader, rootfs_path_in_iso, rootfs_scratch_path);
-    extracted_rootfs = true;
-
-    logStep(options, "open squashfs rootfs");
-    var squash_reader = try squashfs.Reader.openPath(allocator, io, rootfs_scratch_path);
-    var squash_reader_open = true;
-    defer if (squash_reader_open) squash_reader.close(io);
-
-    const nested_scratch_prefix = try std.fmt.allocPrint(allocator, "{s}.build-image-nested", .{scratch_base});
-    defer allocator.free(nested_scratch_prefix);
-
-    logStep(options, "merge ISO, squashfs, and OCI trees");
-    var source_tree = try MergedSourceTree.init(allocator, io, &iso_reader, rootfs_path_in_iso, &squash_reader, &container_image, nested_scratch_prefix);
-    source_tree.bind();
-    var source_tree_open = true;
-    defer if (source_tree_open) source_tree.deinit(allocator);
-
-    try enterStage(options, .apply_filesystem_changes);
-    if (options.skip_iso_rootfs) {
-        logStep(options, "prune merged tree to container rootfs + boot assets");
-        try source_tree.pruneToContainerRootfsAndBootAssets(
-            allocator,
-            &container_image,
-            architecture,
-            options.boot_mode != .bls_only,
-        );
-    }
-
-    if (!options.skip_iso_rootfs) {
-        // Only for the full-rootfs path: the merged tree there always
-        // brings its own systemd (from the distro ISO/squashfs), so a
-        // systemd unit is guaranteed to actually be usable. A
-        // --skip-iso-rootfs image's rootfs *is* the given container --
-        // there's no guarantee it has systemd at all (its PID 1 is
-        // whatever /sbin/init the container provides, e.g. zvminit),
-        // so wiring in a systemd unit there wouldn't do anything; it's
-        // that from-scratch init's own job to invoke azagent if it wants
-        // to (see zvminit/README.md).
-        logStep(options, "install azagent systemd unit if present in the source tree");
-        try installAzagentSystemdUnitIfPresent(allocator, &source_tree);
-    }
-
-    const root_tree_spool_path = try std.fmt.allocPrint(
-        allocator,
-        "{s}.build-image-root-tree.spool",
-        .{scratch_base},
-    );
-    defer allocator.free(root_tree_spool_path);
-    logStep(options, "materialize merged sources into owned root tree");
-    var root_tree = try root_tree_mod.RootTree.init(
-        allocator,
-        io,
-        root_tree_spool_path,
-        options.limits,
-    );
-    root_tree.diagnostic = options.limit_diagnostic;
-    defer root_tree.deinit();
-    try root_tree.importExt4View(&source_tree.view);
-
-    // RootTree owns every path, xattr, and content byte from this point on.
-    // Release all format readers and their scratch files before customization.
-    source_tree.deinit(allocator);
-    source_tree_open = false;
-    squash_reader.close(io);
-    squash_reader_open = false;
-    Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch |err| return err;
-    extracted_rootfs = false;
-    iso_reader.close(io);
-    iso_reader_open = false;
-    container_image.deinit();
-    container_image_open = false;
-
     const customization_epoch: u64 = if (options.deterministic) |deterministic|
         deterministic.filesystem_timestamp
     else blk: {
@@ -378,9 +467,35 @@ pub fn build(
         if (now < 0) return error.InvalidSystemTime;
         break :blk @intCast(now);
     };
-    try os_customization.apply(allocator, &root_tree, options.os, customization_epoch);
-    try enterStage(options, .generalize_and_cleanup);
-    try os_customization.generalize(allocator, &root_tree, options.generalization);
+
+    var root_tree = try materializeCustomizedRootTree(
+        allocator,
+        io,
+        &iso_reader,
+        &iso_reader_open,
+        rootfs_path_in_iso,
+        &container_image,
+        &container_image_open,
+        architecture,
+        .{
+            .skip_iso_rootfs = options.skip_iso_rootfs,
+            .retain_uki_boot_assets = options.boot_mode != .bls_only,
+            .os = options.os,
+            .generalization = options.generalization,
+            .limits = options.limits,
+            .limit_diagnostic = options.limit_diagnostic,
+            .customization_epoch = customization_epoch,
+            .scratch_base = scratch_base,
+            .scratch_infix = "build-image",
+            .reporting = .{
+                .event_sink = options.event_sink,
+                .stage_sink = options.stage_sink,
+                .verbose = options.verbose,
+            },
+        },
+    );
+    defer root_tree.deinit();
+
     try enterStage(options, .prepare_initramfs);
     if (options.verity) {
         logStep(options, "check initramfs for dm-verity tooling");
@@ -690,7 +805,11 @@ fn validateBuildPathIsolation(
     };
 }
 
-fn buildSourceConflicts(
+/// True when the input `source_path` is, contains, or is contained by any of
+/// `reserved_paths` or the `nested_prefix_path` scratch namespace, compared
+/// canonically. Shared with `build_iso` so both builders refuse to read an
+/// input that aliases an output or scratch path.
+pub fn buildSourceConflicts(
     io: Io,
     source_path: []const u8,
     reserved_paths: []const []const u8,
@@ -712,7 +831,12 @@ fn buildSourceConflicts(
             source.len > nested_prefix.len and source[nested_prefix.len] == '-');
 }
 
-fn canonicalBuildPath(
+/// Canonicalizes `path` against `dir`, resolving the longest existing prefix
+/// through `realPathFile` and appending the not-yet-existing remainder, so two
+/// spellings of the same location compare equal. Shared with `build_iso` for
+/// output/scratch path-isolation checks. Returns the canonical length in
+/// `buffer`.
+pub fn canonicalBuildPath(
     dir: Io.Dir,
     io: Io,
     path: []const u8,
@@ -747,7 +871,9 @@ fn canonicalBuildPath(
     }
 }
 
-fn buildPathContains(parent: []const u8, candidate: []const u8) bool {
+/// True when `candidate` is strictly inside the directory `parent` (a proper
+/// path-segment-aligned descendant). Shared with `build_iso`.
+pub fn buildPathContains(parent: []const u8, candidate: []const u8) bool {
     if (parent.len >= candidate.len or !std.mem.startsWith(u8, candidate, parent)) return false;
     return std.fs.path.isSep(candidate[parent.len]) or
         (std.fs.path.isSep(parent[parent.len - 1]) and parent.len == 1);
@@ -784,7 +910,10 @@ fn buildsOutputInPlace(options: BuildImageOptions) bool {
     return !options.stream_to_stdout and spec.format == .raw and spec.compression == .none;
 }
 
-fn parseArchitecture(raw_arch: ?[]const u8) ?bootconfig.Architecture {
+/// Derives a `bootconfig.Architecture` from an OCI architecture string
+/// (`amd64`/`x86_64`, `arm64`/`aarch64`), or null when unrecognized. Shared
+/// with `build_iso`.
+pub fn parseArchitecture(raw_arch: ?[]const u8) ?bootconfig.Architecture {
     const arch = raw_arch orelse return null;
     if (std.ascii.eqlIgnoreCase(arch, "amd64") or std.ascii.eqlIgnoreCase(arch, "x86_64")) return .x86_64;
     if (std.ascii.eqlIgnoreCase(arch, "arm64") or std.ascii.eqlIgnoreCase(arch, "aarch64")) return .aarch64;
@@ -983,7 +1112,11 @@ fn emitWarning(options: BuildImageOptions, code: []const u8, message: []const u8
     }
 }
 
-fn discoverRootfsPathInIso(
+/// Resolves the LiveOS rootfs payload path within a source ISO, honoring an
+/// explicit override or scoring the tree's files for the best candidate.
+/// Shared with `build_iso`, which replaces this payload rather than flattening
+/// it. Returns a root-relative path (no leading slash), the caller's to free.
+pub fn discoverRootfsPathInIso(
     allocator: std.mem.Allocator,
     reader: *iso9660.Reader,
     override_path: ?[]const u8,
@@ -2461,7 +2594,11 @@ fn readBytes(bytes: []const u8, buffer: []u8, offset: u64) ext4.FileTreeView.Con
     return count;
 }
 
-fn readIsoFileAt(io: Io, reader: *iso9660.Reader, index: usize, buffer: []u8, offset: u64) !usize {
+/// Reads `buffer.len` bytes of the ISO file node `index` at byte `offset`,
+/// following the entry's extents. Shared with `build_iso`, which streams
+/// retained source ISO files straight into the regenerated image. Returns the
+/// number of bytes produced (short only at end of file).
+pub fn readIsoFileAt(io: Io, reader: *iso9660.Reader, index: usize, buffer: []u8, offset: u64) !usize {
     const entry = reader.getEntry(index);
     if (entry.kind != .file) return error.NotAFile;
     if (offset > entry.size) return error.UnexpectedEndOfStream;

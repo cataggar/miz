@@ -312,6 +312,19 @@ pub fn runQemuBootSmoke(
     });
     defer spawned.deinit();
 
+    return awaitQemuBoot(allocator, io, &spawned, serial_output_path, extra_wait_marker);
+}
+
+/// Polls an already-spawned QEMU (over QMP) until the guest reaches the
+/// expected kernel-boot marker (and `extra_wait_marker`, if any) or QEMU
+/// stops running, then quits it cleanly. Shared by the disk and ISO runners.
+fn awaitQemuBoot(
+    allocator: std.mem.Allocator,
+    io: Io,
+    spawned: anytype,
+    serial_output_path: []const u8,
+    extra_wait_marker: ?[]const u8,
+) !QemuBootSmokeResult {
     const deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(qemu_boot_smoke_timeout_seconds));
     var timed_out = true;
 
@@ -370,6 +383,66 @@ pub fn runQemuBootSmoke(
         .quit_acknowledged = quit_acknowledged,
         .serial_output = serial_output,
     };
+}
+
+/// Boots a generated ISO as a UEFI CD-ROM under OVMF, using the same QMP-driven
+/// poll as `runQemuBootSmoke`. Requires an OVMF firmware pair (an ISO is booted
+/// through UEFI El Torito here).
+pub fn runQemuIsoBootSmoke(
+    allocator: std.mem.Allocator,
+    io: Io,
+    qemu_path: []const u8,
+    ovmf: struct { firmware: OvmfFirmwarePair, vars_copy_path: []const u8 },
+    iso_path: []const u8,
+    serial_output_path: []const u8,
+    extra_wait_marker: ?[]const u8,
+) !QemuBootSmokeResult {
+    const serial_arg = try std.fmt.allocPrint(allocator, "file:{s}", .{serial_output_path});
+    defer allocator.free(serial_arg);
+    const cdrom_drive = try std.fmt.allocPrint(
+        allocator,
+        "file={s},format=raw,if=none,media=cdrom,id=live-cd",
+        .{iso_path},
+    );
+    defer allocator.free(cdrom_drive);
+    const ovmf_code_drive = try std.fmt.allocPrint(
+        allocator,
+        "if=pflash,format=raw,readonly=on,file={s}",
+        .{ovmf.firmware.code_path},
+    );
+    defer allocator.free(ovmf_code_drive);
+    const ovmf_vars_drive = try std.fmt.allocPrint(
+        allocator,
+        "if=pflash,format=raw,file={s}",
+        .{ovmf.vars_copy_path},
+    );
+    defer allocator.free(ovmf_vars_drive);
+
+    var args = std.array_list.Managed([]const u8).init(allocator);
+    defer args.deinit();
+    try args.appendSlice(&.{
+        "-M",                               "q35",
+        "-accel",                           "tcg",
+        "-m",                               "2048",
+        "-display",                         "none",
+        "-no-reboot",                       "-monitor",
+        "none",                             "-serial",
+        serial_arg,                         "-drive",
+        ovmf_code_drive,                    "-drive",
+        ovmf_vars_drive,                    "-drive",
+        cdrom_drive,                        "-device",
+        "ide-cd,drive=live-cd,bootindex=0",
+    });
+
+    var spawned = try qmp.spawnAndConnect(allocator, io, .{
+        .binary = qemu_path,
+        .extra_args = args.items,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer spawned.deinit();
+
+    return awaitQemuBoot(allocator, io, &spawned, serial_output_path, extra_wait_marker);
 }
 
 fn serialOutputShowsKernelBoot(serial_output: []const u8) bool {
@@ -881,4 +954,59 @@ test "build-image --verity opportunistically boot-smokes a provisioned verity-ca
         );
     }
     try std.testing.expect(reached_verity_target);
+}
+
+test "build-iso opportunistically boot-smokes a regenerated LiveOS ISO as a UEFI CD-ROM under QEMU" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Gated on the same real fixtures as the build-image boot smokes plus
+    // OVMF; skips cleanly (never fails) whenever qemu, OVMF, or the
+    // ZVMI_BOOT_TEST_ISO/ZVMI_BOOT_TEST_OCI fixtures are unavailable. An ISO
+    // is booted through UEFI El Torito here, so OVMF is required.
+    var prereqs = try requireQemuBootSmokePrereqs(allocator, io);
+    defer prereqs.deinit(allocator);
+    var ovmf = try requireOvmfFirmwarePairAlloc(allocator, io, prereqs.qemu_path);
+    defer ovmf.deinit(allocator);
+
+    const output_path = "test-build-iso-qemu.iso";
+    const ovmf_vars_copy_path = "test-build-iso-qemu.OVMF_VARS.fd";
+    const serial_output_path = "test-build-iso-qemu.serial.log";
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, ovmf_vars_copy_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, serial_output_path) catch {};
+
+    var report = try zvmi.build_iso.build(allocator, io, .{
+        .iso_path = prereqs.iso_path,
+        .container_path = prereqs.oci_path,
+        .output_path = output_path,
+        // Generous, since the fixture is a real LiveOS rootfs; a developer
+        // supplying fixtures can size this from a --dry-run if it is too small.
+        .rootfs_size = qemu_boot_smoke_disk_size,
+    });
+    defer report.deinit(allocator);
+
+    try copyFileToPath(allocator, io, ovmf.vars_path, ovmf_vars_copy_path);
+
+    var qemu = try runQemuIsoBootSmoke(
+        allocator,
+        io,
+        prereqs.qemu_path,
+        .{ .firmware = ovmf, .vars_copy_path = ovmf_vars_copy_path },
+        output_path,
+        serial_output_path,
+        null,
+    );
+    defer qemu.deinit(allocator);
+
+    if (!serialOutputShowsKernelBoot(qemu.serial_output)) {
+        std.debug.print(
+            "build-iso QEMU boot smoke did not reach kernel boot (timed_out={}, quit_acknowledged={})\nserial output:\n{s}\n",
+            .{ qemu.timed_out, qemu.quit_acknowledged, qemu.serial_output },
+        );
+    }
+    // A structural pipeline cannot honestly assert a full userspace boot; this
+    // only claims the regenerated ISO's boot chain reaches the kernel, which is
+    // the strongest claim a CD-ROM boot smoke can make without guest agents.
+    try std.testing.expect(serialOutputShowsKernelBoot(qemu.serial_output));
 }

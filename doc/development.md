@@ -6,7 +6,8 @@ Build a fixed, 1 MiB-aligned Azure-compatible VHD from the
 [Azure Linux 4.0 ISO](https://aka.ms/azurelinux-4.0-x86_64.iso) plus a
 container image, ready to upload as an Azure managed disk and run as a VM.
 See [Image building](image-building.md) for the implemented format,
-filesystem, container, boot, and `zvmi build-image` workflows.
+filesystem, container, boot, `zvmi build-image`, and `zvmi build-iso`
+workflows.
 
 ## Layout
 
@@ -35,7 +36,8 @@ zvmi/
         iso9660.zig            # ISO9660 read/write codec (PVD, Rock Ridge,
                               #   Joliet reader; writer emits deterministic
                               #   Rock Ridge images with both-endian path
-                              #   tables and optional El Torito boot support)
+                              #   tables and optional El Torito boot support;
+                              #   readVolumeIdAlloc/readBootCatalog helpers)
         squashfs.zig           # squashfs read/write codec (superblock,
                               #   inode/directory/fragment tables, XZ/zstd
                               #   compressed blocks; writer emits zstd or
@@ -89,7 +91,11 @@ zvmi/
                               #   OCI layer ingestion and COSI packaging
         zstd.zig               # minimal private raw-block zstd codec for COSI
         cosi.zig               # COSI writer (tar + metadata.json + raw.zst parts)
-        build_image.zig        # ISO + OCI -> raw/fixed-VHD orchestration
+        build_image.zig        # ISO + OCI -> raw/fixed-VHD orchestration;
+                              #   materializeCustomizedRootTree is shared with
+                              #   build_iso
+        build_iso.zig          # ISO + OCI -> generated LiveOS ISO (ext4
+                              #   rootfs.img in SquashFS + El Torito), `build-iso`
         customize.zig          # the image-customization request: versioned
                               #   public types, planning, preflight, backend
                               #   selection, execution and provenance
@@ -132,6 +138,8 @@ zvmi/
     image.zig               # `addImage`: the exported std.Build helper that
                               #   declares an image build, including the
                               #   registry image an input may name
+    iso.zig                 # `addIso`: exported helper for a generated LiveOS
+                              #   ISO product (separate from the disk builder)
     oci.zig                 # `addOciPull`: pull a layout beside a build
   cli/
     src/
@@ -139,6 +147,8 @@ zvmi/
       image_builder.zig      # `zvmi-image-builder`: turns declared arguments
                               #   into a customize request; pins a registry
                               #   tag before the request is built
+      iso_builder.zig        # `zvmi-iso-builder`: host driver for the exported
+                              #   addIso build helper (`zvmi.build_iso.build`)
       commands/
         create.zig            # `zvmi create`
         info.zig              # `zvmi info`
@@ -150,6 +160,7 @@ zvmi/
         cosi.zig              # `zvmi cosi`
         oci.zig               # `zvmi oci` transport and bundle commands
         build_image.zig       # `zvmi build-image`
+        build_iso.zig         # `zvmi build-iso`
         qemu.zig              # `zvmi qemu`
         opts.zig              # shared `-o subformat=...` parsing
   zvminit/                  # minimal PID 1 for real-boot testing of

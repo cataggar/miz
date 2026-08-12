@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const image_build = @import("build/image.zig");
+const iso_build = @import("build/iso.zig");
 const oci_build = @import("build/oci.zig");
 
 const AzureLinuxArchitecture = enum {
@@ -37,8 +38,19 @@ pub const OciPullOptions = oci_build.Options;
 pub const OciPullResult = oci_build.Result;
 pub const addOciPull = oci_build.add;
 
+pub const IsoArchitecture = iso_build.Architecture;
+pub const IsoCompression = iso_build.Compression;
+pub const IsoBootPlatform = iso_build.BootPlatform;
+pub const IsoBootImage = iso_build.BootImage;
+pub const IsoContainer = iso_build.Container;
+pub const IsoOsCustomization = iso_build.OsCustomization;
+pub const IsoOptions = iso_build.Options;
+pub const IsoResult = iso_build.Result;
+pub const addIso = iso_build.add;
+
 test {
     std.testing.refAllDecls(oci_build);
+    std.testing.refAllDecls(iso_build);
 }
 
 pub fn build(b: *std.Build) void {
@@ -233,6 +245,29 @@ pub fn build(b: *std.Build) void {
         "Run the host image builder's argument tests",
     );
     image_builder_test_step.dependOn(&run_image_builder_tests.step);
+
+    // Host-only ISO builder used by the exported `addIso` build helper.
+    const iso_builder_exe = b.addExecutable(.{
+        .name = "zvmi-iso-builder",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cli/src/iso_builder.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zvmi", .module = host_zvmi_mod },
+            },
+        }),
+    });
+    b.installArtifact(iso_builder_exe);
+    const iso_builder_tests = b.addTest(.{
+        .root_module = iso_builder_exe.root_module,
+    });
+    const run_iso_builder_tests = b.addRunArtifact(iso_builder_tests);
+    const iso_builder_test_step = b.step(
+        "test-iso-builder",
+        "Run the host ISO builder's argument tests",
+    );
+    iso_builder_test_step.dependOn(&run_iso_builder_tests.step);
 
     const preserved_image_wire_mod = b.createModule(.{
         .root_source_file = b.path("packages/zvmi/src/preserved_image_wire.zig"),

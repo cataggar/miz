@@ -1209,6 +1209,35 @@ fn parseBootEntry(list: *std.array_list.Managed(BootCatalogEntry), entry: []cons
     });
 }
 
+pub const VolumeIdError = error{
+    BadVolumeDescriptor,
+    MissingPrimaryVolumeDescriptor,
+} || Io.File.ReadPositionalError || std.mem.Allocator.Error;
+
+/// Reads the primary volume descriptor's 32-byte volume identifier, trimmed of
+/// trailing spaces and NULs. A regenerating pipeline (e.g. `build_iso`) reuses
+/// it so a `root=live:CDLABEL=<id>` boot line still finds the volume after the
+/// image is rewritten. Caller owns the returned slice.
+pub fn readVolumeIdAlloc(allocator: std.mem.Allocator, io: Io, file: Io.File) VolumeIdError![]u8 {
+    var sector: [descriptor_size]u8 = undefined;
+    var lba: u32 = volume_descriptor_lba;
+    while (true) : (lba += 1) {
+        _ = try file.readPositionalAll(io, &sector, @as(u64, lba) * descriptor_size);
+        if (!std.mem.eql(u8, sector[1..6], &standard_id)) return error.BadVolumeDescriptor;
+        switch (sector[0]) {
+            1 => {
+                const raw = sector[40..72];
+                var end: usize = raw.len;
+                while (end > 0 and (raw[end - 1] == ' ' or raw[end - 1] == 0)) end -= 1;
+                return allocator.dupe(u8, raw[0..end]);
+            },
+            255 => break,
+            else => {},
+        }
+    }
+    return error.MissingPrimaryVolumeDescriptor;
+}
+
 // ===========================================================================
 // Writer
 // ===========================================================================
