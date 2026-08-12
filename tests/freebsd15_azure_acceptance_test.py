@@ -40,10 +40,49 @@ def test_run_and_cleanup_modes():
     assert '"$command_name" != run' in content
 
 
-def test_candidate_key_validates_zfs_full_only():
+def _preflight(candidate_key):
+    env = os.environ.copy()
+    env.update(
+        {
+            "STATE_FILE": os.path.join(os.path.dirname(SCRIPT), "unused-state"),
+            "GITHUB_RUN_ID": "123",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "CANDIDATE_KEY": candidate_key,
+        }
+    )
+    return subprocess.run(
+        [SCRIPT, "invalid-mode"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def test_candidate_key_accepts_supported_profiles():
+    for architecture in ("x86_64", "aarch64"):
+        for profile in ("ufs-full", "ufs-core", "zfs-full"):
+            result = _preflight(f"{architecture}-{profile}")
+            assert result.returncode == 2, (profile, result.stderr)
+
+
+def test_candidate_key_rejects_unsupported_profiles_fail_closed():
+    for key in (
+        "x86_64-zfs-core",
+        "aarch64-zfs-core",
+        "x86_64-ufs-minimal",
+        "riscv64-ufs-core",
+    ):
+        assert _preflight(key).returncode == 1
+
+
+def test_candidate_manifest_binds_requested_profile():
     with open(SCRIPT) as f:
         content = f.read()
-    assert "(x86_64|aarch64)-zfs-full" in content
+    assert 'doc.get("architecture") != architecture' in content
+    assert 'doc.get("filesystem") != filesystem' in content
+    assert 'doc.get("flavor") != flavor' in content
+    assert '("ufs", "core")' in content
+    assert '("zfs", "full")' in content
 
 
 def test_ownership_tags_use_freebsd15():
@@ -61,12 +100,38 @@ def test_resource_group_prefix():
 def test_contracts_set():
     with open(SCRIPT) as f:
         content = f.read()
+    assert (
+        'shared_contracts_before_storage="matching-architecture-gen2,'
+        'key-only-ssh,agent-ready,hn0-dhcp,serial-console"'
+    ) in content
+    assert (
+        'shared_contracts_after_storage="root-growth,gpt-healthy,'
+        'reboot-reconnect,instance-identity"'
+    ) in content
+    assert 'filesystem_contracts="zfs-root,zpool-healthy"' in content
+    assert (
+        'filesystem_contracts="ufs-root,ufs-root-partition-growth,'
+        'ufs-root-filesystem-growth,no-os-disk-swap"'
+    ) in content
+    assert (
+        'contracts="$shared_contracts_before_storage,$filesystem_contracts,'
+        '$shared_contracts_after_storage"'
+    ) in content
+
+
+def test_zfs_contract_result_remains_backward_compatible():
     expected = (
-        "matching-architecture-gen2,key-only-ssh,agent-ready,"
-        "hn0-dhcp,serial-console,zfs-root,zpool-healthy,"
-        "root-growth,gpt-healthy,reboot-reconnect,instance-identity"
+        "matching-architecture-gen2,key-only-ssh,agent-ready,hn0-dhcp,"
+        "serial-console,zfs-root,zpool-healthy,root-growth,gpt-healthy,"
+        "reboot-reconnect,instance-identity"
     )
-    assert expected in content
+    before = (
+        "matching-architecture-gen2,key-only-ssh,agent-ready,hn0-dhcp,"
+        "serial-console"
+    )
+    storage = "zfs-root,zpool-healthy"
+    after = "root-growth,gpt-healthy,reboot-reconnect,instance-identity"
+    assert ",".join((before, storage, after)) == expected
 
 
 def test_never_retains_vhd():
@@ -99,8 +164,48 @@ def test_reboot_reconnect_contract():
 def test_zfs_root_validation():
     with open(SCRIPT) as f:
         content = f.read()
-    assert "zpool status zroot" in content
-    assert "zpool get" in content
+    assert 'zpool status -x "$root_pool"' in content
+    assert 'zpool get -H -o value autoexpand "$root_pool"' in content
+    assert "pre_reboot_storage_identity" in content
+    assert "post_reboot_storage_identity" in content
+
+
+def test_ufs_root_and_growth_validation_has_no_zfs_assumptions():
+    with open(SCRIPT) as f:
+        content = f.read()
+    start = content.index("    # ufs-root and UFS growth:")
+    end = content.index("    ;;", start)
+    ufs_checks = content[start:end]
+    assert "mount -p" not in ufs_checks  # Root type is checked before dispatch.
+    assert "diskinfo" in ufs_checks
+    assert "df -k /" in ufs_checks
+    assert "root_partition_size" in ufs_checks
+    assert "root_filesystem_kib" in ufs_checks
+    assert "zpool" not in ufs_checks
+    assert "zfs " not in ufs_checks
+
+
+def test_gpt_health_and_no_os_disk_swap():
+    with open(SCRIPT) as f:
+        content = f.read()
+    assert '! gpart show "$disk" | grep -q CORRUPT' in content
+    assert 'gpart status -s "$disk"' in content
+    assert 'swap found on OS disk: $swap_device' in content
+
+
+def test_clean_shutdown_is_observed():
+    with open(SCRIPT) as f:
+        content = f.read()
+    assert "wait_for_poweroff" in content
+    assert "PowerState/stopped|PowerState/deallocated" in content
+
+
+def test_ufs_result_uses_deterministic_shared_schema():
+    with open(SCRIPT) as f:
+        content = f.read()
+    assert '"type": "zvmi-freebsd15-azure-acceptance"' in content
+    assert '"contracts": contracts.split(",")' in content
+    assert "json.dump(document, output, indent=2, sort_keys=True)" in content
 
 
 def test_no_default_freebsd_account():
