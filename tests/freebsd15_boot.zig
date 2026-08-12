@@ -14,6 +14,7 @@ const Io = std.Io;
 const serial_limit: usize = 2 * 1024 * 1024;
 const serial_tail_size: usize = 256 * 1024;
 const boot_timeout_seconds: i64 = 10 * 60;
+const ssh_diagnostic_limit_bytes: usize = 64 * 1024;
 
 /// Every release image is pinned to roughly 6.04 GiB, so each acceptance
 /// overlay is created at 12 GiB to prove first-boot growth. The size stays
@@ -233,64 +234,94 @@ fn runCommand(io: Io, argv: []const []const u8) !void {
     }
 }
 
-fn commandSucceeded(io: Io, argv: []const []const u8) bool {
-    var child = std.process.spawn(io, .{
-        .argv = argv,
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    }) catch return false;
-    defer child.kill(io);
-    const term = child.wait(io) catch return false;
-    return switch (term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
-}
+const SshOperation = enum {
+    readiness,
+    identity,
+    static_contract,
+    update_contract,
+    package_lifecycle,
+    power,
 
-fn sshSucceeded(
+    fn description(self: SshOperation) []const u8 {
+        return switch (self) {
+            .readiness => "SSH readiness",
+            .identity => "guest identity",
+            .static_contract => "static guest contract",
+            .update_contract => "package update contract",
+            .package_lifecycle => "package lifecycle contract",
+            .power => "guest power command",
+        };
+    }
+
+    fn timeoutSeconds(self: SshOperation) u32 {
+        return switch (self) {
+            .readiness, .identity => 15,
+            .static_contract => 2 * 60,
+            .update_contract => 10 * 60,
+            .package_lifecycle => 5 * 60,
+            .power => 30,
+        };
+    }
+};
+
+const SshCommandResult = struct {
+    operation: SshOperation,
+    term: std.process.Child.Term,
+    stdout: []u8,
+    stderr: []u8,
+
+    fn deinit(self: *SshCommandResult, allocator: Allocator) void {
+        allocator.free(self.stdout);
+        allocator.free(self.stderr);
+        self.* = undefined;
+    }
+
+    fn succeeded(self: SshCommandResult) bool {
+        return switch (self.term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+    }
+
+    fn timedOut(self: SshCommandResult) bool {
+        return switch (self.term) {
+            .exited => |code| code == 124,
+            else => false,
+        };
+    }
+};
+
+const ssh_capture_script =
+    "exec \"$@\" > >(/usr/bin/tail -c 65536) " ++
+    "2> >(/usr/bin/tail -c 65536 >&2)";
+
+fn runSshCommandAlloc(
     allocator: Allocator,
     io: Io,
     ssh_path: []const u8,
     key_path: []const u8,
     port: u16,
+    operation: SshOperation,
     command: []const u8,
-) !bool {
+) !SshCommandResult {
     const port_text = try std.fmt.allocPrint(allocator, "{d}", .{port});
     defer allocator.free(port_text);
-    return commandSucceeded(io, &.{
-        ssh_path,
-        "-i",
-        key_path,
-        "-p",
-        port_text,
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=5",
-        "-o",
-        "ConnectionAttempts=1",
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        "zvmitest@127.0.0.1",
-        command,
-    });
-}
-
-fn sshOutputAlloc(
-    allocator: Allocator,
-    io: Io,
-    ssh_path: []const u8,
-    key_path: []const u8,
-    port: u16,
-    command: []const u8,
-) ![]u8 {
-    const port_text = try std.fmt.allocPrint(allocator, "{d}", .{port});
-    defer allocator.free(port_text);
+    const timeout_text = try std.fmt.allocPrint(
+        allocator,
+        "{d}s",
+        .{operation.timeoutSeconds()},
+    );
+    defer allocator.free(timeout_text);
     const result = try std.process.run(allocator, io, .{
         .argv = &.{
+            "/bin/bash",
+            "-c",
+            ssh_capture_script,
+            "zvmi-ssh-capture",
+            "/usr/bin/timeout",
+            "--foreground",
+            "--kill-after=5s",
+            timeout_text,
             ssh_path,
             "-i",
             key_path,
@@ -309,19 +340,156 @@ fn sshOutputAlloc(
             "zvmitest@127.0.0.1",
             command,
         },
-        .stdout_limit = .limited(16 * 1024),
-        .stderr_limit = .limited(16 * 1024),
-        .timeout = .{ .duration = .{
-            .raw = .fromSeconds(15),
-            .clock = .awake,
-        } },
+        .stdout_limit = .limited(ssh_diagnostic_limit_bytes),
+        .stderr_limit = .limited(ssh_diagnostic_limit_bytes),
     });
-    allocator.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code == 0) return result.stdout,
-        else => {},
+    return .{
+        .operation = operation,
+        .term = result.term,
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+    };
+}
+
+fn diagnosticTail(bytes: []const u8) []const u8 {
+    const start = bytes.len - @min(bytes.len, ssh_diagnostic_limit_bytes);
+    return bytes[start..];
+}
+
+fn appendDiagnosticStream(
+    writer: *std.Io.Writer,
+    name: []const u8,
+    bytes: []const u8,
+) !void {
+    const tail = diagnosticTail(bytes);
+    try writer.print(
+        "{s} tail ({d} byte{s}):\n",
+        .{ name, tail.len, if (tail.len == 1) "" else "s" },
+    );
+    if (tail.len == 0) {
+        try writer.writeAll("<empty>\n");
+    } else {
+        try writer.print("{s}\n", .{tail});
     }
-    allocator.free(result.stdout);
+}
+
+fn sshFailureDiagnosticAlloc(
+    allocator: Allocator,
+    result: SshCommandResult,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    if (result.timedOut()) {
+        try output.writer.print(
+            "FreeBSD acceptance {s} timed out after {d} seconds\n",
+            .{ result.operation.description(), result.operation.timeoutSeconds() },
+        );
+    } else switch (result.term) {
+        .exited => |code| try output.writer.print(
+            "FreeBSD acceptance {s} failed with exit code {d}\n",
+            .{ result.operation.description(), code },
+        ),
+        .signal => |signal| try output.writer.print(
+            "FreeBSD acceptance {s} ended by signal {d}\n",
+            .{ result.operation.description(), @intFromEnum(signal) },
+        ),
+        .stopped => |signal| try output.writer.print(
+            "FreeBSD acceptance {s} stopped by signal {d}\n",
+            .{ result.operation.description(), @intFromEnum(signal) },
+        ),
+        .unknown => |status| try output.writer.print(
+            "FreeBSD acceptance {s} ended with unknown status {d}\n",
+            .{ result.operation.description(), status },
+        ),
+    }
+    try appendDiagnosticStream(&output.writer, "stdout", result.stdout);
+    try appendDiagnosticStream(&output.writer, "stderr", result.stderr);
+    return output.toOwnedSlice();
+}
+
+fn printSshFailure(
+    allocator: Allocator,
+    result: SshCommandResult,
+) !void {
+    const diagnostic = try sshFailureDiagnosticAlloc(allocator, result);
+    defer allocator.free(diagnostic);
+    std.debug.print("{s}", .{diagnostic});
+}
+
+fn sshSucceeded(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    key_path: []const u8,
+    port: u16,
+    operation: SshOperation,
+    command: []const u8,
+) !bool {
+    var result = try runSshCommandAlloc(
+        allocator,
+        io,
+        ssh_path,
+        key_path,
+        port,
+        operation,
+        command,
+    );
+    defer result.deinit(allocator);
+    return result.succeeded();
+}
+
+fn sshOutputAlloc(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    key_path: []const u8,
+    port: u16,
+    operation: SshOperation,
+    command: []const u8,
+) ![]u8 {
+    var result = try runSshCommandAlloc(
+        allocator,
+        io,
+        ssh_path,
+        key_path,
+        port,
+        operation,
+        command,
+    );
+    if (!result.succeeded()) {
+        defer result.deinit(allocator);
+        try printSshFailure(allocator, result);
+        return error.SshCommandFailed;
+    }
+    allocator.free(result.stderr);
+    return result.stdout;
+}
+
+fn requireSshSuccess(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    key_path: []const u8,
+    port: u16,
+    operation: SshOperation,
+    command: []const u8,
+) !void {
+    std.debug.print(
+        "FreeBSD acceptance: running {s} (timeout {d}s)\n",
+        .{ operation.description(), operation.timeoutSeconds() },
+    );
+    var result = try runSshCommandAlloc(
+        allocator,
+        io,
+        ssh_path,
+        key_path,
+        port,
+        operation,
+        command,
+    );
+    defer result.deinit(allocator);
+    if (result.succeeded()) return;
+    try printSshFailure(allocator, result);
     return error.SshCommandFailed;
 }
 
@@ -456,6 +624,7 @@ fn waitForSshState(
             ssh_path,
             key_path,
             port,
+            .readiness,
             "true",
         );
         if (connected == wanted) return;
@@ -493,42 +662,44 @@ fn waitForQemuExit(
 
 /// The generalized guest contract, which every profile must satisfy
 /// identically. Anything that depends on how the root is stored belongs in
-/// the per-filesystem checks instead.
+/// the per-filesystem checks instead. Source rc.conf directly because sysrc(8)
+/// is not part of the retained core contract.
 const shared_remote_checks =
     \\set -eu
-    \\test "$(sysrc -n waagent_enable)" = YES
-    \\test "$(sysrc -n sshd_enable)" = YES
-    \\test "$(sysrc -n nuageinit_enable)" = YES
-    \\test "$(sysrc -n growfs_enable)" = YES
-    \\test "$(sysrc -n growfs_swap_size)" = 0
-    \\test "$(sysrc -n ifconfig_DEFAULT)" = "SYNCDHCP accept_rtadv"
-    \\test "$(sysrc -n ifconfig_hn0)" = SYNCDHCP
-    \\test "$(sysrc -n firstboot_pkg_upgrade_enable)" = NO
-    \\pkg info -e azure-agent
-    \\! pw usershow freebsd >/dev/null 2>&1
-    \\sudo -n awk -F: '$1 == "root" && $2 == "*LOCKED*" { ok=1 } END { exit !ok }' /etc/master.passwd
+    \\. /etc/rc.conf
+    \\test "${waagent_enable-}" = YES
+    \\test "${sshd_enable-}" = YES
+    \\test "${nuageinit_enable-}" = YES
+    \\test "${growfs_enable-}" = YES
+    \\test "${growfs_swap_size-}" = 0
+    \\test "${ifconfig_DEFAULT-}" = "SYNCDHCP accept_rtadv"
+    \\test "${ifconfig_hn0-}" = SYNCDHCP
+    \\test "${firstboot_pkg_upgrade_enable-}" = NO
+    \\/usr/local/sbin/pkg info -e azure-agent
+    \\! /usr/sbin/pw usershow freebsd >/dev/null 2>&1
+    \\/usr/local/bin/sudo -n /usr/bin/awk -F: '$1 == "root" && $2 == "*LOCKED*" { ok=1 } END { exit !ok }' /etc/master.passwd
     \\test -s /etc/ssh/ssh_host_ed25519_key
     \\test -s /home/zvmitest/.ssh/authorized_keys
     \\test ! -e /firstboot
     \\test ! -e /firstboot-reboot
     \\test ! -e /root/zvmi-generalize.sh
     \\test ! -e /etc/rc.d/zvmi_generalize
-    \\! grep -Eq '^[^#].*[[:space:]]swap[[:space:]]' /etc/fstab
-    \\test "$(swapinfo -k | wc -l | tr -d ' ')" = 1
-    \\grep -Fx 'Provisioning.Agent=auto' /usr/local/etc/waagent.conf
-    \\grep -Fx 'ResourceDisk.SwapSizeMB=2048' /usr/local/etc/waagent.conf
-    \\disk=$(gpart show | awk '$1 == "=>" { print $4; exit }')
+    \\! /usr/bin/grep -Eq '^[^#].*[[:space:]]swap[[:space:]]' /etc/fstab
+    \\test "$(/usr/sbin/swapinfo -k | /usr/bin/wc -l | /usr/bin/tr -d ' ')" = 1
+    \\/usr/bin/grep -Fx 'Provisioning.Agent=auto' /usr/local/etc/waagent.conf
+    \\/usr/bin/grep -Fx 'ResourceDisk.SwapSizeMB=2048' /usr/local/etc/waagent.conf
+    \\disk=$(/sbin/gpart show | /usr/bin/awk '$1 == "=>" { print $4; exit }')
     \\test -n "${disk}"
-    \\! gpart show | grep -q CORRUPT
-    \\test "$(gpart status -s "${disk}" | awk '{ print $2 }' | sort -u)" = OK
+    \\! /sbin/gpart show | /usr/bin/grep -q CORRUPT
+    \\test "$(/sbin/gpart status -s "${disk}" | /usr/bin/awk '{ print $2 }' | /usr/bin/sort -u)" = OK
 ;
 
 /// UFS-specific state. The root is named in /etc/fstab and grows with
 /// growfs(8), so df(1) reports the enlarged filesystem directly.
 const ufs_remote_checks =
-    \\test "$(mount -p | awk '$2 == "/" { print $3 }')" = ufs
-    \\grep -Eq '^[^#]+[[:space:]]+/[[:space:]]+ufs[[:space:]]' /etc/fstab
-    \\test "$(($(df -k / | awk 'END { print $2 }') * 1024))" -ge @MINIMUM_ROOT_BYTES@
+    \\test "$(/sbin/mount -p | /usr/bin/awk '$2 == "/" { print $3 }')" = ufs
+    \\/usr/bin/grep -Eq '^[^#]+[[:space:]]+/[[:space:]]+ufs[[:space:]]' /etc/fstab
+    \\test "$(($(/bin/df -k / | /usr/bin/awk 'END { print $2 }') * 1024))" -ge @MINIMUM_ROOT_BYTES@
 ;
 
 /// ZFS-specific state. The root has no fstab entry and grows by onlining the
@@ -536,16 +707,16 @@ const ufs_remote_checks =
 /// The pool must also be healthy, carry autoexpand for later enlargements,
 /// and be re-GUIDed on every boot so two clones stay distinguishable.
 const zfs_remote_checks =
-    \\test "$(mount -p | awk '$2 == "/" { print $3 }')" = zfs
-    \\root_pool=$(mount -p | awk '$2 == "/" { print $1 }' | sed 's|/.*||')
+    \\test "$(/sbin/mount -p | /usr/bin/awk '$2 == "/" { print $3 }')" = zfs
+    \\root_pool=$(/sbin/mount -p | /usr/bin/awk '$2 == "/" { print $1 }' | /usr/bin/sed 's|/.*||')
     \\test "${root_pool}" = zroot
-    \\test "$(zpool status -x "${root_pool}")" = "pool '${root_pool}' is healthy"
-    \\test "$(sysrc -n zfs_enable)" = YES
-    \\test "$(sysrc -n zpool_reguid)" = "${root_pool}"
-    \\test "$(zpool get -H -o value autoexpand "${root_pool}")" = on
-    \\test "$(zpool list -Hp -o size "${root_pool}")" -ge @MINIMUM_ROOT_BYTES@
-    \\test -z "$(zfs list -H -o name,org.freebsd:swap -t volume | awk '$2 == "on" { print $1 }')"
-    \\! grep -Eq '[[:space:]]ufs[[:space:]]' /etc/fstab
+    \\test "$(/sbin/zpool status -x "${root_pool}")" = "pool '${root_pool}' is healthy"
+    \\test "${zfs_enable-}" = YES
+    \\test "${zpool_reguid-}" = "${root_pool}"
+    \\test "$(/sbin/zpool get -H -o value autoexpand "${root_pool}")" = on
+    \\test "$(/sbin/zpool list -Hp -o size "${root_pool}")" -ge @MINIMUM_ROOT_BYTES@
+    \\test -z "$(/sbin/zfs list -H -o name,org.freebsd:swap -t volume | /usr/bin/awk '$2 == "on" { print $1 }')"
+    \\! /usr/bin/grep -Eq '[[:space:]]ufs[[:space:]]' /etc/fstab
 ;
 
 fn replaceTokenAlloc(
@@ -570,7 +741,7 @@ fn replaceTokenAlloc(
 /// this from the manifest rather than restating it is what makes the
 /// contract enforceable: a package removed from the manifest stops being
 /// required here in the same diff, and nothing else can quietly drop one.
-fn contractRemoteChecksAlloc(
+fn staticPackageRemoteChecksAlloc(
     allocator: Allocator,
     flavor: Flavor,
 ) ![]u8 {
@@ -578,31 +749,48 @@ fn contractRemoteChecksAlloc(
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     for (manifest.required) |package| {
-        try output.writer.print("pkg info -e {s}\n", .{package.name});
+        try output.writer.print("/usr/local/sbin/pkg info -e {s}\n", .{package.name});
     }
     for (manifest.library_roots) |library| {
-        try output.writer.print("pkg info -e {s}\n", .{library});
+        try output.writer.print("/usr/local/sbin/pkg info -e {s}\n", .{library});
     }
     for (manifest.excluded) |excluded| {
-        try output.writer.print("! pkg info -e {s}\n", .{excluded});
+        try output.writer.print("! /usr/local/sbin/pkg info -e {s}\n", .{excluded});
     }
     for (manifest.excluded_classes) |class| {
         try output.writer.print(
-            "! pkg query -a '%n' | grep -Eq '^FreeBSD-.*-{s}$'\n",
+            "! /usr/local/sbin/pkg query -a '%n' | " ++
+                "/usr/bin/grep -Eq '^FreeBSD-.*-{s}$'\n",
             .{class},
         );
     }
-    // The update path is the reason an image stays supportable. Exercise it
-    // again as the key-only, non-root acceptance user, using sudo only for
-    // catalogue or package-database writes. The base upgrade is a dry run so
-    // acceptance succeeds whether or not upstream has published an update.
     try output.writer.print(
-        "package_state_before=$(pkg query -a '%n %v %a' | sort | sha256 -q)\n" ++
-            "sudo -n pkg update -f\n" ++
-            "sudo -n pkg update -f -r {s}\n" ++
-            "pkg rquery -r {s} '%n-%v' FreeBSD-runtime >/dev/null\n" ++
-            "sudo -n pkg upgrade -n -U -r {s}\n" ++
-            "test \"$(pkg query -a '%n %v %a' | sort | sha256 -q)\" = " ++
+        "! /usr/local/sbin/pkg info -e {s}\n",
+        .{packages.representative_package},
+    );
+    return output.toOwnedSlice();
+}
+
+/// Refresh both catalogues and exercise the pkgbase solver without applying
+/// an update. This is intentionally separate from the static guest contract:
+/// finalized images carry neither catalogues nor package archives, so the
+/// first refresh is a bounded network operation rather than an SSH probe.
+fn updateRemoteChecksAlloc(
+    allocator: Allocator,
+    flavor: Flavor,
+) ![]u8 {
+    const manifest = packages.forFlavor(flavor);
+    return std.fmt.allocPrint(
+        allocator,
+        "set -eu\n" ++
+            "package_state_before=$(/usr/local/sbin/pkg query -a '%n %v %a' | " ++
+            "/usr/bin/sort | /sbin/sha256 -q)\n" ++
+            "/usr/local/bin/sudo -n /usr/local/sbin/pkg update -f\n" ++
+            "/usr/local/bin/sudo -n /usr/local/sbin/pkg update -f -r {s}\n" ++
+            "/usr/local/sbin/pkg rquery -r {s} '%n-%v' FreeBSD-runtime >/dev/null\n" ++
+            "/usr/local/bin/sudo -n /usr/local/sbin/pkg upgrade -n -U -r {s}\n" ++
+            "test \"$(/usr/local/sbin/pkg query -a '%n %v %a' | " ++
+            "/usr/bin/sort | /sbin/sha256 -q)\" = " ++
             "\"${{package_state_before}}\"\n",
         .{
             manifest.base_repository,
@@ -610,17 +798,28 @@ fn contractRemoteChecksAlloc(
             manifest.base_repository,
         },
     );
-    try output.writer.print(
-        "! pkg info -e {s}\n" ++
-            "pkg rquery '%n-%v' {s} >/dev/null\n" ++
-            "package_state_before=$(pkg query -a '%n %v %a' | sort | sha256 -q)\n" ++
-            "sudo -n pkg install -y {s}\n" ++
-            "pkg info -e {s}\n" ++
-            "sudo -n pkg delete -y {s}\n" ++
-            "! pkg info -e {s}\n" ++
-            "test \"$(pkg query -a '%n %v %a' | sort | sha256 -q)\" = " ++
+}
+
+/// Prove a ports package can be resolved, installed, removed, and cleaned
+/// without changing the shipped package set. No assertion requires an update
+/// to exist; the lifecycle only requires the current catalogue to be usable.
+fn packageLifecycleRemoteChecksAlloc(allocator: Allocator) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "set -eu\n" ++
+            "! /usr/local/sbin/pkg info -e {s}\n" ++
+            "/usr/local/sbin/pkg rquery '%n-%v' {s} >/dev/null\n" ++
+            "package_state_before=$(/usr/local/sbin/pkg query -a '%n %v %a' | " ++
+            "/usr/bin/sort | /sbin/sha256 -q)\n" ++
+            "/usr/local/bin/sudo -n /usr/local/sbin/pkg install -y {s}\n" ++
+            "/usr/local/sbin/pkg info -e {s}\n" ++
+            "/usr/local/bin/sudo -n /usr/local/sbin/pkg delete -y {s}\n" ++
+            "! /usr/local/sbin/pkg info -e {s}\n" ++
+            "test \"$(/usr/local/sbin/pkg query -a '%n %v %a' | " ++
+            "/usr/bin/sort | /sbin/sha256 -q)\" = " ++
             "\"${{package_state_before}}\"\n" ++
-            "sudo -n pkg clean -ay\n",
+            "/usr/local/bin/sudo -n /usr/local/sbin/pkg clean -ay\n" ++
+            "test -z \"$(/usr/bin/find /var/cache/pkg -type f)\"\n",
         .{
             packages.representative_package,
             packages.representative_package,
@@ -630,10 +829,9 @@ fn contractRemoteChecksAlloc(
             packages.representative_package,
         },
     );
-    return output.toOwnedSlice();
 }
 
-fn remoteChecksAlloc(
+fn staticRemoteChecksAlloc(
     allocator: Allocator,
     root_filesystem: RootFilesystem,
     flavor: Flavor,
@@ -655,7 +853,7 @@ fn remoteChecksAlloc(
         minimum,
     );
     defer allocator.free(rendered);
-    const contract = try contractRemoteChecksAlloc(allocator, flavor);
+    const contract = try staticPackageRemoteChecksAlloc(allocator, flavor);
     defer allocator.free(contract);
     return std.fmt.allocPrint(
         allocator,
@@ -667,7 +865,7 @@ fn remoteChecksAlloc(
 const shared_identity_command =
     \\/usr/bin/ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256 |
     \\  /usr/bin/awk '{ print $2 }'
-    \\sysctl -n kern.hostuuid
+    \\/sbin/sysctl -n kern.hostuuid
 ;
 
 /// A ZFS root carries a third per-instance identifier that UFS has no
@@ -721,6 +919,7 @@ fn readGuestIdentityAlloc(
         ssh_path,
         key_path,
         port,
+        .identity,
         command,
     );
     defer allocator.free(output);
@@ -825,11 +1024,39 @@ test "guest identities compare every per-instance value" {
     );
 }
 
-test "remote checks stay filesystem-specific" {
+fn expectCommandBefore(
+    command: []const u8,
+    first: []const u8,
+    second: []const u8,
+) !void {
+    const first_index = std.mem.indexOf(u8, command, first) orelse
+        return error.ExpectedCommandMissing;
+    const second_index = std.mem.indexOf(u8, command, second) orelse
+        return error.ExpectedCommandMissing;
+    try std.testing.expect(first_index < second_index);
+}
+
+const BootPhase = enum {
+    initial,
+    after_reboot,
+};
+
+/// The builder already exercises the update and package lifecycle for every
+/// image. QEMU repeats that expensive network contract once against a clean,
+/// finalized clone; both clones and both boots still repeat the static and
+/// identity contracts that provide the dual-instance and reboot evidence.
+fn shouldRunExpensivePackageContract(
+    instance_index: usize,
+    boot_phase: BootPhase,
+) bool {
+    return instance_index == 0 and boot_phase == .initial;
+}
+
+test "static remote checks stay filesystem-specific" {
     const allocator = std.testing.allocator;
-    const ufs = try remoteChecksAlloc(allocator, .ufs, .full);
+    const ufs = try staticRemoteChecksAlloc(allocator, .ufs, .full);
     defer allocator.free(ufs);
-    const zfs = try remoteChecksAlloc(allocator, .zfs, .full);
+    const zfs = try staticRemoteChecksAlloc(allocator, .zfs, .full);
     defer allocator.free(zfs);
 
     for ([_][]const u8{ ufs, zfs }) |checks| {
@@ -842,24 +1069,26 @@ test "remote checks stay filesystem-specific" {
         try std.testing.expect(std.mem.indexOf(
             u8,
             checks,
-            "! gpart show | grep -q CORRUPT",
+            "! /sbin/gpart show | /usr/bin/grep -q CORRUPT",
         ) != null);
         try std.testing.expect(std.mem.indexOf(
             u8,
             checks,
             "8589934592",
         ) != null);
+        try std.testing.expect(std.mem.indexOf(u8, checks, ". /etc/rc.conf") != null);
+        try std.testing.expect(std.mem.indexOf(u8, checks, "sysrc") == null);
     }
     try std.testing.expect(std.mem.indexOf(u8, ufs, "zpool") == null);
     try std.testing.expect(std.mem.indexOf(u8, zfs, "zpool list -Hp -o size") != null);
     try std.testing.expect(std.mem.indexOf(u8, zfs, "df -k /") == null);
 }
 
-test "remote checks enforce the retained contract for every flavor" {
+test "static remote checks enforce the retained contract for every flavor" {
     const allocator = std.testing.allocator;
-    const full = try remoteChecksAlloc(allocator, .ufs, .full);
+    const full = try staticRemoteChecksAlloc(allocator, .ufs, .full);
     defer allocator.free(full);
-    const core = try remoteChecksAlloc(allocator, .ufs, .core);
+    const core = try staticRemoteChecksAlloc(allocator, .ufs, .core);
     defer allocator.free(core);
 
     for ([_][]const u8{ full, core }) |checks| {
@@ -869,7 +1098,7 @@ test "remote checks enforce the retained contract for every flavor" {
         for (packages.required_packages) |package| {
             const line = try std.fmt.allocPrint(
                 allocator,
-                "\npkg info -e {s}\n",
+                "\n/usr/local/sbin/pkg info -e {s}\n",
                 .{package.name},
             );
             defer allocator.free(line);
@@ -877,49 +1106,24 @@ test "remote checks enforce the retained contract for every flavor" {
                 std.mem.indexOf(u8, checks, line) != null,
             );
         }
-        // The base update path is what makes a published image supportable.
         try std.testing.expect(std.mem.indexOf(
             u8,
             checks,
-            "sudo -n pkg update -f -r FreeBSD-base",
+            "! /usr/local/sbin/pkg info -e tree",
         ) != null);
         try std.testing.expect(std.mem.indexOf(
             u8,
             checks,
-            "sudo -n pkg upgrade -n -U -r FreeBSD-base",
-        ) != null);
-        try std.testing.expect(std.mem.indexOf(
-            u8,
-            checks,
-            "sudo -n pkg install -y tree",
-        ) != null);
-        try std.testing.expect(std.mem.indexOf(
-            u8,
-            checks,
-            "sudo -n pkg delete -y tree",
-        ) != null);
-        try std.testing.expect(std.mem.indexOf(
-            u8,
-            checks,
-            "! pkg info -e tree",
-        ) != null);
-        try std.testing.expect(std.mem.indexOf(
-            u8,
-            checks,
-            "sudo -n pkg clean -ay",
-        ) != null);
-        try std.testing.expect(std.mem.indexOf(
-            u8,
-            checks,
-            "pkg upgrade -r FreeBSD-base",
+            "pkg update",
         ) == null);
+        try std.testing.expect(std.mem.indexOf(u8, checks, "pkg install") == null);
     }
 
     // Only the core flavor claims exclusions, so only it may assert them.
     for (packages.core_excluded_packages) |excluded| {
         const line = try std.fmt.allocPrint(
             allocator,
-            "! pkg info -e {s}\n",
+            "! /usr/local/sbin/pkg info -e {s}\n",
             .{excluded},
         );
         defer allocator.free(line);
@@ -929,7 +1133,7 @@ test "remote checks enforce the retained contract for every flavor" {
     for (packages.library_roots) |library| {
         const line = try std.fmt.allocPrint(
             allocator,
-            "pkg info -e {s}\n",
+            "/usr/local/sbin/pkg info -e {s}\n",
             .{library},
         );
         defer allocator.free(line);
@@ -940,6 +1144,118 @@ test "remote checks enforce the retained contract for every flavor" {
         core,
         "'^FreeBSD-.*-dbg$'",
     ) != null);
+}
+
+test "package contract phases preserve update and lifecycle ordering" {
+    const allocator = std.testing.allocator;
+    const update = try updateRemoteChecksAlloc(allocator, .core);
+    defer allocator.free(update);
+    const lifecycle = try packageLifecycleRemoteChecksAlloc(allocator);
+    defer allocator.free(lifecycle);
+
+    try expectCommandBefore(
+        update,
+        "/usr/local/bin/sudo -n /usr/local/sbin/pkg update -f\n",
+        "/usr/local/bin/sudo -n /usr/local/sbin/pkg update -f -r FreeBSD-base",
+    );
+    try expectCommandBefore(
+        update,
+        "/usr/local/bin/sudo -n /usr/local/sbin/pkg update -f -r FreeBSD-base",
+        "/usr/local/sbin/pkg rquery -r FreeBSD-base",
+    );
+    try expectCommandBefore(
+        update,
+        "/usr/local/sbin/pkg rquery -r FreeBSD-base",
+        "/usr/local/bin/sudo -n /usr/local/sbin/pkg upgrade -n -U -r FreeBSD-base",
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        update,
+        "/usr/local/bin/sudo -n /usr/local/sbin/pkg upgrade -n -U -r FreeBSD-base",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, update, "pkg install") == null);
+
+    try expectCommandBefore(
+        lifecycle,
+        "/usr/local/sbin/pkg rquery '%n-%v' tree",
+        "/usr/local/bin/sudo -n /usr/local/sbin/pkg install -y tree",
+    );
+    try expectCommandBefore(
+        lifecycle,
+        "/usr/local/bin/sudo -n /usr/local/sbin/pkg install -y tree",
+        "/usr/local/bin/sudo -n /usr/local/sbin/pkg delete -y tree",
+    );
+    try expectCommandBefore(
+        lifecycle,
+        "/usr/local/bin/sudo -n /usr/local/sbin/pkg delete -y tree",
+        "/usr/local/bin/sudo -n /usr/local/sbin/pkg clean -ay",
+    );
+    try expectCommandBefore(
+        lifecycle,
+        "/usr/local/bin/sudo -n /usr/local/sbin/pkg clean -ay",
+        "/usr/bin/find /var/cache/pkg -type f",
+    );
+}
+
+test "SSH operations use phase-appropriate bounded timeouts" {
+    try std.testing.expectEqual(@as(u32, 15), SshOperation.readiness.timeoutSeconds());
+    try std.testing.expectEqual(@as(u32, 15), SshOperation.identity.timeoutSeconds());
+    try std.testing.expectEqual(@as(u32, 120), SshOperation.static_contract.timeoutSeconds());
+    try std.testing.expectEqual(@as(u32, 600), SshOperation.update_contract.timeoutSeconds());
+    try std.testing.expectEqual(@as(u32, 300), SshOperation.package_lifecycle.timeoutSeconds());
+    try std.testing.expectEqual(@as(u32, 30), SshOperation.power.timeoutSeconds());
+    try std.testing.expect(
+        SshOperation.readiness.timeoutSeconds() <
+            SshOperation.update_contract.timeoutSeconds(),
+    );
+}
+
+test "SSH failure diagnostics identify exit and timeout with bounded streams" {
+    const allocator = std.testing.allocator;
+    var exited = SshCommandResult{
+        .operation = .static_contract,
+        .term = .{ .exited = 7 },
+        .stdout = try allocator.dupe(u8, "static stdout"),
+        .stderr = try allocator.dupe(u8, "static stderr"),
+    };
+    defer exited.deinit(allocator);
+    const exit_diagnostic = try sshFailureDiagnosticAlloc(allocator, exited);
+    defer allocator.free(exit_diagnostic);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        exit_diagnostic,
+        "static guest contract failed with exit code 7",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, exit_diagnostic, "static stdout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exit_diagnostic, "static stderr") != null);
+
+    var timed_out = SshCommandResult{
+        .operation = .update_contract,
+        .term = .{ .exited = 124 },
+        .stdout = try allocator.alloc(u8, ssh_diagnostic_limit_bytes + 4),
+        .stderr = try allocator.dupe(u8, "update stderr"),
+    };
+    defer timed_out.deinit(allocator);
+    @memset(timed_out.stdout, 'x');
+    @memcpy(timed_out.stdout[0..4], "drop");
+    @memcpy(timed_out.stdout[timed_out.stdout.len - 4 ..], "keep");
+    const timeout_diagnostic = try sshFailureDiagnosticAlloc(allocator, timed_out);
+    defer allocator.free(timeout_diagnostic);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        timeout_diagnostic,
+        "package update contract timed out after 600 seconds",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, timeout_diagnostic, "drop") == null);
+    try std.testing.expect(std.mem.indexOf(u8, timeout_diagnostic, "keep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, timeout_diagnostic, "update stderr") != null);
+}
+
+test "expensive package contract runs once while static evidence repeats" {
+    try std.testing.expect(shouldRunExpensivePackageContract(0, .initial));
+    try std.testing.expect(!shouldRunExpensivePackageContract(0, .after_reboot));
+    try std.testing.expect(!shouldRunExpensivePackageContract(1, .initial));
+    try std.testing.expect(!shouldRunExpensivePackageContract(1, .after_reboot));
 }
 
 test "the flavor selector accepts only known flavors" {
@@ -967,12 +1283,17 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
     }
 
     const io = std.testing.io;
-    const remote_checks = try remoteChecksAlloc(
+    const static_remote_checks = try staticRemoteChecksAlloc(
         allocator,
         root_filesystem,
         flavor,
     );
-    defer allocator.free(remote_checks);
+    defer allocator.free(static_remote_checks);
+    const update_remote_checks = try updateRemoteChecksAlloc(allocator, flavor);
+    defer allocator.free(update_remote_checks);
+    const package_lifecycle_remote_checks =
+        try packageLifecycleRemoteChecksAlloc(allocator);
+    defer allocator.free(package_lifecycle_remote_checks);
     const image_path = try requireImageAlloc(allocator, io, architecture);
     defer allocator.free(image_path);
     const absolute_image = try Dir.cwd().realPathFileAlloc(
@@ -1325,14 +1646,35 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             port,
             true,
         );
-        try std.testing.expect(try sshSucceeded(
+        try requireSshSuccess(
             allocator,
             io,
             ssh_path,
             private_key_path,
             port,
-            remote_checks,
-        ));
+            .static_contract,
+            static_remote_checks,
+        );
+        if (shouldRunExpensivePackageContract(instance_index, .initial)) {
+            try requireSshSuccess(
+                allocator,
+                io,
+                ssh_path,
+                private_key_path,
+                port,
+                .update_contract,
+                update_remote_checks,
+            );
+            try requireSshSuccess(
+                allocator,
+                io,
+                ssh_path,
+                private_key_path,
+                port,
+                .package_lifecycle,
+                package_lifecycle_remote_checks,
+            );
+        }
         var identity_before_reboot = try readGuestIdentityAlloc(
             allocator,
             io,
@@ -1358,6 +1700,7 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             ssh_path,
             private_key_path,
             port,
+            .power,
             "sudo -n /sbin/shutdown -r now",
         );
         try waitForAdditionalSerialMarker(
@@ -1377,14 +1720,15 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             port,
             true,
         );
-        try std.testing.expect(try sshSucceeded(
+        try requireSshSuccess(
             allocator,
             io,
             ssh_path,
             private_key_path,
             port,
-            remote_checks,
-        ));
+            .static_contract,
+            static_remote_checks,
+        );
         var identity_after_reboot = try readGuestIdentityAlloc(
             allocator,
             io,
@@ -1421,6 +1765,7 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             ssh_path,
             private_key_path,
             port,
+            .power,
             "sudo -n /sbin/shutdown -p now",
         );
         const term = try waitForQemuExit(io, &spawned);

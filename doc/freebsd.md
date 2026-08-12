@@ -151,8 +151,13 @@ is recorded only after `tree` is removed; host-side validation also rejects a
 recorded manifest containing it. Package archives, caches, and repository
 catalogues are then removed before free-space reclamation.
 
-QEMU acceptance repeats the metadata refresh, dry-run base solver, and
-`tree` install/remove cycle on both instances before and after reboot. These
+QEMU acceptance repeats the static guest, package-presence, filesystem, and
+identity contract on both instances before and after reboot. It repeats the
+metadata refresh, dry-run base solver, and `tree` install/remove/cleanup cycle
+once on the first clean, finalized clone; the builder has already exercised
+the same lifecycle while producing every image, while this pass proves it
+still works after catalogues and caches were removed. The network phases have
+separate bounded timeouts from fast SSH readiness and identity probes. All
 commands run through the provisioned key-only, non-root account and use
 `sudo -n` for every catalogue or package-database write, so acceptance also
 proves the published administrative path rather than relying on root console
