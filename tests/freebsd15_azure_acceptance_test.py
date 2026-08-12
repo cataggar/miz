@@ -1,9 +1,11 @@
 """Static validation tests for scripts/freebsd15_azure_acceptance.sh."""
 
 import os
+import shutil
 import stat
 import subprocess
 import sys
+from pathlib import Path
 
 SCRIPT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -56,6 +58,72 @@ def _preflight(candidate_key):
         text=True,
         env=env,
     )
+
+
+def _serial_console_function():
+    content = Path(SCRIPT).read_text(encoding="utf-8")
+    start = content.index("require_serial_console_log() {")
+    end = content.index("\n}\n", start) + len("\n}\n")
+    return content[start:end]
+
+
+def _run_serial_console_case(mode):
+    root = (
+        Path(SCRIPT).parents[1]
+        / ".scratch"
+        / f"freebsd15-serial-console-{os.getpid()}-{mode}"
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.update(
+        {
+            "BOOT_LOG": str(root / "boot.log"),
+            "SERIAL_MODE": mode,
+        }
+    )
+    harness = f"""
+set -u -o pipefail
+attempts=0
+sleeps=0
+az() {{
+  attempts=$((attempts + 1))
+  case "$SERIAL_MODE" in
+    missing) return 1 ;;
+    empty) return 0 ;;
+    no-marker) printf 'UEFI firmware initialized\\nlogin: ' ;;
+    valid) printf 'FreeBSD 15.1-RELEASE kernel boot\\n' ;;
+    *) return 2 ;;
+  esac
+}}
+sleep() {{
+  sleeps=$((sleeps + 1))
+}}
+boot_log=$BOOT_LOG
+resource_group=rg-test
+vm_name=vm-test
+{_serial_console_function()}
+set +e
+require_serial_console_log
+status=$?
+set -e
+printf 'status=%s\\nattempts=%s\\nsleeps=%s\\n' \
+  "$status" "$attempts" "$sleeps"
+"""
+    try:
+        result = subprocess.run(
+            ["bash", "-c", harness],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    metrics = {}
+    for line in result.stdout.splitlines():
+        key, value = line.split("=", 1)
+        metrics[key] = int(value)
+    return result, metrics
 
 
 def test_candidate_key_accepts_supported_profiles():
@@ -146,6 +214,41 @@ def test_contracts_set():
         'contracts="$shared_contracts_before_storage,$filesystem_contracts,'
         '$shared_contracts_after_storage"'
     ) in content
+
+
+def test_serial_console_missing_or_empty_log_fails_after_bounded_retries():
+    for mode in ("missing", "empty"):
+        result, metrics = _run_serial_console_case(mode)
+        assert metrics == {"status": 1, "attempts": 6, "sleeps": 5}
+        assert "did not return a nonempty serial log after 6 attempts" in (
+            result.stderr
+        )
+
+
+def test_serial_console_log_without_freebsd_marker_fails_closed():
+    result, metrics = _run_serial_console_case("no-marker")
+    assert metrics == {"status": 1, "attempts": 6, "sleeps": 5}
+    assert "serial log is missing expected FreeBSD output" in result.stderr
+
+
+def test_serial_console_valid_log_succeeds_without_extra_retries():
+    result, metrics = _run_serial_console_case("valid")
+    assert metrics == {"status": 0, "attempts": 1, "sleeps": 0}
+    assert result.stderr == ""
+
+
+def test_serial_console_gate_precedes_result_and_keeps_cleanup_active():
+    content = Path(SCRIPT).read_text(encoding="utf-8")
+    definition = content.index("require_serial_console_log() {")
+    invocation = content.index("\nrequire_serial_console_log\n", definition)
+    result_writer = content.index(
+        "python3 scripts/freebsd15_release.py azure-result",
+        invocation,
+    )
+    cleanup_trap = content.index("trap cleanup_on_exit EXIT")
+    assert cleanup_trap < invocation < result_writer
+    assert "if ! cleanup_group; then" in content
+    assert "::warning::Azure managed boot diagnostics" not in content
 
 
 def test_zfs_contract_result_remains_backward_compatible():
