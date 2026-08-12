@@ -86,6 +86,18 @@ installed ELF files and requires that no library became unresolvable that was
 resolvable before the prune. That audit is what makes the manifest
 dependency-closed rather than merely reviewed.
 
+FreeBSD marks several pkgbase set metapackages as vital. `pkg autoremove`
+therefore cannot remove them merely because the pipeline changed their
+automatic state, and a surviving `FreeBSD-set-devel` can keep
+`FreeBSD-clang` installed. The core prune first computes the ordinary retained
+closure, then collects only packages selected by the reviewed exclusion names
+and classes, marks those survivors automatic and non-vital, and asks
+`pkg autoremove` to solve the closure again. It never uses forced deletion. If
+a retained package or shared-library consumer actually requires an exclusion,
+the solver leaves it installed and the build reports its automatic, vital, and
+locked state, reverse package dependencies, and shared-library consumers before
+failing.
+
 ### Exclusions
 
 Each exclusion is listed by name in the manifest and must be absent from the

@@ -442,6 +442,48 @@ const package_prune_script =
     \\          pkg query -a '%B' | sort -u > "$1.required"
     \\          comm -13 "$1.provided" "$1.required" > "$1"
     \\      }
+    \\      zvmi_collect_core_exclusions()
+    \\      {
+    \\          output=$1
+    \\          : > "${output}"
+    \\          for excluded in @EXCLUDED_PACKAGES@; do
+    \\              if pkg info -e "${excluded}"; then
+    \\                  printf '%s\n' "${excluded}" >> "${output}"
+    \\              fi
+    \\          done
+    \\          pkg query -a '%n' |
+    \\              grep -E '^FreeBSD-.*-(@EXCLUDED_CLASSES@)$' \
+    \\                  >> "${output}" || true
+    \\          sort -u -o "${output}" "${output}"
+    \\      }
+    \\      zvmi_exclusion_diagnostic()
+    \\      {
+    \\          package=$1
+    \\          echo "core manifest cannot remove ${package}" >&2
+    \\          pkg query \
+    \\              '  state: %n-%v automatic=%a vital=%V locked=%k' \
+    \\              "${package}" >&2 || true
+    \\          pkg query '  required by package: %rn-%rv' \
+    \\              "${package}" >&2 || true
+    \\          for capability in $(pkg query '%y' "${package}"); do
+    \\              consumers=$(pkg query -a '%n %Y' |
+    \\                  awk -v wanted="${capability}" \
+    \\                      '$2 == wanted { print $1 }')
+    \\              if [ -n "${consumers}" ]; then
+    \\                  echo "  capability ${capability} required by:" >&2
+    \\                  printf '%s\n' "${consumers}" |
+    \\                      sed 's/^/    /' >&2
+    \\              fi
+    \\          done
+    \\          for library in $(pkg query '%b' "${package}"); do
+    \\              consumers=$(pkg shlib -qR "${library}" || true)
+    \\              if [ -n "${consumers}" ]; then
+    \\                  echo "  shared library ${library} required by:" >&2
+    \\                  printf '%s\n' "${consumers}" |
+    \\                      sed 's/^/    /' >&2
+    \\              fi
+    \\          done
+    \\      }
     \\      zvmi_unresolved_shlibs /root/zvmi-shlibs-before
     \\      # pkgbase leaf packages declare no dependencies at all: the real
     \\      # edges live in shlib metadata, which pkg's solver does not
@@ -463,17 +505,40 @@ const package_prune_script =
     \\          pkg set -y -A 0 "${third_party}"
     \\      done < /root/zvmi-third-party-packages
     \\      pkg autoremove -y
-    \\      for excluded in @EXCLUDED_PACKAGES@; do
-    \\          if pkg info -e "${excluded}"; then
-    \\              echo "core manifest violated: ${excluded} survived" >&2
+    \\      # FreeBSD's package sets are vital. Marking every base package
+    \\      # automatic therefore computes most of the closure, but a vital
+    \\      # excluded set can survive and keep manual or automatic excluded
+    \\      # dependencies such as FreeBSD-clang alive. Only packages selected
+    \\      # by the reviewed exclusion names and classes may lose that
+    \\      # protection. A retained dependency still keeps them installed.
+    \\      zvmi_collect_core_exclusions /root/zvmi-core-exclusions
+    \\      if [ -s /root/zvmi-core-exclusions ]; then
+    \\          while read -r excluded; do
+    \\              if ! pkg set -y -A 1 "${excluded}"; then
+    \\                  zvmi_exclusion_diagnostic "${excluded}"
+    \\                  exit 1
+    \\              fi
+    \\              if ! pkg set -y -v 0 "${excluded}"; then
+    \\                  zvmi_exclusion_diagnostic "${excluded}"
+    \\                  exit 1
+    \\              fi
+    \\          done < /root/zvmi-core-exclusions
+    \\          pkg autoremove -y
+    \\      fi
+    \\      zvmi_collect_core_exclusions /root/zvmi-core-exclusions
+    \\      if [ -s /root/zvmi-core-exclusions ]; then
+    \\          while read -r excluded; do
+    \\              zvmi_exclusion_diagnostic "${excluded}"
+    \\          done < /root/zvmi-core-exclusions
+    \\          echo "core manifest violated: exclusions are required" >&2
+    \\          exit 1
+    \\      fi
+    \\      for root in @RETAINED_ROOTS@; do
+    \\          if ! pkg info -e "${root}"; then
+    \\              echo "core manifest lost retained root: ${root}" >&2
     \\              exit 1
     \\          fi
     \\      done
-    \\      if pkg query -a '%n' |
-    \\          grep -Eq '^FreeBSD-.*-(@EXCLUDED_CLASSES@)$'; then
-    \\          echo "core manifest violated: excluded class survived" >&2
-    \\          exit 1
-    \\      fi
     \\      # Dry run: report a broken declared dependency rather than
     \\      # quietly reinstalling the package the prune just removed.
     \\      pkg check -d -n -a
@@ -510,6 +575,7 @@ const package_record_script =
     \\      rm -f /root/zvmi-third-party-packages
     \\      rm -f /root/zvmi-shlibs-before* /root/zvmi-shlibs-after*
     \\      rm -f /root/zvmi-shlibs-lost
+    \\      rm -f /root/zvmi-core-exclusions
 ;
 
 const Substitution = struct {
@@ -809,6 +875,7 @@ test "the core guest script prunes from the manifest and audits the result" {
     try std.testing.expect(std.mem.indexOf(u8, script, "pkg autoremove -y") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "pkg check -B -a") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "pkg check -d -n -a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "pkg delete -f") == null);
     try std.testing.expect(std.mem.indexOf(u8, script, "rm -rf /usr") == null);
     try std.testing.expect(std.mem.indexOf(u8, script, "find /usr") == null);
     // Every retained package and every reviewed exclusion has to appear.
@@ -824,7 +891,7 @@ test "the core guest script prunes from the manifest and audits the result" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         script,
-        "grep -Eq '^FreeBSD-.*-(dbg|dev|lib32)$'",
+        "grep -E '^FreeBSD-.*-(dbg|dev|lib32)$'",
     ) != null);
     // The update path, a non-destructive base solver run, and a real ports
     // package lifecycle are proven in the guest.
@@ -861,6 +928,127 @@ test "the core guest script prunes from the manifest and audits the result" {
         if (line.len == 0) continue;
         try std.testing.expect(std.mem.startsWith(u8, line, "      "));
     }
+}
+
+test "a manual excluded package surviving autoremove is reclassified" {
+    const allocator = std.testing.allocator;
+    const script = try guestScriptAlloc(allocator, forFlavor(.core), "abc");
+    defer allocator.free(script);
+
+    // Model an upstream-manual FreeBSD-clang surviving the first autoremove:
+    // the exact reviewed name is collected regardless of its automatic flag,
+    // and the second pass changes both flags that can keep it out of
+    // autoremove.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "for excluded in FreeBSD-clang ",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "if pkg info -e \"${excluded}\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "if ! pkg set -y -A 1 \"${excluded}\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "if ! pkg set -y -v 0 \"${excluded}\"",
+    ) != null);
+}
+
+test "generated exclusion commands preserve dependency-safe order" {
+    const allocator = std.testing.allocator;
+    const script = try guestScriptAlloc(allocator, forFlavor(.core), "abc");
+    defer allocator.free(script);
+
+    // The first autoremove may leave an upstream-manual package behind, and
+    // vital pkgbase sets are never orphaned. Every surviving reviewed
+    // exclusion is therefore made automatic and non-vital before a second
+    // dependency-aware autoremove. The final collection and diagnostic happen
+    // only after that second pass.
+    const first_autoremove = std.mem.indexOf(
+        u8,
+        script,
+        "pkg autoremove -y",
+    ).?;
+    const first_collection = std.mem.indexOfPos(
+        u8,
+        script,
+        first_autoremove,
+        "zvmi_collect_core_exclusions /root/zvmi-core-exclusions",
+    ).?;
+    const automatic = std.mem.indexOfPos(
+        u8,
+        script,
+        first_collection,
+        "if ! pkg set -y -A 1 \"${excluded}\"",
+    ).?;
+    const non_vital = std.mem.indexOfPos(
+        u8,
+        script,
+        automatic,
+        "if ! pkg set -y -v 0 \"${excluded}\"",
+    ).?;
+    const second_autoremove = std.mem.indexOfPos(
+        u8,
+        script,
+        non_vital,
+        "pkg autoremove -y",
+    ).?;
+    const final_collection = std.mem.indexOfPos(
+        u8,
+        script,
+        second_autoremove,
+        "zvmi_collect_core_exclusions /root/zvmi-core-exclusions",
+    ).?;
+    const diagnostic = std.mem.indexOfPos(
+        u8,
+        script,
+        final_collection,
+        "zvmi_exclusion_diagnostic \"${excluded}\"",
+    ).?;
+
+    try std.testing.expect(first_autoremove < first_collection);
+    try std.testing.expect(first_collection < automatic);
+    try std.testing.expect(automatic < non_vital);
+    try std.testing.expect(non_vital < second_autoremove);
+    try std.testing.expect(second_autoremove < final_collection);
+    try std.testing.expect(final_collection < diagnostic);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "automatic=%a vital=%V locked=%k",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "required by package: %rn-%rv",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "capability ${capability} required by:",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "pkg shlib -qR \"${library}\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script[final_collection..],
+        "if ! pkg info -e \"${root}\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script[final_collection..],
+        "core manifest lost retained root: ${root}",
+    ) != null);
 }
 
 test "the full guest script verifies the contract without pruning" {
