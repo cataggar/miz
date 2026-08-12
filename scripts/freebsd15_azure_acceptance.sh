@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# FreeBSD 15 Azure acceptance harness — ZFS full variants (aarch64 / x86_64).
+# FreeBSD 15 Azure acceptance harness — UFS and ZFS variants (aarch64 / x86_64).
 # Validates a candidate QCOW2 by deriving a fixed VHD, uploading to Azure,
-# booting a Gen2 VM, and exercising key provisioning/networking/ZFS contracts.
+# booting a Gen2 VM, and exercising shared and filesystem-specific contracts.
 set -Eeuo pipefail
 
 command_name=${1:-run}
@@ -11,7 +11,7 @@ if [[ -z ${STATE_FILE:-} || -z ${GITHUB_RUN_ID:-} || -z ${GITHUB_RUN_ATTEMPT:-} 
 fi
 [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
 [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
-[[ "$CANDIDATE_KEY" =~ ^(x86_64|aarch64)-zfs-full$ ]]
+[[ "$CANDIDATE_KEY" =~ ^(x86_64|aarch64)-(ufs-(full|core)|zfs-full)$ ]]
 
 cleanup_group() {
   [[ -s "$STATE_FILE" ]] || return 0
@@ -86,8 +86,13 @@ if [[ -z ${CANDIDATE_DIR:-} || -z ${SOURCE_COMMIT:-} || -z ${ARCHITECTURE:-} ||
 fi
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
 [[ "$ARCHITECTURE" =~ ^(x86_64|aarch64)$ ]]
-[[ "$FILESYSTEM" == zfs ]]
-[[ "$FLAVOR" == full ]]
+case "$FILESYSTEM-$FLAVOR" in
+  ufs-full|ufs-core|zfs-full) ;;
+  *)
+    echo "::error::Unsupported FreeBSD Azure acceptance profile: $FILESYSTEM-$FLAVOR"
+    exit 1
+    ;;
+esac
 [[ "$CANDIDATE_KEY" == "$ARCHITECTURE-$FILESYSTEM-$FLAVOR" ]]
 [[ "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ ]]
 [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
@@ -237,40 +242,102 @@ mkdir -p "$RESULT_DIR"
 manifest="$CANDIDATE_DIR/candidate.json"
 asset="$CANDIDATE_DIR/$ASSET_NAME"
 
-# Validate candidate binding — architecture, filesystem, flavor, source commit
-readarray -t candidate < <(
-  python3 - "$manifest" "$asset" "$CANDIDATE_KEY" "$SOURCE_COMMIT" <<'PY'
-import json
-import hashlib
+validate_candidate_binding() {
+  python3 - "$manifest" "$asset" "$CANDIDATE_KEY" "$SOURCE_COMMIT" \
+    "$ARCHITECTURE" "$FILESYSTEM" "$FLAVOR" "$ASSET_NAME" \
+    "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" scripts/freebsd15_release.py <<'PY'
+import importlib.util
 import sys
+from pathlib import Path
 
-manifest_path, asset_path, key, source_commit = sys.argv[1:]
-doc = json.load(open(manifest_path, encoding="utf-8"))
-if doc.get("schema") != 2:
-    raise SystemExit("unsupported candidate schema")
-if doc.get("type") != "zvmi-freebsd15-candidate":
-    raise SystemExit("unexpected candidate type")
+(
+    manifest_path,
+    asset_path,
+    key,
+    source_commit,
+    architecture,
+    filesystem,
+    flavor,
+    asset_name,
+    run_id,
+    run_attempt,
+    helper_path,
+) = sys.argv[1:]
+
+helper = Path(helper_path).resolve(strict=True)
+spec = importlib.util.spec_from_file_location("freebsd15_release", helper)
+if spec is None or spec.loader is None:
+    raise SystemExit("could not load canonical candidate validator")
+release = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(release)
+
+doc, canonical_asset = release.validate_candidate(
+    Path(manifest_path).resolve(strict=True),
+    source_commit,
+)
+requested_asset = Path(asset_path).resolve(strict=True)
+if requested_asset != canonical_asset.resolve():
+    raise SystemExit("candidate asset path does not match manifest")
+if requested_asset.name != asset_name or doc.get("asset_name") != asset_name:
+    raise SystemExit("candidate asset name mismatch")
 if doc.get("variant") != key:
     raise SystemExit(f"candidate variant mismatch: expected {key}")
-if doc.get("filesystem") != "zfs":
-    raise SystemExit("this harness only accepts ZFS candidates")
-if doc.get("flavor") != "full":
-    raise SystemExit("this harness only accepts full-flavor candidates")
-if doc.get("source_commit") != source_commit:
-    raise SystemExit("source commit mismatch")
-# Verify the asset digest
-with open(asset_path, "rb") as f:
-    h = hashlib.sha256()
-    while chunk := f.read(1 << 20):
-        h.update(chunk)
-actual_sha256 = h.hexdigest()
-if actual_sha256 != doc.get("asset_sha256"):
-    raise SystemExit("candidate asset SHA-256 mismatch")
+if doc.get("architecture") != architecture:
+    raise SystemExit("candidate architecture mismatch")
+if doc.get("filesystem") != filesystem:
+    raise SystemExit("candidate filesystem mismatch")
+if doc.get("flavor") != flavor:
+    raise SystemExit("candidate flavor mismatch")
+if (filesystem, flavor) not in {
+    ("ufs", "full"),
+    ("ufs", "core"),
+    ("zfs", "full"),
+}:
+    raise SystemExit("unsupported candidate filesystem/flavor combination")
+if not isinstance(doc.get("asset_bytes"), int) or doc["asset_bytes"] <= 0:
+    raise SystemExit("candidate asset size is missing or invalid")
+if not isinstance(doc.get("virtual_size"), int) or doc["virtual_size"] <= 0:
+    raise SystemExit("candidate virtual size is missing or invalid")
+source = doc.get("source")
+if not isinstance(source, dict):
+    raise SystemExit("candidate source metadata is missing")
+if not isinstance(source.get("bytes"), int) or source["bytes"] <= 0:
+    raise SystemExit("candidate source size is missing or invalid")
+packages = doc.get("packages")
+if not isinstance(packages, dict):
+    raise SystemExit("candidate package manifest is missing")
+if not isinstance(packages.get("installed_bytes"), int) or packages["installed_bytes"] <= 0:
+    raise SystemExit("candidate package installed size is missing or invalid")
+package_manifest_path = Path(f"{requested_asset}.packages.txt").resolve(strict=True)
+installed_packages = release.parse_package_manifest(package_manifest_path)
+release.verify_package_manifest(flavor, installed_packages)
+if [package["name"] for package in installed_packages] != packages.get("names"):
+    raise SystemExit("candidate package manifest content does not match")
+if len(installed_packages) != packages.get("count"):
+    raise SystemExit("candidate package manifest count does not match")
+if sum(package["installed_bytes"] for package in installed_packages) != packages["installed_bytes"]:
+    raise SystemExit("candidate package manifest installed size does not match")
+validation = doc.get("validation")
+if not isinstance(validation, dict):
+    raise SystemExit("candidate validation metadata is missing")
+for field in ("qemu_version", "runner", "run_id", "run_attempt"):
+    value = validation.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"candidate validation metadata is missing {field}")
+if validation["runner"] != release.VARIANTS[key]["runner"]:
+    raise SystemExit("candidate validation runner does not match profile")
+if validation["run_id"] != run_id or validation["run_attempt"] != run_attempt:
+    raise SystemExit("candidate validation workflow identity mismatch")
 print(doc["asset_sha256"])
 print(doc["asset_bytes"])
 print(doc["virtual_size"])
 print(doc["architecture"])
 PY
+}
+
+# Canonically validate every candidate field before creating Azure resources.
+readarray -t candidate < <(
+  validate_candidate_binding
 )
 test "${#candidate[@]}" -eq 4
 qcow_sha256=${candidate[0]}
@@ -543,6 +610,23 @@ reboot_and_reconnect() {
   return 1
 }
 
+wait_for_poweroff() {
+  local power_state
+  for _ in {1..60}; do
+    power_state=$(az vm get-instance-view \
+      --resource-group "$resource_group" \
+      --name "$vm_name" \
+      --query "instanceView.statuses[?starts_with(code, 'PowerState/')].code | [0]" \
+      --output tsv)
+    case "$power_state" in
+      PowerState/stopped|PowerState/deallocated) return ;;
+    esac
+    sleep 5
+  done
+  echo "::error::Guest did not complete a clean shutdown"
+  return 1
+}
+
 # --- CONTRACT: matching-architecture-gen2 ---
 # (Gen2 enforced by disk hyper-v-generation V2)
 
@@ -567,15 +651,20 @@ pre_reboot_hostkey=$(ssh "${ssh_options[@]}" "$ssh_target" \
   'cat /etc/ssh/ssh_host_ed25519_key.pub')
 pre_reboot_hostuuid=$(ssh "${ssh_options[@]}" "$ssh_target" \
   'sudo sysctl -n kern.hostuuid')
-pre_reboot_zpool_guid=$(ssh "${ssh_options[@]}" "$ssh_target" \
-  "zpool get -Hp -o value guid zroot")
+pre_reboot_storage_identity=
+if [[ "$FILESYSTEM" == zfs ]]; then
+  pre_reboot_storage_identity=$(ssh "${ssh_options[@]}" "$ssh_target" \
+    'zpool get -Hp -o value guid zroot')
+fi
 
-# --- CONTRACTS: agent-ready, hn0-dhcp, zfs-root, zpool-healthy, root-growth, gpt-healthy ---
+# --- SHARED CONTRACTS: agent-ready, hn0-dhcp, root-growth, gpt-healthy ---
+# --- FILESYSTEM CONTRACTS: ufs-root / zfs-root and their growth/health state ---
 ssh "${ssh_options[@]}" "$ssh_target" \
-  "/bin/sh -s -- '$virtual_size' '$runtime_architecture'" <<'GUEST'
+  "/bin/sh -s -- '$virtual_size' '$runtime_architecture' '$FILESYSTEM'" <<'GUEST'
 set -eu
 original_size=$1
 runtime_arch=$2
+expected_filesystem=$3
 
 # Validate runtime architecture
 hw_machine=$(sysctl -n hw.machine_arch)
@@ -614,28 +703,89 @@ else
   ifconfig "$nic" | grep -q 'inet '
 fi
 
-# zfs-root: root is on ZFS
-rootfs=$(mount | awk '$3=="/" {print $5}')
-test "$rootfs" = "zfs"
+root_device=$(mount -p | awk '$2 == "/" { print $1 }')
+rootfs=$(mount -p | awk '$2 == "/" { print $3 }')
+test -n "$root_device"
+test "$rootfs" = "$expected_filesystem"
 
-# zpool-healthy: zroot pool is healthy
-zpool status zroot | grep -q 'state: ONLINE'
+case "$expected_filesystem" in
+  ufs)
+    # ufs-root and UFS growth: both the partition provider and filesystem must
+    # have expanded beyond the exact candidate's original virtual size.
+    grep -Eq '^[^#]+[[:space:]]+/[[:space:]]+ufs[[:space:]]' /etc/fstab
+    root_provider=$(basename "$(realpath "$root_device")")
+    disk=$(printf '%s\n' "$root_provider" | sed -E 's/p[0-9]+$//')
+    test "$disk" != "$root_provider"
+    root_partition_size=$(diskinfo "$root_device" | awk '{ print $3 }')
+    root_filesystem_kib=$(df -k / | awk 'END { print $2 }')
+    test "$root_partition_size" -gt "$original_size"
+    test "$root_filesystem_kib" -gt "$((original_size / 1024))"
+    ;;
+  zfs)
+    # zfs-root, pool health, autoexpand, growth, and absence of swap zvols.
+    root_pool=${root_device%%/*}
+    test "$root_pool" = zroot
+    test "$(zpool status -x "$root_pool")" = "pool '$root_pool' is healthy"
+    test "$(zpool get -H -o value autoexpand "$root_pool")" = on
+    pool_size=$(zpool list -Hp -o size "$root_pool")
+    test "$pool_size" -gt "$original_size"
+    disk=$(zpool status -LP "$root_pool" |
+      awk '/\/dev\// { sub("^/dev/", "", $1); sub("p[0-9]+$", "", $1); print $1; exit }')
+    test -z "$(zfs list -H -o name,org.freebsd:swap -t volume |
+      awk '$2 == "on" { print $1 }')"
+    ;;
+  *)
+    echo "unsupported root filesystem: $expected_filesystem" >&2
+    exit 1
+    ;;
+esac
 
-# root-growth: pool and root dataset have grown beyond the original virtual size
-pool_size=$(zpool get -Hp -o value size zroot)
-test "$pool_size" -gt "$original_size"
-
-# gpt-healthy: no corrupt or missing GPT entries
-# On FreeBSD, gpart validates the partition table
-disk=$(zpool status -LP zroot | awk '/\/dev\//{gsub(/p[0-9]+$/,"",$1); print $1; exit}')
+# gpt-healthy: the OS disk has a recovered GPT and every provider is healthy.
 test -n "$disk"
-gpart show "$disk" >/dev/null
+! gpart show "$disk" | grep -q CORRUPT
+test "$(gpart status -s "$disk" | awk '{ print $2 }' | sort -u)" = OK
 
-# swap policy: no swap on ZFS root pool
-if swapinfo -k 2>/dev/null | grep -q zroot; then
-  echo "swap found on zroot" >&2
-  exit 1
-fi
+# no-os-disk-swap: positively identify every swap as resource-disk-backed.
+require_resource_disk_provider() {
+  provider=$1
+  resource_disk=$(printf '%s\n' "$provider" | sed -E 's/(p|s)[0-9]+$//')
+  if [ "$resource_disk" = "$provider" ] || [ "$resource_disk" = "$disk" ]; then
+    echo "swap is not backed by a resource-disk partition: $provider" >&2
+    return 1
+  fi
+  diskinfo "/dev/$resource_disk" >/dev/null
+}
+
+swapinfo -k | awk 'NR > 1 { print $1 }' | while IFS= read -r swap_device; do
+  test -n "$swap_device" || continue
+  swap_provider=$(basename "$(realpath "$swap_device")")
+  case "$swap_provider" in
+    md[0-9]*)
+      md_unit=${swap_provider#md}
+      md_backing=$(mdconfig -lv -u "$md_unit" |
+        awk -F '	' '$2 == "vnode" { print $4; exit }')
+      if [ -z "$md_backing" ] || [ ! -f "$md_backing" ]; then
+        echo "swap md provider is not a resolvable vnode: $swap_device" >&2
+        exit 1
+      fi
+      md_backing_mount=$(df -k "$md_backing" | awk 'END { print $6 }')
+      md_backing_device=$(df -k "$md_backing" | awk 'END { print $1 }')
+      if [ "$md_backing_mount" = / ] || [ "${md_backing_device#/dev/}" = "$md_backing_device" ]; then
+        echo "swap vnode is backed by the OS/root filesystem: $md_backing" >&2
+        exit 1
+      fi
+      md_backing_provider=$(basename "$(realpath "$md_backing_device")")
+      require_resource_disk_provider "$md_backing_provider"
+      ;;
+    *p[0-9]*|*s[0-9]*)
+      require_resource_disk_provider "$swap_provider"
+      ;;
+    *)
+      echo "swap provider is not positively identified as resource-disk-backed: $swap_device" >&2
+      exit 1
+      ;;
+  esac
+done
 GUEST
 
 # --- CONTRACT: serial-console ---
@@ -663,40 +813,126 @@ post_reboot_hostkey=$(ssh "${ssh_options[@]}" "$ssh_target" \
   'cat /etc/ssh/ssh_host_ed25519_key.pub')
 post_reboot_hostuuid=$(ssh "${ssh_options[@]}" "$ssh_target" \
   'sudo sysctl -n kern.hostuuid')
-post_reboot_zpool_guid=$(ssh "${ssh_options[@]}" "$ssh_target" \
-  "zpool get -Hp -o value guid zroot")
 test "$pre_reboot_hostkey" = "$post_reboot_hostkey"
 test "$pre_reboot_hostuuid" = "$post_reboot_hostuuid"
-test "$pre_reboot_zpool_guid" = "$post_reboot_zpool_guid"
 
-# Verify post-reboot ZFS health
-ssh "${ssh_options[@]}" "$ssh_target" 'zpool status zroot | grep -q "state: ONLINE"'
+if [[ "$FILESYSTEM" == zfs ]]; then
+  post_reboot_storage_identity=$(ssh "${ssh_options[@]}" "$ssh_target" \
+    'zpool get -Hp -o value guid zroot')
+  test "$pre_reboot_storage_identity" = "$post_reboot_storage_identity"
+  ssh "${ssh_options[@]}" "$ssh_target" \
+    'test "$(zpool status -x zroot)" = "pool '\''zroot'\'' is healthy"; test "$(zpool get -H -o value autoexpand zroot)" = on'
+else
+  ssh "${ssh_options[@]}" "$ssh_target" \
+    'test "$(mount -p | awk '\''$2 == "/" { print $3 }'\'')" = ufs'
+fi
 
 # Clean shutdown
 ssh "${ssh_options[@]}" "$ssh_target" 'sudo shutdown -p now' >/dev/null 2>&1 || true
+wait_for_poweroff
 
 # --- Generate result ---
-# The azure-result command is expected to be provided by scripts/freebsd15_release.py
-# in a parallel prerequisite PR. Design the invocation for the shared contract.
 azure_accepted_sha256=$(sha256sum "$asset" | awk '{print $1}')
 test "$azure_accepted_sha256" = "$qcow_sha256"
+readarray -t result_candidate < <(
+  validate_candidate_binding
+)
+test "${#result_candidate[@]}" -eq 4
+test "${result_candidate[0]}" = "$qcow_sha256"
+test "${result_candidate[1]}" = "$qcow_bytes"
+test "${result_candidate[2]}" = "$virtual_size"
+test "${result_candidate[3]}" = "$candidate_architecture"
 
-contracts="matching-architecture-gen2,key-only-ssh,agent-ready,hn0-dhcp,serial-console,zfs-root,zpool-healthy,root-growth,gpt-healthy,reboot-reconnect,instance-identity"
+shared_contracts_before_storage="matching-architecture-gen2,key-only-ssh,agent-ready,hn0-dhcp,serial-console"
+shared_contracts_after_storage="root-growth,gpt-healthy,reboot-reconnect,instance-identity"
+case "$FILESYSTEM" in
+  zfs)
+    # Keep the established ZFS/full result contract byte-for-byte stable.
+    filesystem_contracts="zfs-root,zpool-healthy"
+    ;;
+  ufs)
+    filesystem_contracts="ufs-root,ufs-root-partition-growth,ufs-root-filesystem-growth,no-os-disk-swap"
+    ;;
+esac
+contracts="$shared_contracts_before_storage,$filesystem_contracts,$shared_contracts_after_storage"
 
-python3 scripts/freebsd15_release.py azure-result \
-  --manifest "$manifest" \
-  --asset "$asset" \
-  --key "$CANDIDATE_KEY" \
-  --source-commit "$SOURCE_COMMIT" \
-  --location "$AZURE_LOCATION" \
-  --vm-size "$AZURE_VM_SIZE" \
-  --resource-group "$resource_group" \
-  --vhd-sha256 "$vhd_sha256" \
-  --vhd-bytes "$vhd_bytes" \
-  --contracts "$contracts" \
-  --run-id "$GITHUB_RUN_ID" \
-  --run-attempt "$GITHUB_RUN_ATTEMPT" \
-  --output "$RESULT_DIR/azure-result.json"
+if [[ "$FILESYSTEM" == zfs ]]; then
+  python3 scripts/freebsd15_release.py azure-result \
+    --manifest "$manifest" \
+    --asset "$asset" \
+    --key "$CANDIDATE_KEY" \
+    --source-commit "$SOURCE_COMMIT" \
+    --location "$AZURE_LOCATION" \
+    --vm-size "$AZURE_VM_SIZE" \
+    --resource-group "$resource_group" \
+    --vhd-sha256 "$vhd_sha256" \
+    --vhd-bytes "$vhd_bytes" \
+    --contracts "$contracts" \
+    --run-id "$GITHUB_RUN_ID" \
+    --run-attempt "$GITHUB_RUN_ATTEMPT" \
+    --output "$RESULT_DIR/azure-result.json"
+else
+  # The shared release helper currently accepts only the already-wired ZFS
+  # gate. Emit the same deterministic schema for UFS until release integration
+  # teaches the helper to validate the filesystem-specific contract list.
+  python3 - \
+    "$CANDIDATE_KEY" "$ARCHITECTURE" "$FILESYSTEM" "$FLAVOR" "$ASSET_NAME" \
+    "$SOURCE_COMMIT" "$qcow_sha256" "$vhd_sha256" "$vhd_bytes" \
+    "$AZURE_LOCATION" "$AZURE_VM_SIZE" "$resource_group" "$contracts" \
+    "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+    "$RESULT_DIR/azure-result.json" <<'PY'
+import json
+import sys
+
+(
+    variant,
+    architecture,
+    filesystem,
+    flavor,
+    asset_name,
+    source_commit,
+    qcow_sha256,
+    vhd_sha256,
+    vhd_bytes,
+    location,
+    vm_size,
+    resource_group,
+    contracts,
+    run_id,
+    run_attempt,
+    output_path,
+) = sys.argv[1:]
+if filesystem != "ufs":
+    raise SystemExit("UFS result writer received a non-UFS candidate")
+if flavor not in {"full", "core"}:
+    raise SystemExit("UFS result writer received an unsupported flavor")
+document = {
+    "schema": 1,
+    "type": "zvmi-freebsd15-azure-acceptance",
+    "variant": variant,
+    "architecture": architecture,
+    "filesystem": filesystem,
+    "flavor": flavor,
+    "asset_name": asset_name,
+    "source_commit": source_commit,
+    "qcow_sha256": qcow_sha256,
+    "derived_vhd_sha256": vhd_sha256,
+    "derived_vhd_bytes": int(vhd_bytes),
+    "status": "success",
+    "location": location,
+    "vm_size": vm_size,
+    "resource_group": resource_group,
+    "contracts": contracts.split(","),
+    "workflow": {
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+    },
+}
+with open(output_path, "w", encoding="utf-8") as output:
+    json.dump(document, output, indent=2, sort_keys=True)
+    output.write("\n")
+PY
+fi
 
 # Final source-digest assertion
 test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"

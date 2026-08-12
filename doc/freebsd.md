@@ -347,7 +347,14 @@ script refuses to proceed unless both `azure-result.json` files are present.
 The Azure acceptance job uses a protected GitHub environment with OIDC
 credentials and architecture-specific `AZURE_LOCATION_X64`/`AZURE_VM_SIZE_X64`
 and `AZURE_LOCATION_ARM64`/`AZURE_VM_SIZE_ARM64` configuration variables.
-UFS and core release sets skip Azure acceptance entirely.
+The harness also accepts UFS full and core candidates, using the same protected
+subscription configuration and temporary-resource-group ownership model. Its
+shared Gen2, provisioning, network, serial, reboot, identity, GPT, growth, and
+shutdown checks are combined with disjoint storage contracts: UFS proves root
+partition and filesystem growth without invoking ZFS, while ZFS preserves pool
+health, autoexpand, and GUID stability checks. The current workflow remains
+wired only for the established ZFS release gate; UFS/core workflow and release
+metadata integration is tracked separately.
 
 See [Image building](image-building.md) for the shared image-format and Azure
 VHD tooling.
