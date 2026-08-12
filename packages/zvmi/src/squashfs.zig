@@ -1,12 +1,23 @@
-//! SquashFS 4.0 **read-only** reader.
+//! SquashFS 4.0 reader **and writer**.
 //!
-//! Supports uncompressed blocks plus XZ- and zstd-compressed metadata, data,
-//! and fragment blocks. This covers the real Azure Linux installer media used
-//! by `zvmi build-image`, while keeping the implementation focused on the
-//! documented SquashFS 4.0 on-disk layout.
+//! The reader supports uncompressed blocks plus XZ- and zstd-compressed
+//! metadata, data, and fragment blocks. This covers the real Azure Linux
+//! installer media used by `zvmi build-image`, while keeping the
+//! implementation focused on the documented SquashFS 4.0 on-disk layout.
+//!
+//! The writer (`writeImage`/`writeImagePath`) emits a valid SquashFS 4.0
+//! image from a generic pull-based `TreeSource`. It streams regular-file
+//! content block by block -- never holding a whole file in memory -- and
+//! produces byte-for-byte deterministic output. It supports directories,
+//! regular files (including multi-block and >4 GiB files via extended
+//! inodes), and symlinks with POSIX mode/uid/gid, an uncompressed mode and
+//! zstd compression, and optional tail fragments. This is enough to build the
+//! outer LiveOS SquashFS wrapper that carries an ext4 `rootfs.img`. The
+//! reader above round-trips everything the writer emits.
 
 const std = @import("std");
 const Io = std.Io;
+const zstd = @import("zstd.zig");
 
 pub const magic: u32 = 0x7371_7368; // "hsqs" little-endian on disk
 pub const major_version: u16 = 4;
@@ -1226,6 +1237,854 @@ fn dirEntryLessThan(_: void, a: DirEntry, b: DirEntry) bool {
     return std.mem.lessThan(u8, a.name, b.name);
 }
 
+// ===========================================================================
+// Writer
+// ===========================================================================
+
+/// Block compressor used for data, fragment, and metadata blocks. `zstd`
+/// produces frames the reader above (and Zig's stdlib zstd decoder) round-trip;
+/// `none` stores every block verbatim with the on-disk "uncompressed" bit set.
+pub const WriterCompression = enum { none, zstd };
+
+/// Node kinds the writer can encode. RootTree kinds outside this set
+/// (hardlink, device, fifo) are rejected with a precise error by the adapter
+/// rather than being silently dropped.
+pub const SourceKind = enum { directory, file, symlink };
+
+/// One node pulled from a `TreeSource`, addressed by its root-relative path.
+/// Paths carry no leading slash and use '/' separators; the root directory is
+/// described separately by `SourceRoot` and is never returned as a node.
+pub const SourceNode = struct {
+    path: []const u8,
+    kind: SourceKind,
+    /// POSIX mode. Only the low 12 bits (permissions + setuid/setgid/sticky)
+    /// are used; the type bits are derived from `kind`.
+    mode: u16,
+    uid: u32 = 0,
+    gid: u32 = 0,
+    mtime: u32 = 0,
+    /// Byte length for regular files. For symlinks this is the target length
+    /// when the target is delivered through `read` rather than
+    /// `symlink_target`; ignored for directories.
+    size: u64 = 0,
+    /// Link target for symlinks, borrowed for the duration of the write call.
+    /// May be left empty for sources that expose the target through `read`
+    /// (in which case `size` gives its length); ignored for other kinds.
+    symlink_target: []const u8 = &.{},
+};
+
+/// Metadata for the image root directory.
+pub const SourceRoot = struct {
+    mode: u16 = 0o755,
+    uid: u32 = 0,
+    gid: u32 = 0,
+    mtime: u32 = 0,
+};
+
+/// Generic pull-based source the writer consumes. Any tree (RootTree included)
+/// can expose one without the SquashFS codec depending on its concrete type.
+/// `node` may fail so an adapter can reject unrepresentable nodes precisely.
+pub const TreeSource = struct {
+    context: *const anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        root: *const fn (context: *const anyopaque) SourceRoot,
+        count: *const fn (context: *const anyopaque) usize,
+        node: *const fn (context: *const anyopaque, index: usize) anyerror!SourceNode,
+        read: *const fn (context: *const anyopaque, index: usize, buffer: []u8, offset: u64) anyerror!usize,
+    };
+
+    pub fn root(self: TreeSource) SourceRoot {
+        return self.vtable.root(self.context);
+    }
+    pub fn count(self: TreeSource) usize {
+        return self.vtable.count(self.context);
+    }
+    pub fn node(self: TreeSource, index: usize) anyerror!SourceNode {
+        return self.vtable.node(self.context, index);
+    }
+    pub fn read(self: TreeSource, index: usize, buffer: []u8, offset: u64) anyerror!usize {
+        return self.vtable.read(self.context, index, buffer, offset);
+    }
+};
+
+pub const WriteOptions = struct {
+    compression: WriterCompression = .zstd,
+    /// Data block size. Must be a power of two in [4096, 1 MiB].
+    block_size: u32 = 128 * 1024,
+    /// Pack sub-block file tails into shared fragment blocks. Disable for a
+    /// deterministic layout that stores each tail as its own data block.
+    use_fragments: bool = true,
+    /// Deterministic image modification time stamped into the superblock.
+    mtime: u32 = 0,
+};
+
+pub const WriteResult = struct {
+    /// Total image length in bytes.
+    bytes_written: u64,
+    inode_count: u32,
+    fragment_count: u32,
+};
+
+pub const WriteError = error{
+    EmptyBlockSize,
+    BlockSizeNotPowerOfTwo,
+    BlockSizeOutOfRange,
+    InvalidPath,
+    MissingParentDirectory,
+    DuplicatePath,
+    NameTooLong,
+    SymlinkTargetTooLong,
+    TooManyIds,
+    ContentReadShort,
+};
+
+/// Writes a SquashFS 4.0 image describing `source` to `output`, which must be
+/// a writable file positioned at offset 0. Streams file content block by block
+/// and returns the image length plus inode/fragment counts.
+pub fn writeImage(
+    allocator: std.mem.Allocator,
+    io: Io,
+    output: Io.File,
+    source: TreeSource,
+    options: WriteOptions,
+) anyerror!WriteResult {
+    if (options.block_size == 0) return error.EmptyBlockSize;
+    if (!std.math.isPowerOfTwo(options.block_size)) return error.BlockSizeNotPowerOfTwo;
+    if (options.block_size < 4096 or options.block_size > 1 << 20) return error.BlockSizeOutOfRange;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var writer = Writer{
+        .allocator = allocator,
+        .arena = arena.allocator(),
+        .io = io,
+        .file = output,
+        .options = options,
+        .compress = options.compression == .zstd,
+        .inode_table = MetaWriter.init(allocator, options.compression == .zstd),
+        .directory_table = MetaWriter.init(allocator, options.compression == .zstd),
+        .fragments = std.array_list.Managed(FragmentRecord).init(allocator),
+        .ids = std.array_list.Managed(u32).init(allocator),
+        .fragment_buffer = std.array_list.Managed(u8).init(allocator),
+    };
+    defer writer.deinit();
+
+    return writer.run(source);
+}
+
+/// Convenience wrapper that creates (truncating) `path` and writes the image.
+pub fn writeImagePath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+    source: TreeSource,
+    options: WriteOptions,
+) anyerror!WriteResult {
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    return writeImage(allocator, io, file, source, options);
+}
+
+const FragmentRecord = struct {
+    start_block: u64,
+    size_field: u32,
+};
+
+const BuildNode = struct {
+    kind: SourceKind,
+    name: []const u8,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    mtime: u32,
+    file_size: u64,
+    symlink_target: []const u8,
+    source_index: ?usize,
+    children: std.array_list.Managed(usize),
+
+    inode_number: u32 = 0,
+    parent_inode: u32 = 0,
+    inode_ref: u64 = 0,
+    entry_type: u16 = 0,
+
+    data_start: u64 = 0,
+    block_sizes: []u32 = &.{},
+    fragment_index: u32 = invalid_fragment,
+    fragment_offset: u32 = 0,
+
+    dir_start_block: u32 = 0,
+    dir_offset: u16 = 0,
+    dir_size: u32 = 0,
+};
+
+const CompressedBlock = struct {
+    bytes: []u8,
+    uncompressed: bool,
+};
+
+fn compressBlock(allocator: std.mem.Allocator, compress: bool, payload: []const u8) !CompressedBlock {
+    if (!compress or payload.len == 0) {
+        return .{ .bytes = try allocator.dupe(u8, payload), .uncompressed = true };
+    }
+    var out = try std.Io.Writer.Allocating.initCapacity(allocator, @max(@as(usize, 64), payload.len / 2));
+    defer out.deinit();
+    zstd.writeFrameForSlice(&out.writer, payload, null) catch {
+        return .{ .bytes = try allocator.dupe(u8, payload), .uncompressed = true };
+    };
+    const compressed = out.written();
+    if (compressed.len < payload.len) {
+        return .{ .bytes = try allocator.dupe(u8, compressed), .uncompressed = false };
+    }
+    return .{ .bytes = try allocator.dupe(u8, payload), .uncompressed = true };
+}
+
+/// Streams uncompressed metadata into a sequence of 8 KiB SquashFS metadata
+/// blocks. `currentRef` yields the (block, offset) reference of the next byte
+/// to be written, matching the inode/directory reference encoding the reader
+/// resolves.
+const MetaWriter = struct {
+    allocator: std.mem.Allocator,
+    compress: bool,
+    out: std.array_list.Managed(u8),
+    block: std.array_list.Managed(u8),
+    block_starts: std.array_list.Managed(u64),
+
+    fn init(allocator: std.mem.Allocator, compress: bool) MetaWriter {
+        return .{
+            .allocator = allocator,
+            .compress = compress,
+            .out = std.array_list.Managed(u8).init(allocator),
+            .block = std.array_list.Managed(u8).init(allocator),
+            .block_starts = std.array_list.Managed(u64).init(allocator),
+        };
+    }
+
+    fn deinit(self: *MetaWriter) void {
+        self.out.deinit();
+        self.block.deinit();
+        self.block_starts.deinit();
+    }
+
+    const Ref = struct { block: u32, offset: u16 };
+
+    fn currentRef(self: *const MetaWriter) Ref {
+        return .{ .block = @intCast(self.out.items.len), .offset = @intCast(self.block.items.len) };
+    }
+
+    fn write(self: *MetaWriter, bytes: []const u8) !void {
+        try self.block.appendSlice(bytes);
+        while (self.block.items.len >= metadata_block_size) {
+            try self.emitBlock(self.block.items[0..metadata_block_size]);
+            const remainder = self.block.items.len - metadata_block_size;
+            std.mem.copyForwards(u8, self.block.items[0..remainder], self.block.items[metadata_block_size..]);
+            self.block.shrinkRetainingCapacity(remainder);
+        }
+    }
+
+    fn finish(self: *MetaWriter) !void {
+        if (self.block.items.len > 0) {
+            try self.emitBlock(self.block.items);
+            self.block.clearRetainingCapacity();
+        }
+    }
+
+    fn emitBlock(self: *MetaWriter, payload: []const u8) !void {
+        try self.block_starts.append(self.out.items.len);
+        const stored = try compressBlock(self.allocator, self.compress, payload);
+        defer self.allocator.free(stored.bytes);
+        const header: u16 = if (stored.uncompressed)
+            @as(u16, @intCast(stored.bytes.len)) | metadata_uncompressed_bit
+        else
+            @intCast(stored.bytes.len);
+        try appendU16Le(&self.out, header);
+        try self.out.appendSlice(stored.bytes);
+    }
+};
+
+const Writer = struct {
+    allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: Io,
+    file: Io.File,
+    options: WriteOptions,
+    compress: bool,
+    cursor: u64 = 0,
+
+    nodes: []BuildNode = &.{},
+    root_ref: u64 = 0,
+
+    inode_table: MetaWriter,
+    directory_table: MetaWriter,
+    fragments: std.array_list.Managed(FragmentRecord),
+    ids: std.array_list.Managed(u32),
+    fragment_buffer: std.array_list.Managed(u8),
+    read_buffer: []u8 = &.{},
+
+    fn deinit(self: *Writer) void {
+        self.inode_table.deinit();
+        self.directory_table.deinit();
+        self.fragments.deinit();
+        self.ids.deinit();
+        self.fragment_buffer.deinit();
+        if (self.read_buffer.len != 0) self.allocator.free(self.read_buffer);
+    }
+
+    fn run(self: *Writer, source: TreeSource) anyerror!WriteResult {
+        try self.buildTree(source);
+
+        var counter: u32 = 0;
+        assignInodeNumbers(self.nodes, 0, &counter);
+        self.nodes[0].parent_inode = @intCast(self.nodes.len + 1);
+
+        self.read_buffer = try self.allocator.alloc(u8, self.options.block_size);
+        self.cursor = superblock_size;
+
+        // Data pass: stream every regular file, packing tails into fragments.
+        for (self.nodes) |*node| {
+            if (node.kind == .file) try self.writeFileData(source, node);
+        }
+        try self.flushFragment();
+
+        // Inode + directory tables, post-order so children precede parents.
+        try self.writeSubtree(0);
+        self.root_ref = self.nodes[0].inode_ref;
+        try self.inode_table.finish();
+        try self.directory_table.finish();
+        // Guarantee a resolvable directory block for empty directories.
+        if (self.directory_table.out.items.len == 0) try self.directory_table.write(&.{0});
+        try self.directory_table.finish();
+
+        const inode_table_start = self.cursor;
+        try self.writeRaw(self.inode_table.out.items);
+        const directory_table_start = self.cursor;
+        try self.writeRaw(self.directory_table.out.items);
+
+        const fragment_table_start = if (self.fragments.items.len > 0)
+            try self.writeFragmentTable()
+        else
+            invalid_table;
+
+        const id_table_start = try self.writeIdTable();
+
+        const bytes_used = self.cursor;
+        try self.writeSuperblock(.{
+            .inode_table_start = inode_table_start,
+            .directory_table_start = directory_table_start,
+            .fragment_table_start = fragment_table_start,
+            .id_table_start = id_table_start,
+            .bytes_used = bytes_used,
+        });
+
+        return .{
+            .bytes_written = bytes_used,
+            .inode_count = @intCast(self.nodes.len),
+            .fragment_count = @intCast(self.fragments.items.len),
+        };
+    }
+
+    fn buildTree(self: *Writer, source: TreeSource) anyerror!void {
+        const total = source.count();
+        const Collected = struct { index: usize, node: SourceNode };
+        var collected = try std.array_list.Managed(Collected).initCapacity(self.arena, total);
+        var i: usize = 0;
+        while (i < total) : (i += 1) {
+            collected.appendAssumeCapacity(.{ .index = i, .node = try source.node(i) });
+        }
+        std.mem.sort(Collected, collected.items, {}, struct {
+            fn less(_: void, a: Collected, b: Collected) bool {
+                return std.mem.lessThan(u8, a.node.path, b.node.path);
+            }
+        }.less);
+
+        var nodes = std.array_list.Managed(BuildNode).init(self.arena);
+        var map = std.StringHashMap(usize).init(self.arena);
+
+        const root = source.root();
+        try nodes.append(.{
+            .kind = .directory,
+            .name = "",
+            .mode = root.mode,
+            .uid = root.uid,
+            .gid = root.gid,
+            .mtime = root.mtime,
+            .file_size = 0,
+            .symlink_target = &.{},
+            .source_index = null,
+            .children = std.array_list.Managed(usize).init(self.arena),
+        });
+        try map.put("", 0);
+
+        for (collected.items) |item| {
+            const sn = item.node;
+            var path = sn.path;
+            while (path.len > 0 and path[0] == '/') path = path[1..];
+            if (path.len == 0) return error.InvalidPath;
+
+            const parent_path, const name = splitLast(path);
+            if (name.len == 0 or name.len > 256) return error.NameTooLong;
+            const parent_index = map.get(parent_path) orelse return error.MissingParentDirectory;
+            if (map.contains(path)) return error.DuplicatePath;
+
+            // Symlink targets may be handed over as a borrowed slice or, when a
+            // source only exposes them through its content channel (RootTree
+            // spools them), pulled via `read`. Either way we copy into the
+            // arena so the bytes stay valid until the inode is emitted.
+            const symlink_target: []const u8 = if (sn.kind == .symlink) blk: {
+                const target = if (sn.symlink_target.len > 0)
+                    try self.arena.dupe(u8, sn.symlink_target)
+                else target_blk: {
+                    const buffer = try self.arena.alloc(u8, @intCast(sn.size));
+                    try self.readExact(source, item.index, buffer, 0);
+                    break :target_blk buffer;
+                };
+                if (target.len > std.math.maxInt(u16)) return error.SymlinkTargetTooLong;
+                break :blk target;
+            } else &.{};
+
+            const new_index = nodes.items.len;
+            try nodes.append(.{
+                .kind = sn.kind,
+                .name = name,
+                .mode = sn.mode,
+                .uid = sn.uid,
+                .gid = sn.gid,
+                .mtime = sn.mtime,
+                .file_size = if (sn.kind == .file) sn.size else 0,
+                .symlink_target = symlink_target,
+                .source_index = item.index,
+                .children = std.array_list.Managed(usize).init(self.arena),
+            });
+            try map.put(path, new_index);
+            try nodes.items[parent_index].children.append(new_index);
+        }
+
+        self.nodes = nodes.items;
+        for (self.nodes) |*node| {
+            std.mem.sort(usize, node.children.items, self.nodes, childNameLess);
+        }
+    }
+
+    fn writeFileData(self: *Writer, source: TreeSource, node: *BuildNode) anyerror!void {
+        const source_index = node.source_index.?;
+        const block_size: u64 = self.options.block_size;
+        const size = node.file_size;
+        const full_blocks: usize = @intCast(size / block_size);
+        const remainder: usize = @intCast(size % block_size);
+        const tail_as_fragment = self.options.use_fragments and remainder > 0;
+        const block_count = full_blocks + (if (remainder > 0 and !tail_as_fragment) @as(usize, 1) else 0);
+
+        node.data_start = self.cursor;
+        node.block_sizes = try self.arena.alloc(u32, block_count);
+
+        var offset: u64 = 0;
+        var block_index: usize = 0;
+        while (block_index < full_blocks) : (block_index += 1) {
+            try self.readExact(source, source_index, self.read_buffer[0..self.options.block_size], offset);
+            node.block_sizes[block_index] = try self.storeDataBlock(self.read_buffer[0..self.options.block_size]);
+            offset += block_size;
+        }
+
+        if (remainder > 0) {
+            try self.readExact(source, source_index, self.read_buffer[0..remainder], offset);
+            if (tail_as_fragment) {
+                const placement = try self.addFragment(self.read_buffer[0..remainder]);
+                node.fragment_index = placement.index;
+                node.fragment_offset = placement.offset;
+            } else {
+                node.block_sizes[full_blocks] = try self.storeDataBlock(self.read_buffer[0..remainder]);
+                node.fragment_index = invalid_fragment;
+            }
+        } else {
+            node.fragment_index = invalid_fragment;
+        }
+    }
+
+    fn readExact(self: *Writer, source: TreeSource, index: usize, buffer: []u8, offset: u64) anyerror!void {
+        _ = self;
+        var done: usize = 0;
+        while (done < buffer.len) {
+            const got = try source.read(index, buffer[done..], offset + done);
+            if (got == 0) return error.ContentReadShort;
+            done += got;
+        }
+    }
+
+    fn storeDataBlock(self: *Writer, payload: []const u8) anyerror!u32 {
+        const stored = try compressBlock(self.allocator, self.compress, payload);
+        defer self.allocator.free(stored.bytes);
+        try self.writeRaw(stored.bytes);
+        const raw: u32 = @intCast(stored.bytes.len);
+        return if (stored.uncompressed) raw | data_uncompressed_bit else raw;
+    }
+
+    const FragmentPlacement = struct { index: u32, offset: u32 };
+
+    fn addFragment(self: *Writer, tail: []const u8) anyerror!FragmentPlacement {
+        if (self.fragment_buffer.items.len + tail.len > self.options.block_size) {
+            try self.flushFragment();
+        }
+        const placement = FragmentPlacement{
+            .index = @intCast(self.fragments.items.len),
+            .offset = @intCast(self.fragment_buffer.items.len),
+        };
+        try self.fragment_buffer.appendSlice(tail);
+        return placement;
+    }
+
+    fn flushFragment(self: *Writer) anyerror!void {
+        if (self.fragment_buffer.items.len == 0) return;
+        const start = self.cursor;
+        const size_field = try self.storeDataBlock(self.fragment_buffer.items);
+        try self.fragments.append(.{ .start_block = start, .size_field = size_field });
+        self.fragment_buffer.clearRetainingCapacity();
+    }
+
+    fn writeSubtree(self: *Writer, node_index: usize) anyerror!void {
+        // Children first: leaf inodes and subdirectory inodes must exist before
+        // this directory's listing can reference them.
+        for (self.nodes[node_index].children.items) |child_index| {
+            switch (self.nodes[child_index].kind) {
+                .directory => try self.writeSubtree(child_index),
+                .file, .symlink => try self.writeLeafInode(child_index),
+            }
+        }
+        try self.writeDirectory(node_index);
+    }
+
+    fn writeLeafInode(self: *Writer, node_index: usize) anyerror!void {
+        switch (self.nodes[node_index].kind) {
+            .file => try self.writeFileInode(node_index),
+            .symlink => try self.writeSymlinkInode(node_index),
+            .directory => unreachable,
+        }
+    }
+
+    fn writeFileInode(self: *Writer, node_index: usize) anyerror!void {
+        const node = &self.nodes[node_index];
+        const uid_index = try self.idIndex(node.uid);
+        const gid_index = try self.idIndex(node.gid);
+        const mode = fullMode(node.kind, node.mode);
+        const extended = node.file_size > std.math.maxInt(u32) or node.data_start > std.math.maxInt(u32);
+
+        var buf = std.array_list.Managed(u8).init(self.arena);
+        defer buf.deinit();
+        if (extended) {
+            try appendU16Le(&buf, @intFromEnum(InodeType.ext_file));
+            try appendU16Le(&buf, mode);
+            try appendU16Le(&buf, uid_index);
+            try appendU16Le(&buf, gid_index);
+            try appendU32Le(&buf, node.mtime);
+            try appendU32Le(&buf, node.inode_number);
+            try appendU64Le(&buf, node.data_start);
+            try appendU64Le(&buf, node.file_size);
+            try appendU64Le(&buf, 0); // sparse
+            try appendU32Le(&buf, 1); // nlink
+            try appendU32Le(&buf, node.fragment_index);
+            try appendU32Le(&buf, node.fragment_offset);
+            try appendU32Le(&buf, no_xattr);
+            node.entry_type = @intFromEnum(InodeType.ext_file);
+        } else {
+            try appendU16Le(&buf, @intFromEnum(InodeType.basic_file));
+            try appendU16Le(&buf, mode);
+            try appendU16Le(&buf, uid_index);
+            try appendU16Le(&buf, gid_index);
+            try appendU32Le(&buf, node.mtime);
+            try appendU32Le(&buf, node.inode_number);
+            try appendU32Le(&buf, @intCast(node.data_start));
+            try appendU32Le(&buf, node.fragment_index);
+            try appendU32Le(&buf, node.fragment_offset);
+            try appendU32Le(&buf, @intCast(node.file_size));
+            node.entry_type = @intFromEnum(InodeType.basic_file);
+        }
+        for (node.block_sizes) |size_field| try appendU32Le(&buf, size_field);
+
+        node.inode_ref = self.inodeRefForNext();
+        try self.inode_table.write(buf.items);
+    }
+
+    fn writeSymlinkInode(self: *Writer, node_index: usize) anyerror!void {
+        const node = &self.nodes[node_index];
+        const uid_index = try self.idIndex(node.uid);
+        const gid_index = try self.idIndex(node.gid);
+        const mode = fullMode(node.kind, node.mode);
+
+        var buf = std.array_list.Managed(u8).init(self.arena);
+        defer buf.deinit();
+        try appendU16Le(&buf, @intFromEnum(InodeType.basic_symlink));
+        try appendU16Le(&buf, mode);
+        try appendU16Le(&buf, uid_index);
+        try appendU16Le(&buf, gid_index);
+        try appendU32Le(&buf, node.mtime);
+        try appendU32Le(&buf, node.inode_number);
+        try appendU32Le(&buf, 1); // nlink
+        try appendU32Le(&buf, @intCast(node.symlink_target.len));
+        try buf.appendSlice(node.symlink_target);
+        node.entry_type = @intFromEnum(InodeType.basic_symlink);
+
+        node.inode_ref = self.inodeRefForNext();
+        try self.inode_table.write(buf.items);
+    }
+
+    fn writeDirectory(self: *Writer, node_index: usize) anyerror!void {
+        try self.writeDirectoryListing(node_index);
+
+        const node = &self.nodes[node_index];
+        const uid_index = try self.idIndex(node.uid);
+        const gid_index = try self.idIndex(node.gid);
+        const mode = fullMode(node.kind, node.mode);
+        var subdirs: u32 = 0;
+        for (node.children.items) |child_index| {
+            if (self.nodes[child_index].kind == .directory) subdirs += 1;
+        }
+        const nlink = subdirs + 2;
+        const raw_size = node.dir_size + 3;
+        const extended = raw_size > std.math.maxInt(u16);
+
+        var buf = std.array_list.Managed(u8).init(self.arena);
+        defer buf.deinit();
+        if (extended) {
+            try appendU16Le(&buf, @intFromEnum(InodeType.ext_dir));
+            try appendU16Le(&buf, mode);
+            try appendU16Le(&buf, uid_index);
+            try appendU16Le(&buf, gid_index);
+            try appendU32Le(&buf, node.mtime);
+            try appendU32Le(&buf, node.inode_number);
+            try appendU32Le(&buf, nlink);
+            try appendU32Le(&buf, raw_size);
+            try appendU32Le(&buf, node.dir_start_block);
+            try appendU32Le(&buf, node.parent_inode);
+            try appendU16Le(&buf, 0); // index count
+            try appendU16Le(&buf, node.dir_offset);
+            try appendU32Le(&buf, no_xattr);
+            node.entry_type = @intFromEnum(InodeType.ext_dir);
+        } else {
+            try appendU16Le(&buf, @intFromEnum(InodeType.basic_dir));
+            try appendU16Le(&buf, mode);
+            try appendU16Le(&buf, uid_index);
+            try appendU16Le(&buf, gid_index);
+            try appendU32Le(&buf, node.mtime);
+            try appendU32Le(&buf, node.inode_number);
+            try appendU32Le(&buf, node.dir_start_block);
+            try appendU32Le(&buf, nlink);
+            try appendU16Le(&buf, @intCast(raw_size));
+            try appendU16Le(&buf, node.dir_offset);
+            try appendU32Le(&buf, node.parent_inode);
+            node.entry_type = @intFromEnum(InodeType.basic_dir);
+        }
+
+        node.inode_ref = self.inodeRefForNext();
+        try self.inode_table.write(buf.items);
+    }
+
+    fn writeDirectoryListing(self: *Writer, node_index: usize) anyerror!void {
+        const children = self.nodes[node_index].children.items;
+        if (children.len == 0) {
+            self.nodes[node_index].dir_start_block = 0;
+            self.nodes[node_index].dir_offset = 0;
+            self.nodes[node_index].dir_size = 0;
+            return;
+        }
+
+        var listing = std.array_list.Managed(u8).init(self.arena);
+        defer listing.deinit();
+
+        var i: usize = 0;
+        while (i < children.len) {
+            const first = self.nodes[children[i]];
+            const group_block: u32 = @intCast(first.inode_ref >> 16);
+            const base_inode = first.inode_number;
+
+            var j = i;
+            var count: usize = 0;
+            while (j < children.len and count < 256) {
+                const child = self.nodes[children[j]];
+                if (@as(u32, @intCast(child.inode_ref >> 16)) != group_block) break;
+                const delta = @as(i64, child.inode_number) - @as(i64, base_inode);
+                if (delta < std.math.minInt(i16) or delta > std.math.maxInt(i16)) break;
+                j += 1;
+                count += 1;
+            }
+
+            try appendU32Le(&listing, @intCast(count - 1));
+            try appendU32Le(&listing, group_block);
+            try appendU32Le(&listing, base_inode);
+            var k = i;
+            while (k < j) : (k += 1) {
+                const child = self.nodes[children[k]];
+                const inode_offset: u16 = @intCast(child.inode_ref & 0xFFFF);
+                const delta: i16 = @intCast(@as(i64, child.inode_number) - @as(i64, base_inode));
+                try appendU16Le(&listing, inode_offset);
+                try appendI16Le(&listing, delta);
+                try appendU16Le(&listing, child.entry_type);
+                try appendU16Le(&listing, @intCast(child.name.len - 1));
+                try listing.appendSlice(child.name);
+            }
+            i = j;
+        }
+
+        const ref = self.directory_table.currentRef();
+        self.nodes[node_index].dir_start_block = ref.block;
+        self.nodes[node_index].dir_offset = ref.offset;
+        self.nodes[node_index].dir_size = @intCast(listing.items.len);
+        try self.directory_table.write(listing.items);
+    }
+
+    fn inodeRefForNext(self: *const Writer) u64 {
+        const ref = self.inode_table.currentRef();
+        return (@as(u64, ref.block) << 16) | ref.offset;
+    }
+
+    fn idIndex(self: *Writer, value: u32) !u16 {
+        for (self.ids.items, 0..) |existing, index| {
+            if (existing == value) return @intCast(index);
+        }
+        if (self.ids.items.len > std.math.maxInt(u16)) return error.TooManyIds;
+        try self.ids.append(value);
+        return @intCast(self.ids.items.len - 1);
+    }
+
+    fn writeFragmentTable(self: *Writer) anyerror!u64 {
+        var payload = std.array_list.Managed(u8).init(self.arena);
+        defer payload.deinit();
+        for (self.fragments.items) |fragment| {
+            try appendU64Le(&payload, fragment.start_block);
+            try appendU32Le(&payload, fragment.size_field);
+            try appendU32Le(&payload, 0); // unused
+        }
+        return self.writeIndexedMetaTable(payload.items);
+    }
+
+    fn writeIdTable(self: *Writer) anyerror!u64 {
+        var payload = std.array_list.Managed(u8).init(self.arena);
+        defer payload.deinit();
+        for (self.ids.items) |id| try appendU32Le(&payload, id);
+        return self.writeIndexedMetaTable(payload.items);
+    }
+
+    fn writeIndexedMetaTable(self: *Writer, payload: []const u8) anyerror!u64 {
+        var meta = MetaWriter.init(self.allocator, self.compress);
+        defer meta.deinit();
+        try meta.write(payload);
+        try meta.finish();
+
+        const meta_image_start = self.cursor;
+        try self.writeRaw(meta.out.items);
+
+        const index_table_start = self.cursor;
+        for (meta.block_starts.items) |relative| {
+            var buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &buf, meta_image_start + relative, .little);
+            try self.writeRaw(&buf);
+        }
+        return index_table_start;
+    }
+
+    fn writeRaw(self: *Writer, bytes: []const u8) anyerror!void {
+        if (bytes.len == 0) return;
+        try self.file.writePositionalAll(self.io, bytes, self.cursor);
+        self.cursor += bytes.len;
+    }
+
+    const SuperblockLayout = struct {
+        inode_table_start: u64,
+        directory_table_start: u64,
+        fragment_table_start: u64,
+        id_table_start: u64,
+        bytes_used: u64,
+    };
+
+    fn writeSuperblock(self: *Writer, layout: SuperblockLayout) anyerror!void {
+        const block_log: u16 = @intCast(std.math.log2_int(u32, self.options.block_size));
+        const compression_id: u16 = switch (self.options.compression) {
+            .none => @intFromEnum(Compression.gzip),
+            .zstd => @intFromEnum(Compression.zstd),
+        };
+        var flags: u16 = no_xattrs_flag;
+        if (self.options.compression == .none) {
+            flags |= uncompressed_inodes_flag | uncompressed_data_flag |
+                uncompressed_fragments_flag | uncompressed_ids_flag;
+        }
+        if (self.fragments.items.len == 0) flags |= no_fragments_flag;
+
+        var sb: [superblock_size]u8 = undefined;
+        @memset(&sb, 0);
+        std.mem.writeInt(u32, sb[0..4], magic, .little);
+        std.mem.writeInt(u32, sb[4..8], @intCast(self.nodes.len), .little);
+        std.mem.writeInt(u32, sb[8..12], self.options.mtime, .little);
+        std.mem.writeInt(u32, sb[12..16], self.options.block_size, .little);
+        std.mem.writeInt(u32, sb[16..20], @intCast(self.fragments.items.len), .little);
+        std.mem.writeInt(u16, sb[20..22], compression_id, .little);
+        std.mem.writeInt(u16, sb[22..24], block_log, .little);
+        std.mem.writeInt(u16, sb[24..26], flags, .little);
+        std.mem.writeInt(u16, sb[26..28], @intCast(self.ids.items.len), .little);
+        std.mem.writeInt(u16, sb[28..30], major_version, .little);
+        std.mem.writeInt(u16, sb[30..32], 0, .little);
+        std.mem.writeInt(u64, sb[32..40], self.root_ref, .little);
+        std.mem.writeInt(u64, sb[40..48], layout.bytes_used, .little);
+        std.mem.writeInt(u64, sb[48..56], layout.id_table_start, .little);
+        std.mem.writeInt(u64, sb[56..64], invalid_table, .little);
+        std.mem.writeInt(u64, sb[64..72], layout.inode_table_start, .little);
+        std.mem.writeInt(u64, sb[72..80], layout.directory_table_start, .little);
+        std.mem.writeInt(u64, sb[80..88], layout.fragment_table_start, .little);
+        std.mem.writeInt(u64, sb[88..96], invalid_table, .little);
+        try self.file.writePositionalAll(self.io, &sb, 0);
+    }
+};
+
+const superblock_size: usize = 96;
+const no_xattr: u32 = 0xFFFF_FFFF;
+const uncompressed_inodes_flag: u16 = 0x0001;
+const uncompressed_data_flag: u16 = 0x0002;
+const uncompressed_fragments_flag: u16 = 0x0008;
+const no_fragments_flag: u16 = 0x0010;
+const no_xattrs_flag: u16 = 0x0200;
+const uncompressed_ids_flag: u16 = 0x0800;
+
+const InodeType = enum(u16) {
+    basic_dir = 1,
+    basic_file = 2,
+    basic_symlink = 3,
+    ext_dir = 8,
+    ext_file = 9,
+    ext_symlink = 10,
+};
+
+fn fullMode(kind: SourceKind, mode: u16) u16 {
+    const type_bits: u16 = switch (kind) {
+        .directory => 0o040000,
+        .file => 0o100000,
+        .symlink => 0o120000,
+    };
+    return (mode & 0o7777) | type_bits;
+}
+
+fn splitLast(path: []const u8) struct { []const u8, []const u8 } {
+    const separator = std.mem.lastIndexOfScalar(u8, path, '/') orelse return .{ "", path };
+    return .{ path[0..separator], path[separator + 1 ..] };
+}
+
+fn childNameLess(nodes: []BuildNode, a: usize, b: usize) bool {
+    return std.mem.lessThan(u8, nodes[a].name, nodes[b].name);
+}
+
+fn assignInodeNumbers(nodes: []BuildNode, index: usize, counter: *u32) void {
+    counter.* += 1;
+    nodes[index].inode_number = counter.*;
+    for (nodes[index].children.items) |child_index| {
+        nodes[child_index].parent_inode = nodes[index].inode_number;
+        assignInodeNumbers(nodes, child_index, counter);
+    }
+}
+
+fn appendI16Le(list: *std.array_list.Managed(u8), value: i16) !void {
+    var buf: [2]u8 = undefined;
+    std.mem.writeInt(i16, &buf, value, .little);
+    try list.appendSlice(&buf);
+}
+
 fn appendU16Le(list: *std.array_list.Managed(u8), value: u16) !void {
     var buf: [2]u8 = undefined;
     std.mem.writeInt(u16, &buf, value, .little);
@@ -1290,7 +2149,6 @@ fn compressSyntheticXz(allocator: std.mem.Allocator, payload: []const u8) ![]u8 
 }
 
 fn compressSyntheticZstd(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
-    const zstd = @import("zstd.zig");
     var out = try std.Io.Writer.Allocating.initCapacity(allocator, @max(@as(usize, 64), payload.len));
     errdefer out.deinit();
     try zstd.writeRawFrameForSlice(&out.writer, payload, null);
@@ -1671,4 +2529,260 @@ test "xz decompressor supports x86 BCJ + LZMA2 filter chains" {
     const decoded = try decompressXzAlloc(std.testing.allocator, &encoded, expected.len);
     defer std.testing.allocator.free(decoded);
     try std.testing.expectEqualSlices(u8, &expected, decoded);
+}
+
+// ===========================================================================
+// Writer tests
+// ===========================================================================
+
+const TestNode = struct {
+    path: []const u8,
+    kind: SourceKind,
+    mode: u16,
+    uid: u32 = 0,
+    gid: u32 = 0,
+    mtime: u32 = 0,
+    content: []const u8 = &.{},
+    target: []const u8 = &.{},
+};
+
+const TestSource = struct {
+    root_meta: SourceRoot = .{},
+    nodes: []const TestNode,
+
+    fn cast(context: *const anyopaque) *const TestSource {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn source(self: *const TestSource) TreeSource {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    const vtable = TreeSource.VTable{
+        .root = rootFn,
+        .count = countFn,
+        .node = nodeFn,
+        .read = readFn,
+    };
+
+    fn rootFn(context: *const anyopaque) SourceRoot {
+        return cast(context).root_meta;
+    }
+    fn countFn(context: *const anyopaque) usize {
+        return cast(context).nodes.len;
+    }
+    fn nodeFn(context: *const anyopaque, index: usize) anyerror!SourceNode {
+        const node = cast(context).nodes[index];
+        return .{
+            .path = node.path,
+            .kind = node.kind,
+            .mode = node.mode,
+            .uid = node.uid,
+            .gid = node.gid,
+            .mtime = node.mtime,
+            .size = node.content.len,
+            .symlink_target = node.target,
+        };
+    }
+    fn readFn(context: *const anyopaque, index: usize, buffer: []u8, offset: u64) anyerror!usize {
+        const node = cast(context).nodes[index];
+        if (offset >= node.content.len) return 0;
+        const want: usize = @intCast(@min(@as(u64, buffer.len), node.content.len - offset));
+        @memcpy(buffer[0..want], node.content[@intCast(offset)..][0..want]);
+        return want;
+    }
+};
+
+fn buildTestImageAlloc(
+    allocator: std.mem.Allocator,
+    source: TreeSource,
+    options: WriteOptions,
+    path: []const u8,
+) ![]u8 {
+    const io = std.testing.io;
+    _ = try writeImagePath(allocator, io, path, source, options);
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    const stat = try file.stat(io);
+    const bytes = try allocator.alloc(u8, @intCast(stat.size));
+    errdefer allocator.free(bytes);
+    _ = try file.readPositionalAll(io, bytes, 0);
+    return bytes;
+}
+
+test "squashfs writer round-trips nested directories, metadata, and a symlink" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "test-squashfs-writer-basic.sqsh";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const nodes = [_]TestNode{
+        .{ .path = "bin", .kind = .directory, .mode = 0o755 },
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "etc/os-release", .kind = .file, .mode = 0o644, .uid = 1000, .gid = 1001, .content = "NAME=zvmi\n" },
+        .{ .path = "etc/nested", .kind = .directory, .mode = 0o700 },
+        .{ .path = "etc/nested/hello.txt", .kind = .file, .mode = 0o600, .content = "hello world" },
+        .{ .path = "bin/sh", .kind = .symlink, .mode = 0o777, .target = "busybox" },
+    };
+    var test_source = TestSource{ .nodes = &nodes };
+
+    const result = try writeImagePath(allocator, io, path, test_source.source(), .{ .compression = .zstd });
+    try std.testing.expectEqual(@as(u32, nodes.len + 1), result.inode_count);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+
+    const etc = try reader.lookup("/etc");
+    try std.testing.expectEqual(EntryKind.directory, reader.getEntry(etc).kind);
+
+    const os_release = try reader.lookup("/etc/os-release");
+    const os_entry = reader.getEntry(os_release);
+    try std.testing.expectEqual(@as(u32, 0o644), os_entry.mode & 0o7777);
+    try std.testing.expectEqual(@as(u32, 1000), os_entry.uid);
+    try std.testing.expectEqual(@as(u32, 1001), os_entry.gid);
+    const os_bytes = try reader.readFileAlloc(allocator, io, os_release);
+    defer allocator.free(os_bytes);
+    try std.testing.expectEqualStrings("NAME=zvmi\n", os_bytes);
+
+    const hello = try reader.lookup("/etc/nested/hello.txt");
+    const hello_bytes = try reader.readFileAlloc(allocator, io, hello);
+    defer allocator.free(hello_bytes);
+    try std.testing.expectEqualStrings("hello world", hello_bytes);
+
+    const sh = try reader.lookup("/bin/sh");
+    try std.testing.expectEqual(EntryKind.symlink, reader.getEntry(sh).kind);
+    try std.testing.expectEqualStrings("busybox", try reader.readLink(sh));
+
+    const nested = reader.getEntry(try reader.lookup("/etc/nested"));
+    try std.testing.expectEqual(@as(u32, 0o700), nested.mode & 0o7777);
+}
+
+fn multiBlockContentAlloc(allocator: std.mem.Allocator, len: usize) ![]u8 {
+    const bytes = try allocator.alloc(u8, len);
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    for (bytes) |*byte| byte.* = random.int(u8);
+    return bytes;
+}
+
+test "squashfs writer streams a multi-block file across fragment and no-fragment modes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // 4 KiB blocks with a 300 KiB body -> many full blocks plus a tail.
+    const content = try multiBlockContentAlloc(allocator, 300 * 1024 + 123);
+    defer allocator.free(content);
+
+    inline for (.{ true, false }) |use_fragments| {
+        const path = if (use_fragments) "test-squashfs-writer-frag.sqsh" else "test-squashfs-writer-nofrag.sqsh";
+        defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+        const nodes = [_]TestNode{
+            .{ .path = "big.bin", .kind = .file, .mode = 0o644, .content = content },
+        };
+        var test_source = TestSource{ .nodes = &nodes };
+        const result = try writeImagePath(allocator, io, path, test_source.source(), .{
+            .compression = .zstd,
+            .block_size = 4096,
+            .use_fragments = use_fragments,
+        });
+        try std.testing.expectEqual(use_fragments, result.fragment_count > 0);
+
+        var reader = try Reader.openPath(allocator, io, path);
+        defer reader.close(io);
+
+        const index = try reader.lookup("/big.bin");
+        try std.testing.expectEqual(@as(u64, content.len), reader.getEntry(index).size);
+
+        // Read back in small chunks to exercise the streaming read path.
+        const actual = try allocator.alloc(u8, content.len);
+        defer allocator.free(actual);
+        var offset: u64 = 0;
+        while (offset < content.len) {
+            const got = try reader.readFileAt(allocator, io, index, actual[@intCast(offset)..], offset);
+            try std.testing.expect(got > 0);
+            offset += got;
+        }
+        try std.testing.expectEqualSlices(u8, content, actual);
+    }
+}
+
+test "squashfs writer supports the uncompressed option" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "test-squashfs-writer-none.sqsh";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const nodes = [_]TestNode{
+        .{ .path = "a", .kind = .directory, .mode = 0o755 },
+        .{ .path = "a/data", .kind = .file, .mode = 0o644, .content = "uncompressed payload bytes" },
+    };
+    var test_source = TestSource{ .nodes = &nodes };
+    _ = try writeImagePath(allocator, io, path, test_source.source(), .{ .compression = .none, .block_size = 4096 });
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    const index = try reader.lookup("/a/data");
+    const bytes = try reader.readFileAlloc(allocator, io, index);
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("uncompressed payload bytes", bytes);
+}
+
+test "squashfs writer output is byte-for-byte deterministic" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path_a = "test-squashfs-writer-det-a.sqsh";
+    const path_b = "test-squashfs-writer-det-b.sqsh";
+    defer Io.Dir.cwd().deleteFile(io, path_a) catch {};
+    defer Io.Dir.cwd().deleteFile(io, path_b) catch {};
+
+    const body = try multiBlockContentAlloc(allocator, 200 * 1024 + 7);
+    defer allocator.free(body);
+    const nodes = [_]TestNode{
+        .{ .path = "etc", .kind = .directory, .mode = 0o755 },
+        .{ .path = "etc/conf", .kind = .file, .mode = 0o644, .content = "config" },
+        .{ .path = "rootfs.img", .kind = .file, .mode = 0o644, .content = body },
+        .{ .path = "link", .kind = .symlink, .mode = 0o777, .target = "etc/conf" },
+    };
+    var test_source = TestSource{ .nodes = &nodes };
+
+    const image_a = try buildTestImageAlloc(allocator, test_source.source(), .{}, path_a);
+    defer allocator.free(image_a);
+    const image_b = try buildTestImageAlloc(allocator, test_source.source(), .{}, path_b);
+    defer allocator.free(image_b);
+    try std.testing.expectEqualSlices(u8, image_a, image_b);
+}
+
+test "squashfs writer zstd option actually shrinks compressible data" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path_z = "test-squashfs-writer-zstd.sqsh";
+    const path_n = "test-squashfs-writer-raw.sqsh";
+    defer Io.Dir.cwd().deleteFile(io, path_z) catch {};
+    defer Io.Dir.cwd().deleteFile(io, path_n) catch {};
+
+    const body = try allocator.alloc(u8, 256 * 1024);
+    defer allocator.free(body);
+    @memset(body, 'Z');
+    const nodes = [_]TestNode{
+        .{ .path = "rootfs.img", .kind = .file, .mode = 0o644, .content = body },
+    };
+    var test_source = TestSource{ .nodes = &nodes };
+
+    const zstd_result = try writeImagePath(allocator, io, path_z, test_source.source(), .{ .compression = .zstd });
+    const none_result = try writeImagePath(allocator, io, path_n, test_source.source(), .{ .compression = .none });
+    try std.testing.expect(zstd_result.bytes_written < none_result.bytes_written);
+}
+
+test "squashfs writer rejects a node whose parent directory is missing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "test-squashfs-writer-badparent.sqsh";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const nodes = [_]TestNode{
+        .{ .path = "missing/child", .kind = .file, .mode = 0o644, .content = "x" },
+    };
+    var test_source = TestSource{ .nodes = &nodes };
+    try std.testing.expectError(error.MissingParentDirectory, writeImagePath(allocator, io, path, test_source.source(), .{}));
 }

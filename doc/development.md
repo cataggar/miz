@@ -34,9 +34,10 @@ zvmi/
                               #   create/pwrite/resize)
         iso9660.zig            # ISO9660 **read-only** codec (PVD, Rock
                               #   Ridge, Joliet)
-        squashfs.zig           # squashfs **read-only** codec (superblock,
+        squashfs.zig           # squashfs read/write codec (superblock,
                               #   inode/directory/fragment tables, XZ/zstd
-                              #   compressed blocks)
+                              #   compressed blocks; writer emits zstd or
+                              #   uncompressed images from a pull-based tree)
         oci.zig                # local OCI/docker-save image ingestion
                               #   plus shared OCI transport exports
         oci/                   # references/models, verified content, local
