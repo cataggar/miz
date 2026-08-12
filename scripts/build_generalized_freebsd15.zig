@@ -2090,6 +2090,33 @@ test "every FreeBSD profile seed honors the generalized guest contract" {
             user_data,
             expected_result,
         ) != null);
+
+        // The representative ports package must be removed before the
+        // shipped manifest is recorded, and caches are cleaned only after
+        // that final package state has been captured.
+        const install_index = std.mem.indexOf(
+            u8,
+            user_data,
+            "pkg install -y tree",
+        ) orelse return error.GuestContractViolated;
+        const delete_index = std.mem.indexOf(
+            u8,
+            user_data,
+            "pkg delete -y tree",
+        ) orelse return error.GuestContractViolated;
+        const record_index = std.mem.indexOf(
+            u8,
+            user_data,
+            packages.record_prefix,
+        ) orelse return error.GuestContractViolated;
+        const clean_index = std.mem.indexOf(
+            u8,
+            user_data,
+            "pkg clean -ay",
+        ) orelse return error.GuestContractViolated;
+        try std.testing.expect(install_index < delete_index);
+        try std.testing.expect(delete_index < record_index);
+        try std.testing.expect(record_index < clean_index);
     }
 }
 
