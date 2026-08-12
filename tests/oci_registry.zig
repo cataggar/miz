@@ -618,6 +618,13 @@ const RequestLog = struct {
     auth: AuthKind,
 };
 
+const DeadlineBehavior = union(enum) {
+    stalled_layer_body,
+    slow_responses: Io.Duration,
+};
+
+const deadline_fixture_timeout: Io.Duration = .fromMilliseconds(500);
+
 const Fixture = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -643,6 +650,10 @@ const Fixture = struct {
     config_blob_requests: usize = 0,
     status_body_size: usize = 0,
     redirect_blob_url: ?[]u8 = null,
+    deadline_behavior: ?DeadlineBehavior = null,
+    deadline_stopping: bool = false,
+    deadline_completed: usize = 0,
+    deadline_stalled: bool = false,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -754,7 +765,21 @@ const Fixture = struct {
         try std.testing.expectEqual(self.expected_requests, self.handled);
     }
 
+    fn finishDeadline(self: *Fixture) !void {
+        @atomicStore(bool, &self.deadline_stopping, true, .release);
+        self.watchdog.interrupt();
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+        self.watchdog.disarm();
+        if (self.watchdog.tripped()) return error.FixtureTimedOut;
+        if (self.err) |err| return err;
+    }
+
     fn deinit(self: *Fixture) void {
+        if (self.deadline_behavior != null)
+            @atomicStore(bool, &self.deadline_stopping, true, .release);
         if (self.thread) |thread| {
             self.watchdog.interrupt();
             thread.join();
@@ -786,11 +811,13 @@ const Fixture = struct {
 
     fn run(self: *Fixture) void {
         self.serve() catch |err| {
+            if (@atomicLoad(bool, &self.deadline_stopping, .acquire)) return;
             self.err = err;
         };
     }
 
     fn serve(self: *Fixture) !void {
+        if (self.deadline_behavior) |behavior| return self.serveDeadline(behavior);
         while (self.handled < self.expected_requests) {
             {
                 var stream = try self.listener.accept(self.io);
@@ -806,6 +833,74 @@ const Fixture = struct {
                 self.handled += 1;
             }
         }
+    }
+
+    fn serveDeadline(self: *Fixture, behavior: DeadlineBehavior) !void {
+        defer {
+            const stream = Io.net.Stream{ .socket = self.listener.socket };
+            stream.shutdown(self.io, .both) catch {};
+        }
+        deadline_loop: while (self.handled < self.expected_requests) {
+            if (@atomicLoad(bool, &self.deadline_stopping, .acquire)) return;
+            {
+                var stream = try self.listener.accept(self.io);
+                defer stream.close(self.io);
+                var input_buffer: [response_head_buffer_size]u8 = undefined;
+                var output_buffer: [response_head_buffer_size]u8 = undefined;
+                var stream_reader = stream.reader(self.io, &input_buffer);
+                var stream_writer = stream.writer(self.io, &output_buffer);
+                var server = std.http.Server.init(&stream_reader.interface, &stream_writer.interface);
+                var request = try server.receiveHead();
+                try self.recordRequest(&request);
+
+                switch (behavior) {
+                    .stalled_layer_body => {
+                        if (try self.isLayerRequest(request.head.target)) {
+                            if (!self.deadline_stalled) {
+                                try self.beginStalledLayerBody(&request);
+                                self.deadline_stalled = true;
+                                try Io.sleep(self.io, deadline_fixture_timeout, .awake);
+                                self.handled += 1;
+                                continue :deadline_loop;
+                            }
+                            try request.respond("", .{ .status = .bad_request });
+                        } else {
+                            try self.respond(&request);
+                        }
+                    },
+                    .slow_responses => |delay| {
+                        try Io.sleep(self.io, delay, .awake);
+                        self.respond(&request) catch {
+                            self.handled += 1;
+                            return;
+                        };
+                    },
+                }
+                self.handled += 1;
+                self.deadline_completed += 1;
+            }
+        }
+    }
+
+    fn isLayerRequest(self: *Fixture, target: []const u8) !bool {
+        const expected = try std.fmt.allocPrint(
+            self.allocator,
+            "/v2/team/image/blobs/{s}",
+            .{self.layer_digest},
+        );
+        defer self.allocator.free(expected);
+        return std.mem.eql(u8, target, expected);
+    }
+
+    fn beginStalledLayerBody(self: *Fixture, request: *std.http.Server.Request) !void {
+        const out = request.server.out;
+        try out.writeAll("HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: ");
+        try out.print("{d}", .{self.layer.len});
+        try out.writeAll("\r\nDocker-Content-Digest: ");
+        try out.writeAll(self.layer_digest);
+        try out.writeAll("\r\n\r\n");
+        try out.writeAll(self.layer[0 .. self.layer.len / 2]);
+        try out.flush();
     }
 
     fn recordRequest(self: *Fixture, request: *const std.http.Server.Request) !void {
@@ -4251,6 +4346,107 @@ fn pinnedReferenceFor(allocator: std.mem.Allocator, fixture: *const Fixture) ![]
         "docker://{s}/team/image@{s}",
         .{ fixture.authority, fixture.manifest_digest },
     );
+}
+
+fn deadlineAfterMilliseconds(io: Io, milliseconds: i64) zvmi.customize.Deadline {
+    return .{ .timeout = (Io.Timeout{ .duration = .{
+        .raw = .fromMilliseconds(milliseconds),
+        .clock = .awake,
+    } }).toDeadline(io) };
+}
+
+fn expectNoPublishedLayout(io: Io, path: []const u8) !void {
+    var published = Io.Dir.cwd().openDir(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (published) |*directory| {
+        directory.close(io);
+        return error.TestUnexpectedResult;
+    }
+
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const base = std.fs.path.basename(path);
+    var directory = try Io.Dir.cwd().openDir(io, parent, .{ .iterate = true });
+    defer directory.close(io);
+    var prefix_buffer: [512]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(
+        &prefix_buffer,
+        ".{s}.zvmi-oci-staging-",
+        .{base},
+    );
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, prefix));
+    }
+}
+
+test "a stalled registry body cannot outlive the absolute pull deadline" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try Fixture.init(allocator, io, .anonymous, 16, null);
+    fixture.deadline_behavior = .stalled_layer_body;
+    defer fixture.deinit();
+    try fixture.start();
+    const destination = "test-oci-registry-deadline-stalled-body";
+    deleteLayout(io, destination);
+    defer deleteLayout(io, destination);
+    const reference = try pinnedReferenceFor(allocator, &fixture);
+    defer allocator.free(reference);
+
+    const started = Io.Clock.Timestamp.now(io, .awake);
+    try std.testing.expectError(
+        error.ExecutionDeadlineExceeded,
+        zvmi.customize.pullRegistryImageWithDeadline(
+            allocator,
+            io,
+            std.process.Environ.empty,
+            .{ .reference = reference, .access = .{ .plain_http = true } },
+            destination,
+            deadlineAfterMilliseconds(io, 200),
+        ),
+    );
+    const elapsed = started.raw.durationTo(Io.Clock.Timestamp.now(io, .awake).raw);
+    try fixture.finishDeadline();
+
+    try std.testing.expect(fixture.deadline_stalled);
+    try std.testing.expect(elapsed.toMilliseconds() < 2000);
+    try expectNoPublishedLayout(io, destination);
+}
+
+test "slow registry requests consume one shared absolute pull deadline" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try Fixture.init(allocator, io, .anonymous, 16, null);
+    fixture.deadline_behavior = .{ .slow_responses = .fromMilliseconds(100) };
+    defer fixture.deinit();
+    try fixture.start();
+    const destination = "test-oci-registry-deadline-cumulative";
+    deleteLayout(io, destination);
+    defer deleteLayout(io, destination);
+    const reference = try pinnedReferenceFor(allocator, &fixture);
+    defer allocator.free(reference);
+
+    const started = Io.Clock.Timestamp.now(io, .awake);
+    try std.testing.expectError(
+        error.ExecutionDeadlineExceeded,
+        zvmi.customize.pullRegistryImageWithDeadline(
+            allocator,
+            io,
+            std.process.Environ.empty,
+            .{ .reference = reference, .access = .{ .plain_http = true } },
+            destination,
+            deadlineAfterMilliseconds(io, 250),
+        ),
+    );
+    const elapsed = started.raw.durationTo(Io.Clock.Timestamp.now(io, .awake).raw);
+    try fixture.finishDeadline();
+
+    // Each response delay is far shorter than the budget, and several
+    // requests completed. Only carrying the original timestamp forward can
+    // make the sequence fail.
+    try std.testing.expect(fixture.deadline_completed >= 2);
+    try std.testing.expect(elapsed.toMilliseconds() < 2000);
 }
 
 test "a declared registry image is pulled into the layout the plan named" {
