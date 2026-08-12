@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import shutil
+from datetime import datetime
 from pathlib import Path
 
 
@@ -265,8 +266,9 @@ RELEASE_SETS = {
         ),
     },
     "core": {
-        "release_tag": "FreeBSD-15.1-core-20260730",
-        "release_title": "FreeBSD 15.1 Core - 20260730",
+        "release_tag_prefix": "FreeBSD-15.1-core-",
+        "release_title_prefix": "FreeBSD 15.1 Core - ",
+        "requires_release_date": True,
         "variants": ("aarch64-ufs-core", "x86_64-ufs-core"),
         "summary": (
             "Generalized FreeBSD 15.1-RELEASE UFS core images built with "
@@ -322,6 +324,7 @@ AZURE_CONTRACTS = (
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+RELEASE_DATE_RE = re.compile(r"^[0-9]{8}$")
 CANDIDATE_SCHEMA = 3
 # Core publication requires at least this reduction in both qemu-img's
 # allocated size and the downloadable compressed file size. Ten percent is a
@@ -409,11 +412,59 @@ def release_set(name: str) -> dict:
     return RELEASE_SETS[name]
 
 
+def require_release_date(value: object) -> str:
+    if not isinstance(value, str) or not RELEASE_DATE_RE.fullmatch(value):
+        raise ValueError("core release date must be an explicit YYYYMMDD value")
+    try:
+        datetime.strptime(value, "%Y%m%d")
+    except ValueError as error:
+        raise ValueError("core release date is not a valid calendar date") from error
+    return value
+
+
+def release_identity(
+    name: str,
+    release_date: str | None = None,
+) -> tuple[str, str]:
+    selected = release_set(name)
+    if selected.get("requires_release_date"):
+        reviewed_date = require_release_date(release_date)
+        return (
+            selected["release_tag_prefix"] + reviewed_date,
+            selected["release_title_prefix"] + reviewed_date,
+        )
+    if release_date not in (None, ""):
+        raise ValueError("release date is only applicable to core releases")
+    return selected["release_tag"], selected["release_title"]
+
+
+def validate_release_tag(name: str, tag: object) -> None:
+    selected = release_set(name)
+    if not isinstance(tag, str):
+        raise ValueError("release tag must be a string")
+    if selected.get("requires_release_date"):
+        prefix = selected["release_tag_prefix"]
+        if not tag.startswith(prefix):
+            raise ValueError(f"{name} release tag does not match release set")
+        expected, _ = release_identity(name, tag.removeprefix(prefix))
+        if tag != expected:
+            raise ValueError(f"{name} release tag does not match release set")
+    elif tag != selected["release_tag"]:
+        raise ValueError(f"{name} release tag does not match release set")
+
+
 def build_variants(name: str) -> tuple[str, ...]:
     selected = release_set(name)
     if name == "core":
         return (*selected["variants"], *RELEASE_SETS["ufs"]["variants"])
     return selected["variants"]
+
+
+def azure_variants(name: str) -> tuple[str, ...]:
+    selected = release_set(name)
+    if name in ("zfs", "core"):
+        return selected["variants"]
+    return ()
 
 
 def azure_contracts(filesystem: str) -> tuple[str, ...]:
@@ -526,10 +577,38 @@ def matrix_command(args: argparse.Namespace) -> None:
     print(json.dumps({"include": include}, sort_keys=True))
 
 
+def azure_matrix_command(args: argparse.Namespace) -> None:
+    include = []
+    for key in azure_variants(args.release_set):
+        variant = VARIANTS[key]
+        if variant["architecture"] == "aarch64":
+            location_variable = "AZURE_LOCATION_ARM64"
+            size_variable = "AZURE_VM_SIZE_ARM64"
+        else:
+            location_variable = "AZURE_LOCATION_X64"
+            size_variable = "AZURE_VM_SIZE_X64"
+        include.append(
+            {
+                "key": key,
+                "architecture": variant["architecture"],
+                "filesystem": variant["filesystem"],
+                "flavor": variant["flavor"],
+                "asset_name": variant["asset_name"],
+                "location_variable": location_variable,
+                "size_variable": size_variable,
+            }
+        )
+    print(json.dumps({"include": include}, sort_keys=True))
+
+
 def describe_command(args: argparse.Namespace) -> None:
     selected = release_set(args.release_set)
-    print(f"release_tag={selected['release_tag']}")
-    print(f"release_title={selected['release_title']}")
+    release_tag, release_title = release_identity(
+        args.release_set,
+        getattr(args, "release_date", None),
+    )
+    print(f"release_tag={release_tag}")
+    print(f"release_title={release_title}")
     print(f"asset_count={len(selected['variants'])}")
     print(
         "core_minimum_reduction_percent="
@@ -797,6 +876,7 @@ def release_notes(
     source_commit: str,
     azure_results: dict[str, dict] | None = None,
     minimum_core_reduction_percent: int | None = None,
+    core_rows: list[tuple[dict, dict]] | None = None,
 ) -> str:
     lines = [selected["summary"], "", "## Highlights", ""]
     lines.extend(f"- {highlight}" for highlight in selected["highlights"])
@@ -823,17 +903,71 @@ def release_notes(
                 **candidate
             )
         )
-    if minimum_core_reduction_percent is not None:
+    if core_rows is not None:
         lines.extend(
             [
                 "",
-                "## Core size gate",
+                "## Full UFS versus core evidence",
                 "",
-                f"Both architectures reduced qemu-img allocated size and "
-                f"compressed/download size by at least "
-                f"{minimum_core_reduction_percent}% versus the corresponding "
-                "full UFS release assets. Virtual size is reported above and "
-                "may not regress.",
+                "| Architecture | Full virtual | Core virtual | "
+                "Virtual reduction | Full allocated | Core allocated | "
+                "Allocated reduction | Full compressed/download | "
+                "Core compressed/download | Compressed reduction | "
+                "Full packages | Core packages | Full SHA-256 | "
+                "Core SHA-256 |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+                "| ---: | ---: | ---: | ---: | --- | --- |",
+            ]
+        )
+        for full, core in core_rows:
+            lines.append(
+                f"| {core['architecture']} "
+                f"| {full['virtual_size']} | {core['virtual_size']} "
+                f"| {size_reduction_percent(full['virtual_size'], core['virtual_size']):.1f}% "
+                f"| {full['allocated_size']} | {core['allocated_size']} "
+                f"| {size_reduction_percent(full['allocated_size'], core['allocated_size']):.1f}% "
+                f"| {full['compressed_size']} | {core['compressed_size']} "
+                "| "
+                f"{size_reduction_percent(full['compressed_size'], core['compressed_size']):.1f}% "
+                f"| {full['packages']} | {core['packages']} "
+                f"| `{full['sha256']}` | `{core['sha256']}` |"
+            )
+        lines.extend(
+            [
+                "",
+                f"Both architectures passed the staging gate requiring at "
+                f"least {minimum_core_reduction_percent}% reduction in "
+                "qemu-img allocated size and compressed/download size. Core "
+                "virtual size may not exceed its same-source full UFS "
+                "baseline.",
+            ]
+        )
+    if any(candidate["flavor"] == "core" for candidate in candidates):
+        manifest = package_manifest("core")
+        lines.extend(
+            [
+                "",
+                "## Core package contract",
+                "",
+                f"- Reviewed manifest revision: {manifest['revision']}",
+                "- The core package set is dependency-closed and realized by "
+                "`pkg`; it is not produced by ad hoc deletion from a full "
+                "image.",
+                "- Retained package roots:",
+                "",
+                "```",
+                *manifest["required"],
+                *manifest["library_roots"],
+                "```",
+                "",
+                "- Reviewed package exclusions:",
+                "",
+                "```",
+                *manifest["excluded"],
+                "```",
+                "",
+                "- Excluded FreeBSD pkgbase name classes: "
+                + ", ".join(f"`{name}`" for name in manifest["excluded_classes"]),
             ]
         )
     lines.extend(
@@ -869,6 +1003,32 @@ def release_notes(
                 "</details>",
             ]
         )
+    if core_rows is not None:
+        lines.extend(
+            [
+                "",
+                "## Full UFS baseline package manifests",
+                "",
+                "These same-dispatch baselines are size evidence only and "
+                "are not release assets.",
+            ]
+        )
+        for full, _ in core_rows:
+            package_manifest_record = full["package_manifest"]
+            lines.extend(
+                [
+                    "",
+                    f"<details><summary>{full['asset_name']} baseline package "
+                    f"manifest ({package_manifest_record['count']} packages)"
+                    "</summary>",
+                    "",
+                    "```",
+                    *package_manifest_record["names"],
+                    "```",
+                    "",
+                    "</details>",
+                ]
+            )
     lines.extend(
         [
             "",
@@ -887,7 +1047,18 @@ def release_notes(
                 f"  - File size: {source['bytes']} bytes",
                 f"  - SHA-256: `{source['sha256']}`",
                 f"  - QEMU acceptance: `{validation['qemu_version']}` on "
-                f"`{validation['runner']}`",
+                f"`{validation['runner']}`; passed dual-instance UEFI "
+                "provisioning, SSH, reboot, identity separation, disk growth, "
+                "and clean shutdown.",
+            ]
+        )
+    if core_rows is not None:
+        lines.extend(
+            [
+                "- Full UFS baselines and core candidates were built in this "
+                "dispatch from the same source commit and the same "
+                "architecture-specific pinned UFS source name, URL, and "
+                "SHA-256.",
             ]
         )
     if azure_results is not None:
@@ -897,7 +1068,7 @@ def release_notes(
                 "## Azure validation",
                 "",
                 "- Exact-candidate matching-architecture Gen2 validation is "
-                "complete for every ZFS release asset.",
+                "complete for every published release asset.",
             ]
         )
         for candidate in candidates:
@@ -910,6 +1081,10 @@ def release_notes(
                     f"`{azure['derived_vhd_sha256']}`",
                     f"  - Derived VHD size: "
                     f"{azure['derived_vhd_bytes']} bytes",
+                    "  - Passed contracts: "
+                    + ", ".join(
+                        f"`{contract}`" for contract in azure["contracts"]
+                    ),
                 ]
             )
         lines.extend(
@@ -934,7 +1109,7 @@ def release_notes(
     lines.extend(
         [
             "",
-            "No checksum sidecar assets are published.",
+            "No `.sha256` or package-manifest sidecar assets are published.",
             "",
         ]
     )
@@ -945,14 +1120,20 @@ def stage_command(args: argparse.Namespace) -> None:
     if not COMMIT_RE.fullmatch(args.source_commit):
         raise ValueError("source commit must be a lowercase 40-character SHA")
     selected = release_set(args.release_set)
-    if args.release_tag != selected["release_tag"]:
+    expected_release_tag, _ = release_identity(
+        args.release_set,
+        getattr(args, "release_date", None),
+    )
+    if args.release_tag != expected_release_tag:
         raise ValueError(
             f"{args.release_set} releases must be tagged "
-            f"{selected['release_tag']}"
+            f"{expected_release_tag}"
         )
-    if args.release_set == "zfs":
+    if args.release_set in ("zfs", "core"):
         if args.azure_results is None:
-            raise ValueError("zfs releases require --azure-results")
+            raise ValueError(
+                f"{args.release_set} releases require --azure-results"
+            )
     elif args.azure_results is not None:
         raise ValueError("azure results are not applicable to this release set")
 
@@ -982,6 +1163,7 @@ def stage_command(args: argparse.Namespace) -> None:
             CORE_MINIMUM_REDUCTION_PERCENT,
         )
     )
+    core_rows = None
     if args.release_set == "core":
         if getattr(args, "baseline", None) is None:
             raise ValueError("core releases require a full UFS --baseline")
@@ -990,7 +1172,7 @@ def stage_command(args: argparse.Namespace) -> None:
             "schema": CANDIDATE_SCHEMA,
             "type": "zvmi-freebsd15-release",
             "release_set": "core",
-            "release_tag": selected["release_tag"],
+            "release_tag": expected_release_tag,
             "source_commit": args.source_commit,
             "assets": [
                 candidate_release_asset(by_variant[key]) for key in wanted
@@ -1001,7 +1183,7 @@ def stage_command(args: argparse.Namespace) -> None:
         raise ValueError("a size baseline is only applicable to core releases")
 
     azure_by_variant = None
-    if args.release_set == "zfs":
+    if args.release_set in ("zfs", "core"):
         azure_manifests = sorted(args.azure_results.rglob("azure-result.json"))
         if len(azure_manifests) != len(wanted):
             raise ValueError(f"expected {len(wanted)} azure result manifests")
@@ -1029,10 +1211,6 @@ def stage_command(args: argparse.Namespace) -> None:
                     raise ValueError(
                         f"{azure_manifest}: {profile_key} does not match profile"
                     )
-            if document.get("filesystem") != "zfs":
-                raise ValueError(f"{azure_manifest}: filesystem must be zfs")
-            if document.get("flavor") != "full":
-                raise ValueError(f"{azure_manifest}: flavor must be full")
             if document.get("source_commit") != args.source_commit:
                 raise ValueError(f"{azure_manifest}: source commit mismatch")
             if document.get("qcow_sha256") != candidate["asset_sha256"]:
@@ -1137,6 +1315,7 @@ def stage_command(args: argparse.Namespace) -> None:
             minimum_core_reduction_percent=(
                 minimum_reduction if args.release_set == "core" else None
             ),
+            core_rows=core_rows,
         ),
         encoding="utf-8",
     )
@@ -1158,6 +1337,8 @@ def candidate_release_asset(candidate: dict) -> dict:
         "virtual_size": candidate["virtual_size"],
         "sha256": candidate["asset_sha256"],
         "packages": candidate["packages"]["count"],
+        "package_manifest": candidate["packages"],
+        "source": candidate["source"],
     }
 
 
@@ -1171,8 +1352,9 @@ def load_publish_manifest(path: Path) -> dict:
     if release_set_name not in RELEASE_SETS:
         raise ValueError(f"{path}: unexpected release set")
     selected = RELEASE_SETS[release_set_name]
-    if document.get("release_tag") != selected["release_tag"]:
-        raise ValueError(f"{path}: release tag does not match release set")
+    validate_release_tag(release_set_name, document.get("release_tag"))
+    if not COMMIT_RE.fullmatch(str(document.get("source_commit", ""))):
+        raise ValueError(f"{path}: invalid source commit")
     assets = document.get("assets")
     if not isinstance(assets, list) or not assets:
         raise ValueError(f"{path}: release assets are missing")
@@ -1208,7 +1390,43 @@ def load_publish_manifest(path: Path) -> dict:
         if asset.get("bytes") != compressed_size:
             raise ValueError(f"{path}: {key} download size does not match")
         require_sha256(asset.get("sha256", ""), f"{path}: {key} SHA-256")
-        require_positive_int(asset.get("packages"), f"{path}: {key} package count")
+        package_count = require_positive_int(
+            asset.get("packages"),
+            f"{path}: {key} package count",
+        )
+        package_record = asset.get("package_manifest")
+        if not isinstance(package_record, dict):
+            raise ValueError(f"{path}: {key} package manifest is missing")
+        reviewed = package_manifest(expected["flavor"])
+        if package_record.get("manifest_revision") != reviewed["revision"]:
+            raise ValueError(f"{path}: {key} package manifest revision mismatch")
+        if package_record.get("count") != package_count:
+            raise ValueError(f"{path}: {key} package manifest count mismatch")
+        package_names = package_record.get("names")
+        if not isinstance(package_names, list) or len(package_names) != package_count:
+            raise ValueError(f"{path}: {key} package names are incomplete")
+        if (
+            any(not isinstance(name, str) or not name for name in package_names)
+            or len(set(package_names)) != package_count
+        ):
+            raise ValueError(f"{path}: {key} package names are invalid or duplicate")
+        require_positive_int(
+            package_record.get("installed_bytes"),
+            f"{path}: {key} installed package bytes",
+        )
+        verify_package_manifest(
+            expected["flavor"],
+            [{"name": name} for name in package_names],
+        )
+        source = asset.get("source")
+        if not isinstance(source, dict):
+            raise ValueError(f"{path}: {key} source metadata is missing")
+        for field in ("name", "sha256"):
+            if source.get(field) != expected[f"source_{field}"]:
+                raise ValueError(f"{path}: {key} source {field} does not match")
+        if source.get("url") != source_url(key):
+            raise ValueError(f"{path}: {key} source URL does not match")
+        require_positive_int(source.get("bytes"), f"{path}: {key} source bytes")
         by_variant[key] = asset
     if set(by_variant) != set(selected["variants"]):
         raise ValueError(f"{path}: release asset matrix is incomplete or unexpected")
@@ -1221,6 +1439,8 @@ def full_core_rows(baseline: dict, candidate: dict) -> list[tuple[dict, dict]]:
         raise ValueError("size baseline must be the full UFS release set")
     if candidate.get("release_set") != "core":
         raise ValueError("size candidate must be the core UFS release set")
+    if baseline.get("source_commit") != candidate.get("source_commit"):
+        raise ValueError("full UFS baseline and core source commits differ")
     baseline_by_architecture = {
         asset["architecture"]: asset for asset in baseline["assets"]
     }
@@ -1244,6 +1464,10 @@ def full_core_rows(baseline: dict, candidate: dict) -> list[tuple[dict, dict]]:
         if core["filesystem"] != "ufs" or core["flavor"] != "core":
             raise ValueError(
                 f"{core['architecture']} candidate must be core UFS"
+            )
+        if full["source"] != core["source"]:
+            raise ValueError(
+                f"{core['architecture']} full and core pinned sources differ"
             )
         rows.append((full, core))
     return rows
@@ -1322,8 +1546,17 @@ def parser() -> argparse.ArgumentParser:
     matrix.add_argument("--release-set", choices=RELEASE_SETS, required=True)
     matrix.set_defaults(handler=matrix_command)
 
+    azure_matrix = commands.add_parser("azure-matrix")
+    azure_matrix.add_argument(
+        "--release-set",
+        choices=RELEASE_SETS,
+        required=True,
+    )
+    azure_matrix.set_defaults(handler=azure_matrix_command)
+
     describe = commands.add_parser("describe")
     describe.add_argument("--release-set", choices=RELEASE_SETS, required=True)
+    describe.add_argument("--release-date")
     describe.set_defaults(handler=describe_command)
 
     architectures = sorted({v["architecture"] for v in VARIANTS.values()})
@@ -1375,6 +1608,7 @@ def parser() -> argparse.ArgumentParser:
     stage.add_argument("--candidates", type=Path, required=True)
     stage.add_argument("--source-commit", required=True)
     stage.add_argument("--release-tag", required=True)
+    stage.add_argument("--release-date")
     stage.add_argument("--azure-results", type=Path, default=None)
     stage.add_argument(
         "--baseline",

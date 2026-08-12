@@ -333,24 +333,22 @@ def test_workflow_azure_acceptance_job_exists():
     assert "azure_acceptance:" in content
 
 
-def test_workflow_azure_acceptance_only_for_zfs():
+def test_workflow_azure_acceptance_for_zfs_and_core_only():
     content = _workflow_content()
-    # The azure_acceptance job condition must include release_set == 'zfs'
     idx = content.index("azure_acceptance:")
     section = content[idx : idx + 600]
     assert "inputs.release_set == 'zfs'" in section
+    assert "inputs.release_set == 'core'" in section
 
 
-def test_workflow_azure_acceptance_has_both_architectures():
+def test_workflow_azure_acceptance_uses_release_set_matrix():
     content = _workflow_content()
     idx = content.index("azure_acceptance:")
     section = content[idx : content.index("\n  publish:", idx)]
-    assert "x86_64-zfs-full" in section
-    assert "aarch64-zfs-full" in section
-    assert "AZURE_LOCATION_X64" in section
-    assert "AZURE_LOCATION_ARM64" in section
-    assert "AZURE_VM_SIZE_X64" in section
-    assert "AZURE_VM_SIZE_ARM64" in section
+    assert "fromJSON(needs.prepare.outputs.azure_matrix)" in section
+    assert "CANDIDATE_KEY: ${{ matrix.key }}" in section
+    assert "AZURE_LOCATION: ${{ vars[matrix.location_variable] }}" in section
+    assert "AZURE_VM_SIZE: ${{ vars[matrix.size_variable] }}" in section
 
 
 def test_workflow_publish_depends_on_azure_acceptance():
@@ -360,7 +358,7 @@ def test_workflow_publish_depends_on_azure_acceptance():
     assert "azure_acceptance" in section
 
 
-def test_workflow_publish_requires_azure_success_for_zfs():
+def test_workflow_publish_requires_azure_success_for_gated_sets():
     content = _workflow_content()
     idx = content.index("\n  publish:")
     section = content[idx : idx + 600]
@@ -371,8 +369,7 @@ def test_workflow_publish_allows_skipped_azure_for_non_zfs():
     content = _workflow_content()
     idx = content.index("\n  publish:")
     section = content[idx : idx + 600]
-    # Non-ZFS should still publish even with azure_acceptance skipped
-    assert "inputs.release_set != 'zfs'" in section
+    assert "inputs.release_set == 'ufs'" in section
 
 
 def test_workflow_azure_acceptance_uses_oidc():
@@ -381,6 +378,8 @@ def test_workflow_azure_acceptance_uses_oidc():
     section = content[idx : content.index("\n  publish:", idx)]
     assert "id-token: write" in section
     assert "azure/login@" in section
+    assert "environment: freebsd15-release" in section
+    assert "secrets.AZURE_SUBSCRIPTION_ID" in section
 
 
 def test_workflow_azure_acceptance_uses_harness():
@@ -391,12 +390,13 @@ def test_workflow_azure_acceptance_uses_harness():
     assert "scripts/freebsd15_azure_acceptance.sh cleanup" in section
 
 
-def test_workflow_publish_downloads_azure_results_for_zfs():
+def test_workflow_publish_downloads_azure_results_for_zfs_and_core():
     content = _workflow_content()
     idx = content.index("\n  publish:")
     section = content[idx:]
     assert "freebsd15-azure-*" in section
     assert "AZURE_RESULTS_DIR" in section
+    assert "inputs.release_set == 'zfs' || inputs.release_set == 'core'" in section
 
 
 def test_workflow_publish_fail_closed_check():
@@ -442,3 +442,19 @@ def test_core_workflow_builds_and_separates_full_ufs_baselines():
     assert "Download exact core publication candidates" in content
     assert "Download exact full UFS baseline candidates" in content
     assert "merge-multiple: false" in content
+
+
+def test_core_release_date_is_explicit_and_not_stale():
+    content = _workflow_content()
+    assert "core_release_date:" in content
+    assert "Explicit reviewed YYYYMMDD" in content
+    assert "CORE_RELEASE_DATE" in content
+    assert "--release-date" in content
+    assert "20260730" not in content
+
+
+def test_ufs_full_does_not_require_azure_results():
+    content = _workflow_content()
+    publish = content[content.index("\n  publish:") :]
+    assert "inputs.release_set == 'ufs' ||" in publish
+    assert "inputs.release_set != 'ufs' && '.release/freebsd15/azure-results'" in publish
