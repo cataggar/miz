@@ -726,6 +726,142 @@ pub const Deadline = struct {
     };
 };
 
+fn runUntilDeadline(
+    io: Io,
+    deadline: Deadline,
+    comptime operation: anytype,
+    args: anytype,
+    comptime dispose: anytype,
+) @TypeOf(@call(.auto, operation, args)) {
+    try deadline.check(io);
+    const remaining = deadline.timeout.toDurationFromNow(io) orelse
+        return @call(.auto, operation, args);
+    if (remaining.raw.toNanoseconds() <= 0)
+        return error.ExecutionDeadlineExceeded;
+    const OperationResult = @TypeOf(@call(.auto, operation, args));
+    const Selection = union(enum) {
+        operation: OperationResult,
+        timeout: Io.Cancelable!void,
+    };
+    var buffer: [2]Selection = undefined;
+    var select = Io.Select(Selection).init(io, &buffer);
+    select.async(.operation, operation, args);
+    select.async(
+        .timeout,
+        Io.sleep,
+        .{ io, remaining.raw, remaining.clock },
+    );
+    const selected = select.await() catch |err| {
+        while (select.cancel()) |pending| {
+            switch (pending) {
+                .operation => |result| {
+                    if (result) |value| {
+                        var owned = value;
+                        dispose(&owned);
+                    } else |_| {}
+                },
+                .timeout => |result| result catch {},
+            }
+        }
+        return err;
+    };
+    switch (selected) {
+        .operation => |result| {
+            select.cancelDiscard();
+            return result;
+        },
+        .timeout => |result| {
+            try result;
+            while (select.cancel()) |pending| {
+                switch (pending) {
+                    .operation => |operation_result| {
+                        if (operation_result) |value| {
+                            var owned = value;
+                            dispose(&owned);
+                        } else |_| {}
+                    },
+                    .timeout => |timeout_result| timeout_result catch {},
+                }
+            }
+            return error.ExecutionDeadlineExceeded;
+        },
+    }
+}
+
+test "deadline wrapper preserves unbounded operation behavior" {
+    const TestResult = struct {
+        disposed: *bool,
+
+        fn deinit(self: *@This()) void {
+            self.disposed.* = true;
+            self.* = undefined;
+        }
+    };
+    const TestOperation = struct {
+        fn run(disposed: *bool) anyerror!TestResult {
+            return .{ .disposed = disposed };
+        }
+    };
+
+    var disposed = false;
+    var result = try runUntilDeadline(
+        std.testing.io,
+        .unbounded,
+        TestOperation.run,
+        .{&disposed},
+        TestResult.deinit,
+    );
+    try std.testing.expect(!disposed);
+    result.deinit();
+    try std.testing.expect(disposed);
+}
+
+test "deadline wrapper cancels and unwinds the bounded operation" {
+    const State = struct {
+        started: bool = false,
+        unwound: bool = false,
+        disposed: bool = false,
+    };
+    const TestResult = struct {
+        state: *State,
+
+        fn deinit(self: *@This()) void {
+            self.state.disposed = true;
+            self.* = undefined;
+        }
+    };
+    const TestOperation = struct {
+        fn run(io: Io, state: *State) anyerror!TestResult {
+            state.started = true;
+            defer state.unwound = true;
+            try Io.sleep(io, .fromSeconds(60), .awake);
+            return .{ .state = state };
+        }
+    };
+
+    const io = std.testing.io;
+    const deadline: Deadline = .{
+        .timeout = (Io.Timeout{ .duration = .{
+            .raw = .fromMilliseconds(10),
+            .clock = .awake,
+        } }).toDeadline(io),
+    };
+    var state: State = .{};
+    try std.testing.expectError(
+        error.ExecutionDeadlineExceeded,
+        runUntilDeadline(
+            io,
+            deadline,
+            TestOperation.run,
+            .{ io, &state },
+            TestResult.deinit,
+        ),
+    );
+    try std.testing.expect(state.started);
+    try std.testing.expect(state.unwound);
+    try std.testing.expect(!state.disposed);
+}
+
 /// Twice the appliance boot's budget. A firmware guest interprets the
 /// firmware, the bootloader, the kernel and an init system where the
 /// appliance interprets a kernel and one static binary, and on a software
@@ -8521,12 +8657,13 @@ pub fn execute(
             .phase = .execution,
             .message = "pull the declared container image",
         } });
-        container_pull = pullRegistryImage(
+        container_pull = pullRegistryImageWithDeadline(
             allocator,
             io,
             platform.registry_environ,
             image,
             plan.data.container_pull_path.?,
+            deadline,
         ) catch |err| {
             // A signature failure gets its own diagnostic rather than
             // arriving as one more error name under "failed to pull". The
@@ -8542,10 +8679,8 @@ pub fn execute(
                     err,
                 );
             } else {
-                try appendFailure(
+                try appendExecutionFailure(
                     &diagnostics,
-                    .execution_failed,
-                    .execution,
                     "/input/iso_oci/container/registry",
                     "failed to pull the declared container image",
                     err,
@@ -9402,6 +9537,45 @@ pub fn pinDeclaredImage(
 /// nothing else records. Re-deriving it from the pulled layout afterwards
 /// would mean a second copy of the selection rules.
 pub fn pullRegistryImage(
+    allocator: Allocator,
+    io: Io,
+    environ: std.process.Environ,
+    image: RegistryImage,
+    destination_path: []const u8,
+) !RegistryPull {
+    return pullRegistryImageWithDeadline(
+        allocator,
+        io,
+        environ,
+        image,
+        destination_path,
+        .unbounded,
+    );
+}
+
+/// Pulls an image under the run's one absolute deadline.
+///
+/// The race surrounds registry setup, pinning, signature verification, and
+/// copying as one operation. Cancelling that operation unwinds its registry
+/// client and partial-copy cleanup before this function returns.
+pub fn pullRegistryImageWithDeadline(
+    allocator: Allocator,
+    io: Io,
+    environ: std.process.Environ,
+    image: RegistryImage,
+    destination_path: []const u8,
+    deadline: Deadline,
+) !RegistryPull {
+    return runUntilDeadline(
+        io,
+        deadline,
+        pullRegistryImageUnbounded,
+        .{ allocator, io, environ, image, destination_path },
+        RegistryPull.deinit,
+    );
+}
+
+fn pullRegistryImageUnbounded(
     allocator: Allocator,
     io: Io,
     environ: std.process.Environ,
