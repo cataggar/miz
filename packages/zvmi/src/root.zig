@@ -9,8 +9,9 @@
 //! bootloader population (copy EFI binaries + generate grub.cfg/BLS),
 //! Secure Boot MOK asset plumbing, UKI generation, dm-verity hash-tree
 //! generation + kernel cmdline/COSI metadata wiring,
-//! qcow2 read/write, VHDX read/write, ISO9660/squashfs
-//! **read-only** (including squashfs XZ/zstd-compressed blocks), local OCI image ingestion, a minimal native ext4
+//! qcow2 read/write, VHDX read/write, ISO9660 **read-only** and SquashFS
+//! read/write (reader handles XZ/zstd-compressed blocks; writer emits zstd
+//! or uncompressed images from a pull-based tree), local OCI image ingestion, a minimal native ext4
 //! writer/readback helper, COSI output packaging, and the initial
 //! `build-image` orchestration pipeline for ISO + OCI -> raw/fixed-VHD/VHDX/qcow2.
 

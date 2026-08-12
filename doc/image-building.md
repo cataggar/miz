@@ -6,8 +6,10 @@ Supports `raw`, fixed `vhd`, dynamic `vhd`, `vhdx`, `qcow2`, MBR/GPT partition t
 native FAT32 filesystem read/write for ESP-style partitions, native ESP
 bootloader population (copy prebuilt EFI binaries + generate `grub.cfg`/BLS
 text), an Azure-readiness check, **read-only** ISO9660
-(+Rock Ridge/Joliet) and squashfs readers (including
-XZ/zstd-compressed squashfs blocks), automatic unwrapping of nested ext4 or
+(+Rock Ridge/Joliet) and a squashfs reader (including
+XZ/zstd-compressed squashfs blocks) paired with a native squashfs **writer**
+(deterministic zstd or uncompressed images built from a pull-based tree),
+automatic unwrapping of nested ext4 or
 squashfs rootfs images discovered inside squashfs payloads (matching LiveOS
 media such as Azure Linux 4.0), local OCI container image ingestion, a minimal
 native ext4 writer/readback library API, COSI output packaging, and a first

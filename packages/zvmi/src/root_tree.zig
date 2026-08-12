@@ -2,6 +2,7 @@ const std = @import("std");
 const ext4 = @import("ext4.zig");
 const fat32 = @import("fat32.zig");
 const limits_mod = @import("limits.zig");
+const squashfs = @import("squashfs.zig");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -996,6 +997,75 @@ pub const RootTree = struct {
         };
     }
 
+    fn readNodeContentByIndex(self: *const RootTree, index: usize, buffer: []u8, offset: u64) !usize {
+        return switch (self.nodes.items[index].payload) {
+            .content => |content| content.readAt(buffer, offset),
+            else => 0,
+        };
+    }
+
+    /// Adapts this tree to the generic SquashFS `TreeSource`, so the filesystem
+    /// codec can pull nodes without depending on `RootTree` itself. Sort the
+    /// tree (`sortNodes`) beforehand if a specific enumeration order matters;
+    /// the writer re-sorts by path regardless. Node kinds the SquashFS writer
+    /// cannot represent (hardlink, device, fifo) and metadata it does not model
+    /// (extended attributes) are reported as precise errors rather than being
+    /// silently dropped.
+    pub fn squashfsSource(self: *const RootTree) squashfs.TreeSource {
+        return .{ .context = self, .vtable = &squashfs_vtable };
+    }
+
+    const squashfs_vtable = squashfs.TreeSource.VTable{
+        .root = squashfsRoot,
+        .count = squashfsCount,
+        .node = squashfsNode,
+        .read = squashfsRead,
+    };
+
+    fn squashfsCtx(context: *const anyopaque) *const RootTree {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn squashfsRoot(context: *const anyopaque) squashfs.SourceRoot {
+        const self = squashfsCtx(context);
+        return .{
+            .mode = self.root_metadata.mode,
+            .uid = self.root_metadata.uid,
+            .gid = self.root_metadata.gid,
+            .mtime = clampMtime(self.root_metadata.mtime),
+        };
+    }
+
+    fn squashfsCount(context: *const anyopaque) usize {
+        return squashfsCtx(context).nodes.items.len;
+    }
+
+    fn squashfsNode(context: *const anyopaque, index: usize) anyerror!squashfs.SourceNode {
+        const self = squashfsCtx(context);
+        const node = self.nodes.items[index];
+        if (node.metadata.xattrs.len != 0) return error.UnsupportedXattrs;
+        const kind: squashfs.SourceKind = switch (node.kind) {
+            .directory => .directory,
+            .file => .file,
+            .symlink => .symlink,
+            .hardlink, .block_device, .char_device, .fifo => return error.UnsupportedNodeKind,
+        };
+        return .{
+            .path = node.path,
+            .kind = kind,
+            .mode = node.metadata.mode,
+            .uid = node.metadata.uid,
+            .gid = node.metadata.gid,
+            .mtime = clampMtime(node.metadata.mtime),
+            .size = node.size(),
+            .symlink_target = &.{},
+        };
+    }
+
+    fn squashfsRead(context: *const anyopaque, index: usize, buffer: []u8, offset: u64) anyerror!usize {
+        return squashfsCtx(context).readNodeContentByIndex(index, buffer, offset);
+    }
+
     fn putNode(
         self: *RootTree,
         path: []const u8,
@@ -1763,6 +1833,13 @@ fn fatPathEqual(left: []const u8, right: []const u8) bool {
 
 fn lessNode(_: void, left: Node, right: Node) bool {
     return std.mem.order(u8, left.path, right.path) == .lt;
+}
+
+fn clampMtime(value: ?i64) u32 {
+    const seconds = value orelse return 0;
+    if (seconds <= 0) return 0;
+    if (seconds >= std.math.maxInt(u32)) return std.math.maxInt(u32);
+    return @intCast(seconds);
 }
 
 /// Splits a tree-relative path into its parent directory and its own name.
@@ -2679,4 +2756,77 @@ fn hashSubsecondTimes(hash: *std.crypto.hash.sha2.Sha256, metadata: anytype) voi
     hashInt(hash, metadata.ctime_nsec);
     hashInt(hash, metadata.crtime_nsec);
     hashOptionalInt(hash, metadata.crtime);
+}
+
+test "root tree adapts to the squashfs writer and round-trips through the reader" {
+    const io = std.testing.io;
+    const spool_path = "test-root-tree-squashfs.spool";
+    const image_path = "test-root-tree-squashfs.img";
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+    try tree.putDirectory("etc", .{ .mode = 0o755 });
+    try tree.putFileBytes("etc/os-release", "NAME=zvmi\n", .{ .mode = 0o644, .uid = 5, .gid = 6 });
+    try tree.putSymlink("etc/alias", "os-release", .{ .mode = 0o777 });
+    try tree.sortNodes();
+
+    _ = try squashfs.writeImagePath(
+        std.testing.allocator,
+        io,
+        image_path,
+        tree.squashfsSource(),
+        .{ .compression = .zstd },
+    );
+
+    var reader = try squashfs.Reader.openPath(std.testing.allocator, io, image_path);
+    defer reader.close(io);
+
+    const file_index = try reader.lookup("/etc/os-release");
+    const file_entry = reader.getEntry(file_index);
+    try std.testing.expectEqual(@as(u32, 5), file_entry.uid);
+    try std.testing.expectEqual(@as(u32, 6), file_entry.gid);
+    const bytes = try reader.readFileAlloc(std.testing.allocator, io, file_index);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("NAME=zvmi\n", bytes);
+
+    const link_index = try reader.lookup("/etc/alias");
+    try std.testing.expectEqual(squashfs.EntryKind.symlink, reader.getEntry(link_index).kind);
+    try std.testing.expectEqualStrings("os-release", try reader.readLink(link_index));
+}
+
+test "root tree squashfs adapter rejects node kinds and metadata it cannot represent" {
+    const io = std.testing.io;
+    const spool_path = "test-root-tree-squashfs-reject.spool";
+    const image_path = "test-root-tree-squashfs-reject.img";
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+    try tree.putFifo("pipe", .{ .mode = 0o644 });
+    try tree.sortNodes();
+
+    try std.testing.expectError(error.UnsupportedNodeKind, squashfs.writeImagePath(
+        std.testing.allocator,
+        io,
+        image_path,
+        tree.squashfsSource(),
+        .{},
+    ));
+
+    var xattr_tree = try RootTree.init(std.testing.allocator, io, spool_path ++ ".x", .{});
+    defer xattr_tree.deinit();
+    defer Io.Dir.cwd().deleteFile(io, spool_path ++ ".x") catch {};
+    const xattrs = [_]ext4.Xattr{.{ .name = "user.test", .value = "v" }};
+    try xattr_tree.putFileBytes("f", "data", .{ .mode = 0o644, .xattrs = &xattrs });
+    try xattr_tree.sortNodes();
+    try std.testing.expectError(error.UnsupportedXattrs, squashfs.writeImagePath(
+        std.testing.allocator,
+        io,
+        image_path,
+        xattr_tree.squashfsSource(),
+        .{},
+    ));
 }
