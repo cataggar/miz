@@ -127,6 +127,7 @@ REQUIRED_PACKAGES = (
     "FreeBSD-set-minimal",
     "FreeBSD-runtime",
     "FreeBSD-rc",
+    "FreeBSD-bsdconfig",
     "FreeBSD-pam",
     "FreeBSD-bootloader",
     "FreeBSD-efi-tools",
@@ -204,7 +205,7 @@ CORE_EXCLUDED_PACKAGES = (
 
 CORE_EXCLUDED_CLASSES = ("dbg", "dev", "lib32")
 
-PACKAGE_MANIFEST_REVISION = 1
+PACKAGE_MANIFEST_REVISION = 2
 
 PACKAGE_MANIFESTS = {
     "full": {
