@@ -1,6 +1,7 @@
 const std = @import("std");
 const ext4 = @import("ext4.zig");
 const fat32 = @import("fat32.zig");
+const xfs = @import("xfs.zig");
 const limits_mod = @import("limits.zig");
 const squashfs = @import("squashfs.zig");
 const iso9660 = @import("iso9660.zig");
@@ -60,6 +61,12 @@ const Content = struct {
         },
         memory: []u8,
         borrowed: ext4.FileTreeView.ContentReader,
+        /// Same lifecycle as `.borrowed`, for a source whose content reader
+        /// is shaped like `xfs.ContentReader` rather than ext4's. Kept as its
+        /// own variant instead of adapting to `ext4.FileTreeView.ContentReader`
+        /// because the two are structurally identical but nominally distinct
+        /// Zig types with no implicit conversion between them.
+        borrowed_xfs: xfs.ContentReader,
         host_path: []u8,
     },
 
@@ -77,6 +84,7 @@ const Content = struct {
                 break :blk wanted;
             },
             .borrowed => |reader| reader.readAt(buffer[0..wanted], offset),
+            .borrowed_xfs => |reader| reader.readAt(buffer[0..wanted], offset),
             .host_path => |path| blk: {
                 const file = try Io.Dir.cwd().openFile(self.io, path, .{});
                 defer file.close(self.io);
@@ -359,10 +367,11 @@ pub const RootTree = struct {
         try self.checkFileBytes(target.len);
         const old_spool_len = self.spool_len;
         var reader = BytesReader{ .bytes = target };
-        const content = self.spoolContent(target.len, .{
+        const typed_reader: ext4.FileTreeView.ContentReader = .{
             .ctx = &reader,
             .read_at_fn = BytesReader.readAt,
-        }) catch |err| {
+        };
+        const content = self.spoolContent(target.len, typed_reader) catch |err| {
             try self.rollbackSpool(old_spool_len);
             return err;
         };
@@ -559,6 +568,49 @@ pub const RootTree = struct {
         _ = try self.importExt4GeneralMode(source, .borrowed, "");
     }
 
+    /// Imports a tree produced by the XFS scanner. XFS entries carry their
+    /// own timestamps, xattrs, hardlink targets and device numbers directly
+    /// (mirroring `ext4.GeneralTree`'s shape), so — like
+    /// `importExt4General` — the scanned tree is consumed directly rather
+    /// than squeezed through a filesystem-neutral view that would lose that
+    /// fidelity.
+    pub fn importXfs(self: *RootTree, source: *xfs.Tree) !void {
+        self.setRootMetadata(.{
+            .mode = source.root.mode,
+            .uid = source.root.uid,
+            .gid = source.root.gid,
+            .atime = source.root.atime,
+            .mtime = source.root.mtime,
+            .ctime = source.root.ctime,
+            .atime_nsec = source.root.atime_nsec,
+            .mtime_nsec = source.root.mtime_nsec,
+            .ctime_nsec = source.root.ctime_nsec,
+            .crtime = source.root.crtime,
+            .crtime_nsec = source.root.crtime_nsec,
+        });
+        _ = try self.importXfsMode(source, .owned, "");
+    }
+
+    /// Imports paths and metadata while retaining read-only content readers
+    /// owned by `source`, which must outlive this tree.
+    pub fn importXfsBorrowed(self: *RootTree, source: *xfs.Tree) !void {
+        if (self.storage != .memory) return error.BorrowedImportRequiresMemoryTree;
+        self.setRootMetadata(.{
+            .mode = source.root.mode,
+            .uid = source.root.uid,
+            .gid = source.root.gid,
+            .atime = source.root.atime,
+            .mtime = source.root.mtime,
+            .ctime = source.root.ctime,
+            .atime_nsec = source.root.atime_nsec,
+            .mtime_nsec = source.root.mtime_nsec,
+            .ctime_nsec = source.root.ctime_nsec,
+            .crtime = source.root.crtime,
+            .crtime_nsec = source.root.crtime_nsec,
+        });
+        _ = try self.importXfsMode(source, .borrowed, "");
+    }
+
     fn importExt4GeneralMode(
         self: *RootTree,
         source: *ext4.GeneralTree,
@@ -623,6 +675,87 @@ pub const RootTree = struct {
                         continue;
                     }
                     try self.putOwnedContent(path, .symlink, entry.size, content, metadata);
+                },
+            }
+        }
+        return source.nodeCount();
+    }
+
+    fn importXfsMode(
+        self: *RootTree,
+        source: *xfs.Tree,
+        mode: ImportMode,
+        prefix: []const u8,
+    ) !usize {
+        var path_buffer = std.array_list.Managed(u8).init(self.allocator);
+        defer path_buffer.deinit();
+        var target_buffer = std.array_list.Managed(u8).init(self.allocator);
+        defer target_buffer.deinit();
+
+        var index: usize = 0;
+        while (index < source.nodeCount()) : (index += 1) {
+            const entry = source.entryAt(index);
+            const metadata = Metadata{
+                .mode = entry.mode,
+                .uid = entry.uid,
+                .gid = entry.gid,
+                .atime = entry.atime,
+                .mtime = entry.mtime,
+                .ctime = entry.ctime,
+                .atime_nsec = entry.atime_nsec,
+                .mtime_nsec = entry.mtime_nsec,
+                .ctime_nsec = entry.ctime_nsec,
+                .crtime = entry.crtime,
+                .crtime_nsec = entry.crtime_nsec,
+                // xfs.Xattr and ext4.Xattr are both exactly
+                // `{name: []const u8, value: []const u8}`; reinterpreting
+                // the slice reuses the whole existing xattr pipeline
+                // (limits, dedup, sorting) instead of duplicating it.
+                .xattrs = @ptrCast(entry.xattrs),
+            };
+            const path = try joinMountPath(&path_buffer, prefix, entry.path);
+            switch (entry.kind) {
+                .directory => try self.putDirectory(path, metadata),
+                .fifo => try self.putFifo(path, metadata),
+                // root_tree.Kind has no socket variant; reject it explicitly
+                // rather than silently dropping or misclassifying it, the
+                // same way ext4.zig rejects socket inodes during its scan.
+                .socket => return error.UnsupportedSocketInode,
+                .block_device => try self.putDevice(path, .block_device, .{
+                    .major = entry.device.major,
+                    .minor = entry.device.minor,
+                }, metadata),
+                .char_device => try self.putDevice(path, .char_device, .{
+                    .major = entry.device.major,
+                    .minor = entry.device.minor,
+                }, metadata),
+                // The scanner always emits the content-bearing name before any
+                // further link to it, so the target is already present. Both
+                // names come from the same source, so a mount moves the two of
+                // them together and the link survives the merge.
+                .hardlink => try self.putHardlink(
+                    path,
+                    try joinMountPath(&target_buffer, prefix, entry.hardlink_target),
+                    metadata,
+                ),
+                .file, .symlink => {
+                    const kind: Kind = if (entry.kind == .file) .file else .symlink;
+                    // xfs always attaches a (possibly zero-length) content
+                    // reader to file/symlink entries, but the null fallback
+                    // is kept for defense in depth, matching the ext4 path.
+                    const content = entry.content orelse if (entry.size == 0)
+                        emptyXfsContentReader()
+                    else
+                        return error.MissingContent;
+                    if (mode == .borrowed) {
+                        try self.putBorrowedXfsContent(path, kind, entry.size, content, metadata);
+                        continue;
+                    }
+                    if (kind == .file) {
+                        try self.putXfsFileReader(path, entry.size, content, metadata);
+                        continue;
+                    }
+                    try self.putOwnedXfsContent(path, .symlink, entry.size, content, metadata);
                 },
             }
         }
@@ -749,9 +882,36 @@ pub const RootTree = struct {
         });
     }
 
+    /// Mounts an XFS volume produced by `xfs.scanReadable`. XFS entries carry
+    /// their own timestamps, xattrs, hardlink targets and device numbers
+    /// directly, so — like `mountExt4General` — the scanned tree is
+    /// consumed directly rather than through `FileTreeView`.
+    pub fn mountXfs(
+        self: *RootTree,
+        source: *xfs.Tree,
+        target: []const u8,
+    ) !MountReport {
+        return self.mountInternal(target, xfsRootMetadata(source), .owned, .{ .xfs = source });
+    }
+
+    pub fn mountXfsBorrowed(
+        self: *RootTree,
+        source: *xfs.Tree,
+        target: []const u8,
+    ) !MountReport {
+        if (self.storage != .memory) return error.BorrowedImportRequiresMemoryTree;
+        return self.mountInternal(
+            target,
+            xfsRootMetadata(source),
+            .borrowed,
+            .{ .xfs = source },
+        );
+    }
+
     const MountSource = union(enum) {
         view: *ext4.FileTreeView,
         general: *ext4.GeneralTree,
+        xfs: *xfs.Tree,
     };
 
     fn mountInternal(
@@ -793,6 +953,7 @@ pub const RootTree = struct {
         const imported = switch (source) {
             .view => |view| try self.importExt4ViewMode(view, mode, owned_target),
             .general => |general| try self.importExt4GeneralMode(general, mode, owned_target),
+            .xfs => |tree| try self.importXfsMode(tree, mode, owned_target),
         };
         // Every mounted entry's parent is a directory the same source already
         // emitted, so nothing is created implicitly and nothing may replace an
@@ -1286,10 +1447,14 @@ pub const RootTree = struct {
         }
     }
 
+    /// `reader` is `anytype` rather than `ext4.FileTreeView.ContentReader`
+    /// because every byte here is read once and copied immediately, so the
+    /// reader's own type never has to be stored: an `xfs.ContentReader`
+    /// works exactly as well as ext4's, without an adapter.
     fn spoolContent(
         self: *RootTree,
         size: u64,
-        reader: ext4.FileTreeView.ContentReader,
+        reader: anytype,
     ) !Content {
         const start = self.spool_len;
         const end = std.math.add(u64, start, size) catch return error.SpoolLimitExceeded;
@@ -1360,6 +1525,83 @@ pub const RootTree = struct {
         };
     }
 
+    /// Same contract as `putBorrowedContent`, for an `xfs.ContentReader`
+    /// instead of ext4's. The two are structurally identical but distinct
+    /// Zig types, so the reader is kept in its own `Content.source` variant
+    /// rather than adapted to look like the other.
+    fn putBorrowedXfsContent(
+        self: *RootTree,
+        path: []const u8,
+        kind: Kind,
+        size: u64,
+        reader: xfs.ContentReader,
+        metadata: Metadata,
+    ) !void {
+        try self.checkFileBytes(size);
+        try validatePath(path, self.limits, self.diagnostic);
+        const old_spool_len = self.spool_len;
+        const end = std.math.add(u64, old_spool_len, size) catch
+            return error.SpoolLimitExceeded;
+        try self.checkSpoolBytes(end);
+        const digest = try hashContentReader(reader, size);
+        self.spool_len = end;
+        self.putNode(path, kind, metadata, .{ .content = .{
+            .io = self.io,
+            .size = size,
+            .sha256 = digest,
+            .source = .{ .borrowed_xfs = reader },
+        } }) catch |err| {
+            try self.rollbackSpool(old_spool_len);
+            return err;
+        };
+    }
+
+    /// Spools an `xfs.ContentReader`'s bytes into this tree, exactly like
+    /// `putFileReader` does for ext4's reader shape.
+    fn putXfsFileReader(
+        self: *RootTree,
+        path: []const u8,
+        size: u64,
+        reader: xfs.ContentReader,
+        metadata: Metadata,
+    ) !void {
+        try validatePath(path, self.limits, self.diagnostic);
+        try self.checkFileBytes(size);
+        const old_spool_len = self.spool_len;
+        const content = self.spoolContent(size, reader) catch |err| {
+            try self.rollbackSpool(old_spool_len);
+            return err;
+        };
+        self.putNode(path, .file, metadata, .{ .content = content }) catch |err| {
+            try self.rollbackSpool(old_spool_len);
+            return err;
+        };
+    }
+
+    /// Spools an `xfs.ContentReader`'s bytes for a non-file kind (a
+    /// symlink), exactly like `putOwnedContent` does for ext4's reader
+    /// shape.
+    fn putOwnedXfsContent(
+        self: *RootTree,
+        path: []const u8,
+        kind: Kind,
+        size: u64,
+        content: xfs.ContentReader,
+        metadata: Metadata,
+    ) !void {
+        try self.checkFileBytes(size);
+        try validatePath(path, self.limits, self.diagnostic);
+        const old_spool_len = self.spool_len;
+        const owned = self.spoolContent(size, content) catch |err| {
+            try self.rollbackSpool(old_spool_len);
+            return err;
+        };
+        self.putNode(path, kind, metadata, .{ .content = owned }) catch |err| {
+            try self.rollbackSpool(old_spool_len);
+            return err;
+        };
+    }
+
     fn referenceHostFile(
         self: *RootTree,
         file: Io.File,
@@ -1371,10 +1613,11 @@ pub const RootTree = struct {
             return error.SpoolLimitExceeded;
         try self.checkSpoolBytes(end);
         var file_reader = FileReader{ .io = self.io, .file = file };
-        const digest = try hashContentReader(.{
+        const typed_reader: ext4.FileTreeView.ContentReader = .{
             .ctx = &file_reader,
             .read_at_fn = FileReader.readAt,
-        }, size);
+        };
+        const digest = try hashContentReader(typed_reader, size);
         const owned_path = try self.allocator.dupe(u8, path);
         self.spool_len = end;
         return .{
@@ -1598,7 +1841,7 @@ pub const RootTree = struct {
             .content => |content| switch (content.source) {
                 .memory => |bytes| self.allocator.free(bytes),
                 .host_path => |path| self.allocator.free(path),
-                .spooled, .borrowed => {},
+                .spooled, .borrowed, .borrowed_xfs => {},
             },
             .none, .device => {},
         }
@@ -1665,8 +1908,10 @@ pub const RootTree = struct {
     }
 };
 
+/// `reader` is `anytype` so this works for both ext4's and xfs's identically
+/// shaped, but nominally distinct, `ContentReader` types.
 fn hashContentReader(
-    reader: ext4.FileTreeView.ContentReader,
+    reader: anytype,
     size: u64,
 ) ![32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1748,6 +1993,24 @@ fn fatRootMetadata(source: *const fat32.Tree) Metadata {
         .mode = source.metadata.directory_mode,
         .uid = source.metadata.uid,
         .gid = source.metadata.gid,
+    };
+}
+
+fn xfsRootMetadata(source: *const xfs.Tree) Metadata {
+    return .{
+        .mode = source.root.mode,
+        .uid = source.root.uid,
+        .gid = source.root.gid,
+        .atime = source.root.atime,
+        .mtime = source.root.mtime,
+        .ctime = source.root.ctime,
+        .atime_nsec = source.root.atime_nsec,
+        .mtime_nsec = source.root.mtime_nsec,
+        .ctime_nsec = source.root.ctime_nsec,
+        .crtime = source.root.crtime,
+        .crtime_nsec = source.root.crtime_nsec,
+        // See importXfsMode: xfs.Xattr and ext4.Xattr share layout exactly.
+        .xattrs = @ptrCast(source.root.xattrs),
     };
 }
 
@@ -1961,6 +2224,16 @@ const EmptyReader = struct {
 
 fn emptyContentReader() ext4.FileTreeView.ContentReader {
     return .{ .ctx = undefined, .read_at_fn = EmptyReader.readAt };
+}
+
+const EmptyXfsReader = struct {
+    fn readAt(_: *const anyopaque, _: []u8, _: u64) xfs.ContentReader.ContentError!usize {
+        return 0;
+    }
+};
+
+fn emptyXfsContentReader() xfs.ContentReader {
+    return .{ .ctx = undefined, .read_at_fn = EmptyXfsReader.readAt };
 }
 
 fn hashInt(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
@@ -2654,6 +2927,261 @@ test "a mount list rejects duplicate and later-shadowing targets" {
     try std.testing.expectError(
         error.MountTargetNotNormalized,
         validateMountTargets(&.{"/boot//efi"}),
+    );
+}
+
+fn writeXfsFixture(io: Io, path: []const u8, bytes: []const u8) !void {
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, 0);
+}
+
+test "owned tree imports an XFS volume preserving metadata xattrs hardlinks and devices" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const image_path = "test-root-tree-xfs-owned.img";
+    const spool_path = "test-root-tree-xfs-owned.spool";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    const volume = try xfs.buildIntegrationVolume(allocator);
+    defer allocator.free(volume);
+    try writeXfsFixture(io, image_path, volume);
+
+    var reader = try xfs.Reader.openPath(allocator, io, image_path);
+    defer reader.close(io);
+    var source = try xfs.scanReadable(&reader, io, allocator, .{
+        .available_length = xfs.integration_data_blocks * xfs.integration_block_size,
+    });
+    defer source.deinit();
+
+    var tree = try RootTree.init(allocator, io, spool_path, .{});
+    defer tree.deinit();
+    try tree.importXfs(&source);
+
+    // Root metadata came from the XFS root inode, not a default.
+    try std.testing.expectEqual(@as(u16, 0o755), tree.root_metadata.mode);
+
+    // file.txt: plain EXTENTS content, spooled (owned) into the tree.
+    var file_txt_bytes: [xfs.file_txt_content.len]u8 = undefined;
+    _ = try tree.readNodeContent("file.txt", &file_txt_bytes, 0);
+    try std.testing.expectEqualStrings(xfs.file_txt_content, &file_txt_bytes);
+
+    // link: LOCAL symlink target preserved verbatim.
+    const link = tree.findNode("link").?;
+    try std.testing.expectEqual(Kind.symlink, link.kind);
+    var link_target: [8]u8 = undefined;
+    _ = try tree.readNodeContent("link", &link_target, 0);
+    try std.testing.expectEqualStrings("file.txt", &link_target);
+
+    // dev: char device major/minor round-trip without squeezing through an
+    // ext4-shaped device type.
+    const dev = tree.findNode("dev").?;
+    try std.testing.expectEqual(Kind.char_device, dev.kind);
+    try std.testing.expectEqual(Device{ .major = 1, .minor = 3 }, dev.payload.device);
+
+    // hardlinked / sub/hardlinked2: two names, one inode, preserved as a
+    // hardlink rather than a duplicated copy.
+    var hardlinked_bytes: [xfs.hardlinked_content.len]u8 = undefined;
+    _ = try tree.readNodeContent("hardlinked", &hardlinked_bytes, 0);
+    try std.testing.expectEqualStrings(xfs.hardlinked_content, &hardlinked_bytes);
+    const alias = tree.findNode("sub/hardlinked2").?;
+    try std.testing.expectEqual(Kind.hardlink, alias.kind);
+    try std.testing.expectEqualStrings("hardlinked", alias.payload.hardlink_target);
+
+    // attrs.txt: xattrs preserved through the shared ext4.Xattr-shaped
+    // pipeline, including the root-flagged "trusted." namespace entry.
+    const attrs_txt = tree.findNode("attrs.txt").?;
+    var saw_foo = false;
+    var saw_baz = false;
+    for (attrs_txt.metadata.xattrs) |xattr| {
+        if (std.mem.eql(u8, xattr.name, "user.foo")) {
+            try std.testing.expectEqualStrings("bar", xattr.value);
+            saw_foo = true;
+        }
+        if (std.mem.eql(u8, xattr.name, "trusted.baz")) {
+            try std.testing.expectEqualStrings("qux", xattr.value);
+            saw_baz = true;
+        }
+    }
+    try std.testing.expect(saw_foo);
+    try std.testing.expect(saw_baz);
+
+    // sub: nested "block"-format directory scans as a plain directory.
+    try std.testing.expectEqual(Kind.directory, tree.findNode("sub").?.kind);
+
+    // big.bin: FMT_BTREE content across two extents, spooled whole.
+    var big_bin_bytes: [2 * xfs.integration_block_size]u8 = undefined;
+    _ = try tree.readNodeContent("big.bin", &big_bin_bytes, 0);
+    try std.testing.expectEqualSlices(u8, &xfs.big_bin_block0, big_bin_bytes[0..xfs.integration_block_size]);
+    try std.testing.expectEqualSlices(u8, &xfs.big_bin_block1, big_bin_bytes[xfs.integration_block_size..]);
+
+    // rlink: remote-EXTENTS symlink target preserved.
+    var rlink_target: [xfs.rlink_target.len]u8 = undefined;
+    _ = try tree.readNodeContent("rlink", &rlink_target, 0);
+    try std.testing.expectEqualStrings(xfs.rlink_target, &rlink_target);
+}
+
+test "borrowed XFS import requires a memory tree and reads content through the live source" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const image_path = "test-root-tree-xfs-borrowed.img";
+    const spool_path = "test-root-tree-xfs-borrowed-rejected.spool";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    const volume = try xfs.buildIntegrationVolume(allocator);
+    defer allocator.free(volume);
+    try writeXfsFixture(io, image_path, volume);
+
+    var reader = try xfs.Reader.openPath(allocator, io, image_path);
+    defer reader.close(io);
+    var source = try xfs.scanReadable(&reader, io, allocator, .{
+        .available_length = xfs.integration_data_blocks * xfs.integration_block_size,
+    });
+    defer source.deinit();
+
+    // A spooled (file-backed) tree cannot borrow: its own lifecycle does
+    // not promise the source stays alive, so it must be refused up front.
+    var spooled = try RootTree.init(allocator, io, spool_path, .{});
+    defer spooled.deinit();
+    try std.testing.expectError(error.BorrowedImportRequiresMemoryTree, spooled.importXfsBorrowed(&source));
+
+    // A memory tree can, and reads bytes lazily through the still-open
+    // xfs.Reader rather than copying them up front.
+    var borrowed = RootTree.initMemory(allocator, io, .{});
+    defer borrowed.deinit();
+    try borrowed.importXfsBorrowed(&source);
+
+    var file_txt_bytes: [xfs.file_txt_content.len]u8 = undefined;
+    _ = try borrowed.readNodeContent("file.txt", &file_txt_bytes, 0);
+    try std.testing.expectEqualStrings(xfs.file_txt_content, &file_txt_bytes);
+
+    const alias = borrowed.findNode("sub/hardlinked2").?;
+    try std.testing.expectEqual(Kind.hardlink, alias.kind);
+}
+
+test "mountXfs replaces a subtree with a scanned XFS volume and carries its root metadata" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const image_path = "test-root-tree-xfs-mount.img";
+    const spool_path = "test-root-tree-xfs-mount-root.spool";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    const volume = try xfs.buildIntegrationVolume(allocator);
+    defer allocator.free(volume);
+    try writeXfsFixture(io, image_path, volume);
+
+    var reader = try xfs.Reader.openPath(allocator, io, image_path);
+    defer reader.close(io);
+    var source = try xfs.scanReadable(&reader, io, allocator, .{
+        .available_length = xfs.integration_data_blocks * xfs.integration_block_size,
+    });
+    defer source.deinit();
+
+    var root = try RootTree.init(allocator, io, spool_path, .{});
+    defer root.deinit();
+    try root.putDirectory("data", .{ .mode = 0o755 });
+    try root.putFileBytes("data/stale", "stale", .{ .mode = 0o644 });
+    try root.putFileBytes("etc/hostname", "host\n", .{ .mode = 0o644 });
+
+    const report = try root.mountXfs(&source, "/data");
+    try std.testing.expectEqual(@as(usize, 1), report.shadowed_nodes);
+    try std.testing.expectEqual(source.nodeCount(), report.imported_nodes);
+
+    // The stale file the mount covered is gone; the mount point itself now
+    // carries the mounted XFS root's own mode/uid/gid.
+    try std.testing.expectEqual(@as(?NodeView, null), root.findNode("data/stale"));
+    const mount_point = root.findNode("data").?;
+    try std.testing.expectEqual(@as(u16, 0o755), mount_point.metadata.mode);
+
+    var file_txt_bytes: [xfs.file_txt_content.len]u8 = undefined;
+    _ = try root.readNodeContent("data/file.txt", &file_txt_bytes, 0);
+    try std.testing.expectEqualStrings(xfs.file_txt_content, &file_txt_bytes);
+
+    const dev = root.findNode("data/dev").?;
+    try std.testing.expectEqual(Device{ .major = 1, .minor = 3 }, dev.payload.device);
+
+    // Everything outside the mount point survives untouched.
+    try std.testing.expect(root.findNode("etc/hostname") != null);
+}
+
+test "mountXfsBorrowed requires a memory tree" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const image_path = "test-root-tree-xfs-mount-borrowed.img";
+    const spool_path = "test-root-tree-xfs-mount-borrowed.spool";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    const volume = try xfs.buildIntegrationVolume(allocator);
+    defer allocator.free(volume);
+    try writeXfsFixture(io, image_path, volume);
+
+    var reader = try xfs.Reader.openPath(allocator, io, image_path);
+    defer reader.close(io);
+    var source = try xfs.scanReadable(&reader, io, allocator, .{
+        .available_length = xfs.integration_data_blocks * xfs.integration_block_size,
+    });
+    defer source.deinit();
+
+    var spooled = try RootTree.init(allocator, io, spool_path, .{});
+    defer spooled.deinit();
+    try spooled.putDirectory("data", .{ .mode = 0o755 });
+    try std.testing.expectError(
+        error.BorrowedImportRequiresMemoryTree,
+        spooled.mountXfsBorrowed(&source, "/data"),
+    );
+
+    var memory = RootTree.initMemory(allocator, io, .{});
+    defer memory.deinit();
+    try memory.putDirectory("data", .{ .mode = 0o755 });
+    _ = try memory.mountXfsBorrowed(&source, "/data");
+    var file_txt_bytes: [xfs.file_txt_content.len]u8 = undefined;
+    _ = try memory.readNodeContent("data/file.txt", &file_txt_bytes, 0);
+    try std.testing.expectEqualStrings(xfs.file_txt_content, &file_txt_bytes);
+}
+
+test "importXfs rejects a socket entry by name instead of misclassifying it" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const image_path = "test-root-tree-xfs-socket.img";
+    const spool_path = "test-root-tree-xfs-socket.spool";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    const volume = try xfs.buildSocketVolume(allocator);
+    defer allocator.free(volume);
+    try writeXfsFixture(io, image_path, volume);
+
+    var reader = try xfs.Reader.openPath(allocator, io, image_path);
+    defer reader.close(io);
+    var source = try xfs.scanReadable(&reader, io, allocator, .{
+        .available_length = xfs.socket_data_blocks * xfs.integration_block_size,
+    });
+    defer source.deinit();
+
+    var tree = try RootTree.init(allocator, io, spool_path, .{});
+    defer tree.deinit();
+    try std.testing.expectError(error.UnsupportedSocketInode, tree.importXfs(&source));
+}
+
+test "opening a malformed XFS image is refused by the reader before any import" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const image_path = "test-root-tree-xfs-malformed.img";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+
+    // Not a valid XFS superblock at all: detection/opening must fail
+    // outright rather than an import later silently producing an empty or
+    // wrong tree.
+    var garbage: [xfs.integration_block_size]u8 = [_]u8{0xAA} ** xfs.integration_block_size;
+    try writeXfsFixture(io, image_path, &garbage);
+
+    try std.testing.expectError(
+        error.BadMagic,
+        xfs.Reader.openPath(allocator, io, image_path),
     );
 }
 

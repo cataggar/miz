@@ -8,6 +8,7 @@ const std = @import("std");
 const boot_options = @import("boot_options.zig");
 const ext4 = @import("ext4.zig");
 const fat32 = @import("fat32.zig");
+const xfs = @import("xfs.zig");
 const Format = @import("formats.zig").Format;
 const free_space = @import("free_space.zig");
 const gpt = @import("gpt.zig");
@@ -281,6 +282,7 @@ pub const SourceFilesystem = enum {
     detect,
     ext4,
     fat32,
+    xfs,
 };
 
 /// One filesystem merged into the rebuilt root at a mount point.
@@ -1371,6 +1373,25 @@ fn fatScanOptions(
         .diagnostic = caps.diagnostic,
     };
 }
+
+fn xfsScanOptions(
+    options: RebuildOptions,
+    partition_length: u64,
+    caps: ScanCaps,
+) xfs.ScanOptions {
+    return .{
+        .available_length = partition_length,
+        .max_nodes = caps.max_nodes,
+        .max_path_bytes = options.limits.max_path_bytes,
+        .max_component_bytes = options.limits.max_component_bytes,
+        .max_file_bytes = options.limits.max_file_bytes,
+        .max_total_bytes = caps.max_total_bytes,
+        .max_xattrs_per_node = options.limits.max_xattrs_per_node,
+        .max_xattr_bytes_per_node = options.limits.max_xattr_bytes_per_node,
+        .max_scan_metadata_bytes = options.limits.max_scan_metadata_bytes,
+        .diagnostic = caps.diagnostic,
+    };
+}
 /// One handle over both importers, so the rebuild pipeline downstream of the
 /// scan does not have to be written twice and cannot drift between profiles.
 const ScannedSource = union(enum) {
@@ -1611,12 +1632,15 @@ const MountedSource = struct {
     image_open: bool = false,
     reader: ext4.Reader = undefined,
     reader_open: bool = false,
+    xfs_reader: xfs.Reader = undefined,
+    xfs_reader_open: bool = false,
     filesystem: fat32.FileSystem = undefined,
     tree: ?MountedTree = null,
 
     const MountedTree = union(enum) {
         ext4: ScannedSource,
         fat: fat32.Tree,
+        xfs: xfs.Tree,
     };
 
     fn open(
@@ -1681,6 +1705,23 @@ const MountedSource = struct {
                 ) catch |err| return budget.failed(local, err);
                 self.tree = .{ .fat = scanned };
             },
+            .xfs => {
+                self.xfs_reader = try xfs.Reader.openReadOnlySource(
+                    allocator,
+                    io,
+                    self.image.file,
+                    .{ .ctx = &self.image, .read_at_fn = imageReadAt },
+                    partition.offset,
+                );
+                self.xfs_reader_open = true;
+                const scanned = xfs.scanReadable(
+                    &self.xfs_reader,
+                    io,
+                    allocator,
+                    xfsScanOptions(options, partition.length, budget.caps(&local)),
+                ) catch |err| return budget.failed(local, err);
+                self.tree = .{ .xfs = scanned };
+            },
         }
         budget.fold(local);
         budget.charge(self.nodeCount(), self.contentBytes());
@@ -1690,11 +1731,16 @@ const MountedSource = struct {
         if (self.tree) |*tree| switch (tree.*) {
             .ext4 => |*scanned| scanned.deinit(),
             .fat => |*scanned| scanned.deinit(),
+            .xfs => |*scanned| scanned.deinit(),
         };
         self.tree = null;
         if (self.reader_open) {
             self.reader.deinit();
             self.reader_open = false;
+        }
+        if (self.xfs_reader_open) {
+            self.xfs_reader.close(io);
+            self.xfs_reader_open = false;
         }
         if (self.image_open) {
             self.image.close(io);
@@ -1707,6 +1753,7 @@ const MountedSource = struct {
         return switch (tree) {
             .ext4 => |scanned| scanned.nodeCount(),
             .fat => |scanned| scanned.nodeCount(),
+            .xfs => |scanned| scanned.nodeCount(),
         };
     }
 
@@ -1715,6 +1762,7 @@ const MountedSource = struct {
         return switch (tree) {
             .ext4 => |scanned| scanned.contentBytes(),
             .fat => |scanned| scanned.content_bytes,
+            .xfs => |scanned| scanned.content_bytes,
         };
     }
 
@@ -1755,6 +1803,10 @@ const MountedSource = struct {
             .fat => |*fat| switch (mode) {
                 .owned => tree.mountFat(fat, self.target),
                 .borrowed => tree.mountFatBorrowed(fat, self.target),
+            },
+            .xfs => |*source| switch (mode) {
+                .owned => tree.mountXfs(source, self.target),
+                .borrowed => tree.mountXfsBorrowed(source, self.target),
             },
         };
     }
@@ -1954,6 +2006,10 @@ fn buildIdentityPlan(
                 // vendor directory an installer spelled differently.
                 esp_roots.appendAssumeCapacity(try scratch.dupe(u8, mount.target));
             },
+            .xfs => |*scanned| {
+                before.filesystem_uuid = try dupeFilesystemUuid(scratch, &scanned.identity.uuid);
+                before.filesystem_label = try dupeLabel(scratch, &scanned.identity.label);
+            },
         }
         slot.* = .{
             .before = before,
@@ -2046,17 +2102,23 @@ fn resolveFilesystem(
     switch (requested) {
         .ext4 => return .ext4,
         .fat32 => return .fat32,
+        .xfs => return .xfs,
         .detect => {},
     }
     const looks_ext4 = try hasExt4Superblock(image, io, partition);
     const looks_fat32 = try hasFat32BootSector(image, io, partition);
-    if (looks_ext4 and looks_fat32) return error.AmbiguousSourceFilesystem;
+    const looks_xfs = try hasXfsSuperblock(image, io, partition);
+    const matches = @as(u2, @intFromBool(looks_ext4)) +
+        @as(u2, @intFromBool(looks_fat32)) +
+        @as(u2, @intFromBool(looks_xfs));
+    if (matches > 1) return error.AmbiguousSourceFilesystem;
     if (looks_ext4) return .ext4;
     if (looks_fat32) return .fat32;
+    if (looks_xfs) return .xfs;
     return error.UnrecognizedSourceFilesystem;
 }
 
-const ResolvedFilesystem = enum { ext4, fat32 };
+const ResolvedFilesystem = enum { ext4, fat32, xfs };
 
 /// The ext2/3/4 superblock lives 1024 bytes into the filesystem and carries
 /// its magic 0x38 bytes into itself.
@@ -2081,6 +2143,19 @@ fn hasFat32BootSector(image: Image, io: Io, partition: Partition) !bool {
     }
     if (boot[510] != 0x55 or boot[511] != 0xAA) return false;
     return std.mem.eql(u8, boot[82..90], "FAT32   ");
+}
+
+/// XFS's magic ("XFSB") lives at the very first four bytes of the
+/// filesystem, unlike ext4's (1024 bytes in) or FAT32's (a trailer
+/// signature), so it cannot collide with either at the byte level -- only a
+/// deliberately crafted image could satisfy more than one of these checks.
+fn hasXfsSuperblock(image: Image, io: Io, partition: Partition) !bool {
+    if (partition.length < 4) return false;
+    var magic: [4]u8 = undefined;
+    if (try image.pread(io, &magic, partition.offset) != magic.len) {
+        return error.UnexpectedEndOfFile;
+    }
+    return std.mem.readInt(u32, &magic, .big) == xfs.magic;
 }
 
 fn imageReadAt(
@@ -5782,6 +5857,48 @@ test "filesystem detection names a merged source or refuses to guess" {
     );
 }
 
+test "filesystem detection recognizes a bare XFS superblock and refuses an XFS/FAT32 collision" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-preserved-detect-xfs.raw";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const volume = try xfs.buildIntegrationVolume(allocator);
+    defer allocator.free(volume);
+
+    const length: u64 = 64 * 1024 * 1024;
+    var image = try Image.create(io, path, .raw, length, .{});
+    defer image.close(io);
+    const partition = Partition{ .offset = 0, .length = length };
+
+    try image.pwrite(io, volume, 0);
+    try std.testing.expectEqual(
+        ResolvedFilesystem.xfs,
+        try resolveFilesystem(image, io, partition, .detect),
+    );
+
+    // A FAT32 trailer signature and type string written past the XFS
+    // superblock (which only occupies the first few hundred bytes) describes
+    // two filesystems at once, exactly like the ext4/FAT32 collision above.
+    var boot: [512]u8 = undefined;
+    if (try image.pread(io, &boot, 0) != boot.len) return error.UnexpectedEndOfFile;
+    boot[510] = 0x55;
+    boot[511] = 0xAA;
+    @memcpy(boot[82..90], "FAT32   ");
+    try image.pwrite(io, &boot, 0);
+    try std.testing.expectError(
+        error.AmbiguousSourceFilesystem,
+        resolveFilesystem(image, io, partition, .detect),
+    );
+
+    // A caller that already knows which filesystem this is skips the probe
+    // entirely, so the same colliding bytes resolve without error.
+    try std.testing.expectEqual(
+        ResolvedFilesystem.xfs,
+        try resolveFilesystem(image, io, partition, .xfs),
+    );
+}
+
 test "limits and peaks are accounted across every merged source, not per source" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
@@ -5888,4 +6005,272 @@ test "a source whose scan fails leaves nothing behind for cleanup to walk" {
         try std.testing.expect(mount.tree == null);
         try std.testing.expectEqual(@as(usize, 0), mount.nodeCount());
     }
+}
+
+const xfs_mount_test_first_lba: u32 = 2048;
+
+/// A raw disk with a single Linux-typed MBR partition holding `volume`
+/// verbatim, so `MountedSource.open` can resolve and scan it exactly as it
+/// would a real XFS-formatted partition.
+fn createXfsMountTestDisk(io: Io, path: []const u8, volume: []const u8) !void {
+    if (volume.len % mbr.sector_size != 0) return error.InvalidPartitionBounds;
+    const sectors: u32 = @intCast(volume.len / mbr.sector_size);
+    const total_len = (@as(u64, xfs_mount_test_first_lba) + sectors) * mbr.sector_size;
+
+    var image = try Image.createExclusive(io, path, .raw, total_len, .{});
+    defer image.close(io);
+
+    var boot_record = mbr.singleLinuxPartitionMbr(xfs_mount_test_first_lba, sectors);
+    boot_record.disk_signature = 0x5846_4D44;
+    const encoded_mbr = boot_record.encode();
+    try image.pwrite(io, &encoded_mbr, 0);
+    try image.pwrite(io, volume, @as(u64, xfs_mount_test_first_lba) * mbr.sector_size);
+}
+
+test "MountedSource opens a scanned XFS partition, accounts its nodes and content, and mounts it owned" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const disk_path = "test-preserved-xfs-mount-owned.raw";
+    const spool_path = "test-preserved-xfs-mount-owned.spool";
+    defer Io.Dir.cwd().deleteFile(io, disk_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    const volume = try xfs.buildIntegrationVolume(allocator);
+    defer allocator.free(volume);
+    try createXfsMountTestDisk(io, disk_path, volume);
+
+    const options = RebuildOptions{
+        .source_path = disk_path,
+        .output_path = "unused-xfs-mount-owned-output.raw",
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 1 },
+        .source_date_epoch = 1_735_689_600,
+    };
+    const spec = SourceMount{ .partition = .{ .mbr_index = 1 }, .target = "/data" };
+
+    var budget = CombinedBudget{ .limits = .{}, .sink = null };
+    var mount = MountedSource{ .target = spec.target };
+    defer mount.deinit(io);
+    try mount.open(allocator, io, spec, options, disk_path, &budget);
+
+    const tree = mount.tree orelse return error.MissingMountedTree;
+    try std.testing.expect(tree == .xfs);
+    try std.testing.expectEqual(tree.xfs.nodeCount(), mount.nodeCount());
+    try std.testing.expectEqual(tree.xfs.content_bytes, mount.contentBytes());
+    try std.testing.expect(mount.nodeCount() > 0);
+    try std.testing.expectEqualSlices(u8, &xfs.test_fs_uuid, &tree.xfs.identity.uuid);
+    // The budget the caller passed in is charged for exactly what this
+    // source contributed, since it is the only source in this test.
+    try std.testing.expectEqual(mount.nodeCount(), budget.nodes);
+    try std.testing.expectEqual(mount.contentBytes(), budget.content_bytes);
+
+    var root = try root_tree.RootTree.init(allocator, io, spool_path, .{});
+    defer root.deinit();
+    try root.putDirectory("data", .{ .mode = 0o755 });
+    const report = try mount.mountInto(&root, .owned);
+    try std.testing.expectEqual(@as(usize, 0), report.shadowed_nodes);
+    try std.testing.expectEqual(tree.xfs.nodeCount(), report.imported_nodes);
+
+    // An owned mount spools its own copy of the content, so the imported
+    // tree still reads it correctly after the mounted source is torn down.
+    mount.deinit(io);
+    var file_txt_bytes: [xfs.file_txt_content.len]u8 = undefined;
+    _ = try root.readNodeContent("data/file.txt", &file_txt_bytes, 0);
+    try std.testing.expectEqualStrings(xfs.file_txt_content, &file_txt_bytes);
+}
+
+test "MountedSource mounts a scanned XFS partition borrowed, reading content through the live source" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const disk_path = "test-preserved-xfs-mount-borrowed.raw";
+    defer Io.Dir.cwd().deleteFile(io, disk_path) catch {};
+
+    const volume = try xfs.buildIntegrationVolume(allocator);
+    defer allocator.free(volume);
+    try createXfsMountTestDisk(io, disk_path, volume);
+
+    const options = RebuildOptions{
+        .source_path = disk_path,
+        .output_path = "unused-xfs-mount-borrowed-output.raw",
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 1 },
+        .source_date_epoch = 1_735_689_600,
+    };
+    const spec = SourceMount{ .partition = .{ .mbr_index = 1 }, .target = "/data" };
+
+    var budget = CombinedBudget{ .limits = .{}, .sink = null };
+    var mount = MountedSource{ .target = spec.target };
+    defer mount.deinit(io);
+    try mount.open(allocator, io, spec, options, disk_path, &budget);
+
+    var memory = root_tree.RootTree.initMemory(allocator, io, .{});
+    defer memory.deinit();
+    try memory.putDirectory("data", .{ .mode = 0o755 });
+    _ = try mount.mountInto(&memory, .borrowed);
+
+    // Borrowed content is read through the mounted source's own tree, so it
+    // has to still be open here, before the source is torn down. Teardown
+    // itself is left to the `defer`s above, in their declared LIFO order:
+    // `memory` first (while `mount`'s xfs tree is still live to answer any
+    // borrowed reference it drops), then `mount`.
+    var file_txt_bytes: [xfs.file_txt_content.len]u8 = undefined;
+    _ = try memory.readNodeContent("data/file.txt", &file_txt_bytes, 0);
+    try std.testing.expectEqualStrings(xfs.file_txt_content, &file_txt_bytes);
+}
+
+test "MountedSource.open on an unscannable XFS partition leaves the tree unset for cleanup" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const disk_path = "test-preserved-xfs-mount-malformed.raw";
+    defer Io.Dir.cwd().deleteFile(io, disk_path) catch {};
+
+    const volume = try xfs.buildIntegrationVolume(allocator);
+    defer allocator.free(volume);
+    // Flip a byte inside the magic itself so the reader refuses to open it
+    // outright, exactly like the root_tree.zig malformed-image test: a
+    // partition whose superblock does not even start with "XFSB" must never
+    // reach a scan.
+    volume[0] ^= 0xff;
+    try createXfsMountTestDisk(io, disk_path, volume);
+
+    const options = RebuildOptions{
+        .source_path = disk_path,
+        .output_path = "unused-xfs-mount-malformed-output.raw",
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 1 },
+        .source_date_epoch = 1_735_689_600,
+    };
+    // Requested explicitly rather than left to `.detect`: the corrupted
+    // magic would otherwise make detection itself refuse the partition
+    // first, and this test is about the reader's own rejection once a
+    // caller already knows (or claims) it is XFS.
+    const spec = SourceMount{
+        .partition = .{ .mbr_index = 1 },
+        .target = "/data",
+        .filesystem = .xfs,
+    };
+
+    var budget = CombinedBudget{ .limits = .{}, .sink = null };
+    var mount = MountedSource{ .target = spec.target };
+    defer mount.deinit(io);
+    try std.testing.expectError(
+        error.BadMagic,
+        mount.open(allocator, io, spec, options, disk_path, &budget),
+    );
+    try std.testing.expect(mount.tree == null);
+    try std.testing.expectEqual(@as(usize, 0), mount.nodeCount());
+    try std.testing.expectEqual(@as(u64, 0), mount.contentBytes());
+}
+
+fn createXfsIdentitySourceDisk(
+    allocator: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+    volume: []const u8,
+) !void {
+    const root_first_lba: u32 = 2048;
+    const root_sectors: u32 = 48 * 1024;
+    const xfs_first_lba: u32 = root_first_lba + root_sectors;
+    if (volume.len % mbr.sector_size != 0) return error.InvalidPartitionBounds;
+    const xfs_sectors: u32 = @intCast(volume.len / mbr.sector_size);
+    const total_len = (@as(u64, xfs_first_lba) + xfs_sectors) * mbr.sector_size;
+
+    var image = try Image.createExclusive(io, path, .raw, total_len, .{});
+    defer image.close(io);
+
+    var boot_record = mbr.singleLinuxPartitionMbr(root_first_lba, root_sectors);
+    boot_record.entries[1] = .{
+        .partition_type = .linux,
+        .first_lba = xfs_first_lba,
+        .sector_count = xfs_sectors,
+    };
+    boot_record.disk_signature = 0x5849_4444;
+    const encoded_mbr = boot_record.encode();
+    try image.pwrite(io, &encoded_mbr, 0);
+    try image.pwrite(io, volume, @as(u64, xfs_first_lba) * mbr.sector_size);
+
+    const spool_path = "test-preserved-xfs-identity-root.spool";
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try root_tree.RootTree.init(allocator, io, spool_path, .{});
+    defer tree.deinit();
+    try tree.putDirectory("etc", .{ .mode = 0o755 });
+    try tree.putFileBytes("etc/hostname", "root\n", .{ .mode = 0o644 });
+
+    _ = try ext4.populate(io, image.file, allocator, try tree.ext4View(), .{
+        .offset = @as(u64, root_first_lba) * mbr.sector_size,
+        .length = @as(u64, root_sectors) * mbr.sector_size,
+        .label = "xfs-id-root",
+        .uuid = [_]u8{0x77} ** 16,
+        .timestamp = 1_735_689_600,
+    });
+}
+
+test "buildIdentityPlan reads a mounted XFS source's filesystem uuid and label" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const disk_path = "test-preserved-xfs-identity.raw";
+    defer Io.Dir.cwd().deleteFile(io, disk_path) catch {};
+
+    const volume = try xfs.buildIntegrationVolume(allocator);
+    defer allocator.free(volume);
+    try createXfsIdentitySourceDisk(allocator, io, disk_path, volume);
+
+    var source_image = try Image.openPathReadOnly(io, disk_path);
+    defer source_image.close(io);
+
+    const root_partition = Partition{
+        .offset = @as(u64, 2048) * mbr.sector_size,
+        .length = @as(u64, 48 * 1024) * mbr.sector_size,
+    };
+    var reader = try ext4.openReadOnlySource(
+        io,
+        source_image.file,
+        .{ .ctx = &source_image, .read_at_fn = imageReadAt },
+        allocator,
+        .{ .offset = root_partition.offset },
+    );
+    defer reader.deinit();
+
+    const mounts = [_]SourceMount{
+        .{ .partition = .{ .mbr_index = 2 }, .target = "/data" },
+    };
+    const options = RebuildOptions{
+        .source_path = disk_path,
+        .output_path = "unused-xfs-identity-output.raw",
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 1 },
+        .source_date_epoch = 1_735_689_600,
+        .source_mounts = &mounts,
+    };
+
+    var budget = CombinedBudget{ .limits = .{}, .sink = null };
+    var sources = try SourceSet.open(
+        allocator,
+        io,
+        &reader,
+        options,
+        disk_path,
+        root_partition.length,
+        &budget,
+    );
+    defer sources.deinit(io);
+
+    var identity_plan = try buildIdentityPlan(allocator, io, options, source_image, &sources);
+    defer identity_plan.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), identity_plan.plan.filesystems.len);
+    const mounted = identity_plan.plan.filesystems[1];
+    var expected_uuid_buf: [identity_rewrite.canonical_uuid_bytes]u8 = undefined;
+    const expected_uuid = identity_rewrite.formatFilesystemUuid(&expected_uuid_buf, &xfs.test_fs_uuid);
+    try std.testing.expectEqualStrings(expected_uuid, mounted.before.filesystem_uuid.?);
+    // The synthetic XFS fixture carries an all-zero label, which trims away
+    // to nothing rather than surfacing as a run of NUL bytes.
+    try std.testing.expectEqual(@as(?[]const u8, null), mounted.before.filesystem_label);
+    try std.testing.expectEqualStrings("/data", mounted.merged_at.?);
+    // The mounted source's own after-identity always names the root, since
+    // its content becomes a plain directory inside it.
+    try std.testing.expectEqualStrings(
+        identity_plan.plan.filesystems[0].before.filesystem_uuid.?,
+        mounted.after.filesystem_uuid.?,
+    );
 }

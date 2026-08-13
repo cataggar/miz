@@ -298,6 +298,8 @@ pub const OpenError = error{
     SuperblockChecksumMismatch,
     InvalidSuperblockGeometry,
     RealtimeVolumeUnsupported,
+    SourceReadFailed,
+    UnexpectedEndOfFile,
 } || FeatureError || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError || std.mem.Allocator.Error;
 
 fn maskLow(bits: u6) u64 {
@@ -446,38 +448,105 @@ fn classifyFeatures(compat: u32, ro_compat: u32, incompat: u32) FeatureError!voi
 // Reader: superblock + raw block/inode addressing over an open file
 // ---------------------------------------------------------------------------
 
-pub const ReadError = error{ UnexpectedEndOfFile, InvalidAddress } || Io.File.ReadPositionalError || std.mem.Allocator.Error;
+pub const ReadError = error{ UnexpectedEndOfFile, InvalidAddress, SourceReadFailed } ||
+    Io.File.ReadPositionalError || std.mem.Allocator.Error;
+
+/// A read-only positional byte source used when XFS lives in a virtual disk
+/// view (a partition on a raw disk image, or any format `Image` already
+/// translates -- qcow2, VHD, VHDX) rather than directly in `file` at byte 0.
+/// Mirrors `ext4.ReadOnlySource`'s shape exactly; callback errors are
+/// deliberately collapsed to `error.SourceReadFailed`.
+pub const ReadOnlySource = struct {
+    ctx: *const anyopaque,
+    read_at_fn: *const fn (ctx: *const anyopaque, io: Io, buffer: []u8, offset: u64) anyerror!usize,
+};
+
+fn readSourceAll(
+    io: Io,
+    file: Io.File,
+    source: ?ReadOnlySource,
+    buffer: []u8,
+    offset: u64,
+) (Io.File.ReadPositionalError || error{ SourceReadFailed, UnexpectedEndOfFile })!void {
+    if (source) |read_source| {
+        const got = read_source.read_at_fn(read_source.ctx, io, buffer, offset) catch
+            return error.SourceReadFailed;
+        if (got != buffer.len) return error.UnexpectedEndOfFile;
+        return;
+    }
+    _ = try file.readPositionalAll(io, buffer, offset);
+}
 
 pub const Reader = struct {
     allocator: std.mem.Allocator,
     file: Io.File,
+    read_only_source: ?ReadOnlySource = null,
+    /// Byte offset of the filesystem's own block 0 within `file` (or within
+    /// the byte source `read_only_source` addresses) -- zero for a
+    /// standalone `.img` file, and a partition's start offset when the
+    /// filesystem is embedded inside a larger disk image.
+    offset: u64 = 0,
+    /// Whether `close` should close `file`. Only `openPath` opens the file
+    /// itself and so is the only path responsible for closing it again;
+    /// `openFile` and `openReadOnlySource` take a file a caller already owns
+    /// (an `Image`'s handle, typically), and closing it out from under the
+    /// caller would be a use-after-free the moment the caller closes its own
+    /// copy -- exactly like `ext4.Reader`, which never closes a caller-given
+    /// file either.
+    owns_file: bool = false,
     superblock: Superblock,
 
     pub fn openPath(allocator: std.mem.Allocator, io: Io, path: []const u8) OpenError!Reader {
         const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
         errdefer file.close(io);
-        return openFile(allocator, io, file);
+        var reader = try openFile(allocator, io, file);
+        reader.owns_file = true;
+        return reader;
     }
 
     pub fn openFile(allocator: std.mem.Allocator, io: Io, file: Io.File) OpenError!Reader {
+        return openInternal(allocator, io, file, null, 0);
+    }
+
+    /// Opens XFS through a guest-visible read-only byte source at `offset`.
+    /// `file` is retained only for API/layout compatibility and is never
+    /// read while `source` is present.
+    pub fn openReadOnlySource(
+        allocator: std.mem.Allocator,
+        io: Io,
+        file: Io.File,
+        source: ReadOnlySource,
+        offset: u64,
+    ) OpenError!Reader {
+        return openInternal(allocator, io, file, source, offset);
+    }
+
+    fn openInternal(
+        allocator: std.mem.Allocator,
+        io: Io,
+        file: Io.File,
+        source: ?ReadOnlySource,
+        offset: u64,
+    ) OpenError!Reader {
         var buf: [superblock_size]u8 = undefined;
-        _ = try file.readPositionalAll(io, &buf, 0);
+        try readSourceAll(io, file, source, &buf, offset);
         const superblock = try parseSuperblock(&buf);
         return .{
             .allocator = allocator,
             .file = file,
+            .read_only_source = source,
+            .offset = offset,
             .superblock = superblock,
         };
     }
 
     pub fn close(self: *Reader, io: Io) void {
-        self.file.close(io);
+        if (self.owns_file) self.file.close(io);
         self.* = undefined;
     }
 
     pub fn readAt(self: Reader, io: Io, buffer: []u8, offset: u64) ReadError!void {
-        const got = try self.file.readPositionalAll(io, buffer, offset);
-        if (got != buffer.len) return error.UnexpectedEndOfFile;
+        try readSourceAll(io, self.file, self.read_only_source, buffer, self.offset + offset);
     }
 
     /// Byte offset of fs-block `fsblock` within the volume.
@@ -1875,7 +1944,7 @@ fn encodeBmbtRec(buf: []u8, logical_block: u64, start_block: u64, block_count: u
     beU64(buf, 8, l1);
 }
 
-const test_fs_uuid = [16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
+pub const test_fs_uuid = [16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
 
 // ---------------------------------------------------------------------------
 // Superblock fixtures
@@ -2551,19 +2620,23 @@ fn expectXattr(entry: Entry, name: []const u8, value: []const u8) !void {
 }
 
 const integration_fixture_path = "test-xfs-general.img";
-const integration_block_size: u32 = 512;
-const integration_ag_blocks: u32 = 32;
-const integration_ag_count: u32 = 2;
-const integration_data_blocks: u64 = integration_ag_blocks * integration_ag_count;
+/// Exposed (rather than kept private) so `root_tree.zig` and
+/// `preserved_image.zig` can build focused XFS-backed tests against a real,
+/// hand-built XFS volume without requiring `mkfs.xfs` in the test
+/// environment.
+pub const integration_block_size: u32 = 512;
+pub const integration_ag_blocks: u32 = 32;
+pub const integration_ag_count: u32 = 2;
+pub const integration_data_blocks: u64 = integration_ag_blocks * integration_ag_count;
 
-const file_txt_content = "hello from file.txt, read back through a single EXTENTS record\n";
-const hardlinked_content = "shared content, visible under two names via one inode\n";
+pub const file_txt_content = "hello from file.txt, read back through a single EXTENTS record\n";
+pub const hardlinked_content = "shared content, visible under two names via one inode\n";
 const attrs_txt_content = "attrs.txt content, alongside a populated shortform xattr fork\n";
-const in_sub_txt_content = "in_sub.txt content: this block is real, the next is a hole\n";
-const rlink_target = "0123456789" ** 20; // 200 bytes: exercises the *remote* EXTENTS symlink path.
-const big_bin_block0 = [_]u8{'A'} ** integration_block_size;
-const big_bin_block1 = [_]u8{'B'} ** integration_block_size;
-const in_sub_txt_size: u64 = integration_block_size + 100;
+pub const in_sub_txt_content = "in_sub.txt content: this block is real, the next is a hole\n";
+pub const rlink_target = "0123456789" ** 20; // 200 bytes: exercises the *remote* EXTENTS symlink path.
+pub const big_bin_block0 = [_]u8{'A'} ** integration_block_size;
+pub const big_bin_block1 = [_]u8{'B'} ** integration_block_size;
+pub const in_sub_txt_size: u64 = integration_block_size + 100;
 
 /// Builds the full synthetic volume described in this module's test plan:
 /// two allocation groups, a shortform root directory, a nested single-block
@@ -2573,7 +2646,11 @@ const in_sub_txt_size: u64 = integration_block_size + 100;
 /// xattr fork -- geometry chosen so `inode_per_block_log == 0` and
 /// `ag_block_log == log2(ag_blocks)` make every inode number equal to the
 /// raw fs-block number it lives in, regardless of which AG it falls in.
-fn buildIntegrationVolume(allocator: std.mem.Allocator) ![]u8 {
+///
+/// Public so other modules' tests (`root_tree.zig`, `preserved_image.zig`)
+/// can reuse this exact fixture instead of hand-building their own synthetic
+/// XFS bytes or depending on `mkfs.xfs` being present.
+pub fn buildIntegrationVolume(allocator: std.mem.Allocator) ![]u8 {
     const volume = try buildVolume(allocator, integration_data_blocks, integration_block_size);
     errdefer allocator.free(volume);
 
@@ -2772,6 +2849,52 @@ fn buildIntegrationVolume(allocator: std.mem.Allocator) ![]u8 {
     @memcpy(symlink_block[symlink_header_size..][0..rlink_target.len], rlink_target);
     writeCrc(&symlink_block, 12);
     putBlock(volume, integration_block_size, 52, &symlink_block);
+
+    return volume;
+}
+
+pub const socket_ag_blocks: u32 = 32;
+pub const socket_ag_count: u32 = 1;
+pub const socket_data_blocks: u64 = socket_ag_blocks * socket_ag_count;
+
+/// A second, much smaller synthetic volume containing only a root directory
+/// and a single socket-mode inode. Unlike ext4.zig -- whose own scan rejects
+/// a socket inode before a `GeneralTree` can ever represent one -- this
+/// reader classifies `.socket` like any other kind, deferring the "refuse
+/// it" decision to a consumer such as `root_tree.zig`. This fixture exists
+/// to exercise exactly that consumer-side rejection.
+pub fn buildSocketVolume(allocator: std.mem.Allocator) ![]u8 {
+    const volume = try buildVolume(allocator, socket_data_blocks, integration_block_size);
+    errdefer allocator.free(volume);
+
+    const sb = buildTestSuperblock(.{
+        .block_size = integration_block_size,
+        .sector_size = integration_block_size,
+        .inode_size = integration_block_size,
+        .ag_blocks = socket_ag_blocks,
+        .ag_count = socket_ag_count,
+        .data_blocks = socket_data_blocks,
+        .root_ino = 2,
+    });
+    putBlock(volume, integration_block_size, 0, &sb);
+
+    var root_dir = ShortformDirBuilder.init(2);
+    root_dir.append("sock", 3, dir_ft_sock);
+    const root_inode = try buildTestInode(allocator, integration_block_size, .{
+        .ino = 2,
+        .mode = s_ifdir | 0o755,
+        .nlink = 2,
+        .data_format = fmt_local,
+    }, root_dir.finish());
+    defer allocator.free(root_inode);
+    putBlock(volume, integration_block_size, 2, root_inode);
+
+    const sock_inode = try buildTestInode(allocator, integration_block_size, .{
+        .ino = 3,
+        .mode = s_ifsock | 0o755,
+    }, "");
+    defer allocator.free(sock_inode);
+    putBlock(volume, integration_block_size, 3, sock_inode);
 
     return volume;
 }
