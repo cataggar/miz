@@ -5,6 +5,7 @@ const credential_mod = @import("credential.zig");
 const customize = @import("customize.zig");
 const grub_defaults = @import("grub_defaults.zig");
 const initramfs_mod = @import("initramfs.zig");
+const layout = @import("layout.zig");
 const os_customization = @import("os_customization.zig");
 const packages_mod = @import("packages.zig");
 const preserved_image = @import("preserved_image.zig");
@@ -69,6 +70,12 @@ const Manifest = struct {
     virtual_size: u64,
     partition_offset: u64,
     partition_length: u64,
+    /// The filesystem to mount the target partition as, rather than a
+    /// hardcoded `"ext4"` at the mount call site. Set from
+    /// `RawMutationTarget.root_filesystem`. Defaults to `.ext4` so manifests
+    /// built before this field existed -- and every test literal that omits
+    /// it -- still describe the ext4 root this project has always produced.
+    root_filesystem: layout.FilesystemKind = .ext4,
     packages: customize.PackagePolicy,
     initramfs: customize.InitramfsPolicy,
     kernel_modules: []const customize.KernelModule = &.{},
@@ -185,6 +192,7 @@ pub fn runParent(
         .virtual_size = options.target.virtual_size,
         .partition_offset = options.target.partition.offset,
         .partition_length = options.target.partition.length,
+        .root_filesystem = options.target.root_filesystem,
         .packages = options.plan.data.packages,
         .initramfs = options.plan.data.initramfs,
         .kernel_modules = options.plan.data.os.kernel_modules,
@@ -655,7 +663,7 @@ const Session = struct {
         try self.runSuccess(&.{
             findTool(self.io, mount_candidates).?,
             "-t",
-            "ext4",
+            self.manifest.root_filesystem.mountTypeName(),
             "-o",
             "rw,nodev,nosuid",
             self.loop_path.?,
@@ -4188,6 +4196,92 @@ test "worker executes policy with strict reverse cleanup" {
     try std.testing.expect(missing_resolver.cleanup_complete);
 }
 
+test "the root mount is spelled with the manifest's declared filesystem, not a hardcoded ext4" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+
+    const Case = struct {
+        why: []const u8,
+        root_filesystem: layout.FilesystemKind,
+        expected_type: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .why = "the default and the one every plan before this field existed produced",
+            .root_filesystem = .ext4,
+            .expected_type = "ext4",
+        },
+        .{
+            // Not root-mountable in practice -- `unsafe_chroot`'s own
+            // capability check refuses it before this point is ever reached
+            // -- but the mount call site itself must still spell whatever the
+            // manifest says, since the whole point of this field is that the
+            // call site stops assuming.
+            .why = "a kind whose kernel driver name differs from its own name",
+            .root_filesystem = .fat32,
+            .expected_type = "vfat",
+        },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.why});
+        const root_path = "test-unsafe-chroot-root-filesystem-root";
+        const raw_path = "test-unsafe-chroot-root-filesystem-stage.raw";
+        defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+        defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+        const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
+            .exclusive = true,
+            .read = true,
+        });
+        try raw_file.setLength(io, 8192);
+        const raw_inode = (try raw_file.stat(io)).inode;
+        raw_file.close(io);
+
+        const manifest = Manifest{
+            .raw_path = raw_path,
+            .root_path = root_path,
+            .status_path = "unused.status",
+            .report_path = "unused-report.json",
+            .stage_inode = raw_inode,
+            .virtual_size = 8192,
+            .partition_offset = 1024,
+            .partition_length = 4096,
+            .packages = .{},
+            .initramfs = .unchanged,
+            .root_filesystem = case.root_filesystem,
+        };
+        var context = FakeExecutorContext{
+            .allocator = allocator,
+            .io = io,
+            .root_path = root_path,
+            .unmounts = .init(allocator),
+            .timeline = .init(allocator),
+        };
+        const result = try executeManifest(allocator, io, manifest, .{
+            .context = &context,
+            .runFn = FakeExecutorContext.run,
+        });
+        try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
+        try std.testing.expect(result.cleanup_complete);
+
+        // Named rather than indexed, and the first "mount" record rather
+        // than any: the root is the first thing `open` mounts, before the
+        // tmpfs/proc/sysfs bind mounts that follow it, and each of those
+        // spells its own well-known type regardless of this field.
+        const root_mount = try findToolRecord(result.report.tools, "mount");
+        var saw_type_flag = false;
+        for (root_mount.command, 0..) |argument, index| {
+            if (!std.mem.eql(u8, argument, "-t")) continue;
+            try std.testing.expect(index + 1 < root_mount.command.len);
+            try std.testing.expectEqualStrings(case.expected_type, root_mount.command[index + 1]);
+            saw_type_flag = true;
+            break;
+        }
+        try std.testing.expect(saw_type_flag);
+    }
+}
+
 test "hooks run where the plan says they run, and stop existing when they are done" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -6087,7 +6181,7 @@ const FakeExecutorContext = struct {
     /// recent command.
     selinux_config_seen: ?[]const u8 = null,
 
-    fn plantSelinuxTree(self: *FakeExecutorContext, layout: FakeSelinuxLayout) !void {
+    fn plantSelinuxTree(self: *FakeExecutorContext, selinux_layout: FakeSelinuxLayout) !void {
         // Planted once and then left alone. The executor rewrites this file
         // itself for a configuration change, and a fake that put the original
         // back on the next command would be undoing the work under test.
@@ -6095,7 +6189,7 @@ const FakeExecutorContext = struct {
             self.allocator.free(existing);
             return;
         }
-        try self.writeTargetFile("etc/selinux/config", switch (layout) {
+        try self.writeTargetFile("etc/selinux/config", switch (selinux_layout) {
             .none => return,
             .no_policy_named => "SELINUX=enforcing\n",
             .targeted, .missing_contexts => "SELINUX=enforcing\nSELINUXTYPE=targeted\n",
@@ -6103,13 +6197,13 @@ const FakeExecutorContext = struct {
             .targeted_disabled => "SELINUX=disabled\nSELINUXTYPE=targeted\n",
             .targeted_with_minimum => "SELINUX=enforcing\nSELINUXTYPE=targeted\n",
         });
-        if (layout == .targeted_with_minimum) {
+        if (selinux_layout == .targeted_with_minimum) {
             try self.writeTargetFile(
                 "etc/selinux/minimum/contexts/files/file_contexts",
                 "/.*  system_u:object_r:default_t:s0\n",
             );
         }
-        if (layout == .missing_contexts) return;
+        if (selinux_layout == .missing_contexts) return;
         try self.writeTargetFile(
             "etc/selinux/targeted/contexts/files/file_contexts",
             "/.*  system_u:object_r:default_t:s0\n",
@@ -6227,7 +6321,7 @@ const FakeExecutorContext = struct {
             if (self.selinux_config_seen) |previous| self.allocator.free(previous);
             self.selinux_config_seen = seen;
         }
-        if (self.plant_selinux) |layout| try self.plantSelinuxTree(layout);
+        if (self.plant_selinux) |selinux_layout| try self.plantSelinuxTree(selinux_layout);
         if (self.plant_in_target) |relative| {
             const path = try std.fs.path.join(
                 self.allocator,

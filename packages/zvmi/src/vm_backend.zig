@@ -11,6 +11,7 @@ const builtin = @import("builtin");
 const credential_mod = @import("credential.zig");
 const customize = @import("customize.zig");
 const free_space = @import("free_space.zig");
+const layout_mod = @import("layout.zig");
 const os_customization = @import("os_customization.zig");
 const preserved_image = @import("preserved_image.zig");
 const transaction_guard = @import("transaction_guard.zig");
@@ -643,6 +644,7 @@ fn buildControl(
             .kernel_modules = data.os.kernel_modules,
             .hooks = hooks.carried,
             .selinux = data.selinux,
+            .root_filesystem = data.storage.preserve.root_filesystem,
         }),
         .hooks = hooks.plans,
     };
@@ -751,7 +753,18 @@ const ControlInput = struct {
     kernel_modules: []const customize.KernelModule = &.{},
     hooks: []const vm_control.Hook = &.{},
     selinux: customize.SelinuxPolicy = .unchanged,
+    root_filesystem: layout_mod.FilesystemKind = .ext4,
 };
+
+/// Converts the plan's declared root filesystem to the guest agent's own
+/// mirror of the same two kinds, since `vm_control.zig` cannot import
+/// `layout.zig` (see its module doc comment).
+fn toControlFilesystem(kind: layout_mod.FilesystemKind) vm_control.RootFilesystemKind {
+    return switch (kind) {
+        .ext4 => .ext4,
+        .fat32 => .fat32,
+    };
+}
 
 fn controlFromPolicy(
     allocator: Allocator,
@@ -845,6 +858,7 @@ fn controlFromPolicy(
 
     return .{
         .root_device = input.devices.root_device,
+        .root_filesystem = toControlFilesystem(input.root_filesystem),
         .result_device = input.devices.result_device,
         .credential_device = input.devices.credential_device,
         .network = switch (input.network) {
@@ -2127,6 +2141,32 @@ test "trust material reaches the guest as base64 whether it was inline or a host
         "6.12.0-1.azl",
         control.initramfs.regenerate.kernels[0],
     );
+}
+
+test "the declared root filesystem reaches the guest control document, defaulting to ext4" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const default_control = try controlFromPolicy(allocator, std.testing.io, .{
+        .packages = .{},
+        .initramfs = .unchanged,
+        .network = .offline,
+        .devices = .{ .root_device = "/dev/vda2", .result_device = "/dev/vdb" },
+    });
+    // Every plan before this field existed preserved an ext4 root, so a
+    // caller who never names the field must get exactly the value that was
+    // always implied.
+    try std.testing.expectEqual(vm_control.RootFilesystemKind.ext4, default_control.root_filesystem);
+
+    const fat32_control = try controlFromPolicy(allocator, std.testing.io, .{
+        .packages = .{},
+        .initramfs = .unchanged,
+        .network = .offline,
+        .devices = .{ .root_device = "/dev/vda1", .result_device = "/dev/vdb" },
+        .root_filesystem = .fat32,
+    });
+    try std.testing.expectEqual(vm_control.RootFilesystemKind.fat32, fat32_control.root_filesystem);
 }
 
 test "an offline guest is never handed package actions" {

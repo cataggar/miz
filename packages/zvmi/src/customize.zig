@@ -39,7 +39,7 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 29;
+pub const plan_schema_version: u32 = 30;
 pub const provenance_schema_version: u32 = 32;
 const mib: u64 = 1024 * 1024;
 
@@ -373,6 +373,25 @@ pub const PreservedStorage = struct {
     /// How many inodes the rebuilt root filesystem gets. `rebuild`-only and
     /// content-derived by default, for the same two reasons as `journal`.
     inodes: ext4.InodeOptions = .{},
+    /// The filesystem already inside the preserved source's root partition.
+    ///
+    /// Read only by `unsafe_chroot` and `vm`: both mount that partition with
+    /// the host kernel's own driver rather than write it, so they are the
+    /// only backends that need to know its kind at all. `native_edit` edits
+    /// existing files in place through this project's own ext4 code and
+    /// `rebuild` always writes a fresh ext4 tree regardless of what the
+    /// source held, so neither ever reads this field.
+    ///
+    /// Defaults to `.ext4` because every plan and every fixture today mounts
+    /// an ext4 root -- this is what a caller never had to say before this
+    /// field existed, and an unset field must keep saying it. A source whose
+    /// root is `.fat32` has to declare that explicitly, and is refused before
+    /// either executor touches the disk: a FAT32 filesystem carries none of
+    /// the permissions, symlinks, device nodes or hard links a chroot or
+    /// guest package transaction needs from a root, so mounting one as a
+    /// root is not a capability either backend actually has, only one the
+    /// type system would otherwise let a caller ask for.
+    root_filesystem: layout.FilesystemKind = .ext4,
 };
 pub const PreserveStorage = PreservedStorage;
 pub const RootPartitionSelector = PartitionSelector;
@@ -3533,6 +3552,20 @@ pub const CapabilityKind = enum {
     rebuild,
     unsafe_chroot,
     vm,
+    /// The preserved source's root partition holds the declared
+    /// `storage.preserve.root_filesystem` kind, and `unsafe_chroot`/`vm` are
+    /// able to mount it as a root with the host kernel's own driver.
+    ///
+    /// Named apart from `unsafe_chroot`/`vm` themselves, because both
+    /// backends mount the preserved root rather than write it -- neither has
+    /// an ext4 or FAT32 writer of its own to fall back on -- so a refusal
+    /// here says which filesystem kind was the problem rather than only that
+    /// the backend as a whole was unavailable. Only `.ext4` is available:
+    /// `.fat32` is a kind this project can write, but not one either
+    /// executor can safely treat as a Linux root, since neither backend
+    /// implements the general filesystem creation a package transaction or
+    /// initramfs regeneration needs from one.
+    root_filesystem_mount,
     package_management,
     repository_access,
     repository_trust,
@@ -3690,6 +3723,7 @@ pub const ResolvedPreservedStorage = struct {
     identity_rewrite: IdentityRewritePolicy = .rewrite_and_verify,
     journal: ext4.JournalOptions = .{},
     inodes: ext4.InodeOptions = .{},
+    root_filesystem: layout.FilesystemKind = .ext4,
 };
 
 pub const ResolvedStorage = union(enum) {
@@ -4090,6 +4124,7 @@ pub fn resolve(
             .identity_rewrite = storage.identity_rewrite,
             .journal = storage.journal,
             .inodes = storage.inodes,
+            .root_filesystem = storage.root_filesystem,
         } },
     };
     const resolved_os = try dupeOsCustomization(plan_allocator, request.os, context.base_path);
@@ -5191,11 +5226,33 @@ fn buildCapabilities(
             try capabilities.append(.{ .kind = .unsafe_chroot, .path = "", .reason = "run the Linux-only privileged same-architecture chroot executor; chroot is not a sandbox" });
             try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "execute target code on the host" });
             try capabilities.append(.{ .kind = .standalone_output, .path = output.path, .reason = "publish a standalone output" });
+            if (storage == .preserve) {
+                try capabilities.append(.{
+                    .kind = .root_filesystem_mount,
+                    .path = "",
+                    .reason = try std.fmt.allocPrint(
+                        allocator,
+                        "mount the preserved root as {t}, using the host kernel's own driver",
+                        .{storage.preserve.root_filesystem},
+                    ),
+                });
+            }
         },
         .vm => {
             try capabilities.append(.{ .kind = .vm, .path = "", .reason = "run the isolated full-system VM executor" });
             try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "execute target code in a VM" });
             try capabilities.append(.{ .kind = .standalone_output, .path = output.path, .reason = "publish a standalone output" });
+            if (storage == .preserve) {
+                try capabilities.append(.{
+                    .kind = .root_filesystem_mount,
+                    .path = "",
+                    .reason = try std.fmt.allocPrint(
+                        allocator,
+                        "mount the preserved root as {t}, using the guest kernel's own driver",
+                        .{storage.preserve.root_filesystem},
+                    ),
+                });
+            }
             if (execution.vm) |vm| switch (vm.boot) {
                 .direct_kernel => {},
                 .firmware => |firmware| try capabilities.append(.{
@@ -5386,7 +5443,6 @@ fn buildCapabilities(
             .reason = "execute target binaries only through the explicit compatible runner policy",
         });
     }
-    _ = storage;
     try capabilities.append(.{ .kind = .atomic_commit, .path = output.path, .reason = "publish output only after successful completion" });
     return try capabilities.toOwnedSlice();
 }
@@ -5610,7 +5666,7 @@ fn deriveNonzeroU32(seed: Seed, label: []const u8) u32 {
 
 fn hashPlan(plan: ResolvedPlanData) Digest {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("zvmi-resolved-plan-v4\x00");
+    hash.update("zvmi-resolved-plan-v5\x00");
     hashInt(&hash, plan.schema_version);
     hashInt(&hash, @intFromBool(plan.container_pull_path != null));
     if (plan.container_pull_path) |path| hashString(&hash, path);
@@ -5710,6 +5766,7 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
             // produce the content-derived count are different requests.
             hashBool(&hash, storage.inodes.bytes_per_inode != null);
             hashInt(&hash, storage.inodes.bytes_per_inode orelse 0);
+            hash.update(@tagName(storage.root_filesystem));
         },
     }
     hashOsCustomization(&hash, plan.os);
@@ -6328,6 +6385,7 @@ pub fn preflight(
                 else => .unsupported,
             },
             .vm => vmCapabilityState(platform, io, plan),
+            .root_filesystem_mount => rootFilesystemMountCapabilityState(platform, io, plan),
             .gpt_source => gptSourceAvailable(io, requirement.path),
             .kernel_option_change => kernelOptionChangeAvailable(io, requirement.path),
             .vm_firmware => if (plan.data.execution.vm) |vm| switch (vm.boot) {
@@ -6695,6 +6753,7 @@ fn systemCapabilityCheck(_: ?*anyopaque, io: Io, requirement: CapabilityRequirem
         .rebuild,
         .unsafe_chroot,
         .vm,
+        .root_filesystem_mount,
         .package_management,
         .repository_access,
         .repository_trust,
@@ -6769,6 +6828,166 @@ fn packageCacheAvailable(io: Io, plan: *const ResolvedPlan) CapabilityState {
     const stat = Io.Dir.cwd().statFile(io, probed, .{}) catch return .missing;
     if (stat.kind != .directory) return .missing;
     return .available;
+}
+
+/// Whether the preserved source's declared root filesystem is one
+/// `unsafe_chroot` or `vm` can actually mount as a Linux root.
+///
+/// Both backends mount the partition with the host or guest kernel's own
+/// driver rather than write it, so the question is not "can this project
+/// write this filesystem" -- neither backend writes anything to the root at
+/// all before a package or hook transaction starts -- it is "does mounting
+/// this kind as a root make sense for what runs next". Only `.ext4` does:
+/// `.fat32` is a kind this project can write for other partitions, but a
+/// FAT32 root has no permissions, symlinks, device nodes or hard links for
+/// a chroot or guest transaction to preserve, and neither executor
+/// implements the general filesystem mutation that would be needed to work
+/// around that. The check runs before either backend's own availability, so
+/// a declared kind this backend cannot use is reported as the reason,
+/// rather than surfacing only once the backend itself is checked.
+fn rootFilesystemMountCapabilityState(
+    platform: Platform,
+    io: Io,
+    plan: *const ResolvedPlan,
+) CapabilityState {
+    const data = plan.data;
+    if (data.storage != .preserve or data.storage.preserve.root_filesystem != .ext4) {
+        return .unsupported;
+    }
+    return switch (data.execution.backend) {
+        .unsafe_chroot => unsafeChrootCapabilityState(platform, io, plan),
+        .vm => vmCapabilityState(platform, io, plan),
+        else => .unsupported,
+    };
+}
+
+test "root_filesystem_mount is declared for the backends that mount the preserved root, naming the declared kind, and omitted where nothing is mounted" {
+    var chroot_request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    chroot_request.execution.backend = .unsafe_chroot;
+    chroot_request.execution.acknowledge_unsafe = true;
+
+    var chroot_resolved = try resolve(std.testing.allocator, &chroot_request, .{ .host_architecture = .x86_64 });
+    defer chroot_resolved.deinit(std.testing.allocator);
+    const chroot_capabilities = chroot_resolved.plan.?.data.required_capabilities;
+    try std.testing.expect(hasCapabilityKind(chroot_capabilities, .root_filesystem_mount));
+    var saw_chroot_reason = false;
+    for (chroot_capabilities) |capability| {
+        if (capability.kind != .root_filesystem_mount) continue;
+        try std.testing.expect(std.mem.indexOf(u8, capability.reason, "ext4") != null);
+        saw_chroot_reason = true;
+    }
+    try std.testing.expect(saw_chroot_reason);
+
+    var vm_request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    vm_request.execution.backend = .vm;
+    vm_request.execution.vm = validVmPolicy();
+
+    var vm_resolved = try resolve(std.testing.allocator, &vm_request, .{ .host_architecture = .x86_64 });
+    defer vm_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(hasCapabilityKind(
+        vm_resolved.plan.?.data.required_capabilities,
+        .root_filesystem_mount,
+    ));
+
+    // `native_edit` never mounts the preserved root -- it edits the raw stage
+    // through this project's own filesystem code -- so it declares no
+    // requirement for a capability whose whole subject is mounting.
+    var edit_request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    var edit_resolved = try resolve(std.testing.allocator, &edit_request, .{ .host_architecture = .x86_64 });
+    defer edit_resolved.deinit(std.testing.allocator);
+    try std.testing.expect(!hasCapabilityKind(
+        edit_resolved.plan.?.data.required_capabilities,
+        .root_filesystem_mount,
+    ));
+}
+
+test "rootFilesystemMountCapabilityState accepts a mountable ext4 root and rejects an unmountable fat32 root regardless of the backend's own availability" {
+    const Check = struct {
+        fn available(_: ?*anyopaque, _: Io, _: *const ResolvedPlan) CapabilityState {
+            return .available;
+        }
+    };
+
+    var chroot_request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    chroot_request.execution.backend = .unsafe_chroot;
+    chroot_request.execution.acknowledge_unsafe = true;
+
+    var chroot_resolved = try resolve(std.testing.allocator, &chroot_request, .{ .host_architecture = .x86_64 });
+    defer chroot_resolved.deinit(std.testing.allocator);
+    var platform = Platform.system();
+    platform.unsafeChrootCheckFn = Check.available;
+    try std.testing.expectEqual(
+        CapabilityState.available,
+        rootFilesystemMountCapabilityState(platform, std.testing.io, &chroot_resolved.plan.?),
+    );
+
+    // FAT32 carries no POSIX permissions, symlinks, device nodes or hard
+    // links for a chroot transaction to preserve, so it is refused as a root
+    // kind even though the backend itself -- the fake check function -- says
+    // it is otherwise ready. The rejection is about the declared kind, not
+    // about whether unsafe_chroot is available.
+    chroot_request.storage.preserve.root_filesystem = .fat32;
+    var fat32_resolved = try resolve(std.testing.allocator, &chroot_request, .{ .host_architecture = .x86_64 });
+    defer fat32_resolved.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        rootFilesystemMountCapabilityState(platform, std.testing.io, &fat32_resolved.plan.?),
+    );
+
+    var vm_request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    vm_request.execution.backend = .vm;
+    vm_request.execution.vm = validVmPolicy();
+    vm_request.storage.preserve.root_filesystem = .fat32;
+    var vm_resolved = try resolve(std.testing.allocator, &vm_request, .{ .host_architecture = .x86_64 });
+    defer vm_resolved.deinit(std.testing.allocator);
+    var vm_platform = Platform.system();
+    vm_platform.vmCheckFn = Check.available;
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        rootFilesystemMountCapabilityState(vm_platform, std.testing.io, &vm_resolved.plan.?),
+    );
+}
+
+test "a declared root filesystem changes the plan hash, and leaving it unset hashes the same as naming ext4 explicitly" {
+    var default_request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    var default_resolved = try resolve(std.testing.allocator, &default_request, .{ .host_architecture = .x86_64 });
+    defer default_resolved.deinit(std.testing.allocator);
+
+    var explicit_ext4_request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    explicit_ext4_request.storage.preserve.root_filesystem = .ext4;
+    var explicit_ext4_resolved = try resolve(std.testing.allocator, &explicit_ext4_request, .{ .host_architecture = .x86_64 });
+    defer explicit_ext4_resolved.deinit(std.testing.allocator);
+
+    // A plan that never named the field and one that named it as the exact
+    // default it would have taken anyway are the same plan, so a caller
+    // upgrading onto this field sees no hash churn on a run it did not
+    // change.
+    try std.testing.expectEqualSlices(
+        u8,
+        &default_resolved.plan.?.data.plan_hash.bytes,
+        &explicit_ext4_resolved.plan.?.data.plan_hash.bytes,
+    );
+
+    var fat32_request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    fat32_request.storage.preserve.root_filesystem = .fat32;
+    var fat32_resolved = try resolve(std.testing.allocator, &fat32_request, .{ .host_architecture = .x86_64 });
+    defer fat32_resolved.deinit(std.testing.allocator);
+
+    // A materially different declared kind is a materially different plan.
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &default_resolved.plan.?.data.plan_hash.bytes,
+        &fat32_resolved.plan.?.data.plan_hash.bytes,
+    ));
+
+    // Deterministic: resolving the same request twice hashes identically.
+    var repeat_resolved = try resolve(std.testing.allocator, &fat32_request, .{ .host_architecture = .x86_64 });
+    defer repeat_resolved.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(
+        u8,
+        &fat32_resolved.plan.?.data.plan_hash.bytes,
+        &repeat_resolved.plan.?.data.plan_hash.bytes,
+    );
 }
 
 /// Whether a disk carries a GPT that the COSI writer can describe.
@@ -8911,6 +9130,7 @@ pub fn execute(
                 .output_compression = plan.data.output.format.compression(),
                 .root_partition = plan.data.storage.preserve.root_partition,
                 .require_linux_partition = true,
+                .root_filesystem = plan.data.storage.preserve.root_filesystem,
                 .output_create_options = outputCreateOptions(plan),
             }, .{
                 .context = &hook_context,
@@ -8953,6 +9173,7 @@ pub fn execute(
                 .output_compression = plan.data.output.format.compression(),
                 .root_partition = plan.data.storage.preserve.root_partition,
                 .require_linux_partition = true,
+                .root_filesystem = plan.data.storage.preserve.root_filesystem,
                 .output_create_options = outputCreateOptions(plan),
             }, .{
                 .context = &hook_context,
@@ -14309,7 +14530,15 @@ test "the schema versions move only when the documents do" {
     // The counts are recorded unconditionally rather than only when a ratio
     // was asked for, because shipping an image with three free inodes is
     // precisely the case where nobody asked for anything.
-    try std.testing.expectEqual(@as(u32, 29), plan_schema_version);
+    //
+    // The plan alone moved for `storage.preserve.root_filesystem`: it is
+    // purely an instruction -- which kind of filesystem the preserved
+    // source's root partition already holds -- with no outcome of its own to
+    // record. `unsafe_chroot` and `vm` mount exactly the kind the plan
+    // states; nothing about a run decides that value, so provenance has
+    // nothing new to say about it beyond echoing the resolved configuration
+    // it already carries.
+    try std.testing.expectEqual(@as(u32, 30), plan_schema_version);
     try std.testing.expectEqual(@as(u32, 32), provenance_schema_version);
 }
 
