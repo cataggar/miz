@@ -400,7 +400,7 @@ jobs:
           name: freebsd15-azure-failure-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
           path: |
             ${{ env.RESULT_DIR }}/*.json
-            ${{ env.RESULT_DIR }}/boot.log
+            ${{ env.RESULT_DIR }}/boot.log*
             ${{ env.RESULT_DIR }}/uefi-db.bin
             ${{ env.RESULT_DIR }}/guest-contract.stdout
             ${{ env.RESULT_DIR }}/guest-contract.stderr
