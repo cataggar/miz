@@ -6195,6 +6195,11 @@ fn createXfsIdentitySourceDisk(
     defer tree.deinit();
     try tree.putDirectory("etc", .{ .mode = 0o755 });
     try tree.putFileBytes("etc/hostname", "root\n", .{ .mode = 0o644 });
+    // A mount replaces a directory's contents; it never creates one, the
+    // same way a real `mount(8)` refuses a missing target. Both consumers of
+    // this fixture -- `buildIdentityPlan` (which never mounts) and a full
+    // `rebuild` merge (which does) -- need this to already exist.
+    try tree.putDirectory("data", .{ .mode = 0o755 });
 
     _ = try ext4.populate(io, image.file, allocator, try tree.ext4View(), .{
         .offset = @as(u64, root_first_lba) * mbr.sector_size,
@@ -6273,4 +6278,191 @@ test "buildIdentityPlan reads a mounted XFS source's filesystem uuid and label" 
         identity_plan.plan.filesystems[0].before.filesystem_uuid.?,
         mounted.after.filesystem_uuid.?,
     );
+}
+
+test "rebuild merges an XFS filesystem into the root and the ext4 output round-trips its content and metadata" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const disk_path = "test-preserved-xfs-roundtrip-source.raw";
+    const output_path = "test-preserved-xfs-roundtrip-output.raw";
+    const artifacts = [_][]const u8{
+        disk_path,
+        output_path,
+        "test-preserved-xfs-identity-root.spool",
+        output_path ++ ".native-rebuild.raw",
+        output_path ++ ".native-rebuild.output",
+        output_path ++ ".native-rebuild.spool",
+    };
+    defer for (artifacts) |artifact| Io.Dir.cwd().deleteFile(io, artifact) catch {};
+
+    const volume = try xfs.buildIntegrationVolume(allocator);
+    defer allocator.free(volume);
+    // Reuses the same root+xfs disk layout `buildIdentityPlan` proves the
+    // identity handling on; this test proves the other half -- that the
+    // XFS content and metadata a merge imports actually survive being
+    // rewritten as this project's own ext4 output.
+    try createXfsIdentitySourceDisk(allocator, io, disk_path, volume);
+
+    const mounts = [_]SourceMount{
+        .{ .partition = .{ .mbr_index = 2 }, .target = "/data" },
+    };
+    const options = RebuildOptions{
+        .source_path = disk_path,
+        .output_path = output_path,
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 1 },
+        .source_date_epoch = 1_735_689_600,
+        .source_mounts = &mounts,
+    };
+
+    const report = try rebuild(allocator, io, options);
+    try std.testing.expectEqual(@as(usize, 1), report.merged_source_count);
+    // A merge makes the output a function of two sources, not of the one
+    // the report names.
+    try std.testing.expect(!report.source_reproducible);
+
+    var output = try Image.openPath(io, output_path);
+    defer output.close(io);
+
+    const root_first_lba: u32 = 2048;
+    const root_sectors: u32 = 48 * 1024;
+    var reader = try ext4.openGeneral(io, output.file, allocator, .{
+        .offset = @as(u64, root_first_lba) * mbr.sector_size,
+    });
+    defer reader.deinit();
+    var tree = try ext4.scanReadable(&reader, io, allocator, .{
+        .available_length = @as(u64, root_sectors) * mbr.sector_size,
+    });
+    defer tree.deinit();
+
+    // The XFS fixture's every inode carries the same fixed timestamps
+    // (`buildTestInode`), so every merged entry's times are checked against
+    // the same three constants: proof timestamps travel through the merge
+    // and the ext4 rewrite rather than being replaced by the image-wide
+    // default the writer falls back to for genuinely new nodes.
+    const expected_atime: i64 = 1_700_000_000;
+    const expected_mtime: i64 = 1_700_000_001;
+    const expected_ctime: i64 = 1_700_000_002;
+
+    var saw_file_txt = false;
+    var saw_link = false;
+    var saw_dev = false;
+    var saw_hardlinked = false;
+    var saw_hardlinked_alias = false;
+    var saw_attrs_txt = false;
+    var saw_in_sub_txt = false;
+    var saw_unwritten_bin = false;
+    var saw_big_bin = false;
+    var saw_rlink = false;
+
+    var index: usize = 0;
+    while (index < tree.nodeCount()) : (index += 1) {
+        const entry = tree.entryAt(index);
+        if (std.mem.eql(u8, entry.path, "data/file.txt")) {
+            saw_file_txt = true;
+            try std.testing.expectEqual(ext4.GeneralKind.file, entry.kind);
+            try std.testing.expectEqual(@as(u16, 0o644), entry.mode);
+            try std.testing.expectEqual(expected_atime, entry.atime);
+            try std.testing.expectEqual(expected_mtime, entry.mtime);
+            try std.testing.expectEqual(expected_ctime, entry.ctime);
+        }
+        if (std.mem.eql(u8, entry.path, "data/link")) {
+            saw_link = true;
+            try std.testing.expectEqual(ext4.GeneralKind.symlink, entry.kind);
+        }
+        if (std.mem.eql(u8, entry.path, "data/dev")) {
+            saw_dev = true;
+            try std.testing.expectEqual(ext4.GeneralKind.char_device, entry.kind);
+            try std.testing.expectEqual(@as(u32, 1), entry.device.major);
+            try std.testing.expectEqual(@as(u32, 3), entry.device.minor);
+        }
+        if (std.mem.eql(u8, entry.path, "data/hardlinked")) {
+            saw_hardlinked = true;
+            try std.testing.expectEqual(ext4.GeneralKind.file, entry.kind);
+        }
+        if (std.mem.eql(u8, entry.path, "data/sub/hardlinked2")) {
+            saw_hardlinked_alias = true;
+            try std.testing.expectEqual(ext4.GeneralKind.hardlink, entry.kind);
+            try std.testing.expectEqualStrings("data/hardlinked", entry.hardlink_target);
+        }
+        if (std.mem.eql(u8, entry.path, "data/attrs.txt")) {
+            saw_attrs_txt = true;
+            var saw_foo = false;
+            var saw_baz = false;
+            for (entry.xattrs) |xattr| {
+                if (std.mem.eql(u8, xattr.name, "user.foo")) {
+                    try std.testing.expectEqualStrings("bar", xattr.value);
+                    saw_foo = true;
+                }
+                if (std.mem.eql(u8, xattr.name, "trusted.baz")) {
+                    try std.testing.expectEqualStrings("qux", xattr.value);
+                    saw_baz = true;
+                }
+            }
+            try std.testing.expect(saw_foo);
+            try std.testing.expect(saw_baz);
+        }
+        if (std.mem.eql(u8, entry.path, "data/sub/in_sub.txt")) {
+            saw_in_sub_txt = true;
+            try std.testing.expectEqual(xfs.in_sub_txt_size, entry.size);
+        }
+        if (std.mem.eql(u8, entry.path, "data/unwritten.bin")) {
+            saw_unwritten_bin = true;
+            try std.testing.expectEqual(xfs.unwritten_bin_size, entry.size);
+        }
+        if (std.mem.eql(u8, entry.path, "data/big.bin")) {
+            saw_big_bin = true;
+            try std.testing.expectEqual(@as(u64, 2 * xfs.integration_block_size), entry.size);
+        }
+        if (std.mem.eql(u8, entry.path, "data/rlink")) {
+            saw_rlink = true;
+            try std.testing.expectEqual(ext4.GeneralKind.symlink, entry.kind);
+        }
+    }
+    try std.testing.expect(saw_file_txt);
+    try std.testing.expect(saw_link);
+    try std.testing.expect(saw_dev);
+    try std.testing.expect(saw_hardlinked);
+    try std.testing.expect(saw_hardlinked_alias);
+    try std.testing.expect(saw_attrs_txt);
+    try std.testing.expect(saw_in_sub_txt);
+    try std.testing.expect(saw_unwritten_bin);
+    try std.testing.expect(saw_big_bin);
+    try std.testing.expect(saw_rlink);
+
+    // Byte content, read back through the rebuilt ext4 output rather than
+    // off the scanned tree's in-memory view.
+    const file_txt_bytes = try reader.readFileAlloc(io, allocator, "data/file.txt");
+    defer allocator.free(file_txt_bytes);
+    try std.testing.expectEqualStrings(xfs.file_txt_content, file_txt_bytes);
+
+    const link_target = try reader.readLinkAlloc(io, allocator, "data/link");
+    defer allocator.free(link_target);
+    try std.testing.expectEqualStrings("file.txt", link_target);
+
+    const hardlinked_bytes = try reader.readFileAlloc(io, allocator, "data/hardlinked");
+    defer allocator.free(hardlinked_bytes);
+    try std.testing.expectEqualStrings(xfs.hardlinked_content, hardlinked_bytes);
+
+    // sub/in_sub.txt: a real extent followed by a genuine hole, both
+    // surviving the merge and the ext4 rewrite.
+    const in_sub_bytes = try reader.readFileAlloc(io, allocator, "data/sub/in_sub.txt");
+    defer allocator.free(in_sub_bytes);
+    try std.testing.expectEqualStrings(xfs.in_sub_txt_content, in_sub_bytes[0..xfs.in_sub_txt_content.len]);
+    for (in_sub_bytes[xfs.integration_block_size..]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+
+    // unwritten.bin: an unwritten (allocated, never written) extent, also
+    // read back as zeros after the same merge and rewrite.
+    const unwritten_bytes = try reader.readFileAlloc(io, allocator, "data/unwritten.bin");
+    defer allocator.free(unwritten_bytes);
+    for (unwritten_bytes) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+
+    const big_bin_bytes = try reader.readFileAlloc(io, allocator, "data/big.bin");
+    defer allocator.free(big_bin_bytes);
+    try std.testing.expectEqualSlices(u8, &xfs.big_bin_block0, big_bin_bytes[0..xfs.integration_block_size]);
+    try std.testing.expectEqualSlices(u8, &xfs.big_bin_block1, big_bin_bytes[xfs.integration_block_size..]);
+
+    const rlink_bytes = try reader.readLinkAlloc(io, allocator, "data/rlink");
+    defer allocator.free(rlink_bytes);
+    try std.testing.expectEqualStrings(xfs.rlink_target, rlink_bytes);
 }

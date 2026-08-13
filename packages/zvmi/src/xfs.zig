@@ -2762,13 +2762,19 @@ pub const rlink_target = "0123456789" ** 20; // 200 bytes: exercises the *remote
 pub const big_bin_block0 = [_]u8{'A'} ** integration_block_size;
 pub const big_bin_block1 = [_]u8{'B'} ** integration_block_size;
 pub const in_sub_txt_size: u64 = integration_block_size + 100;
+/// `unwritten.bin`'s single extent is marked unwritten (allocated, never
+/// written) rather than left as a hole, so a consumer can tell the two
+/// apart in the fixture even though both read back as zeros.
+pub const unwritten_bin_size: u64 = integration_block_size;
 
 /// Builds the full synthetic volume described in this module's test plan:
 /// two allocation groups, a shortform root directory, a nested single-block
 /// "block" format directory, EXTENTS and BTREE regular files (the latter
-/// with a genuine hole), LOCAL and remote-EXTENTS symlinks, a hardlinked
-/// inode reached under two names, a character device, and a shortform
-/// xattr fork -- geometry chosen so `inode_per_block_log == 0` and
+/// with a genuine hole), an EXTENTS file whose sole extent is unwritten
+/// (allocated but never written, distinct from a hole -- no extent record
+/// at all), LOCAL and remote-EXTENTS symlinks, a hardlinked inode reached
+/// under two names, a character device, and a shortform xattr fork --
+/// geometry chosen so `inode_per_block_log == 0` and
 /// `ag_block_log == log2(ag_blocks)` make every inode number equal to the
 /// raw fs-block number it lives in, regardless of which AG it falls in.
 ///
@@ -2800,6 +2806,7 @@ pub fn buildIntegrationVolume(allocator: std.mem.Allocator) ![]u8 {
     root_dir.append("sub", 40, dir_ft_dir);
     root_dir.append("big.bin", 50, dir_ft_reg_file);
     root_dir.append("rlink", 51, dir_ft_symlink);
+    root_dir.append("unwritten.bin", 8, dir_ft_reg_file);
     const root_inode = try buildTestInode(allocator, integration_block_size, .{
         .ino = 2,
         .mode = s_ifdir | 0o755,
@@ -2879,6 +2886,25 @@ pub fn buildIntegrationVolume(allocator: std.mem.Allocator) ![]u8 {
     defer allocator.free(attrs_txt_inode);
     putBlock(volume, integration_block_size, 7, attrs_txt_inode);
     putBlock(volume, integration_block_size, 22, attrs_txt_content);
+
+    // --- unwritten.bin (ino 8, AG0): EXTENTS regular file whose sole
+    // extent is unwritten -- allocated but never written. Block 23 (the
+    // extent's target) is filled with a non-zero marker rather than left
+    // zeroed, so a read that returned it verbatim instead of zero-filling
+    // would be caught rather than accidentally matching anyway.
+    var unwritten_extent: [bmbt_rec_size]u8 = undefined;
+    encodeBmbtRec(&unwritten_extent, 0, 23, 1, true);
+    const unwritten_inode = try buildTestInode(allocator, integration_block_size, .{
+        .ino = 8,
+        .mode = s_ifreg | 0o644,
+        .size = unwritten_bin_size,
+        .data_format = fmt_extents,
+        .nextents = 1,
+    }, &unwritten_extent);
+    defer allocator.free(unwritten_inode);
+    putBlock(volume, integration_block_size, 8, unwritten_inode);
+    const unwritten_marker = [_]u8{0xEE} ** integration_block_size;
+    putBlock(volume, integration_block_size, 23, &unwritten_marker);
 
     // --- sub (ino 40, AG1): EXTENTS single-block "block" format dir ---
     var sub_dir = BlockFormatDirBuilder{};
@@ -3191,10 +3217,22 @@ test "the reader scans a hand-built XFS v5 filesystem across two allocation grou
     defer allocator.free(rlink_bytes);
     try testing.expectEqualStrings(rlink_target, rlink_bytes);
 
+    // unwritten.bin: sole extent is unwritten (allocated, never written),
+    // distinct from in_sub.txt's genuine hole (no extent record at all).
+    // Both read back as zeros, but only this one has a real, non-zero block
+    // sitting behind the mapping -- proving the zero-fill comes from the
+    // unwritten flag and not from the backing block happening to be zero.
+    const unwritten_bin = findEntry(&tree, "unwritten.bin").?;
+    try testing.expectEqual(Kind.file, unwritten_bin.kind);
+    const unwritten_bin_bytes = try readEntryAlloc(allocator, unwritten_bin);
+    defer allocator.free(unwritten_bin_bytes);
+    for (unwritten_bin_bytes) |byte| try testing.expectEqual(@as(u8, 0), byte);
+
     // The hardlinked inode's bytes are billed once, not once per name.
     try testing.expectEqual(
         @as(u64, file_txt_content.len + "file.txt".len + hardlinked_content.len +
-            attrs_txt_content.len + in_sub_txt_size + 2 * integration_block_size + rlink_target.len),
+            attrs_txt_content.len + in_sub_txt_size + 2 * integration_block_size + rlink_target.len +
+            unwritten_bin_size),
         tree.content_bytes,
     );
 }
