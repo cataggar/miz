@@ -1,0 +1,67 @@
+{
+  "base": {
+    "id": "/subscriptions/test/resourceGroups/rg-test/providers/Microsoft.Compute/galleries/gallery-test/images/image-test/versions/1.0.0",
+    "name": "1.0.0",
+    "resourceGroup": "rg-test",
+    "location": "swedencentral",
+    "type": "Microsoft.Compute/galleries/images/versions",
+    "provisioningState": "Succeeded",
+    "storageProfile": {
+      "osDiskImage": {
+        "source": {
+          "id": "/subscriptions/test/resourceGroups/rg-test/providers/Microsoft.Compute/disks/disk-test"
+        }
+      },
+      "dataDiskImages": []
+    },
+    "publishingProfile": {
+      "replicationMode": "Shallow",
+      "targetRegions": [
+        {
+          "name": "Sweden Central",
+          "regionalReplicaCount": 1,
+          "storageAccountType": "Standard_LRS"
+        }
+      ]
+    }
+  },
+  "cases": {
+    "bytes-only": {
+      "set": {
+        "storageProfile.osDiskImage.sizeInBytes": 9663676416,
+        "storageProfile.osDiskImage.sizeInGB": null
+      }
+    },
+    "gib-only": {
+      "set": {
+        "storageProfile.osDiskImage.sizeInGB": 9
+      }
+    },
+    "both-consistent": {
+      "set": {
+        "storageProfile.osDiskImage.sizeInBytes": 9663676416,
+        "storageProfile.osDiskImage.sizeInGB": 9
+      }
+    },
+    "both-inconsistent": {
+      "set": {
+        "storageProfile.osDiskImage.sizeInBytes": 9663676416,
+        "storageProfile.osDiskImage.sizeInGB": 8
+      }
+    },
+    "missing": {
+      "set": {}
+    },
+    "wrong-size": {
+      "set": {
+        "storageProfile.osDiskImage.sizeInBytes": 8589934592
+      }
+    },
+    "missing-size-and-source": {
+      "remove": [
+        "storageProfile.osDiskImage.source"
+      ],
+      "set": {}
+    }
+  }
+}

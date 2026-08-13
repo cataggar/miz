@@ -1,0 +1,49 @@
+{
+  "base": {
+    "id": "/subscriptions/test/resourceGroups/rg-test/providers/Microsoft.Compute/disks/disk-test",
+    "name": "disk-test",
+    "resourceGroup": "rg-test",
+    "location": "swedencentral",
+    "type": "Microsoft.Compute/disks",
+    "osType": "Linux",
+    "hyperVGeneration": "V2",
+    "supportedCapabilities": {
+      "architecture": "x64"
+    },
+    "diskState": "Unattached",
+    "provisioningState": "Succeeded"
+  },
+  "cases": {
+    "bytes-only": {
+      "set": {
+        "diskSizeBytes": 9663676416,
+        "diskSizeGb": null
+      }
+    },
+    "gib-only": {
+      "set": {
+        "diskSizeGb": 9
+      }
+    },
+    "both-consistent": {
+      "set": {
+        "diskSizeBytes": 9663676416,
+        "diskSizeGb": 9
+      }
+    },
+    "both-inconsistent": {
+      "set": {
+        "diskSizeBytes": 9663676416,
+        "diskSizeGb": 8
+      }
+    },
+    "missing": {
+      "set": {}
+    },
+    "wrong-size": {
+      "set": {
+        "diskSizeBytes": 8589934592
+      }
+    }
+  }
+}

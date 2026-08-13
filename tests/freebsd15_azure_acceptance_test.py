@@ -1,5 +1,6 @@
 """Static validation tests for scripts/freebsd15_azure_acceptance.sh."""
 
+import json
 import os
 import shutil
 import stat
@@ -12,6 +13,11 @@ SCRIPT = os.path.join(
     "scripts",
     "freebsd15_azure_acceptance.sh",
 )
+METADATA_VALIDATOR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "scripts",
+    "freebsd15_azure_metadata.py",
+)
 REPLICATION_FIXTURES = (
     Path(__file__).parent / "fixtures" / "freebsd15_azure_replication"
 )
@@ -23,6 +29,15 @@ IMAGE_VERSION_MISMATCH_FIXTURE = (
     Path(__file__).parent
     / "fixtures"
     / "freebsd15_azure_image_version_mismatch.json"
+)
+MANAGED_DISK_SIZE_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "freebsd15_azure_managed_disk_sizes.json"
+)
+GALLERY_SIZE_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "freebsd15_azure_gallery_sizes.json"
+)
+VM_SIZE_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "freebsd15_azure_vm_sizes.json"
 )
 
 
@@ -39,6 +54,11 @@ def test_bash_syntax():
         text=True,
     )
     assert result.returncode == 0, f"Syntax error: {result.stderr}"
+
+
+def test_metadata_validator_python_syntax():
+    source = Path(METADATA_VALIDATOR).read_text(encoding="utf-8")
+    compile(source, METADATA_VALIDATOR, "exec")
 
 
 def test_has_strict_mode():
@@ -224,6 +244,97 @@ printf 'status=%s\\n' "$status"
         check=True,
     )
     return result, int(result.stdout.removeprefix("status=").strip())
+
+
+def _set_fixture_path(document, path, value):
+    components = path.split(".")
+    owner = document
+    for component in components[:-1]:
+        owner = owner[component]
+    owner[components[-1]] = value
+
+
+def _remove_fixture_path(document, path):
+    components = path.split(".")
+    owner = document
+    for component in components[:-1]:
+        owner = owner[component]
+    owner.pop(components[-1], None)
+
+
+def _run_size_validation_case(command, fixture_path, case_name):
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    document = json.loads(json.dumps(fixture["base"]))
+    case = fixture["cases"][case_name]
+    for path in case.get("remove", []):
+        _remove_fixture_path(document, path)
+    for path, value in case.get("set", {}).items():
+        _set_fixture_path(document, path, value)
+
+    root = (
+        Path(SCRIPT).parents[1]
+        / ".scratch"
+        / f"freebsd15-size-{os.getpid()}-{command}-{case_name}"
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    document_path = root / "metadata.json"
+    document_path.write_text(json.dumps(document), encoding="utf-8")
+    disk_id = (
+        "/subscriptions/test/resourceGroups/rg-test/providers/Microsoft.Compute/"
+        "disks/disk-test"
+    )
+    arguments = {
+        "managed-disk": [
+            str(document_path),
+            disk_id,
+            "disk-test",
+            "rg-test",
+            "swedencentral",
+            "x64",
+            "9",
+        ],
+        "gallery-image-version": [
+            str(document_path),
+            (
+                "/subscriptions/test/resourceGroups/rg-test/providers/"
+                "Microsoft.Compute/galleries/gallery-test/images/image-test/"
+                "versions/1.0.0"
+            ),
+            "1.0.0",
+            "rg-test",
+            "swedencentral",
+            "Sweden Central",
+            disk_id,
+            "9",
+        ],
+        "vm": [
+            str(document_path),
+            (
+                "/subscriptions/test/resourceGroups/rg-test/providers/"
+                "Microsoft.Compute/virtualMachines/vm-test"
+            ),
+            "vm-test",
+            "rg-test",
+            "swedencentral",
+            "Standard_D2s_v5",
+            (
+                "/subscriptions/test/resourceGroups/rg-test/providers/"
+                "Microsoft.Compute/galleries/gallery-test/images/image-test/"
+                "versions/1.0.0"
+            ),
+            "azureuser",
+            "x64",
+            "9",
+        ],
+    }
+    try:
+        return subprocess.run(
+            [sys.executable, METADATA_VALIDATOR, command, *arguments[command]],
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def _run_image_replication_case(mode, timeout_seconds=5):
@@ -479,6 +590,66 @@ def test_gallery_target_region_does_not_strip_whitespace():
     assert "gallery image-version target location mismatch" in result.stderr
 
 
+def test_managed_disk_size_metadata_shapes():
+    for case_name in ("bytes-only", "gib-only", "both-consistent"):
+        result = _run_size_validation_case(
+            "managed-disk", MANAGED_DISK_SIZE_FIXTURE, case_name
+        )
+        assert result.returncode == 0, (case_name, result.stderr)
+
+    for case_name in ("both-inconsistent", "missing", "wrong-size"):
+        result = _run_size_validation_case(
+            "managed-disk", MANAGED_DISK_SIZE_FIXTURE, case_name
+        )
+        assert result.returncode != 0, case_name
+        assert "managed disk expansion size" in result.stderr
+        assert "expected 9 GiB (9663676416 bytes)" in result.stderr
+
+    inconsistent = _run_size_validation_case(
+        "managed-disk", MANAGED_DISK_SIZE_FIXTURE, "both-inconsistent"
+    )
+    assert '"diskSizeBytes": 9663676416' in inconsistent.stderr
+    assert '"diskSizeGb": 8' in inconsistent.stderr
+
+
+def test_gallery_size_metadata_shapes_and_exact_source_binding():
+    for case_name in ("bytes-only", "gib-only", "both-consistent", "missing"):
+        result = _run_size_validation_case(
+            "gallery-image-version", GALLERY_SIZE_FIXTURE, case_name
+        )
+        assert result.returncode == 0, (case_name, result.stderr)
+
+    for case_name in ("both-inconsistent", "wrong-size"):
+        result = _run_size_validation_case(
+            "gallery-image-version", GALLERY_SIZE_FIXTURE, case_name
+        )
+        assert result.returncode != 0, case_name
+        assert "gallery image-version OS disk size mismatch" in result.stderr
+        assert "expected 9 GiB (9663676416 bytes)" in result.stderr
+
+    missing = _run_size_validation_case(
+        "gallery-image-version", GALLERY_SIZE_FIXTURE, "missing-size-and-source"
+    )
+    assert missing.returncode != 0
+    assert "does not expose the exact managed disk source" in missing.stderr
+    assert "osDiskImage keys" in missing.stderr
+
+
+def test_vm_os_disk_size_metadata_shapes():
+    for case_name in ("bytes-only", "gib-only", "both-consistent"):
+        result = _run_size_validation_case("vm", VM_SIZE_FIXTURE, case_name)
+        assert result.returncode == 0, (case_name, result.stderr)
+
+    for case_name in ("both-inconsistent", "missing", "wrong-size"):
+        result = _run_size_validation_case("vm", VM_SIZE_FIXTURE, case_name)
+        assert result.returncode != 0, case_name
+        assert "VM OS disk size" in result.stderr
+        assert "expected 9 GiB (9663676416 bytes)" in result.stderr
+
+    wrong = _run_size_validation_case("vm", VM_SIZE_FIXTURE, "wrong-size")
+    assert '"managedDisk.sizeInBytes": 8589934592' in wrong.stderr
+
+
 def test_image_replication_failed_blocks_vm_with_diagnostics():
     result, metrics = _run_image_replication_case("failed")
     assert metrics["status"] == "1"
@@ -685,9 +856,11 @@ def test_replication_gate_keeps_owned_resource_group_cleanup_active():
 
 def test_disk_gallery_version_and_vm_source_identities_fail_closed():
     content = Path(SCRIPT).read_text(encoding="utf-8")
+    metadata = Path(METADATA_VALIDATOR).read_text(encoding="utf-8")
+    validation = content + metadata
     assert 'expected_disk_id="/subscriptions/$subscription_id/' in content
     assert 'test "${disk_id,,}" = "${expected_disk_id,,}"' in content
-    assert "managed disk architecture mismatch" in content
+    assert "managed disk architecture mismatch" in validation
     assert 'expected_gallery_id="/subscriptions/$subscription_id/' in content
     assert 'expected_image_definition_id="$expected_gallery_id/images/' in content
     assert 'image_version_id="$expected_image_definition_id/versions/' in content
@@ -697,15 +870,19 @@ def test_disk_gallery_version_and_vm_source_identities_fail_closed():
     assert "gallery image-definition identifier mismatch" in content
     assert (
         "gallery image version is not sourced from the exact managed disk"
-        in content
+        in validation
     )
-    assert "gallery image-version provisioning did not succeed" in content
-    assert "gallery image-version OS disk size mismatch" in content
-    assert "VM is not bound to the exact gallery image version" in content
-    assert "VM OS disk size mismatch" in content
+    assert "gallery image-version provisioning did not succeed" in validation
+    assert '"gallery image-version OS disk"' in validation
+    assert "VM is not bound to the exact gallery image version" in validation
+    assert '"VM OS disk"' in validation
+    assert "size mismatch" in validation
     assert 'expected_vm_id="/subscriptions/$subscription_id/' in content
     assert 'test "${vm_id,,}" = "${expected_vm_id,,}"' in content
-    assert "VM architecture mismatch" in content
+    assert "VM architecture mismatch" in validation
+    assert "freebsd15_azure_metadata.py managed-disk" in content
+    assert "freebsd15_azure_metadata.py gallery-image-version" in content
+    assert "freebsd15_azure_metadata.py vm" in content
     assert content.count(
         'test "$(sha256sum "$asset" | awk \'{print $1}\')" = "$qcow_sha256"'
     ) >= 3
