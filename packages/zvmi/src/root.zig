@@ -34,6 +34,7 @@ pub const fat32 = @import("fat32.zig");
 pub const iso9660 = @import("iso9660.zig");
 pub const squashfs = @import("squashfs.zig");
 pub const ext4 = @import("ext4.zig");
+pub const xfs = @import("xfs.zig");
 pub const bootconfig = @import("bootconfig.zig");
 pub const boot_options = @import("boot_options.zig");
 pub const grub_defaults = @import("grub_defaults.zig");
