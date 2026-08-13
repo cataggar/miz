@@ -121,7 +121,7 @@ report_error() {
 }
 trap 'report_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
-for tool in az azcopy curl python3 qemu-img sha256sum ssh ssh-keygen; do
+for tool in az azcopy curl date python3 qemu-img sha256sum ssh ssh-keygen; do
   command -v "$tool" >/dev/null || {
     echo "::error::Required Azure acceptance tool $tool is unavailable"
     exit 1
@@ -403,6 +403,7 @@ disk_json="$RESULT_DIR/disk.json"
 gallery_json="$RESULT_DIR/gallery.json"
 image_definition_json="$RESULT_DIR/image-definition.json"
 image_version_json="$RESULT_DIR/image-version.json"
+image_replication_json="$RESULT_DIR/image-version-replication.json"
 vm_json="$RESULT_DIR/vm.json"
 mkdir -p "$(dirname -- "$STATE_FILE")"
 rm -f -- "$STATE_FILE" "${STATE_FILE}.group.json" "$vhd" "$private_key" "$private_key.pub"
@@ -424,6 +425,159 @@ cleanup_on_exit() {
 }
 trap cleanup_on_exit EXIT
 trap 'exit 130' INT TERM
+
+replication_epoch_seconds() {
+  date +%s
+}
+
+wait_for_image_version_replication() {
+  local timeout_seconds=${1:-1800}
+  local delay_seconds=${2:-5}
+  local max_delay_seconds=${3:-30}
+  local aggregate_state deadline details elapsed now observation progress sleep_seconds
+  local started_at state
+
+  if [[ ! "$timeout_seconds" =~ ^[1-9][0-9]*$ ||
+        ! "$delay_seconds" =~ ^[1-9][0-9]*$ ||
+        ! "$max_delay_seconds" =~ ^[1-9][0-9]*$ ||
+        "$delay_seconds" -gt "$max_delay_seconds" ]]; then
+    echo "::error::Invalid Azure image replication timeout/backoff configuration" >&2
+    return 1
+  fi
+
+  started_at=$(replication_epoch_seconds)
+  deadline=$((started_at + timeout_seconds))
+  while true; do
+    now=$(replication_epoch_seconds)
+    if [[ -n ${state:-} && "$now" -ge "$deadline" ]]; then
+      elapsed=$((now - started_at))
+      echo "::error::Timed out after ${elapsed}s waiting for Azure image version" \
+        "replication to $AZURE_LOCATION (last state=$state," \
+        "aggregated=$aggregate_state, progress=$progress, details=$details);" \
+        "status saved to $image_replication_json" >&2
+      return 1
+    fi
+
+    if ! az sig image-version show \
+      --resource-group "$resource_group" \
+      --gallery-name "$gallery_name" \
+      --gallery-image-definition "$image_definition_name" \
+      --gallery-image-version "$image_version" \
+      --expand ReplicationStatus \
+      --output json >"$image_replication_json"
+    then
+      echo "::error::Could not query Azure image version replication status;" \
+        "response saved to $image_replication_json" >&2
+      return 1
+    fi
+
+    if ! observation=$(
+      python3 - "$image_replication_json" "$AZURE_LOCATION" <<'PY'
+import json
+import sys
+
+path, expected_region = sys.argv[1:]
+document = json.load(open(path, encoding="utf-8"))
+replication = document.get("replicationStatus")
+if not isinstance(replication, dict):
+    raise SystemExit("image version replicationStatus is missing")
+summary = replication.get("summary")
+if not isinstance(summary, list):
+    raise SystemExit("image version regional replication summary is missing")
+
+
+def same(left, right):
+    return isinstance(left, str) and left.casefold() == right.casefold()
+
+
+matches = [
+    entry
+    for entry in summary
+    if isinstance(entry, dict) and same(entry.get("region"), expected_region)
+]
+if not matches:
+    reported = [
+        entry.get("region")
+        for entry in summary
+        if isinstance(entry, dict) and isinstance(entry.get("region"), str)
+    ]
+    raise SystemExit(
+        f"replication status does not include target region {expected_region!r}; "
+        f"reported regions: {reported!r}"
+    )
+if len(matches) != 1:
+    raise SystemExit(
+        f"replication status includes target region {expected_region!r} "
+        f"{len(matches)} times"
+    )
+
+target = matches[0]
+state = target.get("state")
+if not isinstance(state, str) or not state:
+    raise SystemExit("target region replication state is missing")
+aggregate = replication.get("aggregatedState")
+if aggregate is not None and not isinstance(aggregate, str):
+    raise SystemExit("aggregated replication state is invalid")
+
+
+def compact(value):
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+
+
+print(
+    "\x1f".join(
+        (
+            state,
+            aggregate or "",
+            compact(target.get("progress")),
+            compact(target.get("details")),
+        )
+    )
+)
+PY
+    )
+    then
+      echo "::error::Azure returned invalid regional image replication status;" \
+        "response saved to $image_replication_json" >&2
+      return 1
+    fi
+    IFS=$'\x1f' read -r state aggregate_state progress details <<<"$observation"
+
+    if [[ "${state,,}" == completed ]]; then
+      return
+    fi
+    if [[ "${state,,}" == failed || "${aggregate_state,,}" == failed ]]; then
+      echo "::error::Azure image version replication to $AZURE_LOCATION failed" \
+        "(state=$state, aggregated=$aggregate_state, progress=$progress," \
+        "details=$details); status saved to $image_replication_json" >&2
+      return 1
+    fi
+    case "${state,,}" in
+      replicating|unknown) ;;
+      *)
+        echo "::error::Azure returned unexpected image replication state" \
+          "$state for $AZURE_LOCATION (aggregated=$aggregate_state," \
+          "progress=$progress, details=$details);" \
+          "status saved to $image_replication_json" >&2
+        return 1
+        ;;
+    esac
+
+    now=$(replication_epoch_seconds)
+    if [[ "$now" -ge "$deadline" ]]; then
+      continue
+    fi
+    sleep_seconds=$delay_seconds
+    if [[ "$sleep_seconds" -gt "$((deadline - now))" ]]; then
+      sleep_seconds=$((deadline - now))
+    fi
+    sleep "$sleep_seconds"
+    delay_seconds=$((delay_seconds * 2))
+    if [[ "$delay_seconds" -gt "$max_delay_seconds" ]]; then
+      delay_seconds=$max_delay_seconds
+    fi
+  done
+}
 
 # Derive the fixed VHD
 source_before=$(sha256sum "$asset" | awk '{print $1}')
@@ -843,6 +997,10 @@ if target.get("storageAccountType") not in (None, "Standard_LRS"):
 PY
 test "${image_version_id,,}" = \
   "${expected_image_definition_id,,}/versions/${image_version,,}"
+wait_for_image_version_replication \
+  "${AZURE_IMAGE_REPLICATION_TIMEOUT_SECONDS:-1800}" \
+  "${AZURE_IMAGE_REPLICATION_INITIAL_DELAY_SECONDS:-5}" \
+  "${AZURE_IMAGE_REPLICATION_MAX_DELAY_SECONDS:-30}"
 
 # Create the matching-architecture VM from the exact gallery version with key-only SSH.
 ssh-keygen -q -t ed25519 -N '' -C zvmi-azure-acceptance -f "$private_key"

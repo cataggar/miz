@@ -1,0 +1,13 @@
+{
+  "replicationStatus": {
+    "aggregatedState": "Completed",
+    "summary": [
+      {
+        "region": "westus2",
+        "state": "Completed",
+        "details": "",
+        "progress": 100
+      }
+    ]
+  }
+}

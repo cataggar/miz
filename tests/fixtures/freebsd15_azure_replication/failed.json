@@ -1,0 +1,13 @@
+{
+  "replicationStatus": {
+    "aggregatedState": "Failed",
+    "summary": [
+      {
+        "region": "westus2",
+        "state": "Failed",
+        "details": "Replica copy failed",
+        "progress": 67
+      }
+    ]
+  }
+}

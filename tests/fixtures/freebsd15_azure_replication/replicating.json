@@ -1,0 +1,13 @@
+{
+  "replicationStatus": {
+    "aggregatedState": "InProgress",
+    "summary": [
+      {
+        "region": "westus2",
+        "state": "Replicating",
+        "details": "Copying image blocks",
+        "progress": 42
+      }
+    ]
+  }
+}

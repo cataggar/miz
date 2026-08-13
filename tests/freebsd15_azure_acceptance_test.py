@@ -12,6 +12,9 @@ SCRIPT = os.path.join(
     "scripts",
     "freebsd15_azure_acceptance.sh",
 )
+REPLICATION_FIXTURES = (
+    Path(__file__).parent / "fixtures" / "freebsd15_azure_replication"
+)
 
 
 def test_script_exists_and_executable():
@@ -126,6 +129,106 @@ printf 'status=%s\\nattempts=%s\\nsleeps=%s\\n' \
     return result, metrics
 
 
+def _image_replication_functions():
+    content = Path(SCRIPT).read_text(encoding="utf-8")
+    start = content.index("replication_epoch_seconds() {")
+    end = content.index("\n# Derive the fixed VHD", start)
+    return content[start:end]
+
+
+def _run_image_replication_case(mode, timeout_seconds=5):
+    root = (
+        Path(SCRIPT).parents[1]
+        / ".scratch"
+        / f"freebsd15-image-replication-{os.getpid()}-{mode}"
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.update(
+        {
+            "FIXTURE_DIR": str(REPLICATION_FIXTURES),
+            "REPLICATION_MODE": mode,
+            "REPLICATION_RESULT": str(root / "replication.json"),
+        }
+    )
+    harness = f"""
+set -u -o pipefail
+attempts=0
+sleeps=0
+clock=0
+events=
+delays=
+az() {{
+  if [[ "$1 $2 ${{3:-}}" == "sig image-version show" ]]; then
+    case " $* " in
+      *" --expand ReplicationStatus "*) ;;
+      *) return 9 ;;
+    esac
+    attempts=$((attempts + 1))
+    events="${{events:+$events,}}show"
+    case "$REPLICATION_MODE" in
+      pending-completed)
+        if [[ "$attempts" -eq 1 ]]; then
+          fixture=replicating.json
+        else
+          fixture=completed.json
+        fi
+        ;;
+      failed) fixture=failed.json ;;
+      missing-region) fixture=missing-region.json ;;
+      timeout) fixture=replicating.json ;;
+      *) return 8 ;;
+    esac
+    cat "$FIXTURE_DIR/$fixture"
+    return
+  fi
+  if [[ "$1 $2" == "vm create" ]]; then
+    events="${{events:+$events,}}vm"
+    return
+  fi
+  return 7
+}}
+sleep() {{
+  sleeps=$((sleeps + 1))
+  delays="${{delays:+$delays,}}$1"
+  clock=$((clock + $1))
+}}
+{_image_replication_functions()}
+replication_epoch_seconds() {{
+  printf '%s\\n' "$clock"
+}}
+resource_group=rg-test
+gallery_name=gallery-test
+image_definition_name=image-test
+image_version=1.0.0
+AZURE_LOCATION=westus2
+image_replication_json=$REPLICATION_RESULT
+wait_for_image_version_replication {timeout_seconds} 1 2
+status=$?
+if [[ "$status" -eq 0 ]]; then
+  az vm create
+fi
+printf 'status=%s\\nattempts=%s\\nsleeps=%s\\nclock=%s\\n' \
+  "$status" "$attempts" "$sleeps" "$clock"
+printf 'delays=%s\\nevents=%s\\n' "$delays" "$events"
+"""
+    try:
+        result = subprocess.run(
+            ["bash", "-c", harness],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    metrics = {}
+    for line in result.stdout.splitlines():
+        key, value = line.split("=", 1)
+        metrics[key] = value
+    return result, metrics
+
+
 def test_candidate_key_accepts_supported_profiles():
     for architecture in ("x86_64", "aarch64"):
         for profile in ("ufs-full", "ufs-core", "zfs-full"):
@@ -237,6 +340,51 @@ def test_serial_console_valid_log_succeeds_without_extra_retries():
     assert result.stderr == ""
 
 
+def test_image_replication_pending_then_completed_precedes_vm_creation():
+    result, metrics = _run_image_replication_case("pending-completed")
+    assert metrics == {
+        "status": "0",
+        "attempts": "2",
+        "sleeps": "1",
+        "clock": "1",
+        "delays": "1",
+        "events": "show,show,vm",
+    }
+    assert result.stderr == ""
+
+
+def test_image_replication_failed_blocks_vm_with_diagnostics():
+    result, metrics = _run_image_replication_case("failed")
+    assert metrics["status"] == "1"
+    assert metrics["events"] == "show"
+    assert metrics["sleeps"] == "0"
+    assert "replication to westus2 failed" in result.stderr
+    assert "Replica copy failed" in result.stderr
+
+
+def test_image_replication_missing_target_region_blocks_vm():
+    result, metrics = _run_image_replication_case("missing-region")
+    assert metrics["status"] == "1"
+    assert metrics["events"] == "show"
+    assert metrics["sleeps"] == "0"
+    assert "does not include target region 'westus2'" in result.stderr
+    assert "invalid regional image replication status" in result.stderr
+
+
+def test_image_replication_timeout_uses_bounded_exponential_backoff():
+    result, metrics = _run_image_replication_case("timeout", timeout_seconds=3)
+    assert metrics == {
+        "status": "1",
+        "attempts": "2",
+        "sleeps": "2",
+        "clock": "3",
+        "delays": "1,2",
+        "events": "show,show",
+    }
+    assert "Timed out after 3s" in result.stderr
+    assert "last state=Replicating" in result.stderr
+
+
 def test_serial_console_gate_precedes_result_and_keeps_cleanup_active():
     content = Path(SCRIPT).read_text(encoding="utf-8")
     definition = content.index("require_serial_console_log() {")
@@ -332,7 +480,10 @@ def test_gallery_definition_and_version_precede_provisioned_vm():
     version_create = content.index("az sig image-version create", definition_create)
     version_wait = content.index("az sig image-version wait", version_create)
     version_show = content.index("az sig image-version show", version_wait)
-    vm_create = content.index("az vm create", version_show)
+    replication_wait = content.index(
+        "\nwait_for_image_version_replication \\", version_show
+    )
+    vm_create = content.index("az vm create", replication_wait)
     definition_block = content[definition_create:version_create]
     version_block = content[version_create:version_wait]
     vm_end = content.index("\naz vm show", vm_create)
@@ -345,6 +496,7 @@ def test_gallery_definition_and_version_precede_provisioned_vm():
         < version_create
         < version_wait
         < version_show
+        < replication_wait
         < vm_create
     )
     assert "image_publisher=zvmi" in content
@@ -363,6 +515,10 @@ def test_gallery_definition_and_version_precede_provisioned_vm():
     assert '--target-regions "$AZURE_LOCATION=1=Standard_LRS"' in version_block
     assert "--no-wait" in version_block
     assert "--created" in content[version_wait:version_show]
+    replication_function = _image_replication_functions()
+    assert "--expand ReplicationStatus" in replication_function
+    assert 'if [[ "${state,,}" == completed ]]' in replication_function
+    assert "Timed out after ${elapsed}s" in replication_function
     assert '--image "$image_version_id"' in vm_block
     assert '--admin-username "$admin_username"' in vm_block
     assert "--authentication-type ssh" in vm_block
@@ -378,6 +534,16 @@ def test_gallery_definition_and_version_precede_provisioned_vm():
     assert "az image create" not in content
     assert "az image show" not in content
     assert "--attach-os-disk" not in content
+
+
+def test_replication_gate_keeps_owned_resource_group_cleanup_active():
+    content = Path(SCRIPT).read_text(encoding="utf-8")
+    cleanup_function = content.index("cleanup_on_exit() {")
+    cleanup_trap = content.index("trap cleanup_on_exit EXIT")
+    replication_wait = content.index("\nwait_for_image_version_replication \\")
+    vm_create = content.index("az vm create", replication_wait)
+    assert cleanup_trap < replication_wait < vm_create
+    assert "if ! cleanup_group; then" in content[cleanup_function:cleanup_trap]
 
 
 def test_disk_gallery_version_and_vm_source_identities_fail_closed():
