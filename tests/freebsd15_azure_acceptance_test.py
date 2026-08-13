@@ -165,6 +165,13 @@ def _image_replication_functions():
     return content[start:end]
 
 
+def _managed_boot_diagnostics_functions():
+    content = Path(SCRIPT).read_text(encoding="utf-8")
+    start = content.index("boot_diagnostics_epoch_seconds() {")
+    end = content.index("\nwait_for_image_version_replication() {", start)
+    return content[start:end]
+
+
 def _shell_function(name):
     content = Path(SCRIPT).read_text(encoding="utf-8")
     start = content.index(f"{name}() {{")
@@ -474,6 +481,109 @@ printf 'delays=%s\\nevents=%s\\n' "$delays" "$events"
     return result, metrics
 
 
+def _run_managed_boot_diagnostics_case(mode, timeout_seconds=3):
+    root = (
+        Path(SCRIPT).parents[1]
+        / ".scratch"
+        / f"freebsd15-boot-diagnostics-{os.getpid()}-{mode}"
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    pending = root / "pending.json"
+    ready = root / "ready.json"
+    custom = root / "custom.json"
+    malformed = root / "malformed.json"
+    pending.write_text(json.dumps({"diagnosticsProfile": None}), encoding="utf-8")
+    ready.write_text(
+        json.dumps(
+            {
+                "diagnosticsProfile": {
+                    "bootDiagnostics": {"enabled": True, "storageUri": None}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    custom.write_text(
+        json.dumps(
+            {
+                "diagnosticsProfile": {
+                    "bootDiagnostics": {
+                        "enabled": True,
+                        "storageUri": "https://custom.blob.core.windows.net/",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    malformed.write_text(
+        json.dumps({"diagnosticsProfile": {"bootDiagnostics": []}}),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "BOOT_DIAGNOSTICS_ROOT": str(root),
+            "BOOT_DIAGNOSTICS_MODE": mode,
+        }
+    )
+    harness = f"""
+set -u -o pipefail
+attempts=0
+sleeps=0
+clock=0
+az() {{
+  [[ "$1 $2" == "vm show" ]] || return 8
+  attempts=$((attempts + 1))
+  case "$BOOT_DIAGNOSTICS_MODE" in
+    pending-ready)
+      if [[ "$attempts" -eq 1 ]]; then fixture=pending.json; else fixture=ready.json; fi
+      ;;
+    timeout) fixture=pending.json ;;
+    custom-storage) fixture=custom.json ;;
+    malformed) fixture=malformed.json ;;
+    api-failure)
+      printf 'synthetic Azure API failure\\n' >&2
+      return 1
+      ;;
+    *) return 7 ;;
+  esac
+  cat "$BOOT_DIAGNOSTICS_ROOT/$fixture"
+}}
+sleep() {{
+  sleeps=$((sleeps + 1))
+  clock=$((clock + $1))
+}}
+{_managed_boot_diagnostics_functions()}
+boot_diagnostics_epoch_seconds() {{
+  printf '%s\\n' "$clock"
+}}
+resource_group=rg-test
+vm_name=vm-test
+vm_json=$BOOT_DIAGNOSTICS_ROOT/vm.json
+vm_show_stderr=$BOOT_DIAGNOSTICS_ROOT/vm-show.stderr
+wait_for_managed_boot_diagnostics {timeout_seconds} 1
+status=$?
+printf 'status=%s\\nattempts=%s\\nsleeps=%s\\nclock=%s\\n' \
+  "$status" "$attempts" "$sleeps" "$clock"
+"""
+    try:
+        result = subprocess.run(
+            ["bash", "-c", harness],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    metrics = {}
+    for line in result.stdout.splitlines():
+        key, value = line.split("=", 1)
+        metrics[key] = int(value)
+    return result, metrics
+
+
 def test_candidate_key_accepts_supported_profiles():
     for architecture in ("x86_64", "aarch64"):
         for profile in ("ufs-full", "ufs-core", "zfs-full"):
@@ -724,6 +834,49 @@ def test_vm_os_disk_size_metadata_shapes():
     assert '"managedDisk.sizeInBytes": 8589934592' in wrong.stderr
 
 
+def test_vm_managed_boot_diagnostics_metadata_fails_closed():
+    for case_name in (
+        "boot-storage-empty",
+        "boot-storage-custom",
+        "boot-disabled",
+        "boot-profile-missing",
+    ):
+        result = _run_size_validation_case("vm", VM_SIZE_FIXTURE, case_name)
+        assert result.returncode != 0, case_name
+        assert "VM managed boot diagnostics policy mismatch" in result.stderr
+
+
+def test_managed_boot_diagnostics_pending_then_ready():
+    result, metrics = _run_managed_boot_diagnostics_case("pending-ready")
+    assert metrics == {"status": 0, "attempts": 2, "sleeps": 1, "clock": 1}
+    assert result.stderr == ""
+
+
+def test_managed_boot_diagnostics_wait_is_bounded():
+    result, metrics = _run_managed_boot_diagnostics_case("timeout")
+    assert metrics == {"status": 1, "attempts": 3, "sleeps": 3, "clock": 3}
+    assert "Timed out after 3s and 3 attempts" in result.stderr
+    assert '"diagnosticsProfile": null' in result.stderr
+
+
+def test_managed_boot_diagnostics_rejects_custom_or_malformed_metadata():
+    for mode, message in (
+        ("custom-storage", "storageUri must be absent or null"),
+        ("malformed", "bootDiagnostics is not an object"),
+    ):
+        result, metrics = _run_managed_boot_diagnostics_case(mode)
+        assert metrics == {"status": 1, "attempts": 1, "sleeps": 0, "clock": 0}
+        assert message in result.stderr
+        assert "invalid managed boot diagnostics metadata" in result.stderr
+
+
+def test_managed_boot_diagnostics_timeout_reports_latest_api_failure():
+    result, metrics = _run_managed_boot_diagnostics_case("api-failure")
+    assert metrics == {"status": 1, "attempts": 3, "sleeps": 3, "clock": 3}
+    assert "Latest Azure VM metadata API diagnostics" in result.stderr
+    assert "synthetic Azure API failure" in result.stderr
+
+
 def test_image_replication_failed_blocks_vm_with_diagnostics():
     result, metrics = _run_image_replication_case("failed")
     assert metrics["status"] == "1"
@@ -866,8 +1019,17 @@ def test_gallery_definition_and_version_precede_provisioned_vm():
     vm_create = content.index("az vm create", replication_wait)
     definition_block = content[definition_create:version_create]
     version_block = content[version_create:version_wait]
-    vm_end = content.index("\naz vm show", vm_create)
+    vm_end = content.index("\nexpected_vm_id=", vm_create)
     vm_block = content[vm_create:vm_end]
+    boot_diagnostics_enable = content.index(
+        "az vm boot-diagnostics enable", vm_create
+    )
+    boot_diagnostics_wait = content.index(
+        "\nwait_for_managed_boot_diagnostics \\", boot_diagnostics_enable
+    )
+    vm_validation = content.index(
+        "python3 scripts/freebsd15_azure_metadata.py vm", boot_diagnostics_wait
+    )
 
     assert (
         disk_validation
@@ -910,7 +1072,18 @@ def test_gallery_definition_and_version_precede_provisioned_vm():
     assert '--location "$AZURE_LOCATION"' in vm_block
     assert "--public-ip-sku Standard" in vm_block
     assert "--nsg-rule SSH" in vm_block
-    assert '--boot-diagnostics-storage ""' in vm_block
+    assert "--boot-diagnostics-storage" not in vm_block
+    enable_block = content[boot_diagnostics_enable:boot_diagnostics_wait]
+    assert "--storage" not in enable_block
+    assert (
+        vm_create
+        < boot_diagnostics_enable
+        < boot_diagnostics_wait
+        < vm_validation
+    )
+    assert "Could not enable Azure managed boot diagnostics" in enable_block
+    assert "AZURE_BOOT_DIAGNOSTICS_TIMEOUT_SECONDS:-180" in vm_block
+    assert "AZURE_BOOT_DIAGNOSTICS_POLL_SECONDS:-5" in vm_block
     assert "--specialized" not in vm_block
     assert "az image create" not in content
     assert "az image show" not in content

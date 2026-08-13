@@ -343,7 +343,7 @@ def validate_vm(argv):
     if security_type not in (None, "Standard"):
         raise SystemExit("VM security type mismatch")
     boot = (document.get("diagnosticsProfile") or {}).get("bootDiagnostics") or {}
-    if boot.get("enabled") is not True or boot.get("storageUri") not in (None, ""):
+    if boot.get("enabled") is not True or boot.get("storageUri") is not None:
         raise SystemExit("VM managed boot diagnostics policy mismatch")
     interfaces = (document.get("networkProfile") or {}).get("networkInterfaces")
     if not isinstance(interfaces, list) or len(interfaces) != 1:
