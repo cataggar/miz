@@ -179,6 +179,68 @@ def _shell_function(name):
     return content[start:end]
 
 
+def _guest_contract_script():
+    content = Path(SCRIPT).read_text(encoding="utf-8")
+    start = content.index(
+        '  "/bin/sh -s -- \'$vhd_current_size\' '
+        '\'$runtime_architecture\' \'$FILESYSTEM\'" <<\'GUEST\''
+    )
+    start = content.index("\n", start) + 1
+    end = content.index("\nGUEST\n", start)
+    return content[start:end]
+
+
+def _run_guest_capture_case():
+    root = (
+        Path(SCRIPT).parents[1]
+        / ".scratch"
+        / f"freebsd15-guest-capture-{os.getpid()}"
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    stdout_path = root / "guest-contract.stdout"
+    stderr_path = root / "guest-contract.stderr"
+    harness = f"""
+set -u -o pipefail
+guest_output_line_limit=5
+ssh_options=()
+ssh_target=guest-test
+ssh() {{
+  for number in {{1..12}}; do
+    printf 'stdout-line-%s\\n' "$number"
+    printf 'stderr-line-%s\\n' "$number" >&2
+  done
+  return 37
+}}
+{_shell_function("print_bounded_guest_file")}
+{_shell_function("run_guest_contract")}
+set +e
+run_guest_contract "$GUEST_STDOUT" "$GUEST_STDERR" /bin/sh -s
+status=$?
+set -e
+printf 'status=%s\\n' "$status"
+"""
+    env = os.environ.copy()
+    env.update(
+        {
+            "GUEST_STDOUT": str(stdout_path),
+            "GUEST_STDERR": str(stderr_path),
+        }
+    )
+    try:
+        result = subprocess.run(
+            ["bash", "-c", harness],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+        stdout = stdout_path.read_text(encoding="utf-8")
+        stderr = stderr_path.read_text(encoding="utf-8")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return result, stdout, stderr
+
+
 def _run_location_resolution_case(mode, expected_location="swedencentral"):
     root = (
         Path(SCRIPT).parents[1]
@@ -1197,6 +1259,92 @@ def test_reboot_reconnect_contract():
     assert "reboot_and_reconnect" in content
     assert "pre_reboot_hostkey" in content
     assert "post_reboot_hostkey" in content
+
+
+def test_guest_contract_failure_is_phase_identified_and_fail_closed():
+    result = subprocess.run(
+        ["/bin/sh", "-s", "--", "1", "not-the-local-architecture", "ufs"],
+        input=_guest_contract_script(),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "guest contract failed: phase=runtime-architecture" in result.stderr
+    assert "check=read hw.machine_arch" in result.stderr
+    assert "remote_line=" in result.stderr
+
+
+def test_guest_contract_capture_preserves_status_files_and_bounds_output():
+    result, captured_stdout, captured_stderr = _run_guest_capture_case()
+    assert result.stdout == "status=37\n"
+    assert captured_stdout.startswith("stdout-line-1\n")
+    assert captured_stdout.endswith("stdout-line-12\n")
+    assert captured_stderr.startswith("stderr-line-1\n")
+    assert captured_stderr.endswith("stderr-line-12\n")
+    assert "Remote guest contract SSH failed with status 37" in result.stderr
+    assert "stdout-line-5" in result.stderr
+    assert "stderr-line-5" in result.stderr
+    assert "stdout-line-6" not in result.stderr
+    assert "stderr-line-6" not in result.stderr
+    assert result.stderr.count("[truncated: 12 total lines]") == 2
+
+
+def test_guest_contract_failure_artifacts_and_observations_are_bounded():
+    content = Path(SCRIPT).read_text(encoding="utf-8")
+    workflow = (
+        Path(SCRIPT).parents[1] / ".github/workflows/freebsd15-release.yml"
+    ).read_text(encoding="utf-8")
+    failure_upload = workflow.split(
+        "      - name: Upload failed Azure acceptance diagnostics", 1
+    )[1].split("      - name: Upload exact Azure acceptance result", 1)[0]
+    assert "${{ env.RESULT_DIR }}/guest-contract.stdout" in workflow
+    assert "${{ env.RESULT_DIR }}/guest-contract.stderr" in workflow
+    assert "id_ed25519" not in failure_upload
+    assert "guest_output_line_limit=200" in content
+    assert "guest observation: $observation (first 40 lines)" in content
+    for observation in (
+        "architecture",
+        "sshd-settings",
+        "agent-processes",
+        "agent-service",
+        "network-interfaces",
+        "mounts",
+        "root-device",
+        "gpart-status",
+        "swapinfo",
+        "mdconfig",
+    ):
+        assert f"guest_observation {observation}" in content
+
+
+def test_guest_contract_phase_names_and_result_contracts_are_stable():
+    content = Path(SCRIPT).read_text(encoding="utf-8")
+    for phase in (
+        "runtime-architecture",
+        "sshd-policy",
+        "account-policy",
+        "azure-agent-ready",
+        "network-dhcp",
+        "root-filesystem",
+        "ufs-root-growth",
+        "zfs-root-health",
+        "gpt-health",
+        "swap-policy",
+    ):
+        assert f"begin_guest_phase {phase} " in content
+    assert (
+        'shared_contracts_before_storage="matching-architecture-gen2,'
+        'key-only-ssh,agent-ready,hn0-dhcp,serial-console"'
+    ) in content
+    assert (
+        'shared_contracts_after_storage="root-growth,gpt-healthy,'
+        'reboot-reconnect,instance-identity"'
+    ) in content
+    assert 'filesystem_contracts="zfs-root,zpool-healthy"' in content
+    assert (
+        'filesystem_contracts="ufs-root,ufs-root-partition-growth,'
+        'ufs-root-filesystem-growth,no-os-disk-swap"'
+    ) in content
 
 
 def test_zfs_root_validation():

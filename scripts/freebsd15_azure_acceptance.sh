@@ -1096,6 +1096,45 @@ ssh_options=(
   -o UserKnownHostsFile=/dev/null
 )
 ssh_target="$admin_username@$public_ip"
+guest_contract_stdout="$RESULT_DIR/guest-contract.stdout"
+guest_contract_stderr="$RESULT_DIR/guest-contract.stderr"
+guest_output_line_limit=200
+
+print_bounded_guest_file() {
+  local label=$1 path=$2 line_count
+  printf -- '--- %s (first %s lines) ---\n' \
+    "$label" "$guest_output_line_limit" >&2
+  if [[ ! -s "$path" ]]; then
+    echo "[empty]" >&2
+    return
+  fi
+  sed -n "1,${guest_output_line_limit}p" "$path" >&2
+  line_count=$(wc -l <"$path")
+  if (( line_count > guest_output_line_limit )); then
+    printf '[truncated: %s total lines]\n' "$line_count" >&2
+  fi
+}
+
+run_guest_contract() {
+  local stdout_path=$1 stderr_path=$2 status
+  shift 2
+  if ssh "${ssh_options[@]}" "$ssh_target" "$@" \
+      >"$stdout_path" 2>"$stderr_path"
+  then
+    return
+  else
+    status=$?
+  fi
+  printf '::error::Remote guest contract SSH failed with status %s\n' \
+    "$status" >&2
+  if ! print_bounded_guest_file "remote guest stdout" "$stdout_path"; then
+    echo "::warning::Could not print captured remote guest stdout" >&2
+  fi
+  if ! print_bounded_guest_file "remote guest stderr" "$stderr_path"; then
+    echo "::warning::Could not print captured remote guest stderr" >&2
+  fi
+  return "$status"
+}
 
 wait_for_ssh() {
   for _ in {1..180}; do
@@ -1199,31 +1238,124 @@ fi
 
 # --- SHARED CONTRACTS: agent-ready, hn0-dhcp, root-growth, gpt-healthy ---
 # --- FILESYSTEM CONTRACTS: ufs-root / zfs-root and their growth/health state ---
-ssh "${ssh_options[@]}" "$ssh_target" \
+run_guest_contract "$guest_contract_stdout" "$guest_contract_stderr" \
   "/bin/sh -s -- '$vhd_current_size' '$runtime_architecture' '$FILESYSTEM'" <<'GUEST'
 set -eu
 original_size=$1
 runtime_arch=$2
 expected_filesystem=$3
+guest_phase=initialization
+guest_check="initialize guest contract"
+root_device=
+rootfs=
+root_provider=
+disk=
+root_partition_size=
+root_filesystem_kib=
+root_pool=
+pool_size=
+
+begin_guest_phase() {
+  guest_phase=$1
+  guest_check=$2
+  printf 'guest contract phase: %s\n' "$guest_phase"
+}
+
+guest_observation() {
+  observation=$1
+  shift
+  printf '%s\n' "--- guest observation: $observation (first 40 lines) ---"
+  "$@" 2>&1 | sed -n '1,40p'
+}
+
+guest_contract_diagnostics() {
+  set +e
+  diagnostic_root_device=$root_device
+  diagnostic_rootfs=$rootfs
+  diagnostic_disk=$disk
+  if [ -z "$diagnostic_root_device" ]; then
+    diagnostic_root_device=$(mount -p | awk '$2 == "/" { print $1 }')
+  fi
+  if [ -z "$diagnostic_rootfs" ]; then
+    diagnostic_rootfs=$(mount -p | awk '$2 == "/" { print $3 }')
+  fi
+  if [ -z "$diagnostic_disk" ] && [ "$diagnostic_rootfs" = ufs ]; then
+    diagnostic_root_provider=$(basename "$(realpath "$diagnostic_root_device")")
+    diagnostic_disk=$(printf '%s\n' "$diagnostic_root_provider" |
+      sed -E 's/p[0-9]+$//')
+  elif [ -z "$diagnostic_disk" ] && [ "$diagnostic_rootfs" = zfs ]; then
+    diagnostic_disk=$(zpool status -LP "${diagnostic_root_device%%/*}" |
+      awk '/\/dev\// { sub("^/dev/", "", $1); sub("p[0-9]+$", "", $1); print $1; exit }')
+  fi
+  printf '%s\n' \
+    "guest contract context: phase=$guest_phase check=$guest_check" \
+    "guest storage context: original_size=$original_size root_device=$diagnostic_root_device rootfs=$diagnostic_rootfs root_provider=$root_provider disk=$diagnostic_disk" \
+    "guest size context: root_partition_size=$root_partition_size root_filesystem_kib=$root_filesystem_kib root_pool=$root_pool pool_size=$pool_size"
+  guest_observation architecture uname -a
+  guest_observation architecture-sysctl sysctl -n hw.machine_arch
+  guest_observation sshd-settings /bin/sh -c \
+    "sudo sshd -T 2>&1 | grep -Ei '^(passwordauthentication|kbdinteractiveauthentication) '"
+  guest_observation agent-processes /bin/sh -c \
+    "ps axww -o pid=,ppid=,command= | grep -E '[w]aagent|[a]zure-agent'"
+  guest_observation agent-service service azure_agent status
+  guest_observation network-interfaces ifconfig -a
+  guest_observation mounts mount -p
+  guest_observation root-filesystem df -k /
+  if [ -n "$diagnostic_root_device" ] && [ "$diagnostic_rootfs" = ufs ]; then
+    guest_observation root-device diskinfo "$diagnostic_root_device"
+  elif [ "$diagnostic_rootfs" = zfs ]; then
+    guest_observation zpool-list zpool list -Hp
+    guest_observation zpool-status zpool status -LP
+  fi
+  if [ -n "$diagnostic_disk" ]; then
+    guest_observation gpart-show gpart show "$diagnostic_disk"
+    guest_observation gpart-status gpart status -s "$diagnostic_disk"
+  fi
+  guest_observation swapinfo swapinfo -k
+  guest_observation mdconfig mdconfig -lv
+}
+
+guest_contract_exit() {
+  status=$?
+  trap - EXIT
+  if [ "$status" -eq 0 ]; then
+    exit 0
+  fi
+  line=${LINENO:-unknown}
+  printf 'guest contract failed: phase=%s check=%s status=%s remote_line=%s\n' \
+    "$guest_phase" "$guest_check" "$status" "$line" >&2
+  guest_contract_diagnostics >&2
+  exit "$status"
+}
+trap guest_contract_exit EXIT
 
 # Validate runtime architecture
+begin_guest_phase runtime-architecture "read hw.machine_arch"
 hw_machine=$(sysctl -n hw.machine_arch)
+guest_check="match hw.machine_arch to release architecture"
 test "$hw_machine" = "$runtime_arch"
 
 # key-only-ssh: verify sshd configuration
+begin_guest_phase sshd-policy "read effective sshd configuration"
 sshd_config=$(sudo sshd -T 2>/dev/null)
+guest_check="disable SSH password authentication"
 printf '%s\n' "$sshd_config" | grep -iq '^passwordauthentication no'
+guest_check="disable SSH keyboard-interactive authentication"
 printf '%s\n' "$sshd_config" | grep -iq '^kbdinteractiveauthentication no'
 
 # No default freebsd account, root is locked
+begin_guest_phase account-policy "reject default freebsd account"
 ! id freebsd >/dev/null 2>&1
+guest_check="read root password field"
 root_pw=$(sudo awk -F: '$1=="root"{print $2}' /etc/master.passwd)
+guest_check="require locked root account"
 case "$root_pw" in
   '*LOCKED*'|'*'|'!*'|'!') ;;
-  *) echo "root account is not locked: $root_pw" >&2; exit 1 ;;
+  *) echo "root account is not locked" >&2; exit 1 ;;
 esac
 
 # agent-ready: Azure Agent (waagent or azure-agent) is running
+begin_guest_phase azure-agent-ready "find a running Azure Agent"
 if ! pgrep -f 'python.*waagent' >/dev/null 2>&1 && \
    ! service azure_agent status >/dev/null 2>&1 && \
    ! pgrep azure-agent >/dev/null 2>&1; then
@@ -1232,45 +1364,70 @@ if ! pgrep -f 'python.*waagent' >/dev/null 2>&1 && \
 fi
 
 # hn0-dhcp: network interface has an address via DHCP
+begin_guest_phase network-dhcp "select the Azure network interface"
 if ifconfig hn0 >/dev/null 2>&1; then
+  guest_check="require an IPv4 address on hn0"
   ifconfig hn0 | grep -q 'inet '
 elif ifconfig eth0 >/dev/null 2>&1; then
+  guest_check="require an IPv4 address on eth0"
   ifconfig eth0 | grep -q 'inet '
 else
   # Any Hyper-V NIC
+  guest_check="find a Hyper-V network interface"
   nic=$(ifconfig -l | tr ' ' '\n' | grep -E '^(hn|storvsc)' | head -1)
   test -n "$nic"
+  guest_check="require an IPv4 address on the Hyper-V network interface"
   ifconfig "$nic" | grep -q 'inet '
 fi
 
+begin_guest_phase root-filesystem "identify the root device"
 root_device=$(mount -p | awk '$2 == "/" { print $1 }')
+guest_check="identify the root filesystem type"
 rootfs=$(mount -p | awk '$2 == "/" { print $3 }')
+guest_check="require a nonempty root device"
 test -n "$root_device"
+guest_check="match the expected root filesystem"
 test "$rootfs" = "$expected_filesystem"
 
 case "$expected_filesystem" in
   ufs)
     # ufs-root and UFS growth: both the partition provider and filesystem must
     # have expanded beyond the exact candidate's original virtual size.
+    begin_guest_phase ufs-root-growth "require a UFS root fstab entry"
     grep -Eq '^[^#]+[[:space:]]+/[[:space:]]+ufs[[:space:]]' /etc/fstab
+    guest_check="resolve the UFS root provider"
     root_provider=$(basename "$(realpath "$root_device")")
+    guest_check="identify the UFS root disk"
     disk=$(printf '%s\n' "$root_provider" | sed -E 's/p[0-9]+$//')
+    guest_check="require a partitioned UFS root device"
     test "$disk" != "$root_provider"
+    guest_check="read the UFS root partition size"
     root_partition_size=$(diskinfo "$root_device" | awk '{ print $3 }')
+    guest_check="read the UFS root filesystem size"
     root_filesystem_kib=$(df -k / | awk 'END { print $2 }')
+    guest_check="require UFS root partition growth"
     test "$root_partition_size" -gt "$original_size"
+    guest_check="require UFS root filesystem growth"
     test "$root_filesystem_kib" -gt "$((original_size / 1024))"
     ;;
   zfs)
     # zfs-root, pool health, autoexpand, growth, and absence of swap zvols.
+    begin_guest_phase zfs-root-health "identify the ZFS root pool"
     root_pool=${root_device%%/*}
+    guest_check="require zroot as the root pool"
     test "$root_pool" = zroot
+    guest_check="require a healthy ZFS root pool"
     test "$(zpool status -x "$root_pool")" = "pool '$root_pool' is healthy"
+    guest_check="require ZFS root pool autoexpand"
     test "$(zpool get -H -o value autoexpand "$root_pool")" = on
+    guest_check="read the ZFS root pool size"
     pool_size=$(zpool list -Hp -o size "$root_pool")
+    guest_check="require ZFS root pool growth"
     test "$pool_size" -gt "$original_size"
+    guest_check="identify the ZFS root disk"
     disk=$(zpool status -LP "$root_pool" |
       awk '/\/dev\// { sub("^/dev/", "", $1); sub("p[0-9]+$", "", $1); print $1; exit }')
+    guest_check="reject ZFS swap volumes"
     test -z "$(zfs list -H -o name,org.freebsd:swap -t volume |
       awk '$2 == "on" { print $1 }')"
     ;;
@@ -1281,11 +1438,15 @@ case "$expected_filesystem" in
 esac
 
 # gpt-healthy: the OS disk has a recovered GPT and every provider is healthy.
+begin_guest_phase gpt-health "require a nonempty OS disk"
 test -n "$disk"
+guest_check="reject corrupt GPT metadata"
 ! gpart show "$disk" | grep -q CORRUPT
+guest_check="require every GPT provider status to be OK"
 test "$(gpart status -s "$disk" | awk '{ print $2 }' | sort -u)" = OK
 
 # no-os-disk-swap: positively identify every swap as resource-disk-backed.
+begin_guest_phase swap-policy "define resource-disk provider validation"
 require_resource_disk_provider() {
   provider=$1
   resource_disk=$(printf '%s\n' "$provider" | sed -E 's/(p|s)[0-9]+$//')
@@ -1296,28 +1457,36 @@ require_resource_disk_provider() {
   diskinfo "/dev/$resource_disk" >/dev/null
 }
 
+guest_check="enumerate configured swap devices"
 swapinfo -k | awk 'NR > 1 { print $1 }' | while IFS= read -r swap_device; do
   test -n "$swap_device" || continue
+  guest_check="resolve swap provider $swap_device"
   swap_provider=$(basename "$(realpath "$swap_device")")
   case "$swap_provider" in
     md[0-9]*)
       md_unit=${swap_provider#md}
+      guest_check="resolve md-backed swap vnode $swap_device"
       md_backing=$(mdconfig -lv -u "$md_unit" |
         awk -F '	' '$2 == "vnode" { print $4; exit }')
       if [ -z "$md_backing" ] || [ ! -f "$md_backing" ]; then
         echo "swap md provider is not a resolvable vnode: $swap_device" >&2
         exit 1
       fi
+      guest_check="identify md-backed swap mount $swap_device"
       md_backing_mount=$(df -k "$md_backing" | awk 'END { print $6 }')
+      guest_check="identify md-backed swap device $swap_device"
       md_backing_device=$(df -k "$md_backing" | awk 'END { print $1 }')
       if [ "$md_backing_mount" = / ] || [ "${md_backing_device#/dev/}" = "$md_backing_device" ]; then
         echo "swap vnode is backed by the OS/root filesystem: $md_backing" >&2
         exit 1
       fi
+      guest_check="resolve md-backed swap provider $swap_device"
       md_backing_provider=$(basename "$(realpath "$md_backing_device")")
+      guest_check="require resource-disk backing for $swap_device"
       require_resource_disk_provider "$md_backing_provider"
       ;;
     *p[0-9]*|*s[0-9]*)
+      guest_check="require resource-disk backing for $swap_device"
       require_resource_disk_provider "$swap_provider"
       ;;
     *)
