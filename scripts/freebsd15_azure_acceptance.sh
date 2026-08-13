@@ -369,22 +369,26 @@ candidate_architecture=${candidate[4]}
 [[ "$virtual_size" =~ ^[0-9]+$ ]]
 [[ "$candidate_architecture" == "$ARCHITECTURE" ]]
 
+set_architecture_profile() {
+  case "$1" in
+    aarch64)
+      short_arch=arm64
+      expected_azure_architecture=Arm64
+      runtime_architecture=aarch64
+      azure_image_architecture=Arm64
+      ;;
+    x86_64)
+      short_arch=x64
+      expected_azure_architecture=x64
+      runtime_architecture=amd64
+      azure_image_architecture=x64
+      ;;
+  esac
+}
+
 suffix=${CANDIDATE_KEY//_/-}
 resource_group="zvmi-fb15-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
-case "$ARCHITECTURE" in
-  aarch64)
-    short_arch=arm64
-    expected_azure_architecture=Arm64
-    runtime_architecture=arm64
-    azure_image_architecture=Arm64
-    ;;
-  x86_64)
-    short_arch=x64
-    expected_azure_architecture=x64
-    runtime_architecture=amd64
-    azure_image_architecture=x64
-    ;;
-esac
+set_architecture_profile "$ARCHITECTURE"
 name_seed="${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}${short_arch}"
 disk_name="zvmi-os-${name_seed}"
 gallery_name="zvmifb15${name_seed}"
@@ -1255,6 +1259,100 @@ root_filesystem_kib=
 root_pool=
 pool_size=
 
+privileged_diskinfo() {
+  sudo -n diskinfo "$@"
+}
+
+privileged_gpart() {
+  sudo -n gpart "$@"
+}
+
+privileged_glabel_status() {
+  sudo -n glabel status
+}
+
+privileged_mdconfig() {
+  sudo -n mdconfig "$@"
+}
+
+partition_disk_for_provider() {
+  partition_provider=$1
+  partition_disk=$(printf '%s\n' "$partition_provider" |
+    sed -E 's/(p|s)[0-9]+$//')
+  if [ -z "$partition_disk" ] || [ "$partition_disk" = "$partition_provider" ] ||
+      ! printf '%s\n' "$partition_provider" |
+        grep -Eq '^[[:alnum:]_.-]+(p|s)[0-9]+$'; then
+    echo "provider is not an exact partition provider: $partition_provider" >&2
+    return 1
+  fi
+  printf '%s\n' "$partition_disk"
+}
+
+resolve_guest_provider() {
+  case "$1" in
+    /dev/*) requested_provider=${1#/dev/} ;;
+    /*)
+      echo "guest provider is malformed: $1" >&2
+      return 1
+      ;;
+    *) requested_provider=$1 ;;
+  esac
+  if [ -z "$requested_provider" ]; then
+    echo "guest provider is malformed: $1" >&2
+    return 1
+  fi
+  case "$requested_provider" in
+    */*)
+      resolved_provider=$(
+        privileged_glabel_status |
+          awk -v requested="$requested_provider" '
+            NR == 1 {
+              if (NF != 3 || $1 != "Name" || $2 != "Status" ||
+                  $3 != "Components") {
+                exit 2
+              }
+              next
+            }
+            NF == 0 {
+              next
+            }
+            NF != 3 {
+              exit 3
+            }
+            $1 == requested {
+              if ($3 == "" || $3 ~ /\//) {
+                exit 3
+              }
+              print $3
+              matches++
+            }
+            END {
+              if (matches != 1) {
+                exit 4
+              }
+            }
+          '
+      ) || {
+        echo "GEOM label did not resolve exactly once: $requested_provider" >&2
+        return 1
+      }
+      partition_disk_for_provider "$resolved_provider" >/dev/null || {
+        echo "GEOM label does not resolve to a partition: $requested_provider" >&2
+        return 1
+      }
+      printf '%s\n' "$resolved_provider"
+      ;;
+    *)
+      if ! printf '%s\n' "$requested_provider" |
+          grep -Eq '^[[:alnum:]_.-]+$'; then
+        echo "guest provider is malformed: $1" >&2
+        return 1
+      fi
+      printf '%s\n' "$requested_provider"
+      ;;
+  esac
+}
+
 begin_guest_phase() {
   guest_phase=$1
   guest_check=$2
@@ -1273,23 +1371,33 @@ guest_contract_diagnostics() {
   diagnostic_root_device=$root_device
   diagnostic_rootfs=$rootfs
   diagnostic_disk=$disk
+  diagnostic_root_provider=
   if [ -z "$diagnostic_root_device" ]; then
     diagnostic_root_device=$(mount -p | awk '$2 == "/" { print $1 }')
   fi
   if [ -z "$diagnostic_rootfs" ]; then
     diagnostic_rootfs=$(mount -p | awk '$2 == "/" { print $3 }')
   fi
-  if [ -z "$diagnostic_disk" ] && [ "$diagnostic_rootfs" = ufs ]; then
-    diagnostic_root_provider=$(basename "$(realpath "$diagnostic_root_device")")
-    diagnostic_disk=$(printf '%s\n' "$diagnostic_root_provider" |
-      sed -E 's/p[0-9]+$//')
+  if [ "$diagnostic_rootfs" = ufs ]; then
+    if [ -n "$root_provider" ]; then
+      diagnostic_root_provider=$root_provider
+    elif [ -n "$diagnostic_root_device" ]; then
+      diagnostic_root_provider=$(resolve_guest_provider "$diagnostic_root_device")
+    fi
+    if [ -z "$diagnostic_disk" ] && [ -n "$diagnostic_root_provider" ]; then
+      diagnostic_disk=$(partition_disk_for_provider "$diagnostic_root_provider")
+    fi
   elif [ -z "$diagnostic_disk" ] && [ "$diagnostic_rootfs" = zfs ]; then
-    diagnostic_disk=$(zpool status -LP "${diagnostic_root_device%%/*}" |
-      awk '/\/dev\// { sub("^/dev/", "", $1); sub("p[0-9]+$", "", $1); print $1; exit }')
+    diagnostic_root_provider=$(zpool status -LP "${diagnostic_root_device%%/*}" |
+      awk '/\/dev\// { sub("^/dev/", "", $1); print $1 }')
+    if [ "$(printf '%s\n' "$diagnostic_root_provider" | sed '/^$/d' | wc -l)" -eq 1 ]; then
+      diagnostic_root_provider=$(resolve_guest_provider "$diagnostic_root_provider")
+      diagnostic_disk=$(partition_disk_for_provider "$diagnostic_root_provider")
+    fi
   fi
   printf '%s\n' \
     "guest contract context: phase=$guest_phase check=$guest_check" \
-    "guest storage context: original_size=$original_size root_device=$diagnostic_root_device rootfs=$diagnostic_rootfs root_provider=$root_provider disk=$diagnostic_disk" \
+    "guest storage context: original_size=$original_size root_device=$diagnostic_root_device rootfs=$diagnostic_rootfs root_provider=$diagnostic_root_provider disk=$diagnostic_disk" \
     "guest size context: root_partition_size=$root_partition_size root_filesystem_kib=$root_filesystem_kib root_pool=$root_pool pool_size=$pool_size"
   guest_observation architecture uname -a
   guest_observation architecture-sysctl sysctl -n hw.machine_arch
@@ -1301,18 +1409,19 @@ guest_contract_diagnostics() {
   guest_observation network-interfaces ifconfig -a
   guest_observation mounts mount -p
   guest_observation root-filesystem df -k /
-  if [ -n "$diagnostic_root_device" ] && [ "$diagnostic_rootfs" = ufs ]; then
-    guest_observation root-device diskinfo "$diagnostic_root_device"
+  if [ -n "$diagnostic_root_provider" ] && [ "$diagnostic_rootfs" = ufs ]; then
+    guest_observation root-device privileged_diskinfo \
+      "/dev/$diagnostic_root_provider"
   elif [ "$diagnostic_rootfs" = zfs ]; then
     guest_observation zpool-list zpool list -Hp
     guest_observation zpool-status zpool status -LP
   fi
   if [ -n "$diagnostic_disk" ]; then
-    guest_observation gpart-show gpart show "$diagnostic_disk"
-    guest_observation gpart-status gpart status -s "$diagnostic_disk"
+    guest_observation gpart-show privileged_gpart show "$diagnostic_disk"
+    guest_observation gpart-status privileged_gpart status -s "$diagnostic_disk"
   fi
   guest_observation swapinfo swapinfo -k
-  guest_observation mdconfig mdconfig -lv
+  guest_observation mdconfig privileged_mdconfig -lv
 }
 
 guest_contract_exit() {
@@ -1396,13 +1505,12 @@ case "$expected_filesystem" in
     begin_guest_phase ufs-root-growth "require a UFS root fstab entry"
     grep -Eq '^[^#]+[[:space:]]+/[[:space:]]+ufs[[:space:]]' /etc/fstab
     guest_check="resolve the UFS root provider"
-    root_provider=$(basename "$(realpath "$root_device")")
+    root_provider=$(resolve_guest_provider "$root_device")
     guest_check="identify the UFS root disk"
-    disk=$(printf '%s\n' "$root_provider" | sed -E 's/p[0-9]+$//')
-    guest_check="require a partitioned UFS root device"
-    test "$disk" != "$root_provider"
+    disk=$(partition_disk_for_provider "$root_provider")
     guest_check="read the UFS root partition size"
-    root_partition_size=$(diskinfo "$root_device" | awk '{ print $3 }')
+    root_partition_size=$(privileged_diskinfo "/dev/$root_provider" |
+      awk '{ print $3 }')
     guest_check="read the UFS root filesystem size"
     root_filesystem_kib=$(df -k / | awk 'END { print $2 }')
     guest_check="require UFS root partition growth"
@@ -1424,9 +1532,14 @@ case "$expected_filesystem" in
     pool_size=$(zpool list -Hp -o size "$root_pool")
     guest_check="require ZFS root pool growth"
     test "$pool_size" -gt "$original_size"
+    guest_check="identify the single ZFS root provider"
+    root_provider=$(zpool status -LP "$root_pool" |
+      awk '/\/dev\// { sub("^/dev/", "", $1); print $1 }')
+    test "$(printf '%s\n' "$root_provider" | sed '/^$/d' | wc -l)" -eq 1
+    guest_check="resolve the ZFS root provider"
+    root_provider=$(resolve_guest_provider "$root_provider")
     guest_check="identify the ZFS root disk"
-    disk=$(zpool status -LP "$root_pool" |
-      awk '/\/dev\// { sub("^/dev/", "", $1); sub("p[0-9]+$", "", $1); print $1; exit }')
+    disk=$(partition_disk_for_provider "$root_provider")
     guest_check="reject ZFS swap volumes"
     test -z "$(zfs list -H -o name,org.freebsd:swap -t volume |
       awk '$2 == "on" { print $1 }')"
@@ -1441,32 +1554,33 @@ esac
 begin_guest_phase gpt-health "require a nonempty OS disk"
 test -n "$disk"
 guest_check="reject corrupt GPT metadata"
-! gpart show "$disk" | grep -q CORRUPT
+! privileged_gpart show "$disk" | grep -q CORRUPT
 guest_check="require every GPT provider status to be OK"
-test "$(gpart status -s "$disk" | awk '{ print $2 }' | sort -u)" = OK
+test "$(privileged_gpart status -s "$disk" |
+  awk '{ print $2 }' | sort -u)" = OK
 
 # no-os-disk-swap: positively identify every swap as resource-disk-backed.
 begin_guest_phase swap-policy "define resource-disk provider validation"
 require_resource_disk_provider() {
   provider=$1
-  resource_disk=$(printf '%s\n' "$provider" | sed -E 's/(p|s)[0-9]+$//')
-  if [ "$resource_disk" = "$provider" ] || [ "$resource_disk" = "$disk" ]; then
+  resource_disk=$(partition_disk_for_provider "$provider") || return 1
+  if [ "$resource_disk" = "$disk" ]; then
     echo "swap is not backed by a resource-disk partition: $provider" >&2
     return 1
   fi
-  diskinfo "/dev/$resource_disk" >/dev/null
+  privileged_diskinfo "/dev/$resource_disk" >/dev/null
 }
 
 guest_check="enumerate configured swap devices"
 swapinfo -k | awk 'NR > 1 { print $1 }' | while IFS= read -r swap_device; do
   test -n "$swap_device" || continue
   guest_check="resolve swap provider $swap_device"
-  swap_provider=$(basename "$(realpath "$swap_device")")
+  swap_provider=$(resolve_guest_provider "$swap_device")
   case "$swap_provider" in
     md[0-9]*)
       md_unit=${swap_provider#md}
       guest_check="resolve md-backed swap vnode $swap_device"
-      md_backing=$(mdconfig -lv -u "$md_unit" |
+      md_backing=$(privileged_mdconfig -lv -u "$md_unit" |
         awk -F '	' '$2 == "vnode" { print $4; exit }')
       if [ -z "$md_backing" ] || [ ! -f "$md_backing" ]; then
         echo "swap md provider is not a resolvable vnode: $swap_device" >&2
@@ -1481,7 +1595,7 @@ swapinfo -k | awk 'NR > 1 { print $1 }' | while IFS= read -r swap_device; do
         exit 1
       fi
       guest_check="resolve md-backed swap provider $swap_device"
-      md_backing_provider=$(basename "$(realpath "$md_backing_device")")
+      md_backing_provider=$(resolve_guest_provider "$md_backing_device")
       guest_check="require resource-disk backing for $swap_device"
       require_resource_disk_provider "$md_backing_provider"
       ;;
