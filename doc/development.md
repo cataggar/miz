@@ -6,8 +6,8 @@ Build a fixed, 1 MiB-aligned Azure-compatible VHD from the
 [Azure Linux 4.0 ISO](https://aka.ms/azurelinux-4.0-x86_64.iso) plus a
 container image, ready to upload as an Azure managed disk and run as a VM.
 See [Image building](image-building.md) for the implemented format,
-filesystem, container, boot, `zvmi build-image`, and `zvmi build-iso`
-workflows.
+filesystem, container, boot, `zvmi build-image`, `zvmi build-iso`, and
+`zvmi recustomize-iso` workflows.
 
 ## Layout
 
@@ -95,7 +95,13 @@ zvmi/
                               #   materializeCustomizedRootTree is shared with
                               #   build_iso
         build_iso.zig          # ISO + OCI -> generated LiveOS ISO (ext4
-                              #   rootfs.img in SquashFS + El Torito), `build-iso`
+                              #   rootfs.img in SquashFS + El Torito), `build-iso`;
+                              #   shares writeRootfsImage/wrapSquashfsPayload/
+                              #   OutputIsoTree with recustomize_iso
+        recustomize_iso.zig    # strict ISO in -> customized ISO out; preserves
+                              #   the source tree/metadata/timestamps/volume/El
+                              #   Torito catalog or refuses via the strict gate,
+                              #   `recustomize-iso` (PXE out of scope)
         customize.zig          # the image-customization request: versioned
                               #   public types, planning, preflight, backend
                               #   selection, execution and provenance
@@ -139,7 +145,9 @@ zvmi/
                               #   declares an image build, including the
                               #   registry image an input may name
     iso.zig                 # `addIso`: exported helper for a generated LiveOS
-                              #   ISO product (separate from the disk builder)
+                              #   ISO product (separate from the disk builder);
+                              #   `addRecustomize`: strict preserve-or-refuse ISO
+                              #   recustomization helper
     oci.zig                 # `addOciPull`: pull a layout beside a build
   cli/
     src/
@@ -149,6 +157,9 @@ zvmi/
                               #   tag before the request is built
       iso_builder.zig        # `zvmi-iso-builder`: host driver for the exported
                               #   addIso build helper (`zvmi.build_iso.build`)
+      recustomize_iso_builder.zig  # `zvmi-recustomize-iso-builder`: host driver
+                              #   for the exported addRecustomize helper
+                              #   (`zvmi.recustomize_iso.build`)
       commands/
         create.zig            # `zvmi create`
         info.zig              # `zvmi info`
@@ -161,6 +172,7 @@ zvmi/
         oci.zig               # `zvmi oci` transport and bundle commands
         build_image.zig       # `zvmi build-image`
         build_iso.zig         # `zvmi build-iso`
+        recustomize_iso.zig   # `zvmi recustomize-iso`
         qemu.zig              # `zvmi qemu`
         opts.zig              # shared `-o subformat=...` parsing
   zvminit/                  # minimal PID 1 for real-boot testing of

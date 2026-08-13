@@ -75,6 +75,15 @@ regenerated media still boots, and the El Torito catalog is recreated
 explicitly -- the ISO's *directory tree and boot catalog* are regenerated
 filesystem contents, not preserved byte regions of the original image.
 
+`zvmi recustomize-iso` honors the same `--skip-iso-rootfs` publication policy
+and the same payload replacement, but treats the source Azure Linux ISO as
+authoritative: it preserves the source directory tree, node
+metadata/timestamps, primary volume metadata, and El Torito catalog exactly
+(mapping boot entries back to their source paths, so you never re-specify a
+boot image), replacing only the `LiveOS` payload. If the source ISO carries any
+feature the native writer cannot losslessly reproduce it refuses with a precise
+diagnostic rather than shipping a lossy image. PXE is out of scope.
+
 The recipe creates bounded flavor-specific OCI layers, validates rootfs
 identity cleanup, GPT/root GUIDs, fallback EFI, UKI PE sections/cmdline,
 partition geometry, free space, and OCI architecture/provenance before

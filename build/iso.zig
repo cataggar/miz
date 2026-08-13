@@ -141,20 +141,7 @@ pub fn add(
     dependency: *std.Build.Dependency,
     options: Options,
 ) Result {
-    const container: Container = switch (options.container) {
-        .oci_layout => |layout| blk: {
-            const validate = b.addRunArtifact(dependency.artifact("zvmi-input-validator"));
-            validate.setName(b.fmt("validate OCI layout for {s}", .{options.name}));
-            validate.addDirectoryArg(layout);
-
-            const snapshot = b.addWriteFiles();
-            snapshot.step.name = b.fmt("snapshot OCI layout for {s}", .{options.name});
-            snapshot.step.dependOn(&validate.step);
-            const tracked_layout = snapshot.addCopyDirectory(layout, "oci-layout", .{});
-            break :blk .{ .oci_layout = tracked_layout };
-        },
-        .archive => |archive| .{ .archive = archive },
-    };
+    const container = snapshotContainer(b, dependency, options.name, options.container);
 
     const run = b.addRunArtifact(dependency.artifact("zvmi-iso-builder"));
     run.setName(b.fmt("build iso {s}", .{options.name}));
@@ -169,6 +156,26 @@ pub fn add(
         .path = bundle.path(b, options.output_basename),
         .report_path = bundle.path(b, "report.json"),
         .step = run,
+    };
+}
+
+/// Snapshots an OCI-layout container into the build cache (so additions and
+/// removals invalidate the step) after validating it; archives pass through.
+/// Shared by `add` and `addRecustomize`.
+fn snapshotContainer(b: *std.Build, dependency: *std.Build.Dependency, name: []const u8, container: Container) Container {
+    return switch (container) {
+        .oci_layout => |layout| blk: {
+            const validate = b.addRunArtifact(dependency.artifact("zvmi-input-validator"));
+            validate.setName(b.fmt("validate OCI layout for {s}", .{name}));
+            validate.addDirectoryArg(layout);
+
+            const snapshot = b.addWriteFiles();
+            snapshot.step.name = b.fmt("snapshot OCI layout for {s}", .{name});
+            snapshot.step.dependOn(&validate.step);
+            const tracked_layout = snapshot.addCopyDirectory(layout, "oci-layout", .{});
+            break :blk .{ .oci_layout = tracked_layout };
+        },
+        .archive => |archive| .{ .archive = archive },
     };
 }
 
@@ -204,7 +211,7 @@ fn configureRequest(
     if (options.root_selinux_label) |label| run.addArgs(&.{ "--root-selinux-label", label });
     if (options.source_date_epoch) |epoch| run.addArgs(&.{ "--source-date-epoch", b.fmt("{d}", .{epoch}) });
     addLimitArgs(b, run, options.limits);
-    addCustomizationArgs(b, run, options) catch @panic("failed to materialize iso customization");
+    addCustomizationArgs(b, run, options.name, options.os, options.generalization) catch @panic("failed to materialize iso customization");
     if (options.verbose) run.addArg("--verbose");
 }
 
@@ -217,21 +224,22 @@ fn addLimitArgs(b: *std.Build, run: *std.Build.Step.Run, limits: ImportLimits) v
         }
     }
 }
-
 fn addCustomizationArgs(
     b: *std.Build,
     run: *std.Build.Step.Run,
-    options: Options,
+    name: []const u8,
+    os: OsCustomization,
+    generalization: GeneralizationPolicy,
 ) !void {
-    if (!hasCustomization(options.os, options.generalization)) return;
+    if (!hasCustomization(os, generalization)) return;
 
-    const operations = try b.allocator.alloc(customization_wire.FilesystemOperation, options.os.filesystem.len);
+    const operations = try b.allocator.alloc(customization_wire.FilesystemOperation, os.filesystem.len);
     var sources = std.array_list.Managed(std.Build.LazyPath).init(b.allocator);
     defer sources.deinit();
     const inline_files = b.addWriteFiles();
-    inline_files.step.name = b.fmt("materialize inline customization for {s}", .{options.name});
+    inline_files.step.name = b.fmt("materialize inline customization for {s}", .{name});
 
-    for (options.os.filesystem, 0..) |operation, index| {
+    for (os.filesystem, 0..) |operation, index| {
         operations[index] = switch (operation) {
             .put_file => |file| blk: {
                 const source: std.Build.LazyPath = switch (file.source) {
@@ -256,17 +264,17 @@ fn addCustomizationArgs(
     const configuration = customization_wire.Configuration{
         .os = .{
             .filesystem = operations,
-            .hostname = options.os.hostname,
-            .groups = options.os.groups,
-            .users = options.os.users,
-            .services = options.os.services,
-            .kernel_modules = options.os.kernel_modules,
+            .hostname = os.hostname,
+            .groups = os.groups,
+            .users = os.users,
+            .services = os.services,
+            .kernel_modules = os.kernel_modules,
         },
-        .generalization = options.generalization,
+        .generalization = generalization,
     };
     const json = try std.json.Stringify.valueAlloc(b.allocator, configuration, .{});
     const config_files = b.addWriteFiles();
-    config_files.step.name = b.fmt("write iso customization config for {s}", .{options.name});
+    config_files.step.name = b.fmt("write iso customization config for {s}", .{name});
     const config_path = config_files.add("customization.json", json);
 
     run.addArg("--customization-config");
@@ -284,6 +292,104 @@ fn hasCustomization(os: OsCustomization, generalization: GeneralizationPolicy) b
         return true;
     }
     return generalization != .none;
+}
+
+// ===========================================================================
+// recustomize-iso: strict preserve-or-refuse ISO -> customized ISO helper
+// ===========================================================================
+
+/// Options for the strict `addRecustomize` helper. Unlike `Options` it exposes
+/// no boot-image or volume-id overrides: `recustomize-iso` preserves the source
+/// El Torito catalog and volume metadata, or refuses. PXE is out of scope.
+pub const RecustomizeOptions = struct {
+    name: []const u8,
+    iso: std.Build.LazyPath,
+    container: Container,
+    /// ext4 rootfs.img size before SquashFS wrapping. Rounded up to the ext4
+    /// block size; must be large enough to hold the customized tree.
+    rootfs_size: u64,
+    /// Basename of the recustomized ISO inside the result bundle.
+    output_basename: []const u8,
+    /// LiveOS payload path in the source ISO to replace. Null discovers it.
+    rootfs_path_in_iso: ?[]const u8 = null,
+    /// Path of the ext4 image inside the regenerated SquashFS.
+    nested_rootfs_path: ?[]const u8 = null,
+    squashfs_compression: Compression = .zstd,
+    skip_iso_rootfs: bool = false,
+    architecture: ?Architecture = null,
+    ext4_label: []const u8 = "rootfs",
+    journal: bool = false,
+    journal_size: ?u64 = null,
+    root_selinux_label: ?[]const u8 = null,
+    /// Stamp this POSIX timestamp into the ext4/SquashFS/regenerated payload and
+    /// derive a fixed root filesystem UUID from it for a reproducible ISO.
+    source_date_epoch: ?u32 = null,
+    os: OsCustomization = .{},
+    generalization: GeneralizationPolicy = .none,
+    limits: ImportLimits = .{},
+    verbose: bool = false,
+};
+
+pub const RecustomizeResult = struct {
+    /// The recustomized ISO.
+    path: std.Build.LazyPath,
+    /// A machine-readable JSON preservation report: source hash, output
+    /// hash/size, source/output volume metadata, replaced payload path,
+    /// customized root-tree digest, preserved node count, preserved boot
+    /// entries/platforms, and whether the strict inspection was clean.
+    report_path: std.Build.LazyPath,
+    step: *std.Build.Step.Run,
+};
+
+/// Strictly recustomizes a source LiveOS ISO during a consumer's build: the
+/// source directory tree, node metadata/timestamps, volume metadata, and El
+/// Torito catalog are preserved and only the LiveOS payload is replaced, or the
+/// build step fails with a precise diagnostic. Yields the ISO plus a
+/// machine-readable preservation report.
+pub fn addRecustomize(
+    b: *std.Build,
+    dependency: *std.Build.Dependency,
+    options: RecustomizeOptions,
+) RecustomizeResult {
+    const container = snapshotContainer(b, dependency, options.name, options.container);
+
+    const run = b.addRunArtifact(dependency.artifact("zvmi-recustomize-iso-builder"));
+    run.setName(b.fmt("recustomize iso {s}", .{options.name}));
+    run.has_side_effects = true;
+
+    run.addArg("--iso");
+    run.addFileArg(options.iso);
+    run.addArg("--container");
+    switch (container) {
+        .oci_layout => |layout| run.addDirectoryArg(layout),
+        .archive => |archive| run.addFileArg(archive),
+    }
+    run.addArgs(&.{ "--rootfs-size", b.fmt("{d}", .{options.rootfs_size}) });
+    if (options.rootfs_path_in_iso) |path| run.addArgs(&.{ "--rootfs-path", path });
+    if (options.nested_rootfs_path) |path| run.addArgs(&.{ "--nested-rootfs-path", path });
+    if (options.squashfs_compression != .zstd) {
+        run.addArgs(&.{ "--squashfs-compression", options.squashfs_compression.cliName() });
+    }
+    if (options.skip_iso_rootfs) run.addArg("--skip-iso-rootfs");
+    if (options.architecture) |arch| run.addArgs(&.{ "--architecture", arch.cliName() });
+    if (!std.mem.eql(u8, options.ext4_label, "rootfs")) run.addArgs(&.{ "--ext4-label", options.ext4_label });
+    if (options.journal) run.addArg("--journal");
+    if (options.journal_size) |size| run.addArgs(&.{ "--journal-size", b.fmt("{d}", .{size}) });
+    if (options.root_selinux_label) |label| run.addArgs(&.{ "--root-selinux-label", label });
+    if (options.source_date_epoch) |epoch| run.addArgs(&.{ "--source-date-epoch", b.fmt("{d}", .{epoch}) });
+    addLimitArgs(b, run, options.limits);
+    addCustomizationArgs(b, run, options.name, options.os, options.generalization) catch @panic("failed to materialize recustomize customization");
+    if (options.verbose) run.addArg("--verbose");
+
+    run.addArgs(&.{ "--iso-basename", options.output_basename });
+    run.addArg("--bundle-output");
+    const bundle = run.addOutputDirectoryArg(b.fmt("{s}-result", .{options.name}));
+
+    return .{
+        .path = bundle.path(b, options.output_basename),
+        .report_path = bundle.path(b, "report.json"),
+        .step = run,
+    };
 }
 
 test {

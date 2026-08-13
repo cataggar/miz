@@ -47,6 +47,9 @@ pub const IsoOsCustomization = iso_build.OsCustomization;
 pub const IsoOptions = iso_build.Options;
 pub const IsoResult = iso_build.Result;
 pub const addIso = iso_build.add;
+pub const RecustomizeIsoOptions = iso_build.RecustomizeOptions;
+pub const RecustomizeIsoResult = iso_build.RecustomizeResult;
+pub const addRecustomizeIso = iso_build.addRecustomize;
 
 test {
     std.testing.refAllDecls(oci_build);
@@ -268,6 +271,31 @@ pub fn build(b: *std.Build) void {
         "Run the host ISO builder's argument tests",
     );
     iso_builder_test_step.dependOn(&run_iso_builder_tests.step);
+
+    // Host-only recustomize-iso builder used by the exported `addRecustomize`
+    // build helper. Kept apart from the iso builder since it drives the strict
+    // preserve-or-refuse product and emits a preservation report.
+    const recustomize_iso_builder_exe = b.addExecutable(.{
+        .name = "zvmi-recustomize-iso-builder",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cli/src/recustomize_iso_builder.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zvmi", .module = host_zvmi_mod },
+            },
+        }),
+    });
+    b.installArtifact(recustomize_iso_builder_exe);
+    const recustomize_iso_builder_tests = b.addTest(.{
+        .root_module = recustomize_iso_builder_exe.root_module,
+    });
+    const run_recustomize_iso_builder_tests = b.addRunArtifact(recustomize_iso_builder_tests);
+    const recustomize_iso_builder_test_step = b.step(
+        "test-recustomize-iso-builder",
+        "Run the host recustomize-iso builder's argument tests",
+    );
+    recustomize_iso_builder_test_step.dependOn(&run_recustomize_iso_builder_tests.step);
 
     const preserved_image_wire_mod = b.createModule(.{
         .root_source_file = b.path("packages/zvmi/src/preserved_image_wire.zig"),

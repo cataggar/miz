@@ -2036,6 +2036,95 @@ pub const BootEntry = struct {
     bootable: bool = true,
 };
 
+/// A single El Torito boot image entry within a `BootCatalogLayout`. Unlike
+/// `BootEntry` it carries no platform id: the platform is inherited from the
+/// validation entry (for the default entry) or the governing section header
+/// (for section entries), exactly as El Torito lays the catalog out on disk.
+/// `image_path` names a regular file already present in the source tree; its
+/// assigned LBA is wired into the catalog.
+pub const BootImageEntry = struct {
+    /// Root-relative path (no leading slash) of the boot image file.
+    image_path: []const u8,
+    /// Load segment in real-mode paragraphs; 0 selects the El Torito default
+    /// (0x07C0). Ignored by UEFI firmware but preserved in the catalog.
+    load_segment: u16 = 0,
+    /// System type byte (partition type of the boot image).
+    system_type: u8 = 0,
+    /// Virtual 512-byte sectors to load; 0 lets the writer derive it from the
+    /// boot image size.
+    load_sectors: u16 = 0,
+    bootable: bool = true,
+};
+
+/// A section header plus its entries, reproduced verbatim so a rewrite can
+/// preserve a source catalog's section grouping, order, and id strings.
+pub const BootCatalogSection = struct {
+    /// Section header platform id; the section's entries inherit it.
+    platform: u8,
+    /// True emits a final section header (0x91); false emits a "more headers
+    /// follow" header (0x90). Reproduces the source's final-vs-more indicator.
+    final: bool = true,
+    /// 28-byte section header id string, emitted verbatim.
+    id_string: [28]u8 = [_]u8{0} ** 28,
+    /// Section entries, in catalog order.
+    entries: []const BootImageEntry,
+};
+
+/// A fully specified El Torito boot catalog layout for exact reproduction. When
+/// set on `WriteOptions.boot_catalog` it wholly determines the catalog and
+/// `boot_entries` is ignored: the validation entry (platform assignment plus its
+/// 24-byte id string), the initial/default entry, and the section headers and
+/// their entries are emitted in the given order. `recustomize-iso` builds this
+/// from `Reader.inspectForRewrite` so a source catalog round-trips byte-for-byte
+/// within the supported (no-emulation) model; authoring callers such as
+/// `build-iso` keep using the simpler `boot_entries` convention and leave this
+/// null. The whole catalog must fit in one 2048-byte logical sector.
+pub const BootCatalogLayout = struct {
+    /// Validation entry platform id; the default entry inherits it.
+    validation_platform: u8,
+    /// Validation entry 24-byte developer id string, emitted verbatim.
+    validation_id: [24]u8 = [_]u8{0} ** 24,
+    /// The initial/default boot entry (immediately follows the validation
+    /// entry and inherits `validation_platform`).
+    default_entry: BootImageEntry,
+    /// Section headers and their entries, in catalog order.
+    sections: []const BootCatalogSection = &.{},
+};
+
+/// Projects a platform-tagged `BootEntry` onto the platform-less
+/// `BootImageEntry` the catalog emitter writes; the platform is carried by the
+/// validation entry / section header, not the 32-byte boot entry itself.
+fn toImageEntry(entry: BootEntry) BootImageEntry {
+    return .{
+        .image_path = entry.image_path,
+        .load_segment = entry.load_segment,
+        .system_type = entry.system_type,
+        .load_sectors = entry.load_sectors,
+        .bootable = entry.bootable,
+    };
+}
+
+/// Writes the 32-byte El Torito validation entry into `cat[0..32]`: header id
+/// 0x01, platform id, up to 24 bytes of developer id string at [4..28], the
+/// 0x55AA key signature, and the checksum word chosen so all 16 words sum to
+/// zero. The id string is space for the whole 24-byte field (zero-padded).
+fn writeValidationEntry(cat: []u8, platform: u8, id_string: []const u8) void {
+    cat[0] = 0x01;
+    cat[1] = platform;
+    @memset(cat[4..28], 0);
+    const n = @min(id_string.len, 24);
+    @memcpy(cat[4..][0..n], id_string[0..n]);
+    cat[30] = 0x55;
+    cat[31] = 0xAA;
+    var sum: u16 = 0;
+    var i: usize = 0;
+    while (i < 32) : (i += 2) {
+        if (i == 28) continue;
+        sum +%= std.mem.readInt(u16, cat[i..][0..2], .little);
+    }
+    std.mem.writeInt(u16, cat[28..30], (~sum +% 1), .little);
+}
+
 pub const WriteOptions = struct {
     /// Volume identifier written to the primary volume descriptor (d-chars,
     /// truncated/space-padded to 32 bytes).
@@ -2051,8 +2140,14 @@ pub const WriteOptions = struct {
     /// Application identifier (a-chars, truncated/space-padded to 128 bytes).
     application_id: []const u8 = "",
     /// El Torito boot entries. Empty means a plain (non-bootable) ISO. At most
-    /// one entry per platform is supported.
+    /// one entry per platform is supported. Ignored when `boot_catalog` is set.
     boot_entries: []const BootEntry = &.{},
+    /// Precise El Torito catalog layout for exact reproduction. When non-null it
+    /// wholly determines the boot catalog (validation platform assignment and
+    /// 24-byte id string, section grouping/order and 28-byte id strings, and
+    /// entry order/fields) and `boot_entries` is ignored. When null the writer
+    /// emits `boot_entries` using its default BIOS-first authoring convention.
+    boot_catalog: ?BootCatalogLayout = null,
 };
 
 pub const WriteResult = struct {
@@ -2074,6 +2169,7 @@ pub const WriteError = error{
     TooManyBootEntries,
     DuplicateBootPlatform,
     BootImageNotFound,
+    BootCatalogTooLarge,
     ContentReadShort,
     SystemUseAreaTooLong,
 };
@@ -2392,7 +2488,7 @@ const IsoWriter = struct {
     }
 
     fn assignLayout(self: *IsoWriter) anyerror!void {
-        const has_boot = self.options.boot_entries.len > 0;
+        const has_boot = self.hasBoot();
         try self.validateBootEntries();
 
         var lba: u32 = system_area_sectors;
@@ -2440,7 +2536,15 @@ const IsoWriter = struct {
         self.total_sectors = lba;
     }
 
+    fn hasBoot(self: *const IsoWriter) bool {
+        return self.options.boot_catalog != null or self.options.boot_entries.len > 0;
+    }
+
     fn validateBootEntries(self: *IsoWriter) anyerror!void {
+        if (self.options.boot_catalog) |layout| {
+            try self.validateBootCatalogLayout(layout);
+            return;
+        }
         if (self.options.boot_entries.len == 0) return;
         if (self.options.boot_entries.len > 2) return error.TooManyBootEntries;
         var seen_bios = false;
@@ -2458,6 +2562,24 @@ const IsoWriter = struct {
             }
             _ = self.findFileNode(entry.image_path) orelse return error.BootImageNotFound;
         }
+    }
+
+    /// Validates an exact `BootCatalogLayout`: every referenced boot image must
+    /// resolve to a modeled file, and the whole catalog (validation entry,
+    /// default entry, and each section header plus its entries) must fit in a
+    /// single 2048-byte logical sector, which is all El Torito lays out and all
+    /// the reader models.
+    fn validateBootCatalogLayout(self: *IsoWriter, layout: BootCatalogLayout) anyerror!void {
+        _ = self.findFileNode(layout.default_entry.image_path) orelse return error.BootImageNotFound;
+        var bytes: usize = 64; // validation entry (32) + default entry (32)
+        for (layout.sections) |section| {
+            bytes += 32; // section header
+            for (section.entries) |entry| {
+                _ = self.findFileNode(entry.image_path) orelse return error.BootImageNotFound;
+                bytes += 32;
+            }
+        }
+        if (bytes > sector_size) return error.BootCatalogTooLarge;
     }
 
     fn findFileNode(self: *IsoWriter, path: []const u8) ?usize {
@@ -2500,13 +2622,13 @@ const IsoWriter = struct {
 
     fn emit(self: *IsoWriter, source: TreeSource) anyerror!void {
         try self.emitPrimaryVolumeDescriptor();
-        if (self.options.boot_entries.len > 0) try self.emitBootRecord();
+        if (self.hasBoot()) try self.emitBootRecord();
         try self.emitTerminator();
         try self.emitPathTable(true);
         try self.emitPathTable(false);
         try self.emitDirectories();
         try self.emitContinuation();
-        if (self.options.boot_entries.len > 0) try self.emitBootCatalog();
+        if (self.hasBoot()) try self.emitBootCatalog();
         try self.emitFiles(source);
         try self.padImage();
     }
@@ -2713,9 +2835,20 @@ const IsoWriter = struct {
 
     fn emitBootCatalog(self: *IsoWriter) anyerror!void {
         var cat = [_]u8{0} ** sector_size;
+        if (self.options.boot_catalog) |layout| {
+            self.emitBootCatalogLayout(&cat, layout);
+        } else {
+            self.emitBootCatalogFromEntries(&cat);
+        }
+        try self.writeSector(self.boot_catalog_lba, &cat);
+    }
 
-        // Order: BIOS first (if present) becomes the validation platform and
-        // default entry; the remaining platform is emitted as a section.
+    /// Emits a boot catalog from `boot_entries` using the default authoring
+    /// convention: BIOS (if present) becomes the validation platform and default
+    /// entry; the remaining platform is emitted as a final section. Id strings
+    /// are left empty. This preserves `build-iso`'s historical output byte for
+    /// byte.
+    fn emitBootCatalogFromEntries(self: *IsoWriter, cat: []u8) void {
         var default_entry: ?BootEntry = null;
         var section_entry: ?BootEntry = null;
         for (self.options.boot_entries) |entry| {
@@ -2729,32 +2862,41 @@ const IsoWriter = struct {
         }
         const default = default_entry.?;
 
-        // Validation entry.
-        cat[0] = 0x01;
-        cat[1] = @intFromEnum(default.platform);
-        cat[30] = 0x55;
-        cat[31] = 0xAA;
-        var sum: u16 = 0;
-        var i: usize = 0;
-        while (i < 32) : (i += 2) {
-            if (i == 28) continue;
-            sum +%= std.mem.readInt(u16, cat[i..][0..2], .little);
-        }
-        std.mem.writeInt(u16, cat[28..30], (~sum +% 1), .little);
-
-        self.writeBootEntry(cat[32..64], default);
+        writeValidationEntry(cat, @intFromEnum(default.platform), &.{});
+        self.writeBootImageEntry(cat[32..64], toImageEntry(default));
 
         if (section_entry) |entry| {
             cat[64] = 0x91; // final section header
             cat[65] = @intFromEnum(entry.platform);
             std.mem.writeInt(u16, cat[66..68], 1, .little);
-            self.writeBootEntry(cat[96..128], entry);
+            self.writeBootImageEntry(cat[96..128], toImageEntry(entry));
         }
-
-        try self.writeSector(self.boot_catalog_lba, &cat);
     }
 
-    fn writeBootEntry(self: *IsoWriter, dst: []u8, entry: BootEntry) void {
+    /// Emits a boot catalog that reproduces `layout` exactly: the validation
+    /// entry's platform and 24-byte id string, the default entry, and each
+    /// section header (platform, final-vs-more indicator, 28-byte id string)
+    /// followed by its entries in order. `validateBootCatalogLayout` has already
+    /// guaranteed every image resolves and the whole catalog fits one sector.
+    fn emitBootCatalogLayout(self: *IsoWriter, cat: []u8, layout: BootCatalogLayout) void {
+        writeValidationEntry(cat, layout.validation_platform, &layout.validation_id);
+        self.writeBootImageEntry(cat[32..64], layout.default_entry);
+
+        var offset: usize = 64;
+        for (layout.sections) |section| {
+            cat[offset] = if (section.final) 0x91 else 0x90;
+            cat[offset + 1] = section.platform;
+            std.mem.writeInt(u16, cat[offset + 2 ..][0..2], @intCast(section.entries.len), .little);
+            @memcpy(cat[offset + 4 .. offset + 32], &section.id_string);
+            offset += 32;
+            for (section.entries) |entry| {
+                self.writeBootImageEntry(cat[offset .. offset + 32], entry);
+                offset += 32;
+            }
+        }
+    }
+
+    fn writeBootImageEntry(self: *IsoWriter, dst: []u8, entry: BootImageEntry) void {
         const node_index = self.findFileNode(entry.image_path).?;
         const image_lba = self.nodes[node_index].extent_lba;
         const image_size = self.nodes[node_index].file_size;
@@ -3511,6 +3653,76 @@ test "iso writer emits dual BIOS and UEFI el torito catalog" {
     const uefi_idx = try reader.lookup("/EFI/efiboot.img");
     try std.testing.expectEqual(reader.getEntry(bios_idx).extents[0].lba, catalog.entries[0].image_lba);
     try std.testing.expectEqual(reader.getEntry(uefi_idx).extents[0].lba, catalog.entries[1].image_lba);
+}
+
+test "iso writer reproduces an exact boot catalog layout: UEFI validation/default + BIOS section with id strings" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-iso-writer-exact-layout.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const ts = dualBootTestSource();
+    var validation_id = [_]u8{0} ** 24;
+    @memcpy(validation_id[0..11], "ZVMI-VALID.");
+    var section_id = [_]u8{0} ** 28;
+    @memcpy(section_id[0..13], "ZVMI-SECTION.");
+
+    // Exact layout the default `boot_entries` convention could never emit: the
+    // UEFI entry is the validation/default (not BIOS-first), and the BIOS entry
+    // lives in a section carrying a non-empty id string.
+    _ = try writeImagePath(allocator, io, path, ts.source(), .{
+        .boot_catalog = .{
+            .validation_platform = boot_platform_uefi,
+            .validation_id = validation_id,
+            .default_entry = .{ .image_path = "EFI/efiboot.img", .load_sectors = 4, .bootable = true },
+            .sections = &.{
+                .{
+                    .platform = boot_platform_bios,
+                    .final = true,
+                    .id_string = section_id,
+                    .entries = &.{
+                        .{ .image_path = "boot/bios.img", .load_segment = 0x7C0, .system_type = 0x12, .load_sectors = 8 },
+                    },
+                },
+            },
+        },
+    });
+
+    // The parsed catalog keeps UEFI as the validation platform and preserves the
+    // section header sequence and both entries' fields in order.
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    var catalog = try readBootCatalog(allocator, io, file);
+    defer catalog.deinit(allocator);
+    try std.testing.expectEqual(boot_platform_uefi, catalog.validation_platform);
+    try std.testing.expectEqualSlices(u8, &validation_id, &catalog.validation.id_string);
+    try std.testing.expectEqual(@as(usize, 1), catalog.headers.len);
+    try std.testing.expectEqual(boot_platform_bios, catalog.headers[0].platform);
+    try std.testing.expect(catalog.headers[0].final);
+    try std.testing.expectEqualSlices(u8, &section_id, &catalog.headers[0].id_string);
+
+    try std.testing.expectEqual(@as(usize, 2), catalog.entries.len);
+    try std.testing.expectEqual(BootEntryKind.default, catalog.entries[0].kind);
+    try std.testing.expectEqual(boot_platform_uefi, catalog.entries[0].platform);
+    try std.testing.expectEqual(@as(u16, 4), catalog.entries[0].load_sectors);
+    try std.testing.expectEqual(BootEntryKind.section, catalog.entries[1].kind);
+    try std.testing.expectEqual(boot_platform_bios, catalog.entries[1].platform);
+    try std.testing.expectEqual(@as(u16, 0x7C0), catalog.entries[1].load_segment);
+    try std.testing.expectEqual(@as(u8, 0x12), catalog.entries[1].system_type);
+    try std.testing.expectEqual(@as(u16, 8), catalog.entries[1].load_sectors);
+
+    // Both boot images still map to their real files and the image survives the
+    // strict rewrite gate unchanged.
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    const uefi_idx = try reader.lookup("/EFI/efiboot.img");
+    const bios_idx = try reader.lookup("/boot/bios.img");
+    try std.testing.expectEqual(reader.getEntry(uefi_idx).extents[0].lba, catalog.entries[0].image_lba);
+    try std.testing.expectEqual(reader.getEntry(bios_idx).extents[0].lba, catalog.entries[1].image_lba);
+
+    var inspection = try reader.inspectForRewrite(allocator, io);
+    defer inspection.deinit();
+    try std.testing.expect(inspection.losslessWithinModel());
 }
 
 test "iso writer reports no boot record for a plain image" {
