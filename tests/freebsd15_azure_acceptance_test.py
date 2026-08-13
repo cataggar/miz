@@ -892,7 +892,6 @@ def test_gallery_definition_and_version_precede_provisioned_vm():
     assert '--architecture "$azure_image_architecture"' in definition_block
     assert '--os-snapshot "$disk_id"' in version_block
     assert "--replication-mode Shallow" in version_block
-    assert '--target-regions "$AZURE_LOCATION=1=Standard_LRS"' in version_block
     assert "--no-wait" in version_block
     assert "--created" in content[version_wait:version_show]
     replication_function = _image_replication_functions()
@@ -916,6 +915,24 @@ def test_gallery_definition_and_version_precede_provisioned_vm():
     assert "az image create" not in content
     assert "az image show" not in content
     assert "--attach-os-disk" not in content
+
+
+def test_gallery_version_uses_safe_cli_target_region_grammar():
+    content = Path(SCRIPT).read_text(encoding="utf-8")
+    version_create = content.index("az sig image-version create")
+    version_wait = content.index("az sig image-version wait", version_create)
+    version_block = content[version_create:version_wait]
+    target_region_lines = [
+        line for line in version_block.splitlines() if "--target-regions" in line
+    ]
+
+    assert (
+        '  --storage-account-type Standard_LRS \\\n'
+        '  --target-regions "$AZURE_LOCATION=1=standard_lrs" \\\n'
+    ) in version_block
+    assert target_region_lines == [
+        '  --target-regions "$AZURE_LOCATION=1=standard_lrs" \\'
+    ]
 
 
 def test_replication_gate_keeps_owned_resource_group_cleanup_active():

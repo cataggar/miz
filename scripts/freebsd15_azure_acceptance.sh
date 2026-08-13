@@ -871,7 +871,7 @@ az sig image-version create \
   --replication-mode Shallow \
   --replica-count 1 \
   --storage-account-type Standard_LRS \
-  --target-regions "$AZURE_LOCATION=1=Standard_LRS" \
+  --target-regions "$AZURE_LOCATION=1=standard_lrs" \
   --no-wait \
   --output json >/dev/null
 az sig image-version wait \
