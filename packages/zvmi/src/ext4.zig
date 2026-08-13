@@ -51,6 +51,7 @@
 
 const std = @import("std");
 const limits_mod = @import("limits.zig");
+const tree_cursor = @import("tree_cursor.zig");
 const Io = std.Io;
 
 /// The scan shares the importer's limit defaults so a source that scans is a
@@ -221,16 +222,11 @@ const xattr_name_trusted: u8 = 4;
 const xattr_name_security: u8 = 6;
 const xattr_name_system: u8 = 7;
 
-pub const Kind = enum(u8) {
-    directory,
-    file,
-    symlink,
-    /// A second name for a `file` entry's inode, named by `hardlink_target`.
-    hardlink,
-    block_device,
-    char_device,
-    fifo,
-};
+/// A node kind as seen through `FileTreeView`/`Cursor`. This is
+/// `tree_cursor.Kind`; kept as its own name here because so much of this
+/// file, and every caller written before `tree_cursor.zig` existed, spells
+/// it `ext4.Kind`.
+pub const Kind = tree_cursor.Kind;
 
 /// How many inodes the written filesystem gets.
 ///
@@ -372,95 +368,17 @@ pub fn freeDirEntries(allocator: std.mem.Allocator, entries: []DirEntry) void {
     allocator.free(entries);
 }
 
-pub const Xattr = struct {
-    name: []const u8,
-    value: []const u8,
-};
+pub const Xattr = tree_cursor.Xattr;
 
-pub const OwnedXattr = struct {
-    name: []u8,
-    value: []u8,
-};
+pub const OwnedXattr = tree_cursor.OwnedXattr;
 
-pub fn freeXattrs(allocator: std.mem.Allocator, xattrs: []OwnedXattr) void {
-    for (xattrs) |xattr| {
-        allocator.free(xattr.name);
-        allocator.free(xattr.value);
-    }
-    allocator.free(xattrs);
-}
+pub const freeXattrs = tree_cursor.freeXattrs;
 
-/// Small, self-contained tree-population interface for future ingestion
-/// modules to adapt to. `populate()` resets the view once, consumes every
-/// yielded entry, sorts them by path depth/name, and then writes the full
-/// filesystem image in one pass. The root directory is implicit; entries must
-/// use relative paths like `boot/kernel` rather than `/boot/kernel`.
-pub const FileTreeView = struct {
-    ctx: *anyopaque,
-    next_fn: *const fn (ctx: *anyopaque) IteratorError!?Entry,
-    reset_fn: *const fn (ctx: *anyopaque) void,
-
-    pub const IteratorError = error{EnumerationFailed};
-    pub const ContentError = error{ ReadFailed, UnexpectedEndOfStream };
-
-    pub const ContentReader = struct {
-        ctx: *const anyopaque,
-        read_at_fn: *const fn (ctx: *const anyopaque, buffer: []u8, offset: u64) ContentError!usize,
-
-        pub fn readAt(self: ContentReader, buffer: []u8, offset: u64) ContentError!usize {
-            return self.read_at_fn(self.ctx, buffer, offset);
-        }
-    };
-
-    pub const Entry = struct {
-        /// Relative UTF-8/byte path using `/` separators, without a leading `/`.
-        path: []const u8,
-        kind: Kind,
-        /// Unix permission/sticky bits only; the file type comes from `kind`.
-        mode: u16,
-        uid: u32,
-        gid: u32,
-        /// Regular-file byte length, symlink-target byte length, or 0 for dirs.
-        size: u64,
-        /// Required for non-empty regular files and symlinks.
-        content: ?ContentReader = null,
-        /// Optional extended attributes such as `user.*` or `security.*`.
-        xattrs: []const Xattr = &.{},
-        /// Device numbers, for `block_device` and `char_device` only.
-        device: DeviceNumbers = .{},
-        /// The already-emitted path whose inode a `hardlink` shares. Copying
-        /// the bytes instead would silently break every consumer that relies
-        /// on shared identity, from package managers to `rsync -H`.
-        hardlink_target: []const u8 = "",
-        /// POSIX seconds. Null means "use the image-wide timestamp", which is
-        /// what a reproducible build wants; an imported filesystem carrying
-        /// real per-file times supplies them so they survive the round trip.
-        atime: ?i64 = null,
-        mtime: ?i64 = null,
-        ctime: ?i64 = null,
-        /// Sub-second parts of the three times above, 0..999999999. A source
-        /// that stored whole seconds -- or a caller that does not care --
-        /// leaves these zero, which is what the writer emitted for every
-        /// inode before they existed.
-        atime_nsec: u32 = 0,
-        mtime_nsec: u32 = 0,
-        ctime_nsec: u32 = 0,
-        /// The inode's creation time. Null means the source had none to give
-        /// -- a 128-byte inode has nowhere to store one -- and the writer
-        /// falls back to the image-wide timestamp, which is the honest answer
-        /// for a node this build is genuinely creating.
-        crtime: ?i64 = null,
-        crtime_nsec: u32 = 0,
-    };
-
-    pub fn reset(self: *FileTreeView) void {
-        self.reset_fn(self.ctx);
-    }
-
-    pub fn next(self: *FileTreeView) IteratorError!?Entry {
-        return self.next_fn(self.ctx);
-    }
-};
+/// The filesystem-neutral pull cursor `populate()` drains, and the shape
+/// `RootTree.cursor()` returns. This is `tree_cursor.Cursor`, kept under its
+/// original name here for source compatibility with every caller written
+/// before `tree_cursor.zig` existed; new code may spell it either way.
+pub const FileTreeView = tree_cursor.Cursor;
 
 pub const PopulateError = std.mem.Allocator.Error || Io.File.ReadPositionalError ||
     Io.File.WritePositionalError || Io.File.SetLengthError || Io.File.StatError ||
@@ -796,7 +714,7 @@ const PreparedPopulate = struct {
 /// or modifying a file.
 pub fn preflightPopulate(
     allocator: std.mem.Allocator,
-    tree: *FileTreeView,
+    tree: *tree_cursor.Cursor,
     options: PopulateOptions,
 ) PopulateError!FilesystemInfo {
     var prepared = try preparePopulate(allocator, tree, options);
@@ -863,7 +781,7 @@ const max_minimum_size_rounds: u32 = 64;
 /// caller that has a headroom policy applies it.
 pub fn minimumPopulateLength(
     allocator: std.mem.Allocator,
-    tree: *FileTreeView,
+    tree: *tree_cursor.Cursor,
     options: PopulateOptions,
 ) PopulateError!MinimumSize {
     return minimumPopulateLengthAtLeast(allocator, tree, options, 0);
@@ -883,7 +801,7 @@ pub fn minimumPopulateLength(
 /// caller to discover it as a `NotEnoughSpace` from `populate`.
 pub fn minimumPopulateLengthAtLeast(
     allocator: std.mem.Allocator,
-    tree: *FileTreeView,
+    tree: *tree_cursor.Cursor,
     options: PopulateOptions,
     floor: u64,
 ) PopulateError!MinimumSize {
@@ -1197,7 +1115,7 @@ pub fn populate(
     io: Io,
     file: Io.File,
     allocator: std.mem.Allocator,
-    tree: *FileTreeView,
+    tree: *tree_cursor.Cursor,
     options: PopulateOptions,
 ) PopulateError!FilesystemInfo {
     var prepared = try preparePopulate(allocator, tree, options);
@@ -4060,10 +3978,7 @@ pub const GeneralKind = enum {
     fifo,
 };
 
-pub const DeviceNumbers = struct {
-    major: u32 = 0,
-    minor: u32 = 0,
-};
+pub const DeviceNumbers = tree_cursor.DeviceNumbers;
 
 /// Refusals that name the exact ext4 feature responsible. A partial import is
 /// worse than no import: every one of these features changes how guest-visible

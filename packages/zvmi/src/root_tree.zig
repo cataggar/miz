@@ -5,6 +5,7 @@ const xfs = @import("xfs.zig");
 const limits_mod = @import("limits.zig");
 const squashfs = @import("squashfs.zig");
 const iso9660 = @import("iso9660.zig");
+const tree_cursor = @import("tree_cursor.zig");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -42,7 +43,7 @@ pub const Metadata = struct {
     /// answer for a node the build is genuinely creating.
     crtime: ?i64 = null,
     crtime_nsec: u32 = 0,
-    xattrs: []const ext4.Xattr = &.{},
+    xattrs: []const tree_cursor.Xattr = &.{},
 };
 
 pub const Device = struct {
@@ -60,10 +61,10 @@ const Content = struct {
             offset: u64,
         },
         memory: []u8,
-        borrowed: ext4.FileTreeView.ContentReader,
+        borrowed: tree_cursor.Cursor.ContentReader,
         /// Same lifecycle as `.borrowed`, for a source whose content reader
         /// is shaped like `xfs.ContentReader` rather than ext4's. Kept as its
-        /// own variant instead of adapting to `ext4.FileTreeView.ContentReader`
+        /// own variant instead of adapting to `tree_cursor.Cursor.ContentReader`
         /// because the two are structurally identical but nominally distinct
         /// Zig types with no implicit conversion between them.
         borrowed_xfs: xfs.ContentReader,
@@ -105,7 +106,7 @@ const Node = struct {
     path: []u8,
     kind: Kind,
     metadata: Metadata,
-    owned_xattrs: []ext4.OwnedXattr,
+    owned_xattrs: []tree_cursor.OwnedXattr,
     payload: Payload,
 
     pub fn size(self: Node) u64 {
@@ -185,7 +186,12 @@ pub const RootTree = struct {
     root_metadata: RootMetadata = .{},
     iteration_index: usize = 0,
     sorted: bool = true,
-    view: ext4.FileTreeView,
+    /// The neutral pull cursor `cursor()` (and its deprecated alias
+    /// `ext4View()`) hands to a writer. Reused across calls rather than
+    /// allocated fresh, since it carries no state of its own beyond the
+    /// function pointers and `self` -- `iteration_index` above is the only
+    /// mutable state, and `Cursor.reset()` is how a consumer rewinds it.
+    tree_cursor_view: tree_cursor.Cursor,
 
     pub fn init(
         allocator: Allocator,
@@ -208,10 +214,10 @@ pub const RootTree = struct {
             .storage = .spooled,
             .nodes = .init(allocator),
             .limits = limits,
-            .view = .{
+            .tree_cursor_view = .{
                 .ctx = undefined,
-                .next_fn = nextExt4,
-                .reset_fn = resetExt4,
+                .next_fn = nextCursor,
+                .reset_fn = resetCursor,
             },
         };
     }
@@ -225,10 +231,10 @@ pub const RootTree = struct {
             .storage = .memory,
             .nodes = .init(allocator),
             .limits = limits,
-            .view = .{
+            .tree_cursor_view = .{
                 .ctx = undefined,
-                .next_fn = nextExt4,
-                .reset_fn = resetExt4,
+                .next_fn = nextCursor,
+                .reset_fn = resetCursor,
             },
         };
     }
@@ -341,7 +347,7 @@ pub const RootTree = struct {
         self: *RootTree,
         path: []const u8,
         size: u64,
-        reader: ext4.FileTreeView.ContentReader,
+        reader: tree_cursor.Cursor.ContentReader,
         metadata: Metadata,
     ) !void {
         try validatePath(path, self.limits, self.diagnostic);
@@ -367,7 +373,7 @@ pub const RootTree = struct {
         try self.checkFileBytes(target.len);
         const old_spool_len = self.spool_len;
         var reader = BytesReader{ .bytes = target };
-        const typed_reader: ext4.FileTreeView.ContentReader = .{
+        const typed_reader: tree_cursor.Cursor.ContentReader = .{
             .ctx = &reader,
             .read_at_fn = BytesReader.readAt,
         };
@@ -442,20 +448,20 @@ pub const RootTree = struct {
         return removed;
     }
 
-    pub fn importExt4View(self: *RootTree, source: *ext4.FileTreeView) !void {
+    pub fn importExt4View(self: *RootTree, source: *tree_cursor.Cursor) !void {
         _ = try self.importExt4ViewMode(source, .owned, "");
     }
 
     /// Imports only paths and metadata while retaining read-only content
     /// readers supplied by `source`. The source must outlive this tree.
-    pub fn importExt4ViewBorrowed(self: *RootTree, source: *ext4.FileTreeView) !void {
+    pub fn importExt4ViewBorrowed(self: *RootTree, source: *tree_cursor.Cursor) !void {
         if (self.storage != .memory) return error.BorrowedImportRequiresMemoryTree;
         _ = try self.importExt4ViewMode(source, .borrowed, "");
     }
 
     fn importExt4ViewMode(
         self: *RootTree,
-        source: *ext4.FileTreeView,
+        source: *tree_cursor.Cursor,
         mode: ImportMode,
         prefix: []const u8,
     ) !usize {
@@ -707,7 +713,7 @@ pub const RootTree = struct {
                 .ctime_nsec = entry.ctime_nsec,
                 .crtime = entry.crtime,
                 .crtime_nsec = entry.crtime_nsec,
-                // xfs.Xattr and ext4.Xattr are both exactly
+                // xfs.Xattr and tree_cursor.Xattr are both exactly
                 // `{name: []const u8, value: []const u8}`; reinterpreting
                 // the slice reuses the whole existing xattr pipeline
                 // (limits, dedup, sorting) instead of duplicating it.
@@ -769,7 +775,7 @@ pub const RootTree = struct {
         path: []const u8,
         kind: Kind,
         size: u64,
-        content: ext4.FileTreeView.ContentReader,
+        content: tree_cursor.Cursor.ContentReader,
         metadata: Metadata,
     ) !void {
         try self.checkFileBytes(size);
@@ -820,7 +826,7 @@ pub const RootTree = struct {
     /// the ones visible at the mount point.
     pub fn mountExt4View(
         self: *RootTree,
-        source: *ext4.FileTreeView,
+        source: *tree_cursor.Cursor,
         target: []const u8,
         root: Metadata,
     ) !MountReport {
@@ -829,7 +835,7 @@ pub const RootTree = struct {
 
     pub fn mountExt4ViewBorrowed(
         self: *RootTree,
-        source: *ext4.FileTreeView,
+        source: *tree_cursor.Cursor,
         target: []const u8,
         root: Metadata,
     ) !MountReport {
@@ -909,7 +915,7 @@ pub const RootTree = struct {
     }
 
     const MountSource = union(enum) {
-        view: *ext4.FileTreeView,
+        view: *tree_cursor.Cursor,
         general: *ext4.GeneralTree,
         xfs: *xfs.Tree,
     };
@@ -970,8 +976,8 @@ pub const RootTree = struct {
     /// Creating a missing one would be a silent fallback that turns a typo
     /// into a plausible-looking image.
     fn validateMountPoint(self: *const RootTree, relative: []const u8) !void {
-        var cursor: usize = 0;
-        while (std.mem.indexOfScalarPos(u8, relative, cursor, '/')) |slash| {
+        var scan: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, relative, scan, '/')) |slash| {
             const ancestor = relative[0..slash];
             const index = self.findIndex(ancestor) orelse return error.MissingMountTargetParent;
             switch (self.nodes.items[index].kind) {
@@ -981,7 +987,7 @@ pub const RootTree = struct {
                 .symlink => return error.MountTargetTraversesSymlink,
                 else => return error.MountTargetTraversesNonDirectory,
             }
-            cursor = slash + 1;
+            scan = slash + 1;
         }
         const index = self.findIndex(relative) orelse return error.MissingMountTarget;
         switch (self.nodes.items[index].kind) {
@@ -991,15 +997,38 @@ pub const RootTree = struct {
         }
     }
 
-    pub fn ext4View(self: *RootTree) !*ext4.FileTreeView {
+    /// Returns the filesystem-neutral pull cursor over this tree: every node
+    /// in path order, with its kind, mode/uid/gid, device numbers, hardlink
+    /// target, size, a content reader, and xattrs -- everything
+    /// `ext4.populate` (or a future filesystem writer written against
+    /// `tree_cursor.Cursor` rather than this module) needs to write an
+    /// inode. This is the tree's primary consumption shape; `ext4View` is a
+    /// compatibility alias for callers written before this name existed.
+    ///
+    /// Root-directory metadata is deliberately not part of the cursor: see
+    /// `rootMetadata`/`setRootMetadata` and `ext4.PopulateOptions`'s `root_*`
+    /// fields, which carry it instead of folding it silently into the entry
+    /// stream.
+    ///
+    /// The returned pointer aliases this tree and is valid only until the
+    /// next call that mutates it (`put*`, `remove`, a `mount*`, or another
+    /// call to `cursor`/`ext4View`); a consumer resets it with
+    /// `Cursor.reset()` rather than asking for a new one mid-drain.
+    pub fn cursor(self: *RootTree) !*tree_cursor.Cursor {
         try self.sortAndValidate();
         self.iteration_index = 0;
-        self.view = .{
+        self.tree_cursor_view = .{
             .ctx = self,
-            .next_fn = nextExt4,
-            .reset_fn = resetExt4,
+            .next_fn = nextCursor,
+            .reset_fn = resetCursor,
         };
-        return &self.view;
+        return &self.tree_cursor_view;
+    }
+
+    /// Deprecated alias for `cursor`, kept for source compatibility with
+    /// callers written before the neutral cursor had its own name.
+    pub fn ext4View(self: *RootTree) !*tree_cursor.Cursor {
+        return self.cursor();
     }
 
     pub fn populateFat32(
@@ -1398,8 +1427,8 @@ pub const RootTree = struct {
             for (parents.items) |parent| self.allocator.free(parent.path);
             parents.deinit();
         }
-        var cursor: usize = 0;
-        while (std.mem.indexOfScalarPos(u8, path, cursor, '/')) |slash| {
+        var scan: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, path, scan, '/')) |slash| {
             const parent = path[0..slash];
             if (self.findIndex(parent)) |index| {
                 if (self.nodes.items[index].kind != .directory) {
@@ -1416,7 +1445,7 @@ pub const RootTree = struct {
                     return err;
                 };
             }
-            cursor = slash + 1;
+            scan = slash + 1;
         }
         return parents;
     }
@@ -1447,7 +1476,7 @@ pub const RootTree = struct {
         }
     }
 
-    /// `reader` is `anytype` rather than `ext4.FileTreeView.ContentReader`
+    /// `reader` is `anytype` rather than `tree_cursor.Cursor.ContentReader`
     /// because every byte here is read once and copied immediately, so the
     /// reader's own type never has to be stored: an `xfs.ContentReader`
     /// works exactly as well as ext4's, without an adapter.
@@ -1503,7 +1532,7 @@ pub const RootTree = struct {
         path: []const u8,
         kind: Kind,
         size: u64,
-        reader: ext4.FileTreeView.ContentReader,
+        reader: tree_cursor.Cursor.ContentReader,
         metadata: Metadata,
     ) !void {
         try self.checkFileBytes(size);
@@ -1613,7 +1642,7 @@ pub const RootTree = struct {
             return error.SpoolLimitExceeded;
         try self.checkSpoolBytes(end);
         var file_reader = FileReader{ .io = self.io, .file = file };
-        const typed_reader: ext4.FileTreeView.ContentReader = .{
+        const typed_reader: tree_cursor.Cursor.ContentReader = .{
             .ctx = &file_reader,
             .read_at_fn = FileReader.readAt,
         };
@@ -1628,7 +1657,7 @@ pub const RootTree = struct {
         };
     }
 
-    fn dupeXattrs(self: *RootTree, source: []const ext4.Xattr) ![]ext4.OwnedXattr {
+    fn dupeXattrs(self: *RootTree, source: []const tree_cursor.Xattr) ![]tree_cursor.OwnedXattr {
         limits_mod.observe(self.diagnostic, .xattrs_per_node, source.len);
         if (source.len > self.limits.max_xattrs_per_node) {
             return limits_mod.exceeded(
@@ -1653,7 +1682,7 @@ pub const RootTree = struct {
             );
         }
 
-        const out = try self.allocator.alloc(ext4.OwnedXattr, source.len);
+        const out = try self.allocator.alloc(tree_cursor.OwnedXattr, source.len);
         var initialized: usize = 0;
         errdefer {
             for (out[0..initialized]) |xattr| {
@@ -1672,7 +1701,7 @@ pub const RootTree = struct {
             };
             initialized += 1;
         }
-        std.mem.sort(ext4.OwnedXattr, out, {}, lessXattr);
+        std.mem.sort(tree_cursor.OwnedXattr, out, {}, lessXattr);
         if (out.len > 1) {
             for (out[1..], out[0 .. out.len - 1]) |current, previous| {
                 if (std.mem.eql(u8, current.name, previous.name)) return error.DuplicateXattr;
@@ -1847,17 +1876,17 @@ pub const RootTree = struct {
         }
     }
 
-    fn resetExt4(ctx: *anyopaque) void {
+    fn resetCursor(ctx: *anyopaque) void {
         const self: *RootTree = @ptrCast(@alignCast(ctx));
         self.iteration_index = 0;
     }
 
-    fn nextExt4(ctx: *anyopaque) ext4.FileTreeView.IteratorError!?ext4.FileTreeView.Entry {
+    fn nextCursor(ctx: *anyopaque) tree_cursor.Cursor.IteratorError!?tree_cursor.Cursor.Entry {
         const self: *RootTree = @ptrCast(@alignCast(ctx));
         if (self.iteration_index >= self.nodes.items.len) return null;
         const node = &self.nodes.items[self.iteration_index];
         self.iteration_index += 1;
-        const kind: ext4.Kind = switch (node.kind) {
+        const kind: tree_cursor.Kind = switch (node.kind) {
             .directory => .directory,
             .file => .file,
             .symlink => .symlink,
@@ -1876,7 +1905,7 @@ pub const RootTree = struct {
             .size = if (carries_content) node.size() else 0,
             .content = if (carries_content) .{
                 .ctx = &node.payload.content,
-                .read_at_fn = readExt4Content,
+                .read_at_fn = readCursorContent,
             } else null,
             .xattrs = node.metadata.xattrs,
             .device = switch (node.payload) {
@@ -1898,11 +1927,11 @@ pub const RootTree = struct {
         };
     }
 
-    fn readExt4Content(
+    fn readCursorContent(
         ctx: *const anyopaque,
         buffer: []u8,
         offset: u64,
-    ) ext4.FileTreeView.ContentError!usize {
+    ) tree_cursor.Cursor.ContentError!usize {
         const content: *const Content = @ptrCast(@alignCast(ctx));
         return content.readAt(buffer, offset) catch error.ReadFailed;
     }
@@ -2009,7 +2038,7 @@ fn xfsRootMetadata(source: *const xfs.Tree) Metadata {
         .ctime_nsec = source.root.ctime_nsec,
         .crtime = source.root.crtime,
         .crtime_nsec = source.root.crtime_nsec,
-        // See importXfsMode: xfs.Xattr and ext4.Xattr share layout exactly.
+        // See importXfsMode: xfs.Xattr and tree_cursor.Xattr share layout exactly.
         .xattrs = @ptrCast(source.root.xattrs),
     };
 }
@@ -2177,15 +2206,15 @@ fn splitPath(path: []const u8) struct { parent: []const u8, name: []const u8 } {
     return .{ .parent = path[0..separator], .name = path[separator + 1 ..] };
 }
 
-fn lessXattr(_: void, left: ext4.OwnedXattr, right: ext4.OwnedXattr) bool {
+fn lessXattr(_: void, left: tree_cursor.OwnedXattr, right: tree_cursor.OwnedXattr) bool {
     return std.mem.order(u8, left.name, right.name) == .lt;
 }
 
-fn ownedXattrsView(source: []ext4.OwnedXattr) []const ext4.Xattr {
+fn ownedXattrsView(source: []tree_cursor.OwnedXattr) []const tree_cursor.Xattr {
     return @ptrCast(source);
 }
 
-fn freeOwnedXattrs(allocator: Allocator, xattrs: []ext4.OwnedXattr) void {
+fn freeOwnedXattrs(allocator: Allocator, xattrs: []tree_cursor.OwnedXattr) void {
     if (xattrs.len == 0) return;
     for (xattrs) |xattr| {
         allocator.free(xattr.name);
@@ -2197,7 +2226,7 @@ fn freeOwnedXattrs(allocator: Allocator, xattrs: []ext4.OwnedXattr) void {
 const BytesReader = struct {
     bytes: []const u8,
 
-    fn readAt(ctx: *const anyopaque, buffer: []u8, offset: u64) ext4.FileTreeView.ContentError!usize {
+    fn readAt(ctx: *const anyopaque, buffer: []u8, offset: u64) tree_cursor.Cursor.ContentError!usize {
         const self: *const BytesReader = @ptrCast(@alignCast(ctx));
         if (offset >= self.bytes.len) return 0;
         const count = @min(buffer.len, self.bytes.len - @as(usize, @intCast(offset)));
@@ -2210,19 +2239,19 @@ const FileReader = struct {
     io: Io,
     file: Io.File,
 
-    fn readAt(ctx: *const anyopaque, buffer: []u8, offset: u64) ext4.FileTreeView.ContentError!usize {
+    fn readAt(ctx: *const anyopaque, buffer: []u8, offset: u64) tree_cursor.Cursor.ContentError!usize {
         const self: *const FileReader = @ptrCast(@alignCast(ctx));
         return self.file.readPositionalAll(self.io, buffer, offset) catch error.ReadFailed;
     }
 };
 
 const EmptyReader = struct {
-    fn readAt(_: *const anyopaque, _: []u8, _: u64) ext4.FileTreeView.ContentError!usize {
+    fn readAt(_: *const anyopaque, _: []u8, _: u64) tree_cursor.Cursor.ContentError!usize {
         return 0;
     }
 };
 
-fn emptyContentReader() ext4.FileTreeView.ContentReader {
+fn emptyContentReader() tree_cursor.Cursor.ContentReader {
     return .{ .ctx = undefined, .read_at_fn = EmptyReader.readAt };
 }
 
@@ -2372,6 +2401,158 @@ test "owned tree offers special files and hardlinks to the ext4 writer" {
     }
     try std.testing.expect(saw_device);
     try std.testing.expect(saw_hardlink);
+}
+
+test "the neutral cursor resets, orders by path, and preserves content/hardlink/device/xattr fidelity" {
+    const io = std.testing.io;
+    const spool_path = "test-root-tree-cursor-fidelity.spool";
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    try tree.putDirectory("a", .{ .mode = 0o755 });
+    try tree.putFileBytes("a/file", "hello", .{
+        .mode = 0o640,
+        .xattrs = &.{.{ .name = "user.test", .value = "v" }},
+    });
+    try tree.putHardlink("a/file-link", "a/file", .{ .mode = 0o640 });
+    try tree.putDevice("dev0", .block_device, .{ .major = 7, .minor = 3 }, .{ .mode = 0o600 });
+
+    // `cursor()`, not `ext4View()`, is the primary consumption shape: the
+    // returned type is `*tree_cursor.Cursor` regardless of which name a
+    // caller reaches it through.
+    const first = try tree.cursor();
+
+    var first_paths = std.array_list.Managed([]const u8).init(std.testing.allocator);
+    defer first_paths.deinit();
+    var saw_content = false;
+    var saw_xattr = false;
+    var saw_hardlink = false;
+    var saw_device = false;
+    while (try first.next()) |entry| {
+        try first_paths.append(entry.path);
+        switch (entry.kind) {
+            .file => {
+                var buffer: [5]u8 = undefined;
+                const read = try entry.content.?.readAt(&buffer, 0);
+                try std.testing.expectEqual(@as(usize, 5), read);
+                try std.testing.expectEqualStrings("hello", &buffer);
+                saw_content = true;
+
+                try std.testing.expectEqual(@as(usize, 1), entry.xattrs.len);
+                try std.testing.expectEqualStrings("user.test", entry.xattrs[0].name);
+                try std.testing.expectEqualStrings("v", entry.xattrs[0].value);
+                saw_xattr = true;
+            },
+            .hardlink => {
+                try std.testing.expectEqualStrings("a/file", entry.hardlink_target);
+                saw_hardlink = true;
+            },
+            .block_device => {
+                try std.testing.expectEqual(@as(u32, 7), entry.device.major);
+                try std.testing.expectEqual(@as(u32, 3), entry.device.minor);
+                saw_device = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_content);
+    try std.testing.expect(saw_xattr);
+    try std.testing.expect(saw_hardlink);
+    try std.testing.expect(saw_device);
+
+    // Byte order on the path, which is what a writer relies on to see every
+    // directory before its own children.
+    try std.testing.expectEqual(@as(usize, 4), first_paths.items.len);
+    try std.testing.expectEqualStrings("a", first_paths.items[0]);
+    try std.testing.expectEqualStrings("a/file", first_paths.items[1]);
+    try std.testing.expectEqualStrings("a/file-link", first_paths.items[2]);
+    try std.testing.expectEqualStrings("dev0", first_paths.items[3]);
+
+    // `reset()` rewinds the same cursor rather than requiring a new one, and
+    // it yields the identical order every time -- what `ext4.populate`
+    // relies on when a caller hands it a cursor that has already been
+    // walked once (`preflightPopulate` followed by `populate`, say).
+    first.reset();
+    var second_paths = std.array_list.Managed([]const u8).init(std.testing.allocator);
+    defer second_paths.deinit();
+    while (try first.next()) |entry| try second_paths.append(entry.path);
+    try std.testing.expectEqual(first_paths.items.len, second_paths.items.len);
+    for (first_paths.items, second_paths.items) |before, after| {
+        try std.testing.expectEqualStrings(before, after);
+    }
+}
+
+test "ext4.populate emits identical bytes through cursor() and the ext4View() alias" {
+    const io = std.testing.io;
+    const fs_size: u64 = 8 * 1024 * 1024;
+
+    var tree_a = try RootTree.init(std.testing.allocator, io, "test-root-tree-cursor-digest-a.spool", .{});
+    defer tree_a.deinit();
+    defer Io.Dir.cwd().deleteFile(io, "test-root-tree-cursor-digest-a.spool") catch {};
+    try tree_a.putDirectory("etc", .{ .mode = 0o755 });
+    try tree_a.putFileBytes("etc/hostname", "appliance\n", .{
+        .mode = 0o640,
+        .uid = 4,
+        .gid = 5,
+        .xattrs = &.{.{ .name = "user.origin", .value = "root-tree" }},
+    });
+    try tree_a.putSymlink("hostname", "etc/hostname", .{ .mode = 0o777 });
+    try tree_a.putDevice("etc/console", .char_device, .{ .major = 5, .minor = 1 }, .{ .mode = 0o600 });
+    try tree_a.putHardlink("etc/hostname-link", "etc/hostname", .{ .mode = 0o640 });
+
+    var tree_b = try RootTree.init(std.testing.allocator, io, "test-root-tree-cursor-digest-b.spool", .{});
+    defer tree_b.deinit();
+    defer Io.Dir.cwd().deleteFile(io, "test-root-tree-cursor-digest-b.spool") catch {};
+    try tree_b.putDirectory("etc", .{ .mode = 0o755 });
+    try tree_b.putFileBytes("etc/hostname", "appliance\n", .{
+        .mode = 0o640,
+        .uid = 4,
+        .gid = 5,
+        .xattrs = &.{.{ .name = "user.origin", .value = "root-tree" }},
+    });
+    try tree_b.putSymlink("hostname", "etc/hostname", .{ .mode = 0o777 });
+    try tree_b.putDevice("etc/console", .char_device, .{ .major = 5, .minor = 1 }, .{ .mode = 0o600 });
+    try tree_b.putHardlink("etc/hostname-link", "etc/hostname", .{ .mode = 0o640 });
+
+    const image_path_a = "test-root-tree-cursor-digest-a.img";
+    const image_path_b = "test-root-tree-cursor-digest-b.img";
+    defer Io.Dir.cwd().deleteFile(io, image_path_a) catch {};
+    defer Io.Dir.cwd().deleteFile(io, image_path_b) catch {};
+
+    const image_a = try Io.Dir.cwd().createFile(io, image_path_a, .{ .read = true });
+    defer image_a.close(io);
+    // The new, neutrally-named primary shape.
+    _ = try ext4.populate(io, image_a, std.testing.allocator, try tree_a.cursor(), .{
+        .length = fs_size,
+        .uuid = [_]u8{0x61} ** 16,
+        .timestamp = 1_717_171_717,
+    });
+
+    const image_b = try Io.Dir.cwd().createFile(io, image_path_b, .{ .read = true });
+    defer image_b.close(io);
+    // The pre-existing name, still accepted, still going through the same
+    // `tree_cursor.Cursor` underneath.
+    _ = try ext4.populate(io, image_b, std.testing.allocator, try tree_b.ext4View(), .{
+        .length = fs_size,
+        .uuid = [_]u8{0x61} ** 16,
+        .timestamp = 1_717_171_717,
+    });
+
+    const bytes_a = try std.testing.allocator.alloc(u8, fs_size);
+    defer std.testing.allocator.free(bytes_a);
+    _ = try image_a.readPositionalAll(io, bytes_a, 0);
+    const bytes_b = try std.testing.allocator.alloc(u8, fs_size);
+    defer std.testing.allocator.free(bytes_b);
+    _ = try image_b.readPositionalAll(io, bytes_b, 0);
+
+    try std.testing.expectEqualSlices(u8, bytes_a, bytes_b);
+
+    var digest_a: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes_a, &digest_a, .{});
+    var digest_b: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes_b, &digest_b, .{});
+    try std.testing.expectEqualSlices(u8, &digest_a, &digest_b);
 }
 
 test "borrowed node paths are safe overlay and removal inputs" {
@@ -2989,7 +3170,7 @@ test "owned tree imports an XFS volume preserving metadata xattrs hardlinks and 
     try std.testing.expectEqual(Kind.hardlink, alias.kind);
     try std.testing.expectEqualStrings("hardlinked", alias.payload.hardlink_target);
 
-    // attrs.txt: xattrs preserved through the shared ext4.Xattr-shaped
+    // attrs.txt: xattrs preserved through the shared tree_cursor.Xattr-shaped
     // pipeline, including the root-flagged "trusted." namespace entry.
     const attrs_txt = tree.findNode("attrs.txt").?;
     var saw_foo = false;
@@ -3418,7 +3599,7 @@ test "root tree squashfs adapter rejects node kinds and metadata it cannot repre
     var xattr_tree = try RootTree.init(std.testing.allocator, io, spool_path ++ ".x", .{});
     defer xattr_tree.deinit();
     defer Io.Dir.cwd().deleteFile(io, spool_path ++ ".x") catch {};
-    const xattrs = [_]ext4.Xattr{.{ .name = "user.test", .value = "v" }};
+    const xattrs = [_]tree_cursor.Xattr{.{ .name = "user.test", .value = "v" }};
     try xattr_tree.putFileBytes("f", "data", .{ .mode = 0o644, .xattrs = &xattrs });
     try xattr_tree.sortNodes();
     try std.testing.expectError(error.UnsupportedXattrs, squashfs.writeImagePath(
@@ -3492,7 +3673,7 @@ test "root tree iso9660 adapter rejects node kinds and metadata it cannot repres
     var xattr_tree = try RootTree.init(std.testing.allocator, io, spool_path ++ ".x", .{});
     defer xattr_tree.deinit();
     defer Io.Dir.cwd().deleteFile(io, spool_path ++ ".x") catch {};
-    const xattrs = [_]ext4.Xattr{.{ .name = "user.test", .value = "v" }};
+    const xattrs = [_]tree_cursor.Xattr{.{ .name = "user.test", .value = "v" }};
     try xattr_tree.putFileBytes("f", "data", .{ .mode = 0o644, .xattrs = &xattrs });
     try xattr_tree.sortNodes();
     try std.testing.expectError(error.UnsupportedXattrs, iso9660.writeImagePath(
