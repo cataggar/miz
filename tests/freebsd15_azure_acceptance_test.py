@@ -292,20 +292,78 @@ def test_gen2_disk():
     assert "--hyper-v-generation V2" in content
 
 
-def test_generalized_gen2_image_precedes_provisioned_vm():
+def test_architecture_maps_exactly_for_gallery_definition():
     content = Path(SCRIPT).read_text(encoding="utf-8")
-    image_create = content.index("az image create")
-    vm_create = content.index("az vm create", image_create)
-    image_block = content[image_create:vm_create]
+    mapping_start = content.index('case "$ARCHITECTURE" in')
+    mapping_end = content.index("\nesac", mapping_start)
+    mapping = content[mapping_start:mapping_end]
+
+    assert (
+        "aarch64)\n"
+        "    short_arch=arm64\n"
+        "    expected_azure_architecture=Arm64\n"
+        "    runtime_architecture=arm64\n"
+        "    azure_image_architecture=Arm64"
+    ) in mapping
+    assert (
+        "x86_64)\n"
+        "    short_arch=x64\n"
+        "    expected_azure_architecture=x64\n"
+        "    runtime_architecture=amd64\n"
+        "    azure_image_architecture=x64"
+    ) in mapping
+    definition_create = content.index("az sig image-definition create")
+    definition_show = content.index(
+        "az sig image-definition show", definition_create
+    )
+    definition_block = content[definition_create:definition_show]
+    assert '--architecture "$azure_image_architecture"' in definition_block
+
+
+def test_gallery_definition_and_version_precede_provisioned_vm():
+    content = Path(SCRIPT).read_text(encoding="utf-8")
+    disk_validation = content.index(
+        "# Validate the imported disk identity and matching architecture"
+    )
+    gallery_create = content.index("az sig create")
+    definition_create = content.index(
+        "az sig image-definition create", gallery_create
+    )
+    version_create = content.index("az sig image-version create", definition_create)
+    version_wait = content.index("az sig image-version wait", version_create)
+    version_show = content.index("az sig image-version show", version_wait)
+    vm_create = content.index("az vm create", version_show)
+    definition_block = content[definition_create:version_create]
+    version_block = content[version_create:version_wait]
     vm_end = content.index("\naz vm show", vm_create)
     vm_block = content[vm_create:vm_end]
 
-    assert image_create < vm_create
-    assert '--source "$disk_id"' in image_block
-    assert "--os-type Linux" in image_block
-    assert "--hyper-v-generation V2" in image_block
-    assert 'os_disk.get("osState") != "Generalized"' in image_block
-    assert '--image "$image_id"' in vm_block
+    assert (
+        disk_validation
+        < gallery_create
+        < definition_create
+        < version_create
+        < version_wait
+        < version_show
+        < vm_create
+    )
+    assert "image_publisher=zvmi" in content
+    assert "image_offer=freebsd15" in content
+    assert 'image_sku="${short_arch}-${FILESYSTEM}-${FLAVOR}"' in content
+    assert "--permissions Private" in content[gallery_create:definition_create]
+    assert '--publisher "$image_publisher"' in definition_block
+    assert '--offer "$image_offer"' in definition_block
+    assert '--sku "$image_sku"' in definition_block
+    assert "--os-type Linux" in definition_block
+    assert "--os-state Generalized" in definition_block
+    assert "--hyper-v-generation V2" in definition_block
+    assert '--architecture "$azure_image_architecture"' in definition_block
+    assert '--os-snapshot "$disk_id"' in version_block
+    assert "--replication-mode Shallow" in version_block
+    assert '--target-regions "$AZURE_LOCATION=1=Standard_LRS"' in version_block
+    assert "--no-wait" in version_block
+    assert "--created" in content[version_wait:version_show]
+    assert '--image "$image_version_id"' in vm_block
     assert '--admin-username "$admin_username"' in vm_block
     assert "--authentication-type ssh" in vm_block
     assert '--ssh-key-values "$private_key.pub"' in vm_block
@@ -316,18 +374,32 @@ def test_generalized_gen2_image_precedes_provisioned_vm():
     assert "--public-ip-sku Standard" in vm_block
     assert "--nsg-rule SSH" in vm_block
     assert '--boot-diagnostics-storage ""' in vm_block
+    assert "--specialized" not in vm_block
+    assert "az image create" not in content
+    assert "az image show" not in content
     assert "--attach-os-disk" not in content
 
 
-def test_disk_image_and_vm_source_identities_fail_closed():
+def test_disk_gallery_version_and_vm_source_identities_fail_closed():
     content = Path(SCRIPT).read_text(encoding="utf-8")
     assert 'expected_disk_id="/subscriptions/$subscription_id/' in content
     assert 'test "${disk_id,,}" = "${expected_disk_id,,}"' in content
     assert "managed disk architecture mismatch" in content
-    assert "temporary image is not sourced from the exact managed disk" in content
-    assert 'expected_image_id="/subscriptions/$subscription_id/' in content
-    assert 'test "${image_id,,}" = "${expected_image_id,,}"' in content
-    assert "VM is not bound to the exact temporary image" in content
+    assert 'expected_gallery_id="/subscriptions/$subscription_id/' in content
+    assert 'expected_image_definition_id="$expected_gallery_id/images/' in content
+    assert 'image_version_id="$expected_image_definition_id/versions/' in content
+    assert "gallery image-definition architecture mismatch" in content
+    assert "gallery image definition is not Gen2" in content
+    assert "gallery image definition is not generalized" in content
+    assert "gallery image-definition identifier mismatch" in content
+    assert (
+        "gallery image version is not sourced from the exact managed disk"
+        in content
+    )
+    assert "gallery image-version provisioning did not succeed" in content
+    assert "gallery image-version OS disk size mismatch" in content
+    assert "VM is not bound to the exact gallery image version" in content
+    assert "VM OS disk size mismatch" in content
     assert 'expected_vm_id="/subscriptions/$subscription_id/' in content
     assert 'test "${vm_id,,}" = "${expected_vm_id,,}"' in content
     assert "VM architecture mismatch" in content
@@ -339,13 +411,31 @@ def test_disk_image_and_vm_source_identities_fail_closed():
     ) == 2
 
 
-def test_owned_resource_group_cleanup_removes_private_image_and_vm():
+def test_owned_resource_group_cleanup_removes_gallery_disk_and_vm():
     content = Path(SCRIPT).read_text(encoding="utf-8")
-    assert 'image_name="zvmi-image-${name_seed}"' in content
+    for command in (
+        "az disk create",
+        "az sig create",
+        "az sig image-definition create",
+        "az sig image-version create",
+        "az vm create",
+    ):
+        start = content.index(command)
+        end = content.index("--output", start)
+        assert '--resource-group "$resource_group"' in content[start:end]
+    assert 'gallery_name="zvmifb15${name_seed}"' in content
+    assert (
+        'image_definition_name="zvmifb15${short_arch}${FILESYSTEM}${FLAVOR}"'
+        in content
+    )
+    assert 'image_version=1.0.0' in content
     assert 'trap cleanup_on_exit EXIT' in content
     assert 'az group delete --name "$resource_group" --yes' in content
     assert "Owned temporary resource group still exists after deletion" in content
-    assert "az image delete" not in content
+    assert "az sig delete" not in content
+    assert "az sig image-definition delete" not in content
+    assert "az sig image-version delete" not in content
+    assert "az disk delete" not in content
     assert "az vm delete" not in content
 
 
