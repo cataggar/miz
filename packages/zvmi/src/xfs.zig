@@ -2,11 +2,12 @@
 //! on-disk format.
 //!
 //! This is step 1 ("read before write") of the XFS support plan: a general
-//! reader that can later feed `root_tree` with an owned or borrowed tree of
-//! metadata, the way `ext4.zig`'s `GeneralTree`/`scanReadable` and
-//! `squashfs.zig`'s `Reader` already do for their filesystems. Nothing here
-//! is wired into `root_tree`, `capture`, `preserved_image`, or COSI yet, and
-//! nothing here writes to an XFS filesystem.
+//! reader that feeds `root_tree` with an owned or borrowed tree of metadata,
+//! the way `ext4.zig`'s `GeneralTree`/`scanReadable` and `squashfs.zig`'s
+//! `Reader` already do for their filesystems. `root_tree` (`importXfs`/
+//! `mountXfs`), `capture` (root discovery, `--source-root`, `--source-mount`)
+//! and COSI's `/etc/os-release` extraction are all wired to this reader; only
+//! writing to an XFS filesystem remains out of scope.
 //!
 //! Supported on-disk profile (anything outside this list is rejected with a
 //! named error rather than silently skipped or misread):
@@ -508,6 +509,15 @@ pub const Reader = struct {
         return openInternal(allocator, io, file, null, 0);
     }
 
+    /// Like `openFile`, but for a filesystem embedded at `offset` inside a
+    /// larger raw file -- a partition of a disk image read directly through
+    /// its host file, with no guest-visible address translation in between.
+    /// Use `openReadOnlySource` instead when the container itself needs
+    /// translating (qcow2, VHD, VHDX).
+    pub fn openFileAt(allocator: std.mem.Allocator, io: Io, file: Io.File, offset: u64) OpenError!Reader {
+        return openInternal(allocator, io, file, null, offset);
+    }
+
     /// Opens XFS through a guest-visible read-only byte source at `offset`.
     /// `file` is retained only for API/layout compatibility and is never
     /// read while `source` is present.
@@ -587,6 +597,121 @@ pub const Reader = struct {
         std.debug.assert(buffer.len == self.superblock.block_size);
         const offset = try self.fsBlockOffset(fsblock);
         try self.readAt(io, buffer, offset);
+    }
+
+    fn readParsedInode(self: Reader, io: Io, ino: u64) (ReadError || InodeError || std.mem.Allocator.Error)!ParsedInode {
+        const raw = try self.allocator.alloc(u8, self.superblock.inode_size);
+        defer self.allocator.free(raw);
+        try self.readInodeRaw(io, ino, raw);
+        return parseInode(self.superblock, ino, raw, self.allocator);
+    }
+
+    /// Resolves a `/`-separated path (leading slashes and an empty path both
+    /// mean the root) to an inode number by walking one directory listing
+    /// per component, exactly as `ext4.Reader.lookupPath` does. This never
+    /// scans the whole tree, so it stays cheap even against a filesystem too
+    /// large or too limited (by `--max-nodes` and friends) for a full import.
+    fn lookupPath(self: *Reader, io: Io, path: []const u8) LookupError!u64 {
+        if (path.len == 0 or std.mem.eql(u8, path, "/")) return self.superblock.root_ino;
+
+        var current: u64 = self.superblock.root_ino;
+        var start: usize = 0;
+        while (start < path.len) {
+            while (start < path.len and path[start] == '/') : (start += 1) {}
+            if (start >= path.len) break;
+            var end = start;
+            while (end < path.len and path[end] != '/') : (end += 1) {}
+            current = try self.lookupChild(io, current, path[start..end]);
+            start = end + 1;
+        }
+        return current;
+    }
+
+    fn lookupChild(self: *Reader, io: Io, dir_ino: u64, name: []const u8) LookupError!u64 {
+        var dir_inode = try self.readParsedInode(io, dir_ino);
+        defer dir_inode.deinit(self.allocator);
+        if (dir_inode.kind != .directory) return error.NotDirectory;
+
+        const children = try readDirectoryChildren(self, io, self.allocator, dir_inode);
+        defer {
+            for (children) |child| self.allocator.free(child.name);
+            self.allocator.free(children);
+        }
+        for (children) |child| {
+            if (std.mem.eql(u8, child.name, name)) return child.ino;
+        }
+        return error.NotFound;
+    }
+
+    pub const LookupError = ReadError || InodeError || DirectoryError || ExtentError ||
+        std.mem.Allocator.Error || error{ NotFound, NotDirectory };
+
+    pub const Stat = struct {
+        ino: u64,
+        kind: Kind,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        size: u64,
+    };
+
+    pub const StatError = LookupError;
+
+    /// Looks up `path` and reports its kind and POSIX metadata without
+    /// importing anything. Mirrors `ext4.Reader.statPath`, which callers
+    /// probing "does this candidate filesystem look like a root" (an `/etc`
+    /// directory) already rely on; this is what lets that probe treat XFS
+    /// exactly like ext4 rather than as a special case.
+    pub fn statPath(self: *Reader, io: Io, path: []const u8) StatError!Stat {
+        const ino = try self.lookupPath(io, path);
+        var inode = try self.readParsedInode(io, ino);
+        defer inode.deinit(self.allocator);
+        return .{
+            .ino = inode.ino,
+            .kind = inode.kind,
+            .mode = inode.mode,
+            .uid = inode.uid,
+            .gid = inode.gid,
+            .size = inode.size,
+        };
+    }
+
+    pub const ReadFileError = LookupError || error{ NotFile, FileTooLarge };
+
+    /// Reads a regular file's entire content by path without a full tree
+    /// scan, for callers -- COSI's `/etc/os-release` extraction, chiefly --
+    /// that need one file out of a filesystem this reader can open rather
+    /// than everything in it. Mirrors `ext4.Reader.readFileAlloc`.
+    pub fn readFileAlloc(self: *Reader, io: Io, allocator: std.mem.Allocator, path: []const u8) ReadFileError![]u8 {
+        const ino = try self.lookupPath(io, path);
+        var inode = try self.readParsedInode(io, ino);
+        defer inode.deinit(self.allocator);
+        if (inode.kind != .file) return error.NotFile;
+
+        const size = std.math.cast(usize, inode.size) orelse return error.FileTooLarge;
+        const buffer = try allocator.alloc(u8, size);
+        errdefer allocator.free(buffer);
+        if (size == 0) return buffer;
+
+        const data_fork_bytes = try self.allocator.dupe(u8, inode.dataForkBytes());
+        defer self.allocator.free(data_fork_bytes);
+        var content = Content{
+            .reader = self,
+            .io = io,
+            .ino = inode.ino,
+            .size = inode.size,
+            .data_format = inode.data_format,
+            .data_extents = inode.data_extents,
+            .data_fork_bytes = data_fork_bytes,
+        };
+
+        var done: usize = 0;
+        while (done < size) {
+            const got = try contentReadAt(&content, buffer[done..], done);
+            if (got == 0) break;
+            done += got;
+        }
+        return buffer[0..done];
     }
 };
 
@@ -2899,6 +3024,79 @@ pub fn buildSocketVolume(allocator: std.mem.Allocator) ![]u8 {
     return volume;
 }
 
+pub const etc_os_release_ag_blocks: u32 = 16;
+pub const etc_os_release_ag_count: u32 = 1;
+pub const etc_os_release_data_blocks: u64 = etc_os_release_ag_blocks * etc_os_release_ag_count;
+/// Volume label baked into `buildEtcOsReleaseVolume`, exposed so a caller
+/// asserting an XFS source's identity survived a capture/mount has a known
+/// value to check against, the way `test_fs_uuid` already lets it check the
+/// UUID.
+pub const etc_os_release_label: [12]u8 = .{ 'c', 'a', 'p', 'r', 'o', 'o', 't', 0, 0, 0, 0, 0 };
+
+/// A third, minimal synthetic volume: just a root directory holding `/etc`,
+/// which in turn holds `/etc/os-release` with the given `content`. Exposed
+/// (like `buildIntegrationVolume` and `buildSocketVolume`) so `capture.zig`'s
+/// root-discovery tests and `cosi.zig`'s `/etc/os-release` extraction tests
+/// can each prove their XFS path against a genuine `/etc` without either
+/// needing `mkfs.xfs` or hand-rolling their own on-disk bytes.
+pub fn buildEtcOsReleaseVolume(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    std.debug.assert(content.len <= integration_block_size);
+    const volume = try buildVolume(allocator, etc_os_release_data_blocks, integration_block_size);
+    errdefer allocator.free(volume);
+
+    const sb = buildTestSuperblock(.{
+        .block_size = integration_block_size,
+        .sector_size = integration_block_size,
+        .inode_size = integration_block_size,
+        .ag_blocks = etc_os_release_ag_blocks,
+        .ag_count = etc_os_release_ag_count,
+        .data_blocks = etc_os_release_data_blocks,
+        .root_ino = 2,
+        .label = etc_os_release_label,
+    });
+    putBlock(volume, integration_block_size, 0, &sb);
+
+    // root (ino 2): shortform directory -> etc
+    var root_dir = ShortformDirBuilder.init(2);
+    root_dir.append("etc", 3, dir_ft_dir);
+    const root_inode = try buildTestInode(allocator, integration_block_size, .{
+        .ino = 2,
+        .mode = s_ifdir | 0o755,
+        .nlink = 3,
+        .data_format = fmt_local,
+    }, root_dir.finish());
+    defer allocator.free(root_inode);
+    putBlock(volume, integration_block_size, 2, root_inode);
+
+    // etc (ino 3): shortform directory -> os-release
+    var etc_dir = ShortformDirBuilder.init(2);
+    etc_dir.append("os-release", 4, dir_ft_reg_file);
+    const etc_inode = try buildTestInode(allocator, integration_block_size, .{
+        .ino = 3,
+        .mode = s_ifdir | 0o755,
+        .nlink = 2,
+        .data_format = fmt_local,
+    }, etc_dir.finish());
+    defer allocator.free(etc_inode);
+    putBlock(volume, integration_block_size, 3, etc_inode);
+
+    // os-release (ino 4): EXTENTS regular file, content at block 10
+    var extent: [bmbt_rec_size]u8 = undefined;
+    encodeBmbtRec(&extent, 0, 10, 1, false);
+    const os_release_inode = try buildTestInode(allocator, integration_block_size, .{
+        .ino = 4,
+        .mode = s_ifreg | 0o644,
+        .size = content.len,
+        .data_format = fmt_extents,
+        .nextents = 1,
+    }, &extent);
+    defer allocator.free(os_release_inode);
+    putBlock(volume, integration_block_size, 4, os_release_inode);
+    putBlock(volume, integration_block_size, 10, content);
+
+    return volume;
+}
+
 test "the reader scans a hand-built XFS v5 filesystem across two allocation groups" {
     const allocator = testing.allocator;
     const volume = try buildIntegrationVolume(allocator);
@@ -3282,4 +3480,55 @@ test "readExtents rejects a BTREE root whose numrecs exceeds its maxrecs capacit
         1,
         &root_literal,
     ));
+}
+
+test "Reader.statPath finds /etc without a full tree scan" {
+    const allocator = testing.allocator;
+    const os_release = "NAME=zvmi\nID=zvmi\n";
+    const volume = try buildEtcOsReleaseVolume(allocator, os_release);
+    defer allocator.free(volume);
+
+    const path = "test-xfs-stat-path.img";
+    try writeFixture(path, volume);
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    const io = std.testing.io;
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+
+    const root_stat = try reader.statPath(io, "/");
+    try testing.expectEqual(Kind.directory, root_stat.kind);
+
+    const etc_stat = try reader.statPath(io, "/etc");
+    try testing.expectEqual(Kind.directory, etc_stat.kind);
+
+    const os_release_stat = try reader.statPath(io, "etc/os-release");
+    try testing.expectEqual(Kind.file, os_release_stat.kind);
+    try testing.expectEqual(@as(u64, os_release.len), os_release_stat.size);
+
+    try testing.expectError(error.NotFound, reader.statPath(io, "/etc/missing"));
+    try testing.expectError(error.NotFound, reader.statPath(io, "/missing"));
+    try testing.expectError(error.NotDirectory, reader.statPath(io, "/etc/os-release/nope"));
+}
+
+test "Reader.readFileAlloc reads /etc/os-release without a full tree scan" {
+    const allocator = testing.allocator;
+    const os_release = "NAME=zvmi\nID=zvmi\nVERSION_ID=1\n";
+    const volume = try buildEtcOsReleaseVolume(allocator, os_release);
+    defer allocator.free(volume);
+
+    const path = "test-xfs-read-file-alloc.img";
+    try writeFixture(path, volume);
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    const io = std.testing.io;
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+
+    const bytes = try reader.readFileAlloc(io, allocator, "etc/os-release");
+    defer allocator.free(bytes);
+    try testing.expectEqualStrings(os_release, bytes);
+
+    try testing.expectError(error.NotFile, reader.readFileAlloc(io, allocator, "/etc"));
+    try testing.expectError(error.NotFound, reader.readFileAlloc(io, allocator, "/etc/missing"));
 }
