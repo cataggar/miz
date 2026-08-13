@@ -153,9 +153,10 @@ pub fn describeCaptureFailure(err: anyerror) ?[]const u8 {
         error.AccessDenied, error.PermissionDenied => "reading a block device requires root, even though capture only reads it and writes nothing to it",
         error.RootSizeBelowMinimum => "--root-size is smaller than the captured content needs",
         error.EspSizeBelowMinimum => "--esp-size is smaller than the captured EFI system partition needs; note that FAT32 cannot go below about 33.5M whatever it holds",
-        error.SourceRootRequired => "no partition of --source holds an ext4 filesystem, so name the root explicitly with --source-root (e.g. --source-root gpt:2, or --source-root lvm:<vg>/<lv> for a root inside LVM)",
-        error.AmbiguousSourceRoot => "--source holds more than one ext4 filesystem with an /etc, so which one is the root has to be said with --source-root (e.g. --source-root gpt:2). The others can be merged in with --source-mount <spec>=<path>",
-        error.NoRootLikeFilesystem => "--source holds an ext4 filesystem, but none with an /etc, so none of them looks like a root -- a separate /boot on a machine whose root is xfs or btrfs looks exactly like this. Name the root with --source-root, and merge the rest in with --source-mount <spec>=<path>",
+        error.SourceRootRequired => "no partition of --source holds a supported root filesystem (ext4 or xfs), so name the root explicitly with --source-root (e.g. --source-root gpt:2, or --source-root lvm:<vg>/<lv> for a root inside LVM)",
+        error.AmbiguousSourceRoot => "--source holds more than one ext4 or xfs filesystem with an /etc, so which one is the root has to be said with --source-root (e.g. --source-root gpt:2). The others can be merged in with --source-mount <spec>=<path>",
+        error.NoRootLikeFilesystem => "--source holds an ext4 or xfs filesystem, but none with an /etc, so none of them looks like a root -- a separate /boot on a machine whose root is btrfs or another unsupported filesystem looks exactly like this. Name the root with --source-root, and merge the rest in with --source-mount <spec>=<path>",
+        error.UnrecognizedRootFilesystem => "this is neither an ext4 nor an xfs filesystem",
         error.SourceHasNoPartitionTable => "a gpt:<n> spec needs --source to be a disk with a GPT; name a device or image directly instead",
         error.PartitionNotFound => "--source has no partition with that number; the numbering matches lsblk and parted, from one",
         error.InvalidGptIndex => "a partition spec is gpt:<n>, numbered from one as lsblk and parted number them",
@@ -400,9 +401,9 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
 
     var diagnostic = zvmi.limits.Diagnostic{};
 
-    var root_reader = openSourceExt4(gpa, io, root_source) catch |err|
-        return failWithHint("capture: the root source is not an ext4 filesystem", err);
-    defer root_reader.deinit();
+    var root_reader = openSourceFilesystem(gpa, io, root_source) catch |err|
+        return failWithHint("capture: the root source is not a supported filesystem (ext4 or xfs)", err);
+    defer root_reader.deinit(io);
 
     // A root named by path rather than as a partition of --source carries no
     // PARTUUID this can retire, so a `PARTUUID=`-rooted fstab would come
@@ -410,12 +411,8 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
     // retired, the verification pass would have nothing to match and would
     // report a clean rewrite. Silence is the failure mode worth avoiding.
     if (request.rewrite_identities and root_source.partition == null) {
-        warnUnretirablePartitionReference(gpa, io, root_reader);
+        warnUnretirablePartitionReference(gpa, io, &root_reader);
     }
-
-    var root_scan = zvmi.ext4.scanReadable(&root_reader, io, gpa, scanOptions(request.limits, root_source.length, &diagnostic)) catch |err|
-        return failLimits("capture: reading the root filesystem failed", err, &diagnostic);
-    defer root_scan.deinit();
 
     const spool_path = stagingPath(gpa, request.destination, ".spool") catch
         return fail("capture: out of memory", .{});
@@ -427,9 +424,6 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
     defer tree.deinit();
     tree.diagnostic = &diagnostic;
 
-    tree.importExt4General(&root_scan) catch |err|
-        return failLimits("capture: importing the root filesystem failed", err, &diagnostic);
-
     var sources = std.array_list.Managed(zvmi.disk_assembly.SourceFilesystem).init(gpa);
     defer sources.deinit();
     var identifier_storage = std.array_list.Managed([]u8).init(gpa);
@@ -438,11 +432,43 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
         identifier_storage.deinit();
     }
 
-    const root_uuid = ownedUuid(gpa, &identifier_storage, &root_scan.identity.uuid) catch
-        return fail("capture: out of memory", .{});
-    const root_label = ownedLabel(gpa, &identifier_storage, &root_scan.identity.label) catch
-        return fail("capture: out of memory", .{});
-    var root_before = zvmi.identity_rewrite.Identifiers{ .filesystem_uuid = root_uuid, .filesystem_label = root_label };
+    // Scanning, importing and identity extraction all read from types that
+    // differ by filesystem (`ext4.GeneralTree` vs `xfs.Tree`), so this is
+    // the one place that switches on which the root turned out to be; the
+    // rest of `capture` -- staging, sizing, identity rewriting, output --
+    // never needs to know.
+    const root_identity: struct { uuid: []const u8, label: ?[]const u8 } = switch (root_reader) {
+        .ext4 => |*reader| blk: {
+            var root_scan = zvmi.ext4.scanReadable(reader, io, gpa, scanOptions(request.limits, root_source.length, &diagnostic)) catch |err|
+                return failLimits("capture: reading the root filesystem failed", err, &diagnostic);
+            defer root_scan.deinit();
+
+            tree.importExt4General(&root_scan) catch |err|
+                return failLimits("capture: importing the root filesystem failed", err, &diagnostic);
+
+            const uuid = ownedUuid(gpa, &identifier_storage, &root_scan.identity.uuid) catch
+                return fail("capture: out of memory", .{});
+            const label = ownedLabel(gpa, &identifier_storage, &root_scan.identity.label) catch
+                return fail("capture: out of memory", .{});
+            break :blk .{ .uuid = uuid, .label = label };
+        },
+        .xfs => |*reader| blk: {
+            var root_scan = zvmi.xfs.scanReadable(reader, io, gpa, xfsScanOptions(request.limits, root_source.length, &diagnostic)) catch |err|
+                return failLimits("capture: reading the root filesystem failed", err, &diagnostic);
+            defer root_scan.deinit();
+
+            tree.importXfs(&root_scan) catch |err|
+                return failLimits("capture: importing the root filesystem failed", err, &diagnostic);
+
+            const uuid = ownedUuid(gpa, &identifier_storage, &root_scan.identity.uuid) catch
+                return fail("capture: out of memory", .{});
+            const label = ownedLabel(gpa, &identifier_storage, &root_scan.identity.label) catch
+                return fail("capture: out of memory", .{});
+            break :blk .{ .uuid = uuid, .label = label };
+        },
+    };
+
+    var root_before = zvmi.identity_rewrite.Identifiers{ .filesystem_uuid = root_identity.uuid, .filesystem_label = root_identity.label };
     ownedPartition(gpa, &identifier_storage, root_source.partition, &root_before) catch
         return fail("capture: out of memory", .{});
     sources.append(.{
@@ -458,22 +484,42 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
         const opened = resolveSpec(gpa, io, &disk, table, mount.source, &scratch) catch |err|
             return failWithHint("capture: cannot read a --source-mount filesystem", err);
 
-        var reader = openSourceExt4(gpa, io, opened) catch |err|
-            return failWithHint("capture: a --source-mount filesystem is not ext4", err);
-        defer reader.deinit();
+        var reader = openSourceFilesystem(gpa, io, opened) catch |err|
+            return failWithHint("capture: a --source-mount filesystem is not a supported filesystem (ext4 or xfs)", err);
+        defer reader.deinit(io);
 
-        var scan = zvmi.ext4.scanReadable(&reader, io, gpa, scanOptions(request.limits, opened.length, &diagnostic)) catch |err|
-            return failLimits("capture: reading a --source-mount filesystem failed", err, &diagnostic);
-        defer scan.deinit();
+        const mount_identity: struct { uuid: []const u8, label: ?[]const u8 } = switch (reader) {
+            .ext4 => |*r| blk: {
+                var scan = zvmi.ext4.scanReadable(r, io, gpa, scanOptions(request.limits, opened.length, &diagnostic)) catch |err|
+                    return failLimits("capture: reading a --source-mount filesystem failed", err, &diagnostic);
+                defer scan.deinit();
 
-        _ = tree.mountExt4General(&scan, mount.target) catch |err|
-            return failWithHint("capture: mounting a --source-mount filesystem failed", err);
+                _ = tree.mountExt4General(&scan, mount.target) catch |err|
+                    return failWithHint("capture: mounting a --source-mount filesystem failed", err);
 
-        const uuid = ownedUuid(gpa, &identifier_storage, &scan.identity.uuid) catch
-            return fail("capture: out of memory", .{});
-        const mount_label = ownedLabel(gpa, &identifier_storage, &scan.identity.label) catch
-            return fail("capture: out of memory", .{});
-        var mount_before = zvmi.identity_rewrite.Identifiers{ .filesystem_uuid = uuid, .filesystem_label = mount_label };
+                const uuid = ownedUuid(gpa, &identifier_storage, &scan.identity.uuid) catch
+                    return fail("capture: out of memory", .{});
+                const label = ownedLabel(gpa, &identifier_storage, &scan.identity.label) catch
+                    return fail("capture: out of memory", .{});
+                break :blk .{ .uuid = uuid, .label = label };
+            },
+            .xfs => |*r| blk: {
+                var scan = zvmi.xfs.scanReadable(r, io, gpa, xfsScanOptions(request.limits, opened.length, &diagnostic)) catch |err|
+                    return failLimits("capture: reading a --source-mount filesystem failed", err, &diagnostic);
+                defer scan.deinit();
+
+                _ = tree.mountXfs(&scan, mount.target) catch |err|
+                    return failWithHint("capture: mounting a --source-mount filesystem failed", err);
+
+                const uuid = ownedUuid(gpa, &identifier_storage, &scan.identity.uuid) catch
+                    return fail("capture: out of memory", .{});
+                const label = ownedLabel(gpa, &identifier_storage, &scan.identity.label) catch
+                    return fail("capture: out of memory", .{});
+                break :blk .{ .uuid = uuid, .label = label };
+            },
+        };
+
+        var mount_before = zvmi.identity_rewrite.Identifiers{ .filesystem_uuid = mount_identity.uuid, .filesystem_label = mount_identity.label };
         ownedPartition(gpa, &identifier_storage, opened.partition, &mount_before) catch
             return fail("capture: out of memory", .{});
         sources.append(.{
@@ -668,11 +714,140 @@ fn openSourceExt4(
     );
 }
 
+fn openSourceXfs(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    opened: OpenedSource,
+) zvmi.xfs.OpenError!zvmi.xfs.Reader {
+    return zvmi.xfs.Reader.openReadOnlySource(
+        gpa,
+        io,
+        opened.image.file,
+        .{ .ctx = opened.image, .read_at_fn = imageReadAt },
+        opened.offset,
+    );
+}
+
+/// A root or --source-mount filesystem, once its type has been resolved.
+/// Small on purpose: everything that genuinely differs by filesystem type
+/// (scanning, importing/mounting into the staging tree, and closing the
+/// reader) is a two-armed switch at the one or two call sites that need it,
+/// rather than a wider abstraction this task's XFS read path does not need.
+const RootReader = union(enum) {
+    ext4: zvmi.ext4.Reader,
+    xfs: zvmi.xfs.Reader,
+
+    fn deinit(self: *RootReader, io: std.Io) void {
+        switch (self.*) {
+            .ext4 => |*reader| reader.deinit(),
+            .xfs => |*reader| reader.close(io),
+        }
+    }
+
+    /// Whether this candidate's root directory has an /etc. Any failure to
+    /// even stat it -- not just "no such entry" -- is treated as "no",
+    /// matching the ext4-only check this generalises.
+    fn hasEtc(self: *RootReader, io: std.Io) bool {
+        return switch (self.*) {
+            .ext4 => |*reader| blk: {
+                const stat = reader.statPath(io, "/etc") catch break :blk false;
+                break :blk stat.kind == .directory;
+            },
+            .xfs => |*reader| blk: {
+                const stat = reader.statPath(io, "/etc") catch break :blk false;
+                break :blk stat.kind == .directory;
+            },
+        };
+    }
+
+    /// Best-effort file read used only by `warnUnretirablePartitionReference`,
+    /// which already treats any failure the same way (silence).
+    fn readFileAlloc(self: *RootReader, io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+        return switch (self.*) {
+            .ext4 => |*reader| try reader.readFileAlloc(io, gpa, path),
+            .xfs => |*reader| try reader.readFileAlloc(io, gpa, path),
+        };
+    }
+};
+
+/// Whether opening a candidate as ext4 failed only because it plainly is not
+/// one -- wrong magic, an unrecognised feature bit this general reader has
+/// no specific name for, or a source too short to even hold a superblock --
+/// as opposed to a genuine read failure or a *named*, specifically
+/// unsupported ext4 feature, which is a real failure worth reporting rather
+/// than silently treating the candidate as absent.
+fn isNotExt4(err: zvmi.ext4.GeneralOpenError) bool {
+    return switch (err) {
+        error.BadMagic,
+        error.UnsupportedFilesystemFeature,
+        error.UnsupportedBlockSize,
+        error.UnexpectedEndOfFile,
+        => true,
+        else => false,
+    };
+}
+
+/// The XFS analogue of `isNotExt4`: wrong magic, an unrecognised incompat
+/// bit (this reader's equivalent of ext4's own "unknown feature" catch-all),
+/// or a source too short to even hold a superblock.
+fn isNotXfs(err: zvmi.xfs.OpenError) bool {
+    return switch (err) {
+        error.BadMagic,
+        error.UnsupportedIncompatFeature,
+        error.UnexpectedEndOfFile,
+        => true,
+        else => false,
+    };
+}
+
+pub const FsOpenError = (zvmi.ext4.GeneralOpenError || zvmi.xfs.OpenError) || error{UnrecognizedRootFilesystem};
+
+/// Opens `opened` as whichever supported filesystem it holds. ext4 is tried
+/// first only because its own checks run first; neither guess is favoured
+/// once a filesystem is actually found. Failing both guesses in a way that
+/// means "plainly neither" (see `isNotExt4`/`isNotXfs`) is reported as
+/// `error.UnrecognizedRootFilesystem`, filesystem-neutral by construction so
+/// `resolveRoot`'s discovery loop can treat it as "not a candidate" and an
+/// explicit --source-root/--source-mount can turn it into a user-facing
+/// message. Anything else -- an unreadable disk, an exhausted allocator, a
+/// named and specifically unsupported feature -- is a real failure and
+/// propagates as itself.
+fn openSourceFilesystem(gpa: std.mem.Allocator, io: std.Io, opened: OpenedSource) FsOpenError!RootReader {
+    const ext4_reader = openSourceExt4(gpa, io, opened) catch |ext4_err| {
+        if (!isNotExt4(ext4_err)) return ext4_err;
+        const xfs_reader = openSourceXfs(gpa, io, opened) catch |xfs_err| {
+            if (!isNotXfs(xfs_err)) return xfs_err;
+            return error.UnrecognizedRootFilesystem;
+        };
+        return .{ .xfs = xfs_reader };
+    };
+    return .{ .ext4 = ext4_reader };
+}
+
 fn scanOptions(
     limits: zvmi.limits.ImportLimits,
     available_length: u64,
     diagnostic: *zvmi.limits.Diagnostic,
 ) zvmi.ext4.GeneralScanOptions {
+    return .{
+        .available_length = available_length,
+        .max_nodes = limits.max_nodes,
+        .max_path_bytes = limits.max_path_bytes,
+        .max_component_bytes = limits.max_component_bytes,
+        .max_file_bytes = limits.max_file_bytes,
+        .max_total_bytes = limits.max_total_bytes,
+        .max_xattrs_per_node = limits.max_xattrs_per_node,
+        .max_xattr_bytes_per_node = limits.max_xattr_bytes_per_node,
+        .max_scan_metadata_bytes = limits.max_scan_metadata_bytes,
+        .diagnostic = diagnostic,
+    };
+}
+
+fn xfsScanOptions(
+    limits: zvmi.limits.ImportLimits,
+    available_length: u64,
+    diagnostic: *zvmi.limits.Diagnostic,
+) zvmi.xfs.ScanOptions {
     return .{
         .available_length = available_length,
         .max_nodes = limits.max_nodes,
@@ -699,20 +874,22 @@ fn resolveRoot(
         const spec = try parseSourceSpec(text);
         return resolveSpec(gpa, io, disk, table, spec, scratch);
     }
-    // With no --source-root, the root is whichever partition holds an ext4
-    // filesystem -- provided exactly one does. That is a fact read off the
-    // disk rather than a guess, and it covers the ordinary single-root
-    // install. Ambiguity is refused, never resolved: "the biggest one" would
-    // be right often enough to be trusted and wrong often enough to matter.
+    // With no --source-root, the root is whichever partition holds a
+    // supported filesystem -- ext4 or xfs -- provided exactly one does. That
+    // is a fact read off the disk rather than a guess, and it covers the
+    // ordinary single-root install. Ambiguity is refused, never resolved:
+    // "the biggest one" would be right often enough to be trusted and wrong
+    // often enough to matter.
     const parsed = table orelse
         return .{ .image = disk, .offset = 0, .length = disk.virtual_size };
 
     var found: ?OpenedSource = null;
-    var saw_ext4 = false;
+    var saw_supported_fs = false;
     for (parsed.partitions) |entry| {
         if (entry.isEmpty()) continue;
-        // An ESP is FAT and would never probe as ext4, but skipping it by
-        // type keeps the candidate set to partitions that could be a root.
+        // An ESP is FAT and would never probe as ext4 or xfs, but skipping
+        // it by type keeps the candidate set to partitions that could be a
+        // root.
         if (std.mem.eql(u8, &entry.partition_type_guid, &zvmi.guid.esp)) continue;
         const candidate = OpenedSource{
             .image = disk,
@@ -720,34 +897,31 @@ fn resolveRoot(
             .length = (entry.last_lba - entry.first_lba + 1) * zvmi.gpt.sector_size,
             .partition = entry,
         };
-        var probe = openSourceExt4(gpa, io, candidate) catch |err| switch (err) {
-            // Not an ext4 filesystem, or not one this can read: both mean
-            // "not a candidate". Anything else -- an unreadable disk, an
-            // exhausted allocator -- is a real failure, and reporting it as
-            // "no partition holds an ext4 filesystem" would be a false
-            // statement about the disk rather than a diagnosis.
-            error.BadMagic,
-            error.UnsupportedFilesystemFeature,
-            error.UnsupportedBlockSize,
-            error.UnexpectedEndOfFile,
-            => continue,
+        var probe = openSourceFilesystem(gpa, io, candidate) catch |err| switch (err) {
+            // Neither an ext4 nor an xfs filesystem, or not one this can
+            // read: both mean "not a candidate". Anything else -- an
+            // unreadable disk, an exhausted allocator -- is a real failure,
+            // and reporting it as "no partition holds a supported
+            // filesystem" would be a false statement about the disk rather
+            // than a diagnosis.
+            error.UnrecognizedRootFilesystem => continue,
             else => return err,
         };
-        defer probe.deinit();
-        saw_ext4 = true;
+        defer probe.deinit(io);
+        saw_supported_fs = true;
 
-        // Holding an ext4 filesystem is not being the root. A separate /boot
-        // is ext4 on plenty of systems whose root is xfs or btrfs, and
-        // capturing it would produce a plausible image of the wrong thing.
-        // Every root has /etc; no /boot, /var or /home does.
-        const etc = probe.statPath(io, "/etc") catch continue;
-        if (etc.kind != .directory) continue;
+        // Holding a supported filesystem is not being the root. A separate
+        // /boot is ext4 (or xfs) on plenty of systems whose root is
+        // something else entirely, and capturing it would produce a
+        // plausible image of the wrong thing. Every root has /etc; no
+        // /boot, /var or /home does.
+        if (!probe.hasEtc(io)) continue;
 
         if (found != null) return error.AmbiguousSourceRoot;
         found = candidate;
     }
     if (found) |value| return value;
-    return if (saw_ext4) error.NoRootLikeFilesystem else error.SourceRootRequired;
+    return if (saw_supported_fs) error.NoRootLikeFilesystem else error.SourceRootRequired;
 }
 
 fn resolveSpec(
@@ -838,7 +1012,7 @@ fn ownedLabel(
 /// Warns when the captured fstab names the source by an identifier this
 /// capture cannot replace. Best effort by design: an unreadable or absent
 /// fstab is not itself a problem, and this only ever adds a warning.
-fn warnUnretirablePartitionReference(gpa: std.mem.Allocator, io: std.Io, reader: zvmi.ext4.Reader) void {
+fn warnUnretirablePartitionReference(gpa: std.mem.Allocator, io: std.Io, reader: *RootReader) void {
     const fstab = reader.readFileAlloc(io, gpa, "/etc/fstab") catch return;
     defer gpa.free(fstab);
     const kind: []const u8 = if (std.mem.indexOf(u8, fstab, "PARTUUID=") != null)
@@ -1117,4 +1291,409 @@ test "the failures an operator is most likely to hit explain themselves" {
 
     // Errors that already read well are left alone rather than restated.
     try std.testing.expect(describeCaptureFailure(error.OutOfMemory) == null);
+}
+
+// ---------------------------------------------------------------------------
+// XFS source support: automatic root discovery, ext4/xfs ambiguity, explicit
+// root/mount import with identity preservation, and malformed-XFS handling.
+//
+// These are the first tests in this file to drive `resolveRoot`,
+// `resolveSpec` and `openSourceFilesystem` themselves rather than the pure
+// parsing/message helpers above, so the ambiguity test needs a genuine ext4
+// fixture too; `TestInMemoryTree` below is a local copy of the same
+// `FileTreeView` implementation `cosi.zig` keeps privately for exactly this
+// purpose (ext4.zig's own equivalent is private to that file).
+// ---------------------------------------------------------------------------
+
+const TestInMemoryEntry = struct {
+    path: []const u8,
+    kind: zvmi.ext4.Kind,
+    mode: u16,
+    uid: u32 = 0,
+    gid: u32 = 0,
+    size: u64 = 0,
+    bytes: []const u8 = "",
+};
+
+const TestInMemoryTree = struct {
+    entries: []const TestInMemoryEntry,
+    index: usize = 0,
+    view: zvmi.ext4.FileTreeView,
+
+    fn init(entries: []const TestInMemoryEntry) TestInMemoryTree {
+        return .{
+            .entries = entries,
+            .view = .{ .ctx = undefined, .next_fn = next, .reset_fn = reset },
+        };
+    }
+
+    /// A separate step from `init` so `view.ctx` is bound only once the tree
+    /// is in its final, stable storage location rather than the temporary
+    /// returned by `init` itself.
+    fn bind(self: *TestInMemoryTree) void {
+        self.view = .{ .ctx = self, .next_fn = next, .reset_fn = reset };
+    }
+
+    fn reset(ctx: *anyopaque) void {
+        const self: *TestInMemoryTree = @ptrCast(@alignCast(ctx));
+        self.index = 0;
+    }
+
+    fn next(ctx: *anyopaque) zvmi.ext4.FileTreeView.IteratorError!?zvmi.ext4.FileTreeView.Entry {
+        const self: *TestInMemoryTree = @ptrCast(@alignCast(ctx));
+        if (self.index >= self.entries.len) return null;
+        const entry = self.entries[self.index];
+        self.index += 1;
+        return .{
+            .path = entry.path,
+            .kind = entry.kind,
+            .mode = entry.mode,
+            .uid = entry.uid,
+            .gid = entry.gid,
+            .size = entry.size,
+            .content = switch (entry.kind) {
+                .file, .symlink => .{ .ctx = &self.entries[self.index - 1], .read_at_fn = readContent },
+                else => null,
+            },
+        };
+    }
+
+    fn readContent(ctx: *const anyopaque, buffer: []u8, offset: u64) zvmi.ext4.FileTreeView.ContentError!usize {
+        const entry: *const TestInMemoryEntry = @ptrCast(@alignCast(ctx));
+        const off = std.math.cast(usize, offset) orelse return error.UnexpectedEndOfStream;
+        if (off > entry.bytes.len) return error.UnexpectedEndOfStream;
+        const n = @min(buffer.len, entry.bytes.len - off);
+        std.mem.copyForwards(u8, buffer[0..n], entry.bytes[off .. off + n]);
+        return n;
+    }
+};
+
+/// Writes a real ext4 filesystem holding just `/etc/os-release` at `offset`
+/// within `file`, so ambiguity tests have a genuine ext4 root candidate
+/// alongside a synthetic xfs one built by `zvmi.xfs.buildEtcOsReleaseVolume`.
+fn writeExt4EtcRoot(
+    io: std.Io,
+    file: std.Io.File,
+    offset: u64,
+    length: u64,
+    uuid: [16]u8,
+    label: []const u8,
+    os_release: []const u8,
+) !void {
+    var tree = TestInMemoryTree.init(&[_]TestInMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o755 },
+        .{ .path = "etc/os-release", .kind = .file, .mode = 0o644, .size = os_release.len, .bytes = os_release },
+    });
+    tree.bind();
+    _ = try zvmi.ext4.populate(io, file, std.testing.allocator, &tree.view, .{
+        .offset = offset,
+        .length = length,
+        .uuid = uuid,
+        .label = label,
+    });
+}
+
+/// A `CaptureRequest` with every field a test does not care about set to a
+/// harmless default; only `root_spec_text` varies across the tests below.
+fn testCaptureRequest(root_spec_text: ?[]const u8) CaptureRequest {
+    return .{
+        .source_path = "",
+        .root_spec_text = root_spec_text,
+        .esp_spec_text = null,
+        .no_esp = true,
+        .mounts = &.{},
+        .root_size = null,
+        .esp_size = null,
+        .architecture = .auto,
+        .label = "",
+        .selinux_label = null,
+        .journal = false,
+        .rewrite_identities = false,
+        .dry_run = true,
+        .spec = .{ .format = .raw },
+        .destination = .stdout,
+        .level = null,
+        .limits = .{},
+    };
+}
+
+test "resolveRoot finds an XFS root automatically, skipping the ESP" {
+    const io = std.testing.io;
+    const path = "test-capture-xfs-auto-root.img";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const os_release = "NAME=zvmi\nID=zvmi\n";
+    const volume = try zvmi.xfs.buildEtcOsReleaseVolume(std.testing.allocator, os_release);
+    defer std.testing.allocator.free(volume);
+
+    var img = try zvmi.Image.create(io, path, .raw, 8 * 1024 * 1024, .{});
+    defer img.close(io);
+
+    const specs = [_]zvmi.gpt.PartitionSpec{
+        .{
+            .type_guid = zvmi.guid.esp,
+            .unique_guid = zvmi.guid.parse("11111111-1111-1111-1111-111111111111"),
+            .size_sectors = 2048,
+            .name_utf16le = zvmi.gpt.asciiName("EFI System"),
+        },
+        .{
+            .type_guid = zvmi.guid.parse("22222222-2222-2222-2222-222222222222"),
+            .unique_guid = zvmi.guid.parse("33333333-3333-3333-3333-333333333333"),
+            .size_sectors = 2048,
+            .name_utf16le = zvmi.gpt.asciiName("root"),
+        },
+    };
+    var placements: [specs.len]zvmi.gpt.Placement = undefined;
+    try zvmi.gpt.writeGpt(&img, io, zvmi.guid.parse("44444444-4444-4444-4444-444444444444"), &specs, &placements);
+
+    const root_offset = placements[1].first_lba * zvmi.gpt.sector_size;
+    try img.pwrite(io, volume, root_offset);
+
+    const table = try zvmi.gpt.readGpt(img, io, std.testing.allocator);
+    defer std.testing.allocator.free(table.partitions);
+
+    var scratch = std.array_list.Managed(*zvmi.Image).init(std.testing.allocator);
+    defer {
+        for (scratch.items) |opened| {
+            opened.close(io);
+            std.testing.allocator.destroy(opened);
+        }
+        scratch.deinit();
+    }
+
+    const request = testCaptureRequest(null);
+    const found = try resolveRoot(std.testing.allocator, io, &img, table, request, &scratch);
+    try std.testing.expectEqual(root_offset, found.offset);
+    try std.testing.expectEqual(@as(u64, 2048 * zvmi.gpt.sector_size), found.length);
+
+    var reader = try openSourceFilesystem(std.testing.allocator, io, found);
+    defer reader.deinit(io);
+    try std.testing.expect(reader == .xfs);
+    try std.testing.expect(reader.hasEtc(io));
+}
+
+test "resolveRoot refuses ambiguity between an ext4 root and an xfs root" {
+    const io = std.testing.io;
+    const path = "test-capture-xfs-ext4-ambiguous.img";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const os_release = "NAME=zvmi\nID=zvmi\n";
+    const volume = try zvmi.xfs.buildEtcOsReleaseVolume(std.testing.allocator, os_release);
+    defer std.testing.allocator.free(volume);
+
+    var img = try zvmi.Image.create(io, path, .raw, 32 * 1024 * 1024, .{});
+    defer img.close(io);
+
+    const specs = [_]zvmi.gpt.PartitionSpec{
+        .{
+            .type_guid = zvmi.guid.esp,
+            .unique_guid = zvmi.guid.parse("11111111-1111-1111-1111-111111111111"),
+            .size_sectors = 2048,
+            .name_utf16le = zvmi.gpt.asciiName("EFI System"),
+        },
+        .{
+            .type_guid = zvmi.guid.parse("22222222-2222-2222-2222-222222222222"),
+            .unique_guid = zvmi.guid.parse("33333333-3333-3333-3333-333333333333"),
+            .size_sectors = 16384,
+            .name_utf16le = zvmi.gpt.asciiName("ext4root"),
+        },
+        .{
+            .type_guid = zvmi.guid.parse("55555555-5555-5555-5555-555555555555"),
+            .unique_guid = zvmi.guid.parse("66666666-6666-6666-6666-666666666666"),
+            .size_sectors = 2048,
+            .name_utf16le = zvmi.gpt.asciiName("xfsroot"),
+        },
+    };
+    var placements: [specs.len]zvmi.gpt.Placement = undefined;
+    try zvmi.gpt.writeGpt(&img, io, zvmi.guid.parse("77777777-7777-7777-7777-777777777777"), &specs, &placements);
+
+    const ext4_offset = placements[1].first_lba * zvmi.gpt.sector_size;
+    const ext4_length = (placements[1].last_lba - placements[1].first_lba + 1) * zvmi.gpt.sector_size;
+    try writeExt4EtcRoot(
+        io,
+        img.file,
+        ext4_offset,
+        ext4_length,
+        [_]u8{0xAA} ** 16,
+        "extroot",
+        os_release,
+    );
+
+    const xfs_offset = placements[2].first_lba * zvmi.gpt.sector_size;
+    try img.pwrite(io, volume, xfs_offset);
+
+    const table = try zvmi.gpt.readGpt(img, io, std.testing.allocator);
+    defer std.testing.allocator.free(table.partitions);
+
+    var scratch = std.array_list.Managed(*zvmi.Image).init(std.testing.allocator);
+    defer {
+        for (scratch.items) |opened| {
+            opened.close(io);
+            std.testing.allocator.destroy(opened);
+        }
+        scratch.deinit();
+    }
+
+    const request = testCaptureRequest(null);
+    try std.testing.expectError(
+        error.AmbiguousSourceRoot,
+        resolveRoot(std.testing.allocator, io, &img, table, request, &scratch),
+    );
+}
+
+test "an explicit XFS --source-root is opened, scanned and imported, preserving its identity" {
+    const io = std.testing.io;
+    const path = "test-capture-xfs-explicit-root.img";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const os_release = "NAME=zvmi\nID=zvmi\n";
+    const volume = try zvmi.xfs.buildEtcOsReleaseVolume(std.testing.allocator, os_release);
+    defer std.testing.allocator.free(volume);
+
+    var img = try zvmi.Image.create(io, path, .raw, volume.len, .{});
+    defer img.close(io);
+    try img.pwrite(io, volume, 0);
+
+    var disk = try zvmi.Image.openPathReadOnly(io, path);
+    defer disk.close(io);
+
+    var scratch = std.array_list.Managed(*zvmi.Image).init(std.testing.allocator);
+    defer {
+        for (scratch.items) |opened| {
+            opened.close(io);
+            std.testing.allocator.destroy(opened);
+        }
+        scratch.deinit();
+    }
+
+    const request = testCaptureRequest(path);
+    const found = try resolveRoot(std.testing.allocator, io, &disk, null, request, &scratch);
+
+    var reader = try openSourceFilesystem(std.testing.allocator, io, found);
+    defer reader.deinit(io);
+    try std.testing.expect(reader == .xfs);
+
+    var diagnostic = zvmi.limits.Diagnostic{};
+    var scan = try zvmi.xfs.scanReadable(&reader.xfs, io, std.testing.allocator, xfsScanOptions(.{}, found.length, &diagnostic));
+    defer scan.deinit();
+
+    var tree = zvmi.root_tree.RootTree.initMemory(std.testing.allocator, io, (zvmi.limits.ImportLimits{}).tree());
+    defer tree.deinit();
+    try tree.importXfs(&scan);
+
+    const content = try tree.readFileAlloc(std.testing.allocator, "etc/os-release", 4096);
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings(os_release, content);
+
+    var identifier_storage = std.array_list.Managed([]u8).init(std.testing.allocator);
+    defer {
+        for (identifier_storage.items) |owned| std.testing.allocator.free(owned);
+        identifier_storage.deinit();
+    }
+    const uuid = try ownedUuid(std.testing.allocator, &identifier_storage, &scan.identity.uuid);
+    try std.testing.expectEqualStrings("01020304-0506-0708-090a-0b0c0d0e0f10", uuid);
+    const label = try ownedLabel(std.testing.allocator, &identifier_storage, &scan.identity.label);
+    try std.testing.expectEqualStrings("caproot", label.?);
+}
+
+test "an explicit XFS --source-mount is opened, scanned and mounted" {
+    const io = std.testing.io;
+    const path = "test-capture-xfs-explicit-mount.img";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const os_release = "NAME=zvmi\nID=zvmi\n";
+    const volume = try zvmi.xfs.buildEtcOsReleaseVolume(std.testing.allocator, os_release);
+    defer std.testing.allocator.free(volume);
+
+    var img = try zvmi.Image.create(io, path, .raw, volume.len, .{});
+    defer img.close(io);
+    try img.pwrite(io, volume, 0);
+
+    var disk = try zvmi.Image.openPathReadOnly(io, path);
+    defer disk.close(io);
+
+    var scratch = std.array_list.Managed(*zvmi.Image).init(std.testing.allocator);
+    defer {
+        for (scratch.items) |opened| {
+            opened.close(io);
+            std.testing.allocator.destroy(opened);
+        }
+        scratch.deinit();
+    }
+
+    const opened = try resolveSpec(std.testing.allocator, io, &disk, null, .{ .path = path }, &scratch);
+
+    var reader = try openSourceFilesystem(std.testing.allocator, io, opened);
+    defer reader.deinit(io);
+    try std.testing.expect(reader == .xfs);
+
+    var diagnostic = zvmi.limits.Diagnostic{};
+    var scan = try zvmi.xfs.scanReadable(&reader.xfs, io, std.testing.allocator, xfsScanOptions(.{}, opened.length, &diagnostic));
+    defer scan.deinit();
+
+    var tree = zvmi.root_tree.RootTree.initMemory(std.testing.allocator, io, (zvmi.limits.ImportLimits{}).tree());
+    defer tree.deinit();
+    // The mount point must already exist as a directory: `mountXfs` replaces
+    // its contents but never creates it, the same way `mount(8)` refuses a
+    // missing target rather than inventing one.
+    try tree.putDirectory("data", .{ .mode = 0o755 });
+    _ = try tree.mountXfs(&scan, "/data");
+
+    const content = try tree.readFileAlloc(std.testing.allocator, "data/etc/os-release", 4096);
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings(os_release, content);
+}
+
+test "a malformed XFS candidate propagates as a genuine failure, not a silently skipped one" {
+    const io = std.testing.io;
+    const path = "test-capture-xfs-malformed.img";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var img = try zvmi.Image.create(io, path, .raw, 8 * 1024 * 1024, .{});
+    defer img.close(io);
+
+    const specs = [_]zvmi.gpt.PartitionSpec{
+        .{
+            .type_guid = zvmi.guid.esp,
+            .unique_guid = zvmi.guid.parse("11111111-1111-1111-1111-111111111111"),
+            .size_sectors = 2048,
+            .name_utf16le = zvmi.gpt.asciiName("EFI System"),
+        },
+        .{
+            .type_guid = zvmi.guid.parse("22222222-2222-2222-2222-222222222222"),
+            .unique_guid = zvmi.guid.parse("33333333-3333-3333-3333-333333333333"),
+            .size_sectors = 2048,
+            .name_utf16le = zvmi.gpt.asciiName("root"),
+        },
+    };
+    var placements: [specs.len]zvmi.gpt.Placement = undefined;
+    try zvmi.gpt.writeGpt(&img, io, zvmi.guid.parse("44444444-4444-4444-4444-444444444444"), &specs, &placements);
+
+    // XFS's own magic with an otherwise-zeroed superblock: real enough to
+    // rule out "not XFS at all" (`isNotXfs`'s skip list), but a version
+    // field no reader supports -- exactly the case that must surface as
+    // `error.UnsupportedSuperblockVersion` rather than being reported as
+    // "no root filesystem found".
+    var malformed = [_]u8{0} ** 512;
+    std.mem.writeInt(u32, malformed[0..4], zvmi.xfs.magic, .big);
+    const root_offset = placements[1].first_lba * zvmi.gpt.sector_size;
+    try img.pwrite(io, &malformed, root_offset);
+
+    const table = try zvmi.gpt.readGpt(img, io, std.testing.allocator);
+    defer std.testing.allocator.free(table.partitions);
+
+    var scratch = std.array_list.Managed(*zvmi.Image).init(std.testing.allocator);
+    defer {
+        for (scratch.items) |opened| {
+            opened.close(io);
+            std.testing.allocator.destroy(opened);
+        }
+        scratch.deinit();
+    }
+
+    const request = testCaptureRequest(null);
+    try std.testing.expectError(
+        error.UnsupportedSuperblockVersion,
+        resolveRoot(std.testing.allocator, io, &img, table, request, &scratch),
+    );
 }

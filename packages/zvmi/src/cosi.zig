@@ -22,6 +22,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const Io = std.Io;
 const ext4 = @import("ext4.zig");
+const xfs = @import("xfs.zig");
 const guid = @import("guid.zig");
 const gpt = @import("gpt.zig");
 const image_mod = @import("image.zig");
@@ -404,18 +405,33 @@ fn detectOsRelease(
     if (os_release_override) |value| return value;
 
     for (partitions) |part| {
-        if (!std.mem.eql(u8, part.mount_point, "/") or !std.mem.eql(u8, part.fs_type, "ext4")) continue;
+        if (!std.mem.eql(u8, part.mount_point, "/")) continue;
 
-        var reader = ext4.Reader.open(io, img.file, arena, .{ .offset = part.offset_bytes }) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => continue,
-        };
-        defer reader.deinit();
+        if (std.mem.eql(u8, part.fs_type, "ext4")) {
+            var reader = ext4.Reader.open(io, img.file, arena, .{ .offset = part.offset_bytes }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+            defer reader.deinit();
 
-        return reader.readFileAlloc(io, arena, "etc/os-release") catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => continue,
-        };
+            return reader.readFileAlloc(io, arena, "etc/os-release") catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+        }
+
+        if (std.mem.eql(u8, part.fs_type, "xfs")) {
+            var reader = xfs.Reader.openFileAt(arena, io, img.file, part.offset_bytes) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+            defer reader.close(io);
+
+            return reader.readFileAlloc(io, arena, "etc/os-release") catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+        }
     }
 
     return "";
@@ -927,4 +943,70 @@ test "write builds a COSI tarball with GPT metadata and compressed zstd partitio
     try std.testing.expectEqual(@as(usize, 2), parsed_json.value.osPackages.len);
     try std.testing.expectEqualStrings("bash", parsed_json.value.osPackages[0].name);
     try std.testing.expectEqual(@as(u32, 23), parsed_json.value.compression.maxWindowLog);
+}
+
+fn dummyPartitionArtifact(offset_bytes: u64, uncompressed_size: u64, fs_type: []const u8) PartitionArtifact {
+    return .{
+        .number = 1,
+        .offset_bytes = offset_bytes,
+        .uncompressed_size = uncompressed_size,
+        .image = .{ .path = "", .compressedSize = 0, .uncompressedSize = 0, .sha384 = "" },
+        .mount_point = "/",
+        .fs_type = fs_type,
+        .fs_uuid = "",
+        .part_type = "",
+        .part_type_guid = guid.parse("00000000-0000-0000-0000-000000000000"),
+    };
+}
+
+test "detectOsRelease reads /etc/os-release from an XFS root partition" {
+    const io = std.testing.io;
+    const disk_path = "test-cosi-xfs-os-release.img";
+    defer Io.Dir.cwd().deleteFile(io, disk_path) catch {};
+
+    const os_release = "NAME=zvmi\nID=zvmi\nVERSION_ID=1\n";
+    const volume = try xfs.buildEtcOsReleaseVolume(std.testing.allocator, os_release);
+    defer std.testing.allocator.free(volume);
+
+    const disk_size: u64 = 4 * 1024 * 1024;
+    var img = try Image.create(io, disk_path, .raw, disk_size, .{});
+    defer img.close(io);
+
+    const partition_offset: u64 = 1024 * 1024;
+    try img.pwrite(io, volume, partition_offset);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const partitions = [_]PartitionArtifact{dummyPartitionArtifact(partition_offset, volume.len, "xfs")};
+    const detected = try detectOsRelease(arena, img, io, &partitions, null);
+    try std.testing.expectEqualStrings(os_release, detected);
+}
+
+test "detectOsRelease treats an XFS partition it cannot open as having no os-release" {
+    const io = std.testing.io;
+    const disk_path = "test-cosi-xfs-malformed.img";
+    defer Io.Dir.cwd().deleteFile(io, disk_path) catch {};
+
+    const disk_size: u64 = 2 * 1024 * 1024;
+    var img = try Image.create(io, disk_path, .raw, disk_size, .{});
+    defer img.close(io);
+
+    // The "XFSB" magic is present -- exactly what the coarse, magic-only
+    // `probeFilesystem` check above looks for -- but the rest of the
+    // superblock is garbage, well short of a valid v5 filesystem. This
+    // proves a malformed/unsupported XFS partition falls through to "no
+    // os-release" rather than being misreported as a valid one.
+    var garbage: [512]u8 = [_]u8{0xAA} ** 512;
+    @memcpy(garbage[0..4], "XFSB");
+    try img.pwrite(io, &garbage, 0);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const partitions = [_]PartitionArtifact{dummyPartitionArtifact(0, disk_size, "xfs")};
+    const detected = try detectOsRelease(arena, img, io, &partitions, null);
+    try std.testing.expectEqualStrings("", detected);
 }
