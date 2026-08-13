@@ -24,6 +24,7 @@ const azure = @import("azure.zig");
 const bootconfig = @import("bootconfig.zig");
 const ext4 = @import("ext4.zig");
 const fat32 = @import("fat32.zig");
+const filesystem_writer = @import("filesystem_writer.zig");
 const gpt = @import("gpt.zig");
 const guid = @import("guid.zig");
 const identity_rewrite = @import("identity_rewrite.zig");
@@ -241,13 +242,15 @@ pub fn assemble(
     // costs a rejection rather than a published image that does not boot.
     const rewrites = try applyIdentityRewrite(allocator, tree, options, identities);
 
-    const esp_minimum: ?u64 = if (options.esp_tree) |esp_tree|
-        try esp_tree.minimumFat32VolumeLength(
-            .{ .metadata_policy = .lossy_posix_metadata },
-            .{ .alignment = layout_mod.default_alignment },
-        )
-    else
-        null;
+    const esp_minimum: ?u64 = if (options.esp_tree) |esp_tree| blk: {
+        const size = try filesystem_writer.minimumLength(allocator, esp_tree, .fat32, .{
+            .fat32 = .{
+                .populate = .{ .metadata_policy = .lossy_posix_metadata },
+                .volume = .{ .alignment = layout_mod.default_alignment },
+            },
+        });
+        break :blk size.length;
+    } else null;
     const esp_length: ?u64 = if (esp_minimum) |minimum| switch (options.esp_size) {
         .minimum_plus => |slack| alignUp(try add(minimum, slack)),
         .exact => |exact| blk: {
@@ -264,11 +267,8 @@ pub fn assemble(
         .timestamp = options.filesystem_timestamp,
         .journal = options.ext4_journal,
     };
-    const root_minimum = try ext4.minimumPopulateLength(
-        allocator,
-        try tree.ext4View(),
-        populate_options,
-    );
+    const root_size_options: filesystem_writer.SizeOptions = .{ .ext4 = populate_options };
+    const root_minimum = try filesystem_writer.minimumLength(allocator, tree, .ext4, root_size_options);
     const root_floor = switch (options.root_size) {
         .minimum_plus => |slack| try add(root_minimum.length, slack),
         .exact => |exact| blk: {
@@ -280,10 +280,11 @@ pub fn assemble(
     // monotone in the length, so the aligned size a caller asked for may be
     // one the layout refuses. Solving for it here is what keeps that from
     // surfacing as a bare `NotEnoughSpace` at write time.
-    const root_fit = try ext4.minimumPopulateLengthAtLeast(
+    const root_fit = try filesystem_writer.minimumLengthAtLeast(
         allocator,
-        try tree.ext4View(),
-        populate_options,
+        tree,
+        .ext4,
+        root_size_options,
         root_floor,
     );
 
@@ -315,7 +316,7 @@ pub fn assemble(
         .esp_minimum_bytes = esp_minimum,
         .root_filesystem_uuid = identities.root_filesystem_uuid,
         .esp_volume_id = if (esp_partition != null) identities.esp_volume_id else null,
-        .journal_block_count = root_fit.journal_blocks,
+        .journal_block_count = root_fit.ext4_journal_block_count.?,
         .root_node_count = tree.nodeCount(),
         .esp_node_count = if (options.esp_tree) |esp_tree| esp_tree.nodeCount() else 0,
         .identity_rewrite = rewrites.root,
@@ -336,24 +337,32 @@ pub fn assemble(
 
     if (options.esp_tree) |esp_tree| {
         const partition = esp_partition.?;
-        try fat32.format(&img, io, .{
-            .partition_offset = partition.offset_bytes,
-            .partition_len = partition.length_bytes,
-            .volume_id = identities.esp_volume_id,
-            .volume_label = options.esp_volume_label,
+        const esp_planned = findRole(planned.partitions, .esp).?;
+        _ = try filesystem_writer.formatAndPopulate(io, allocator, &img, esp_tree, esp_planned.filesystem, .{
+            .fat32 = .{
+                .format = .{
+                    .partition_offset = partition.offset_bytes,
+                    .partition_len = partition.length_bytes,
+                    .volume_id = identities.esp_volume_id,
+                    .volume_label = options.esp_volume_label,
+                },
+                .populate = .{ .metadata_policy = .lossy_posix_metadata },
+            },
         });
-        var esp_fs = try fat32.open(&img, io, .{
-            .offset = partition.offset_bytes,
-            .length = partition.length_bytes,
-        });
-        try esp_tree.populateFat32(&esp_fs, .{ .metadata_policy = .lossy_posix_metadata });
     }
 
     var root_populate = populate_options;
     root_populate.offset = root_partition.offset_bytes;
     root_populate.length = root_partition.filesystem_length;
-    const populated = try ext4.populate(io, img.file, allocator, try tree.ext4View(), root_populate);
-    report.journal_block_count = populated.journal_block_count;
+    const populate_result = try filesystem_writer.formatAndPopulate(
+        io,
+        allocator,
+        &img,
+        tree,
+        root_planned.filesystem,
+        .{ .ext4 = root_populate },
+    );
+    report.journal_block_count = populate_result.ext4.journal_block_count;
 
     img.close(io);
     img_open = false;
