@@ -404,6 +404,7 @@ gallery_json="$RESULT_DIR/gallery.json"
 image_definition_json="$RESULT_DIR/image-definition.json"
 image_version_json="$RESULT_DIR/image-version.json"
 image_replication_json="$RESULT_DIR/image-version-replication.json"
+azure_locations_json="$RESULT_DIR/azure-locations.json"
 vm_json="$RESULT_DIR/vm.json"
 mkdir -p "$(dirname -- "$STATE_FILE")"
 rm -f -- "$STATE_FILE" "${STATE_FILE}.group.json" "$vhd" "$private_key" "$private_key.pub"
@@ -425,6 +426,123 @@ cleanup_on_exit() {
 }
 trap cleanup_on_exit EXIT
 trap 'exit 130' INT TERM
+
+resolve_azure_location_display_name() {
+  local locations_path=$1 expected_location=$2
+  if ! az account list-locations --output json >"$locations_path"; then
+    echo "::error::Could not query Azure location metadata" >&2
+    return 1
+  fi
+  python3 - "$locations_path" "$expected_location" <<'PY'
+import json
+import sys
+
+path, expected = sys.argv[1:]
+locations = json.load(open(path, encoding="utf-8"))
+if not isinstance(locations, list):
+    raise SystemExit("Azure location metadata is not a list")
+matches = [
+    location
+    for location in locations
+    if isinstance(location, dict)
+    and isinstance(location.get("name"), str)
+    and location["name"].casefold() == expected.casefold()
+]
+if len(matches) != 1:
+    raise SystemExit(
+        f"Azure location metadata contains {len(matches)} exact canonical "
+        f"matches for {expected!r}"
+    )
+display_name = matches[0].get("displayName")
+if not isinstance(display_name, str) or not display_name:
+    raise SystemExit(f"Azure location {expected!r} has no display name")
+print(display_name)
+PY
+}
+
+validate_gallery_image_version_metadata() {
+  python3 - "$@" <<'PY'
+import json
+import sys
+
+(
+    path,
+    expected_id,
+    expected_name,
+    expected_group,
+    expected_location,
+    expected_location_display_name,
+    expected_disk_id,
+    expected_size_gib,
+) = sys.argv[1:]
+document = json.load(open(path, encoding="utf-8"))
+
+
+def same(left, right):
+    return isinstance(left, str) and left.casefold() == right.casefold()
+
+
+def same_location(value):
+    return isinstance(value, str) and value.casefold() in (
+        expected_location.casefold(),
+        expected_location_display_name.casefold(),
+    )
+
+
+if not same(document.get("id"), expected_id):
+    raise SystemExit("Azure returned a different gallery image-version identity")
+if document.get("name") != expected_name:
+    raise SystemExit("Azure returned a different gallery image-version name")
+resource_group = document.get("resourceGroup")
+if resource_group not in (None, "") and not same(resource_group, expected_group):
+    raise SystemExit("image version is outside the owned temporary resource group")
+if not same(document.get("location"), expected_location):
+    raise SystemExit("gallery image-version location mismatch")
+if not same(document.get("type"), "Microsoft.Compute/galleries/images/versions"):
+    raise SystemExit("Azure returned a non-gallery-image-version resource")
+if document.get("provisioningState") != "Succeeded":
+    raise SystemExit("gallery image-version provisioning did not succeed")
+
+storage = document.get("storageProfile")
+if not isinstance(storage, dict):
+    raise SystemExit("gallery image-version storage profile is missing")
+os_disk = storage.get("osDiskImage")
+if not isinstance(os_disk, dict):
+    raise SystemExit("gallery image-version OS disk metadata is missing")
+image_size_gib = os_disk.get("sizeInGB")
+if image_size_gib is not None and image_size_gib != int(expected_size_gib):
+    raise SystemExit("gallery image-version OS disk size mismatch")
+source = os_disk.get("source")
+if source is not None:
+    if not isinstance(source, dict) or not same(source.get("id"), expected_disk_id):
+        raise SystemExit("gallery image version is not sourced from the exact managed disk")
+artifact_source = storage.get("source")
+if artifact_source is not None:
+    if not isinstance(artifact_source, dict):
+        raise SystemExit("gallery image-version artifact source is invalid")
+    exposed_id = artifact_source.get("id")
+    if exposed_id not in (None, "") and not same(exposed_id, expected_disk_id):
+        raise SystemExit("gallery image-version exposed a different source resource")
+if storage.get("dataDiskImages") not in (None, []):
+    raise SystemExit("gallery image version unexpectedly contains data disks")
+
+publishing = document.get("publishingProfile")
+if not isinstance(publishing, dict):
+    raise SystemExit("gallery image-version publishing profile is missing")
+if publishing.get("replicationMode") != "Shallow":
+    raise SystemExit("gallery image-version replication mode mismatch")
+target_regions = publishing.get("targetRegions")
+if not isinstance(target_regions, list) or len(target_regions) != 1:
+    raise SystemExit("gallery image-version target region is missing or ambiguous")
+target = target_regions[0]
+if not isinstance(target, dict) or not same_location(target.get("name")):
+    raise SystemExit("gallery image-version target location mismatch")
+if target.get("regionalReplicaCount") not in (None, 1):
+    raise SystemExit("gallery image-version replica count mismatch")
+if target.get("storageAccountType") not in (None, "Standard_LRS"):
+    raise SystemExit("gallery image-version storage account type mismatch")
+PY
+}
 
 replication_epoch_seconds() {
   date +%s
@@ -472,11 +590,12 @@ wait_for_image_version_replication() {
     fi
 
     if ! observation=$(
-      python3 - "$image_replication_json" "$AZURE_LOCATION" <<'PY'
+      python3 - "$image_replication_json" "$AZURE_LOCATION" \
+        "$azure_location_display_name" <<'PY'
 import json
 import sys
 
-path, expected_region = sys.argv[1:]
+path, expected_region, expected_region_display_name = sys.argv[1:]
 document = json.load(open(path, encoding="utf-8"))
 replication = document.get("replicationStatus")
 if not isinstance(replication, dict):
@@ -486,14 +605,17 @@ if not isinstance(summary, list):
     raise SystemExit("image version regional replication summary is missing")
 
 
-def same(left, right):
-    return isinstance(left, str) and left.casefold() == right.casefold()
+def same_region(value):
+    return isinstance(value, str) and value.casefold() in (
+        expected_region.casefold(),
+        expected_region_display_name.casefold(),
+    )
 
 
 matches = [
     entry
     for entry in summary
-    if isinstance(entry, dict) and same(entry.get("region"), expected_region)
+    if isinstance(entry, dict) and same_region(entry.get("region"))
 ]
 if not matches:
     reported = [
@@ -578,6 +700,10 @@ PY
     fi
   done
 }
+
+azure_location_display_name=$(
+  resolve_azure_location_display_name "$azure_locations_json" "$AZURE_LOCATION"
+)
 
 # Derive the fixed VHD
 source_before=$(sha256sum "$asset" | awk '{print $1}')
@@ -921,80 +1047,10 @@ az sig image-version show \
   --gallery-image-definition "$image_definition_name" \
   --gallery-image-version "$image_version" \
   --output json >"$image_version_json"
-python3 - "$image_version_json" "$image_version_id" "$image_version" \
-  "$resource_group" "$AZURE_LOCATION" "$disk_id" "$expanded_size_gib" <<'PY'
-import json
-import sys
-
-(
-    path,
-    expected_id,
-    expected_name,
-    expected_group,
-    expected_location,
-    expected_disk_id,
-    expected_size_gib,
-) = sys.argv[1:]
-document = json.load(open(path, encoding="utf-8"))
-
-
-def same(left, right):
-    return isinstance(left, str) and left.casefold() == right.casefold()
-
-
-if not same(document.get("id"), expected_id):
-    raise SystemExit("Azure returned a different gallery image-version identity")
-if document.get("name") != expected_name:
-    raise SystemExit("Azure returned a different gallery image-version name")
-resource_group = document.get("resourceGroup")
-if resource_group not in (None, "") and not same(resource_group, expected_group):
-    raise SystemExit("image version is outside the owned temporary resource group")
-if not same(document.get("location"), expected_location):
-    raise SystemExit("gallery image-version location mismatch")
-if not same(document.get("type"), "Microsoft.Compute/galleries/images/versions"):
-    raise SystemExit("Azure returned a non-gallery-image-version resource")
-if document.get("provisioningState") != "Succeeded":
-    raise SystemExit("gallery image-version provisioning did not succeed")
-
-storage = document.get("storageProfile")
-if not isinstance(storage, dict):
-    raise SystemExit("gallery image-version storage profile is missing")
-os_disk = storage.get("osDiskImage")
-if not isinstance(os_disk, dict):
-    raise SystemExit("gallery image-version OS disk metadata is missing")
-image_size_gib = os_disk.get("sizeInGB")
-if image_size_gib is not None and image_size_gib != int(expected_size_gib):
-    raise SystemExit("gallery image-version OS disk size mismatch")
-source = os_disk.get("source")
-if source is not None:
-    if not isinstance(source, dict) or not same(source.get("id"), expected_disk_id):
-        raise SystemExit("gallery image version is not sourced from the exact managed disk")
-artifact_source = storage.get("source")
-if artifact_source is not None:
-    if not isinstance(artifact_source, dict):
-        raise SystemExit("gallery image-version artifact source is invalid")
-    exposed_id = artifact_source.get("id")
-    if exposed_id not in (None, "") and not same(exposed_id, expected_disk_id):
-        raise SystemExit("gallery image-version exposed a different source resource")
-if storage.get("dataDiskImages") not in (None, []):
-    raise SystemExit("gallery image version unexpectedly contains data disks")
-
-publishing = document.get("publishingProfile")
-if not isinstance(publishing, dict):
-    raise SystemExit("gallery image-version publishing profile is missing")
-if publishing.get("replicationMode") != "Shallow":
-    raise SystemExit("gallery image-version replication mode mismatch")
-target_regions = publishing.get("targetRegions")
-if not isinstance(target_regions, list) or len(target_regions) != 1:
-    raise SystemExit("gallery image-version target region is missing or ambiguous")
-target = target_regions[0]
-if not same(target.get("name"), expected_location):
-    raise SystemExit("gallery image-version target location mismatch")
-if target.get("regionalReplicaCount") not in (None, 1):
-    raise SystemExit("gallery image-version replica count mismatch")
-if target.get("storageAccountType") not in (None, "Standard_LRS"):
-    raise SystemExit("gallery image-version storage account type mismatch")
-PY
+validate_gallery_image_version_metadata \
+  "$image_version_json" "$image_version_id" "$image_version" \
+  "$resource_group" "$AZURE_LOCATION" "$azure_location_display_name" \
+  "$disk_id" "$expanded_size_gib"
 test "${image_version_id,,}" = \
   "${expected_image_definition_id,,}/versions/${image_version,,}"
 wait_for_image_version_replication \

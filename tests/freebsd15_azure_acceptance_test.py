@@ -15,6 +15,15 @@ SCRIPT = os.path.join(
 REPLICATION_FIXTURES = (
     Path(__file__).parent / "fixtures" / "freebsd15_azure_replication"
 )
+LOCATION_FIXTURE = Path(__file__).parent / "fixtures" / "freebsd15_azure_locations.json"
+IMAGE_VERSION_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "freebsd15_azure_image_version.json"
+)
+IMAGE_VERSION_MISMATCH_FIXTURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "freebsd15_azure_image_version_mismatch.json"
+)
 
 
 def test_script_exists_and_executable():
@@ -132,8 +141,89 @@ printf 'status=%s\\nattempts=%s\\nsleeps=%s\\n' \
 def _image_replication_functions():
     content = Path(SCRIPT).read_text(encoding="utf-8")
     start = content.index("replication_epoch_seconds() {")
-    end = content.index("\n# Derive the fixed VHD", start)
+    end = content.index("\nazure_location_display_name=$(", start)
     return content[start:end]
+
+
+def _shell_function(name):
+    content = Path(SCRIPT).read_text(encoding="utf-8")
+    start = content.index(f"{name}() {{")
+    end = content.index("\n}\n", start) + len("\n}\n")
+    return content[start:end]
+
+
+def _run_location_resolution_case(mode, expected_location="swedencentral"):
+    root = (
+        Path(SCRIPT).parents[1]
+        / ".scratch"
+        / f"freebsd15-location-resolution-{os.getpid()}-{mode}"
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.update(
+        {
+            "LOCATION_FIXTURE": str(LOCATION_FIXTURE),
+            "LOCATION_RESULT": str(root / "locations.json"),
+            "LOCATION_MODE": mode,
+            "EXPECTED_LOCATION": expected_location,
+        }
+    )
+    harness = f"""
+set -u -o pipefail
+az() {{
+  [[ "$*" == "account list-locations --output json" ]] || return 8
+  [[ "$LOCATION_MODE" != query-failure ]] || return 1
+  cat "$LOCATION_FIXTURE"
+}}
+{_shell_function("resolve_azure_location_display_name")}
+display_name=$(
+  resolve_azure_location_display_name "$LOCATION_RESULT" "$EXPECTED_LOCATION"
+)
+status=$?
+printf 'status=%s\\ndisplay_name=%s\\n' "$status" "$display_name"
+"""
+    try:
+        result = subprocess.run(
+            ["bash", "-c", harness],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    metrics = dict(line.split("=", 1) for line in result.stdout.splitlines())
+    return result, metrics
+
+
+def _run_image_version_validation_case(fixture):
+    env = os.environ.copy()
+    env["IMAGE_VERSION_FIXTURE"] = str(fixture)
+    expected_id = (
+        "/subscriptions/test/resourceGroups/rg-test/providers/Microsoft.Compute/"
+        "galleries/gallery-test/images/image-test/versions/1.0.0"
+    )
+    disk_id = (
+        "/subscriptions/test/resourceGroups/rg-test/providers/Microsoft.Compute/"
+        "disks/disk-test"
+    )
+    harness = f"""
+set -u -o pipefail
+{_shell_function("validate_gallery_image_version_metadata")}
+validate_gallery_image_version_metadata \
+  "$IMAGE_VERSION_FIXTURE" "{expected_id}" 1.0.0 rg-test \
+  swedencentral "Sweden Central" "{disk_id}" 8
+status=$?
+printf 'status=%s\\n' "$status"
+"""
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    return result, int(result.stdout.removeprefix("status=").strip())
 
 
 def _run_image_replication_case(mode, timeout_seconds=5):
@@ -176,6 +266,7 @@ az() {{
         ;;
       failed) fixture=failed.json ;;
       missing-region) fixture=missing-region.json ;;
+      whitespace-mismatch) fixture=whitespace-mismatch.json ;;
       timeout) fixture=replicating.json ;;
       *) return 8 ;;
     esac
@@ -202,6 +293,7 @@ gallery_name=gallery-test
 image_definition_name=image-test
 image_version=1.0.0
 AZURE_LOCATION=westus2
+azure_location_display_name="West US 2"
 image_replication_json=$REPLICATION_RESULT
 wait_for_image_version_replication {timeout_seconds} 1 2
 status=$?
@@ -353,6 +445,40 @@ def test_image_replication_pending_then_completed_precedes_vm_creation():
     assert result.stderr == ""
 
 
+def test_location_metadata_resolves_exact_canonical_name():
+    result, metrics = _run_location_resolution_case("success")
+    assert metrics == {"status": "0", "display_name": "Sweden Central"}
+    assert result.stderr == ""
+
+
+def test_location_metadata_mismatch_fails_closed():
+    result, metrics = _run_location_resolution_case(
+        "success", expected_location="swedencentral2"
+    )
+    assert metrics == {"status": "1", "display_name": ""}
+    assert "0 exact canonical matches for 'swedencentral2'" in result.stderr
+
+
+def test_location_metadata_query_failure_fails_closed():
+    result, metrics = _run_location_resolution_case("query-failure")
+    assert metrics == {"status": "1", "display_name": ""}
+    assert "Could not query Azure location metadata" in result.stderr
+
+
+def test_gallery_target_region_accepts_exact_display_name():
+    result, status = _run_image_version_validation_case(IMAGE_VERSION_FIXTURE)
+    assert status == 0
+    assert result.stderr == ""
+
+
+def test_gallery_target_region_does_not_strip_whitespace():
+    result, status = _run_image_version_validation_case(
+        IMAGE_VERSION_MISMATCH_FIXTURE
+    )
+    assert status == 1
+    assert "gallery image-version target location mismatch" in result.stderr
+
+
 def test_image_replication_failed_blocks_vm_with_diagnostics():
     result, metrics = _run_image_replication_case("failed")
     assert metrics["status"] == "1"
@@ -369,6 +495,15 @@ def test_image_replication_missing_target_region_blocks_vm():
     assert metrics["sleeps"] == "0"
     assert "does not include target region 'westus2'" in result.stderr
     assert "invalid regional image replication status" in result.stderr
+
+
+def test_image_replication_does_not_strip_whitespace():
+    result, metrics = _run_image_replication_case("whitespace-mismatch")
+    assert metrics["status"] == "1"
+    assert metrics["events"] == "show"
+    assert metrics["sleeps"] == "0"
+    assert "'West  US 2'" in result.stderr
+    assert "does not include target region 'westus2'" in result.stderr
 
 
 def test_image_replication_timeout_uses_bounded_exponential_backoff():
@@ -517,8 +652,10 @@ def test_gallery_definition_and_version_precede_provisioned_vm():
     assert "--created" in content[version_wait:version_show]
     replication_function = _image_replication_functions()
     assert "--expand ReplicationStatus" in replication_function
+    assert '"$azure_location_display_name"' in replication_function
     assert 'if [[ "${state,,}" == completed ]]' in replication_function
     assert "Timed out after ${elapsed}s" in replication_function
+    assert "az account list-locations --output json" in content
     assert '--image "$image_version_id"' in vm_block
     assert '--admin-username "$admin_username"' in vm_block
     assert "--authentication-type ssh" in vm_block
