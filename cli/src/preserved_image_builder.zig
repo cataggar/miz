@@ -679,6 +679,7 @@ fn mapSourceMounts(
                 .detect => .detect,
                 .ext4 => .ext4,
                 .fat32 => .fat32,
+                .xfs => .xfs,
             },
             .fat_metadata = .{
                 .directory_mode = mount.fat_metadata.directory_mode,
@@ -1843,6 +1844,32 @@ test "merged source mounts survive the loader with their synthesized metadata" {
     try std.testing.expectEqual(
         zvmi.customize.IdentityRewritePolicy.rewrite_and_verify,
         loaded.identity_rewrite,
+    );
+}
+
+test "an explicit XFS source mount survives the loader" {
+    const configuration =
+        \\{
+        \\  "api_version": 3,
+        \\  "backend": "rebuild",
+        \\  "root_partition": { "gpt_index": 2 },
+        \\  "source_profile": "general",
+        \\  "source_mounts": [
+        \\    {
+        \\      "partition": { "gpt_index": 3 },
+        \\      "target": "/var",
+        \\      "filesystem": "xfs"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const loaded = try loadV3Configuration(arena.allocator(), configuration, &.{});
+    try std.testing.expectEqual(@as(usize, 1), loaded.source_mounts.len);
+    try std.testing.expectEqual(
+        zvmi.customize.SourceFilesystem.xfs,
+        loaded.source_mounts[0].filesystem,
     );
 }
 

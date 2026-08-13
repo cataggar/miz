@@ -82,6 +82,7 @@ pub const SourceFilesystem = enum {
     detect,
     ext4,
     fat32,
+    xfs,
 };
 
 /// POSIX metadata invented for entries read from a FAT source, which stores
