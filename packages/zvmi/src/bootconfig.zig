@@ -3,13 +3,13 @@
 //! locations, and generate minimal GRUB + Boot Loader Specification text
 //! configuration without invoking any external bootloader tooling.
 //!
-//! To keep future image-build orchestration consistent with `zvmi.ext4`, this
-//! module reuses the exact same vtable-style source-tree interface:
-//! `bootconfig.SourceTreeView == ext4.FileTreeView`.
+//! The source tree this module reads from is the same filesystem-neutral
+//! pull cursor `ext4.populate` drains: `bootconfig.SourceTreeView ==
+//! tree_cursor.Cursor` (which `ext4.FileTreeView` also aliases).
 
 const std = @import("std");
 const Io = std.Io;
-const ext4 = @import("ext4.zig");
+const tree_cursor = @import("tree_cursor.zig");
 const fat32 = @import("fat32.zig");
 const guid = @import("guid.zig");
 const layout = @import("layout.zig");
@@ -20,8 +20,8 @@ const uki = @import("uki.zig");
 const uki_signing = @import("uki_signing.zig");
 const verity = @import("verity.zig");
 
-pub const SourceTreeView = ext4.FileTreeView;
-pub const SourceKind = ext4.Kind;
+pub const SourceTreeView = tree_cursor.Cursor;
+pub const SourceKind = tree_cursor.Kind;
 
 pub const Architecture = enum {
     x86_64,
