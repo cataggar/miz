@@ -94,22 +94,43 @@ def _preflight(candidate_key):
 
 def _serial_console_function():
     content = Path(SCRIPT).read_text(encoding="utf-8")
-    start = content.index("require_serial_console_log() {")
+    start = content.index("normalize_serial_console_response() {")
     end = content.index("\n}\n", start) + len("\n}\n")
+    for _ in range(3):
+        end = content.index("\n}\n", end) + len("\n}\n")
     return content[start:end]
 
 
-def _run_serial_console_case(mode):
+def _run_serial_console_case(mode, timeout_seconds=3, delay_seconds=1):
     root = (
         Path(SCRIPT).parents[1]
         / ".scratch"
         / f"freebsd15-serial-console-{os.getpid()}-{mode}"
     )
     root.mkdir(parents=True, exist_ok=True)
+    blob_not_found = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        "<Error><Code>BlobNotFound</Code>"
+        "<Message>The specified blob does not exist.</Message></Error>"
+    )
+    (root / "blob.json").write_text(
+        json.dumps(blob_not_found) + "\n", encoding="utf-8"
+    )
+    (root / "valid.json").write_text(
+        json.dumps("FreeBSD 15.1-RELEASE kernel boot\n"), encoding="utf-8"
+    )
+    (root / "error.json").write_text(
+        json.dumps({"error": {"code": "UnexpectedAzureError"}}),
+        encoding="utf-8",
+    )
     env = os.environ.copy()
     env.update(
         {
             "BOOT_LOG": str(root / "boot.log"),
+            "BOOT_LOG_CANDIDATE": str(root / "boot.log.candidate"),
+            "BOOT_LOG_RAW": str(root / "boot.log.raw"),
+            "BOOT_LOG_STDERR": str(root / "boot.log.stderr"),
+            "SERIAL_ROOT": str(root),
             "SERIAL_MODE": mode,
         }
     )
@@ -117,29 +138,47 @@ def _run_serial_console_case(mode):
 set -u -o pipefail
 attempts=0
 sleeps=0
+clock=0
 az() {{
   attempts=$((attempts + 1))
   case "$SERIAL_MODE" in
     missing) return 1 ;;
     empty) return 0 ;;
+    blob-then-valid)
+      if [[ "$attempts" -eq 1 ]]; then
+        cat "$SERIAL_ROOT/blob.json"
+      else
+        cat "$SERIAL_ROOT/valid.json"
+      fi
+      ;;
+    persistent-blob) cat "$SERIAL_ROOT/blob.json" ;;
+    structured-error) cat "$SERIAL_ROOT/error.json" ;;
     no-marker) printf 'UEFI firmware initialized\\nlogin: ' ;;
-    valid) printf 'FreeBSD 15.1-RELEASE kernel boot\\n' ;;
+    valid-json) cat "$SERIAL_ROOT/valid.json" ;;
+    valid-raw) printf 'FreeBSD 15.1-RELEASE kernel boot\\n' ;;
     *) return 2 ;;
   esac
 }}
 sleep() {{
   sleeps=$((sleeps + 1))
+  clock=$((clock + $1))
 }}
 boot_log=$BOOT_LOG
+boot_log_candidate=$BOOT_LOG_CANDIDATE
+boot_log_raw=$BOOT_LOG_RAW
+boot_log_stderr=$BOOT_LOG_STDERR
 resource_group=rg-test
 vm_name=vm-test
 {_serial_console_function()}
+serial_console_epoch_seconds() {{
+  printf '%s\\n' "$clock"
+}}
 set +e
-require_serial_console_log
+require_serial_console_log {timeout_seconds} {delay_seconds}
 status=$?
 set -e
-printf 'status=%s\\nattempts=%s\\nsleeps=%s\\n' \
-  "$status" "$attempts" "$sleeps"
+printf 'status=%s\\nattempts=%s\\nsleeps=%s\\nclock=%s\\n' \
+  "$status" "$attempts" "$sleeps" "$clock"
 """
     try:
         result = subprocess.run(
@@ -149,13 +188,66 @@ printf 'status=%s\\nattempts=%s\\nsleeps=%s\\n' \
             env=env,
             check=True,
         )
+        boot_log = (root / "boot.log").read_text(encoding="utf-8") \
+            if (root / "boot.log").exists() else None
+        raw_log = (root / "boot.log.raw").read_text(encoding="utf-8") \
+            if (root / "boot.log.raw").exists() else None
     finally:
         shutil.rmtree(root, ignore_errors=True)
     metrics = {}
     for line in result.stdout.splitlines():
         key, value = line.split("=", 1)
         metrics[key] = int(value)
-    return result, metrics
+    return result, metrics, boot_log, raw_log
+
+
+def _run_cleanup_boot_log_case():
+    root = (
+        Path(SCRIPT).parents[1]
+        / ".scratch"
+        / f"freebsd15-cleanup-boot-log-{os.getpid()}"
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    existing = "FreeBSD existing useful serial log\n"
+    (root / "boot.log").write_text(existing, encoding="utf-8")
+    blob_not_found = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        "<Error><Code>BlobNotFound</Code></Error>"
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "BOOT_LOG_ROOT": str(root),
+            "BLOB_NOT_FOUND": json.dumps(blob_not_found),
+        }
+    )
+    harness = f"""
+set -u -o pipefail
+az() {{
+  printf '%s\\n' "$BLOB_NOT_FOUND"
+}}
+boot_log=$BOOT_LOG_ROOT/boot.log
+cleanup_boot_log=$BOOT_LOG_ROOT/boot.log.cleanup
+cleanup_boot_log_raw=$BOOT_LOG_ROOT/boot.log.cleanup.raw
+cleanup_boot_log_stderr=$BOOT_LOG_ROOT/boot.log.cleanup.stderr
+resource_group=rg-test
+vm_name=vm-test
+{_serial_console_function()}
+collect_failure_boot_log
+"""
+    try:
+        result = subprocess.run(
+            ["bash", "-c", harness],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+        preserved = (root / "boot.log").read_text(encoding="utf-8")
+        raw = (root / "boot.log.cleanup.raw").read_text(encoding="utf-8")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return result, existing, preserved, raw
 
 
 def _image_replication_functions():
@@ -773,25 +865,87 @@ def test_contracts_set():
     ) in content
 
 
+def test_serial_console_blob_not_found_then_valid_retries_and_succeeds():
+    result, metrics, boot_log, raw_log = _run_serial_console_case(
+        "blob-then-valid"
+    )
+    assert metrics == {"status": 0, "attempts": 2, "sleeps": 1, "clock": 1}
+    assert boot_log == "FreeBSD 15.1-RELEASE kernel boot\n"
+    assert raw_log == json.dumps("FreeBSD 15.1-RELEASE kernel boot\n")
+    assert result.stderr == ""
+
+
+def test_serial_console_persistent_blob_not_found_fails_without_real_content():
+    result, metrics, boot_log, raw_log = _run_serial_console_case(
+        "persistent-blob"
+    )
+    assert metrics == {"status": 1, "attempts": 3, "sleeps": 3, "clock": 3}
+    assert boot_log is None
+    assert "BlobNotFound" in raw_log
+    assert "did not return real serial content after 3s and 3 attempts" in (
+        result.stderr
+    )
+    assert "blob is not available yet" in result.stderr
+
+
+def test_serial_console_accepts_json_quoted_and_raw_freebsd_logs():
+    for mode in ("valid-json", "valid-raw"):
+        result, metrics, boot_log, raw_log = _run_serial_console_case(mode)
+        assert metrics == {"status": 0, "attempts": 1, "sleeps": 0, "clock": 0}
+        assert boot_log == "FreeBSD 15.1-RELEASE kernel boot\n"
+        assert raw_log
+        assert result.stderr == ""
+
+
+def test_serial_console_non_freebsd_real_content_fails_closed():
+    result, metrics, boot_log, raw_log = _run_serial_console_case("no-marker")
+    assert metrics == {"status": 1, "attempts": 3, "sleeps": 3, "clock": 3}
+    assert boot_log == "UEFI firmware initialized\nlogin: "
+    assert raw_log == boot_log
+    assert "serial log is missing expected FreeBSD output" in result.stderr
+
+
+def test_serial_console_structured_error_is_not_treated_as_real_content():
+    result, metrics, boot_log, raw_log = _run_serial_console_case(
+        "structured-error"
+    )
+    assert metrics == {"status": 1, "attempts": 3, "sleeps": 3, "clock": 3}
+    assert boot_log is None
+    assert "UnexpectedAzureError" in raw_log
+    assert "structured error instead of serial content" in result.stderr
+
+
 def test_serial_console_missing_or_empty_log_fails_after_bounded_retries():
     for mode in ("missing", "empty"):
-        result, metrics = _run_serial_console_case(mode)
-        assert metrics == {"status": 1, "attempts": 6, "sleeps": 5}
-        assert "did not return a nonempty serial log after 6 attempts" in (
+        result, metrics, boot_log, _ = _run_serial_console_case(mode)
+        assert metrics == {"status": 1, "attempts": 3, "sleeps": 3, "clock": 3}
+        assert boot_log is None
+        assert "did not return real serial content after 3s and 3 attempts" in (
             result.stderr
         )
 
 
-def test_serial_console_log_without_freebsd_marker_fails_closed():
-    result, metrics = _run_serial_console_case("no-marker")
-    assert metrics == {"status": 1, "attempts": 6, "sleeps": 5}
-    assert "serial log is missing expected FreeBSD output" in result.stderr
+def test_serial_console_timeout_configuration_requires_positive_integers():
+    for timeout_seconds, delay_seconds in ((0, 1), (3, 0)):
+        result, metrics, _, _ = _run_serial_console_case(
+            "valid-raw", timeout_seconds, delay_seconds
+        )
+        assert metrics == {"status": 1, "attempts": 0, "sleeps": 0, "clock": 0}
+        assert "Invalid Azure serial log timeout configuration" in result.stderr
 
 
-def test_serial_console_valid_log_succeeds_without_extra_retries():
-    result, metrics = _run_serial_console_case("valid")
-    assert metrics == {"status": 0, "attempts": 1, "sleeps": 0}
+def test_cleanup_blob_not_found_preserves_existing_serial_log():
+    result, existing, preserved, raw = _run_cleanup_boot_log_case()
+    assert preserved == existing
+    assert "BlobNotFound" in raw
     assert result.stderr == ""
+
+
+def test_failure_upload_retains_raw_serial_console_responses():
+    workflow = (
+        Path(SCRIPT).parents[1] / ".github/workflows/freebsd15-release.yml"
+    ).read_text(encoding="utf-8")
+    assert "${{ env.RESULT_DIR }}/boot.log*" in workflow
 
 
 def test_image_replication_pending_then_completed_precedes_vm_creation():
@@ -1017,16 +1171,20 @@ def test_image_replication_timeout_uses_bounded_exponential_backoff():
     assert "last state=Replicating" in result.stderr
 
 
-def test_serial_console_gate_precedes_result_and_keeps_cleanup_active():
+def test_serial_console_gate_follows_reconnect_and_precedes_result():
     content = Path(SCRIPT).read_text(encoding="utf-8")
     definition = content.index("require_serial_console_log() {")
     invocation = content.index("\nrequire_serial_console_log\n", definition)
+    reboot = content.index("\nreboot_and_reconnect\n", invocation - 200)
+    pre_identity = content.index("pre_reboot_hostkey=")
+    post_identity = content.index("post_reboot_hostkey=", invocation)
     result_writer = content.index(
         "python3 scripts/freebsd15_release.py azure-result",
         invocation,
     )
     cleanup_trap = content.index("trap cleanup_on_exit EXIT")
-    assert cleanup_trap < invocation < result_writer
+    assert cleanup_trap < pre_identity < reboot < invocation < post_identity
+    assert invocation < result_writer
     assert "if ! cleanup_group; then" in content
     assert "::warning::Azure managed boot diagnostics" not in content
 

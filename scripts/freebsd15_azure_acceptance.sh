@@ -402,6 +402,12 @@ admin_username=zvmitest
 vhd="$RESULT_DIR/${CANDIDATE_KEY}.vhd"
 private_key="$RESULT_DIR/id_ed25519"
 boot_log="$RESULT_DIR/boot.log"
+boot_log_candidate="$RESULT_DIR/boot.log.candidate"
+boot_log_raw="$RESULT_DIR/boot.log.raw"
+boot_log_stderr="$RESULT_DIR/boot.log.stderr"
+cleanup_boot_log="$RESULT_DIR/boot.log.cleanup"
+cleanup_boot_log_raw="$RESULT_DIR/boot.log.cleanup.raw"
+cleanup_boot_log_stderr="$RESULT_DIR/boot.log.cleanup.stderr"
 sku_json="$RESULT_DIR/sku.json"
 disk_json="$RESULT_DIR/disk.json"
 gallery_json="$RESULT_DIR/gallery.json"
@@ -416,14 +422,181 @@ vm_show_stderr="$RESULT_DIR/vm-show.stderr"
 mkdir -p "$(dirname -- "$STATE_FILE")"
 rm -f -- "$STATE_FILE" "${STATE_FILE}.group.json" "$vhd" "$private_key" "$private_key.pub"
 
+normalize_serial_console_response() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+raw_path, output_path = map(Path, sys.argv[1:])
+raw = raw_path.read_bytes()
+output_path.unlink(missing_ok=True)
+
+try:
+    decoded = raw.decode("utf-8")
+except UnicodeDecodeError:
+    decoded = None
+
+candidate = raw
+if decoded is not None:
+    try:
+        document = json.loads(decoded)
+    except json.JSONDecodeError:
+        pass
+    else:
+        if not isinstance(document, str):
+            raise SystemExit(12)
+        candidate = document.encode("utf-8")
+
+if not candidate.strip():
+    raise SystemExit(11)
+
+text = candidate.decode("utf-8", errors="replace")
+stripped = text.lstrip()
+if stripped.startswith("<"):
+    try:
+        root = ET.fromstring(stripped)
+    except ET.ParseError:
+        if stripped.startswith(("<?xml", "<Error", "<error")):
+            raise SystemExit(12)
+    else:
+        if root.tag.rsplit("}", 1)[-1].casefold() == "error":
+            code = next(
+                (
+                    (element.text or "").strip()
+                    for element in root
+                    if element.tag.rsplit("}", 1)[-1].casefold() == "code"
+                ),
+                "",
+            )
+            if code.casefold() == "blobnotfound":
+                raise SystemExit(10)
+            raise SystemExit(12)
+
+output_path.write_bytes(candidate)
+PY
+}
+
+collect_failure_boot_log() {
+  rm -f -- "$cleanup_boot_log" "$cleanup_boot_log_raw" \
+    "$cleanup_boot_log_stderr"
+  if ! az vm boot-diagnostics get-boot-log \
+    --resource-group "$resource_group" \
+    --name "$vm_name" >"$cleanup_boot_log_raw" \
+    2>"$cleanup_boot_log_stderr"
+  then
+    return 0
+  fi
+  if normalize_serial_console_response \
+    "$cleanup_boot_log_raw" "$cleanup_boot_log"
+  then
+    if [[ -s "$boot_log" ]]; then
+      rm -f -- "$cleanup_boot_log"
+    else
+      mv -- "$cleanup_boot_log" "$boot_log"
+    fi
+  else
+    rm -f -- "$cleanup_boot_log"
+  fi
+}
+
+serial_console_epoch_seconds() {
+  date +%s
+}
+
+require_serial_console_log() {
+  local timeout_seconds=${1:-${AZURE_SERIAL_LOG_TIMEOUT_SECONDS:-120}}
+  local delay_seconds=${2:-${AZURE_SERIAL_LOG_POLL_SECONDS:-5}}
+  local attempt=0 deadline elapsed normalization_status now observation
+  local saw_real_content=false sleep_seconds started_at
+
+  if [[ ! "$timeout_seconds" =~ ^[1-9][0-9]*$ ||
+        ! "$delay_seconds" =~ ^[1-9][0-9]*$ ]]; then
+    echo "::error::Invalid Azure serial log timeout configuration" >&2
+    return 1
+  fi
+
+  rm -f -- "$boot_log" "$boot_log_candidate" "$boot_log_raw" \
+    "$boot_log_stderr"
+  started_at=$(serial_console_epoch_seconds)
+  deadline=$((started_at + timeout_seconds))
+  observation="no Azure serial log response"
+
+  while true; do
+    now=$(serial_console_epoch_seconds)
+    if [[ "$attempt" -gt 0 && "$now" -ge "$deadline" ]]; then
+      break
+    fi
+    attempt=$((attempt + 1))
+
+    if az vm boot-diagnostics get-boot-log \
+      --resource-group "$resource_group" \
+      --name "$vm_name" >"$boot_log_raw" 2>"$boot_log_stderr"
+    then
+      normalization_status=0
+      normalize_serial_console_response "$boot_log_raw" "$boot_log_candidate" ||
+        normalization_status=$?
+      case "$normalization_status" in
+        0)
+          mv -- "$boot_log_candidate" "$boot_log"
+          saw_real_content=true
+          observation="real serial content without a FreeBSD marker"
+          if grep -a -iq 'FreeBSD' "$boot_log"; then
+            return
+          fi
+          ;;
+        10)
+          observation="Azure boot diagnostics blob is not available yet"
+          ;;
+        11)
+          observation="Azure returned an empty serial log"
+          ;;
+        12)
+          observation="Azure returned a structured error instead of serial content"
+          ;;
+        *)
+          echo "::error::Could not normalize Azure serial log response;" \
+            "raw response saved to $boot_log_raw" >&2
+          return 1
+          ;;
+      esac
+    else
+      observation="Azure serial log request failed"
+    fi
+
+    now=$(serial_console_epoch_seconds)
+    if [[ "$now" -ge "$deadline" ]]; then
+      continue
+    fi
+    sleep_seconds=$delay_seconds
+    if [[ "$sleep_seconds" -gt "$((deadline - now))" ]]; then
+      sleep_seconds=$((deadline - now))
+    fi
+    sleep "$sleep_seconds"
+  done
+
+  now=$(serial_console_epoch_seconds)
+  elapsed=$((now - started_at))
+  if $saw_real_content; then
+    echo "::error::Azure serial log is missing expected FreeBSD output after" \
+      "${elapsed}s and $attempt attempts; raw response saved to $boot_log_raw" >&2
+  else
+    echo "::error::Azure managed boot diagnostics did not return real serial" \
+      "content after ${elapsed}s and $attempt attempts (last observation:" \
+      "$observation); raw response saved to $boot_log_raw" >&2
+  fi
+  return 1
+}
+
 cleanup_on_exit() {
   status=$?
   trap - EXIT INT TERM
   if [[ "$status" -ne 0 ]] &&
       az vm show --resource-group "$resource_group" --name "$vm_name" >/dev/null 2>&1; then
-    az vm boot-diagnostics get-boot-log \
-      --resource-group "$resource_group" \
-      --name "$vm_name" >"$boot_log" 2>/dev/null || rm -f "$boot_log"
+    if ! collect_failure_boot_log; then
+      echo "::warning::Could not collect the failure-time Azure serial log" >&2
+    fi
   fi
   rm -f -- "$vhd" "$private_key" "$private_key.pub"
   if ! cleanup_group; then
@@ -1181,35 +1354,6 @@ wait_for_poweroff() {
   return 1
 }
 
-require_serial_console_log() {
-  local attempt saw_nonempty=false
-  rm -f -- "$boot_log"
-  for attempt in {1..6}; do
-    if az vm boot-diagnostics get-boot-log \
-      --resource-group "$resource_group" \
-      --name "$vm_name" >"$boot_log" 2>/dev/null
-    then
-      if [[ -s "$boot_log" ]]; then
-        saw_nonempty=true
-        if grep -iq 'FreeBSD' "$boot_log"; then
-          return
-        fi
-      fi
-    fi
-    if [[ "$attempt" -lt 6 ]]; then
-      sleep 5
-    fi
-  done
-  if $saw_nonempty; then
-    echo "::error::Azure serial log is missing expected FreeBSD output" >&2
-  else
-    echo "::error::Azure managed boot diagnostics did not return a nonempty" \
-      "serial log after 6 attempts" \
-      >&2
-  fi
-  return 1
-}
-
 # --- CONTRACT: matching-architecture-gen2 ---
 # (Gen2 and architecture are validated across SKU, source disk, image, and VM.)
 
@@ -1611,11 +1755,11 @@ swapinfo -k | awk 'NR > 1 { print $1 }' | while IFS= read -r swap_device; do
 done
 GUEST
 
-# --- CONTRACT: serial-console ---
-require_serial_console_log
-
 # --- CONTRACT: reboot-reconnect ---
 reboot_and_reconnect
+
+# --- CONTRACT: serial-console ---
+require_serial_console_log
 
 # --- CONTRACT: instance-identity ---
 post_reboot_hostkey=$(ssh "${ssh_options[@]}" "$ssh_target" \
