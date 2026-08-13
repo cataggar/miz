@@ -3020,6 +3020,14 @@ test "owned tree imports an XFS volume preserving metadata xattrs hardlinks and 
     var rlink_target: [xfs.rlink_target.len]u8 = undefined;
     _ = try tree.readNodeContent("rlink", &rlink_target, 0);
     try std.testing.expectEqualStrings(xfs.rlink_target, &rlink_target);
+
+    // unwritten.bin: sole extent is unwritten (allocated but never
+    // written), so it reads back as zeros even though its backing block on
+    // disk holds a non-zero marker -- proving the spool preserved the
+    // XFS reader's zero-fill rather than accidentally copying real bytes.
+    var unwritten_bytes: [xfs.unwritten_bin_size]u8 = undefined;
+    _ = try tree.readNodeContent("unwritten.bin", &unwritten_bytes, 0);
+    for (unwritten_bytes) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
 test "borrowed XFS import requires a memory tree and reads content through the live source" {
