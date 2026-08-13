@@ -1378,9 +1378,15 @@ guest_contract_diagnostics() {
   if [ -z "$diagnostic_rootfs" ]; then
     diagnostic_rootfs=$(mount -p | awk '$2 == "/" { print $3 }')
   fi
-  if [ -z "$diagnostic_disk" ] && [ "$diagnostic_rootfs" = ufs ]; then
-    diagnostic_root_provider=$(resolve_guest_provider "$diagnostic_root_device")
-    diagnostic_disk=$(partition_disk_for_provider "$diagnostic_root_provider")
+  if [ "$diagnostic_rootfs" = ufs ]; then
+    if [ -n "$root_provider" ]; then
+      diagnostic_root_provider=$root_provider
+    elif [ -n "$diagnostic_root_device" ]; then
+      diagnostic_root_provider=$(resolve_guest_provider "$diagnostic_root_device")
+    fi
+    if [ -z "$diagnostic_disk" ] && [ -n "$diagnostic_root_provider" ]; then
+      diagnostic_disk=$(partition_disk_for_provider "$diagnostic_root_provider")
+    fi
   elif [ -z "$diagnostic_disk" ] && [ "$diagnostic_rootfs" = zfs ]; then
     diagnostic_root_provider=$(zpool status -LP "${diagnostic_root_device%%/*}" |
       awk '/\/dev\// { sub("^/dev/", "", $1); print $1 }')
@@ -1391,7 +1397,7 @@ guest_contract_diagnostics() {
   fi
   printf '%s\n' \
     "guest contract context: phase=$guest_phase check=$guest_check" \
-    "guest storage context: original_size=$original_size root_device=$diagnostic_root_device rootfs=$diagnostic_rootfs root_provider=$root_provider disk=$diagnostic_disk" \
+    "guest storage context: original_size=$original_size root_device=$diagnostic_root_device rootfs=$diagnostic_rootfs root_provider=$diagnostic_root_provider disk=$diagnostic_disk" \
     "guest size context: root_partition_size=$root_partition_size root_filesystem_kib=$root_filesystem_kib root_pool=$root_pool pool_size=$pool_size"
   guest_observation architecture uname -a
   guest_observation architecture-sysctl sysctl -n hw.machine_arch

@@ -1332,6 +1332,58 @@ def test_guest_contract_failure_is_phase_identified_and_fail_closed():
     assert "remote_line=" in result.stderr
 
 
+def test_post_root_resolution_failure_observes_ufs_root_device():
+    harness = f"""
+set -u
+sudo() {{
+  printf 'sudo-call:%s\\n' "$*" >&2
+  case "$*" in
+    "-n diskinfo /dev/da0p3") printf 'da0p3 512 4294967296\\n' ;;
+    "-n gpart show da0") printf '=> 40 8388528 da0 GPT\\n' ;;
+    "-n gpart status -s da0") printf 'da0p3 OK da0\\n' ;;
+    "-n mdconfig -lv") : ;;
+  esac
+}}
+{_guest_storage_functions(
+    "privileged_diskinfo",
+    "privileged_gpart",
+    "privileged_glabel_status",
+    "privileged_mdconfig",
+    "partition_disk_for_provider",
+    "resolve_guest_provider",
+    "guest_observation",
+    "guest_contract_diagnostics",
+    "guest_contract_exit",
+)}
+original_size=2147483648
+root_device=/dev/gpt/rootfs
+rootfs=ufs
+root_provider=da0p3
+disk=da0
+root_partition_size=4294967296
+root_filesystem_kib=4194304
+root_pool=
+pool_size=
+guest_phase=gpt-health
+guest_check="require every GPT provider status to be OK"
+post_root_failure() {{
+  return 23
+}}
+post_root_failure
+guest_contract_exit
+"""
+    result = subprocess.run(
+        ["/bin/sh", "-c", harness],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 23
+    assert "guest contract failed: phase=gpt-health" in result.stderr
+    assert "--- guest observation: root-device (first 40 lines) ---" in result.stderr
+    assert "sudo-call:-n diskinfo /dev/da0p3" in result.stderr
+    assert "sudo-call:-n glabel status" not in result.stderr
+
+
 def test_guest_contract_capture_preserves_status_files_and_bounds_output():
     result, captured_stdout, captured_stderr = _run_guest_capture_case()
     assert result.stdout == "status=37\n"
