@@ -65,6 +65,24 @@ pub const PartitionRole = enum {
 pub const FilesystemKind = enum {
     ext4,
     fat32,
+
+    /// The spelling `mount(8)`'s `-t` option (and the `mount(2)` syscall's
+    /// `filesystemtype` argument) needs for this kind on Linux.
+    ///
+    /// This is not the same string as the enum tag for `fat32`: the kernel
+    /// has one driver for every flavour of FAT, named `vfat`, and no driver
+    /// at all named `fat32`. A mount call site that assumed the tag name was
+    /// the mount type would ask the kernel for a filesystem it has never
+    /// heard of. Centralizing the mapping here means the two executors that
+    /// mount a planned or preserved root -- `unsafe_chroot.zig` and
+    /// `zvmiguest/main.zig` -- answer "which mount type does this kind need"
+    /// identically rather than each carrying its own copy of the answer.
+    pub fn mountTypeName(self: FilesystemKind) []const u8 {
+        return switch (self) {
+            .ext4 => "ext4",
+            .fat32 => "vfat",
+        };
+    }
 };
 
 pub const PartitionRequest = struct {
@@ -382,4 +400,11 @@ test "planLayout keeps filesystem independent of an explicit type_guid override"
 
     try std.testing.expectEqual(FilesystemKind.fat32, planned[0].filesystem);
     try std.testing.expectEqualSlices(u8, &guid.linux_filesystem_data, &planned[0].type_guid);
+}
+
+test "FilesystemKind.mountTypeName spells each kind the way mount(8)/mount(2) expects" {
+    // ext4's tag and its mount type happen to agree; fat32's must not, since
+    // the kernel has no filesystem driver named `fat32`.
+    try std.testing.expectEqualStrings("ext4", FilesystemKind.ext4.mountTypeName());
+    try std.testing.expectEqualStrings("vfat", FilesystemKind.fat32.mountTypeName());
 }

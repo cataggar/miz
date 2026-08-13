@@ -20,7 +20,7 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
-pub const control_version: u32 = 6;
+pub const control_version: u32 = 7;
 pub const result_version: u32 = 4;
 
 /// Path the host writes the control document to inside the initramfs, and the
@@ -447,12 +447,51 @@ pub const HookOutcome = struct {
     exit_code: u8,
 };
 
+/// The filesystem the guest mounts `Control.root_device` as.
+///
+/// A self-contained mirror of `layout.FilesystemKind` rather than a shared
+/// import of it: this module deliberately imports nothing but std, so the
+/// libc-free, statically linked guest agent never pulls in `layout.zig`'s
+/// import graph (`azure.zig`, `gpt.zig`, `guid.zig`) just to read one field.
+/// The host converts from `layout.FilesystemKind` when it builds the control
+/// document.
+pub const RootFilesystemKind = enum {
+    ext4,
+    fat32,
+
+    /// The spelling `mount(2)`'s `fstype` argument expects. Not `@tagName`
+    /// because the Linux kernel has no `fat32` driver -- only `vfat`, which
+    /// handles every FAT variant -- so `fat32` and `ext4` diverge here.
+    ///
+    /// Null-terminated, unlike `layout.FilesystemKind`'s copy of this method:
+    /// the guest passes this straight into the raw `mount(2)` syscall rather
+    /// than into a spawned `mount(8)` process's argv, so it needs a
+    /// `[*:0]const u8` rather than a `[]const u8`.
+    pub fn mountTypeName(self: RootFilesystemKind) [*:0]const u8 {
+        return switch (self) {
+            .ext4 => "ext4",
+            .fat32 => "vfat",
+        };
+    }
+};
+
+test "RootFilesystemKind.mountTypeName spells each kind the way mount(2) expects" {
+    try std.testing.expectEqualStrings("ext4", std.mem.span(RootFilesystemKind.ext4.mountTypeName()));
+    try std.testing.expectEqualStrings("vfat", std.mem.span(RootFilesystemKind.fat32.mountTypeName()));
+}
+
 pub const Control = struct {
     version: u32 = control_version,
     /// Block device holding the target root filesystem, e.g. `/dev/vda2`.
     /// The guest kernel scans the partition table, so the host passes the
     /// partition device rather than an offset the guest would have to honour.
     root_device: []const u8,
+    /// The filesystem already inside `root_device`, mounted with this exact
+    /// spelling rather than a hardcoded `"ext4"` at the mount call site.
+    /// Defaults to `.ext4` so a control document built before this field
+    /// existed still describes the ext4 root this project has always
+    /// produced.
+    root_filesystem: RootFilesystemKind = .ext4,
     /// Block device the sealed result is written to, e.g. `/dev/vdb`.
     result_device: []const u8,
     /// Block device holding the framed credential material, e.g. `/dev/vdc`,
@@ -1290,7 +1329,7 @@ test "a version mismatch is refused by name even when the document is otherwise 
     // what it must report -- not the parse failure that happens to come first.
     try std.testing.expectError(error.UnsupportedVersion, parseControl(
         allocator,
-        \\{"version":7,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\{"version":8,"root_device":"/dev/vda2","result_device":"/dev/vdb",
         \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
         ,
     ));
@@ -1299,7 +1338,7 @@ test "a version mismatch is refused by name even when the document is otherwise 
     // failure: the version claimed it would be understood, and it was not.
     try std.testing.expectError(error.UnknownField, parseControl(
         allocator,
-        \\{"version":6,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\{"version":7,"root_device":"/dev/vda2","result_device":"/dev/vdb",
         \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
         ,
     ));
@@ -1408,6 +1447,38 @@ test "a document with no modules is the document this backend has always sent" {
     const parsed = try parseControl(allocator, json);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed.value.modules.len);
+}
+
+test "a document written before root_filesystem existed still parses as the ext4 root every backend has always mounted" {
+    const allocator = std.testing.allocator;
+    // Deliberately hand-written without a `root_filesystem` key, standing in
+    // for a document a pre-existing host build would have sent.
+    const json =
+        \\{"version":7,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\"network":{"offline":{}}}
+    ;
+    const parsed = try parseControl(allocator, json);
+    defer parsed.deinit();
+    try std.testing.expectEqual(RootFilesystemKind.ext4, parsed.value.root_filesystem);
+}
+
+test "an explicitly declared root filesystem round-trips through the control document" {
+    const allocator = std.testing.allocator;
+    const control = Control{
+        .root_device = "/dev/vda2",
+        .root_filesystem = .fat32,
+        .result_device = "/dev/vdb",
+        .network = .offline,
+    };
+    try control.validate();
+
+    const json = try std.json.Stringify.valueAlloc(allocator, control, .{});
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"root_filesystem\":\"fat32\"") != null);
+
+    const parsed = try parseControl(allocator, json);
+    defer parsed.deinit();
+    try std.testing.expectEqual(RootFilesystemKind.fat32, parsed.value.root_filesystem);
 }
 
 test "a control document the guest could be driven by is rejected" {

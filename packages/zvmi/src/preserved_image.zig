@@ -14,6 +14,7 @@ const free_space = @import("free_space.zig");
 const gpt = @import("gpt.zig");
 const guid = @import("guid.zig");
 const identity_rewrite = @import("identity_rewrite.zig");
+const layout = @import("layout.zig");
 const limits_mod = @import("limits.zig");
 const image_mod = @import("image.zig");
 const Image = image_mod.Image;
@@ -113,6 +114,10 @@ pub const RawMutationTarget = struct {
     virtual_size: u64,
     stage_inode: Io.File.INode,
     partition: PartitionGeometry,
+    /// The filesystem the mounting executors -- `unsafe_chroot` and `vm` --
+    /// mount `partition` as, rather than a hardcoded `"ext4"` at the call
+    /// site. Set from `RawMutationOptions.root_filesystem`.
+    root_filesystem: layout.FilesystemKind = .ext4,
 };
 
 pub const RawMutationHook = struct {
@@ -142,6 +147,14 @@ pub const RawMutationOptions = struct {
     expected_source_format: ?Format = null,
     expected_virtual_size: ?u64 = null,
     require_linux_partition: bool = false,
+    /// The filesystem already inside the source's root partition, carried
+    /// through to `RawMutationTarget` unchanged. Only a hook that mounts the
+    /// root -- `unsafe_chroot` and `vm` -- reads it; `edit` and `rebuild`
+    /// never mount anything and act on the raw stage through this project's
+    /// own ext4 code regardless of what this says. Defaults to `.ext4`
+    /// because every caller before this field existed only ever preserved an
+    /// ext4 root.
+    root_filesystem: layout.FilesystemKind = .ext4,
     /// Kernel command-line options appended to every boot entry the image
     /// already carries, applied to the raw stage after every filesystem
     /// change. Empty leaves the boot configuration exactly as the source
@@ -1177,6 +1190,7 @@ fn transactRawInternal(
             .offset = partition.offset,
             .length = partition.length,
         },
+        .root_filesystem = options.root_filesystem,
     }) catch |err| {
         if (err == error.MutationResourcesActive) {
             raw_exists = false;
@@ -3966,6 +3980,58 @@ test "raw mutation hook receives a closed standalone stage and controls publicat
             Io.Dir.cwd().statFile(io, artifact, .{}),
         );
     }
+}
+
+test "the declared root filesystem reaches the mutation hook's target unchanged, defaulting to ext4" {
+    const io = std.testing.io;
+    const source_path = "test-raw-mutation-filesystem-source.raw";
+    const default_path = "test-raw-mutation-filesystem-default.raw";
+    const fat32_path = "test-raw-mutation-filesystem-fat32.raw";
+    const paths = [_][]const u8{
+        source_path,
+        default_path,
+        default_path ++ ".raw-mutation.raw",
+        default_path ++ ".raw-mutation.output",
+        fat32_path,
+        fat32_path ++ ".raw-mutation.raw",
+        fat32_path ++ ".raw-mutation.output",
+    };
+    for (paths) |path| removeStagingPath(io, path);
+    defer for (paths) |path| removeStagingPath(io, path);
+    try createTestDisk(io, source_path);
+
+    const CaptureHook = struct {
+        fn run(
+            context_ptr: ?*anyopaque,
+            _: Allocator,
+            _: Io,
+            target: RawMutationTarget,
+        ) !void {
+            const captured: *layout.FilesystemKind = @ptrCast(@alignCast(context_ptr.?));
+            captured.* = target.root_filesystem;
+        }
+    };
+
+    // Omitted entirely, standing in for every caller before this option
+    // existed.
+    var default_captured: layout.FilesystemKind = undefined;
+    _ = try transactRaw(std.testing.allocator, io, .{
+        .source_path = source_path,
+        .output_path = default_path,
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 1 },
+    }, .{ .context = &default_captured, .runFn = CaptureHook.run });
+    try std.testing.expectEqual(layout.FilesystemKind.ext4, default_captured);
+
+    var fat32_captured: layout.FilesystemKind = undefined;
+    _ = try transactRaw(std.testing.allocator, io, .{
+        .source_path = source_path,
+        .output_path = fat32_path,
+        .output_format = .raw,
+        .root_partition = .{ .mbr_index = 1 },
+        .root_filesystem = .fat32,
+    }, .{ .context = &fat32_captured, .runFn = CaptureHook.run });
+    try std.testing.expectEqual(layout.FilesystemKind.fat32, fat32_captured);
 }
 
 test "preserved editor mutates a raw copy without changing source or unrelated bytes" {

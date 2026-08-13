@@ -183,7 +183,7 @@ const Session = struct {
             return fail("read-credentials", @errorName(err));
         };
 
-        self.mountTarget(control.root_device) catch |err| {
+        self.mountTarget(control.root_device, control.root_filesystem) catch |err| {
             return fail("mount-root", @errorName(err));
         };
         // Before anything is written into the target, so a root this backend
@@ -469,7 +469,7 @@ const Session = struct {
         }
     }
 
-    fn mountTarget(self: *Session, device: []const u8) !void {
+    fn mountTarget(self: *Session, device: []const u8, filesystem: control_mod.RootFilesystemKind) !void {
         try mkdirPath("/mnt");
         try mkdirPath(guest_root);
         const device_z = try self.allocator.dupeZ(u8, device);
@@ -477,7 +477,7 @@ const Session = struct {
         // the jump to `rdinit`, so the node may not exist yet even though the
         // driver is built in and the disk is present.
         try waitForDevice(device_z);
-        try mountChecked(device_z, guest_root, "ext4", linux.MS.NOSUID | linux.MS.NODEV);
+        try mountChecked(device_z, guest_root, filesystem.mountTypeName(), linux.MS.NOSUID | linux.MS.NODEV);
         self.root_mounted = true;
 
         // A target missing these is not a root filesystem this backend can
