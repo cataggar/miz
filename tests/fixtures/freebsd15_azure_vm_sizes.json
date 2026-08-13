@@ -1,0 +1,83 @@
+{
+  "base": {
+    "id": "/subscriptions/test/resourceGroups/rg-test/providers/Microsoft.Compute/virtualMachines/vm-test",
+    "name": "vm-test",
+    "resourceGroup": "rg-test",
+    "location": "swedencentral",
+    "type": "Microsoft.Compute/virtualMachines",
+    "provisioningState": "Succeeded",
+    "vmId": "12345678-1234-1234-1234-123456789abc",
+    "hardwareProfile": {
+      "vmSize": "Standard_D2s_v5"
+    },
+    "storageProfile": {
+      "imageReference": {
+        "id": "/subscriptions/test/resourceGroups/rg-test/providers/Microsoft.Compute/galleries/gallery-test/images/image-test/versions/1.0.0"
+      },
+      "osDisk": {
+        "osType": "Linux",
+        "createOption": "FromImage",
+        "managedDisk": {
+          "id": "/subscriptions/test/resourceGroups/rg-test/providers/Microsoft.Compute/disks/vm-test_OsDisk_1"
+        }
+      }
+    },
+    "osProfile": {
+      "adminUsername": "azureuser",
+      "linuxConfiguration": {
+        "disablePasswordAuthentication": true,
+        "provisionVMAgent": false
+      }
+    },
+    "securityProfile": {
+      "securityType": "Standard"
+    },
+    "diagnosticsProfile": {
+      "bootDiagnostics": {
+        "enabled": true,
+        "storageUri": null
+      }
+    },
+    "networkProfile": {
+      "networkInterfaces": [
+        {
+          "id": "/subscriptions/test/resourceGroups/rg-test/providers/Microsoft.Network/networkInterfaces/vm-testVMNic"
+        }
+      ]
+    },
+    "architecture": "x64"
+  },
+  "cases": {
+    "bytes-only": {
+      "set": {
+        "storageProfile.osDisk.diskSizeBytes": 9663676416,
+        "storageProfile.osDisk.diskSizeGb": null
+      }
+    },
+    "gib-only": {
+      "set": {
+        "storageProfile.osDisk.diskSizeGb": 9
+      }
+    },
+    "both-consistent": {
+      "set": {
+        "storageProfile.osDisk.diskSizeBytes": 9663676416,
+        "storageProfile.osDisk.diskSizeGb": 9
+      }
+    },
+    "both-inconsistent": {
+      "set": {
+        "storageProfile.osDisk.diskSizeBytes": 9663676416,
+        "storageProfile.osDisk.diskSizeGb": 8
+      }
+    },
+    "missing": {
+      "set": {}
+    },
+    "wrong-size": {
+      "set": {
+        "storageProfile.osDisk.managedDisk.sizeInBytes": 8589934592
+      }
+    }
+  }
+}
