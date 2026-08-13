@@ -190,6 +190,43 @@ def _guest_contract_script():
     return content[start:end]
 
 
+def _guest_storage_functions(*names):
+    return "\n".join(_shell_function(name) for name in names)
+
+
+def _run_provider_resolution_case(provider, glabel_output=""):
+    harness = f"""
+set -u
+sudo() {{
+  printf 'sudo-call:%s\\n' "$*" >&2
+  test "$1" = -n
+  test "$2" = glabel
+  test "$3" = status
+  printf '%s' "$GLABEL_OUTPUT"
+}}
+{_guest_storage_functions(
+    "privileged_glabel_status",
+    "partition_disk_for_provider",
+    "resolve_guest_provider",
+)}
+set +e
+resolved=$(resolve_guest_provider "$PROVIDER")
+status=$?
+set -e
+printf 'status=%s\\nresolved=%s\\n' "$status" "$resolved"
+"""
+    env = os.environ.copy()
+    env.update({"PROVIDER": provider, "GLABEL_OUTPUT": glabel_output})
+    result = subprocess.run(
+        ["/bin/sh", "-c", harness],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    return result
+
+
 def _run_guest_capture_case():
     root = (
         Path(SCRIPT).parents[1]
@@ -1037,23 +1074,21 @@ def test_gen2_disk():
 
 def test_architecture_maps_exactly_for_gallery_definition():
     content = Path(SCRIPT).read_text(encoding="utf-8")
-    mapping_start = content.index('case "$ARCHITECTURE" in')
-    mapping_end = content.index("\nesac", mapping_start)
-    mapping = content[mapping_start:mapping_end]
+    mapping = _shell_function("set_architecture_profile")
 
     assert (
         "aarch64)\n"
-        "    short_arch=arm64\n"
-        "    expected_azure_architecture=Arm64\n"
-        "    runtime_architecture=arm64\n"
-        "    azure_image_architecture=Arm64"
+        "      short_arch=arm64\n"
+        "      expected_azure_architecture=Arm64\n"
+        "      runtime_architecture=aarch64\n"
+        "      azure_image_architecture=Arm64"
     ) in mapping
     assert (
         "x86_64)\n"
-        "    short_arch=x64\n"
-        "    expected_azure_architecture=x64\n"
-        "    runtime_architecture=amd64\n"
-        "    azure_image_architecture=x64"
+        "      short_arch=x64\n"
+        "      expected_azure_architecture=x64\n"
+        "      runtime_architecture=amd64\n"
+        "      azure_image_architecture=x64"
     ) in mapping
     definition_create = content.index("az sig image-definition create")
     definition_show = content.index(
@@ -1061,6 +1096,29 @@ def test_architecture_maps_exactly_for_gallery_definition():
     )
     definition_block = content[definition_create:definition_show]
     assert '--architecture "$azure_image_architecture"' in definition_block
+
+
+def test_architecture_profiles_execute_with_exact_runtime_and_azure_mappings():
+    harness = f"""
+set -u
+{_shell_function("set_architecture_profile")}
+for architecture in aarch64 x86_64; do
+  set_architecture_profile "$architecture"
+  printf '%s:%s:%s:%s:%s\\n' "$architecture" "$short_arch" \
+    "$expected_azure_architecture" "$runtime_architecture" \
+    "$azure_image_architecture"
+done
+"""
+    result = subprocess.run(
+        ["/bin/sh", "-c", harness],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.splitlines() == [
+        "aarch64:arm64:Arm64:aarch64:Arm64",
+        "x86_64:x64:x64:amd64:x64",
+    ]
 
 
 def test_gallery_definition_and_version_precede_provisioned_vm():
@@ -1317,6 +1375,72 @@ def test_guest_contract_failure_artifacts_and_observations_are_bounded():
         assert f"guest_observation {observation}" in content
 
 
+def test_guest_provider_resolver_keeps_direct_provider_without_glabel():
+    result = _run_provider_resolution_case("/dev/da0p3")
+    assert result.stdout == "status=0\nresolved=da0p3\n"
+    assert result.stderr == ""
+
+
+def test_guest_provider_resolver_resolves_exact_geom_labels_with_sudo_n():
+    for label in ("gpt/rootfs", "label/resource-swap", "ufs/rootfs"):
+        result = _run_provider_resolution_case(
+            f"/dev/{label}",
+            "Name Status Components\n"
+            "gpt/efi N/A da0p1\n"
+            f"{label} N/A da0p3\n",
+        )
+        assert result.stdout == "status=0\nresolved=da0p3\n"
+        assert result.stderr == "sudo-call:-n glabel status\n"
+
+
+def test_guest_provider_resolver_rejects_missing_ambiguous_and_malformed_labels():
+    fixtures = (
+        "Name Status Components\ngpt/efi N/A da0p1\n",
+        "Name Status Components\n"
+        "gpt/rootfs N/A da0p3\n"
+        "gpt/rootfs N/A da1p3\n",
+        "Name Status Components\ngpt/rootfs N/A da0\n",
+        "unexpected header\ngpt/rootfs N/A da0p3\n",
+        "Name Status Components\nmalformed-row\ngpt/rootfs N/A da0p3\n",
+    )
+    for fixture in fixtures:
+        result = _run_provider_resolution_case("/dev/gpt/rootfs", fixture)
+        assert result.stdout == "status=1\nresolved=\n"
+        assert "sudo-call:-n glabel status\n" in result.stderr
+        assert "GEOM label" in result.stderr
+
+
+def test_privileged_storage_commands_use_exact_noninteractive_sudo_invocations():
+    harness = f"""
+set -u
+sudo() {{
+  printf '%s\\n' "$*"
+}}
+{_guest_storage_functions(
+    "privileged_diskinfo",
+    "privileged_gpart",
+    "privileged_glabel_status",
+    "privileged_mdconfig",
+)}
+privileged_diskinfo /dev/da0p3
+privileged_gpart status -s da0
+privileged_glabel_status
+privileged_mdconfig -lv -u 0
+"""
+    result = subprocess.run(
+        ["/bin/sh", "-c", harness],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.splitlines() == [
+        "-n diskinfo /dev/da0p3",
+        "-n gpart status -s da0",
+        "-n glabel status",
+        "-n mdconfig -lv -u 0",
+    ]
+
+
 def test_guest_contract_phase_names_and_result_contracts_are_stable():
     content = Path(SCRIPT).read_text(encoding="utf-8")
     for phase in (
@@ -1374,10 +1498,10 @@ def test_ufs_root_and_growth_validation_has_no_zfs_assumptions():
 def test_gpt_health_and_no_os_disk_swap():
     with open(SCRIPT) as f:
         content = f.read()
-    assert '! gpart show "$disk" | grep -q CORRUPT' in content
-    assert 'gpart status -s "$disk"' in content
+    assert '! privileged_gpart show "$disk" | grep -q CORRUPT' in content
+    assert 'privileged_gpart status -s "$disk"' in content
     assert "require_resource_disk_provider" in content
-    assert '"$resource_disk" = "$disk"' in content
+    assert '[ "$resource_disk" = "$disk" ]' in content
     assert "swap provider is not positively identified as resource-disk-backed" in content
 
 
@@ -1387,7 +1511,7 @@ def test_md_backed_root_swap_file_is_rejected():
     start = content.index("    md[0-9]*)")
     end = content.index("      ;;", start)
     md_checks = content[start:end]
-    assert 'mdconfig -lv -u "$md_unit"' in md_checks
+    assert 'privileged_mdconfig -lv -u "$md_unit"' in md_checks
     assert '$2 == "vnode" { print $4; exit }' in md_checks
     assert 'md_backing_mount=$(df -k "$md_backing"' in md_checks
     assert 'md_backing_device=$(df -k "$md_backing"' in md_checks
@@ -1440,6 +1564,43 @@ def test_resource_disk_provider_parser_supports_gpt_and_mbr():
         content = f.read()
     assert "sed -E 's/(p|s)[0-9]+$//'" in content
     assert "*p[0-9]*|*s[0-9]*)" in content
+
+
+def test_swap_resource_disk_safety_accepts_only_non_os_partition_backing():
+    harness = f"""
+set -u
+sudo_call=
+sudo() {{
+  sudo_call=$*
+}}
+{_guest_storage_functions(
+    "privileged_diskinfo",
+    "partition_disk_for_provider",
+    "require_resource_disk_provider",
+)}
+disk=da0
+require_resource_disk_provider da1p1
+printf 'resource_status=%s\\nsudo_call=%s\\n' "$?" "$sudo_call"
+set +e
+require_resource_disk_provider da0p2
+printf 'os_status=%s\\n' "$?"
+require_resource_disk_provider da1
+printf 'whole_disk_status=%s\\n' "$?"
+"""
+    result = subprocess.run(
+        ["/bin/sh", "-c", harness],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.splitlines() == [
+        "resource_status=0",
+        "sudo_call=-n diskinfo /dev/da1",
+        "os_status=1",
+        "whole_disk_status=1",
+    ]
+    assert "swap is not backed by a resource-disk partition: da0p2" in result.stderr
+    assert "provider is not an exact partition provider: da1" in result.stderr
 
 
 def test_clean_shutdown_is_observed():
