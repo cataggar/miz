@@ -846,10 +846,11 @@ fn validateFinalizedImage(
         root_partition.last_lba < root_partition.first_lba)
         return error.InvalidRootPartition;
     const requests = [_]zvmi.layout.PartitionRequest{
-        .{ .name = "ESP", .role = .esp, .size = .{ .fixed = 512 * 1024 * 1024 } },
+        .{ .name = "ESP", .role = .esp, .filesystem = .fat32, .size = .{ .fixed = 512 * 1024 * 1024 } },
         .{
             .name = "root",
             .role = candidate.architecture.rootRole(),
+            .filesystem = .ext4,
             .size = .{ .percent = 100.0 },
         },
     };

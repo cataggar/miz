@@ -1874,8 +1874,8 @@ test "populateEsp copies EFI binaries and generates grub.cfg plus BLS entries" {
 
     const disk_size = 256 * 1024 * 1024;
     const requests = [_]layout.PartitionRequest{
-        .{ .name = "ESP", .role = .esp, .size = .{ .fixed = 96 * 1024 * 1024 } },
-        .{ .name = "root", .role = .root_x86_64, .size = .{ .percent = 100.0 } },
+        .{ .name = "ESP", .role = .esp, .filesystem = .fat32, .size = .{ .fixed = 96 * 1024 * 1024 } },
+        .{ .name = "root", .role = .root_x86_64, .filesystem = .ext4, .size = .{ .percent = 100.0 } },
     };
     const planned = try layout.planLayout(std.testing.allocator, disk_size, &requests, null);
     defer std.testing.allocator.free(planned);
@@ -1997,8 +1997,8 @@ test "populateEsp ignores GRUB's own linux.mod and installer loader binaries as 
 
     const disk_size = 256 * 1024 * 1024;
     const requests = [_]layout.PartitionRequest{
-        .{ .name = "ESP", .role = .esp, .size = .{ .fixed = 96 * 1024 * 1024 } },
-        .{ .name = "root", .role = .root_x86_64, .size = .{ .percent = 100.0 } },
+        .{ .name = "ESP", .role = .esp, .filesystem = .fat32, .size = .{ .fixed = 96 * 1024 * 1024 } },
+        .{ .name = "root", .role = .root_x86_64, .filesystem = .ext4, .size = .{ .percent = 100.0 } },
     };
     const planned = try layout.planLayout(std.testing.allocator, disk_size, &requests, null);
     defer std.testing.allocator.free(planned);
@@ -2097,6 +2097,7 @@ test "populateEsp synthesizes fallback BOOTX64.EFI from shim when needed" {
         .{ .planned = .{
             .name = "ESP",
             .role = .esp,
+            .filesystem = .fat32,
             .type_guid = guid.esp,
             .offset_bytes = 0,
             .length_bytes = esp_len,
@@ -2104,6 +2105,7 @@ test "populateEsp synthesizes fallback BOOTX64.EFI from shim when needed" {
         .{ .planned = .{
             .name = "root",
             .role = .root_x86_64,
+            .filesystem = .ext4,
             .type_guid = guid.linux_root_x86_64,
             .offset_bytes = esp_len,
             .length_bytes = esp_len,
@@ -2147,6 +2149,7 @@ test "populateEsp appends dm-verity kernel arguments to grub.cfg and BLS entries
         .{ .planned = .{
             .name = "ESP",
             .role = .esp,
+            .filesystem = .fat32,
             .type_guid = guid.esp,
             .offset_bytes = 0,
             .length_bytes = esp_len,
@@ -2154,6 +2157,7 @@ test "populateEsp appends dm-verity kernel arguments to grub.cfg and BLS entries
         .{ .planned = .{
             .name = "root",
             .role = .root_x86_64,
+            .filesystem = .ext4,
             .type_guid = guid.linux_root_x86_64,
             .offset_bytes = esp_len,
             .length_bytes = esp_len,
@@ -2257,6 +2261,7 @@ test "generateBiosGrubCfg renders an MBR grub.cfg for the discovered kernel" {
         .{ .planned = .{
             .name = "root",
             .role = .root_x86_64,
+            .filesystem = .ext4,
             .type_guid = guid.linux_root_x86_64,
             .offset_bytes = 1024 * 1024,
             .length_bytes = 128 * 1024 * 1024,
@@ -2301,6 +2306,7 @@ test "generateBiosGrubCfg selects boot/grub/grub.cfg for legacy BIOS assets" {
         .{ .planned = .{
             .name = "root",
             .role = .root_x86_64,
+            .filesystem = .ext4,
             .type_guid = guid.linux_root_x86_64,
             .offset_bytes = 1024 * 1024,
             .length_bytes = 128 * 1024 * 1024,
@@ -2328,6 +2334,7 @@ test "generateBiosGrubCfg prefers an existing boot/grub2/grub.cfg over usr/lib B
         .{ .planned = .{
             .name = "root",
             .role = .root_x86_64,
+            .filesystem = .ext4,
             .type_guid = guid.linux_root_x86_64,
             .offset_bytes = 1024 * 1024,
             .length_bytes = 128 * 1024 * 1024,
@@ -2368,6 +2375,7 @@ test "populateEsp copies MOK assets and emits UKIs when requested" {
         .{ .planned = .{
             .name = "ESP",
             .role = .esp,
+            .filesystem = .fat32,
             .type_guid = guid.esp,
             .offset_bytes = 0,
             .length_bytes = esp_len,
@@ -2375,6 +2383,7 @@ test "populateEsp copies MOK assets and emits UKIs when requested" {
         .{ .planned = .{
             .name = "root",
             .role = .root_x86_64,
+            .filesystem = .ext4,
             .type_guid = guid.linux_root_x86_64,
             .offset_bytes = esp_len,
             .length_bytes = esp_len,
@@ -2456,6 +2465,7 @@ test "populateEsp can generate UKI-only ESP boot path" {
         .{ .planned = .{
             .name = "ESP",
             .role = .esp,
+            .filesystem = .fat32,
             .type_guid = guid.esp,
             .offset_bytes = 0,
             .length_bytes = esp_len,
@@ -2463,6 +2473,7 @@ test "populateEsp can generate UKI-only ESP boot path" {
         .{ .planned = .{
             .name = "root",
             .role = .root_x86_64,
+            .filesystem = .ext4,
             .type_guid = guid.linux_root_x86_64,
             .offset_bytes = esp_len,
             .length_bytes = esp_len,
@@ -2514,6 +2525,7 @@ test "a UKI-only ESP signs once and writes the signed bytes to both destinations
         .{ .planned = .{
             .name = "ESP",
             .role = .esp,
+            .filesystem = .fat32,
             .type_guid = guid.esp,
             .offset_bytes = 0,
             .length_bytes = esp_len,
@@ -2521,6 +2533,7 @@ test "a UKI-only ESP signs once and writes the signed bytes to both destinations
         .{ .planned = .{
             .name = "root",
             .role = .root_x86_64,
+            .filesystem = .ext4,
             .type_guid = guid.linux_root_x86_64,
             .offset_bytes = esp_len,
             .length_bytes = esp_len,
@@ -2639,6 +2652,7 @@ test "an unsigned UKI reaches the ESP exactly as generated" {
         .{ .planned = .{
             .name = "ESP",
             .role = .esp,
+            .filesystem = .fat32,
             .type_guid = guid.esp,
             .offset_bytes = 0,
             .length_bytes = esp_len,
@@ -2646,6 +2660,7 @@ test "an unsigned UKI reaches the ESP exactly as generated" {
         .{ .planned = .{
             .name = "root",
             .role = .root_x86_64,
+            .filesystem = .ext4,
             .type_guid = guid.linux_root_x86_64,
             .offset_bytes = esp_len,
             .length_bytes = esp_len,
