@@ -65,6 +65,21 @@ PY
     echo "::error::Failed to delete owned temporary resource group"
     return 1
   fi
+  if ! group_exists=$(az group exists --name "$resource_group" --output tsv); then
+    echo "::error::Could not verify temporary resource-group deletion"
+    return 1
+  fi
+  case "$group_exists" in
+    false) ;;
+    true)
+      echo "::error::Owned temporary resource group still exists after deletion"
+      return 1
+      ;;
+    *)
+      echo "::error::Azure returned an invalid post-cleanup resource-group result"
+      return 1
+      ;;
+  esac
 }
 
 if [[ "$command_name" == cleanup ]]; then
@@ -106,7 +121,7 @@ report_error() {
 }
 trap 'report_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
-for tool in az azcopy curl python3 qemu-img sha256sum ssh ssh-keygen; do
+for tool in az azcopy curl date python3 qemu-img sha256sum ssh ssh-keygen; do
   command -v "$tool" >/dev/null || {
     echo "::error::Required Azure acceptance tool $tool is unavailable"
     exit 1
@@ -356,16 +371,41 @@ candidate_architecture=${candidate[4]}
 
 suffix=${CANDIDATE_KEY//_/-}
 resource_group="zvmi-fb15-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
-short_arch=${ARCHITECTURE/x86_64/x64}
-short_arch=${short_arch/aarch64/arm64}
+case "$ARCHITECTURE" in
+  aarch64)
+    short_arch=arm64
+    expected_azure_architecture=Arm64
+    runtime_architecture=arm64
+    azure_image_architecture=Arm64
+    ;;
+  x86_64)
+    short_arch=x64
+    expected_azure_architecture=x64
+    runtime_architecture=amd64
+    azure_image_architecture=x64
+    ;;
+esac
 name_seed="${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}${short_arch}"
 disk_name="zvmi-os-${name_seed}"
+gallery_name="zvmifb15${name_seed}"
+image_definition_name="zvmifb15${short_arch}${FILESYSTEM}${FLAVOR}"
+image_version=1.0.0
+image_publisher=zvmi
+image_offer=freebsd15
+image_sku="${short_arch}-${FILESYSTEM}-${FLAVOR}"
 vm_name="zvmi-vm-${name_seed}"
 admin_username=zvmitest
 vhd="$RESULT_DIR/${CANDIDATE_KEY}.vhd"
 private_key="$RESULT_DIR/id_ed25519"
 boot_log="$RESULT_DIR/boot.log"
 sku_json="$RESULT_DIR/sku.json"
+disk_json="$RESULT_DIR/disk.json"
+gallery_json="$RESULT_DIR/gallery.json"
+image_definition_json="$RESULT_DIR/image-definition.json"
+image_version_json="$RESULT_DIR/image-version.json"
+image_replication_json="$RESULT_DIR/image-version-replication.json"
+azure_locations_json="$RESULT_DIR/azure-locations.json"
+vm_json="$RESULT_DIR/vm.json"
 mkdir -p "$(dirname -- "$STATE_FILE")"
 rm -f -- "$STATE_FILE" "${STATE_FILE}.group.json" "$vhd" "$private_key" "$private_key.pub"
 
@@ -386,6 +426,284 @@ cleanup_on_exit() {
 }
 trap cleanup_on_exit EXIT
 trap 'exit 130' INT TERM
+
+resolve_azure_location_display_name() {
+  local locations_path=$1 expected_location=$2
+  if ! az account list-locations --output json >"$locations_path"; then
+    echo "::error::Could not query Azure location metadata" >&2
+    return 1
+  fi
+  python3 - "$locations_path" "$expected_location" <<'PY'
+import json
+import sys
+
+path, expected = sys.argv[1:]
+locations = json.load(open(path, encoding="utf-8"))
+if not isinstance(locations, list):
+    raise SystemExit("Azure location metadata is not a list")
+matches = [
+    location
+    for location in locations
+    if isinstance(location, dict)
+    and isinstance(location.get("name"), str)
+    and location["name"].casefold() == expected.casefold()
+]
+if len(matches) != 1:
+    raise SystemExit(
+        f"Azure location metadata contains {len(matches)} exact canonical "
+        f"matches for {expected!r}"
+    )
+display_name = matches[0].get("displayName")
+if not isinstance(display_name, str) or not display_name:
+    raise SystemExit(f"Azure location {expected!r} has no display name")
+print(display_name)
+PY
+}
+
+validate_gallery_image_version_metadata() {
+  python3 - "$@" <<'PY'
+import json
+import sys
+
+(
+    path,
+    expected_id,
+    expected_name,
+    expected_group,
+    expected_location,
+    expected_location_display_name,
+    expected_disk_id,
+    expected_size_gib,
+) = sys.argv[1:]
+document = json.load(open(path, encoding="utf-8"))
+
+
+def same(left, right):
+    return isinstance(left, str) and left.casefold() == right.casefold()
+
+
+def same_location(value):
+    return isinstance(value, str) and value.casefold() in (
+        expected_location.casefold(),
+        expected_location_display_name.casefold(),
+    )
+
+
+if not same(document.get("id"), expected_id):
+    raise SystemExit("Azure returned a different gallery image-version identity")
+if document.get("name") != expected_name:
+    raise SystemExit("Azure returned a different gallery image-version name")
+resource_group = document.get("resourceGroup")
+if resource_group not in (None, "") and not same(resource_group, expected_group):
+    raise SystemExit("image version is outside the owned temporary resource group")
+if not same(document.get("location"), expected_location):
+    raise SystemExit("gallery image-version location mismatch")
+if not same(document.get("type"), "Microsoft.Compute/galleries/images/versions"):
+    raise SystemExit("Azure returned a non-gallery-image-version resource")
+if document.get("provisioningState") != "Succeeded":
+    raise SystemExit("gallery image-version provisioning did not succeed")
+
+storage = document.get("storageProfile")
+if not isinstance(storage, dict):
+    raise SystemExit("gallery image-version storage profile is missing")
+os_disk = storage.get("osDiskImage")
+if not isinstance(os_disk, dict):
+    raise SystemExit("gallery image-version OS disk metadata is missing")
+image_size_gib = os_disk.get("sizeInGB")
+if image_size_gib is not None and image_size_gib != int(expected_size_gib):
+    raise SystemExit("gallery image-version OS disk size mismatch")
+source = os_disk.get("source")
+if source is not None:
+    if not isinstance(source, dict) or not same(source.get("id"), expected_disk_id):
+        raise SystemExit("gallery image version is not sourced from the exact managed disk")
+artifact_source = storage.get("source")
+if artifact_source is not None:
+    if not isinstance(artifact_source, dict):
+        raise SystemExit("gallery image-version artifact source is invalid")
+    exposed_id = artifact_source.get("id")
+    if exposed_id not in (None, "") and not same(exposed_id, expected_disk_id):
+        raise SystemExit("gallery image-version exposed a different source resource")
+if storage.get("dataDiskImages") not in (None, []):
+    raise SystemExit("gallery image version unexpectedly contains data disks")
+
+publishing = document.get("publishingProfile")
+if not isinstance(publishing, dict):
+    raise SystemExit("gallery image-version publishing profile is missing")
+if publishing.get("replicationMode") != "Shallow":
+    raise SystemExit("gallery image-version replication mode mismatch")
+target_regions = publishing.get("targetRegions")
+if not isinstance(target_regions, list) or len(target_regions) != 1:
+    raise SystemExit("gallery image-version target region is missing or ambiguous")
+target = target_regions[0]
+if not isinstance(target, dict) or not same_location(target.get("name")):
+    raise SystemExit("gallery image-version target location mismatch")
+if target.get("regionalReplicaCount") not in (None, 1):
+    raise SystemExit("gallery image-version replica count mismatch")
+if target.get("storageAccountType") not in (None, "Standard_LRS"):
+    raise SystemExit("gallery image-version storage account type mismatch")
+PY
+}
+
+replication_epoch_seconds() {
+  date +%s
+}
+
+wait_for_image_version_replication() {
+  local timeout_seconds=${1:-1800}
+  local delay_seconds=${2:-5}
+  local max_delay_seconds=${3:-30}
+  local aggregate_state deadline details elapsed now observation progress sleep_seconds
+  local started_at state
+
+  if [[ ! "$timeout_seconds" =~ ^[1-9][0-9]*$ ||
+        ! "$delay_seconds" =~ ^[1-9][0-9]*$ ||
+        ! "$max_delay_seconds" =~ ^[1-9][0-9]*$ ||
+        "$delay_seconds" -gt "$max_delay_seconds" ]]; then
+    echo "::error::Invalid Azure image replication timeout/backoff configuration" >&2
+    return 1
+  fi
+
+  started_at=$(replication_epoch_seconds)
+  deadline=$((started_at + timeout_seconds))
+  while true; do
+    now=$(replication_epoch_seconds)
+    if [[ -n ${state:-} && "$now" -ge "$deadline" ]]; then
+      elapsed=$((now - started_at))
+      echo "::error::Timed out after ${elapsed}s waiting for Azure image version" \
+        "replication to $AZURE_LOCATION (last state=$state," \
+        "aggregated=$aggregate_state, progress=$progress, details=$details);" \
+        "status saved to $image_replication_json" >&2
+      return 1
+    fi
+
+    if ! az sig image-version show \
+      --resource-group "$resource_group" \
+      --gallery-name "$gallery_name" \
+      --gallery-image-definition "$image_definition_name" \
+      --gallery-image-version "$image_version" \
+      --expand ReplicationStatus \
+      --output json >"$image_replication_json"
+    then
+      echo "::error::Could not query Azure image version replication status;" \
+        "response saved to $image_replication_json" >&2
+      return 1
+    fi
+
+    if ! observation=$(
+      python3 - "$image_replication_json" "$AZURE_LOCATION" \
+        "$azure_location_display_name" <<'PY'
+import json
+import sys
+
+path, expected_region, expected_region_display_name = sys.argv[1:]
+document = json.load(open(path, encoding="utf-8"))
+replication = document.get("replicationStatus")
+if not isinstance(replication, dict):
+    raise SystemExit("image version replicationStatus is missing")
+summary = replication.get("summary")
+if not isinstance(summary, list):
+    raise SystemExit("image version regional replication summary is missing")
+
+
+def same_region(value):
+    return isinstance(value, str) and value.casefold() in (
+        expected_region.casefold(),
+        expected_region_display_name.casefold(),
+    )
+
+
+matches = [
+    entry
+    for entry in summary
+    if isinstance(entry, dict) and same_region(entry.get("region"))
+]
+if not matches:
+    reported = [
+        entry.get("region")
+        for entry in summary
+        if isinstance(entry, dict) and isinstance(entry.get("region"), str)
+    ]
+    raise SystemExit(
+        f"replication status does not include target region {expected_region!r}; "
+        f"reported regions: {reported!r}"
+    )
+if len(matches) != 1:
+    raise SystemExit(
+        f"replication status includes target region {expected_region!r} "
+        f"{len(matches)} times"
+    )
+
+target = matches[0]
+state = target.get("state")
+if not isinstance(state, str) or not state:
+    raise SystemExit("target region replication state is missing")
+aggregate = replication.get("aggregatedState")
+if aggregate is not None and not isinstance(aggregate, str):
+    raise SystemExit("aggregated replication state is invalid")
+
+
+def compact(value):
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+
+
+print(
+    "\x1f".join(
+        (
+            state,
+            aggregate or "",
+            compact(target.get("progress")),
+            compact(target.get("details")),
+        )
+    )
+)
+PY
+    )
+    then
+      echo "::error::Azure returned invalid regional image replication status;" \
+        "response saved to $image_replication_json" >&2
+      return 1
+    fi
+    IFS=$'\x1f' read -r state aggregate_state progress details <<<"$observation"
+
+    if [[ "${state,,}" == completed ]]; then
+      return
+    fi
+    if [[ "${state,,}" == failed || "${aggregate_state,,}" == failed ]]; then
+      echo "::error::Azure image version replication to $AZURE_LOCATION failed" \
+        "(state=$state, aggregated=$aggregate_state, progress=$progress," \
+        "details=$details); status saved to $image_replication_json" >&2
+      return 1
+    fi
+    case "${state,,}" in
+      replicating|unknown) ;;
+      *)
+        echo "::error::Azure returned unexpected image replication state" \
+          "$state for $AZURE_LOCATION (aggregated=$aggregate_state," \
+          "progress=$progress, details=$details);" \
+          "status saved to $image_replication_json" >&2
+        return 1
+        ;;
+    esac
+
+    now=$(replication_epoch_seconds)
+    if [[ "$now" -ge "$deadline" ]]; then
+      continue
+    fi
+    sleep_seconds=$delay_seconds
+    if [[ "$sleep_seconds" -gt "$((deadline - now))" ]]; then
+      sleep_seconds=$((deadline - now))
+    fi
+    sleep "$sleep_seconds"
+    delay_seconds=$((delay_seconds * 2))
+    if [[ "$delay_seconds" -gt "$max_delay_seconds" ]]; then
+      delay_seconds=$max_delay_seconds
+    fi
+  done
+}
+
+azure_location_display_name=$(
+  resolve_azure_location_display_name "$azure_locations_json" "$AZURE_LOCATION"
+)
 
 # Derive the fixed VHD
 source_before=$(sha256sum "$asset" | awk '{print $1}')
@@ -454,14 +772,6 @@ az vm list-skus \
   --size "$AZURE_VM_SIZE" \
   --all \
   --output json >"$sku_json"
-expected_azure_architecture=x64
-runtime_architecture=amd64
-azure_image_architecture=x64
-if [[ "$ARCHITECTURE" == aarch64 ]]; then
-  expected_azure_architecture=Arm64
-  runtime_architecture=arm64
-  azure_image_architecture=Arm64
-fi
 python3 - "$sku_json" "$AZURE_VM_SIZE" "$expected_azure_architecture" <<'PY'
 import json
 import sys
@@ -496,12 +806,16 @@ az disk create \
   --hyper-v-generation V2 \
   --architecture "$azure_image_architecture" \
   --output json >/dev/null
+subscription_id=$(az account show --query id --output tsv)
+[[ "$subscription_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+expected_disk_id="/subscriptions/$subscription_id/resourceGroups/$resource_group"
+expected_disk_id+="/providers/Microsoft.Compute/disks/$disk_name"
 disk_id=$(az disk show \
   --resource-group "$resource_group" \
   --name "$disk_name" \
   --query id \
   --output tsv)
-[[ "$disk_id" == /subscriptions/* ]]
+test "${disk_id,,}" = "${expected_disk_id,,}"
 upload_sas=$(grant_disk_write_access "$disk_id" 7200)
 [[ "$upload_sas" == https://* ]]
 echo "::add-mask::$upload_sas"
@@ -520,15 +834,238 @@ az disk update \
   --size-gb "$expanded_size_gib" \
   --output json >/dev/null
 
-# Create VM with key-only SSH
+# Validate the imported disk identity and matching architecture before using it.
+az disk show \
+  --resource-group "$resource_group" \
+  --name "$disk_name" \
+  --output json >"$disk_json"
+disk_id=$(
+  python3 - "$disk_json" "$expected_disk_id" "$disk_name" "$resource_group" \
+    "$AZURE_LOCATION" "$azure_image_architecture" "$expanded_size_gib" <<'PY'
+import json
+import sys
+
+(
+    path,
+    expected_id,
+    expected_name,
+    expected_group,
+    expected_location,
+    expected_architecture,
+    expected_size_gib,
+) = sys.argv[1:]
+document = json.load(open(path, encoding="utf-8"))
+
+
+def same(left, right):
+    return isinstance(left, str) and left.casefold() == right.casefold()
+
+
+if not same(document.get("id"), expected_id):
+    raise SystemExit("Azure returned a different managed disk identity")
+if document.get("name") != expected_name:
+    raise SystemExit("Azure returned a different managed disk name")
+resource_group = document.get("resourceGroup")
+if resource_group not in (None, "") and not same(resource_group, expected_group):
+    raise SystemExit("managed disk is outside the owned temporary resource group")
+if not same(document.get("location"), expected_location):
+    raise SystemExit("managed disk location mismatch")
+if not same(document.get("type"), "Microsoft.Compute/disks"):
+    raise SystemExit("Azure returned a non-disk resource")
+if document.get("osType") != "Linux":
+    raise SystemExit("managed disk OS type mismatch")
+if document.get("hyperVGeneration") != "V2":
+    raise SystemExit("managed disk is not Gen2")
+supported = document.get("supportedCapabilities")
+if not isinstance(supported, dict) or supported.get("architecture") != expected_architecture:
+    raise SystemExit("managed disk architecture mismatch")
+if document.get("diskState") != "Unattached":
+    raise SystemExit("managed disk is not safely detached after upload")
+if document.get("provisioningState") != "Succeeded":
+    raise SystemExit("managed disk provisioning did not succeed")
+if document.get("diskSizeGb") != int(expected_size_gib):
+    raise SystemExit("managed disk expansion size mismatch")
+print(document["id"])
+PY
+)
+test "${disk_id,,}" = "${expected_disk_id,,}"
+test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
+test "$(sha256sum "$vhd" | awk '{print $1}')" = "$vhd_sha256"
+
+# Create a private gallery and generalized Linux Gen2 image definition.
+az sig create \
+  --resource-group "$resource_group" \
+  --gallery-name "$gallery_name" \
+  --location "$AZURE_LOCATION" \
+  --permissions Private \
+  --output json >/dev/null
+az sig show \
+  --resource-group "$resource_group" \
+  --gallery-name "$gallery_name" \
+  --output json >"$gallery_json"
+expected_gallery_id="/subscriptions/$subscription_id/resourceGroups/$resource_group"
+expected_gallery_id+="/providers/Microsoft.Compute/galleries/$gallery_name"
+python3 - "$gallery_json" "$expected_gallery_id" "$gallery_name" \
+  "$resource_group" "$AZURE_LOCATION" <<'PY'
+import json
+import sys
+
+(
+    path,
+    expected_id,
+    expected_name,
+    expected_group,
+    expected_location,
+) = sys.argv[1:]
+document = json.load(open(path, encoding="utf-8"))
+
+
+def same(left, right):
+    return isinstance(left, str) and left.casefold() == right.casefold()
+
+
+if not same(document.get("id"), expected_id):
+    raise SystemExit("Azure returned a different gallery identity")
+if document.get("name") != expected_name:
+    raise SystemExit("Azure returned a different gallery name")
+resource_group = document.get("resourceGroup")
+if resource_group not in (None, "") and not same(resource_group, expected_group):
+    raise SystemExit("gallery is outside the owned temporary resource group")
+if not same(document.get("location"), expected_location):
+    raise SystemExit("gallery location mismatch")
+if not same(document.get("type"), "Microsoft.Compute/galleries"):
+    raise SystemExit("Azure returned a non-gallery resource")
+if document.get("provisioningState") != "Succeeded":
+    raise SystemExit("temporary gallery provisioning did not succeed")
+sharing = document.get("sharingProfile")
+if not isinstance(sharing, dict) or sharing.get("permissions") != "Private":
+    raise SystemExit("temporary gallery is not private")
+PY
+
+az sig image-definition create \
+  --resource-group "$resource_group" \
+  --gallery-name "$gallery_name" \
+  --gallery-image-definition "$image_definition_name" \
+  --publisher "$image_publisher" \
+  --offer "$image_offer" \
+  --sku "$image_sku" \
+  --os-type Linux \
+  --os-state Generalized \
+  --hyper-v-generation V2 \
+  --architecture "$azure_image_architecture" \
+  --location "$AZURE_LOCATION" \
+  --output json >/dev/null
+az sig image-definition show \
+  --resource-group "$resource_group" \
+  --gallery-name "$gallery_name" \
+  --gallery-image-definition "$image_definition_name" \
+  --output json >"$image_definition_json"
+expected_image_definition_id="$expected_gallery_id/images/$image_definition_name"
+python3 - "$image_definition_json" "$expected_image_definition_id" \
+  "$image_definition_name" "$resource_group" "$AZURE_LOCATION" \
+  "$azure_image_architecture" "$image_publisher" "$image_offer" \
+  "$image_sku" <<'PY'
+import json
+import sys
+
+(
+    path,
+    expected_id,
+    expected_name,
+    expected_group,
+    expected_location,
+    expected_architecture,
+    expected_publisher,
+    expected_offer,
+    expected_sku,
+) = sys.argv[1:]
+document = json.load(open(path, encoding="utf-8"))
+
+
+def same(left, right):
+    return isinstance(left, str) and left.casefold() == right.casefold()
+
+
+if not same(document.get("id"), expected_id):
+    raise SystemExit("Azure returned a different gallery image-definition identity")
+if document.get("name") != expected_name:
+    raise SystemExit("Azure returned a different gallery image-definition name")
+resource_group = document.get("resourceGroup")
+if resource_group not in (None, "") and not same(resource_group, expected_group):
+    raise SystemExit("image definition is outside the owned temporary resource group")
+if not same(document.get("location"), expected_location):
+    raise SystemExit("gallery image-definition location mismatch")
+if not same(document.get("type"), "Microsoft.Compute/galleries/images"):
+    raise SystemExit("Azure returned a non-gallery-image-definition resource")
+if document.get("provisioningState") != "Succeeded":
+    raise SystemExit("gallery image-definition provisioning did not succeed")
+if document.get("architecture") != expected_architecture:
+    raise SystemExit("gallery image-definition architecture mismatch")
+if document.get("hyperVGeneration") != "V2":
+    raise SystemExit("gallery image definition is not Gen2")
+if document.get("osType") != "Linux":
+    raise SystemExit("gallery image-definition OS type mismatch")
+if document.get("osState") != "Generalized":
+    raise SystemExit("gallery image definition is not generalized")
+identifier = document.get("identifier")
+expected_identifier = {
+    "publisher": expected_publisher,
+    "offer": expected_offer,
+    "sku": expected_sku,
+}
+if identifier != expected_identifier:
+    raise SystemExit("gallery image-definition identifier mismatch")
+PY
+
+# Azure CLI names its managed-disk source option --os-snapshot.
+image_version_id="$expected_image_definition_id/versions/$image_version"
+az sig image-version create \
+  --resource-group "$resource_group" \
+  --gallery-name "$gallery_name" \
+  --gallery-image-definition "$image_definition_name" \
+  --gallery-image-version "$image_version" \
+  --location "$AZURE_LOCATION" \
+  --os-snapshot "$disk_id" \
+  --replication-mode Shallow \
+  --replica-count 1 \
+  --storage-account-type Standard_LRS \
+  --target-regions "$AZURE_LOCATION=1=Standard_LRS" \
+  --no-wait \
+  --output json >/dev/null
+az sig image-version wait \
+  --resource-group "$resource_group" \
+  --gallery-name "$gallery_name" \
+  --gallery-image-definition "$image_definition_name" \
+  --gallery-image-version "$image_version" \
+  --created \
+  --interval 10 \
+  --timeout 1800 \
+  --output none
+az sig image-version show \
+  --resource-group "$resource_group" \
+  --gallery-name "$gallery_name" \
+  --gallery-image-definition "$image_definition_name" \
+  --gallery-image-version "$image_version" \
+  --output json >"$image_version_json"
+validate_gallery_image_version_metadata \
+  "$image_version_json" "$image_version_id" "$image_version" \
+  "$resource_group" "$AZURE_LOCATION" "$azure_location_display_name" \
+  "$disk_id" "$expanded_size_gib"
+test "${image_version_id,,}" = \
+  "${expected_image_definition_id,,}/versions/${image_version,,}"
+wait_for_image_version_replication \
+  "${AZURE_IMAGE_REPLICATION_TIMEOUT_SECONDS:-1800}" \
+  "${AZURE_IMAGE_REPLICATION_INITIAL_DELAY_SECONDS:-5}" \
+  "${AZURE_IMAGE_REPLICATION_MAX_DELAY_SECONDS:-30}"
+
+# Create the matching-architecture VM from the exact gallery version with key-only SSH.
 ssh-keygen -q -t ed25519 -N '' -C zvmi-azure-acceptance -f "$private_key"
 az vm create \
   --resource-group "$resource_group" \
   --name "$vm_name" \
   --location "$AZURE_LOCATION" \
   --size "$AZURE_VM_SIZE" \
-  --attach-os-disk "$disk_name" \
-  --os-type Linux \
+  --image "$image_version_id" \
   --admin-username "$admin_username" \
   --authentication-type ssh \
   --ssh-key-values "$private_key.pub" \
@@ -538,6 +1075,123 @@ az vm create \
   --nsg-rule SSH \
   --boot-diagnostics-storage "" \
   --output json >/dev/null
+az vm show \
+  --resource-group "$resource_group" \
+  --name "$vm_name" \
+  --output json >"$vm_json"
+expected_vm_id="/subscriptions/$subscription_id/resourceGroups/$resource_group"
+expected_vm_id+="/providers/Microsoft.Compute/virtualMachines/$vm_name"
+vm_id=$(
+  python3 - "$vm_json" "$expected_vm_id" "$vm_name" "$resource_group" \
+    "$AZURE_LOCATION" "$AZURE_VM_SIZE" "$image_version_id" "$admin_username" \
+    "$azure_image_architecture" "$expanded_size_gib" <<'PY'
+import json
+import re
+import sys
+
+(
+    path,
+    expected_id,
+    expected_name,
+    expected_group,
+    expected_location,
+    expected_size,
+    expected_image_version_id,
+    expected_admin,
+    expected_architecture,
+    expected_size_gib,
+) = sys.argv[1:]
+document = json.load(open(path, encoding="utf-8"))
+
+
+def same(left, right):
+    return isinstance(left, str) and left.casefold() == right.casefold()
+
+
+if not same(document.get("id"), expected_id):
+    raise SystemExit("Azure returned a different VM identity")
+if document.get("name") != expected_name:
+    raise SystemExit("Azure returned a different VM name")
+resource_group = document.get("resourceGroup")
+if resource_group not in (None, "") and not same(resource_group, expected_group):
+    raise SystemExit("VM is outside the owned temporary resource group")
+if not same(document.get("location"), expected_location):
+    raise SystemExit("VM location mismatch")
+if not same(document.get("type"), "Microsoft.Compute/virtualMachines"):
+    raise SystemExit("Azure returned a non-VM resource")
+if document.get("provisioningState") != "Succeeded":
+    raise SystemExit("VM provisioning did not succeed")
+if not re.fullmatch(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+    document.get("vmId", ""),
+):
+    raise SystemExit("Azure returned an invalid VM instance identity")
+
+hardware = document.get("hardwareProfile")
+if not isinstance(hardware, dict) or hardware.get("vmSize") != expected_size:
+    raise SystemExit("VM size mismatch")
+storage = document.get("storageProfile")
+if not isinstance(storage, dict):
+    raise SystemExit("VM storage profile is missing")
+image_reference = storage.get("imageReference")
+if not isinstance(image_reference, dict) or not same(
+    image_reference.get("id"), expected_image_version_id
+):
+    raise SystemExit("VM is not bound to the exact gallery image version")
+os_disk = storage.get("osDisk")
+if not isinstance(os_disk, dict):
+    raise SystemExit("VM OS disk metadata is missing")
+if os_disk.get("osType") != "Linux" or os_disk.get("createOption") != "FromImage":
+    raise SystemExit("VM OS disk was not created as Linux from the image")
+if os_disk.get("diskSizeGb") != int(expected_size_gib):
+    raise SystemExit("VM OS disk size mismatch")
+vm_os_disk_id = (os_disk.get("managedDisk") or {}).get("id")
+disk_prefix = (
+    expected_id.rsplit("/providers/", 1)[0]
+    + "/providers/Microsoft.Compute/disks/"
+)
+if not isinstance(vm_os_disk_id, str) or not vm_os_disk_id.casefold().startswith(
+    disk_prefix.casefold()
+):
+    raise SystemExit("VM OS disk is outside the owned temporary resource group")
+
+os_profile = document.get("osProfile")
+if not isinstance(os_profile, dict) or os_profile.get("adminUsername") != expected_admin:
+    raise SystemExit("VM administrator identity mismatch")
+linux = os_profile.get("linuxConfiguration")
+if not isinstance(linux, dict):
+    raise SystemExit("VM Linux provisioning policy is missing")
+if linux.get("disablePasswordAuthentication") is not True:
+    raise SystemExit("VM does not require key-only authentication")
+if linux.get("provisionVMAgent") is not False:
+    raise SystemExit("VM agent policy mismatch")
+
+security = document.get("securityProfile") or {}
+security_type = security.get("securityType")
+if security_type not in (None, "Standard"):
+    raise SystemExit("VM security type mismatch")
+boot = (document.get("diagnosticsProfile") or {}).get("bootDiagnostics") or {}
+if boot.get("enabled") is not True or boot.get("storageUri") not in (None, ""):
+    raise SystemExit("VM managed boot diagnostics policy mismatch")
+interfaces = (document.get("networkProfile") or {}).get("networkInterfaces")
+if not isinstance(interfaces, list) or len(interfaces) != 1:
+    raise SystemExit("VM network interface metadata is missing or ambiguous")
+nic_prefix = (
+    expected_id.rsplit("/providers/", 1)[0]
+    + "/providers/Microsoft.Network/networkInterfaces/"
+)
+if not same(interfaces[0].get("id", "")[: len(nic_prefix)], nic_prefix):
+    raise SystemExit("VM network interface is outside the owned temporary resource group")
+
+for owner in (document, hardware, os_disk):
+    architecture = owner.get("architecture")
+    if architecture not in (None, "") and architecture != expected_architecture:
+        raise SystemExit("VM architecture mismatch")
+print(document["id"])
+PY
+)
+test "${vm_id,,}" = "${expected_vm_id,,}"
 public_ip=$(az vm show \
   --resource-group "$resource_group" \
   --name "$vm_name" \
@@ -545,6 +1199,11 @@ public_ip=$(az vm show \
   --query publicIps \
   --output tsv)
 [[ "$public_ip" =~ ^[0-9a-fA-F:.]+$ ]]
+test "$(az vm get-instance-view \
+  --resource-group "$resource_group" \
+  --name "$vm_name" \
+  --query "instanceView.statuses[?code=='ProvisioningState/succeeded'].code | [0]" \
+  --output tsv)" = ProvisioningState/succeeded
 test "$(az vm get-instance-view \
   --resource-group "$resource_group" \
   --name "$vm_name" \
@@ -637,7 +1296,7 @@ require_serial_console_log() {
 }
 
 # --- CONTRACT: matching-architecture-gen2 ---
-# (Gen2 enforced by disk hyper-v-generation V2)
+# (Gen2 and architecture are validated across SKU, source disk, image, and VM.)
 
 # --- CONTRACT: key-only-ssh ---
 wait_for_ssh
@@ -870,6 +1529,7 @@ python3 scripts/freebsd15_release.py azure-result \
 
 # Final source-digest assertion
 test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
+test "$(sha256sum "$vhd" | awk '{print $1}')" = "$vhd_sha256"
 
 {
   echo "### Azure acceptance: $ASSET_NAME"
@@ -878,6 +1538,7 @@ test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
   echo "- Derived VHD: \`$vhd_sha256\`; current $vhd_current_size bytes;" \
     "file $vhd_bytes bytes (not retained or published)"
   echo "- Azure: \`$AZURE_LOCATION\` / \`$AZURE_VM_SIZE\`"
+  echo "- Temporary managed disk, gallery image version, and VM: owned resource-group cleanup"
   echo "- Contracts: $contracts"
   echo "- Status: success"
 } >>"$GITHUB_STEP_SUMMARY"

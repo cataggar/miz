@@ -1,0 +1,27 @@
+{
+  "id": "/subscriptions/test/resourceGroups/rg-test/providers/Microsoft.Compute/galleries/gallery-test/images/image-test/versions/1.0.0",
+  "name": "1.0.0",
+  "resourceGroup": "rg-test",
+  "location": "swedencentral",
+  "type": "Microsoft.Compute/galleries/images/versions",
+  "provisioningState": "Succeeded",
+  "storageProfile": {
+    "osDiskImage": {
+      "sizeInGB": 8,
+      "source": {
+        "id": "/subscriptions/test/resourceGroups/rg-test/providers/Microsoft.Compute/disks/disk-test"
+      }
+    },
+    "dataDiskImages": []
+  },
+  "publishingProfile": {
+    "replicationMode": "Shallow",
+    "targetRegions": [
+      {
+        "name": "Sweden Central",
+        "regionalReplicaCount": 1,
+        "storageAccountType": "Standard_LRS"
+      }
+    ]
+  }
+}
