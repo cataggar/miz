@@ -78,6 +78,32 @@
       "set": {
         "storageProfile.osDisk.managedDisk.sizeInBytes": 8589934592
       }
+    },
+    "boot-storage-empty": {
+      "set": {
+        "storageProfile.osDisk.diskSizeGb": 9,
+        "diagnosticsProfile.bootDiagnostics.storageUri": ""
+      }
+    },
+    "boot-storage-custom": {
+      "set": {
+        "storageProfile.osDisk.diskSizeGb": 9,
+        "diagnosticsProfile.bootDiagnostics.storageUri": "https://custom.blob.core.windows.net/"
+      }
+    },
+    "boot-disabled": {
+      "set": {
+        "storageProfile.osDisk.diskSizeGb": 9,
+        "diagnosticsProfile.bootDiagnostics.enabled": false
+      }
+    },
+    "boot-profile-missing": {
+      "set": {
+        "storageProfile.osDisk.diskSizeGb": 9
+      },
+      "remove": [
+        "diagnosticsProfile"
+      ]
     }
   }
 }

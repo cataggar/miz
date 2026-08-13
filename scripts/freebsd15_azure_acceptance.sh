@@ -406,6 +406,9 @@ image_version_json="$RESULT_DIR/image-version.json"
 image_replication_json="$RESULT_DIR/image-version-replication.json"
 azure_locations_json="$RESULT_DIR/azure-locations.json"
 vm_json="$RESULT_DIR/vm.json"
+boot_diagnostics_enable_json="$RESULT_DIR/boot-diagnostics-enable.json"
+boot_diagnostics_enable_stderr="$RESULT_DIR/boot-diagnostics-enable.stderr"
+vm_show_stderr="$RESULT_DIR/vm-show.stderr"
 mkdir -p "$(dirname -- "$STATE_FILE")"
 rm -f -- "$STATE_FILE" "${STATE_FILE}.group.json" "$vhd" "$private_key" "$private_key.pub"
 
@@ -466,6 +469,122 @@ validate_gallery_image_version_metadata() {
 
 replication_epoch_seconds() {
   date +%s
+}
+
+boot_diagnostics_epoch_seconds() {
+  date +%s
+}
+
+wait_for_managed_boot_diagnostics() {
+  local timeout_seconds=${1:-180}
+  local delay_seconds=${2:-5}
+  local attempt deadline elapsed max_attempts now observation query_attempts=0
+  local sleep_seconds started_at
+
+  if [[ ! "$timeout_seconds" =~ ^[1-9][0-9]*$ ||
+        ! "$delay_seconds" =~ ^[1-9][0-9]*$ ]]; then
+    echo "::error::Invalid Azure boot diagnostics timeout configuration" >&2
+    return 1
+  fi
+
+  started_at=$(boot_diagnostics_epoch_seconds)
+  deadline=$((started_at + timeout_seconds))
+  max_attempts=$(((timeout_seconds + delay_seconds - 1) / delay_seconds + 1))
+  observation="VM metadata has not been queried"
+
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    now=$(boot_diagnostics_epoch_seconds)
+    if [[ "$attempt" -gt 1 && "$now" -ge "$deadline" ]]; then
+      break
+    fi
+
+    query_attempts=$((query_attempts + 1))
+    if az vm show \
+      --resource-group "$resource_group" \
+      --name "$vm_name" \
+      --output json >"$vm_json" 2>"$vm_show_stderr"
+    then
+      if ! observation=$(
+        python3 - "$vm_json" <<'PY'
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+if not isinstance(document, dict):
+    raise SystemExit("VM metadata is not an object")
+profile = document.get("diagnosticsProfile")
+if profile is None:
+    print("pending: diagnosticsProfile is absent or null")
+    raise SystemExit(0)
+if not isinstance(profile, dict):
+    raise SystemExit("VM diagnosticsProfile is not an object")
+boot = profile.get("bootDiagnostics")
+if boot is None:
+    print("pending: bootDiagnostics is absent or null")
+    raise SystemExit(0)
+if not isinstance(boot, dict):
+    raise SystemExit("VM bootDiagnostics is not an object")
+storage_uri = boot.get("storageUri")
+if storage_uri is not None:
+    raise SystemExit(
+        "managed boot diagnostics storageUri must be absent or null, "
+        f"not {storage_uri!r}"
+    )
+enabled = boot.get("enabled")
+if enabled is True:
+    print("ready")
+elif enabled in (None, False):
+    print(f"pending: bootDiagnostics.enabled is {enabled!r}")
+else:
+    raise SystemExit(
+        f"VM bootDiagnostics.enabled has invalid value {enabled!r}"
+    )
+PY
+      )
+      then
+        echo "::error::Azure returned invalid managed boot diagnostics metadata;" \
+          "response saved to $vm_json" >&2
+        cat "$vm_json" >&2
+        return 1
+      fi
+      if [[ "$observation" == ready ]]; then
+        return
+      fi
+      if [[ "$observation" != pending:* ]]; then
+        echo "::error::Unexpected managed boot diagnostics observation:" \
+          "$observation; response saved to $vm_json" >&2
+        cat "$vm_json" >&2
+        return 1
+      fi
+    else
+      observation="Azure VM metadata query failed"
+    fi
+
+    now=$(boot_diagnostics_epoch_seconds)
+    if [[ "$now" -ge "$deadline" || "$attempt" -eq "$max_attempts" ]]; then
+      break
+    fi
+    sleep_seconds=$delay_seconds
+    if [[ "$sleep_seconds" -gt "$((deadline - now))" ]]; then
+      sleep_seconds=$((deadline - now))
+    fi
+    sleep "$sleep_seconds"
+  done
+
+  now=$(boot_diagnostics_epoch_seconds)
+  elapsed=$((now - started_at))
+  echo "::error::Timed out after ${elapsed}s and ${query_attempts} attempts waiting for" \
+    "managed boot diagnostics metadata (last observation: $observation);" \
+    "VM metadata saved to $vm_json" >&2
+  if [[ -s "$vm_show_stderr" ]]; then
+    echo "::error::Latest Azure VM metadata API diagnostics:" >&2
+    cat "$vm_show_stderr" >&2
+  fi
+  if [[ -s "$vm_json" ]]; then
+    echo "::error::Latest Azure VM metadata response:" >&2
+    cat "$vm_json" >&2
+  fi
+  return 1
 }
 
 wait_for_image_version_replication() {
@@ -915,12 +1034,27 @@ az vm create \
   --security-type Standard \
   --public-ip-sku Standard \
   --nsg-rule SSH \
-  --boot-diagnostics-storage "" \
   --output json >/dev/null
-az vm show \
+if ! az vm boot-diagnostics enable \
   --resource-group "$resource_group" \
   --name "$vm_name" \
-  --output json >"$vm_json"
+  --output json >"$boot_diagnostics_enable_json" \
+  2>"$boot_diagnostics_enable_stderr"
+then
+  echo "::error::Could not enable Azure managed boot diagnostics;" \
+    "CLI response saved to $boot_diagnostics_enable_json and" \
+    "$boot_diagnostics_enable_stderr" >&2
+  if [[ -s "$boot_diagnostics_enable_stderr" ]]; then
+    cat "$boot_diagnostics_enable_stderr" >&2
+  fi
+  if [[ -s "$boot_diagnostics_enable_json" ]]; then
+    cat "$boot_diagnostics_enable_json" >&2
+  fi
+  exit 1
+fi
+wait_for_managed_boot_diagnostics \
+  "${AZURE_BOOT_DIAGNOSTICS_TIMEOUT_SECONDS:-180}" \
+  "${AZURE_BOOT_DIAGNOSTICS_POLL_SECONDS:-5}"
 expected_vm_id="/subscriptions/$subscription_id/resourceGroups/$resource_group"
 expected_vm_id+="/providers/Microsoft.Compute/virtualMachines/$vm_name"
 vm_id=$(
