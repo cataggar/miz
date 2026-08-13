@@ -105,6 +105,21 @@ const symlink_header_size: usize = 56;
 const symlink_owner_offset: usize = 32;
 const bmbt_long_header_size: usize = 72;
 const bmbt_rec_size: usize = 16;
+/// `struct xfs_bmdr_block` (the inode-literal-area btree root header):
+/// bb_level(be16,0) + bb_numrecs(be16,2) = 4 bytes.
+const bmdr_header_size: usize = 4;
+/// Both the inode-rooted root (`xfs_bmdr_block`) and the on-disk long-form
+/// btree blocks (`xfs_btree_block`) store their key and pointer arrays as
+/// fixed-capacity vectors sized for `maxrecs` -- the maximum number of
+/// records that could ever fit in the available space -- not for the
+/// `numrecs` actually populated. The pointer array therefore always starts
+/// at `maxrecs * key_size` past the key array's start, never at
+/// `numrecs * key_size`: getting this wrong reads pointers out of what is
+/// actually still key bytes (or beyond the block) for any node that isn't
+/// completely full. See `xfs_bmdr_ptr_addr`/`xfs_bmbt_ptr_addr` in
+/// `xfs_bmap_btree.h`.
+const bmbt_key_size: usize = 8;
+const bmbt_ptr_size: usize = 8;
 
 /// XFS_SB_VERSION_NUMBITS: the low 4 bits of `sb_versionnum` are the version.
 const sb_version_num_mask: u16 = 0x000f;
@@ -249,13 +264,22 @@ pub const Superblock = struct {
     features_log_incompat: u32,
 
     /// Directory data-block size in bytes: `1 << (block_log + dir_block_log)`.
+    /// `parseSuperblock` already rejects any combination whose sum would not
+    /// fit safely in a `u32` shift amount, but the addition is redone here in
+    /// a widened type (rather than trusting the original narrow `u8` fields
+    /// not to overflow) so this method can never panic on its own.
     fn dirBlockSize(self: Superblock) u32 {
-        return @as(u32, 1) << @intCast(self.block_log + self.dir_block_log);
+        const shift: u32 = @as(u32, self.block_log) + @as(u32, self.dir_block_log);
+        return @as(u32, 1) << @intCast(shift);
     }
 
     /// Total AG-number+offset bits used inside an inode number.
+    /// `parseSuperblock` already rejects any combination that would not fit
+    /// in 63 bits, but see `dirBlockSize`'s comment above for why the sum is
+    /// still computed in a widened type here rather than as `u8 + u8`.
     fn aginoBits(self: Superblock) u6 {
-        return @intCast(self.ag_block_log + self.inode_per_block_log);
+        const bits: u32 = @as(u32, self.ag_block_log) + @as(u32, self.inode_per_block_log);
+        return @intCast(bits);
     }
 
     /// Blocks actually present in allocation group `agno`, accounting for the
@@ -307,6 +331,7 @@ fn parseSuperblock(buf: *const [superblock_size]u8) OpenError!Superblock {
     const block_log = buf[120];
     const ag_block_log = buf[124];
     const inode_per_block_log = buf[123];
+    const dir_block_log = buf[192];
 
     if (block_size == 0 or !std.math.isPowerOfTwo(block_size) or
         block_log >= 32 or (@as(u32, 1) << @intCast(block_log)) != block_size)
@@ -325,9 +350,19 @@ fn parseSuperblock(buf: *const [superblock_size]u8) OpenError!Superblock {
     if (data_blocks <= expected_total) return error.InvalidSuperblockGeometry;
     const last_ag_blocks = data_blocks - expected_total;
     if (last_ag_blocks > ag_blocks) return error.InvalidSuperblockGeometry;
-    if (@as(u6, @intCast(ag_block_log)) + inode_per_block_log > 63) {
-        return error.InvalidSuperblockGeometry;
-    }
+    // Both `ag_block_log`/`inode_per_block_log` (the agino bit width used by
+    // `aginoBits`) and `block_log`/`dir_block_log` (the directory
+    // block-size shift used by `dirBlockSize`) are raw on-disk `u8` fields
+    // with no independent range limit; an adversarial or corrupt superblock
+    // could set either byte anywhere up to 255. Widen both sums to `u32`
+    // before comparing so a large `inopblog`/`dirblklog` value is rejected
+    // by name here rather than overflowing a narrow (`u6`/`u8`) addition or
+    // failing an `@intCast` panic the first time some other codepath shifts
+    // by it.
+    const agino_bits: u32 = @as(u32, ag_block_log) + @as(u32, inode_per_block_log);
+    if (agino_bits > 63) return error.InvalidSuperblockGeometry;
+    const dir_block_shift: u32 = @as(u32, block_log) + @as(u32, dir_block_log);
+    if (dir_block_shift > 31) return error.InvalidSuperblockGeometry;
 
     var uuid: [16]u8 = undefined;
     @memcpy(&uuid, buf[32..48]);
@@ -360,7 +395,7 @@ fn parseSuperblock(buf: *const [superblock_size]u8) OpenError!Superblock {
         .inode_per_block_log = inode_per_block_log,
         .ag_block_log = ag_block_log,
         .quota_flags = std.mem.readInt(u16, buf[176..178], .big),
-        .dir_block_log = buf[192],
+        .dir_block_log = dir_block_log,
         .features_compat = features_compat,
         .features_ro_compat = features_ro_compat,
         .features_incompat = features_incompat,
@@ -633,6 +668,7 @@ pub const InodeError = error{
     UnsupportedAttrForkFormat,
     RealtimeFileUnsupported,
     InvalidInodeLayout,
+    InvalidForkOffset,
 };
 
 fn parseInode(sb: Superblock, ino: u64, raw: []const u8, allocator: std.mem.Allocator) (InodeError || std.mem.Allocator.Error)!ParsedInode {
@@ -679,6 +715,14 @@ fn parseInode(sb: Superblock, ino: u64, raw: []const u8, allocator: std.mem.Allo
     }
 
     const fork_off = raw[82];
+    // `di_forkoff` is stored in 8-byte units from the start of the literal
+    // area; a corrupt or adversarial value past the literal area's real
+    // length would otherwise make every later `dataForkBytes()`/
+    // `attrForkBytes()` slice operation panic instead of returning a named
+    // error, since Zig slice bounds are checked at the point of use, not
+    // when the (out-of-range) length is merely stored.
+    const literal_area_len = raw.len - dinode_v3_core_size;
+    if (@as(usize, fork_off) * 8 > literal_area_len) return error.InvalidForkOffset;
     const literal_area = try allocator.dupe(u8, raw[dinode_v3_core_size..]);
     errdefer allocator.free(literal_area);
 
@@ -778,20 +822,23 @@ fn readExtents(
             }
         },
         fmt_btree => {
-            if (data_fork_bytes.len < 4) return error.UnsupportedExtentLayout;
+            if (data_fork_bytes.len < bmdr_header_size) return error.UnsupportedExtentLayout;
             const level = std.mem.readInt(u16, data_fork_bytes[0..2], .big);
             const numrecs = std.mem.readInt(u16, data_fork_bytes[2..4], .big);
             if (level == 0 or level > max_extent_depth) return error.UnsupportedExtentDepth;
-            const ptrs = data_fork_bytes[4..];
-            // The root's key/ptr arrays live in the same literal area, split
-            // in half: `numrecs` keys (8 bytes each) followed by `numrecs`
-            // pointers (8 bytes each). Full-tree enumeration only needs the
-            // pointers.
-            if (ptrs.len < @as(usize, numrecs) * 16) return error.UnsupportedExtentLayout;
-            const ptr_area = ptrs[@as(usize, numrecs) * 8 ..][0 .. @as(usize, numrecs) * 8];
+            const body = data_fork_bytes[bmdr_header_size..];
+            // `xfs_bmdr_maxrecs(dblocklen, leaf=false)`: the root's key/ptr
+            // arrays are sized for however many (key,ptr) pairs fit in the
+            // whole available fork area, not for `numrecs`.
+            const maxrecs = body.len / (bmbt_key_size + bmbt_ptr_size);
+            if (@as(usize, numrecs) > maxrecs) return error.UnsupportedExtentLayout;
+            // The pointer array starts after the full `maxrecs`-sized key
+            // array (`xfs_bmdr_ptr_addr`), not after just the `numrecs`
+            // populated key slots.
+            const ptr_area = body[maxrecs * bmbt_key_size ..][0 .. maxrecs * bmbt_ptr_size];
             var index: usize = 0;
             while (index < numrecs) : (index += 1) {
-                const child = std.mem.readInt(u64, ptr_area[index * 8 ..][0..8], .big);
+                const child = std.mem.readInt(u64, ptr_area[index * bmbt_ptr_size ..][0..8], .big);
                 try walkBtreeNode(reader, io, allocator, ino, child, level - 1, &extents);
             }
         },
@@ -865,13 +912,15 @@ fn walkBtreeNode(
     }
 
     // Non-leaf long-form blocks size their key/ptr arrays for the maximum a
-    // full block could ever hold; only the first `numrecs` pointers (after
-    // the matching `numrecs` keys) are populated.
-    if (@as(usize, numrecs) * 16 > body.len) return error.UnsupportedExtentLayout;
-    const ptr_area = body[@as(usize, numrecs) * 8 ..][0 .. @as(usize, numrecs) * 8];
+    // full block could ever hold (`xfs_bmbt_maxrecs`, based on the whole
+    // block length); only the first `numrecs` pointers (after the full
+    // `maxrecs`-sized key array, per `xfs_bmbt_ptr_addr`) are populated.
+    const maxrecs = body.len / (bmbt_key_size + bmbt_ptr_size);
+    if (@as(usize, numrecs) > maxrecs) return error.UnsupportedExtentLayout;
+    const ptr_area = body[maxrecs * bmbt_key_size ..][0 .. maxrecs * bmbt_ptr_size];
     var index: usize = 0;
     while (index < numrecs) : (index += 1) {
-        const child = std.mem.readInt(u64, ptr_area[index * 8 ..][0..8], .big);
+        const child = std.mem.readInt(u64, ptr_area[index * bmbt_ptr_size ..][0..8], .big);
         try walkBtreeNode(reader, io, allocator, ino, child, level - 1, extents);
     }
 }
@@ -1954,6 +2003,45 @@ test "parseSuperblock accepts every known ro-compat bit together" {
     _ = try parseSuperblock(&buf);
 }
 
+test "parseSuperblock rejects an oversized inode_per_block_log without an arithmetic overflow" {
+    // A raw 0xff `sb_inopblog` byte, added to a valid `ag_block_log`,
+    // regression-tests that the agino-bit-width check widens both operands
+    // before summing: a narrow `u6`/`u8` addition would panic on overflow
+    // (31 + 255 doesn't fit in a `u8`) instead of returning this error.
+    const buf = buildTestSuperblock(.{ .inode_per_block_log = 0xff });
+    try testing.expectError(error.InvalidSuperblockGeometry, parseSuperblock(&buf));
+}
+
+test "parseSuperblock rejects an oversized dir_block_log without an arithmetic overflow" {
+    // Same concern as above but for the directory block-size shift
+    // (`block_log + dir_block_log`), which `dirBlockSize` later uses as a
+    // `u32` shift amount.
+    const buf = buildTestSuperblock(.{ .dir_block_log = 0xff });
+    try testing.expectError(error.InvalidSuperblockGeometry, parseSuperblock(&buf));
+}
+
+test "parseSuperblock rejects an agino bit width one past the 63-bit boundary" {
+    const buf = buildTestSuperblock(.{ .ag_block_log = 5, .inode_per_block_log = 59 });
+    try testing.expectError(error.InvalidSuperblockGeometry, parseSuperblock(&buf));
+}
+
+test "parseSuperblock accepts an agino bit width exactly at the 63-bit boundary" {
+    const buf = buildTestSuperblock(.{ .ag_block_log = 5, .inode_per_block_log = 58 });
+    const sb = try parseSuperblock(&buf);
+    try testing.expectEqual(@as(u6, 63), sb.aginoBits());
+}
+
+test "parseSuperblock rejects a directory block shift one past the 31-bit boundary" {
+    const buf = buildTestSuperblock(.{ .block_log = 9, .dir_block_log = 23 });
+    try testing.expectError(error.InvalidSuperblockGeometry, parseSuperblock(&buf));
+}
+
+test "parseSuperblock accepts a directory block shift exactly at the 31-bit boundary" {
+    const buf = buildTestSuperblock(.{ .block_log = 9, .dir_block_log = 22 });
+    const sb = try parseSuperblock(&buf);
+    try testing.expectEqual(@as(u32, 1) << 31, sb.dirBlockSize());
+}
+
 // ---------------------------------------------------------------------------
 // Inode fixtures
 // ---------------------------------------------------------------------------
@@ -2056,6 +2144,50 @@ test "parseInode rejects a corrupt checksum" {
     }, "");
     defer testing.allocator.free(raw);
     try testing.expectError(error.InodeChecksumMismatch, parseInode(sb, 42, raw, testing.allocator));
+}
+
+test "parseInode rejects a fork offset past the end of the literal area without panicking" {
+    const sb = try testSuperblock();
+    // A malformed/adversarial `di_forkoff` describing a fork boundary
+    // beyond the literal area must be rejected by name here, before any
+    // later `dataForkBytes()`/`attrForkBytes()` call can slice past the
+    // buffer's real length and panic.
+    const raw = try buildTestInode(testing.allocator, sb.inode_size, .{
+        .ino = 42,
+        .mode = s_ifreg | 0o644,
+        .forkoff = 255,
+    }, "");
+    defer testing.allocator.free(raw);
+    try testing.expectError(error.InvalidForkOffset, parseInode(sb, 42, raw, testing.allocator));
+}
+
+test "parseInode rejects a fork offset one 8-byte unit past the literal area boundary" {
+    const sb = try testSuperblock();
+    const literal_area_len = @as(usize, sb.inode_size) - dinode_v3_core_size;
+    const one_past: u8 = @intCast(literal_area_len / 8 + 1);
+    const raw = try buildTestInode(testing.allocator, sb.inode_size, .{
+        .ino = 42,
+        .mode = s_ifreg | 0o644,
+        .forkoff = one_past,
+    }, "");
+    defer testing.allocator.free(raw);
+    try testing.expectError(error.InvalidForkOffset, parseInode(sb, 42, raw, testing.allocator));
+}
+
+test "parseInode accepts a fork offset that exactly fills the literal area" {
+    const sb = try testSuperblock();
+    const literal_area_len = @as(usize, sb.inode_size) - dinode_v3_core_size;
+    const exact: u8 = @intCast(literal_area_len / 8);
+    const raw = try buildTestInode(testing.allocator, sb.inode_size, .{
+        .ino = 42,
+        .mode = s_ifreg | 0o644,
+        .forkoff = exact,
+    }, "");
+    defer testing.allocator.free(raw);
+    var inode = try parseInode(sb, 42, raw, testing.allocator);
+    defer inode.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, literal_area_len), inode.dataForkBytes().len);
+    try testing.expectEqual(@as(usize, 0), inode.attrForkBytes().len);
 }
 
 // ---------------------------------------------------------------------------
@@ -2583,11 +2715,18 @@ fn buildIntegrationVolume(allocator: std.mem.Allocator) ![]u8 {
     putBlock(volume, integration_block_size, 43, in_sub_txt_content);
 
     // --- big.bin (ino 50, AG1): FMT_BTREE, 2 extents via a leaf block --
-    var big_bin_root: [20]u8 = undefined;
+    // The inode-rooted bmdr block sizes its key/ptr arrays for `maxrecs`
+    // (however many (key,ptr) pairs fit in the whole literal area), not for
+    // `numrecs` -- deliberately using numrecs=1 << maxrecs here (a
+    // non-full root) regression-tests that the pointer is read from the
+    // maxrecs-based offset (`xfs_bmdr_ptr_addr`), not from `numrecs * 8`.
+    const big_bin_literal_area_len = integration_block_size - dinode_v3_core_size;
+    const big_bin_root_maxrecs = (big_bin_literal_area_len - bmdr_header_size) / (bmbt_key_size + bmbt_ptr_size);
+    const big_bin_root_ptr_offset = bmdr_header_size + big_bin_root_maxrecs * bmbt_key_size;
+    var big_bin_root: [big_bin_root_ptr_offset + 8]u8 = [_]u8{0} ** (big_bin_root_ptr_offset + 8);
     beU16(&big_bin_root, 0, 1); // level: 1 above the leaf
     beU16(&big_bin_root, 2, 1); // numrecs
-    beU64(&big_bin_root, 4, 0); // key (unused by this reader)
-    beU64(&big_bin_root, 12, 53); // ptr: child fsblock
+    beU64(&big_bin_root, big_bin_root_ptr_offset, 53); // ptr: child fsblock
     const big_bin_inode = try buildTestInode(allocator, integration_block_size, .{
         .ino = 50,
         .mode = s_ifreg | 0o644,
@@ -2894,4 +3033,130 @@ test "scan rejects a directory cycle" {
     try testing.expectError(error.DirectoryCycle, scanReadable(&reader, io, allocator, .{
         .available_length = integration_data_blocks * integration_block_size,
     }));
+}
+
+test "readExtents walks a non-full, three-level BTREE chain using maxrecs-based pointer offsets" {
+    // Regression for a bug where both the inode-rooted bmdr root and the
+    // on-disk long-form btree "node" level addressed their pointer arrays
+    // right after `numrecs` keys instead of after the full `maxrecs`-sized
+    // key array (`xfs_bmdr_ptr_addr`/`xfs_bmbt_ptr_addr`). Every level here
+    // is deliberately non-full (numrecs == 1, well under each level's real
+    // maxrecs) so a numrecs-based offset would read the pointer from bytes
+    // that are still (zeroed) key/padding space, not the byte-4 image below.
+    const allocator = testing.allocator;
+    const volume = try buildVolume(allocator, integration_data_blocks, integration_block_size);
+    defer allocator.free(volume);
+
+    const sb = buildTestSuperblock(.{
+        .block_size = integration_block_size,
+        .sector_size = integration_block_size,
+        .inode_size = integration_block_size,
+        .ag_blocks = integration_ag_blocks,
+        .ag_count = integration_ag_count,
+        .data_blocks = integration_data_blocks,
+        .root_ino = 2,
+    });
+    putBlock(volume, integration_block_size, 0, &sb);
+
+    var root_dir = ShortformDirBuilder.init(2);
+    root_dir.append("big.bin", 3, dir_ft_reg_file);
+    const root_inode = try buildTestInode(allocator, integration_block_size, .{
+        .ino = 2,
+        .mode = s_ifdir | 0o755,
+        .nlink = 2,
+        .data_format = fmt_local,
+    }, root_dir.finish());
+    defer allocator.free(root_inode);
+    putBlock(volume, integration_block_size, 2, root_inode);
+
+    // Level 2: the inode-rooted bmdr root. Its key/ptr arrays are sized for
+    // `maxrecs` (however many (key,ptr) pairs fit in the whole literal
+    // area), not `numrecs` -- so the single real pointer must sit at the
+    // maxrecs-based offset, with only zeroed key/padding bytes before it.
+    const literal_area_len = integration_block_size - dinode_v3_core_size;
+    const root_maxrecs = (literal_area_len - bmdr_header_size) / (bmbt_key_size + bmbt_ptr_size);
+    const root_ptr_offset = bmdr_header_size + root_maxrecs * bmbt_key_size;
+    var root_literal: [root_ptr_offset + 8]u8 = [_]u8{0} ** (root_ptr_offset + 8);
+    beU16(&root_literal, 0, 2); // level: 2 (root -> internal node -> leaf)
+    beU16(&root_literal, 2, 1); // numrecs: 1, far below root_maxrecs
+    beU64(&root_literal, root_ptr_offset, 10); // ptr: internal node at fsblock 10
+    const big_bin_inode = try buildTestInode(allocator, integration_block_size, .{
+        .ino = 3,
+        .mode = s_ifreg | 0o644,
+        .size = 2 * integration_block_size,
+        .data_format = fmt_btree,
+        .nextents = 2,
+    }, &root_literal);
+    defer allocator.free(big_bin_inode);
+    putBlock(volume, integration_block_size, 3, big_bin_inode);
+
+    // Level 1: an on-disk long-form "node" block (not the root). Its key/ptr
+    // arrays are likewise sized for the block's own maxrecs, computed from
+    // the whole block length, not from this block's numrecs=1.
+    const node_body_len = integration_block_size - bmbt_long_header_size;
+    const node_maxrecs = node_body_len / (bmbt_key_size + bmbt_ptr_size);
+    const node_ptr_offset = bmbt_long_header_size + node_maxrecs * bmbt_key_size;
+    var node: [integration_block_size]u8 = [_]u8{0} ** integration_block_size;
+    beU32(&node, 0, bmap_btree_magic);
+    beU16(&node, 4, 1); // level 1 (internal node, one above the leaf)
+    beU16(&node, 6, 1); // numrecs: 1, far below node_maxrecs
+    beU64(&node, bmbt_long_owner_offset, 3); // bb_owner == ino
+    beU64(&node, node_ptr_offset, 11); // ptr: leaf block at fsblock 11
+    writeCrc(&node, bmbt_long_crc_offset);
+    putBlock(volume, integration_block_size, 10, &node);
+
+    // Level 0: the leaf, holding the two real extent records.
+    var leaf: [integration_block_size]u8 = [_]u8{0} ** integration_block_size;
+    beU32(&leaf, 0, bmap_btree_magic);
+    beU16(&leaf, 4, 0); // level 0 (leaf)
+    beU16(&leaf, 6, 2); // numrecs
+    beU64(&leaf, bmbt_long_owner_offset, 3); // bb_owner == ino
+    encodeBmbtRec(leaf[bmbt_long_header_size..][0..bmbt_rec_size], 0, 20, 1, false);
+    encodeBmbtRec(leaf[bmbt_long_header_size + bmbt_rec_size ..][0..bmbt_rec_size], 1, 21, 1, false);
+    writeCrc(&leaf, bmbt_long_crc_offset);
+    putBlock(volume, integration_block_size, 11, &leaf);
+
+    const block0 = [_]u8{'A'} ** integration_block_size;
+    const block1 = [_]u8{'B'} ** integration_block_size;
+    putBlock(volume, integration_block_size, 20, &block0);
+    putBlock(volume, integration_block_size, 21, &block1);
+
+    const path = "test-xfs-btree-non-full-multilevel.img";
+    try writeFixture(path, volume);
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    const io = std.testing.io;
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+
+    var tree = try scanReadable(&reader, io, allocator, .{
+        .available_length = integration_data_blocks * integration_block_size,
+    });
+    defer tree.deinit();
+
+    const big_bin = findEntry(&tree, "big.bin").?;
+    const big_bin_bytes = try readEntryAlloc(allocator, big_bin);
+    defer allocator.free(big_bin_bytes);
+    try testing.expectEqualSlices(u8, &block0, big_bin_bytes[0..integration_block_size]);
+    try testing.expectEqualSlices(u8, &block1, big_bin_bytes[integration_block_size..]);
+}
+
+test "readExtents rejects a BTREE root whose numrecs exceeds its maxrecs capacity" {
+    const allocator = testing.allocator;
+    const sb = try testSuperblock();
+    var reader: Reader = .{ .allocator = allocator, .file = undefined, .superblock = sb };
+    const literal_area_len = integration_block_size - dinode_v3_core_size;
+    const root_maxrecs = (literal_area_len - bmdr_header_size) / (bmbt_key_size + bmbt_ptr_size);
+    var root_literal: [literal_area_len]u8 = [_]u8{0} ** literal_area_len;
+    beU16(&root_literal, 0, 1); // level
+    beU16(&root_literal, 2, @intCast(root_maxrecs + 1)); // numrecs > maxrecs: must be rejected
+    try testing.expectError(error.UnsupportedExtentLayout, readExtents(
+        &reader,
+        std.testing.io,
+        allocator,
+        3,
+        fmt_btree,
+        1,
+        &root_literal,
+    ));
 }
