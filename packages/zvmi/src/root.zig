@@ -47,6 +47,7 @@ pub const lvm = @import("lvm.zig");
 pub const azure = @import("azure.zig");
 pub const deprovision = @import("deprovision.zig");
 pub const layout = @import("layout.zig");
+pub const filesystem_writer = @import("filesystem_writer.zig");
 pub const oci = @import("oci.zig");
 pub const cosi = @import("cosi.zig");
 pub const build_image = @import("build_image.zig");

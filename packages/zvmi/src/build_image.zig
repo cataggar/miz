@@ -6,6 +6,7 @@ const bootconfig = @import("bootconfig.zig");
 const cosi = @import("cosi.zig");
 const ext4 = @import("ext4.zig");
 const fat32 = @import("fat32.zig");
+const filesystem_writer = @import("filesystem_writer.zig");
 const Format = @import("formats.zig").Format;
 const gpt = @import("gpt.zig");
 const guid = @import("guid.zig");
@@ -544,10 +545,14 @@ pub fn build(
 
     if (findPartitionByRole(planned_partitions, .esp)) |esp_partition| {
         logStep(options, "format ESP as FAT32");
-        try fat32.format(&raw_img, io, .{
-            .partition_offset = esp_partition.planned.offset_bytes,
-            .partition_len = esp_partition.planned.length_bytes,
-            .volume_label = "ZVMI ESP   ".*,
+        _ = try filesystem_writer.formatAndPopulate(io, allocator, &raw_img, null, esp_partition.planned.filesystem, .{
+            .fat32 = .{
+                .format = .{
+                    .partition_offset = esp_partition.planned.offset_bytes,
+                    .partition_len = esp_partition.planned.length_bytes,
+                    .volume_label = "ZVMI ESP   ".*,
+                },
+            },
         });
     }
 
@@ -618,14 +623,16 @@ pub fn build(
         };
         break :blk &root_xattr_buffer;
     } else &.{};
-    _ = try ext4.populate(io, raw_img.file, allocator, try root_tree.ext4View(), .{
-        .offset = root_partition.planned.offset_bytes,
-        .length = rootfs_length,
-        .label = options.ext4_label,
-        .root_xattrs = root_xattrs,
-        .uuid = root_filesystem_uuid,
-        .timestamp = if (options.deterministic) |deterministic| deterministic.filesystem_timestamp else 0,
-        .journal = options.ext4_journal,
+    _ = try filesystem_writer.formatAndPopulate(io, allocator, &raw_img, &root_tree, root_partition.planned.filesystem, .{
+        .ext4 = .{
+            .offset = root_partition.planned.offset_bytes,
+            .length = rootfs_length,
+            .label = options.ext4_label,
+            .root_xattrs = root_xattrs,
+            .uuid = root_filesystem_uuid,
+            .timestamp = if (options.deterministic) |deterministic| deterministic.filesystem_timestamp else 0,
+            .journal = options.ext4_journal,
+        },
     });
 
     if (verity_layout) |layout_for_verity| {
