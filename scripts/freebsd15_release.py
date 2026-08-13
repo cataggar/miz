@@ -898,22 +898,8 @@ def release_notes(
             "separation.",
             "- Images include Azure Agent, generic and Hyper-V DHCP "
             "configuration, and FreeBSD's Azure serial-console settings.",
-            "",
-            "## Assets",
-            "",
-            "| Architecture | Root | Flavor | Asset | Virtual size | "
-            "Allocated size | Compressed/download size | SHA-256 |",
-            "| --- | --- | --- | --- | ---: | ---: | ---: | --- |",
         ]
     )
-    for candidate in candidates:
-        lines.append(
-            "| {architecture} | {filesystem} | {flavor} | `{asset_name}` "
-            "| {virtual_size} | {allocated_size} | {compressed_size} "
-            "| `{asset_sha256}` |".format(
-                **candidate
-            )
-        )
     if core_rows is not None:
         lines.extend(
             [
