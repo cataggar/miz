@@ -110,6 +110,42 @@ def validate_managed_disk(argv):
     print(document["id"])
 
 
+def validate_gallery(argv):
+    (
+        path,
+        expected_id,
+        expected_name,
+        expected_group,
+        expected_location,
+    ) = argv
+    document = load_document(path)
+
+    if not same(document.get("id"), expected_id):
+        raise SystemExit("Azure returned a different gallery identity")
+    if document.get("name") != expected_name:
+        raise SystemExit("Azure returned a different gallery name")
+    resource_group = document.get("resourceGroup")
+    if resource_group not in (None, "") and not same(resource_group, expected_group):
+        raise SystemExit("gallery is outside the owned temporary resource group")
+    if not same(document.get("location"), expected_location):
+        raise SystemExit("gallery location mismatch")
+    if not same(document.get("type"), "Microsoft.Compute/galleries"):
+        raise SystemExit("Azure returned a non-gallery resource")
+    if document.get("provisioningState") != "Succeeded":
+        raise SystemExit("temporary gallery provisioning did not succeed")
+
+    present, sharing = value_at(document, "sharingProfile")
+    if present and sharing is not None:
+        if not isinstance(sharing, dict):
+            raise SystemExit("temporary gallery sharing metadata is invalid")
+        permissions = sharing.get("permissions")
+        if permissions is not None and not same(permissions, "Private"):
+            raise SystemExit("temporary gallery is not private")
+        for field in ("groups", "communityGalleryInfo"):
+            if sharing.get(field) not in (None, "", [], {}):
+                raise SystemExit("temporary gallery exposes shared metadata")
+
+
 def validate_gallery_image_version(argv):
     (
         path,
@@ -330,6 +366,7 @@ def validate_vm(argv):
 
 COMMANDS = {
     "managed-disk": (validate_managed_disk, 7),
+    "gallery": (validate_gallery, 5),
     "gallery-image-version": (validate_gallery_image_version, 8),
     "vm": (validate_vm, 10),
 }

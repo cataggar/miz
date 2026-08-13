@@ -773,7 +773,6 @@ az sig create \
   --resource-group "$resource_group" \
   --gallery-name "$gallery_name" \
   --location "$AZURE_LOCATION" \
-  --permissions Private \
   --output json >/dev/null
 az sig show \
   --resource-group "$resource_group" \
@@ -781,42 +780,9 @@ az sig show \
   --output json >"$gallery_json"
 expected_gallery_id="/subscriptions/$subscription_id/resourceGroups/$resource_group"
 expected_gallery_id+="/providers/Microsoft.Compute/galleries/$gallery_name"
-python3 - "$gallery_json" "$expected_gallery_id" "$gallery_name" \
-  "$resource_group" "$AZURE_LOCATION" <<'PY'
-import json
-import sys
-
-(
-    path,
-    expected_id,
-    expected_name,
-    expected_group,
-    expected_location,
-) = sys.argv[1:]
-document = json.load(open(path, encoding="utf-8"))
-
-
-def same(left, right):
-    return isinstance(left, str) and left.casefold() == right.casefold()
-
-
-if not same(document.get("id"), expected_id):
-    raise SystemExit("Azure returned a different gallery identity")
-if document.get("name") != expected_name:
-    raise SystemExit("Azure returned a different gallery name")
-resource_group = document.get("resourceGroup")
-if resource_group not in (None, "") and not same(resource_group, expected_group):
-    raise SystemExit("gallery is outside the owned temporary resource group")
-if not same(document.get("location"), expected_location):
-    raise SystemExit("gallery location mismatch")
-if not same(document.get("type"), "Microsoft.Compute/galleries"):
-    raise SystemExit("Azure returned a non-gallery resource")
-if document.get("provisioningState") != "Succeeded":
-    raise SystemExit("temporary gallery provisioning did not succeed")
-sharing = document.get("sharingProfile")
-if not isinstance(sharing, dict) or sharing.get("permissions") != "Private":
-    raise SystemExit("temporary gallery is not private")
-PY
+python3 scripts/freebsd15_azure_metadata.py gallery \
+  "$gallery_json" "$expected_gallery_id" "$gallery_name" \
+  "$resource_group" "$AZURE_LOCATION"
 
 az sig image-definition create \
   --resource-group "$resource_group" \

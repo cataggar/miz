@@ -337,6 +337,48 @@ def _run_size_validation_case(command, fixture_path, case_name):
         shutil.rmtree(root, ignore_errors=True)
 
 
+def _run_gallery_validation_case(sharing_marker, sharing_value=None):
+    root = (
+        Path(SCRIPT).parents[1]
+        / ".scratch"
+        / f"freebsd15-gallery-{os.getpid()}-{sharing_marker}"
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    gallery_id = (
+        "/subscriptions/test/resourceGroups/rg-test/providers/"
+        "Microsoft.Compute/galleries/gallery-test"
+    )
+    document = {
+        "id": gallery_id,
+        "name": "gallery-test",
+        "resourceGroup": "rg-test",
+        "location": "swedencentral",
+        "type": "Microsoft.Compute/galleries",
+        "provisioningState": "Succeeded",
+    }
+    if sharing_marker != "absent":
+        document["sharingProfile"] = sharing_value
+    document_path = root / "metadata.json"
+    document_path.write_text(json.dumps(document), encoding="utf-8")
+    try:
+        return subprocess.run(
+            [
+                sys.executable,
+                METADATA_VALIDATOR,
+                "gallery",
+                str(document_path),
+                gallery_id,
+                "gallery-test",
+                "rg-test",
+                "swedencentral",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def _run_image_replication_case(mode, timeout_seconds=5):
     root = (
         Path(SCRIPT).parents[1]
@@ -590,6 +632,38 @@ def test_gallery_target_region_does_not_strip_whitespace():
     assert "gallery image-version target location mismatch" in result.stderr
 
 
+def test_default_private_gallery_allows_missing_sharing_metadata():
+    for marker, value in (
+        ("absent", None),
+        ("null", None),
+        ("empty", {}),
+        ("private", {"permissions": "Private"}),
+    ):
+        result = _run_gallery_validation_case(marker, value)
+        assert result.returncode == 0, (marker, result.stderr)
+
+
+def test_gallery_sharing_metadata_fails_closed_when_shared():
+    cases = {
+        "invalid-profile": "Private",
+        "groups-permission": {"permissions": "Groups"},
+        "community-permission": {"permissions": "Community"},
+        "unknown-permission": {"permissions": "Shared"},
+        "groups-metadata": {
+            "permissions": "Private",
+            "groups": [{"type": "Subscriptions", "ids": ["test"]}],
+        },
+        "community-metadata": {
+            "permissions": "Private",
+            "communityGalleryInfo": {"published": True},
+        },
+    }
+    for marker, value in cases.items():
+        result = _run_gallery_validation_case(marker, value)
+        assert result.returncode != 0, marker
+        assert "temporary gallery" in result.stderr
+
+
 def test_managed_disk_size_metadata_shapes():
     for case_name in ("bytes-only", "gib-only", "both-consistent"):
         result = _run_size_validation_case(
@@ -808,7 +882,7 @@ def test_gallery_definition_and_version_precede_provisioned_vm():
     assert "image_publisher=zvmi" in content
     assert "image_offer=freebsd15" in content
     assert 'image_sku="${short_arch}-${FILESYSTEM}-${FLAVOR}"' in content
-    assert "--permissions Private" in content[gallery_create:definition_create]
+    assert "--permissions" not in content[gallery_create:definition_create]
     assert '--publisher "$image_publisher"' in definition_block
     assert '--offer "$image_offer"' in definition_block
     assert '--sku "$image_sku"' in definition_block
@@ -881,6 +955,7 @@ def test_disk_gallery_version_and_vm_source_identities_fail_closed():
     assert 'test "${vm_id,,}" = "${expected_vm_id,,}"' in content
     assert "VM architecture mismatch" in validation
     assert "freebsd15_azure_metadata.py managed-disk" in content
+    assert "freebsd15_azure_metadata.py gallery \\" in content
     assert "freebsd15_azure_metadata.py gallery-image-version" in content
     assert "freebsd15_azure_metadata.py vm" in content
     assert content.count(
