@@ -44,9 +44,37 @@ pub const PartitionRole = enum {
     }
 };
 
+/// Which native writer formats a partition's contents once it is written.
+///
+/// This is deliberately independent of `PartitionRole`: a role picks a GPT
+/// partition *type* GUID (what the partition table says the partition is
+/// for), while `FilesystemKind` picks what bytes a writer actually puts
+/// inside it. The two correlate at most call sites today -- an ESP is
+/// FAT32, a Linux root is ext4 -- but that correlation lives at the call
+/// site, not in either enum, because neither a role nor a type GUID implies
+/// a filesystem by itself. A vendor-specific root GUID and a `linux_root_*`
+/// GUID could both hold ext4; an ESP's GUID is fixed by the UEFI spec yet
+/// says nothing about FAT32 versus FAT16.
+///
+/// Deliberately covers only what zvmi can actually write today. XFS has a
+/// bounded read-only reader (`xfs.zig`) and ISO9660/SquashFS are read-only
+/// by design; none of them belong in a "how do I format this partition"
+/// enum until a writer exists for them. Adding a variant here for a
+/// filesystem zvmi cannot write would claim a capability that does not
+/// exist (see issue #327).
+pub const FilesystemKind = enum {
+    ext4,
+    fat32,
+};
+
 pub const PartitionRequest = struct {
     name: []const u8,
     role: PartitionRole,
+    /// Stated explicitly by every caller rather than derived from `role`:
+    /// a role and its filesystem are orthogonal choices, so defaulting one
+    /// from the other would let a call site get a filesystem it never
+    /// actually asked for.
+    filesystem: FilesystemKind,
     size: union(enum) {
         fixed: u64,
         percent: f64,
@@ -59,6 +87,7 @@ pub const PartitionRequest = struct {
 pub const PlannedPartition = struct {
     name: []const u8,
     role: PartitionRole,
+    filesystem: FilesystemKind,
     type_guid: guid.Guid,
     offset_bytes: u64,
     length_bytes: u64,
@@ -173,6 +202,7 @@ pub fn planLayout(
         planned[i] = .{
             .name = request.name,
             .role = request.role,
+            .filesystem = request.filesystem,
             .type_guid = request.type_guid orelse request.role.defaultTypeGuid(),
             .offset_bytes = cursor,
             .length_bytes = length,
@@ -185,10 +215,10 @@ pub fn planLayout(
 
 test "planLayout mixes fixed and percentage requests deterministically" {
     const requests = [_]PartitionRequest{
-        .{ .name = "ESP", .role = .esp, .size = .{ .fixed = 64 * azure.one_mib } },
-        .{ .name = "boot", .role = .boot, .size = .{ .fixed = 32 * azure.one_mib } },
-        .{ .name = "root", .role = .root_x86_64, .size = .{ .percent = 75.0 } },
-        .{ .name = "usr", .role = .usr_x86_64, .size = .{ .percent = 25.0 }, .type_guid = guid.linux_filesystem_data },
+        .{ .name = "ESP", .role = .esp, .filesystem = .fat32, .size = .{ .fixed = 64 * azure.one_mib } },
+        .{ .name = "boot", .role = .boot, .filesystem = .ext4, .size = .{ .fixed = 32 * azure.one_mib } },
+        .{ .name = "root", .role = .root_x86_64, .filesystem = .ext4, .size = .{ .percent = 75.0 } },
+        .{ .name = "usr", .role = .usr_x86_64, .filesystem = .ext4, .size = .{ .percent = 25.0 }, .type_guid = guid.linux_filesystem_data },
     };
 
     const planned = try planLayout(std.testing.allocator, 512 * azure.one_mib, &requests, null);
@@ -197,19 +227,25 @@ test "planLayout mixes fixed and percentage requests deterministically" {
     try std.testing.expectEqual(@as(usize, requests.len), planned.len);
     try std.testing.expectEqual(@as(u64, azure.one_mib), planned[0].offset_bytes);
     try std.testing.expectEqual(@as(u64, 64 * azure.one_mib), planned[0].length_bytes);
+    try std.testing.expectEqual(FilesystemKind.fat32, planned[0].filesystem);
     try std.testing.expectEqual(@as(u64, 65 * azure.one_mib), planned[1].offset_bytes);
     try std.testing.expectEqualSlices(u8, &guid.linux_xbootldr, &planned[1].type_guid);
+    try std.testing.expectEqual(FilesystemKind.ext4, planned[1].filesystem);
     try std.testing.expectEqual(@as(u64, 97 * azure.one_mib), planned[2].offset_bytes);
     try std.testing.expectEqual(@as(u64, 310 * azure.one_mib), planned[2].length_bytes);
     try std.testing.expectEqual(@as(u64, 407 * azure.one_mib), planned[3].offset_bytes);
     try std.testing.expectEqual(@as(u64, 104 * azure.one_mib), planned[3].length_bytes);
     try std.testing.expectEqualSlices(u8, &guid.linux_filesystem_data, &planned[3].type_guid);
+    // The `usr` request overrides its type GUID away from the role default
+    // yet still asks for ext4: role and filesystem are set independently,
+    // and neither is inferred from the other.
+    try std.testing.expectEqual(FilesystemKind.ext4, planned[3].filesystem);
 }
 
 test "planLayout rounds offsets and lengths to the requested alignment" {
     const requests = [_]PartitionRequest{
-        .{ .name = "boot", .role = .boot, .size = .{ .fixed = azure.one_mib } },
-        .{ .name = "root", .role = .root_aarch64, .size = .{ .fixed = 5 * azure.one_mib } },
+        .{ .name = "boot", .role = .boot, .filesystem = .ext4, .size = .{ .fixed = azure.one_mib } },
+        .{ .name = "root", .role = .root_aarch64, .filesystem = .ext4, .size = .{ .fixed = 5 * azure.one_mib } },
     };
 
     const four_mib = 4 * azure.one_mib;
@@ -224,9 +260,9 @@ test "planLayout rounds offsets and lengths to the requested alignment" {
 
 test "planLayout rejects over-allocation" {
     const requests = [_]PartitionRequest{
-        .{ .name = "ESP", .role = .esp, .size = .{ .fixed = 32 * azure.one_mib } },
-        .{ .name = "root", .role = .root_x86_64, .size = .{ .percent = 80.0 } },
-        .{ .name = "usr", .role = .usr_x86_64, .size = .{ .percent = 30.0 } },
+        .{ .name = "ESP", .role = .esp, .filesystem = .fat32, .size = .{ .fixed = 32 * azure.one_mib } },
+        .{ .name = "root", .role = .root_x86_64, .filesystem = .ext4, .size = .{ .percent = 80.0 } },
+        .{ .name = "usr", .role = .usr_x86_64, .filesystem = .ext4, .size = .{ .percent = 30.0 } },
     };
 
     try std.testing.expectError(error.OverAllocated, planLayout(std.testing.allocator, 128 * azure.one_mib, &requests, null));
@@ -234,7 +270,7 @@ test "planLayout rejects over-allocation" {
 
 test "planLayout rejects a positive percentage that cannot reach one alignment unit" {
     const requests = [_]PartitionRequest{
-        .{ .name = "tiny", .role = .linux_filesystem_data, .size = .{ .percent = 1.0 } },
+        .{ .name = "tiny", .role = .linux_filesystem_data, .filesystem = .ext4, .size = .{ .percent = 1.0 } },
     };
 
     try std.testing.expectError(error.PartitionTooSmall, planLayout(std.testing.allocator, 64 * azure.one_mib, &requests, null));
@@ -247,8 +283,8 @@ test "planLayout survives a GPT write/read round-trip" {
 
     const disk_size = 256 * azure.one_mib;
     const requests = [_]PartitionRequest{
-        .{ .name = "ESP", .role = .esp, .size = .{ .fixed = 64 * azure.one_mib } },
-        .{ .name = "root", .role = .root_x86_64, .size = .{ .percent = 100.0 } },
+        .{ .name = "ESP", .role = .esp, .filesystem = .fat32, .size = .{ .fixed = 64 * azure.one_mib } },
+        .{ .name = "root", .role = .root_x86_64, .filesystem = .ext4, .size = .{ .percent = 100.0 } },
     };
 
     const planned = try planLayout(std.testing.allocator, disk_size, &requests, null);
@@ -287,4 +323,63 @@ test "planLayout survives a GPT write/read round-trip" {
     try std.testing.expectEqualSlices(u8, &guid.esp, &parsed.partitions[0].partition_type_guid);
     try std.testing.expectEqualSlices(u8, &guid.linux_root_x86_64, &parsed.partitions[1].partition_type_guid);
     try std.testing.expectEqualSlices(u8, &disk_guid, &parsed.header.disk_guid);
+}
+
+test "planLayout propagates each request's filesystem to its planned partition unchanged" {
+    const requests = [_]PartitionRequest{
+        .{ .name = "ESP", .role = .esp, .filesystem = .fat32, .size = .{ .fixed = 64 * azure.one_mib } },
+        .{ .name = "boot", .role = .boot, .filesystem = .ext4, .size = .{ .fixed = 32 * azure.one_mib } },
+        .{ .name = "root", .role = .root_x86_64, .filesystem = .ext4, .size = .{ .percent = 100.0 } },
+    };
+
+    const planned = try planLayout(std.testing.allocator, 256 * azure.one_mib, &requests, null);
+    defer std.testing.allocator.free(planned);
+
+    for (requests, planned) |request, partition| {
+        try std.testing.expectEqual(request.filesystem, partition.filesystem);
+    }
+    try std.testing.expectEqual(FilesystemKind.fat32, planned[0].filesystem);
+    try std.testing.expectEqual(FilesystemKind.ext4, planned[1].filesystem);
+    try std.testing.expectEqual(FilesystemKind.ext4, planned[2].filesystem);
+}
+
+test "planLayout keeps role and filesystem independent: a role's GPT type GUID does not change with filesystem" {
+    // Two requests share the same role (and so the same default type GUID)
+    // but ask for different filesystems. If `filesystem` were derived from
+    // `role`, this would be inexpressible; instead both plan cleanly and the
+    // type GUID -- which comes from `role` alone -- is identical.
+    const requests = [_]PartitionRequest{
+        .{ .name = "data-a", .role = .linux_filesystem_data, .filesystem = .ext4, .size = .{ .fixed = 16 * azure.one_mib } },
+        .{ .name = "data-b", .role = .linux_filesystem_data, .filesystem = .fat32, .size = .{ .fixed = 16 * azure.one_mib } },
+    };
+
+    const planned = try planLayout(std.testing.allocator, 128 * azure.one_mib, &requests, null);
+    defer std.testing.allocator.free(planned);
+
+    try std.testing.expectEqual(FilesystemKind.ext4, planned[0].filesystem);
+    try std.testing.expectEqual(FilesystemKind.fat32, planned[1].filesystem);
+    try std.testing.expectEqualSlices(u8, &planned[0].type_guid, &planned[1].type_guid);
+    try std.testing.expectEqualSlices(u8, &guid.linux_filesystem_data, &planned[0].type_guid);
+}
+
+test "planLayout keeps filesystem independent of an explicit type_guid override" {
+    // The `usr` role defaults to a usr-specific type GUID, but a caller can
+    // override the GUID (as the "usr" request above does) without that
+    // override implying anything about the filesystem: the two fields are
+    // set, and vary, independently of one another.
+    const requests = [_]PartitionRequest{
+        .{
+            .name = "usr",
+            .role = .usr_x86_64,
+            .filesystem = .fat32,
+            .size = .{ .fixed = 32 * azure.one_mib },
+            .type_guid = guid.linux_filesystem_data,
+        },
+    };
+
+    const planned = try planLayout(std.testing.allocator, 128 * azure.one_mib, &requests, null);
+    defer std.testing.allocator.free(planned);
+
+    try std.testing.expectEqual(FilesystemKind.fat32, planned[0].filesystem);
+    try std.testing.expectEqualSlices(u8, &guid.linux_filesystem_data, &planned[0].type_guid);
 }

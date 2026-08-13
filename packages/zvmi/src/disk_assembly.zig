@@ -534,11 +534,11 @@ fn planPartitions(
     var requests: [2]layout_mod.PartitionRequest = undefined;
     var count: usize = 0;
     if (esp_length) |length| {
-        requests[count] = .{ .name = esp_partition_name, .role = .esp, .size = .{ .fixed = length } };
+        requests[count] = .{ .name = esp_partition_name, .role = .esp, .filesystem = .fat32, .size = .{ .fixed = length } };
         count += 1;
     }
     const root_length = alignUp(root_filesystem_length);
-    requests[count] = .{ .name = root_partition_name, .role = root_role, .size = .{ .fixed = root_length } };
+    requests[count] = .{ .name = root_partition_name, .role = root_role, .filesystem = .ext4, .size = .{ .fixed = root_length } };
     count += 1;
 
     // The first partition starts at the first aligned offset past the

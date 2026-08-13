@@ -2922,10 +2922,11 @@ fn planGeneralizedGen2Layout(
     flavor: *const FlavorDescriptor,
 ) ![]zvmi.layout.PlannedPartition {
     const requests = [_]zvmi.layout.PartitionRequest{
-        .{ .name = "ESP", .role = .esp, .size = .{ .fixed = flavor.esp_size_bytes } },
+        .{ .name = "ESP", .role = .esp, .filesystem = .fat32, .size = .{ .fixed = flavor.esp_size_bytes } },
         .{
             .name = "root",
             .role = architecture.root_role,
+            .filesystem = .ext4,
             .size = .{ .percent = 100.0 },
             .type_guid = architecture.root_type_guid,
         },

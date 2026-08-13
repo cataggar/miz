@@ -948,8 +948,8 @@ fn planGen2PartitionIdentities(
         .aarch64 => .root_aarch64,
     };
     const requests = [_]layout.PartitionRequest{
-        .{ .name = "ESP", .role = .esp, .size = .{ .fixed = esp_size } },
-        .{ .name = "root", .role = root_role, .size = .{ .percent = 100.0 } },
+        .{ .name = "ESP", .role = .esp, .filesystem = .fat32, .size = .{ .fixed = esp_size } },
+        .{ .name = "root", .role = root_role, .filesystem = .ext4, .size = .{ .percent = 100.0 } },
     };
     const planned = try layout.planLayout(allocator, disk_size, &requests, null);
     errdefer allocator.free(planned);
@@ -989,6 +989,7 @@ fn planGen1PartitionIdentities(
     identities[0] = .{ .planned = .{
         .name = "root",
         .role = root_role,
+        .filesystem = .ext4,
         .type_guid = root_role.defaultTypeGuid(),
         .offset_bytes = offset_bytes,
         .length_bytes = usable_bytes,
