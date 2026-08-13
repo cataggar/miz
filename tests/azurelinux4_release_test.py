@@ -9,6 +9,7 @@ import subprocess
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import azurelinux4_release as release
 
@@ -84,6 +85,8 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         key,
         certificate_der=TEST_CERTIFICATE_DER,
         signing_certificate_sha256=TEST_SIGNING_CERTIFICATE_SHA256,
+        asset_size=None,
+        virtual_size=1024,
     ):
         certificate_sha256 = hashlib.sha256(certificate_der).hexdigest()
         architecture, flavor, asset_name = release.EXPECTED[key]
@@ -91,6 +94,8 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         candidate_dir.mkdir(parents=True)
         asset = candidate_dir / asset_name
         asset.write_bytes((key + "\n").encode())
+        if asset_size is not None:
+            os.truncate(asset, asset_size)
         provenance = candidate_dir / "internal-provenance"
         provenance.mkdir()
         (provenance / "inputs.txt").write_text(f"{key}\n", encoding="utf-8")
@@ -149,7 +154,7 @@ class AzureLinuxReleaseTest(unittest.TestCase):
                 flavor=flavor,
                 asset=asset,
                 validated_sha256=digest,
-                virtual_size=1024,
+                virtual_size=virtual_size,
                 source_commit=self.source_commit,
                 provenance_dir=provenance,
                 runner=f"runner-{architecture}",
@@ -222,6 +227,67 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             )
         )
         return output, notes
+
+    def test_format_mib_uses_binary_units_and_one_decimal_place(self):
+        cases = {
+            0: "0.0 MiB",
+            52_428: "0.0 MiB",
+            52_429: "0.1 MiB",
+            release.MIB_BYTES - 1: "1.0 MiB",
+            release.MIB_BYTES: "1.0 MiB",
+            360_667_136: "344.0 MiB",
+            5_368_709_120: "5120.0 MiB",
+        }
+        for byte_count, expected in cases.items():
+            with self.subTest(byte_count=byte_count):
+                self.assertEqual(release.format_mib(byte_count), expected)
+
+    def test_format_mib_rejects_invalid_byte_counts(self):
+        for value in (True, False, 1.0, "1", None):
+            with self.subTest(value=value):
+                with self.assertRaises(TypeError):
+                    release.format_mib(value)
+        with self.assertRaises(ValueError):
+            release.format_mib(-1)
+
+    def test_stage_notes_format_file_and_virtual_sizes_but_manifest_keeps_bytes(self):
+        representative_key = "x86_64-full"
+        with mock.patch.object(release, "sha256", return_value="9" * 64):
+            for key in release.EXPECTED:
+                self.make_bundle(
+                    key,
+                    asset_size=360_667_136 if key == representative_key else None,
+                    virtual_size=(
+                        5_368_709_120 if key == representative_key else 1024
+                    ),
+                )
+            output, notes = self.stage()
+
+        notes_text = notes.read_text()
+        self.assertIn(
+            "| Asset | SHA-256 | UKI SHA-256 | File size | Virtual size | "
+            "Azure validation | Derived VHD evidence (not published) |",
+            notes_text,
+        )
+        self.assertNotIn("| Bytes |", notes_text)
+        self.assertIn(
+            f"| `{release.EXPECTED[representative_key][2]}` | `{'9' * 64}` | "
+            f"`{'3' * 64}` | 344.0 MiB | 5120.0 MiB | "
+            "`eastus2` / `Standard_D2ds_v5` | "
+            f"`{'9' * 64}`; current 1048576 bytes; file 1049088 bytes |",
+            notes_text,
+        )
+
+        manifest = json.loads((output / "publish-manifest.json").read_text())
+        representative = next(
+            item
+            for item in manifest["assets"]
+            if item["key"] == representative_key
+        )
+        self.assertEqual(representative["bytes"], 360_667_136)
+        self.assertEqual(representative["virtual_size"], 5_368_709_120)
+        self.assertIs(type(representative["bytes"]), int)
+        self.assertIs(type(representative["virtual_size"]), int)
 
     def test_stage_requires_and_copies_exact_four_bound_assets(self):
         self.make_all_bundles()

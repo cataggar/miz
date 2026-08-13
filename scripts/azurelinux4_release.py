@@ -72,10 +72,22 @@ PRIVATE_KEY_PEM_MARKERS = (
     b"-----BEGIN EC PRIVATE KEY-----",
     b"-----BEGIN OPENSSH PRIVATE KEY-----",
 )
+MIB_BYTES = 1024 * 1024
 
 
 def fail(message: str) -> None:
     raise SystemExit(message)
+
+
+def format_mib(byte_count: int) -> str:
+    if type(byte_count) is not int:
+        raise TypeError("byte count must be an integer")
+    if byte_count < 0:
+        raise ValueError("byte count must be nonnegative")
+    tenths, remainder = divmod(byte_count * 10, MIB_BYTES)
+    if remainder * 2 >= MIB_BYTES:
+        tenths += 1
+    return f"{tenths // 10}.{tenths % 10} MiB"
 
 
 def sha256(path: Path) -> str:
@@ -812,12 +824,13 @@ def stage_command(args: argparse.Namespace) -> None:
         f"All UKIs are trusted through enrolled leaf SHA-256 `{release_certificate_sha256}`.",
         f"Artifact Signing leaf certificate SHA-256: `{release_signing_certificate_sha256}`.",
         "",
-        "| Asset | SHA-256 | UKI SHA-256 | Bytes | Azure validation | Derived VHD evidence (not published) |",
-        "| --- | --- | --- | ---: | --- | --- |",
+        "| Asset | SHA-256 | UKI SHA-256 | File size | Virtual size | Azure validation | Derived VHD evidence (not published) |",
+        "| --- | --- | --- | ---: | ---: | --- | --- |",
     ]
     for item in staged:
         lines.append(
-            f"| `{item['asset_name']}` | `{item['sha256']}` | `{item['fallback_uki_sha256']}` | {item['bytes']} | "
+            f"| `{item['asset_name']}` | `{item['sha256']}` | `{item['fallback_uki_sha256']}` | "
+            f"{format_mib(item['bytes'])} | {format_mib(item['virtual_size'])} | "
             f"`{item['azure_location']}` / `{item['azure_vm_size']}` | "
             f"`{item['derived_vhd_sha256']}`; current "
             f"{item['derived_vhd_current_size']} bytes; file "
