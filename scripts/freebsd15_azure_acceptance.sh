@@ -11,7 +11,7 @@ if [[ -z ${STATE_FILE:-} || -z ${GITHUB_RUN_ID:-} || -z ${GITHUB_RUN_ATTEMPT:-} 
 fi
 [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
 [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
-[[ "$CANDIDATE_KEY" =~ ^(x86_64|aarch64)-(ufs-(full|core)|zfs-full)$ ]]
+[[ "$CANDIDATE_KEY" =~ ^(x86_64|aarch64)-(ufs|zfs)-(full|core)$ ]]
 
 cleanup_group() {
   [[ -s "$STATE_FILE" ]] || return 0
@@ -102,7 +102,7 @@ fi
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
 [[ "$ARCHITECTURE" =~ ^(x86_64|aarch64)$ ]]
 case "$FILESYSTEM-$FLAVOR" in
-  ufs-full|ufs-core|zfs-full) ;;
+  ufs-full|ufs-core|zfs-full|zfs-core) ;;
   *)
     echo "::error::Unsupported FreeBSD Azure acceptance profile: $FILESYSTEM-$FLAVOR"
     exit 1

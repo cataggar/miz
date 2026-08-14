@@ -8,13 +8,12 @@ if [[ -z ${SOURCE_COMMIT:-} || -z ${RELEASE_SET:-} ||
   echo "::error::Required publication configuration is incomplete"
   exit 1
 fi
-if [[ "$RELEASE_SET" == "ufs" ]]; then
-  if [[ -z ${RELEASE_DATE:-} || ! "$RELEASE_DATE" =~ ^[0-9]{8}$ ]]; then
-    echo "::error::UFS releases require an explicit reviewed RELEASE_DATE"
-    exit 1
-  fi
-elif [[ -n ${RELEASE_DATE:-} ]]; then
-  echo "::error::RELEASE_DATE is only applicable to UFS releases"
+if [[ "$RELEASE_SET" != "zfs" ]]; then
+  echo "::error::Only the combined ZFS release set is publishable"
+  exit 1
+fi
+if [[ -z ${RELEASE_DATE:-} || ! "$RELEASE_DATE" =~ ^[0-9]{8}$ ]]; then
+  echo "::error::ZFS releases require an explicit reviewed RELEASE_DATE"
   exit 1
 fi
 for tool in gh python3 sha256sum; do
@@ -26,12 +25,9 @@ done
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
 [[ "$REPOSITORY" == cataggar/zvmi ]]
 
-describe_args=(--release-set "$RELEASE_SET")
-if [[ "$RELEASE_SET" == "ufs" ]]; then
-  describe_args+=(--release-date "$RELEASE_DATE")
-fi
 release_description=$(python3 scripts/freebsd15_release.py describe \
-  "${describe_args[@]}")
+  --release-set "$RELEASE_SET" \
+  --release-date "$RELEASE_DATE")
 expected_tag=${release_description#*release_tag=}
 expected_tag=${expected_tag%%$'\n'*}
 expected_title=${release_description#*release_title=}
@@ -81,6 +77,18 @@ assets = document.get("assets")
 if not isinstance(assets, list) or len(assets) != int(count):
     raise SystemExit("publish manifest asset count mismatch")
 expected_names = set()
+expected_variants = {
+    "aarch64-zfs-full": "FreeBSD-15.1-aarch64.qcow2",
+    "x86_64-zfs-full": "FreeBSD-15.1-x86_64.qcow2",
+    "aarch64-zfs-core": "FreeBSD-15.1-aarch64.core.qcow2",
+    "x86_64-zfs-core": "FreeBSD-15.1-x86_64.core.qcow2",
+}
+actual_variants = {
+    asset.get("variant"): asset.get("asset_name")
+    for asset in assets
+}
+if actual_variants != expected_variants:
+    raise SystemExit(f"ZFS publication allowlist mismatch: {actual_variants!r}")
 for asset in assets:
     name = asset.get("asset_name")
     digest = asset.get("sha256")
