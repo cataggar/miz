@@ -790,14 +790,17 @@ fn decodeTimestamp(raw: *const [8]u8, bigtime: bool) Timestamp {
 }
 
 // ---------------------------------------------------------------------------
-// Device number decode (matches ext4.zig's "new_decode_dev" bit math; XFS
-// always uses this single 32-bit form, with no legacy 16-bit fallback).
+// Device number decode. XFS stores the 32-bit device number in the data fork
+// using the IRIX/System V encoding: the major number occupies bits 18..31 and
+// the minor number occupies bits 0..17. This matches xfsprogs' IRIX_DEV_MAJOR/
+// IRIX_DEV_MINOR macros and the kernel's sysv_encode_dev(); it deliberately
+// differs from ext4's new_decode_dev() layout used in ext4.zig.
 // ---------------------------------------------------------------------------
 
 fn decodeDeviceNumbers(rdev: u32) DeviceNumbers {
     return .{
-        .major = (rdev >> 8) & 0xfff,
-        .minor = (rdev & 0xff) | ((rdev >> 12) & 0xffff_ff00),
+        .major = (rdev >> 18) & 0x1ff,
+        .minor = rdev & 0x3ffff,
     };
 }
 
@@ -2593,10 +2596,23 @@ test "readSymlinkTargetAlloc rejects an oversized target" {
 // Device numbers
 // ---------------------------------------------------------------------------
 
-test "decodeDeviceNumbers matches the standard major/minor packing" {
-    const dev = decodeDeviceNumbers(0x103);
+test "decodeDeviceNumbers matches the XFS sysv/IRIX major/minor packing" {
+    // sysv_encode_dev(major=1, minor=3) = (1 << 18) | 3 = 0x40003
+    const dev = decodeDeviceNumbers(0x40003);
     try testing.expectEqual(@as(u32, 1), dev.major);
     try testing.expectEqual(@as(u32, 3), dev.minor);
+
+    // sysv_encode_dev(major=8, minor=0) = 8 << 18 = 0x200000
+    const dev2 = decodeDeviceNumbers(0x200000);
+    try testing.expectEqual(@as(u32, 8), dev2.major);
+    try testing.expectEqual(@as(u32, 0), dev2.minor);
+
+    // A minor above 0xff must round-trip; this case distinguishes the sysv
+    // encoding from ext4's new_decode_dev(): sysv_encode_dev(4, 300) =
+    // (4 << 18) | 300 = 0x10012c.
+    const dev3 = decodeDeviceNumbers(0x10012c);
+    try testing.expectEqual(@as(u32, 4), dev3.major);
+    try testing.expectEqual(@as(u32, 300), dev3.minor);
 }
 
 // ---------------------------------------------------------------------------
@@ -2841,8 +2857,9 @@ pub fn buildIntegrationVolume(allocator: std.mem.Allocator) ![]u8 {
     putBlock(volume, integration_block_size, 4, link_inode);
 
     // --- dev (ino 5, AG0): char device, major 1 minor 3 ----------------
+    // On disk XFS stores the device number sysv-encoded: (major << 18) | minor.
     var dev_data: [4]u8 = undefined;
-    beU32(&dev_data, 0, 0x103);
+    beU32(&dev_data, 0, 0x40003);
     const dev_inode = try buildTestInode(allocator, integration_block_size, .{
         .ino = 5,
         .mode = s_ifchr | 0o644,

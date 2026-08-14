@@ -156,6 +156,12 @@ const ino_align: u32 = 4; // sb_inoalignmt, in blocks
 const log_blocks: u32 = 16384; // 64 MiB internal log (mkfs's proven minimum)
 const symlink_max_len: u32 = 1024;
 
+// A single bmbt extent record packs its block count into 21 bits, so no one
+// extent may describe more than this many filesystem blocks. Files whose data
+// would exceed one such extent are rejected rather than promoted to a
+// multi-extent or btree fork, which is out of scope for this pass.
+const max_extent_blocks: u64 = 0x1f_ffff;
+
 const sb_magic: u32 = 0x5846_5342; // "XFSB"
 const agf_magic: u32 = 0x5841_4746; // "XAGF"
 const agi_magic: u32 = 0x5841_4749; // "XAGI"
@@ -299,9 +305,9 @@ fn ceilDiv(a: u64, b: u64) u64 {
 }
 
 /// The device-number encoding XFS actually stores on disk (`sysv_encode_dev`:
-/// `minor | (major << 18)`), confirmed against mkfs output. Note the reader's
-/// `new_decode_dev` differs; tests here verify the real on-disk bytes rather
-/// than round-tripping the (major, minor) pair through that decode.
+/// `minor | (major << 18)`), confirmed against mkfs output and a real kernel
+/// mount. The reader's `decodeDeviceNumbers` is the exact inverse, so a device
+/// round-trips to the requested (major, minor).
 fn encodeDev(major: u32, minor: u32) u32 {
     return (minor & 0x3ffff) | (major << 18);
 }
@@ -544,8 +550,21 @@ fn buildPlan(
     var by_path = std.StringHashMapUnmanaged(usize).empty;
     try by_path.put(a, "", 0); // the root directory is the empty relative path
 
+    // Two passes over the sorted entries. Pass one plans every non-hardlink
+    // node so that `by_path` holds every candidate hardlink target before any
+    // link is resolved: a hardlink may sort before its target (e.g. "aaa"
+    // linking to "zzz", or the cross-directory "ab-x" linking to "ab/c").
+    // Hardlinks never consume an inode number (planEntry returns before
+    // bumping next_ino), so deferring them leaves the real inodes' numbering
+    // byte-for-byte identical to a single sorted pass, preserving determinism.
+    // This mirrors ext4.zig's two-pass hardlink resolution.
     var next_ino: u64 = first_user_ino;
     for (raw.items) |*e| {
+        if (e.kind == .hardlink) continue;
+        try planEntry(&plan, &by_path, e, &next_ino, options);
+    }
+    for (raw.items) |*e| {
+        if (e.kind != .hardlink) continue;
         try planEntry(&plan, &by_path, e, &next_ino, options);
     }
 
@@ -742,7 +761,14 @@ fn planEntry(
 
     switch (e.kind) {
         .directory => node.nlink = 2, // "." plus the parent's entry; bumped by children
-        .file => node.file_content = try readContent(a, e, e.size),
+        .file => {
+            // Reject oversized files before allocating their content: a single
+            // extent can describe at most `max_extent_blocks` blocks (enforced
+            // in layoutFile), and readContent would otherwise allocate
+            // gigabytes only to fail during layout.
+            if (ceilDiv(e.size, block_size) > max_extent_blocks) return error.FileTooLarge;
+            node.file_content = try readContent(a, e, e.size);
+        },
         .symlink => {
             if (e.size == 0) return error.EmptySymlink;
             if (e.size > symlink_max_len) return error.SymlinkTooLong;
@@ -918,7 +944,9 @@ fn layoutFile(node: *InodeNode, attr_bytes: u32) WriteError!void {
     node.data_block_count = blocks;
     const avail = availableDataFork(attr_bytes);
     if (16 > avail) return error.TooManyExtents;
-    if (blocks > 0x1f_ffff_ffff) return error.FileTooLarge; // 43-bit extent count field
+    // A bmbt extent record encodes its block count in 21 bits; a larger single
+    // extent would silently corrupt the packed startblock/blockcount word.
+    if (blocks > max_extent_blocks) return error.FileTooLarge;
 }
 
 fn layoutSymlink(node: *InodeNode, attr_bytes: u32) WriteError!void {
@@ -1710,18 +1738,6 @@ fn writeFixtureFile(path: []const u8, bytes: []const u8) !void {
     try file.writePositionalAll(io, bytes, 0);
 }
 
-/// Mirrors the reader's `new_decode_dev`, so a device test can assert the
-/// exact (major, minor) the reader will report from the real `sysv_encode_dev`
-/// bytes this writer stores -- documenting, not hiding, that the two encodings
-/// differ (see `encodeDev`).
-fn readerDecodeDev(major: u32, minor: u32) tree_cursor.DeviceNumbers {
-    const rdev = encodeDev(major, minor);
-    return .{
-        .major = (rdev >> 8) & 0xfff,
-        .minor = (rdev & 0xff) | ((rdev >> 12) & 0xffff_ff00),
-    };
-}
-
 const roundtrip_opts = PopulateOptions{
     .format = .{
         .length = 160 * 1024 * 1024,
@@ -1849,15 +1865,16 @@ test "populate emits a tree the merged reader reads back field-for-field" {
     defer allocator.free(longlink_target);
     try testing.expectEqualSlices(u8, long_target, longlink_target);
 
-    // Character and block devices: kind is exact; the reader's decode of the
-    // real on-disk (sysv) rdev is what we assert against.
+    // Character and block devices: the reader now decodes the real on-disk
+    // (sysv/IRIX) rdev, so it reports exactly the major/minor we requested.
     const cdev = findRt(&tree, "cdev").?;
     try testing.expectEqual(xfs.Kind.char_device, cdev.kind);
-    const cdev_expect = readerDecodeDev(1, 3);
-    try testing.expectEqual(cdev_expect.major, cdev.device.major);
-    try testing.expectEqual(cdev_expect.minor, cdev.device.minor);
+    try testing.expectEqual(@as(u32, 1), cdev.device.major);
+    try testing.expectEqual(@as(u32, 3), cdev.device.minor);
     const bdev = findRt(&tree, "bdev").?;
     try testing.expectEqual(xfs.Kind.block_device, bdev.kind);
+    try testing.expectEqual(@as(u32, 8), bdev.device.major);
+    try testing.expectEqual(@as(u32, 0), bdev.device.minor);
 
     // FIFO.
     const pipe = findRt(&tree, "pipe").?;
@@ -1906,6 +1923,66 @@ test "populate is byte-for-byte deterministic" {
     try testing.expect(std.mem.eql(u8, buf1, buf2));
 }
 
+/// Assert that exactly one of `p1`/`p2` is surfaced as a `.hardlink` pointing
+/// at the other, and that the non-link side holds `content`. Which side the
+/// reader reports as the link depends on its traversal order, so accept either.
+fn expectLinkedPair(
+    tree: *xfs.Tree,
+    allocator: std.mem.Allocator,
+    p1: []const u8,
+    p2: []const u8,
+    content: []const u8,
+) !void {
+    const e1 = findRt(tree, p1) orelse return error.MissingEntry;
+    const e2 = findRt(tree, p2) orelse return error.MissingEntry;
+    var links: usize = 0;
+    if (e1.kind == .hardlink) links += 1;
+    if (e2.kind == .hardlink) links += 1;
+    try testing.expectEqual(@as(usize, 1), links);
+    const link = if (e1.kind == .hardlink) e1 else e2;
+    const file = if (e1.kind == .hardlink) e2 else e1;
+    try testing.expectEqualStrings(file.path, link.hardlink_target);
+    const data = try readRt(allocator, file);
+    defer allocator.free(data);
+    try testing.expectEqualSlices(u8, content, data);
+}
+
+test "populate resolves hardlinks that sort before their targets" {
+    const allocator = testing.allocator;
+    // Both links sort *before* the file they point at, exercising the two-pass
+    // resolution: "aaa" < "zzz", and the cross-directory "ab-x" < "ab/c"
+    // (because '-' (0x2d) < '/' (0x2f)). A single sorted pass would wrongly
+    // reject these with error.HardlinkTargetMissing.
+    var entries = [_]FixtureEntry{
+        .{ .path = "aaa", .kind = .hardlink, .hardlink_target = "zzz" },
+        .{ .path = "zzz", .kind = .file, .mode = 0o644, .size = 6, .content = "shared" },
+        .{ .path = "ab", .kind = .directory, .mode = 0o755 },
+        .{ .path = "ab-x", .kind = .hardlink, .hardlink_target = "ab/c" },
+        .{ .path = "ab/c", .kind = .file, .mode = 0o644, .size = 5, .content = "inner" },
+    };
+    const opts = PopulateOptions{ .format = .{ .length = 160 * 1024 * 1024, .uuid = xfs.test_fs_uuid } };
+
+    var fc = FixtureCursor{ .entries = &entries };
+    var cur = fc.cursor();
+    const buffer = try allocator.alloc(u8, opts.format.length);
+    defer allocator.free(buffer);
+    @memset(buffer, 0xcc);
+    try populate(allocator, buffer, &cur, opts);
+
+    const path = "test-xfs-writer-hardlink-order.img";
+    try writeFixtureFile(path, buffer);
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    const io = std.testing.io;
+    var reader = try xfs.Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    var tree = try xfs.scanReadable(&reader, io, allocator, .{ .available_length = opts.format.length });
+    defer tree.deinit();
+
+    try expectLinkedPair(&tree, allocator, "aaa", "zzz", "shared");
+    try expectLinkedPair(&tree, allocator, "ab-x", "ab/c", "inner");
+}
+
 fn expectReject(entries: []FixtureEntry, root: RootMetadata, length: u64, expected: WriteError) !void {
     var fc = FixtureCursor{ .entries = entries };
     var cur = fc.cursor();
@@ -1933,6 +2010,12 @@ test "populate rejects unsupported shapes before writing" {
     }
     {
         var e = [_]FixtureEntry{.{ .path = "h", .kind = .hardlink, .hardlink_target = "nope" }};
+        try expectReject(&e, .{}, big_len, error.HardlinkTargetMissing);
+    }
+    {
+        // A genuinely missing target must still be rejected under the two-pass
+        // resolution, even when the link sorts before the (absent) target name.
+        var e = [_]FixtureEntry{.{ .path = "aaa", .kind = .hardlink, .hardlink_target = "zzz" }};
         try expectReject(&e, .{}, big_len, error.HardlinkTargetMissing);
     }
     {
@@ -1996,6 +2079,40 @@ test "populate rejects an over-large single directory" {
         try list.append(a, .{ .path = name, .kind = .file, .size = 0 });
     }
     try expectReject(list.items, .{}, 512 * 1024 * 1024, error.DirectoryTooLarge);
+}
+
+test "layoutFile enforces the 21-bit single-extent block-count bound" {
+    // Build the layout for a file whose data occupies exactly the largest
+    // single extent a bmbt record can encode (21-bit block count). Exercising
+    // layoutFile directly keeps the test from allocating ~8 GiB of content.
+    var node = InodeNode{
+        .ino = first_user_ino,
+        .kind = .file,
+        .mode_bits = 0o644,
+        .uid = 0,
+        .gid = 0,
+        .nlink = 1,
+        .size = max_extent_blocks * block_size,
+        .atime = 0,
+        .mtime = 0,
+        .ctime = 0,
+        .crtime = 0,
+        .atime_nsec = 0,
+        .mtime_nsec = 0,
+        .ctime_nsec = 0,
+        .crtime_nsec = 0,
+        .device = .{},
+        .parent_ino = root_ino,
+    };
+    try layoutFile(&node, 0);
+    try testing.expectEqual(@as(u32, 1), node.nextents);
+    try testing.expectEqual(max_extent_blocks, node.data_block_count);
+
+    // One block over the boundary needs a second extent (out of scope), so the
+    // writer must reject it rather than corrupt the packed startblock word.
+    var too_big = node;
+    too_big.size = (max_extent_blocks + 1) * block_size;
+    try testing.expectError(error.FileTooLarge, layoutFile(&too_big, 0));
 }
 
 fn findRt(tree: *xfs.Tree, path: []const u8) ?xfs.Entry {
