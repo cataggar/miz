@@ -671,19 +671,21 @@ pub fn build(
                 xfs_root_xattr[0] = .{ .name = "security.selinux", .value = value };
                 break :x xfs_root_xattr[0..1];
             } else &.{};
-            break :blk .{ .xfs = .{
-                .format = .{
-                    .offset = root_partition.planned.offset_bytes,
-                    .length = rootfs_length,
-                    .label = options.ext4_label,
-                    .uuid = root_filesystem_uuid,
-                    .timestamp = .{ .sec = filesystem_timestamp, .nsec = 0 },
+            break :blk .{
+                .xfs = .{
+                    .format = .{
+                        .offset = root_partition.planned.offset_bytes,
+                        .length = rootfs_length,
+                        .label = options.ext4_label,
+                        .uuid = root_filesystem_uuid,
+                        .timestamp = .{ .sec = filesystem_timestamp, .nsec = 0 },
+                    },
+                    // The root inode matches ext4's implicit root (mode 0o755,
+                    // root:root); leaving the times null lets the writer fall back
+                    // to the same filesystem-wide timestamp ext4 stamps them with.
+                    .root = .{ .mode = 0o755, .uid = 0, .gid = 0, .xattrs = root_xattrs },
                 },
-                // The root inode matches ext4's implicit root (mode 0o755,
-                // root:root); leaving the times null lets the writer fall back
-                // to the same filesystem-wide timestamp ext4 stamps them with.
-                .root = .{ .mode = 0o755, .uid = 0, .gid = 0, .xattrs = root_xattrs },
-            } };
+            };
         },
         // The root role never plans a FAT32 filesystem (the ESP is separate),
         // so this is unreachable in practice; name it rather than write a

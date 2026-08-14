@@ -1713,64 +1713,64 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
                 ));
             }
             if (request.output.size_policy == .explicit) {
-            if (request.output.size % 512 != 0) {
-                try diagnostics.append(validationError(.invalid_output, "/output/size", "output size must be a multiple of 512 bytes", null));
-            }
-            if (request.output.size > std.math.maxInt(u64) - mib) {
-                try diagnostics.append(validationError(.invalid_output, "/output/size", "output size is too large to align safely", null));
-            }
-            const minimum_size = switch (storage.generation) {
-                .gen1 => 2 * mib,
-                .gen2 => if (storage.esp_size > std.math.maxInt(u64) - 2 * mib)
-                    std.math.maxInt(u64)
-                else
-                    storage.esp_size + 2 * mib,
-            };
-            if (storage.generation == .gen2 and storage.esp_size > std.math.maxInt(u64) - 2 * mib) {
-                try diagnostics.append(validationError(.invalid_storage, "/storage/fresh/esp_size", "ESP size is too large to plan safely", null));
-            }
-            if (request.output.size <= minimum_size) {
-                try diagnostics.append(validationError(.invalid_storage, "/output/size", "output is too small for the selected partition layout", null));
-            }
-            if (storage.ext4_label.len > 16) {
-                try diagnostics.append(validationError(.invalid_storage, "/storage/fresh/ext4_label", "ext4 label must be at most 16 bytes", null));
-            }
-            if (storage.generation == .gen1 and request.boot_security.boot_mode != .bls_only) {
-                try diagnostics.append(validationError(
-                    .incompatible_boot_policy,
-                    "/boot_security/boot_mode",
-                    "UKI modes require a Gen2 EFI System Partition",
-                    "use bls_only for Gen1 or select Gen2 storage",
-                ));
-            }
-            if (storage.generation == .gen1 and request.boot_security.verity) {
-                try diagnostics.append(validationError(
-                    .incompatible_boot_policy,
-                    "/boot_security/verity",
-                    "Gen1 verity cannot generate a final-hash-aware BIOS GRUB configuration",
-                    "disable verity or select Gen2 storage",
-                ));
-            }
-            if (storage.generation == .gen1 and request.target_architecture != null and request.target_architecture.? != .x86_64) {
-                try diagnostics.append(validationError(
-                    .incompatible_boot_policy,
-                    "/target_architecture",
-                    "the native Gen1 BIOS backend only supports x86_64 images",
-                    "select x86_64 or use Gen2 storage for aarch64",
-                ));
-            }
-            if (request.output.size % 512 == 0 and
-                request.output.size <= std.math.maxInt(u64) - mib and
-                (storage.generation == .gen1 or storage.esp_size <= std.math.maxInt(u64) - 2 * mib))
-            {
-                if (validateStorageGeometry(
-                    if (request.output.format == .vhd) azure.alignSizeToMib(request.output.size) else request.output.size,
-                    storage,
-                    request.boot_security.verity,
-                )) |diagnostic| {
-                    try diagnostics.append(diagnostic);
+                if (request.output.size % 512 != 0) {
+                    try diagnostics.append(validationError(.invalid_output, "/output/size", "output size must be a multiple of 512 bytes", null));
                 }
-            }
+                if (request.output.size > std.math.maxInt(u64) - mib) {
+                    try diagnostics.append(validationError(.invalid_output, "/output/size", "output size is too large to align safely", null));
+                }
+                const minimum_size = switch (storage.generation) {
+                    .gen1 => 2 * mib,
+                    .gen2 => if (storage.esp_size > std.math.maxInt(u64) - 2 * mib)
+                        std.math.maxInt(u64)
+                    else
+                        storage.esp_size + 2 * mib,
+                };
+                if (storage.generation == .gen2 and storage.esp_size > std.math.maxInt(u64) - 2 * mib) {
+                    try diagnostics.append(validationError(.invalid_storage, "/storage/fresh/esp_size", "ESP size is too large to plan safely", null));
+                }
+                if (request.output.size <= minimum_size) {
+                    try diagnostics.append(validationError(.invalid_storage, "/output/size", "output is too small for the selected partition layout", null));
+                }
+                if (storage.ext4_label.len > 16) {
+                    try diagnostics.append(validationError(.invalid_storage, "/storage/fresh/ext4_label", "ext4 label must be at most 16 bytes", null));
+                }
+                if (storage.generation == .gen1 and request.boot_security.boot_mode != .bls_only) {
+                    try diagnostics.append(validationError(
+                        .incompatible_boot_policy,
+                        "/boot_security/boot_mode",
+                        "UKI modes require a Gen2 EFI System Partition",
+                        "use bls_only for Gen1 or select Gen2 storage",
+                    ));
+                }
+                if (storage.generation == .gen1 and request.boot_security.verity) {
+                    try diagnostics.append(validationError(
+                        .incompatible_boot_policy,
+                        "/boot_security/verity",
+                        "Gen1 verity cannot generate a final-hash-aware BIOS GRUB configuration",
+                        "disable verity or select Gen2 storage",
+                    ));
+                }
+                if (storage.generation == .gen1 and request.target_architecture != null and request.target_architecture.? != .x86_64) {
+                    try diagnostics.append(validationError(
+                        .incompatible_boot_policy,
+                        "/target_architecture",
+                        "the native Gen1 BIOS backend only supports x86_64 images",
+                        "select x86_64 or use Gen2 storage for aarch64",
+                    ));
+                }
+                if (request.output.size % 512 == 0 and
+                    request.output.size <= std.math.maxInt(u64) - mib and
+                    (storage.generation == .gen1 or storage.esp_size <= std.math.maxInt(u64) - 2 * mib))
+                {
+                    if (validateStorageGeometry(
+                        if (request.output.format == .vhd) azure.alignSizeToMib(request.output.size) else request.output.size,
+                        storage,
+                        request.boot_security.verity,
+                    )) |diagnostic| {
+                        try diagnostics.append(diagnostic);
+                    }
+                }
             }
         },
         .preserve => |storage| switch (storage.root_partition) {
