@@ -328,7 +328,7 @@ if not isinstance(packages.get("installed_bytes"), int) or packages["installed_b
     raise SystemExit("candidate package installed size is missing or invalid")
 package_manifest_path = Path(f"{requested_asset}.packages.txt").resolve(strict=True)
 installed_packages = release.parse_package_manifest(package_manifest_path)
-release.verify_package_manifest(flavor, installed_packages)
+release.verify_package_manifest(filesystem, flavor, installed_packages)
 if [package["name"] for package in installed_packages] != packages.get("names"):
     raise SystemExit("candidate package manifest content does not match")
 if len(installed_packages) != packages.get("count"):

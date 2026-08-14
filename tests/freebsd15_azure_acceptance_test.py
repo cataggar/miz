@@ -809,7 +809,10 @@ def test_candidate_manifest_uses_canonical_validation():
     assert "candidate package installed size is missing or invalid" in content
     assert 'Path(f"{requested_asset}.packages.txt").resolve(strict=True)' in content
     assert "release.parse_package_manifest(package_manifest_path)" in content
-    assert "release.verify_package_manifest(flavor, installed_packages)" in content
+    assert (
+        "release.verify_package_manifest(filesystem, flavor, installed_packages)"
+        in content
+    )
     assert "candidate package manifest content does not match" in content
     assert "candidate package manifest count does not match" in content
     assert "candidate package manifest installed size does not match" in content
