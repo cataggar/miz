@@ -777,15 +777,13 @@ printf 'status=%s\\nattempts=%s\\nsleeps=%s\\nclock=%s\\n' \
 
 def test_candidate_key_accepts_supported_profiles():
     for architecture in ("x86_64", "aarch64"):
-        for profile in ("ufs-full", "ufs-core", "zfs-full"):
+        for profile in ("ufs-full", "ufs-core", "zfs-full", "zfs-core"):
             result = _preflight(f"{architecture}-{profile}")
             assert result.returncode == 2, (profile, result.stderr)
 
 
 def test_candidate_key_rejects_unsupported_profiles_fail_closed():
     for key in (
-        "x86_64-zfs-core",
-        "aarch64-zfs-core",
         "x86_64-ufs-minimal",
         "riscv64-ufs-core",
     ):
@@ -803,6 +801,7 @@ def test_candidate_manifest_uses_canonical_validation():
     assert 'doc.get("flavor") != flavor' in content
     assert '("ufs", "core")' in content
     assert '("zfs", "full")' in content
+    assert '("zfs", "core")' in content
     assert "candidate compressed size is missing or invalid" in content
     assert "candidate allocated size is missing or invalid" in content
     assert "candidate source size is missing or invalid" in content
@@ -810,7 +809,10 @@ def test_candidate_manifest_uses_canonical_validation():
     assert "candidate package installed size is missing or invalid" in content
     assert 'Path(f"{requested_asset}.packages.txt").resolve(strict=True)' in content
     assert "release.parse_package_manifest(package_manifest_path)" in content
-    assert "release.verify_package_manifest(flavor, installed_packages)" in content
+    assert (
+        "release.verify_package_manifest(filesystem, flavor, installed_packages)"
+        in content
+    )
     assert "candidate package manifest content does not match" in content
     assert "candidate package manifest count does not match" in content
     assert "candidate package manifest installed size does not match" in content
@@ -1894,11 +1896,11 @@ def test_workflow_staging_requires_azure_success_for_gated_sets():
     assert "needs.azure_acceptance.result == 'success'" in section
 
 
-def test_workflow_staging_does_not_allow_skipped_azure_for_ufs():
+def test_workflow_staging_does_not_allow_skipped_azure_for_zfs():
     content = _workflow_content()
     idx = content.index("\n  stage:")
     section = content[idx : idx + 600]
-    assert "inputs.release_set == 'ufs'" not in section
+    assert "inputs.release_set == 'zfs'" not in section
 
 
 def test_workflow_azure_acceptance_uses_oidc():
@@ -1982,25 +1984,59 @@ def test_workflow_persists_exact_qemu_info_for_candidate_metadata():
     assert 'jq -r \'.\"actual-size\"\' "$CANDIDATE_DIR/qemu-img-info.json"' in content
 
 
-def test_ufs_workflow_builds_one_combined_candidate_matrix():
+def test_zfs_workflow_builds_one_combined_candidate_matrix():
     content = _workflow_content()
     assert "BASELINE_CANDIDATES_DIR" not in content
     assert "Download every build-validated candidate" in content
     assert "freebsd15-candidate-*" in content
     assert "merge-multiple: false" in content
+    assert 'default: zfs' in content
+    assert "          - ufs" not in content
+    assert 'test "$RELEASE_SET" = zfs' in content
+    assert content.count('print(len(json.loads(sys.argv[1])["include"]))') == 2
 
 
-def test_ufs_release_date_is_explicit_and_not_stale():
+def test_zfs_release_date_is_explicit_and_reviewed():
     content = _workflow_content()
     assert "release_date:" in content
     assert "Explicit reviewed YYYYMMDD" in content
+    release_date = content.split("      release_date:", 1)[1].split(
+        "      validation_only:", 1
+    )[0]
+    assert "required: true" in release_date
+    assert "default:" not in release_date
     assert "RELEASE_DATE" in content
     assert "--release-date" in content
     assert "20260730" not in content
 
 
-def test_combined_ufs_requires_azure_results():
+def test_combined_zfs_requires_four_azure_results():
     content = _workflow_content()
     stage = content[content.index("\n  stage:") : content.index("\n  publish:")]
     assert "needs.azure_acceptance.result == 'success'" in stage
     assert "AZURE_RESULTS_DIR: .release/freebsd15/azure-results" in stage
+    assert 'test "$count" -eq "$EXPECTED_ASSET_COUNT"' in stage
+
+
+def test_workflow_default_zfs_model_has_unqualified_four_asset_allowlist():
+    stage_script = Path(
+        SCRIPT
+    ).with_name("freebsd15_stage_release.sh").read_text(encoding="utf-8")
+    for asset in (
+        "FreeBSD-15.1-aarch64.qcow2",
+        "FreeBSD-15.1-x86_64.qcow2",
+        "FreeBSD-15.1-aarch64.core.qcow2",
+        "FreeBSD-15.1-x86_64.core.qcow2",
+    ):
+        assert asset in stage_script
+    assert ".zfs.qcow2" not in stage_script
+    assert "aarch64-zfs-core" in stage_script
+    assert "x86_64-zfs-core" in stage_script
+
+
+def test_validation_only_zfs_never_reaches_publication():
+    content = _workflow_content()
+    publish = content[content.index("\n  publish:") :]
+    assert "inputs.validation_only == false" in publish
+    assert "github.repository == 'cataggar/zvmi'" in publish
+    assert "github.ref == 'refs/heads/main'" in publish

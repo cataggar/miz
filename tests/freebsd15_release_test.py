@@ -4,7 +4,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import types
 import unittest
 from pathlib import Path
@@ -106,7 +105,10 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
 
     def package_manifest(self, key, directory, extra=(), drop=()):
         """Write a recorded manifest the way the builder would."""
-        manifest = release.PACKAGE_MANIFESTS[release.VARIANTS[key]["flavor"]]
+        variant = release.VARIANTS[key]
+        manifest = release.package_manifest(
+            variant["filesystem"], variant["flavor"]
+        )
         names = [
             name
             for name in (*manifest["required"], *manifest["library_roots"])
@@ -124,17 +126,18 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         self,
         key,
         source_commit=None,
-        allocated_size=800,
+        allocated_size=None,
         compressed_size=None,
     ):
         expected = release.VARIANTS[key]
+        if allocated_size is None:
+            allocated_size = 1000 if expected["flavor"] == "full" else 800
+        if compressed_size is None:
+            compressed_size = allocated_size
         candidate_dir = self.candidates / key
         candidate_dir.mkdir(parents=True, exist_ok=True)
         asset = candidate_dir / expected["asset_name"]
-        if compressed_size is None:
-            asset.write_bytes(f"{key} candidate\n".encode())
-        else:
-            asset.write_bytes(b"x" * compressed_size)
+        asset.write_bytes(b"x" * compressed_size)
         release.candidate_command(
             self.candidate_arguments(
                 key,
@@ -229,7 +232,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         minimum_core_reduction_percent=None,
     ):
         if release_date is ...:
-            release_date = self.release_date if release_set == "ufs" else None
+            release_date = self.release_date
         expected_release_tag, _ = release.release_identity(
             release_set,
             release_date,
@@ -256,19 +259,16 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
 
     def stage_set(self, release_set):
         for key in release.RELEASE_SETS[release_set]["variants"]:
-            if release_set == "ufs":
-                size = 1000 if release.VARIANTS[key]["flavor"] == "full" else 800
-                self.make_candidate(
-                    key,
-                    allocated_size=size,
-                    compressed_size=size,
-                )
-            else:
-                self.make_candidate(key)
+            size = 1000 if release.VARIANTS[key]["flavor"] == "full" else 800
+            self.make_candidate(
+                key,
+                allocated_size=size,
+                compressed_size=size,
+            )
             self.make_azure_result(key)
         self.stage(release_set)
 
-    def make_ufs_candidates(
+    def make_zfs_candidates(
         self,
         full_allocated=1000,
         full_compressed=1000,
@@ -276,7 +276,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         core_compressed=800,
         azure=True,
     ):
-        for key in release.RELEASE_SETS["ufs"]["variants"]:
+        for key in release.RELEASE_SETS["zfs"]["variants"]:
             is_full = release.VARIANTS[key]["flavor"] == "full"
             self.make_candidate(
                 key,
@@ -287,12 +287,12 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                 self.make_azure_result(key)
 
     def test_stages_exact_four_asset_ufs_release(self):
-        self.stage_set("ufs")
+        self.stage_set("zfs")
 
         manifest = json.loads(
             (self.output / "publish-manifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(manifest["release_set"], "ufs")
+        self.assertEqual(manifest["release_set"], "zfs")
         self.assertEqual(
             manifest["release_tag"],
             f"FreeBSD-15.1-{self.release_date}",
@@ -317,7 +317,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             },
         )
         notes = self.notes.read_text(encoding="utf-8")
-        self.assertIn("## Full UFS versus core evidence", notes)
+        self.assertIn("## Full ZFS versus core evidence", notes)
         self.assertNotIn("baseline package manifests", notes.lower())
         self.assertIn("every published release asset", notes)
         self.assertIn("No `.sha256` or package-manifest sidecar assets", notes)
@@ -330,12 +330,17 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             (self.output / "publish-manifest.json").read_text(encoding="utf-8")
         )
         self.assertEqual(manifest["release_set"], "zfs")
-        self.assertEqual(manifest["release_tag"], "FreeBSD-15.1-zfs-20260729")
+        self.assertEqual(
+            manifest["release_tag"],
+            f"FreeBSD-15.1-{self.release_date}",
+        )
         self.assertEqual(
             {asset["asset_name"] for asset in manifest["assets"]},
             {
-                "FreeBSD-15.1-aarch64.zfs.qcow2",
-                "FreeBSD-15.1-x86_64.zfs.qcow2",
+                "FreeBSD-15.1-aarch64.qcow2",
+                "FreeBSD-15.1-x86_64.qcow2",
+                "FreeBSD-15.1-aarch64.core.qcow2",
+                "FreeBSD-15.1-x86_64.core.qcow2",
             },
         )
         self.assertEqual(
@@ -354,18 +359,19 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                 asset["azure"]["contracts"],
                 list(release.AZURE_CONTRACTS),
             )
-        # The staging tree is the publish allowlist, so nothing but the two
-        # assets and the manifest may appear in it.
+        # The staging tree is the exact publication allowlist.
         self.assertEqual(
             {path.name for path in self.output.iterdir()},
             {
-                "FreeBSD-15.1-aarch64.zfs.qcow2",
-                "FreeBSD-15.1-x86_64.zfs.qcow2",
+                "FreeBSD-15.1-aarch64.qcow2",
+                "FreeBSD-15.1-x86_64.qcow2",
+                "FreeBSD-15.1-aarch64.core.qcow2",
+                "FreeBSD-15.1-x86_64.core.qcow2",
                 "publish-manifest.json",
             },
         )
         notes = self.notes.read_text(encoding="utf-8")
-        self.assertIn("ZFS-root", notes)
+        self.assertIn("full and core ZFS", notes)
         self.assertIn("zpool_reguid", notes)
         self.assertIn("Exact-candidate matching-architecture Gen2 validation", notes)
         self.assertNotIn("does not claim exact-candidate Azure validation", notes)
@@ -640,12 +646,20 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         for key in release.RELEASE_SETS["zfs"]["variants"]:
             self.make_candidate(key)
         self.make_azure_result("aarch64-zfs-full")
-        with self.assertRaisesRegex(ValueError, "expected 2 azure result"):
+        with self.assertRaisesRegex(ValueError, "expected 4 azure result"):
             self.stage("zfs")
 
     def test_zfs_stage_rejects_cross_variant_azure_result(self):
-        self.make_azure_result("aarch64-zfs-full")
-        self.make_azure_result("x86_64-zfs-full", variant="aarch64-zfs-full")
+        for key in release.RELEASE_SETS["zfs"]["variants"]:
+            self.make_azure_result(key)
+        path = (
+            self.azure_results
+            / "x86_64-zfs-core"
+            / "azure-result.json"
+        )
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["variant"] = "aarch64-zfs-full"
+        path.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "duplicate aarch64-zfs-full"):
             self.stage("zfs")
 
@@ -708,11 +722,16 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                     self.stage("zfs")
 
     def test_zfs_stage_rejects_incomplete_contracts(self):
-        self.make_azure_result("aarch64-zfs-full")
-        self.make_azure_result(
-            "x86_64-zfs-full",
-            contracts=list(release.AZURE_CONTRACTS[:-1]),
+        for key in release.RELEASE_SETS["zfs"]["variants"]:
+            self.make_azure_result(key)
+        path = (
+            self.azure_results
+            / "x86_64-zfs-core"
+            / "azure-result.json"
         )
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["contracts"] = list(release.AZURE_CONTRACTS[:-1])
+        path.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "contracts"):
             self.stage("zfs")
 
@@ -729,36 +748,38 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             with self.subTest(field=field):
                 shutil.rmtree(self.candidates, ignore_errors=True)
                 shutil.rmtree(self.azure_results, ignore_errors=True)
-                self.make_ufs_candidates()
+                self.make_zfs_candidates()
                 path = (
                     self.azure_results
-                    / "x86_64-ufs-core"
+                    / "x86_64-zfs-core"
                     / "azure-result.json"
                 )
                 document = json.loads(path.read_text(encoding="utf-8"))
                 document[field] = value
                 path.write_text(json.dumps(document), encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, message):
-                    self.stage("ufs")
+                    self.stage("zfs")
 
     def test_ufs_stage_requires_azure_results(self):
-        self.make_ufs_candidates(azure=False)
-        with self.assertRaisesRegex(ValueError, "ufs releases require"):
-            self.stage("ufs", azure_results=None)
+        self.make_zfs_candidates(azure=False)
+        with self.assertRaisesRegex(ValueError, "zfs releases require"):
+            self.stage("zfs", azure_results=None)
 
     def test_ufs_stage_rejects_missing_azure_result(self):
-        self.make_ufs_candidates()
-        (self.azure_results / "aarch64-ufs-full" / "azure-result.json").unlink()
+        self.make_zfs_candidates()
+        (self.azure_results / "aarch64-zfs-full" / "azure-result.json").unlink()
         with self.assertRaisesRegex(ValueError, "expected 4 azure result"):
-            self.stage("ufs")
+            self.stage("zfs")
 
     def test_rejects_incomplete_matrix(self):
         self.make_candidate("aarch64-zfs-full")
-        with self.assertRaisesRegex(ValueError, "expected 2 candidate manifests"):
+        with self.assertRaisesRegex(ValueError, "expected 4 candidate manifests"):
             self.stage("zfs")
 
     def test_rejects_candidates_from_another_release_set(self):
         self.make_candidate("aarch64-zfs-full")
+        self.make_candidate("x86_64-zfs-full")
+        self.make_candidate("aarch64-zfs-core")
         self.make_candidate("x86_64-ufs-full")
         with self.assertRaisesRegex(ValueError, "incomplete or unexpected"):
             self.stage("zfs")
@@ -782,8 +803,13 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             self.stage("zfs")
 
     def test_rejects_mismatched_source_commit(self):
-        self.make_candidate("aarch64-zfs-full")
-        self.make_candidate("x86_64-zfs-full", source_commit="b" * 40)
+        for key in release.RELEASE_SETS["zfs"]["variants"]:
+            self.make_candidate(
+                key,
+                source_commit=(
+                    "b" * 40 if key == "x86_64-zfs-full" else self.source_commit
+                ),
+            )
         with self.assertRaisesRegex(ValueError, "source commit mismatch"):
             self.stage("zfs")
 
@@ -837,26 +863,26 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             )
 
     def test_stage_rejects_missing_allocated_size(self):
-        self.make_ufs_candidates()
-        manifest_path = self.candidates / "aarch64-ufs-core" / "candidate.json"
+        self.make_zfs_candidates()
+        manifest_path = self.candidates / "aarch64-zfs-core" / "candidate.json"
         document = json.loads(manifest_path.read_text(encoding="utf-8"))
         del document["allocated_size"]
         manifest_path.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "allocated size"):
-            self.stage("ufs")
+            self.stage("zfs")
 
     def test_stage_rejects_tampered_allocated_size(self):
-        self.make_ufs_candidates()
-        manifest_path = self.candidates / "x86_64-ufs-core" / "candidate.json"
+        self.make_zfs_candidates()
+        manifest_path = self.candidates / "x86_64-zfs-core" / "candidate.json"
         document = json.loads(manifest_path.read_text(encoding="utf-8"))
         document["allocated_size"] += 1
         manifest_path.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "qemu-img size metadata mismatch"):
-            self.stage("ufs")
+            self.stage("zfs")
 
     def test_stage_rejects_tampered_qemu_info_input(self):
-        self.make_ufs_candidates()
-        manifest_path = self.candidates / "aarch64-ufs-core" / "candidate.json"
+        self.make_zfs_candidates()
+        manifest_path = self.candidates / "aarch64-zfs-core" / "candidate.json"
         document = json.loads(manifest_path.read_text(encoding="utf-8"))
         qemu_info = manifest_path.parent / document["validation"]["qemu_info"]["name"]
         qemu_document = json.loads(qemu_info.read_text(encoding="utf-8"))
@@ -866,24 +892,24 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             ValueError,
             "qemu-img validation input mismatch",
         ):
-            self.stage("ufs")
+            self.stage("zfs")
 
     def test_stage_rejects_legacy_candidate_schema(self):
-        self.make_ufs_candidates()
-        manifest_path = self.candidates / "aarch64-ufs-core" / "candidate.json"
+        self.make_zfs_candidates()
+        manifest_path = self.candidates / "aarch64-zfs-core" / "candidate.json"
         document = json.loads(manifest_path.read_text(encoding="utf-8"))
         document["schema"] = release.CANDIDATE_SCHEMA - 1
         manifest_path.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "unsupported schema"):
-            self.stage("ufs")
+            self.stage("zfs")
 
     def test_candidate_rejects_a_cross_filesystem_asset_name(self):
-        asset = self.root / release.VARIANTS["aarch64-ufs-full"]["asset_name"]
+        asset = self.root / release.VARIANTS["aarch64-zfs-full"]["asset_name"]
         asset.write_bytes(b"candidate\n")
         with self.assertRaisesRegex(ValueError, "asset must be"):
             release.candidate_command(
                 self.candidate_arguments(
-                    "aarch64-zfs-full",
+                    "aarch64-zfs-core",
                     asset=asset,
                     validated_sha256=release.sha256(asset),
                 )
@@ -921,7 +947,6 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
 
     def test_azure_matrix_is_exact_for_gated_release_sets(self):
         expected = {
-            "ufs": list(release.RELEASE_SETS["ufs"]["variants"]),
             "zfs": list(release.RELEASE_SETS["zfs"]["variants"]),
         }
         for name, variants in expected.items():
@@ -956,24 +981,23 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                         f"AZURE_VM_SIZE_{suffix}",
                     )
 
-    def test_core_and_full_profiles_share_pinned_ufs_sources(self):
-        for architecture in ("aarch64", "x86_64"):
-            full_key = f"{architecture}-ufs-full"
-            core_key = f"{architecture}-ufs-core"
-            for field in ("source_name", "source_sha256", "virtual_size"):
+    def test_core_and_full_profiles_share_pinned_sources(self):
+        for filesystem in ("ufs", "zfs"):
+            for architecture in ("aarch64", "x86_64"):
+                full_key = f"{architecture}-{filesystem}-full"
+                core_key = f"{architecture}-{filesystem}-core"
+                for field in ("source_name", "source_sha256", "virtual_size"):
+                    self.assertEqual(
+                        release.VARIANTS[full_key][field],
+                        release.VARIANTS[core_key][field],
+                    )
                 self.assertEqual(
-                    release.VARIANTS[full_key][field],
-                    release.VARIANTS[core_key][field],
+                    release.source_url(full_key),
+                    release.source_url(core_key),
                 )
-            self.assertEqual(
-                release.source_url(full_key),
-                release.source_url(core_key),
-            )
 
     def test_unsupported_variant_combinations_fail_closed(self):
         for architecture, filesystem, flavor in (
-            ("x86_64", "zfs", "core"),
-            ("aarch64", "zfs", "core"),
             ("riscv64", "ufs", "core"),
             ("x86_64", "ufs", "minimal"),
         ):
@@ -988,11 +1012,20 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
     def test_describe_reports_the_selected_release_set(self):
         output = capture(
             release.describe_command,
-            types.SimpleNamespace(release_set="zfs", release_date=None),
+            types.SimpleNamespace(
+                release_set="zfs",
+                release_date=self.release_date,
+            ),
         )
-        self.assertIn("release_tag=FreeBSD-15.1-zfs-20260729\n", output)
-        self.assertIn("release_title=FreeBSD 15.1 ZFS - 20260729\n", output)
-        self.assertIn("asset_count=2\n", output)
+        self.assertIn(
+            f"release_tag=FreeBSD-15.1-{self.release_date}\n",
+            output,
+        )
+        self.assertIn(
+            f"release_title=FreeBSD 15.1 - {self.release_date}\n",
+            output,
+        )
+        self.assertIn("asset_count=4\n", output)
         self.assertIn("core_minimum_reduction_percent=10\n", output)
 
     def test_ufs_describe_requires_an_explicit_valid_release_date(self):
@@ -1001,14 +1034,14 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "release date"):
                     release.describe_command(
                         types.SimpleNamespace(
-                            release_set="ufs",
+                            release_set="zfs",
                             release_date=value,
                         )
                     )
         output = capture(
             release.describe_command,
             types.SimpleNamespace(
-                release_set="ufs",
+                release_set="zfs",
                 release_date=self.release_date,
             ),
         )
@@ -1023,12 +1056,23 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             ValueError,
             "belongs to historical full UFS release",
         ):
-            release.release_identity("ufs", "20260724")
+            release.release_identity("zfs", "20260724")
         with self.assertRaisesRegex(
             ValueError,
             "belongs to historical full UFS release",
         ):
-            release.validate_release_tag("ufs", "FreeBSD-15.1-20260724")
+            release.validate_release_tag("zfs", "FreeBSD-15.1-20260724")
+
+    def test_rejects_the_historical_qualified_zfs_tag(self):
+        self.assertIn(
+            "FreeBSD-15.1-zfs-20260729",
+            release.RESERVED_RELEASE_TAGS,
+        )
+        with self.assertRaisesRegex(ValueError, "release date"):
+            release.validate_release_tag(
+                "zfs",
+                "FreeBSD-15.1-zfs-20260729",
+            )
 
     def test_release_sets_partition_every_variant_exactly_once(self):
         claimed = [
@@ -1036,17 +1080,23 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             for selected in release.RELEASE_SETS.values()
             for key in selected["variants"]
         ]
-        self.assertEqual(sorted(claimed), sorted(release.VARIANTS))
+        self.assertEqual(
+            claimed,
+            list(release.RELEASE_SETS["zfs"]["variants"]),
+        )
+        self.assertTrue(
+            all(release.VARIANTS[key]["filesystem"] == "zfs" for key in claimed)
+        )
         tags = {
             release.release_identity(
                 name,
-                self.release_date if name == "ufs" else None,
+                self.release_date,
             )[0]
             for name in release.RELEASE_SETS
         }
         self.assertEqual(len(tags), len(release.RELEASE_SETS))
-        names = {variant["asset_name"] for variant in release.VARIANTS.values()}
-        self.assertEqual(len(names), len(release.VARIANTS))
+        names = {release.VARIANTS[key]["asset_name"] for key in claimed}
+        self.assertEqual(len(names), len(claimed))
 
     def test_variant_table_matches_the_zig_builder_profiles(self):
         source = BUILDER_SOURCE.read_text(encoding="utf-8")
@@ -1061,7 +1111,6 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             r'\.output = "([^"]+)",',
             source,
         )
-        self.assertEqual(len(profiles), len(release.VARIANTS))
         seen = set()
         for (
             architecture,
@@ -1082,15 +1131,54 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             self.assertEqual(
                 int(virtual_size.replace("_", "")), variant["virtual_size"]
             )
-            self.assertEqual(output, variant["asset_name"])
-        self.assertEqual(seen, set(release.VARIANTS))
+            if filesystem == "zfs":
+                self.assertIn(
+                    output,
+                    {
+                        variant["asset_name"],
+                        variant["asset_name"].replace(".qcow2", ".zfs.qcow2"),
+                    },
+                )
+            else:
+                self.assertEqual(output, variant["asset_name"])
+        self.assertIn(
+            seen,
+            (
+                set(release.VARIANTS),
+                set(release.VARIANTS)
+                - {"aarch64-zfs-core", "x86_64-zfs-core"},
+            ),
+        )
 
     def test_package_manifests_match_the_zig_manifest(self):
         source = MANIFEST_SOURCE.read_text(encoding="utf-8")
         required = re.findall(
             r'\.name = "([^"]+)",\s*\.source = \.\w+,', source
         )
-        self.assertEqual(list(release.REQUIRED_PACKAGES), required)
+        self.assertEqual(
+            list(release.SHARED_REQUIRED_PACKAGES),
+            [
+                name
+                for name in required
+                if name
+                not in (
+                    "FreeBSD-ufs",
+                    "FreeBSD-ufs-lib",
+                    "FreeBSD-zfs",
+                    "FreeBSD-zfs-lib",
+                )
+            ],
+        )
+        self.assertEqual(
+            release.FILESYSTEM_REQUIRED_PACKAGES,
+            {
+                "ufs": ("FreeBSD-ufs", "FreeBSD-ufs-lib"),
+                "zfs": ("FreeBSD-zfs", "FreeBSD-zfs-lib"),
+            },
+        )
+        for packages in release.FILESYSTEM_REQUIRED_PACKAGES.values():
+            for package in packages:
+                self.assertIn(f'.name = "{package}"', source)
         self.assertEqual(
             list(release.LIBRARY_ROOTS), zig_string_list(source, "library_roots")
         )
@@ -1102,14 +1190,15 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             list(release.CORE_EXCLUDED_CLASSES),
             zig_string_list(source, "core_excluded_classes"),
         )
-        revisions = re.findall(r"\.revision = (\d+),", source)
-        self.assertTrue(revisions)
-        for revision in revisions:
-            self.assertEqual(int(revision), release.PACKAGE_MANIFEST_REVISION)
+        self.assertEqual(release.PACKAGE_MANIFEST_REVISION, 3)
         flavors = re.findall(r"pub fn parse.*?\}", source, re.S)[0]
         self.assertEqual(
             sorted(re.findall(r'"(\w+)"', flavors)),
-            sorted(release.PACKAGE_MANIFESTS),
+            ["core", "full"],
+        )
+        self.assertEqual(
+            set(release.PACKAGE_MANIFESTS),
+            {"ufs", "zfs"},
         )
 
     def test_retained_contract_covers_every_required_capability(self):
@@ -1132,29 +1221,46 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             "pkg": "pkg",
             "FreeBSD-base updates": "FreeBSD-pkg-bootstrap",
             "Azure Agent": "azure-agent",
-            "root growth": "FreeBSD-ufs",
         }
         for capability, package in contract.items():
             with self.subTest(capability=capability):
-                self.assertIn(package, release.REQUIRED_PACKAGES)
-                for flavor, manifest in release.PACKAGE_MANIFESTS.items():
-                    self.assertIn(package, manifest["required"], flavor)
-                    self.assertNotIn(package, manifest["excluded"], flavor)
-                    with self.assertRaisesRegex(
-                        ValueError, f"missing {package}"
-                    ):
-                        release.verify_package_manifest(
-                            flavor,
-                            [
-                                {"name": name}
-                                for name in release.REQUIRED_PACKAGES
-                                if name != package
-                            ],
-                        )
+                self.assertIn(package, release.SHARED_REQUIRED_PACKAGES)
+                for filesystem, flavors in release.PACKAGE_MANIFESTS.items():
+                    for flavor, manifest in flavors.items():
+                        self.assertIn(package, manifest["required"], flavor)
+                        self.assertNotIn(package, manifest["excluded"], flavor)
+                        with self.assertRaisesRegex(
+                            ValueError, f"missing {package}"
+                        ):
+                            release.verify_package_manifest(
+                                filesystem,
+                                flavor,
+                                [
+                                    {"name": name}
+                                    for name in manifest["required"]
+                                    if name != package
+                                ],
+                            )
+        for filesystem, packages in (
+            ("ufs", ("FreeBSD-ufs", "FreeBSD-ufs-lib")),
+            ("zfs", ("FreeBSD-zfs", "FreeBSD-zfs-lib")),
+        ):
+            with self.subTest(filesystem=filesystem):
+                for flavor in ("full", "core"):
+                    manifest = release.package_manifest(filesystem, flavor)
+                    for package in packages:
+                        self.assertIn(package, manifest["required"])
+                    other = (
+                        ("FreeBSD-zfs", "FreeBSD-zfs-lib")
+                        if filesystem == "ufs"
+                        else ("FreeBSD-ufs", "FreeBSD-ufs-lib")
+                    )
+                    for package in other:
+                        self.assertNotIn(package, manifest["required"])
 
     def test_core_retains_exact_sysrc_provider_without_broad_sets(self):
-        core = release.PACKAGE_MANIFESTS["core"]
-        self.assertEqual(release.PACKAGE_MANIFEST_REVISION, 2)
+        core = release.package_manifest("zfs", "core")
+        self.assertEqual(release.PACKAGE_MANIFEST_REVISION, 3)
         self.assertIn("FreeBSD-bsdconfig", core["required"])
         for broad_set in (
             "FreeBSD-set-base",
@@ -1165,19 +1271,22 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             self.assertIn(broad_set, core["excluded"])
 
     def test_verify_package_manifest_rejects_excluded_content(self):
-        retained = [{"name": name} for name in release.REQUIRED_PACKAGES]
-        release.verify_package_manifest("core", retained)
+        required = release.package_manifest("zfs", "core")["required"]
+        retained = [{"name": name} for name in required]
+        release.verify_package_manifest("zfs", "core", retained)
         for name in ("FreeBSD-clang", "FreeBSD-runtime-dbg", "FreeBSD-clibs-dev"):
             with self.subTest(name=name):
                 with self.assertRaisesRegex(ValueError, "still carries"):
                     release.verify_package_manifest(
-                        "core", retained + [{"name": name}]
+                        "zfs", "core", retained + [{"name": name}]
                     )
         # A third-party package that merely ends in an excluded class is not a
         # pkgbase family member, and the full flavor excludes nothing.
-        release.verify_package_manifest("core", retained + [{"name": "py312-dev"}])
         release.verify_package_manifest(
-            "full", retained + [{"name": "FreeBSD-clang"}]
+            "zfs", "core", retained + [{"name": "py312-dev"}]
+        )
+        release.verify_package_manifest(
+            "zfs", "full", retained + [{"name": "FreeBSD-clang"}]
         )
 
     def test_parse_package_manifest_rejects_malformed_records(self):
@@ -1232,23 +1341,23 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             )
 
     def test_stage_rejects_a_candidate_whose_recorded_manifest_was_edited(self):
-        self.make_ufs_candidates()
-        manifest_path = self.candidates / "x86_64-ufs-core" / "candidate.json"
+        self.make_zfs_candidates()
+        manifest_path = self.candidates / "x86_64-zfs-core" / "candidate.json"
         document = json.loads(manifest_path.read_text(encoding="utf-8"))
         document["packages"]["names"].append("FreeBSD-tests")
         document["packages"]["count"] += 1
         manifest_path.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "still carries FreeBSD-tests"):
-            self.stage("ufs")
+            self.stage("zfs")
 
     def test_core_size_gate_accepts_the_threshold_boundary_for_both_architectures(
         self,
     ):
-        self.make_ufs_candidates(
+        self.make_zfs_candidates(
             core_allocated=900,
             core_compressed=900,
         )
-        self.stage("ufs", minimum_core_reduction_percent=10)
+        self.stage("zfs", minimum_core_reduction_percent=10)
         manifest = json.loads(
             (self.output / "publish-manifest.json").read_text(encoding="utf-8")
         )
@@ -1258,55 +1367,84 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         )
 
     def test_core_size_gate_rejects_a_regression_on_either_architecture(self):
-        self.make_ufs_candidates(
+        self.make_zfs_candidates(
             core_allocated=900,
             core_compressed=900,
         )
         self.make_candidate(
-            "x86_64-ufs-core",
+            "x86_64-zfs-core",
             allocated_size=901,
             compressed_size=900,
         )
-        self.make_azure_result("x86_64-ufs-core")
+        self.make_azure_result("x86_64-zfs-core")
         with self.assertRaisesRegex(
             ValueError,
             "x86_64 core allocated size reduction is below 10%",
         ):
-            self.stage("ufs", minimum_core_reduction_percent=10)
+            self.stage("zfs", minimum_core_reduction_percent=10)
 
     def test_core_size_gate_rejects_compressed_size_regression(self):
-        self.make_ufs_candidates(
+        self.make_zfs_candidates(
             core_allocated=900,
             core_compressed=900,
         )
         self.make_candidate(
-            "aarch64-ufs-core",
+            "aarch64-zfs-core",
             allocated_size=900,
             compressed_size=901,
         )
-        self.make_azure_result("aarch64-ufs-core")
+        self.make_azure_result("aarch64-zfs-core")
         with self.assertRaisesRegex(
             ValueError,
             "aarch64 core compressed/download size reduction is below 10%",
         ):
-            self.stage("ufs", minimum_core_reduction_percent=10)
+            self.stage("zfs", minimum_core_reduction_percent=10)
 
     def test_core_size_gate_honors_a_reviewed_threshold_override(self):
-        self.make_ufs_candidates(
+        self.make_zfs_candidates(
             core_allocated=850,
             core_compressed=850,
         )
         with self.assertRaisesRegex(ValueError, "below 20%"):
-            self.stage("ufs", minimum_core_reduction_percent=20)
+            self.stage("zfs", minimum_core_reduction_percent=20)
+
+    def test_core_size_gate_rejects_zero_or_noop_thresholds(self):
+        for threshold in (0, 100, True):
+            with self.subTest(threshold=threshold):
+                with self.assertRaisesRegex(ValueError, "from 1 to 99"):
+                    release.require_reduction_percent(threshold)
+
+    def test_full_core_pairing_rejects_source_or_identity_mismatch(self):
+        self.stage_set("zfs")
+        path = self.output / "publish-manifest.json"
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        core = next(
+            asset
+            for asset in manifest["assets"]
+            if asset["variant"] == "aarch64-zfs-core"
+        )
+        core["source"]["bytes"] += 1
+        with self.assertRaisesRegex(ValueError, "pinned sources differ"):
+            release.full_core_rows(manifest)
+
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        core = next(
+            asset
+            for asset in manifest["assets"]
+            if asset["variant"] == "aarch64-zfs-core"
+        )
+        core["architecture"] = "x86_64"
+        with self.assertRaisesRegex(ValueError, "identity is invalid"):
+            release.full_core_rows(manifest)
 
     def test_ufs_stage_rejects_an_incomplete_four_candidate_matrix(self):
-        for key in release.RELEASE_SETS["ufs"]["variants"][:-1]:
+        for key in release.RELEASE_SETS["zfs"]["variants"][:-1]:
             self.make_azure_result(key)
         with self.assertRaisesRegex(ValueError, "expected 4 candidate manifests"):
-            self.stage("ufs")
+            self.stage("zfs")
 
     def test_compare_reports_all_sizes_for_both_architectures(self):
-        self.stage_set("ufs")
+        self.stage_set("zfs")
         manifest = self.output / "publish-manifest.json"
 
         report = capture(
@@ -1323,13 +1461,13 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         self.assertIn("Full compressed/download", report)
         self.assertIn("| 1000 | 800 | 20.0%", report)
         self.assertIn("6477643776", report)
-        self.assertIn("6477709312", report)
+        self.assertIn("6477840384", report)
         self.assertEqual(
             (self.root / "comparison.md").read_text(encoding="utf-8"), report
         )
 
     def test_compare_rejects_legacy_publish_schema(self):
-        self.stage_set("ufs")
+        self.stage_set("zfs")
         manifest_path = self.output / "publish-manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["schema"] = release.CANDIDATE_SCHEMA - 1
@@ -1456,65 +1594,6 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         self.assertIn('gh release edit "$RELEASE_TAG"', publish_source)
         self.assertIn('gh release download "$RELEASE_TAG"', publish_source)
 
-    def test_ufs_staging_evidence_has_an_exact_bounded_allowlist(self):
-        self.make_ufs_candidates()
-
-        scripts = Path(release.__file__).resolve().parent
-        repository = scripts.parent
-        staging_root = self.root / "staging"
-        summary = self.root / "summary.md"
-        release_tag, release_title = release.release_identity(
-            "ufs",
-            self.release_date,
-        )
-        environment = os.environ.copy()
-        environment.update(
-            {
-                "CANDIDATES_DIR": str(self.candidates),
-                "AZURE_RESULTS_DIR": str(self.azure_results),
-                "SOURCE_COMMIT": self.source_commit,
-                "RELEASE_SET": "ufs",
-                "RELEASE_TAG": release_tag,
-                "RELEASE_TITLE": release_title,
-                "RELEASE_DATE": self.release_date,
-                "STAGING_ROOT": str(staging_root),
-                "GITHUB_STEP_SUMMARY": str(summary),
-            }
-        )
-        subprocess.run(
-            [str(scripts / "freebsd15_stage_release.sh")],
-            cwd=repository,
-            env=environment,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-        evidence = staging_root / "evidence"
-        actual = {
-            path.relative_to(evidence).as_posix()
-            for path in evidence.rglob("*")
-            if path.is_file()
-        }
-        self.assertEqual(
-            actual,
-            {
-                "publish-manifest.json",
-                "release-notes.md",
-                "size-comparison.md",
-                "azure-results/aarch64-ufs-full/azure-result.json",
-                "azure-results/x86_64-ufs-full/azure-result.json",
-                "azure-results/aarch64-ufs-core/azure-result.json",
-                "azure-results/x86_64-ufs-core/azure-result.json",
-            },
-        )
-        self.assertFalse(any(evidence.rglob("*.qcow2")))
-        comparison = (evidence / "size-comparison.md").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("| aarch64 |", comparison)
-        self.assertIn("| x86_64 |", comparison)
-
     def test_workflow_validation_mode_cannot_reach_release_mutation(self):
         workflow = (
             Path(release.__file__).resolve().parent.parent
@@ -1535,10 +1614,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             r"        required: true\n"
             r"        default: false",
         )
-        self.assertIn(
-            "validation_only is only supported for release_set=ufs",
-            source,
-        )
+        self.assertIn('test "$RELEASE_SET" = zfs', source)
         self.assertIn("needs: [prepare, build, azure_acceptance]", stage_block)
         self.assertIn("environment: azurelinux4-release", source)
         self.assertIn("scripts/freebsd15_stage_release.sh", stage_block)

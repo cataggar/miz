@@ -7,16 +7,15 @@ on:
         description: Which FreeBSD 15.1 release set to build and publish
         type: choice
         required: true
-        default: ufs
+        default: zfs
         options:
-          - ufs
           - zfs
       release_date:
-        description: Explicit reviewed YYYYMMDD date for the combined UFS release; leave blank for ZFS
+        description: Explicit reviewed YYYYMMDD date for the combined ZFS release
         type: string
-        required: false
+        required: true
       validation_only:
-        description: Validate the combined UFS release without creating a tag or mutating a GitHub release
+        description: Validate the combined ZFS release without creating a tag or mutating a GitHub release
         type: boolean
         required: true
         default: false
@@ -24,8 +23,7 @@ on:
 permissions:
   contents: read
 
-# Release sets publish disjoint assets under distinct tags, so UFS and ZFS
-# runs may proceed independently; two runs of the same set may not.
+# Only one combined ZFS release run may stage or publish at a time.
 concurrency:
   group: freebsd15-release-${{ inputs.release_set }}
   cancel-in-progress: false
@@ -76,30 +74,22 @@ jobs:
               exit 1
               ;;
           esac
-          if [[ "$VALIDATION_ONLY" == true && "$RELEASE_SET" != ufs ]]; then
-            echo "::error::validation_only is only supported for release_set=ufs"
-            exit 1
-          fi
+          test "$RELEASE_SET" = zfs
+          [[ "$RELEASE_DATE" =~ ^[0-9]{8}$ ]]
           matrix=$(python3 scripts/freebsd15_release.py matrix \
             --release-set "$RELEASE_SET")
           azure_matrix=$(python3 scripts/freebsd15_release.py azure-matrix \
             --release-set "$RELEASE_SET")
+          test "$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["include"]))' "$matrix")" -eq 4
+          test "$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["include"]))' "$azure_matrix")" -eq 4
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "azure_matrix=$azure_matrix" >> "$GITHUB_OUTPUT"
-          describe_args=(--release-set "$RELEASE_SET")
-          if [[ "$RELEASE_SET" == ufs ]]; then
-            [[ "$RELEASE_DATE" =~ ^[0-9]{8}$ ]]
-            describe_args+=(--release-date "$RELEASE_DATE")
-          else
-            test -z "$RELEASE_DATE"
-          fi
           python3 scripts/freebsd15_release.py describe \
-            "${describe_args[@]}" >> "$GITHUB_OUTPUT"
+            --release-set "$RELEASE_SET" \
+            --release-date "$RELEASE_DATE" >> "$GITHUB_OUTPUT"
           echo "Release set: \`$RELEASE_SET\`" >> "$GITHUB_STEP_SUMMARY"
-          if [[ "$RELEASE_SET" == ufs ]]; then
-            echo "Reviewed UFS release date: \`$RELEASE_DATE\`" \
-              >> "$GITHUB_STEP_SUMMARY"
-          fi
+          echo "Reviewed ZFS release date: \`$RELEASE_DATE\`" \
+            >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: build and validate ${{ matrix.variant }}
@@ -502,6 +492,8 @@ jobs:
       ${{
         always() &&
         inputs.validation_only == false &&
+        github.repository == 'cataggar/zvmi' &&
+        github.ref == 'refs/heads/main' &&
         needs.prepare.result == 'success' &&
         needs.stage.result == 'success'
       }}

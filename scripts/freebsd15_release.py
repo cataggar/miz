@@ -25,7 +25,7 @@ VARIANTS = {
         "filesystem": "ufs",
         "flavor": "full",
         "source_directory": "aarch64",
-        "asset_name": "FreeBSD-15.1-aarch64.qcow2",
+        "asset_name": "FreeBSD-15.1-aarch64.ufs.qcow2",
         "source_name": (
             "FreeBSD-15.1-RELEASE-arm64-aarch64-"
             "BASIC-CLOUDINIT-ufs.qcow2.xz"
@@ -42,7 +42,7 @@ VARIANTS = {
         "filesystem": "ufs",
         "flavor": "full",
         "source_directory": "amd64",
-        "asset_name": "FreeBSD-15.1-x86_64.qcow2",
+        "asset_name": "FreeBSD-15.1-x86_64.ufs.qcow2",
         "source_name": (
             "FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz"
         ),
@@ -58,7 +58,7 @@ VARIANTS = {
         "filesystem": "zfs",
         "flavor": "full",
         "source_directory": "aarch64",
-        "asset_name": "FreeBSD-15.1-aarch64.zfs.qcow2",
+        "asset_name": "FreeBSD-15.1-aarch64.qcow2",
         "source_name": (
             "FreeBSD-15.1-RELEASE-arm64-aarch64-"
             "BASIC-CLOUDINIT-zfs.qcow2.xz"
@@ -75,7 +75,7 @@ VARIANTS = {
         "filesystem": "zfs",
         "flavor": "full",
         "source_directory": "amd64",
-        "asset_name": "FreeBSD-15.1-x86_64.zfs.qcow2",
+        "asset_name": "FreeBSD-15.1-x86_64.qcow2",
         "source_name": (
             "FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-zfs.qcow2.xz"
         ),
@@ -86,14 +86,14 @@ VARIANTS = {
         "runner": "ubuntu-24.04",
         "qemu": "/usr/bin/qemu-system-x86_64",
     },
-    # The core variants start from the same pinned UFS sources as the full
-    # ones: only the package manifest the guest realizes differs.
+    # Core variants start from the matching full profile's pinned source;
+    # only the package manifest the guest realizes differs.
     "aarch64-ufs-core": {
         "architecture": "aarch64",
         "filesystem": "ufs",
         "flavor": "core",
         "source_directory": "aarch64",
-        "asset_name": "FreeBSD-15.1-aarch64.core.qcow2",
+        "asset_name": "FreeBSD-15.1-aarch64.ufs.core.qcow2",
         "source_name": (
             "FreeBSD-15.1-RELEASE-arm64-aarch64-"
             "BASIC-CLOUDINIT-ufs.qcow2.xz"
@@ -110,7 +110,7 @@ VARIANTS = {
         "filesystem": "ufs",
         "flavor": "core",
         "source_directory": "amd64",
-        "asset_name": "FreeBSD-15.1-x86_64.core.qcow2",
+        "asset_name": "FreeBSD-15.1-x86_64.ufs.core.qcow2",
         "source_name": (
             "FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz"
         ),
@@ -121,6 +121,41 @@ VARIANTS = {
         "runner": "ubuntu-24.04",
         "qemu": "/usr/bin/qemu-system-x86_64",
     },
+    # Core ZFS variants use the same architecture-specific pinned source as
+    # their full counterparts. Only the reviewed package realization differs.
+    "aarch64-zfs-core": {
+        "architecture": "aarch64",
+        "filesystem": "zfs",
+        "flavor": "core",
+        "source_directory": "aarch64",
+        "asset_name": "FreeBSD-15.1-aarch64.core.qcow2",
+        "source_name": (
+            "FreeBSD-15.1-RELEASE-arm64-aarch64-"
+            "BASIC-CLOUDINIT-zfs.qcow2.xz"
+        ),
+        "source_sha256": (
+            "0911a033b0a5d060486f92e534f3482c6a2ab96af6abb8a60683eeb24f6746af"
+        ),
+        "virtual_size": 6_477_643_776,
+        "runner": "ubuntu-24.04-arm",
+        "qemu": "/usr/bin/qemu-system-aarch64",
+    },
+    "x86_64-zfs-core": {
+        "architecture": "x86_64",
+        "filesystem": "zfs",
+        "flavor": "core",
+        "source_directory": "amd64",
+        "asset_name": "FreeBSD-15.1-x86_64.core.qcow2",
+        "source_name": (
+            "FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-zfs.qcow2.xz"
+        ),
+        "source_sha256": (
+            "4159e137d4a78f46b62d3523edd9a4dc79fd0cdcf17e34e531342f52333f4131"
+        ),
+        "virtual_size": 6_477_840_384,
+        "runner": "ubuntu-24.04",
+        "qemu": "/usr/bin/qemu-system-x86_64",
+    },
 }
 
 # The retained contract and the reviewed exclusions, mirrored from
@@ -128,7 +163,7 @@ VARIANTS = {
 # release helper validates the manifest an image actually recorded without
 # trusting the builder that produced it, exactly as it does for the profile
 # table. tests/freebsd15_release_test.py keeps the two in agreement.
-REQUIRED_PACKAGES = (
+SHARED_REQUIRED_PACKAGES = (
     "FreeBSD-set-minimal",
     "FreeBSD-runtime",
     "FreeBSD-rc",
@@ -150,7 +185,6 @@ REQUIRED_PACKAGES = (
     "FreeBSD-utilities",
     "FreeBSD-vi",
     "FreeBSD-geom",
-    "FreeBSD-ufs",
     "FreeBSD-nuageinit",
     "FreeBSD-flua",
     "FreeBSD-pkg-bootstrap",
@@ -158,6 +192,11 @@ REQUIRED_PACKAGES = (
     "pkg",
     "azure-agent",
 )
+
+FILESYSTEM_REQUIRED_PACKAGES = {
+    "ufs": ("FreeBSD-ufs", "FreeBSD-ufs-lib"),
+    "zfs": ("FreeBSD-zfs", "FreeBSD-zfs-lib"),
+}
 
 LIBRARY_ROOTS = (
     "FreeBSD-audit-lib",
@@ -210,25 +249,28 @@ CORE_EXCLUDED_PACKAGES = (
 
 CORE_EXCLUDED_CLASSES = ("dbg", "dev", "lib32")
 
-PACKAGE_MANIFEST_REVISION = 2
+PACKAGE_MANIFEST_REVISION = 3
 
 PACKAGE_MANIFESTS = {
-    "full": {
-        "revision": PACKAGE_MANIFEST_REVISION,
-        "required": REQUIRED_PACKAGES,
-        "library_roots": (),
-        "excluded": (),
-        "excluded_classes": (),
-        "prunes": False,
-    },
-    "core": {
-        "revision": PACKAGE_MANIFEST_REVISION,
-        "required": REQUIRED_PACKAGES,
-        "library_roots": LIBRARY_ROOTS,
-        "excluded": CORE_EXCLUDED_PACKAGES,
-        "excluded_classes": CORE_EXCLUDED_CLASSES,
-        "prunes": True,
-    },
+    filesystem: {
+        "full": {
+            "revision": PACKAGE_MANIFEST_REVISION,
+            "required": (*SHARED_REQUIRED_PACKAGES, *required),
+            "library_roots": (),
+            "excluded": (),
+            "excluded_classes": (),
+            "prunes": False,
+        },
+        "core": {
+            "revision": PACKAGE_MANIFEST_REVISION,
+            "required": (*SHARED_REQUIRED_PACKAGES, *required),
+            "library_roots": LIBRARY_ROOTS,
+            "excluded": CORE_EXCLUDED_PACKAGES,
+            "excluded_classes": CORE_EXCLUDED_CLASSES,
+            "prunes": True,
+        },
+    }
+    for filesystem, required in FILESYSTEM_REQUIRED_PACKAGES.items()
 }
 
 SOURCE_URL_PREFIX = (
@@ -240,18 +282,18 @@ SOURCE_URL_PREFIX = (
 # what lets the publisher refuse an incomplete or unexpected upload without
 # consulting a second source of truth.
 RELEASE_SETS = {
-    "ufs": {
+    "zfs": {
         "release_tag_prefix": "FreeBSD-15.1-",
         "release_title_prefix": "FreeBSD 15.1 - ",
         "requires_release_date": True,
         "variants": (
-            "aarch64-ufs-full",
-            "x86_64-ufs-full",
-            "aarch64-ufs-core",
-            "x86_64-ufs-core",
+            "aarch64-zfs-full",
+            "x86_64-zfs-full",
+            "aarch64-zfs-core",
+            "x86_64-zfs-core",
         ),
         "summary": (
-            "Generalized FreeBSD 15.1-RELEASE full and core UFS images built "
+            "Generalized FreeBSD 15.1-RELEASE full and core ZFS images built "
             "with zvmi."
         ),
         "highlights": (
@@ -260,21 +302,6 @@ RELEASE_SETS = {
             "file.",
             "The core flavor is realized by pkg from an explicit, reviewed "
             "pkgbase manifest, not by deleting files from a full image.",
-            "First boot grows the UFS root partition and filesystem to fill a "
-            "larger disk without disturbing GPT metadata.",
-        ),
-    },
-    "zfs": {
-        "release_tag": "FreeBSD-15.1-zfs-20260729",
-        "release_title": "FreeBSD 15.1 ZFS - 20260729",
-        "variants": ("aarch64-zfs-full", "x86_64-zfs-full"),
-        "summary": (
-            "Generalized FreeBSD 15.1-RELEASE ZFS-root images built with zvmi."
-        ),
-        "highlights": (
-            "Added matching AArch64 and x86_64 ZFS-root release images.",
-            "Each asset is a standalone zstd-compressed QCOW2 with no backing "
-            "file.",
             "First boot grows the last GPT partition and onlines the enlarged "
             "`zroot` vdev; `autoexpand` keeps later enlargements working.",
             "`zpool_reguid` gives every instance a distinct pool GUID.",
@@ -282,13 +309,12 @@ RELEASE_SETS = {
     },
 }
 
-UFS_CORE_VARIANTS = ("aarch64-ufs-core", "x86_64-ufs-core")
-
 # Historical tags remain published but are not dispatchable release sets.
 # Keeping their ownership explicit prevents the broad combined UFS prefix
 # from targeting an existing release.
 RESERVED_RELEASE_TAGS = {
     "FreeBSD-15.1-20260724": "historical full UFS release",
+    "FreeBSD-15.1-zfs-20260729": "historical ZFS release",
 }
 
 AZURE_SHARED_CONTRACTS_BEFORE_STORAGE = (
@@ -327,10 +353,10 @@ COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 RELEASE_DATE_RE = re.compile(r"^[0-9]{8}$")
 CANDIDATE_SCHEMA = 3
 # Core publication requires at least this reduction in both qemu-img's
-# allocated size and the downloadable compressed file size. Ten percent is a
-# conservative default: large enough to reject noise from QCOW2 metadata and
-# compression variance, while leaving the reviewed package manifest—not an
-# aggressive size target—as the primary definition of "core".
+# allocated size and the downloadable compressed file size. Validation of both
+# architectures measured reductions above 72%, so ten percent is a conservative
+# fail-closed floor while the reviewed package manifest—not an aggressive size
+# target—remains the primary definition of "core".
 CORE_MINIMUM_REDUCTION_PERCENT = 10
 PROFILE_KEYS = (
     "architecture",
@@ -348,10 +374,12 @@ def variant_key(architecture: str, filesystem: str, flavor: str) -> str:
     return key
 
 
-def package_manifest(flavor: str) -> dict:
-    if flavor not in PACKAGE_MANIFESTS:
+def package_manifest(filesystem: str, flavor: str) -> dict:
+    if filesystem not in PACKAGE_MANIFESTS:
+        raise ValueError(f"unsupported FreeBSD filesystem: {filesystem}")
+    if flavor not in PACKAGE_MANIFESTS[filesystem]:
         raise ValueError(f"unsupported FreeBSD flavor: {flavor}")
-    return PACKAGE_MANIFESTS[flavor]
+    return PACKAGE_MANIFESTS[filesystem][flavor]
 
 
 def has_name_class(name: str, name_class: str) -> bool:
@@ -387,13 +415,17 @@ def parse_package_manifest(path: Path) -> list[dict]:
     return packages
 
 
-def verify_package_manifest(flavor: str, packages: list[dict]) -> None:
-    """Check a recorded manifest against the reviewed one for `flavor`.
+def verify_package_manifest(
+    filesystem: str,
+    flavor: str,
+    packages: list[dict],
+) -> None:
+    """Check a recorded manifest for the selected filesystem and flavor.
 
     The builder already did this, but the release helper must be able to
     reject a candidate without trusting the builder that produced it.
     """
-    manifest = package_manifest(flavor)
+    manifest = package_manifest(filesystem, flavor)
     installed = {package["name"] for package in packages}
     for required in manifest["required"]:
         if required not in installed:
@@ -643,7 +675,7 @@ def candidate_command(args: argparse.Namespace) -> None:
     if not args.qemu_version.strip() or not args.runner.strip():
         raise ValueError("QEMU version and runner must be recorded")
     packages = parse_package_manifest(args.package_manifest.resolve(strict=True))
-    verify_package_manifest(expected["flavor"], packages)
+    verify_package_manifest(expected["filesystem"], expected["flavor"], packages)
 
     document = {
         "schema": CANDIDATE_SCHEMA,
@@ -658,7 +690,9 @@ def candidate_command(args: argparse.Namespace) -> None:
         "asset_sha256": actual_sha256,
         "virtual_size": args.virtual_size,
         "packages": {
-            "manifest_revision": package_manifest(expected["flavor"])["revision"],
+            "manifest_revision": package_manifest(
+                expected["filesystem"], expected["flavor"]
+            )["revision"],
             "count": len(packages),
             "installed_bytes": sum(
                 package["installed_bytes"] for package in packages
@@ -858,7 +892,7 @@ def validate_candidate(
     recorded = document.get("packages")
     if not isinstance(recorded, dict) or not recorded.get("names"):
         raise ValueError(f"{manifest_path}: no recorded package manifest")
-    reviewed = package_manifest(expected["flavor"])
+    reviewed = package_manifest(expected["filesystem"], expected["flavor"])
     if recorded.get("manifest_revision") != reviewed["revision"]:
         raise ValueError(
             f"{manifest_path}: package manifest revision does not match"
@@ -866,6 +900,7 @@ def validate_candidate(
     if recorded.get("count") != len(recorded["names"]):
         raise ValueError(f"{manifest_path}: package count does not match")
     verify_package_manifest(
+        expected["filesystem"],
         expected["flavor"],
         [{"name": name} for name in recorded["names"]],
     )
@@ -895,7 +930,7 @@ def release_notes(
         lines.extend(
             [
                 "",
-                "## Full UFS versus core evidence",
+                f"## Full {candidates[0]['filesystem'].upper()} versus core evidence",
                 "",
                 "| Architecture | Full virtual | Core virtual | "
                 "Virtual reduction | Full allocated | Core allocated | "
@@ -927,11 +962,12 @@ def release_notes(
                 f"least {minimum_core_reduction_percent}% reduction in "
                 "qemu-img allocated size and compressed/download size. Core "
                 "virtual size may not exceed its matching same-source full "
-                "UFS asset.",
+                f"{candidates[0]['filesystem'].upper()} asset.",
             ]
         )
     if any(candidate["flavor"] == "core" for candidate in candidates):
-        manifest = package_manifest("core")
+        filesystem = candidates[0]["filesystem"]
+        manifest = package_manifest(filesystem, "core")
         lines.extend(
             [
                 "",
@@ -1017,9 +1053,10 @@ def release_notes(
     if core_rows is not None:
         lines.extend(
             [
-                "- Full and core UFS candidates were built in this dispatch "
+                f"- Full and core {candidates[0]['filesystem'].upper()} "
+                "candidates were built in this dispatch "
                 "from the same source commit and the same "
-                "architecture-specific pinned UFS source name, URL, and "
+                "architecture-specific pinned source name, URL, and "
                 "SHA-256.",
             ]
         )
@@ -1122,19 +1159,17 @@ def stage_command(args: argparse.Namespace) -> None:
             CORE_MINIMUM_REDUCTION_PERCENT,
         )
     )
-    core_rows = None
-    if args.release_set == "ufs":
-        core_rows = full_core_rows({
-            "schema": CANDIDATE_SCHEMA,
-            "type": "zvmi-freebsd15-release",
-            "release_set": "ufs",
-            "release_tag": expected_release_tag,
-            "source_commit": args.source_commit,
-            "assets": [
-                candidate_release_asset(by_variant[key]) for key in wanted
-            ],
-        })
-        enforce_core_size_gate(core_rows, minimum_reduction)
+    core_rows = full_core_rows({
+        "schema": CANDIDATE_SCHEMA,
+        "type": "zvmi-freebsd15-release",
+        "release_set": args.release_set,
+        "release_tag": expected_release_tag,
+        "source_commit": args.source_commit,
+        "assets": [
+            candidate_release_asset(by_variant[key]) for key in wanted
+        ],
+    })
+    enforce_core_size_gate(core_rows, minimum_reduction)
     azure_manifests = sorted(args.azure_results.rglob("azure-result.json"))
     if len(azure_manifests) != len(wanted):
         raise ValueError(f"expected {len(wanted)} azure result manifests")
@@ -1277,7 +1312,7 @@ def stage_command(args: argparse.Namespace) -> None:
             args.source_commit,
             azure_results=azure_by_variant,
             minimum_core_reduction_percent=(
-                minimum_reduction if args.release_set == "ufs" else None
+                minimum_reduction
             ),
             core_rows=core_rows,
         ),
@@ -1361,7 +1396,7 @@ def load_publish_manifest(path: Path) -> dict:
         package_record = asset.get("package_manifest")
         if not isinstance(package_record, dict):
             raise ValueError(f"{path}: {key} package manifest is missing")
-        reviewed = package_manifest(expected["flavor"])
+        reviewed = package_manifest(expected["filesystem"], expected["flavor"])
         if package_record.get("manifest_revision") != reviewed["revision"]:
             raise ValueError(f"{path}: {key} package manifest revision mismatch")
         if package_record.get("count") != package_count:
@@ -1379,6 +1414,7 @@ def load_publish_manifest(path: Path) -> dict:
             f"{path}: {key} installed package bytes",
         )
         verify_package_manifest(
+            expected["filesystem"],
             expected["flavor"],
             [{"name": name} for name in package_names],
         )
@@ -1398,34 +1434,58 @@ def load_publish_manifest(path: Path) -> dict:
 
 
 def full_core_rows(release_manifest: dict) -> list[tuple[dict, dict]]:
-    """Pair full and core UFS assets in the only allowed comparison direction."""
-    if release_manifest.get("release_set") != "ufs":
-        raise ValueError("size comparison requires the combined UFS release set")
+    """Pair full and core assets for the selected release filesystem."""
+    release_set_name = release_manifest.get("release_set")
+    selected = release_set(release_set_name)
+    filesystems = {VARIANTS[key]["filesystem"] for key in selected["variants"]}
+    if len(filesystems) != 1:
+        raise ValueError("size comparison requires one release filesystem")
+    filesystem = filesystems.pop()
     by_variant = {
         asset["variant"]: asset for asset in release_manifest["assets"]
     }
     rows = []
-    for key in UFS_CORE_VARIANTS:
+    core_variants = tuple(
+        key
+        for key in selected["variants"]
+        if VARIANTS[key]["flavor"] == "core"
+    )
+    for key in core_variants:
         core = by_variant.get(key)
+        core_profile = VARIANTS[key]
         if core is None:
-            raise ValueError(f"no {VARIANTS[key]['architecture']} core UFS asset")
-        expected_full = f"{core['architecture']}-ufs-full"
+            raise ValueError(
+                f"no {core_profile['architecture']} core "
+                f"{filesystem.upper()} asset"
+            )
+        if any(
+            core.get(field) != core_profile[field]
+            for field in ("architecture", "filesystem", "flavor")
+        ):
+            raise ValueError(f"{key} core asset identity is invalid")
+        expected_full = f"{core_profile['architecture']}-{filesystem}-full"
         full = by_variant.get(expected_full)
         if full is None:
             raise ValueError(
-                f"no {core['architecture']} full UFS asset"
+                f"no {core_profile['architecture']} full "
+                f"{filesystem.upper()} asset"
             )
+        full_profile = VARIANTS[expected_full]
         if (
             full["variant"] != expected_full
-            or full["filesystem"] != "ufs"
-            or full["flavor"] != "full"
+            or any(
+                full.get(field) != full_profile[field]
+                for field in ("architecture", "filesystem", "flavor")
+            )
         ):
             raise ValueError(
-                f"{core['architecture']} paired asset must be full UFS"
+                f"{core_profile['architecture']} paired asset identity is invalid"
             )
-        if core["filesystem"] != "ufs" or core["flavor"] != "core":
+        if (
+            core["variant"] != key
+        ):
             raise ValueError(
-                f"{core['architecture']} candidate must be core UFS"
+                f"{core_profile['architecture']} core asset identity is invalid"
             )
         if full["source"] != core["source"]:
             raise ValueError(
@@ -1444,7 +1504,7 @@ def enforce_core_size_gate(
     minimum_reduction_percent: int,
 ) -> None:
     threshold = require_reduction_percent(minimum_reduction_percent)
-    if len(rows) != len(UFS_CORE_VARIANTS):
+    if len(rows) != 2:
         raise ValueError("core size gate requires both architectures")
     for full, core in rows:
         architecture = core["architecture"]
@@ -1520,7 +1580,7 @@ def parser() -> argparse.ArgumentParser:
     candidate = commands.add_parser("candidate")
     candidate.add_argument("--architecture", choices=architectures, required=True)
     candidate.add_argument("--filesystem", choices=filesystems, required=True)
-    candidate.add_argument("--flavor", choices=sorted(PACKAGE_MANIFESTS), required=True)
+    candidate.add_argument("--flavor", choices=("core", "full"), required=True)
     candidate.add_argument("--package-manifest", type=Path, required=True)
     candidate.add_argument("--asset", type=Path, required=True)
     candidate.add_argument("--validated-sha256", required=True)

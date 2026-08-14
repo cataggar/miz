@@ -11,13 +11,12 @@ if [[ -z ${AZURE_RESULTS_DIR:-} ]]; then
   echo "::error::$RELEASE_SET releases require AZURE_RESULTS_DIR"
   exit 1
 fi
-if [[ "$RELEASE_SET" == "ufs" ]]; then
-  if [[ -z ${RELEASE_DATE:-} || ! "$RELEASE_DATE" =~ ^[0-9]{8}$ ]]; then
-    echo "::error::UFS releases require an explicit reviewed RELEASE_DATE"
-    exit 1
-  fi
-elif [[ -n ${RELEASE_DATE:-} ]]; then
-  echo "::error::RELEASE_DATE is only applicable to UFS releases"
+if [[ "$RELEASE_SET" != "zfs" ]]; then
+  echo "::error::Only the combined ZFS release set is publishable"
+  exit 1
+fi
+if [[ -z ${RELEASE_DATE:-} || ! "$RELEASE_DATE" =~ ^[0-9]{8}$ ]]; then
+  echo "::error::ZFS releases require an explicit reviewed RELEASE_DATE"
   exit 1
 fi
 for tool in python3 sha256sum; do
@@ -28,14 +27,9 @@ for tool in python3 sha256sum; do
 done
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
 
-describe_args=(--release-set "$RELEASE_SET")
-stage_release_date_args=()
-if [[ "$RELEASE_SET" == "ufs" ]]; then
-  describe_args+=(--release-date "$RELEASE_DATE")
-  stage_release_date_args=(--release-date "$RELEASE_DATE")
-fi
 release_description=$(python3 scripts/freebsd15_release.py describe \
-  "${describe_args[@]}")
+  --release-set "$RELEASE_SET" \
+  --release-date "$RELEASE_DATE")
 expected_tag=${release_description#*release_tag=}
 expected_tag=${expected_tag%%$'\n'*}
 expected_title=${release_description#*release_title=}
@@ -62,23 +56,32 @@ python3 scripts/freebsd15_release.py stage \
   --candidates "$CANDIDATES_DIR" \
   --source-commit "$SOURCE_COMMIT" \
   --release-tag "$RELEASE_TAG" \
-  "${stage_release_date_args[@]}" \
+  --release-date "$RELEASE_DATE" \
   --azure-results "$AZURE_RESULTS_DIR" \
   --minimum-core-reduction-percent "$minimum_core_reduction" \
   --output "$assets_dir" \
   --notes "$notes_file"
 
-if [[ "$RELEASE_SET" == "ufs" ]]; then
-  python3 scripts/freebsd15_release.py compare \
-    --candidate "$assets_dir/publish-manifest.json" \
-    --output "$comparison_file" >/dev/null
-fi
+python3 scripts/freebsd15_release.py compare \
+  --candidate "$assets_dir/publish-manifest.json" \
+  --output "$comparison_file" >/dev/null
 
-python3 - "$assets_dir/publish-manifest.json" >"$expected_file" <<'PY'
+python3 - "$assets_dir/publish-manifest.json" "$RELEASE_SET" >"$expected_file" <<'PY'
 import json
 import sys
 
 document = json.load(open(sys.argv[1], encoding="utf-8"))
+if document.get("release_set") != sys.argv[2]:
+    raise SystemExit("publish manifest release set mismatch")
+expected = {
+    "aarch64-zfs-full": "FreeBSD-15.1-aarch64.qcow2",
+    "x86_64-zfs-full": "FreeBSD-15.1-x86_64.qcow2",
+    "aarch64-zfs-core": "FreeBSD-15.1-aarch64.core.qcow2",
+    "x86_64-zfs-core": "FreeBSD-15.1-x86_64.core.qcow2",
+}
+actual = {asset["variant"]: asset["asset_name"] for asset in document["assets"]}
+if actual != expected:
+    raise SystemExit(f"ZFS publication allowlist mismatch: {actual!r}")
 for asset in document["assets"]:
     print(f"{asset['asset_name']}\t{asset['sha256']}\t{asset['bytes']}")
 PY
@@ -92,9 +95,7 @@ done <"$expected_file"
 mkdir -p "$evidence_dir"
 cp "$assets_dir/publish-manifest.json" "$evidence_dir/publish-manifest.json"
 cp "$notes_file" "$evidence_dir/release-notes.md"
-if [[ "$RELEASE_SET" == "ufs" ]]; then
-  cp "$comparison_file" "$evidence_dir/size-comparison.md"
-fi
+cp "$comparison_file" "$evidence_dir/size-comparison.md"
 
 python3 - \
   "$RELEASE_SET" \
@@ -111,8 +112,15 @@ manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
 variants = {asset["variant"] for asset in manifest["assets"]}
 evidence = Path(evidence_root)
 expected = {"publish-manifest.json", "release-notes.md"}
-if release_set == "ufs":
-    expected.add("size-comparison.md")
+expected.add("size-comparison.md")
+expected_variants = {
+    "aarch64-zfs-full",
+    "x86_64-zfs-full",
+    "aarch64-zfs-core",
+    "x86_64-zfs-core",
+}
+if variants != expected_variants:
+    raise SystemExit(f"unexpected ZFS variant allowlist: {variants!r}")
 source_documents = sorted(Path(azure_root).rglob("azure-result.json"))
 copied = set()
 for source in source_documents:

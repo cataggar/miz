@@ -94,11 +94,16 @@ const Profile = struct {
         return self.root_storage.filesystem();
     }
 
-    /// The package manifest the guest realizes. Manifests are keyed by flavor
-    /// alone because upstream's minimal set already absorbs the architecture
-    /// differences, so a per-profile copy would only be a place to disagree.
+    /// The package manifest the guest realizes. Architecture differences are
+    /// absorbed by pkgbase sets, while filesystem tools remain explicit.
     fn packageManifest(self: *const Profile) *const packages.Manifest {
-        return packages.forFlavor(self.flavor);
+        return packages.forProfile(
+            switch (self.rootFilesystem()) {
+                .ufs => .ufs,
+                .zfs => .zfs,
+            },
+            self.flavor,
+        );
     }
 };
 
@@ -118,10 +123,7 @@ const zfs_root_storage = RootStorage{ .zfs = .{ .pool = "zroot" } };
 /// Every architecture x filesystem x flavor combination this builder can
 /// produce. Keeping the pinned source metadata, virtual size, and output
 /// naming in one table makes an unsupported combination a lookup failure
-/// rather than a half-applied set of defaults. The table is deliberately not
-/// a full cross product: a core ZFS image is not a supported combination, so
-/// asking for one is `UnsupportedProfile` and never a quietly substituted UFS
-/// build.
+/// rather than a half-applied set of defaults.
 const profiles = [_]Profile{
     .{
         .architecture = .aarch64,
@@ -131,8 +133,8 @@ const profiles = [_]Profile{
         .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz",
         .source_sha256 = "9722aea499610802de9a14bb645707fc4f6df49ff765cd9ce372b783c4693963",
         .virtual_size = 6_477_643_776,
-        .output = "FreeBSD-15.1-aarch64.qcow2",
-        .work_dir = ".scratch/generalized-freebsd15-aarch64",
+        .output = "FreeBSD-15.1-aarch64.ufs.qcow2",
+        .work_dir = ".scratch/generalized-freebsd15-aarch64-ufs",
     },
     .{
         .architecture = .x86_64,
@@ -142,8 +144,8 @@ const profiles = [_]Profile{
         .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz",
         .source_sha256 = "e4ca4db889f8559c9b9dfcacc70405c038476f4b6d41649b152d3809a2ed9e1f",
         .virtual_size = 6_477_709_312,
-        .output = "FreeBSD-15.1-x86_64.qcow2",
-        .work_dir = ".scratch/generalized-freebsd15-x86_64",
+        .output = "FreeBSD-15.1-x86_64.ufs.qcow2",
+        .work_dir = ".scratch/generalized-freebsd15-x86_64-ufs",
     },
     .{
         .architecture = .aarch64,
@@ -153,8 +155,8 @@ const profiles = [_]Profile{
         .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-zfs.qcow2.xz",
         .source_sha256 = "0911a033b0a5d060486f92e534f3482c6a2ab96af6abb8a60683eeb24f6746af",
         .virtual_size = 6_477_643_776,
-        .output = "FreeBSD-15.1-aarch64.zfs.qcow2",
-        .work_dir = ".scratch/generalized-freebsd15-aarch64-zfs",
+        .output = "FreeBSD-15.1-aarch64.qcow2",
+        .work_dir = ".scratch/generalized-freebsd15-aarch64",
     },
     .{
         .architecture = .x86_64,
@@ -164,13 +166,11 @@ const profiles = [_]Profile{
         .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-zfs.qcow2.xz",
         .source_sha256 = "4159e137d4a78f46b62d3523edd9a4dc79fd0cdcf17e34e531342f52333f4131",
         .virtual_size = 6_477_840_384,
-        .output = "FreeBSD-15.1-x86_64.zfs.qcow2",
-        .work_dir = ".scratch/generalized-freebsd15-x86_64-zfs",
+        .output = "FreeBSD-15.1-x86_64.qcow2",
+        .work_dir = ".scratch/generalized-freebsd15-x86_64",
     },
-    // The core profiles start from the same pinned UFS sources as the full
-    // ones. Nothing about the acquired image differs; what differs is the
-    // package manifest the guest realizes, so sharing the source digest here
-    // is the accurate statement rather than a copy waiting to drift.
+    // Core profiles start from the matching full profile's pinned source.
+    // Nothing about acquisition differs; only the package manifest changes.
     .{
         .architecture = .aarch64,
         .flavor = .core,
@@ -179,8 +179,8 @@ const profiles = [_]Profile{
         .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz",
         .source_sha256 = "9722aea499610802de9a14bb645707fc4f6df49ff765cd9ce372b783c4693963",
         .virtual_size = 6_477_643_776,
-        .output = "FreeBSD-15.1-aarch64.core.qcow2",
-        .work_dir = ".scratch/generalized-freebsd15-aarch64-core",
+        .output = "FreeBSD-15.1-aarch64.ufs.core.qcow2",
+        .work_dir = ".scratch/generalized-freebsd15-aarch64-ufs-core",
     },
     .{
         .architecture = .x86_64,
@@ -190,6 +190,28 @@ const profiles = [_]Profile{
         .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz",
         .source_sha256 = "e4ca4db889f8559c9b9dfcacc70405c038476f4b6d41649b152d3809a2ed9e1f",
         .virtual_size = 6_477_709_312,
+        .output = "FreeBSD-15.1-x86_64.ufs.core.qcow2",
+        .work_dir = ".scratch/generalized-freebsd15-x86_64-ufs-core",
+    },
+    .{
+        .architecture = .aarch64,
+        .flavor = .core,
+        .root_storage = zfs_root_storage,
+        .source_name = "FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-zfs.qcow2.xz",
+        .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-zfs.qcow2.xz",
+        .source_sha256 = "0911a033b0a5d060486f92e534f3482c6a2ab96af6abb8a60683eeb24f6746af",
+        .virtual_size = 6_477_643_776,
+        .output = "FreeBSD-15.1-aarch64.core.qcow2",
+        .work_dir = ".scratch/generalized-freebsd15-aarch64-core",
+    },
+    .{
+        .architecture = .x86_64,
+        .flavor = .core,
+        .root_storage = zfs_root_storage,
+        .source_name = "FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-zfs.qcow2.xz",
+        .source_url = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-zfs.qcow2.xz",
+        .source_sha256 = "4159e137d4a78f46b62d3523edd9a4dc79fd0cdcf17e34e531342f52333f4131",
+        .virtual_size = 6_477_840_384,
         .output = "FreeBSD-15.1-x86_64.core.qcow2",
         .work_dir = ".scratch/generalized-freebsd15-x86_64-core",
     },
@@ -278,7 +300,7 @@ const Accel = enum {
 
 const Args = struct {
     architecture: Architecture = .aarch64,
-    root_filesystem: RootFilesystem = .ufs,
+    root_filesystem: RootFilesystem = .zfs,
     flavor: Flavor = .full,
     profile: *const Profile = undefined,
     source: ?[]const u8 = null,
@@ -301,7 +323,7 @@ const help_text =
     \\Usage: build_generalized_freebsd15 [options]
     \\
     \\  --architecture <arch>    Guest architecture: aarch64 (default) or x86_64
-    \\  --filesystem <fs>        Root filesystem: ufs (default) or zfs
+    \\  --filesystem <fs>        Root filesystem: zfs (default) or ufs
     \\  --flavor <flavor>        Image flavor: full (default) or core
     \\  --source <path>          Local .qcow2.xz source (official image if omitted)
     \\  --source-sha256 <hex>    Expected compressed source SHA-256
@@ -1661,10 +1683,10 @@ pub fn main(init: std.process.Init) !void {
 
 test "FreeBSD builder defaults pin the official release source" {
     const args = try parseArgs(&.{});
-    const profile = findProfile(.aarch64, .ufs, .full).?;
+    const profile = findProfile(.aarch64, .zfs, .full).?;
     try std.testing.expect(args.source == null);
     try std.testing.expectEqual(Architecture.aarch64, args.architecture);
-    try std.testing.expectEqual(RootFilesystem.ufs, args.root_filesystem);
+    try std.testing.expectEqual(RootFilesystem.zfs, args.root_filesystem);
     try std.testing.expectEqual(Flavor.full, args.flavor);
     try std.testing.expectEqual(profile, args.profile);
     try std.testing.expectEqualStrings(
@@ -1688,7 +1710,7 @@ test "FreeBSD builder defaults pin the official release source" {
 
 test "FreeBSD builder selects pinned x86_64 defaults" {
     const args = try parseArgs(&.{ "--architecture", "x86_64" });
-    const profile = findProfile(.x86_64, .ufs, .full).?;
+    const profile = findProfile(.x86_64, .zfs, .full).?;
     try std.testing.expectEqual(Architecture.x86_64, args.architecture);
     try std.testing.expectEqualStrings(
         profile.source_sha256,
@@ -1707,15 +1729,15 @@ test "FreeBSD builder selects pinned x86_64 defaults" {
     );
 }
 
-test "FreeBSD builder selects pinned ZFS defaults per architecture" {
-    const aarch64 = try parseArgs(&.{ "--filesystem", "zfs" });
+test "FreeBSD builder selects unqualified ZFS defaults per architecture" {
+    const aarch64 = try parseArgs(&.{});
     try std.testing.expectEqual(RootFilesystem.zfs, aarch64.root_filesystem);
     try std.testing.expectEqualStrings(
-        "FreeBSD-15.1-aarch64.zfs.qcow2",
+        "FreeBSD-15.1-aarch64.qcow2",
         aarch64.output,
     );
     try std.testing.expectEqualStrings(
-        ".scratch/generalized-freebsd15-aarch64-zfs",
+        ".scratch/generalized-freebsd15-aarch64",
         aarch64.work_dir,
     );
     try std.testing.expectEqualStrings(
@@ -1737,14 +1759,13 @@ test "FreeBSD builder selects pinned ZFS defaults per architecture" {
 
     const x86_64 = try parseArgs(&.{
         "--architecture", "x86_64",
-        "--filesystem",   "zfs",
     });
     try std.testing.expectEqualStrings(
-        "FreeBSD-15.1-x86_64.zfs.qcow2",
+        "FreeBSD-15.1-x86_64.qcow2",
         x86_64.output,
     );
     try std.testing.expectEqualStrings(
-        ".scratch/generalized-freebsd15-x86_64-zfs",
+        ".scratch/generalized-freebsd15-x86_64",
         x86_64.work_dir,
     );
     try std.testing.expectEqualStrings(
@@ -1761,12 +1782,7 @@ test "FreeBSD builder selects pinned ZFS defaults per architecture" {
     );
 }
 
-/// The filesystem/flavor combinations the project supports, spelled out so
-/// that gaining or losing one is a deliberate edit rather than a side effect
-/// of the profile table. A core ZFS image is not supported: ZFS already
-/// compresses the bulk of what the core manifest removes, and a second
-/// unpublished variant would double the acceptance matrix for no download
-/// size win.
+/// The complete filesystem/flavor cross product the project supports.
 const supported_variants = [_]struct {
     root_filesystem: RootFilesystem,
     flavor: Flavor,
@@ -1774,6 +1790,7 @@ const supported_variants = [_]struct {
     .{ .root_filesystem = .ufs, .flavor = .full },
     .{ .root_filesystem = .zfs, .flavor = .full },
     .{ .root_filesystem = .ufs, .flavor = .core },
+    .{ .root_filesystem = .zfs, .flavor = .core },
 };
 
 test "FreeBSD profile table is complete, unique, and pinned" {
@@ -1823,16 +1840,24 @@ test "FreeBSD profile table is complete, unique, and pinned" {
                 .zfs => "-zfs.qcow2.xz",
             },
         ) != null);
-        try std.testing.expectEqualStrings(
-            switch (profile.rootFilesystem()) {
-                .ufs => ".qcow2",
-                .zfs => ".zfs.qcow2",
-            },
-            profile.output[profile.output.len - switch (profile.rootFilesystem()) {
-                .ufs => ".qcow2".len,
-                .zfs => ".zfs.qcow2".len,
-            } ..],
-        );
+        if (profile.rootFilesystem() == .zfs) {
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                profile.output,
+                ".zfs",
+            ) == null);
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                profile.output,
+                "-zfs",
+            ) == null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                profile.output,
+                ".ufs.",
+            ) != null);
+        }
         // Azure fixed VHDs derived from these images require a 512-byte
         // aligned virtual size, so a mistyped pin must fail here.
         try std.testing.expect(profile.virtual_size > 0);
@@ -1868,29 +1893,47 @@ test "FreeBSD profile table is complete, unique, and pinned" {
     }
 }
 
-test "unsupported FreeBSD variants fail instead of falling back" {
-    for (std.enums.values(Architecture)) |architecture| {
-        try std.testing.expect(
-            findProfile(architecture, .zfs, .core) == null,
-        );
+test "ZFS publishing names are unqualified and UFS names stay explicit" {
+    const expected = [_]struct {
+        architecture: Architecture,
+        filesystem: RootFilesystem,
+        flavor: Flavor,
+        output: []const u8,
+    }{
+        .{ .architecture = .aarch64, .filesystem = .zfs, .flavor = .full, .output = "FreeBSD-15.1-aarch64.qcow2" },
+        .{ .architecture = .x86_64, .filesystem = .zfs, .flavor = .full, .output = "FreeBSD-15.1-x86_64.qcow2" },
+        .{ .architecture = .aarch64, .filesystem = .zfs, .flavor = .core, .output = "FreeBSD-15.1-aarch64.core.qcow2" },
+        .{ .architecture = .x86_64, .filesystem = .zfs, .flavor = .core, .output = "FreeBSD-15.1-x86_64.core.qcow2" },
+        .{ .architecture = .aarch64, .filesystem = .ufs, .flavor = .full, .output = "FreeBSD-15.1-aarch64.ufs.qcow2" },
+        .{ .architecture = .x86_64, .filesystem = .ufs, .flavor = .full, .output = "FreeBSD-15.1-x86_64.ufs.qcow2" },
+        .{ .architecture = .aarch64, .filesystem = .ufs, .flavor = .core, .output = "FreeBSD-15.1-aarch64.ufs.core.qcow2" },
+        .{ .architecture = .x86_64, .filesystem = .ufs, .flavor = .core, .output = "FreeBSD-15.1-x86_64.ufs.core.qcow2" },
+    };
+    for (expected) |entry| {
+        const profile = findProfile(
+            entry.architecture,
+            entry.filesystem,
+            entry.flavor,
+        ).?;
+        try std.testing.expectEqualStrings(entry.output, profile.output);
     }
-    try std.testing.expectError(
-        error.UnsupportedProfile,
-        parseArgs(&.{ "--filesystem", "zfs", "--flavor", "core" }),
-    );
 }
 
-test "each FreeBSD flavor selects its own package manifest" {
+test "each FreeBSD profile selects its filesystem and flavor manifest" {
     for (&profiles) |*profile| {
         const manifest = profile.packageManifest();
         try std.testing.expectEqual(profile.flavor, manifest.flavor);
+        try std.testing.expectEqual(
+            profile.rootFilesystem() == .zfs,
+            manifest.filesystem == .zfs,
+        );
         // The pinned upstream images are 15.1 release images, so a manifest
         // written against another release would install mismatched base
         // packages on the very first `pkg upgrade`.
         try std.testing.expectEqualStrings("15.1", manifest.release);
     }
-    try std.testing.expect(packages.core_manifest.prunes);
-    try std.testing.expect(!packages.full_manifest.prunes);
+    try std.testing.expect(packages.zfs_core_manifest.prunes);
+    try std.testing.expect(!packages.zfs_full_manifest.prunes);
 }
 
 test "FreeBSD builder parses explicit source and tool paths" {

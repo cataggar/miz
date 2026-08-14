@@ -11,7 +11,7 @@ if [[ -z ${STATE_FILE:-} || -z ${GITHUB_RUN_ID:-} || -z ${GITHUB_RUN_ATTEMPT:-} 
 fi
 [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
 [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
-[[ "$CANDIDATE_KEY" =~ ^(x86_64|aarch64)-(ufs-(full|core)|zfs-full)$ ]]
+[[ "$CANDIDATE_KEY" =~ ^(x86_64|aarch64)-(ufs|zfs)-(full|core)$ ]]
 
 cleanup_group() {
   [[ -s "$STATE_FILE" ]] || return 0
@@ -102,7 +102,7 @@ fi
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
 [[ "$ARCHITECTURE" =~ ^(x86_64|aarch64)$ ]]
 case "$FILESYSTEM-$FLAVOR" in
-  ufs-full|ufs-core|zfs-full) ;;
+  ufs-full|ufs-core|zfs-full|zfs-core) ;;
   *)
     echo "::error::Unsupported FreeBSD Azure acceptance profile: $FILESYSTEM-$FLAVOR"
     exit 1
@@ -307,6 +307,7 @@ if (filesystem, flavor) not in {
     ("ufs", "full"),
     ("ufs", "core"),
     ("zfs", "full"),
+    ("zfs", "core"),
 }:
     raise SystemExit("unsupported candidate filesystem/flavor combination")
 if not isinstance(doc.get("compressed_size"), int) or doc["compressed_size"] <= 0:
@@ -327,7 +328,7 @@ if not isinstance(packages.get("installed_bytes"), int) or packages["installed_b
     raise SystemExit("candidate package installed size is missing or invalid")
 package_manifest_path = Path(f"{requested_asset}.packages.txt").resolve(strict=True)
 installed_packages = release.parse_package_manifest(package_manifest_path)
-release.verify_package_manifest(flavor, installed_packages)
+release.verify_package_manifest(filesystem, flavor, installed_packages)
 if [package["name"] for package in installed_packages] != packages.get("names"):
     raise SystemExit("candidate package manifest content does not match")
 if len(installed_packages) != packages.get("count"):

@@ -11,7 +11,9 @@
 //! the manifest names the roots, pkg computes their closure, and every base
 //! package outside that closure is removed as a package.
 //!
-//! Both flavors carry the same retained contract. The full flavor only
+//! Both filesystems and flavors carry the same shared retained contract.
+//! Filesystem packages are selected separately so the recorded contract
+//! proves the root can be administered and recovered. The full flavor only
 //! verifies it, which is what keeps a core-only change from silently
 //! regressing the full images; the core flavor additionally prunes and then
 //! proves that every reviewed exclusion is really gone and that nothing
@@ -34,6 +36,11 @@ pub const Flavor = enum {
         if (std.mem.eql(u8, text, "core")) return .core;
         return null;
     }
+};
+
+pub const RootFilesystem = enum {
+    ufs,
+    zfs,
 };
 
 /// One clause of the retained contract. Every clause must be claimed by at
@@ -80,7 +87,7 @@ pub const RequiredPackage = struct {
 /// but naming them individually is what makes the contract testable: a test
 /// can assert that DHCP or the base update path is still claimed, which a
 /// single metapackage name could never express.
-pub const required_packages = [_]RequiredPackage{
+pub const shared_required_packages = [_]RequiredPackage{
     .{
         .name = "FreeBSD-set-minimal",
         .source = .pkgbase,
@@ -208,12 +215,6 @@ pub const required_packages = [_]RequiredPackage{
         .why = "gpart(8), which rc.d/growfs resizes the last partition with.",
     },
     .{
-        .name = "FreeBSD-ufs",
-        .source = .pkgbase,
-        .clauses = &.{.root_growth},
-        .why = "growfs(8), newfs(8), and fsck for the UFS root.",
-    },
-    .{
         .name = "FreeBSD-nuageinit",
         .source = .pkgbase,
         .clauses = &.{.provisioning},
@@ -250,6 +251,44 @@ pub const required_packages = [_]RequiredPackage{
         .why = "Azure provisioning, extension, and heartbeat agent.",
     },
 };
+
+/// The FreeBSD 15.1 pkgbase repository describes these as the UFS management
+/// utilities and their runtime library. Keeping both explicit makes growfs,
+/// fsck, dump/restore, and console recovery part of the recorded contract.
+pub const ufs_required_packages =
+    shared_required_packages ++ [_]RequiredPackage{
+        .{
+            .name = "FreeBSD-ufs",
+            .source = .pkgbase,
+            .clauses = &.{ .root_growth, .recovery_tools },
+            .why = "growfs(8), newfs(8), fsck, dump, and restore for UFS.",
+        },
+        .{
+            .name = "FreeBSD-ufs-lib",
+            .source = .pkgbase,
+            .clauses = &.{.recovery_tools},
+            .why = "Runtime libufs used by the UFS administration tools.",
+        },
+    };
+
+/// Official 15.1 pkgbase metadata assigns zfs(8), zpool(8), zfsd(8), and the
+/// administration/recovery utilities to FreeBSD-zfs, with their runtime
+/// libraries in FreeBSD-zfs-lib.
+pub const zfs_required_packages =
+    shared_required_packages ++ [_]RequiredPackage{
+        .{
+            .name = "FreeBSD-zfs",
+            .source = .pkgbase,
+            .clauses = &.{ .root_growth, .recovery_tools },
+            .why = "Boot/import, zfs/zpool administration, online growth, scrub, health, and recovery tools.",
+        },
+        .{
+            .name = "FreeBSD-zfs-lib",
+            .source = .pkgbase,
+            .clauses = &.{.recovery_tools},
+            .why = "Runtime OpenZFS libraries required by the ZFS tools.",
+        },
+    };
 
 /// Packages the retained set links against but that no declared pkgbase
 /// dependency names. pkgbase records these edges as shlib metadata only, so
@@ -331,6 +370,7 @@ pub const core_excluded_classes = [_][]const u8{
 pub const representative_package = "tree";
 
 pub const Manifest = struct {
+    filesystem: RootFilesystem,
     flavor: Flavor,
     /// Manifest revision. Bump it whenever the retained or excluded sets
     /// change so a recorded image manifest can be tied to a reviewed one.
@@ -347,12 +387,13 @@ pub const Manifest = struct {
     prunes: bool,
 };
 
-pub const full_manifest = Manifest{
+pub const ufs_full_manifest = Manifest{
+    .filesystem = .ufs,
     .flavor = .full,
-    .revision = 2,
+    .revision = 3,
     .release = "15.1",
     .base_repository = "FreeBSD-base",
-    .required = &required_packages,
+    .required = &ufs_required_packages,
     // The full flavor keeps upstream's complete base install, so it has no
     // library roots to name and nothing to exclude; it only has to prove the
     // retained contract still holds.
@@ -362,22 +403,58 @@ pub const full_manifest = Manifest{
     .prunes = false,
 };
 
-pub const core_manifest = Manifest{
+pub const ufs_core_manifest = Manifest{
+    .filesystem = .ufs,
     .flavor = .core,
-    .revision = 2,
+    .revision = 3,
     .release = "15.1",
     .base_repository = "FreeBSD-base",
-    .required = &required_packages,
+    .required = &ufs_required_packages,
     .library_roots = &library_roots,
     .excluded = &core_excluded_packages,
     .excluded_classes = &core_excluded_classes,
     .prunes = true,
 };
 
-pub fn forFlavor(flavor: Flavor) *const Manifest {
-    return switch (flavor) {
-        .full => &full_manifest,
-        .core => &core_manifest,
+pub const zfs_full_manifest = Manifest{
+    .filesystem = .zfs,
+    .flavor = .full,
+    .revision = 3,
+    .release = "15.1",
+    .base_repository = "FreeBSD-base",
+    .required = &zfs_required_packages,
+    .library_roots = &.{},
+    .excluded = &.{},
+    .excluded_classes = &.{},
+    .prunes = false,
+};
+
+pub const zfs_core_manifest = Manifest{
+    .filesystem = .zfs,
+    .flavor = .core,
+    .revision = 3,
+    .release = "15.1",
+    .base_repository = "FreeBSD-base",
+    .required = &zfs_required_packages,
+    .library_roots = &library_roots,
+    .excluded = &core_excluded_packages,
+    .excluded_classes = &core_excluded_classes,
+    .prunes = true,
+};
+
+pub fn forProfile(
+    filesystem: RootFilesystem,
+    flavor: Flavor,
+) *const Manifest {
+    return switch (filesystem) {
+        .ufs => switch (flavor) {
+            .full => &ufs_full_manifest,
+            .core => &ufs_core_manifest,
+        },
+        .zfs => switch (flavor) {
+            .full => &zfs_full_manifest,
+            .core => &zfs_core_manifest,
+        },
     };
 }
 
@@ -778,52 +855,88 @@ pub fn verifyRecordedManifest(
     }
 }
 
-test "the retained contract claims every clause exactly once per package" {
-    var claimed = std.EnumSet(Clause).initEmpty();
-    for (&required_packages, 0..) |package, index| {
-        try std.testing.expect(package.name.len != 0);
-        try std.testing.expect(package.why.len != 0);
-        try std.testing.expect(package.clauses.len != 0);
-        for (package.clauses) |clause| claimed.insert(clause);
-        // A clause list that repeats itself is a review mistake, not a
-        // stronger claim.
-        for (package.clauses, 0..) |clause, first| {
-            for (package.clauses[first + 1 ..]) |other| {
-                try std.testing.expect(clause != other);
+test "each filesystem retained contract claims every clause" {
+    for (std.enums.values(RootFilesystem)) |filesystem| {
+        const required = forProfile(filesystem, .core).required;
+        var claimed = std.EnumSet(Clause).initEmpty();
+        for (required, 0..) |package, index| {
+            try std.testing.expect(package.name.len != 0);
+            try std.testing.expect(package.why.len != 0);
+            try std.testing.expect(package.clauses.len != 0);
+            for (package.clauses) |clause| claimed.insert(clause);
+            for (package.clauses, 0..) |clause, first| {
+                for (package.clauses[first + 1 ..]) |other| {
+                    try std.testing.expect(clause != other);
+                }
+            }
+            for (required[index + 1 ..]) |other| {
+                try std.testing.expect(!std.mem.eql(
+                    u8,
+                    package.name,
+                    other.name,
+                ));
             }
         }
-        for (required_packages[index + 1 ..]) |other| {
-            try std.testing.expect(!std.mem.eql(u8, package.name, other.name));
+        for (std.enums.values(Clause)) |clause| {
+            std.testing.expect(claimed.contains(clause)) catch |err| {
+                std.debug.print(
+                    "{s} contract does not claim {s}\n",
+                    .{ @tagName(filesystem), @tagName(clause) },
+                );
+                return err;
+            };
         }
-    }
-    // Every clause of the issue's retain-at-minimum list must be claimed, so
-    // dropping a capability requires deleting a clause in review.
-    for (std.enums.values(Clause)) |clause| {
-        std.testing.expect(claimed.contains(clause)) catch |err| {
-            std.debug.print("no package claims {s}\n", .{@tagName(clause)});
-            return err;
-        };
     }
 }
 
-test "manifests are versioned, disjoint, and internally consistent" {
-    const full = forFlavor(.full);
-    const core = forFlavor(.core);
-    try std.testing.expectEqual(Flavor.full, full.flavor);
-    try std.testing.expectEqual(Flavor.core, core.flavor);
-    try std.testing.expect(!full.prunes);
-    try std.testing.expect(core.prunes);
-    try std.testing.expect(full.revision > 0);
-    try std.testing.expect(core.revision > 0);
-    try std.testing.expectEqualStrings("15.1", core.release);
-    try std.testing.expectEqualStrings("FreeBSD-base", core.base_repository);
-    try std.testing.expectEqual(@as(u32, 2), full.revision);
-    try std.testing.expectEqual(full.revision, core.revision);
-    // Both flavors carry the same contract; only the core flavor prunes.
-    try std.testing.expectEqual(full.required.len, core.required.len);
-    try std.testing.expectEqual(@as(usize, 0), full.excluded.len);
-    try std.testing.expect(core.excluded.len > 0);
-    try std.testing.expect(core.library_roots.len > 0);
+test "filesystem and flavor manifests are versioned and consistent" {
+    for (std.enums.values(RootFilesystem)) |filesystem| {
+        const full = forProfile(filesystem, .full);
+        const core = forProfile(filesystem, .core);
+        try std.testing.expectEqual(filesystem, full.filesystem);
+        try std.testing.expectEqual(filesystem, core.filesystem);
+        try std.testing.expectEqual(Flavor.full, full.flavor);
+        try std.testing.expectEqual(Flavor.core, core.flavor);
+        try std.testing.expect(!full.prunes);
+        try std.testing.expect(core.prunes);
+        try std.testing.expectEqual(@as(u32, 3), full.revision);
+        try std.testing.expectEqual(full.revision, core.revision);
+        try std.testing.expectEqualStrings("15.1", core.release);
+        try std.testing.expectEqualStrings("FreeBSD-base", core.base_repository);
+        try std.testing.expectEqual(full.required.len, core.required.len);
+        try std.testing.expectEqual(@as(usize, 0), full.excluded.len);
+        try std.testing.expect(core.excluded.len > 0);
+        try std.testing.expect(core.library_roots.len > 0);
+    }
+
+    const ufs = forProfile(.ufs, .core);
+    const zfs = forProfile(.zfs, .core);
+    try std.testing.expectEqual(
+        shared_required_packages.len + 2,
+        ufs.required.len,
+    );
+    try std.testing.expectEqual(
+        shared_required_packages.len + 2,
+        zfs.required.len,
+    );
+    try std.testing.expectEqualStrings("FreeBSD-ufs", ufs.required[ufs.required.len - 2].name);
+    try std.testing.expectEqualStrings("FreeBSD-ufs-lib", ufs.required[ufs.required.len - 1].name);
+    try std.testing.expectEqualStrings("FreeBSD-zfs", zfs.required[zfs.required.len - 2].name);
+    try std.testing.expectEqualStrings("FreeBSD-zfs-lib", zfs.required[zfs.required.len - 1].name);
+    for (shared_required_packages, 0..) |package, index| {
+        try std.testing.expectEqualStrings(package.name, ufs.required[index].name);
+        try std.testing.expectEqualStrings(package.name, zfs.required[index].name);
+    }
+    for (ufs.required) |package| {
+        try std.testing.expect(!std.mem.eql(u8, package.name, "FreeBSD-zfs"));
+        try std.testing.expect(!std.mem.eql(u8, package.name, "FreeBSD-zfs-lib"));
+    }
+    for (zfs.required) |package| {
+        try std.testing.expect(!std.mem.eql(u8, package.name, "FreeBSD-ufs"));
+        try std.testing.expect(!std.mem.eql(u8, package.name, "FreeBSD-ufs-lib"));
+    }
+
+    const core = ufs;
 
     // An exclusion class that matched a retained package would delete it at
     // build time, on a runner, after an hour of QEMU.
@@ -897,7 +1010,7 @@ test "excluded name classes match components, not substrings" {
 test "the core guest script prunes from the manifest and audits the result" {
     const allocator = std.testing.allocator;
     const nonce = "0123456789abcdef";
-    const script = try guestScriptAlloc(allocator, forFlavor(.core), nonce);
+    const script = try guestScriptAlloc(allocator, forProfile(.ufs, .core), nonce);
     defer allocator.free(script);
 
     try std.testing.expect(std.mem.indexOf(u8, script, "@") == null);
@@ -910,7 +1023,7 @@ test "the core guest script prunes from the manifest and audits the result" {
     try std.testing.expect(std.mem.indexOf(u8, script, "rm -rf /usr") == null);
     try std.testing.expect(std.mem.indexOf(u8, script, "find /usr") == null);
     // Every retained package and every reviewed exclusion has to appear.
-    for (&required_packages) |package| {
+    for (&ufs_required_packages) |package| {
         try std.testing.expect(std.mem.indexOf(u8, script, package.name) != null);
     }
     for (&library_roots) |library| {
@@ -961,9 +1074,30 @@ test "the core guest script prunes from the manifest and audits the result" {
     }
 }
 
+test "the ZFS core guest script retains ZFS administration packages" {
+    const allocator = std.testing.allocator;
+    const script = try guestScriptAlloc(
+        allocator,
+        forProfile(.zfs, .core),
+        "abc",
+    );
+    defer allocator.free(script);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "FreeBSD-zfs FreeBSD-zfs-lib",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        script,
+        "FreeBSD-ufs FreeBSD-ufs-lib",
+    ) == null);
+}
+
 test "a manual excluded package surviving autoremove is reclassified" {
     const allocator = std.testing.allocator;
-    const script = try guestScriptAlloc(allocator, forFlavor(.core), "abc");
+    const script = try guestScriptAlloc(allocator, forProfile(.ufs, .core), "abc");
     defer allocator.free(script);
 
     // Model an upstream-manual FreeBSD-clang surviving the first autoremove:
@@ -994,7 +1128,7 @@ test "a manual excluded package surviving autoremove is reclassified" {
 
 test "generated exclusion commands preserve dependency-safe order" {
     const allocator = std.testing.allocator;
-    const script = try guestScriptAlloc(allocator, forFlavor(.core), "abc");
+    const script = try guestScriptAlloc(allocator, forProfile(.ufs, .core), "abc");
     defer allocator.free(script);
 
     // The first autoremove may leave an upstream-manual package behind, and
@@ -1084,7 +1218,7 @@ test "generated exclusion commands preserve dependency-safe order" {
 
 test "the full guest script verifies the contract without pruning" {
     const allocator = std.testing.allocator;
-    const script = try guestScriptAlloc(allocator, forFlavor(.full), "abc");
+    const script = try guestScriptAlloc(allocator, forProfile(.ufs, .full), "abc");
     defer allocator.free(script);
 
     try std.testing.expect(std.mem.indexOf(u8, script, "@") == null);
@@ -1092,7 +1226,7 @@ test "the full guest script verifies the contract without pruning" {
     try std.testing.expect(std.mem.indexOf(u8, script, "pkg set -y -g -A 1") == null);
     // The retained contract and the update path are still proven, so a core
     // change that breaks them cannot pass the full builds either.
-    for (&required_packages) |package| {
+    for (&ufs_required_packages) |package| {
         try std.testing.expect(std.mem.indexOf(u8, script, package.name) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, script, "pkg update -f -r FreeBSD-base") != null);
@@ -1107,7 +1241,7 @@ test "the full guest script verifies the contract without pruning" {
 }
 
 test "a recorded manifest is verified against the reviewed one" {
-    const core = forFlavor(.core);
+    const core = forProfile(.ufs, .core);
     var installed: std.ArrayList(InstalledPackage) = .empty;
     defer installed.deinit(std.testing.allocator);
     for (core.required) |package| {
@@ -1168,7 +1302,7 @@ test "a recorded manifest is verified against the reviewed one" {
     try verifyRecordedManifest(core, installed.items, &diagnostic);
 
     // The full flavor excludes nothing, so the same list passes.
-    try verifyRecordedManifest(forFlavor(.full), installed.items, null);
+    try verifyRecordedManifest(forProfile(.ufs, .full), installed.items, null);
     try std.testing.expectError(
         error.RecordedManifestEmpty,
         verifyRecordedManifest(core, &.{}, null),

@@ -2,9 +2,11 @@
 
 ## Generalized FreeBSD 15.1 QCOW2 images
 
-`zvmi qemu FreeBSD` selects the host-native FreeBSD 15.1 image from release
-`FreeBSD-15.1-20260724`; use `--arch x86_64|aarch64` to override the host
-architecture.
+ZFS is the default root filesystem for future FreeBSD 15.1 images.
+`zvmi qemu FreeBSD` selects the host-native image; use
+`--arch x86_64|aarch64` to override the host architecture. Historical
+published releases remain available under their original immutable tags and
+asset names.
 
 The FreeBSD builder is driven by an explicit profile table indexed by
 architecture, root filesystem, and flavor. Each profile pins its own upstream
@@ -15,20 +17,16 @@ not even agree on virtual size. Selecting an unsupported combination fails with
 
 | Architecture | Root | Flavor | Asset |
 | --- | --- | --- | --- |
-| aarch64 | ufs | full | `FreeBSD-15.1-aarch64.qcow2` |
-| x86_64 | ufs | full | `FreeBSD-15.1-x86_64.qcow2` |
-| aarch64 | zfs | full | `FreeBSD-15.1-aarch64.zfs.qcow2` |
-| x86_64 | zfs | full | `FreeBSD-15.1-x86_64.zfs.qcow2` |
-| aarch64 | ufs | core | `FreeBSD-15.1-aarch64.core.qcow2` |
-| x86_64 | ufs | core | `FreeBSD-15.1-x86_64.core.qcow2` |
+| aarch64 | zfs | full | `FreeBSD-15.1-aarch64.qcow2` |
+| x86_64 | zfs | full | `FreeBSD-15.1-x86_64.qcow2` |
+| aarch64 | zfs | core | `FreeBSD-15.1-aarch64.core.qcow2` |
+| x86_64 | zfs | core | `FreeBSD-15.1-x86_64.core.qcow2` |
 
-The table is deliberately not a full cross product. A core ZFS image is not a
-supported combination - ZFS already compresses most of what the core manifest
-removes, and a second unpublished variant would double the acceptance matrix
-for no download-size win - so `--filesystem zfs --flavor core` fails with
-`UnsupportedProfile`. The two core profiles pin the *same* upstream source as
-the corresponding full UFS profiles: nothing about the acquired image differs,
-only the package manifest the guest realizes.
+These four ZFS profiles form the active release set. Full and core for one
+architecture pin the same upstream ZFS source; only the package manifest
+realized in the guest differs. UFS profiles remain manually buildable for
+legacy use and comparison, but UFS is not a future release set and its images
+must not be mixed into the ZFS publication.
 
 All profiles use the official BASIC-CLOUDINIT images so NoCloud provisioning
 stays available. The builder downloads the profile's compressed QCOW2, verifies
@@ -75,7 +73,7 @@ mapping is enforced by tests rather than by careful reading:
 | Provisioning | `FreeBSD-nuageinit`, `FreeBSD-flua` |
 | Packages and base updates | `pkg`, `FreeBSD-pkg-bootstrap`, `FreeBSD-libarchive` |
 | Azure Agent | `azure-agent` |
-| Root growth | `FreeBSD-ufs`, `FreeBSD-geom`, `FreeBSD-rc` |
+| Root growth and storage administration | `FreeBSD-zfs` or `FreeBSD-ufs`, `FreeBSD-geom`, `FreeBSD-rc` |
 
 pkgbase leaf packages declare no dependencies at all: the real edges live in
 shared-library metadata that `pkg`'s solver does not consult, so the manifest
@@ -102,6 +100,14 @@ The shared retained manifest names the exact pkgbase provider
 `FreeBSD-bsdconfig` for `sysrc(8)`. The core flavor does not retain
 `FreeBSD-set-base`, `FreeBSD-set-devel`, or `FreeBSD-set-optional` to obtain
 it; those broad sets remain reviewed exclusions.
+
+For ZFS core, the filesystem-aware contract also retains the ZFS kernel and
+userland packages plus the boot, pool import, growth, health, scrub, and
+recovery tools required by a ZFS root. Validation proves the root pool remains
+healthy and administrable after pruning and that ordinary signed package
+install/remove operations do not change the reviewed retained package state.
+The core image removes only packages outside that closure; it does not reduce
+storage capability by deleting ZFS administration or recovery support.
 
 ### Exclusions
 
@@ -204,7 +210,8 @@ investigated and rejected:
   partition, which is the root. Deleting swap therefore leaves an interior
   hole; shrinking the disk would require relocating the root partition, not
   just truncating the image.
-- UFS cannot shrink in place, so reducing the virtual size would mean
+- UFS cannot shrink in place, so reducing a manually built UFS image's
+  virtual size would mean
   rebuilding the root filesystem and forfeiting the in-place, verified-upstream
   provenance the whole pipeline is built around.
 - The virtual size is pinned per profile and is what Azure fixed-VHD derivation
@@ -225,7 +232,7 @@ preserving all three measures. Schema-2 candidates and staging manifests are
 intentionally rejected rather than guessed or migrated; build artifacts are
 short-lived and must be regenerated with complete size metadata.
 
-The combined UFS staging manifest carries both flavors, so the comparison
+The combined ZFS staging manifest carries both flavors, so the comparison
 table is produced from that one digest- and provenance-bound manifest:
 
 ```text
@@ -236,19 +243,19 @@ python3 scripts/freebsd15_release.py compare \
 
 The report shows full and core virtual, allocated, and compressed/download
 sizes and reductions for both architectures. Pairing is derived from exact
-`<architecture>-ufs-full` and `<architecture>-ufs-core` variant identities, so
+`<architecture>-zfs-full` and `<architecture>-zfs-core` variant identities, so
 the comparison direction cannot be reversed.
 
-UFS staging is also the core publication size gate. Both architectures must reduce
-both allocated and compressed/download size by at least 10% relative to their
-matching full UFS asset, while virtual size may not increase. The reviewed
-default is `CORE_MINIMUM_REDUCTION_PERCENT = 10`; maintainers may set
-`stage --minimum-core-reduction-percent` explicitly for a release review.
-The exact boundary is inclusive. Missing, incomplete, cross-filesystem,
-wrong-flavor, or wrong-architecture pairings fail closed, and external
-baseline manifests are not accepted. All four UFS candidates come from the
-same source commit and workflow run and all four enter the publication
-allowlist.
+ZFS staging is also the core publication size gate. Both architectures must
+reduce allocated and compressed/download size relative to their matching full
+ZFS asset, while virtual size may not increase. `describe` exposes the
+reviewed 10% threshold used by staging so the workflow and review use one
+value. Pre-publication validation measured reductions above 72% for both
+architectures in both metrics, leaving substantial margin above that
+conservative floor. Missing, incomplete, cross-filesystem, wrong-flavor, or
+wrong-architecture pairings fail closed, and external baseline manifests are
+not accepted. All four ZFS candidates come from the same source commit and
+workflow run and enter the publication allowlist together.
 
 Root storage handling is the one part that is deliberately *not* shared. The
 UFS and ZFS seeds embed disjoint shell fragments:
@@ -275,22 +282,23 @@ zig build generalized-freebsd15 -- \
   --architecture aarch64 \
   --filesystem ufs \
   --work-dir /path/to/aarch64-ufs-cache \
-  --output /path/to/FreeBSD-15.1-aarch64.qcow2
+  --output /path/to/FreeBSD-15.1-aarch64.ufs.qcow2
 
 zig build generalized-freebsd15 -- \
   --architecture x86_64 \
   --filesystem zfs \
   --work-dir /path/to/x86_64-zfs-cache \
-  --output /path/to/FreeBSD-15.1-x86_64.zfs.qcow2
+  --output /path/to/FreeBSD-15.1-x86_64.qcow2
 
 zig build generalized-freebsd15 -- \
   --architecture x86_64 \
+  --filesystem zfs \
   --flavor core \
-  --work-dir /path/to/x86_64-core-cache \
+  --work-dir /path/to/x86_64-zfs-core-cache \
   --output /path/to/FreeBSD-15.1-x86_64.core.qcow2
 ```
 
-`--filesystem` defaults to `ufs` and `--flavor` defaults to `full`; both, with
+`--filesystem` defaults to `zfs` and `--flavor` defaults to `full`; both, with
 `--architecture`, select exactly one profile, whose defaults for `--output` and
 `--work-dir` are used when those options are omitted.
 
@@ -314,18 +322,19 @@ zig build test-freebsd15-boot
 
 ZVMI_FREEBSD15_ARCHITECTURE=x86_64 \
 ZVMI_FREEBSD15_FILESYSTEM=zfs \
-ZVMI_FREEBSD15_IMAGE=/path/to/FreeBSD-15.1-x86_64.zfs.qcow2 \
+ZVMI_FREEBSD15_IMAGE=/path/to/FreeBSD-15.1-x86_64.qcow2 \
 ZVMI_FREEBSD15_QEMU=/usr/bin/qemu-system-x86_64 \
 zig build test-freebsd15-boot
 
 ZVMI_FREEBSD15_ARCHITECTURE=x86_64 \
+ZVMI_FREEBSD15_FILESYSTEM=zfs \
 ZVMI_FREEBSD15_FLAVOR=core \
 ZVMI_FREEBSD15_IMAGE=/path/to/FreeBSD-15.1-x86_64.core.qcow2 \
 ZVMI_FREEBSD15_QEMU=/usr/bin/qemu-system-x86_64 \
 zig build test-freebsd15-boot
 ```
 
-`ZVMI_FREEBSD15_FILESYSTEM` defaults to `ufs` and must match the image under
+`ZVMI_FREEBSD15_FILESYSTEM` defaults to `zfs` and must match the image under
 test, because the guest-side assertions are filesystem-specific.
 `ZVMI_FREEBSD15_FLAVOR` defaults to `full`; the flavor-specific assertions are
 generated from the same manifest the builder used, so acceptance and the image
@@ -345,27 +354,26 @@ filesystem to have grown past the shipped size, `gpart show` to report no
 `CORRUPT` GPT metadata, and every `gpart status` entry to read `OK`.
 
 The manually dispatched **Build, validate, and publish FreeBSD 15.1 images**
-workflow takes a `release_set` input that names exactly which assets a run may
-publish:
+workflow has one active release set:
 
 | Release set | Tag | Assets |
 | --- | --- | --- |
-| `ufs` | `FreeBSD-15.1-<reviewed YYYYMMDD>` | `FreeBSD-15.1-aarch64.qcow2`, `FreeBSD-15.1-x86_64.qcow2`, `FreeBSD-15.1-aarch64.core.qcow2`, `FreeBSD-15.1-x86_64.core.qcow2` |
-| `zfs` | `FreeBSD-15.1-zfs-20260729` | `FreeBSD-15.1-aarch64.zfs.qcow2`, `FreeBSD-15.1-x86_64.zfs.qcow2` |
+| `zfs` | `FreeBSD-15.1-<reviewed YYYYMMDD>` | `FreeBSD-15.1-aarch64.qcow2`, `FreeBSD-15.1-x86_64.qcow2`, `FreeBSD-15.1-aarch64.core.qcow2`, `FreeBSD-15.1-x86_64.core.qcow2` |
 
-The combined UFS line supersedes separate full-only and core-only dispatches;
-their already-published releases remain immutable historical releases. ZFS
-remains separate because a core ZFS profile is unsupported.
+The tag and assets are intentionally unqualified: neither `.zfs` nor `-zfs`
+appears in a default ZFS publication. UFS remains manually buildable, but
+there is no active UFS release-set option and no future UFS publication path.
+Previously published UFS, ZFS-qualified, full-only, and core-only releases are
+immutable historical releases; this workflow never replaces or edits them.
 
 `scripts/freebsd15_release.py matrix` expands the selected set into the build
 matrix and `describe` resolves its tag, title, asset count, and reviewed size
-threshold, so the tag, allowlist, and built variants cannot disagree. UFS
-requires the dispatcher to enter `release_date` explicitly as a valid calendar
-`YYYYMMDD`; there is no preselected proposed publication date. The historical
-full-only `FreeBSD-15.1-20260724` tag is reserved and cannot be selected by the
-new dated UFS set. Each candidate builds on a native GitHub-hosted runner, caches its
+threshold, so the tag, allowlist, and built variants cannot disagree. ZFS
+requires an explicit reviewed `release_date` in valid calendar `YYYYMMDD`
+form. Historical tags are reserved and cannot be selected for a replacement
+release. Each candidate builds on a native GitHub-hosted runner, caches its
 digest-pinned upstream source, persists its exact qemu-img validation JSON,
-validates the standalone QCOW2, and runs dual-instance acceptance. UFS staging
+validates the standalone QCOW2, and runs dual-instance acceptance. ZFS staging
 requires both architectures to pass the reviewed full-versus-core allocated
 and compressed/download reduction threshold and records virtual, allocated,
 compressed, and package-count evidence for both sides. A separate publication
@@ -376,6 +384,23 @@ publishes the non-Latest release. SHA-256 values, package manifests, retained
 and excluded core package contracts, all size evidence, and complete
 source/build/QEMU/Azure provenance are recorded in the release notes; checksum
 files and package-manifest sidecars are not published.
+
+The required procedure is:
+
+1. Dispatch `release_set=zfs` with the reviewed date and
+   `validation_only=true`.
+2. Review all four QEMU and exact-candidate Azure results, the candidate
+   manifests, and the same-manifest full/core ZFS size comparison against the
+   reviewed threshold reported by `describe`.
+3. After review, dispatch the identical merged `main` release configuration
+   with `validation_only=false`. Publication is gated on all four builds, all
+   four protected-environment Azure runs, staging reproduction, and the exact
+   four-asset allowlist.
+
+Validation-only uploads short-lived evidence and cannot create a tag, draft,
+asset, or release. Publication is possible only from merged `main`; the
+protected `azurelinux4-release` environment remains the credential boundary
+for Azure acceptance.
 
 The released QCOW2 files are not directly uploadable to Azure. Derive aligned
 fixed VHDs without changing their partitions:
@@ -388,9 +413,9 @@ zvmi azure derive \
   FreeBSD-15.1-aarch64.vhd
 ```
 
-Both release sets enforce exact-candidate Azure acceptance as a required gate
-before publication. ZFS validates its two full assets and UFS validates all
-four full and core assets with protected Azure boot-and-contract runs (using
+The ZFS release set enforces exact-candidate Azure acceptance as a required
+gate before publication. It validates all four full and core assets with
+protected Azure boot-and-contract runs (using
 `scripts/freebsd15_azure_acceptance.sh`) against the same build artifacts
 accepted by the QEMU step, and the publication script refuses to proceed unless
 the exact result matrix is present.
@@ -401,8 +426,9 @@ OIDC through the `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and
 `AZURE_SUBSCRIPTION_ID` secrets and selects the architecture-specific
 `AZURE_LOCATION_X64`/`AZURE_VM_SIZE_X64` or
 `AZURE_LOCATION_ARM64`/`AZURE_VM_SIZE_ARM64` configuration variables.
-The harness also accepts UFS full and core candidates, using the same protected
-subscription configuration and temporary-resource-group ownership model. Its
+The harness also accepts manually built UFS full and core candidates, using
+the same protected subscription configuration and temporary-resource-group
+ownership model. Its
 shared Gen2, provisioning, network, serial, reboot, identity, GPT, growth, and
 shutdown checks are combined with disjoint storage contracts: UFS proves root
 partition and filesystem growth without invoking ZFS, while ZFS preserves pool
