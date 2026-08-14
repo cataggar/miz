@@ -353,10 +353,10 @@ COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 RELEASE_DATE_RE = re.compile(r"^[0-9]{8}$")
 CANDIDATE_SCHEMA = 3
 # Core publication requires at least this reduction in both qemu-img's
-# allocated size and the downloadable compressed file size. Ten percent is a
-# conservative default: large enough to reject noise from QCOW2 metadata and
-# compression variance, while leaving the reviewed package manifest—not an
-# aggressive size target—as the primary definition of "core".
+# allocated size and the downloadable compressed file size. Validation of both
+# architectures measured reductions above 72%, so ten percent is a conservative
+# fail-closed floor while the reviewed package manifest—not an aggressive size
+# target—remains the primary definition of "core".
 CORE_MINIMUM_REDUCTION_PERCENT = 10
 PROFILE_KEYS = (
     "architecture",

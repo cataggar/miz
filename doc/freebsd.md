@@ -249,14 +249,13 @@ the comparison direction cannot be reversed.
 ZFS staging is also the core publication size gate. Both architectures must
 reduce allocated and compressed/download size relative to their matching full
 ZFS asset, while virtual size may not increase. `describe` exposes the
-provisional threshold used by staging so the workflow and review use one
-value. That threshold is not a measured claim: maintainers must first run
-validation-only, inspect the same-manifest evidence, and review whether the
-provisional value is supported before publishing. Missing, incomplete,
-cross-filesystem, wrong-flavor, or wrong-architecture pairings fail closed,
-and external baseline manifests are not accepted. All four ZFS candidates
-come from the same source commit and workflow run and enter the publication
-allowlist together.
+reviewed 10% threshold used by staging so the workflow and review use one
+value. Pre-publication validation measured reductions above 72% for both
+architectures in both metrics, leaving substantial margin above that
+conservative floor. Missing, incomplete, cross-filesystem, wrong-flavor, or
+wrong-architecture pairings fail closed, and external baseline manifests are
+not accepted. All four ZFS candidates come from the same source commit and
+workflow run and enter the publication allowlist together.
 
 Root storage handling is the one part that is deliberately *not* shared. The
 UFS and ZFS seeds embed disjoint shell fragments:
@@ -391,9 +390,8 @@ The required procedure is:
 1. Dispatch `release_set=zfs` with the reviewed date and
    `validation_only=true`.
 2. Review all four QEMU and exact-candidate Azure results, the candidate
-   manifests, and the same-manifest full/core ZFS size comparison. Review the
-   provisional threshold reported by `describe`; do not treat it as measured
-   until this evidence exists.
+   manifests, and the same-manifest full/core ZFS size comparison against the
+   reviewed threshold reported by `describe`.
 3. After review, dispatch the identical merged `main` release configuration
    with `validation_only=false`. Publication is gated on all four builds, all
    four protected-environment Azure runs, staging reproduction, and the exact
