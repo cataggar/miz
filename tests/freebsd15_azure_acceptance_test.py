@@ -1861,12 +1861,12 @@ def test_workflow_azure_acceptance_job_exists():
     assert "azure_acceptance:" in content
 
 
-def test_workflow_azure_acceptance_for_zfs_and_core_only():
+def test_workflow_azure_acceptance_runs_for_every_release_set():
     content = _workflow_content()
     idx = content.index("azure_acceptance:")
     section = content[idx : idx + 600]
-    assert "inputs.release_set == 'zfs'" in section
-    assert "inputs.release_set == 'core'" in section
+    assert "needs.build.result == 'success'" in section
+    assert "inputs.release_set ==" not in section
 
 
 def test_workflow_azure_acceptance_uses_release_set_matrix():
@@ -1894,11 +1894,11 @@ def test_workflow_staging_requires_azure_success_for_gated_sets():
     assert "needs.azure_acceptance.result == 'success'" in section
 
 
-def test_workflow_staging_allows_skipped_azure_for_ufs():
+def test_workflow_staging_does_not_allow_skipped_azure_for_ufs():
     content = _workflow_content()
     idx = content.index("\n  stage:")
     section = content[idx : idx + 600]
-    assert "inputs.release_set == 'ufs'" in section
+    assert "inputs.release_set == 'ufs'" not in section
 
 
 def test_workflow_azure_acceptance_uses_oidc():
@@ -1937,13 +1937,13 @@ def test_workflow_azure_acceptance_uses_harness():
     assert "scripts/freebsd15_azure_acceptance.sh cleanup" in section
 
 
-def test_workflow_publish_downloads_azure_results_for_zfs_and_core():
+def test_workflow_publish_downloads_azure_results_for_every_release_set():
     content = _workflow_content()
     idx = content.index("\n  publish:")
     section = content[idx:]
     assert "freebsd15-azure-*" in section
     assert "AZURE_RESULTS_DIR" in section
-    assert "inputs.release_set == 'zfs' || inputs.release_set == 'core'" in section
+    assert "inputs.release_set == 'core'" not in section
 
 
 def test_workflow_staging_fail_closed_check():
@@ -1952,7 +1952,7 @@ def test_workflow_staging_fail_closed_check():
         content.index("\n  stage:") : content.index("\n  publish:")
     ]
     assert 'test "$AZURE_RESULT" = success' in section
-    assert 'test "$count" -eq 2' in section
+    assert 'test "$count" -eq "$EXPECTED_ASSET_COUNT"' in section
 
 
 def test_workflow_artifact_naming_consistent():
@@ -1982,27 +1982,25 @@ def test_workflow_persists_exact_qemu_info_for_candidate_metadata():
     assert 'jq -r \'.\"actual-size\"\' "$CANDIDATE_DIR/qemu-img-info.json"' in content
 
 
-def test_core_workflow_builds_and_separates_full_ufs_baselines():
+def test_ufs_workflow_builds_one_combined_candidate_matrix():
     content = _workflow_content()
-    assert "BASELINE_CANDIDATES_DIR" in content
-    assert "freebsd15-candidate-*-ufs-core-" in content
-    assert "freebsd15-candidate-*-ufs-full-" in content
-    assert "Download exact core publication candidates" in content
-    assert "Download exact full UFS baseline candidates" in content
+    assert "BASELINE_CANDIDATES_DIR" not in content
+    assert "Download every build-validated candidate" in content
+    assert "freebsd15-candidate-*" in content
     assert "merge-multiple: false" in content
 
 
-def test_core_release_date_is_explicit_and_not_stale():
+def test_ufs_release_date_is_explicit_and_not_stale():
     content = _workflow_content()
-    assert "core_release_date:" in content
+    assert "release_date:" in content
     assert "Explicit reviewed YYYYMMDD" in content
-    assert "CORE_RELEASE_DATE" in content
+    assert "RELEASE_DATE" in content
     assert "--release-date" in content
     assert "20260730" not in content
 
 
-def test_ufs_full_does_not_require_azure_results():
+def test_combined_ufs_requires_azure_results():
     content = _workflow_content()
     stage = content[content.index("\n  stage:") : content.index("\n  publish:")]
-    assert "inputs.release_set == 'ufs' ||" in stage
-    assert "inputs.release_set != 'ufs' && '.release/freebsd15/azure-results'" in stage
+    assert "needs.azure_acceptance.result == 'success'" in stage
+    assert "AZURE_RESULTS_DIR: .release/freebsd15/azure-results" in stage

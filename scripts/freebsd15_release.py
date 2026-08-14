@@ -241,16 +241,25 @@ SOURCE_URL_PREFIX = (
 # consulting a second source of truth.
 RELEASE_SETS = {
     "ufs": {
-        "release_tag": "FreeBSD-15.1-20260724",
-        "release_title": "FreeBSD 15.1 - 20260724",
-        "variants": ("aarch64-ufs-full", "x86_64-ufs-full"),
+        "release_tag_prefix": "FreeBSD-15.1-",
+        "release_title_prefix": "FreeBSD 15.1 - ",
+        "requires_release_date": True,
+        "variants": (
+            "aarch64-ufs-full",
+            "x86_64-ufs-full",
+            "aarch64-ufs-core",
+            "x86_64-ufs-core",
+        ),
         "summary": (
-            "Generalized FreeBSD 15.1-RELEASE UFS images built with zvmi."
+            "Generalized FreeBSD 15.1-RELEASE full and core UFS images built "
+            "with zvmi."
         ),
         "highlights": (
-            "Added matching AArch64 and x86_64 release images.",
+            "Added matching AArch64 and x86_64 full and core release images.",
             "Each asset is a standalone zstd-compressed QCOW2 with no backing "
             "file.",
+            "The core flavor is realized by pkg from an explicit, reviewed "
+            "pkgbase manifest, not by deleting files from a full image.",
             "First boot grows the UFS root partition and filesystem to fill a "
             "larger disk without disturbing GPT metadata.",
         ),
@@ -271,30 +280,15 @@ RELEASE_SETS = {
             "`zpool_reguid` gives every instance a distinct pool GUID.",
         ),
     },
-    "core": {
-        "release_tag_prefix": "FreeBSD-15.1-core-",
-        "release_title_prefix": "FreeBSD 15.1 Core - ",
-        "requires_release_date": True,
-        "variants": ("aarch64-ufs-core", "x86_64-ufs-core"),
-        "summary": (
-            "Generalized FreeBSD 15.1-RELEASE UFS core images built with "
-            "zvmi."
-        ),
-        "highlights": (
-            "Added matching AArch64 and x86_64 core release images.",
-            "The core flavor is realized by pkg from an explicit, reviewed "
-            "pkgbase manifest, not by deleting files from a full image.",
-            "Compilers, debuggers, development headers, debug symbols, "
-            "32-bit compatibility libraries, tests, sources, and hardware "
-            "support the supported virtual machines never use are excluded.",
-            "UEFI boot, the release kernel, virtio and Hyper-V support, "
-            "key-only OpenSSH, nuageinit provisioning, `pkg`, the "
-            "FreeBSD-base update path, and the Azure Agent are retained and "
-            "verified in the guest and again on the host.",
-            "Package caches are removed and unused filesystem space is "
-            "reclaimed before the final standalone zstd QCOW2 compression.",
-        ),
-    },
+}
+
+UFS_CORE_VARIANTS = ("aarch64-ufs-core", "x86_64-ufs-core")
+
+# Historical tags remain published but are not dispatchable release sets.
+# Keeping their ownership explicit prevents the broad combined UFS prefix
+# from targeting an existing release.
+RESERVED_RELEASE_TAGS = {
+    "FreeBSD-15.1-20260724": "historical full UFS release",
 }
 
 AZURE_SHARED_CONTRACTS_BEFORE_STORAGE = (
@@ -420,11 +414,11 @@ def release_set(name: str) -> dict:
 
 def require_release_date(value: object) -> str:
     if not isinstance(value, str) or not RELEASE_DATE_RE.fullmatch(value):
-        raise ValueError("core release date must be an explicit YYYYMMDD value")
+        raise ValueError("release date must be an explicit YYYYMMDD value")
     try:
         datetime.strptime(value, "%Y%m%d")
     except ValueError as error:
-        raise ValueError("core release date is not a valid calendar date") from error
+        raise ValueError("release date is not a valid calendar date") from error
     return value
 
 
@@ -435,12 +429,18 @@ def release_identity(
     selected = release_set(name)
     if selected.get("requires_release_date"):
         reviewed_date = require_release_date(release_date)
-        return (
+        identity = (
             selected["release_tag_prefix"] + reviewed_date,
             selected["release_title_prefix"] + reviewed_date,
         )
+        if identity[0] in RESERVED_RELEASE_TAGS:
+            raise ValueError(
+                f"{identity[0]} belongs to "
+                f"{RESERVED_RELEASE_TAGS[identity[0]]}"
+            )
+        return identity
     if release_date not in (None, ""):
-        raise ValueError("release date is only applicable to core releases")
+        raise ValueError("release date is not applicable to this release set")
     return selected["release_tag"], selected["release_title"]
 
 
@@ -460,17 +460,11 @@ def validate_release_tag(name: str, tag: object) -> None:
 
 
 def build_variants(name: str) -> tuple[str, ...]:
-    selected = release_set(name)
-    if name == "core":
-        return (*selected["variants"], *RELEASE_SETS["ufs"]["variants"])
-    return selected["variants"]
+    return release_set(name)["variants"]
 
 
 def azure_variants(name: str) -> tuple[str, ...]:
-    selected = release_set(name)
-    if name in ("zfs", "core"):
-        return selected["variants"]
-    return ()
+    return release_set(name)["variants"]
 
 
 def azure_contracts(filesystem: str) -> tuple[str, ...]:
@@ -558,7 +552,6 @@ def load_qemu_image_info(path: Path, expected_virtual_size: int) -> dict:
 
 
 def matrix_command(args: argparse.Namespace) -> None:
-    selected = release_set(args.release_set)
     include = []
     for key in build_variants(args.release_set):
         variant = VARIANTS[key]
@@ -575,9 +568,7 @@ def matrix_command(args: argparse.Namespace) -> None:
                 "virtual_size": variant["virtual_size"],
                 "runner": variant["runner"],
                 "qemu": variant["qemu"],
-                "release_role": (
-                    "release" if key in selected["variants"] else "baseline"
-                ),
+                "release_role": "release",
             }
         )
     print(json.dumps({"include": include}, sort_keys=True))
@@ -935,8 +926,8 @@ def release_notes(
                 f"Both architectures passed the staging gate requiring at "
                 f"least {minimum_core_reduction_percent}% reduction in "
                 "qemu-img allocated size and compressed/download size. Core "
-                "virtual size may not exceed its same-source full UFS "
-                "baseline.",
+                "virtual size may not exceed its matching same-source full "
+                "UFS asset.",
             ]
         )
     if any(candidate["flavor"] == "core" for candidate in candidates):
@@ -1000,32 +991,6 @@ def release_notes(
                 "</details>",
             ]
         )
-    if core_rows is not None:
-        lines.extend(
-            [
-                "",
-                "## Full UFS baseline package manifests",
-                "",
-                "These same-dispatch baselines are size evidence only and "
-                "are not release assets.",
-            ]
-        )
-        for full, _ in core_rows:
-            package_manifest_record = full["package_manifest"]
-            lines.extend(
-                [
-                    "",
-                    f"<details><summary>{full['asset_name']} baseline package "
-                    f"manifest ({package_manifest_record['count']} packages)"
-                    "</summary>",
-                    "",
-                    "```",
-                    *package_manifest_record["names"],
-                    "```",
-                    "",
-                    "</details>",
-                ]
-            )
     lines.extend(
         [
             "",
@@ -1052,8 +1017,8 @@ def release_notes(
     if core_rows is not None:
         lines.extend(
             [
-                "- Full UFS baselines and core candidates were built in this "
-                "dispatch from the same source commit and the same "
+                "- Full and core UFS candidates were built in this dispatch "
+                "from the same source commit and the same "
                 "architecture-specific pinned UFS source name, URL, and "
                 "SHA-256.",
             ]
@@ -1128,13 +1093,8 @@ def stage_command(args: argparse.Namespace) -> None:
             f"{args.release_set} releases must be tagged "
             f"{expected_release_tag}"
         )
-    if args.release_set in ("zfs", "core"):
-        if args.azure_results is None:
-            raise ValueError(
-                f"{args.release_set} releases require --azure-results"
-            )
-    elif args.azure_results is not None:
-        raise ValueError("azure results are not applicable to this release set")
+    if args.azure_results is None:
+        raise ValueError(f"{args.release_set} releases require --azure-results")
 
     wanted = selected["variants"]
     manifests = sorted(args.candidates.rglob("candidate.json"))
@@ -1163,14 +1123,11 @@ def stage_command(args: argparse.Namespace) -> None:
         )
     )
     core_rows = None
-    if args.release_set == "core":
-        if getattr(args, "baseline", None) is None:
-            raise ValueError("core releases require a full UFS --baseline")
-        baseline = load_publish_manifest(args.baseline)
-        core_rows = full_core_rows(baseline, {
+    if args.release_set == "ufs":
+        core_rows = full_core_rows({
             "schema": CANDIDATE_SCHEMA,
             "type": "zvmi-freebsd15-release",
-            "release_set": "core",
+            "release_set": "ufs",
             "release_tag": expected_release_tag,
             "source_commit": args.source_commit,
             "assets": [
@@ -1178,106 +1135,101 @@ def stage_command(args: argparse.Namespace) -> None:
             ],
         })
         enforce_core_size_gate(core_rows, minimum_reduction)
-    elif getattr(args, "baseline", None) is not None:
-        raise ValueError("a size baseline is only applicable to core releases")
-
-    azure_by_variant = None
-    if args.release_set in ("zfs", "core"):
-        azure_manifests = sorted(args.azure_results.rglob("azure-result.json"))
-        if len(azure_manifests) != len(wanted):
-            raise ValueError(f"expected {len(wanted)} azure result manifests")
-        azure_by_variant = {}
-        for azure_manifest in azure_manifests:
-            document = json.loads(azure_manifest.read_text(encoding="utf-8"))
-            if document.get("schema") != CANDIDATE_SCHEMA:
-                raise ValueError(f"{azure_manifest}: unsupported schema")
-            if document.get("type") != "zvmi-freebsd15-azure-acceptance":
-                raise ValueError(f"{azure_manifest}: unexpected azure result type")
-            key = document.get("variant")
-            if key not in wanted:
-                raise ValueError(f"{azure_manifest}: unexpected variant")
-            if key in azure_by_variant:
-                raise ValueError(f"duplicate {key} azure result")
-            candidate = by_variant[key]
-            expected = VARIANTS[key]
-            for profile_key in (
-                "architecture",
-                "filesystem",
-                "flavor",
-                "asset_name",
-            ):
-                if document.get(profile_key) != expected[profile_key]:
-                    raise ValueError(
-                        f"{azure_manifest}: {profile_key} does not match profile"
-                    )
-            if document.get("source_commit") != args.source_commit:
-                raise ValueError(f"{azure_manifest}: source commit mismatch")
-            if document.get("qcow_sha256") != candidate["asset_sha256"]:
+    azure_manifests = sorted(args.azure_results.rglob("azure-result.json"))
+    if len(azure_manifests) != len(wanted):
+        raise ValueError(f"expected {len(wanted)} azure result manifests")
+    azure_by_variant = {}
+    for azure_manifest in azure_manifests:
+        document = json.loads(azure_manifest.read_text(encoding="utf-8"))
+        if document.get("schema") != CANDIDATE_SCHEMA:
+            raise ValueError(f"{azure_manifest}: unsupported schema")
+        if document.get("type") != "zvmi-freebsd15-azure-acceptance":
+            raise ValueError(f"{azure_manifest}: unexpected azure result type")
+        key = document.get("variant")
+        if key not in wanted:
+            raise ValueError(f"{azure_manifest}: unexpected variant")
+        if key in azure_by_variant:
+            raise ValueError(f"duplicate {key} azure result")
+        candidate = by_variant[key]
+        expected = VARIANTS[key]
+        for profile_key in (
+            "architecture",
+            "filesystem",
+            "flavor",
+            "asset_name",
+        ):
+            if document.get(profile_key) != expected[profile_key]:
                 raise ValueError(
-                    f"{azure_manifest}: QCOW SHA-256 does not match candidate"
+                    f"{azure_manifest}: {profile_key} does not match profile"
                 )
-            for field in ("virtual_size", "allocated_size", "compressed_size"):
-                if document.get(f"qcow_{field}") != candidate[field]:
-                    raise ValueError(
-                        f"{azure_manifest}: QCOW {field} does not match candidate"
-                    )
-            if document.get("status") != "success":
-                raise ValueError(f"{azure_manifest}: status is not success")
-            derived_vhd_bytes = document.get("derived_vhd_bytes")
-            derived_vhd_current_size = document.get(
-                "derived_vhd_current_size"
-            )
-            if (
-                not isinstance(derived_vhd_bytes, int)
-                or not isinstance(derived_vhd_current_size, int)
-                or derived_vhd_current_size <= 0
-                or derived_vhd_current_size % AZURE_VHD_ALIGNMENT != 0
-                or derived_vhd_bytes
-                != derived_vhd_current_size + VHD_FOOTER_BYTES
-            ):
-                raise ValueError(
-                    f"{azure_manifest}: derived VHD size evidence is inconsistent"
-                )
-            require_sha256(
-                document.get("derived_vhd_sha256", ""),
-                "derived VHD SHA-256",
-            )
-            require_non_empty(document.get("location", ""), "location")
-            require_non_empty(document.get("vm_size", ""), "vm_size")
-            require_non_empty(
-                document.get("resource_group", ""),
-                "resource_group",
-            )
-            if document.get("contracts") != list(
-                azure_contracts(candidate["filesystem"])
-            ):
-                raise ValueError(
-                    f"{azure_manifest}: contracts do not match required Azure contracts"
-                )
-            workflow = document.get("workflow")
-            if not isinstance(workflow, dict):
-                raise ValueError(f"{azure_manifest}: workflow is missing")
-            workflow_run_id = require_non_empty(
-                str(workflow.get("run_id", "")),
-                "run_id",
-            )
-            workflow_run_attempt = require_non_empty(
-                str(workflow.get("run_attempt", "")),
-                "run_attempt",
-            )
-            candidate_workflow = candidate["validation"]
-            if (
-                workflow_run_id != candidate_workflow["run_id"]
-                or workflow_run_attempt != candidate_workflow["run_attempt"]
-            ):
-                raise ValueError(
-                    f"{azure_manifest}: workflow identity does not match candidate"
-                )
-            azure_by_variant[key] = document
-        if set(azure_by_variant) != set(wanted):
+        if document.get("source_commit") != args.source_commit:
+            raise ValueError(f"{azure_manifest}: source commit mismatch")
+        if document.get("qcow_sha256") != candidate["asset_sha256"]:
             raise ValueError(
-                f"{args.release_set} azure result matrix is incomplete or unexpected"
+                f"{azure_manifest}: QCOW SHA-256 does not match candidate"
             )
+        for field in ("virtual_size", "allocated_size", "compressed_size"):
+            if document.get(f"qcow_{field}") != candidate[field]:
+                raise ValueError(
+                    f"{azure_manifest}: QCOW {field} does not match candidate"
+                )
+        if document.get("status") != "success":
+            raise ValueError(f"{azure_manifest}: status is not success")
+        derived_vhd_bytes = document.get("derived_vhd_bytes")
+        derived_vhd_current_size = document.get(
+            "derived_vhd_current_size"
+        )
+        if (
+            not isinstance(derived_vhd_bytes, int)
+            or not isinstance(derived_vhd_current_size, int)
+            or derived_vhd_current_size <= 0
+            or derived_vhd_current_size % AZURE_VHD_ALIGNMENT != 0
+            or derived_vhd_bytes
+            != derived_vhd_current_size + VHD_FOOTER_BYTES
+        ):
+            raise ValueError(
+                f"{azure_manifest}: derived VHD size evidence is inconsistent"
+            )
+        require_sha256(
+            document.get("derived_vhd_sha256", ""),
+            "derived VHD SHA-256",
+        )
+        require_non_empty(document.get("location", ""), "location")
+        require_non_empty(document.get("vm_size", ""), "vm_size")
+        require_non_empty(
+            document.get("resource_group", ""),
+            "resource_group",
+        )
+        if document.get("contracts") != list(
+            azure_contracts(candidate["filesystem"])
+        ):
+            raise ValueError(
+                f"{azure_manifest}: contracts do not match required Azure contracts"
+            )
+        workflow = document.get("workflow")
+        if not isinstance(workflow, dict):
+            raise ValueError(f"{azure_manifest}: workflow is missing")
+        workflow_run_id = require_non_empty(
+            str(workflow.get("run_id", "")),
+            "run_id",
+        )
+        workflow_run_attempt = require_non_empty(
+            str(workflow.get("run_attempt", "")),
+            "run_attempt",
+        )
+        candidate_workflow = candidate["validation"]
+        if (
+            workflow_run_id != candidate_workflow["run_id"]
+            or workflow_run_attempt != candidate_workflow["run_attempt"]
+        ):
+            raise ValueError(
+                f"{azure_manifest}: workflow identity does not match candidate"
+            )
+        azure_by_variant[key] = document
+    if set(azure_by_variant) != set(wanted):
+        raise ValueError(
+            f"{args.release_set} azure result matrix is incomplete or unexpected"
+        )
 
     args.output.mkdir(parents=True, exist_ok=True)
     candidates = [by_variant[key] for key in wanted]
@@ -1325,7 +1277,7 @@ def stage_command(args: argparse.Namespace) -> None:
             args.source_commit,
             azure_results=azure_by_variant,
             minimum_core_reduction_percent=(
-                minimum_reduction if args.release_set == "core" else None
+                minimum_reduction if args.release_set == "ufs" else None
             ),
             core_rows=core_rows,
         ),
@@ -1445,33 +1397,31 @@ def load_publish_manifest(path: Path) -> dict:
     return document
 
 
-def full_core_rows(baseline: dict, candidate: dict) -> list[tuple[dict, dict]]:
-    """Return architecture pairs in the only allowed comparison direction."""
-    if baseline.get("release_set") != "ufs":
-        raise ValueError("size baseline must be the full UFS release set")
-    if candidate.get("release_set") != "core":
-        raise ValueError("size candidate must be the core UFS release set")
-    if baseline.get("source_commit") != candidate.get("source_commit"):
-        raise ValueError("full UFS baseline and core source commits differ")
-    baseline_by_architecture = {
-        asset["architecture"]: asset for asset in baseline["assets"]
+def full_core_rows(release_manifest: dict) -> list[tuple[dict, dict]]:
+    """Pair full and core UFS assets in the only allowed comparison direction."""
+    if release_manifest.get("release_set") != "ufs":
+        raise ValueError("size comparison requires the combined UFS release set")
+    by_variant = {
+        asset["variant"]: asset for asset in release_manifest["assets"]
     }
     rows = []
-    for key in RELEASE_SETS["core"]["variants"]:
-        core = next(asset for asset in candidate["assets"] if asset["variant"] == key)
-        full = baseline_by_architecture.get(core["architecture"])
+    for key in UFS_CORE_VARIANTS:
+        core = by_variant.get(key)
+        if core is None:
+            raise ValueError(f"no {VARIANTS[key]['architecture']} core UFS asset")
+        expected_full = f"{core['architecture']}-ufs-full"
+        full = by_variant.get(expected_full)
         if full is None:
             raise ValueError(
-                f"no {core['architecture']} full UFS baseline asset"
+                f"no {core['architecture']} full UFS asset"
             )
-        expected_full = f"{core['architecture']}-ufs-full"
         if (
             full["variant"] != expected_full
             or full["filesystem"] != "ufs"
             or full["flavor"] != "full"
         ):
             raise ValueError(
-                f"{core['architecture']} baseline must be full UFS"
+                f"{core['architecture']} paired asset must be full UFS"
             )
         if core["filesystem"] != "ufs" or core["flavor"] != "core":
             raise ValueError(
@@ -1494,7 +1444,7 @@ def enforce_core_size_gate(
     minimum_reduction_percent: int,
 ) -> None:
     threshold = require_reduction_percent(minimum_reduction_percent)
-    if len(rows) != len(RELEASE_SETS["core"]["variants"]):
+    if len(rows) != len(UFS_CORE_VARIANTS):
         raise ValueError("core size gate requires both architectures")
     for full, core in rows:
         architecture = core["architecture"]
@@ -1514,15 +1464,9 @@ def enforce_core_size_gate(
 
 
 def compare_command(args: argparse.Namespace) -> None:
-    """Report the full-versus-core size comparison for two staged sets.
-
-    The argument roles are intentional and validated: baseline is full UFS,
-    candidate is core UFS. This prevents an accidental reversal from turning a
-    regression into a positive reduction.
-    """
-    baseline = load_publish_manifest(args.baseline)
+    """Report the full-versus-core size comparison within one staged set."""
     candidate = load_publish_manifest(args.candidate)
-    rows = full_core_rows(baseline, candidate)
+    rows = full_core_rows(candidate)
 
     lines = [
         "| Architecture | Full virtual | Core virtual | Virtual reduction | "
@@ -1624,11 +1568,6 @@ def parser() -> argparse.ArgumentParser:
     stage.add_argument("--release-date")
     stage.add_argument("--azure-results", type=Path, default=None)
     stage.add_argument(
-        "--baseline",
-        type=Path,
-        help="staged full UFS publish manifest; required for core",
-    )
-    stage.add_argument(
         "--minimum-core-reduction-percent",
         type=int,
         default=CORE_MINIMUM_REDUCTION_PERCENT,
@@ -1642,7 +1581,6 @@ def parser() -> argparse.ArgumentParser:
     stage.set_defaults(handler=stage_command)
 
     compare = commands.add_parser("compare")
-    compare.add_argument("--baseline", type=Path, required=True)
     compare.add_argument("--candidate", type=Path, required=True)
     compare.add_argument("--output", type=Path)
     compare.set_defaults(handler=compare_command)

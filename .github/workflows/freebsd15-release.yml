@@ -11,13 +11,12 @@ on:
         options:
           - ufs
           - zfs
-          - core
-      core_release_date:
-        description: Explicit reviewed YYYYMMDD date for a core release; leave blank for UFS/ZFS
+      release_date:
+        description: Explicit reviewed YYYYMMDD date for the combined UFS release; leave blank for ZFS
         type: string
         required: false
       validation_only:
-        description: Validate the core release without creating a tag or mutating a GitHub release
+        description: Validate the combined UFS release without creating a tag or mutating a GitHub release
         type: boolean
         required: true
         default: false
@@ -25,8 +24,8 @@ on:
 permissions:
   contents: read
 
-# Release sets publish disjoint assets under distinct tags, so UFS, ZFS, and
-# core runs may proceed independently; two runs of the same set may not.
+# Release sets publish disjoint assets under distinct tags, so UFS and ZFS
+# runs may proceed independently; two runs of the same set may not.
 concurrency:
   group: freebsd15-release-${{ inputs.release_set }}
   cancel-in-progress: false
@@ -43,6 +42,7 @@ jobs:
       azure_matrix: ${{ steps.set.outputs.azure_matrix }}
       release_tag: ${{ steps.set.outputs.release_tag }}
       release_title: ${{ steps.set.outputs.release_title }}
+      asset_count: ${{ steps.set.outputs.asset_count }}
     steps:
       - name: Check out merged main
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -65,7 +65,7 @@ jobs:
         id: set
         env:
           RELEASE_SET: ${{ inputs.release_set }}
-          CORE_RELEASE_DATE: ${{ inputs.core_release_date }}
+          RELEASE_DATE: ${{ inputs.release_date }}
           VALIDATION_ONLY: ${{ inputs.validation_only }}
         run: |
           set -euo pipefail
@@ -76,8 +76,8 @@ jobs:
               exit 1
               ;;
           esac
-          if [[ "$VALIDATION_ONLY" == true && "$RELEASE_SET" != core ]]; then
-            echo "::error::validation_only is only supported for release_set=core"
+          if [[ "$VALIDATION_ONLY" == true && "$RELEASE_SET" != ufs ]]; then
+            echo "::error::validation_only is only supported for release_set=ufs"
             exit 1
           fi
           matrix=$(python3 scripts/freebsd15_release.py matrix \
@@ -87,17 +87,17 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "azure_matrix=$azure_matrix" >> "$GITHUB_OUTPUT"
           describe_args=(--release-set "$RELEASE_SET")
-          if [[ "$RELEASE_SET" == core ]]; then
-            [[ "$CORE_RELEASE_DATE" =~ ^[0-9]{8}$ ]]
-            describe_args+=(--release-date "$CORE_RELEASE_DATE")
+          if [[ "$RELEASE_SET" == ufs ]]; then
+            [[ "$RELEASE_DATE" =~ ^[0-9]{8}$ ]]
+            describe_args+=(--release-date "$RELEASE_DATE")
           else
-            test -z "$CORE_RELEASE_DATE"
+            test -z "$RELEASE_DATE"
           fi
           python3 scripts/freebsd15_release.py describe \
             "${describe_args[@]}" >> "$GITHUB_OUTPUT"
           echo "Release set: \`$RELEASE_SET\`" >> "$GITHUB_STEP_SUMMARY"
-          if [[ "$RELEASE_SET" == core ]]; then
-            echo "Reviewed core release date: \`$CORE_RELEASE_DATE\`" \
+          if [[ "$RELEASE_SET" == ufs ]]; then
+            echo "Reviewed UFS release date: \`$RELEASE_DATE\`" \
               >> "$GITHUB_STEP_SUMMARY"
           fi
 
@@ -261,8 +261,7 @@ jobs:
       ${{
         always() &&
         needs.prepare.result == 'success' &&
-        needs.build.result == 'success' &&
-        (inputs.release_set == 'zfs' || inputs.release_set == 'core')
+        needs.build.result == 'success'
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: 240
@@ -428,10 +427,7 @@ jobs:
         always() &&
         needs.prepare.result == 'success' &&
         needs.build.result == 'success' &&
-        (
-          inputs.release_set == 'ufs' ||
-          needs.azure_acceptance.result == 'success'
-        )
+        needs.azure_acceptance.result == 'success'
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -443,12 +439,12 @@ jobs:
       RELEASE_SET: ${{ inputs.release_set }}
       RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
       RELEASE_TITLE: ${{ needs.prepare.outputs.release_title }}
-      RELEASE_DATE: ${{ inputs.core_release_date }}
+      RELEASE_DATE: ${{ inputs.release_date }}
       CANDIDATES_DIR: .release/freebsd15/candidates
-      BASELINE_CANDIDATES_DIR: .release/freebsd15/baseline-candidates
       STAGING_ROOT: .release/freebsd15/staging
-      AZURE_RESULTS_DIR: ${{ inputs.release_set != 'ufs' && '.release/freebsd15/azure-results' || '' }}
+      AZURE_RESULTS_DIR: .release/freebsd15/azure-results
       AZURE_RESULT: ${{ needs.azure_acceptance.result }}
+      EXPECTED_ASSET_COUNT: ${{ needs.prepare.outputs.asset_count }}
     steps:
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -456,32 +452,14 @@ jobs:
           ref: ${{ needs.prepare.outputs.source_commit }}
           persist-credentials: false
 
-      - name: Download every non-core build-validated candidate
-        if: inputs.release_set != 'core'
+      - name: Download every build-validated candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: freebsd15-candidate-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
           path: ${{ env.CANDIDATES_DIR }}
           merge-multiple: false
 
-      - name: Download exact core publication candidates
-        if: inputs.release_set == 'core'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: freebsd15-candidate-*-ufs-core-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
-          path: ${{ env.CANDIDATES_DIR }}
-          merge-multiple: false
-
-      - name: Download exact full UFS baseline candidates
-        if: inputs.release_set == 'core'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: freebsd15-candidate-*-ufs-full-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
-          path: ${{ env.BASELINE_CANDIDATES_DIR }}
-          merge-multiple: false
-
       - name: Download Azure acceptance results
-        if: inputs.release_set == 'zfs' || inputs.release_set == 'core'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: freebsd15-azure-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
@@ -489,13 +467,12 @@ jobs:
           merge-multiple: false
 
       - name: Fail closed on incomplete Azure gate
-        if: inputs.release_set == 'zfs' || inputs.release_set == 'core'
         run: |
           set -euo pipefail
           test "$AZURE_RESULT" = success
           test -d "$AZURE_RESULTS_DIR"
           count=$(find "$AZURE_RESULTS_DIR" -name 'azure-result.json' | wc -l)
-          test "$count" -eq 2
+          test "$count" -eq "$EXPECTED_ASSET_COUNT"
 
       - name: Stage and verify only the exact release-set allowlist
         run: scripts/freebsd15_stage_release.sh
@@ -538,14 +515,13 @@ jobs:
       RELEASE_SET: ${{ inputs.release_set }}
       RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
       RELEASE_TITLE: ${{ needs.prepare.outputs.release_title }}
-      RELEASE_DATE: ${{ inputs.core_release_date }}
+      RELEASE_DATE: ${{ inputs.release_date }}
       CANDIDATES_DIR: .release/freebsd15/candidates
-      BASELINE_CANDIDATES_DIR: .release/freebsd15/baseline-candidates
       STAGING_ROOT: .release/freebsd15/publication-staging
       PLAN_DIR: .release/freebsd15/publication-plan
       REPOSITORY: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
-      AZURE_RESULTS_DIR: ${{ inputs.release_set != 'ufs' && '.release/freebsd15/azure-results' || '' }}
+      AZURE_RESULTS_DIR: .release/freebsd15/azure-results
     steps:
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -553,32 +529,14 @@ jobs:
           ref: ${{ needs.prepare.outputs.source_commit }}
           persist-credentials: false
 
-      - name: Download every non-core build-validated candidate
-        if: inputs.release_set != 'core'
+      - name: Download every build-validated candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: freebsd15-candidate-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
           path: ${{ env.CANDIDATES_DIR }}
           merge-multiple: false
 
-      - name: Download exact core publication candidates
-        if: inputs.release_set == 'core'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: freebsd15-candidate-*-ufs-core-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
-          path: ${{ env.CANDIDATES_DIR }}
-          merge-multiple: false
-
-      - name: Download exact full UFS baseline candidates
-        if: inputs.release_set == 'core'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: freebsd15-candidate-*-ufs-full-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
-          path: ${{ env.BASELINE_CANDIDATES_DIR }}
-          merge-multiple: false
-
       - name: Download Azure acceptance results
-        if: inputs.release_set == 'zfs' || inputs.release_set == 'core'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: freebsd15-azure-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}

@@ -7,23 +7,17 @@ if [[ -z ${CANDIDATES_DIR:-} || -z ${SOURCE_COMMIT:-} ||
   echo "::error::Required staging configuration is incomplete"
   exit 1
 fi
-if [[ "$RELEASE_SET" == "zfs" || "$RELEASE_SET" == "core" ]]; then
-  if [[ -z ${AZURE_RESULTS_DIR:-} ]]; then
-    echo "::error::$RELEASE_SET releases require AZURE_RESULTS_DIR"
-    exit 1
-  fi
-fi
-if [[ "$RELEASE_SET" == "core" && -z ${BASELINE_CANDIDATES_DIR:-} ]]; then
-  echo "::error::Core releases require BASELINE_CANDIDATES_DIR"
+if [[ -z ${AZURE_RESULTS_DIR:-} ]]; then
+  echo "::error::$RELEASE_SET releases require AZURE_RESULTS_DIR"
   exit 1
 fi
-if [[ "$RELEASE_SET" == "core" ]]; then
+if [[ "$RELEASE_SET" == "ufs" ]]; then
   if [[ -z ${RELEASE_DATE:-} || ! "$RELEASE_DATE" =~ ^[0-9]{8}$ ]]; then
-    echo "::error::Core releases require an explicit reviewed RELEASE_DATE"
+    echo "::error::UFS releases require an explicit reviewed RELEASE_DATE"
     exit 1
   fi
 elif [[ -n ${RELEASE_DATE:-} ]]; then
-  echo "::error::RELEASE_DATE is only applicable to core releases"
+  echo "::error::RELEASE_DATE is only applicable to UFS releases"
   exit 1
 fi
 for tool in python3 sha256sum; do
@@ -36,7 +30,7 @@ done
 
 describe_args=(--release-set "$RELEASE_SET")
 stage_release_date_args=()
-if [[ "$RELEASE_SET" == "core" ]]; then
+if [[ "$RELEASE_SET" == "ufs" ]]; then
   describe_args+=(--release-date "$RELEASE_DATE")
   stage_release_date_args=(--release-date "$RELEASE_DATE")
 fi
@@ -60,34 +54,8 @@ mkdir -p "$STAGING_ROOT"
 assets_dir="$STAGING_ROOT/assets"
 notes_file="$STAGING_ROOT/release-notes.md"
 expected_file="$STAGING_ROOT/expected.tsv"
-baseline_dir="$STAGING_ROOT/full-ufs-baseline"
-baseline_notes="$STAGING_ROOT/full-ufs-baseline-notes.md"
 comparison_file="$STAGING_ROOT/size-comparison.md"
 evidence_dir="$STAGING_ROOT/evidence"
-
-azure_results_args=()
-if [[ "$RELEASE_SET" == "zfs" || "$RELEASE_SET" == "core" ]]; then
-  azure_results_args=(--azure-results "$AZURE_RESULTS_DIR")
-fi
-
-baseline_args=()
-if [[ "$RELEASE_SET" == "core" ]]; then
-  ufs_description=$(python3 scripts/freebsd15_release.py describe \
-    --release-set ufs)
-  ufs_tag=${ufs_description#*release_tag=}
-  ufs_tag=${ufs_tag%%$'\n'*}
-  python3 scripts/freebsd15_release.py stage \
-    --release-set ufs \
-    --candidates "$BASELINE_CANDIDATES_DIR" \
-    --source-commit "$SOURCE_COMMIT" \
-    --release-tag "$ufs_tag" \
-    --output "$baseline_dir" \
-    --notes "$baseline_notes"
-  baseline_args=(
-    --baseline "$baseline_dir/publish-manifest.json"
-    --minimum-core-reduction-percent "$minimum_core_reduction"
-  )
-fi
 
 python3 scripts/freebsd15_release.py stage \
   --release-set "$RELEASE_SET" \
@@ -95,14 +63,13 @@ python3 scripts/freebsd15_release.py stage \
   --source-commit "$SOURCE_COMMIT" \
   --release-tag "$RELEASE_TAG" \
   "${stage_release_date_args[@]}" \
-  "${azure_results_args[@]}" \
-  "${baseline_args[@]}" \
+  --azure-results "$AZURE_RESULTS_DIR" \
+  --minimum-core-reduction-percent "$minimum_core_reduction" \
   --output "$assets_dir" \
   --notes "$notes_file"
 
-if [[ "$RELEASE_SET" == "core" ]]; then
+if [[ "$RELEASE_SET" == "ufs" ]]; then
   python3 scripts/freebsd15_release.py compare \
-    --baseline "$baseline_dir/publish-manifest.json" \
     --candidate "$assets_dir/publish-manifest.json" \
     --output "$comparison_file" >/dev/null
 fi
@@ -125,7 +92,7 @@ done <"$expected_file"
 mkdir -p "$evidence_dir"
 cp "$assets_dir/publish-manifest.json" "$evidence_dir/publish-manifest.json"
 cp "$notes_file" "$evidence_dir/release-notes.md"
-if [[ "$RELEASE_SET" == "core" ]]; then
+if [[ "$RELEASE_SET" == "ufs" ]]; then
   cp "$comparison_file" "$evidence_dir/size-comparison.md"
 fi
 
@@ -144,24 +111,23 @@ manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
 variants = {asset["variant"] for asset in manifest["assets"]}
 evidence = Path(evidence_root)
 expected = {"publish-manifest.json", "release-notes.md"}
-if release_set == "core":
+if release_set == "ufs":
     expected.add("size-comparison.md")
-if release_set in {"zfs", "core"}:
-    source_documents = sorted(Path(azure_root).rglob("azure-result.json"))
-    copied = set()
-    for source in source_documents:
-        document = json.loads(source.read_text(encoding="utf-8"))
-        variant = document["variant"]
-        if variant not in variants or variant in copied:
-            raise SystemExit("unexpected or duplicate Azure evidence variant")
-        relative = Path("azure-results") / variant / "azure-result.json"
-        destination = evidence / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, destination)
-        copied.add(variant)
-        expected.add(relative.as_posix())
-    if copied != variants:
-        raise SystemExit("Azure evidence matrix is incomplete")
+source_documents = sorted(Path(azure_root).rglob("azure-result.json"))
+copied = set()
+for source in source_documents:
+    document = json.loads(source.read_text(encoding="utf-8"))
+    variant = document["variant"]
+    if variant not in variants or variant in copied:
+        raise SystemExit("unexpected or duplicate Azure evidence variant")
+    relative = Path("azure-results") / variant / "azure-result.json"
+    destination = evidence / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+    copied.add(variant)
+    expected.add(relative.as_posix())
+if copied != variants:
+    raise SystemExit("Azure evidence matrix is incomplete")
 
 actual = {
     path.relative_to(evidence).as_posix()

@@ -8,13 +8,13 @@ if [[ -z ${SOURCE_COMMIT:-} || -z ${RELEASE_SET:-} ||
   echo "::error::Required publication configuration is incomplete"
   exit 1
 fi
-if [[ "$RELEASE_SET" == "core" ]]; then
+if [[ "$RELEASE_SET" == "ufs" ]]; then
   if [[ -z ${RELEASE_DATE:-} || ! "$RELEASE_DATE" =~ ^[0-9]{8}$ ]]; then
-    echo "::error::Core releases require an explicit reviewed RELEASE_DATE"
+    echo "::error::UFS releases require an explicit reviewed RELEASE_DATE"
     exit 1
   fi
 elif [[ -n ${RELEASE_DATE:-} ]]; then
-  echo "::error::RELEASE_DATE is only applicable to core releases"
+  echo "::error::RELEASE_DATE is only applicable to UFS releases"
   exit 1
 fi
 for tool in gh python3 sha256sum; do
@@ -27,7 +27,7 @@ done
 [[ "$REPOSITORY" == cataggar/zvmi ]]
 
 describe_args=(--release-set "$RELEASE_SET")
-if [[ "$RELEASE_SET" == "core" ]]; then
+if [[ "$RELEASE_SET" == "ufs" ]]; then
   describe_args+=(--release-date "$RELEASE_DATE")
 fi
 release_description=$(python3 scripts/freebsd15_release.py describe \

@@ -225,38 +225,30 @@ preserving all three measures. Schema-2 candidates and staging manifests are
 intentionally rejected rather than guessed or migrated; build artifacts are
 short-lived and must be regenerated with complete size metadata.
 
-Given two staged release sets, the comparison table of full against core is
-produced by:
+The combined UFS staging manifest carries both flavors, so the comparison
+table is produced from that one digest- and provenance-bound manifest:
 
 ```text
 python3 scripts/freebsd15_release.py compare \
-  --baseline .release/freebsd15/staging-ufs/publish-manifest.json \
-  --candidate .release/freebsd15/staging-core/publish-manifest.json \
+  --candidate .release/freebsd15/staging/assets/publish-manifest.json \
   --output comparison.md
 ```
 
 The report shows full and core virtual, allocated, and compressed/download
-sizes and reductions for both architectures. Argument roles are strict:
-`--baseline` must be the two-architecture full UFS release and `--candidate`
-must be the corresponding core UFS release, so reversing the comparison cannot
-turn a regression into an apparent improvement.
+sizes and reductions for both architectures. Pairing is derived from exact
+`<architecture>-ufs-full` and `<architecture>-ufs-core` variant identities, so
+the comparison direction cannot be reversed.
 
-Core staging is also the publication size gate. Both architectures must reduce
+UFS staging is also the core publication size gate. Both architectures must reduce
 both allocated and compressed/download size by at least 10% relative to their
-matching full UFS baselines, while virtual size may not increase. The reviewed
+matching full UFS asset, while virtual size may not increase. The reviewed
 default is `CORE_MINIMUM_REDUCTION_PERCENT = 10`; maintainers may set
 `stage --minimum-core-reduction-percent` explicitly for a release review.
-The exact boundary is inclusive. A full UFS staging manifest is mandatory via
-`stage --baseline`; missing, incomplete, cross-filesystem, wrong-flavor, or
-wrong-architecture baselines fail closed.
-
-For a core dispatch, the same source commit builds four candidates: the two
-core assets plus full UFS candidates for both architectures. Publication
-stages and validates the full candidates locally to create the baseline
-manifest, then passes that manifest into core staging. The baseline JSON is
-therefore derived from digest-, package-, provenance-, and qemu-info-bound
-artifacts from the same run; an external baseline JSON is never trusted. Only
-the two core assets enter the publication allowlist.
+The exact boundary is inclusive. Missing, incomplete, cross-filesystem,
+wrong-flavor, or wrong-architecture pairings fail closed, and external
+baseline manifests are not accepted. All four UFS candidates come from the
+same source commit and workflow run and all four enter the publication
+allowlist.
 
 Root storage handling is the one part that is deliberately *not* shared. The
 UFS and ZFS seeds embed disjoint shell fragments:
@@ -358,20 +350,22 @@ publish:
 
 | Release set | Tag | Assets |
 | --- | --- | --- |
-| `ufs` | `FreeBSD-15.1-20260724` | `FreeBSD-15.1-aarch64.qcow2`, `FreeBSD-15.1-x86_64.qcow2` |
+| `ufs` | `FreeBSD-15.1-<reviewed YYYYMMDD>` | `FreeBSD-15.1-aarch64.qcow2`, `FreeBSD-15.1-x86_64.qcow2`, `FreeBSD-15.1-aarch64.core.qcow2`, `FreeBSD-15.1-x86_64.core.qcow2` |
 | `zfs` | `FreeBSD-15.1-zfs-20260729` | `FreeBSD-15.1-aarch64.zfs.qcow2`, `FreeBSD-15.1-x86_64.zfs.qcow2` |
-| `core` | `FreeBSD-15.1-core-<reviewed YYYYMMDD>` | `FreeBSD-15.1-aarch64.core.qcow2`, `FreeBSD-15.1-x86_64.core.qcow2` |
+
+The combined UFS line supersedes separate full-only and core-only dispatches;
+their already-published releases remain immutable historical releases. ZFS
+remains separate because a core ZFS profile is unsupported.
 
 `scripts/freebsd15_release.py matrix` expands the selected set into the build
 matrix and `describe` resolves its tag, title, asset count, and reviewed size
-threshold, so the tag, allowlist, and built variants cannot disagree. Core
-requires the dispatcher to enter `core_release_date` explicitly as a valid
-calendar `YYYYMMDD`; there is no preselected proposed publication date. Core
-adds the two full UFS baseline builds described above from the same source
-commit and architecture-specific pinned UFS sources; its published asset count
-remains two. Each candidate builds on a native GitHub-hosted runner, caches its
+threshold, so the tag, allowlist, and built variants cannot disagree. UFS
+requires the dispatcher to enter `release_date` explicitly as a valid calendar
+`YYYYMMDD`; there is no preselected proposed publication date. The historical
+full-only `FreeBSD-15.1-20260724` tag is reserved and cannot be selected by the
+new dated UFS set. Each candidate builds on a native GitHub-hosted runner, caches its
 digest-pinned upstream source, persists its exact qemu-img validation JSON,
-validates the standalone QCOW2, and runs dual-instance acceptance. Core staging
+validates the standalone QCOW2, and runs dual-instance acceptance. UFS staging
 requires both architectures to pass the reviewed full-versus-core allocated
 and compressed/download reduction threshold and records virtual, allocated,
 compressed, and package-count evidence for both sides. A separate publication
@@ -380,8 +374,8 @@ source commit, stages a draft, uploads exactly the release set's assets,
 verifies GitHub's asset digests and a fresh exact-allowlist download, and then
 publishes the non-Latest release. SHA-256 values, package manifests, retained
 and excluded core package contracts, all size evidence, and complete
-source/build/QEMU/Azure provenance are recorded in the release notes; baseline
-images, checksum files, and package-manifest sidecars are not published.
+source/build/QEMU/Azure provenance are recorded in the release notes; checksum
+files and package-manifest sidecars are not published.
 
 The released QCOW2 files are not directly uploadable to Azure. Derive aligned
 fixed VHDs without changing their partitions:
@@ -394,13 +388,12 @@ zvmi azure derive \
   FreeBSD-15.1-aarch64.vhd
 ```
 
-The ZFS and core release workflows enforce exact-candidate Azure acceptance as
-a required gate before publication: both architectures must pass a protected
-Azure boot-and-contract validation run (using
+Both release sets enforce exact-candidate Azure acceptance as a required gate
+before publication. ZFS validates its two full assets and UFS validates all
+four full and core assets with protected Azure boot-and-contract runs (using
 `scripts/freebsd15_azure_acceptance.sh`) against the same build artifacts
 accepted by the QEMU step, and the publication script refuses to proceed unless
-both `azure-result.json` files are present. Full UFS publication retains its
-existing QEMU-only behavior and rejects accidental Azure-result input.
+the exact result matrix is present.
 The Azure acceptance job reuses the existing protected
 `azurelinux4-release` GitHub environment so FreeBSD validation runs in the
 same Azure subscription as Azure Linux validation. It authenticates only with
