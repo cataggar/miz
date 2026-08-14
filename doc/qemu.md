@@ -43,7 +43,7 @@ on AArch64 hosts and x86_64 otherwise. The default model is `full`;
 `--model core` selects the matching `*.core.qcow2` asset. Model selection
 applies to catalog aliases, while an explicit image path remains authoritative.
 If the selected image is absent, `zvmi` runs the verified ghr download for its
-pinned `AzureLinux-4.0-20260723` release asset.
+pinned `AzureLinux-4.0-20260814` release asset.
 The `FreeBSD` alias similarly selects the host-native FreeBSD 15.1 image from
 release `FreeBSD-15.1-20260724`; on an AArch64 host it downloads
 `FreeBSD-15.1-aarch64.qcow2`.
@@ -178,7 +178,7 @@ zvmi qemu AzureLinux-4.0-aarch64
 ```
 
 The exact `AzureLinux-4.0-aarch64.qcow2` asset is downloaded from release
-`AzureLinux-4.0-20260723` when it is not already present.
+`AzureLinux-4.0-20260814` when it is not already present.
 
 Use `--qemu`, `--firmware-code`, and `--firmware-vars` (or the compatible
 `--ovmf-code`/`--ovmf-vars` names) for non-standard installations. Arguments

@@ -51,7 +51,7 @@ const known_images = [_]KnownImage{
     .{
         .alias = "AzureLinux-4.0-x86_64",
         .disk_name = "AzureLinux-4.0-x86_64.qcow2",
-        .release_spec = "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260723",
+        .release_spec = "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260814",
         .architecture = .x86_64,
         .image_sha256 = "e7b79748bc994f55c20b48d07323d4fb2695703380c7a8abc068d39f46711ce3",
         .certificate_sha256 = release_certificate_sha256,
@@ -61,7 +61,7 @@ const known_images = [_]KnownImage{
     .{
         .alias = "AzureLinux-4.0-aarch64",
         .disk_name = "AzureLinux-4.0-aarch64.qcow2",
-        .release_spec = "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260723",
+        .release_spec = "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260814",
         .architecture = .aarch64,
         .image_sha256 = "590c6eddbbbc952ff21c8d9a026ae16e10f22ad71e940dc87c10e5e8016ef544",
         .certificate_sha256 = release_certificate_sha256,
@@ -71,7 +71,7 @@ const known_images = [_]KnownImage{
     .{
         .alias = "AzureLinux-4.0-x86_64",
         .disk_name = "AzureLinux-4.0-x86_64.core.qcow2",
-        .release_spec = "cataggar/zvmi/AzureLinux-4.0-x86_64.core.qcow2@AzureLinux-4.0-20260723",
+        .release_spec = "cataggar/zvmi/AzureLinux-4.0-x86_64.core.qcow2@AzureLinux-4.0-20260814",
         .architecture = .x86_64,
         .image_sha256 = "44992c857178e95b3a3d2c2c1c2008791d3e5a704f845f4500cc6e86a0baadc6",
         .certificate_sha256 = release_certificate_sha256,
@@ -81,7 +81,7 @@ const known_images = [_]KnownImage{
     .{
         .alias = "AzureLinux-4.0-aarch64",
         .disk_name = "AzureLinux-4.0-aarch64.core.qcow2",
-        .release_spec = "cataggar/zvmi/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260723",
+        .release_spec = "cataggar/zvmi/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260814",
         .architecture = .aarch64,
         .image_sha256 = "ff294c8655ea80f890a41a7c6dc545d997da498dc5f5f03fd3aee8dea81b0f65",
         .certificate_sha256 = release_certificate_sha256,
@@ -4697,15 +4697,15 @@ test "qemu-img snapshot overlay argv is explicit" {
 
 test "qemu release download specs remain pinned to validated releases" {
     try std.testing.expectEqualStrings(
-        "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260723",
+        "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260814",
         default_image_spec,
     );
     try std.testing.expectEqualStrings(
-        "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260723",
+        "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260814",
         known_images[0].release_spec,
     );
     try std.testing.expectEqualStrings(
-        "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260723",
+        "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260814",
         known_images[1].release_spec,
     );
     try std.testing.expectEqualStrings(
@@ -4717,11 +4717,11 @@ test "qemu release download specs remain pinned to validated releases" {
         known_images[3].image_sha256,
     );
     try std.testing.expectEqualStrings(
-        "cataggar/zvmi/AzureLinux-4.0-x86_64.core.qcow2@AzureLinux-4.0-20260723",
+        "cataggar/zvmi/AzureLinux-4.0-x86_64.core.qcow2@AzureLinux-4.0-20260814",
         known_images[2].release_spec,
     );
     try std.testing.expectEqualStrings(
-        "cataggar/zvmi/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260723",
+        "cataggar/zvmi/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260814",
         known_images[3].release_spec,
     );
     try std.testing.expectEqualStrings(
@@ -4755,7 +4755,7 @@ test "qemu known image download argv is exact" {
     try expectArgv(&.{
         "ghr",
         "download",
-        "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260723",
+        "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260814",
         "--sha256",
         "590c6eddbbbc952ff21c8d9a026ae16e10f22ad71e940dc87c10e5e8016ef544",
         "--output",
@@ -4777,7 +4777,7 @@ test "qemu core image download argv is exact" {
     try expectArgv(&.{
         "ghr",
         "download",
-        "cataggar/zvmi/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260723",
+        "cataggar/zvmi/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260814",
         "--sha256",
         "ff294c8655ea80f890a41a7c6dc545d997da498dc5f5f03fd3aee8dea81b0f65",
         "--output",
