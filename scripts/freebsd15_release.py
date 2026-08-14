@@ -25,7 +25,7 @@ VARIANTS = {
         "filesystem": "ufs",
         "flavor": "full",
         "source_directory": "aarch64",
-        "asset_name": "FreeBSD-15.1-aarch64.qcow2",
+        "asset_name": "FreeBSD-15.1-aarch64.ufs.qcow2",
         "source_name": (
             "FreeBSD-15.1-RELEASE-arm64-aarch64-"
             "BASIC-CLOUDINIT-ufs.qcow2.xz"
@@ -42,7 +42,7 @@ VARIANTS = {
         "filesystem": "ufs",
         "flavor": "full",
         "source_directory": "amd64",
-        "asset_name": "FreeBSD-15.1-x86_64.qcow2",
+        "asset_name": "FreeBSD-15.1-x86_64.ufs.qcow2",
         "source_name": (
             "FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz"
         ),
@@ -86,14 +86,14 @@ VARIANTS = {
         "runner": "ubuntu-24.04",
         "qemu": "/usr/bin/qemu-system-x86_64",
     },
-    # The core variants start from the same pinned UFS sources as the full
-    # ones: only the package manifest the guest realizes differs.
+    # Core variants start from the matching full profile's pinned source;
+    # only the package manifest the guest realizes differs.
     "aarch64-ufs-core": {
         "architecture": "aarch64",
         "filesystem": "ufs",
         "flavor": "core",
         "source_directory": "aarch64",
-        "asset_name": "FreeBSD-15.1-aarch64.core.qcow2",
+        "asset_name": "FreeBSD-15.1-aarch64.ufs.core.qcow2",
         "source_name": (
             "FreeBSD-15.1-RELEASE-arm64-aarch64-"
             "BASIC-CLOUDINIT-ufs.qcow2.xz"
@@ -110,7 +110,7 @@ VARIANTS = {
         "filesystem": "ufs",
         "flavor": "core",
         "source_directory": "amd64",
-        "asset_name": "FreeBSD-15.1-x86_64.core.qcow2",
+        "asset_name": "FreeBSD-15.1-x86_64.ufs.core.qcow2",
         "source_name": (
             "FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz"
         ),
@@ -194,8 +194,8 @@ SHARED_REQUIRED_PACKAGES = (
 )
 
 FILESYSTEM_REQUIRED_PACKAGES = {
-    "ufs": ("FreeBSD-ufs",),
-    "zfs": ("FreeBSD-zfs",),
+    "ufs": ("FreeBSD-ufs", "FreeBSD-ufs-lib"),
+    "zfs": ("FreeBSD-zfs", "FreeBSD-zfs-lib"),
 }
 
 LIBRARY_ROOTS = (

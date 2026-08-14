@@ -1160,9 +1160,25 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             [
                 name
                 for name in required
-                if name not in ("FreeBSD-ufs", "FreeBSD-zfs")
+                if name
+                not in (
+                    "FreeBSD-ufs",
+                    "FreeBSD-ufs-lib",
+                    "FreeBSD-zfs",
+                    "FreeBSD-zfs-lib",
+                )
             ],
         )
+        self.assertEqual(
+            release.FILESYSTEM_REQUIRED_PACKAGES,
+            {
+                "ufs": ("FreeBSD-ufs", "FreeBSD-ufs-lib"),
+                "zfs": ("FreeBSD-zfs", "FreeBSD-zfs-lib"),
+            },
+        )
+        for packages in release.FILESYSTEM_REQUIRED_PACKAGES.values():
+            for package in packages:
+                self.assertIn(f'.name = "{package}"', source)
         self.assertEqual(
             list(release.LIBRARY_ROOTS), zig_string_list(source, "library_roots")
         )
@@ -1225,16 +1241,22 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
                                     if name != package
                                 ],
                             )
-        for filesystem, package in (
-            ("ufs", "FreeBSD-ufs"),
-            ("zfs", "FreeBSD-zfs"),
+        for filesystem, packages in (
+            ("ufs", ("FreeBSD-ufs", "FreeBSD-ufs-lib")),
+            ("zfs", ("FreeBSD-zfs", "FreeBSD-zfs-lib")),
         ):
             with self.subTest(filesystem=filesystem):
                 for flavor in ("full", "core"):
                     manifest = release.package_manifest(filesystem, flavor)
-                    self.assertIn(package, manifest["required"])
-                    other = "FreeBSD-zfs" if filesystem == "ufs" else "FreeBSD-ufs"
-                    self.assertNotIn(other, manifest["required"])
+                    for package in packages:
+                        self.assertIn(package, manifest["required"])
+                    other = (
+                        ("FreeBSD-zfs", "FreeBSD-zfs-lib")
+                        if filesystem == "ufs"
+                        else ("FreeBSD-ufs", "FreeBSD-ufs-lib")
+                    )
+                    for package in other:
+                        self.assertNotIn(package, manifest["required"])
 
     def test_core_retains_exact_sysrc_provider_without_broad_sets(self):
         core = release.package_manifest("zfs", "core")
@@ -1592,10 +1614,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             r"        required: true\n"
             r"        default: false",
         )
-        self.assertIn(
-            "validation_only is only supported for release_set=ufs",
-            source,
-        )
+        self.assertIn('test "$RELEASE_SET" = zfs', source)
         self.assertIn("needs: [prepare, build, azure_acceptance]", stage_block)
         self.assertIn("environment: azurelinux4-release", source)
         self.assertIn("scripts/freebsd15_stage_release.sh", stage_block)

@@ -1996,7 +1996,11 @@ def test_zfs_release_date_is_explicit_and_reviewed():
     content = _workflow_content()
     assert "release_date:" in content
     assert "Explicit reviewed YYYYMMDD" in content
-    assert 'default: "20260814"' in content
+    release_date = content.split("      release_date:", 1)[1].split(
+        "      validation_only:", 1
+    )[0]
+    assert "required: true" in release_date
+    assert "default:" not in release_date
     assert "RELEASE_DATE" in content
     assert "--release-date" in content
     assert "20260730" not in content

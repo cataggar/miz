@@ -14,7 +14,6 @@ on:
         description: Explicit reviewed YYYYMMDD date for the combined ZFS release
         type: string
         required: true
-        default: "20260814"
       validation_only:
         description: Validate the combined ZFS release without creating a tag or mutating a GitHub release
         type: boolean
