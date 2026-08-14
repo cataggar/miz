@@ -108,7 +108,7 @@ fn rootFilesystemFromEnvironment(allocator: Allocator) !RootFilesystem {
     const value = try optionalEnvAlloc(
         allocator,
         "ZVMI_FREEBSD15_FILESYSTEM",
-    ) orelse return .ufs;
+    ) orelse return .zfs;
     defer allocator.free(value);
     return RootFilesystem.parse(value) orelse error.InvalidRootFilesystem;
 }
@@ -893,9 +893,16 @@ fn replaceTokenAlloc(
 /// required here in the same diff, and nothing else can quietly drop one.
 fn staticPackageRemoteChecksAlloc(
     allocator: Allocator,
+    root_filesystem: RootFilesystem,
     flavor: Flavor,
 ) ![]u8 {
-    const manifest = packages.forFlavor(flavor);
+    const manifest = packages.forProfile(
+        switch (root_filesystem) {
+            .ufs => .ufs,
+            .zfs => .zfs,
+        },
+        flavor,
+    );
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     for (manifest.required) |package| {
@@ -927,9 +934,16 @@ fn staticPackageRemoteChecksAlloc(
 /// first refresh is a bounded network operation rather than an SSH probe.
 fn updateRemoteChecksAlloc(
     allocator: Allocator,
+    root_filesystem: RootFilesystem,
     flavor: Flavor,
 ) ![]u8 {
-    const manifest = packages.forFlavor(flavor);
+    const manifest = packages.forProfile(
+        switch (root_filesystem) {
+            .ufs => .ufs,
+            .zfs => .zfs,
+        },
+        flavor,
+    );
     return std.fmt.allocPrint(
         allocator,
         "set -eu\n" ++
@@ -1003,7 +1017,11 @@ fn staticRemoteChecksAlloc(
         minimum,
     );
     defer allocator.free(rendered);
-    const contract = try staticPackageRemoteChecksAlloc(allocator, flavor);
+    const contract = try staticPackageRemoteChecksAlloc(
+        allocator,
+        root_filesystem,
+        flavor,
+    );
     defer allocator.free(contract);
     return std.fmt.allocPrint(
         allocator,
@@ -1238,42 +1256,46 @@ test "static remote checks stay filesystem-specific" {
     try std.testing.expect(std.mem.indexOf(u8, zfs, "df -k /") == null);
 }
 
-test "static remote checks enforce the retained contract for every flavor" {
+test "static remote checks enforce each filesystem and flavor contract" {
     const allocator = std.testing.allocator;
-    const full = try staticRemoteChecksAlloc(allocator, .ufs, .full);
-    defer allocator.free(full);
-    const core = try staticRemoteChecksAlloc(allocator, .ufs, .core);
-    defer allocator.free(core);
-
-    for ([_][]const u8{ full, core }) |checks| {
-        // Every clause of the retain-at-minimum list is a package the booted
-        // image must still carry, so losing one fails acceptance rather than
-        // shipping.
-        for (packages.required_packages) |package| {
-            const line = try std.fmt.allocPrint(
+    for (std.enums.values(RootFilesystem)) |filesystem| {
+        for (std.enums.values(Flavor)) |flavor| {
+            const checks = try staticRemoteChecksAlloc(
                 allocator,
-                "\n/usr/local/sbin/pkg info -e {s}\n",
-                .{package.name},
+                filesystem,
+                flavor,
             );
-            defer allocator.free(line);
-            try std.testing.expect(
-                std.mem.indexOf(u8, checks, line) != null,
+            defer allocator.free(checks);
+            const manifest = packages.forProfile(
+                switch (filesystem) {
+                    .ufs => .ufs,
+                    .zfs => .zfs,
+                },
+                flavor,
             );
+            for (manifest.required) |package| {
+                const line = try std.fmt.allocPrint(
+                    allocator,
+                    "\n/usr/local/sbin/pkg info -e {s}\n",
+                    .{package.name},
+                );
+                defer allocator.free(line);
+                try std.testing.expect(std.mem.indexOf(u8, checks, line) != null);
+            }
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                checks,
+                "! /usr/local/sbin/pkg info -e tree",
+            ) != null);
+            try std.testing.expect(std.mem.indexOf(u8, checks, "pkg update") == null);
+            try std.testing.expect(std.mem.indexOf(u8, checks, "pkg install") == null);
         }
-        try std.testing.expect(std.mem.indexOf(
-            u8,
-            checks,
-            "! /usr/local/sbin/pkg info -e tree",
-        ) != null);
-        try std.testing.expect(std.mem.indexOf(
-            u8,
-            checks,
-            "pkg update",
-        ) == null);
-        try std.testing.expect(std.mem.indexOf(u8, checks, "pkg install") == null);
     }
 
-    // Only the core flavor claims exclusions, so only it may assert them.
+    const full = try staticRemoteChecksAlloc(allocator, .zfs, .full);
+    defer allocator.free(full);
+    const core = try staticRemoteChecksAlloc(allocator, .zfs, .core);
+    defer allocator.free(core);
     for (packages.core_excluded_packages) |excluded| {
         const line = try std.fmt.allocPrint(
             allocator,
@@ -1298,11 +1320,13 @@ test "static remote checks enforce the retained contract for every flavor" {
         core,
         "'^FreeBSD-.*-dbg$'",
     ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, core, "FreeBSD-zfs\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, core, "FreeBSD-zfs-lib\n") != null);
 }
 
 test "package contract phases preserve update and lifecycle ordering" {
     const allocator = std.testing.allocator;
-    const update = try updateRemoteChecksAlloc(allocator, .core);
+    const update = try updateRemoteChecksAlloc(allocator, .zfs, .core);
     defer allocator.free(update);
     const lifecycle = try packageLifecycleRemoteChecksAlloc(allocator);
     defer allocator.free(lifecycle);
@@ -1561,7 +1585,11 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
         flavor,
     );
     defer allocator.free(static_remote_checks);
-    const update_remote_checks = try updateRemoteChecksAlloc(allocator, flavor);
+    const update_remote_checks = try updateRemoteChecksAlloc(
+        allocator,
+        root_filesystem,
+        flavor,
+    );
     defer allocator.free(update_remote_checks);
     const package_lifecycle_remote_checks =
         try packageLifecycleRemoteChecksAlloc(allocator);
