@@ -6,6 +6,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const disk_size: u64 = 160 * 1024 * 1024;
+const fixture_executable_max_size: usize = 128 * 1024 * 1024;
 const partition_first_lba: u32 = 2048;
 const partition_sectors: u32 = 300 * 1024;
 const partition_offset = @as(u64, partition_first_lba) * zvmi.mbr.sector_size;
@@ -892,7 +893,7 @@ fn createSourceDisk(
         io,
         self_exe,
         allocator,
-        .limited(64 * 1024 * 1024),
+        .limited(fixture_executable_max_size),
     );
     defer allocator.free(executable);
 
