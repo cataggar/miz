@@ -2708,6 +2708,7 @@ test "readXattrs decodes shortform entries with prefix flags" {
     var xb = ShortformXattrBuilder{};
     xb.append("foo", "bar", 0);
     xb.append("baz", "qux", attr_root_bit);
+    xb.append("selinux", "system_u:object_r:etc_t:s0\x00", attr_secure_bit);
     const built = try buildXattrTestInode(testing.allocator, sb, xb.finish());
     defer testing.allocator.free(built.raw);
     var inode = built.inode;
@@ -2721,11 +2722,15 @@ test "readXattrs decodes shortform entries with prefix flags" {
         }
         testing.allocator.free(xattrs);
     }
-    try testing.expectEqual(@as(usize, 2), xattrs.len);
+    try testing.expectEqual(@as(usize, 3), xattrs.len);
     try testing.expectEqualStrings("user.foo", xattrs[0].name);
     try testing.expectEqualStrings("bar", xattrs[0].value);
     try testing.expectEqualStrings("trusted.baz", xattrs[1].name);
     try testing.expectEqualStrings("qux", xattrs[1].value);
+    // The `security.` namespace (attr_secure_bit) is the SELinux label path;
+    // its value keeps the trailing NUL a context carries verbatim.
+    try testing.expectEqualStrings("security.selinux", xattrs[2].name);
+    try testing.expectEqualStrings("system_u:object_r:etc_t:s0\x00", xattrs[2].value);
 }
 
 test "readXattrs rejects the PARENT and INCOMPLETE flag bits" {
