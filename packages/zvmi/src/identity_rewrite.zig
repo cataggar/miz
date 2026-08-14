@@ -474,7 +474,7 @@ pub fn apply(
     try plan.validate();
 
     var report = Report{ .retired_identifiers = countRetired(plan) };
-    if (report.retired_identifiers == 0) return report;
+    if (report.retired_identifiers == 0 and plan.rootType() == null) return report;
 
     var scope = try Scope.init(allocator, plan);
     defer scope.deinit();
@@ -1801,6 +1801,53 @@ test "apply rewrites a tree and accepts it once nothing stale is left" {
         \\linux /vmlinuz root=UUID=11111111-1111-1111-1111-111111111111 ro
         \\
     , grub);
+}
+
+test "apply performs a root filesystem type-only rewrite" {
+    const allocator = std.testing.allocator;
+    var tree = root_tree.RootTree.initMemory(allocator, std.testing.io, .{});
+    defer tree.deinit();
+
+    try putTestFile(
+        &tree,
+        "etc/fstab",
+        "UUID=11111111-1111-1111-1111-111111111111 / ext4 defaults 0 1\n",
+    );
+    try putTestFile(
+        &tree,
+        "boot/grub/grub.cfg",
+        "linux /vmlinuz root=UUID=11111111-1111-1111-1111-111111111111 rootfstype=ext4 ro\n",
+    );
+
+    const filesystems = [_]Filesystem{.{
+        .before = .{ .filesystem_uuid = test_root_uuid },
+        .after = .{ .filesystem_uuid = test_root_uuid },
+        .root_filesystem_type = .xfs,
+    }};
+    const report = try apply(
+        allocator,
+        &tree,
+        .{ .filesystems = &filesystems },
+        .rewrite_and_verify,
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 0), report.retired_identifiers);
+    try std.testing.expectEqual(@as(usize, 1), report.fstab_types_rewritten);
+    try std.testing.expectEqual(@as(usize, 1), report.config_rootfstype_rewritten);
+
+    const fstab = try readTestFile(allocator, &tree, "etc/fstab");
+    defer allocator.free(fstab);
+    try std.testing.expectEqualStrings(
+        "UUID=11111111-1111-1111-1111-111111111111 / xfs defaults 0 1\n",
+        fstab,
+    );
+
+    const grub = try readTestFile(allocator, &tree, "boot/grub/grub.cfg");
+    defer allocator.free(grub);
+    try std.testing.expectEqualStrings(
+        "linux /vmlinuz root=UUID=11111111-1111-1111-1111-111111111111 rootfstype=xfs ro\n",
+        grub,
+    );
 }
 
 test "apply fails the build and names the file holding a stale identifier" {
