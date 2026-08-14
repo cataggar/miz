@@ -216,7 +216,7 @@ power off cleanly.
 
 ## Azure Linux 4 release images
 
-Release `AzureLinux-4.0-20260723` contains exactly four Gen2 QCOW2 assets:
+Release `AzureLinux-4.0-20260814` contains exactly four Gen2 QCOW2 assets:
 
 ```text
 AzureLinux-4.0-x86_64.qcow2
@@ -234,7 +234,7 @@ cannot expose SSH until that key has been supplied through the Azure OVF
 profile. Release UKIs are trusted through the exact Artifact Signing leaf enrolled in UEFI `db`; its fingerprint is recorded in `candidate.json`, `publish-manifest.json`, release notes, local Secure Boot acceptance, and Azure acceptance together with every signing operation ID.
 
 `zvmi qemu` defaults to the full x86_64 asset pinned as
-`AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260723`. The `AzureLinux`
+`AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260814`. The `AzureLinux`
 alias selects the host-native architecture; add `--model core` to select its
 matching core asset, or `--arch` to override the host architecture. Explicit
 AArch64 and core filenames remain supported. Add `--secure-boot` to verify the
