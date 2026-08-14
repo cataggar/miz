@@ -1114,10 +1114,12 @@ incompatible ones are refused up front, by name, rather than half-built:
   before any work.
 - **The ext4 journal** does not describe an XFS root. XFS keeps its own internal
   metadata log rather than an ext4-style JBD2 journal, so `--journal` /
-  `--journal-size` are ext4-only knobs. `zvmi build-image` rejects `--journal`
-  beside an XFS root by name; `zvmi capture`, which journals by default,
-  silently leaves the ext4 journal off for an XFS root rather than failing on
-  its own default (XFS is already crash-safe through its log).
+  `--journal-size` are ext4-only knobs. Both entry points reject an ext4 journal
+  beside an XFS root by name (`Ext4JournalWithXfsRoot`): `zvmi build-image`
+  rejects an explicit `--journal`, and `zvmi capture` -- which journals by
+  default -- passes that default through untouched, so `--root-filesystem xfs`
+  must be paired with `--no-journal` rather than having the flag quietly cleared
+  behind the user's back. XFS is already crash-safe through its own log.
 - **The XFS volume label** is at most 12 bytes, and the writer rejects a longer
   one rather than truncating it, so a `--label` / `--ext4-label` over that on an
   XFS root is refused with the byte limit named.

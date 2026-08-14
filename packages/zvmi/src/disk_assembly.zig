@@ -490,6 +490,20 @@ const Rewrites = struct {
     esp: identity_rewrite.Report,
 };
 
+/// Maps the writer's notion of a root filesystem kind onto the identity
+/// rewriter's, which only distinguishes the two kinds a root is ever written
+/// as. A `fat32` root is not a real case -- `assemble` refuses it a few steps
+/// later, where it builds the root's size and format options -- so it maps to
+/// null here, which simply leaves the fstab type field and any `rootfstype=`
+/// untouched rather than asserting on a value that is about to be rejected.
+fn identityFilesystemType(kind: layout_mod.FilesystemKind) ?identity_rewrite.FilesystemType {
+    return switch (kind) {
+        .ext4 => .ext4,
+        .xfs => .xfs,
+        .fat32 => null,
+    };
+}
+
 /// Reconciles both trees against the identifiers this assembly creates.
 ///
 /// The ESP is reconciled as a tree of its own rather than through
@@ -524,6 +538,7 @@ fn applyIdentityRewrite(
     const esp_partition_uuid = guid.formatLower(&esp_partuuid_text, identities.esp_partition_guid);
 
     const has_esp = options.esp_tree != null;
+    const root_type = identityFilesystemType(options.root_filesystem);
     const filesystems = try allocator.alloc(identity_rewrite.Filesystem, options.identity.sources.len);
     defer allocator.free(filesystems);
     for (options.identity.sources, filesystems) |source, *slot| {
@@ -547,6 +562,14 @@ fn applyIdentityRewrite(
                 .none => .{},
             },
             .merged_at = source.merged_at,
+            // Only the surviving root carries a kind, and only when it is one
+            // the type rewrite understands. A merged source is a directory now,
+            // so tagging it would be meaningless; leaving every other entry
+            // null is what keeps identifier-only rewrites behaving as before.
+            .root_filesystem_type = if (source.successor == .root and source.merged_at == null)
+                root_type
+            else
+                null,
         };
     }
 

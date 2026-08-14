@@ -32,14 +32,18 @@
 //! comment.
 //!
 //! XFS differs from the other two in *where* it writes. `ext4.populate` streams
-//! into the image file and `fat32.format` writes through an `Image` handle, but
-//! `xfs_writer.populate` fills a caller-provided in-memory byte region (the
-//! bounded writer's design). The `.xfs` arm bridges that: it allocates a
-//! partition-sized buffer, has the writer emit into it at buffer offset 0, and
-//! `pwrite`s the result to the partition's real offset in the image. That keeps
-//! this module's public surface filesystem-neutral -- a caller still passes a
-//! partition offset in `FormatOptions.xfs.format.offset` exactly as it does for
-//! ext4 -- and confines the buffer round-trip to this one arm.
+//! into the image file and `fat32.format` writes through an `Image` handle, and
+//! -- as of the bounded-writer work on issue #327 -- `xfs_writer.populateImage`
+//! does too: it emits every metadata/data/log block through a random-access
+//! `xfs_writer.Output` sink with one positional `pwrite` each. The `.xfs` arm
+//! builds an `Image`-backed sink whose base offset is the partition's own image
+//! offset, so the writer's absolute block addresses land at the right place
+//! with no partition-sized buffer ever allocated -- public XFS output costs a
+//! fixed amount of memory no matter how large the partition is. The old buffer
+//! entry point (`xfs_writer.populate`) survives only as a compatibility/test
+//! wrapper. Free space and the tail past the last allocation group are never
+//! written; on the freshly created `Image` the public path always hands us,
+//! they read back as deterministic zero through the backend's sparse guarantee.
 
 const std = @import("std");
 const Io = std.Io;
@@ -91,9 +95,9 @@ pub const FormatOptions = union(Kind) {
     },
     /// Like ext4, XFS formats and populates in one pass and cannot be written
     /// without a tree. `format.offset` is interpreted the same way ext4's is
-    /// -- the partition's byte offset in the image -- even though the writer
-    /// itself fills an in-memory buffer; the `.xfs` arm rebases it to the
-    /// buffer and `pwrite`s to that image offset.
+    /// -- the partition's byte offset in the image -- and the `.xfs` arm hands
+    /// it straight to the writer as the base offset of an `Image`-backed
+    /// positional sink, so no partition-sized buffer is involved.
     xfs: xfs_writer.PopulateOptions,
 };
 
@@ -105,6 +109,36 @@ pub const FormatResult = union(Kind) {
     /// caller reading `ext4`-only fields must switch on the tag rather than
     /// assume ext4.
     xfs: void,
+};
+
+/// Adapts an `Image` into an `xfs_writer.Output`: every block the writer emits
+/// becomes one bounded `Image.pwrite` at an absolute image offset (the
+/// partition's own offset plus the filesystem-relative block address the writer
+/// computes). This is what lets public XFS output stay bounded -- the writer
+/// never holds more than a single block, and the huge free space is simply
+/// never written, reading back as zero through the freshly created image's
+/// sparse guarantee.
+///
+/// `Image.pwrite` fails with a rich error union, but `xfs_writer.Output` may
+/// only report `error.OutputWriteFailed`. The real error is stashed in
+/// `failure` and re-raised by the arm, so a backend write failure surfaces with
+/// its true cause rather than a flattened placeholder.
+const ImageOutputSink = struct {
+    image: *Image,
+    io: Io,
+    failure: ?Image.PwriteError = null,
+
+    fn writeAtImpl(context: *anyopaque, offset: u64, bytes: []const u8) xfs_writer.Output.Error!void {
+        const self: *ImageOutputSink = @ptrCast(@alignCast(context));
+        self.image.pwrite(self.io, bytes, offset) catch |err| {
+            self.failure = err;
+            return error.OutputWriteFailed;
+        };
+    }
+
+    fn output(self: *ImageOutputSink) xfs_writer.Output {
+        return .{ .context = self, .write_at_fn = writeAtImpl };
+    }
 };
 
 /// Formats `image`'s region for `kind` per `options`, and -- when `tree` is
@@ -143,20 +177,20 @@ pub fn formatAndPopulate(
         },
         .xfs => |xfs_options| {
             const source = tree orelse return error.MissingTree;
-            // `xfs_writer.populate` fills an in-memory region, so the writer
-            // sees a buffer-local offset of 0 while the partition's real image
-            // offset is remembered for the final `pwrite`. The buffer is sized
-            // to the whole partition length; the writer rounds the filesystem
-            // down to a whole number of allocation groups and never writes
-            // past that, so zeroing first keeps the unused tail deterministic.
-            const image_offset = xfs_options.format.offset;
-            const buffer = try allocator.alloc(u8, std.math.cast(usize, xfs_options.format.length) orelse return error.Overflow);
-            defer allocator.free(buffer);
-            @memset(buffer, 0);
-            var buffered = xfs_options;
-            buffered.format.offset = 0;
-            try xfs_writer.populate(allocator, buffer, try source.cursor(), buffered);
-            try image.pwrite(io, buffer, image_offset);
+            // The writer emits through a positional `Image` sink whose base is
+            // the partition's own image offset (carried in `format.offset`), so
+            // every block lands at the right absolute position without a
+            // partition-sized buffer. The whole plan is validated before the
+            // first byte is written, preserving reject-before-write; the fresh
+            // image the public path supplies reads back as zero everywhere the
+            // writer does not write.
+            var sink = ImageOutputSink{ .image = image, .io = io };
+            xfs_writer.populateImage(allocator, sink.output(), try source.cursor(), xfs_options) catch |err| switch (err) {
+                // Re-raise the backend's true error rather than the writer's
+                // opaque `OutputWriteFailed` placeholder.
+                error.OutputWriteFailed => return sink.failure.?,
+                else => return err,
+            };
             return .{ .xfs = {} };
         },
     }
@@ -500,8 +534,8 @@ test "formatAndPopulate dispatches xfs and the reader reads it back at a partiti
     try tree.putFileBytes("hello.txt", "hi\n", .{ .mode = 0o644 });
 
     // Size the partition through the neutral seam, then place it at a non-zero
-    // offset so the `.xfs` arm's rebase-to-buffer and `pwrite`-to-image-offset
-    // path (and the reader's matching `openFileAt`) are both exercised.
+    // offset so the `.xfs` arm's positional `Image` sink (base = partition
+    // offset) and the reader's matching `openFileAt` are both exercised.
     const size_opts = xfs_writer.PopulateOptions{ .format = .{ .length = 0, .label = "rootfs" } };
     const min = try minimumLength(testing.allocator, &tree, .xfs, .{ .xfs = size_opts });
 

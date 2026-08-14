@@ -92,6 +92,54 @@ pub const PopulateOptions = struct {
     root: RootMetadata = .{},
 };
 
+/// A random-access positional output sink the writer emits through, so the
+/// filesystem's bytes reach their destination without a partition-sized buffer
+/// ever being allocated. `writeAt` places `bytes` at an *absolute* byte offset
+/// -- `format.offset` (the partition's own position) plus the filesystem-block
+/// address the writer computes -- which is exactly a file/image byte position
+/// or an index into a caller buffer.
+///
+/// Two sinks exist. `bufferSink` wraps a `[]u8` (the compatibility/test path
+/// `populate` uses, and the one the reader round-trips); it never fails. An
+/// `Image`-backed sink lives in `filesystem_writer` and issues one bounded
+/// `pwrite` per metadata/data/log block, so public XFS output costs a fixed
+/// amount of memory no matter how large the partition is. Only the blocks the
+/// filesystem actually uses are written; the vast free space and the tail past
+/// the last allocation group are left untouched, which for a freshly created
+/// `Image` (raw/qcow2/VHD/VHDX) reads back as deterministic zero through the
+/// backend's own sparse guarantee rather than a multi-gigabyte zero write.
+pub const Output = struct {
+    context: *anyopaque,
+    write_at_fn: *const fn (context: *anyopaque, offset: u64, bytes: []const u8) Error!void,
+
+    /// The single failure a sink may report. A real backend error (an
+    /// `Image.pwrite` failure, say) is surfaced out-of-band by the sink so the
+    /// writer's `WriteError` stays a fixed, meaningful set rather than widening
+    /// to every backend's error union.
+    pub const Error = error{OutputWriteFailed};
+
+    pub fn writeAt(self: Output, offset: u64, bytes: []const u8) Error!void {
+        return self.write_at_fn(self.context, offset, bytes);
+    }
+};
+
+/// A `[]u8`-backed `Output`: the compatibility sink `populate` builds so the
+/// existing buffer API (and its reader round-trip tests) keep working over the
+/// same core writer the bounded `Image` path uses. Infallible: the caller has
+/// already proven the buffer is long enough.
+pub const BufferSink = struct {
+    buffer: []u8,
+
+    fn writeAtImpl(context: *anyopaque, offset: u64, bytes: []const u8) Output.Error!void {
+        const self: *BufferSink = @ptrCast(@alignCast(context));
+        @memcpy(self.buffer[@intCast(offset)..][0..bytes.len], bytes);
+    }
+
+    pub fn output(self: *BufferSink) Output {
+        return .{ .context = self, .write_at_fn = writeAtImpl };
+    }
+};
+
 /// A deterministic non-nil default UUID, so a caller that does not care still
 /// gets reproducible output rather than zeros (which some tools treat as
 /// "unset").
@@ -134,7 +182,7 @@ pub const WriteError = error{
     MissingContent,
     ContentSizeMismatch,
     UnsupportedKind,
-} || std.mem.Allocator.Error || Cursor.IteratorError || Cursor.ContentError;
+} || std.mem.Allocator.Error || Cursor.IteratorError || Cursor.ContentError || Output.Error;
 
 // ---------------------------------------------------------------------------
 // On-disk constants
@@ -475,12 +523,33 @@ pub fn minimumSize(
     return minimumLength(&plan.geom);
 }
 
+/// Sizes a built `plan`'s geometry to `options.format.length` -- rounded down
+/// to whole allocation groups, never below the content minimum -- and returns
+/// the filesystem's own byte length (`format.offset` excluded). Shared by the
+/// buffer and `Image` entry points so both accept exactly the same lengths.
+fn sizeGeometry(plan: *Plan, options: PopulateOptions) WriteError!u64 {
+    const min_len = try minimumLength(&plan.geom);
+    if (options.format.length < min_len) return error.LengthTooSmall;
+
+    const requested_blocks = options.format.length / block_size;
+    var ag_blocks: u64 = requested_blocks / 2;
+    if (ag_blocks < plan.geom.ag_blocks) ag_blocks = plan.geom.ag_blocks;
+    try finalizeGeometry(&plan.geom, @intCast(ag_blocks));
+
+    return plan.geom.data_blocks * block_size;
+}
+
 /// Formats and populates a clean XFS v5 filesystem for `cursor`'s tree into
 /// `buffer[options.format.offset..]`. Resets and fully drains the cursor. On
 /// any rejected shape or too-small buffer it returns an error having written
 /// nothing meaningful (a caller must treat a non-`void` return as total
 /// failure). A successful return means every planned byte was written; there
 /// is no partial success.
+///
+/// This is the compatibility/test path: it fills a caller buffer and zeroes the
+/// filesystem's whole span first, so free space is deterministically zero in
+/// the buffer. Production integration writes through `populateImage` instead,
+/// which never allocates or zeroes a partition-sized region.
 pub fn populate(
     allocator: std.mem.Allocator,
     buffer: []u8,
@@ -492,23 +561,55 @@ pub fn populate(
     var plan = try buildPlan(allocator, cursor, options);
     defer plan.deinit();
 
-    const min_len = try minimumLength(&plan.geom);
-    if (options.format.length < min_len) return error.LengthTooSmall;
-
-    // Size the filesystem to the requested length, rounded down to whole AGs,
-    // never below the minimum.
-    const requested_blocks = options.format.length / block_size;
-    var ag_blocks: u64 = requested_blocks / 2;
-    if (ag_blocks < plan.geom.ag_blocks) ag_blocks = plan.geom.ag_blocks;
-    try finalizeGeometry(&plan.geom, @intCast(ag_blocks));
-
-    const fs_len = plan.geom.data_blocks * block_size;
+    const fs_len = try sizeGeometry(&plan, options);
     const end = std.math.add(u64, options.format.offset, fs_len) catch return error.Overflow;
     if (buffer.len < end) return error.BufferTooSmall;
 
-    const region = buffer[@intCast(options.format.offset)..@intCast(end)];
-    @memset(region, 0);
-    try writeImage(region, &plan, options);
+    // The buffer path owns a bounded, caller-sized region, so zeroing its whole
+    // span up front keeps free space and any tail past the last allocation
+    // group deterministic -- the reader round-trip and byte-parity tests depend
+    // on it. The `Image` path relies on the backend's sparse-zero guarantee for
+    // the same regions instead, never touching them.
+    @memset(buffer[@intCast(options.format.offset)..@intCast(end)], 0);
+
+    var sink = BufferSink{ .buffer = buffer };
+    var ctx = WriteCtx{ .out = sink.output(), .base = options.format.offset, .plan = &plan, .options = options };
+    try writeImageTo(&ctx);
+}
+
+/// Formats and populates a clean XFS v5 filesystem for `cursor`'s tree, emitting
+/// every metadata/data/log block through `output` with one bounded positional
+/// write each. Memory use is fixed (a single block-sized scratch plus the
+/// planning arena, whose size tracks the tree's own content) no matter how
+/// large `options.format.length` is: the huge free space between structures and
+/// the tail past the last allocation group are never written.
+///
+/// The whole plan is built and validated -- every unsupported shape rejected,
+/// the length checked against the content minimum -- *before* the first byte is
+/// written, preserving the reject-before-write contract. `output` must address
+/// a region that reads back as zero where the writer does not write (a freshly
+/// created `Image` satisfies this through its sparse-zero guarantee); the writer
+/// itself zero-fills every partial block it emits, so no stale bytes leak into a
+/// used block even on a destination whose free space is not zero.
+pub fn populateImage(
+    allocator: std.mem.Allocator,
+    output: Output,
+    cursor: *Cursor,
+    options: PopulateOptions,
+) WriteError!void {
+    if (options.format.offset % sector_size != 0) return error.OffsetNotAligned;
+
+    var plan = try buildPlan(allocator, cursor, options);
+    defer plan.deinit();
+
+    const fs_len = try sizeGeometry(&plan, options);
+    // Guard the same offset+length overflow the buffer path checks, so an
+    // absurd offset fails before any write rather than wrapping a positional
+    // write into the wrong place.
+    _ = std.math.add(u64, options.format.offset, fs_len) catch return error.Overflow;
+
+    var ctx = WriteCtx{ .out = output, .base = options.format.offset, .plan = &plan, .options = options };
+    try writeImageTo(&ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -1058,33 +1159,69 @@ fn bitWidth(value: u32) u8 {
 // ---------------------------------------------------------------------------
 
 const WriteCtx = struct {
-    region: []u8,
+    out: Output,
+    /// The partition's own byte offset in the destination (`format.offset`),
+    /// added to every filesystem-block address so a positional write lands at
+    /// the right absolute position. The filesystem's block 0 sits here.
+    base: u64,
     plan: *Plan,
     options: PopulateOptions,
+    /// One block-sized staging buffer, reused for every block and sector the
+    /// writer emits. This -- not a partition-sized region -- is what bounds the
+    /// writer's memory: a metadata or data block is assembled here in full,
+    /// then flushed with a single positional write, before the next one reuses
+    /// it. Two structures are never assembled at once (inode cores are written
+    /// in a pass that emits no data blocks; data blocks in a later pass), so a
+    /// single buffer suffices.
+    scratch: [block_size]u8 = undefined,
 
     fn geom(self: *const WriteCtx) *const Geometry {
         return &self.plan.geom;
     }
 
-    fn blockSlice(self: *WriteCtx, fsblock: u64) []u8 {
-        const off: usize = @intCast(fsblock * block_size);
-        return self.region[off..][0..block_size];
+    /// A zeroed block-sized staging slice to fill, then flush with `putBlock`.
+    fn blockBuf(self: *WriteCtx) []u8 {
+        @memset(self.scratch[0..block_size], 0);
+        return self.scratch[0..block_size];
     }
 
-    fn sectorSlice(self: *WriteCtx, fsblock: u64, sector: u32) []u8 {
-        const off: usize = @intCast(fsblock * block_size + sector * sector_size);
-        return self.region[off..][0..sector_size];
+    /// Flushes the staged block to filesystem block `fsblock`.
+    fn putBlock(self: *WriteCtx, fsblock: u64) WriteError!void {
+        try self.out.writeAt(self.base + fsblock * block_size, self.scratch[0..block_size]);
+    }
+
+    /// A zeroed sector-sized staging slice to fill, then flush with `putSector`.
+    fn sectorBuf(self: *WriteCtx) []u8 {
+        @memset(self.scratch[0..sector_size], 0);
+        return self.scratch[0..sector_size];
+    }
+
+    /// Flushes the staged sector to sector `sector` of filesystem block
+    /// `fsblock`.
+    fn putSector(self: *WriteCtx, fsblock: u64, sector: u32) WriteError!void {
+        try self.out.writeAt(self.base + fsblock * block_size + @as(u64, sector) * sector_size, self.scratch[0..sector_size]);
+    }
+
+    /// Writes already-assembled bytes (file content held in the plan arena)
+    /// straight through at filesystem byte offset `fs_offset`, bypassing the
+    /// staging buffer. Used only for whole file-data blocks, which are already
+    /// contiguous in memory; the trailing partial block still goes through the
+    /// staging buffer so its tail is zero-filled.
+    fn writeThrough(self: *WriteCtx, fs_offset: u64, bytes: []const u8) WriteError!void {
+        try self.out.writeAt(self.base + fs_offset, bytes);
     }
 };
 
-fn writeImage(region: []u8, plan: *Plan, options: PopulateOptions) WriteError!void {
-    var ctx = WriteCtx{ .region = region, .plan = plan, .options = options };
-
-    assignDataBlocks(&ctx);
-    try writeSuperblocks(&ctx);
-    try writeAgMetadata(&ctx);
-    try writeInodeChunks(&ctx);
-    writeLog(&ctx);
+/// Emits the whole filesystem through `ctx.out`. Runs inode cores and data
+/// blocks as two separate passes so the single staging buffer is never asked to
+/// hold an inode chunk and one of its data blocks at the same time.
+fn writeImageTo(ctx: *WriteCtx) WriteError!void {
+    assignDataBlocks(ctx);
+    try writeSuperblocks(ctx);
+    try writeAgMetadata(ctx);
+    try writeInodeChunks(ctx);
+    try writeDataBlocks(ctx);
+    try writeLog(ctx);
 }
 
 /// Assigns each inode's contiguous data-block run in AG0, immediately after the
@@ -1116,7 +1253,7 @@ fn writeSuperblocks(ctx: *WriteCtx) WriteError!void {
 
     var agno: u32 = 0;
     while (agno < 2) : (agno += 1) {
-        const sb = ctx.sectorSlice(@as(u64, agno) * g.ag_blocks, 0);
+        const sb = ctx.sectorBuf();
         beU32(sb, 0, sb_magic);
         beU32(sb, 4, block_size);
         beU64(sb, 8, g.data_blocks);
@@ -1173,6 +1310,7 @@ fn writeSuperblocks(ctx: *WriteCtx) WriteError!void {
         beU64(sb, 240, 0); // lsn
         @memset(sb[248..264], 0); // meta_uuid (unused without META_UUID)
         writeCrc(sb, 224);
+        try ctx.putSector(@as(u64, agno) * g.ag_blocks, 0);
     }
 }
 
@@ -1196,7 +1334,7 @@ fn writeOneAgHeaders(ctx: *WriteCtx, agno: u32) WriteError!void {
     const free_len: u32 = if (is_data_ag) g.ag0_free_len else g.ag1_free_len;
 
     // --- AGF (sector 1) ---
-    const agf = ctx.sectorSlice(ag_base, 1);
+    const agf = ctx.sectorBuf();
     beU32(agf, 0, agf_magic);
     beU32(agf, 4, 1); // versionnum
     beU32(agf, 8, agno);
@@ -1220,9 +1358,10 @@ fn writeOneAgHeaders(ctx: *WriteCtx, agno: u32) WriteError!void {
     beU32(agf, 92, 0); // refcount_level
     beU64(agf, 208, 0); // lsn
     writeCrc(agf, 216);
+    try ctx.putSector(ag_base, 1);
 
     // --- AGI (sector 2) ---
-    const agi = ctx.sectorSlice(ag_base, 2);
+    const agi = ctx.sectorBuf();
     beU32(agi, 0, agi_magic);
     beU32(agi, 4, 1);
     beU32(agi, 8, agno);
@@ -1248,9 +1387,10 @@ fn writeOneAgHeaders(ctx: *WriteCtx, agno: u32) WriteError!void {
     beU32(agi, 328, 0); // free_root
     beU32(agi, 332, 0); // free_level
     writeCrc(agi, 312);
+    try ctx.putSector(ag_base, 2);
 
     // --- AGFL (sector 3) ---
-    const agfl = ctx.sectorSlice(ag_base, 3);
+    const agfl = ctx.sectorBuf();
     beU32(agfl, 0, agfl_magic);
     beU32(agfl, 4, agno); // seqno
     @memcpy(agfl[8..24], &ctx.options.format.uuid);
@@ -1265,6 +1405,7 @@ fn writeOneAgHeaders(ctx: *WriteCtx, agno: u32) WriteError!void {
         beU32(agfl, 36 + (1 + i) * 4, agfl_base + i);
     }
     writeCrc(agfl, 32);
+    try ctx.putSector(ag_base, 3);
 
     // --- bnobt root (block 1) and cntbt root (block 2) ---
     try writeAllocBtree(ctx, ag_base + 1, bnobt_magic, agno, free_start, free_len);
@@ -1289,20 +1430,22 @@ fn writeAllocBtree(
     start: u32,
     len: u32,
 ) WriteError!void {
-    const blk = ctx.blockSlice(fsblock);
+    const blk = ctx.blockBuf();
     writeShortBtreeHeader(blk, magic, fsblock, agno, 1, &ctx.options.format.uuid);
     // Single record: the one free extent (startblock, blockcount).
     beU32(blk, 56, start);
     beU32(blk, 60, len);
     writeCrc(blk, 52);
+    try ctx.putBlock(fsblock);
 }
 
 fn writeInobtRoot(ctx: *WriteCtx, fsblock: u64, agno: u32, is_data_ag: bool) WriteError!void {
     const g = ctx.geom();
-    const blk = ctx.blockSlice(fsblock);
+    const blk = ctx.blockBuf();
     if (!is_data_ag) {
         writeShortBtreeHeader(blk, inobt_magic, fsblock, agno, 0, &ctx.options.format.uuid);
         writeCrc(blk, 52);
+        try ctx.putBlock(fsblock);
         return;
     }
     writeShortBtreeHeader(blk, inobt_magic, fsblock, agno, g.inode_chunks, &ctx.options.format.uuid);
@@ -1329,6 +1472,7 @@ fn writeInobtRoot(ctx: *WriteCtx, fsblock: u64, agno: u32, is_data_ag: bool) Wri
         beU64(rec, 8, free_mask);
     }
     writeCrc(blk, 52);
+    try ctx.putBlock(fsblock);
 }
 
 fn writeShortBtreeHeader(blk: []u8, magic: u32, fsblock: u64, agno: u32, numrecs: u32, uuid: *const [16]u8) void {
@@ -1346,29 +1490,30 @@ fn writeShortBtreeHeader(blk: []u8, magic: u32, fsblock: u64, agno: u32, numrecs
 
 fn writeInodeChunks(ctx: *WriteCtx) WriteError!void {
     const g = ctx.geom();
-    // Every inode slot in every chunk must be a valid v3 inode; used slots get
-    // real content, free slots a well-formed empty inode.
-    var idx: u64 = 0;
-    const total_slots = g.inode_count;
-    while (idx < total_slots) : (idx += 1) {
-        const ino = root_ino + idx;
-        const inode_off = inodeByteOffset(g, ino);
-        const inode = ctx.region[@intCast(inode_off)..][0..inode_size];
-        if (idx < g.used_inodes) {
-            try writeInodeCore(ctx, inode, &ctx.plan.nodes.items[@intCast(idx)]);
-        } else {
-            writeFreeInode(ctx, inode, ino);
+    // The inode table starts at fsblock 8 (root_ino 64 >> inopblog 3) and every
+    // slot in every block must be a valid v3 inode: used slots get real
+    // content, free slots a well-formed empty inode. Emit one whole block (8
+    // inodes) at a time through the staging buffer, so no inode-table byte
+    // reaches the sink before its block is fully assembled and nothing
+    // partition-sized is ever held. inode_count is a multiple of 64, so the
+    // division is exact.
+    const inode_blocks = g.inode_count / inodes_per_block;
+    var b: u64 = 0;
+    while (b < inode_blocks) : (b += 1) {
+        const blk = ctx.blockBuf();
+        var k: u32 = 0;
+        while (k < inodes_per_block) : (k += 1) {
+            const idx = b * inodes_per_block + k;
+            const ino = root_ino + idx;
+            const inode = blk[@as(usize, @intCast(k)) * inode_size ..][0..inode_size];
+            if (idx < g.used_inodes) {
+                try writeInodeCore(ctx, inode, &ctx.plan.nodes.items[@intCast(idx)]);
+            } else {
+                writeFreeInode(ctx, inode, ino);
+            }
         }
+        try ctx.putBlock(8 + b);
     }
-}
-
-/// Byte offset of an inode within AG0 (all inodes live there).
-fn inodeByteOffset(g: *const Geometry, ino: u64) u64 {
-    _ = g;
-    const agino = ino; // AG0, so ino == agino
-    const agbno = agino >> inopblog;
-    const off_in_block = agino & (inodes_per_block - 1);
-    return agbno * block_size + off_in_block * inode_size;
 }
 
 fn writeFreeInode(ctx: *WriteCtx, inode: []u8, ino: u64) void {
@@ -1419,35 +1564,57 @@ fn writeInodeCore(ctx: *WriteCtx, inode: []u8, node: *InodeNode) WriteError!void
     @memcpy(inode[160..176], &ctx.options.format.uuid);
 
     // Data fork (literal area starts at 176).
-    try writeDataFork(ctx, inode, node);
+    writeDataFork(inode, node);
     // Attr fork (shortform), if any.
     if (node.xattrs.len != 0) writeAttrFork(inode, node);
 
     writeCrc(inode, 100);
 }
 
-fn writeDataFork(ctx: *WriteCtx, inode: []u8, node: *InodeNode) WriteError!void {
+/// Writes only an inode's *literal area* (the in-inode data fork at byte 176):
+/// the data-fork extent pointer, a shortform directory, an inline symlink
+/// target, or a device number. It touches nothing but `inode`, so it is safe to
+/// run while a whole inode block is being assembled in the staging buffer. The
+/// out-of-line blocks those extent pointers reference are emitted later by
+/// `writeDataBlocks`, a separate pass, so the staging buffer never holds an
+/// inode chunk and one of its data blocks at once.
+fn writeDataFork(inode: []u8, node: *InodeNode) void {
     const lit = inode[176..inode_size];
     switch (node.kind) {
         .directory => if (node.dir_is_block) {
             encodeExtent(lit[0..16], 0, node.data_start_block, 1, false);
-            try writeBlockDirectory(ctx, node);
         } else {
             writeShortformDir(lit, node);
         },
         .file => if (node.nextents == 1) {
             encodeExtent(lit[0..16], 0, node.data_start_block, node.data_block_count, false);
-            try writeFileData(ctx, node);
         },
         .symlink => if (node.di_format == fmt_local) {
             @memcpy(lit[0..node.symlink_target.len], node.symlink_target);
         } else {
             encodeExtent(lit[0..16], 0, node.data_start_block, 1, false);
-            writeRemoteSymlink(ctx, node);
         },
         .block_device, .char_device => beU32(lit, 0, encodeDev(node.device.major, node.device.minor)),
         .fifo => beU32(lit, 0, 0),
         .hardlink => unreachable,
+    }
+}
+
+/// Second write pass: emits every inode's out-of-line data blocks -- block-
+/// format directory blocks, file data, and remote symlink blocks. Runs after
+/// `writeInodeChunks` so the shared staging buffer only holds one structure at a
+/// time. All these blocks live past the inode table (`assignDataBlocks` places
+/// them there), so the two passes never target the same block. Every node in
+/// `plan.nodes` is a used inode (see the geometry builder), so iterating them
+/// covers exactly the inodes whose literal forks referenced a data block.
+fn writeDataBlocks(ctx: *WriteCtx) WriteError!void {
+    for (ctx.plan.nodes.items) |*node| {
+        switch (node.kind) {
+            .directory => if (node.dir_is_block) try writeBlockDirectory(ctx, node),
+            .file => if (node.nextents == 1) try writeFileData(ctx, node),
+            .symlink => if (node.di_format != fmt_local) try writeRemoteSymlink(ctx, node),
+            else => {},
+        }
     }
 }
 
@@ -1515,13 +1682,28 @@ fn writeAttrFork(inode: []u8, node: *InodeNode) void {
 }
 
 fn writeFileData(ctx: *WriteCtx, node: *InodeNode) WriteError!void {
-    const base = node.data_start_block * block_size;
-    @memcpy(ctx.region[@intCast(base)..][0..node.file_content.len], node.file_content);
-    // Trailing bytes of the last block stay zero (already memset).
+    const content = node.file_content;
+    const base_block = node.data_start_block;
+    // Whole blocks are already contiguous in the plan arena, so stream them
+    // straight through the sink without staging -- this is the one path that can
+    // move more than a block per write, and it is bounded by the file's own
+    // in-memory content, never by the partition.
+    const whole = content.len - (content.len % block_size);
+    if (whole > 0) try ctx.writeThrough(base_block * block_size, content[0..whole]);
+
+    // The final partial block goes through the zeroed staging buffer so its tail
+    // is deterministically zero even when the destination's free space is not:
+    // no stale bytes can leak into the file's last block.
+    const rem = content.len - whole;
+    if (rem > 0) {
+        const blk = ctx.blockBuf();
+        @memcpy(blk[0..rem], content[whole..]);
+        try ctx.putBlock(base_block + whole / block_size);
+    }
 }
 
-fn writeRemoteSymlink(ctx: *WriteCtx, node: *InodeNode) void {
-    const blk = ctx.blockSlice(node.data_start_block);
+fn writeRemoteSymlink(ctx: *WriteCtx, node: *InodeNode) WriteError!void {
+    const blk = ctx.blockBuf();
     beU32(blk, 0, symlink_magic);
     beU32(blk, 4, 0); // sl_offset
     beU32(blk, 8, @intCast(node.symlink_target.len)); // sl_bytes
@@ -1531,6 +1713,7 @@ fn writeRemoteSymlink(ctx: *WriteCtx, node: *InodeNode) void {
     beU64(blk, 48, 0); // sl_lsn
     @memcpy(blk[56..][0..node.symlink_target.len], node.symlink_target);
     writeCrc(blk, 12);
+    try ctx.putBlock(node.data_start_block);
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,7 +1728,7 @@ fn leafLess(_: void, x: LeafEntry, y: LeafEntry) bool {
 }
 
 fn writeBlockDirectory(ctx: *WriteCtx, node: *InodeNode) WriteError!void {
-    const blk = ctx.blockSlice(node.data_start_block);
+    const blk = ctx.blockBuf();
     const a = ctx.plan.allocator();
 
     const leaf_count: u32 = @intCast(2 + node.children.items.len);
@@ -1601,6 +1784,7 @@ fn writeBlockDirectory(ctx: *WriteCtx, node: *InodeNode) WriteError!void {
     beU32(blk, block_size - 4, 0);
 
     writeCrc(blk, 4);
+    try ctx.putBlock(node.data_start_block);
 }
 
 fn writeDirDataEntry(blk: []u8, off: *u32, ino: u64, name: []const u8, ftype: u8) void {
@@ -1619,10 +1803,9 @@ fn writeDirDataEntry(blk: []u8, off: *u32, ino: u64, name: []const u8, ftype: u8
 // mkfs so xfs_repair sees a clean log needing no recovery.
 // ---------------------------------------------------------------------------
 
-fn writeLog(ctx: *WriteCtx) void {
+fn writeLog(ctx: *WriteCtx) WriteError!void {
     const g = ctx.geom();
-    const base = g.log_phys_block * block_size;
-    const header = ctx.region[@intCast(base)..][0..sector_size];
+    const header = ctx.sectorBuf();
 
     beU32(header, 0, log_magic);
     beU32(header, 4, 1); // h_cycle
@@ -1637,14 +1820,16 @@ fn writeLog(ctx: *WriteCtx) void {
     beU32(header, 300, 1); // h_fmt = XLOG_FMT_LINUX_LE
     @memcpy(header[304..320], &ctx.options.format.uuid);
     beU32(header, 320, 32768); // h_size
+    try ctx.putSector(g.log_phys_block, 0);
 
     // Unmount record data sector: first word cycle-stamped to the cycle number.
-    const data = ctx.region[@intCast(base + sector_size)..][0..sector_size];
+    const data = ctx.sectorBuf();
     beU32(data, 0, 1); // cycle stamp (original 0xb0c0d0d0 saved above)
     beU32(data, 4, 8); // oh_len
     data[8] = 0xaa; // oh_clientid = XFS_LOG
     data[9] = 0x20; // oh_flags = XLOG_UNMOUNT_TRANS
     leU16(data, 12, 0x556e); // unmount magic, little-endian per h_fmt
+    try ctx.putSector(g.log_phys_block, 1);
 }
 
 // ===========================================================================
@@ -1921,6 +2106,230 @@ test "populate is byte-for-byte deterministic" {
     try populate(allocator, buf2, &cur2, opts);
 
     try testing.expect(std.mem.eql(u8, buf1, buf2));
+}
+
+/// Wraps a child allocator but refuses any single allocation, resize, or remap
+/// larger than `cap`. A test hands the bounded `Image` writer one of these with
+/// a cap far below the partition size: if the writer ever tried to buffer the
+/// whole partition, the request would exceed the cap and the write would fail
+/// with `error.OutOfMemory`. Completing under a tiny cap is the proof that no
+/// partition-sized allocation happens.
+const CappedAllocator = struct {
+    child: std.mem.Allocator,
+    cap: usize,
+    exceeded: bool = false,
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        if (len > self.cap) {
+            self.exceeded = true;
+            return null;
+        }
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > self.cap) {
+            self.exceeded = true;
+            return false;
+        }
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > self.cap) {
+            self.exceeded = true;
+            return null;
+        }
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+
+    fn allocator(self: *CappedAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free },
+        };
+    }
+};
+
+/// An `Output` sink that keeps no partition-sized buffer of its own: it only
+/// records the largest single positional write and the highest byte offset
+/// touched. A test uses it to prove the writer both stays within the partition
+/// and never issues a write whose size scales with the partition.
+const CountingSink = struct {
+    writes: u64 = 0,
+    max_write: usize = 0,
+    max_end: u64 = 0,
+
+    fn writeAtImpl(context: *anyopaque, offset: u64, bytes: []const u8) Output.Error!void {
+        const self: *CountingSink = @ptrCast(@alignCast(context));
+        self.writes += 1;
+        if (bytes.len > self.max_write) self.max_write = bytes.len;
+        const end = offset + bytes.len;
+        if (end > self.max_end) self.max_end = end;
+    }
+
+    fn output(self: *CountingSink) Output {
+        return .{ .context = self, .write_at_fn = writeAtImpl };
+    }
+};
+
+test "populateImage writes byte-for-byte the same image as populate" {
+    const allocator = testing.allocator;
+
+    // A 9000-byte file spans two whole blocks plus an 808-byte tail, exercising
+    // both the straight-through whole-block path and the zero-padded partial
+    // final block.
+    var big9000: [9000]u8 = undefined;
+    for (&big9000, 0..) |*b, i| b.* = @intCast((i * 31 + 7) & 0xff);
+
+    var entries = [_]FixtureEntry{
+        .{ .path = "a.txt", .kind = .file, .mode = 0o644, .size = 5, .content = "alpha" },
+        .{ .path = "d", .kind = .directory, .mode = 0o755 },
+        .{ .path = "d/b.txt", .kind = .file, .mode = 0o644, .size = 4, .content = "beta" },
+        .{ .path = "s", .kind = .symlink, .size = 5, .content = "a.txt" },
+        .{ .path = "big.bin", .kind = .file, .mode = 0o644, .size = 9000, .content = &big9000 },
+    };
+    // 160 MiB rounds to a filesystem that fills the whole span exactly, so the
+    // buffer path zeroes and writes every byte and there is no undefined tail to
+    // avoid comparing.
+    const opts = PopulateOptions{ .format = .{ .length = 160 * 1024 * 1024, .uuid = xfs.test_fs_uuid } };
+
+    var fc_ref = FixtureCursor{ .entries = &entries };
+    var cur_ref = fc_ref.cursor();
+    const buf_ref = try allocator.alloc(u8, opts.format.length);
+    defer allocator.free(buf_ref);
+    @memset(buf_ref, 0);
+    try populate(allocator, buf_ref, &cur_ref, opts);
+
+    // The image path relies on the destination already reading as zero (the
+    // fresh-image guarantee), so pre-zero the sink buffer exactly as a freshly
+    // created sparse image would present it.
+    var fc_img = FixtureCursor{ .entries = &entries };
+    var cur_img = fc_img.cursor();
+    const buf_img = try allocator.alloc(u8, opts.format.length);
+    defer allocator.free(buf_img);
+    @memset(buf_img, 0);
+    var sink = BufferSink{ .buffer = buf_img };
+    try populateImage(allocator, sink.output(), &cur_img, opts);
+
+    try testing.expect(std.mem.eql(u8, buf_ref, buf_img));
+
+    // Read parity: the image-path bytes reopen and read back field-for-field.
+    const path = "test-xfs-writer-populateimage-parity.img";
+    try writeFixtureFile(path, buf_img);
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const io = std.testing.io;
+    var reader = try xfs.Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    var tree = try xfs.scanReadable(&reader, io, allocator, .{ .available_length = opts.format.length });
+    defer tree.deinit();
+    const big = findRt(&tree, "big.bin").?;
+    try testing.expectEqual(@as(u64, 9000), big.size);
+    const big_bytes = try readRt(allocator, big);
+    defer allocator.free(big_bytes);
+    try testing.expectEqualSlices(u8, &big9000, big_bytes);
+}
+
+test "populateImage keeps memory bounded for a multi-gigabyte partition" {
+    // A deliberately tiny cap -- three orders of magnitude below the partition
+    // -- proves the writer never allocates anything partition-sized. The old
+    // arm allocated the whole partition up front and would fail here outright.
+    var capped = CappedAllocator{ .child = testing.allocator, .cap = 8 * 1024 * 1024 };
+    const a = capped.allocator();
+
+    var big: [9000]u8 = undefined;
+    for (&big, 0..) |*b, i| b.* = @intCast((i * 13 + 1) & 0xff);
+    var entries = [_]FixtureEntry{
+        .{ .path = "a.txt", .kind = .file, .mode = 0o644, .size = 5, .content = "alpha" },
+        .{ .path = "dir", .kind = .directory, .mode = 0o755 },
+        .{ .path = "dir/b.bin", .kind = .file, .mode = 0o644, .size = 9000, .content = &big },
+        .{ .path = "s", .kind = .symlink, .size = 5, .content = "a.txt" },
+    };
+
+    // A 16 GiB logical partition: a partition-sized buffer would be 16 GiB and
+    // could never fit under the 8 MiB cap (nor in test RAM).
+    const partition_len: u64 = 16 * 1024 * 1024 * 1024;
+    const opts = PopulateOptions{ .format = .{ .length = partition_len, .uuid = xfs.test_fs_uuid } };
+
+    var sink = CountingSink{};
+    var fc = FixtureCursor{ .entries = &entries };
+    var cur = fc.cursor();
+    try populateImage(a, sink.output(), &cur, opts);
+
+    try testing.expect(!capped.exceeded);
+    // Every write stayed far below the partition size, and nothing was written
+    // past the partition's end.
+    try testing.expect(sink.max_write <= 8 * 1024 * 1024);
+    try testing.expect(sink.max_end <= partition_len);
+    try testing.expect(sink.writes > 0);
+}
+
+test "populateImage leaves a nonzero destination tail untouched and stays valid" {
+    const allocator = testing.allocator;
+    var entries = [_]FixtureEntry{
+        .{ .path = "a.txt", .kind = .file, .mode = 0o644, .size = 11, .content = "hello world" },
+        .{ .path = "d", .kind = .directory, .mode = 0o755 },
+        .{ .path = "d/b.txt", .kind = .file, .mode = 0o644, .size = 4, .content = "beta" },
+        .{ .path = "s", .kind = .symlink, .size = 5, .content = "a.txt" },
+    };
+    // A length that is not a whole number of allocation groups, so the writer
+    // rounds the filesystem down and leaves a tail it must never touch.
+    const partition_len: u64 = 160 * 1024 * 1024 + 123 * 1024;
+    const opts = PopulateOptions{ .format = .{ .length = partition_len, .uuid = xfs.test_fs_uuid } };
+
+    // Discover the exact filesystem length through the real sizing path rather
+    // than re-deriving the rounding here.
+    var probe_fc = FixtureCursor{ .entries = &entries };
+    var probe_cur = probe_fc.cursor();
+    var probe_plan = try buildPlan(allocator, &probe_cur, opts);
+    const fs_len = try sizeGeometry(&probe_plan, opts);
+    probe_plan.deinit();
+    try testing.expect(fs_len < partition_len); // a real tail exists to observe
+
+    const buf = try allocator.alloc(u8, @intCast(partition_len));
+    defer allocator.free(buf);
+    // The filesystem's own span is fresh (zero), exactly as a newly created
+    // sparse image presents it; the tail beyond it is deliberately dirtied so
+    // we can prove the writer neither reads nor depends on it.
+    @memset(buf[0..@intCast(fs_len)], 0);
+    @memset(buf[@intCast(fs_len)..], 0xFF);
+
+    var fc = FixtureCursor{ .entries = &entries };
+    var cur = fc.cursor();
+    var sink = BufferSink{ .buffer = buf };
+    try populateImage(allocator, sink.output(), &cur, opts);
+
+    // The writer never wrote past the filesystem: every tail byte is still the
+    // 0xFF we planted, so the output is bounded to fs_len whatever the (much
+    // larger) partition length is.
+    for (buf[@intCast(fs_len)..]) |byte| try testing.expectEqual(@as(u8, 0xFF), byte);
+
+    // The filesystem itself is valid despite the dirty tail: the reader reads
+    // every file back.
+    const path = "test-xfs-writer-nonzero-tail.img";
+    try writeFixtureFile(path, buf[0..@intCast(fs_len)]);
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const io = std.testing.io;
+    var reader = try xfs.Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    var tree = try xfs.scanReadable(&reader, io, allocator, .{ .available_length = fs_len });
+    defer tree.deinit();
+    const a_txt = findRt(&tree, "a.txt").?;
+    const a_bytes = try readRt(allocator, a_txt);
+    defer allocator.free(a_bytes);
+    try testing.expectEqualStrings("hello world", a_bytes);
+    const b_txt = findRt(&tree, "d/b.txt").?;
+    const b_bytes = try readRt(allocator, b_txt);
+    defer allocator.free(b_bytes);
+    try testing.expectEqualStrings("beta", b_bytes);
 }
 
 /// Assert that exactly one of `p1`/`p2` is surfaced as a `.hardlink` pointing
