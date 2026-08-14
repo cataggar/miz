@@ -25,9 +25,21 @@
 //! filesystem-neutral, and the asymmetry between "ext4 pulls a cursor" and
 //! "FAT32 pushes over a tree" lives only inside it.
 //!
-//! Deliberately covers only what `layout.FilesystemKind` covers. There is no
-//! XFS (or other) arm here, and none should be added without a real writer
-//! behind it -- see `layout.FilesystemKind`'s own doc comment.
+//! Deliberately covers only what `layout.FilesystemKind` covers: ext4, FAT32,
+//! and -- now that `xfs_writer.zig` emits a bounded, deterministic,
+//! `xfs_repair`-clean image (issue #327) -- XFS. A kind must have a real writer
+//! behind it before it earns an arm here; see `layout.FilesystemKind`'s own doc
+//! comment.
+//!
+//! XFS differs from the other two in *where* it writes. `ext4.populate` streams
+//! into the image file and `fat32.format` writes through an `Image` handle, but
+//! `xfs_writer.populate` fills a caller-provided in-memory byte region (the
+//! bounded writer's design). The `.xfs` arm bridges that: it allocates a
+//! partition-sized buffer, has the writer emit into it at buffer offset 0, and
+//! `pwrite`s the result to the partition's real offset in the image. That keeps
+//! this module's public surface filesystem-neutral -- a caller still passes a
+//! partition offset in `FormatOptions.xfs.format.offset` exactly as it does for
+//! ext4 -- and confines the buffer round-trip to this one arm.
 
 const std = @import("std");
 const Io = std.Io;
@@ -36,6 +48,8 @@ const Allocator = std.mem.Allocator;
 const layout = @import("layout.zig");
 const ext4 = @import("ext4.zig");
 const fat32 = @import("fat32.zig");
+const xfs_writer = @import("xfs_writer.zig");
+const xfs = @import("xfs.zig");
 const image_mod = @import("image.zig");
 const Image = image_mod.Image;
 const root_tree_mod = @import("root_tree.zig");
@@ -51,12 +65,13 @@ pub const DispatchError = error{
     /// real write/size failure, and so nothing here ever falls back to
     /// treating mismatched options as whichever kind they happened to tag.
     FilesystemOptionsMismatch,
-    /// `.ext4` was requested with `tree = null`. ext4 has no format step
-    /// separate from populating a tree -- `ext4.populate` does both in one
-    /// call -- so there is nothing a `null` tree could mean for it, unlike
-    /// FAT32, which formats independently of any tree and can be left
-    /// empty for a caller (such as `bootconfig.populateEsp`) that writes
-    /// its own files afterward without going through a `RootTree` at all.
+    /// `.ext4` or `.xfs` was requested with `tree = null`. Neither has a
+    /// format step separate from populating a tree -- `ext4.populate` and
+    /// `xfs_writer.populate` both format and fill in one call -- so there is
+    /// nothing a `null` tree could mean for them, unlike FAT32, which formats
+    /// independently of any tree and can be left empty for a caller (such as
+    /// `bootconfig.populateEsp`) that writes its own files afterward without
+    /// going through a `RootTree` at all.
     MissingTree,
 };
 
@@ -74,11 +89,22 @@ pub const FormatOptions = union(Kind) {
         /// ignored when the caller only wanted an empty, formatted volume.
         populate: root_tree_mod.FatPopulateOptions = .{},
     },
+    /// Like ext4, XFS formats and populates in one pass and cannot be written
+    /// without a tree. `format.offset` is interpreted the same way ext4's is
+    /// -- the partition's byte offset in the image -- even though the writer
+    /// itself fills an in-memory buffer; the `.xfs` arm rebases it to the
+    /// buffer and `pwrite`s to that image offset.
+    xfs: xfs_writer.PopulateOptions,
 };
 
 pub const FormatResult = union(Kind) {
     ext4: ext4.FilesystemInfo,
     fat32: void,
+    /// XFS carries no post-write info a caller needs (no journal to report, no
+    /// group geometry to echo back), so like FAT32 its result is empty. A
+    /// caller reading `ext4`-only fields must switch on the tag rather than
+    /// assume ext4.
+    xfs: void,
 };
 
 /// Formats `image`'s region for `kind` per `options`, and -- when `tree` is
@@ -115,6 +141,24 @@ pub fn formatAndPopulate(
             }
             return .{ .fat32 = {} };
         },
+        .xfs => |xfs_options| {
+            const source = tree orelse return error.MissingTree;
+            // `xfs_writer.populate` fills an in-memory region, so the writer
+            // sees a buffer-local offset of 0 while the partition's real image
+            // offset is remembered for the final `pwrite`. The buffer is sized
+            // to the whole partition length; the writer rounds the filesystem
+            // down to a whole number of allocation groups and never writes
+            // past that, so zeroing first keeps the unused tail deterministic.
+            const image_offset = xfs_options.format.offset;
+            const buffer = try allocator.alloc(u8, std.math.cast(usize, xfs_options.format.length) orelse return error.Overflow);
+            defer allocator.free(buffer);
+            @memset(buffer, 0);
+            var buffered = xfs_options;
+            buffered.format.offset = 0;
+            try xfs_writer.populate(allocator, buffer, try source.cursor(), buffered);
+            try image.pwrite(io, buffer, image_offset);
+            return .{ .xfs = {} };
+        },
     }
 }
 
@@ -125,6 +169,7 @@ pub const SizeOptions = union(Kind) {
         populate: root_tree_mod.FatPopulateOptions = .{},
         volume: fat32.VolumeLengthOptions = .{},
     },
+    xfs: xfs_writer.PopulateOptions,
 };
 
 /// A backend-neutral sizing answer. `ext4_journal_block_count` is populated
@@ -176,6 +221,16 @@ pub fn minimumLengthAtLeast(
         .fat32 => |fat_options| {
             const minimum = try tree.minimumFat32VolumeLength(fat_options.populate, fat_options.volume);
             return .{ .length = alignUpTo(@max(minimum, floor), fat_options.volume.alignment) };
+        },
+        .xfs => |xfs_options| {
+            // The XFS writer accepts any length at or above its content
+            // minimum -- it rounds a larger request down to whole allocation
+            // groups and clamps a smaller one back up to the minimum -- so, as
+            // with FAT32, raising the answer to `floor` needs no re-search.
+            // XFS has no journal, so the journal block count stays null rather
+            // than a dishonest zero.
+            const minimum = try xfs_writer.minimumSize(allocator, try tree.cursor(), xfs_options);
+            return .{ .length = @max(minimum, floor), .ext4_journal_block_count = null };
         },
     }
 }
@@ -374,4 +429,116 @@ test "minimumLengthAtLeast raises a fat32 answer to the floor without re-searchi
 
     const below_floor = try minimumLengthAtLeast(testing.allocator, &tree, .fat32, .{ .fat32 = .{} }, 0);
     try testing.expectEqual(base.length, below_floor.length);
+}
+
+test "minimumLength dispatches xfs and never reports a journal block count" {
+    const io = testing.io;
+    var tree = makeEmptyMemoryTree(testing.allocator, io);
+    defer tree.deinit();
+    try tree.putFileBytes("hello.txt", "hi\n", .{ .mode = 0o644 });
+
+    const options = xfs_writer.PopulateOptions{ .format = .{ .length = 0, .label = "rootfs" } };
+    const dispatched = try minimumLength(testing.allocator, &tree, .xfs, .{ .xfs = options });
+
+    var direct_tree = makeEmptyMemoryTree(testing.allocator, io);
+    defer direct_tree.deinit();
+    try direct_tree.putFileBytes("hello.txt", "hi\n", .{ .mode = 0o644 });
+    const direct = try xfs_writer.minimumSize(testing.allocator, try direct_tree.cursor(), options);
+
+    try testing.expectEqual(direct, dispatched.length);
+    // XFS has no journal, so an honest sizing answer leaves the ext4-only
+    // journal field null rather than a misleading zero.
+    try testing.expectEqual(@as(?u32, null), dispatched.ext4_journal_block_count);
+}
+
+test "minimumLength rejects an xfs label longer than twelve bytes before sizing" {
+    const io = testing.io;
+    var tree = makeEmptyMemoryTree(testing.allocator, io);
+    defer tree.deinit();
+
+    const options = xfs_writer.PopulateOptions{ .format = .{ .length = 0, .label = "this-label-is-way-too-long" } };
+    const result = minimumLength(testing.allocator, &tree, .xfs, .{ .xfs = options });
+    try testing.expectError(error.LabelTooLong, result);
+}
+
+test "formatAndPopulate rejects xfs options tagged for another kind" {
+    const io = testing.io;
+    var tree = makeEmptyMemoryTree(testing.allocator, io);
+    defer tree.deinit();
+
+    var img = try Image.create(io, "test-filesystem-writer-xfs-mismatch.raw", .raw, 64 * 1024 * 1024, .{});
+    defer img.close(io);
+    defer Io.Dir.cwd().deleteFile(io, "test-filesystem-writer-xfs-mismatch.raw") catch {};
+
+    const as_ext4 = formatAndPopulate(io, testing.allocator, &img, &tree, .xfs, .{
+        .ext4 = .{ .length = 64 * 1024 * 1024 },
+    });
+    try testing.expectError(error.FilesystemOptionsMismatch, as_ext4);
+
+    const as_xfs = formatAndPopulate(io, testing.allocator, &img, &tree, .ext4, .{
+        .xfs = .{ .format = .{ .length = 64 * 1024 * 1024 } },
+    });
+    try testing.expectError(error.FilesystemOptionsMismatch, as_xfs);
+}
+
+test "formatAndPopulate rejects an xfs request with no tree" {
+    const io = testing.io;
+    var img = try Image.create(io, "test-filesystem-writer-xfs-missing-tree.raw", .raw, 64 * 1024 * 1024, .{});
+    defer img.close(io);
+    defer Io.Dir.cwd().deleteFile(io, "test-filesystem-writer-xfs-missing-tree.raw") catch {};
+
+    const result = formatAndPopulate(io, testing.allocator, &img, null, .xfs, .{
+        .xfs = .{ .format = .{ .length = 64 * 1024 * 1024 } },
+    });
+    try testing.expectError(error.MissingTree, result);
+}
+
+test "formatAndPopulate dispatches xfs and the reader reads it back at a partition offset" {
+    const io = testing.io;
+    var tree = makeEmptyMemoryTree(testing.allocator, io);
+    defer tree.deinit();
+    try tree.putFileBytes("hello.txt", "hi\n", .{ .mode = 0o644 });
+
+    // Size the partition through the neutral seam, then place it at a non-zero
+    // offset so the `.xfs` arm's rebase-to-buffer and `pwrite`-to-image-offset
+    // path (and the reader's matching `openFileAt`) are both exercised.
+    const size_opts = xfs_writer.PopulateOptions{ .format = .{ .length = 0, .label = "rootfs" } };
+    const min = try minimumLength(testing.allocator, &tree, .xfs, .{ .xfs = size_opts });
+
+    const partition_offset: u64 = 1024 * 1024;
+    var img = try Image.create(io, "test-filesystem-writer-xfs-dispatch.raw", .raw, partition_offset + min.length, .{});
+    defer img.close(io);
+    defer Io.Dir.cwd().deleteFile(io, "test-filesystem-writer-xfs-dispatch.raw") catch {};
+
+    const result = try formatAndPopulate(io, testing.allocator, &img, &tree, .xfs, .{
+        .xfs = .{ .format = .{ .offset = partition_offset, .length = min.length, .label = "rootfs" } },
+    });
+    try testing.expect(result == .xfs);
+
+    var reader = try xfs.Reader.openFileAt(testing.allocator, io, img.file, partition_offset);
+    defer reader.close(io);
+    var rtree = try xfs.scanReadable(&reader, io, testing.allocator, .{ .available_length = min.length });
+    defer rtree.deinit();
+
+    try testing.expectEqualSlices(u8, "rootfs\x00\x00\x00\x00\x00\x00", &rtree.identity.label);
+
+    var found = false;
+    var index: usize = 0;
+    while (index < rtree.nodeCount()) : (index += 1) {
+        const entry = rtree.entryAt(index);
+        if (!std.mem.eql(u8, entry.path, "hello.txt")) continue;
+        found = true;
+        try testing.expectEqual(xfs.Kind.file, entry.kind);
+        try testing.expectEqual(@as(u64, 3), entry.size);
+        const content = entry.content orelse return error.MissingContent;
+        var buf: [3]u8 = undefined;
+        var done: usize = 0;
+        while (done < buf.len) {
+            const got = try content.readAt(buf[done..], done);
+            try testing.expect(got != 0);
+            done += got;
+        }
+        try testing.expectEqualStrings("hi\n", &buf);
+    }
+    try testing.expect(found);
 }

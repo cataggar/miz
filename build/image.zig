@@ -51,6 +51,19 @@ pub const Architecture = enum {
     }
 };
 
+/// The filesystem the bootable root partition is written as. Defaults to ext4
+/// so an existing image definition keeps producing byte-identical output; the
+/// flag is only emitted when it is not the default, so a plain ext4 build's
+/// argument vector -- and therefore its bytes -- never change.
+pub const RootFilesystem = enum {
+    ext4,
+    xfs,
+
+    fn cliName(kind: RootFilesystem) []const u8 {
+        return @tagName(kind);
+    }
+};
+
 pub const Reproducibility = struct {
     seed: [32]u8,
     source_date_epoch: u64,
@@ -196,6 +209,10 @@ pub const Options = struct {
     skip_iso_rootfs: bool = false,
     esp_size: ?u64 = null,
     ext4_label: []const u8 = "rootfs",
+    /// Filesystem for the root partition. Defaults to ext4; `.xfs` selects the
+    /// bounded native XFS v5 writer. The ESP stays FAT32 regardless. XFS cannot
+    /// be combined with `journal` or `verity` (both are rejected downstream).
+    root_filesystem: RootFilesystem = .ext4,
     /// Create a JBD2 journal on the root filesystem. Off by default, so an
     /// existing image definition keeps producing the bytes it always has.
     /// Turn it on for an image that boots into a mutable root filesystem;
@@ -831,6 +848,7 @@ fn configureRequest(
     if (options.skip_iso_rootfs) run.addArg("--skip-iso-rootfs");
     if (options.esp_size) |size| run.addArgs(&.{ "--esp-size", b.fmt("{d}", .{size}) });
     if (!std.mem.eql(u8, options.ext4_label, "rootfs")) run.addArgs(&.{ "--ext4-label", options.ext4_label });
+    if (options.root_filesystem != .ext4) run.addArgs(&.{ "--root-filesystem", options.root_filesystem.cliName() });
     if (options.journal) run.addArg("--journal");
     if (options.journal_size) |size| run.addArgs(&.{ "--journal-size", b.fmt("{d}", .{size}) });
     if (options.verity) run.addArg("--verity");

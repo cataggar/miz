@@ -56,15 +56,17 @@ pub const PartitionRole = enum {
 /// GUID could both hold ext4; an ESP's GUID is fixed by the UEFI spec yet
 /// says nothing about FAT32 versus FAT16.
 ///
-/// Deliberately covers only what zvmi can actually write today. XFS has a
-/// bounded read-only reader (`xfs.zig`) and ISO9660/SquashFS are read-only
-/// by design; none of them belong in a "how do I format this partition"
-/// enum until a writer exists for them. Adding a variant here for a
-/// filesystem zvmi cannot write would claim a capability that does not
-/// exist (see issue #327).
+/// Deliberately covers only what zvmi can actually write today. `ext4` and
+/// `fat32` have native writers of long standing; `xfs` joins them now that
+/// `xfs_writer.zig` emits a bounded, deterministic, `xfs_repair`-clean XFS v5
+/// filesystem (issue #327), so a caller may legitimately ask for an XFS root.
+/// ISO9660/SquashFS remain read-only by design and stay out of this "how do I
+/// format this partition" enum: adding a variant for a filesystem zvmi cannot
+/// write would claim a capability that does not exist.
 pub const FilesystemKind = enum {
     ext4,
     fat32,
+    xfs,
 
     /// The spelling `mount(8)`'s `-t` option (and the `mount(2)` syscall's
     /// `filesystemtype` argument) needs for this kind on Linux.
@@ -81,6 +83,7 @@ pub const FilesystemKind = enum {
         return switch (self) {
             .ext4 => "ext4",
             .fat32 => "vfat",
+            .xfs => "xfs",
         };
     }
 };
@@ -404,7 +407,9 @@ test "planLayout keeps filesystem independent of an explicit type_guid override"
 
 test "FilesystemKind.mountTypeName spells each kind the way mount(8)/mount(2) expects" {
     // ext4's tag and its mount type happen to agree; fat32's must not, since
-    // the kernel has no filesystem driver named `fat32`.
+    // the kernel has no filesystem driver named `fat32`. xfs, like ext4,
+    // names its driver the same as its tag.
     try std.testing.expectEqualStrings("ext4", FilesystemKind.ext4.mountTypeName());
     try std.testing.expectEqualStrings("vfat", FilesystemKind.fat32.mountTypeName());
+    try std.testing.expectEqualStrings("xfs", FilesystemKind.xfs.mountTypeName());
 }

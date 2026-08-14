@@ -59,12 +59,20 @@ const help_text =
     \\  --architecture <auto|x86_64|aarch64>
     \\                           Decides the root partition type GUID that
     \\                           discoverable-partitions logic looks for.
-    \\  --label <name>           ext4 volume label for the new root.
+    \\  --label <name>           ext4/XFS volume label for the new root. For an
+    \\                           XFS root it must be at most 12 bytes.
+    \\  --root-filesystem <ext4|xfs>
+    \\                           Filesystem for the captured root (default
+    \\                           ext4). xfs uses the bounded native XFS writer
+    \\                           and keeps its own internal log, so --no-journal
+    \\                           has no effect on it; the ESP stays FAT32.
     \\  --root-selinux-label <context>
     \\                           SELinux context for the new root directory.
     \\  --no-journal             Omit the ext4 journal. On by default here,
     \\                           unlike elsewhere in zvmi, because a captured
     \\                           system boots into a mutable root filesystem.
+    \\                           Only meaningful for an ext4 root; XFS always
+    \\                           journals internally.
     \\  --no-identity-rewrite    Leave /etc/fstab and the bootloader naming
     \\                           the source's UUIDs. The image will not boot;
     \\                           this exists for inspecting what changed.
@@ -216,6 +224,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var esp_size: ?u64 = null;
     var architecture: Architecture = .auto;
     var label: []const u8 = "";
+    var root_filesystem: zvmi.layout.FilesystemKind = .ext4;
     var selinux_label: ?[]const u8 = null;
     var journal = true;
     var rewrite_identities = true;
@@ -269,6 +278,16 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             i += 1;
             if (i >= args.len) return fail("capture: --label requires a value", .{});
             label = args[i];
+        } else if (std.mem.eql(u8, arg, "--root-filesystem")) {
+            i += 1;
+            if (i >= args.len) return fail("capture: --root-filesystem requires a value", .{});
+            if (std.mem.eql(u8, args[i], "ext4")) {
+                root_filesystem = .ext4;
+            } else if (std.mem.eql(u8, args[i], "xfs")) {
+                root_filesystem = .xfs;
+            } else {
+                return fail("capture: invalid --root-filesystem '{s}': expected ext4 or xfs", .{args[i]});
+            }
         } else if (std.mem.eql(u8, arg, "--root-selinux-label")) {
             i += 1;
             if (i >= args.len) return fail("capture: --root-selinux-label requires a context", .{});
@@ -346,6 +365,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         .esp_size = esp_size,
         .architecture = architecture,
         .label = label,
+        .root_filesystem = root_filesystem,
         .selinux_label = selinux_label,
         .journal = journal,
         .rewrite_identities = rewrite_identities,
@@ -367,6 +387,7 @@ const CaptureRequest = struct {
     esp_size: ?u64,
     architecture: Architecture,
     label: []const u8,
+    root_filesystem: zvmi.layout.FilesystemKind,
     selinux_label: ?[]const u8,
     journal: bool,
     rewrite_identities: bool,
@@ -615,10 +636,13 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
         .esp_size = if (request.esp_size) |size| .{ .exact = size } else .{ .minimum_plus = zvmi.disk_assembly.default_esp_slack },
         .root_size = if (request.root_size) |size| .{ .exact = size } else .{ .minimum_plus = zvmi.disk_assembly.default_root_slack },
         .ext4_label = request.label,
+        .root_filesystem = request.root_filesystem,
         // On by default here and nowhere else in zvmi: this image becomes a
         // machine's live, mutable root filesystem, and an unclean shutdown
-        // without a journal has nothing to replay.
-        .ext4_journal = .{ .enabled = request.journal },
+        // without a journal has nothing to replay. XFS keeps its own internal
+        // log, so the ext4 JBD2 journal only applies to an ext4 root; asking
+        // for both is rejected by `disk_assembly`, so it is gated here.
+        .ext4_journal = .{ .enabled = request.journal and request.root_filesystem == .ext4 },
         .root_selinux_label = request.selinux_label,
         .identity = .{
             .policy = if (request.rewrite_identities) .rewrite_and_verify else .off,
@@ -1108,7 +1132,8 @@ fn reportMinimums(
             .aarch64 => .aarch64,
         },
         .esp_tree = esp_tree,
-        .ext4_journal = .{ .enabled = request.journal },
+        .root_filesystem = request.root_filesystem,
+        .ext4_journal = .{ .enabled = request.journal and request.root_filesystem == .ext4 },
         .identity = .{ .policy = .off },
         .dry_run = true,
     }) catch return;
@@ -1406,6 +1431,7 @@ fn testCaptureRequest(root_spec_text: ?[]const u8) CaptureRequest {
         .esp_size = null,
         .architecture = .auto,
         .label = "",
+        .root_filesystem = .ext4,
         .selinux_label = null,
         .journal = false,
         .rewrite_identities = false,

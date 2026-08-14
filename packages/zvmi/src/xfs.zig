@@ -2037,6 +2037,50 @@ fn validateComponent(component: []const u8, options: ScanOptions) !void {
 
 const testing = std.testing;
 
+/// Runs `xfs_repair -n` (no-modify check) over a filesystem image, searching
+/// the same places `ext4.runE2fsck` does for its tool. Returns `null` when
+/// `xfs_repair` is not installed, so a caller can skip rather than fail on a
+/// host without xfsprogs.
+pub fn runXfsRepair(allocator: std.mem.Allocator, path: []const u8) !?std.process.RunResult {
+    const candidates = [_][]const u8{ "xfs_repair", "/sbin/xfs_repair", "/usr/sbin/xfs_repair" };
+    for (candidates) |bin| {
+        const result = std.process.run(allocator, std.testing.io, .{
+            .argv = &.{ bin, "-n", path },
+            .cwd = .{ .path = "." },
+        }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        return result;
+    }
+    return null;
+}
+
+/// Asserts a filesystem image is clean by an external `xfs_repair -n`, skipping
+/// the test when the tool is absent. The mirror of `ext4.expectE2fsckClean`.
+pub fn expectXfsRepairClean(path: []const u8) !void {
+    const maybe_result = try runXfsRepair(std.testing.allocator, path);
+    const result = maybe_result orelse {
+        std.debug.print("skipping xfs_repair validation: xfs_repair not found (tried PATH, /sbin, /usr/sbin)\n", .{});
+        return error.SkipZigTest;
+    };
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| {
+            if (code != 0) {
+                std.debug.print("xfs_repair -n reported problems (exit {d}):\nstdout:\n{s}\nstderr:\n{s}\n", .{ code, result.stdout, result.stderr });
+            }
+            try std.testing.expectEqual(@as(u8, 0), code);
+        },
+        else => {
+            std.debug.print("xfs_repair did not exit normally:\nstdout:\n{s}\nstderr:\n{s}\n", .{ result.stdout, result.stderr });
+            return error.TestUnexpectedResult;
+        },
+    }
+}
+
 fn writeFixture(path: []const u8, bytes: []const u8) !void {
     const io = std.testing.io;
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });

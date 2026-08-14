@@ -21,7 +21,8 @@ XZ/zstd-compressed squashfs blocks) paired with a native squashfs **writer**
 automatic unwrapping of nested ext4 or
 squashfs rootfs images discovered inside squashfs payloads (matching LiveOS
 media such as Azure Linux 4.0), local OCI container image ingestion, a minimal
-native ext4 writer/readback library API, COSI output packaging, a
+native ext4 writer/readback library API, a bounded native XFS v5
+writer/readback library selectable as the root output filesystem, COSI output packaging, a
 `zvmi build-image` orchestration path that builds `raw`, fixed-`vhd`, `vhdx`,
 and `qcow2` disk images from an ISO + local OCI layout, a `zvmi build-iso`
 path that regenerates a customized **LiveOS ISO** from an ISO + local OCI
@@ -1091,6 +1092,56 @@ converted only once that is complete.
 a stream. `-O vhd` is written *fixed*, as `build-image` writes it, because the
 reason to want a captured image as a VHD is almost always an Azure
 managed-disk upload and those refuse dynamic.
+
+## The root output filesystem (ext4 or XFS)
+
+The generated root filesystem is ext4 by default, and every surface keeps that
+default, so an image built without asking for anything else is byte-for-byte the
+image it always was. When a run does ask for XFS instead, the root is written by
+the bounded native XFS v5 writer -- the same offline, deterministic,
+mount-free construction the ext4 writer uses, not a call out to `mkfs.xfs`. The
+ESP is unaffected either way: it is always FAT32, planned and populated as its
+own partition.
+
+The two roots are not interchangeable in every combination, and the
+incompatible ones are refused up front, by name, rather than half-built:
+
+- **dm-verity** is an ext4-root feature here. The verity split and hash tree are
+  computed on ext4's block geometry, and the bounded XFS writer fills an
+  in-memory buffer it rounds down to whole allocation groups, so a *verified*
+  XFS root is not something this path can seal. `--root-filesystem xfs` with
+  `--verity` (or `.root_filesystem = .xfs` with `.verity = true`) is rejected
+  before any work.
+- **The ext4 journal** does not describe an XFS root. XFS keeps its own internal
+  metadata log rather than an ext4-style JBD2 journal, so `--journal` /
+  `--journal-size` are ext4-only knobs. `zvmi build-image` rejects `--journal`
+  beside an XFS root by name; `zvmi capture`, which journals by default,
+  silently leaves the ext4 journal off for an XFS root rather than failing on
+  its own default (XFS is already crash-safe through its log).
+- **The XFS volume label** is at most 12 bytes, and the writer rejects a longer
+  one rather than truncating it, so a `--label` / `--ext4-label` over that on an
+  XFS root is refused with the byte limit named.
+- **The privileged preserved-image backends** (`unsafe_chroot`, the VM) mount
+  the *source* root to preserve it, and only mount ext4, so they refuse an XFS
+  *source* the same way they refuse a FAT32 one. This is a different axis from
+  the output selection here: an XFS *output* root is written by `native_fresh`,
+  which never mounts anything, so choosing it requires no kernel XFS mount
+  support and no capability the ext4 output did not already need.
+
+SELinux root labelling (`--root-selinux-label`) is preserved for an XFS root
+exactly as for ext4 -- the `security.selinux` attribute is carried in an XFS
+shortform xattr rather than dropped -- and the root inode's mode, ownership and
+timestamps match the ext4 writer's, so the choice of filesystem is the only
+difference between the two outputs.
+
+| Surface | How to ask for it |
+| --- | --- |
+| `zvmi build-image` | `--root-filesystem ext4` (default), `--root-filesystem xfs` |
+| `zvmi capture` | `--root-filesystem ext4` (default), `--root-filesystem xfs` |
+| `std.Build` helper (`image.addImage`) | `.root_filesystem = .ext4` (default), `.root_filesystem = .xfs` |
+| `build_image.build` | `BuildImageOptions.root_filesystem` |
+| `disk_assembly.assemble` | `AssembleOptions.root_filesystem` |
+| Fresh-storage customization request | `storage.fresh.root_filesystem` |
 
 ## Journalling the root filesystem
 

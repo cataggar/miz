@@ -757,12 +757,17 @@ const ControlInput = struct {
 };
 
 /// Converts the plan's declared root filesystem to the guest agent's own
-/// mirror of the same two kinds, since `vm_control.zig` cannot import
-/// `layout.zig` (see its module doc comment).
+/// mirror of the same kinds, since `vm_control.zig` cannot import `layout.zig`
+/// (see its module doc comment). The conversion is total, but whether a given
+/// kind is one the guest may actually mount as a root is decided upstream by
+/// `customize.rootFilesystemMountCapabilityState`, which admits only `.ext4`;
+/// `.fat32` and `.xfs` are carried here for type completeness and refused
+/// before any VM run starts.
 fn toControlFilesystem(kind: layout_mod.FilesystemKind) vm_control.RootFilesystemKind {
     return switch (kind) {
         .ext4 => .ext4,
         .fat32 => .fat32,
+        .xfs => .xfs,
     };
 }
 
