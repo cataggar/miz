@@ -71,6 +71,7 @@ const ParsedArgs = struct {
     skip_iso_rootfs: bool = false,
     esp_size: u64 = zvmi.build_image.default_esp_size,
     ext4_label: []const u8 = "rootfs",
+    root_filesystem: zvmi.layout.FilesystemKind = .ext4,
     verity: bool = false,
     extra_kernel_options: []const u8 = "",
     boot_mode: zvmi.bootconfig.BootMode = .bls_only,
@@ -255,6 +256,7 @@ pub fn main(init: std.process.Init) !void {
             .esp_size = args.esp_size,
             .ext4_label = args.ext4_label,
             .skip_iso_rootfs = args.skip_iso_rootfs,
+            .root_filesystem = args.root_filesystem,
         } },
         .boot_security = .{
             .boot_mode = args.boot_mode,
@@ -417,6 +419,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
     var skip_iso_rootfs = false;
     var esp_size: u64 = zvmi.build_image.default_esp_size;
     var ext4_label: []const u8 = "rootfs";
+    var root_filesystem: zvmi.layout.FilesystemKind = .ext4;
     var verity = false;
     var extra_kernel_options: []const u8 = "";
     var boot_mode: zvmi.bootconfig.BootMode = .bls_only;
@@ -509,6 +512,14 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
             esp_size = try zvmi.parseSize(value);
         } else if (std.mem.eql(u8, arg, "--ext4-label")) {
             ext4_label = value;
+        } else if (std.mem.eql(u8, arg, "--root-filesystem")) {
+            if (std.mem.eql(u8, value, "ext4")) {
+                root_filesystem = .ext4;
+            } else if (std.mem.eql(u8, value, "xfs")) {
+                root_filesystem = .xfs;
+            } else {
+                return error.InvalidRootFilesystem;
+            }
         } else if (std.mem.eql(u8, arg, "--extra-kernel-options")) {
             extra_kernel_options = value;
         } else if (std.mem.eql(u8, arg, "--boot-mode")) {
@@ -589,6 +600,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
         .skip_iso_rootfs = skip_iso_rootfs,
         .esp_size = esp_size,
         .ext4_label = ext4_label,
+        .root_filesystem = root_filesystem,
         .verity = verity,
         .extra_kernel_options = extra_kernel_options,
         .boot_mode = boot_mode,
@@ -913,6 +925,35 @@ test "a registry option beside a local layout is refused rather than ignored" {
             "--container",         "./oci-layout",
             "--registry-username", "builder",
         }, &buffer),
+    ));
+}
+
+test "the output root filesystem defaults to ext4 and parses an explicit choice" {
+    var default_buffer: [40][]const u8 = undefined;
+    const default_parsed = try parseArgs(std.testing.allocator, testArgs(
+        &.{ "--container", "./oci-layout" },
+        &default_buffer,
+    ));
+    try std.testing.expectEqual(zvmi.layout.FilesystemKind.ext4, default_parsed.root_filesystem);
+
+    var xfs_buffer: [40][]const u8 = undefined;
+    const xfs_parsed = try parseArgs(std.testing.allocator, testArgs(
+        &.{ "--container", "./oci-layout", "--root-filesystem", "xfs" },
+        &xfs_buffer,
+    ));
+    try std.testing.expectEqual(zvmi.layout.FilesystemKind.xfs, xfs_parsed.root_filesystem);
+
+    var ext4_buffer: [40][]const u8 = undefined;
+    const ext4_parsed = try parseArgs(std.testing.allocator, testArgs(
+        &.{ "--container", "./oci-layout", "--root-filesystem", "ext4" },
+        &ext4_buffer,
+    ));
+    try std.testing.expectEqual(zvmi.layout.FilesystemKind.ext4, ext4_parsed.root_filesystem);
+
+    var bad_buffer: [40][]const u8 = undefined;
+    try std.testing.expectError(error.InvalidRootFilesystem, parseArgs(
+        std.testing.allocator,
+        testArgs(&.{ "--container", "./oci-layout", "--root-filesystem", "btrfs" }, &bad_buffer),
     ));
 }
 

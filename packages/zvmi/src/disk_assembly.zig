@@ -32,6 +32,9 @@ const image_mod = @import("image.zig");
 const Image = image_mod.Image;
 const layout_mod = @import("layout.zig");
 const root_tree_mod = @import("root_tree.zig");
+const tree_cursor = @import("tree_cursor.zig");
+const xfs = @import("xfs.zig");
+const xfs_writer = @import("xfs_writer.zig");
 
 const mib: u64 = azure.one_mib;
 
@@ -136,6 +139,13 @@ pub const AssembleOptions = struct {
     esp_volume_label: [11]u8 = "EFI        ".*,
 
     root_size: Size = .{ .minimum_plus = default_root_slack },
+    /// Which filesystem the root partition is assembled as. Defaults to ext4,
+    /// so an assembly that does not ask for anything else keeps producing
+    /// byte-identical ext4 roots. `.xfs` selects the bounded native XFS v5
+    /// writer. XFS keeps its own log rather than a JBD2 journal, so pairing it
+    /// with `ext4_journal` is rejected (`error.Ext4JournalWithXfsRoot`); the
+    /// ESP stays FAT32 regardless.
+    root_filesystem: layout_mod.FilesystemKind = .ext4,
     ext4_label: []const u8 = "",
     /// Whether the root filesystem carries a JBD2 journal. Off by default
     /// here only because `ext4.JournalOptions` is off by default everywhere;
@@ -166,6 +176,14 @@ pub const Error = error{
     /// An ESP size was requested without any ESP contents to size it from.
     MissingEspContents,
     InvalidRootSelinuxLabel,
+    /// `root_filesystem` was `.xfs` but `ext4_journal` was enabled. XFS carries
+    /// its own internal log, so a JBD2 journal request cannot apply to it and
+    /// is refused rather than silently ignored.
+    Ext4JournalWithXfsRoot,
+    /// `root_filesystem` named a kind this path cannot write as a bootable root
+    /// (only ext4 and XFS are valid roots; the ESP's FAT32 is planned
+    /// separately).
+    UnsupportedRootFilesystem,
     InvalidRawPath,
 };
 
@@ -224,16 +242,27 @@ pub fn assemble(
 ) !Report {
     if (options.raw_path.len == 0) return error.InvalidRawPath;
     if (options.esp_tree == null and options.esp_size == .exact) return error.MissingEspContents;
+    // XFS has an internal metadata log, not a JBD2 journal, so an ext4 journal
+    // request cannot describe it. Reject the pairing by name before any work.
+    if (options.root_filesystem == .xfs and options.ext4_journal.enabled) return error.Ext4JournalWithXfsRoot;
 
     var root_xattr_buffer: [1]ext4.Xattr = undefined;
     var root_selinux_value: ?[]u8 = null;
     defer if (root_selinux_value) |value| allocator.free(value);
-    const root_xattrs = try buildRootXattrs(
+    const ext4_root_xattrs = try buildRootXattrs(
         allocator,
         options.root_selinux_label,
         &root_xattr_buffer,
         &root_selinux_value,
     );
+    // XFS carries the same SELinux context faithfully in a shortform xattr, so
+    // build the neutral-cursor record from the very bytes `buildRootXattrs`
+    // already validated and owns.
+    var xfs_root_xattr_buffer: [1]tree_cursor.Xattr = undefined;
+    const xfs_root_xattrs: []const tree_cursor.Xattr = if (root_selinux_value) |value| x: {
+        xfs_root_xattr_buffer[0] = .{ .name = "security.selinux", .value = value };
+        break :x xfs_root_xattr_buffer[0..1];
+    } else &.{};
 
     const identities = resolveIdentities(io, options.deterministic);
 
@@ -259,16 +288,31 @@ pub fn assemble(
         },
     } else null;
 
-    const populate_options = ext4.PopulateOptions{
+    const ext4_populate = ext4.PopulateOptions{
         .length = 0,
         .label = options.ext4_label,
-        .root_xattrs = root_xattrs,
+        .root_xattrs = ext4_root_xattrs,
         .uuid = identities.root_filesystem_uuid,
         .timestamp = options.filesystem_timestamp,
         .journal = options.ext4_journal,
     };
-    const root_size_options: filesystem_writer.SizeOptions = .{ .ext4 = populate_options };
-    const root_minimum = try filesystem_writer.minimumLength(allocator, tree, .ext4, root_size_options);
+    const xfs_populate = xfs_writer.PopulateOptions{
+        .format = .{
+            .length = 0,
+            .label = options.ext4_label,
+            .uuid = identities.root_filesystem_uuid,
+            .timestamp = .{ .sec = options.filesystem_timestamp, .nsec = 0 },
+        },
+        // The captured root inode mirrors ext4's implicit root (mode 0o755,
+        // root:root); null times fall back to the filesystem-wide timestamp.
+        .root = .{ .mode = 0o755, .uid = 0, .gid = 0, .xattrs = xfs_root_xattrs },
+    };
+    const root_size_options: filesystem_writer.SizeOptions = switch (options.root_filesystem) {
+        .ext4 => .{ .ext4 = ext4_populate },
+        .xfs => .{ .xfs = xfs_populate },
+        .fat32 => return error.UnsupportedRootFilesystem,
+    };
+    const root_minimum = try filesystem_writer.minimumLength(allocator, tree, options.root_filesystem, root_size_options);
     const root_floor = switch (options.root_size) {
         .minimum_plus => |slack| try add(root_minimum.length, slack),
         .exact => |exact| blk: {
@@ -283,12 +327,12 @@ pub fn assemble(
     const root_fit = try filesystem_writer.minimumLengthAtLeast(
         allocator,
         tree,
-        .ext4,
+        options.root_filesystem,
         root_size_options,
         root_floor,
     );
 
-    const planned = try planPartitions(allocator, options.architecture, esp_length, root_fit.length);
+    const planned = try planPartitions(allocator, options.architecture, options.root_filesystem, esp_length, root_fit.length);
     defer allocator.free(planned.partitions);
 
     const esp_partition: ?AssembledPartition = if (findRole(planned.partitions, .esp)) |part| .{
@@ -316,7 +360,7 @@ pub fn assemble(
         .esp_minimum_bytes = esp_minimum,
         .root_filesystem_uuid = identities.root_filesystem_uuid,
         .esp_volume_id = if (esp_partition != null) identities.esp_volume_id else null,
-        .journal_block_count = root_fit.ext4_journal_block_count.?,
+        .journal_block_count = root_fit.ext4_journal_block_count orelse 0,
         .root_node_count = tree.nodeCount(),
         .esp_node_count = if (options.esp_tree) |esp_tree| esp_tree.nodeCount() else 0,
         .identity_rewrite = rewrites.root,
@@ -351,18 +395,35 @@ pub fn assemble(
         });
     }
 
-    var root_populate = populate_options;
-    root_populate.offset = root_partition.offset_bytes;
-    root_populate.length = root_partition.filesystem_length;
+    const root_format_options: filesystem_writer.FormatOptions = switch (options.root_filesystem) {
+        .ext4 => blk: {
+            var root_populate = ext4_populate;
+            root_populate.offset = root_partition.offset_bytes;
+            root_populate.length = root_partition.filesystem_length;
+            break :blk .{ .ext4 = root_populate };
+        },
+        .xfs => blk: {
+            var root_populate = xfs_populate;
+            root_populate.format.offset = root_partition.offset_bytes;
+            root_populate.format.length = root_partition.filesystem_length;
+            break :blk .{ .xfs = root_populate };
+        },
+        .fat32 => return error.UnsupportedRootFilesystem,
+    };
     const populate_result = try filesystem_writer.formatAndPopulate(
         io,
         allocator,
         &img,
         tree,
         root_planned.filesystem,
-        .{ .ext4 = root_populate },
+        root_format_options,
     );
-    report.journal_block_count = populate_result.ext4.journal_block_count;
+    // Only ext4 has a journal to report; XFS's own log is not a JBD2 journal,
+    // so an honest count for it is zero rather than a borrowed ext4 field.
+    report.journal_block_count = switch (populate_result) {
+        .ext4 => |info| info.journal_block_count,
+        else => 0,
+    };
 
     img.close(io);
     img_open = false;
@@ -429,6 +490,20 @@ const Rewrites = struct {
     esp: identity_rewrite.Report,
 };
 
+/// Maps the writer's notion of a root filesystem kind onto the identity
+/// rewriter's, which only distinguishes the two kinds a root is ever written
+/// as. A `fat32` root is not a real case -- `assemble` refuses it a few steps
+/// later, where it builds the root's size and format options -- so it maps to
+/// null here, which simply leaves the fstab type field and any `rootfstype=`
+/// untouched rather than asserting on a value that is about to be rejected.
+fn identityFilesystemType(kind: layout_mod.FilesystemKind) ?identity_rewrite.FilesystemType {
+    return switch (kind) {
+        .ext4 => .ext4,
+        .xfs => .xfs,
+        .fat32 => null,
+    };
+}
+
 /// Reconciles both trees against the identifiers this assembly creates.
 ///
 /// The ESP is reconciled as a tree of its own rather than through
@@ -463,6 +538,7 @@ fn applyIdentityRewrite(
     const esp_partition_uuid = guid.formatLower(&esp_partuuid_text, identities.esp_partition_guid);
 
     const has_esp = options.esp_tree != null;
+    const root_type = identityFilesystemType(options.root_filesystem);
     const filesystems = try allocator.alloc(identity_rewrite.Filesystem, options.identity.sources.len);
     defer allocator.free(filesystems);
     for (options.identity.sources, filesystems) |source, *slot| {
@@ -486,6 +562,14 @@ fn applyIdentityRewrite(
                 .none => .{},
             },
             .merged_at = source.merged_at,
+            // Only the surviving root carries a kind, and only when it is one
+            // the type rewrite understands. A merged source is a directory now,
+            // so tagging it would be meaningless; leaving every other entry
+            // null is what keeps identifier-only rewrites behaving as before.
+            .root_filesystem_type = if (source.successor == .root and source.merged_at == null)
+                root_type
+            else
+                null,
         };
     }
 
@@ -533,6 +617,7 @@ const PlannedDisk = struct {
 fn planPartitions(
     allocator: Allocator,
     architecture: bootconfig.Architecture,
+    root_filesystem: layout_mod.FilesystemKind,
     esp_length: ?u64,
     root_filesystem_length: u64,
 ) !PlannedDisk {
@@ -547,7 +632,7 @@ fn planPartitions(
         count += 1;
     }
     const root_length = alignUp(root_filesystem_length);
-    requests[count] = .{ .name = root_partition_name, .role = root_role, .filesystem = .ext4, .size = .{ .fixed = root_length } };
+    requests[count] = .{ .name = root_partition_name, .role = root_role, .filesystem = root_filesystem, .size = .{ .fixed = root_length } };
     count += 1;
 
     // The first partition starts at the first aligned offset past the
@@ -812,6 +897,138 @@ test "the assembled root filesystem passes a real e2fsck" {
 
     try extractPartition(io, raw_path, part_path, report.root.offset_bytes, report.root.filesystem_length);
     try ext4.expectE2fsckClean(part_path);
+}
+
+test "the assembled xfs root passes a real xfs_repair" {
+    const io = testing.io;
+    const raw_path = "test-disk-assembly-xfs-repair.img";
+    const part_path = "test-disk-assembly-xfs-repair.root";
+    const root_spool = "test-disk-assembly-xfs-repair.root-spool";
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, part_path) catch {};
+
+    var root = try buildSourceRoot(io, root_spool);
+    defer root.deinit();
+
+    const report = try assemble(testing.allocator, io, &root, .{
+        .raw_path = raw_path,
+        .architecture = .aarch64,
+        .root_filesystem = .xfs,
+        .root_size = .{ .minimum_plus = 8 * mib },
+        .ext4_label = "captured",
+        .filesystem_timestamp = 1_717_171_717,
+        .deterministic = test_determinism,
+    });
+    try testing.expect(report.esp == null);
+    try testing.expectEqual(@as(u32, 0), report.journal_block_count);
+    try testing.expectEqualSlices(u8, &guid.linux_root_aarch64, &report.root.type_guid);
+
+    // Extract just the root filesystem so an external checker that has no
+    // concept of a partition offset can be pointed at it, then let the real
+    // xfsprogs verifier attest the bytes this project's writer produced.
+    try extractPartition(io, raw_path, part_path, report.root.offset_bytes, report.root.filesystem_length);
+    try xfs.expectXfsRepairClean(part_path);
+}
+
+test "assembles an xfs root that its own reader reads back, rewritten and journal-free" {
+    const io = testing.io;
+    const raw_path = "test-disk-assembly-xfs.img";
+    const root_spool = "test-disk-assembly-xfs.root-spool";
+    const esp_spool = "test-disk-assembly-xfs.esp-spool";
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+
+    var root = try buildSourceRoot(io, root_spool);
+    defer root.deinit();
+    var esp = try buildSourceEsp(io, esp_spool);
+    defer esp.deinit();
+
+    const sources = captureSources();
+    const report = try assemble(testing.allocator, io, &root, .{
+        .raw_path = raw_path,
+        .architecture = .x86_64,
+        .root_filesystem = .xfs,
+        .esp_tree = &esp,
+        // XFS keeps a 64 MiB internal log, so its minimum is far above ext4's;
+        // the sizing seam finds that floor and this only asks for headroom.
+        .root_size = .{ .minimum_plus = 4 * mib },
+        .ext4_label = "captured",
+        .filesystem_timestamp = 1_717_171_717,
+        .identity = .{ .sources = &sources },
+        .deterministic = test_determinism,
+    });
+    // XFS logs internally; the ext4 JBD2 count is honestly zero, not borrowed.
+    try testing.expectEqual(@as(u32, 0), report.journal_block_count);
+    try testing.expectEqualSlices(u8, &guid.linux_root_x86_64, &report.root.type_guid);
+    // The ESP is unaffected by the root filesystem choice: still FAT32.
+    try testing.expectEqualSlices(u8, &guid.esp, &report.esp.?.type_guid);
+
+    var img = try Image.openPathReadOnly(io, raw_path);
+    defer img.close(io);
+    try testing.expectEqual(report.virtual_size, img.virtual_size);
+
+    var reader = try xfs.Reader.openFileAt(testing.allocator, io, img.file, report.root.offset_bytes);
+    defer reader.close(io);
+    var rtree = try xfs.scanReadable(&reader, io, testing.allocator, .{ .available_length = report.root.filesystem_length });
+    defer rtree.deinit();
+
+    // The label the assembler was given round-trips through the XFS superblock.
+    try testing.expectEqualSlices(u8, "captured\x00\x00\x00\x00", &rtree.identity.label);
+
+    // The same identity rewrite that ext4 gets runs on the tree before the XFS
+    // writer sees it, so the fstab this image carries names its own new UUID.
+    var expected_uuid: [identity_rewrite.canonical_uuid_bytes]u8 = undefined;
+    const new_root_uuid = identity_rewrite.formatFilesystemUuid(&expected_uuid, &test_determinism.root_filesystem_uuid);
+
+    var found_fstab = false;
+    var index: usize = 0;
+    while (index < rtree.nodeCount()) : (index += 1) {
+        const entry = rtree.entryAt(index);
+        if (!std.mem.eql(u8, entry.path, "etc/fstab")) continue;
+        found_fstab = true;
+        const content = entry.content orelse return error.MissingContent;
+        const buffer = try testing.allocator.alloc(u8, @intCast(entry.size));
+        defer testing.allocator.free(buffer);
+        var done: usize = 0;
+        while (done < buffer.len) {
+            const got = try content.readAt(buffer[done..], done);
+            if (got == 0) break;
+            done += got;
+        }
+        try testing.expect(std.mem.indexOf(u8, buffer[0..done], new_root_uuid) != null);
+        try testing.expect(std.mem.indexOf(u8, buffer[0..done], source_root_uuid) == null);
+    }
+    try testing.expect(found_fstab);
+    try testing.expect(report.identity_rewrite.fstab_entries_rewritten > 0);
+
+    // The ESP really is a FAT32 volume next to the XFS root, and its boot chain
+    // was rewritten to the same new root UUID.
+    var esp_fs = try fat32.open(&img, io, .{
+        .offset = report.esp.?.offset_bytes,
+        .length = report.esp.?.length_bytes,
+    });
+    const grub_cfg = try esp_fs.readFileAlloc(io, testing.allocator, "EFI/vendor/grub.cfg");
+    defer testing.allocator.free(grub_cfg);
+    try testing.expect(std.mem.indexOf(u8, grub_cfg, new_root_uuid) != null);
+    try testing.expect(std.mem.indexOf(u8, grub_cfg, source_root_uuid) == null);
+}
+
+test "an ext4 journal requested with an xfs root is refused by name" {
+    const io = testing.io;
+    const raw_path = "test-disk-assembly-xfs-journal.img";
+    const root_spool = "test-disk-assembly-xfs-journal.root-spool";
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+
+    var root = try buildSourceRoot(io, root_spool);
+    defer root.deinit();
+
+    try testing.expectError(error.Ext4JournalWithXfsRoot, assemble(testing.allocator, io, &root, .{
+        .raw_path = raw_path,
+        .architecture = .x86_64,
+        .root_filesystem = .xfs,
+        .ext4_journal = .{ .enabled = true },
+        .deterministic = test_determinism,
+        .dry_run = true,
+    }));
 }
 
 test "an exact size below what the tree needs is refused by name" {

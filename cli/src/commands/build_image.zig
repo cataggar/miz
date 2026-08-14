@@ -5,7 +5,7 @@ const zvmi = @import("zvmi");
 const opts = @import("opts.zig");
 
 const help_text =
-    \\usage: zvmi build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}|-> [-O raw|raw.gz|raw.zst|vhd|vhdx|qcow2] [--compress-level <1-9>] [--rootfs-path <path>] [--skip-iso-rootfs] [--max-oci-blob-size <size>] [--max-oci-layer-size <size>] [--max-oci-archive-size <size>] [--esp-size <size>] [--ext4-label <label>] [--journal|--no-journal] [--journal-size <size>] [--root-selinux-label <context>] [--stub-source-path <path>] [--os-release-source-path <path>] [--splash-source-path <path>] [--uki-output-directory <path>] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--dry-run] [-v]
+    \\usage: zvmi build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}|-> [-O raw|raw.gz|raw.zst|vhd|vhdx|qcow2] [--compress-level <1-9>] [--rootfs-path <path>] [--skip-iso-rootfs] [--max-oci-blob-size <size>] [--max-oci-layer-size <size>] [--max-oci-archive-size <size>] [--esp-size <size>] [--ext4-label <label>] [--root-filesystem ext4|xfs] [--journal|--no-journal] [--journal-size <size>] [--root-selinux-label <context>] [--stub-source-path <path>] [--os-release-source-path <path>] [--splash-source-path <path>] [--uki-output-directory <path>] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--dry-run] [-v]
     \\
     \\Options:
     \\  -o <path>|-                Output path, or - to stream the image to stdout.
@@ -17,7 +17,11 @@ const help_text =
     \\  --boot-mode bls|uki|both   Gen2 boot files: GRUB+BLS only (default), UKI only, or both.
     \\  --esp-size <size>          ESP size (default 96M). UKI/both commonly need 512M or larger.
     \\  --generation 1|2           Azure VM generation (default 2).
-    \\  --ext4-label <label>       Root ext4 filesystem label (default rootfs).
+    \\  --ext4-label <label>       Root ext4 filesystem label (default rootfs). For an
+    \\                              XFS root this is the volume label and must be <=12 bytes.
+    \\  --root-filesystem ext4|xfs Filesystem for the root partition (default ext4). xfs
+    \\                              selects the bounded native XFS v5 writer; the ESP stays
+    \\                              FAT32. xfs is incompatible with --journal and --verity.
     \\  --journal, --no-journal    Create a JBD2 journal on the root filesystem, or not
     \\                              (default --no-journal, matching every earlier build).
     \\                              Use --journal for an image that boots into a mutable
@@ -101,6 +105,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var size: ?u64 = null;
     var esp_size: ?u64 = null;
     var ext4_label: []const u8 = "rootfs";
+    var root_filesystem: zvmi.layout.FilesystemKind = .ext4;
     var journal = zvmi.ext4.JournalOptions{};
     var root_selinux_label: ?[]const u8 = null;
     var stub_source_path: ?[]const u8 = null;
@@ -149,6 +154,16 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             i += 1;
             if (i >= args.len) return fail("build-image: --ext4-label requires a value", .{});
             ext4_label = args[i];
+        } else if (std.mem.eql(u8, arg, "--root-filesystem")) {
+            i += 1;
+            if (i >= args.len) return fail("build-image: --root-filesystem requires a value", .{});
+            if (std.mem.eql(u8, args[i], "ext4")) {
+                root_filesystem = .ext4;
+            } else if (std.mem.eql(u8, args[i], "xfs")) {
+                root_filesystem = .xfs;
+            } else {
+                return fail("build-image: invalid --root-filesystem '{s}': expected ext4 or xfs", .{args[i]});
+            }
         } else if (std.mem.eql(u8, arg, "--journal")) {
             journal.enabled = true;
         } else if (std.mem.eql(u8, arg, "--no-journal")) {
@@ -276,6 +291,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             .skip_iso_rootfs = skip_iso_rootfs,
             .esp_size = esp_size orelse zvmi.build_image.default_esp_size,
             .ext4_label = ext4_label,
+            .root_filesystem = root_filesystem,
             .ext4_journal = journal,
             .root_selinux_label = root_selinux_label,
             .verity = enable_verity,
@@ -429,6 +445,18 @@ fn describeBuildImageFailure(
             u8,
             "build-image: failed: --journal and --verity cannot be combined.\nA dm-verity root is mounted read-only over a hash tree computed from its exact bytes, so it is never written to and has nothing to journal; the journal would only consume space and imply a durability property the image does not have.\nDrop --journal for a verity image, or drop --verity for a mutable journalled root.",
         ),
+        error.Ext4JournalWithXfsRoot => allocator.dupe(
+            u8,
+            "build-image: failed: --journal cannot be combined with --root-filesystem xfs.\nXFS keeps its own internal metadata log rather than an ext4-style JBD2 journal, so a --journal request cannot describe it.\nDrop --journal for an XFS root, or select --root-filesystem ext4 to journal an ext4 root.",
+        ),
+        error.VerityWithXfsRoot => allocator.dupe(
+            u8,
+            "build-image: failed: --verity cannot be combined with --root-filesystem xfs.\nThe dm-verity split and hash tree are computed on ext4 block geometry and the bounded XFS writer fills a buffer rounded down to whole allocation groups, so a verified XFS root cannot be sealed here.\nDrop --verity for an XFS root, or select --root-filesystem ext4 for a verity root.",
+        ),
+        error.UnsupportedRootFilesystem => allocator.dupe(
+            u8,
+            "build-image: failed: the selected root filesystem cannot be written as a bootable root.\nOnly ext4 and xfs are valid roots; the ESP is always FAT32 and planned separately.",
+        ),
         error.FilesystemTooSmallForJournal => allocator.dupe(
             u8,
             "build-image: failed: --journal was requested, but the root filesystem is smaller than the 8M minimum a JBD2 journal needs.\nIncrease --size, or drop --journal.",
@@ -483,6 +511,23 @@ test "describeBuildImageFailure explains why a journal and verity cannot be comb
     try std.testing.expect(std.mem.indexOf(u8, message, "--journal") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "--verity") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "read-only") != null);
+}
+
+test "describeBuildImageFailure names the xfs root incompatibilities" {
+    const journal = try describeBuildImageFailure(std.testing.allocator, error.Ext4JournalWithXfsRoot, .{});
+    defer std.testing.allocator.free(journal);
+    try std.testing.expect(std.mem.indexOf(u8, journal, "--journal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, journal, "xfs") != null);
+
+    const verity = try describeBuildImageFailure(std.testing.allocator, error.VerityWithXfsRoot, .{});
+    defer std.testing.allocator.free(verity);
+    try std.testing.expect(std.mem.indexOf(u8, verity, "--verity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, verity, "xfs") != null);
+
+    const unsupported = try describeBuildImageFailure(std.testing.allocator, error.UnsupportedRootFilesystem, .{});
+    defer std.testing.allocator.free(unsupported);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported, "ext4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported, "FAT32") != null);
 }
 
 test "describeBuildImageFailure names the journal size that was refused" {

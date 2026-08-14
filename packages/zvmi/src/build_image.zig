@@ -17,6 +17,7 @@ const mbr = @import("mbr.zig");
 const oci = @import("oci.zig");
 const os_customization = @import("os_customization.zig");
 const output = @import("output.zig");
+const tree_cursor = @import("tree_cursor.zig");
 const iso9660 = @import("iso9660.zig");
 const qcow2 = @import("qcow2.zig");
 const limits_mod = @import("limits.zig");
@@ -26,6 +27,7 @@ const squashfs = @import("squashfs.zig");
 const uki_signing = @import("uki_signing.zig");
 const verity = @import("verity.zig");
 const verity_tooling = @import("verity_tooling.zig");
+const xfs = @import("xfs.zig");
 
 const mib: u64 = azure.one_mib;
 pub const default_esp_size: u64 = 96 * mib;
@@ -78,6 +80,15 @@ pub const BuildImageOptions = struct {
     os: os_customization.OsCustomization = .{},
     generalization: os_customization.GeneralizationPolicy = .none,
     esp_size: u64 = default_esp_size,
+    /// Which filesystem the bootable root partition is written as. Defaults to
+    /// ext4, so every build that predates the option -- and every build that
+    /// does not ask for anything else -- keeps producing byte-identical ext4
+    /// roots. `.xfs` selects the bounded native XFS v5 writer; the ESP is
+    /// always FAT32 regardless. `.fat32` is not a valid root and is rejected.
+    /// XFS is incompatible with `ext4_journal` (XFS has its own log, not a
+    /// JBD2 journal) and with `verity` (the dm-verity split assumes ext4 block
+    /// geometry); both combinations are rejected by name before any work.
+    root_filesystem: layout.FilesystemKind = .ext4,
     ext4_label: []const u8 = "rootfs",
     /// Whether the root filesystem carries a JBD2 journal, and how large.
     /// Off by default, matching every build that predates the option. Turn
@@ -429,6 +440,7 @@ pub fn build(
         options.generation,
         architecture,
         options.esp_size,
+        options.root_filesystem,
         if (options.deterministic) |*deterministic| deterministic else null,
     );
     var planned_partitions_owned = false;
@@ -562,6 +574,16 @@ pub fn build(
     // Accepting the combination would cost real space and imply a durability
     // property the image does not have.
     if (options.verity and options.ext4_journal.enabled) return error.JournalWithVerityRoot;
+    // XFS keeps its own internal metadata log, not a JBD2 journal, so the
+    // ext4-only `ext4_journal` knob has no meaning for an XFS root. Reject the
+    // pairing by name rather than silently ignore a durability request the
+    // writer never acts on.
+    if (options.root_filesystem == .xfs and options.ext4_journal.enabled) return error.Ext4JournalWithXfsRoot;
+    // dm-verity here splits the partition and hashes it on ext4's block
+    // geometry, and the bounded XFS writer fills an in-memory buffer it rounds
+    // down to whole allocation groups -- so a verified XFS root is not
+    // something this path can honestly seal yet. Reject it up front by name.
+    if (options.root_filesystem == .xfs and options.verity) return error.VerityWithXfsRoot;
     const verity_layout = if (options.verity)
         try verity.splitPartition(root_partition.planned.length_bytes, ext4.default_block_size, ext4.default_block_size)
     else
@@ -605,11 +627,15 @@ pub fn build(
     try enterStage(options, .populate_filesystem);
     report.root_tree_digest = try root_tree.manifestDigest();
     if (options.limit_diagnostic) |sink| report.limit_peaks = sink.peaks;
-    logStep(options, "populate root ext4 filesystem");
-    var root_xattr_buffer: [1]ext4.Xattr = undefined;
+
+    // The optional SELinux root context is stored as a single `security.selinux`
+    // xattr on the root inode. Its NUL-terminated value is identical whichever
+    // backend writes it, so compute it once and hand it to the backend-specific
+    // xattr record chosen below. XFS shortform xattrs carry it faithfully, so
+    // SELinux labelling is preserved for an XFS root, not silently dropped.
     var root_selinux_value: ?[]u8 = null;
     defer if (root_selinux_value) |value| allocator.free(value);
-    const root_xattrs: []const ext4.Xattr = if (options.root_selinux_label) |label| blk: {
+    if (options.root_selinux_label) |label| {
         if (label.len == 0 or std.mem.indexOfScalar(u8, label, 0) != null) {
             return error.InvalidRootSelinuxLabel;
         }
@@ -617,23 +643,54 @@ pub fn build(
         std.mem.copyForwards(u8, value[0..label.len], label);
         value[label.len] = 0;
         root_selinux_value = value;
-        root_xattr_buffer[0] = .{
-            .name = "security.selinux",
-            .value = value,
-        };
-        break :blk &root_xattr_buffer;
-    } else &.{};
-    _ = try filesystem_writer.formatAndPopulate(io, allocator, &raw_img, &root_tree, root_partition.planned.filesystem, .{
-        .ext4 = .{
-            .offset = root_partition.planned.offset_bytes,
-            .length = rootfs_length,
-            .label = options.ext4_label,
-            .root_xattrs = root_xattrs,
-            .uuid = root_filesystem_uuid,
-            .timestamp = if (options.deterministic) |deterministic| deterministic.filesystem_timestamp else 0,
-            .journal = options.ext4_journal,
+    }
+    const filesystem_timestamp: u32 = if (options.deterministic) |deterministic| deterministic.filesystem_timestamp else 0;
+
+    var ext4_root_xattr: [1]ext4.Xattr = undefined;
+    var xfs_root_xattr: [1]tree_cursor.Xattr = undefined;
+    const format_options: filesystem_writer.FormatOptions = switch (root_partition.planned.filesystem) {
+        .ext4 => blk: {
+            logStep(options, "populate root ext4 filesystem");
+            const root_xattrs: []const ext4.Xattr = if (root_selinux_value) |value| x: {
+                ext4_root_xattr[0] = .{ .name = "security.selinux", .value = value };
+                break :x ext4_root_xattr[0..1];
+            } else &.{};
+            break :blk .{ .ext4 = .{
+                .offset = root_partition.planned.offset_bytes,
+                .length = rootfs_length,
+                .label = options.ext4_label,
+                .root_xattrs = root_xattrs,
+                .uuid = root_filesystem_uuid,
+                .timestamp = filesystem_timestamp,
+                .journal = options.ext4_journal,
+            } };
         },
-    });
+        .xfs => blk: {
+            logStep(options, "populate root xfs filesystem");
+            const root_xattrs: []const tree_cursor.Xattr = if (root_selinux_value) |value| x: {
+                xfs_root_xattr[0] = .{ .name = "security.selinux", .value = value };
+                break :x xfs_root_xattr[0..1];
+            } else &.{};
+            break :blk .{ .xfs = .{
+                .format = .{
+                    .offset = root_partition.planned.offset_bytes,
+                    .length = rootfs_length,
+                    .label = options.ext4_label,
+                    .uuid = root_filesystem_uuid,
+                    .timestamp = .{ .sec = filesystem_timestamp, .nsec = 0 },
+                },
+                // The root inode matches ext4's implicit root (mode 0o755,
+                // root:root); leaving the times null lets the writer fall back
+                // to the same filesystem-wide timestamp ext4 stamps them with.
+                .root = .{ .mode = 0o755, .uid = 0, .gid = 0, .xattrs = root_xattrs },
+            } };
+        },
+        // The root role never plans a FAT32 filesystem (the ESP is separate),
+        // so this is unreachable in practice; name it rather than write a
+        // FAT32 root a caller could never boot.
+        .fat32 => return error.UnsupportedRootFilesystem,
+    };
+    _ = try filesystem_writer.formatAndPopulate(io, allocator, &raw_img, &root_tree, root_partition.planned.filesystem, format_options);
 
     if (verity_layout) |layout_for_verity| {
         try enterStage(options, .seal_verity);
@@ -934,11 +991,12 @@ fn planPartitionIdentities(
     generation: azure.Generation,
     architecture: bootconfig.Architecture,
     esp_size: u64,
+    root_filesystem: layout.FilesystemKind,
     deterministic: ?*const BuildImageDeterminism,
 ) ![]bootconfig.PlannedPartitionIdentity {
     return switch (generation) {
-        .gen2 => try planGen2PartitionIdentities(allocator, io, disk_size, architecture, esp_size, deterministic),
-        .gen1 => try planGen1PartitionIdentities(allocator, io, disk_size, architecture, deterministic),
+        .gen2 => try planGen2PartitionIdentities(allocator, io, disk_size, architecture, esp_size, root_filesystem, deterministic),
+        .gen1 => try planGen1PartitionIdentities(allocator, io, disk_size, architecture, root_filesystem, deterministic),
     };
 }
 
@@ -948,6 +1006,7 @@ fn planGen2PartitionIdentities(
     disk_size: u64,
     architecture: bootconfig.Architecture,
     esp_size: u64,
+    root_filesystem: layout.FilesystemKind,
     deterministic: ?*const BuildImageDeterminism,
 ) ![]bootconfig.PlannedPartitionIdentity {
     const root_role: layout.PartitionRole = switch (architecture) {
@@ -956,7 +1015,7 @@ fn planGen2PartitionIdentities(
     };
     const requests = [_]layout.PartitionRequest{
         .{ .name = "ESP", .role = .esp, .filesystem = .fat32, .size = .{ .fixed = esp_size } },
-        .{ .name = "root", .role = root_role, .filesystem = .ext4, .size = .{ .percent = 100.0 } },
+        .{ .name = "root", .role = root_role, .filesystem = root_filesystem, .size = .{ .percent = 100.0 } },
     };
     const planned = try layout.planLayout(allocator, disk_size, &requests, null);
     errdefer allocator.free(planned);
@@ -977,6 +1036,7 @@ fn planGen1PartitionIdentities(
     io: Io,
     disk_size: u64,
     architecture: bootconfig.Architecture,
+    root_filesystem: layout.FilesystemKind,
     deterministic: ?*const BuildImageDeterminism,
 ) ![]bootconfig.PlannedPartitionIdentity {
     if (disk_size % gpt.sector_size != 0) return error.InvalidDiskSize;
@@ -996,7 +1056,7 @@ fn planGen1PartitionIdentities(
     identities[0] = .{ .planned = .{
         .name = "root",
         .role = root_role,
-        .filesystem = .ext4,
+        .filesystem = root_filesystem,
         .type_guid = root_role.defaultTypeGuid(),
         .offset_bytes = offset_bytes,
         .length_bytes = usable_bytes,
@@ -3177,6 +3237,152 @@ test "build-image builds Gen2 VHD, VHDX, and qcow2 outputs from XZ squashfs + OC
     defer qcow2_img.close(io);
     try std.testing.expectEqual(Format.qcow2, qcow2_img.format);
     try expectGen2BuiltImageContents(allocator, io, &qcow2_img, qcow2_report, qcow2_output_path);
+}
+
+test "build-image builds a raw XFS root the xfs reader reads back" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-xfs.iso";
+    const oci_root = "test-build-image-xfs-oci";
+    const output_path = "test-build-image-xfs.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
+    defer fixture.deinit(allocator);
+
+    var report = try build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        // XFS's internal log floors the root far above ext4's; leave generous
+        // room after the 96 MiB ESP so the writer has whole allocation groups.
+        .size = 320 * mib,
+        .root_filesystem = .xfs,
+    });
+    defer report.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), report.planned_partitions.len);
+    // The root partition really plans an XFS filesystem, and the ESP stays FAT32.
+    try std.testing.expectEqual(layout.FilesystemKind.xfs, report.planned_partitions[1].planned.filesystem);
+    try std.testing.expectEqual(layout.FilesystemKind.fat32, report.planned_partitions[0].planned.filesystem);
+
+    var img = try Image.openPathReadOnly(io, output_path);
+    defer img.close(io);
+
+    const root_planned = report.planned_partitions[1].planned;
+    var reader = try xfs.Reader.openFileAt(allocator, io, img.file, root_planned.offset_bytes);
+    defer reader.close(io);
+    var rtree = try xfs.scanReadable(&reader, io, allocator, .{ .available_length = root_planned.length_bytes });
+    defer rtree.deinit();
+
+    // The same payloads the ext4 path lands (squashfs file, OCI overlay, kernel)
+    // read back out of the XFS image the public build path just wrote.
+    const Want = struct { path: []const u8, first: u8, last: u8, size: u64 };
+    const wants = [_]Want{
+        .{ .path = "etc/message.txt", .first = 'A', .last = 'B', .size = 1500 },
+        .{ .path = "app/hello.txt", .first = 'h', .last = '\n', .size = 18 },
+        .{ .path = "boot/vmlinuz-test", .first = 'k', .last = 'i', .size = 15 },
+    };
+    var found: usize = 0;
+    var index: usize = 0;
+    while (index < rtree.nodeCount()) : (index += 1) {
+        const entry = rtree.entryAt(index);
+        for (wants) |want| {
+            if (!std.mem.eql(u8, entry.path, want.path)) continue;
+            found += 1;
+            try std.testing.expectEqual(xfs.Kind.file, entry.kind);
+            try std.testing.expectEqual(want.size, entry.size);
+            const content = entry.content orelse return error.MissingContent;
+            const buffer = try allocator.alloc(u8, @intCast(entry.size));
+            defer allocator.free(buffer);
+            var done: usize = 0;
+            while (done < buffer.len) {
+                const got = try content.readAt(buffer[done..], done);
+                if (got == 0) break;
+                done += got;
+            }
+            try std.testing.expectEqual(buffer.len, done);
+            try std.testing.expectEqual(want.first, buffer[0]);
+            try std.testing.expectEqual(want.last, buffer[buffer.len - 1]);
+        }
+    }
+    try std.testing.expectEqual(wants.len, found);
+}
+
+test "build-image rejects a dm-verity xfs root by name even with tooling present" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-xfs-verity.iso";
+    const oci_root = "test-build-image-xfs-verity-oci";
+    const output_path = "test-build-image-xfs-verity.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    // The initramfs carries dm-verity tooling, so the preflight that guards
+    // that passes; the rejection we expect is the geometry one, by name.
+    const initrd_bytes = try makeSyntheticInitramfsCpio(allocator, "usr/lib/systemd/systemd-veritysetup-generator");
+    defer allocator.free(initrd_bytes);
+
+    var fixture = try createBuildImageOciFixtureWithOptions(allocator, io, oci_root, .{
+        .initrd_bytes = initrd_bytes,
+    });
+    defer fixture.deinit(allocator);
+
+    try std.testing.expectError(error.VerityWithXfsRoot, build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 320 * mib,
+        .root_filesystem = .xfs,
+        .verity = true,
+    }));
+}
+
+test "build-image rejects an ext4 journal on an xfs root by name" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const iso_path = "test-build-image-xfs-journal.iso";
+    const oci_root = "test-build-image-xfs-journal-oci";
+    const output_path = "test-build-image-xfs-journal.raw";
+    defer Io.Dir.cwd().deleteFile(io, iso_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, oci_root) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+
+    const squashfs_bytes = try squashfs.buildSyntheticSquashfsImage(allocator, .{ .compression = .xz });
+    defer allocator.free(squashfs_bytes);
+    try writeMinimalIsoWithFile(allocator, io, iso_path, "ROOT.SQUASHFS;1", squashfs_bytes);
+
+    var fixture = try createBuildImageOciFixture(allocator, io, oci_root);
+    defer fixture.deinit(allocator);
+
+    try std.testing.expectError(error.Ext4JournalWithXfsRoot, build(allocator, io, .{
+        .iso_path = iso_path,
+        .container_path = oci_root,
+        .output_path = output_path,
+        .output_format = .raw,
+        .generation = .gen2,
+        .size = 320 * mib,
+        .root_filesystem = .xfs,
+        .ext4_journal = .{ .enabled = true },
+    }));
 }
 
 test "build-image populates multi-block squashfs files into ext4 for small sequential reads" {

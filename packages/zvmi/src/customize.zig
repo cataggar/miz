@@ -341,6 +341,13 @@ pub const FreshStorage = struct {
     esp_size: u64 = build_image.default_esp_size,
     ext4_label: []const u8 = "rootfs",
     skip_iso_rootfs: bool = false,
+    /// Which filesystem the freshly built root partition is written as. This
+    /// is the output-root axis and is entirely independent of any preserved
+    /// source's `root_filesystem` (that one describes bytes being read, this
+    /// one bytes being written). Defaults to ext4, so a request that does not
+    /// name it plans and hashes exactly as it did before the option existed.
+    /// `.xfs` selects the bounded native XFS v5 writer; the ESP stays FAT32.
+    root_filesystem: layout.FilesystemKind = .ext4,
 };
 
 pub const PartitionSelector = preserved_image.PartitionSelector;
@@ -1681,7 +1688,31 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
     }
 
     switch (request.storage) {
-        .fresh => |storage| if (request.output.size_policy == .explicit) {
+        .fresh => |storage| {
+            // The output-root XFS selection is incompatible with dm-verity in
+            // this path: the verity split and hash tree are computed on ext4
+            // block geometry and the bounded XFS writer fills a buffer rounded
+            // down to whole allocation groups, so a verified XFS root cannot be
+            // sealed here. Reject it by name regardless of how size was chosen.
+            if (storage.root_filesystem == .xfs and request.boot_security.verity) {
+                try diagnostics.append(validationError(
+                    .incompatible_boot_policy,
+                    "/boot_security/verity",
+                    "dm-verity is not supported for an XFS root filesystem",
+                    "disable verity or select the ext4 root filesystem",
+                ));
+            }
+            // The XFS writer rejects a label longer than 12 bytes rather than
+            // truncating it; surface that as a storage diagnostic up front.
+            if (storage.root_filesystem == .xfs and storage.ext4_label.len > 12) {
+                try diagnostics.append(validationError(
+                    .invalid_storage,
+                    "/storage/fresh/ext4_label",
+                    "an XFS root filesystem label must be at most 12 bytes",
+                    "shorten the label or select the ext4 root filesystem",
+                ));
+            }
+            if (request.output.size_policy == .explicit) {
             if (request.output.size % 512 != 0) {
                 try diagnostics.append(validationError(.invalid_output, "/output/size", "output size must be a multiple of 512 bytes", null));
             }
@@ -1739,6 +1770,7 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
                 )) |diagnostic| {
                     try diagnostics.append(diagnostic);
                 }
+            }
             }
         },
         .preserve => |storage| switch (storage.root_partition) {
@@ -3714,6 +3746,10 @@ pub const ResolvedFreshStorage = struct {
     esp_size: u64,
     ext4_label: []const u8,
     skip_iso_rootfs: bool,
+    /// The output root filesystem chosen for a fresh build (see
+    /// `FreshStorage.root_filesystem`). Distinct from any preserved source's
+    /// filesystem.
+    root_filesystem: layout.FilesystemKind = .ext4,
 };
 
 pub const ResolvedPreservedStorage = struct {
@@ -4116,6 +4152,7 @@ pub fn resolve(
             .esp_size = storage.esp_size,
             .ext4_label = try plan_allocator.dupe(u8, storage.ext4_label),
             .skip_iso_rootfs = storage.skip_iso_rootfs,
+            .root_filesystem = storage.root_filesystem,
         } },
         .preserve => |storage| .{ .preserve = .{
             .root_partition = try dupePartitionSelector(plan_allocator, storage.root_partition),
@@ -5737,6 +5774,15 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
             hashInt(&hash, storage.esp_size);
             hashString(&hash, storage.ext4_label);
             hashBool(&hash, storage.skip_iso_rootfs);
+            // Hashed only when it is not the historical default, so every
+            // ext4 fresh plan -- including one that names ext4 explicitly --
+            // keeps the exact hash it had before this field existed. A build
+            // that opts into a different output filesystem is a different
+            // plan and must not collide with the ext4 one.
+            if (storage.root_filesystem != .ext4) {
+                hash.update("root_filesystem");
+                hash.update(@tagName(storage.root_filesystem));
+            }
         },
         .preserve => |storage| {
             hashPartitionSelector(&hash, storage.root_partition);
@@ -6948,6 +6994,46 @@ test "rootFilesystemMountCapabilityState accepts a mountable ext4 root and rejec
     );
 }
 
+test "rootFilesystemMountCapabilityState refuses an XFS preserved source root for every mounting backend" {
+    const Check = struct {
+        fn available(_: ?*anyopaque, _: Io, _: *const ResolvedPlan) CapabilityState {
+            return .available;
+        }
+    };
+
+    // An XFS *source* root would have to be mounted for unsafe_chroot or the VM
+    // to preserve it, and neither backend has kernel XFS mount plumbing wired
+    // here, so the plan is refused up front regardless of the backend's own
+    // readiness -- exactly as FAT32 is. (An XFS *output* root is a separate
+    // axis: native_fresh writes it without ever mounting, so it needs no mount
+    // capability at all and never reaches this check.)
+    var chroot_request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    chroot_request.execution.backend = .unsafe_chroot;
+    chroot_request.execution.acknowledge_unsafe = true;
+    chroot_request.storage.preserve.root_filesystem = .xfs;
+    var chroot_resolved = try resolve(std.testing.allocator, &chroot_request, .{ .host_architecture = .x86_64 });
+    defer chroot_resolved.deinit(std.testing.allocator);
+    var platform = Platform.system();
+    platform.unsafeChrootCheckFn = Check.available;
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        rootFilesystemMountCapabilityState(platform, std.testing.io, &chroot_resolved.plan.?),
+    );
+
+    var vm_request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
+    vm_request.execution.backend = .vm;
+    vm_request.execution.vm = validVmPolicy();
+    vm_request.storage.preserve.root_filesystem = .xfs;
+    var vm_resolved = try resolve(std.testing.allocator, &vm_request, .{ .host_architecture = .x86_64 });
+    defer vm_resolved.deinit(std.testing.allocator);
+    var vm_platform = Platform.system();
+    vm_platform.vmCheckFn = Check.available;
+    try std.testing.expectEqual(
+        CapabilityState.unsupported,
+        rootFilesystemMountCapabilityState(vm_platform, std.testing.io, &vm_resolved.plan.?),
+    );
+}
+
 test "a declared root filesystem changes the plan hash, and leaving it unset hashes the same as naming ext4 explicitly" {
     var default_request = validNativeEditRequest("source.raw", "output.raw", ".", &.{});
     var default_resolved = try resolve(std.testing.allocator, &default_request, .{ .host_architecture = .x86_64 });
@@ -6988,6 +7074,87 @@ test "a declared root filesystem changes the plan hash, and leaving it unset has
         &fat32_resolved.plan.?.data.plan_hash.bytes,
         &repeat_resolved.plan.?.data.plan_hash.bytes,
     );
+}
+
+test "the fresh output root filesystem is ext4 by default and only a non-default kind moves the plan hash" {
+    var default_request = validRequest();
+    var default_resolved = try resolve(std.testing.allocator, &default_request, .{ .host_architecture = .x86_64 });
+    defer default_resolved.deinit(std.testing.allocator);
+    const default_hash = (default_resolved.plan orelse return error.TestUnexpectedResult).data.plan_hash;
+
+    // Naming ext4 explicitly is the same plan as leaving it unset: a caller
+    // upgrading onto this field sees no hash churn, and every existing ext4
+    // image keeps the exact bytes it had before the field existed.
+    var explicit_ext4 = validRequest();
+    explicit_ext4.storage.fresh.root_filesystem = .ext4;
+    var explicit_ext4_resolved = try resolve(std.testing.allocator, &explicit_ext4, .{ .host_architecture = .x86_64 });
+    defer explicit_ext4_resolved.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(
+        u8,
+        &default_hash.bytes,
+        &(explicit_ext4_resolved.plan orelse return error.TestUnexpectedResult).data.plan_hash.bytes,
+    );
+
+    // Choosing XFS is a materially different plan, so its hash must move.
+    var xfs_request = validRequest();
+    xfs_request.storage.fresh.root_filesystem = .xfs;
+    var xfs_resolved = try resolve(std.testing.allocator, &xfs_request, .{ .host_architecture = .x86_64 });
+    defer xfs_resolved.deinit(std.testing.allocator);
+    const xfs_hash = (xfs_resolved.plan orelse return error.TestUnexpectedResult).data.plan_hash;
+    try std.testing.expect(!std.mem.eql(u8, &default_hash.bytes, &xfs_hash.bytes));
+
+    // Deterministic: the same XFS request hashes identically twice.
+    var repeat = validRequest();
+    repeat.storage.fresh.root_filesystem = .xfs;
+    var repeat_resolved = try resolve(std.testing.allocator, &repeat, .{ .host_architecture = .x86_64 });
+    defer repeat_resolved.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(
+        u8,
+        &xfs_hash.bytes,
+        &(repeat_resolved.plan orelse return error.TestUnexpectedResult).data.plan_hash.bytes,
+    );
+}
+
+test "an XFS output root rejects dm-verity and an over-long label as named diagnostics" {
+    // XFS + verity is refused up front, by name, at the verity pointer.
+    var verity_request = validRequest();
+    verity_request.storage.fresh.root_filesystem = .xfs;
+    verity_request.boot_security.verity = true;
+    var verity_diagnostics = try validate(std.testing.allocator, &verity_request);
+    defer verity_diagnostics.deinit(std.testing.allocator);
+    var saw_verity = false;
+    for (verity_diagnostics.items) |diagnostic| {
+        saw_verity = saw_verity or
+            (diagnostic.code == .incompatible_boot_policy and
+                std.mem.eql(u8, diagnostic.configuration_path, "/boot_security/verity"));
+    }
+    try std.testing.expect(saw_verity);
+
+    // XFS labels are capped at 12 bytes (the writer rejects, not truncates),
+    // so a 13-byte label is a named storage diagnostic for an XFS root.
+    var label_request = validRequest();
+    label_request.storage.fresh.root_filesystem = .xfs;
+    label_request.storage.fresh.ext4_label = "thirteen_char";
+    var label_diagnostics = try validate(std.testing.allocator, &label_request);
+    defer label_diagnostics.deinit(std.testing.allocator);
+    var saw_label = false;
+    for (label_diagnostics.items) |diagnostic| {
+        saw_label = saw_label or
+            (diagnostic.code == .invalid_storage and
+                std.mem.eql(u8, diagnostic.configuration_path, "/storage/fresh/ext4_label"));
+    }
+    try std.testing.expect(saw_label);
+
+    // The same 13-byte label on the default ext4 root is fine (its cap is 16),
+    // so the XFS rule does not leak onto ext4.
+    var ext4_label_request = validRequest();
+    ext4_label_request.storage.fresh.ext4_label = "thirteen_char";
+    var ext4_label_diagnostics = try validate(std.testing.allocator, &ext4_label_request);
+    defer ext4_label_diagnostics.deinit(std.testing.allocator);
+    for (ext4_label_diagnostics.items) |diagnostic| {
+        try std.testing.expect(!(diagnostic.code == .invalid_storage and
+            std.mem.eql(u8, diagnostic.configuration_path, "/storage/fresh/ext4_label")));
+    }
 }
 
 /// Whether a disk carries a GPT that the COSI writer can describe.
@@ -8370,6 +8537,7 @@ fn buildResult(
             .esp_size = storage.esp_size,
             .ext4_label = try result_allocator.dupe(u8, storage.ext4_label),
             .skip_iso_rootfs = storage.skip_iso_rootfs,
+            .root_filesystem = storage.root_filesystem,
         } },
         .preserve => |storage| .{ .preserve = storage },
     };
@@ -9908,6 +10076,7 @@ fn buildOptionsFromPlan(
         .generalization = plan.data.generalization,
         .esp_size = storage.esp_size,
         .ext4_label = storage.ext4_label,
+        .root_filesystem = storage.root_filesystem,
         .verity = plan.data.boot_security.verity,
         .extra_kernel_options = plan.data.boot_security.extra_kernel_options,
         .boot_mode = plan.data.boot_security.boot_mode,

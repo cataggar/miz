@@ -71,6 +71,7 @@ pub fn build(b: *std.Build) void {
         .size = 256 * 1024 * 1024,
         .target_architecture = .x86_64,
         .rootfs_path_in_iso = "images/rootfs.squashfs",
+        .root_filesystem = .xfs,
         .reproducibility = .{
             .seed = [_]u8{0x11} ** 32,
             .source_date_epoch = 1_735_689_600,

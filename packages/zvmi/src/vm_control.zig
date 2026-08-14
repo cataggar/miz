@@ -458,10 +458,12 @@ pub const HookOutcome = struct {
 pub const RootFilesystemKind = enum {
     ext4,
     fat32,
+    xfs,
 
     /// The spelling `mount(2)`'s `fstype` argument expects. Not `@tagName`
     /// because the Linux kernel has no `fat32` driver -- only `vfat`, which
-    /// handles every FAT variant -- so `fat32` and `ext4` diverge here.
+    /// handles every FAT variant -- so `fat32` diverges here; `ext4` and `xfs`
+    /// happen to agree with their tags.
     ///
     /// Null-terminated, unlike `layout.FilesystemKind`'s copy of this method:
     /// the guest passes this straight into the raw `mount(2)` syscall rather
@@ -471,6 +473,7 @@ pub const RootFilesystemKind = enum {
         return switch (self) {
             .ext4 => "ext4",
             .fat32 => "vfat",
+            .xfs => "xfs",
         };
     }
 };
@@ -478,6 +481,7 @@ pub const RootFilesystemKind = enum {
 test "RootFilesystemKind.mountTypeName spells each kind the way mount(2) expects" {
     try std.testing.expectEqualStrings("ext4", std.mem.span(RootFilesystemKind.ext4.mountTypeName()));
     try std.testing.expectEqualStrings("vfat", std.mem.span(RootFilesystemKind.fat32.mountTypeName()));
+    try std.testing.expectEqualStrings("xfs", std.mem.span(RootFilesystemKind.xfs.mountTypeName()));
 }
 
 pub const Control = struct {

@@ -59,12 +59,23 @@ const help_text =
     \\  --architecture <auto|x86_64|aarch64>
     \\                           Decides the root partition type GUID that
     \\                           discoverable-partitions logic looks for.
-    \\  --label <name>           ext4 volume label for the new root.
+    \\  --label <name>           ext4/XFS volume label for the new root. For an
+    \\                           XFS root it must be at most 12 bytes.
+    \\  --root-filesystem <ext4|xfs>
+    \\                           Filesystem for the captured root (default
+    \\                           ext4). xfs uses the bounded native XFS writer
+    \\                           and keeps its own internal log; pass
+    \\                           --no-journal alongside it, since an ext4
+    \\                           journal on an XFS root is rejected rather than
+    \\                           quietly ignored. The ESP stays FAT32.
     \\  --root-selinux-label <context>
     \\                           SELinux context for the new root directory.
     \\  --no-journal             Omit the ext4 journal. On by default here,
     \\                           unlike elsewhere in zvmi, because a captured
     \\                           system boots into a mutable root filesystem.
+    \\                           Required for an XFS root: XFS journals
+    \\                           internally, and asking for an ext4 journal on
+    \\                           top of it is rejected by name.
     \\  --no-identity-rewrite    Leave /etc/fstab and the bootloader naming
     \\                           the source's UUIDs. The image will not boot;
     \\                           this exists for inspecting what changed.
@@ -216,6 +227,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var esp_size: ?u64 = null;
     var architecture: Architecture = .auto;
     var label: []const u8 = "";
+    var root_filesystem: zvmi.layout.FilesystemKind = .ext4;
     var selinux_label: ?[]const u8 = null;
     var journal = true;
     var rewrite_identities = true;
@@ -269,6 +281,16 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             i += 1;
             if (i >= args.len) return fail("capture: --label requires a value", .{});
             label = args[i];
+        } else if (std.mem.eql(u8, arg, "--root-filesystem")) {
+            i += 1;
+            if (i >= args.len) return fail("capture: --root-filesystem requires a value", .{});
+            if (std.mem.eql(u8, args[i], "ext4")) {
+                root_filesystem = .ext4;
+            } else if (std.mem.eql(u8, args[i], "xfs")) {
+                root_filesystem = .xfs;
+            } else {
+                return fail("capture: invalid --root-filesystem '{s}': expected ext4 or xfs", .{args[i]});
+            }
         } else if (std.mem.eql(u8, arg, "--root-selinux-label")) {
             i += 1;
             if (i >= args.len) return fail("capture: --root-selinux-label requires a context", .{});
@@ -346,6 +368,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         .esp_size = esp_size,
         .architecture = architecture,
         .label = label,
+        .root_filesystem = root_filesystem,
         .selinux_label = selinux_label,
         .journal = journal,
         .rewrite_identities = rewrite_identities,
@@ -367,6 +390,7 @@ const CaptureRequest = struct {
     esp_size: ?u64,
     architecture: Architecture,
     label: []const u8,
+    root_filesystem: zvmi.layout.FilesystemKind,
     selinux_label: ?[]const u8,
     journal: bool,
     rewrite_identities: bool,
@@ -376,6 +400,17 @@ const CaptureRequest = struct {
     level: ?zvmi.output.Level,
     limits: zvmi.limits.ImportLimits,
 };
+
+/// The ext4 journal setting a capture hands to `disk_assembly`. The request's
+/// flag is returned exactly as it stands -- never masked by the root
+/// filesystem kind. Capture defaults the journal on, so this is what makes an
+/// ext4 journal asked for on an XFS root reach `disk_assembly` and be rejected
+/// by name (`Ext4JournalWithXfsRoot`) instead of being quietly cleared here,
+/// before any validation runs, the way an earlier version did. A user who
+/// wants an XFS root passes `--no-journal`.
+fn ext4JournalSetting(request: CaptureRequest) zvmi.ext4.JournalOptions {
+    return .{ .enabled = request.journal };
+}
 
 fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
     var disk = zvmi.Image.openPathReadOnly(io, request.source_path) catch |err|
@@ -615,10 +650,12 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
         .esp_size = if (request.esp_size) |size| .{ .exact = size } else .{ .minimum_plus = zvmi.disk_assembly.default_esp_slack },
         .root_size = if (request.root_size) |size| .{ .exact = size } else .{ .minimum_plus = zvmi.disk_assembly.default_root_slack },
         .ext4_label = request.label,
-        // On by default here and nowhere else in zvmi: this image becomes a
-        // machine's live, mutable root filesystem, and an unclean shutdown
-        // without a journal has nothing to replay.
-        .ext4_journal = .{ .enabled = request.journal },
+        .root_filesystem = request.root_filesystem,
+        // On by default here and nowhere else in zvmi (a captured system boots
+        // into a mutable root that needs a journal to replay). The flag is
+        // passed through untouched by `ext4JournalSetting` so an ext4 journal
+        // asked for on an XFS root is rejected by name rather than dropped here.
+        .ext4_journal = ext4JournalSetting(request),
         .root_selinux_label = request.selinux_label,
         .identity = .{
             .policy = if (request.rewrite_identities) .rewrite_and_verify else .off,
@@ -1108,7 +1145,10 @@ fn reportMinimums(
             .aarch64 => .aarch64,
         },
         .esp_tree = esp_tree,
-        .ext4_journal = .{ .enabled = request.journal },
+        .root_filesystem = request.root_filesystem,
+        // Matches the real assemble above via the same helper, so the two can
+        // never diverge on how the journal flag maps.
+        .ext4_journal = ext4JournalSetting(request),
         .identity = .{ .policy = .off },
         .dry_run = true,
     }) catch return;
@@ -1149,15 +1189,24 @@ fn reportSizes(request: CaptureRequest, report: ?zvmi.disk_assembly.Report) void
 /// builds cleanly and then fails to boot, so what it did is stated rather
 /// than assumed, and what it could not do is a warning.
 fn reportIdentity(which: []const u8, report: zvmi.identity_rewrite.Report) void {
-    if (report.retired_identifiers == 0) return;
+    // A filesystem-type correction (ext4 -> xfs in fstab or a `rootfstype=`)
+    // can happen with no identifier retired at all -- a root that keeps its
+    // UUID through the conversion -- so the summary must not hinge on
+    // `retired_identifiers` alone, or that correction would be made silently.
+    const did_anything = report.retired_identifiers > 0 or
+        report.fstab_types_rewritten > 0 or
+        report.config_rootfstype_rewritten > 0;
+    if (!did_anything) return;
     std.debug.print(
-        "capture: {s} identity rewrite: {d} fstab entries rewritten, {d} dropped, {d} references in {d} config files\n",
+        "capture: {s} identity rewrite: {d} fstab entries rewritten, {d} filesystem-type corrections, {d} dropped, {d} references in {d} config files ({d} rootfstype corrections)\n",
         .{
             which,
             report.fstab_entries_rewritten,
+            report.fstab_types_rewritten,
             report.fstab_entries_dropped,
             report.config_references_rewritten,
             report.config_files_rewritten,
+            report.config_rootfstype_rewritten,
         },
     );
     if (report.fstab_entries_unresolved > 0) {
@@ -1406,6 +1455,7 @@ fn testCaptureRequest(root_spec_text: ?[]const u8) CaptureRequest {
         .esp_size = null,
         .architecture = .auto,
         .label = "",
+        .root_filesystem = .ext4,
         .selinux_label = null,
         .journal = false,
         .rewrite_identities = false,
@@ -1696,4 +1746,27 @@ test "a malformed XFS candidate propagates as a genuine failure, not a silently 
         error.UnsupportedSuperblockVersion,
         resolveRoot(std.testing.allocator, io, &img, table, request, &scratch),
     );
+}
+
+test "capture keeps the journal flag for validation instead of erasing it for an XFS root" {
+    // The bug this guards: capture defaults the journal on, and an earlier
+    // version silently cleared it whenever the root was XFS, so a contradictory
+    // `--root-filesystem xfs` (journal still on by default) was accepted and the
+    // setting vanished. The mapping must instead pass the flag straight through
+    // so `disk_assembly` sees the contradiction and rejects it by name; the only
+    // thing that turns the journal off is the operator's own `--no-journal`.
+    var request = testCaptureRequest(null);
+
+    request.root_filesystem = .xfs;
+    request.journal = true;
+    try std.testing.expect(ext4JournalSetting(request).enabled);
+
+    request.journal = false;
+    try std.testing.expect(!ext4JournalSetting(request).enabled);
+
+    // And nothing about an ext4 root changes: the flag is still whatever was
+    // asked for, never synthesized.
+    request.root_filesystem = .ext4;
+    request.journal = true;
+    try std.testing.expect(ext4JournalSetting(request).enabled);
 }

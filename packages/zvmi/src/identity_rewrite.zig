@@ -118,6 +118,34 @@ pub const Identifiers = struct {
     }
 };
 
+/// The two filesystem kinds this project can write a root as, spelled the way
+/// `/etc/fstab`'s third field and a kernel `rootfstype=` name them. Everything
+/// else an imported system might use (btrfs, f2fs, an unrecognized word) is
+/// deliberately absent: the only stale-type confusion a rebuild introduces is
+/// converting between these two, and a value the writer does not produce is one
+/// this module must never invent by rewriting toward it.
+pub const FilesystemType = enum {
+    ext4,
+    xfs,
+
+    pub fn name(self: FilesystemType) []const u8 {
+        return switch (self) {
+            .ext4 => "ext4",
+            .xfs => "xfs",
+        };
+    }
+
+    /// Parses exactly the two kinds this module understands, case-sensitively
+    /// (fstab and the kernel both spell them lowercase). Any other word -- a
+    /// filesystem this project does not write, a `swap`, an `auto` -- returns
+    /// null so the caller leaves it untouched rather than guessing.
+    pub fn parse(text: []const u8) ?FilesystemType {
+        if (std.mem.eql(u8, text, "ext4")) return .ext4;
+        if (std.mem.eql(u8, text, "xfs")) return .xfs;
+        return null;
+    }
+};
+
 /// What became of one source filesystem.
 pub const Filesystem = struct {
     /// How the imported configuration still names it.
@@ -135,6 +163,15 @@ pub const Filesystem = struct {
     /// filesystem `after` names. An `/etc/fstab` entry for it is removed
     /// rather than rewritten.
     merged_at: ?[]const u8 = null,
+    /// The kind the rebuilt filesystem actually is, set only on the entry that
+    /// remains the root (`merged_at` null and the successor root). Null on
+    /// every other entry, and null whenever a caller does not thread a kind
+    /// through at all -- which is what keeps this backward-compatible: a plan
+    /// built the old way rewrites identifiers exactly as before and touches no
+    /// filesystem-type field. When it is set and the imported `/etc/fstab` or
+    /// kernel command line names a *different* ext4/xfs type for the root, that
+    /// stale type is corrected to this one.
+    root_filesystem_type: ?FilesystemType = null,
 };
 
 /// The whole reconciliation: what happened to each source filesystem, plus
@@ -177,6 +214,19 @@ pub const Plan = struct {
             }
         }
         return false;
+    }
+
+    /// The kind the rebuilt root filesystem actually is, or null when no entry
+    /// carries one -- an older caller that never threaded a kind, or a plan
+    /// that simply did not record it. Only the surviving root entry is ever
+    /// tagged (a merged filesystem is a directory now, not a root), so the
+    /// first non-merged entry that carries a kind is the answer.
+    pub fn rootType(self: Plan) ?FilesystemType {
+        for (self.filesystems) |filesystem| {
+            if (filesystem.merged_at != null) continue;
+            if (filesystem.root_filesystem_type) |kind| return kind;
+        }
+        return null;
     }
 
     fn find(self: Plan, kind: Kind, value: []const u8) ?Filesystem {
@@ -285,6 +335,11 @@ pub const Report = struct {
     /// means the rewrite and the verification pass were both no-ops.
     retired_identifiers: usize = 0,
     fstab_entries_rewritten: usize = 0,
+    /// Root `/etc/fstab` entries whose third (filesystem-type) field was
+    /// corrected from a stale ext4/xfs value to the kind the root now is.
+    /// Counted separately from `fstab_entries_rewritten`, which stays a count
+    /// of *identifier* splices, so a type-only correction is still visible.
+    fstab_types_rewritten: usize = 0,
     fstab_entries_dropped: usize = 0,
     /// fstab entries naming a retired identifier for which the plan supplied
     /// no replacement. Left exactly as they were and reported, because a
@@ -292,6 +347,10 @@ pub const Report = struct {
     fstab_entries_unresolved: usize = 0,
     config_files_rewritten: usize = 0,
     config_references_rewritten: usize = 0,
+    /// The subset of `config_references_rewritten` that were `rootfstype=`
+    /// filesystem-type corrections on a kernel command line rather than
+    /// identifier replacements. Zero unless the root's kind changed.
+    config_rootfstype_rewritten: usize = 0,
     /// Files the verification pass read in full.
     verified_files: usize = 0,
     /// Occurrences of a retired identifier that survived every rewrite.
@@ -415,7 +474,7 @@ pub fn apply(
     try plan.validate();
 
     var report = Report{ .retired_identifiers = countRetired(plan) };
-    if (report.retired_identifiers == 0) return report;
+    if (report.retired_identifiers == 0 and plan.rootType() == null) return report;
 
     var scope = try Scope.init(allocator, plan);
     defer scope.deinit();
@@ -557,6 +616,7 @@ fn rewriteTreeFstab(
     const rewritten = try rewriteFstab(allocator, original, plan, &fstab);
     defer allocator.free(rewritten);
     report.fstab_entries_rewritten += fstab.entries_rewritten;
+    report.fstab_types_rewritten += fstab.types_rewritten;
     report.fstab_entries_dropped += fstab.entries_dropped;
     report.fstab_entries_unresolved += fstab.entries_unresolved;
     if (std.mem.eql(u8, original, rewritten)) return;
@@ -576,12 +636,13 @@ fn rewriteTreeConfig(
     };
     defer allocator.free(original);
 
-    var references: usize = 0;
-    const rewritten = try rewriteConfig(allocator, original, plan, &references);
+    var config = ConfigReport{};
+    const rewritten = try rewriteConfig(allocator, original, plan, &config);
     defer allocator.free(rewritten);
-    if (references == 0) return;
+    if (config.references == 0) return;
     report.config_files_rewritten += 1;
-    report.config_references_rewritten += references;
+    report.config_references_rewritten += config.references;
+    report.config_rootfstype_rewritten += config.rootfstype_rewritten;
     try replaceFileContent(tree, path, rewritten);
 }
 
@@ -596,6 +657,11 @@ fn replaceFileContent(tree: *root_tree.RootTree, path: []const u8, bytes: []cons
 
 pub const FstabReport = struct {
     entries_rewritten: usize = 0,
+    /// Root entries whose filesystem-type (third) field was corrected. Kept
+    /// apart from `entries_rewritten` so a type-only fix -- an entry whose
+    /// identifier did not change but whose ext4/xfs type did -- is still
+    /// counted rather than lost.
+    types_rewritten: usize = 0,
     entries_dropped: usize = 0,
     entries_unresolved: usize = 0,
 };
@@ -665,13 +731,22 @@ fn rewriteFstabLine(
     report: *FstabReport,
 ) !void {
     // Only the line terminator is trimmed for parsing; `raw` -- terminator
-    // included -- is what gets copied.
+    // included -- is what gets copied. Field offsets index into `body`, which
+    // is a prefix of `raw`, so they address `raw`'s bytes directly.
     const body = std.mem.trimEnd(u8, raw, "\r\n");
     var fields = FieldIterator{ .bytes = body };
     const spec = fields.next() orelse return out.appendSlice(raw);
     if (spec.text[0] == '#') return out.appendSlice(raw);
 
-    if (fields.next()) |mount_point| {
+    const mount_field = fields.next();
+    const type_field = fields.next();
+
+    // Is this the entry that mounts the rebuilt root? Decided by the mount
+    // point alone, so it holds however the entry names its device -- a tagged
+    // UUID, a `/dev` path, anything -- since only the type rewrite depends on
+    // it and the root is always mounted at "/".
+    var is_root_mount = false;
+    if (mount_field) |mount_point| {
         const decoded = try unescapeFstabField(allocator, mount_point.text);
         defer allocator.free(decoded);
         for (plan.filesystems) |filesystem| {
@@ -683,27 +758,74 @@ fn rewriteFstabLine(
             report.entries_dropped += 1;
             return;
         }
+        is_root_mount = std.mem.eql(u8, decoded, "/");
     }
 
-    const tagged = parseTaggedSpec(spec.text) orelse return out.appendSlice(raw);
-    const filesystem = plan.find(tagged.kind, tagged.value) orelse return out.appendSlice(raw);
-    if (filesystem.merged_at != null) {
-        // The filesystem this entry names does not exist any more, wherever
-        // the entry proposed to mount it.
-        report.entries_dropped += 1;
-        return;
+    // Splice 1 (optional): the tagged identifier in the first field.
+    var id_start: ?usize = null;
+    var id_len: usize = 0;
+    var id_replacement: []const u8 = "";
+    if (parseTaggedSpec(spec.text)) |tagged| {
+        if (plan.find(tagged.kind, tagged.value)) |filesystem| {
+            if (filesystem.merged_at != null) {
+                // The filesystem this entry names does not exist any more,
+                // wherever the entry proposed to mount it.
+                report.entries_dropped += 1;
+                return;
+            }
+            if (isRetired(filesystem, tagged.kind)) {
+                if (filesystem.after.get(tagged.kind)) |replacement| {
+                    id_start = spec.start + tagged.value_offset;
+                    id_len = tagged.value.len;
+                    id_replacement = replacement;
+                } else {
+                    report.entries_unresolved += 1;
+                }
+            }
+        }
     }
-    if (!isRetired(filesystem, tagged.kind)) return out.appendSlice(raw);
-    const replacement = filesystem.after.get(tagged.kind) orelse {
-        report.entries_unresolved += 1;
-        return out.appendSlice(raw);
-    };
 
-    const value_start = spec.start + tagged.value_offset;
-    try out.appendSlice(raw[0..value_start]);
-    try out.appendSlice(replacement);
-    try out.appendSlice(raw[value_start + tagged.value.len ..]);
-    report.entries_rewritten += 1;
+    // Splice 2 (optional): the filesystem-type third field, but only on the
+    // root entry, only when a root kind is known, and only when the imported
+    // type is a recognized ext4/xfs value that differs from it. An unrelated
+    // type (btrfs, swap, auto) parses to null and is left exactly as it was.
+    var type_start: ?usize = null;
+    var type_len: usize = 0;
+    var type_replacement: []const u8 = "";
+    if (is_root_mount) {
+        if (plan.rootType()) |root_kind| {
+            if (type_field) |tf| {
+                if (FilesystemType.parse(tf.text)) |imported| {
+                    if (imported != root_kind) {
+                        type_start = tf.start;
+                        type_len = tf.text.len;
+                        type_replacement = root_kind.name();
+                    }
+                }
+            }
+        }
+    }
+
+    if (id_start == null and type_start == null) return out.appendSlice(raw);
+
+    // Apply the splices in ascending offset order -- the identifier is in field
+    // one, the type in field three, so identifier always precedes type -- and
+    // copy every other byte (spacing, field padding, comments, the terminator)
+    // through untouched.
+    var pos: usize = 0;
+    if (id_start) |start| {
+        try out.appendSlice(raw[pos..start]);
+        try out.appendSlice(id_replacement);
+        pos = start + id_len;
+        report.entries_rewritten += 1;
+    }
+    if (type_start) |start| {
+        try out.appendSlice(raw[pos..start]);
+        try out.appendSlice(type_replacement);
+        pos = start + type_len;
+        report.types_rewritten += 1;
+    }
+    try out.appendSlice(raw[pos..]);
 }
 
 const TaggedSpec = struct {
@@ -750,10 +872,21 @@ fn unescapeFstabField(allocator: Allocator, field: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-/// Rewrites retired UUIDs in a bootloader configuration in place, returning
-/// owned bytes. Every byte that is not part of a replaced identifier is
-/// copied through unchanged, which is what keeps a distro `grub.cfg`'s menu
-/// structure, its generated-file banners and its shell quoting intact.
+/// How much `rewriteConfig` changed, split so a caller can report a
+/// filesystem-type correction distinctly from an identifier replacement.
+pub const ConfigReport = struct {
+    /// Every value replaced -- retired identifiers and `rootfstype=`
+    /// corrections both. This is what "did the file change" turns on.
+    references: usize = 0,
+    /// The subset of `references` that were `rootfstype=` type corrections.
+    rootfstype_rewritten: usize = 0,
+};
+
+/// Rewrites retired UUIDs, and a stale root `rootfstype=`, in a bootloader
+/// configuration in place, returning owned bytes. Every byte that is not part
+/// of a replaced value is copied through unchanged, which is what keeps a
+/// distro `grub.cfg`'s menu structure, its generated-file banners and its
+/// shell quoting intact.
 ///
 /// A retired identifier is replaced wherever it appears as a whole token,
 /// rather than only after the specific spellings `root=UUID=` and
@@ -762,6 +895,23 @@ fn unescapeFstabField(allocator: Allocator, field: []const u8) ![]u8 {
 /// comments, and every one of them is equally stale. Restricting the rewrite
 /// to two syntaxes would leave the rest for the verification pass to reject.
 ///
+/// A stale filesystem *type* is corrected only through the one syntax that
+/// unambiguously names the root's kind: a `rootfstype=<ext4|xfs>` kernel
+/// parameter that disagrees with the kind the root now is. That is the extent
+/// of the filesystem-type rewrite here, and it is deliberate.
+///
+/// GRUB's `search` selects a device by `--fs-uuid`, `--label` or `--file` --
+/// all identifiers, handled above -- and has no filesystem-*type* hint to
+/// rewrite; the investigation the issue asked for found none. The filesystem
+/// type does appear in a `grub.cfg` as `insmod ext2`/`insmod xfs`, but those
+/// name the module GRUB itself uses to *read* a partition (usually `/boot` or
+/// the ESP, not the converted root), so rewriting them toward the root's kind
+/// would as often break booting as fix it. A bare `ext4`/`xfs` word could also
+/// be a menu title, a comment or part of a path. Both are therefore left
+/// untouched rather than rewritten by broad textual replacement: a genuinely
+/// stale one is caught by the verification pass and reported for the
+/// `unsafe_chroot` escape hatch, never silently corrupted.
+///
 /// Labels are deliberately not rewritten here: a label is an arbitrary word,
 /// and replacing every occurrence of `boot` or `EFI` in a shell-syntax
 /// configuration would corrupt it.
@@ -769,7 +919,7 @@ pub fn rewriteConfig(
     allocator: Allocator,
     original: []const u8,
     plan: Plan,
-    replacements: *usize,
+    report: *ConfigReport,
 ) ![]u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
@@ -777,11 +927,22 @@ pub fn rewriteConfig(
 
     var index: usize = 0;
     while (index < original.len) {
+        // The `rootfstype=` rewrite carries its own word-boundary rule (its key
+        // is not hexadecimal, so the identifier token boundary below does not
+        // apply), so it is tried first and independently.
+        if (findRootfstypeRewrite(plan, original, index)) |rewrite| {
+            try out.appendSlice(rootfstype_key);
+            try out.appendSlice(rewrite.replacement);
+            index += rewrite.consumed;
+            report.references += 1;
+            report.rootfstype_rewritten += 1;
+            continue;
+        }
         if (tokenStartsAt(original, index)) {
             if (findConfigReplacement(plan, original, index)) |match| {
                 try out.appendSlice(match.replacement);
                 index += match.length;
-                replacements.* += 1;
+                report.references += 1;
                 continue;
             }
         }
@@ -789,6 +950,51 @@ pub fn rewriteConfig(
         index += 1;
     }
     return out.toOwnedSlice();
+}
+
+const rootfstype_key = "rootfstype=";
+
+const RootfstypeRewrite = struct {
+    replacement: []const u8,
+    /// Bytes of `original` this consumes: the whole `rootfstype=<value>` run,
+    /// since the key is re-emitted verbatim and only the value changes.
+    consumed: usize,
+};
+
+/// Matches a `rootfstype=<ext4|xfs>` assignment at `index` whose value is a
+/// recognized type differing from the root's actual kind, and returns the
+/// corrected value. Returns null -- leaving the bytes untouched -- when no root
+/// kind is known, the key does not start here at a genuine word boundary, or
+/// the value is unrecognized or already correct.
+fn findRootfstypeRewrite(plan: Plan, bytes: []const u8, index: usize) ?RootfstypeRewrite {
+    const root_kind = plan.rootType() orelse return null;
+    // A real word boundary for a non-hexadecimal key: start of file, or a
+    // command-line separator (whitespace or a shell quote) immediately before.
+    if (index != 0 and !isCmdlineSeparator(bytes[index - 1])) return null;
+    if (!std.mem.startsWith(u8, bytes[index..], rootfstype_key)) return null;
+
+    const value_start = index + rootfstype_key.len;
+    var value_end = value_start;
+    while (value_end < bytes.len and isFilesystemTypeByte(bytes[value_end])) value_end += 1;
+    const value = bytes[value_start..value_end];
+
+    const imported = FilesystemType.parse(value) orelse return null;
+    if (imported == root_kind) return null;
+    return .{ .replacement = root_kind.name(), .consumed = rootfstype_key.len + value.len };
+}
+
+/// A command-line token separator: what precedes a standalone kernel parameter
+/// like `rootfstype=`. Whitespace, or a shell quote a `grub.cfg` wraps the
+/// parameter list in.
+fn isCmdlineSeparator(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r' or byte == '"' or byte == '\'';
+}
+
+/// The alphabet of a filesystem-type word: `mount`/the kernel spell every type
+/// name in lowercase ASCII letters and digits, so the value ends at the first
+/// byte outside that set (a space, a quote, a newline).
+fn isFilesystemTypeByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte);
 }
 
 const ConfigMatch = struct {
@@ -1153,12 +1359,12 @@ test "grub configuration is rewritten in place and keeps its structure" {
             .merged_at = "/boot/efi",
         },
     };
-    var replacements: usize = 0;
+    var config = ConfigReport{};
     const rewritten = try rewriteConfig(
         allocator,
         original,
         .{ .filesystems = &filesystems },
-        &replacements,
+        &config,
     );
     defer allocator.free(rewritten);
 
@@ -1174,7 +1380,7 @@ test "grub configuration is rewritten in place and keeps its structure" {
         "\tchainloader /EFI/Microsoft/Boot/bootmgfw.efi\n" ++
         "}\n";
     try std.testing.expectEqualStrings(expected, rewritten);
-    try std.testing.expectEqual(@as(usize, 2), replacements);
+    try std.testing.expectEqual(@as(usize, 2), config.references);
 }
 
 test "a retired identifier inside a longer token is not spliced" {
@@ -1187,16 +1393,16 @@ test "a retired identifier inside a longer token is not spliced" {
         .after = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
         .merged_at = "/boot",
     }};
-    var replacements: usize = 0;
+    var config = ConfigReport{};
     const rewritten = try rewriteConfig(
         allocator,
         original,
         .{ .filesystems = &filesystems },
-        &replacements,
+        &config,
     );
     defer allocator.free(rewritten);
     try std.testing.expectEqualStrings(original, rewritten);
-    try std.testing.expectEqual(@as(usize, 0), replacements);
+    try std.testing.expectEqual(@as(usize, 0), config.references);
 }
 
 test "a plan with nothing retired changes nothing" {
@@ -1214,6 +1420,290 @@ test "a plan with nothing retired changes nothing" {
     const rewritten = try rewriteFstab(allocator, original, plan, &report);
     defer allocator.free(rewritten);
     try std.testing.expectEqualStrings(original, rewritten);
+}
+
+test "an ext4 root converted to xfs has its fstab type field corrected" {
+    const allocator = std.testing.allocator;
+    // The identifier is unchanged (the root keeps its UUID through the
+    // rebuild); only the third field is stale after ext4 -> xfs.
+    const original = "UUID=11111111-1111-1111-1111-111111111111 / ext4 defaults 0 1\n";
+    const filesystems = [_]Filesystem{.{
+        .before = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+        .after = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+        .root_filesystem_type = .xfs,
+    }};
+    var report = FstabReport{};
+    const rewritten = try rewriteFstab(
+        allocator,
+        original,
+        .{ .filesystems = &filesystems },
+        &report,
+    );
+    defer allocator.free(rewritten);
+    try std.testing.expectEqualStrings(
+        "UUID=11111111-1111-1111-1111-111111111111 / xfs defaults 0 1\n",
+        rewritten,
+    );
+    try std.testing.expectEqual(@as(usize, 0), report.entries_rewritten);
+    try std.testing.expectEqual(@as(usize, 1), report.types_rewritten);
+}
+
+test "an xfs root and its identifier are corrected together in one entry" {
+    const allocator = std.testing.allocator;
+    // Both fields are stale: the UUID was retired and the type was ext4. The
+    // two splices land in ascending offset order and every byte between and
+    // around them -- the tab padding -- is preserved.
+    const original = "UUID=22222222-2222-2222-2222-222222222222\t/\text4\tdefaults\t0 1\n";
+    const filesystems = [_]Filesystem{.{
+        .before = .{ .filesystem_uuid = "22222222-2222-2222-2222-222222222222" },
+        .after = .{ .filesystem_uuid = "33333333-3333-3333-3333-333333333333" },
+        .root_filesystem_type = .xfs,
+    }};
+    var report = FstabReport{};
+    const rewritten = try rewriteFstab(
+        allocator,
+        original,
+        .{ .filesystems = &filesystems },
+        &report,
+    );
+    defer allocator.free(rewritten);
+    try std.testing.expectEqualStrings(
+        "UUID=33333333-3333-3333-3333-333333333333\t/\txfs\tdefaults\t0 1\n",
+        rewritten,
+    );
+    try std.testing.expectEqual(@as(usize, 1), report.entries_rewritten);
+    try std.testing.expectEqual(@as(usize, 1), report.types_rewritten);
+}
+
+test "an ext4 root that stays ext4 keeps its fstab bytes exactly" {
+    const allocator = std.testing.allocator;
+    // The default path: the kind is threaded through and it is still ext4, so
+    // the type field must not be touched even though a root kind is known.
+    const original = "UUID=11111111-1111-1111-1111-111111111111 / ext4 defaults 0 1\n";
+    const filesystems = [_]Filesystem{.{
+        .before = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+        .after = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+        .root_filesystem_type = .ext4,
+    }};
+    var report = FstabReport{};
+    const rewritten = try rewriteFstab(
+        allocator,
+        original,
+        .{ .filesystems = &filesystems },
+        &report,
+    );
+    defer allocator.free(rewritten);
+    try std.testing.expectEqualStrings(original, rewritten);
+    try std.testing.expectEqual(@as(usize, 0), report.types_rewritten);
+}
+
+test "the fstab type rewrite preserves comments alignment and unrelated mounts" {
+    const allocator = std.testing.allocator;
+    // A realistic fstab: a comment, the root on aligned columns, a separate
+    // ext4 /home that must stay ext4, and a btrfs mount whose type is an
+    // unrelated word the rewrite must not recognize. Only the root's `ext4`
+    // becomes `xfs`; every other byte -- the column spacing, the comment, the
+    // trailing blank line -- is identical.
+    const original =
+        "# /etc/fstab: static file system information.\n" ++
+        "UUID=11111111-1111-1111-1111-111111111111   /       ext4    defaults        0 1\n" ++
+        "UUID=44444444-4444-4444-4444-444444444444   /home   ext4    defaults        0 2\n" ++
+        "UUID=55555555-5555-5555-5555-555555555555   /data   btrfs   defaults        0 2\n" ++
+        "\n";
+    const filesystems = [_]Filesystem{.{
+        .before = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+        .after = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+        .root_filesystem_type = .xfs,
+    }};
+    var report = FstabReport{};
+    const rewritten = try rewriteFstab(
+        allocator,
+        original,
+        .{ .filesystems = &filesystems },
+        &report,
+    );
+    defer allocator.free(rewritten);
+    const expected =
+        "# /etc/fstab: static file system information.\n" ++
+        "UUID=11111111-1111-1111-1111-111111111111   /       xfs    defaults        0 1\n" ++
+        "UUID=44444444-4444-4444-4444-444444444444   /home   ext4    defaults        0 2\n" ++
+        "UUID=55555555-5555-5555-5555-555555555555   /data   btrfs   defaults        0 2\n" ++
+        "\n";
+    try std.testing.expectEqualStrings(expected, rewritten);
+    try std.testing.expectEqual(@as(usize, 1), report.types_rewritten);
+}
+
+test "a merged mount is dropped even when a root type rewrite is active" {
+    const allocator = std.testing.allocator;
+    // The root converts to xfs and /boot is merged away in the same plan. The
+    // merged entry must still be deleted, not type-rewritten (it is not the
+    // root mount), and the root's type is corrected.
+    const original =
+        "UUID=11111111-1111-1111-1111-111111111111 / ext4 defaults 0 1\n" ++
+        "UUID=22222222-2222-2222-2222-222222222222 /boot ext4 defaults 0 2\n";
+    const filesystems = [_]Filesystem{
+        .{
+            .before = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+            .after = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+            .root_filesystem_type = .xfs,
+        },
+        .{
+            .before = .{ .filesystem_uuid = "22222222-2222-2222-2222-222222222222" },
+            .after = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+            .merged_at = "/boot",
+        },
+    };
+    var report = FstabReport{};
+    const rewritten = try rewriteFstab(
+        allocator,
+        original,
+        .{ .filesystems = &filesystems },
+        &report,
+    );
+    defer allocator.free(rewritten);
+    try std.testing.expectEqualStrings(
+        "UUID=11111111-1111-1111-1111-111111111111 / xfs defaults 0 1\n",
+        rewritten,
+    );
+    try std.testing.expectEqual(@as(usize, 1), report.types_rewritten);
+    try std.testing.expectEqual(@as(usize, 1), report.entries_dropped);
+}
+
+test "a stale rootfstype on the kernel command line is corrected" {
+    const allocator = std.testing.allocator;
+    const original =
+        "linux /vmlinuz root=UUID=11111111-1111-1111-1111-111111111111 rootfstype=ext4 ro\n";
+    const filesystems = [_]Filesystem{.{
+        .before = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+        .after = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+        .root_filesystem_type = .xfs,
+    }};
+    var config = ConfigReport{};
+    const rewritten = try rewriteConfig(
+        allocator,
+        original,
+        .{ .filesystems = &filesystems },
+        &config,
+    );
+    defer allocator.free(rewritten);
+    try std.testing.expectEqualStrings(
+        "linux /vmlinuz root=UUID=11111111-1111-1111-1111-111111111111 rootfstype=xfs ro\n",
+        rewritten,
+    );
+    try std.testing.expectEqual(@as(usize, 1), config.references);
+    try std.testing.expectEqual(@as(usize, 1), config.rootfstype_rewritten);
+}
+
+test "a rootfstype already matching the root is left untouched" {
+    const allocator = std.testing.allocator;
+    const original = "GRUB_CMDLINE_LINUX=\"rootfstype=xfs quiet\"\n";
+    const filesystems = [_]Filesystem{.{
+        .before = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+        .after = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+        .root_filesystem_type = .xfs,
+    }};
+    var config = ConfigReport{};
+    const rewritten = try rewriteConfig(
+        allocator,
+        original,
+        .{ .filesystems = &filesystems },
+        &config,
+    );
+    defer allocator.free(rewritten);
+    try std.testing.expectEqualStrings(original, rewritten);
+    try std.testing.expectEqual(@as(usize, 0), config.references);
+    try std.testing.expectEqual(@as(usize, 0), config.rootfstype_rewritten);
+}
+
+test "a rootfstype glued to a longer word is not a boundary and is left alone" {
+    const allocator = std.testing.allocator;
+    // `notrootfstype=ext4` is a different key; the boundary check must refuse
+    // to treat its tail as a `rootfstype=` assignment.
+    const original = "set notrootfstype=ext4\n";
+    const filesystems = [_]Filesystem{.{
+        .before = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+        .after = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+        .root_filesystem_type = .xfs,
+    }};
+    var config = ConfigReport{};
+    const rewritten = try rewriteConfig(
+        allocator,
+        original,
+        .{ .filesystems = &filesystems },
+        &config,
+    );
+    defer allocator.free(rewritten);
+    try std.testing.expectEqualStrings(original, rewritten);
+    try std.testing.expectEqual(@as(usize, 0), config.rootfstype_rewritten);
+}
+
+test "an unrelated rootfstype value is not rewritten toward the root kind" {
+    const allocator = std.testing.allocator;
+    // btrfs is not a kind this module writes; a `rootfstype=btrfs` is not the
+    // stale-conversion case and must be left for the verification pass, never
+    // rewritten to the root's kind.
+    const original = "rootfstype=btrfs ro\n";
+    const filesystems = [_]Filesystem{.{
+        .before = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+        .after = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+        .root_filesystem_type = .xfs,
+    }};
+    var config = ConfigReport{};
+    const rewritten = try rewriteConfig(
+        allocator,
+        original,
+        .{ .filesystems = &filesystems },
+        &config,
+    );
+    defer allocator.free(rewritten);
+    try std.testing.expectEqualStrings(original, rewritten);
+    try std.testing.expectEqual(@as(usize, 0), config.rootfstype_rewritten);
+}
+
+test "a config with no root kind threaded leaves rootfstype exactly as before" {
+    const allocator = std.testing.allocator;
+    // Backward compatibility: an older plan that never set a root kind must
+    // behave as it always did and touch no `rootfstype=`.
+    const original = "rootfstype=ext4 ro\n";
+    const filesystems = [_]Filesystem{.{
+        .before = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+        .after = .{ .filesystem_uuid = "11111111-1111-1111-1111-111111111111" },
+    }};
+    var config = ConfigReport{};
+    const rewritten = try rewriteConfig(
+        allocator,
+        original,
+        .{ .filesystems = &filesystems },
+        &config,
+    );
+    defer allocator.free(rewritten);
+    try std.testing.expectEqualStrings(original, rewritten);
+    try std.testing.expectEqual(@as(usize, 0), config.rootfstype_rewritten);
+}
+
+test "a stale rootfstype and a retired identifier are both corrected in one line" {
+    const allocator = std.testing.allocator;
+    const original =
+        "linux /vmlinuz root=UUID=22222222-2222-2222-2222-222222222222 rootfstype=ext4 ro\n";
+    const filesystems = [_]Filesystem{.{
+        .before = .{ .filesystem_uuid = "22222222-2222-2222-2222-222222222222" },
+        .after = .{ .filesystem_uuid = "33333333-3333-3333-3333-333333333333" },
+        .root_filesystem_type = .xfs,
+    }};
+    var config = ConfigReport{};
+    const rewritten = try rewriteConfig(
+        allocator,
+        original,
+        .{ .filesystems = &filesystems },
+        &config,
+    );
+    defer allocator.free(rewritten);
+    try std.testing.expectEqualStrings(
+        "linux /vmlinuz root=UUID=33333333-3333-3333-3333-333333333333 rootfstype=xfs ro\n",
+        rewritten,
+    );
+    try std.testing.expectEqual(@as(usize, 2), config.references);
+    try std.testing.expectEqual(@as(usize, 1), config.rootfstype_rewritten);
 }
 
 test "a malformed plan is refused rather than matched loosely" {
@@ -1311,6 +1801,53 @@ test "apply rewrites a tree and accepts it once nothing stale is left" {
         \\linux /vmlinuz root=UUID=11111111-1111-1111-1111-111111111111 ro
         \\
     , grub);
+}
+
+test "apply performs a root filesystem type-only rewrite" {
+    const allocator = std.testing.allocator;
+    var tree = root_tree.RootTree.initMemory(allocator, std.testing.io, .{});
+    defer tree.deinit();
+
+    try putTestFile(
+        &tree,
+        "etc/fstab",
+        "UUID=11111111-1111-1111-1111-111111111111 / ext4 defaults 0 1\n",
+    );
+    try putTestFile(
+        &tree,
+        "boot/grub/grub.cfg",
+        "linux /vmlinuz root=UUID=11111111-1111-1111-1111-111111111111 rootfstype=ext4 ro\n",
+    );
+
+    const filesystems = [_]Filesystem{.{
+        .before = .{ .filesystem_uuid = test_root_uuid },
+        .after = .{ .filesystem_uuid = test_root_uuid },
+        .root_filesystem_type = .xfs,
+    }};
+    const report = try apply(
+        allocator,
+        &tree,
+        .{ .filesystems = &filesystems },
+        .rewrite_and_verify,
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 0), report.retired_identifiers);
+    try std.testing.expectEqual(@as(usize, 1), report.fstab_types_rewritten);
+    try std.testing.expectEqual(@as(usize, 1), report.config_rootfstype_rewritten);
+
+    const fstab = try readTestFile(allocator, &tree, "etc/fstab");
+    defer allocator.free(fstab);
+    try std.testing.expectEqualStrings(
+        "UUID=11111111-1111-1111-1111-111111111111 / xfs defaults 0 1\n",
+        fstab,
+    );
+
+    const grub = try readTestFile(allocator, &tree, "boot/grub/grub.cfg");
+    defer allocator.free(grub);
+    try std.testing.expectEqualStrings(
+        "linux /vmlinuz root=UUID=11111111-1111-1111-1111-111111111111 rootfstype=xfs ro\n",
+        grub,
+    );
 }
 
 test "apply fails the build and names the file holding a stale identifier" {
