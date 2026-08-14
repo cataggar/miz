@@ -5,13 +5,19 @@
 //! consumes) plus separately-carried root-directory metadata, and emits a
 //! *Linux/xfsprogs-valid* clean XFS v5 filesystem into a caller-provided byte
 //! region -- not merely bytes this project's own reader happens to accept. The
-//! output round-trips through `xfs.zig` and, in development, passes
-//! `xfs_repair -n` (mounting requires an `xfs` kernel module the CI host lacks).
+//! output round-trips through `xfs.zig`, passes `xfs_repair -n`, and -- where an
+//! `xfs` kernel module is available (CI hosts often lack one) -- mounts cleanly
+//! read/write on a real Linux kernel, preserving mode/owner/timestamps,
+//! symlinks, hardlinks, device nodes, FIFOs, and the user/trusted/security
+//! xattr namespaces.
 //!
-//! Deliberately unreachable from `layout.FilesystemKind`, the public
-//! CLI/config surface, and `filesystem_writer`'s dispatch: wiring this into the
-//! product is a dependent change. Only `root.zig` re-exports it, so its tests
-//! run.
+//! Reachable from the public product as of #414: `layout.FilesystemKind.xfs`,
+//! `filesystem_writer`'s `.xfs` dispatch arm, the CLI (`--root-filesystem xfs`),
+//! and the build API (`.root_filesystem = .xfs`) all select it, with ext4 still
+//! the default so unchanged images keep identical bytes. Production writes
+//! through the bounded `populateImage`/`Output` path (one positional write per
+//! block, never a partition-sized buffer); the older buffer entry point
+//! (`populate`) survives only as the compatibility/reader-round-trip path.
 //!
 //! ## Geometry (fixed, classic, reader- and repair-compatible)
 //!
@@ -1947,6 +1953,9 @@ test "populate emits a tree the merged reader reads back field-for-field" {
     const file_xattrs = [_]tree_cursor.Xattr{
         .{ .name = "user.color", .value = "blue" },
         .{ .name = "trusted.seal", .value = "xyz" },
+        // The SELinux label path: a `security.` xattr keeps the trailing NUL a
+        // context carries, exercising the writer's attr_secure_bit encoding.
+        .{ .name = "security.selinux", .value = "system_u:object_r:etc_t:s0\x00" },
     };
 
     var list = std.ArrayListUnmanaged(FixtureEntry).empty;
@@ -2026,10 +2035,11 @@ test "populate emits a tree the merged reader reads back field-for-field" {
     defer allocator.free(big_bytes);
     try testing.expectEqualSlices(u8, big_bin, big_bytes);
 
-    // attrs.txt: shortform xattr fork round-trips both namespaces.
+    // attrs.txt: shortform xattr fork round-trips all three namespaces.
     const attrs = findRt(&tree, "attrs.txt").?;
     try expectRtXattr(attrs, "user.color", "blue");
     try expectRtXattr(attrs, "trusted.seal", "xyz");
+    try expectRtXattr(attrs, "security.selinux", "system_u:object_r:etc_t:s0\x00");
 
     // dir/nested.txt via a shortform subdirectory.
     const nested = findRt(&tree, "dir/nested.txt").?;
