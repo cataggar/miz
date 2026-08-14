@@ -801,6 +801,7 @@ def test_candidate_manifest_uses_canonical_validation():
     assert 'doc.get("flavor") != flavor' in content
     assert '("ufs", "core")' in content
     assert '("zfs", "full")' in content
+    assert '("zfs", "core")' in content
     assert "candidate compressed size is missing or invalid" in content
     assert "candidate allocated size is missing or invalid" in content
     assert "candidate source size is missing or invalid" in content

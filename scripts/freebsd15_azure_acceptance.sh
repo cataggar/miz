@@ -307,6 +307,7 @@ if (filesystem, flavor) not in {
     ("ufs", "full"),
     ("ufs", "core"),
     ("zfs", "full"),
+    ("zfs", "core"),
 }:
     raise SystemExit("unsupported candidate filesystem/flavor combination")
 if not isinstance(doc.get("compressed_size"), int) or doc["compressed_size"] <= 0:
