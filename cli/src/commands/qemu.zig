@@ -1998,7 +1998,7 @@ fn prepareSecureBootVmStateAlloc(
         .data = certificate.pem,
         .flags = .{
             .truncate = true,
-            .permissions = .fromMode(0o600),
+            .permissions = privateFilePermissions(),
         },
     });
     const expected_trust_state = try enrollSecureBootVars(
@@ -2290,6 +2290,13 @@ fn privateDirectoryPermissions() std.Io.File.Permissions {
     return switch (builtin.os.tag) {
         .windows => .default_dir,
         else => .fromMode(0o700),
+    };
+}
+
+fn privateFilePermissions() std.Io.File.Permissions {
+    return switch (builtin.os.tag) {
+        .windows => .default_file,
+        else => .fromMode(0o600),
     };
 }
 

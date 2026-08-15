@@ -132,7 +132,7 @@ pub const Extractor = struct {
         }
         var parent = try self.openParent(path, true);
         defer parent.close(self.io);
-        parent.dir.createDir(self.io, parent.basename, .fromMode(0o755)) catch |err| switch (err) {
+        parent.dir.createDir(self.io, parent.basename, directoryPermissions(0o755)) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -151,7 +151,7 @@ pub const Extractor = struct {
         defer parent.close(self.io);
         var file = try parent.dir.createFile(self.io, parent.basename, .{
             .exclusive = true,
-            .permissions = .fromMode(0o600),
+            .permissions = filePermissions(0o600),
         });
         defer file.close(self.io);
         var buffer: [64 * 1024]u8 = undefined;
@@ -165,7 +165,7 @@ pub const Extractor = struct {
             if (self.options.preserve_ownership) entry.uid else null,
             if (self.options.preserve_ownership) entry.gid else null,
         );
-        try file.setPermissions(self.io, .fromMode(@intCast(entry.mode & 0o7777)));
+        try file.setPermissions(self.io, filePermissions(@intCast(entry.mode & 0o7777)));
         try self.setXattrsFile(file, entry.xattrs);
         try file.setTimestamps(self.io, .{
             .modify_timestamp = .{ .new = timestamp(entry.mtime) },
@@ -361,7 +361,7 @@ pub const Extractor = struct {
     fn createSyntheticDirectory(self: *Extractor, path: []const u8) !void {
         var parent = try self.openParent(path, true);
         defer parent.close(self.io);
-        parent.dir.createDir(self.io, parent.basename, .fromMode(0o755)) catch |err| switch (err) {
+        parent.dir.createDir(self.io, parent.basename, directoryPermissions(0o755)) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -512,6 +512,7 @@ pub const Extractor = struct {
             node.kind == .character_device or
             node.kind == .block_device)
         {
+            if (builtin.os.tag != .linux) return error.UnsupportedEntryKind;
             var parent = try self.openParent(path, false);
             defer parent.close(self.io);
             if (self.options.preserve_ownership) {
@@ -533,7 +534,7 @@ pub const Extractor = struct {
             try parent.dir.setFilePermissions(
                 self.io,
                 parent.basename,
-                .fromMode(@intCast(node.mode & 0o7777)),
+                filePermissions(@intCast(node.mode & 0o7777)),
                 .{},
             );
             try parent.dir.setTimestamps(self.io, parent.basename, .{
@@ -559,7 +560,13 @@ pub const Extractor = struct {
         if (self.options.preserve_ownership) {
             try file.setOwner(self.io, node.uid, node.gid);
         }
-        try file.setPermissions(self.io, .fromMode(@intCast(node.mode & 0o7777)));
+        try file.setPermissions(
+            self.io,
+            if (node.kind == .directory)
+                directoryPermissions(@intCast(node.mode & 0o7777))
+            else
+                filePermissions(@intCast(node.mode & 0o7777)),
+        );
         try file.setTimestamps(self.io, .{
             .modify_timestamp = .{ .new = timestamp(node.mtime) },
         });
@@ -605,7 +612,7 @@ pub const Extractor = struct {
             }) catch |err| switch (err) {
                 error.FileNotFound => blk: {
                     if (!create) return err;
-                    try current.createDir(self.io, component, .fromMode(0o755));
+                    try current.createDir(self.io, component, directoryPermissions(0o755));
                     break :blk try current.openDir(self.io, component, .{
                         .follow_symlinks = false,
                     });
@@ -620,6 +627,20 @@ pub const Extractor = struct {
         return .{ .dir = current, .basename = basename, .owned = true };
     }
 };
+
+fn directoryPermissions(mode: u16) Io.File.Permissions {
+    return switch (builtin.os.tag) {
+        .windows => .default_dir,
+        else => .fromMode(mode),
+    };
+}
+
+fn filePermissions(mode: u16) Io.File.Permissions {
+    return switch (builtin.os.tag) {
+        .windows => .default_file,
+        else => .fromMode(mode),
+    };
+}
 
 fn validateWhiteout(entry: tar.StreamEntry) !void {
     if (entry.kind != .file or

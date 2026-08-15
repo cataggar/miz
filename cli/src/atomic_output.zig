@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const zvmi = @import("zvmi");
 
 const Allocator = std.mem.Allocator;
@@ -23,7 +24,7 @@ pub fn writeAtomicProtected(
 ) !void {
     _ = allocator;
     var stage = try Dir.cwd().createFileAtomic(io, destination, .{
-        .permissions = .fromMode(0o600),
+        .permissions = privateFilePermissions(),
         .replace = true,
     });
     defer stage.deinit(io);
@@ -34,6 +35,13 @@ pub fn writeAtomicProtected(
     try stage.file.writePositionalAll(io, bytes, 0);
     try stage.file.sync(io);
     try stage.replace(io);
+}
+
+fn privateFilePermissions() Io.File.Permissions {
+    return switch (builtin.os.tag) {
+        .windows => .default_file,
+        else => .fromMode(0o600),
+    };
 }
 
 fn aliasesProtectedFile(

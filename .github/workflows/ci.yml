@@ -43,6 +43,11 @@ jobs:
       - name: zig build
         run: zig build
 
+      - name: Windows release builds
+        run: |
+          zig build install-zvmi -Doptimize=ReleaseSafe -Dtarget=x86_64-windows
+          zig build install-zvmi -Doptimize=ReleaseSafe -Dtarget=aarch64-windows
+
       - name: zig build test
         run: zig build test --summary all
 

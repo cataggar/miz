@@ -230,6 +230,7 @@ fn makeTreeWritable(
     allocator: std.mem.Allocator,
     path: []const u8,
 ) !void {
+    if (builtin.os.tag != .linux) return error.AtomicReplaceUnsupported;
     var root = try Io.Dir.cwd().openDir(io, path, .{
         .iterate = true,
         .follow_symlinks = false,

@@ -4,6 +4,7 @@
 //! transfers are deliberately kept outside that path and stream through a
 //! destination-owned temporary file while a SHA-256 verifier runs.
 const std = @import("std");
+const builtin = @import("builtin");
 const auth = @import("auth.zig");
 const content = @import("content.zig");
 const copy = @import("copy.zig");
@@ -2946,7 +2947,7 @@ fn createUniqueTempFile(io: Io, allocator: Allocator, dir: Io.Dir, kind: []const
         const file = dir.createFile(io, name, .{
             .read = true,
             .exclusive = true,
-            .permissions = .fromMode(0o600),
+            .permissions = privateFilePermissions(),
         }) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 allocator.free(name);
@@ -2960,6 +2961,13 @@ fn createUniqueTempFile(io: Io, allocator: Allocator, dir: Io.Dir, kind: []const
         return .{ .name = name, .file = file };
     }
     return error.PathAlreadyExists;
+}
+
+fn privateFilePermissions() Io.File.Permissions {
+    return switch (builtin.os.tag) {
+        .windows => .default_file,
+        else => .fromMode(0o600),
+    };
 }
 
 fn percentEncodeAlloc(allocator: Allocator, value: []const u8) ![]u8 {
