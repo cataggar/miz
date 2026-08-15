@@ -390,7 +390,7 @@ set_architecture_profile() {
 suffix=${CANDIDATE_KEY//_/-}
 resource_group="zvmi-fb15-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
 set_architecture_profile "$ARCHITECTURE"
-name_seed="${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}${short_arch}"
+name_seed="${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}${short_arch}${FILESYSTEM}${FLAVOR}"
 disk_name="zvmi-os-${name_seed}"
 gallery_name="zvmifb15${name_seed}"
 image_definition_name="zvmifb15${short_arch}${FILESYSTEM}${FLAVOR}"
