@@ -1915,9 +1915,12 @@ def test_workflow_azure_acceptance_uses_oidc():
     assert "id-token: write" in section
     assert "azure/login@" in section
     assert "environment: azurelinux4-release" in section
-    assert section.count("secrets.AZURE_CLIENT_ID") == 3
-    assert section.count("secrets.AZURE_TENANT_ID") == 3
-    assert section.count("secrets.AZURE_SUBSCRIPTION_ID") == 3
+    assert section.count("secrets.AZURE_CLIENT_ID") == 4
+    assert section.count("secrets.AZURE_TENANT_ID") == 4
+    assert section.count("secrets.AZURE_SUBSCRIPTION_ID") == 4
+    assert section.index(
+        "Refresh Azure OIDC credential before acceptance"
+    ) < section.index("Run exact-artifact Azure acceptance")
     assert "AZURE_CLIENT_SECRET" not in section
     assert "client-secret:" not in section
 
