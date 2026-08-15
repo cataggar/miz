@@ -141,38 +141,39 @@ if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
   echo "::error::Release $RELEASE_TAG already exists; refusing to replace it"
   exit 1
 fi
-tag_ref_file="$STAGING_ROOT/tag-ref.json"
-tag_error_file="$STAGING_ROOT/tag-ref.error"
-if gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG" \
-  >"$tag_ref_file" 2>"$tag_error_file"; then
-  tag_sha=$(python3 - "$tag_ref_file" <<'PY'
+tag_refs_file="$STAGING_ROOT/tag-refs.json"
+gh api "repos/$REPOSITORY/git/matching-refs/tags/$RELEASE_TAG" \
+  --paginate >"$tag_refs_file"
+readarray -t tag_object < <(python3 - "$tag_refs_file" "$RELEASE_TAG" <<'PY'
 import json
 import sys
 
-document = json.load(open(sys.argv[1], encoding="utf-8"))
-print(document["object"]["sha"])
+expected = f"refs/tags/{sys.argv[2]}"
+matches = [
+    item
+    for item in json.load(open(sys.argv[1], encoding="utf-8"))
+    if item["ref"] == expected
+]
+if len(matches) > 1:
+    raise SystemExit("duplicate exact tag refs")
+if matches:
+    print(matches[0]["object"]["type"])
+    print(matches[0]["object"]["sha"])
 PY
 )
-  if [[ "$tag_sha" != "$SOURCE_COMMIT" ]]; then
+
+if ((${#tag_object[@]} != 0)); then
+  tag_type=${tag_object[0]}
+  tag_sha=${tag_object[1]}
+  if [[ "$tag_type" != commit || "$tag_sha" != "$SOURCE_COMMIT" ]]; then
     echo "::error::Existing tag $RELEASE_TAG does not target $SOURCE_COMMIT"
     exit 1
   fi
-elif python3 - "$tag_ref_file" <<'PY'
-import json
-import sys
-
-document = json.load(open(sys.argv[1], encoding="utf-8"))
-raise SystemExit(document.get("status") != "404")
-PY
-then
+else
   gh api --method POST "repos/$REPOSITORY/git/refs" \
     -f "ref=refs/tags/$RELEASE_TAG" \
     -f "sha=$SOURCE_COMMIT" >/dev/null
   tag_created=true
-else
-  cat "$tag_error_file" >&2
-  echo "::error::Unable to inspect existing tag $RELEASE_TAG"
-  exit 1
 fi
 
 gh release create "$RELEASE_TAG" \
