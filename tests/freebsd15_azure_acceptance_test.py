@@ -1448,6 +1448,11 @@ def test_owned_resource_group_cleanup_removes_gallery_disk_and_vm():
         start = content.index(command)
         end = content.index("--output", start)
         assert '--resource-group "$resource_group"' in content[start:end]
+    assert (
+        'name_seed="${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}'
+        '${short_arch}${FILESYSTEM}${FLAVOR}"'
+        in content
+    )
     assert 'gallery_name="zvmifb15${name_seed}"' in content
     assert (
         'image_definition_name="zvmifb15${short_arch}${FILESYSTEM}${FLAVOR}"'
