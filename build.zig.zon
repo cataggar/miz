@@ -1,6 +1,6 @@
 .{
     .name = .zvmi,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .fingerprint = 0x918747103382f4de,
     .minimum_zig_version = "0.16.0",
 

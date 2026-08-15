@@ -10,7 +10,7 @@ image workflows.
 Install the pre-built `zvmi` CLI from GitHub Releases with [ghr](https://github.com/cataggar/ghr):
 
 ```console
-ghr install cataggar/zvmi@v0.1.0
+ghr install cataggar/zvmi@v0.2.0
 ```
 
 The only executable in release archives is the `zvmi` CLI. Build from source
