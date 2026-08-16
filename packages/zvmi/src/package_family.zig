@@ -172,7 +172,7 @@ pub fn execute(
             return failed(.lock_missing, "debz did not emit or preserve the exact lock", .disposable, 0);
         };
     }
-    const provenance_path = if (mutates(request.operation))
+    const provenance_path = if (publishes(request.operation))
         try std.fmt.allocPrint(allocator, "{s}/transaction-result.json", .{request.inputs.state_path})
     else
         null;
@@ -183,7 +183,7 @@ pub fn execute(
         };
     }
 
-    if (request.operation != .inspect and request.operation != .recover) {
+    if (publishes(request.operation)) {
         Dir.renamePreserve(
             Dir.cwd(),
             request.inputs.root_stage,
@@ -196,7 +196,7 @@ pub fn execute(
     }
     return .{
         .succeeded = true,
-        .published = request.operation != .inspect and request.operation != .recover,
+        .published = publishes(request.operation),
         .lock_path = lock_path,
         .provenance_path = provenance_path,
     };
@@ -254,13 +254,17 @@ fn valid(request: Request) bool {
     for (request.inputs.foreign_architectures) |architecture|
         if (architecture == request.inputs.architecture) return false;
     if ((request.operation == .create or request.operation == .customize) and request.package == null) return false;
-    if (request.operation == .recover and request.inputs.lock_input_path == null) return false;
+    if (request.operation != .inspect and request.inputs.lock_input_path == null) return false;
     if (request.inputs.lock_output_path != null and request.inputs.lock_input_path == null) return false;
     return true;
 }
 
 fn mutates(operation: Operation) bool {
     return operation != .inspect;
+}
+
+fn publishes(operation: Operation) bool {
+    return operation != .inspect and operation != .recover;
 }
 
 fn absolute(path: []const u8) bool {
@@ -504,4 +508,36 @@ test "backend failures never publish partial roots" {
     try std.testing.expect(!result.succeeded);
     try std.testing.expect(!result.published);
     try std.testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, output, .{}));
+}
+
+test "unlocked mutations are rejected before invoking debz" {
+    const RunnerState = struct {
+        invoked: bool = false,
+
+        fn run(context: ?*anyopaque, _: Allocator, _: Io, _: []const []const u8) !RunResult {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.invoked = true;
+            return .{ .exit_code = 0 };
+        }
+    };
+    var state: RunnerState = .{};
+    const result = try execute(std.testing.allocator, std.testing.io, .{
+        .runner = .{ .context = &state, .runFn = RunnerState.run },
+    }, .{
+        .family = .debian,
+        .distribution = .ubuntu_26_04,
+        .operation = .update,
+        .inputs = .{
+            .root_stage = "/build/root-stage",
+            .published_root = "/build/root",
+            .architecture = .amd64,
+            .source_paths = &.{"/inputs/ubuntu.sources"},
+            .keyring_paths = &.{"/inputs/ubuntu.gpg"},
+            .cache_path = "/cache/debz",
+            .state_path = "/state/debz",
+        },
+    });
+    try std.testing.expect(!result.succeeded);
+    try std.testing.expectEqual(DiagnosticId.invalid_request, result.diagnostic.?.id);
+    try std.testing.expect(!state.invoked);
 }

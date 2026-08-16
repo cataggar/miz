@@ -10,6 +10,8 @@ architectures, repository sources, keyrings, configuration, cache, state,
 credential reference, exact lock, and network policy explicit. `offline`
 becomes debz cache-only mode. Credentials remain indirect references and are
 never copied into diagnostics or artifacts.
+Every create, customize, update, or recovery request requires a reviewed exact
+lock input, so zvmi cannot start an unlocked image mutation.
 
 For create/customize/update, debz runs against `root_stage`. zvmi verifies the
 exact lock and `state/transaction-result.json` before an atomic
