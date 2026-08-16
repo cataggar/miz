@@ -213,6 +213,8 @@ fn debzArgv(allocator: Allocator, executable: []const u8, request: Request) ![]c
     });
     try pair(&argv, allocator, "--install-root", request.inputs.root_stage);
     try pair(&argv, allocator, "--architecture", request.inputs.architecture.debzName());
+    for (request.inputs.foreign_architectures) |architecture|
+        try pair(&argv, allocator, "--foreign-architecture", architecture.debzName());
     try pair(&argv, allocator, "--cache-path", request.inputs.cache_path);
     try pair(&argv, allocator, "--state-path", request.inputs.state_path);
     for (request.inputs.source_paths) |path| try pair(&argv, allocator, "--source", path);
