@@ -70,6 +70,7 @@ pub const vm_backend = @import("vm_backend.zig");
 pub const vm_control = @import("vm_control.zig");
 pub const vm_payload = @import("vm_payload.zig");
 pub const artifact_pipeline = @import("artifact_pipeline.zig");
+pub const package_family = @import("package_family.zig");
 pub const verity = @import("verity.zig");
 pub const authenticode = @import("authenticode.zig");
 pub const uki_certificate = @import("uki_certificate.zig");

@@ -43,6 +43,9 @@ jobs:
       - name: zig build
         run: zig build
 
+      - name: Hermetic Debian-family package backend acceptance
+        run: zig test packages/zvmi/src/package_family.zig
+
       - name: Windows release builds
         run: |
           zig build install-zvmi -Doptimize=ReleaseSafe -Dtarget=x86_64-windows
