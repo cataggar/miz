@@ -11,6 +11,7 @@
 
 - [Library API](library-api.md)
 - [Image building](image-building.md)
+- [Ubuntu and Debian package families](debian-package-family.md)
 - [OCI copy, inspect, and tag listing](oci.md)
 - [UKI signing certificate extraction](uki-certificate.md)
 - [zvminit](https://github.com/cataggar/zvmi/blob/main/zvminit/README.md)
