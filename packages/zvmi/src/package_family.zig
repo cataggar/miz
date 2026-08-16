@@ -11,6 +11,8 @@ const Dir = Io.Dir;
 pub const api_version: u32 = 1;
 pub const request_schema = "io.github.cataggar.zvmi.package-family.request.v1";
 pub const result_schema = "io.github.cataggar.zvmi.package-family.result.v1";
+pub const debz_api_version: u32 = 1;
+pub const debz_api_commit = "6dcee1b08ede86b32ed4e8435425d210f3f65af5";
 
 pub const Family = enum { rpm, debian };
 pub const Distribution = enum { azure_linux, ubuntu_26_04, debian };

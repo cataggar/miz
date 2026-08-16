@@ -12,6 +12,9 @@ becomes debz cache-only mode. Credentials remain indirect references and are
 never copied into diagnostics or artifacts.
 Every create, customize, update, or recovery request requires a reviewed exact
 lock input, so zvmi cannot start an unlocked image mutation.
+This integration targets debz API v1 as merged in immutable commit
+`6dcee1b08ede86b32ed4e8435425d210f3f65af5`; builders must provision that
+revision or a compatible release rather than vendoring its binary.
 
 For create/customize/update, debz runs against `root_stage`. zvmi verifies the
 exact lock and `state/transaction-result.json` before an atomic
