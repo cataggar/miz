@@ -16,6 +16,10 @@
             .url = "git+https://github.com/cataggar/debz.git#d5385857a44fca753af515e805af70be9f004183",
             .hash = "debz-0.1.0-Mmw8sLW8FgAUbZWJi5a7UShKu-AaGP4Hsmf3m5lJNYQH",
         },
+        .rpmz = .{
+            .url = "git+https://github.com/cataggar/rpmz#15b5e1291a9fc3eb3980a4088d757b9d0254d468",
+            .hash = "rpmz-0.1.0-5KEwN2CRkQA-qHdelei8dHxBU3le6kPBVZt10YEqN1Ov",
+        },
     },
 
     .paths = .{

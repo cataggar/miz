@@ -90,6 +90,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const debz_mod = debz_dependency.module("debz");
+    const rpmz_dependency = b.dependency("rpmz", .{
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
 
     // ---- packages/vmiz: the core disk-image library ----
     const vmiz_mod = b.addModule("vmiz", .{
@@ -103,6 +107,41 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     host_vmiz_mod.addImport("debz", debz_mod);
+    const package_family_mod = b.createModule(.{
+        .root_source_file = b.path("packages/vmiz/src/package_family.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "debz", .module = debz_mod }},
+    });
+    const host_package_family_mod = b.addModule("vmiz-package-family-host", .{
+        .root_source_file = b.path("packages/vmiz/src/rpm_package_family.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "package_family", .module = package_family_mod },
+            .{ .name = "rpmz", .module = rpmz_dependency.module("rpmz") },
+        },
+    });
+    _ = b.addModule("zvmi-package-family-host", .{
+        .root_source_file = b.path("packages/vmiz/src/rpm_package_family.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "package_family", .module = package_family_mod },
+            .{ .name = "rpmz", .module = rpmz_dependency.module("rpmz") },
+        },
+    });
+    const host_package_family_tests = b.addTest(.{
+        .root_module = host_package_family_mod,
+    });
+    const run_host_package_family_tests = b.addRunArtifact(
+        host_package_family_tests,
+    );
+    const package_family_test_step = b.step(
+        "test-package-family-host",
+        "Run host-only rpmz package-family tests",
+    );
+    package_family_test_step.dependOn(&run_host_package_family_tests.step);
     // Declared this early because the preserved-image builder resolves EDK2
     // firmware through the same module `vmiz qemu` does, and that builder is
     // constructed well before the qemu-facing part of the graph.
@@ -809,6 +848,18 @@ pub fn build(b: *std.Build) void {
     build_api_consumer_check.setName("check external build.zig consumer");
     build_api_consumer_check.setCwd(b.path("tests/build_api_consumer"));
 
+    const package_family_consumer_check = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "build",
+        "check",
+    });
+    package_family_consumer_check.setName(
+        "check external host package-family consumer",
+    );
+    package_family_consumer_check.setCwd(
+        b.path("tests/package_family_consumer"),
+    );
+
     const build_api_diagnostics_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
@@ -1049,6 +1100,7 @@ pub fn build(b: *std.Build) void {
     }
 
     test_step.dependOn(&run_vmiz_tests.step);
+    test_step.dependOn(&run_host_package_family_tests.step);
     test_step.dependOn(&run_oci_registry_tests.step);
     test_step.dependOn(&run_wireserver_tests.step);
     test_step.dependOn(&run_qemu_host_tests.step);
@@ -1077,6 +1129,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(vmizguest_step);
     test_step.dependOn(&run_build_api_tests.step);
     test_step.dependOn(&build_api_consumer_check.step);
+    test_step.dependOn(&package_family_consumer_check.step);
     test_step.dependOn(&build_api_diagnostics_check.step);
     test_step.dependOn(&build_api_execution_diagnostics_check.step);
     test_step.dependOn(&build_api_preserved_diagnostics_check.step);

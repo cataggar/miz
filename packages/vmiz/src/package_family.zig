@@ -8,19 +8,60 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Dir = Io.Dir;
 
-pub const api_version: u32 = 2;
-pub const request_schema = "io.github.cataggar.vmiz.package-family.request.v2";
-pub const result_schema = "io.github.cataggar.vmiz.package-family.result.v2";
+pub const api_version: u32 = 3;
+pub const request_schema = "io.github.cataggar.vmiz.package-family.request.v3";
+pub const result_schema = "io.github.cataggar.vmiz.package-family.result.v3";
 pub const debz_api_commit = "d5385857a44fca753af515e805af70be9f004183";
+pub const rpmz_api_commit = "15b5e1291a9fc3eb3980a4088d757b9d0254d468";
+pub const rpm_lock_schema = "io.github.cataggar.vmiz.rpm-lock.v1";
+pub const rpm_provenance_schema = "io.github.cataggar.vmiz.rpm-provenance.v1";
 
 pub const Family = enum { rpm, debian };
 pub const Distribution = enum { azure_linux, ubuntu_26_04, debian };
+pub const RpmBackend = enum { rpmz, legacy_tdnf };
 pub const Architecture = enum { amd64, arm64 };
-pub const Operation = enum { resolve_lock, create, customize, update, recover, inspect };
+pub const Operation = enum { resolve_lock, create, customize, update, remove, recover, inspect };
 pub const CacheMode = enum { online, prefer_cache, offline };
 pub const RepositoryPolicy = enum { strict_priority, best_version };
 pub const ConffilePolicy = enum { keep_existing, use_package_version };
 pub const FailureDisposition = enum { disposable, recoverable };
+
+pub const RpmRepository = struct {
+    id: []const u8,
+    base_urls: []const []const u8 = &.{},
+    local_snapshot: ?[]const u8 = null,
+    priority: i32 = 50,
+    gpg_check: bool = true,
+    gpg_key_paths: []const []const u8 = &.{},
+};
+
+pub const RpmAction = union(enum) {
+    install: []const []const u8,
+    remove: []const []const u8,
+    update_all,
+    update_selected: []const []const u8,
+};
+
+pub const RpmPackageLock = struct {
+    name: []const u8,
+    evr: []const u8,
+    architecture: []const u8,
+};
+
+pub const RpmOptions = struct {
+    repositories: []const RpmRepository,
+    actions: []const RpmAction = &.{},
+    distro: []const u8,
+    release_version: []const u8,
+    rpmdb_path: []const u8 = "/var/lib/rpm",
+    scratch_path: []const u8,
+    bundle_input_path: ?[]const u8 = null,
+    bundle_output_path: ?[]const u8 = null,
+    exact_lock: []const RpmPackageLock = &.{},
+    import_trust: bool = false,
+    allow_erasing: bool = false,
+    gpg_check: bool = true,
+};
 
 pub const Inputs = struct {
     root_stage: []const u8,
@@ -43,6 +84,7 @@ pub const Inputs = struct {
     conffile: ConffilePolicy = .keep_existing,
     deadline_ms: u64 = 300_000,
     lock_wait_ms: u64 = 30_000,
+    rpm: ?RpmOptions = null,
 };
 
 pub const Request = struct {
@@ -54,6 +96,7 @@ pub const Request = struct {
     /// debz package-family schema v1 accepts at most one package. Requests
     /// containing more than one name are rejected rather than truncated.
     packages: []const []const u8 = &.{},
+    rpm_backend: RpmBackend = .rpmz,
     inputs: Inputs,
 };
 
@@ -68,6 +111,11 @@ pub const DiagnosticId = enum {
     lock_missing,
     provenance_missing,
     publication_failed,
+    unsupported_operation,
+    solver_contradiction,
+    bundle_invalid,
+    rpmdb_mismatch,
+    inventory_mismatch,
 };
 
 pub const Diagnostic = struct {
@@ -75,6 +123,7 @@ pub const Diagnostic = struct {
     message: []const u8,
     disposition: FailureDisposition,
     backend_exit_status: ?u8 = null,
+    solver_problem_count: ?usize = null,
 };
 
 pub const Result = struct {
@@ -101,7 +150,8 @@ pub const DebianBackend = struct {
 
 pub const BackendSet = struct {
     debian: DebianBackend = .{},
-    rpm: ?ExistingBackend = null,
+    rpmz: ?ExistingBackend = null,
+    legacy_rpm: ?ExistingBackend = null,
 };
 
 pub fn execute(
@@ -113,10 +163,16 @@ pub fn execute(
     if (!valid(request))
         return failed(.invalid_request, "invalid explicit package-family request", .disposable, null);
     if (request.family == .rpm) {
-        const backend = backends.rpm orelse
-            return failed(.unsupported_family, "RPM package-family backend is not configured", .disposable, null);
+        const backend = switch (request.rpm_backend) {
+            .rpmz => backends.rpmz orelse
+                return failed(.backend_unavailable, "host rpmz package-family backend is not configured", .disposable, null),
+            .legacy_tdnf => backends.legacy_rpm orelse
+                return failed(.backend_unavailable, "legacy in-target tdnf/rpm backend is not configured", .disposable, null),
+        };
         return backend.executeFn(backend.context, allocator, io, request);
     }
+    if (request.operation == .remove)
+        return failed(.unsupported_operation, "embedded debz does not expose package removal", .disposable, null);
     if (request.distribution != .ubuntu_26_04 and request.distribution != .debian)
         return failed(.unsupported_distribution, "debz supports Ubuntu and Debian roots only", .disposable, null);
     if (request.packages.len > 1)
@@ -275,6 +331,7 @@ fn debzOperation(operation: Operation) debz.package_family_backend.Operation {
         .create => .create,
         .customize => .customize,
         .update => .update,
+        .remove => unreachable,
         .recover => .recover,
         .inspect => .inspect,
     };
@@ -315,6 +372,7 @@ fn valid(request: Request) bool {
         pathContains(request.inputs.published_root, request.inputs.root_stage)) return false;
     if (overlaps(request.inputs.root_stage, request.inputs.cache_path) or
         overlaps(request.inputs.root_stage, request.inputs.state_path)) return false;
+    if (request.family == .rpm) return validRpm(request);
     if (request.inputs.source_paths.len == 0 or request.inputs.keyring_paths.len == 0) return false;
     for (request.inputs.source_paths) |path|
         if (!absolute(path) or overlaps(request.inputs.root_stage, path)) return false;
@@ -341,16 +399,40 @@ fn valid(request: Request) bool {
     return request.inputs.deadline_ms != 0;
 }
 
+fn validRpm(request: Request) bool {
+    const options = request.inputs.rpm orelse return false;
+    if (request.distribution != .azure_linux or options.repositories.len == 0 or
+        options.actions.len == 0 or options.distro.len == 0 or
+        options.release_version.len == 0) return false;
+    if (!absolute(request.inputs.cache_path) or !absolute(options.scratch_path) or
+        !absolute(options.rpmdb_path)) return false;
+    if (request.operation != .resolve_lock and request.inputs.lock_output_path == null) return false;
+    if (overlaps(request.inputs.root_stage, request.inputs.cache_path) or
+        overlaps(request.inputs.root_stage, options.scratch_path)) return false;
+    for (options.repositories) |repository| {
+        if (repository.id.len == 0) return false;
+        if ((repository.local_snapshot == null) == (repository.base_urls.len == 0)) return false;
+        if (repository.local_snapshot) |path| if (!absolute(path)) return false;
+        for (repository.gpg_key_paths) |path| if (!absolute(path)) return false;
+    }
+    if (options.bundle_input_path) |path| if (!absolute(path)) return false;
+    if (options.bundle_output_path) |path| if (!absolute(path)) return false;
+    if (options.bundle_input_path != null and options.bundle_output_path != null) return false;
+    if (request.inputs.lock_input_path) |path| if (!absolute(path)) return false;
+    if (request.inputs.lock_output_path) |path| if (!absolute(path)) return false;
+    return true;
+}
+
 fn mutates(operation: Operation) bool {
     return operation != .resolve_lock and operation != .inspect;
 }
 
 fn requiresProvenance(operation: Operation) bool {
-    return operation == .create or operation == .customize or operation == .update;
+    return operation == .create or operation == .customize or operation == .update or operation == .remove;
 }
 
 fn publishes(operation: Operation) bool {
-    return operation == .create or operation == .customize or operation == .update;
+    return operation == .create or operation == .customize or operation == .update or operation == .remove;
 }
 
 fn cleanup(io: Io, request: Request) void {

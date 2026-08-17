@@ -1,0 +1,15 @@
+.{
+    .name = .package_family_consumer,
+    .version = "0.0.0",
+    .fingerprint = 0x3a04f0f453e74c54,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // The dependency key deliberately does not encode the repository name.
+        .image_toolkit = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+    },
+}

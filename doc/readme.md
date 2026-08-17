@@ -12,6 +12,7 @@
 - [Library API](library-api.md)
 - [Image building](image-building.md)
 - [Ubuntu and Debian package families](debian-package-family.md)
+- [Host RPM package family](rpm-package-family.md)
 - [OCI copy, inspect, and tag listing](oci.md)
 - [UKI signing certificate extraction](uki-certificate.md)
 - [vmizinit](https://github.com/cataggar/vmiz/blob/main/vmizinit/README.md)
