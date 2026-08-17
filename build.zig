@@ -101,12 +101,23 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    _ = b.addModule("zvmi", .{
+        .root_source_file = b.path("packages/vmiz/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const host_vmiz_mod = b.addModule("vmiz_host", .{
         .root_source_file = b.path("packages/vmiz/src/root.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     });
     host_vmiz_mod.addImport("debz", debz_mod);
+    const host_zvmi_mod = b.addModule("zvmi_host", .{
+        .root_source_file = b.path("packages/vmiz/src/root.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    host_zvmi_mod.addImport("debz", debz_mod);
     const package_family_mod = b.createModule(.{
         .root_source_file = b.path("packages/vmiz/src/package_family.zig"),
         .target = b.graph.host,
@@ -859,6 +870,17 @@ pub fn build(b: *std.Build) void {
     package_family_consumer_check.setCwd(
         b.path("tests/package_family_consumer"),
     );
+    const rename_compatibility_consumer_check = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "build",
+        "rename-compatibility",
+    });
+    rename_compatibility_consumer_check.setName(
+        "check external zvmi compatibility consumer",
+    );
+    rename_compatibility_consumer_check.setCwd(
+        b.path("tests/build_api_consumer"),
+    );
 
     const build_api_diagnostics_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
@@ -1130,6 +1152,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_build_api_tests.step);
     test_step.dependOn(&build_api_consumer_check.step);
     test_step.dependOn(&package_family_consumer_check.step);
+    test_step.dependOn(&rename_compatibility_consumer_check.step);
     test_step.dependOn(&build_api_diagnostics_check.step);
     test_step.dependOn(&build_api_execution_diagnostics_check.step);
     test_step.dependOn(&build_api_preserved_diagnostics_check.step);

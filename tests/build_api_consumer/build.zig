@@ -18,6 +18,20 @@ pub fn build(b: *std.Build) void {
     b.step("package-family", "Compile and test the public package-family API")
         .dependOn(&run_package_family_consumer.step);
 
+    const rename_compatibility_consumer = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("rename_compatibility_consumer.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "zvmi", .module = dependency.module("zvmi_host") },
+            },
+        }),
+    });
+    const run_rename_compatibility_consumer = b.addRunArtifact(rename_compatibility_consumer);
+    b.step("rename-compatibility", "Compile and test the zvmi compatibility alias")
+        .dependOn(&run_rename_compatibility_consumer.step);
+
     const pull = vmiz.addOciPull(b, dependency, .{
         .name = "remote-container",
         .source = "docker://registry.example/team/image@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
