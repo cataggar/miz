@@ -1,6 +1,6 @@
 //! Opt-in QEMU acceptance for generalized FreeBSD 15.1 release images.
-//! Set `ZVMI_FREEBSD15_IMAGE`, `ZVMI_FREEBSD15_ARCHITECTURE`,
-//! `ZVMI_FREEBSD15_FILESYSTEM`, and `ZVMI_FREEBSD15_FLAVOR` to run it.
+//! Set `VMIZ_FREEBSD15_IMAGE`, `VMIZ_FREEBSD15_ARCHITECTURE`,
+//! `VMIZ_FREEBSD15_FILESYSTEM`, and `VMIZ_FREEBSD15_FLAVOR` to run it.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -98,7 +98,7 @@ fn optionalEnvAlloc(
 fn architectureFromEnvironment(allocator: Allocator) !Architecture {
     const value = try optionalEnvAlloc(
         allocator,
-        "ZVMI_FREEBSD15_ARCHITECTURE",
+        "VMIZ_FREEBSD15_ARCHITECTURE",
     ) orelse return .aarch64;
     defer allocator.free(value);
     return Architecture.parse(value) orelse error.InvalidArchitecture;
@@ -107,7 +107,7 @@ fn architectureFromEnvironment(allocator: Allocator) !Architecture {
 fn rootFilesystemFromEnvironment(allocator: Allocator) !RootFilesystem {
     const value = try optionalEnvAlloc(
         allocator,
-        "ZVMI_FREEBSD15_FILESYSTEM",
+        "VMIZ_FREEBSD15_FILESYSTEM",
     ) orelse return .zfs;
     defer allocator.free(value);
     return RootFilesystem.parse(value) orelse error.InvalidRootFilesystem;
@@ -116,7 +116,7 @@ fn rootFilesystemFromEnvironment(allocator: Allocator) !RootFilesystem {
 fn flavorFromEnvironment(allocator: Allocator) !Flavor {
     const value = try optionalEnvAlloc(
         allocator,
-        "ZVMI_FREEBSD15_FLAVOR",
+        "VMIZ_FREEBSD15_FLAVOR",
     ) orelse return .full;
     defer allocator.free(value);
     return Flavor.parse(value) orelse error.InvalidFlavor;
@@ -129,11 +129,11 @@ fn requireImageAlloc(
 ) ![]u8 {
     const path = try optionalEnvAlloc(
         allocator,
-        "ZVMI_FREEBSD15_IMAGE",
+        "VMIZ_FREEBSD15_IMAGE",
     ) orelse {
         std.debug.print(
             "skipping FreeBSD {s} boot acceptance: set " ++
-                "ZVMI_FREEBSD15_IMAGE to a generalized QCOW2\n",
+                "VMIZ_FREEBSD15_IMAGE to a generalized QCOW2\n",
             .{@tagName(architecture)},
         );
         return error.SkipZigTest;
@@ -141,7 +141,7 @@ fn requireImageAlloc(
     errdefer allocator.free(path);
     if (!try qemu_host.pathAccessible(io, path, .{ .read = true })) {
         std.debug.print(
-            "ZVMI_FREEBSD15_IMAGE is not readable: {s}\n",
+            "VMIZ_FREEBSD15_IMAGE is not readable: {s}\n",
             .{path},
         );
         return error.AcceptanceImageNotReadable;
@@ -194,12 +194,12 @@ fn resolveFirmwareAlloc(
 ) !Firmware {
     const explicit_code = try optionalEnvAlloc(
         allocator,
-        "ZVMI_FREEBSD15_UEFI_CODE",
+        "VMIZ_FREEBSD15_UEFI_CODE",
     );
     defer if (explicit_code) |path| allocator.free(path);
     const explicit_vars = try optionalEnvAlloc(
         allocator,
-        "ZVMI_FREEBSD15_UEFI_VARS",
+        "VMIZ_FREEBSD15_UEFI_VARS",
     );
     defer if (explicit_vars) |path| allocator.free(path);
     if ((explicit_code == null) != (explicit_vars == null)) {
@@ -213,7 +213,7 @@ fn resolveFirmwareAlloc(
     })) |firmware| return firmware;
     std.debug.print(
         "skipping FreeBSD {s} boot acceptance: matching UEFI firmware was not found; " ++
-            "set ZVMI_FREEBSD15_UEFI_CODE and ZVMI_FREEBSD15_UEFI_VARS\n",
+            "set VMIZ_FREEBSD15_UEFI_CODE and VMIZ_FREEBSD15_UEFI_VARS\n",
         .{@tagName(architecture)},
     );
     return error.SkipZigTest;
@@ -413,14 +413,14 @@ fn runTimedCommandAlloc(
         "/bin/bash",
         "-c",
         ssh_capture_script,
-        "zvmi-ssh-capture",
+        "vmiz-ssh-capture",
         "/usr/bin/timeout",
         kill_after_arg,
         timeout_text,
         "/bin/bash",
         "-c",
         timeout_wrapper_script,
-        "zvmi-timeout-wrapper",
+        "vmiz-timeout-wrapper",
         completion_path,
         started_path,
         timeout_path,
@@ -497,7 +497,7 @@ fn runSshCommandAlloc(
             "StrictHostKeyChecking=no",
             "-o",
             "UserKnownHostsFile=/dev/null",
-            "zvmitest@127.0.0.1",
+            "vmiztest@127.0.0.1",
             command,
         },
     );
@@ -829,11 +829,11 @@ const shared_remote_checks =
     \\! /usr/sbin/pw usershow freebsd >/dev/null 2>&1
     \\/usr/local/bin/sudo -n /usr/bin/awk -F: '$1 == "root" && $2 == "*LOCKED*" { ok=1 } END { exit !ok }' /etc/master.passwd
     \\test -s /etc/ssh/ssh_host_ed25519_key
-    \\test -s /home/zvmitest/.ssh/authorized_keys
+    \\test -s /home/vmiztest/.ssh/authorized_keys
     \\test ! -e /firstboot
     \\test ! -e /firstboot-reboot
-    \\test ! -e /root/zvmi-generalize.sh
-    \\test ! -e /etc/rc.d/zvmi_generalize
+    \\test ! -e /root/vmiz-generalize.sh
+    \\test ! -e /etc/rc.d/vmiz_generalize
     \\! /usr/bin/grep -Eq '^[^#].*[[:space:]]swap[[:space:]]' /etc/fstab
     \\test "$(/usr/sbin/swapinfo -k | /usr/bin/wc -l | /usr/bin/tr -d ' ')" = 1
     \\/usr/bin/grep -Fx 'Provisioning.Agent=auto' /usr/local/etc/waagent.conf
@@ -1614,7 +1614,7 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
     const qemu_path = try requireToolOverrideAlloc(
         allocator,
         io,
-        "ZVMI_FREEBSD15_QEMU",
+        "VMIZ_FREEBSD15_QEMU",
         architecture.qemuName(),
         architecture,
     );
@@ -1751,13 +1751,13 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
         const nonce = std.fmt.bytesToHex(nonce_bytes, .lower);
         const ready_marker = try std.fmt.allocPrint(
             allocator,
-            "ZVMI_FREEBSD_ACCEPTANCE_READY {s}",
+            "VMIZ_FREEBSD_ACCEPTANCE_READY {s}",
             .{&nonce},
         );
         defer allocator.free(ready_marker);
         const failure_marker = try std.fmt.allocPrint(
             allocator,
-            "ZVMI_FREEBSD_ACCEPTANCE_FAILED {s}",
+            "VMIZ_FREEBSD_ACCEPTANCE_FAILED {s}",
             .{&nonce},
         );
         defer allocator.free(failure_marker);
@@ -1765,50 +1765,50 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
         try Dir.cwd().createDir(io, seed_dir, .default_dir);
         const metadata = try std.fmt.allocPrint(
             allocator,
-            "instance-id: zvmi-acceptance-{s}\n" ++
-                "local-hostname: zvmi-acceptance\n",
+            "instance-id: vmiz-acceptance-{s}\n" ++
+                "local-hostname: vmiz-acceptance\n",
             .{&nonce},
         );
         defer allocator.free(metadata);
         const user_data = try std.fmt.allocPrint(
             allocator,
             \\#cloud-config
-            \\hostname: zvmi-acceptance
+            \\hostname: vmiz-acceptance
             \\ssh_pwauth: false
             \\users:
-            \\  - name: zvmitest
+            \\  - name: vmiztest
             \\    groups: wheel
             \\    shell: /bin/sh
             \\    ssh_authorized_keys:
             \\      - {s}
             \\write_files:
-            \\  - path: /usr/local/etc/sudoers.d/zvmitest
+            \\  - path: /usr/local/etc/sudoers.d/vmiztest
             \\    permissions: "0440"
             \\    content: |
-            \\      zvmitest ALL=(ALL) NOPASSWD: ALL
-            \\  - path: /root/zvmi-acceptance-ready.sh
+            \\      vmiztest ALL=(ALL) NOPASSWD: ALL
+            \\  - path: /root/vmiz-acceptance-ready.sh
             \\    permissions: "0700"
             \\    content: |
             \\      #!/bin/sh
             \\      sleep 30
             \\      if [ -s /etc/ssh/ssh_host_ed25519_key ] &&
-            \\          [ -s /home/zvmitest/.ssh/authorized_keys ] &&
-            \\          /usr/bin/id zvmitest >/dev/null 2>&1 &&
+            \\          [ -s /home/vmiztest/.ssh/authorized_keys ] &&
+            \\          /usr/bin/id vmiztest >/dev/null 2>&1 &&
             \\          /usr/sbin/service sshd onestatus >/dev/null 2>&1 &&
             \\          /sbin/ifconfig vtnet0 | /usr/bin/grep -q 'inet '; then
-            \\          printf 'ZVMI_FREEBSD_ACCEPTANCE_READY {s}\n' >/dev/console
+            \\          printf 'VMIZ_FREEBSD_ACCEPTANCE_READY {s}\n' >/dev/console
             \\      else
-            \\          printf 'ZVMI_FREEBSD_ACCEPTANCE_FAILED {s}\n' >/dev/console
+            \\          printf 'VMIZ_FREEBSD_ACCEPTANCE_FAILED {s}\n' >/dev/console
             \\          /sbin/ifconfig -a >/dev/console 2>&1 || true
             \\          /usr/sbin/service sshd onestatus >/dev/console 2>&1 || true
-            \\          /usr/bin/id zvmitest >/dev/console 2>&1 || true
+            \\          /usr/bin/id vmiztest >/dev/console 2>&1 || true
             \\          /usr/bin/stat -f '%Sp %Su:%Sg %z %N' \
-            \\              /home/zvmitest /home/zvmitest/.ssh \
-            \\              /home/zvmitest/.ssh/authorized_keys \
+            \\              /home/vmiztest /home/vmiztest/.ssh \
+            \\              /home/vmiztest/.ssh/authorized_keys \
             \\              >/dev/console 2>&1 || true
             \\      fi
             \\runcmd:
-            \\  - /usr/sbin/daemon -cf /root/zvmi-acceptance-ready.sh
+            \\  - /usr/sbin/daemon -cf /root/vmiz-acceptance-ready.sh
             \\
         ,
             .{ public_key, &nonce, &nonce },

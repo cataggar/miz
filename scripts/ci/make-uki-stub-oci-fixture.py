@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Builds a from-scratch OCI image layout overlaying a systemd EFI stub
-(`linuxx64.efi.stub`) for use as the `ZVMI_BOOT_TEST_UKI_OCI` fixture in CI.
+(`linuxx64.efi.stub`) for use as the `VMIZ_BOOT_TEST_UKI_OCI` fixture in CI.
 
-`zvmi build-image --boot-mode uki` needs a systemd EFI stub (e.g.
+`vmiz build-image --boot-mode uki` needs a systemd EFI stub (e.g.
 `linuxx64.efi.stub`, typically from the `systemd-boot-unsigned`/
 `systemd-boot-efi` package) to exist somewhere in the merged ISO/squashfs/
 container source tree -- see the UKI guidance in `doc/image-building.md`.
-`zvmi.bootconfig` discovers it by *basename* match anywhere in the merged
+`vmiz.bootconfig` discovers it by *basename* match anywhere in the merged
 tree (not a fixed path), so this only needs to overlay the single stub file;
 the archive path used below
 (`usr/lib/systemd/boot/efi/linuxx64.efi.stub`) simply mirrors the

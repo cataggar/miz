@@ -2,7 +2,7 @@
 
 ## ghr Authenticode parser
 
-`packages/zvmi/src/authenticode.zig` adapts PE parsing and Authenticode
+`packages/vmiz/src/authenticode.zig` adapts PE parsing and Authenticode
 range-hashing code from ghr.
 
 Copyright (c) 2026 Cameron Taggart.

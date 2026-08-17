@@ -19,7 +19,7 @@ cleanup_group() {
   local resource_group metadata_file group_exists expected_resource_group suffix
   resource_group=$(<"$STATE_FILE")
   suffix=${CANDIDATE_KEY//_/-}
-  expected_resource_group="zvmi-al4-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
+  expected_resource_group="vmiz-al4-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
   [[ "$resource_group" == "$expected_resource_group" ]] || {
     echo "::error::Refusing cleanup of unexpected resource-group name"
     return 1
@@ -47,10 +47,10 @@ import sys
 
 tags = json.load(open(sys.argv[1], encoding="utf-8")).get("tags") or {}
 expected = {
-    "zvmi-owner": "azurelinux4-release",
-    "zvmi-run-id": sys.argv[2],
-    "zvmi-run-attempt": sys.argv[3],
-    "zvmi-candidate": sys.argv[4],
+    "vmiz-owner": "azurelinux4-release",
+    "vmiz-run-id": sys.argv[2],
+    "vmiz-run-attempt": sys.argv[3],
+    "vmiz-candidate": sys.argv[4],
 }
 if tags != expected:
     raise SystemExit(f"refusing to delete resource group with non-exact ownership tags: {tags!r}")
@@ -75,7 +75,7 @@ fi
 
 if [[ -z ${CANDIDATE_DIR:-} || -z ${SOURCE_COMMIT:-} || -z ${ARCHITECTURE:-} ||
       -z ${FLAVOR:-} || -z ${ASSET_NAME:-} || -z ${AZURE_LOCATION:-} ||
-      -z ${AZURE_VM_SIZE:-} || -z ${RESULT_DIR:-} || -z ${ZVMI:-} ||
+      -z ${AZURE_VM_SIZE:-} || -z ${RESULT_DIR:-} || -z ${VMIZ:-} ||
       -z ${GITHUB_STEP_SUMMARY:-} ]]; then
   echo "::error::Azure acceptance configuration is incomplete"
   exit 1
@@ -86,7 +86,7 @@ fi
 [[ "$CANDIDATE_KEY" == "$ARCHITECTURE-$FLAVOR" ]]
 [[ "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ ]]
 [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
-[[ -x "$ZVMI" ]]
+[[ -x "$VMIZ" ]]
 
 report_error() {
   local status=$1 line=$2 command=$3
@@ -264,15 +264,15 @@ certificate_der_base64=${signing_identity[2]}
 [[ "$fallback_uki_sha256" =~ ^[0-9a-f]{64}$ ]]
 
 suffix=${CANDIDATE_KEY//_/-}
-resource_group="zvmi-al4-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
+resource_group="vmiz-al4-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
 short_arch=${ARCHITECTURE/x86_64/x64}
 name_seed="${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}${short_arch}${FLAVOR}"
-disk_name="zvmi-os-${name_seed}"
-data_disk_name="zvmi-data-${name_seed}"
-gallery_name="zvmial4${name_seed}"
-image_name="zvmial4${short_arch}${FLAVOR}"
-vm_name="zvmi-vm-${name_seed}"
-admin_username=zvmitest
+disk_name="vmiz-os-${name_seed}"
+data_disk_name="vmiz-data-${name_seed}"
+gallery_name="vmizal4${name_seed}"
+image_name="vmizal4${short_arch}${FLAVOR}"
+vm_name="vmiz-vm-${name_seed}"
+admin_username=vmiztest
 vhd="$RESULT_DIR/${CANDIDATE_KEY}.vhd"
 private_key="$RESULT_DIR/id_ed25519"
 boot_log="$RESULT_DIR/boot.log"
@@ -334,10 +334,10 @@ if ! az group create \
   --name "$resource_group" \
   --location "$AZURE_LOCATION" \
   --tags \
-    zvmi-owner=azurelinux4-release \
-    "zvmi-run-id=$GITHUB_RUN_ID" \
-    "zvmi-run-attempt=$GITHUB_RUN_ATTEMPT" \
-    "zvmi-candidate=$CANDIDATE_KEY" \
+    vmiz-owner=azurelinux4-release \
+    "vmiz-run-id=$GITHUB_RUN_ID" \
+    "vmiz-run-attempt=$GITHUB_RUN_ATTEMPT" \
+    "vmiz-candidate=$CANDIDATE_KEY" \
   --output json >/dev/null
 then
   echo "::error::Failed to create the persisted temporary resource group"
@@ -391,7 +391,7 @@ PY
 
 source_before=$(sha256sum "$asset" | awk '{print $1}')
 test "$source_before" = "$qcow_sha256"
-"$ZVMI" azure derive \
+"$VMIZ" azure derive \
   --input-sha256 "$qcow_sha256" \
   --expected-virtual-size "$virtual_size" \
   "$asset" \
@@ -455,7 +455,7 @@ az sig image-definition create \
   --resource-group "$resource_group" \
   --gallery-name "$gallery_name" \
   --gallery-image-definition "$image_name" \
-  --publisher zvmi \
+  --publisher vmiz \
   --offer azurelinux4 \
   --sku "${short_arch}-${FLAVOR}" \
   --os-type Linux \
@@ -568,7 +568,7 @@ if state != "Succeeded":
 PY
 [[ "$image_version_id" == /subscriptions/* ]]
 
-ssh-keygen -q -t ed25519 -N '' -C zvmi-azure-acceptance -f "$private_key"
+ssh-keygen -q -t ed25519 -N '' -C vmiz-azure-acceptance -f "$private_key"
 az vm create \
   --resource-group "$resource_group" \
   --name "$vm_name" \
@@ -694,7 +694,7 @@ trap 'guest_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 original_size=$1
 runtime_arch=$2
 release_arch=$3
-test "$(id -un)" = zvmitest
+test "$(id -un)" = vmiztest
 test "$(uname -m)" = "$runtime_arch"
 sshd_config=$(sudo -n /usr/sbin/sshd -T)
 grep -Fxq 'passwordauthentication no' <<<"$sshd_config"
@@ -781,7 +781,7 @@ guest_error() {
 }
 trap 'guest_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 has_resource_disk=$1
-sudo -n /usr/bin/test /proc/1/exe -ef /sbin/zvminit
+sudo -n /usr/bin/test /proc/1/exe -ef /sbin/vmizinit
 test -f /var/lib/azagent/provisioned
 master=
 for proc in /proc/[0-9]*; do
@@ -817,8 +817,8 @@ else
   ssh "${ssh_options[@]}" "$ssh_target" '/usr/bin/bash -s' <<'GUEST'
 set -euo pipefail
 sudo -n /usr/bin/test /proc/1/exe -ef /usr/lib/systemd/systemd
-test ! -e /sbin/zvminit
-test ! -e /usr/bin/zvminit
+test ! -e /sbin/vmizinit
+test ! -e /usr/bin/vmizinit
 for unit in cloud-final.service waagent.service sshd.service systemd-networkd.service; do
   systemctl is-active --quiet "$unit"
   systemctl is-enabled --quiet "$unit"
@@ -909,8 +909,8 @@ for _ in {1..6}; do
 done
 if [[ -s "$boot_log" ]]; then
   if [[ "$FLAVOR" == core ]]; then
-    grep -Fq '[zvminit] ZVMINIT_PID1_READY supervisor loop active' "$boot_log"
-    grep -Fq '[zvminit] azagent completed successfully' "$boot_log"
+    grep -Fq '[vmizinit] VMIZINIT_PID1_READY supervisor loop active' "$boot_log"
+    grep -Fq '[vmizinit] azagent completed successfully' "$boot_log"
   fi
   if [[ "$ARCHITECTURE" == aarch64 ]]; then
     grep -Fq 'ttyAMA0' "$boot_log"

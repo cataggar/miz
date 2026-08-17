@@ -1,7 +1,7 @@
 //! Detects, formats, and mounts Azure's temporary/local "resource disk"
 //! (typically `/dev/sdb`) at `/d`, with optional swap-file setup.
 //! Native replacement for the resource-disk portion of Python `waagent`
-//! (`azurelinuxagent/daemon/resourcedisk/default.py`) -- see zvmi issue #113.
+//! (`azurelinuxagent/daemon/resourcedisk/default.py`) -- see vmiz issue #113.
 //!
 //! Unlike `hostname.zig`/`passwd.zig`/`ssh_keys.zig` (which only ever run
 //! once, gated by the sentinel in `sentinel.zig`), this module's `setup`
@@ -9,7 +9,7 @@
 //! across a VM's lifetime, so its formatted state must be re-checked each
 //! time, not assumed from a previous run (see `main.zig`'s wiring).
 //!
-//! Reuses `zvmi`'s `mbr.zig`/`ext4.zig` codecs directly against a real block
+//! Reuses `vmiz`'s `mbr.zig`/`ext4.zig` codecs directly against a real block
 //! device special file -- both already operate on any `Io.File` plus a byte
 //! offset/length, so no library changes were needed to point them at
 //! `/dev/sdb` instead of a disk-image file.
@@ -17,12 +17,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
-const zvmi = @import("zvmi");
-const mbr = zvmi.mbr;
-const gpt = zvmi.gpt;
-const guid_codec = zvmi.guid;
-const ext4 = zvmi.ext4;
-const Image = zvmi.Image;
+const vmiz = @import("vmiz");
+const mbr = vmiz.mbr;
+const gpt = vmiz.gpt;
+const guid_codec = vmiz.guid;
+const ext4 = vmiz.ext4;
+const Image = vmiz.Image;
 
 /// Gen1 (BIOS/synthetic-IDE) resource-disk VMBus device IDs start with this
 /// prefix (IDE port 1, per upstream's `device_for_ide_port(1)`).
@@ -118,7 +118,7 @@ fn lastColonSegmentIsOne(name: []const u8) bool {
 }
 
 /// Byte offset (in sectors) where the resource disk's single data partition
-/// starts: 1 MiB aligned, matching `packages/zvmi/src/layout.zig`'s own
+/// starts: 1 MiB aligned, matching `packages/vmiz/src/layout.zig`'s own
 /// `default_alignment` convention used elsewhere in this repo.
 pub const partition_start_lba: u32 = 2048;
 
@@ -141,7 +141,7 @@ pub fn isWholeDiskLinuxPartition(decoded: mbr.Mbr, total_sectors: u64) bool {
 pub const default_mount_point = "/d";
 pub const dataloss_warning_file_name = "DATALOSS_WARNING_README.txt";
 
-/// zvmi's own wording (not copied from upstream's copyrighted text):
+/// vmiz's own wording (not copied from upstream's copyrighted text):
 /// a plain notice that the resource disk is temporary/non-persistent.
 pub const dataloss_warning_text =
     \\This is the VM's temporary resource disk.
@@ -315,7 +315,7 @@ fn reReadPartitionTable(file: std.Io.File) void {
 }
 
 /// Mounts `device_path` (e.g. `/dev/sdb1`) at `mount_point` via a direct
-/// `mount(2)` syscall (matching `cdrom.zig`/`zvminit`'s style), creating
+/// `mount(2)` syscall (matching `cdrom.zig`/`vmizinit`'s style), creating
 /// the mount point directory if needed. `EBUSY` is accepted only when
 /// `/proc/mounts` confirms this exact source/target pair is already mounted.
 pub fn mountAt(io: std.Io, device_path: [:0]const u8, mount_point: [:0]const u8) !void {

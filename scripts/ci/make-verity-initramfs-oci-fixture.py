@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Builds a from-scratch OCI image layout overlaying a verity-capable
 initramfs at `boot/initramfs-<kver>.img`, for use as the
-`ZVMI_BOOT_TEST_VERITY_OCI` fixture in CI.
+`VMIZ_BOOT_TEST_VERITY_OCI` fixture in CI.
 
-`zvmi build-image --verity` needs the source initramfs to already include
+`vmiz build-image --verity` needs the source initramfs to already include
 dm-verity userspace tooling (`systemd-veritysetup-generator`/
 `systemd-veritysetup`/`veritysetup`) -- see "Producing a verity-capable
 initramfs" in `doc/image-building.md`. Container layers always take
@@ -11,7 +11,7 @@ precedence over ISO/squashfs entries at the same path, so overlaying the
 regenerated initramfs at the exact same `boot/initramfs-<kver>.img` path the ISO uses
 (matching kernel version is essential -- see
 `build-verity-initramfs-fixture.sh`, which produces both the initramfs and
-its kernel version) cleanly replaces the stock copy with no extra `zvmi`
+its kernel version) cleanly replaces the stock copy with no extra `vmiz`
 flag needed.
 
 Usage: make-verity-initramfs-oci-fixture.py <output-dir> <path-to-initramfs> <kernel-version>

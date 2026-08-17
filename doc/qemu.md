@@ -1,6 +1,6 @@
 # QEMU
 
-Use `zvmi qemu` to acquire and boot cataloged Azure Linux and FreeBSD images
+Use `vmiz qemu` to acquire and boot cataloged Azure Linux and FreeBSD images
 with architecture-matched QEMU and firmware. See
 [Azure Linux images](azure-linux.md) for the full/core image comparison and
 release security model.
@@ -31,18 +31,18 @@ ghr install cataggar/qemu
 Then run the command from the directory where the VM disk should live:
 
 ```text
-zvmi qemu AzureLinux
-zvmi qemu AzureLinux --model core
-zvmi qemu AzureLinux-4.0-x86_64
-zvmi qemu FreeBSD
-zvmi qemu FreeBSD --arch x86_64
+vmiz qemu AzureLinux
+vmiz qemu AzureLinux --model core
+vmiz qemu AzureLinux-4.0-x86_64
+vmiz qemu FreeBSD
+vmiz qemu FreeBSD --arch x86_64
 ```
 
 The `AzureLinux` short alias selects the host-native catalog image: AArch64
 on AArch64 hosts and x86_64 otherwise. The default model is `full`;
 `--model core` selects the matching `*.core.qcow2` asset. Model selection
 applies to catalog aliases, while an explicit image path remains authoritative.
-If the selected image is absent, `zvmi` runs the verified ghr download for its
+If the selected image is absent, `vmiz` runs the verified ghr download for its
 pinned `AzureLinux-4.0-20260814` release asset.
 The `FreeBSD` alias similarly selects the host-native FreeBSD 15.1 image from
 release `FreeBSD-15.1-20260724`; on an AArch64 host it downloads
@@ -50,8 +50,8 @@ release `FreeBSD-15.1-20260724`; on an AArch64 host it downloads
 Existing images are never refreshed or overwritten. QEMU and its matching
 EDK2 firmware are resolved from the `cataggar/qemu` ghr installation first,
 then from a system QEMU/UEFI installation. Directory-prefixed aliases such as
-`zvmi qemu images/AzureLinux` or
-`zvmi qemu images/AzureLinux-4.0-x86_64` place the downloaded disk and
+`vmiz qemu images/AzureLinux` or
+`vmiz qemu images/AzureLinux-4.0-x86_64` place the downloaded disk and
 firmware under that directory.
 
 `FreeBSD` selects the pinned FreeBSD 15.1 release asset for the requested
@@ -59,7 +59,7 @@ architecture. It defaults to the host architecture; for example, an ARM64 host
 runs the x86_64 image through TCG when explicitly requested:
 
 ```text
-zvmi qemu FreeBSD --arch x86_64
+vmiz qemu FreeBSD --arch x86_64
 ```
 
 When administrator provisioning is requested, cataloged FreeBSD images receive
@@ -70,14 +70,14 @@ The published Azure Linux images use the signed direct UKI boot path described i
 [Azure Linux images](azure-linux.md). Secure Boot is opt-in:
 
 ```text
-zvmi qemu AzureLinux --secure-boot
-zvmi qemu AzureLinux-4.0-aarch64 --secure-boot
+vmiz qemu AzureLinux --secure-boot
+vmiz qemu AzureLinux-4.0-aarch64 --secure-boot
 ```
 
 This mode requires `virt-fw-vars` from `python3-virt-firmware` and
 architecture-appropriate Secure-Boot-capable OVMF or AAVMF. The catalog pins
 both the release asset SHA-256 and the canonical-DER SHA-256 of the exact Azure
-Artifact Signing leaf. Before first enrollment, `zvmi` verifies the pristine
+Artifact Signing leaf. Before first enrollment, `vmiz` verifies the pristine
 catalog image digest, extracts the signer from every fallback and named UKI,
 and requires that signer to match the catalog fingerprint. It then appends
 only that leaf to the Microsoft-enrolled variables template. It never enrolls
@@ -87,7 +87,7 @@ An explicit image that is not a matching catalog entry requires independent
 trust material:
 
 ```text
-zvmi qemu custom.qcow2 --secure-boot \
+vmiz qemu custom.qcow2 --secure-boot \
   --secure-boot-certificate release.pem \
   --secure-boot-certificate-sha256 <canonical-DER-SHA-256>
 ```
@@ -125,7 +125,7 @@ AzureLinux-4.0-x86_64.secboot.vars.json
 The metadata binds persistent Secure Boot state to the enrolled leaf.
 Cataloged disks may change during persistent guest use after initial
 digest-bound enrollment, but every subsequent launch still requires the
-pinned embedded signer. `zvmi` also recreates the expected enrollment from the
+pinned embedded signer. `vmiz` also recreates the expected enrollment from the
 selected Microsoft template and requires the persistent PK, KEK, and complete
 `db` contents to match before reuse.
 
@@ -144,20 +144,20 @@ QEMU exits.
 Use snapshot mode when guest changes should be discarded:
 
 ```text
-zvmi qemu AzureLinux --snapshot
+vmiz qemu AzureLinux --snapshot
 ```
 
 Snapshot mode uses the sibling `qemu-img` binary to create a temporary qcow2
 overlay and creates temporary UEFI variables directly from the pristine
 firmware source, not from persistent `.vars.fd` or `.secboot.vars.fd` state.
 Secure Boot snapshots enroll the same verified leaf into that temporary
-template. `zvmi` removes both when QEMU exits. The automatic accelerator is
+template. `vmiz` removes both when QEMU exits. The automatic accelerator is
 WHPX for x86_64 Windows, HVF for same-architecture macOS guests, KVM for
 same-architecture Linux guests when `/dev/kvm` is available, and TCG for
 cross-architecture or otherwise unaccelerated guests. Override it when needed:
 
 ```text
-zvmi qemu AzureLinux --accel tcg
+vmiz qemu AzureLinux --accel tcg
 ```
 
 An explicit image path must already exist. Without an architecture option it
@@ -166,15 +166,15 @@ corresponding architecture, `FreeBSD` selects the requested catalog
 architecture, and `aarch64` or `auto` can be used for other Arm64 images:
 
 ```text
-zvmi qemu ./AzureLinux-4.0-x86_64.qcow2
-zvmi qemu custom.qcow2
+vmiz qemu ./AzureLinux-4.0-x86_64.qcow2
+vmiz qemu custom.qcow2
 ```
 
 The AArch64 profile is already wired for `qemu-system-aarch64`, `virt`, and
 AArch64 EDK2 firmware:
 
 ```text
-zvmi qemu AzureLinux-4.0-aarch64
+vmiz qemu AzureLinux-4.0-aarch64
 ```
 
 The exact `AzureLinux-4.0-aarch64.qcow2` asset is downloaded from release
@@ -186,12 +186,12 @@ after `--` are appended directly to QEMU. The terminal is attached to
 QEMU's `-nographic` serial console; use QEMU's `Ctrl+A`, then `X`, escape to
 exit. With the default secure command line, a successful local boot reaches
 the full image's systemd startup and login prompt. It does not emit
-`zvminit` readiness markers.
+`vmizinit` readiness markers.
 
 Those markers apply only when a core image is selected with `--model core` or
 an explicit `*.core.qcow2` path. A successful unprovisioned core boot reports
 that automatic Azure detection is still pending, the diagnostic root shell is
-disabled, and the `ZVMINIT_PID1_READY supervisor loop active` marker.
+disabled, and the `VMIZINIT_PID1_READY supervisor loop active` marker.
 
 Core images have no default login, username, or password. To log in locally,
 launch with `--admin-username <name> --ssh-public-key <path>` and SSH to that
@@ -201,7 +201,7 @@ To provision an administrator at launch, supply
 `--admin-username <name> --ssh-public-key <path>` together. `--ssh-port`
 (default `2222`) forwards localhost TCP to guest SSH. The command creates a
 short-lived hybrid `cidata` ISO containing NoCloud metadata/user-data, Azure
-`ovf-env.xml`, and the explicit `zvmi-local-provisioning` marker, then removes
+`ovf-env.xml`, and the explicit `vmiz-local-provisioning` marker, then removes
 the seed and temporary launch state when QEMU exits.
 
 This command is intentionally a focused launcher for cataloged Azure Linux and

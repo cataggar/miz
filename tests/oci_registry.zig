@@ -1,10 +1,10 @@
 //! Offline loopback coverage for the OCI Distribution read transport.
 const std = @import("std");
 const tls = @import("tls");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 
 const Io = std.Io;
-const oci = zvmi.oci;
+const oci = vmiz.oci;
 
 const Scenario = enum {
     anonymous,
@@ -1261,7 +1261,7 @@ fn deleteLayout(io: Io, path: []const u8) void {
     var directory = Io.Dir.cwd().openDir(io, parent, .{}) catch return;
     defer directory.close(io);
     var lock_buffer: [512]u8 = undefined;
-    const lock = std.fmt.bufPrint(&lock_buffer, ".{s}.zvmi-oci-bootstrap.lock", .{base}) catch return;
+    const lock = std.fmt.bufPrint(&lock_buffer, ".{s}.vmiz-oci-bootstrap.lock", .{base}) catch return;
     directory.deleteFile(io, lock) catch {};
 }
 
@@ -4348,7 +4348,7 @@ fn pinnedReferenceFor(allocator: std.mem.Allocator, fixture: *const Fixture) ![]
     );
 }
 
-fn deadlineAfterMilliseconds(io: Io, milliseconds: i64) zvmi.customize.Deadline {
+fn deadlineAfterMilliseconds(io: Io, milliseconds: i64) vmiz.customize.Deadline {
     return .{ .timeout = (Io.Timeout{ .duration = .{
         .raw = .fromMilliseconds(milliseconds),
         .clock = .awake,
@@ -4372,7 +4372,7 @@ fn expectNoPublishedLayout(io: Io, path: []const u8) !void {
     var prefix_buffer: [512]u8 = undefined;
     const prefix = try std.fmt.bufPrint(
         &prefix_buffer,
-        ".{s}.zvmi-oci-staging-",
+        ".{s}.vmiz-oci-staging-",
         .{base},
     );
     var iterator = directory.iterate();
@@ -4397,7 +4397,7 @@ test "a stalled registry body cannot outlive the absolute pull deadline" {
     const started = Io.Clock.Timestamp.now(io, .awake);
     try std.testing.expectError(
         error.ExecutionDeadlineExceeded,
-        zvmi.customize.pullRegistryImageWithDeadline(
+        vmiz.customize.pullRegistryImageWithDeadline(
             allocator,
             io,
             std.process.Environ.empty,
@@ -4430,7 +4430,7 @@ test "slow registry requests consume one shared absolute pull deadline" {
     const started = Io.Clock.Timestamp.now(io, .awake);
     try std.testing.expectError(
         error.ExecutionDeadlineExceeded,
-        zvmi.customize.pullRegistryImageWithDeadline(
+        vmiz.customize.pullRegistryImageWithDeadline(
             allocator,
             io,
             std.process.Environ.empty,
@@ -4461,7 +4461,7 @@ test "a declared registry image is pulled into the layout the plan named" {
     const reference = try pinnedReferenceFor(allocator, &fixture);
     defer allocator.free(reference);
 
-    var pull = try zvmi.customize.pullRegistryImage(
+    var pull = try vmiz.customize.pullRegistryImage(
         allocator,
         io,
         std.process.Environ.empty,
@@ -4514,7 +4514,7 @@ test "a registry needing a credential the request did not declare fails to authe
 
     const reference = try pinnedReferenceFor(allocator, &fixture);
     defer allocator.free(reference);
-    try std.testing.expectError(error.AuthenticationFailed, zvmi.customize.pullRegistryImage(
+    try std.testing.expectError(error.AuthenticationFailed, vmiz.customize.pullRegistryImage(
         allocator,
         io,
         environment,
@@ -4616,19 +4616,19 @@ const SignatureFixture = struct {
                 .{
                     payload_digest,
                     cosign_payload.len,
-                    zvmi.oci.cosign.signature_annotation,
+                    vmiz.oci.cosign.signature_annotation,
                     cosign_key_pair_signature,
                 },
             ),
-            .crowded => for (0..zvmi.oci.cosign_discovery.max_candidates + 1) |index| {
+            .crowded => for (0..vmiz.oci.cosign_discovery.max_candidates + 1) |index| {
                 if (index != 0) try layers.writer.writeByte(',');
                 try layers.writer.print(
                     "{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"{s}\":\"{s}\"}}}}",
                     .{
-                        zvmi.oci.cosign.payload_media_type,
+                        vmiz.oci.cosign.payload_media_type,
                         payload_digest,
                         cosign_payload.len,
-                        zvmi.oci.cosign.signature_annotation,
+                        vmiz.oci.cosign.signature_annotation,
                         cosign_key_pair_signature,
                     },
                 );
@@ -4637,15 +4637,15 @@ const SignatureFixture = struct {
                 "{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"{s}\":\"{s}\"}}}}," ++
                     "{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"{s}\":\"{s}\"}}}}",
                 .{
-                    zvmi.oci.cosign.payload_media_type,
+                    vmiz.oci.cosign.payload_media_type,
                     payload_digest,
                     cosign_payload.len,
-                    zvmi.oci.cosign.signature_annotation,
+                    vmiz.oci.cosign.signature_annotation,
                     cosign_key_pair_signature,
-                    zvmi.oci.cosign.payload_media_type,
+                    vmiz.oci.cosign.payload_media_type,
                     payload_digest,
                     cosign_payload.len,
-                    zvmi.oci.cosign.signature_annotation,
+                    vmiz.oci.cosign.signature_annotation,
                     cosign_keyless_signature,
                 },
             ),
@@ -4661,7 +4661,7 @@ const SignatureFixture = struct {
         errdefer allocator.free(manifest_digest);
 
         const image = try oci.content.Digest.parse(cosign_image_digest);
-        const tag = zvmi.oci.cosign_discovery.signatureTag(image);
+        const tag = vmiz.oci.cosign_discovery.signatureTag(image);
         const signature_target = try std.fmt.allocPrint(
             allocator,
             "/v2/team/image/manifests/{s}",
@@ -4798,11 +4798,11 @@ fn signatureSourceFor(fixture: *SignatureFixture) !oci.registry.Source {
     );
 }
 
-fn discoverSignatures(fixture: *SignatureFixture) !zvmi.oci.cosign_discovery.Outcome {
+fn discoverSignatures(fixture: *SignatureFixture) !vmiz.oci.cosign_discovery.Outcome {
     var source = try signatureSourceFor(fixture);
     defer source.deinit();
     const image = try oci.content.Digest.parse(cosign_image_digest);
-    return zvmi.oci.cosign_discovery.discover(&source, image);
+    return vmiz.oci.cosign_discovery.discover(&source, image);
 }
 
 test "discovery finds every signature cosign attached to an image digest" {
@@ -4845,7 +4845,7 @@ test "what discovery returns is what verification accepts" {
     defer outcome.deinit();
     try fixture.finish();
 
-    const key = try zvmi.oci.cosign.parsePublicKeyPem(cosign_release_public_key);
+    const key = try vmiz.oci.cosign.parsePublicKeyPem(cosign_release_public_key);
     const image = try oci.content.Digest.parse(cosign_image_digest);
     const candidates = outcome.found.candidates;
 
@@ -4854,11 +4854,11 @@ test "what discovery returns is what verification accepts" {
     // payload, made with an ephemeral certificate this repository cannot
     // check, so it does not -- which is why one candidate verifying is what
     // matters and not all of them.
-    try zvmi.oci.cosign.verify(allocator, .{
+    try vmiz.oci.cosign.verify(allocator, .{
         .payload = candidates[0].payload,
         .signature = candidates[0].signature,
     }, key, image);
-    try std.testing.expectError(error.SignatureMismatch, zvmi.oci.cosign.verify(allocator, .{
+    try std.testing.expectError(error.SignatureMismatch, vmiz.oci.cosign.verify(allocator, .{
         .payload = candidates[1].payload,
         .signature = candidates[1].signature,
     }, key, image));
@@ -4874,7 +4874,7 @@ test "an image with no signature artifact is unsigned, not a failure" {
     defer outcome.deinit();
     try fixture.finish();
     try std.testing.expectEqual(
-        zvmi.oci.cosign_discovery.Absence.no_artifact,
+        vmiz.oci.cosign_discovery.Absence.no_artifact,
         outcome.absent,
     );
 }
@@ -4889,7 +4889,7 @@ test "an artifact carrying no simple-signing layer is unsigned, not a parse fail
     defer outcome.deinit();
     try fixture.finish();
     try std.testing.expectEqual(
-        zvmi.oci.cosign_discovery.Absence.no_signature_layer,
+        vmiz.oci.cosign_discovery.Absence.no_signature_layer,
         outcome.absent,
     );
 }
@@ -5061,10 +5061,10 @@ const PolicyFixture = struct {
                 oci.model.media_type_oci_config,
                 config_digest,
                 config.len,
-                zvmi.oci.cosign.payload_media_type,
+                vmiz.oci.cosign.payload_media_type,
                 payload_digest,
                 payload.len,
-                zvmi.oci.cosign.signature_annotation,
+                vmiz.oci.cosign.signature_annotation,
                 encoded,
             },
         );
@@ -5072,7 +5072,7 @@ const PolicyFixture = struct {
         const signature_manifest_digest = try digestText(allocator, signature_manifest);
         errdefer allocator.free(signature_manifest_digest);
         const image = try oci.content.Digest.parse(manifest_digest);
-        const tag = zvmi.oci.cosign_discovery.signatureTag(image);
+        const tag = vmiz.oci.cosign_discovery.signatureTag(image);
         const signature_target = try std.fmt.allocPrint(
             allocator,
             "/v2/team/image/manifests/{s}",
@@ -5273,7 +5273,7 @@ test "a declared signature policy admits an image its key signed" {
     const image_reference = try fixture.reference(allocator);
     defer allocator.free(image_reference);
 
-    var pull = try zvmi.customize.pullRegistryImage(
+    var pull = try vmiz.customize.pullRegistryImage(
         allocator,
         io,
         std.process.Environ.empty,
@@ -5313,7 +5313,7 @@ test "a declared signature policy refuses an unsigned image before it downloads 
     const image_reference = try fixture.reference(allocator);
     defer allocator.free(image_reference);
 
-    try std.testing.expectError(error.RegistryImageUnsigned, zvmi.customize.pullRegistryImage(
+    try std.testing.expectError(error.RegistryImageUnsigned, vmiz.customize.pullRegistryImage(
         allocator,
         io,
         std.process.Environ.empty,
@@ -5343,7 +5343,7 @@ test "an image signed by somebody else is refused as such, not as unsigned" {
     // Distinct from `RegistryImageUnsigned`. An image nobody signed and an
     // image the wrong person signed lead an operator to look in different
     // places, and only one of them is plausibly a mistyped key.
-    try std.testing.expectError(error.RegistrySignatureRejected, zvmi.customize.pullRegistryImage(
+    try std.testing.expectError(error.RegistrySignatureRejected, vmiz.customize.pullRegistryImage(
         allocator,
         io,
         std.process.Environ.empty,
@@ -5375,7 +5375,7 @@ test "a pull with no signature policy asks the registry nothing about signatures
     const image_reference = try fixture.reference(allocator);
     defer allocator.free(image_reference);
 
-    var pull = try zvmi.customize.pullRegistryImage(
+    var pull = try vmiz.customize.pullRegistryImage(
         allocator,
         io,
         std.process.Environ.empty,
@@ -5399,7 +5399,7 @@ test "provenance for a verified pull is a different value from one that was neve
     const image_reference = try fixture.reference(allocator);
     defer allocator.free(image_reference);
 
-    var pull = try zvmi.customize.pullRegistryImage(
+    var pull = try vmiz.customize.pullRegistryImage(
         allocator,
         io,
         std.process.Environ.empty,
@@ -5422,7 +5422,7 @@ test "provenance for a verified pull is a different value from one that was neve
     );
     const image = try oci.content.Digest.parse(fixture.manifest_digest);
     try std.testing.expectEqualStrings(
-        &zvmi.oci.cosign_discovery.signatureTag(image),
+        &vmiz.oci.cosign_discovery.signatureTag(image),
         verified.signature_tag,
     );
     try std.testing.expectEqualStrings(policy_public_key_pem, verified.key.inline_bytes);
@@ -5440,7 +5440,7 @@ test "provenance for an unchecked pull does not read as verified" {
     const image_reference = try fixture.reference(allocator);
     defer allocator.free(image_reference);
 
-    var pull = try zvmi.customize.pullRegistryImage(
+    var pull = try vmiz.customize.pullRegistryImage(
         allocator,
         io,
         std.process.Environ.empty,
@@ -5454,7 +5454,7 @@ test "provenance for an unchecked pull does not read as verified" {
     // there is no reading of this value under which a run that never asked
     // the question comes back as having answered it.
     try std.testing.expectEqual(
-        std.meta.Tag(zvmi.customize.RegistrySignatureRecord).not_requested,
+        std.meta.Tag(vmiz.customize.RegistrySignatureRecord).not_requested,
         std.meta.activeTag(pull.record.signature),
     );
 }

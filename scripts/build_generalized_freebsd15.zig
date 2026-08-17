@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 const qmp = @import("qmp");
 const qemu_host = @import("qemu_host");
 const packages = @import("freebsd15_package_manifest.zig");
@@ -14,7 +14,7 @@ const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const File = std.Io.File;
 const Io = std.Io;
-const artifact_pipeline = zvmi.artifact_pipeline;
+const artifact_pipeline = vmiz.artifact_pipeline;
 
 const source_max_size: u64 = 2 * 1024 * 1024 * 1024;
 const image_max_size: u64 = 6 * 1024 * 1024 * 1024;
@@ -24,7 +24,7 @@ const seed_iso_max_size: u64 = 4 * 1024 * 1024;
 const firmware_max_size: u64 = 128 * 1024 * 1024;
 const default_customization_timeout_seconds: u32 = 30 * 60;
 const qmp_connect_timeout_seconds: u32 = 10;
-const customization_result_prefix = "ZVMI_FREEBSD_CUSTOMIZATION_RESULT";
+const customization_result_prefix = "VMIZ_FREEBSD_CUSTOMIZATION_RESULT";
 const serial_tail_size: usize = 256 * 1024;
 /// Upper bound on the serial log scanned for the recorded package manifest.
 /// The manifest is emitted once near the end of a run, but boot chatter comes
@@ -518,7 +518,7 @@ fn rejectOutputAlias(
 
 const customization_user_data_template =
     \\#cloud-config
-    \\hostname: zvmi-freebsd-customizer
+    \\hostname: vmiz-freebsd-customizer
     \\users: []
     \\ssh_pwauth: false
     \\packages:
@@ -528,7 +528,7 @@ const customization_user_data_template =
     \\    permissions: "0644"
     \\    content: |
     \\      firstboot_pkg_upgrade_enable="NO"
-    \\  - path: /root/zvmi-generalize.sh
+    \\  - path: /root/vmiz-generalize.sh
     \\    permissions: "0700"
     \\    content: |
     \\      #!/bin/sh
@@ -542,7 +542,7 @@ const customization_user_data_template =
     \\          fi
     \\          for output in /dev/console /dev/ttyu0; do
     \\              if [ -w "${output}" ]; then
-    \\                  printf 'ZVMI_FREEBSD_CUSTOMIZATION_RESULT @NONCE@ %d\n' \
+    \\                  printf 'VMIZ_FREEBSD_CUSTOMIZATION_RESULT @NONCE@ %d\n' \
     \\                      "${status}" >"${output}" || true
     \\              fi
     \\          done
@@ -583,8 +583,8 @@ const customization_user_data_template =
     \\                  if (!found)
     \\                      print key "=" value
     \\              }
-    \\          ' /usr/local/etc/waagent.conf > /usr/local/etc/waagent.conf.zvmi
-    \\          mv /usr/local/etc/waagent.conf.zvmi /usr/local/etc/waagent.conf
+    \\          ' /usr/local/etc/waagent.conf > /usr/local/etc/waagent.conf.vmiz
+    \\          mv /usr/local/etc/waagent.conf.vmiz /usr/local/etc/waagent.conf
     \\      }
     \\      set_agent_config Provisioning.Agent auto
     \\      set_agent_config Provisioning.SshHostKeyPairType ed25519
@@ -603,17 +603,17 @@ const customization_user_data_template =
     \\      rm -f /var/db/pkg/repo-*.sqlite
     \\@FREE_SPACE_RECLAMATION@
     \\
-    \\      cat > /etc/rc.d/zvmi_generalize <<'ZVMI_SHUTDOWN'
+    \\      cat > /etc/rc.d/vmiz_generalize <<'VMIZ_SHUTDOWN'
     \\      #!/bin/sh
     \\      #
-    \\      # PROVIDE: zvmi_generalize
+    \\      # PROVIDE: vmiz_generalize
     \\      # BEFORE: random
     \\      # KEYWORD: shutdown
     \\      . /etc/rc.subr
-    \\      name="zvmi_generalize"
+    \\      name="vmiz_generalize"
     \\      start_cmd=":"
-    \\      stop_cmd="zvmi_generalize_stop"
-    \\      zvmi_generalize_stop()
+    \\      stop_cmd="vmiz_generalize_stop"
+    \\      vmiz_generalize_stop()
     \\      {
     \\          set -eu
     \\          rm -rf /var/lib/waagent /var/log/azure /var/cache/nuageinit
@@ -626,32 +626,32 @@ const customization_user_data_template =
     \\          rm -f /etc/ssh/ssh_host_*
     \\          rm -f /etc/hostid /etc/machine-id
     \\          rm -f /var/db/dhclient.leases.*
-    \\          rm -f /root/.*history /root/zvmi-generalize.sh
+    \\          rm -f /root/.*history /root/vmiz-generalize.sh
     \\          touch /firstboot
-    \\          rm -f /etc/rc.d/zvmi_generalize
+    \\          rm -f /etc/rc.d/vmiz_generalize
     \\          sync
     \\          for output in /dev/console /dev/ttyu0; do
     \\              if [ -w "${output}" ]; then
-    \\                  printf 'ZVMI_FREEBSD_CUSTOMIZATION_RESULT @NONCE@ 0\n' \
+    \\                  printf 'VMIZ_FREEBSD_CUSTOMIZATION_RESULT @NONCE@ 0\n' \
     \\                      >"${output}" || true
     \\              fi
     \\          done
     \\      }
     \\      load_rc_config "${name}"
     \\      run_rc_command "$1"
-    \\      ZVMI_SHUTDOWN
-    \\      chmod 0555 /etc/rc.d/zvmi_generalize
+    \\      VMIZ_SHUTDOWN
+    \\      chmod 0555 /etc/rc.d/vmiz_generalize
     \\      /usr/sbin/daemon -cf /bin/sh -c \
-    \\          '/bin/sleep 30; /sbin/shutdown -p now "zvmi customization complete"'
+    \\          '/bin/sleep 30; /sbin/shutdown -p now "vmiz customization complete"'
     \\      trap - EXIT HUP INT TERM
     \\runcmd:
-    \\  - /bin/sh /root/zvmi-generalize.sh
+    \\  - /bin/sh /root/vmiz-generalize.sh
     \\
 ;
 
 const customization_metadata_template =
-    \\instance-id: zvmi-build-@NONCE@
-    \\local-hostname: zvmi-freebsd-customizer
+    \\instance-id: vmiz-build-@NONCE@
+    \\local-hostname: vmiz-freebsd-customizer
     \\
 ;
 
@@ -665,9 +665,9 @@ const ufs_root_storage_script =
     \\      sysrc growfs_enable=YES
     \\      sysrc growfs_swap_size=0
     \\      swapoff -a
-    \\      awk '$3 != "swap" { print }' /etc/fstab > /etc/fstab.zvmi
-    \\      chmod 0644 /etc/fstab.zvmi
-    \\      mv /etc/fstab.zvmi /etc/fstab
+    \\      awk '$3 != "swap" { print }' /etc/fstab > /etc/fstab.vmiz
+    \\      chmod 0644 /etc/fstab.vmiz
+    \\      mv /etc/fstab.vmiz /etc/fstab
     \\      # A UFS root is mounted from /etc/fstab, so dropping that line
     \\      # while stripping swap would produce an unbootable image.
     \\      grep -Eq '@FSTAB_ROOT_PATTERN@' /etc/fstab
@@ -696,9 +696,9 @@ const zfs_root_storage_script =
     \\      # UFS has no equivalent, so this must not move into shared code.
     \\      sysrc zpool_reguid="${root_pool}"
     \\      swapoff -a
-    \\      awk '$3 != "swap" { print }' /etc/fstab > /etc/fstab.zvmi
-    \\      chmod 0644 /etc/fstab.zvmi
-    \\      mv /etc/fstab.zvmi /etc/fstab
+    \\      awk '$3 != "swap" { print }' /etc/fstab > /etc/fstab.vmiz
+    \\      chmod 0644 /etc/fstab.vmiz
+    \\      mv /etc/fstab.vmiz /etc/fstab
     \\      # The ZFS image never names its root in /etc/fstab, so demanding a
     \\      # root line here - as the UFS profile does - would be wrong.
     \\      # Require instead that nothing swap-like survives, including the
@@ -743,10 +743,10 @@ const ufs_reclamation_script =
     \\      if [ "${fill_mb}" -gt 0 ]; then
     \\          # ENOSPC here is success, not failure: the point is to reach
     \\          # the end of the free space, however much of it there is.
-    \\          dd if=/dev/zero of=/zvmi-reclaim.tmp bs=1m \
+    \\          dd if=/dev/zero of=/vmiz-reclaim.tmp bs=1m \
     \\              count="${fill_mb}" || true
     \\      fi
-    \\      rm -f /zvmi-reclaim.tmp
+    \\      rm -f /vmiz-reclaim.tmp
     \\      sync
 ;
 
@@ -895,7 +895,7 @@ const TemporaryDirectory = struct {
             const hex = std.fmt.bytesToHex(random, .lower);
             const path = try std.fmt.allocPrint(
                 allocator,
-                "{s}/.zvmi-freebsd-{s}",
+                "{s}/.vmiz-freebsd-{s}",
                 .{ parent, &hex },
             );
             Dir.cwd().createDir(
@@ -2271,12 +2271,12 @@ test "FreeBSD seed embeds only the selected profile's root storage" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         ufs_seed,
-        "/zvmi-reclaim.tmp",
+        "/vmiz-reclaim.tmp",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         zfs_seed,
-        "/zvmi-reclaim.tmp",
+        "/vmiz-reclaim.tmp",
     ) == null);
     try std.testing.expect(std.mem.indexOf(u8, zfs_seed, "zpool trim") != null);
 
@@ -2289,7 +2289,7 @@ test "FreeBSD seed embeds only the selected profile's root storage" {
         try expectIndentedBlock(
             seed,
             "      rm -f /var/db/pkg/repo-*.sqlite",
-            "      cat > /etc/rc.d/zvmi_generalize",
+            "      cat > /etc/rc.d/vmiz_generalize",
         );
     }
 }

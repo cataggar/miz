@@ -1,5 +1,5 @@
 //! Exported `std.Build` helper for generating a customized LiveOS ISO during a
-//! consumer's build. Runs the host `zvmi-iso-builder` over a source ISO and an
+//! consumer's build. Runs the host `vmiz-iso-builder` over a source ISO and an
 //! OCI container image and yields the generated ISO plus a machine-readable
 //! report.
 //!
@@ -10,8 +10,8 @@
 //! partition/format plan an ISO does not have.
 
 const std = @import("std");
-const customization_wire = @import("../packages/zvmi/src/customization_wire.zig");
-const limits_mod = @import("../packages/zvmi/src/limits.zig");
+const customization_wire = @import("../packages/vmiz/src/customization_wire.zig");
+const limits_mod = @import("../packages/vmiz/src/limits.zig");
 
 pub const Architecture = enum {
     x86_64,
@@ -143,7 +143,7 @@ pub fn add(
 ) Result {
     const container = snapshotContainer(b, dependency, options.name, options.container);
 
-    const run = b.addRunArtifact(dependency.artifact("zvmi-iso-builder"));
+    const run = b.addRunArtifact(dependency.artifact("vmiz-iso-builder"));
     run.setName(b.fmt("build iso {s}", .{options.name}));
     run.has_side_effects = true;
     configureRequest(b, run, options, container);
@@ -165,7 +165,7 @@ pub fn add(
 fn snapshotContainer(b: *std.Build, dependency: *std.Build.Dependency, name: []const u8, container: Container) Container {
     return switch (container) {
         .oci_layout => |layout| blk: {
-            const validate = b.addRunArtifact(dependency.artifact("zvmi-input-validator"));
+            const validate = b.addRunArtifact(dependency.artifact("vmiz-input-validator"));
             validate.setName(b.fmt("validate OCI layout for {s}", .{name}));
             validate.addDirectoryArg(layout);
 
@@ -353,7 +353,7 @@ pub fn addRecustomize(
 ) RecustomizeResult {
     const container = snapshotContainer(b, dependency, options.name, options.container);
 
-    const run = b.addRunArtifact(dependency.artifact("zvmi-recustomize-iso-builder"));
+    const run = b.addRunArtifact(dependency.artifact("vmiz-recustomize-iso-builder"));
     run.setName(b.fmt("recustomize iso {s}", .{options.name}));
     run.has_side_effects = true;
 

@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # Builds a verity-capable initramfs (i.e. one with dm-verity userspace
 # tooling added via `dracut --add systemd-veritysetup`) from a real Azure
-# Linux ISO fixture, for use as the ZVMI_BOOT_TEST_VERITY_OCI fixture in CI.
+# Linux ISO fixture, for use as the VMIZ_BOOT_TEST_VERITY_OCI fixture in CI.
 #
 # See "Producing a verity-capable initramfs" in doc/image-building.md for
 # the manual version of this recipe. This script automates it against the
 # same ISO fixture the boot-smoke job already downloads
-# (ZVMI_BOOT_TEST_ISO), rather than a separately-provisioned installed
+# (VMIZ_BOOT_TEST_ISO), rather than a separately-provisioned installed
 # system, so the exact kernel/module version always matches what the
 # boot-smoke tests actually boot.
 #
 # Azure Linux's installer/live media ships an ext4 rootfs image nested
 # inside an outer squashfs wrapper (LiveOS/squashfs.img -> LiveOS/rootfs.img
-# -- see build_image.zig's "LiveOS-style media" handling for why zvmi itself
+# -- see build_image.zig's "LiveOS-style media" handling for why vmiz itself
 # reads it the same way), and that rootfs already has `dracut`/`tdnf` plus
 # working package-repo config, but lacks `veritysetup` (dm-verity userspace
 # tooling) since it's live/installer media, not the installed system.

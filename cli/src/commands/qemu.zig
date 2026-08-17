@@ -1,4 +1,4 @@
-//! `zvmi qemu [<image>] [--model full|core]
+//! `vmiz qemu [<image>] [--model full|core]
 //!             [--architecture auto|x86_64|aarch64]
 //!             [--admin-username <name>] [--ssh-public-key <path>]
 //!             [--ssh-port <port>] [--snapshot] [--accel auto|whpx|kvm|hvf|tcg]
@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 const qemu_host = @import("qemu_host");
 const guest_validation = @import("guest_validation");
 const atomic_output = @import("../atomic_output.zig");
@@ -51,7 +51,7 @@ const known_images = [_]KnownImage{
     .{
         .alias = "AzureLinux-4.0-x86_64",
         .disk_name = "AzureLinux-4.0-x86_64.qcow2",
-        .release_spec = "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260814",
+        .release_spec = "cataggar/vmiz/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260814",
         .architecture = .x86_64,
         .image_sha256 = "e7b79748bc994f55c20b48d07323d4fb2695703380c7a8abc068d39f46711ce3",
         .certificate_sha256 = release_certificate_sha256,
@@ -61,7 +61,7 @@ const known_images = [_]KnownImage{
     .{
         .alias = "AzureLinux-4.0-aarch64",
         .disk_name = "AzureLinux-4.0-aarch64.qcow2",
-        .release_spec = "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260814",
+        .release_spec = "cataggar/vmiz/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260814",
         .architecture = .aarch64,
         .image_sha256 = "590c6eddbbbc952ff21c8d9a026ae16e10f22ad71e940dc87c10e5e8016ef544",
         .certificate_sha256 = release_certificate_sha256,
@@ -71,7 +71,7 @@ const known_images = [_]KnownImage{
     .{
         .alias = "AzureLinux-4.0-x86_64",
         .disk_name = "AzureLinux-4.0-x86_64.core.qcow2",
-        .release_spec = "cataggar/zvmi/AzureLinux-4.0-x86_64.core.qcow2@AzureLinux-4.0-20260814",
+        .release_spec = "cataggar/vmiz/AzureLinux-4.0-x86_64.core.qcow2@AzureLinux-4.0-20260814",
         .architecture = .x86_64,
         .image_sha256 = "44992c857178e95b3a3d2c2c1c2008791d3e5a704f845f4500cc6e86a0baadc6",
         .certificate_sha256 = release_certificate_sha256,
@@ -81,7 +81,7 @@ const known_images = [_]KnownImage{
     .{
         .alias = "AzureLinux-4.0-aarch64",
         .disk_name = "AzureLinux-4.0-aarch64.core.qcow2",
-        .release_spec = "cataggar/zvmi/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260814",
+        .release_spec = "cataggar/vmiz/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260814",
         .architecture = .aarch64,
         .image_sha256 = "ff294c8655ea80f890a41a7c6dc545d997da498dc5f5f03fd3aee8dea81b0f65",
         .certificate_sha256 = release_certificate_sha256,
@@ -91,7 +91,7 @@ const known_images = [_]KnownImage{
     .{
         .alias = "FreeBSD-15.1-x86_64",
         .disk_name = "FreeBSD-15.1-x86_64.qcow2",
-        .release_spec = "cataggar/zvmi/FreeBSD-15.1-x86_64.qcow2@FreeBSD-15.1-20260724",
+        .release_spec = "cataggar/vmiz/FreeBSD-15.1-x86_64.qcow2@FreeBSD-15.1-20260724",
         .architecture = .x86_64,
         .image_sha256 = "28908a347c0eaafda5dbf28fb0208d68f29d0f9165b2454f0cd14fe371b7f58e",
         .certificate_sha256 = null,
@@ -100,7 +100,7 @@ const known_images = [_]KnownImage{
     .{
         .alias = "FreeBSD-15.1-aarch64",
         .disk_name = "FreeBSD-15.1-aarch64.qcow2",
-        .release_spec = "cataggar/zvmi/FreeBSD-15.1-aarch64.qcow2@FreeBSD-15.1-20260724",
+        .release_spec = "cataggar/vmiz/FreeBSD-15.1-aarch64.qcow2@FreeBSD-15.1-20260724",
         .architecture = .aarch64,
         .image_sha256 = "28f2138af20c4ede674f18922b216ad673816882e6270414f2bae5c6feff4b1e",
         .certificate_sha256 = null,
@@ -113,10 +113,10 @@ const default_image_spec = known_images[0].release_spec;
 const default_ssh_port: u16 = 2222;
 const max_ssh_port: u16 = 65535;
 const max_secure_boot_certificate_bytes: usize = 1024 * 1024;
-const local_provisioning_marker = "zvmi-local-provisioning";
+const local_provisioning_marker = "vmiz-local-provisioning";
 
 const help_text =
-    \\usage: zvmi qemu [<image>] [--model full|core]
+    \\usage: vmiz qemu [<image>] [--model full|core]
     \\                  [--architecture auto|x86_64|aarch64]
     \\                  [--admin-username <name>] [--ssh-public-key <path>]
     \\                  [--ssh-port <port>] [--snapshot] [--accel auto|whpx|kvm|hvf|tcg]
@@ -209,7 +209,7 @@ const Options = struct {
     ovmf_vars_path: ?[]const u8 = null,
     secure_boot: bool = false,
     secure_boot_certificate_path: ?[]const u8 = null,
-    secure_boot_certificate_sha256: ?zvmi.artifact_pipeline.Digest = null,
+    secure_boot_certificate_sha256: ?vmiz.artifact_pipeline.Digest = null,
     admin_username: ?[]const u8 = null,
     ssh_public_key_path: ?[]const u8 = null,
     ssh_port: ?u16 = null,
@@ -255,8 +255,8 @@ const ResolvedImage = struct {
     secure_vars_metadata_path: []u8,
     architecture: GuestArchitecture,
     release_spec: ?[]const u8,
-    expected_image_sha256: ?zvmi.artifact_pipeline.Digest,
-    expected_certificate_sha256: ?zvmi.artifact_pipeline.Digest,
+    expected_image_sha256: ?vmiz.artifact_pipeline.Digest,
+    expected_certificate_sha256: ?vmiz.artifact_pipeline.Digest,
     provisioning_media: ProvisioningMedia,
     download_allowed: bool,
 
@@ -282,7 +282,7 @@ const LaunchPlan = struct {
     qemu_data_dir: ?[]const u8,
     architecture: qemu_host.GuestArchitecture = .x86_64,
     image_path: []const u8,
-    image_format: zvmi.Format,
+    image_format: vmiz.Format,
     ovmf_code_path: []const u8,
     ovmf_vars_path: []const u8,
     accel: Accel,
@@ -324,7 +324,7 @@ const GhrMetadata = struct {
 
 const SecureBootCertificate = struct {
     pem: []u8,
-    sha256: zvmi.artifact_pipeline.Digest,
+    sha256: vmiz.artifact_pipeline.Digest,
     launch_image_path: []u8,
 
     fn deinit(
@@ -346,9 +346,9 @@ const SecureBootMetadata = struct {
 };
 
 const SecureBootTrustState = struct {
-    pk_sha256: zvmi.artifact_pipeline.Digest,
-    kek_sha256: zvmi.artifact_pipeline.Digest,
-    db_sha256: zvmi.artifact_pipeline.Digest,
+    pk_sha256: vmiz.artifact_pipeline.Digest,
+    kek_sha256: vmiz.artifact_pipeline.Digest,
+    db_sha256: vmiz.artifact_pipeline.Digest,
 
     fn eql(self: SecureBootTrustState, other: SecureBootTrustState) bool {
         return std.mem.eql(u8, &self.pk_sha256, &other.pk_sha256) and
@@ -711,7 +711,7 @@ fn runVm(
             secure_boot_certificate.?.launch_image_path
         else
             image.disk_path;
-    const launch_image_format: zvmi.Format = if (vm_state.overlay_path != null) .qcow2 else image_format;
+    const launch_image_format: vmiz.Format = if (vm_state.overlay_path != null) .qcow2 else image_format;
     var argv = buildQemuArgv(gpa, .{
         .qemu_path = qemu.binary_path,
         .qemu_data_dir = qemu.data_dir,
@@ -801,7 +801,7 @@ fn parseArgs(args: []const []const u8) ParseResult {
             i += 1;
             if (i >= args.len) return parseFailure(.missing_value, arg);
             options.secure_boot_certificate_sha256 =
-                zvmi.artifact_pipeline.parseSha256(args[i]) catch
+                vmiz.artifact_pipeline.parseSha256(args[i]) catch
                     return parseFailure(.invalid_secure_boot_sha256, args[i]);
         } else if (std.mem.eql(u8, arg, "--model")) {
             i += 1;
@@ -1024,9 +1024,9 @@ fn resolveImageAlloc(
                 argument,
                 known.architecture,
                 known.release_spec,
-                try zvmi.artifact_pipeline.parseSha256(known.image_sha256),
+                try vmiz.artifact_pipeline.parseSha256(known.image_sha256),
                 if (known.certificate_sha256) |sha256|
-                    try zvmi.artifact_pipeline.parseSha256(sha256)
+                    try vmiz.artifact_pipeline.parseSha256(sha256)
                 else
                     null,
                 known.provisioning_media,
@@ -1140,9 +1140,9 @@ fn resolvedKnownImageAlloc(
         disk_path,
         known.architecture,
         known.release_spec,
-        try zvmi.artifact_pipeline.parseSha256(known.image_sha256),
+        try vmiz.artifact_pipeline.parseSha256(known.image_sha256),
         if (known.certificate_sha256) |sha256|
-            try zvmi.artifact_pipeline.parseSha256(sha256)
+            try vmiz.artifact_pipeline.parseSha256(sha256)
         else
             null,
         known.provisioning_media,
@@ -1155,8 +1155,8 @@ fn resolvedDiskImageAlloc(
     disk_path: []const u8,
     architecture: GuestArchitecture,
     release_spec: ?[]const u8,
-    expected_image_sha256: ?zvmi.artifact_pipeline.Digest,
-    expected_certificate_sha256: ?zvmi.artifact_pipeline.Digest,
+    expected_image_sha256: ?vmiz.artifact_pipeline.Digest,
+    expected_certificate_sha256: ?vmiz.artifact_pipeline.Digest,
     provisioning_media: ProvisioningMedia,
     download_allowed: bool,
 ) !ResolvedImage {
@@ -1238,7 +1238,7 @@ fn currentHostCapabilities(io: std.Io) HostCapabilities {
     };
 }
 
-fn qemuFormatName(format: zvmi.Format) []const u8 {
+fn qemuFormatName(format: vmiz.Format) []const u8 {
     return switch (format) {
         .raw => "raw",
         .vhd => "vpc",
@@ -1247,7 +1247,7 @@ fn qemuFormatName(format: zvmi.Format) []const u8 {
     };
 }
 
-fn detectImageFormat(io: std.Io, image_path: []const u8) !zvmi.Format {
+fn detectImageFormat(io: std.Io, image_path: []const u8) !vmiz.Format {
     var file = try std.Io.Dir.cwd().openFile(io, image_path, .{});
     defer file.close(io);
 
@@ -1274,7 +1274,7 @@ fn detectImageFormat(io: std.Io, image_path: []const u8) !zvmi.Format {
 fn hashOpenFile(
     io: std.Io,
     file: std.Io.File,
-) !zvmi.artifact_pipeline.Digest {
+) !vmiz.artifact_pipeline.Digest {
     const initial = try file.stat(io);
     if (initial.kind != .file) return error.ImageNotRegularFile;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1296,7 +1296,7 @@ fn hashOpenFile(
     {
         return error.ImageChangedDuringHash;
     }
-    var digest: zvmi.artifact_pipeline.Digest = undefined;
+    var digest: vmiz.artifact_pipeline.Digest = undefined;
     hash.final(&digest);
     return digest;
 }
@@ -1314,14 +1314,14 @@ fn createValidatedImageLinkAlloc(
     io: std.Io,
     image_file: std.Io.File,
     image_path: []const u8,
-    verified_sha256: zvmi.artifact_pipeline.Digest,
+    verified_sha256: vmiz.artifact_pipeline.Digest,
 ) ![]u8 {
     const parent = std.fs.path.dirname(image_path) orelse ".";
     const directory = try randomTempPathAlloc(
         allocator,
         io,
         parent,
-        ".zvmi-secure-boot-image-",
+        ".vmiz-secure-boot-image-",
         "",
     );
     defer allocator.free(directory);
@@ -1389,11 +1389,11 @@ fn prepareSecureBootCertificateAlloc(
             .limited(max_secure_boot_certificate_bytes),
         );
         defer allocator.free(certificate_pem);
-        const certificate_der = try zvmi.authenticode.decodePemCertificateAlloc(
+        const certificate_der = try vmiz.authenticode.decodePemCertificateAlloc(
             allocator,
             certificate_pem,
         );
-        const certificate_sha256 = zvmi.artifact_pipeline.sha256Bytes(
+        const certificate_sha256 = vmiz.artifact_pipeline.sha256Bytes(
             certificate_der,
         );
         if (!std.mem.eql(
@@ -1407,7 +1407,7 @@ fn prepareSecureBootCertificateAlloc(
         explicit_certificate_der = certificate_der;
     }
 
-    var initial_image_sha256: ?zvmi.artifact_pipeline.Digest = null;
+    var initial_image_sha256: ?vmiz.artifact_pipeline.Digest = null;
     var disk = blk: {
         const image_file = try std.Io.Dir.cwd().openFile(io, image.disk_path, .{
             .mode = .read_only,
@@ -1424,10 +1424,10 @@ fn prepareSecureBootCertificateAlloc(
                 return error.CatalogImageDigestMismatch;
             initial_image_sha256 = actual_image_sha256;
         }
-        break :blk try zvmi.Image.openFile(io, image_file);
+        break :blk try vmiz.Image.openFile(io, image_file);
     };
     defer disk.close(io);
-    var extracted = try zvmi.uki_certificate.extractAlloc(
+    var extracted = try vmiz.uki_certificate.extractAlloc(
         allocator,
         io,
         &disk,
@@ -1446,7 +1446,7 @@ fn prepareSecureBootCertificateAlloc(
             return error.ExplicitCertificateDoesNotMatchImage;
     }
 
-    const pem = try zvmi.authenticode.encodePemCertificateAlloc(
+    const pem = try vmiz.authenticode.encodePemCertificateAlloc(
         allocator,
         extracted.certificate_der,
     );
@@ -1469,7 +1469,7 @@ fn resolveArchitecture(
     io: std.Io,
     options: Options,
     image: ResolvedImage,
-    image_format: zvmi.Format,
+    image_format: vmiz.Format,
 ) !qemu_host.GuestArchitecture {
     _ = image_format;
     if (!options.architecture_was_explicit) return image.architecture;
@@ -1482,11 +1482,11 @@ fn resolveArchitecture(
 }
 
 fn detectImageArchitecture(io: std.Io, image_path: []const u8) !qemu_host.GuestArchitecture {
-    var image = try zvmi.Image.openPathReadOnly(io, image_path);
+    var image = try vmiz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
 
     var gpt_architecture: ?qemu_host.GuestArchitecture = null;
-    if (zvmi.gpt.readGpt(image, io, std.heap.page_allocator)) |parsed| {
+    if (vmiz.gpt.readGpt(image, io, std.heap.page_allocator)) |parsed| {
         defer std.heap.page_allocator.free(parsed.partitions);
         gpt_architecture = inferArchitectureFromGpt(parsed.partitions) catch |err| switch (err) {
             error.AmbiguousArchitecture => return err,
@@ -1518,16 +1518,16 @@ fn detectImageArchitecture(io: std.Io, image_path: []const u8) !qemu_host.GuestA
 }
 
 pub fn inferArchitectureFromGpt(
-    partitions: []const zvmi.gpt.PartitionEntry,
+    partitions: []const vmiz.gpt.PartitionEntry,
 ) !qemu_host.GuestArchitecture {
     var result: ?qemu_host.GuestArchitecture = null;
     for (partitions) |partition| {
         const architecture: ?qemu_host.GuestArchitecture =
-            if (std.mem.eql(u8, &partition.partition_type_guid, &zvmi.guid.linux_root_x86_64) or
-            std.mem.eql(u8, &partition.partition_type_guid, &zvmi.guid.linux_usr_x86_64))
+            if (std.mem.eql(u8, &partition.partition_type_guid, &vmiz.guid.linux_root_x86_64) or
+            std.mem.eql(u8, &partition.partition_type_guid, &vmiz.guid.linux_usr_x86_64))
                 .x86_64
-            else if (std.mem.eql(u8, &partition.partition_type_guid, &zvmi.guid.linux_root_aarch64) or
-            std.mem.eql(u8, &partition.partition_type_guid, &zvmi.guid.linux_usr_aarch64))
+            else if (std.mem.eql(u8, &partition.partition_type_guid, &vmiz.guid.linux_root_aarch64) or
+            std.mem.eql(u8, &partition.partition_type_guid, &vmiz.guid.linux_usr_aarch64))
                 .aarch64
             else
                 null;
@@ -1592,7 +1592,7 @@ fn validateSecureBootMetadata(
     allocator: std.mem.Allocator,
     io: std.Io,
     metadata_path: []const u8,
-    expected_certificate_sha256: zvmi.artifact_pipeline.Digest,
+    expected_certificate_sha256: vmiz.artifact_pipeline.Digest,
 ) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
@@ -1609,7 +1609,7 @@ fn validateSecureBootMetadata(
     ) catch return error.InvalidSecureBootMetadata;
     defer parsed.deinit();
     if (parsed.value.schema != 1) return error.InvalidSecureBootMetadata;
-    const actual = zvmi.artifact_pipeline.parseSha256(
+    const actual = vmiz.artifact_pipeline.parseSha256(
         parsed.value.certificate_sha256,
     ) catch return error.InvalidSecureBootMetadata;
     if (!std.mem.eql(u8, &actual, &expected_certificate_sha256))
@@ -1620,9 +1620,9 @@ fn writeSecureBootMetadata(
     allocator: std.mem.Allocator,
     io: std.Io,
     metadata_path: []const u8,
-    certificate_sha256: zvmi.artifact_pipeline.Digest,
+    certificate_sha256: vmiz.artifact_pipeline.Digest,
 ) !void {
-    const fingerprint = zvmi.artifact_pipeline.formatSha256(certificate_sha256);
+    const fingerprint = vmiz.artifact_pipeline.formatSha256(certificate_sha256);
     const bytes = try std.json.Stringify.valueAlloc(
         allocator,
         .{
@@ -1675,7 +1675,7 @@ fn runVirtFwVars(
 
 fn efiSignatureDatabaseCertificateCount(
     database: []const u8,
-    certificate_sha256: zvmi.artifact_pipeline.Digest,
+    certificate_sha256: vmiz.artifact_pipeline.Digest,
 ) !usize {
     const efi_cert_x509_guid = [_]u8{
         0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
@@ -1723,7 +1723,7 @@ fn efiSignatureDatabaseCertificateCount(
             var signature_offset = signatures_start;
             while (signature_offset < list_end) : (signature_offset += signature_size) {
                 const certificate = database[signature_offset + 16 .. signature_offset + signature_size];
-                const digest = zvmi.artifact_pipeline.sha256Bytes(certificate);
+                const digest = vmiz.artifact_pipeline.sha256Bytes(certificate);
                 if (std.mem.eql(u8, &digest, &certificate_sha256))
                     matches += 1;
             }
@@ -1736,7 +1736,7 @@ fn efiSignatureDatabaseCertificateCount(
 fn validateEnrolledVarsJson(
     allocator: std.mem.Allocator,
     json: []const u8,
-    certificate_sha256: zvmi.artifact_pipeline.Digest,
+    certificate_sha256: vmiz.artifact_pipeline.Digest,
 ) !SecureBootTrustState {
     const global_variable_guid = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
     const image_security_database_guid = "d719b2cb-3d3a-4596-a3bc-dad00e67656f";
@@ -1767,9 +1767,9 @@ fn validateEnrolledVarsJson(
     var secure_boot_enable_seen = false;
     var custom_mode_disabled = false;
     var custom_mode_seen = false;
-    var pk_sha256: ?zvmi.artifact_pipeline.Digest = null;
-    var kek_sha256: ?zvmi.artifact_pipeline.Digest = null;
-    var db_sha256: ?zvmi.artifact_pipeline.Digest = null;
+    var pk_sha256: ?vmiz.artifact_pipeline.Digest = null;
+    var kek_sha256: ?vmiz.artifact_pipeline.Digest = null;
+    var db_sha256: ?vmiz.artifact_pipeline.Digest = null;
     var certificate_matches: usize = 0;
     for (variables.items) |variable_value| {
         const variable = switch (variable_value) {
@@ -1846,7 +1846,7 @@ fn validateEnrolledVarsJson(
                 database,
                 certificate_sha256,
             );
-            db_sha256 = zvmi.artifact_pipeline.sha256Bytes(database);
+            db_sha256 = vmiz.artifact_pipeline.sha256Bytes(database);
         }
     }
     if (!secure_boot_enable or
@@ -1868,14 +1868,14 @@ fn validateEnrolledVarsJson(
 fn sha256HexDataAlloc(
     allocator: std.mem.Allocator,
     data_hex: []const u8,
-) !zvmi.artifact_pipeline.Digest {
+) !vmiz.artifact_pipeline.Digest {
     if (data_hex.len == 0 or data_hex.len % 2 != 0)
         return error.InvalidEnrolledSecureBootVars;
     const data = try allocator.alloc(u8, data_hex.len / 2);
     defer allocator.free(data);
     _ = std.fmt.hexToBytes(data, data_hex) catch
         return error.InvalidEnrolledSecureBootVars;
-    return zvmi.artifact_pipeline.sha256Bytes(data);
+    return vmiz.artifact_pipeline.sha256Bytes(data);
 }
 
 fn enrollSecureBootVars(
@@ -1884,7 +1884,7 @@ fn enrollSecureBootVars(
     virt_fw_vars_path: []const u8,
     template_path: []const u8,
     certificate_path: []const u8,
-    certificate_sha256: zvmi.artifact_pipeline.Digest,
+    certificate_sha256: vmiz.artifact_pipeline.Digest,
     output_path: []const u8,
     validation_json_path: []const u8,
 ) !SecureBootTrustState {
@@ -1916,7 +1916,7 @@ fn validateSecureBootVars(
     virt_fw_vars_path: []const u8,
     vars_path: []const u8,
     validation_json_path: []const u8,
-    certificate_sha256: zvmi.artifact_pipeline.Digest,
+    certificate_sha256: vmiz.artifact_pipeline.Digest,
 ) !SecureBootTrustState {
     try runVirtFwVars(allocator, io, &.{
         virt_fw_vars_path,
@@ -1960,7 +1960,7 @@ fn prepareSecureBootVmStateAlloc(
         allocator,
         io,
         environ,
-        "zvmi-secure-boot-",
+        "vmiz-secure-boot-",
     );
     errdefer {
         std.Io.Dir.cwd().deleteTree(io, temp_dir) catch {};
@@ -2107,7 +2107,7 @@ fn prepareVmStateAlloc(
     if (!snapshot)
         return preparePersistentVmStateAlloc(allocator, io, persistent_vars_path);
 
-    const temp_dir = try createTemporaryWorkDirAlloc(allocator, io, environ, "zvmi-qemu-");
+    const temp_dir = try createTemporaryWorkDirAlloc(allocator, io, environ, "vmiz-qemu-");
     errdefer {
         std.Io.Dir.cwd().deleteTree(io, temp_dir) catch {};
         allocator.free(temp_dir);
@@ -2166,7 +2166,7 @@ fn createSnapshotOverlayAlloc(
     qemu_path: []const u8,
     temp_dir: []const u8,
     image_path: []const u8,
-    image_format: zvmi.Format,
+    image_format: vmiz.Format,
 ) ![]u8 {
     const qemu_img_path = try resolveQemuImgPathAlloc(allocator, io, environ, qemu_path);
     defer allocator.free(qemu_img_path);
@@ -2176,7 +2176,7 @@ fn createSnapshotOverlayAlloc(
         allocator,
         io,
         temp_dir,
-        "zvmi-qemu-overlay-",
+        "vmiz-qemu-overlay-",
         ".qcow2",
     );
     errdefer allocator.free(overlay_path);
@@ -2737,7 +2737,7 @@ fn buildOvfEnvAlloc(
         \\  <wa:ProvisioningSection>
         \\    <LinuxProvisioningConfigurationSet xmlns="http://schemas.microsoft.com/windowsazure">
         \\      <ConfigurationSetType>LinuxProvisioningConfiguration</ConfigurationSetType>
-        \\      <HostName>zvmi-local</HostName>
+        \\      <HostName>vmiz-local</HostName>
         \\      <UserName>
     );
     try appendXmlEscaped(&output, allocator, username);
@@ -2760,7 +2760,7 @@ fn buildOvfEnvAlloc(
 fn buildNoCloudMetaDataAlloc(allocator: std.mem.Allocator, instance_id: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "instance-id: {s}\nlocal-hostname: zvmi-local\n",
+        "instance-id: {s}\nlocal-hostname: vmiz-local\n",
         .{instance_id},
     );
 }
@@ -2826,7 +2826,7 @@ fn createSeedStateAlloc(
     const xorriso_path = try resolveXorrisoAlloc(allocator, io, environ, options.xorriso_path);
     defer allocator.free(xorriso_path);
 
-    const work_dir = try createTemporaryWorkDirAlloc(allocator, io, environ, "zvmi-qemu-seed-");
+    const work_dir = try createTemporaryWorkDirAlloc(allocator, io, environ, "vmiz-qemu-seed-");
     errdefer {
         std.Io.Dir.cwd().deleteTree(io, work_dir) catch {};
         allocator.free(work_dir);
@@ -3795,15 +3795,15 @@ test "qemu auto accelerator follows host capabilities" {
 }
 
 test "qemu architecture inference uses only recognized GPT root or usr GUIDs" {
-    const x86 = [_]zvmi.gpt.PartitionEntry{.{
-        .partition_type_guid = zvmi.guid.linux_root_x86_64,
+    const x86 = [_]vmiz.gpt.PartitionEntry{.{
+        .partition_type_guid = vmiz.guid.linux_root_x86_64,
     }};
-    const arm = [_]zvmi.gpt.PartitionEntry{.{
-        .partition_type_guid = zvmi.guid.linux_usr_aarch64,
+    const arm = [_]vmiz.gpt.PartitionEntry{.{
+        .partition_type_guid = vmiz.guid.linux_usr_aarch64,
     }};
-    const ambiguous = [_]zvmi.gpt.PartitionEntry{
-        .{ .partition_type_guid = zvmi.guid.linux_root_x86_64 },
-        .{ .partition_type_guid = zvmi.guid.linux_root_aarch64 },
+    const ambiguous = [_]vmiz.gpt.PartitionEntry{
+        .{ .partition_type_guid = vmiz.guid.linux_root_x86_64 },
+        .{ .partition_type_guid = vmiz.guid.linux_root_aarch64 },
     };
     try std.testing.expectEqual(qemu_host.GuestArchitecture.x86_64, try inferArchitectureFromGpt(&x86));
     try std.testing.expectEqual(qemu_host.GuestArchitecture.aarch64, try inferArchitectureFromGpt(&arm));
@@ -3839,7 +3839,7 @@ test "qemu detects supported image signatures without fully opening the image" {
     });
     const qcow2_path = try tmp.dir.realPathFileAlloc(io, "disk.qcow2", allocator);
     defer allocator.free(qcow2_path);
-    try std.testing.expectEqual(zvmi.Format.qcow2, try detectImageFormat(io, qcow2_path));
+    try std.testing.expectEqual(vmiz.Format.qcow2, try detectImageFormat(io, qcow2_path));
 
     try tmp.dir.writeFile(io, .{
         .sub_path = "disk.vhdx",
@@ -3847,7 +3847,7 @@ test "qemu detects supported image signatures without fully opening the image" {
     });
     const vhdx_path = try tmp.dir.realPathFileAlloc(io, "disk.vhdx", allocator);
     defer allocator.free(vhdx_path);
-    try std.testing.expectEqual(zvmi.Format.vhdx, try detectImageFormat(io, vhdx_path));
+    try std.testing.expectEqual(vmiz.Format.vhdx, try detectImageFormat(io, vhdx_path));
 
     try tmp.dir.writeFile(io, .{
         .sub_path = "disk.raw",
@@ -3855,7 +3855,7 @@ test "qemu detects supported image signatures without fully opening the image" {
     });
     const raw_path = try tmp.dir.realPathFileAlloc(io, "disk.raw", allocator);
     defer allocator.free(raw_path);
-    try std.testing.expectEqual(zvmi.Format.raw, try detectImageFormat(io, raw_path));
+    try std.testing.expectEqual(vmiz.Format.raw, try detectImageFormat(io, raw_path));
 }
 
 test "qemu Secure Boot validated image link survives source path replacement" {
@@ -4031,7 +4031,7 @@ test "qemu Secure Boot trust fails before inspecting untrusted image contents" {
             io,
             .{
                 .secure_boot = true,
-                .secure_boot_certificate_sha256 = zvmi.artifact_pipeline.sha256Bytes("wrong leaf"),
+                .secure_boot_certificate_sha256 = vmiz.artifact_pipeline.sha256Bytes("wrong leaf"),
             },
             known,
             true,
@@ -4068,7 +4068,7 @@ test "qemu Secure Boot state requires matching vars and metadata" {
         &.{ root_buf[0..root_len], "state.vars.json" },
     );
     defer allocator.free(metadata_path);
-    const digest = zvmi.artifact_pipeline.sha256Bytes("release leaf");
+    const digest = vmiz.artifact_pipeline.sha256Bytes("release leaf");
 
     try std.testing.expect(!try secureBootStateExists(
         io,
@@ -4101,7 +4101,7 @@ test "qemu Secure Boot state requires matching vars and metadata" {
             allocator,
             io,
             metadata_path,
-            zvmi.artifact_pipeline.sha256Bytes("other leaf"),
+            vmiz.artifact_pipeline.sha256Bytes("other leaf"),
         ),
     );
 }
@@ -4119,7 +4119,7 @@ test "qemu validates the exact release leaf in enrolled vars JSON" {
     std.mem.writeInt(u32, database[20..24], 0, .little);
     std.mem.writeInt(u32, database[24..28], 16 + certificate.len, .little);
     @memcpy(database[28 + 16 ..], certificate);
-    const digest = zvmi.artifact_pipeline.sha256Bytes(certificate);
+    const digest = vmiz.artifact_pipeline.sha256Bytes(certificate);
     try std.testing.expectEqual(
         @as(usize, 1),
         try efiSignatureDatabaseCertificateCount(&database, digest),
@@ -4169,14 +4169,14 @@ test "qemu validates the exact release leaf in enrolled vars JSON" {
     const trust_state = try validateEnrolledVarsJson(allocator, json, digest);
     var changed_trust_state = trust_state;
     changed_trust_state.pk_sha256 =
-        zvmi.artifact_pipeline.sha256Bytes("different platform key");
+        vmiz.artifact_pipeline.sha256Bytes("different platform key");
     try std.testing.expect(!changed_trust_state.eql(trust_state));
     try std.testing.expectError(
         error.InvalidEnrolledSecureBootVars,
         validateEnrolledVarsJson(
             allocator,
             json,
-            zvmi.artifact_pipeline.sha256Bytes("other certificate"),
+            vmiz.artifact_pipeline.sha256Bytes("other certificate"),
         ),
     );
 
@@ -4704,15 +4704,15 @@ test "qemu-img snapshot overlay argv is explicit" {
 
 test "qemu release download specs remain pinned to validated releases" {
     try std.testing.expectEqualStrings(
-        "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260814",
+        "cataggar/vmiz/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260814",
         default_image_spec,
     );
     try std.testing.expectEqualStrings(
-        "cataggar/zvmi/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260814",
+        "cataggar/vmiz/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260814",
         known_images[0].release_spec,
     );
     try std.testing.expectEqualStrings(
-        "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260814",
+        "cataggar/vmiz/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260814",
         known_images[1].release_spec,
     );
     try std.testing.expectEqualStrings(
@@ -4724,19 +4724,19 @@ test "qemu release download specs remain pinned to validated releases" {
         known_images[3].image_sha256,
     );
     try std.testing.expectEqualStrings(
-        "cataggar/zvmi/AzureLinux-4.0-x86_64.core.qcow2@AzureLinux-4.0-20260814",
+        "cataggar/vmiz/AzureLinux-4.0-x86_64.core.qcow2@AzureLinux-4.0-20260814",
         known_images[2].release_spec,
     );
     try std.testing.expectEqualStrings(
-        "cataggar/zvmi/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260814",
+        "cataggar/vmiz/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260814",
         known_images[3].release_spec,
     );
     try std.testing.expectEqualStrings(
-        "cataggar/zvmi/FreeBSD-15.1-x86_64.qcow2@FreeBSD-15.1-20260724",
+        "cataggar/vmiz/FreeBSD-15.1-x86_64.qcow2@FreeBSD-15.1-20260724",
         known_images[4].release_spec,
     );
     try std.testing.expectEqualStrings(
-        "cataggar/zvmi/FreeBSD-15.1-aarch64.qcow2@FreeBSD-15.1-20260724",
+        "cataggar/vmiz/FreeBSD-15.1-aarch64.qcow2@FreeBSD-15.1-20260724",
         known_images[5].release_spec,
     );
     for (known_images[0..4]) |known| {
@@ -4746,7 +4746,7 @@ test "qemu release download specs remain pinned to validated releases" {
         );
     }
     for (known_images) |known| {
-        _ = try zvmi.artifact_pipeline.parseSha256(known.image_sha256);
+        _ = try vmiz.artifact_pipeline.parseSha256(known.image_sha256);
     }
 }
 
@@ -4762,7 +4762,7 @@ test "qemu known image download argv is exact" {
     try expectArgv(&.{
         "ghr",
         "download",
-        "cataggar/zvmi/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260814",
+        "cataggar/vmiz/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260814",
         "--sha256",
         "590c6eddbbbc952ff21c8d9a026ae16e10f22ad71e940dc87c10e5e8016ef544",
         "--output",
@@ -4784,7 +4784,7 @@ test "qemu core image download argv is exact" {
     try expectArgv(&.{
         "ghr",
         "download",
-        "cataggar/zvmi/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260814",
+        "cataggar/vmiz/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260814",
         "--sha256",
         "ff294c8655ea80f890a41a7c6dc545d997da498dc5f5f03fd3aee8dea81b0f65",
         "--output",
@@ -4804,7 +4804,7 @@ test "qemu FreeBSD image download argv is exact" {
     try expectArgv(&.{
         "ghr",
         "download",
-        "cataggar/zvmi/FreeBSD-15.1-aarch64.qcow2@FreeBSD-15.1-20260724",
+        "cataggar/vmiz/FreeBSD-15.1-aarch64.qcow2@FreeBSD-15.1-20260724",
         "--sha256",
         "28f2138af20c4ede674f18922b216ad673816882e6270414f2bae5c6feff4b1e",
         "--output",

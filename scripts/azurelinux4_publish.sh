@@ -16,7 +16,7 @@ for tool in gh python3 sha256sum; do
 done
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
 [[ "$RELEASE_TAG" == AzureLinux-4.0-20260814 ]]
-[[ "$REPOSITORY" == cataggar/zvmi ]]
+[[ "$REPOSITORY" == cataggar/vmiz ]]
 
 mkdir -p "$STAGING_ROOT"
 assets_dir="$STAGING_ROOT/assets"

@@ -1,6 +1,6 @@
 # UKI signing certificates
 
-`zvmi uki certificate` extracts the X.509 certificate identified by the
+`vmiz uki certificate` extracts the X.509 certificate identified by the
 Authenticode CMS `SignerInfo` in a disk image's UKIs. It reads the image,
 GPT, FAT32 ESP, PE certificate table, CMS, and X.509 data natively; it does
 not mount the image or invoke OpenSSL, `sbverify`, or guest code.
@@ -8,7 +8,7 @@ not mount the image or invoke OpenSSL, `sbverify`, or guest code.
 ## Export PEM
 
 ```console
-zvmi uki certificate AzureLinux-4.0-x86_64.qcow2 \
+vmiz uki certificate AzureLinux-4.0-x86_64.qcow2 \
   --output release.pem
 ```
 
@@ -19,7 +19,7 @@ atomically only after the complete image passes inspection.
 To require a previously trusted canonical-DER SHA-256 fingerprint:
 
 ```console
-zvmi uki certificate AzureLinux-4.0-x86_64.qcow2 \
+vmiz uki certificate AzureLinux-4.0-x86_64.qcow2 \
   --output release.pem \
   --expected-sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
@@ -32,7 +32,7 @@ output.
 Use `--output=json` for machine-readable output on stdout:
 
 ```console
-zvmi uki certificate AzureLinux-4.0-aarch64.qcow2 --output=json
+vmiz uki certificate AzureLinux-4.0-aarch64.qcow2 --output=json
 ```
 
 The version 1 document contains:
@@ -61,7 +61,7 @@ including a leading zero octet when present.
 ## Image requirements
 
 The command supports raw, fixed or dynamic VHD, VHDX, and standalone QCOW2
-through `zvmi.Image`. QCOW2 backing files and external data files are rejected
+through `vmiz.Image`. QCOW2 backing files and external data files are rejected
 so the inspected result cannot depend on separately mutable host files.
 
 The image must have:

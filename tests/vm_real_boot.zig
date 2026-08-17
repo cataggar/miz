@@ -8,19 +8,19 @@
 //!
 //! It needs a kernel, so it is opt-in and told where to find one:
 //!
-//!   ZVMI_RUN_VM_BOOT_TEST=1
-//!   ZVMI_VM_BOOT_KERNEL=/path/to/vmlinuz-<release>
-//!   ZVMI_VM_BOOT_MODULES_BUILTIN=/path/to/modules.builtin
-//!   ZVMI_VM_BOOT_MODULE_TREE=/path/to/lib/modules/<release>   (optional)
-//!   ZVMI_VM_QEMU=/path/to/qemu-system-<arch>
-//!   ZVMI_VM_ACCEL=software|hardware        (default: software)
-//!   ZVMI_VM_BOOT_ARCH=x86_64|aarch64       (default: the host's)
-//!   ZVMI_VM_BOOT_WORKDIR=/path             (default: /tmp)
+//!   VMIZ_RUN_VM_BOOT_TEST=1
+//!   VMIZ_VM_BOOT_KERNEL=/path/to/vmlinuz-<release>
+//!   VMIZ_VM_BOOT_MODULES_BUILTIN=/path/to/modules.builtin
+//!   VMIZ_VM_BOOT_MODULE_TREE=/path/to/lib/modules/<release>   (optional)
+//!   VMIZ_VM_QEMU=/path/to/qemu-system-<arch>
+//!   VMIZ_VM_ACCEL=software|hardware        (default: software)
+//!   VMIZ_VM_BOOT_ARCH=x86_64|aarch64       (default: the host's)
+//!   VMIZ_VM_BOOT_WORKDIR=/path             (default: /tmp)
 //!
 //! `modules.builtin` comes from the same kernel package and is what decides
 //! how the guest's disks are attached, so it is required rather than inferred.
 //!
-//! `ZVMI_VM_BOOT_MODULE_TREE` points at a real `lib/modules/<release>`, which
+//! `VMIZ_VM_BOOT_MODULE_TREE` points at a real `lib/modules/<release>`, which
 //! is staged into the image verbatim: this test computes no dependency closure
 //! of its own, so what a kernel that modularizes `ext4` or its virtio drivers
 //! boots on is the production resolver rather than a fixture agreeing with it.
@@ -31,7 +31,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -39,8 +39,8 @@ const Allocator = std.mem.Allocator;
 const guest_stub = @import("vm_guest_stub.zig");
 
 const guest_agents = std.StaticStringMap([]const u8).initComptime(.{
-    .{ "x86_64", @embedFile("zvmi_guest_agent_x86_64") },
-    .{ "aarch64", @embedFile("zvmi_guest_agent_aarch64") },
+    .{ "x86_64", @embedFile("vmiz_guest_agent_x86_64") },
+    .{ "aarch64", @embedFile("vmiz_guest_agent_aarch64") },
 });
 const guest_stubs = std.StaticStringMap([]const u8).initComptime(.{
     .{ "x86_64", @embedFile("vm_guest_stub_x86_64") },
@@ -50,8 +50,8 @@ const guest_stubs = std.StaticStringMap([]const u8).initComptime(.{
 const disk_size: u64 = 512 * 1024 * 1024;
 const partition_first_lba: u32 = 2048;
 const partition_sectors: u32 = 900 * 1024;
-const partition_offset = @as(u64, partition_first_lba) * zvmi.mbr.sector_size;
-const partition_length = @as(u64, partition_sectors) * zvmi.mbr.sector_size;
+const partition_offset = @as(u64, partition_first_lba) * vmiz.mbr.sector_size;
+const partition_length = @as(u64, partition_sectors) * vmiz.mbr.sector_size;
 
 /// Written by the `rpm` stub from inside the guest's chroot. Its presence in
 /// the published image is the proof that matters: the guest booted, found the
@@ -63,7 +63,7 @@ const installed_nevra = guest_stub.installed_nevra;
 /// The hook the run declares: a script the host reads, carries through the
 /// control document, and the guest executes with the image's own interpreter.
 const hook_name = "records-its-arguments";
-const hook_phase: zvmi.customize.HookPhase = .after_packages;
+const hook_phase: vmiz.customize.HookPhase = .after_packages;
 const hook_script = "#!" ++ guest_stub.hook_interpreter_path ++ "\n" ++
     "# the interpreter never reads this; the kernel only needs the line above\n";
 
@@ -85,23 +85,23 @@ const Settings = struct {
     /// the case this test has always run: a kernel that needs nothing loaded.
     module_tree_path: ?[]const u8,
     emulator_path: []const u8,
-    acceleration: zvmi.customize.VmAcceleration,
+    acceleration: vmiz.customize.VmAcceleration,
     /// The guest's architecture: what the image is, what the kernel is, and
     /// what the emulator has to emulate.
-    architecture: zvmi.customize.Architecture,
-    host_architecture: zvmi.customize.Architecture,
+    architecture: vmiz.customize.Architecture,
+    host_architecture: vmiz.customize.Architecture,
     work_root: []const u8,
 
     fn fromEnvironment(environment: *std.process.Environ.Map) ?Settings {
-        const requested = environment.get("ZVMI_RUN_VM_BOOT_TEST") orelse "";
+        const requested = environment.get("VMIZ_RUN_VM_BOOT_TEST") orelse "";
         if (!std.mem.eql(u8, requested, "1")) {
             std.debug.print(
-                "skipping vm real boot: set ZVMI_RUN_VM_BOOT_TEST=1 to opt in\n",
+                "skipping vm real boot: set VMIZ_RUN_VM_BOOT_TEST=1 to opt in\n",
                 .{},
             );
             return null;
         }
-        const host_architecture: zvmi.customize.Architecture = switch (builtin.cpu.arch) {
+        const host_architecture: vmiz.customize.Architecture = switch (builtin.cpu.arch) {
             .x86_64 => .x86_64,
             .aarch64 => .aarch64,
             else => {
@@ -109,37 +109,37 @@ const Settings = struct {
                 return null;
             },
         };
-        const named = environment.get("ZVMI_VM_BOOT_ARCH") orelse @tagName(host_architecture);
+        const named = environment.get("VMIZ_VM_BOOT_ARCH") orelse @tagName(host_architecture);
         const architecture = std.meta.stringToEnum(
-            zvmi.customize.Architecture,
+            vmiz.customize.Architecture,
             named,
         ) orelse {
-            std.debug.print("skipping vm real boot: unknown ZVMI_VM_BOOT_ARCH {s}\n", .{named});
+            std.debug.print("skipping vm real boot: unknown VMIZ_VM_BOOT_ARCH {s}\n", .{named});
             return null;
         };
         return .{
-            .kernel_path = environment.get("ZVMI_VM_BOOT_KERNEL") orelse {
-                std.debug.print("skipping vm real boot: ZVMI_VM_BOOT_KERNEL is unset\n", .{});
+            .kernel_path = environment.get("VMIZ_VM_BOOT_KERNEL") orelse {
+                std.debug.print("skipping vm real boot: VMIZ_VM_BOOT_KERNEL is unset\n", .{});
                 return null;
             },
-            .modules_builtin_path = environment.get("ZVMI_VM_BOOT_MODULES_BUILTIN") orelse {
+            .modules_builtin_path = environment.get("VMIZ_VM_BOOT_MODULES_BUILTIN") orelse {
                 std.debug.print(
-                    "skipping vm real boot: ZVMI_VM_BOOT_MODULES_BUILTIN is unset\n",
+                    "skipping vm real boot: VMIZ_VM_BOOT_MODULES_BUILTIN is unset\n",
                     .{},
                 );
                 return null;
             },
-            .emulator_path = environment.get("ZVMI_VM_QEMU") orelse {
-                std.debug.print("skipping vm real boot: ZVMI_VM_QEMU is unset\n", .{});
+            .emulator_path = environment.get("VMIZ_VM_QEMU") orelse {
+                std.debug.print("skipping vm real boot: VMIZ_VM_QEMU is unset\n", .{});
                 return null;
             },
-            .module_tree_path = environment.get("ZVMI_VM_BOOT_MODULE_TREE"),
+            .module_tree_path = environment.get("VMIZ_VM_BOOT_MODULE_TREE"),
             // Software emulation is the default because the runners this is
             // expected to run on have no accelerator, and a test that demands
             // one is a test that is usually skipped.
             .acceleration = if (std.mem.eql(
                 u8,
-                environment.get("ZVMI_VM_ACCEL") orelse "software",
+                environment.get("VMIZ_VM_ACCEL") orelse "software",
                 "hardware",
             )) .hardware else .software,
             .architecture = architecture,
@@ -147,7 +147,7 @@ const Settings = struct {
             // A boot needs room for two copies of the image, and the default
             // temporary directory is frequently a small tmpfs, so where the
             // workspace lands has to be the caller's decision.
-            .work_root = environment.get("ZVMI_VM_BOOT_WORKDIR") orelse "/tmp",
+            .work_root = environment.get("VMIZ_VM_BOOT_WORKDIR") orelse "/tmp",
         };
     }
 };
@@ -162,7 +162,7 @@ fn runBoot(
     const random_hex = std.fmt.bytesToHex(random, .lower);
     const work_path = try std.fmt.allocPrint(
         allocator,
-        "{s}/zvmi-vm-boot-{s}",
+        "{s}/vmiz-vm-boot-{s}",
         .{ settings.work_root, &random_hex },
     );
     const source_path = try std.fs.path.join(allocator, &.{ work_path, "source.raw" });
@@ -185,7 +185,7 @@ fn runBoot(
     );
     const source_digest = try digestOfFile(io, source_path);
 
-    const request = zvmi.customize.Request{
+    const request = vmiz.customize.Request{
         .target_architecture = settings.architecture,
         .input = .{ .disk = .{ .path = source_path } },
         .output = .{
@@ -231,7 +231,7 @@ fn runBoot(
             .source_date_epoch = 1_735_689_600,
         },
     };
-    var resolved = try zvmi.customize.resolve(allocator, &request, .{
+    var resolved = try vmiz.customize.resolve(allocator, &request, .{
         .host_architecture = settings.host_architecture,
     });
     defer resolved.deinit(allocator);
@@ -239,11 +239,11 @@ fn runBoot(
     if (resolved.diagnostics.hasErrors()) return error.ResolutionReportedErrors;
     const transaction_path = try allocator.dupe(u8, plan.data.transaction_path);
 
-    var platform = zvmi.customize.Platform.system();
+    var platform = vmiz.customize.Platform.system();
     platform.vmCheckFn = checkVm;
     platform.vmRunFn = runVm;
 
-    var report = try zvmi.customize.preflight(allocator, io, plan, platform);
+    var report = try vmiz.customize.preflight(allocator, io, plan, platform);
     defer report.deinit(allocator);
     if (!report.ready()) {
         for (report.capabilities) |capability| {
@@ -257,7 +257,7 @@ fn runBoot(
     }
 
     const started = Io.Clock.awake.now(io);
-    var outcome = try zvmi.customize.execute(allocator, io, plan, platform, null);
+    var outcome = try vmiz.customize.execute(allocator, io, plan, platform, null);
     defer outcome.deinit(allocator);
     const elapsed_ms: u64 = @intCast(@divTrunc(
         Io.Clock.awake.now(io).nanoseconds - started.nanoseconds,
@@ -337,20 +337,20 @@ fn runBoot(
 fn checkVm(
     _: ?*anyopaque,
     io: Io,
-    plan: *const zvmi.customize.ResolvedPlan,
-) zvmi.customize.CapabilityState {
-    return zvmi.vm_backend.available(io, plan);
+    plan: *const vmiz.customize.ResolvedPlan,
+) vmiz.customize.CapabilityState {
+    return vmiz.vm_backend.available(io, plan);
 }
 
 fn runVm(
     _: ?*anyopaque,
     allocator: Allocator,
     io: Io,
-    plan: *const zvmi.customize.ResolvedPlan,
-    target: zvmi.preserved_image.RawMutationTarget,
-    deadline: zvmi.customize.Deadline,
-) !zvmi.customize.VmRuntimeReport {
-    return zvmi.vm_backend.run(allocator, io, .{
+    plan: *const vmiz.customize.ResolvedPlan,
+    target: vmiz.preserved_image.RawMutationTarget,
+    deadline: vmiz.customize.Deadline,
+) !vmiz.customize.VmRuntimeReport {
+    return vmiz.vm_backend.run(allocator, io, .{
         .deadline = deadline,
         .plan = plan,
         .transaction_path = plan.data.transaction_path,
@@ -380,7 +380,7 @@ fn createSourceDisk(
         io,
         settings.kernel_path,
         allocator,
-        .limited(zvmi.vm_payload.max_kernel_bytes),
+        .limited(vmiz.vm_payload.max_kernel_bytes),
     );
     const modules_builtin = try cwd.readFileAlloc(
         io,
@@ -391,15 +391,15 @@ fn createSourceDisk(
     const release = releaseFromKernelPath(settings.kernel_path) orelse
         return error.KernelPathDoesNotNameARelease;
 
-    var image = try zvmi.Image.createExclusive(io, source_path, .raw, disk_size, .{});
+    var image = try vmiz.Image.createExclusive(io, source_path, .raw, disk_size, .{});
     defer image.close(io);
-    const boot_record = zvmi.mbr.singleLinuxPartitionMbr(
+    const boot_record = vmiz.mbr.singleLinuxPartitionMbr(
         partition_first_lba,
         partition_sectors,
     ).encode();
     try image.pwrite(io, &boot_record, 0);
 
-    var tree = try zvmi.root_tree.RootTree.init(allocator, io, spool_path, .{});
+    var tree = try vmiz.root_tree.RootTree.init(allocator, io, spool_path, .{});
     defer tree.deinit();
     inline for (.{
         "boot",    "dev",         "etc", "lib",     "proc",
@@ -446,7 +446,7 @@ fn createSourceDisk(
         guest_stubs.get(@tagName(settings.architecture)).?,
         .{ .mode = 0o755 },
     );
-    _ = try zvmi.ext4.populate(io, image.file, allocator, try tree.ext4View(), .{
+    _ = try vmiz.ext4.populate(io, image.file, allocator, try tree.ext4View(), .{
         .offset = partition_offset,
         .length = partition_length,
         .label = "vm-boot",
@@ -467,7 +467,7 @@ fn createSourceDisk(
 fn stageModuleTree(
     allocator: Allocator,
     io: Io,
-    tree: *zvmi.root_tree.RootTree,
+    tree: *vmiz.root_tree.RootTree,
     module_directory: []const u8,
     source_path: []const u8,
 ) !void {
@@ -535,9 +535,9 @@ fn expectGuestFile(
     guest_path: []const u8,
     expected: []const u8,
 ) !void {
-    var image = try zvmi.Image.openPathReadOnly(io, image_path);
+    var image = try vmiz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
-    var reader = try zvmi.ext4.open(io, image.file, allocator, .{
+    var reader = try vmiz.ext4.open(io, image.file, allocator, .{
         .offset = partition_offset,
     });
     defer reader.deinit();
@@ -552,9 +552,9 @@ fn expectMissingGuestFile(
     image_path: []const u8,
     guest_path: []const u8,
 ) !void {
-    var image = try zvmi.Image.openPathReadOnly(io, image_path);
+    var image = try vmiz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
-    var reader = try zvmi.ext4.open(io, image.file, allocator, .{
+    var reader = try vmiz.ext4.open(io, image.file, allocator, .{
         .offset = partition_offset,
     });
     defer reader.deinit();

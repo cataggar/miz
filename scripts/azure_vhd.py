@@ -72,7 +72,7 @@ def validate_azure_vhd_footer(
     if features != 2 or version != 0x00010000:
         fail("derived upload VHD footer version is invalid")
     if (
-        footer[28:32] != b"zvmi"
+        footer[28:32] != b"vmiz"
         or creator_version != 0x00010000
         or footer[36:40] != b"\0" * 4
     ):

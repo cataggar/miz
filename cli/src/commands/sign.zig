@@ -1,10 +1,10 @@
-//! `zvmi sign` implements the external UKI signer protocol used by the
+//! `vmiz sign` implements the external UKI signer protocol used by the
 //! Azure Linux release builder. The private key remains in Azure Artifact
 //! Signing; this command exchanges GitHub OIDC for a short-lived token and
 //! submits only the Authenticode signed-attributes digest.
 
 const std = @import("std");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 const atomic_output = @import("../atomic_output.zig");
 
 const Allocator = std.mem.Allocator;
@@ -21,9 +21,9 @@ const artifact_signing_provider = "azure-artifact-signing";
 const github_actions_host_suffix = ".actions.githubusercontent.com";
 const oidc_audience = "api%3A%2F%2FAzureADTokenExchange";
 const decodePemCertificateAlloc =
-    zvmi.authenticode.decodePemCertificateAlloc;
+    vmiz.authenticode.decodePemCertificateAlloc;
 const encodePemCertificateAlloc =
-    zvmi.authenticode.encodePemCertificateAlloc;
+    vmiz.authenticode.encodePemCertificateAlloc;
 
 const OidcResponse = struct {
     value: []const u8,
@@ -51,13 +51,13 @@ pub fn run(
         exportCertificateFallible(allocator, io, environ, args[1])
     else {
         std.debug.print(
-            "usage: zvmi sign [certificate <absolute-output.pem>]\n",
+            "usage: vmiz sign [certificate <absolute-output.pem>]\n",
             .{},
         );
         return 1;
     };
     result catch |err| {
-        std.debug.print("zvmi sign: failed: {s}\n", .{@errorName(err)});
+        std.debug.print("vmiz sign: failed: {s}\n", .{@errorName(err)});
         return 1;
     };
     return 0;
@@ -67,31 +67,31 @@ fn runFallible(allocator: Allocator, io: Io, environ: Environ) !void {
     const unsigned_path = try requiredEnvAlloc(
         allocator,
         environ,
-        "ZVMI_UKI_UNSIGNED",
+        "VMIZ_UKI_UNSIGNED",
     );
     defer allocator.free(unsigned_path);
     const signed_path = try requiredEnvAlloc(
         allocator,
         environ,
-        "ZVMI_UKI_SIGNED",
+        "VMIZ_UKI_SIGNED",
     );
     defer allocator.free(signed_path);
     const certificate_path = try requiredEnvAlloc(
         allocator,
         environ,
-        "ZVMI_UKI_CERTIFICATE",
+        "VMIZ_UKI_CERTIFICATE",
     );
     defer allocator.free(certificate_path);
     const expected_unsigned_text = try requiredEnvAlloc(
         allocator,
         environ,
-        "ZVMI_UKI_UNSIGNED_SHA256",
+        "VMIZ_UKI_UNSIGNED_SHA256",
     );
     defer allocator.free(expected_unsigned_text);
     const expected_certificate_text = try requiredEnvAlloc(
         allocator,
         environ,
-        "ZVMI_UKI_CERTIFICATE_SHA256",
+        "VMIZ_UKI_CERTIFICATE_SHA256",
     );
     defer allocator.free(expected_certificate_text);
     var provider = try ArtifactSigningEnvironment.init(
@@ -107,10 +107,10 @@ fn runFallible(allocator: Allocator, io: Io, environ: Environ) !void {
         .limited(max_unsigned_bytes),
     );
     defer allocator.free(unsigned);
-    const expected_unsigned = try zvmi.artifact_pipeline.parseSha256(
+    const expected_unsigned = try vmiz.artifact_pipeline.parseSha256(
         expected_unsigned_text,
     );
-    const actual_unsigned = zvmi.artifact_pipeline.sha256Bytes(unsigned);
+    const actual_unsigned = vmiz.artifact_pipeline.sha256Bytes(unsigned);
     if (!std.mem.eql(u8, &actual_unsigned, &expected_unsigned))
         return error.UnsignedUkiDigestMismatch;
 
@@ -126,16 +126,16 @@ fn runFallible(allocator: Allocator, io: Io, environ: Environ) !void {
         certificate_pem,
     );
     defer allocator.free(certificate_der);
-    const expected_certificate = try zvmi.artifact_pipeline.parseSha256(
+    const expected_certificate = try vmiz.artifact_pipeline.parseSha256(
         expected_certificate_text,
     );
-    const actual_certificate = zvmi.artifact_pipeline.sha256Bytes(
+    const actual_certificate = vmiz.artifact_pipeline.sha256Bytes(
         certificate_der,
     );
     if (!std.mem.eql(u8, &actual_certificate, &expected_certificate))
         return error.SigningCertificateFingerprintMismatch;
 
-    var prepared = try zvmi.authenticode.prepareRsaSha256Alloc(
+    var prepared = try vmiz.authenticode.prepareRsaSha256Alloc(
         allocator,
         unsigned,
     );
@@ -163,18 +163,18 @@ fn runFallible(allocator: Allocator, io: Io, environ: Environ) !void {
     );
     defer signing_result.deinit(allocator);
 
-    var certificate_chain = try zvmi.authenticode
+    var certificate_chain = try vmiz.authenticode
         .parseArtifactSigningCertificateChainAlloc(
         allocator,
         signing_result.certificate_bundle,
     );
     defer certificate_chain.deinit(allocator);
-    const signing_certificate = try zvmi.authenticode
+    const signing_certificate = try vmiz.authenticode
         .artifactSigningCertificateDer(signing_result.certificate_bundle);
     if (!std.mem.eql(u8, signing_certificate, certificate_der))
         return error.ArtifactSigningCertificateMismatch;
 
-    const signed = try zvmi.authenticode.finishRsaSha256WithChainAlloc(
+    const signed = try vmiz.authenticode.finishRsaSha256WithChainAlloc(
         allocator,
         prepared,
         signing_certificate,
@@ -186,7 +186,7 @@ fn runFallible(allocator: Allocator, io: Io, environ: Environ) !void {
 
     const metadata_path_optional = environ.getAlloc(
         allocator,
-        "ZVMI_UKI_SIGNING_METADATA",
+        "VMIZ_UKI_SIGNING_METADATA",
     ) catch |err| switch (err) {
         error.EnvironmentVariableMissing => null,
         else => return err,
@@ -195,11 +195,11 @@ fn runFallible(allocator: Allocator, io: Io, environ: Environ) !void {
         defer allocator.free(metadata_path);
         if (metadata_path.len == 0 or !Dir.path.isAbsolute(metadata_path))
             return error.SigningMetadataPathMustBeAbsolute;
-        const leaf_sha256 = zvmi.artifact_pipeline.sha256Bytes(
+        const leaf_sha256 = vmiz.artifact_pipeline.sha256Bytes(
             signing_certificate,
         );
-        const leaf_sha256_hex = zvmi.artifact_pipeline.formatSha256(leaf_sha256);
-        const enrolled_certificate_sha256_hex = zvmi.artifact_pipeline.formatSha256(
+        const leaf_sha256_hex = vmiz.artifact_pipeline.formatSha256(leaf_sha256);
+        const enrolled_certificate_sha256_hex = vmiz.artifact_pipeline.formatSha256(
             actual_certificate,
         );
         const metadata = try std.json.Stringify.valueAlloc(
@@ -370,19 +370,19 @@ const ArtifactSigningEnvironment = struct {
         const tenant_id = try requiredEnvAlloc(
             allocator,
             environ,
-            "ZVMI_AZURE_TENANT_ID",
+            "VMIZ_AZURE_TENANT_ID",
         );
         errdefer allocator.free(tenant_id);
         const client_id = try requiredEnvAlloc(
             allocator,
             environ,
-            "ZVMI_AZURE_CLIENT_ID",
+            "VMIZ_AZURE_CLIENT_ID",
         );
         errdefer allocator.free(client_id);
         const endpoint_env = try requiredEnvAlloc(
             allocator,
             environ,
-            "ZVMI_ARTIFACT_SIGNING_ENDPOINT",
+            "VMIZ_ARTIFACT_SIGNING_ENDPOINT",
         );
         defer allocator.free(endpoint_env);
         const endpoint = try normalizeArtifactSigningEndpointAlloc(
@@ -393,13 +393,13 @@ const ArtifactSigningEnvironment = struct {
         const account = try requiredEnvAlloc(
             allocator,
             environ,
-            "ZVMI_ARTIFACT_SIGNING_ACCOUNT",
+            "VMIZ_ARTIFACT_SIGNING_ACCOUNT",
         );
         errdefer allocator.free(account);
         const profile = try requiredEnvAlloc(
             allocator,
             environ,
-            "ZVMI_ARTIFACT_SIGNING_PROFILE",
+            "VMIZ_ARTIFACT_SIGNING_PROFILE",
         );
         errdefer allocator.free(profile);
         const oidc_request_url = try requiredEnvAlloc(
@@ -651,7 +651,7 @@ fn signDigestWithArtifactSigningAlloc(
 fn reportUnknownArtifactSigningOperationStatus(status: []const u8) void {
     if (status.len == 0 or status.len > 64) {
         std.debug.print(
-            "zvmi sign: Artifact Signing returned a redacted operation status\n",
+            "vmiz sign: Artifact Signing returned a redacted operation status\n",
             .{},
         );
         return;
@@ -661,14 +661,14 @@ fn reportUnknownArtifactSigningOperationStatus(status: []const u8) void {
             byte != '_' and byte != '.')
         {
             std.debug.print(
-                "zvmi sign: Artifact Signing returned a redacted operation status\n",
+                "vmiz sign: Artifact Signing returned a redacted operation status\n",
                 .{},
             );
             return;
         }
     }
     std.debug.print(
-        "zvmi sign: Artifact Signing returned operation status: {s}\n",
+        "vmiz sign: Artifact Signing returned operation status: {s}\n",
         .{status},
     );
 }
@@ -697,7 +697,7 @@ fn fetchSigningCertificateAlloc(
     defer response.deinit(allocator);
     if (response.status != .ok)
         return error.ArtifactSigningCertificateFetchFailed;
-    try zvmi.authenticode.validateX509CertificateDer(response.body);
+    try vmiz.authenticode.validateX509CertificateDer(response.body);
     return allocator.dupe(u8, response.body);
 }
 
@@ -719,7 +719,7 @@ fn artifactRequestAlloc(
     const uri = try std.Uri.parse(url);
     const extra_headers = [_]std.http.Header{
         .{ .name = "Accept", .value = accept },
-        .{ .name = "client-version", .value = "zvmi/1" },
+        .{ .name = "client-version", .value = "vmiz/1" },
         .{ .name = "Authorization", .value = authorization },
     };
     // Zig 0.16 does not emit privileged_headers on the initial request.
@@ -1197,7 +1197,7 @@ test "Artifact Signing endpoints and resource names are constrained" {
         endpoint,
     );
     try validatePathSegment("cataggar");
-    try validatePathSegment("zvmi-uki");
+    try validatePathSegment("vmiz-uki");
     try std.testing.expectError(
         error.InvalidArtifactSigningEndpoint,
         normalizeArtifactSigningEndpointAlloc(
@@ -1214,7 +1214,7 @@ test "Artifact Signing endpoints and resource names are constrained" {
     );
     try std.testing.expectError(
         error.InvalidArtifactSigningResourceName,
-        validatePathSegment("../zvmi"),
+        validatePathSegment("../vmiz"),
     );
 }
 
@@ -1235,14 +1235,14 @@ test "Artifact Signing uses padded standard base64 and exact operation URLs" {
         .{
             .endpoint = "https://wus.codesigning.azure.net",
             .account = "cataggar",
-            .profile = "zvmi-uki",
+            .profile = "vmiz-uki",
         },
         "00000000-0000-4000-8000-000000000000",
     );
     defer std.testing.allocator.free(poll_url);
     try std.testing.expectEqualStrings(
         "https://wus.codesigning.azure.net/codesigningaccounts/cataggar/" ++
-            "certificateprofiles/zvmi-uki/sign/" ++
+            "certificateprofiles/vmiz-uki/sign/" ++
             "00000000-0000-4000-8000-000000000000?" ++
             "api-version=2024-06-15",
         poll_url,
@@ -1250,7 +1250,7 @@ test "Artifact Signing uses padded standard base64 and exact operation URLs" {
     const config: ArtifactSigningConfig = .{
         .endpoint = "https://wus.codesigning.azure.net",
         .account = "cataggar",
-        .profile = "zvmi-uki",
+        .profile = "vmiz-uki",
     };
     try std.testing.expectEqualStrings(
         "00000000-0000-4000-8000-000000000000",
@@ -1262,16 +1262,16 @@ test "Artifact Signing uses padded standard base64 and exact operation URLs" {
     );
     const invalid_locations = [_][]const u8{
         "https://eus.codesigning.azure.net/codesigningaccounts/cataggar/" ++
-            "certificateprofiles/zvmi-uki/sign/" ++
+            "certificateprofiles/vmiz-uki/sign/" ++
             "00000000-0000-4000-8000-000000000000?api-version=2024-06-15",
         "https://wus.codesigning.azure.net/codesigningaccounts/other/" ++
-            "certificateprofiles/zvmi-uki/sign/" ++
+            "certificateprofiles/vmiz-uki/sign/" ++
             "00000000-0000-4000-8000-000000000000?api-version=2024-06-15",
         "https://wus.codesigning.azure.net/codesigningaccounts/cataggar/" ++
             "certificateprofiles/other/sign/" ++
             "00000000-0000-4000-8000-000000000000?api-version=2024-06-15",
         "https://wus.codesigning.azure.net/codesigningaccounts/cataggar/" ++
-            "certificateprofiles/zvmi-uki/sign/" ++
+            "certificateprofiles/vmiz-uki/sign/" ++
             "00000000-0000-4000-8000-000000000000?api-version=2022-06-15",
     };
     for (invalid_locations) |location| {
@@ -1290,7 +1290,7 @@ test "Artifact Signing uses padded standard base64 and exact operation URLs" {
             std.testing.allocator,
             config,
             "https://wus.codesigning.azure.net/codesigningaccounts/cataggar/" ++
-                "certificateprofiles/zvmi-uki/sign/not-a-uuid?" ++
+                "certificateprofiles/vmiz-uki/sign/not-a-uuid?" ++
                 "api-version=2024-06-15",
         ),
     );
@@ -1509,7 +1509,7 @@ fn runMockArtifactSigningScenario(
     const config: ArtifactSigningConfig = .{
         .endpoint = endpoint,
         .account = "cataggar",
-        .profile = "zvmi-uki",
+        .profile = "vmiz-uki",
     };
     const poll_url = try expectedArtifactSigningPollUrlAlloc(
         allocator,

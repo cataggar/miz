@@ -6,17 +6,17 @@ Build a fixed, 1 MiB-aligned Azure-compatible VHD from the
 [Azure Linux 4.0 ISO](https://aka.ms/azurelinux-4.0-x86_64.iso) plus a
 container image, ready to upload as an Azure managed disk and run as a VM.
 See [Image building](image-building.md) for the implemented format,
-filesystem, container, boot, `zvmi build-image`, `zvmi build-iso`, and
-`zvmi recustomize-iso` workflows.
+filesystem, container, boot, `vmiz build-image`, `vmiz build-iso`, and
+`vmiz recustomize-iso` workflows.
 
 ## Layout
 
 ```
-zvmi/
+vmiz/
   build.zig               # top-level build graph
   build.zig.zon            # package manifest
   packages/
-    zvmi/                   # the core disk-image library
+    vmiz/                   # the core disk-image library
       src/
         root.zig             # public API surface
         image.zig            # format-agnostic Image (open/create/read/write,
@@ -81,12 +81,12 @@ zvmi/
                               #   label, PV header, metadata area, volume
                               #   group text, extent-to-offset mapping
         azure.zig              # 1 MiB alignment + Gen1/Gen2 partition-style
-                              #   checks (backs `zvmi azure fixup`)
+                              #   checks (backs `vmiz azure fixup`)
         deprovision.zig        # offline image generalization: resets
                               #   hostname/SSH host keys/machine-id/DHCP
                               #   state (+ optional user removal) directly
                               #   via ext4.Editor (backs
-                              #   `zvmi azure deprovision`; issue #110)
+                              #   `vmiz azure deprovision`; issue #110)
         tar.zig                # minimal private USTAR reader/writer shared by
                               #   OCI layer ingestion and COSI packaging
         zstd.zig               # minimal private raw-block zstd codec for COSI
@@ -132,7 +132,7 @@ zvmi/
                               #   can see the target root
         formats.zig           # Format enum (raw, vhd, vhdx, qcow2)
         size.zig              # qemu-img-style size suffix parsing (K/M/G/T)
-  zvmiguest/
+  vmizguest/
     main.zig                # the guest agent: a static, libc-free PID 1 that
                               #   runs inside the image's own initramfs on the
                               #   `vm` backend, applies the control document
@@ -151,32 +151,32 @@ zvmi/
     oci.zig                 # `addOciPull`: pull a layout beside a build
   cli/
     src/
-      main.zig               # `zvmi` executable entry point
-      image_builder.zig      # `zvmi-image-builder`: turns declared arguments
+      main.zig               # `vmiz` executable entry point
+      image_builder.zig      # `vmiz-image-builder`: turns declared arguments
                               #   into a customize request; pins a registry
                               #   tag before the request is built
-      iso_builder.zig        # `zvmi-iso-builder`: host driver for the exported
-                              #   addIso build helper (`zvmi.build_iso.build`)
-      recustomize_iso_builder.zig  # `zvmi-recustomize-iso-builder`: host driver
+      iso_builder.zig        # `vmiz-iso-builder`: host driver for the exported
+                              #   addIso build helper (`vmiz.build_iso.build`)
+      recustomize_iso_builder.zig  # `vmiz-recustomize-iso-builder`: host driver
                               #   for the exported addRecustomize helper
-                              #   (`zvmi.recustomize_iso.build`)
+                              #   (`vmiz.recustomize_iso.build`)
       commands/
-        create.zig            # `zvmi create`
-        info.zig              # `zvmi info`
-        convert.zig           # `zvmi convert`
-        resize.zig            # `zvmi resize`
-        check.zig             # `zvmi check`
-        map.zig               # `zvmi map`
+        create.zig            # `vmiz create`
+        info.zig              # `vmiz info`
+        convert.zig           # `vmiz convert`
+        resize.zig            # `vmiz resize`
+        check.zig             # `vmiz check`
+        map.zig               # `vmiz map`
         azure.zig             # Azure fixed-VHD derivation/readiness helpers
-        cosi.zig              # `zvmi cosi`
-        oci.zig               # `zvmi oci` transport and bundle commands
-        build_image.zig       # `zvmi build-image`
-        build_iso.zig         # `zvmi build-iso`
-        recustomize_iso.zig   # `zvmi recustomize-iso`
-        qemu.zig              # `zvmi qemu`
+        cosi.zig              # `vmiz cosi`
+        oci.zig               # `vmiz oci` transport and bundle commands
+        build_image.zig       # `vmiz build-image`
+        build_iso.zig         # `vmiz build-iso`
+        recustomize_iso.zig   # `vmiz recustomize-iso`
+        qemu.zig              # `vmiz qemu`
         opts.zig              # shared `-o subformat=...` parsing
-  zvminit/                  # minimal PID 1 for real-boot testing of
-                              #   --skip-iso-rootfs images (see zvminit/README.md)
+  vmizinit/                  # minimal PID 1 for real-boot testing of
+                              #   --skip-iso-rootfs images (see vmizinit/README.md)
   qmp/                      # native Zig QEMU Machine Protocol (QMP) client,
                               #   MIT licensed (see qmp/README.md)
   qemu/
@@ -187,7 +187,7 @@ zvmi/
   qcow2/                    # native Zig qcow2 reader/writer, MIT licensed
                               #   (see qcow2/README.md -- a separate,
                               #   standalone implementation from
-                              #   packages/zvmi/src/qcow2.zig, kept for its
+                              #   packages/vmiz/src/qcow2.zig, kept for its
                               #   CLI + qemu-img cross-validation
                               #   methodology; see issue #96)
   wireserver/
@@ -230,7 +230,7 @@ zvmi/
                               #   build-image output (Gen1/Gen2, --verity,
                               #   --boot-mode uki); driven by qmp, skips
                               #   gracefully when qemu-system-x86_64, OVMF, or
-                              #   the ZVMI_BOOT_TEST_* fixture env vars aren't
+                              #   the VMIZ_BOOT_TEST_* fixture env vars aren't
                               #   available
     freebsd15_boot.zig
                               #   opt-in generalized FreeBSD acceptance under
@@ -280,20 +280,20 @@ Four steps, cheapest first:
   ghr install cataggar/qemu@v11.0.91-z.15
   scripts/ci/fetch-vm-boot-kernel.sh fixtures/vm-boot-kernel
 
-  ZVMI_RUN_VM_BOOT_TEST=1 \
-  ZVMI_VM_BOOT_KERNEL=... ZVMI_VM_BOOT_MODULES_BUILTIN=... \
-  ZVMI_VM_QEMU=$(readlink -f "$(command -v qemu-system-$(uname -m))") \
+  VMIZ_RUN_VM_BOOT_TEST=1 \
+  VMIZ_VM_BOOT_KERNEL=... VMIZ_VM_BOOT_MODULES_BUILTIN=... \
+  VMIZ_VM_QEMU=$(readlink -f "$(command -v qemu-system-$(uname -m))") \
     zig build test-vm-real-boot
   ```
 
-  `ZVMI_VM_ACCEL` defaults to `software`, because no hosted runner class
+  `VMIZ_VM_ACCEL` defaults to `software`, because no hosted runner class
   guarantees `/dev/kvm` and a test that demands one is a test that quietly
-  stops running. `ZVMI_VM_BOOT_WORKDIR` (default `/tmp`) moves the workspace,
+  stops running. `VMIZ_VM_BOOT_WORKDIR` (default `/tmp`) moves the workspace,
   which needs room for two copies of the image.
-- The same test with `ZVMI_VM_BOOT_ARCH` naming the *other* architecture is the
+- The same test with `VMIZ_VM_BOOT_ARCH` naming the *other* architecture is the
   cross-architecture acceptance test: the kernel, the guest agent and the
   binary the guest executes are all the guest's, and only the emulator is the
-  host's. Pass the matching `ZVMI_VM_QEMU` and a kernel for that architecture.
+  host's. Pass the matching `VMIZ_VM_QEMU` and a kernel for that architecture.
   One `cataggar/qemu` ghr install supplies every `qemu-system-*`.
 
 - `zig build test-vm-firmware-boot` runs `tests/vm_firmware_boot.zig`, which
@@ -305,19 +305,19 @@ Four steps, cheapest first:
   ```
   ghr install cataggar/qemu@v11.0.91-z.15
 
-  ZVMI_RUN_VM_FIRMWARE_TEST=1 \
-  ZVMI_VM_FIRMWARE_IMAGE=/path/to/bootable.raw \
-  ZVMI_VM_FIRMWARE_MARKER='Welcome to Azure Linux' \
-  ZVMI_VM_QEMU=$(readlink -f "$(command -v qemu-system-$(uname -m))") \
+  VMIZ_RUN_VM_FIRMWARE_TEST=1 \
+  VMIZ_VM_FIRMWARE_IMAGE=/path/to/bootable.raw \
+  VMIZ_VM_FIRMWARE_MARKER='Welcome to Azure Linux' \
+  VMIZ_VM_QEMU=$(readlink -f "$(command -v qemu-system-$(uname -m))") \
     zig build test-vm-firmware-boot
   ```
 
-  With `ZVMI_VM_FIRMWARE_CODE`/`ZVMI_VM_FIRMWARE_VARS` unset, the firmware is
-  resolved through the same `qemu_host` search `zvmi qemu` uses, so the
+  With `VMIZ_VM_FIRMWARE_CODE`/`VMIZ_VM_FIRMWARE_VARS` unset, the firmware is
+  resolved through the same `qemu_host` search `vmiz qemu` uses, so the
   resolution path a real build takes is exercised too. Set
-  `ZVMI_VM_FIRMWARE_ARCH` to the other architecture for the cross-architecture
-  case, `ZVMI_VM_FIRMWARE_SECURE_BOOT=1` for the Secure Boot wiring, and
-  `ZVMI_VM_FIRMWARE_TIMEOUT` to change the 1800-second budget. The image is
+  `VMIZ_VM_FIRMWARE_ARCH` to the other architecture for the cross-architecture
+  case, `VMIZ_VM_FIRMWARE_SECURE_BOOT=1` for the Secure Boot wiring, and
+  `VMIZ_VM_FIRMWARE_TIMEOUT` to change the 1800-second budget. The image is
   attested in place and the test fails if a single byte of it changed, which is
   the read-only claim checked against a real emulator rather than a stand-in.
 
@@ -335,7 +335,7 @@ cover both halves of that sentence:
   kernel this project's own images run.
 - `fetch-vm-boot-modular-kernel.sh` fetches a Debian *generic* kernel, which
   modularizes `ext4`, `virtio_blk`, `virtio_scsi`, `sd_mod` and `virtio_pci`.
-  Pointing `ZVMI_VM_BOOT_MODULE_TREE` at the tree it prints stages that tree
+  Pointing `VMIZ_VM_BOOT_MODULE_TREE` at the tree it prints stages that tree
   into the synthetic image, so the guest reaches its root only if the backend
   resolved the dependency closure, appended the modules to the initramfs and
   inserted them in order. With the variable unset the test behaves exactly as

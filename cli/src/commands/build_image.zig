@@ -1,11 +1,11 @@
-//! `zvmi build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{raw|vhd|vhdx|qcow2}|-> [-O raw.gz] [--compress-level <1-9>] [--skip-iso-rootfs] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--stub-source-path <path>]`
+//! `vmiz build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{raw|vhd|vhdx|qcow2}|-> [-O raw.gz] [--compress-level <1-9>] [--skip-iso-rootfs] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--stub-source-path <path>]`
 
 const std = @import("std");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 const opts = @import("opts.zig");
 
 const help_text =
-    \\usage: zvmi build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}|-> [-O raw|raw.gz|raw.zst|vhd|vhdx|qcow2] [--compress-level <1-9>] [--rootfs-path <path>] [--skip-iso-rootfs] [--max-oci-blob-size <size>] [--max-oci-layer-size <size>] [--max-oci-archive-size <size>] [--esp-size <size>] [--ext4-label <label>] [--root-filesystem ext4|xfs] [--journal|--no-journal] [--journal-size <size>] [--root-selinux-label <context>] [--stub-source-path <path>] [--os-release-source-path <path>] [--splash-source-path <path>] [--uki-output-directory <path>] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--dry-run] [-v]
+    \\usage: vmiz build-image --iso <file.iso> --container <oci-layout> [--generation 1|2] --size <size> -o <output.{{raw|vhd|vhdx|qcow2}}|-> [-O raw|raw.gz|raw.zst|vhd|vhdx|qcow2] [--compress-level <1-9>] [--rootfs-path <path>] [--skip-iso-rootfs] [--max-oci-blob-size <size>] [--max-oci-layer-size <size>] [--max-oci-archive-size <size>] [--esp-size <size>] [--ext4-label <label>] [--root-filesystem ext4|xfs] [--journal|--no-journal] [--journal-size <size>] [--root-selinux-label <context>] [--stub-source-path <path>] [--os-release-source-path <path>] [--splash-source-path <path>] [--uki-output-directory <path>] [--verity] [--extra-kernel-options <opts>] [--boot-mode bls|uki|both] [--dry-run] [-v]
     \\
     \\Options:
     \\  -o <path>|-                Output path, or - to stream the image to stdout.
@@ -82,31 +82,31 @@ const help_text =
 ;
 
 const BuildImageFailureContext = struct {
-    boot_mode: zvmi.bootconfig.BootMode = .bls_only,
+    boot_mode: vmiz.bootconfig.BootMode = .bls_only,
     stub_source_path: ?[]const u8 = null,
     /// The breach that stopped the import, when one did. It carries the
     /// observed value, the configured limit, and the flag that raises it,
     /// which is everything the caller needs to retry successfully.
-    limit_exceeded: ?zvmi.limits.Exceeded = null,
+    limit_exceeded: ?vmiz.limits.Exceeded = null,
 };
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var iso_path: ?[]const u8 = null;
     var container_path: ?[]const u8 = null;
     var output_path: ?[]const u8 = null;
-    var output_format: ?zvmi.Format = null;
-    var output_compression: ?zvmi.output.Compression = null;
-    var compression_level: ?zvmi.output.Level = null;
+    var output_format: ?vmiz.Format = null;
+    var output_compression: ?vmiz.output.Compression = null;
+    var compression_level: ?vmiz.output.Level = null;
     var stream_to_stdout = false;
     var rootfs_path: ?[]const u8 = null;
     var skip_iso_rootfs = false;
-    var oci_load_options = zvmi.oci.LoadOptions{};
-    var generation: zvmi.azure.Generation = .gen2;
+    var oci_load_options = vmiz.oci.LoadOptions{};
+    var generation: vmiz.azure.Generation = .gen2;
     var size: ?u64 = null;
     var esp_size: ?u64 = null;
     var ext4_label: []const u8 = "rootfs";
-    var root_filesystem: zvmi.layout.FilesystemKind = .ext4;
-    var journal = zvmi.ext4.JournalOptions{};
+    var root_filesystem: vmiz.layout.FilesystemKind = .ext4;
+    var journal = vmiz.ext4.JournalOptions{};
     var root_selinux_label: ?[]const u8 = null;
     var stub_source_path: ?[]const u8 = null;
     var os_release_source_path: ?[]const u8 = null;
@@ -114,10 +114,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var uki_output_directory: []const u8 = "EFI/Linux";
     var enable_verity = false;
     var extra_kernel_options: []const u8 = "";
-    var boot_mode: zvmi.bootconfig.BootMode = .bls_only;
+    var boot_mode: vmiz.bootconfig.BootMode = .bls_only;
     var dry_run = false;
     var verbose = false;
-    var limits: zvmi.limits.ImportLimits = .{};
+    var limits: vmiz.limits.ImportLimits = .{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -143,12 +143,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, arg, "--size")) {
             i += 1;
             if (i >= args.len) return fail("build-image: --size requires a value", .{});
-            size = zvmi.parseSize(args[i]) catch |err|
+            size = vmiz.parseSize(args[i]) catch |err|
                 return fail("build-image: invalid --size '{s}': {s}", .{ args[i], @errorName(err) });
         } else if (std.mem.eql(u8, arg, "--esp-size")) {
             i += 1;
             if (i >= args.len) return fail("build-image: --esp-size requires a value", .{});
-            esp_size = zvmi.parseSize(args[i]) catch |err|
+            esp_size = vmiz.parseSize(args[i]) catch |err|
                 return fail("build-image: invalid --esp-size '{s}': {s}", .{ args[i], @errorName(err) });
         } else if (std.mem.eql(u8, arg, "--ext4-label")) {
             i += 1;
@@ -174,7 +174,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, arg, "--journal-size")) {
             i += 1;
             if (i >= args.len) return fail("build-image: --journal-size requires a value", .{});
-            journal.size_bytes = zvmi.parseSize(args[i]) catch |err|
+            journal.size_bytes = vmiz.parseSize(args[i]) catch |err|
                 return fail("build-image: invalid --journal-size '{s}': {s}", .{ args[i], @errorName(err) });
             journal.enabled = true;
         } else if (std.mem.eql(u8, arg, "--root-selinux-label")) {
@@ -208,14 +208,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, arg, "-O")) {
             i += 1;
             if (i >= args.len) return fail("build-image: -O requires a format", .{});
-            const spec = zvmi.output.Spec.parseName(args[i]) orelse
+            const spec = vmiz.output.Spec.parseName(args[i]) orelse
                 return fail("build-image: unknown output format '{s}'", .{args[i]});
             output_format = spec.format;
             output_compression = spec.compression;
         } else if (std.mem.eql(u8, arg, "--compress-level")) {
             i += 1;
             if (i >= args.len) return fail("build-image: --compress-level requires a value", .{});
-            compression_level = zvmi.output.parseLevel(args[i]) catch
+            compression_level = vmiz.output.parseLevel(args[i]) catch
                 return fail("build-image: invalid --compress-level '{s}' (expected 1 fastest through 9 smallest)", .{args[i]});
         } else if (std.mem.eql(u8, arg, "--rootfs-path")) {
             i += 1;
@@ -262,7 +262,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             verbose = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             return fail(help_text, .{});
-        } else if (zvmi.limits.limitForFlag(arg) != null) {
+        } else if (vmiz.limits.limitForFlag(arg) != null) {
             i += 1;
             if (i >= args.len) return fail("build-image: {s} requires a value", .{arg});
             _ = limits.parseFlag(arg, args[i]) catch |err|
@@ -274,9 +274,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
 
     // The sink outlives the build so a failure can name the limit that
     // stopped it and a success can report how close the import came.
-    var limit_sink = zvmi.limits.Diagnostic{};
+    var limit_sink = vmiz.limits.Diagnostic{};
     var report = blk: {
-        const built = zvmi.build_image.build(gpa, io, .{
+        const built = vmiz.build_image.build(gpa, io, .{
             .iso_path = iso_path orelse return fail("build-image: --iso is required", .{}),
             .container_path = container_path orelse return fail("build-image: --container is required", .{}),
             .oci_load_options = oci_load_options,
@@ -289,7 +289,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             .stream_to_stdout = stream_to_stdout,
             .rootfs_path_in_iso = rootfs_path,
             .skip_iso_rootfs = skip_iso_rootfs,
-            .esp_size = esp_size orelse zvmi.build_image.default_esp_size,
+            .esp_size = esp_size orelse vmiz.build_image.default_esp_size,
             .ext4_label = ext4_label,
             .root_filesystem = root_filesystem,
             .ext4_journal = journal,
@@ -328,8 +328,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
 /// Prints what the import actually needed, so the next run can be sized from a
 /// --dry-run instead of from a guess. A limit the import never touched stays
 /// at zero and is left out.
-fn printLimitPeaks(peaks: zvmi.limits.Peaks, configured: zvmi.limits.ImportLimits) void {
-    inline for (comptime std.enums.values(zvmi.limits.Limit)) |limit| {
+fn printLimitPeaks(peaks: vmiz.limits.Peaks, configured: vmiz.limits.ImportLimits) void {
+    inline for (comptime std.enums.values(vmiz.limits.Limit)) |limit| {
         const peak = peaks.value(limit);
         if (peak != 0) {
             std.debug.print(
@@ -341,13 +341,13 @@ fn printLimitPeaks(peaks: zvmi.limits.Peaks, configured: zvmi.limits.ImportLimit
 }
 
 fn parseOciLimit(value: []const u8) !usize {
-    const size = try zvmi.parseSize(value);
+    const size = try vmiz.parseSize(value);
     if (size == 0) return error.ZeroOciLimit;
     return std.math.cast(usize, size) orelse error.OciLimitTooLarge;
 }
 
-fn printReport(report: zvmi.build_image.BuildImageReport, dry_run: bool) void {
-    const output_text = (zvmi.output.Spec{
+fn printReport(report: vmiz.build_image.BuildImageReport, dry_run: bool) void {
+    const output_text = (vmiz.output.Spec{
         .format = report.output_format,
         .compression = report.output_compression,
     }).displayName();
@@ -406,8 +406,8 @@ fn describeBuildImageFailure(
     if (context.limit_exceeded) |breach| {
         // The error name alone says nothing actionable; the breach knows the
         // value that was observed and the flag that admits it.
-        var message_buffer: [zvmi.limits.Exceeded.max_message_bytes]u8 = undefined;
-        var remediation_buffer: [zvmi.limits.Exceeded.max_remediation_bytes]u8 = undefined;
+        var message_buffer: [vmiz.limits.Exceeded.max_message_bytes]u8 = undefined;
+        var remediation_buffer: [vmiz.limits.Exceeded.max_remediation_bytes]u8 = undefined;
         if (breach.limit.err() == err) {
             return std.fmt.allocPrint(
                 allocator,
@@ -439,7 +439,7 @@ fn describeBuildImageFailure(
         ),
         error.InitramfsMissingVerityTooling => allocator.dupe(
             u8,
-            "build-image: failed: --verity was requested, but the source initramfs (boot/initrd*/boot/initramfs* in the merged ISO/squashfs/container tree) does not include dm-verity userspace tooling (systemd-veritysetup-generator, systemd-veritysetup, or veritysetup).\nWithout it, systemd-veritysetup-generator never runs and the built image will hang at boot waiting on /dev/mapper/root (see https://github.com/cataggar/zvmi/issues/77).\nRebuild the initramfs with that tooling included (e.g. dracut --add veritysetup, or the equivalent module/package for the base OS's initramfs generator) before using --verity.",
+            "build-image: failed: --verity was requested, but the source initramfs (boot/initrd*/boot/initramfs* in the merged ISO/squashfs/container tree) does not include dm-verity userspace tooling (systemd-veritysetup-generator, systemd-veritysetup, or veritysetup).\nWithout it, systemd-veritysetup-generator never runs and the built image will hang at boot waiting on /dev/mapper/root (see https://github.com/cataggar/vmiz/issues/77).\nRebuild the initramfs with that tooling included (e.g. dracut --add veritysetup, or the equivalent module/package for the base OS's initramfs generator) before using --verity.",
         ),
         error.JournalWithVerityRoot => allocator.dupe(
             u8,
@@ -483,7 +483,7 @@ fn describeBuildImageFailure(
 
 fn outputConstraintMessage(
     allocator: std.mem.Allocator,
-    err: zvmi.output.SpecError,
+    err: vmiz.output.SpecError,
 ) std.mem.Allocator.Error![]u8 {
     return std.fmt.allocPrint(
         allocator,

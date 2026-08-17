@@ -1,18 +1,18 @@
 # OCI images and bundles
 
-`zvmi oci` copies, inspects, unpacks, and repacks OCI images without a
+`vmiz oci` copies, inspects, unpacks, and repacks OCI images without a
 container daemon:
 
 ```console
-zvmi oci copy docker://registry.example/team/image:stable oci:./layout:stable
-zvmi oci copy --override-os linux --override-arch arm64 oci:./layout:stable docker://registry.example/team/image:arm64
-zvmi oci copy --all docker://registry.example/team/image:stable oci:./complete:stable
-zvmi oci inspect oci:./layout:stable
-zvmi oci list-tags docker://registry.example/team/image
-zvmi oci pin docker://registry.example/team/image:stable
-zvmi oci unpack --image oci:./layout:stable ./bundle
-zvmi oci repack --image oci:./layout:edited ./bundle
-zvmi oci config --image oci:./layout:edited
+vmiz oci copy docker://registry.example/team/image:stable oci:./layout:stable
+vmiz oci copy --override-os linux --override-arch arm64 oci:./layout:stable docker://registry.example/team/image:arm64
+vmiz oci copy --all docker://registry.example/team/image:stable oci:./complete:stable
+vmiz oci inspect oci:./layout:stable
+vmiz oci list-tags docker://registry.example/team/image
+vmiz oci pin docker://registry.example/team/image:stable
+vmiz oci unpack --image oci:./layout:stable ./bundle
+vmiz oci repack --image oci:./layout:edited ./bundle
+vmiz oci config --image oci:./layout:edited
 ```
 
 `copy`, `unpack`, and `repack` print the committed or selected root digest.
@@ -81,9 +81,9 @@ ID 0; any other new ownership is rejected as unmapped. This one-ID mapping
 does not emulate a subordinate-ID range, so rootless unpack rejects images
 configured to run as a nonzero user or with supplemental groups.
 
-The private `.zvmi/metadata.json` records the exact root and selected manifest,
+The private `.vmiz/metadata.json` records the exact root and selected manifest,
 config digest, platform, source layout, and unpack ownership mode.
-`.zvmi/base.json` is a sorted, no-follow snapshot containing content hashes,
+`.vmiz/base.json` is a sorted, no-follow snapshot containing content hashes,
 links, modes, timestamps, owners, device numbers, and base64 xattrs. Repack
 refuses a missing or changed base graph.
 
@@ -108,7 +108,7 @@ image-configuration JSON without rewriting extension fields.
 ## Pinning a tag to a digest
 
 ```console
-zvmi oci pin docker://registry.example/team/image:stable
+vmiz oci pin docker://registry.example/team/image:stable
 docker://registry.example/team/image@sha256:...
 ```
 
@@ -135,7 +135,7 @@ two-step workflow is one step for anyone who does not need it to be two.
 before the request is built and prints what it resolved to:
 
 ```console
-zvmi-image-builder: pinned docker://registry.example/team/image:stable to docker://registry.example/team/image@sha256:...
+vmiz-image-builder: pinned docker://registry.example/team/image:stable to docker://registry.example/team/image@sha256:...
 ```
 
 The digest is still stated out loud rather than followed silently, which is
@@ -163,7 +163,7 @@ instead state one directly through `registry.Options.credential`, which
 disables discovery entirely: none of the six locations above, and no credential
 helper they name, is consulted. A registry that needs authentication then fails
 as an authentication error naming the reference rather than succeeding because
-the machine happened to be logged in. The `zvmi oci` commands do not state a
+the machine happened to be logged in. The `vmiz oci` commands do not state a
 credential and keep the discovery behaviour above.
 
 **An image build reads none of those six locations.** A customize run does not
