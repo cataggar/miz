@@ -1,7 +1,7 @@
-//! `zvmi info [--output=human|json] <file>`
+//! `vmiz info [--output=human|json] <file>`
 
 const std = @import("std");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 
 const OutputMode = enum { human, json };
 
@@ -21,9 +21,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         }
     }
 
-    const file_path = path orelse return fail("usage: zvmi info [--output=human|json] <file>", .{});
+    const file_path = path orelse return fail("usage: vmiz info [--output=human|json] <file>", .{});
 
-    var img = zvmi.Image.openPath(io, file_path) catch |err|
+    var img = vmiz.Image.openPath(io, file_path) catch |err|
         return fail("info: failed to open '{s}': {s}", .{ file_path, @errorName(err) });
     defer img.close(io);
 

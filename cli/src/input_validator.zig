@@ -4,21 +4,21 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     if (args.len != 2) {
-        std.debug.print("usage: zvmi-input-validator <oci-layout>\n", .{});
+        std.debug.print("usage: vmiz-input-validator <oci-layout>\n", .{});
         std.process.exit(2);
     }
 
     var dir = std.Io.Dir.cwd().openDir(init.io, args[1], .{ .iterate = true }) catch |err| {
-        std.debug.print("zvmi-input-validator: cannot open '{s}': {t}\n", .{ args[1], err });
+        std.debug.print("vmiz-input-validator: cannot open '{s}': {t}\n", .{ args[1], err });
         std.process.exit(1);
     };
     defer dir.close(init.io);
 
     validateDirectory(init.gpa, init.io, dir) catch |err| {
         if (err == error.UnsupportedEntry) {
-            std.debug.print("zvmi-input-validator: OCI layout '{s}' contains a symlink or special file; only regular files and directories are supported\n", .{args[1]});
+            std.debug.print("vmiz-input-validator: OCI layout '{s}' contains a symlink or special file; only regular files and directories are supported\n", .{args[1]});
         } else {
-            std.debug.print("zvmi-input-validator: cannot validate '{s}': {t}\n", .{ args[1], err });
+            std.debug.print("vmiz-input-validator: cannot validate '{s}': {t}\n", .{ args[1], err });
         }
         std.process.exit(1);
     };

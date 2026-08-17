@@ -1,17 +1,17 @@
-//! `zvmi uki certificate <disk-image> --output <certificate.pem>`
-//! `zvmi uki certificate <disk-image> --output=json`
+//! `vmiz uki certificate <disk-image> --output <certificate.pem>`
+//! `vmiz uki certificate <disk-image> --output=json`
 
 const std = @import("std");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 const atomic_output = @import("../atomic_output.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const usage =
-    "usage: zvmi uki certificate <disk-image> --output <certificate.pem> " ++
+    "usage: vmiz uki certificate <disk-image> --output <certificate.pem> " ++
     "[--expected-sha256 <hex>]\n" ++
-    "       zvmi uki certificate <disk-image> --output=json " ++
+    "       vmiz uki certificate <disk-image> --output=json " ++
     "[--expected-sha256 <hex>]";
 
 const Output = union(enum) {
@@ -22,7 +22,7 @@ const Output = union(enum) {
 const ParsedArgs = struct {
     image_path: []const u8,
     output: Output,
-    expected_sha256: ?zvmi.artifact_pipeline.Digest,
+    expected_sha256: ?vmiz.artifact_pipeline.Digest,
 };
 
 const ParseError = error{
@@ -41,13 +41,13 @@ const ParseError = error{
 pub fn run(allocator: Allocator, io: Io, args: []const []const u8) u8 {
     const parsed = parseArgs(args) catch |err| {
         std.debug.print(
-            "zvmi uki: {s}\n{s}\n",
+            "vmiz uki: {s}\n{s}\n",
             .{ @errorName(err), usage },
         );
         return 1;
     };
 
-    var image = zvmi.Image.openPathReadOnlyStandalone(
+    var image = vmiz.Image.openPathReadOnlyStandalone(
         io,
         parsed.image_path,
     ) catch |err|
@@ -56,7 +56,7 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) u8 {
             .{ parsed.image_path, @errorName(err) },
         );
     defer image.close(io);
-    var result = zvmi.uki_certificate.extractAlloc(
+    var result = vmiz.uki_certificate.extractAlloc(
         allocator,
         io,
         &image,
@@ -67,7 +67,7 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) u8 {
     );
     defer result.deinit(allocator);
 
-    const pem = zvmi.authenticode.encodePemCertificateAlloc(
+    const pem = vmiz.authenticode.encodePemCertificateAlloc(
         allocator,
         result.certificate_der,
     ) catch |err| return fail(
@@ -127,7 +127,7 @@ fn parseArgs(args: []const []const u8) ParseError!ParsedArgs {
 
     var image_path: ?[]const u8 = null;
     var output: ?Output = null;
-    var expected_sha256: ?zvmi.artifact_pipeline.Digest = null;
+    var expected_sha256: ?vmiz.artifact_pipeline.Digest = null;
     var expected_sha256_set = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -146,7 +146,7 @@ fn parseArgs(args: []const []const u8) ParseError!ParsedArgs {
             expected_sha256_set = true;
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
-            expected_sha256 = zvmi.artifact_pipeline.parseSha256(
+            expected_sha256 = vmiz.artifact_pipeline.parseSha256(
                 args[i],
             ) catch return error.InvalidSha256;
         } else if (std.mem.startsWith(u8, argument, "-")) {
@@ -166,10 +166,10 @@ fn parseArgs(args: []const []const u8) ParseError!ParsedArgs {
 
 fn jsonAlloc(
     allocator: Allocator,
-    result: zvmi.uki_certificate.Result,
+    result: vmiz.uki_certificate.Result,
     pem: []const u8,
 ) ![]u8 {
-    const fingerprint = zvmi.artifact_pipeline.formatSha256(
+    const fingerprint = vmiz.artifact_pipeline.formatSha256(
         result.certificate_sha256,
     );
     const subject = try base64Alloc(allocator, result.subject_der);
@@ -226,9 +226,9 @@ fn writeStdout(io: Io, bytes: []const u8) !void {
 fn writeHuman(
     io: Io,
     output_path: []const u8,
-    result: zvmi.uki_certificate.Result,
+    result: vmiz.uki_certificate.Result,
 ) !void {
-    const fingerprint = zvmi.artifact_pipeline.formatSha256(
+    const fingerprint = vmiz.artifact_pipeline.formatSha256(
         result.certificate_sha256,
     );
     var buffer: [4096]u8 = undefined;
@@ -257,7 +257,7 @@ fn sameResolvedPath(
 }
 
 fn fail(comptime format: []const u8, args: anytype) u8 {
-    std.debug.print("zvmi uki certificate: " ++ format ++ "\n", args);
+    std.debug.print("vmiz uki certificate: " ++ format ++ "\n", args);
     return 1;
 }
 
@@ -305,8 +305,8 @@ test "JSON output exposes canonical signer fields" {
     var serial = [_]u8{ 0x00, 0xaf };
     var path = "EFI/BOOT/BOOTX64.EFI".*;
     var paths = [_][]u8{&path};
-    const digest = zvmi.artifact_pipeline.sha256Bytes(&certificate);
-    const result = zvmi.uki_certificate.Result{
+    const digest = vmiz.artifact_pipeline.sha256Bytes(&certificate);
+    const result = vmiz.uki_certificate.Result{
         .certificate_der = &certificate,
         .certificate_sha256 = digest,
         .subject_der = &subject,

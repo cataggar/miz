@@ -1,6 +1,6 @@
 //! Locates, mounts, and reads `ovf-env.xml` off a provisioning CD-ROM/DVD.
 //! Azure media is the default. Synthetic local media must also contain the
-//! explicit `zvmi-local-provisioning` marker used by zvminit to select
+//! explicit `vmiz-local-provisioning` marker used by vmizinit to select
 //! `azagent --skip-ready`; an OVF document alone never selects local mode.
 //!
 //! Deliberately narrower than upstream's `get_dvd_device` (which regex-
@@ -8,7 +8,7 @@
 //! Azure's Hyper-V media and the controlled QEMU acceptance topology both
 //! expose `/dev/sr0` (with `/dev/cdrom` retained as a conventional alias).
 //!
-//! Uses direct `mount(2)`/`umount(2)` syscalls (matching `zvminit`'s
+//! Uses direct `mount(2)`/`umount(2)` syscalls (matching `vmizinit`'s
 //! style) rather than shelling out to `mount`/`umount`. Not covered by an
 //! automated test: it requires a real block device, which isn't available
 //! in a unit-test sandbox -- exercised only via manual/real-VM
@@ -28,7 +28,7 @@ pub const ProbeResult = enum {
     indeterminate,
 };
 
-pub const local_provisioning_marker = "zvmi-local-provisioning";
+pub const local_provisioning_marker = "vmiz-local-provisioning";
 
 pub const ReadError = error{
     NoProvisioningMediaFound,

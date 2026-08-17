@@ -1,10 +1,10 @@
-//! `zvmi`: a qemu-img-like CLI over the `zvmi` library. Supports `create`,
+//! `vmiz`: a qemu-img-like CLI over the `vmiz` library. Supports `create`,
 //! `info`, `convert`, `resize`, `check`, `map`, `build-image`, `build-iso`,
 //! `recustomize-iso`, `azure`, `cosi`, `oci`, `qemu`, and release signing over
 //! `raw`, `vhd`, `vhdx`, and `qcow2`.
 
 const std = @import("std");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 
 const create_cmd = @import("commands/create.zig");
 const info_cmd = @import("commands/info.zig");
@@ -24,7 +24,7 @@ const oci_cmd = @import("commands/oci.zig");
 const uki_cmd = @import("commands/uki.zig");
 
 const usage =
-    \\Usage: zvmi <command> [options]
+    \\Usage: vmiz <command> [options]
     \\
     \\Commands:
     \\  create -f <format> [-o subformat=fixed|dynamic] <file> <size>
@@ -98,7 +98,7 @@ fn run(
         std.debug.print("{s}", .{usage});
         return 0;
     }
-    std.debug.print("zvmi: unknown command '{s}'\n\n{s}", .{ command, usage });
+    std.debug.print("vmiz: unknown command '{s}'\n\n{s}", .{ command, usage });
     return 1;
 }
 

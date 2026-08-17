@@ -2,12 +2,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const qemu_host = @import("qemu_host");
 const boot_smoke = @import("boot_smoke.zig");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const disk_size: u64 = 4 * 1024 * zvmi.azure.one_mib;
-const smoke_marker = "ZVMI real package customization verified";
+const disk_size: u64 = 4 * 1024 * vmiz.azure.one_mib;
+const smoke_marker = "VMIZ real package customization verified";
 
 const Config = struct {
     iso_path: []const u8,
@@ -21,7 +21,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(allocator);
     if (argv.len == 3 and std.mem.eql(u8, argv[1], "--unsafe-chroot-worker")) {
-        return zvmi.unsafe_chroot.workerMain(init, argv[2]);
+        return vmiz.unsafe_chroot.workerMain(init, argv[2]);
     }
     if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) {
         std.debug.print(
@@ -36,21 +36,21 @@ pub fn main(init: std.process.Init) !void {
         return runIntegration(allocator, init.io, argv[0], config);
     }
 
-    const requested = if (init.environ_map.get("ZVMI_RUN_REAL_PACKAGE_BOOT")) |value|
+    const requested = if (init.environ_map.get("VMIZ_RUN_REAL_PACKAGE_BOOT")) |value|
         std.mem.eql(u8, value, "1")
     else
         false;
     if (!requested) {
         std.debug.print(
-            "skipping real unsafe-chroot boot integration: set ZVMI_RUN_REAL_PACKAGE_BOOT=1 to opt in\n",
+            "skipping real unsafe-chroot boot integration: set VMIZ_RUN_REAL_PACKAGE_BOOT=1 to opt in\n",
             .{},
         );
         return;
     }
 
-    const iso_path = init.environ_map.get("ZVMI_BOOT_TEST_ISO") orelse
+    const iso_path = init.environ_map.get("VMIZ_BOOT_TEST_ISO") orelse
         return error.MissingIsoFixture;
-    const oci_path = init.environ_map.get("ZVMI_BOOT_TEST_OCI") orelse
+    const oci_path = init.environ_map.get("VMIZ_BOOT_TEST_OCI") orelse
         return error.MissingOciFixture;
     const qemu_path = try qemu_host.findExecutableInPathAlloc(
         allocator,
@@ -59,8 +59,8 @@ pub fn main(init: std.process.Init) !void {
         "qemu-system-x86_64",
     ) orelse return error.QemuUnavailable;
     const firmware = try qemu_host.findFirmwarePairAlloc(allocator, init.io, .{
-        .explicit_code_path = init.environ_map.get("ZVMI_BOOT_TEST_OVMF_CODE"),
-        .explicit_vars_path = init.environ_map.get("ZVMI_BOOT_TEST_OVMF_VARS"),
+        .explicit_code_path = init.environ_map.get("VMIZ_BOOT_TEST_OVMF_CODE"),
+        .explicit_vars_path = init.environ_map.get("VMIZ_BOOT_TEST_OVMF_VARS"),
         .qemu_path = qemu_path,
     }) orelse return error.OvmfUnavailable;
     const config = Config{
@@ -135,7 +135,7 @@ fn runIntegration(
     self_exe: []const u8,
     config: Config,
 ) !void {
-    if (zvmi.unsafe_chroot.available(io) != .available) {
+    if (vmiz.unsafe_chroot.available(io) != .available) {
         return error.UnsafeChrootHostUnavailable;
     }
 
@@ -144,7 +144,7 @@ fn runIntegration(
     const random_hex = std.fmt.bytesToHex(random, .lower);
     const work_path = try std.fmt.allocPrint(
         allocator,
-        "/tmp/zvmi-real-package-boot-{s}",
+        "/tmp/vmiz-real-package-boot-{s}",
         .{&random_hex},
     );
     try Io.Dir.cwd().createDir(io, work_path, .default_dir);
@@ -187,14 +187,14 @@ fn runIntegration(
         allocator,
         source_path,
         root_offset,
-        "usr/lib/systemd/system/zvmi-real-package-smoke.service",
+        "usr/lib/systemd/system/vmiz-real-package-smoke.service",
     );
     try ensureGuestPath(
         io,
         allocator,
         source_path,
         root_offset,
-        "etc/systemd/system/multi-user.target.wants/zvmi-real-package-smoke.service",
+        "etc/systemd/system/multi-user.target.wants/vmiz-real-package-smoke.service",
     );
     const initramfs_path = try std.fmt.allocPrint(
         allocator,
@@ -208,13 +208,13 @@ fn runIntegration(
         root_offset,
         "etc/pki/rpm-gpg/RPM-GPG-KEY-azurelinux-4.0-primary",
     );
-    const source_digest = try zvmi.customize.hashSourcePath(
+    const source_digest = try vmiz.customize.hashSourcePath(
         allocator,
         io,
         source_path,
     );
 
-    const actions = [_]zvmi.customize.PackageAction{
+    const actions = [_]vmiz.customize.PackageAction{
         .{ .install = &.{"nano"} },
     };
     // The hook writes what it can see rather than a fixed marker, so the file
@@ -225,18 +225,18 @@ fn runIntegration(
         \\#!/bin/sh
         \\set -e
         \\test -x /usr/bin/nano
-        \\echo "$1" > /etc/zvmi-hook-after-packages
+        \\echo "$1" > /etc/vmiz-hook-after-packages
         \\
     ;
     const finalize_script =
         \\#!/bin/sh
         \\set -e
-        \\test -f /etc/zvmi-hook-after-packages
-        \\ls /run/zvmi-hook-* > /etc/zvmi-hook-leftovers 2>/dev/null || true
-        \\echo finalize > /etc/zvmi-hook-finalize
+        \\test -f /etc/vmiz-hook-after-packages
+        \\ls /run/vmiz-hook-* > /etc/vmiz-hook-leftovers 2>/dev/null || true
+        \\echo finalize > /etc/vmiz-hook-finalize
         \\
     ;
-    const hooks = [_]zvmi.customize.Hook{
+    const hooks = [_]vmiz.customize.Hook{
         .{
             .name = "after-packages",
             .phase = .after_packages,
@@ -255,14 +255,14 @@ fn runIntegration(
         &after_packages_digest,
         .{},
     );
-    const repositories = [_]zvmi.customize.PackageRepository{.{
+    const repositories = [_]vmiz.customize.PackageRepository{.{
         .id = "azurelinux-base",
         .urls = &.{
             "https://packages.microsoft.com/azurelinux/4.0/beta/base/x86_64",
         },
         .trust = &.{.{ .inline_bytes = trust }},
     }};
-    const request = zvmi.customize.Request{
+    const request = vmiz.customize.Request{
         .target_architecture = .x86_64,
         .input = .{ .disk = .{ .path = source_path } },
         .output = .{
@@ -292,7 +292,7 @@ fn runIntegration(
             .source_date_epoch = 1_735_689_600,
         },
     };
-    var resolved = try zvmi.customize.resolve(allocator, &request, .{
+    var resolved = try vmiz.customize.resolve(allocator, &request, .{
         .host_architecture = .x86_64,
     });
     defer resolved.deinit(allocator);
@@ -301,11 +301,11 @@ fn runIntegration(
     }
 
     var context = RuntimeContext{ .self_exe = self_exe };
-    var platform = zvmi.customize.Platform.system();
+    var platform = vmiz.customize.Platform.system();
     platform.context = &context;
     platform.unsafeChrootCheckFn = checkUnsafeChroot;
     platform.unsafeChrootRunFn = runUnsafeChroot;
-    var preflight = try zvmi.customize.preflight(
+    var preflight = try vmiz.customize.preflight(
         allocator,
         io,
         &resolved.plan.?,
@@ -314,7 +314,7 @@ fn runIntegration(
     defer preflight.deinit(allocator);
     if (!preflight.ready()) return error.RealPackagePreflightFailed;
 
-    var outcome = try zvmi.customize.execute(
+    var outcome = try vmiz.customize.execute(
         allocator,
         io,
         &resolved.plan.?,
@@ -330,7 +330,7 @@ fn runIntegration(
         }
     }
     try validateProvenance(&result.provenance, kernel, after_packages_digest);
-    const final_source_digest = try zvmi.customize.hashSourcePath(
+    const final_source_digest = try vmiz.customize.hashSourcePath(
         allocator,
         io,
         source_path,
@@ -346,15 +346,15 @@ fn runIntegration(
         allocator,
         output_path,
         root_offset,
-        "etc/zvmi-hook-after-packages",
+        "etc/vmiz-hook-after-packages",
     );
-    try ensureGuestPath(io, allocator, output_path, root_offset, "etc/zvmi-hook-finalize");
+    try ensureGuestPath(io, allocator, output_path, root_offset, "etc/vmiz-hook-finalize");
     const hook_argument = try readGuestFile(
         allocator,
         io,
         output_path,
         root_offset,
-        "etc/zvmi-hook-after-packages",
+        "etc/vmiz-hook-after-packages",
     );
     defer allocator.free(hook_argument);
     try ensure(std.mem.eql(
@@ -370,11 +370,11 @@ fn runIntegration(
         io,
         output_path,
         root_offset,
-        "etc/zvmi-hook-leftovers",
+        "etc/vmiz-hook-leftovers",
     );
     defer allocator.free(leftovers);
-    try ensure(std.mem.indexOf(u8, leftovers, "zvmi-hook-0") == null);
-    try ensureGuestPathAbsent(io, allocator, output_path, root_offset, "run/zvmi-hook-1");
+    try ensure(std.mem.indexOf(u8, leftovers, "vmiz-hook-0") == null);
+    try ensureGuestPathAbsent(io, allocator, output_path, root_offset, "run/vmiz-hook-1");
     try ensureGuestFileNonempty(
         allocator,
         io,
@@ -434,38 +434,38 @@ fn buildSourceImage(
         \\set -eu
         \\rpm -q nano >/dev/null
         \\test -s "/boot/initramfs-$(uname -r).img"
-        \\printf 'ZVMI real package customization verified\n' >/dev/ttyS0
+        \\printf 'VMIZ real package customization verified\n' >/dev/ttyS0
         \\
     ;
     const unit =
         \\[Unit]
-        \\Description=Verify real zvmi package customization
+        \\Description=Verify real vmiz package customization
         \\After=local-fs.target
         \\
         \\[Service]
         \\Type=oneshot
-        \\ExecStart=/usr/local/sbin/zvmi-real-package-smoke
+        \\ExecStart=/usr/local/sbin/vmiz-real-package-smoke
         \\
         \\[Install]
         \\WantedBy=multi-user.target
         \\
     ;
-    const filesystem = [_]zvmi.os_customization.FilesystemOperation{
+    const filesystem = [_]vmiz.os_customization.FilesystemOperation{
         .{ .put_file = .{
-            .path = "/usr/local/sbin/zvmi-real-package-smoke",
+            .path = "/usr/local/sbin/vmiz-real-package-smoke",
             .source = .{ .inline_bytes = script },
             .metadata = .{ .mode = 0o755 },
         } },
         .{ .put_file = .{
-            .path = "/usr/lib/systemd/system/zvmi-real-package-smoke.service",
+            .path = "/usr/lib/systemd/system/vmiz-real-package-smoke.service",
             .source = .{ .inline_bytes = unit },
         } },
     };
-    const services = [_]zvmi.os_customization.Service{.{
-        .name = "zvmi-real-package-smoke.service",
+    const services = [_]vmiz.os_customization.Service{.{
+        .name = "vmiz-real-package-smoke.service",
         .state = .enabled,
     }};
-    var report = try zvmi.build_image.build(allocator, io, .{
+    var report = try vmiz.build_image.build(allocator, io, .{
         .iso_path = iso_path,
         .container_path = oci_path,
         .output_path = output_path,
@@ -493,14 +493,14 @@ fn findKernelRelease(
     image_path: []const u8,
     root_offset: u64,
 ) ![]u8 {
-    var image = try zvmi.Image.openPathReadOnly(io, image_path);
+    var image = try vmiz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
-    var reader = try zvmi.ext4.open(io, image.file, allocator, .{
+    var reader = try vmiz.ext4.open(io, image.file, allocator, .{
         .offset = root_offset,
     });
     defer reader.deinit();
     const entries = try reader.listDir(io, allocator, "usr/lib/modules");
-    defer zvmi.ext4.freeDirEntries(allocator, entries);
+    defer vmiz.ext4.freeDirEntries(allocator, entries);
     var kernel: ?[]u8 = null;
     for (entries) |entry| {
         if (entry.kind != .directory) continue;
@@ -517,9 +517,9 @@ fn readGuestFile(
     root_offset: u64,
     path: []const u8,
 ) ![]u8 {
-    var image = try zvmi.Image.openPathReadOnly(io, image_path);
+    var image = try vmiz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
-    var reader = try zvmi.ext4.open(io, image.file, allocator, .{
+    var reader = try vmiz.ext4.open(io, image.file, allocator, .{
         .offset = root_offset,
     });
     defer reader.deinit();
@@ -533,9 +533,9 @@ fn ensureGuestFileNonempty(
     root_offset: u64,
     path: []const u8,
 ) !void {
-    var image = try zvmi.Image.openPathReadOnly(io, image_path);
+    var image = try vmiz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
-    var reader = try zvmi.ext4.open(io, image.file, allocator, .{
+    var reader = try vmiz.ext4.open(io, image.file, allocator, .{
         .offset = root_offset,
     });
     defer reader.deinit();
@@ -549,19 +549,19 @@ fn ensureBootEntryReferences(
     image_path: []const u8,
     initramfs_name: []const u8,
 ) !void {
-    var image = try zvmi.Image.openPathReadOnly(io, image_path);
+    var image = try vmiz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
-    const parsed = try zvmi.gpt.readGpt(image, io, allocator);
+    const parsed = try vmiz.gpt.readGpt(image, io, allocator);
     defer allocator.free(parsed.partitions);
     if (parsed.partitions.len < 2) return error.EspPartitionMissing;
     const esp_partition = parsed.partitions[0];
-    var esp = try zvmi.fat32.open(&image, io, .{
-        .offset = esp_partition.first_lba * zvmi.gpt.sector_size,
+    var esp = try vmiz.fat32.open(&image, io, .{
+        .offset = esp_partition.first_lba * vmiz.gpt.sector_size,
         .length = (esp_partition.last_lba - esp_partition.first_lba + 1) *
-            zvmi.gpt.sector_size,
+            vmiz.gpt.sector_size,
     });
     const entries = try esp.listDirAlloc(io, allocator, "loader/entries");
-    defer zvmi.fat32.freeDirEntries(allocator, entries);
+    defer vmiz.fat32.freeDirEntries(allocator, entries);
     for (entries) |entry| {
         if (entry.kind != .file or
             !std.mem.endsWith(u8, entry.name, ".conf"))
@@ -586,9 +586,9 @@ fn ensureGuestPath(
     root_offset: u64,
     path: []const u8,
 ) !void {
-    var image = try zvmi.Image.openPathReadOnly(io, image_path);
+    var image = try vmiz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
-    var reader = try zvmi.ext4.open(io, image.file, allocator, .{
+    var reader = try vmiz.ext4.open(io, image.file, allocator, .{
         .offset = root_offset,
     });
     defer reader.deinit();
@@ -606,9 +606,9 @@ fn ensureGuestPathAbsent(
     root_offset: u64,
     path: []const u8,
 ) !void {
-    var image = try zvmi.Image.openPathReadOnly(io, image_path);
+    var image = try vmiz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
-    var reader = try zvmi.ext4.open(io, image.file, allocator, .{
+    var reader = try vmiz.ext4.open(io, image.file, allocator, .{
         .offset = root_offset,
     });
     defer reader.deinit();
@@ -621,7 +621,7 @@ fn ensureGuestPathAbsent(
 }
 
 fn validateProvenance(
-    provenance: *const zvmi.customize.Provenance,
+    provenance: *const vmiz.customize.Provenance,
     kernel: []const u8,
     after_packages_digest: [32]u8,
 ) !void {
@@ -675,7 +675,7 @@ fn validateProvenance(
         "/boot/initramfs-{s}.img",
         .{kernel},
     );
-    const expected_temporary = "/run/zvmi-initramfs.img";
+    const expected_temporary = "/run/vmiz-initramfs.img";
     for (provenance.tools) |tool| {
         if (!std.mem.eql(u8, tool.name, "dracut") or
             tool.command.len != 8)
@@ -718,21 +718,21 @@ const RuntimeContext = struct {
 fn checkUnsafeChroot(
     _: ?*anyopaque,
     io: Io,
-    _: *const zvmi.customize.ResolvedPlan,
-) zvmi.customize.CapabilityState {
-    return zvmi.unsafe_chroot.available(io);
+    _: *const vmiz.customize.ResolvedPlan,
+) vmiz.customize.CapabilityState {
+    return vmiz.unsafe_chroot.available(io);
 }
 
 fn runUnsafeChroot(
     context_ptr: ?*anyopaque,
     allocator: Allocator,
     io: Io,
-    plan: *const zvmi.customize.ResolvedPlan,
-    target: zvmi.preserved_image.RawMutationTarget,
-    deadline: zvmi.customize.Deadline,
-) !zvmi.customize.UnsafeChrootRuntimeReport {
+    plan: *const vmiz.customize.ResolvedPlan,
+    target: vmiz.preserved_image.RawMutationTarget,
+    deadline: vmiz.customize.Deadline,
+) !vmiz.customize.UnsafeChrootRuntimeReport {
     const context: *RuntimeContext = @ptrCast(@alignCast(context_ptr.?));
-    return zvmi.unsafe_chroot.runParent(allocator, io, .{
+    return vmiz.unsafe_chroot.runParent(allocator, io, .{
         .deadline = deadline,
         .self_exe = context.self_exe,
         .transaction_path = plan.data.transaction_path,

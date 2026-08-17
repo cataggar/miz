@@ -44,19 +44,19 @@ jobs:
         run: zig build
 
       - name: Hermetic Debian-family package backend acceptance
-        run: zig test packages/zvmi/src/package_family.zig
+        run: zig test packages/vmiz/src/package_family.zig
 
       - name: Windows release builds
         run: |
-          zig build install-zvmi -Doptimize=ReleaseSafe -Dtarget=x86_64-windows
-          zig build install-zvmi -Doptimize=ReleaseSafe -Dtarget=aarch64-windows
+          zig build install-vmiz -Doptimize=ReleaseSafe -Dtarget=x86_64-windows
+          zig build install-vmiz -Doptimize=ReleaseSafe -Dtarget=aarch64-windows
 
       - name: zig build test
         run: zig build test --summary all
 
       - name: privileged unsafe-chroot integration
         env:
-          ZVMI_RUN_PRIVILEGED_TEST: "1"
+          VMIZ_RUN_PRIVILEGED_TEST: "1"
         run: zig build test-unsafe-chroot-integration --summary all
 
       # The VM backend boots the image's own kernel with `rdinit=`. Drivers it
@@ -82,11 +82,11 @@ jobs:
             x86_64) guest="aarch64" ;;
             *) guest="x86_64" ;;
           esac
-          echo "ZVMI_VM_CROSS_ARCH=$guest" >> "$GITHUB_ENV"
+          echo "VMIZ_VM_CROSS_ARCH=$guest" >> "$GITHUB_ENV"
           scripts/ci/fetch-vm-boot-kernel.sh \
             "fixtures/vm-boot-kernel/$host" "$host" >> "$GITHUB_ENV"
           scripts/ci/fetch-vm-boot-kernel.sh \
-            "fixtures/vm-boot-kernel/$guest" "$guest" ZVMI_VM_CROSS_ >> "$GITHUB_ENV"
+            "fixtures/vm-boot-kernel/$guest" "$guest" VMIZ_VM_CROSS_ >> "$GITHUB_ENV"
 
       # Hardware acceleration is probed rather than required. No hosted runner
       # class is guaranteed to expose /dev/kvm, and a test that demands one is
@@ -94,21 +94,21 @@ jobs:
       - name: Select QEMU accelerator
         run: |
           if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-            echo "ZVMI_VM_ACCEL=hardware" >> "$GITHUB_ENV"
+            echo "VMIZ_VM_ACCEL=hardware" >> "$GITHUB_ENV"
           else
-            echo "ZVMI_VM_ACCEL=software" >> "$GITHUB_ENV"
+            echo "VMIZ_VM_ACCEL=software" >> "$GITHUB_ENV"
           fi
 
       - name: real VM boot
         env:
-          ZVMI_RUN_VM_BOOT_TEST: "1"
+          VMIZ_RUN_VM_BOOT_TEST: "1"
         run: |
           set -euo pipefail
           # `readlink -f` resolves the ghr shim to the binary inside the
           # extracted tree, which is what QEMU needs: it locates its ROMs
           # relative to its own path, and an x86 direct-kernel boot still
           # loads a BIOS ROM.
-          ZVMI_VM_QEMU="$(readlink -f "$(command -v "qemu-system-$(uname -m)")")" \
+          VMIZ_VM_QEMU="$(readlink -f "$(command -v "qemu-system-$(uname -m)")")" \
             zig build test-vm-real-boot --summary all
 
       # The same emulator package supplies every guest architecture, so the
@@ -116,17 +116,17 @@ jobs:
       # the acceptance criterion the backend exists for.
       - name: cross-architecture VM boot
         env:
-          ZVMI_RUN_VM_BOOT_TEST: "1"
+          VMIZ_RUN_VM_BOOT_TEST: "1"
         run: |
           set -euo pipefail
-          export ZVMI_VM_BOOT_ARCH="${ZVMI_VM_CROSS_ARCH}"
-          export ZVMI_VM_BOOT_KERNEL="${ZVMI_VM_CROSS_KERNEL}"
-          export ZVMI_VM_BOOT_MODULES_BUILTIN="${ZVMI_VM_CROSS_MODULES_BUILTIN}"
+          export VMIZ_VM_BOOT_ARCH="${VMIZ_VM_CROSS_ARCH}"
+          export VMIZ_VM_BOOT_KERNEL="${VMIZ_VM_CROSS_KERNEL}"
+          export VMIZ_VM_BOOT_MODULES_BUILTIN="${VMIZ_VM_CROSS_MODULES_BUILTIN}"
           # KVM cannot cross architectures, so this run is emulated whatever
           # the host happens to offer.
-          export ZVMI_VM_ACCEL=software
-          ZVMI_VM_QEMU="$(readlink -f \
-            "$(command -v "qemu-system-${ZVMI_VM_CROSS_ARCH}")")" \
+          export VMIZ_VM_ACCEL=software
+          VMIZ_VM_QEMU="$(readlink -f \
+            "$(command -v "qemu-system-${VMIZ_VM_CROSS_ARCH}")")" \
             zig build test-vm-real-boot --summary all
 
       # Azure Linux proves the built-in path and can prove nothing else: it
@@ -152,15 +152,15 @@ jobs:
           fi
           scripts/ci/fetch-vm-boot-modular-kernel.sh \
             "fixtures/vm-boot-modular-kernel/$(uname -m)" "$(uname -m)" \
-            ZVMI_VM_MODULAR_ >> "$GITHUB_ENV"
+            VMIZ_VM_MODULAR_ >> "$GITHUB_ENV"
 
       - name: modular VM boot
         env:
-          ZVMI_RUN_VM_BOOT_TEST: "1"
+          VMIZ_RUN_VM_BOOT_TEST: "1"
         run: |
           set -euo pipefail
-          export ZVMI_VM_BOOT_KERNEL="${ZVMI_VM_MODULAR_KERNEL}"
-          export ZVMI_VM_BOOT_MODULES_BUILTIN="${ZVMI_VM_MODULAR_MODULES_BUILTIN}"
-          export ZVMI_VM_BOOT_MODULE_TREE="${ZVMI_VM_MODULAR_MODULE_TREE}"
-          ZVMI_VM_QEMU="$(readlink -f "$(command -v "qemu-system-$(uname -m)")")" \
+          export VMIZ_VM_BOOT_KERNEL="${VMIZ_VM_MODULAR_KERNEL}"
+          export VMIZ_VM_BOOT_MODULES_BUILTIN="${VMIZ_VM_MODULAR_MODULES_BUILTIN}"
+          export VMIZ_VM_BOOT_MODULE_TREE="${VMIZ_VM_MODULAR_MODULE_TREE}"
+          VMIZ_VM_QEMU="$(readlink -f "$(command -v "qemu-system-$(uname -m)")")" \
             zig build test-vm-real-boot --summary all

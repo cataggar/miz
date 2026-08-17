@@ -2,7 +2,7 @@
 //! state" protocol needed to provision a VM: protocol version negotiation,
 //! fetching the goal state (incarnation/container id/role instance id), and
 //! reporting instance health back to the WireServer. This is a building
-//! block for `azagent` (see github.com/cataggar/zvmi issue #112); the
+//! block for `azagent` (see github.com/cataggar/vmiz issue #112); the
 //! HostGAPlugin/vmSettings fast-track path, IMDS, extension config/manifest
 //! handling, and client-certificate-authenticated endpoints are explicitly
 //! out of scope (see issue #111).

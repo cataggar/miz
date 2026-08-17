@@ -1,8 +1,8 @@
 //! Architecture-matched EDK2 resolution for the `vm` backend's firmware boot.
 //!
 //! The search itself is not restated here: it is `qemu_host`, the same module
-//! `zvmi qemu` resolves its own firmware through, so a firmware boot of a
-//! customization run and a hand-driven `zvmi qemu` run of the same image find
+//! `vmiz qemu` resolves its own firmware through, so a firmware boot of a
+//! customization run and a hand-driven `vmiz qemu` run of the same image find
 //! the same files in the same order. What this module adds is the part that is
 //! specific to a customization: the resolved pair has to be raw (the backend
 //! hands paths to an emulator, not a decompressor) and it has to live at a
@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const qemu_host = @import("qemu_host");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 
 pub const ResolveError = Error || std.mem.Allocator.Error;
 
@@ -37,7 +37,7 @@ pub const Resolved = struct {
 };
 
 pub const Options = struct {
-    architecture: zvmi.customize.Architecture,
+    architecture: vmiz.customize.Architecture,
     /// The `qemu-system-<arch>` binary the plan names. Its directory is the
     /// first place the search looks, which is what makes one `ghr` install of
     /// `cataggar/qemu` cover both guest architectures.
@@ -52,7 +52,7 @@ pub const Options = struct {
     materialize_directory: []const u8,
 };
 
-fn guestArchitecture(architecture: zvmi.customize.Architecture) qemu_host.GuestArchitecture {
+fn guestArchitecture(architecture: vmiz.customize.Architecture) qemu_host.GuestArchitecture {
     return switch (architecture) {
         .x86_64 => .x86_64,
         .aarch64 => .aarch64,

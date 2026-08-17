@@ -1,12 +1,12 @@
 //! Opportunistic real-QEMU boot verification for images produced by
-//! `zvmi.build_image.build()`. Skipped gracefully (not failed) whenever
-//! `qemu-system-x86_64`, OVMF firmware, or the `ZVMI_BOOT_TEST_ISO`/
-//! `ZVMI_BOOT_TEST_OCI` fixture env vars aren't available, matching the
+//! `vmiz.build_image.build()`. Skipped gracefully (not failed) whenever
+//! `qemu-system-x86_64`, OVMF firmware, or the `VMIZ_BOOT_TEST_ISO`/
+//! `VMIZ_BOOT_TEST_OCI` fixture env vars aren't available, matching the
 //! opportunistic-external-tool pattern used elsewhere in this repo.
 //!
-//! Lives outside `packages/zvmi` (rather than inside
-//! `packages/zvmi/src/build_image.zig`, where this test used to live)
-//! because it needs both `zvmi` (to actually build an image) and `qmp`
+//! Lives outside `packages/vmiz` (rather than inside
+//! `packages/vmiz/src/build_image.zig`, where this test used to live)
+//! because it needs both `vmiz` (to actually build an image) and `qmp`
 //! (to drive the resulting QEMU process precisely -- see issue #99) --
 //! two independent top-level components of this repo's single root
 //! `build.zig`, not something either component's own module should
@@ -14,13 +14,13 @@
 
 const std = @import("std");
 const Io = std.Io;
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 const qmp = @import("qmp");
 const qemu_host = @import("qemu_host");
 
 const qemu_boot_smoke_timeout_seconds: i64 = 120;
 const qemu_boot_smoke_serial_limit: usize = 256 * 1024;
-const qemu_boot_smoke_disk_size: u64 = 4 * 1024 * zvmi.azure.one_mib;
+const qemu_boot_smoke_disk_size: u64 = 4 * 1024 * vmiz.azure.one_mib;
 
 pub const OvmfFirmwarePair = qemu_host.FirmwarePair;
 
@@ -137,15 +137,15 @@ fn requireOvmfFirmwarePairAlloc(
     io: Io,
     qemu_path: []const u8,
 ) !OvmfFirmwarePair {
-    const env_code = try getOptionalTestEnvPathAlloc(allocator, "ZVMI_BOOT_TEST_OVMF_CODE");
+    const env_code = try getOptionalTestEnvPathAlloc(allocator, "VMIZ_BOOT_TEST_OVMF_CODE");
     defer if (env_code) |path| allocator.free(path);
-    const env_vars = try getOptionalTestEnvPathAlloc(allocator, "ZVMI_BOOT_TEST_OVMF_VARS");
+    const env_vars = try getOptionalTestEnvPathAlloc(allocator, "VMIZ_BOOT_TEST_OVMF_VARS");
     defer if (env_vars) |path| allocator.free(path);
 
     if (env_code != null or env_vars != null) {
         if (env_code == null or env_vars == null) {
             std.debug.print(
-                "skipping build-image QEMU boot smoke test: set both ZVMI_BOOT_TEST_OVMF_CODE and ZVMI_BOOT_TEST_OVMF_VARS together\n",
+                "skipping build-image QEMU boot smoke test: set both VMIZ_BOOT_TEST_OVMF_CODE and VMIZ_BOOT_TEST_OVMF_VARS together\n",
                 .{},
             );
             return error.SkipZigTest;
@@ -169,7 +169,7 @@ fn requireOvmfFirmwarePairAlloc(
     })) |pair| return pair;
 
     std.debug.print(
-        "skipping build-image QEMU boot smoke test: OVMF firmware not found; set ZVMI_BOOT_TEST_OVMF_CODE and ZVMI_BOOT_TEST_OVMF_VARS\n",
+        "skipping build-image QEMU boot smoke test: OVMF firmware not found; set VMIZ_BOOT_TEST_OVMF_CODE and VMIZ_BOOT_TEST_OVMF_VARS\n",
         .{},
     );
     return error.SkipZigTest;
@@ -182,7 +182,7 @@ fn requireIsoOciFixturesAlloc(
     const iso_path = try requireProvisionedBootTestPathAlloc(
         allocator,
         io,
-        "ZVMI_BOOT_TEST_ISO",
+        "VMIZ_BOOT_TEST_ISO",
         "bootable ISO fixture",
     );
     errdefer allocator.free(iso_path);
@@ -190,7 +190,7 @@ fn requireIsoOciFixturesAlloc(
     const oci_path = try requireProvisionedBootTestPathAlloc(
         allocator,
         io,
-        "ZVMI_BOOT_TEST_OCI",
+        "VMIZ_BOOT_TEST_OCI",
         "OCI layout fixture",
     );
     errdefer allocator.free(oci_path);
@@ -466,33 +466,33 @@ test "build-image boot-smokes typed customization and generalization under Gen2 
     defer Io.Dir.cwd().deleteFile(io, ovmf_vars_copy_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, serial_output_path) catch {};
 
-    const service_name = "zvmi-customization-smoke.service";
+    const service_name = "vmiz-customization-smoke.service";
     const smoke_script =
         \\#!/bin/sh
         \\set -eu
-        \\test "$(cat /etc/hostname)" = "zvmi-customized"
-        \\grep -q '^zvmi-smoke:' /etc/passwd
-        \\grep -q 'ssh-ed25519 AAAATEST zvmi-smoke' /home/zvmi-smoke/.ssh/authorized_keys
+        \\test "$(cat /etc/hostname)" = "vmiz-customized"
+        \\grep -q '^vmiz-smoke:' /etc/passwd
+        \\grep -q 'ssh-ed25519 AAAATEST vmiz-smoke' /home/vmiz-smoke/.ssh/authorized_keys
         \\test ! -e /var/lib/azagent/captured
-        \\printf 'ZVMI customization verified\n' >/dev/ttyS0
+        \\printf 'VMIZ customization verified\n' >/dev/ttyS0
         \\
     ;
     const service_unit =
         \\[Unit]
-        \\Description=Verify zvmi typed image customization
+        \\Description=Verify vmiz typed image customization
         \\After=local-fs.target
         \\
         \\[Service]
         \\Type=oneshot
-        \\ExecStart=/usr/local/sbin/zvmi-customization-smoke
+        \\ExecStart=/usr/local/sbin/vmiz-customization-smoke
         \\
         \\[Install]
         \\WantedBy=multi-user.target
         \\
     ;
-    const filesystem = [_]zvmi.os_customization.FilesystemOperation{
+    const filesystem = [_]vmiz.os_customization.FilesystemOperation{
         .{ .put_file = .{
-            .path = "/usr/local/sbin/zvmi-customization-smoke",
+            .path = "/usr/local/sbin/vmiz-customization-smoke",
             .source = .{ .inline_bytes = smoke_script },
             .metadata = .{ .mode = 0o755 },
         } },
@@ -505,15 +505,15 @@ test "build-image boot-smokes typed customization and generalization under Gen2 
             .source = .{ .inline_bytes = "remove-me" },
         } },
     };
-    const users = [_]zvmi.os_customization.User{.{
-        .name = "zvmi-smoke",
-        .ssh_authorized_keys = &.{"ssh-ed25519 AAAATEST zvmi-smoke"},
+    const users = [_]vmiz.os_customization.User{.{
+        .name = "vmiz-smoke",
+        .ssh_authorized_keys = &.{"ssh-ed25519 AAAATEST vmiz-smoke"},
     }};
-    const services = [_]zvmi.os_customization.Service{.{
+    const services = [_]vmiz.os_customization.Service{.{
         .name = service_name,
         .state = .enabled,
     }};
-    var report = try zvmi.build_image.build(allocator, io, .{
+    var report = try vmiz.build_image.build(allocator, io, .{
         .iso_path = prereqs.iso_path,
         .container_path = prereqs.oci_path,
         .output_path = output_path,
@@ -523,7 +523,7 @@ test "build-image boot-smokes typed customization and generalization under Gen2 
         .extra_kernel_options = "console=tty0 console=ttyS0,115200n8 selinux=0",
         .os = .{
             .filesystem = &filesystem,
-            .hostname = "zvmi-customized",
+            .hostname = "vmiz-customized",
             .users = &users,
             .services = &services,
         },
@@ -540,12 +540,12 @@ test "build-image boot-smokes typed customization and generalization under Gen2 
         .{ .firmware = ovmf, .vars_copy_path = ovmf_vars_copy_path },
         output_path,
         serial_output_path,
-        "ZVMI customization verified",
+        "VMIZ customization verified",
     );
     defer qemu.deinit(allocator);
 
     if (!serialOutputShowsKernelBoot(qemu.serial_output) or
-        std.mem.indexOf(u8, qemu.serial_output, "ZVMI customization verified") == null)
+        std.mem.indexOf(u8, qemu.serial_output, "VMIZ customization verified") == null)
     {
         std.debug.print(
             "QEMU customization boot smoke did not reach its marker (timed_out={}, quit_acknowledged={})\nserial output:\n{s}\n",
@@ -553,7 +553,7 @@ test "build-image boot-smokes typed customization and generalization under Gen2 
         );
     }
     try std.testing.expect(serialOutputShowsKernelBoot(qemu.serial_output));
-    try std.testing.expect(std.mem.indexOf(u8, qemu.serial_output, "ZVMI customization verified") != null);
+    try std.testing.expect(std.mem.indexOf(u8, qemu.serial_output, "VMIZ customization verified") != null);
 }
 
 test "native-edit boot-smokes a kernel argument appended to an already-built image" {
@@ -578,30 +578,30 @@ test "native-edit boot-smokes a kernel argument appended to an already-built ima
 
     // The image is built without the argument, so reaching the marker can only
     // mean the preserved-image edit put it on the command line afterwards.
-    const service_name = "zvmi-kernel-options-smoke.service";
+    const service_name = "vmiz-kernel-options-smoke.service";
     const smoke_script =
         \\#!/bin/sh
         \\set -eu
-        \\grep -q 'zvmi.smoke=applied' /proc/cmdline
-        \\printf 'ZVMI kernel option verified\n' >/dev/ttyS0
+        \\grep -q 'vmiz.smoke=applied' /proc/cmdline
+        \\printf 'VMIZ kernel option verified\n' >/dev/ttyS0
         \\
     ;
     const service_unit =
         \\[Unit]
-        \\Description=Verify a zvmi kernel-argument change
+        \\Description=Verify a vmiz kernel-argument change
         \\After=local-fs.target
         \\
         \\[Service]
         \\Type=oneshot
-        \\ExecStart=/usr/local/sbin/zvmi-kernel-options-smoke
+        \\ExecStart=/usr/local/sbin/vmiz-kernel-options-smoke
         \\
         \\[Install]
         \\WantedBy=multi-user.target
         \\
     ;
-    const filesystem = [_]zvmi.os_customization.FilesystemOperation{
+    const filesystem = [_]vmiz.os_customization.FilesystemOperation{
         .{ .put_file = .{
-            .path = "/usr/local/sbin/zvmi-kernel-options-smoke",
+            .path = "/usr/local/sbin/vmiz-kernel-options-smoke",
             .source = .{ .inline_bytes = smoke_script },
             .metadata = .{ .mode = 0o755 },
         } },
@@ -610,11 +610,11 @@ test "native-edit boot-smokes a kernel argument appended to an already-built ima
             .source = .{ .inline_bytes = service_unit },
         } },
     };
-    const services = [_]zvmi.os_customization.Service{.{
+    const services = [_]vmiz.os_customization.Service{.{
         .name = service_name,
         .state = .enabled,
     }};
-    var build_report = try zvmi.build_image.build(allocator, io, .{
+    var build_report = try vmiz.build_image.build(allocator, io, .{
         .iso_path = prereqs.iso_path,
         .container_path = prereqs.oci_path,
         .output_path = base_path,
@@ -629,7 +629,7 @@ test "native-edit boot-smokes a kernel argument appended to an already-built ima
     });
     defer build_report.deinit(allocator);
 
-    var request = zvmi.customize.Request{
+    var request = vmiz.customize.Request{
         .target_architecture = .x86_64,
         .input = .{ .disk = .{ .path = base_path } },
         .output = .{
@@ -642,13 +642,13 @@ test "native-edit boot-smokes a kernel argument appended to an already-built ima
             .workspace_path = workspace_path,
             .backend = .native_edit,
         },
-        .boot_security = .{ .extra_kernel_options = "zvmi.smoke=applied" },
+        .boot_security = .{ .extra_kernel_options = "vmiz.smoke=applied" },
         .reproducibility = .{
             .seed = .{ .bytes = [_]u8{0x5B} ** 32 },
             .source_date_epoch = 1_735_689_600,
         },
     };
-    var resolved = try zvmi.customize.resolve(
+    var resolved = try vmiz.customize.resolve(
         allocator,
         &request,
         .{ .host_architecture = .x86_64 },
@@ -656,11 +656,11 @@ test "native-edit boot-smokes a kernel argument appended to an already-built ima
     defer resolved.deinit(allocator);
     try std.testing.expect(!resolved.diagnostics.hasErrors());
 
-    var outcome = try zvmi.customize.execute(
+    var outcome = try vmiz.customize.execute(
         allocator,
         io,
         &resolved.plan.?,
-        zvmi.customize.Platform.system(),
+        vmiz.customize.Platform.system(),
         null,
     );
     defer outcome.deinit(allocator);
@@ -677,12 +677,12 @@ test "native-edit boot-smokes a kernel argument appended to an already-built ima
         .{ .firmware = ovmf, .vars_copy_path = ovmf_vars_copy_path },
         output_path,
         serial_output_path,
-        "ZVMI kernel option verified",
+        "VMIZ kernel option verified",
     );
     defer qemu.deinit(allocator);
 
     if (!serialOutputShowsKernelBoot(qemu.serial_output) or
-        std.mem.indexOf(u8, qemu.serial_output, "ZVMI kernel option verified") == null)
+        std.mem.indexOf(u8, qemu.serial_output, "VMIZ kernel option verified") == null)
     {
         std.debug.print(
             "QEMU kernel-option boot smoke did not reach its marker (timed_out={}, quit_acknowledged={})\nserial output:\n{s}\n",
@@ -690,7 +690,7 @@ test "native-edit boot-smokes a kernel argument appended to an already-built ima
         );
     }
     try std.testing.expect(serialOutputShowsKernelBoot(qemu.serial_output));
-    try std.testing.expect(std.mem.indexOf(u8, qemu.serial_output, "ZVMI kernel option verified") != null);
+    try std.testing.expect(std.mem.indexOf(u8, qemu.serial_output, "VMIZ kernel option verified") != null);
 }
 
 test "build-image opportunistically boot-smokes a provisioned Gen1 BIOS raw image under QEMU" {
@@ -708,7 +708,7 @@ test "build-image opportunistically boot-smokes a provisioned Gen1 BIOS raw imag
     // Gen1/BIOS: MBR-partitioned, GRUB embedded in the post-MBR gap. No OVMF
     // needed -- QEMU's built-in SeaBIOS boots the raw disk's embedded GRUB
     // directly (see PR #82/#83 for the structural coverage this complements).
-    var report = try zvmi.build_image.build(allocator, io, .{
+    var report = try vmiz.build_image.build(allocator, io, .{
         .iso_path = prereqs.iso_path,
         .container_path = prereqs.oci_path,
         .output_path = output_path,
@@ -756,14 +756,14 @@ test "build-image --boot-mode uki fails fast against a provisioned real ISO/OCI 
     const output_path = "test-build-image-uki-real-media.raw";
     defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
 
-    try std.testing.expectError(error.MissingUkiStub, zvmi.build_image.build(allocator, io, .{
+    try std.testing.expectError(error.MissingUkiStub, vmiz.build_image.build(allocator, io, .{
         .iso_path = fixtures.iso_path,
         .container_path = fixtures.oci_path,
         .output_path = output_path,
         .output_format = .raw,
         .generation = .gen2,
-        .esp_size = 512 * zvmi.azure.one_mib,
-        .size = qemu_boot_smoke_disk_size + 512 * zvmi.azure.one_mib,
+        .esp_size = 512 * vmiz.azure.one_mib,
+        .size = qemu_boot_smoke_disk_size + 512 * vmiz.azure.one_mib,
         .boot_mode = .uki_only,
     }));
 }
@@ -773,7 +773,7 @@ test "build-image --boot-mode uki opportunistically boot-smokes a provisioned st
     // separately-provisioned fixture beyond the base ISO/OCI: a container
     // that adds a systemd EFI stub (e.g. linuxx64.efi.stub from the
     // systemd-boot-unsigned package) into the merged source tree. Skips
-    // (not fails) when ZVMI_BOOT_TEST_UKI_OCI isn't set.
+    // (not fails) when VMIZ_BOOT_TEST_UKI_OCI isn't set.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -782,9 +782,9 @@ test "build-image --boot-mode uki opportunistically boot-smokes a provisioned st
     var ovmf = try requireOvmfFirmwarePairAlloc(allocator, io, prereqs.qemu_path);
     defer ovmf.deinit(allocator);
 
-    const uki_oci_path = try optionalProvisionedBootTestPathAlloc(allocator, io, "ZVMI_BOOT_TEST_UKI_OCI") orelse {
+    const uki_oci_path = try optionalProvisionedBootTestPathAlloc(allocator, io, "VMIZ_BOOT_TEST_UKI_OCI") orelse {
         std.debug.print(
-            "skipping build-image --boot-mode uki QEMU boot smoke test: set ZVMI_BOOT_TEST_UKI_OCI to an OCI layout providing a systemd EFI stub\n",
+            "skipping build-image --boot-mode uki QEMU boot smoke test: set VMIZ_BOOT_TEST_UKI_OCI to an OCI layout providing a systemd EFI stub\n",
             .{},
         );
         return error.SkipZigTest;
@@ -798,7 +798,7 @@ test "build-image --boot-mode uki opportunistically boot-smokes a provisioned st
     defer Io.Dir.cwd().deleteFile(io, ovmf_vars_copy_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, serial_output_path) catch {};
 
-    var report = try zvmi.build_image.build(allocator, io, .{
+    var report = try vmiz.build_image.build(allocator, io, .{
         .iso_path = prereqs.iso_path,
         .container_path = uki_oci_path,
         .output_path = output_path,
@@ -807,8 +807,8 @@ test "build-image --boot-mode uki opportunistically boot-smokes a provisioned st
         // UKI mode stores the kernel/initrd inside the EFI binary itself, so
         // it needs a bigger ESP than BLS/GRUB mode -- see the UKI guidance
         // in doc/image-building.md.
-        .esp_size = 512 * zvmi.azure.one_mib,
-        .size = qemu_boot_smoke_disk_size + 512 * zvmi.azure.one_mib,
+        .esp_size = 512 * vmiz.azure.one_mib,
+        .size = qemu_boot_smoke_disk_size + 512 * vmiz.azure.one_mib,
         .boot_mode = .uki_only,
         .extra_kernel_options = "console=tty0 console=ttyS0,115200n8",
     });
@@ -844,7 +844,7 @@ test "build-image --verity fails fast against a provisioned real ISO/OCI whose i
     // dm-verity userspace tooling. `build-image --verity` should fail fast
     // with `error.InitramfsMissingVerityTooling` against such media instead
     // of silently producing an image that hangs at boot. No QEMU needed:
-    // this only exercises `zvmi.build_image.build()` itself.
+    // this only exercises `vmiz.build_image.build()` itself.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -854,7 +854,7 @@ test "build-image --verity fails fast against a provisioned real ISO/OCI whose i
     const output_path = "test-build-image-verity-real-media.raw";
     defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
 
-    try std.testing.expectError(error.InitramfsMissingVerityTooling, zvmi.build_image.build(allocator, io, .{
+    try std.testing.expectError(error.InitramfsMissingVerityTooling, vmiz.build_image.build(allocator, io, .{
         .iso_path = fixtures.iso_path,
         .container_path = fixtures.oci_path,
         .output_path = output_path,
@@ -872,7 +872,7 @@ test "build-image --verity opportunistically boot-smokes a provisioned verity-ca
     // at the same boot/initramfs-<kver>.img path the base ISO/squashfs
     // rootfs uses -- see "Producing a verity-capable initramfs" in
     // doc/image-building.md. Most dev/CI setups won't have this provisioned,
-    // so this skips (not fails) when ZVMI_BOOT_TEST_VERITY_OCI isn't set,
+    // so this skips (not fails) when VMIZ_BOOT_TEST_VERITY_OCI isn't set,
     // on top of the usual QEMU/OVMF/ISO prerequisites.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -882,9 +882,9 @@ test "build-image --verity opportunistically boot-smokes a provisioned verity-ca
     var ovmf = try requireOvmfFirmwarePairAlloc(allocator, io, prereqs.qemu_path);
     defer ovmf.deinit(allocator);
 
-    const verity_oci_path = try optionalProvisionedBootTestPathAlloc(allocator, io, "ZVMI_BOOT_TEST_VERITY_OCI") orelse {
+    const verity_oci_path = try optionalProvisionedBootTestPathAlloc(allocator, io, "VMIZ_BOOT_TEST_VERITY_OCI") orelse {
         std.debug.print(
-            "skipping build-image --verity QEMU boot smoke test: set ZVMI_BOOT_TEST_VERITY_OCI to an OCI layout overlaying a verity-capable initramfs\n",
+            "skipping build-image --verity QEMU boot smoke test: set VMIZ_BOOT_TEST_VERITY_OCI to an OCI layout overlaying a verity-capable initramfs\n",
             .{},
         );
         return error.SkipZigTest;
@@ -898,7 +898,7 @@ test "build-image --verity opportunistically boot-smokes a provisioned verity-ca
     defer Io.Dir.cwd().deleteFile(io, ovmf_vars_copy_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, serial_output_path) catch {};
 
-    var report = try zvmi.build_image.build(allocator, io, .{
+    var report = try vmiz.build_image.build(allocator, io, .{
         .iso_path = prereqs.iso_path,
         .container_path = verity_oci_path,
         .output_path = output_path,
@@ -911,8 +911,8 @@ test "build-image --verity opportunistically boot-smokes a provisioned verity-ca
         // seeing the CI runner's own hardware instead of the eventual QEMU
         // boot-smoke guest's). The default 96 MiB ESP has margin to spare
         // but this keeps it comfortably sized regardless.
-        .esp_size = 512 * zvmi.azure.one_mib,
-        .size = qemu_boot_smoke_disk_size + 512 * zvmi.azure.one_mib,
+        .esp_size = 512 * vmiz.azure.one_mib,
+        .size = qemu_boot_smoke_disk_size + 512 * vmiz.azure.one_mib,
         .verity = true,
         .extra_kernel_options = "console=tty0 console=ttyS0,115200n8",
     });
@@ -962,7 +962,7 @@ test "build-iso opportunistically boot-smokes a regenerated LiveOS ISO as a UEFI
 
     // Gated on the same real fixtures as the build-image boot smokes plus
     // OVMF; skips cleanly (never fails) whenever qemu, OVMF, or the
-    // ZVMI_BOOT_TEST_ISO/ZVMI_BOOT_TEST_OCI fixtures are unavailable. An ISO
+    // VMIZ_BOOT_TEST_ISO/VMIZ_BOOT_TEST_OCI fixtures are unavailable. An ISO
     // is booted through UEFI El Torito here, so OVMF is required.
     var prereqs = try requireQemuBootSmokePrereqs(allocator, io);
     defer prereqs.deinit(allocator);
@@ -976,7 +976,7 @@ test "build-iso opportunistically boot-smokes a regenerated LiveOS ISO as a UEFI
     defer Io.Dir.cwd().deleteFile(io, ovmf_vars_copy_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, serial_output_path) catch {};
 
-    var report = try zvmi.build_iso.build(allocator, io, .{
+    var report = try vmiz.build_iso.build(allocator, io, .{
         .iso_path = prereqs.iso_path,
         .container_path = prereqs.oci_path,
         .output_path = output_path,

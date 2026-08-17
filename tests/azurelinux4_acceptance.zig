@@ -1,6 +1,6 @@
 //! Opt-in native-QEMU acceptance for finalized Azure Linux 4 QCOW2 images.
 //!
-//! The selected build options and `ZVMI_AZURELINUX4_IMAGE` must agree on one
+//! The selected build options and `VMIZ_AZURELINUX4_IMAGE` must agree on one
 //! of the four release candidates.  This deliberately refuses TCG: release
 //! acceptance is run only by a native x86_64 or AArch64 matrix entry.
 
@@ -9,13 +9,13 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const qemu_host = @import("qemu_host");
 const qmp = @import("qmp");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const Io = std.Io;
 
-const admin_username = "zvmitest";
+const admin_username = "vmiztest";
 const boot_timeout_seconds: i64 = 8 * 60;
 const serial_limit: usize = 2 * 1024 * 1024;
 
@@ -30,14 +30,14 @@ const Architecture = enum {
         };
     }
 
-    fn rootGuid(self: Architecture) zvmi.guid.Guid {
+    fn rootGuid(self: Architecture) vmiz.guid.Guid {
         return switch (self) {
-            .x86_64 => zvmi.guid.linux_root_x86_64,
-            .aarch64 => zvmi.guid.linux_root_aarch64,
+            .x86_64 => vmiz.guid.linux_root_x86_64,
+            .aarch64 => vmiz.guid.linux_root_aarch64,
         };
     }
 
-    fn rootRole(self: Architecture) zvmi.layout.PartitionRole {
+    fn rootRole(self: Architecture) vmiz.layout.PartitionRole {
         return switch (self) {
             .x86_64 => .root_x86_64,
             .aarch64 => .root_aarch64,
@@ -246,10 +246,10 @@ fn requireImageAlloc(
 ) ![]u8 {
     const image_path = try optionalEnvAlloc(
         allocator,
-        "ZVMI_AZURELINUX4_IMAGE",
+        "VMIZ_AZURELINUX4_IMAGE",
     ) orelse {
         std.debug.print(
-            "skipping Azure Linux 4 acceptance: set ZVMI_AZURELINUX4_IMAGE to {s}\n",
+            "skipping Azure Linux 4 acceptance: set VMIZ_AZURELINUX4_IMAGE to {s}\n",
             .{candidate.expectedFileName()},
         );
         return error.SkipZigTest;
@@ -265,7 +265,7 @@ fn requireImageAlloc(
     }
     if (!try qemu_host.pathAccessible(io, image_path, .{ .read = true })) {
         std.debug.print(
-            "ZVMI_AZURELINUX4_IMAGE is not readable: {s}\n",
+            "VMIZ_AZURELINUX4_IMAGE is not readable: {s}\n",
             .{image_path},
         );
         return error.AcceptanceImageNotReadable;
@@ -361,7 +361,7 @@ fn requireToolOverrideAlloc(
 fn requireFoundFirmware(firmware: ?Firmware) !Firmware {
     return firmware orelse {
         std.debug.print(
-            "Azure Linux 4 acceptance requires matching UEFI firmware; set ZVMI_AZURELINUX4_UEFI_CODE and ZVMI_AZURELINUX4_UEFI_VARS\n",
+            "Azure Linux 4 acceptance requires matching UEFI firmware; set VMIZ_AZURELINUX4_UEFI_CODE and VMIZ_AZURELINUX4_UEFI_VARS\n",
             .{},
         );
         return error.RequiredFirmwareNotFound;
@@ -377,12 +377,12 @@ fn requireFirmwareAlloc(
 ) !Firmware {
     const explicit_code = if (secure_boot) try optionalEnvAlloc(
         allocator,
-        "ZVMI_AZURELINUX4_UEFI_CODE",
+        "VMIZ_AZURELINUX4_UEFI_CODE",
     ) else null;
     defer if (explicit_code) |path| allocator.free(path);
     const explicit_vars = if (secure_boot) try optionalEnvAlloc(
         allocator,
-        "ZVMI_AZURELINUX4_UEFI_VARS",
+        "VMIZ_AZURELINUX4_UEFI_VARS",
     ) else null;
     defer if (explicit_vars) |path| allocator.free(path);
 
@@ -460,7 +460,7 @@ fn canonicalCertificateSha256(
     openssl_path: []const u8,
     certificate_path: []const u8,
     output_path: []const u8,
-) !zvmi.artifact_pipeline.Digest {
+) !vmiz.artifact_pipeline.Digest {
     try runCommand(allocator, io, &.{
         openssl_path,
         "x509",
@@ -479,7 +479,7 @@ fn canonicalCertificateSha256(
     );
     defer allocator.free(certificate);
     if (certificate.len == 0) return error.EmptySigningCertificate;
-    return zvmi.artifact_pipeline.sha256Bytes(certificate);
+    return vmiz.artifact_pipeline.sha256Bytes(certificate);
 }
 
 fn prepareEnrolledVars(
@@ -516,24 +516,24 @@ fn verifyUkiSignatures(
     scratch_path: []const u8,
 ) !void {
     var file = try Dir.cwd().openFile(io, image_path, .{ .mode = .read_only });
-    var image = try zvmi.Image.openStandaloneQcow2File(io, file);
+    var image = try vmiz.Image.openStandaloneQcow2File(io, file);
     defer image.close(io);
     file = undefined;
-    const parsed = try zvmi.gpt.readGpt(image, io, allocator);
+    const parsed = try vmiz.gpt.readGpt(image, io, allocator);
     defer allocator.free(parsed.partitions);
     if (parsed.partitions.len < 1 or
-        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &zvmi.guid.esp))
+        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &vmiz.guid.esp))
     {
         return error.MissingEspPartition;
     }
     const partition = parsed.partitions[0];
-    var esp = try zvmi.fat32.open(&image, io, .{
-        .offset = partition.first_lba * zvmi.gpt.sector_size,
+    var esp = try vmiz.fat32.open(&image, io, .{
+        .offset = partition.first_lba * vmiz.gpt.sector_size,
         .length = (partition.last_lba - partition.first_lba + 1) *
-            zvmi.gpt.sector_size,
+            vmiz.gpt.sector_size,
     });
     const entries = try esp.listDirAlloc(io, allocator, "EFI/Linux");
-    defer zvmi.fat32.freeDirEntries(allocator, entries);
+    defer vmiz.fat32.freeDirEntries(allocator, entries);
     var index: usize = 0;
     for (entries) |entry| {
         if (entry.kind != .file or entry.name.len <= 4 or
@@ -598,11 +598,11 @@ fn verifyNativeUkiCertificate(
     io: Io,
     image_path: []const u8,
     expected_certificate_der: []const u8,
-    expected_certificate_sha256: zvmi.artifact_pipeline.Digest,
+    expected_certificate_sha256: vmiz.artifact_pipeline.Digest,
 ) !void {
-    var image = try zvmi.Image.openPathReadOnlyStandalone(io, image_path);
+    var image = try vmiz.Image.openPathReadOnlyStandalone(io, image_path);
     defer image.close(io);
-    var extracted = try zvmi.uki_certificate.extractAlloc(
+    var extracted = try vmiz.uki_certificate.extractAlloc(
         allocator,
         io,
         &image,
@@ -622,7 +622,7 @@ fn tamperUkiCmdlineAlloc(
     allocator: Allocator,
     signed: []const u8,
 ) ![]u8 {
-    var inspection = try zvmi.uki.inspect(allocator, signed);
+    var inspection = try vmiz.uki.inspect(allocator, signed);
     defer inspection.deinit(allocator);
     const cmdline = inspection.findSection(".cmdline") orelse
         return error.MissingUkiCmdline;
@@ -693,23 +693,23 @@ fn createTamperedOverlay(
         source_image,
         overlay_path,
     });
-    var image = try zvmi.Image.openPath(io, overlay_path);
+    var image = try vmiz.Image.openPath(io, overlay_path);
     defer image.close(io);
-    const parsed = try zvmi.gpt.readGpt(image, io, allocator);
+    const parsed = try vmiz.gpt.readGpt(image, io, allocator);
     defer allocator.free(parsed.partitions);
     if (parsed.partitions.len < 1 or
-        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &zvmi.guid.esp))
+        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &vmiz.guid.esp))
     {
         return error.MissingEspPartition;
     }
     const partition = parsed.partitions[0];
-    var esp = try zvmi.fat32.open(&image, io, .{
-        .offset = partition.first_lba * zvmi.gpt.sector_size,
+    var esp = try vmiz.fat32.open(&image, io, .{
+        .offset = partition.first_lba * vmiz.gpt.sector_size,
         .length = (partition.last_lba - partition.first_lba + 1) *
-            zvmi.gpt.sector_size,
+            vmiz.gpt.sector_size,
     });
     const entries = try esp.listDirAlloc(io, allocator, "EFI/Linux");
-    defer zvmi.fat32.freeDirEntries(allocator, entries);
+    defer vmiz.fat32.freeDirEntries(allocator, entries);
     var index: usize = 0;
     for (entries) |entry| {
         if (entry.kind != .file or entry.name.len <= 4 or
@@ -800,7 +800,7 @@ fn validateQemuImgInfo(
 }
 
 fn requireNonemptyUkiSection(
-    inspection: *const zvmi.uki.Inspection,
+    inspection: *const vmiz.uki.Inspection,
     name: []const u8,
 ) ![]const u8 {
     const section = inspection.findSection(name) orelse return error.MissingUkiSection;
@@ -813,9 +813,9 @@ fn validateFinalizedImage(
     io: Io,
     image_path: []const u8,
     candidate: Candidate,
-) !zvmi.artifact_pipeline.Digest {
+) !vmiz.artifact_pipeline.Digest {
     var file = try Dir.cwd().openFile(io, image_path, .{ .mode = .read_only });
-    var image = try zvmi.Image.openStandaloneQcow2File(io, file);
+    var image = try vmiz.Image.openStandaloneQcow2File(io, file);
     defer image.close(io);
     file = undefined;
 
@@ -827,25 +827,25 @@ fn validateFinalizedImage(
     if (image.virtual_size != candidate.expectedVirtualSize())
         return error.UnexpectedVirtualSize;
 
-    const parsed = try zvmi.gpt.readGpt(image, io, allocator);
+    const parsed = try vmiz.gpt.readGpt(image, io, allocator);
     defer allocator.free(parsed.partitions);
     if (parsed.partitions.len != 2) return error.UnexpectedPartitionCount;
     const esp_partition = parsed.partitions[0];
     const root_partition = parsed.partitions[1];
-    if (!std.mem.eql(u8, &esp_partition.partition_type_guid, &zvmi.guid.esp))
+    if (!std.mem.eql(u8, &esp_partition.partition_type_guid, &vmiz.guid.esp))
         return error.UnexpectedEspPartition;
     if (!std.mem.eql(u8, &root_partition.partition_type_guid, &candidate.architecture.rootGuid()))
         return error.UnexpectedRootArchitecture;
     const esp_size = (esp_partition.last_lba - esp_partition.first_lba + 1) *
-        zvmi.gpt.sector_size;
+        vmiz.gpt.sector_size;
     if (esp_size != 512 * 1024 * 1024)
         return error.UnexpectedEspSize;
-    if (esp_partition.first_lba % (1024 * 1024 / zvmi.gpt.sector_size) != 0)
+    if (esp_partition.first_lba % (1024 * 1024 / vmiz.gpt.sector_size) != 0)
         return error.UnexpectedEspAlignment;
     if (root_partition.first_lba != esp_partition.last_lba + 1 or
         root_partition.last_lba < root_partition.first_lba)
         return error.InvalidRootPartition;
-    const requests = [_]zvmi.layout.PartitionRequest{
+    const requests = [_]vmiz.layout.PartitionRequest{
         .{ .name = "ESP", .role = .esp, .filesystem = .fat32, .size = .{ .fixed = 512 * 1024 * 1024 } },
         .{
             .name = "root",
@@ -854,7 +854,7 @@ fn validateFinalizedImage(
             .size = .{ .percent = 100.0 },
         },
     };
-    const expected_layout = try zvmi.layout.planLayout(
+    const expected_layout = try vmiz.layout.planLayout(
         allocator,
         image.virtual_size,
         &requests,
@@ -868,13 +868,13 @@ fn validateFinalizedImage(
     {
         return error.InvalidRootPartition;
     }
-    if (std.mem.eql(u8, &root_partition.unique_partition_guid, &zvmi.guid.nil))
+    if (std.mem.eql(u8, &root_partition.unique_partition_guid, &vmiz.guid.nil))
         return error.InvalidRootPartitionGuid;
 
-    var esp = try zvmi.fat32.open(&image, io, .{
-        .offset = esp_partition.first_lba * zvmi.gpt.sector_size,
+    var esp = try vmiz.fat32.open(&image, io, .{
+        .offset = esp_partition.first_lba * vmiz.gpt.sector_size,
         .length = (esp_partition.last_lba - esp_partition.first_lba + 1) *
-            zvmi.gpt.sector_size,
+            vmiz.gpt.sector_size,
     });
     const uki = try esp.readFileAlloc(
         io,
@@ -883,7 +883,7 @@ fn validateFinalizedImage(
     );
     defer allocator.free(uki);
 
-    var inspection = try zvmi.uki.inspect(allocator, uki);
+    var inspection = try vmiz.uki.inspect(allocator, uki);
     defer inspection.deinit(allocator);
     if (inspection.machine != candidate.architecture.ukiMachine())
         return error.UnexpectedUkiArchitecture;
@@ -896,7 +896,7 @@ fn validateFinalizedImage(
     const cmdline = try requireNonemptyUkiSection(&inspection, ".cmdline");
 
     var root_guid_text: [36]u8 = undefined;
-    const root_guid = zvmi.guid.formatLower(
+    const root_guid = vmiz.guid.formatLower(
         &root_guid_text,
         root_partition.unique_partition_guid,
     );
@@ -913,7 +913,7 @@ fn validateFinalizedImage(
         .core => {
             const expected = try std.fmt.allocPrint(
                 allocator,
-                "{s}init=/sbin/zvminit zvminit.mode=persistent zvminit.azure=auto console=tty0 {s}",
+                "{s}init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=auto console=tty0 {s}",
                 .{ expected_prefix, candidate.architecture.serialConsole() },
             );
             defer allocator.free(expected);
@@ -929,13 +929,13 @@ fn validateFinalizedImage(
             defer allocator.free(expected);
             if (!std.mem.eql(u8, cmdline, expected))
                 return error.UnexpectedFullUkiCmdline;
-            if (std.mem.indexOf(u8, cmdline, "init=/sbin/zvminit") != null)
-                return error.FullImageContainsZvminitBootContract;
+            if (std.mem.indexOf(u8, cmdline, "init=/sbin/vmizinit") != null)
+                return error.FullImageContainsVmizinitBootContract;
         },
     }
 
     const entries = try esp.listDirAlloc(io, allocator, "EFI/Linux");
-    defer zvmi.fat32.freeDirEntries(allocator, entries);
+    defer vmiz.fat32.freeDirEntries(allocator, entries);
     var named_count: usize = 0;
     var fallback_matches_named = false;
     for (entries) |entry| {
@@ -953,14 +953,14 @@ fn validateFinalizedImage(
         defer allocator.free(named_path);
         const named = try esp.readFileAlloc(io, allocator, named_path);
         defer allocator.free(named);
-        var named_inspection = try zvmi.uki.inspect(allocator, named);
+        var named_inspection = try vmiz.uki.inspect(allocator, named);
         defer named_inspection.deinit(allocator);
         if (named_inspection.security_directory == null) return error.UnsignedUki;
         if (std.mem.eql(u8, named, uki)) fallback_matches_named = true;
     }
     if (named_count == 0) return error.MissingNamedUki;
     if (!fallback_matches_named) return error.FallbackUkiMismatch;
-    return zvmi.artifact_pipeline.sha256Bytes(uki);
+    return vmiz.artifact_pipeline.sha256Bytes(uki);
 }
 
 fn createSeed(
@@ -992,8 +992,8 @@ fn createSeed(
     try Dir.cwd().createDir(io, instance.seed_dir, .default_dir);
     const metadata = try std.fmt.allocPrint(
         allocator,
-        "instance-id: zvmi-azurelinux4-acceptance-{s}\n" ++
-            "local-hostname: zvmi-azurelinux4-{s}\n",
+        "instance-id: vmiz-azurelinux4-acceptance-{s}\n" ++
+            "local-hostname: vmiz-azurelinux4-{s}\n",
         .{ instance.label, instance.label },
     );
     defer allocator.free(metadata);
@@ -1002,7 +1002,7 @@ fn createSeed(
         \\#cloud-config
         \\users:
         \\  - default
-        \\  - name: zvmitest
+        \\  - name: vmiztest
         \\    groups: wheel
         \\    shell: /bin/bash
         \\    sudo: "ALL=(ALL) NOPASSWD:ALL"
@@ -1022,7 +1022,7 @@ fn createSeed(
         \\  <wa:ProvisioningSection>
         \\    <LinuxProvisioningConfigurationSet xmlns="http://schemas.microsoft.com/windowsazure">
         \\      <ConfigurationSetType>LinuxProvisioningConfiguration</ConfigurationSetType>
-        \\      <HostName>zvmi-azurelinux4-{s}</HostName>
+        \\      <HostName>vmiz-azurelinux4-{s}</HostName>
         \\      <UserName>{s}</UserName>
         \\      <DisableSshPasswordAuthentication>true</DisableSshPasswordAuthentication>
         \\      <SSH><PublicKeys><PublicKey><Path>/home/{s}/.ssh/authorized_keys</Path><Value>{s}</Value></PublicKey></PublicKeys></SSH>
@@ -1043,7 +1043,7 @@ fn createSeed(
     defer allocator.free(ovf_path);
     const marker_path = try std.fs.path.join(
         allocator,
-        &.{ instance.seed_dir, "zvmi-local-provisioning" },
+        &.{ instance.seed_dir, "vmiz-local-provisioning" },
     );
     defer allocator.free(marker_path);
 
@@ -1315,7 +1315,7 @@ fn sshOutputAlloc(
 
 fn efiDbContainsCertificate(
     variable: []const u8,
-    certificate_sha256: zvmi.artifact_pipeline.Digest,
+    certificate_sha256: vmiz.artifact_pipeline.Digest,
 ) bool {
     const efi_cert_x509_guid = [_]u8{
         0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
@@ -1359,7 +1359,7 @@ fn efiDbContainsCertificate(
         var signature_offset = signatures_start;
         while (signature_offset < list_end) : (signature_offset += signature_size) {
             const certificate = variable[signature_offset + 16 .. signature_offset + signature_size];
-            const digest = zvmi.artifact_pipeline.sha256Bytes(certificate);
+            const digest = vmiz.artifact_pipeline.sha256Bytes(certificate);
             if (is_x509 and std.mem.eql(u8, &digest, &certificate_sha256)) return true;
         }
         list_offset = list_end;
@@ -1373,7 +1373,7 @@ fn verifyGuestSecureBoot(
     ssh_path: []const u8,
     candidate: Candidate,
     instance: *const Instance,
-    certificate_sha256: zvmi.artifact_pipeline.Digest,
+    certificate_sha256: vmiz.artifact_pipeline.Digest,
 ) !void {
     const db = try sshOutputAlloc(
         allocator,
@@ -1565,7 +1565,7 @@ fn verifyAdminLogin(
 
 const core_checks =
     \\set -eu
-    \\sudo -n /usr/bin/test /proc/1/exe -ef /sbin/zvminit
+    \\sudo -n /usr/bin/test /proc/1/exe -ef /sbin/vmizinit
     \\test -f /var/lib/azagent/provisioned
     \\find_sshd_master() {
     \\  for proc in /proc/[0-9]*; do
@@ -1603,8 +1603,8 @@ fn readCoreSshdPid(
 const full_checks =
     \\set -eu
     \\sudo -n /usr/bin/test /proc/1/exe -ef /usr/lib/systemd/systemd
-    \\test ! -e /sbin/zvminit
-    \\test ! -e /usr/bin/zvminit
+    \\test ! -e /sbin/vmizinit
+    \\test ! -e /usr/bin/vmizinit
     \\for unit in cloud-init-local.service cloud-init-main.service cloud-init-network.service cloud-config.service cloud-final.service waagent.service sshd.service systemd-networkd.service; do
     \\  systemctl is-active --quiet "$unit"
     \\  systemctl is-enabled --quiet "$unit"
@@ -1793,7 +1793,7 @@ test "EFI db parser finds the exact enrolled DER certificate" {
         .little,
     );
     @memcpy(variable[list_offset + 28 + 16 ..], certificate);
-    const digest = zvmi.artifact_pipeline.sha256Bytes(certificate);
+    const digest = vmiz.artifact_pipeline.sha256Bytes(certificate);
     try std.testing.expect(efiDbContainsCertificate(&variable, digest));
     try std.testing.expect(!efiDbContainsCertificate(
         &variable,
@@ -1820,7 +1820,7 @@ test "Azure Linux 4 finalized QCOW2 boots, provisions, restarts, and powers off"
     const qemu_path = try requireToolOverrideAlloc(
         allocator,
         io,
-        "ZVMI_AZURELINUX4_QEMU",
+        "VMIZ_AZURELINUX4_QEMU",
         qemu_host.qemuSystemName(candidate.architecture.guestArchitecture()),
     );
     defer allocator.free(qemu_path);
@@ -1837,41 +1837,41 @@ test "Azure Linux 4 finalized QCOW2 boots, provisions, restarts, and powers off"
     const sbverify_path = try requireToolOverrideAlloc(
         allocator,
         io,
-        "ZVMI_AZURELINUX4_SBVERIFY",
+        "VMIZ_AZURELINUX4_SBVERIFY",
         "sbverify",
     );
     defer allocator.free(sbverify_path);
     const virt_fw_vars_path = try requireToolOverrideAlloc(
         allocator,
         io,
-        "ZVMI_AZURELINUX4_VIRT_FW_VARS",
+        "VMIZ_AZURELINUX4_VIRT_FW_VARS",
         "virt-fw-vars",
     );
     defer allocator.free(virt_fw_vars_path);
     const certificate_path = try requireEnvAlloc(
         allocator,
-        "ZVMI_AZURELINUX4_SIGNING_CERTIFICATE",
+        "VMIZ_AZURELINUX4_SIGNING_CERTIFICATE",
     );
     defer allocator.free(certificate_path);
     const expected_certificate_text = try requireEnvAlloc(
         allocator,
-        "ZVMI_AZURELINUX4_SIGNING_CERTIFICATE_SHA256",
+        "VMIZ_AZURELINUX4_SIGNING_CERTIFICATE_SHA256",
     );
     defer allocator.free(expected_certificate_text);
-    const expected_certificate_sha256 = zvmi.artifact_pipeline.parseSha256(
+    const expected_certificate_sha256 = vmiz.artifact_pipeline.parseSha256(
         expected_certificate_text,
     ) catch return error.InvalidSigningCertificateSha256;
     const expected_uki_text = try requireEnvAlloc(
         allocator,
-        "ZVMI_AZURELINUX4_UKI_SHA256",
+        "VMIZ_AZURELINUX4_UKI_SHA256",
     );
     defer allocator.free(expected_uki_text);
-    const expected_uki_sha256 = zvmi.artifact_pipeline.parseSha256(
+    const expected_uki_sha256 = vmiz.artifact_pipeline.parseSha256(
         expected_uki_text,
     ) catch return error.InvalidExpectedUkiSha256;
     const result_path = try requireEnvAlloc(
         allocator,
-        "ZVMI_AZURELINUX4_ACCEPTANCE_RESULT",
+        "VMIZ_AZURELINUX4_ACCEPTANCE_RESULT",
     );
     defer allocator.free(result_path);
     var firmware = try requireFirmwareAlloc(
@@ -1884,7 +1884,7 @@ test "Azure Linux 4 finalized QCOW2 boots, provisions, restarts, and powers off"
     defer firmware.deinit(allocator);
 
     try validateQemuImgInfo(allocator, io, qemu_img_path, absolute_image);
-    const source_sha256 = (try zvmi.artifact_pipeline.hashFile(
+    const source_sha256 = (try vmiz.artifact_pipeline.hashFile(
         io,
         absolute_image,
     )).sha256;
@@ -2164,7 +2164,7 @@ test "Azure Linux 4 finalized QCOW2 boots, provisions, restarts, and powers off"
     );
     try Io.sleep(io, .fromSeconds(5), .awake);
     if (try serialContains(allocator, io, &rejected, "Linux version") or
-        try serialContains(allocator, io, &rejected, "ZVMINIT_PID1_READY") or
+        try serialContains(allocator, io, &rejected, "VMIZINIT_PID1_READY") or
         try sshSucceeded(allocator, io, ssh_path, &rejected, "true"))
     {
         return error.TamperedUkiBootedWithSecureBoot;
@@ -2173,13 +2173,13 @@ test "Azure Linux 4 finalized QCOW2 boots, provisions, restarts, and powers off"
 
     try std.testing.expectEqual(
         source_sha256,
-        (try zvmi.artifact_pipeline.hashFile(io, absolute_image)).sha256,
+        (try vmiz.artifact_pipeline.hashFile(io, absolute_image)).sha256,
     );
-    const source_sha256_hex = zvmi.artifact_pipeline.formatSha256(source_sha256);
-    const certificate_sha256_hex = zvmi.artifact_pipeline.formatSha256(
+    const source_sha256_hex = vmiz.artifact_pipeline.formatSha256(source_sha256);
+    const certificate_sha256_hex = vmiz.artifact_pipeline.formatSha256(
         certificate_sha256,
     );
-    const uki_sha256_hex = zvmi.artifact_pipeline.formatSha256(uki_sha256);
+    const uki_sha256_hex = vmiz.artifact_pipeline.formatSha256(uki_sha256);
     const result = try std.json.Stringify.valueAlloc(
         allocator,
         .{

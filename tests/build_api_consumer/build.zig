@@ -1,18 +1,18 @@
 const std = @import("std");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 
 pub fn build(b: *std.Build) void {
-    const dependency = b.dependencyFromBuildZig(zvmi, .{
+    const dependency = b.dependencyFromBuildZig(vmiz, .{
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
     });
 
-    const pull = zvmi.addOciPull(b, dependency, .{
+    const pull = vmiz.addOciPull(b, dependency, .{
         .name = "remote-container",
         .source = "docker://registry.example/team/image@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         .platform = .{ .os = "linux", .architecture = "amd64" },
     });
-    _ = zvmi.addImage(b, dependency, .{
+    _ = vmiz.addImage(b, dependency, .{
         .name = "remote-layout-fixture",
         .input = .{
             .iso = b.path("fixtures/os.iso"),
@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
     // A registry image named by the request itself, rather than pulled beside
     // it by addOciPull.  Only configured, never built: the point is that the
     // exported API accepts it and emits the flags.
-    _ = zvmi.addImage(b, dependency, .{
+    _ = vmiz.addImage(b, dependency, .{
         .name = "registry-image-fixture",
         .input = .{
             .iso = b.path("fixtures/os.iso"),
@@ -58,7 +58,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const layout_image = zvmi.addImage(b, dependency, .{
+    const layout_image = vmiz.addImage(b, dependency, .{
         .name = "layout-fixture",
         .input = .{
             .iso = b.path("fixtures/os.iso"),
@@ -99,7 +99,7 @@ pub fn build(b: *std.Build) void {
         .generalization = .{ .azure = .{ .reset_hostname = false } },
     });
 
-    const archive_image = zvmi.addImage(b, dependency, .{
+    const archive_image = vmiz.addImage(b, dependency, .{
         .name = "archive-fixture",
         .input = .{
             .iso = b.path("fixtures/os.iso"),
@@ -128,7 +128,7 @@ pub fn build(b: *std.Build) void {
     // A LiveOS ISO product, configured through the exported `addIso` helper.
     // Only configured, never built here: this verifies the ISO build API wires
     // and typechecks in an external consumer, alongside the disk-image helpers.
-    _ = zvmi.addIso(b, dependency, .{
+    _ = vmiz.addIso(b, dependency, .{
         .name = "liveos-fixture",
         .iso = b.path("fixtures/os.iso"),
         .container = .{ .oci_layout = pull.layout },
@@ -152,7 +152,7 @@ pub fn build(b: *std.Build) void {
     // `addRecustomizeIso` helper. Only configured, never built here: this
     // verifies the preserve-or-refuse API wires and typechecks in an external
     // consumer, and that it exposes no boot-image/volume-id overrides.
-    _ = zvmi.addRecustomizeIso(b, dependency, .{
+    _ = vmiz.addRecustomizeIso(b, dependency, .{
         .name = "recustomized-liveos-fixture",
         .iso = b.path("fixtures/os.iso"),
         .container = .{ .oci_layout = pull.layout },
@@ -168,7 +168,7 @@ pub fn build(b: *std.Build) void {
         .generalization = .{ .azure = .{ .reset_hostname = false } },
     });
 
-    _ = zvmi.addImage(b, dependency, .{
+    _ = vmiz.addImage(b, dependency, .{
         .name = "cosi-fixture",
         .input = .{
             .iso = b.path("fixtures/os.iso"),
@@ -187,7 +187,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const execution_failure_image = zvmi.addImage(b, dependency, .{
+    const execution_failure_image = vmiz.addImage(b, dependency, .{
         .name = "execution-failure-fixture",
         .input = .{
             .iso = b.path("fixtures/os.iso"),
@@ -206,14 +206,14 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const foreign_dependency = b.dependencyFromBuildZig(zvmi, .{
+    const foreign_dependency = b.dependencyFromBuildZig(vmiz, .{
         .target = b.resolveTargetQuery(.{
             .cpu_arch = .aarch64,
             .os_tag = .linux,
         }),
         .optimize = .ReleaseSafe,
     });
-    const preserved_image = zvmi.addPreservedImage(b, foreign_dependency, .{
+    const preserved_image = vmiz.addPreservedImage(b, foreign_dependency, .{
         .name = "preserved-fixture",
         .input = .{
             .disk = b.path("fixtures/os.iso"),
@@ -270,7 +270,7 @@ pub fn build(b: *std.Build) void {
 
     // The vm backend on a foreign guest architecture, so the external consumer
     // path covers cross-architecture execution and the VM policy end to end.
-    const preserved_vm_image = zvmi.addPreservedImage(b, foreign_dependency, .{
+    const preserved_vm_image = vmiz.addPreservedImage(b, foreign_dependency, .{
         .name = "preserved-vm-fixture",
         .input = .{ .disk = b.path("fixtures/os.iso") },
         .root_partition = .{ .gpt_index = 2 },

@@ -1,6 +1,6 @@
 //! Host-native entry point used by the exported `build/iso.zig` `addRecustomize`
 //! helper. Parses a `recustomize-iso` request and drives
-//! `zvmi.recustomize_iso.build`, writing the recustomized ISO and a
+//! `vmiz.recustomize_iso.build`, writing the recustomized ISO and a
 //! machine-readable preservation report into a result bundle directory.
 //!
 //! On a strict refusal it emits the structured diagnostic (kind, path, catalog
@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const customization_loader = @import("customization_loader.zig");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 
 const ParsedArgs = struct {
     iso_path: []const u8,
@@ -17,17 +17,17 @@ const ParsedArgs = struct {
     bundle_output_path: []const u8,
     iso_basename: []const u8,
     rootfs_path_in_iso: ?[]const u8 = null,
-    nested_rootfs_path: []const u8 = zvmi.recustomize_iso.default_nested_rootfs_path,
-    squashfs_compression: zvmi.squashfs.WriterCompression = .zstd,
+    nested_rootfs_path: []const u8 = vmiz.recustomize_iso.default_nested_rootfs_path,
+    squashfs_compression: vmiz.squashfs.WriterCompression = .zstd,
     skip_iso_rootfs: bool = false,
-    architecture: ?zvmi.bootconfig.Architecture = null,
+    architecture: ?vmiz.bootconfig.Architecture = null,
     ext4_label: []const u8 = "rootfs",
-    journal: zvmi.ext4.JournalOptions = .{},
+    journal: vmiz.ext4.JournalOptions = .{},
     root_selinux_label: ?[]const u8 = null,
     source_date_epoch: ?u32 = null,
     customization_config: ?[]const u8 = null,
     customization_sources: []const []const u8 = &.{},
-    limits: zvmi.limits.ImportLimits = .{},
+    limits: vmiz.limits.ImportLimits = .{},
     verbose: bool = false,
 };
 
@@ -38,12 +38,12 @@ pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(arena);
 
     const args = parseArgs(arena, argv[1..]) catch |err| {
-        std.debug.print("zvmi-recustomize-iso-builder: {t}\n", .{err});
+        std.debug.print("vmiz-recustomize-iso-builder: {t}\n", .{err});
         std.process.exit(2);
     };
 
     std.Io.Dir.cwd().createDirPath(io, args.bundle_output_path) catch |err| {
-        std.debug.print("zvmi-recustomize-iso-builder: cannot create result bundle: {t}\n", .{err});
+        std.debug.print("vmiz-recustomize-iso-builder: cannot create result bundle: {t}\n", .{err});
         std.process.exit(1);
     };
     const output_path = try std.fs.path.join(arena, &.{ args.bundle_output_path, args.iso_basename });
@@ -55,19 +55,19 @@ pub fn main(init: std.process.Init) !void {
         args.customization_config,
         args.customization_sources,
     ) catch |err| {
-        std.debug.print("zvmi-recustomize-iso-builder: cannot load customization: {t}\n", .{err});
+        std.debug.print("vmiz-recustomize-iso-builder: cannot load customization: {t}\n", .{err});
         std.process.exit(1);
     };
 
-    const determinism: ?zvmi.recustomize_iso.Determinism = if (args.source_date_epoch) |epoch| .{
+    const determinism: ?vmiz.recustomize_iso.Determinism = if (args.source_date_epoch) |epoch| .{
         .filesystem_timestamp = epoch,
         .root_filesystem_uuid = deriveUuid(epoch),
     } else null;
 
-    var diagnostic = zvmi.recustomize_iso.RecustomizeDiagnostic{ .kind = .boot_image_unmapped };
+    var diagnostic = vmiz.recustomize_iso.RecustomizeDiagnostic{ .kind = .boot_image_unmapped };
     defer diagnostic.deinit(gpa);
 
-    var report = zvmi.recustomize_iso.build(gpa, io, .{
+    var report = vmiz.recustomize_iso.build(gpa, io, .{
         .iso_path = args.iso_path,
         .container_path = args.container_path,
         .output_path = output_path,
@@ -93,7 +93,7 @@ pub fn main(init: std.process.Init) !void {
             error.DuplicateBootPlatform,
             error.BootSelectionCriteria,
             => std.debug.print(
-                "zvmi-recustomize-iso-builder: refused: {s}{s}{s}{s}\n",
+                "vmiz-recustomize-iso-builder: refused: {s}{s}{s}{s}\n",
                 .{
                     diagnostic.kind.describe(),
                     if (diagnostic.path.len > 0) " at " else "",
@@ -101,19 +101,19 @@ pub fn main(init: std.process.Init) !void {
                     formatCatalogSuffix(arena, diagnostic),
                 },
             ),
-            else => std.debug.print("zvmi-recustomize-iso-builder: build failed: {t}\n", .{err}),
+            else => std.debug.print("vmiz-recustomize-iso-builder: build failed: {t}\n", .{err}),
         }
         std.process.exit(1);
     };
     defer report.deinit(gpa);
 
     writeReport(gpa, io, report_path, report) catch |err| {
-        std.debug.print("zvmi-recustomize-iso-builder: cannot write report: {t}\n", .{err});
+        std.debug.print("vmiz-recustomize-iso-builder: cannot write report: {t}\n", .{err});
         std.process.exit(1);
     };
 }
 
-fn formatCatalogSuffix(arena: std.mem.Allocator, diagnostic: zvmi.recustomize_iso.RecustomizeDiagnostic) []const u8 {
+fn formatCatalogSuffix(arena: std.mem.Allocator, diagnostic: vmiz.recustomize_iso.RecustomizeDiagnostic) []const u8 {
     if (diagnostic.catalog_index) |index| {
         return std.fmt.allocPrint(arena, " (boot catalog entry #{d}) [{s}]", .{ index, diagnostic.detail }) catch "";
     }
@@ -126,7 +126,7 @@ fn formatCatalogSuffix(arena: std.mem.Allocator, diagnostic: zvmi.recustomize_is
 fn deriveUuid(epoch: u32) [16]u8 {
     var digest: [32]u8 = undefined;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("zvmi-recustomize-iso-rootfs-uuid\x00");
+    hasher.update("vmiz-recustomize-iso-rootfs-uuid\x00");
     var epoch_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &epoch_bytes, epoch, .little);
     hasher.update(&epoch_bytes);
@@ -169,7 +169,7 @@ const ReportJson = struct {
     boot_entries: []const BootEntryJson,
 };
 
-fn volumeJson(v: zvmi.iso9660.VolumeMetadata) VolumeJson {
+fn volumeJson(v: vmiz.iso9660.VolumeMetadata) VolumeJson {
     return .{
         .volume_id = v.volume_id,
         .system_id = v.system_id,
@@ -184,7 +184,7 @@ fn writeReport(
     allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
-    report: zvmi.recustomize_iso.RecustomizeIsoReport,
+    report: vmiz.recustomize_iso.RecustomizeIsoReport,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -254,7 +254,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
             container_path = try nextArg(args, i);
         } else if (std.mem.eql(u8, arg, "--rootfs-size")) {
             i += 1;
-            rootfs_size = try zvmi.parseSize(try nextArg(args, i));
+            rootfs_size = try vmiz.parseSize(try nextArg(args, i));
         } else if (std.mem.eql(u8, arg, "--bundle-output")) {
             i += 1;
             bundle_output_path = try nextArg(args, i);
@@ -294,7 +294,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
             result.journal.enabled = true;
         } else if (std.mem.eql(u8, arg, "--journal-size")) {
             i += 1;
-            result.journal.size_bytes = try zvmi.parseSize(try nextArg(args, i));
+            result.journal.size_bytes = try vmiz.parseSize(try nextArg(args, i));
             result.journal.enabled = true;
         } else if (std.mem.eql(u8, arg, "--root-selinux-label")) {
             i += 1;
@@ -310,7 +310,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
             try sources.append(try nextArg(args, i));
         } else if (std.mem.eql(u8, arg, "--verbose")) {
             result.verbose = true;
-        } else if (zvmi.limits.limitForFlag(arg) != null) {
+        } else if (vmiz.limits.limitForFlag(arg) != null) {
             i += 1;
             _ = try result.limits.parseFlag(arg, try nextArg(args, i));
         } else {

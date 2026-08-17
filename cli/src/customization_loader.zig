@@ -1,9 +1,9 @@
 const std = @import("std");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 
 pub const Loaded = struct {
-    os: zvmi.customize.OsCustomization,
-    generalization: zvmi.customize.GeneralizationPolicy,
+    os: vmiz.customize.OsCustomization,
+    generalization: vmiz.customize.GeneralizationPolicy,
 };
 
 pub fn load(
@@ -23,7 +23,7 @@ pub fn load(
         .limited(16 * 1024 * 1024),
     );
     const parsed = try std.json.parseFromSlice(
-        zvmi.customization_wire.Configuration,
+        vmiz.customization_wire.Configuration,
         allocator,
         bytes,
         .{ .ignore_unknown_fields = false },
@@ -33,11 +33,11 @@ pub fn load(
 
 pub fn map(
     allocator: std.mem.Allocator,
-    wire: zvmi.customization_wire.Configuration,
+    wire: vmiz.customization_wire.Configuration,
     source_paths: []const []const u8,
 ) !Loaded {
     const filesystem = try allocator.alloc(
-        zvmi.customize.FilesystemOperation,
+        vmiz.customize.FilesystemOperation,
         wire.os.filesystem.len,
     );
     for (wire.os.filesystem, 0..) |operation, index| {
@@ -73,13 +73,13 @@ pub fn map(
             } },
         };
     }
-    const groups = try allocator.alloc(zvmi.customize.Group, wire.os.groups.len);
+    const groups = try allocator.alloc(vmiz.customize.Group, wire.os.groups.len);
     for (wire.os.groups, 0..) |group, index| groups[index] = .{
         .name = group.name,
         .gid = group.gid,
         .members = group.members,
     };
-    const users = try allocator.alloc(zvmi.customize.User, wire.os.users.len);
+    const users = try allocator.alloc(vmiz.customize.User, wire.os.users.len);
     for (wire.os.users, 0..) |user, index| users[index] = .{
         .name = user.name,
         .uid = user.uid,
@@ -95,7 +95,7 @@ pub fn map(
         .ssh_authorized_keys = user.ssh_authorized_keys,
         .passwordless_sudo = user.passwordless_sudo,
     };
-    const services = try allocator.alloc(zvmi.customize.Service, wire.os.services.len);
+    const services = try allocator.alloc(vmiz.customize.Service, wire.os.services.len);
     for (wire.os.services, 0..) |service, index| services[index] = .{
         .name = service.name,
         .state = switch (service.state) {
@@ -103,7 +103,7 @@ pub fn map(
             .disabled => .disabled,
         },
     };
-    const modules = try allocator.alloc(zvmi.customize.KernelModule, wire.os.kernel_modules.len);
+    const modules = try allocator.alloc(vmiz.customize.KernelModule, wire.os.kernel_modules.len);
     for (wire.os.kernel_modules, 0..) |module, index| modules[index] = .{
         .name = module.name,
         .load = module.load,
@@ -138,8 +138,8 @@ pub fn map(
 
 fn convertMetadata(
     allocator: std.mem.Allocator,
-    metadata: zvmi.customization_wire.Metadata,
-) !zvmi.customize.Metadata {
+    metadata: vmiz.customization_wire.Metadata,
+) !vmiz.customize.Metadata {
     return .{
         .mode = metadata.mode,
         .uid = metadata.uid,
@@ -151,9 +151,9 @@ fn convertMetadata(
 
 fn convertXattrs(
     allocator: std.mem.Allocator,
-    xattrs: []const zvmi.customization_wire.Xattr,
-) ![]const zvmi.ext4.Xattr {
-    const converted = try allocator.alloc(zvmi.ext4.Xattr, xattrs.len);
+    xattrs: []const vmiz.customization_wire.Xattr,
+) ![]const vmiz.ext4.Xattr {
+    const converted = try allocator.alloc(vmiz.ext4.Xattr, xattrs.len);
     for (xattrs, 0..) |xattr, index| converted[index] = .{
         .name = xattr.name,
         .value = xattr.value,

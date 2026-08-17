@@ -1,5 +1,5 @@
 //! Grows the root partition + ext4 filesystem to fill a larger disk than
-//! the image was built at ("growpart"/`resize2fs` equivalent). See zvmi
+//! the image was built at ("growpart"/`resize2fs` equivalent). See vmiz
 //! issue #130.
 //!
 //! Generalized images are typically built small and deployed onto VMs with
@@ -32,11 +32,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
-const zvmi = @import("zvmi");
-const mbr = zvmi.mbr;
-const gpt = zvmi.gpt;
-const ext4 = zvmi.ext4;
-const Image = zvmi.Image;
+const vmiz = @import("vmiz");
+const mbr = vmiz.mbr;
+const gpt = vmiz.gpt;
+const ext4 = vmiz.ext4;
+const Image = vmiz.Image;
 const resource_disk = @import("resource_disk.zig");
 
 pub const RootDevice = struct {
@@ -141,7 +141,7 @@ const PartitionExtent = struct {
 };
 
 /// Grows the GPT root partition (identified as the *last* entry in the
-/// table, matching both zvmi-built images and real Azure Linux images) to
+/// table, matching both vmiz-built images and real Azure Linux images) to
 /// the disk's new, larger end. Always returns the resulting partition
 /// extent, including when the table was already grown, so callers can
 /// retry the kernel and filesystem resize steps after an earlier failure.

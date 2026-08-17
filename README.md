@@ -1,4 +1,4 @@
-# zvmi
+# vmiz
 
 A Zig 0.16 library and CLI for reading, writing, converting, and building VM
 disk images, including raw, VHD/VPC, VHDX, and qcow2 formats. It also provides
@@ -7,13 +7,13 @@ image workflows.
 
 ## Install
 
-Install the pre-built `zvmi` CLI from GitHub Releases with [ghr](https://github.com/cataggar/ghr):
+Install the pre-built `vmiz` CLI from GitHub Releases with [ghr](https://github.com/cataggar/ghr):
 
 ```console
-ghr install cataggar/zvmi@v0.2.0
+ghr install cataggar/vmiz@v0.2.0
 ```
 
-The only executable in release archives is the `zvmi` CLI. Build from source
+The only executable in release archives is the `vmiz` CLI. Build from source
 to use the library or the repository's other tools.
 
 ## Documentation

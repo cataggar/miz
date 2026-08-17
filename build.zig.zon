@@ -1,7 +1,7 @@
 .{
-    .name = .zvmi,
+    .name = .vmiz,
     .version = "0.2.0",
-    .fingerprint = 0x918747103382f4de,
+    .fingerprint = 0x2bf030e3d064be03,
     .minimum_zig_version = "0.16.0",
 
     .dependencies = .{
@@ -24,9 +24,9 @@
         "qmp",
         "nbd",
         "qcow2",
-        "zvminit",
+        "vmizinit",
         "azagent",
-        "zvmiguest",
+        "vmizguest",
         "wireserver",
         "scripts",
         "tests",

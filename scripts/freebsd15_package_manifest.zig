@@ -461,8 +461,8 @@ pub fn forProfile(
 /// Marker every recorded package line carries. The guest writes the manifest
 /// of what it actually ships to the console so the host can verify it against
 /// this file instead of trusting the guest's own checks.
-pub const record_prefix = "ZVMI_FREEBSD_PACKAGE";
-pub const update_validation_prefix = "ZVMI_FREEBSD_UPDATE_VALIDATION";
+pub const record_prefix = "VMIZ_FREEBSD_PACKAGE";
+pub const update_validation_prefix = "VMIZ_FREEBSD_UPDATE_VALIDATION";
 
 /// Shared package handling: identify which installed packages came from
 /// pkgbase, and prove both repositories and the install path still work.
@@ -470,17 +470,17 @@ pub const update_validation_prefix = "ZVMI_FREEBSD_UPDATE_VALIDATION";
 /// path breaks.
 const shared_package_script =
     \\      pkg -N
-    \\      pkg query -a '%n %o' > /root/zvmi-installed
-    \\      awk '$2 ~ /^base\// { print $1 }' /root/zvmi-installed \
-    \\          > /root/zvmi-base-packages
-    \\      awk '$2 !~ /^base\// { print $1 }' /root/zvmi-installed \
-    \\          > /root/zvmi-third-party-packages
-    \\      test -s /root/zvmi-base-packages
+    \\      pkg query -a '%n %o' > /root/vmiz-installed
+    \\      awk '$2 ~ /^base\// { print $1 }' /root/vmiz-installed \
+    \\          > /root/vmiz-base-packages
+    \\      awk '$2 !~ /^base\// { print $1 }' /root/vmiz-installed \
+    \\          > /root/vmiz-third-party-packages
+    \\      test -s /root/vmiz-base-packages
     \\      # The prune addresses base packages through the FreeBSD- name
     \\      # glob, so that glob and the base/ origin prefix must describe
     \\      # exactly the same set or the prune would miss or overreach.
-    \\      ! grep -qv '^FreeBSD-' /root/zvmi-base-packages
-    \\      ! grep -q '^FreeBSD-' /root/zvmi-third-party-packages
+    \\      ! grep -qv '^FreeBSD-' /root/vmiz-base-packages
+    \\      ! grep -q '^FreeBSD-' /root/vmiz-third-party-packages
     \\      # The base repository is disabled by default in the packaged
     \\      # /etc/pkg/FreeBSD.conf; upstream's VM images re-enable it as an
     \\      # unpackaged side effect. State it explicitly instead, so the
@@ -488,12 +488,12 @@ const shared_package_script =
     \\      # happened to arrive with.
     \\      mkdir -p /usr/local/etc/pkg/repos
     \\      printf '%s: { enabled: yes }\n' @BASE_REPOSITORY@ \
-    \\          > /usr/local/etc/pkg/repos/zvmi-@BASE_REPOSITORY@.conf
+    \\          > /usr/local/etc/pkg/repos/vmiz-@BASE_REPOSITORY@.conf
     \\@PACKAGE_PRUNE@
     \\      for required in @REQUIRED_PACKAGES@; do
     \\          pkg info -e "${required}"
     \\      done
-    \\      zvmi_package_state()
+    \\      vmiz_package_state()
     \\      {
     \\          pkg query -a '%n %v %a' | sort | sha256 -q
     \\      }
@@ -505,28 +505,28 @@ const shared_package_script =
     \\      pkg update -f
     \\      pkg update -f -r @BASE_REPOSITORY@
     \\      pkg rquery -r @BASE_REPOSITORY@ '%n-%v' FreeBSD-runtime
-    \\      package_state_before=$(zvmi_package_state)
+    \\      package_state_before=$(vmiz_package_state)
     \\      pkg upgrade -n -U -r @BASE_REPOSITORY@
-    \\      test "$(zvmi_package_state)" = "${package_state_before}"
+    \\      test "$(vmiz_package_state)" = "${package_state_before}"
     \\      ! pkg info -e @REPRESENTATIVE_PACKAGE@
     \\      pkg rquery '%n-%v' @REPRESENTATIVE_PACKAGE@
-    \\      package_state_before=$(zvmi_package_state)
+    \\      package_state_before=$(vmiz_package_state)
     \\      pkg install -y @REPRESENTATIVE_PACKAGE@
     \\      pkg info -e @REPRESENTATIVE_PACKAGE@
     \\      pkg delete -y @REPRESENTATIVE_PACKAGE@
     \\      ! pkg info -e @REPRESENTATIVE_PACKAGE@
-    \\      test "$(zvmi_package_state)" = "${package_state_before}"
+    \\      test "$(vmiz_package_state)" = "${package_state_before}"
 ;
 
 /// Core prune. pkg computes the closure; the manifest only names the roots.
 const package_prune_script =
-    \\      zvmi_unresolved_shlibs()
+    \\      vmiz_unresolved_shlibs()
     \\      {
     \\          pkg query -a '%b' | sort -u > "$1.provided"
     \\          pkg query -a '%B' | sort -u > "$1.required"
     \\          comm -13 "$1.provided" "$1.required" > "$1"
     \\      }
-    \\      zvmi_collect_core_exclusions()
+    \\      vmiz_collect_core_exclusions()
     \\      {
     \\          output=$1
     \\          : > "${output}"
@@ -540,7 +540,7 @@ const package_prune_script =
     \\                  >> "${output}" || true
     \\          sort -u -o "${output}" "${output}"
     \\      }
-    \\      zvmi_exclusion_diagnostic()
+    \\      vmiz_exclusion_diagnostic()
     \\      {
     \\          package=$1
     \\          echo "core manifest cannot remove ${package}" >&2
@@ -568,7 +568,7 @@ const package_prune_script =
     \\              fi
     \\          done
     \\      }
-    \\      zvmi_unresolved_shlibs /root/zvmi-shlibs-before
+    \\      vmiz_unresolved_shlibs /root/vmiz-shlibs-before
     \\      # pkgbase leaf packages declare no dependencies at all: the real
     \\      # edges live in shlib metadata, which pkg's solver does not
     \\      # consult. That is why the manifest names library roots and why
@@ -587,7 +587,7 @@ const package_prune_script =
     \\      done
     \\      while read -r third_party; do
     \\          pkg set -y -A 0 "${third_party}"
-    \\      done < /root/zvmi-third-party-packages
+    \\      done < /root/vmiz-third-party-packages
     \\      pkg autoremove -y
     \\      # FreeBSD's package sets are vital. Marking every base package
     \\      # automatic therefore computes most of the closure, but a vital
@@ -595,25 +595,25 @@ const package_prune_script =
     \\      # dependencies such as FreeBSD-clang alive. Only packages selected
     \\      # by the reviewed exclusion names and classes may lose that
     \\      # protection. A retained dependency still keeps them installed.
-    \\      zvmi_collect_core_exclusions /root/zvmi-core-exclusions
-    \\      if [ -s /root/zvmi-core-exclusions ]; then
+    \\      vmiz_collect_core_exclusions /root/vmiz-core-exclusions
+    \\      if [ -s /root/vmiz-core-exclusions ]; then
     \\          while read -r excluded; do
     \\              if ! pkg set -y -A 1 "${excluded}"; then
-    \\                  zvmi_exclusion_diagnostic "${excluded}"
+    \\                  vmiz_exclusion_diagnostic "${excluded}"
     \\                  exit 1
     \\              fi
     \\              if ! pkg set -y -v 0 "${excluded}"; then
-    \\                  zvmi_exclusion_diagnostic "${excluded}"
+    \\                  vmiz_exclusion_diagnostic "${excluded}"
     \\                  exit 1
     \\              fi
-    \\          done < /root/zvmi-core-exclusions
+    \\          done < /root/vmiz-core-exclusions
     \\          pkg autoremove -y
     \\      fi
-    \\      zvmi_collect_core_exclusions /root/zvmi-core-exclusions
-    \\      if [ -s /root/zvmi-core-exclusions ]; then
+    \\      vmiz_collect_core_exclusions /root/vmiz-core-exclusions
+    \\      if [ -s /root/vmiz-core-exclusions ]; then
     \\          while read -r excluded; do
-    \\              zvmi_exclusion_diagnostic "${excluded}"
-    \\          done < /root/zvmi-core-exclusions
+    \\              vmiz_exclusion_diagnostic "${excluded}"
+    \\          done < /root/vmiz-core-exclusions
     \\          echo "core manifest violated: exclusions are required" >&2
     \\          exit 1
     \\      fi
@@ -626,14 +626,14 @@ const package_prune_script =
     \\      # Dry run: report a broken declared dependency rather than
     \\      # quietly reinstalling the package the prune just removed.
     \\      pkg check -d -n -a
-    \\      zvmi_unresolved_shlibs /root/zvmi-shlibs-after
+    \\      vmiz_unresolved_shlibs /root/vmiz-shlibs-after
     \\      # A shared library that nothing provides any more is exactly what
     \\      # a manifest that is not dependency-closed produces. Compare
     \\      # against the pre-prune audit so a pre-existing upstream quirk
     \\      # cannot be mistaken for damage this prune caused.
-    \\      comm -13 /root/zvmi-shlibs-before /root/zvmi-shlibs-after \
-    \\          > /root/zvmi-shlibs-lost
-    \\      test ! -s /root/zvmi-shlibs-lost
+    \\      comm -13 /root/vmiz-shlibs-before /root/vmiz-shlibs-after \
+    \\          > /root/vmiz-shlibs-lost
+    \\      test ! -s /root/vmiz-shlibs-lost
 ;
 
 /// Record what the image actually ships. The host verifies this against the
@@ -655,11 +655,11 @@ const package_record_script =
     \\                  >"${output}" || true
     \\          fi
     \\      done
-    \\      rm -f /root/zvmi-installed /root/zvmi-base-packages
-    \\      rm -f /root/zvmi-third-party-packages
-    \\      rm -f /root/zvmi-shlibs-before* /root/zvmi-shlibs-after*
-    \\      rm -f /root/zvmi-shlibs-lost
-    \\      rm -f /root/zvmi-core-exclusions
+    \\      rm -f /root/vmiz-installed /root/vmiz-base-packages
+    \\      rm -f /root/vmiz-third-party-packages
+    \\      rm -f /root/vmiz-shlibs-before* /root/vmiz-shlibs-after*
+    \\      rm -f /root/vmiz-shlibs-lost
+    \\      rm -f /root/vmiz-core-exclusions
 ;
 
 const Substitution = struct {
@@ -1049,7 +1049,7 @@ test "the core guest script prunes from the manifest and audits the result" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         script,
-        "test \"$(zvmi_package_state)\" = \"${package_state_before}\"",
+        "test \"$(vmiz_package_state)\" = \"${package_state_before}\"",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "! pkg info -e tree") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "pkg rquery '%n-%v' tree") != null);
@@ -1058,13 +1058,13 @@ test "the core guest script prunes from the manifest and audits the result" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         script,
-        "ZVMI_FREEBSD_UPDATE_VALIDATION 0123456789abcdef base-solver-dry-run-ok",
+        "VMIZ_FREEBSD_UPDATE_VALIDATION 0123456789abcdef base-solver-dry-run-ok",
     ) != null);
     // The shipped manifest is recorded under the run's nonce.
     try std.testing.expect(std.mem.indexOf(
         u8,
         script,
-        "ZVMI_FREEBSD_PACKAGE 0123456789abcdef %n %v %sb",
+        "VMIZ_FREEBSD_PACKAGE 0123456789abcdef %n %v %sb",
     ) != null);
     // Every line stays inside the cloud-config script literal's indentation.
     var lines = std.mem.splitScalar(u8, script, '\n');
@@ -1145,7 +1145,7 @@ test "generated exclusion commands preserve dependency-safe order" {
         u8,
         script,
         first_autoremove,
-        "zvmi_collect_core_exclusions /root/zvmi-core-exclusions",
+        "vmiz_collect_core_exclusions /root/vmiz-core-exclusions",
     ).?;
     const automatic = std.mem.indexOfPos(
         u8,
@@ -1169,13 +1169,13 @@ test "generated exclusion commands preserve dependency-safe order" {
         u8,
         script,
         second_autoremove,
-        "zvmi_collect_core_exclusions /root/zvmi-core-exclusions",
+        "vmiz_collect_core_exclusions /root/vmiz-core-exclusions",
     ).?;
     const diagnostic = std.mem.indexOfPos(
         u8,
         script,
         final_collection,
-        "zvmi_exclusion_diagnostic \"${excluded}\"",
+        "vmiz_exclusion_diagnostic \"${excluded}\"",
     ).?;
 
     try std.testing.expect(first_autoremove < first_collection);

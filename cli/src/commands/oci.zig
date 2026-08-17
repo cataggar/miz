@@ -2,20 +2,20 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 
 const Io = std.Io;
-const oci = zvmi.oci;
+const oci = vmiz.oci;
 
 const usage =
     \\usage:
-    \\  zvmi oci copy [options] <source> <destination>
-    \\  zvmi oci inspect [options] <source>
-    \\  zvmi oci list-tags [options] docker://<registry>/<repository>
-    \\  zvmi oci pin [options] docker://<registry>/<repository>:<tag>
-    \\  zvmi oci unpack [options] --image oci:<layout>[:tag] <bundle>
-    \\  zvmi oci repack --image oci:<layout>:<tag> <bundle>
-    \\  zvmi oci config [options] --image oci:<layout>[:tag]
+    \\  vmiz oci copy [options] <source> <destination>
+    \\  vmiz oci inspect [options] <source>
+    \\  vmiz oci list-tags [options] docker://<registry>/<repository>
+    \\  vmiz oci pin [options] docker://<registry>/<repository>:<tag>
+    \\  vmiz oci unpack [options] --image oci:<layout>[:tag] <bundle>
+    \\  vmiz oci repack --image oci:<layout>:<tag> <bundle>
+    \\  vmiz oci config [options] --image oci:<layout>[:tag]
     \\
     \\copy options:
     \\  --all
@@ -241,7 +241,7 @@ pub fn run(
             return argumentFailure("config", err);
         return runConfig(allocator, io, parsed);
     }
-    return fail("zvmi oci: unknown subcommand '{s}'\n\n{s}", .{ args[0], usage });
+    return fail("vmiz oci: unknown subcommand '{s}'\n\n{s}", .{ args[0], usage });
 }
 
 fn runConfig(
@@ -250,11 +250,11 @@ fn runConfig(
     args: ConfigArgs,
 ) u8 {
     const parsed = oci.reference.parse(args.source, .source) catch |err|
-        return fail("zvmi oci config: invalid source '{s}': {s}", .{ args.source, @errorName(err) });
+        return fail("vmiz oci config: invalid source '{s}': {s}", .{ args.source, @errorName(err) });
     const source_ref = switch (parsed) {
         .layout => |value| value,
         .registry => return fail(
-            "zvmi oci config: source must be a local OCI layout: '{s}'",
+            "vmiz oci config: source must be a local OCI layout: '{s}'",
             .{args.source},
         ),
     };
@@ -265,12 +265,12 @@ fn runConfig(
         source_ref,
         .{ .platform = args.platform },
     ) catch |err| return fail(
-        "zvmi oci config: '{s}' failed: {s}",
+        "vmiz oci config: '{s}' failed: {s}",
         .{ args.source, @errorName(err) },
     );
     defer resolved.deinit();
     writeLine(io, resolved.config_bytes) catch |err|
-        return fail("zvmi oci config: failed to write output: {s}", .{@errorName(err)});
+        return fail("vmiz oci config: failed to write output: {s}", .{@errorName(err)});
     return 0;
 }
 
@@ -280,11 +280,11 @@ fn runRepack(
     args: RepackArgs,
 ) u8 {
     const parsed = oci.reference.parse(args.target, .destination) catch |err|
-        return fail("zvmi oci repack: invalid target '{s}': {s}", .{ args.target, @errorName(err) });
+        return fail("vmiz oci repack: invalid target '{s}': {s}", .{ args.target, @errorName(err) });
     const target = switch (parsed) {
         .layout => |value| value,
         .registry => return fail(
-            "zvmi oci repack: target must be a local OCI layout: '{s}'",
+            "vmiz oci repack: target must be a local OCI layout: '{s}'",
             .{args.target},
         ),
     };
@@ -295,11 +295,11 @@ fn runRepack(
         args.bundle,
         .{ .compression = args.compression },
     ) catch |err| return fail(
-        "zvmi oci repack: '{s}' to '{s}' failed: {s}",
+        "vmiz oci repack: '{s}' to '{s}' failed: {s}",
         .{ args.bundle, args.target, @errorName(err) },
     );
     writeLine(io, result.digest()) catch |err|
-        return fail("zvmi oci repack: failed to write output: {s}", .{@errorName(err)});
+        return fail("vmiz oci repack: failed to write output: {s}", .{@errorName(err)});
     return 0;
 }
 
@@ -309,11 +309,11 @@ fn runUnpack(
     args: UnpackArgs,
 ) u8 {
     const source = oci.reference.parse(args.source, .source) catch |err|
-        return fail("zvmi oci unpack: invalid source '{s}': {s}", .{ args.source, @errorName(err) });
+        return fail("vmiz oci unpack: invalid source '{s}': {s}", .{ args.source, @errorName(err) });
     const local = switch (source) {
         .layout => |value| value,
         .registry => return fail(
-            "zvmi oci unpack: source must be a local OCI layout: '{s}'",
+            "vmiz oci unpack: source must be a local OCI layout: '{s}'",
             .{args.source},
         ),
     };
@@ -329,17 +329,17 @@ fn runUnpack(
             .force = args.force,
         },
     ) catch |err| return fail(
-        "zvmi oci unpack: '{s}' to '{s}' failed: {s}",
+        "vmiz oci unpack: '{s}' to '{s}' failed: {s}",
         .{ args.source, args.destination, @errorName(err) },
     );
     if (result.cleanup_warning) {
         std.debug.print(
-            "zvmi oci unpack: warning: replaced bundle was left at a hidden staging path because cleanup failed\n",
+            "vmiz oci unpack: warning: replaced bundle was left at a hidden staging path because cleanup failed\n",
             .{},
         );
     }
     writeLine(io, result.digest()) catch |err|
-        return fail("zvmi oci unpack: failed to write output: {s}", .{@errorName(err)});
+        return fail("vmiz oci unpack: failed to write output: {s}", .{@errorName(err)});
     return 0;
 }
 
@@ -350,9 +350,9 @@ fn runCopy(
     args: CopyArgs,
 ) u8 {
     const source = oci.reference.parse(args.source, .source) catch |err|
-        return fail("zvmi oci copy: invalid source '{s}': {s}", .{ args.source, @errorName(err) });
+        return fail("vmiz oci copy: invalid source '{s}': {s}", .{ args.source, @errorName(err) });
     const destination = oci.reference.parse(args.destination, .destination) catch |err|
-        return fail("zvmi oci copy: invalid destination '{s}': {s}", .{ args.destination, @errorName(err) });
+        return fail("vmiz oci copy: invalid destination '{s}': {s}", .{ args.destination, @errorName(err) });
     validateEndpoint(source, args.source_options) catch |err|
         return argumentFailure("copy", err);
     validateEndpoint(destination, args.destination_options) catch |err|
@@ -503,13 +503,13 @@ fn finishCopy(
     var result = copy_result;
     defer result.deinit(allocator);
     writeLine(io, result.root.digest) catch |err|
-        return fail("zvmi oci copy: failed to write output: {s}", .{@errorName(err)});
+        return fail("vmiz oci copy: failed to write output: {s}", .{@errorName(err)});
     return 0;
 }
 
 fn failCopy(args: CopyArgs, err: anyerror) u8 {
     return fail(
-        "zvmi oci copy: '{s}' to '{s}' failed: {s}",
+        "vmiz oci copy: '{s}' to '{s}' failed: {s}",
         .{ args.source, args.destination, @errorName(err) },
     );
 }
@@ -521,7 +521,7 @@ fn runInspect(
     args: InspectArgs,
 ) u8 {
     const source = oci.reference.parse(args.source, .source) catch |err|
-        return fail("zvmi oci inspect: invalid source '{s}': {s}", .{ args.source, @errorName(err) });
+        return fail("vmiz oci inspect: invalid source '{s}': {s}", .{ args.source, @errorName(err) });
     validateEndpoint(source, args.endpoint) catch |err|
         return argumentFailure("inspect", err);
     return switch (source) {
@@ -586,17 +586,17 @@ fn finishInspect(
         arena_state.allocator(),
         result,
     ) catch |err| return fail(
-        "zvmi oci inspect: failed to format output: {s}",
+        "vmiz oci inspect: failed to format output: {s}",
         .{@errorName(err)},
     );
     writeJson(io, output) catch |err|
-        return fail("zvmi oci inspect: failed to write output: {s}", .{@errorName(err)});
+        return fail("vmiz oci inspect: failed to write output: {s}", .{@errorName(err)});
     return 0;
 }
 
 fn failInspect(source: []const u8, err: anyerror) u8 {
     return fail(
-        "zvmi oci inspect: '{s}' failed: {s}",
+        "vmiz oci inspect: '{s}' failed: {s}",
         .{ source, @errorName(err) },
     );
 }
@@ -608,7 +608,7 @@ fn runTags(
     args: TagsArgs,
 ) u8 {
     const parsed = oci.reference.parse(args.source, .list_tags) catch |err|
-        return fail("zvmi oci list-tags: invalid source '{s}': {s}", .{ args.source, @errorName(err) });
+        return fail("vmiz oci list-tags: invalid source '{s}': {s}", .{ args.source, @errorName(err) });
     const source = switch (parsed) {
         .registry => |value| value,
         .layout => unreachable,
@@ -620,7 +620,7 @@ fn runTags(
         source,
         args.endpoint.registry(),
     ) catch |err| return fail(
-        "zvmi oci list-tags: '{s}' failed: {s}",
+        "vmiz oci list-tags: '{s}' failed: {s}",
         .{ args.source, @errorName(err) },
     );
     defer client.deinit();
@@ -629,7 +629,7 @@ fn runTags(
             return failRegistry("list-tags", args.source, status, err);
         }
         return fail(
-            "zvmi oci list-tags: '{s}' failed: {s}",
+            "vmiz oci list-tags: '{s}' failed: {s}",
             .{ args.source, @errorName(err) },
         );
     };
@@ -639,7 +639,7 @@ fn runTags(
         .repository = args.source,
         .tags = tags.tags,
     }) catch |err| return fail(
-        "zvmi oci list-tags: failed to write output: {s}",
+        "vmiz oci list-tags: failed to write output: {s}",
         .{@errorName(err)},
     );
     return 0;
@@ -652,11 +652,11 @@ fn runPin(
     args: PinArgs,
 ) u8 {
     const parsed = oci.reference.parse(args.source, .source) catch |err|
-        return fail("zvmi oci pin: invalid source '{s}': {s}", .{ args.source, @errorName(err) });
+        return fail("vmiz oci pin: invalid source '{s}': {s}", .{ args.source, @errorName(err) });
     const source = switch (parsed) {
         .registry => |value| value,
         .layout => return fail(
-            "zvmi oci pin: source must be a registry reference: '{s}'",
+            "vmiz oci pin: source must be a registry reference: '{s}'",
             .{args.source},
         ),
     };
@@ -667,7 +667,7 @@ fn runPin(
         source,
         args.endpoint.registry(),
     ) catch |err| return fail(
-        "zvmi oci pin: '{s}' failed: {s}",
+        "vmiz oci pin: '{s}' failed: {s}",
         .{ args.source, @errorName(err) },
     );
     defer client.deinit();
@@ -675,12 +675,12 @@ fn runPin(
         if (client.lastError()) |status| {
             return failRegistry("pin", args.source, status, err);
         }
-        return fail("zvmi oci pin: '{s}' failed: {s}", .{ args.source, @errorName(err) });
+        return fail("vmiz oci pin: '{s}' failed: {s}", .{ args.source, @errorName(err) });
     };
     defer result.deinit();
     if (!args.json) {
         writeLine(io, result.reference) catch |err|
-            return fail("zvmi oci pin: failed to write output: {s}", .{@errorName(err)});
+            return fail("vmiz oci pin: failed to write output: {s}", .{@errorName(err)});
         return 0;
     }
     writeJson(io, .{
@@ -697,7 +697,7 @@ fn runPin(
             .variant = value.variant,
         } else null,
     }) catch |err| return fail(
-        "zvmi oci pin: failed to write output: {s}",
+        "vmiz oci pin: failed to write output: {s}",
         .{@errorName(err)},
     );
     return 0;
@@ -1135,7 +1135,7 @@ fn isHelp(value: []const u8) bool {
 
 fn argumentFailure(subcommand: []const u8, err: anyerror) u8 {
     return fail(
-        "zvmi oci {s}: invalid arguments: {s}\n\n{s}",
+        "vmiz oci {s}: invalid arguments: {s}\n\n{s}",
         .{ subcommand, @errorName(err), usage },
     );
 }
@@ -1148,12 +1148,12 @@ fn failRegistry(
 ) u8 {
     if (status.code) |code| {
         return fail(
-            "zvmi oci {s}: '{s}' failed: HTTP {d} {s} ({s})",
+            "vmiz oci {s}: '{s}' failed: HTTP {d} {s} ({s})",
             .{ operation, reference, status.status, code, @errorName(err) },
         );
     }
     return fail(
-        "zvmi oci {s}: '{s}' failed: HTTP {d} ({s})",
+        "vmiz oci {s}: '{s}' failed: HTTP {d} ({s})",
         .{ operation, reference, status.status, @errorName(err) },
     );
 }

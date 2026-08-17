@@ -1,13 +1,13 @@
-//! `zvmi build-iso --iso <file.iso> --container <oci-layout> --rootfs-size <size> -o <output.iso>`:
+//! `vmiz build-iso --iso <file.iso> --container <oci-layout> --rootfs-size <size> -o <output.iso>`:
 //! regenerate a customized LiveOS ISO. The source ISO's directory tree and
 //! boot files are retained; its LiveOS payload is replaced by a native SquashFS
 //! wrapping a deterministic ext4 rootfs.img built from the customized root tree.
 
 const std = @import("std");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 
 const help_text =
-    \\usage: zvmi build-iso --iso <file.iso> --container <oci-layout> --rootfs-size <size> -o <output.iso>
+    \\usage: vmiz build-iso --iso <file.iso> --container <oci-layout> --rootfs-size <size> -o <output.iso>
     \\                      [--rootfs-path <path>] [--nested-rootfs-path <path>] [--volume-id <id>]
     \\                      [--uefi-boot-image <path>] [--bios-boot-image <path>]
     \\                      [--squashfs-compression zstd|none] [--skip-iso-rootfs]
@@ -75,19 +75,19 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var output_path: ?[]const u8 = null;
     var rootfs_size: ?u64 = null;
     var rootfs_path: ?[]const u8 = null;
-    var nested_rootfs_path: []const u8 = zvmi.build_iso.default_nested_rootfs_path;
+    var nested_rootfs_path: []const u8 = vmiz.build_iso.default_nested_rootfs_path;
     var volume_id: ?[]const u8 = null;
     var uefi_boot_image: ?[]const u8 = null;
     var bios_boot_image: ?[]const u8 = null;
-    var squashfs_compression: zvmi.squashfs.WriterCompression = .zstd;
+    var squashfs_compression: vmiz.squashfs.WriterCompression = .zstd;
     var skip_iso_rootfs = false;
-    var architecture: ?zvmi.bootconfig.Architecture = null;
+    var architecture: ?vmiz.bootconfig.Architecture = null;
     var ext4_label: []const u8 = "rootfs";
-    var journal = zvmi.ext4.JournalOptions{};
+    var journal = vmiz.ext4.JournalOptions{};
     var root_selinux_label: ?[]const u8 = null;
     var source_date_epoch: ?u32 = null;
-    var oci_load_options = zvmi.oci.LoadOptions{};
-    var limits: zvmi.limits.ImportLimits = .{};
+    var oci_load_options = vmiz.oci.LoadOptions{};
+    var limits: vmiz.limits.ImportLimits = .{};
     var dry_run = false;
     var verbose = false;
 
@@ -105,7 +105,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, arg, "--rootfs-size")) {
             i += 1;
             if (i >= args.len) return fail("build-iso: --rootfs-size requires a value", .{});
-            rootfs_size = zvmi.parseSize(args[i]) catch |err|
+            rootfs_size = vmiz.parseSize(args[i]) catch |err|
                 return fail("build-iso: invalid --rootfs-size '{s}': {s}", .{ args[i], @errorName(err) });
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
             i += 1;
@@ -166,7 +166,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, arg, "--journal-size")) {
             i += 1;
             if (i >= args.len) return fail("build-iso: --journal-size requires a value", .{});
-            journal.size_bytes = zvmi.parseSize(args[i]) catch |err|
+            journal.size_bytes = vmiz.parseSize(args[i]) catch |err|
                 return fail("build-iso: invalid --journal-size '{s}': {s}", .{ args[i], @errorName(err) });
             journal.enabled = true;
         } else if (std.mem.eql(u8, arg, "--root-selinux-label")) {
@@ -200,7 +200,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             std.debug.print("{s}", .{help_text});
             return 0;
-        } else if (zvmi.limits.limitForFlag(arg) != null) {
+        } else if (vmiz.limits.limitForFlag(arg) != null) {
             i += 1;
             if (i >= args.len) return fail("build-iso: {s} requires a value", .{arg});
             _ = limits.parseFlag(arg, args[i]) catch |err|
@@ -210,7 +210,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         }
     }
 
-    var boot_images_buf: [2]zvmi.build_iso.BootImage = undefined;
+    var boot_images_buf: [2]vmiz.build_iso.BootImage = undefined;
     var boot_images_len: usize = 0;
     if (uefi_boot_image) |path| {
         boot_images_buf[boot_images_len] = .{ .platform = .uefi, .image_path = path };
@@ -221,13 +221,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         boot_images_len += 1;
     }
 
-    const determinism: ?zvmi.build_iso.Determinism = if (source_date_epoch) |epoch| .{
+    const determinism: ?vmiz.build_iso.Determinism = if (source_date_epoch) |epoch| .{
         .filesystem_timestamp = epoch,
         .root_filesystem_uuid = deriveUuid(epoch),
     } else null;
 
-    var limit_sink = zvmi.limits.Diagnostic{};
-    var report = zvmi.build_iso.build(gpa, io, .{
+    var limit_sink = vmiz.limits.Diagnostic{};
+    var report = vmiz.build_iso.build(gpa, io, .{
         .iso_path = iso_path orelse return fail("build-iso: --iso is required", .{}),
         .container_path = container_path orelse return fail("build-iso: --container is required", .{}),
         .oci_load_options = oci_load_options,
@@ -266,7 +266,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
 fn deriveUuid(epoch: u32) [16]u8 {
     var digest: [32]u8 = undefined;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("zvmi-build-iso-rootfs-uuid\x00");
+    hasher.update("vmiz-build-iso-rootfs-uuid\x00");
     var epoch_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &epoch_bytes, epoch, .little);
     hasher.update(&epoch_bytes);
@@ -275,12 +275,12 @@ fn deriveUuid(epoch: u32) [16]u8 {
 }
 
 fn parseOciLimit(value: []const u8) !usize {
-    const size = try zvmi.parseSize(value);
+    const size = try vmiz.parseSize(value);
     if (size == 0) return error.ZeroOciLimit;
     return std.math.cast(usize, size) orelse error.OciLimitTooLarge;
 }
 
-fn printReport(report: zvmi.build_iso.BuildIsoReport, dry_run: bool) void {
+fn printReport(report: vmiz.build_iso.BuildIsoReport, dry_run: bool) void {
     const arch_text = switch (report.architecture) {
         .x86_64 => "x86_64",
         .aarch64 => "aarch64",
@@ -315,11 +315,11 @@ fn printReport(report: zvmi.build_iso.BuildIsoReport, dry_run: bool) void {
 fn describeFailure(
     allocator: std.mem.Allocator,
     err: anyerror,
-    limit_exceeded: ?zvmi.limits.Exceeded,
+    limit_exceeded: ?vmiz.limits.Exceeded,
 ) std.mem.Allocator.Error![]u8 {
     if (limit_exceeded) |breach| {
-        var message_buffer: [zvmi.limits.Exceeded.max_message_bytes]u8 = undefined;
-        var remediation_buffer: [zvmi.limits.Exceeded.max_remediation_bytes]u8 = undefined;
+        var message_buffer: [vmiz.limits.Exceeded.max_message_bytes]u8 = undefined;
+        var remediation_buffer: [vmiz.limits.Exceeded.max_remediation_bytes]u8 = undefined;
         if (breach.limit.err() == err) {
             return std.fmt.allocPrint(
                 allocator,

@@ -294,7 +294,7 @@ RELEASE_SETS = {
         ),
         "summary": (
             "Generalized FreeBSD 15.1-RELEASE full and core ZFS images built "
-            "with zvmi."
+            "with vmiz."
         ),
         "highlights": (
             "Added matching AArch64 and x86_64 full and core release images.",
@@ -679,7 +679,7 @@ def candidate_command(args: argparse.Namespace) -> None:
 
     document = {
         "schema": CANDIDATE_SCHEMA,
-        "type": "zvmi-freebsd15-candidate",
+        "type": "vmiz-freebsd15-candidate",
         "variant": key,
         "architecture": expected["architecture"],
         "filesystem": expected["filesystem"],
@@ -771,7 +771,7 @@ def azure_result_command(args: argparse.Namespace) -> None:
 
     document = {
         "schema": CANDIDATE_SCHEMA,
-        "type": "zvmi-freebsd15-azure-acceptance",
+        "type": "vmiz-freebsd15-azure-acceptance",
         "variant": candidate["variant"],
         "architecture": candidate["architecture"],
         "filesystem": candidate["filesystem"],
@@ -809,7 +809,7 @@ def validate_candidate(
     document = json.loads(manifest_path.read_text(encoding="utf-8"))
     if document.get("schema") != CANDIDATE_SCHEMA:
         raise ValueError(f"{manifest_path}: unsupported schema")
-    if document.get("type") != "zvmi-freebsd15-candidate":
+    if document.get("type") != "vmiz-freebsd15-candidate":
         raise ValueError(f"{manifest_path}: unexpected candidate type")
     key = document.get("variant")
     if key not in VARIANTS:
@@ -1093,7 +1093,7 @@ def release_notes(
                 "",
                 "The QCOW2 assets are not directly uploadable to Azure. "
                 "Validation was completed on aligned fixed VHDs derived with "
-                "`zvmi azure derive` from these exact release candidates.",
+                "`vmiz azure derive` from these exact release candidates.",
             ]
         )
     else:
@@ -1101,7 +1101,7 @@ def release_notes(
             [
                 "",
                 "The QCOW2 assets are not directly uploadable to Azure. "
-                "Derive an aligned fixed VHD with `zvmi azure derive` before "
+                "Derive an aligned fixed VHD with `vmiz azure derive` before "
                 "upload. The exact release candidates were validated under "
                 "UEFI QEMU; this release does not claim exact-candidate Azure "
                 "validation.",
@@ -1161,7 +1161,7 @@ def stage_command(args: argparse.Namespace) -> None:
     )
     core_rows = full_core_rows({
         "schema": CANDIDATE_SCHEMA,
-        "type": "zvmi-freebsd15-release",
+        "type": "vmiz-freebsd15-release",
         "release_set": args.release_set,
         "release_tag": expected_release_tag,
         "source_commit": args.source_commit,
@@ -1178,7 +1178,7 @@ def stage_command(args: argparse.Namespace) -> None:
         document = json.loads(azure_manifest.read_text(encoding="utf-8"))
         if document.get("schema") != CANDIDATE_SCHEMA:
             raise ValueError(f"{azure_manifest}: unsupported schema")
-        if document.get("type") != "zvmi-freebsd15-azure-acceptance":
+        if document.get("type") != "vmiz-freebsd15-azure-acceptance":
             raise ValueError(f"{azure_manifest}: unexpected azure result type")
         key = document.get("variant")
         if key not in wanted:
@@ -1295,7 +1295,7 @@ def stage_command(args: argparse.Namespace) -> None:
 
     manifest = {
         "schema": CANDIDATE_SCHEMA,
-        "type": "zvmi-freebsd15-release",
+        "type": "vmiz-freebsd15-release",
         "release_set": args.release_set,
         "release_tag": args.release_tag,
         "source_commit": args.source_commit,
@@ -1343,7 +1343,7 @@ def candidate_release_asset(candidate: dict) -> dict:
 
 def load_publish_manifest(path: Path) -> dict:
     document = json.loads(path.read_text(encoding="utf-8"))
-    if document.get("type") != "zvmi-freebsd15-release":
+    if document.get("type") != "vmiz-freebsd15-release":
         raise ValueError(f"{path}: not a publish manifest")
     if document.get("schema") != CANDIDATE_SCHEMA:
         raise ValueError(f"{path}: unsupported schema")

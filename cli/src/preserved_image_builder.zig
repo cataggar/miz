@@ -4,55 +4,55 @@ const std = @import("std");
 const builtin = @import("builtin");
 const customization_loader = @import("customization_loader.zig");
 const vm_firmware = @import("vm_firmware.zig");
-const zvmi = @import("zvmi");
-const wire = zvmi.preserved_image_wire;
+const vmiz = @import("vmiz");
+const wire = vmiz.preserved_image_wire;
 
 /// The in-VM guest agents, embedded by the build graph. Both architectures
 /// travel with the builder because cross-architecture customization is the
 /// point of the `vm` backend: the runner architecture, not the host's, decides
 /// which one boots.
 const guest_agents = std.StaticStringMap([]const u8).initComptime(.{
-    .{ "x86_64", @embedFile("zvmi_guest_agent_x86_64") },
-    .{ "aarch64", @embedFile("zvmi_guest_agent_aarch64") },
+    .{ "x86_64", @embedFile("vmiz_guest_agent_x86_64") },
+    .{ "aarch64", @embedFile("vmiz_guest_agent_aarch64") },
 });
 
 const ParsedArgs = struct {
-    api_version: u32 = zvmi.customize.current_api_version,
-    architecture: zvmi.customize.Architecture,
+    api_version: u32 = vmiz.customize.current_api_version,
+    architecture: vmiz.customize.Architecture,
     disk_path: []const u8,
     dependency_paths: []const []const u8,
     configuration_path: []const u8,
     operation_source_paths: []const []const u8,
     bundle_output_path: []const u8,
     image_basename: []const u8,
-    format: zvmi.customize.OutputFormat,
-    seed: zvmi.customize.Seed,
+    format: vmiz.customize.OutputFormat,
+    seed: vmiz.customize.Seed,
     source_date_epoch: u64,
-    limits: zvmi.limits.ImportLimits = .{},
+    limits: vmiz.limits.ImportLimits = .{},
     preflight_only: bool = false,
     reuse_success: bool = false,
     verbose: bool = false,
 };
 
 const LoadedConfiguration = struct {
-    backend: zvmi.customize.ExecutionBackend,
-    root_partition: zvmi.customize.PartitionSelector,
-    source_profile: zvmi.customize.SourceProfilePolicy,
-    source_mounts: []const zvmi.customize.SourceMount,
-    identity_rewrite: zvmi.customize.IdentityRewritePolicy,
-    journal: zvmi.ext4.JournalOptions,
-    inodes: zvmi.ext4.InodeOptions,
-    operations: []const zvmi.customize.ExistingPathOperation,
-    os: zvmi.customize.OsCustomization,
-    generalization: zvmi.customize.GeneralizationPolicy,
+    backend: vmiz.customize.ExecutionBackend,
+    root_partition: vmiz.customize.PartitionSelector,
+    source_profile: vmiz.customize.SourceProfilePolicy,
+    source_mounts: []const vmiz.customize.SourceMount,
+    identity_rewrite: vmiz.customize.IdentityRewritePolicy,
+    journal: vmiz.ext4.JournalOptions,
+    inodes: vmiz.ext4.InodeOptions,
+    operations: []const vmiz.customize.ExistingPathOperation,
+    os: vmiz.customize.OsCustomization,
+    generalization: vmiz.customize.GeneralizationPolicy,
     acknowledge_unsafe: bool,
-    packages: zvmi.customize.PackagePolicy,
-    hooks: []const zvmi.customize.Hook,
-    initramfs: zvmi.customize.InitramfsPolicy,
-    selinux: zvmi.customize.SelinuxPolicy,
+    packages: vmiz.customize.PackagePolicy,
+    hooks: []const vmiz.customize.Hook,
+    initramfs: vmiz.customize.InitramfsPolicy,
+    selinux: vmiz.customize.SelinuxPolicy,
     guest_execution: wire.GuestExecutionPolicy,
     runner: ?wire.Runner,
-    vm: ?zvmi.customize.VmPolicy,
+    vm: ?vmiz.customize.VmPolicy,
     deadline_seconds: ?u32 = null,
     /// Set when the configuration asked for a firmware boot without naming the
     /// EDK2 files. Resolution needs the runner architecture and the filesystem,
@@ -65,20 +65,20 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(arena);
     if (argv.len == 3 and std.mem.eql(u8, argv[1], "--unsafe-chroot-worker")) {
-        return zvmi.unsafe_chroot.workerMain(init, argv[2]);
+        return vmiz.unsafe_chroot.workerMain(init, argv[2]);
     }
     const args = parseArgs(arena, argv[1..]) catch |err| {
-        std.debug.print("zvmi-preserved-image-builder: invalid arguments: {t}\n", .{err});
+        std.debug.print("vmiz-preserved-image-builder: invalid arguments: {t}\n", .{err});
         std.process.exit(2);
     };
     if (!isBasename(args.image_basename) or isReservedBasename(args.image_basename)) {
-        std.debug.print("zvmi-preserved-image-builder: image output must be a non-reserved basename\n", .{});
+        std.debug.print("vmiz-preserved-image-builder: image output must be a non-reserved basename\n", .{});
         std.process.exit(2);
     }
 
     const lock_path = try std.fmt.allocPrint(arena, "{s}.lock", .{args.bundle_output_path});
     validateIsolation(arena, init.io, &args, lock_path) catch |err| {
-        std.debug.print("zvmi-preserved-image-builder: result paths overlap an input: {t}\n", .{err});
+        std.debug.print("vmiz-preserved-image-builder: result paths overlap an input: {t}\n", .{err});
         std.process.exit(2);
     };
     const dependency_closure_exact = validateDependencyClosure(
@@ -87,12 +87,12 @@ pub fn main(init: std.process.Init) !void {
         &args,
         lock_path,
     ) catch |err| {
-        std.debug.print("zvmi-preserved-image-builder: invalid disk dependency closure: {t}\n", .{err});
+        std.debug.print("vmiz-preserved-image-builder: invalid disk dependency closure: {t}\n", .{err});
         std.process.exit(2);
     };
 
     const lock_file = acquireBundleLock(init.io, lock_path) catch |err| {
-        std.debug.print("zvmi-preserved-image-builder: cannot lock result bundle: {t}\n", .{err});
+        std.debug.print("vmiz-preserved-image-builder: cannot lock result bundle: {t}\n", .{err});
         std.process.exit(1);
     };
     defer lock_file.close(init.io);
@@ -106,7 +106,7 @@ pub fn main(init: std.process.Init) !void {
 
     try resetBundle(arena, init.io, args.bundle_output_path);
     std.Io.Dir.cwd().createDirPath(init.io, args.bundle_output_path) catch |err| {
-        std.debug.print("zvmi-preserved-image-builder: cannot create result bundle: {t}\n", .{err});
+        std.debug.print("vmiz-preserved-image-builder: cannot create result bundle: {t}\n", .{err});
         std.process.exit(1);
     };
 
@@ -199,7 +199,7 @@ pub fn main(init: std.process.Init) !void {
         firmware.vars_path = resolved_firmware.vars_path;
     }
 
-    const request = zvmi.customize.Request{
+    const request = vmiz.customize.Request{
         .api_version = args.api_version,
         .target_architecture = args.architecture,
         .input = .{ .disk = .{
@@ -256,7 +256,7 @@ pub fn main(init: std.process.Init) !void {
         .limits = args.limits,
     };
 
-    const host_architecture: zvmi.customize.Architecture = switch (builtin.cpu.arch) {
+    const host_architecture: vmiz.customize.Architecture = switch (builtin.cpu.arch) {
         .x86_64 => .x86_64,
         .aarch64 => .aarch64,
         else => {
@@ -275,7 +275,7 @@ pub fn main(init: std.process.Init) !void {
         },
     };
 
-    var resolved = try zvmi.customize.resolve(init.gpa, &request, .{
+    var resolved = try vmiz.customize.resolve(init.gpa, &request, .{
         .host_architecture = host_architecture,
     });
     defer resolved.deinit(init.gpa);
@@ -292,7 +292,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (args.preflight_only) {
-        var report = try zvmi.customize.preflight(
+        var report = try vmiz.customize.preflight(
             init.gpa,
             init.io,
             &resolved.plan.?,
@@ -320,7 +320,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var console = ConsoleEvents{ .verbose = args.verbose };
-    var outcome = try zvmi.customize.execute(
+    var outcome = try vmiz.customize.execute(
         init.gpa,
         init.io,
         &resolved.plan.?,
@@ -395,8 +395,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs {
-    var api_version: u32 = zvmi.customize.current_api_version;
-    var architecture: ?zvmi.customize.Architecture = null;
+    var api_version: u32 = vmiz.customize.current_api_version;
+    var architecture: ?vmiz.customize.Architecture = null;
     var disk_path: ?[]const u8 = null;
     var dependencies = std.array_list.Managed([]const u8).init(allocator);
     errdefer dependencies.deinit();
@@ -405,10 +405,10 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
     errdefer operation_sources.deinit();
     var bundle_output_path: ?[]const u8 = null;
     var image_basename: ?[]const u8 = null;
-    var format: ?zvmi.customize.OutputFormat = null;
-    var seed: ?zvmi.customize.Seed = null;
+    var format: ?vmiz.customize.OutputFormat = null;
+    var seed: ?vmiz.customize.Seed = null;
     var source_date_epoch: ?u64 = null;
-    var limits: zvmi.limits.ImportLimits = .{};
+    var limits: vmiz.limits.ImportLimits = .{};
     var preflight_only = false;
     var reuse_success = false;
     var verbose = false;
@@ -661,8 +661,8 @@ fn vmFirmwareUnresolved(configuration: ?wire.VmConfiguration) bool {
 fn mapSourceMounts(
     allocator: std.mem.Allocator,
     mounts: []const wire.SourceMount,
-) ![]const zvmi.customize.SourceMount {
-    const mapped = try allocator.alloc(zvmi.customize.SourceMount, mounts.len);
+) ![]const vmiz.customize.SourceMount {
+    const mapped = try allocator.alloc(vmiz.customize.SourceMount, mounts.len);
     for (mounts, mapped) |mount, *slot| {
         slot.* = .{
             .source_path = mount.source_path,
@@ -692,7 +692,7 @@ fn mapSourceMounts(
     return mapped;
 }
 
-fn mapVmPolicy(configuration: ?wire.VmConfiguration) ?zvmi.customize.VmPolicy {
+fn mapVmPolicy(configuration: ?wire.VmConfiguration) ?vmiz.customize.VmPolicy {
     const present = configuration orelse return null;
     return .{
         .emulator_command = present.emulator_command,
@@ -732,8 +732,8 @@ fn mapOperations(
     allocator: std.mem.Allocator,
     operations: []const wire.Operation,
     source_paths: []const []const u8,
-) ![]const zvmi.customize.ExistingPathOperation {
-    const mapped = try allocator.alloc(zvmi.customize.ExistingPathOperation, operations.len);
+) ![]const vmiz.customize.ExistingPathOperation {
+    const mapped = try allocator.alloc(vmiz.customize.ExistingPathOperation, operations.len);
     errdefer allocator.free(mapped);
     for (operations, 0..) |operation, index| {
         mapped[index] = switch (operation) {
@@ -759,8 +759,8 @@ fn mapHooks(
     allocator: std.mem.Allocator,
     hooks: []const wire.Hook,
     source_paths: []const []const u8,
-) ![]const zvmi.customize.Hook {
-    const mapped = try allocator.alloc(zvmi.customize.Hook, hooks.len);
+) ![]const vmiz.customize.Hook {
+    const mapped = try allocator.alloc(vmiz.customize.Hook, hooks.len);
     errdefer allocator.free(mapped);
     for (hooks, mapped) |hook, *slot| {
         if (hook.source.source_index >= source_paths.len) {
@@ -785,9 +785,9 @@ fn mapPackagePolicy(
     allocator: std.mem.Allocator,
     policy: wire.PackagePolicy,
     source_paths: []const []const u8,
-) !zvmi.customize.PackagePolicy {
+) !vmiz.customize.PackagePolicy {
     const actions = try allocator.alloc(
-        zvmi.customize.PackageAction,
+        vmiz.customize.PackageAction,
         policy.actions.len,
     );
     errdefer allocator.free(actions);
@@ -800,7 +800,7 @@ fn mapPackagePolicy(
         };
     }
     const repositories = try allocator.alloc(
-        zvmi.customize.PackageRepository,
+        vmiz.customize.PackageRepository,
         policy.repositories.len,
     );
     errdefer allocator.free(repositories);
@@ -813,7 +813,7 @@ fn mapPackagePolicy(
     };
     for (policy.repositories, 0..) |repository, index| {
         const trust = try allocator.alloc(
-            zvmi.customize.TrustSource,
+            vmiz.customize.TrustSource,
             repository.trust.len,
         );
         repositories[index] = .{
@@ -853,7 +853,7 @@ fn mapPackagePolicy(
             .snapshot => |snapshot| .{ .snapshot = snapshot },
             .exact => |locks| exact: {
                 const mapped = try allocator.alloc(
-                    zvmi.customize.PackageVersionLock,
+                    vmiz.customize.PackageVersionLock,
                     locks.len,
                 );
                 for (locks, 0..) |lock, index| mapped[index] = .{
@@ -874,7 +874,7 @@ fn mapPackagePolicy(
 fn mapInitramfsPolicy(
     allocator: std.mem.Allocator,
     policy: wire.InitramfsPolicy,
-) !zvmi.customize.InitramfsPolicy {
+) !vmiz.customize.InitramfsPolicy {
     return switch (policy) {
         .unchanged => .unchanged,
         .regenerate => |regenerate| .{ .regenerate = .{
@@ -897,14 +897,14 @@ fn mapInitramfsPolicy(
     };
 }
 
-fn parseArchitecture(value: []const u8) ?zvmi.customize.Architecture {
+fn parseArchitecture(value: []const u8) ?vmiz.customize.Architecture {
     if (std.mem.eql(u8, value, "x86_64")) return .x86_64;
     if (std.mem.eql(u8, value, "aarch64")) return .aarch64;
     return null;
 }
 
-fn parseFormat(value: []const u8) ?zvmi.customize.OutputFormat {
-    return zvmi.customize.OutputFormat.parseName(value);
+fn parseFormat(value: []const u8) ?vmiz.customize.OutputFormat {
+    return vmiz.customize.OutputFormat.parseName(value);
 }
 
 fn isBasename(path: []const u8) bool {
@@ -949,7 +949,7 @@ fn validateDependencyClosure(
     args: *const ParsedArgs,
     lock_path: []const u8,
 ) !bool {
-    var image = try zvmi.Image.openPathReadOnly(io, args.disk_path);
+    var image = try vmiz.Image.openPathReadOnly(io, args.disk_path);
     defer image.close(io);
     const discovered = try image.sourceDependencyPaths(allocator);
     defer {
@@ -1083,7 +1083,7 @@ fn computeReuseKey(
     args: *const ParsedArgs,
 ) ![32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("zvmi-preserved-image-builder-reuse-v1\x00");
+    hash.update("vmiz-preserved-image-builder-reuse-v1\x00");
     for (argv[1..]) |arg| {
         var length: [8]u8 = undefined;
         std.mem.writeInt(u64, &length, arg.len, .big);
@@ -1108,18 +1108,18 @@ fn hashSource(
     io: std.Io,
     path: []const u8,
 ) !void {
-    const digest = try zvmi.customize.hashSourcePath(allocator, io, path);
+    const digest = try vmiz.customize.hashSourcePath(allocator, io, path);
     hash.update(&digest.bytes);
 }
 
 const UnsafeRuntimeContext = struct {
     self_exe: []const u8,
     environ: std.process.Environ = .empty,
-    availability: ?zvmi.customize.CapabilityState = null,
+    availability: ?vmiz.customize.CapabilityState = null,
 };
 
-fn unsafePlatform(context: *UnsafeRuntimeContext) zvmi.customize.Platform {
-    var platform = zvmi.customize.Platform.system();
+fn unsafePlatform(context: *UnsafeRuntimeContext) vmiz.customize.Platform {
+    var platform = vmiz.customize.Platform.system();
     platform.context = context;
     platform.unsafeChrootCheckFn = checkUnsafeChroot;
     platform.unsafeChrootRunFn = runUnsafeChroot;
@@ -1131,11 +1131,11 @@ fn unsafePlatform(context: *UnsafeRuntimeContext) zvmi.customize.Platform {
 fn checkUnsafeChroot(
     context_ptr: ?*anyopaque,
     io: std.Io,
-    _: *const zvmi.customize.ResolvedPlan,
-) zvmi.customize.CapabilityState {
+    _: *const vmiz.customize.ResolvedPlan,
+) vmiz.customize.CapabilityState {
     const context: *UnsafeRuntimeContext = @ptrCast(@alignCast(context_ptr.?));
     if (context.availability == null) {
-        context.availability = zvmi.unsafe_chroot.available(io);
+        context.availability = vmiz.unsafe_chroot.available(io);
     }
     return context.availability.?;
 }
@@ -1144,12 +1144,12 @@ fn runUnsafeChroot(
     context_ptr: ?*anyopaque,
     allocator: std.mem.Allocator,
     io: std.Io,
-    plan: *const zvmi.customize.ResolvedPlan,
-    target: zvmi.preserved_image.RawMutationTarget,
-    deadline: zvmi.customize.Deadline,
-) !zvmi.customize.UnsafeChrootRuntimeReport {
+    plan: *const vmiz.customize.ResolvedPlan,
+    target: vmiz.preserved_image.RawMutationTarget,
+    deadline: vmiz.customize.Deadline,
+) !vmiz.customize.UnsafeChrootRuntimeReport {
     const context: *UnsafeRuntimeContext = @ptrCast(@alignCast(context_ptr.?));
-    return zvmi.unsafe_chroot.runParent(allocator, io, .{
+    return vmiz.unsafe_chroot.runParent(allocator, io, .{
         .self_exe = context.self_exe,
         .transaction_path = plan.data.transaction_path,
         .plan = plan,
@@ -1162,24 +1162,24 @@ fn runUnsafeChroot(
 fn checkVm(
     _: ?*anyopaque,
     io: std.Io,
-    plan: *const zvmi.customize.ResolvedPlan,
-) zvmi.customize.CapabilityState {
-    return zvmi.vm_backend.available(io, plan);
+    plan: *const vmiz.customize.ResolvedPlan,
+) vmiz.customize.CapabilityState {
+    return vmiz.vm_backend.available(io, plan);
 }
 
 fn runVm(
     context_ptr: ?*anyopaque,
     allocator: std.mem.Allocator,
     io: std.Io,
-    plan: *const zvmi.customize.ResolvedPlan,
-    target: zvmi.preserved_image.RawMutationTarget,
-    deadline: zvmi.customize.Deadline,
-) !zvmi.customize.VmRuntimeReport {
+    plan: *const vmiz.customize.ResolvedPlan,
+    target: vmiz.preserved_image.RawMutationTarget,
+    deadline: vmiz.customize.Deadline,
+) !vmiz.customize.VmRuntimeReport {
     const context: *UnsafeRuntimeContext = @ptrCast(@alignCast(context_ptr.?));
     const agent = guest_agents.get(
         @tagName(plan.data.architectures.runner),
     ) orelse return error.VmGuestAgentUnavailable;
-    return zvmi.vm_backend.run(allocator, io, .{
+    return vmiz.vm_backend.run(allocator, io, .{
         .plan = plan,
         .transaction_path = plan.data.transaction_path,
         .target = target,
@@ -1222,7 +1222,7 @@ fn resetBundle(
             if (std.mem.eql(
                 u8,
                 entry.basename,
-                zvmi.unsafe_chroot.active_lease_basename,
+                vmiz.unsafe_chroot.active_lease_basename,
             )) {
                 return error.MutationResourcesActive;
             }
@@ -1240,7 +1240,7 @@ test "bundle reset preserves transactions with active backend resources" {
     defer std.Io.Dir.cwd().deleteTree(io, bundle_path) catch {};
     try std.Io.Dir.cwd().createDirPath(io, transaction_path);
     var marker_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const marker_path = try zvmi.unsafe_chroot.activeLeasePath(
+    const marker_path = try vmiz.unsafe_chroot.activeLeasePath(
         transaction_path,
         &marker_buffer,
     );
@@ -1282,11 +1282,11 @@ fn writePlan(
     allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
-    plan: *const zvmi.customize.ResolvedPlan,
+    plan: *const vmiz.customize.ResolvedPlan,
 ) !void {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    try zvmi.customize.writePlanJson(plan, &output.writer);
+    try vmiz.customize.writePlanJson(plan, &output.writer);
     try writeBytes(io, path, output.written());
 }
 
@@ -1294,11 +1294,11 @@ fn writeDiagnostics(
     allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
-    diagnostics: zvmi.customize.DiagnosticSet,
+    diagnostics: vmiz.customize.DiagnosticSet,
 ) !void {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    try zvmi.customize.writeDiagnosticsJson(diagnostics, &output.writer);
+    try vmiz.customize.writeDiagnosticsJson(diagnostics, &output.writer);
     try writeBytes(io, path, output.written());
 }
 
@@ -1306,14 +1306,14 @@ fn writeRunnerDiagnostic(
     allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
-    phase: zvmi.customize.DiagnosticPhase,
-    code: zvmi.customize.DiagnosticCode,
+    phase: vmiz.customize.DiagnosticPhase,
+    code: vmiz.customize.DiagnosticCode,
     configuration_path: []const u8,
     message: []const u8,
     remediation: []const u8,
     cause: ?anyerror,
 ) !void {
-    var items = [_]zvmi.customize.Diagnostic{.{
+    var items = [_]vmiz.customize.Diagnostic{.{
         .severity = .@"error",
         .phase = phase,
         .code = code,
@@ -1329,11 +1329,11 @@ fn writeProvenance(
     allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
-    provenance: zvmi.customize.Provenance,
+    provenance: vmiz.customize.Provenance,
 ) !void {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    try zvmi.customize.writeProvenanceJson(provenance, &output.writer);
+    try vmiz.customize.writeProvenanceJson(provenance, &output.writer);
     try writeBytes(io, path, output.written());
 }
 
@@ -1346,11 +1346,11 @@ fn writeBytes(io: std.Io, path: []const u8, bytes: []const u8) !void {
 const ConsoleEvents = struct {
     verbose: bool,
 
-    fn emit(context: ?*anyopaque, event: zvmi.customize.ExecutionEvent) void {
+    fn emit(context: ?*anyopaque, event: vmiz.customize.ExecutionEvent) void {
         const self: *ConsoleEvents = @ptrCast(@alignCast(context.?));
         switch (event) {
             .progress => |progress| if (self.verbose) {
-                std.debug.print("zvmi-preserved-image-builder: {s}\n", .{progress.message});
+                std.debug.print("vmiz-preserved-image-builder: {s}\n", .{progress.message});
             },
             .diagnostic => {},
         }
@@ -1419,7 +1419,7 @@ test "configuration loader accepts v2 and v3 transport" {
         &.{"replacement"},
     );
     try std.testing.expectEqual(
-        zvmi.customize.ExecutionBackend.rebuild,
+        vmiz.customize.ExecutionBackend.rebuild,
         v2.backend,
     );
     try std.testing.expectEqual(@as(usize, 0), v2.packages.actions.len);
@@ -1433,7 +1433,7 @@ test "configuration loader accepts v2 and v3 transport" {
         &.{"trust-source"},
     );
     try std.testing.expectEqual(
-        zvmi.customize.ExecutionBackend.unsafe_chroot,
+        vmiz.customize.ExecutionBackend.unsafe_chroot,
         v3.backend,
     );
     try std.testing.expect(v3.acknowledge_unsafe);
@@ -1480,7 +1480,7 @@ test "the vm backend and a cross-architecture runner survive the loader" {
         \\{"api_version":3,"backend":"vm","root_partition":{"gpt_index":2},"guest_execution":"cross_architecture","runner":{"kind":"vm","guest_architecture":"aarch64","command":"/usr/bin/qemu-system-aarch64"},"vm":{"emulator_command":"/usr/bin/qemu-system-aarch64","boot":{"direct_kernel":{}},"acceleration":"software"}}
     ;
     const loaded = try parseConfiguration(allocator, json, &.{});
-    try std.testing.expectEqual(zvmi.customize.ExecutionBackend.vm, loaded.backend);
+    try std.testing.expectEqual(vmiz.customize.ExecutionBackend.vm, loaded.backend);
     try std.testing.expectEqual(
         wire.GuestExecutionPolicy.cross_architecture,
         loaded.guest_execution,
@@ -1495,7 +1495,7 @@ test "the vm backend and a cross-architecture runner survive the loader" {
     );
     try std.testing.expect(loaded.vm.?.boot == .direct_kernel);
     try std.testing.expectEqual(
-        zvmi.customize.VmAcceleration.software,
+        vmiz.customize.VmAcceleration.software,
         loaded.vm.?.acceleration,
     );
 
@@ -1564,7 +1564,7 @@ test "a credential crosses the wire as a locator the build system never stages" 
             .trust = &.{.{ .source_index = 0 }},
             .credential = .{ .basic = .{
                 .username = "builder",
-                .password = .{ .host_environment = "ZVMI_REPOSITORY_TOKEN" },
+                .password = .{ .host_environment = "VMIZ_REPOSITORY_TOKEN" },
             } },
         }},
     };
@@ -1582,7 +1582,7 @@ test "a credential crosses the wire as a locator the build system never stages" 
         return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("builder", credential.basic.username);
     try std.testing.expectEqualStrings(
-        "ZVMI_REPOSITORY_TOKEN",
+        "VMIZ_REPOSITORY_TOKEN",
         credential.basic.password.host_environment,
     );
 
@@ -1619,12 +1619,12 @@ test "a hook crosses the wire as a staged source and lands on a host path" {
 
     try std.testing.expectEqual(@as(usize, 2), mapped.len);
     try std.testing.expectEqualStrings("early", mapped[0].name);
-    try std.testing.expectEqual(zvmi.customize.HookPhase.after_packages, mapped[0].phase);
+    try std.testing.expectEqual(vmiz.customize.HookPhase.after_packages, mapped[0].phase);
     try std.testing.expectEqualStrings("staged/early.sh", mapped[0].source.host_path);
     try std.testing.expectEqual(@as(usize, 2), mapped[0].arguments.len);
     try std.testing.expectEqualStrings("--quiet", mapped[0].arguments[0]);
     try std.testing.expectEqualStrings("late", mapped[1].name);
-    try std.testing.expectEqual(zvmi.customize.HookPhase.finalize, mapped[1].phase);
+    try std.testing.expectEqual(vmiz.customize.HookPhase.finalize, mapped[1].phase);
     try std.testing.expectEqualStrings("staged/late.sh", mapped[1].source.host_path);
 
     // An index the caller never staged is refused rather than silently reading
@@ -1696,11 +1696,11 @@ test "dependency closure is checked before a bundle can be reset" {
 
     try std.Io.Dir.cwd().createDirPath(io, bundle_path);
     {
-        var base = try zvmi.Image.createExclusive(io, base_path, .qcow2, 4096, .{});
+        var base = try vmiz.Image.createExclusive(io, base_path, .qcow2, 4096, .{});
         base.close(io);
     }
     {
-        var overlay = try zvmi.Image.createExclusive(io, disk_path, .qcow2, 4096, .{});
+        var overlay = try vmiz.Image.createExclusive(io, disk_path, .qcow2, 4096, .{});
         var backing_offset: [8]u8 = undefined;
         std.mem.writeInt(u64, &backing_offset, 104, .big);
         var backing_length: [4]u8 = undefined;
@@ -1752,7 +1752,7 @@ test "import limit flags raise the limits the request carries" {
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), parsed.limits.max_nodes);
     try std.testing.expectEqual(@as(u64, 4 * 1024 * 1024 * 1024), parsed.limits.max_source_file_bytes);
     // Every other limit keeps its conservative default.
-    try std.testing.expectEqual(zvmi.limits.ImportLimits{
+    try std.testing.expectEqual(vmiz.limits.ImportLimits{
         .max_nodes = parsed.limits.max_nodes,
         .max_source_file_bytes = parsed.limits.max_source_file_bytes,
     }, parsed.limits);
@@ -1807,7 +1807,7 @@ test "merged source mounts survive the loader with their synthesized metadata" {
         loaded.source_mounts[0].partition.mbr_index,
     );
     try std.testing.expectEqual(
-        zvmi.customize.SourceFilesystem.detect,
+        vmiz.customize.SourceFilesystem.detect,
         loaded.source_mounts[0].filesystem,
     );
     // Unstated FAT metadata is the documented default, not an accident.
@@ -1825,7 +1825,7 @@ test "merged source mounts survive the loader with their synthesized metadata" {
     try std.testing.expectEqualStrings("/dev/sdb", loaded.source_mounts[1].source_path);
     try std.testing.expectEqualStrings("/boot/efi", loaded.source_mounts[1].target);
     try std.testing.expectEqual(
-        zvmi.customize.SourceFilesystem.fat32,
+        vmiz.customize.SourceFilesystem.fat32,
         loaded.source_mounts[1].filesystem,
     );
     try std.testing.expectEqual(
@@ -1842,7 +1842,7 @@ test "merged source mounts survive the loader with their synthesized metadata" {
     // Absent from the configuration above, so it has to arrive as the safe
     // default rather than as whatever the loader's zero value happens to be.
     try std.testing.expectEqual(
-        zvmi.customize.IdentityRewritePolicy.rewrite_and_verify,
+        vmiz.customize.IdentityRewritePolicy.rewrite_and_verify,
         loaded.identity_rewrite,
     );
 }
@@ -1868,7 +1868,7 @@ test "an explicit XFS source mount survives the loader" {
     const loaded = try loadV3Configuration(arena.allocator(), configuration, &.{});
     try std.testing.expectEqual(@as(usize, 1), loaded.source_mounts.len);
     try std.testing.expectEqual(
-        zvmi.customize.SourceFilesystem.xfs,
+        vmiz.customize.SourceFilesystem.xfs,
         loaded.source_mounts[0].filesystem,
     );
 }
@@ -1887,7 +1887,7 @@ test "an operator can opt out of failing on an identifier the rewriter cannot re
     defer arena.deinit();
     const loaded = try loadV3Configuration(arena.allocator(), configuration, &.{});
     try std.testing.expectEqual(
-        zvmi.customize.IdentityRewritePolicy.rewrite_only,
+        vmiz.customize.IdentityRewritePolicy.rewrite_only,
         loaded.identity_rewrite,
     );
 }
@@ -1905,7 +1905,7 @@ test "a version 2 configuration keeps the safe identity rewrite default" {
     defer arena.deinit();
     const loaded = try loadV2Configuration(arena.allocator(), configuration, &.{});
     try std.testing.expectEqual(
-        zvmi.customize.IdentityRewritePolicy.rewrite_and_verify,
+        vmiz.customize.IdentityRewritePolicy.rewrite_and_verify,
         loaded.identity_rewrite,
     );
 }
@@ -1914,7 +1914,7 @@ test "the wire's synthesized FAT metadata defaults are the library's" {
     // Two spellings of the same policy would eventually disagree, and the
     // disagreement would show up as an image whose ownership silently changed.
     const wire_defaults = wire.SynthesizedFatMetadata{};
-    const library_defaults = zvmi.customize.SynthesizedFatMetadata{};
+    const library_defaults = vmiz.customize.SynthesizedFatMetadata{};
     try std.testing.expectEqual(library_defaults.directory_mode, wire_defaults.directory_mode);
     try std.testing.expectEqual(library_defaults.file_mode, wire_defaults.file_mode);
     try std.testing.expectEqual(library_defaults.uid, wire_defaults.uid);

@@ -1,7 +1,7 @@
-//! `zvmi cosi <disk-image> -o <output.cosi>`
+//! `vmiz cosi <disk-image> -o <output.cosi>`
 
 const std = @import("std");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     _ = gpa;
@@ -23,14 +23,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         }
     }
 
-    const src_path = input_path orelse return fail("usage: zvmi cosi <disk-image> -o <output.cosi>", .{});
+    const src_path = input_path orelse return fail("usage: vmiz cosi <disk-image> -o <output.cosi>", .{});
     const dst_path = output_path orelse return fail("cosi: -o <output.cosi> is required", .{});
 
-    var img = zvmi.Image.openPath(io, src_path) catch |err|
+    var img = vmiz.Image.openPath(io, src_path) catch |err|
         return fail("cosi: failed to open '{s}': {s}", .{ src_path, @errorName(err) });
     defer img.close(io);
 
-    zvmi.cosi.write(img, io, std.heap.smp_allocator, dst_path) catch |err|
+    vmiz.cosi.write(img, io, std.heap.smp_allocator, dst_path) catch |err|
         return fail("cosi: failed to write '{s}': {s}", .{ dst_path, @errorName(err) });
 
     return 0;

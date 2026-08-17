@@ -1,17 +1,17 @@
-//! `zvmi resize <file> [+|-]<size>`
+//! `vmiz resize <file> [+|-]<size>`
 
 const std = @import("std");
-const zvmi = @import("zvmi");
+const vmiz = @import("vmiz");
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     _ = gpa;
     if (args.len != 2) {
-        return fail("usage: zvmi resize <file> [+]<size>", .{});
+        return fail("usage: vmiz resize <file> [+]<size>", .{});
     }
     const path = args[0];
     const size_arg = args[1];
 
-    var img = zvmi.Image.openPath(io, path) catch |err|
+    var img = vmiz.Image.openPath(io, path) catch |err|
         return fail("resize: failed to open '{s}': {s}", .{ path, @errorName(err) });
     defer img.close(io);
 
@@ -27,7 +27,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
 
     const relative = size_arg.len > 0 and size_arg[0] == '+';
     const magnitude_str = if (relative) size_arg[1..] else size_arg;
-    const magnitude = zvmi.parseSize(magnitude_str) catch |err|
+    const magnitude = vmiz.parseSize(magnitude_str) catch |err|
         return fail("resize: invalid size '{s}': {s}", .{ size_arg, @errorName(err) });
 
     const new_size = if (relative) img.virtual_size + magnitude else magnitude;
