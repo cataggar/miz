@@ -7,7 +7,8 @@ directly; the default path does not spawn `debz`, `apt`, or `apt-get` and does
 not use libapt-pkg or python-apt. Static init, guest, and cross-target modules
 do not import or link debz. Build consumers that need this API use the
 host-targeted `vmiz_host` module; the cross-target `vmiz` module stays free of
-host package-manager linkage.
+host package-manager linkage. Host builds require the liblzma and libzstd
+development libraries that debz declares through its Zig build module.
 
 The version 2 request makes the staged and published root, native/foreign
 architectures, repository sources, keyrings, configuration, cache, state,
