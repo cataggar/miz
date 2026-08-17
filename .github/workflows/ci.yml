@@ -44,7 +44,12 @@ jobs:
         run: zig build
 
       - name: Hermetic Debian-family package backend acceptance
-        run: zig test packages/vmiz/src/package_family.zig
+        run: |
+          if grep -n 'std\.process\.spawn' packages/vmiz/src/package_family.zig; then
+            echo "production package-family path must not spawn debz" >&2
+            exit 1
+          fi
+          zig build test-package-family
 
       - name: Windows release builds
         run: |
