@@ -557,3 +557,11 @@ workspace that grows on demand. See
 
 
 See [Image building](image-building.md) for format, filesystem, boot, and verity details.
+## Host package-family adapter
+
+Host applications can import the separately registered
+`vmiz-package-family-host` module (`zvmi-package-family-host` remains a
+compatibility alias). Its `package_family` namespace contains the
+versioned request/result types, while `execute` selects embedded rpmz by
+default. Keeping this module separate prevents rpmz from entering the core,
+guest-agent, or init static module graphs.
