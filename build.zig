@@ -85,6 +85,11 @@ pub fn build(b: *std.Build) void {
         .bzip2 = false,
         .bzip2recover = false,
     });
+    const debz_dependency = b.dependency("debz", .{
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const debz_mod = debz_dependency.module("debz");
 
     // ---- packages/vmiz: the core disk-image library ----
     const vmiz_mod = b.addModule("vmiz", .{
@@ -92,11 +97,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const host_vmiz_mod = b.createModule(.{
+    const host_vmiz_mod = b.addModule("vmiz_host", .{
         .root_source_file = b.path("packages/vmiz/src/root.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     });
+    host_vmiz_mod.addImport("debz", debz_mod);
     // Declared this early because the preserved-image builder resolves EDK2
     // firmware through the same module `vmiz qemu` does, and that builder is
     // constructed well before the qemu-facing part of the graph.
@@ -108,8 +114,19 @@ pub fn build(b: *std.Build) void {
     });
     host_qemu_host_mod.linkLibrary(host_bzip2.artifact("bz2"));
 
-    const vmiz_tests = b.addTest(.{ .root_module = vmiz_mod });
+    const vmiz_tests = b.addTest(.{ .root_module = host_vmiz_mod });
     const run_vmiz_tests = b.addRunArtifact(vmiz_tests);
+    const package_family_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("packages/vmiz/src/package_family.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "debz", .module = debz_mod }},
+        }),
+    });
+    const run_package_family_tests = b.addRunArtifact(package_family_tests);
+    b.step("test-package-family", "Run embedded debz package-family acceptance tests")
+        .dependOn(&run_package_family_tests.step);
     const tls_fixture = b.dependency("tls", .{
         .target = b.graph.host,
         .optimize = optimize,
@@ -443,7 +460,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "vmiz", .module = vmiz_mod },
             },
         }),
         .linkage = .static,
@@ -466,7 +483,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "vmiz", .module = vmiz_mod },
             },
         }),
         .linkage = .static,
@@ -487,7 +504,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "vmiz", .module = vmiz_mod },
             },
         }),
         .linkage = .static,
@@ -508,7 +525,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "vmiz", .module = vmiz_mod },
                 .{ .name = "qemu_host", .module = host_qemu_host_mod },
             },
         }),
@@ -563,7 +580,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "vmiz", .module = vmiz_mod },
                 .{ .name = "qmp", .module = host_qmp_mod },
                 .{ .name = "qemu_host", .module = host_qemu_host_mod },
             },
@@ -787,7 +804,7 @@ pub fn build(b: *std.Build) void {
     const build_api_consumer_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
-        "--help",
+        "package-family",
     });
     build_api_consumer_check.setName("check external build.zig consumer");
     build_api_consumer_check.setCwd(b.path("tests/build_api_consumer"));

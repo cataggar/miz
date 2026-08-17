@@ -6,6 +6,17 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
     });
+    const package_family_consumer = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("package_family_consumer.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "vmiz", .module = dependency.module("vmiz_host") }},
+        }),
+    });
+    const run_package_family_consumer = b.addRunArtifact(package_family_consumer);
+    b.step("package-family", "Compile and test the public package-family API")
+        .dependOn(&run_package_family_consumer.step);
 
     const pull = vmiz.addOciPull(b, dependency, .{
         .name = "remote-container",

@@ -31,6 +31,9 @@ jobs:
             cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
             cataggar/qemu@v11.0.91-z.15
 
+      - name: Install embedded debz system libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liblzma-dev libzstd-dev
+
       - name: zig fmt --check
         run: zig fmt --check .
 
@@ -44,7 +47,12 @@ jobs:
         run: zig build
 
       - name: Hermetic Debian-family package backend acceptance
-        run: zig test packages/vmiz/src/package_family.zig
+        run: |
+          if grep -n 'std\.process\.spawn' packages/vmiz/src/package_family.zig; then
+            echo "production package-family path must not spawn debz" >&2
+            exit 1
+          fi
+          zig build test-package-family
 
       - name: Windows release builds
         run: |
