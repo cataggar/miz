@@ -130,8 +130,12 @@ pub fn execute(
         return failed(.incompatible_backend, "incompatible debz package-family capability schema", .disposable, null);
 
     const backend_result = executeDebz(allocator, io, backends.debian, request) catch {
-        cleanup(io, request);
-        return failed(.backend_unavailable, "embedded debz backend could not execute", .disposable, null);
+        return failed(
+            .backend_unavailable,
+            "embedded debz backend could not execute",
+            if (mutates(request.operation)) .recoverable else .disposable,
+            null,
+        );
     };
     if (!std.mem.eql(u8, backend_result.schema, debz.package_family_backend.result_schema) or
         backend_result.version != debz.package_family_backend.schema_version or
@@ -157,10 +161,16 @@ pub fn execute(
         cleanup(io, request);
         return failed(.lock_missing, "debz did not return an exact lock path", .disposable, 0);
     }
+    var lock_digest: ?[32]u8 = null;
     if (lock_path) |path| {
-        _ = Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch {
+        const expected = request.inputs.lock_output_path orelse request.inputs.lock_input_path;
+        if (expected == null or !std.mem.eql(u8, path, expected.?)) {
             cleanup(io, request);
-            return failed(.lock_missing, "debz did not emit or preserve the exact lock", .disposable, 0);
+            return failed(.lock_missing, "debz returned an unexpected exact lock path", .disposable, 0);
+        }
+        lock_digest = verifyLock(allocator, io, path, request.inputs.architecture) catch {
+            cleanup(io, request);
+            return failed(.lock_missing, "debz did not emit or preserve a valid exact lock", .disposable, 0);
         };
     }
 
@@ -168,8 +178,15 @@ pub fn execute(
     if (requiresProvenance(request.operation)) {
         const path = provenance_path orelse
             return failed(.provenance_missing, "debz did not return transaction provenance", .recoverable, 0);
-        _ = Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch
-            return failed(.provenance_missing, "debz did not emit transaction provenance", .recoverable, 0);
+        const expected = try std.fmt.allocPrint(allocator, "{s}/{s}", .{
+            request.inputs.state_path,
+            debz.package_family_backend.provenance_basename,
+        });
+        defer allocator.free(expected);
+        if (!std.mem.eql(u8, path, expected))
+            return failed(.provenance_missing, "debz returned an unexpected provenance path", .recoverable, 0);
+        verifyProvenance(allocator, io, path, lock_digest.?) catch
+            return failed(.provenance_missing, "debz did not emit valid transaction provenance", .recoverable, 0);
     }
 
     if (publishes(request.operation)) {
@@ -294,10 +311,17 @@ fn valid(request: Request) bool {
     if (!absolute(request.inputs.root_stage) or !absolute(request.inputs.published_root) or
         !absolute(request.inputs.cache_path) or !absolute(request.inputs.state_path)) return false;
     if (std.mem.eql(u8, request.inputs.root_stage, request.inputs.published_root)) return false;
+    if (pathContains(request.inputs.root_stage, request.inputs.published_root) or
+        pathContains(request.inputs.published_root, request.inputs.root_stage)) return false;
+    if (overlaps(request.inputs.root_stage, request.inputs.cache_path) or
+        overlaps(request.inputs.root_stage, request.inputs.state_path)) return false;
     if (request.inputs.source_paths.len == 0 or request.inputs.keyring_paths.len == 0) return false;
-    for (request.inputs.source_paths) |path| if (!absolute(path)) return false;
-    for (request.inputs.config_paths) |path| if (!absolute(path)) return false;
-    for (request.inputs.keyring_paths) |path| if (!absolute(path)) return false;
+    for (request.inputs.source_paths) |path|
+        if (!absolute(path) or overlaps(request.inputs.root_stage, path)) return false;
+    for (request.inputs.config_paths) |path|
+        if (!absolute(path) or overlaps(request.inputs.root_stage, path)) return false;
+    for (request.inputs.keyring_paths) |path|
+        if (!absolute(path) or overlaps(request.inputs.root_stage, path)) return false;
     for (request.inputs.foreign_architectures) |architecture|
         if (architecture == request.inputs.architecture) return false;
     if ((request.operation == .resolve_lock or request.operation == .create or request.operation == .customize) and
@@ -308,9 +332,12 @@ fn valid(request: Request) bool {
     } else if (request.operation != .inspect and request.inputs.lock_input_path == null) return false;
     if (request.inputs.lock_output_path != null and request.inputs.lock_input_path == null and
         request.operation != .resolve_lock) return false;
-    if (request.inputs.lock_input_path) |path| if (!absolute(path)) return false;
-    if (request.inputs.lock_output_path) |path| if (!absolute(path)) return false;
-    if (request.inputs.credential_reference) |path| if (!absolute(path)) return false;
+    if (request.inputs.lock_input_path) |path|
+        if (!absolute(path) or overlaps(request.inputs.root_stage, path)) return false;
+    if (request.inputs.lock_output_path) |path|
+        if (!absolute(path) or overlaps(request.inputs.root_stage, path)) return false;
+    if (request.inputs.credential_reference) |path|
+        if (!absolute(path) or overlaps(request.inputs.root_stage, path)) return false;
     return request.inputs.deadline_ms != 0;
 }
 
@@ -331,7 +358,94 @@ fn cleanup(io: Io, request: Request) void {
 }
 
 fn absolute(path: []const u8) bool {
-    return path.len > 1 and path[0] == '/' and path[path.len - 1] != '/';
+    if (path.len <= 1 or path[0] != '/' or path[path.len - 1] == '/') return false;
+    var components = std.mem.splitScalar(u8, path[1..], '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, "..")) return false;
+    }
+    return true;
+}
+
+fn pathContains(parent: []const u8, child: []const u8) bool {
+    return child.len > parent.len and std.mem.startsWith(u8, child, parent) and
+        child[parent.len] == '/';
+}
+
+fn overlaps(left: []const u8, right: []const u8) bool {
+    return std.mem.eql(u8, left, right) or pathContains(left, right) or pathContains(right, left);
+}
+
+fn readRegularFile(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    maximum_bytes: usize,
+) ![]u8 {
+    const stat = try Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+    if (stat.kind != .file) return error.NotFile;
+    var file = try Dir.cwd().openFile(io, path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    return reader.interface.allocRemaining(allocator, .limited(maximum_bytes));
+}
+
+fn verifyLock(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    architecture: Architecture,
+) ![32]u8 {
+    const bytes = try readRegularFile(allocator, io, path, debz.exact_lock.maximum_document_bytes);
+    defer allocator.free(bytes);
+    var lock = try debz.decodeExactClosureLock(
+        allocator,
+        bytes,
+        debz.exact_lock.maximum_document_bytes,
+    );
+    defer lock.deinit();
+    const expected = switch (architecture) {
+        .amd64 => "amd64",
+        .arm64 => "arm64",
+    };
+    if (!std.mem.eql(u8, lock.lock.target_architecture, expected))
+        return error.ArchitectureMismatch;
+    return lock.lock.digest_sha256;
+}
+
+fn verifyProvenance(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    lock_digest: [32]u8,
+) !void {
+    const bytes = try readRegularFile(
+        allocator,
+        io,
+        path,
+        debz.transaction_provenance.maximum_document_bytes,
+    );
+    defer allocator.free(bytes);
+    var provenance = try debz.validateTransactionProvenance(
+        allocator,
+        bytes,
+        debz.transaction_provenance.maximum_document_bytes,
+    );
+    defer provenance.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, provenance.bytes, .{});
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidProvenance,
+    };
+    const encoded = object.get("lock_sha256") orelse return error.InvalidProvenance;
+    if (encoded != .string or encoded.string.len != 64) return error.InvalidProvenance;
+    const expected = std.fmt.bytesToHex(lock_digest, .lower);
+    if (!std.mem.eql(u8, encoded.string, &expected)) return error.InvalidProvenance;
 }
 
 fn failed(
@@ -375,14 +489,13 @@ const FakeProduct = struct {
         if (self.fail_status) |status|
             return debz.product_api.failure(request.operation, status, .transaction_failed, "credential=https://secret@example.invalid");
         if (request.options.lock_output_path orelse request.options.lock_input_path) |path| {
-            var lock = try Dir.cwd().createFile(self.io, path, .{});
-            lock.close(self.io);
+            if (request.options.lock_output_path != null)
+                try writeTestLock(self.io, path, request.options.architecture);
         }
         if (request.operation.mutates() and request.operation != .recover and request.options.lock_input_path != null) {
             const provenance = try std.fmt.allocPrint(std.testing.allocator, "{s}/transaction-result.json", .{self.state_path});
             defer std.testing.allocator.free(provenance);
-            var file = try Dir.cwd().createFile(self.io, provenance, .{});
-            file.close(self.io);
+            try writeTestProvenance(self.io, request.options.lock_input_path.?, provenance);
         }
         return .{
             .operation = request.operation,
@@ -392,6 +505,84 @@ const FakeProduct = struct {
         };
     }
 };
+
+fn writeTestLock(io: Io, path: []const u8, architecture: []const u8) !void {
+    const repository_id: [64]u8 = @splat('a');
+    const snapshot: [32]u8 = @splat(1);
+    const repositories = [_]debz.exact_lock.Repository{.{
+        .id = repository_id,
+        .snapshot_sha256 = snapshot,
+        .release_sha256 = @splat(2),
+        .index_sha256 = @splat(3),
+        .signer_fingerprints = &.{@splat(4)},
+    }};
+    const packages = [_]debz.exact_lock.Package{.{
+        .name = "fixture",
+        .version = "1",
+        .architecture = architecture,
+        .repository_id = repository_id,
+        .repository_snapshot_sha256 = snapshot,
+        .sha256 = @splat(5),
+        .declared_size = 1,
+        .retention = .requested,
+        .dpkg_selection_hold = false,
+    }};
+    var lock = try debz.createExactClosureLock(std.testing.allocator, .{
+        .target_architecture = architecture,
+        .request_sha256 = @splat(6),
+        .policy_sha256 = @splat(7),
+        .repositories = &repositories,
+        .packages = &packages,
+        .authenticated_metadata = true,
+    });
+    defer lock.deinit();
+    const bytes = try lock.lock.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var file = try Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, bytes);
+}
+
+fn writeTestProvenance(io: Io, lock_path: []const u8, path: []const u8) !void {
+    const lock_bytes = try readRegularFile(
+        std.testing.allocator,
+        io,
+        lock_path,
+        debz.exact_lock.maximum_document_bytes,
+    );
+    defer std.testing.allocator.free(lock_bytes);
+    var lock = try debz.decodeExactClosureLock(
+        std.testing.allocator,
+        lock_bytes,
+        debz.exact_lock.maximum_document_bytes,
+    );
+    defer lock.deinit();
+    var provenance = try debz.createTransactionProvenance(std.testing.allocator, .{
+        .target_architecture = lock.lock.target_architecture,
+        .request_sha256 = @splat(6),
+        .solver_policy_sha256 = @splat(7),
+        .executor_policy_sha256 = @splat(8),
+        .plan_sha256 = @splat(9),
+        .lock_sha256 = lock.lock.digest_sha256,
+        .repositories = &.{},
+        .packages = &.{},
+        .commands = &.{},
+        .journal_steps = &.{},
+        .final_verification = .{
+            .status = .exact_match,
+            .installed_state_sha256 = @splat(10),
+            .package_origins_sha256 = @splat(11),
+            .detail = "fixture verified",
+        },
+        .outcome = .succeeded,
+    });
+    defer provenance.deinit();
+    const bytes = try provenance.result.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var file = try Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, bytes);
+}
 
 fn fixturePaths(allocator: Allocator, io: Io, suffix: []const u8) !struct {
     stage: []u8,

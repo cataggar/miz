@@ -28,8 +28,10 @@ The immutable Zig dependency is debz commit
 the debz capability, request, result, exact-lock, and provenance schemas before
 accepting output.
 
-For create/customize/update, debz runs against `root_stage`. vmiz verifies the
-exact lock and `state/transaction-result.json` before an atomic
+For create/customize/update, debz runs against `root_stage`. vmiz parses the
+canonical exact-lock document, checks its target architecture, validates the
+provenance digest and lock binding, and verifies `state/transaction-result.json`
+before an atomic
 rename-without-replacement publishes `published_root`. Backend, verification,
 or publication failures return typed diagnostics with a disposable or
 recoverable disposition and never report or publish success. Download and
