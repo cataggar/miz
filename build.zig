@@ -137,7 +137,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "vmiz", .module = vmiz_mod },
                 .{ .name = "tls", .module = tls_fixture.module("tls") },
             },
         }),
@@ -251,7 +251,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "vmiz", .module = vmiz_mod },
             },
         }),
     });
@@ -274,7 +274,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "vmiz", .module = vmiz_mod },
             },
         }),
     });
@@ -299,7 +299,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "vmiz", .module = vmiz_mod },
             },
         }),
     });
@@ -326,7 +326,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "vmiz", .module = vmiz_mod },
                 .{ .name = "qemu_host", .module = host_qemu_host_mod },
             },
         }),
