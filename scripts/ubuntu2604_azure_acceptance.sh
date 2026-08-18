@@ -52,6 +52,7 @@ cleanup_group() {
     return 1
   fi
   if ! python3 - "$metadata_file" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CANDIDATE_KEY" <<'PY'
+import hashlib
 import json
 import sys
 
@@ -458,6 +459,7 @@ info = json.load(open(info_path, encoding="utf-8"))
 qemu_virtual_size = info.get("virtual-size")
 if type(qemu_virtual_size) is not int:
     raise SystemExit("qemu-img omitted the derived VHD virtual size")
+qemu_info_sha256 = hashlib.sha256(open(info_path, "rb").read()).hexdigest()
 document = {
     "schema": 1,
     "type": "vmiz-azure-vhd-conversion",
@@ -484,6 +486,7 @@ document = {
         "bytes": int(vhd_bytes),
         "current_size": int(vhd_current_size),
         "qemu_virtual_size": qemu_virtual_size,
+        "qemu_info_sha256": qemu_info_sha256,
     },
 }
 open(output, "w", encoding="utf-8").write(

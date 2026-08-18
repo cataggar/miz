@@ -103,6 +103,17 @@ else:
         self.assertIn('write_bearer_header "$token" "$auth_header"\n  token=', harness)
         self.assertIn('--header "@$auth_header"', harness)
 
+    def test_conversion_attestation_binds_qemu_info_digest(self) -> None:
+        harness = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            'qemu_info_sha256 = hashlib.sha256(open(info_path, "rb").read()).hexdigest()',
+            harness,
+        )
+        self.assertIn('"qemu_info_sha256": qemu_info_sha256', harness)
+        self.assertIn('--vhd-info "$RESULT_DIR/vhd-info.json"', harness)
+        self.assertIn('--conversion-attestation "$conversion_attestation"', harness)
+        self.assertNotIn("--vhd-current-size", harness)
+
     def test_cleanup_requires_exact_ownership_tags(self) -> None:
         env = self.environment()
         tags = {
