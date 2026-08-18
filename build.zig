@@ -1044,6 +1044,66 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_builder_tests.step);
         test_step.dependOn(generalized_check_step);
 
+        // ---- Ubuntu 26.04: immutable Canonical cloud-image input, Azure
+        // package customization, host-side signed UKI, and standalone zstd
+        // QCOW2 finalization. The builder is host-native for both guest
+        // architectures; libguestfs performs the isolated guest mutation. ----
+        const ubuntu2604_builder_mod = b.createModule(.{
+            .root_source_file = b.path("scripts/build_generalized_ubuntu2604.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vmiz", .module = host_vmiz_mod },
+            },
+        });
+        const ubuntu2604_builder_exe = b.addExecutable(.{
+            .name = "build_generalized_ubuntu2604",
+            .root_module = ubuntu2604_builder_mod,
+        });
+        b.installArtifact(ubuntu2604_builder_exe);
+
+        const ubuntu2604_check = b.step(
+            "check-generalized-ubuntu2604",
+            "Compile the Ubuntu 26.04 builder for both guest architecture profiles",
+        );
+        ubuntu2604_check.dependOn(&ubuntu2604_builder_exe.step);
+
+        const ubuntu2604_tests = b.addTest(.{
+            .root_module = ubuntu2604_builder_mod,
+        });
+        const run_ubuntu2604_tests = b.addRunArtifact(ubuntu2604_tests);
+        const ubuntu2604_test_step = b.step(
+            "test-generalized-ubuntu2604",
+            "Run focused Ubuntu 26.04 builder tests",
+        );
+        ubuntu2604_test_step.dependOn(&run_ubuntu2604_tests.step);
+        test_step.dependOn(&run_ubuntu2604_tests.step);
+        test_step.dependOn(ubuntu2604_check);
+
+        const run_ubuntu2604 = b.addRunArtifact(ubuntu2604_builder_exe);
+        run_ubuntu2604.addArgs(&.{ "--architecture", @tagName(ubuntu2604_architecture) });
+        if (b.args) |args| run_ubuntu2604.addArgs(args);
+        const ubuntu2604_step = b.step(
+            "generalized-ubuntu2604",
+            "Build the selected generalized Ubuntu 26.04 Gen2 QCOW2 image",
+        );
+        ubuntu2604_step.dependOn(&run_ubuntu2604.step);
+
+        inline for (.{ Ubuntu2604Architecture.x86_64, Ubuntu2604Architecture.aarch64 }) |architecture| {
+            const run_arch = b.addRunArtifact(ubuntu2604_builder_exe);
+            run_arch.addArgs(&.{ "--architecture", @tagName(architecture) });
+            if (b.args) |args| run_arch.addArgs(args);
+            const step_name = switch (architecture) {
+                .x86_64 => "generalized-ubuntu2604-amd64",
+                .aarch64 => "generalized-ubuntu2604-arm64",
+            };
+            const step_description = switch (architecture) {
+                .x86_64 => "Build generalized Ubuntu 26.04 for x86_64/amd64",
+                .aarch64 => "Build generalized Ubuntu 26.04 for arm64/aarch64",
+            };
+            b.step(step_name, step_description).dependOn(&run_arch.step);
+        }
+
         // Opt-in native-QEMU acceptance for a completed, finalized release
         // candidate. The image itself is intentionally supplied at runtime:
         // four native matrix entries select their architecture/flavor here and
