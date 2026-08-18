@@ -17,4 +17,7 @@ zig build run -- info foo.vhd
 zig build run -- qemu
 ```
 
-See [Image building](image-building.md) for advanced image commands, [Azure Linux images](azure-linux.md) for the hosted release recipes, and [FreeBSD images](freebsd.md) for the FreeBSD workflow.
+See [Image building](image-building.md) for advanced image commands,
+[Azure Linux images](azure-linux.md) and
+[Ubuntu 26.04 images](ubuntu.md) for hosted release recipes, and
+[FreeBSD images](freebsd.md) for the FreeBSD workflow.

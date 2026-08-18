@@ -3,7 +3,9 @@
 Use `vmiz qemu` to acquire and boot cataloged Azure Linux and FreeBSD images
 with architecture-matched QEMU and firmware. See
 [Azure Linux images](azure-linux.md) for the full/core image comparison and
-release security model.
+release security model. Ubuntu 26.04 images and their release workflow are
+documented in [Ubuntu 26.04 images](ubuntu.md), but Ubuntu catalog aliases are
+not added until the published asset digests and signer fingerprint are final.
 
 The same installation is what the `vm` customization backend runs guests in,
 including guests of an architecture the host cannot execute: one
@@ -207,6 +209,16 @@ the seed and temporary launch state when QEMU exits.
 This command is intentionally a focused launcher for cataloged Azure Linux and
 FreeBSD Gen2 images plus compatible explicit disks, not a general VM
 configuration manager.
+
+Until Ubuntu catalog bindings are finalized, launch an Ubuntu image only by
+explicit path. Secure Boot also requires the independently verified release
+certificate and its canonical-DER SHA-256:
+
+```text
+vmiz qemu ./Ubuntu-26.04-x86_64.qcow2 --secure-boot \
+  --secure-boot-certificate release.pem \
+  --secure-boot-certificate-sha256 <canonical-DER-SHA-256>
+```
 
 ## Shared firmware resolution
 
