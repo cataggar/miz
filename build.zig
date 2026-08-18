@@ -14,6 +14,11 @@ const AzureLinuxFlavor = enum {
     full,
 };
 
+const Ubuntu2604Architecture = enum {
+    x86_64,
+    aarch64,
+};
+
 pub const ImageFormat = image_build.Format;
 pub const ImageGeneration = image_build.Generation;
 pub const ImageBootMode = image_build.BootMode;
@@ -69,6 +74,11 @@ pub fn build(b: *std.Build) void {
         "azurelinux-flavor",
         "Azure Linux guest flavor: core (default, vmizinit) or full (official vm-base/systemd)",
     ) orelse .core;
+    const ubuntu2604_architecture = b.option(
+        Ubuntu2604Architecture,
+        "ubuntu2604-arch",
+        "Ubuntu 26.04 server guest architecture: x86_64 (default) or aarch64",
+    ) orelse .x86_64;
     const bzip2 = b.dependency("bzip2", .{
         .target = target,
         .optimize = optimize,
@@ -1070,6 +1080,37 @@ pub fn build(b: *std.Build) void {
             "Run native-QEMU acceptance for one finalized Azure Linux 4 core or full QCOW2",
         );
         azurelinux_acceptance_step.dependOn(&run_azurelinux_acceptance_tests.step);
+
+        // Opt-in native-QEMU acceptance for exactly one finalized Ubuntu
+        // 26.04 server candidate. The runtime image and signing identity are
+        // supplied by the release workflow.
+        const ubuntu2604_acceptance_options = b.addOptions();
+        ubuntu2604_acceptance_options.addOption(
+            []const u8,
+            "ubuntu2604_architecture",
+            @tagName(ubuntu2604_architecture),
+        );
+        const ubuntu2604_acceptance_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/ubuntu2604_acceptance.zig"),
+                .target = b.graph.host,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "build_options", .module = ubuntu2604_acceptance_options.createModule() },
+                    .{ .name = "qemu_host", .module = host_qemu_host_mod },
+                    .{ .name = "qmp", .module = host_qmp_mod },
+                    .{ .name = "vmiz", .module = host_vmiz_mod },
+                },
+            }),
+        });
+        const run_ubuntu2604_acceptance_tests = b.addRunArtifact(
+            ubuntu2604_acceptance_tests,
+        );
+        const ubuntu2604_acceptance_step = b.step(
+            "test-ubuntu2604-acceptance",
+            "Run native-QEMU acceptance for one finalized Ubuntu 26.04 server QCOW2",
+        );
+        ubuntu2604_acceptance_step.dependOn(&run_ubuntu2604_acceptance_tests.step);
 
         const freebsd_builder_mod = b.createModule(.{
             .root_source_file = b.path("scripts/build_generalized_freebsd15.zig"),
