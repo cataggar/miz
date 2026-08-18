@@ -50,7 +50,7 @@ const Profile = struct {
     output: []const u8,
     work_dir: []const u8,
     efi_fallback: []const u8,
-    pe_machine: []const u8,
+    pe_machine: u16,
 };
 
 const profiles = [_]Profile{
@@ -64,7 +64,7 @@ const profiles = [_]Profile{
         .output = "Ubuntu-26.04-x86_64.qcow2",
         .work_dir = ".scratch/ubuntu2604-x86_64",
         .efi_fallback = "BOOTX64.EFI",
-        .pe_machine = "Advanced Micro Devices X86-64",
+        .pe_machine = 0x8664,
     },
     .{
         .architecture = .aarch64,
@@ -76,7 +76,7 @@ const profiles = [_]Profile{
         .output = "Ubuntu-26.04-aarch64.qcow2",
         .work_dir = ".scratch/ubuntu2604-aarch64",
         .efi_fallback = "BOOTAA64.EFI",
-        .pe_machine = "Aarch64",
+        .pe_machine = 0xaa64,
     },
 };
 
@@ -89,16 +89,14 @@ const required_manifest_packages = [_][]const u8{
     "netplan.io",
 };
 
-const azure_packages =
-    "linux-azure linux-tools-azure linux-cloud-tools-azure " ++
-    "walinuxagent cloud-init cloud-guest-utils openssh-server sudo " ++
-    "systemd-resolved netplan.io sbsigntool";
+const debz_packages = [_][]const u8{ "linux-azure", "walinuxagent" };
 
 const Args = struct {
     architecture: ?Architecture = null,
     source: ?[]const u8 = null,
     output: ?[]const u8 = null,
     work_dir: ?[]const u8 = null,
+    provenance_dir: ?[]const u8 = null,
     size: u64 = default_virtual_size,
     signing_certificate: ?[]const u8 = null,
     signing_certificate_sha256: ?[]const u8 = null,
@@ -111,6 +109,7 @@ const help =
     \\  --source <path>                         verified local Canonical .img
     \\  --output <path>                         output QCOW2
     \\  --work-dir <path>                       persistent download/work cache
+    \\  --provenance-dir <path>                 release provenance sidecars
     \\  --size <size>                           virtual size (default 5G)
     \\  --uki-signing-certificate <path>        Secure Boot certificate
     \\  --uki-signing-certificate-sha256 <hex>  DER certificate SHA-256
@@ -124,22 +123,42 @@ fn profileFor(architecture: Architecture) *const Profile {
     unreachable;
 }
 
-fn packageFamilyInspectRequest(profile: *const Profile, root: []const u8) package_family.Request {
+fn packageFamilyRequest(
+    operation: package_family.Operation,
+    profile: *const Profile,
+    package: []const u8,
+    root_stage: []const u8,
+    published_root: []const u8,
+    source_path: []const u8,
+    keyring_path: []const u8,
+    cache_path: []const u8,
+    state_path: []const u8,
+    lock_path: []const u8,
+) package_family.Request {
     return .{
         .family = .debian,
         .distribution = .ubuntu_26_04,
-        .operation = .inspect,
+        .operation = operation,
+        .packages = &.{package},
         .inputs = .{
-            .root_stage = root,
-            .published_root = root,
+            .root_stage = root_stage,
+            .published_root = published_root,
             .architecture = switch (profile.architecture) {
                 .x86_64 => .amd64,
                 .aarch64 => .arm64,
             },
-            .source_paths = &.{},
-            .keyring_paths = &.{},
-            .cache_path = ".",
-            .state_path = ".",
+            .source_paths = &.{source_path},
+            .keyring_paths = &.{keyring_path},
+            .cache_path = cache_path,
+            .state_path = state_path,
+            .lock_input_path = if (operation == .resolve_lock) null else lock_path,
+            .lock_output_path = if (operation == .resolve_lock) lock_path else null,
+            .cache_mode = .online,
+            .repository_policy = .strict_priority,
+            .recommends = false,
+            .allow_downgrade = false,
+            .conffile = .keep_existing,
+            .deadline_ms = 30 * 60 * 1000,
         },
     };
 }
@@ -165,6 +184,10 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
             args.work_dir = argv[i];
+        } else if (std.mem.eql(u8, arg, "--provenance-dir")) {
+            i += 1;
+            if (i == argv.len) return error.MissingArgument;
+            args.provenance_dir = argv[i];
         } else if (std.mem.eql(u8, arg, "--size")) {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
@@ -245,6 +268,18 @@ fn acquire(
     }, curl.downloader());
 }
 
+fn copyBoundedFile(
+    allocator: Allocator,
+    io: Io,
+    source: []const u8,
+    destination: []const u8,
+    limit: u64,
+) !void {
+    const bytes = try Dir.cwd().readFileAlloc(io, source, allocator, .limited(limit));
+    defer allocator.free(bytes);
+    try Dir.cwd().writeFile(io, .{ .sub_path = destination, .data = bytes });
+}
+
 fn validateManifest(bytes: []const u8, profile: *const Profile) !void {
     for (&required_manifest_packages) |name| {
         const needle = try std.fmt.allocPrint(std.testing.allocator, "{s}\t", .{name});
@@ -269,6 +304,30 @@ fn validateManifestRuntime(allocator: Allocator, bytes: []const u8, profile: *co
         .aarch64 => ":amd64\t",
     };
     if (std.mem.indexOf(u8, bytes, foreign) != null) return error.ForeignArchitecturePackage;
+}
+
+fn requireSha256SumsEntry(bytes: []const u8, filename: []const u8, digest: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var matches: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len < 67) continue;
+        const separator = line[64..66];
+        if (!std.mem.eql(u8, separator, " *") and !std.mem.eql(u8, separator, "  ")) continue;
+        if (!std.mem.eql(u8, line[66..], filename)) continue;
+        matches += 1;
+        if (!std.ascii.eqlIgnoreCase(line[0..64], digest)) return error.SignedDigestMismatch;
+    }
+    if (matches != 1) return error.SignedEntryMissingOrDuplicate;
+}
+
+fn peMachine(bytes: []const u8) !u16 {
+    if (bytes.len < 0x40 or !std.mem.eql(u8, bytes[0..2], "MZ")) return error.InvalidPeImage;
+    const pe_offset = std.mem.readInt(u32, bytes[0x3c..0x40], .little);
+    if (pe_offset > bytes.len -| 6) return error.InvalidPeImage;
+    const offset: usize = @intCast(pe_offset);
+    if (!std.mem.eql(u8, bytes[offset .. offset + 4], "PE\x00\x00")) return error.InvalidPeImage;
+    const machine: *const [2]u8 = @ptrCast(bytes[offset + 4 ..].ptr);
+    return std.mem.readInt(u16, machine, .little);
 }
 
 fn validateExactLock(bytes: []const u8, profile: *const Profile) !void {
@@ -314,17 +373,6 @@ fn customizationScript(allocator: Allocator, profile: *const Profile) ![]u8 {
         \\#!/bin/sh
         \\set -eux
         \\export DEBIAN_FRONTEND=noninteractive
-        \\cat > /etc/apt/sources.list.d/ubuntu.sources <<'EOF'
-        \\Types: deb
-        \\URIs: {s}
-        \\Suites: resolute resolute-updates resolute-security
-        \\Components: main restricted universe multiverse
-        \\Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-        \\Check-Valid-Until: no
-        \\EOF
-        \\rm -f /etc/apt/sources.list
-        \\apt-get update
-        \\apt-get install -y --no-install-recommends {s}
         \\kernel="$(basename "$(readlink -f /boot/vmlinuz)")"
         \\kernel="${{kernel#vmlinuz-}}"
         \\case "$kernel" in *-azure) ;; *) echo "linux-azure did not become active" >&2; exit 1;; esac
@@ -378,11 +426,9 @@ fn customizationScript(allocator: Allocator, profile: *const Profile) ![]u8 {
         \\: > /etc/machine-id
         \\rm -f /var/lib/dbus/machine-id /etc/ssh/ssh_host_* /var/lib/systemd/random-seed
         \\rm -rf /var/lib/cloud/* /var/lib/waagent/* /var/log/azure/* /var/log/journal/* /tmp/* /var/tmp/*
-        \\apt-get clean
-        \\rm -rf /var/lib/apt/lists/*
         \\sync
         \\
-    , .{ snapshot_base, azure_packages, release });
+    , .{release});
 }
 
 fn verifyCanonicalPublication(
@@ -416,31 +462,271 @@ fn verifyCanonicalPublication(
     try run(allocator, io, &.{ "gpg", "--batch", "--homedir", gnupg, "--verify", signature_path, sums_path });
 }
 
+const DebzEvidence = struct {
+    package: []const u8,
+    lock_path: []u8,
+    lock_sha256: [64]u8,
+    lock_digest_sha256: [64]u8,
+    provenance_path: []u8,
+    provenance_sha256: [64]u8,
+    provenance_digest_sha256: [64]u8,
+    provenance_lock_sha256: [64]u8,
+
+    fn deinit(self: *DebzEvidence, allocator: Allocator) void {
+        allocator.free(self.lock_path);
+        allocator.free(self.provenance_path);
+        self.* = undefined;
+    }
+};
+
+const DebzCustomization = struct {
+    root_path: []u8,
+    evidence: [debz_packages.len]DebzEvidence,
+
+    fn deinit(self: *DebzCustomization, allocator: Allocator) void {
+        allocator.free(self.root_path);
+        for (&self.evidence) |*item| item.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn requireSucceeded(result: package_family.Result) !void {
+    if (!result.succeeded or result.diagnostic != null) return error.DebzTransactionFailed;
+}
+
+fn requireJsonSha256Field(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    field: []const u8,
+) ![64]u8 {
+    const bytes = try Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
+    defer allocator.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const value = parsed.value.object.get(field) orelse return error.DebzEvidenceFieldMissing;
+    if (value != .string) return error.DebzEvidenceFieldMissing;
+    return artifact_pipeline.formatSha256(try artifact_pipeline.parseSha256(value.string));
+}
+
+fn customizeRootWithDebz(
+    allocator: Allocator,
+    io: Io,
+    profile: *const Profile,
+    mutable_image: []const u8,
+    work_dir: []const u8,
+    provenance_dir: []const u8,
+) !DebzCustomization {
+    const extraction = try std.fs.path.join(allocator, &.{ work_dir, "official-root" });
+    defer allocator.free(extraction);
+    try Dir.cwd().deleteTree(io, extraction);
+    try Dir.cwd().createDirPath(io, extraction);
+    try run(allocator, io, &.{ "virt-copy-out", "-a", mutable_image, "/", extraction });
+
+    const direct_etc = try std.fs.path.join(allocator, &.{ extraction, "etc" });
+    defer allocator.free(direct_etc);
+    const nested_root = try std.fs.path.join(allocator, &.{ extraction, "root" });
+    defer allocator.free(nested_root);
+    const nested_etc = try std.fs.path.join(allocator, &.{ nested_root, "etc" });
+    defer allocator.free(nested_etc);
+    var current = if (Dir.cwd().statFile(io, direct_etc, .{})) |_|
+        try allocator.dupe(u8, extraction)
+    else |_| if (Dir.cwd().statFile(io, nested_etc, .{})) |_|
+        try allocator.dupe(u8, nested_root)
+    else |_|
+        return error.OfficialRootExtractionFailed;
+    errdefer allocator.free(current);
+
+    const trusted_keyring = try std.fs.path.join(allocator, &.{ current, "usr/share/keyrings/ubuntu-archive-keyring.gpg" });
+    defer allocator.free(trusted_keyring);
+    const absolute_keyring = try Dir.cwd().realPathFileAlloc(io, trusted_keyring, allocator);
+    defer allocator.free(absolute_keyring);
+    const source_path = try std.fs.path.join(allocator, &.{ work_dir, "ubuntu-snapshot.sources" });
+    defer allocator.free(source_path);
+    const source_document = try std.fmt.allocPrint(allocator,
+        \\Types: deb
+        \\URIs: {s}
+        \\Suites: resolute resolute-updates resolute-security
+        \\Components: main restricted universe multiverse
+        \\Architectures: {s}
+        \\Signed-By: {s}
+        \\Check-Valid-Until: no
+        \\
+    , .{ snapshot_base, profile.ubuntu_architecture, absolute_keyring });
+    defer allocator.free(source_document);
+    try Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = source_document });
+    const absolute_source = try Dir.cwd().realPathFileAlloc(io, source_path, allocator);
+    defer allocator.free(absolute_source);
+
+    var evidence: [debz_packages.len]DebzEvidence = undefined;
+    var evidence_count: usize = 0;
+    errdefer {
+        for (evidence[0..evidence_count]) |*item| item.deinit(allocator);
+    }
+
+    for (&debz_packages, 0..) |package, index| {
+        const transaction_dir = try std.fmt.allocPrint(allocator, "{s}/debz-{s}", .{ work_dir, package });
+        defer allocator.free(transaction_dir);
+        try Dir.cwd().deleteTree(io, transaction_dir);
+        try Dir.cwd().createDirPath(io, transaction_dir);
+        const cache = try std.fs.path.join(allocator, &.{ transaction_dir, "cache" });
+        defer allocator.free(cache);
+        const state = try std.fs.path.join(allocator, &.{ transaction_dir, "state" });
+        defer allocator.free(state);
+        const resolve_root = try std.fs.path.join(allocator, &.{ transaction_dir, "resolve-root" });
+        defer allocator.free(resolve_root);
+        try Dir.cwd().createDirPath(io, cache);
+        try Dir.cwd().createDirPath(io, state);
+        try Dir.cwd().createDirPath(io, resolve_root);
+
+        const absolute_cache = try Dir.cwd().realPathFileAlloc(io, cache, allocator);
+        defer allocator.free(absolute_cache);
+        const absolute_state = try Dir.cwd().realPathFileAlloc(io, state, allocator);
+        defer allocator.free(absolute_state);
+        const absolute_resolve_root = try Dir.cwd().realPathFileAlloc(io, resolve_root, allocator);
+        defer allocator.free(absolute_resolve_root);
+        const absolute_transaction = try Dir.cwd().realPathFileAlloc(io, transaction_dir, allocator);
+        defer allocator.free(absolute_transaction);
+        const absolute_dummy = try std.fs.path.join(allocator, &.{ absolute_transaction, "resolve-published-unused" });
+        defer allocator.free(absolute_dummy);
+        const absolute_lock = try std.fs.path.join(allocator, &.{ absolute_transaction, "exact-lock.json" });
+        defer allocator.free(absolute_lock);
+
+        const resolved = try package_family.execute(allocator, io, .{}, packageFamilyRequest(
+            .resolve_lock,
+            profile,
+            package,
+            absolute_resolve_root,
+            absolute_dummy,
+            absolute_source,
+            absolute_keyring,
+            absolute_cache,
+            absolute_state,
+            absolute_lock,
+        ));
+        try requireSucceeded(resolved);
+        if (resolved.lock_path == null or !std.mem.eql(u8, resolved.lock_path.?, absolute_lock))
+            return error.DebzLockMismatch;
+
+        const stage = try std.fmt.allocPrint(allocator, "{s}/root-stage-{d}", .{ work_dir, index });
+        defer allocator.free(stage);
+        const published = try std.fmt.allocPrint(allocator, "{s}/root-debz-{d}", .{ work_dir, index });
+        defer allocator.free(published);
+        try Dir.cwd().deleteTree(io, stage);
+        try Dir.cwd().deleteTree(io, published);
+        try Dir.cwd().createDirPath(io, stage);
+        const current_contents = try std.fmt.allocPrint(allocator, "{s}/.", .{current});
+        defer allocator.free(current_contents);
+        try run(allocator, io, &.{ "cp", "-a", "--reflink=auto", current_contents, stage });
+        const absolute_stage = try Dir.cwd().realPathFileAlloc(io, stage, allocator);
+        defer allocator.free(absolute_stage);
+        const absolute_published = if (std.fs.path.isAbsolute(published))
+            try allocator.dupe(u8, published)
+        else blk: {
+            const absolute_work = try Dir.cwd().realPathFileAlloc(io, work_dir, allocator);
+            defer allocator.free(absolute_work);
+            break :blk try std.fs.path.join(allocator, &.{ absolute_work, std.fs.path.basename(published) });
+        };
+
+        const customized = try package_family.execute(allocator, io, .{}, packageFamilyRequest(
+            .customize,
+            profile,
+            package,
+            absolute_stage,
+            absolute_published,
+            absolute_source,
+            absolute_keyring,
+            absolute_cache,
+            absolute_state,
+            absolute_lock,
+        ));
+        try requireSucceeded(customized);
+        if (!customized.published or customized.provenance_path == null)
+            return error.DebzProvenanceMissing;
+        defer allocator.free(customized.provenance_path.?);
+        const expected_provenance = try std.fs.path.join(allocator, &.{ absolute_state, "transaction-result.json" });
+        defer allocator.free(expected_provenance);
+        if (!std.mem.eql(u8, customized.provenance_path.?, expected_provenance))
+            return error.DebzProvenanceMismatch;
+
+        const lock_metadata = try artifact_pipeline.hashFile(io, absolute_lock);
+        const provenance_metadata = try artifact_pipeline.hashFile(io, expected_provenance);
+        const lock_filename = try std.fmt.allocPrint(
+            allocator,
+            "debz-exact-lock-{s}-{s}.json",
+            .{ package, profile.ubuntu_architecture },
+        );
+        defer allocator.free(lock_filename);
+        const provenance_filename = try std.fmt.allocPrint(
+            allocator,
+            "debz-transaction-provenance-{s}-{s}.json",
+            .{ package, profile.ubuntu_architecture },
+        );
+        defer allocator.free(provenance_filename);
+        const stable_lock = try std.fs.path.join(allocator, &.{ provenance_dir, lock_filename });
+        defer allocator.free(stable_lock);
+        const stable_provenance = try std.fs.path.join(allocator, &.{ provenance_dir, provenance_filename });
+        defer allocator.free(stable_provenance);
+        try Dir.cwd().copyFile(absolute_lock, Dir.cwd(), stable_lock, io, .{});
+        try Dir.cwd().copyFile(expected_provenance, Dir.cwd(), stable_provenance, io, .{});
+        evidence[index] = .{
+            .package = package,
+            .lock_path = try allocator.dupe(u8, stable_lock),
+            .lock_sha256 = artifact_pipeline.formatSha256(lock_metadata.sha256),
+            .lock_digest_sha256 = try requireJsonSha256Field(allocator, io, stable_lock, "digest_sha256"),
+            .provenance_path = try allocator.dupe(u8, stable_provenance),
+            .provenance_sha256 = artifact_pipeline.formatSha256(provenance_metadata.sha256),
+            .provenance_digest_sha256 = try requireJsonSha256Field(allocator, io, stable_provenance, "digest_sha256"),
+            .provenance_lock_sha256 = try requireJsonSha256Field(allocator, io, stable_provenance, "lock_sha256"),
+        };
+        if (!std.mem.eql(u8, &evidence[index].lock_digest_sha256, &evidence[index].provenance_lock_sha256))
+            return error.DebzProvenanceLockMismatch;
+        evidence_count += 1;
+        allocator.free(current);
+        current = absolute_published;
+    }
+    return .{ .root_path = current, .evidence = evidence };
+}
+
 fn writeProvenance(
     allocator: Allocator,
     io: Io,
     path: []const u8,
     profile: *const Profile,
     source_digest: [64]u8,
-    lock_digest: [64]u8,
+    evidence: *const [debz_packages.len]DebzEvidence,
 ) !void {
     const document = try std.fmt.allocPrint(allocator,
-        \\{{"schema":"io.github.cataggar.vmiz.ubuntu2604-provenance.v1","release":"{s}","architecture":"{s}","source":{{"url":"{s}/{s}","sha256":"{s}","sha256sums_sha256":"{s}","signature_sha256":"{s}","canonical_fingerprint":"{s}"}},"packages":{{"distribution":"ubuntu_26_04","snapshot":"{s}","package_family_schema":"{s}","package_family_version":{d},"debz_commit":"{s}","exact_inventory_sha256":"{s}"}}}}
+        \\{{"schema":1,"type":"vmiz-ubuntu2604-build-provenance","architecture":"{s}","release":"26.04","snapshot":{{"id":"release-{s}","base_url":"{s}/"}},"canonical_key_fingerprint":"{s}","sha256sums_signature_verified":true,"artifacts":{{"sha256sums":{{"filename":"SHA256SUMS","sha256":"{s}"}},"sha256sums_signature":{{"filename":"SHA256SUMS.gpg","sha256":"{s}"}},"source_image":{{"filename":"{s}","sha256":"{s}"}},"image_manifest":{{"filename":"{s}","sha256":"{s}"}}}},"debz":{{"api_commit":"{s}","transactions":[{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}},{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}}]}}}}
         \\
     , .{
-        release,
         @tagName(profile.architecture),
+        release,
         release_base,
-        profile.source_name,
-        source_digest,
+        canonical_fingerprint,
         sums_sha256,
         sums_signature_sha256,
-        canonical_fingerprint,
-        snapshot_base,
-        package_family.request_schema,
-        package_family.api_version,
+        profile.source_name,
+        source_digest,
+        profile.manifest_name,
+        profile.manifest_sha256,
         package_family.debz_api_commit,
-        lock_digest,
+        evidence[0].package,
+        std.fs.path.basename(evidence[0].lock_path),
+        evidence[0].lock_sha256,
+        evidence[0].lock_digest_sha256,
+        std.fs.path.basename(evidence[0].provenance_path),
+        evidence[0].provenance_sha256,
+        evidence[0].provenance_digest_sha256,
+        evidence[0].provenance_lock_sha256,
+        evidence[1].package,
+        std.fs.path.basename(evidence[1].lock_path),
+        evidence[1].lock_sha256,
+        evidence[1].lock_digest_sha256,
+        std.fs.path.basename(evidence[1].provenance_path),
+        evidence[1].provenance_sha256,
+        evidence[1].provenance_digest_sha256,
+        evidence[1].provenance_lock_sha256,
     });
     defer allocator.free(document);
     try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = document });
@@ -462,6 +748,14 @@ pub fn main(init: std.process.Init) !void {
     const work_dir = args.work_dir orelse profile.work_dir;
     const output = args.output orelse profile.output;
     try Dir.cwd().createDirPath(io, work_dir);
+    const allocated_provenance_dir = if (args.provenance_dir == null)
+        try std.fs.path.join(allocator, &.{ work_dir, "provenance" })
+    else
+        null;
+    defer if (allocated_provenance_dir) |path| allocator.free(path);
+    const provenance_dir = args.provenance_dir orelse allocated_provenance_dir.?;
+    try Dir.cwd().deleteTree(io, provenance_dir);
+    try Dir.cwd().createDirPath(io, provenance_dir);
 
     for (&[_][]const u8{ "curl", "gpg" }) |tool|
         try requireTool(allocator, io, tool);
@@ -473,6 +767,10 @@ pub fn main(init: std.process.Init) !void {
     try acquire(allocator, io, release_base ++ "/SHA256SUMS", sums_path, sums_sha256, 64 * 1024);
     try acquire(allocator, io, release_base ++ "/SHA256SUMS.gpg", signature_path, sums_signature_sha256, 16 * 1024);
     try verifyCanonicalPublication(allocator, io, work_dir, sums_path, signature_path);
+    const sums = try Dir.cwd().readFileAlloc(io, sums_path, allocator, .limited(64 * 1024));
+    defer allocator.free(sums);
+    try requireSha256SumsEntry(sums, profile.source_name, profile.source_sha256);
+    try requireSha256SumsEntry(sums, profile.manifest_name, profile.manifest_sha256);
 
     const manifest_path = try std.fs.path.join(allocator, &.{ work_dir, profile.manifest_name });
     defer allocator.free(manifest_path);
@@ -482,6 +780,15 @@ pub fn main(init: std.process.Init) !void {
     const manifest = try Dir.cwd().readFileAlloc(io, manifest_path, allocator, .limited(manifest_max_size));
     defer allocator.free(manifest);
     try validateManifestRuntime(allocator, manifest, profile);
+    const provenance_sums = try std.fs.path.join(allocator, &.{ provenance_dir, "SHA256SUMS" });
+    defer allocator.free(provenance_sums);
+    const provenance_signature = try std.fs.path.join(allocator, &.{ provenance_dir, "SHA256SUMS.gpg" });
+    defer allocator.free(provenance_signature);
+    const provenance_manifest = try std.fs.path.join(allocator, &.{ provenance_dir, profile.manifest_name });
+    defer allocator.free(provenance_manifest);
+    try copyBoundedFile(allocator, io, sums_path, provenance_sums, 64 * 1024);
+    try copyBoundedFile(allocator, io, signature_path, provenance_signature, 16 * 1024);
+    try copyBoundedFile(allocator, io, manifest_path, provenance_manifest, manifest_max_size);
 
     const source_path = if (args.source) |source| source else blk: {
         const path = try std.fs.path.join(allocator, &.{ work_dir, profile.source_name });
@@ -496,7 +803,7 @@ pub fn main(init: std.process.Init) !void {
         return error.ChecksumMismatch;
     if (args.preflight_only) return;
 
-    for (&[_][]const u8{ "qemu-img", "virt-resize", "virt-customize", "virt-copy-out", "virt-copy-in", "virt-cat", "virt-ls", "virt-filesystems", "ukify", "file", "sbverify" }) |tool|
+    for (&[_][]const u8{ "qemu-img", "virt-resize", "virt-customize", "virt-copy-out", "virt-copy-in", "virt-cat", "virt-ls", "virt-filesystems", "virt-tar-in", "guestfish", "tar", "cp", "ukify", "sbverify" }) |tool|
         try requireTool(allocator, io, tool);
     if (args.signing_certificate == null or args.signing_certificate_sha256 == null or args.signing_key == null)
         return error.SigningConfigurationRequired;
@@ -508,6 +815,30 @@ pub fn main(init: std.process.Init) !void {
     Dir.cwd().deleteFile(io, mutable) catch {};
     try run(allocator, io, &.{ "qemu-img", "create", "-f", "qcow2", mutable, size_text });
     try run(allocator, io, &.{ "virt-resize", "--expand", "/dev/sda1", source_path, mutable });
+
+    var debz_customization = try customizeRootWithDebz(allocator, io, profile, mutable, work_dir, provenance_dir);
+    defer debz_customization.deinit(allocator);
+    const root_tar = try std.fs.path.join(allocator, &.{ work_dir, "debz-customized-root.tar" });
+    defer allocator.free(root_tar);
+    Dir.cwd().deleteFile(io, root_tar) catch {};
+    try run(allocator, io, &.{
+        "tar", "--xattrs",                   "--acls", "--numeric-owner",
+        "-C",  debz_customization.root_path, "-cf",    root_tar,
+        ".",
+    });
+    const guestfish_script = try std.fs.path.join(allocator, &.{ work_dir, "replace-root.guestfish" });
+    defer allocator.free(guestfish_script);
+    const guestfish_commands = try std.fmt.allocPrint(allocator,
+        \\add-drive-opts {s} format:qcow2
+        \\run
+        \\mount /dev/sda1 /
+        \\rm-rf /
+        \\
+    , .{mutable});
+    defer allocator.free(guestfish_commands);
+    try Dir.cwd().writeFile(io, .{ .sub_path = guestfish_script, .data = guestfish_commands });
+    try run(allocator, io, &.{ "guestfish", "-f", guestfish_script });
+    try run(allocator, io, &.{ "virt-tar-in", "-a", mutable, root_tar, "/" });
 
     const script_path = try std.fs.path.join(allocator, &.{ work_dir, "customize.sh" });
     defer allocator.free(script_path);
@@ -526,8 +857,6 @@ pub fn main(init: std.process.Init) !void {
     const lock_bytes = try Dir.cwd().readFileAlloc(io, lock_path, allocator, .limited(4 * 1024 * 1024));
     defer allocator.free(lock_bytes);
     try validateExactLockRuntime(allocator, lock_bytes, profile);
-    const lock_metadata = try artifact_pipeline.hashFile(io, lock_path);
-
     const kernel_listing = try capture(allocator, io, &.{ "virt-ls", "-a", mutable, "/boot" });
     defer allocator.free(kernel_listing);
     const release_name = findAzureKernelRelease(kernel_listing) orelse return error.AzureKernelMissing;
@@ -617,11 +946,9 @@ pub fn main(init: std.process.Init) !void {
     const final_lock = try capture(allocator, io, &.{ "virt-cat", "-a", output, "/var/lib/vmiz/ubuntu2604-package-lock.tsv" });
     defer allocator.free(final_lock);
     try validateExactLockRuntime(allocator, final_lock, profile);
-    const machine = try capture(allocator, io, &.{ "file", signed_path });
-    defer allocator.free(machine);
-    if (std.mem.indexOf(u8, machine, profile.pe_machine) == null) return error.WrongUkiArchitecture;
+    if (try peMachine(signed.bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
 
-    const provenance_path = try std.fmt.allocPrint(allocator, "{s}.provenance.json", .{output});
+    const provenance_path = try std.fs.path.join(allocator, &.{ provenance_dir, "ubuntu2604-build-provenance.json" });
     defer allocator.free(provenance_path);
     try writeProvenance(
         allocator,
@@ -629,7 +956,7 @@ pub fn main(init: std.process.Init) !void {
         provenance_path,
         profile,
         artifact_pipeline.formatSha256(source_metadata.sha256),
-        artifact_pipeline.formatSha256(lock_metadata.sha256),
+        &debz_customization.evidence,
     );
 }
 
@@ -652,14 +979,40 @@ test "profiles pin immutable official sources for both architectures" {
     try std.testing.expectEqual(@as(u64, 5 * 1024 * 1024 * 1024), default_virtual_size);
 }
 
-test "package-family inspection is explicitly Ubuntu 26.04 and architecture-correct" {
-    const amd64 = packageFamilyInspectRequest(profileFor(.x86_64), "/root");
+test "package-family resolve and customize requests are exact-lock operations" {
+    const amd64 = packageFamilyRequest(
+        .resolve_lock,
+        profileFor(.x86_64),
+        "linux-azure",
+        "/root-stage",
+        "/published",
+        "/inputs/ubuntu.sources",
+        "/inputs/ubuntu.gpg",
+        "/cache",
+        "/state",
+        "/state/linux-azure.lock",
+    );
     try std.testing.expectEqual(package_family.Family.debian, amd64.family);
     try std.testing.expectEqual(package_family.Distribution.ubuntu_26_04, amd64.distribution);
-    try std.testing.expectEqual(package_family.Operation.inspect, amd64.operation);
+    try std.testing.expectEqual(package_family.Operation.resolve_lock, amd64.operation);
     try std.testing.expectEqual(package_family.Architecture.amd64, amd64.inputs.architecture);
-    const arm64 = packageFamilyInspectRequest(profileFor(.aarch64), "/root");
+    try std.testing.expectEqualStrings("/state/linux-azure.lock", amd64.inputs.lock_output_path.?);
+    try std.testing.expect(amd64.inputs.lock_input_path == null);
+    const arm64 = packageFamilyRequest(
+        .customize,
+        profileFor(.aarch64),
+        "walinuxagent",
+        "/root-stage",
+        "/published",
+        "/inputs/ubuntu.sources",
+        "/inputs/ubuntu.gpg",
+        "/cache",
+        "/state",
+        "/state/walinuxagent.lock",
+    );
     try std.testing.expectEqual(package_family.Architecture.arm64, arm64.inputs.architecture);
+    try std.testing.expectEqualStrings("/state/walinuxagent.lock", arm64.inputs.lock_input_path.?);
+    try std.testing.expect(arm64.inputs.lock_output_path == null);
 }
 
 test "arguments accept Ubuntu and project architecture spellings" {
@@ -679,12 +1032,43 @@ test "signed source manifest contract rejects missing packages and foreign archi
     try std.testing.expectError(error.RequiredPackageMissing, validateManifest("cloud-init\t1\n", profileFor(.x86_64)));
 }
 
+test "signed checksum entries bind exact filenames and digests" {
+    const digest = "1111111111111111111111111111111111111111111111111111111111111111";
+    const sums = digest ++ " *ubuntu.img\n" ++
+        "2222222222222222222222222222222222222222222222222222222222222222 *ubuntu.manifest\n";
+    try requireSha256SumsEntry(sums, "ubuntu.img", digest);
+    try std.testing.expectError(error.SignedDigestMismatch, requireSha256SumsEntry(
+        sums,
+        "ubuntu.img",
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    ));
+    try std.testing.expectError(error.SignedEntryMissingOrDuplicate, requireSha256SumsEntry(sums, "missing.img", digest));
+    try std.testing.expectError(error.SignedEntryMissingOrDuplicate, requireSha256SumsEntry(
+        sums ++ digest ++ " *ubuntu.img\n",
+        "ubuntu.img",
+        digest,
+    ));
+}
+
 test "Azure kernel discovery is architecture-neutral and exact" {
     try std.testing.expectEqualStrings(
         "7.0.0-1001-azure",
         findAzureKernelRelease("config\nvmlinuz-7.0.0-1001-azure\n").?,
     );
     try std.testing.expect(findAzureKernelRelease("vmlinuz-7.0.0-28-generic\n") == null);
+}
+
+test "UKI architecture validation parses the PE machine field" {
+    var x86: [0x86]u8 = @splat(0);
+    @memcpy(x86[0..2], "MZ");
+    std.mem.writeInt(u32, x86[0x3c..0x40], 0x80, .little);
+    @memcpy(x86[0x80..0x84], "PE\x00\x00");
+    std.mem.writeInt(u16, x86[0x84..0x86], 0x8664, .little);
+    try std.testing.expectEqual(@as(u16, 0x8664), try peMachine(&x86));
+    std.mem.writeInt(u16, x86[0x84..0x86], 0xaa64, .little);
+    try std.testing.expectEqual(@as(u16, 0xaa64), try peMachine(&x86));
+    x86[0] = 0;
+    try std.testing.expectError(error.InvalidPeImage, peMachine(&x86));
 }
 
 test "exact lock requires coherent Azure and provisioning packages" {
@@ -713,4 +1097,61 @@ test "final qcow2 validation rejects backing files and wrong sizes" {
         "{\"format\":\"qcow2\",\"virtual-size\":1}",
         default_virtual_size,
     ));
+}
+
+test "provenance binds signed source metadata and validated debz evidence" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_buffer[0..root_length], "provenance.json" });
+    defer std.testing.allocator.free(path);
+    var evidence = [2]DebzEvidence{
+        .{
+            .package = "linux-azure",
+            .lock_path = try std.testing.allocator.dupe(u8, "/state/linux.lock"),
+            .lock_sha256 = @splat('1'),
+            .lock_digest_sha256 = @splat('a'),
+            .provenance_path = try std.testing.allocator.dupe(u8, "/state/linux.transaction.json"),
+            .provenance_sha256 = @splat('2'),
+            .provenance_digest_sha256 = @splat('b'),
+            .provenance_lock_sha256 = @splat('a'),
+        },
+        .{
+            .package = "walinuxagent",
+            .lock_path = try std.testing.allocator.dupe(u8, "/state/waagent.lock"),
+            .lock_sha256 = @splat('3'),
+            .lock_digest_sha256 = @splat('c'),
+            .provenance_path = try std.testing.allocator.dupe(u8, "/state/waagent.transaction.json"),
+            .provenance_sha256 = @splat('4'),
+            .provenance_digest_sha256 = @splat('d'),
+            .provenance_lock_sha256 = @splat('c'),
+        },
+    };
+    defer for (&evidence) |*item| item.deinit(std.testing.allocator);
+    try writeProvenance(
+        std.testing.allocator,
+        std.testing.io,
+        path,
+        profileFor(.x86_64),
+        @splat('5'),
+        &evidence,
+    );
+    const document = try Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(document);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, document, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 9), parsed.value.object.count());
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("schema").?.integer);
+    try std.testing.expectEqualStrings("vmiz-ubuntu2604-build-provenance", parsed.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings(
+        profileFor(.x86_64).manifest_sha256,
+        parsed.value.object.get("artifacts").?.object.get("image_manifest").?.object.get("sha256").?.string,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        parsed.value.object.get("debz").?.object.get("transactions").?.array.items.len,
+    );
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("debz").?.object.count());
+    try std.testing.expectEqual(@as(usize, 4), parsed.value.object.get("artifacts").?.object.count());
 }
