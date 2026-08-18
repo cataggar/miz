@@ -876,7 +876,7 @@ pub fn main(init: std.process.Init) !void {
     const output = args.output orelse profile.output;
     try Dir.cwd().createDirPath(io, work_dir);
     const allocated_provenance_dir = if (args.provenance_dir == null)
-        try std.fs.path.join(allocator, &.{ work_dir, "provenance" })
+        try std.fs.path.join(allocator, &.{ work_dir, "internal-provenance" })
     else
         null;
     defer if (allocated_provenance_dir) |path| allocator.free(path);
@@ -1140,6 +1140,10 @@ test "package-family resolve and customize requests are exact-lock operations" {
 test "arguments accept Ubuntu and project architecture spellings" {
     try std.testing.expectEqual(Architecture.x86_64, (try parseArgs(&.{ "--architecture", "amd64" })).architecture.?);
     try std.testing.expectEqual(Architecture.aarch64, (try parseArgs(&.{ "--architecture", "aarch64" })).architecture.?);
+    try std.testing.expectEqualStrings(
+        "candidate/internal-provenance",
+        (try parseArgs(&.{ "--provenance-dir", "candidate/internal-provenance" })).provenance_dir.?,
+    );
     try std.testing.expectError(error.ImageTooSmall, parseArgs(&.{ "--size", "4G" }));
 }
 
