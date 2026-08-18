@@ -1,0 +1,866 @@
+# Protected-environment setup required before dispatch:
+# - `ubuntu2604-signing`: restrict deployments to `main`, require reviewers, and
+#   define variables VMIZ_AZURE_TENANT_ID, VMIZ_AZURE_CLIENT_ID,
+#   VMIZ_ARTIFACT_SIGNING_ENDPOINT, VMIZ_ARTIFACT_SIGNING_ACCOUNT, and
+#   VMIZ_ARTIFACT_SIGNING_PROFILE. The signing app's Entra federated credential
+#   subject is `repo:cataggar/vmiz:environment:ubuntu2604-signing`.
+# - `ubuntu2604-release`: restrict deployments to `main`, require reviewers,
+#   define secrets AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, and
+#   variables AZURE_LOCATION_X64, AZURE_LOCATION_ARM64, AZURE_VM_SIZE_X64, and
+#   AZURE_VM_SIZE_ARM64. The acceptance app's Entra federated credential subject
+#   is `repo:cataggar/vmiz:environment:ubuntu2604-release`.
+# Before dispatch, create RELEASE_TAG at the exact current `main` commit. The
+# workflow accepts lightweight or annotated tags, but never moves an existing
+# tag and publishes exactly the two QCOW2 assets declared below.
+name: Build, validate, and publish Ubuntu 26.04 images
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Completed Ubuntu release run whose successful candidates should be reused
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ubuntu2604-release-20260818
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: Ubuntu-26.04-20260818
+  RELEASE_TITLE: Ubuntu Server 26.04 - 20260818
+
+jobs:
+  prepare:
+    name: resolve immutable main source
+    if: github.repository == 'cataggar/vmiz' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source_commit: ${{ steps.source.outputs.commit }}
+      candidate_run_id: ${{ steps.source.outputs.candidate_run_id }}
+      candidate_run_attempt: ${{ steps.source.outputs.candidate_run_attempt }}
+      reuse_candidates: ${{ steps.source.outputs.reuse_candidates }}
+    steps:
+      - name: Check out merged main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind release to source commit and exact candidate attempt
+        id: source
+        env:
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$CANDIDATE_RUN_ID" ]]; then
+            commit=$(git rev-parse HEAD)
+            [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+            test "$(git rev-parse origin/main)" = "$commit"
+            candidate_run_id=$GITHUB_RUN_ID
+            candidate_run_attempt=$GITHUB_RUN_ATTEMPT
+            reuse_candidates=false
+          else
+            [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+            test "$CANDIDATE_RUN_ID" != "$GITHUB_RUN_ID"
+
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID")
+            test "$(jq -r .repository.full_name <<<"$run")" = "$GITHUB_REPOSITORY"
+            test "$(jq -r .path <<<"$run")" = ".github/workflows/ubuntu2604-release.yml"
+            test "$(jq -r .event <<<"$run")" = workflow_dispatch
+            test "$(jq -r .head_branch <<<"$run")" = main
+            test "$(jq -r .status <<<"$run")" = completed
+            commit=$(jq -r .head_sha <<<"$run")
+            candidate_run_attempt=$(jq -r .run_attempt <<<"$run")
+            [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$candidate_run_attempt" =~ ^[1-9][0-9]*$ ]]
+
+            jobs=$(
+              gh api --paginate \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID/attempts/$candidate_run_attempt/jobs?per_page=100" |
+                jq -s '[.[].jobs[]]'
+            )
+            artifacts=$(
+              gh api --paginate \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID/artifacts?per_page=100" |
+                jq -s '[.[].artifacts[]]'
+            )
+            for key in x86_64-full aarch64-full; do
+              test "$(
+                jq --arg name "build/native $key" \
+                  '[.[] | select(.name == $name and .conclusion == "success")] | length' \
+                  <<<"$jobs"
+              )" = 1
+              artifact="ubuntu2604-candidate-$key-$commit-$candidate_run_attempt"
+              test "$(
+                jq --arg name "$artifact" \
+                  '[.[] | select(.name == $name and .expired == false and .size_in_bytes > 0)] | length' \
+                  <<<"$artifacts"
+              )" = 1
+            done
+            test "$(
+              jq '[.[] | select(
+                (.name == "build/native x86_64-full" or
+                 .name == "build/native aarch64-full") and
+                .conclusion == "success"
+              )] | length' <<<"$jobs"
+            )" = 2
+            test "$(
+              jq --arg suffix "-$commit-$candidate_run_attempt" \
+                '[.[] | select(
+                  (.name | startswith("ubuntu2604-candidate-")) and
+                  (.name | endswith($suffix)) and
+                  .expired == false
+                )] | length' <<<"$artifacts"
+            )" = 2
+
+            candidate_run_id=$CANDIDATE_RUN_ID
+            reuse_candidates=true
+          fi
+
+          test "$(git ls-remote origin "refs/heads/main" | awk '{print $1}')" = "$commit"
+          direct_tag=$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')
+          peeled_tag=$(git ls-remote origin "refs/tags/$RELEASE_TAG^{}" | awk '{print $1}')
+          tag_commit=${peeled_tag:-$direct_tag}
+          test "$tag_commit" = "$commit"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "candidate_run_id=$candidate_run_id" >> "$GITHUB_OUTPUT"
+          echo "candidate_run_attempt=$candidate_run_attempt" >> "$GITHUB_OUTPUT"
+          echo "reuse_candidates=$reuse_candidates" >> "$GITHUB_OUTPUT"
+          echo "Accepted source commit: \`$commit\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Candidate run: \`$candidate_run_id\` attempt \`$candidate_run_attempt\`" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: build/native ${{ matrix.key }}
+    needs: prepare
+    if: needs.prepare.outputs.reuse_candidates != 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    environment: ubuntu2604-signing
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - key: x86_64-full
+            architecture: x86_64
+            runner: ubuntu-24.04
+            asset_name: Ubuntu-26.04-x86_64.qcow2
+          - key: aarch64-full
+            architecture: aarch64
+            runner: ubuntu-24.04-arm
+            asset_name: Ubuntu-26.04-aarch64.qcow2
+    env:
+      CANDIDATE_KEY: ${{ matrix.key }}
+      ARCHITECTURE: ${{ matrix.architecture }}
+      FLAVOR: full
+      ASSET_NAME: ${{ matrix.asset_name }}
+      VIRTUAL_SIZE: 5368709120
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      WORK_DIR: .scratch/ubuntu2604-release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
+      BUNDLE_DIR: artifact-staging/candidates/${{ matrix.key }}
+      SIGNING_PROBE_DIR: ${{ github.workspace }}/signing-probe-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
+      UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/vmiz
+      VMIZ_AZURE_TENANT_ID: ${{ vars.VMIZ_AZURE_TENANT_ID }}
+      VMIZ_AZURE_CLIENT_ID: ${{ vars.VMIZ_AZURE_CLIENT_ID }}
+      VMIZ_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.VMIZ_ARTIFACT_SIGNING_ENDPOINT }}
+      VMIZ_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.VMIZ_ARTIFACT_SIGNING_ACCOUNT }}
+      VMIZ_ARTIFACT_SIGNING_PROFILE: ${{ vars.VMIZ_ARTIFACT_SIGNING_PROFILE }}
+    steps:
+      - name: Check out accepted source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Install complete Ubuntu image-builder dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          packages=(
+            binutils cpio curl file gnupg jq libguestfs-tools openssl
+            python3 python3-pefile qemu-utils sbsigntool systemd-ukify
+            tar xorriso xz-utils zstd
+          )
+          sudo apt-get install -y --no-install-recommends "${packages[@]}"
+          for tool in curl guestfish gpg qemu-img sbverify tar ukify virt-cat \
+            virt-copy-in virt-copy-out virt-customize virt-filesystems virt-ls \
+            virt-resize virt-tar-in xorriso; do
+            command -v "$tool" >/dev/null
+          done
+
+      - name: Build built-in Artifact Signing client
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build install-vmiz
+          test -x "$UKI_SIGN_COMMAND"
+
+      - name: Resolve protected signing certificate
+        run: |
+          set -euo pipefail
+          uuid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          [[ "$VMIZ_AZURE_TENANT_ID" =~ $uuid ]]
+          [[ "$VMIZ_AZURE_CLIENT_ID" =~ $uuid ]]
+          [[ "$VMIZ_ARTIFACT_SIGNING_ENDPOINT" =~ ^https://[a-z0-9.-]+\.codesigning\.azure\.net/?$ ]]
+          [[ "$VMIZ_ARTIFACT_SIGNING_ACCOUNT" =~ ^[A-Za-z0-9._-]{1,128}$ ]]
+          [[ "$VMIZ_ARTIFACT_SIGNING_PROFILE" =~ ^[A-Za-z0-9._-]{1,128}$ ]]
+          certificate="$RUNNER_TEMP/vmiz-uki-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CANDIDATE_KEY}.pem"
+          umask 077
+          "$UKI_SIGN_COMMAND" sign certificate "$certificate"
+          openssl x509 -in "$certificate" -noout
+          actual=$(openssl x509 -in "$certificate" -outform DER | sha256sum | awk '{print $1}')
+          [[ "$actual" =~ ^[0-9a-f]{64}$ ]]
+          echo "UKI_SIGNING_CERTIFICATE=$certificate" >> "$GITHUB_ENV"
+          echo "UKI_SIGNING_CERTIFICATE_SHA256=$actual" >> "$GITHUB_ENV"
+
+      - name: Prove protected signing before the image build
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          case "$ARCHITECTURE" in
+            x86_64) target=x86_64-uefi ;;
+            aarch64) target=aarch64-uefi ;;
+            *) exit 1 ;;
+          esac
+          scratch="$SIGNING_PROBE_DIR"
+          mkdir -m 0700 "$scratch"
+          unsigned="$scratch/unsigned.efi"
+          signed="$scratch/signed.efi"
+          metadata="$scratch/metadata.json"
+          cp "$UKI_SIGNING_CERTIFICATE" "$scratch/certificate.pem"
+          zig build-exe -target "$target" tests/efi_signing_probe.zig -femit-bin="$unsigned"
+          export VMIZ_UKI_UNSIGNED="$unsigned"
+          export VMIZ_UKI_SIGNED="$signed"
+          export VMIZ_UKI_CERTIFICATE="$UKI_SIGNING_CERTIFICATE"
+          export VMIZ_UKI_ARCHITECTURE="$ARCHITECTURE"
+          export VMIZ_UKI_FLAVOR="$FLAVOR"
+          export VMIZ_UKI_SIGNING_METADATA="$metadata"
+          VMIZ_UKI_UNSIGNED_SHA256=$(sha256sum "$unsigned" | awk '{print $1}')
+          export VMIZ_UKI_UNSIGNED_SHA256
+          export VMIZ_UKI_CERTIFICATE_SHA256="$UKI_SIGNING_CERTIFICATE_SHA256"
+          "$UKI_SIGN_COMMAND" sign
+          test -s "$signed"
+          test -s "$metadata"
+          sbverify --verbose --cert "$UKI_SIGNING_CERTIFICATE" "$signed"
+          rm -rf -- "$scratch"
+
+      - name: Upload failed signing probe
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ubuntu2604-signing-probe-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.SIGNING_PROBE_DIR }}/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Build exact finalized Ubuntu QCOW2
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          rm -rf -- "$BUNDLE_DIR"
+          mkdir -p "$BUNDLE_DIR/internal-provenance"
+          build_log="$GITHUB_WORKSPACE/$WORK_DIR/build.log"
+          zig build \
+            -Dubuntu2604-arch="$ARCHITECTURE" \
+            generalized-ubuntu2604 -- \
+            --work-dir "$GITHUB_WORKSPACE/$WORK_DIR" \
+            --provenance-dir "$GITHUB_WORKSPACE/$BUNDLE_DIR/internal-provenance" \
+            --output "$GITHUB_WORKSPACE/$BUNDLE_DIR/$ASSET_NAME" \
+            --size "$VIRTUAL_SIZE" \
+            --uki-signing-certificate "$UKI_SIGNING_CERTIFICATE" \
+            --uki-signing-certificate-sha256 "$UKI_SIGNING_CERTIFICATE_SHA256" \
+            --uki-sign-command "$UKI_SIGN_COMMAND" \
+            --uki-sign-command-arg sign \
+            2>&1 | tee "$build_log"
+          cp "$build_log" "$BUNDLE_DIR/internal-provenance/build.log"
+
+      - name: Validate standalone zstd QCOW2 and exact 5 GiB size
+        run: |
+          set -euo pipefail
+          asset="$BUNDLE_DIR/$ASSET_NAME"
+          test -f "$asset"
+          qemu-img check "$asset"
+          qemu-img info --output=json "$asset" > "$BUNDLE_DIR/internal-provenance/qemu-img-info.json"
+          python3 - "$BUNDLE_DIR/internal-provenance/qemu-img-info.json" "$VIRTUAL_SIZE" <<'PY'
+          import json
+          import sys
+          info = json.load(open(sys.argv[1], encoding="utf-8"))
+          if info.get("format") != "qcow2":
+              raise SystemExit("candidate is not QCOW2")
+          if info.get("virtual-size") != int(sys.argv[2]):
+              raise SystemExit("candidate virtual size is not exactly 5 GiB")
+          if info.get("backing-filename") or info.get("full-backing-filename"):
+              raise SystemExit("candidate has a backing file")
+          data = (info.get("format-specific") or {}).get("data") or {}
+          if data.get("compression-type") != "zstd":
+              raise SystemExit("candidate does not use zstd cluster compression")
+          PY
+          digest=$(sha256sum "$asset" | awk '{print $1}')
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          printf '%s\n' "$digest" > "$BUNDLE_DIR/internal-provenance/build-validated-digest"
+
+      - name: Create and verify exact candidate bundle
+        env:
+          RUNNER_NAME_VALUE: ${{ runner.name }}
+          RUN_ID_VALUE: ${{ github.run_id }}
+          RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          validated=$(<"$BUNDLE_DIR/internal-provenance/build-validated-digest")
+          python3 scripts/ubuntu2604_release.py candidate \
+            --key "$CANDIDATE_KEY" \
+            --architecture "$ARCHITECTURE" \
+            --flavor "$FLAVOR" \
+            --asset "$BUNDLE_DIR/$ASSET_NAME" \
+            --validated-sha256 "$validated" \
+            --virtual-size "$VIRTUAL_SIZE" \
+            --source-commit "$SOURCE_COMMIT" \
+            --provenance-dir "$BUNDLE_DIR/internal-provenance" \
+            --runner "$RUNNER_NAME_VALUE" \
+            --run-id "$RUN_ID_VALUE" \
+            --run-attempt "$RUN_ATTEMPT_VALUE" \
+            --output "$BUNDLE_DIR/candidate.json"
+          python3 scripts/ubuntu2604_release.py verify-candidate \
+            --manifest "$BUNDLE_DIR/candidate.json" \
+            --asset "$BUNDLE_DIR/$ASSET_NAME" \
+            --key "$CANDIDATE_KEY" \
+            --source-commit "$SOURCE_COMMIT"
+
+      - name: Upload exact validated candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ubuntu2604-candidate-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.BUNDLE_DIR }}/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+      - name: Clean privileged build state
+        if: always()
+        run: |
+          sudo rm -rf -- "$WORK_DIR"
+          rm -rf -- "$BUNDLE_DIR" "$SIGNING_PROBE_DIR"
+          rm -f -- "${UKI_SIGNING_CERTIFICATE:-}"
+
+  native_qemu:
+    name: native-QEMU ${{ matrix.key }}
+    needs: [prepare, build]
+    if: >-
+      ${{
+        always() &&
+        needs.prepare.result == 'success' &&
+        (
+          needs.build.result == 'success' ||
+          (
+            needs.prepare.outputs.reuse_candidates == 'true' &&
+            needs.build.result == 'skipped'
+          )
+        )
+      }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: x86_64-full
+            architecture: x86_64
+            runner: ubuntu-24.04
+            asset_name: Ubuntu-26.04-x86_64.qcow2
+          - key: aarch64-full
+            architecture: aarch64
+            runner: ubuntu-24.04-arm
+            asset_name: Ubuntu-26.04-aarch64.qcow2
+    env:
+      CANDIDATE_KEY: ${{ matrix.key }}
+      ARCHITECTURE: ${{ matrix.architecture }}
+      ASSET_NAME: ${{ matrix.asset_name }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      CANDIDATE_DIR: .release/native/${{ matrix.key }}/candidate
+      RESULT_DIR: artifact-staging/native-results/${{ matrix.key }}
+    steps:
+      - name: Check out accepted source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Download exact build-validated candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ubuntu2604-candidate-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ needs.prepare.outputs.candidate_run_attempt }}
+          path: ${{ env.CANDIDATE_DIR }}
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.prepare.outputs.candidate_run_id }}
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Install native KVM, QEMU, firmware, and vTPM tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          packages=(
+            openssh-client openssl python3-virt-firmware qemu-utils
+            sbsigntool swtpm swtpm-tools xorriso
+          )
+          case "$ARCHITECTURE" in
+            x86_64) packages+=(ovmf qemu-system-x86) ;;
+            aarch64) packages+=(qemu-efi-aarch64 qemu-system-arm) ;;
+            *) exit 1 ;;
+          esac
+          sudo apt-get install -y --no-install-recommends "${packages[@]}"
+          test -r /dev/kvm
+          test -w /dev/kvm
+          for tool in qemu-img sbverify ssh ssh-keygen swtpm virt-fw-vars xorriso; do
+            command -v "$tool" >/dev/null
+          done
+          command -v "qemu-system-${ARCHITECTURE/x86_64/x86_64}" >/dev/null
+
+      - name: Verify candidate and bind native acceptance inputs
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESULT_DIR"
+          asset="$CANDIDATE_DIR/$ASSET_NAME"
+          manifest="$CANDIDATE_DIR/candidate.json"
+          python3 scripts/ubuntu2604_release.py verify-candidate \
+            --manifest "$manifest" \
+            --asset "$asset" \
+            --key "$CANDIDATE_KEY" \
+            --source-commit "$SOURCE_COMMIT"
+          python3 - "$manifest" "$RESULT_DIR/signing-certificate.der" "$GITHUB_ENV" <<'PY'
+          import base64
+          import json
+          import re
+          import sys
+          manifest_path, certificate_path, environment_path = sys.argv[1:]
+          value = json.load(open(manifest_path, encoding="utf-8"))
+          signing = value["uki_signing"]
+          values = {
+              "VMIZ_UBUNTU2604_IMAGE_SHA256": value["sha256"],
+              "VMIZ_UBUNTU2604_SIGNING_CERTIFICATE_SHA256": signing["certificate_sha256"],
+              "VMIZ_UBUNTU2604_UKI_SHA256": signing["fallback_uki_sha256"],
+          }
+          if any(re.fullmatch(r"[0-9a-f]{64}", item) is None for item in values.values()):
+              raise SystemExit("candidate signing bindings are malformed")
+          certificate = base64.b64decode(signing["certificate_der_base64"], validate=True)
+          open(certificate_path, "wb").write(certificate)
+          with open(environment_path, "a", encoding="utf-8") as output:
+              for name, item in values.items():
+                  print(f"{name}={item}", file=output)
+          PY
+          openssl x509 -inform DER \
+            -in "$RESULT_DIR/signing-certificate.der" \
+            -out "$RESULT_DIR/signing-certificate.pem"
+          echo "VMIZ_UBUNTU2604_IMAGE=$GITHUB_WORKSPACE/$asset" >> "$GITHUB_ENV"
+          echo "VMIZ_UBUNTU2604_SIGNING_CERTIFICATE=$GITHUB_WORKSPACE/$RESULT_DIR/signing-certificate.pem" >> "$GITHUB_ENV"
+          echo "VMIZ_UBUNTU2604_ACCEPTANCE_RESULT=$GITHUB_WORKSPACE/$RESULT_DIR/native-result.json" >> "$GITHUB_ENV"
+
+      - name: Run matching-architecture native Secure Boot acceptance
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build --fetch \
+            --build-file "$GITHUB_WORKSPACE/vendor/zig-bzip2/build.zig" \
+            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build \
+            -Dubuntu2604-arch="$ARCHITECTURE" \
+            test-ubuntu2604-acceptance
+          test -s "$VMIZ_UBUNTU2604_ACCEPTANCE_RESULT"
+
+      - name: Validate explicit native acceptance evidence
+        run: |
+          set -euo pipefail
+          python3 - "$RESULT_DIR/native-result.json" "$CANDIDATE_DIR/candidate.json" <<'PY'
+          import json
+          import sys
+          result = json.load(open(sys.argv[1], encoding="utf-8"))
+          candidate = json.load(open(sys.argv[2], encoding="utf-8"))
+          expected_contracts = {
+              "matching-architecture-native-kvm", "standalone-zstd-qcow2",
+              "gpt-layout", "secure-boot", "uefi-db-signer", "signed-uki",
+              "vtpm", "kernel-lockdown", "module-signatures",
+              "tampered-uki-rejected", "key-only-ssh",
+              "cloud-init-provisioning", "walinuxagent", "netplan-networkd",
+              "generalized-identity", "root-growth", "reboot-reconnect",
+              "clean-service-health",
+          }
+          if set(result) != {
+              "schema", "type", "candidate_sha256", "certificate_sha256",
+              "fallback_uki_sha256", "contracts",
+          }:
+              raise SystemExit("native acceptance result has unexpected fields")
+          if result["schema"] != 1 or result["type"] != "ubuntu2604-local-secure-boot-acceptance":
+              raise SystemExit("native acceptance schema mismatch")
+          if result["candidate_sha256"] != candidate["sha256"]:
+              raise SystemExit("native acceptance candidate digest mismatch")
+          if result["certificate_sha256"] != candidate["uki_signing"]["certificate_sha256"]:
+              raise SystemExit("native acceptance certificate mismatch")
+          if result["fallback_uki_sha256"] != candidate["uki_signing"]["fallback_uki_sha256"]:
+              raise SystemExit("native acceptance UKI mismatch")
+          if len(result["contracts"]) != len(expected_contracts) or set(result["contracts"]) != expected_contracts:
+              raise SystemExit("native acceptance contract set mismatch")
+          PY
+
+      - name: Upload native acceptance failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ubuntu2604-native-failure-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.RESULT_DIR }}/
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Upload exact native acceptance result
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ubuntu2604-native-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.RESULT_DIR }}/native-result.json
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Remove candidate and local acceptance state
+        if: always()
+        run: rm -rf -- ".release/native/$CANDIDATE_KEY" "$RESULT_DIR"
+
+  azure_acceptance:
+    name: Azure ${{ matrix.key }}
+    needs: [prepare, build]
+    if: >-
+      ${{
+        always() &&
+        needs.prepare.result == 'success' &&
+        (
+          needs.build.result == 'success' ||
+          (
+            needs.prepare.outputs.reuse_candidates == 'true' &&
+            needs.build.result == 'skipped'
+          )
+        )
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    environment: ubuntu2604-release
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: x86_64-full
+            architecture: x86_64
+            asset_name: Ubuntu-26.04-x86_64.qcow2
+            location_variable: AZURE_LOCATION_X64
+            size_variable: AZURE_VM_SIZE_X64
+          - key: aarch64-full
+            architecture: aarch64
+            asset_name: Ubuntu-26.04-aarch64.qcow2
+            location_variable: AZURE_LOCATION_ARM64
+            size_variable: AZURE_VM_SIZE_ARM64
+    env:
+      CANDIDATE_KEY: ${{ matrix.key }}
+      ARCHITECTURE: ${{ matrix.architecture }}
+      FLAVOR: full
+      ASSET_NAME: ${{ matrix.asset_name }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      CANDIDATE_DIR: .release/azure/${{ matrix.key }}/candidate
+      RESULT_DIR: artifact-staging/azure-results/${{ matrix.key }}
+      STATE_FILE: .release/azure/${{ matrix.key }}/resource-group
+      AZURE_LOCATION: ${{ vars[matrix.location_variable] }}
+      AZURE_VM_SIZE: ${{ vars[matrix.size_variable] }}
+    steps:
+      - name: Check out accepted source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Download exact build-validated candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ubuntu2604-candidate-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ needs.prepare.outputs.candidate_run_attempt }}
+          path: ${{ env.CANDIDATE_DIR }}
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.prepare.outputs.candidate_run_id }}
+
+      - name: Fail closed on missing protected configuration
+        env:
+          AZURE_CLIENT_ID_VALUE: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID_VALUE: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID_VALUE: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          uuid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          [[ "$AZURE_CLIENT_ID_VALUE" =~ $uuid ]]
+          [[ "$AZURE_TENANT_ID_VALUE" =~ $uuid ]]
+          [[ "$AZURE_SUBSCRIPTION_ID_VALUE" =~ $uuid ]]
+          [[ "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ ]]
+          [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
+
+      - name: Log in to Azure with protected-environment OIDC
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Require Azure acceptance tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssh-client qemu-utils
+          for tool in az azcopy qemu-img ssh ssh-keygen python3; do
+            command -v "$tool" >/dev/null
+          done
+          az version --output json >/dev/null
+
+      - name: Build accepted-source vmiz
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build --fetch \
+            --build-file "$GITHUB_WORKSPACE/vendor/zig-bzip2/build.zig" \
+            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build -Doptimize=ReleaseSafe
+          test -x zig-out/bin/vmiz
+
+      - name: Run exact-digest Azure Trusted Launch acceptance
+        env:
+          VMIZ: ${{ github.workspace }}/zig-out/bin/vmiz
+          RUN_ID_VALUE: ${{ github.run_id }}
+          RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          export GITHUB_RUN_ID=$RUN_ID_VALUE
+          export GITHUB_RUN_ATTEMPT=$RUN_ATTEMPT_VALUE
+          scripts/ubuntu2604_azure_acceptance.sh run
+
+      - name: Refresh Azure OIDC credential for unconditional cleanup
+        if: always()
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete only ownership-tagged temporary Azure resources
+        if: always()
+        env:
+          RUN_ID_VALUE: ${{ github.run_id }}
+          RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
+        run: |
+          export GITHUB_RUN_ID=$RUN_ID_VALUE
+          export GITHUB_RUN_ATTEMPT=$RUN_ATTEMPT_VALUE
+          if [[ -x scripts/ubuntu2604_azure_acceptance.sh ]]; then
+            scripts/ubuntu2604_azure_acceptance.sh cleanup
+          elif [[ -s "$STATE_FILE" ]]; then
+            echo "::error::Cleanup script is absent while Azure state exists"
+            exit 1
+          fi
+
+      - name: Upload failed Azure acceptance diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ubuntu2604-azure-failure-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.RESULT_DIR }}/*.json
+            ${{ env.RESULT_DIR }}/boot.log
+            ${{ env.RESULT_DIR }}/uefi-db.bin
+          if-no-files-found: warn
+          retention-days: 2
+
+      - name: Upload exact Azure acceptance result
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ubuntu2604-azure-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.RESULT_DIR }}/azure-result.json
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Remove derived VHD and local credentials
+        if: always()
+        run: rm -rf -- ".release/azure/$CANDIDATE_KEY" "$RESULT_DIR"
+
+  publish:
+    name: verify complete two-candidate gate and publish
+    needs: [prepare, build, native_qemu, azure_acceptance]
+    if: >-
+      ${{
+        always() &&
+        needs.prepare.result == 'success' &&
+        (
+          needs.build.result == 'success' ||
+          (
+            needs.prepare.outputs.reuse_candidates == 'true' &&
+            needs.build.result == 'skipped'
+          )
+        ) &&
+        needs.native_qemu.result == 'success' &&
+        needs.azure_acceptance.result == 'success'
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: ubuntu2604-release
+    permissions:
+      actions: read
+      contents: write
+    env:
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      CANDIDATES_DIR: .release/publication/candidates
+      NATIVE_RESULTS_DIR: .release/publication/native
+      AZURE_RESULTS_DIR: .release/publication/azure
+      STAGING_ROOT: .release/publication/staging
+      REPOSITORY: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      PREPARE_RESULT: ${{ needs.prepare.result }}
+      BUILD_RESULT: ${{ needs.prepare.outputs.reuse_candidates == 'true' && 'success' || needs.build.result }}
+      NATIVE_RESULT: ${{ needs.native_qemu.result }}
+      AZURE_RESULT: ${{ needs.azure_acceptance.result }}
+    steps:
+      - name: Check out accepted source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Download all build-validated candidates
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: ubuntu2604-candidate-*-${{ needs.prepare.outputs.source_commit }}-${{ needs.prepare.outputs.candidate_run_attempt }}
+          path: ${{ env.CANDIDATES_DIR }}
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.prepare.outputs.candidate_run_id }}
+
+      - name: Download all native-QEMU acceptance results
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: ubuntu2604-native-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.NATIVE_RESULTS_DIR }}
+          merge-multiple: false
+
+      - name: Download all Azure acceptance results
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: ubuntu2604-azure-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.AZURE_RESULTS_DIR }}
+          merge-multiple: false
+
+      - name: Validate exact successful two-by-three release gate
+        run: |
+          set -euo pipefail
+          test "$PREPARE_RESULT" = success
+          test "$BUILD_RESULT" = success
+          test "$NATIVE_RESULT" = success
+          test "$AZURE_RESULT" = success
+          python3 - "$CANDIDATES_DIR" "$NATIVE_RESULTS_DIR" "$AZURE_RESULTS_DIR" "$SOURCE_COMMIT" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          candidates_root, native_root, azure_root = map(Path, sys.argv[1:4])
+          source_commit = sys.argv[4]
+          expected = {
+              "x86_64-full": "Ubuntu-26.04-x86_64.qcow2",
+              "aarch64-full": "Ubuntu-26.04-aarch64.qcow2",
+          }
+          candidate_docs = list(candidates_root.rglob("candidate.json"))
+          native_docs = list(native_root.rglob("native-result.json"))
+          azure_docs = list(azure_root.rglob("azure-result.json"))
+          if len(candidate_docs) != 2 or len(native_docs) != 2 or len(azure_docs) != 2:
+              raise SystemExit("release gate did not receive exactly two results of each kind")
+          candidates = {}
+          for path in candidate_docs:
+              value = json.load(open(path, encoding="utf-8"))
+              key = value.get("key")
+              if key not in expected or value.get("asset_name") != expected[key]:
+                  raise SystemExit("unexpected candidate identity")
+              if value.get("source_commit") != source_commit or key in candidates:
+                  raise SystemExit("candidate source or uniqueness mismatch")
+              candidates[key] = value
+          native_by_digest = {}
+          for path in native_docs:
+              value = json.load(open(path, encoding="utf-8"))
+              digest = value.get("candidate_sha256")
+              if digest in native_by_digest:
+                  raise SystemExit("duplicate native acceptance digest")
+              native_by_digest[digest] = value
+          azure = {}
+          for path in azure_docs:
+              value = json.load(open(path, encoding="utf-8"))
+              key = value.get("key")
+              if key not in expected or key in azure:
+                  raise SystemExit("unexpected or duplicate Azure result")
+              azure[key] = value
+          if set(candidates) != set(expected) or set(azure) != set(expected):
+              raise SystemExit("release matrix is incomplete")
+          for key, candidate in candidates.items():
+              digest = candidate["sha256"]
+              native = native_by_digest.get(digest)
+              if native is None:
+                  raise SystemExit(f"{key}: native result is not digest-bound")
+              if native.get("certificate_sha256") != candidate["uki_signing"]["certificate_sha256"]:
+                  raise SystemExit(f"{key}: native signer binding mismatch")
+              result = azure[key]
+              if (
+                  result.get("source_commit") != source_commit
+                  or result.get("qcow_sha256") != digest
+                  or result.get("azure_accepted_sha256") != digest
+                  or result.get("status") != "success"
+              ):
+                  raise SystemExit(f"{key}: Azure result is not exact and successful")
+          PY
+
+      - name: Publish exactly two accepted Ubuntu assets
+        run: scripts/ubuntu2604_publish.sh
+
+      - name: Remove publication staging
+        if: always()
+        run: rm -rf -- .release/publication
