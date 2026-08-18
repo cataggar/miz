@@ -12,10 +12,12 @@ import os
 import re
 import shutil
 from pathlib import Path
+from urllib.parse import urlsplit
 
 try:
     from scripts.azure_vhd import (
         AZURE_VHD_ALIGNMENT,
+        AzureVhdGeometry,
         VHD_FOOTER_BYTES,
         VHD_MAX_CHS_SECTORS,
         inspect_azure_vhd,
@@ -24,6 +26,7 @@ try:
 except ModuleNotFoundError:
     from azure_vhd import (
         AZURE_VHD_ALIGNMENT,
+        AzureVhdGeometry,
         VHD_FOOTER_BYTES,
         VHD_MAX_CHS_SECTORS,
         inspect_azure_vhd,
@@ -64,6 +67,10 @@ AZURE_CONTRACTS = {
     "runtime-release-identity",
 }
 RELEASE_TAG_RE = re.compile(r"^Ubuntu-26\.04-[0-9]{8}$")
+SNAPSHOT_ID_RE = re.compile(r"^release-[0-9]{8}(?:\.[0-9]+)?$")
+CANONICAL_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{40}$")
+DEBZ_API_COMMIT = "d5385857a44fca753af515e805af70be9f004183"
+UBUNTU_PROVENANCE_FILENAME = "ubuntu2604-build-provenance.json"
 CANDIDATE_FIELDS = {
     "schema",
     "type",
@@ -77,6 +84,7 @@ CANDIDATE_FIELDS = {
     "virtual_size",
     "build_validation",
     "provenance",
+    "ubuntu_provenance",
     "uki_signing",
     "workflow",
 }
@@ -90,9 +98,7 @@ AZURE_RESULT_FIELDS = {
     "source_commit",
     "qcow_sha256",
     "azure_accepted_sha256",
-    "derived_vhd_sha256",
-    "derived_vhd_bytes",
-    "derived_vhd_current_size",
+    "conversion",
     "certificate_sha256",
     "signing_certificate_sha256",
     "fallback_uki_sha256",
@@ -109,9 +115,11 @@ PRIVATE_KEY_PEM_MARKERS = (
     b"-----BEGIN PRIVATE KEY-----",
     b"-----BEGIN ENCRYPTED PRIVATE KEY-----",
     b"-----BEGIN RSA PRIVATE KEY-----",
+    b"-----BEGIN DSA PRIVATE KEY-----",
     b"-----BEGIN EC PRIVATE KEY-----",
     b"-----BEGIN OPENSSH PRIVATE KEY-----",
 )
+OPENSSH_PRIVATE_KEY_MAGIC = b"openssh-key-v1\0"
 MIB_BYTES = 1024 * 1024
 
 
@@ -237,7 +245,10 @@ def write_json(path: Path, value: dict[str, object]) -> None:
 
 
 def contains_private_key(data: bytes) -> bool:
-    if any(marker in data for marker in PRIVATE_KEY_PEM_MARKERS):
+    if (
+        any(marker in data for marker in PRIVATE_KEY_PEM_MARKERS)
+        or OPENSSH_PRIVATE_KEY_MAGIC in data
+    ):
         return True
 
     def read_tlv(
@@ -344,6 +355,248 @@ def provenance_records(root: Path) -> list[dict[str, object]]:
     if not records:
         fail(f"provenance directory is empty: {root}")
     return records
+
+
+def require_file_binding(
+    value: object,
+    label: str,
+    *,
+    expected_filename: str,
+) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != {"filename", "sha256"}:
+        fail(f"{label} binding is invalid")
+    if value.get("filename") != expected_filename:
+        fail(f"{label} filename is not {expected_filename}")
+    digest = require_sha256(value.get("sha256"), f"{label} digest")
+    return {"filename": expected_filename, "sha256": digest}
+
+
+def require_bound_provenance_file(
+    root: Path,
+    binding: dict[str, str],
+    label: str,
+) -> Path:
+    path = root / binding["filename"]
+    if not path.is_file():
+        fail(f"{label} file is absent from provenance")
+    if sha256(path) != binding["sha256"]:
+        fail(f"{label} file digest does not match provenance")
+    return path
+
+
+def parse_sha256sums(path: Path) -> dict[str, str]:
+    result: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        fail(f"cannot read Ubuntu SHA256SUMS: {error}")
+    for line in lines:
+        match = re.fullmatch(r"([0-9a-f]{64}) [ *](\S+)", line)
+        if match is None:
+            fail("Ubuntu SHA256SUMS contains a noncanonical entry")
+        digest, filename = match.groups()
+        if Path(filename).name != filename or filename in result:
+            fail("Ubuntu SHA256SUMS contains an invalid or duplicate filename")
+        result[filename] = digest
+    if not result:
+        fail("Ubuntu SHA256SUMS is empty")
+    return result
+
+
+def validate_ubuntu_provenance(
+    root: Path,
+    architecture: str,
+) -> dict[str, object]:
+    path = root / UBUNTU_PROVENANCE_FILENAME
+    document = read_json(path)
+    if set(document) != {
+        "schema",
+        "type",
+        "architecture",
+        "release",
+        "snapshot",
+        "canonical_key_fingerprint",
+        "sha256sums_signature_verified",
+        "artifacts",
+        "debz",
+    }:
+        fail("Ubuntu build provenance has unexpected fields")
+    if (
+        document.get("schema") != 1
+        or document.get("type") != "vmiz-ubuntu2604-build-provenance"
+        or document.get("architecture") != architecture
+        or document.get("release") != "26.04"
+    ):
+        fail("invalid Ubuntu build provenance identity")
+
+    snapshot = document.get("snapshot")
+    if not isinstance(snapshot, dict) or set(snapshot) != {"id", "base_url"}:
+        fail("Ubuntu snapshot binding is invalid")
+    snapshot_id = snapshot.get("id")
+    base_url = snapshot.get("base_url")
+    if (
+        not isinstance(snapshot_id, str)
+        or SNAPSHOT_ID_RE.fullmatch(snapshot_id) is None
+        or not isinstance(base_url, str)
+    ):
+        fail("Ubuntu snapshot identity is not immutable")
+    parsed_url = urlsplit(base_url)
+    if (
+        parsed_url.scheme != "https"
+        or parsed_url.netloc != "cloud-images.ubuntu.com"
+        or parsed_url.path != f"/releases/26.04/{snapshot_id}/"
+        or parsed_url.query
+        or parsed_url.fragment
+    ):
+        fail("Ubuntu snapshot URL is not the exact immutable release URL")
+    fingerprint = document.get("canonical_key_fingerprint")
+    if (
+        not isinstance(fingerprint, str)
+        or CANONICAL_FINGERPRINT_RE.fullmatch(fingerprint) is None
+    ):
+        fail("Canonical signing key fingerprint is invalid")
+    if document.get("sha256sums_signature_verified") is not True:
+        fail("Ubuntu SHA256SUMS signature was not explicitly verified")
+
+    source_architecture = "amd64" if architecture == "x86_64" else "arm64"
+    prefix = f"ubuntu-26.04-server-cloudimg-{source_architecture}"
+    expected_artifacts = {
+        "sha256sums": "SHA256SUMS",
+        "sha256sums_signature": "SHA256SUMS.gpg",
+        "source_image": f"{prefix}.img",
+        "source_rootfs": f"{prefix}-root.tar.xz",
+        "image_manifest": f"{prefix}.manifest",
+        "rootfs_manifest": f"{prefix}-root.manifest",
+    }
+    artifacts = document.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != set(expected_artifacts):
+        fail("Ubuntu source artifact bindings are not exact")
+    bindings = {
+        name: require_file_binding(
+            artifacts[name],
+            f"Ubuntu {name}",
+            expected_filename=filename,
+        )
+        for name, filename in expected_artifacts.items()
+    }
+    checksum_path = require_bound_provenance_file(
+        root, bindings["sha256sums"], "Ubuntu SHA256SUMS"
+    )
+    require_bound_provenance_file(
+        root,
+        bindings["sha256sums_signature"],
+        "Ubuntu SHA256SUMS signature",
+    )
+    require_bound_provenance_file(
+        root, bindings["image_manifest"], "Ubuntu image manifest"
+    )
+    require_bound_provenance_file(
+        root, bindings["rootfs_manifest"], "Ubuntu rootfs manifest"
+    )
+    sums = parse_sha256sums(checksum_path)
+    for name in (
+        "source_image",
+        "source_rootfs",
+        "image_manifest",
+        "rootfs_manifest",
+    ):
+        binding = bindings[name]
+        if sums.get(binding["filename"]) != binding["sha256"]:
+            fail(f"Ubuntu SHA256SUMS does not bind {binding['filename']}")
+
+    debz = document.get("debz")
+    if not isinstance(debz, dict) or set(debz) != {
+        "api_commit",
+        "exact_lock",
+        "transaction_provenance",
+    }:
+        fail("debz provenance binding is invalid")
+    if debz.get("api_commit") != DEBZ_API_COMMIT:
+        fail("debz API commit is not the embedded vmiz revision")
+    exact_lock_name = f"debz-exact-lock-{source_architecture}.json"
+    transaction_name = (
+        f"debz-transaction-provenance-{source_architecture}.json"
+    )
+    exact_lock = debz.get("exact_lock")
+    if not isinstance(exact_lock, dict) or set(exact_lock) != {
+        "filename",
+        "sha256",
+        "digest_sha256",
+    }:
+        fail("debz exact-lock binding is invalid")
+    exact_lock_binding = require_file_binding(
+        {
+            "filename": exact_lock.get("filename"),
+            "sha256": exact_lock.get("sha256"),
+        },
+        "debz exact lock",
+        expected_filename=exact_lock_name,
+    )
+    lock_digest = require_sha256(
+        exact_lock.get("digest_sha256"), "debz exact-lock semantic digest"
+    )
+    lock_path = require_bound_provenance_file(
+        root, exact_lock_binding, "debz exact lock"
+    )
+    lock_document = read_json(lock_path)
+    if (
+        lock_document.get("schema")
+        != "https://debz.dev/schema/exact-closure-lock-v1"
+        or lock_document.get("version") != 1
+        or lock_document.get("target_architecture") != source_architecture
+        or lock_document.get("digest_sha256") != lock_digest
+        or not isinstance(lock_document.get("repositories"), list)
+        or not lock_document["repositories"]
+        or not isinstance(lock_document.get("packages"), list)
+        or not lock_document["packages"]
+    ):
+        fail("debz exact lock does not satisfy the Ubuntu release contract")
+
+    transaction = debz.get("transaction_provenance")
+    if not isinstance(transaction, dict) or set(transaction) != {
+        "filename",
+        "sha256",
+        "digest_sha256",
+        "lock_sha256",
+    }:
+        fail("debz transaction provenance binding is invalid")
+    transaction_binding = require_file_binding(
+        {
+            "filename": transaction.get("filename"),
+            "sha256": transaction.get("sha256"),
+        },
+        "debz transaction provenance",
+        expected_filename=transaction_name,
+    )
+    transaction_digest = require_sha256(
+        transaction.get("digest_sha256"),
+        "debz transaction provenance semantic digest",
+    )
+    transaction_lock = require_sha256(
+        transaction.get("lock_sha256"),
+        "debz transaction provenance lock digest",
+    )
+    if transaction_lock != lock_digest:
+        fail("debz transaction provenance is not bound to the exact lock")
+    transaction_path = require_bound_provenance_file(
+        root, transaction_binding, "debz transaction provenance"
+    )
+    transaction_document = read_json(transaction_path)
+    final_verification = transaction_document.get("final_verification")
+    if (
+        transaction_document.get("schema")
+        != "https://debz.dev/schema/transaction-result-v1"
+        or transaction_document.get("version") != 1
+        or transaction_document.get("target_architecture")
+        != source_architecture
+        or transaction_document.get("lock_sha256") != lock_digest
+        or transaction_document.get("digest_sha256") != transaction_digest
+        or transaction_document.get("outcome") != "succeeded"
+        or not isinstance(final_verification, dict)
+        or final_verification.get("status") != "exact_match"
+    ):
+        fail("debz transaction provenance does not prove an exact transaction")
+    return document
 
 
 def validate_signing_provenance(
@@ -494,6 +747,9 @@ def candidate_command(args: argparse.Namespace) -> None:
     source_commit = require_commit(args.source_commit)
     provenance_root = args.provenance_dir.resolve()
     records = provenance_records(provenance_root)
+    ubuntu_provenance = validate_ubuntu_provenance(
+        provenance_root, architecture
+    )
     signing = validate_signing_provenance(provenance_root, architecture, flavor)
     digest = sha256(asset)
     if require_sha256(
@@ -533,6 +789,7 @@ def candidate_command(args: argparse.Namespace) -> None:
                 "digest": provenance_digest(records),
                 "files": records,
             },
+            "ubuntu_provenance": ubuntu_provenance,
             "uki_signing": signing,
             "workflow": {
                 "run_id": args.run_id,
@@ -633,6 +890,14 @@ def verify_candidate(
         fail(f"{actual_key}: provenance file allowlist mismatch")
     if provenance.get("digest") != provenance_digest(files):
         fail(f"{actual_key}: aggregate provenance digest mismatch")
+    ubuntu_provenance = document.get("ubuntu_provenance")
+    if not isinstance(ubuntu_provenance, dict):
+        fail(f"{actual_key}: Ubuntu provenance binding is absent")
+    actual_ubuntu_provenance = validate_ubuntu_provenance(
+        provenance_root, document["architecture"]
+    )
+    if ubuntu_provenance != actual_ubuntu_provenance:
+        fail(f"{actual_key}: Ubuntu provenance binding does not match files")
     signing = document.get("uki_signing")
     if not isinstance(signing, dict):
         fail(f"{actual_key}: UKI signing binding is absent")
@@ -670,6 +935,81 @@ def verify_vhd_command(args: argparse.Namespace) -> None:
     print(geometry.file_size)
 
 
+def validate_conversion_attestation(
+    path: Path,
+    candidate: dict[str, object],
+    vhd: Path,
+    vhd_info: Path,
+    geometry: AzureVhdGeometry,
+) -> dict[str, object]:
+    document = read_json(path)
+    if set(document) != {
+        "schema",
+        "type",
+        "key",
+        "status",
+        "tool",
+        "operation",
+        "source",
+        "parameters",
+        "result",
+    }:
+        fail("Azure VHD conversion attestation has unexpected fields")
+    if (
+        document.get("schema") != 1
+        or document.get("type") != "vmiz-azure-vhd-conversion"
+        or document.get("key") != candidate["key"]
+        or document.get("status") != "success"
+        or document.get("tool") != "vmiz"
+        or document.get("operation") != "azure derive"
+    ):
+        fail("Azure VHD conversion attestation identity is invalid")
+    source = document.get("source")
+    if not isinstance(source, dict) or set(source) != {
+        "asset_name",
+        "sha256_before",
+        "sha256_after",
+        "bytes",
+        "virtual_size",
+    }:
+        fail("Azure VHD conversion source binding is invalid")
+    if source != {
+        "asset_name": candidate["asset_name"],
+        "sha256_before": candidate["sha256"],
+        "sha256_after": candidate["sha256"],
+        "bytes": candidate["bytes"],
+        "virtual_size": candidate["virtual_size"],
+    }:
+        fail("Azure VHD conversion is not bound to the candidate bytes")
+    parameters = document.get("parameters")
+    if not isinstance(parameters, dict) or parameters != {
+        "input_sha256": candidate["sha256"],
+        "expected_virtual_size": candidate["virtual_size"],
+        "output_format": "vpc-fixed",
+        "vhd_alignment_bytes": AZURE_VHD_ALIGNMENT,
+        "vhd_footer_bytes": VHD_FOOTER_BYTES,
+    }:
+        fail("Azure VHD conversion parameters are invalid")
+    expected_current_size = (
+        (candidate["virtual_size"] + AZURE_VHD_ALIGNMENT - 1)
+        // AZURE_VHD_ALIGNMENT
+        * AZURE_VHD_ALIGNMENT
+    )
+    if geometry.current_size != expected_current_size:
+        fail("derived VHD current size is not the aligned candidate virtual size")
+    result = document.get("result")
+    digest = sha256(vhd)
+    if not isinstance(result, dict) or result != {
+        "sha256": digest,
+        "bytes": geometry.file_size,
+        "current_size": geometry.current_size,
+        "qemu_virtual_size": geometry.qemu_virtual_size,
+        "qemu_info_sha256": sha256(vhd_info),
+    }:
+        fail("Azure VHD conversion result does not match the validated VHD")
+    return document
+
+
 def azure_result_command(args: argparse.Namespace) -> None:
     candidate = verify_candidate(
         args.manifest,
@@ -680,13 +1020,14 @@ def azure_result_command(args: argparse.Namespace) -> None:
     vhd = args.vhd.resolve()
     if not vhd.is_file():
         fail(f"derived VHD is missing: {vhd}")
-    if (
-        type(args.vhd_current_size) is not int
-        or args.vhd_current_size <= 0
-        or args.vhd_current_size % AZURE_VHD_ALIGNMENT != 0
-        or vhd.stat().st_size != args.vhd_current_size + VHD_FOOTER_BYTES
-    ):
-        fail("derived VHD current-size evidence is inconsistent")
+    geometry = inspect_azure_vhd(args.vhd_info, vhd)
+    conversion = validate_conversion_attestation(
+        args.conversion_attestation,
+        candidate,
+        vhd,
+        args.vhd_info,
+        geometry,
+    )
     request = read_json(args.uefi_request)
     response = read_json(args.uefi_response)
     request_uefi = validate_azure_gallery_uefi_settings(
@@ -720,9 +1061,7 @@ def azure_result_command(args: argparse.Namespace) -> None:
             "source_commit": candidate["source_commit"],
             "qcow_sha256": candidate["sha256"],
             "azure_accepted_sha256": sha256(args.asset),
-            "derived_vhd_sha256": sha256(vhd),
-            "derived_vhd_bytes": vhd.stat().st_size,
-            "derived_vhd_current_size": args.vhd_current_size,
+            "conversion": conversion,
             "certificate_sha256": candidate["uki_signing"]["certificate_sha256"],
             "signing_certificate_sha256": candidate["uki_signing"][
                 "signing_certificate_sha256"
@@ -864,18 +1203,80 @@ def _stage_into(args: argparse.Namespace, output: Path, notes: Path) -> None:
             or release_signing_provider != signing_provider
         ):
             fail("release candidates do not share one Artifact Signing identity")
-        require_sha256(azure.get("derived_vhd_sha256"), f"{key} VHD digest")
         contracts = azure.get("contracts")
         if not has_exact_contracts(contracts, AZURE_CONTRACTS):
             fail(f"{key}: Azure contract results are absent")
-        derived_vhd_bytes = azure.get("derived_vhd_bytes")
-        derived_vhd_current_size = azure.get("derived_vhd_current_size")
+        conversion = azure.get("conversion")
+        if (
+            not isinstance(conversion, dict)
+            or set(conversion)
+            != {
+                "schema",
+                "type",
+                "key",
+                "status",
+                "tool",
+                "operation",
+                "source",
+                "parameters",
+                "result",
+            }
+            or conversion.get("schema") != 1
+            or conversion.get("type") != "vmiz-azure-vhd-conversion"
+            or conversion.get("key") != key
+            or conversion.get("status") != "success"
+            or conversion.get("tool") != "vmiz"
+            or conversion.get("operation") != "azure derive"
+        ):
+            fail(f"{key}: Azure VHD conversion attestation is invalid")
+        if conversion.get("source") != {
+            "asset_name": asset_name,
+            "sha256_before": digest,
+            "sha256_after": digest,
+            "bytes": candidate["bytes"],
+            "virtual_size": candidate["virtual_size"],
+        }:
+            fail(f"{key}: Azure VHD conversion source binding is invalid")
+        if conversion.get("parameters") != {
+            "input_sha256": digest,
+            "expected_virtual_size": candidate["virtual_size"],
+            "output_format": "vpc-fixed",
+            "vhd_alignment_bytes": AZURE_VHD_ALIGNMENT,
+            "vhd_footer_bytes": VHD_FOOTER_BYTES,
+        }:
+            fail(f"{key}: Azure VHD conversion parameters are invalid")
+        conversion_result = conversion.get("result")
+        if not isinstance(conversion_result, dict) or set(conversion_result) != {
+            "sha256",
+            "bytes",
+            "current_size",
+            "qemu_virtual_size",
+            "qemu_info_sha256",
+        }:
+            fail(f"{key}: Azure VHD conversion result is invalid")
+        derived_vhd_sha256 = require_sha256(
+            conversion_result.get("sha256"), f"{key} VHD digest"
+        )
+        derived_vhd_bytes = conversion_result.get("bytes")
+        derived_vhd_current_size = conversion_result.get("current_size")
+        qemu_virtual_size = conversion_result.get("qemu_virtual_size")
+        require_sha256(
+            conversion_result.get("qemu_info_sha256"),
+            f"{key} qemu VHD info digest",
+        )
+        expected_vhd_current_size = (
+            (candidate["virtual_size"] + AZURE_VHD_ALIGNMENT - 1)
+            // AZURE_VHD_ALIGNMENT
+            * AZURE_VHD_ALIGNMENT
+        )
         if (
             type(derived_vhd_bytes) is not int
             or type(derived_vhd_current_size) is not int
+            or type(qemu_virtual_size) is not int
             or derived_vhd_current_size <= 0
-            or derived_vhd_current_size % AZURE_VHD_ALIGNMENT != 0
+            or derived_vhd_current_size != expected_vhd_current_size
             or derived_vhd_bytes != derived_vhd_current_size + VHD_FOOTER_BYTES
+            or qemu_virtual_size <= 0
         ):
             fail(f"{key}: derived VHD size binding is absent")
         if not isinstance(azure.get("location"), str) or not azure["location"]:
@@ -916,7 +1317,8 @@ def _stage_into(args: argparse.Namespace, output: Path, notes: Path) -> None:
                 "azure_location": azure.get("location"),
                 "azure_vm_size": azure.get("vm_size"),
                 "azure_resource_group": azure.get("resource_group"),
-                "derived_vhd_sha256": azure.get("derived_vhd_sha256"),
+                "conversion": conversion,
+                "derived_vhd_sha256": derived_vhd_sha256,
                 "derived_vhd_bytes": derived_vhd_bytes,
                 "derived_vhd_current_size": derived_vhd_current_size,
                 "azure_image_version_id": azure.get("image_version_id"),
@@ -1030,7 +1432,15 @@ def parser() -> argparse.ArgumentParser:
     candidate.add_argument("--validated-sha256", required=True)
     candidate.add_argument("--virtual-size", type=int, required=True)
     candidate.add_argument("--source-commit", required=True)
-    candidate.add_argument("--provenance-dir", type=Path, required=True)
+    candidate.add_argument(
+        "--provenance-dir",
+        type=Path,
+        required=True,
+        help=(
+            "complete internal provenance tree containing "
+            "ubuntu2604-build-provenance.json and every referenced metadata file"
+        ),
+    )
     candidate.add_argument("--runner", required=True)
     candidate.add_argument("--run-id", required=True)
     candidate.add_argument("--run-attempt", required=True)
@@ -1053,7 +1463,21 @@ def parser() -> argparse.ArgumentParser:
     azure.add_argument("--manifest", type=Path, required=True)
     azure.add_argument("--asset", type=Path, required=True)
     azure.add_argument("--vhd", type=Path, required=True)
-    azure.add_argument("--vhd-current-size", type=int, required=True)
+    azure.add_argument(
+        "--vhd-info",
+        type=Path,
+        required=True,
+        help="qemu-img info -f vpc --output=json output for --vhd",
+    )
+    azure.add_argument(
+        "--conversion-attestation",
+        type=Path,
+        required=True,
+        help=(
+            "harness-produced vmiz-azure-vhd-conversion JSON binding the "
+            "candidate, azure derive parameters, and observed VHD result"
+        ),
+    )
     azure.add_argument("--key", required=True)
     azure.add_argument("--source-commit", required=True)
     azure.add_argument("--location", required=True)
