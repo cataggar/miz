@@ -9,6 +9,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "ubuntu2604_azure_acceptance.sh"
+LIBRARY = ROOT / "scripts" / "ubuntu2604_azure_acceptance_lib.sh"
 
 
 class UbuntuAzureAcceptanceTests(unittest.TestCase):
@@ -67,6 +68,40 @@ else:
             text=True,
         )
         self.assertNotEqual(result.returncode, 0)
+
+    def test_curl_auth_header_is_private_bearer_header(self) -> None:
+        header = self.scratch / "auth-header"
+        token = "regression-token-not-a-secret"
+        env = {
+            **os.environ,
+            "AUTH_HEADER": str(header),
+            "AUTH_TOKEN": token,
+            "ACCEPTANCE_LIBRARY": str(LIBRARY),
+        }
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$ACCEPTANCE_LIBRARY"; '
+                'write_bearer_header "$AUTH_TOKEN" "$AUTH_HEADER"',
+            ],
+            cwd=ROOT,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotIn(token, result.stdout)
+        self.assertNotIn(token, result.stderr)
+        self.assertEqual(
+            header.read_text(encoding="utf-8"),
+            f"Authorization: Bearer {token}\n",
+        )
+        self.assertEqual(header.stat().st_mode & 0o777, 0o600)
+
+        harness = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('write_bearer_header "$token" "$auth_header"\n  token=', harness)
+        self.assertIn('--header "@$auth_header"', harness)
 
     def test_cleanup_requires_exact_ownership_tags(self) -> None:
         env = self.environment()

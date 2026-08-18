@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/ubuntu2604_azure_acceptance_lib.sh
+source "$script_dir/ubuntu2604_azure_acceptance_lib.sh"
+
 # Release-schema integration contract (implemented by the Ubuntu release
 # tooling PR): `verify-candidate`, `verify-vhd`, and `azure-result` must expose
 # the same arguments consumed below. Keep schema validation in that tool
@@ -137,7 +141,7 @@ grant_disk_write_access() {
     rm -rf "$request_dir"
     return 1
   fi
-  (umask 077; printf 'Authorization: Bearer %s\n' "$token" >"$auth_header")
+  write_bearer_header "$token" "$auth_header"
   token=
 
   if ! status=$(curl \
@@ -295,6 +299,7 @@ uefi_create_response="$RESULT_DIR/gallery-version-create-response.json"
 uefi_response="$RESULT_DIR/gallery-version-response.json"
 vm_security_json="$RESULT_DIR/vm-security.json"
 instance_security_json="$RESULT_DIR/instance-security.json"
+conversion_attestation="$RESULT_DIR/conversion-attestation.json"
 mkdir -p "$(dirname -- "$STATE_FILE")"
 rm -f -- "$STATE_FILE" "${STATE_FILE}.group.json" "$vhd" "$private_key" "$private_key.pub"
 python3 - "$certificate_der" "$certificate_sha256" "$certificate_der_base64" <<'PY'
@@ -423,6 +428,68 @@ test "$vhd_current_size" -eq "$expected_vhd_current_size"
 test "$vhd_bytes" -eq "$((vhd_current_size + 512))"
 vhd_sha256=$(sha256sum "$vhd" | awk '{print $1}')
 [[ "$vhd_sha256" =~ ^[0-9a-f]{64}$ ]]
+python3 - \
+  "$conversion_attestation" \
+  "$CANDIDATE_KEY" \
+  "$ASSET_NAME" \
+  "$qcow_sha256" \
+  "$qcow_bytes" \
+  "$virtual_size" \
+  "$vhd_sha256" \
+  "$vhd_bytes" \
+  "$vhd_current_size" \
+  "$RESULT_DIR/vhd-info.json" <<'PY'
+import json
+import sys
+
+(
+    output,
+    key,
+    asset_name,
+    qcow_sha256,
+    qcow_bytes,
+    virtual_size,
+    vhd_sha256,
+    vhd_bytes,
+    vhd_current_size,
+    info_path,
+) = sys.argv[1:]
+info = json.load(open(info_path, encoding="utf-8"))
+qemu_virtual_size = info.get("virtual-size")
+if type(qemu_virtual_size) is not int:
+    raise SystemExit("qemu-img omitted the derived VHD virtual size")
+document = {
+    "schema": 1,
+    "type": "vmiz-azure-vhd-conversion",
+    "key": key,
+    "status": "success",
+    "tool": "vmiz",
+    "operation": "azure derive",
+    "source": {
+        "asset_name": asset_name,
+        "sha256_before": qcow_sha256,
+        "sha256_after": qcow_sha256,
+        "bytes": int(qcow_bytes),
+        "virtual_size": int(virtual_size),
+    },
+    "parameters": {
+        "input_sha256": qcow_sha256,
+        "expected_virtual_size": int(virtual_size),
+        "output_format": "vpc-fixed",
+        "vhd_alignment_bytes": 1024 * 1024,
+        "vhd_footer_bytes": 512,
+    },
+    "result": {
+        "sha256": vhd_sha256,
+        "bytes": int(vhd_bytes),
+        "current_size": int(vhd_current_size),
+        "qemu_virtual_size": qemu_virtual_size,
+    },
+}
+open(output, "w", encoding="utf-8").write(
+    json.dumps(document, indent=2, sort_keys=True) + "\n"
+)
+PY
 
 az disk create \
   --resource-group "$resource_group" \
@@ -908,7 +975,8 @@ python3 "$RELEASE_SCHEMA" azure-result \
   --manifest "$manifest" \
   --asset "$asset" \
   --vhd "$vhd" \
-  --vhd-current-size "$vhd_current_size" \
+  --vhd-info "$RESULT_DIR/vhd-info.json" \
+  --conversion-attestation "$conversion_attestation" \
   --key "$CANDIDATE_KEY" \
   --source-commit "$SOURCE_COMMIT" \
   --location "$AZURE_LOCATION" \
