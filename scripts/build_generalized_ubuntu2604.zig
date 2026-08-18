@@ -23,6 +23,7 @@ const release = "20260731";
 const release_base = "https://cloud-images.ubuntu.com/releases/26.04/release-" ++ release;
 const snapshot_base = "https://snapshot.ubuntu.com/ubuntu/20260731T000000Z";
 const canonical_fingerprint = "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81";
+const canonical_fingerprint_lower = "d2eb44626fddc30b513d5bb71a5d6c4c7db87c81";
 const sums_sha256 = "d562d59dac70f68d67d00e994db5cd89e49e9d93f7f80b4cb868a5eeb057ec36";
 const sums_signature_sha256 = "2bf5fae8be0c79cc30c5c10223f1d4790b6ef541240896bfe48c7ac57c3404ed";
 const default_virtual_size: u64 = 5 * 1024 * 1024 * 1024;
@@ -101,6 +102,8 @@ const Args = struct {
     signing_certificate: ?[]const u8 = null,
     signing_certificate_sha256: ?[]const u8 = null,
     signing_key: ?[]const u8 = null,
+    signing_command: ?[]const u8 = null,
+    signing_command_arg: ?[]const u8 = null,
     preflight_only: bool = false,
 };
 
@@ -114,6 +117,8 @@ const help =
     \\  --uki-signing-certificate <path>        Secure Boot certificate
     \\  --uki-signing-certificate-sha256 <hex>  DER certificate SHA-256
     \\  --uki-signing-key <path>                local signing key
+    \\  --uki-sign-command <absolute-path>       external production signer
+    \\  --uki-sign-command-arg <argument>        external signer argument
     \\  --preflight-only                        verify pins/tools without building
     \\
 ;
@@ -204,6 +209,14 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
             args.signing_key = argv[i];
+        } else if (std.mem.eql(u8, arg, "--uki-sign-command")) {
+            i += 1;
+            if (i == argv.len) return error.MissingArgument;
+            args.signing_command = argv[i];
+        } else if (std.mem.eql(u8, arg, "--uki-sign-command-arg")) {
+            i += 1;
+            if (i == argv.len) return error.MissingArgument;
+            args.signing_command_arg = argv[i];
         } else if (std.mem.eql(u8, arg, "--preflight-only")) {
             args.preflight_only = true;
         } else if (std.mem.eql(u8, arg, "--help")) {
@@ -211,8 +224,31 @@ fn parseArgs(argv: []const []const u8) !Args {
             std.process.exit(0);
         } else return error.UnknownArgument;
     }
+
     if (args.size < default_virtual_size) return error.ImageTooSmall;
     return args;
+}
+
+fn signingConfig(args: Args) !uki_signing.Config {
+    const certificate = args.signing_certificate orelse return error.SigningConfigurationRequired;
+    const certificate_sha256 = args.signing_certificate_sha256 orelse return error.SigningConfigurationRequired;
+    if ((args.signing_key == null) == (args.signing_command == null)) return error.SigningModeRequired;
+    if (args.signing_command == null and args.signing_command_arg != null) return error.SigningCommandRequired;
+    const mode: uki_signing.Mode = if (args.signing_key) |key|
+        .{ .local_key = .{ .private_key_path = key } }
+    else blk: {
+        const command = args.signing_command.?;
+        if (!std.fs.path.isAbsolute(command)) return error.SigningCommandMustBeAbsolute;
+        break :blk .{ .external_command = .{
+            .executable_path = command,
+            .argument = args.signing_command_arg,
+        } };
+    };
+    return .{
+        .certificate_path = certificate,
+        .expected_certificate_sha256 = try uki_signing.parseFingerprint(certificate_sha256),
+        .mode = mode,
+    };
 }
 
 fn run(allocator: Allocator, io: Io, argv: []const []const u8) !void {
@@ -703,7 +739,7 @@ fn writeProvenance(
         @tagName(profile.architecture),
         release,
         release_base,
-        canonical_fingerprint,
+        canonical_fingerprint_lower,
         sums_sha256,
         sums_signature_sha256,
         profile.source_name,
@@ -730,6 +766,97 @@ fn writeProvenance(
     });
     defer allocator.free(document);
     try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = document });
+}
+
+fn writeSigningProvenance(
+    allocator: Allocator,
+    io: Io,
+    provenance_dir: []const u8,
+    profile: *const Profile,
+    config: uki_signing.Config,
+    certificate: *const uki_signing.Certificate,
+    signed: *const uki_signing.SignedUki,
+) !void {
+    const metadata = signed.provider_metadata;
+    var provider_fingerprint: [64]u8 = undefined;
+    const provider = if (metadata) |value| blk: {
+        provider_fingerprint = artifact_pipeline.formatSha256(value.signing_certificate_sha256);
+        break :blk .{
+            .name = value.provider,
+            .endpoint = value.endpoint,
+            .account = value.account,
+            .profile = value.profile,
+            .signing_certificate_sha256 = @as([]const u8, &provider_fingerprint),
+        };
+    } else null;
+    const unsigned_hex = artifact_pipeline.formatSha256(signed.unsigned_sha256);
+    const signed_hex = artifact_pipeline.formatSha256(signed.signed_sha256);
+    const operation_id: ?[]const u8 = if (metadata) |value| value.operation_id else null;
+    const signing_fingerprint: ?[]const u8 = if (metadata != null) &provider_fingerprint else null;
+    const fallback_path = try std.fmt.allocPrint(allocator, "EFI/BOOT/{s}", .{profile.efi_fallback});
+    defer allocator.free(fallback_path);
+    const named_path = try std.fmt.allocPrint(allocator, "EFI/Linux/{s}", .{profile.efi_fallback});
+    defer allocator.free(named_path);
+    const Record = struct {
+        path: []const u8,
+        unsigned_sha256: []const u8,
+        signed_sha256: []const u8,
+        finalized_sha256: []const u8,
+        signed_bytes: usize,
+        signing_operation_id: ?[]const u8,
+        signing_certificate_sha256: ?[]const u8,
+    };
+    const records = [_]Record{
+        .{
+            .path = named_path,
+            .unsigned_sha256 = &unsigned_hex,
+            .signed_sha256 = &signed_hex,
+            .finalized_sha256 = &signed_hex,
+            .signed_bytes = signed.bytes.len,
+            .signing_operation_id = operation_id,
+            .signing_certificate_sha256 = signing_fingerprint,
+        },
+        .{
+            .path = fallback_path,
+            .unsigned_sha256 = &unsigned_hex,
+            .signed_sha256 = &signed_hex,
+            .finalized_sha256 = &signed_hex,
+            .signed_bytes = signed.bytes.len,
+            .signing_operation_id = operation_id,
+            .signing_certificate_sha256 = signing_fingerprint,
+        },
+    };
+    const certificate_hex = artifact_pipeline.formatSha256(certificate.sha256);
+    const certificate_base64 = try allocator.alloc(
+        u8,
+        std.base64.standard.Encoder.calcSize(certificate.der.len),
+    );
+    defer allocator.free(certificate_base64);
+    _ = std.base64.standard.Encoder.encode(certificate_base64, certificate.der);
+    const document = .{
+        .schema = 1,
+        .type = "vmiz-uki-signing",
+        .architecture = @tagName(profile.architecture),
+        .flavor = "full",
+        .signer_mode = config.mode.name(),
+        .certificate_sha256 = @as([]const u8, &certificate_hex),
+        .certificate_der_base64 = certificate_base64,
+        .certificate_details = certificate.details,
+        .provider = provider,
+        .signature_verification = "success",
+        .files = &records,
+    };
+    const json = try std.json.Stringify.valueAlloc(allocator, document, .{ .whitespace = .indent_2 });
+    defer allocator.free(json);
+    const filename = try std.fmt.allocPrint(
+        allocator,
+        "uki-signing-full-{s}.json",
+        .{@tagName(profile.architecture)},
+    );
+    defer allocator.free(filename);
+    const path = try std.fs.path.join(allocator, &.{ provenance_dir, filename });
+    defer allocator.free(path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -805,8 +932,7 @@ pub fn main(init: std.process.Init) !void {
 
     for (&[_][]const u8{ "qemu-img", "virt-resize", "virt-customize", "virt-copy-out", "virt-copy-in", "virt-cat", "virt-ls", "virt-filesystems", "virt-tar-in", "guestfish", "tar", "cp", "ukify", "sbverify" }) |tool|
         try requireTool(allocator, io, tool);
-    if (args.signing_certificate == null or args.signing_certificate_sha256 == null or args.signing_key == null)
-        return error.SigningConfigurationRequired;
+    const config = try signingConfig(args);
 
     const mutable = try std.fs.path.join(allocator, &.{ work_dir, "customized.qcow2" });
     defer allocator.free(mutable);
@@ -897,11 +1023,6 @@ pub fn main(init: std.process.Init) !void {
     const signing_scratch = try std.fs.path.join(allocator, &.{ work_dir, "signing" });
     defer allocator.free(signing_scratch);
     try uki_signing.prepareScratchDirectory(io, signing_scratch);
-    const config = uki_signing.Config{
-        .certificate_path = args.signing_certificate.?,
-        .expected_certificate_sha256 = try uki_signing.parseFingerprint(args.signing_certificate_sha256.?),
-        .mode = .{ .local_key = .{ .private_key_path = args.signing_key.? } },
-    };
     var certificate = try uki_signing.prepareCertificate(allocator, io, config, signing_scratch);
     defer certificate.deinit(allocator);
     const unsigned_bytes = try Dir.cwd().readFileAlloc(io, unsigned_uki, allocator, .limited(256 * 1024 * 1024));
@@ -914,7 +1035,7 @@ pub fn main(init: std.process.Init) !void {
         init.environ_map,
         0,
         @tagName(profile.architecture),
-        "server",
+        "full",
         unsigned_bytes,
     );
     defer signed.deinit(allocator);
@@ -947,6 +1068,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(final_lock);
     try validateExactLockRuntime(allocator, final_lock, profile);
     if (try peMachine(signed.bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
+    try writeSigningProvenance(allocator, io, provenance_dir, profile, config, &certificate, &signed);
 
     const provenance_path = try std.fs.path.join(allocator, &.{ provenance_dir, "ubuntu2604-build-provenance.json" });
     defer allocator.free(provenance_path);
@@ -1019,6 +1141,29 @@ test "arguments accept Ubuntu and project architecture spellings" {
     try std.testing.expectEqual(Architecture.x86_64, (try parseArgs(&.{ "--architecture", "amd64" })).architecture.?);
     try std.testing.expectEqual(Architecture.aarch64, (try parseArgs(&.{ "--architecture", "aarch64" })).architecture.?);
     try std.testing.expectError(error.ImageTooSmall, parseArgs(&.{ "--size", "4G" }));
+}
+
+test "UKI signing configuration supports local and external modes exclusively" {
+    const fingerprint = "1111111111111111111111111111111111111111111111111111111111111111";
+    const local = try signingConfig(.{
+        .signing_certificate = "release.crt",
+        .signing_certificate_sha256 = fingerprint,
+        .signing_key = "release.key",
+    });
+    try std.testing.expectEqualStrings("local-key", local.mode.name());
+    const external = try signingConfig(.{
+        .signing_certificate = "release.crt",
+        .signing_certificate_sha256 = fingerprint,
+        .signing_command = "/usr/local/bin/sign-uki",
+        .signing_command_arg = "sign",
+    });
+    try std.testing.expectEqualStrings("external-command", external.mode.name());
+    try std.testing.expectError(error.SigningModeRequired, signingConfig(.{
+        .signing_certificate = "release.crt",
+        .signing_certificate_sha256 = fingerprint,
+        .signing_key = "release.key",
+        .signing_command = "/usr/local/bin/sign-uki",
+    }));
 }
 
 test "signed source manifest contract rejects missing packages and foreign architecture" {
