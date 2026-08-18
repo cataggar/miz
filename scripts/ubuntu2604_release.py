@@ -70,6 +70,7 @@ RELEASE_TAG_RE = re.compile(r"^Ubuntu-26\.04-[0-9]{8}$")
 SNAPSHOT_ID_RE = re.compile(r"^release-[0-9]{8}(?:\.[0-9]+)?$")
 CANONICAL_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{40}$")
 DEBZ_API_COMMIT = "d5385857a44fca753af515e805af70be9f004183"
+DEBZ_PACKAGES = ("linux-azure", "walinuxagent")
 UBUNTU_PROVENANCE_FILENAME = "ubuntu2604-build-provenance.json"
 CANDIDATE_FIELDS = {
     "schema",
@@ -464,9 +465,7 @@ def validate_ubuntu_provenance(
         "sha256sums": "SHA256SUMS",
         "sha256sums_signature": "SHA256SUMS.gpg",
         "source_image": f"{prefix}.img",
-        "source_rootfs": f"{prefix}-root.tar.xz",
         "image_manifest": f"{prefix}.manifest",
-        "rootfs_manifest": f"{prefix}-root.manifest",
     }
     artifacts = document.get("artifacts")
     if not isinstance(artifacts, dict) or set(artifacts) != set(expected_artifacts):
@@ -490,16 +489,8 @@ def validate_ubuntu_provenance(
     require_bound_provenance_file(
         root, bindings["image_manifest"], "Ubuntu image manifest"
     )
-    require_bound_provenance_file(
-        root, bindings["rootfs_manifest"], "Ubuntu rootfs manifest"
-    )
     sums = parse_sha256sums(checksum_path)
-    for name in (
-        "source_image",
-        "source_rootfs",
-        "image_manifest",
-        "rootfs_manifest",
-    ):
+    for name in ("source_image", "image_manifest"):
         binding = bindings[name]
         if sums.get(binding["filename"]) != binding["sha256"]:
             fail(f"Ubuntu SHA256SUMS does not bind {binding['filename']}")
@@ -507,95 +498,127 @@ def validate_ubuntu_provenance(
     debz = document.get("debz")
     if not isinstance(debz, dict) or set(debz) != {
         "api_commit",
-        "exact_lock",
-        "transaction_provenance",
+        "transactions",
     }:
         fail("debz provenance binding is invalid")
     if debz.get("api_commit") != DEBZ_API_COMMIT:
         fail("debz API commit is not the embedded vmiz revision")
-    exact_lock_name = f"debz-exact-lock-{source_architecture}.json"
-    transaction_name = (
-        f"debz-transaction-provenance-{source_architecture}.json"
-    )
-    exact_lock = debz.get("exact_lock")
-    if not isinstance(exact_lock, dict) or set(exact_lock) != {
-        "filename",
-        "sha256",
-        "digest_sha256",
-    }:
-        fail("debz exact-lock binding is invalid")
-    exact_lock_binding = require_file_binding(
-        {
-            "filename": exact_lock.get("filename"),
-            "sha256": exact_lock.get("sha256"),
-        },
-        "debz exact lock",
-        expected_filename=exact_lock_name,
-    )
-    lock_digest = require_sha256(
-        exact_lock.get("digest_sha256"), "debz exact-lock semantic digest"
-    )
-    lock_path = require_bound_provenance_file(
-        root, exact_lock_binding, "debz exact lock"
-    )
-    lock_document = read_json(lock_path)
+    transactions = debz.get("transactions")
     if (
-        lock_document.get("schema")
-        != "https://debz.dev/schema/exact-closure-lock-v1"
-        or lock_document.get("version") != 1
-        or lock_document.get("target_architecture") != source_architecture
-        or lock_document.get("digest_sha256") != lock_digest
-        or not isinstance(lock_document.get("repositories"), list)
-        or not lock_document["repositories"]
-        or not isinstance(lock_document.get("packages"), list)
-        or not lock_document["packages"]
+        not isinstance(transactions, list)
+        or len(transactions) != len(DEBZ_PACKAGES)
+        or [item.get("package") for item in transactions if isinstance(item, dict)]
+        != list(DEBZ_PACKAGES)
     ):
-        fail("debz exact lock does not satisfy the Ubuntu release contract")
+        fail("debz transaction set is not exact or stably ordered")
+    for item, package in zip(transactions, DEBZ_PACKAGES, strict=True):
+        if not isinstance(item, dict) or set(item) != {
+            "package",
+            "exact_lock",
+            "transaction_provenance",
+        }:
+            fail(f"{package}: debz transaction binding is invalid")
+        exact_lock = item.get("exact_lock")
+        if not isinstance(exact_lock, dict) or set(exact_lock) != {
+            "filename",
+            "sha256",
+            "digest_sha256",
+        }:
+            fail(f"{package}: debz exact-lock binding is invalid")
+        exact_lock_binding = require_file_binding(
+            {
+                "filename": exact_lock.get("filename"),
+                "sha256": exact_lock.get("sha256"),
+            },
+            f"{package} debz exact lock",
+            expected_filename=(
+                f"debz-exact-lock-{package}-{source_architecture}.json"
+            ),
+        )
+        lock_digest = require_sha256(
+            exact_lock.get("digest_sha256"),
+            f"{package} debz exact-lock semantic digest",
+        )
+        lock_path = require_bound_provenance_file(
+            root, exact_lock_binding, f"{package} debz exact lock"
+        )
+        lock_document = read_json(lock_path)
+        lock_packages = lock_document.get("packages")
+        if (
+            lock_document.get("schema")
+            != "https://debz.dev/schema/exact-closure-lock-v1"
+            or lock_document.get("version") != 1
+            or lock_document.get("target_architecture") != source_architecture
+            or lock_document.get("digest_sha256") != lock_digest
+            or not isinstance(lock_document.get("repositories"), list)
+            or not lock_document["repositories"]
+            or not isinstance(lock_packages, list)
+            or not any(
+                isinstance(entry, dict) and entry.get("name") == package
+                for entry in lock_packages
+            )
+        ):
+            fail(
+                f"{package}: debz exact lock does not satisfy the Ubuntu "
+                "release contract"
+            )
 
-    transaction = debz.get("transaction_provenance")
-    if not isinstance(transaction, dict) or set(transaction) != {
-        "filename",
-        "sha256",
-        "digest_sha256",
-        "lock_sha256",
-    }:
-        fail("debz transaction provenance binding is invalid")
-    transaction_binding = require_file_binding(
-        {
-            "filename": transaction.get("filename"),
-            "sha256": transaction.get("sha256"),
-        },
-        "debz transaction provenance",
-        expected_filename=transaction_name,
-    )
-    transaction_digest = require_sha256(
-        transaction.get("digest_sha256"),
-        "debz transaction provenance semantic digest",
-    )
-    transaction_lock = require_sha256(
-        transaction.get("lock_sha256"),
-        "debz transaction provenance lock digest",
-    )
-    if transaction_lock != lock_digest:
-        fail("debz transaction provenance is not bound to the exact lock")
-    transaction_path = require_bound_provenance_file(
-        root, transaction_binding, "debz transaction provenance"
-    )
-    transaction_document = read_json(transaction_path)
-    final_verification = transaction_document.get("final_verification")
-    if (
-        transaction_document.get("schema")
-        != "https://debz.dev/schema/transaction-result-v1"
-        or transaction_document.get("version") != 1
-        or transaction_document.get("target_architecture")
-        != source_architecture
-        or transaction_document.get("lock_sha256") != lock_digest
-        or transaction_document.get("digest_sha256") != transaction_digest
-        or transaction_document.get("outcome") != "succeeded"
-        or not isinstance(final_verification, dict)
-        or final_verification.get("status") != "exact_match"
-    ):
-        fail("debz transaction provenance does not prove an exact transaction")
+        transaction = item.get("transaction_provenance")
+        if not isinstance(transaction, dict) or set(transaction) != {
+            "filename",
+            "sha256",
+            "digest_sha256",
+            "lock_sha256",
+        }:
+            fail(f"{package}: debz transaction provenance binding is invalid")
+        transaction_binding = require_file_binding(
+            {
+                "filename": transaction.get("filename"),
+                "sha256": transaction.get("sha256"),
+            },
+            f"{package} debz transaction provenance",
+            expected_filename=(
+                "debz-transaction-provenance-"
+                f"{package}-{source_architecture}.json"
+            ),
+        )
+        transaction_digest = require_sha256(
+            transaction.get("digest_sha256"),
+            f"{package} debz transaction provenance semantic digest",
+        )
+        transaction_lock = require_sha256(
+            transaction.get("lock_sha256"),
+            f"{package} debz transaction provenance lock digest",
+        )
+        if transaction_lock != lock_digest:
+            fail(
+                f"{package}: debz transaction provenance is not bound to "
+                "the exact lock"
+            )
+        transaction_path = require_bound_provenance_file(
+            root,
+            transaction_binding,
+            f"{package} debz transaction provenance",
+        )
+        transaction_document = read_json(transaction_path)
+        final_verification = transaction_document.get("final_verification")
+        if (
+            transaction_document.get("schema")
+            != "https://debz.dev/schema/transaction-result-v1"
+            or transaction_document.get("version") != 1
+            or transaction_document.get("target_architecture")
+            != source_architecture
+            or transaction_document.get("lock_sha256") != lock_digest
+            or transaction_document.get("digest_sha256")
+            != transaction_digest
+            or transaction_document.get("outcome") != "succeeded"
+            or not isinstance(final_verification, dict)
+            or final_verification.get("status") != "exact_match"
+        ):
+            fail(
+                f"{package}: debz transaction provenance does not prove "
+                "an exact transaction"
+            )
     return document
 
 

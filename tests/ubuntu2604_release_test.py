@@ -87,15 +87,12 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         prefix = f"ubuntu-26.04-server-cloudimg-{source_architecture}"
         artifact_digests = {
             "source_image": "5" * 64,
-            "source_rootfs": "6" * 64,
         }
         artifact_filenames = {
             "source_image": f"{prefix}.img",
-            "source_rootfs": f"{prefix}-root.tar.xz",
             "image_manifest": f"{prefix}.manifest",
-            "rootfs_manifest": f"{prefix}-root.manifest",
         }
-        for name in ("image_manifest", "rootfs_manifest"):
+        for name in ("image_manifest",):
             path = provenance / artifact_filenames[name]
             path.write_text(f"{name} for {key}\n", encoding="utf-8")
             artifact_digests[name] = release.sha256(path)
@@ -108,52 +105,80 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         signature_path = provenance / "SHA256SUMS.gpg"
         signature_path.write_bytes(b"detached signature")
 
-        lock_digest = "7" * 64
-        lock_path = provenance / f"debz-exact-lock-{source_architecture}.json"
-        lock_path.write_text(
-            json.dumps(
+        debz_transactions = []
+        for index, package in enumerate(release.DEBZ_PACKAGES):
+            lock_digest = str(7 + index) * 64
+            lock_path = (
+                provenance
+                / f"debz-exact-lock-{package}-{source_architecture}.json"
+            )
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "schema": (
+                            "https://debz.dev/schema/exact-closure-lock-v1"
+                        ),
+                        "version": 1,
+                        "target_architecture": source_architecture,
+                        "request_sha256": "1" * 64,
+                        "policy_sha256": "2" * 64,
+                        "repositories": [{"fixture": True}],
+                        "packages": [{"name": package}],
+                        "digest_sha256": lock_digest,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            transaction_digest = chr(ord("a") + index) * 64
+            transaction_path = (
+                provenance
+                / (
+                    "debz-transaction-provenance-"
+                    f"{package}-{source_architecture}.json"
+                )
+            )
+            transaction_path.write_text(
+                json.dumps(
+                    {
+                        "schema": (
+                            "https://debz.dev/schema/transaction-result-v1"
+                        ),
+                        "version": 1,
+                        "target_architecture": source_architecture,
+                        "lock_sha256": lock_digest,
+                        "outcome": "succeeded",
+                        "final_verification": {"status": "exact_match"},
+                        "digest_sha256": transaction_digest,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            debz_transactions.append(
                 {
-                    "schema": "https://debz.dev/schema/exact-closure-lock-v1",
-                    "version": 1,
-                    "target_architecture": source_architecture,
-                    "request_sha256": "8" * 64,
-                    "policy_sha256": "9" * 64,
-                    "repositories": [{"fixture": True}],
-                    "packages": [{"fixture": True}],
-                    "digest_sha256": lock_digest,
+                    "package": package,
+                    "exact_lock": {
+                        "filename": lock_path.name,
+                        "sha256": release.sha256(lock_path),
+                        "digest_sha256": lock_digest,
+                    },
+                    "transaction_provenance": {
+                        "filename": transaction_path.name,
+                        "sha256": release.sha256(transaction_path),
+                        "digest_sha256": transaction_digest,
+                        "lock_sha256": lock_digest,
+                    },
                 }
-            ),
-            encoding="utf-8",
-        )
-        transaction_digest = "a" * 64
-        transaction_path = (
-            provenance
-            / f"debz-transaction-provenance-{source_architecture}.json"
-        )
-        transaction_path.write_text(
-            json.dumps(
-                {
-                    "schema": "https://debz.dev/schema/transaction-result-v1",
-                    "version": 1,
-                    "target_architecture": source_architecture,
-                    "lock_sha256": lock_digest,
-                    "outcome": "succeeded",
-                    "final_verification": {"status": "exact_match"},
-                    "digest_sha256": transaction_digest,
-                }
-            ),
-            encoding="utf-8",
-        )
+            )
         provenance_document = {
             "schema": 1,
             "type": "vmiz-ubuntu2604-build-provenance",
             "architecture": architecture,
             "release": "26.04",
             "snapshot": {
-                "id": "release-20260818",
+                "id": "release-20260731",
                 "base_url": (
                     "https://cloud-images.ubuntu.com/releases/"
-                    "26.04/release-20260818/"
+                    "26.04/release-20260731/"
                 ),
             },
             "canonical_key_fingerprint": "c" * 40,
@@ -177,17 +202,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             },
             "debz": {
                 "api_commit": release.DEBZ_API_COMMIT,
-                "exact_lock": {
-                    "filename": lock_path.name,
-                    "sha256": release.sha256(lock_path),
-                    "digest_sha256": lock_digest,
-                },
-                "transaction_provenance": {
-                    "filename": transaction_path.name,
-                    "sha256": release.sha256(transaction_path),
-                    "digest_sha256": transaction_digest,
-                    "lock_sha256": lock_digest,
-                },
+                "transactions": debz_transactions,
             },
         }
         (provenance / release.UBUNTU_PROVENANCE_FILENAME).write_text(
@@ -520,7 +535,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             lambda value: value.__setitem__(
                 "sha256sums_signature_verified", False
             ),
-            lambda value: value["artifacts"].pop("source_rootfs"),
+            lambda value: value["artifacts"].pop("source_image"),
         )
         for index, mutate in enumerate(mutations):
             with self.subTest(index=index):
@@ -561,9 +576,20 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         metadata = root / release.UBUNTU_PROVENANCE_FILENAME
         self.rewrite(
             metadata,
-            lambda value: value["debz"]["transaction_provenance"].__setitem__(
-                "lock_sha256", "0" * 64
-            ),
+            lambda value: value["debz"]["transactions"][0][
+                "transaction_provenance"
+            ].__setitem__("lock_sha256", "0" * 64),
+        )
+        with self.assertRaises(SystemExit):
+            release.validate_ubuntu_provenance(root, "x86_64")
+
+    def test_ubuntu_provenance_requires_two_stably_ordered_debz_transactions(self):
+        self.make_bundle("x86_64-full")
+        root = self.candidates / "x86_64-full" / "internal-provenance"
+        metadata = root / release.UBUNTU_PROVENANCE_FILENAME
+        self.rewrite(
+            metadata,
+            lambda value: value["debz"]["transactions"].reverse(),
         )
         with self.assertRaises(SystemExit):
             release.validate_ubuntu_provenance(root, "x86_64")
