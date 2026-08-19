@@ -203,6 +203,7 @@ jobs:
             tar xorriso xz-utils zstd
           )
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
+          sudo chmod 0644 /boot/vmlinuz-*
           for tool in curl guestfish gpg qemu-img sbverify tar ukify virt-cat \
             virt-copy-in virt-copy-out virt-customize virt-filesystems virt-ls \
             virt-resize virt-tar-in xorriso; do
