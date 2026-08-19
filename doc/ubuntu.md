@@ -104,7 +104,7 @@ sudo chmod 0666 /dev/kvm
 
 The permission adjustment lets the unprivileged libguestfs `supermin` process
 read the appliance kernel installed by `linux-image-generic` and use native KVM
-acceleration.
+acceleration when `/dev/kvm` is available.
 
 Run a source-pin preflight (requiring only `curl` and `gpg`) with:
 
