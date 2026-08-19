@@ -1019,6 +1019,10 @@ pub fn main(init: std.process.Init) !void {
 
     const mutable = try std.fs.path.join(allocator, &.{ work_dir, "customized.qcow2" });
     defer allocator.free(mutable);
+    const destination_root = switch (profile.architecture) {
+        .x86_64 => "/dev/sda4",
+        .aarch64 => "/dev/sda3",
+    };
     const size_text = try std.fmt.allocPrint(allocator, "{d}", .{args.size});
     defer allocator.free(size_text);
     Dir.cwd().deleteFile(io, mutable) catch {};
@@ -1026,7 +1030,7 @@ pub fn main(init: std.process.Init) !void {
     if (profile.architecture == .aarch64) {
         try run(allocator, io, &.{ "virt-resize", "--expand", "/dev/sda1", "--no-expand-content", source_path, mutable });
         try run(allocator, io, &.{
-            "guestfish", "--rw", "-a", mutable, "run", ":", "e2fsck-f", "/dev/sda1", ":", "resize2fs", "/dev/sda1",
+            "guestfish", "--rw", "-a", mutable, "run", ":", "e2fsck-f", destination_root, ":", "resize2fs", destination_root,
         });
     } else {
         try run(allocator, io, &.{ "virt-resize", "--expand", "/dev/sda1", source_path, mutable });
@@ -1047,10 +1051,10 @@ pub fn main(init: std.process.Init) !void {
     const guestfish_commands = try std.fmt.allocPrint(allocator,
         \\add-drive-opts {s} format:qcow2
         \\run
-        \\mount /dev/sda1 /
+        \\mount {s} /
         \\rm-rf /
         \\
-    , .{mutable});
+    , .{ mutable, destination_root });
     defer allocator.free(guestfish_commands);
     try Dir.cwd().writeFile(io, .{ .sub_path = guestfish_script, .data = guestfish_commands });
     try run(allocator, io, &.{ "guestfish", "-f", guestfish_script });
@@ -1143,8 +1147,8 @@ pub fn main(init: std.process.Init) !void {
     try validateQcow2Info(allocator, info, args.size);
     const partitions = try capture(allocator, io, &.{ "virt-filesystems", "--partitions", "-a", output });
     defer allocator.free(partitions);
-    if (std.mem.indexOf(u8, partitions, "/dev/sda1") == null or
-        std.mem.indexOf(u8, partitions, "/dev/sda15") == null) return error.InvalidGen2PartitionLayout;
+    if (std.mem.indexOf(u8, partitions, destination_root) == null)
+        return error.InvalidGen2PartitionLayout;
     const fallback_listing = try capture(allocator, io, &.{ "virt-ls", "-a", output, "/boot/efi/EFI/BOOT" });
     defer allocator.free(fallback_listing);
     if (std.mem.indexOf(u8, fallback_listing, profile.efi_fallback) == null) return error.FinalUkiMissing;

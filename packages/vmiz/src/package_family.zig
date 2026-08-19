@@ -160,8 +160,8 @@ pub fn execute(
     backends: BackendSet,
     request: Request,
 ) !Result {
-    if (!valid(request))
-        return failed(.invalid_request, "invalid explicit package-family request", .disposable, null);
+    if (invalidRequestMessage(request)) |message|
+        return failed(.invalid_request, message, .disposable, null);
     if (request.family == .rpm) {
         const backend = switch (request.rpm_backend) {
             .rpmz => backends.rpmz orelse
@@ -369,40 +369,63 @@ fn contains(values: []const []const u8, expected: []const u8) bool {
 }
 
 fn valid(request: Request) bool {
-    if (!std.mem.eql(u8, request.schema, request_schema) or request.version != api_version) return false;
+    return invalidRequestMessage(request) == null;
+}
+
+fn invalidRequestMessage(request: Request) ?[]const u8 {
+    if (!std.mem.eql(u8, request.schema, request_schema) or request.version != api_version)
+        return "invalid package-family schema";
     if (!absolute(request.inputs.root_stage) or !absolute(request.inputs.published_root) or
-        !absolute(request.inputs.cache_path) or !absolute(request.inputs.state_path)) return false;
-    if (std.mem.eql(u8, request.inputs.root_stage, request.inputs.published_root)) return false;
+        !absolute(request.inputs.cache_path) or !absolute(request.inputs.state_path))
+        return "package-family paths must be normalized absolute paths";
+    if (std.mem.eql(u8, request.inputs.root_stage, request.inputs.published_root))
+        return "package-family staging and publication paths must differ";
     if (pathContains(request.inputs.root_stage, request.inputs.published_root) or
-        pathContains(request.inputs.published_root, request.inputs.root_stage)) return false;
+        pathContains(request.inputs.published_root, request.inputs.root_stage))
+        return "package-family staging and publication paths must not contain each other";
     if (overlaps(request.inputs.root_stage, request.inputs.cache_path) or
-        overlaps(request.inputs.root_stage, request.inputs.state_path)) return false;
-    if (request.family == .rpm) return validRpm(request);
+        overlaps(request.inputs.root_stage, request.inputs.state_path))
+        return "package-family staging must not overlap cache or state";
+    if (request.family == .rpm) return if (validRpm(request)) null else "invalid rpm package-family request";
     if ((request.inputs.source_paths.len == 0 and request.inputs.config_paths.len == 0) or
-        request.inputs.keyring_paths.len == 0) return false;
+        request.inputs.keyring_paths.len == 0)
+        return "debian package-family sources and keyrings are required";
     for (request.inputs.source_paths) |path|
-        if (!absolute(path) or overlaps(request.inputs.root_stage, path)) return false;
+        if (!absolute(path) or overlaps(request.inputs.root_stage, path))
+            return "debian source paths must be absolute and outside staging";
     for (request.inputs.config_paths) |path|
-        if (!absolute(path) or overlaps(request.inputs.root_stage, path)) return false;
+        if (!absolute(path) or overlaps(request.inputs.root_stage, path))
+            return "debian config paths must be absolute and outside staging";
     for (request.inputs.keyring_paths) |path|
-        if (!absolute(path) or overlaps(request.inputs.root_stage, path)) return false;
+        if (!absolute(path) or overlaps(request.inputs.root_stage, path))
+            return "debian keyring paths must be absolute and outside staging";
     for (request.inputs.foreign_architectures) |architecture|
-        if (architecture == request.inputs.architecture) return false;
+        if (architecture == request.inputs.architecture)
+            return "foreign architecture must differ from target architecture";
     if ((request.operation == .resolve_lock or request.operation == .create or request.operation == .customize) and
-        request.packages.len == 0) return false;
-    if ((request.operation == .recover or request.operation == .inspect) and request.packages.len != 0) return false;
+        request.packages.len == 0)
+        return "package-family operation requires a package";
+    if ((request.operation == .recover or request.operation == .inspect) and request.packages.len != 0)
+        return "package-family operation does not accept packages";
     if (request.operation == .resolve_lock) {
-        if (request.inputs.lock_input_path != null or request.inputs.lock_output_path == null) return false;
-    } else if (request.operation != .inspect and request.inputs.lock_input_path == null) return false;
+        if (request.inputs.lock_input_path != null or request.inputs.lock_output_path == null)
+            return "resolve-lock requires only a lock output path";
+    } else if (request.operation != .inspect and request.inputs.lock_input_path == null)
+        return "package-family mutation requires a lock input path";
     if (request.inputs.lock_output_path != null and request.inputs.lock_input_path == null and
-        request.operation != .resolve_lock) return false;
+        request.operation != .resolve_lock)
+        return "lock output requires a lock input outside resolve-lock";
     if (request.inputs.lock_input_path) |path|
-        if (!absolute(path) or overlaps(request.inputs.root_stage, path)) return false;
+        if (!absolute(path) or overlaps(request.inputs.root_stage, path))
+            return "lock input must be absolute and outside staging";
     if (request.inputs.lock_output_path) |path|
-        if (!absolute(path) or overlaps(request.inputs.root_stage, path)) return false;
+        if (!absolute(path) or overlaps(request.inputs.root_stage, path))
+            return "lock output must be absolute and outside staging";
     if (request.inputs.credential_reference) |path|
-        if (!absolute(path) or overlaps(request.inputs.root_stage, path)) return false;
-    return request.inputs.deadline_ms != 0;
+        if (!absolute(path) or overlaps(request.inputs.root_stage, path))
+            return "credential reference must be absolute and outside staging";
+    if (request.inputs.deadline_ms == 0) return "package-family deadline must be nonzero";
+    return null;
 }
 
 fn validRpm(request: Request) bool {
