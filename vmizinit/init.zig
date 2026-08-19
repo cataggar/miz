@@ -293,14 +293,10 @@ const BootConfig = struct {
 };
 
 fn parseBootConfig(cmdline: []const u8) BootConfig {
-    const mode_prefix = "vmizinit.mode=";
-    const azure_prefix = "vmizinit.azure=";
-    const shell_prefix = "vmizinit.shell=";
     var config: BootConfig = .{};
     var tokens = std.mem.tokenizeAny(u8, cmdline, " \t\r\n");
     while (tokens.next()) |token| {
-        if (std.mem.startsWith(u8, token, mode_prefix)) {
-            const value = token[mode_prefix.len..];
+        if (bootOptionValue(token, "vmizinit.mode=", "zvminit.mode=")) |value| {
             if (std.mem.eql(u8, value, "persistent")) {
                 config.mode = .persistent;
                 config.invalid_mode = null;
@@ -311,8 +307,7 @@ fn parseBootConfig(cmdline: []const u8) BootConfig {
                 config.mode = .immutable;
                 config.invalid_mode = value;
             }
-        } else if (std.mem.startsWith(u8, token, azure_prefix)) {
-            const value = token[azure_prefix.len..];
+        } else if (bootOptionValue(token, "vmizinit.azure=", "zvminit.azure=")) |value| {
             if (std.mem.eql(u8, value, "auto")) {
                 config.azure_policy = .auto;
                 config.invalid_azure_policy = null;
@@ -326,8 +321,7 @@ fn parseBootConfig(cmdline: []const u8) BootConfig {
                 config.azure_policy = .auto;
                 config.invalid_azure_policy = value;
             }
-        } else if (std.mem.startsWith(u8, token, shell_prefix)) {
-            const value = token[shell_prefix.len..];
+        } else if (bootOptionValue(token, "vmizinit.shell=", "zvminit.shell=")) |value| {
             if (std.mem.eql(u8, value, "on")) {
                 config.shell_enabled = true;
                 config.invalid_shell = null;
@@ -341,6 +335,12 @@ fn parseBootConfig(cmdline: []const u8) BootConfig {
         }
     }
     return config;
+}
+
+fn bootOptionValue(token: []const u8, current_prefix: []const u8, legacy_prefix: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, token, current_prefix)) return token[current_prefix.len..];
+    if (std.mem.startsWith(u8, token, legacy_prefix)) return token[legacy_prefix.len..];
+    return null;
 }
 
 fn readBootConfig() BootConfig {
@@ -1303,6 +1303,7 @@ const sshd_path = "/usr/sbin/sshd";
 /// installs this path instead, and vmizinit runs it *in place of* sshd rather
 /// than alongside it. An image that does not ship it is unaffected.
 const access_provider_path = "/usr/local/sbin/vmizinit-access";
+const legacy_access_provider_path = "/usr/local/sbin/zvminit-access";
 const provisioning_retry_seconds: u32 = 5;
 const access_max_backoff_seconds: u32 = 30;
 
@@ -1312,25 +1313,33 @@ const AccessProvider = enum {
     sshd,
     /// `/usr/local/sbin/vmizinit-access`, supplied by the image.
     override,
+    /// Compatibility path used by images built before the vmiz rename.
+    legacy_override,
 
     fn path(provider: AccessProvider) [*:0]const u8 {
         return switch (provider) {
             .sshd => sshd_path,
             .override => access_provider_path,
+            .legacy_override => legacy_access_provider_path,
         };
     }
 };
 
 /// The decision itself, separated from the probe so it can be tested on a
 /// build host: `linux.access` is a raw Linux syscall and means nothing here.
-fn accessProviderFor(override_present: bool) AccessProvider {
-    return if (override_present) .override else .sshd;
+fn accessProviderFor(override_present: bool, legacy_override_present: bool) AccessProvider {
+    if (override_present) return .override;
+    if (legacy_override_present) return .legacy_override;
+    return .sshd;
 }
 
 /// Resolved once per supervisor pass rather than cached, so an image that
 /// installs the override during provisioning is picked up without a reboot.
 fn selectAccessProvider() AccessProvider {
-    return accessProviderFor(linux.errno(linux.access(access_provider_path, linux.F_OK)) == .SUCCESS);
+    return accessProviderFor(
+        linux.errno(linux.access(access_provider_path, linux.F_OK)) == .SUCCESS,
+        linux.errno(linux.access(legacy_access_provider_path, linux.F_OK)) == .SUCCESS,
+    );
 }
 
 const AzagentLaunchMode = enum {
@@ -1379,6 +1388,7 @@ fn spawnAccessProvider(provider: AccessProvider) ?linux.pid_t {
             writeStr("[vmizinit] starting supervised sshd -D -e\r\n");
         },
         .override => writeStr("[vmizinit] starting supervised " ++ access_provider_path ++ "\r\n"),
+        .legacy_override => writeStr("[vmizinit] starting supervised " ++ legacy_access_provider_path ++ "\r\n"),
     }
     const pid = forkProcess("[vmizinit] fork() for the access provider failed") orelse return null;
     if (pid == 0) {
@@ -1392,11 +1402,11 @@ fn spawnAccessProvider(provider: AccessProvider) ?linux.pid_t {
                 const argv = [_:null]?[*:0]const u8{ sshd_path, "-D", "-e", null };
                 _ = linux.execve(sshd_path, &argv, &envp);
             },
-            .override => {
+            .override, .legacy_override => {
                 // No arguments: everything the provider needs comes from the
                 // image, so its configuration surface stays out of PID 1.
-                const argv = [_:null]?[*:0]const u8{ access_provider_path, null };
-                _ = linux.execve(access_provider_path, &argv, &envp);
+                const argv = [_:null]?[*:0]const u8{ path, null };
+                _ = linux.execve(path, &argv, &envp);
             },
         }
         writeStr("[vmizinit] execve(access provider) failed\r\n");
@@ -1740,7 +1750,7 @@ fn shouldStartAccessProvider(
     if (!services_allowed or access_pid != 0 or retry != 0) return false;
     return switch (provider) {
         .sshd => provisioned,
-        .override => true,
+        .override, .legacy_override => true,
     };
 }
 
@@ -1887,6 +1897,13 @@ test "parseBootConfig accepts boot modes Azure policies and explicit shell setti
     try std.testing.expect(!immutable.shell_enabled);
 }
 
+test "parseBootConfig accepts legacy zvminit option names" {
+    const config = parseBootConfig("zvminit.mode=persistent zvminit.azure=on zvminit.shell=on");
+    try std.testing.expectEqual(BootMode.persistent, config.mode);
+    try std.testing.expectEqual(AzurePolicy.on, config.azure_policy);
+    try std.testing.expect(config.shell_enabled);
+}
+
 test "parseBootConfig uses the last value for each setting" {
     const config = parseBootConfig("vmizinit.mode=persistent vmizinit.azure=off vmizinit.shell=on vmizinit.mode=immutable vmizinit.azure=auto vmizinit.shell=off");
     try std.testing.expectEqual(BootMode.immutable, config.mode);
@@ -1963,6 +1980,7 @@ test "a replacement access provider starts without waiting for provisioning" {
     // stalled provisioner remove the machine's last way in.
     try std.testing.expect(shouldStartAccessProvider(.override, true, false, 0, 0));
     try std.testing.expect(shouldStartAccessProvider(.override, true, true, 0, 0));
+    try std.testing.expect(shouldStartAccessProvider(.legacy_override, true, false, 0, 0));
 
     // Everything else still gates it identically to sshd.
     try std.testing.expect(!shouldStartAccessProvider(.override, false, true, 0, 0));
@@ -1976,6 +1994,7 @@ test "each access provider runs its own binary" {
     // supervisable at all.
     try std.testing.expectEqualStrings(sshd_path, std.mem.span(AccessProvider.path(.sshd)));
     try std.testing.expectEqualStrings(access_provider_path, std.mem.span(AccessProvider.path(.override)));
+    try std.testing.expectEqualStrings(legacy_access_provider_path, std.mem.span(AccessProvider.path(.legacy_override)));
     try std.testing.expect(!std.mem.eql(u8, sshd_path, access_provider_path));
 }
 
@@ -1983,8 +2002,9 @@ test "an image with no override resolves to the default provider" {
     // The whole compatibility promise of this seam: an image that ships no
     // /usr/local/sbin/vmizinit-access behaves exactly as it did before it
     // existed, on every architecture.
-    try std.testing.expectEqual(AccessProvider.sshd, accessProviderFor(false));
-    try std.testing.expectEqual(AccessProvider.override, accessProviderFor(true));
+    try std.testing.expectEqual(AccessProvider.sshd, accessProviderFor(false, false));
+    try std.testing.expectEqual(AccessProvider.override, accessProviderFor(true, true));
+    try std.testing.expectEqual(AccessProvider.legacy_override, accessProviderFor(false, true));
 }
 
 test "azagent launch selects skip-ready only for explicit local media" {
