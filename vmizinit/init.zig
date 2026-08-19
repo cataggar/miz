@@ -687,10 +687,11 @@ fn mountEtcOverlay() void {
 // used to drop /lib/modules entirely, and even after that's fixed, something
 // still has to actually call insmod. Since the exact drivers this appliance
 // needs are known ahead of time (Hyper-V networking, overlayfs for immutable
-// mode, and the provisioning DVD's UDF/ISO9660 filesystems), loading them in
-// dependency order with a raw init_module() syscall is simpler and more
-// self-contained than shipping kmod: no MODALIAS matching and no extra
-// shared-library dependencies (liblzma/libzstd/libcrypto) added to the image.
+// mode, XFS for the Azure resource disk, and the provisioning DVD's
+// UDF/ISO9660 filesystems), loading them in dependency order with a raw
+// init_module() syscall is simpler and more self-contained than shipping
+// kmod: no MODALIAS matching and no extra shared-library dependencies
+// (liblzma/libzstd/libcrypto) added to the image.
 
 const max_module_file_size: usize = 4 * 1024 * 1024;
 
@@ -767,6 +768,7 @@ fn loadBootModules(mode: BootMode) void {
         loadModuleAt(gpa, release, "kernel/fs/overlayfs/overlay.ko.xz");
     }
     loadModuleAt(gpa, release, "kernel/drivers/net/hyperv/hv_netvsc.ko.xz");
+    loadModuleAt(gpa, release, "kernel/fs/xfs/xfs.ko.xz");
     loadModuleAt(gpa, release, "kernel/lib/crc/crc-itu-t.ko.xz");
     loadModuleAt(gpa, release, "kernel/fs/udf/udf.ko.xz");
     loadModuleAt(gpa, release, "kernel/fs/isofs/isofs.ko.xz");
