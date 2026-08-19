@@ -549,6 +549,61 @@ fn requireJsonSha256Field(
     return artifact_pipeline.formatSha256(try artifact_pipeline.parseSha256(value.string));
 }
 
+fn extractGuestRoot(
+    io: Io,
+    mutable_image: []const u8,
+    extraction: []const u8,
+) !void {
+    var archive = try std.process.spawn(io, .{
+        .argv = &.{ "virt-tar-out", "-a", mutable_image, "/", "-" },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .inherit,
+    });
+    defer archive.kill(io);
+
+    var extract = try std.process.spawn(io, .{
+        .argv = &.{
+            "tar",
+            "--extract",
+            "--file=-",
+            "--directory",
+            extraction,
+            "--exclude=./dev/*",
+            "--exclude=./proc/*",
+            "--exclude=./run/*",
+            "--exclude=./sys/*",
+        },
+        .stdin = .pipe,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer extract.kill(io);
+
+    var archive_buffer: [64 * 1024]u8 = undefined;
+    var archive_reader = archive.stdout.?.readerStreaming(io, &archive_buffer);
+    var extract_buffer: [64 * 1024]u8 = undefined;
+    var extract_writer = extract.stdin.?.writerStreaming(io, &extract_buffer);
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const count = try archive_reader.interface.readSliceShort(&buffer);
+        if (count == 0) break;
+        try extract_writer.interface.writeAll(buffer[0..count]);
+    }
+    try extract_writer.interface.flush();
+    extract.stdin.?.close(io);
+    extract.stdin = null;
+
+    switch (try archive.wait(io)) {
+        .exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
+    switch (try extract.wait(io)) {
+        .exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
+}
+
 fn customizeRootWithDebz(
     allocator: Allocator,
     io: Io,
@@ -561,7 +616,7 @@ fn customizeRootWithDebz(
     defer allocator.free(extraction);
     try Dir.cwd().deleteTree(io, extraction);
     try Dir.cwd().createDirPath(io, extraction);
-    try run(allocator, io, &.{ "virt-copy-out", "-a", mutable_image, "/", extraction });
+    try extractGuestRoot(io, mutable_image, extraction);
 
     const direct_etc = try std.fs.path.join(allocator, &.{ extraction, "etc" });
     defer allocator.free(direct_etc);
@@ -576,6 +631,12 @@ fn customizeRootWithDebz(
     else |_|
         return error.OfficialRootExtractionFailed;
     errdefer allocator.free(current);
+
+    for (&[_][]const u8{ "dev", "proc", "run", "sys" }) |name| {
+        const mountpoint = try std.fs.path.join(allocator, &.{ current, name });
+        defer allocator.free(mountpoint);
+        try Dir.cwd().createDirPath(io, mountpoint);
+    }
 
     const trusted_keyring = try std.fs.path.join(allocator, &.{ current, "usr/share/keyrings/ubuntu-archive-keyring.gpg" });
     defer allocator.free(trusted_keyring);
@@ -934,7 +995,7 @@ pub fn main(init: std.process.Init) !void {
         return error.ChecksumMismatch;
     if (args.preflight_only) return;
 
-    for (&[_][]const u8{ "qemu-img", "virt-resize", "virt-customize", "virt-copy-out", "virt-copy-in", "virt-cat", "virt-ls", "virt-filesystems", "virt-tar-in", "guestfish", "tar", "cp", "ukify", "sbverify" }) |tool|
+    for (&[_][]const u8{ "qemu-img", "virt-resize", "virt-customize", "virt-copy-in", "virt-cat", "virt-ls", "virt-filesystems", "virt-tar-in", "virt-tar-out", "guestfish", "tar", "cp", "ukify", "sbverify" }) |tool|
         try requireTool(allocator, io, tool);
     const config = try signingConfig(args);
 

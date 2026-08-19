@@ -68,7 +68,10 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
             'sudo apt-get install -y --no-install-recommends "${packages[@]}"'
         )
         kernel_access = install.index("sudo chmod 0644 /boot/vmlinuz-*")
+        kvm_access = install.index("sudo chmod 0666 /dev/kvm")
         self.assertLess(apt_install, kernel_access)
+        self.assertLess(kernel_access, kvm_access)
+        self.assertIn("virt-tar-out", install)
 
     def test_build_log_pipeline_prepares_work_dir_and_propagates_failures(self) -> None:
         build = self.source.split(
