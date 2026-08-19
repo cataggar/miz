@@ -203,6 +203,11 @@ pub fn execute(
     if (!backend_result.succeeded) {
         const disposition: FailureDisposition = if (backend_result.diagnostic != null and
             backend_result.diagnostic.?.recoverable) .recoverable else .disposable;
+        if (backend_result.diagnostic) |diagnostic| {
+            const message = try debz.transaction_provenance.redactAlloc(allocator, diagnostic.message);
+            defer allocator.free(message);
+            std.debug.print("embedded debz backend {s}: {s}\n", .{ @tagName(diagnostic.id), message });
+        }
         if (disposition == .disposable) cleanup(io, request);
         return failed(
             .backend_failed,

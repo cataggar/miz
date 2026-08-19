@@ -531,7 +531,15 @@ const DebzCustomization = struct {
 };
 
 fn requireSucceeded(result: package_family.Result) !void {
-    if (!result.succeeded or result.diagnostic != null) return error.DebzTransactionFailed;
+    if (!result.succeeded or result.diagnostic != null) {
+        if (result.diagnostic) |diagnostic| {
+            std.debug.print("debz {s}: {s}", .{ @tagName(diagnostic.id), diagnostic.message });
+            if (diagnostic.backend_exit_status) |status|
+                std.debug.print(" (exit status {d})", .{status});
+            std.debug.print("\n", .{});
+        }
+        return error.DebzTransactionFailed;
+    }
 }
 
 fn requireJsonSha256Field(

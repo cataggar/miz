@@ -72,6 +72,17 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         self.assertLess(apt_install, kernel_access)
         self.assertLess(kernel_access, kvm_access)
         self.assertIn("virt-tar-out", install)
+        self.assertIn("if [[ -e /dev/kvm ]]", install)
+
+    def test_arm_builder_enables_actionable_libguestfs_traces(self) -> None:
+        build = self.source.split(
+            "- name: Build exact finalized Ubuntu QCOW2", 1
+        )[1].split(
+            "- name: Validate standalone zstd QCOW2 and exact 5 GiB size", 1
+        )[0]
+        self.assertIn('if [[ "$ARCHITECTURE" == aarch64 ]]', build)
+        self.assertIn("export LIBGUESTFS_DEBUG=1", build)
+        self.assertIn("export LIBGUESTFS_TRACE=1", build)
 
     def test_build_log_pipeline_prepares_work_dir_and_propagates_failures(self) -> None:
         build = self.source.split(
