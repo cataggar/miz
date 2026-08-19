@@ -57,6 +57,13 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
             self.source,
         )
 
+    def test_image_builder_installs_embedded_debz_development_libraries(self) -> None:
+        install = self.source.split(
+            "- name: Install complete Ubuntu image-builder dependencies", 1
+        )[1].split("- name: Build built-in Artifact Signing client", 1)[0]
+        self.assertIn("liblzma-dev", install)
+        self.assertIn("libzstd-dev", install)
+
     def test_native_acceptance_cannot_silently_skip(self) -> None:
         native = self.source.split("  native_qemu:", 1)[1].split(
             "  azure_acceptance:", 1
