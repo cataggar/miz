@@ -99,10 +99,12 @@ sudo apt-get install -y --no-install-recommends \
   python3 python3-pefile qemu-utils sbsigntool systemd-ukify \
   tar xorriso xz-utils zstd
 sudo chmod 0644 /boot/vmlinuz-*
+sudo chmod 0666 /dev/kvm
 ```
 
 The permission adjustment lets the unprivileged libguestfs `supermin` process
-read the appliance kernel installed by `linux-image-generic`.
+read the appliance kernel installed by `linux-image-generic` and use native KVM
+acceleration.
 
 Run a source-pin preflight (requiring only `curl` and `gpg`) with:
 
