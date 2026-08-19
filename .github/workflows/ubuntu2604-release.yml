@@ -283,6 +283,7 @@ jobs:
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           rm -rf -- "$BUNDLE_DIR"
           mkdir -p "$BUNDLE_DIR/internal-provenance"
+          mkdir -p "$GITHUB_WORKSPACE/$WORK_DIR"
           build_log="$GITHUB_WORKSPACE/$WORK_DIR/build.log"
           zig build \
             -Dubuntu2604-arch="$ARCHITECTURE" \

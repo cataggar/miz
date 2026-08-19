@@ -476,11 +476,7 @@ fn verifyCanonicalPublication(
 ) !void {
     const gnupg = try std.fs.path.join(allocator, &.{ work_dir, "gnupg" });
     defer allocator.free(gnupg);
-    try Dir.cwd().deleteTree(io, gnupg);
-    try Dir.cwd().createDirPath(io, gnupg);
-    var directory = try Dir.cwd().openDir(io, gnupg, .{});
-    defer directory.close(io);
-    try directory.setPermissions(io, .fromMode(0o700));
+    try prepareCanonicalKeyring(io, gnupg);
 
     const key_url = try std.fmt.allocPrint(
         allocator,
@@ -496,6 +492,14 @@ fn verifyCanonicalPublication(
     defer allocator.free(fingerprints);
     if (std.mem.indexOf(u8, fingerprints, canonical_fingerprint) == null) return error.CanonicalFingerprintMismatch;
     try run(allocator, io, &.{ "gpg", "--batch", "--homedir", gnupg, "--verify", signature_path, sums_path });
+}
+
+fn prepareCanonicalKeyring(io: Io, gnupg: []const u8) !void {
+    try Dir.cwd().deleteTree(io, gnupg);
+    try Dir.cwd().createDirPath(io, gnupg);
+    var directory = try Dir.cwd().openDir(io, gnupg, .{ .iterate = true });
+    defer directory.close(io);
+    try directory.setPermissions(io, .fromMode(0o700));
 }
 
 const DebzEvidence = struct {
@@ -1099,6 +1103,21 @@ test "profiles pin immutable official sources for both architectures" {
         try std.testing.expect(std.mem.indexOf(u8, profile.source_name, "26.04") != null);
     }
     try std.testing.expectEqual(@as(u64, 5 * 1024 * 1024 * 1024), default_virtual_size);
+}
+
+test "Canonical keyring preparation uses a chmod-capable directory handle" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root_buffer[0..root_length], "gnupg" },
+    );
+    defer std.testing.allocator.free(path);
+
+    try prepareCanonicalKeyring(std.testing.io, path);
+    try prepareCanonicalKeyring(std.testing.io, path);
 }
 
 test "package-family resolve and customize requests are exact-lock operations" {

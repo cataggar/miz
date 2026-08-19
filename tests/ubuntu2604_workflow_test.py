@@ -64,6 +64,20 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         self.assertIn("liblzma-dev", install)
         self.assertIn("libzstd-dev", install)
 
+    def test_build_log_pipeline_prepares_work_dir_and_propagates_failures(self) -> None:
+        build = self.source.split(
+            "- name: Build exact finalized Ubuntu QCOW2", 1
+        )[1].split(
+            "- name: Validate standalone zstd QCOW2 and exact 5 GiB size", 1
+        )[0]
+        pipefail = build.index("set -euo pipefail")
+        mkdir = build.index('mkdir -p "$GITHUB_WORKSPACE/$WORK_DIR"')
+        build_log = build.index('build_log="$GITHUB_WORKSPACE/$WORK_DIR/build.log"')
+        tee = build.index('2>&1 | tee "$build_log"')
+        self.assertLess(pipefail, tee)
+        self.assertLess(mkdir, build_log)
+        self.assertLess(build_log, tee)
+
     def test_native_acceptance_cannot_silently_skip(self) -> None:
         native = self.source.split("  native_qemu:", 1)[1].split(
             "  azure_acceptance:", 1
