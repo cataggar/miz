@@ -134,7 +134,7 @@ fn packageFamilyRequest(
     package: []const u8,
     root_stage: []const u8,
     published_root: []const u8,
-    source_path: []const u8,
+    source_config_path: []const u8,
     keyring_path: []const u8,
     cache_path: []const u8,
     state_path: []const u8,
@@ -152,8 +152,9 @@ fn packageFamilyRequest(
                 .x86_64 => .amd64,
                 .aarch64 => .arm64,
             },
-            .source_paths = &.{source_path},
+            .source_paths = &.{},
             .keyring_paths = &.{keyring_path},
+            .config_paths = &.{source_config_path},
             .cache_path = cache_path,
             .state_path = state_path,
             .lock_input_path = if (operation == .resolve_lock) null else lock_path,
@@ -665,6 +666,16 @@ fn customizeRootWithDebz(
     try Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = source_document });
     const absolute_source = try Dir.cwd().realPathFileAlloc(io, source_path, allocator);
     defer allocator.free(absolute_source);
+    const source_config_path = try std.fs.path.join(allocator, &.{ work_dir, "ubuntu-snapshot.json" });
+    defer allocator.free(source_config_path);
+    const source_config = try std.json.Stringify.valueAlloc(allocator, .{
+        .source_path = absolute_source,
+        .immutable = true,
+    }, .{});
+    defer allocator.free(source_config);
+    try Dir.cwd().writeFile(io, .{ .sub_path = source_config_path, .data = source_config });
+    const absolute_source_config = try Dir.cwd().realPathFileAlloc(io, source_config_path, allocator);
+    defer allocator.free(absolute_source_config);
 
     var evidence: [debz_packages.len]DebzEvidence = undefined;
     var evidence_count: usize = 0;
@@ -706,7 +717,7 @@ fn customizeRootWithDebz(
             package,
             absolute_resolve_root,
             absolute_dummy,
-            absolute_source,
+            absolute_source_config,
             absolute_keyring,
             absolute_cache,
             absolute_state,
@@ -742,7 +753,7 @@ fn customizeRootWithDebz(
             package,
             absolute_stage,
             absolute_published,
-            absolute_source,
+            absolute_source_config,
             absolute_keyring,
             absolute_cache,
             absolute_state,
@@ -1008,11 +1019,20 @@ pub fn main(init: std.process.Init) !void {
 
     const mutable = try std.fs.path.join(allocator, &.{ work_dir, "customized.qcow2" });
     defer allocator.free(mutable);
+    const resize_source = if (profile.architecture == .aarch64) blk: {
+        const path = try std.fs.path.join(allocator, &.{ work_dir, "fsck-source.qcow2" });
+        errdefer allocator.free(path);
+        Dir.cwd().deleteFile(io, path) catch {};
+        try run(allocator, io, &.{ "qemu-img", "convert", "-O", "qcow2", source_path, path });
+        try run(allocator, io, &.{ "guestfish", "--rw", "-a", path, "run", ":", "e2fsck-f", "/dev/sda1" });
+        break :blk path;
+    } else null;
+    defer if (resize_source) |path| allocator.free(path);
     const size_text = try std.fmt.allocPrint(allocator, "{d}", .{args.size});
     defer allocator.free(size_text);
     Dir.cwd().deleteFile(io, mutable) catch {};
     try run(allocator, io, &.{ "qemu-img", "create", "-f", "qcow2", mutable, size_text });
-    try run(allocator, io, &.{ "virt-resize", "--expand", "/dev/sda1", source_path, mutable });
+    try run(allocator, io, &.{ "virt-resize", "--expand", "/dev/sda1", resize_source orelse source_path, mutable });
 
     var debz_customization = try customizeRootWithDebz(allocator, io, profile, mutable, work_dir, provenance_dir);
     defer debz_customization.deinit(allocator);
@@ -1205,6 +1225,8 @@ test "package-family resolve and customize requests are exact-lock operations" {
     try std.testing.expectEqual(package_family.Distribution.ubuntu_26_04, amd64.distribution);
     try std.testing.expectEqual(package_family.Operation.resolve_lock, amd64.operation);
     try std.testing.expectEqual(package_family.Architecture.amd64, amd64.inputs.architecture);
+    try std.testing.expectEqual(@as(usize, 0), amd64.inputs.source_paths.len);
+    try std.testing.expectEqualStrings("/inputs/ubuntu.sources", amd64.inputs.config_paths[0]);
     try std.testing.expectEqualStrings("/state/linux-azure.lock", amd64.inputs.lock_output_path.?);
     try std.testing.expect(amd64.inputs.lock_input_path == null);
     const arm64 = packageFamilyRequest(
@@ -1220,6 +1242,8 @@ test "package-family resolve and customize requests are exact-lock operations" {
         "/state/walinuxagent.lock",
     );
     try std.testing.expectEqual(package_family.Architecture.arm64, arm64.inputs.architecture);
+    try std.testing.expectEqual(@as(usize, 0), arm64.inputs.source_paths.len);
+    try std.testing.expectEqualStrings("/inputs/ubuntu.sources", arm64.inputs.config_paths[0]);
     try std.testing.expectEqualStrings("/state/walinuxagent.lock", arm64.inputs.lock_input_path.?);
     try std.testing.expect(arm64.inputs.lock_output_path == null);
 }
