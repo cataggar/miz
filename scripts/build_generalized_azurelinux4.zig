@@ -1753,7 +1753,7 @@ fn configureCoreGuest(
         "PermitEmptyPasswords no\n" ++
         "PubkeyAuthentication yes\n", "0600");
     try writeRootFile(gpa, io, rootfs_path, work_dir, "etc/waagent.conf", "ResourceDisk.Format=y\n" ++
-        "ResourceDisk.Filesystem=ext4\n" ++
+        "ResourceDisk.Filesystem=xfs\n" ++
         "ResourceDisk.MountPoint=/d\n" ++
         "ResourceDisk.EnableSwap=n\n" ++
         "DataDisk.Mount=y\n", "0644");
@@ -1862,6 +1862,16 @@ fn validateGeneralizedRootfs(
             !configValueEquals(content, "ResourceDisk.Format", "n"))
         {
             return error.InvalidFullProvisioningConfiguration;
+        }
+    } else {
+        const waagent_conf = try rootfsPath(rootfs_path, gpa, "etc/waagent.conf");
+        defer gpa.free(waagent_conf);
+        const content = try capture(gpa, io, &.{ "sudo", "cat", waagent_conf });
+        defer gpa.free(content);
+        if (!configValueEquals(content, "ResourceDisk.Format", "y") or
+            !configValueEquals(content, "ResourceDisk.Filesystem", "xfs"))
+        {
+            return error.InvalidCoreProvisioningConfiguration;
         }
     }
 }

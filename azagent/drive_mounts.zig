@@ -185,6 +185,7 @@ pub const SetupOptions = struct {
     now_unix_seconds: i64,
     resource_enabled: bool,
     resource_mount_point: []const u8 = resource_disk.default_mount_point,
+    resource_filesystem: resource_disk.Filesystem = .ext4,
     /// Applies to the resource disk only. Managed data disks are mount-only
     /// (this module never writes their metadata), so their ownership is
     /// whatever the person who formatted them chose, and is not ours to
@@ -238,6 +239,7 @@ pub fn setup(options: SetupOptions) !void {
             .now_unix_seconds = options.now_unix_seconds,
             .mount_point = mount_point,
             .format_policy = if (disk.is_resource) .replace_invalid else .mount_existing,
+            .filesystem = if (disk.is_resource) options.resource_filesystem else .ext4,
             .owner = if (disk.is_resource) options.resource_owner else null,
             .write_dataloss_warning = disk.is_resource,
             .enable_swap = disk.is_resource and options.resource_enable_swap,

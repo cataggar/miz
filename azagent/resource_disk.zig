@@ -9,10 +9,9 @@
 //! across a VM's lifetime, so its formatted state must be re-checked each
 //! time, not assumed from a previous run (see `main.zig`'s wiring).
 //!
-//! Reuses `vmiz`'s `mbr.zig`/`ext4.zig` codecs directly against a real block
-//! device special file -- both already operate on any `Io.File` plus a byte
-//! offset/length, so no library changes were needed to point them at
-//! `/dev/sdb` instead of a disk-image file.
+//! Ext4 and XFS formatting reuse `vmiz`'s native codecs directly against the
+//! block device, so the writer and idempotency check share the same supported
+//! on-disk feature profile.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -22,7 +21,28 @@ const mbr = vmiz.mbr;
 const gpt = vmiz.gpt;
 const guid_codec = vmiz.guid;
 const ext4 = vmiz.ext4;
+const xfs = vmiz.xfs;
+const xfs_writer = vmiz.xfs_writer;
+const tree_cursor = vmiz.tree_cursor;
 const Image = vmiz.Image;
+
+pub const Filesystem = enum {
+    ext4,
+    xfs,
+
+    pub fn parse(value: []const u8) ?Filesystem {
+        if (std.mem.eql(u8, value, "ext4")) return .ext4;
+        if (std.mem.eql(u8, value, "xfs")) return .xfs;
+        return null;
+    }
+
+    fn mountName(filesystem: Filesystem) [*:0]const u8 {
+        return switch (filesystem) {
+            .ext4 => "ext4",
+            .xfs => "xfs",
+        };
+    }
+};
 
 /// Gen1 (BIOS/synthetic-IDE) resource-disk VMBus device IDs start with this
 /// prefix (IDE port 1, per upstream's `device_for_ide_port(1)`).
@@ -186,6 +206,42 @@ pub fn ensureFormatted(io: std.Io, allocator: Allocator, file: std.Io.File, tota
     }
 }
 
+fn hasXfsAt(io: std.Io, allocator: Allocator, file: std.Io.File, offset: u64) bool {
+    var reader = xfs.Reader.openFileAt(allocator, io, file, offset) catch return false;
+    reader.close(io);
+    return true;
+}
+
+const XfsRegion = struct {
+    offset: u64,
+    length: u64,
+};
+
+fn prepareXfsMbr(io: std.Io, allocator: Allocator, file: std.Io.File, total_sectors: u32, now_unix_seconds: i64) !?XfsRegion {
+    if (total_sectors <= partition_start_lba) return error.DiskTooSmall;
+
+    var sector0: [mbr.sector_size]u8 = undefined;
+    const already_formatted = blk: {
+        _ = file.readPositionalAll(io, &sector0, 0) catch break :blk false;
+        const decoded = mbr.Mbr.decode(&sector0) catch break :blk false;
+        if (!isWholeDiskLinuxPartition(decoded, total_sectors)) break :blk false;
+        const partition_offset = @as(u64, partition_start_lba) * mbr.sector_size;
+        break :blk hasXfsAt(io, allocator, file, partition_offset);
+    };
+    if (already_formatted) return null;
+
+    const sector_count = total_sectors - partition_start_lba;
+    var table = mbr.singleLinuxPartitionMbr(partition_start_lba, sector_count);
+    table.disk_signature = @truncate(@as(u64, @bitCast(now_unix_seconds)));
+    const encoded = table.encode();
+    try file.writePositionalAll(io, &encoded, 0);
+    reReadPartitionTable(file);
+    return .{
+        .offset = @as(u64, partition_start_lba) * mbr.sector_size,
+        .length = @as(u64, sector_count) * mbr.sector_size,
+    };
+}
+
 fn ensureFormattedMbr(io: std.Io, allocator: Allocator, file: std.Io.File, total_sectors: u32, now_unix_seconds: i64) !void {
     if (total_sectors <= partition_start_lba) return error.DiskTooSmall;
 
@@ -267,6 +323,117 @@ fn isWholeDiskGptExt4(io: std.Io, allocator: Allocator, file: std.Io.File, total
     return true;
 }
 
+fn wholeDiskGptPlacement(io: std.Io, allocator: Allocator, file: std.Io.File, total_sectors: u64) ?gpt.Placement {
+    const img = Image{
+        .file = file,
+        .format = .raw,
+        .data_offset = 0,
+        .virtual_size = total_sectors * gpt.sector_size,
+    };
+    const parsed = gpt.readGpt(img, io, allocator) catch return null;
+    defer allocator.free(parsed.partitions);
+    const expected_first_usable = 2 + gpt.partition_array_sectors;
+    const expected_last_usable = total_sectors - 2 - gpt.partition_array_sectors;
+    if (parsed.header.current_lba != 1 or parsed.header.backup_lba != total_sectors - 1) return null;
+    if (parsed.header.first_usable_lba != expected_first_usable or parsed.header.last_usable_lba != expected_last_usable) return null;
+    if (parsed.partitions.len != 1) return null;
+    const partition = parsed.partitions[0];
+    if (!std.mem.eql(u8, &partition.partition_type_guid, &guid_codec.linux_filesystem_data)) return null;
+    if (partition.first_lba != partition_start_lba) return null;
+    const alignment_sectors = ext4.default_block_size / gpt.sector_size;
+    const partition_sectors = partition.last_lba - partition.first_lba + 1;
+    if (partition_sectors % alignment_sectors != 0) return null;
+    if (expected_last_usable - partition.last_lba >= alignment_sectors) return null;
+    return .{
+        .first_lba = partition.first_lba,
+        .last_lba = partition.last_lba,
+    };
+}
+
+fn prepareXfsGpt(io: std.Io, allocator: Allocator, file: std.Io.File, total_sectors: u64, now_unix_seconds: i64) !?XfsRegion {
+    if (total_sectors <= 2 * gpt.partition_array_sectors + 3) return error.DiskTooSmall;
+    if (wholeDiskGptPlacement(io, allocator, file, total_sectors)) |placement| {
+        if (hasXfsAt(io, allocator, file, placement.first_lba * gpt.sector_size)) return null;
+    }
+
+    var img = Image{
+        .file = file,
+        .format = .raw,
+        .data_offset = 0,
+        .virtual_size = total_sectors * gpt.sector_size,
+    };
+    const last_usable_lba = total_sectors - 2 - gpt.partition_array_sectors;
+    if (last_usable_lba < partition_start_lba) return error.DiskTooSmall;
+    const alignment_sectors = ext4.default_block_size / gpt.sector_size;
+    const available_sectors = last_usable_lba - partition_start_lba + 1;
+    const partition_sectors = available_sectors / alignment_sectors * alignment_sectors;
+    if (partition_sectors == 0) return error.DiskTooSmall;
+    const placement = gpt.Placement{
+        .first_lba = partition_start_lba,
+        .last_lba = partition_start_lba + partition_sectors - 1,
+    };
+    const specs = [_]gpt.PlacedPartitionSpec{.{
+        .type_guid = guid_codec.linux_filesystem_data,
+        .unique_guid = resourceGuid(now_unix_seconds, total_sectors, 1),
+        .placement = placement,
+        .name_utf16le = gpt.asciiName("resource"),
+    }};
+    try gpt.writeGptPlaced(&img, io, resourceGuid(now_unix_seconds, total_sectors, 0), &specs);
+    reReadPartitionTable(file);
+    return .{
+        .offset = placement.first_lba * gpt.sector_size,
+        .length = partition_sectors * gpt.sector_size,
+    };
+}
+
+fn prepareXfs(io: std.Io, allocator: Allocator, file: std.Io.File, total_sectors: u64, now_unix_seconds: i64) !?XfsRegion {
+    if (total_sectors > std.math.maxInt(u32)) {
+        return prepareXfsGpt(io, allocator, file, total_sectors, now_unix_seconds);
+    }
+    return prepareXfsMbr(io, allocator, file, @intCast(total_sectors), now_unix_seconds);
+}
+
+const EmptyCursor = struct {
+    fn next(_: *anyopaque) tree_cursor.Cursor.IteratorError!?tree_cursor.Cursor.Entry {
+        return null;
+    }
+
+    fn reset(_: *anyopaque) void {}
+
+    fn cursor(self: *EmptyCursor) tree_cursor.Cursor {
+        return .{ .ctx = self, .next_fn = next, .reset_fn = reset };
+    }
+};
+
+const FileOutputSink = struct {
+    file: std.Io.File,
+    io: std.Io,
+
+    fn writeAt(context: *anyopaque, offset: u64, bytes: []const u8) xfs_writer.Output.Error!void {
+        const self: *FileOutputSink = @ptrCast(@alignCast(context));
+        self.file.writePositionalAll(self.io, bytes, offset) catch return error.OutputWriteFailed;
+    }
+
+    fn output(self: *FileOutputSink) xfs_writer.Output {
+        return .{ .context = self, .write_at_fn = writeAt };
+    }
+};
+
+fn formatXfs(allocator: Allocator, io: std.Io, file: std.Io.File, region: XfsRegion, now_unix_seconds: i64, total_sectors: u64) !void {
+    var empty: EmptyCursor = .{};
+    var cursor = empty.cursor();
+    var sink = FileOutputSink{ .file = file, .io = io };
+    try xfs_writer.populateImage(allocator, sink.output(), &cursor, .{
+        .format = .{
+            .offset = region.offset,
+            .length = region.length,
+            .uuid = resourceGuid(now_unix_seconds, total_sectors, 2),
+            .label = "resource",
+            .timestamp = .{ .sec = now_unix_seconds },
+        },
+    });
+}
+
 fn ensureFormattedGpt(io: std.Io, allocator: Allocator, file: std.Io.File, total_sectors: u64, now_unix_seconds: i64) !void {
     if (total_sectors <= 2 * gpt.partition_array_sectors + 3) return error.DiskTooSmall;
     if (isWholeDiskGptExt4(io, allocator, file, total_sectors)) return;
@@ -318,7 +485,7 @@ fn reReadPartitionTable(file: std.Io.File) void {
 /// `mount(2)` syscall (matching `cdrom.zig`/`vmizinit`'s style), creating
 /// the mount point directory if needed. `EBUSY` is accepted only when
 /// `/proc/mounts` confirms this exact source/target pair is already mounted.
-pub fn mountAt(io: std.Io, device_path: [:0]const u8, mount_point: [:0]const u8) !void {
+pub fn mountAt(io: std.Io, device_path: [:0]const u8, mount_point: [:0]const u8, filesystem: Filesystem) !void {
     try std.Io.Dir.cwd().createDirPath(io, mount_point);
     switch (mountStatus(device_path, mount_point)) {
         .exact => return,
@@ -326,7 +493,7 @@ pub fn mountAt(io: std.Io, device_path: [:0]const u8, mount_point: [:0]const u8)
         .unmounted => {},
     }
 
-    const rc = linux.mount(device_path.ptr, mount_point.ptr, "ext4", 0, 0);
+    const rc = linux.mount(device_path.ptr, mount_point.ptr, filesystem.mountName(), 0, 0);
     switch (linux.errno(rc)) {
         .SUCCESS => {},
         .BUSY => if (mountStatus(device_path, mount_point) != .exact) return error.MountPointBusy,
@@ -481,6 +648,7 @@ pub const SetupOptions = struct {
     /// directory tree (tests).
     devices_dir: std.Io.Dir,
     now_unix_seconds: i64,
+    filesystem: Filesystem = .ext4,
     /// Borrowed, not necessarily null-terminated (e.g. a slice straight out
     /// of a parsed `/etc/waagent.conf` -- see `waagent_conf.zig`'s
     /// `resourcedisk_mount_point`); `setup` null-terminates its own copy
@@ -515,6 +683,7 @@ pub const SetupDeviceOptions = struct {
     now_unix_seconds: i64,
     mount_point: []const u8,
     format_policy: FormatPolicy,
+    filesystem: Filesystem = .ext4,
     /// When set, `chown`s the mount point to these ids once mounted. See
     /// `SetupOptions.owner`.
     owner: ?Owner = null,
@@ -544,13 +713,18 @@ pub fn setupDevice(options: SetupDeviceOptions) !void {
             .replace_invalid => {
                 const total_bytes = try blockDeviceSizeBytes(device_file);
                 const total_sectors = total_bytes / mbr.sector_size;
-                try ensureFormatted(options.io, options.allocator, device_file, total_sectors, options.now_unix_seconds);
+                switch (options.filesystem) {
+                    .ext4 => try ensureFormatted(options.io, options.allocator, device_file, total_sectors, options.now_unix_seconds),
+                    .xfs => if (try prepareXfs(options.io, options.allocator, device_file, total_sectors, options.now_unix_seconds)) |region| {
+                        try formatXfs(options.allocator, options.io, device_file, region, options.now_unix_seconds, total_sectors);
+                    },
+                }
             },
             .mount_existing => {},
         }
     }
 
-    try mountAt(options.io, part_path, mount_point);
+    try mountAt(options.io, part_path, mount_point, options.filesystem);
 
     var mount_dir = try openMountDir(std.Io.Dir.cwd(), options.io, mount_point);
     defer mount_dir.close(options.io);
@@ -597,6 +771,7 @@ pub fn setup(options: SetupOptions) !void {
         .now_unix_seconds = options.now_unix_seconds,
         .mount_point = options.mount_point,
         .format_policy = .replace_invalid,
+        .filesystem = options.filesystem,
         .owner = options.owner,
         .write_dataloss_warning = true,
         .enable_swap = options.enable_swap,
@@ -789,6 +964,31 @@ test "partitionDevicePath handles conventional and digit-ending disk names" {
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("/dev/sdb1", try partitionDevicePath(&buf, "sdb"));
     try std.testing.expectEqualStrings("/dev/nvme0n1p1", try partitionDevicePath(&buf, "nvme0n1"));
+}
+
+test "filesystem parser accepts supported names and rejects unknown values" {
+    try std.testing.expectEqual(Filesystem.ext4, Filesystem.parse("ext4").?);
+    try std.testing.expectEqual(Filesystem.xfs, Filesystem.parse("xfs").?);
+    try std.testing.expectEqual(@as(?Filesystem, null), Filesystem.parse("btrfs"));
+}
+
+test "native XFS formatting is detected and preserved on the next boot" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const total_sectors: u32 = (1024 * 1024 * 1024) / mbr.sector_size;
+    const file = try tmp.dir.createFile(io, "disk.img", .{ .truncate = true, .read = true });
+    defer file.close(io);
+    try file.setLength(io, @as(u64, total_sectors) * mbr.sector_size);
+
+    const region = (try prepareXfs(io, allocator, file, total_sectors, 1_700_000_000)).?;
+    var sector0: [mbr.sector_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &sector0, 0);
+    try std.testing.expect(isWholeDiskLinuxPartition(try mbr.Mbr.decode(&sector0), total_sectors));
+    try formatXfs(allocator, io, file, region, 1_700_000_000, total_sectors);
+    try std.testing.expect((try prepareXfs(io, allocator, file, total_sectors, 1_800_000_000)) == null);
 }
 
 test "mount status distinguishes exact, occupied, and free targets" {

@@ -30,9 +30,8 @@ pub const WaagentConf = struct {
     /// Matches upstream's own conservative default -- see issue #125's
     /// note on `config/mariner/waagent.conf` shipping this as `n`.
     resourcedisk_format: bool = false,
-    /// `azagent` only has an ext4 writer; a recognized-but-unsupported
-    /// value here (anything other than "ext4") should be logged and
-    /// ignored by whatever consumes this field (#113), not honored.
+    /// Unsupported values are logged and leave resource-disk formatting
+    /// disabled rather than silently selecting another filesystem.
     resourcedisk_filesystem: []const u8 = "ext4",
     resourcedisk_mount_point: []const u8 = "/d",
     /// Account that should own the resource disk's mount point, or `""` to
