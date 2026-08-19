@@ -64,6 +64,11 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         self.assertIn("liblzma-dev", install)
         self.assertIn("libzstd-dev", install)
         self.assertIn("linux-image-generic", install)
+        apt_install = install.index(
+            'sudo apt-get install -y --no-install-recommends "${packages[@]}"'
+        )
+        kernel_access = install.index("sudo chmod 0644 /boot/vmlinuz-*")
+        self.assertLess(apt_install, kernel_access)
 
     def test_build_log_pipeline_prepares_work_dir_and_propagates_failures(self) -> None:
         build = self.source.split(

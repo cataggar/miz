@@ -98,7 +98,11 @@ sudo apt-get install -y --no-install-recommends \
   linux-image-generic openssl \
   python3 python3-pefile qemu-utils sbsigntool systemd-ukify \
   tar xorriso xz-utils zstd
+sudo chmod 0644 /boot/vmlinuz-*
 ```
+
+The permission adjustment lets the unprivileged libguestfs `supermin` process
+read the appliance kernel installed by `linux-image-generic`.
 
 Run a source-pin preflight (requiring only `curl` and `gpg`) with:
 
