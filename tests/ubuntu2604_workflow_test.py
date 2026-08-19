@@ -57,12 +57,13 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
             self.source,
         )
 
-    def test_image_builder_installs_embedded_debz_development_libraries(self) -> None:
+    def test_image_builder_installs_complete_native_dependencies(self) -> None:
         install = self.source.split(
             "- name: Install complete Ubuntu image-builder dependencies", 1
         )[1].split("- name: Build built-in Artifact Signing client", 1)[0]
         self.assertIn("liblzma-dev", install)
         self.assertIn("libzstd-dev", install)
+        self.assertIn("linux-image-generic", install)
 
     def test_build_log_pipeline_prepares_work_dir_and_propagates_failures(self) -> None:
         build = self.source.split(

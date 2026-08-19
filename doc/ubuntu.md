@@ -95,7 +95,7 @@ builder dependencies as the release workflow:
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
   binutils cpio curl file gnupg jq libguestfs-tools liblzma-dev libzstd-dev \
-  openssl \
+  linux-image-generic openssl \
   python3 python3-pefile qemu-utils sbsigntool systemd-ukify \
   tar xorriso xz-utils zstd
 ```
