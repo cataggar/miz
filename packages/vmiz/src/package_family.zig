@@ -378,7 +378,8 @@ fn valid(request: Request) bool {
     if (overlaps(request.inputs.root_stage, request.inputs.cache_path) or
         overlaps(request.inputs.root_stage, request.inputs.state_path)) return false;
     if (request.family == .rpm) return validRpm(request);
-    if (request.inputs.source_paths.len == 0 or request.inputs.keyring_paths.len == 0) return false;
+    if ((request.inputs.source_paths.len == 0 and request.inputs.config_paths.len == 0) or
+        request.inputs.keyring_paths.len == 0) return false;
     for (request.inputs.source_paths) |path|
         if (!absolute(path) or overlaps(request.inputs.root_stage, path)) return false;
     for (request.inputs.config_paths) |path|
@@ -769,6 +770,26 @@ test "multiple package names are rejected without invoking debz" {
     });
     try std.testing.expectEqual(DiagnosticId.unsupported_package_count, result.diagnostic.?.id);
     try std.testing.expect(fake.seen_operation == null);
+}
+
+test "immutable repository configs can supply all source documents" {
+    try std.testing.expect(valid(.{
+        .family = .debian,
+        .distribution = .ubuntu_26_04,
+        .operation = .resolve_lock,
+        .packages = &.{"linux-azure"},
+        .inputs = .{
+            .root_stage = "/build/root-stage",
+            .published_root = "/build/root",
+            .architecture = .amd64,
+            .source_paths = &.{},
+            .config_paths = &.{"/inputs/ubuntu-snapshot.json"},
+            .keyring_paths = &.{"/inputs/ubuntu.gpg"},
+            .cache_path = "/cache/debz",
+            .state_path = "/state/debz",
+            .lock_output_path = "/state/linux-azure.lock",
+        },
+    }));
 }
 
 test "capability mismatch is a typed boundary failure" {

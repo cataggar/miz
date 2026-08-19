@@ -1019,20 +1019,18 @@ pub fn main(init: std.process.Init) !void {
 
     const mutable = try std.fs.path.join(allocator, &.{ work_dir, "customized.qcow2" });
     defer allocator.free(mutable);
-    const resize_source = if (profile.architecture == .aarch64) blk: {
-        const path = try std.fs.path.join(allocator, &.{ work_dir, "fsck-source.qcow2" });
-        errdefer allocator.free(path);
-        Dir.cwd().deleteFile(io, path) catch {};
-        try run(allocator, io, &.{ "qemu-img", "convert", "-O", "qcow2", source_path, path });
-        try run(allocator, io, &.{ "guestfish", "--rw", "-a", path, "run", ":", "e2fsck-f", "/dev/sda1" });
-        break :blk path;
-    } else null;
-    defer if (resize_source) |path| allocator.free(path);
     const size_text = try std.fmt.allocPrint(allocator, "{d}", .{args.size});
     defer allocator.free(size_text);
     Dir.cwd().deleteFile(io, mutable) catch {};
     try run(allocator, io, &.{ "qemu-img", "create", "-f", "qcow2", mutable, size_text });
-    try run(allocator, io, &.{ "virt-resize", "--expand", "/dev/sda1", resize_source orelse source_path, mutable });
+    if (profile.architecture == .aarch64) {
+        try run(allocator, io, &.{ "virt-resize", "--expand", "/dev/sda1", "--no-expand-content", source_path, mutable });
+        try run(allocator, io, &.{
+            "guestfish", "--rw", "-a", mutable, "run", ":", "e2fsck-f", "/dev/sda1", ":", "resize2fs", "/dev/sda1",
+        });
+    } else {
+        try run(allocator, io, &.{ "virt-resize", "--expand", "/dev/sda1", source_path, mutable });
+    }
 
     var debz_customization = try customizeRootWithDebz(allocator, io, profile, mutable, work_dir, provenance_dir);
     defer debz_customization.deinit(allocator);
