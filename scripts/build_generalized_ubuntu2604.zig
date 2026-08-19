@@ -659,7 +659,6 @@ fn customizeRootWithDebz(
         \\Components: main restricted universe multiverse
         \\Architectures: {s}
         \\Signed-By: {s}
-        \\Check-Valid-Until: no
         \\
     , .{ snapshot_base, profile.ubuntu_architecture, absolute_keyring });
     defer allocator.free(source_document);

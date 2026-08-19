@@ -104,7 +104,9 @@ sudo chmod 0666 /dev/kvm
 
 The permission adjustment lets the unprivileged libguestfs `supermin` process
 read the appliance kernel installed by `linux-image-generic` and use native KVM
-acceleration when `/dev/kvm` is available.
+acceleration when `/dev/kvm` is available. On hosts without KVM, set
+`LIBGUESTFS_BACKEND_SETTINGS=force_tcg` so libguestfs does not select
+KVM-specific Arm machine settings before falling back to emulation.
 
 Run a source-pin preflight (requiring only `curl` and `gpg`) with:
 

@@ -206,6 +206,8 @@ jobs:
           sudo chmod 0644 /boot/vmlinuz-*
           if [[ -e /dev/kvm ]]; then
             sudo chmod 0666 /dev/kvm
+          else
+            echo "LIBGUESTFS_BACKEND_SETTINGS=force_tcg" >> "$GITHUB_ENV"
           fi
           for tool in curl guestfish gpg qemu-img sbverify tar ukify virt-cat \
             virt-copy-in virt-copy-out virt-customize virt-filesystems virt-ls \
@@ -285,10 +287,6 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          if [[ "$ARCHITECTURE" == aarch64 ]]; then
-            export LIBGUESTFS_DEBUG=1
-            export LIBGUESTFS_TRACE=1
-          fi
           rm -rf -- "$BUNDLE_DIR"
           mkdir -p "$BUNDLE_DIR/internal-provenance"
           mkdir -p "$GITHUB_WORKSPACE/$WORK_DIR"
