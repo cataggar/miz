@@ -284,8 +284,9 @@ fn resourceDiskOwner(allocator: std.mem.Allocator, io: std.Io, username: []const
 
 fn driveMountSetup(allocator: std.mem.Allocator, io: std.Io, now_unix_seconds: i64, conf: waagent_conf.WaagentConf) !void {
     if (!conf.resourcedisk_format and !conf.datadisk_mount) return;
-    if (conf.resourcedisk_format and !std.mem.eql(u8, conf.resourcedisk_filesystem, "ext4")) {
-        std.debug.print("azagent: warning: ResourceDisk.Filesystem={s} is not supported, using ext4 instead\n", .{conf.resourcedisk_filesystem});
+    const resource_filesystem = resource_disk.Filesystem.parse(conf.resourcedisk_filesystem);
+    if (conf.resourcedisk_format and resource_filesystem == null) {
+        std.debug.print("azagent: warning: ResourceDisk.Filesystem={s} is not supported; temporary disk formatting is disabled\n", .{conf.resourcedisk_filesystem});
     }
 
     var devices_dir = try std.Io.Dir.cwd().openDir(io, "/sys/bus/vmbus/devices", .{ .iterate = true });
@@ -319,8 +320,9 @@ fn driveMountSetup(allocator: std.mem.Allocator, io: std.Io, now_unix_seconds: i
         .root_disk_name = if (root) |device| device.disk_name else null,
         .scsi_resource_disk_name = resource_name,
         .now_unix_seconds = now_unix_seconds,
-        .resource_enabled = conf.resourcedisk_format,
+        .resource_enabled = conf.resourcedisk_format and resource_filesystem != null,
         .resource_mount_point = conf.resourcedisk_mount_point,
+        .resource_filesystem = resource_filesystem orelse .ext4,
         .resource_owner = resourceDiskOwner(allocator, io, conf.resourcedisk_owner),
         .resource_enable_swap = conf.resourcedisk_enable_swap,
         .resource_swap_size_mb = if (conf.resourcedisk_swap_size_mb > 0) conf.resourcedisk_swap_size_mb else resource_disk.default_swap_size_mb,

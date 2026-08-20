@@ -19,6 +19,8 @@ Both flavors are Gen2 direct-UKI images with x86_64 and AArch64 variants. Releas
 
 `vmizinit` supports an immutable default for other appliance uses, but the released Azure core images use `vmizinit.mode=persistent` so the provisioned account, SSH keys, host keys, and agent state survive reboot.
 
+Core images format Azure's temporary resource disk as XFS. Its dynamic inode allocation is a better fit for build workspaces and package caches containing many small files than a fixed-inode ext4 filesystem. Managed data disks remain mount-only and are never reformatted by `azagent`.
+
 See [QEMU](qemu.md) for local launch and provisioning behavior.
 
 ## Generalized Azure Linux 4 core and full QCOW2

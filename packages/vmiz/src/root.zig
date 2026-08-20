@@ -36,6 +36,7 @@ pub const squashfs = @import("squashfs.zig");
 pub const ext4 = @import("ext4.zig");
 pub const xfs = @import("xfs.zig");
 pub const xfs_writer = @import("xfs_writer.zig");
+pub const tree_cursor = @import("tree_cursor.zig");
 pub const bootconfig = @import("bootconfig.zig");
 pub const boot_options = @import("boot_options.zig");
 pub const grub_defaults = @import("grub_defaults.zig");
