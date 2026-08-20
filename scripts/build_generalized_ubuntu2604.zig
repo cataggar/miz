@@ -697,6 +697,7 @@ fn customizeRootWithDebz(
         try Dir.cwd().createDirPath(io, cache);
         try Dir.cwd().createDirPath(io, state);
         try Dir.cwd().createDirPath(io, resolve_root);
+        try prepareEmptyDpkgRoot(allocator, io, resolve_root);
 
         const absolute_cache = try Dir.cwd().realPathFileAlloc(io, cache, allocator);
         defer allocator.free(absolute_cache);
@@ -804,7 +805,17 @@ fn customizeRootWithDebz(
         allocator.free(current);
         current = absolute_published;
     }
+
     return .{ .root_path = current, .evidence = evidence };
+}
+
+fn prepareEmptyDpkgRoot(allocator: Allocator, io: Io, root: []const u8) !void {
+    const dpkg_dir = try std.fs.path.join(allocator, &.{ root, "var/lib/dpkg" });
+    defer allocator.free(dpkg_dir);
+    try Dir.cwd().createDirPath(io, dpkg_dir);
+    const status = try std.fs.path.join(allocator, &.{ dpkg_dir, "status" });
+    defer allocator.free(status);
+    try Dir.cwd().writeFile(io, .{ .sub_path = status, .data = "" });
 }
 
 fn writeProvenance(
@@ -1248,6 +1259,21 @@ test "package-family resolve and customize requests are exact-lock operations" {
     try std.testing.expectEqualStrings("/inputs/ubuntu.sources", arm64.inputs.config_paths[0]);
     try std.testing.expectEqualStrings("/state/walinuxagent.lock", arm64.inputs.lock_input_path.?);
     try std.testing.expect(arm64.inputs.lock_output_path == null);
+}
+
+test "empty lock-resolution roots contain a valid dpkg database" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(std.testing.io, &root_buffer);
+
+    try prepareEmptyDpkgRoot(
+        std.testing.allocator,
+        std.testing.io,
+        root_buffer[0..root_length],
+    );
+    const status = try temporary.dir.statFile(std.testing.io, "var/lib/dpkg/status", .{});
+    try std.testing.expectEqual(@as(u64, 0), status.size);
 }
 
 test "arguments accept Ubuntu and project architecture spellings" {
