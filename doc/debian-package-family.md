@@ -26,7 +26,7 @@ operation. vmiz exposes a package list but rejects more than one name with a
 typed diagnostic rather than silently dropping names.
 
 The immutable Zig dependency is debz commit
-`d5385857a44fca753af515e805af70be9f004183`. At every call boundary vmiz checks
+`e26f05bf18d1b1137a2f9d351253fa917673e918`. At every call boundary vmiz checks
 the debz capability, request, result, exact-lock, and provenance schemas before
 accepting output.
 

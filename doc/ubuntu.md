@@ -37,7 +37,7 @@ The following inputs are compiled into the builder:
 - arm64 manifest SHA-256:
   `2889120db0432e8029f8f01622efb40ce964e434ba2c81e98937ad1e2616e4f5`
 - embedded debz API commit:
-  `d5385857a44fca753af515e805af70be9f004183`
+  `e26f05bf18d1b1137a2f9d351253fa917673e918`
 
 The builder first verifies the pinned checksum files, imports only the pinned
 Canonical fingerprint, verifies the detached signature, and requires exactly
@@ -195,7 +195,7 @@ the exact run ownership tags.
 `.github/workflows/ubuntu2604-release.yml` is manually dispatched from
 `main`. Before dispatch:
 
-1. Create the required tag `Ubuntu-26.04-20260818` at the exact current
+1. Create the required tag `Ubuntu-26.04-20260820` at the exact current
    `main` commit. Lightweight and annotated tags are accepted; an existing tag
    is never moved.
 2. Configure protected environment `ubuntu2604-signing`, restricted to
