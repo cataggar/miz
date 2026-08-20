@@ -11,7 +11,7 @@ const Dir = Io.Dir;
 pub const api_version: u32 = 3;
 pub const request_schema = "io.github.cataggar.vmiz.package-family.request.v3";
 pub const result_schema = "io.github.cataggar.vmiz.package-family.result.v3";
-pub const debz_api_commit = "d5385857a44fca753af515e805af70be9f004183";
+pub const debz_api_commit = "e26f05bf18d1b1137a2f9d351253fa917673e918";
 pub const rpmz_api_commit = "15b5e1291a9fc3eb3980a4088d757b9d0254d468";
 pub const rpm_lock_schema = "io.github.cataggar.vmiz.rpm-lock.v1";
 pub const rpm_provenance_schema = "io.github.cataggar.vmiz.rpm-provenance.v1";
@@ -796,23 +796,42 @@ test "multiple package names are rejected without invoking debz" {
 }
 
 test "immutable repository configs can supply all source documents" {
-    try std.testing.expect(valid(.{
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const paths = try fixturePaths(allocator, io, "config-only");
+    defer allocator.free(paths.stage);
+    defer allocator.free(paths.output);
+    defer allocator.free(paths.state);
+    defer allocator.free(paths.lock);
+    defer Dir.cwd().deleteTree(io, paths.stage) catch {};
+    defer Dir.cwd().deleteTree(io, paths.output) catch {};
+    defer Dir.cwd().deleteTree(io, paths.state) catch {};
+    defer Dir.cwd().deleteFile(io, paths.lock) catch {};
+    try Dir.cwd().createDir(io, paths.stage, .default_dir);
+    try Dir.cwd().createDir(io, paths.state, .default_dir);
+
+    var fake: FakeProduct = .{ .io = io, .state_path = paths.state, .lock_path = paths.lock };
+    const result = try execute(allocator, io, .{
+        .debian = .{ .product_executor = fake.interface() },
+    }, .{
         .family = .debian,
         .distribution = .ubuntu_26_04,
         .operation = .resolve_lock,
         .packages = &.{"linux-azure"},
         .inputs = .{
-            .root_stage = "/build/root-stage",
-            .published_root = "/build/root",
+            .root_stage = paths.stage,
+            .published_root = paths.output,
             .architecture = .amd64,
             .source_paths = &.{},
             .config_paths = &.{"/inputs/ubuntu-snapshot.json"},
             .keyring_paths = &.{"/inputs/ubuntu.gpg"},
             .cache_path = "/cache/debz",
-            .state_path = "/state/debz",
-            .lock_output_path = "/state/linux-azure.lock",
+            .state_path = paths.state,
+            .lock_output_path = paths.lock,
         },
-    }));
+    });
+    try std.testing.expect(result.succeeded);
+    try std.testing.expectEqual(debz.ProductOperation.plan, fake.seen_operation.?);
 }
 
 test "capability mismatch is a typed boundary failure" {
