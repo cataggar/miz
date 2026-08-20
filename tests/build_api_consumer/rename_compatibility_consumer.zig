@@ -4,7 +4,7 @@ const zvmi = @import("zvmi");
 test "legacy module alias exposes the current package-family API" {
     try std.testing.expectEqual(@as(u32, 3), zvmi.package_family.api_version);
     try std.testing.expectEqualStrings(
-        "e26f05bf18d1b1137a2f9d351253fa917673e918",
+        "f46153f8d3d0318969104ed23d172ead8256c1ac",
         zvmi.package_family.debz_api_commit,
     );
 }

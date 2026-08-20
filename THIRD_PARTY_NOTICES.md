@@ -57,14 +57,14 @@ https://sourceware.org/bzip2/1.0.8/LICENSE
 ## debz
 
 Host-side Debian-family package operations embed `cataggar/debz` at immutable
-commit `e26f05bf18d1b1137a2f9d351253fa917673e918`.
+commit `f46153f8d3d0318969104ed23d172ead8256c1ac`.
 
 Copyright (c) debz contributors.
 
 Licensed under the Apache License 2.0. See:
-https://github.com/cataggar/debz/blob/e26f05bf18d1b1137a2f9d351253fa917673e918/LICENSE
+https://github.com/cataggar/debz/blob/f46153f8d3d0318969104ed23d172ead8256c1ac/LICENSE
 
 debz links its statically configured Debian-semantics libsolv dependency and
 system libc, liblzma, and libzstd through its Zig package build conventions.
 See debz's notices for the corresponding BSD-3-Clause and 0BSD terms:
-https://github.com/cataggar/debz/blob/e26f05bf18d1b1137a2f9d351253fa917673e918/THIRD_PARTY_NOTICES
+https://github.com/cataggar/debz/blob/f46153f8d3d0318969104ed23d172ead8256c1ac/THIRD_PARTY_NOTICES
