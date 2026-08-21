@@ -3068,6 +3068,9 @@ pub const Editor = struct {
     }
 
     fn writeInodeRaw(self: Editor, io: Io, inode_number: u32, raw: *RawInode) EditError!void {
+        if (self.reader.feature_ro_compat & feature_ro_compat_metadata_csum != 0) {
+            setInodeChecksum(raw.bytes(), self.reader.uuid, inode_number);
+        }
         try self.reader.file.writePositionalAll(io, raw.bytes(), self.inodeLocation(inode_number));
     }
 
@@ -7845,7 +7848,7 @@ fn setInodeChecksum(block: []u8, uuid: [16]u8, inode_number: u32) void {
 
 fn setInodeChecksumSeed(block: []u8, checksum_seed: u32, inode_number: u32) void {
     var inode_le = std.mem.nativeToLittle(u32, inode_number);
-    var generation_le = std.mem.nativeToLittle(u32, readInt(u32, block[64..68]));
+    var generation_le = std.mem.nativeToLittle(u32, readInt(u32, block[100..104]));
     const wide = block.len >= 132 and readInt(u16, block[128..130]) >= 4;
     writeInt(u16, block[124..126], 0);
     if (wide) writeInt(u16, block[130..132], 0);
@@ -7856,6 +7859,30 @@ fn setInodeChecksumSeed(block: []u8, checksum_seed: u32, inode_number: u32) void
     });
     writeInt(u16, block[124..126], @truncate(checksum));
     if (wide) writeInt(u16, block[130..132], @truncate(checksum >> 16));
+}
+
+test "inode checksum uses i_generation rather than i_block data" {
+    var inode: [writer_inode_size]u8 = [_]u8{0} ** writer_inode_size;
+    const uuid = [_]u8{0x5a} ** 16;
+    writeInt(u16, inode[128..130], writer_extra_isize);
+    writeInt(u32, inode[64..68], 0xdead_beef);
+    writeInt(u32, inode[100..104], 0x1234_5678);
+
+    setInodeChecksum(&inode, uuid, 11);
+
+    var expected = inode;
+    writeInt(u16, expected[124..126], 0);
+    writeInt(u16, expected[130..132], 0);
+    var inode_le = std.mem.nativeToLittle(u32, 11);
+    var generation_le = std.mem.nativeToLittle(u32, 0x1234_5678);
+    const checksum = ext4Crc32c(&.{
+        &uuid,
+        std.mem.asBytes(&inode_le),
+        std.mem.asBytes(&generation_le),
+        &expected,
+    });
+    try std.testing.expectEqual(@as(u16, @truncate(checksum)), readInt(u16, inode[124..126]));
+    try std.testing.expectEqual(@as(u16, @truncate(checksum >> 16)), readInt(u16, inode[130..132]));
 }
 
 fn setSuperblockChecksum(sb: []u8) void {
@@ -9142,6 +9169,53 @@ test "Editor.deleteTree recursively removes a directory and adjusts the parent's
     // reference going away.
     const root_inode_after = try reader.readInode(io, root_inode);
     try std.testing.expectEqual(root_link_count_before - 1, root_inode_after.link_count);
+}
+
+test "Editor frees inodes with valid metadata checksums" {
+    const io = std.testing.io;
+    const path = "test-ext4-editor-free-inode-checksum.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "remove-file", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "gone" },
+        .{ .path = "remove-dir", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "remove-dir/nested", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 6, .bytes = "nested" },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = 8 * 1024 * 1024,
+        .uuid = [_]u8{0x61} ** 16,
+    });
+
+    var editor = try Editor.open(io, file, std.testing.allocator, .{});
+    defer editor.deinit();
+    const removed_file_inode = try editor.reader.lookupPath(io, "remove-file");
+    const removed_directory_inode = try editor.reader.lookupPath(io, "remove-dir");
+    const removed_nested_inode = try editor.reader.lookupPath(io, "remove-dir/nested");
+
+    try editor.deleteFile(io, "remove-file");
+    try editor.deleteTree(io, "remove-dir");
+    try editor.flush(io);
+
+    for ([_]u32{ removed_file_inode, removed_directory_inode, removed_nested_inode }) |inode_number| {
+        var raw = try editor.readInodeRaw(io, inode_number);
+        var checked = raw;
+        setInodeChecksum(checked.bytes(), editor.reader.uuid, inode_number);
+        try std.testing.expectEqual(
+            readInt(u16, checked.bytes()[124..126]),
+            readInt(u16, raw.bytes()[124..126]),
+        );
+        if (raw.bytes().len >= 132 and readInt(u16, raw.bytes()[128..130]) >= 4) {
+            try std.testing.expectEqual(
+                readInt(u16, checked.bytes()[130..132]),
+                readInt(u16, raw.bytes()[130..132]),
+            );
+        }
+        try std.testing.expectEqual(@as(u16, 0), readInt(u16, raw.bytes()[0..2]));
+    }
 }
 
 test "Editor.writeFile overwrites content, preserves xattrs, and handles growth/shrink" {
