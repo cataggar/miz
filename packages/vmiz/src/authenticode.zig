@@ -2,30 +2,49 @@
 //!
 //! The PE parsing and range-hashing portions are adapted from ghr's
 //! `src/authenticode.zig` (MIT, Copyright (c) 2026 Cameron Taggart).
-//! This module deliberately contains no private-key operation: callers send
-//! `PreparedRsaSha256.signing_digest` to their signing provider and supply
-//! the resulting PKCS#1 v1.5 RSA signature to `finishRsaSha256Alloc`.
 //!
-//! It reads signatures as well as writing them, and the reading side is held
-//! to the same line: `embeddedSigner`, `imageSha256` and `embeddedImageSha256`
-//! say what a signature is over and who it names, never whether it is to be
-//! believed. Verifying the signature itself, or a certificate chain, is a
-//! trust decision and is somebody else's.
+//! There are two write paths and both keep the same shape. The provider path
+//! performs no private-key operation: callers send
+//! `PreparedRsaSha256.signing_digest` to their signing service and supply the
+//! resulting PKCS#1 v1.5 RSA signature to `finishRsaSha256Alloc`. The
+//! local-key path, `signRsaSha256Alloc`, does the RSA operation here from a
+//! private key the caller already holds -- the development and self-signed
+//! arrangement, never production, which is why it is a distinct entry point.
+//!
+//! On the reading side, `embeddedSigner`, `imageSha256` and
+//! `embeddedImageSha256` say what a signature is over and who it names without
+//! deciding whether to believe it. `verifyRsaSha256` goes one controlled step
+//! further: it checks the PKCS#1 v1.5 RSA signature against the public key of
+//! the certificate the signature itself names, so tampered images, signatures
+//! and signer substitutions fail closed. It still builds no certificate chain
+//! and consults no trust store; deciding that the named certificate is the
+//! enrolled one, and that the enrolled one is trusted, stays with the caller.
 
 const std = @import("std");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const rsa = std.crypto.Certificate.rsa;
 
 const oid_spc_indirect_data = "\x06\x0a\x2b\x06\x01\x04\x01\x82\x37\x02\x01\x04";
 const oid_spc_pe_image_data = "\x06\x0a\x2b\x06\x01\x04\x01\x82\x37\x02\x01\x0f";
 const oid_sha256 = "\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01";
 const oid_rsa_encryption = "\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01";
+const oid_sha256_with_rsa = "\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b";
 const oid_signed_data = "\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x07\x02";
 const oid_data = "\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x07\x01";
 const oid_content_type = "\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x09\x03";
 const oid_message_digest = "\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x09\x04";
+// The SHA-256 DigestInfo prefix for EMSA-PKCS1-v1_5, matching the constant the
+// standard library uses to verify the same signatures.
+const sha256_digest_info_prefix = [_]u8{
+    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+    0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+    0x00, 0x04, 0x20,
+};
 const max_der_nesting = 32;
 const max_certificate_bytes = 1024 * 1024;
+const max_private_key_bytes = 64 * 1024;
+const max_rsa_modulus_bits = 4096;
 
 const Error = error{
     InvalidPe,
@@ -47,6 +66,14 @@ const Error = error{
     InvalidSignatureLength,
     UnsupportedSignatureDigestAlgorithm,
     TrailingDataAfterCertificateTable,
+    InvalidRsaPrivateKey,
+    InvalidPrivateKeyPem,
+    UnsupportedRsaKeySize,
+    MissingSignedAttributes,
+    SignedAttributesMismatch,
+    UnsupportedSignatureAlgorithm,
+    UnsupportedPublicKeyAlgorithm,
+    SignatureVerificationFailed,
 };
 
 /// A SHA-256 digest, the only image digest this module produces or reads.
@@ -455,6 +482,34 @@ fn parseAuthenticodeCmsInner(
     machine: u16,
     body: []const u8,
 ) Error!EmbeddedSigner {
+    const layout = try parseSignerInfoLayout(machine, body);
+    return resolveSigner(body, layout);
+}
+
+/// The elements of a CMS SignedData a caller might read, located but not yet
+/// interpreted. `signed_attributes` is optional because CMS permits its
+/// absence; Authenticode does not, which is a rule the verifier enforces and
+/// signer identification does not need.
+const SignerInfoLayout = struct {
+    machine: u16,
+    sid_issuer: DerElement,
+    sid_serial: DerElement,
+    digest_algorithm: DerElement,
+    signed_attributes: ?DerElement,
+    signature_algorithm: DerElement,
+    signature: DerElement,
+    certificates: DerElement,
+};
+
+/// Navigates one CMS SignedData to its single SignerInfo and locates every
+/// element callers need, without deciding what any of them means. The
+/// navigation and its acceptance are exactly what signer identification has
+/// always used, so that verification reads the same structure identification
+/// does rather than a second interpretation of it.
+fn parseSignerInfoLayout(
+    machine: u16,
+    body: []const u8,
+) Error!SignerInfoLayout {
     const content_info = try parseDerElement(body, 0);
     if (content_info.tag != 0x30 or content_info.end != body.len)
         return error.InvalidDer;
@@ -563,12 +618,15 @@ fn parseAuthenticodeCmsInner(
     const digest_algorithm = try parseDerElement(body, field_index);
     if (digest_algorithm.tag != 0x30) return error.InvalidDer;
     field_index = digest_algorithm.end;
+    var signed_attributes: ?DerElement = null;
     var field = try parseDerElement(body, field_index);
     if (field.tag == 0xa0) {
+        signed_attributes = field;
         field_index = field.end;
         field = try parseDerElement(body, field_index);
     }
     if (field.tag != 0x30) return error.InvalidDer;
+    const signature_algorithm = field;
     field_index = field.end;
     const signature = try parseDerElement(body, field_index);
     if (signature.tag != 0x04 or signature.content_start == signature.end)
@@ -581,9 +639,26 @@ fn parseAuthenticodeCmsInner(
     }
     if (field_index != signer_info.end) return error.InvalidDer;
 
+    return .{
+        .machine = machine,
+        .sid_issuer = sid_issuer,
+        .sid_serial = sid_serial,
+        .digest_algorithm = digest_algorithm,
+        .signed_attributes = signed_attributes,
+        .signature_algorithm = signature_algorithm,
+        .signature = signature,
+        .certificates = certificates,
+    };
+}
+
+/// Selects the certificate a SignerInfo names, by matching its issuer and
+/// serial. This is identification, not trust: it says which certificate the
+/// signature claims to be from, and an ambiguous or absent match is refused
+/// rather than guessed at.
+fn resolveSigner(body: []const u8, layout: SignerInfoLayout) Error!EmbeddedSigner {
     var match: ?EmbeddedSigner = null;
-    var certificate_index = certificates.content_start;
-    while (certificate_index < certificates.end) {
+    var certificate_index = layout.certificates.content_start;
+    while (certificate_index < layout.certificates.end) {
         const certificate = try parseDerElement(body, certificate_index);
         if (certificate.tag != 0x30) return error.InvalidCertificate;
         const certificate_der = body[certificate.start..certificate.end];
@@ -591,15 +666,15 @@ fn parseAuthenticodeCmsInner(
         if (std.mem.eql(
             u8,
             identity.issuer,
-            body[sid_issuer.start..sid_issuer.end],
+            body[layout.sid_issuer.start..layout.sid_issuer.end],
         ) and std.mem.eql(
             u8,
             identity.serial,
-            body[sid_serial.start..sid_serial.end],
+            body[layout.sid_serial.start..layout.sid_serial.end],
         )) {
             if (match != null) return error.AmbiguousSignerCertificate;
             match = .{
-                .machine = machine,
+                .machine = layout.machine,
                 .certificate_der = certificate_der,
                 .subject_der = identity.subject,
                 .issuer_der = identity.issuer,
@@ -608,7 +683,7 @@ fn parseAuthenticodeCmsInner(
         }
         certificate_index = certificate.end;
     }
-    if (certificate_index != certificates.end) return error.InvalidDer;
+    if (certificate_index != layout.certificates.end) return error.InvalidDer;
     return match orelse error.SignerCertificateNotFound;
 }
 
@@ -739,6 +814,521 @@ pub fn finishRsaSha256WithChainAlloc(
     writeU16Le(output[certificate_offset + 6 ..][0..2], 0x0002);
     @memcpy(output[certificate_offset + 8 .. certificate_offset + certificate_length], cms);
     return output;
+}
+
+/// An RSA private key's signing components, borrowed from the DER buffer they
+/// were parsed out of. The modulus length is the RSA signature length.
+pub const RsaPrivateKey = struct {
+    /// Big-endian modulus with the DER sign byte removed.
+    modulus: []const u8,
+    /// Big-endian private exponent with the DER sign byte removed.
+    private_exponent: []const u8,
+};
+
+/// Parses an RSA private key from DER, accepting both the PKCS#8
+/// `PrivateKeyInfo` wrapper and a bare PKCS#1 `RSAPrivateKey`. Bounded like
+/// every other DER path here; the key is the caller's own and is not attacker
+/// input, but a corrupt file should fail rather than mislead.
+pub fn parseRsaPrivateKeyDer(der_bytes: []const u8) Error!RsaPrivateKey {
+    if (der_bytes.len == 0 or der_bytes.len > max_private_key_bytes)
+        return error.InvalidRsaPrivateKey;
+    const outer = parseDerElement(der_bytes, 0) catch return error.InvalidRsaPrivateKey;
+    if (outer.tag != 0x30 or outer.end != der_bytes.len)
+        return error.InvalidRsaPrivateKey;
+    validateDerTree(der_bytes, outer, 0) catch return error.InvalidRsaPrivateKey;
+
+    const version = parseDerElement(der_bytes, outer.content_start) catch
+        return error.InvalidRsaPrivateKey;
+    if (version.tag != 0x02) return error.InvalidRsaPrivateKey;
+    const second = parseDerElement(der_bytes, version.end) catch
+        return error.InvalidRsaPrivateKey;
+    // A PKCS#8 PrivateKeyInfo has an AlgorithmIdentifier SEQUENCE here; a
+    // PKCS#1 RSAPrivateKey has the modulus INTEGER. The tag is what tells them
+    // apart.
+    if (second.tag == 0x30) {
+        requireRsaEncryptionAlgorithm(der_bytes, second) catch
+            return error.InvalidRsaPrivateKey;
+        const octet = parseDerElement(der_bytes, second.end) catch
+            return error.InvalidRsaPrivateKey;
+        if (octet.tag != 0x04 or octet.end != outer.end)
+            return error.InvalidRsaPrivateKey;
+        return parsePkcs1RsaPrivateKey(der_bytes[octet.content_start..octet.end]);
+    }
+    return parsePkcs1RsaPrivateKeyFields(der_bytes, second, outer.end);
+}
+
+fn parsePkcs1RsaPrivateKey(bytes: []const u8) Error!RsaPrivateKey {
+    const outer = parseDerElement(bytes, 0) catch return error.InvalidRsaPrivateKey;
+    if (outer.tag != 0x30 or outer.end != bytes.len)
+        return error.InvalidRsaPrivateKey;
+    validateDerTree(bytes, outer, 0) catch return error.InvalidRsaPrivateKey;
+    const version = parseDerElement(bytes, outer.content_start) catch
+        return error.InvalidRsaPrivateKey;
+    if (version.tag != 0x02) return error.InvalidRsaPrivateKey;
+    const modulus = parseDerElement(bytes, version.end) catch
+        return error.InvalidRsaPrivateKey;
+    return parsePkcs1RsaPrivateKeyFields(bytes, modulus, outer.end);
+}
+
+fn parsePkcs1RsaPrivateKeyFields(
+    bytes: []const u8,
+    modulus_element: DerElement,
+    container_end: usize,
+) Error!RsaPrivateKey {
+    const modulus = try integerMagnitude(bytes, modulus_element);
+    const public_exponent = parseDerElement(bytes, modulus_element.end) catch
+        return error.InvalidRsaPrivateKey;
+    if (public_exponent.tag != 0x02) return error.InvalidRsaPrivateKey;
+    const private_exponent_element = parseDerElement(bytes, public_exponent.end) catch
+        return error.InvalidRsaPrivateKey;
+    const private_exponent = try integerMagnitude(bytes, private_exponent_element);
+    if (private_exponent_element.end > container_end) return error.InvalidRsaPrivateKey;
+    if (!validRsaSignatureLength(modulus.len)) return error.UnsupportedRsaKeySize;
+    // The private exponent is reduced modulo the key's order, so it is smaller
+    // than the modulus; a larger one is not this key.
+    if (private_exponent.len == 0 or private_exponent.len > modulus.len)
+        return error.InvalidRsaPrivateKey;
+    return .{ .modulus = modulus, .private_exponent = private_exponent };
+}
+
+fn integerMagnitude(bytes: []const u8, element: DerElement) Error![]const u8 {
+    if (element.tag != 0x02 or element.content_start == element.end)
+        return error.InvalidRsaPrivateKey;
+    var content = bytes[element.content_start..element.end];
+    while (content.len > 1 and content[0] == 0) content = content[1..];
+    if (content.len == 1 and content[0] == 0) return error.InvalidRsaPrivateKey;
+    return content;
+}
+
+fn requireRsaEncryptionAlgorithm(bytes: []const u8, algorithm: DerElement) Error!void {
+    if (algorithm.tag != 0x30) return error.InvalidRsaPrivateKey;
+    const oid = parseDerElement(bytes, algorithm.content_start) catch
+        return error.InvalidRsaPrivateKey;
+    if (oid.tag != 0x06 or
+        !std.mem.eql(u8, bytes[oid.start..oid.end], oid_rsa_encryption))
+        return error.InvalidRsaPrivateKey;
+}
+
+/// Decodes a PEM private key, accepting PKCS#8 (`PRIVATE KEY`) and PKCS#1
+/// (`RSA PRIVATE KEY`) blocks, and returns the DER. Encrypted keys are not
+/// accepted: a build that needs a passphrase is a build asking for one, which
+/// this deliberately cannot answer.
+pub fn decodePrivateKeyPemAlloc(
+    allocator: std.mem.Allocator,
+    pem: []const u8,
+) ![]u8 {
+    if (std.mem.indexOf(u8, pem, "-----BEGIN RSA PRIVATE KEY-----") != null) {
+        return decodePemBlockAlloc(
+            allocator,
+            pem,
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----END RSA PRIVATE KEY-----",
+            max_private_key_bytes,
+        );
+    }
+    return decodePemBlockAlloc(
+        allocator,
+        pem,
+        "-----BEGIN PRIVATE KEY-----",
+        "-----END PRIVATE KEY-----",
+        max_private_key_bytes,
+    );
+}
+
+fn decodePemBlockAlloc(
+    allocator: std.mem.Allocator,
+    pem: []const u8,
+    begin_marker: []const u8,
+    end_marker: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    const begin = std.mem.indexOf(u8, pem, begin_marker) orelse
+        return error.InvalidPrivateKeyPem;
+    if (std.mem.trim(u8, pem[0..begin], " \t\r\n").len != 0)
+        return error.InvalidPrivateKeyPem;
+    const body_start = begin + begin_marker.len;
+    const relative_end = std.mem.indexOf(u8, pem[body_start..], end_marker) orelse
+        return error.InvalidPrivateKeyPem;
+    const body_end = body_start + relative_end;
+    const suffix = pem[body_end + end_marker.len ..];
+    if (std.mem.trim(u8, suffix, " \t\r\n").len != 0)
+        return error.InvalidPrivateKeyPem;
+
+    var encoded: std.Io.Writer.Allocating = .init(allocator);
+    defer encoded.deinit();
+    for (pem[body_start..body_end]) |byte| {
+        if (std.ascii.isWhitespace(byte)) continue;
+        try encoded.writer.writeByte(byte);
+    }
+    const encoded_slice = encoded.written();
+    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(encoded_slice) catch
+        return error.InvalidPrivateKeyPem;
+    if (decoded_size == 0 or decoded_size > max_bytes) return error.InvalidPrivateKeyPem;
+    const decoded = try allocator.alloc(u8, decoded_size);
+    errdefer allocator.free(decoded);
+    std.base64.standard.Decoder.decode(decoded, encoded_slice) catch
+        return error.InvalidPrivateKeyPem;
+    return decoded;
+}
+
+/// Produces a PKCS#1 v1.5 RSA/SHA-256 signature over `signing_digest` with a
+/// local private key. This is the one private-key operation in the module and
+/// exists for the local-key build path; production signing uses an external
+/// provider and never reaches here.
+pub fn signRsaSha256Alloc(
+    allocator: std.mem.Allocator,
+    private_key: RsaPrivateKey,
+    signing_digest: [Sha256.digest_length]u8,
+) ![]u8 {
+    const modulus_len = private_key.modulus.len;
+    if (!validRsaSignatureLength(modulus_len)) return error.UnsupportedRsaKeySize;
+    const t_len = sha256_digest_info_prefix.len + Sha256.digest_length;
+    // EM = 0x00 || 0x01 || PS || 0x00 || T, with PS at least eight 0xff octets.
+    if (modulus_len < t_len + 11) return error.UnsupportedRsaKeySize;
+
+    const encoded = try allocator.alloc(u8, modulus_len);
+    defer allocator.free(encoded);
+    encoded[0] = 0x00;
+    encoded[1] = 0x01;
+    @memset(encoded[2 .. modulus_len - t_len - 1], 0xff);
+    encoded[modulus_len - t_len - 1] = 0x00;
+    @memcpy(
+        encoded[modulus_len - t_len ..][0..sha256_digest_info_prefix.len],
+        &sha256_digest_info_prefix,
+    );
+    @memcpy(
+        encoded[modulus_len - Sha256.digest_length ..][0..Sha256.digest_length],
+        &signing_digest,
+    );
+
+    const Modulus = std.crypto.ff.Modulus(max_rsa_modulus_bits);
+    const modulus = Modulus.fromBytes(private_key.modulus, .big) catch
+        return error.InvalidRsaPrivateKey;
+    const base = Modulus.Fe.fromBytes(modulus, encoded, .big) catch
+        return error.InvalidRsaPrivateKey;
+    // The private exponent is secret, so this is the constant-time `pow`
+    // rather than the public-exponent variant.
+    const exponent = Modulus.Fe.fromBytes(modulus, private_key.private_exponent, .big) catch
+        return error.InvalidRsaPrivateKey;
+    const signature_fe = modulus.pow(base, exponent) catch
+        return error.InvalidRsaPrivateKey;
+
+    const signature = try allocator.alloc(u8, modulus_len);
+    errdefer allocator.free(signature);
+    signature_fe.toBytes(signature, .big) catch return error.InvalidRsaPrivateKey;
+    return signature;
+}
+
+/// Signs an unsigned PE image with a local RSA private key and its
+/// certificate, and returns the signed image only after verifying that the
+/// bytes carry a valid signature over this image by that certificate. A key
+/// and certificate that do not belong together fail here rather than ship.
+pub fn signPeRsaSha256Alloc(
+    allocator: std.mem.Allocator,
+    unsigned_pe: []const u8,
+    private_key_der: []const u8,
+    certificate_der: []const u8,
+) ![]u8 {
+    const key = try parseRsaPrivateKeyDer(private_key_der);
+    var prepared = try prepareRsaSha256Alloc(allocator, unsigned_pe);
+    defer prepared.deinit(allocator);
+    const signature = try signRsaSha256Alloc(allocator, key, prepared.signing_digest);
+    defer allocator.free(signature);
+    const signed = try finishRsaSha256Alloc(allocator, prepared, certificate_der, signature);
+    errdefer allocator.free(signed);
+    _ = try verifyRsaSha256(signed);
+    return signed;
+}
+
+/// Verifies a PE's embedded Authenticode signature: the PKCS#1 v1.5 RSA
+/// signature against the public key of the certificate the signature names,
+/// the signed attributes' binding to the encapsulated content, and that
+/// content's digest against this image. Returns the signer identity, all of it
+/// re-derived from the bytes.
+///
+/// It is the whole of what can be established without a trust store, and no
+/// more: it does not decide that the named certificate is the one a caller
+/// enrolled, nor build a chain to a trusted root. Both remain the caller's.
+pub fn verifyRsaSha256(pe_bytes: []const u8) Error!EmbeddedSigner {
+    const table = try authenticodeCms(pe_bytes);
+    const layout = parseSignerInfoLayout(table.machine, table.cms) catch |err|
+        return mapCmsError(err);
+    const signer = resolveSigner(table.cms, layout) catch |err| return mapCmsError(err);
+
+    // The digest and signature algorithms must be the ones this verifier
+    // understands, so "verified" never quietly means "over an algorithm not
+    // looked at".
+    try requireAlgorithmOid(table.cms, layout.digest_algorithm, &.{oid_sha256});
+    try requireAlgorithmOid(
+        table.cms,
+        layout.signature_algorithm,
+        &.{ oid_rsa_encryption, oid_sha256_with_rsa },
+    );
+
+    const signed_attributes = layout.signed_attributes orelse
+        return error.MissingSignedAttributes;
+    const attributes = try extractSignedAttributes(table.cms, signed_attributes);
+
+    // The signed attributes must commit to the encapsulated content: its OID
+    // is what the signature says it is over, and the messageDigest is that
+    // content's SHA-256. Without this a signature over any content could be
+    // lifted onto this one.
+    const spc = try spcIndirectDataContent(table.cms);
+    if (!std.mem.eql(u8, attributes.content_type, oid_spc_indirect_data))
+        return error.SignedAttributesMismatch;
+    var content_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(table.cms[spc.content_start..spc.end], &content_digest, .{});
+    if (!std.mem.eql(u8, attributes.message_digest, &content_digest))
+        return error.SignedAttributesMismatch;
+
+    // And that content's PE digest must be this image's, so the signature is
+    // over these exact bytes and not another image with the same signer.
+    const claimed = try embeddedImageSha256(pe_bytes);
+    const actual = try imageSha256(pe_bytes);
+    if (!std.mem.eql(u8, &claimed, &actual))
+        return error.SignatureVerificationFailed;
+
+    // Only now the cryptographic check, over the DER SET OF signed attributes,
+    // which is the [0] element re-tagged from IMPLICIT to SET as the standard
+    // requires.
+    try verifyPkcs1Sha256(
+        signer.certificate_der,
+        table.cms[signed_attributes.start + 1 .. signed_attributes.end],
+        table.cms[layout.signature.content_start..layout.signature.end],
+    );
+    return signer;
+}
+
+fn mapCmsError(err: Error) Error {
+    return switch (err) {
+        error.MissingSignerInfo,
+        error.MultipleSignerInfos,
+        error.UnsupportedSignerIdentifier,
+        error.SignerCertificateNotFound,
+        error.AmbiguousSignerCertificate,
+        error.MissingSignedAttributes,
+        error.SignedAttributesMismatch,
+        error.UnsupportedSignatureAlgorithm,
+        error.UnsupportedSignatureDigestAlgorithm,
+        error.UnsupportedPublicKeyAlgorithm,
+        error.SignatureVerificationFailed,
+        => err,
+        else => error.InvalidAuthenticodeCms,
+    };
+}
+
+const SignedAttributes = struct {
+    content_type: []const u8,
+    message_digest: []const u8,
+};
+
+/// Reads the two Authenticode-mandatory signed attributes out of the SignerInfo
+/// `[0]` set: the contentType OID and the messageDigest octet string. Both must
+/// be present exactly once, and nothing about the set may be malformed.
+fn extractSignedAttributes(
+    body: []const u8,
+    signed_attributes: DerElement,
+) Error!SignedAttributes {
+    var content_type: ?[]const u8 = null;
+    var message_digest: ?[]const u8 = null;
+    var index = signed_attributes.content_start;
+    while (index < signed_attributes.end) {
+        const attribute = try parseDerElement(body, index);
+        if (attribute.tag != 0x30) return error.SignedAttributesMismatch;
+        const oid = try parseDerElement(body, attribute.content_start);
+        if (oid.tag != 0x06) return error.SignedAttributesMismatch;
+        const is_content_type =
+            std.mem.eql(u8, body[oid.start..oid.end], oid_content_type);
+        const is_message_digest =
+            std.mem.eql(u8, body[oid.start..oid.end], oid_message_digest);
+        // Real Authenticode signatures also carry attributes this verifier does
+        // not interpret, such as spcSpOpusInfo; those are stepped over by the
+        // SEQUENCE length without judging their contents. Only the two
+        // attributes a signature's meaning depends on are parsed, and each is
+        // required to be present exactly once with the type it must have.
+        if (is_content_type or is_message_digest) {
+            const values = try parseDerElement(body, oid.end);
+            if (values.tag != 0x31 or values.end != attribute.end)
+                return error.SignedAttributesMismatch;
+            const value = try parseDerElement(body, values.content_start);
+            if (value.end != values.end) return error.SignedAttributesMismatch;
+            if (is_content_type) {
+                if (content_type != null or value.tag != 0x06)
+                    return error.SignedAttributesMismatch;
+                content_type = body[value.start..value.end];
+            } else {
+                if (message_digest != null or value.tag != 0x04)
+                    return error.SignedAttributesMismatch;
+                message_digest = body[value.content_start..value.end];
+            }
+        }
+        index = attribute.end;
+    }
+    if (index != signed_attributes.end) return error.SignedAttributesMismatch;
+    return .{
+        .content_type = content_type orelse return error.SignedAttributesMismatch,
+        .message_digest = message_digest orelse return error.SignedAttributesMismatch,
+    };
+}
+
+fn requireAlgorithmOid(
+    body: []const u8,
+    algorithm: DerElement,
+    accepted: []const []const u8,
+) Error!void {
+    if (algorithm.tag != 0x30) return error.InvalidAuthenticodeCms;
+    const oid = try parseDerElement(body, algorithm.content_start);
+    if (oid.tag != 0x06) return error.InvalidAuthenticodeCms;
+    for (accepted) |candidate| {
+        if (std.mem.eql(u8, body[oid.start..oid.end], candidate)) return;
+    }
+    // The digest OID set is only ever the one SHA-256 value; anything else is
+    // an unsupported digest rather than an unsupported signature scheme.
+    if (accepted.len == 1) return error.UnsupportedSignatureDigestAlgorithm;
+    return error.UnsupportedSignatureAlgorithm;
+}
+
+fn verifyPkcs1Sha256(
+    certificate_der: []const u8,
+    signed_attributes_after_tag: []const u8,
+    signature: []const u8,
+) Error!void {
+    const certificate = std.crypto.Certificate{ .buffer = certificate_der, .index = 0 };
+    const parsed = certificate.parse() catch return error.InvalidCertificate;
+    switch (parsed.pub_key_algo) {
+        .rsaEncryption => {},
+        else => return error.UnsupportedPublicKeyAlgorithm,
+    }
+    const components = rsa.PublicKey.parseDer(parsed.pubKey()) catch
+        return error.InvalidCertificate;
+    const public_key = rsa.PublicKey.fromBytes(components.exponent, components.modulus) catch
+        return error.InvalidCertificate;
+    if (signature.len != components.modulus.len)
+        return error.SignatureVerificationFailed;
+    const set_tag = [_]u8{0x31};
+    inline for (.{ 128, 256, 384, 512 }) |candidate| {
+        if (signature.len == candidate) {
+            var buffer: [candidate]u8 = undefined;
+            @memcpy(&buffer, signature[0..candidate]);
+            rsa.PKCS1v1_5Signature.concatVerify(
+                candidate,
+                buffer,
+                &.{ &set_tag, signed_attributes_after_tag },
+                public_key,
+                Sha256,
+            ) catch return error.SignatureVerificationFailed;
+            return;
+        }
+    }
+    return error.UnsupportedRsaKeySize;
+}
+
+/// A short, human-readable, non-secret description of a certificate's subject,
+/// issuer, serial and validity, for signing provenance. It replaces the text
+/// `openssl x509 -subject -issuer -serial -dates` printed, in a form that does
+/// not depend on OpenSSL being present.
+pub fn describeCertificateAlloc(
+    allocator: std.mem.Allocator,
+    certificate_der: []const u8,
+) ![]u8 {
+    const outer = try parseCertificateElement(certificate_der, 0);
+    if (outer.tag != 0x30 or outer.end != certificate_der.len)
+        return error.InvalidCertificate;
+    const tbs = try parseCertificateElement(certificate_der, outer.content_start);
+    if (tbs.tag != 0x30) return error.InvalidCertificate;
+    var index = tbs.content_start;
+    var field = try parseCertificateElement(certificate_der, index);
+    if (field.tag == 0xa0) {
+        index = field.end;
+        field = try parseCertificateElement(certificate_der, index);
+    }
+    if (field.tag != 0x02) return error.InvalidCertificate; // serial
+    const serial = certificate_der[field.content_start..field.end];
+    index = field.end;
+    const signature_algorithm = try parseCertificateElement(certificate_der, index);
+    index = signature_algorithm.end;
+    const issuer = try parseCertificateElement(certificate_der, index);
+    if (issuer.tag != 0x30) return error.InvalidCertificate;
+    index = issuer.end;
+    const validity = try parseCertificateElement(certificate_der, index);
+    if (validity.tag != 0x30) return error.InvalidCertificate;
+    const not_before = try parseCertificateElement(certificate_der, validity.content_start);
+    const not_after = try parseCertificateElement(certificate_der, not_before.end);
+    index = validity.end;
+    const subject = try parseCertificateElement(certificate_der, index);
+    if (subject.tag != 0x30) return error.InvalidCertificate;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("subject=");
+    try writeName(&out.writer, certificate_der, subject);
+    try out.writer.writeAll("\nissuer=");
+    try writeName(&out.writer, certificate_der, issuer);
+    try out.writer.writeAll("\nserial=");
+    try writeHex(&out.writer, serial);
+    try out.writer.writeAll("\nnotBefore=");
+    try writeTime(&out.writer, certificate_der[not_before.content_start..not_before.end]);
+    try out.writer.writeAll("\nnotAfter=");
+    try writeTime(&out.writer, certificate_der[not_after.content_start..not_after.end]);
+    return out.toOwnedSlice();
+}
+
+fn writeName(writer: *std.Io.Writer, bytes: []const u8, name: DerElement) !void {
+    var first = true;
+    var rdn_index = name.content_start;
+    while (rdn_index < name.end) {
+        const rdn = try parseCertificateElement(bytes, rdn_index);
+        if (rdn.tag != 0x31) return error.InvalidCertificate;
+        var attribute_index = rdn.content_start;
+        while (attribute_index < rdn.end) {
+            const attribute = try parseCertificateElement(bytes, attribute_index);
+            const oid = try parseCertificateElement(bytes, attribute.content_start);
+            const value = try parseCertificateElement(bytes, oid.end);
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.writeAll(shortNameForOid(bytes[oid.start..oid.end]));
+            try writer.writeByte('=');
+            try writePrintable(writer, bytes[value.content_start..value.end]);
+            attribute_index = attribute.end;
+        }
+        rdn_index = rdn.end;
+    }
+    if (first) try writer.writeAll("(empty)");
+}
+
+fn shortNameForOid(oid: []const u8) []const u8 {
+    const table = [_]struct { oid: []const u8, name: []const u8 }{
+        .{ .oid = "\x06\x03\x55\x04\x03", .name = "CN" },
+        .{ .oid = "\x06\x03\x55\x04\x0a", .name = "O" },
+        .{ .oid = "\x06\x03\x55\x04\x0b", .name = "OU" },
+        .{ .oid = "\x06\x03\x55\x04\x06", .name = "C" },
+        .{ .oid = "\x06\x03\x55\x04\x07", .name = "L" },
+        .{ .oid = "\x06\x03\x55\x04\x08", .name = "ST" },
+        .{ .oid = "\x06\x0a\x09\x92\x26\x89\x93\xf2\x2c\x64\x01\x01", .name = "DC" },
+    };
+    for (table) |entry| {
+        if (std.mem.eql(u8, oid, entry.oid)) return entry.name;
+    }
+    return "OID";
+}
+
+fn writePrintable(writer: *std.Io.Writer, value: []const u8) !void {
+    for (value) |byte| {
+        if (byte >= 0x20 and byte < 0x7f and byte != ',' and byte != '\\')
+            try writer.writeByte(byte)
+        else
+            try writer.print("\\x{x:0>2}", .{byte});
+    }
+}
+
+fn writeHex(writer: *std.Io.Writer, value: []const u8) !void {
+    var stripped = value;
+    while (stripped.len > 1 and stripped[0] == 0) stripped = stripped[1..];
+    for (stripped) |byte| try writer.print("{x:0>2}", .{byte});
+}
+
+fn writeTime(writer: *std.Io.Writer, value: []const u8) !void {
+    try writePrintable(writer, value);
 }
 
 fn parseUnsignedPe(bytes: []const u8) Error!Pe {
@@ -1072,6 +1662,49 @@ fn validateValidity(bytes: []const u8, validity: DerElement) Error!void {
     const not_after = try parseCertificateElement(bytes, index);
     if (!isCertificateTime(not_after) or not_after.end != validity.end)
         return error.InvalidCertificate;
+
+    // A certificate whose validity ends before it begins is never valid at any
+    // instant, so it is rejected without consulting a clock. Consulting one is
+    // deliberately avoided: expiry is a function of when a build runs, and
+    // reproducible builds must not depend on that.
+    const before = canonicalCertificateTime(
+        not_before.tag,
+        bytes[not_before.content_start..not_before.end],
+    );
+    const after = canonicalCertificateTime(
+        not_after.tag,
+        bytes[not_after.content_start..not_after.end],
+    );
+    if (before != null and after != null) {
+        if (std.mem.order(u8, &before.?, &after.?) == .gt)
+            return error.InvalidCertificate;
+    }
+}
+
+/// Renders a conforming UTCTime or GeneralizedTime as a comparable
+/// `YYYYMMDDHHMMSS` string, applying the RFC 5280 two-digit-year rule
+/// (`YY >= 50` is 19YY, otherwise 20YY). A value that is not in the one
+/// conforming form yields null, so a comparison is only made between two
+/// values that are actually comparable, never a guessed one.
+fn canonicalCertificateTime(tag: u8, content: []const u8) ?[14]u8 {
+    var out: [14]u8 = undefined;
+    if (tag == 0x17) {
+        if (content.len != 13 or content[12] != 'Z') return null;
+        for (content[0..12]) |byte| if (!std.ascii.isDigit(byte)) return null;
+        const yy = @as(u16, content[0] - '0') * 10 + (content[1] - '0');
+        const century: []const u8 = if (yy >= 50) "19" else "20";
+        out[0] = century[0];
+        out[1] = century[1];
+        @memcpy(out[2..14], content[0..12]);
+        return out;
+    }
+    if (tag == 0x18) {
+        if (content.len != 15 or content[14] != 'Z') return null;
+        for (content[0..14]) |byte| if (!std.ascii.isDigit(byte)) return null;
+        @memcpy(out[0..14], content[0..14]);
+        return out;
+    }
+    return null;
 }
 
 fn isCertificateTime(element: DerElement) bool {
@@ -1775,6 +2408,297 @@ test "image digest rejects an unsigned image with trailing bytes it cannot place
         imageSha256(extended),
     );
     try std.testing.expectError(error.UnsignedPe, embeddedImageSha256(image));
+}
+
+// RSA-2048 keys and self-signed certificates generated once, offline, purely
+// as test material; they sign nothing outside this file. keyA belongs to certA
+// (CN "vmiz native local signer", serial 0x04a1); keyB belongs to certB
+// ("vmiz other signer"), and is the foreign signer the fail-closed tests use.
+const test_local_key_pkcs8_b64 =
+    "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDdK9rFKpZSLT1QYvdAmPlxXsPFEwN4evJTFhlWvRYRXUo/uJqz" ++
+    "k49QhFuJsBuSrRF95VwVgb+cKXE7I/QFof9zc4tc0RnfiBaRZ4XnKPervOD+0SeGN5RggtZs8HSEFB0E5oeema9YuIBSKug6SjCx" ++
+    "UCJkB0392sEQ2Qxiit60z+YJSBEI49pFaoPDxU8utWpkZyA6jOffdsrN/6N1UbAp1CdZ9b1Ab2+8snQtAlT55wdedbdMDxq9o0YN" ++
+    "NEdRX4yoh2j+2jLHc0ITmymk8ovnsm9RfBB8hgjEbESFsx6vKQc/b/+vlbKLfcwyvQ1WG81MuXDiy3VMz+xsQlO7IJBlAgMBAAEC" ++
+    "ggEACm5uFAyNKHUPxkHUrYxJf4pbq2jZKg6KbVbGfSvP5aPDw7ueOEgGY2LKunS+6C0XfRubOzxyYBgoSgTJFpbsaHKTqR4HnV5a" ++
+    "yiLa0utAuy3eYsZUmeT3L5IcMOkqZaxZLgj9boKLHaEeFEIHz+/92e8QoC0kBYwSvQuvpNot5NMu4zjts2AXt1pwnwd8Ygdzmm9h" ++
+    "jYvNgPwkqxSXsiK5i14TFzPWVI3s225IBUdz/84QON90+dDEN9JFWCCXdbl1PIB9tWMXK2EsqvWWW5IgOKMG9Sd4CseVxII+7hHC" ++
+    "KzamW+2/JO40EP+zbEBVjbYK3qKD0JIuurbbTO0JttgS5QKBgQD/JioNG6p92Qq6TtxhEw6LcCDIxVrUcU/pXsA8RveBedM2nfLm" ++
+    "LWfE7IOZ/DixZcUXXu9UlkwmmdfjLmGSoW3FxlzAy1i9KL0Udi/K/Kd/lLa6t3cYolLJtMZOJ6zioPBU/OJkSe/vudVGtDiJ5Q7Z" ++
+    "ZDXGWgiJfe1Z7LAe9dYzywKBgQDd6K52MdEqHS8sTmOjB4o+yZ+Ke0t/clJ5JO9/zSsVa2BlKG4MoIzPOZpRE0OchHlk8mIKJtVr" ++
+    "hOczTFFfmpVaD1Oi0/JhnwOx3n7jp6xhUXjMhZwu6GS6X7w0dP3ZlWaII5G99c9rl3RPKuNxTM70WV4cZ/boa8hRFnFwVCymjwKB" ++
+    "gDP9aNAm9QSTtzXjX9B/+5S6ElQWsr1bIXdiETW3GDPPyRP190qjseNUdjRoSn0LSa/LbmUEAxxSeMUX7FXegumr07aNONXCeVS0" ++
+    "CGUKOm8qtFkzjRb97HShW08NkpLTTGVk6hSZZESqzySLEII4pF/zpWl3awnpGPYb3n9QhIclAoGAFKeXtYCli1n0DhetxnrpLzbt" ++
+    "FqKrQE2Px57ce/TI0dGQw1mkBKDc+lzONEWqwWLDOdYlsfQzYTKZoni0CkYFKMDMdBduNA/s9B1VijMNJHHE4KR/CQ6wcXh/uBI7" ++
+    "noj9ZiaJZjj++XC7brL7QIx5pty6mcJDhRajKokAPghXr5kCgYBNyYMGPvwnTvmfEQWDBYe/0H4Q82Zqh8QNTTzX35DKhPT2RsbL" ++
+    "M1/ePDAWKHXeHIBnMBMc5HklzIvpIRXP3Oze+IfFJlIoJHIRTPHZezrN1BBVOM/9oiW9CDmZYOh5gbnGlRcuo6d5XuP0wUObztXB" ++
+    "vlWHnccBPXjb//zb8KNLDQ==";
+const test_local_key_pkcs1_b64 =
+    "MIIEogIBAAKCAQEA3SvaxSqWUi09UGL3QJj5cV7DxRMDeHryUxYZVr0WEV1KP7ias5OPUIRbibAbkq0RfeVcFYG/nClxOyP0BaH/" ++
+    "c3OLXNEZ34gWkWeF5yj3q7zg/tEnhjeUYILWbPB0hBQdBOaHnpmvWLiAUiroOkowsVAiZAdN/drBENkMYoretM/mCUgRCOPaRWqD" ++
+    "w8VPLrVqZGcgOozn33bKzf+jdVGwKdQnWfW9QG9vvLJ0LQJU+ecHXnW3TA8avaNGDTRHUV+MqIdo/toyx3NCE5sppPKL57JvUXwQ" ++
+    "fIYIxGxEhbMerykHP2//r5Wyi33MMr0NVhvNTLlw4st1TM/sbEJTuyCQZQIDAQABAoIBAApubhQMjSh1D8ZB1K2MSX+KW6to2SoO" ++
+    "im1Wxn0rz+Wjw8O7njhIBmNiyrp0vugtF30bmzs8cmAYKEoEyRaW7Ghyk6keB51eWsoi2tLrQLst3mLGVJnk9y+SHDDpKmWsWS4I" ++
+    "/W6Cix2hHhRCB8/v/dnvEKAtJAWMEr0Lr6TaLeTTLuM47bNgF7dacJ8HfGIHc5pvYY2LzYD8JKsUl7IiuYteExcz1lSN7NtuSAVH" ++
+    "c//OEDjfdPnQxDfSRVggl3W5dTyAfbVjFythLKr1lluSIDijBvUneArHlcSCPu4Rwis2plvtvyTuNBD/s2xAVY22Ct6ig9CSLrq2" ++
+    "20ztCbbYEuUCgYEA/yYqDRuqfdkKuk7cYRMOi3AgyMVa1HFP6V7APEb3gXnTNp3y5i1nxOyDmfw4sWXFF17vVJZMJpnX4y5hkqFt" ++
+    "xcZcwMtYvSi9FHYvyvynf5S2urd3GKJSybTGTies4qDwVPziZEnv77nVRrQ4ieUO2WQ1xloIiX3tWeywHvXWM8sCgYEA3eiudjHR" ++
+    "Kh0vLE5joweKPsmfintLf3JSeSTvf80rFWtgZShuDKCMzzmaURNDnIR5ZPJiCibVa4TnM0xRX5qVWg9TotPyYZ8Dsd5+46esYVF4" ++
+    "zIWcLuhkul+8NHT92ZVmiCORvfXPa5d0TyrjcUzO9FleHGf26GvIURZxcFQspo8CgYAz/WjQJvUEk7c141/Qf/uUuhJUFrK9WyF3" ++
+    "YhE1txgzz8kT9fdKo7HjVHY0aEp9C0mvy25lBAMcUnjFF+xV3oLpq9O2jTjVwnlUtAhlCjpvKrRZM40W/ex0oVtPDZKS00xlZOoU" ++
+    "mWREqs8kixCCOKRf86Vpd2sJ6Rj2G95/UISHJQKBgBSnl7WApYtZ9A4XrcZ66S827Raiq0BNj8ee3Hv0yNHRkMNZpASg3PpczjRF" ++
+    "qsFiwznWJbH0M2EymaJ4tApGBSjAzHQXbjQP7PQdVYozDSRxxOCkfwkOsHF4f7gSO56I/WYmiWY4/vlwu26y+0CMeabcupnCQ4UW" ++
+    "oyqJAD4IV6+ZAoGATcmDBj78J075nxEFgwWHv9B+EPNmaofEDU0819+QyoT09kbGyzNf3jwwFih13hyAZzATHOR5JcyL6SEVz9zs" ++
+    "3viHxSZSKCRyEUzx2Xs6zdQQVTjP/aIlvQg5mWDoeYG5xpUXLqOneV7j9MFDm87Vwb5Vh53HAT142//82/CjSw0=";
+const test_local_cert_b64 =
+    "MIIC3jCCAcagAwIBAgICBKEwDQYJKoZIhvcNAQELBQAwMjEhMB8GA1UEAwwYdm1peiBuYXRpdmUgbG9jYWwgc2lnbmVyMQ0wCwYD" ++
+    "VQQKDAR2bWl6MB4XDTI2MDEwMTAwMDAwMFoXDTM2MDEwMTAwMDAwMFowMjEhMB8GA1UEAwwYdm1peiBuYXRpdmUgbG9jYWwgc2ln" ++
+    "bmVyMQ0wCwYDVQQKDAR2bWl6MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3SvaxSqWUi09UGL3QJj5cV7DxRMDeHry" ++
+    "UxYZVr0WEV1KP7ias5OPUIRbibAbkq0RfeVcFYG/nClxOyP0BaH/c3OLXNEZ34gWkWeF5yj3q7zg/tEnhjeUYILWbPB0hBQdBOaH" ++
+    "npmvWLiAUiroOkowsVAiZAdN/drBENkMYoretM/mCUgRCOPaRWqDw8VPLrVqZGcgOozn33bKzf+jdVGwKdQnWfW9QG9vvLJ0LQJU" ++
+    "+ecHXnW3TA8avaNGDTRHUV+MqIdo/toyx3NCE5sppPKL57JvUXwQfIYIxGxEhbMerykHP2//r5Wyi33MMr0NVhvNTLlw4st1TM/s" ++
+    "bEJTuyCQZQIDAQABMA0GCSqGSIb3DQEBCwUAA4IBAQBNS2/qaGKoAqAPJ0ZeMxsNW/Q1w7vvIZaTwbRVrFOfadxK/V+ep8nzCceD" ++
+    "q+2U8trT28hH1tiI69eUtsMPDfY1l3NO9fbNiI6XRx+r/hG8WLb1/2u08MKWQu0BKLizu1jVSbChrJJp3wB4BwTNX7+IxtKhjM89" ++
+    "ytjINkih+N1xTy/BgSlii+IKuGbb9fhSpeAc3hOTty6GFTWjpQ1/uxryNI4Uxx2XBS03SOoK+6Qcv8cojtZdoFF0MGNye1sEk3ot" ++
+    "8G/8PwaL3exIfJY9VYNW3L87ReO52Vv9krQUSVa1+1C8c1iBxFIftCILOrVP6vr0kIcQBfNaPT75y+lqWkVN";
+const test_other_key_pkcs8_b64 =
+    "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCQXpNLEgJyQI0AuOYgHOxBACYUp0FoU1xzpms1euk67CFaAFVu" ++
+    "yT7bUNAk+j2I2uP/59GbZMC0XDu3tGUh5JNJIHUimEKiyKAs2ouJ4tI0/HowvA2reA9YBXqKyVpilVa9rtneUiKrYiA9O3rESoqL" ++
+    "03ZT/MAU2wG2IDg+GzdE465ZS6uTiU86Z8Jg2TJjarEP57yh1qJcZ1NpKyYPnXDCP8kxQlhkwbegOzlvfAmiOO9q0bSaYKkRXDR5" ++
+    "rYi/ffQyvw5hqs7Ab5BNztdpaF9+vbMQxYWDgP+HqD3irWLSLh157Zg+5NCm8yKpA32ilVSyfiBbvbYRLa1RABQZ+7K1AgMBAAEC" ++
+    "ggEAG/rQZiy736PGEB1FsHSajzB1sOwHf64kTV+0CH3lRN+tyREmfZ2wOnYrmPcMxQDTTm4B0DGTLYFwq3ZhYVO4/eO1//ntdDoY" ++
+    "3QiQIa2dmtpR3i8cIR7YLnGFYe+LPm7+DC4emHlnsbqHUAa+kNt3hYj6tmVWXtRhPQh6jgLdT9LcGw90ePltIssAU5ROrVySwhNS" ++
+    "2OKC9XLwhg/Tgl2CsxJcp4XM6LyrdB3ixG8El9F7j/uxtXrE7hDc09KmgwLUkPKOIsNdKBgl+2ztMw+ZU59zfQZeuKChKdjbt63A" ++
+    "PWJYCh+HCIyKDkQm9Xbgi7FKVgOFO3smTZ3yG8qsw094wQKBgQDBQi9hZiecYgM02zlt2qLDgL8I97i3L89QaIggRYo532euc6Yq" ++
+    "9bou8L0uJ5xr1dIrfwdXHdTFraG1pMkFJuT8SlLjMTzL+GnEFFreM2PI8DqS/Y7/2yRVm03kwGYxfUPHnETb8C0IMJ8upI+3YBSc" ++
+    "gVamOYE/gYO1TwxzCuoQoQKBgQC/PTE9hXONxpAV3p3B0e3JcsdqKizWKc3qxqnndk9gReAALbaxYNlGLZDUuXtnmsxW32E+DRbU" ++
+    "SWFANLsHMg/H+TWTsnCxb6qnpDTTNXUoF5oCWMVlimJfMt13Q9jYXUcucXHuQqdTBbovdmcEHUeW3AMKsjdtv38+2RdxkuDllQKB" ++
+    "gQCTK8fRMG4x1SID+n59feY9Y6oXNi7gsfP6k+A2Uz60W8ElRMTiKkciwAoRP/EK3cYzgYUhfoIuF8/x+A9tcPUoe6Eriq911TMW" ++
+    "MzoPxKrUtryke5uOlF/TIXXsIeiw/2fCduqpYvmoJv7SElevmeeYV5aY92nJ5uNaC1y7rzAYgQKBgQC9/LjyeaX275EtaOApMbme" ++
+    "LF1YZ1Xr3dQorf0VakApUMHc641YYvL3+UStUSf8IZlnpLwivTY06EGpW7mCyIVNEZPci6XRYTKVIVkpiy49ClWCh1Z0LirUkN/c" ++
+    "IJdJPEH/Lc0V+znoDQSPKn3lZIE+qoyLD8ppSZnMgjf8KQMskQKBgE9M2sBljijuxPxcX503tanyzWbmn1EJecqil+SFsuyT0FYs" ++
+    "hw1xC33HiVXZF3JImkzLOkzSNuYA332Y+2t0RVTlmRFhvZ8Dmu5pqBrTTtVm1jS97kHkugCZcBlhqdRTuxTtX1abJIdMGcZIHucP" ++
+    "NZ6A/JVFj1lBt83EDqhFLW8s";
+const test_other_cert_b64 =
+    "MIIC0DCCAbigAwIBAgICBLIwDQYJKoZIhvcNAQELBQAwKzEaMBgGA1UEAwwRdm1peiBvdGhlciBzaWduZXIxDTALBgNVBAoMBHZt" ++
+    "aXowHhcNMjYwMTAxMDAwMDAwWhcNMzYwMTAxMDAwMDAwWjArMRowGAYDVQQDDBF2bWl6IG90aGVyIHNpZ25lcjENMAsGA1UECgwE" ++
+    "dm1pejCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAJBek0sSAnJAjQC45iAc7EEAJhSnQWhTXHOmazV66TrsIVoAVW7J" ++
+    "PttQ0CT6PYja4//n0ZtkwLRcO7e0ZSHkk0kgdSKYQqLIoCzai4ni0jT8ejC8Dat4D1gFeorJWmKVVr2u2d5SIqtiID07esRKiovT" ++
+    "dlP8wBTbAbYgOD4bN0TjrllLq5OJTzpnwmDZMmNqsQ/nvKHWolxnU2krJg+dcMI/yTFCWGTBt6A7OW98CaI472rRtJpgqRFcNHmt" ++
+    "iL999DK/DmGqzsBvkE3O12loX369sxDFhYOA/4eoPeKtYtIuHXntmD7k0KbzIqkDfaKVVLJ+IFu9thEtrVEAFBn7srUCAwEAATAN" ++
+    "BgkqhkiG9w0BAQsFAAOCAQEAClqB4FQWqx/bqN4bYrQeXgtxtEql9XPxEqwH5dHQbwlC5Rw7nJ8h0Tho92wuDG0bDXSHFJFHJYYx" ++
+    "U1PFkx2oz8OquyLl4AgXgvseOsZAbvcebxFAKnqIQ9Y8L6iDICR0qLG0TIEFDfobIoMFL6ff1n4vRY3zygPXcv/mRpihff5GlG3W" ++
+    "e96Dta79yc+J2NqXmIp5vfBbS2udtmwHV5BiY8aqxwDIJah2MxLN5bWhvgRALUS7hv9Kosb1f9XbNmE9/WlJKhV7hQjR56SA973e" ++
+    "hrZ0IRBMXGe0geuPVTsI3MNDuyQ5SnI81iTt3tx98wfN72/gqYwW+7HAX8ns1NUN3w==";
+
+fn decodeTestBase64Alloc(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    const size = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
+    const out = try allocator.alloc(u8, size);
+    errdefer allocator.free(out);
+    try std.base64.standard.Decoder.decode(out, encoded);
+    return out;
+}
+
+test "native local-key signatures verify against the enrolled certificate" {
+    const allocator = std.testing.allocator;
+    const certificate = try decodeTestBase64Alloc(allocator, test_local_cert_b64);
+    defer allocator.free(certificate);
+
+    // The same key expressed as PKCS#8 and as PKCS#1 must sign identically.
+    for ([_][]const u8{ test_local_key_pkcs8_b64, test_local_key_pkcs1_b64 }) |key_b64| {
+        const key = try decodeTestBase64Alloc(allocator, key_b64);
+        defer allocator.free(key);
+        const image = try makeTestPe(allocator, 512);
+        defer allocator.free(image);
+
+        const signed = try signPeRsaSha256Alloc(allocator, image, key, certificate);
+        defer allocator.free(signed);
+
+        const signer = try verifyRsaSha256(signed);
+        try std.testing.expectEqual(@as(u16, 0x8664), signer.machine);
+        try std.testing.expectEqualSlices(u8, certificate, signer.certificate_der);
+        try std.testing.expectEqualSlices(u8, "\x04\xa1", signer.serial_number);
+
+        // Structural identification agrees with cryptographic verification.
+        const identified = try embeddedSigner(signed);
+        try std.testing.expectEqualSlices(u8, certificate, identified.certificate_der);
+    }
+
+    const details = try describeCertificateAlloc(allocator, certificate);
+    defer allocator.free(details);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        details,
+        "subject=CN=vmiz native local signer",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "serial=04a1") != null);
+}
+
+test "native verification fails closed on tampering and signer substitution" {
+    const allocator = std.testing.allocator;
+    const certificate = try decodeTestBase64Alloc(allocator, test_local_cert_b64);
+    defer allocator.free(certificate);
+    const other_certificate = try decodeTestBase64Alloc(allocator, test_other_cert_b64);
+    defer allocator.free(other_certificate);
+    const key = try decodeTestBase64Alloc(allocator, test_local_key_pkcs8_b64);
+    defer allocator.free(key);
+
+    const image = try makeTestPe(allocator, 512);
+    defer allocator.free(image);
+    var prepared = try prepareRsaSha256Alloc(allocator, image);
+    defer prepared.deinit(allocator);
+    const parsed_key = try parseRsaPrivateKeyDer(key);
+    const signature = try signRsaSha256Alloc(allocator, parsed_key, prepared.signing_digest);
+    defer allocator.free(signature);
+
+    const signed = try finishRsaSha256Alloc(allocator, prepared, certificate, signature);
+    defer allocator.free(signed);
+    _ = try verifyRsaSha256(signed);
+
+    // A byte of the image that the signature covers cannot be changed unseen.
+    {
+        const tampered = try allocator.dupe(u8, signed);
+        defer allocator.free(tampered);
+        tampered[0x1f0] ^= 0x01;
+        try std.testing.expectError(
+            error.SignatureVerificationFailed,
+            verifyRsaSha256(tampered),
+        );
+    }
+
+    // A single bit of the signature invalidates it.
+    {
+        const tampered_signature = try allocator.dupe(u8, signature);
+        defer allocator.free(tampered_signature);
+        tampered_signature[0] ^= 0x80;
+        const bad = try finishRsaSha256Alloc(
+            allocator,
+            prepared,
+            certificate,
+            tampered_signature,
+        );
+        defer allocator.free(bad);
+        try std.testing.expectError(
+            error.SignatureVerificationFailed,
+            verifyRsaSha256(bad),
+        );
+    }
+
+    // Substituting a different signer's certificate, whose key did not produce
+    // this signature, is rejected rather than accepted on identity alone.
+    {
+        const substituted = try finishRsaSha256Alloc(
+            allocator,
+            prepared,
+            other_certificate,
+            signature,
+        );
+        defer allocator.free(substituted);
+        try std.testing.expectError(
+            error.SignatureVerificationFailed,
+            verifyRsaSha256(substituted),
+        );
+    }
+
+    // A malformed WIN_CERTIFICATE revision is refused before any crypto.
+    {
+        const malformed = try allocator.dupe(u8, signed);
+        defer allocator.free(malformed);
+        const table_offset = @as(usize, readU32Le(malformed[0x128..][0..4]));
+        writeU16Le(malformed[table_offset + 4 ..][0..2], 0x0100);
+        try std.testing.expectError(
+            error.UnsupportedWinCertificate,
+            verifyRsaSha256(malformed),
+        );
+    }
+
+    // Signing cannot bind a key to a certificate it does not match: the
+    // self-verification inside signing catches it before anything ships.
+    try std.testing.expectError(
+        error.SignatureVerificationFailed,
+        signPeRsaSha256Alloc(allocator, image, key, other_certificate),
+    );
+}
+
+test "native private key decoding rejects malformed and encrypted keys" {
+    const allocator = std.testing.allocator;
+
+    const der = try decodeTestBase64Alloc(allocator, test_local_key_pkcs8_b64);
+    defer allocator.free(der);
+    const parsed = try parseRsaPrivateKeyDer(der);
+    try std.testing.expect(parsed.modulus.len == 256);
+
+    try std.testing.expectError(
+        error.InvalidRsaPrivateKey,
+        parseRsaPrivateKeyDer("\x30\x03\x02\x01\x00"),
+    );
+    try std.testing.expectError(
+        error.InvalidRsaPrivateKey,
+        parseRsaPrivateKeyDer(&[_]u8{ 0x02, 0x01, 0x00 }),
+    );
+
+    // A conforming PEM wrapper round-trips to the same DER; an encrypted key
+    // (which this cannot decrypt) and non-PEM input are refused.
+    const pem = try wrapPemForTest(allocator, "PRIVATE KEY", der);
+    defer allocator.free(pem);
+    const decoded = try decodePrivateKeyPemAlloc(allocator, pem);
+    defer allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, der, decoded);
+
+    try std.testing.expectError(
+        error.InvalidPrivateKeyPem,
+        decodePrivateKeyPemAlloc(
+            allocator,
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidPrivateKeyPem,
+        decodePrivateKeyPemAlloc(allocator, "not a pem file"),
+    );
+}
+
+test "certificate validity that ends before it begins is rejected" {
+    const allocator = std.testing.allocator;
+    const certificate = try decodeTestBase64Alloc(allocator, test_local_cert_b64);
+    defer allocator.free(certificate);
+
+    // certA is valid 2026-01-01..2036-01-01; moving notAfter to 2025 inverts
+    // the interval without disturbing any other field, so only the
+    // chronological rule can reject it.
+    const inverted = try allocator.dupe(u8, certificate);
+    defer allocator.free(inverted);
+    const not_after = std.mem.indexOf(u8, inverted, "360101000000Z").?;
+    inverted[not_after] = '2';
+    inverted[not_after + 1] = '5';
+    try std.testing.expectError(
+        error.InvalidCertificate,
+        validateX509CertificateDer(inverted),
+    );
+}
+
+fn wrapPemForTest(
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    der: []const u8,
+) ![]u8 {
+    const encoded = try allocator.alloc(
+        u8,
+        std.base64.standard.Encoder.calcSize(der.len),
+    );
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, der);
+    var pem: std.Io.Writer.Allocating = .init(allocator);
+    errdefer pem.deinit();
+    try pem.writer.print("-----BEGIN {s}-----\n", .{label});
+    var offset: usize = 0;
+    while (offset < encoded.len) {
+        const end = @min(offset + 64, encoded.len);
+        try pem.writer.writeAll(encoded[offset..end]);
+        try pem.writer.writeByte('\n');
+        offset = end;
+    }
+    try pem.writer.print("-----END {s}-----\n", .{label});
+    return pem.toOwnedSlice();
 }
 
 fn testCertificate() []const u8 {

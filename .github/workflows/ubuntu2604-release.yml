@@ -197,12 +197,12 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           packages=(
-            binutils file jq linux-image-generic openssl
-            python3 python3-pefile sbsigntool systemd-ukify
+            binutils file jq linux-image-generic
+            python3 python3-pefile systemd-ukify
           )
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
           sudo chmod 0644 /boot/vmlinuz-*
-          for tool in sbverify ukify; do
+          for tool in ukify; do
             command -v "$tool" >/dev/null
           done
 
@@ -226,8 +226,7 @@ jobs:
           certificate="$RUNNER_TEMP/vmiz-uki-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CANDIDATE_KEY}.pem"
           umask 077
           "$UKI_SIGN_COMMAND" sign certificate "$certificate"
-          openssl x509 -in "$certificate" -noout
-          actual=$(openssl x509 -in "$certificate" -outform DER | sha256sum | awk '{print $1}')
+          actual=$("$UKI_SIGN_COMMAND" uki fingerprint "$certificate")
           [[ "$actual" =~ ^[0-9a-f]{64}$ ]]
           echo "UKI_SIGNING_CERTIFICATE=$certificate" >> "$GITHUB_ENV"
           echo "UKI_SIGNING_CERTIFICATE_SHA256=$actual" >> "$GITHUB_ENV"
@@ -261,7 +260,7 @@ jobs:
           "$UKI_SIGN_COMMAND" sign
           test -s "$signed"
           test -s "$metadata"
-          sbverify --verbose --cert "$UKI_SIGNING_CERTIFICATE" "$signed"
+          "$UKI_SIGN_COMMAND" uki verify --certificate "$UKI_SIGNING_CERTIFICATE" "$signed"
           rm -rf -- "$scratch"
 
       - name: Upload failed signing probe

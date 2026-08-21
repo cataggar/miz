@@ -190,7 +190,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           packages=(
-            curl dnf file jq openssh-client openssl python3-virt-firmware qemu-utils rpm sbsigntool tar
+            curl dnf file jq openssh-client python3-virt-firmware qemu-utils rpm tar
           )
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
           echo '%_dbpath /usr/lib/sysimage/rpm' | sudo tee /root/.rpmmacros >/dev/null
@@ -216,8 +216,8 @@ jobs:
           certificate="$RUNNER_TEMP/vmiz-uki-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CANDIDATE_KEY}.pem"
           umask 077
           "$UKI_SIGN_COMMAND" sign certificate "$certificate"
-          openssl x509 -in "$certificate" -noout
-          actual=$(openssl x509 -in "$certificate" -outform DER | sha256sum | awk '{print $1}')
+          actual=$("$UKI_SIGN_COMMAND" uki fingerprint "$certificate")
+          [[ "$actual" =~ ^[0-9a-f]{64}$ ]]
           echo "UKI_SIGNING_CERTIFICATE=$certificate" >> "$GITHUB_ENV"
           echo "UKI_SIGNING_CERTIFICATE_SHA256=$actual" >> "$GITHUB_ENV"
 
@@ -250,7 +250,7 @@ jobs:
           "$UKI_SIGN_COMMAND" sign
           test -s "$signed"
           test -s "$metadata"
-          sbverify --verbose --cert "$UKI_SIGNING_CERTIFICATE" "$signed"
+          "$UKI_SIGN_COMMAND" uki verify --certificate "$UKI_SIGNING_CERTIFICATE" "$signed"
           rm -rf -- "$scratch"
 
       - name: Upload failed signing probe

@@ -919,7 +919,12 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertIn("tests/efi_signing_probe.zig", workflow)
         self.assertIn('"$UKI_SIGN_COMMAND" sign', workflow)
         self.assertIn(
-            'sbverify --verbose --cert "$UKI_SIGNING_CERTIFICATE" "$signed"',
+            'actual=$("$UKI_SIGN_COMMAND" uki fingerprint "$certificate")',
+            workflow,
+        )
+        self.assertIn(
+            '"$UKI_SIGN_COMMAND" uki verify '
+            '--certificate "$UKI_SIGNING_CERTIFICATE" "$signed"',
             workflow,
         )
         self.assertIn("Upload failed signing probe", workflow)
@@ -938,7 +943,12 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertNotIn("VMIZ_AZURE_KEY_ID", workflow)
         self.assertNotIn("--uki-signing-key", workflow)
         self.assertIn("python3-virt-firmware", workflow)
-        self.assertIn("sbsigntool", workflow)
+        # Signing, certificate fingerprinting, and Secure Boot verification are
+        # fully native (vmiz uki ...); the external OpenSSL/sbsigntool toolchain
+        # must no longer appear anywhere in the production release workflow.
+        self.assertNotIn("sbsigntool", workflow)
+        self.assertNotIn("sbverify", workflow)
+        self.assertNotIn("openssl", workflow)
 
         azure = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()
         self.assertIn("api-version=2025-03-03", azure)

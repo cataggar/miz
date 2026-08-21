@@ -879,7 +879,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         self.assertNotIn('"curl"', builder)
         self.assertNotIn("gnupg", workflow)
         self.assertNotIn("curl", workflow)
-        self.assertIn("for tool in mount", workflow)
+        self.assertIn("for tool in ukify", workflow)
 
     def test_publisher_is_draft_first_allowlisted_and_fail_safe(self):
         script = (ROOT / "scripts" / "ubuntu2604_publish.sh").read_text()

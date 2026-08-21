@@ -88,8 +88,13 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         # installed or discovered here.
         for removed_tool in ("mount", "mknod", "chroot", "setsid", "timeout", "unshare"):
             self.assertNotIn(removed_tool, install)
-        for required_tool in ("sbverify", "ukify"):
+        for required_tool in ("ukify",):
             self.assertIn(required_tool, install)
+        # Native X.509/Authenticode signing and Secure Boot verification replace
+        # the openssl and sbsigntool utilities, so they must no longer be
+        # installed or discovered in the image-builder dependency step.
+        for removed_signing_tool in ("openssl", "sbsigntool", "sbverify"):
+            self.assertNotIn(removed_signing_tool, install)
         self.assertIn('command -v "$tool"', install)
         for forbidden in (
             "libguestfs",
