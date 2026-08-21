@@ -55,6 +55,11 @@ FIFOs, device numbers, filesystem UUID, and label are retained by the
 existing importer/tree/writer path. `copyOut` copies one regular file; it
 never recursively materializes a guest directory.
 
+The pinned Canonical Ubuntu profile (`descriptor_size = 64`, compat `0x103c`,
+incompat `0x22c2`, and ro-compat `0x046b`) is supported. Commits rebuild its
+e2fsprogs-style `resize_inode` reservation and empty `orphan_file` inode,
+including seeded metadata checksums, rather than dropping those structures.
+
 ## Inspect UKI signing certificates
 
 Open a supported disk format with `vmiz.Image`, then use

@@ -69,6 +69,7 @@ const CommitProfile = struct {
     feature_compat: u32,
     feature_incompat: u32,
     feature_ro_compat: u32,
+    checksum_seed: ?u32 = null,
 };
 
 pub const FileSystem = struct {
@@ -778,6 +779,19 @@ pub const FileSystem = struct {
             .timestamp = std.math.cast(u32, root.mtime orelse 0) orelse 0,
             .journal = .{ .enabled = self.identity.has_journal },
             .preserve_feature_ro_compat = commit_profile.feature_ro_compat,
+            .preserve_feature_compat = if (commit_profile.descriptor_size == 64)
+                commit_profile.feature_compat
+            else
+                null,
+            .preserve_feature_incompat = if (commit_profile.descriptor_size == 64)
+                commit_profile.feature_incompat
+            else
+                null,
+            .descriptor_size = commit_profile.descriptor_size,
+            .preserve_checksum_seed = if (commit_profile.descriptor_size == 64)
+                commit_profile.checksum_seed
+            else
+                null,
         });
         try stage_file.sync(self.io);
         stage_file.close(self.io);
@@ -838,6 +852,19 @@ pub const FileSystem = struct {
                 .feature_compat = self.identity.feature_compat,
                 .feature_incompat = self.identity.feature_incompat,
                 .feature_ro_compat = self.identity.feature_ro_compat,
+            };
+        }
+        if (self.identity.descriptor_size == 64 and
+            self.identity.feature_compat == 0x103c and
+            self.identity.feature_incompat == 0x22c2 and
+            self.identity.feature_ro_compat == 0x046b)
+        {
+            return .{
+                .descriptor_size = 64,
+                .feature_compat = self.identity.feature_compat,
+                .feature_incompat = self.identity.feature_incompat,
+                .feature_ro_compat = self.identity.feature_ro_compat,
+                .checksum_seed = self.identity.checksum_seed,
             };
         }
         return error.UnsupportedCommitProfile;
@@ -956,6 +983,78 @@ test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
     try std.testing.expectError(error.UnsupportedCommitProfile, fs.commit());
     fs.identity.feature_compat = original_compat;
     _ = try fs.commit();
+}
+
+test "mountless commit preserves the pinned Ubuntu descriptor-64 profile" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const image_path = "test-ext4-mountless-pinned.raw";
+    const spool_path = "test-ext4-mountless-pinned.spool";
+    const reopen_spool_path = "test-ext4-mountless-pinned-reopen.spool";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, reopen_spool_path) catch {};
+
+    const length: u64 = 64 * 1024 * 1024;
+    var image = try @import("image.zig").Image.createExclusive(
+        io,
+        image_path,
+        .raw,
+        length,
+        .{},
+    );
+    var image_open = true;
+    defer if (image_open) image.close(io);
+
+    var source_tree = root_tree.RootTree.initMemory(allocator, io, .{});
+    defer source_tree.deinit();
+    try source_tree.putDirectory("etc", .{ .mode = 0o755 });
+    try source_tree.putFileBytes("etc/os-release", "NAME=vmiz\n", .{ .mode = 0o644 });
+    _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
+        .length = length,
+        .label = "ubuntu-root",
+        .uuid = [_]u8{0x71} ** 16,
+        .timestamp = 1_724_000_000,
+        .journal = .{ .enabled = true },
+        .preserve_feature_ro_compat = 0x046b,
+        .preserve_feature_compat = 0x103c,
+        .preserve_feature_incompat = 0x22c2,
+        .descriptor_size = 64,
+        .preserve_checksum_seed = 0x89AB_CDEF,
+    });
+
+    var fs = try FileSystem.open(allocator, io, image.file, .{
+        .length = length,
+        .spool_path = spool_path,
+        .atomic_path = image_path,
+    });
+    const identity = fs.filesystemIdentity();
+    try std.testing.expectEqual(@as(u16, 64), identity.descriptor_size);
+    try std.testing.expectEqual(@as(u32, 0x103c), identity.feature_compat);
+    try std.testing.expectEqual(@as(u32, 0x22c2), identity.feature_incompat);
+    try std.testing.expectEqual(@as(u32, 0x046b), identity.feature_ro_compat);
+    try fs.write("/etc/os-release", "NAME=vmiz-pinned\n", null);
+    _ = try fs.commit();
+    fs.deinit();
+    image.close(io);
+    image_open = false;
+
+    try ext4.expectE2fsckClean(image_path);
+    var reopened_image = try @import("image.zig").Image.openPath(io, image_path);
+    defer reopened_image.close(io);
+    var reopened = try FileSystem.open(allocator, io, reopened_image.file, .{
+        .length = length,
+        .spool_path = reopen_spool_path,
+        .atomic_path = image_path,
+    });
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u16, 64), reopened.filesystemIdentity().descriptor_size);
+    try std.testing.expectEqual(@as(u32, 0x103c), reopened.filesystemIdentity().feature_compat);
+    try std.testing.expectEqual(@as(u32, 0x22c2), reopened.filesystemIdentity().feature_incompat);
+    try std.testing.expectEqual(@as(u32, 0x046b), reopened.filesystemIdentity().feature_ro_compat);
+    const content = try reopened.read(allocator, "/etc/os-release", 64);
+    defer allocator.free(content);
+    try std.testing.expectEqualStrings("NAME=vmiz-pinned\n", content);
 }
 
 test "mountless round trip preserves security metadata and special nodes" {
