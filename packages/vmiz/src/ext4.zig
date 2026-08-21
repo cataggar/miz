@@ -9533,16 +9533,21 @@ test "a real e2fsprogs pinned profile survives import and native growth" {
         &.{ "-h", path },
     )) orelse return error.SkipZigTest;
     defer std.testing.allocator.free(report);
-    for ([_][]const u8{
-        "64bit",
-        "flex_bg",
-        "metadata_csum_seed",
-        "resize_inode",
-        "orphan_file",
-        "Orphan file inode:        12",
-    }) |needle| {
+    for ([_][]const u8{ "64bit", "flex_bg", "metadata_csum_seed", "resize_inode", "orphan_file" }) |needle| {
         try std.testing.expect(std.mem.indexOf(u8, report, needle) != null);
     }
+    var orphan_line_found = false;
+    var report_lines = std.mem.splitScalar(u8, report, '\n');
+    while (report_lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        const prefix = "Orphan file inode:";
+        if (!std.mem.startsWith(u8, trimmed, prefix)) continue;
+        const number = std.fmt.parseInt(u32, std.mem.trim(u8, trimmed[prefix.len..], " \t\r"), 10) catch
+            return error.ExternalToolFailed;
+        try std.testing.expectEqual(@as(u32, 12), number);
+        orphan_line_found = true;
+    }
+    try std.testing.expect(orphan_line_found);
     const inode_report = (try runToolCapture(
         std.testing.allocator,
         "debugfs",
