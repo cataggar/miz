@@ -1041,7 +1041,7 @@ pub fn build(b: *std.Build) void {
         // ---- Ubuntu 26.04: immutable Canonical cloud-image input, Azure
         // package customization, host-side signed UKI, and standalone zstd
         // QCOW2 finalization. The builder is host-native for both guest
-        // architectures; libguestfs performs the isolated guest mutation. ----
+        // architectures and uses the offline-root mount namespace. ----
         const ubuntu2604_builder_mod = b.createModule(.{
             .root_source_file = b.path("scripts/build_generalized_ubuntu2604.zig"),
             .target = b.graph.host,

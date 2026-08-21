@@ -10,6 +10,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const ext4 = @import("ext4.zig");
 const limits_mod = @import("limits.zig");
+const os_customization = @import("os_customization.zig");
 const root_tree = @import("root_tree.zig");
 const tree_cursor = @import("tree_cursor.zig");
 
@@ -547,6 +548,32 @@ pub const FileSystem = struct {
     /// created when the writer cannot reproduce its reserved structures.
     pub fn validateCommitProfile(self: *const FileSystem) !void {
         _ = try self.commitProfile();
+    }
+
+    /// Applies the same declarative OS customization used by the native
+    /// rebuild backend while the imported tree is still mountless. This keeps
+    /// service enablement and account removal out of the guest command
+    /// executor, where they would otherwise require mutable system tools.
+    pub fn applyCustomization(
+        self: *FileSystem,
+        customization: os_customization.OsCustomization,
+        source_date_epoch: u64,
+    ) Error!void {
+        try self.ensureMutable();
+        try os_customization.apply(
+            self.allocator,
+            &self.tree,
+            customization,
+            source_date_epoch,
+        );
+    }
+
+    pub fn generalize(
+        self: *FileSystem,
+        policy: os_customization.GeneralizationPolicy,
+    ) Error!void {
+        try self.ensureMutable();
+        try os_customization.generalize(self.allocator, &self.tree, policy);
     }
 
     pub fn rootMetadata(self: *const FileSystem) root_tree.RootMetadata {

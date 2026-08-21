@@ -3,10 +3,10 @@
 //!
 //! The official cloud disk is the authoritative filesystem/package input.
 //! Its detached signature, signer fingerprint, checksum document, image, and
-//! package manifest are all pinned.  A confined libguestfs customization then
+//! package manifest are all pinned. A native offline-root transaction then
 //! switches the guest to the immutable Ubuntu snapshot, installs the Azure
 //! kernel/agent closure, writes an exact dpkg inventory, and generalizes the
-//! machine.  The UKI is assembled and signed on the host so private signing
+//! machine. The UKI is assembled and signed on the host so private signing
 //! material is never copied into the guest disk.
 
 const std = @import("std");
@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const Io = std.Io;
 const artifact_pipeline = vmiz.artifact_pipeline;
+const offline_root = vmiz.offline_root;
 const package_family = vmiz.package_family;
 const guid = vmiz.guid;
 
@@ -52,6 +53,7 @@ const Profile = struct {
     output: []const u8,
     work_dir: []const u8,
     efi_fallback: []const u8,
+    serial_console: []const u8,
     pe_machine: u16,
     root_partition_table_index: u32,
     root_partition_type_guid: guid.Guid,
@@ -68,6 +70,7 @@ const profiles = [_]Profile{
         .output = "Ubuntu-26.04-x86_64.qcow2",
         .work_dir = ".scratch/ubuntu2604-x86_64",
         .efi_fallback = "BOOTX64.EFI",
+        .serial_console = "console=ttyS0,115200n8",
         .pe_machine = 0x8664,
         .root_partition_table_index = 0,
         .root_partition_type_guid = guid.linux_root_x86_64,
@@ -82,6 +85,7 @@ const profiles = [_]Profile{
         .output = "Ubuntu-26.04-aarch64.qcow2",
         .work_dir = ".scratch/ubuntu2604-aarch64",
         .efi_fallback = "BOOTAA64.EFI",
+        .serial_console = "console=ttyAMA0,115200n8",
         .pe_machine = 0xaa64,
         .root_partition_table_index = 0,
         .root_partition_type_guid = guid.linux_root_aarch64,
@@ -411,70 +415,6 @@ fn validateQcow2Info(allocator: Allocator, bytes: []const u8, expected_size: u64
     if (virtual_size != .integer or virtual_size.integer != expected_size) return error.UnexpectedVirtualSize;
 }
 
-fn customizationScript(allocator: Allocator, profile: *const Profile) ![]u8 {
-    _ = profile;
-    return std.fmt.allocPrint(allocator,
-        \\#!/bin/sh
-        \\set -eux
-        \\export DEBIAN_FRONTEND=noninteractive
-        \\kernel="$(basename "$(readlink -f /boot/vmlinuz)")"
-        \\kernel="${{kernel#vmlinuz-}}"
-        \\case "$kernel" in *-azure) ;; *) echo "linux-azure did not become active" >&2; exit 1;; esac
-        \\update-initramfs -c -k "$kernel"
-        \\install -d -m 0755 /etc/ssh/sshd_config.d /etc/cloud/cloud.cfg.d /etc/netplan /var/lib/vmiz
-        \\cat > /etc/ssh/sshd_config.d/10-vmiz-generalized.conf <<'EOF'
-        \\PasswordAuthentication no
-        \\KbdInteractiveAuthentication no
-        \\PermitRootLogin prohibit-password
-        \\EOF
-        \\cat > /etc/cloud/cloud.cfg.d/90-azure.cfg <<'EOF'
-        \\datasource_list: [ Azure ]
-        \\datasource:
-        \\  Azure:
-        \\    apply_network_config: true
-        \\growpart:
-        \\  mode: auto
-        \\  devices: ['/']
-        \\resize_rootfs: true
-        \\EOF
-        \\cat > /etc/netplan/50-cloud-init.yaml <<'EOF'
-        \\network:
-        \\  version: 2
-        \\  renderer: networkd
-        \\  ethernets:
-        \\    all:
-        \\      match:
-        \\        name: "e*"
-        \\      dhcp4: true
-        \\      dhcp6: true
-        \\EOF
-        \\cat > /etc/waagent.conf <<'EOF'
-        \\Provisioning.Enabled=n
-        \\Provisioning.Agent=auto
-        \\Provisioning.DeleteRootPassword=y
-        \\OS.EnableFIPS=n
-        \\OS.RootDeviceScsiTimeout=300
-        \\ResourceDisk.Format=n
-        \\ResourceDisk.EnableSwap=n
-        \\Logs.Verbose=n
-        \\Extensions.Enabled=y
-        \\AutoUpdate.Enabled=y
-        \\EOF
-        \\systemctl enable systemd-networkd.service systemd-resolved.service ssh.service walinuxagent.service
-        \\ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-        \\dpkg-query -W -f='${{binary:Package}}\t${{Version}}\t${{Architecture}}\n' | LC_ALL=C sort > /var/lib/vmiz/ubuntu2604-package-lock.tsv
-        \\printf '%s\n' '{s}' > /var/lib/vmiz/source-release
-        \\userdel -r ubuntu 2>/dev/null || true
-        \\cloud-init clean --logs
-        \\rm -f /etc/machine-id
-        \\: > /etc/machine-id
-        \\rm -f /var/lib/dbus/machine-id /etc/ssh/ssh_host_* /var/lib/systemd/random-seed
-        \\rm -rf /var/lib/cloud/* /var/lib/waagent/* /var/log/azure/* /var/log/journal/* /tmp/* /var/tmp/*
-        \\sync
-        \\
-    , .{release});
-}
-
 fn verifyCanonicalPublication(
     allocator: Allocator,
     io: Io,
@@ -624,6 +564,38 @@ fn partitionOffsetLength(partition: vmiz.gpt.PartitionEntry) !struct { offset: u
     };
 }
 
+fn rootPartitionGuid(
+    allocator: Allocator,
+    io: Io,
+    image_path: []const u8,
+    profile: *const Profile,
+) !guid.Guid {
+    var image = try vmiz.Image.openPathReadOnly(io, image_path);
+    defer image.close(io);
+    const parsed = try vmiz.gpt.readGpt(image, io, allocator);
+    defer allocator.free(parsed.partitions);
+    const partition = try findNamedRootPartition(parsed.partitions);
+    if (!std.mem.eql(u8, &partition.partition_type_guid, &profile.root_partition_type_guid))
+        return error.RootPartitionTypeMismatch;
+    if (std.mem.eql(u8, &partition.unique_partition_guid, &guid.nil))
+        return error.InvalidRootPartitionGuid;
+    return partition.unique_partition_guid;
+}
+
+fn ukiCmdline(
+    allocator: Allocator,
+    root_guid: guid.Guid,
+    profile: *const Profile,
+) ![]u8 {
+    var root_guid_text: [36]u8 = undefined;
+    const root_guid_value = guid.formatLower(&root_guid_text, root_guid);
+    return std.fmt.allocPrint(
+        allocator,
+        "root=PARTUUID={s} {s}",
+        .{ root_guid_value, profile.serial_console },
+    );
+}
+
 fn labelEquals(label: [16]u8, expected: []const u8) bool {
     if (expected.len > label.len) return false;
     if (!std.mem.eql(u8, label[0..expected.len], expected)) return false;
@@ -695,6 +667,233 @@ fn requireJsonSha256Field(
     const value = parsed.value.object.get(field) orelse return error.DebzEvidenceFieldMissing;
     if (value != .string) return error.DebzEvidenceFieldMissing;
     return artifact_pipeline.formatSha256(try artifact_pipeline.parseSha256(value.string));
+}
+
+fn lessLine(_: void, left: []const u8, right: []const u8) bool {
+    return std.mem.order(u8, left, right) == .lt;
+}
+
+fn sortedPackageLock(allocator: Allocator, bytes: []const u8) ![]u8 {
+    var lines = std.array_list.Managed([]const u8).init(allocator);
+    defer lines.deinit();
+    var iterator = std.mem.splitScalar(u8, bytes, '\n');
+    while (iterator.next()) |line| {
+        if (line.len != 0) try lines.append(line);
+    }
+    std.mem.sort([]const u8, lines.items, {}, lessLine);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    for (lines.items) |line| {
+        try output.writer.writeAll(line);
+        try output.writer.writeByte('\n');
+    }
+    return output.toOwnedSlice();
+}
+
+fn runOfflineCommand(
+    executor: *offline_root.Executor,
+    command: offline_root.Command,
+) !offline_root.CommandResult {
+    return executor.execute(command);
+}
+
+fn validateNativeBootArtifacts(
+    allocator: Allocator,
+    root: *offline_root.Root,
+    release_name: []const u8,
+) !void {
+    const modules_path = try std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{release_name});
+    defer allocator.free(modules_path);
+    const modules = try root.discover(modules_path, "*");
+    defer root.freeFound(modules);
+    if (modules.len == 0) return error.AzureKernelModulesMissing;
+    const modules_dep_path = try std.fmt.allocPrint(allocator, "{s}/modules.dep", .{modules_path});
+    defer allocator.free(modules_dep_path);
+    const modules_dep = root.inspect(modules_dep_path) catch |err| switch (err) {
+        error.PathNotFound => return error.KernelModulesDependencyMissing,
+        else => return err,
+    };
+    defer allocator.free(modules_dep.path);
+    if (modules_dep.kind != .file) return error.KernelModulesDependencyMissing;
+    const initrd_path = try std.fmt.allocPrint(allocator, "/boot/initrd.img-{s}", .{release_name});
+    defer allocator.free(initrd_path);
+    const initrd = root.inspect(initrd_path) catch |err| switch (err) {
+        error.PathNotFound => return error.InitramfsMissing,
+        else => return err,
+    };
+    defer allocator.free(initrd.path);
+    if (initrd.kind != .file or initrd.size == 0) return error.InitramfsMissing;
+}
+
+fn validateUkiBytes(
+    fallback_bytes: []const u8,
+    named_bytes: []const u8,
+    profile: *const Profile,
+) !void {
+    if (!std.mem.eql(u8, fallback_bytes, named_bytes)) return error.FinalUkiMissing;
+    if (try peMachine(fallback_bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
+}
+
+fn customizeOfflineRoot(
+    allocator: Allocator,
+    io: Io,
+    profile: *const Profile,
+    root_path: []const u8,
+    provenance_dir: []const u8,
+) ![]u8 {
+    var root = try offline_root.Root.init(allocator, io, root_path, .{});
+    defer root.deinit();
+    const release_name = try root.activeKernelRelease();
+    errdefer allocator.free(release_name);
+    try root.validateArchitecture(switch (profile.architecture) {
+        .x86_64 => .x86_64,
+        .aarch64 => .aarch64,
+    });
+
+    var executor = try offline_root.Executor.init(allocator, io, .{
+        .root = &root,
+        .architecture = switch (profile.architecture) {
+            .x86_64 => .x86_64,
+            .aarch64 => .aarch64,
+        },
+        .timeout_ms = 30 * 60 * 1000,
+    });
+    defer executor.deinit();
+
+    const directories = [_]offline_root.Operation{
+        .{ .create_directory = .{ .path = "/etc/ssh/sshd_config.d", .mode = 0o755 } },
+        .{ .create_directory = .{ .path = "/etc/cloud/cloud.cfg.d", .mode = 0o755 } },
+        .{ .create_directory = .{ .path = "/etc/netplan", .mode = 0o755 } },
+        .{ .create_directory = .{ .path = "/var/lib/vmiz", .mode = 0o755 } },
+    };
+    try root.apply(&directories);
+
+    const ssh_config =
+        "PasswordAuthentication no\n" ++
+        "KbdInteractiveAuthentication no\n" ++
+        "PermitRootLogin prohibit-password\n";
+    const cloud_config =
+        "datasource_list: [ Azure ]\n" ++
+        "datasource:\n" ++
+        "  Azure:\n" ++
+        "    apply_network_config: true\n" ++
+        "growpart:\n" ++
+        "  mode: auto\n" ++
+        "  devices: ['/']\n" ++
+        "resize_rootfs: true\n";
+    const netplan =
+        "network:\n" ++
+        "  version: 2\n" ++
+        "  renderer: networkd\n" ++
+        "  ethernets:\n" ++
+        "    all:\n" ++
+        "      match:\n" ++
+        "        name: \"e*\"\n" ++
+        "      dhcp4: true\n" ++
+        "      dhcp6: true\n";
+    const waagent =
+        "Provisioning.Enabled=n\n" ++
+        "Provisioning.Agent=auto\n" ++
+        "Provisioning.DeleteRootPassword=y\n" ++
+        "OS.EnableFIPS=n\n" ++
+        "OS.RootDeviceScsiTimeout=300\n" ++
+        "ResourceDisk.Format=n\n" ++
+        "ResourceDisk.EnableSwap=n\n" ++
+        "Logs.Verbose=n\n" ++
+        "Extensions.Enabled=y\n" ++
+        "AutoUpdate.Enabled=y\n";
+    try root.apply(&.{
+        .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-vmiz-generalized.conf", .source = .{ .inline_bytes = ssh_config } } },
+        .{ .write_file = .{ .path = "/etc/cloud/cloud.cfg.d/90-azure.cfg", .source = .{ .inline_bytes = cloud_config } } },
+        .{ .write_file = .{ .path = "/etc/netplan/50-cloud-init.yaml", .source = .{ .inline_bytes = netplan } } },
+        .{ .write_file = .{ .path = "/etc/waagent.conf", .source = .{ .inline_bytes = waagent } } },
+        .{ .replace_symlink = .{ .path = "/etc/resolv.conf", .target = "/run/systemd/resolve/stub-resolv.conf" } },
+    });
+
+    try validateNativeBootArtifacts(allocator, &root, release_name);
+
+    var initramfs = try runOfflineCommand(&executor, .{ .update_initramfs = release_name });
+    defer initramfs.deinit(allocator);
+
+    var package_query = try runOfflineCommand(&executor, .dpkg_query);
+    defer package_query.deinit(allocator);
+    const lock = try sortedPackageLock(allocator, package_query.stdout);
+    defer allocator.free(lock);
+    try root.apply(&.{
+        .{ .write_file = .{
+            .path = "/var/lib/vmiz/ubuntu2604-package-lock.tsv",
+            .source = .{ .inline_bytes = lock },
+        } },
+        .{ .write_file = .{
+            .path = "/var/lib/vmiz/source-release",
+            .source = .{ .inline_bytes = release ++ "\n" },
+        } },
+        .{ .write_file = .{
+            .path = "/etc/machine-id",
+            .source = .{ .inline_bytes = "" },
+            .mode = 0o444,
+        } },
+    });
+
+    var cloud_init = try runOfflineCommand(&executor, .{ .cloud_init_clean = .{ .logs = true } });
+    defer cloud_init.deinit(allocator);
+    try root.apply(&.{
+        .{ .remove = "/var/lib/dbus/machine-id" },
+        .{ .remove = "/var/lib/systemd/random-seed" },
+        .{ .cleanup = .{ .directory = "/etc/ssh", .pattern = "ssh_host_*" } },
+        .{ .cleanup = .{ .directory = "/var/lib/cloud", .pattern = "*" } },
+        .{ .cleanup = .{ .directory = "/var/lib/waagent", .pattern = "*" } },
+        .{ .cleanup = .{ .directory = "/var/log/azure", .pattern = "*" } },
+        .{ .cleanup = .{ .directory = "/var/log/journal", .pattern = "*" } },
+        .{ .cleanup = .{ .directory = "/tmp", .pattern = "*" } },
+        .{ .cleanup = .{ .directory = "/var/tmp", .pattern = "*" } },
+    });
+
+    const modules_path = try std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{release_name});
+    defer allocator.free(modules_path);
+    const initrd_path = try std.fmt.allocPrint(allocator, "/boot/initrd.img-{s}", .{release_name});
+    defer allocator.free(initrd_path);
+    for ([_][]const u8{
+        "/etc/ssh/ssh_host_*",
+        "/var/lib/cloud/*",
+        "/var/lib/waagent/*",
+        "/var/log/azure/*",
+        "/var/log/journal/*",
+        "/tmp/*",
+        "/var/tmp/*",
+    }) |pattern| {
+        const slash = std.mem.lastIndexOfScalar(u8, pattern, '/') orelse return error.InvalidCleanupPattern;
+        const directory = pattern[0..slash];
+        const basename = pattern[slash + 1 ..];
+        const remaining = root.discover(directory, basename) catch |err| switch (err) {
+            error.FileNotFound => &.{},
+            else => return err,
+        };
+        defer root.freeFound(remaining);
+        if (remaining.len != 0) return error.CleanupIncomplete;
+    }
+
+    const evidence_path = try std.fs.path.join(allocator, &.{ provenance_dir, "ubuntu2604-boot-input-evidence.json" });
+    defer allocator.free(evidence_path);
+    var lock_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(lock, &lock_hash, .{});
+    const lock_sha256 = artifact_pipeline.formatSha256(lock_hash);
+    const kernel_path = try std.fmt.allocPrint(allocator, "/boot/vmlinuz-{s}", .{release_name});
+    defer allocator.free(kernel_path);
+    const evidence = try std.json.Stringify.valueAlloc(allocator, .{
+        .schema = 1,
+        .type = "vmiz-ubuntu2604-boot-input-evidence",
+        .architecture = @tagName(profile.architecture),
+        .kernel_release = release_name,
+        .kernel = kernel_path,
+        .initramfs = initrd_path,
+        .modules = modules_path,
+        .package_lock = "/var/lib/vmiz/ubuntu2604-package-lock.tsv",
+        .package_lock_sha256 = @as([]const u8, &lock_sha256),
+    }, .{ .whitespace = .indent_2 });
+    defer allocator.free(evidence);
+    try Dir.cwd().writeFile(io, .{ .sub_path = evidence_path, .data = evidence });
+    return release_name;
 }
 
 fn customizeRootWithDebz(
@@ -899,7 +1098,39 @@ fn customizeRootWithDebz(
         published_transferred = true;
     }
 
+    const release_name = try customizeOfflineRoot(
+        allocator,
+        io,
+        profile,
+        current,
+        provenance_dir,
+    );
+    allocator.free(release_name);
     try native_root.filesystem.importHostTreeWithManifest(current, .{}, &host_manifest);
+    try native_root.filesystem.applyCustomization(.{
+        .services = &.{
+            .{ .name = "systemd-networkd.service", .state = .enabled },
+            .{ .name = "systemd-resolved.service", .state = .enabled },
+            .{ .name = "ssh.service", .state = .enabled },
+            .{ .name = "walinuxagent.service", .state = .enabled },
+        },
+    }, 0);
+    try native_root.filesystem.generalize(.{ .azure = .{
+        .reset_hostname = false,
+        .clear_machine_id = false,
+        .remove_ssh_host_keys = false,
+        .remove_agent_state = false,
+        .remove_dhcp_leases = false,
+        .remove_resolver_configuration = false,
+        .clear_random_seed = false,
+        .remove_users = &.{"ubuntu"},
+    } });
+    if (native_root.filesystem.stat("/home/ubuntu")) |_| {
+        return error.UserCleanupIncomplete;
+    } else |err| switch (err) {
+        error.PathNotFound => {},
+        else => return error.UserCleanupIncomplete,
+    }
     try native_root.finish();
     return .{ .root_path = current, .evidence = evidence };
 }
@@ -1142,6 +1373,142 @@ fn writeSigningProvenance(
     try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
+fn extractNativeBootInputs(
+    allocator: Allocator,
+    io: Io,
+    image_path: []const u8,
+    work_dir: []const u8,
+    extract_dir: []const u8,
+    profile: *const Profile,
+) ![]u8 {
+    var native_root = try openNativeRoot(allocator, io, image_path, work_dir);
+    defer native_root.deinit();
+    const lock_bytes = try native_root.filesystem.read(
+        allocator,
+        "/var/lib/vmiz/ubuntu2604-package-lock.tsv",
+        4 * 1024 * 1024,
+    );
+    defer allocator.free(lock_bytes);
+    try validateExactLockRuntime(allocator, lock_bytes, profile);
+
+    const boot_entries = try native_root.filesystem.list(allocator, "/boot", 4096);
+    defer allocator.free(boot_entries);
+    var release_name: ?[]u8 = null;
+    for (boot_entries) |entry| {
+        const name = std.fs.path.basename(entry.path);
+        if (std.mem.startsWith(u8, name, "vmlinuz-") and
+            std.mem.endsWith(u8, name, "-azure"))
+        {
+            if (release_name != null) return error.MultipleAzureKernels;
+            release_name = try allocator.dupe(u8, name["vmlinuz-".len..]);
+        }
+    }
+    const kernel_release = release_name orelse return error.AzureKernelMissing;
+    errdefer allocator.free(kernel_release);
+    const modules_guest = try std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{kernel_release});
+    defer allocator.free(modules_guest);
+    const modules = try native_root.filesystem.list(allocator, modules_guest, 4096);
+    defer allocator.free(modules);
+    if (modules.len == 0) return error.AzureKernelModulesMissing;
+
+    try Dir.cwd().deleteTree(io, extract_dir);
+    try Dir.cwd().createDirPath(io, extract_dir);
+    const kernel_guest = try std.fmt.allocPrint(allocator, "/boot/vmlinuz-{s}", .{kernel_release});
+    defer allocator.free(kernel_guest);
+    const initrd_guest = try std.fmt.allocPrint(allocator, "/boot/initrd.img-{s}", .{kernel_release});
+    defer allocator.free(initrd_guest);
+    const kernel = try native_root.filesystem.read(allocator, kernel_guest, 256 * 1024 * 1024);
+    defer allocator.free(kernel);
+    const initrd = try native_root.filesystem.read(allocator, initrd_guest, 256 * 1024 * 1024);
+    defer allocator.free(initrd);
+    const os_release = try native_root.filesystem.read(allocator, "/usr/lib/os-release", 64 * 1024);
+    defer allocator.free(os_release);
+    const kernel_host = try std.fmt.allocPrint(allocator, "{s}/vmlinuz-{s}", .{ extract_dir, kernel_release });
+    defer allocator.free(kernel_host);
+    const initrd_host = try std.fmt.allocPrint(allocator, "{s}/initrd.img-{s}", .{ extract_dir, kernel_release });
+    defer allocator.free(initrd_host);
+    const os_release_host = try std.fs.path.join(allocator, &.{ extract_dir, "os-release" });
+    defer allocator.free(os_release_host);
+    try Dir.cwd().writeFile(io, .{ .sub_path = kernel_host, .data = kernel });
+    try Dir.cwd().writeFile(io, .{ .sub_path = initrd_host, .data = initrd });
+    try Dir.cwd().writeFile(io, .{ .sub_path = os_release_host, .data = os_release });
+    return kernel_release;
+}
+
+fn espPartition(partitions: []const vmiz.gpt.PartitionEntry) !vmiz.gpt.PartitionEntry {
+    var found: ?vmiz.gpt.PartitionEntry = null;
+    for (partitions) |partition| {
+        if (!std.mem.eql(u8, &partition.partition_type_guid, &guid.esp)) continue;
+        if (found != null) return error.AmbiguousEspPartition;
+        found = partition;
+    }
+    return found orelse error.MissingEspPartition;
+}
+
+fn insertSignedUki(
+    allocator: Allocator,
+    io: Io,
+    image_path: []const u8,
+    signed_path: []const u8,
+    profile: *const Profile,
+) !void {
+    var image = try vmiz.Image.openPath(io, image_path);
+    defer image.close(io);
+    const parsed = try vmiz.gpt.readGpt(image, io, allocator);
+    defer allocator.free(parsed.partitions);
+    const esp = try espPartition(parsed.partitions);
+    var filesystem = try vmiz.fat32.open(&image, io, .{
+        .offset = esp.first_lba * vmiz.gpt.sector_size,
+        .length = (esp.last_lba - esp.first_lba + 1) * vmiz.gpt.sector_size,
+    });
+    try filesystem.createDir(io, "EFI/Linux");
+    try filesystem.createDir(io, "EFI/BOOT");
+    const signed = try Dir.cwd().readFileAlloc(io, signed_path, allocator, .limited(256 * 1024 * 1024));
+    defer allocator.free(signed);
+    const named = try std.fmt.allocPrint(allocator, "EFI/Linux/{s}", .{profile.efi_fallback});
+    defer allocator.free(named);
+    const fallback = try std.fmt.allocPrint(allocator, "EFI/BOOT/{s}", .{profile.efi_fallback});
+    defer allocator.free(fallback);
+    filesystem.deletePath(io, named) catch |err| switch (err) {
+        error.PathNotFound => {},
+        else => return err,
+    };
+    filesystem.deletePath(io, fallback) catch |err| switch (err) {
+        error.PathNotFound => {},
+        else => return err,
+    };
+    try filesystem.writeFile(io, named, signed);
+    try filesystem.writeFile(io, fallback, signed);
+}
+
+fn validateFinalNativeImage(
+    allocator: Allocator,
+    io: Io,
+    image_path: []const u8,
+    work_dir: []const u8,
+    profile: *const Profile,
+) !void {
+    var image = try vmiz.Image.openPathReadOnly(io, image_path);
+    defer image.close(io);
+    const parsed = try vmiz.gpt.readGpt(image, io, allocator);
+    defer allocator.free(parsed.partitions);
+    const esp = try espPartition(parsed.partitions);
+    var filesystem = try vmiz.fat32.open(&image, io, .{
+        .offset = esp.first_lba * vmiz.gpt.sector_size,
+        .length = (esp.last_lba - esp.first_lba + 1) * vmiz.gpt.sector_size,
+    });
+    const fallback = try std.fmt.allocPrint(allocator, "EFI/BOOT/{s}", .{profile.efi_fallback});
+    defer allocator.free(fallback);
+    const named = try std.fmt.allocPrint(allocator, "EFI/Linux/{s}", .{profile.efi_fallback});
+    defer allocator.free(named);
+    const fallback_bytes = try filesystem.readFileAlloc(io, allocator, fallback);
+    defer allocator.free(fallback_bytes);
+    const named_bytes = try filesystem.readFileAlloc(io, allocator, named);
+    defer allocator.free(named_bytes);
+    try validateUkiBytes(fallback_bytes, named_bytes, profile);
+    _ = work_dir;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
@@ -1213,7 +1580,7 @@ pub fn main(init: std.process.Init) !void {
         return error.ChecksumMismatch;
     if (args.preflight_only) return;
 
-    for (&[_][]const u8{ "qemu-img", "virt-customize", "virt-copy-in", "virt-cat", "virt-ls", "ukify", "sbverify" }) |tool|
+    for (&[_][]const u8{ "qemu-img", "ukify", "sbverify", "unshare", "mount", "umount", "chroot", "mknod", "timeout", "setsid" }) |tool|
         try requireTool(allocator, io, tool);
     const config = try signingConfig(args);
 
@@ -1243,40 +1610,17 @@ pub fn main(init: std.process.Init) !void {
     var debz_customization = try customizeRootWithDebz(allocator, io, profile, mutable, work_dir, provenance_dir);
     defer debz_customization.deinit(allocator);
 
-    const script_path = try std.fs.path.join(allocator, &.{ work_dir, "customize.sh" });
-    defer allocator.free(script_path);
-    const script = try customizationScript(allocator, profile);
-    defer allocator.free(script);
-    try Dir.cwd().writeFile(io, .{ .sub_path = script_path, .data = script });
-    try run(allocator, io, &.{ "virt-customize", "--no-logfile", "-a", mutable, "--run", script_path });
-
-    const lock_dir = try std.fs.path.join(allocator, &.{ work_dir, "lock" });
-    defer allocator.free(lock_dir);
-    try Dir.cwd().deleteTree(io, lock_dir);
-    try Dir.cwd().createDirPath(io, lock_dir);
-    try run(allocator, io, &.{ "virt-copy-out", "-a", mutable, "/var/lib/vmiz/ubuntu2604-package-lock.tsv", lock_dir });
-    const lock_path = try std.fs.path.join(allocator, &.{ lock_dir, "ubuntu2604-package-lock.tsv" });
-    defer allocator.free(lock_path);
-    const lock_bytes = try Dir.cwd().readFileAlloc(io, lock_path, allocator, .limited(4 * 1024 * 1024));
-    defer allocator.free(lock_bytes);
-    try validateExactLockRuntime(allocator, lock_bytes, profile);
-    const kernel_listing = try capture(allocator, io, &.{ "virt-ls", "-a", mutable, "/boot" });
-    defer allocator.free(kernel_listing);
-    const release_name = findAzureKernelRelease(kernel_listing) orelse return error.AzureKernelMissing;
     const extract_dir = try std.fs.path.join(allocator, &.{ work_dir, "uki-input" });
     defer allocator.free(extract_dir);
-    try Dir.cwd().deleteTree(io, extract_dir);
-    try Dir.cwd().createDirPath(io, extract_dir);
-    const kernel_guest = try std.fmt.allocPrint(allocator, "/boot/vmlinuz-{s}", .{release_name});
-    defer allocator.free(kernel_guest);
-    const initrd_guest = try std.fmt.allocPrint(allocator, "/boot/initrd.img-{s}", .{release_name});
-    defer allocator.free(initrd_guest);
-    const modules_guest = try std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{release_name});
-    defer allocator.free(modules_guest);
-    const modules_listing = try capture(allocator, io, &.{ "virt-ls", "-a", mutable, modules_guest });
-    defer allocator.free(modules_listing);
-    if (std.mem.trim(u8, modules_listing, " \t\r\n").len == 0) return error.AzureKernelModulesMissing;
-    try run(allocator, io, &.{ "virt-copy-out", "-a", mutable, kernel_guest, initrd_guest, "/usr/lib/os-release", extract_dir });
+    const release_name = try extractNativeBootInputs(
+        allocator,
+        io,
+        mutable,
+        work_dir,
+        extract_dir,
+        profile,
+    );
+    defer allocator.free(release_name);
 
     const kernel_host = try std.fmt.allocPrint(allocator, "{s}/vmlinuz-{s}", .{ extract_dir, release_name });
     defer allocator.free(kernel_host);
@@ -1286,6 +1630,9 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(os_release_host);
     const os_release_argument = try std.fmt.allocPrint(allocator, "@{s}", .{os_release_host});
     defer allocator.free(os_release_argument);
+    const root_partition_guid = try rootPartitionGuid(allocator, io, mutable, profile);
+    const cmdline = try ukiCmdline(allocator, root_partition_guid, profile);
+    defer allocator.free(cmdline);
     const unsigned_uki = try std.fs.path.join(allocator, &.{ work_dir, "ubuntu2604.unsigned.efi" });
     defer allocator.free(unsigned_uki);
     try run(allocator, io, &.{
@@ -1293,7 +1640,7 @@ pub fn main(init: std.process.Init) !void {
         "--linux",      kernel_host,
         "--initrd",     initrd_host,
         "--os-release", os_release_argument,
-        "--cmdline",    "root=LABEL=cloudimg-rootfs ro console=tty1 console=ttyS0 earlyprintk=ttyS0 panic=-1",
+        "--cmdline",    cmdline,
         "--output",     unsigned_uki,
     });
 
@@ -1321,23 +1668,18 @@ pub fn main(init: std.process.Init) !void {
     try Dir.cwd().writeFile(io, .{ .sub_path = signed_path, .data = signed.bytes });
     try uki_signing.verifyBytes(allocator, io, config, signing_scratch, 0, signed.bytes);
 
-    try run(allocator, io, &.{ "virt-customize", "--no-logfile", "-a", mutable, "--mkdir", "/boot/efi/EFI/Linux", "--mkdir", "/boot/efi/EFI/BOOT" });
-    try run(allocator, io, &.{ "virt-copy-in", "-a", mutable, signed_path, "/boot/efi/EFI/Linux" });
-    try run(allocator, io, &.{ "virt-copy-in", "-a", mutable, signed_path, "/boot/efi/EFI/BOOT" });
+    try insertSignedUki(allocator, io, mutable, signed_path, profile);
     try run(allocator, io, &.{ "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2", "-o", "compat=1.1,compression_type=zstd", "-c", mutable, output });
     const info = try capture(allocator, io, &.{ "qemu-img", "info", "--output=json", output });
     defer allocator.free(info);
     try validateQcow2Info(allocator, info, args.size);
-    const fallback_listing = try capture(allocator, io, &.{ "virt-ls", "-a", output, "/boot/efi/EFI/BOOT" });
-    defer allocator.free(fallback_listing);
-    if (std.mem.indexOf(u8, fallback_listing, profile.efi_fallback) == null) return error.FinalUkiMissing;
-    const named_listing = try capture(allocator, io, &.{ "virt-ls", "-a", output, "/boot/efi/EFI/Linux" });
-    defer allocator.free(named_listing);
-    if (std.mem.indexOf(u8, named_listing, profile.efi_fallback) == null) return error.FinalUkiMissing;
-    const os_release = try capture(allocator, io, &.{ "virt-cat", "-a", output, "/etc/os-release" });
+    try validateFinalNativeImage(allocator, io, output, work_dir, profile);
+    var final_root = try openNativeRoot(allocator, io, output, work_dir);
+    defer final_root.deinit();
+    const os_release = try final_root.filesystem.read(allocator, "/etc/os-release", 64 * 1024);
     defer allocator.free(os_release);
     if (std.mem.indexOf(u8, os_release, "VERSION_ID=\"26.04\"") == null) return error.WrongGuestRelease;
-    const final_lock = try capture(allocator, io, &.{ "virt-cat", "-a", output, "/var/lib/vmiz/ubuntu2604-package-lock.tsv" });
+    const final_lock = try final_root.filesystem.read(allocator, "/var/lib/vmiz/ubuntu2604-package-lock.tsv", 4 * 1024 * 1024);
     defer allocator.free(final_lock);
     try validateExactLockRuntime(allocator, final_lock, profile);
     if (try peMachine(signed.bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
@@ -1557,6 +1899,85 @@ test "Azure kernel discovery is architecture-neutral and exact" {
         findAzureKernelRelease("config\nvmlinuz-7.0.0-1001-azure\n").?,
     );
     try std.testing.expect(findAzureKernelRelease("vmlinuz-7.0.0-28-generic\n") == null);
+}
+
+test "UKI cmdline binds final root PARTUUID and native serial console" {
+    const root_guid = guid.parse("11111111-2222-3333-4444-555555555555");
+    const x86_cmdline = try ukiCmdline(std.testing.allocator, root_guid, profileFor(.x86_64));
+    defer std.testing.allocator.free(x86_cmdline);
+    try std.testing.expectEqualStrings(
+        "root=PARTUUID=11111111-2222-3333-4444-555555555555 console=ttyS0,115200n8",
+        x86_cmdline,
+    );
+    const arm_cmdline = try ukiCmdline(std.testing.allocator, root_guid, profileFor(.aarch64));
+    defer std.testing.allocator.free(arm_cmdline);
+    try std.testing.expectEqualStrings(
+        "root=PARTUUID=11111111-2222-3333-4444-555555555555 console=ttyAMA0,115200n8",
+        arm_cmdline,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, x86_cmdline, "LABEL=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, arm_cmdline, "ttyS0") == null);
+}
+
+test "native boot validation rejects missing modules.dep and initramfs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const root_path = try std.fs.path.join(allocator, &.{ cwd, ".scratch/ubuntu-native-boot-validation" });
+    defer allocator.free(root_path);
+    Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, root_path);
+    var root = try offline_root.Root.init(allocator, io, root_path, .{});
+    defer root.deinit();
+    try root.createDirectory("/lib/modules/7.0.0-1001-azure", 0o755);
+    try root.createDirectory("/boot", 0o755);
+    try root.writeFile(.{
+        .path = "/lib/modules/7.0.0-1001-azure/kernel",
+        .source = .{ .inline_bytes = "module" },
+    });
+    try root.writeFile(.{
+        .path = "/boot/initrd.img-7.0.0-1001-azure",
+        .source = .{ .inline_bytes = "initrd" },
+    });
+    try std.testing.expectError(
+        error.KernelModulesDependencyMissing,
+        validateNativeBootArtifacts(allocator, &root, "7.0.0-1001-azure"),
+    );
+    try root.writeFile(.{
+        .path = "/lib/modules/7.0.0-1001-azure/modules.dep",
+        .source = .{ .inline_bytes = "" },
+    });
+    try validateNativeBootArtifacts(allocator, &root, "7.0.0-1001-azure");
+    try root.remove("/lib/modules/7.0.0-1001-azure/modules.dep", false);
+    try std.testing.expectError(
+        error.KernelModulesDependencyMissing,
+        validateNativeBootArtifacts(allocator, &root, "7.0.0-1001-azure"),
+    );
+    try root.writeFile(.{
+        .path = "/lib/modules/7.0.0-1001-azure/modules.dep",
+        .source = .{ .inline_bytes = "" },
+    });
+    try root.remove("/boot/initrd.img-7.0.0-1001-azure", false);
+    try std.testing.expectError(
+        error.InitramfsMissing,
+        validateNativeBootArtifacts(allocator, &root, "7.0.0-1001-azure"),
+    );
+}
+
+test "native ESP UKI validation preserves exact signed bytes and machine" {
+    var uki: [0x86]u8 = @splat(0);
+    @memcpy(uki[0..2], "MZ");
+    std.mem.writeInt(u32, uki[0x3c..0x40], 0x80, .little);
+    @memcpy(uki[0x80..0x84], "PE\x00\x00");
+    std.mem.writeInt(u16, uki[0x84..0x86], 0x8664, .little);
+    try validateUkiBytes(&uki, &uki, profileFor(.x86_64));
+    var different = uki;
+    different[0x85] ^= 1;
+    try std.testing.expectError(error.FinalUkiMissing, validateUkiBytes(&uki, &different, profileFor(.x86_64)));
+    std.mem.writeInt(u16, uki[0x84..0x86], 0xaa64, .little);
+    try std.testing.expectError(error.WrongUkiArchitecture, validateUkiBytes(&uki, &uki, profileFor(.x86_64)));
 }
 
 test "UKI architecture validation parses the PE machine field" {

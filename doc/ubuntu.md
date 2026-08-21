@@ -66,7 +66,9 @@ priority and no recommends or downgrades, and retain both the exact lock and
 equal the lock's semantic digest. The final sorted dpkg inventory at
 `/var/lib/vmiz/ubuntu2604-package-lock.tsv` must contain the Azure kernel,
 agent, cloud-init, and OpenSSH for the selected architecture and no foreign
-amd64/arm64 packages.
+amd64/arm64 packages. The native inspection records the selected kernel,
+initramfs, modules directory, and exact lock digest in
+`internal-provenance/ubuntu2604-boot-input-evidence.json`.
 
 ## Guest and disk contract
 
@@ -107,19 +109,20 @@ builder dependencies as the release workflow:
 ```console
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
-  binutils cpio curl file gnupg jq libguestfs-tools liblzma-dev libzstd-dev \
+  binutils cpio curl file gnupg jq liblzma-dev libzstd-dev \
   linux-image-generic openssl \
   python3 python3-pefile qemu-utils sbsigntool systemd-ukify \
-  tar xorriso xz-utils zstd
+  util-linux xorriso xz-utils zstd
 sudo chmod 0644 /boot/vmlinuz-*
-sudo chmod 0666 /dev/kvm
 ```
 
-The permission adjustment lets the unprivileged libguestfs `supermin` process
-read the appliance kernel installed by `linux-image-generic` and use native KVM
-acceleration when `/dev/kvm` is available. On hosts without KVM, set
-`LIBGUESTFS_BACKEND_SETTINGS=force_tcg` so libguestfs does not select
-KVM-specific Arm machine settings before falling back to emulation.
+The full build runs the bounded guest-tool allowlist in a private mount, PID,
+and network namespace, so it must be invoked with `sudo` on Linux. The executor
+mounts only `dev`, `proc`, `sys`, and `run`, creates the four required device
+nodes plus an isolated `tmp`, and tears the namespace down after every
+command. `update-initramfs`, `dpkg-query`, and optional `cloud-init clean` are
+the only guest commands; systemd enablement and account removal are native
+mountless operations.
 
 Run a source-pin preflight (requiring only `curl` and `gpg`) with:
 
@@ -132,14 +135,14 @@ A full build requires signing. For local development, supply exactly one
 certificate and private key:
 
 ```console
-zig build -Dubuntu2604-arch=x86_64 generalized-ubuntu2604 -- \
+sudo -E zig build -Dubuntu2604-arch=x86_64 generalized-ubuntu2604 -- \
   --provenance-dir artifacts/x86_64/internal-provenance \
   --output artifacts/x86_64/Ubuntu-26.04-x86_64.qcow2 \
   --uki-signing-certificate test.pem \
   --uki-signing-certificate-sha256 <canonical-DER-SHA-256> \
   --uki-signing-key test.key
 
-zig build -Dubuntu2604-arch=aarch64 generalized-ubuntu2604 -- \
+sudo -E zig build -Dubuntu2604-arch=aarch64 generalized-ubuntu2604 -- \
   --provenance-dir artifacts/aarch64/internal-provenance \
   --output artifacts/aarch64/Ubuntu-26.04-aarch64.qcow2 \
   --uki-signing-certificate test.pem \
