@@ -164,6 +164,12 @@ pub const FileSystem = struct {
         return self.identity;
     }
 
+    /// Rejects a source before a host package stage or image stage is
+    /// created when the writer cannot reproduce its reserved structures.
+    pub fn validateCommitProfile(self: *const FileSystem) !void {
+        _ = try self.commitProfile();
+    }
+
     pub fn rootMetadata(self: *const FileSystem) root_tree.RootMetadata {
         return self.tree.rootMetadata();
     }
@@ -711,7 +717,7 @@ pub const FileSystem = struct {
         if (!self.sameSourceStat(current_stat) or !self.sameSourceStat(atomic_stat)) {
             return error.AtomicSourceChanged;
         }
-        const commit_profile = try self.validateCommitProfile();
+        const commit_profile = try self.commitProfile();
         const cursor = try self.tree.cursor();
         const root = self.tree.rootMetadata();
         const label = self.identity.label;
@@ -772,11 +778,6 @@ pub const FileSystem = struct {
             .timestamp = std.math.cast(u32, root.mtime orelse 0) orelse 0,
             .journal = .{ .enabled = self.identity.has_journal },
             .preserve_feature_ro_compat = commit_profile.feature_ro_compat,
-            .preserve_feature_compat = commit_profile.feature_compat,
-            .preserve_feature_incompat = commit_profile.feature_incompat,
-            .descriptor_size = commit_profile.descriptor_size,
-            .preserve_checksum_seed = if (commit_profile.feature_incompat &
-                ext4.feature_incompat_csum_seed != 0) self.identity.checksum_seed else null,
         });
         try stage_file.sync(self.io);
         stage_file.close(self.io);
@@ -807,7 +808,7 @@ pub const FileSystem = struct {
             std.meta.eql(observed.ctime, self.source_ctime);
     }
 
-    fn validateCommitProfile(self: *const FileSystem) !CommitProfile {
+    fn commitProfile(self: *const FileSystem) !CommitProfile {
         if (self.identity.inode_size != 256) {
             return error.UnsupportedCommitProfile;
         }
@@ -834,22 +835,6 @@ pub const FileSystem = struct {
         {
             return .{
                 .descriptor_size = 32,
-                .feature_compat = self.identity.feature_compat,
-                .feature_incompat = self.identity.feature_incompat,
-                .feature_ro_compat = self.identity.feature_ro_compat,
-            };
-        }
-        // Pinned Canonical Ubuntu 26.04 roots use this exact 64-bit
-        // descriptor/profile tuple. It is handled separately from the
-        // ordinary writer profile so a subset cannot silently gain mandatory
-        // bits or lose checksum/layout semantics.
-        if (self.identity.descriptor_size == 64 and
-            self.identity.feature_compat == 0x103c and
-            self.identity.feature_incompat == 0x22c2 and
-            self.identity.feature_ro_compat == 0x046b)
-        {
-            return .{
-                .descriptor_size = 64,
                 .feature_compat = self.identity.feature_compat,
                 .feature_incompat = self.identity.feature_incompat,
                 .feature_ro_compat = self.identity.feature_ro_compat,
@@ -1123,12 +1108,6 @@ test "mountless round trip preserves security metadata and special nodes" {
     try fs.mkdir("/empty", .{ .mode = 0 });
     try fs.write("/empty/file", "new", null);
     try fs.remove("/empty", true);
-    fs.identity.descriptor_size = 64;
-    fs.identity.feature_compat = 0x103c;
-    fs.identity.feature_incompat = 0x22c2;
-    fs.identity.feature_ro_compat = 0x046b;
-    fs.identity.has_journal = true;
-    fs.identity.checksum_seed = 0x12345678;
     _ = try fs.commit();
     fs.deinit();
     fs_open = false;
@@ -1144,11 +1123,7 @@ test "mountless round trip preserves security metadata and special nodes" {
     });
     defer reopened.deinit();
     try std.testing.expectEqual(@as(u16, 0), (try reopened.stat("/etc/void")).metadata.mode);
-    try std.testing.expectEqual(@as(u16, 64), reopened.filesystemIdentity().descriptor_size);
-    try std.testing.expectEqual(@as(u32, 0x103c), reopened.filesystemIdentity().feature_compat);
-    try std.testing.expectEqual(@as(u32, 0x22c2), reopened.filesystemIdentity().feature_incompat);
-    try std.testing.expectEqual(@as(u32, 0x046b), reopened.filesystemIdentity().feature_ro_compat);
-    try std.testing.expectEqual(@as(u32, 0x12345678), reopened.filesystemIdentity().checksum_seed);
+    try std.testing.expectEqual(@as(u16, 32), reopened.filesystemIdentity().descriptor_size);
     try std.testing.expectEqual(@as(usize, 3), (try reopened.stat("/")).metadata.xattrs.len);
     try std.testing.expectEqual(
         @as(usize, 1),
