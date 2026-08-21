@@ -68,6 +68,8 @@ contains the displaced original and is retained for operator-managed recovery;
 vmiz never removes it automatically. Linux publication treats the exchange as
 the linearization point; later pathname replacements are not rolled back or
 deleted, and durability failures retain the recovery directory.
+The atomic destination must not be a final-component symlink and must retain
+the pinned filesystem device/inode identity through publication.
 
 The pinned Canonical Ubuntu profile (`descriptor_size = 64`, compat `0x103c`,
 incompat `0x22c2`, and ro-compat `0x046b`) is supported. Commits rebuild its

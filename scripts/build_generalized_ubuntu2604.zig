@@ -563,7 +563,17 @@ const NativeRoot = struct {
     }
 
     fn finish(self: *NativeRoot) !void {
-        var commit_result = try self.filesystem.commit();
+        var commit_result = self.filesystem.commit() catch |err| {
+            if (self.filesystem.recoveryArtifactPath()) |path| {
+                std.debug.print(
+                    "native ext4 commit failed: {s}; recovery artifact retained at {s}\n",
+                    .{ @errorName(err), path },
+                );
+            } else {
+                std.debug.print("native ext4 commit failed: {s}\n", .{@errorName(err)});
+            }
+            return err;
+        };
         defer commit_result.deinit();
         std.debug.print(
             "native ext4 recovery artifact retained at {s}\n",

@@ -451,6 +451,7 @@ pub const FileSystem = struct {
     test_after_exchange_hook_ctx: ?*anyopaque = null,
     test_stage_ready_hook: ?*const fn (ctx: *anyopaque, stage_path: []const u8) anyerror!void = null,
     test_stage_ready_hook_ctx: ?*anyopaque = null,
+    test_fail_durability_after_exchange: bool = false,
     recovery_path: ?[]u8 = null,
 
     /// Opens and imports an ext4 partition without mounting it. The source
@@ -1258,6 +1259,9 @@ pub const FileSystem = struct {
                     atomic_path,
                 );
             }
+            if (self.test_fail_durability_after_exchange) {
+                return error.AtomicDurabilityUnknown;
+            }
         }
 
         syncDestinationDirectory(self.io, atomic_path) catch
@@ -1540,8 +1544,7 @@ test "atomic commit preserves host image mode timestamps and xattrs" {
         32 * 1024 * 1024,
         .{},
     );
-    var image_open = true;
-    defer if (image_open) image.close(io);
+    defer image.close(io);
     var source_tree = root_tree.RootTree.initMemory(allocator, io, .{});
     defer source_tree.deinit();
     try source_tree.putFileBytes("etc", "source", .{ .mode = 0o600 });
@@ -1592,8 +1595,6 @@ test "atomic commit preserves host image mode timestamps and xattrs" {
     }
     fs.deinit();
     fs_open = false;
-    image.close(io);
-    image_open = false;
 
     const stat = try Io.Dir.cwd().statFile(io, image_path, .{});
     try std.testing.expectEqual(
@@ -1717,6 +1718,47 @@ test "atomic commit preserves a replacement after exchange and leaves recovery a
     const replacement_stat = try Io.Dir.cwd().statFile(io, image_path, .{});
     try std.testing.expectEqual(@as(u64, 32 * 1024 * 1024), replacement_stat.size);
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, recovery_path, .{}));
+}
+
+test "durability failure exposes recovery path before filesystem teardown" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const image_path = "test-ext4-mountless-durability-failure.raw";
+    const spool_path = "test-ext4-mountless-durability-failure.spool";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    var image = try @import("image.zig").Image.createExclusive(
+        io,
+        image_path,
+        .raw,
+        32 * 1024 * 1024,
+        .{},
+    );
+    defer image.close(io);
+    var source_tree = root_tree.RootTree.initMemory(allocator, io, .{});
+    defer source_tree.deinit();
+    try source_tree.putFileBytes("etc", "source", .{ .mode = 0o600 });
+    _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
+        .length = 32 * 1024 * 1024,
+    });
+
+    var fs = try FileSystem.open(allocator, io, image.file, .{
+        .length = 32 * 1024 * 1024,
+        .spool_path = spool_path,
+        .atomic_path = image_path,
+    });
+    fs.test_fail_durability_after_exchange = true;
+    try std.testing.expectError(error.AtomicDurabilityUnknown, fs.commit());
+    const recovery_path = try allocator.dupe(
+        u8,
+        fs.recoveryArtifactPath() orelse return error.AtomicPublishUnrecoverable,
+    );
+    fs.deinit();
+    const recovery_stat = try Io.Dir.cwd().statFile(io, recovery_path, .{});
+    try std.testing.expectEqual(Io.File.Kind.directory, recovery_stat.kind);
+    try Io.Dir.cwd().deleteTree(io, recovery_path);
+    allocator.free(recovery_path);
 }
 
 test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
