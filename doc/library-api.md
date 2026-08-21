@@ -42,7 +42,8 @@ defer allocator.free(bytes);
 try fs.mkdir("/etc/vmiz", .{ .mode = 0o700 });
 try fs.write("/etc/vmiz/config", "enabled\n", null);
 try fs.remove("/var/cache/old", true);
-_ = try fs.commit();
+const commit = try fs.commit();
+try fs.cleanupRecoveryArtifact();
 ```
 
 `stat`, `list`, `read`, `readLink`, `write`, `mkdir`, `remove`, `copyIn`, and
@@ -58,10 +59,12 @@ never recursively materializes a guest directory.
 On Linux, `commit` also captures and reapplies the atomic image path's mode,
 owner/group, atime/mtime, ACL xattrs, and all other host xattrs to the closed
 stage before publication; metadata capture or application failure aborts the
-transaction without replacing the source. Linux publication uses an atomic
-conditional exchange and validates both the staged object and the displaced
-source before cleanup, so a non-cooperating replacement is preserved and
-reported as `AtomicSourceChanged`.
+transaction without replacing the source. `commit` returns the filesystem
+result plus a recovery-artifact path. Cleanup is explicit: callers must call
+`cleanupRecoveryArtifact`, which conditionally removes only the exact displaced
+object and otherwise retains it. Linux publication treats the exchange as the
+linearization point; later pathname replacements are not rolled back or
+deleted, and durability failures retain the recovery artifact.
 
 The pinned Canonical Ubuntu profile (`descriptor_size = 64`, compat `0x103c`,
 incompat `0x22c2`, and ro-compat `0x046b`) is supported. Commits rebuild its
