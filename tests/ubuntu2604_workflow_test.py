@@ -64,19 +64,27 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         self.assertIn("liblzma-dev", install)
         self.assertIn("libzstd-dev", install)
         self.assertIn("linux-image-generic", install)
+        self.assertIn("util-linux", install)
         apt_install = install.index(
             'sudo apt-get install -y --no-install-recommends "${packages[@]}"'
         )
         kernel_access = install.index("sudo chmod 0644 /boot/vmlinuz-*")
-        kvm_access = install.index("sudo chmod 0666 /dev/kvm")
         self.assertLess(apt_install, kernel_access)
-        self.assertLess(kernel_access, kvm_access)
-        self.assertIn("virt-tar-out", install)
-        self.assertIn("if [[ -e /dev/kvm ]]", install)
-        self.assertIn(
-            'echo "LIBGUESTFS_BACKEND_SETTINGS=force_tcg" >> "$GITHUB_ENV"',
-            install,
-        )
+        for tool in ("mount", "mknod", "chroot", "timeout", "unshare"):
+            self.assertIn(tool, install)
+        self.assertIn('command -v "$tool"', install)
+        for forbidden in (
+            "libguestfs",
+            "virt-customize",
+            "virt-copy-in",
+            "virt-copy-out",
+            "virt-ls",
+            "virt-cat",
+            "sudo chmod 0666 /dev/kvm",
+            "LIBGUESTFS_BACKEND_SETTINGS",
+            "force_tcg",
+        ):
+            self.assertNotIn(forbidden, install)
 
     def test_build_log_pipeline_prepares_work_dir_and_propagates_failures(self) -> None:
         build = self.source.split(
@@ -91,6 +99,8 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         self.assertLess(pipefail, tee)
         self.assertLess(mkdir, build_log)
         self.assertLess(build_log, tee)
+        self.assertIn('sudo -E "$(command -v zig)" build', build)
+        self.assertIn('sudo chown -R "$(id -u):$(id -g)"', build)
 
     def test_native_acceptance_cannot_silently_skip(self) -> None:
         native = self.source.split("  native_qemu:", 1)[1].split(
