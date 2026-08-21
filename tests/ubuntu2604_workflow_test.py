@@ -136,6 +136,32 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
             cleanup,
         )
         self.assertNotIn('rm -rf -- "$BUNDLE_DIR"', cleanup)
+        # Cleanup must attempt every removal and surface failures without
+        # masking the original build failure: aggregate a status and exit with
+        # it rather than letting a failed sudo rm be swallowed by a later
+        # succeeding command.
+        self.assertIn("set -uo pipefail", cleanup)
+        self.assertIn("status=0", cleanup)
+        self.assertIn(
+            'sudo rm -rf -- "$WORK_DIR" "$BUNDLE_DIR" || status=1',
+            cleanup,
+        )
+        self.assertIn('exit "$status"', cleanup)
+        # Signing material cleanup is preserved.
+        self.assertIn('rm -rf -- "$SIGNING_PROBE_DIR" || status=1', cleanup)
+        self.assertIn('rm -f -- "${UKI_SIGNING_CERTIFICATE:-}" || status=1', cleanup)
+        # No broad chmod is used to make outputs readable; ownership is
+        # normalized with a targeted chown in the build step instead.
+        self.assertNotIn("chmod", cleanup)
+
+    def test_release_identifier_is_the_next_immutable_tag(self) -> None:
+        # The workflow targets a single immutable release identifier across the
+        # concurrency group, tag, and title. Advancing it must be atomic and the
+        # superseded identifier must not linger anywhere in the workflow.
+        self.assertIn("group: ubuntu2604-release-20260828", self.source)
+        self.assertIn("RELEASE_TAG: Ubuntu-26.04-20260828", self.source)
+        self.assertIn("RELEASE_TITLE: Ubuntu Server 26.04 - 20260828", self.source)
+        self.assertNotIn("20260827", self.source)
 
     def test_forbidden_tools_are_confined_to_optional_oracle_jobs(self) -> None:
         jobs = list(re.finditer(r"(?m)^  ([a-z][a-z0-9_]*):\n", self.source))

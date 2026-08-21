@@ -44,6 +44,7 @@ const manifest_max_size: u64 = 256 * 1024;
 const sums_max_size: u64 = 64 * 1024;
 const signature_max_size: u64 = 16 * 1024;
 const public_key_max_size: usize = 4 * 1024;
+const keyring_max_size: usize = 1024 * 1024;
 
 const Architecture = enum {
     x86_64,
@@ -215,11 +216,11 @@ fn profileFor(architecture: Architecture) *const Profile {
 fn packageFamilyRequest(
     operation: package_family.Operation,
     profile: *const Profile,
-    package: []const u8,
+    packages: []const []const u8,
     root_stage: []const u8,
     published_root: []const u8,
-    source_config_path: []const u8,
-    keyring_path: []const u8,
+    config_paths: []const []const u8,
+    keyring_paths: []const []const u8,
     cache_path: []const u8,
     state_path: []const u8,
     lock_path: []const u8,
@@ -228,7 +229,7 @@ fn packageFamilyRequest(
         .family = .debian,
         .distribution = .ubuntu_26_04,
         .operation = operation,
-        .packages = &.{package},
+        .packages = packages,
         .inputs = .{
             .root_stage = root_stage,
             .published_root = published_root,
@@ -237,8 +238,8 @@ fn packageFamilyRequest(
                 .aarch64 => .arm64,
             },
             .source_paths = &.{},
-            .keyring_paths = &.{keyring_path},
-            .config_paths = &.{source_config_path},
+            .keyring_paths = keyring_paths,
+            .config_paths = config_paths,
             .cache_path = cache_path,
             .state_path = state_path,
             .lock_input_path = if (operation == .resolve_lock) null else lock_path,
@@ -252,6 +253,96 @@ fn packageFamilyRequest(
             .deadline_ms = 30 * 60 * 1000,
         },
     };
+}
+
+/// Assert a package-family request keeps every source, config, keyring, cache,
+/// state, and lock path outside both `root_stage` and `published_root` before
+/// it is dispatched. The policy lives in `package_family`, so resolve and
+/// customize requests are validated with the boundary's own rules instead of a
+/// duplicated copy here.
+fn assertRequestSeparation(request: package_family.Request) !void {
+    if (package_family.requestViolation(request)) |message| {
+        std.debug.print("package-family separation violation: {s}\n", .{message});
+        return error.PackageFamilySeparationViolation;
+    }
+}
+
+const TrustedKeyring = struct {
+    /// Absolute host path of the validated keyring copy.
+    path: [:0]u8,
+    /// SHA-256 of the trusted bytes, used to prove the copy never changes.
+    sha256: [32]u8,
+
+    fn deinit(self: *TrustedKeyring, allocator: Allocator) void {
+        allocator.free(self.path);
+    }
+};
+
+/// Copy the guest Ubuntu archive keyring to a bounded, read-only host file
+/// outside every debz `root_stage` and `published_root`, then validate the copy
+/// so debz `keyring_paths` and the generated `Signed-By` configuration consume
+/// exactly those trusted bytes. The guest source is read as a bounded regular
+/// file without following symlinks, and the materialized copy is re-stat'd and
+/// re-hashed so later guest mutation cannot redirect or alter the trusted path.
+fn materializeTrustedKeyring(
+    allocator: Allocator,
+    io: Io,
+    guest_keyring: []const u8,
+    destination: []const u8,
+) !TrustedKeyring {
+    const source_stat = try Dir.cwd().statFile(io, guest_keyring, .{ .follow_symlinks = false });
+    if (source_stat.kind != .file) return error.TrustedKeyringNotRegularFile;
+    if (source_stat.size == 0) return error.TrustedKeyringEmpty;
+    if (source_stat.size > keyring_max_size) return error.TrustedKeyringTooLarge;
+
+    var source_file = try Dir.cwd().openFile(io, guest_keyring, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer source_file.close(io);
+    var source_reader = source_file.reader(io, &.{});
+    const bytes = try source_reader.interface.allocRemaining(allocator, .limited(keyring_max_size));
+    defer allocator.free(bytes);
+    if (bytes.len == 0) return error.TrustedKeyringEmpty;
+    const expected = artifact_pipeline.sha256Bytes(bytes);
+
+    Dir.cwd().deleteFile(io, destination) catch {};
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = destination,
+        .data = bytes,
+        .flags = .{ .exclusive = true },
+    });
+    try Dir.cwd().setFilePermissions(
+        io,
+        destination,
+        std.Io.File.Permissions.fromMode(0o400),
+        .{},
+    );
+
+    const copy_stat = try Dir.cwd().statFile(io, destination, .{ .follow_symlinks = false });
+    if (copy_stat.kind != .file) return error.TrustedKeyringNotRegularFile;
+    if (copy_stat.nlink != 1) return error.TrustedKeyringAmbiguousLink;
+    if (copy_stat.size != source_stat.size) return error.TrustedKeyringSizeMismatch;
+    const materialized = try artifact_pipeline.hashFile(io, destination);
+    if (!std.mem.eql(u8, &materialized.sha256, &expected))
+        return error.TrustedKeyringDigestMismatch;
+
+    const absolute_path = try Dir.cwd().realPathFileAlloc(io, destination, allocator);
+    errdefer allocator.free(absolute_path);
+    return .{ .path = absolute_path, .sha256 = expected };
+}
+
+/// Re-hash the materialized keyring and confirm it still matches the digest
+/// captured at copy time. Proves that no debz resolve/customize transaction
+/// mutated the trusted host copy.
+fn assertTrustedKeyringUnchanged(io: Io, keyring: TrustedKeyring) !void {
+    const stat = try Dir.cwd().statFile(io, keyring.path, .{ .follow_symlinks = false });
+    if (stat.kind != .file) return error.TrustedKeyringNotRegularFile;
+    if (stat.nlink != 1) return error.TrustedKeyringAmbiguousLink;
+    const current = try artifact_pipeline.hashFile(io, keyring.path);
+    if (!std.mem.eql(u8, &current.sha256, &keyring.sha256))
+        return error.TrustedKeyringDigestMismatch;
 }
 
 fn parseArgs(argv: []const []const u8) !Args {
@@ -1380,9 +1471,9 @@ fn customizeRootWithDebz(
     defer allocator.free(trusted_keyring);
     const external_keyring = try std.fs.path.join(allocator, &.{ work_dir, "ubuntu-archive-keyring.gpg" });
     defer allocator.free(external_keyring);
-    try Dir.cwd().copyFile(trusted_keyring, Dir.cwd(), external_keyring, io, .{});
-    const absolute_keyring = try Dir.cwd().realPathFileAlloc(io, external_keyring, allocator);
-    defer allocator.free(absolute_keyring);
+    var trusted = try materializeTrustedKeyring(allocator, io, trusted_keyring, external_keyring);
+    defer trusted.deinit(allocator);
+    const absolute_keyring = trusted.path;
     const source_path = try std.fs.path.join(allocator, &.{ work_dir, "ubuntu-snapshot.sources" });
     defer allocator.free(source_path);
     const source_document = try std.fmt.allocPrint(allocator,
@@ -1409,6 +1500,12 @@ fn customizeRootWithDebz(
     const absolute_source_config = try Dir.cwd().realPathFileAlloc(io, source_config_path, allocator);
     defer allocator.free(absolute_source_config);
 
+    // Caller-owned single-element input slices. Their storage outlives every
+    // resolve and customize request so the package-family boundary never reads
+    // dangling pointers, and both requests reuse the same trusted keyring copy.
+    const config_inputs = [_][]const u8{absolute_source_config};
+    const keyring_inputs = [_][]const u8{absolute_keyring};
+
     var evidence: [debz_packages.len]DebzEvidence = undefined;
     var evidence_count: usize = 0;
     errdefer {
@@ -1416,6 +1513,7 @@ fn customizeRootWithDebz(
     }
 
     for (&debz_packages, 0..) |package, index| {
+        const packages = [_][]const u8{package};
         const transaction_dir = try std.fmt.allocPrint(allocator, "{s}/debz-{s}", .{ work_dir, package });
         defer allocator.free(transaction_dir);
         try Dir.cwd().deleteTree(io, transaction_dir);
@@ -1440,18 +1538,20 @@ fn customizeRootWithDebz(
         const absolute_lock = try std.fs.path.join(allocator, &.{ absolute_transaction, "exact-lock.json" });
         defer allocator.free(absolute_lock);
 
-        const resolved = try package_family.execute(allocator, io, .{}, packageFamilyRequest(
+        const resolve_request = packageFamilyRequest(
             .resolve_lock,
             profile,
-            package,
+            &packages,
             absolute_resolve_root,
             absolute_dummy,
-            absolute_source_config,
-            absolute_keyring,
+            &config_inputs,
+            &keyring_inputs,
             absolute_cache,
             absolute_state,
             absolute_lock,
-        ));
+        );
+        try assertRequestSeparation(resolve_request);
+        const resolved = try package_family.execute(allocator, io, .{}, resolve_request);
         try requireSucceeded(resolved);
         if (resolved.lock_path == null or !std.mem.eql(u8, resolved.lock_path.?, absolute_lock))
             return error.DebzLockMismatch;
@@ -1478,18 +1578,20 @@ fn customizeRootWithDebz(
         var published_transferred = false;
         errdefer if (!published_transferred) allocator.free(absolute_published);
 
-        const customized = try package_family.execute(allocator, io, .{}, packageFamilyRequest(
+        const customize_request = packageFamilyRequest(
             .customize,
             profile,
-            package,
+            &packages,
             absolute_stage,
             absolute_published,
-            absolute_source_config,
-            absolute_keyring,
+            &config_inputs,
+            &keyring_inputs,
             absolute_cache,
             absolute_state,
             absolute_lock,
-        ));
+        );
+        try assertRequestSeparation(customize_request);
+        const customized = try package_family.execute(allocator, io, .{}, customize_request);
         try requireSucceeded(customized);
         if (!customized.published or customized.provenance_path == null)
             return error.DebzProvenanceMissing;
@@ -1537,6 +1639,8 @@ fn customizeRootWithDebz(
         current = absolute_published;
         published_transferred = true;
     }
+
+    try assertTrustedKeyringUnchanged(io, trusted);
 
     const release_name = try customizeOfflineRoot(
         allocator,
@@ -2380,11 +2484,11 @@ test "package-family resolve and customize requests are exact-lock operations" {
     const amd64 = packageFamilyRequest(
         .resolve_lock,
         profileFor(.x86_64),
-        "linux-azure",
+        &.{"linux-azure"},
         "/root-stage",
         "/published",
-        "/inputs/ubuntu.sources",
-        "/inputs/ubuntu.gpg",
+        &.{"/inputs/ubuntu.sources"},
+        &.{"/inputs/ubuntu.gpg"},
         "/cache",
         "/state",
         "/state/linux-azure.lock",
@@ -2404,11 +2508,11 @@ test "package-family resolve and customize requests are exact-lock operations" {
     const arm64 = packageFamilyRequest(
         .customize,
         profileFor(.aarch64),
-        "walinuxagent",
+        &.{"walinuxagent"},
         "/root-stage",
         "/published",
-        "/inputs/ubuntu.sources",
-        "/inputs/ubuntu.gpg",
+        &.{"/inputs/ubuntu.sources"},
+        &.{"/inputs/ubuntu.gpg"},
         "/cache",
         "/state",
         "/state/walinuxagent.lock",
@@ -2422,6 +2526,123 @@ test "package-family resolve and customize requests are exact-lock operations" {
     try std.testing.expectEqualStrings("/inputs/ubuntu.sources", arm64.inputs.config_paths[0]);
     try std.testing.expectEqualStrings("/state/walinuxagent.lock", arm64.inputs.lock_input_path.?);
     try std.testing.expect(arm64.inputs.lock_output_path == null);
+}
+
+test "package-family requests reject keyrings overlapping staging and accept the external copy" {
+    const profile = profileFor(.aarch64);
+    const resolve_root = "/work/official-root";
+    const resolve_published = "/work/debz-linux-azure/resolve-published-unused";
+    const external_keyring = "/work/ubuntu-archive-keyring.gpg";
+    const source_config = "/work/ubuntu-snapshot.json";
+    const cache = "/work/debz-linux-azure/cache";
+    const state = "/work/debz-linux-azure/state";
+    const lock = "/work/debz-linux-azure/exact-lock.json";
+
+    // The corrected requests resolve the keyring from an external host copy and
+    // pass the shared separation policy for both resolve and customize.
+    const good_resolve = packageFamilyRequest(.resolve_lock, profile, &.{"linux-azure"}, resolve_root, resolve_published, &.{source_config}, &.{external_keyring}, cache, state, lock);
+    try assertRequestSeparation(good_resolve);
+    try std.testing.expectEqualStrings(external_keyring, good_resolve.inputs.keyring_paths[0]);
+    const good_customize = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{external_keyring}, cache, state, lock);
+    try assertRequestSeparation(good_customize);
+    try std.testing.expectEqualStrings(external_keyring, good_customize.inputs.keyring_paths[0]);
+
+    // The original blocker: a keyring read from inside the resolve root_stage is
+    // rejected with the exact boundary message the protected aarch64 builder hit.
+    const guest_keyring = resolve_root ++ "/usr/share/keyrings/ubuntu-archive-keyring.gpg";
+    const bad_resolve = packageFamilyRequest(.resolve_lock, profile, &.{"linux-azure"}, resolve_root, resolve_published, &.{source_config}, &.{guest_keyring}, cache, state, lock);
+    try std.testing.expectError(error.PackageFamilySeparationViolation, assertRequestSeparation(bad_resolve));
+    try std.testing.expectEqualStrings(
+        "debian keyring paths must be absolute and outside staging",
+        package_family.requestViolation(bad_resolve).?,
+    );
+
+    const staged_keyring = "/work/root-stage-0/usr/share/keyrings/ubuntu-archive-keyring.gpg";
+    const bad_customize = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{staged_keyring}, cache, state, lock);
+    try std.testing.expectError(error.PackageFamilySeparationViolation, assertRequestSeparation(bad_customize));
+
+    // A keyring under the publication root is rejected too, so a published guest
+    // can never mutate the trusted input after debz consumes it.
+    const published_keyring = "/work/root-debz-0/usr/share/keyrings/ubuntu-archive-keyring.gpg";
+    const published_overlap = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{published_keyring}, cache, state, lock);
+    try std.testing.expectError(error.PackageFamilySeparationViolation, assertRequestSeparation(published_overlap));
+    try std.testing.expectEqualStrings(
+        "debian keyring paths must be outside publication",
+        package_family.requestViolation(published_overlap).?,
+    );
+}
+
+test "trusted keyring copy is bounded, read-only, and immune to guest mutation" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const guest_relative = "guest/usr/share/keyrings/ubuntu-archive-keyring.gpg";
+    try temporary.dir.createDirPath(io, "guest/usr/share/keyrings");
+    const guest_bytes = "trusted-ubuntu-archive-keyring-bytes";
+    try temporary.dir.writeFile(io, .{ .sub_path = guest_relative, .data = guest_bytes });
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try temporary.dir.realPath(io, &root_buffer)];
+    const guest_keyring = try std.fs.path.join(allocator, &.{ root, guest_relative });
+    defer allocator.free(guest_keyring);
+    const destination = try std.fs.path.join(allocator, &.{ root, "ubuntu-archive-keyring.gpg" });
+    defer allocator.free(destination);
+
+    var trusted = try materializeTrustedKeyring(allocator, io, guest_keyring, destination);
+    defer trusted.deinit(allocator);
+
+    // The copy lives at the external host destination, is a read-only regular
+    // file, and carries the digest of exactly the guest bytes.
+    try std.testing.expectEqualStrings(destination, trusted.path);
+    const copy_stat = try temporary.dir.statFile(io, "ubuntu-archive-keyring.gpg", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.file, copy_stat.kind);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o400), copy_stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(u64, guest_bytes.len), copy_stat.size);
+    try std.testing.expectEqual(artifact_pipeline.sha256Bytes(guest_bytes), trusted.sha256);
+    try assertTrustedKeyringUnchanged(io, trusted);
+
+    // Mutating the guest source after materialization cannot change the trusted
+    // host copy: its digest is stable and the immutability assertion still holds.
+    try temporary.dir.writeFile(io, .{ .sub_path = guest_relative, .data = "tampered-guest-keyring-bytes-differ" });
+    try assertTrustedKeyringUnchanged(io, trusted);
+    const after = try artifact_pipeline.hashFile(io, destination);
+    try std.testing.expectEqual(trusted.sha256, after.sha256);
+}
+
+test "trusted keyring materialization rejects empty and non-regular sources" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try temporary.dir.realPath(io, &root_buffer)];
+    const destination = try std.fs.path.join(allocator, &.{ root, "keyring.gpg" });
+    defer allocator.free(destination);
+
+    try temporary.dir.writeFile(io, .{ .sub_path = "empty.gpg", .data = "" });
+    const empty = try std.fs.path.join(allocator, &.{ root, "empty.gpg" });
+    defer allocator.free(empty);
+    try std.testing.expectError(
+        error.TrustedKeyringEmpty,
+        materializeTrustedKeyring(allocator, io, empty, destination),
+    );
+
+    try temporary.dir.createDirPath(io, "keyring-dir");
+    const directory = try std.fs.path.join(allocator, &.{ root, "keyring-dir" });
+    defer allocator.free(directory);
+    try std.testing.expectError(
+        error.TrustedKeyringNotRegularFile,
+        materializeTrustedKeyring(allocator, io, directory, destination),
+    );
+
+    // No destination file is produced when validation rejects the source.
+    try std.testing.expectError(
+        error.FileNotFound,
+        temporary.dir.statFile(io, "keyring.gpg", .{}),
+    );
 }
 
 test "root staging preserves intentionally inaccessible snapd directory" {

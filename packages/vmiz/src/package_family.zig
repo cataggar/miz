@@ -277,6 +277,43 @@ pub fn execute(
     };
 }
 
+/// Host-side separation assertion for resolve and customize dispatch. Returns
+/// the first violation message, or null when the request is well formed and
+/// every source, config, keyring, cache, state, and lock path is an absolute
+/// path outside both `root_stage` and `published_root`. It reuses exactly the
+/// boundary policy `execute` enforces, then additionally forbids inputs from
+/// overlapping the publication root so a published guest can never mutate the
+/// trusted host inputs (for example a keyring) after they are consumed. Hosts
+/// assert this before every dispatch instead of duplicating path policy.
+pub fn requestViolation(request: Request) ?[]const u8 {
+    if (invalidRequestMessage(request)) |message| return message;
+    if (request.family != .debian) return null;
+    const published = request.inputs.published_root;
+    if (overlaps(published, request.inputs.cache_path) or
+        overlaps(published, request.inputs.state_path))
+        return "package-family publication must not overlap cache or state";
+    for (request.inputs.source_paths) |path|
+        if (overlaps(published, path)) return "debian source paths must be outside publication";
+    for (request.inputs.config_paths) |path|
+        if (overlaps(published, path)) return "debian config paths must be outside publication";
+    for (request.inputs.keyring_paths) |path|
+        if (overlaps(published, path)) return "debian keyring paths must be outside publication";
+    if (request.inputs.lock_input_path) |path|
+        if (overlaps(published, path)) return "lock input must be outside publication";
+    if (request.inputs.lock_output_path) |path|
+        if (overlaps(published, path)) return "lock output must be outside publication";
+    if (request.inputs.credential_reference) |path|
+        if (overlaps(published, path)) return "credential reference must be outside publication";
+    return null;
+}
+
+/// Shared normalized-path containment predicate. Exposed so hosts and tests
+/// reuse the same overlap policy the boundary enforces instead of
+/// reimplementing prefix arithmetic.
+pub fn pathsOverlap(left: []const u8, right: []const u8) bool {
+    return overlaps(left, right);
+}
+
 fn executeDebz(
     allocator: Allocator,
     io: Io,
@@ -943,4 +980,78 @@ test "backend diagnostics redact credentials and preserve recoverable stage" {
     try std.testing.expectEqual(FailureDisposition.recoverable, result.diagnostic.?.disposition);
     try std.testing.expect(std.mem.indexOf(u8, result.diagnostic.?.message, "secret") == null);
     _ = try Dir.cwd().statFile(io, paths.stage, .{});
+}
+
+test "pathsOverlap matches containment in either direction but not siblings" {
+    try std.testing.expect(pathsOverlap("/work", "/work"));
+    try std.testing.expect(pathsOverlap("/work", "/work/root-stage"));
+    try std.testing.expect(pathsOverlap("/work/root-stage", "/work"));
+    try std.testing.expect(!pathsOverlap("/work/root-stage", "/work/keyring.gpg"));
+    try std.testing.expect(!pathsOverlap("/work/root", "/work/root-stage"));
+}
+
+test "requestViolation reuses boundary policy and forbids publication overlap" {
+    const separated: Inputs = .{
+        .root_stage = "/work/root-stage",
+        .published_root = "/work/root",
+        .architecture = .amd64,
+        .source_paths = &.{},
+        .config_paths = &.{"/work/ubuntu-snapshot.json"},
+        .keyring_paths = &.{"/work/ubuntu-archive-keyring.gpg"},
+        .cache_path = "/work/debz/cache",
+        .state_path = "/work/debz/state",
+        .lock_output_path = "/work/debz/exact-lock.json",
+    };
+    const well_formed: Request = .{
+        .family = .debian,
+        .distribution = .ubuntu_26_04,
+        .operation = .resolve_lock,
+        .packages = &.{"linux-azure"},
+        .inputs = separated,
+    };
+    try std.testing.expect(requestViolation(well_formed) == null);
+
+    // A keyring resolved from inside the resolve root_stage reproduces the exact
+    // boundary rejection that broke the protected aarch64 builder.
+    var keyring_in_stage = separated;
+    keyring_in_stage.keyring_paths = &.{"/work/root-stage/usr/share/keyrings/ubuntu-archive-keyring.gpg"};
+    try std.testing.expectEqualStrings(
+        "debian keyring paths must be absolute and outside staging",
+        requestViolation(.{
+            .family = .debian,
+            .distribution = .ubuntu_26_04,
+            .operation = .resolve_lock,
+            .packages = &.{"linux-azure"},
+            .inputs = keyring_in_stage,
+        }).?,
+    );
+
+    // A keyring living under the publication root would be captured or mutated
+    // by the published guest, so requestViolation rejects it even though the
+    // looser boundary check tolerates it.
+    var keyring_in_published = separated;
+    keyring_in_published.keyring_paths = &.{"/work/root/usr/share/keyrings/ubuntu-archive-keyring.gpg"};
+    try std.testing.expectEqualStrings(
+        "debian keyring paths must be outside publication",
+        requestViolation(.{
+            .family = .debian,
+            .distribution = .ubuntu_26_04,
+            .operation = .resolve_lock,
+            .packages = &.{"linux-azure"},
+            .inputs = keyring_in_published,
+        }).?,
+    );
+
+    var cache_in_published = separated;
+    cache_in_published.cache_path = "/work/root/var/cache/debz";
+    try std.testing.expectEqualStrings(
+        "package-family publication must not overlap cache or state",
+        requestViolation(.{
+            .family = .debian,
+            .distribution = .ubuntu_26_04,
+            .operation = .resolve_lock,
+            .packages = &.{"linux-azure"},
+            .inputs = cache_in_published,
+        }).?,
+    );
 }
