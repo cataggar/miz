@@ -111,15 +111,15 @@ builder dependencies as the release workflow:
 ```console
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
-  binutils cpio curl file gnupg jq liblzma-dev libzstd-dev \
+  binutils cpio file gnupg jq liblzma-dev libzstd-dev \
   linux-image-generic openssl \
   python3 python3-pefile qemu-utils sbsigntool systemd-ukify \
   util-linux xorriso xz-utils zstd
 sudo chmod 0644 /boot/vmlinuz-*
 ```
 
-The builder inventory is limited to download and verification tools
-(`curl`, GnuPG, OpenSSL), native compilation and image mutation dependencies
+The builder inventory is limited to verification tools (GnuPG, OpenSSL),
+native compilation and image mutation dependencies
 (`liblzma-dev`, `libzstd-dev`, `util-linux`, `cpio`, `xz`, and `zstd`), UKI
 assembly/signing tools (`binutils`, `linux-image-generic`, `python3-pefile`,
 `sbsigntool`, and `systemd-ukify`), `xorriso`, and `qemu-utils`.
@@ -135,13 +135,18 @@ command. `update-initramfs`, `dpkg-query`, and optional `cloud-init clean` are
 the only guest commands; systemd enablement and account removal are native
 mountless operations.
 
-Run a source-pin preflight (requiring only `curl`, `gpg`, and agent-free
-`gpgv`) with:
+Run a source-pin preflight (requiring only `gpg` and agent-free `gpgv`) with:
 
 ```console
 zig build -Dubuntu2604-arch=x86_64 generalized-ubuntu2604 -- --preflight-only
 zig build -Dubuntu2604-arch=aarch64 generalized-ubuntu2604 -- --preflight-only
 ```
+
+Release artifacts are fetched by vmiz's native HTTPS downloader. It accepts
+only HTTPS URLs, verifies the system TLS certificate chain using TLS 1.2 or
+newer, bounds redirects, retries and response sizes, and atomically publishes
+only fully downloaded inputs. Pinned artifact SHA-256 values and the
+Canonical signing-key fingerprint remain mandatory verification gates.
 
 A full build requires signing. For local development, supply exactly one
 certificate and private key:

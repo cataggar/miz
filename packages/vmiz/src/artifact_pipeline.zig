@@ -37,6 +37,7 @@ pub const Downloader = struct {
         allocator: Allocator,
         io: Io,
         url: []const u8,
+        max_size: u64,
         output: *Io.Writer,
     ) anyerror!void,
 
@@ -45,6 +46,7 @@ pub const Downloader = struct {
         allocator: Allocator,
         io: Io,
         url: []const u8,
+        max_size: u64,
         output: *Io.Writer,
     ) !void {
         return self.downloadFn(
@@ -52,6 +54,7 @@ pub const Downloader = struct {
             allocator,
             io,
             url,
+            max_size,
             output,
         );
     }
@@ -73,6 +76,7 @@ pub const CurlDownloader = struct {
         allocator: Allocator,
         io: Io,
         url: []const u8,
+        _: u64,
         output: *Io.Writer,
     ) !void {
         const self: *CurlDownloader = @ptrCast(@alignCast(context_ptr.?));
@@ -111,6 +115,310 @@ pub const CurlDownloader = struct {
         }
     }
 };
+
+pub const NativeHttpsResponse = struct {
+    status: u16,
+    redirect_location: ?[]const u8 = null,
+    /// Set only when `redirect_location` was allocated with the downloader's
+    /// request allocator and must be released after redirect processing.
+    redirect_location_owned: bool = false,
+    content_length: ?u64 = null,
+};
+
+/// The native HTTPS transport is replaceable so callers can exercise its
+/// security policy without network access. Production uses Zig's TLS client.
+pub const NativeHttpsTransport = struct {
+    context: ?*anyopaque = null,
+    getFn: *const fn (
+        context: ?*anyopaque,
+        allocator: Allocator,
+        io: Io,
+        url: []const u8,
+        max_size: u64,
+        output: *Io.Writer,
+    ) anyerror!NativeHttpsResponse,
+
+    pub fn get(
+        self: NativeHttpsTransport,
+        allocator: Allocator,
+        io: Io,
+        url: []const u8,
+        max_size: u64,
+        output: *Io.Writer,
+    ) !NativeHttpsResponse {
+        return self.getFn(
+            self.context,
+            allocator,
+            io,
+            url,
+            max_size,
+            output,
+        );
+    }
+};
+
+pub const Sleep = struct {
+    context: ?*anyopaque,
+    call: *const fn (
+        context: ?*anyopaque,
+        io: Io,
+        seconds: u64,
+    ) anyerror!void,
+};
+
+/// HTTPS-only downloader for pinned public artifacts. It uses Zig's native
+/// TLS client (which negotiates TLS 1.2 or newer), follows only bounded HTTPS
+/// redirects, and retries only before any response body is published.
+pub const NativeHttpsDownloader = struct {
+    retries: u8 = native_https_max_retries,
+    max_redirects: u8 = native_https_max_redirects,
+    max_backoff_seconds: u64 = native_https_max_backoff_seconds,
+    sleep: ?Sleep = null,
+    transport: ?NativeHttpsTransport = null,
+    client: ?std.http.Client = null,
+
+    pub fn init(allocator: Allocator, io: Io) NativeHttpsDownloader {
+        return .{
+            .client = .{
+                .allocator = allocator,
+                .io = io,
+                .read_buffer_size = native_https_response_head_limit,
+                .write_buffer_size = native_https_write_buffer_size,
+            },
+        };
+    }
+
+    pub fn deinit(self: *NativeHttpsDownloader) void {
+        if (self.client) |*client| client.deinit();
+        self.* = undefined;
+    }
+
+    pub fn downloader(self: *NativeHttpsDownloader) Downloader {
+        return .{
+            .context = self,
+            .downloadFn = download,
+        };
+    }
+
+    fn download(
+        context_ptr: ?*anyopaque,
+        allocator: Allocator,
+        io: Io,
+        url: []const u8,
+        max_size: u64,
+        output: *Io.Writer,
+    ) !void {
+        const self: *NativeHttpsDownloader = @ptrCast(@alignCast(context_ptr.?));
+        if (max_size == 0) return error.ArtifactTooLarge;
+        try validateHttpsUrl(url);
+        var current_url = try allocator.dupe(u8, url);
+        defer allocator.free(current_url);
+        var redirects: u8 = 0;
+        var retry_count: u8 = 0;
+
+        while (true) {
+            const response = self.fetch(
+                allocator,
+                io,
+                current_url,
+                max_size,
+                output,
+            ) catch |err| {
+                if (!isRetryableNativeHttpsError(err)) return err;
+                try self.retry(io, &retry_count);
+                continue;
+            };
+            if (response.status == 200) {
+                if (response.content_length) |length|
+                    if (length > max_size) return error.ArtifactTooLarge;
+                return;
+            }
+            if (isRedirectStatus(response.status)) {
+                const location = response.redirect_location orelse return error.InvalidRedirect;
+                defer if (response.redirect_location_owned) allocator.free(location);
+                if (redirects >= @min(self.max_redirects, native_https_max_redirects))
+                    return error.RedirectLimitExceeded;
+                const next_url = try resolveHttpsRedirectAlloc(
+                    allocator,
+                    current_url,
+                    location,
+                );
+                allocator.free(current_url);
+                current_url = next_url;
+                redirects += 1;
+                continue;
+            }
+            if (isRetryableNativeHttpsStatus(response.status)) {
+                try self.retry(io, &retry_count);
+                continue;
+            }
+            return error.HttpsUnexpectedStatus;
+        }
+    }
+
+    fn fetch(
+        self: *NativeHttpsDownloader,
+        allocator: Allocator,
+        io: Io,
+        url: []const u8,
+        max_size: u64,
+        output: *Io.Writer,
+    ) !NativeHttpsResponse {
+        if (self.transport) |transport|
+            return transport.get(allocator, io, url, max_size, output);
+        if (self.client) |*client|
+            return fetchNativeHttps(client, url, max_size, output);
+        return error.HttpsTransportUnavailable;
+    }
+
+    fn retry(self: *const NativeHttpsDownloader, io: Io, retry_count: *u8) !void {
+        if (retry_count.* >= @min(self.retries, native_https_max_retries))
+            return error.HttpsRetryExhausted;
+        const backoff = @as(u64, 1) << @intCast(@min(retry_count.*, @as(u8, 63)));
+        const seconds = @min(
+            backoff,
+            @min(self.max_backoff_seconds, native_https_max_backoff_seconds),
+        );
+        if (self.sleep) |sleep| {
+            try sleep.call(sleep.context, io, seconds);
+        } else {
+            try io.sleep(Io.Duration.fromSeconds(@intCast(seconds)), .real);
+        }
+        retry_count.* += 1;
+    }
+};
+
+const native_https_max_retries: u8 = 3;
+const native_https_max_redirects: u8 = 5;
+const native_https_max_backoff_seconds: u64 = 4;
+const native_https_response_head_limit = 16 * 1024;
+const native_https_write_buffer_size = 8 * 1024;
+const native_https_response_buffer_size = 64 * 1024;
+const native_https_max_location_size = 8 * 1024;
+
+fn fetchNativeHttps(
+    client: *std.http.Client,
+    url: []const u8,
+    max_size: u64,
+    output: *Io.Writer,
+) !NativeHttpsResponse {
+    const uri = std.Uri.parse(url) catch return error.InvalidHttpsUrl;
+    try validateHttpsUri(uri);
+    var request = try client.request(.GET, uri, .{
+        .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .headers = .{ .accept_encoding = .{ .override = "identity" } },
+    });
+    defer request.deinit();
+    try request.sendBodiless();
+    var response = try request.receiveHead(&.{});
+    if (response.head.content_encoding != .identity)
+        return error.InvalidResponseContentEncoding;
+    const status = @intFromEnum(response.head.status);
+    if (status != 200) {
+        const location: ?[]u8 = if (isRedirectStatus(status)) blk: {
+            const raw_location = response.head.location orelse return error.InvalidRedirect;
+            break :blk try client.allocator.dupe(u8, raw_location);
+        } else null;
+        return .{
+            .status = status,
+            .redirect_location = location,
+            .redirect_location_owned = location != null,
+            .content_length = response.head.content_length,
+        };
+    }
+    if (response.head.content_length) |length|
+        if (length > max_size) return error.ArtifactTooLarge;
+
+    var response_buffer: [native_https_response_buffer_size]u8 = undefined;
+    const reader = response.reader(&response_buffer);
+    var transfer_buffer: [native_https_response_buffer_size]u8 = undefined;
+    while (true) {
+        const count = try reader.readSliceShort(&transfer_buffer);
+        if (count == 0) break;
+        try output.writeAll(transfer_buffer[0..count]);
+    }
+    return .{
+        .status = status,
+        .content_length = response.head.content_length,
+    };
+}
+
+fn isRedirectStatus(status: u16) bool {
+    return status >= 300 and status < 400;
+}
+
+fn isRetryableNativeHttpsStatus(status: u16) bool {
+    return switch (status) {
+        408, 429, 500, 502, 503, 504 => true,
+        else => false,
+    };
+}
+
+/// Only errors before a response body is received are retried. Retrying a
+/// partial stream would concatenate it with a later attempt in the stage.
+fn isRetryableNativeHttpsError(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.HostUnreachable,
+        error.NetworkUnreachable,
+        error.BrokenPipe,
+        error.HttpConnectionClosing,
+        error.Timeout,
+        => true,
+        else => false,
+    };
+}
+
+fn validateHttpsUrl(value: []const u8) !void {
+    const uri = std.Uri.parse(value) catch return error.InvalidHttpsUrl;
+    try validateHttpsUri(uri);
+}
+
+fn validateHttpsUri(uri: std.Uri) !void {
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https") or
+        uri.host == null or
+        uri.user != null or
+        uri.password != null or
+        uri.fragment != null)
+    {
+        return error.InvalidHttpsUrl;
+    }
+}
+
+fn resolveHttpsRedirectAlloc(
+    allocator: Allocator,
+    base_text: []const u8,
+    location: []const u8,
+) ![]u8 {
+    if (location.len == 0 or location.len > native_https_max_location_size or
+        std.mem.indexOfAny(u8, location, "\r\n") != null)
+    {
+        return error.InvalidRedirect;
+    }
+    const base = std.Uri.parse(base_text) catch return error.InvalidRedirect;
+    validateHttpsUri(base) catch return error.InvalidRedirect;
+    const required = std.math.add(usize, base_text.len, location.len) catch
+        return error.InvalidRedirect;
+    const storage = try allocator.alloc(u8, std.math.add(usize, required, 1) catch
+        return error.InvalidRedirect);
+    defer allocator.free(storage);
+    @memcpy(storage[0..location.len], location);
+    var auxiliary = storage;
+    const resolved = base.resolveInPlace(location.len, &auxiliary) catch
+        return error.InvalidRedirect;
+    validateHttpsUri(resolved) catch return error.HttpsDowngrade;
+    var text = std.Io.Writer.Allocating.init(allocator);
+    defer text.deinit();
+    resolved.format(&text.writer) catch return error.InvalidRedirect;
+    const result = try text.toOwnedSlice();
+    errdefer allocator.free(result);
+    if (result.len == 0 or result.len > native_https_max_location_size)
+        return error.InvalidRedirect;
+    validateHttpsUrl(result) catch return error.HttpsDowngrade;
+    return result;
+}
 
 pub const AcquireOptions = struct {
     url: []const u8,
@@ -273,6 +581,7 @@ pub fn acquireVerified(
         allocator,
         io,
         options.url,
+        options.max_size,
         &hashing_writer.writer,
     ) catch |err| {
         if (hashing_writer.limit_exceeded) return error.ArtifactTooLarge;
@@ -292,6 +601,49 @@ pub fn acquireVerified(
         .artifact = downloaded,
         .reused_cache = false,
     };
+}
+
+/// Download a separately authenticated input through a pipeline-owned atomic
+/// stage. Callers that use this instead of `acquireVerified` must perform
+/// their own authentication before trusting the returned metadata.
+pub fn downloadBoundedAtomic(
+    allocator: Allocator,
+    io: Io,
+    url: []const u8,
+    destination_path: []const u8,
+    max_size: u64,
+    downloader: Downloader,
+) !Metadata {
+    if (max_size == 0) return error.ArtifactTooLarge;
+    var output = try OutputLocation.open(io, destination_path);
+    defer output.close(io);
+    var stage = try output.dir.createFileAtomic(io, output.basename, .{
+        .replace = true,
+    });
+    defer stage.deinit(io);
+
+    var output_buffer: [64 * 1024]u8 = undefined;
+    var output_writer = stage.file.writer(io, &output_buffer);
+    var hashing_writer = HashingWriter.init(
+        &output_writer.interface,
+        max_size,
+    );
+    downloader.download(
+        allocator,
+        io,
+        url,
+        max_size,
+        &hashing_writer.writer,
+    ) catch |err| {
+        if (hashing_writer.limit_exceeded) return error.ArtifactTooLarge;
+        return err;
+    };
+    try hashing_writer.writer.flush();
+    try output_writer.interface.flush();
+    try validateStage(io, stage.file);
+    const downloaded = try hashing_writer.finish(destination_path);
+    try stage.replace(io);
+    return downloaded;
 }
 
 /// Decompress a digest-pinned XZ artifact with XZ Utils. Unlike Zig 0.16's
@@ -1430,6 +1782,26 @@ test "verified acquisition preserves output on checksum mismatch" {
             },
         ),
     );
+
+    var interrupted_steps = [_]TestNativeHttpsStep{
+        .{ .partial_failure = "partial" },
+    };
+    var interrupted_transport = TestNativeHttpsTransport{ .steps = &interrupted_steps };
+    defer interrupted_transport.deinit(std.testing.allocator);
+    var interrupted = NativeHttpsDownloader{
+        .transport = .{ .context = &interrupted_transport, .getFn = TestNativeHttpsTransport.get },
+    };
+    try std.testing.expectError(
+        error.EndOfStream,
+        downloadBoundedAtomic(
+            std.testing.allocator,
+            io,
+            "https://example.invalid/key",
+            output_path,
+            1024,
+            interrupted.downloader(),
+        ),
+    );
     try expectFileContent(io, output_path, "existing\n");
 }
 
@@ -1488,6 +1860,280 @@ test "verified acquisition replaces oversized cache without hashing it" {
     try std.testing.expect(!result.reused_cache);
     try std.testing.expectEqual(@as(usize, 1), context.calls);
     try expectFileContent(io, output_path, context.payload);
+}
+
+test "native HTTPS acquisition follows bounded redirects and retries" {
+    const io = std.testing.io;
+    const output_path = "test-native-https-acquire.bin";
+    Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Dir.cwd().deleteFile(io, output_path) catch {};
+
+    var steps = [_]TestNativeHttpsStep{
+        .{ .response = .{ .status = 302, .location = "/release/artifact" } },
+        .{ .response = .{ .status = 503 } },
+        .{ .response = .{ .status = 200, .content_length = 17, .payload = "native artifact\n" } },
+    };
+    var transport = TestNativeHttpsTransport{ .steps = &steps };
+    defer transport.deinit(std.testing.allocator);
+    var sleep = TestNativeHttpsSleep{};
+    var native = NativeHttpsDownloader{
+        .retries = 2,
+        .transport = .{ .context = &transport, .getFn = TestNativeHttpsTransport.get },
+        .sleep = .{ .context = &sleep, .call = TestNativeHttpsSleep.call },
+    };
+    const acquired = try acquireVerified(
+        std.testing.allocator,
+        io,
+        .{
+            .url = "https://example.invalid/artifact",
+            .destination_path = output_path,
+            .expected_sha256 = sha256Bytes("native artifact\n"),
+            .max_size = 1024,
+        },
+        native.downloader(),
+    );
+    try std.testing.expect(!acquired.reused_cache);
+    try std.testing.expectEqual(@as(usize, 3), transport.calls);
+    try std.testing.expectEqualStrings(
+        "https://example.invalid/artifact",
+        transport.urls[0].?,
+    );
+    try std.testing.expectEqualStrings(
+        "https://example.invalid/release/artifact",
+        transport.urls[1].?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), sleep.calls);
+    try std.testing.expectEqual(@as(u64, 1), sleep.seconds[0]);
+}
+
+test "native HTTPS acquisition fails closed on unsafe redirects and retry exhaustion" {
+    const io = std.testing.io;
+    const output_path = "test-native-https-fail-closed.bin";
+    Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Dir.cwd().deleteFile(io, output_path) catch {};
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = output_path,
+        .data = "existing\n",
+    });
+
+    var downgrade_steps = [_]TestNativeHttpsStep{
+        .{ .response = .{ .status = 302, .location = "http://example.invalid/artifact" } },
+    };
+    var downgrade_transport = TestNativeHttpsTransport{ .steps = &downgrade_steps };
+    defer downgrade_transport.deinit(std.testing.allocator);
+    var downgrade = NativeHttpsDownloader{
+        .transport = .{ .context = &downgrade_transport, .getFn = TestNativeHttpsTransport.get },
+    };
+    try std.testing.expectError(
+        error.HttpsDowngrade,
+        acquireVerified(
+            std.testing.allocator,
+            io,
+            .{
+                .url = "https://example.invalid/artifact",
+                .destination_path = output_path,
+                .expected_sha256 = sha256Bytes("expected\n"),
+                .max_size = 1024,
+            },
+            downgrade.downloader(),
+        ),
+    );
+    try expectFileContent(io, output_path, "existing\n");
+
+    var retry_steps = [_]TestNativeHttpsStep{
+        .connection_refused,
+        .connection_refused,
+    };
+    var retry_transport = TestNativeHttpsTransport{ .steps = &retry_steps };
+    defer retry_transport.deinit(std.testing.allocator);
+    var retry_sleep = TestNativeHttpsSleep{};
+    var retrying = NativeHttpsDownloader{
+        .retries = 1,
+        .transport = .{ .context = &retry_transport, .getFn = TestNativeHttpsTransport.get },
+        .sleep = .{ .context = &retry_sleep, .call = TestNativeHttpsSleep.call },
+    };
+    try std.testing.expectError(
+        error.HttpsRetryExhausted,
+        acquireVerified(
+            std.testing.allocator,
+            io,
+            .{
+                .url = "https://example.invalid/artifact",
+                .destination_path = output_path,
+                .expected_sha256 = sha256Bytes("expected\n"),
+                .max_size = 1024,
+            },
+            retrying.downloader(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 2), retry_transport.calls);
+    try std.testing.expectEqual(@as(usize, 1), retry_sleep.calls);
+    try expectFileContent(io, output_path, "existing\n");
+
+    var bounded_steps = [_]TestNativeHttpsStep{
+        .{ .response = .{ .status = 503 } },
+        .{ .response = .{ .status = 503 } },
+        .{ .response = .{ .status = 503 } },
+        .{ .response = .{ .status = 503 } },
+    };
+    var bounded_transport = TestNativeHttpsTransport{ .steps = &bounded_steps };
+    defer bounded_transport.deinit(std.testing.allocator);
+    var bounded_sleep = TestNativeHttpsSleep{};
+    var bounded = NativeHttpsDownloader{
+        .retries = 10,
+        .max_backoff_seconds = 60,
+        .transport = .{ .context = &bounded_transport, .getFn = TestNativeHttpsTransport.get },
+        .sleep = .{ .context = &bounded_sleep, .call = TestNativeHttpsSleep.call },
+    };
+    try std.testing.expectError(
+        error.HttpsRetryExhausted,
+        acquireVerified(
+            std.testing.allocator,
+            io,
+            .{
+                .url = "https://example.invalid/artifact",
+                .destination_path = output_path,
+                .expected_sha256 = sha256Bytes("expected\n"),
+                .max_size = 1024,
+            },
+            bounded.downloader(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 4), bounded_transport.calls);
+    try std.testing.expectEqual(@as(usize, 3), bounded_sleep.calls);
+    try std.testing.expectEqualSlices(
+        u64,
+        &.{ 1, 2, 4 },
+        bounded_sleep.seconds[0..bounded_sleep.calls],
+    );
+}
+
+test "native HTTPS acquisition rejects TLS failures, oversized, and partial bodies" {
+    const io = std.testing.io;
+    const output_path = "test-native-https-body.bin";
+    Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Dir.cwd().deleteFile(io, output_path) catch {};
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = output_path,
+        .data = "existing\n",
+    });
+
+    var tls_steps = [_]TestNativeHttpsStep{.tls_failure};
+    var tls_transport = TestNativeHttpsTransport{ .steps = &tls_steps };
+    defer tls_transport.deinit(std.testing.allocator);
+    var tls = NativeHttpsDownloader{
+        .transport = .{ .context = &tls_transport, .getFn = TestNativeHttpsTransport.get },
+    };
+    try std.testing.expectError(
+        error.TlsCertificateInvalid,
+        acquireVerified(
+            std.testing.allocator,
+            io,
+            .{
+                .url = "https://example.invalid/artifact",
+                .destination_path = output_path,
+                .expected_sha256 = sha256Bytes("expected\n"),
+                .max_size = 1024,
+            },
+            tls.downloader(),
+        ),
+    );
+
+    var oversized_steps = [_]TestNativeHttpsStep{
+        .{ .response = .{ .status = 200, .content_length = 1025 } },
+    };
+    var oversized_transport = TestNativeHttpsTransport{ .steps = &oversized_steps };
+    defer oversized_transport.deinit(std.testing.allocator);
+    var oversized = NativeHttpsDownloader{
+        .transport = .{ .context = &oversized_transport, .getFn = TestNativeHttpsTransport.get },
+    };
+    try std.testing.expectError(
+        error.ArtifactTooLarge,
+        acquireVerified(
+            std.testing.allocator,
+            io,
+            .{
+                .url = "https://example.invalid/artifact",
+                .destination_path = output_path,
+                .expected_sha256 = sha256Bytes("expected\n"),
+                .max_size = 1024,
+            },
+            oversized.downloader(),
+        ),
+    );
+
+    var partial_steps = [_]TestNativeHttpsStep{
+        .{ .response = .{ .status = 200, .content_length = 7, .payload = "partial" } },
+    };
+    var partial_transport = TestNativeHttpsTransport{ .steps = &partial_steps };
+    defer partial_transport.deinit(std.testing.allocator);
+    var partial = NativeHttpsDownloader{
+        .transport = .{ .context = &partial_transport, .getFn = TestNativeHttpsTransport.get },
+    };
+    try std.testing.expectError(
+        error.ChecksumMismatch,
+        acquireVerified(
+            std.testing.allocator,
+            io,
+            .{
+                .url = "https://example.invalid/artifact",
+                .destination_path = output_path,
+                .expected_sha256 = sha256Bytes("complete artifact\n"),
+                .max_size = 1024,
+            },
+            partial.downloader(),
+        ),
+    );
+    try expectFileContent(io, output_path, "existing\n");
+}
+
+test "native HTTPS acquisition rejects redirect loops and non-HTTPS URLs" {
+    const io = std.testing.io;
+    const output_path = "test-native-https-redirects.bin";
+    Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Dir.cwd().deleteFile(io, output_path) catch {};
+    var loop_steps = [_]TestNativeHttpsStep{
+        .{ .response = .{ .status = 302, .location = "/one" } },
+        .{ .response = .{ .status = 302, .location = "/two" } },
+        .{ .response = .{ .status = 302, .location = "/one" } },
+    };
+    var loop_transport = TestNativeHttpsTransport{ .steps = &loop_steps };
+    defer loop_transport.deinit(std.testing.allocator);
+    var loop = NativeHttpsDownloader{
+        .max_redirects = 2,
+        .transport = .{ .context = &loop_transport, .getFn = TestNativeHttpsTransport.get },
+    };
+    try std.testing.expectError(
+        error.RedirectLimitExceeded,
+        acquireVerified(
+            std.testing.allocator,
+            io,
+            .{
+                .url = "https://example.invalid/artifact",
+                .destination_path = output_path,
+                .expected_sha256 = sha256Bytes("expected\n"),
+                .max_size = 1024,
+            },
+            loop.downloader(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 3), loop_transport.calls);
+
+    var rejected = NativeHttpsDownloader{};
+    try std.testing.expectError(
+        error.InvalidHttpsUrl,
+        acquireVerified(
+            std.testing.allocator,
+            io,
+            .{
+                .url = "http://example.invalid/artifact",
+                .destination_path = output_path,
+                .expected_sha256 = sha256Bytes("expected\n"),
+                .max_size = 1024,
+            },
+            rejected.downloader(),
+        ),
+    );
 }
 
 test "XZ decompression validates and publishes bounded output" {
@@ -2176,6 +2822,75 @@ fn expectFileContent(io: Io, path: []const u8, expected: []const u8) !void {
     try std.testing.expectEqualStrings(expected, actual);
 }
 
+const TestNativeHttpsStep = union(enum) {
+    response: struct {
+        status: u16,
+        location: ?[]const u8 = null,
+        content_length: ?u64 = null,
+        payload: []const u8 = "",
+    },
+    connection_refused,
+    tls_failure,
+    partial_failure: []const u8,
+};
+
+const TestNativeHttpsTransport = struct {
+    steps: []const TestNativeHttpsStep,
+    calls: usize = 0,
+    urls: [8]?[]u8 = .{null} ** 8,
+
+    fn deinit(self: *TestNativeHttpsTransport, allocator: Allocator) void {
+        for (&self.urls) |*url| {
+            if (url.*) |value| allocator.free(value);
+            url.* = null;
+        }
+    }
+
+    fn get(
+        context_ptr: ?*anyopaque,
+        allocator: Allocator,
+        _: Io,
+        url: []const u8,
+        _: u64,
+        output: *Io.Writer,
+    ) !NativeHttpsResponse {
+        const context: *TestNativeHttpsTransport = @ptrCast(@alignCast(context_ptr.?));
+        if (context.calls == context.steps.len or context.calls == context.urls.len)
+            return error.UnexpectedNativeHttpsRequest;
+        const step = context.steps[context.calls];
+        context.urls[context.calls] = try allocator.dupe(u8, url);
+        context.calls += 1;
+        return switch (step) {
+            .response => |response| blk: {
+                if (response.status == 200) try output.writeAll(response.payload);
+                break :blk .{
+                    .status = response.status,
+                    .redirect_location = response.location,
+                    .content_length = response.content_length,
+                };
+            },
+            .connection_refused => error.ConnectionRefused,
+            .tls_failure => error.TlsCertificateInvalid,
+            .partial_failure => |payload| {
+                try output.writeAll(payload);
+                return error.EndOfStream;
+            },
+        };
+    }
+};
+
+const TestNativeHttpsSleep = struct {
+    calls: usize = 0,
+    seconds: [8]u64 = .{0} ** 8,
+
+    fn call(context_ptr: ?*anyopaque, _: Io, seconds: u64) !void {
+        const context: *TestNativeHttpsSleep = @ptrCast(@alignCast(context_ptr.?));
+        if (context.calls == context.seconds.len) return error.UnexpectedNativeHttpsSleep;
+        context.seconds[context.calls] = seconds;
+        context.calls += 1;
+    }
+};
+
 const TestDownloader = struct {
     payload: []const u8,
     calls: usize = 0,
@@ -2185,6 +2900,7 @@ const TestDownloader = struct {
         _: Allocator,
         _: Io,
         _: []const u8,
+        _: u64,
         output: *Io.Writer,
     ) !void {
         const context: *TestDownloader = @ptrCast(@alignCast(context_ptr.?));
