@@ -356,6 +356,7 @@ pub const Extent = struct {
     logical_block: u32,
     start_block: u64,
     block_count: u16,
+    initialized: bool = true,
 };
 
 pub const DirEntry = struct {
@@ -395,6 +396,7 @@ pub const PopulateError = std.mem.Allocator.Error || Io.File.ReadPositionalError
     MissingContentReader,
     UnexpectedContentLength,
     InvalidDirectorySize,
+    InvalidSparseExtent,
     MissingHardlinkTarget,
     UnsupportedHardlinkTarget,
     TooManyHardlinks,
@@ -465,6 +467,7 @@ const OwnedEntry = struct {
     device: DeviceNumbers = .{},
     hardlink_target: []u8 = &.{},
     times: InodeTimes = .{},
+    sparse_extents: []tree_cursor.SparseExtent = &.{},
 };
 
 /// The three times an inode written by this module can carry. On a 256-byte
@@ -581,6 +584,7 @@ const Node = struct {
     link_count: u16 = 1,
     device: DeviceNumbers = .{},
     hardlink_target: []const u8 = "",
+    sparse_extents: []const tree_cursor.SparseExtent = &.{},
     /// False for a `hardlink`, which reuses the inode its target owns and so
     /// must be skipped everywhere an inode is allocated, counted or written.
     owns_inode: bool = true,
@@ -677,6 +681,7 @@ const WriterPlan = struct {
         for (self.entries) |entry| {
             allocator.free(entry.path);
             if (entry.hardlink_target.len > 0) allocator.free(entry.hardlink_target);
+            allocator.free(entry.sparse_extents);
         }
         allocator.free(self.entries);
         self.* = undefined;
@@ -2356,9 +2361,13 @@ pub const Reader = struct {
         while (remaining > 0) {
             const logical_block: u32 = @intCast(logical_offset / self.block_size);
             const within_block: usize = @intCast(logical_offset % self.block_size);
-            const physical_block = findPhysicalBlock(extents, logical_block) orelse return error.UnsupportedInodeLayout;
+            const physical_block = findPhysicalBlock(extents, logical_block);
             const chunk = @min(remaining, @as(usize, self.block_size) - within_block);
-            try self.readAll(io, buffer[done .. done + chunk], self.blockOffset(physical_block) + within_block);
+            if (physical_block) |block| {
+                try self.readAll(io, buffer[done .. done + chunk], self.blockOffset(block) + within_block);
+            } else {
+                @memset(buffer[done .. done + chunk], 0);
+            }
             done += chunk;
             remaining -= chunk;
             logical_offset += chunk;
@@ -2515,9 +2524,12 @@ pub const Reader = struct {
         while (remaining > 0) {
             const logical_block: u32 = @intCast(logical_offset / self.block_size);
             const within_block: usize = @intCast(logical_offset % self.block_size);
-            const physical_block = findPhysicalBlock(extents, logical_block) orelse return error.UnsupportedInodeLayout;
             const chunk = @min(remaining, @as(usize, self.block_size) - within_block);
-            try self.readAll(io, buffer[done .. done + chunk], self.blockOffset(physical_block) + within_block);
+            if (findPhysicalBlock(extents, logical_block)) |physical_block| {
+                try self.readAll(io, buffer[done .. done + chunk], self.blockOffset(physical_block) + within_block);
+            } else {
+                @memset(buffer[done .. done + chunk], 0);
+            }
             done += chunk;
             remaining -= chunk;
             logical_offset += chunk;
@@ -3401,6 +3413,10 @@ pub const StrictTree = struct {
     allocator: std.mem.Allocator,
     entries: []StrictEntry,
     identity: StrictFilesystemIdentity,
+    /// Metadata of the implicit root inode, retained beside the entry view.
+    root: GeneralRoot,
+    root_xattrs_owned: []OwnedXattr,
+    root_xattr_views: []Xattr,
     /// Guest-visible file bytes. An importer spools a full copy of exactly
     /// this many bytes, so it is also the scratch space an import needs.
     content_bytes: u64,
@@ -3414,6 +3430,8 @@ pub const StrictTree = struct {
             self.allocator.free(entry.xattr_views);
         }
         self.allocator.free(self.entries);
+        freeXattrs(self.allocator, self.root_xattrs_owned);
+        self.allocator.free(self.root_xattr_views);
         self.* = undefined;
     }
 
@@ -3480,10 +3498,17 @@ pub fn scanWriterCompatible(
     defer scanner.deinit();
     try scanner.scan();
     const entries = try scanner.entries.toOwnedSlice();
+    const root_xattrs = scanner.root_xattrs_owned;
+    scanner.root_xattrs_owned = &.{};
+    const root_views = scanner.root_xattr_views;
+    scanner.root_xattr_views = &.{};
     return .{
         .allocator = allocator,
         .entries = entries,
         .identity = scanner.identity,
+        .root = scanner.root,
+        .root_xattrs_owned = root_xattrs,
+        .root_xattr_views = root_views,
         .content_bytes = scanner.total_content_bytes,
     };
 }
@@ -3506,6 +3531,9 @@ const StrictScanner = struct {
     options: StrictScanOptions,
     identity: StrictFilesystemIdentity,
     entries: std.array_list.Managed(StrictEntry),
+    root: GeneralRoot = undefined,
+    root_xattrs_owned: []OwnedXattr = &.{},
+    root_xattr_views: []Xattr = &.{},
     visited_inodes: []u8,
     allocated_inodes: []u8,
     owned_blocks: []u8,
@@ -3586,6 +3614,8 @@ const StrictScanner = struct {
             self.allocator.free(entry.xattr_views);
         }
         self.entries.deinit();
+        freeXattrs(self.allocator, self.root_xattrs_owned);
+        self.allocator.free(self.root_xattr_views);
         self.allocator.free(self.visited_inodes);
         self.allocator.free(self.allocated_inodes);
         self.allocator.free(self.owned_blocks);
@@ -3872,11 +3902,27 @@ const StrictScanner = struct {
         if (inode.sector_count != expected_sectors) return error.UnsupportedInodeBlockCount;
 
         if (is_root) {
-            if (inode.kind != .directory or inode.mode != 0o755 or inode.uid != 0 or
-                inode.gid != 0 or xattrs.len != 0)
-            {
-                return error.NoncanonicalRootMetadata;
+            self.root = .{
+                .mode = inode.mode,
+                .uid = inode.uid,
+                .gid = inode.gid,
+                .atime = @intCast(inode.atime),
+                .mtime = @intCast(inode.mtime),
+                .ctime = @intCast(inode.ctime),
+                .atime_nsec = 0,
+                .mtime_nsec = 0,
+                .ctime_nsec = 0,
+                .crtime = null,
+                .crtime_nsec = 0,
+                .xattrs = &.{},
+            };
+            self.root_xattrs_owned = xattrs;
+            self.root_xattr_views = try self.allocator.alloc(Xattr, xattrs.len);
+            for (xattrs, 0..) |xattr, index| {
+                self.root_xattr_views[index] = .{ .name = xattr.name, .value = xattr.value };
             }
+            self.root.xattrs = self.root_xattr_views;
+            xattrs_owned = false;
         } else {
             self.total_content_bytes = std.math.add(
                 u64,
@@ -4854,6 +4900,7 @@ pub const GeneralEntry = struct {
     /// Set only for `.hardlink`: the path of the first entry that shares the
     /// source inode. Always earlier in iteration order than the link itself.
     hardlink_target: []const u8,
+    sparse_extents: []const tree_cursor.SparseExtent,
     content: ?FileTreeView.ContentReader,
     xattrs: []const Xattr,
 };
@@ -4885,6 +4932,7 @@ const GeneralNode = struct {
     device: DeviceNumbers,
     /// Borrowed from the earlier node that owns this inode's content.
     hardlink_target: []const u8,
+    sparse_extents: []tree_cursor.SparseExtent,
     has_content: bool,
     content: GeneralContent,
     xattrs: []OwnedXattr,
@@ -4914,6 +4962,7 @@ pub const GeneralTree = struct {
     pub fn deinit(self: *GeneralTree) void {
         for (self.entries) |entry| {
             self.allocator.free(entry.path);
+            self.allocator.free(entry.sparse_extents);
             freeXattrs(self.allocator, entry.xattrs);
             self.allocator.free(entry.xattr_views);
         }
@@ -4947,6 +4996,7 @@ pub const GeneralTree = struct {
             .crtime_nsec = node.crtime_nsec,
             .device = node.device,
             .hardlink_target = node.hardlink_target,
+            .sparse_extents = node.sparse_extents,
             .content = if (node.has_content) .{
                 .ctx = &node.content,
                 .read_at_fn = generalContentReadAt,
@@ -4998,6 +5048,7 @@ pub const GeneralTree = struct {
             .xattrs = entry.xattrs,
             .device = entry.device,
             .hardlink_target = entry.hardlink_target,
+            .sparse_extents = entry.sparse_extents,
         };
     }
 };
@@ -5303,6 +5354,8 @@ const GeneralScanner = struct {
         const xattrs = try self.readNodeXattrs(inode, &raw);
         var xattrs_owned = true;
         defer if (xattrs_owned) freeXattrs(self.allocator, xattrs);
+        const sparse_extents = try self.readSparseExtents(inode);
+        errdefer self.allocator.free(sparse_extents);
         const owned_path = try self.allocator.dupe(u8, path);
         // Ownership moves into `entries` on a successful append, and the tree
         // frees it from there; recursing into a subdirectory can still fail
@@ -5314,6 +5367,8 @@ const GeneralScanner = struct {
         for (xattrs, 0..) |xattr, index| {
             views[index] = .{ .name = xattr.name, .value = xattr.value };
         }
+        var sparse_owned = true;
+        errdefer if (sparse_owned) self.allocator.free(sparse_extents);
         try self.entries.append(.{
             .path = owned_path,
             .kind = inode.kind,
@@ -5331,6 +5386,7 @@ const GeneralScanner = struct {
             .crtime_nsec = inode.crtime_nsec,
             .device = inode.device,
             .hardlink_target = "",
+            .sparse_extents = sparse_extents,
             .has_content = inode.hasContent(),
             .content = .{
                 .reader = self.reader,
@@ -5344,6 +5400,7 @@ const GeneralScanner = struct {
             .xattr_views = views,
         });
         xattrs_owned = false;
+        sparse_owned = false;
         node_owned = false;
 
         if (inode.kind != .directory and inode.link_count > 1) {
@@ -5379,11 +5436,54 @@ const GeneralScanner = struct {
             .crtime_nsec = inode.crtime_nsec,
             .device = .{},
             .hardlink_target = target,
+            .sparse_extents = try self.allocator.alloc(tree_cursor.SparseExtent, 0),
             .has_content = false,
             .content = undefined,
             .xattrs = &.{},
             .xattr_views = &.{},
         });
+    }
+
+    fn readSparseExtents(self: *GeneralScanner, inode: GeneralInode) ![]tree_cursor.SparseExtent {
+        if (!inode.hasContent() or inode.size == 0 or inode.isFastSymlink()) {
+            return self.allocator.alloc(tree_cursor.SparseExtent, 0);
+        }
+        const extents = try readGeneralExtents(
+            self.reader,
+            self.io,
+            self.allocator,
+            inode.block_bytes[0..],
+            inode.inode,
+        );
+        defer self.allocator.free(extents);
+        const total_blocks = blocksForBytes(inode.size, self.reader.block_size);
+        var holes = std.array_list.Managed(tree_cursor.SparseExtent).init(self.allocator);
+        errdefer holes.deinit();
+        var logical: u32 = 0;
+        for (extents) |extent| {
+            if (extent.logical_block > logical) {
+                try holes.append(.{
+                    .logical_block = logical,
+                    .block_count = extent.logical_block - logical,
+                });
+            }
+            const end = std.math.add(u32, extent.logical_block, extent.block_count) catch
+                return error.UnsupportedExtent;
+            if (!extent.initialized) {
+                try holes.append(.{
+                    .logical_block = extent.logical_block,
+                    .block_count = extent.block_count,
+                });
+            }
+            logical = @max(logical, end);
+        }
+        if (logical < total_blocks) {
+            try holes.append(.{
+                .logical_block = logical,
+                .block_count = total_blocks - logical,
+            });
+        }
+        return holes.toOwnedSlice();
     }
 
     fn readGeneralInode(
@@ -6063,6 +6163,7 @@ fn buildPlan(
         for (entries_list.items) |entry| {
             allocator.free(entry.path);
             if (entry.hardlink_target.len > 0) allocator.free(entry.hardlink_target);
+            allocator.free(entry.sparse_extents);
             freeOwnedXattrSlice(allocator, entry.xattrs);
         }
         entries_list.deinit();
@@ -6080,6 +6181,8 @@ fn buildPlan(
         errdefer allocator.free(owned_path);
         const owned_hardlink_target = try allocator.dupe(u8, entry.hardlink_target);
         errdefer if (owned_hardlink_target.len > 0) allocator.free(owned_hardlink_target);
+        const owned_sparse_extents = try allocator.dupe(tree_cursor.SparseExtent, entry.sparse_extents);
+        errdefer allocator.free(owned_sparse_extents);
         const times = try InodeTimes.from(entry);
         try entries_list.append(.{
             .path = owned_path,
@@ -6093,6 +6196,7 @@ fn buildPlan(
             .device = entry.device,
             .hardlink_target = owned_hardlink_target,
             .times = times,
+            .sparse_extents = owned_sparse_extents,
         });
     }
 
@@ -6155,6 +6259,7 @@ fn buildPlan(
             .device = entry.device,
             .hardlink_target = entry.hardlink_target,
             .times = entry.times,
+            .sparse_extents = entry.sparse_extents,
             .owns_inode = owns_inode,
         };
         entry.xattrs = &.{};
@@ -6191,7 +6296,11 @@ fn buildPlan(
             },
             .file => {
                 node.size_on_disk = node.declared_size;
-                node.data_block_count = blocksForBytes(node.size_on_disk, options.block_size);
+                node.data_block_count = try initializedBlockCount(
+                    node.size_on_disk,
+                    node.sparse_extents,
+                    options.block_size,
+                );
                 data_blocks_needed += node.data_block_count;
                 if (node.size_on_disk > std.math.maxInt(i32)) feature_ro_compat |= feature_ro_compat_large_file;
             },
@@ -6211,7 +6320,11 @@ fn buildPlan(
                 // Azure Linux image, see issue #74 -- a real distro symlink
                 // of exactly 60 characters triggered this in practice).
                 node.uses_fast_symlink = node.declared_size < 60;
-                node.data_block_count = if (node.uses_fast_symlink) 0 else blocksForBytes(node.size_on_disk, options.block_size);
+                node.data_block_count = if (node.uses_fast_symlink) 0 else try initializedBlockCount(
+                    node.size_on_disk,
+                    node.sparse_extents,
+                    options.block_size,
+                );
                 data_blocks_needed += node.data_block_count;
             },
             // A device or FIFO is entirely described by its inode, and a
@@ -6378,8 +6491,18 @@ fn allocateNodeBlocks(
         if (node.data_block_count == 0) {
             node.extents = &.{};
         } else {
-            node.extents = try block_allocator.allocate(allocator, node.data_block_count);
+            if (node.sparse_extents.len == 0) {
+                node.extents = try block_allocator.allocate(allocator, node.data_block_count);
+            } else {
+                node.extents = try allocateSparseExtents(
+                    allocator,
+                    block_allocator,
+                    blocksForBytes(node.size_on_disk, default_block_size),
+                    node.sparse_extents,
+                );
+            }
         }
+
         if (!node.uses_fast_symlink) {
             try allocateExtentTreeBlocks(allocator, block_allocator, node, default_block_size);
         }
@@ -6387,6 +6510,56 @@ fn allocateNodeBlocks(
             node.xattr_block = try block_allocator.allocateSingle();
         }
     }
+}
+
+fn allocateSparseExtents(
+    allocator: std.mem.Allocator,
+    block_allocator: *BlockAllocator,
+    logical_block_count: u32,
+    sparse_extents: []const tree_cursor.SparseExtent,
+) PopulateError![]Extent {
+    var output = std.array_list.Managed(Extent).init(allocator);
+    errdefer output.deinit();
+    var logical: u32 = 0;
+    for (sparse_extents) |sparse| {
+        if (sparse.logical_block > logical) {
+            const run = try block_allocator.allocate(allocator, sparse.logical_block - logical);
+            defer allocator.free(run);
+            for (run) |extent| {
+                try output.append(.{
+                    .logical_block = extent.logical_block + logical,
+                    .start_block = extent.start_block,
+                    .block_count = extent.block_count,
+                });
+            }
+        }
+        var remaining = sparse.block_count;
+        var hole_logical = sparse.logical_block;
+        while (remaining > 0) {
+            const take: u16 = @intCast(@min(remaining, @as(u32, 0x7FFF)));
+            try output.append(.{
+                .logical_block = hole_logical,
+                .start_block = 0,
+                .block_count = take,
+                .initialized = false,
+            });
+            hole_logical += take;
+            remaining -= take;
+        }
+        logical = sparse.logical_block + sparse.block_count;
+    }
+    if (logical < logical_block_count) {
+        const run = try block_allocator.allocate(allocator, logical_block_count - logical);
+        defer allocator.free(run);
+        for (run) |extent| {
+            try output.append(.{
+                .logical_block = extent.logical_block + logical,
+                .start_block = extent.start_block,
+                .block_count = extent.block_count,
+            });
+        }
+    }
+    return output.toOwnedSlice();
 }
 
 const BlockAllocator = struct {
@@ -6467,14 +6640,14 @@ fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions)
             .file, .symlink => {
                 if (!node.uses_fast_symlink and node.data_block_count != 0) {
                     const content = node.content orelse return error.MissingContentReader;
-                    var written_data: u64 = 0;
                     var extent_index: usize = 0;
                     while (extent_index < node.extents.len) : (extent_index += 1) {
                         const extent = node.extents[extent_index];
+                        if (!extent.initialized) continue;
                         var block_index: u16 = 0;
                         while (block_index < extent.block_count) : (block_index += 1) {
                             @memset(&scratch, 0);
-                            const copy_off = written_data;
+                            const copy_off = @as(u64, extent.logical_block + block_index) * options.block_size;
                             const remaining = node.size_on_disk - copy_off;
                             const to_read = @min(@as(u64, options.block_size), remaining);
                             const want = @as(usize, @intCast(to_read));
@@ -6484,7 +6657,6 @@ fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions)
                             }
                             const physical_block = extent.start_block + block_index;
                             try file.writePositionalAll(io, &scratch, options.offset + physical_block * options.block_size);
-                            written_data += want;
                         }
                     }
                 }
@@ -7273,6 +7445,28 @@ fn blocksForBytes(bytes: u64, block_size: u32) u32 {
     return @intCast(divCeil(bytes, block_size));
 }
 
+fn initializedBlockCount(
+    bytes: u64,
+    sparse_extents: []const tree_cursor.SparseExtent,
+    block_size: u32,
+) PopulateError!u32 {
+    const total = blocksForBytes(bytes, block_size);
+    var holes: u64 = 0;
+    var previous_end: u32 = 0;
+    for (sparse_extents) |sparse| {
+        if (sparse.block_count == 0 or sparse.logical_block < previous_end) {
+            return error.InvalidSparseExtent;
+        }
+        const end = std.math.add(u32, sparse.logical_block, sparse.block_count) catch
+            return error.InvalidSparseExtent;
+        if (end > total) return error.InvalidSparseExtent;
+        holes += sparse.block_count;
+        previous_end = end;
+    }
+    if (holes > total) return error.InvalidSparseExtent;
+    return @intCast(total - holes);
+}
+
 fn blocksToGroups(total_blocks: u32, blocks_per_group: u32) u32 {
     return @intCast(divCeil(total_blocks, blocks_per_group));
 }
@@ -7341,7 +7535,8 @@ fn encodeExtentLeafNode(buf: []u8, max_entries: usize, extents: []const Extent) 
     for (extents, 0..) |extent, index| {
         const base = extent_header_size + index * extent_entry_size;
         writeInt(u32, buf[base .. base + 4], extent.logical_block);
-        writeInt(u16, buf[base + 4 .. base + 6], extent.block_count);
+        writeInt(u16, buf[base + 4 .. base + 6], extent.block_count |
+            if (extent.initialized) @as(u16, 0) else @as(u16, 0x8000));
         writeInt(u16, buf[base + 6 .. base + 8], @as(u16, @truncate(extent.start_block >> 32)));
         writeInt(u32, buf[base + 8 .. base + 12], @as(u32, @truncate(extent.start_block)));
     }
@@ -7523,7 +7718,8 @@ fn decodeExtent(buf: []const u8) Extent {
     return .{
         .logical_block = readInt(u32, buf[0..4]),
         .start_block = (@as(u64, start_hi) << 32) | start_lo,
-        .block_count = readInt(u16, buf[4..6]),
+        .block_count = @intCast(readInt(u16, buf[4..6]) & 0x7FFF),
+        .initialized = readInt(u16, buf[4..6]) <= 32768,
     };
 }
 
@@ -7538,7 +7734,7 @@ fn decodeExtentIndex(buf: []const u8) ExtentIndex {
 
 fn findPhysicalBlock(extents: []const Extent, logical_block: u32) ?u64 {
     for (extents) |extent| {
-        if (logical_block >= extent.logical_block and logical_block < extent.logical_block + extent.block_count) {
+        if (extent.initialized and logical_block >= extent.logical_block and logical_block < extent.logical_block + extent.block_count) {
             return extent.start_block + (logical_block - extent.logical_block);
         }
     }

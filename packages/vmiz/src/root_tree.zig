@@ -108,6 +108,7 @@ const Node = struct {
     metadata: Metadata,
     owned_xattrs: []tree_cursor.OwnedXattr,
     payload: Payload,
+    sparse_extents: []tree_cursor.SparseExtent = &.{},
 
     pub fn size(self: Node) u64 {
         return switch (self.payload) {
@@ -121,6 +122,7 @@ const Node = struct {
 pub const ContentView = struct {
     size: u64,
     sha256: [32]u8,
+    sparse_extents: []const tree_cursor.SparseExtent = &.{},
 };
 
 pub const NodePayload = union(enum) {
@@ -159,6 +161,10 @@ pub const RootMetadata = struct {
     ctime_nsec: u32 = 0,
     crtime: ?i64 = null,
     crtime_nsec: u32 = 0,
+    /// Extended attributes on the implicit ext4 root inode. The slice is
+    /// borrowed from the source tree or caller and is copied by the ext4
+    /// writer before the source is released.
+    xattrs: []const tree_cursor.Xattr = &.{},
 };
 
 pub const FatMetadataPolicy = enum {
@@ -314,6 +320,20 @@ pub const RootTree = struct {
         }, metadata);
     }
 
+    pub fn putFileBytesSparse(
+        self: *RootTree,
+        path: []const u8,
+        bytes: []const u8,
+        sparse_extents: []const tree_cursor.SparseExtent,
+        metadata: Metadata,
+    ) !void {
+        var reader = BytesReader{ .bytes = bytes };
+        try self.putFileReaderSparse(path, bytes.len, .{
+            .ctx = &reader,
+            .read_at_fn = BytesReader.readAt,
+        }, sparse_extents, metadata);
+    }
+
     pub fn putFileFromPath(
         self: *RootTree,
         path: []const u8,
@@ -361,6 +381,35 @@ pub const RootTree = struct {
             try self.rollbackSpool(old_spool_len);
             return err;
         };
+    }
+
+    pub fn putFileReaderSparse(
+        self: *RootTree,
+        path: []const u8,
+        size: u64,
+        reader: tree_cursor.Cursor.ContentReader,
+        sparse_extents: []const tree_cursor.SparseExtent,
+        metadata: Metadata,
+    ) !void {
+        try validatePath(path, self.limits, self.diagnostic);
+        try self.checkFileBytes(size);
+        const old_spool_len = self.spool_len;
+        const content = self.spoolContent(size, reader) catch |err| {
+            try self.rollbackSpool(old_spool_len);
+            return err;
+        };
+        var owned_sparse_extents = try self.allocator.dupe(
+            tree_cursor.SparseExtent,
+            sparse_extents,
+        );
+        errdefer self.allocator.free(owned_sparse_extents);
+        self.putNode(path, .file, metadata, .{ .content = content }) catch |err| {
+            try self.rollbackSpool(old_spool_len);
+            return err;
+        };
+        const index = self.findIndex(path) orelse return error.MissingNode;
+        self.nodes.items[index].sparse_extents = owned_sparse_extents;
+        owned_sparse_extents = &.{};
     }
 
     pub fn putSymlink(
@@ -503,7 +552,13 @@ pub const RootTree = struct {
                     else
                         return error.MissingContent;
                     if (mode == .owned) {
-                        try self.putFileReader(path, entry.size, content, metadata);
+                        try self.putFileReaderSparse(
+                            path,
+                            entry.size,
+                            content,
+                            entry.sparse_extents,
+                            metadata,
+                        );
                     } else {
                         try self.putBorrowedContent(
                             path,
@@ -550,8 +605,29 @@ pub const RootTree = struct {
             .ctime_nsec = source.root.ctime_nsec,
             .crtime = source.root.crtime,
             .crtime_nsec = source.root.crtime_nsec,
+            .xattrs = source.root.xattrs,
         });
         _ = try self.importExt4GeneralMode(source, .owned, "");
+    }
+
+    /// Imports a strict writer-compatible ext4 tree while retaining the
+    /// source root inode metadata and xattrs alongside its entries.
+    pub fn importExt4Strict(self: *RootTree, source: *ext4.StrictTree) !void {
+        self.setRootMetadata(.{
+            .mode = source.root.mode,
+            .uid = source.root.uid,
+            .gid = source.root.gid,
+            .atime = source.root.atime,
+            .mtime = source.root.mtime,
+            .ctime = source.root.ctime,
+            .atime_nsec = source.root.atime_nsec,
+            .mtime_nsec = source.root.mtime_nsec,
+            .ctime_nsec = source.root.ctime_nsec,
+            .crtime = source.root.crtime,
+            .crtime_nsec = source.root.crtime_nsec,
+            .xattrs = source.root.xattrs,
+        });
+        _ = try self.importExt4ViewMode(source.fileTreeView(), .owned, "");
     }
 
     /// Imports paths and metadata while retaining read-only content readers
@@ -570,6 +646,7 @@ pub const RootTree = struct {
             .ctime_nsec = source.root.ctime_nsec,
             .crtime = source.root.crtime,
             .crtime_nsec = source.root.crtime_nsec,
+            .xattrs = source.root.xattrs,
         });
         _ = try self.importExt4GeneralMode(source, .borrowed, "");
     }
@@ -593,6 +670,7 @@ pub const RootTree = struct {
             .ctime_nsec = source.root.ctime_nsec,
             .crtime = source.root.crtime,
             .crtime_nsec = source.root.crtime_nsec,
+            .xattrs = @ptrCast(source.root.xattrs),
         });
         _ = try self.importXfsMode(source, .owned, "");
     }
@@ -613,6 +691,7 @@ pub const RootTree = struct {
             .ctime_nsec = source.root.ctime_nsec,
             .crtime = source.root.crtime,
             .crtime_nsec = source.root.crtime_nsec,
+            .xattrs = @ptrCast(source.root.xattrs),
         });
         _ = try self.importXfsMode(source, .borrowed, "");
     }
@@ -677,7 +756,13 @@ pub const RootTree = struct {
                         continue;
                     }
                     if (kind == .file) {
-                        try self.putFileReader(path, entry.size, content, metadata);
+                        try self.putFileReaderSparse(
+                            path,
+                            entry.size,
+                            content,
+                            entry.sparse_extents,
+                            metadata,
+                        );
                         continue;
                     }
                     try self.putOwnedContent(path, .symlink, entry.size, content, metadata);
@@ -1117,6 +1202,10 @@ pub const RootTree = struct {
         hashOptionalInt(&hash, self.root_metadata.mtime);
         hashOptionalInt(&hash, self.root_metadata.ctime);
         hashSubsecondTimes(&hash, self.root_metadata);
+        for (self.root_metadata.xattrs) |xattr| {
+            hashString(&hash, xattr.name);
+            hashString(&hash, xattr.value);
+        }
         for (self.nodes.items) |node| {
             hashString(&hash, node.path);
             hashInt(&hash, @intFromEnum(node.kind));
@@ -1143,6 +1232,10 @@ pub const RootTree = struct {
                     hashInt(&hash, device.minor);
                 },
             }
+            for (node.sparse_extents) |sparse| {
+                hashInt(&hash, sparse.logical_block);
+                hashInt(&hash, sparse.block_count);
+            }
         }
         var digest: [32]u8 = undefined;
         hash.final(&digest);
@@ -1168,6 +1261,7 @@ pub const RootTree = struct {
                 .content => |content| .{ .content = .{
                     .size = content.size,
                     .sha256 = content.sha256,
+                    .sparse_extents = node.sparse_extents,
                 } },
                 .hardlink_target => |target| .{ .hardlink_target = target },
                 .device => |device| .{ .device = device },
@@ -1860,6 +1954,7 @@ pub const RootTree = struct {
 
     fn freeNode(self: *RootTree, node: *Node) void {
         self.allocator.free(node.path);
+        self.allocator.free(node.sparse_extents);
         freeOwnedXattrs(self.allocator, node.owned_xattrs);
         self.freePayload(node.payload);
     }
@@ -1924,6 +2019,7 @@ pub const RootTree = struct {
             .ctime_nsec = node.metadata.ctime_nsec,
             .crtime = node.metadata.crtime,
             .crtime_nsec = node.metadata.crtime_nsec,
+            .sparse_extents = node.sparse_extents,
         };
     }
 
