@@ -2,12 +2,16 @@
 //!
 //! Feature flags intentionally stay within a conservative, fsck-friendly
 //! subset:
-//!   - `feature_compat = EXT_ATTR | DIR_INDEX`, plus `HAS_JOURNAL` when a
-//!     journal is asked for: external xattr blocks are supported, and
+//!   - The compact writer profile uses `feature_compat = EXT_ATTR | DIR_INDEX`,
+//!     plus `HAS_JOURNAL` when a journal is asked for: external xattr blocks
+//!     are supported, and
 //!     directories that outgrow a single leaf block are written with ext4
 //!     htree indexes, including interior index nodes when a single root index
 //!     block is no longer enough. `RESIZE_INODE` and the quota bits remain
-//!     permanently unset.
+//!     unset in this compact profile. The pinned Canonical Ubuntu profile is
+//!     separate: it rebuilds e2fsprogs-style `resize_inode` reservations and
+//!     an empty `orphan_file` structure rather than treating those bits as
+//!     metadata-free.
 //!
 //!     The journal is opt-in and off by default. Nothing needs one while the
 //!     image is being built -- the filesystem is created offline and written
@@ -46,8 +50,8 @@
 //! readback support. With 4 KiB blocks this writer supports extent-tree depths
 //! up to 4, which is enough to cover the filesystem's 32-bit logical-block
 //! space. Resizing is supported as an offline, in-place grow operation that
-//! rewrites the superblock/GDTs and initializes new block groups without
-//! enabling ext4's separate `RESIZE_INODE` online-resize scaffolding.
+//! rewrites the superblock/GDTs and initializes new block groups; the pinned
+//! profile also preserves and updates e2fsprogs' `RESIZE_INODE` mapping.
 
 const std = @import("std");
 const limits_mod = @import("limits.zig");
@@ -106,7 +110,7 @@ const rev_dynamic: u32 = 1;
 
 const feature_compat_dir_prealloc: u32 = 0x0001;
 const feature_compat_imagic_inodes: u32 = 0x0002;
-const feature_compat_has_journal: u32 = 0x0004;
+pub const feature_compat_has_journal: u32 = 0x0004;
 const feature_compat_ext_attr: u32 = 0x0008;
 const feature_compat_resize_inode: u32 = 0x0010;
 const feature_compat_dir_index: u32 = 0x0020;
@@ -147,15 +151,16 @@ const feature_ro_compat_project: u32 = 0x2000;
 const feature_ro_compat_shared_blocks: u32 = 0x4000;
 const feature_ro_compat_verity: u32 = 0x8000;
 const feature_ro_compat_orphan_present: u32 = 0x0001_0000;
-const writer_feature_compat: u32 = feature_compat_ext_attr | feature_compat_dir_index;
-const writer_feature_incompat: u32 = feature_incompat_filetype | feature_incompat_extents;
+const orphan_block_magic: u32 = 0x0B10_CA04;
+pub const writer_feature_compat: u32 = feature_compat_ext_attr | feature_compat_dir_index;
+pub const writer_feature_incompat: u32 = feature_incompat_filetype | feature_incompat_extents;
 /// Always set by this writer. `EXTRA_ISIZE` asserts that every inode has at
 /// least `s_min_extra_isize` bytes past the classic 128 already filled in,
 /// which is exactly what `writeInodes` guarantees.
-const writer_feature_ro_compat_base: u32 = feature_ro_compat_sparse_super | feature_ro_compat_metadata_csum | feature_ro_compat_extra_isize;
+pub const writer_feature_ro_compat_base: u32 = feature_ro_compat_sparse_super | feature_ro_compat_metadata_csum | feature_ro_compat_extra_isize;
 /// Allowed on a filesystem this module reads back, but conditional on its
 /// contents rather than always present.
-const writer_feature_ro_compat_optional: u32 = feature_ro_compat_large_file;
+pub const writer_feature_ro_compat_optional: u32 = feature_ro_compat_large_file;
 const reader_feature_compat: u32 = writer_feature_compat | feature_compat_has_journal | feature_compat_resize_inode | feature_compat_orphan_file;
 const reader_feature_incompat: u32 = writer_feature_incompat | feature_incompat_64bit | feature_incompat_flex_bg | feature_incompat_csum_seed;
 const reader_feature_ro_compat: u32 = writer_feature_ro_compat_base | feature_ro_compat_large_file | feature_ro_compat_huge_file | feature_ro_compat_dir_nlink | feature_ro_compat_extra_isize;
@@ -320,6 +325,22 @@ pub const PopulateOptions = struct {
     timestamp: u32 = 0,
     /// Journal creation policy. Off by default; see `JournalOptions`.
     journal: JournalOptions = .{},
+    /// Optional supported source feature bits to retain even when the
+    /// current content no longer requires them (currently LARGE_FILE).
+    preserve_feature_ro_compat: u32 = 0,
+    /// A source profile to reproduce. The default is vmiz's compact writer
+    /// profile; the only alternate profile currently supported is the pinned
+    /// Canonical Ubuntu 26.04 64-byte-descriptor layout.
+    preserve_feature_compat: ?u32 = null,
+    preserve_feature_incompat: ?u32 = null,
+    descriptor_size: u16 = group_desc_size,
+    /// Metadata checksum seed from a source that has CSUM_SEED. When omitted,
+    /// the UUID-derived seed is used, which is valid for a freshly built
+    /// profile but does not promise byte preservation.
+    preserve_checksum_seed: ?u32 = null,
+    /// Existing orphan-file inode number to retain in a rebuilt pinned
+    /// profile. Null lets the writer allocate the next normal inode.
+    preserve_orphan_file_inode: ?u32 = null,
     /// Inode table sizing policy. Content-derived by default; see
     /// `InodeOptions`.
     inodes: InodeOptions = .{},
@@ -356,6 +377,7 @@ pub const Extent = struct {
     logical_block: u32,
     start_block: u64,
     block_count: u16,
+    initialized: bool = true,
 };
 
 pub const DirEntry = struct {
@@ -385,6 +407,8 @@ pub const PopulateError = std.mem.Allocator.Error || Io.File.ReadPositionalError
     Io.File.WritePositionalError || Io.File.SetLengthError || Io.File.StatError ||
     FileTreeView.IteratorError || FileTreeView.ContentError || error{
     UnsupportedBlockSize,
+    UnsupportedDescriptorSize,
+    UnsupportedFeatures,
     InvalidRange,
     LabelTooLong,
     InvalidPath,
@@ -395,6 +419,7 @@ pub const PopulateError = std.mem.Allocator.Error || Io.File.ReadPositionalError
     MissingContentReader,
     UnexpectedContentLength,
     InvalidDirectorySize,
+    InvalidSparseExtent,
     MissingHardlinkTarget,
     UnsupportedHardlinkTarget,
     TooManyHardlinks,
@@ -465,6 +490,7 @@ const OwnedEntry = struct {
     device: DeviceNumbers = .{},
     hardlink_target: []u8 = &.{},
     times: InodeTimes = .{},
+    sparse_extents: []tree_cursor.SparseExtent = &.{},
 };
 
 /// The three times an inode written by this module can carry. On a 256-byte
@@ -581,12 +607,21 @@ const Node = struct {
     link_count: u16 = 1,
     device: DeviceNumbers = .{},
     hardlink_target: []const u8 = "",
+    sparse_extents: []const tree_cursor.SparseExtent = &.{},
     /// False for a `hardlink`, which reuses the inode its target owns and so
     /// must be skipped everywhere an inode is allocated, counted or written.
     owns_inode: bool = true,
     uses_fast_symlink: bool = false,
     uses_hashed_directory: bool = false,
     hashed_directory_index_block_count: u32 = 0,
+    special: SpecialKind = .none,
+};
+
+const SpecialKind = enum {
+    none,
+    journal,
+    resize_inode,
+    orphan_file,
 };
 
 const ExtentHeader = struct {
@@ -617,6 +652,9 @@ const Layout = struct {
     gdt_blocks: u32,
     inodes_per_group: u32,
     inode_table_blocks: u32,
+    descriptor_size: u16 = group_desc_size,
+    reserved_gdt_blocks: u32 = 0,
+    feature_incompat: u32 = writer_feature_incompat,
     groups: []GroupLayout,
 };
 
@@ -644,7 +682,9 @@ const WriterPlan = struct {
     /// letting it into that array would make it a child of the root, count it
     /// as a link, and hand it a name it must never have.
     journal: []Node,
+    specials: []Node,
     feature_compat: u32,
+    feature_incompat: u32,
     feature_ro_compat: u32,
     data_blocks_needed: u32,
     /// Nodes that own an inode, which is fewer than `nodes.len` whenever the
@@ -674,9 +714,15 @@ const WriterPlan = struct {
             if (node.extent_tree_blocks.len > 0) allocator.free(node.extent_tree_blocks);
         }
         allocator.free(self.journal);
+        for (self.specials) |node| {
+            if (node.extents.len > 0) allocator.free(node.extents);
+            if (node.extent_tree_blocks.len > 0) allocator.free(node.extent_tree_blocks);
+        }
+        allocator.free(self.specials);
         for (self.entries) |entry| {
             allocator.free(entry.path);
             if (entry.hardlink_target.len > 0) allocator.free(entry.hardlink_target);
+            allocator.free(entry.sparse_extents);
         }
         allocator.free(self.entries);
         self.* = undefined;
@@ -704,7 +750,7 @@ const PreparedPopulate = struct {
             ),
             .group_count = self.layout.group_count,
             .feature_compat = self.writer.feature_compat,
-            .feature_incompat = writer_feature_incompat,
+            .feature_incompat = self.writer.feature_incompat,
             .feature_ro_compat = self.writer.feature_ro_compat,
             .journal_block_count = self.writer.journalBlockCount(),
         };
@@ -842,6 +888,12 @@ pub fn minimumPopulateLengthAtLeast(
         min_journalled_filesystem_blocks);
 
     var journal_blocks: u32 = fixed_journal orelse 0;
+    const layout_profile = LayoutProfile{
+        .descriptor_size = if (plan.feature_incompat & feature_incompat_64bit != 0) 64 else 32,
+        .feature_compat = plan.feature_compat,
+        .feature_incompat = plan.feature_incompat,
+        .reserved_gdt_blocks = if (plan.feature_compat & feature_compat_resize_inode != 0) 1 else 0,
+    };
     var extent_tree_allowance: u32 = 0;
     // A confirmed answer that a later, tighter round may yet improve on.
     var best: ?MinimumSize = null;
@@ -855,6 +907,7 @@ pub fn minimumPopulateLengthAtLeast(
             needed,
             total_floor,
             options.inodes.bytes_per_inode,
+            layout_profile,
         );
 
         // The journal ladder is keyed on the size it is helping to choose,
@@ -946,17 +999,31 @@ fn layOutTrial(
     bytes_per_inode: ?u32,
 ) PopulateError!Layout {
     releaseNodeAllocations(allocator, plan.nodes);
+    releaseNodeAllocations(allocator, plan.specials);
     releaseNodeAllocations(allocator, plan.journal);
     allocator.free(plan.journal);
     plan.journal = &.{};
     plan.journal = try buildJournalNode(allocator, journal_blocks);
     plan.data_blocks_needed = needed_blocks;
 
-    const layout = try buildLayout(allocator, total_blocks, plan.inode_count, needed_blocks, bytes_per_inode);
+    const layout = try buildLayoutWithProfile(
+        allocator,
+        total_blocks,
+        plan.inode_count,
+        needed_blocks,
+        bytes_per_inode,
+        .{
+            .descriptor_size = if (plan.feature_incompat & feature_incompat_64bit != 0) 64 else 32,
+            .feature_compat = plan.feature_compat,
+            .feature_incompat = plan.feature_incompat,
+            .reserved_gdt_blocks = if (plan.feature_compat & feature_compat_resize_inode != 0) 1 else 0,
+        },
+    );
     errdefer allocator.free(layout.groups);
-    assignInodesToGroups(plan.nodes, layout.groups, layout.inodes_per_group);
+    assignInodesToGroups(plan.nodes, plan.specials, layout.groups, layout.inodes_per_group);
     var block_allocator = BlockAllocator{ .groups = layout.groups };
     try allocateNodeBlocks(allocator, plan.nodes, &block_allocator);
+    try allocateNodeBlocks(allocator, plan.specials, &block_allocator);
     try allocateNodeBlocks(allocator, plan.journal, &block_allocator);
     return layout;
 }
@@ -978,6 +1045,7 @@ fn releaseNodeAllocations(allocator: std.mem.Allocator, nodes: []Node) void {
 fn countExtentTreeBlocks(plan: *const WriterPlan) PopulateError!u32 {
     var total: u64 = 0;
     for (plan.nodes) |node| total += node.extent_tree_blocks.len;
+    for (plan.specials) |node| total += node.extent_tree_blocks.len;
     for (plan.journal) |node| total += node.extent_tree_blocks.len;
     return std.math.cast(u32, total) orelse error.TooManyExtents;
 }
@@ -1003,6 +1071,7 @@ fn solveTotalBlocks(
     needed_blocks: u32,
     floor_blocks: u32,
     bytes_per_inode: ?u32,
+    profile: LayoutProfile,
 ) PopulateError!u32 {
     // Whole block groups are searched first, because "do G groups fit" is
     // monotone in G and so safe to bisect: a group brings its own blocks,
@@ -1013,14 +1082,14 @@ fn solveTotalBlocks(
     const max_groups = blocksToGroups(std.math.maxInt(u32), default_blocks_per_group);
     var low: u32 = 1;
     var high: u32 = 1;
-    while (!try groupCountFits(allocator, inode_count, needed_blocks, high, bytes_per_inode)) {
+    while (!try groupCountFits(allocator, inode_count, needed_blocks, high, bytes_per_inode, profile)) {
         if (high >= max_groups) return error.FilesystemTooLarge;
         low = high + 1;
         high = if (high > max_groups / 2) max_groups else high * 2;
     }
     while (low < high) {
         const mid = low + (high - low) / 2;
-        if (try groupCountFits(allocator, inode_count, needed_blocks, mid, bytes_per_inode)) {
+        if (try groupCountFits(allocator, inode_count, needed_blocks, mid, bytes_per_inode, profile)) {
             high = mid;
         } else {
             low = mid + 1;
@@ -1039,6 +1108,7 @@ fn solveTotalBlocks(
         @max(low, floor_groups),
         floor_blocks,
         bytes_per_inode,
+        profile,
     );
 }
 
@@ -1048,13 +1118,15 @@ fn groupCountFits(
     needed_blocks: u32,
     group_count: u32,
     bytes_per_inode: ?u32,
+    profile: LayoutProfile,
 ) PopulateError!bool {
-    const layout = buildLayout(
+    const layout = buildLayoutWithProfile(
         allocator,
         blocksForGroupCount(group_count),
         inode_count,
         needed_blocks,
         bytes_per_inode,
+        profile,
     ) catch |err| switch (err) {
         // Both mean "this geometry is too small", which is exactly what the
         // search exists to walk past. Every other failure is real.
@@ -1088,9 +1160,17 @@ fn trimToLastGroup(
     group_count: u32,
     floor_blocks: u32,
     bytes_per_inode: ?u32,
+    profile: LayoutProfile,
 ) PopulateError!u32 {
     const full_blocks = blocksForGroupCount(group_count);
-    const layout = try buildLayout(allocator, full_blocks, inode_count, needed_blocks, bytes_per_inode);
+    const layout = try buildLayoutWithProfile(
+        allocator,
+        full_blocks,
+        inode_count,
+        needed_blocks,
+        bytes_per_inode,
+        profile,
+    );
     const spare = countFreeBlocks(layout.groups) - needed_blocks;
     const last = layout.groups[layout.groups.len - 1];
     const last_capacity = last.data_capacity;
@@ -1105,7 +1185,14 @@ fn trimToLastGroup(
     // The trimmed geometry is derived rather than searched, so it is
     // confirmed against the one definition of what a block group costs
     // before it is handed back as an answer.
-    const confirmed = try buildLayout(allocator, total, inode_count, needed_blocks, bytes_per_inode);
+    const confirmed = try buildLayoutWithProfile(
+        allocator,
+        total,
+        inode_count,
+        needed_blocks,
+        bytes_per_inode,
+        profile,
+    );
     allocator.free(confirmed.groups);
     return total;
 }
@@ -1141,18 +1228,28 @@ pub fn populate(
         };
     }
 
-    try writeNodeData(io, file, prepared.writer.nodes, options);
+    try writeNodeData(
+        io,
+        file,
+        prepared.writer.nodes,
+        prepared.writer.specials,
+        prepared.layout,
+        options,
+    );
     try writeJournalData(io, file, prepared.writer.journal, options);
     try zeroUnusedInodeTableBlocks(io, file, prepared.layout, options.offset);
-    try writeBitmaps(io, file, prepared.layout, options.offset);
+    try writeBitmaps(io, file, prepared.layout, options.offset, prepared.writer.nodes, prepared.writer.specials);
     try writeInodes(io, file, prepared.writer.nodes, prepared.layout, options);
+    try writeSpecialInodes(io, file, prepared.writer.specials, prepared.layout, options);
     try writeInodes(io, file, prepared.writer.journal, prepared.layout, options);
     try writeGroupDescriptorTables(
         io,
         file,
         prepared.layout,
         options.offset,
-        options.uuid orelse [_]u8{0} ** 16,
+        options,
+        prepared.writer.nodes,
+        prepared.writer.specials,
     );
     try writeSuperblocks(io, file, prepared.layout, prepared.writer, options);
 
@@ -1178,16 +1275,26 @@ fn preparePopulate(
 
     var writer = try buildPlan(allocator, tree, options, try resolveJournalBlocks(options, total_blocks));
     errdefer writer.deinit(allocator);
-    const layout = try buildLayout(
+    const profile = try resolveWriterProfile(options, try resolveJournalBlocks(
+        options,
+        total_blocks,
+    ));
+    const layout = try buildLayoutWithProfile(
         allocator,
         total_blocks,
         writer.inode_count,
         writer.data_blocks_needed,
         options.inodes.bytes_per_inode,
+        .{
+            .descriptor_size = profile.descriptor_size,
+            .feature_compat = profile.feature_compat,
+            .feature_incompat = profile.feature_incompat,
+            .reserved_gdt_blocks = profile.resize_gdt_blocks,
+        },
     );
     errdefer allocator.free(layout.groups);
 
-    assignInodesToGroups(writer.nodes, layout.groups, layout.inodes_per_group);
+    assignInodesToGroups(writer.nodes, writer.specials, layout.groups, layout.inodes_per_group);
     if (writer.data_blocks_needed > countFreeBlocks(layout.groups)) {
         return error.NotEnoughSpace;
     }
@@ -1197,6 +1304,7 @@ fn preparePopulate(
     // comparable.
     var block_allocator = BlockAllocator{ .groups = layout.groups };
     try allocateNodeBlocks(allocator, writer.nodes, &block_allocator);
+    try allocateNodeBlocks(allocator, writer.specials, &block_allocator);
     try allocateNodeBlocks(allocator, writer.journal, &block_allocator);
     return .{ .writer = writer, .layout = layout };
 }
@@ -1246,8 +1354,155 @@ fn buildJournalNode(allocator: std.mem.Allocator, block_count: u32) PopulateErro
         .xattrs = &.{},
         .size_on_disk = size_bytes,
         .data_block_count = block_count,
+        .special = .journal,
     };
     return journal;
+}
+
+const WriterProfile = struct {
+    descriptor_size: u16,
+    feature_compat: u32,
+    feature_incompat: u32,
+    feature_ro_compat: u32,
+    checksum_seed: u32,
+    resize_gdt_blocks: u32,
+    has_orphan_file: bool,
+};
+
+fn resolveWriterProfile(options: PopulateOptions, journal_blocks: u32) PopulateError!WriterProfile {
+    const default_compat = if (journal_blocks == 0)
+        writer_feature_compat
+    else
+        writer_feature_compat | feature_compat_has_journal;
+    const compat = options.preserve_feature_compat orelse default_compat;
+    const incompat = options.preserve_feature_incompat orelse writer_feature_incompat;
+    const descriptor_size = options.descriptor_size;
+    if (descriptor_size != group_desc_size and descriptor_size != 64) {
+        return error.UnsupportedDescriptorSize;
+    }
+    if (options.preserve_feature_compat == null and
+        options.preserve_feature_incompat == null and
+        descriptor_size != group_desc_size)
+    {
+        return error.UnsupportedFeatures;
+    }
+    if ((compat & feature_compat_has_journal != 0) != (journal_blocks != 0) and
+        !(options.journal.enabled and journal_blocks == 0))
+    {
+        return error.UnsupportedFeatures;
+    }
+
+    const ro_supported = writer_feature_ro_compat_base |
+        feature_ro_compat_large_file |
+        feature_ro_compat_huge_file |
+        feature_ro_compat_dir_nlink;
+    const feature_ro_compat = writer_feature_ro_compat_base |
+        (options.preserve_feature_ro_compat & ro_supported & ~writer_feature_ro_compat_base);
+    if (options.preserve_feature_ro_compat & ~ro_supported != 0) {
+        return error.UnsupportedFeatures;
+    }
+
+    if (descriptor_size == 64 or
+        options.preserve_feature_compat != null or
+        options.preserve_feature_incompat != null or
+        options.preserve_checksum_seed != null)
+    {
+        // This is the only non-compact profile whose reserved structures are
+        // rebuilt here. Keeping the tuple exact prevents a caller from
+        // accidentally enabling one half of a feature without its on-disk
+        // companion.
+        const pinned_compat = writer_feature_compat | feature_compat_has_journal |
+            feature_compat_resize_inode | feature_compat_orphan_file;
+        const pinned_incompat = writer_feature_incompat |
+            feature_incompat_64bit | feature_incompat_flex_bg |
+            feature_incompat_csum_seed;
+        const pinned_ro = writer_feature_ro_compat_base |
+            feature_ro_compat_large_file | feature_ro_compat_huge_file |
+            feature_ro_compat_dir_nlink;
+        if (descriptor_size != 64 or compat != pinned_compat or
+            incompat != pinned_incompat or feature_ro_compat != pinned_ro)
+        {
+            return error.UnsupportedFeatures;
+        }
+    } else if (compat & ~(writer_feature_compat | feature_compat_has_journal) != 0 or
+        incompat != writer_feature_incompat)
+    {
+        return error.UnsupportedFeatures;
+    }
+
+    const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const checksum_seed = if (incompat & feature_incompat_csum_seed != 0)
+        options.preserve_checksum_seed orelse ext4Crc32c(&.{&uuid})
+    else
+        ext4Crc32c(&.{&uuid});
+    return .{
+        .descriptor_size = descriptor_size,
+        .feature_compat = compat,
+        .feature_incompat = incompat,
+        .feature_ro_compat = feature_ro_compat,
+        .checksum_seed = checksum_seed,
+        .resize_gdt_blocks = if (compat & feature_compat_resize_inode != 0) 1 else 0,
+        .has_orphan_file = compat & feature_compat_orphan_file != 0,
+    };
+}
+
+fn buildResizeInodeNode(allocator: std.mem.Allocator, inode_number: u32) PopulateError![]Node {
+    const node = try allocator.alloc(Node, 1);
+    const addresses_per_block = default_block_size / 4;
+    const max_size = (@as(u64, addresses_per_block) * addresses_per_block +
+        addresses_per_block + 12) * default_block_size;
+    node[0] = .{
+        .path = "",
+        .name = "",
+        .parent_path = "",
+        .parent_index = 0,
+        .inode = inode_number,
+        .kind = .file,
+        .mode = 0o600,
+        .uid = 0,
+        .gid = 0,
+        .declared_size = max_size,
+        .content = null,
+        .xattrs = &.{},
+        .size_on_disk = max_size,
+        .data_block_count = 1,
+        .owns_inode = true,
+        .special = .resize_inode,
+    };
+    return node;
+}
+
+fn defaultOrphanFileBlocks(total_blocks: u32) u32 {
+    if (total_blocks < 128 * 1024) return 32;
+    if (total_blocks < 2 * 1024 * 1024) return @max(@as(u32, 32), total_blocks / 4096);
+    return 512;
+}
+
+fn buildOrphanFileNode(
+    allocator: std.mem.Allocator,
+    inode_number: u32,
+    block_count: u32,
+) PopulateError![]Node {
+    const node = try allocator.alloc(Node, 1);
+    node[0] = .{
+        .path = "",
+        .name = "",
+        .parent_path = "",
+        .parent_index = 0,
+        .inode = inode_number,
+        .kind = .file,
+        .mode = 0o600,
+        .uid = 0,
+        .gid = 0,
+        .declared_size = @as(u64, block_count) * default_block_size,
+        .content = null,
+        .xattrs = &.{},
+        .size_on_disk = @as(u64, block_count) * default_block_size,
+        .data_block_count = block_count,
+        .owns_inode = true,
+        .special = .orphan_file,
+    };
+    return node;
 }
 
 /// Grow an ext4 filesystem in place by extending the final block group or
@@ -1377,11 +1632,14 @@ pub fn resize(io: Io, file: Io.File, allocator: std.mem.Allocator, options: Resi
         }
     }
 
-    try writeBitmaps(io, file, new_layout, options.offset);
+    try writeBitmaps(io, file, new_layout, options.offset, &.{}, &.{});
 
     var uuid: [16]u8 = undefined;
     @memcpy(&uuid, sb[0x68..0x78]);
-    try writeGroupDescriptorTables(io, file, new_layout, options.offset, uuid);
+    try writeGroupDescriptorTables(io, file, new_layout, options.offset, .{
+        .length = 0,
+        .uuid = uuid,
+    }, &.{}, &.{});
 
     writeInt(u32, sb[0x00..0x04], new_group_count * inodes_per_group);
     writeInt(u32, sb[0x04..0x08], new_total_blocks);
@@ -1439,6 +1697,13 @@ fn resizeGeneral(
     if (ro_compat & feature_ro_compat_sparse_super == 0) {
         return error.UnsupportedResizeLayout;
     }
+    if (compat & feature_compat_orphan_file != 0) {
+        var orphan_reader = Reader.open(io, file, allocator, .{ .offset = options.offset }) catch
+            return error.UnsupportedResizeLayout;
+        defer orphan_reader.deinit();
+        validateOrphanFile(&orphan_reader, io, sb) catch
+            return error.UnsupportedResizeLayout;
+    }
     if (readInt(u16, sb[0x3A..0x3C]) & state_clean == 0 or
         readInt(u32, sb[0xE8..0xEC]) != 0)
     {
@@ -1472,6 +1737,10 @@ fn resizeGeneral(
             else
                 0,
         };
+    }
+    const current_stat = try file.stat(io);
+    if (current_stat.size < options.offset + options.length) {
+        try file.setLength(io, options.offset + options.length);
     }
 
     const blocks_per_group = readInt(u32, sb[0x20..0x24]);
@@ -1576,7 +1845,7 @@ fn resizeGeneral(
             old_group_count,
             new_group_count,
             blocks_per_group,
-            readInt(u32, sb[0x1C..0x20]),
+            readInt(u32, sb[0x14..0x18]),
             reserved_gdt_blocks,
             checksum_seed,
             ro_compat,
@@ -1656,7 +1925,13 @@ fn resizeGeneral(
             else
                 0;
         writeDescriptorCounts(descriptor, descriptor_size, old_free_blocks + @as(u32, @intCast(added)), old_free_inodes, old_used_dirs);
-        writeDescriptorBitmapChecksums(descriptor, descriptor_size, checksum_seed, &bitmap, &inode_bitmap_bytes);
+        writeDescriptorBitmapChecksums(
+            descriptor,
+            descriptor_size,
+            checksum_seed,
+            &bitmap,
+            inode_bitmap_bytes[0 .. inodes_per_group / 8],
+        );
         setGeneralDescriptorChecksum(descriptor, descriptor_size, checksum_seed, old_last_group);
     }
 
@@ -1728,7 +2003,7 @@ fn resizeGeneral(
             descriptor_size,
             checksum_seed,
             &block_bitmap_bytes,
-            &inode_bitmap_bytes,
+            inode_bitmap_bytes[0 .. inodes_per_group / 8],
         );
         setGeneralDescriptorChecksum(descriptor, descriptor_size, checksum_seed, group_index);
         free_blocks += group_block_count - metadata_blocks;
@@ -1794,7 +2069,7 @@ fn resizeGeneral(
             while (index < reserved_bytes.len / default_block_size) : (index += 1) {
                 const block = @as(u64, new_gdt_blocks) +
                     @as(u64, index) +
-                    readInt(u32, sb[0x1C..0x20]) + 1;
+                    readInt(u32, sb[0x14..0x18]) + 1;
                 try file.writePositionalAll(
                     io,
                     reserved_bytes[index * default_block_size ..][0..default_block_size],
@@ -2028,7 +2303,7 @@ fn prepareResizeInodeLegacy(
         }
     }
 
-    const sectors = (1 + new_reserved_gdt_blocks) * sectors_per_block;
+    const sectors = resizeInodeSectors(new_group_count, new_reserved_gdt_blocks);
     writeInt(u32, inode[28..32], sectors);
     if (inode.len >= 118) writeInt(u16, inode[116..118], @truncate(sectors >> 16));
     if (ro_compat & feature_ro_compat_metadata_csum != 0) {
@@ -2086,6 +2361,7 @@ pub const Reader = struct {
     blocks_per_group: u32,
     inodes_per_group: u32,
     inode_size: u16,
+    descriptor_size: u16,
     feature_compat: u32,
     feature_incompat: u32,
     feature_ro_compat: u32,
@@ -2191,6 +2467,7 @@ pub const Reader = struct {
             .blocks_per_group = blocks_per_group,
             .inodes_per_group = inodes_per_group,
             .inode_size = inode_size_on_disk,
+            .descriptor_size = desc_size,
             .feature_compat = compat,
             .feature_incompat = incompat,
             .feature_ro_compat = ro_compat,
@@ -2356,9 +2633,13 @@ pub const Reader = struct {
         while (remaining > 0) {
             const logical_block: u32 = @intCast(logical_offset / self.block_size);
             const within_block: usize = @intCast(logical_offset % self.block_size);
-            const physical_block = findPhysicalBlock(extents, logical_block) orelse return error.UnsupportedInodeLayout;
+            const physical_block = findPhysicalBlock(extents, logical_block);
             const chunk = @min(remaining, @as(usize, self.block_size) - within_block);
-            try self.readAll(io, buffer[done .. done + chunk], self.blockOffset(physical_block) + within_block);
+            if (physical_block) |block| {
+                try self.readAll(io, buffer[done .. done + chunk], self.blockOffset(block) + within_block);
+            } else {
+                @memset(buffer[done .. done + chunk], 0);
+            }
             done += chunk;
             remaining -= chunk;
             logical_offset += chunk;
@@ -2515,9 +2796,12 @@ pub const Reader = struct {
         while (remaining > 0) {
             const logical_block: u32 = @intCast(logical_offset / self.block_size);
             const within_block: usize = @intCast(logical_offset % self.block_size);
-            const physical_block = findPhysicalBlock(extents, logical_block) orelse return error.UnsupportedInodeLayout;
             const chunk = @min(remaining, @as(usize, self.block_size) - within_block);
-            try self.readAll(io, buffer[done .. done + chunk], self.blockOffset(physical_block) + within_block);
+            if (findPhysicalBlock(extents, logical_block)) |physical_block| {
+                try self.readAll(io, buffer[done .. done + chunk], self.blockOffset(physical_block) + within_block);
+            } else {
+                @memset(buffer[done .. done + chunk], 0);
+            }
             done += chunk;
             remaining -= chunk;
             logical_offset += chunk;
@@ -3401,6 +3685,10 @@ pub const StrictTree = struct {
     allocator: std.mem.Allocator,
     entries: []StrictEntry,
     identity: StrictFilesystemIdentity,
+    /// Metadata of the implicit root inode, retained beside the entry view.
+    root: GeneralRoot,
+    root_xattrs_owned: []OwnedXattr,
+    root_xattr_views: []Xattr,
     /// Guest-visible file bytes. An importer spools a full copy of exactly
     /// this many bytes, so it is also the scratch space an import needs.
     content_bytes: u64,
@@ -3414,6 +3702,8 @@ pub const StrictTree = struct {
             self.allocator.free(entry.xattr_views);
         }
         self.allocator.free(self.entries);
+        freeXattrs(self.allocator, self.root_xattrs_owned);
+        self.allocator.free(self.root_xattr_views);
         self.* = undefined;
     }
 
@@ -3480,10 +3770,17 @@ pub fn scanWriterCompatible(
     defer scanner.deinit();
     try scanner.scan();
     const entries = try scanner.entries.toOwnedSlice();
+    const root_xattrs = scanner.root_xattrs_owned;
+    scanner.root_xattrs_owned = &.{};
+    const root_views = scanner.root_xattr_views;
+    scanner.root_xattr_views = &.{};
     return .{
         .allocator = allocator,
         .entries = entries,
         .identity = scanner.identity,
+        .root = scanner.root,
+        .root_xattrs_owned = root_xattrs,
+        .root_xattr_views = root_views,
         .content_bytes = scanner.total_content_bytes,
     };
 }
@@ -3506,6 +3803,9 @@ const StrictScanner = struct {
     options: StrictScanOptions,
     identity: StrictFilesystemIdentity,
     entries: std.array_list.Managed(StrictEntry),
+    root: GeneralRoot = undefined,
+    root_xattrs_owned: []OwnedXattr = &.{},
+    root_xattr_views: []Xattr = &.{},
     visited_inodes: []u8,
     allocated_inodes: []u8,
     owned_blocks: []u8,
@@ -3586,6 +3886,8 @@ const StrictScanner = struct {
             self.allocator.free(entry.xattr_views);
         }
         self.entries.deinit();
+        freeXattrs(self.allocator, self.root_xattrs_owned);
+        self.allocator.free(self.root_xattr_views);
         self.allocator.free(self.visited_inodes);
         self.allocator.free(self.allocated_inodes);
         self.allocator.free(self.owned_blocks);
@@ -3872,11 +4174,27 @@ const StrictScanner = struct {
         if (inode.sector_count != expected_sectors) return error.UnsupportedInodeBlockCount;
 
         if (is_root) {
-            if (inode.kind != .directory or inode.mode != 0o755 or inode.uid != 0 or
-                inode.gid != 0 or xattrs.len != 0)
-            {
-                return error.NoncanonicalRootMetadata;
+            self.root = .{
+                .mode = inode.mode,
+                .uid = inode.uid,
+                .gid = inode.gid,
+                .atime = @intCast(inode.atime),
+                .mtime = @intCast(inode.mtime),
+                .ctime = @intCast(inode.ctime),
+                .atime_nsec = 0,
+                .mtime_nsec = 0,
+                .ctime_nsec = 0,
+                .crtime = null,
+                .crtime_nsec = 0,
+                .xattrs = &.{},
+            };
+            self.root_xattrs_owned = xattrs;
+            self.root_xattr_views = try self.allocator.alloc(Xattr, xattrs.len);
+            for (xattrs, 0..) |xattr, index| {
+                self.root_xattr_views[index] = .{ .name = xattr.name, .value = xattr.value };
             }
+            self.root.xattrs = self.root_xattr_views;
+            xattrs_owned = false;
         } else {
             self.total_content_bytes = std.math.add(
                 u64,
@@ -4799,9 +5117,12 @@ pub const GeneralFilesystemIdentity = struct {
     /// partition or device holding it.
     filesystem_length: u64,
     inode_size: u16,
+    descriptor_size: u16,
     feature_compat: u32,
     feature_incompat: u32,
     feature_ro_compat: u32,
+    checksum_seed: u32,
+    orphan_file_inode: ?u32,
     /// Reported because a journal-less rebuild of a journalled source is a
     /// deliberate change of behaviour the operator should know about.
     has_journal: bool,
@@ -4854,6 +5175,7 @@ pub const GeneralEntry = struct {
     /// Set only for `.hardlink`: the path of the first entry that shares the
     /// source inode. Always earlier in iteration order than the link itself.
     hardlink_target: []const u8,
+    sparse_extents: []const tree_cursor.SparseExtent,
     content: ?FileTreeView.ContentReader,
     xattrs: []const Xattr,
 };
@@ -4885,6 +5207,7 @@ const GeneralNode = struct {
     device: DeviceNumbers,
     /// Borrowed from the earlier node that owns this inode's content.
     hardlink_target: []const u8,
+    sparse_extents: []tree_cursor.SparseExtent,
     has_content: bool,
     content: GeneralContent,
     xattrs: []OwnedXattr,
@@ -4914,6 +5237,7 @@ pub const GeneralTree = struct {
     pub fn deinit(self: *GeneralTree) void {
         for (self.entries) |entry| {
             self.allocator.free(entry.path);
+            self.allocator.free(entry.sparse_extents);
             freeXattrs(self.allocator, entry.xattrs);
             self.allocator.free(entry.xattr_views);
         }
@@ -4947,6 +5271,7 @@ pub const GeneralTree = struct {
             .crtime_nsec = node.crtime_nsec,
             .device = node.device,
             .hardlink_target = node.hardlink_target,
+            .sparse_extents = node.sparse_extents,
             .content = if (node.has_content) .{
                 .ctx = &node.content,
                 .read_at_fn = generalContentReadAt,
@@ -4998,6 +5323,7 @@ pub const GeneralTree = struct {
             .xattrs = entry.xattrs,
             .device = entry.device,
             .hardlink_target = entry.hardlink_target,
+            .sparse_extents = entry.sparse_extents,
         };
     }
 };
@@ -5117,6 +5443,7 @@ const GeneralScanner = struct {
     root_xattr_views: []Xattr,
     content_bytes: u64 = 0,
     node_count: usize = 0,
+    scan_metadata_bytes: u64 = 0,
 
     fn init(
         reader: *Reader,
@@ -5150,6 +5477,7 @@ const GeneralScanner = struct {
             .root = undefined,
             .root_xattrs_owned = &.{},
             .root_xattr_views = &.{},
+            .scan_metadata_bytes = @intCast(directory_bitmap_len),
         };
     }
 
@@ -5190,13 +5518,18 @@ const GeneralScanner = struct {
         const root = try self.readGeneralInode(root_inode, &raw);
         if (root.kind != .directory) return error.RootIsNotADirectory;
         const xattrs = try self.readNodeXattrs(root, &raw);
-        errdefer freeXattrs(self.allocator, xattrs);
+        var xattrs_owned = true;
+        errdefer if (xattrs_owned) freeXattrs(self.allocator, xattrs);
         const views = try self.allocator.alloc(Xattr, xattrs.len);
+        var views_owned = true;
+        errdefer if (views_owned) self.allocator.free(views);
         for (xattrs, 0..) |xattr, index| {
             views[index] = .{ .name = xattr.name, .value = xattr.value };
         }
         self.root_xattrs_owned = xattrs;
         self.root_xattr_views = views;
+        xattrs_owned = false;
+        views_owned = false;
         self.root = .{
             .mode = root.mode,
             .uid = root.uid,
@@ -5303,6 +5636,8 @@ const GeneralScanner = struct {
         const xattrs = try self.readNodeXattrs(inode, &raw);
         var xattrs_owned = true;
         defer if (xattrs_owned) freeXattrs(self.allocator, xattrs);
+        const sparse_extents = try self.readSparseExtents(inode);
+        errdefer self.allocator.free(sparse_extents);
         const owned_path = try self.allocator.dupe(u8, path);
         // Ownership moves into `entries` on a successful append, and the tree
         // frees it from there; recursing into a subdirectory can still fail
@@ -5314,6 +5649,8 @@ const GeneralScanner = struct {
         for (xattrs, 0..) |xattr, index| {
             views[index] = .{ .name = xattr.name, .value = xattr.value };
         }
+        var sparse_owned = true;
+        errdefer if (sparse_owned) self.allocator.free(sparse_extents);
         try self.entries.append(.{
             .path = owned_path,
             .kind = inode.kind,
@@ -5331,6 +5668,7 @@ const GeneralScanner = struct {
             .crtime_nsec = inode.crtime_nsec,
             .device = inode.device,
             .hardlink_target = "",
+            .sparse_extents = sparse_extents,
             .has_content = inode.hasContent(),
             .content = .{
                 .reader = self.reader,
@@ -5344,6 +5682,7 @@ const GeneralScanner = struct {
             .xattr_views = views,
         });
         xattrs_owned = false;
+        sparse_owned = false;
         node_owned = false;
 
         if (inode.kind != .directory and inode.link_count > 1) {
@@ -5379,11 +5718,79 @@ const GeneralScanner = struct {
             .crtime_nsec = inode.crtime_nsec,
             .device = .{},
             .hardlink_target = target,
+            .sparse_extents = try self.allocator.alloc(tree_cursor.SparseExtent, 0),
             .has_content = false,
             .content = undefined,
             .xattrs = &.{},
             .xattr_views = &.{},
         });
+    }
+
+    fn readSparseExtents(self: *GeneralScanner, inode: GeneralInode) ![]tree_cursor.SparseExtent {
+        if (!inode.hasContent() or inode.size == 0 or inode.isFastSymlink()) {
+            return self.allocator.alloc(tree_cursor.SparseExtent, 0);
+        }
+        const extents = try readGeneralExtents(
+            self.reader,
+            self.io,
+            self.allocator,
+            inode.block_bytes[0..],
+            inode.inode,
+        );
+        defer self.allocator.free(extents);
+        const total_blocks = blocksForBytes(inode.size, self.reader.block_size);
+        var holes = std.array_list.Managed(tree_cursor.SparseExtent).init(self.allocator);
+        errdefer holes.deinit();
+        var logical: u32 = 0;
+        for (extents) |extent| {
+            if (extent.logical_block > logical) {
+                try self.appendSparseExtent(&holes, .{
+                    .logical_block = logical,
+                    .block_count = extent.logical_block - logical,
+                });
+            }
+            const end = std.math.add(u32, extent.logical_block, extent.block_count) catch
+                return error.UnsupportedExtent;
+            if (!extent.initialized) {
+                try self.appendSparseExtent(&holes, .{
+                    .logical_block = extent.logical_block,
+                    .block_count = extent.block_count,
+                });
+            }
+            logical = @max(logical, end);
+        }
+        if (logical < total_blocks) {
+            try self.appendSparseExtent(&holes, .{
+                .logical_block = logical,
+                .block_count = total_blocks - logical,
+            });
+        }
+        const result = try holes.toOwnedSlice();
+        self.scan_metadata_bytes += @as(u64, @intCast(result.len)) * @sizeOf(tree_cursor.SparseExtent);
+        limits_mod.observe(self.options.diagnostic, .scan_metadata_bytes, self.scan_metadata_bytes);
+        return result;
+    }
+
+    fn appendSparseExtent(
+        self: *GeneralScanner,
+        holes: *std.array_list.Managed(tree_cursor.SparseExtent),
+        extent: tree_cursor.SparseExtent,
+    ) !void {
+        const count = std.math.add(u64, @intCast(holes.items.len), 1) catch
+            return error.ScanMetadataLimitExceeded;
+        const added = std.math.mul(u64, count, @sizeOf(tree_cursor.SparseExtent)) catch
+            return error.ScanMetadataLimitExceeded;
+        const observed = std.math.add(u64, self.scan_metadata_bytes, added) catch
+            return error.ScanMetadataLimitExceeded;
+        if (observed > self.options.max_scan_metadata_bytes) {
+            return limits_mod.exceeded(
+                self.options.diagnostic,
+                .scan_metadata_bytes,
+                observed,
+                self.options.max_scan_metadata_bytes,
+            );
+        }
+        try holes.append(extent);
     }
 
     fn readGeneralInode(
@@ -5568,6 +5975,9 @@ fn validateGeneralSuperblock(
         return error.SourceNotCleanlyUnmounted;
     }
     if (readInt(u32, sb[0xE8..0xEC]) != 0) return error.SourceHasOrphanInodes;
+    if (reader.feature_compat & feature_compat_orphan_file != 0) {
+        try validateOrphanFile(reader, io, sb);
+    }
 
     // `s_blocks_count_hi` is the only place a 64-bit filesystem records the
     // blocks this build cannot address, so it is checked rather than
@@ -5577,6 +5987,7 @@ fn validateGeneralSuperblock(
     {
         return error.FilesystemTooLargeToImport;
     }
+
     if (readInt(u32, sb[0x54..0x58]) < first_non_reserved_inode) {
         return error.UnsupportedFirstInode;
     }
@@ -5602,11 +6013,63 @@ fn validateGeneralSuperblock(
         .block_size = reader.block_size,
         .filesystem_length = filesystem_length,
         .inode_size = reader.inode_size,
+        .descriptor_size = reader.descriptor_size,
         .feature_compat = reader.feature_compat,
         .feature_incompat = reader.feature_incompat,
         .feature_ro_compat = reader.feature_ro_compat,
+        .checksum_seed = checksumSeed(&sb, reader.uuid, reader.feature_incompat),
+        .orphan_file_inode = if (reader.feature_compat & feature_compat_orphan_file != 0)
+            readInt(u32, sb[0x280..0x284])
+        else
+            null,
         .has_journal = reader.feature_compat & feature_compat_has_journal != 0,
     };
+}
+
+fn validateOrphanFile(reader: *Reader, io: Io, sb: [superblock_size]u8) !void {
+    const orphan_inode_number = readInt(u32, sb[0x280..0x284]);
+    if (orphan_inode_number == 0) return error.UnsupportedInodeLayout;
+    const inode = try reader.readInode(io, orphan_inode_number);
+    if (inode.kind != .file or inode.mode != 0o600 or inode.link_count != 1 or
+        inode.size == 0 or inode.size % reader.block_size != 0)
+    {
+        return error.UnsupportedInodeLayout;
+    }
+    const block_count = inode.size / reader.block_size;
+    if (block_count > 512) return error.UnsupportedInodeLayout;
+    const extents = try reader.readInodeExtentsAlloc(io, reader.allocator, inode);
+    defer reader.allocator.free(extents);
+    const checksum_seed = checksumSeed(&sb, reader.uuid, reader.feature_incompat);
+    var block: [default_block_size]u8 = undefined;
+    var logical: u32 = 0;
+    while (logical < block_count) : (logical += 1) {
+        const physical = findPhysicalBlock(extents, logical) orelse
+            return error.UnsupportedInodeLayout;
+        try reader.readAll(io, &block, reader.blockOffset(physical));
+        if (readInt(u32, block[block.len - 8 .. block.len - 4]) != orphan_block_magic) {
+            return error.UnsupportedInodeLayout;
+        }
+        if (reader.feature_ro_compat & feature_ro_compat_metadata_csum != 0) {
+            var inode_le = std.mem.nativeToLittle(u32, orphan_inode_number);
+            var generation_le = std.mem.nativeToLittle(u32, inode.generation);
+            var block_le = std.mem.nativeToLittle(u64, physical);
+            const expected = ext4Crc32cSeed(checksum_seed, &.{
+                std.mem.asBytes(&inode_le),
+                std.mem.asBytes(&generation_le),
+                std.mem.asBytes(&block_le),
+                block[0 .. block.len - 8],
+            });
+            if (readInt(u32, block[block.len - 4 ..]) != expected) {
+                return error.UnsupportedInodeLayout;
+            }
+        }
+        var slot: usize = 0;
+        while (slot < block.len - 8) : (slot += 4) {
+            if (readInt(u32, block[slot .. slot + 4]) != 0) {
+                return error.SourceHasOrphanInodes;
+            }
+        }
+    }
 }
 
 /// A 64-bit filesystem widens every group-descriptor block pointer with a
@@ -6063,6 +6526,7 @@ fn buildPlan(
         for (entries_list.items) |entry| {
             allocator.free(entry.path);
             if (entry.hardlink_target.len > 0) allocator.free(entry.hardlink_target);
+            allocator.free(entry.sparse_extents);
             freeOwnedXattrSlice(allocator, entry.xattrs);
         }
         entries_list.deinit();
@@ -6080,6 +6544,8 @@ fn buildPlan(
         errdefer allocator.free(owned_path);
         const owned_hardlink_target = try allocator.dupe(u8, entry.hardlink_target);
         errdefer if (owned_hardlink_target.len > 0) allocator.free(owned_hardlink_target);
+        const owned_sparse_extents = try allocator.dupe(tree_cursor.SparseExtent, entry.sparse_extents);
+        errdefer allocator.free(owned_sparse_extents);
         const times = try InodeTimes.from(entry);
         try entries_list.append(.{
             .path = owned_path,
@@ -6093,6 +6559,7 @@ fn buildPlan(
             .device = entry.device,
             .hardlink_target = owned_hardlink_target,
             .times = times,
+            .sparse_extents = owned_sparse_extents,
         });
     }
 
@@ -6155,6 +6622,7 @@ fn buildPlan(
             .device = entry.device,
             .hardlink_target = entry.hardlink_target,
             .times = entry.times,
+            .sparse_extents = entry.sparse_extents,
             .owns_inode = owns_inode,
         };
         entry.xattrs = &.{};
@@ -6180,7 +6648,10 @@ fn buildPlan(
     try buildDirectoryPayloads(allocator, nodes, options.block_size);
 
     var data_blocks_needed: u32 = 0;
-    var feature_ro_compat: u32 = writer_feature_ro_compat_base;
+    var feature_ro_compat: u32 = writer_feature_ro_compat_base |
+        (options.preserve_feature_ro_compat &
+            (writer_feature_ro_compat_optional | feature_ro_compat_huge_file |
+                feature_ro_compat_dir_nlink));
     for (nodes) |*node| {
         switch (node.kind) {
             .directory => {
@@ -6191,7 +6662,11 @@ fn buildPlan(
             },
             .file => {
                 node.size_on_disk = node.declared_size;
-                node.data_block_count = blocksForBytes(node.size_on_disk, options.block_size);
+                node.data_block_count = try initializedBlockCount(
+                    node.size_on_disk,
+                    node.sparse_extents,
+                    options.block_size,
+                );
                 data_blocks_needed += node.data_block_count;
                 if (node.size_on_disk > std.math.maxInt(i32)) feature_ro_compat |= feature_ro_compat_large_file;
             },
@@ -6211,7 +6686,11 @@ fn buildPlan(
                 // Azure Linux image, see issue #74 -- a real distro symlink
                 // of exactly 60 characters triggered this in practice).
                 node.uses_fast_symlink = node.declared_size < 60;
-                node.data_block_count = if (node.uses_fast_symlink) 0 else blocksForBytes(node.size_on_disk, options.block_size);
+                node.data_block_count = if (node.uses_fast_symlink) 0 else try initializedBlockCount(
+                    node.size_on_disk,
+                    node.sparse_extents,
+                    options.block_size,
+                );
                 data_blocks_needed += node.data_block_count;
             },
             // A device or FIFO is entirely described by its inode, and a
@@ -6225,26 +6704,70 @@ fn buildPlan(
         }
     }
 
+    const profile = try resolveWriterProfile(options, journal_blocks);
+    var specials = std.array_list.Managed(Node).init(allocator);
+    errdefer {
+        for (specials.items) |node| {
+            if (node.extents.len > 0) allocator.free(node.extents);
+            if (node.extent_tree_blocks.len > 0) allocator.free(node.extent_tree_blocks);
+        }
+        specials.deinit();
+    }
+    if (profile.feature_compat & feature_compat_resize_inode != 0) {
+        const resize_node = try buildResizeInodeNode(allocator, resize_inode);
+        try specials.append(resize_node[0]);
+        allocator.free(resize_node);
+    }
+
     // The journal already owns reserved inode 8, which every layout counts as
     // used whether or not it holds anything, so only its blocks are new.
     const journal = try buildJournalNode(allocator, journal_blocks);
     errdefer allocator.free(journal);
     data_blocks_needed = std.math.add(u32, data_blocks_needed, journal_blocks) catch
         return error.NotEnoughSpace;
+    if (profile.has_orphan_file) {
+        const orphan_inode = options.preserve_orphan_file_inode orelse next_inode;
+        if (orphan_inode < next_inode) return error.UnsupportedFeatures;
+        const orphan = try buildOrphanFileNode(
+            allocator,
+            orphan_inode,
+            defaultOrphanFileBlocks(@intCast(options.length / options.block_size)),
+        );
+        try specials.append(orphan[0]);
+        allocator.free(orphan);
+        inode_count += 1;
+        const required_inode_count = std.math.add(
+            u32,
+            orphan_inode - first_non_reserved_inode,
+            2,
+        ) catch return error.TooManyInodes;
+        inode_count = @max(inode_count, required_inode_count);
+        data_blocks_needed = std.math.add(
+            u32,
+            data_blocks_needed,
+            specials.items[specials.items.len - 1].data_block_count,
+        ) catch return error.NotEnoughSpace;
+    }
 
     return .{
         .entries = try entries_list.toOwnedSlice(),
         .nodes = nodes,
         .journal = journal,
-        .feature_compat = if (journal_blocks == 0)
-            writer_feature_compat
-        else
-            writer_feature_compat | feature_compat_has_journal,
+        .specials = try specials.toOwnedSlice(),
+        .feature_compat = profile.feature_compat,
+        .feature_incompat = profile.feature_incompat,
         .feature_ro_compat = feature_ro_compat,
         .data_blocks_needed = data_blocks_needed,
         .inode_count = inode_count,
     };
 }
+
+const LayoutProfile = struct {
+    descriptor_size: u16 = group_desc_size,
+    feature_compat: u32 = writer_feature_compat,
+    feature_incompat: u32 = writer_feature_incompat,
+    reserved_gdt_blocks: u32 = 0,
+};
 
 fn buildLayout(
     allocator: std.mem.Allocator,
@@ -6253,8 +6776,32 @@ fn buildLayout(
     data_blocks_needed: u32,
     bytes_per_inode: ?u32,
 ) PopulateError!Layout {
+    return buildLayoutWithProfile(
+        allocator,
+        total_blocks,
+        node_count,
+        data_blocks_needed,
+        bytes_per_inode,
+        .{},
+    );
+}
+
+fn buildLayoutWithProfile(
+    allocator: std.mem.Allocator,
+    total_blocks: u32,
+    node_count: usize,
+    data_blocks_needed: u32,
+    bytes_per_inode: ?u32,
+    profile: LayoutProfile,
+) PopulateError!Layout {
+    if (profile.descriptor_size != group_desc_size and profile.descriptor_size != 64) {
+        return error.UnsupportedDescriptorSize;
+    }
     const group_count = blocksToGroups(total_blocks, default_blocks_per_group);
-    const gdt_blocks = @max(@as(u32, 1), blocksForBytes(@as(u64, group_count) * group_desc_size, default_block_size));
+    const gdt_blocks = @max(
+        @as(u32, 1),
+        blocksForBytes(@as(u64, group_count) * profile.descriptor_size, default_block_size),
+    );
 
     const usable_nodes = std.math.cast(u32, node_count - 1) orelse return error.TooManyInodes;
     const total_used_inodes = first_non_reserved_inode - 1 + usable_nodes;
@@ -6285,7 +6832,10 @@ fn buildLayout(
         const start_block = @as(u64, group_index) * default_blocks_per_group;
         const block_count = @min(default_blocks_per_group, total_blocks - @as(u32, @intCast(start_block)));
         const has_super_copy = group_index == 0 or isSparseSuperGroup(group_index);
-        const super_gdt_blocks: u32 = if (has_super_copy) 1 + gdt_blocks else 0;
+        const super_gdt_blocks: u32 = if (has_super_copy)
+            1 + gdt_blocks + profile.reserved_gdt_blocks
+        else
+            0;
         const reserved_block_count = super_gdt_blocks + 2 + inode_table_blocks;
         if (reserved_block_count >= block_count) return error.NotEnoughSpace;
         groups[group_index] = .{
@@ -6310,6 +6860,9 @@ fn buildLayout(
         .gdt_blocks = gdt_blocks,
         .inodes_per_group = inodes_per_group,
         .inode_table_blocks = inode_table_blocks,
+        .descriptor_size = profile.descriptor_size,
+        .reserved_gdt_blocks = profile.reserved_gdt_blocks,
+        .feature_incompat = profile.feature_incompat,
         .groups = groups,
     };
 }
@@ -6358,12 +6911,25 @@ fn buildFixedLayout(
     };
 }
 
-fn assignInodesToGroups(nodes: []Node, groups: []GroupLayout, inodes_per_group: u32) void {
+fn assignInodesToGroups(
+    nodes: []Node,
+    specials: []Node,
+    groups: []GroupLayout,
+    inodes_per_group: u32,
+) void {
     for (nodes) |node| {
         if (!node.owns_inode) continue;
         const group_index = (node.inode - 1) / inodes_per_group;
         groups[group_index].used_inode_count += 1;
         if (node.kind == .directory) groups[group_index].used_dir_count += 1;
+    }
+    for (specials) |node| {
+        // Resize inode 7 is already part of the reserved inode range. The
+        // orphan file is the only special inode allocated from the normal
+        // inode sequence.
+        if (node.inode < first_non_reserved_inode) continue;
+        const group_index = (node.inode - 1) / inodes_per_group;
+        groups[group_index].used_inode_count += 1;
     }
     // Reserved inodes 1..10 live in group 0.
     groups[0].used_inode_count += first_non_reserved_inode - 2;
@@ -6378,8 +6944,18 @@ fn allocateNodeBlocks(
         if (node.data_block_count == 0) {
             node.extents = &.{};
         } else {
-            node.extents = try block_allocator.allocate(allocator, node.data_block_count);
+            if (node.sparse_extents.len == 0) {
+                node.extents = try block_allocator.allocate(allocator, node.data_block_count);
+            } else {
+                node.extents = try allocateSparseExtents(
+                    allocator,
+                    block_allocator,
+                    blocksForBytes(node.size_on_disk, default_block_size),
+                    node.sparse_extents,
+                );
+            }
         }
+
         if (!node.uses_fast_symlink) {
             try allocateExtentTreeBlocks(allocator, block_allocator, node, default_block_size);
         }
@@ -6387,6 +6963,56 @@ fn allocateNodeBlocks(
             node.xattr_block = try block_allocator.allocateSingle();
         }
     }
+}
+
+fn allocateSparseExtents(
+    allocator: std.mem.Allocator,
+    block_allocator: *BlockAllocator,
+    logical_block_count: u32,
+    sparse_extents: []const tree_cursor.SparseExtent,
+) PopulateError![]Extent {
+    var output = std.array_list.Managed(Extent).init(allocator);
+    errdefer output.deinit();
+    var logical: u32 = 0;
+    for (sparse_extents) |sparse| {
+        if (sparse.logical_block > logical) {
+            const run = try block_allocator.allocate(allocator, sparse.logical_block - logical);
+            defer allocator.free(run);
+            for (run) |extent| {
+                try output.append(.{
+                    .logical_block = extent.logical_block + logical,
+                    .start_block = extent.start_block,
+                    .block_count = extent.block_count,
+                });
+            }
+        }
+        var remaining = sparse.block_count;
+        var hole_logical = sparse.logical_block;
+        while (remaining > 0) {
+            const take: u16 = @intCast(@min(remaining, @as(u32, 0x7FFF)));
+            try output.append(.{
+                .logical_block = hole_logical,
+                .start_block = 0,
+                .block_count = take,
+                .initialized = false,
+            });
+            hole_logical += take;
+            remaining -= take;
+        }
+        logical = sparse.logical_block + sparse.block_count;
+    }
+    if (logical < logical_block_count) {
+        const run = try block_allocator.allocate(allocator, logical_block_count - logical);
+        defer allocator.free(run);
+        for (run) |extent| {
+            try output.append(.{
+                .logical_block = extent.logical_block + logical,
+                .start_block = extent.start_block,
+                .block_count = extent.block_count,
+            });
+        }
+    }
+    return output.toOwnedSlice();
 }
 
 const BlockAllocator = struct {
@@ -6431,10 +7057,27 @@ const BlockAllocator = struct {
     }
 };
 
-fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions) PopulateError!void {
+fn populateChecksumSeed(options: PopulateOptions) u32 {
+    const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const incompat = options.preserve_feature_incompat orelse writer_feature_incompat;
+    return if (incompat & feature_incompat_csum_seed != 0)
+        options.preserve_checksum_seed orelse ext4Crc32c(&.{&uuid})
+    else
+        ext4Crc32c(&.{&uuid});
+}
+
+fn writeNodeData(
+    io: Io,
+    file: Io.File,
+    nodes: []Node,
+    specials: []Node,
+    layout: Layout,
+    options: PopulateOptions,
+) PopulateError!void {
     var scratch: [default_block_size]u8 = [_]u8{0} ** default_block_size;
     const block_len: usize = @intCast(options.block_size);
     const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const checksum_seed = populateChecksumSeed(options);
     for (nodes) |node| {
         switch (node.kind) {
             // Nothing outside the inode itself, so nothing to write here.
@@ -6450,9 +7093,21 @@ fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions)
                         const count_offset: usize = if (block_index == 0) 32 else 8;
                         const limit = readInt(u16, block[count_offset .. count_offset + 2]);
                         const count = readInt(u16, block[count_offset + 2 .. count_offset + 4]);
-                        setDxChecksum(block, count_offset, count, limit, uuid, node.inode, 0);
+                        if (((options.preserve_feature_incompat orelse writer_feature_incompat) &
+                            feature_incompat_csum_seed) != 0)
+                        {
+                            setDxChecksumSeed(block, count_offset, count, limit, checksum_seed, node.inode, 0);
+                        } else {
+                            setDxChecksum(block, count_offset, count, limit, uuid, node.inode, 0);
+                        }
                     } else {
-                        setDirectoryLeafChecksum(block, uuid, node.inode, 0);
+                        if ((options.preserve_feature_incompat orelse writer_feature_incompat) &
+                            feature_incompat_csum_seed != 0)
+                        {
+                            setDirectoryLeafChecksumSeed(block, checksum_seed, node.inode, 0);
+                        } else {
+                            setDirectoryLeafChecksum(block, uuid, node.inode, 0);
+                        }
                     }
                 }
                 var extent_index: usize = 0;
@@ -6467,14 +7122,14 @@ fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions)
             .file, .symlink => {
                 if (!node.uses_fast_symlink and node.data_block_count != 0) {
                     const content = node.content orelse return error.MissingContentReader;
-                    var written_data: u64 = 0;
                     var extent_index: usize = 0;
                     while (extent_index < node.extents.len) : (extent_index += 1) {
                         const extent = node.extents[extent_index];
+                        if (!extent.initialized) continue;
                         var block_index: u16 = 0;
                         while (block_index < extent.block_count) : (block_index += 1) {
                             @memset(&scratch, 0);
-                            const copy_off = written_data;
+                            const copy_off = @as(u64, extent.logical_block + block_index) * options.block_size;
                             const remaining = node.size_on_disk - copy_off;
                             const to_read = @min(@as(u64, options.block_size), remaining);
                             const want = @as(usize, @intCast(to_read));
@@ -6484,7 +7139,6 @@ fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions)
                             }
                             const physical_block = extent.start_block + block_index;
                             try file.writePositionalAll(io, &scratch, options.offset + physical_block * options.block_size);
-                            written_data += want;
                         }
                     }
                 }
@@ -6492,17 +7146,134 @@ fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions)
         }
         for (node.extent_tree_blocks) |block| {
             var extent_block = block.bytes;
-            setExtentBlockChecksum(extent_block[0..block_len], uuid, node.inode, 0);
+            if ((options.preserve_feature_incompat orelse writer_feature_incompat) &
+                feature_incompat_csum_seed != 0)
+            {
+                setExtentBlockChecksumSeed(extent_block[0..block_len], checksum_seed, node.inode, 0);
+            } else {
+                setExtentBlockChecksum(extent_block[0..block_len], uuid, node.inode, 0);
+            }
             try file.writePositionalAll(io, extent_block[0..block_len], options.offset + block.block_number * options.block_size);
         }
         if (node.xattr_block_bytes) |xattr_block| {
             const block_number = node.xattr_block orelse unreachable;
             const scratch_block = try std.heap.page_allocator.dupe(u8, xattr_block);
             defer std.heap.page_allocator.free(scratch_block);
-            setXattrBlockChecksum(scratch_block, uuid, block_number);
+            if ((options.preserve_feature_incompat orelse writer_feature_incompat) &
+                feature_incompat_csum_seed != 0)
+            {
+                setXattrBlockChecksumSeed(scratch_block, checksum_seed, block_number);
+            } else {
+                setXattrBlockChecksum(scratch_block, uuid, block_number);
+            }
             try file.writePositionalAll(io, scratch_block, options.offset + block_number * options.block_size);
         }
     }
+
+    for (specials) |node| {
+        switch (node.special) {
+            .resize_inode => try writeResizeInodeData(io, file, node, layout, options),
+            .orphan_file => try writeOrphanFileData(io, file, node, options, checksum_seed),
+            .journal, .none => {},
+        }
+    }
+}
+
+fn writeResizeInodeData(
+    io: Io,
+    file: Io.File,
+    node: Node,
+    layout: Layout,
+    options: PopulateOptions,
+) PopulateError!void {
+    if (node.extents.len != 1 or node.extents[0].block_count != 1 or
+        layout.reserved_gdt_blocks == 0)
+    {
+        return error.UnsupportedFeatures;
+    }
+    var dindir: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+    var index: u32 = 0;
+    while (index < layout.reserved_gdt_blocks) : (index += 1) {
+        const pointer_block = layout.groups[0].start_block + 1 +
+            layout.gdt_blocks + index;
+        std.mem.writeInt(
+            u32,
+            dindir[@as(usize, layout.gdt_blocks + index) * 4 ..][0..4],
+            @intCast(pointer_block),
+            .little,
+        );
+        var pointers: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+        var pointer_index: usize = 0;
+        var group: u32 = 1;
+        while (group < layout.group_count) : (group += 1) {
+            if (!isSparseSuperGroup(group)) continue;
+            const backup_gdt = pointer_block + @as(u64, group) * default_blocks_per_group;
+            std.mem.writeInt(
+                u32,
+                pointers[pointer_index * 4 ..][0..4],
+                @intCast(backup_gdt),
+                .little,
+            );
+            pointer_index += 1;
+        }
+        try file.writePositionalAll(
+            io,
+            &pointers,
+            options.offset + pointer_block * options.block_size,
+        );
+        group = 1;
+        while (group < layout.group_count) : (group += 1) {
+            if (!isSparseSuperGroup(group)) continue;
+            const backup_pointer = pointer_block +
+                @as(u64, group) * default_blocks_per_group;
+            try file.writePositionalAll(
+                io,
+                &pointers,
+                options.offset + backup_pointer * options.block_size,
+            );
+        }
+    }
+    try file.writePositionalAll(
+        io,
+        &dindir,
+        options.offset + node.extents[0].start_block * options.block_size,
+    );
+}
+
+fn writeOrphanFileData(
+    io: Io,
+    file: Io.File,
+    node: Node,
+    options: PopulateOptions,
+    checksum_seed: u32,
+) PopulateError!void {
+    var block: [default_block_size]u8 = undefined;
+    var inode_le = std.mem.nativeToLittle(u32, node.inode);
+    var generation_le: u32 = 0;
+    var index: u32 = 0;
+    for (node.extents) |extent| {
+        var extent_index: u16 = 0;
+        while (extent_index < extent.block_count) : (extent_index += 1) {
+            @memset(&block, 0);
+            writeInt(u32, block[block.len - 8 .. block.len - 4], orphan_block_magic);
+            const physical = extent.start_block + extent_index;
+            var block_le = std.mem.nativeToLittle(u64, physical);
+            const checksum = ext4Crc32cSeed(checksum_seed, &.{
+                std.mem.asBytes(&inode_le),
+                std.mem.asBytes(&generation_le),
+                std.mem.asBytes(&block_le),
+                block[0 .. block.len - 8],
+            });
+            writeInt(u32, block[block.len - 4 ..], checksum);
+            try file.writePositionalAll(
+                io,
+                &block,
+                options.offset + physical * options.block_size,
+            );
+            index += 1;
+        }
+    }
+    if (index != node.data_block_count) return error.UnexpectedContentLength;
 }
 
 /// Writes the journal's own blocks: a JBD2 superblock in logical block 0 and
@@ -6514,6 +7285,7 @@ fn writeJournalData(io: Io, file: Io.File, journal: []const Node, options: Popul
     if (journal.len == 0) return;
     const node = journal[0];
     const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const checksum_seed = populateChecksumSeed(options);
     const block_len: usize = @intCast(options.block_size);
 
     var block: [default_block_size]u8 = undefined;
@@ -6532,7 +7304,13 @@ fn writeJournalData(io: Io, file: Io.File, journal: []const Node, options: Popul
 
     for (node.extent_tree_blocks) |tree_block| {
         var extent_block = tree_block.bytes;
-        setExtentBlockChecksum(extent_block[0..block_len], uuid, node.inode, 0);
+        if (((options.preserve_feature_incompat orelse writer_feature_incompat) &
+            feature_incompat_csum_seed) != 0)
+        {
+            setExtentBlockChecksumSeed(extent_block[0..block_len], checksum_seed, node.inode, 0);
+        } else {
+            setExtentBlockChecksum(extent_block[0..block_len], uuid, node.inode, 0);
+        }
         try file.writePositionalAll(io, extent_block[0..block_len], options.offset + tree_block.block_number * options.block_size);
     }
 }
@@ -6575,7 +7353,14 @@ fn zeroUnusedInodeTableBlocks(io: Io, file: Io.File, layout: Layout, offset: u64
     }
 }
 
-fn buildGroupBitmaps(layout: Layout, group: GroupLayout, block_bitmap: []u8, inode_bitmap: []u8) void {
+fn buildGroupBitmaps(
+    layout: Layout,
+    group: GroupLayout,
+    block_bitmap: []u8,
+    inode_bitmap: []u8,
+    nodes: []const Node,
+    specials: []const Node,
+) void {
     @memset(block_bitmap, 0);
     @memset(inode_bitmap, 0);
 
@@ -6588,9 +7373,28 @@ fn buildGroupBitmaps(layout: Layout, group: GroupLayout, block_bitmap: []u8, ino
         setBitmapBit(block_bitmap, bit);
     }
 
-    bit = 0;
-    while (bit < group.used_inode_count) : (bit += 1) {
-        setBitmapBit(inode_bitmap, bit);
+    if (nodes.len == 0 and specials.len == 0) {
+        bit = 0;
+        while (bit < group.used_inode_count) : (bit += 1) setBitmapBit(inode_bitmap, bit);
+    } else {
+        if (group.index == 0) {
+            setBitmapBit(inode_bitmap, 0);
+            bit = 2;
+            while (bit < first_non_reserved_inode - 1) : (bit += 1) setBitmapBit(inode_bitmap, bit);
+        }
+        for (nodes) |node| {
+            if (!node.owns_inode) continue;
+            const inode_group = (node.inode - 1) / layout.inodes_per_group;
+            if (inode_group == group.index) {
+                setBitmapBit(inode_bitmap, (node.inode - 1) % layout.inodes_per_group);
+            }
+        }
+        for (specials) |node| {
+            const inode_group = (node.inode - 1) / layout.inodes_per_group;
+            if (inode_group == group.index) {
+                setBitmapBit(inode_bitmap, (node.inode - 1) % layout.inodes_per_group);
+            }
+        }
     }
     bit = layout.inodes_per_group;
     while (bit < default_block_size * 8) : (bit += 1) {
@@ -6598,12 +7402,42 @@ fn buildGroupBitmaps(layout: Layout, group: GroupLayout, block_bitmap: []u8, ino
     }
 }
 
-fn writeBitmaps(io: Io, file: Io.File, layout: Layout, offset: u64) PopulateError!void {
+fn groupItableUnused(
+    layout: Layout,
+    group: GroupLayout,
+    nodes: []const Node,
+    specials: []const Node,
+) u32 {
+    var highest: ?u32 = if (group.index == 0) 9 else null;
+    for (nodes) |node| {
+        if (!node.owns_inode) continue;
+        const inode_group = (node.inode - 1) / layout.inodes_per_group;
+        if (inode_group != group.index) continue;
+        const index = (node.inode - 1) % layout.inodes_per_group;
+        highest = if (highest) |current| @max(current, index) else index;
+    }
+    for (specials) |node| {
+        const inode_group = (node.inode - 1) / layout.inodes_per_group;
+        if (inode_group != group.index) continue;
+        const index = (node.inode - 1) % layout.inodes_per_group;
+        highest = if (highest) |current| @max(current, index) else index;
+    }
+    return if (highest) |index| layout.inodes_per_group - index - 1 else layout.inodes_per_group;
+}
+
+fn writeBitmaps(
+    io: Io,
+    file: Io.File,
+    layout: Layout,
+    offset: u64,
+    nodes: []const Node,
+    specials: []const Node,
+) PopulateError!void {
     var block_bitmap: [default_block_size]u8 = undefined;
     var inode_bitmap: [default_block_size]u8 = undefined;
 
     for (layout.groups) |group| {
-        buildGroupBitmaps(layout, group, &block_bitmap, &inode_bitmap);
+        buildGroupBitmaps(layout, group, &block_bitmap, &inode_bitmap, nodes, specials);
         try file.writePositionalAll(io, &block_bitmap, offset + @as(u64, group.block_bitmap_block) * default_block_size);
         try file.writePositionalAll(io, &inode_bitmap, offset + @as(u64, group.inode_bitmap_block) * default_block_size);
     }
@@ -6611,6 +7445,7 @@ fn writeBitmaps(io: Io, file: Io.File, layout: Layout, offset: u64) PopulateErro
 
 fn writeInodes(io: Io, file: Io.File, nodes: []Node, layout: Layout, options: PopulateOptions) PopulateError!void {
     const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const checksum_seed = populateChecksumSeed(options);
     for (nodes) |node| {
         // A hardlink shares the target's inode, which the target already
         // wrote; writing it twice would be redundant at best and would
@@ -6676,7 +7511,13 @@ fn writeInodes(io: Io, file: Io.File, nodes: []Node, layout: Layout, options: Po
         writeInt(u32, buf[144..148], crtime.seconds);
         writeInt(u32, buf[148..152], encodeInodeExtra(crtime.epoch, node.times.crtime_nsec));
 
-        setInodeChecksum(&buf, uuid, node.inode);
+        if (((options.preserve_feature_incompat orelse writer_feature_incompat) &
+            feature_incompat_csum_seed) != 0)
+        {
+            setInodeChecksumSeed(&buf, checksum_seed, node.inode);
+        } else {
+            setInodeChecksum(&buf, uuid, node.inode);
+        }
 
         const group_index = (node.inode - 1) / layout.inodes_per_group;
         const index_in_group = (node.inode - 1) % layout.inodes_per_group;
@@ -6686,29 +7527,138 @@ fn writeInodes(io: Io, file: Io.File, nodes: []Node, layout: Layout, options: Po
     }
 }
 
-fn writeGroupDescriptorTables(io: Io, file: Io.File, layout: Layout, offset: u64, uuid: [16]u8) PopulateError!void {
-    const desc_bytes = @as(usize, layout.group_count) * group_desc_size;
+fn writeSpecialInodes(
+    io: Io,
+    file: Io.File,
+    nodes: []Node,
+    layout: Layout,
+    options: PopulateOptions,
+) PopulateError!void {
+    const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const checksum_seed = populateChecksumSeed(options);
+    const times = try encodeInodeTime(options.timestamp);
+    for (nodes) |node| {
+        var buf: [writer_inode_size]u8 = [_]u8{0} ** writer_inode_size;
+        writeInt(u16, buf[0..2], inodeMode(node));
+        writeInt(u16, buf[26..28], 1);
+        writeInt(u32, buf[8..12], times.seconds);
+        writeInt(u32, buf[12..16], times.seconds);
+        writeInt(u32, buf[16..20], times.seconds);
+        writeInt(u16, buf[128..130], writer_extra_isize);
+        writeInt(u32, buf[132..136], encodeInodeExtra(times.epoch, 0));
+        writeInt(u32, buf[136..140], encodeInodeExtra(times.epoch, 0));
+        writeInt(u32, buf[140..144], encodeInodeExtra(times.epoch, 0));
+        writeInt(u32, buf[144..148], times.seconds);
+        writeInt(u32, buf[148..152], encodeInodeExtra(times.epoch, 0));
+
+        switch (node.special) {
+            .resize_inode => {
+                if (node.extents.len != 1) return error.UnsupportedFeatures;
+                writeInt(u32, buf[4..8], @truncate(node.size_on_disk));
+                writeInt(
+                    u32,
+                    buf[28..32],
+                    resizeInodeSectors(layout.group_count, layout.reserved_gdt_blocks),
+                );
+                writeInt(u32, buf[40 + 13 * 4 ..][0..4], @intCast(node.extents[0].start_block));
+            },
+            .orphan_file => {
+                writeInt(u32, buf[4..8], @truncate(node.size_on_disk));
+                writeInt(u32, buf[28..32], inodeSectorCount(node));
+                writeInt(u32, buf[32..36], inode_flag_extents);
+                @memcpy(buf[40..100], &node.extent_root);
+            },
+            .journal, .none => continue,
+        }
+        writeInt(u32, buf[108..112], @truncate(node.size_on_disk >> 32));
+        if (((options.preserve_feature_incompat orelse writer_feature_incompat) &
+            feature_incompat_csum_seed) != 0)
+        {
+            setInodeChecksumSeed(&buf, checksum_seed, node.inode);
+        } else {
+            setInodeChecksum(&buf, uuid, node.inode);
+        }
+        const group_index = (node.inode - 1) / layout.inodes_per_group;
+        const index_in_group = (node.inode - 1) % layout.inodes_per_group;
+        const group = layout.groups[group_index];
+        const inode_offset = options.offset + @as(u64, group.inode_table_block) *
+            options.block_size + @as(u64, index_in_group) * writer_inode_size;
+        try file.writePositionalAll(io, &buf, inode_offset);
+    }
+}
+
+fn writeGroupDescriptorTables(
+    io: Io,
+    file: Io.File,
+    layout: Layout,
+    offset: u64,
+    options: PopulateOptions,
+    nodes: []const Node,
+    specials: []const Node,
+) PopulateError!void {
+    const desc_size: usize = layout.descriptor_size;
+    const desc_bytes = @as(usize, layout.group_count) * desc_size;
     const table_bytes = @as(usize, layout.gdt_blocks) * default_block_size;
     const buf = try std.heap.page_allocator.alloc(u8, table_bytes);
     defer std.heap.page_allocator.free(buf);
     @memset(buf, 0);
     var block_bitmap: [default_block_size]u8 = undefined;
     var inode_bitmap: [default_block_size]u8 = undefined;
+    const checksum_seed = populateChecksumSeed(options);
     for (layout.groups, 0..) |group, index| {
-        const base = index * group_desc_size;
-        buildGroupBitmaps(layout, group, &block_bitmap, &inode_bitmap);
-        writeInt(u32, buf[base + 0 .. base + 4], group.block_bitmap_block);
-        writeInt(u32, buf[base + 4 .. base + 8], group.inode_bitmap_block);
-        writeInt(u32, buf[base + 8 .. base + 12], group.inode_table_block);
-        writeInt(u16, buf[base + 12 .. base + 14], @intCast(group.block_count - group.reserved_block_count - group.used_data_blocks));
-        writeInt(u16, buf[base + 14 .. base + 16], @intCast(layout.inodes_per_group - group.used_inode_count));
-        writeInt(u16, buf[base + 16 .. base + 18], @intCast(group.used_dir_count));
-        writeInt(u16, buf[base + 0x18 .. base + 0x1A], @truncate(bitmapChecksum(uuid, &block_bitmap, default_blocks_per_group / 8)));
-        writeInt(u16, buf[base + 0x1A .. base + 0x1C], @truncate(bitmapChecksum(uuid, &inode_bitmap, layout.inodes_per_group / 8)));
-        writeInt(u16, buf[base + 0x1C .. base + 0x1E], @intCast(layout.inodes_per_group - group.used_inode_count));
+        const base = index * desc_size;
+        buildGroupBitmaps(layout, group, &block_bitmap, &inode_bitmap, nodes, specials);
+        const itable_unused = if (nodes.len == 0 and specials.len == 0)
+            layout.inodes_per_group - group.used_inode_count
+        else
+            groupItableUnused(layout, group, nodes, specials);
+        const descriptor = buf[base .. base + desc_size];
+        writeDescriptorBlockPointer(
+            descriptor,
+            layout.descriptor_size,
+            layout.feature_incompat,
+            0,
+            group.block_bitmap_block,
+        );
+        writeDescriptorBlockPointer(
+            descriptor,
+            layout.descriptor_size,
+            layout.feature_incompat,
+            1,
+            group.inode_bitmap_block,
+        );
+        writeDescriptorBlockPointer(
+            descriptor,
+            layout.descriptor_size,
+            layout.feature_incompat,
+            2,
+            group.inode_table_block,
+        );
+        writeDescriptorCounts(
+            descriptor,
+            layout.descriptor_size,
+            group.block_count - group.reserved_block_count - group.used_data_blocks,
+            layout.inodes_per_group - group.used_inode_count,
+            group.used_dir_count,
+        );
+        writeDescriptorBitmapChecksums(
+            descriptor,
+            layout.descriptor_size,
+            checksum_seed,
+            block_bitmap[0 .. default_blocks_per_group / 8],
+            inode_bitmap[0 .. layout.inodes_per_group / 8],
+        );
+        writeInt(u16, buf[base + 0x1C .. base + 0x1E], @intCast(itable_unused));
+        if (layout.descriptor_size == 64) {
+            writeInt(
+                u16,
+                descriptor[0x32..0x34],
+                @intCast(itable_unused >> 16),
+            );
+        }
+        setGeneralDescriptorChecksum(descriptor, layout.descriptor_size, checksum_seed, @intCast(index));
     }
     _ = desc_bytes;
-    setGroupDescriptorChecksums(buf[0 .. @as(usize, layout.group_count) * group_desc_size], layout, uuid);
 
     try file.writePositionalAll(io, buf, offset + default_block_size);
     for (layout.groups) |group| {
@@ -6753,16 +7703,16 @@ fn writeSuperblocks(io: Io, file: Io.File, layout: Layout, plan: WriterPlan, opt
     writeInt(u16, sb[0x58..0x5A], writer_inode_size);
     writeInt(u16, sb[0x5A..0x5C], 0);
     writeInt(u32, sb[0x5C..0x60], plan.feature_compat);
-    writeInt(u32, sb[0x60..0x64], writer_feature_incompat);
+    writeInt(u32, sb[0x60..0x64], plan.feature_incompat);
     writeInt(u32, sb[0x64..0x68], plan.feature_ro_compat);
     sb[0x68..0x78].* = uuid;
     sb[0x78..0x88].* = label;
     writeInt(u8, sb[0xCC..0xCD], 0);
     writeInt(u8, sb[0xCD..0xCE], 0);
-    writeInt(u16, sb[0xCE..0xD0], 0);
+    writeInt(u16, sb[0xCE..0xD0], @intCast(layout.reserved_gdt_blocks));
     writeInt(u8, sb[0xFC..0xFD], dx_hash_half_md4);
     writeInt(u8, sb[0xFD..0xFE], 0);
-    writeInt(u16, sb[0xFE..0x100], group_desc_size);
+    writeInt(u16, sb[0xFE..0x100], layout.descriptor_size);
     writeInt(u32, sb[0x108..0x10C], options.timestamp);
     // `s_min_extra_isize` / `s_want_extra_isize`. The first is a promise that
     // every inode already has that many extra bytes filled in, which is what
@@ -6771,6 +7721,14 @@ fn writeSuperblocks(io: Io, file: Io.File, layout: Layout, plan: WriterPlan, opt
     writeInt(u16, sb[0x15C..0x15E], writer_extra_isize);
     writeInt(u16, sb[0x15E..0x160], writer_extra_isize);
     writeInt(u8, sb[0x175..0x176], super_checksum_type_crc32c);
+    if (plan.feature_incompat & feature_incompat_csum_seed != 0) {
+        writeInt(u32, sb[0x270..0x274], populateChecksumSeed(options));
+    }
+    for (plan.specials) |special| {
+        if (special.special == .orphan_file) {
+            writeInt(u32, sb[0x280..0x284], special.inode);
+        }
+    }
     if (plan.journal.len != 0) {
         const journal = plan.journal[0];
         writeInt(u32, sb[0xE0..0xE4], journal_inode);
@@ -7273,6 +8231,28 @@ fn blocksForBytes(bytes: u64, block_size: u32) u32 {
     return @intCast(divCeil(bytes, block_size));
 }
 
+fn initializedBlockCount(
+    bytes: u64,
+    sparse_extents: []const tree_cursor.SparseExtent,
+    block_size: u32,
+) PopulateError!u32 {
+    const total = blocksForBytes(bytes, block_size);
+    var holes: u64 = 0;
+    var previous_end: u32 = 0;
+    for (sparse_extents) |sparse| {
+        if (sparse.block_count == 0 or sparse.logical_block < previous_end) {
+            return error.InvalidSparseExtent;
+        }
+        const end = std.math.add(u32, sparse.logical_block, sparse.block_count) catch
+            return error.InvalidSparseExtent;
+        if (end > total) return error.InvalidSparseExtent;
+        holes += sparse.block_count;
+        previous_end = end;
+    }
+    if (holes > total) return error.InvalidSparseExtent;
+    return @intCast(total - holes);
+}
+
 fn blocksToGroups(total_blocks: u32, blocks_per_group: u32) u32 {
     return @intCast(divCeil(total_blocks, blocks_per_group));
 }
@@ -7298,6 +8278,15 @@ fn isPowerOf(value: u32, base: u32) bool {
     var current = value;
     while (current > 1 and current % base == 0) current /= base;
     return current == 1;
+}
+
+fn resizeInodeSectors(group_count: u32, reserved_gdt_blocks: u32) u32 {
+    var backup_count: u32 = 0;
+    var group: u32 = 1;
+    while (group < group_count) : (group += 1) {
+        if (isSparseSuperGroup(group)) backup_count += 1;
+    }
+    return (1 + reserved_gdt_blocks * (1 + backup_count)) * sectors_per_block;
 }
 
 fn encodeDirEntry(buf: []u8, entry: DirEntrySpec, rec_len: u16) void {
@@ -7341,7 +8330,8 @@ fn encodeExtentLeafNode(buf: []u8, max_entries: usize, extents: []const Extent) 
     for (extents, 0..) |extent, index| {
         const base = extent_header_size + index * extent_entry_size;
         writeInt(u32, buf[base .. base + 4], extent.logical_block);
-        writeInt(u16, buf[base + 4 .. base + 6], extent.block_count);
+        writeInt(u16, buf[base + 4 .. base + 6], extent.block_count |
+            if (extent.initialized) @as(u16, 0) else @as(u16, 0x8000));
         writeInt(u16, buf[base + 6 .. base + 8], @as(u16, @truncate(extent.start_block >> 32)));
         writeInt(u32, buf[base + 8 .. base + 12], @as(u32, @truncate(extent.start_block)));
     }
@@ -7520,10 +8510,15 @@ fn parseExtentHeader(buf: []const u8) ReadError!ExtentHeader {
 fn decodeExtent(buf: []const u8) Extent {
     const start_hi = readInt(u16, buf[6..8]);
     const start_lo = readInt(u32, buf[8..12]);
+    const raw_count = readInt(u16, buf[4..6]);
     return .{
         .logical_block = readInt(u32, buf[0..4]),
         .start_block = (@as(u64, start_hi) << 32) | start_lo,
-        .block_count = readInt(u16, buf[4..6]),
+        // 0x8000 is the one ambiguous-looking value in ext4's extent
+        // encoding: it denotes a fully initialized 32768-block extent.
+        // Unwritten extents use values strictly above it.
+        .block_count = if (raw_count == 0x8000) 0x8000 else raw_count & 0x7FFF,
+        .initialized = raw_count <= 0x8000,
     };
 }
 
@@ -7538,7 +8533,7 @@ fn decodeExtentIndex(buf: []const u8) ExtentIndex {
 
 fn findPhysicalBlock(extents: []const Extent, logical_block: u32) ?u64 {
     for (extents) |extent| {
-        if (logical_block >= extent.logical_block and logical_block < extent.logical_block + extent.block_count) {
+        if (extent.initialized and logical_block >= extent.logical_block and logical_block < extent.logical_block + extent.block_count) {
             return extent.start_block + (logical_block - extent.logical_block);
         }
     }
@@ -7787,10 +8782,13 @@ fn putDirectoryLeafTail(block: []u8) void {
 }
 
 fn setDirectoryLeafChecksum(block: []u8, uuid: [16]u8, inode_number: u32, inode_generation: u32) void {
+    setDirectoryLeafChecksumSeed(block, ext4Crc32c(&.{&uuid}), inode_number, inode_generation);
+}
+
+fn setDirectoryLeafChecksumSeed(block: []u8, checksum_seed: u32, inode_number: u32, inode_generation: u32) void {
     var inode_le = std.mem.nativeToLittle(u32, inode_number);
     var generation_le = std.mem.nativeToLittle(u32, inode_generation);
-    writeInt(u32, block[block.len - 4 ..], ext4Crc32c(&.{
-        &uuid,
+    writeInt(u32, block[block.len - 4 ..], ext4Crc32cSeed(checksum_seed, &.{
         std.mem.asBytes(&inode_le),
         std.mem.asBytes(&generation_le),
         block[0 .. block.len - 12],
@@ -7798,14 +8796,17 @@ fn setDirectoryLeafChecksum(block: []u8, uuid: [16]u8, inode_number: u32, inode_
 }
 
 fn setExtentBlockChecksum(block: []u8, uuid: [16]u8, inode_number: u32, inode_generation: u32) void {
+    setExtentBlockChecksumSeed(block, ext4Crc32c(&.{&uuid}), inode_number, inode_generation);
+}
+
+fn setExtentBlockChecksumSeed(block: []u8, checksum_seed: u32, inode_number: u32, inode_generation: u32) void {
     std.debug.assert(readInt(u16, block[0..2]) == extent_magic);
     const tail_offset = extentTailOffset(@intCast(readInt(u16, block[4..6])));
     std.debug.assert(tail_offset + extent_tail_size <= block.len);
 
     var inode_le = std.mem.nativeToLittle(u32, inode_number);
     var generation_le = std.mem.nativeToLittle(u32, inode_generation);
-    writeInt(u32, block[tail_offset .. tail_offset + extent_tail_size], ext4Crc32c(&.{
-        &uuid,
+    writeInt(u32, block[tail_offset .. tail_offset + extent_tail_size], ext4Crc32cSeed(checksum_seed, &.{
         std.mem.asBytes(&inode_le),
         std.mem.asBytes(&generation_le),
         block[0..tail_offset],
@@ -7813,13 +8814,32 @@ fn setExtentBlockChecksum(block: []u8, uuid: [16]u8, inode_number: u32, inode_ge
 }
 
 fn setDxChecksum(block: []u8, count_offset: usize, count: usize, limit: usize, uuid: [16]u8, inode_number: u32, inode_generation: u32) void {
+    setDxChecksumSeed(
+        block,
+        count_offset,
+        count,
+        limit,
+        ext4Crc32c(&.{&uuid}),
+        inode_number,
+        inode_generation,
+    );
+}
+
+fn setDxChecksumSeed(
+    block: []u8,
+    count_offset: usize,
+    count: usize,
+    limit: usize,
+    checksum_seed: u32,
+    inode_number: u32,
+    inode_generation: u32,
+) void {
     var inode_le = std.mem.nativeToLittle(u32, inode_number);
     var generation_le = std.mem.nativeToLittle(u32, inode_generation);
     const tail_offset = count_offset + limit * 8;
     const tail = block[tail_offset .. tail_offset + 8];
     @memset(tail, 0);
-    writeInt(u32, tail[4..8], ext4Crc32c(&.{
-        &uuid,
+    writeInt(u32, tail[4..8], ext4Crc32cSeed(checksum_seed, &.{
         std.mem.asBytes(&inode_le),
         std.mem.asBytes(&generation_le),
         block[0 .. count_offset + count * 8],
@@ -7829,10 +8849,13 @@ fn setDxChecksum(block: []u8, count_offset: usize, count: usize, limit: usize, u
 }
 
 fn setXattrBlockChecksum(block: []u8, uuid: [16]u8, block_number: u64) void {
+    setXattrBlockChecksumSeed(block, ext4Crc32c(&.{&uuid}), block_number);
+}
+
+fn setXattrBlockChecksumSeed(block: []u8, checksum_seed: u32, block_number: u64) void {
     var block_le = std.mem.nativeToLittle(u64, block_number);
     writeInt(u32, block[0x10..0x14], 0);
-    writeInt(u32, block[0x10..0x14], ext4Crc32c(&.{
-        &uuid,
+    writeInt(u32, block[0x10..0x14], ext4Crc32cSeed(checksum_seed, &.{
         std.mem.asBytes(&block_le),
         block,
     }));
@@ -8484,6 +9507,232 @@ test "reader opens read-only-safe 64-byte group descriptor ext4 images" {
     const contents = try reader.readFileAlloc(io, std.testing.allocator, "etc/os-release");
     defer std.testing.allocator.free(contents);
     try std.testing.expectEqualSlices(u8, "NAME=vmiz", contents);
+}
+
+test "the pinned Ubuntu 64-bit profile rebuilds resize and orphan metadata" {
+    const io = std.testing.io;
+    const path = "test-ext4-pinned-profile.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "etc/os-release", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 9, .bytes = "NAME=vmiz" },
+    });
+    tree.bind();
+
+    const old_length: u64 = 64 * 1024 * 1024;
+    const checksum_seed: u32 = 0x1234_5678;
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    const info = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = old_length,
+        .label = "ubuntu-root",
+        .uuid = [_]u8{0x6A} ** 16,
+        .timestamp = 1_724_000_000,
+        .journal = .{ .enabled = true },
+        .preserve_feature_ro_compat = 0x046b,
+        .preserve_feature_compat = 0x103c,
+        .preserve_feature_incompat = 0x22c2,
+        .descriptor_size = 64,
+        .preserve_checksum_seed = checksum_seed,
+    });
+    try std.testing.expect(info.feature_incompat & feature_incompat_64bit != 0);
+    try std.testing.expectEqual(@as(u32, 0x103c), info.feature_compat);
+    try std.testing.expectEqual(@as(u32, 0x22c2), info.feature_incompat);
+    try std.testing.expectEqual(@as(u32, 0x046b), info.feature_ro_compat);
+
+    try expectE2fsckClean(path);
+
+    var sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &sb, superblock_offset);
+    try std.testing.expectEqual(@as(u16, 64), readInt(u16, sb[0xFE..0x100]));
+    try std.testing.expectEqual(@as(u32, 0x103c), readInt(u32, sb[0x5C..0x60]));
+    try std.testing.expectEqual(@as(u32, 0x22c2), readInt(u32, sb[0x60..0x64]));
+    try std.testing.expectEqual(@as(u32, 0x046b), readInt(u32, sb[0x64..0x68]));
+    try std.testing.expectEqual(checksum_seed, readInt(u32, sb[0x270..0x274]));
+    const orphan_inode_number = readInt(u32, sb[0x280..0x284]);
+    try std.testing.expect(orphan_inode_number >= first_non_reserved_inode);
+
+    var reader = try openGeneral(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    var imported = try scanReadable(&reader, io, std.testing.allocator, .{
+        .available_length = old_length,
+    });
+    defer imported.deinit();
+    try std.testing.expectEqual(SourceProfile.ext4_general_v1, imported.identity.profile);
+    try std.testing.expectEqual(checksum_seed, imported.identity.checksum_seed);
+    const contents = try reader.readFileAlloc(io, std.testing.allocator, "etc/os-release");
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualSlices(u8, "NAME=vmiz", contents);
+
+    const grown_length: u64 = 9 * 1024 * 1024 * 1024;
+    const grown = try resize(io, file, std.testing.allocator, .{ .length = grown_length });
+    try std.testing.expectEqual(@as(u32, 0x103c), grown.feature_compat);
+    try std.testing.expectEqual(@as(u32, 0x22c2), grown.feature_incompat);
+    try std.testing.expectEqual(@as(u32, 0x046b), grown.feature_ro_compat);
+    try expectE2fsckClean(path);
+
+    var reopened = try openGeneral(io, file, std.testing.allocator, .{});
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u32, grown_length / default_block_size), reopened.total_blocks);
+    const grown_contents = try reopened.readFileAlloc(io, std.testing.allocator, "etc/os-release");
+    defer std.testing.allocator.free(grown_contents);
+    try std.testing.expectEqualSlices(u8, "NAME=vmiz", grown_contents);
+}
+
+test "a real e2fsprogs pinned profile survives import and native growth" {
+    const io = std.testing.io;
+    const path = "test-ext4-pinned-mke2fs.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    const length: u64 = 64 * 1024 * 1024;
+    var blocks_text: [32]u8 = undefined;
+    try runExternalToolChecked(std.testing.allocator, "mke2fs", &.{
+        "-q",
+        "-F",
+        "-t",
+        "ext4",
+        "-b",
+        "4096",
+        "-O",
+        "64bit,flex_bg,metadata_csum,metadata_csum_seed,orphan_file,resize_inode,dir_index,has_journal",
+        path,
+        try std.fmt.bufPrint(&blocks_text, "{d}", .{length / default_block_size}),
+    });
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    var raw_sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &raw_sb, superblock_offset);
+    // e2fsprogs places s_orphan_file_inum at 0x280 in the 1024-byte
+    // superblock. Keep this assertion beside the real fixture so a future
+    // profile update cannot accidentally read s_flags at 0x160 instead.
+    const expected_orphan_inode = readInt(u32, raw_sb[0x280..0x284]);
+    try std.testing.expect(expected_orphan_inode >= first_non_reserved_inode);
+    // The superblock bitfields are the semantic oracle. dumpe2fs feature
+    // labels have changed across e2fsprogs releases, so do not make a
+    // particular token spelling or ordering part of the acceptance test.
+    const raw_compat = readInt(u32, raw_sb[0x5C..0x60]);
+    const raw_incompat = readInt(u32, raw_sb[0x60..0x64]);
+    const raw_ro_compat = readInt(u32, raw_sb[0x64..0x68]);
+    try std.testing.expectEqual(@as(u32, 0x103c), raw_compat);
+    try std.testing.expectEqual(@as(u32, 0x22c2), raw_incompat);
+    try std.testing.expectEqual(@as(u32, 0x046b), raw_ro_compat);
+    const report = (try runToolCapture(
+        std.testing.allocator,
+        "dumpe2fs",
+        &.{ "-h", path },
+    )) orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(report);
+    var features_line_found = false;
+    var orphan_line_count: u8 = 0;
+    var report_lines = std.mem.splitScalar(u8, report, '\n');
+    while (report_lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "Filesystem features:")) {
+            features_line_found = true;
+        }
+        const prefix = "Orphan file inode:";
+        if (!std.mem.startsWith(u8, trimmed, prefix)) continue;
+        const number = std.fmt.parseInt(u32, std.mem.trim(u8, trimmed[prefix.len..], " \t\r"), 10) catch
+            return error.ExternalToolFailed;
+        try std.testing.expectEqual(expected_orphan_inode, number);
+        orphan_line_count += 1;
+    }
+    try std.testing.expect(features_line_found);
+    try std.testing.expectEqual(@as(u8, 1), orphan_line_count);
+    var debugfs_command: [64]u8 = undefined;
+    const inode_report = (try runToolCapture(
+        std.testing.allocator,
+        "debugfs",
+        &.{
+            "-R",
+            try std.fmt.bufPrint(&debugfs_command, "stat <{d}>", .{expected_orphan_inode}),
+            path,
+        },
+    )) orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(inode_report);
+    var mode_ok = false;
+    var flags_ok = false;
+    var inode_lines = std.mem.splitScalar(u8, inode_report, '\n');
+    while (inode_lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.indexOf(u8, trimmed, "Mode:")) |mode_offset| {
+            const mode_text = std.mem.trim(u8, trimmed[mode_offset + "Mode:".len ..], " \t");
+            const end = std.mem.indexOfAny(u8, mode_text, " \t") orelse mode_text.len;
+            mode_ok = (std.fmt.parseInt(u16, mode_text[0..end], 8) catch 0) == 0o600;
+        }
+        if (std.mem.indexOf(u8, trimmed, "Flags:")) |flags_offset| {
+            const flags_text = std.mem.trim(u8, trimmed[flags_offset + "Flags:".len ..], " \t");
+            const end = std.mem.indexOfAny(u8, flags_text, " \t") orelse flags_text.len;
+            flags_ok = (std.fmt.parseInt(u32, flags_text[0..end], 0) catch 0) == inode_flag_extents;
+        }
+    }
+    try std.testing.expect(mode_ok);
+    try std.testing.expect(flags_ok);
+    var reader = try openGeneral(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(u16, 64), reader.descriptor_size);
+    try std.testing.expectEqual(@as(u32, 0x103c), reader.feature_compat);
+    try std.testing.expectEqual(@as(u32, 0x22c2), reader.feature_incompat);
+    try std.testing.expectEqual(@as(u32, 0x046b), reader.feature_ro_compat);
+    var imported = try scanReadable(&reader, io, std.testing.allocator, .{
+        .available_length = length,
+    });
+    defer imported.deinit();
+    try std.testing.expectEqual(@as(?u32, expected_orphan_inode), imported.identity.orphan_file_inode);
+    try std.testing.expectEqual(@as(usize, 1), imported.nodeCount());
+    try expectE2fsckClean(path);
+
+    _ = try resize(io, file, std.testing.allocator, .{ .length = 9 * 1024 * 1024 * 1024 });
+    try expectE2fsckClean(path);
+}
+
+fn populateSyntheticPinnedOrphan(
+    io: Io,
+    path: []const u8,
+    orphan_inode: u32,
+) !void {
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "file", .kind = .file, .mode = 0o600, .uid = 0, .gid = 0, .size = 7, .bytes = "payload" },
+    });
+    tree.bind();
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = 64 * 1024 * 1024,
+        .uuid = [_]u8{0x73} ** 16,
+        .journal = .{ .enabled = true },
+        .preserve_feature_ro_compat = 0x046b,
+        .preserve_feature_compat = 0x103c,
+        .preserve_feature_incompat = 0x22c2,
+        .descriptor_size = 64,
+        .preserve_checksum_seed = 0xA1B2_C3D4,
+        .preserve_orphan_file_inode = orphan_inode,
+    });
+}
+
+test "synthetic pinned profiles preserve source orphan inode numbers" {
+    const io = std.testing.io;
+    for ([_]struct { path: []const u8, inode: u32 }{
+        .{ .path = "test-ext4-pinned-orphan-12.img", .inode = 12 },
+        .{ .path = "test-ext4-pinned-orphan-706.img", .inode = 706 },
+    }) |case| {
+        defer Io.Dir.cwd().deleteFile(io, case.path) catch {};
+        try populateSyntheticPinnedOrphan(io, case.path, case.inode);
+        const file = try Io.Dir.cwd().openFile(io, case.path, .{ .mode = .read_write });
+        defer file.close(io);
+        var sb: [superblock_size]u8 = undefined;
+        _ = try file.readPositionalAll(io, &sb, superblock_offset);
+        try std.testing.expectEqual(case.inode, readInt(u32, sb[0x280..0x284]));
+        var reader = try openGeneral(io, file, std.testing.allocator, .{});
+        defer reader.deinit();
+        var imported = try scanReadable(&reader, io, std.testing.allocator, .{
+            .available_length = 64 * 1024 * 1024,
+        });
+        defer imported.deinit();
+        try std.testing.expectEqual(@as(?u32, case.inode), imported.identity.orphan_file_inode);
+        try expectE2fsckClean(case.path);
+    }
 }
 
 test "populate respects non-zero partition-relative offsets" {
@@ -10666,7 +11915,10 @@ test "resize uses a metadata checksum seed for stock group metadata" {
         _ = try file.readPositionalAll(io, &block_bitmap, block_bitmap_block * default_block_size);
         _ = try file.readPositionalAll(io, &inode_bitmap, inode_bitmap_block * default_block_size);
         const block_checksum = ext4Crc32cSeed(checksum_seed, &.{&block_bitmap});
-        const inode_checksum = ext4Crc32cSeed(checksum_seed, &.{&inode_bitmap});
+        const inode_checksum = ext4Crc32cSeed(
+            checksum_seed,
+            &.{inode_bitmap[0 .. readInt(u32, sb[0x28..0x2C]) / 8]},
+        );
         try std.testing.expectEqual(@as(u16, @truncate(block_checksum)), readInt(u16, group_descriptor[0x18..0x1A]));
         try std.testing.expectEqual(@as(u16, @truncate(inode_checksum)), readInt(u16, group_descriptor[0x1A..0x1C]));
         try std.testing.expectEqual(@as(u16, @truncate(block_checksum >> 16)), readInt(u16, group_descriptor[0x38..0x3A]));
@@ -10748,7 +12000,10 @@ test "resize reserves resize_inode GDT space in appended sparse-super groups" {
         @as(u64, inode_table_block) * default_block_size + 6 * 256,
     );
     try std.testing.expectEqual(@as(u32, 9), readInt(u32, inode7_after[92..96]));
-    try std.testing.expectEqual(@as(u32, 2 * sectors_per_block), readInt(u32, inode7_after[28..32]));
+    try std.testing.expectEqual(
+        resizeInodeSectors(2, 1),
+        readInt(u32, inode7_after[28..32]),
+    );
     var dindir: [default_block_size]u8 = undefined;
     _ = try file.readPositionalAll(
         io,
@@ -12063,4 +13318,16 @@ test "strict writer-compatible scan rejects a tampered inode epoch" {
             .expected_length = length,
         }),
     );
+}
+
+test "reader treats ee_len 0x8000 as an initialized 32768-block extent" {
+    var encoded = [_]u8{0} ** extent_entry_size;
+    writeInt(u32, encoded[0..4], 123);
+    writeInt(u16, encoded[4..6], 0x8000);
+    writeInt(u16, encoded[6..8], 0);
+    writeInt(u32, encoded[8..12], 456);
+    const extent = decodeExtent(&encoded);
+    try std.testing.expectEqual(@as(u32, 123), extent.logical_block);
+    try std.testing.expectEqual(@as(u16, 32768), extent.block_count);
+    try std.testing.expect(extent.initialized);
 }

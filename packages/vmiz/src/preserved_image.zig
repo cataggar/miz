@@ -1349,6 +1349,7 @@ fn populateOptions(
         .root_ctime_nsec = root.ctime_nsec,
         .root_crtime = root.crtime,
         .root_crtime_nsec = root.crtime_nsec,
+        .root_xattrs = root.xattrs,
     };
 }
 
@@ -1521,14 +1522,17 @@ const ScannedSource = union(enum) {
 
     fn importInto(self: *ScannedSource, tree: *root_tree.RootTree) !void {
         switch (self.*) {
-            .strict => |*scanned| try tree.importExt4View(scanned.fileTreeView()),
+            .strict => |*scanned| try tree.importExt4Strict(scanned),
             .general => |*scanned| try tree.importExt4General(scanned),
         }
     }
 
     fn importBorrowedInto(self: *ScannedSource, tree: *root_tree.RootTree) !void {
         switch (self.*) {
-            .strict => |*scanned| try tree.importExt4ViewBorrowed(scanned.fileTreeView()),
+            // Strict trees do not expose borrowed timestamp-rich entries;
+            // their source content is already deterministic and the
+            // validation path only needs an owned import.
+            .strict => |*scanned| try tree.importExt4Strict(scanned),
             .general => |*scanned| try tree.importExt4GeneralBorrowed(scanned),
         }
     }

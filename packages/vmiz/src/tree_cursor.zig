@@ -42,6 +42,14 @@ pub const DeviceNumbers = struct {
     minor: u32 = 0,
 };
 
+/// A logical range that reads as zero and has no initialized data blocks.
+/// Ranges are expressed in filesystem blocks and may be omitted when a file
+/// is fully dense.
+pub const SparseExtent = struct {
+    logical_block: u32,
+    block_count: u32,
+};
+
 /// A borrowed extended attribute, valid only for as long as the entry that
 /// yielded it.
 pub const Xattr = struct {
@@ -124,6 +132,7 @@ pub const Cursor = struct {
         /// is the honest answer for a node a build is genuinely creating.
         crtime: ?i64 = null,
         crtime_nsec: u32 = 0,
+        sparse_extents: []const SparseExtent = &.{},
     };
 
     pub fn reset(self: *Cursor) void {

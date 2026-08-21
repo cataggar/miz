@@ -18,6 +18,64 @@ const report = try vmiz.root_resize.growExistingQcow2(allocator, io, path, .{
 The operation accepts standalone QCOW2 files only and performs no qemu,
 libguestfs, `e2fsck`, or `resize2fs` process execution.
 
+## Read and mutate an ext4 partition without mounting it
+
+`vmiz.ext4_mountless.FileSystem` opens an existing ext4 filesystem at a byte
+offset, scans it through the general importer, and spools file bytes under the
+declared import limits. It never creates a host copy of the guest tree or
+interprets guest permissions while reading:
+
+```zig
+var fs = try vmiz.ext4_mountless.FileSystem.open(allocator, io, image.file, .{
+    .offset = root_offset,
+    .length = root_partition_length,
+    .spool_path = "transaction/root.spool",
+    .atomic_path = image_path,
+});
+defer fs.deinit();
+
+const entries = try fs.list(allocator, "/", 10_000);
+defer allocator.free(entries);
+const bytes = try fs.read(allocator, "/etc/os-release", 4 * 1024 * 1024);
+defer allocator.free(bytes);
+
+try fs.mkdir("/etc/vmiz", .{ .mode = 0o700 });
+try fs.write("/etc/vmiz/config", "enabled\n", null);
+try fs.remove("/var/cache/old", true);
+const commit = try fs.commit();
+defer commit.deinit();
+_ = commit.filesystem;
+// Keep commit.recovery_path for operator-managed recovery. vmiz never
+// removes this private directory automatically.
+```
+
+`stat`, `list`, `read`, `readLink`, `write`, `mkdir`, `remove`, `copyIn`, and
+`copyOut` are bounded operations. `commit` requires `atomic_path`, stages a
+complete image copy, validates/writes the replacement, and atomically renames
+it only after the stage is closed; a source profile the writer cannot preserve
+is rejected before staging. Imported ownership, mode bits (including `000`),
+timestamps, xattrs, ACL/capability xattrs, hard links, symlinks, sparse ranges,
+FIFOs, device numbers, filesystem UUID, and label are retained by the
+existing importer/tree/writer path. `copyOut` copies one regular file; it
+never recursively materializes a guest directory.
+
+On Linux, `commit` also captures and reapplies the atomic image path's mode,
+owner/group, atime/mtime, ACL xattrs, and all other host xattrs to the closed
+stage before publication; metadata capture or application failure aborts the
+transaction without replacing the source. `commit` returns the filesystem
+result plus a private same-filesystem recovery-directory path. The directory
+contains the displaced original and is retained for operator-managed recovery;
+vmiz never removes it automatically. Linux publication treats the exchange as
+the linearization point; later pathname replacements are not rolled back or
+deleted, and durability failures retain the recovery directory.
+The atomic destination must not be a final-component symlink and must retain
+the pinned filesystem device/inode identity through publication.
+
+The pinned Canonical Ubuntu profile (`descriptor_size = 64`, compat `0x103c`,
+incompat `0x22c2`, and ro-compat `0x046b`) is supported. Commits rebuild its
+e2fsprogs-style `resize_inode` reservation and empty `orphan_file` inode,
+including seeded metadata checksums, rather than dropping those structures.
+
 ## Inspect UKI signing certificates
 
 Open a supported disk format with `vmiz.Image`, then use

@@ -69,6 +69,29 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
 
+    def test_package_root_uses_native_mountless_ext4_round_trip(self):
+        builder = (
+            ROOT / "scripts" / "build_generalized_ubuntu2604.zig"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "vmiz.ext4_mountless.FileSystem.open",
+            builder,
+        )
+        self.assertIn("exportHostTree", builder)
+        self.assertIn("importHostTree", builder)
+        self.assertIn("native_root.finish()", builder)
+        self.assertIn("cloudimg-rootfs", builder)
+        self.assertNotIn("/dev/sda4", builder)
+        self.assertNotIn("/dev/sda3", builder)
+        for forbidden in (
+            "virt-tar-out",
+            "virt-tar-in",
+            '"guestfish"',
+            '"tar"',
+            '"cp"',
+        ):
+            self.assertNotIn(forbidden, builder)
+
     def make_bundle(
         self,
         key: str,

@@ -16,9 +16,22 @@ flavor in this release.
 `release-20260731` cloud-image publication. The official server cloud disk,
 not a root tarball reconstructed from packages, is the authoritative
 filesystem and initial package input. The builder then extracts that root and
-uses the embedded `vmiz.package_family` debz backend against
+passes a bounded, readable staging view to the embedded
+`vmiz.package_family` debz backend against
 `https://snapshot.ubuntu.com/ubuntu/20260731T000000Z` to install the coherent
 `linux-azure` and `walinuxagent` closures.
+
+The package-root round trip is native: the mutable QCOW2 is converted to a
+raw staging image, `vmiz.ext4_mountless.FileSystem` reads the selected ext4
+partition without mounting it, and the package-safe staging view is imported
+back through the same API before the raw image is converted back. This path
+does not use `virt-tar-*`, `guestfish`, host `tar`, or host `cp`; mode-`000`
+entries are read from ext4 bytes rather than made readable on the host, while
+their original metadata remains in the native tree.
+
+The root partition is selected by the validated GPT name
+`cloudimg-rootfs` and the ext4 filesystem label, not by a fixed `/dev/sdaN`
+slot; Canonical's populated partition slots differ between image revisions.
 
 The following inputs are compiled into the builder:
 
