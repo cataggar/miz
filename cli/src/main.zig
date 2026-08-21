@@ -1,6 +1,6 @@
 //! `vmiz`: a qemu-img-like CLI over the `vmiz` library. Supports `create`,
 //! `info`, `convert`, `resize`, `check`, `map`, `build-image`, `build-iso`,
-//! `recustomize-iso`, `azure`, `cosi`, `oci`, `qemu`, and release signing over
+//! `recustomize-iso`, `resize-root`, `azure`, `cosi`, `oci`, `qemu`, and release signing over
 //! `raw`, `vhd`, `vhdx`, and `qcow2`.
 
 const std = @import("std");
@@ -10,6 +10,7 @@ const create_cmd = @import("commands/create.zig");
 const info_cmd = @import("commands/info.zig");
 const convert_cmd = @import("commands/convert.zig");
 const resize_cmd = @import("commands/resize.zig");
+const resize_root_cmd = @import("commands/resize_root.zig");
 const check_cmd = @import("commands/check.zig");
 const map_cmd = @import("commands/map.zig");
 const azure_cmd = @import("commands/azure.zig");
@@ -31,6 +32,7 @@ const usage =
     \\  info [--output=human|json] <file>
     \\  convert -f <src_format> -O <dst_format> [-o subformat=fixed|dynamic] [--compress-level <1-9>] <src> <dst|->
     \\  resize <file> [+]<size>
+    \\  resize-root [--label <label>] <file.qcow2> [+]<size>
     \\  check <file>
     \\  map [--output=human|json] <file>
     \\  azure derive --input-sha256 <hex> [--expected-virtual-size <size>] <input.qcow2> <output.vhd>
@@ -82,6 +84,9 @@ fn run(
     if (std.mem.eql(u8, command, "info")) return info_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "convert")) return convert_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "resize")) return resize_cmd.run(gpa, io, rest);
+    if (std.mem.eql(u8, command, "resize-root") or std.mem.eql(u8, command, "grow-root")) {
+        return resize_root_cmd.run(gpa, io, rest);
+    }
     if (std.mem.eql(u8, command, "check")) return check_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "map")) return map_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "azure")) return azure_cmd.run(gpa, io, rest);
@@ -107,6 +112,7 @@ test {
     _ = info_cmd;
     _ = convert_cmd;
     _ = resize_cmd;
+    _ = resize_root_cmd;
     _ = check_cmd;
     _ = map_cmd;
     _ = azure_cmd;

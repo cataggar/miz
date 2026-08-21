@@ -48,6 +48,7 @@ pub const gpt = @import("gpt.zig");
 pub const lvm = @import("lvm.zig");
 pub const azure = @import("azure.zig");
 pub const deprovision = @import("deprovision.zig");
+pub const root_resize = @import("root_resize.zig");
 pub const layout = @import("layout.zig");
 pub const filesystem_writer = @import("filesystem_writer.zig");
 pub const oci = @import("oci.zig");

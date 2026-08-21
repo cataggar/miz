@@ -1,5 +1,23 @@
 # Library API
 
+## Grow an existing Ubuntu QCOW2 image
+
+`vmiz.root_resize.growExistingQcow2` performs the complete native growth
+transaction: it enlarges the QCOW2 virtual disk, relocates and updates both
+GPT copies, selects the ext4 root by its validated filesystem label, and
+grows that partition and filesystem. The result is atomically published, so
+unsupported or malformed input leaves the original image untouched:
+
+```zig
+const report = try vmiz.root_resize.growExistingQcow2(allocator, io, path, .{
+    .target_size = 5 * 1024 * 1024 * 1024,
+    .filesystem_label = "cloudimg-rootfs",
+});
+```
+
+The operation accepts standalone QCOW2 files only and performs no qemu,
+libguestfs, `e2fsck`, or `resize2fs` process execution.
+
 ## Inspect UKI signing certificates
 
 Open a supported disk format with `vmiz.Image`, then use
