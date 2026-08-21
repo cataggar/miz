@@ -74,6 +74,8 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
             "cpio",
             "xz-utils",
             " zstd",
+            "qemu-utils",
+            "qemu-img",
         ):
             self.assertNotIn(removed, install)
         apt_install = install.index(
@@ -145,6 +147,28 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         self.assertLess(build_log, tee)
         self.assertIn('sudo -E "$(command -v zig)" build', build)
         self.assertIn('sudo chown -R "$(id -u):$(id -g)"', build)
+
+    def test_build_validates_qcow2_and_publishes_metadata_natively(self) -> None:
+        build_job = self.source.split("\n  build:\n", 1)[1].split(
+            "\n  native_qemu:\n", 1
+        )[0]
+        validate = build_job.split(
+            "- name: Validate standalone zstd QCOW2 and exact 5 GiB size", 1
+        )[1].split("- name:", 1)[0]
+        # The build job emits and validates the release image entirely with
+        # vmiz; qemu-img/qemu-utils must not appear anywhere in it (issue #476,
+        # acceptance: Ubuntu build must not invoke qemu tooling).
+        self.assertNotIn("qemu-img", build_job)
+        self.assertNotIn("qemu-utils", build_job)
+        self.assertIn('"$vmiz" check "$asset"', validate)
+        self.assertIn('"$vmiz" info --output=json "$asset"', validate)
+        self.assertIn('vmiz="$GITHUB_WORKSPACE/zig-out/bin/vmiz"', validate)
+        # Native metadata is the publication input the candidate provenance
+        # binds and the exactness gate parses.
+        self.assertIn("image-info.json", validate)
+        self.assertIn('data.get("compression-type") != "zstd"', validate)
+        self.assertIn("candidate virtual size is not exactly 5 GiB", validate)
+        self.assertIn("candidate has a backing file", validate)
 
     def test_native_acceptance_cannot_silently_skip(self) -> None:
         native = self.source.split("  native_qemu:", 1)[1].split(

@@ -71,9 +71,10 @@ fn finalizeCompressedQcow2(
     mutable: []const u8,
     output: []const u8,
 ) !void {
-    // vmiz validates and mutates QCOW2 natively, but it does not yet encode
-    // compressed zstd clusters. This is the sole external image-format
-    // boundary: qemu-img produces the standalone compressed release artifact.
+    // Emit the standalone zstd-compressed release artifact natively. vmiz
+    // reads the mutable qcow2's guest bytes and re-encodes them into
+    // compressed qcow2 v3 clusters, so the Ubuntu release path no longer
+    // shells out to qemu-img/qemu-utils.
     const staged_output = try std.fmt.allocPrint(
         allocator,
         "{s}.vmiz-finalize-stage",
@@ -82,13 +83,30 @@ fn finalizeCompressedQcow2(
     defer allocator.free(staged_output);
     Dir.cwd().deleteFile(io, staged_output) catch {};
     errdefer Dir.cwd().deleteFile(io, staged_output) catch {};
-    try run(allocator, io, &.{
-        "qemu-img", "convert",                          "-f", "qcow2", "-O",          "qcow2",
-        "-o",       "compat=1.1,compression_type=zstd", "-c", mutable, staged_output,
-    });
+
     var source = try vmiz.Image.openPathReadOnlyStandalone(io, mutable);
+    defer source.close(io);
+    if (source.format != .qcow2) return error.InvalidFinalQcow2;
     const expected_size = source.virtual_size;
-    source.close(io);
+    const source_ctx = vmiz.qcow2.Qcow2SourceContext{
+        .file = source.file,
+        .info = &source.qcow2.?,
+    };
+
+    const staged_file = try Dir.cwd().createFile(io, staged_output, .{ .read = true, .truncate = true });
+    {
+        errdefer staged_file.close(io);
+        _ = try vmiz.qcow2.writeStandaloneCompressed(
+            allocator,
+            io,
+            staged_file,
+            expected_size,
+            source_ctx.reader(),
+            .{},
+        );
+    }
+    staged_file.close(io);
+
     try validateFinalQcow2(io, staged_output, expected_size);
     try Dir.cwd().rename(staged_output, Dir.cwd(), output, io);
 }
@@ -2018,7 +2036,7 @@ pub fn main(init: std.process.Init) !void {
         return error.ChecksumMismatch;
     if (args.preflight_only) return;
 
-    for (&[_][]const u8{ "qemu-img", "ukify", "sbverify", "unshare", "mount", "umount", "chroot", "mknod", "timeout", "setsid" }) |tool|
+    for (&[_][]const u8{ "ukify", "sbverify", "unshare", "mount", "umount", "chroot", "mknod", "timeout", "setsid" }) |tool|
         try requireTool(allocator, io, tool);
     const config = try signingConfig(args);
 
@@ -2694,7 +2712,7 @@ test "final native qcow2 validation covers the exact release size" {
     );
 }
 
-test "production builder contains no libguestfs command surface" {
+test "production builder contains no libguestfs or qemu-img command surface" {
     const source = @embedFile("build_generalized_ubuntu2604.zig");
     const tests_begin = std.mem.indexOf(u8, source, "test \"profiles pin") orelse
         return error.TestBoundaryMissing;
@@ -2713,6 +2731,11 @@ test "production builder contains no libguestfs command surface" {
         "\"virt-tar-out\"",
         "\"supermin\"",
         "\"LIBGUESTFS_BACKEND_SETTINGS\"",
+        // Acceptance #1: production finalization must not invoke qemu tooling;
+        // compressed qcow2 clusters are emitted natively by vmiz.qcow2.
+        "\"qemu-img\"",
+        "\"qemu-utils\"",
+        "\"qemu-nbd\"",
     }) |forbidden| {
         try std.testing.expect(std.mem.indexOf(u8, production, forbidden) == null);
     }

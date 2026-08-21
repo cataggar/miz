@@ -198,12 +198,12 @@ jobs:
           sudo apt-get update
           packages=(
             binutils file jq linux-image-generic openssl
-            python3 python3-pefile qemu-utils sbsigntool systemd-ukify
+            python3 python3-pefile sbsigntool systemd-ukify
             util-linux
           )
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
           sudo chmod 0644 /boot/vmlinuz-*
-          for tool in mount mknod qemu-img sbverify chroot ukify \
+          for tool in mount mknod sbverify chroot ukify \
             setsid timeout unshare; do
             command -v "$tool" >/dev/null
           done
@@ -303,10 +303,17 @@ jobs:
         run: |
           set -euo pipefail
           asset="$BUNDLE_DIR/$ASSET_NAME"
+          vmiz="$GITHUB_WORKSPACE/zig-out/bin/vmiz"
           test -f "$asset"
-          qemu-img check "$asset"
-          qemu-img info --output=json "$asset" > "$BUNDLE_DIR/internal-provenance/qemu-img-info.json"
-          python3 - "$BUNDLE_DIR/internal-provenance/qemu-img-info.json" "$VIRTUAL_SIZE" <<'PY'
+          test -x "$vmiz"
+          # Native validation and metadata: vmiz replaces the external image
+          # tool as both the QCOW2 integrity check and the info publication
+          # input (issue #476). The compressed release image is emitted by
+          # vmiz.qcow2 natively, so the production build no longer depends on
+          # any external qemu tooling.
+          "$vmiz" check "$asset"
+          "$vmiz" info --output=json "$asset" > "$BUNDLE_DIR/internal-provenance/image-info.json"
+          python3 - "$BUNDLE_DIR/internal-provenance/image-info.json" "$VIRTUAL_SIZE" <<'PY'
           import json
           import sys
           info = json.load(open(sys.argv[1], encoding="utf-8"))
