@@ -98,6 +98,8 @@ const HostMetadata = struct {
 
 pub const CommitResult = struct {
     filesystem: ext4.FilesystemInfo,
+    /// Private same-filesystem directory containing the displaced original.
+    /// It is retained for operator recovery and is never removed by vmiz.
     recovery_path: []const u8,
 };
 
@@ -107,27 +109,24 @@ fn failedLinuxSyscall(result: usize) bool {
     return @as(isize, @bitCast(result)) < 0;
 }
 
-fn sameFileStat(lhs: Io.File.Stat, rhs: Io.File.Stat) bool {
-    return lhs.inode == rhs.inode and
-        lhs.size == rhs.size and
-        std.meta.eql(lhs.mtime, rhs.mtime) and
-        std.meta.eql(lhs.ctime, rhs.ctime);
-}
-
-fn syncDestinationDirectory(io: Io, atomic_path: []const u8) Error!void {
+fn syncDirectoryPath(io: Io, path: []const u8) Error!void {
     if (comptime builtin.os.tag != .linux) {
         return error.AtomicDurabilityUnsupported;
     }
-    const parent = std.fs.path.dirname(atomic_path) orelse ".";
-    var directory = if (std.fs.path.isAbsolute(parent))
-        try Io.Dir.openDirAbsolute(io, parent, .{ .iterate = true })
+    var directory = if (std.fs.path.isAbsolute(path))
+        try Io.Dir.openDirAbsolute(io, path, .{ .iterate = true })
     else
-        try Io.Dir.cwd().openDir(io, if (parent.len == 0) "." else parent, .{ .iterate = true });
+        try Io.Dir.cwd().openDir(io, if (path.len == 0) "." else path, .{ .iterate = true });
     defer directory.close(io);
     const sync_result = std.os.linux.fsync(directory.handle);
     if (failedLinuxSyscall(sync_result)) {
         return error.AtomicDurabilityFailed;
     }
+}
+
+fn syncDestinationDirectory(io: Io, atomic_path: []const u8) Error!void {
+    const parent = std.fs.path.dirname(atomic_path) orelse ".";
+    return syncDirectoryPath(io, parent);
 }
 
 fn captureHostMetadata(allocator: Allocator, io: Io, file: Io.File) Error!HostMetadata {
@@ -251,19 +250,19 @@ fn purgeHostXattrsNotInSource(
     }
 }
 
-fn purgeAllHostXattrs(allocator: Allocator, file: Io.File) Error!void {
+fn purgeAllHostXattrsFd(allocator: Allocator, fd: std.posix.fd_t) Error!void {
     if (comptime builtin.os.tag != .linux) {
         return error.HostMetadataPreservationUnsupported;
     }
     const linux = std.os.linux;
     var probe: [1]u8 = undefined;
-    const raw_size = linux.flistxattr(file.handle, &probe, 0);
+    const raw_size = linux.flistxattr(fd, &probe, 0);
     if (failedLinuxSyscall(raw_size)) return error.HostMetadataPreservationFailed;
     if (raw_size > max_host_xattr_bytes) return error.HostMetadataPreservationFailed;
     const names = try allocator.alloc(u8, @intCast(raw_size));
     defer allocator.free(names);
     const names_len = if (names.len == 0) 0 else blk: {
-        const result = linux.flistxattr(file.handle, names.ptr, names.len);
+        const result = linux.flistxattr(fd, names.ptr, names.len);
         if (failedLinuxSyscall(result)) return error.HostMetadataPreservationFailed;
         break :blk @as(usize, @intCast(result));
     };
@@ -275,11 +274,15 @@ fn purgeAllHostXattrs(allocator: Allocator, file: Io.File) Error!void {
         const name_z = try allocator.allocSentinel(u8, end - cursor, 0);
         defer allocator.free(name_z);
         @memcpy(name_z, names[cursor..end]);
-        if (failedLinuxSyscall(linux.fremovexattr(@intCast(file.handle), name_z.ptr))) {
+        if (failedLinuxSyscall(linux.fremovexattr(@intCast(fd), name_z.ptr))) {
             return error.HostMetadataPreservationFailed;
         }
         cursor = end + 1;
     }
+}
+
+fn purgeAllHostXattrs(allocator: Allocator, file: Io.File) Error!void {
+    return purgeAllHostXattrsFd(allocator, file.handle);
 }
 
 fn applyHostMetadata(io: Io, file: Io.File, metadata: *const HostMetadata) Error!void {
@@ -312,6 +315,63 @@ fn applyHostMetadata(io: Io, file: Io.File, metadata: *const HostMetadata) Error
     }) catch return error.HostMetadataPreservationFailed;
 }
 
+fn createPrivateDirectory(allocator: Allocator, io: Io, atomic_path: []const u8) Error![]u8 {
+    const timestamp = @as(u64, @intCast(Io.Clock.real.now(io).nanoseconds));
+    var attempt: u32 = 0;
+    while (attempt < 64) : (attempt += 1) {
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "{s}.mountless-private-{x}-{d}",
+            .{ atomic_path, timestamp, attempt },
+        );
+        Io.Dir.cwd().createDir(io, path, .fromMode(0o700)) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                allocator.free(path);
+                continue;
+            },
+            else => {
+                allocator.free(path);
+                return err;
+            },
+        };
+        return path;
+    }
+    return error.AtomicPublishFailed;
+}
+
+fn preparePrivateDirectory(allocator: Allocator, io: Io, path: []const u8) Error!Io.Dir {
+    if (comptime builtin.os.tag != .linux) return error.AtomicPublishUnsupported;
+    var directory = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch
+        return error.AtomicPublishFailed;
+    errdefer directory.close(io);
+    const linux = std.os.linux;
+    var statx: linux.Statx = undefined;
+    const statx_result = linux.statx(
+        @intCast(directory.handle),
+        "",
+        linux.AT.EMPTY_PATH,
+        linux.STATX.BASIC_STATS,
+        &statx,
+    );
+    const io_stat = Io.Dir.cwd().statFile(io, path, .{}) catch
+        return error.AtomicPublishFailed;
+    if (failedLinuxSyscall(statx_result) or
+        !statx.mask.UID or statx.uid != linux.geteuid() or
+        io_stat.kind != .directory)
+    {
+        return error.AtomicPublishFailed;
+    }
+    try purgeAllHostXattrsFd(allocator, directory.handle);
+    directory.setPermissions(io, .fromMode(0o700)) catch
+        return error.AtomicPublishFailed;
+    const sanitized_stat = Io.Dir.cwd().statFile(io, path, .{}) catch
+        return error.AtomicPublishFailed;
+    if (@as(u16, @intCast(sanitized_stat.permissions.toMode() & 0o7777)) != 0o700) {
+        return error.AtomicPublishFailed;
+    }
+    return directory;
+}
+
 pub const FileSystem = struct {
     allocator: Allocator,
     io: Io,
@@ -339,7 +399,6 @@ pub const FileSystem = struct {
     test_stage_ready_hook: ?*const fn (ctx: *anyopaque, stage_path: []const u8) anyerror!void = null,
     test_stage_ready_hook_ctx: ?*anyopaque = null,
     recovery_path: ?[]u8 = null,
-    recovery_stat: ?Io.File.Stat = null,
 
     /// Opens and imports an ext4 partition without mounting it. The source
     /// bytes are bounded by `limits` and retained in the tree's spool, not in
@@ -991,15 +1050,17 @@ pub const FileSystem = struct {
         }
         var host_metadata = try captureHostMetadata(self.allocator, self.io, self.file);
         defer host_metadata.deinit(self.allocator);
-        const stage_path = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}.mountless-stage-{d}",
-            .{ atomic_path, @as(u64, @intCast(Io.Clock.real.now(self.io).nanoseconds)) },
-        );
-        defer self.allocator.free(stage_path);
+        const private_dir_path = try createPrivateDirectory(self.allocator, self.io, atomic_path);
+        defer self.allocator.free(private_dir_path);
         var exchanged = false;
-        defer if (!exchanged) DirDelete(self.io, stage_path);
-        var stage_file = try Io.Dir.cwd().createFile(self.io, stage_path, .{
+        defer if (!exchanged) Io.Dir.cwd().deleteTree(self.io, private_dir_path) catch {};
+        var private_dir = try preparePrivateDirectory(self.allocator, self.io, private_dir_path);
+        defer private_dir.close(self.io);
+        try syncDestinationDirectory(self.io, atomic_path);
+        try syncDirectoryPath(self.io, private_dir_path);
+        const stage_path = try std.fs.path.join(self.allocator, &.{ private_dir_path, "stage" });
+        defer self.allocator.free(stage_path);
+        var stage_file = try private_dir.createFile(self.io, "stage", .{
             .read = true,
             .truncate = true,
             .exclusive = true,
@@ -1010,6 +1071,7 @@ pub const FileSystem = struct {
         try purgeAllHostXattrs(self.allocator, stage_file);
         stage_file.setPermissions(self.io, .fromMode(0o600)) catch
             return error.HostMetadataPreservationFailed;
+        try syncDirectoryPath(self.io, private_dir_path);
         if (comptime builtin.is_test) {
             if (self.test_stage_ready_hook) |hook| {
                 try hook(
@@ -1078,7 +1140,7 @@ pub const FileSystem = struct {
                 try hook(self.test_publish_hook_ctx orelse return error.AtomicPublishFailed);
             }
         }
-        try self.publishStage(stage_path, atomic_path, &exchanged);
+        try self.publishStage(stage_path, private_dir_path, atomic_path, &exchanged);
         self.committed = true;
         return .{
             .filesystem = info,
@@ -1089,6 +1151,7 @@ pub const FileSystem = struct {
     fn publishStage(
         self: *FileSystem,
         stage_path: []const u8,
+        private_dir_path: []const u8,
         atomic_path: []const u8,
         exchanged: *bool,
     ) Error!void {
@@ -1099,7 +1162,7 @@ pub const FileSystem = struct {
         const displaced_expected = Io.Dir.cwd().statFile(self.io, atomic_path, .{}) catch
             return error.AtomicSourceChanged;
         if (!self.sameSourceStat(displaced_expected)) return error.AtomicSourceChanged;
-        var recovery_path: ?[]u8 = try self.allocator.dupe(u8, stage_path);
+        var recovery_path: ?[]u8 = try self.allocator.dupe(u8, private_dir_path);
         defer if (recovery_path) |path| self.allocator.free(path);
         const stage_z = try self.allocator.allocSentinel(u8, stage_path.len, 0);
         defer self.allocator.free(stage_z);
@@ -1118,8 +1181,6 @@ pub const FileSystem = struct {
         exchanged.* = true;
         self.recovery_path = recovery_path.?;
         recovery_path = null;
-        self.recovery_stat = Io.Dir.cwd().statFile(self.io, stage_path, .{}) catch
-            return error.AtomicPublishUnrecoverable;
 
         if (comptime builtin.is_test) {
             if (self.test_after_exchange_hook) |hook| {
@@ -1133,35 +1194,14 @@ pub const FileSystem = struct {
 
         syncDestinationDirectory(self.io, atomic_path) catch
             return error.AtomicDurabilityUnknown;
+        syncDirectoryPath(self.io, private_dir_path) catch
+            return error.AtomicDurabilityUnknown;
     }
 
-    /// Returns the displaced pre-commit image retained after a successful
-    /// exchange. The path remains valid until this filesystem is deinitialized
-    /// or the artifact is explicitly cleaned up.
+    /// Returns the private same-filesystem directory containing the displaced
+    /// original. The directory remains valid until an operator removes it.
     pub fn recoveryArtifactPath(self: *const FileSystem) ?[]const u8 {
         return self.recovery_path;
-    }
-
-    /// Conditionally removes the displaced artifact. If another writer has
-    /// touched the recovery pathname, it is retained rather than unlinked.
-    pub fn cleanupRecoveryArtifact(self: *FileSystem) Error!void {
-        const path = self.recovery_path orelse return;
-        const expected = self.recovery_stat orelse return error.AtomicPublishUnrecoverable;
-        const observed = Io.Dir.cwd().statFile(self.io, path, .{}) catch |err| switch (err) {
-            error.FileNotFound => {
-                self.allocator.free(path);
-                self.recovery_path = null;
-                self.recovery_stat = null;
-                return;
-            },
-            else => return err,
-        };
-        if (!sameFileStat(observed, expected)) return error.RecoveryArtifactChanged;
-        Io.Dir.cwd().deleteFile(self.io, path) catch return error.RecoveryCleanupFailed;
-        syncDestinationDirectory(self.io, path) catch return error.AtomicDurabilityUnknown;
-        self.allocator.free(path);
-        self.recovery_path = null;
-        self.recovery_stat = null;
     }
 
     fn ensureMutable(self: *const FileSystem) Error!void {
@@ -1464,8 +1504,12 @@ test "atomic commit preserves host image mode timestamps and xattrs" {
     fs.test_stage_ready_hook = inspectStageReady;
     fs.test_stage_ready_hook_ctx = &stage_ready;
     try fs.write("/etc", "changed", null);
-    _ = try fs.commit();
-    try fs.cleanupRecoveryArtifact();
+    const commit_result = try fs.commit();
+    const recovery_path = try allocator.dupe(u8, commit_result.recovery_path);
+    defer {
+        Io.Dir.cwd().deleteTree(io, recovery_path) catch {};
+        allocator.free(recovery_path);
+    }
     fs.deinit();
     fs_open = false;
     image.close(io);
@@ -1580,8 +1624,11 @@ test "atomic commit preserves a replacement after exchange and leaves recovery a
     const result = try fs.commit();
     const recovery_path = try allocator.dupe(u8, result.recovery_path);
     defer allocator.free(recovery_path);
-    try std.testing.expect((try Io.Dir.cwd().statFile(io, recovery_path, .{})).size == 32 * 1024 * 1024);
-    try fs.cleanupRecoveryArtifact();
+    try std.testing.expectEqual(
+        Io.File.Kind.directory,
+        (try Io.Dir.cwd().statFile(io, recovery_path, .{})).kind,
+    );
+    try Io.Dir.cwd().deleteTree(io, recovery_path);
     fs.deinit();
     image.close(io);
     image_open = false;
@@ -1655,8 +1702,12 @@ test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
     fs.identity.feature_compat = original_compat & ~ext4.writer_feature_compat;
     try std.testing.expectError(error.UnsupportedCommitProfile, fs.commit());
     fs.identity.feature_compat = original_compat;
-    _ = try fs.commit();
-    try fs.cleanupRecoveryArtifact();
+    const commit_result = try fs.commit();
+    const recovery_path = try allocator.dupe(u8, commit_result.recovery_path);
+    defer {
+        Io.Dir.cwd().deleteTree(io, recovery_path) catch {};
+        allocator.free(recovery_path);
+    }
 }
 
 test "mountless commit preserves the pinned Ubuntu descriptor-64 profile" {
@@ -1710,8 +1761,12 @@ test "mountless commit preserves the pinned Ubuntu descriptor-64 profile" {
     try std.testing.expectEqual(@as(u32, 0x22c2), identity.feature_incompat);
     try std.testing.expectEqual(@as(u32, 0x046b), identity.feature_ro_compat);
     try fs.write("/etc/os-release", "NAME=vmiz-pinned\n", null);
-    _ = try fs.commit();
-    try fs.cleanupRecoveryArtifact();
+    const commit_result = try fs.commit();
+    const recovery_path = try allocator.dupe(u8, commit_result.recovery_path);
+    defer {
+        Io.Dir.cwd().deleteTree(io, recovery_path) catch {};
+        allocator.free(recovery_path);
+    }
     fs.deinit();
     fs_open = false;
     image.close(io);
@@ -1891,8 +1946,12 @@ test "mountless round trip preserves security metadata and special nodes" {
     try fs.mkdir("/empty", .{ .mode = 0 });
     try fs.write("/empty/file", "new", null);
     try fs.remove("/empty", true);
-    _ = try fs.commit();
-    try fs.cleanupRecoveryArtifact();
+    const commit_result = try fs.commit();
+    const recovery_path = try allocator.dupe(u8, commit_result.recovery_path);
+    defer {
+        Io.Dir.cwd().deleteTree(io, recovery_path) catch {};
+        allocator.free(recovery_path);
+    }
     fs.deinit();
     fs_open = false;
     image.close(io);

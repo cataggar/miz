@@ -43,7 +43,9 @@ try fs.mkdir("/etc/vmiz", .{ .mode = 0o700 });
 try fs.write("/etc/vmiz/config", "enabled\n", null);
 try fs.remove("/var/cache/old", true);
 const commit = try fs.commit();
-try fs.cleanupRecoveryArtifact();
+_ = commit.filesystem;
+// Keep commit.recovery_path for operator-managed recovery. vmiz never
+// removes this private directory automatically.
 ```
 
 `stat`, `list`, `read`, `readLink`, `write`, `mkdir`, `remove`, `copyIn`, and
@@ -60,11 +62,11 @@ On Linux, `commit` also captures and reapplies the atomic image path's mode,
 owner/group, atime/mtime, ACL xattrs, and all other host xattrs to the closed
 stage before publication; metadata capture or application failure aborts the
 transaction without replacing the source. `commit` returns the filesystem
-result plus a recovery-artifact path. Cleanup is explicit: callers must call
-`cleanupRecoveryArtifact`, which conditionally removes only the exact displaced
-object and otherwise retains it. Linux publication treats the exchange as the
-linearization point; later pathname replacements are not rolled back or
-deleted, and durability failures retain the recovery artifact.
+result plus a private same-filesystem recovery-directory path. The directory
+contains the displaced original and is retained for operator-managed recovery;
+vmiz never removes it automatically. Linux publication treats the exchange as
+the linearization point; later pathname replacements are not rolled back or
+deleted, and durability failures retain the recovery directory.
 
 The pinned Canonical Ubuntu profile (`descriptor_size = 64`, compat `0x103c`,
 incompat `0x22c2`, and ro-compat `0x046b`) is supported. Commits rebuild its

@@ -564,7 +564,6 @@ const NativeRoot = struct {
 
     fn finish(self: *NativeRoot) !void {
         _ = try self.filesystem.commit();
-        try self.filesystem.cleanupRecoveryArtifact();
         self.filesystem.deinit();
         self.filesystem_open = false;
         self.image.close(self.io);
