@@ -737,7 +737,7 @@ fn customizeRootWithDebz(
         try Dir.cwd().createDirPath(io, stage);
         const current_contents = try std.fmt.allocPrint(allocator, "{s}/.", .{current});
         defer allocator.free(current_contents);
-        try run(allocator, io, &.{ "cp", "-a", "--reflink=auto", current_contents, stage });
+        const restricted_permissions = try copyRootStage(allocator, io, current, current_contents, stage);
         const absolute_stage = try Dir.cwd().realPathFileAlloc(io, stage, allocator);
         defer allocator.free(absolute_stage);
         const absolute_published = if (std.fs.path.isAbsolute(published))
@@ -747,6 +747,8 @@ fn customizeRootWithDebz(
             defer allocator.free(absolute_work);
             break :blk try std.fs.path.join(allocator, &.{ absolute_work, std.fs.path.basename(published) });
         };
+        var published_transferred = false;
+        errdefer if (!published_transferred) allocator.free(absolute_published);
 
         const customized = try package_family.execute(allocator, io, .{}, packageFamilyRequest(
             .customize,
@@ -764,6 +766,7 @@ fn customizeRootWithDebz(
         if (!customized.published or customized.provenance_path == null)
             return error.DebzProvenanceMissing;
         defer allocator.free(customized.provenance_path.?);
+        try restoreRestrictedRootEntry(allocator, io, absolute_published, restricted_permissions);
         const expected_provenance = try std.fs.path.join(allocator, &.{ absolute_state, "transaction-result.json" });
         defer allocator.free(expected_provenance);
         if (!std.mem.eql(u8, customized.provenance_path.?, expected_provenance))
@@ -804,9 +807,56 @@ fn customizeRootWithDebz(
         evidence_count += 1;
         allocator.free(current);
         current = absolute_published;
+        published_transferred = true;
     }
 
     return .{ .root_path = current, .evidence = evidence };
+}
+
+const restricted_root_entry = "var/lib/snapd/void";
+
+fn copyRootStage(
+    allocator: Allocator,
+    io: Io,
+    source_root: []const u8,
+    source_contents: []const u8,
+    stage: []const u8,
+) !?std.Io.File.Permissions {
+    const source_entry = try std.fs.path.join(allocator, &.{ source_root, restricted_root_entry });
+    defer allocator.free(source_entry);
+    const original = Dir.cwd().statFile(io, source_entry, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            try run(allocator, io, &.{ "cp", "-a", "--reflink=auto", source_contents, stage });
+            return null;
+        },
+        else => return err,
+    };
+    const required_mode: std.posix.mode_t = if (original.kind == .directory) 0o500 else 0o400;
+    if (original.permissions.toMode() & required_mode == required_mode) {
+        try run(allocator, io, &.{ "cp", "-a", "--reflink=auto", source_contents, stage });
+        return null;
+    }
+
+    const readable = std.Io.File.Permissions.fromMode(original.permissions.toMode() | required_mode);
+    try Dir.cwd().setFilePermissions(io, source_entry, readable, .{});
+    run(allocator, io, &.{ "cp", "-a", "--reflink=auto", source_contents, stage }) catch |err| {
+        try Dir.cwd().setFilePermissions(io, source_entry, original.permissions, .{});
+        return err;
+    };
+    try Dir.cwd().setFilePermissions(io, source_entry, original.permissions, .{});
+    return original.permissions;
+}
+
+fn restoreRestrictedRootEntry(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    permissions: ?std.Io.File.Permissions,
+) !void {
+    const value = permissions orelse return;
+    const path = try std.fs.path.join(allocator, &.{ root, restricted_root_entry });
+    defer allocator.free(path);
+    try Dir.cwd().setFilePermissions(io, path, value, .{});
 }
 
 fn prepareEmptyDpkgRoot(allocator: Allocator, io: Io, root: []const u8) !void {
@@ -1040,9 +1090,8 @@ pub fn main(init: std.process.Init) !void {
     try run(allocator, io, &.{ "qemu-img", "create", "-f", "qcow2", mutable, size_text });
     if (profile.architecture == .aarch64) {
         try run(allocator, io, &.{ "virt-resize", "--expand", "/dev/sda1", "--no-expand-content", source_path, mutable });
-        try run(allocator, io, &.{
-            "guestfish", "--rw", "-a", mutable, "run", ":", "e2fsck-f", destination_root, ":", "resize2fs", destination_root,
-        });
+        try run(allocator, io, &.{ "guestfish", "--rw", "-a", mutable, "run", ":", "e2fsck-f", destination_root });
+        try run(allocator, io, &.{ "guestfish", "--rw", "-a", mutable, "run", ":", "resize2fs", destination_root });
     } else {
         try run(allocator, io, &.{ "virt-resize", "--expand", "/dev/sda1", source_path, mutable });
     }
@@ -1274,6 +1323,47 @@ test "empty lock-resolution roots contain a valid dpkg database" {
     );
     const status = try temporary.dir.statFile(std.testing.io, "var/lib/dpkg/status", .{});
     try std.testing.expectEqual(@as(u64, 0), status.size);
+}
+
+test "root staging preserves intentionally inaccessible snapd directory" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    try temporary.dir.createDirPath(io, "source/var/lib/snapd/void");
+    try temporary.dir.createDirPath(io, "stage");
+    try temporary.dir.setFilePermissions(
+        io,
+        "source/var/lib/snapd/void",
+        std.Io.File.Permissions.fromMode(0),
+        .{},
+    );
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    const source = try std.fs.path.join(allocator, &.{ root_buffer[0..root_length], "source" });
+    defer allocator.free(source);
+    const source_contents = try std.fs.path.join(allocator, &.{ source, "." });
+    defer allocator.free(source_contents);
+    const stage = try std.fs.path.join(allocator, &.{ root_buffer[0..root_length], "stage" });
+    defer allocator.free(stage);
+
+    const permissions = try copyRootStage(allocator, io, source, source_contents, stage);
+    try std.testing.expect(permissions != null);
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0),
+        (try temporary.dir.statFile(io, "source/var/lib/snapd/void", .{})).permissions.toMode() & 0o777,
+    );
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0o500),
+        (try temporary.dir.statFile(io, "stage/var/lib/snapd/void", .{})).permissions.toMode() & 0o777,
+    );
+
+    try restoreRestrictedRootEntry(allocator, io, stage, permissions);
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0),
+        (try temporary.dir.statFile(io, "stage/var/lib/snapd/void", .{})).permissions.toMode() & 0o777,
+    );
 }
 
 test "arguments accept Ubuntu and project architecture spellings" {
