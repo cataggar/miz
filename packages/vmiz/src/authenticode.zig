@@ -21,6 +21,7 @@
 //! enrolled one, and that the enrolled one is trusted, stays with the caller.
 
 const std = @import("std");
+const der = @import("der.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const rsa = std.crypto.Certificate.rsa;
@@ -1194,12 +1195,12 @@ fn verifyPkcs1Sha256(
     signature: []const u8,
 ) Error!void {
     const certificate = std.crypto.Certificate{ .buffer = certificate_der, .index = 0 };
-    const parsed = certificate.parse() catch return error.InvalidCertificate;
+    const parsed = der.parseCertificate(certificate) catch return error.InvalidCertificate;
     switch (parsed.pub_key_algo) {
         .rsaEncryption => {},
         else => return error.UnsupportedPublicKeyAlgorithm,
     }
-    const components = rsa.PublicKey.parseDer(parsed.pubKey()) catch
+    const components = der.parseRsaPublicKey(parsed.pubKey()) catch
         return error.InvalidCertificate;
     const public_key = rsa.PublicKey.fromBytes(components.exponent, components.modulus) catch
         return error.InvalidCertificate;
@@ -1938,7 +1939,7 @@ fn validateDerTree(bytes: []const u8, element: DerElement, depth: usize) Error!v
 fn parseCertificateElement(bytes: []const u8, start: usize) Error!DerElement {
     const strict = parseDerElement(bytes, start) catch return error.InvalidCertificate;
     const index = std.math.cast(u32, start) orelse return error.InvalidCertificate;
-    const standard = std.crypto.Certificate.der.Element.parse(bytes, index) catch return error.InvalidCertificate;
+    const standard = der.parseElement(bytes, index) catch return error.InvalidCertificate;
     if (standard.slice.start != strict.content_start or standard.slice.end != strict.end)
         return error.InvalidCertificate;
     return strict;
@@ -2619,12 +2620,132 @@ test "native verification fails closed on tampering and signer substitution" {
     );
 }
 
+test "certificate inspection fails closed on malformed and truncated DER" {
+    const allocator = std.testing.allocator;
+
+    // These are the encodings whose length octets point past the buffer -- the
+    // exact shapes that made the standard library's unchecked `Element.parse`
+    // index out of bounds and panic. `describeCertificateAlloc` walks every
+    // field through the bounds-checked `der.parseElement`, so each is refused.
+    for ([_][]const u8{
+        "",
+        "\x30",
+        "\x30\x82\x05\xf4",
+        "\x30\x84\xff\xff\xff\xff",
+        "\x30\x80",
+    }) |malformed| {
+        try std.testing.expectError(
+            error.InvalidCertificate,
+            describeCertificateAlloc(allocator, malformed),
+        );
+    }
+
+    // Truncating a real certificate at every possible length must fail closed
+    // rather than crash. A panic here is not catchable with `catch`, so it
+    // would be a denial of service reachable through any inspected certificate.
+    const certificate = try decodeTestBase64Alloc(allocator, test_local_cert_b64);
+    defer allocator.free(certificate);
+    var cut: usize = 0;
+    while (cut < certificate.len) : (cut += 1) {
+        if (describeCertificateAlloc(allocator, certificate[0..cut])) |text| {
+            allocator.free(text);
+        } else |_| {}
+    }
+    // The whole certificate still inspects cleanly.
+    const full = try describeCertificateAlloc(allocator, certificate);
+    allocator.free(full);
+}
+
+test "verification fails closed on a truncated signed image" {
+    const allocator = std.testing.allocator;
+    const certificate = try decodeTestBase64Alloc(allocator, test_local_cert_b64);
+    defer allocator.free(certificate);
+    const key = try decodeTestBase64Alloc(allocator, test_local_key_pkcs8_b64);
+    defer allocator.free(key);
+    const image = try makeTestPe(allocator, 512);
+    defer allocator.free(image);
+    const signed = try signPeRsaSha256Alloc(allocator, image, key, certificate);
+    defer allocator.free(signed);
+
+    // Every prefix of a valid signed image is hostile input: the PE headers,
+    // the WIN_CERTIFICATE, the PKCS#7, the embedded certificate and the
+    // signature are each reached with fewer bytes than they claim. None of
+    // those parsers may panic; each truncation is simply rejected.
+    var cut: usize = 0;
+    while (cut < signed.len) : (cut += 1) {
+        _ = verifyRsaSha256(signed[0..cut]) catch {};
+    }
+    // The untruncated image still verifies.
+    _ = try verifyRsaSha256(signed);
+}
+
+test "verification fails closed when the embedded certificate is corrupt" {
+    const allocator = std.testing.allocator;
+    const certificate = try decodeTestBase64Alloc(allocator, test_local_cert_b64);
+    defer allocator.free(certificate);
+    const key = try decodeTestBase64Alloc(allocator, test_local_key_pkcs8_b64);
+    defer allocator.free(key);
+    const image = try makeTestPe(allocator, 512);
+    defer allocator.free(image);
+    const signed = try signPeRsaSha256Alloc(allocator, image, key, certificate);
+    defer allocator.free(signed);
+
+    // The embedded certificate is not covered by the Authenticode signature,
+    // yet its bytes are parsed to recover the RSA public key that checks that
+    // signature. It is therefore attacker-controlled, and parsing it is exactly
+    // where `std.crypto.Certificate.parse` used to panic on a malformed field.
+    const cert_offset = std.mem.indexOf(u8, signed, certificate).?;
+    const outer = try parseDerElement(certificate, 0);
+    const tbs = try parseDerElement(certificate, outer.content_start);
+
+    {
+        // Overwrite everything past the tbsCertificate -- the signatureAlgorithm
+        // and signatureValue -- with a byte that is not a valid DER length. The
+        // verifier's structural validation of the whole PKCS#7 rejects the
+        // corrupt certificate before any cryptography, rather than crashing.
+        const corrupt = try allocator.dupe(u8, signed);
+        defer allocator.free(corrupt);
+        @memset(corrupt[cert_offset + tbs.end .. cert_offset + certificate.len], 0xff);
+        try std.testing.expectError(
+            error.InvalidAuthenticodeCms,
+            verifyRsaSha256(corrupt),
+        );
+    }
+}
+
+test "verification never panics on a corrupted signed image" {
+    const allocator = std.testing.allocator;
+    const certificate = try decodeTestBase64Alloc(allocator, test_local_cert_b64);
+    defer allocator.free(certificate);
+    const key = try decodeTestBase64Alloc(allocator, test_local_key_pkcs8_b64);
+    defer allocator.free(key);
+    const image = try makeTestPe(allocator, 512);
+    defer allocator.free(image);
+    const signed = try signPeRsaSha256Alloc(allocator, image, key, certificate);
+    defer allocator.free(signed);
+
+    // Flipping every byte of a valid signed image in turn drives corrupted
+    // input through every parser the verifier owns: the PE headers, the
+    // WIN_CERTIFICATE table, the PKCS#7, the embedded certificate, its RSA
+    // public key and the signature. None of them may panic -- a panic is not
+    // catchable, so it would be a denial of service reachable through any
+    // signed image -- so each corruption is rejected or, for an inert byte,
+    // ignored.
+    var i: usize = 0;
+    while (i < signed.len) : (i += 1) {
+        const corrupt = try allocator.dupe(u8, signed);
+        defer allocator.free(corrupt);
+        corrupt[i] ^= 0xff;
+        _ = verifyRsaSha256(corrupt) catch {};
+    }
+}
+
 test "native private key decoding rejects malformed and encrypted keys" {
     const allocator = std.testing.allocator;
 
-    const der = try decodeTestBase64Alloc(allocator, test_local_key_pkcs8_b64);
-    defer allocator.free(der);
-    const parsed = try parseRsaPrivateKeyDer(der);
+    const der_bytes = try decodeTestBase64Alloc(allocator, test_local_key_pkcs8_b64);
+    defer allocator.free(der_bytes);
+    const parsed = try parseRsaPrivateKeyDer(der_bytes);
     try std.testing.expect(parsed.modulus.len == 256);
 
     try std.testing.expectError(
@@ -2638,11 +2759,11 @@ test "native private key decoding rejects malformed and encrypted keys" {
 
     // A conforming PEM wrapper round-trips to the same DER; an encrypted key
     // (which this cannot decrypt) and non-PEM input are refused.
-    const pem = try wrapPemForTest(allocator, "PRIVATE KEY", der);
+    const pem = try wrapPemForTest(allocator, "PRIVATE KEY", der_bytes);
     defer allocator.free(pem);
     const decoded = try decodePrivateKeyPemAlloc(allocator, pem);
     defer allocator.free(decoded);
-    try std.testing.expectEqualSlices(u8, der, decoded);
+    try std.testing.expectEqualSlices(u8, der_bytes, decoded);
 
     try std.testing.expectError(
         error.InvalidPrivateKeyPem,
@@ -2679,14 +2800,14 @@ test "certificate validity that ends before it begins is rejected" {
 fn wrapPemForTest(
     allocator: std.mem.Allocator,
     label: []const u8,
-    der: []const u8,
+    der_bytes: []const u8,
 ) ![]u8 {
     const encoded = try allocator.alloc(
         u8,
-        std.base64.standard.Encoder.calcSize(der.len),
+        std.base64.standard.Encoder.calcSize(der_bytes.len),
     );
     defer allocator.free(encoded);
-    _ = std.base64.standard.Encoder.encode(encoded, der);
+    _ = std.base64.standard.Encoder.encode(encoded, der_bytes);
     var pem: std.Io.Writer.Allocating = .init(allocator);
     errdefer pem.deinit();
     try pem.writer.print("-----BEGIN {s}-----\n", .{label});

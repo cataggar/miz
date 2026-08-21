@@ -80,6 +80,7 @@ pub const artifact_pipeline = @import("artifact_pipeline.zig");
 pub const package_family = @import("package_family.zig");
 pub const verity = @import("verity.zig");
 pub const authenticode = @import("authenticode.zig");
+pub const der = @import("der.zig");
 pub const uki_certificate = @import("uki_certificate.zig");
 pub const block_device = @import("block_device.zig");
 pub const output = @import("output.zig");
