@@ -29,6 +29,13 @@ pub const OpenOptions = struct {
     diagnostic: ?*limits_mod.Diagnostic = null,
 };
 
+pub const HostTreeOptions = struct {
+    max_file_bytes: u64 = 16 * 1024 * 1024 * 1024,
+    /// Runtime-only directories are represented by their mount points in a
+    /// package-manager root and must remain untouched in the ext4 tree.
+    excluded_top_level: []const []const u8 = &.{ "dev", "proc", "run", "sys" },
+};
+
 pub const Error = anyerror;
 
 pub const FileSystem = struct {
@@ -289,6 +296,140 @@ pub const FileSystem = struct {
         try destination.writePositionalAll(self.io, bytes, 0);
     }
 
+    /// Materializes a bounded, tool-safe package root. Guest bytes are read
+    /// through the ext4 tree, so mode `000` entries never become unreadable
+    /// host inputs; regular files receive ordinary readable staging modes.
+    pub fn exportHostTree(
+        self: *const FileSystem,
+        destination: []const u8,
+        options: HostTreeOptions,
+    ) Error!void {
+        try Io.Dir.cwd().createDirPath(self.io, destination);
+        for (0..self.tree.nodeCount()) |index| {
+            const entry = self.tree.nodeView(index);
+            if (excludedTopLevel(entry.path, options.excluded_top_level)) continue;
+            const host_path = try std.fs.path.join(self.allocator, &.{ destination, entry.path });
+            defer self.allocator.free(host_path);
+            const parent = std.fs.path.dirname(host_path) orelse destination;
+            try Io.Dir.cwd().createDirPath(self.io, parent);
+            switch (entry.kind) {
+                .directory => try Io.Dir.cwd().createDirPath(self.io, host_path),
+                .file, .hardlink => {
+                    const bytes = try self.read(self.allocator, entry.path, options.max_file_bytes);
+                    defer self.allocator.free(bytes);
+                    try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = host_path, .data = bytes });
+                    try Io.Dir.cwd().setFilePermissions(self.io, host_path, .fromMode(0o644), .{});
+                },
+                .symlink => {
+                    const target = try self.readLink(self.allocator, entry.path, options.max_file_bytes);
+                    defer self.allocator.free(target);
+                    Io.Dir.cwd().deleteFile(self.io, host_path) catch {};
+                    try Io.Dir.cwd().symLink(self.io, target, host_path, .{});
+                },
+                // A package root only needs the mount points for these
+                // entries. The original special nodes remain in the native
+                // tree and are never replaced by host placeholders.
+                .block_device, .char_device, .fifo => {},
+            }
+        }
+    }
+
+    /// Imports files produced by a host package tool without using a host
+    /// archive extractor. Existing native metadata remains authoritative;
+    /// new files receive root ownership and the host mode bits.
+    pub fn importHostTree(
+        self: *FileSystem,
+        source: []const u8,
+        options: HostTreeOptions,
+    ) Error!void {
+        var seen = std.StringHashMap(void).init(self.allocator);
+        defer {
+            var iterator = seen.keyIterator();
+            while (iterator.next()) |key| self.allocator.free(key.*);
+            seen.deinit();
+        }
+        try self.importHostDirectory(source, "", options, &seen);
+
+        var removals = std.array_list.Managed([]u8).init(self.allocator);
+        defer {
+            for (removals.items) |path| self.allocator.free(path);
+            removals.deinit();
+        }
+        for (0..self.tree.nodeCount()) |index| {
+            const entry = self.tree.nodeView(index);
+            if (excludedTopLevel(entry.path, options.excluded_top_level)) continue;
+            if (seen.contains(entry.path)) continue;
+            try removals.append(try self.allocator.dupe(u8, entry.path));
+        }
+        std.mem.sortUnstable([]u8, removals.items, {}, struct {
+            fn less(_: void, a: []u8, b: []u8) bool {
+                return a.len > b.len;
+            }
+        }.less);
+        for (removals.items) |path| {
+            _ = self.tree.remove(path) catch {};
+        }
+    }
+
+    fn importHostDirectory(
+        self: *FileSystem,
+        host_path: []const u8,
+        relative: []const u8,
+        options: HostTreeOptions,
+        seen: *std.StringHashMap(void),
+    ) Error!void {
+        var directory = try Io.Dir.cwd().openDir(self.io, host_path, .{ .iterate = true });
+        defer directory.close(self.io);
+        var iterator = directory.iterate();
+        while (try iterator.next(self.io)) |entry| {
+            const child = if (relative.len == 0)
+                try self.allocator.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ relative, entry.name });
+            errdefer self.allocator.free(child);
+            if (excludedTopLevel(child, options.excluded_top_level)) continue;
+            try seen.put(try self.allocator.dupe(u8, child), {});
+            const child_host = try std.fs.path.join(self.allocator, &.{ host_path, entry.name });
+            defer self.allocator.free(child_host);
+            switch (entry.kind) {
+                .directory => {
+                    const existing = self.tree.findNode(child);
+                    if (existing == null) try self.mkdir(child, .{ .mode = 0o755 });
+                    try self.importHostDirectory(child_host, child, options, seen);
+                },
+                .file => {
+                    const host_stat = try Io.Dir.cwd().statFile(self.io, child_host, .{});
+                    const existing = self.tree.findNode(child);
+                    if (existing == null or existing.?.kind != .hardlink) {
+                        const metadata = if (existing) |node| node.metadata else Metadata{
+                            .mode = @intCast(host_stat.permissions.toMode() & 0o7777),
+                        };
+                        try self.copyIn(child_host, child, metadata);
+                    }
+                },
+                .sym_link => {
+                    var target_buffer: [4096]u8 = undefined;
+                    const target_len = try Io.Dir.cwd().readLink(self.io, child_host, &target_buffer);
+                    const existing = self.tree.findNode(child);
+                    const metadata = if (existing) |node| node.metadata else Metadata{ .mode = 0o777 };
+                    try self.symlink(child, target_buffer[0..target_len], metadata);
+                },
+                else => {},
+            }
+            self.allocator.free(child);
+        }
+    }
+
+    pub fn symlink(
+        self: *FileSystem,
+        path: []const u8,
+        target: []const u8,
+        metadata: Metadata,
+    ) Error!void {
+        try self.ensureMutable();
+        try self.tree.putSymlink(try normalizePath(path), target, metadata);
+    }
+
     /// Rewrites the selected ext4 range with the mutated tree, retaining its
     /// UUID, label, root metadata, filesystem length, and journal presence.
     pub fn commit(self: *FileSystem) Error!ext4.FilesystemInfo {
@@ -363,6 +504,12 @@ fn isImmediateChild(parent: []const u8, path: []const u8) bool {
     return std.mem.indexOfScalar(u8, path[parent.len + 1 ..], '/') == null;
 }
 
+fn excludedTopLevel(path: []const u8, excluded: []const []const u8) bool {
+    const first = if (std.mem.indexOfScalar(u8, path, '/')) |slash| path[0..slash] else path;
+    for (excluded) |name| if (std.mem.eql(u8, first, name)) return true;
+    return false;
+}
+
 test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
@@ -370,10 +517,12 @@ test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
     const spool_path = "test-ext4-mountless.spool";
     const copy_in_path = "test-ext4-mountless-copy-in";
     const copy_out_path = "test-ext4-mountless-copy-out";
+    const host_tree_path = "test-ext4-mountless-host-tree";
     defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, copy_in_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, copy_out_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, host_tree_path) catch {};
 
     var image = try @import("image.zig").Image.createExclusive(
         io,
@@ -402,6 +551,8 @@ test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
     const listed = try fs.list(allocator, "/", 16);
     defer allocator.free(listed);
     try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try fs.exportHostTree(host_tree_path, .{});
+    try fs.importHostTree(host_tree_path, .{});
     try std.testing.expectEqual(@as(u16, 0), (try fs.stat("/etc/void")).metadata.mode);
     try std.testing.expectError(error.FileLimitExceeded, fs.read(allocator, "/etc/void", 2));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = copy_in_path, .data = "from-host" });
