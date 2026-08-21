@@ -37,6 +37,8 @@ The following inputs are compiled into the builder:
 
 - Canonical key fingerprint:
   `D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81`
+- Pinned Canonical ASCII public-key SHA-256:
+  `e581b39fac6bfc199e921788c3c07ac5406fe88db487c7bdcf1e1d2f78fbcf05`
 - `SHA256SUMS` SHA-256:
   `d562d59dac70f68d67d00e994db5cd89e49e9d93f7f80b4cb868a5eeb057ec36`
 - `SHA256SUMS.gpg` SHA-256:
@@ -52,12 +54,16 @@ The following inputs are compiled into the builder:
 - embedded debz API commit:
   `9cabfc0f808a8beb4709d7e5b3ae7baf19d733d5`
 
-The builder first verifies the pinned checksum files, imports only the pinned
-Canonical fingerprint, verifies the detached signature, and requires exactly
-one signed checksum entry for the selected image and manifest. It separately
-hashes downloaded or `--source` image bytes. The manifest must contain the
-expected architecture and the systemd, cloud-init, cloud-guest-utils,
-OpenSSH, sudo, and netplan packages.
+The builder first verifies the pinned checksum files with its bounded native
+OpenPGP verifier. It embeds Canonical's ASCII-armored public key, pins the
+complete armored key and its full v4 fingerprint, and accepts only a
+4096-bit RSA/65537 key and an unambiguous v4 binary-document RSA/SHA-512
+detached signature with Canonical's issuer fingerprint. It has no keyring,
+trust database, keyserver, GnuPG configuration, or GnuPG executable
+dependency. It then requires exactly one signed checksum entry for the
+selected image and manifest. It separately hashes downloaded or `--source`
+image bytes. The manifest must contain the expected architecture and the
+systemd, cloud-init, cloud-guest-utils, OpenSSH, sudo, and netplan packages.
 
 Each of `linux-azure` and `walinuxagent` is a separate debz transaction:
 resolve an exact closure lock from the Canonical image's installed dpkg
@@ -111,15 +117,15 @@ builder dependencies as the release workflow:
 ```console
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
-  binutils cpio file gnupg jq liblzma-dev libzstd-dev \
+  binutils cpio file jq liblzma-dev libzstd-dev \
   linux-image-generic openssl \
   python3 python3-pefile qemu-utils sbsigntool systemd-ukify \
   util-linux xorriso xz-utils zstd
 sudo chmod 0644 /boot/vmlinuz-*
 ```
 
-The builder inventory is limited to verification tools (GnuPG, OpenSSL),
-native compilation and image mutation dependencies
+The builder inventory is limited to native HTTPS and OpenPGP verification tools
+(OpenSSL provides UKI signing support), native compilation and image mutation dependencies
 (`liblzma-dev`, `libzstd-dev`, `util-linux`, `cpio`, `xz`, and `zstd`), UKI
 assembly/signing tools (`binutils`, `linux-image-generic`, `python3-pefile`,
 `sbsigntool`, and `systemd-ukify`), `xorriso`, and `qemu-utils`.
@@ -135,7 +141,8 @@ command. `update-initramfs`, `dpkg-query`, and optional `cloud-init clean` are
 the only guest commands; systemd enablement and account removal are native
 mountless operations.
 
-Run a source-pin preflight (requiring only `gpg` and agent-free `gpgv`) with:
+Run a source-pin preflight using the compiled native HTTPS and OpenPGP
+verifiers with:
 
 ```console
 zig build -Dubuntu2604-arch=x86_64 generalized-ubuntu2604 -- --preflight-only
@@ -145,10 +152,10 @@ zig build -Dubuntu2604-arch=aarch64 generalized-ubuntu2604 -- --preflight-only
 Release artifacts are fetched by vmiz's native HTTPS downloader. It accepts
 only HTTPS URLs, verifies the system TLS certificate chain using TLS 1.2 or
 newer, bounds redirects, retries and response sizes, and atomically publishes
-only fully downloaded inputs. Pinned artifact SHA-256 values and the
-Canonical signing-key fingerprint remain mandatory verification gates.
-The bounded request-buffer sizing for signed redirects is informed by
-[`ghr`'s MIT-licensed HTTP implementation](https://github.com/cataggar/ghr/blob/main/src/http.zig);
+only fully downloaded inputs. Pinned artifact SHA-256 values, the complete
+Canonical signing-key armor, and its full fingerprint remain mandatory
+verification gates. The bounded request-buffer sizing for signed redirects is
+informed by [`ghr`'s MIT-licensed HTTP implementation](https://github.com/cataggar/ghr/blob/main/src/http.zig);
 vmiz does not vendor that code.
 
 A full build requires signing. For local development, supply exactly one
