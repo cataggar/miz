@@ -874,7 +874,17 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         self.assertIn('"gpgv", "--keyring"', builder)
         self.assertNotIn('"gpg", "--batch", "--homedir"', builder)
         self.assertNotIn('"--import"', builder)
-        self.assertIn("curl gpg gpgv mount", workflow)
+        self.assertIn("gpg gpgv mount", workflow)
+        self.assertNotIn("curl", workflow)
+
+    def test_release_acquisition_uses_native_https_without_curl(self):
+        builder = (
+            ROOT / "scripts" / "build_generalized_ubuntu2604.zig"
+        ).read_text(encoding="utf-8")
+        self.assertIn("NativeHttpsDownloader.init", builder)
+        self.assertIn("artifact_pipeline.acquireVerified", builder)
+        self.assertIn("artifact_pipeline.downloadBoundedAtomic", builder)
+        self.assertNotIn('"curl"', builder)
 
     def test_publisher_is_draft_first_allowlisted_and_fail_safe(self):
         script = (ROOT / "scripts" / "ubuntu2604_publish.sh").read_text()

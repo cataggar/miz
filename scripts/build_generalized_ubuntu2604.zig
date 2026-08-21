@@ -345,14 +345,14 @@ fn acquire(
     path: []const u8,
     sha256: []const u8,
     max_size: u64,
+    downloader: artifact_pipeline.Downloader,
 ) !void {
-    var curl = artifact_pipeline.CurlDownloader{ .executable_path = "curl", .retries = 5 };
     _ = try artifact_pipeline.acquireVerified(allocator, io, .{
         .url = url,
         .destination_path = path,
         .expected_sha256 = try artifact_pipeline.parseSha256(sha256),
         .max_size = max_size,
-    }, curl.downloader());
+    }, downloader);
 }
 
 fn copyBoundedFile(
@@ -474,6 +474,7 @@ fn verifyCanonicalPublication(
     work_dir: []const u8,
     sums_path: []const u8,
     signature_path: []const u8,
+    downloader: artifact_pipeline.Downloader,
 ) !void {
     const key_url = try std.fmt.allocPrint(
         allocator,
@@ -483,7 +484,14 @@ fn verifyCanonicalPublication(
     defer allocator.free(key_url);
     const key_path = try std.fs.path.join(allocator, &.{ work_dir, "canonical-cloud-image-key.asc" });
     defer allocator.free(key_path);
-    try run(allocator, io, &.{ "curl", "--fail", "--location", "--proto", "=https", "--tlsv1.2", "--output", key_path, key_url });
+    _ = try artifact_pipeline.downloadBoundedAtomic(
+        allocator,
+        io,
+        key_url,
+        key_path,
+        256 * 1024,
+        downloader,
+    );
     const fingerprints = try capture(allocator, io, &.{ "gpg", "--batch", "--no-options", "--with-colons", "--show-keys", "--fingerprint", key_path });
     defer allocator.free(fingerprints);
     if (!hasExactCanonicalPrimaryFingerprint(fingerprints)) return error.CanonicalFingerprintMismatch;
@@ -1620,16 +1628,19 @@ pub fn main(init: std.process.Init) !void {
     try Dir.cwd().deleteTree(io, provenance_dir);
     try Dir.cwd().createDirPath(io, provenance_dir);
 
-    for (&[_][]const u8{ "curl", "gpg", "gpgv" }) |tool|
+    for (&[_][]const u8{ "gpg", "gpgv" }) |tool|
         try requireTool(allocator, io, tool);
+    var https = artifact_pipeline.NativeHttpsDownloader.init(allocator, io);
+    defer https.deinit();
+    const downloader = https.downloader();
 
     const sums_path = try std.fs.path.join(allocator, &.{ work_dir, "SHA256SUMS" });
     defer allocator.free(sums_path);
     const signature_path = try std.fs.path.join(allocator, &.{ work_dir, "SHA256SUMS.gpg" });
     defer allocator.free(signature_path);
-    try acquire(allocator, io, release_base ++ "/SHA256SUMS", sums_path, sums_sha256, 64 * 1024);
-    try acquire(allocator, io, release_base ++ "/SHA256SUMS.gpg", signature_path, sums_signature_sha256, 16 * 1024);
-    try verifyCanonicalPublication(allocator, io, work_dir, sums_path, signature_path);
+    try acquire(allocator, io, release_base ++ "/SHA256SUMS", sums_path, sums_sha256, 64 * 1024, downloader);
+    try acquire(allocator, io, release_base ++ "/SHA256SUMS.gpg", signature_path, sums_signature_sha256, 16 * 1024, downloader);
+    try verifyCanonicalPublication(allocator, io, work_dir, sums_path, signature_path, downloader);
     const sums = try Dir.cwd().readFileAlloc(io, sums_path, allocator, .limited(64 * 1024));
     defer allocator.free(sums);
     try requireSha256SumsEntry(sums, profile.source_name, profile.source_sha256);
@@ -1639,7 +1650,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(manifest_path);
     const manifest_url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ release_base, profile.manifest_name });
     defer allocator.free(manifest_url);
-    try acquire(allocator, io, manifest_url, manifest_path, profile.manifest_sha256, manifest_max_size);
+    try acquire(allocator, io, manifest_url, manifest_path, profile.manifest_sha256, manifest_max_size, downloader);
     const manifest = try Dir.cwd().readFileAlloc(io, manifest_path, allocator, .limited(manifest_max_size));
     defer allocator.free(manifest);
     try validateManifestRuntime(allocator, manifest, profile);
@@ -1657,7 +1668,7 @@ pub fn main(init: std.process.Init) !void {
         const path = try std.fs.path.join(allocator, &.{ work_dir, profile.source_name });
         const url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ release_base, profile.source_name });
         defer allocator.free(url);
-        try acquire(allocator, io, url, path, profile.source_sha256, source_max_size);
+        try acquire(allocator, io, url, path, profile.source_sha256, source_max_size, downloader);
         break :blk path;
     };
     defer if (args.source == null) allocator.free(source_path);
@@ -1790,6 +1801,34 @@ fn findAzureKernelRelease(listing: []const u8) ?[]const u8 {
     return null;
 }
 
+const ProfileNativeHttpsTransport = struct {
+    expected_names: []const []const u8,
+    calls: usize = 0,
+
+    fn get(
+        context_ptr: ?*anyopaque,
+        _: Allocator,
+        _: Io,
+        url: []const u8,
+        max_size: u64,
+        output: *Io.Writer,
+    ) !artifact_pipeline.NativeHttpsResponse {
+        const context: *ProfileNativeHttpsTransport = @ptrCast(@alignCast(context_ptr.?));
+        if (context.calls == context.expected_names.len or
+            !std.mem.endsWith(u8, url, context.expected_names[context.calls]) or
+            max_size != 1024)
+        {
+            return error.UnexpectedProfileAcquisition;
+        }
+        context.calls += 1;
+        try output.writeAll("profile artifact\n");
+        return .{
+            .status = 200,
+            .content_length = "profile artifact\n".len,
+        };
+    }
+};
+
 test "profiles pin immutable official sources for both architectures" {
     try std.testing.expectEqual(@as(usize, 2), profiles.len);
     for (&profiles) |*profile| {
@@ -1802,6 +1841,46 @@ test "profiles pin immutable official sources for both architectures" {
     try std.testing.expectEqual(@as(u32, 0), profiles[1].root_partition_table_index);
     try std.testing.expectEqualSlices(u8, &guid.linux_root_x86_64, &profiles[0].root_partition_type_guid);
     try std.testing.expectEqualSlices(u8, &guid.linux_root_aarch64, &profiles[1].root_partition_type_guid);
+}
+
+test "both architecture profiles acquire through the shared native HTTPS downloader" {
+    const io = std.testing.io;
+    const payload = "profile artifact\n";
+    const expected_digest = artifact_pipeline.sha256Bytes(payload);
+    const digest = artifact_pipeline.formatSha256(expected_digest);
+    var transport = ProfileNativeHttpsTransport{
+        .expected_names = &.{ profiles[0].source_name, profiles[1].source_name },
+    };
+    var https = artifact_pipeline.NativeHttpsDownloader{
+        .transport = .{ .context = &transport, .getFn = ProfileNativeHttpsTransport.get },
+    };
+    for (&profiles, 0..) |profile, index| {
+        const output_path = switch (index) {
+            0 => "test-ubuntu2604-native-amd64.img",
+            1 => "test-ubuntu2604-native-arm64.img",
+            else => unreachable,
+        };
+        Dir.cwd().deleteFile(io, output_path) catch {};
+        defer Dir.cwd().deleteFile(io, output_path) catch {};
+        const url = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{s}/{s}",
+            .{ release_base, profile.source_name },
+        );
+        defer std.testing.allocator.free(url);
+        try acquire(
+            std.testing.allocator,
+            io,
+            url,
+            output_path,
+            &digest,
+            1024,
+            https.downloader(),
+        );
+        const metadata = try artifact_pipeline.hashFile(io, output_path);
+        try std.testing.expectEqualSlices(u8, &expected_digest, &metadata.sha256);
+    }
+    try std.testing.expectEqual(profiles.len, transport.calls);
 }
 
 test "Canonical fingerprint listing accepts exactly one matching primary key" {
