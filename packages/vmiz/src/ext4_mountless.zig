@@ -482,6 +482,32 @@ pub const FileSystem = struct {
                 }
             }
         }
+        var pre_seen = std.StringHashMap(void).init(self.allocator);
+        defer {
+            var iterator = pre_seen.keyIterator();
+            while (iterator.next()) |key| self.allocator.free(key.*);
+            pre_seen.deinit();
+        }
+        try self.collectHostPaths(source, "", options, &pre_seen);
+        for (0..self.tree.nodeCount()) |index| {
+            const node = self.tree.nodeView(index);
+            if (node.kind != .file or excludedTopLevel(node.path, options.excluded_top_level) or
+                (manifest != null and manifest.?.contains(node.path)) or pre_seen.contains(node.path))
+            {
+                continue;
+            }
+            for (0..self.tree.nodeCount()) |alias_index| {
+                const alias = self.tree.nodeView(alias_index);
+                if (alias.kind != .hardlink) continue;
+                const target = switch (alias.payload) {
+                    .hardlink_target => |path| path,
+                    else => continue,
+                };
+                if (std.mem.eql(u8, target, node.path) and pre_seen.contains(alias.path)) {
+                    return error.HardlinkTargetInUse;
+                }
+            }
+        }
         var seen = std.StringHashMap(void).init(self.allocator);
         defer {
             var iterator = seen.keyIterator();
@@ -518,7 +544,33 @@ pub const FileSystem = struct {
             }
         }.less);
         for (removals.items) |path| {
-            _ = self.tree.remove(path) catch {};
+            _ = try self.tree.remove(path);
+        }
+    }
+
+    fn collectHostPaths(
+        self: *const FileSystem,
+        host_path: []const u8,
+        relative: []const u8,
+        options: HostTreeOptions,
+        seen: *std.StringHashMap(void),
+    ) Error!void {
+        var directory = try Io.Dir.cwd().openDir(self.io, host_path, .{ .iterate = true });
+        defer directory.close(self.io);
+        var iterator = directory.iterate();
+        while (try iterator.next(self.io)) |entry| {
+            const child = if (relative.len == 0)
+                try self.allocator.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ relative, entry.name });
+            defer self.allocator.free(child);
+            if (excludedTopLevel(child, options.excluded_top_level)) continue;
+            try seen.put(try self.allocator.dupe(u8, child), {});
+            if (entry.kind == .directory) {
+                const child_host = try std.fs.path.join(self.allocator, &.{ host_path, entry.name });
+                defer self.allocator.free(child_host);
+                try self.collectHostPaths(child_host, child, options, seen);
+            }
         }
     }
 
@@ -1034,6 +1086,15 @@ test "mountless round trip preserves security metadata and special nodes" {
     defer allocator.free(staged_target);
     try std.testing.expectEqualStrings("staged-alias", staged_target);
     try std.testing.expectEqual(Kind.hardlink, (try fs.stat("/usr/bin/void-alias")).kind);
+    const staged_canonical = try std.fs.path.join(allocator, &.{ host_tree_path, "etc/void" });
+    defer allocator.free(staged_canonical);
+    try Io.Dir.cwd().deleteFile(io, staged_canonical);
+    try std.testing.expectError(
+        error.HardlinkTargetInUse,
+        fs.importHostTreeWithManifest(host_tree_path, .{}, &host_manifest),
+    );
+    try std.testing.expectEqual(Kind.file, (try fs.stat("/etc/void")).kind);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = staged_canonical, .data = "staged-alias" });
     try std.testing.expectEqualSlices(u8, &([_]u8{0x45} ** 16), &fs.filesystemIdentity().uuid);
     try std.testing.expectEqualSlices(u8, "fidelity", fs.filesystemIdentity().label[0..8]);
     const locked = try fs.stat("/etc/void");
