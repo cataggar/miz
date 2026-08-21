@@ -133,6 +133,11 @@ pub const ExecutorOptions = struct {
     supervisor_timeout_ms_override: ?u64 = null,
     pidfd_mode: PidfdMode = .auto,
     pidfd_open_fn: ?PidfdOpenFn = null,
+    /// Test-only override for the path the init child reads to locate the
+    /// staging root, replacing `/proc/self/fd/N`.  It lets a test point the
+    /// bind at a different inode and prove the post-bind identity check fails
+    /// closed; production code leaves it null.
+    root_bind_path_override: ?[*:0]const u8 = null,
     run_fn: ?*const fn (
         context: ?*anyopaque,
         allocator: Allocator,
@@ -297,15 +302,21 @@ pub const Executor = struct {
 
         // The staging root is reached through the inherited descriptor only.
         // Its `/proc/self/fd/N` alias lets the init child re-resolve the exact
-        // inode inside the new mount namespace (rename-proof), and the private
-        // bind mount onto a dedicated mountpoint gives chroot a real mount root
-        // so the pseudo-filesystems below it can be mounted.
-        const root_fd_path = try std.fmt.allocPrintSentinel(
-            arena,
-            "/proc/self/fd/{d}",
-            .{self.root_dir.handle},
-            0,
-        );
+        // inode inside the new mount namespace, and the private bind mount onto
+        // a dedicated mountpoint gives chroot a real mount root so the
+        // pseudo-filesystems below it can be mounted.  The init child re-checks
+        // the bound inode against this descriptor before chroot, so a rename
+        // that races its readlink and mount fails closed instead of silently
+        // redirecting the chroot.
+        const root_fd_path: [*:0]const u8 = if (self.options.root_bind_path_override) |override|
+            override
+        else
+            (try std.fmt.allocPrintSentinel(
+                arena,
+                "/proc/self/fd/{d}",
+                .{self.root_dir.handle},
+                0,
+            )).ptr;
         const mountpoint = try std.fmt.allocPrintSentinel(
             arena,
             "/run/vmiz-offline-root-{d}-{d}",
@@ -323,7 +334,7 @@ pub const Executor = struct {
 
         var request = NamespaceRequest{
             .root_fd = self.root_dir.handle,
-            .root_fd_path = root_fd_path.ptr,
+            .root_fd_path = root_fd_path,
             .mountpoint = mountpoint.ptr,
             .argv = guest_argv_z,
             .envp = guest_envp_z,
@@ -609,12 +620,24 @@ fn namespaceChild(arg: usize) callconv(.c) u8 {
     if (request.pre_chroot_delay_ms != 0) childSleepMs(request.pre_chroot_delay_ms);
 
     // Re-resolve the staging root strictly through the inherited descriptor.
-    // `/proc/self/fd/N` names the exact inode the parent opened, so a rename of
-    // the original path cannot redirect the chroot.  Reading the link yields
-    // that inode's current path, which is bind-mounted onto a dedicated
-    // mountpoint inside this private namespace; chrooting into a real mount
-    // root is what lets the pseudo-filesystems below be mounted.  This mirrors
-    // the previous `mount --bind /proc/self/fd/$root_fd $mountpoint` step.
+    // The kernel refuses to bind-mount the `/proc/self/fd/N` symlink target
+    // directly (it returns EINVAL), so the path the descriptor currently names
+    // is read back and bind-mounted onto a dedicated mountpoint inside this
+    // private namespace; chrooting into a real mount root is what lets the
+    // pseudo-filesystems below be mounted.  This mirrors the previous
+    // `mount --bind /proc/self/fd/$root_fd $mountpoint` step.
+    //
+    // readlink followed by mount is a two-step path lookup, so a concurrent
+    // rename or replacement between them could bind a different inode than the
+    // one the parent opened.  Capture the inherited descriptor's identity first
+    // and re-verify it after the bind: a bind mount exposes the source inode
+    // unchanged, so the mountpoint must report the same device and inode and
+    // must still be a directory.  Any mismatch is detached and fails closed
+    // before the chroot can commit to the wrong tree.
+    var root_identity: linux.Statx = undefined;
+    if (linux.errno(linux.statx(request.root_fd, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &root_identity)) != .SUCCESS)
+        return childSetupFailure("stat-root");
+
     var resolved_root: [linux.PATH_MAX]u8 = undefined;
     const link_len = linux.readlink(request.root_fd_path, &resolved_root, resolved_root.len);
     if (linux.errno(link_len) != .SUCCESS or link_len >= resolved_root.len)
@@ -623,6 +646,18 @@ fn namespaceChild(arg: usize) callconv(.c) u8 {
     const resolved_root_z: [*:0]const u8 = @ptrCast(&resolved_root);
     if (linux.errno(linux.mount(resolved_root_z, request.mountpoint, null, linux.MS.BIND, 0)) != .SUCCESS)
         return childSetupFailure("bind-root");
+
+    var bound_identity: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, request.mountpoint, linux.AT.NO_AUTOMOUNT, linux.STATX.BASIC_STATS, &bound_identity)) != .SUCCESS or
+        bound_identity.ino != root_identity.ino or
+        bound_identity.dev_major != root_identity.dev_major or
+        bound_identity.dev_minor != root_identity.dev_minor or
+        (bound_identity.mode & linux.S.IFMT) != linux.S.IFDIR)
+    {
+        _ = linux.umount2(request.mountpoint, linux.MNT.DETACH);
+        return childSetupFailure("verify-root");
+    }
+
     if (linux.errno(linux.chroot(request.mountpoint)) != .SUCCESS) return childSetupFailure("chroot");
     if (linux.errno(linux.chdir("/")) != .SUCCESS) return childSetupFailure("chdir");
     _ = linux.close(request.root_fd);
@@ -1796,6 +1831,44 @@ test "privileged offline namespace contains PID1 and reaps descendants" {
     try std.testing.expectEqual(@as(?u8, 7), failed.exit_code);
     try std.testing.expectEqualStrings("boom", failed.stderr);
     try expectNoResidualOfflineMounts(io);
+
+    // Identity verification: if the path the init child resolves and binds
+    // names a different inode than the inherited root descriptor -- exactly
+    // what a rename racing the child's readlink and mount would produce -- the
+    // run must fail closed with a `verify-root` setup error before chroot, and
+    // must leave no residual mount behind.  The override points the bind at a
+    // decoy directory whose inode cannot match the real staging root.
+    {
+        const decoy_dir = try std.fs.path.join(allocator, &.{ cwd, ".scratch/offline-root-decoy" });
+        defer allocator.free(decoy_dir);
+        const decoy_link = try std.fs.path.joinZ(allocator, &.{ cwd, ".scratch/offline-root-decoy-link" });
+        defer allocator.free(decoy_link);
+        Io.Dir.cwd().deleteFile(io, decoy_link) catch {};
+        try Io.Dir.cwd().createDirPath(io, decoy_dir);
+        defer Io.Dir.cwd().deleteTree(io, decoy_dir) catch {};
+        try Io.Dir.cwd().symLink(io, decoy_dir, decoy_link, .{});
+        defer Io.Dir.cwd().deleteFile(io, decoy_link) catch {};
+
+        var decoy_executor = try Executor.init(allocator, io, .{
+            .root = &root,
+            .architecture = Architecture.host(),
+            .timeout_ms = 5 * 1000,
+            .root_bind_path_override = decoy_link.ptr,
+        });
+        defer decoy_executor.deinit();
+        const rejected = try decoy_executor.runIsolated(
+            &.{ "/bin/sh", "-c", "printf escaped > /decoy-marker" },
+            5 * 1000,
+        );
+        defer {
+            var result = rejected;
+            result.deinit(allocator);
+        }
+        try std.testing.expectEqual(CommandOutcome.failed, rejected.outcome);
+        try std.testing.expectEqual(@as(?u8, namespace_setup_failure_exit), rejected.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, rejected.stderr, "verify-root") != null);
+        try expectNoResidualOfflineMounts(io);
+    }
 
     const timed = try executor.runIsolated(
         &.{ "/bin/sh", "-c", "(sleep 10; printf alive > /descendant-marker) & sleep 10" },
