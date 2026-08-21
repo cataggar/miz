@@ -26,7 +26,7 @@ operation. vmiz exposes a package list but rejects more than one name with a
 typed diagnostic rather than silently dropping names.
 
 The immutable Zig dependency is debz commit
-`b2445dbfdd4e19e0412e934cdc04cdcd1280ced7`. At every call boundary vmiz checks
+`9cabfc0f808a8beb4709d7e5b3ae7baf19d733d5`. At every call boundary vmiz checks
 the debz capability, request, result, exact-lock, and provenance schemas before
 accepting output.
 
@@ -39,6 +39,11 @@ or publication failures return typed diagnostics with a disposable or
 recoverable disposition and never report or publish success. Download and
 planning failures delete the disposable stage; dpkg/recovery and publication
 failures retain recoverable state.
+
+Callers resolving against a preinstalled root can require a locked installed
+baseline. debz then imports every fully installed dpkg identity, binds unchanged
+packages to authenticated repository records as retained entries, and refuses
+missing packages, version drift, or architecture drift.
 
 Hermetic tests inject a typed debz product executor and cover an Ubuntu
 26.04-style resolve/review/create fixture, amd64 and arm64/foreign selection,

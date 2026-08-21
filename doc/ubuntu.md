@@ -50,7 +50,7 @@ The following inputs are compiled into the builder:
 - arm64 manifest SHA-256:
   `2889120db0432e8029f8f01622efb40ce964e434ba2c81e98937ad1e2616e4f5`
 - embedded debz API commit:
-  `b2445dbfdd4e19e0412e934cdc04cdcd1280ced7`
+  `9cabfc0f808a8beb4709d7e5b3ae7baf19d733d5`
 
 The builder first verifies the pinned checksum files, imports only the pinned
 Canonical fingerprint, verifies the detached signature, and requires exactly
@@ -60,9 +60,11 @@ expected architecture and the systemd, cloud-init, cloud-guest-utils,
 OpenSSH, sudo, and netplan packages.
 
 Each of `linux-azure` and `walinuxagent` is a separate debz transaction:
-resolve an exact closure lock, apply that same lock with strict repository
-priority and no recommends or downgrades, and retain both the exact lock and
-`transaction-result.json`. The transaction provenance's `lock_sha256` must
+resolve an exact closure lock from the Canonical image's installed dpkg
+baseline, apply that same lock with strict repository priority and no
+recommends or downgrades, and retain both the exact lock and
+`transaction-result.json`. Missing baseline packages, versions, or
+architectures fail lock generation. The transaction provenance's `lock_sha256` must
 equal the lock's semantic digest. The final sorted dpkg inventory at
 `/var/lib/vmiz/ubuntu2604-package-lock.tsv` must contain the Azure kernel,
 agent, cloud-init, and OpenSSH for the selected architecture and no foreign

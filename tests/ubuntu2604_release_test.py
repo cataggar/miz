@@ -146,7 +146,20 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                         "request_sha256": "1" * 64,
                         "policy_sha256": "2" * 64,
                         "repositories": [{"fixture": True}],
-                        "packages": [{"name": package}],
+                        "packages": [
+                            {
+                                "name": "base-files",
+                                "version": "1",
+                                "architecture": source_architecture,
+                                "retention": "retained",
+                            },
+                            {
+                                "name": package,
+                                "version": "1",
+                                "architecture": source_architecture,
+                                "retention": "requested",
+                            },
+                        ],
                         "digest_sha256": lock_digest,
                     }
                 ),
@@ -225,6 +238,10 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             },
             "debz": {
                 "api_commit": release.DEBZ_API_COMMIT,
+                "baseline": {
+                    "source": "canonical-image-dpkg-status",
+                    "enforcement": "exact-final-closure",
+                },
                 "transactions": debz_transactions,
             },
         }
@@ -602,6 +619,45 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             lambda value: value["debz"]["transactions"][0][
                 "transaction_provenance"
             ].__setitem__("lock_sha256", "0" * 64),
+        )
+        with self.assertRaises(SystemExit):
+            release.validate_ubuntu_provenance(root, "x86_64")
+
+    def test_ubuntu_provenance_requires_locked_baseline_for_both_architectures(self):
+        for key, architecture in (
+            ("x86_64-full", "x86_64"),
+            ("aarch64-full", "aarch64"),
+        ):
+            with self.subTest(architecture=architecture):
+                shutil.rmtree(self.root)
+                self.root.mkdir(parents=True)
+                self.make_bundle(key)
+                root = self.candidates / key / "internal-provenance"
+                metadata = root / release.UBUNTU_PROVENANCE_FILENAME
+                document = json.loads(metadata.read_text(encoding="utf-8"))
+                transaction = document["debz"]["transactions"][0]
+                lock_path = root / transaction["exact_lock"]["filename"]
+                lock = json.loads(lock_path.read_text(encoding="utf-8"))
+                lock["packages"] = [
+                    entry
+                    for entry in lock["packages"]
+                    if entry.get("retention") != "retained"
+                ]
+                lock_path.write_text(json.dumps(lock), encoding="utf-8")
+                transaction["exact_lock"]["sha256"] = release.sha256(lock_path)
+                metadata.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertRaises(SystemExit):
+                    release.validate_ubuntu_provenance(root, architecture)
+
+    def test_ubuntu_provenance_requires_explicit_baseline_contract(self):
+        self.make_bundle("x86_64-full")
+        root = self.candidates / "x86_64-full" / "internal-provenance"
+        metadata = root / release.UBUNTU_PROVENANCE_FILENAME
+        self.rewrite(
+            metadata,
+            lambda value: value["debz"]["baseline"].__setitem__(
+                "enforcement", "transaction-actions-only"
+            ),
         )
         with self.assertRaises(SystemExit):
             release.validate_ubuntu_provenance(root, "x86_64")
