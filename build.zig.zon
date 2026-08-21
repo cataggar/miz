@@ -6,8 +6,8 @@
 
     .dependencies = .{
         .bzip2z = .{
-            .url = "git+https://github.com/cataggar/bzip2z#23f2a1370436eef6bd91449d9b058e9951ce4e7f",
-            .hash = "bzip2z-0.1.0-m5Ndlr5TCwDY9zuWBA92qrtkSnY4GSmrgyP-pCO4h-tb",
+            .url = "git+https://github.com/cataggar/bzip2z#05f6d4e34df2da2729490aee2a5bbe43b5ce94f6",
+            .hash = "bzip2z-0.1.0-m5NdlhNXCwC5mTHdg2pgMytHjahuQP6nImdle78Pb9kO",
         },
         .tls = .{
             .url = "git+https://github.com/cataggar/tls.zig#2621e411af81c8b4d8fa5aaae08b9b183a80bb46",

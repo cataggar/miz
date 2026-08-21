@@ -805,11 +805,11 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         manifest = (ROOT / "build.zig.zon").read_text()
         self.assertIn(
             "git+https://github.com/cataggar/bzip2z"
-            "#23f2a1370436eef6bd91449d9b058e9951ce4e7f",
+            "#05f6d4e34df2da2729490aee2a5bbe43b5ce94f6",
             manifest,
         )
         self.assertIn(
-            "bzip2z-0.1.0-m5Ndlr5TCwDY9zuWBA92qrtkSnY4GSmrgyP-pCO4h-tb",
+            "bzip2z-0.1.0-m5NdlhNXCwC5mTHdg2pgMytHjahuQP6nImdle78Pb9kO",
             manifest,
         )
         self.assertNotIn("mirrors.kernel.org/sourceware/bzip2", manifest)

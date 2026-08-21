@@ -25,12 +25,12 @@ https://github.com/ctaggart/ghr/blob/main/LICENSE
 ## bzip2z
 
 Host-side firmware decompression uses `cataggar/bzip2z` at immutable commit
-`23f2a1370436eef6bd91449d9b058e9951ce4e7f`.
+`05f6d4e34df2da2729490aee2a5bbe43b5ce94f6`.
 
 Copyright (c) 2026 Peter Marreck.
 
 Licensed under the MIT License. See:
-https://github.com/cataggar/bzip2z/blob/23f2a1370436eef6bd91449d9b058e9951ce4e7f/LICENSE
+https://github.com/cataggar/bzip2z/blob/05f6d4e34df2da2729490aee2a5bbe43b5ce94f6/LICENSE
 
 ## tls.zig (test fixture only)
 
