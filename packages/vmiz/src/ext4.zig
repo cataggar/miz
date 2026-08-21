@@ -7848,7 +7848,7 @@ fn setInodeChecksum(block: []u8, uuid: [16]u8, inode_number: u32) void {
 
 fn setInodeChecksumSeed(block: []u8, checksum_seed: u32, inode_number: u32) void {
     var inode_le = std.mem.nativeToLittle(u32, inode_number);
-    var generation_le = std.mem.nativeToLittle(u32, readInt(u32, block[64..68]));
+    var generation_le = std.mem.nativeToLittle(u32, readInt(u32, block[100..104]));
     const wide = block.len >= 132 and readInt(u16, block[128..130]) >= 4;
     writeInt(u16, block[124..126], 0);
     if (wide) writeInt(u16, block[130..132], 0);
@@ -7859,6 +7859,30 @@ fn setInodeChecksumSeed(block: []u8, checksum_seed: u32, inode_number: u32) void
     });
     writeInt(u16, block[124..126], @truncate(checksum));
     if (wide) writeInt(u16, block[130..132], @truncate(checksum >> 16));
+}
+
+test "inode checksum uses i_generation rather than i_block data" {
+    var inode: [writer_inode_size]u8 = [_]u8{0} ** writer_inode_size;
+    const uuid = [_]u8{0x5a} ** 16;
+    writeInt(u16, inode[128..130], writer_extra_isize);
+    writeInt(u32, inode[64..68], 0xdead_beef);
+    writeInt(u32, inode[100..104], 0x1234_5678);
+
+    setInodeChecksum(&inode, uuid, 11);
+
+    var expected = inode;
+    writeInt(u16, expected[124..126], 0);
+    writeInt(u16, expected[130..132], 0);
+    var inode_le = std.mem.nativeToLittle(u32, 11);
+    var generation_le = std.mem.nativeToLittle(u32, 0x1234_5678);
+    const checksum = ext4Crc32c(&.{
+        &uuid,
+        std.mem.asBytes(&inode_le),
+        std.mem.asBytes(&generation_le),
+        &expected,
+    });
+    try std.testing.expectEqual(@as(u16, @truncate(checksum)), readInt(u16, inode[124..126]));
+    try std.testing.expectEqual(@as(u16, @truncate(checksum >> 16)), readInt(u16, inode[130..132]));
 }
 
 fn setSuperblockChecksum(sb: []u8) void {
