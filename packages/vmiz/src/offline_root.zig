@@ -259,25 +259,35 @@ pub const Executor = struct {
         timeout_ms: u64,
     ) !CommandResult {
         if (builtin.os.tag != .linux) return error.UnsupportedHost;
+        // The namespace's first child is chrooted before this script can
+        // mount /proc or run guest code. The host-side `std.process.run`
+        // timeout supervises the whole unshare process; the in-namespace
+        // setpriv/timeout pair drops capabilities before guest code starts,
+        // supplies a shorter command deadline, and kills its process group
+        // before the reverse unmount trap runs.
         const script =
             \\set -eu
-            \\root="$1"
-            \\shift
             \\timeout_seconds="$1"
             \\shift
-            \\cleanup() { status=$?; umount "$root/tmp" 2>/dev/null || status=125; umount "$root/run" 2>/dev/null || status=125; umount "$root/sys" 2>/dev/null || status=125; umount "$root/proc" 2>/dev/null || status=125; umount "$root/dev" 2>/dev/null || status=125; exit "$status"; }
+            \\cd /
+            \\cleanup() { status=$?; umount -n /tmp 2>/dev/null || umount -n -l /tmp 2>/dev/null || { echo tmp-cleanup-failed >&2; status=125; }; umount -n /run 2>/dev/null || umount -n -l /run 2>/dev/null || { echo run-cleanup-failed >&2; status=125; }; umount -n /sys 2>/dev/null || umount -n -l /sys 2>/dev/null || { echo sys-cleanup-failed >&2; status=125; }; umount -n /proc 2>/dev/null || umount -n -l /proc 2>/dev/null || { echo proc-cleanup-failed >&2; status=125; }; umount -n /dev 2>/dev/null || umount -n -l /dev 2>/dev/null || true; exit "$status"; }
             \\trap cleanup EXIT
-            \\mount --make-rprivate /
-            \\mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$root/dev"
-            \\mount -t proc -o nosuid,nodev,noexec proc "$root/proc"
-            \\mount -t sysfs -o ro,nosuid,nodev,noexec sysfs "$root/sys"
-            \\mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$root/run"
-            \\mount -t tmpfs -o mode=1777,nosuid,nodev,noexec tmpfs "$root/tmp"
-            \\mknod -m 666 "$root/dev/null" c 1 3
-            \\mknod -m 666 "$root/dev/zero" c 1 5
-            \\mknod -m 666 "$root/dev/random" c 1 8
-            \\mknod -m 666 "$root/dev/urandom" c 1 9
-            \\exec timeout --signal=TERM --kill-after=5s "$timeout_seconds" setsid chroot "$root" "$@"
+            \\mount -t tmpfs -o mode=0755,nosuid tmpfs /dev
+            \\mount -t proc -o nosuid,nodev,noexec proc /proc
+            \\mount -t sysfs -o ro,nosuid,nodev,noexec sysfs /sys
+            \\mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+            \\mount -t tmpfs -o mode=1777,nosuid,nodev,noexec tmpfs /tmp
+            \\mknod -m 666 /dev/null c 1 3
+            \\mknod -m 666 /dev/zero c 1 5
+            \\mknod -m 666 /dev/random c 1 8
+            \\mknod -m 666 /dev/urandom c 1 9
+            \\chmod 666 /dev/null /dev/zero /dev/random /dev/urandom
+            \\set +e
+            \\setpriv --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- timeout --signal=TERM --kill-after=5s "$timeout_seconds" "$@"
+            \\status=$?
+            \\set -e
+            \\if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then kill -KILL -1 2>/dev/null || true; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do wait 2>/dev/null || break; done; fi
+            \\exit "$status"
         ;
         var argv = std.array_list.Managed([]const u8).init(self.allocator);
         defer argv.deinit();
@@ -290,6 +300,8 @@ pub const Executor = struct {
         try argv.append("--propagation");
         try argv.append("private");
         try argv.append("--");
+        try argv.append("chroot");
+        try argv.append(self.options.root_path);
         try argv.append("/bin/sh");
         try argv.append("-c");
         try argv.append(script);
@@ -300,7 +312,6 @@ pub const Executor = struct {
             .{std.math.divCeil(u64, timeout_ms, 1000) catch return error.TimeoutOutOfRange},
         );
         try argv.append(timeout_seconds);
-        try argv.append(self.options.root_path);
         try argv.appendSlice(guest_argv);
         defer self.allocator.free(timeout_seconds);
 
@@ -384,8 +395,7 @@ pub const Root = struct {
     }
 
     pub fn writeFile(self: *Root, file: WriteFile) !void {
-        const path = try self.hostPath(file.path);
-        defer self.allocator.free(path);
+        const relative = try normalizeGuestPath(file.path);
         try self.ensureParent(file.path);
         var bytes: []u8 = undefined;
         var owned = false;
@@ -400,43 +410,56 @@ pub const Root = struct {
             },
         }
         defer if (owned) self.allocator.free(bytes);
-        const existing = Io.Dir.cwd().statFile(self.io, path, .{ .follow_symlinks = false }) catch null;
+        var root_dir = try self.openRootDir();
+        defer root_dir.close(self.io);
+        const existing = root_dir.statFile(self.io, relative, .{ .follow_symlinks = false }) catch null;
         if (existing) |stat| {
             if (stat.kind == .directory) return error.NotRegularFile;
-            Io.Dir.cwd().deleteFile(self.io, path) catch {};
+            try root_dir.deleteFile(self.io, relative);
         }
-        try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = bytes });
-        try Io.Dir.cwd().setFilePermissions(self.io, path, .fromMode(file.mode), .{});
+        try root_dir.writeFile(self.io, .{
+            .sub_path = relative,
+            .data = bytes,
+            .flags = .{
+                .exclusive = true,
+                .permissions = .fromMode(file.mode),
+                .resolve_beneath = true,
+            },
+        });
     }
 
     pub fn createDirectory(self: *Root, guest_path: []const u8, mode: u32) !void {
-        const path = try self.hostPath(guest_path);
-        defer self.allocator.free(path);
-        try Io.Dir.cwd().createDirPath(self.io, path);
-        try Io.Dir.cwd().setFilePermissions(self.io, path, .fromMode(mode), .{});
+        const relative = try normalizeGuestPath(guest_path);
+        try self.ensureSafeDirectory(relative);
+        var root_dir = try self.openRootDir();
+        defer root_dir.close(self.io);
+        try root_dir.setFilePermissions(self.io, relative, .fromMode(mode), .{ .follow_symlinks = false });
     }
 
     pub fn replaceSymlink(self: *Root, guest_path: []const u8, target: []const u8) !void {
         if (target.len == 0 or std.mem.indexOfScalar(u8, target, 0) != null) return error.InvalidSymlinkTarget;
-        const path = try self.hostPath(guest_path);
-        defer self.allocator.free(path);
+        const relative = try normalizeGuestPath(guest_path);
         try self.ensureParent(guest_path);
-        if (Io.Dir.cwd().statFile(self.io, path, .{ .follow_symlinks = false })) |stat| {
+        var root_dir = try self.openRootDir();
+        defer root_dir.close(self.io);
+        if (root_dir.statFile(self.io, relative, .{ .follow_symlinks = false })) |stat| {
             if (stat.kind == .directory) return error.NotRegularFile;
-            try Io.Dir.cwd().deleteFile(self.io, path);
+            try root_dir.deleteFile(self.io, relative);
         } else |_| {}
-        try Io.Dir.cwd().symLink(self.io, target, path, .{});
+        try root_dir.symLink(self.io, target, relative, .{});
     }
 
     pub fn remove(self: *Root, guest_path: []const u8, recursive: bool) !void {
-        const path = try self.hostPath(guest_path);
-        defer self.allocator.free(path);
-        const stat = Io.Dir.cwd().statFile(self.io, path, .{ .follow_symlinks = false }) catch
+        const relative = try normalizeGuestPath(guest_path);
+        try self.validateParentComponents(relative, false);
+        var root_dir = try self.openRootDir();
+        defer root_dir.close(self.io);
+        const stat = root_dir.statFile(self.io, relative, .{ .follow_symlinks = false }) catch
             return error.PathNotFound;
         if (stat.kind == .directory and recursive) {
-            try Io.Dir.cwd().deleteTree(self.io, path);
+            try root_dir.deleteTree(self.io, relative);
         } else {
-            try Io.Dir.cwd().deleteFile(self.io, path);
+            try root_dir.deleteFile(self.io, relative);
         }
     }
 
@@ -450,12 +473,19 @@ pub const Root = struct {
     }
 
     pub fn discover(self: *Root, guest_directory: []const u8, pattern: []const u8) ![]FoundEntry {
-        _ = try normalizeGuestPath(guest_directory);
         if (std.mem.count(u8, pattern, "*") > 1) return error.InvalidDiscoveryPattern;
-        const directory = try self.hostPath(guest_directory);
-        defer self.allocator.free(directory);
-        var dir = try Io.Dir.cwd().openDir(self.io, directory, .{ .iterate = true });
-        defer dir.close(self.io);
+        const relative = try normalizeGuestPath(guest_directory);
+        var root_dir = try self.openRootDir();
+        defer root_dir.close(self.io);
+        var dir: Io.Dir = undefined;
+        var owns_dir = false;
+        if (relative.len == 0) {
+            dir = root_dir;
+        } else {
+            dir = try root_dir.openDir(self.io, relative, .{ .iterate = true, .follow_symlinks = false });
+            owns_dir = true;
+        }
+        defer if (owns_dir) dir.close(self.io);
         var iterator = dir.iterate();
         var entries = std.array_list.Managed(FoundEntry).init(self.allocator);
         errdefer {
@@ -480,9 +510,11 @@ pub const Root = struct {
     }
 
     pub fn inspect(self: *Root, guest_path: []const u8) !Inspection {
-        const path = try self.hostPath(guest_path);
-        defer self.allocator.free(path);
-        const stat = Io.Dir.cwd().statFile(self.io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        const relative = try normalizeGuestPath(guest_path);
+        try self.validateParentComponents(relative, false);
+        var root_dir = try self.openRootDir();
+        defer root_dir.close(self.io);
+        const stat = root_dir.statFile(self.io, relative, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => return error.PathNotFound,
             else => return err,
         };
@@ -499,21 +531,37 @@ pub const Root = struct {
     }
 
     pub fn readFile(self: *Root, guest_path: []const u8) ![]u8 {
-        const path = try self.hostPath(guest_path);
-        defer self.allocator.free(path);
-        return Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(self.limits.max_file_bytes));
+        const relative = try normalizeGuestPath(guest_path);
+        try self.validateParentComponents(relative, true);
+        var root_dir = try self.openRootDir();
+        defer root_dir.close(self.io);
+        var file = try root_dir.openFile(self.io, relative, .{
+            .mode = .read_only,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        });
+        defer file.close(self.io);
+        const stat = try file.stat(self.io);
+        if (stat.kind != .file) return error.NotRegularFile;
+        if (stat.size > self.limits.max_file_bytes) return error.FileLimitExceeded;
+        const bytes = try self.allocator.alloc(u8, @intCast(stat.size));
+        errdefer self.allocator.free(bytes);
+        _ = try file.readPositionalAll(self.io, bytes, 0);
+        return bytes;
     }
 
     pub fn readLink(self: *Root, guest_path: []const u8) ![]u8 {
-        const path = try self.hostPath(guest_path);
-        defer self.allocator.free(path);
+        const relative = try normalizeGuestPath(guest_path);
+        try self.validateParentComponents(relative, false);
+        var root_dir = try self.openRootDir();
+        defer root_dir.close(self.io);
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const length = try Io.Dir.cwd().readLink(self.io, path, &buffer);
+        const length = try root_dir.readLink(self.io, relative, &buffer);
         return self.allocator.dupe(u8, buffer[0..length]);
     }
 
     pub fn validateArchitecture(self: *Root, architecture: Architecture) !void {
-        const shell = self.readFile("/bin/sh") catch return error.GuestArchitectureUnknown;
+        const shell = self.readFile("/usr/bin/dash") catch return error.GuestArchitectureUnknown;
         defer self.allocator.free(shell);
         if (shell.len < 20 or !std.mem.eql(u8, shell[0..4], "\x7fELF")) {
             return error.GuestArchitectureUnknown;
@@ -548,17 +596,69 @@ pub const Root = struct {
     fn ensureParent(self: *Root, guest_path: []const u8) !void {
         const relative = try normalizeGuestPath(guest_path);
         const parent = std.fs.path.dirname(relative) orelse return;
-        const path = try std.fs.path.join(self.allocator, &.{ self.root_path, parent });
-        defer self.allocator.free(path);
-        try Io.Dir.cwd().createDirPath(self.io, path);
+        try self.ensureSafeDirectory(parent);
     }
 
-    fn hostPath(self: *Root, guest_path: []const u8) ![]u8 {
-        const relative = try normalizeGuestPath(guest_path);
-        return if (relative.len == 0)
-            self.allocator.dupe(u8, self.root_path)
-        else
-            std.fs.path.join(self.allocator, &.{ self.root_path, relative });
+    fn openRootDir(self: *Root) !Io.Dir {
+        return Io.Dir.openDirAbsolute(self.io, self.root_path, .{
+            .access_sub_paths = true,
+            .iterate = true,
+        });
+    }
+
+    /// Traverses from an open root directory and refuses symlinked
+    /// components. The descriptor walk is the portable fallback for hosts
+    /// without openat2; no lexical prefix check is trusted for containment.
+    fn validateParentComponents(self: *Root, relative: []const u8, include_final: bool) !void {
+        var current = try Io.Dir.openDirAbsolute(self.io, self.root_path, .{ .access_sub_paths = true });
+        defer current.close(self.io);
+        if (relative.len == 0) return;
+        var components = std.mem.splitScalar(u8, relative, '/');
+        var component_index: usize = 0;
+        while (components.next()) |component| : (component_index += 1) {
+            const is_final = component_index + 1 == std.mem.count(u8, relative, "/") + 1;
+            if (is_final and !include_final) break;
+            if (is_final) {
+                const stat = current.statFile(self.io, component, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                    error.FileNotFound => return,
+                    else => return err,
+                };
+                if (stat.kind == .sym_link) return error.GuestSymlinkTraversal;
+                break;
+            }
+            const next = current.openDir(self.io, component, .{
+                .access_sub_paths = true,
+                .follow_symlinks = false,
+            }) catch |err| switch (err) {
+                error.FileNotFound => return,
+                else => return err,
+            };
+            current.close(self.io);
+            current = next;
+        }
+    }
+
+    fn ensureSafeDirectory(self: *Root, relative: []const u8) !void {
+        var current = try Io.Dir.openDirAbsolute(self.io, self.root_path, .{ .access_sub_paths = true });
+        defer current.close(self.io);
+        if (relative.len == 0) return;
+        var components = std.mem.splitScalar(u8, relative, '/');
+        while (components.next()) |component| {
+            const stat = current.statFile(self.io, component, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound => blk: {
+                    try current.createDir(self.io, component, .default_dir);
+                    break :blk try current.statFile(self.io, component, .{ .follow_symlinks = false });
+                },
+                else => return err,
+            };
+            if (stat.kind != .directory) return error.NotDirectory;
+            const next = try current.openDir(self.io, component, .{
+                .access_sub_paths = true,
+                .follow_symlinks = false,
+            });
+            current.close(self.io);
+            current = next;
+        }
     }
 };
 
@@ -677,6 +777,55 @@ test "offline root applies structured operations and cleans up" {
     try std.testing.expectError(error.PathNotFound, root.inspect("/var/log/stale"));
 }
 
+test "offline root refuses intermediate symlink escapes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const root_path = try std.fs.path.join(allocator, &.{ cwd, "test-offline-root-symlink-root" });
+    defer allocator.free(root_path);
+    const outside_path = try std.fs.path.join(allocator, &.{ cwd, "test-offline-root-symlink-outside" });
+    defer allocator.free(outside_path);
+    Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    Io.Dir.cwd().deleteTree(io, outside_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, outside_path) catch {};
+    const safe_path = try std.fs.path.join(allocator, &.{ root_path, "safe" });
+    defer allocator.free(safe_path);
+    try Io.Dir.cwd().createDirPath(io, safe_path);
+    try Io.Dir.cwd().createDirPath(io, outside_path);
+    const sentinel = try std.fs.path.join(allocator, &.{ outside_path, "sentinel" });
+    defer allocator.free(sentinel);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = sentinel, .data = "unchanged" });
+
+    const etc_path = try std.fs.path.join(allocator, &.{ root_path, "etc" });
+    defer allocator.free(etc_path);
+    try Io.Dir.cwd().symLink(io, outside_path, etc_path, .{});
+    const nested_path = try std.fs.path.join(allocator, &.{ root_path, "safe/nested" });
+    defer allocator.free(nested_path);
+    try Io.Dir.cwd().symLink(io, outside_path, nested_path, .{});
+
+    var root = try Root.init(allocator, io, root_path, .{});
+    for ([_][]const u8{ "/etc/escape", "/safe/nested/escape" }) |guest_path| {
+        root.writeFile(.{
+            .path = guest_path,
+            .source = .{ .inline_bytes = "must-not-write" },
+        }) catch |err| {
+            try std.testing.expect(
+                err == error.NotDir or
+                    err == error.NotDirectory or
+                    err == error.GuestSymlinkTraversal or
+                    err == error.SymLinkLoop,
+            );
+            continue;
+        };
+        return error.SymlinkEscapeAccepted;
+    }
+    const unchanged = try Io.Dir.cwd().readFileAlloc(io, sentinel, allocator, .limited(1024));
+    defer allocator.free(unchanged);
+    try std.testing.expectEqualStrings("unchanged", unchanged);
+}
+
 const FakeRunner = struct {
     outcome: CommandOutcome,
     exit_code: ?u8 = 0,
@@ -753,4 +902,61 @@ test "offline executor enforces architecture, allowlist, timeout, and failure" {
     defer failure_executor.deinit();
     try std.testing.expectError(error.CommandFailed, failure_executor.execute(.{ .update_initramfs = "6.0.0-azure" }));
     try std.testing.expectEqual(@as(u64, 300 * 1000), failure.timeout_ms);
+}
+
+test "privileged offline namespace contains PID1 and reaps descendants" {
+    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0) {
+        std.debug.print("skipping offline-root containment test: root Linux runner required\n", .{});
+        return;
+    }
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const fixture = try std.fs.path.join(allocator, &.{ cwd, ".scratch/offline-root-integration-root" });
+    defer allocator.free(fixture);
+    if (Io.Dir.cwd().statFile(io, fixture, .{ .follow_symlinks = false })) |_| {} else |_| {
+        std.debug.print("skipping offline-root containment test: integration root fixture missing\n", .{});
+        return;
+    }
+    const sentinel = try std.fs.path.join(allocator, &.{ cwd, ".scratch/offline-root-host-sentinel" });
+    defer allocator.free(sentinel);
+    const marker = try std.fs.path.join(allocator, &.{ fixture, "descendant-marker" });
+    defer allocator.free(marker);
+    Io.Dir.cwd().deleteFile(io, sentinel) catch {};
+    Io.Dir.cwd().deleteFile(io, marker) catch {};
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = sentinel, .data = "unchanged" });
+    defer Io.Dir.cwd().deleteFile(io, sentinel) catch {};
+
+    var executor = try Executor.init(allocator, io, .{
+        .root_path = fixture,
+        .architecture = Architecture.host(),
+        .timeout_ms = 5 * 1000,
+    });
+    defer executor.deinit();
+    const probe = try executor.runIsolated(
+        &.{ "/bin/sh", "-c", "printf escaped > \"/proc/1/root$1\"", "probe", sentinel },
+        5 * 1000,
+    );
+    defer {
+        var result = probe;
+        result.deinit(allocator);
+    }
+    const sentinel_bytes = try Io.Dir.cwd().readFileAlloc(io, sentinel, allocator, .limited(1024));
+    defer allocator.free(sentinel_bytes);
+    try std.testing.expectEqualStrings("unchanged", sentinel_bytes);
+
+    const timed = try executor.runIsolated(
+        &.{ "/bin/sh", "-c", "(sleep 10; printf alive > /descendant-marker) & sleep 10" },
+        1 * 1000,
+    );
+    defer {
+        var result = timed;
+        result.deinit(allocator);
+    }
+    try std.testing.expectEqual(CommandOutcome.timed_out, timed.outcome);
+    try Io.sleep(io, .fromSeconds(2), .real);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, marker, .{ .follow_symlinks = false }));
+    Io.Dir.cwd().access(io, fixture, .{ .read = true, .execute = true }) catch
+        return error.OfflineRootTeardownIncomplete;
 }

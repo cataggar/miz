@@ -662,6 +662,43 @@ fn runOfflineCommand(
     return executor.execute(command);
 }
 
+fn validateNativeBootArtifacts(
+    allocator: Allocator,
+    root: *offline_root.Root,
+    release_name: []const u8,
+) !void {
+    const modules_path = try std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{release_name});
+    defer allocator.free(modules_path);
+    const modules = try root.discover(modules_path, "*");
+    defer root.freeFound(modules);
+    if (modules.len == 0) return error.AzureKernelModulesMissing;
+    const modules_dep_path = try std.fmt.allocPrint(allocator, "{s}/modules.dep", .{modules_path});
+    defer allocator.free(modules_dep_path);
+    const modules_dep = root.inspect(modules_dep_path) catch |err| switch (err) {
+        error.PathNotFound => return error.KernelModulesDependencyMissing,
+        else => return err,
+    };
+    defer allocator.free(modules_dep.path);
+    if (modules_dep.kind != .file) return error.KernelModulesDependencyMissing;
+    const initrd_path = try std.fmt.allocPrint(allocator, "/boot/initrd.img-{s}", .{release_name});
+    defer allocator.free(initrd_path);
+    const initrd = root.inspect(initrd_path) catch |err| switch (err) {
+        error.PathNotFound => return error.InitramfsMissing,
+        else => return err,
+    };
+    defer allocator.free(initrd.path);
+    if (initrd.kind != .file or initrd.size == 0) return error.InitramfsMissing;
+}
+
+fn validateUkiBytes(
+    fallback_bytes: []const u8,
+    named_bytes: []const u8,
+    profile: *const Profile,
+) !void {
+    if (!std.mem.eql(u8, fallback_bytes, named_bytes)) return error.FinalUkiMissing;
+    if (try peMachine(fallback_bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
+}
+
 fn customizeOfflineRoot(
     allocator: Allocator,
     io: Io,
@@ -737,16 +774,7 @@ fn customizeOfflineRoot(
         .{ .replace_symlink = .{ .path = "/etc/resolv.conf", .target = "/run/systemd/resolve/stub-resolv.conf" } },
     });
 
-    const modules_path = try std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{release_name});
-    defer allocator.free(modules_path);
-    const modules = try root.discover(modules_path, "*");
-    defer root.freeFound(modules);
-    if (modules.len == 0) return error.AzureKernelModulesMissing;
-    const modules_dep_path = try std.fmt.allocPrint(allocator, "{s}/modules.dep", .{modules_path});
-    defer allocator.free(modules_dep_path);
-    const modules_dep = try root.inspect(modules_dep_path);
-    defer allocator.free(modules_dep.path);
-    if (modules_dep.kind != .file) return error.KernelModulesDependencyMissing;
+    try validateNativeBootArtifacts(allocator, &root, release_name);
 
     var initramfs = try runOfflineCommand(&executor, .{ .update_initramfs = release_name });
     defer initramfs.deinit(allocator);
@@ -785,11 +813,10 @@ fn customizeOfflineRoot(
         .{ .cleanup = .{ .directory = "/var/tmp", .pattern = "*" } },
     });
 
+    const modules_path = try std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{release_name});
+    defer allocator.free(modules_path);
     const initrd_path = try std.fmt.allocPrint(allocator, "/boot/initrd.img-{s}", .{release_name});
     defer allocator.free(initrd_path);
-    const initrd = try root.inspect(initrd_path);
-    defer allocator.free(initrd.path);
-    if (initrd.kind != .file or initrd.size == 0) return error.InitramfsMissing;
     for ([_][]const u8{
         "/etc/ssh/ssh_host_*",
         "/var/lib/cloud/*",
@@ -1442,8 +1469,7 @@ fn validateFinalNativeImage(
     defer allocator.free(fallback_bytes);
     const named_bytes = try filesystem.readFileAlloc(io, allocator, named);
     defer allocator.free(named_bytes);
-    if (!std.mem.eql(u8, fallback_bytes, named_bytes)) return error.FinalUkiMissing;
-    if (try peMachine(fallback_bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
+    try validateUkiBytes(fallback_bytes, named_bytes, profile);
     _ = work_dir;
 }
 
@@ -1518,7 +1544,7 @@ pub fn main(init: std.process.Init) !void {
         return error.ChecksumMismatch;
     if (args.preflight_only) return;
 
-    for (&[_][]const u8{ "qemu-img", "ukify", "sbverify", "unshare", "mount", "umount", "chroot", "mknod", "timeout", "setsid" }) |tool|
+    for (&[_][]const u8{ "qemu-img", "ukify", "sbverify", "unshare", "mount", "umount", "chroot", "mknod", "timeout" }) |tool|
         try requireTool(allocator, io, tool);
     const config = try signingConfig(args);
 
@@ -1834,6 +1860,66 @@ test "Azure kernel discovery is architecture-neutral and exact" {
         findAzureKernelRelease("config\nvmlinuz-7.0.0-1001-azure\n").?,
     );
     try std.testing.expect(findAzureKernelRelease("vmlinuz-7.0.0-28-generic\n") == null);
+}
+
+test "native boot validation rejects missing modules.dep and initramfs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const root_path = try std.fs.path.join(allocator, &.{ cwd, ".scratch/ubuntu-native-boot-validation" });
+    defer allocator.free(root_path);
+    Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, root_path);
+    var root = try offline_root.Root.init(allocator, io, root_path, .{});
+    try root.createDirectory("/lib/modules/7.0.0-1001-azure", 0o755);
+    try root.createDirectory("/boot", 0o755);
+    try root.writeFile(.{
+        .path = "/lib/modules/7.0.0-1001-azure/kernel",
+        .source = .{ .inline_bytes = "module" },
+    });
+    try root.writeFile(.{
+        .path = "/boot/initrd.img-7.0.0-1001-azure",
+        .source = .{ .inline_bytes = "initrd" },
+    });
+    try std.testing.expectError(
+        error.KernelModulesDependencyMissing,
+        validateNativeBootArtifacts(allocator, &root, "7.0.0-1001-azure"),
+    );
+    try root.writeFile(.{
+        .path = "/lib/modules/7.0.0-1001-azure/modules.dep",
+        .source = .{ .inline_bytes = "" },
+    });
+    try validateNativeBootArtifacts(allocator, &root, "7.0.0-1001-azure");
+    try root.remove("/lib/modules/7.0.0-1001-azure/modules.dep", false);
+    try std.testing.expectError(
+        error.KernelModulesDependencyMissing,
+        validateNativeBootArtifacts(allocator, &root, "7.0.0-1001-azure"),
+    );
+    try root.writeFile(.{
+        .path = "/lib/modules/7.0.0-1001-azure/modules.dep",
+        .source = .{ .inline_bytes = "" },
+    });
+    try root.remove("/boot/initrd.img-7.0.0-1001-azure", false);
+    try std.testing.expectError(
+        error.InitramfsMissing,
+        validateNativeBootArtifacts(allocator, &root, "7.0.0-1001-azure"),
+    );
+}
+
+test "native ESP UKI validation preserves exact signed bytes and machine" {
+    var uki: [0x86]u8 = @splat(0);
+    @memcpy(uki[0..2], "MZ");
+    std.mem.writeInt(u32, uki[0x3c..0x40], 0x80, .little);
+    @memcpy(uki[0x80..0x84], "PE\x00\x00");
+    std.mem.writeInt(u16, uki[0x84..0x86], 0x8664, .little);
+    try validateUkiBytes(&uki, &uki, profileFor(.x86_64));
+    var different = uki;
+    different[0x85] ^= 1;
+    try std.testing.expectError(error.FinalUkiMissing, validateUkiBytes(&uki, &different, profileFor(.x86_64)));
+    std.mem.writeInt(u16, uki[0x84..0x86], 0xaa64, .little);
+    try std.testing.expectError(error.WrongUkiArchitecture, validateUkiBytes(&uki, &uki, profileFor(.x86_64)));
 }
 
 test "UKI architecture validation parses the PE machine field" {
