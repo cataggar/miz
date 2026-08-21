@@ -180,7 +180,7 @@ vmiz/
   qmp/                      # native Zig QEMU Machine Protocol (QMP) client,
                               #   MIT licensed (see qmp/README.md)
   qemu/
-    bzip2.zig               # embedded bzip2 streaming decoder binding
+    bzip2.zig               # bounded bzip2z streaming decoder adapter
     host.zig                # shared host QEMU executable + OVMF discovery
   nbd/                      # native Zig NBD client + reference server, MIT
                               #   licensed (see nbd/README.md)

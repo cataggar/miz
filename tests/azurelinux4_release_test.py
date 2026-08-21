@@ -796,23 +796,24 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertIn("ref: ${{ github.sha }}", acceptance)
         self.assertIn("path: release-source", acceptance)
         self.assertIn("working-directory: release-source", acceptance)
-        self.assertIn(
-            '--build-file "$GITHUB_WORKSPACE/vendor/zig-bzip2/build.zig"',
-            acceptance,
-        )
+        self.assertNotIn("vendor/zig-bzip2", acceptance)
+        self.assertNotIn("--build-file", acceptance)
         self.assertIn(
             "VMIZ: ${{ github.workspace }}/release-source/zig-out/bin/vmiz",
             acceptance,
         )
-        bzip2_manifest = (ROOT / "vendor/zig-bzip2/build.zig.zon").read_text()
+        manifest = (ROOT / "build.zig.zon").read_text()
         self.assertIn(
-            "https://mirrors.kernel.org/sourceware/bzip2/bzip2-1.0.8.tar.gz",
-            bzip2_manifest,
+            "git+https://github.com/cataggar/bzip2z"
+            "#05f6d4e34df2da2729490aee2a5bbe43b5ce94f6",
+            manifest,
         )
         self.assertIn(
-            "N-V-__8AAEg_LwBxlEVzMYnlhoZahVvdwk6ddIRturUKBCXF",
-            bzip2_manifest,
+            "bzip2z-0.1.0-m5NdlhNXCwC5mTHdg2pgMytHjahuQP6nImdle78Pb9kO",
+            manifest,
         )
+        self.assertNotIn("mirrors.kernel.org/sourceware/bzip2", manifest)
+        self.assertFalse((ROOT / "vendor/zig-bzip2").exists())
 
     def test_azure_acceptance_allows_arm64_without_temporary_resource_disk(self):
         script = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()

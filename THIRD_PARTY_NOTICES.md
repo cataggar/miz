@@ -22,15 +22,15 @@ Copyright (c) 2026 Cameron Taggart.
 Licensed under the MIT License. See:
 https://github.com/ctaggart/ghr/blob/main/LICENSE
 
-## zig-bzip2
+## bzip2z
 
-This project vendors the `silver-signal/zig-bzip2` Zig build wrapper, version
-1.0.8.
+Host-side firmware decompression uses `cataggar/bzip2z` at immutable commit
+`05f6d4e34df2da2729490aee2a5bbe43b5ce94f6`.
 
-Copyright (c) 2024 silver-signal contributors.
+Copyright (c) 2026 Peter Marreck.
 
 Licensed under the MIT License. See:
-https://github.com/silver-signal/zig-bzip2/blob/1.0.8/LICENSE
+https://github.com/cataggar/bzip2z/blob/05f6d4e34df2da2729490aee2a5bbe43b5ce94f6/LICENSE
 
 ## tls.zig (test fixture only)
 
@@ -42,17 +42,6 @@ Copyright (c) tls.zig contributors.
 
 Licensed under the MIT License. See:
 https://github.com/cataggar/tls.zig/blob/2621e411af81c8b4d8fa5aaae08b9b183a80bb46/LICENSE
-
-## bzip2
-
-This project statically links bzip2 version 1.0.8.
-
-Copyright (c) 1996-2019 Julian R Seward.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the conditions in the bzip2 1.0.8
-license are met. See:
-https://sourceware.org/bzip2/1.0.8/LICENSE
 
 ## debz
 

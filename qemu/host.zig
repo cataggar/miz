@@ -631,72 +631,22 @@ fn decompressBzip2Firmware(
     destination: Io.File,
     max_output_size: u64,
 ) !u64 {
-    var decoder: bzip2.Decoder = undefined;
-    try decoder.init();
-    defer decoder.deinit();
-
     var input_buffer: [64 * 1024]u8 = undefined;
+    var source_reader = source.reader(io, &input_buffer);
+    var limited_reader = source_reader.interface.limited(
+        .limited64(source_size),
+        &.{},
+    );
     var output_buffer: [64 * 1024]u8 = undefined;
-    var source_offset: u64 = 0;
-    var destination_offset: u64 = 0;
-    var finished = false;
-
-    while (source_offset < source_size and !finished) {
-        const input_length: usize = @intCast(
-            @min(source_size - source_offset, input_buffer.len),
-        );
-        const read = try source.readPositionalAll(
-            io,
-            input_buffer[0..input_length],
-            source_offset,
-        );
-        if (read != input_length) return error.FirmwareSourceShortRead;
-
-        var input_offset: usize = 0;
-        while (input_offset < read) {
-            const step = try decoder.step(
-                input_buffer[input_offset..read],
-                &output_buffer,
-            );
-            if (step.consumed == 0 and step.produced == 0)
-                return error.InvalidBzip2Data;
-            input_offset += step.consumed;
-            if (step.produced > max_output_size - destination_offset)
-                return error.FirmwareTooLarge;
-            try destination.writePositionalAll(
-                io,
-                output_buffer[0..step.produced],
-                destination_offset,
-            );
-            destination_offset += step.produced;
-
-            if (step.finished) {
-                if (input_offset != read or source_offset + read != source_size)
-                    return error.TrailingBzip2Data;
-                finished = true;
-                break;
-            }
-        }
-        source_offset += read;
-    }
-    while (!finished) {
-        const step = try decoder.step(&.{}, &output_buffer);
-        if (step.produced > max_output_size - destination_offset)
-            return error.FirmwareTooLarge;
-        try destination.writePositionalAll(
-            io,
-            output_buffer[0..step.produced],
-            destination_offset,
-        );
-        destination_offset += step.produced;
-        if (step.finished) {
-            finished = true;
-            break;
-        }
-        if (step.produced == 0) break;
-    }
-    if (!finished) return error.TruncatedBzip2Data;
-    return destination_offset;
+    var output_writer = destination.writer(io, &output_buffer);
+    try bzip2.decompressStream(
+        std.heap.page_allocator,
+        &limited_reader.interface,
+        &output_writer.interface,
+        max_output_size,
+    );
+    try output_writer.interface.flush();
+    return output_writer.logicalPos();
 }
 
 fn sameFileSnapshot(a: Io.File.Stat, b: Io.File.Stat) bool {
@@ -1173,6 +1123,64 @@ test "truncated and CRC-invalid compressed firmware publish nothing" {
     );
     try std.testing.expect(!try pathAccessible(io, truncated_dest, .{ .read = true }));
     try std.testing.expect(!try pathAccessible(io, invalid_dest, .{ .read = true }));
+}
+
+test "trailing and concatenated compressed firmware publish nothing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const compressed_hex = "425a6839314159265359b2fb814a0000031180000223265480200022000f508069a6872f849c1e4e188f177245385090b2fb814a";
+    var compressed: [compressed_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&compressed, compressed_hex);
+    var trailing: [compressed.len + 1]u8 = undefined;
+    @memcpy(trailing[0..compressed.len], &compressed);
+    trailing[compressed.len] = 0;
+    var concatenated: [compressed.len * 2]u8 = undefined;
+    @memcpy(concatenated[0..compressed.len], &compressed);
+    @memcpy(concatenated[compressed.len..], &compressed);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "trailing.bz2",
+        .data = &trailing,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "concatenated.bz2",
+        .data = &concatenated,
+    });
+
+    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    const trailing_source = try std.fs.path.join(allocator, &.{ root, "trailing.bz2" });
+    defer allocator.free(trailing_source);
+    const concatenated_source = try std.fs.path.join(allocator, &.{ root, "concatenated.bz2" });
+    defer allocator.free(concatenated_source);
+    const trailing_dest = try std.fs.path.join(allocator, &.{ root, "trailing.fd" });
+    defer allocator.free(trailing_dest);
+    const concatenated_dest = try std.fs.path.join(allocator, &.{ root, "concatenated.fd" });
+    defer allocator.free(concatenated_dest);
+
+    try std.testing.expectError(
+        error.TrailingBzip2Data,
+        materializeFirmwareFile(
+            io,
+            .{ .path = trailing_source, .encoding = .bzip2 },
+            trailing_dest,
+            .{},
+        ),
+    );
+    try std.testing.expectError(
+        error.TrailingBzip2Data,
+        materializeFirmwareFile(
+            io,
+            .{ .path = concatenated_source, .encoding = .bzip2 },
+            concatenated_dest,
+            .{},
+        ),
+    );
+    try std.testing.expect(!try pathAccessible(io, trailing_dest, .{ .read = true }));
+    try std.testing.expect(!try pathAccessible(io, concatenated_dest, .{ .read = true }));
 }
 
 test "firmware materialization enforces output size limits" {
