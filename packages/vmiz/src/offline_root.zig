@@ -636,6 +636,38 @@ test "offline command validation is fail closed" {
         defer args.deinit();
         break :blk executor.appendCommand(&args, .{ .update_initramfs = "../bad" });
     });
+    try std.testing.expectError(error.InvalidServiceName, blk: {
+        var executor = Executor{
+            .allocator = std.testing.allocator,
+            .io = undefined,
+            .options = .{
+                .root_path = "/",
+                .architecture = Architecture.host(),
+                .require_privileged_namespace = false,
+            },
+            .records = .init(std.testing.allocator),
+        };
+        defer executor.deinit();
+        var args = std.array_list.Managed([]const u8).init(std.testing.allocator);
+        defer args.deinit();
+        break :blk executor.appendCommand(&args, .{ .systemctl_enable = &.{"ssh.service;touch"} });
+    });
+    try std.testing.expectError(error.InvalidUsername, blk: {
+        var executor = Executor{
+            .allocator = std.testing.allocator,
+            .io = undefined,
+            .options = .{
+                .root_path = "/",
+                .architecture = Architecture.host(),
+                .require_privileged_namespace = false,
+            },
+            .records = .init(std.testing.allocator),
+        };
+        defer executor.deinit();
+        var args = std.array_list.Managed([]const u8).init(std.testing.allocator);
+        defer args.deinit();
+        break :blk executor.appendCommand(&args, .{ .account_cleanup = "root;rm" });
+    });
 }
 
 test "offline root applies structured operations and cleans up" {
