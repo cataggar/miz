@@ -9594,7 +9594,7 @@ test "a real e2fsprogs pinned profile survives import and native growth" {
         "-b",
         "4096",
         "-O",
-        "64bit,flex_bg,metadata_csum,orphan_file,resize_inode,dir_index,has_journal",
+        "64bit,flex_bg,metadata_csum,metadata_csum_seed,orphan_file,resize_inode,dir_index,has_journal",
         path,
         try std.fmt.bufPrint(&blocks_text, "{d}", .{length / default_block_size}),
     });
@@ -9611,9 +9611,12 @@ test "a real e2fsprogs pinned profile survives import and native growth" {
     // The superblock bitfields are the semantic oracle. dumpe2fs feature
     // labels have changed across e2fsprogs releases, so do not make a
     // particular token spelling or ordering part of the acceptance test.
-    try std.testing.expectEqual(@as(u32, 0x103c), readInt(u32, raw_sb[0x5C..0x60]));
-    try std.testing.expectEqual(@as(u32, 0x22c2), readInt(u32, raw_sb[0x60..0x64]));
-    try std.testing.expectEqual(@as(u32, 0x046b), readInt(u32, raw_sb[0x64..0x68]));
+    const raw_compat = readInt(u32, raw_sb[0x5C..0x60]);
+    const raw_incompat = readInt(u32, raw_sb[0x60..0x64]);
+    const raw_ro_compat = readInt(u32, raw_sb[0x64..0x68]);
+    try std.testing.expectEqual(@as(u32, 0x103c), raw_compat);
+    try std.testing.expectEqual(@as(u32, 0x22c2), raw_incompat);
+    try std.testing.expectEqual(@as(u32, 0x046b), raw_ro_compat);
     const report = (try runToolCapture(
         std.testing.allocator,
         "dumpe2fs",
