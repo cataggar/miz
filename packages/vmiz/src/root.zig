@@ -67,6 +67,7 @@ pub const root_tree = @import("root_tree.zig");
 pub const identity_rewrite = @import("identity_rewrite.zig");
 pub const preserved_image = @import("preserved_image.zig");
 pub const os_customization = @import("os_customization.zig");
+pub const offline_root = @import("offline_root.zig");
 pub const customization_wire = @import("customization_wire.zig");
 pub const preserved_image_wire = @import("preserved_image_wire.zig");
 pub const unsafe_chroot = @import("unsafe_chroot.zig");

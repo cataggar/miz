@@ -197,21 +197,15 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           packages=(
-            binutils cpio curl file gnupg jq libguestfs-tools liblzma-dev
+            binutils cpio curl file gnupg jq liblzma-dev
             libzstd-dev linux-image-generic openssl
             python3 python3-pefile qemu-utils sbsigntool systemd-ukify
-            tar xorriso xz-utils zstd
+            util-linux xorriso xz-utils zstd
           )
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
           sudo chmod 0644 /boot/vmlinuz-*
-          if [[ -e /dev/kvm ]]; then
-            sudo chmod 0666 /dev/kvm
-          else
-            echo "LIBGUESTFS_BACKEND_SETTINGS=force_tcg" >> "$GITHUB_ENV"
-          fi
-          for tool in curl guestfish gpg qemu-img sbverify tar ukify virt-cat \
-            virt-copy-in virt-copy-out virt-customize virt-filesystems virt-ls \
-            virt-resize virt-tar-in virt-tar-out xorriso; do
+          for tool in curl gpg mount mknod qemu-img sbverify chroot ukify \
+            unshare xorriso; do
             command -v "$tool" >/dev/null
           done
 
@@ -291,7 +285,7 @@ jobs:
           mkdir -p "$BUNDLE_DIR/internal-provenance"
           mkdir -p "$GITHUB_WORKSPACE/$WORK_DIR"
           build_log="$GITHUB_WORKSPACE/$WORK_DIR/build.log"
-          zig build \
+          sudo -E "$(command -v zig)" build \
             -Dubuntu2604-arch="$ARCHITECTURE" \
             generalized-ubuntu2604 -- \
             --work-dir "$GITHUB_WORKSPACE/$WORK_DIR" \
@@ -303,6 +297,7 @@ jobs:
             --uki-sign-command "$UKI_SIGN_COMMAND" \
             --uki-sign-command-arg sign \
             2>&1 | tee "$build_log"
+          sudo chown -R "$(id -u):$(id -g)" "$WORK_DIR" "$BUNDLE_DIR"
           cp "$build_log" "$BUNDLE_DIR/internal-provenance/build.log"
 
       - name: Validate standalone zstd QCOW2 and exact 5 GiB size
