@@ -20,7 +20,7 @@ test "public consumer can model lock review and locked creation" {
     };
     try std.testing.expectEqual(package_family.Operation.resolve_lock, resolve.operation);
     try std.testing.expectEqualStrings(
-        "f46153f8d3d0318969104ed23d172ead8256c1ac",
+        "b2445dbfdd4e19e0412e934cdc04cdcd1280ced7",
         package_family.debz_api_commit,
     );
 }

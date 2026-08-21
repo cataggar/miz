@@ -13,8 +13,8 @@
             .hash = "tls-0.1.0-ER2e0vpTBgCVdP6tvFCii9_PFjATLb23ht2_xbGy5mYU",
         },
         .debz = .{
-            .url = "git+https://github.com/cataggar/debz.git#f46153f8d3d0318969104ed23d172ead8256c1ac",
-            .hash = "debz-0.1.0-Mmw8sIT3GADuq7AvzYY7bMsHt6r6tP3T4SsFzgp3X7mY",
+            .url = "git+https://github.com/cataggar/debz.git#b2445dbfdd4e19e0412e934cdc04cdcd1280ced7",
+            .hash = "debz-0.2.0-Mmw8sC7-GABX4-gvs8mOnQ9quW_Crb3G8QDdZKxIBdOD",
         },
         .rpmz = .{
             .url = "git+https://github.com/cataggar/rpmz#15b5e1291a9fc3eb3980a4088d757b9d0254d468",
