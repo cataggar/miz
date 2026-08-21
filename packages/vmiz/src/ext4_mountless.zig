@@ -25,6 +25,10 @@ pub const OpenOptions = struct {
     offset: u64 = 0,
     length: u64,
     spool_path: []const u8,
+    /// Path of the image file to replace on commit. Commits are refused
+    /// without this so a caller cannot accidentally mutate the original
+    /// partition in place.
+    atomic_path: ?[]const u8 = null,
     limits: Limits = .{},
     diagnostic: ?*limits_mod.Diagnostic = null,
 };
@@ -34,6 +38,28 @@ pub const HostTreeOptions = struct {
     /// Runtime-only directories are represented by their mount points in a
     /// package-manager root and must remain untouched in the ext4 tree.
     excluded_top_level: []const []const u8 = &.{ "dev", "proc", "run", "sys" },
+};
+
+pub const HostTreeManifest = struct {
+    allocator: Allocator,
+    excluded_paths: std.array_list.Managed([]u8),
+
+    pub fn init(allocator: Allocator) HostTreeManifest {
+        return .{ .allocator = allocator, .excluded_paths = .init(allocator) };
+    }
+
+    pub fn deinit(self: *HostTreeManifest) void {
+        for (self.excluded_paths.items) |path| self.allocator.free(path);
+        self.excluded_paths.deinit();
+        self.* = undefined;
+    }
+
+    fn contains(self: *const HostTreeManifest, path: []const u8) bool {
+        for (self.excluded_paths.items) |excluded| {
+            if (std.mem.eql(u8, excluded, path)) return true;
+        }
+        return false;
+    }
 };
 
 pub const Error = anyerror;
@@ -48,6 +74,8 @@ pub const FileSystem = struct {
     offset: u64,
     length: u64,
     identity: ext4.GeneralFilesystemIdentity,
+    atomic_path: ?[]const u8,
+    source_inode: Io.File.INode,
     committed: bool = false,
 
     /// Opens and imports an ext4 partition without mounting it. The source
@@ -63,8 +91,13 @@ pub const FileSystem = struct {
         if (options.spool_path.len == 0) return error.InvalidSpoolPath;
         const end = std.math.add(u64, options.offset, options.length) catch
             return error.InvalidRange;
-        const file_size = (try file.stat(io)).size;
+        const file_stat = try file.stat(io);
+        const file_size = file_stat.size;
         if (end > file_size) return error.InvalidRange;
+        if (options.atomic_path) |atomic_path| {
+            const atomic_stat = try Io.Dir.cwd().statFile(io, atomic_path, .{});
+            if (atomic_stat.inode != file_stat.inode) return error.AtomicSourceChanged;
+        }
 
         var reader = try ext4.openGeneral(io, file, allocator, .{ .offset = options.offset });
         errdefer reader.deinit();
@@ -102,6 +135,8 @@ pub const FileSystem = struct {
             .offset = options.offset,
             .length = options.length,
             .identity = source.identity,
+            .atomic_path = options.atomic_path,
+            .source_inode = file_stat.inode,
         };
     }
 
@@ -227,8 +262,17 @@ pub const FileSystem = struct {
         metadata: ?Metadata,
     ) Error!void {
         try self.ensureMutable();
-        const relative = try normalizePath(path);
-        const existing = self.tree.findNode(relative);
+        var relative = try normalizePath(path);
+        var existing = self.tree.findNode(relative);
+        if (existing) |entry| {
+            if (entry.kind == .hardlink) {
+                relative = switch (entry.payload) {
+                    .hardlink_target => |target| target,
+                    else => return error.NotRegularFile,
+                };
+                existing = self.tree.findNode(relative);
+            }
+        }
         const selected = metadata orelse if (existing) |entry|
             entry.metadata
         else
@@ -271,8 +315,17 @@ pub const FileSystem = struct {
         defer source.close(self.io);
         const source_stat = try source.stat(self.io);
         if (source_stat.kind != .file) return error.HostSourceNotRegularFile;
-        const relative = try normalizePath(destination);
-        const existing = self.tree.findNode(relative);
+        var relative = try normalizePath(destination);
+        var existing = self.tree.findNode(relative);
+        if (existing) |entry| {
+            if (entry.kind == .hardlink) {
+                relative = switch (entry.payload) {
+                    .hardlink_target => |target| target,
+                    else => return error.NotRegularFile,
+                };
+                existing = self.tree.findNode(relative);
+            }
+        }
         const selected = metadata orelse if (existing) |entry|
             entry.metadata
         else
@@ -304,10 +357,22 @@ pub const FileSystem = struct {
         destination: []const u8,
         options: HostTreeOptions,
     ) Error!void {
+        return self.exportHostTreeWithManifest(destination, options, null);
+    }
+
+    pub fn exportHostTreeWithManifest(
+        self: *const FileSystem,
+        destination: []const u8,
+        options: HostTreeOptions,
+        manifest: ?*HostTreeManifest,
+    ) Error!void {
         try Io.Dir.cwd().createDirPath(self.io, destination);
         for (0..self.tree.nodeCount()) |index| {
             const entry = self.tree.nodeView(index);
-            if (excludedTopLevel(entry.path, options.excluded_top_level)) continue;
+            if (excludedTopLevel(entry.path, options.excluded_top_level)) {
+                if (manifest) |out| try out.excluded_paths.append(try self.allocator.dupe(u8, entry.path));
+                continue;
+            }
             const host_path = try std.fs.path.join(self.allocator, &.{ destination, entry.path });
             defer self.allocator.free(host_path);
             const parent = std.fs.path.dirname(host_path) orelse destination;
@@ -342,6 +407,15 @@ pub const FileSystem = struct {
         source: []const u8,
         options: HostTreeOptions,
     ) Error!void {
+        return self.importHostTreeWithManifest(source, options, null);
+    }
+
+    pub fn importHostTreeWithManifest(
+        self: *FileSystem,
+        source: []const u8,
+        options: HostTreeOptions,
+        manifest: ?*const HostTreeManifest,
+    ) Error!void {
         var seen = std.StringHashMap(void).init(self.allocator);
         defer {
             var iterator = seen.keyIterator();
@@ -357,7 +431,8 @@ pub const FileSystem = struct {
         }
         for (0..self.tree.nodeCount()) |index| {
             const entry = self.tree.nodeView(index);
-            if (excludedTopLevel(entry.path, options.excluded_top_level)) continue;
+            if (excludedTopLevel(entry.path, options.excluded_top_level) or
+                (manifest != null and manifest.?.contains(entry.path))) continue;
             if (seen.contains(entry.path)) continue;
             try removals.append(try self.allocator.dupe(u8, entry.path));
         }
@@ -401,6 +476,14 @@ pub const FileSystem = struct {
                     const host_stat = try Io.Dir.cwd().statFile(self.io, child_host, .{});
                     const existing = self.tree.findNode(child);
                     if (existing == null or existing.?.kind != .hardlink) {
+                        if (existing) |node| {
+                            if (node.kind == .file and
+                                try self.hostFileEquals(child_host, child, host_stat.size, options.max_file_bytes))
+                            {
+                                self.allocator.free(child);
+                                continue;
+                            }
+                        }
                         const metadata = if (existing) |node| node.metadata else Metadata{
                             .mode = @intCast(host_stat.permissions.toMode() & 0o7777),
                         };
@@ -420,6 +503,32 @@ pub const FileSystem = struct {
         }
     }
 
+    fn hostFileEquals(
+        self: *const FileSystem,
+        host_path: []const u8,
+        guest_path: []const u8,
+        size: u64,
+        max_bytes: u64,
+    ) !bool {
+        if (size > max_bytes) return error.FileLimitExceeded;
+        const host = try Io.Dir.cwd().openFile(self.io, host_path, .{});
+        defer host.close(self.io);
+        var buffer: [64 * 1024]u8 = undefined;
+        var offset: u64 = 0;
+        while (offset < size) {
+            const wanted: usize = @intCast(@min(@as(u64, buffer.len), size - offset));
+            const got = try host.readPositionalAll(self.io, buffer[0..wanted], offset);
+            if (got != wanted) return false;
+            var guest_buffer: [64 * 1024]u8 = undefined;
+            const guest_got = try self.tree.readNodeContent(guest_path, guest_buffer[0..wanted], offset);
+            if (guest_got != wanted or !std.mem.eql(u8, buffer[0..wanted], guest_buffer[0..wanted])) {
+                return false;
+            }
+            offset += wanted;
+        }
+        return true;
+    }
+
     pub fn symlink(
         self: *FileSystem,
         path: []const u8,
@@ -434,10 +543,26 @@ pub const FileSystem = struct {
     /// UUID, label, root metadata, filesystem length, and journal presence.
     pub fn commit(self: *FileSystem) Error!ext4.FilesystemInfo {
         try self.ensureMutable();
+        const atomic_path = self.atomic_path orelse return error.AtomicPublishPathRequired;
+        const current_stat = try self.file.stat(self.io);
+        const atomic_stat = try Io.Dir.cwd().statFile(self.io, atomic_path, .{});
+        if (current_stat.inode != self.source_inode or atomic_stat.inode != self.source_inode) {
+            return error.AtomicSourceChanged;
+        }
+        try validateCommitProfile(self.identity);
         const cursor = try self.tree.cursor();
         const root = self.tree.rootMetadata();
         const label = self.identity.label;
-        const info = try ext4.populate(self.io, self.file, self.allocator, cursor, .{
+        const stage_path = try std.fmt.allocPrint(self.allocator, "{s}.mountless-stage", .{atomic_path});
+        defer self.allocator.free(stage_path);
+        DirDelete(self.io, stage_path);
+        var stage_published = false;
+        defer if (!stage_published) DirDelete(self.io, stage_path);
+        try Io.Dir.cwd().copyFile(atomic_path, Io.Dir.cwd(), stage_path, self.io, .{});
+        var stage_file = try Io.Dir.cwd().openFile(self.io, stage_path, .{ .mode = .read_write });
+        var stage_open = true;
+        defer if (stage_open) stage_file.close(self.io);
+        const info = try ext4.populate(self.io, stage_file, self.allocator, cursor, .{
             .offset = self.offset,
             .length = self.identity.filesystem_length,
             .block_size = self.identity.block_size,
@@ -457,7 +582,18 @@ pub const FileSystem = struct {
             .uuid = self.identity.uuid,
             .timestamp = std.math.cast(u32, root.mtime orelse 0) orelse 0,
             .journal = .{ .enabled = self.identity.has_journal },
+            .preserve_feature_ro_compat = self.identity.feature_ro_compat &
+                ext4.writer_feature_ro_compat_optional,
         });
+        try stage_file.sync(self.io);
+        stage_file.close(self.io);
+        stage_open = false;
+        // POSIX rename atomically replaces the old image path after the
+        // fully validated stage has been closed. This API targets ext4/Linux
+        // image mutation; Windows/WASI callers should provide a filesystem
+        // layer with equivalent replace semantics.
+        try Io.Dir.cwd().rename(stage_path, Io.Dir.cwd(), atomic_path, self.io);
+        stage_published = true;
         self.committed = true;
         return info;
     }
@@ -466,6 +602,22 @@ pub const FileSystem = struct {
         if (self.committed) return error.AlreadyCommitted;
     }
 };
+
+fn DirDelete(io: Io, path: []const u8) void {
+    Io.Dir.cwd().deleteFile(io, path) catch {};
+}
+
+fn validateCommitProfile(identity: ext4.GeneralFilesystemIdentity) !void {
+    if (identity.inode_size != 256 or identity.descriptor_size != 32) {
+        return error.UnsupportedCommitProfile;
+    }
+    const compat_allowed = ext4.writer_feature_compat |
+        if (identity.has_journal) ext4.feature_compat_has_journal else 0;
+    if (identity.feature_compat & ~compat_allowed != 0) return error.UnsupportedCommitProfile;
+    if (identity.feature_incompat != ext4.writer_feature_incompat) return error.UnsupportedCommitProfile;
+    const ro_allowed = ext4.writer_feature_ro_compat_base | ext4.writer_feature_ro_compat_optional;
+    if (identity.feature_ro_compat & ~ro_allowed != 0) return error.UnsupportedCommitProfile;
+}
 
 pub const NativeFilesystem = FileSystem;
 pub const Mountless = FileSystem;
@@ -544,6 +696,7 @@ test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
     var fs = try FileSystem.open(allocator, io, image.file, .{
         .length = 32 * 1024 * 1024,
         .spool_path = spool_path,
+        .atomic_path = image_path,
     });
     defer fs.deinit();
     try std.testing.expectEqualSlices(u8, &([_]u8{0x52} ** 16), &fs.filesystemIdentity().uuid);
@@ -551,8 +704,10 @@ test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
     const listed = try fs.list(allocator, "/", 16);
     defer allocator.free(listed);
     try std.testing.expectEqual(@as(usize, 1), listed.len);
-    try fs.exportHostTree(host_tree_path, .{});
-    try fs.importHostTree(host_tree_path, .{});
+    var host_manifest = HostTreeManifest.init(allocator);
+    defer host_manifest.deinit();
+    try fs.exportHostTreeWithManifest(host_tree_path, .{}, &host_manifest);
+    try fs.importHostTreeWithManifest(host_tree_path, .{}, &host_manifest);
     try std.testing.expectEqual(@as(u16, 0), (try fs.stat("/etc/void")).metadata.mode);
     try std.testing.expectError(error.FileLimitExceeded, fs.read(allocator, "/etc/void", 2));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = copy_in_path, .data = "from-host" });
@@ -564,6 +719,10 @@ test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
     try fs.mkdir("/new", .{ .mode = 0o000 });
     try fs.write("/new/file", "changed", null);
     try fs.remove("/etc/void", false);
+    const original_compat = fs.identity.feature_compat;
+    fs.identity.feature_compat |= 0x0010; // resize_inode, not emitted by the writer
+    try std.testing.expectError(error.UnsupportedCommitProfile, fs.commit());
+    fs.identity.feature_compat = original_compat;
     _ = try fs.commit();
 }
 
@@ -573,9 +732,11 @@ test "mountless round trip preserves security metadata and special nodes" {
     const image_path = "test-ext4-mountless-fidelity.raw";
     const spool_path = "test-ext4-mountless-fidelity.spool";
     const reopen_spool_path = "test-ext4-mountless-fidelity-reopen.spool";
+    const host_tree_path = "test-ext4-mountless-fidelity-host-tree";
     defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, reopen_spool_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, host_tree_path) catch {};
 
     var image = try @import("image.zig").Image.createExclusive(
         io,
@@ -584,7 +745,8 @@ test "mountless round trip preserves security metadata and special nodes" {
         64 * 1024 * 1024,
         .{},
     );
-    defer image.close(io);
+    var image_open = true;
+    defer if (image_open) image.close(io);
     var source_tree = root_tree.RootTree.initMemory(allocator, io, .{});
     defer source_tree.deinit();
     const xattrs = [_]tree_cursor.Xattr{
@@ -624,11 +786,41 @@ test "mountless round trip preserves security metadata and special nodes" {
         .root_xattrs = &xattrs,
     });
 
+    const probe_spool_path = "test-ext4-mountless-fidelity-probe.spool";
+    defer Io.Dir.cwd().deleteFile(io, probe_spool_path) catch {};
+    var probe_diagnostic = limits_mod.Diagnostic{};
+    var probe = try FileSystem.open(allocator, io, image.file, .{
+        .length = 64 * 1024 * 1024,
+        .spool_path = probe_spool_path,
+        .atomic_path = image_path,
+        .diagnostic = &probe_diagnostic,
+    });
+    probe.deinit();
+    const sparse_metadata_peak = probe_diagnostic.peaks.scan_metadata_bytes;
+    try std.testing.expect(sparse_metadata_peak > 0);
+    var limited_diagnostic = limits_mod.Diagnostic{};
+    try std.testing.expectError(
+        error.ScanMetadataLimitExceeded,
+        FileSystem.open(allocator, io, image.file, .{
+            .length = 64 * 1024 * 1024,
+            .spool_path = probe_spool_path,
+            .atomic_path = image_path,
+            .limits = .{ .max_scan_metadata_bytes = @intCast(sparse_metadata_peak - 1) },
+            .diagnostic = &limited_diagnostic,
+        }),
+    );
+
     var fs = try FileSystem.open(allocator, io, image.file, .{
         .length = 64 * 1024 * 1024,
         .spool_path = spool_path,
+        .atomic_path = image_path,
     });
-    defer fs.deinit();
+    var fs_open = true;
+    defer if (fs_open) fs.deinit();
+    var host_manifest = HostTreeManifest.init(allocator);
+    defer host_manifest.deinit();
+    try fs.exportHostTreeWithManifest(host_tree_path, .{}, &host_manifest);
+    try fs.importHostTreeWithManifest(host_tree_path, .{}, &host_manifest);
     try std.testing.expectEqualSlices(u8, &([_]u8{0x45} ** 16), &fs.filesystemIdentity().uuid);
     try std.testing.expectEqualSlices(u8, "fidelity", fs.filesystemIdentity().label[0..8]);
     const locked = try fs.stat("/etc/void");
@@ -643,6 +835,11 @@ test "mountless round trip preserves security metadata and special nodes" {
     const alias_bytes = try fs.read(allocator, "/usr/bin/void-alias", 64);
     defer allocator.free(alias_bytes);
     try std.testing.expectEqualStrings("inaccessible", alias_bytes);
+    try fs.write("/usr/bin/void-alias", "shared", null);
+    const shared_target = try fs.read(allocator, "/etc/void", 64);
+    defer allocator.free(shared_target);
+    try std.testing.expectEqualStrings("shared", shared_target);
+    try std.testing.expectEqual(Kind.hardlink, (try fs.stat("/usr/bin/void-alias")).kind);
     const link = try fs.readLink(allocator, "/etc/void-link", 64);
     defer allocator.free(link);
     try std.testing.expectEqualStrings("void", link);
@@ -653,10 +850,17 @@ test "mountless round trip preserves security metadata and special nodes" {
     try fs.write("/empty/file", "new", null);
     try fs.remove("/empty", true);
     _ = try fs.commit();
+    fs.deinit();
+    fs_open = false;
+    image.close(io);
+    image_open = false;
 
-    var reopened = try FileSystem.open(allocator, io, image.file, .{
+    var reopened_image = try @import("image.zig").Image.openPath(io, image_path);
+    defer reopened_image.close(io);
+    var reopened = try FileSystem.open(allocator, io, reopened_image.file, .{
         .length = 64 * 1024 * 1024,
         .spool_path = reopen_spool_path,
+        .atomic_path = image_path,
     });
     defer reopened.deinit();
     try std.testing.expectEqual(@as(u16, 0), (try reopened.stat("/etc/void")).metadata.mode);
@@ -666,5 +870,9 @@ test "mountless round trip preserves security metadata and special nodes" {
         (try reopened.stat("/etc/sparse")).payload.content.sparse_extents.len,
     );
     try std.testing.expectEqual(Kind.char_device, (try reopened.stat("/dev/null")).kind);
+    try std.testing.expectEqual(Kind.hardlink, (try reopened.stat("/usr/bin/void-alias")).kind);
+    const reopened_shared = try reopened.read(allocator, "/usr/bin/void-alias", 64);
+    defer allocator.free(reopened_shared);
+    try std.testing.expectEqualStrings("shared", reopened_shared);
     try std.testing.expectError(error.PathNotFound, reopened.stat("/empty"));
 }

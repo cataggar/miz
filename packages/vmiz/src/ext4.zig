@@ -106,7 +106,7 @@ const rev_dynamic: u32 = 1;
 
 const feature_compat_dir_prealloc: u32 = 0x0001;
 const feature_compat_imagic_inodes: u32 = 0x0002;
-const feature_compat_has_journal: u32 = 0x0004;
+pub const feature_compat_has_journal: u32 = 0x0004;
 const feature_compat_ext_attr: u32 = 0x0008;
 const feature_compat_resize_inode: u32 = 0x0010;
 const feature_compat_dir_index: u32 = 0x0020;
@@ -147,15 +147,15 @@ const feature_ro_compat_project: u32 = 0x2000;
 const feature_ro_compat_shared_blocks: u32 = 0x4000;
 const feature_ro_compat_verity: u32 = 0x8000;
 const feature_ro_compat_orphan_present: u32 = 0x0001_0000;
-const writer_feature_compat: u32 = feature_compat_ext_attr | feature_compat_dir_index;
-const writer_feature_incompat: u32 = feature_incompat_filetype | feature_incompat_extents;
+pub const writer_feature_compat: u32 = feature_compat_ext_attr | feature_compat_dir_index;
+pub const writer_feature_incompat: u32 = feature_incompat_filetype | feature_incompat_extents;
 /// Always set by this writer. `EXTRA_ISIZE` asserts that every inode has at
 /// least `s_min_extra_isize` bytes past the classic 128 already filled in,
 /// which is exactly what `writeInodes` guarantees.
-const writer_feature_ro_compat_base: u32 = feature_ro_compat_sparse_super | feature_ro_compat_metadata_csum | feature_ro_compat_extra_isize;
+pub const writer_feature_ro_compat_base: u32 = feature_ro_compat_sparse_super | feature_ro_compat_metadata_csum | feature_ro_compat_extra_isize;
 /// Allowed on a filesystem this module reads back, but conditional on its
 /// contents rather than always present.
-const writer_feature_ro_compat_optional: u32 = feature_ro_compat_large_file;
+pub const writer_feature_ro_compat_optional: u32 = feature_ro_compat_large_file;
 const reader_feature_compat: u32 = writer_feature_compat | feature_compat_has_journal | feature_compat_resize_inode | feature_compat_orphan_file;
 const reader_feature_incompat: u32 = writer_feature_incompat | feature_incompat_64bit | feature_incompat_flex_bg | feature_incompat_csum_seed;
 const reader_feature_ro_compat: u32 = writer_feature_ro_compat_base | feature_ro_compat_large_file | feature_ro_compat_huge_file | feature_ro_compat_dir_nlink | feature_ro_compat_extra_isize;
@@ -320,6 +320,9 @@ pub const PopulateOptions = struct {
     timestamp: u32 = 0,
     /// Journal creation policy. Off by default; see `JournalOptions`.
     journal: JournalOptions = .{},
+    /// Optional supported source feature bits to retain even when the
+    /// current content no longer requires them (currently LARGE_FILE).
+    preserve_feature_ro_compat: u32 = 0,
     /// Inode table sizing policy. Content-derived by default; see
     /// `InodeOptions`.
     inodes: InodeOptions = .{},
@@ -2091,6 +2094,7 @@ pub const Reader = struct {
     blocks_per_group: u32,
     inodes_per_group: u32,
     inode_size: u16,
+    descriptor_size: u16,
     feature_compat: u32,
     feature_incompat: u32,
     feature_ro_compat: u32,
@@ -2196,6 +2200,7 @@ pub const Reader = struct {
             .blocks_per_group = blocks_per_group,
             .inodes_per_group = inodes_per_group,
             .inode_size = inode_size_on_disk,
+            .descriptor_size = desc_size,
             .feature_compat = compat,
             .feature_incompat = incompat,
             .feature_ro_compat = ro_compat,
@@ -4845,6 +4850,7 @@ pub const GeneralFilesystemIdentity = struct {
     /// partition or device holding it.
     filesystem_length: u64,
     inode_size: u16,
+    descriptor_size: u16,
     feature_compat: u32,
     feature_incompat: u32,
     feature_ro_compat: u32,
@@ -5168,6 +5174,7 @@ const GeneralScanner = struct {
     root_xattr_views: []Xattr,
     content_bytes: u64 = 0,
     node_count: usize = 0,
+    scan_metadata_bytes: u64 = 0,
 
     fn init(
         reader: *Reader,
@@ -5201,6 +5208,7 @@ const GeneralScanner = struct {
             .root = undefined,
             .root_xattrs_owned = &.{},
             .root_xattr_views = &.{},
+            .scan_metadata_bytes = @intCast(directory_bitmap_len),
         };
     }
 
@@ -5241,13 +5249,18 @@ const GeneralScanner = struct {
         const root = try self.readGeneralInode(root_inode, &raw);
         if (root.kind != .directory) return error.RootIsNotADirectory;
         const xattrs = try self.readNodeXattrs(root, &raw);
-        errdefer freeXattrs(self.allocator, xattrs);
+        var xattrs_owned = true;
+        errdefer if (xattrs_owned) freeXattrs(self.allocator, xattrs);
         const views = try self.allocator.alloc(Xattr, xattrs.len);
+        var views_owned = true;
+        errdefer if (views_owned) self.allocator.free(views);
         for (xattrs, 0..) |xattr, index| {
             views[index] = .{ .name = xattr.name, .value = xattr.value };
         }
         self.root_xattrs_owned = xattrs;
         self.root_xattr_views = views;
+        xattrs_owned = false;
+        views_owned = false;
         self.root = .{
             .mode = root.mode,
             .uid = root.uid,
@@ -5462,7 +5475,7 @@ const GeneralScanner = struct {
         var logical: u32 = 0;
         for (extents) |extent| {
             if (extent.logical_block > logical) {
-                try holes.append(.{
+                try self.appendSparseExtent(&holes, .{
                     .logical_block = logical,
                     .block_count = extent.logical_block - logical,
                 });
@@ -5470,7 +5483,7 @@ const GeneralScanner = struct {
             const end = std.math.add(u32, extent.logical_block, extent.block_count) catch
                 return error.UnsupportedExtent;
             if (!extent.initialized) {
-                try holes.append(.{
+                try self.appendSparseExtent(&holes, .{
                     .logical_block = extent.logical_block,
                     .block_count = extent.block_count,
                 });
@@ -5478,12 +5491,37 @@ const GeneralScanner = struct {
             logical = @max(logical, end);
         }
         if (logical < total_blocks) {
-            try holes.append(.{
+            try self.appendSparseExtent(&holes, .{
                 .logical_block = logical,
                 .block_count = total_blocks - logical,
             });
         }
-        return holes.toOwnedSlice();
+        const result = try holes.toOwnedSlice();
+        self.scan_metadata_bytes += @as(u64, @intCast(result.len)) * @sizeOf(tree_cursor.SparseExtent);
+        limits_mod.observe(self.options.diagnostic, .scan_metadata_bytes, self.scan_metadata_bytes);
+        return result;
+    }
+
+    fn appendSparseExtent(
+        self: *GeneralScanner,
+        holes: *std.array_list.Managed(tree_cursor.SparseExtent),
+        extent: tree_cursor.SparseExtent,
+    ) !void {
+        const count = std.math.add(u64, @intCast(holes.items.len), 1) catch
+            return error.ScanMetadataLimitExceeded;
+        const added = std.math.mul(u64, count, @sizeOf(tree_cursor.SparseExtent)) catch
+            return error.ScanMetadataLimitExceeded;
+        const observed = std.math.add(u64, self.scan_metadata_bytes, added) catch
+            return error.ScanMetadataLimitExceeded;
+        if (observed > self.options.max_scan_metadata_bytes) {
+            return limits_mod.exceeded(
+                self.options.diagnostic,
+                .scan_metadata_bytes,
+                observed,
+                self.options.max_scan_metadata_bytes,
+            );
+        }
+        try holes.append(extent);
     }
 
     fn readGeneralInode(
@@ -5702,6 +5740,7 @@ fn validateGeneralSuperblock(
         .block_size = reader.block_size,
         .filesystem_length = filesystem_length,
         .inode_size = reader.inode_size,
+        .descriptor_size = reader.descriptor_size,
         .feature_compat = reader.feature_compat,
         .feature_incompat = reader.feature_incompat,
         .feature_ro_compat = reader.feature_ro_compat,
@@ -6285,7 +6324,8 @@ fn buildPlan(
     try buildDirectoryPayloads(allocator, nodes, options.block_size);
 
     var data_blocks_needed: u32 = 0;
-    var feature_ro_compat: u32 = writer_feature_ro_compat_base;
+    var feature_ro_compat: u32 = writer_feature_ro_compat_base |
+        (options.preserve_feature_ro_compat & writer_feature_ro_compat_optional);
     for (nodes) |*node| {
         switch (node.kind) {
             .directory => {
@@ -7715,11 +7755,15 @@ fn parseExtentHeader(buf: []const u8) ReadError!ExtentHeader {
 fn decodeExtent(buf: []const u8) Extent {
     const start_hi = readInt(u16, buf[6..8]);
     const start_lo = readInt(u32, buf[8..12]);
+    const raw_count = readInt(u16, buf[4..6]);
     return .{
         .logical_block = readInt(u32, buf[0..4]),
         .start_block = (@as(u64, start_hi) << 32) | start_lo,
-        .block_count = @intCast(readInt(u16, buf[4..6]) & 0x7FFF),
-        .initialized = readInt(u16, buf[4..6]) <= 32768,
+        // 0x8000 is the one ambiguous-looking value in ext4's extent
+        // encoding: it denotes a fully initialized 32768-block extent.
+        // Unwritten extents use values strictly above it.
+        .block_count = if (raw_count == 0x8000) 0x8000 else raw_count & 0x7FFF,
+        .initialized = raw_count <= 0x8000,
     };
 }
 
@@ -12259,4 +12303,16 @@ test "strict writer-compatible scan rejects a tampered inode epoch" {
             .expected_length = length,
         }),
     );
+}
+
+test "reader treats ee_len 0x8000 as an initialized 32768-block extent" {
+    var encoded = [_]u8{0} ** extent_entry_size;
+    writeInt(u32, encoded[0..4], 123);
+    writeInt(u16, encoded[4..6], 0x8000);
+    writeInt(u16, encoded[6..8], 0);
+    writeInt(u32, encoded[8..12], 456);
+    const extent = decodeExtent(&encoded);
+    try std.testing.expectEqual(@as(u32, 123), extent.logical_block);
+    try std.testing.expectEqual(@as(u16, 32768), extent.block_count);
+    try std.testing.expect(extent.initialized);
 }
