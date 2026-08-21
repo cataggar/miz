@@ -84,6 +84,11 @@ pub const Inspection = struct {
 
 pub const Kind = enum { file, directory, symlink, other };
 
+const ParentDirectory = struct {
+    dir: Io.Dir,
+    name: []const u8,
+};
+
 pub const Command = union(enum) {
     update_initramfs: []const u8,
     dpkg_query,
@@ -368,13 +373,29 @@ pub const Root = struct {
     allocator: Allocator,
     io: Io,
     root_path: []const u8,
+    root_dir: Io.Dir,
     limits: Limits = .{},
 
     pub fn init(allocator: Allocator, io: Io, root_path: []const u8, limits: Limits) !Root {
         if (!std.fs.path.isAbsolute(root_path)) return error.RootPathMustBeAbsolute;
         const stat = try Io.Dir.cwd().statFile(io, root_path, .{ .follow_symlinks = false });
         if (stat.kind != .directory) return error.RootNotDirectory;
-        return .{ .allocator = allocator, .io = io, .root_path = root_path, .limits = limits };
+        const root_dir = try Io.Dir.openDirAbsolute(io, root_path, .{
+            .access_sub_paths = true,
+            .iterate = true,
+        });
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .root_path = root_path,
+            .root_dir = root_dir,
+            .limits = limits,
+        };
+    }
+
+    pub fn deinit(self: *Root) void {
+        self.root_dir.close(self.io);
+        self.* = undefined;
     }
 
     pub fn apply(self: *Root, operations: []const Operation) !void {
@@ -396,7 +417,6 @@ pub const Root = struct {
 
     pub fn writeFile(self: *Root, file: WriteFile) !void {
         const relative = try normalizeGuestPath(file.path);
-        try self.ensureParent(file.path);
         var bytes: []u8 = undefined;
         var owned = false;
         switch (file.source) {
@@ -410,15 +430,15 @@ pub const Root = struct {
             },
         }
         defer if (owned) self.allocator.free(bytes);
-        var root_dir = try self.openRootDir();
-        defer root_dir.close(self.io);
-        const existing = root_dir.statFile(self.io, relative, .{ .follow_symlinks = false }) catch null;
+        var parent = try self.openParentDirectory(relative, true);
+        defer parent.dir.close(self.io);
+        const existing = parent.dir.statFile(self.io, parent.name, .{ .follow_symlinks = false }) catch null;
         if (existing) |stat| {
             if (stat.kind == .directory) return error.NotRegularFile;
-            try root_dir.deleteFile(self.io, relative);
+            try parent.dir.deleteFile(self.io, parent.name);
         }
-        try root_dir.writeFile(self.io, .{
-            .sub_path = relative,
+        try parent.dir.writeFile(self.io, .{
+            .sub_path = parent.name,
             .data = bytes,
             .flags = .{
                 .exclusive = true,
@@ -430,36 +450,36 @@ pub const Root = struct {
 
     pub fn createDirectory(self: *Root, guest_path: []const u8, mode: u32) !void {
         const relative = try normalizeGuestPath(guest_path);
-        try self.ensureSafeDirectory(relative);
-        var root_dir = try self.openRootDir();
-        defer root_dir.close(self.io);
-        try root_dir.setFilePermissions(self.io, relative, .fromMode(mode), .{ .follow_symlinks = false });
+        var directory = try self.openDirectoryPath(relative, true);
+        defer directory.close(self.io);
+        try directory.setPermissions(self.io, .fromMode(mode));
     }
 
     pub fn replaceSymlink(self: *Root, guest_path: []const u8, target: []const u8) !void {
         if (target.len == 0 or std.mem.indexOfScalar(u8, target, 0) != null) return error.InvalidSymlinkTarget;
         const relative = try normalizeGuestPath(guest_path);
-        try self.ensureParent(guest_path);
-        var root_dir = try self.openRootDir();
-        defer root_dir.close(self.io);
-        if (root_dir.statFile(self.io, relative, .{ .follow_symlinks = false })) |stat| {
+        var parent = try self.openParentDirectory(relative, true);
+        defer parent.dir.close(self.io);
+        if (parent.dir.statFile(self.io, parent.name, .{ .follow_symlinks = false })) |stat| {
             if (stat.kind == .directory) return error.NotRegularFile;
-            try root_dir.deleteFile(self.io, relative);
+            try parent.dir.deleteFile(self.io, parent.name);
         } else |_| {}
-        try root_dir.symLink(self.io, target, relative, .{});
+        try parent.dir.symLink(self.io, target, parent.name, .{});
     }
 
     pub fn remove(self: *Root, guest_path: []const u8, recursive: bool) !void {
         const relative = try normalizeGuestPath(guest_path);
-        try self.validateParentComponents(relative, false);
-        var root_dir = try self.openRootDir();
-        defer root_dir.close(self.io);
-        const stat = root_dir.statFile(self.io, relative, .{ .follow_symlinks = false }) catch
+        var parent = self.openParentDirectory(relative, false) catch |err| switch (err) {
+            error.FileNotFound => return error.PathNotFound,
+            else => return err,
+        };
+        defer parent.dir.close(self.io);
+        const stat = parent.dir.statFile(self.io, parent.name, .{ .follow_symlinks = false }) catch
             return error.PathNotFound;
         if (stat.kind == .directory and recursive) {
-            try root_dir.deleteTree(self.io, relative);
+            try parent.dir.deleteTree(self.io, parent.name);
         } else {
-            try root_dir.deleteFile(self.io, relative);
+            try parent.dir.deleteFile(self.io, parent.name);
         }
     }
 
@@ -475,17 +495,8 @@ pub const Root = struct {
     pub fn discover(self: *Root, guest_directory: []const u8, pattern: []const u8) ![]FoundEntry {
         if (std.mem.count(u8, pattern, "*") > 1) return error.InvalidDiscoveryPattern;
         const relative = try normalizeGuestPath(guest_directory);
-        var root_dir = try self.openRootDir();
-        defer root_dir.close(self.io);
-        var dir: Io.Dir = undefined;
-        var owns_dir = false;
-        if (relative.len == 0) {
-            dir = root_dir;
-        } else {
-            dir = try root_dir.openDir(self.io, relative, .{ .iterate = true, .follow_symlinks = false });
-            owns_dir = true;
-        }
-        defer if (owns_dir) dir.close(self.io);
+        var dir = try self.openDirectoryPath(relative, false);
+        defer dir.close(self.io);
         var iterator = dir.iterate();
         var entries = std.array_list.Managed(FoundEntry).init(self.allocator);
         errdefer {
@@ -511,10 +522,9 @@ pub const Root = struct {
 
     pub fn inspect(self: *Root, guest_path: []const u8) !Inspection {
         const relative = try normalizeGuestPath(guest_path);
-        try self.validateParentComponents(relative, false);
-        var root_dir = try self.openRootDir();
-        defer root_dir.close(self.io);
-        const stat = root_dir.statFile(self.io, relative, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        var parent = try self.openParentDirectory(relative, false);
+        defer parent.dir.close(self.io);
+        const stat = parent.dir.statFile(self.io, parent.name, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => return error.PathNotFound,
             else => return err,
         };
@@ -532,10 +542,9 @@ pub const Root = struct {
 
     pub fn readFile(self: *Root, guest_path: []const u8) ![]u8 {
         const relative = try normalizeGuestPath(guest_path);
-        try self.validateParentComponents(relative, true);
-        var root_dir = try self.openRootDir();
-        defer root_dir.close(self.io);
-        var file = try root_dir.openFile(self.io, relative, .{
+        var parent = try self.openParentDirectory(relative, false);
+        defer parent.dir.close(self.io);
+        var file = try parent.dir.openFile(self.io, parent.name, .{
             .mode = .read_only,
             .follow_symlinks = false,
             .resolve_beneath = true,
@@ -552,11 +561,10 @@ pub const Root = struct {
 
     pub fn readLink(self: *Root, guest_path: []const u8) ![]u8 {
         const relative = try normalizeGuestPath(guest_path);
-        try self.validateParentComponents(relative, false);
-        var root_dir = try self.openRootDir();
-        defer root_dir.close(self.io);
+        var parent = try self.openParentDirectory(relative, false);
+        defer parent.dir.close(self.io);
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const length = try root_dir.readLink(self.io, relative, &buffer);
+        const length = try parent.dir.readLink(self.io, parent.name, &buffer);
         return self.allocator.dupe(u8, buffer[0..length]);
     }
 
@@ -593,72 +601,61 @@ pub const Root = struct {
         return self.allocator.dupe(u8, name["vmlinuz-".len..]);
     }
 
-    fn ensureParent(self: *Root, guest_path: []const u8) !void {
-        const relative = try normalizeGuestPath(guest_path);
-        const parent = std.fs.path.dirname(relative) orelse return;
-        try self.ensureSafeDirectory(parent);
-    }
-
-    fn openRootDir(self: *Root) !Io.Dir {
+    fn duplicateRootDir(self: *Root) !Io.Dir {
+        if (comptime builtin.os.tag == .linux) {
+            const result = std.os.linux.dup(self.root_dir.handle);
+            if (@as(isize, @bitCast(result)) < 0) return error.RootFdDupFailed;
+            return .{ .handle = @intCast(result) };
+        }
         return Io.Dir.openDirAbsolute(self.io, self.root_path, .{
             .access_sub_paths = true,
             .iterate = true,
         });
     }
 
-    /// Traverses from an open root directory and refuses symlinked
-    /// components. The descriptor walk is the portable fallback for hosts
-    /// without openat2; no lexical prefix check is trusted for containment.
-    fn validateParentComponents(self: *Root, relative: []const u8, include_final: bool) !void {
-        var current = try Io.Dir.openDirAbsolute(self.io, self.root_path, .{ .access_sub_paths = true });
-        defer current.close(self.io);
-        if (relative.len == 0) return;
-        var components = std.mem.splitScalar(u8, relative, '/');
-        var component_index: usize = 0;
-        while (components.next()) |component| : (component_index += 1) {
-            const is_final = component_index + 1 == std.mem.count(u8, relative, "/") + 1;
-            if (is_final and !include_final) break;
-            if (is_final) {
-                const stat = current.statFile(self.io, component, .{ .follow_symlinks = false }) catch |err| switch (err) {
-                    error.FileNotFound => return,
-                    else => return err,
-                };
-                if (stat.kind == .sym_link) return error.GuestSymlinkTraversal;
-                break;
-            }
-            const next = current.openDir(self.io, component, .{
-                .access_sub_paths = true,
-                .follow_symlinks = false,
-            }) catch |err| switch (err) {
-                error.FileNotFound => return,
-                else => return err,
-            };
-            current.close(self.io);
-            current = next;
-        }
-    }
-
-    fn ensureSafeDirectory(self: *Root, relative: []const u8) !void {
-        var current = try Io.Dir.openDirAbsolute(self.io, self.root_path, .{ .access_sub_paths = true });
-        defer current.close(self.io);
-        if (relative.len == 0) return;
+    fn openDirectoryPath(self: *Root, relative: []const u8, create_missing: bool) !Io.Dir {
+        var current = try self.duplicateRootDir();
+        if (relative.len == 0) return current;
         var components = std.mem.splitScalar(u8, relative, '/');
         while (components.next()) |component| {
             const stat = current.statFile(self.io, component, .{ .follow_symlinks = false }) catch |err| switch (err) {
-                error.FileNotFound => blk: {
+                error.FileNotFound => if (create_missing) blk: {
                     try current.createDir(self.io, component, .default_dir);
                     break :blk try current.statFile(self.io, component, .{ .follow_symlinks = false });
+                } else {
+                    current.close(self.io);
+                    return err;
                 },
-                else => return err,
+                else => {
+                    current.close(self.io);
+                    return err;
+                },
             };
-            if (stat.kind != .directory) return error.NotDirectory;
-            const next = try current.openDir(self.io, component, .{
+            if (stat.kind != .directory) {
+                current.close(self.io);
+                return error.NotDirectory;
+            }
+            const next = current.openDir(self.io, component, .{
                 .access_sub_paths = true,
+                .iterate = true,
                 .follow_symlinks = false,
-            });
+            }) catch |err| {
+                current.close(self.io);
+                return err;
+            };
             current.close(self.io);
             current = next;
         }
+        return current;
+    }
+
+    fn openParentDirectory(self: *Root, relative: []const u8, create_missing: bool) !ParentDirectory {
+        if (relative.len == 0) return error.InvalidGuestPath;
+        const parent = std.fs.path.dirname(relative) orelse "";
+        return .{
+            .dir = try self.openDirectoryPath(parent, create_missing),
+            .name = std.fs.path.basename(relative),
+        };
     }
 };
 
@@ -715,6 +712,7 @@ test "offline root rejects traversal and wildcard ambiguity" {
             .allocator = std.testing.allocator,
             .io = undefined,
             .root_path = "/",
+            .root_dir = undefined,
         };
         break :blk root.discover("/", "a*b*c");
     });
@@ -759,6 +757,7 @@ test "offline root applies structured operations and cleans up" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = stale, .data = "stale" });
 
     var root = try Root.init(allocator, io, path, .{});
+    defer root.deinit();
     try root.apply(&.{
         .{ .create_directory = .{ .path = "/etc/vmiz", .mode = 0o755 } },
         .{ .write_file = .{ .path = "/etc/vmiz/config", .source = .{ .inline_bytes = "ok\n" } } },
@@ -806,6 +805,7 @@ test "offline root refuses intermediate symlink escapes" {
     try Io.Dir.cwd().symLink(io, outside_path, nested_path, .{});
 
     var root = try Root.init(allocator, io, root_path, .{});
+    defer root.deinit();
     for ([_][]const u8{ "/etc/escape", "/safe/nested/escape" }) |guest_path| {
         root.writeFile(.{
             .path = guest_path,
@@ -824,6 +824,77 @@ test "offline root refuses intermediate symlink escapes" {
     const unchanged = try Io.Dir.cwd().readFileAlloc(io, sentinel, allocator, .limited(1024));
     defer allocator.free(unchanged);
     try std.testing.expectEqualStrings("unchanged", unchanged);
+}
+
+const SymlinkRace = struct {
+    root_path: []const u8,
+    outside_path: []const u8,
+    stop: *std.atomic.Value(bool),
+    io: Io,
+
+    fn run(self: *SymlinkRace) void {
+        while (!self.stop.load(.acquire)) {
+            const nested = std.fs.path.join(std.heap.page_allocator, &.{ self.root_path, "safe/nested" }) catch return;
+            defer std.heap.page_allocator.free(nested);
+            Io.Dir.cwd().deleteTree(self.io, nested) catch {};
+            Io.Dir.cwd().symLink(self.io, self.outside_path, nested, .{}) catch {};
+            Io.Dir.cwd().deleteFile(self.io, nested) catch {};
+            Io.Dir.cwd().createDirPath(self.io, nested) catch {};
+        }
+    }
+};
+
+test "offline root mutations and discovery survive concurrent symlink replacement" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const root_path = try std.fs.path.join(allocator, &.{ cwd, "test-offline-root-concurrent-root" });
+    defer allocator.free(root_path);
+    const outside_path = try std.fs.path.join(allocator, &.{ cwd, "test-offline-root-concurrent-outside" });
+    defer allocator.free(outside_path);
+    Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    Io.Dir.cwd().deleteTree(io, outside_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, outside_path) catch {};
+    const safe_path = try std.fs.path.join(allocator, &.{ root_path, "safe" });
+    defer allocator.free(safe_path);
+    try Io.Dir.cwd().createDirPath(io, safe_path);
+    try Io.Dir.cwd().createDirPath(io, outside_path);
+
+    var root = try Root.init(allocator, io, root_path, .{});
+    defer root.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    var race = SymlinkRace{
+        .root_path = root_path,
+        .outside_path = outside_path,
+        .stop = &stop,
+        .io = io,
+    };
+    var thread = try std.Thread.spawn(.{}, SymlinkRace.run, .{&race});
+    for (0..128) |_| {
+        root.writeFile(.{
+            .path = "/safe/nested/file",
+            .source = .{ .inline_bytes = "inside" },
+        }) catch {};
+        root.createDirectory("/safe/nested/mkdir", 0o755) catch {};
+        root.replaceSymlink("/safe/nested/link", "/safe/nested/file") catch {};
+        root.remove("/safe/nested/file", false) catch {};
+        const entries = root.discover("/safe/nested", "*") catch null;
+        if (entries) |found| root.freeFound(found);
+    }
+    stop.store(true, .release);
+    thread.join();
+
+    const outside_file = try std.fs.path.join(allocator, &.{ outside_path, "file" });
+    defer allocator.free(outside_file);
+    const outside_mkdir = try std.fs.path.join(allocator, &.{ outside_path, "mkdir" });
+    defer allocator.free(outside_mkdir);
+    const outside_link = try std.fs.path.join(allocator, &.{ outside_path, "link" });
+    defer allocator.free(outside_link);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, outside_file, .{ .follow_symlinks = false }));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, outside_mkdir, .{ .follow_symlinks = false }));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, outside_link, .{ .follow_symlinks = false }));
 }
 
 const FakeRunner = struct {

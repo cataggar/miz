@@ -111,6 +111,12 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         self.assertIn("VMIZ_UBUNTU2604_IMAGE=", native)
         self.assertIn("test -s \"$VMIZ_UBUNTU2604_ACCEPTANCE_RESULT\"", native)
         self.assertIn("tampered-uki-rejected", native)
+        self.assertIn("Provision privileged offline-root containment fixture", native)
+        self.assertIn(
+            'sudo -E "$(command -v zig)" test packages/vmiz/src/offline_root.zig',
+            native,
+        )
+        self.assertIn('sudo rm -rf -- "$fixture"', native)
 
 
 if __name__ == "__main__":

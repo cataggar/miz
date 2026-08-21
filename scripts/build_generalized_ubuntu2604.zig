@@ -53,6 +53,7 @@ const Profile = struct {
     output: []const u8,
     work_dir: []const u8,
     efi_fallback: []const u8,
+    serial_console: []const u8,
     pe_machine: u16,
     root_partition_table_index: u32,
     root_partition_type_guid: guid.Guid,
@@ -69,6 +70,7 @@ const profiles = [_]Profile{
         .output = "Ubuntu-26.04-x86_64.qcow2",
         .work_dir = ".scratch/ubuntu2604-x86_64",
         .efi_fallback = "BOOTX64.EFI",
+        .serial_console = "console=ttyS0,115200n8",
         .pe_machine = 0x8664,
         .root_partition_table_index = 0,
         .root_partition_type_guid = guid.linux_root_x86_64,
@@ -83,6 +85,7 @@ const profiles = [_]Profile{
         .output = "Ubuntu-26.04-aarch64.qcow2",
         .work_dir = ".scratch/ubuntu2604-aarch64",
         .efi_fallback = "BOOTAA64.EFI",
+        .serial_console = "console=ttyAMA0,115200n8",
         .pe_machine = 0xaa64,
         .root_partition_table_index = 0,
         .root_partition_type_guid = guid.linux_root_aarch64,
@@ -561,6 +564,38 @@ fn partitionOffsetLength(partition: vmiz.gpt.PartitionEntry) !struct { offset: u
     };
 }
 
+fn rootPartitionGuid(
+    allocator: Allocator,
+    io: Io,
+    image_path: []const u8,
+    profile: *const Profile,
+) !guid.Guid {
+    var image = try vmiz.Image.openPathReadOnly(io, image_path);
+    defer image.close(io);
+    const parsed = try vmiz.gpt.readGpt(image, io, allocator);
+    defer allocator.free(parsed.partitions);
+    const partition = try findNamedRootPartition(parsed.partitions);
+    if (!std.mem.eql(u8, &partition.partition_type_guid, &profile.root_partition_type_guid))
+        return error.RootPartitionTypeMismatch;
+    if (std.mem.eql(u8, &partition.unique_partition_guid, &guid.nil))
+        return error.InvalidRootPartitionGuid;
+    return partition.unique_partition_guid;
+}
+
+fn ukiCmdline(
+    allocator: Allocator,
+    root_guid: guid.Guid,
+    profile: *const Profile,
+) ![]u8 {
+    var root_guid_text: [36]u8 = undefined;
+    const root_guid_value = guid.formatLower(&root_guid_text, root_guid);
+    return std.fmt.allocPrint(
+        allocator,
+        "root=PARTUUID={s} {s}",
+        .{ root_guid_value, profile.serial_console },
+    );
+}
+
 fn labelEquals(label: [16]u8, expected: []const u8) bool {
     if (expected.len > label.len) return false;
     if (!std.mem.eql(u8, label[0..expected.len], expected)) return false;
@@ -707,6 +742,7 @@ fn customizeOfflineRoot(
     provenance_dir: []const u8,
 ) ![]u8 {
     var root = try offline_root.Root.init(allocator, io, root_path, .{});
+    defer root.deinit();
     const release_name = try root.activeKernelRelease();
     errdefer allocator.free(release_name);
     try root.validateArchitecture(switch (profile.architecture) {
@@ -1594,6 +1630,9 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(os_release_host);
     const os_release_argument = try std.fmt.allocPrint(allocator, "@{s}", .{os_release_host});
     defer allocator.free(os_release_argument);
+    const root_partition_guid = try rootPartitionGuid(allocator, io, mutable, profile);
+    const cmdline = try ukiCmdline(allocator, root_partition_guid, profile);
+    defer allocator.free(cmdline);
     const unsigned_uki = try std.fs.path.join(allocator, &.{ work_dir, "ubuntu2604.unsigned.efi" });
     defer allocator.free(unsigned_uki);
     try run(allocator, io, &.{
@@ -1601,7 +1640,7 @@ pub fn main(init: std.process.Init) !void {
         "--linux",      kernel_host,
         "--initrd",     initrd_host,
         "--os-release", os_release_argument,
-        "--cmdline",    "root=LABEL=cloudimg-rootfs ro console=tty1 console=ttyS0 earlyprintk=ttyS0 panic=-1",
+        "--cmdline",    cmdline,
         "--output",     unsigned_uki,
     });
 
@@ -1862,6 +1901,24 @@ test "Azure kernel discovery is architecture-neutral and exact" {
     try std.testing.expect(findAzureKernelRelease("vmlinuz-7.0.0-28-generic\n") == null);
 }
 
+test "UKI cmdline binds final root PARTUUID and native serial console" {
+    const root_guid = guid.parse("11111111-2222-3333-4444-555555555555");
+    const x86_cmdline = try ukiCmdline(std.testing.allocator, root_guid, profileFor(.x86_64));
+    defer std.testing.allocator.free(x86_cmdline);
+    try std.testing.expectEqualStrings(
+        "root=PARTUUID=11111111-2222-3333-4444-555555555555 console=ttyS0,115200n8",
+        x86_cmdline,
+    );
+    const arm_cmdline = try ukiCmdline(std.testing.allocator, root_guid, profileFor(.aarch64));
+    defer std.testing.allocator.free(arm_cmdline);
+    try std.testing.expectEqualStrings(
+        "root=PARTUUID=11111111-2222-3333-4444-555555555555 console=ttyAMA0,115200n8",
+        arm_cmdline,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, x86_cmdline, "LABEL=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, arm_cmdline, "ttyS0") == null);
+}
+
 test "native boot validation rejects missing modules.dep and initramfs" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1873,6 +1930,7 @@ test "native boot validation rejects missing modules.dep and initramfs" {
     defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
     try Io.Dir.cwd().createDirPath(io, root_path);
     var root = try offline_root.Root.init(allocator, io, root_path, .{});
+    defer root.deinit();
     try root.createDirectory("/lib/modules/7.0.0-1001-azure", 0o755);
     try root.createDirectory("/boot", 0o755);
     try root.writeFile(.{
