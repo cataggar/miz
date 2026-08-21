@@ -76,6 +76,9 @@ pub const FileSystem = struct {
     identity: ext4.GeneralFilesystemIdentity,
     atomic_path: ?[]const u8,
     source_inode: Io.File.INode,
+    source_size: u64,
+    source_mtime: Io.Timestamp,
+    source_ctime: Io.Timestamp,
     committed: bool = false,
 
     /// Opens and imports an ext4 partition without mounting it. The source
@@ -137,6 +140,9 @@ pub const FileSystem = struct {
             .identity = source.identity,
             .atomic_path = options.atomic_path,
             .source_inode = file_stat.inode,
+            .source_size = file_stat.size,
+            .source_mtime = file_stat.mtime,
+            .source_ctime = file_stat.ctime,
         };
     }
 
@@ -394,7 +400,11 @@ pub const FileSystem = struct {
                 // A package root only needs the mount points for these
                 // entries. The original special nodes remain in the native
                 // tree and are never replaced by host placeholders.
-                .block_device, .char_device, .fifo => {},
+                .block_device, .char_device, .fifo => {
+                    if (manifest) |out| {
+                        try out.excluded_paths.append(try self.allocator.dupe(u8, entry.path));
+                    }
+                },
             }
         }
     }
@@ -416,6 +426,46 @@ pub const FileSystem = struct {
         options: HostTreeOptions,
         manifest: ?*const HostTreeManifest,
     ) Error!void {
+        const HardlinkUpdate = struct {
+            host_path: []u8,
+            target: []u8,
+            canonical_changed: bool,
+        };
+        var hardlink_updates = std.array_list.Managed(HardlinkUpdate).init(self.allocator);
+        defer {
+            for (hardlink_updates.items) |update| {
+                self.allocator.free(update.host_path);
+                self.allocator.free(update.target);
+            }
+            hardlink_updates.deinit();
+        }
+        for (0..self.tree.nodeCount()) |index| {
+            const node = self.tree.nodeView(index);
+            if (node.kind != .hardlink) continue;
+            const target = switch (node.payload) {
+                .hardlink_target => |path| path,
+                else => continue,
+            };
+            const alias_host = try std.fs.path.join(self.allocator, &.{ source, node.path });
+            defer self.allocator.free(alias_host);
+            const alias_stat = Io.Dir.cwd().statFile(self.io, alias_host, .{}) catch continue;
+            if (alias_stat.kind != .file) continue;
+            const target_host = try std.fs.path.join(self.allocator, &.{ source, target });
+            defer self.allocator.free(target_host);
+            const canonical_changed = if (Io.Dir.cwd().statFile(self.io, target_host, .{})) |target_stat|
+                target_stat.kind != .file or
+                    !try self.hostFileEquals(target_host, target, target_stat.size, options.max_file_bytes)
+            else |_|
+                true;
+            const alias_changed = !try self.hostFileEquals(alias_host, target, alias_stat.size, options.max_file_bytes);
+            if (alias_changed) {
+                try hardlink_updates.append(.{
+                    .host_path = try self.allocator.dupe(u8, alias_host),
+                    .target = try self.allocator.dupe(u8, target),
+                    .canonical_changed = canonical_changed,
+                });
+            }
+        }
         var seen = std.StringHashMap(void).init(self.allocator);
         defer {
             var iterator = seen.keyIterator();
@@ -428,6 +478,16 @@ pub const FileSystem = struct {
         defer {
             for (removals.items) |path| self.allocator.free(path);
             removals.deinit();
+        }
+        for (hardlink_updates.items) |update| {
+            const target = self.tree.findNode(update.target) orelse continue;
+            if (update.canonical_changed) {
+                if (!try self.hostFileEquals(update.host_path, update.target, (try Io.Dir.cwd().statFile(self.io, update.host_path, .{})).size, options.max_file_bytes)) {
+                    return error.ConflictingHardlinkUpdate;
+                }
+            } else {
+                try self.copyIn(update.host_path, update.target, target.metadata);
+            }
         }
         for (0..self.tree.nodeCount()) |index| {
             const entry = self.tree.nodeView(index);
@@ -546,22 +606,49 @@ pub const FileSystem = struct {
         const atomic_path = self.atomic_path orelse return error.AtomicPublishPathRequired;
         const current_stat = try self.file.stat(self.io);
         const atomic_stat = try Io.Dir.cwd().statFile(self.io, atomic_path, .{});
-        if (current_stat.inode != self.source_inode or atomic_stat.inode != self.source_inode) {
+        if (!self.sameSourceStat(current_stat) or !self.sameSourceStat(atomic_stat)) {
             return error.AtomicSourceChanged;
         }
-        try validateCommitProfile(self.identity);
+        const preserve_feature_ro_compat = try self.validateCommitProfile();
         const cursor = try self.tree.cursor();
         const root = self.tree.rootMetadata();
         const label = self.identity.label;
-        const stage_path = try std.fmt.allocPrint(self.allocator, "{s}.mountless-stage", .{atomic_path});
+        const lock_path = try std.fmt.allocPrint(self.allocator, "{s}.mountless-lock", .{atomic_path});
+        defer self.allocator.free(lock_path);
+        var lock_file = try Io.Dir.cwd().createFile(self.io, lock_path, .{
+            .read = true,
+            .truncate = true,
+            .exclusive = true,
+        });
+        defer {
+            lock_file.close(self.io);
+            DirDelete(self.io, lock_path);
+        }
+        const stage_path = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}.mountless-stage-{d}",
+            .{ atomic_path, @as(u64, @intCast(Io.Clock.real.now(self.io).nanoseconds)) },
+        );
         defer self.allocator.free(stage_path);
-        DirDelete(self.io, stage_path);
         var stage_published = false;
         defer if (!stage_published) DirDelete(self.io, stage_path);
-        try Io.Dir.cwd().copyFile(atomic_path, Io.Dir.cwd(), stage_path, self.io, .{});
-        var stage_file = try Io.Dir.cwd().openFile(self.io, stage_path, .{ .mode = .read_write });
+        var stage_file = try Io.Dir.cwd().createFile(self.io, stage_path, .{
+            .read = true,
+            .truncate = true,
+            .exclusive = true,
+        });
         var stage_open = true;
         defer if (stage_open) stage_file.close(self.io);
+        var copy_buffer: [1024 * 1024]u8 = undefined;
+        var copied: u64 = 0;
+        while (copied < self.source_size) {
+            const wanted: usize = @intCast(@min(@as(u64, copy_buffer.len), self.source_size - copied));
+            const got = try self.file.readPositionalAll(self.io, copy_buffer[0..wanted], copied);
+            if (got != wanted) return error.SourceChangedDuringCopy;
+            try stage_file.writePositionalAll(self.io, copy_buffer[0..got], copied);
+            copied += got;
+        }
+        if (!self.sameSourceStat(try self.file.stat(self.io))) return error.AtomicSourceChanged;
         const info = try ext4.populate(self.io, stage_file, self.allocator, cursor, .{
             .offset = self.offset,
             .length = self.identity.filesystem_length,
@@ -582,12 +669,16 @@ pub const FileSystem = struct {
             .uuid = self.identity.uuid,
             .timestamp = std.math.cast(u32, root.mtime orelse 0) orelse 0,
             .journal = .{ .enabled = self.identity.has_journal },
-            .preserve_feature_ro_compat = self.identity.feature_ro_compat &
-                ext4.writer_feature_ro_compat_optional,
+            .preserve_feature_ro_compat = preserve_feature_ro_compat,
         });
         try stage_file.sync(self.io);
         stage_file.close(self.io);
         stage_open = false;
+        if (!self.sameSourceStat(try self.file.stat(self.io)) or
+            !self.sameSourceStat(try Io.Dir.cwd().statFile(self.io, atomic_path, .{})))
+        {
+            return error.AtomicSourceChanged;
+        }
         // POSIX rename atomically replaces the old image path after the
         // fully validated stage has been closed. This API targets ext4/Linux
         // image mutation; Windows/WASI callers should provide a filesystem
@@ -601,22 +692,49 @@ pub const FileSystem = struct {
     fn ensureMutable(self: *const FileSystem) Error!void {
         if (self.committed) return error.AlreadyCommitted;
     }
+
+    fn sameSourceStat(self: *const FileSystem, observed: Io.File.Stat) bool {
+        return observed.inode == self.source_inode and
+            observed.size == self.source_size and
+            std.meta.eql(observed.mtime, self.source_mtime) and
+            std.meta.eql(observed.ctime, self.source_ctime);
+    }
+
+    fn validateCommitProfile(self: *const FileSystem) !u32 {
+        if (self.identity.inode_size != 256 or self.identity.descriptor_size != 32) {
+            return error.UnsupportedCommitProfile;
+        }
+        const expected_compat = ext4.writer_feature_compat |
+            if (self.identity.has_journal) ext4.feature_compat_has_journal else 0;
+        if (self.identity.feature_compat != expected_compat or
+            self.identity.feature_incompat != ext4.writer_feature_incompat)
+        {
+            return error.UnsupportedCommitProfile;
+        }
+        const optional = ext4.writer_feature_ro_compat_optional;
+        if (self.identity.feature_ro_compat & ~(ext4.writer_feature_ro_compat_base | optional) != 0) {
+            return error.UnsupportedCommitProfile;
+        }
+        var contains_large_file = false;
+        for (0..self.tree.nodeCount()) |index| {
+            const node = self.tree.nodeView(index);
+            switch (node.payload) {
+                .content => |content| if (content.size > std.math.maxInt(i32)) {
+                    contains_large_file = true;
+                },
+                else => {},
+            }
+            if (contains_large_file) break;
+        }
+        const expected_ro = ext4.writer_feature_ro_compat_base |
+            if ((self.identity.feature_ro_compat & optional) != 0 or contains_large_file) optional else 0;
+        if (self.identity.feature_ro_compat != expected_ro) return error.UnsupportedCommitProfile;
+        return self.identity.feature_ro_compat & optional;
+    }
 };
 
 fn DirDelete(io: Io, path: []const u8) void {
     Io.Dir.cwd().deleteFile(io, path) catch {};
-}
-
-fn validateCommitProfile(identity: ext4.GeneralFilesystemIdentity) !void {
-    if (identity.inode_size != 256 or identity.descriptor_size != 32) {
-        return error.UnsupportedCommitProfile;
-    }
-    const compat_allowed = ext4.writer_feature_compat |
-        if (identity.has_journal) ext4.feature_compat_has_journal else 0;
-    if (identity.feature_compat & ~compat_allowed != 0) return error.UnsupportedCommitProfile;
-    if (identity.feature_incompat != ext4.writer_feature_incompat) return error.UnsupportedCommitProfile;
-    const ro_allowed = ext4.writer_feature_ro_compat_base | ext4.writer_feature_ro_compat_optional;
-    if (identity.feature_ro_compat & ~ro_allowed != 0) return error.UnsupportedCommitProfile;
 }
 
 pub const NativeFilesystem = FileSystem;
@@ -723,6 +841,9 @@ test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
     fs.identity.feature_compat |= 0x0010; // resize_inode, not emitted by the writer
     try std.testing.expectError(error.UnsupportedCommitProfile, fs.commit());
     fs.identity.feature_compat = original_compat;
+    fs.identity.feature_compat = original_compat & ~ext4.writer_feature_compat;
+    try std.testing.expectError(error.UnsupportedCommitProfile, fs.commit());
+    fs.identity.feature_compat = original_compat;
     _ = try fs.commit();
 }
 
@@ -759,6 +880,7 @@ test "mountless round trip preserves security metadata and special nodes" {
     try source_tree.putDirectory("dev", .{ .mode = 0o755 });
     try source_tree.putDirectory("usr", .{ .mode = 0o755 });
     try source_tree.putDirectory("usr/bin", .{ .mode = 0o755 });
+    try source_tree.putDirectory("var", .{ .mode = 0o755 });
     try source_tree.putFileBytes("etc/void", "inaccessible", .{
         .mode = 0,
         .uid = 1234,
@@ -779,6 +901,7 @@ test "mountless round trip preserves security metadata and special nodes" {
     try source_tree.putSymlink("etc/void-link", "void", .{ .mode = 0o777 });
     try source_tree.putDevice("dev/null", .char_device, .{ .major = 1, .minor = 3 }, .{ .mode = 0o666 });
     try source_tree.putFifo("dev/initctl", .{ .mode = 0o600 });
+    try source_tree.putFifo("var/fifo", .{ .mode = 0o600 });
     _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
         .length = 64 * 1024 * 1024,
         .label = "fidelity",
@@ -820,7 +943,14 @@ test "mountless round trip preserves security metadata and special nodes" {
     var host_manifest = HostTreeManifest.init(allocator);
     defer host_manifest.deinit();
     try fs.exportHostTreeWithManifest(host_tree_path, .{}, &host_manifest);
+    const staged_alias = try std.fs.path.join(allocator, &.{ host_tree_path, "usr/bin/void-alias" });
+    defer allocator.free(staged_alias);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = staged_alias, .data = "staged-alias" });
     try fs.importHostTreeWithManifest(host_tree_path, .{}, &host_manifest);
+    const staged_target = try fs.read(allocator, "/etc/void", 64);
+    defer allocator.free(staged_target);
+    try std.testing.expectEqualStrings("staged-alias", staged_target);
+    try std.testing.expectEqual(Kind.hardlink, (try fs.stat("/usr/bin/void-alias")).kind);
     try std.testing.expectEqualSlices(u8, &([_]u8{0x45} ** 16), &fs.filesystemIdentity().uuid);
     try std.testing.expectEqualSlices(u8, "fidelity", fs.filesystemIdentity().label[0..8]);
     const locked = try fs.stat("/etc/void");
@@ -834,7 +964,7 @@ test "mountless round trip preserves security metadata and special nodes" {
     try std.testing.expectEqual(@as(usize, 1), sparse.payload.content.sparse_extents.len);
     const alias_bytes = try fs.read(allocator, "/usr/bin/void-alias", 64);
     defer allocator.free(alias_bytes);
-    try std.testing.expectEqualStrings("inaccessible", alias_bytes);
+    try std.testing.expectEqualStrings("staged-alias", alias_bytes);
     try fs.write("/usr/bin/void-alias", "shared", null);
     const shared_target = try fs.read(allocator, "/etc/void", 64);
     defer allocator.free(shared_target);
@@ -870,9 +1000,49 @@ test "mountless round trip preserves security metadata and special nodes" {
         (try reopened.stat("/etc/sparse")).payload.content.sparse_extents.len,
     );
     try std.testing.expectEqual(Kind.char_device, (try reopened.stat("/dev/null")).kind);
+    try std.testing.expectEqual(Kind.fifo, (try reopened.stat("/var/fifo")).kind);
     try std.testing.expectEqual(Kind.hardlink, (try reopened.stat("/usr/bin/void-alias")).kind);
     const reopened_shared = try reopened.read(allocator, "/usr/bin/void-alias", 64);
     defer allocator.free(reopened_shared);
     try std.testing.expectEqualStrings("shared", reopened_shared);
     try std.testing.expectError(error.PathNotFound, reopened.stat("/empty"));
+}
+
+test "atomic commit rejects replacement of the source path after open" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const image_path = "test-ext4-mountless-source-replaced.raw";
+    const replacement_path = "test-ext4-mountless-source-replacement.raw";
+    const spool_path = "test-ext4-mountless-source-replaced.spool";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, replacement_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    var image = try @import("image.zig").Image.createExclusive(io, image_path, .raw, 32 * 1024 * 1024, .{});
+    var image_open = true;
+    defer if (image_open) image.close(io);
+    var tree = root_tree.RootTree.initMemory(allocator, io, .{});
+    defer tree.deinit();
+    try tree.putFileBytes("etc", "source", .{ .mode = 0o644 });
+    _ = try ext4.populate(io, image.file, allocator, try tree.cursor(), .{ .length = 32 * 1024 * 1024 });
+
+    var fs = try FileSystem.open(allocator, io, image.file, .{
+        .length = 32 * 1024 * 1024,
+        .spool_path = spool_path,
+        .atomic_path = image_path,
+    });
+    defer fs.deinit();
+
+    var replacement = try @import("image.zig").Image.createExclusive(
+        io,
+        replacement_path,
+        .raw,
+        32 * 1024 * 1024,
+        .{},
+    );
+    replacement.close(io);
+    try Io.Dir.cwd().rename(replacement_path, Io.Dir.cwd(), image_path, io);
+    try std.testing.expectError(error.AtomicSourceChanged, fs.commit());
+    image_open = false;
+    image.close(io);
 }
