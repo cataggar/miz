@@ -368,9 +368,16 @@ jobs:
       - name: Clean privileged build state
         if: always()
         run: |
-          sudo rm -rf -- "$WORK_DIR" "$BUNDLE_DIR"
-          rm -rf -- "$SIGNING_PROBE_DIR"
-          rm -f -- "${UKI_SIGNING_CERTIFICATE:-}"
+          # Reliably remove root-owned build state and signing material even if
+          # an earlier removal fails, and surface any cleanup failure via a
+          # non-zero exit. This runs in its own always() step, so it never masks
+          # the original build failure recorded on the build steps above.
+          set -uo pipefail
+          status=0
+          sudo rm -rf -- "$WORK_DIR" "$BUNDLE_DIR" || status=1
+          rm -rf -- "$SIGNING_PROBE_DIR" || status=1
+          rm -f -- "${UKI_SIGNING_CERTIFICATE:-}" || status=1
+          exit "$status"
 
   native_qemu:
     name: native-QEMU ${{ matrix.key }}

@@ -97,12 +97,24 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             '"cp"',
         ):
             self.assertNotIn(forbidden, production)
+        # The guest archive keyring is copied to a bounded, validated host copy
+        # outside every debz staging/publication root via materializeTrustedKeyring,
+        # and debz consumes the trusted copy's absolute path (not the guest path),
+        # with a post-transaction check that the trusted bytes never changed.
         self.assertIn(
-            "copyFile(trusted_keyring, Dir.cwd(), external_keyring",
+            "materializeTrustedKeyring(allocator, io, trusted_keyring, external_keyring)",
             production,
         )
         self.assertIn(
-            "realPathFileAlloc(io, external_keyring",
+            "const absolute_keyring = trusted.path",
+            production,
+        )
+        self.assertIn(
+            "realPathFileAlloc(io, destination",
+            production,
+        )
+        self.assertIn(
+            "assertTrustedKeyringUnchanged",
             production,
         )
         self.assertNotIn(
