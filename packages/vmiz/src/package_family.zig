@@ -8,10 +8,10 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Dir = Io.Dir;
 
-pub const api_version: u32 = 3;
-pub const request_schema = "io.github.cataggar.vmiz.package-family.request.v3";
-pub const result_schema = "io.github.cataggar.vmiz.package-family.result.v3";
-pub const debz_api_commit = "b2445dbfdd4e19e0412e934cdc04cdcd1280ced7";
+pub const api_version: u32 = 4;
+pub const request_schema = "io.github.cataggar.vmiz.package-family.request.v4";
+pub const result_schema = "io.github.cataggar.vmiz.package-family.result.v4";
+pub const debz_api_commit = "9cabfc0f808a8beb4709d7e5b3ae7baf19d733d5";
 pub const rpmz_api_commit = "15b5e1291a9fc3eb3980a4088d757b9d0254d468";
 pub const rpm_lock_schema = "io.github.cataggar.vmiz.rpm-lock.v1";
 pub const rpm_provenance_schema = "io.github.cataggar.vmiz.rpm-provenance.v1";
@@ -24,6 +24,7 @@ pub const Operation = enum { resolve_lock, create, customize, update, remove, re
 pub const CacheMode = enum { online, prefer_cache, offline };
 pub const RepositoryPolicy = enum { strict_priority, best_version };
 pub const ConffilePolicy = enum { keep_existing, use_package_version };
+pub const InstalledBaselinePolicy = enum { none, require_locked };
 pub const FailureDisposition = enum { disposable, recoverable };
 
 pub const RpmRepository = struct {
@@ -82,6 +83,7 @@ pub const Inputs = struct {
     recommends: bool = false,
     allow_downgrade: bool = false,
     conffile: ConffilePolicy = .keep_existing,
+    installed_baseline: InstalledBaselinePolicy = .none,
     deadline_ms: u64 = 300_000,
     lock_wait_ms: u64 = 30_000,
     rpm: ?RpmOptions = null,
@@ -229,7 +231,13 @@ pub fn execute(
             cleanup(io, request);
             return failed(.lock_missing, "debz returned an unexpected exact lock path", .disposable, 0);
         }
-        lock_digest = verifyLock(allocator, io, path, request.inputs.architecture) catch {
+        lock_digest = verifyLock(
+            allocator,
+            io,
+            path,
+            request.inputs.architecture,
+            request.inputs.installed_baseline,
+        ) catch {
             cleanup(io, request);
             return failed(.lock_missing, "debz did not emit or preserve a valid exact lock", .disposable, 0);
         };
@@ -510,6 +518,7 @@ fn verifyLock(
     io: Io,
     path: []const u8,
     architecture: Architecture,
+    installed_baseline: InstalledBaselinePolicy,
 ) ![32]u8 {
     const bytes = try readRegularFile(allocator, io, path, debz.exact_lock.maximum_document_bytes);
     defer allocator.free(bytes);
@@ -525,6 +534,16 @@ fn verifyLock(
     };
     if (!std.mem.eql(u8, lock.lock.target_architecture, expected))
         return error.ArchitectureMismatch;
+    if (installed_baseline == .require_locked) {
+        var retained = false;
+        for (lock.lock.packages) |package| {
+            if (package.retention == .retained) {
+                retained = true;
+                break;
+            }
+        }
+        if (!retained) return error.InstalledBaselineMissing;
+    }
     return lock.lock.digest_sha256;
 }
 
@@ -709,6 +728,34 @@ fn fixturePaths(allocator: Allocator, io: Io, suffix: []const u8) !struct {
         .state = try std.fmt.allocPrint(allocator, "{s}/.test-package-{s}-state", .{ cwd, suffix }),
         .lock = try std.fmt.allocPrint(allocator, "{s}/.test-package-{s}.lock", .{ cwd, suffix }),
     };
+}
+
+test "installed baseline policy rejects action-only locks for both architectures" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const paths = try fixturePaths(allocator, io, "baseline-policy");
+    defer allocator.free(paths.stage);
+    defer allocator.free(paths.output);
+    defer allocator.free(paths.state);
+    defer allocator.free(paths.lock);
+    defer Dir.cwd().deleteFile(io, paths.lock) catch {};
+
+    for ([_]struct { spelling: []const u8, architecture: Architecture }{
+        .{ .spelling = "amd64", .architecture = .amd64 },
+        .{ .spelling = "arm64", .architecture = .arm64 },
+    }) |case| {
+        try writeTestLock(io, paths.lock, case.spelling);
+        try std.testing.expectError(
+            error.InstalledBaselineMissing,
+            verifyLock(
+                allocator,
+                io,
+                paths.lock,
+                case.architecture,
+                .require_locked,
+            ),
+        );
+    }
 }
 
 test "embedded debz product executor resolves reviewed lock then publishes Ubuntu fixture" {

@@ -213,6 +213,7 @@ fn packageFamilyRequest(
             .recommends = false,
             .allow_downgrade = false,
             .conffile = .keep_existing,
+            .installed_baseline = .require_locked,
             .deadline_ms = 30 * 60 * 1000,
         },
     };
@@ -1062,18 +1063,14 @@ fn customizeRootWithDebz(
         defer allocator.free(cache);
         const state = try std.fs.path.join(allocator, &.{ transaction_dir, "state" });
         defer allocator.free(state);
-        const resolve_root = try std.fs.path.join(allocator, &.{ transaction_dir, "resolve-root" });
-        defer allocator.free(resolve_root);
         try Dir.cwd().createDirPath(io, cache);
         try Dir.cwd().createDirPath(io, state);
-        try Dir.cwd().createDirPath(io, resolve_root);
-        try prepareEmptyDpkgRoot(allocator, io, resolve_root);
 
         const absolute_cache = try Dir.cwd().realPathFileAlloc(io, cache, allocator);
         defer allocator.free(absolute_cache);
         const absolute_state = try Dir.cwd().realPathFileAlloc(io, state, allocator);
         defer allocator.free(absolute_state);
-        const absolute_resolve_root = try Dir.cwd().realPathFileAlloc(io, resolve_root, allocator);
+        const absolute_resolve_root = try Dir.cwd().realPathFileAlloc(io, current, allocator);
         defer allocator.free(absolute_resolve_root);
         const absolute_transaction = try Dir.cwd().realPathFileAlloc(io, transaction_dir, allocator);
         defer allocator.free(absolute_transaction);
@@ -1311,15 +1308,6 @@ fn restoreRestrictedRootEntry(
     try Dir.cwd().setFilePermissions(io, path, value, .{});
 }
 
-fn prepareEmptyDpkgRoot(allocator: Allocator, io: Io, root: []const u8) !void {
-    const dpkg_dir = try std.fs.path.join(allocator, &.{ root, "var/lib/dpkg" });
-    defer allocator.free(dpkg_dir);
-    try Dir.cwd().createDirPath(io, dpkg_dir);
-    const status = try std.fs.path.join(allocator, &.{ dpkg_dir, "status" });
-    defer allocator.free(status);
-    try Dir.cwd().writeFile(io, .{ .sub_path = status, .data = "" });
-}
-
 fn writeProvenance(
     allocator: Allocator,
     io: Io,
@@ -1329,7 +1317,7 @@ fn writeProvenance(
     evidence: *const [debz_packages.len]DebzEvidence,
 ) !void {
     const document = try std.fmt.allocPrint(allocator,
-        \\{{"schema":1,"type":"vmiz-ubuntu2604-build-provenance","architecture":"{s}","release":"26.04","snapshot":{{"id":"release-{s}","base_url":"{s}/"}},"canonical_key_fingerprint":"{s}","sha256sums_signature_verified":true,"artifacts":{{"sha256sums":{{"filename":"SHA256SUMS","sha256":"{s}"}},"sha256sums_signature":{{"filename":"SHA256SUMS.gpg","sha256":"{s}"}},"source_image":{{"filename":"{s}","sha256":"{s}"}},"image_manifest":{{"filename":"{s}","sha256":"{s}"}}}},"debz":{{"api_commit":"{s}","transactions":[{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}},{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}}]}}}}
+        \\{{"schema":1,"type":"vmiz-ubuntu2604-build-provenance","architecture":"{s}","release":"26.04","snapshot":{{"id":"release-{s}","base_url":"{s}/"}},"canonical_key_fingerprint":"{s}","sha256sums_signature_verified":true,"artifacts":{{"sha256sums":{{"filename":"SHA256SUMS","sha256":"{s}"}},"sha256sums_signature":{{"filename":"SHA256SUMS.gpg","sha256":"{s}"}},"source_image":{{"filename":"{s}","sha256":"{s}"}},"image_manifest":{{"filename":"{s}","sha256":"{s}"}}}},"debz":{{"api_commit":"{s}","baseline":{{"source":"canonical-image-dpkg-status","enforcement":"exact-final-closure"}},"transactions":[{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}},{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}}]}}}}
         \\
     , .{
         @tagName(profile.architecture),
@@ -1832,6 +1820,10 @@ test "package-family resolve and customize requests are exact-lock operations" {
     try std.testing.expectEqual(package_family.Distribution.ubuntu_26_04, amd64.distribution);
     try std.testing.expectEqual(package_family.Operation.resolve_lock, amd64.operation);
     try std.testing.expectEqual(package_family.Architecture.amd64, amd64.inputs.architecture);
+    try std.testing.expectEqual(
+        package_family.InstalledBaselinePolicy.require_locked,
+        amd64.inputs.installed_baseline,
+    );
     try std.testing.expectEqual(@as(usize, 0), amd64.inputs.source_paths.len);
     try std.testing.expectEqualStrings("/inputs/ubuntu.sources", amd64.inputs.config_paths[0]);
     try std.testing.expectEqualStrings("/state/linux-azure.lock", amd64.inputs.lock_output_path.?);
@@ -1849,25 +1841,14 @@ test "package-family resolve and customize requests are exact-lock operations" {
         "/state/walinuxagent.lock",
     );
     try std.testing.expectEqual(package_family.Architecture.arm64, arm64.inputs.architecture);
+    try std.testing.expectEqual(
+        package_family.InstalledBaselinePolicy.require_locked,
+        arm64.inputs.installed_baseline,
+    );
     try std.testing.expectEqual(@as(usize, 0), arm64.inputs.source_paths.len);
     try std.testing.expectEqualStrings("/inputs/ubuntu.sources", arm64.inputs.config_paths[0]);
     try std.testing.expectEqualStrings("/state/walinuxagent.lock", arm64.inputs.lock_input_path.?);
     try std.testing.expect(arm64.inputs.lock_output_path == null);
-}
-
-test "empty lock-resolution roots contain a valid dpkg database" {
-    var temporary = std.testing.tmpDir(.{});
-    defer temporary.cleanup();
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root_length = try temporary.dir.realPath(std.testing.io, &root_buffer);
-
-    try prepareEmptyDpkgRoot(
-        std.testing.allocator,
-        std.testing.io,
-        root_buffer[0..root_length],
-    );
-    const status = try temporary.dir.statFile(std.testing.io, "var/lib/dpkg/status", .{});
-    try std.testing.expectEqual(@as(u64, 0), status.size);
 }
 
 test "root staging preserves intentionally inaccessible snapd directory" {
@@ -2229,6 +2210,10 @@ test "provenance binds signed source metadata and validated debz evidence" {
         @as(usize, 2),
         parsed.value.object.get("debz").?.object.get("transactions").?.array.items.len,
     );
-    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("debz").?.object.count());
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.object.get("debz").?.object.count());
+    try std.testing.expectEqualStrings(
+        "canonical-image-dpkg-status",
+        parsed.value.object.get("debz").?.object.get("baseline").?.object.get("source").?.string,
+    );
     try std.testing.expectEqual(@as(usize, 4), parsed.value.object.get("artifacts").?.object.count());
 }

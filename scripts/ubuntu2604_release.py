@@ -69,7 +69,7 @@ AZURE_CONTRACTS = {
 RELEASE_TAG_RE = re.compile(r"^Ubuntu-26\.04-[0-9]{8}$")
 SNAPSHOT_ID_RE = re.compile(r"^release-[0-9]{8}(?:\.[0-9]+)?$")
 CANONICAL_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{40}$")
-DEBZ_API_COMMIT = "b2445dbfdd4e19e0412e934cdc04cdcd1280ced7"
+DEBZ_API_COMMIT = "9cabfc0f808a8beb4709d7e5b3ae7baf19d733d5"
 DEBZ_PACKAGES = ("linux-azure", "walinuxagent")
 UBUNTU_PROVENANCE_FILENAME = "ubuntu2604-build-provenance.json"
 CANDIDATE_FIELDS = {
@@ -498,11 +498,17 @@ def validate_ubuntu_provenance(
     debz = document.get("debz")
     if not isinstance(debz, dict) or set(debz) != {
         "api_commit",
+        "baseline",
         "transactions",
     }:
         fail("debz provenance binding is invalid")
     if debz.get("api_commit") != DEBZ_API_COMMIT:
         fail("debz API commit is not the embedded vmiz revision")
+    if debz.get("baseline") != {
+        "source": "canonical-image-dpkg-status",
+        "enforcement": "exact-final-closure",
+    }:
+        fail("debz baseline provenance contract is invalid")
     transactions = debz.get("transactions")
     if (
         not isinstance(transactions, list)
@@ -553,6 +559,19 @@ def validate_ubuntu_provenance(
             or not isinstance(lock_document.get("repositories"), list)
             or not lock_document["repositories"]
             or not isinstance(lock_packages, list)
+            or not any(
+                isinstance(entry, dict)
+                and entry.get("retention") == "retained"
+                and isinstance(entry.get("name"), str)
+                and entry["name"]
+                and isinstance(entry.get("version"), str)
+                and entry["version"]
+                and entry.get("architecture") in {
+                    source_architecture,
+                    "all",
+                }
+                for entry in lock_packages
+            )
             or not any(
                 isinstance(entry, dict) and entry.get("name") == package
                 for entry in lock_packages

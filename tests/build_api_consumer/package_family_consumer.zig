@@ -16,11 +16,16 @@ test "public consumer can model lock review and locked creation" {
             .cache_path = "/cache/debz",
             .state_path = "/state/debz",
             .lock_output_path = "/locks/ubuntu.lock",
+            .installed_baseline = .require_locked,
         },
     };
     try std.testing.expectEqual(package_family.Operation.resolve_lock, resolve.operation);
+    try std.testing.expectEqual(
+        package_family.InstalledBaselinePolicy.require_locked,
+        resolve.inputs.installed_baseline,
+    );
     try std.testing.expectEqualStrings(
-        "b2445dbfdd4e19e0412e934cdc04cdcd1280ced7",
+        "9cabfc0f808a8beb4709d7e5b3ae7baf19d733d5",
         package_family.debz_api_commit,
     );
 }
