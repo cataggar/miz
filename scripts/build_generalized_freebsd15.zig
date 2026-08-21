@@ -310,7 +310,6 @@ const Args = struct {
     curl_path: []const u8 = "curl",
     qemu_img_path: []const u8 = "qemu-img",
     qemu_path: []const u8 = "",
-    xorriso_path: []const u8 = "xorriso",
     uefi_code_path: ?[]const u8 = null,
     uefi_vars_path: ?[]const u8 = null,
     accel: Accel = .auto,
@@ -331,7 +330,6 @@ const help_text =
     \\  --curl <path>            curl executable (default: curl)
     \\  --qemu-img <path>        qemu-img executable (default: qemu-img)
     \\  --qemu <path>            Architecture-matched qemu-system executable
-    \\  --xorriso <path>         xorriso executable used for the NoCloud ISO
     \\  --uefi-code <path>       Architecture-matched UEFI pflash code image
     \\  --uefi-vars <path>       Architecture-matched UEFI pflash variables template
     \\  --accel <auto|kvm|tcg>   QEMU accelerator (default: auto)
@@ -370,8 +368,6 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.qemu_img_path = try nextValue(argv, &i);
         } else if (std.mem.eql(u8, arg, "--qemu")) {
             args.qemu_path = try nextValue(argv, &i);
-        } else if (std.mem.eql(u8, arg, "--xorriso")) {
-            args.xorriso_path = try nextValue(argv, &i);
         } else if (std.mem.eql(u8, arg, "--uefi-code")) {
             args.uefi_code_path = try nextValue(argv, &i);
         } else if (std.mem.eql(u8, arg, "--uefi-vars")) {
@@ -985,17 +981,9 @@ fn createSeedIso(
     allocator: Allocator,
     io: Io,
     temporary_path: []const u8,
-    xorriso_path: []const u8,
     profile: Profile,
     nonce: []const u8,
 ) ![]u8 {
-    const seed_dir = try std.fs.path.join(allocator, &.{ temporary_path, "seed" });
-    defer allocator.free(seed_dir);
-    try Dir.cwd().createDir(io, seed_dir, .default_dir);
-    const metadata_path = try std.fs.path.join(allocator, &.{ seed_dir, "meta-data" });
-    defer allocator.free(metadata_path);
-    const user_data_path = try std.fs.path.join(allocator, &.{ seed_dir, "user-data" });
-    defer allocator.free(user_data_path);
     const seed_iso_path = try std.fs.path.join(allocator, &.{ temporary_path, "seed.iso" });
     errdefer allocator.free(seed_iso_path);
 
@@ -1011,21 +999,10 @@ fn createSeedIso(
         nonce,
     );
     defer allocator.free(user_data);
-    try Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata });
-    try Dir.cwd().writeFile(io, .{ .sub_path = user_data_path, .data = user_data });
-    try runCommand(io, &.{
-        xorriso_path,
-        "-as",
-        "mkisofs",
-        "-quiet",
-        "-V",
-        "cidata",
-        "-J",
-        "-r",
-        "-o",
-        seed_iso_path,
-        seed_dir,
-    }, error.SeedIsoCreationFailed);
+    _ = vmiz.iso9660.writeNoCloudSeedPath(allocator, io, seed_iso_path, .{
+        .meta_data = metadata,
+        .user_data = user_data,
+    }) catch return error.SeedIsoCreationFailed;
     const seed_stat = try Dir.cwd().statFile(io, seed_iso_path, .{
         .follow_symlinks = false,
     });
@@ -1570,7 +1547,6 @@ pub fn main(init: std.process.Init) !void {
             allocator,
             io,
             temporary.path,
-            args.xorriso_path,
             profile.*,
             &nonce_hex,
         );
@@ -1692,7 +1668,6 @@ test "FreeBSD builder defaults pin the official release source" {
     try std.testing.expectEqualStrings("curl", args.curl_path);
     try std.testing.expectEqualStrings("qemu-img", args.qemu_img_path);
     try std.testing.expectEqualStrings("qemu-system-aarch64", args.qemu_path);
-    try std.testing.expectEqualStrings("xorriso", args.xorriso_path);
     try std.testing.expectEqual(Accel.auto, args.accel);
     try std.testing.expectEqual(
         default_customization_timeout_seconds,
@@ -1948,8 +1923,6 @@ test "FreeBSD builder parses explicit source and tool paths" {
         "/tools/qemu-img",
         "--qemu",
         "/tools/qemu-system-x86_64",
-        "--xorriso",
-        "/tools/xorriso",
         "--uefi-code",
         "/firmware/code.fd",
         "--uefi-vars",
@@ -1967,7 +1940,6 @@ test "FreeBSD builder parses explicit source and tool paths" {
     try std.testing.expectEqualStrings("/tools/curl", args.curl_path);
     try std.testing.expectEqualStrings("/tools/qemu-img", args.qemu_img_path);
     try std.testing.expectEqualStrings("/tools/qemu-system-x86_64", args.qemu_path);
-    try std.testing.expectEqualStrings("/tools/xorriso", args.xorriso_path);
     try std.testing.expectEqualStrings("/firmware/code.fd", args.uefi_code_path.?);
     try std.testing.expectEqualStrings("/firmware/vars.fd", args.uefi_vars_path.?);
     try std.testing.expectEqual(Accel.tcg, args.accel);

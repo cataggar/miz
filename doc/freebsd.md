@@ -303,7 +303,7 @@ zig build generalized-freebsd15 -- \
 `--work-dir` are used when those options are omitted.
 
 The builder is Linux-only and requires Zig 0.16, `curl`, XZ Utils, `qemu-img`,
-the architecture-matched `qemu-system` executable, `xorriso`, matching
+the architecture-matched `qemu-system` executable, matching
 EDK2/AAVMF or OVMF firmware, and outbound guest networking for signed FreeBSD
 package installation. Use `--source` for a local official compressed image;
 the pinned profile checksum remains required unless explicitly overridden with
