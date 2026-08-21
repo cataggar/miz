@@ -9521,6 +9521,36 @@ test "a real e2fsprogs pinned profile survives import and native growth" {
 
     const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
     defer file.close(io);
+    var raw_sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &raw_sb, superblock_offset);
+    // e2fsprogs places s_orphan_file_inum at 0x280 in the 1024-byte
+    // superblock. Keep this assertion beside the real fixture so a future
+    // profile update cannot accidentally read s_flags at 0x160 instead.
+    try std.testing.expectEqual(@as(u32, 12), readInt(u32, raw_sb[0x280..0x284]));
+    const report = (try runToolCapture(
+        std.testing.allocator,
+        "dumpe2fs",
+        &.{ "-h", path },
+    )) orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(report);
+    for ([_][]const u8{
+        "64bit",
+        "flex_bg",
+        "metadata_csum_seed",
+        "resize_inode",
+        "orphan_file",
+        "Orphan file inode:        12",
+    }) |needle| {
+        try std.testing.expect(std.mem.indexOf(u8, report, needle) != null);
+    }
+    const inode_report = (try runToolCapture(
+        std.testing.allocator,
+        "debugfs",
+        &.{ "-R", "stat <12>", path },
+    )) orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(inode_report);
+    try std.testing.expect(std.mem.indexOf(u8, inode_report, "Mode:  0600") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inode_report, "Flags: 0x80000") != null);
     var reader = try openGeneral(io, file, std.testing.allocator, .{});
     defer reader.deinit();
     try std.testing.expectEqual(@as(u16, 64), reader.descriptor_size);
