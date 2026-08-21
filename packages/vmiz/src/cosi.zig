@@ -269,23 +269,22 @@ fn primaryGptSize(header: gpt.Header) u64 {
 }
 
 fn streamCompressedRegionWriter(writer: *std.Io.Writer, img: Image, io: Io, offset_bytes: u64, length: u64, image_id: [16]u8) WriteError!void {
-    try zstd.writeSkippableFrame(writer, image_id);
-    try zstd.writeFrameHeader(writer, length);
-    if (length == 0) {
-        try zstd.writeRawBlock(writer, &.{}, true);
-        return;
-    }
-
-    var buffer: [zstd.max_block_size]u8 = undefined;
+    var read_buffer: [64 * 1024]u8 = undefined;
+    var block_buffer: [zstd.max_block_size]u8 = undefined;
+    var encoder = try zstd.FrameEncoder.init(writer, &block_buffer, .{
+        .content_size = length,
+        .skippable_payload = image_id,
+    });
     var done: u64 = 0;
     while (done < length) {
         const remaining = length - done;
-        const chunk_len: usize = @intCast(@min(remaining, buffer.len));
-        const got = try img.pread(io, buffer[0..chunk_len], offset_bytes + done);
+        const chunk_len: usize = @intCast(@min(remaining, read_buffer.len));
+        const got = try img.pread(io, read_buffer[0..chunk_len], offset_bytes + done);
         if (got != chunk_len) return error.ShortRead;
         done += chunk_len;
-        try zstd.writeBlocksForSlice(writer, buffer[0..chunk_len], done == length);
+        try encoder.writeAll(read_buffer[0..chunk_len]);
     }
+    try encoder.finish();
 }
 
 const FsProbe = struct {

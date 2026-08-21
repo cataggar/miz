@@ -277,7 +277,7 @@ pub fn writeImageTo(
 
 /// A forward-only sink for image bytes that knows how to emit a run of
 /// zeros without materializing it (gzip, uncompressed) or with a single
-/// reusable block buffer (zstd).
+/// reusable bounded zstd frame encoder.
 const Sink = struct {
     out: *Io.Writer,
     /// Total number of guest-visible bytes this sink will be given. zstd
@@ -298,13 +298,9 @@ const Sink = struct {
         history: []u8,
     };
 
-    /// zstd blocks are emitted whole, so bytes accumulate here until a
-    /// block is full. The full block is deliberately *not* flushed as soon
-    /// as it fills: only `finish` knows which block is the last one, and a
-    /// frame whose last block is empty is not worth risking on a decoder.
     const Zstd = struct {
         block: []u8,
-        fill: usize = 0,
+        encoder: zstd.FrameEncoder,
     };
 
     fn init(
@@ -331,11 +327,13 @@ const Sink = struct {
             .zstd => {
                 const block = try allocator.alloc(u8, zstd.max_block_size);
                 errdefer allocator.free(block);
-                try zstd.writeFrameHeader(out, total);
+                const encoder = try zstd.FrameEncoder.init(out, block, .{
+                    .content_size = total,
+                });
                 return .{
                     .out = out,
                     .total = total,
-                    .state = .{ .zstd = .{ .block = block } },
+                    .state = .{ .zstd = .{ .block = block, .encoder = encoder } },
                 };
             },
         }
@@ -357,16 +355,7 @@ const Sink = struct {
         switch (self.state) {
             .none => try self.out.writeAll(bytes),
             .gzip => |gzip| try gzip.compressor.writer.writeAll(bytes),
-            .zstd => |*zstd_state| {
-                var rest = bytes;
-                while (rest.len > 0) {
-                    if (zstd_state.fill == zstd_state.block.len) try self.flushZstdBlock(false);
-                    const take = @min(rest.len, zstd_state.block.len - zstd_state.fill);
-                    @memcpy(zstd_state.block[zstd_state.fill..][0..take], rest[0..take]);
-                    zstd_state.fill += take;
-                    rest = rest[take..];
-                }
-            },
+            .zstd => |*zstd_state| try zstd_state.encoder.writeAll(bytes),
         }
         self.written += bytes.len;
     }
@@ -375,24 +364,9 @@ const Sink = struct {
         switch (self.state) {
             .none => try splatZeroes(self.out, count),
             .gzip => |gzip| try splatZeroes(&gzip.compressor.writer, count),
-            .zstd => |*zstd_state| {
-                var remaining = count;
-                while (remaining > 0) {
-                    if (zstd_state.fill == zstd_state.block.len) try self.flushZstdBlock(false);
-                    const take: usize = @intCast(@min(remaining, zstd_state.block.len - zstd_state.fill));
-                    @memset(zstd_state.block[zstd_state.fill..][0..take], 0);
-                    zstd_state.fill += take;
-                    remaining -= take;
-                }
-            },
+            .zstd => |*zstd_state| try zstd_state.encoder.writeZeroes(count),
         }
         self.written += count;
-    }
-
-    fn flushZstdBlock(self: *Sink, is_last: bool) WriteError!void {
-        const zstd_state = &self.state.zstd;
-        try zstd.writeBlocksForSlice(self.out, zstd_state.block[0..zstd_state.fill], is_last);
-        zstd_state.fill = 0;
     }
 
     fn finish(self: *Sink) WriteError!void {
@@ -404,7 +378,7 @@ const Sink = struct {
         switch (self.state) {
             .none => {},
             .gzip => |gzip| try gzip.compressor.finish(),
-            .zstd => try self.flushZstdBlock(true),
+            .zstd => |*zstd_state| try zstd_state.encoder.finish(),
         }
     }
 };

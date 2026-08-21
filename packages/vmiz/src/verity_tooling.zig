@@ -199,25 +199,16 @@ fn decompressXz(allocator: std.mem.Allocator, bytes: []const u8) DecompressError
 
 const testing = std.testing;
 
-fn appendCpioEntry(allocator: std.mem.Allocator, list: *std.array_list.Managed(u8), path: []const u8, content: []const u8) !void {
-    var header: [110]u8 = undefined;
-    _ = try std.fmt.bufPrint(&header, "070701{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}", .{
-        0, @as(u32, 0o100644), 0, 0, 1, 0, content.len, 0, 0, 0, 0, path.len + 1, 0,
-    });
-    try list.appendSlice(&header);
-    try list.appendSlice(path);
-    try list.append(0);
-    while (list.items.len % 4 != 0) try list.append(0);
-    try list.appendSlice(content);
-    while (list.items.len % 4 != 0) try list.append(0);
-    _ = allocator;
-}
-
 fn buildTestArchive(allocator: std.mem.Allocator, paths: []const []const u8) ![]u8 {
     var list = std.array_list.Managed(u8).init(allocator);
     errdefer list.deinit();
-    for (paths) |path| try appendCpioEntry(allocator, &list, path, "bytes");
-    try appendCpioEntry(allocator, &list, "TRAILER!!!", "");
+    var writer = cpio.Writer.init(&list, .newc);
+    for (paths) |path| try writer.append(.{
+        .path = path,
+        .content = "bytes",
+        .metadata = .{ .mode = 0o100644 },
+    });
+    try writer.finish();
     return list.toOwnedSlice();
 }
 

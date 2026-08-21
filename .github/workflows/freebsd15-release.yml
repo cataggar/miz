@@ -151,7 +151,7 @@ jobs:
           test "$(uname -m)" = "$expected_uname"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            curl jq openssh-client qemu-utils xorriso xz-utils \
+            curl jq openssh-client qemu-utils xorriso \
             "${platform_packages[@]}"
           test -x "$QEMU"
 

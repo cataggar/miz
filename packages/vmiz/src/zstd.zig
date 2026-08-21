@@ -1,4 +1,5 @@
-//! Small Zstandard encoder/decoder support for COSI output.
+//! Small deterministic Zstandard encoder/decoder used by COSI, SquashFS, and
+//! consumers of the public `vmiz.zstd` API.
 //!
 //! Implemented encoder subset:
 //! - optional leading skippable frame carrying a 16-byte image identifier,
@@ -32,6 +33,10 @@ const invalid_pos = std.math.maxInt(u32);
 
 pub const Error = std.Io.Writer.Error || error{
     BlockTooLarge,
+    EmptyBlockBuffer,
+    ContentSizeExceeded,
+    ContentSizeMismatch,
+    EncoderFinished,
 };
 
 pub const DecodeError = std.mem.Allocator.Error || error{
@@ -64,18 +69,136 @@ const Bitstream = struct {
     }
 };
 
+pub const Compression = enum {
+    compressed,
+    raw,
+};
+
+/// Parameters for a streaming zstd frame. The content size is intentionally
+/// mandatory: callers that write image regions can prove completeness before
+/// publishing a frame, and the emitted single-segment header carries that
+/// same value.
+pub const EncoderOptions = struct {
+    content_size: u64,
+    skippable_payload: ?[skippable_payload_len]u8 = null,
+    compression: Compression = .compressed,
+};
+
+/// A bounded streaming encoder for one zstd frame.
+///
+/// The caller owns `block_buffer`, which bounds encoder working memory and
+/// must remain alive until `finish` returns. Its size selects a block size
+/// from 1 through `max_block_size`; a full buffer is held until another write
+/// or `finish` determines whether it is the final block. This allows callers
+/// such as the QCOW2 writer to use one fixed, bounded buffer per cluster.
+pub const FrameEncoder = struct {
+    writer: *std.Io.Writer,
+    block_buffer: []u8,
+    content_size: u64,
+    written: u64 = 0,
+    fill: usize = 0,
+    compression: Compression,
+    finished: bool = false,
+
+    pub fn init(
+        writer: *std.Io.Writer,
+        block_buffer: []u8,
+        options: EncoderOptions,
+    ) Error!FrameEncoder {
+        if (block_buffer.len == 0) return error.EmptyBlockBuffer;
+        const bounded_buffer = block_buffer[0..@min(block_buffer.len, max_block_size)];
+        if (options.skippable_payload) |payload| try writeSkippableFrame(writer, payload);
+        try writeFrameHeader(writer, options.content_size);
+        return .{
+            .writer = writer,
+            .block_buffer = bounded_buffer,
+            .content_size = options.content_size,
+            .compression = options.compression,
+        };
+    }
+
+    /// Adds exactly these uncompressed bytes to the frame. Writing beyond the
+    /// declared content size fails before mutating the frame.
+    pub fn writeAll(self: *FrameEncoder, bytes: []const u8) Error!void {
+        if (self.finished) return error.EncoderFinished;
+        const count = std.math.cast(u64, bytes.len) orelse return error.ContentSizeExceeded;
+        if (count > self.content_size - self.written) return error.ContentSizeExceeded;
+
+        var remaining = bytes;
+        while (remaining.len > 0) {
+            if (self.fill == self.block_buffer.len) try self.flushBlock(false);
+            const take = @min(remaining.len, self.block_buffer.len - self.fill);
+            @memcpy(self.block_buffer[self.fill..][0..take], remaining[0..take]);
+            self.fill += take;
+            self.written += take;
+            remaining = remaining[take..];
+        }
+    }
+
+    /// Adds a zero run without requiring the caller to allocate it.
+    pub fn writeZeroes(self: *FrameEncoder, count: u64) Error!void {
+        if (self.finished) return error.EncoderFinished;
+        if (count > self.content_size - self.written) return error.ContentSizeExceeded;
+
+        var remaining = count;
+        while (remaining > 0) {
+            if (self.fill == self.block_buffer.len) try self.flushBlock(false);
+            const take: usize = @intCast(@min(remaining, self.block_buffer.len - self.fill));
+            @memset(self.block_buffer[self.fill..][0..take], 0);
+            self.fill += take;
+            self.written += take;
+            remaining -= take;
+        }
+    }
+
+    /// Emits the final zstd block only when the exact declared content size
+    /// was supplied. A zero-byte frame receives its required empty final
+    /// block here.
+    pub fn finish(self: *FrameEncoder) Error!void {
+        if (self.finished) return error.EncoderFinished;
+        if (self.written != self.content_size) return error.ContentSizeMismatch;
+        try self.flushBlock(true);
+        self.finished = true;
+    }
+
+    fn flushBlock(self: *FrameEncoder, is_last: bool) Error!void {
+        switch (self.compression) {
+            .compressed => try writeBlocksForSlice(self.writer, self.block_buffer[0..self.fill], is_last),
+            .raw => try writeRawBlock(self.writer, self.block_buffer[0..self.fill], is_last),
+        }
+        self.fill = 0;
+    }
+};
+
 pub fn frameHeaderSize() usize {
     return 4 + 1 + 8;
 }
 
-/// Worst-case size for this module's frame writer, assuming every block falls
-/// back to raw storage.
-pub fn encodedSize(uncompressed_size: u64, include_skippable: bool) u64 {
-    const blocks = @max(@as(u64, 1), std.math.divCeil(u64, uncompressed_size, max_block_size) catch unreachable);
-    return (if (include_skippable) 8 + skippable_payload_len else 0) + frameHeaderSize() + blocks * 3 + uncompressed_size;
+/// Maximum size of a frame that uses `block_size` or smaller blocks. All
+/// compressed blocks fall back to raw storage unless they shrink, so this is
+/// a strict bound for either encoder mode.
+pub fn maxEncodedSizeForBlockSize(
+    uncompressed_size: u64,
+    block_size: usize,
+    include_skippable: bool,
+) error{SizeOverflow}!u64 {
+    if (block_size == 0 or block_size > max_block_size) return error.SizeOverflow;
+    const blocks = @max(
+        @as(u64, 1),
+        std.math.divCeil(u64, uncompressed_size, block_size) catch return error.SizeOverflow,
+    );
+    const headers = std.math.mul(u64, blocks, 3) catch return error.SizeOverflow;
+    const prefix: u64 = (if (include_skippable) 8 + skippable_payload_len else 0) + frameHeaderSize();
+    const with_headers = std.math.add(u64, prefix, headers) catch return error.SizeOverflow;
+    return std.math.add(u64, with_headers, uncompressed_size) catch return error.SizeOverflow;
 }
 
-pub fn writeSkippableFrame(writer: *std.Io.Writer, payload: [skippable_payload_len]u8) Error!void {
+/// Maximum size of a frame emitted with a full `max_block_size` buffer.
+pub fn maxEncodedSize(uncompressed_size: u64, include_skippable: bool) error{SizeOverflow}!u64 {
+    return maxEncodedSizeForBlockSize(uncompressed_size, max_block_size, include_skippable);
+}
+
+fn writeSkippableFrame(writer: *std.Io.Writer, payload: [skippable_payload_len]u8) Error!void {
     var header: [8]u8 = undefined;
     std.mem.writeInt(u32, header[0..4], skippable_magic, .little);
     std.mem.writeInt(u32, header[4..8], skippable_payload_len, .little);
@@ -83,7 +206,7 @@ pub fn writeSkippableFrame(writer: *std.Io.Writer, payload: [skippable_payload_l
     try writer.writeAll(&payload);
 }
 
-pub fn writeFrameHeader(writer: *std.Io.Writer, uncompressed_size: u64) Error!void {
+fn writeFrameHeader(writer: *std.Io.Writer, uncompressed_size: u64) Error!void {
     var header: [frameHeaderSize()]u8 = undefined;
     std.mem.writeInt(u32, header[0..4], zstd_magic, .little);
     header[4] = 0xE0; // FCS=8 bytes, single-segment, no checksum/dict.
@@ -105,31 +228,23 @@ fn writeBlockHeader(writer: *std.Io.Writer, block_type: u2, block_size: usize, i
     try writer.writeAll(&header);
 }
 
-pub fn writeRawBlock(writer: *std.Io.Writer, bytes: []const u8, is_last: bool) Error!void {
+fn writeRawBlock(writer: *std.Io.Writer, bytes: []const u8, is_last: bool) Error!void {
     try writeBlockHeader(writer, 0, bytes.len, is_last);
     try writer.writeAll(bytes);
 }
 
 pub fn writeRawFrameForSlice(writer: *std.Io.Writer, bytes: []const u8, payload: ?[skippable_payload_len]u8) Error!void {
-    if (payload) |p| try writeSkippableFrame(writer, p);
-    try writeFrameHeader(writer, bytes.len);
-
-    if (bytes.len == 0) {
-        try writeRawBlock(writer, &.{}, true);
-        return;
-    }
-
-    var offset: usize = 0;
-    while (offset < bytes.len) {
-        const remaining = bytes.len - offset;
-        const chunk_len = @min(remaining, max_block_size);
-        const is_last = offset + chunk_len == bytes.len;
-        try writeRawBlock(writer, bytes[offset .. offset + chunk_len], is_last);
-        offset += chunk_len;
-    }
+    var block_buffer: [max_block_size]u8 = undefined;
+    var encoder = try FrameEncoder.init(writer, &block_buffer, .{
+        .content_size = bytes.len,
+        .skippable_payload = payload,
+        .compression = .raw,
+    });
+    try encoder.writeAll(bytes);
+    try encoder.finish();
 }
 
-pub fn writeBlocksForSlice(writer: *std.Io.Writer, bytes: []const u8, is_last_chunk: bool) Error!void {
+fn writeBlocksForSlice(writer: *std.Io.Writer, bytes: []const u8, is_last_chunk: bool) Error!void {
     std.debug.assert(bytes.len <= max_block_size);
 
     if (bytes.len == 0) {
@@ -137,6 +252,36 @@ pub fn writeBlocksForSlice(writer: *std.Io.Writer, bytes: []const u8, is_last_ch
         return;
     }
 
+    if (compressedBlockEncodingSize(bytes) < 3 + bytes.len) {
+        return writeCompressedBlocks(writer, bytes, is_last_chunk);
+    }
+
+    try writeRawBlock(writer, bytes, is_last_chunk);
+}
+
+/// Returns the complete wire size when encoding a slice with the selected
+/// one-sequence blocks. It is evaluated before writing so a compressed choice
+/// cannot exceed the equivalent raw block.
+fn compressedBlockEncodingSize(bytes: []const u8) usize {
+    var cursor: usize = 0;
+    var encoded_size: usize = 0;
+    while (cursor < bytes.len) {
+        if (findBestMatch(bytes, cursor)) |match| {
+            encoded_size += 3 + match.compressed_size;
+            cursor = match.start + match.len;
+            continue;
+        }
+        encoded_size += 3 + bytes.len - cursor;
+        break;
+    }
+    return encoded_size;
+}
+
+fn writeCompressedBlocks(
+    writer: *std.Io.Writer,
+    bytes: []const u8,
+    is_last_chunk: bool,
+) Error!void {
     var cursor: usize = 0;
     while (cursor < bytes.len) {
         if (findBestMatch(bytes, cursor)) |match| {
@@ -151,28 +296,19 @@ pub fn writeBlocksForSlice(writer: *std.Io.Writer, bytes: []const u8, is_last_ch
             cursor = match.start + match.len;
             continue;
         }
-
         try writeRawBlock(writer, bytes[cursor..], is_last_chunk);
-        break;
+        return;
     }
 }
 
 pub fn writeFrameForSlice(writer: *std.Io.Writer, bytes: []const u8, payload: ?[skippable_payload_len]u8) Error!void {
-    if (payload) |p| try writeSkippableFrame(writer, p);
-    try writeFrameHeader(writer, bytes.len);
-
-    if (bytes.len == 0) {
-        try writeRawBlock(writer, &.{}, true);
-        return;
-    }
-
-    var offset: usize = 0;
-    while (offset < bytes.len) {
-        const remaining = bytes.len - offset;
-        const chunk_len = @min(remaining, max_block_size);
-        try writeBlocksForSlice(writer, bytes[offset .. offset + chunk_len], offset + chunk_len == bytes.len);
-        offset += chunk_len;
-    }
+    var block_buffer: [max_block_size]u8 = undefined;
+    var encoder = try FrameEncoder.init(writer, &block_buffer, .{
+        .content_size = bytes.len,
+        .skippable_payload = payload,
+    });
+    try encoder.writeAll(bytes);
+    try encoder.finish();
 }
 
 fn findBestMatch(bytes: []const u8, cursor: usize) ?Match {
@@ -392,7 +528,10 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, encoded: []const u8) DecodeErro
     return .{ .payload = payload, .bytes = try out.toOwnedSlice() };
 }
 
-fn decodeWithCli(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+/// The external implementation is an optional interoperability oracle.  Native
+/// tests still prove round-tripping when a developer or CI runner does not
+/// install `zstd`.
+fn decodeWithCli(allocator: std.mem.Allocator, data: []const u8) !?[]u8 {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "frame.zst", .data = data });
@@ -416,11 +555,7 @@ fn decodeWithCli(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
         .cwd = .{ .path = "." },
     }) catch |err| switch (err) {
         error.FileNotFound => {
-            std.debug.print(
-                "zstd CLI prerequisite is missing: executable 'zstd' was not found on PATH\n",
-                .{},
-            );
-            return error.ExternalDecompressionFailed;
+            return null;
         },
         else => return err,
     };
@@ -449,9 +584,10 @@ fn decodeWithCli(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
 }
 
 fn expectCliAndLocalDecode(encoded: []const u8, expected: []const u8, payload: ?[skippable_payload_len]u8) !void {
-    const cli_decoded = try decodeWithCli(std.testing.allocator, encoded);
-    defer std.testing.allocator.free(cli_decoded);
-    try std.testing.expectEqualSlices(u8, expected, cli_decoded);
+    if (try decodeWithCli(std.testing.allocator, encoded)) |cli_decoded| {
+        defer std.testing.allocator.free(cli_decoded);
+        try std.testing.expectEqualSlices(u8, expected, cli_decoded);
+    }
 
     const decoded = try decodeAlloc(std.testing.allocator, encoded);
     defer std.testing.allocator.free(decoded.bytes);
@@ -512,7 +648,7 @@ test "empty input emits a valid empty frame" {
     const encoded = try writeAndCheck("", null);
     defer std.testing.allocator.free(encoded);
 
-    try std.testing.expectEqual(encodedSize(0, false), encoded.len);
+    try std.testing.expectEqual(try maxEncodedSize(0, false), @as(u64, encoded.len));
     try expectCliAndLocalDecode(encoded, "", null);
 }
 
@@ -524,6 +660,65 @@ test "raw-frame encoder still round-trips via stdlib-backed decoder" {
 
     const payload: [skippable_payload_len]u8 = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     try writeRawFrameForSlice(&out.writer, input[0..], payload);
-    try std.testing.expectEqual(encodedSize(input.len, true), out.written().len);
+    try std.testing.expectEqual(try maxEncodedSize(input.len, true), @as(u64, out.written().len));
     try expectCliAndLocalDecode(out.written(), input[0..], payload);
+}
+
+test "streaming frame encoder preserves data across bounded writes" {
+    var input: [max_block_size + 501]u8 = undefined;
+    var value: u32 = 0x1234_5678;
+    for (&input) |*byte| {
+        value = value *% 1664525 +% 1013904223;
+        byte.* = @truncate(value >> 24);
+    }
+
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    var block_buffer: [4096]u8 = undefined;
+    var encoder = try FrameEncoder.init(&out.writer, &block_buffer, .{
+        .content_size = input.len,
+    });
+
+    var offset: usize = 0;
+    while (offset < input.len) {
+        const chunk_len = @min(@as(usize, 733), input.len - offset);
+        try encoder.writeAll(input[offset .. offset + chunk_len]);
+        offset += chunk_len;
+    }
+    try encoder.finish();
+    try std.testing.expectError(error.EncoderFinished, encoder.writeAll(""));
+    try std.testing.expect(
+        out.written().len <= try maxEncodedSizeForBlockSize(input.len, block_buffer.len, false),
+    );
+    try expectCliAndLocalDecode(out.written(), &input, null);
+}
+
+test "streaming frame encoder requires exact content size" {
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    var block_buffer: [8]u8 = undefined;
+    var encoder = try FrameEncoder.init(&out.writer, &block_buffer, .{
+        .content_size = 4,
+        .compression = .raw,
+    });
+
+    try encoder.writeAll("a");
+    try std.testing.expectError(error.ContentSizeMismatch, encoder.finish());
+    try std.testing.expectError(error.ContentSizeExceeded, encoder.writeAll("bcde"));
+    try std.testing.expectError(error.ContentSizeExceeded, encoder.writeZeroes(4));
+    try encoder.writeZeroes(2);
+    try encoder.writeAll("d");
+    try encoder.finish();
+    try expectCliAndLocalDecode(out.written(), "a\x00\x00d", null);
+}
+
+test "streaming frame encoder rejects empty buffers and size overflow" {
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+
+    try std.testing.expectError(error.EmptyBlockBuffer, FrameEncoder.init(&out.writer, &.{}, .{
+        .content_size = 0,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+    try std.testing.expectError(error.SizeOverflow, maxEncodedSize(std.math.maxInt(u64), false));
 }

@@ -436,9 +436,6 @@ pub const DecompressXzOptions = struct {
     output_path: []const u8,
     max_output_size: u64,
     max_memory_size: u64,
-    /// Explicit XZ Utils executable dependency. The pipeline streams its
-    /// stdout and relies on its complete stream/check validation.
-    xz_path: []const u8,
 };
 
 pub const Qcow2SourceFormat = enum {
@@ -649,17 +646,19 @@ pub fn downloadBoundedAtomic(
     return downloaded;
 }
 
-/// Decompress a digest-pinned XZ artifact with XZ Utils. Unlike Zig 0.16's
-/// in-process XZ decoder, XZ Utils validates block/stream checks and handles
-/// concatenated streams. Its memory use and the published output are bounded.
+/// Decompress one digest-pinned XZ stream with the native Zig decoder.
+///
+/// Source images are a single XZ stream.  Concatenated streams and trailing
+/// bytes are rejected rather than silently choosing an interpretation.  The
+/// compressed input and decoder allocations are bounded by `max_memory_size`;
+/// output is streamed into an atomic stage through a size-limited writer.
 pub fn decompressXz(
     allocator: Allocator,
     io: Io,
     options: DecompressXzOptions,
 ) !Metadata {
     if (options.max_output_size == 0) return error.OutputTooLarge;
-    if (options.max_memory_size == 0) return error.MemoryLimitTooSmall;
-    if (options.xz_path.len == 0) return error.InvalidXzPath;
+    if (options.max_memory_size < 64 * 1024) return error.MemoryLimitTooSmall;
 
     const input_file = try Dir.cwd().openFile(io, options.input_path, .{
         .mode = .read_only,
@@ -681,6 +680,11 @@ pub fn decompressXz(
     if (!std.mem.eql(u8, &input.sha256, &options.expected_input_sha256)) {
         return error.InputChecksumMismatch;
     }
+    if (input_stat.size > options.max_memory_size or
+        input_stat.size > std.math.maxInt(usize))
+    {
+        return error.MemoryLimitTooSmall;
+    }
 
     var output = try OutputLocation.open(io, options.output_path);
     defer output.close(io);
@@ -693,96 +697,42 @@ pub fn decompressXz(
     });
     defer stage.deinit(io);
 
-    const memory_limit = try std.fmt.allocPrint(
-        allocator,
-        "--memlimit-decompress={d}",
-        .{options.max_memory_size},
-    );
-    defer allocator.free(memory_limit);
-
-    var child = try std.process.spawn(io, .{
-        .argv = &.{
-            options.xz_path,
-            "--format=xz",
-            "--decompress",
-            "--stdout",
-            "--threads=1",
-            memory_limit,
-        },
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .inherit,
-    });
-    const child_stdin = child.stdin.?;
-    child.stdin = null;
-    var input_pump = InputPump{
-        .io = io,
-        .input = input_file,
-        .output = child_stdin,
-        .size = input_stat.size,
-    };
-    var input_thread = std.Thread.spawn(
-        .{},
-        InputPump.run,
-        .{&input_pump},
-    ) catch |err| {
-        child_stdin.close(io);
-        child.kill(io);
-        return err;
-    };
-    var input_joined = false;
-    defer {
-        child.kill(io);
-        if (!input_joined) input_thread.join();
+    const compressed = try allocator.alloc(u8, @intCast(input_stat.size));
+    defer allocator.free(compressed);
+    if (try input_file.readPositionalAll(io, compressed, 0) != compressed.len) {
+        return error.InputChanged;
     }
-
+    const decoder_limit: usize = @intCast(options.max_memory_size - input_stat.size);
+    const declared_dictionary = xzFirstLzma2Dictionary(compressed) catch
+        return error.XzDecompressionFailed;
+    if (declared_dictionary > decoder_limit) return error.MemoryLimitTooSmall;
+    var decoder_allocator = CappedAllocator.init(allocator, decoder_limit);
+    var input_reader = Io.Reader.fixed(compressed);
+    var decompressor = std.compress.xz.Decompress.init(
+        &input_reader,
+        decoder_allocator.allocator(),
+        &.{},
+    ) catch return error.XzDecompressionFailed;
+    defer decompressor.deinit();
     var output_buffer: [64 * 1024]u8 = undefined;
     var output_writer = stage.file.writer(io, &output_buffer);
-    var pipe_buffer: [64 * 1024]u8 = undefined;
-    var pipe_reader = child.stdout.?.readerStreaming(io, &pipe_buffer);
-    var buffer: [64 * 1024]u8 = undefined;
-    var total: u64 = 0;
-    var hash = Sha256.init(.{});
-    while (true) {
-        const read = pipe_reader.interface.readSliceShort(&buffer) catch
-            return error.XzDecompressionFailed;
-        if (read == 0) break;
-        const remaining = options.max_output_size - total;
-        if (read > remaining) return error.OutputTooLarge;
-        try output_writer.interface.writeAll(buffer[0..read]);
-        hash.update(buffer[0..read]);
-        total += read;
-    }
+    var hashing_writer = HashingWriter.init(&output_writer.interface, options.max_output_size);
+    _ = decompressor.reader.streamRemaining(&hashing_writer.writer) catch {
+        return if (hashing_writer.limit_exceeded) error.OutputTooLarge else error.XzDecompressionFailed;
+    };
+    if (hashing_writer.limit_exceeded) return error.OutputTooLarge;
+    if (input_reader.seek != input_reader.end) return error.XzDecompressionFailed;
+    try hashing_writer.writer.flush();
     try output_writer.interface.flush();
-
-    const term = try child.wait(io);
-    input_thread.join();
-    input_joined = true;
-    if (input_pump.failure == .input_changed) {
-        return error.InputChanged;
-    }
-    switch (term) {
-        .exited => |code| if (code != 0) return error.XzDecompressionFailed,
-        else => return error.XzDecompressionFailed,
-    }
-    if (input_pump.failure == .xz_failed) {
-        return error.XzDecompressionFailed;
-    }
-    if (!std.mem.eql(u8, &input_pump.digest, &options.expected_input_sha256)) {
-        return error.InputChanged;
-    }
+    const readable_stage = try openProcFdReadOnly(io, stage.file);
+    defer readable_stage.close(io);
+    try validateXzIntegrity(io, compressed, readable_stage, hashing_writer.count);
 
     if (!sameFileSnapshot(input_stat, try input_file.stat(io))) {
         return error.InputChanged;
     }
     try validateStage(io, stage.file);
-    var digest: Digest = undefined;
-    hash.final(&digest);
-    const decompressed = Metadata{
-        .path = options.output_path,
-        .sha256 = digest,
-        .size = total,
-    };
+    const decompressed = try hashing_writer.finish(options.output_path);
     try stage.replace(io);
     return decompressed;
 }
@@ -1234,10 +1184,11 @@ fn runQemuImg(io: Io, options: QemuImgRunOptions) !void {
 
 fn openProcFdReadOnly(io: Io, file: File) !File {
     var path_buffer: [64]u8 = undefined;
+    const fd_directory = if (builtin.os.tag == .linux) "/proc/self/fd" else "/dev/fd";
     const path = try std.fmt.bufPrint(
         &path_buffer,
-        "/proc/self/fd/{d}",
-        .{file.handle},
+        "{s}/{d}",
+        .{ fd_directory, file.handle },
     );
     return Dir.cwd().openFile(io, path, .{
         .mode = .read_only,
@@ -1490,54 +1441,229 @@ fn posixFileSystemId(file: File) !u64 {
     }
 }
 
-const InputPump = struct {
+/// The Zig 0.16 XZ decoder validates stream framing but does not compare the
+/// per-block check bytes.  Verify the checked output independently, using the
+/// XZ index to bind each stored check to its exact decoded byte range.
+fn validateXzIntegrity(
     io: Io,
-    input: File,
+    encoded: []const u8,
     output: File,
-    size: u64,
-    digest: Digest = undefined,
-    failure: ?Failure = null,
-
-    const Failure = enum {
-        input_changed,
-        xz_failed,
-    };
-
-    fn run(self: *InputPump) void {
-        defer self.output.close(self.io);
-        var output_buffer: [64 * 1024]u8 = undefined;
-        var output_writer = self.output.writerStreaming(self.io, &output_buffer);
-        var buffer: [64 * 1024]u8 = undefined;
-        var hash = Sha256.init(.{});
-        var offset: u64 = 0;
-        while (offset < self.size) {
-            const length: usize = @intCast(@min(self.size - offset, buffer.len));
-            const read = self.input.readPositionalAll(
-                self.io,
-                buffer[0..length],
-                offset,
-            ) catch {
-                self.failure = .input_changed;
-                return;
-            };
-            if (read != length) {
-                self.failure = .input_changed;
-                return;
-            }
-            output_writer.interface.writeAll(buffer[0..read]) catch {
-                self.failure = .xz_failed;
-                return;
-            };
-            hash.update(buffer[0..read]);
-            offset += read;
-        }
-        output_writer.interface.flush() catch {
-            self.failure = .xz_failed;
-            return;
-        };
-        hash.final(&self.digest);
+    output_size: u64,
+) !void {
+    if (encoded.len < 24 or
+        !std.mem.eql(u8, encoded[0..6], &.{ 0xFD, '7', 'z', 'X', 'Z', 0 }) or
+        !std.mem.eql(u8, encoded[encoded.len - 2 ..], "YZ"))
+    {
+        return error.XzDecompressionFailed;
     }
-};
+    const check = encoded[7] & 0x0F;
+    const check_size: usize = switch (check) {
+        0 => 0,
+        1 => 4,
+        4 => 8,
+        10 => Sha256.digest_length,
+        else => return error.XzDecompressionFailed,
+    };
+    if (!std.mem.eql(u8, encoded[encoded.len - 4 .. encoded.len - 2], encoded[6..8])) {
+        return error.XzDecompressionFailed;
+    }
+    const backward_size = readU32Le(encoded[encoded.len - 8 .. encoded.len - 4]);
+    const index_size = std.math.mul(usize, @as(usize, backward_size) + 1, 4) catch
+        return error.XzDecompressionFailed;
+    if (index_size > encoded.len - 12) return error.XzDecompressionFailed;
+    const index_start = encoded.len - 12 - index_size;
+    const index_with_checksum = encoded[index_start .. encoded.len - 12];
+    if (index_with_checksum.len < 5 or index_with_checksum[0] != 0) {
+        return error.XzDecompressionFailed;
+    }
+
+    var index_offset: usize = 1;
+    const records = try xzLeb128(index_with_checksum, &index_offset);
+    if (records > std.math.maxInt(usize)) return error.XzDecompressionFailed;
+    var block_offset: usize = 12;
+    var output_offset: u64 = 0;
+    var block_index: u64 = 0;
+    while (block_index < records) : (block_index += 1) {
+        const unpadded_size = try xzLeb128(index_with_checksum, &index_offset);
+        const unpacked_size = try xzLeb128(index_with_checksum, &index_offset);
+        if (unpadded_size == 0 or unpadded_size > std.math.maxInt(usize)) {
+            return error.XzDecompressionFailed;
+        }
+        if (block_offset >= index_start) return error.XzDecompressionFailed;
+        const header_size = std.math.add(
+            usize,
+            @as(usize, encoded[block_offset]),
+            1,
+        ) catch return error.XzDecompressionFailed;
+        const header_bytes = std.math.mul(usize, header_size, 4) catch
+            return error.XzDecompressionFailed;
+        if (header_bytes > unpadded_size -| check_size) return error.XzDecompressionFailed;
+        const content_end = std.math.add(
+            usize,
+            block_offset,
+            @intCast(unpadded_size - check_size),
+        ) catch
+            return error.XzDecompressionFailed;
+        const check_start = std.math.add(
+            usize,
+            content_end,
+            (4 - (content_end % 4)) % 4,
+        ) catch return error.XzDecompressionFailed;
+        const block_end = std.math.add(usize, check_start, check_size) catch
+            return error.XzDecompressionFailed;
+        if (block_end > index_start) return error.XzDecompressionFailed;
+        if (unpacked_size > output_size -| output_offset) return error.XzDecompressionFailed;
+        for (encoded[content_end..check_start]) |byte| {
+            if (byte != 0) return error.XzDecompressionFailed;
+        }
+        const output_end = std.math.add(u64, output_offset, unpacked_size) catch
+            return error.XzDecompressionFailed;
+        if (output_end > output_size) return error.XzDecompressionFailed;
+        try validateXzCheck(
+            io,
+            output,
+            output_offset,
+            unpacked_size,
+            check,
+            encoded[check_start..block_end],
+        );
+        block_offset = block_end;
+        output_offset = output_end;
+    }
+    while (index_offset < index_with_checksum.len - 4) : (index_offset += 1) {
+        if (index_with_checksum[index_offset] != 0) return error.XzDecompressionFailed;
+    }
+    if (index_offset != index_with_checksum.len - 4 or block_offset != index_start or output_offset != output_size) {
+        return error.XzDecompressionFailed;
+    }
+    const stored_index_crc = readU32Le(index_with_checksum[index_with_checksum.len - 4 ..]);
+    if (std.hash.Crc32.hash(index_with_checksum[0 .. index_with_checksum.len - 4]) != stored_index_crc) {
+        return error.XzDecompressionFailed;
+    }
+}
+
+fn xzLeb128(bytes: []const u8, offset: *usize) !u64 {
+    var value: u64 = 0;
+    var shift: u6 = 0;
+    var count: usize = 0;
+    while (count < 9) : (count += 1) {
+        if (offset.* == bytes.len) return error.XzDecompressionFailed;
+        const byte = bytes[offset.*];
+        offset.* += 1;
+        if (count == 8 and byte > 1) return error.XzDecompressionFailed;
+        value |= @as(u64, byte & 0x7F) << shift;
+        if (byte & 0x80 == 0) return value;
+        shift += 7;
+    }
+    return error.XzDecompressionFailed;
+}
+
+/// Returns the LZMA2 dictionary declared by the first XZ block.  XZ streams
+/// use one filter chain throughout in vmiz's supported single-filter profile;
+/// unsupported filter layouts fail before allocating a decoder dictionary.
+fn xzFirstLzma2Dictionary(encoded: []const u8) !usize {
+    if (encoded.len < 13 or
+        !std.mem.eql(u8, encoded[0..6], &.{ 0xFD, '7', 'z', 'X', 'Z', 0 }))
+    {
+        return error.XzDecompressionFailed;
+    }
+    if (encoded[12] == 0) return 0;
+    const header_len = std.math.mul(usize, @as(usize, encoded[12]) + 1, 4) catch
+        return error.XzDecompressionFailed;
+    const header_end = std.math.add(usize, 12, header_len) catch
+        return error.XzDecompressionFailed;
+    if (header_len < 8 or header_end > encoded.len) return error.XzDecompressionFailed;
+    const header = encoded[12..header_end];
+    const flags = header[1];
+    if (flags & 0x3F != 0) return error.XzDecompressionFailed;
+    var offset: usize = 2;
+    const fields = header[0 .. header.len - 4];
+    if (flags & 0x40 != 0) _ = try xzLeb128(fields, &offset);
+    if (flags & 0x80 != 0) _ = try xzLeb128(fields, &offset);
+    if (try xzLeb128(fields, &offset) != 0x21 or
+        try xzLeb128(fields, &offset) != 1 or
+        offset >= fields.len)
+    {
+        return error.XzDecompressionFailed;
+    }
+    const property = fields[offset];
+    offset += 1;
+    while (offset < fields.len) : (offset += 1) {
+        if (fields[offset] != 0) return error.XzDecompressionFailed;
+    }
+    if (property > 40) return error.XzDecompressionFailed;
+    const dictionary: u64 = if (property == 40)
+        std.math.maxInt(u32)
+    else
+        (@as(u64, 2 | (property & 1)) << @intCast(property / 2 + 11));
+    if (dictionary > std.math.maxInt(usize)) return error.MemoryLimitTooSmall;
+    return @intCast(dictionary);
+}
+
+fn validateXzCheck(
+    io: Io,
+    output: File,
+    offset: u64,
+    len: u64,
+    check: u8,
+    expected: []const u8,
+) !void {
+    if (check == 0) return;
+    var buffer: [64 * 1024]u8 = undefined;
+    var current = offset;
+    switch (check) {
+        1 => {
+            var hasher = std.hash.Crc32.init();
+            while (current - offset < len) {
+                const amount: usize = @intCast(@min(len - (current - offset), buffer.len));
+                if (try output.readPositionalAll(io, buffer[0..amount], current) != amount) return error.XzDecompressionFailed;
+                hasher.update(buffer[0..amount]);
+                current += amount;
+            }
+            if (hasher.final() != readU32Le(expected[0..4])) return error.XzDecompressionFailed;
+        },
+        4 => {
+            var hasher = std.hash.crc.Crc64Xz.init();
+            while (current - offset < len) {
+                const amount: usize = @intCast(@min(len - (current - offset), buffer.len));
+                if (try output.readPositionalAll(io, buffer[0..amount], current) != amount) return error.XzDecompressionFailed;
+                hasher.update(buffer[0..amount]);
+                current += amount;
+            }
+            if (hasher.final() != readU64Le(expected[0..8])) return error.XzDecompressionFailed;
+        },
+        10 => {
+            var hasher = Sha256.init(.{});
+            while (current - offset < len) {
+                const amount: usize = @intCast(@min(len - (current - offset), buffer.len));
+                if (try output.readPositionalAll(io, buffer[0..amount], current) != amount) return error.XzDecompressionFailed;
+                hasher.update(buffer[0..amount]);
+                current += amount;
+            }
+            var actual: [Sha256.digest_length]u8 = undefined;
+            hasher.final(&actual);
+            if (!std.mem.eql(u8, &actual, expected)) return error.XzDecompressionFailed;
+        },
+        else => return error.XzDecompressionFailed,
+    }
+}
+
+fn readU32Le(bytes: []const u8) u32 {
+    std.debug.assert(bytes.len == 4);
+    return @as(u32, bytes[0]) |
+        (@as(u32, bytes[1]) << 8) |
+        (@as(u32, bytes[2]) << 16) |
+        (@as(u32, bytes[3]) << 24);
+}
+
+fn readU64Le(bytes: []const u8) u64 {
+    std.debug.assert(bytes.len == 8);
+    var value: u64 = 0;
+    for (bytes, 0..) |byte, index| {
+        value |= @as(u64, byte) << @intCast(index * 8);
+    }
+    return value;
+}
 
 const HashingWriter = struct {
     child: *Io.Writer,
@@ -1607,6 +1733,98 @@ const HashingWriter = struct {
             .sha256 = digest,
             .size = self.count,
         };
+    }
+};
+
+/// Caps decoder-owned allocations without constraining the file-backed output.
+/// `std.compress.xz` grows its LZMA2 buffers through the allocator it receives,
+/// so this prevents a malformed stream from turning a declared resource limit
+/// into an unbounded heap allocation.
+const CappedAllocator = struct {
+    child: Allocator,
+    limit: usize,
+    used: usize = 0,
+
+    fn init(child: Allocator, limit: usize) CappedAllocator {
+        return .{ .child = child, .limit = limit };
+    }
+
+    fn allocator(self: *CappedAllocator) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(
+        ctx: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        if (len > self.limit -| self.used) return null;
+        const memory = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.used += len;
+        return memory;
+    }
+
+    fn resize(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and new_len - memory.len > self.limit -| self.used) {
+            return false;
+        }
+        if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        if (new_len >= memory.len) {
+            self.used += new_len - memory.len;
+        } else {
+            self.used -= memory.len - new_len;
+        }
+        return true;
+    }
+
+    fn remap(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and new_len - memory.len > self.limit -| self.used) {
+            return null;
+        }
+        const remapped = self.child.rawRemap(memory, alignment, new_len, ret_addr) orelse
+            return null;
+        if (new_len >= memory.len) {
+            self.used += new_len - memory.len;
+        } else {
+            self.used -= memory.len - new_len;
+        }
+        return remapped;
+    }
+
+    fn free(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) void {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        std.debug.assert(memory.len <= self.used);
+        self.used -= memory.len;
+        self.child.rawFree(memory, alignment, ret_addr);
     }
 };
 
@@ -2150,9 +2368,6 @@ test "native HTTPS request buffer covers bounded signed redirects" {
 }
 
 test "XZ decompression validates and publishes bounded output" {
-    if (!xzAvailable(std.testing.allocator, std.testing.io)) {
-        return error.SkipZigTest;
-    }
     const io = std.testing.io;
     const input_path = "test-artifact.xz";
     const output_path = "test-artifact.out";
@@ -2172,10 +2387,7 @@ test "XZ decompression validates and publishes bounded output" {
     try expectFileContent(io, output_path, expected);
 }
 
-test "XZ decompression accepts concatenated streams" {
-    if (!xzAvailable(std.testing.allocator, std.testing.io)) {
-        return error.SkipZigTest;
-    }
+test "XZ decompression rejects concatenated streams" {
     const io = std.testing.io;
     const input_path = "test-artifact-concatenated.xz";
     const output_path = "test-artifact-concatenated.out";
@@ -2186,20 +2398,18 @@ test "XZ decompression accepts concatenated streams" {
         .sub_path = input_path,
         .data = &input,
     });
-    const result = try decompressXz(
-        std.testing.allocator,
-        io,
-        testXzOptions(input_path, output_path, &input, 1024),
+    try std.testing.expectError(
+        error.XzDecompressionFailed,
+        decompressXz(
+            std.testing.allocator,
+            io,
+            testXzOptions(input_path, output_path, &input, 1024),
+        ),
     );
-    const expected = "FreeBSD artifact pipeline\n" ** 2;
-    try std.testing.expectEqual(@as(u64, expected.len), result.size);
-    try expectFileContent(io, output_path, expected);
+    try std.testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, output_path, .{}));
 }
 
 test "XZ decompression rejects corrupt stream checks and trailing bytes" {
-    if (!xzAvailable(std.testing.allocator, std.testing.io)) {
-        return error.SkipZigTest;
-    }
     const io = std.testing.io;
     const corrupt_path = "test-artifact-corrupt.xz";
     const trailing_path = "test-artifact-trailing.xz";
@@ -2208,7 +2418,9 @@ test "XZ decompression rejects corrupt stream checks and trailing bytes" {
     defer Dir.cwd().deleteFile(io, trailing_path) catch {};
     defer Dir.cwd().deleteFile(io, output_path) catch {};
     var corrupt = test_xz;
-    corrupt[55] ^= 0x01;
+    // This is the CRC64 check, not a framing byte: native verification must
+    // reject a stream whose decoder can otherwise reconstruct the payload.
+    corrupt[56] ^= 0x01;
     const trailing = test_xz ++ [_]u8{0x7f};
     try Dir.cwd().writeFile(io, .{
         .sub_path = corrupt_path,
@@ -2244,9 +2456,6 @@ test "XZ decompression rejects corrupt stream checks and trailing bytes" {
 }
 
 test "XZ decompression preserves output on digest and resource limits" {
-    if (!xzAvailable(std.testing.allocator, std.testing.io)) {
-        return error.SkipZigTest;
-    }
     const io = std.testing.io;
     const input_path = "test-artifact-limits.xz";
     const output_path = "test-artifact-limits.out";
@@ -2271,7 +2480,14 @@ test "XZ decompression preserves output on digest and resource limits" {
     options.max_output_size = 1024;
     options.max_memory_size = 1;
     try std.testing.expectError(
-        error.XzDecompressionFailed,
+        error.MemoryLimitTooSmall,
+        decompressXz(std.testing.allocator, io, options),
+    );
+    try expectFileContent(io, output_path, "existing\n");
+
+    options.max_memory_size = 4 * 1024 * 1024;
+    try std.testing.expectError(
+        error.MemoryLimitTooSmall,
         decompressXz(std.testing.allocator, io, options),
     );
     try expectFileContent(io, output_path, "existing\n");
@@ -2286,9 +2502,6 @@ test "XZ decompression preserves output on digest and resource limits" {
 }
 
 test "XZ decompression rejects hard-linked input and output" {
-    if (!xzAvailable(std.testing.allocator, std.testing.io)) {
-        return error.SkipZigTest;
-    }
     const io = std.testing.io;
     const input_path = "test-artifact-alias.xz";
     const output_path = "test-artifact-alias.out";
@@ -2796,19 +3009,6 @@ fn testXzOptions(
         .output_path = output_path,
         .max_output_size = max_output_size,
         .max_memory_size = 64 * 1024 * 1024,
-        .xz_path = "xz",
-    };
-}
-
-fn xzAvailable(allocator: Allocator, io: Io) bool {
-    const result = std.process.run(allocator, io, .{
-        .argv = &.{ "xz", "--version" },
-    }) catch return false;
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    return switch (result.term) {
-        .exited => |code| code == 0,
-        else => false,
     };
 }
 

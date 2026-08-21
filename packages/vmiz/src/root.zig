@@ -60,6 +60,8 @@ pub const build_iso = @import("build_iso.zig");
 pub const recustomize_iso = @import("recustomize_iso.zig");
 pub const customize = @import("customize.zig");
 pub const cpio = @import("cpio.zig");
+/// Native deterministic Zstandard frame encoder shared by image formats.
+pub const zstd = @import("zstd.zig");
 pub const kernel_modules = @import("kernel_modules.zig");
 pub const limits = @import("limits.zig");
 pub const free_space = @import("free_space.zig");
