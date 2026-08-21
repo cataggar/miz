@@ -118,17 +118,20 @@ builder dependencies as the release workflow:
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
   binutils file jq \
-  linux-image-generic openssl \
-  python3 python3-pefile qemu-utils sbsigntool systemd-ukify
+  linux-image-generic \
+  python3 python3-pefile qemu-utils systemd-ukify
 sudo chmod 0644 /boot/vmlinuz-*
 ```
 
 The builder inventory is limited to UKI assembly/signing tools (`binutils`,
-`linux-image-generic`, `python3-pefile`, `sbsigntool`, and `systemd-ukify`),
-`qemu-utils`, `file`, `jq`, and OpenSSL. HTTPS/OpenPGP artifact
-verification and XZ/zstd decoding and encoding plus newc cpio archive creation
-are native, bounded implementations; no host codec library or `curl`, GnuPG,
-`cpio`, `xz`, or `zstd` executable is used.
+`linux-image-generic`, `python3-pefile`, and `systemd-ukify`), `qemu-utils`,
+`file`, and `jq`. HTTPS/OpenPGP artifact verification and XZ/zstd decoding and
+encoding plus newc cpio archive creation are native, bounded implementations;
+no host codec library or `curl`, GnuPG, `cpio`, `xz`, or `zstd` executable is
+used. X.509 certificate normalization, canonical-DER fingerprinting, local-key
+Authenticode signing, and Secure Boot signature verification are likewise
+native, so the builder neither installs nor invokes `openssl`, `sbsign`, or
+`sbverify`.
 `qemu-img convert` is retained only because vmiz does not yet encode the final
 standalone zstd-compressed QCOW2 clusters. All resize, copy, GPT, filesystem
 mutation, and final structural validation before publication are native.

@@ -2036,7 +2036,7 @@ pub fn main(init: std.process.Init) !void {
         return error.ChecksumMismatch;
     if (args.preflight_only) return;
 
-    for (&[_][]const u8{ "ukify", "sbverify" }) |tool|
+    for (&[_][]const u8{"ukify"}) |tool|
         try requireTool(allocator, io, tool);
     const config = try signingConfig(args);
 
@@ -2103,7 +2103,7 @@ pub fn main(init: std.process.Init) !void {
     const signing_scratch = try std.fs.path.join(allocator, &.{ work_dir, "signing" });
     defer allocator.free(signing_scratch);
     try uki_signing.prepareScratchDirectory(io, signing_scratch);
-    var certificate = try uki_signing.prepareCertificate(allocator, io, config, signing_scratch);
+    var certificate = try uki_signing.prepareCertificate(allocator, io, config);
     defer certificate.deinit(allocator);
     const unsigned_bytes = try Dir.cwd().readFileAlloc(io, unsigned_uki, allocator, .limited(256 * 1024 * 1024));
     defer allocator.free(unsigned_bytes);
@@ -2122,7 +2122,7 @@ pub fn main(init: std.process.Init) !void {
     const signed_path = try std.fs.path.join(allocator, &.{ work_dir, profile.efi_fallback });
     defer allocator.free(signed_path);
     try Dir.cwd().writeFile(io, .{ .sub_path = signed_path, .data = signed.bytes });
-    try uki_signing.verifyBytes(allocator, io, config, signing_scratch, 0, signed.bytes);
+    try uki_signing.verifyBytes(allocator, io, config, signed.bytes);
 
     try insertSignedUki(allocator, io, mutable, signed_path, profile);
     try finalizeCompressedQcow2(allocator, io, mutable, output);

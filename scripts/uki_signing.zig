@@ -10,7 +10,6 @@ pub const Digest = vmiz.artifact_pipeline.Digest;
 pub const Mode = union(enum) {
     local_key: struct {
         private_key_path: []const u8,
-        sbsign_path: []const u8 = "sbsign",
     },
     external_command: struct {
         executable_path: []const u8,
@@ -29,8 +28,6 @@ pub const Config = struct {
     certificate_path: []const u8,
     expected_certificate_sha256: Digest,
     mode: Mode,
-    openssl_path: []const u8 = "openssl",
-    sbverify_path: []const u8 = "sbverify",
 };
 
 pub const Certificate = struct {
@@ -102,9 +99,7 @@ pub const ProviderMetadata = struct {
     }
 };
 
-const max_certificate_bytes = 1024 * 1024;
-const max_command_output_bytes = 64 * 1024;
-const max_signature_overhead = 4 * 1024 * 1024;
+const max_private_key_bytes = 64 * 1024;
 const max_provider_metadata_bytes = 16 * 1024;
 
 pub fn parseFingerprint(value: []const u8) error{InvalidCertificateFingerprint}!Digest {
@@ -120,54 +115,36 @@ pub fn prepareScratchDirectory(io: Io, path: []const u8) !void {
     try directory.setPermissions(io, .fromMode(0o700));
 }
 
+/// Loads the declared signing certificate, checks its fingerprint against the
+/// one the release is pinned to, and renders a short human description of it.
+/// The normalization to DER, the structural validation, and the description
+/// are all this project's own code; nothing here runs `openssl`.
 pub fn prepareCertificate(
     allocator: Allocator,
     io: Io,
     config: Config,
-    scratch_path: []const u8,
 ) !Certificate {
-    const der_path = try std.fs.path.join(allocator, &.{ scratch_path, "certificate.der" });
-    defer allocator.free(der_path);
-    try runSanitizedNoOutput(allocator, io, &.{
-        config.openssl_path,
-        "x509",
-        "-in",
-        config.certificate_path,
-        "-outform",
-        "DER",
-        "-out",
-        der_path,
-    });
-
-    const der = try Dir.cwd().readFileAlloc(
-        io,
-        der_path,
+    var certificate = vmiz.uki_signing.loadCertificateAlloc(
         allocator,
-        .limited(max_certificate_bytes),
-    );
-    errdefer allocator.free(der);
-    if (der.len == 0) return error.EmptyCertificate;
-    const digest = vmiz.artifact_pipeline.sha256Bytes(der);
-    if (!std.mem.eql(u8, &digest, &config.expected_certificate_sha256))
+        io,
+        .{ .host_path = config.certificate_path },
+    ) catch return error.InvalidSigningCertificate;
+    defer certificate.deinit(allocator);
+    if (certificate.der.len == 0) return error.EmptyCertificate;
+    if (!std.mem.eql(u8, &certificate.sha256, &config.expected_certificate_sha256))
         return error.CertificateFingerprintMismatch;
 
-    const details = try runSanitized(allocator, io, &.{
-        config.openssl_path,
-        "x509",
-        "-in",
-        config.certificate_path,
-        "-noout",
-        "-subject",
-        "-issuer",
-        "-serial",
-        "-dates",
-    }, max_command_output_bytes);
+    const details = try vmiz.authenticode.describeCertificateAlloc(
+        allocator,
+        certificate.der,
+    );
     errdefer allocator.free(details);
     if (details.len == 0) return error.EmptyCertificateDetails;
 
+    const der = try allocator.dupe(u8, certificate.der);
     return .{
         .der = der,
-        .sha256 = digest,
+        .sha256 = certificate.sha256,
         .details = details,
     };
 }
@@ -189,9 +166,6 @@ pub fn signUkiAlloc(
             io,
             config,
             local.private_key_path,
-            local.sbsign_path,
-            scratch_path,
-            index,
             unsigned_bytes,
         ),
         .external_command => |external| try signWithProviderAlloc(
@@ -209,11 +183,11 @@ pub fn signUkiAlloc(
     };
     errdefer allocator.free(signed_bytes.bytes);
 
-    // `sbverify` is the cross-check: the library established that these bytes
-    // carry a signature over this image by the declared certificate, and this
-    // says an independent implementation agrees. Neither check subsumes the
-    // other, which is the point of running both.
-    try verifyBytes(allocator, io, config, scratch_path, index, signed_bytes.bytes);
+    // A second, independent pass over the finished bytes: whichever path
+    // produced them, `verifyBytes` re-derives the signer from the image and
+    // checks the RSA signature against the enrolled certificate's own key, so
+    // a signature that does not verify never leaves this function.
+    try verifyBytes(allocator, io, config, signed_bytes.bytes);
 
     return .{
         .bytes = signed_bytes.bytes,
@@ -232,57 +206,53 @@ const SignedBytes = struct {
 /// self-signed build does. The library has no equivalent and should not grow
 /// one: it would mean a key on the build host, which is the arrangement
 /// production signing exists to avoid.
+///
+/// The RSA signing is this project's own (`authenticode.signPeRsaSha256Alloc`),
+/// so a local build depends on no external `sbsign`. That function embeds the
+/// signature and then verifies it against the certificate before returning, so
+/// a key and certificate that do not belong together fail here.
 fn signWithLocalKeyAlloc(
     allocator: Allocator,
     io: Io,
     config: Config,
     private_key_path: []const u8,
-    sbsign_path: []const u8,
-    scratch_path: []const u8,
-    index: usize,
     unsigned_bytes: []const u8,
 ) !SignedBytes {
-    const unsigned_path = try std.fmt.allocPrint(
+    var certificate = vmiz.uki_signing.loadCertificateAlloc(
         allocator,
-        "{s}/unsigned-{d}.efi",
-        .{ scratch_path, index },
-    );
-    defer allocator.free(unsigned_path);
-    const signed_path = try std.fmt.allocPrint(
-        allocator,
-        "{s}/signed-{d}.efi",
-        .{ scratch_path, index },
-    );
-    defer allocator.free(signed_path);
-    Dir.cwd().deleteFile(io, unsigned_path) catch {};
-    Dir.cwd().deleteFile(io, signed_path) catch {};
-    defer Dir.cwd().deleteFile(io, unsigned_path) catch {};
-    defer Dir.cwd().deleteFile(io, signed_path) catch {};
-    try Dir.cwd().writeFile(io, .{
-        .sub_path = unsigned_path,
-        .data = unsigned_bytes,
-        .flags = .{
-            .truncate = true,
-            .permissions = .fromMode(0o600),
-        },
-    });
-    try runSanitizedNoOutput(allocator, io, &.{
-        sbsign_path,
-        "--key",
-        private_key_path,
-        "--cert",
-        config.certificate_path,
-        "--output",
-        signed_path,
-        unsigned_path,
-    });
-
-    const signed_bytes = try Dir.cwd().readFileAlloc(
         io,
-        signed_path,
+        .{ .host_path = config.certificate_path },
+    ) catch return error.InvalidSigningCertificate;
+    defer certificate.deinit(allocator);
+    if (!std.mem.eql(u8, &certificate.sha256, &config.expected_certificate_sha256))
+        return error.CertificateFingerprintMismatch;
+
+    const key_file = Dir.cwd().readFileAlloc(
+        io,
+        private_key_path,
         allocator,
-        .limited(unsigned_bytes.len + max_signature_overhead),
-    );
+        .limited(max_private_key_bytes),
+    ) catch return error.InvalidSigningPrivateKey;
+    defer {
+        @memset(key_file, 0);
+        allocator.free(key_file);
+    }
+    const key_der = if (std.mem.indexOf(u8, key_file, "PRIVATE KEY-----") != null)
+        vmiz.authenticode.decodePrivateKeyPemAlloc(allocator, key_file) catch
+            return error.InvalidSigningPrivateKey
+    else
+        try allocator.dupe(u8, key_file);
+    defer {
+        @memset(key_der, 0);
+        allocator.free(key_der);
+    }
+
+    const signed_bytes = vmiz.authenticode.signPeRsaSha256Alloc(
+        allocator,
+        unsigned_bytes,
+        key_der,
+        certificate.der,
+    ) catch return error.LocalKeySigningFailed;
     errdefer allocator.free(signed_bytes);
     try verifyPayloads(allocator, unsigned_bytes, signed_bytes);
     return .{ .bytes = signed_bytes };
@@ -450,52 +420,36 @@ fn isUuid(value: []const u8) bool {
     return true;
 }
 
+/// Verifies finished signed bytes natively: the embedded Authenticode signature
+/// must be a valid RSA/SHA-256 signature over this image, and the certificate
+/// it was made by must be, byte for byte, the enrolled certificate this release
+/// is pinned to. This is the replacement for `sbverify`, and unlike it, it
+/// checks the signer's identity rather than only that some signature verifies.
 pub fn verifyBytes(
     allocator: Allocator,
     io: Io,
     config: Config,
-    scratch_path: []const u8,
-    index: usize,
     signed_bytes: []const u8,
 ) !void {
-    const signed_path = try std.fmt.allocPrint(
-        allocator,
-        "{s}/verify-{d}.efi",
-        .{ scratch_path, index },
-    );
-    defer allocator.free(signed_path);
-    Dir.cwd().deleteFile(io, signed_path) catch {};
-    defer Dir.cwd().deleteFile(io, signed_path) catch {};
-    try Dir.cwd().writeFile(io, .{
-        .sub_path = signed_path,
-        .data = signed_bytes,
-        .flags = .{
-            .truncate = true,
-            .permissions = .fromMode(0o600),
-        },
-    });
-    try verifyFile(allocator, io, config, signed_path);
-}
+    const signer = vmiz.authenticode.verifyRsaSha256(signed_bytes) catch
+        return error.SignatureVerificationFailed;
 
-fn verifyFile(
-    allocator: Allocator,
-    io: Io,
-    config: Config,
-    signed_path: []const u8,
-) !void {
-    try runSanitizedNoOutput(allocator, io, &.{
-        config.sbverify_path,
-        "--cert",
-        config.certificate_path,
-        signed_path,
-    });
-    const listed = try runSanitized(allocator, io, &.{
-        config.sbverify_path,
-        "--list",
-        signed_path,
-    }, max_command_output_bytes);
-    defer allocator.free(listed);
-    if (listed.len == 0) return error.EmptySignatureList;
+    var certificate = vmiz.uki_signing.loadCertificateAlloc(
+        allocator,
+        io,
+        .{ .host_path = config.certificate_path },
+    ) catch return error.InvalidSigningCertificate;
+    defer certificate.deinit(allocator);
+    if (!std.mem.eql(u8, &certificate.sha256, &config.expected_certificate_sha256))
+        return error.CertificateFingerprintMismatch;
+
+    // "Verified" is only meaningful against a known certificate: the signer the
+    // signature names must be the enrolled one, not merely a well-formed one.
+    if (!std.mem.eql(u8, signer.certificate_der, certificate.der))
+        return error.SignerCertificateMismatch;
+    const signer_digest = vmiz.artifact_pipeline.sha256Bytes(signer.certificate_der);
+    if (!std.mem.eql(u8, &signer_digest, &config.expected_certificate_sha256))
+        return error.SignerCertificateMismatch;
 }
 
 fn verifyPayloads(
@@ -523,41 +477,6 @@ fn verifyPayloads(
             return error.SignedPeSectionsChanged;
         }
     }
-}
-
-/// Runs a signing-related command without echoing argv or forwarding output.
-/// The caller may request bounded stdout for public certificate/signature data.
-fn runSanitized(
-    allocator: Allocator,
-    io: Io,
-    argv: []const []const u8,
-    stdout_limit: ?usize,
-) ![]u8 {
-    const result = try std.process.run(allocator, io, .{
-        .argv = argv,
-        .stdout_limit = .limited(stdout_limit orelse max_command_output_bytes),
-        .stderr_limit = .limited(max_command_output_bytes),
-        .timeout = .{ .duration = .{
-            .raw = .fromSeconds(5 * 60),
-            .clock = .awake,
-        } },
-    });
-    allocator.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code == 0) return result.stdout,
-        else => {},
-    }
-    allocator.free(result.stdout);
-    return error.SigningCommandFailed;
-}
-
-fn runSanitizedNoOutput(
-    allocator: Allocator,
-    io: Io,
-    argv: []const []const u8,
-) !void {
-    const stdout = try runSanitized(allocator, io, argv, null);
-    allocator.free(stdout);
 }
 
 test "signing mode names are stable provenance values" {

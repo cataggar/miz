@@ -7,12 +7,17 @@ const atomic_output = @import("../atomic_output.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const Dir = std.Io.Dir;
+
+const max_signed_pe_bytes = 512 * 1024 * 1024;
 
 const usage =
     "usage: vmiz uki certificate <disk-image> --output <certificate.pem> " ++
     "[--expected-sha256 <hex>]\n" ++
     "       vmiz uki certificate <disk-image> --output=json " ++
-    "[--expected-sha256 <hex>]";
+    "[--expected-sha256 <hex>]\n" ++
+    "       vmiz uki fingerprint <certificate.pem>\n" ++
+    "       vmiz uki verify --certificate <certificate.pem> <signed-pe>";
 
 const Output = union(enum) {
     pem: []const u8,
@@ -39,6 +44,24 @@ const ParseError = error{
 };
 
 pub fn run(allocator: Allocator, io: Io, args: []const []const u8) u8 {
+    if (args.len == 0) {
+        std.debug.print("vmiz uki: expected a subcommand\n{s}\n", .{usage});
+        return 1;
+    }
+    if (std.mem.eql(u8, args[0], "certificate"))
+        return runCertificate(allocator, io, args);
+    if (std.mem.eql(u8, args[0], "fingerprint"))
+        return runFingerprint(allocator, io, args[1..]);
+    if (std.mem.eql(u8, args[0], "verify"))
+        return runVerify(allocator, io, args[1..]);
+    std.debug.print(
+        "vmiz uki: unknown subcommand '{s}'\n{s}\n",
+        .{ args[0], usage },
+    );
+    return 1;
+}
+
+fn runCertificate(allocator: Allocator, io: Io, args: []const []const u8) u8 {
     const parsed = parseArgs(args) catch |err| {
         std.debug.print(
             "vmiz uki: {s}\n{s}\n",
@@ -118,6 +141,152 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) u8 {
         },
     }
     return 0;
+}
+
+fn runFingerprint(allocator: Allocator, io: Io, args: []const []const u8) u8 {
+    if (args.len != 1 or std.mem.startsWith(u8, args[0], "-")) {
+        std.debug.print(
+            "usage: vmiz uki fingerprint <certificate.pem>\n",
+            .{},
+        );
+        return 1;
+    }
+    var certificate = vmiz.uki_signing.loadCertificateAlloc(
+        allocator,
+        io,
+        .{ .host_path = args[0] },
+    ) catch |err| return failFingerprint(
+        "failed to load certificate '{s}': {s}",
+        .{ args[0], @errorName(err) },
+    );
+    defer certificate.deinit(allocator);
+    const fingerprint = vmiz.artifact_pipeline.formatSha256(certificate.sha256);
+    writeStdout(io, &fingerprint) catch |err| return failFingerprint(
+        "failed to write fingerprint: {s}",
+        .{@errorName(err)},
+    );
+    return 0;
+}
+
+const VerifyArgs = struct {
+    certificate_path: []const u8,
+    signed_path: []const u8,
+};
+
+const VerifyParseError = error{
+    MissingCertificate,
+    DuplicateCertificate,
+    MissingOptionValue,
+    MissingSignedImage,
+    MultipleSignedImages,
+    UnexpectedArgument,
+};
+
+fn parseVerifyArgs(args: []const []const u8) VerifyParseError!VerifyArgs {
+    var certificate_path: ?[]const u8 = null;
+    var signed_path: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const argument = args[i];
+        if (std.mem.eql(u8, argument, "--certificate")) {
+            if (certificate_path != null) return error.DuplicateCertificate;
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            certificate_path = args[i];
+        } else if (std.mem.startsWith(u8, argument, "-")) {
+            return error.UnexpectedArgument;
+        } else if (signed_path == null) {
+            signed_path = argument;
+        } else {
+            return error.MultipleSignedImages;
+        }
+    }
+    return .{
+        .certificate_path = certificate_path orelse return error.MissingCertificate,
+        .signed_path = signed_path orelse return error.MissingSignedImage,
+    };
+}
+
+fn runVerify(allocator: Allocator, io: Io, args: []const []const u8) u8 {
+    const parsed = parseVerifyArgs(args) catch |err| {
+        std.debug.print(
+            "vmiz uki verify: {s}\nusage: vmiz uki verify " ++
+                "--certificate <certificate.pem> <signed-pe>\n",
+            .{@errorName(err)},
+        );
+        return 1;
+    };
+
+    const signed_bytes = Dir.cwd().readFileAlloc(
+        io,
+        parsed.signed_path,
+        allocator,
+        .limited(max_signed_pe_bytes),
+    ) catch |err| return failVerify(
+        "failed to read '{s}': {s}",
+        .{ parsed.signed_path, @errorName(err) },
+    );
+    defer allocator.free(signed_bytes);
+
+    // Full native Authenticode verification: this fails closed on tampering,
+    // an unsupported algorithm, an invalid validity interval, a malformed
+    // certificate table, or a digest that does not cover the image.
+    const signer = vmiz.authenticode.verifyRsaSha256(signed_bytes) catch |err|
+        return failVerify(
+            "signature verification failed: {s}",
+            .{@errorName(err)},
+        );
+
+    var certificate = vmiz.uki_signing.loadCertificateAlloc(
+        allocator,
+        io,
+        .{ .host_path = parsed.certificate_path },
+    ) catch |err| return failVerify(
+        "failed to load certificate '{s}': {s}",
+        .{ parsed.certificate_path, @errorName(err) },
+    );
+    defer certificate.deinit(allocator);
+
+    // "Verified" is only meaningful against a known certificate: the signer the
+    // signature names must be the enrolled one, not merely a well-formed one.
+    if (!std.mem.eql(u8, signer.certificate_der, certificate.der))
+        return failVerify(
+            "signature was not made by the certificate '{s}'",
+            .{parsed.certificate_path},
+        );
+
+    const fingerprint = vmiz.artifact_pipeline.formatSha256(certificate.sha256);
+    reportVerified(io, parsed.signed_path, &fingerprint) catch |err|
+        return failVerify(
+            "failed to report verification: {s}",
+            .{@errorName(err)},
+        );
+    return 0;
+}
+
+fn reportVerified(
+    io: Io,
+    signed_path: []const u8,
+    fingerprint: []const u8,
+) !void {
+    var buffer: [4096]u8 = undefined;
+    var file_writer: Io.File.Writer = .init(.stdout(), io, &buffer);
+    const writer = &file_writer.interface;
+    try writer.print(
+        "verified {s} against certificate sha256 {s}\n",
+        .{ signed_path, fingerprint },
+    );
+    try writer.flush();
+}
+
+fn failFingerprint(comptime format: []const u8, args: anytype) u8 {
+    std.debug.print("vmiz uki fingerprint: " ++ format ++ "\n", args);
+    return 1;
+}
+
+fn failVerify(comptime format: []const u8, args: anytype) u8 {
+    std.debug.print("vmiz uki verify: " ++ format ++ "\n", args);
+    return 1;
 }
 
 fn parseArgs(args: []const []const u8) ParseError!ParsedArgs {
@@ -340,4 +509,72 @@ test "JSON output exposes canonical signer fields" {
         "EFI/BOOT/BOOTX64.EFI",
         root.get("uki_paths").?.array.items[0].string,
     );
+}
+
+test "verify requires a certificate and exactly one signed image" {
+    const parsed = try parseVerifyArgs(&.{
+        "--certificate",
+        "release.pem",
+        "signed.efi",
+    });
+    try std.testing.expectEqualStrings("release.pem", parsed.certificate_path);
+    try std.testing.expectEqualStrings("signed.efi", parsed.signed_path);
+
+    // The signed image may precede the flag; order is not significant.
+    const reordered = try parseVerifyArgs(&.{
+        "signed.efi",
+        "--certificate",
+        "release.pem",
+    });
+    try std.testing.expectEqualStrings("release.pem", reordered.certificate_path);
+    try std.testing.expectEqualStrings("signed.efi", reordered.signed_path);
+
+    try std.testing.expectError(
+        error.MissingCertificate,
+        parseVerifyArgs(&.{"signed.efi"}),
+    );
+    try std.testing.expectError(
+        error.MissingSignedImage,
+        parseVerifyArgs(&.{ "--certificate", "release.pem" }),
+    );
+    try std.testing.expectError(
+        error.MissingOptionValue,
+        parseVerifyArgs(&.{"--certificate"}),
+    );
+    try std.testing.expectError(
+        error.DuplicateCertificate,
+        parseVerifyArgs(&.{
+            "--certificate",
+            "a.pem",
+            "--certificate",
+            "b.pem",
+            "signed.efi",
+        }),
+    );
+    try std.testing.expectError(
+        error.MultipleSignedImages,
+        parseVerifyArgs(&.{
+            "--certificate",
+            "release.pem",
+            "one.efi",
+            "two.efi",
+        }),
+    );
+    try std.testing.expectError(
+        error.UnexpectedArgument,
+        parseVerifyArgs(&.{ "--certificate", "release.pem", "--bogus" }),
+    );
+}
+
+test "an unknown uki subcommand is refused rather than misread" {
+    try std.testing.expectEqual(@as(u8, 1), run(
+        std.testing.allocator,
+        undefined,
+        &.{"bogus"},
+    ));
+    try std.testing.expectEqual(@as(u8, 1), run(
+        std.testing.allocator,
+        undefined,
+        &.{},
+    ));
 }

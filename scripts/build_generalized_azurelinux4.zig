@@ -2768,7 +2768,6 @@ fn verifySignedGeneralizedImage(
     io: Io,
     image_path: []const u8,
     config: uki_signing.Config,
-    scratch_path: []const u8,
     report: *const UkiSigningReport,
 ) !void {
     var image = try vmiz.Image.openPathReadOnly(io, image_path);
@@ -2787,7 +2786,7 @@ fn verifySignedGeneralizedImage(
             vmiz.gpt.sector_size,
     });
 
-    for (report.records, 0..) |record, index| {
+    for (report.records) |record| {
         const bytes = try esp.readFileAlloc(io, gpa, record.path);
         defer gpa.free(bytes);
         if (bytes.len != record.signed_size or
@@ -2799,7 +2798,7 @@ fn verifySignedGeneralizedImage(
         {
             return error.FinalizedUkiDigestMismatch;
         }
-        try uki_signing.verifyBytes(gpa, io, config, scratch_path, index, bytes);
+        try uki_signing.verifyBytes(gpa, io, config, bytes);
     }
 }
 
@@ -3512,9 +3511,6 @@ const Args = struct {
     uki_signing_key: ?[]const u8 = null,
     uki_sign_command: ?[]const u8 = null,
     uki_sign_command_arg: ?[]const u8 = null,
-    sbsign: []const u8 = "sbsign",
-    sbverify: []const u8 = "sbverify",
-    openssl: []const u8 = "openssl",
 };
 
 const help_text =
@@ -3540,9 +3536,6 @@ const help_text =
     \\                      External production signer executable
     \\  --uki-sign-command-arg <argument>
     \\                      Optional fixed signer subcommand
-    \\  --sbsign <path>     sbsign executable for local-key mode
-    \\  --sbverify <path>   sbverify executable (default: sbverify)
-    \\  --openssl <path>    OpenSSL executable (default: openssl)
     \\
     \\Preferred invocation: zig build generalized-azurelinux4 -- [user options]
     \\
@@ -3625,18 +3618,6 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
             a.uki_sign_command_arg = argv[i];
-        } else if (std.mem.eql(u8, arg, "--sbsign")) {
-            i += 1;
-            if (i >= argv.len) return error.MissingValue;
-            a.sbsign = argv[i];
-        } else if (std.mem.eql(u8, arg, "--sbverify")) {
-            i += 1;
-            if (i >= argv.len) return error.MissingValue;
-            a.sbverify = argv[i];
-        } else if (std.mem.eql(u8, arg, "--openssl")) {
-            i += 1;
-            if (i >= argv.len) return error.MissingValue;
-            a.openssl = argv[i];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print("{s}", .{help_text});
             std.process.exit(0);
@@ -3671,7 +3652,6 @@ fn signingConfig(args: Args) !?uki_signing.Config {
     const mode: uki_signing.Mode = if (args.uki_signing_key) |key_path|
         .{ .local_key = .{
             .private_key_path = key_path,
-            .sbsign_path = args.sbsign,
         } }
     else blk: {
         const command_path = args.uki_sign_command.?;
@@ -3686,8 +3666,6 @@ fn signingConfig(args: Args) !?uki_signing.Config {
     return .{
         .certificate_path = certificate_path,
         .expected_certificate_sha256 = expected_sha256,
-        .sbverify_path = args.sbverify,
-        .openssl_path = args.openssl,
         .mode = mode,
     };
 }
@@ -3780,23 +3758,18 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
         }
-        const signing_tools = switch (config.mode) {
-            .local_key => |local| [_][]const u8{
-                config.openssl_path,
-                config.sbverify_path,
-                local.sbsign_path,
+        switch (config.mode) {
+            // Local-key signing is native now, so it needs no external tools.
+            .local_key => {},
+            .external_command => |external| {
+                if (!requireTool(gpa, io, external.executable_path)) {
+                    std.debug.print(
+                        "error: required signing tool '{s}' not found\n",
+                        .{external.executable_path},
+                    );
+                    tools_ok = false;
+                }
             },
-            .external_command => |external| [_][]const u8{
-                config.openssl_path,
-                config.sbverify_path,
-                external.executable_path,
-            },
-        };
-        for (signing_tools) |tool| {
-            if (!requireTool(gpa, io, tool)) {
-                std.debug.print("error: required signing tool '{s}' not found\n", .{tool});
-                tools_ok = false;
-            }
         }
     }
     if (!tools_ok) std.process.exit(1);
@@ -3828,7 +3801,6 @@ pub fn main(init: std.process.Init) !void {
             gpa,
             io,
             config,
-            signing_scratch.?,
         );
     }
 
@@ -4023,7 +3995,6 @@ pub fn main(init: std.process.Init) !void {
             io,
             staged_qcow2,
             config,
-            signing_scratch.?,
             &signing_report.?,
         ) catch |err| {
             std.debug.print(
