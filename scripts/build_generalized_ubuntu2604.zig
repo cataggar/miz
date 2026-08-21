@@ -69,7 +69,7 @@ const profiles = [_]Profile{
         .work_dir = ".scratch/ubuntu2604-x86_64",
         .efi_fallback = "BOOTX64.EFI",
         .pe_machine = 0x8664,
-        .root_partition_table_index = 3,
+        .root_partition_table_index = 0,
         .root_partition_type_guid = guid.linux_root_x86_64,
     },
     .{
@@ -83,7 +83,7 @@ const profiles = [_]Profile{
         .work_dir = ".scratch/ubuntu2604-aarch64",
         .efi_fallback = "BOOTAA64.EFI",
         .pe_machine = 0xaa64,
-        .root_partition_table_index = 2,
+        .root_partition_table_index = 0,
         .root_partition_type_guid = guid.linux_root_aarch64,
     },
 };
@@ -538,6 +538,123 @@ const DebzCustomization = struct {
     }
 };
 
+const NativeRoot = struct {
+    allocator: Allocator,
+    io: Io,
+    mutable_image: []const u8,
+    raw_path: []u8,
+    image: vmiz.Image,
+    filesystem: vmiz.ext4_mountless.FileSystem,
+    image_open: bool = true,
+    filesystem_open: bool = true,
+
+    fn deinit(self: *NativeRoot) void {
+        if (self.filesystem_open) {
+            self.filesystem.deinit();
+            self.filesystem_open = false;
+        }
+        if (self.image_open) {
+            self.image.close(self.io);
+            self.image_open = false;
+        }
+        Dir.cwd().deleteFile(self.io, self.raw_path) catch {};
+        self.allocator.free(self.raw_path);
+        self.* = undefined;
+    }
+
+    fn finish(self: *NativeRoot) !void {
+        _ = try self.filesystem.commit();
+        self.filesystem.deinit();
+        self.filesystem_open = false;
+        self.image.close(self.io);
+        self.image_open = false;
+        Dir.cwd().deleteFile(self.io, self.mutable_image) catch {};
+        try run(self.allocator, self.io, &.{
+            "qemu-img", "convert", "-f", "raw", "-O", "qcow2", self.raw_path, self.mutable_image,
+        });
+        Dir.cwd().deleteFile(self.io, self.raw_path) catch {};
+    }
+};
+
+fn partitionNameEquals(partition: vmiz.gpt.PartitionEntry, expected: []const u8) bool {
+    if (expected.len > partition.name_utf16le.len) return false;
+    for (expected, 0..) |byte, index| {
+        if (partition.name_utf16le[index] != byte) return false;
+    }
+    for (partition.name_utf16le[expected.len..]) |code_unit| {
+        if (code_unit != 0) return false;
+    }
+    return true;
+}
+
+fn findNamedRootPartition(partitions: []const vmiz.gpt.PartitionEntry) !vmiz.gpt.PartitionEntry {
+    var found: ?vmiz.gpt.PartitionEntry = null;
+    for (partitions) |partition| {
+        if (!partitionNameEquals(partition, "cloudimg-rootfs")) continue;
+        if (found != null) return error.AmbiguousRootPartition;
+        found = partition;
+    }
+    return found orelse error.RootPartitionNotFound;
+}
+
+fn partitionOffsetLength(partition: vmiz.gpt.PartitionEntry) !struct { offset: u64, length: u64 } {
+    const offset = std.math.mul(u64, partition.first_lba, vmiz.gpt.sector_size) catch
+        return error.InvalidPartitionBounds;
+    const sectors = std.math.add(u64, partition.last_lba - partition.first_lba, 1) catch
+        return error.InvalidPartitionBounds;
+    return .{
+        .offset = offset,
+        .length = std.math.mul(u64, sectors, vmiz.gpt.sector_size) catch
+            return error.InvalidPartitionBounds,
+    };
+}
+
+fn labelEquals(label: [16]u8, expected: []const u8) bool {
+    if (expected.len > label.len) return false;
+    if (!std.mem.eql(u8, label[0..expected.len], expected)) return false;
+    for (label[expected.len..]) |byte| if (byte != 0) return false;
+    return true;
+}
+
+fn openNativeRoot(
+    allocator: Allocator,
+    io: Io,
+    mutable_image: []const u8,
+    work_dir: []const u8,
+) !NativeRoot {
+    const raw_path = try std.fs.path.join(allocator, &.{ work_dir, "customized.native.raw" });
+    errdefer allocator.free(raw_path);
+    errdefer Dir.cwd().deleteFile(io, raw_path) catch {};
+    try run(allocator, io, &.{ "qemu-img", "convert", "-f", "qcow2", "-O", "raw", mutable_image, raw_path });
+    var image = try vmiz.Image.openPath(io, raw_path);
+    errdefer image.close(io);
+    const partitions = try vmiz.gpt.readGpt(image, io, allocator);
+    defer allocator.free(partitions.partitions);
+    const partition = try findNamedRootPartition(partitions.partitions);
+    const geometry = try partitionOffsetLength(partition);
+    const spool_path = try std.fs.path.join(allocator, &.{ work_dir, "customized.native.spool" });
+    defer allocator.free(spool_path);
+    Dir.cwd().deleteFile(io, spool_path) catch {};
+    var filesystem = try vmiz.ext4_mountless.FileSystem.open(allocator, io, image.file, .{
+        .offset = geometry.offset,
+        .length = geometry.length,
+        .spool_path = spool_path,
+        .atomic_path = raw_path,
+    });
+    if (!labelEquals(filesystem.filesystemIdentity().label, "cloudimg-rootfs")) {
+        filesystem.deinit();
+        return error.RootFilesystemLabelMismatch;
+    }
+    return .{
+        .allocator = allocator,
+        .io = io,
+        .mutable_image = mutable_image,
+        .raw_path = raw_path,
+        .image = image,
+        .filesystem = filesystem,
+    };
+}
+
 fn requireSucceeded(result: package_family.Result) !void {
     if (!result.succeeded or result.diagnostic != null) {
         if (result.diagnostic) |diagnostic| {
@@ -565,61 +682,6 @@ fn requireJsonSha256Field(
     return artifact_pipeline.formatSha256(try artifact_pipeline.parseSha256(value.string));
 }
 
-fn extractGuestRoot(
-    io: Io,
-    mutable_image: []const u8,
-    extraction: []const u8,
-) !void {
-    var archive = try std.process.spawn(io, .{
-        .argv = &.{ "virt-tar-out", "-a", mutable_image, "/", "-" },
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .inherit,
-    });
-    defer archive.kill(io);
-
-    var extract = try std.process.spawn(io, .{
-        .argv = &.{
-            "tar",
-            "--extract",
-            "--file=-",
-            "--directory",
-            extraction,
-            "--exclude=./dev/*",
-            "--exclude=./proc/*",
-            "--exclude=./run/*",
-            "--exclude=./sys/*",
-        },
-        .stdin = .pipe,
-        .stdout = .inherit,
-        .stderr = .inherit,
-    });
-    defer extract.kill(io);
-
-    var archive_buffer: [64 * 1024]u8 = undefined;
-    var archive_reader = archive.stdout.?.readerStreaming(io, &archive_buffer);
-    var extract_buffer: [64 * 1024]u8 = undefined;
-    var extract_writer = extract.stdin.?.writerStreaming(io, &extract_buffer);
-    var buffer: [64 * 1024]u8 = undefined;
-    while (true) {
-        const count = try archive_reader.interface.readSliceShort(&buffer);
-        if (count == 0) break;
-        try extract_writer.interface.writeAll(buffer[0..count]);
-    }
-    try extract_writer.interface.flush();
-    extract.stdin.?.close(io);
-    extract.stdin = null;
-
-    switch (try archive.wait(io)) {
-        .exited => |code| if (code != 0) return error.CommandFailed,
-        else => return error.CommandFailed,
-    }
-    switch (try extract.wait(io)) {
-        .exited => |code| if (code != 0) return error.CommandFailed,
-        else => return error.CommandFailed,
-    }
-}
-
 fn customizeRootWithDebz(
     allocator: Allocator,
     io: Io,
@@ -632,7 +694,12 @@ fn customizeRootWithDebz(
     defer allocator.free(extraction);
     try Dir.cwd().deleteTree(io, extraction);
     try Dir.cwd().createDirPath(io, extraction);
-    try extractGuestRoot(io, mutable_image, extraction);
+    var native_root = try openNativeRoot(allocator, io, mutable_image, work_dir);
+    defer native_root.deinit();
+    var host_manifest = vmiz.ext4_mountless.HostTreeManifest.init(allocator);
+    defer host_manifest.deinit();
+    try native_root.filesystem.validateCommitProfile();
+    try native_root.filesystem.exportHostTreeWithManifest(extraction, .{}, &host_manifest);
 
     const direct_etc = try std.fs.path.join(allocator, &.{ extraction, "etc" });
     defer allocator.free(direct_etc);
@@ -817,6 +884,8 @@ fn customizeRootWithDebz(
         published_transferred = true;
     }
 
+    try native_root.filesystem.importHostTreeWithManifest(current, .{}, &host_manifest);
+    try native_root.finish();
     return .{ .root_path = current, .evidence = evidence };
 }
 
@@ -1129,7 +1198,7 @@ pub fn main(init: std.process.Init) !void {
         return error.ChecksumMismatch;
     if (args.preflight_only) return;
 
-    for (&[_][]const u8{ "qemu-img", "virt-customize", "virt-copy-in", "virt-cat", "virt-ls", "virt-filesystems", "virt-tar-in", "virt-tar-out", "guestfish", "tar", "cp", "ukify", "sbverify" }) |tool|
+    for (&[_][]const u8{ "qemu-img", "virt-customize", "virt-copy-in", "virt-cat", "virt-ls", "ukify", "sbverify" }) |tool|
         try requireTool(allocator, io, tool);
     const config = try signingConfig(args);
 
@@ -1147,7 +1216,7 @@ pub fn main(init: std.process.Init) !void {
     );
     try vmiz.copyAll(io, source_image, &mutable_image, allocator);
     mutable_image.close(io);
-    const growth = try vmiz.root_resize.growExistingQcow2(
+    _ = try vmiz.root_resize.growExistingQcow2(
         allocator,
         io,
         mutable,
@@ -1156,36 +1225,8 @@ pub fn main(init: std.process.Init) !void {
             .filesystem_label = vmiz.root_resize.default_filesystem_label,
         },
     );
-    const destination_root = try std.fmt.allocPrint(
-        allocator,
-        "/dev/sda{d}",
-        .{growth.root_table_index + 1},
-    );
-    defer allocator.free(destination_root);
-
     var debz_customization = try customizeRootWithDebz(allocator, io, profile, mutable, work_dir, provenance_dir);
     defer debz_customization.deinit(allocator);
-    const root_tar = try std.fs.path.join(allocator, &.{ work_dir, "debz-customized-root.tar" });
-    defer allocator.free(root_tar);
-    Dir.cwd().deleteFile(io, root_tar) catch {};
-    try run(allocator, io, &.{
-        "tar", "--xattrs",                   "--acls", "--numeric-owner",
-        "-C",  debz_customization.root_path, "-cf",    root_tar,
-        ".",
-    });
-    const guestfish_script = try std.fs.path.join(allocator, &.{ work_dir, "replace-root.guestfish" });
-    defer allocator.free(guestfish_script);
-    const guestfish_commands = try std.fmt.allocPrint(allocator,
-        \\add-drive-opts {s} format:qcow2
-        \\run
-        \\mount {s} /
-        \\rm-rf /
-        \\
-    , .{ mutable, destination_root });
-    defer allocator.free(guestfish_commands);
-    try Dir.cwd().writeFile(io, .{ .sub_path = guestfish_script, .data = guestfish_commands });
-    try run(allocator, io, &.{ "guestfish", "-f", guestfish_script });
-    try run(allocator, io, &.{ "virt-tar-in", "-a", mutable, root_tar, "/" });
 
     const script_path = try std.fs.path.join(allocator, &.{ work_dir, "customize.sh" });
     defer allocator.free(script_path);
@@ -1272,10 +1313,6 @@ pub fn main(init: std.process.Init) !void {
     const info = try capture(allocator, io, &.{ "qemu-img", "info", "--output=json", output });
     defer allocator.free(info);
     try validateQcow2Info(allocator, info, args.size);
-    const partitions = try capture(allocator, io, &.{ "virt-filesystems", "--partitions", "-a", output });
-    defer allocator.free(partitions);
-    if (std.mem.indexOf(u8, partitions, destination_root) == null)
-        return error.InvalidGen2PartitionLayout;
     const fallback_listing = try capture(allocator, io, &.{ "virt-ls", "-a", output, "/boot/efi/EFI/BOOT" });
     defer allocator.free(fallback_listing);
     if (std.mem.indexOf(u8, fallback_listing, profile.efi_fallback) == null) return error.FinalUkiMissing;
@@ -1320,8 +1357,8 @@ test "profiles pin immutable official sources for both architectures" {
         try std.testing.expect(std.mem.indexOf(u8, profile.source_name, "26.04") != null);
     }
     try std.testing.expectEqual(@as(u64, 5 * 1024 * 1024 * 1024), default_virtual_size);
-    try std.testing.expectEqual(@as(u32, 3), profiles[0].root_partition_table_index);
-    try std.testing.expectEqual(@as(u32, 2), profiles[1].root_partition_table_index);
+    try std.testing.expectEqual(@as(u32, 0), profiles[0].root_partition_table_index);
+    try std.testing.expectEqual(@as(u32, 0), profiles[1].root_partition_table_index);
     try std.testing.expectEqualSlices(u8, &guid.linux_root_x86_64, &profiles[0].root_partition_type_guid);
     try std.testing.expectEqualSlices(u8, &guid.linux_root_aarch64, &profiles[1].root_partition_type_guid);
 }
