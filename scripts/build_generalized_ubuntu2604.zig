@@ -829,29 +829,77 @@ fn copyRootStage(
     source_contents: []const u8,
     stage: []const u8,
 ) !?std.Io.File.Permissions {
+    _ = source_contents;
     const source_entry = try std.fs.path.join(allocator, &.{ source_root, restricted_root_entry });
     defer allocator.free(source_entry);
     const original = Dir.cwd().statFile(io, source_entry, .{}) catch |err| switch (err) {
         error.FileNotFound => {
-            try run(allocator, io, &.{ "cp", "-a", "--reflink=auto", source_contents, stage });
+            try copyHostTree(allocator, io, source_root, stage);
             return null;
         },
         else => return err,
     };
     const required_mode: std.posix.mode_t = if (original.kind == .directory) 0o500 else 0o400;
-    if (original.permissions.toMode() & required_mode == required_mode) {
-        try run(allocator, io, &.{ "cp", "-a", "--reflink=auto", source_contents, stage });
-        return null;
-    }
-
     const readable = std.Io.File.Permissions.fromMode(original.permissions.toMode() | required_mode);
-    try Dir.cwd().setFilePermissions(io, source_entry, readable, .{});
-    run(allocator, io, &.{ "cp", "-a", "--reflink=auto", source_contents, stage }) catch |err| {
-        try Dir.cwd().setFilePermissions(io, source_entry, original.permissions, .{});
-        return err;
-    };
-    try Dir.cwd().setFilePermissions(io, source_entry, original.permissions, .{});
-    return original.permissions;
+    const needs_readable = original.permissions.toMode() & required_mode != required_mode;
+    if (needs_readable) try Dir.cwd().setFilePermissions(io, source_entry, readable, .{});
+    defer if (needs_readable) Dir.cwd().setFilePermissions(io, source_entry, original.permissions, .{}) catch {};
+    try copyHostTree(allocator, io, source_root, stage);
+    if (needs_readable) {
+        const stage_entry = try std.fs.path.join(allocator, &.{ stage, restricted_root_entry });
+        defer allocator.free(stage_entry);
+        try Dir.cwd().setFilePermissions(io, stage_entry, readable, .{});
+        return original.permissions;
+    }
+    return null;
+}
+
+fn copyHostTree(
+    allocator: Allocator,
+    io: Io,
+    source: []const u8,
+    destination: []const u8,
+) !void {
+    try Dir.cwd().createDirPath(io, destination);
+    const directory_stat = try Dir.cwd().statFile(io, source, .{});
+    const original_permissions = directory_stat.permissions;
+    if (directory_stat.permissions.toMode() & 0o700 != 0o700) {
+        try Dir.cwd().setFilePermissions(
+            io,
+            source,
+            std.Io.File.Permissions.fromMode(directory_stat.permissions.toMode() | 0o700),
+            .{},
+        );
+        defer Dir.cwd().setFilePermissions(io, source, original_permissions, .{}) catch {};
+    }
+    var directory = try Dir.cwd().openDir(io, source, .{ .iterate = true });
+    defer directory.close(io);
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        const source_path = try std.fs.path.join(allocator, &.{ source, entry.name });
+        defer allocator.free(source_path);
+        const destination_path = try std.fs.path.join(allocator, &.{ destination, entry.name });
+        defer allocator.free(destination_path);
+        switch (entry.kind) {
+            .directory => try copyHostTree(allocator, io, source_path, destination_path),
+            .file => {
+                const source_stat = try Dir.cwd().statFile(io, source_path, .{});
+                try Dir.cwd().copyFile(
+                    source_path,
+                    Dir.cwd(),
+                    destination_path,
+                    io,
+                    .{ .permissions = .fromMode(source_stat.permissions.toMode() | 0o400) },
+                );
+            },
+            .sym_link => {
+                var target: [4096]u8 = undefined;
+                const length = try Dir.cwd().readLink(io, source_path, &target);
+                try Dir.cwd().symLink(io, target[0..length], destination_path, .{});
+            },
+            else => {},
+        }
+    }
 }
 
 fn restoreRestrictedRootEntry(
