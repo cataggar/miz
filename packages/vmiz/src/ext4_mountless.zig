@@ -97,16 +97,60 @@ const HostMetadata = struct {
 };
 
 pub const CommitResult = struct {
+    allocator: Allocator,
     filesystem: ext4.FilesystemInfo,
-    /// Private same-filesystem directory containing the displaced original.
-    /// It is retained for operator recovery and is never removed by vmiz.
-    recovery_path: []const u8,
+    /// Owned private same-filesystem directory containing the displaced
+    /// original. It is retained for operator recovery and is never removed by
+    /// vmiz. Call `deinit()` after recording or using the path.
+    recovery_path: []u8,
+
+    pub fn deinit(self: *CommitResult) void {
+        self.allocator.free(self.recovery_path);
+        self.* = undefined;
+    }
 };
 
 const max_host_xattr_bytes: usize = 16 * 1024 * 1024;
 
 fn failedLinuxSyscall(result: usize) bool {
     return @as(isize, @bitCast(result)) < 0;
+}
+
+const DeviceIdentity = struct {
+    major: u32,
+    minor: u32,
+};
+
+fn linuxDeviceFromFile(file: Io.File) Error!DeviceIdentity {
+    if (comptime builtin.os.tag != .linux) return .{ .major = 0, .minor = 0 };
+    var statx: std.os.linux.Statx = undefined;
+    const result = std.os.linux.statx(
+        @intCast(file.handle),
+        "",
+        std.os.linux.AT.EMPTY_PATH,
+        std.os.linux.STATX.BASIC_STATS,
+        &statx,
+    );
+    if (failedLinuxSyscall(result)) return error.AtomicSourceChanged;
+    return .{ .major = statx.dev_major, .minor = statx.dev_minor };
+}
+
+fn linuxDeviceFromPath(allocator: Allocator, io: Io, path: []const u8) Error!DeviceIdentity {
+    if (comptime builtin.os.tag != .linux) return .{ .major = 0, .minor = 0 };
+    const path_z = try allocator.allocSentinel(u8, path.len, 0);
+    defer allocator.free(path_z);
+    @memcpy(path_z, path);
+    var statx: std.os.linux.Statx = undefined;
+    const result = std.os.linux.statx(
+        std.os.linux.AT.FDCWD,
+        path_z.ptr,
+        std.os.linux.AT.SYMLINK_NOFOLLOW | std.os.linux.AT.STATX_DONT_SYNC,
+        std.os.linux.STATX.BASIC_STATS,
+        &statx,
+    );
+    if (failedLinuxSyscall(result)) return error.AtomicSourceChanged;
+    _ = io;
+    return .{ .major = statx.dev_major, .minor = statx.dev_minor };
 }
 
 fn syncDirectoryPath(io: Io, path: []const u8) Error!void {
@@ -339,7 +383,12 @@ fn createPrivateDirectory(allocator: Allocator, io: Io, atomic_path: []const u8)
     return error.AtomicPublishFailed;
 }
 
-fn preparePrivateDirectory(allocator: Allocator, io: Io, path: []const u8) Error!Io.Dir {
+fn preparePrivateDirectory(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    expected_device: DeviceIdentity,
+) Error!Io.Dir {
     if (comptime builtin.os.tag != .linux) return error.AtomicPublishUnsupported;
     var directory = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch
         return error.AtomicPublishFailed;
@@ -357,6 +406,8 @@ fn preparePrivateDirectory(allocator: Allocator, io: Io, path: []const u8) Error
         return error.AtomicPublishFailed;
     if (failedLinuxSyscall(statx_result) or
         !statx.mask.UID or statx.uid != linux.geteuid() or
+        statx.dev_major != expected_device.major or
+        statx.dev_minor != expected_device.minor or
         io_stat.kind != .directory)
     {
         return error.AtomicPublishFailed;
@@ -384,6 +435,8 @@ pub const FileSystem = struct {
     identity: ext4.GeneralFilesystemIdentity,
     atomic_path: ?[]const u8,
     source_inode: Io.File.INode,
+    source_device_major: u32 = 0,
+    source_device_minor: u32 = 0,
     source_size: u64,
     source_mtime: Io.Timestamp,
     source_ctime: Io.Timestamp,
@@ -416,9 +469,19 @@ pub const FileSystem = struct {
         const file_stat = try file.stat(io);
         const file_size = file_stat.size;
         if (end > file_size) return error.InvalidRange;
+        const source_device = try linuxDeviceFromFile(file);
         if (options.atomic_path) |atomic_path| {
-            const atomic_stat = try Io.Dir.cwd().statFile(io, atomic_path, .{});
-            if (atomic_stat.inode != file_stat.inode) return error.AtomicSourceChanged;
+            const atomic_stat = try Io.Dir.cwd().statFile(io, atomic_path, .{
+                .follow_symlinks = false,
+            });
+            if (atomic_stat.kind == .sym_link) return error.AtomicPathSymlink;
+            const atomic_device = try linuxDeviceFromPath(allocator, io, atomic_path);
+            if (atomic_stat.inode != file_stat.inode or
+                atomic_device.major != source_device.major or
+                atomic_device.minor != source_device.minor)
+            {
+                return error.AtomicSourceChanged;
+            }
         }
 
         var reader = try ext4.openGeneral(io, file, allocator, .{ .offset = options.offset });
@@ -459,6 +522,8 @@ pub const FileSystem = struct {
             .identity = source.identity,
             .atomic_path = options.atomic_path,
             .source_inode = file_stat.inode,
+            .source_device_major = source_device.major,
+            .source_device_minor = source_device.minor,
             .source_size = file_stat.size,
             .source_mtime = file_stat.mtime,
             .source_ctime = file_stat.ctime,
@@ -1029,8 +1094,7 @@ pub const FileSystem = struct {
         try self.ensureMutable();
         const atomic_path = self.atomic_path orelse return error.AtomicPublishPathRequired;
         const current_stat = try self.file.stat(self.io);
-        const atomic_stat = try Io.Dir.cwd().statFile(self.io, atomic_path, .{});
-        if (!self.sameSourceStat(current_stat) or !self.sameSourceStat(atomic_stat)) {
+        if (!self.sameSourceStat(current_stat) or !try self.sameSourcePath(atomic_path)) {
             return error.AtomicSourceChanged;
         }
         const commit_profile = try self.commitProfile();
@@ -1054,7 +1118,10 @@ pub const FileSystem = struct {
         defer self.allocator.free(private_dir_path);
         var exchanged = false;
         defer if (!exchanged) Io.Dir.cwd().deleteTree(self.io, private_dir_path) catch {};
-        var private_dir = try preparePrivateDirectory(self.allocator, self.io, private_dir_path);
+        var private_dir = try preparePrivateDirectory(self.allocator, self.io, private_dir_path, .{
+            .major = self.source_device_major,
+            .minor = self.source_device_minor,
+        });
         defer private_dir.close(self.io);
         try syncDestinationDirectory(self.io, atomic_path);
         try syncDirectoryPath(self.io, private_dir_path);
@@ -1131,7 +1198,7 @@ pub const FileSystem = struct {
         stage_file.close(self.io);
         stage_open = false;
         if (!self.sameSourceStat(try self.file.stat(self.io)) or
-            !self.sameSourceStat(try Io.Dir.cwd().statFile(self.io, atomic_path, .{})))
+            !try self.sameSourcePath(atomic_path))
         {
             return error.AtomicSourceChanged;
         }
@@ -1142,9 +1209,11 @@ pub const FileSystem = struct {
         }
         try self.publishStage(stage_path, private_dir_path, atomic_path, &exchanged);
         self.committed = true;
+        const owned_recovery_path = try self.allocator.dupe(u8, self.recovery_path.?);
         return .{
+            .allocator = self.allocator,
             .filesystem = info,
-            .recovery_path = self.recovery_path.?,
+            .recovery_path = owned_recovery_path,
         };
     }
 
@@ -1159,9 +1228,7 @@ pub const FileSystem = struct {
             return error.AtomicPublishUnsupported;
         }
         const linux = std.os.linux;
-        const displaced_expected = Io.Dir.cwd().statFile(self.io, atomic_path, .{}) catch
-            return error.AtomicSourceChanged;
-        if (!self.sameSourceStat(displaced_expected)) return error.AtomicSourceChanged;
+        if (!try self.sameSourcePath(atomic_path)) return error.AtomicSourceChanged;
         var recovery_path: ?[]u8 = try self.allocator.dupe(u8, private_dir_path);
         defer if (recovery_path) |path| self.allocator.free(path);
         const stage_z = try self.allocator.allocSentinel(u8, stage_path.len, 0);
@@ -1213,6 +1280,17 @@ pub const FileSystem = struct {
             observed.size == self.source_size and
             std.meta.eql(observed.mtime, self.source_mtime) and
             std.meta.eql(observed.ctime, self.source_ctime);
+    }
+
+    fn sameSourcePath(self: *const FileSystem, path: []const u8) Error!bool {
+        const path_stat = try Io.Dir.cwd().statFile(self.io, path, .{
+            .follow_symlinks = false,
+        });
+        if (path_stat.kind == .sym_link) return error.AtomicPathSymlink;
+        const device = try linuxDeviceFromPath(self.allocator, self.io, path);
+        return self.sameSourceStat(path_stat) and
+            device.major == self.source_device_major and
+            device.minor == self.source_device_minor;
     }
 
     fn commitProfile(self: *const FileSystem) !CommitProfile {
@@ -1504,7 +1582,8 @@ test "atomic commit preserves host image mode timestamps and xattrs" {
     fs.test_stage_ready_hook = inspectStageReady;
     fs.test_stage_ready_hook_ctx = &stage_ready;
     try fs.write("/etc", "changed", null);
-    const commit_result = try fs.commit();
+    var commit_result = try fs.commit();
+    defer commit_result.deinit();
     const recovery_path = try allocator.dupe(u8, commit_result.recovery_path);
     defer {
         Io.Dir.cwd().deleteTree(io, recovery_path) catch {};
@@ -1621,7 +1700,8 @@ test "atomic commit preserves a replacement after exchange and leaves recovery a
     };
     fs.test_after_exchange_hook = replaceAtomicPathAfterExchange;
     fs.test_after_exchange_hook_ctx = &race;
-    const result = try fs.commit();
+    var result = try fs.commit();
+    defer result.deinit();
     const recovery_path = try allocator.dupe(u8, result.recovery_path);
     defer allocator.free(recovery_path);
     try std.testing.expectEqual(
@@ -1702,7 +1782,8 @@ test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
     fs.identity.feature_compat = original_compat & ~ext4.writer_feature_compat;
     try std.testing.expectError(error.UnsupportedCommitProfile, fs.commit());
     fs.identity.feature_compat = original_compat;
-    const commit_result = try fs.commit();
+    var commit_result = try fs.commit();
+    defer commit_result.deinit();
     const recovery_path = try allocator.dupe(u8, commit_result.recovery_path);
     defer {
         Io.Dir.cwd().deleteTree(io, recovery_path) catch {};
@@ -1761,7 +1842,8 @@ test "mountless commit preserves the pinned Ubuntu descriptor-64 profile" {
     try std.testing.expectEqual(@as(u32, 0x22c2), identity.feature_incompat);
     try std.testing.expectEqual(@as(u32, 0x046b), identity.feature_ro_compat);
     try fs.write("/etc/os-release", "NAME=vmiz-pinned\n", null);
-    const commit_result = try fs.commit();
+    var commit_result = try fs.commit();
+    defer commit_result.deinit();
     const recovery_path = try allocator.dupe(u8, commit_result.recovery_path);
     defer {
         Io.Dir.cwd().deleteTree(io, recovery_path) catch {};
@@ -1946,7 +2028,8 @@ test "mountless round trip preserves security metadata and special nodes" {
     try fs.mkdir("/empty", .{ .mode = 0 });
     try fs.write("/empty/file", "new", null);
     try fs.remove("/empty", true);
-    const commit_result = try fs.commit();
+    var commit_result = try fs.commit();
+    defer commit_result.deinit();
     const recovery_path = try allocator.dupe(u8, commit_result.recovery_path);
     defer {
         Io.Dir.cwd().deleteTree(io, recovery_path) catch {};
@@ -2019,4 +2102,40 @@ test "atomic commit rejects replacement of the source path after open" {
     try std.testing.expectError(error.AtomicSourceChanged, fs.commit());
     image_open = false;
     image.close(io);
+}
+
+test "mountless open rejects an atomic final-component symlink" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const image_path = "test-ext4-mountless-atomic-symlink.raw";
+    const symlink_path = "test-ext4-mountless-atomic-symlink";
+    const spool_path = "test-ext4-mountless-atomic-symlink.spool";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, symlink_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    var image = try @import("image.zig").Image.createExclusive(
+        io,
+        image_path,
+        .raw,
+        32 * 1024 * 1024,
+        .{},
+    );
+    defer image.close(io);
+    var tree = root_tree.RootTree.initMemory(allocator, io, .{});
+    defer tree.deinit();
+    try tree.putFileBytes("etc", "source", .{ .mode = 0o644 });
+    _ = try ext4.populate(io, image.file, allocator, try tree.cursor(), .{
+        .length = 32 * 1024 * 1024,
+    });
+    try Io.Dir.cwd().symLink(io, image_path, symlink_path, .{});
+
+    try std.testing.expectError(
+        error.AtomicPathSymlink,
+        FileSystem.open(allocator, io, image.file, .{
+            .length = 32 * 1024 * 1024,
+            .spool_path = spool_path,
+            .atomic_path = symlink_path,
+        }),
+    );
 }

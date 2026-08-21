@@ -43,6 +43,7 @@ try fs.mkdir("/etc/vmiz", .{ .mode = 0o700 });
 try fs.write("/etc/vmiz/config", "enabled\n", null);
 try fs.remove("/var/cache/old", true);
 const commit = try fs.commit();
+defer commit.deinit();
 _ = commit.filesystem;
 // Keep commit.recovery_path for operator-managed recovery. vmiz never
 // removes this private directory automatically.

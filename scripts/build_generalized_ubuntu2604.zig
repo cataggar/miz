@@ -563,7 +563,12 @@ const NativeRoot = struct {
     }
 
     fn finish(self: *NativeRoot) !void {
-        _ = try self.filesystem.commit();
+        var commit_result = try self.filesystem.commit();
+        defer commit_result.deinit();
+        std.debug.print(
+            "native ext4 recovery artifact retained at {s}\n",
+            .{commit_result.recovery_path},
+        );
         self.filesystem.deinit();
         self.filesystem_open = false;
         self.image.close(self.io);
