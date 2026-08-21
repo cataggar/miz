@@ -410,7 +410,8 @@ pub const Executor = struct {
             ),
             .clock = .awake,
         } };
-        while (multi_reader.fill(64, timeout)) |_| {
+        const deadline = timeout.toDeadline(self.io);
+        while (multi_reader.fill(64, deadline)) |_| {
             if (stdout_reader.buffered().len > 4 * 1024 * 1024 or
                 stderr_reader.buffered().len > 4 * 1024 * 1024)
             {
@@ -437,9 +438,17 @@ pub const Executor = struct {
             },
         }
         try multi_reader.checkAnyError();
-        const term = child.wait(self.io) catch |err| {
+        const term = waitUntilDeadline(self.io, &child, deadline) catch |err| {
             killProcessGroup(&child);
             child.kill(self.io);
+            if (err == error.Timeout) {
+                return .{
+                    .outcome = .timed_out,
+                    .exit_code = null,
+                    .stdout = &.{},
+                    .stderr = &.{},
+                };
+            }
             return err;
         };
         const stdout = try multi_reader.toOwnedSlice(0);
@@ -468,6 +477,35 @@ fn killProcessGroup(child: *std.process.Child) void {
     const pid = child.id orelse return;
     _ = std.os.linux.kill(-@as(i32, @intCast(pid)), .TERM);
     _ = std.os.linux.kill(-@as(i32, @intCast(pid)), .KILL);
+}
+
+fn waitUntilDeadline(
+    io: Io,
+    child: *std.process.Child,
+    deadline: Io.Timeout,
+) !std.process.Child.Term {
+    if (comptime builtin.os.tag != .linux) return child.wait(io);
+    const pid = child.id orelse return error.Timeout;
+    const opened = std.os.linux.pidfd_open(pid, 0);
+    if (std.os.linux.errno(opened) != .SUCCESS) return error.Timeout;
+    const pidfd: i32 = @intCast(opened);
+    defer _ = std.os.linux.close(pidfd);
+    while (true) {
+        const remaining = deadline.toDurationFromNow(io) orelse return child.wait(io);
+        if (remaining.raw.nanoseconds <= 0) return error.Timeout;
+        var fds = [_]std.os.linux.pollfd{.{
+            .fd = pidfd,
+            .events = std.os.linux.POLL.IN,
+            .revents = 0,
+        }};
+        const milliseconds = @max(@as(i64, 1), remaining.raw.toMilliseconds());
+        const poll_result = std.os.linux.poll(&fds, fds.len, @intCast(@min(milliseconds, std.math.maxInt(i32))));
+        switch (std.os.linux.errno(poll_result)) {
+            .SUCCESS => if (poll_result != 0) return child.wait(io),
+            .INTR => {},
+            else => return error.Timeout,
+        }
+    }
 }
 
 pub const Root = struct {
@@ -1329,6 +1367,23 @@ test "privileged offline namespace contains PID1 and reaps descendants" {
         result.deinit(allocator);
     }
     try std.testing.expectEqual(CommandOutcome.timed_out, stalled.outcome);
+    try expectNoResidualOfflineMounts(io);
+    var chatty_executor = try Executor.init(allocator, io, .{
+        .root = &root,
+        .architecture = Architecture.host(),
+        .timeout_ms = 5 * 1000,
+        .supervisor_timeout_ms_override = 1 * 1000,
+    });
+    defer chatty_executor.deinit();
+    const chatty = try chatty_executor.runIsolated(
+        &.{ "/bin/sh", "-c", "while true; do printf x; sleep 0.1; done" },
+        5 * 1000,
+    );
+    defer {
+        var result = chatty;
+        result.deinit(allocator);
+    }
+    try std.testing.expectEqual(CommandOutcome.timed_out, chatty.outcome);
     try expectNoResidualOfflineMounts(io);
     Io.Dir.cwd().access(io, fixture, .{ .read = true, .execute = true }) catch
         return error.OfflineRootTeardownIncomplete;
