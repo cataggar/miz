@@ -126,6 +126,8 @@ pub const ExecutorOptions = struct {
     /// The executor requires a privileged mount namespace.  Callers may
     /// disable this only for a test runner supplied through `run_fn`.
     require_privileged_namespace: bool = true,
+    pre_chroot_delay_ms: u64 = 0,
+    supervisor_timeout_ms_override: ?u64 = null,
     run_fn: ?*const fn (
         context: ?*anyopaque,
         allocator: Allocator,
@@ -307,37 +309,30 @@ pub const Executor = struct {
             \\shift
             \\mountpoint="$1"
             \\shift
+            \\pre_chroot_seconds="$1"
+            \\shift
             \\case "$root_fd" in *[!0-9]*|'') exit 125;; esac
+            \\if [ "$pre_chroot_seconds" != "0" ]; then sleep "$pre_chroot_seconds"; fi
             \\mount --bind "/proc/self/fd/$root_fd" "$mountpoint"
-            \\eval "exec ${root_fd}>&-"
+            \\for fd_path in /proc/self/fd/*; do fd="${fd_path##*/}"; case "$fd" in 0|1|2) ;; *) eval "exec ${fd}>&-" 2>/dev/null || true ;; esac; done
             \\exec chroot "$mountpoint" /bin/sh -c "$inner_script" vmiz-offline-root "$@"
-        ;
-        const outer_script =
-            \\set -eu
-            \\unshare_script="$1"
-            \\shift
-            \\root_fd="$1"
-            \\shift
-            \\inner_script="$1"
-            \\shift
-            \\timeout_seconds="$1"
-            \\shift
-            \\mountpoint="$1"
-            \\shift
-            \\cleanup() { status=$?; rmdir "$mountpoint" 2>/dev/null || true; exit "$status"; }
-            \\trap cleanup EXIT TERM INT HUP
-            \\mkdir "$mountpoint"
-            \\unshare --mount --net --pid --fork --kill-child --propagation private -- /bin/sh -c "$unshare_script" vmiz-unshare "$root_fd" "$inner_script" "$mountpoint" "$timeout_seconds" "$@"
-            \\status=$?
-            \\exit "$status"
         ;
         var argv = std.array_list.Managed([]const u8).init(self.allocator);
         defer argv.deinit();
+        try argv.append("setsid");
+        try argv.append("unshare");
+        try argv.append("--mount");
+        try argv.append("--net");
+        try argv.append("--pid");
+        try argv.append("--fork");
+        try argv.append("--kill-child");
+        try argv.append("--propagation");
+        try argv.append("private");
+        try argv.append("--");
         try argv.append("/bin/sh");
         try argv.append("-c");
-        try argv.append(outer_script);
-        try argv.append("vmiz-offline-root");
         try argv.append(unshare_script);
+        try argv.append("vmiz-unshare");
         const root_fd_text = try std.fmt.allocPrint(
             self.allocator,
             "{d}",
@@ -345,22 +340,30 @@ pub const Executor = struct {
         );
         try argv.append(root_fd_text);
         try argv.append(inner_script);
-        const timeout_seconds = try std.fmt.allocPrint(
-            self.allocator,
-            "{d}s",
-            .{std.math.divCeil(u64, timeout_ms, 1000) catch return error.TimeoutOutOfRange},
-        );
-        try argv.append(timeout_seconds);
         const mountpoint = try std.fmt.allocPrint(
             self.allocator,
             "/run/vmiz-offline-root-{d}-{d}",
             .{ std.os.linux.getpid(), self.root_dir.handle },
         );
         try argv.append(mountpoint);
+        const pre_chroot_seconds = try std.fmt.allocPrint(
+            self.allocator,
+            "{d}",
+            .{std.math.divCeil(u64, self.options.pre_chroot_delay_ms, 1000) catch return error.TimeoutOutOfRange},
+        );
+        try argv.append(pre_chroot_seconds);
+        const timeout_seconds = try std.fmt.allocPrint(
+            self.allocator,
+            "{d}s",
+            .{std.math.divCeil(u64, timeout_ms, 1000) catch return error.TimeoutOutOfRange},
+        );
+        try argv.append(timeout_seconds);
         try argv.appendSlice(guest_argv);
         defer self.allocator.free(root_fd_text);
+        defer self.allocator.free(pre_chroot_seconds);
         defer self.allocator.free(timeout_seconds);
         defer self.allocator.free(mountpoint);
+        try Io.Dir.createDirAbsolute(self.io, mountpoint, .fromMode(0o700));
         defer Io.Dir.deleteDirAbsolute(self.io, mountpoint) catch {};
 
         var environment = std.process.Environ.Map.init(self.allocator);
@@ -371,30 +374,78 @@ pub const Executor = struct {
         try environment.put("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
         try environment.put("TERM", "dumb");
         try environment.put("DEBIAN_FRONTEND", "noninteractive");
-        const result = std.process.run(self.allocator, self.io, .{
-            .argv = argv.items,
-            .environ_map = &environment,
-            .stdout_limit = .limited(4 * 1024 * 1024),
-            .stderr_limit = .limited(4 * 1024 * 1024),
-            .timeout = .{ .duration = .{
-                .raw = std.Io.Duration.fromMilliseconds(
-                    std.math.cast(
-                        i64,
-                        std.math.add(u64, timeout_ms, cleanup_timeout_ms) catch return error.TimeoutOutOfRange,
-                    ) orelse return error.TimeoutOutOfRange,
-                ),
-                .clock = .awake,
-            } },
-        }) catch |err| switch (err) {
-            error.Timeout => return .{
-                .outcome = .timed_out,
-                .exit_code = null,
-                .stdout = &.{},
-                .stderr = &.{},
+        const result = try self.runSupervised(argv.items, &environment, timeout_ms);
+        return result;
+    }
+
+    fn runSupervised(
+        self: *Executor,
+        argv: []const []const u8,
+        environment: *std.process.Environ.Map,
+        timeout_ms: u64,
+    ) !CommandResult {
+        var child = try std.process.spawn(self.io, .{
+            .argv = argv,
+            .environ_map = environment,
+            .stdin = .ignore,
+            .stdout = .pipe,
+            .stderr = .pipe,
+        });
+        var multi_reader_buffer: Io.File.MultiReader.Buffer(2) = undefined;
+        var multi_reader: Io.File.MultiReader = undefined;
+        multi_reader.init(
+            self.allocator,
+            self.io,
+            multi_reader_buffer.toStreams(),
+            &.{ child.stdout.?, child.stderr.? },
+        );
+        defer multi_reader.deinit();
+        const stdout_reader = multi_reader.reader(0);
+        const stderr_reader = multi_reader.reader(1);
+        const host_timeout_ms = self.options.supervisor_timeout_ms_override orelse
+            (std.math.add(u64, timeout_ms, cleanup_timeout_ms) catch return error.TimeoutOutOfRange);
+        const timeout: Io.Timeout = .{ .duration = .{
+            .raw = std.Io.Duration.fromMilliseconds(
+                std.math.cast(i64, host_timeout_ms) orelse return error.TimeoutOutOfRange,
+            ),
+            .clock = .awake,
+        } };
+        while (multi_reader.fill(64, timeout)) |_| {
+            if (stdout_reader.buffered().len > 4 * 1024 * 1024 or
+                stderr_reader.buffered().len > 4 * 1024 * 1024)
+            {
+                killProcessGroup(&child);
+                child.kill(self.io);
+                return error.StreamTooLong;
+            }
+        } else |err| switch (err) {
+            error.EndOfStream => {},
+            error.Timeout => {
+                killProcessGroup(&child);
+                child.kill(self.io);
+                return .{
+                    .outcome = .timed_out,
+                    .exit_code = null,
+                    .stdout = &.{},
+                    .stderr = &.{},
+                };
             },
-            else => return err,
+            else => |read_err| {
+                killProcessGroup(&child);
+                child.kill(self.io);
+                return read_err;
+            },
+        }
+        try multi_reader.checkAnyError();
+        const term = child.wait(self.io) catch |err| {
+            killProcessGroup(&child);
+            child.kill(self.io);
+            return err;
         };
-        const exit_code: ?u8 = switch (result.term) {
+        const stdout = try multi_reader.toOwnedSlice(0);
+        errdefer self.allocator.free(stdout);
+        const stderr = try multi_reader.toOwnedSlice(1);
+        const exit_code: ?u8 = switch (term) {
             .exited => |code| std.math.cast(u8, code),
             else => null,
         };
@@ -406,11 +457,18 @@ pub const Executor = struct {
             else
                 .failed,
             .exit_code = exit_code,
-            .stdout = result.stdout,
-            .stderr = result.stderr,
+            .stdout = stdout,
+            .stderr = stderr,
         };
     }
 };
+
+fn killProcessGroup(child: *std.process.Child) void {
+    if (comptime builtin.os.tag != .linux) return;
+    const pid = child.id orelse return;
+    _ = std.os.linux.kill(-@as(i32, @intCast(pid)), .TERM);
+    _ = std.os.linux.kill(-@as(i32, @intCast(pid)), .KILL);
+}
 
 pub const Root = struct {
     allocator: Allocator,
@@ -1208,6 +1266,27 @@ test "privileged offline namespace contains PID1 and reaps descendants" {
     defer allocator.free(sentinel_bytes);
     try std.testing.expectEqualStrings("unchanged", sentinel_bytes);
     try expectNoResidualOfflineMounts(io);
+    const root_fd_text = try std.fmt.allocPrint(allocator, "{d}", .{executor.root_dir.handle});
+    defer allocator.free(root_fd_text);
+    const fd_probe = try executor.runIsolated(
+        &.{
+            "/bin/sh",
+            "-c",
+            "if [ -e \"/proc/self/fd/$1\" ] || [ -e \"/proc/self/fd/$1/..\" ]; then printf escaped > \"$2\"; fi; for fd in /proc/self/fd/*; do n=\"${fd##*/}\"; if [ \"$n\" = \"$1\" ]; then printf escaped > \"$2\"; fi; done",
+            "fd-probe",
+            root_fd_text,
+            sentinel,
+        },
+        5 * 1000,
+    );
+    defer {
+        var result = fd_probe;
+        result.deinit(allocator);
+    }
+    const fd_sentinel = try Io.Dir.cwd().readFileAlloc(io, sentinel, allocator, .limited(1024));
+    defer allocator.free(fd_sentinel);
+    try std.testing.expectEqualStrings("unchanged", fd_sentinel);
+    try expectNoResidualOfflineMounts(io);
 
     const timed = try executor.runIsolated(
         &.{ "/bin/sh", "-c", "(sleep 10; printf alive > /descendant-marker) & sleep 10" },
@@ -1233,6 +1312,24 @@ test "privileged offline namespace contains PID1 and reaps descendants" {
         try std.testing.expectEqual(CommandOutcome.succeeded, repeated.outcome);
         try expectNoResidualOfflineMounts(io);
     }
+    var stalled_executor = try Executor.init(allocator, io, .{
+        .root = &root,
+        .architecture = Architecture.host(),
+        .timeout_ms = 5 * 1000,
+        .pre_chroot_delay_ms = 3 * 1000,
+        .supervisor_timeout_ms_override = 1 * 1000,
+    });
+    defer stalled_executor.deinit();
+    const stalled = try stalled_executor.runIsolated(
+        &.{ "/bin/sh", "-c", "exit 0" },
+        5 * 1000,
+    );
+    defer {
+        var result = stalled;
+        result.deinit(allocator);
+    }
+    try std.testing.expectEqual(CommandOutcome.timed_out, stalled.outcome);
+    try expectNoResidualOfflineMounts(io);
     Io.Dir.cwd().access(io, fixture, .{ .read = true, .execute = true }) catch
         return error.OfflineRootTeardownIncomplete;
 }

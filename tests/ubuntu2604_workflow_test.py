@@ -70,7 +70,7 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         )
         kernel_access = install.index("sudo chmod 0644 /boot/vmlinuz-*")
         self.assertLess(apt_install, kernel_access)
-        for tool in ("mount", "mknod", "chroot", "timeout", "unshare"):
+        for tool in ("mount", "mknod", "chroot", "setsid", "timeout", "unshare"):
             self.assertIn(tool, install)
         self.assertIn('command -v "$tool"', install)
         for forbidden in (

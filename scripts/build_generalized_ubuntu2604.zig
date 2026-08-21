@@ -1580,7 +1580,7 @@ pub fn main(init: std.process.Init) !void {
         return error.ChecksumMismatch;
     if (args.preflight_only) return;
 
-    for (&[_][]const u8{ "qemu-img", "ukify", "sbverify", "unshare", "mount", "umount", "chroot", "mknod", "timeout" }) |tool|
+    for (&[_][]const u8{ "qemu-img", "ukify", "sbverify", "unshare", "mount", "umount", "chroot", "mknod", "timeout", "setsid" }) |tool|
         try requireTool(allocator, io, tool);
     const config = try signingConfig(args);
 
