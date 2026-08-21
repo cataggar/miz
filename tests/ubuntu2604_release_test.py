@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import struct
 import types
@@ -17,6 +18,10 @@ CERTIFICATE_DER = b"vmiz Ubuntu test certificate"
 CERTIFICATE_SHA256 = hashlib.sha256(CERTIFICATE_DER).hexdigest()
 SIGNING_CERTIFICATE_SHA256 = "4" * 64
 OPERATION_ID = "00000000-0000-4000-8000-000000000001"
+FORBIDDEN_PRODUCTION_TOOL = re.compile(
+    r"libguestfs|guestfish|supermin|LIBGUESTFS_BACKEND_SETTINGS|"
+    r"\bvirt-(?!fw-vars\b|firmware\b)[a-z0-9-]+"
+)
 
 
 def fixed_vhd_geometry(virtual_size: int) -> tuple[int, int, int]:
@@ -73,16 +78,17 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         builder = (
             ROOT / "scripts" / "build_generalized_ubuntu2604.zig"
         ).read_text(encoding="utf-8")
+        production = builder.split('test "profiles pin', 1)[0]
         self.assertIn(
             "vmiz.ext4_mountless.FileSystem.open",
-            builder,
+            production,
         )
-        self.assertIn("exportHostTree", builder)
-        self.assertIn("importHostTree", builder)
-        self.assertIn("native_root.finish()", builder)
-        self.assertIn("cloudimg-rootfs", builder)
-        self.assertNotIn("/dev/sda4", builder)
-        self.assertNotIn("/dev/sda3", builder)
+        self.assertIn("exportHostTree", production)
+        self.assertIn("importHostTree", production)
+        self.assertIn("native_root.finish()", production)
+        self.assertIn("cloudimg-rootfs", production)
+        self.assertNotIn("/dev/sda4", production)
+        self.assertNotIn("/dev/sda3", production)
         for forbidden in (
             "virt-tar-out",
             "virt-tar-in",
@@ -90,7 +96,23 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             '"tar"',
             '"cp"',
         ):
-            self.assertNotIn(forbidden, builder)
+            self.assertNotIn(forbidden, production)
+
+    def test_production_builder_has_only_documented_qemu_img_boundary(self):
+        builder = (
+            ROOT / "scripts" / "build_generalized_ubuntu2604.zig"
+        ).read_text(encoding="utf-8")
+        production = builder.split('test "profiles pin', 1)[0]
+        self.assertIsNone(FORBIDDEN_PRODUCTION_TOOL.search(production))
+        self.assertEqual(production.count('"qemu-img"'), 2)
+        self.assertIn(
+            '"qemu-img", "convert"',
+            production,
+        )
+        self.assertIn(
+            "sole external image-format",
+            production,
+        )
 
     def make_bundle(
         self,
@@ -410,7 +432,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         for key in release.EXPECTED:
             self.make_bundle(key)
 
-    def stage(self, release_tag: str = "Ubuntu-26.04-20260824"):
+    def stage(self, release_tag: str = "Ubuntu-26.04-20260825"):
         output = self.root / "staged"
         notes = self.root / "release-notes.md"
         release.stage_command(

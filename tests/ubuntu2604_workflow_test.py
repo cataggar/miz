@@ -1,9 +1,14 @@
 from pathlib import Path
+import re
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = ROOT / ".github" / "workflows" / "ubuntu2604-release.yml"
+FORBIDDEN_PRODUCTION_TOOL = re.compile(
+    r"libguestfs|guestfish|supermin|LIBGUESTFS_BACKEND_SETTINGS|"
+    r"\bvirt-(?!fw-vars\b|firmware\b)[a-z0-9-]+"
+)
 
 
 class Ubuntu2604WorkflowTests(unittest.TestCase):
@@ -75,6 +80,8 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         self.assertIn('command -v "$tool"', install)
         for forbidden in (
             "libguestfs",
+            "guestfish",
+            "supermin",
             "virt-customize",
             "virt-copy-in",
             "virt-copy-out",
@@ -85,6 +92,37 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
             "force_tcg",
         ):
             self.assertNotIn(forbidden, install)
+
+    def test_forbidden_tools_are_confined_to_optional_oracle_jobs(self) -> None:
+        jobs = list(re.finditer(r"(?m)^  ([a-z][a-z0-9_]*):\n", self.source))
+        covered_matches: list[re.Match[str]] = []
+        publish = self.source.split("\n  publish:\n", 1)[1]
+        for index, job in enumerate(jobs):
+            end = jobs[index + 1].start() if index + 1 < len(jobs) else len(self.source)
+            section = self.source[job.start() : end]
+            matches = list(FORBIDDEN_PRODUCTION_TOOL.finditer(section))
+            if not matches:
+                continue
+            name = job.group(1)
+            self.assertTrue(
+                name.startswith("optional_oracle_"),
+                f"{name} contains a forbidden production tool",
+            )
+            self.assertIn("continue-on-error: true", section)
+            self.assertNotIn("\n    outputs:", section)
+            self.assertNotIn("actions/upload-artifact", section)
+            self.assertNotIn("actions/download-artifact", section)
+            publish_needs = publish.split("\n    if:", 1)[0]
+            self.assertNotIn(name, publish_needs)
+            self.assertNotIn(f"needs.{name}", publish)
+            covered_matches.extend(matches)
+        self.assertEqual(
+            len(covered_matches),
+            len(list(FORBIDDEN_PRODUCTION_TOOL.finditer(self.source))),
+            "forbidden tools may appear only in explicitly optional oracle jobs",
+        )
+        self.assertIn("python3-virt-firmware", self.source)
+        self.assertIn("virt-fw-vars", self.source)
 
     def test_build_log_pipeline_prepares_work_dir_and_propagates_failures(self) -> None:
         build = self.source.split(

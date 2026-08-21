@@ -25,9 +25,9 @@ The package-root round trip is native: the mutable QCOW2 is converted to a
 raw staging image, `vmiz.ext4_mountless.FileSystem` reads the selected ext4
 partition without mounting it, and the package-safe staging view is imported
 back through the same API before the raw image is converted back. This path
-does not use `virt-tar-*`, `guestfish`, host `tar`, or host `cp`; mode-`000`
-entries are read from ext4 bytes rather than made readable on the host, while
-their original metadata remains in the native tree.
+has no libguestfs, guestfish, supermin, or libguestfs `virt-*` dependency;
+mode-`000` entries are read from ext4 bytes rather than made readable on the
+host, while their original metadata remains in the native tree.
 
 The root partition is selected by the validated GPT name
 `cloudimg-rootfs` and the ext4 filesystem label, not by a fixed `/dev/sdaN`
@@ -118,6 +118,15 @@ sudo apt-get install -y --no-install-recommends \
 sudo chmod 0644 /boot/vmlinuz-*
 ```
 
+The builder inventory is limited to download and verification tools
+(`curl`, GnuPG, OpenSSL), native compilation and image mutation dependencies
+(`liblzma-dev`, `libzstd-dev`, `util-linux`, `cpio`, `xz`, and `zstd`), UKI
+assembly/signing tools (`binutils`, `linux-image-generic`, `python3-pefile`,
+`sbsigntool`, and `systemd-ukify`), `xorriso`, and `qemu-utils`.
+`qemu-img convert` is retained only because vmiz does not yet encode the final
+standalone zstd-compressed QCOW2 clusters. All resize, copy, GPT, filesystem
+mutation, and final structural validation before publication are native.
+
 The full build runs the bounded guest-tool allowlist in a private mount, PID,
 and network namespace, so it must be invoked with `sudo` on Linux. The executor
 mounts only `dev`, `proc`, `sys`, and `run`, creates the four required device
@@ -197,6 +206,12 @@ Secure Boot, signed UKI, vTPM, lockdown, signed modules, rejection of a
 tampered UKI, key-only SSH, cloud-init, WALinuxAgent, netplan/networkd, root
 growth, generalized identity, reboot/reconnect, and clean service health.
 
+The `python3-virt-firmware` package and its `virt-fw-vars` executable are
+firmware-variable tooling, not libguestfs. They remain required solely to
+create per-instance Secure Boot variable stores for QEMU acceptance.
+`qemu-utils` remains in native acceptance for candidate inspection and in
+Azure acceptance for the documented fixed-VHD conversion boundary.
+
 Azure acceptance requires an Azure subscription and OIDC application allowed
 to create and delete the temporary resource group and its managed disks,
 Compute Gallery/image definition/version with custom UEFI `db`, network,
@@ -213,7 +228,7 @@ the exact run ownership tags.
 `.github/workflows/ubuntu2604-release.yml` is manually dispatched from
 `main`. Before dispatch:
 
-1. Create the required tag `Ubuntu-26.04-20260824` at the exact current
+1. Create the required tag `Ubuntu-26.04-20260825` at the exact current
    `main` commit. Lightweight and annotated tags are accepted; an existing tag
    is never moved.
 2. Configure protected environment `ubuntu2604-signing`, restricted to
