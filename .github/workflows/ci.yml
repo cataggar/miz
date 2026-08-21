@@ -31,8 +31,8 @@ jobs:
             cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
             cataggar/qemu@v11.0.91-z.15
 
-      - name: Install embedded debz system libraries
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liblzma-dev libzstd-dev
+      - name: Install test system dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liblzma-dev libzstd-dev zstd
 
       - name: zig fmt --check
         run: zig fmt --check .

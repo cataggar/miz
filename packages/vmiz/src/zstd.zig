@@ -393,31 +393,59 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, encoded: []const u8) DecodeErro
 }
 
 fn decodeWithCli(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
-    const encoded_len = std.base64.standard.Encoder.calcSize(data.len);
-    const encoded = try allocator.alloc(u8, encoded_len);
-    defer allocator.free(encoded);
-    _ = std.base64.standard.Encoder.encode(encoded, data);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "frame.zst", .data = data });
 
-    const result = try std.process.run(allocator, std.testing.io, .{
+    const frame_path = try std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/tmp/{s}/frame.zst",
+        .{tmp.sub_path},
+    );
+    defer allocator.free(frame_path);
+
+    const result = std.process.run(allocator, std.testing.io, .{
         .argv = &.{
-            "sh",
+            "zstd",
+            "-q",
+            "-d",
             "-c",
-            "printf '%s' \"$1\" | base64 -d | zstd -q -d -c",
-            "sh",
-            encoded,
+            "--",
+            frame_path,
         },
         .cwd = .{ .path = "." },
-    });
+    }) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print(
+                "zstd CLI prerequisite is missing: executable 'zstd' was not found on PATH\n",
+                .{},
+            );
+            return error.ExternalDecompressionFailed;
+        },
+        else => return err,
+    };
     defer allocator.free(result.stderr);
     errdefer allocator.free(result.stdout);
 
     switch (result.term) {
-        .exited => |code| if (code == 0) return result.stdout,
-        else => {},
+        .exited => |code| {
+            if (code == 0) return result.stdout;
+            std.debug.print(
+                "zstd CLI decompression failed with exit status {d}:\nstderr:\n{s}\n",
+                .{ code, result.stderr },
+            );
+            allocator.free(result.stdout);
+            return error.ExternalDecompressionFailed;
+        },
+        else => {
+            std.debug.print(
+                "zstd CLI decompression did not exit normally ({t}):\nstderr:\n{s}\n",
+                .{ result.term, result.stderr },
+            );
+            allocator.free(result.stdout);
+            return error.ExternalDecompressionFailed;
+        },
     }
-
-    allocator.free(result.stdout);
-    return error.ExternalDecompressionFailed;
 }
 
 fn expectCliAndLocalDecode(encoded: []const u8, expected: []const u8, payload: ?[skippable_payload_len]u8) !void {
