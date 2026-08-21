@@ -64,9 +64,8 @@ vmiz/
                               #   verification of what it returns
         verity.zig             # dm-verity SHA-256 hash-tree generation +
                               #   kernel cmdline metadata helpers
-        cpio.zig               # minimal read-only newc-format cpio archive
-                              #   reader (concatenated archives, e.g. dracut
-                              #   early-cpio + main)
+        cpio.zig               # strict deterministic newc/CRC cpio reader
+                              #   and writer (safe paths, metadata and checks)
         verity_tooling.zig     # initramfs dm-verity userspace tooling
                               #   detection for `--verity` (issue #77)
         layout.zig             # partition-layout planner (sizing math,

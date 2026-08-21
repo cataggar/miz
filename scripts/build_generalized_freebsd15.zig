@@ -308,7 +308,6 @@ const Args = struct {
     output: []const u8 = "",
     work_dir: []const u8 = "",
     curl_path: []const u8 = "curl",
-    xz_path: []const u8 = "xz",
     qemu_img_path: []const u8 = "qemu-img",
     qemu_path: []const u8 = "",
     xorriso_path: []const u8 = "xorriso",
@@ -330,7 +329,6 @@ const help_text =
     \\  --output <path>          Output QCOW2
     \\  --work-dir <dir>         Download/decompression cache directory
     \\  --curl <path>            curl executable (default: curl)
-    \\  --xz <path>              XZ Utils executable (default: xz)
     \\  --qemu-img <path>        qemu-img executable (default: qemu-img)
     \\  --qemu <path>            Architecture-matched qemu-system executable
     \\  --xorriso <path>         xorriso executable used for the NoCloud ISO
@@ -368,8 +366,6 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.work_dir = try nextValue(argv, &i);
         } else if (std.mem.eql(u8, arg, "--curl")) {
             args.curl_path = try nextValue(argv, &i);
-        } else if (std.mem.eql(u8, arg, "--xz")) {
-            args.xz_path = try nextValue(argv, &i);
         } else if (std.mem.eql(u8, arg, "--qemu-img")) {
             args.qemu_img_path = try nextValue(argv, &i);
         } else if (std.mem.eql(u8, arg, "--qemu")) {
@@ -1492,7 +1488,6 @@ pub fn main(init: std.process.Init) !void {
             .output_path = decompressed_path,
             .max_output_size = image_max_size,
             .max_memory_size = xz_memory_limit,
-            .xz_path = args.xz_path,
         },
     );
 
@@ -1695,7 +1690,6 @@ test "FreeBSD builder defaults pin the official release source" {
     );
     try std.testing.expectEqualStrings(profile.output, args.output);
     try std.testing.expectEqualStrings("curl", args.curl_path);
-    try std.testing.expectEqualStrings("xz", args.xz_path);
     try std.testing.expectEqualStrings("qemu-img", args.qemu_img_path);
     try std.testing.expectEqualStrings("qemu-system-aarch64", args.qemu_path);
     try std.testing.expectEqualStrings("xorriso", args.xorriso_path);
@@ -1950,8 +1944,6 @@ test "FreeBSD builder parses explicit source and tool paths" {
         "work",
         "--curl",
         "/tools/curl",
-        "--xz",
-        "/tools/xz",
         "--qemu-img",
         "/tools/qemu-img",
         "--qemu",
@@ -1973,7 +1965,6 @@ test "FreeBSD builder parses explicit source and tool paths" {
     try std.testing.expectEqualStrings("out.qcow2", args.output);
     try std.testing.expectEqualStrings("work", args.work_dir);
     try std.testing.expectEqualStrings("/tools/curl", args.curl_path);
-    try std.testing.expectEqualStrings("/tools/xz", args.xz_path);
     try std.testing.expectEqualStrings("/tools/qemu-img", args.qemu_img_path);
     try std.testing.expectEqualStrings("/tools/qemu-system-x86_64", args.qemu_path);
     try std.testing.expectEqualStrings("/tools/xorriso", args.xorriso_path);

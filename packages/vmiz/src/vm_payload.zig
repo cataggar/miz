@@ -715,76 +715,35 @@ pub fn appendMembers(
     var out: std.array_list.Managed(u8) = .init(allocator);
     errdefer out.deinit();
     try out.appendSlice(initrd);
-    for (members) |member| try writeCpioMember(&out, member);
-    try writeCpioTrailer(&out);
+    var writer = cpio.Writer.init(&out, .newc);
+    for (members) |member| try writer.append(try cpioMember(member));
+    try writer.finish();
     return out.toOwnedSlice();
 }
 
-const cpio_header_size = 110;
+fn cpioMember(member: Member) !cpio.WriteEntry {
+    const mtime = std.math.cast(u32, member.mtime) orelse
+        return error.InvalidCpioMemberMetadata;
+    return .{
+        .path = member.path,
+        .content = member.bytes,
+        .metadata = .{
+            // A single link makes this an independent initramfs member.  The
+            // remaining zero metadata is deliberate and reproducible.
+            .mode = member.mode,
+            .mtime = mtime,
+        },
+    };
+}
 
 fn writeCpioMember(out: *std.array_list.Managed(u8), member: Member) !void {
-    try writeCpioHeader(out, .{
-        .name = member.path,
-        .mode = member.mode,
-        .size = member.bytes.len,
-        .mtime = member.mtime,
-        .nlink = 1,
-    });
-    try out.appendSlice(member.bytes);
-    try padTo4(out);
+    var writer = cpio.Writer.init(out, .newc);
+    try writer.append(try cpioMember(member));
 }
 
 fn writeCpioTrailer(out: *std.array_list.Managed(u8)) !void {
-    try writeCpioHeader(out, .{
-        .name = "TRAILER!!!",
-        .mode = 0,
-        .size = 0,
-        .mtime = 0,
-        .nlink = 1,
-    });
-}
-
-const CpioHeader = struct {
-    name: []const u8,
-    mode: u32,
-    size: usize,
-    mtime: u64,
-    nlink: u32,
-};
-
-fn writeCpioHeader(out: *std.array_list.Managed(u8), header: CpioHeader) !void {
-    const start = out.items.len;
-    try out.appendSlice(cpio.magic_newc);
-    // ino is deliberately constant: the kernel keys hardlinks on it only when
-    // nlink > 1, and a constant keeps the archive byte-reproducible.
-    try writeHexField(out, 0);
-    try writeHexField(out, header.mode);
-    try writeHexField(out, 0); // uid: the agent runs as the guest's root
-    try writeHexField(out, 0); // gid
-    try writeHexField(out, header.nlink);
-    try writeHexField(out, @truncate(header.mtime));
-    try writeHexField(out, @intCast(header.size));
-    try writeHexField(out, 0); // devmajor
-    try writeHexField(out, 0); // devminor
-    try writeHexField(out, 0); // rdevmajor
-    try writeHexField(out, 0); // rdevminor
-    try writeHexField(out, @intCast(header.name.len + 1));
-    try writeHexField(out, 0); // check, unused by newc
-    std.debug.assert(out.items.len - start == cpio_header_size);
-
-    try out.appendSlice(header.name);
-    try out.append(0);
-    try padTo4(out);
-}
-
-fn writeHexField(out: *std.array_list.Managed(u8), value: u32) !void {
-    var buffer: [8]u8 = undefined;
-    _ = std.fmt.bufPrint(&buffer, "{X:0>8}", .{value}) catch unreachable;
-    try out.appendSlice(&buffer);
-}
-
-fn padTo4(out: *std.array_list.Managed(u8)) !void {
-    while (out.items.len % 4 != 0) try out.append(0);
+    var writer = cpio.Writer.init(out, .newc);
+    try writer.finish();
 }
 
 test "the appended agent is a readable cpio member after an existing archive" {

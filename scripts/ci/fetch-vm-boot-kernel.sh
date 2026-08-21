@@ -54,10 +54,10 @@ modules_builtin_path="${destination}/lib/modules/${kernel_version}/modules.built
 # The caller is expected to wrap this in actions/cache keyed on the version
 # above, so a cache hit skips the download entirely.
 if [ ! -f "$kernel_path" ] || [ ! -f "$modules_builtin_path" ]; then
-    for tool in curl rpm2cpio cpio; do
+    for tool in curl rpm2cpio zig; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             echo "fetch-vm-boot-kernel: ${tool} is required to extract the kernel" >&2
-            echo "on Debian and Ubuntu: sudo apt-get install -y rpm2cpio cpio" >&2
+            echo "on Debian and Ubuntu: sudo apt-get install -y rpm2cpio" >&2
             exit 1
         fi
     done
@@ -68,14 +68,14 @@ if [ ! -f "$kernel_path" ] || [ ! -f "$modules_builtin_path" ]; then
         "${base_url}/${rpm_architecture}/Packages/k/${rpm_name}"
 
     # Only these two members are extracted: the rest of an Azure Linux kernel
-    # package is the module tree, which an rdinit guest can never load.
-    (
-        cd "$destination"
-        rpm2cpio "$rpm_name" | cpio -idm --quiet \
-            "./boot/vmlinuz-${kernel_version}" \
-            "./lib/modules/${kernel_version}/modules.builtin"
-    )
-    rm -f "$rpm_path"
+    # package is the module tree, which an rdinit guest can never load.  The
+    # native cpio reader rejects malformed metadata and unsafe paths.
+    cpio_path="${destination}/${rpm_name}.cpio"
+    rpm2cpio "$rpm_path" > "$cpio_path"
+    zig run packages/vmiz/src/cpio_extract.zig -- "$cpio_path" "$destination" \
+        "./boot/vmlinuz-${kernel_version}" \
+        "./lib/modules/${kernel_version}/modules.builtin"
+    rm -f "$rpm_path" "$cpio_path"
 fi
 
 for required in "$kernel_path" "$modules_builtin_path"; do

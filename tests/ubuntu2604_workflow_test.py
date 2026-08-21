@@ -66,10 +66,16 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         install = self.source.split(
             "- name: Install complete Ubuntu image-builder dependencies", 1
         )[1].split("- name: Build built-in Artifact Signing client", 1)[0]
-        self.assertIn("liblzma-dev", install)
-        self.assertIn("libzstd-dev", install)
         self.assertIn("linux-image-generic", install)
         self.assertIn("util-linux", install)
+        for removed in (
+            "liblzma-dev",
+            "libzstd-dev",
+            "cpio",
+            "xz-utils",
+            " zstd",
+        ):
+            self.assertNotIn(removed, install)
         apt_install = install.index(
             'sudo apt-get install -y --no-install-recommends "${packages[@]}"'
         )

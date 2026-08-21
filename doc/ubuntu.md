@@ -117,18 +117,20 @@ builder dependencies as the release workflow:
 ```console
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
-  binutils cpio file jq liblzma-dev libzstd-dev \
+  binutils file jq \
   linux-image-generic openssl \
   python3 python3-pefile qemu-utils sbsigntool systemd-ukify \
-  util-linux xorriso xz-utils zstd
+  util-linux xorriso
 sudo chmod 0644 /boot/vmlinuz-*
 ```
 
-The builder inventory is limited to native HTTPS and OpenPGP verification tools
-(OpenSSL provides UKI signing support), native compilation and image mutation dependencies
-(`liblzma-dev`, `libzstd-dev`, `util-linux`, `cpio`, `xz`, and `zstd`), UKI
-assembly/signing tools (`binutils`, `linux-image-generic`, `python3-pefile`,
-`sbsigntool`, and `systemd-ukify`), `xorriso`, and `qemu-utils`.
+The builder inventory is limited to native compilation and image-mutation
+dependencies (`util-linux`), UKI assembly/signing tools (`binutils`,
+`linux-image-generic`, `python3-pefile`, `sbsigntool`, and `systemd-ukify`),
+`xorriso`, `qemu-utils`, `file`, `jq`, and OpenSSL. HTTPS/OpenPGP artifact
+verification and XZ/zstd decoding and encoding plus newc cpio archive creation
+are native, bounded implementations; no host codec library or `curl`, GnuPG,
+`cpio`, `xz`, or `zstd` executable is used.
 `qemu-img convert` is retained only because vmiz does not yet encode the final
 standalone zstd-compressed QCOW2 clusters. All resize, copy, GPT, filesystem
 mutation, and final structural validation before publication are native.

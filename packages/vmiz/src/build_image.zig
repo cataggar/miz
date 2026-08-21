@@ -4,6 +4,7 @@ const Io = std.Io;
 const azure = @import("azure.zig");
 const bootconfig = @import("bootconfig.zig");
 const cosi = @import("cosi.zig");
+const cpio = @import("cpio.zig");
 const ext4 = @import("ext4.zig");
 const fat32 = @import("fat32.zig");
 const filesystem_writer = @import("filesystem_writer.zig");
@@ -5041,22 +5042,14 @@ fn makeSyntheticBiosCoreImg(allocator: std.mem.Allocator) ![]u8 {
 fn makeSyntheticInitramfsCpio(allocator: std.mem.Allocator, entry_path: []const u8) ![]u8 {
     var list = std.array_list.Managed(u8).init(allocator);
     errdefer list.deinit();
-    try appendCpioTestEntry(&list, entry_path, "elf-bytes");
-    try appendCpioTestEntry(&list, "TRAILER!!!", "");
-    return list.toOwnedSlice();
-}
-
-fn appendCpioTestEntry(list: *std.array_list.Managed(u8), name: []const u8, content: []const u8) !void {
-    var header: [110]u8 = undefined;
-    _ = try std.fmt.bufPrint(&header, "070701{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}", .{
-        0, @as(u32, 0o100644), 0, 0, 1, 0, content.len, 0, 0, 0, 0, name.len + 1, 0,
+    var writer = cpio.Writer.init(&list, .newc);
+    try writer.append(.{
+        .path = entry_path,
+        .content = "elf-bytes",
+        .metadata = .{ .mode = 0o100644 },
     });
-    try list.appendSlice(&header);
-    try list.appendSlice(name);
-    try list.append(0);
-    while (list.items.len % 4 != 0) try list.append(0);
-    try list.appendSlice(content);
-    while (list.items.len % 4 != 0) try list.append(0);
+    try writer.finish();
+    return list.toOwnedSlice();
 }
 
 // Minimal in-memory adapter to the production ISO9660 writer, used only by the
