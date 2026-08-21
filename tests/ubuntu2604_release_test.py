@@ -862,29 +862,23 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             self.stage()
         self.assertTrue((output / "do-not-replace").is_file())
 
-    def test_canonical_signature_verification_is_agent_free(self):
+    def test_canonical_signature_verification_is_native_and_gnupg_free(self):
         builder = (
             ROOT / "scripts" / "build_generalized_ubuntu2604.zig"
         ).read_text(encoding="utf-8")
         workflow = (
             ROOT / ".github" / "workflows" / "ubuntu2604-release.yml"
         ).read_text(encoding="utf-8")
-        self.assertIn('"gpg", "--batch", "--no-options"', builder)
-        self.assertIn('"gpg", "--batch", "--yes", "--dearmor"', builder)
-        self.assertIn('"gpgv", "--keyring"', builder)
-        self.assertNotIn('"gpg", "--batch", "--homedir"', builder)
-        self.assertNotIn('"--import"', builder)
-        self.assertIn("gpg gpgv mount", workflow)
-        self.assertNotIn("curl", workflow)
-
-    def test_release_acquisition_uses_native_https_without_curl(self):
-        builder = (
-            ROOT / "scripts" / "build_generalized_ubuntu2604.zig"
-        ).read_text(encoding="utf-8")
+        self.assertIn('@embedFile("fixtures/canonical-ubuntu-cloud-image-key.asc")', builder)
+        self.assertIn("verifyOpenPgpDetachedSignature", builder)
+        self.assertIn("PKCS1v1_5Signature.concatVerify", builder)
         self.assertIn("NativeHttpsDownloader.init", builder)
         self.assertIn("artifact_pipeline.acquireVerified", builder)
-        self.assertIn("artifact_pipeline.downloadBoundedAtomic", builder)
+        self.assertNotIn('"gpg"', builder)
         self.assertNotIn('"curl"', builder)
+        self.assertNotIn("gnupg", workflow)
+        self.assertNotIn("curl", workflow)
+        self.assertIn("for tool in mount", workflow)
 
     def test_publisher_is_draft_first_allowlisted_and_fail_safe(self):
         script = (ROOT / "scripts" / "ubuntu2604_publish.sh").read_text()

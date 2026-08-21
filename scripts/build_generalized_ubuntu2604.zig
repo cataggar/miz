@@ -27,11 +27,23 @@ const release_base = "https://cloud-images.ubuntu.com/releases/26.04/release-" +
 const snapshot_base = "https://snapshot.ubuntu.com/ubuntu/20260731T000000Z";
 const canonical_fingerprint = "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81";
 const canonical_fingerprint_lower = "d2eb44626fddc30b513d5bb71a5d6c4c7db87c81";
+const canonical_fingerprint_bytes = [_]u8{
+    0xd2, 0xeb, 0x44, 0x62, 0x6f, 0xdd, 0xc3, 0x0b, 0x51, 0x3d,
+    0x5b, 0xb7, 0x1a, 0x5d, 0x6c, 0x4c, 0x7d, 0xb8, 0x7c, 0x81,
+};
+const canonical_key_armor = @embedFile("fixtures/canonical-ubuntu-cloud-image-key.asc");
+const canonical_key_armor_sha256 = [_]u8{
+    0xe5, 0x81, 0xb3, 0x9f, 0xac, 0x6b, 0xfc, 0x19, 0x9e, 0x92, 0x17, 0x88, 0xc3, 0xc0, 0x7a, 0xc5,
+    0x40, 0x6f, 0xe8, 0x8d, 0xb4, 0x87, 0xc7, 0xbd, 0xcf, 0x1e, 0x1d, 0x2f, 0x78, 0xfb, 0xcf, 0x05,
+};
 const sums_sha256 = "d562d59dac70f68d67d00e994db5cd89e49e9d93f7f80b4cb868a5eeb057ec36";
 const sums_signature_sha256 = "2bf5fae8be0c79cc30c5c10223f1d4790b6ef541240896bfe48c7ac57c3404ed";
 const default_virtual_size: u64 = 5 * 1024 * 1024 * 1024;
 const source_max_size: u64 = 2 * 1024 * 1024 * 1024;
 const manifest_max_size: u64 = 256 * 1024;
+const sums_max_size: u64 = 64 * 1024;
+const signature_max_size: u64 = 16 * 1024;
+const public_key_max_size: usize = 4 * 1024;
 
 const Architecture = enum {
     x86_64,
@@ -407,29 +419,394 @@ fn requireSha256SumsEntry(bytes: []const u8, filename: []const u8, digest: []con
     if (matches != 1) return error.SignedEntryMissingOrDuplicate;
 }
 
-fn hasExactCanonicalPrimaryFingerprint(bytes: []const u8) bool {
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    var expect_primary_fingerprint = false;
-    var primary_count: usize = 0;
-    var matched = false;
-    while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "pub:")) {
-            expect_primary_fingerprint = true;
-            continue;
+const ArmorKind = enum {
+    public_key,
+    signature,
+
+    fn begin(self: ArmorKind) []const u8 {
+        return switch (self) {
+            .public_key => "-----BEGIN PGP PUBLIC KEY BLOCK-----",
+            .signature => "-----BEGIN PGP SIGNATURE-----",
+        };
+    }
+
+    fn end(self: ArmorKind) []const u8 {
+        return switch (self) {
+            .public_key => "-----END PGP PUBLIC KEY BLOCK-----",
+            .signature => "-----END PGP SIGNATURE-----",
+        };
+    }
+};
+
+const OpenPgpPacket = struct {
+    tag: u8,
+    body: []const u8,
+};
+
+const OpenPgpPacketReader = struct {
+    bytes: []const u8,
+    offset: usize = 0,
+
+    fn take(self: *OpenPgpPacketReader, count: usize) ![]const u8 {
+        if (count > self.bytes.len -| self.offset) return error.TruncatedOpenPgpPacket;
+        const result = self.bytes[self.offset .. self.offset + count];
+        self.offset += count;
+        return result;
+    }
+
+    fn takeByte(self: *OpenPgpPacketReader) !u8 {
+        return (try self.take(1))[0];
+    }
+
+    fn next(self: *OpenPgpPacketReader) !?OpenPgpPacket {
+        if (self.offset == self.bytes.len) return null;
+        const ctb = try self.takeByte();
+        if ((ctb & 0x80) == 0) return error.InvalidOpenPgpPacketHeader;
+
+        var tag: u8 = undefined;
+        var body_length: usize = undefined;
+        if ((ctb & 0x40) != 0) {
+            tag = ctb & 0x3f;
+            const first_length = try self.takeByte();
+            body_length = switch (first_length) {
+                0...191 => first_length,
+                192...223 => blk: {
+                    const second_length = try self.takeByte();
+                    break :blk ((@as(usize, first_length) - 192) << 8) + second_length + 192;
+                },
+                255 => blk: {
+                    const encoded = try self.take(4);
+                    const value = std.mem.readInt(u32, encoded[0..4], .big);
+                    if (value < 8384) return error.NonCanonicalOpenPgpLength;
+                    break :blk value;
+                },
+                else => return error.PartialOpenPgpPacketsUnsupported,
+            };
+        } else {
+            tag = (ctb >> 2) & 0x0f;
+            body_length = switch (ctb & 0x03) {
+                0 => try self.takeByte(),
+                1 => std.mem.readInt(u16, (try self.take(2))[0..2], .big),
+                2 => std.mem.readInt(u32, (try self.take(4))[0..4], .big),
+                else => return error.IndeterminateOpenPgpPacketsUnsupported,
+            };
         }
-        if (!expect_primary_fingerprint or !std.mem.startsWith(u8, line, "fpr:")) continue;
-        expect_primary_fingerprint = false;
-        primary_count += 1;
-        var fields = std.mem.splitScalar(u8, line, ':');
-        var field_index: usize = 0;
-        while (fields.next()) |field| : (field_index += 1) {
-            if (field_index == 9) {
-                matched = std.mem.eql(u8, field, canonical_fingerprint);
-                break;
-            }
+        return .{ .tag = tag, .body = try self.take(body_length) };
+    }
+};
+
+const OpenPgpMpi = struct {
+    bits: u16,
+    bytes: []const u8,
+};
+
+fn parseOpenPgpMpi(bytes: []const u8, offset: *usize) !OpenPgpMpi {
+    if (bytes.len -| offset.* < 2) return error.TruncatedOpenPgpMpi;
+    const bits = std.mem.readInt(u16, bytes[offset.*..][0..2], .big);
+    offset.* += 2;
+    if (bits == 0) return error.InvalidOpenPgpMpi;
+    const byte_count = (@as(usize, bits) + 7) / 8;
+    if (byte_count > bytes.len -| offset.*) return error.TruncatedOpenPgpMpi;
+    const value = bytes[offset.* .. offset.* + byte_count];
+    offset.* += byte_count;
+    const unused_bits: u4 = @intCast((8 - (bits % 8)) % 8);
+    const first_significant_bit: u3 = @intCast(7 - unused_bits);
+    if (value[0] == 0 or
+        (unused_bits != 0 and value[0] >> @as(u3, @intCast(8 - unused_bits)) != 0) or
+        (value[0] & (@as(u8, 1) << first_significant_bit)) == 0)
+        return error.NonCanonicalOpenPgpMpi;
+    return .{ .bits = bits, .bytes = value };
+}
+
+fn crc24(bytes: []const u8) u32 {
+    var crc: u32 = 0xb704ce;
+    for (bytes) |byte| {
+        crc ^= @as(u32, byte) << 16;
+        for (0..8) |_| {
+            crc = (crc << 1) ^ if ((crc & 0x800000) != 0) @as(u32, 0x1864cfb) else 0;
+            crc &= 0xffffff;
         }
     }
-    return primary_count == 1 and matched;
+    return crc;
+}
+
+fn validateArmorHeader(line: []const u8) !void {
+    const separator = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidOpenPgpArmorHeader;
+    if (separator == 0 or separator + 1 >= line.len) return error.InvalidOpenPgpArmorHeader;
+    for (line) |byte|
+        if (byte < 0x20 or byte > 0x7e) return error.InvalidOpenPgpArmorHeader;
+}
+
+fn decodeOpenPgpArmorAlloc(
+    allocator: Allocator,
+    armored: []const u8,
+    kind: ArmorKind,
+    max_size: usize,
+) ![]u8 {
+    if (!std.mem.endsWith(u8, armored, "\n")) return error.InvalidOpenPgpArmor;
+    var lines = std.mem.splitScalar(u8, armored, '\n');
+    if (!std.mem.eql(u8, lines.next() orelse return error.InvalidOpenPgpArmor, kind.begin()))
+        return error.InvalidOpenPgpArmor;
+
+    var encoded = try allocator.alloc(u8, armored.len);
+    defer allocator.free(encoded);
+    var encoded_length: usize = 0;
+    var previous_line_length: ?usize = null;
+    var saw_body = false;
+    var saw_separator = false;
+    var expected_crc: ?u32 = null;
+
+    while (lines.next()) |line| {
+        if (!saw_separator) {
+            if (line.len == 0) {
+                saw_separator = true;
+            } else {
+                try validateArmorHeader(line);
+            }
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "=")) {
+            if (!saw_body or line.len != 5) return error.InvalidOpenPgpArmor;
+            var crc_bytes: [3]u8 = undefined;
+            try std.base64.standard.Decoder.decode(&crc_bytes, line[1..]);
+            expected_crc = std.mem.readInt(u24, &crc_bytes, .big);
+            break;
+        }
+        if (line.len == 0 or line.len > 64) return error.InvalidOpenPgpArmor;
+        if (previous_line_length) |length|
+            if (length != 64) return error.NonCanonicalOpenPgpArmor;
+        for (line) |byte|
+            if (!(std.ascii.isAlphanumeric(byte) or byte == '+' or byte == '/' or byte == '='))
+                return error.InvalidOpenPgpArmor;
+        @memcpy(encoded[encoded_length .. encoded_length + line.len], line);
+        encoded_length += line.len;
+        previous_line_length = line.len;
+        saw_body = true;
+    }
+
+    const crc = expected_crc orelse return error.InvalidOpenPgpArmor;
+    if (previous_line_length == null or encoded_length % 4 != 0) return error.InvalidOpenPgpArmor;
+    if (!std.mem.eql(u8, lines.next() orelse return error.InvalidOpenPgpArmor, kind.end()))
+        return error.InvalidOpenPgpArmor;
+    if (lines.next()) |trailing|
+        if (trailing.len != 0 or lines.next() != null) return error.TrailingOpenPgpArmorData;
+
+    const decoded_length = try std.base64.standard.Decoder.calcSizeForSlice(encoded[0..encoded_length]);
+    if (decoded_length == 0 or decoded_length > max_size) return error.OpenPgpArmorTooLarge;
+    const decoded = try allocator.alloc(u8, decoded_length);
+    errdefer allocator.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, encoded[0..encoded_length]);
+    if (crc24(decoded) != crc) return error.OpenPgpArmorCrcMismatch;
+    return decoded;
+}
+
+const ParsedOpenPgpPublicKey = struct {
+    fingerprint: [20]u8,
+    created_at: u32,
+    rsa: std.crypto.Certificate.rsa.PublicKey,
+};
+
+fn parseOpenPgpPublicKeyPacket(body: []const u8) !ParsedOpenPgpPublicKey {
+    if (body.len < 8 or body[0] != 4) return error.UnsupportedOpenPgpPublicKeyVersion;
+    if (body[5] != 1) return error.UnsupportedOpenPgpPublicKeyAlgorithm;
+    var offset: usize = 6;
+    const modulus = try parseOpenPgpMpi(body, &offset);
+    const exponent = try parseOpenPgpMpi(body, &offset);
+    if (offset != body.len) return error.TrailingOpenPgpPublicKeyData;
+    if (modulus.bits != 4096 or modulus.bytes.len != 512 or !std.mem.eql(u8, exponent.bytes, "\x01\x00\x01"))
+        return error.WeakOrUnsupportedOpenPgpRsaKey;
+
+    var fingerprint: [20]u8 = undefined;
+    var hasher = std.crypto.hash.Sha1.init(.{});
+    hasher.update("\x99");
+    var length: [2]u8 = undefined;
+    std.mem.writeInt(u16, &length, @intCast(body.len), .big);
+    hasher.update(&length);
+    hasher.update(body);
+    hasher.final(&fingerprint);
+
+    return .{
+        .fingerprint = fingerprint,
+        .created_at = std.mem.readInt(u32, body[1..5], .big),
+        .rsa = try std.crypto.Certificate.rsa.PublicKey.fromBytes(exponent.bytes, modulus.bytes),
+    };
+}
+
+fn parseSingleOpenPgpPublicKeyPacket(packet_bytes: []const u8) !ParsedOpenPgpPublicKey {
+    var reader = OpenPgpPacketReader{ .bytes = packet_bytes };
+    const packet = try reader.next() orelse return error.OpenPgpPublicKeyMissing;
+    if (packet.tag != 6) return error.OpenPgpPublicKeyMissing;
+    if (try reader.next() != null) return error.AmbiguousOpenPgpPublicKeyPackets;
+    return parseOpenPgpPublicKeyPacket(packet.body);
+}
+
+fn parseCanonicalPublicKey(allocator: Allocator) !ParsedOpenPgpPublicKey {
+    var armor_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(canonical_key_armor, &armor_digest, .{});
+    if (!std.mem.eql(u8, &armor_digest, &canonical_key_armor_sha256)) return error.CanonicalKeyArmorPinMismatch;
+
+    const decoded = try decodeOpenPgpArmorAlloc(allocator, canonical_key_armor, .public_key, public_key_max_size);
+    defer allocator.free(decoded);
+    var reader = OpenPgpPacketReader{ .bytes = decoded };
+    const primary = try reader.next() orelse return error.OpenPgpPublicKeyMissing;
+    if (primary.tag != 6) return error.OpenPgpPublicKeyMissing;
+    const key = try parseOpenPgpPublicKeyPacket(primary.body);
+    // The entire armored transfer is source-pinned above; parse its remaining
+    // packets only to reject malformed or unsupported trailing data.
+    while (try reader.next()) |packet| {
+        switch (packet.tag) {
+            2, 13 => if (packet.body.len == 0) return error.InvalidOpenPgpCanonicalKeyPacket,
+            else => return error.UnsupportedOpenPgpCanonicalKeyPacket,
+        }
+    }
+    if (!std.mem.eql(u8, &key.fingerprint, &canonical_fingerprint_bytes))
+        return error.CanonicalFingerprintMismatch;
+    return key;
+}
+
+const SignatureSubpackets = struct {
+    creation_time: ?u32 = null,
+    issuer_fingerprint: bool = false,
+    issuer_key_id: bool = false,
+};
+
+fn readOpenPgpSubpacketLength(bytes: []const u8, offset: *usize) !usize {
+    if (offset.* == bytes.len) return error.TruncatedOpenPgpSubpacket;
+    const first = bytes[offset.*];
+    offset.* += 1;
+    return switch (first) {
+        0...191 => first,
+        192...223 => blk: {
+            if (offset.* == bytes.len) return error.TruncatedOpenPgpSubpacket;
+            const second = bytes[offset.*];
+            offset.* += 1;
+            break :blk ((@as(usize, first) - 192) << 8) + second + 192;
+        },
+        255 => blk: {
+            if (bytes.len -| offset.* < 4) return error.TruncatedOpenPgpSubpacket;
+            const result = std.mem.readInt(u32, bytes[offset.*..][0..4], .big);
+            offset.* += 4;
+            if (result < 8384) return error.NonCanonicalOpenPgpLength;
+            break :blk result;
+        },
+        else => return error.PartialOpenPgpPacketsUnsupported,
+    };
+}
+
+fn parseSignatureSubpackets(
+    bytes: []const u8,
+    hashed: bool,
+    key: *const ParsedOpenPgpPublicKey,
+    result: *SignatureSubpackets,
+) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const length = try readOpenPgpSubpacketLength(bytes, &offset);
+        if (length == 0 or length > bytes.len -| offset) return error.InvalidOpenPgpSubpacket;
+        const packet = bytes[offset .. offset + length];
+        offset += length;
+        if ((packet[0] & 0x80) != 0) return error.UnsupportedCriticalOpenPgpSubpacket;
+        const body = packet[1..];
+        switch (packet[0]) {
+            2 => {
+                if (!hashed or result.creation_time != null or body.len != 4)
+                    return error.InvalidOpenPgpSignatureCreationTime;
+                result.creation_time = std.mem.readInt(u32, body[0..4], .big);
+            },
+            16 => {
+                if (hashed or result.issuer_key_id or body.len != 8 or
+                    !std.mem.eql(u8, body, key.fingerprint[key.fingerprint.len - 8 ..]))
+                    return error.InvalidOpenPgpIssuer;
+                result.issuer_key_id = true;
+            },
+            33 => {
+                if (!hashed or result.issuer_fingerprint or body.len != 21 or body[0] != 4 or
+                    !std.mem.eql(u8, body[1..], &key.fingerprint))
+                    return error.InvalidOpenPgpIssuer;
+                result.issuer_fingerprint = true;
+            },
+            else => return error.UnsupportedOpenPgpSignatureSubpacket,
+        }
+    }
+}
+
+fn verifyOpenPgpDetachedSignature(
+    allocator: Allocator,
+    io: Io,
+    content: []const u8,
+    encoded_signature: []const u8,
+    key: *const ParsedOpenPgpPublicKey,
+) !void {
+    const signature_bytes = if (std.mem.startsWith(u8, encoded_signature, "-----BEGIN PGP SIGNATURE-----"))
+        try decodeOpenPgpArmorAlloc(allocator, encoded_signature, .signature, signature_max_size)
+    else
+        try allocator.dupe(u8, encoded_signature);
+    defer allocator.free(signature_bytes);
+
+    var reader = OpenPgpPacketReader{ .bytes = signature_bytes };
+    const packet = try reader.next() orelse return error.OpenPgpDetachedSignatureMissing;
+    if (packet.tag != 2) return error.OpenPgpDetachedSignatureMissing;
+    if (try reader.next() != null) return error.AmbiguousOpenPgpDetachedSignature;
+    const body = packet.body;
+    if (body.len < 10 or body[0] != 4 or body[1] != 0 or body[2] != 1 or body[3] != 10)
+        return error.UnsupportedOpenPgpDetachedSignature;
+
+    const hashed_length = std.mem.readInt(u16, body[4..6], .big);
+    const hashed_end = 6 + @as(usize, hashed_length);
+    if (hashed_end > body.len -| 2) return error.TruncatedOpenPgpDetachedSignature;
+    var subpackets = SignatureSubpackets{};
+    try parseSignatureSubpackets(body[6..hashed_end], true, key, &subpackets);
+
+    const unhashed_length = std.mem.readInt(u16, body[hashed_end..][0..2], .big);
+    const unhashed_end = hashed_end + 2 + @as(usize, unhashed_length);
+    if (unhashed_end > body.len -| 4) return error.TruncatedOpenPgpDetachedSignature;
+    try parseSignatureSubpackets(body[hashed_end + 2 .. unhashed_end], false, key, &subpackets);
+    const creation_time = subpackets.creation_time orelse return error.OpenPgpSignatureCreationTimeMissing;
+    if (!subpackets.issuer_fingerprint or !subpackets.issuer_key_id) return error.OpenPgpSignatureIssuerMissing;
+    if (creation_time < key.created_at or @as(i64, creation_time) > Io.Timestamp.now(io, .real).toSeconds())
+        return error.InvalidOpenPgpSignatureTime;
+
+    const left_hash = body[unhashed_end..][0..2];
+    var signature_offset = unhashed_end + 2;
+    const signature_mpi = try parseOpenPgpMpi(body, &signature_offset);
+    if (signature_offset != body.len or signature_mpi.bits != 4096 or signature_mpi.bytes.len != 512)
+        return error.WeakOrMalformedOpenPgpSignature;
+
+    var trailer: [6]u8 = undefined;
+    trailer[0] = 4;
+    trailer[1] = 0xff;
+    std.mem.writeInt(u32, trailer[2..6], @intCast(hashed_end), .big);
+    var digest: [64]u8 = undefined;
+    var hasher = std.crypto.hash.sha2.Sha512.init(.{});
+    hasher.update(content);
+    hasher.update(body[0..hashed_end]);
+    hasher.update(&trailer);
+    hasher.final(&digest);
+    if (!std.mem.eql(u8, left_hash, digest[0..2])) return error.OpenPgpSignatureHashPrefixMismatch;
+
+    var signature: [512]u8 = undefined;
+    @memcpy(&signature, signature_mpi.bytes);
+    try std.crypto.Certificate.rsa.PKCS1v1_5Signature.concatVerify(
+        512,
+        signature,
+        &.{ content, body[0..hashed_end], &trailer },
+        key.rsa,
+        std.crypto.hash.sha2.Sha512,
+    );
+}
+
+fn verifyCanonicalPublication(
+    allocator: Allocator,
+    io: Io,
+    sums_path: []const u8,
+    signature_path: []const u8,
+) !void {
+    const sums = try Dir.cwd().readFileAlloc(io, sums_path, allocator, .limited(sums_max_size));
+    defer allocator.free(sums);
+    const signature = try Dir.cwd().readFileAlloc(io, signature_path, allocator, .limited(signature_max_size));
+    defer allocator.free(signature);
+    const key = try parseCanonicalPublicKey(allocator);
+    try verifyOpenPgpDetachedSignature(allocator, io, sums, signature, &key);
 }
 
 fn peMachine(bytes: []const u8) !u16 {
@@ -466,40 +843,6 @@ fn validateExactLockRuntime(allocator: Allocator, bytes: []const u8, profile: *c
         .aarch64 => "\tamd64\n",
     };
     if (std.mem.indexOf(u8, bytes, foreign_arch) != null) return error.ForeignArchitecturePackage;
-}
-
-fn verifyCanonicalPublication(
-    allocator: Allocator,
-    io: Io,
-    work_dir: []const u8,
-    sums_path: []const u8,
-    signature_path: []const u8,
-    downloader: artifact_pipeline.Downloader,
-) !void {
-    const key_url = try std.fmt.allocPrint(
-        allocator,
-        "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x{s}",
-        .{canonical_fingerprint},
-    );
-    defer allocator.free(key_url);
-    const key_path = try std.fs.path.join(allocator, &.{ work_dir, "canonical-cloud-image-key.asc" });
-    defer allocator.free(key_path);
-    _ = try artifact_pipeline.downloadBoundedAtomic(
-        allocator,
-        io,
-        key_url,
-        key_path,
-        256 * 1024,
-        downloader,
-    );
-    const fingerprints = try capture(allocator, io, &.{ "gpg", "--batch", "--no-options", "--with-colons", "--show-keys", "--fingerprint", key_path });
-    defer allocator.free(fingerprints);
-    if (!hasExactCanonicalPrimaryFingerprint(fingerprints)) return error.CanonicalFingerprintMismatch;
-    const keyring_path = try std.fs.path.join(allocator, &.{ work_dir, "canonical-cloud-image-key.gpg" });
-    defer allocator.free(keyring_path);
-    Dir.cwd().deleteFile(io, keyring_path) catch {};
-    try run(allocator, io, &.{ "gpg", "--batch", "--yes", "--dearmor", "--output", keyring_path, key_path });
-    try run(allocator, io, &.{ "gpgv", "--keyring", keyring_path, signature_path, sums_path });
 }
 
 const DebzEvidence = struct {
@@ -1628,8 +1971,6 @@ pub fn main(init: std.process.Init) !void {
     try Dir.cwd().deleteTree(io, provenance_dir);
     try Dir.cwd().createDirPath(io, provenance_dir);
 
-    for (&[_][]const u8{ "gpg", "gpgv" }) |tool|
-        try requireTool(allocator, io, tool);
     var https = artifact_pipeline.NativeHttpsDownloader.init(allocator, io);
     defer https.deinit();
     const downloader = https.downloader();
@@ -1638,10 +1979,10 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(sums_path);
     const signature_path = try std.fs.path.join(allocator, &.{ work_dir, "SHA256SUMS.gpg" });
     defer allocator.free(signature_path);
-    try acquire(allocator, io, release_base ++ "/SHA256SUMS", sums_path, sums_sha256, 64 * 1024, downloader);
-    try acquire(allocator, io, release_base ++ "/SHA256SUMS.gpg", signature_path, sums_signature_sha256, 16 * 1024, downloader);
-    try verifyCanonicalPublication(allocator, io, work_dir, sums_path, signature_path, downloader);
-    const sums = try Dir.cwd().readFileAlloc(io, sums_path, allocator, .limited(64 * 1024));
+    try acquire(allocator, io, release_base ++ "/SHA256SUMS", sums_path, sums_sha256, sums_max_size, downloader);
+    try acquire(allocator, io, release_base ++ "/SHA256SUMS.gpg", signature_path, sums_signature_sha256, signature_max_size, downloader);
+    try verifyCanonicalPublication(allocator, io, sums_path, signature_path);
+    const sums = try Dir.cwd().readFileAlloc(io, sums_path, allocator, .limited(sums_max_size));
     defer allocator.free(sums);
     try requireSha256SumsEntry(sums, profile.source_name, profile.source_sha256);
     try requireSha256SumsEntry(sums, profile.manifest_name, profile.manifest_sha256);
@@ -1660,8 +2001,8 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(provenance_signature);
     const provenance_manifest = try std.fs.path.join(allocator, &.{ provenance_dir, profile.manifest_name });
     defer allocator.free(provenance_manifest);
-    try copyBoundedFile(allocator, io, sums_path, provenance_sums, 64 * 1024);
-    try copyBoundedFile(allocator, io, signature_path, provenance_signature, 16 * 1024);
+    try copyBoundedFile(allocator, io, sums_path, provenance_sums, sums_max_size);
+    try copyBoundedFile(allocator, io, signature_path, provenance_signature, signature_max_size);
     try copyBoundedFile(allocator, io, manifest_path, provenance_manifest, manifest_max_size);
 
     const source_path = if (args.source) |source| source else blk: {
@@ -1883,23 +2224,142 @@ test "both architecture profiles acquire through the shared native HTTPS downloa
     try std.testing.expectEqual(profiles.len, transport.calls);
 }
 
-test "Canonical fingerprint listing accepts exactly one matching primary key" {
-    const matching =
-        "tru::1:1750000000:0:3:1:5\n" ++
-        "pub:-:4096:1:1A5D6C4C7DB87C81:0:::-:::scESC::::::23::0:\n" ++
-        "fpr:::::::::D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81:\n" ++
-        "sub:-:4096:1:AAAAAAAAAAAAAAAA:0::::::e::::::23:\n" ++
-        "fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\n";
-    try std.testing.expect(hasExactCanonicalPrimaryFingerprint(matching));
-    try std.testing.expect(!hasExactCanonicalPrimaryFingerprint(
-        "pub:-:4096:1:BBBBBBBBBBBBBBBB:0:::-:::scESC::::::23::0:\n" ++
-            "fpr:::::::::BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB:\n",
-    ));
-    try std.testing.expect(!hasExactCanonicalPrimaryFingerprint(
-        matching ++
-            "pub:-:4096:1:CCCCCCCCCCCCCCCC:0:::-:::scESC::::::23::0:\n" ++
-            "fpr:::::::::CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC:\n",
-    ));
+test "native OpenPGP verifies the pinned Canonical release fixture" {
+    const key = try parseCanonicalPublicKey(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &canonical_fingerprint_bytes, &key.fingerprint);
+    try verifyOpenPgpDetachedSignature(
+        std.testing.allocator,
+        std.testing.io,
+        @embedFile("fixtures/openpgp/canonical-SHA256SUMS"),
+        @embedFile("fixtures/openpgp/canonical-SHA256SUMS.gpg"),
+        &key,
+    );
+}
+
+test "native OpenPGP cross-validates an independently generated RSA fixture" {
+    const armored_key = @embedFile("fixtures/openpgp/cross-validation-public-key.asc");
+    const packet_key = try decodeOpenPgpArmorAlloc(
+        std.testing.allocator,
+        armored_key,
+        .public_key,
+        public_key_max_size,
+    );
+    defer std.testing.allocator.free(packet_key);
+    const key = try parseSingleOpenPgpPublicKeyPacket(packet_key);
+    try verifyOpenPgpDetachedSignature(
+        std.testing.allocator,
+        std.testing.io,
+        @embedFile("fixtures/openpgp/cross-validation-message.txt"),
+        @embedFile("fixtures/openpgp/cross-validation-signature.asc"),
+        &key,
+    );
+}
+
+test "native OpenPGP verification rejects modified and ambiguous inputs" {
+    const armored_key = @embedFile("fixtures/openpgp/cross-validation-public-key.asc");
+    const packet_key = try decodeOpenPgpArmorAlloc(
+        std.testing.allocator,
+        armored_key,
+        .public_key,
+        public_key_max_size,
+    );
+    defer std.testing.allocator.free(packet_key);
+    const key = try parseSingleOpenPgpPublicKeyPacket(packet_key);
+    const message = @embedFile("fixtures/openpgp/cross-validation-message.txt");
+    const armored_signature = @embedFile("fixtures/openpgp/cross-validation-signature.asc");
+    const packet_signature = try decodeOpenPgpArmorAlloc(
+        std.testing.allocator,
+        armored_signature,
+        .signature,
+        signature_max_size,
+    );
+    defer std.testing.allocator.free(packet_signature);
+
+    var modified_message = try std.testing.allocator.dupe(u8, message);
+    defer std.testing.allocator.free(modified_message);
+    modified_message[0] ^= 1;
+    try std.testing.expectError(
+        error.OpenPgpSignatureHashPrefixMismatch,
+        verifyOpenPgpDetachedSignature(std.testing.allocator, std.testing.io, modified_message, armored_signature, &key),
+    );
+
+    var modified_signature = try std.testing.allocator.dupe(u8, packet_signature);
+    defer std.testing.allocator.free(modified_signature);
+    modified_signature[modified_signature.len - 1] ^= 1;
+    try std.testing.expectError(
+        error.InvalidSignature,
+        verifyOpenPgpDetachedSignature(std.testing.allocator, std.testing.io, message, modified_signature, &key),
+    );
+
+    var unsupported = try std.testing.allocator.dupe(u8, packet_signature);
+    defer std.testing.allocator.free(unsupported);
+    unsupported[5] = 3;
+    try std.testing.expectError(
+        error.UnsupportedOpenPgpDetachedSignature,
+        verifyOpenPgpDetachedSignature(std.testing.allocator, std.testing.io, message, unsupported, &key),
+    );
+
+    const ambiguous = try std.testing.allocator.alloc(u8, packet_signature.len + 2);
+    defer std.testing.allocator.free(ambiguous);
+    @memcpy(ambiguous[0..packet_signature.len], packet_signature);
+    ambiguous[packet_signature.len] = 0xc2;
+    ambiguous[packet_signature.len + 1] = 0;
+    try std.testing.expectError(
+        error.AmbiguousOpenPgpDetachedSignature,
+        verifyOpenPgpDetachedSignature(std.testing.allocator, std.testing.io, message, ambiguous, &key),
+    );
+
+    var weak_key = try std.testing.allocator.dupe(u8, packet_key);
+    defer std.testing.allocator.free(weak_key);
+    weak_key[8] = 3;
+    try std.testing.expectError(error.UnsupportedOpenPgpPublicKeyAlgorithm, parseSingleOpenPgpPublicKeyPacket(weak_key));
+
+    const canonical_key = try parseCanonicalPublicKey(std.testing.allocator);
+    try std.testing.expectError(
+        error.InvalidOpenPgpIssuer,
+        verifyOpenPgpDetachedSignature(std.testing.allocator, std.testing.io, message, armored_signature, &canonical_key),
+    );
+}
+
+test "native OpenPGP parsers reject every fixture truncation" {
+    const allocator = std.testing.allocator;
+    const armored_key = @embedFile("fixtures/openpgp/cross-validation-public-key.asc");
+    const armored_signature = @embedFile("fixtures/openpgp/cross-validation-signature.asc");
+
+    var cut: usize = 0;
+    while (cut < armored_key.len) : (cut += 1) {
+        if (decodeOpenPgpArmorAlloc(allocator, armored_key[0..cut], .public_key, public_key_max_size)) |decoded| {
+            defer allocator.free(decoded);
+            return error.TruncatedOpenPgpArmorAccepted;
+        } else |_| {}
+    }
+    cut = 0;
+    while (cut < armored_signature.len) : (cut += 1) {
+        if (decodeOpenPgpArmorAlloc(allocator, armored_signature[0..cut], .signature, signature_max_size)) |decoded| {
+            defer allocator.free(decoded);
+            return error.TruncatedOpenPgpArmorAccepted;
+        } else |_| {}
+    }
+
+    const packet_key = try decodeOpenPgpArmorAlloc(allocator, armored_key, .public_key, public_key_max_size);
+    defer allocator.free(packet_key);
+    const key = try parseSingleOpenPgpPublicKeyPacket(packet_key);
+    cut = 0;
+    while (cut < packet_key.len) : (cut += 1) {
+        if (parseSingleOpenPgpPublicKeyPacket(packet_key[0..cut])) |_| {
+            return error.TruncatedOpenPgpPublicKeyAccepted;
+        } else |_| {}
+    }
+
+    const packet_signature = try decodeOpenPgpArmorAlloc(allocator, armored_signature, .signature, signature_max_size);
+    defer allocator.free(packet_signature);
+    const message = @embedFile("fixtures/openpgp/cross-validation-message.txt");
+    cut = 0;
+    while (cut < packet_signature.len) : (cut += 1) {
+        if (verifyOpenPgpDetachedSignature(allocator, std.testing.io, message, packet_signature[0..cut], &key)) |_| {
+            return error.TruncatedOpenPgpSignatureAccepted;
+        } else |_| {}
+    }
 }
 
 test "package-family resolve and customize requests are exact-lock operations" {
