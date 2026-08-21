@@ -58,7 +58,10 @@ never recursively materializes a guest directory.
 On Linux, `commit` also captures and reapplies the atomic image path's mode,
 owner/group, atime/mtime, ACL xattrs, and all other host xattrs to the closed
 stage before publication; metadata capture or application failure aborts the
-transaction without replacing the source.
+transaction without replacing the source. Linux publication uses an atomic
+conditional exchange and validates both the staged object and the displaced
+source before cleanup, so a non-cooperating replacement is preserved and
+reported as `AtomicSourceChanged`.
 
 The pinned Canonical Ubuntu profile (`descriptor_size = 64`, compat `0x103c`,
 incompat `0x22c2`, and ro-compat `0x046b`) is supported. Commits rebuild its

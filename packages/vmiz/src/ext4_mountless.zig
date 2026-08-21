@@ -102,6 +102,13 @@ fn failedLinuxSyscall(result: usize) bool {
     return @as(isize, @bitCast(result)) < 0;
 }
 
+fn sameFileStat(lhs: Io.File.Stat, rhs: Io.File.Stat) bool {
+    return lhs.inode == rhs.inode and
+        lhs.size == rhs.size and
+        std.meta.eql(lhs.mtime, rhs.mtime) and
+        std.meta.eql(lhs.ctime, rhs.ctime);
+}
+
 fn captureHostMetadata(allocator: Allocator, io: Io, file: Io.File) Error!HostMetadata {
     const stat = try file.stat(io);
     if (comptime builtin.os.tag != .linux) {
@@ -178,6 +185,51 @@ fn captureHostMetadata(allocator: Allocator, io: Io, file: Io.File) Error!HostMe
     };
 }
 
+fn purgeHostXattrsNotInSource(
+    allocator: Allocator,
+    file: Io.File,
+    metadata: *const HostMetadata,
+) Error!void {
+    if (comptime builtin.os.tag != .linux) {
+        return error.HostMetadataPreservationUnsupported;
+    }
+    const linux = std.os.linux;
+    var probe: [1]u8 = undefined;
+    const raw_size = linux.flistxattr(file.handle, &probe, 0);
+    if (failedLinuxSyscall(raw_size)) return error.HostMetadataPreservationFailed;
+    if (raw_size > max_host_xattr_bytes) return error.HostMetadataPreservationFailed;
+    const names = try allocator.alloc(u8, @intCast(raw_size));
+    defer allocator.free(names);
+    const names_len = if (names.len == 0) 0 else blk: {
+        const result = linux.flistxattr(file.handle, names.ptr, names.len);
+        if (failedLinuxSyscall(result)) return error.HostMetadataPreservationFailed;
+        break :blk @as(usize, @intCast(result));
+    };
+    var cursor: usize = 0;
+    while (cursor < names_len) {
+        const end = std.mem.indexOfScalarPos(u8, names[0..names_len], cursor, 0) orelse
+            return error.HostMetadataPreservationFailed;
+        if (end == cursor) return error.HostMetadataPreservationFailed;
+        const name = names[cursor..end];
+        var retained = false;
+        for (metadata.xattrs) |xattr| {
+            if (std.mem.eql(u8, xattr.name, name)) {
+                retained = true;
+                break;
+            }
+        }
+        if (!retained) {
+            const name_z = try allocator.allocSentinel(u8, name.len, 0);
+            defer allocator.free(name_z);
+            @memcpy(name_z, name);
+            if (failedLinuxSyscall(linux.fremovexattr(@intCast(file.handle), name_z.ptr))) {
+                return error.HostMetadataPreservationFailed;
+            }
+        }
+        cursor = end + 1;
+    }
+}
+
 fn applyHostMetadata(io: Io, file: Io.File, metadata: *const HostMetadata) Error!void {
     if (comptime builtin.os.tag != .linux) {
         return error.HostMetadataPreservationUnsupported;
@@ -224,6 +276,8 @@ pub const FileSystem = struct {
     source_mtime: Io.Timestamp,
     source_ctime: Io.Timestamp,
     committed: bool = false,
+    test_publish_hook: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+    test_publish_hook_ctx: ?*anyopaque = null,
 
     /// Opens and imports an ext4 partition without mounting it. The source
     /// bytes are bounded by `limits` and retained in the tree's spool, not in
@@ -880,8 +934,8 @@ pub const FileSystem = struct {
             .{ atomic_path, @as(u64, @intCast(Io.Clock.real.now(self.io).nanoseconds)) },
         );
         defer self.allocator.free(stage_path);
-        var stage_published = false;
-        defer if (!stage_published) DirDelete(self.io, stage_path);
+        var cleanup_stage = true;
+        defer if (cleanup_stage) DirDelete(self.io, stage_path);
         var stage_file = try Io.Dir.cwd().createFile(self.io, stage_path, .{
             .read = true,
             .truncate = true,
@@ -934,8 +988,10 @@ pub const FileSystem = struct {
             else
                 null,
         });
+        try purgeHostXattrsNotInSource(self.allocator, stage_file, &host_metadata);
         try applyHostMetadata(self.io, stage_file, &host_metadata);
         try stage_file.sync(self.io);
+        const stage_stat = try stage_file.stat(self.io);
         stage_file.close(self.io);
         stage_open = false;
         if (!self.sameSourceStat(try self.file.stat(self.io)) or
@@ -943,14 +999,81 @@ pub const FileSystem = struct {
         {
             return error.AtomicSourceChanged;
         }
-        // POSIX rename atomically replaces the old image path after the
-        // fully validated stage has been closed. This API targets ext4/Linux
-        // image mutation; Windows/WASI callers should provide a filesystem
-        // layer with equivalent replace semantics.
-        try Io.Dir.cwd().rename(stage_path, Io.Dir.cwd(), atomic_path, self.io);
-        stage_published = true;
+        if (comptime builtin.is_test) {
+            if (self.test_publish_hook) |hook| {
+                try hook(self.test_publish_hook_ctx orelse return error.AtomicPublishFailed);
+            }
+        }
+        try self.publishStage(stage_path, atomic_path, stage_stat, &cleanup_stage);
         self.committed = true;
         return info;
+    }
+
+    fn publishStage(
+        self: *const FileSystem,
+        stage_path: []const u8,
+        atomic_path: []const u8,
+        stage_stat: Io.File.Stat,
+        cleanup_stage: *bool,
+    ) Error!void {
+        if (comptime builtin.os.tag != .linux) {
+            return error.AtomicPublishUnsupported;
+        }
+        const linux = std.os.linux;
+        const stage_z = try self.allocator.allocSentinel(u8, stage_path.len, 0);
+        defer self.allocator.free(stage_z);
+        const atomic_z = try self.allocator.allocSentinel(u8, atomic_path.len, 0);
+        defer self.allocator.free(atomic_z);
+        @memcpy(stage_z, stage_path);
+        @memcpy(atomic_z, atomic_path);
+        const exchanged = linux.renameat2(
+            linux.AT.FDCWD,
+            stage_z.ptr,
+            linux.AT.FDCWD,
+            atomic_z.ptr,
+            .{ .EXCHANGE = true },
+        );
+        if (failedLinuxSyscall(exchanged)) return error.AtomicPublishUnsupported;
+
+        const rollback = struct {
+            fn run(
+                linux_impl: anytype,
+                old_path: [*:0]const u8,
+                new_path: [*:0]const u8,
+            ) bool {
+                return !failedLinuxSyscall(linux_impl.renameat2(
+                    linux_impl.AT.FDCWD,
+                    old_path,
+                    linux_impl.AT.FDCWD,
+                    new_path,
+                    .{ .EXCHANGE = true },
+                ));
+            }
+        }.run;
+
+        const published_stat = Io.Dir.cwd().statFile(self.io, atomic_path, .{}) catch {
+            if (!rollback(linux, stage_z.ptr, atomic_z.ptr)) {
+                cleanup_stage.* = false;
+                return error.AtomicPublishFailed;
+            }
+            return error.AtomicSourceChanged;
+        };
+        const old_stat = Io.Dir.cwd().statFile(self.io, stage_path, .{}) catch {
+            if (!rollback(linux, stage_z.ptr, atomic_z.ptr)) {
+                cleanup_stage.* = false;
+                return error.AtomicPublishFailed;
+            }
+            return error.AtomicSourceChanged;
+        };
+        if (!sameFileStat(published_stat, stage_stat) or !self.sameSourceStat(old_stat)) {
+            if (!rollback(linux, stage_z.ptr, atomic_z.ptr)) {
+                cleanup_stage.* = false;
+                return error.AtomicPublishFailed;
+            }
+            return error.AtomicSourceChanged;
+        }
+        DirDelete(self.io, stage_path);
+        cleanup_stage.* = false;
     }
 
     fn ensureMutable(self: *const FileSystem) Error!void {
@@ -1077,6 +1200,43 @@ fn setTestHostXattr(io: Io, path: []const u8, name: []const u8, value: []const u
     if (failedLinuxSyscall(result)) return error.HostMetadataPreservationFailed;
 }
 
+fn setTestHostDirectoryXattr(io: Io, path: []const u8, name: []const u8, value: []const u8) !void {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    _ = io;
+    const path_z = try std.heap.page_allocator.allocSentinel(u8, path.len, 0);
+    defer std.heap.page_allocator.free(path_z);
+    @memcpy(path_z, path);
+    const name_z = try std.heap.page_allocator.allocSentinel(u8, name.len, 0);
+    defer std.heap.page_allocator.free(name_z);
+    @memcpy(name_z, name);
+    const result = std.os.linux.setxattr(
+        path_z.ptr,
+        name_z.ptr,
+        value.ptr,
+        value.len,
+        0,
+    );
+    if (failedLinuxSyscall(result)) return error.HostMetadataPreservationFailed;
+}
+
+fn testHostXattrExists(allocator: Allocator, io: Io, path: []const u8, name: []const u8) !bool {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const name_z = try allocator.allocSentinel(u8, name.len, 0);
+    defer allocator.free(name_z);
+    @memcpy(name_z, name);
+    var probe: [1]u8 = undefined;
+    const raw_size = std.os.linux.fgetxattr(file.handle, name_z.ptr, &probe, 0);
+    if (failedLinuxSyscall(raw_size)) {
+        return if (std.os.linux.errno(raw_size) == .NODATA)
+            false
+        else
+            error.HostMetadataPreservationFailed;
+    }
+    return true;
+}
+
 fn readTestHostXattr(
     allocator: Allocator,
     io: Io,
@@ -1103,14 +1263,40 @@ fn readTestHostXattr(
     return value;
 }
 
+const PublishRaceContext = struct {
+    io: Io,
+    atomic_path: []const u8,
+    replacement_path: []const u8,
+    length: u64,
+};
+
+fn replaceAtomicPathBeforePublish(ctx_ptr: *anyopaque) anyerror!void {
+    const ctx: *PublishRaceContext = @ptrCast(@alignCast(ctx_ptr));
+    const replacement = try Io.Dir.cwd().createFile(ctx.io, ctx.replacement_path, .{
+        .read = true,
+        .truncate = true,
+        .exclusive = true,
+    });
+    try replacement.setLength(ctx.io, ctx.length);
+    replacement.close(ctx.io);
+    try Io.Dir.cwd().rename(
+        ctx.replacement_path,
+        Io.Dir.cwd(),
+        ctx.atomic_path,
+        ctx.io,
+    );
+}
+
 test "atomic commit preserves host image mode timestamps and xattrs" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const image_path = "test-ext4-mountless-host-metadata.raw";
+    const parent_path = "test-ext4-mountless-host-metadata-parent";
+    const image_path = "test-ext4-mountless-host-metadata-parent/image.raw";
     const spool_path = "test-ext4-mountless-host-metadata.spool";
-    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, parent_path) catch {};
     defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, parent_path);
 
     var image = try @import("image.zig").Image.createExclusive(
         io,
@@ -1135,6 +1321,21 @@ test "atomic commit preserves host image mode timestamps and xattrs" {
         .modify_timestamp = .{ .new = expected_mtime },
     });
     try setTestHostXattr(io, image_path, "user.vmiz-host", "preserve-me");
+    const default_acl = [_]u8{
+        0x02, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x06, 0x00,
+        0xff, 0xff, 0xff, 0xff,
+        0x04, 0x00, 0x04, 0x00,
+        0xff, 0xff, 0xff, 0xff,
+        0x10, 0x00, 0x06, 0x00,
+        0xff, 0xff, 0xff, 0xff,
+        0x20, 0x00, 0x04, 0x00,
+        0xff, 0xff, 0xff, 0xff,
+    };
+    setTestHostDirectoryXattr(io, parent_path, "system.posix_acl_default", &default_acl) catch |err| switch (err) {
+        error.HostMetadataPreservationFailed => return error.SkipZigTest,
+        else => return err,
+    };
 
     var fs = try FileSystem.open(allocator, io, image.file, .{
         .length = 32 * 1024 * 1024,
@@ -1156,6 +1357,60 @@ test "atomic commit preserves host image mode timestamps and xattrs" {
     const xattr = try readTestHostXattr(allocator, io, image_path, "user.vmiz-host");
     defer allocator.free(xattr);
     try std.testing.expectEqualStrings("preserve-me", xattr);
+    try std.testing.expect(!try testHostXattrExists(
+        allocator,
+        io,
+        image_path,
+        "system.posix_acl_access",
+    ));
+}
+
+test "atomic commit detects a replacement between validation and exchange" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const image_path = "test-ext4-mountless-publish-race.raw";
+    const replacement_path = "test-ext4-mountless-publish-race-replacement.raw";
+    const spool_path = "test-ext4-mountless-publish-race.spool";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, replacement_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    var image = try @import("image.zig").Image.createExclusive(
+        io,
+        image_path,
+        .raw,
+        32 * 1024 * 1024,
+        .{},
+    );
+    var image_open = true;
+    defer if (image_open) image.close(io);
+    var source_tree = root_tree.RootTree.initMemory(allocator, io, .{});
+    defer source_tree.deinit();
+    try source_tree.putFileBytes("etc", "source", .{ .mode = 0o600 });
+    _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
+        .length = 32 * 1024 * 1024,
+    });
+
+    var fs = try FileSystem.open(allocator, io, image.file, .{
+        .length = 32 * 1024 * 1024,
+        .spool_path = spool_path,
+        .atomic_path = image_path,
+    });
+    var race = PublishRaceContext{
+        .io = io,
+        .atomic_path = image_path,
+        .replacement_path = replacement_path,
+        .length = 32 * 1024 * 1024,
+    };
+    fs.test_publish_hook = replaceAtomicPathBeforePublish;
+    fs.test_publish_hook_ctx = &race;
+    try std.testing.expectError(error.AtomicSourceChanged, fs.commit());
+    fs.deinit();
+    image.close(io);
+    image_open = false;
+
+    const replacement_stat = try Io.Dir.cwd().statFile(io, image_path, .{});
+    try std.testing.expectEqual(@as(u64, 32 * 1024 * 1024), replacement_stat.size);
 }
 
 test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
