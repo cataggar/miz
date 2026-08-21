@@ -79,21 +79,13 @@ pub fn build(b: *std.Build) void {
         "ubuntu2604-arch",
         "Ubuntu 26.04 server guest architecture: x86_64 (default) or aarch64",
     ) orelse .x86_64;
-    const bzip2 = b.dependency("bzip2", .{
+    const bzip2z = b.dependency("bzip2z", .{
         .target = target,
         .optimize = optimize,
-        .linkage = .static,
-        .bz2 = true,
-        .bzip2 = false,
-        .bzip2recover = false,
     });
-    const host_bzip2 = b.dependency("bzip2", .{
+    const host_bzip2z = b.dependency("bzip2z", .{
         .target = b.graph.host,
         .optimize = optimize,
-        .linkage = .static,
-        .bz2 = true,
-        .bzip2 = false,
-        .bzip2recover = false,
     });
     const debz_dependency = b.dependency("debz", .{
         .target = b.graph.host,
@@ -170,9 +162,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("qemu/host.zig"),
         .target = b.graph.host,
         .optimize = optimize,
-        .link_libc = true,
+        .imports = &.{
+            .{ .name = "bzip2z", .module = host_bzip2z.module("bzip2z") },
+        },
     });
-    host_qemu_host_mod.linkLibrary(host_bzip2.artifact("bz2"));
 
     const vmiz_tests = b.addTest(.{ .root_module = host_vmiz_mod });
     const run_vmiz_tests = b.addRunArtifact(vmiz_tests);
@@ -227,9 +220,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("qemu/host.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
+        .imports = &.{
+            .{ .name = "bzip2z", .module = bzip2z.module("bzip2z") },
+        },
     });
-    qemu_host_mod.linkLibrary(bzip2.artifact("bz2"));
     const guest_validation_mod = b.addModule("guest_validation", .{
         .root_source_file = b.path("azagent/validation.zig"),
         .target = target,

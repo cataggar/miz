@@ -344,7 +344,6 @@ jobs:
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           zig build --fetch \
-            --build-file "$GITHUB_WORKSPACE/vendor/zig-bzip2/build.zig" \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           zig build -Doptimize=ReleaseSafe
           test -x zig-out/bin/vmiz
