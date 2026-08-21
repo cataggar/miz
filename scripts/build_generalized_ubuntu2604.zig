@@ -737,15 +737,19 @@ fn customizeOfflineRoot(
         .{ .replace_symlink = .{ .path = "/etc/resolv.conf", .target = "/run/systemd/resolve/stub-resolv.conf" } },
     });
 
+    const modules_path = try std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{release_name});
+    defer allocator.free(modules_path);
+    const modules = try root.discover(modules_path, "*");
+    defer root.freeFound(modules);
+    if (modules.len == 0) return error.AzureKernelModulesMissing;
+    const modules_dep_path = try std.fmt.allocPrint(allocator, "{s}/modules.dep", .{modules_path});
+    defer allocator.free(modules_dep_path);
+    const modules_dep = try root.inspect(modules_dep_path);
+    defer allocator.free(modules_dep.path);
+    if (modules_dep.kind != .file) return error.KernelModulesDependencyMissing;
+
     var initramfs = try runOfflineCommand(&executor, .{ .update_initramfs = release_name });
     defer initramfs.deinit(allocator);
-    var services = try runOfflineCommand(&executor, .{ .systemctl_enable = &.{
-        "systemd-networkd.service",
-        "systemd-resolved.service",
-        "ssh.service",
-        "walinuxagent.service",
-    } });
-    defer services.deinit(allocator);
 
     var package_query = try runOfflineCommand(&executor, .dpkg_query);
     defer package_query.deinit(allocator);
@@ -767,8 +771,6 @@ fn customizeOfflineRoot(
         } },
     });
 
-    var account = try runOfflineCommand(&executor, .{ .account_cleanup = "ubuntu" });
-    defer account.deinit(allocator);
     var cloud_init = try runOfflineCommand(&executor, .{ .cloud_init_clean = .{ .logs = true } });
     defer cloud_init.deinit(allocator);
     try root.apply(&.{
@@ -783,11 +785,6 @@ fn customizeOfflineRoot(
         .{ .cleanup = .{ .directory = "/var/tmp", .pattern = "*" } },
     });
 
-    const modules_path = try std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{release_name});
-    defer allocator.free(modules_path);
-    const modules = try root.discover(modules_path, "*");
-    defer root.freeFound(modules);
-    if (modules.len == 0) return error.AzureKernelModulesMissing;
     const initrd_path = try std.fmt.allocPrint(allocator, "/boot/initrd.img-{s}", .{release_name});
     defer allocator.free(initrd_path);
     const initrd = try root.inspect(initrd_path);
@@ -1047,6 +1044,30 @@ fn customizeRootWithDebz(
     );
     allocator.free(release_name);
     try native_root.filesystem.importHostTreeWithManifest(current, .{}, &host_manifest);
+    try native_root.filesystem.applyCustomization(.{
+        .services = &.{
+            .{ .name = "systemd-networkd.service", .state = .enabled },
+            .{ .name = "systemd-resolved.service", .state = .enabled },
+            .{ .name = "ssh.service", .state = .enabled },
+            .{ .name = "walinuxagent.service", .state = .enabled },
+        },
+    }, 0);
+    try native_root.filesystem.generalize(.{ .azure = .{
+        .reset_hostname = false,
+        .clear_machine_id = false,
+        .remove_ssh_host_keys = false,
+        .remove_agent_state = false,
+        .remove_dhcp_leases = false,
+        .remove_resolver_configuration = false,
+        .clear_random_seed = false,
+        .remove_users = &.{"ubuntu"},
+    } });
+    if (native_root.filesystem.stat("/home/ubuntu")) |_| {
+        return error.UserCleanupIncomplete;
+    } else |err| switch (err) {
+        error.PathNotFound => {},
+        else => return error.UserCleanupIncomplete,
+    }
     try native_root.finish();
     return .{ .root_path = current, .evidence = evidence };
 }
@@ -1497,7 +1518,7 @@ pub fn main(init: std.process.Init) !void {
         return error.ChecksumMismatch;
     if (args.preflight_only) return;
 
-    for (&[_][]const u8{ "qemu-img", "ukify", "sbverify", "unshare", "mount", "umount", "chroot", "mknod" }) |tool|
+    for (&[_][]const u8{ "qemu-img", "ukify", "sbverify", "unshare", "mount", "umount", "chroot", "mknod", "timeout", "setsid" }) |tool|
         try requireTool(allocator, io, tool);
     const config = try signingConfig(args);
 

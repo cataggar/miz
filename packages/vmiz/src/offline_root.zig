@@ -28,6 +28,7 @@ pub const Architecture = enum {
 
 pub const NetworkPolicy = enum { disabled };
 pub const DevicePolicy = enum { minimal };
+const cleanup_timeout_ms: u64 = 90 * 1000;
 
 pub const Limits = struct {
     max_file_bytes: u64 = 256 * 1024 * 1024,
@@ -85,10 +86,8 @@ pub const Kind = enum { file, directory, symlink, other };
 
 pub const Command = union(enum) {
     update_initramfs: []const u8,
-    systemctl_enable: []const []const u8,
     dpkg_query,
     cloud_init_clean: struct { logs: bool = true },
-    account_cleanup: []const u8,
 };
 
 pub const CommandOutcome = enum { succeeded, failed, timed_out };
@@ -175,28 +174,23 @@ pub const Executor = struct {
         var argv = std.array_list.Managed([]const u8).init(self.allocator);
         defer argv.deinit();
         try self.appendCommand(&argv, command);
+        const timeout_ms = @min(self.options.timeout_ms, commandTimeoutMs(command));
         const result = if (self.options.run_fn) |run_fn|
             try run_fn(
                 self.options.run_context,
                 self.allocator,
                 self.io,
                 argv.items,
-                self.options.timeout_ms,
+                timeout_ms,
             )
         else
-            try self.runIsolated(argv.items);
+            try self.runIsolated(argv.items, timeout_ms);
         errdefer {
             var discard = result;
             discard.deinit(self.allocator);
         }
 
-        var normalized_result = result;
-        if (std.meta.activeTag(command) == .account_cleanup and
-            normalized_result.outcome == .failed and
-            normalized_result.exit_code == 6)
-        {
-            normalized_result.outcome = .succeeded;
-        }
+        const normalized_result = result;
         const outcome = normalized_result.outcome;
         const exit_code = normalized_result.exit_code;
         const tool = try self.allocator.dupe(u8, argv.items[argv.items.len - commandArgCount(command)]);
@@ -246,15 +240,6 @@ pub const Executor = struct {
                 try argv.append("-k");
                 try argv.append(release);
             },
-            .systemctl_enable => |services| {
-                if (services.len == 0 or services.len > 32) return error.InvalidServiceList;
-                try argv.append("/usr/bin/systemctl");
-                try argv.append("enable");
-                for (services) |service| {
-                    try validateToken(service, error.InvalidServiceName);
-                    try argv.append(service);
-                }
-            },
             .dpkg_query => {
                 try argv.append("/usr/bin/dpkg-query");
                 try argv.append("-W");
@@ -265,33 +250,34 @@ pub const Executor = struct {
                 try argv.append("clean");
                 if (options.logs) try argv.append("--logs");
             },
-            .account_cleanup => |username| {
-                try validateUsername(username);
-                try argv.append("/usr/sbin/userdel");
-                try argv.append("-r");
-                try argv.append(username);
-            },
         }
     }
 
-    fn runIsolated(self: *Executor, guest_argv: []const []const u8) !CommandResult {
+    fn runIsolated(
+        self: *Executor,
+        guest_argv: []const []const u8,
+        timeout_ms: u64,
+    ) !CommandResult {
         if (builtin.os.tag != .linux) return error.UnsupportedHost;
         const script =
             \\set -eu
             \\root="$1"
             \\shift
-            \\cleanup() { status=$?; umount "$root/run" 2>/dev/null || status=125; umount "$root/sys" 2>/dev/null || status=125; umount "$root/proc" 2>/dev/null || status=125; umount "$root/dev" 2>/dev/null || status=125; exit "$status"; }
+            \\timeout_seconds="$1"
+            \\shift
+            \\cleanup() { status=$?; umount "$root/tmp" 2>/dev/null || status=125; umount "$root/run" 2>/dev/null || status=125; umount "$root/sys" 2>/dev/null || status=125; umount "$root/proc" 2>/dev/null || status=125; umount "$root/dev" 2>/dev/null || status=125; exit "$status"; }
             \\trap cleanup EXIT
             \\mount --make-rprivate /
             \\mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$root/dev"
             \\mount -t proc -o nosuid,nodev,noexec proc "$root/proc"
             \\mount -t sysfs -o ro,nosuid,nodev,noexec sysfs "$root/sys"
             \\mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$root/run"
+            \\mount -t tmpfs -o mode=1777,nosuid,nodev,noexec tmpfs "$root/tmp"
             \\mknod -m 666 "$root/dev/null" c 1 3
             \\mknod -m 666 "$root/dev/zero" c 1 5
             \\mknod -m 666 "$root/dev/random" c 1 8
             \\mknod -m 666 "$root/dev/urandom" c 1 9
-            \\exec chroot "$root" "$@"
+            \\exec timeout --signal=TERM --kill-after=5s "$timeout_seconds" setsid chroot "$root" "$@"
         ;
         var argv = std.array_list.Managed([]const u8).init(self.allocator);
         defer argv.deinit();
@@ -308,8 +294,15 @@ pub const Executor = struct {
         try argv.append("-c");
         try argv.append(script);
         try argv.append("vmiz-offline-root");
+        const timeout_seconds = try std.fmt.allocPrint(
+            self.allocator,
+            "{d}s",
+            .{std.math.divCeil(u64, timeout_ms, 1000) catch return error.TimeoutOutOfRange},
+        );
+        try argv.append(timeout_seconds);
         try argv.append(self.options.root_path);
         try argv.appendSlice(guest_argv);
+        defer self.allocator.free(timeout_seconds);
 
         var environment = std.process.Environ.Map.init(self.allocator);
         defer environment.deinit();
@@ -318,6 +311,7 @@ pub const Executor = struct {
         try environment.put("LC_ALL", "C");
         try environment.put("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
         try environment.put("TERM", "dumb");
+        try environment.put("DEBIAN_FRONTEND", "noninteractive");
         const result = std.process.run(self.allocator, self.io, .{
             .argv = argv.items,
             .environ_map = &environment,
@@ -325,7 +319,10 @@ pub const Executor = struct {
             .stderr_limit = .limited(4 * 1024 * 1024),
             .timeout = .{ .duration = .{
                 .raw = std.Io.Duration.fromMilliseconds(
-                    std.math.cast(i64, self.options.timeout_ms) orelse return error.TimeoutOutOfRange,
+                    std.math.cast(
+                        i64,
+                        std.math.add(u64, timeout_ms, cleanup_timeout_ms) catch return error.TimeoutOutOfRange,
+                    ) orelse return error.TimeoutOutOfRange,
                 ),
                 .clock = .awake,
             } },
@@ -343,7 +340,12 @@ pub const Executor = struct {
             else => null,
         };
         return .{
-            .outcome = if (exit_code == 0) .succeeded else .failed,
+            .outcome = if (exit_code == 0)
+                .succeeded
+            else if (exit_code == 124 or exit_code == 137)
+                .timed_out
+            else
+                .failed,
             .exit_code = exit_code,
             .stdout = result.stdout,
             .stderr = result.stderr,
@@ -560,21 +562,20 @@ pub const Root = struct {
     }
 };
 
-fn commandArgCount(command: Command) usize {
+fn commandTimeoutMs(command: Command) u64 {
     return switch (command) {
-        .update_initramfs => 4,
-        .systemctl_enable => |services| 2 + services.len,
-        .dpkg_query => 3,
-        .cloud_init_clean => |options| 2 + @as(usize, @intFromBool(options.logs)),
-        .account_cleanup => 3,
+        .update_initramfs => 300 * 1000,
+        .dpkg_query => 60 * 1000,
+        .cloud_init_clean => 30 * 1000,
     };
 }
 
-fn validateUsername(username: []const u8) !void {
-    if (username.len == 0 or username.len > 32) return error.InvalidUsername;
-    for (username) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return error.InvalidUsername;
-    }
+fn commandArgCount(command: Command) usize {
+    return switch (command) {
+        .update_initramfs => 4,
+        .dpkg_query => 3,
+        .cloud_init_clean => |options| 2 + @as(usize, @intFromBool(options.logs)),
+    };
 }
 
 fn validateToken(value: []const u8, err: anyerror) !void {
@@ -636,38 +637,6 @@ test "offline command validation is fail closed" {
         defer args.deinit();
         break :blk executor.appendCommand(&args, .{ .update_initramfs = "../bad" });
     });
-    try std.testing.expectError(error.InvalidServiceName, blk: {
-        var executor = Executor{
-            .allocator = std.testing.allocator,
-            .io = undefined,
-            .options = .{
-                .root_path = "/",
-                .architecture = Architecture.host(),
-                .require_privileged_namespace = false,
-            },
-            .records = .init(std.testing.allocator),
-        };
-        defer executor.deinit();
-        var args = std.array_list.Managed([]const u8).init(std.testing.allocator);
-        defer args.deinit();
-        break :blk executor.appendCommand(&args, .{ .systemctl_enable = &.{"ssh.service;touch"} });
-    });
-    try std.testing.expectError(error.InvalidUsername, blk: {
-        var executor = Executor{
-            .allocator = std.testing.allocator,
-            .io = undefined,
-            .options = .{
-                .root_path = "/",
-                .architecture = Architecture.host(),
-                .require_privileged_namespace = false,
-            },
-            .records = .init(std.testing.allocator),
-        };
-        defer executor.deinit();
-        var args = std.array_list.Managed([]const u8).init(std.testing.allocator);
-        defer args.deinit();
-        break :blk executor.appendCommand(&args, .{ .account_cleanup = "root;rm" });
-    });
 }
 
 test "offline root applies structured operations and cleans up" {
@@ -712,17 +681,19 @@ const FakeRunner = struct {
     outcome: CommandOutcome,
     exit_code: ?u8 = 0,
     saw_allowlisted: bool = false,
+    timeout_ms: u64 = 0,
 
     fn run(
         context: ?*anyopaque,
         allocator: Allocator,
         _: Io,
         argv: []const []const u8,
-        _: u64,
+        timeout_ms: u64,
     ) !CommandResult {
         const self: *FakeRunner = @ptrCast(@alignCast(context.?));
         if (argv.len == 0) return error.EmptyCommand;
         self.saw_allowlisted = std.mem.eql(u8, argv[0], "/usr/bin/dpkg-query");
+        self.timeout_ms = timeout_ms;
         return .{
             .outcome = self.outcome,
             .exit_code = self.exit_code,
@@ -757,6 +728,7 @@ test "offline executor enforces architecture, allowlist, timeout, and failure" {
     var result = try executor.execute(.dpkg_query);
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(success.saw_allowlisted);
+    try std.testing.expectEqual(@as(u64, 60 * 1000), success.timeout_ms);
 
     var timeout = FakeRunner{ .outcome = .timed_out };
     var timeout_executor = try Executor.init(std.testing.allocator, std.testing.io, .{
@@ -768,6 +740,7 @@ test "offline executor enforces architecture, allowlist, timeout, and failure" {
     });
     defer timeout_executor.deinit();
     try std.testing.expectError(error.CommandTimeout, timeout_executor.execute(.{ .cloud_init_clean = .{} }));
+    try std.testing.expectEqual(@as(u64, 30 * 1000), timeout.timeout_ms);
 
     var failure = FakeRunner{ .outcome = .failed, .exit_code = 2 };
     var failure_executor = try Executor.init(std.testing.allocator, std.testing.io, .{
@@ -779,4 +752,5 @@ test "offline executor enforces architecture, allowlist, timeout, and failure" {
     });
     defer failure_executor.deinit();
     try std.testing.expectError(error.CommandFailed, failure_executor.execute(.{ .update_initramfs = "6.0.0-azure" }));
+    try std.testing.expectEqual(@as(u64, 300 * 1000), failure.timeout_ms);
 }

@@ -119,7 +119,10 @@ sudo chmod 0644 /boot/vmlinuz-*
 The full build runs the bounded guest-tool allowlist in a private mount, PID,
 and network namespace, so it must be invoked with `sudo` on Linux. The executor
 mounts only `dev`, `proc`, `sys`, and `run`, creates the four required device
-nodes, and tears the namespace down after every command.
+nodes plus an isolated `tmp`, and tears the namespace down after every
+command. `update-initramfs`, `dpkg-query`, and optional `cloud-init clean` are
+the only guest commands; systemd enablement and account removal are native
+mountless operations.
 
 Run a source-pin preflight (requiring only `curl` and `gpg`) with:
 
