@@ -147,6 +147,9 @@ only HTTPS URLs, verifies the system TLS certificate chain using TLS 1.2 or
 newer, bounds redirects, retries and response sizes, and atomically publishes
 only fully downloaded inputs. Pinned artifact SHA-256 values and the
 Canonical signing-key fingerprint remain mandatory verification gates.
+The bounded request-buffer sizing for signed redirects is informed by
+[`ghr`'s MIT-licensed HTTP implementation](https://github.com/cataggar/ghr/blob/main/src/http.zig);
+vmiz does not vendor that code.
 
 A full build requires signing. For local development, supply exactly one
 certificate and private key:

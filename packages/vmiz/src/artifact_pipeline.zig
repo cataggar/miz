@@ -292,7 +292,10 @@ const native_https_max_retries: u8 = 3;
 const native_https_max_redirects: u8 = 5;
 const native_https_max_backoff_seconds: u64 = 4;
 const native_https_response_head_limit = 16 * 1024;
-const native_https_write_buffer_size = 8 * 1024;
+// ghr/src/http.zig (MIT, Cameron Taggart) documents that signed CDN redirect
+// URLs exceed Zig's default request buffer. This larger bounded allowance also
+// covers vmiz's maximum accepted redirect URL plus its request headers.
+const native_https_write_buffer_size = 16 * 1024;
 const native_https_response_buffer_size = 64 * 1024;
 const native_https_max_location_size = 8 * 1024;
 
@@ -2133,6 +2136,16 @@ test "native HTTPS acquisition rejects redirect loops and non-HTTPS URLs" {
             },
             rejected.downloader(),
         ),
+    );
+}
+
+test "native HTTPS request buffer covers bounded signed redirects" {
+    // Keep enough room for a maximum Location plus request-line, Host,
+    // Accept-Encoding, and connection headers on the next HTTPS request.
+    const minimum_request_overhead = 1024;
+    try std.testing.expect(
+        native_https_write_buffer_size >=
+            native_https_max_location_size + minimum_request_overhead,
     );
 }
 
