@@ -473,6 +473,15 @@ pub const FileSystem = struct {
                 });
             }
         }
+        for (hardlink_updates.items, 0..) |update, index| {
+            for (hardlink_updates.items[index + 1 ..]) |other| {
+                if (std.mem.eql(u8, update.target, other.target) and
+                    !try self.hostFilesEqual(update.host_path, other.host_path, options.max_file_bytes))
+                {
+                    return error.ConflictingHardlinkUpdate;
+                }
+            }
+        }
         var seen = std.StringHashMap(void).init(self.allocator);
         defer {
             var iterator = seen.keyIterator();
@@ -589,6 +598,40 @@ pub const FileSystem = struct {
             var guest_buffer: [64 * 1024]u8 = undefined;
             const guest_got = try self.tree.readNodeContent(guest_path, guest_buffer[0..wanted], offset);
             if (guest_got != wanted or !std.mem.eql(u8, buffer[0..wanted], guest_buffer[0..wanted])) {
+                return false;
+            }
+            offset += wanted;
+        }
+        return true;
+    }
+
+    fn hostFilesEqual(
+        self: *const FileSystem,
+        first_path: []const u8,
+        second_path: []const u8,
+        max_bytes: u64,
+    ) !bool {
+        const first = try Io.Dir.cwd().openFile(self.io, first_path, .{});
+        defer first.close(self.io);
+        const second = try Io.Dir.cwd().openFile(self.io, second_path, .{});
+        defer second.close(self.io);
+        const first_stat = try first.stat(self.io);
+        const second_stat = try second.stat(self.io);
+        if (first_stat.kind != .file or second_stat.kind != .file or
+            first_stat.size != second_stat.size)
+        {
+            return false;
+        }
+        if (first_stat.size > max_bytes) return error.FileLimitExceeded;
+        var first_buffer: [64 * 1024]u8 = undefined;
+        var second_buffer: [64 * 1024]u8 = undefined;
+        var offset: u64 = 0;
+        while (offset < first_stat.size) {
+            const wanted: usize = @intCast(@min(@as(u64, first_buffer.len), first_stat.size - offset));
+            if (try first.readPositionalAll(self.io, first_buffer[0..wanted], offset) != wanted or
+                try second.readPositionalAll(self.io, second_buffer[0..wanted], offset) != wanted or
+                !std.mem.eql(u8, first_buffer[0..wanted], second_buffer[0..wanted]))
+            {
                 return false;
             }
             offset += wanted;
@@ -929,6 +972,7 @@ test "mountless round trip preserves security metadata and special nodes" {
         (source_tree.findNode("etc/sparse").?.payload.content).sparse_extents.len,
     );
     try source_tree.putHardlink("usr/bin/void-alias", "etc/void", .{ .mode = 0 });
+    try source_tree.putHardlink("usr/bin/void-alias2", "etc/void", .{ .mode = 0 });
     try source_tree.putSymlink("etc/void-link", "void", .{ .mode = 0o777 });
     try source_tree.putDevice("dev/null", .char_device, .{ .major = 1, .minor = 3 }, .{ .mode = 0o666 });
     try source_tree.putFifo("dev/initctl", .{ .mode = 0o600 });
@@ -976,7 +1020,15 @@ test "mountless round trip preserves security metadata and special nodes" {
     try fs.exportHostTreeWithManifest(host_tree_path, .{}, &host_manifest);
     const staged_alias = try std.fs.path.join(allocator, &.{ host_tree_path, "usr/bin/void-alias" });
     defer allocator.free(staged_alias);
+    const staged_alias2 = try std.fs.path.join(allocator, &.{ host_tree_path, "usr/bin/void-alias2" });
+    defer allocator.free(staged_alias2);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = staged_alias, .data = "staged-alias" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = staged_alias2, .data = "different-alias" });
+    try std.testing.expectError(
+        error.ConflictingHardlinkUpdate,
+        fs.importHostTreeWithManifest(host_tree_path, .{}, &host_manifest),
+    );
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = staged_alias2, .data = "staged-alias" });
     try fs.importHostTreeWithManifest(host_tree_path, .{}, &host_manifest);
     const staged_target = try fs.read(allocator, "/etc/void", 64);
     defer allocator.free(staged_target);
@@ -1044,6 +1096,7 @@ test "mountless round trip preserves security metadata and special nodes" {
     try std.testing.expectEqual(Kind.char_device, (try reopened.stat("/dev/null")).kind);
     try std.testing.expectEqual(Kind.fifo, (try reopened.stat("/var/fifo")).kind);
     try std.testing.expectEqual(Kind.hardlink, (try reopened.stat("/usr/bin/void-alias")).kind);
+    try std.testing.expectEqual(Kind.hardlink, (try reopened.stat("/usr/bin/void-alias2")).kind);
     const reopened_shared = try reopened.read(allocator, "/usr/bin/void-alias", 64);
     defer allocator.free(reopened_shared);
     try std.testing.expectEqualStrings("shared", reopened_shared);
