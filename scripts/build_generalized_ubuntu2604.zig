@@ -2321,6 +2321,47 @@ test "native OpenPGP verification rejects modified and ambiguous inputs" {
     );
 }
 
+test "native OpenPGP parsers reject every fixture truncation" {
+    const allocator = std.testing.allocator;
+    const armored_key = @embedFile("fixtures/openpgp/cross-validation-public-key.asc");
+    const armored_signature = @embedFile("fixtures/openpgp/cross-validation-signature.asc");
+
+    var cut: usize = 0;
+    while (cut < armored_key.len) : (cut += 1) {
+        if (decodeOpenPgpArmorAlloc(allocator, armored_key[0..cut], .public_key, public_key_max_size)) |decoded| {
+            defer allocator.free(decoded);
+            return error.TruncatedOpenPgpArmorAccepted;
+        } else |_| {}
+    }
+    cut = 0;
+    while (cut < armored_signature.len) : (cut += 1) {
+        if (decodeOpenPgpArmorAlloc(allocator, armored_signature[0..cut], .signature, signature_max_size)) |decoded| {
+            defer allocator.free(decoded);
+            return error.TruncatedOpenPgpArmorAccepted;
+        } else |_| {}
+    }
+
+    const packet_key = try decodeOpenPgpArmorAlloc(allocator, armored_key, .public_key, public_key_max_size);
+    defer allocator.free(packet_key);
+    const key = try parseSingleOpenPgpPublicKeyPacket(packet_key);
+    cut = 0;
+    while (cut < packet_key.len) : (cut += 1) {
+        if (parseSingleOpenPgpPublicKeyPacket(packet_key[0..cut])) |_| {
+            return error.TruncatedOpenPgpPublicKeyAccepted;
+        } else |_| {}
+    }
+
+    const packet_signature = try decodeOpenPgpArmorAlloc(allocator, armored_signature, .signature, signature_max_size);
+    defer allocator.free(packet_signature);
+    const message = @embedFile("fixtures/openpgp/cross-validation-message.txt");
+    cut = 0;
+    while (cut < packet_signature.len) : (cut += 1) {
+        if (verifyOpenPgpDetachedSignature(allocator, std.testing.io, message, packet_signature[0..cut], &key)) |_| {
+            return error.TruncatedOpenPgpSignatureAccepted;
+        } else |_| {}
+    }
+}
+
 test "package-family resolve and customize requests are exact-lock operations" {
     const amd64 = packageFamilyRequest(
         .resolve_lock,
