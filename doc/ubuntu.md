@@ -229,7 +229,7 @@ the exact run ownership tags.
 `.github/workflows/ubuntu2604-release.yml` is manually dispatched from
 `main`. Before dispatch:
 
-1. Create the required tag `Ubuntu-26.04-20260825` at the exact current
+1. Create the required tag `Ubuntu-26.04-20260826` at the exact current
    `main` commit. Lightweight and annotated tags are accepted; an existing tag
    is never moved.
 2. Configure protected environment `ubuntu2604-signing`, restricted to
