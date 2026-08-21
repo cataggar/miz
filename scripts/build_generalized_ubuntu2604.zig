@@ -121,6 +121,7 @@ const Profile = struct {
     output: []const u8,
     work_dir: []const u8,
     efi_fallback: []const u8,
+    uki_stub_host_path: []const u8,
     serial_console: []const u8,
     pe_machine: u16,
     root_partition_table_index: u32,
@@ -138,6 +139,7 @@ const profiles = [_]Profile{
         .output = "Ubuntu-26.04-x86_64.qcow2",
         .work_dir = ".scratch/ubuntu2604-x86_64",
         .efi_fallback = "BOOTX64.EFI",
+        .uki_stub_host_path = "/usr/lib/systemd/boot/efi/linuxx64.efi.stub",
         .serial_console = "console=ttyS0,115200n8",
         .pe_machine = 0x8664,
         .root_partition_table_index = 0,
@@ -153,6 +155,7 @@ const profiles = [_]Profile{
         .output = "Ubuntu-26.04-aarch64.qcow2",
         .work_dir = ".scratch/ubuntu2604-aarch64",
         .efi_fallback = "BOOTAA64.EFI",
+        .uki_stub_host_path = "/usr/lib/systemd/boot/efi/linuxaa64.efi.stub",
         .serial_console = "console=ttyAMA0,115200n8",
         .pe_machine = 0xaa64,
         .root_partition_table_index = 0,
@@ -183,6 +186,7 @@ const Args = struct {
     signing_key: ?[]const u8 = null,
     signing_command: ?[]const u8 = null,
     signing_command_arg: ?[]const u8 = null,
+    uki_stub: ?[]const u8 = null,
     preflight_only: bool = false,
 };
 
@@ -198,6 +202,7 @@ const help =
     \\  --uki-signing-key <path>                local signing key
     \\  --uki-sign-command <absolute-path>       external production signer
     \\  --uki-sign-command-arg <argument>        external signer argument
+    \\  --uki-stub <path>                        systemd-boot EFI stub (default: host systemd-boot-efi)
     \\  --preflight-only                        verify pins/tools without building
     \\
 ;
@@ -298,6 +303,10 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
             args.signing_command_arg = argv[i];
+        } else if (std.mem.eql(u8, arg, "--uki-stub")) {
+            i += 1;
+            if (i == argv.len) return error.MissingArgument;
+            args.uki_stub = argv[i];
         } else if (std.mem.eql(u8, arg, "--preflight-only")) {
             args.preflight_only = true;
         } else if (std.mem.eql(u8, arg, "--help")) {
@@ -330,42 +339,6 @@ fn signingConfig(args: Args) !uki_signing.Config {
         .expected_certificate_sha256 = try uki_signing.parseFingerprint(certificate_sha256),
         .mode = mode,
     };
-}
-
-fn run(allocator: Allocator, io: Io, argv: []const []const u8) !void {
-    _ = allocator;
-    var child = try std.process.spawn(io, .{
-        .argv = argv,
-        .stdin = .ignore,
-        .stdout = .inherit,
-        .stderr = .inherit,
-    });
-    switch (try child.wait(io)) {
-        .exited => |code| if (code != 0) return error.CommandFailed,
-        else => return error.CommandFailed,
-    }
-}
-
-fn capture(allocator: Allocator, io: Io, argv: []const []const u8) ![]u8 {
-    const result = try std.process.run(allocator, io, .{ .argv = argv });
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code != 0) {
-            allocator.free(result.stdout);
-            return error.CommandFailed;
-        },
-        else => {
-            allocator.free(result.stdout);
-            return error.CommandFailed;
-        },
-    }
-    return result.stdout;
-}
-
-fn requireTool(allocator: Allocator, io: Io, name: []const u8) !void {
-    const path = try capture(allocator, io, &.{ "sh", "-c", "command -v \"$1\"", "vmiz-tool", name });
-    defer allocator.free(path);
-    if (std.mem.trim(u8, path, " \t\r\n").len == 0) return error.RequiredToolMissing;
 }
 
 fn acquire(
@@ -1745,6 +1718,8 @@ fn writeSigningProvenance(
     config: uki_signing.Config,
     certificate: *const uki_signing.Certificate,
     signed: *const uki_signing.SignedUki,
+    stub_source_path: []const u8,
+    stub_sha256: []const u8,
 ) !void {
     const metadata = signed.provider_metadata;
     var provider_fingerprint: [64]u8 = undefined;
@@ -1807,6 +1782,10 @@ fn writeSigningProvenance(
         .type = "vmiz-uki-signing",
         .architecture = @tagName(profile.architecture),
         .flavor = "full",
+        .uki_stub = .{
+            .source_path = stub_source_path,
+            .sha256 = stub_sha256,
+        },
         .signer_mode = config.mode.name(),
         .certificate_sha256 = @as([]const u8, &certificate_hex),
         .certificate_der_base64 = certificate_base64,
@@ -2036,8 +2015,6 @@ pub fn main(init: std.process.Init) !void {
         return error.ChecksumMismatch;
     if (args.preflight_only) return;
 
-    for (&[_][]const u8{"ukify"}) |tool|
-        try requireTool(allocator, io, tool);
     const config = try signingConfig(args);
 
     const mutable = try std.fs.path.join(allocator, &.{ work_dir, "customized.qcow2" });
@@ -2084,29 +2061,45 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(initrd_host);
     const os_release_host = try std.fs.path.join(allocator, &.{ extract_dir, "os-release" });
     defer allocator.free(os_release_host);
-    const os_release_argument = try std.fmt.allocPrint(allocator, "@{s}", .{os_release_host});
-    defer allocator.free(os_release_argument);
     const root_partition_guid = try rootPartitionGuid(allocator, io, mutable, profile);
     const cmdline = try ukiCmdline(allocator, root_partition_guid, profile);
     defer allocator.free(cmdline);
+
+    const stub_path = args.uki_stub orelse profile.uki_stub_host_path;
+    const stub_bytes = Dir.cwd().readFileAlloc(io, stub_path, allocator, .limited(vmiz.uki.limits.max_stub_size)) catch |err| switch (err) {
+        error.FileNotFound => return error.UkiStubMissing,
+        else => return err,
+    };
+    defer allocator.free(stub_bytes);
+    if (try peMachine(stub_bytes) != profile.pe_machine) return error.WrongStubArchitecture;
+    const stub_sha256 = artifact_pipeline.formatSha256(artifact_pipeline.sha256Bytes(stub_bytes));
+
+    const kernel_bytes = try Dir.cwd().readFileAlloc(io, kernel_host, allocator, .limited(vmiz.uki.limits.max_linux_size));
+    defer allocator.free(kernel_bytes);
+    const initrd_bytes = try Dir.cwd().readFileAlloc(io, initrd_host, allocator, .limited(vmiz.uki.limits.max_initrd_size));
+    defer allocator.free(initrd_bytes);
+    const os_release_bytes = try Dir.cwd().readFileAlloc(io, os_release_host, allocator, .limited(vmiz.uki.limits.max_os_release_size));
+    defer allocator.free(os_release_bytes);
+
+    const unsigned_bytes = try vmiz.uki.generate(allocator, .{
+        .stub = stub_bytes,
+        .linux = kernel_bytes,
+        .initrd = initrd_bytes,
+        .cmdline = cmdline,
+        .os_release = os_release_bytes,
+        .uname = release_name,
+    });
+    defer allocator.free(unsigned_bytes);
+    if (try peMachine(unsigned_bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
     const unsigned_uki = try std.fs.path.join(allocator, &.{ work_dir, "ubuntu2604.unsigned.efi" });
     defer allocator.free(unsigned_uki);
-    try run(allocator, io, &.{
-        "ukify",        "build",
-        "--linux",      kernel_host,
-        "--initrd",     initrd_host,
-        "--os-release", os_release_argument,
-        "--cmdline",    cmdline,
-        "--output",     unsigned_uki,
-    });
+    try Dir.cwd().writeFile(io, .{ .sub_path = unsigned_uki, .data = unsigned_bytes });
 
     const signing_scratch = try std.fs.path.join(allocator, &.{ work_dir, "signing" });
     defer allocator.free(signing_scratch);
     try uki_signing.prepareScratchDirectory(io, signing_scratch);
     var certificate = try uki_signing.prepareCertificate(allocator, io, config);
     defer certificate.deinit(allocator);
-    const unsigned_bytes = try Dir.cwd().readFileAlloc(io, unsigned_uki, allocator, .limited(256 * 1024 * 1024));
-    defer allocator.free(unsigned_bytes);
     var signed = try uki_signing.signUkiAlloc(
         allocator,
         io,
@@ -2137,7 +2130,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(final_lock);
     try validateExactLockRuntime(allocator, final_lock, profile);
     if (try peMachine(signed.bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
-    try writeSigningProvenance(allocator, io, provenance_dir, profile, config, &certificate, &signed);
+    try writeSigningProvenance(allocator, io, provenance_dir, profile, config, &certificate, &signed, stub_path, &stub_sha256);
 
     const provenance_path = try std.fs.path.join(allocator, &.{ provenance_dir, "ubuntu2604-build-provenance.json" });
     defer allocator.free(provenance_path);

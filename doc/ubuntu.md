@@ -117,24 +117,30 @@ builder dependencies as the release workflow:
 ```console
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
-  binutils file jq \
-  linux-image-generic \
-  python3 python3-pefile qemu-utils systemd-ukify
-sudo chmod 0644 /boot/vmlinuz-*
+  file jq python3 systemd-boot-efi
 ```
 
-The builder inventory is limited to UKI assembly/signing tools (`binutils`,
-`linux-image-generic`, `python3-pefile`, and `systemd-ukify`), `qemu-utils`,
-`file`, and `jq`. HTTPS/OpenPGP artifact verification and XZ/zstd decoding and
-encoding plus newc cpio archive creation are native, bounded implementations;
-no host codec library or `curl`, GnuPG, `cpio`, `xz`, or `zstd` executable is
-used. X.509 certificate normalization, canonical-DER fingerprinting, local-key
-Authenticode signing, and Secure Boot signature verification are likewise
-native, so the builder neither installs nor invokes `openssl`, `sbsign`, or
-`sbverify`.
-`qemu-img convert` is retained only because vmiz does not yet encode the final
-standalone zstd-compressed QCOW2 clusters. All resize, copy, GPT, filesystem
-mutation, and final structural validation before publication are native.
+`systemd-boot-efi` installs only the architecture-matched systemd-boot EFI
+stub (`/usr/lib/systemd/boot/efi/linuxx64.efi.stub` on x86_64,
+`linuxaa64.efi.stub` on arm64). The Unified Kernel Image is assembled natively:
+vmiz appends the deterministic `.linux`, `.initrd`, `.cmdline`, `.osrel`, and
+`.uname` PE/COFF sections onto that stub with architecture-correct headers,
+alignment, section flags, and subsystem/entry/image sizing, so the builder no
+longer installs or invokes `systemd-ukify`, `binutils`, `python3-pefile`, or a
+host `linux-image-generic` kernel — the kernel and initrd are extracted from
+the guest image. The stub source path and its SHA-256 are recorded in the
+signing provenance sidecar.
+
+The builder inventory is therefore limited to the native UKI stub source
+(`systemd-boot-efi`), `python3`, `file`, and `jq`. HTTPS/OpenPGP artifact
+verification and XZ/zstd decoding and encoding plus newc cpio archive creation
+are native, bounded implementations; no host codec library or `curl`, GnuPG,
+`cpio`, `xz`, or `zstd` executable is used. X.509 certificate normalization,
+canonical-DER fingerprinting, local-key Authenticode signing, and Secure Boot
+signature verification are likewise native, so the builder neither installs nor
+invokes `openssl`, `sbsign`, or `sbverify`. Standalone zstd-compressed QCOW2
+finalization is native as well; all resize, copy, GPT, filesystem mutation, and
+final structural validation before publication run without `qemu-img`.
 
 The full build runs the bounded guest-tool allowlist in a private mount, PID,
 and network namespace, so it must be invoked with `sudo` on Linux. The executor
