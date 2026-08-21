@@ -1476,12 +1476,15 @@ test "atomic commit preserves host image mode timestamps and xattrs" {
         .spool_path = spool_path,
         .atomic_path = image_path,
     });
+    var fs_open = true;
+    defer if (fs_open) fs.deinit();
     var stage_ready = StageReadyContext{ .allocator = allocator, .io = io };
     fs.test_stage_ready_hook = inspectStageReady;
     fs.test_stage_ready_hook_ctx = &stage_ready;
     try fs.write("/etc", "changed", null);
     _ = try fs.commit();
     fs.deinit();
+    fs_open = false;
     image.close(io);
     image_open = false;
 
@@ -1726,6 +1729,8 @@ test "mountless commit preserves the pinned Ubuntu descriptor-64 profile" {
         .spool_path = spool_path,
         .atomic_path = image_path,
     });
+    var fs_open = true;
+    defer if (fs_open) fs.deinit();
     const identity = fs.filesystemIdentity();
     try std.testing.expectEqual(@as(u16, 64), identity.descriptor_size);
     try std.testing.expectEqual(@as(u32, 0x103c), identity.feature_compat);
@@ -1734,6 +1739,7 @@ test "mountless commit preserves the pinned Ubuntu descriptor-64 profile" {
     try fs.write("/etc/os-release", "NAME=vmiz-pinned\n", null);
     _ = try fs.commit();
     fs.deinit();
+    fs_open = false;
     image.close(io);
     image_open = false;
 
