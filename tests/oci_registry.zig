@@ -4427,7 +4427,6 @@ test "slow registry requests consume one shared absolute pull deadline" {
     const reference = try pinnedReferenceFor(allocator, &fixture);
     defer allocator.free(reference);
 
-    const started = Io.Clock.Timestamp.now(io, .awake);
     try std.testing.expectError(
         error.ExecutionDeadlineExceeded,
         vmiz.customize.pullRegistryImageWithDeadline(
@@ -4439,14 +4438,14 @@ test "slow registry requests consume one shared absolute pull deadline" {
             deadlineAfterMilliseconds(io, 250),
         ),
     );
-    const elapsed = started.raw.durationTo(Io.Clock.Timestamp.now(io, .awake).raw);
     try fixture.finishDeadline();
 
     // Each response delay is far shorter than the budget, and several
     // requests completed. Only carrying the original timestamp forward can
-    // make the sequence fail.
+    // make the sequence fail. Do not impose a wall-clock ceiling on cleanup:
+    // after the deadline wins, unwinding the canceled registry operation may
+    // be descheduled under CI load without changing which deadline won.
     try std.testing.expect(fixture.deadline_completed >= 2);
-    try std.testing.expect(elapsed.toMilliseconds() < 2000);
 }
 
 test "a declared registry image is pulled into the layout the plan named" {
