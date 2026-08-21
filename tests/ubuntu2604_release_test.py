@@ -869,12 +869,12 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         workflow = (
             ROOT / ".github" / "workflows" / "ubuntu2604-release.yml"
         ).read_text(encoding="utf-8")
-        self.assertIn('"gpg", "--batch", "--no-options"', builder)
-        self.assertIn('"gpg", "--batch", "--yes", "--dearmor"', builder)
-        self.assertIn('"gpgv", "--keyring"', builder)
-        self.assertNotIn('"gpg", "--batch", "--homedir"', builder)
+        self.assertIn("std.base64.standard.Decoder", builder)
+        self.assertIn('"gpgv", "--status-fd=1", "--keyring"', builder)
+        self.assertNotIn('"gpg",', builder)
         self.assertNotIn('"--import"', builder)
-        self.assertIn("gpg gpgv mount", workflow)
+        self.assertIn("gpgv mount", workflow)
+        self.assertNotIn("gpg gpgv mount", workflow)
         self.assertNotIn("curl", workflow)
 
     def test_release_acquisition_uses_native_https_without_curl(self):

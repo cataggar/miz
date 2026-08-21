@@ -135,7 +135,7 @@ command. `update-initramfs`, `dpkg-query`, and optional `cloud-init clean` are
 the only guest commands; systemd enablement and account removal are native
 mountless operations.
 
-Run a source-pin preflight (requiring only `gpg` and agent-free `gpgv`) with:
+Run a source-pin preflight (requiring only agent-free `gpgv`) with:
 
 ```console
 zig build -Dubuntu2604-arch=x86_64 generalized-ubuntu2604 -- --preflight-only

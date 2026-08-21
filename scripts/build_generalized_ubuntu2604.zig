@@ -407,29 +407,69 @@ fn requireSha256SumsEntry(bytes: []const u8, filename: []const u8, digest: []con
     if (matches != 1) return error.SignedEntryMissingOrDuplicate;
 }
 
-fn hasExactCanonicalPrimaryFingerprint(bytes: []const u8) bool {
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    var expect_primary_fingerprint = false;
-    var primary_count: usize = 0;
-    var matched = false;
-    while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "pub:")) {
-            expect_primary_fingerprint = true;
+fn decodePublicKeyArmor(allocator: Allocator, armor: []const u8) ![]u8 {
+    const begin_marker = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
+    const end_marker = "-----END PGP PUBLIC KEY BLOCK-----";
+    var encoded: std.ArrayList(u8) = try .initCapacity(allocator, armor.len);
+    defer encoded.deinit(allocator);
+    var found_begin = false;
+    var in_body = false;
+    var found_end = false;
+    var lines = std.mem.splitScalar(u8, armor, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        if (found_end) {
+            if (std.mem.trim(u8, line, " \t").len != 0) return error.InvalidPublicKeyArmor;
             continue;
         }
-        if (!expect_primary_fingerprint or !std.mem.startsWith(u8, line, "fpr:")) continue;
-        expect_primary_fingerprint = false;
-        primary_count += 1;
-        var fields = std.mem.splitScalar(u8, line, ':');
-        var field_index: usize = 0;
-        while (fields.next()) |field| : (field_index += 1) {
-            if (field_index == 9) {
-                matched = std.mem.eql(u8, field, canonical_fingerprint);
-                break;
+        if (!found_begin) {
+            if (std.mem.eql(u8, line, begin_marker)) {
+                found_begin = true;
+            } else if (std.mem.trim(u8, line, " \t").len != 0) {
+                return error.InvalidPublicKeyArmor;
             }
+            continue;
+        }
+        if (!in_body) {
+            if (line.len == 0) {
+                in_body = true;
+            } else if (std.mem.indexOfScalar(u8, line, ':') == null) {
+                return error.InvalidPublicKeyArmor;
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, line, end_marker)) {
+            found_end = true;
+        } else if (std.mem.startsWith(u8, line, "=")) {
+            if (line.len != 5) return error.InvalidPublicKeyArmor;
+        } else if (line.len != 0) {
+            try encoded.appendSlice(allocator, line);
         }
     }
-    return primary_count == 1 and matched;
+    if (!found_begin or !in_body or !found_end or encoded.items.len == 0)
+        return error.InvalidPublicKeyArmor;
+    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(encoded.items) catch
+        return error.InvalidPublicKeyArmor;
+    const decoded = try allocator.alloc(u8, decoded_size);
+    errdefer allocator.free(decoded);
+    std.base64.standard.Decoder.decode(decoded, encoded.items) catch
+        return error.InvalidPublicKeyArmor;
+    return decoded;
+}
+
+fn hasExactCanonicalValidSignature(bytes: []const u8) bool {
+    const prefix = "[GNUPG:] VALIDSIG ";
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var signature_count: usize = 0;
+    var matched = false;
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, prefix)) continue;
+        signature_count += 1;
+        const rest = line[prefix.len..];
+        const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+        matched = std.mem.eql(u8, rest[0..end], canonical_fingerprint);
+    }
+    return signature_count == 1 and matched;
 }
 
 fn peMachine(bytes: []const u8) !u16 {
@@ -492,14 +532,16 @@ fn verifyCanonicalPublication(
         256 * 1024,
         downloader,
     );
-    const fingerprints = try capture(allocator, io, &.{ "gpg", "--batch", "--no-options", "--with-colons", "--show-keys", "--fingerprint", key_path });
-    defer allocator.free(fingerprints);
-    if (!hasExactCanonicalPrimaryFingerprint(fingerprints)) return error.CanonicalFingerprintMismatch;
+    const armor = try Dir.cwd().readFileAlloc(io, key_path, allocator, .limited(128 * 1024));
+    defer allocator.free(armor);
+    const keyring = try decodePublicKeyArmor(allocator, armor);
+    defer allocator.free(keyring);
     const keyring_path = try std.fs.path.join(allocator, &.{ work_dir, "canonical-cloud-image-key.gpg" });
     defer allocator.free(keyring_path);
-    Dir.cwd().deleteFile(io, keyring_path) catch {};
-    try run(allocator, io, &.{ "gpg", "--batch", "--yes", "--dearmor", "--output", keyring_path, key_path });
-    try run(allocator, io, &.{ "gpgv", "--keyring", keyring_path, signature_path, sums_path });
+    try Dir.cwd().writeFile(io, .{ .sub_path = keyring_path, .data = keyring });
+    const status = try capture(allocator, io, &.{ "gpgv", "--status-fd=1", "--keyring", keyring_path, signature_path, sums_path });
+    defer allocator.free(status);
+    if (!hasExactCanonicalValidSignature(status)) return error.CanonicalFingerprintMismatch;
 }
 
 const DebzEvidence = struct {
@@ -1628,7 +1670,7 @@ pub fn main(init: std.process.Init) !void {
     try Dir.cwd().deleteTree(io, provenance_dir);
     try Dir.cwd().createDirPath(io, provenance_dir);
 
-    for (&[_][]const u8{ "gpg", "gpgv" }) |tool|
+    for (&[_][]const u8{"gpgv"}) |tool|
         try requireTool(allocator, io, tool);
     var https = artifact_pipeline.NativeHttpsDownloader.init(allocator, io);
     defer https.deinit();
@@ -1883,22 +1925,38 @@ test "both architecture profiles acquire through the shared native HTTPS downloa
     try std.testing.expectEqual(profiles.len, transport.calls);
 }
 
-test "Canonical fingerprint listing accepts exactly one matching primary key" {
+test "Canonical public key armor is decoded without gpg" {
+    const decoded = try decodePublicKeyArmor(
+        std.testing.allocator,
+        "-----BEGIN PGP PUBLIC KEY BLOCK-----\n" ++
+            "Version: fixture\n\n" ++
+            "AQIDBA==\n" ++
+            "=AAAA\n" ++
+            "-----END PGP PUBLIC KEY BLOCK-----\n",
+    );
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, decoded);
+    try std.testing.expectError(
+        error.InvalidPublicKeyArmor,
+        decodePublicKeyArmor(
+            std.testing.allocator,
+            "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nnot-base64\n" ++
+                "-----END PGP PUBLIC KEY BLOCK-----\n",
+        ),
+    );
+}
+
+test "Canonical gpgv status requires exactly one matching valid signature" {
     const matching =
-        "tru::1:1750000000:0:3:1:5\n" ++
-        "pub:-:4096:1:1A5D6C4C7DB87C81:0:::-:::scESC::::::23::0:\n" ++
-        "fpr:::::::::D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81:\n" ++
-        "sub:-:4096:1:AAAAAAAAAAAAAAAA:0::::::e::::::23:\n" ++
-        "fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\n";
-    try std.testing.expect(hasExactCanonicalPrimaryFingerprint(matching));
-    try std.testing.expect(!hasExactCanonicalPrimaryFingerprint(
-        "pub:-:4096:1:BBBBBBBBBBBBBBBB:0:::-:::scESC::::::23::0:\n" ++
-            "fpr:::::::::BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB:\n",
+        "[GNUPG:] NEWSIG\n" ++
+        "[GNUPG:] VALIDSIG D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81 2026-08-21 0 4 0 1 10 00 D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81\n";
+    try std.testing.expect(hasExactCanonicalValidSignature(matching));
+    try std.testing.expect(!hasExactCanonicalValidSignature(
+        "[GNUPG:] VALIDSIG BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB 2026-08-21 0 4 0 1 10 00 BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n",
     ));
-    try std.testing.expect(!hasExactCanonicalPrimaryFingerprint(
+    try std.testing.expect(!hasExactCanonicalValidSignature(
         matching ++
-            "pub:-:4096:1:CCCCCCCCCCCCCCCC:0:::-:::scESC::::::23::0:\n" ++
-            "fpr:::::::::CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC:\n",
+            "[GNUPG:] VALIDSIG D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81 2026-08-21 0 4 0 1 10 00 D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81\n",
     ));
 }
 
