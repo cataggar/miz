@@ -20,6 +20,7 @@ const artifact_pipeline = vmiz.artifact_pipeline;
 const offline_root = vmiz.offline_root;
 const package_family = vmiz.package_family;
 const guid = vmiz.guid;
+const ImageFormat = vmiz.Format;
 
 const release = "20260731";
 const release_base = "https://cloud-images.ubuntu.com/releases/26.04/release-" ++ release;
@@ -42,6 +43,43 @@ const Architecture = enum {
         return null;
     }
 };
+
+fn validateFinalQcow2(io: Io, path: []const u8, expected_size: u64) !void {
+    var image = try vmiz.Image.openPathReadOnlyStandalone(io, path);
+    defer image.close(io);
+    if (image.format != .qcow2) return error.InvalidFinalQcow2;
+    if (image.virtual_size != expected_size) return error.UnexpectedVirtualSize;
+    const check = try image.check(io);
+    if (!check.ok) return error.InvalidFinalQcow2;
+}
+
+fn finalizeCompressedQcow2(
+    allocator: Allocator,
+    io: Io,
+    mutable: []const u8,
+    output: []const u8,
+) !void {
+    // vmiz validates and mutates QCOW2 natively, but it does not yet encode
+    // compressed zstd clusters. This is the sole external image-format
+    // boundary: qemu-img produces the standalone compressed release artifact.
+    const staged_output = try std.fmt.allocPrint(
+        allocator,
+        "{s}.vmiz-finalize-stage",
+        .{output},
+    );
+    defer allocator.free(staged_output);
+    Dir.cwd().deleteFile(io, staged_output) catch {};
+    errdefer Dir.cwd().deleteFile(io, staged_output) catch {};
+    try run(allocator, io, &.{
+        "qemu-img", "convert",                          "-f", "qcow2", "-O",          "qcow2",
+        "-o",       "compat=1.1,compression_type=zstd", "-c", mutable, staged_output,
+    });
+    var source = try vmiz.Image.openPathReadOnlyStandalone(io, mutable);
+    const expected_size = source.virtual_size;
+    source.close(io);
+    try validateFinalQcow2(io, staged_output, expected_size);
+    try Dir.cwd().rename(staged_output, Dir.cwd(), output, io);
+}
 
 const Profile = struct {
     architecture: Architecture,
@@ -404,17 +442,6 @@ fn validateExactLockRuntime(allocator: Allocator, bytes: []const u8, profile: *c
     if (std.mem.indexOf(u8, bytes, foreign_arch) != null) return error.ForeignArchitecturePackage;
 }
 
-fn validateQcow2Info(allocator: Allocator, bytes: []const u8, expected_size: u64) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
-    defer parsed.deinit();
-    const object = parsed.value.object;
-    const format = object.get("format") orelse return error.InvalidFinalQcow2;
-    if (format != .string or !std.mem.eql(u8, format.string, "qcow2")) return error.InvalidFinalQcow2;
-    if (object.get("backing-filename") != null or object.get("data-file") != null) return error.NonStandaloneQcow2;
-    const virtual_size = object.get("virtual-size") orelse return error.InvalidFinalQcow2;
-    if (virtual_size != .integer or virtual_size.integer != expected_size) return error.UnexpectedVirtualSize;
-}
-
 fn verifyCanonicalPublication(
     allocator: Allocator,
     io: Io,
@@ -523,13 +550,67 @@ const NativeRoot = struct {
         self.filesystem_open = false;
         self.image.close(self.io);
         self.image_open = false;
-        Dir.cwd().deleteFile(self.io, self.mutable_image) catch {};
-        try run(self.allocator, self.io, &.{
-            "qemu-img", "convert", "-f", "raw", "-O", "qcow2", self.raw_path, self.mutable_image,
-        });
+        try publishNativeQcow2(
+            self.allocator,
+            self.io,
+            self.raw_path,
+            self.mutable_image,
+        );
         Dir.cwd().deleteFile(self.io, self.raw_path) catch {};
     }
 };
+
+fn copyNativeImage(
+    allocator: Allocator,
+    io: Io,
+    source_path: []const u8,
+    destination_path: []const u8,
+    format: ImageFormat,
+) !void {
+    var source = try vmiz.Image.openPathReadOnlyStandalone(io, source_path);
+    defer source.close(io);
+    var destination = try vmiz.Image.createExclusive(
+        io,
+        destination_path,
+        format,
+        source.virtual_size,
+        .{},
+    );
+    var destination_open = true;
+    errdefer {
+        if (destination_open) destination.close(io);
+        Dir.cwd().deleteFile(io, destination_path) catch {};
+    }
+    try vmiz.copyAll(io, source, &destination, allocator);
+    try destination.file.sync(io);
+    destination.close(io);
+    destination_open = false;
+}
+
+fn publishNativeQcow2(
+    allocator: Allocator,
+    io: Io,
+    raw_path: []const u8,
+    destination_path: []const u8,
+) !void {
+    const staged_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.vmiz-native-stage",
+        .{destination_path},
+    );
+    defer allocator.free(staged_path);
+    Dir.cwd().deleteFile(io, staged_path) catch {};
+    errdefer Dir.cwd().deleteFile(io, staged_path) catch {};
+    try copyNativeImage(allocator, io, raw_path, staged_path, .qcow2);
+    var staged = try vmiz.Image.openPathReadOnlyStandalone(io, staged_path);
+    const check = staged.check(io) catch |err| {
+        staged.close(io);
+        return err;
+    };
+    staged.close(io);
+    if (!check.ok) return error.FinalImageInvalid;
+    try Dir.cwd().rename(staged_path, Dir.cwd(), destination_path, io);
+}
 
 fn partitionNameEquals(partition: vmiz.gpt.PartitionEntry, expected: []const u8) bool {
     if (expected.len > partition.name_utf16le.len) return false;
@@ -612,7 +693,8 @@ fn openNativeRoot(
     const raw_path = try std.fs.path.join(allocator, &.{ work_dir, "customized.native.raw" });
     errdefer allocator.free(raw_path);
     errdefer Dir.cwd().deleteFile(io, raw_path) catch {};
-    try run(allocator, io, &.{ "qemu-img", "convert", "-f", "qcow2", "-O", "raw", mutable_image, raw_path });
+    Dir.cwd().deleteFile(io, raw_path) catch {};
+    try copyNativeImage(allocator, io, mutable_image, raw_path, .raw);
     var image = try vmiz.Image.openPath(io, raw_path);
     errdefer image.close(io);
     const partitions = try vmiz.gpt.readGpt(image, io, allocator);
@@ -1669,10 +1751,8 @@ pub fn main(init: std.process.Init) !void {
     try uki_signing.verifyBytes(allocator, io, config, signing_scratch, 0, signed.bytes);
 
     try insertSignedUki(allocator, io, mutable, signed_path, profile);
-    try run(allocator, io, &.{ "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2", "-o", "compat=1.1,compression_type=zstd", "-c", mutable, output });
-    const info = try capture(allocator, io, &.{ "qemu-img", "info", "--output=json", output });
-    defer allocator.free(info);
-    try validateQcow2Info(allocator, info, args.size);
+    try finalizeCompressedQcow2(allocator, io, mutable, output);
+    try validateFinalQcow2(io, output, args.size);
     try validateFinalNativeImage(allocator, io, output, work_dir, profile);
     var final_root = try openNativeRoot(allocator, io, output, work_dir);
     defer final_root.deinit();
@@ -1829,6 +1909,48 @@ test "root staging preserves intentionally inaccessible snapd directory" {
         @as(std.posix.mode_t, 0),
         (try temporary.dir.statFile(io, "stage/var/lib/snapd/void", .{})).permissions.toMode() & 0o777,
     );
+}
+
+test "native image conversion round trips and cleans failed publication stages" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_length];
+    const raw_path = try std.fs.path.join(allocator, &.{ root, "source.raw" });
+    defer allocator.free(raw_path);
+    const qcow_path = try std.fs.path.join(allocator, &.{ root, "converted.qcow2" });
+    defer allocator.free(qcow_path);
+    const roundtrip_path = try std.fs.path.join(allocator, &.{ root, "roundtrip.raw" });
+    defer allocator.free(roundtrip_path);
+
+    var raw = try vmiz.Image.create(io, raw_path, .raw, 1024 * 1024, .{});
+    try raw.pwrite(io, "native-ubuntu-builder", 4096);
+    raw.close(io);
+    try copyNativeImage(allocator, io, raw_path, qcow_path, .qcow2);
+    try copyNativeImage(allocator, io, qcow_path, roundtrip_path, .raw);
+    var roundtrip = try vmiz.Image.openPathReadOnly(io, roundtrip_path);
+    defer roundtrip.close(io);
+    var bytes: [21]u8 = undefined;
+    try std.testing.expectEqual(bytes.len, try roundtrip.pread(io, &bytes, 4096));
+    try std.testing.expectEqualStrings("native-ubuntu-builder", &bytes);
+
+    const blocked_destination = try std.fs.path.join(allocator, &.{ root, "blocked" });
+    defer allocator.free(blocked_destination);
+    try Dir.cwd().createDirPath(io, blocked_destination);
+    try std.testing.expectError(
+        error.IsDir,
+        publishNativeQcow2(allocator, io, raw_path, blocked_destination),
+    );
+    const staged = try std.fmt.allocPrint(
+        allocator,
+        "{s}.vmiz-native-stage",
+        .{blocked_destination},
+    );
+    defer allocator.free(staged);
+    try std.testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, staged, .{}));
 }
 
 test "arguments accept Ubuntu and project architecture spellings" {
@@ -2007,18 +2129,51 @@ test "exact lock requires coherent Azure and provisioning packages" {
     try std.testing.expectError(error.ExactLockIncomplete, validateExactLock("linux-azure\t7.0\tamd64\n", profileFor(.x86_64)));
 }
 
-test "final qcow2 validation rejects backing files and wrong sizes" {
-    try validateQcow2Info(std.testing.allocator, "{\"format\":\"qcow2\",\"virtual-size\":5368709120}", default_virtual_size);
-    try std.testing.expectError(error.NonStandaloneQcow2, validateQcow2Info(
+test "final native qcow2 validation covers the exact release size" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fs.path.join(
         std.testing.allocator,
-        "{\"format\":\"qcow2\",\"virtual-size\":5368709120,\"backing-filename\":\"base\"}",
+        &.{ root_buffer[0..root_length], "release.qcow2" },
+    );
+    defer std.testing.allocator.free(path);
+    var image = try vmiz.Image.create(
+        std.testing.io,
+        path,
+        .qcow2,
         default_virtual_size,
-    ));
-    try std.testing.expectError(error.UnexpectedVirtualSize, validateQcow2Info(
-        std.testing.allocator,
-        "{\"format\":\"qcow2\",\"virtual-size\":1}",
-        default_virtual_size,
-    ));
+        .{},
+    );
+    image.close(std.testing.io);
+    try validateFinalQcow2(std.testing.io, path, default_virtual_size);
+    try std.testing.expectError(
+        error.UnexpectedVirtualSize,
+        validateFinalQcow2(std.testing.io, path, default_virtual_size - 512),
+    );
+}
+
+test "production builder contains no libguestfs command surface" {
+    const source = @embedFile("build_generalized_ubuntu2604.zig");
+    const tests_begin = std.mem.indexOf(u8, source, "test \"profiles pin") orelse
+        return error.TestBoundaryMissing;
+    const production = source[0..tests_begin];
+    for (&[_][]const u8{
+        "\"guestfish\"",
+        "\"virt-resize\"",
+        "\"virt-customize\"",
+        "\"virt-copy-in\"",
+        "\"virt-copy-out\"",
+        "\"virt-cat\"",
+        "\"virt-ls\"",
+        "\"virt-filesystems\"",
+        "\"virt-tar-in\"",
+        "\"virt-tar-out\"",
+        "\"supermin\"",
+    }) |forbidden| {
+        try std.testing.expect(std.mem.indexOf(u8, production, forbidden) == null);
+    }
 }
 
 test "provenance binds signed source metadata and validated debz evidence" {
