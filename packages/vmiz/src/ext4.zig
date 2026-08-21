@@ -9527,35 +9527,56 @@ test "a real e2fsprogs pinned profile survives import and native growth" {
     // superblock. Keep this assertion beside the real fixture so a future
     // profile update cannot accidentally read s_flags at 0x160 instead.
     try std.testing.expectEqual(@as(u32, 12), readInt(u32, raw_sb[0x280..0x284]));
+    // The superblock bitfields are the semantic oracle. dumpe2fs feature
+    // labels have changed across e2fsprogs releases, so do not make a
+    // particular token spelling or ordering part of the acceptance test.
+    try std.testing.expectEqual(@as(u32, 0x103c), readInt(u32, raw_sb[0x5C..0x60]));
+    try std.testing.expectEqual(@as(u32, 0x22c2), readInt(u32, raw_sb[0x60..0x64]));
+    try std.testing.expectEqual(@as(u32, 0x046b), readInt(u32, raw_sb[0x64..0x68]));
     const report = (try runToolCapture(
         std.testing.allocator,
         "dumpe2fs",
         &.{ "-h", path },
     )) orelse return error.SkipZigTest;
     defer std.testing.allocator.free(report);
-    for ([_][]const u8{ "64bit", "flex_bg", "metadata_csum_seed", "resize_inode", "orphan_file" }) |needle| {
-        try std.testing.expect(std.mem.indexOf(u8, report, needle) != null);
-    }
-    var orphan_line_found = false;
+    var features_line_found = false;
     var report_lines = std.mem.splitScalar(u8, report, '\n');
     while (report_lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "Filesystem features:")) {
+            features_line_found = true;
+        }
         const prefix = "Orphan file inode:";
         if (!std.mem.startsWith(u8, trimmed, prefix)) continue;
         const number = std.fmt.parseInt(u32, std.mem.trim(u8, trimmed[prefix.len..], " \t\r"), 10) catch
             return error.ExternalToolFailed;
         try std.testing.expectEqual(@as(u32, 12), number);
-        orphan_line_found = true;
     }
-    try std.testing.expect(orphan_line_found);
+    try std.testing.expect(features_line_found);
     const inode_report = (try runToolCapture(
         std.testing.allocator,
         "debugfs",
         &.{ "-R", "stat <12>", path },
     )) orelse return error.SkipZigTest;
     defer std.testing.allocator.free(inode_report);
-    try std.testing.expect(std.mem.indexOf(u8, inode_report, "Mode:  0600") != null);
-    try std.testing.expect(std.mem.indexOf(u8, inode_report, "Flags: 0x80000") != null);
+    var mode_ok = false;
+    var flags_ok = false;
+    var inode_lines = std.mem.splitScalar(u8, inode_report, '\n');
+    while (inode_lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.indexOf(u8, trimmed, "Mode:")) |mode_offset| {
+            const mode_text = std.mem.trim(u8, trimmed[mode_offset + "Mode:".len ..], " \t");
+            const end = std.mem.indexOfAny(u8, mode_text, " \t") orelse mode_text.len;
+            mode_ok = (std.fmt.parseInt(u16, mode_text[0..end], 8) catch 0) == 0o600;
+        }
+        if (std.mem.indexOf(u8, trimmed, "Flags:")) |flags_offset| {
+            const flags_text = std.mem.trim(u8, trimmed[flags_offset + "Flags:".len ..], " \t");
+            const end = std.mem.indexOfAny(u8, flags_text, " \t") orelse flags_text.len;
+            flags_ok = (std.fmt.parseInt(u32, flags_text[0..end], 0) catch 0) == inode_flag_extents;
+        }
+    }
+    try std.testing.expect(mode_ok);
+    try std.testing.expect(flags_ok);
     var reader = try openGeneral(io, file, std.testing.allocator, .{});
     defer reader.deinit();
     try std.testing.expectEqual(@as(u16, 64), reader.descriptor_size);
