@@ -2210,6 +2210,179 @@ pub fn writeImagePath(
     return writeImage(allocator, io, file, source, options);
 }
 
+/// Maximum amount of one NoCloud seed file accepted by `writeNoCloudSeed`.
+/// Provisioning media is control-plane input, not a general-purpose transport.
+pub const max_nocloud_seed_file_size: usize = 1024 * 1024;
+/// Maximum combined payload accepted by `writeNoCloudSeed`. Keeping this below
+/// 4 MiB leaves room for ISO metadata while matching release-builder bounds.
+pub const max_nocloud_seed_content_size: usize = 3 * 1024 * 1024;
+pub const max_nocloud_seed_additional_files: usize = 8;
+
+/// An extra root-level file needed alongside the standard NoCloud files. This
+/// preserves the Azure `ovf-env.xml` and marker-file provisioning contract
+/// without making callers bypass the bounded NoCloud writer.
+pub const NoCloudSeedAdditionalFile = struct {
+    name: []const u8,
+    contents: []const u8,
+};
+
+/// Input for a deterministic `cidata` NoCloud ISO9660 volume. The writer emits
+/// `meta-data`, `user-data`, and, when supplied, `network-config`, all with
+/// fixed metadata and timestamps unless `mtime` is explicitly set.
+pub const NoCloudSeed = struct {
+    meta_data: []const u8,
+    user_data: []const u8,
+    network_config: ?[]const u8 = null,
+    /// Optional bounded root-level files. These cannot replace reserved
+    /// NoCloud names.
+    additional_files: []const NoCloudSeedAdditionalFile = &.{},
+    mtime: i64 = 0,
+};
+
+pub const NoCloudSeedError = error{
+    TooManySeedFiles,
+    SeedFileTooLarge,
+    SeedContentTooLarge,
+    InvalidSeedFileName,
+    DuplicateSeedFileName,
+};
+
+/// Writes a bounded, deterministic ISO9660 `cidata` volume for cloud-init.
+/// The volume contains the required NoCloud files plus optional
+/// `network-config` and explicitly supplied root-level companion files.
+pub fn writeNoCloudSeed(
+    allocator: std.mem.Allocator,
+    io: Io,
+    output: Io.File,
+    seed: NoCloudSeed,
+) anyerror!WriteResult {
+    var source = try NoCloudSeedSource.init(seed);
+    return writeImage(allocator, io, output, source.treeSource(), .{
+        .volume_id = "cidata",
+        .application_id = "vmiz NoCloud seed",
+    });
+}
+
+/// Convenience wrapper that creates (truncating) `path` and writes a NoCloud
+/// seed ISO.
+pub fn writeNoCloudSeedPath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+    seed: NoCloudSeed,
+) anyerror!WriteResult {
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    return writeNoCloudSeed(allocator, io, file, seed);
+}
+
+const NoCloudSeedSource = struct {
+    files: [3 + max_nocloud_seed_additional_files]NoCloudSeedAdditionalFile = undefined,
+    count: usize = 0,
+    mtime: i64,
+
+    fn init(seed: NoCloudSeed) NoCloudSeedError!NoCloudSeedSource {
+        if (seed.additional_files.len > max_nocloud_seed_additional_files)
+            return error.TooManySeedFiles;
+
+        var source = NoCloudSeedSource{ .mtime = seed.mtime };
+        try source.append("meta-data", seed.meta_data);
+        try source.append("user-data", seed.user_data);
+        if (seed.network_config) |network_config| {
+            try source.append("network-config", network_config);
+        }
+        for (seed.additional_files) |file| {
+            if (!isNoCloudSeedFileName(file.name)) return error.InvalidSeedFileName;
+            if (isReservedNoCloudSeedFileName(file.name)) return error.DuplicateSeedFileName;
+            try source.append(file.name, file.contents);
+        }
+        return source;
+    }
+
+    fn append(
+        self: *NoCloudSeedSource,
+        name: []const u8,
+        contents: []const u8,
+    ) NoCloudSeedError!void {
+        if (contents.len > max_nocloud_seed_file_size) return error.SeedFileTooLarge;
+        var total: usize = 0;
+        for (self.files[0..self.count]) |file| {
+            if (std.mem.eql(u8, file.name, name)) return error.DuplicateSeedFileName;
+            total = std.math.add(usize, total, file.contents.len) catch
+                return error.SeedContentTooLarge;
+        }
+        total = std.math.add(usize, total, contents.len) catch
+            return error.SeedContentTooLarge;
+        if (total > max_nocloud_seed_content_size) return error.SeedContentTooLarge;
+        self.files[self.count] = .{ .name = name, .contents = contents };
+        self.count += 1;
+    }
+
+    fn treeSource(self: *const NoCloudSeedSource) TreeSource {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    const vtable = TreeSource.VTable{
+        .root = rootFn,
+        .count = countFn,
+        .node = nodeFn,
+        .read = readFn,
+    };
+
+    fn ctx(context: *const anyopaque) *const NoCloudSeedSource {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn rootFn(context: *const anyopaque) SourceRoot {
+        return .{ .mtime = ctx(context).mtime };
+    }
+
+    fn countFn(context: *const anyopaque) usize {
+        return ctx(context).count;
+    }
+
+    fn nodeFn(context: *const anyopaque, index: usize) anyerror!SourceNode {
+        const source = ctx(context);
+        const file = source.files[index];
+        return .{
+            .path = file.name,
+            .kind = .file,
+            .mode = 0o644,
+            .mtime = source.mtime,
+            .size = file.contents.len,
+        };
+    }
+
+    fn readFn(context: *const anyopaque, index: usize, buffer: []u8, offset: u64) anyerror!usize {
+        const contents = ctx(context).files[index].contents;
+        if (offset >= contents.len) return 0;
+        const offset_usize: usize = @intCast(offset);
+        const count = @min(buffer.len, contents.len - offset_usize);
+        @memcpy(buffer[0..count], contents[offset_usize..][0..count]);
+        return count;
+    }
+};
+
+fn isNoCloudSeedFileName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64 or
+        std.mem.eql(u8, name, ".") or
+        std.mem.eql(u8, name, ".."))
+    {
+        return false;
+    }
+    for (name) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '_' or byte == '-'))
+            return false;
+    }
+    return true;
+}
+
+fn isReservedNoCloudSeedFileName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "meta-data") or
+        std.mem.eql(u8, name, "user-data") or
+        std.mem.eql(u8, name, "network-config");
+}
+
 const sector_size: u32 = descriptor_size;
 const system_area_sectors: u32 = 16;
 const max_record_len: usize = 255;
@@ -3221,6 +3394,300 @@ const TestSource = struct {
         return n_bytes;
     }
 };
+
+const NoCloudOracleFile = struct {
+    iso_id: []const u8,
+    contents: []const u8,
+};
+
+/// A deliberately small ECMA-119 verifier used as an independent oracle for
+/// the NoCloud convenience API. It reads raw descriptors, both path tables,
+/// directory records, and file extents without going through `Reader`.
+fn verifyNoCloudSeedWithEcma119Oracle(
+    bytes: []const u8,
+    expected: []const NoCloudOracleFile,
+    expected_record_date: *const [7]u8,
+) !void {
+    try std.testing.expect(bytes.len >= (volume_descriptor_lba + 2) * descriptor_size);
+    try std.testing.expectEqual(@as(usize, 0), bytes.len % descriptor_size);
+
+    const pvd = bytes[volume_descriptor_lba * descriptor_size ..][0..descriptor_size];
+    try std.testing.expectEqual(@as(u8, 1), pvd[0]);
+    try std.testing.expectEqualStrings("CD001", pvd[1..6]);
+    try std.testing.expectEqual(@as(u8, 1), pvd[6]);
+    try std.testing.expectEqualStrings("CIDATA", std.mem.trimEnd(u8, pvd[40..72], " "));
+    try std.testing.expectEqual(@as(u16, descriptor_size), try oracle723(pvd[128..132]));
+    const total_sectors = try oracle733(pvd[80..88]);
+    try std.testing.expectEqual(@as(u64, total_sectors) * descriptor_size, bytes.len);
+
+    const terminator = bytes[(volume_descriptor_lba + 1) * descriptor_size ..][0..descriptor_size];
+    try std.testing.expectEqual(@as(u8, 255), terminator[0]);
+    try std.testing.expectEqualStrings("CD001", terminator[1..6]);
+    try std.testing.expectEqual(@as(u8, 1), terminator[6]);
+
+    const root = pvd[156..190];
+    const root_lba = try oracle733(root[2..10]);
+    const root_size = try oracle733(root[10..18]);
+    try std.testing.expectEqualSlices(u8, expected_record_date, root[18..25]);
+    try std.testing.expect(root[25] & 0x02 != 0);
+    try oracleExtentFits(bytes, root_lba, root_size);
+
+    const path_table_size = try oracle733(pvd[132..140]);
+    try std.testing.expectEqual(@as(u32, 10), path_table_size);
+    try verifyNoCloudPathTable(
+        bytes,
+        try oracle731(pvd[140..144]),
+        path_table_size,
+        true,
+        root_lba,
+    );
+    try verifyNoCloudPathTable(
+        bytes,
+        try oracle732(pvd[148..152]),
+        path_table_size,
+        false,
+        root_lba,
+    );
+
+    const root_offset: usize = @intCast(@as(u64, root_lba) * descriptor_size);
+    const root_end = root_offset + root_size;
+    var offset = root_offset;
+    var seen: usize = 0;
+    while (offset < root_end) {
+        const record_len = bytes[offset];
+        if (record_len == 0) {
+            offset = std.mem.alignForward(usize, offset + 1, descriptor_size);
+            continue;
+        }
+        try std.testing.expect(record_len >= 34);
+        const record_end = offset + record_len;
+        try std.testing.expect(record_end <= root_end);
+        const record = bytes[offset..record_end];
+        try std.testing.expectEqual(@as(u8, 0), record[1]);
+        try std.testing.expectEqual(@as(u8, 0), record[26]);
+        try std.testing.expectEqual(@as(u8, 0), record[27]);
+        try std.testing.expectEqualSlices(u8, expected_record_date, record[18..25]);
+
+        const name_len = record[32];
+        try std.testing.expect(33 + name_len <= record.len);
+        const name = record[33..][0..name_len];
+        if (!(name.len == 1 and (name[0] == 0 or name[0] == 1))) {
+            try std.testing.expectEqual(@as(u8, 0), record[25] & 0x02);
+            const file_lba = try oracle733(record[2..10]);
+            const file_size = try oracle733(record[10..18]);
+            try oracleExtentFits(bytes, file_lba, file_size);
+
+            var matched: ?NoCloudOracleFile = null;
+            for (expected) |file| {
+                if (std.mem.eql(u8, file.iso_id, name)) {
+                    matched = file;
+                    break;
+                }
+            }
+            const file = matched orelse return error.UnexpectedSeedFile;
+            try std.testing.expectEqual(@as(u32, @intCast(file.contents.len)), file_size);
+            const file_offset: usize = @intCast(@as(u64, file_lba) * descriptor_size);
+            try std.testing.expectEqualSlices(
+                u8,
+                file.contents,
+                bytes[file_offset..][0..file_size],
+            );
+            seen += 1;
+        }
+        offset = record_end;
+    }
+    try std.testing.expectEqual(expected.len, seen);
+}
+
+fn oracleExtentFits(bytes: []const u8, lba: u32, size: u32) !void {
+    const offset = @as(u64, lba) * descriptor_size;
+    try std.testing.expect(offset <= bytes.len);
+    try std.testing.expect(@as(u64, size) <= bytes.len - offset);
+}
+
+fn verifyNoCloudPathTable(
+    bytes: []const u8,
+    lba: u32,
+    size: u32,
+    little_endian: bool,
+    expected_root_lba: u32,
+) !void {
+    try oracleExtentFits(bytes, lba, size);
+    const offset: usize = @intCast(@as(u64, lba) * descriptor_size);
+    const table = bytes[offset..][0..size];
+    try std.testing.expectEqual(@as(u8, 1), table[0]);
+    try std.testing.expectEqual(@as(u8, 0), table[1]);
+    const extent = if (little_endian)
+        try oracle731(table[2..6])
+    else
+        try oracle732(table[2..6]);
+    const parent = if (little_endian)
+        try oracle721(table[6..8])
+    else
+        try oracle722(table[6..8]);
+    try std.testing.expectEqual(expected_root_lba, extent);
+    try std.testing.expectEqual(@as(u16, 1), parent);
+    try std.testing.expectEqual(@as(u8, 0), table[8]);
+    try std.testing.expectEqual(@as(u8, 0), table[9]);
+}
+
+fn oracle721(bytes: []const u8) !u16 {
+    if (bytes.len != 2) return error.InvalidOracleField;
+    return std.mem.readInt(u16, bytes[0..2], .little);
+}
+
+fn oracle722(bytes: []const u8) !u16 {
+    if (bytes.len != 2) return error.InvalidOracleField;
+    return std.mem.readInt(u16, bytes[0..2], .big);
+}
+
+fn oracle723(bytes: []const u8) !u16 {
+    if (bytes.len != 4) return error.InvalidOracleField;
+    const little = try oracle721(bytes[0..2]);
+    const big = try oracle722(bytes[2..4]);
+    if (little != big) return error.InvalidOracleField;
+    return little;
+}
+
+fn oracle731(bytes: []const u8) !u32 {
+    if (bytes.len != 4) return error.InvalidOracleField;
+    return std.mem.readInt(u32, bytes[0..4], .little);
+}
+
+fn oracle732(bytes: []const u8) !u32 {
+    if (bytes.len != 4) return error.InvalidOracleField;
+    return std.mem.readInt(u32, bytes[0..4], .big);
+}
+
+fn oracle733(bytes: []const u8) !u32 {
+    if (bytes.len != 8) return error.InvalidOracleField;
+    const little = try oracle731(bytes[0..4]);
+    const big = try oracle732(bytes[4..8]);
+    if (little != big) return error.InvalidOracleField;
+    return little;
+}
+
+test "NoCloud seed writer round-trips bounded files through raw and native parsers" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-nocloud-seed-roundtrip.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const meta_data = "instance-id: vmiz-test\nlocal-hostname: vmiz-test\n";
+    const user_data = "#cloud-config\nssh_pwauth: false\n";
+    const network_config = "version: 2\nethernets: {}\n";
+    const ovf_env = "<Environment/>\n";
+    const additional = [_]NoCloudSeedAdditionalFile{
+        .{ .name = "ovf-env.xml", .contents = ovf_env },
+        .{ .name = "vmiz-local-provisioning", .contents = "" },
+    };
+    const stamp: i64 = 1_700_000_000;
+    const result = try writeNoCloudSeedPath(allocator, io, path, .{
+        .meta_data = meta_data,
+        .user_data = user_data,
+        .network_config = network_config,
+        .additional_files = &additional,
+        .mtime = stamp,
+    });
+    try std.testing.expectEqual(@as(u32, 5), result.node_count);
+
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024));
+    defer allocator.free(bytes);
+    try verifyNoCloudSeedWithEcma119Oracle(bytes, &.{
+        .{ .iso_id = "META_DATA;1", .contents = meta_data },
+        .{ .iso_id = "NETWORK_CONFIG;1", .contents = network_config },
+        .{ .iso_id = "OVF_ENV_XML;1", .contents = ovf_env },
+        .{ .iso_id = "USER_DATA;1", .contents = user_data },
+        .{ .iso_id = "VMIZ_LOCAL_PROVISIONING;1", .contents = "" },
+    }, &.{ 123, 11, 14, 22, 13, 20, 0 });
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    for ([_]struct { path: []const u8, contents: []const u8 }{
+        .{ .path = "/meta-data", .contents = meta_data },
+        .{ .path = "/user-data", .contents = user_data },
+        .{ .path = "/network-config", .contents = network_config },
+        .{ .path = "/ovf-env.xml", .contents = ovf_env },
+        .{ .path = "/vmiz-local-provisioning", .contents = "" },
+    }) |expected| {
+        const index = try reader.lookup(expected.path);
+        try std.testing.expectEqual(stamp, reader.getEntry(index).mtime);
+        const contents = try reader.readFileAlloc(allocator, io, index);
+        defer allocator.free(contents);
+        try std.testing.expectEqualStrings(expected.contents, contents);
+    }
+}
+
+test "NoCloud seed writer output is deterministic" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path_a = "test-nocloud-seed-det-a.iso";
+    const path_b = "test-nocloud-seed-det-b.iso";
+    defer Io.Dir.cwd().deleteFile(io, path_a) catch {};
+    defer Io.Dir.cwd().deleteFile(io, path_b) catch {};
+
+    const seed = NoCloudSeed{
+        .meta_data = "instance-id: deterministic\n",
+        .user_data = "#cloud-config\n",
+        .network_config = "version: 2\n",
+        .additional_files = &.{.{ .name = "ovf-env.xml", .contents = "<Environment/>\n" }},
+        .mtime = 1_700_000_000,
+    };
+    _ = try writeNoCloudSeedPath(allocator, io, path_a, seed);
+    _ = try writeNoCloudSeedPath(allocator, io, path_b, seed);
+    const a = try Io.Dir.cwd().readFileAlloc(io, path_a, allocator, .limited(4 * 1024 * 1024));
+    defer allocator.free(a);
+    const b = try Io.Dir.cwd().readFileAlloc(io, path_b, allocator, .limited(4 * 1024 * 1024));
+    defer allocator.free(b);
+    try std.testing.expectEqualSlices(u8, a, b);
+}
+
+test "NoCloud seed writer rejects malformed and oversized input" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-nocloud-seed-invalid.iso";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const normal = NoCloudSeed{ .meta_data = "id\n", .user_data = "#cloud-config\n" };
+    try std.testing.expectError(error.InvalidSeedFileName, writeNoCloudSeedPath(allocator, io, path, .{
+        .meta_data = normal.meta_data,
+        .user_data = normal.user_data,
+        .additional_files = &.{.{ .name = "not/a-file", .contents = "" }},
+    }));
+    try std.testing.expectError(error.InvalidSeedFileName, writeNoCloudSeedPath(allocator, io, path, .{
+        .meta_data = normal.meta_data,
+        .user_data = normal.user_data,
+        .additional_files = &.{.{ .name = "..", .contents = "" }},
+    }));
+    try std.testing.expectError(error.DuplicateSeedFileName, writeNoCloudSeedPath(allocator, io, path, .{
+        .meta_data = normal.meta_data,
+        .user_data = normal.user_data,
+        .additional_files = &.{.{ .name = "meta-data", .contents = "" }},
+    }));
+    try std.testing.expectError(error.DuplicateSeedFileName, writeNoCloudSeedPath(allocator, io, path, .{
+        .meta_data = normal.meta_data,
+        .user_data = normal.user_data,
+        .additional_files = &.{.{ .name = "network-config", .contents = "" }},
+    }));
+
+    const oversized = try allocator.alloc(u8, max_nocloud_seed_file_size + 1);
+    defer allocator.free(oversized);
+    try std.testing.expectError(error.SeedFileTooLarge, writeNoCloudSeedPath(allocator, io, path, .{
+        .meta_data = oversized,
+        .user_data = normal.user_data,
+    }));
+
+    const maximum = try allocator.alloc(u8, max_nocloud_seed_file_size);
+    defer allocator.free(maximum);
+    try std.testing.expectError(error.SeedContentTooLarge, writeNoCloudSeedPath(allocator, io, path, .{
+        .meta_data = maximum,
+        .user_data = maximum,
+        .additional_files = &.{
+            .{ .name = "one", .contents = maximum },
+            .{ .name = "two", .contents = maximum },
+        },
+    }));
+}
 
 /// Walks every directory extent in `reader`, inspecting each directory record's
 /// System Use area for `CE` continuation references. Asserts that every

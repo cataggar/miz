@@ -151,7 +151,7 @@ jobs:
           test "$(uname -m)" = "$expected_uname"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            curl jq openssh-client qemu-utils xorriso \
+            curl jq openssh-client qemu-utils \
             "${platform_packages[@]}"
           test -x "$QEMU"
 
@@ -172,7 +172,6 @@ jobs:
             --work-dir "$GITHUB_WORKSPACE/$WORK_DIR" \
             --output "$GITHUB_WORKSPACE/$CANDIDATE_DIR/$ASSET_NAME" \
             --qemu "$QEMU" \
-            --xorriso /usr/bin/xorriso \
             --timeout 3600 2>&1 |
             tee "$RUNNER_TEMP/freebsd15-$VARIANT-build.log"
 

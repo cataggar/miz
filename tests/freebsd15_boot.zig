@@ -7,6 +7,7 @@ const builtin = @import("builtin");
 const qemu_host = @import("qemu_host");
 const qmp = @import("qmp");
 const packages = @import("packages");
+const vmiz = @import("vmiz");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -1626,13 +1627,6 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
         architecture,
     );
     defer allocator.free(qemu_img_path);
-    const xorriso_path = try requireToolAlloc(
-        allocator,
-        io,
-        "xorriso",
-        architecture,
-    );
-    defer allocator.free(xorriso_path);
     const ssh_keygen_path = try requireToolAlloc(
         allocator,
         io,
@@ -1674,11 +1668,6 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             &.{ temporary_path, "vars.fd" },
         );
         defer allocator.free(vars_path);
-        const seed_dir = try std.fs.path.join(
-            allocator,
-            &.{ temporary_path, "seed" },
-        );
-        defer allocator.free(seed_dir);
         const seed_path = try std.fs.path.join(
             allocator,
             &.{ temporary_path, "seed.iso" },
@@ -1762,7 +1751,6 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
         );
         defer allocator.free(failure_marker);
 
-        try Dir.cwd().createDir(io, seed_dir, .default_dir);
         const metadata = try std.fmt.allocPrint(
             allocator,
             "instance-id: vmiz-acceptance-{s}\n" ++
@@ -1814,36 +1802,9 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             .{ public_key, &nonce, &nonce },
         );
         defer allocator.free(user_data);
-        const metadata_path = try std.fs.path.join(
-            allocator,
-            &.{ seed_dir, "meta-data" },
-        );
-        defer allocator.free(metadata_path);
-        const user_data_path = try std.fs.path.join(
-            allocator,
-            &.{ seed_dir, "user-data" },
-        );
-        defer allocator.free(user_data_path);
-        try Dir.cwd().writeFile(io, .{
-            .sub_path = metadata_path,
-            .data = metadata,
-        });
-        try Dir.cwd().writeFile(io, .{
-            .sub_path = user_data_path,
-            .data = user_data,
-        });
-        try runCommand(io, &.{
-            xorriso_path,
-            "-as",
-            "mkisofs",
-            "-quiet",
-            "-V",
-            "cidata",
-            "-J",
-            "-r",
-            "-o",
-            seed_path,
-            seed_dir,
+        _ = try vmiz.iso9660.writeNoCloudSeedPath(allocator, io, seed_path, .{
+            .meta_data = metadata,
+            .user_data = user_data,
         });
 
         var port_bytes: [2]u8 = undefined;

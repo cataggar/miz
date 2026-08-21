@@ -613,6 +613,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "qmp", .module = host_qmp_mod },
                 .{ .name = "qemu_host", .module = host_qemu_host_mod },
                 .{ .name = "packages", .module = freebsd_packages_mod },
+                .{ .name = "vmiz", .module = host_vmiz_mod },
             },
         }),
     });

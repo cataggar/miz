@@ -126,7 +126,6 @@ const Instance = struct {
     work_path: []u8,
     overlay_path: []u8,
     vars_path: []u8,
-    seed_dir: []u8,
     seed_path: []u8,
     private_key_path: []u8,
     public_key_path: []u8,
@@ -156,8 +155,6 @@ const Instance = struct {
         errdefer allocator.free(overlay_path);
         const vars_path = try std.fs.path.join(allocator, &.{ work_path, "vars.fd" });
         errdefer allocator.free(vars_path);
-        const seed_dir = try std.fs.path.join(allocator, &.{ work_path, "seed" });
-        errdefer allocator.free(seed_dir);
         const seed_path = try std.fs.path.join(allocator, &.{ work_path, "seed.iso" });
         errdefer allocator.free(seed_path);
         const private_key_path = try std.fs.path.join(allocator, &.{ work_path, "id_ed25519" });
@@ -181,7 +178,6 @@ const Instance = struct {
             .work_path = work_path,
             .overlay_path = overlay_path,
             .vars_path = vars_path,
-            .seed_dir = seed_dir,
             .seed_path = seed_path,
             .private_key_path = private_key_path,
             .public_key_path = public_key_path,
@@ -202,7 +198,6 @@ const Instance = struct {
         allocator.free(self.work_path);
         allocator.free(self.overlay_path);
         allocator.free(self.vars_path);
-        allocator.free(self.seed_dir);
         allocator.free(self.seed_path);
         allocator.free(self.private_key_path);
         allocator.free(self.public_key_path);
@@ -957,7 +952,6 @@ fn validateFinalizedImage(
 fn createSeed(
     allocator: Allocator,
     io: Io,
-    xorriso_path: []const u8,
     ssh_keygen_path: []const u8,
     instance: *const Instance,
 ) !void {
@@ -980,7 +974,6 @@ fn createSeed(
     defer allocator.free(public_key_file);
     const public_key = std.mem.trim(u8, public_key_file, " \t\r\n");
 
-    try Dir.cwd().createDir(io, instance.seed_dir, .default_dir);
     const metadata = try std.fmt.allocPrint(
         allocator,
         "instance-id: vmiz-ubuntu2604-acceptance-{s}\n" ++
@@ -1026,37 +1019,14 @@ fn createSeed(
     );
     defer allocator.free(ovf_env);
 
-    const metadata_path = try std.fs.path.join(allocator, &.{ instance.seed_dir, "meta-data" });
-    defer allocator.free(metadata_path);
-    const user_data_path = try std.fs.path.join(allocator, &.{ instance.seed_dir, "user-data" });
-    defer allocator.free(user_data_path);
-    const ovf_path = try std.fs.path.join(allocator, &.{ instance.seed_dir, "ovf-env.xml" });
-    defer allocator.free(ovf_path);
-    const marker_path = try std.fs.path.join(
-        allocator,
-        &.{ instance.seed_dir, "vmiz-local-provisioning" },
-    );
-    defer allocator.free(marker_path);
-
-    try Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata });
-    try Dir.cwd().writeFile(io, .{ .sub_path = user_data_path, .data = user_data });
-    try Dir.cwd().writeFile(io, .{ .sub_path = ovf_path, .data = ovf_env });
-    try Dir.cwd().writeFile(io, .{ .sub_path = marker_path, .data = "" });
-
-    try runCommand(allocator, io, &.{
-        xorriso_path,
-        "-as",
-        "mkisofs",
-        "-quiet",
-        "-iso-level",
-        "3",
-        "-R",
-        "-J",
-        "-V",
-        "cidata",
-        "-o",
-        instance.seed_path,
-        instance.seed_dir,
+    const additional_files = [_]vmiz.iso9660.NoCloudSeedAdditionalFile{
+        .{ .name = "ovf-env.xml", .contents = ovf_env },
+        .{ .name = "vmiz-local-provisioning", .contents = "" },
+    };
+    _ = try vmiz.iso9660.writeNoCloudSeedPath(allocator, io, instance.seed_path, .{
+        .meta_data = metadata,
+        .user_data = user_data,
+        .additional_files = &additional_files,
     });
 }
 
@@ -1066,7 +1036,6 @@ fn startInstance(
     qemu_img_path: []const u8,
     qemu_path: []const u8,
     swtpm_path: []const u8,
-    xorriso_path: []const u8,
     ssh_keygen_path: []const u8,
     firmware: *const Firmware,
     vars_template_path: []const u8,
@@ -1096,7 +1065,7 @@ fn startInstance(
     try Dir.copyFileAbsolute(vars_template_path, instance.vars_path, io, .{
         .replace = false,
     });
-    try createSeed(allocator, io, xorriso_path, ssh_keygen_path, instance);
+    try createSeed(allocator, io, ssh_keygen_path, instance);
     try Dir.cwd().createDir(io, instance.swtpm_state_path, .default_dir);
 
     const swtpm_state_arg = try std.fmt.allocPrint(
@@ -1868,8 +1837,6 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
     defer allocator.free(qemu_img_path);
     const swtpm_path = try requireToolAlloc(allocator, io, "swtpm");
     defer allocator.free(swtpm_path);
-    const xorriso_path = try requireToolAlloc(allocator, io, "xorriso");
-    defer allocator.free(xorriso_path);
     const ssh_keygen_path = try requireToolAlloc(allocator, io, "ssh-keygen");
     defer allocator.free(ssh_keygen_path);
     const ssh_path = try requireToolAlloc(allocator, io, "ssh");
@@ -2025,7 +1992,6 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         qemu_img_path,
         qemu_path,
         swtpm_path,
-        xorriso_path,
         ssh_keygen_path,
         &firmware,
         enrolled_vars_path,
@@ -2040,7 +2006,6 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         qemu_img_path,
         qemu_path,
         swtpm_path,
-        xorriso_path,
         ssh_keygen_path,
         &firmware,
         enrolled_vars_path,
@@ -2171,7 +2136,6 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         qemu_img_path,
         qemu_path,
         swtpm_path,
-        xorriso_path,
         ssh_keygen_path,
         &ordinary_firmware,
         ordinary_firmware.vars_path,
@@ -2199,7 +2163,6 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         qemu_img_path,
         qemu_path,
         swtpm_path,
-        xorriso_path,
         ssh_keygen_path,
         &firmware,
         enrolled_vars_path,

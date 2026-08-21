@@ -67,6 +67,8 @@ vmiz qemu FreeBSD --arch x86_64
 When administrator provisioning is requested, cataloged FreeBSD images receive
 the NoCloud seed as a read-only VirtIO block device, matching their release
 acceptance configuration.
+The seed is a deterministic native ISO9660 `CIDATA` volume; no host ISO
+authoring tool is required for either x86_64 or AArch64 guests.
 
 The published Azure Linux images use the signed direct UKI boot path described in
 [Azure Linux images](azure-linux.md). Secure Boot is opt-in:

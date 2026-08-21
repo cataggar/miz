@@ -190,7 +190,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           packages=(
-            curl dnf file jq openssh-client openssl python3-virt-firmware qemu-utils rpm sbsigntool tar xorriso
+            curl dnf file jq openssh-client openssl python3-virt-firmware qemu-utils rpm sbsigntool tar
           )
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
           echo '%_dbpath /usr/lib/sysimage/rpm' | sudo tee /root/.rpmmacros >/dev/null

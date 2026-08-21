@@ -120,14 +120,14 @@ sudo apt-get install -y --no-install-recommends \
   binutils file jq \
   linux-image-generic openssl \
   python3 python3-pefile qemu-utils sbsigntool systemd-ukify \
-  util-linux xorriso
+  util-linux
 sudo chmod 0644 /boot/vmlinuz-*
 ```
 
 The builder inventory is limited to native compilation and image-mutation
 dependencies (`util-linux`), UKI assembly/signing tools (`binutils`,
 `linux-image-generic`, `python3-pefile`, `sbsigntool`, and `systemd-ukify`),
-`xorriso`, `qemu-utils`, `file`, `jq`, and OpenSSL. HTTPS/OpenPGP artifact
+`qemu-utils`, `file`, `jq`, and OpenSSL. HTTPS/OpenPGP artifact
 verification and XZ/zstd decoding and encoding plus newc cpio archive creation
 are native, bounded implementations; no host codec library or `curl`, GnuPG,
 `cpio`, `xz`, or `zstd` executable is used.
@@ -218,7 +218,7 @@ provenance sidecar into `candidate.json`, and rejects private-key material.
 
 Native acceptance is deliberately not emulation. Each architecture requires a
 matching Linux runner with readable and writable `/dev/kvm`, QEMU, OVMF or
-AAVMF, `swtpm`, `virt-fw-vars`, `sbverify`, OpenSSH, and `xorriso`. It enrolls
+AAVMF, `swtpm`, `virt-fw-vars`, `sbverify`, and OpenSSH. It enrolls
 the exact candidate leaf in UEFI `db` and asserts the standalone GPT image,
 Secure Boot, signed UKI, vTPM, lockdown, signed modules, rejection of a
 tampered UKI, key-only SSH, cloud-init, WALinuxAgent, netplan/networkd, root

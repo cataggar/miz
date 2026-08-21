@@ -147,7 +147,6 @@ const help_text =
     \\  --admin-username <n> Provision this administrator account (requires a key).
     \\  --ssh-public-key <p> Read this public key for administrator provisioning.
     \\  --ssh-port <port>   Forward localhost TCP port to guest SSH (default 2222).
-    \\  --xorriso <path>    Explicit xorriso executable for provisioning media.
     \\  --accel <name>      Accelerator: auto (default), whpx, kvm, hvf, or tcg;
     \\                      auto uses TCG when host and guest architectures differ.
     \\  --qemu <path>       Explicit architecture-specific QEMU executable.
@@ -213,7 +212,6 @@ const Options = struct {
     admin_username: ?[]const u8 = null,
     ssh_public_key_path: ?[]const u8 = null,
     ssh_port: ?u16 = null,
-    xorriso_path: ?[]const u8 = null,
     extra_qemu_args: []const []const u8 = &.{},
     help: bool = false,
 };
@@ -858,10 +856,6 @@ fn parseArgs(args: []const []const u8) ParseResult {
             if (i >= args.len) return parseFailure(.missing_value, arg);
             options.ssh_port = parseSshPort(args[i]) orelse
                 return parseFailure(.invalid_ssh_port, args[i]);
-        } else if (std.mem.eql(u8, arg, "--xorriso")) {
-            i += 1;
-            if (i >= args.len) return parseFailure(.missing_value, arg);
-            options.xorriso_path = args[i];
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return parseFailure(.unknown_option, arg);
         } else if (!options.image_was_explicit) {
@@ -2798,21 +2792,6 @@ fn buildNoCloudUserDataAlloc(
     return output.toOwnedSlice(allocator);
 }
 
-fn resolveXorrisoAlloc(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    environ: std.process.Environ,
-    explicit_path: ?[]const u8,
-) ![]u8 {
-    if (explicit_path) |path| {
-        if (!try qemu_host.pathAccessible(io, path, .{ .execute = true }))
-            return error.ExplicitXorrisoNotExecutable;
-        return allocator.dupe(u8, path);
-    }
-    return (try qemu_host.findExecutableInPathAlloc(allocator, io, environ, "xorriso")) orelse
-        return error.XorrisoNotFound;
-}
-
 fn createSeedStateAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2823,30 +2802,12 @@ fn createSeedStateAlloc(
     const key_path = options.ssh_public_key_path orelse return error.MissingProvisioningKey;
     const public_key = try readAndValidatePublicKeyAlloc(allocator, io, key_path);
     defer allocator.free(public_key);
-    const xorriso_path = try resolveXorrisoAlloc(allocator, io, environ, options.xorriso_path);
-    defer allocator.free(xorriso_path);
 
     const work_dir = try createTemporaryWorkDirAlloc(allocator, io, environ, "vmiz-qemu-seed-");
     errdefer {
         std.Io.Dir.cwd().deleteTree(io, work_dir) catch {};
         allocator.free(work_dir);
     }
-    const seed_dir = try std.fs.path.join(allocator, &.{ work_dir, "seed" });
-    defer allocator.free(seed_dir);
-    try std.Io.Dir.cwd().createDir(
-        io,
-        seed_dir,
-        privateDirectoryPermissions(),
-    );
-
-    const meta_path = try std.fs.path.join(allocator, &.{ seed_dir, "meta-data" });
-    defer allocator.free(meta_path);
-    const user_path = try std.fs.path.join(allocator, &.{ seed_dir, "user-data" });
-    defer allocator.free(user_path);
-    const ovf_path = try std.fs.path.join(allocator, &.{ seed_dir, "ovf-env.xml" });
-    defer allocator.free(ovf_path);
-    const marker_path = try std.fs.path.join(allocator, &.{ seed_dir, local_provisioning_marker });
-    defer allocator.free(marker_path);
     const iso_path = try std.fs.path.join(allocator, &.{ work_dir, "seed.iso" });
     errdefer allocator.free(iso_path);
 
@@ -2858,35 +2819,15 @@ fn createSeedStateAlloc(
     const ovf_env = try buildOvfEnvAlloc(allocator, username, public_key);
     defer allocator.free(ovf_env);
 
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = meta_path, .data = meta_data });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = user_path, .data = user_data });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ovf_path, .data = ovf_env });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = marker_path, .data = "" });
-
-    const xorriso_argv = [_][]const u8{
-        xorriso_path,
-        "-as",
-        "mkisofs",
-        "-quiet",
-        "-iso-level",
-        "3",
-        "-R",
-        "-J",
-        "-V",
-        "cidata",
-        "-o",
-        iso_path,
-        seed_dir,
+    const additional_files = [_]vmiz.iso9660.NoCloudSeedAdditionalFile{
+        .{ .name = "ovf-env.xml", .contents = ovf_env },
+        .{ .name = local_provisioning_marker, .contents = "" },
     };
-    var child = try std.process.spawn(io, .{
-        .argv = &xorriso_argv,
-        .stdin = .ignore,
-        .stdout = .inherit,
-        .stderr = .inherit,
+    _ = try vmiz.iso9660.writeNoCloudSeedPath(allocator, io, iso_path, .{
+        .meta_data = meta_data,
+        .user_data = user_data,
+        .additional_files = &additional_files,
     });
-    const term = try child.wait(io);
-    const exit_code = childExitCode(term) orelse return error.XorrisoFailed;
-    if (exit_code != 0) return error.XorrisoFailed;
     if (!try qemu_host.pathAccessible(io, iso_path, .{ .read = true }))
         return error.SeedIsoMissing;
 
@@ -3172,6 +3113,41 @@ fn expectAarch64CpuArgv(accel: Accel, expected_cpu: []const u8) !void {
     }
     try std.testing.expect(cpu_index != null);
     try std.testing.expectEqualStrings(expected_cpu, argv.items.items[cpu_index.? + 1]);
+}
+
+test "qemu provisioning creates a native NoCloud seed with Azure companion files" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var temporary_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const temporary_path_length = try temporary.dir.realPath(io, &temporary_path_buffer);
+    const temporary_path = temporary_path_buffer[0..temporary_path_length];
+    const key_path = try std.fs.path.join(allocator, &.{ temporary_path, "id_ed25519.pub" });
+    defer allocator.free(key_path);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = key_path,
+        .data = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey user@example\n",
+    });
+
+    var seed = try createSeedStateAlloc(allocator, io, std.testing.environ, .{
+        .admin_username = "admin",
+        .ssh_public_key_path = key_path,
+    });
+    defer seed.deinit(allocator, io);
+
+    var reader = try vmiz.iso9660.Reader.openPath(allocator, io, seed.iso_path);
+    defer reader.close(io);
+    for ([_][]const u8{
+        "/meta-data",
+        "/user-data",
+        "/ovf-env.xml",
+        "/" ++ local_provisioning_marker,
+    }) |path| {
+        const index = try reader.lookup(path);
+        const contents = try reader.readFileAlloc(allocator, io, index);
+        defer allocator.free(contents);
+    }
 }
 
 test "qemu parser defaults to the release image" {
