@@ -49,32 +49,24 @@ fn readImageAt(
     return read_context.image.pread(read_context.io, buffer, offset);
 }
 
-fn openProcFdReadWrite(io: Io, file: Io.File) !Io.File {
-    var path_buffer: [64]u8 = undefined;
-    const path = try std.fmt.bufPrint(
-        &path_buffer,
-        "/proc/self/fd/{d}",
-        .{file.handle},
+fn temporarySiblingPath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    destination: []const u8,
+    purpose: []const u8,
+) ![]u8 {
+    var random: [8]u8 = undefined;
+    Io.random(io, &random);
+    const token = std.mem.readInt(u64, &random, .little);
+    const directory = std.fs.path.dirname(destination) orelse ".";
+    const basename = std.fs.path.basename(destination);
+    const temporary_name = try std.fmt.allocPrint(
+        allocator,
+        ".{s}.vmiz-{s}-{x}",
+        .{ basename, purpose, token },
     );
-    return Io.Dir.cwd().openFile(io, path, .{
-        .mode = .read_write,
-        .allow_directory = false,
-        .follow_symlinks = true,
-    });
-}
-
-fn openProcFdReadOnly(io: Io, file: Io.File) !Io.File {
-    var path_buffer: [64]u8 = undefined;
-    const path = try std.fmt.bufPrint(
-        &path_buffer,
-        "/proc/self/fd/{d}",
-        .{file.handle},
-    );
-    return Io.Dir.cwd().openFile(io, path, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = true,
-    });
+    defer allocator.free(temporary_name);
+    return std.fs.path.join(allocator, &.{ directory, temporary_name });
 }
 
 fn labelBytes(label: *const [16]u8) []const u8 {
@@ -214,9 +206,11 @@ pub fn growExistingQcow2(
     }
 
     var source = try Image.openPathReadOnlyStandalone(io, path);
-    defer source.close(io);
+    var source_open = true;
+    defer if (source_open) source.close(io);
     if (source.format != .qcow2) return error.UnsupportedFormat;
     if (options.target_size <= source.virtual_size) return error.ImageDidNotGrow;
+    const old_virtual_size = source.virtual_size;
 
     var source_gpt = try gpt.readVerifiedGpt(
         source,
@@ -251,20 +245,12 @@ pub fn growExistingQcow2(
         gpt.sector_size,
     ) catch return error.InvalidPartitionBounds;
 
-    const raw_path = try std.fmt.allocPrint(
-        allocator,
-        "{s}.vmiz-root-resize-raw",
-        .{path},
-    );
+    const raw_path = try temporarySiblingPath(allocator, io, path, "raw");
     defer allocator.free(raw_path);
-    var raw_stage = try Io.Dir.cwd().createFileAtomic(io, raw_path, .{
-        .replace = false,
-    });
-    defer raw_stage.deinit(io);
-
-    var raw = try Image.createFile(
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    var raw = try Image.createExclusive(
         io,
-        try openProcFdReadWrite(io, raw_stage.file),
+        raw_path,
         .raw,
         options.target_size,
         .{},
@@ -324,19 +310,15 @@ pub fn growExistingQcow2(
 
     raw.close(io);
     raw_open = false;
-    var raw_source = try Image.openFile(
-        io,
-        try openProcFdReadOnly(io, raw_stage.file),
-    );
+    var raw_source = try Image.openPathReadOnly(io, raw_path);
     defer raw_source.close(io);
 
-    var output_stage = try Io.Dir.cwd().createFileAtomic(io, path, .{
-        .replace = true,
-    });
-    defer output_stage.deinit(io);
-    var output = try Image.createFile(
+    const output_path = try temporarySiblingPath(allocator, io, path, "output");
+    defer allocator.free(output_path);
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    var output = try Image.createExclusive(
         io,
-        try openProcFdReadWrite(io, output_stage.file),
+        output_path,
         .qcow2,
         options.target_size,
         .{},
@@ -362,13 +344,15 @@ pub fn growExistingQcow2(
         root,
         new_filesystem_length,
     );
+    try output.file.sync(io);
     output.close(io);
     output_open = false;
-    try output_stage.file.sync(io);
-    try output_stage.replace(io);
+    source.close(io);
+    source_open = false;
+    try Io.Dir.cwd().rename(output_path, Io.Dir.cwd(), path, io);
 
     return .{
-        .old_virtual_size = source.virtual_size,
+        .old_virtual_size = old_virtual_size,
         .new_virtual_size = options.target_size,
         .root_table_index = root.partition.table_index,
         .root_offset = root_offset,

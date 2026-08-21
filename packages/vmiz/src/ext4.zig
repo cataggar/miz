@@ -1492,6 +1492,15 @@ fn resizeGeneral(
     const old_gdt_blocks = blocksForBytes(desc_bytes_old, default_block_size);
     const new_gdt_blocks = blocksForBytes(desc_bytes_new, default_block_size);
     const reserved_gdt_blocks = readInt(u16, sb[0xCE..0xD0]);
+    // Consuming reserved GDT blocks requires extending inode 7's extent
+    // tree and decrementing s_reserved_gdt_blocks. This native path never
+    // edits that inode; refuse before any write rather than handing back a
+    // filesystem whose primary and sparse-super backup reservations disagree.
+    if (compat & feature_compat_resize_inode != 0 and
+        new_gdt_blocks > old_gdt_blocks)
+    {
+        return error.UnsupportedResizeLayout;
+    }
     if (new_gdt_blocks > old_gdt_blocks + reserved_gdt_blocks) {
         return error.UnsupportedResizeLayout;
     }
@@ -1519,6 +1528,7 @@ fn resizeGeneral(
 
     var uuid: [16]u8 = undefined;
     @memcpy(&uuid, sb[0x68..0x78]);
+    const checksum_seed = checksumSeed(&sb, uuid, incompat);
     var free_blocks: u64 =
         readInt(u32, sb[0x0C..0x10]) +
         if (incompat & feature_incompat_64bit != 0)
@@ -1591,8 +1601,8 @@ fn resizeGeneral(
             else
                 0;
         writeDescriptorCounts(descriptor, descriptor_size, old_free_blocks + @as(u32, @intCast(added)), old_free_inodes, old_used_dirs);
-        writeDescriptorBitmapChecksums(descriptor, descriptor_size, uuid, &bitmap, &inode_bitmap_bytes);
-        setGeneralDescriptorChecksum(descriptor, descriptor_size, uuid, old_last_group);
+        writeDescriptorBitmapChecksums(descriptor, descriptor_size, checksum_seed, &bitmap, &inode_bitmap_bytes);
+        setGeneralDescriptorChecksum(descriptor, descriptor_size, checksum_seed, old_last_group);
     }
 
     var group_index = old_group_count;
@@ -1650,11 +1660,11 @@ fn resizeGeneral(
         writeDescriptorBitmapChecksums(
             descriptor,
             descriptor_size,
-            uuid,
+            checksum_seed,
             &block_bitmap_bytes,
             &inode_bitmap_bytes,
         );
-        setGeneralDescriptorChecksum(descriptor, descriptor_size, uuid, group_index);
+        setGeneralDescriptorChecksum(descriptor, descriptor_size, checksum_seed, group_index);
         free_blocks += group_block_count - metadata_blocks;
         free_inodes += inodes_per_group;
     }
@@ -1771,12 +1781,12 @@ fn writeDescriptorCounts(
 fn writeDescriptorBitmapChecksums(
     descriptor: []u8,
     descriptor_size: u16,
-    uuid: [16]u8,
+    checksum_seed: u32,
     block_bitmap: []const u8,
     inode_bitmap: []const u8,
 ) void {
-    const block_checksum = bitmapChecksum(uuid, block_bitmap, block_bitmap.len);
-    const inode_checksum = bitmapChecksum(uuid, inode_bitmap, inode_bitmap.len);
+    const block_checksum = ext4Crc32cSeed(checksum_seed, &.{block_bitmap});
+    const inode_checksum = ext4Crc32cSeed(checksum_seed, &.{inode_bitmap});
     writeInt(u16, descriptor[0x18..0x1A], @truncate(block_checksum));
     writeInt(u16, descriptor[0x1A..0x1C], @truncate(inode_checksum));
     if (descriptor_size == 64) {
@@ -1788,13 +1798,12 @@ fn writeDescriptorBitmapChecksums(
 fn setGeneralDescriptorChecksum(
     descriptor: []u8,
     descriptor_size: u16,
-    uuid: [16]u8,
+    checksum_seed: u32,
     group: u32,
 ) void {
     var group_le = std.mem.nativeToLittle(u32, group);
     writeInt(u16, descriptor[0x1E..0x20], 0);
-    const checksum = ext4Crc32c(&.{
-        &uuid,
+    const checksum = ext4Crc32cSeed(checksum_seed, &.{
         std.mem.asBytes(&group_le),
         descriptor[0..descriptor_size],
     });
@@ -7436,18 +7445,33 @@ fn sortXattrEntries(entries: []XattrBlockEntry) void {
     }
 }
 
-const Ext4Crc32c = std.hash.crc.Crc(u32, .{
-    .polynomial = 0x1edc6f41,
-    .initial = 0xffff_ffff,
-    .reflect_input = true,
-    .reflect_output = true,
-    .xor_output = 0x0000_0000,
-});
+fn ext4Crc32cSeed(seed: u32, chunks: []const []const u8) u32 {
+    var crc = seed;
+    for (chunks) |chunk| {
+        for (chunk) |byte| {
+            crc ^= byte;
+            var bit: u8 = 0;
+            while (bit < 8) : (bit += 1) {
+                crc = (crc >> 1) ^ ((crc & 1) *% 0x82F6_3B78);
+            }
+        }
+    }
+    return crc;
+}
 
 fn ext4Crc32c(chunks: []const []const u8) u32 {
-    var hasher = Ext4Crc32c.init();
-    for (chunks) |chunk| hasher.update(chunk);
-    return hasher.final();
+    return ext4Crc32cSeed(0xffff_ffff, chunks);
+}
+
+fn checksumSeed(
+    sb: *const [superblock_size]u8,
+    uuid: [16]u8,
+    incompat: u32,
+) u32 {
+    if (incompat & feature_incompat_csum_seed != 0) {
+        return readInt(u32, sb[0x270..0x274]);
+    }
+    return ext4Crc32c(&.{&uuid});
 }
 
 fn xattrEntryHash(name: []const u8, value: []const u8) u32 {
@@ -10114,6 +10138,125 @@ test "resize supports a resize_inode filesystem without moving its data" {
 
     const grown = try resize(io, file, std.testing.allocator, .{ .length = 128 * 1024 * 1024 });
     try std.testing.expectEqual(@as(u32, 32768), grown.block_count);
+}
+
+test "resize uses a metadata checksum seed for stock group metadata" {
+    const io = std.testing.io;
+    const path = "test-ext4-resize-csum-seed.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = journalTestTree();
+    tree.bind();
+    const old_length: u64 = 64 * 1024 * 1024;
+    const new_length: u64 = 256 * 1024 * 1024;
+    const checksum_seed: u32 = 0x1234_5678;
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = old_length,
+        .uuid = journal_test_uuid,
+    });
+
+    var sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &sb, superblock_offset);
+    writeInt(u32, sb[0x5C..0x60], readInt(u32, sb[0x5C..0x60]) | feature_compat_resize_inode);
+    writeInt(u32, sb[0x60..0x64], readInt(u32, sb[0x60..0x64]) |
+        feature_incompat_64bit | feature_incompat_flex_bg | feature_incompat_csum_seed);
+    writeInt(u16, sb[0xCE..0xD0], 1);
+    writeInt(u16, sb[0xFE..0x100], 64);
+    writeInt(u32, sb[0x270..0x274], checksum_seed);
+
+    var gdt: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+    _ = try file.readPositionalAll(io, &gdt, default_block_size);
+    var original_descriptor: [32]u8 = undefined;
+    @memcpy(&original_descriptor, gdt[0..32]);
+    @memset(&gdt, 0);
+    @memcpy(gdt[0..32], &original_descriptor);
+    const descriptor = gdt[0..64];
+    var block_bitmap: [default_block_size]u8 = undefined;
+    var inode_bitmap: [default_block_size]u8 = undefined;
+    _ = try file.readPositionalAll(
+        io,
+        &block_bitmap,
+        @as(u64, ext4DescriptorBlock(descriptor, 64, feature_incompat_64bit, 0)) * default_block_size,
+    );
+    _ = try file.readPositionalAll(
+        io,
+        &inode_bitmap,
+        @as(u64, ext4DescriptorBlock(descriptor, 64, feature_incompat_64bit, 1)) * default_block_size,
+    );
+    writeDescriptorBitmapChecksums(descriptor, 64, checksum_seed, &block_bitmap, &inode_bitmap);
+    setGeneralDescriptorChecksum(descriptor, 64, checksum_seed, 0);
+    try file.writePositionalAll(io, &gdt, default_block_size);
+    setSuperblockChecksum(&sb);
+    try file.writePositionalAll(io, &sb, superblock_offset);
+
+    _ = try resize(io, file, std.testing.allocator, .{ .length = new_length });
+
+    var group: u32 = 0;
+    while (group < 2) : (group += 1) {
+        var backup_gdt: [default_block_size]u8 = undefined;
+        const gdt_offset = if (group == 0)
+            @as(u64, default_block_size)
+        else
+            (@as(u64, group) * default_blocks_per_group + 1) * default_block_size;
+        _ = try file.readPositionalAll(io, &backup_gdt, gdt_offset);
+        const group_descriptor = backup_gdt[@as(usize, group) * 64 ..][0..64];
+        const block_bitmap_block = ext4DescriptorBlock(group_descriptor, 64, feature_incompat_64bit, 0);
+        const inode_bitmap_block = ext4DescriptorBlock(group_descriptor, 64, feature_incompat_64bit, 1);
+        _ = try file.readPositionalAll(io, &block_bitmap, block_bitmap_block * default_block_size);
+        _ = try file.readPositionalAll(io, &inode_bitmap, inode_bitmap_block * default_block_size);
+        const block_checksum = ext4Crc32cSeed(checksum_seed, &.{&block_bitmap});
+        const inode_checksum = ext4Crc32cSeed(checksum_seed, &.{&inode_bitmap});
+        try std.testing.expectEqual(@as(u16, @truncate(block_checksum)), readInt(u16, group_descriptor[0x18..0x1A]));
+        try std.testing.expectEqual(@as(u16, @truncate(inode_checksum)), readInt(u16, group_descriptor[0x1A..0x1C]));
+        try std.testing.expectEqual(@as(u16, @truncate(block_checksum >> 16)), readInt(u16, group_descriptor[0x38..0x3A]));
+        try std.testing.expectEqual(@as(u16, @truncate(inode_checksum >> 16)), readInt(u16, group_descriptor[0x3A..0x3C]));
+
+        var descriptor_copy: [64]u8 = undefined;
+        @memcpy(&descriptor_copy, group_descriptor);
+        const stored_descriptor_checksum = readInt(u16, descriptor_copy[0x1E..0x20]);
+        writeInt(u16, descriptor_copy[0x1E..0x20], 0);
+        var group_le = std.mem.nativeToLittle(u32, group);
+        const expected_descriptor_checksum = ext4Crc32cSeed(checksum_seed, &.{
+            std.mem.asBytes(&group_le),
+            &descriptor_copy,
+        });
+        try std.testing.expectEqual(
+            @as(u16, @truncate(expected_descriptor_checksum)),
+            stored_descriptor_checksum,
+        );
+    }
+}
+
+test "resize refuses resize_inode GDT expansion before mutation" {
+    const io = std.testing.io;
+    const path = "test-ext4-resize-inode-gdt-expansion.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = journalTestTree();
+    tree.bind();
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = 64 * 1024 * 1024,
+        .uuid = journal_test_uuid,
+    });
+    var sb_before: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &sb_before, superblock_offset);
+    writeInt(u32, sb_before[0x5C..0x60], readInt(u32, sb_before[0x5C..0x60]) | feature_compat_resize_inode);
+    writeInt(u32, sb_before[0x60..0x64], readInt(u32, sb_before[0x60..0x64]) | feature_incompat_64bit);
+    writeInt(u16, sb_before[0xCE..0xD0], 1);
+    writeInt(u16, sb_before[0xFE..0x100], 64);
+    try file.writePositionalAll(io, &sb_before, superblock_offset);
+
+    try std.testing.expectError(
+        error.UnsupportedResizeLayout,
+        resize(io, file, std.testing.allocator, .{ .length = 9 * 1024 * 1024 * 1024 }),
+    );
+    var sb_after: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &sb_after, superblock_offset);
+    try std.testing.expectEqualSlices(u8, &sb_before, &sb_after);
 }
 
 test "a journalled image is a distinct profile the strict scan refuses" {
