@@ -275,6 +275,9 @@ pub const Executor = struct {
         timeout_ms: u64,
     ) !CommandResult {
         if (builtin.os.tag != .linux) return error.UnsupportedHost;
+        const host_timeout_ms = self.options.supervisor_timeout_ms_override orelse
+            (std.math.add(u64, timeout_ms, cleanup_timeout_ms) catch return error.TimeoutOutOfRange);
+        const supervisor_deadline = try makeSupervisorDeadline(self.io, host_timeout_ms);
         // The namespace's first child is chrooted before this script can
         // mount /proc or run guest code. The host-side `std.process.run`
         // timeout supervises the whole unshare process; the in-namespace
@@ -378,7 +381,7 @@ pub const Executor = struct {
         try environment.put("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
         try environment.put("TERM", "dumb");
         try environment.put("DEBIAN_FRONTEND", "noninteractive");
-        const result = try self.runSupervised(argv.items, &environment, timeout_ms);
+        const result = try self.runSupervised(argv.items, &environment, supervisor_deadline);
         return result;
     }
 
@@ -386,7 +389,7 @@ pub const Executor = struct {
         self: *Executor,
         argv: []const []const u8,
         environment: *std.process.Environ.Map,
-        timeout_ms: u64,
+        deadline: Io.Timeout,
     ) !CommandResult {
         var child = try std.process.spawn(self.io, .{
             .argv = argv,
@@ -395,6 +398,11 @@ pub const Executor = struct {
             .stdout = .pipe,
             .stderr = .pipe,
         });
+        var child_active = true;
+        defer if (child_active) {
+            killProcessGroup(&child);
+            child.kill(self.io);
+        };
         var multi_reader_buffer: Io.File.MultiReader.Buffer(2) = undefined;
         var multi_reader: Io.File.MultiReader = undefined;
         multi_reader.init(
@@ -406,15 +414,6 @@ pub const Executor = struct {
         defer multi_reader.deinit();
         const stdout_reader = multi_reader.reader(0);
         const stderr_reader = multi_reader.reader(1);
-        const host_timeout_ms = self.options.supervisor_timeout_ms_override orelse
-            (std.math.add(u64, timeout_ms, cleanup_timeout_ms) catch return error.TimeoutOutOfRange);
-        const timeout: Io.Timeout = .{ .duration = .{
-            .raw = std.Io.Duration.fromMilliseconds(
-                std.math.cast(i64, host_timeout_ms) orelse return error.TimeoutOutOfRange,
-            ),
-            .clock = .awake,
-        } };
-        const deadline = timeout.toDeadline(self.io);
         while (multi_reader.fill(64, deadline)) |_| {
             if (stdout_reader.buffered().len > 4 * 1024 * 1024 or
                 stderr_reader.buffered().len > 4 * 1024 * 1024)
@@ -461,6 +460,7 @@ pub const Executor = struct {
             }
             return err;
         };
+        child_active = false;
         const stdout = try multi_reader.toOwnedSlice(0);
         errdefer self.allocator.free(stdout);
         const stderr = try multi_reader.toOwnedSlice(1);
@@ -487,6 +487,14 @@ fn killProcessGroup(child: *std.process.Child) void {
     const pid = child.id orelse return;
     _ = std.os.linux.kill(-@as(i32, @intCast(pid)), .TERM);
     _ = std.os.linux.kill(-@as(i32, @intCast(pid)), .KILL);
+}
+
+fn makeSupervisorDeadline(io: Io, timeout_ms: u64) !Io.Timeout {
+    const milliseconds = std.math.cast(i64, timeout_ms) orelse return error.TimeoutOutOfRange;
+    return (Io.Timeout{ .duration = .{
+        .raw = std.Io.Duration.fromMilliseconds(milliseconds),
+        .clock = .awake,
+    } }).toDeadline(io);
 }
 
 fn waitUntilDeadline(
@@ -1305,6 +1313,31 @@ test "offline executor enforces architecture, allowlist, timeout, and failure" {
     const foreign: Architecture = if (host == .x86_64) .aarch64 else .x86_64;
     var test_root = try Root.init(std.testing.allocator, std.testing.io, "/", .{});
     defer test_root.deinit();
+    var invalid_override = try Executor.init(std.testing.allocator, std.testing.io, .{
+        .root = &test_root,
+        .architecture = host,
+        .require_privileged_namespace = false,
+        .supervisor_timeout_ms_override = std.math.maxInt(u64),
+    });
+    defer invalid_override.deinit();
+    const before_invalid = try countOpenFds(std.testing.io);
+    for (0..8) |_| {
+        try std.testing.expectError(
+            error.TimeoutOutOfRange,
+            invalid_override.runIsolated(&.{ "/bin/sh", "-c", "exit 0" }, 1000),
+        );
+    }
+    try std.testing.expectEqual(before_invalid, try countOpenFds(std.testing.io));
+    var overflow_timeout = try Executor.init(std.testing.allocator, std.testing.io, .{
+        .root = &test_root,
+        .architecture = host,
+        .require_privileged_namespace = false,
+    });
+    defer overflow_timeout.deinit();
+    try std.testing.expectError(
+        error.TimeoutOutOfRange,
+        overflow_timeout.runIsolated(&.{ "/bin/sh", "-c", "exit 0" }, std.math.maxInt(u64)),
+    );
     try std.testing.expectError(error.ArchitectureMismatch, Executor.init(
         std.testing.allocator,
         std.testing.io,
