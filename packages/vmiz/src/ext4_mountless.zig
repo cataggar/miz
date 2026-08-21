@@ -124,6 +124,7 @@ fn captureHostMetadata(allocator: Allocator, io: Io, file: Io.File) Error!HostMe
     var xattr_probe: [1]u8 = undefined;
     const xattr_bytes = linux.flistxattr(file.handle, &xattr_probe, 0);
     if (failedLinuxSyscall(xattr_bytes)) return error.HostMetadataPreservationFailed;
+    if (xattr_bytes > max_host_xattr_bytes) return error.HostMetadataPreservationFailed;
     const names = try allocator.alloc(u8, @intCast(xattr_bytes));
     defer allocator.free(names);
     const names_len = if (names.len == 0) 0 else blk: {
