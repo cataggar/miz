@@ -374,21 +374,21 @@ pub const Root = struct {
     io: Io,
     root_path: []const u8,
     root_dir: Io.Dir,
+    root_inode: Io.File.INode,
     limits: Limits = .{},
 
     pub fn init(allocator: Allocator, io: Io, root_path: []const u8, limits: Limits) !Root {
         if (!std.fs.path.isAbsolute(root_path)) return error.RootPathMustBeAbsolute;
-        const stat = try Io.Dir.cwd().statFile(io, root_path, .{ .follow_symlinks = false });
+        var root_dir = try openRootPathNoFollow(io, root_path);
+        errdefer root_dir.close(io);
+        const stat = try root_dir.stat(io);
         if (stat.kind != .directory) return error.RootNotDirectory;
-        const root_dir = try Io.Dir.openDirAbsolute(io, root_path, .{
-            .access_sub_paths = true,
-            .iterate = true,
-        });
         return .{
             .allocator = allocator,
             .io = io,
             .root_path = root_path,
             .root_dir = root_dir,
+            .root_inode = stat.inode,
             .limits = limits,
         };
     }
@@ -602,15 +602,24 @@ pub const Root = struct {
     }
 
     fn duplicateRootDir(self: *Root) !Io.Dir {
-        if (comptime builtin.os.tag == .linux) {
+        const duplicate = if (comptime builtin.os.tag == .linux) blk: {
             const result = std.os.linux.dup(self.root_dir.handle);
             if (@as(isize, @bitCast(result)) < 0) return error.RootFdDupFailed;
-            return .{ .handle = @intCast(result) };
-        }
-        return Io.Dir.openDirAbsolute(self.io, self.root_path, .{
+            break :blk Io.Dir{ .handle = @intCast(result) };
+        } else try self.root_dir.openDir(self.io, ".", .{
             .access_sub_paths = true,
             .iterate = true,
+            .follow_symlinks = false,
         });
+        const stat = duplicate.stat(self.io) catch |err| {
+            duplicate.close(self.io);
+            return err;
+        };
+        if (stat.kind != .directory or stat.inode != self.root_inode) {
+            duplicate.close(self.io);
+            return error.RootDescriptorChanged;
+        }
+        return duplicate;
     }
 
     fn openDirectoryPath(self: *Root, relative: []const u8, create_missing: bool) !Io.Dir {
@@ -705,6 +714,33 @@ fn wildcardMatch(pattern: []const u8, value: []const u8) bool {
     return std.mem.eql(u8, pattern, value);
 }
 
+fn openRootPathNoFollow(io: Io, absolute_path: []const u8) !Io.Dir {
+    var current = try Io.Dir.openDirAbsolute(io, "/", .{
+        .access_sub_paths = true,
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    var components = std.mem.splitScalar(u8, absolute_path[1..], '/');
+    while (components.next()) |component| {
+        if (component.len == 0) continue;
+        if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) {
+            current.close(io);
+            return error.InvalidRootPath;
+        }
+        const next = current.openDir(io, component, .{
+            .access_sub_paths = true,
+            .iterate = true,
+            .follow_symlinks = false,
+        }) catch |err| {
+            current.close(io);
+            return err;
+        };
+        current.close(io);
+        current = next;
+    }
+    return current;
+}
+
 test "offline root rejects traversal and wildcard ambiguity" {
     try std.testing.expectError(error.InvalidGuestPath, normalizeGuestPath("/etc/../shadow"));
     try std.testing.expectError(error.InvalidDiscoveryPattern, blk: {
@@ -713,6 +749,7 @@ test "offline root rejects traversal and wildcard ambiguity" {
             .io = undefined,
             .root_path = "/",
             .root_dir = undefined,
+            .root_inode = undefined,
         };
         break :blk root.discover("/", "a*b*c");
     });
@@ -735,6 +772,87 @@ test "offline command validation is fail closed" {
         defer args.deinit();
         break :blk executor.appendCommand(&args, .{ .update_initramfs = "../bad" });
     });
+}
+
+test "offline root initialization rejects a symlinked root path" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const target = try std.fs.path.join(allocator, &.{ cwd, "test-offline-root-init-target" });
+    defer allocator.free(target);
+    const link = try std.fs.path.join(allocator, &.{ cwd, "test-offline-root-init-link" });
+    defer allocator.free(link);
+    Io.Dir.cwd().deleteTree(io, target) catch {};
+    Io.Dir.cwd().deleteFile(io, link) catch {};
+    defer Io.Dir.cwd().deleteTree(io, target) catch {};
+    defer Io.Dir.cwd().deleteFile(io, link) catch {};
+    try Io.Dir.cwd().createDirPath(io, target);
+    try Io.Dir.cwd().symLink(io, target, link, .{});
+    const opened = Root.init(allocator, io, link, .{}) catch |err| {
+        try std.testing.expect(err == error.NotDir or err == error.SymLinkLoop or err == error.GuestSymlinkTraversal);
+        return;
+    };
+    var accepted = opened;
+    accepted.deinit();
+    return error.RootSymlinkAccepted;
+}
+
+const RootInitRace = struct {
+    link: []const u8,
+    outside: []const u8,
+    stop: *std.atomic.Value(bool),
+    io: Io,
+
+    fn run(self: *RootInitRace) void {
+        while (!self.stop.load(.acquire)) {
+            Io.Dir.cwd().deleteTree(self.io, self.link) catch {};
+            Io.Dir.cwd().symLink(self.io, self.outside, self.link, .{}) catch {};
+            Io.Dir.cwd().deleteFile(self.io, self.link) catch {};
+            Io.Dir.cwd().createDirPath(self.io, self.link) catch {};
+        }
+    }
+};
+
+test "offline root init never follows a concurrently replaced root path" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const target = try std.fs.path.join(allocator, &.{ cwd, "test-offline-root-init-race-target" });
+    defer allocator.free(target);
+    const outside = try std.fs.path.join(allocator, &.{ cwd, "test-offline-root-init-race-outside" });
+    defer allocator.free(outside);
+    const link = try std.fs.path.join(allocator, &.{ cwd, "test-offline-root-init-race-link" });
+    defer allocator.free(link);
+    Io.Dir.cwd().deleteTree(io, target) catch {};
+    Io.Dir.cwd().deleteTree(io, outside) catch {};
+    Io.Dir.cwd().deleteTree(io, link) catch {};
+    defer Io.Dir.cwd().deleteTree(io, target) catch {};
+    defer Io.Dir.cwd().deleteTree(io, outside) catch {};
+    defer Io.Dir.cwd().deleteTree(io, link) catch {};
+    try Io.Dir.cwd().createDirPath(io, target);
+    try Io.Dir.cwd().createDirPath(io, outside);
+    try Io.Dir.cwd().createDirPath(io, link);
+    const outside_stat = try Io.Dir.cwd().statFile(io, outside, .{ .follow_symlinks = false });
+
+    var stop = std.atomic.Value(bool).init(false);
+    var race = RootInitRace{ .link = link, .outside = outside, .stop = &stop, .io = io };
+    var thread = try std.Thread.spawn(.{}, RootInitRace.run, .{&race});
+    for (0..128) |_| {
+        if (Root.init(allocator, io, link, .{})) |opened| {
+            var root = opened;
+            if (root.root_inode == outside_stat.inode) {
+                root.deinit();
+                stop.store(true, .release);
+                thread.join();
+                return error.RootInitEscapedToOutside;
+            }
+            root.deinit();
+        } else |_| {}
+    }
+    stop.store(true, .release);
+    thread.join();
 }
 
 test "offline root applies structured operations and cleans up" {

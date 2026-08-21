@@ -117,6 +117,9 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
             native,
         )
         self.assertIn('sudo rm -rf -- "$fixture"', native)
+        self.assertNotIn("/usr/bin/coreutils", native)
+        self.assertIn('ldd "$binary"', native)
+        self.assertIn("while read -r library", native)
 
 
 if __name__ == "__main__":

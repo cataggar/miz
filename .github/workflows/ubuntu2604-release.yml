@@ -461,14 +461,16 @@ jobs:
           sudo mkdir -p -- "$fixture"/{bin,usr/bin,lib64,dev,proc,sys,run,tmp,etc}
           sudo cp /bin/bash "$fixture/bin/bash"
           sudo ln -s bash "$fixture/bin/sh"
-          for tool in coreutils mount umount setpriv mknod chmod sleep timeout; do
-            sudo cp "/usr/bin/$tool" "$fixture/usr/bin/$tool"
+          for tool in chmod env mount umount setpriv mknod sleep timeout; do
+            executable=$(readlink -f "/usr/bin/$tool")
+            test -x "$executable"
+            sudo cp "$executable" "$fixture/usr/bin/$tool"
           done
-          for binary in /bin/bash /usr/bin/coreutils /usr/bin/mount /usr/bin/umount /usr/bin/setpriv; do
+          for binary in /bin/bash /usr/bin/env /usr/bin/mount /usr/bin/umount /usr/bin/setpriv; do
             sudo cp --parents "$binary" "$fixture"
             while read -r library; do
               [[ -z "$library" ]] || sudo cp --parents "$library" "$fixture"
-            done < <(ldd "$binary" | sed -nE 's/.*=> (\/[^ ]+).*/\1/p; s/^(\/[^ ]+) \(0x.*/\1/p')
+            done < <(ldd "$binary" | sed -nE 's/.*=>[[:space:]]*(\/[^ ]+).*/\1/p; s/^[[:space:]]*(\/[^ ]+)[[:space:]].*/\1/p')
           done
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
