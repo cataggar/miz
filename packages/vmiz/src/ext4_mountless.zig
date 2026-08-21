@@ -1191,6 +1191,7 @@ pub const FileSystem = struct {
                 commit_profile.checksum_seed
             else
                 null,
+            .preserve_orphan_file_inode = self.identity.orphan_file_inode,
         });
         try purgeHostXattrsNotInSource(self.allocator, stage_file, &host_metadata);
         try applyHostMetadata(self.io, stage_file, &host_metadata);
@@ -1841,6 +1842,7 @@ test "mountless commit preserves the pinned Ubuntu descriptor-64 profile" {
     try std.testing.expectEqual(@as(u32, 0x103c), identity.feature_compat);
     try std.testing.expectEqual(@as(u32, 0x22c2), identity.feature_incompat);
     try std.testing.expectEqual(@as(u32, 0x046b), identity.feature_ro_compat);
+    const source_orphan_inode = identity.orphan_file_inode orelse return error.UnsupportedCommitProfile;
     try fs.write("/etc/os-release", "NAME=vmiz-pinned\n", null);
     var commit_result = try fs.commit();
     defer commit_result.deinit();
@@ -1867,6 +1869,10 @@ test "mountless commit preserves the pinned Ubuntu descriptor-64 profile" {
     try std.testing.expectEqual(@as(u32, 0x103c), reopened.filesystemIdentity().feature_compat);
     try std.testing.expectEqual(@as(u32, 0x22c2), reopened.filesystemIdentity().feature_incompat);
     try std.testing.expectEqual(@as(u32, 0x046b), reopened.filesystemIdentity().feature_ro_compat);
+    try std.testing.expectEqual(
+        @as(?u32, source_orphan_inode),
+        reopened.filesystemIdentity().orphan_file_inode,
+    );
     const content = try reopened.read(allocator, "/etc/os-release", 64);
     defer allocator.free(content);
     try std.testing.expectEqualStrings("NAME=vmiz-pinned\n", content);
