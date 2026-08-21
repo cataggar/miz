@@ -368,8 +368,8 @@ jobs:
       - name: Clean privileged build state
         if: always()
         run: |
-          sudo rm -rf -- "$WORK_DIR"
-          rm -rf -- "$BUNDLE_DIR" "$SIGNING_PROBE_DIR"
+          sudo rm -rf -- "$WORK_DIR" "$BUNDLE_DIR"
+          rm -rf -- "$SIGNING_PROBE_DIR"
           rm -f -- "${UKI_SIGNING_CERTIFICATE:-}"
 
   native_qemu:
