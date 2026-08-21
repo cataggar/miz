@@ -11,6 +11,7 @@ const Dir = Io.Dir;
 const File = Io.File;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const image = @import("image.zig");
+const qcow2 = @import("qcow2.zig");
 const gpt = @import("gpt.zig");
 const guid = @import("guid.zig");
 const vhd = @import("vhd.zig");
@@ -480,7 +481,7 @@ pub const FinalizeQcow2Options = struct {
     max_virtual_size: u64,
     output_path: []const u8,
     max_output_size: u64,
-    qemu_img_path: []const u8,
+    qemu_img_path: []const u8 = "",
     compression: Qcow2Compression = .zstd,
     cluster_size: u32 = 64 * 1024,
     convert_environ_map: ?*const std.process.Environ.Map = null,
@@ -738,16 +739,20 @@ pub fn decompressXz(
 }
 
 /// Convert a standalone raw or qcow2 source into a standalone qcow2 output.
-/// On Linux, both source and stage are passed to qemu-img through inherited
-/// descriptors; the shared paths are never reopened by the child. Publication
-/// occurs only after qemu-img and native vmiz validation succeed.
+/// zstd output is emitted natively by the in-tree compressed qcow2 writer and
+/// never invokes qemu-img; other compression types fall back to qemu-img
+/// through inherited descriptors (the shared paths are never reopened by the
+/// child). Publication occurs only after native vmiz validation succeeds (plus
+/// an independent qemu-img check for the non-native fallback path).
 pub fn finalizeQcow2(
     allocator: Allocator,
     io: Io,
     options: FinalizeQcow2Options,
 ) !FinalizedQcow2 {
     if (builtin.os.tag != .linux) return error.UnsupportedHost;
-    if (options.qemu_img_path.len == 0) return error.InvalidQemuImgPath;
+    if (options.compression != .zstd and options.qemu_img_path.len == 0) {
+        return error.InvalidQemuImgPath;
+    }
     if (options.max_input_size == 0) return error.InvalidInputSizeLimit;
     if (options.max_virtual_size == 0) return error.InvalidVirtualSizeLimit;
     if (options.max_output_size == 0) return error.InvalidOutputSizeLimit;
@@ -825,68 +830,103 @@ pub fn finalizeQcow2(
     });
     defer stage.deinit(io);
 
-    const create_options = if (options.compression.qemuName()) |compression|
-        try std.fmt.allocPrint(
+    if (options.compression == .zstd) {
+        const cluster_bits: u32 = std.math.log2_int(u32, options.cluster_size);
+        switch (options.source_format) {
+            .raw => {
+                var source_ctx = qcow2.RawSourceContext{
+                    .file = source_handle,
+                    .readable_len = source_stat.size,
+                };
+                _ = try qcow2.writeStandaloneCompressed(
+                    allocator,
+                    io,
+                    stage.file,
+                    virtual_size,
+                    source_ctx.reader(),
+                    .{ .cluster_bits = cluster_bits },
+                );
+            },
+            .qcow2 => {
+                var source_ctx = qcow2.Qcow2SourceContext{
+                    .file = source_handle,
+                    .info = &source_image.?.qcow2.?,
+                };
+                _ = try qcow2.writeStandaloneCompressed(
+                    allocator,
+                    io,
+                    stage.file,
+                    virtual_size,
+                    source_ctx.reader(),
+                    .{ .cluster_bits = cluster_bits },
+                );
+            },
+        }
+        try validateStageBounded(io, stage.file, options.max_output_size);
+    } else {
+        const create_options = if (options.compression.qemuName()) |compression|
+            try std.fmt.allocPrint(
+                allocator,
+                "compression_type={s},cluster_size={d}",
+                .{ compression, options.cluster_size },
+            )
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "cluster_size={d}",
+                .{options.cluster_size},
+            );
+        defer allocator.free(create_options);
+        const virtual_size_text = try std.fmt.allocPrint(
             allocator,
-            "compression_type={s},cluster_size={d}",
-            .{ compression, options.cluster_size },
-        )
-    else
-        try std.fmt.allocPrint(
-            allocator,
-            "cluster_size={d}",
-            .{options.cluster_size},
+            "{d}",
+            .{virtual_size},
         );
-    defer allocator.free(create_options);
-    const virtual_size_text = try std.fmt.allocPrint(
-        allocator,
-        "{d}",
-        .{virtual_size},
-    );
-    defer allocator.free(virtual_size_text);
+        defer allocator.free(virtual_size_text);
 
-    try runQemuImg(io, .{
-        .argv = &.{
+        try runQemuImg(io, .{
+            .argv = &.{
+                options.qemu_img_path,
+                "create",
+                "-q",
+                "-f",
+                "qcow2",
+                "-o",
+                create_options,
+                "/proc/self/fd/1",
+                virtual_size_text,
+            },
+            .stdin = .ignore,
+            .stdout = .{ .file = stage.file },
+            .failure = error.QemuImgCreateFailed,
+        });
+        try validateStageBounded(io, stage.file, options.max_output_size);
+
+        var convert_argv: std.array_list.Managed([]const u8) = .init(allocator);
+        defer convert_argv.deinit();
+        try convert_argv.appendSlice(&.{
             options.qemu_img_path,
-            "create",
+            "convert",
+            "--target-image-opts",
+            "-n",
             "-q",
+        });
+        if (options.compression != .none) try convert_argv.append("-c");
+        try convert_argv.appendSlice(&.{
             "-f",
-            "qcow2",
-            "-o",
-            create_options,
-            "/proc/self/fd/1",
-            virtual_size_text,
-        },
-        .stdin = .ignore,
-        .stdout = .{ .file = stage.file },
-        .failure = error.QemuImgCreateFailed,
-    });
-    try validateStageBounded(io, stage.file, options.max_output_size);
-
-    var convert_argv: std.array_list.Managed([]const u8) = .init(allocator);
-    defer convert_argv.deinit();
-    try convert_argv.appendSlice(&.{
-        options.qemu_img_path,
-        "convert",
-        "--target-image-opts",
-        "-n",
-        "-q",
-    });
-    if (options.compression != .none) try convert_argv.append("-c");
-    try convert_argv.appendSlice(&.{
-        "-f",
-        options.source_format.qemuName(),
-        "/proc/self/fd/0",
-        "driver=qcow2,file.driver=file,file.filename=/proc/self/fd/1",
-    });
-    try runQemuImg(io, .{
-        .argv = convert_argv.items,
-        .stdin = .{ .file = source_handle },
-        .stdout = .{ .file = stage.file },
-        .environ_map = options.convert_environ_map,
-        .failure = error.QemuImgConvertFailed,
-    });
-    try validateStageBounded(io, stage.file, options.max_output_size);
+            options.source_format.qemuName(),
+            "/proc/self/fd/0",
+            "driver=qcow2,file.driver=file,file.filename=/proc/self/fd/1",
+        });
+        try runQemuImg(io, .{
+            .argv = convert_argv.items,
+            .stdin = .{ .file = source_handle },
+            .stdout = .{ .file = stage.file },
+            .environ_map = options.convert_environ_map,
+            .failure = error.QemuImgConvertFailed,
+        });
+        try validateStageBounded(io, stage.file, options.max_output_size);
+    }
 
     if (!sameFileSnapshot(source_stat, try source_handle.stat(io))) {
         return error.InputChanged;
@@ -904,20 +944,22 @@ pub fn finalizeQcow2(
         return error.InputChanged;
     }
 
-    try runQemuImg(io, .{
-        .argv = &.{
-            options.qemu_img_path,
-            "check",
-            "-q",
-            "-f",
-            "qcow2",
-            "/proc/self/fd/0",
-        },
-        .stdin = .{ .file = stage.file },
-        .stdout = .inherit,
-        .failure = error.QemuImgCheckFailed,
-    });
-    try validateStageBounded(io, stage.file, options.max_output_size);
+    if (options.compression != .zstd) {
+        try runQemuImg(io, .{
+            .argv = &.{
+                options.qemu_img_path,
+                "check",
+                "-q",
+                "-f",
+                "qcow2",
+                "/proc/self/fd/0",
+            },
+            .stdin = .{ .file = stage.file },
+            .stdout = .inherit,
+            .failure = error.QemuImgCheckFailed,
+        });
+        try validateStageBounded(io, stage.file, options.max_output_size);
+    }
 
     const stage_reader = try openProcFdReadOnly(io, stage.file);
     var finalized = image.Image.openFile(io, stage_reader) catch |err| {
@@ -2630,7 +2672,7 @@ test "QCOW2 finalization honors an explicit raw source format" {
     try std.testing.expectEqualStrings(payload, &actual);
 }
 
-test "QCOW2 finalization preserves output when qemu-img cannot start" {
+test "QCOW2 finalization preserves output when the qemu-img fallback cannot start" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const input_path = "test-finalize-failure-input.qcow2";
@@ -2651,6 +2693,8 @@ test "QCOW2 finalization preserves output when qemu-img cannot start" {
         .data = "existing\n",
     });
 
+    // `.none` exercises the qemu-img fallback path (zstd is emitted natively),
+    // so a missing qemu-img binary must fail closed and leave the prior output.
     if (finalizeQcow2(
         std.testing.allocator,
         io,
@@ -2663,12 +2707,68 @@ test "QCOW2 finalization preserves output when qemu-img cannot start" {
             .max_virtual_size = 1024 * 1024,
             .output_path = output_path,
             .max_output_size = 2 * 1024 * 1024,
+            .compression = .none,
             .qemu_img_path = "vmiz-qemu-img-does-not-exist",
         },
     )) |_| {
         return error.ExpectedQemuImgFailure;
     } else |_| {}
     try expectFileContent(io, output_path, "existing\n");
+}
+
+test "QCOW2 finalization emits standalone zstd output natively without qemu-img" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const input_path = "test-finalize-native-input.qcow2";
+    const output_path = "test-finalize-native-output.qcow2";
+    defer Dir.cwd().deleteFile(io, output_path) catch {};
+    defer Dir.cwd().deleteFile(io, input_path) catch {};
+
+    var source = try image.Image.create(
+        io,
+        input_path,
+        .qcow2,
+        2 * 1024 * 1024,
+        .{},
+    );
+    const payload = "native zstd finalization without qemu-img";
+    try source.pwrite(io, payload, 128 * 1024);
+    source.close(io);
+    const before = try hashFile(io, input_path);
+
+    // An empty qemu_img_path proves the zstd path never shells out to qemu-img.
+    const result = try finalizeQcow2(
+        std.testing.allocator,
+        io,
+        .{
+            .input_path = input_path,
+            .expected_input_sha256 = before.sha256,
+            .max_input_size = 4 * 1024 * 1024,
+            .source_format = .qcow2,
+            .expected_virtual_size = 2 * 1024 * 1024,
+            .max_virtual_size = 2 * 1024 * 1024,
+            .output_path = output_path,
+            .max_output_size = 4 * 1024 * 1024,
+            .qemu_img_path = "",
+            .compression = .zstd,
+        },
+    );
+    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024), result.virtual_size);
+    try std.testing.expectEqual(Qcow2Compression.zstd, result.compression);
+    try std.testing.expectEqual(@as(u32, 64 * 1024), result.cluster_size);
+
+    const after = try hashFile(io, input_path);
+    try std.testing.expectEqualSlices(u8, &before.sha256, &after.sha256);
+    var finalized = try image.Image.openPathReadOnly(io, output_path);
+    defer finalized.close(io);
+    try std.testing.expectEqual(image.Format.qcow2, finalized.format);
+    try std.testing.expectEqual(@as(u8, 1), finalized.qcow2.?.compression_type);
+    try std.testing.expectEqual(@as(u16, 0), finalized.qcow2.?.backing_file_len);
+    const check = try finalized.check(io);
+    try std.testing.expect(check.ok);
+    var actual: [payload.len]u8 = undefined;
+    _ = try finalized.pread(io, &actual, 128 * 1024);
+    try std.testing.expectEqualStrings(payload, &actual);
 }
 
 test "QCOW2 finalization rejects hard-linked input and output" {

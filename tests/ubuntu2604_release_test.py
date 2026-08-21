@@ -98,19 +98,20 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, production)
 
-    def test_production_builder_has_only_documented_qemu_img_boundary(self):
+    def test_production_builder_is_fully_native_without_qemu_img(self):
         builder = (
             ROOT / "scripts" / "build_generalized_ubuntu2604.zig"
         ).read_text(encoding="utf-8")
         production = builder.split('test "profiles pin', 1)[0]
         self.assertIsNone(FORBIDDEN_PRODUCTION_TOOL.search(production))
-        self.assertEqual(production.count('"qemu-img"'), 2)
+        # Issue #476: the Ubuntu finalization emits the standalone compressed
+        # release image natively, so qemu-img/qemu-utils no longer appear in
+        # the production builder at all.
+        self.assertEqual(production.count('"qemu-img"'), 0)
+        self.assertEqual(production.count('"qemu-utils"'), 0)
+        self.assertNotIn('"qemu-img", "convert"', production)
         self.assertIn(
-            '"qemu-img", "convert"',
-            production,
-        )
-        self.assertIn(
-            "sole external image-format",
+            "vmiz.qcow2.writeStandaloneCompressed",
             production,
         )
 

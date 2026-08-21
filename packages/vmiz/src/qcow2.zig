@@ -33,6 +33,10 @@
 
 const std = @import("std");
 const Io = std.Io;
+/// Repo-local streaming zstd encoder (`zstd.zig`). Zig's standard library
+/// ships only a zstd *decoder*, so emitting compressed clusters relies on
+/// this bounded, deterministic `FrameEncoder`.
+const zstd_enc = @import("zstd.zig");
 
 pub const file_signature: [4]u8 = .{ 'Q', 'F', 'I', 0xFB };
 pub const min_cluster_bits: u32 = 9;
@@ -1902,6 +1906,380 @@ fn divCeil(numerator: u64, denominator: u64) u64 {
     return std.math.divCeil(u64, numerator, denominator) catch unreachable;
 }
 
+// ---------------------------------------------------------------------------
+// Standalone compressed-image writer
+//
+// Emits a complete, self-contained qcow2 v3 image whose allocated guest
+// clusters are stored as zstd-compressed clusters (compression_type 1) with no
+// backing file. All-zero guest clusters are left unallocated so they read back
+// as zeros, preserving sparse regions. The on-disk layout is deterministic:
+//
+//   cluster 0            header
+//   clusters [1 .. D)    compressed data, packed at 512-byte sector
+//                        granularity (a cluster may share a host cluster with
+//                        its neighbours)
+//   L2 tables            one per L1 entry that maps at least one cluster
+//   L1 table
+//   refcount table
+//   refcount blocks
+//
+// Placing the data region immediately after the header lets the encoder stream
+// each compressed cluster to disk in a single pass while the (small) metadata
+// tables are computed exactly once the final host-cluster count is known.
+// ---------------------------------------------------------------------------
+
+/// Supplies guest-visible bytes for the compressed writer. `readFn` must fill
+/// the whole `buffer`, zero-padding any tail past the source's readable size.
+pub const SourceReader = struct {
+    context: *const anyopaque,
+    readFn: *const fn (context: *const anyopaque, io: Io, offset: u64, buffer: []u8) anyerror!void,
+
+    fn readGuest(self: SourceReader, io: Io, offset: u64, buffer: []u8) anyerror!void {
+        return self.readFn(self.context, io, offset, buffer);
+    }
+};
+
+/// Pins an open raw source file for `SourceReader`. Bytes at or past
+/// `readable_len` read back as zeros.
+pub const RawSourceContext = struct {
+    file: Io.File,
+    readable_len: u64,
+
+    pub fn reader(self: *const RawSourceContext) SourceReader {
+        return .{ .context = self, .readFn = read };
+    }
+
+    fn read(context: *const anyopaque, io: Io, offset: u64, buffer: []u8) anyerror!void {
+        const self: *const RawSourceContext = @ptrCast(@alignCast(context));
+        const available: usize = if (offset >= self.readable_len)
+            0
+        else
+            @intCast(@min(@as(u64, buffer.len), self.readable_len - offset));
+        var filled: usize = 0;
+        if (available > 0) {
+            filled = try self.file.readPositionalAll(io, buffer[0..available], offset);
+        }
+        if (filled < buffer.len) @memset(buffer[filled..], 0);
+    }
+};
+
+/// Pins an opened standalone qcow2 source for `SourceReader`, reading through
+/// the native `pread` path (decompressing/zero-filling as needed).
+pub const Qcow2SourceContext = struct {
+    file: Io.File,
+    info: *const Info,
+
+    pub fn reader(self: *const Qcow2SourceContext) SourceReader {
+        return .{ .context = self, .readFn = read };
+    }
+
+    fn read(context: *const anyopaque, io: Io, offset: u64, buffer: []u8) anyerror!void {
+        const self: *const Qcow2SourceContext = @ptrCast(@alignCast(context));
+        const filled = try pread(self.file, io, self.info.*, buffer, offset);
+        if (filled < buffer.len) @memset(buffer[filled..], 0);
+    }
+};
+
+pub const WriteCompressedOptions = struct {
+    /// qcow2 compression type. Only 1 (zstd) is supported for emission.
+    compression_type: u8 = 1,
+    cluster_bits: u32 = default_cluster_bits,
+};
+
+pub const WriteCompressedError = error{
+    UnsupportedCompressionType,
+    SizeNotSectorAligned,
+    UnsupportedClusterSize,
+    ImageTooLarge,
+    /// A cluster's compressed payload needs more 512-byte sectors than the
+    /// compressed descriptor can address for this cluster size.
+    CompressedClusterTooLarge,
+    /// A compressed cluster would live past the range the descriptor's host
+    /// offset field can encode.
+    CompressedOffsetTooLarge,
+    SourceReadFailed,
+} || std.mem.Allocator.Error || Io.File.ReadPositionalError ||
+    Io.File.WritePositionalError || Io.File.SetLengthError || zstd_enc.Error;
+
+/// Number of 512-byte sectors a compressed descriptor can address for a given
+/// cluster size, and the maximum encodable host byte offset.
+const CompressedGeometry = struct {
+    offset_bits: u6,
+    sector_count_bits: u6,
+    max_sectors: u64,
+    offset_mask: u64,
+
+    fn init(cluster_bits: u32) CompressedGeometry {
+        const sector_count_bits: u6 = @intCast(cluster_bits - 8);
+        const offset_bits: u6 = @intCast(62 - (cluster_bits - 8));
+        return .{
+            .offset_bits = offset_bits,
+            .sector_count_bits = sector_count_bits,
+            .max_sectors = @as(u64, 1) << sector_count_bits,
+            .offset_mask = (@as(u64, 1) << offset_bits) - 1,
+        };
+    }
+
+    /// Builds a compressed L2 descriptor for `sectors` sectors of data at
+    /// sector-aligned byte offset `host_offset`.
+    fn encode(self: CompressedGeometry, host_offset: u64, sectors: u64) WriteCompressedError!u64 {
+        if (sectors == 0 or sectors > self.max_sectors) return error.CompressedClusterTooLarge;
+        if (host_offset > self.offset_mask) return error.CompressedOffsetTooLarge;
+        const additional_sectors = sectors - 1;
+        return compressed_mask | (additional_sectors << self.offset_bits) | host_offset;
+    }
+};
+
+fn isAllZeroBytes(bytes: []const u8) bool {
+    for (bytes) |b| if (b != 0) return false;
+    return true;
+}
+
+/// Writes a standalone zstd-compressed qcow2 image to `out_file`, drawing
+/// `virtual_size` bytes of guest data from `source`. `out_file` is truncated
+/// to the emitted image. Returns the `Info` describing what was written;
+/// callers are expected to re-open and validate the result independently.
+pub fn writeStandaloneCompressed(
+    allocator: std.mem.Allocator,
+    io: Io,
+    out_file: Io.File,
+    virtual_size: u64,
+    source: SourceReader,
+    options: WriteCompressedOptions,
+) WriteCompressedError!Info {
+    if (options.compression_type != 1) return error.UnsupportedCompressionType;
+    const cluster_bits = options.cluster_bits;
+    // Compressed descriptors need cluster_bits in [9, 21]; the sector-count
+    // field (cluster_bits - 8) must leave room for a host offset.
+    if (cluster_bits < min_cluster_bits or cluster_bits > max_cluster_bits) {
+        return error.UnsupportedClusterSize;
+    }
+    if (virtual_size % 512 != 0) return error.SizeNotSectorAligned;
+
+    const cs: u64 = @as(u64, 1) << @intCast(cluster_bits);
+    const geometry = CompressedGeometry.init(cluster_bits);
+    const l2_entries = cs / l2_entry_size;
+    const guest_clusters = divCeil(virtual_size, cs);
+    const l1_size_u64 = @max(@as(u64, 1), divCeil(guest_clusters, l2_entries));
+    const l1_size = std.math.cast(u32, l1_size_u64) orelse return error.ImageTooLarge;
+    const l1_clusters = std.math.cast(u32, divCeil(
+        std.math.mul(u64, l1_size_u64, 8) catch return error.ImageTooLarge,
+        cs,
+    )) orelse return error.ImageTooLarge;
+
+    const guest_clusters_usize = std.math.cast(usize, guest_clusters) orelse return error.ImageTooLarge;
+    const l2_map = try allocator.alloc(u64, guest_clusters_usize);
+    defer allocator.free(l2_map);
+    @memset(l2_map, 0);
+    const l1_used = try allocator.alloc(bool, l1_size);
+    defer allocator.free(l1_used);
+    @memset(l1_used, false);
+
+    const cs_usize = std.math.cast(usize, cs) orelse return error.ImageTooLarge;
+    const cluster_buf = try allocator.alloc(u8, cs_usize);
+    defer allocator.free(cluster_buf);
+    const block_size = @min(cs_usize, zstd_enc.max_block_size);
+    const block_buffer = try allocator.alloc(u8, block_size);
+    defer allocator.free(block_buffer);
+    const max_comp = std.math.cast(
+        usize,
+        zstd_enc.maxEncodedSizeForBlockSize(cs, block_size, false) catch return error.ImageTooLarge,
+    ) orelse return error.ImageTooLarge;
+    // Round the scratch buffer up to a full sector: a compressed payload may
+    // occupy up to `max_comp` bytes, and we zero-pad the tail to a 512-byte
+    // sector boundary before writing it.
+    const comp_buf_len = std.mem.alignForward(usize, max_comp, 512);
+    const comp_buf = try allocator.alloc(u8, comp_buf_len);
+    defer allocator.free(comp_buf);
+
+    // Pass 1: stream each non-zero cluster's compressed payload to disk,
+    // packed at sector granularity starting at cluster 1.
+    var data_offset: u64 = cs;
+    var guest_index: u64 = 0;
+    while (guest_index < guest_clusters) : (guest_index += 1) {
+        source.readGuest(io, guest_index * cs, cluster_buf) catch return error.SourceReadFailed;
+        if (isAllZeroBytes(cluster_buf)) continue;
+
+        var frame_writer = Io.Writer.fixed(comp_buf);
+        var encoder = try zstd_enc.FrameEncoder.init(&frame_writer, block_buffer, .{ .content_size = cs });
+        try encoder.writeAll(cluster_buf);
+        try encoder.finish();
+        const compressed_len = frame_writer.end;
+
+        const sectors = divCeil(compressed_len, 512);
+        const descriptor = try geometry.encode(data_offset, sectors);
+        l2_map[@intCast(guest_index)] = descriptor;
+        l1_used[@intCast(guest_index / l2_entries)] = true;
+
+        const stored_len: usize = @intCast(sectors * 512);
+        @memset(comp_buf[compressed_len..stored_len], 0);
+        try out_file.writePositionalAll(io, comp_buf[0..stored_len], data_offset);
+        data_offset += stored_len;
+    }
+
+    const data_end = std.mem.alignForward(u64, data_offset, cs);
+    const data_clusters = (data_end - cs) / cs;
+
+    var used_l2_count: u64 = 0;
+    for (l1_used) |used| {
+        if (used) used_l2_count += 1;
+    }
+
+    // Metadata trails the data region. rt_cluster is the first refcount-table
+    // cluster; everything before it is fixed, so only the refcount table (R)
+    // and refcount blocks (B) close the size fixpoint.
+    const first_l2_cluster = 1 + data_clusters;
+    const l1_cluster = first_l2_cluster + used_l2_count;
+    const rt_cluster = l1_cluster + l1_clusters;
+    const rb_entries = cs / 2;
+
+    var refcount_table_clusters: u64 = 1;
+    var refcount_block_count: u64 = 1;
+    while (true) {
+        const total = rt_cluster + refcount_table_clusters + refcount_block_count;
+        const need_blocks = @max(@as(u64, 1), divCeil(total, rb_entries));
+        const need_table = @max(@as(u64, 1), divCeil(need_blocks * 8, cs));
+        if (need_blocks == refcount_block_count and need_table == refcount_table_clusters) break;
+        refcount_block_count = need_blocks;
+        refcount_table_clusters = need_table;
+    }
+    const rb_cluster = rt_cluster + refcount_table_clusters;
+    const total_clusters = rb_cluster + refcount_block_count;
+    const file_size = total_clusters * cs;
+
+    // Assign each used L1 entry its L2-table cluster (ascending order).
+    const l2_offset_for = try allocator.alloc(u64, l1_size);
+    defer allocator.free(l2_offset_for);
+    @memset(l2_offset_for, 0);
+    {
+        var next_l2 = first_l2_cluster;
+        for (l1_used, 0..) |used, i| {
+            if (!used) continue;
+            l2_offset_for[i] = next_l2 * cs;
+            next_l2 += 1;
+        }
+    }
+
+    try out_file.setLength(io, file_size);
+
+    // L2 tables.
+    const l2_buf = try allocator.alloc(u8, cs_usize);
+    defer allocator.free(l2_buf);
+    for (l1_used, 0..) |used, i| {
+        if (!used) continue;
+        @memset(l2_buf, 0);
+        const base_guest = @as(u64, i) * l2_entries;
+        var j: u64 = 0;
+        while (j < l2_entries and base_guest + j < guest_clusters) : (j += 1) {
+            const descriptor = l2_map[@intCast(base_guest + j)];
+            if (descriptor != 0) {
+                std.mem.writeInt(u64, l2_buf[@intCast(j * 8)..][0..8], descriptor, .big);
+            }
+        }
+        try out_file.writePositionalAll(io, l2_buf, l2_offset_for[i]);
+    }
+
+    // L1 table.
+    const l1_bytes = std.math.cast(usize, @as(u64, l1_clusters) * cs) orelse return error.ImageTooLarge;
+    const l1_buf = try allocator.alloc(u8, l1_bytes);
+    defer allocator.free(l1_buf);
+    @memset(l1_buf, 0);
+    for (l1_used, 0..) |used, i| {
+        if (!used) continue;
+        std.mem.writeInt(u64, l1_buf[i * 8 ..][0..8], l2_offset_for[i] | copied_mask, .big);
+    }
+    try out_file.writePositionalAll(io, l1_buf, l1_cluster * cs);
+
+    // Refcounts: header, data, L2, L1, refcount table and blocks each hold a
+    // reference; a host cluster shared by adjacent compressed clusters is
+    // counted once per compressed extent (matching qemu's semantics).
+    const total_clusters_usize = std.math.cast(usize, total_clusters) orelse return error.ImageTooLarge;
+    const refcounts = try allocator.alloc(u16, total_clusters_usize);
+    defer allocator.free(refcounts);
+    @memset(refcounts, 0);
+    const bumpRefcount = struct {
+        fn call(counts: []u16, index: u64) void {
+            counts[@intCast(index)] += 1;
+        }
+    }.call;
+    bumpRefcount(refcounts, 0); // header
+    guest_index = 0;
+    while (guest_index < guest_clusters) : (guest_index += 1) {
+        const descriptor = l2_map[@intCast(guest_index)];
+        if (descriptor == 0) continue;
+        const host_offset = descriptor & geometry.offset_mask;
+        const additional_sectors = (descriptor >> geometry.offset_bits) &
+            ((@as(u64, 1) << geometry.sector_count_bits) - 1);
+        const covered_bytes = (additional_sectors + 1) * 512;
+        const first_cluster = host_offset / cs;
+        const last_cluster = (host_offset + covered_bytes - 1) / cs;
+        var c = first_cluster;
+        while (c <= last_cluster) : (c += 1) bumpRefcount(refcounts, c);
+    }
+    for (l1_used, 0..) |used, i| {
+        if (used) bumpRefcount(refcounts, l2_offset_for[i] / cs);
+    }
+    {
+        var k: u64 = 0;
+        while (k < l1_clusters) : (k += 1) bumpRefcount(refcounts, l1_cluster + k);
+        k = 0;
+        while (k < refcount_table_clusters) : (k += 1) bumpRefcount(refcounts, rt_cluster + k);
+        k = 0;
+        while (k < refcount_block_count) : (k += 1) bumpRefcount(refcounts, rb_cluster + k);
+    }
+
+    // Refcount blocks (big-endian u16 per host cluster).
+    const rc_bytes = std.math.cast(usize, refcount_block_count * cs) orelse return error.ImageTooLarge;
+    const refcount_block_buf = try allocator.alloc(u8, rc_bytes);
+    defer allocator.free(refcount_block_buf);
+    @memset(refcount_block_buf, 0);
+    for (refcounts, 0..) |value, idx| {
+        std.mem.writeInt(u16, refcount_block_buf[idx * 2 ..][0..2], value, .big);
+    }
+    try out_file.writePositionalAll(io, refcount_block_buf, rb_cluster * cs);
+
+    // Refcount table (one u64 host offset per allocated block).
+    const rt_bytes = std.math.cast(usize, refcount_table_clusters * cs) orelse return error.ImageTooLarge;
+    const refcount_table_buf = try allocator.alloc(u8, rt_bytes);
+    defer allocator.free(refcount_table_buf);
+    @memset(refcount_table_buf, 0);
+    {
+        var j: u64 = 0;
+        while (j < refcount_block_count) : (j += 1) {
+            std.mem.writeInt(u64, refcount_table_buf[@intCast(j * 8)..][0..8], (rb_cluster + j) * cs, .big);
+        }
+    }
+    try out_file.writePositionalAll(io, refcount_table_buf, rt_cluster * cs);
+
+    const info = Info{
+        .virtual_size = virtual_size,
+        .file_size = file_size,
+        .version = 3,
+        .cluster_bits = cluster_bits,
+        .cluster_size = cs,
+        .l1_size = l1_size,
+        .l1_table_offset = l1_cluster * cs,
+        .active_l1_table_offset = l1_cluster * cs,
+        .l2_entries = l2_entries,
+        .refcount_table_offset = rt_cluster * cs,
+        .refcount_table_clusters = @intCast(refcount_table_clusters),
+        .refcount_table_capacity_blocks = refcount_table_clusters * cs / 8,
+        .refcount_block_count = @intCast(refcount_block_count),
+        .refcount_order = default_refcount_order,
+        .header_length = header_buffer_size,
+        .incompatible_features = incompatible_compression,
+        .crypt_method = 0,
+        .compression_type = options.compression_type,
+        .snapshot_count = 0,
+        .snapshots_offset = 0,
+    };
+    try writeInitialHeader(out_file, io, info);
+    // compression_type byte lives at offset 104, inside the 112-byte header.
+    try out_file.writePositionalAll(io, &[_]u8{options.compression_type}, 104);
+
+    return info;
+}
+
 test "open parses a minimal qcow2 header" {
     const io = std.testing.io;
     const path = "test-qcow2-open.qcow2";
@@ -2755,7 +3133,6 @@ fn writeCompressedFixture(io: Io, path: []const u8) !u64 {
 /// standard library only ships a zstd *decoder*
 /// (`std.compress.zstd.Decompress`), not an encoder).
 fn zstdCompress(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    const zstd_enc = @import("zstd.zig");
     var out = try std.Io.Writer.Allocating.initCapacity(allocator, @max(@as(usize, 64), bytes.len));
     errdefer out.deinit();
     try zstd_enc.writeFrameForSlice(&out.writer, bytes, null);
@@ -3253,4 +3630,293 @@ fn verifyAllocatedClustersMatchRefcounts(file: Io.File, io: Io, info: Info) !voi
     }
 
     try std.testing.expectEqualSlices(u64, deduped_expected.items, actual.items);
+}
+
+// ---------------------------------------------------------------------------
+// Standalone compressed-writer tests
+// ---------------------------------------------------------------------------
+
+/// In-memory `SourceReader` over a byte slice; bytes past the slice read as
+/// zeros (mirroring how sparse tails are handled for real sources).
+const SliceSource = struct {
+    data: []const u8,
+
+    fn reader(self: *const SliceSource) SourceReader {
+        return .{ .context = self, .readFn = read };
+    }
+
+    fn read(context: *const anyopaque, io: Io, offset: u64, buffer: []u8) anyerror!void {
+        _ = io;
+        const self: *const SliceSource = @ptrCast(@alignCast(context));
+        const available: usize = if (offset >= self.data.len)
+            0
+        else
+            @intCast(@min(@as(u64, buffer.len), self.data.len - offset));
+        if (available > 0) @memcpy(buffer[0..available], self.data[@intCast(offset)..][0..available]);
+        if (available < buffer.len) @memset(buffer[available..], 0);
+    }
+};
+
+fn buildMixedGuestData(allocator: std.mem.Allocator, cluster_size: u64, clusters: u64) ![]u8 {
+    const data = try allocator.alloc(u8, @intCast(cluster_size * clusters));
+    @memset(data, 0);
+    const cs: usize = @intCast(cluster_size);
+    // cluster 0: highly compressible repeated text.
+    if (clusters >= 1) {
+        for (data[0..cs], 0..) |*b, i| b.* = @intCast(@as(u8, 'A') + @as(u8, @intCast((i / 137) % 7)));
+    }
+    // cluster 1 left as zeros (sparse hole).
+    // cluster 2: pseudo-random, effectively incompressible.
+    if (clusters >= 3) {
+        var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+        prng.random().bytes(data[2 * cs .. 3 * cs]);
+    }
+    // cluster 3: single repeated byte (compresses to a tiny frame).
+    if (clusters >= 4) @memset(data[3 * cs .. 4 * cs], 0x5A);
+    // remaining clusters stay zero.
+    return data;
+}
+
+fn qemuImgAvailableForTest(allocator: std.mem.Allocator, io: Io) bool {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "qemu-img", "--version" },
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
+test "writeStandaloneCompressed round-trips sparse zstd clusters" {
+    const io = std.testing.io;
+    const path = "test-qcow2-zstd-roundtrip.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const cs: u64 = 65536;
+    // Use enough clusters that the mostly-sparse image is clearly smaller than
+    // its virtual size even though clusters 0/2/3 carry real (incl. one
+    // incompressible) data. Clusters 1 and >=4 stay zero.
+    const clusters: u64 = 32;
+    const virtual_size = cs * clusters;
+    const data = try buildMixedGuestData(std.testing.allocator, cs, clusters);
+    defer std.testing.allocator.free(data);
+    var src = SliceSource{ .data = data };
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    const written = try writeStandaloneCompressed(
+        std.testing.allocator,
+        io,
+        file,
+        virtual_size,
+        src.reader(),
+        .{},
+    );
+    try std.testing.expectEqual(@as(u8, 1), written.compression_type);
+    try std.testing.expectEqual(incompatible_compression, written.incompatible_features);
+    // Sparse: the stored file is far smaller than the virtual size.
+    try std.testing.expect(written.file_size < virtual_size);
+
+    const reopened = try open(io, file);
+    try std.testing.expectEqual(virtual_size, reopened.virtual_size);
+    try std.testing.expectEqual(@as(u8, 1), reopened.compression_type);
+    try std.testing.expectEqual(@as(u16, 0), reopened.backing_file_len);
+    try std.testing.expectEqual(@as(u16, 0), reopened.data_file_len);
+    try std.testing.expectEqual(@as(u64, 65536), reopened.cluster_size);
+    try std.testing.expectEqual(@as(u32, 3), reopened.version);
+    try check(file, io, reopened);
+
+    const buf = try std.testing.allocator.alloc(u8, @intCast(virtual_size));
+    defer std.testing.allocator.free(buf);
+    _ = try pread(file, io, reopened, buf, 0);
+    try std.testing.expectEqualSlices(u8, data, buf);
+
+    // Zero clusters (1 and >=4) remain unallocated so they stay sparse.
+    try std.testing.expectEqual(ClusterKind.compressed, (try lookupGuestCluster(file, io, reopened, 0)).kind);
+    try std.testing.expectEqual(ClusterKind.backing, (try lookupGuestCluster(file, io, reopened, 1)).kind);
+    try std.testing.expectEqual(ClusterKind.compressed, (try lookupGuestCluster(file, io, reopened, 2)).kind);
+    try std.testing.expectEqual(ClusterKind.compressed, (try lookupGuestCluster(file, io, reopened, 3)).kind);
+    try std.testing.expectEqual(ClusterKind.backing, (try lookupGuestCluster(file, io, reopened, 4)).kind);
+    try std.testing.expect(!(try lookupGuestCluster(file, io, reopened, 1)).physically_allocated);
+    try std.testing.expect(!(try lookupGuestCluster(file, io, reopened, 31)).physically_allocated);
+}
+
+test "writeStandaloneCompressed rejects unsupported options" {
+    const io = std.testing.io;
+    const path = "test-qcow2-zstd-reject.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    const data = [_]u8{0} ** 512;
+    var src = SliceSource{ .data = &data };
+
+    try std.testing.expectError(error.UnsupportedCompressionType, writeStandaloneCompressed(
+        std.testing.allocator,
+        io,
+        file,
+        65536,
+        src.reader(),
+        .{ .compression_type = 2 },
+    ));
+    try std.testing.expectError(error.SizeNotSectorAligned, writeStandaloneCompressed(
+        std.testing.allocator,
+        io,
+        file,
+        65536 + 7,
+        src.reader(),
+        .{},
+    ));
+}
+
+test "compressed image with a corrupt descriptor fails closed" {
+    const io = std.testing.io;
+    const path = "test-qcow2-zstd-corrupt-desc.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const cs: u64 = 65536;
+    const data = try buildMixedGuestData(std.testing.allocator, cs, 3);
+    defer std.testing.allocator.free(data);
+    var src = SliceSource{ .data = data };
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    const info = try writeStandaloneCompressed(std.testing.allocator, io, file, cs * 3, src.reader(), .{});
+
+    // Point cluster 0's compressed payload at offset 0 (inside the header),
+    // which the reader must reject.
+    const l1_entry = try readU64(file, io, info.l1_table_offset);
+    const l2_table_offset = l1_entry & host_offset_mask;
+    try writeU64(file, io, l2_table_offset, compressed_mask);
+
+    const reopened = try open(io, file);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectError(error.InvalidL2Entry, pread(file, io, reopened, &buf, 0));
+    try std.testing.expectError(error.InvalidL2Entry, check(file, io, reopened));
+}
+
+test "compressed image with a zeroed refcount fails the native check" {
+    const io = std.testing.io;
+    const path = "test-qcow2-zstd-zero-refcount.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const cs: u64 = 65536;
+    const data = try buildMixedGuestData(std.testing.allocator, cs, 3);
+    defer std.testing.allocator.free(data);
+    var src = SliceSource{ .data = data };
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    const info = try writeStandaloneCompressed(std.testing.allocator, io, file, cs * 3, src.reader(), .{});
+    try check(file, io, info); // clean before corruption
+
+    // Cluster 1 is the first compressed data cluster; drop its refcount.
+    try writeRefcountByClusterIndex(file, io, info, 1, 0);
+    try std.testing.expectError(error.ReferencedClusterHasZeroRefcount, check(file, io, info));
+}
+
+test "truncated compressed image is rejected on open" {
+    const io = std.testing.io;
+    const path = "test-qcow2-zstd-truncated.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const cs: u64 = 65536;
+    const data = try buildMixedGuestData(std.testing.allocator, cs, 4);
+    defer std.testing.allocator.free(data);
+    var src = SliceSource{ .data = data };
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try writeStandaloneCompressed(std.testing.allocator, io, file, cs * 4, src.reader(), .{});
+
+    // Metadata trails the data region, so cutting the tail removes the L1 and
+    // refcount tables the header still points at.
+    try file.setLength(io, 2 * cs);
+    try std.testing.expectError(error.RefcountTablePastEndOfFile, open(io, file));
+}
+
+test "compressed image rejects unknown incompatible feature bits" {
+    const io = std.testing.io;
+    const path = "test-qcow2-zstd-unknown-feature.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const cs: u64 = 65536;
+    const data = try buildMixedGuestData(std.testing.allocator, cs, 3);
+    defer std.testing.allocator.free(data);
+    var src = SliceSource{ .data = data };
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try writeStandaloneCompressed(std.testing.allocator, io, file, cs * 3, src.reader(), .{});
+
+    // Set an unknown incompatible feature bit (bit 5) alongside compression.
+    try writeU64(file, io, 72, incompatible_compression | (@as(u64, 1) << 5));
+    try std.testing.expectError(error.UnsupportedIncompatibleFeature, open(io, file));
+
+    // And an unsupported compression_type value must also fail closed.
+    try writeU64(file, io, 72, incompatible_compression);
+    try file.writePositionalAll(io, &[_]u8{2}, 104);
+    try std.testing.expectError(error.UnsupportedCompressionType, open(io, file));
+}
+
+test "writeStandaloneCompressed output is accepted by qemu-img" {
+    const io = std.testing.io;
+    if (!qemuImgAvailableForTest(std.testing.allocator, io)) return error.SkipZigTest;
+
+    const path = "test-qcow2-zstd-oracle.qcow2";
+    const raw_path = "test-qcow2-zstd-oracle.raw";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+
+    const cs: u64 = 65536;
+    const clusters: u64 = 8;
+    const virtual_size = cs * clusters;
+    const data = try buildMixedGuestData(std.testing.allocator, cs, clusters);
+    defer std.testing.allocator.free(data);
+    var src = SliceSource{ .data = data };
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try writeStandaloneCompressed(std.testing.allocator, io, file, virtual_size, src.reader(), .{});
+
+    // qemu-img check must report a clean image.
+    {
+        const result = try std.process.run(std.testing.allocator, io, .{
+            .argv = &.{ "qemu-img", "check", "-f", "qcow2", path },
+        });
+        defer std.testing.allocator.free(result.stdout);
+        defer std.testing.allocator.free(result.stderr);
+        try std.testing.expectEqual(@as(u8, 0), result.term.exited);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "No errors were found") != null);
+    }
+
+    // qemu-img info must independently report zstd, the exact virtual size,
+    // and the absence of a backing file.
+    {
+        const result = try std.process.run(std.testing.allocator, io, .{
+            .argv = &.{ "qemu-img", "info", path },
+        });
+        defer std.testing.allocator.free(result.stdout);
+        defer std.testing.allocator.free(result.stderr);
+        try std.testing.expectEqual(@as(u8, 0), result.term.exited);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "compression type: zstd") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "524288 bytes") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "backing file") == null);
+    }
+
+    // qemu-img must decode our zstd clusters back to the exact guest bytes.
+    {
+        const result = try std.process.run(std.testing.allocator, io, .{
+            .argv = &.{ "qemu-img", "convert", "-f", "qcow2", "-O", "raw", path, raw_path },
+        });
+        defer std.testing.allocator.free(result.stdout);
+        defer std.testing.allocator.free(result.stderr);
+        try std.testing.expectEqual(@as(u8, 0), result.term.exited);
+        const decoded = try Io.Dir.cwd().readFileAlloc(io, raw_path, std.testing.allocator, .limited(virtual_size + 1));
+        defer std.testing.allocator.free(decoded);
+        try std.testing.expectEqualSlices(u8, data, decoded);
+    }
 }
