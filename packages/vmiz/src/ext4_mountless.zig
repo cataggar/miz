@@ -64,6 +64,13 @@ pub const HostTreeManifest = struct {
 
 pub const Error = anyerror;
 
+const CommitProfile = struct {
+    descriptor_size: u16,
+    feature_compat: u32,
+    feature_incompat: u32,
+    feature_ro_compat: u32,
+};
+
 pub const FileSystem = struct {
     allocator: Allocator,
     io: Io,
@@ -609,7 +616,7 @@ pub const FileSystem = struct {
         if (!self.sameSourceStat(current_stat) or !self.sameSourceStat(atomic_stat)) {
             return error.AtomicSourceChanged;
         }
-        const preserve_feature_ro_compat = try self.validateCommitProfile();
+        const commit_profile = try self.validateCommitProfile();
         const cursor = try self.tree.cursor();
         const root = self.tree.rootMetadata();
         const label = self.identity.label;
@@ -669,7 +676,12 @@ pub const FileSystem = struct {
             .uuid = self.identity.uuid,
             .timestamp = std.math.cast(u32, root.mtime orelse 0) orelse 0,
             .journal = .{ .enabled = self.identity.has_journal },
-            .preserve_feature_ro_compat = preserve_feature_ro_compat,
+            .preserve_feature_ro_compat = commit_profile.feature_ro_compat,
+            .preserve_feature_compat = commit_profile.feature_compat,
+            .preserve_feature_incompat = commit_profile.feature_incompat,
+            .descriptor_size = commit_profile.descriptor_size,
+            .preserve_checksum_seed = if (commit_profile.feature_incompat &
+                ext4.feature_incompat_csum_seed != 0) self.identity.checksum_seed else null,
         });
         try stage_file.sync(self.io);
         stage_file.close(self.io);
@@ -700,21 +712,13 @@ pub const FileSystem = struct {
             std.meta.eql(observed.ctime, self.source_ctime);
     }
 
-    fn validateCommitProfile(self: *const FileSystem) !u32 {
-        if (self.identity.inode_size != 256 or self.identity.descriptor_size != 32) {
+    fn validateCommitProfile(self: *const FileSystem) !CommitProfile {
+        if (self.identity.inode_size != 256) {
             return error.UnsupportedCommitProfile;
         }
         const expected_compat = ext4.writer_feature_compat |
             if (self.identity.has_journal) ext4.feature_compat_has_journal else 0;
-        if (self.identity.feature_compat != expected_compat or
-            self.identity.feature_incompat != ext4.writer_feature_incompat)
-        {
-            return error.UnsupportedCommitProfile;
-        }
         const optional = ext4.writer_feature_ro_compat_optional;
-        if (self.identity.feature_ro_compat & ~(ext4.writer_feature_ro_compat_base | optional) != 0) {
-            return error.UnsupportedCommitProfile;
-        }
         var contains_large_file = false;
         for (0..self.tree.nodeCount()) |index| {
             const node = self.tree.nodeView(index);
@@ -728,8 +732,35 @@ pub const FileSystem = struct {
         }
         const expected_ro = ext4.writer_feature_ro_compat_base |
             if ((self.identity.feature_ro_compat & optional) != 0 or contains_large_file) optional else 0;
-        if (self.identity.feature_ro_compat != expected_ro) return error.UnsupportedCommitProfile;
-        return self.identity.feature_ro_compat & optional;
+        if (self.identity.descriptor_size == 32 and
+            self.identity.feature_compat == expected_compat and
+            self.identity.feature_incompat == ext4.writer_feature_incompat and
+            self.identity.feature_ro_compat == expected_ro)
+        {
+            return .{
+                .descriptor_size = 32,
+                .feature_compat = self.identity.feature_compat,
+                .feature_incompat = self.identity.feature_incompat,
+                .feature_ro_compat = self.identity.feature_ro_compat,
+            };
+        }
+        // Pinned Canonical Ubuntu 26.04 roots use this exact 64-bit
+        // descriptor/profile tuple. It is handled separately from the
+        // ordinary writer profile so a subset cannot silently gain mandatory
+        // bits or lose checksum/layout semantics.
+        if (self.identity.descriptor_size == 64 and
+            self.identity.feature_compat == 0x103c and
+            self.identity.feature_incompat == 0x22c2 and
+            self.identity.feature_ro_compat == 0x046b)
+        {
+            return .{
+                .descriptor_size = 64,
+                .feature_compat = self.identity.feature_compat,
+                .feature_incompat = self.identity.feature_incompat,
+                .feature_ro_compat = self.identity.feature_ro_compat,
+            };
+        }
+        return error.UnsupportedCommitProfile;
     }
 };
 
@@ -979,6 +1010,12 @@ test "mountless round trip preserves security metadata and special nodes" {
     try fs.mkdir("/empty", .{ .mode = 0 });
     try fs.write("/empty/file", "new", null);
     try fs.remove("/empty", true);
+    fs.identity.descriptor_size = 64;
+    fs.identity.feature_compat = 0x103c;
+    fs.identity.feature_incompat = 0x22c2;
+    fs.identity.feature_ro_compat = 0x046b;
+    fs.identity.has_journal = true;
+    fs.identity.checksum_seed = 0x12345678;
     _ = try fs.commit();
     fs.deinit();
     fs_open = false;
@@ -994,6 +1031,11 @@ test "mountless round trip preserves security metadata and special nodes" {
     });
     defer reopened.deinit();
     try std.testing.expectEqual(@as(u16, 0), (try reopened.stat("/etc/void")).metadata.mode);
+    try std.testing.expectEqual(@as(u16, 64), reopened.filesystemIdentity().descriptor_size);
+    try std.testing.expectEqual(@as(u32, 0x103c), reopened.filesystemIdentity().feature_compat);
+    try std.testing.expectEqual(@as(u32, 0x22c2), reopened.filesystemIdentity().feature_incompat);
+    try std.testing.expectEqual(@as(u32, 0x046b), reopened.filesystemIdentity().feature_ro_compat);
+    try std.testing.expectEqual(@as(u32, 0x12345678), reopened.filesystemIdentity().checksum_seed);
     try std.testing.expectEqual(@as(usize, 3), (try reopened.stat("/")).metadata.xattrs.len);
     try std.testing.expectEqual(
         @as(usize, 1),

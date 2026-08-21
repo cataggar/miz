@@ -80,6 +80,9 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         self.assertIn("exportHostTree", builder)
         self.assertIn("importHostTree", builder)
         self.assertIn("native_root.finish()", builder)
+        self.assertIn("cloudimg-rootfs", builder)
+        self.assertNotIn("/dev/sda4", builder)
+        self.assertNotIn("/dev/sda3", builder)
         for forbidden in (
             "virt-tar-out",
             "virt-tar-in",

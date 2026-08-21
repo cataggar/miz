@@ -29,6 +29,10 @@ does not use `virt-tar-*`, `guestfish`, host `tar`, or host `cp`; mode-`000`
 entries are read from ext4 bytes rather than made readable on the host, while
 their original metadata remains in the native tree.
 
+The root partition is selected by the validated GPT name
+`cloudimg-rootfs` and the ext4 filesystem label, not by a fixed `/dev/sdaN`
+slot; Canonical's populated partition slots differ between image revisions.
+
 The following inputs are compiled into the builder:
 
 - Canonical key fingerprint:
