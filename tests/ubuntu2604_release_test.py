@@ -862,6 +862,20 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             self.stage()
         self.assertTrue((output / "do-not-replace").is_file())
 
+    def test_canonical_signature_verification_is_agent_free(self):
+        builder = (
+            ROOT / "scripts" / "build_generalized_ubuntu2604.zig"
+        ).read_text(encoding="utf-8")
+        workflow = (
+            ROOT / ".github" / "workflows" / "ubuntu2604-release.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"gpg", "--batch", "--no-options"', builder)
+        self.assertIn('"gpg", "--batch", "--yes", "--dearmor"', builder)
+        self.assertIn('"gpgv", "--keyring"', builder)
+        self.assertNotIn('"gpg", "--batch", "--homedir"', builder)
+        self.assertNotIn('"--import"', builder)
+        self.assertIn("curl gpg gpgv mount", workflow)
+
     def test_publisher_is_draft_first_allowlisted_and_fail_safe(self):
         script = (ROOT / "scripts" / "ubuntu2604_publish.sh").read_text()
         self.assertIn('test "$(wc -l <"$expected_file")" -eq 2', script)

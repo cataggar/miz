@@ -407,6 +407,31 @@ fn requireSha256SumsEntry(bytes: []const u8, filename: []const u8, digest: []con
     if (matches != 1) return error.SignedEntryMissingOrDuplicate;
 }
 
+fn hasExactCanonicalPrimaryFingerprint(bytes: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var expect_primary_fingerprint = false;
+    var primary_count: usize = 0;
+    var matched = false;
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "pub:")) {
+            expect_primary_fingerprint = true;
+            continue;
+        }
+        if (!expect_primary_fingerprint or !std.mem.startsWith(u8, line, "fpr:")) continue;
+        expect_primary_fingerprint = false;
+        primary_count += 1;
+        var fields = std.mem.splitScalar(u8, line, ':');
+        var field_index: usize = 0;
+        while (fields.next()) |field| : (field_index += 1) {
+            if (field_index == 9) {
+                matched = std.mem.eql(u8, field, canonical_fingerprint);
+                break;
+            }
+        }
+    }
+    return primary_count == 1 and matched;
+}
+
 fn peMachine(bytes: []const u8) !u16 {
     if (bytes.len < 0x40 or !std.mem.eql(u8, bytes[0..2], "MZ")) return error.InvalidPeImage;
     const pe_offset = std.mem.readInt(u32, bytes[0x3c..0x40], .little);
@@ -450,10 +475,6 @@ fn verifyCanonicalPublication(
     sums_path: []const u8,
     signature_path: []const u8,
 ) !void {
-    const gnupg = try std.fs.path.join(allocator, &.{ work_dir, "gnupg" });
-    defer allocator.free(gnupg);
-    try prepareCanonicalKeyring(io, gnupg);
-
     const key_url = try std.fmt.allocPrint(
         allocator,
         "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x{s}",
@@ -463,19 +484,14 @@ fn verifyCanonicalPublication(
     const key_path = try std.fs.path.join(allocator, &.{ work_dir, "canonical-cloud-image-key.asc" });
     defer allocator.free(key_path);
     try run(allocator, io, &.{ "curl", "--fail", "--location", "--proto", "=https", "--tlsv1.2", "--output", key_path, key_url });
-    try run(allocator, io, &.{ "gpg", "--batch", "--homedir", gnupg, "--import", key_path });
-    const fingerprints = try capture(allocator, io, &.{ "gpg", "--batch", "--homedir", gnupg, "--with-colons", "--fingerprint", canonical_fingerprint });
+    const fingerprints = try capture(allocator, io, &.{ "gpg", "--batch", "--no-options", "--with-colons", "--show-keys", "--fingerprint", key_path });
     defer allocator.free(fingerprints);
-    if (std.mem.indexOf(u8, fingerprints, canonical_fingerprint) == null) return error.CanonicalFingerprintMismatch;
-    try run(allocator, io, &.{ "gpg", "--batch", "--homedir", gnupg, "--verify", signature_path, sums_path });
-}
-
-fn prepareCanonicalKeyring(io: Io, gnupg: []const u8) !void {
-    try Dir.cwd().deleteTree(io, gnupg);
-    try Dir.cwd().createDirPath(io, gnupg);
-    var directory = try Dir.cwd().openDir(io, gnupg, .{ .iterate = true });
-    defer directory.close(io);
-    try directory.setPermissions(io, .fromMode(0o700));
+    if (!hasExactCanonicalPrimaryFingerprint(fingerprints)) return error.CanonicalFingerprintMismatch;
+    const keyring_path = try std.fs.path.join(allocator, &.{ work_dir, "canonical-cloud-image-key.gpg" });
+    defer allocator.free(keyring_path);
+    Dir.cwd().deleteFile(io, keyring_path) catch {};
+    try run(allocator, io, &.{ "gpg", "--batch", "--yes", "--dearmor", "--output", keyring_path, key_path });
+    try run(allocator, io, &.{ "gpgv", "--keyring", keyring_path, signature_path, sums_path });
 }
 
 const DebzEvidence = struct {
@@ -1604,7 +1620,7 @@ pub fn main(init: std.process.Init) !void {
     try Dir.cwd().deleteTree(io, provenance_dir);
     try Dir.cwd().createDirPath(io, provenance_dir);
 
-    for (&[_][]const u8{ "curl", "gpg" }) |tool|
+    for (&[_][]const u8{ "curl", "gpg", "gpgv" }) |tool|
         try requireTool(allocator, io, tool);
 
     const sums_path = try std.fs.path.join(allocator, &.{ work_dir, "SHA256SUMS" });
@@ -1788,19 +1804,23 @@ test "profiles pin immutable official sources for both architectures" {
     try std.testing.expectEqualSlices(u8, &guid.linux_root_aarch64, &profiles[1].root_partition_type_guid);
 }
 
-test "Canonical keyring preparation uses a chmod-capable directory handle" {
-    var temporary = std.testing.tmpDir(.{});
-    defer temporary.cleanup();
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root_length = try temporary.dir.realPath(std.testing.io, &root_buffer);
-    const path = try std.fs.path.join(
-        std.testing.allocator,
-        &.{ root_buffer[0..root_length], "gnupg" },
-    );
-    defer std.testing.allocator.free(path);
-
-    try prepareCanonicalKeyring(std.testing.io, path);
-    try prepareCanonicalKeyring(std.testing.io, path);
+test "Canonical fingerprint listing accepts exactly one matching primary key" {
+    const matching =
+        "tru::1:1750000000:0:3:1:5\n" ++
+        "pub:-:4096:1:1A5D6C4C7DB87C81:0:::-:::scESC::::::23::0:\n" ++
+        "fpr:::::::::D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81:\n" ++
+        "sub:-:4096:1:AAAAAAAAAAAAAAAA:0::::::e::::::23:\n" ++
+        "fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\n";
+    try std.testing.expect(hasExactCanonicalPrimaryFingerprint(matching));
+    try std.testing.expect(!hasExactCanonicalPrimaryFingerprint(
+        "pub:-:4096:1:BBBBBBBBBBBBBBBB:0:::-:::scESC::::::23::0:\n" ++
+            "fpr:::::::::BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB:\n",
+    ));
+    try std.testing.expect(!hasExactCanonicalPrimaryFingerprint(
+        matching ++
+            "pub:-:4096:1:CCCCCCCCCCCCCCCC:0:::-:::scESC::::::23::0:\n" ++
+            "fpr:::::::::CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC:\n",
+    ));
 }
 
 test "package-family resolve and customize requests are exact-lock operations" {
