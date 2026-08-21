@@ -118,7 +118,7 @@ pub const CommandResult = struct {
 };
 
 pub const ExecutorOptions = struct {
-    root_path: []const u8,
+    root: *const Root,
     architecture: Architecture,
     timeout_ms: u64 = 30 * 60 * 1000,
     network: NetworkPolicy = .disabled,
@@ -140,11 +140,12 @@ pub const Executor = struct {
     allocator: Allocator,
     io: Io,
     options: ExecutorOptions,
+    root_dir: Io.Dir,
+    root_inode: Io.File.INode,
+    root_dir_owned: bool = true,
     records: std.array_list.Managed(CommandRecord),
 
     pub fn init(allocator: Allocator, io: Io, options: ExecutorOptions) !Executor {
-        if (!std.fs.path.isAbsolute(options.root_path)) return error.RootPathMustBeAbsolute;
-        if (options.root_path.len == 0) return error.InvalidRootPath;
         if (options.architecture != Architecture.host()) return error.ArchitectureMismatch;
         if (options.network != .disabled) return error.NetworkPolicyViolation;
         if (options.devices != .minimal) return error.DevicePolicyViolation;
@@ -153,10 +154,13 @@ pub const Executor = struct {
         {
             return error.PrivilegedNamespaceRequired;
         }
+        const root_dir = try options.root.duplicateDir();
         return .{
             .allocator = allocator,
             .io = io,
             .options = options,
+            .root_dir = root_dir,
+            .root_inode = options.root.root_inode,
             .records = .init(allocator),
         };
     }
@@ -168,6 +172,7 @@ pub const Executor = struct {
             self.allocator.free(record.arguments);
         }
         self.records.deinit();
+        if (self.root_dir_owned) self.root_dir.close(self.io);
         self.* = undefined;
     }
 
@@ -270,16 +275,19 @@ pub const Executor = struct {
         // setpriv/timeout pair drops capabilities before guest code starts,
         // supplies a shorter command deadline, and kills its process group
         // before the reverse unmount trap runs.
-        const script =
+        const inner_script =
             \\set -eu
+            \\root_fd="$1"
+            \\shift
+            \\case "$root_fd" in *[!0-9]*|'') exit 125;; esac
             \\timeout_seconds="$1"
             \\shift
             \\cd /
             \\cleanup() { status=$?; umount -n /tmp 2>/dev/null || umount -n -l /tmp 2>/dev/null || { echo tmp-cleanup-failed >&2; status=125; }; umount -n /run 2>/dev/null || umount -n -l /run 2>/dev/null || { echo run-cleanup-failed >&2; status=125; }; umount -n /sys 2>/dev/null || umount -n -l /sys 2>/dev/null || { echo sys-cleanup-failed >&2; status=125; }; umount -n /proc 2>/dev/null || umount -n -l /proc 2>/dev/null || { echo proc-cleanup-failed >&2; status=125; }; umount -n /dev 2>/dev/null || umount -n -l /dev 2>/dev/null || true; exit "$status"; }
             \\trap cleanup EXIT
-            \\mount -t tmpfs -o mode=0755,nosuid tmpfs /dev
             \\mount -t proc -o nosuid,nodev,noexec proc /proc
             \\mount -t sysfs -o ro,nosuid,nodev,noexec sysfs /sys
+            \\mount -t tmpfs -o mode=0755,nosuid tmpfs /dev
             \\mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
             \\mount -t tmpfs -o mode=1777,nosuid,nodev,noexec tmpfs /tmp
             \\mknod -m 666 /dev/null c 1 3
@@ -294,6 +302,23 @@ pub const Executor = struct {
             \\if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then kill -KILL -1 2>/dev/null || true; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do wait 2>/dev/null || break; done; fi
             \\exit "$status"
         ;
+        const outer_script =
+            \\set -eu
+            \\root_fd="$1"
+            \\shift
+            \\inner_script="$1"
+            \\shift
+            \\case "$root_fd" in *[!0-9]*|'') exit 125;; esac
+            \\mountpoint=""
+            \\cleanup() { status=$?; if [ -n "$mountpoint" ]; then umount -n "$mountpoint" 2>/dev/null || umount -n -l "$mountpoint" 2>/dev/null || status=125; rmdir "$mountpoint" 2>/dev/null || true; fi; exit "$status"; }
+            \\trap cleanup EXIT
+            \\base="/run/vmiz-offline-root-$$"
+            \\index=0
+            \\while ! mkdir "$base-$index" 2>/dev/null; do index=$((index + 1)); done
+            \\mountpoint="$base-$index"
+            \\mount --bind "/proc/self/fd/$root_fd" "$mountpoint"
+            \\exec chroot "$mountpoint" /bin/sh -c "$inner_script" vmiz-offline-root "$root_fd" "$@"
+        ;
         var argv = std.array_list.Managed([]const u8).init(self.allocator);
         defer argv.deinit();
         try argv.append("unshare");
@@ -305,12 +330,17 @@ pub const Executor = struct {
         try argv.append("--propagation");
         try argv.append("private");
         try argv.append("--");
-        try argv.append("chroot");
-        try argv.append(self.options.root_path);
         try argv.append("/bin/sh");
         try argv.append("-c");
-        try argv.append(script);
+        try argv.append(outer_script);
         try argv.append("vmiz-offline-root");
+        const root_fd_text = try std.fmt.allocPrint(
+            self.allocator,
+            "{d}",
+            .{self.root_dir.handle},
+        );
+        try argv.append(root_fd_text);
+        try argv.append(inner_script);
         const timeout_seconds = try std.fmt.allocPrint(
             self.allocator,
             "{d}s",
@@ -318,6 +348,7 @@ pub const Executor = struct {
         );
         try argv.append(timeout_seconds);
         try argv.appendSlice(guest_argv);
+        defer self.allocator.free(root_fd_text);
         defer self.allocator.free(timeout_seconds);
 
         var environment = std.process.Environ.Map.init(self.allocator);
@@ -601,9 +632,13 @@ pub const Root = struct {
         return self.allocator.dupe(u8, name["vmlinuz-".len..]);
     }
 
-    fn duplicateRootDir(self: *Root) !Io.Dir {
+    pub fn duplicateDir(self: *const Root) !Io.Dir {
         const duplicate = if (comptime builtin.os.tag == .linux) blk: {
-            const result = std.os.linux.dup(self.root_dir.handle);
+            const result = std.os.linux.fcntl(
+                self.root_dir.handle,
+                std.os.linux.F.DUPFD,
+                128,
+            );
             if (@as(isize, @bitCast(result)) < 0) return error.RootFdDupFailed;
             break :blk Io.Dir{ .handle = @intCast(result) };
         } else try self.root_dir.openDir(self.io, ".", .{
@@ -623,7 +658,7 @@ pub const Root = struct {
     }
 
     fn openDirectoryPath(self: *Root, relative: []const u8, create_missing: bool) !Io.Dir {
-        var current = try self.duplicateRootDir();
+        var current = try self.duplicateDir();
         if (relative.len == 0) return current;
         var components = std.mem.splitScalar(u8, relative, '/');
         while (components.next()) |component| {
@@ -761,10 +796,13 @@ test "offline command validation is fail closed" {
             .allocator = std.testing.allocator,
             .io = undefined,
             .options = .{
-                .root_path = "/",
+                .root = undefined,
                 .architecture = Architecture.host(),
                 .require_privileged_namespace = false,
             },
+            .root_dir = undefined,
+            .root_inode = undefined,
+            .root_dir_owned = false,
             .records = .init(std.testing.allocator),
         };
         defer executor.deinit();
@@ -1044,11 +1082,13 @@ const FakeRunner = struct {
 test "offline executor enforces architecture, allowlist, timeout, and failure" {
     const host = Architecture.host();
     const foreign: Architecture = if (host == .x86_64) .aarch64 else .x86_64;
+    var test_root = try Root.init(std.testing.allocator, std.testing.io, "/", .{});
+    defer test_root.deinit();
     try std.testing.expectError(error.ArchitectureMismatch, Executor.init(
         std.testing.allocator,
         std.testing.io,
         .{
-            .root_path = "/",
+            .root = &test_root,
             .architecture = foreign,
             .require_privileged_namespace = false,
         },
@@ -1056,7 +1096,7 @@ test "offline executor enforces architecture, allowlist, timeout, and failure" {
 
     var success = FakeRunner{ .outcome = .succeeded };
     var executor = try Executor.init(std.testing.allocator, std.testing.io, .{
-        .root_path = "/",
+        .root = &test_root,
         .architecture = host,
         .require_privileged_namespace = false,
         .run_fn = FakeRunner.run,
@@ -1070,7 +1110,7 @@ test "offline executor enforces architecture, allowlist, timeout, and failure" {
 
     var timeout = FakeRunner{ .outcome = .timed_out };
     var timeout_executor = try Executor.init(std.testing.allocator, std.testing.io, .{
-        .root_path = "/",
+        .root = &test_root,
         .architecture = host,
         .require_privileged_namespace = false,
         .run_fn = FakeRunner.run,
@@ -1082,7 +1122,7 @@ test "offline executor enforces architecture, allowlist, timeout, and failure" {
 
     var failure = FakeRunner{ .outcome = .failed, .exit_code = 2 };
     var failure_executor = try Executor.init(std.testing.allocator, std.testing.io, .{
-        .root_path = "/",
+        .root = &test_root,
         .architecture = host,
         .require_privileged_namespace = false,
         .run_fn = FakeRunner.run,
@@ -1108,9 +1148,20 @@ test "privileged offline namespace contains PID1 and reaps descendants" {
         std.debug.print("skipping offline-root containment test: integration root fixture missing\n", .{});
         return;
     }
+    var root = try Root.init(allocator, io, fixture, .{});
+    defer root.deinit();
+    const pinned = try std.fs.path.join(allocator, &.{ cwd, ".scratch/offline-root-pinned" });
+    defer allocator.free(pinned);
+    Io.Dir.cwd().deleteTree(io, pinned) catch {};
+    try Io.Dir.rename(Io.Dir.cwd(), fixture, Io.Dir.cwd(), pinned, io);
+    try Io.Dir.cwd().symLink(io, cwd, fixture, .{});
+    defer {
+        Io.Dir.cwd().deleteFile(io, fixture) catch {};
+        Io.Dir.rename(Io.Dir.cwd(), pinned, Io.Dir.cwd(), fixture, io) catch {};
+    }
     const sentinel = try std.fs.path.join(allocator, &.{ cwd, ".scratch/offline-root-host-sentinel" });
     defer allocator.free(sentinel);
-    const marker = try std.fs.path.join(allocator, &.{ fixture, "descendant-marker" });
+    const marker = try std.fs.path.join(allocator, &.{ pinned, "descendant-marker" });
     defer allocator.free(marker);
     Io.Dir.cwd().deleteFile(io, sentinel) catch {};
     Io.Dir.cwd().deleteFile(io, marker) catch {};
@@ -1118,7 +1169,7 @@ test "privileged offline namespace contains PID1 and reaps descendants" {
     defer Io.Dir.cwd().deleteFile(io, sentinel) catch {};
 
     var executor = try Executor.init(allocator, io, .{
-        .root_path = fixture,
+        .root = &root,
         .architecture = Architecture.host(),
         .timeout_ms = 5 * 1000,
     });

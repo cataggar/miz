@@ -751,7 +751,7 @@ fn customizeOfflineRoot(
     });
 
     var executor = try offline_root.Executor.init(allocator, io, .{
-        .root_path = root_path,
+        .root = &root,
         .architecture = switch (profile.architecture) {
             .x86_64 => .x86_64,
             .aarch64 => .aarch64,
