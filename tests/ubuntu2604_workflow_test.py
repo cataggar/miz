@@ -67,8 +67,8 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
             "- name: Install complete Ubuntu image-builder dependencies", 1
         )[1].split("- name: Build built-in Artifact Signing client", 1)[0]
         self.assertIn("linux-image-generic", install)
-        self.assertIn("util-linux", install)
         for removed in (
+            "util-linux",
             "liblzma-dev",
             "libzstd-dev",
             "cpio",
@@ -83,8 +83,13 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         )
         kernel_access = install.index("sudo chmod 0644 /boot/vmlinuz-*")
         self.assertLess(apt_install, kernel_access)
-        for tool in ("mount", "mknod", "chroot", "setsid", "timeout", "unshare"):
-            self.assertIn(tool, install)
+        # The offline-root executor now builds its sandbox with direct Linux
+        # syscalls, so the util-linux helper binaries must no longer be
+        # installed or discovered here.
+        for removed_tool in ("mount", "mknod", "chroot", "setsid", "timeout", "unshare"):
+            self.assertNotIn(removed_tool, install)
+        for required_tool in ("sbverify", "ukify"):
+            self.assertIn(required_tool, install)
         self.assertIn('command -v "$tool"', install)
         for forbidden in (
             "libguestfs",

@@ -119,13 +119,11 @@ sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
   binutils file jq \
   linux-image-generic openssl \
-  python3 python3-pefile qemu-utils sbsigntool systemd-ukify \
-  util-linux
+  python3 python3-pefile qemu-utils sbsigntool systemd-ukify
 sudo chmod 0644 /boot/vmlinuz-*
 ```
 
-The builder inventory is limited to native compilation and image-mutation
-dependencies (`util-linux`), UKI assembly/signing tools (`binutils`,
+The builder inventory is limited to UKI assembly/signing tools (`binutils`,
 `linux-image-generic`, `python3-pefile`, `sbsigntool`, and `systemd-ukify`),
 `qemu-utils`, `file`, `jq`, and OpenSSL. HTTPS/OpenPGP artifact
 verification and XZ/zstd decoding and encoding plus newc cpio archive creation
@@ -137,7 +135,10 @@ mutation, and final structural validation before publication are native.
 
 The full build runs the bounded guest-tool allowlist in a private mount, PID,
 and network namespace, so it must be invoked with `sudo` on Linux. The executor
-mounts only `dev`, `proc`, `sys`, and `run`, creates the four required device
+establishes and tears down the namespace using direct, audited Linux syscalls
+(`clone`, `mount`, `mknod`, and `chroot`) rather than `util-linux` command
+helpers such as `unshare`, `mount`, `umount`, or `setsid`. It mounts only
+`dev`, `proc`, `sys`, and `run`, creates the four required device
 nodes plus an isolated `tmp`, and tears the namespace down after every
 command. `update-initramfs`, `dpkg-query`, and optional `cloud-init clean` are
 the only guest commands; systemd enablement and account removal are native
