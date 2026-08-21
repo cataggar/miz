@@ -66,8 +66,14 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         install = self.source.split(
             "- name: Install complete Ubuntu image-builder dependencies", 1
         )[1].split("- name: Build built-in Artifact Signing client", 1)[0]
-        self.assertIn("linux-image-generic", install)
+        # Native vmiz UKI assembly replaces systemd-ukify and its builder
+        # dependency stack (systemd-ukify, binutils, python3-pefile, and the
+        # host linux-image-generic kernel), so none of them may be installed.
         for removed in (
+            "systemd-ukify",
+            "binutils",
+            "python3-pefile",
+            "linux-image-generic",
             "util-linux",
             "liblzma-dev",
             "libzstd-dev",
@@ -81,21 +87,31 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         apt_install = install.index(
             'sudo apt-get install -y --no-install-recommends "${packages[@]}"'
         )
-        kernel_access = install.index("sudo chmod 0644 /boot/vmlinuz-*")
-        self.assertLess(apt_install, kernel_access)
+        # The kernel and initrd are extracted from the guest image natively, so
+        # the host /boot kernel and its chmod fixup are gone.
+        self.assertNotIn("/boot/vmlinuz", install)
+        # systemd-boot-efi supplies only the PE/COFF stub that the native
+        # assembler appends the UKI sections onto; the arch-correct stub is the
+        # sole external input and must be verified present after install.
+        self.assertIn("systemd-boot-efi", install)
+        self.assertIn("/usr/lib/systemd/boot/efi/linuxx64.efi.stub", install)
+        self.assertIn("/usr/lib/systemd/boot/efi/linuxaa64.efi.stub", install)
+        stub_check = install.index('test -f "$uki_stub"')
+        self.assertLess(apt_install, stub_check)
         # The offline-root executor now builds its sandbox with direct Linux
         # syscalls, so the util-linux helper binaries must no longer be
         # installed or discovered here.
         for removed_tool in ("mount", "mknod", "chroot", "setsid", "timeout", "unshare"):
             self.assertNotIn(removed_tool, install)
-        for required_tool in ("ukify",):
-            self.assertIn(required_tool, install)
+        # Native UKI assembly replaces the ukify subprocess entirely; neither the
+        # tool nor a command -v probe for it may remain in the builder step.
+        self.assertNotIn("ukify", install)
+        self.assertNotIn("command -v", install)
         # Native X.509/Authenticode signing and Secure Boot verification replace
         # the openssl and sbsigntool utilities, so they must no longer be
         # installed or discovered in the image-builder dependency step.
         for removed_signing_tool in ("openssl", "sbsigntool", "sbverify"):
             self.assertNotIn(removed_signing_tool, install)
-        self.assertIn('command -v "$tool"', install)
         for forbidden in (
             "libguestfs",
             "guestfish",

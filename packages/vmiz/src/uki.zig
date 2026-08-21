@@ -24,14 +24,41 @@ pub const GenerateOptions = struct {
 pub const GenerateError = std.mem.Allocator.Error || error{
     BadDosSignature,
     BadPeSignature,
+    CmdlineTooLarge,
+    EmptyKernel,
+    ImageTooLarge,
+    InitrdEmpty,
+    InitrdTooLarge,
     InvalidAlignment,
     InvalidOptionalHeader,
     InvalidSecurityDirectory,
     InvalidSectionTable,
+    LinuxTooLarge,
+    OsReleaseTooLarge,
     SectionNameTooLong,
+    SplashTooLarge,
+    StubTooLarge,
     TooManySections,
     TruncatedStub,
+    UnameTooLarge,
     UnsupportedOptionalHeader,
+};
+
+/// Explicit upper bounds enforced by `generate`. They keep a single malformed
+/// or hostile kernel, initrd, stub, or metadata blob from producing an
+/// unbootable or oversized image, and they bound the total section count so the
+/// emitted section table always stays well within the PE limit. The image bound
+/// keeps every file offset inside the PE32+ 32-bit range.
+pub const limits = struct {
+    pub const max_stub_size: usize = 32 * 1024 * 1024;
+    pub const max_linux_size: usize = 512 * 1024 * 1024;
+    pub const max_initrd_size: usize = 512 * 1024 * 1024;
+    pub const max_cmdline_size: usize = 64 * 1024;
+    pub const max_os_release_size: usize = 256 * 1024;
+    pub const max_uname_size: usize = 512;
+    pub const max_splash_size: usize = 16 * 1024 * 1024;
+    pub const max_sections: usize = 64;
+    pub const max_image_size: usize = 3 * 1024 * 1024 * 1024;
 };
 
 const image_scn_cnt_code = 0x0000_0020;
@@ -104,6 +131,8 @@ const SectionSpec = struct {
 };
 
 pub fn generate(allocator: std.mem.Allocator, options: GenerateOptions) GenerateError![]u8 {
+    try validateOptions(options);
+
     const extra_sections = [_]SectionSpec{
         .{ .name = ".linux", .contents = options.linux },
         .{ .name = ".initrd", .contents = options.initrd orelse "" },
@@ -128,6 +157,25 @@ pub fn generate(allocator: std.mem.Allocator, options: GenerateOptions) Generate
     return appendSections(allocator, options.stub, filtered.items);
 }
 
+/// Rejects malformed or oversized inputs before any PE layout work. A UKI is
+/// unbootable without a kernel, and an initrd section that was requested but
+/// empty is treated as malformed rather than silently dropped.
+fn validateOptions(options: GenerateOptions) GenerateError!void {
+    if (options.stub.len > limits.max_stub_size) return error.StubTooLarge;
+    if (options.linux.len == 0) return error.EmptyKernel;
+    if (options.linux.len > limits.max_linux_size) return error.LinuxTooLarge;
+    if (options.initrd) |initrd| {
+        if (initrd.len == 0) return error.InitrdEmpty;
+        if (initrd.len > limits.max_initrd_size) return error.InitrdTooLarge;
+    }
+    if (options.cmdline.len > limits.max_cmdline_size) return error.CmdlineTooLarge;
+    if (options.os_release.len > limits.max_os_release_size) return error.OsReleaseTooLarge;
+    if (options.uname.len > limits.max_uname_size) return error.UnameTooLarge;
+    if (options.splash) |splash| {
+        if (splash.len > limits.max_splash_size) return error.SplashTooLarge;
+    }
+}
+
 fn appendSections(
     allocator: std.mem.Allocator,
     stub: []const u8,
@@ -137,7 +185,7 @@ fn appendSections(
     defer allocator.free(parsed.sections);
 
     const new_section_count = parsed.section_count + extra_sections.len;
-    if (new_section_count > std.math.maxInt(u16)) return error.TooManySections;
+    if (new_section_count > limits.max_sections) return error.TooManySections;
 
     const section_table_end = parsed.section_table_offset + new_section_count * section_header_size;
     const size_of_headers = try alignForwardU32(section_table_end, parsed.file_alignment);
@@ -189,6 +237,7 @@ fn appendSections(
         try alignForwardU32(final_sections[new_section_count - 1].virtual_address + @max(final_sections[new_section_count - 1].virtual_size, final_sections[new_section_count - 1].raw_size), parsed.section_alignment);
 
     const output_len = std.math.cast(usize, next_raw_offset) orelse return error.InvalidSectionTable;
+    if (output_len > limits.max_image_size) return error.ImageTooLarge;
     var output = try allocator.alloc(u8, output_len);
     errdefer allocator.free(output);
     @memset(output, 0);
@@ -249,6 +298,7 @@ fn parseStub(allocator: std.mem.Allocator, stub: []const u8) GenerateError!Parse
     if (!std.mem.eql(u8, stub[pe_offset .. pe_offset + pe_signature.len], pe_signature)) return error.BadPeSignature;
 
     const section_count = std.mem.readInt(u16, stub[file_header_offset + file_header_section_count_offset ..][0..2], .little);
+    if (section_count > limits.max_sections) return error.TooManySections;
     const optional_header_size = std.mem.readInt(u16, stub[file_header_offset + file_header_size_of_optional_header_offset ..][0..2], .little);
     const optional_header_offset = file_header_offset + file_header_size;
     const optional_header_end = optional_header_offset + optional_header_size;
@@ -589,4 +639,361 @@ pub fn syntheticStubPe(allocator: std.mem.Allocator, machine: u16) ![]u8 {
 
     buffer[size_of_headers] = 0xC3;
     return buffer;
+}
+
+// ---------------------------------------------------------------------------
+// Test-only independent PE32+ oracle. It deliberately re-derives the section
+// table, alignment invariants, and certificate directory straight from the
+// emitted bytes without calling `parseStub`/`inspect`, so the assembler is
+// cross-checked by a separate code path rather than by its own reader.
+// ---------------------------------------------------------------------------
+
+const IndependentSection = struct {
+    name: []const u8,
+    virtual_size: u32,
+    virtual_address: u32,
+    raw_size: u32,
+    raw_offset: u32,
+    characteristics: u32,
+};
+
+const IndependentImage = struct {
+    machine: u16,
+    subsystem: u16,
+    section_alignment: u32,
+    file_alignment: u32,
+    size_of_headers: u32,
+    size_of_image: u32,
+    security_offset: u32,
+    security_size: u32,
+    sections: []IndependentSection,
+
+    fn deinit(self: *IndependentImage, allocator: std.mem.Allocator) void {
+        allocator.free(self.sections);
+        self.* = undefined;
+    }
+
+    fn find(self: *const IndependentImage, name: []const u8) ?IndependentSection {
+        for (self.sections) |section| if (std.mem.eql(u8, section.name, name)) return section;
+        return null;
+    }
+};
+
+fn parseIndependently(allocator: std.mem.Allocator, image: []const u8) !IndependentImage {
+    try std.testing.expect(image.len >= 64);
+    try std.testing.expectEqualStrings("MZ", image[0..2]);
+    const pe_offset = std.mem.readInt(u32, image[0x3C..0x40], .little);
+    try std.testing.expectEqualStrings(pe_signature, image[pe_offset .. pe_offset + pe_signature.len]);
+    const file_header = pe_offset + pe_signature.len;
+    const machine = std.mem.readInt(u16, image[file_header + file_header_machine_offset ..][0..2], .little);
+    const count = std.mem.readInt(u16, image[file_header + file_header_section_count_offset ..][0..2], .little);
+    const opt_size = std.mem.readInt(u16, image[file_header + file_header_size_of_optional_header_offset ..][0..2], .little);
+    const opt = file_header + file_header_size;
+    try std.testing.expectEqual(optional_header_magic_pe32_plus, std.mem.readInt(u16, image[opt..][0..2], .little));
+    const section_alignment = std.mem.readInt(u32, image[opt + optional_header_section_alignment_offset ..][0..4], .little);
+    const file_alignment = std.mem.readInt(u32, image[opt + optional_header_file_alignment_offset ..][0..4], .little);
+    const size_of_image = std.mem.readInt(u32, image[opt + optional_header_size_of_image_offset ..][0..4], .little);
+    const size_of_headers = std.mem.readInt(u32, image[opt + optional_header_size_of_headers_offset ..][0..4], .little);
+    const subsystem = std.mem.readInt(u16, image[opt + optional_header_subsystem_offset ..][0..2], .little);
+    const number_of_rva = std.mem.readInt(u32, image[opt + optional_header_number_of_rva_and_sizes_offset ..][0..4], .little);
+    var security_offset: u32 = 0;
+    var security_size: u32 = 0;
+    if (number_of_rva > security_directory_index) {
+        const dir = opt + optional_header_data_directories_offset + security_directory_index * data_directory_entry_size;
+        security_offset = std.mem.readInt(u32, image[dir..][0..4], .little);
+        security_size = std.mem.readInt(u32, image[dir + 4 ..][0..4], .little);
+    }
+    const table = opt + opt_size;
+    const sections = try allocator.alloc(IndependentSection, count);
+    errdefer allocator.free(sections);
+    for (0..count) |index| {
+        const header = image[table + index * section_header_size ..][0..section_header_size];
+        const raw_name = header[0..8];
+        const end = std.mem.indexOfScalar(u8, raw_name, 0) orelse raw_name.len;
+        sections[index] = .{
+            .name = raw_name[0..end],
+            .virtual_size = std.mem.readInt(u32, header[8..12], .little),
+            .virtual_address = std.mem.readInt(u32, header[12..16], .little),
+            .raw_size = std.mem.readInt(u32, header[16..20], .little),
+            .raw_offset = std.mem.readInt(u32, header[20..24], .little),
+            .characteristics = std.mem.readInt(u32, header[36..40], .little),
+        };
+    }
+    return .{
+        .machine = machine,
+        .subsystem = subsystem,
+        .section_alignment = section_alignment,
+        .file_alignment = file_alignment,
+        .size_of_headers = size_of_headers,
+        .size_of_image = size_of_image,
+        .security_offset = security_offset,
+        .security_size = security_size,
+        .sections = sections,
+    };
+}
+
+fn expectIndependentSection(
+    parsed: *const IndependentImage,
+    image: []const u8,
+    name: []const u8,
+    expected: []const u8,
+) !void {
+    const section = parsed.find(name) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, @intCast(expected.len)), section.virtual_size);
+    const contents = image[section.raw_offset..][0..section.virtual_size];
+    try std.testing.expectEqualSlices(u8, expected, contents);
+    // Initialized-data sections are readable and never writable/executable.
+    try std.testing.expect(section.characteristics & image_scn_cnt_initialized_data != 0);
+    try std.testing.expect(section.characteristics & image_scn_mem_read != 0);
+    try std.testing.expect(section.characteristics & image_scn_mem_write == 0);
+    try std.testing.expect(section.characteristics & image_scn_mem_execute == 0);
+}
+
+test "generate emits an architecture-correct arm64 UKI with aligned sections" {
+    const allocator = std.testing.allocator;
+    const stub = try syntheticStubPe(allocator, 0xAA64);
+    defer allocator.free(stub);
+
+    const linux = "arm64 kernel bytes that are not aligned to any boundary!";
+    const initrd = "arm64 initrd bytes";
+    const cmdline = "root=PARTUUID=22222222-2222-2222-2222-222222222222 console=ttyAMA0,115200n8";
+    const os_release = "ID=vmiz\nVERSION_ID=\"26.04\"\n";
+    const uname = "6.14.0-1008-azure";
+
+    const image = try generate(allocator, .{
+        .stub = stub,
+        .linux = linux,
+        .initrd = initrd,
+        .cmdline = cmdline,
+        .os_release = os_release,
+        .uname = uname,
+    });
+    defer allocator.free(image);
+
+    var parsed = try parseIndependently(allocator, image);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u16, 0xAA64), parsed.machine);
+    try std.testing.expectEqual(efi_subsystem_application, parsed.subsystem);
+    try std.testing.expectEqual(@as(u32, 0), parsed.size_of_headers % parsed.file_alignment);
+    try std.testing.expectEqual(@as(u32, 0), parsed.size_of_image % parsed.section_alignment);
+    // An unsigned UKI must not advertise a certificate table.
+    try std.testing.expectEqual(@as(u32, 0), parsed.security_offset);
+    try std.testing.expectEqual(@as(u32, 0), parsed.security_size);
+
+    // Every section respects file/section alignment and stays within bounds.
+    for (parsed.sections) |section| {
+        try std.testing.expectEqual(@as(u32, 0), section.virtual_address % parsed.section_alignment);
+        if (section.raw_size != 0) {
+            try std.testing.expectEqual(@as(u32, 0), section.raw_offset % parsed.file_alignment);
+            try std.testing.expect(@as(usize, section.raw_offset) + section.raw_size <= image.len);
+            try std.testing.expect(section.virtual_address + section.virtual_size <= parsed.size_of_image);
+        }
+    }
+
+    try expectIndependentSection(&parsed, image, ".linux", linux);
+    try expectIndependentSection(&parsed, image, ".initrd", initrd);
+    try expectIndependentSection(&parsed, image, ".cmdline", cmdline);
+    try expectIndependentSection(&parsed, image, ".osrel", os_release);
+    try expectIndependentSection(&parsed, image, ".uname", uname);
+    // The stub's own executable section is preserved, and no splash is present.
+    try std.testing.expect(parsed.find(".text") != null);
+    try std.testing.expect(parsed.find(".splash") == null);
+}
+
+test "generate is deterministic and sensitive to input changes" {
+    const allocator = std.testing.allocator;
+    const stub = try syntheticStubPe(allocator, 0x8664);
+    defer allocator.free(stub);
+
+    const base = GenerateOptions{
+        .stub = stub,
+        .linux = "kernel",
+        .initrd = "initrd",
+        .cmdline = "root=PARTUUID=33333333-3333-3333-3333-333333333333 quiet",
+        .os_release = "ID=vmiz\n",
+        .uname = "6.14.0-1008-azure",
+    };
+
+    const first = try generate(allocator, base);
+    defer allocator.free(first);
+    const second = try generate(allocator, base);
+    defer allocator.free(second);
+    try std.testing.expectEqualSlices(u8, first, second);
+
+    var changed = base;
+    changed.cmdline = "root=PARTUUID=33333333-3333-3333-3333-333333333333 quiet debug";
+    const different = try generate(allocator, changed);
+    defer allocator.free(different);
+    try std.testing.expect(!std.mem.eql(u8, first, different));
+}
+
+test "generate rejects malformed kernel, initrd, and metadata inputs" {
+    const allocator = std.testing.allocator;
+    const stub = try syntheticStubPe(allocator, 0x8664);
+    defer allocator.free(stub);
+
+    const ok = GenerateOptions{
+        .stub = stub,
+        .linux = "kernel",
+        .cmdline = "quiet",
+        .os_release = "ID=vmiz\n",
+        .uname = "6.14.0-azure",
+    };
+
+    {
+        var bad = ok;
+        bad.linux = "";
+        try std.testing.expectError(error.EmptyKernel, generate(allocator, bad));
+    }
+    {
+        var bad = ok;
+        bad.initrd = "";
+        try std.testing.expectError(error.InitrdEmpty, generate(allocator, bad));
+    }
+    {
+        const big = try allocator.alloc(u8, limits.max_cmdline_size + 1);
+        defer allocator.free(big);
+        @memset(big, 'a');
+        var bad = ok;
+        bad.cmdline = big;
+        try std.testing.expectError(error.CmdlineTooLarge, generate(allocator, bad));
+    }
+    {
+        const big = try allocator.alloc(u8, limits.max_os_release_size + 1);
+        defer allocator.free(big);
+        @memset(big, 'a');
+        var bad = ok;
+        bad.os_release = big;
+        try std.testing.expectError(error.OsReleaseTooLarge, generate(allocator, bad));
+    }
+    {
+        const big = try allocator.alloc(u8, limits.max_uname_size + 1);
+        defer allocator.free(big);
+        @memset(big, 'a');
+        var bad = ok;
+        bad.uname = big;
+        try std.testing.expectError(error.UnameTooLarge, generate(allocator, bad));
+    }
+}
+
+test "generate and inspect reject malformed stub images" {
+    const allocator = std.testing.allocator;
+    const options = GenerateOptions{
+        .stub = "",
+        .linux = "kernel",
+        .cmdline = "quiet",
+        .os_release = "ID=vmiz\n",
+        .uname = "6.14.0-azure",
+    };
+
+    {
+        var opt = options;
+        opt.stub = "MZ short";
+        try std.testing.expectError(error.TruncatedStub, generate(allocator, opt));
+    }
+    {
+        const stub = try syntheticStubPe(allocator, 0x8664);
+        defer allocator.free(stub);
+        stub[0] = 'X';
+        var opt = options;
+        opt.stub = stub;
+        try std.testing.expectError(error.BadDosSignature, generate(allocator, opt));
+    }
+    {
+        const stub = try syntheticStubPe(allocator, 0x8664);
+        defer allocator.free(stub);
+        const pe_offset = std.mem.readInt(u32, stub[0x3C..0x40], .little);
+        stub[pe_offset] = 'x';
+        var opt = options;
+        opt.stub = stub;
+        try std.testing.expectError(error.BadPeSignature, generate(allocator, opt));
+    }
+    {
+        const stub = try syntheticStubPe(allocator, 0x8664);
+        defer allocator.free(stub);
+        const pe_offset = std.mem.readInt(u32, stub[0x3C..0x40], .little);
+        const opt_off = pe_offset + pe_signature.len + file_header_size;
+        std.mem.writeInt(u16, stub[opt_off..][0..2], 0x10B, .little);
+        var opt = options;
+        opt.stub = stub;
+        try std.testing.expectError(error.UnsupportedOptionalHeader, generate(allocator, opt));
+    }
+    {
+        const stub = try syntheticStubPe(allocator, 0x8664);
+        defer allocator.free(stub);
+        const pe_offset = std.mem.readInt(u32, stub[0x3C..0x40], .little);
+        std.mem.writeInt(u16, stub[pe_offset + pe_signature.len + file_header_section_count_offset ..][0..2], @intCast(limits.max_sections + 1), .little);
+        var opt = options;
+        opt.stub = stub;
+        try std.testing.expectError(error.TooManySections, generate(allocator, opt));
+        try std.testing.expectError(error.TooManySections, inspect(allocator, stub));
+    }
+}
+
+fn runUkiOracle(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    args: []const []const u8,
+) !?[]u8 {
+    const argv = try allocator.alloc([]const u8, args.len + 1);
+    defer allocator.free(argv);
+    argv[0] = name;
+    @memcpy(argv[1..], args);
+    const result = std.process.run(allocator, std.testing.io, .{
+        .argv = argv,
+        .cwd = .{ .path = "." },
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(result.stderr);
+    errdefer allocator.free(result.stdout);
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.ExternalToolFailed,
+        else => return error.ExternalToolFailed,
+    }
+    return result.stdout;
+}
+
+// Optional, skip-by-default cross-validation against an independent tool. Set
+// VMIZ_UKI_ORACLE_STUB to a real systemd-stub PE to build a UKI on top of it
+// and confirm the section table with `objdump -h` (binutils) or `ukify
+// inspect` (systemd), whichever is installed. These tools are test oracles
+// only; production never depends on them.
+test "optional external oracle confirms native UKI section table" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const stub_path = std.testing.environ.getAlloc(allocator, "VMIZ_UKI_ORACLE_STUB") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.free(stub_path);
+
+    const stub = std.Io.Dir.cwd().readFileAlloc(io, stub_path, allocator, .limited(limits.max_stub_size)) catch
+        return error.SkipZigTest;
+    defer allocator.free(stub);
+
+    const image = try generate(allocator, .{
+        .stub = stub,
+        .linux = "oracle kernel payload",
+        .initrd = "oracle initrd payload",
+        .cmdline = "root=PARTUUID=44444444-4444-4444-4444-444444444444 quiet",
+        .os_release = "ID=vmiz\nVERSION_ID=\"26.04\"\n",
+        .uname = "6.14.0-1008-azure",
+    });
+    defer allocator.free(image);
+
+    const scratch = "uki-oracle-scratch.efi";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = scratch, .data = image });
+    defer std.Io.Dir.cwd().deleteFile(io, scratch) catch {};
+
+    const listing = (try runUkiOracle(allocator, "objdump", &.{ "-h", scratch })) orelse
+        (try runUkiOracle(allocator, "ukify", &.{ "inspect", scratch })) orelse
+        return error.SkipZigTest;
+    defer allocator.free(listing);
+
+    for ([_][]const u8{ ".linux", ".initrd", ".cmdline", ".osrel", ".uname" }) |name| {
+        if (std.mem.indexOf(u8, listing, name) == null) return error.OracleSectionMissing;
+    }
 }
