@@ -2141,6 +2141,7 @@ test "production builder contains no libguestfs command surface" {
         return error.TestBoundaryMissing;
     const production = source[0..tests_begin];
     for (&[_][]const u8{
+        "\"libguestfs\"",
         "\"guestfish\"",
         "\"virt-resize\"",
         "\"virt-customize\"",
@@ -2152,6 +2153,7 @@ test "production builder contains no libguestfs command surface" {
         "\"virt-tar-in\"",
         "\"virt-tar-out\"",
         "\"supermin\"",
+        "\"LIBGUESTFS_BACKEND_SETTINGS\"",
     }) |forbidden| {
         try std.testing.expect(std.mem.indexOf(u8, production, forbidden) == null);
     }
