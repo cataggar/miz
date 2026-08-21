@@ -12,6 +12,7 @@ const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const linux = std.os.linux;
 
 pub const Architecture = enum {
     x86_64,
@@ -277,131 +278,131 @@ pub const Executor = struct {
         if (builtin.os.tag != .linux) return error.UnsupportedHost;
         const host_timeout_ms = self.options.supervisor_timeout_ms_override orelse
             (std.math.add(u64, timeout_ms, cleanup_timeout_ms) catch return error.TimeoutOutOfRange);
+        // Resolve the supervisor deadline before allocating any descriptor so a
+        // rejected timeout leaves no file descriptor behind.
         const supervisor_deadline = try makeSupervisorDeadline(self.io, host_timeout_ms);
-        // The namespace's first child is chrooted before this script can
-        // mount /proc or run guest code. The host-side `std.process.run`
-        // timeout supervises the whole unshare process; the in-namespace
-        // setpriv/timeout pair drops capabilities before guest code starts,
-        // supplies a shorter command deadline, and kills its process group
-        // before the reverse unmount trap runs.
-        const inner_script =
-            \\set -eu
-            \\timeout_seconds="$1"
-            \\shift
-            \\cd /
-            \\cleanup() { status=$?; umount -n /tmp 2>/dev/null || umount -n -l /tmp 2>/dev/null || { echo tmp-cleanup-failed >&2; status=125; }; umount -n /run 2>/dev/null || umount -n -l /run 2>/dev/null || { echo run-cleanup-failed >&2; status=125; }; umount -n /sys 2>/dev/null || umount -n -l /sys 2>/dev/null || { echo sys-cleanup-failed >&2; status=125; }; umount -n /proc 2>/dev/null || umount -n -l /proc 2>/dev/null || { echo proc-cleanup-failed >&2; status=125; }; umount -n /dev 2>/dev/null || umount -n -l /dev 2>/dev/null || true; exit "$status"; }
-            \\trap cleanup EXIT
-            \\mount -t proc -o nosuid,nodev,noexec proc /proc
-            \\mount -t sysfs -o ro,nosuid,nodev,noexec sysfs /sys
-            \\mount -t tmpfs -o mode=0755,nosuid tmpfs /dev
-            \\mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
-            \\mount -t tmpfs -o mode=1777,nosuid,nodev,noexec tmpfs /tmp
-            \\mknod -m 666 /dev/null c 1 3
-            \\mknod -m 666 /dev/zero c 1 5
-            \\mknod -m 666 /dev/random c 1 8
-            \\mknod -m 666 /dev/urandom c 1 9
-            \\chmod 666 /dev/null /dev/zero /dev/random /dev/urandom
-            \\set +e
-            \\setpriv --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- timeout --signal=TERM --kill-after=5s "$timeout_seconds" "$@"
-            \\status=$?
-            \\set -e
-            \\if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then kill -KILL -1 2>/dev/null || true; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do wait 2>/dev/null || break; done; fi
-            \\exit "$status"
-        ;
-        const unshare_script =
-            \\set -eu
-            \\root_fd="$1"
-            \\shift
-            \\inner_script="$1"
-            \\shift
-            \\mountpoint="$1"
-            \\shift
-            \\pre_chroot_seconds="$1"
-            \\shift
-            \\case "$root_fd" in *[!0-9]*|'') exit 125;; esac
-            \\if [ "$pre_chroot_seconds" != "0" ]; then sleep "$pre_chroot_seconds"; fi
-            \\mount --bind "/proc/self/fd/$root_fd" "$mountpoint"
-            \\for fd_path in /proc/self/fd/*; do fd="${fd_path##*/}"; case "$fd" in 0|1|2) ;; *) eval "exec ${fd}>&-" 2>/dev/null || true ;; esac; done
-            \\exec chroot "$mountpoint" /bin/sh -c "$inner_script" vmiz-offline-root "$@"
-        ;
-        var argv = std.array_list.Managed([]const u8).init(self.allocator);
-        defer argv.deinit();
-        try argv.append("setsid");
-        try argv.append("unshare");
-        try argv.append("--mount");
-        try argv.append("--net");
-        try argv.append("--pid");
-        try argv.append("--fork");
-        try argv.append("--kill-child");
-        try argv.append("--propagation");
-        try argv.append("private");
-        try argv.append("--");
-        try argv.append("/bin/sh");
-        try argv.append("-c");
-        try argv.append(unshare_script);
-        try argv.append("vmiz-unshare");
-        const root_fd_text = try std.fmt.allocPrint(
-            self.allocator,
-            "{d}",
-            .{self.root_dir.handle},
-        );
-        try argv.append(root_fd_text);
-        try argv.append(inner_script);
-        const mountpoint = try std.fmt.allocPrint(
-            self.allocator,
-            "/run/vmiz-offline-root-{d}-{d}",
-            .{ std.os.linux.getpid(), self.root_dir.handle },
-        );
-        try argv.append(mountpoint);
-        const pre_chroot_seconds = try std.fmt.allocPrint(
-            self.allocator,
-            "{d}",
-            .{std.math.divCeil(u64, self.options.pre_chroot_delay_ms, 1000) catch return error.TimeoutOutOfRange},
-        );
-        try argv.append(pre_chroot_seconds);
-        const timeout_seconds = try std.fmt.allocPrint(
-            self.allocator,
-            "{d}s",
-            .{std.math.divCeil(u64, timeout_ms, 1000) catch return error.TimeoutOutOfRange},
-        );
-        try argv.append(timeout_seconds);
-        try argv.appendSlice(guest_argv);
-        defer self.allocator.free(root_fd_text);
-        defer self.allocator.free(pre_chroot_seconds);
-        defer self.allocator.free(timeout_seconds);
-        defer self.allocator.free(mountpoint);
-        try Io.Dir.createDirAbsolute(self.io, mountpoint, .fromMode(0o700));
-        defer Io.Dir.deleteDirAbsolute(self.io, mountpoint) catch {};
 
-        var environment = std.process.Environ.Map.init(self.allocator);
-        defer environment.deinit();
-        try environment.put("HOME", "/root");
-        try environment.put("LANG", "C");
-        try environment.put("LC_ALL", "C");
-        try environment.put("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
-        try environment.put("TERM", "dumb");
-        try environment.put("DEBIAN_FRONTEND", "noninteractive");
-        const result = try self.runSupervised(argv.items, &environment, supervisor_deadline);
-        return result;
+        // The bounded executor no longer shells out to util-linux.  A single
+        // clone(2) creates PID 1 of a fresh mount/network/PID namespace, and
+        // that init child performs every mount, device node, chroot,
+        // capability drop and exec step with raw syscalls.  All of the data it
+        // reads is prepared here and observed through copy-on-write memory; the
+        // child itself only issues async-signal-safe syscalls.
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const guest_argv_z = try dupeArgvZ(arena, guest_argv);
+        const guest_envp_z = try buildGuestEnvironment(arena);
+
+        // The staging root is reached through the inherited descriptor only.
+        // Its `/proc/self/fd/N` alias lets the init child re-resolve the exact
+        // inode inside the new mount namespace (rename-proof), and the private
+        // bind mount onto a dedicated mountpoint gives chroot a real mount root
+        // so the pseudo-filesystems below it can be mounted.
+        const root_fd_path = try std.fmt.allocPrintSentinel(
+            arena,
+            "/proc/self/fd/{d}",
+            .{self.root_dir.handle},
+            0,
+        );
+        const mountpoint = try std.fmt.allocPrintSentinel(
+            arena,
+            "/run/vmiz-offline-root-{d}-{d}",
+            .{ linux.getpid(), self.root_dir.handle },
+            0,
+        );
+        // Create the mountpoint on the host before entering the namespace; the
+        // bind mount performed inside stays private, so only this empty
+        // directory is ever visible on the host and it is removed on return.
+        switch (linux.errno(linux.mkdir(mountpoint.ptr, 0o700))) {
+            .SUCCESS, .EXIST => {},
+            else => return error.MountpointSetupFailed,
+        }
+        defer _ = linux.rmdir(mountpoint.ptr);
+
+        var request = NamespaceRequest{
+            .root_fd = self.root_dir.handle,
+            .root_fd_path = root_fd_path.ptr,
+            .mountpoint = mountpoint.ptr,
+            .argv = guest_argv_z,
+            .envp = guest_envp_z,
+            .guest_timeout_ms = timeout_ms,
+            .kill_grace_ms = guest_kill_grace_ms,
+            .pre_chroot_delay_ms = self.options.pre_chroot_delay_ms,
+            .stdin_fd = -1,
+            .stdout_fd = -1,
+            .stderr_fd = -1,
+        };
+
+        const stack = try self.allocator.alignedAlloc(u8, .@"16", child_stack_size);
+        defer self.allocator.free(stack);
+
+        const dev_null_fd = blk: {
+            const rc = linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+            if (linux.errno(rc) != .SUCCESS) return error.DevNullUnavailable;
+            break :blk @as(i32, @intCast(rc));
+        };
+        var dev_null_open = true;
+        defer if (dev_null_open) {
+            _ = linux.close(dev_null_fd);
+        };
+
+        const stdout_pipe = try openChildPipe();
+        var stdout_pipe_open = true;
+        defer if (stdout_pipe_open) closePipePair(stdout_pipe);
+        const stderr_pipe = try openChildPipe();
+        var stderr_pipe_open = true;
+        defer if (stderr_pipe_open) closePipePair(stderr_pipe);
+
+        request.stdin_fd = dev_null_fd;
+        request.stdout_fd = stdout_pipe[1];
+        request.stderr_fd = stderr_pipe[1];
+
+        const stack_top = @intFromPtr(stack.ptr) + stack.len;
+        const clone_flags: u32 = @as(u32, linux.CLONE.NEWNS) |
+            @as(u32, linux.CLONE.NEWNET) |
+            @as(u32, linux.CLONE.NEWPID) |
+            @as(u32, @intFromEnum(linux.SIG.CHLD));
+        const clone_rc = linux.clone(
+            namespaceChild,
+            stack_top,
+            clone_flags,
+            @intFromPtr(&request),
+            null,
+            0,
+            null,
+        );
+        if (linux.errno(clone_rc) != .SUCCESS) return error.NamespaceSpawnFailed;
+        const child_pid: i32 = @intCast(clone_rc);
+
+        // Keep only the read ends of the pipes; the child owns stdin and the
+        // write ends now.
+        _ = linux.close(dev_null_fd);
+        dev_null_open = false;
+        _ = linux.close(stdout_pipe[1]);
+        _ = linux.close(stderr_pipe[1]);
+        stdout_pipe_open = false;
+        stderr_pipe_open = false;
+
+        var child = SupervisedChild{
+            .pid = child_pid,
+            .stdout = .{ .handle = stdout_pipe[0], .flags = .{ .nonblocking = false } },
+            .stderr = .{ .handle = stderr_pipe[0], .flags = .{ .nonblocking = false } },
+        };
+        return self.runSupervised(&child, supervisor_deadline);
     }
 
     fn runSupervised(
         self: *Executor,
-        argv: []const []const u8,
-        environment: *std.process.Environ.Map,
+        child: *SupervisedChild,
         deadline: Io.Timeout,
     ) !CommandResult {
-        var child = try std.process.spawn(self.io, .{
-            .argv = argv,
-            .environ_map = environment,
-            .stdin = .ignore,
-            .stdout = .pipe,
-            .stderr = .pipe,
-        });
+        defer child.closeStreams(self.io);
         var child_active = true;
         defer if (child_active) {
-            killProcessGroup(&child);
-            child.kill(self.io);
+            signalChildTree(child.pid);
+            reapChild(child.pid);
         };
         var multi_reader_buffer: Io.File.MultiReader.Buffer(2) = undefined;
         var multi_reader: Io.File.MultiReader = undefined;
@@ -409,7 +410,7 @@ pub const Executor = struct {
             self.allocator,
             self.io,
             multi_reader_buffer.toStreams(),
-            &.{ child.stdout.?, child.stderr.? },
+            &.{ child.stdout, child.stderr },
         );
         defer multi_reader.deinit();
         const stdout_reader = multi_reader.reader(0);
@@ -418,46 +419,32 @@ pub const Executor = struct {
             if (stdout_reader.buffered().len > 4 * 1024 * 1024 or
                 stderr_reader.buffered().len > 4 * 1024 * 1024)
             {
-                killProcessGroup(&child);
-                child.kill(self.io);
                 return error.StreamTooLong;
             }
         } else |err| switch (err) {
             error.EndOfStream => {},
-            error.Timeout => {
-                killProcessGroup(&child);
-                child.kill(self.io);
-                return .{
-                    .outcome = .timed_out,
-                    .exit_code = null,
-                    .stdout = &.{},
-                    .stderr = &.{},
-                };
+            error.Timeout => return .{
+                .outcome = .timed_out,
+                .exit_code = null,
+                .stdout = &.{},
+                .stderr = &.{},
             },
-            else => |read_err| {
-                killProcessGroup(&child);
-                child.kill(self.io);
-                return read_err;
-            },
+            else => |read_err| return read_err,
         }
         try multi_reader.checkAnyError();
         const term = waitUntilDeadline(
             self.io,
-            &child,
+            child.pid,
             deadline,
             self.options.pidfd_mode,
             self.options.pidfd_open_fn,
         ) catch |err| {
-            killProcessGroup(&child);
-            child.kill(self.io);
-            if (err == error.Timeout) {
-                return .{
-                    .outcome = .timed_out,
-                    .exit_code = null,
-                    .stdout = &.{},
-                    .stderr = &.{},
-                };
-            }
+            if (err == error.Timeout) return .{
+                .outcome = .timed_out,
+                .exit_code = null,
+                .stdout = &.{},
+                .stderr = &.{},
+            };
             return err;
         };
         child_active = false;
@@ -482,11 +469,342 @@ pub const Executor = struct {
     }
 };
 
-fn killProcessGroup(child: *std.process.Child) void {
+// The remainder of this file implements the namespaced executor with direct
+// Linux system calls, replacing the previous setsid/unshare/mount/umount
+// helper processes.
+
+const child_stack_size: usize = 128 * 1024;
+const guest_kill_grace_ms: u64 = 5 * 1000;
+/// _LINUX_CAPABILITY_VERSION_3, the 64-bit capability ABI used by capset(2).
+const linux_capability_version_3: u32 = 0x20080522;
+const namespace_setup_failure_exit: u8 = 125;
+const namespace_supervisor_failure_exit: u8 = 125;
+const guest_exec_failure_exit: u8 = 126;
+const guest_timeout_exit: u8 = 124;
+
+/// Immutable description of the namespace the init child must build.  It lives
+/// on the parent's stack and is read by the child through copy-on-write memory.
+const NamespaceRequest = struct {
+    root_fd: i32,
+    root_fd_path: [*:0]const u8,
+    mountpoint: [*:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    guest_timeout_ms: u64,
+    kill_grace_ms: u64,
+    pre_chroot_delay_ms: u64,
+    stdin_fd: i32,
+    stdout_fd: i32,
+    stderr_fd: i32,
+};
+
+/// Parent-side handle to the cloned init child and the pipe read ends it feeds.
+const SupervisedChild = struct {
+    pid: i32,
+    stdout: Io.File,
+    stderr: Io.File,
+    streams_open: bool = true,
+
+    fn closeStreams(self: *SupervisedChild, io: Io) void {
+        if (!self.streams_open) return;
+        self.streams_open = false;
+        self.stdout.close(io);
+        self.stderr.close(io);
+    }
+};
+
+const MountSpec = struct {
+    source: [*:0]const u8,
+    target: [*:0]const u8,
+    fstype: [*:0]const u8,
+    flags: u32,
+    data: ?[*:0]const u8,
+    stage: [*:0]const u8,
+};
+
+const DeviceNode = struct {
+    path: [*:0]const u8,
+    major: u32,
+    minor: u32,
+};
+
+/// The pseudo-filesystem allowlist, byte-for-byte equivalent to the previous
+/// in-namespace mount script.
+const guest_mounts = [_]MountSpec{
+    .{ .source = "proc", .target = "/proc", .fstype = "proc", .flags = linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC, .data = null, .stage = "proc" },
+    .{ .source = "sysfs", .target = "/sys", .fstype = "sysfs", .flags = linux.MS.RDONLY | linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC, .data = null, .stage = "sys" },
+    .{ .source = "tmpfs", .target = "/dev", .fstype = "tmpfs", .flags = linux.MS.NOSUID, .data = "mode=0755", .stage = "dev" },
+    .{ .source = "tmpfs", .target = "/run", .fstype = "tmpfs", .flags = linux.MS.NOSUID | linux.MS.NODEV, .data = "mode=0755", .stage = "run" },
+    .{ .source = "tmpfs", .target = "/tmp", .fstype = "tmpfs", .flags = linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC, .data = "mode=1777", .stage = "tmp" },
+};
+
+/// The device-node allowlist mirrors the previous `mknod` invocations.
+const guest_devices = [_]DeviceNode{
+    .{ .path = "/dev/null", .major = 1, .minor = 3 },
+    .{ .path = "/dev/zero", .major = 1, .minor = 5 },
+    .{ .path = "/dev/random", .major = 1, .minor = 8 },
+    .{ .path = "/dev/urandom", .major = 1, .minor = 9 },
+};
+
+fn dupeArgvZ(arena: Allocator, argv: []const []const u8) ![:null]const ?[*:0]const u8 {
+    const list = try arena.allocSentinel(?[*:0]const u8, argv.len, null);
+    for (argv, 0..) |value, index| list[index] = (try arena.dupeZ(u8, value)).ptr;
+    return list;
+}
+
+fn buildGuestEnvironment(arena: Allocator) ![:null]const ?[*:0]const u8 {
+    const entries = [_][]const u8{
+        "HOME=/root",
+        "LANG=C",
+        "LC_ALL=C",
+        "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+        "TERM=dumb",
+        "DEBIAN_FRONTEND=noninteractive",
+    };
+    const list = try arena.allocSentinel(?[*:0]const u8, entries.len, null);
+    inline for (entries, 0..) |value, index| list[index] = (try arena.dupeZ(u8, value)).ptr;
+    return list;
+}
+
+fn openChildPipe() ![2]i32 {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS)
+        return error.PipeCreationFailed;
+    return fds;
+}
+
+fn closePipePair(fds: [2]i32) void {
+    _ = linux.close(fds[0]);
+    _ = linux.close(fds[1]);
+}
+
+fn makeDevice(major: u32, minor: u32) u32 {
+    return (major << 8) | (minor & 0xff) | ((minor & 0xffffff00) << 12);
+}
+
+/// Entry point for the cloned namespace init (PID 1).  It runs single-threaded
+/// on a private stack, a copy-on-write image of the parent, so it must only use
+/// async-signal-safe raw syscalls: no allocation, locks, TLS or panics.
+fn namespaceChild(arg: usize) callconv(.c) u8 {
+    const request: *const NamespaceRequest = @ptrFromInt(arg);
+
+    // If the supervising parent dies, take the whole namespace down with it.
+    // This replaces `unshare --kill-child`.
+    _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @as(usize, @intFromEnum(linux.SIG.KILL)), 0, 0, 0);
+    // Lead a fresh session/process group so the parent can signal the whole
+    // tree at once (previously provided by `setsid`).
+    _ = linux.setsid();
+    resetChildSignals();
+
+    // Attach the guest's stdio before the inherited descriptor table is closed.
+    if (linux.errno(linux.dup2(request.stdin_fd, 0)) != .SUCCESS) return childSetupFailure("stdin");
+    if (linux.errno(linux.dup2(request.stdout_fd, 1)) != .SUCCESS) return childSetupFailure("stdout");
+    if (linux.errno(linux.dup2(request.stderr_fd, 2)) != .SUCCESS) return childSetupFailure("stderr");
+
+    // Make every mount private so nothing propagates back to the host mount
+    // namespace (previously `unshare --propagation private`).
+    if (linux.errno(linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0)) != .SUCCESS)
+        return childSetupFailure("propagation");
+
+    if (request.pre_chroot_delay_ms != 0) childSleepMs(request.pre_chroot_delay_ms);
+
+    // Re-resolve the staging root strictly through the inherited descriptor.
+    // `/proc/self/fd/N` names the exact inode the parent opened, so a rename of
+    // the original path cannot redirect the chroot.  Reading the link yields
+    // that inode's current path, which is bind-mounted onto a dedicated
+    // mountpoint inside this private namespace; chrooting into a real mount
+    // root is what lets the pseudo-filesystems below be mounted.  This mirrors
+    // the previous `mount --bind /proc/self/fd/$root_fd $mountpoint` step.
+    var resolved_root: [linux.PATH_MAX]u8 = undefined;
+    const link_len = linux.readlink(request.root_fd_path, &resolved_root, resolved_root.len);
+    if (linux.errno(link_len) != .SUCCESS or link_len >= resolved_root.len)
+        return childSetupFailure("resolve-root");
+    resolved_root[link_len] = 0;
+    const resolved_root_z: [*:0]const u8 = @ptrCast(&resolved_root);
+    if (linux.errno(linux.mount(resolved_root_z, request.mountpoint, null, linux.MS.BIND, 0)) != .SUCCESS)
+        return childSetupFailure("bind-root");
+    if (linux.errno(linux.chroot(request.mountpoint)) != .SUCCESS) return childSetupFailure("chroot");
+    if (linux.errno(linux.chdir("/")) != .SUCCESS) return childSetupFailure("chdir");
+    _ = linux.close(request.root_fd);
+
+    for (guest_mounts) |spec| {
+        _ = linux.mkdir(spec.target, 0o755);
+        const data: usize = if (spec.data) |ptr| @intFromPtr(ptr) else 0;
+        if (linux.errno(linux.mount(spec.source, spec.target, spec.fstype, spec.flags, data)) != .SUCCESS)
+            return childSetupFailure(spec.stage);
+    }
+
+    for (guest_devices) |device| {
+        const mode: u32 = linux.S.IFCHR | 0o666;
+        if (linux.errno(linux.mknod(device.path, mode, makeDevice(device.major, device.minor))) != .SUCCESS)
+            return childSetupFailure("device");
+        _ = linux.chmod(device.path, 0o666);
+    }
+
+    // Drop every inherited descriptor above stdio so the guest starts from a
+    // clean table and can never observe the staging root descriptor.
+    _ = linux.close_range(3, std.math.maxInt(i32), .{ .CLOEXEC = false, .UNSHARE = false });
+
+    const guest = linux.fork();
+    if (linux.errno(guest) != .SUCCESS) return childSetupFailure("fork");
+    if (guest == 0) {
+        // Guest child: drop all capabilities, then exec the allowlisted command
+        // as an unprivileged (capability-empty) uid 0 process.
+        dropAllCapabilities();
+        const path = request.argv[0] orelse linux.exit(guest_exec_failure_exit);
+        _ = linux.execve(path, request.argv, request.envp);
+        childWriteAll(2, "vmiz-offline-root: exec failed\n");
+        linux.exit(guest_exec_failure_exit);
+    }
+
+    return superviseGuest(@intCast(guest), request.guest_timeout_ms, request.kill_grace_ms);
+}
+
+/// Reset the signals PID 1 relies on so an inherited disposition cannot disturb
+/// child reaping or teardown signalling.
+fn resetChildSignals() void {
+    const action = linux.Sigaction{
+        .handler = .{ .handler = linux.SIG.DFL },
+        .mask = std.mem.zeroes(linux.sigset_t),
+        .flags = 0,
+    };
+    _ = linux.sigaction(.CHLD, &action, null);
+    const empty = std.mem.zeroes(linux.sigset_t);
+    _ = linux.sigprocmask(linux.SIG.SETMASK, &empty, null);
+}
+
+/// Supervise the guest from inside the namespace: enforce the per-command
+/// timeout, escalate TERM then KILL, and reap every descendant so no zombie or
+/// stray process survives.  Runs as PID 1, so `kill(-1, ...)` reaches the whole
+/// namespace exactly like the previous `kill -KILL -1`.
+fn superviseGuest(guest_pid: i32, timeout_ms: u64, kill_grace_ms: u64) u8 {
+    const start = monotonicMs();
+    var guest_status: u32 = 0;
+    var guest_reaped = false;
+    var timed_out = false;
+    var escalated = false;
+    var terminate_at: u64 = 0;
+    while (true) {
+        while (true) {
+            var status: u32 = undefined;
+            const rc = linux.waitpid(-1, &status, linux.W.NOHANG);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) break;
+                    if (@as(i32, @intCast(rc)) == guest_pid) {
+                        guest_status = status;
+                        guest_reaped = true;
+                    }
+                },
+                .INTR => {},
+                .CHILD => {
+                    if (timed_out) return guest_timeout_exit;
+                    if (guest_reaped) return exitStatusCode(guest_status);
+                    return namespace_supervisor_failure_exit;
+                },
+                else => return namespace_supervisor_failure_exit,
+            }
+        }
+        const now = monotonicMs();
+        if (guest_reaped) {
+            _ = linux.kill(-1, linux.SIG.KILL);
+        } else if (!timed_out and now -% start >= timeout_ms) {
+            timed_out = true;
+            terminate_at = now;
+            _ = linux.kill(-1, linux.SIG.TERM);
+        } else if (timed_out and !escalated and now -% terminate_at >= kill_grace_ms) {
+            escalated = true;
+            _ = linux.kill(-1, linux.SIG.KILL);
+        }
+        childSleepMs(10);
+    }
+}
+
+/// Replicates `setpriv --inh-caps=-all --ambient-caps=-all --bounding-set=-all`:
+/// clears the ambient set, empties the bounding set, and zeroes the permitted,
+/// effective and inheritable sets so the exec starts with no capabilities.
+fn dropAllCapabilities() void {
+    _ = linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), linux.PR.CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+    var capability: usize = 0;
+    while (capability <= linux.CAP.LAST_CAP) : (capability += 1) {
+        _ = linux.prctl(@intFromEnum(linux.PR.CAPBSET_DROP), capability, 0, 0, 0);
+    }
+    var header = linux.cap_user_header_t{ .version = linux_capability_version_3, .pid = 0 };
+    const data = [2]linux.cap_user_data_t{
+        .{ .effective = 0, .permitted = 0, .inheritable = 0 },
+        .{ .effective = 0, .permitted = 0, .inheritable = 0 },
+    };
+    _ = linux.capset(&header, &data[0]);
+}
+
+fn childSleepMs(milliseconds: u64) void {
+    var request = linux.timespec{
+        .sec = @intCast(milliseconds / 1000),
+        .nsec = @intCast((milliseconds % 1000) * std.time.ns_per_ms),
+    };
+    var remaining: linux.timespec = undefined;
+    while (true) {
+        const rc = linux.nanosleep(&request, &remaining);
+        if (linux.errno(rc) == .INTR) {
+            request = remaining;
+            continue;
+        }
+        return;
+    }
+}
+
+fn monotonicMs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
+    const seconds: u64 = if (ts.sec < 0) 0 else @intCast(ts.sec);
+    const nanoseconds: u64 = if (ts.nsec < 0) 0 else @intCast(ts.nsec);
+    return seconds *% 1000 +% nanoseconds / std.time.ns_per_ms;
+}
+
+fn exitStatusCode(status: u32) u8 {
+    const signal = status & 0x7f;
+    if (signal == 0) return @intCast((status >> 8) & 0xff);
+    return @intCast(128 + (signal & 0x7f));
+}
+
+fn childSetupFailure(stage: [*:0]const u8) u8 {
+    childWriteAll(2, "vmiz-offline-root: setup stage '");
+    childWriteAll(2, std.mem.span(stage));
+    childWriteAll(2, "' failed\n");
+    return namespace_setup_failure_exit;
+}
+
+fn childWriteAll(fd: i32, bytes: []const u8) void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const rc = linux.write(fd, bytes.ptr + offset, bytes.len - offset);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return;
+                offset += rc;
+            },
+            .INTR => {},
+            else => return,
+        }
+    }
+}
+
+fn signalChildTree(pid: i32) void {
     if (comptime builtin.os.tag != .linux) return;
-    const pid = child.id orelse return;
-    _ = std.os.linux.kill(-@as(i32, @intCast(pid)), .TERM);
-    _ = std.os.linux.kill(-@as(i32, @intCast(pid)), .KILL);
+    _ = linux.kill(-pid, linux.SIG.TERM);
+    _ = linux.kill(pid, linux.SIG.TERM);
+    _ = linux.kill(-pid, linux.SIG.KILL);
+    _ = linux.kill(pid, linux.SIG.KILL);
+}
+
+fn reapChild(pid: i32) void {
+    if (comptime builtin.os.tag != .linux) return;
+    var status: u32 = undefined;
+    while (true) {
+        const rc = linux.waitpid(pid, &status, 0);
+        if (linux.errno(rc) == .INTR) continue;
+        return;
+    }
 }
 
 fn makeSupervisorDeadline(io: Io, timeout_ms: u64) !Io.Timeout {
@@ -499,65 +817,51 @@ fn makeSupervisorDeadline(io: Io, timeout_ms: u64) !Io.Timeout {
 
 fn waitUntilDeadline(
     io: Io,
-    child: *std.process.Child,
+    pid: i32,
     deadline: Io.Timeout,
     mode: PidfdMode,
     pidfd_open_fn: ?PidfdOpenFn,
 ) !std.process.Child.Term {
-    if (comptime builtin.os.tag != .linux) return child.wait(io);
-    const pid = child.id orelse return error.Timeout;
+    if (comptime builtin.os.tag != .linux) return error.Timeout;
     if (mode == .force_unexpected) return error.PidfdSetupFailed;
-    if (mode != .auto) return waitpidFallback(io, child, pid, deadline);
+    if (mode != .auto) return waitpidFallback(io, pid, deadline);
     const opened = if (pidfd_open_fn) |open_fn|
-        open_fn(@intCast(pid))
+        open_fn(pid)
     else
-        std.os.linux.pidfd_open(pid, 0);
-    if (std.os.linux.errno(opened) != .SUCCESS) switch (std.os.linux.errno(opened)) {
-        .NOSYS, .INVAL, .PERM, .MFILE, .NFILE => return waitpidFallback(io, child, pid, deadline),
+        linux.pidfd_open(pid, 0);
+    if (linux.errno(opened) != .SUCCESS) switch (linux.errno(opened)) {
+        .NOSYS, .INVAL, .PERM, .MFILE, .NFILE => return waitpidFallback(io, pid, deadline),
         else => return error.PidfdSetupFailed,
     };
     const pidfd: i32 = @intCast(opened);
-    defer _ = std.os.linux.close(pidfd);
+    defer _ = linux.close(pidfd);
     while (true) {
-        const remaining = deadline.toDurationFromNow(io) orelse return child.wait(io);
+        const remaining = deadline.toDurationFromNow(io) orelse return reapTerm(pid);
         if (remaining.raw.nanoseconds <= 0) return error.Timeout;
-        var fds = [_]std.os.linux.pollfd{.{
+        var fds = [_]linux.pollfd{.{
             .fd = pidfd,
-            .events = std.os.linux.POLL.IN,
+            .events = linux.POLL.IN,
             .revents = 0,
         }};
         const milliseconds = @max(@as(i64, 1), remaining.raw.toMilliseconds());
-        const poll_result = std.os.linux.poll(&fds, fds.len, @intCast(@min(milliseconds, std.math.maxInt(i32))));
-        switch (std.os.linux.errno(poll_result)) {
-            .SUCCESS => if (poll_result != 0) return child.wait(io),
+        const poll_result = linux.poll(&fds, fds.len, @intCast(@min(milliseconds, std.math.maxInt(i32))));
+        switch (linux.errno(poll_result)) {
+            .SUCCESS => if (poll_result != 0) return reapTerm(pid),
             .INTR => {},
-            else => return waitpidFallback(io, child, pid, deadline),
+            else => return waitpidFallback(io, pid, deadline),
         }
     }
 }
 
-fn waitpidFallback(
-    io: Io,
-    child: *std.process.Child,
-    pid: std.os.linux.pid_t,
-    deadline: Io.Timeout,
-) !std.process.Child.Term {
+fn waitpidFallback(io: Io, pid: i32, deadline: Io.Timeout) !std.process.Child.Term {
     while (true) {
-        const remaining = deadline.toDurationFromNow(io) orelse {
-            var status: u32 = undefined;
-            _ = std.os.linux.waitpid(pid, &status, 0);
-            clearReapedChild(io, child);
-            return waitStatusTerm(status);
-        };
+        const remaining = deadline.toDurationFromNow(io) orelse return reapTerm(pid);
         if (remaining.raw.nanoseconds <= 0) return error.Timeout;
         var status: u32 = undefined;
-        const result = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
-        switch (std.os.linux.errno(result)) {
+        const result = linux.waitpid(pid, &status, linux.W.NOHANG);
+        switch (linux.errno(result)) {
             .SUCCESS => {
-                if (result != 0) {
-                    clearReapedChild(io, child);
-                    return waitStatusTerm(status);
-                }
+                if (result != 0) return waitStatusTerm(status);
             },
             .INTR => continue,
             else => return error.WaitpidFailed,
@@ -570,14 +874,14 @@ fn waitpidFallback(
     }
 }
 
-fn clearReapedChild(io: Io, child: *std.process.Child) void {
-    if (child.stdin) |file| file.close(io);
-    if (child.stdout) |file| file.close(io);
-    if (child.stderr) |file| file.close(io);
-    child.stdin = null;
-    child.stdout = null;
-    child.stderr = null;
-    child.id = null;
+fn reapTerm(pid: i32) std.process.Child.Term {
+    var status: u32 = undefined;
+    while (true) {
+        const rc = linux.waitpid(pid, &status, 0);
+        if (linux.errno(rc) == .INTR) continue;
+        break;
+    }
+    return waitStatusTerm(status);
 }
 
 fn waitStatusTerm(status: u32) std.process.Child.Term {
@@ -1460,6 +1764,37 @@ test "privileged offline namespace contains PID1 and reaps descendants" {
     const fd_sentinel = try Io.Dir.cwd().readFileAlloc(io, sentinel, allocator, .limited(1024));
     defer allocator.free(fd_sentinel);
     try std.testing.expectEqualStrings("unchanged", fd_sentinel);
+    try expectNoResidualOfflineMounts(io);
+
+    // Success path: an allowlisted guest command runs to completion inside the
+    // namespace, and both its captured stdout and zero exit status are
+    // reported back through the raw-syscall supervisor.
+    const succeeded = try executor.runIsolated(
+        &.{ "/bin/sh", "-c", "printf 'ok-%s' \"$1\"", "vmiz", "42" },
+        5 * 1000,
+    );
+    defer {
+        var result = succeeded;
+        result.deinit(allocator);
+    }
+    try std.testing.expectEqual(CommandOutcome.succeeded, succeeded.outcome);
+    try std.testing.expectEqual(@as(?u8, 0), succeeded.exit_code);
+    try std.testing.expectEqualStrings("ok-42", succeeded.stdout);
+    try expectNoResidualOfflineMounts(io);
+
+    // Failure path: a non-zero guest exit is surfaced as a structured failure
+    // that preserves the exit code and the guest's stderr.
+    const failed = try executor.runIsolated(
+        &.{ "/bin/sh", "-c", "printf boom >&2; exit 7" },
+        5 * 1000,
+    );
+    defer {
+        var result = failed;
+        result.deinit(allocator);
+    }
+    try std.testing.expectEqual(CommandOutcome.failed, failed.outcome);
+    try std.testing.expectEqual(@as(?u8, 7), failed.exit_code);
+    try std.testing.expectEqualStrings("boom", failed.stderr);
     try expectNoResidualOfflineMounts(io);
 
     const timed = try executor.runIsolated(

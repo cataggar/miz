@@ -199,12 +199,10 @@ jobs:
           packages=(
             binutils file jq linux-image-generic openssl
             python3 python3-pefile sbsigntool systemd-ukify
-            util-linux
           )
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
           sudo chmod 0644 /boot/vmlinuz-*
-          for tool in mount mknod sbverify chroot ukify \
-            setsid timeout unshare; do
+          for tool in sbverify ukify; do
             command -v "$tool" >/dev/null
           done
 
@@ -467,12 +465,10 @@ jobs:
           sudo mkdir -p -- "$fixture"/{bin,usr/bin,lib64,dev,proc,sys,run,tmp,etc}
           sudo cp /bin/bash "$fixture/bin/bash"
           sudo ln -s bash "$fixture/bin/sh"
-          for tool in chmod env mount umount setpriv mknod sleep timeout; do
-            executable=$(readlink -f "/usr/bin/$tool")
-            test -x "$executable"
-            sudo cp "$executable" "$fixture/usr/bin/$tool"
-          done
-          for binary in /bin/bash /usr/bin/env /usr/bin/mount /usr/bin/umount /usr/bin/setpriv; do
+          sleep_bin=$(readlink -f /usr/bin/sleep)
+          test -x "$sleep_bin"
+          sudo cp "$sleep_bin" "$fixture/usr/bin/sleep"
+          for binary in /bin/bash "$sleep_bin"; do
             sudo cp --parents "$binary" "$fixture"
             while read -r library; do
               [[ -z "$library" ]] || sudo cp --parents "$library" "$fixture"
