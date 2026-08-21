@@ -1270,6 +1270,13 @@ pub fn resize(io: Io, file: Io.File, allocator: std.mem.Allocator, options: Resi
         const raw = readInt(u16, sb[0xFE..0x100]);
         break :blk if (raw == 0) @as(u16, 32) else raw;
     };
+    const old_length = @as(u64, readInt(u32, sb[0x04..0x08])) *
+        (@as(u64, 1024) << @intCast(readInt(u32, sb[0x18..0x1C])));
+    if (ro_compat & feature_ro_compat_sparse_super == 0 and
+        options.length > old_length)
+    {
+        return error.UnsupportedResizeLayout;
+    }
     if (descriptor_size == 64 or
         incompat & (feature_incompat_64bit | feature_incompat_flex_bg | feature_incompat_csum_seed) != 0 or
         compat & feature_compat_resize_inode != 0)
@@ -1429,6 +1436,9 @@ fn resizeGeneral(
     if (descriptor_size != 32 and descriptor_size != 64) return error.UnsupportedDescriptorSize;
 
     classifyGeneralFeatures(compat, incompat, ro_compat) catch return error.UnsupportedFeatures;
+    if (ro_compat & feature_ro_compat_sparse_super == 0) {
+        return error.UnsupportedResizeLayout;
+    }
     if (readInt(u16, sb[0x3A..0x3C]) & state_clean == 0 or
         readInt(u32, sb[0xE8..0xEC]) != 0)
     {
@@ -1526,8 +1536,16 @@ fn resizeGeneral(
     @memcpy(&uuid, sb[0x68..0x78]);
     const checksum_seed = checksumSeed(&sb, uuid, incompat);
     var resize_inode_bytes: ?[]u8 = null;
-    defer if (resize_inode_bytes) |bytes| allocator.free(bytes);
-    if (compat & feature_compat_resize_inode != 0 and gdt_blocks_consumed != 0) {
+    var resize_inode_dindir_bytes: ?[]u8 = null;
+    var resize_inode_reserved_bytes: ?[]u8 = null;
+    defer {
+        if (resize_inode_bytes) |bytes| allocator.free(bytes);
+        if (resize_inode_dindir_bytes) |bytes| allocator.free(bytes);
+        if (resize_inode_reserved_bytes) |bytes| allocator.free(bytes);
+    }
+    if (compat & feature_compat_resize_inode != 0 and
+        (new_group_count > old_group_count or gdt_blocks_consumed != 0))
+    {
         const group_zero = old_gdt[0..descriptor_size_usize];
         const inode_table_block = ext4DescriptorBlock(
             group_zero,
@@ -1540,15 +1558,31 @@ fn resizeGeneral(
             (resize_inode - 1) * inode_size;
         resize_inode_bytes = try allocator.alloc(u8, inode_size);
         _ = try file.readPositionalAll(io, resize_inode_bytes.?, inode_offset);
-        const remaining = try prepareResizeInode(
+        resize_inode_dindir_bytes = try allocator.alloc(u8, default_block_size);
+        const new_reserved_gdt_blocks = reserved_gdt_blocks - gdt_blocks_consumed;
+        resize_inode_reserved_bytes = try allocator.alloc(
+            u8,
+            @as(usize, @intCast(new_reserved_gdt_blocks)) * default_block_size,
+        );
+        const dindir_block = try prepareResizeInodeLegacy(
+            io,
+            file,
+            options.offset,
             resize_inode_bytes.?,
-            reserved_gdt_blocks,
-            gdt_blocks_consumed,
+            resize_inode_dindir_bytes.?,
+            resize_inode_reserved_bytes.?,
             old_gdt_blocks,
+            new_gdt_blocks,
+            old_group_count,
+            new_group_count,
+            blocks_per_group,
+            readInt(u32, sb[0x1C..0x20]),
+            reserved_gdt_blocks,
             checksum_seed,
             ro_compat,
         );
-        reserved_gdt_blocks = remaining;
+        _ = dindir_block;
+        reserved_gdt_blocks = new_reserved_gdt_blocks;
     }
     var free_blocks: u64 =
         readInt(u32, sb[0x0C..0x10]) +
@@ -1749,6 +1783,25 @@ fn resizeGeneral(
             inode_table_block * default_block_size +
             (resize_inode - 1) * inode_size;
         try file.writePositionalAll(io, bytes, inode_offset);
+        const dindir_block = std.mem.readInt(u32, bytes[40 + 13 * 4 ..][0..4], .little);
+        try file.writePositionalAll(
+            io,
+            resize_inode_dindir_bytes.?,
+            options.offset + @as(u64, dindir_block) * default_block_size,
+        );
+        if (resize_inode_reserved_bytes) |reserved_bytes| {
+            var index: usize = 0;
+            while (index < reserved_bytes.len / default_block_size) : (index += 1) {
+                const block = @as(u64, new_gdt_blocks) +
+                    @as(u64, index) +
+                    readInt(u32, sb[0x1C..0x20]) + 1;
+                try file.writePositionalAll(
+                    io,
+                    reserved_bytes[index * default_block_size ..][0..default_block_size],
+                    options.offset + block * default_block_size,
+                );
+            }
+        }
     }
 
     return .{
@@ -1856,76 +1909,132 @@ fn setGeneralDescriptorChecksum(
     writeInt(u16, descriptor[0x1E..0x20], @truncate(checksum));
 }
 
-fn prepareResizeInode(
+fn prepareResizeInodeLegacy(
+    io: Io,
+    file: Io.File,
+    offset: u64,
     inode: []u8,
-    reserved_gdt_blocks: u32,
-    consumed_gdt_blocks: u32,
+    dindir: []u8,
+    reserved_blocks: []u8,
     old_gdt_blocks: u32,
+    new_gdt_blocks: u32,
+    old_group_count: u32,
+    new_group_count: u32,
+    blocks_per_group: u32,
+    first_data_block: u32,
+    reserved_gdt_blocks: u32,
     checksum_seed: u32,
     ro_compat: u32,
-) !u32 {
+) !u64 {
     if (inode.len < 128 or
-        readInt(u32, inode[32..36]) & inode_flag_extents == 0)
+        readInt(u32, inode[32..36]) & inode_flag_extents != 0)
     {
         return error.UnsupportedResizeLayout;
     }
-    if (consumed_gdt_blocks > reserved_gdt_blocks) {
+    if (dindir.len != default_block_size or
+        reserved_blocks.len % default_block_size != 0)
+    {
         return error.UnsupportedResizeLayout;
+    }
+    if (reserved_blocks.len / default_block_size > default_block_size / 4) {
+        return error.UnsupportedResizeLayout;
+    }
+    const dindir_block = std.mem.readInt(u32, inode[40 + 13 * 4 ..][0..4], .little);
+    if (dindir_block == 0) return error.UnsupportedResizeLayout;
+    _ = try file.readPositionalAll(
+        io,
+        dindir,
+        offset + @as(u64, dindir_block) * default_block_size,
+    );
+
+    const addresses_per_block = default_block_size / 4;
+    var expected_index: usize = @intCast(old_gdt_blocks);
+    var index: usize = 0;
+    while (index < addresses_per_block) : (index += 1) {
+        const pointer = std.mem.readInt(u32, dindir[index * 4 ..][0..4], .little);
+        if (index >= @as(usize, @intCast(old_gdt_blocks)) and
+            index < @as(usize, @intCast(old_gdt_blocks + reserved_gdt_blocks)))
+        {
+            if (index != expected_index or
+                pointer != first_data_block + 1 + old_gdt_blocks +
+                    @as(u32, @intCast(index - @as(usize, @intCast(old_gdt_blocks)))))
+            {
+                return error.UnsupportedResizeLayout;
+            }
+            expected_index += 1;
+        } else if (pointer != 0) {
+            return error.UnsupportedResizeLayout;
+        }
     }
 
-    const header = inode[40..52];
-    if (readInt(u16, header[0..2]) != extent_magic or
-        readInt(u16, header[2..4]) != 1 or
-        readInt(u16, header[6..8]) != 0)
-    {
-        return error.UnsupportedResizeLayout;
+    var backup_count: usize = 0;
+    var group: u32 = 1;
+    while (group < old_group_count) : (group += 1) {
+        if (isSparseSuperGroup(group)) backup_count += 1;
     }
-    const extent = inode[52..64];
-    const raw_length = readInt(u16, extent[4..6]);
-    if (raw_length & 0x8000 != 0) return error.UnsupportedResizeLayout;
-    const physical_start =
-        (@as(u64, readInt(u16, extent[6..8])) << 32) |
-        readInt(u32, extent[8..12]);
-    const expected_start = @as(u64, 1) + old_gdt_blocks;
-    if (readInt(u32, extent[0..4]) != 0 or
-        physical_start != expected_start or
-        raw_length < reserved_gdt_blocks)
-    {
-        return error.UnsupportedResizeLayout;
-    }
-    const old_size = @as(u64, readInt(u32, inode[4..8])) |
-        (@as(u64, readInt(u32, inode[108..112])) << 32);
-    const old_blocks = @as(u64, readInt(u32, inode[28..32])) |
-        if (inode.len >= 118)
-            (@as(u64, readInt(u16, inode[116..118])) << 16)
-        else
-            0;
-    if (old_size != @as(u64, reserved_gdt_blocks) * default_block_size or
-        old_blocks != @as(u64, reserved_gdt_blocks) * sectors_per_block)
-    {
-        return error.UnsupportedResizeLayout;
+    if (backup_count > addresses_per_block) return error.UnsupportedResizeLayout;
+
+    var old_reserved_index: u32 = 0;
+    while (old_reserved_index < reserved_gdt_blocks) : (old_reserved_index += 1) {
+        const pointer_block = first_data_block + 1 + old_gdt_blocks + old_reserved_index;
+        var pointers: [default_block_size]u8 = undefined;
+        _ = try file.readPositionalAll(
+            io,
+            &pointers,
+            offset + @as(u64, pointer_block) * default_block_size,
+        );
+        var pointer_index: usize = 0;
+        group = 1;
+        while (group < old_group_count) : (group += 1) {
+            if (!isSparseSuperGroup(group)) continue;
+            const expected = pointer_block + group * blocks_per_group;
+            const actual = std.mem.readInt(u32, pointers[pointer_index * 4 ..][0..4], .little);
+            if (actual != expected) return error.UnsupportedResizeLayout;
+            pointer_index += 1;
+        }
+        while (pointer_index < addresses_per_block) : (pointer_index += 1) {
+            if (std.mem.readInt(u32, pointers[pointer_index * 4 ..][0..4], .little) != 0) {
+                return error.UnsupportedResizeLayout;
+            }
+        }
     }
 
-    const remaining = reserved_gdt_blocks - consumed_gdt_blocks;
-    if (remaining == 0) {
-        writeInt(u16, header[2..4], 0);
-        @memset(inode[52..64], 0);
-    } else {
-        writeInt(u16, extent[4..6], @intCast(remaining));
-        writeInt(u16, extent[6..8], @truncate((physical_start + consumed_gdt_blocks) >> 32));
-        writeInt(u32, extent[8..12], @truncate(physical_start + consumed_gdt_blocks));
+    @memset(dindir, 0);
+    @memset(reserved_blocks, 0);
+    const new_reserved_gdt_blocks = @as(u32, @intCast(reserved_blocks.len / default_block_size));
+    var reserved_index: u32 = 0;
+    while (reserved_index < new_reserved_gdt_blocks) : (reserved_index += 1) {
+        const logical_index = new_gdt_blocks + reserved_index;
+        if (logical_index >= addresses_per_block) return error.UnsupportedResizeLayout;
+        const pointer_block = first_data_block + 1 + new_gdt_blocks + reserved_index;
+        std.mem.writeInt(
+            u32,
+            dindir[@as(usize, logical_index) * 4 ..][0..4],
+            pointer_block,
+            .little,
+        );
+        const pointer_bytes = reserved_blocks[@as(usize, reserved_index) * default_block_size ..][0..default_block_size];
+        var backup_index: usize = 0;
+        group = 1;
+        while (group < new_group_count) : (group += 1) {
+            if (!isSparseSuperGroup(group)) continue;
+            std.mem.writeInt(
+                u32,
+                pointer_bytes[backup_index * 4 ..][0..4],
+                pointer_block + group * blocks_per_group,
+                .little,
+            );
+            backup_index += 1;
+        }
     }
 
-    const size_bytes = @as(u64, remaining) * default_block_size;
-    writeInt(u32, inode[4..8], @truncate(size_bytes));
-    writeInt(u32, inode[108..112], @truncate(size_bytes >> 32));
-    const sectors = remaining * sectors_per_block;
-    writeInt(u32, inode[28..32], @truncate(sectors));
+    const sectors = (1 + new_reserved_gdt_blocks) * sectors_per_block;
+    writeInt(u32, inode[28..32], sectors);
     if (inode.len >= 118) writeInt(u16, inode[116..118], @truncate(sectors >> 16));
     if (ro_compat & feature_ro_compat_metadata_csum != 0) {
         setInodeChecksumSeed(inode, checksum_seed, resize_inode);
     }
-    return remaining;
+    return dindir_block;
 }
 
 pub const OpenOptions = struct {
@@ -9731,6 +9840,134 @@ fn journalTestTree() InMemoryTree {
     });
 }
 
+/// Replaces the writer's compact metadata placement with the legacy
+/// e2fsprogs RESIZE_INODE shape: inode 7's double-indirect block points at
+/// reserved-GDT pointer blocks, and those pointer blocks enumerate backup
+/// GDT locations. The fixture deliberately keeps the first descriptor block
+/// small so a later growth can consume one reserved block.
+fn configureLegacyResizeInodeFixture(
+    allocator: std.mem.Allocator,
+    io: Io,
+    file: Io.File,
+) !void {
+    var sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &sb, superblock_offset);
+    // The compact test writer uses a historical first-data-block value that
+    // is not the standard 4 KiB e2fsprogs layout; normalize this fixture.
+    writeInt(u32, sb[0x1C..0x20], 0);
+    const inode_size = readInt(u16, sb[0x58..0x5A]);
+    const inodes_per_group = readInt(u32, sb[0x28..0x2C]);
+    const inode_table_blocks = divCeil(
+        @as(u32, inodes_per_group) * inode_size,
+        default_block_size,
+    );
+    const old_gdt = try allocator.alloc(u8, default_block_size);
+    defer allocator.free(old_gdt);
+    _ = try file.readPositionalAll(io, old_gdt, default_block_size);
+    const old_block_bitmap = std.mem.readInt(u32, old_gdt[0..4], .little);
+    const old_inode_bitmap = std.mem.readInt(u32, old_gdt[4..8], .little);
+    const old_inode_table = std.mem.readInt(u32, old_gdt[8..12], .little);
+    const block_bitmap_block: u32 = 10;
+    const inode_bitmap_block: u32 = 11;
+    const inode_table_block: u32 = 12;
+    const dindir_block: u32 = 9;
+    const pointer_block = readInt(u32, sb[0x1C..0x20]) + 1 + 1;
+
+    var block_bitmap: [default_block_size]u8 = undefined;
+    var inode_bitmap: [default_block_size]u8 = undefined;
+    _ = try file.readPositionalAll(
+        io,
+        &block_bitmap,
+        @as(u64, old_block_bitmap) * default_block_size,
+    );
+    _ = try file.readPositionalAll(
+        io,
+        &inode_bitmap,
+        @as(u64, old_inode_bitmap) * default_block_size,
+    );
+    const inode_table_bytes = try allocator.alloc(
+        u8,
+        @as(usize, inode_table_blocks) * default_block_size,
+    );
+    defer allocator.free(inode_table_bytes);
+    _ = try file.readPositionalAll(
+        io,
+        inode_table_bytes,
+        @as(u64, old_inode_table) * default_block_size,
+    );
+
+    setBitmapBit(&block_bitmap, dindir_block);
+    setBitmapBit(&block_bitmap, pointer_block);
+    setBitmapBit(&block_bitmap, block_bitmap_block);
+    setBitmapBit(&block_bitmap, inode_bitmap_block);
+    var block: u32 = 0;
+    while (block < inode_table_blocks) : (block += 1) {
+        setBitmapBit(&block_bitmap, inode_table_block + block);
+    }
+    try file.writePositionalAll(
+        io,
+        &block_bitmap,
+        @as(u64, block_bitmap_block) * default_block_size,
+    );
+    try file.writePositionalAll(
+        io,
+        &inode_bitmap,
+        @as(u64, inode_bitmap_block) * default_block_size,
+    );
+    try file.writePositionalAll(
+        io,
+        inode_table_bytes,
+        @as(u64, inode_table_block) * default_block_size,
+    );
+
+    var gdt: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+    @memcpy(gdt[0..32], old_gdt[0..32]);
+    const descriptor = gdt[0..64];
+    writeInt(u32, descriptor[0..4], block_bitmap_block);
+    writeInt(u32, descriptor[4..8], inode_bitmap_block);
+    writeInt(u32, descriptor[8..12], inode_table_block);
+    const old_free_blocks = readInt(u16, descriptor[0x0C..0x0E]);
+    writeInt(u16, descriptor[0x0C..0x0E], old_free_blocks - 4);
+    writeInt(u32, sb[0x5C..0x60], readInt(u32, sb[0x5C..0x60]) | feature_compat_resize_inode);
+    writeInt(u32, sb[0x60..0x64], readInt(u32, sb[0x60..0x64]) | feature_incompat_64bit);
+    writeInt(u16, sb[0xCE..0xD0], 1);
+    writeInt(u16, sb[0xFE..0x100], 64);
+    const checksum_seed = checksumSeed(&sb, sb[0x68..0x78].*, readInt(u32, sb[0x60..0x64]));
+    writeDescriptorBitmapChecksums(descriptor, 64, checksum_seed, &block_bitmap, &inode_bitmap);
+    setGeneralDescriptorChecksum(descriptor, 64, checksum_seed, 0);
+    try file.writePositionalAll(io, &gdt, default_block_size);
+
+    var dindir: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+    std.mem.writeInt(u32, dindir[4..8], pointer_block, .little);
+    try file.writePositionalAll(io, &dindir, @as(u64, dindir_block) * default_block_size);
+    var pointers: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+    try file.writePositionalAll(io, &pointers, @as(u64, pointer_block) * default_block_size);
+
+    var inode7: []u8 = try allocator.alloc(u8, inode_size);
+    defer allocator.free(inode7);
+    @memset(inode7, 0);
+    writeInt(u16, inode7[0..2], 0o100600);
+    writeInt(u16, inode7[26..28], 1);
+    writeInt(u32, inode7[92..96], dindir_block);
+    const max_size = (@as(u64, default_block_size / 4) * (default_block_size / 4) +
+        default_block_size / 4 + 12) * default_block_size;
+    writeInt(u32, inode7[4..8], @truncate(max_size));
+    writeInt(u32, inode7[108..112], @truncate(max_size >> 32));
+    writeInt(u32, inode7[28..32], 2 * sectors_per_block);
+    setInodeChecksum(inode7, sb[0x68..0x78].*, resize_inode);
+    @memcpy(
+        inode_table_bytes[(resize_inode - 1) * inode_size ..][0..inode_size],
+        inode7,
+    );
+    try file.writePositionalAll(
+        io,
+        inode_table_bytes,
+        @as(u64, inode_table_block) * default_block_size,
+    );
+    setSuperblockChecksum(&sb);
+    try file.writePositionalAll(io, &sb, superblock_offset);
+}
+
 /// Runs an e2fsprogs tool that prints what the test wants to assert on, and
 /// returns its stdout. Null means the tool is not installed anywhere this
 /// looks, which the callers decline over rather than pass vacuously.
@@ -10261,6 +10498,34 @@ test "resize supports a resize_inode filesystem without moving its data" {
     try std.testing.expectEqual(@as(u32, 32768), grown.block_count);
 }
 
+test "resize rejects non-sparse-super growth before mutation" {
+    const io = std.testing.io;
+    const path = "test-ext4-resize-non-sparse.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = journalTestTree();
+    tree.bind();
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = 64 * 1024 * 1024,
+        .uuid = journal_test_uuid,
+    });
+    var sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &sb, superblock_offset);
+    writeInt(u32, sb[0x64..0x68], readInt(u32, sb[0x64..0x68]) & ~feature_ro_compat_sparse_super);
+    setSuperblockChecksum(&sb);
+    try file.writePositionalAll(io, &sb, superblock_offset);
+
+    try std.testing.expectError(
+        error.UnsupportedResizeLayout,
+        resize(io, file, std.testing.allocator, .{ .length = 256 * 1024 * 1024 }),
+    );
+    var after: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &after, superblock_offset);
+    try std.testing.expectEqualSlices(u8, &sb, &after);
+}
+
 test "resize uses a metadata checksum seed for stock group metadata" {
     const io = std.testing.io;
     const path = "test-ext4-resize-csum-seed.img";
@@ -10362,23 +10627,11 @@ test "resize reserves resize_inode GDT space in appended sparse-super groups" {
         .length = 64 * 1024 * 1024,
         .uuid = journal_test_uuid,
     });
-    var sb: [superblock_size]u8 = undefined;
-    _ = try file.readPositionalAll(io, &sb, superblock_offset);
-    writeInt(u32, sb[0x5C..0x60], readInt(u32, sb[0x5C..0x60]) | feature_compat_resize_inode);
-    writeInt(u32, sb[0x60..0x64], readInt(u32, sb[0x60..0x64]) | feature_incompat_64bit);
-    writeInt(u16, sb[0xCE..0xD0], 1);
-    writeInt(u16, sb[0xFE..0x100], 64);
-    try file.writePositionalAll(io, &sb, superblock_offset);
+    try configureLegacyResizeInodeFixture(std.testing.allocator, io, file);
 
-    var inode7_before: [256]u8 = undefined;
     var initial_gdt: [default_block_size]u8 = undefined;
     _ = try file.readPositionalAll(io, &initial_gdt, default_block_size);
     const inode_table_block = std.mem.readInt(u32, initial_gdt[8..12], .little);
-    _ = try file.readPositionalAll(
-        io,
-        &inode7_before,
-        @as(u64, inode_table_block) * default_block_size + 6 * 256,
-    );
 
     _ = try resize(io, file, std.testing.allocator, .{ .length = 256 * 1024 * 1024 });
 
@@ -10420,7 +10673,21 @@ test "resize reserves resize_inode GDT space in appended sparse-super groups" {
         &inode7_after,
         @as(u64, inode_table_block) * default_block_size + 6 * 256,
     );
-    try std.testing.expectEqualSlices(u8, &inode7_before, &inode7_after);
+    try std.testing.expectEqual(@as(u32, 9), readInt(u32, inode7_after[92..96]));
+    try std.testing.expectEqual(@as(u32, 2 * sectors_per_block), readInt(u32, inode7_after[28..32]));
+    var dindir: [default_block_size]u8 = undefined;
+    _ = try file.readPositionalAll(
+        io,
+        &dindir,
+        @as(u64, readInt(u32, inode7_after[92..96])) * default_block_size,
+    );
+    try std.testing.expectEqual(@as(u32, 2), readInt(u32, dindir[4..8]));
+    var pointer_block: [default_block_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &pointer_block, 2 * default_block_size);
+    try std.testing.expectEqual(
+        @as(u32, default_blocks_per_group + 2),
+        readInt(u32, pointer_block[0..4]),
+    );
 }
 
 test "resize_inode mapping is shortened when the primary GDT consumes a reservation" {
@@ -10437,50 +10704,33 @@ test "resize_inode mapping is shortened when the primary GDT consumes a reservat
         .uuid = journal_test_uuid,
     });
 
-    var sb: [superblock_size]u8 = undefined;
-    _ = try file.readPositionalAll(io, &sb, superblock_offset);
-    writeInt(u32, sb[0x5C..0x60], readInt(u32, sb[0x5C..0x60]) | feature_compat_resize_inode);
-    writeInt(u32, sb[0x60..0x64], readInt(u32, sb[0x60..0x64]) | feature_incompat_64bit);
-    writeInt(u16, sb[0xCE..0xD0], 1);
-    writeInt(u16, sb[0xFE..0x100], 64);
-    try file.writePositionalAll(io, &sb, superblock_offset);
-
-    var gdt: [default_block_size]u8 = undefined;
-    _ = try file.readPositionalAll(io, &gdt, default_block_size);
-    const inode_table_block = std.mem.readInt(u32, gdt[8..12], .little);
-    var inode7: [256]u8 = [_]u8{0} ** 256;
-    writeInt(u32, inode7[32..36], inode_flag_extents);
-    writeInt(u16, inode7[40..42], extent_magic);
-    writeInt(u16, inode7[42..44], 1);
-    writeInt(u16, inode7[44..46], @intCast(max_inline_extents));
-    writeInt(u16, inode7[46..48], 0);
-    writeInt(u32, inode7[52..56], 0);
-    writeInt(u16, inode7[56..58], 1);
-    writeInt(u16, inode7[58..60], 0);
-    writeInt(u32, inode7[60..64], 2);
-    writeInt(u32, inode7[4..8], default_block_size);
-    writeInt(u32, inode7[28..32], sectors_per_block);
-    setInodeChecksum(&inode7, journal_test_uuid, resize_inode);
-    try file.writePositionalAll(
-        io,
-        &inode7,
-        @as(u64, inode_table_block) * default_block_size + 6 * 256,
-    );
+    try configureLegacyResizeInodeFixture(std.testing.allocator, io, file);
 
     _ = try resize(io, file, std.testing.allocator, .{ .length = 9 * 1024 * 1024 * 1024 });
 
     var grown_sb: [superblock_size]u8 = undefined;
     _ = try file.readPositionalAll(io, &grown_sb, superblock_offset);
     try std.testing.expectEqual(@as(u16, 0), readInt(u16, grown_sb[0xCE..0xD0]));
+    var grown_gdt: [default_block_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &grown_gdt, default_block_size);
+    const inode_table_block = std.mem.readInt(u32, grown_gdt[8..12], .little);
     var grown_inode7: [256]u8 = undefined;
     _ = try file.readPositionalAll(
         io,
         &grown_inode7,
         @as(u64, inode_table_block) * default_block_size + 6 * 256,
     );
-    try std.testing.expectEqual(@as(u16, 0), readInt(u16, grown_inode7[42..44]));
-    try std.testing.expectEqual(@as(u32, 0), readInt(u32, grown_inode7[4..8]));
-    try std.testing.expectEqual(@as(u32, 0), readInt(u32, grown_inode7[28..32]));
+    try std.testing.expectEqual(@as(u32, 9), readInt(u32, grown_inode7[92..96]));
+    try std.testing.expectEqual(@as(u32, sectors_per_block), readInt(u32, grown_inode7[28..32]));
+    var grown_dindir: [default_block_size]u8 = undefined;
+    _ = try file.readPositionalAll(
+        io,
+        &grown_dindir,
+        @as(u64, readInt(u32, grown_inode7[92..96])) * default_block_size,
+    );
+    var dindir_byte: u8 = 0;
+    for (grown_dindir) |byte| dindir_byte |= byte;
+    try std.testing.expectEqual(@as(u8, 0), dindir_byte);
 }
 
 test "malformed resize_inode mapping is rejected before mutation" {
@@ -10497,18 +10747,20 @@ test "malformed resize_inode mapping is rejected before mutation" {
         .uuid = journal_test_uuid,
     });
 
+    try configureLegacyResizeInodeFixture(std.testing.allocator, io, file);
     var sb: [superblock_size]u8 = undefined;
     _ = try file.readPositionalAll(io, &sb, superblock_offset);
-    writeInt(u32, sb[0x5C..0x60], readInt(u32, sb[0x5C..0x60]) | feature_compat_resize_inode);
-    writeInt(u32, sb[0x60..0x64], readInt(u32, sb[0x60..0x64]) | feature_incompat_64bit);
-    writeInt(u16, sb[0xCE..0xD0], 1);
-    writeInt(u16, sb[0xFE..0x100], 64);
-    try file.writePositionalAll(io, &sb, superblock_offset);
-    var inode7_before: [256]u8 = undefined;
     var gdt: [default_block_size]u8 = undefined;
     _ = try file.readPositionalAll(io, &gdt, default_block_size);
     const inode_table_block = std.mem.readInt(u32, gdt[8..12], .little);
+    var inode7_before: [256]u8 = undefined;
     _ = try file.readPositionalAll(
+        io,
+        &inode7_before,
+        @as(u64, inode_table_block) * default_block_size + 6 * 256,
+    );
+    writeInt(u32, inode7_before[92..96], 0);
+    try file.writePositionalAll(
         io,
         &inode7_before,
         @as(u64, inode_table_block) * default_block_size + 6 * 256,
