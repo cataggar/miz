@@ -277,9 +277,6 @@ pub const Executor = struct {
         // before the reverse unmount trap runs.
         const inner_script =
             \\set -eu
-            \\root_fd="$1"
-            \\shift
-            \\case "$root_fd" in *[!0-9]*|'') exit 125;; esac
             \\timeout_seconds="$1"
             \\shift
             \\cd /
@@ -302,38 +299,45 @@ pub const Executor = struct {
             \\if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then kill -KILL -1 2>/dev/null || true; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do wait 2>/dev/null || break; done; fi
             \\exit "$status"
         ;
-        const outer_script =
+        const unshare_script =
             \\set -eu
             \\root_fd="$1"
             \\shift
             \\inner_script="$1"
             \\shift
+            \\mountpoint="$1"
+            \\shift
             \\case "$root_fd" in *[!0-9]*|'') exit 125;; esac
-            \\mountpoint=""
-            \\cleanup() { status=$?; if [ -n "$mountpoint" ]; then umount -n "$mountpoint" 2>/dev/null || umount -n -l "$mountpoint" 2>/dev/null || status=125; rmdir "$mountpoint" 2>/dev/null || true; fi; exit "$status"; }
-            \\trap cleanup EXIT
-            \\base="/run/vmiz-offline-root-$$"
-            \\index=0
-            \\while ! mkdir "$base-$index" 2>/dev/null; do index=$((index + 1)); done
-            \\mountpoint="$base-$index"
             \\mount --bind "/proc/self/fd/$root_fd" "$mountpoint"
-            \\exec chroot "$mountpoint" /bin/sh -c "$inner_script" vmiz-offline-root "$root_fd" "$@"
+            \\eval "exec ${root_fd}>&-"
+            \\exec chroot "$mountpoint" /bin/sh -c "$inner_script" vmiz-offline-root "$@"
+        ;
+        const outer_script =
+            \\set -eu
+            \\unshare_script="$1"
+            \\shift
+            \\root_fd="$1"
+            \\shift
+            \\inner_script="$1"
+            \\shift
+            \\timeout_seconds="$1"
+            \\shift
+            \\mountpoint="$1"
+            \\shift
+            \\cleanup() { status=$?; rmdir "$mountpoint" 2>/dev/null || true; exit "$status"; }
+            \\trap cleanup EXIT TERM INT HUP
+            \\mkdir "$mountpoint"
+            \\unshare --mount --net --pid --fork --kill-child --propagation private -- /bin/sh -c "$unshare_script" vmiz-unshare "$root_fd" "$inner_script" "$mountpoint" "$timeout_seconds" "$@"
+            \\status=$?
+            \\exit "$status"
         ;
         var argv = std.array_list.Managed([]const u8).init(self.allocator);
         defer argv.deinit();
-        try argv.append("unshare");
-        try argv.append("--mount");
-        try argv.append("--net");
-        try argv.append("--pid");
-        try argv.append("--fork");
-        try argv.append("--kill-child");
-        try argv.append("--propagation");
-        try argv.append("private");
-        try argv.append("--");
         try argv.append("/bin/sh");
         try argv.append("-c");
         try argv.append(outer_script);
         try argv.append("vmiz-offline-root");
+        try argv.append(unshare_script);
         const root_fd_text = try std.fmt.allocPrint(
             self.allocator,
             "{d}",
@@ -347,9 +351,17 @@ pub const Executor = struct {
             .{std.math.divCeil(u64, timeout_ms, 1000) catch return error.TimeoutOutOfRange},
         );
         try argv.append(timeout_seconds);
+        const mountpoint = try std.fmt.allocPrint(
+            self.allocator,
+            "/run/vmiz-offline-root-{d}-{d}",
+            .{ std.os.linux.getpid(), self.root_dir.handle },
+        );
+        try argv.append(mountpoint);
         try argv.appendSlice(guest_argv);
         defer self.allocator.free(root_fd_text);
         defer self.allocator.free(timeout_seconds);
+        defer self.allocator.free(mountpoint);
+        defer Io.Dir.deleteDirAbsolute(self.io, mountpoint) catch {};
 
         var environment = std.process.Environ.Map.init(self.allocator);
         defer environment.deinit();
@@ -776,6 +788,16 @@ fn openRootPathNoFollow(io: Io, absolute_path: []const u8) !Io.Dir {
     return current;
 }
 
+fn expectNoResidualOfflineMounts(io: Io) !void {
+    var run_dir = try Io.Dir.openDirAbsolute(io, "/run", .{ .iterate = true });
+    defer run_dir.close(io);
+    var iterator = run_dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "vmiz-offline-root-"))
+            return error.OfflineRootMountpointResidual;
+    }
+}
+
 test "offline root rejects traversal and wildcard ambiguity" {
     try std.testing.expectError(error.InvalidGuestPath, normalizeGuestPath("/etc/../shadow"));
     try std.testing.expectError(error.InvalidDiscoveryPattern, blk: {
@@ -1185,6 +1207,7 @@ test "privileged offline namespace contains PID1 and reaps descendants" {
     const sentinel_bytes = try Io.Dir.cwd().readFileAlloc(io, sentinel, allocator, .limited(1024));
     defer allocator.free(sentinel_bytes);
     try std.testing.expectEqualStrings("unchanged", sentinel_bytes);
+    try expectNoResidualOfflineMounts(io);
 
     const timed = try executor.runIsolated(
         &.{ "/bin/sh", "-c", "(sleep 10; printf alive > /descendant-marker) & sleep 10" },
@@ -1197,6 +1220,19 @@ test "privileged offline namespace contains PID1 and reaps descendants" {
     try std.testing.expectEqual(CommandOutcome.timed_out, timed.outcome);
     try Io.sleep(io, .fromSeconds(2), .real);
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, marker, .{ .follow_symlinks = false }));
+    try expectNoResidualOfflineMounts(io);
+    for (0..2) |_| {
+        const repeated = try executor.runIsolated(
+            &.{ "/bin/sh", "-c", "exit 0" },
+            5 * 1000,
+        );
+        defer {
+            var result = repeated;
+            result.deinit(allocator);
+        }
+        try std.testing.expectEqual(CommandOutcome.succeeded, repeated.outcome);
+        try expectNoResidualOfflineMounts(io);
+    }
     Io.Dir.cwd().access(io, fixture, .{ .read = true, .execute = true }) catch
         return error.OfflineRootTeardownIncomplete;
 }
