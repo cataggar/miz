@@ -420,15 +420,9 @@ test "grows a labeled root in a standalone QCOW2 transactionally" {
         .uuid = filesystem_uuid,
     });
     // Exercise the stock Ubuntu profile as well as vmiz's compact writer:
-    // 64-byte descriptors, 64bit/flex_bg/csum_seed, and resize_inode.
+    // 64-byte descriptors, 64bit/flex_bg, and the checksum-seed feature.
     var stock_superblock: [1024]u8 = undefined;
     _ = try raw.file.readPositionalAll(io, &stock_superblock, root_offset + 1024);
-    std.mem.writeInt(
-        u32,
-        stock_superblock[0x5C..0x60],
-        std.mem.readInt(u32, stock_superblock[0x5C..0x60], .little) | 0x0010,
-        .little,
-    );
     std.mem.writeInt(
         u32,
         stock_superblock[0x60..0x64],

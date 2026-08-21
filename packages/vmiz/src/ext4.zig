@@ -1479,6 +1479,15 @@ fn resizeGeneral(
         return error.FilesystemTooLarge;
     const old_group_count = blocksToGroups(old_total_u32, blocks_per_group);
     const new_group_count = blocksToGroups(new_total_u32, blocks_per_group);
+    // Appending any group changes the set of sparse-super backup groups.
+    // Safely doing that for RESIZE_INODE requires updating inode 7's extent
+    // tree and every reserved-GDT accounting field; this path does neither,
+    // so reject the complete class before reading or writing metadata.
+    if (compat & feature_compat_resize_inode != 0 and
+        new_group_count > old_group_count)
+    {
+        return error.UnsupportedResizeLayout;
+    }
     const desc_bytes_old = std.math.mul(
         u64,
         old_group_count,
@@ -10159,7 +10168,6 @@ test "resize uses a metadata checksum seed for stock group metadata" {
 
     var sb: [superblock_size]u8 = undefined;
     _ = try file.readPositionalAll(io, &sb, superblock_offset);
-    writeInt(u32, sb[0x5C..0x60], readInt(u32, sb[0x5C..0x60]) | feature_compat_resize_inode);
     writeInt(u32, sb[0x60..0x64], readInt(u32, sb[0x60..0x64]) |
         feature_incompat_64bit | feature_incompat_flex_bg | feature_incompat_csum_seed);
     writeInt(u16, sb[0xCE..0xD0], 1);
@@ -10229,7 +10237,7 @@ test "resize uses a metadata checksum seed for stock group metadata" {
     }
 }
 
-test "resize refuses resize_inode GDT expansion before mutation" {
+test "resize refuses resize_inode sparse-super append before mutation" {
     const io = std.testing.io;
     const path = "test-ext4-resize-inode-gdt-expansion.img";
     defer Io.Dir.cwd().deleteFile(io, path) catch {};
@@ -10252,7 +10260,7 @@ test "resize refuses resize_inode GDT expansion before mutation" {
 
     try std.testing.expectError(
         error.UnsupportedResizeLayout,
-        resize(io, file, std.testing.allocator, .{ .length = 9 * 1024 * 1024 * 1024 }),
+        resize(io, file, std.testing.allocator, .{ .length = 256 * 1024 * 1024 }),
     );
     var sb_after: [superblock_size]u8 = undefined;
     _ = try file.readPositionalAll(io, &sb_after, superblock_offset);
