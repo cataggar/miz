@@ -55,6 +55,11 @@ FIFOs, device numbers, filesystem UUID, and label are retained by the
 existing importer/tree/writer path. `copyOut` copies one regular file; it
 never recursively materializes a guest directory.
 
+On Linux, `commit` also captures and reapplies the atomic image path's mode,
+owner/group, atime/mtime, ACL xattrs, and all other host xattrs to the closed
+stage before publication; metadata capture or application failure aborts the
+transaction without replacing the source.
+
 The pinned Canonical Ubuntu profile (`descriptor_size = 64`, compat `0x103c`,
 incompat `0x22c2`, and ro-compat `0x046b`) is supported. Commits rebuild its
 e2fsprogs-style `resize_inode` reservation and empty `orphan_file` inode,

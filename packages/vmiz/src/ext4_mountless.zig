@@ -7,6 +7,7 @@
 //! writer.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ext4 = @import("ext4.zig");
 const limits_mod = @import("limits.zig");
 const root_tree = @import("root_tree.zig");
@@ -71,6 +72,140 @@ const CommitProfile = struct {
     feature_ro_compat: u32,
     checksum_seed: ?u32 = null,
 };
+
+const HostXattr = struct {
+    name: []u8,
+    value: []u8,
+};
+
+const HostMetadata = struct {
+    permissions: Io.File.Permissions,
+    uid: ?Io.File.Uid,
+    gid: ?Io.File.Gid,
+    atime: ?Io.Timestamp,
+    mtime: Io.Timestamp,
+    xattrs: []HostXattr,
+
+    fn deinit(self: *HostMetadata, allocator: Allocator) void {
+        for (self.xattrs) |xattr| {
+            allocator.free(xattr.name);
+            allocator.free(xattr.value);
+        }
+        allocator.free(self.xattrs);
+        self.* = undefined;
+    }
+};
+
+const max_host_xattr_bytes: usize = 16 * 1024 * 1024;
+
+fn failedLinuxSyscall(result: usize) bool {
+    return @as(isize, @bitCast(result)) < 0;
+}
+
+fn captureHostMetadata(allocator: Allocator, io: Io, file: Io.File) Error!HostMetadata {
+    const stat = try file.stat(io);
+    if (comptime builtin.os.tag != .linux) {
+        return error.HostMetadataPreservationUnsupported;
+    }
+    const linux = std.os.linux;
+    var statx: linux.Statx = undefined;
+    const statx_result = linux.statx(
+        @intCast(file.handle),
+        "",
+        linux.AT.EMPTY_PATH,
+        linux.STATX.BASIC_STATS,
+        &statx,
+    );
+    if (failedLinuxSyscall(statx_result) or
+        !statx.mask.UID or !statx.mask.GID)
+    {
+        return error.HostMetadataPreservationFailed;
+    }
+    var xattr_probe: [1]u8 = undefined;
+    const xattr_bytes = linux.flistxattr(file.handle, &xattr_probe, 0);
+    if (failedLinuxSyscall(xattr_bytes)) return error.HostMetadataPreservationFailed;
+    const names = try allocator.alloc(u8, @intCast(xattr_bytes));
+    defer allocator.free(names);
+    const names_len = if (names.len == 0) 0 else blk: {
+        const result = linux.flistxattr(file.handle, names.ptr, names.len);
+        if (failedLinuxSyscall(result)) return error.HostMetadataPreservationFailed;
+        break :blk @as(usize, @intCast(result));
+    };
+    var xattrs = std.array_list.Managed(HostXattr).init(allocator);
+    errdefer {
+        for (xattrs.items) |xattr| {
+            allocator.free(xattr.name);
+            allocator.free(xattr.value);
+        }
+        xattrs.deinit();
+    }
+    var cursor: usize = 0;
+    var total_bytes: usize = 0;
+    while (cursor < names_len) {
+        const end = std.mem.indexOfScalarPos(u8, names[0..names_len], cursor, 0) orelse
+            return error.HostMetadataPreservationFailed;
+        if (end == cursor) return error.HostMetadataPreservationFailed;
+        const name = try allocator.dupe(u8, names[cursor..end]);
+        errdefer allocator.free(name);
+        const name_z = try allocator.allocSentinel(u8, name.len, 0);
+        defer allocator.free(name_z);
+        @memcpy(name_z, name);
+        const raw_size = linux.fgetxattr(file.handle, name_z.ptr, &xattr_probe, 0);
+        if (failedLinuxSyscall(raw_size)) return error.HostMetadataPreservationFailed;
+        const value_len: usize = @intCast(raw_size);
+        total_bytes = std.math.add(usize, total_bytes, name.len + value_len) catch
+            return error.HostMetadataPreservationFailed;
+        if (total_bytes > max_host_xattr_bytes) return error.HostMetadataPreservationFailed;
+        const value = try allocator.alloc(u8, value_len);
+        errdefer allocator.free(value);
+        if (value_len != 0) {
+            const result = linux.fgetxattr(file.handle, name_z.ptr, value.ptr, value.len);
+            if (failedLinuxSyscall(result) or @as(usize, @intCast(result)) != value.len) {
+                return error.HostMetadataPreservationFailed;
+            }
+        }
+        try xattrs.append(.{ .name = name, .value = value });
+        cursor = end + 1;
+    }
+    return .{
+        .permissions = stat.permissions,
+        .uid = @intCast(statx.uid),
+        .gid = @intCast(statx.gid),
+        .atime = stat.atime,
+        .mtime = stat.mtime,
+        .xattrs = try xattrs.toOwnedSlice(),
+    };
+}
+
+fn applyHostMetadata(io: Io, file: Io.File, metadata: *const HostMetadata) Error!void {
+    if (comptime builtin.os.tag != .linux) {
+        return error.HostMetadataPreservationUnsupported;
+    }
+    if (metadata.uid != null or metadata.gid != null) {
+        file.setOwner(io, metadata.uid, metadata.gid) catch
+            return error.HostMetadataPreservationFailed;
+    }
+    const linux = std.os.linux;
+    for (metadata.xattrs) |xattr| {
+        const name_z = try std.heap.page_allocator.allocSentinel(u8, xattr.name.len, 0);
+        defer std.heap.page_allocator.free(name_z);
+        @memcpy(name_z, xattr.name);
+        const result = linux.fsetxattr(
+            file.handle,
+            name_z.ptr,
+            xattr.value.ptr,
+            xattr.value.len,
+            0,
+        );
+        if (failedLinuxSyscall(result)) return error.HostMetadataPreservationFailed;
+    }
+    file.setPermissions(io, metadata.permissions) catch
+        return error.HostMetadataPreservationFailed;
+    file.setTimestamps(io, .{
+        .access_timestamp = Io.File.SetTimestamp.init(metadata.atime),
+        .modify_timestamp = .{ .new = metadata.mtime },
+    }) catch return error.HostMetadataPreservationFailed;
+}
 
 pub const FileSystem = struct {
     allocator: Allocator,
@@ -444,6 +579,7 @@ pub const FileSystem = struct {
             host_path: []u8,
             target: []u8,
             canonical_changed: bool,
+            target_missing: bool,
         };
         var hardlink_updates = std.array_list.Managed(HardlinkUpdate).init(self.allocator);
         defer {
@@ -466,17 +602,26 @@ pub const FileSystem = struct {
             if (alias_stat.kind != .file) continue;
             const target_host = try std.fs.path.join(self.allocator, &.{ source, target });
             defer self.allocator.free(target_host);
-            const canonical_changed = if (Io.Dir.cwd().statFile(self.io, target_host, .{})) |target_stat|
-                target_stat.kind != .file or
-                    !try self.hostFileEquals(target_host, target, target_stat.size, options.max_file_bytes)
-            else |_|
-                true;
+            var target_missing = false;
+            const canonical_changed = blk: {
+                if (Io.Dir.cwd().statFile(self.io, target_host, .{})) |target_stat| {
+                    break :blk target_stat.kind != .file or
+                        !try self.hostFileEquals(target_host, target, target_stat.size, options.max_file_bytes);
+                } else |err| switch (err) {
+                    error.FileNotFound => {
+                        target_missing = true;
+                        break :blk true;
+                    },
+                    else => return err,
+                }
+            };
             const alias_changed = !try self.hostFileEquals(alias_host, target, alias_stat.size, options.max_file_bytes);
             if (alias_changed) {
                 try hardlink_updates.append(.{
                     .host_path = try self.allocator.dupe(u8, alias_host),
                     .target = try self.allocator.dupe(u8, target),
                     .canonical_changed = canonical_changed,
+                    .target_missing = target_missing,
                 });
             }
         }
@@ -503,17 +648,6 @@ pub const FileSystem = struct {
             {
                 continue;
             }
-            for (0..self.tree.nodeCount()) |alias_index| {
-                const alias = self.tree.nodeView(alias_index);
-                if (alias.kind != .hardlink) continue;
-                const target = switch (alias.payload) {
-                    .hardlink_target => |path| path,
-                    else => continue,
-                };
-                if (std.mem.eql(u8, target, node.path) and pre_seen.contains(alias.path)) {
-                    return error.HardlinkTargetInUse;
-                }
-            }
         }
         var seen = std.StringHashMap(void).init(self.allocator);
         defer {
@@ -530,7 +664,11 @@ pub const FileSystem = struct {
         }
         for (hardlink_updates.items) |update| {
             const target = self.tree.findNode(update.target) orelse continue;
-            if (update.canonical_changed) {
+            if (update.target_missing) {
+                if (update.canonical_changed) {
+                    try self.copyIn(update.host_path, update.target, target.metadata);
+                }
+            } else if (update.canonical_changed) {
                 if (!try self.hostFileEquals(update.host_path, update.target, (try Io.Dir.cwd().statFile(self.io, update.host_path, .{})).size, options.max_file_bytes)) {
                     return error.ConflictingHardlinkUpdate;
                 }
@@ -733,6 +871,8 @@ pub const FileSystem = struct {
             lock_file.close(self.io);
             DirDelete(self.io, lock_path);
         }
+        var host_metadata = try captureHostMetadata(self.allocator, self.io, self.file);
+        defer host_metadata.deinit(self.allocator);
         const stage_path = try std.fmt.allocPrint(
             self.allocator,
             "{s}.mountless-stage-{d}",
@@ -793,6 +933,7 @@ pub const FileSystem = struct {
             else
                 null,
         });
+        try applyHostMetadata(self.io, stage_file, &host_metadata);
         try stage_file.sync(self.io);
         stage_file.close(self.io);
         stage_open = false;
@@ -916,6 +1057,104 @@ fn excludedTopLevel(path: []const u8, excluded: []const []const u8) bool {
     const first = if (std.mem.indexOfScalar(u8, path, '/')) |slash| path[0..slash] else path;
     for (excluded) |name| if (std.mem.eql(u8, first, name)) return true;
     return false;
+}
+
+fn setTestHostXattr(io: Io, path: []const u8, name: []const u8, value: []const u8) !void {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    const name_z = try std.heap.page_allocator.allocSentinel(u8, name.len, 0);
+    defer std.heap.page_allocator.free(name_z);
+    @memcpy(name_z, name);
+    const result = std.os.linux.fsetxattr(
+        file.handle,
+        name_z.ptr,
+        value.ptr,
+        value.len,
+        0,
+    );
+    if (failedLinuxSyscall(result)) return error.HostMetadataPreservationFailed;
+}
+
+fn readTestHostXattr(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    name: []const u8,
+) ![]u8 {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const name_z = try allocator.allocSentinel(u8, name.len, 0);
+    defer allocator.free(name_z);
+    @memcpy(name_z, name);
+    var xattr_probe: [1]u8 = undefined;
+    const raw_size = std.os.linux.fgetxattr(file.handle, name_z.ptr, &xattr_probe, 0);
+    if (failedLinuxSyscall(raw_size)) return error.HostMetadataPreservationFailed;
+    const value = try allocator.alloc(u8, @intCast(raw_size));
+    errdefer allocator.free(value);
+    if (value.len != 0) {
+        const result = std.os.linux.fgetxattr(file.handle, name_z.ptr, value.ptr, value.len);
+        if (failedLinuxSyscall(result) or @as(usize, @intCast(result)) != value.len) {
+            return error.HostMetadataPreservationFailed;
+        }
+    }
+    return value;
+}
+
+test "atomic commit preserves host image mode timestamps and xattrs" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const image_path = "test-ext4-mountless-host-metadata.raw";
+    const spool_path = "test-ext4-mountless-host-metadata.spool";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    var image = try @import("image.zig").Image.createExclusive(
+        io,
+        image_path,
+        .raw,
+        32 * 1024 * 1024,
+        .{},
+    );
+    var image_open = true;
+    defer if (image_open) image.close(io);
+    var source_tree = root_tree.RootTree.initMemory(allocator, io, .{});
+    defer source_tree.deinit();
+    try source_tree.putFileBytes("etc", "source", .{ .mode = 0o600 });
+    _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
+        .length = 32 * 1024 * 1024,
+    });
+
+    try Io.Dir.cwd().setFilePermissions(io, image_path, .fromMode(0o600), .{});
+    const expected_mtime = Io.Timestamp.fromNanoseconds(1_700_000_123_456_789_000);
+    try Io.Dir.cwd().setTimestamps(io, image_path, .{
+        .access_timestamp = .{ .new = expected_mtime },
+        .modify_timestamp = .{ .new = expected_mtime },
+    });
+    try setTestHostXattr(io, image_path, "user.vmiz-host", "preserve-me");
+
+    var fs = try FileSystem.open(allocator, io, image.file, .{
+        .length = 32 * 1024 * 1024,
+        .spool_path = spool_path,
+        .atomic_path = image_path,
+    });
+    try fs.write("/etc", "changed", null);
+    _ = try fs.commit();
+    fs.deinit();
+    image.close(io);
+    image_open = false;
+
+    const stat = try Io.Dir.cwd().statFile(io, image_path, .{});
+    try std.testing.expectEqual(
+        @as(u16, 0o600),
+        @as(u16, @intCast(stat.permissions.toMode() & 0o7777)),
+    );
+    try std.testing.expectEqual(expected_mtime.nanoseconds, stat.mtime.nanoseconds);
+    const xattr = try readTestHostXattr(allocator, io, image_path, "user.vmiz-host");
+    defer allocator.free(xattr);
+    try std.testing.expectEqualStrings("preserve-me", xattr);
 }
 
 test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
@@ -1173,15 +1412,20 @@ test "mountless round trip preserves security metadata and special nodes" {
     const staged_canonical = try std.fs.path.join(allocator, &.{ host_tree_path, "etc/void" });
     defer allocator.free(staged_canonical);
     try Io.Dir.cwd().deleteFile(io, staged_canonical);
-    try std.testing.expectError(
-        error.HardlinkTargetInUse,
-        fs.importHostTreeWithManifest(host_tree_path, .{}, &host_manifest),
+    try fs.importHostTreeWithManifest(host_tree_path, .{}, &host_manifest);
+    try std.testing.expectError(error.PathNotFound, fs.stat("/etc/void"));
+    try std.testing.expectEqual(Kind.file, (try fs.stat("/usr/bin/void-alias")).kind);
+    try std.testing.expectEqual(
+        Kind.hardlink,
+        (try fs.stat("/usr/bin/void-alias2")).kind,
     );
-    try std.testing.expectEqual(Kind.file, (try fs.stat("/etc/void")).kind);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = staged_canonical, .data = "staged-alias" });
+    try std.testing.expectEqualStrings(
+        "usr/bin/void-alias",
+        (try fs.stat("/usr/bin/void-alias2")).payload.hardlink_target,
+    );
     try std.testing.expectEqualSlices(u8, &([_]u8{0x45} ** 16), &fs.filesystemIdentity().uuid);
     try std.testing.expectEqualSlices(u8, "fidelity", fs.filesystemIdentity().label[0..8]);
-    const locked = try fs.stat("/etc/void");
+    const locked = try fs.stat("/usr/bin/void-alias");
     try std.testing.expectEqual(@as(u16, 0), locked.metadata.mode);
     try std.testing.expectEqual(@as(u32, 1234), locked.metadata.uid);
     try std.testing.expectEqual(@as(u32, 2345), locked.metadata.gid);
@@ -1194,10 +1438,11 @@ test "mountless round trip preserves security metadata and special nodes" {
     defer allocator.free(alias_bytes);
     try std.testing.expectEqualStrings("staged-alias", alias_bytes);
     try fs.write("/usr/bin/void-alias", "shared", null);
-    const shared_target = try fs.read(allocator, "/etc/void", 64);
+    const shared_target = try fs.read(allocator, "/usr/bin/void-alias2", 64);
     defer allocator.free(shared_target);
     try std.testing.expectEqualStrings("shared", shared_target);
-    try std.testing.expectEqual(Kind.hardlink, (try fs.stat("/usr/bin/void-alias")).kind);
+    try std.testing.expectEqual(Kind.file, (try fs.stat("/usr/bin/void-alias")).kind);
+    try std.testing.expectEqual(Kind.hardlink, (try fs.stat("/usr/bin/void-alias2")).kind);
     const link = try fs.readLink(allocator, "/etc/void-link", 64);
     defer allocator.free(link);
     try std.testing.expectEqualStrings("void", link);
@@ -1221,7 +1466,7 @@ test "mountless round trip preserves security metadata and special nodes" {
         .atomic_path = image_path,
     });
     defer reopened.deinit();
-    try std.testing.expectEqual(@as(u16, 0), (try reopened.stat("/etc/void")).metadata.mode);
+    try std.testing.expectEqual(@as(u16, 0), (try reopened.stat("/usr/bin/void-alias")).metadata.mode);
     try std.testing.expectEqual(@as(u16, 32), reopened.filesystemIdentity().descriptor_size);
     try std.testing.expectEqual(@as(usize, 3), (try reopened.stat("/")).metadata.xattrs.len);
     try std.testing.expectEqual(
@@ -1230,7 +1475,7 @@ test "mountless round trip preserves security metadata and special nodes" {
     );
     try std.testing.expectEqual(Kind.char_device, (try reopened.stat("/dev/null")).kind);
     try std.testing.expectEqual(Kind.fifo, (try reopened.stat("/var/fifo")).kind);
-    try std.testing.expectEqual(Kind.hardlink, (try reopened.stat("/usr/bin/void-alias")).kind);
+    try std.testing.expectEqual(Kind.file, (try reopened.stat("/usr/bin/void-alias")).kind);
     try std.testing.expectEqual(Kind.hardlink, (try reopened.stat("/usr/bin/void-alias2")).kind);
     const reopened_shared = try reopened.read(allocator, "/usr/bin/void-alias", 64);
     defer allocator.free(reopened_shared);

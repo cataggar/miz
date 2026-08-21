@@ -472,11 +472,107 @@ pub const RootTree = struct {
     }
 
     pub fn remove(self: *RootTree, path: []const u8) !bool {
+        // Removing a file that owns a hardlink set promotes a surviving alias
+        // first, so the tree never leaves a hardlink pointing at a vanished
+        // content owner.
         try validatePath(path, self.limits, self.diagnostic);
         const stable_path = try self.allocator.dupe(u8, path);
         defer self.allocator.free(stable_path);
-        if (self.removalBreaksHardlinks(stable_path, true)) return error.HardlinkTargetInUse;
+        var promotions = std.array_list.Managed([]u8).init(self.allocator);
+        defer {
+            for (promotions.items) |candidate| self.allocator.free(candidate);
+            promotions.deinit();
+        }
+        for (self.nodes.items) |node| {
+            if (node.kind != .file or !pathEqualsOrDescendant(stable_path, node.path)) continue;
+            try promotions.append(try self.allocator.dupe(u8, node.path));
+        }
+        for (promotions.items) |candidate| {
+            try self.promoteHardlinkTarget(candidate, stable_path);
+        }
         return self.removeInternal(stable_path, true);
+    }
+
+    /// A hardlink target is only a name in the tree model; the content and
+    /// inode metadata belong to the one `.file` node. If that name is removed
+    /// while aliases survive, move ownership to the lexicographically first
+    /// surviving alias and retarget the rest before removing the old name.
+    fn promoteHardlinkTarget(self: *RootTree, target_path: []const u8, removal_root: []const u8) !void {
+        const target_index = self.findIndex(target_path) orelse return;
+        if (self.nodes.items[target_index].kind != .file) return;
+
+        var promoted_index: ?usize = null;
+        for (self.nodes.items, 0..) |node, index| {
+            if (node.kind != .hardlink or
+                !std.mem.eql(u8, node.payload.hardlink_target, target_path) or
+                pathEqualsOrDescendant(removal_root, node.path))
+            {
+                continue;
+            }
+            if (promoted_index == null or
+                std.mem.order(u8, node.path, self.nodes.items[promoted_index.?].path) == .lt)
+            {
+                promoted_index = index;
+            }
+        }
+        const promoted = promoted_index orelse return;
+
+        const AliasPlan = struct {
+            index: usize,
+            target: []u8,
+        };
+        var plans = std.array_list.Managed(AliasPlan).init(self.allocator);
+        errdefer {
+            for (plans.items) |plan| {
+                self.allocator.free(plan.target);
+            }
+        }
+        defer plans.deinit();
+
+        const canonical_metadata = self.nodes.items[target_index].metadata;
+        for (self.nodes.items, 0..) |node, index| {
+            if (index == promoted or node.kind != .hardlink or
+                !std.mem.eql(u8, node.payload.hardlink_target, target_path) or
+                pathEqualsOrDescendant(removal_root, node.path))
+            {
+                continue;
+            }
+            const planned_target = try self.allocator.dupe(u8, self.nodes.items[promoted].path);
+            plans.append(.{
+                .index = index,
+                .target = planned_target,
+            }) catch |err| {
+                self.allocator.free(planned_target);
+                return err;
+            };
+        }
+
+        const target_payload = self.nodes.items[target_index].payload;
+        const target_xattrs = self.nodes.items[target_index].owned_xattrs;
+        const target_sparse = self.nodes.items[target_index].sparse_extents;
+        self.nodes.items[target_index].payload = .none;
+        self.nodes.items[target_index].owned_xattrs = &.{};
+        self.nodes.items[target_index].sparse_extents = &.{};
+
+        self.freePayload(self.nodes.items[promoted].payload);
+        freeOwnedXattrs(self.allocator, self.nodes.items[promoted].owned_xattrs);
+        self.allocator.free(self.nodes.items[promoted].sparse_extents);
+        self.nodes.items[promoted].kind = .file;
+        self.nodes.items[promoted].payload = target_payload;
+        self.nodes.items[promoted].owned_xattrs = target_xattrs;
+        self.nodes.items[promoted].sparse_extents = target_sparse;
+        self.nodes.items[promoted].metadata = canonical_metadata;
+        self.nodes.items[promoted].metadata.xattrs = ownedXattrsView(target_xattrs);
+
+        for (plans.items) |plan| {
+            self.freePayload(self.nodes.items[plan.index].payload);
+            freeOwnedXattrs(self.allocator, self.nodes.items[plan.index].owned_xattrs);
+            self.nodes.items[plan.index].payload = .{ .hardlink_target = plan.target };
+            self.nodes.items[plan.index].owned_xattrs = &.{};
+            self.nodes.items[plan.index].metadata = canonical_metadata;
+            self.nodes.items[plan.index].metadata.xattrs = &.{};
+        }
+        plans.clearRetainingCapacity();
     }
 
     fn removeInternal(self: *RootTree, path: []const u8, recursive: bool) bool {
@@ -2745,17 +2841,40 @@ test "hardlink targets remain valid across removals and overlays" {
 
     try tree.putFileBytes("target", "x", .{ .mode = 0o644 });
     try tree.putHardlink("link", "target", .{ .mode = 0o644 });
-    try std.testing.expectError(error.HardlinkTargetInUse, tree.remove("target"));
-    try std.testing.expectError(
-        error.HardlinkTargetInUse,
-        tree.putDirectory("target", .{ .mode = 0o755 }),
-    );
+    _ = try tree.remove("target");
+    try std.testing.expectEqual(Kind.file, tree.findNode("link").?.kind);
+    const promoted = try tree.readFileAlloc(std.testing.allocator, "link", 16);
+    defer std.testing.allocator.free(promoted);
+    try std.testing.expectEqualSlices(u8, "x", promoted);
+    try std.testing.expectEqual(@as(u16, 0o644), tree.findNode("link").?.metadata.mode);
+    try tree.putDirectory("target", .{ .mode = 0o755 });
     try tree.putFileBytes("target", "replacement", .{ .mode = 0o600 });
     _ = try tree.manifestDigest();
-    try std.testing.expectError(
-        error.UnsupportedHardlinkTarget,
-        tree.putHardlink("invalid", "link", .{ .mode = 0o644 }),
-    );
+    try tree.putHardlink("invalid", "link", .{ .mode = 0o644 });
+}
+
+test "canonical hardlink removal promotes the deterministic surviving alias" {
+    const io = std.testing.io;
+    const spool_path = "test-root-tree-hardlink-promotion.spool";
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    const xattrs = [_]tree_cursor.Xattr{.{ .name = "user.origin", .value = "canonical" }};
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    try tree.putFileBytes("canonical", "payload", .{ .mode = 0o600, .uid = 42, .gid = 43, .xattrs = &xattrs });
+    try tree.putHardlink("z-alias", "canonical", .{ .mode = 0o600 });
+    try tree.putHardlink("a-alias", "canonical", .{ .mode = 0o600 });
+    _ = try tree.remove("canonical");
+
+    const promoted = tree.findNode("a-alias").?;
+    try std.testing.expectEqual(Kind.file, promoted.kind);
+    try std.testing.expectEqual(@as(u16, 0o600), promoted.metadata.mode);
+    try std.testing.expectEqual(@as(u32, 42), promoted.metadata.uid);
+    try std.testing.expectEqual(@as(usize, 1), promoted.metadata.xattrs.len);
+    try std.testing.expectEqualStrings("canonical", promoted.metadata.xattrs[0].value);
+    const remaining = tree.findNode("z-alias").?;
+    try std.testing.expectEqual(Kind.hardlink, remaining.kind);
+    try std.testing.expectEqualStrings("a-alias", remaining.payload.hardlink_target);
 }
 
 test "physical spool growth is bounded across replacements" {
