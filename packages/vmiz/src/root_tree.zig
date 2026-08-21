@@ -184,6 +184,8 @@ pub const RootTree = struct {
     storage: enum { spooled, memory },
     spool_len: u64 = 0,
     nodes: std.array_list.Managed(Node),
+    path_index: std.StringHashMap(usize),
+    total_node_bytes: u64 = 0,
     limits: Limits,
     /// Optional sink for the peak measurements and the first limit breach.
     /// Assigned after `init` because it is the caller's, not the tree's, and
@@ -192,6 +194,7 @@ pub const RootTree = struct {
     root_metadata: RootMetadata = .{},
     iteration_index: usize = 0,
     sorted: bool = true,
+    append_only_import: bool = false,
     /// The neutral pull cursor `cursor()` (and its deprecated alias
     /// `ext4View()`) hands to a writer. Reused across calls rather than
     /// allocated fresh, since it carries no state of its own beyond the
@@ -219,6 +222,7 @@ pub const RootTree = struct {
             .spool = spool,
             .storage = .spooled,
             .nodes = .init(allocator),
+            .path_index = .init(allocator),
             .limits = limits,
             .tree_cursor_view = .{
                 .ctx = undefined,
@@ -236,6 +240,7 @@ pub const RootTree = struct {
             .spool = null,
             .storage = .memory,
             .nodes = .init(allocator),
+            .path_index = .init(allocator),
             .limits = limits,
             .tree_cursor_view = .{
                 .ctx = undefined,
@@ -246,6 +251,7 @@ pub const RootTree = struct {
     }
 
     pub fn deinit(self: *RootTree) void {
+        self.path_index.deinit();
         for (self.nodes.items) |*node| self.freeNode(node);
         self.nodes.deinit();
         if (self.spool) |spool| spool.close(self.io);
@@ -288,6 +294,16 @@ pub const RootTree = struct {
         max_bytes: u64,
     ) ![]u8 {
         const index = self.findIndex(path) orelse return error.MissingNode;
+        return self.readFileAllocAt(allocator, index, max_bytes);
+    }
+
+    pub fn readFileAllocAt(
+        self: *const RootTree,
+        allocator: Allocator,
+        index: usize,
+        max_bytes: u64,
+    ) ![]u8 {
+        if (index >= self.nodes.items.len) return error.MissingNode;
         const entry = self.nodes.items[index];
         if (entry.kind != .file) return error.NotRegularFile;
         if (entry.size() > max_bytes) return error.FileLimitExceeded;
@@ -490,7 +506,9 @@ pub const RootTree = struct {
         for (promotions.items) |candidate| {
             try self.promoteHardlinkTarget(candidate, stable_path);
         }
-        return self.removeInternal(stable_path, true);
+        const removed = self.removeInternal(stable_path, true);
+        if (removed) self.recomputeTotalNodeBytes();
+        return removed;
     }
 
     /// A hardlink target is only a name in the tree model; the content and
@@ -582,8 +600,13 @@ pub const RootTree = struct {
             if (std.mem.eql(u8, path, self.nodes.items[index].path) or
                 (recursive and pathEqualsOrDescendant(path, self.nodes.items[index].path)))
             {
-                var node = self.nodes.orderedRemove(index);
+                _ = self.path_index.remove(self.nodes.items[index].path);
+                var node = self.nodes.swapRemove(index);
+                self.total_node_bytes -= node.size();
                 self.freeNode(&node);
+                if (index < self.nodes.items.len) {
+                    self.path_index.putAssumeCapacity(self.nodes.items[index].path, index);
+                }
                 removed = true;
             } else {
                 index += 1;
@@ -798,6 +821,18 @@ pub const RootTree = struct {
         mode: ImportMode,
         prefix: []const u8,
     ) !usize {
+        const append_only = self.nodes.items.len == 0 and prefix.len == 0;
+        if (append_only) {
+            try self.nodes.ensureUnusedCapacity(source.nodeCount());
+            try self.path_index.ensureUnusedCapacity(
+                std.math.cast(u32, source.nodeCount()) orelse return error.NodeLimitExceeded,
+            );
+            self.append_only_import = true;
+        }
+        defer {
+            if (append_only) self.append_only_import = false;
+        }
+
         var path_buffer = std.array_list.Managed(u8).init(self.allocator);
         defer path_buffer.deinit();
         var target_buffer = std.array_list.Managed(u8).init(self.allocator);
@@ -1516,6 +1551,9 @@ pub const RootTree = struct {
         metadata: Metadata,
         payload: Payload,
     ) anyerror!void {
+        if (self.append_only_import) {
+            return self.appendImportedNode(path, kind, metadata, payload);
+        }
         try validatePath(path, self.limits, self.diagnostic);
         var payload_owned = true;
         errdefer if (payload_owned) self.freePayload(payload);
@@ -1567,9 +1605,13 @@ pub const RootTree = struct {
             );
         }
         try self.nodes.ensureUnusedCapacity(parents.items.len + 1);
+        try self.path_index.ensureUnusedCapacity(
+            std.math.cast(u32, parents.items.len + 1) orelse return error.NodeLimitExceeded,
+        );
 
         for (parents.items) |*parent| {
             if (parent.replace_existing) _ = self.removeInternal(parent.path, true);
+            const parent_index = self.nodes.items.len;
             self.nodes.appendAssumeCapacity(.{
                 .path = parent.path,
                 .kind = .directory,
@@ -1577,9 +1619,14 @@ pub const RootTree = struct {
                 .owned_xattrs = &.{},
                 .payload = .none,
             });
+            self.path_index.putAssumeCapacity(
+                self.nodes.items[parent_index].path,
+                parent_index,
+            );
             parent.path = &.{};
         }
         _ = self.removeInternal(owned_path, kind != .directory);
+        const index = self.nodes.items.len;
         self.nodes.appendAssumeCapacity(.{
             .path = owned_path,
             .kind = kind,
@@ -1600,9 +1647,89 @@ pub const RootTree = struct {
             .owned_xattrs = owned_xattrs,
             .payload = payload,
         });
+        self.path_index.putAssumeCapacity(self.nodes.items[index].path, index);
         path_owned = false;
         xattrs_owned = false;
         payload_owned = false;
+        self.total_node_bytes = final_bytes;
+        self.sorted = false;
+    }
+
+    fn appendImportedNode(
+        self: *RootTree,
+        path: []const u8,
+        kind: Kind,
+        metadata: Metadata,
+        payload: Payload,
+    ) !void {
+        var payload_owned = true;
+        errdefer if (payload_owned) self.freePayload(payload);
+        try validatePath(path, self.limits, self.diagnostic);
+        if (self.findIndex(path) != null) return error.DuplicatePath;
+        if (std.fs.path.dirname(path)) |parent| {
+            if (parent.len != 0) {
+                const parent_index = self.findIndex(parent) orelse return error.MissingParent;
+                if (self.nodes.items[parent_index].kind != .directory) {
+                    return error.ParentNotDirectory;
+                }
+            }
+        }
+        const final_node_count = std.math.add(usize, self.nodes.items.len, 1) catch
+            return error.NodeLimitExceeded;
+        limits_mod.observe(self.diagnostic, .nodes, final_node_count);
+        if (final_node_count > self.limits.max_nodes) {
+            return limits_mod.exceeded(
+                self.diagnostic,
+                .nodes,
+                final_node_count,
+                self.limits.max_nodes,
+            );
+        }
+        const final_bytes = std.math.add(
+            u64,
+            self.total_node_bytes,
+            payloadSize(payload),
+        ) catch return error.TotalContentLimitExceeded;
+        limits_mod.observe(self.diagnostic, .total_bytes, final_bytes);
+        if (final_bytes > self.limits.max_total_bytes) {
+            return limits_mod.exceeded(
+                self.diagnostic,
+                .total_bytes,
+                final_bytes,
+                self.limits.max_total_bytes,
+            );
+        }
+
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        const owned_xattrs = try self.dupeXattrs(metadata.xattrs);
+        errdefer freeOwnedXattrs(self.allocator, owned_xattrs);
+        try self.nodes.ensureUnusedCapacity(1);
+        try self.path_index.ensureUnusedCapacity(1);
+        const index = self.nodes.items.len;
+        self.nodes.appendAssumeCapacity(.{
+            .path = owned_path,
+            .kind = kind,
+            .metadata = .{
+                .mode = metadata.mode,
+                .uid = metadata.uid,
+                .gid = metadata.gid,
+                .atime = metadata.atime,
+                .mtime = metadata.mtime,
+                .ctime = metadata.ctime,
+                .atime_nsec = metadata.atime_nsec,
+                .mtime_nsec = metadata.mtime_nsec,
+                .ctime_nsec = metadata.ctime_nsec,
+                .crtime = metadata.crtime,
+                .crtime_nsec = metadata.crtime_nsec,
+                .xattrs = ownedXattrsView(owned_xattrs),
+            },
+            .owned_xattrs = owned_xattrs,
+            .payload = payload,
+        });
+        self.path_index.putAssumeCapacity(self.nodes.items[index].path, index);
+        payload_owned = false;
+        self.total_node_bytes = final_bytes;
         self.sorted = false;
     }
 
@@ -1951,6 +2078,9 @@ pub const RootTree = struct {
     fn sortAndValidateRepresentable(self: *RootTree) !void {
         if (!self.sorted) {
             std.mem.sort(Node, self.nodes.items, {}, lessNode);
+            for (self.nodes.items, 0..) |node, index| {
+                self.path_index.putAssumeCapacity(node.path, index);
+            }
             self.sorted = true;
         }
         for (self.nodes.items) |node| {
@@ -2042,10 +2172,13 @@ pub const RootTree = struct {
     }
 
     fn findIndex(self: *const RootTree, path: []const u8) ?usize {
-        for (self.nodes.items, 0..) |node, index| {
-            if (std.mem.eql(u8, node.path, path)) return index;
-        }
-        return null;
+        return self.path_index.get(path);
+    }
+
+    fn recomputeTotalNodeBytes(self: *RootTree) void {
+        var total: u64 = 0;
+        for (self.nodes.items) |node| total += node.size();
+        self.total_node_bytes = total;
     }
 
     fn freeNode(self: *RootTree, node: *Node) void {
@@ -3898,4 +4031,40 @@ test "root tree iso9660 adapter rejects node kinds and metadata it cannot repres
         xattr_tree.iso9660Source(),
         .{},
     ));
+}
+
+test "indexed append import survives sort overlay and hardlink promotion" {
+    const io = std.testing.io;
+    const spool_path = "test-root-tree-indexed-import.spool";
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+    tree.append_only_import = true;
+    try tree.putDirectory("usr", .{ .mode = 0o755 });
+    try tree.putFileBytes("usr/tool", "old", .{ .mode = 0o755 });
+    try tree.putHardlink("usr/tool-link", "usr/tool", .{ .mode = 0o755 });
+    tree.append_only_import = false;
+
+    const direct = try tree.readFileAllocAt(
+        std.testing.allocator,
+        tree.findIndex("usr/tool").?,
+        16,
+    );
+    defer std.testing.allocator.free(direct);
+    try std.testing.expectEqualStrings("old", direct);
+
+    try tree.sortNodes();
+    try std.testing.expect(tree.findNode("usr/tool-link") != null);
+    try tree.putFileBytes("usr/tool", "new", .{ .mode = 0o755 });
+    const replaced = try tree.readFileAlloc(std.testing.allocator, "usr/tool", 16);
+    defer std.testing.allocator.free(replaced);
+    try std.testing.expectEqualStrings("new", replaced);
+
+    try std.testing.expect(try tree.remove("usr/tool"));
+    try std.testing.expectEqual(Kind.file, tree.findNode("usr/tool-link").?.kind);
+    const promoted = try tree.readFileAlloc(std.testing.allocator, "usr/tool-link", 16);
+    defer std.testing.allocator.free(promoted);
+    try std.testing.expectEqualStrings("new", promoted);
+    try std.testing.expectEqual(@as(u64, 3), tree.total_node_bytes);
 }

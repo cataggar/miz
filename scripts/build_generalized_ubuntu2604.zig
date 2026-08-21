@@ -1378,7 +1378,10 @@ fn customizeRootWithDebz(
 
     const trusted_keyring = try std.fs.path.join(allocator, &.{ current, "usr/share/keyrings/ubuntu-archive-keyring.gpg" });
     defer allocator.free(trusted_keyring);
-    const absolute_keyring = try Dir.cwd().realPathFileAlloc(io, trusted_keyring, allocator);
+    const external_keyring = try std.fs.path.join(allocator, &.{ work_dir, "ubuntu-archive-keyring.gpg" });
+    defer allocator.free(external_keyring);
+    try Dir.cwd().copyFile(trusted_keyring, Dir.cwd(), external_keyring, io, .{});
+    const absolute_keyring = try Dir.cwd().realPathFileAlloc(io, external_keyring, allocator);
     defer allocator.free(absolute_keyring);
     const source_path = try std.fs.path.join(allocator, &.{ work_dir, "ubuntu-snapshot.sources" });
     defer allocator.free(source_path);

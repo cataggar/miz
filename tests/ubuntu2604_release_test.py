@@ -97,6 +97,29 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             '"cp"',
         ):
             self.assertNotIn(forbidden, production)
+        self.assertIn(
+            "copyFile(trusted_keyring, Dir.cwd(), external_keyring",
+            production,
+        )
+        self.assertIn(
+            "realPathFileAlloc(io, external_keyring",
+            production,
+        )
+        self.assertNotIn(
+            "realPathFileAlloc(io, trusted_keyring",
+            production,
+        )
+
+    def test_mountless_round_trip_uses_indexed_bulk_paths(self):
+        root_tree = (
+            ROOT / "packages" / "vmiz" / "src" / "root_tree.zig"
+        ).read_text(encoding="utf-8")
+        ext4_mountless = (
+            ROOT / "packages" / "vmiz" / "src" / "ext4_mountless.zig"
+        ).read_text(encoding="utf-8")
+        self.assertIn("path_index: std.StringHashMap(usize)", root_tree)
+        self.assertIn("append_only_import = true", root_tree)
+        self.assertIn("readFileAllocAt", ext4_mountless)
 
     def test_production_builder_is_fully_native_without_qemu_img(self):
         builder = (

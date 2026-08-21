@@ -804,7 +804,17 @@ pub const FileSystem = struct {
             try Io.Dir.cwd().createDirPath(self.io, parent);
             switch (entry.kind) {
                 .directory => try Io.Dir.cwd().createDirPath(self.io, host_path),
-                .file, .hardlink => {
+                .file => {
+                    const bytes = try self.tree.readFileAllocAt(
+                        self.allocator,
+                        index,
+                        options.max_file_bytes,
+                    );
+                    defer self.allocator.free(bytes);
+                    try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = host_path, .data = bytes });
+                    try Io.Dir.cwd().setFilePermissions(self.io, host_path, .fromMode(0o644), .{});
+                },
+                .hardlink => {
                     const bytes = try self.read(self.allocator, entry.path, options.max_file_bytes);
                     defer self.allocator.free(bytes);
                     try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = host_path, .data = bytes });

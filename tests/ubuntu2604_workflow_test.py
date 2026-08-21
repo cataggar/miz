@@ -98,6 +98,7 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         self.assertIn("/usr/lib/systemd/boot/efi/linuxaa64.efi.stub", install)
         stub_check = install.index('test -f "$uki_stub"')
         self.assertLess(apt_install, stub_check)
+
         # The offline-root executor now builds its sandbox with direct Linux
         # syscalls, so the util-linux helper binaries must no longer be
         # installed or discovered here.
@@ -126,6 +127,15 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
             "force_tcg",
         ):
             self.assertNotIn(forbidden, install)
+
+    def test_privileged_build_outputs_are_cleaned_with_privilege(self) -> None:
+        cleanup = self.source.split("- name: Clean privileged build state", 1)[1]
+        cleanup = cleanup.split("\n  native_qemu:", 1)[0]
+        self.assertIn(
+            'sudo rm -rf -- "$WORK_DIR" "$BUNDLE_DIR"',
+            cleanup,
+        )
+        self.assertNotIn('rm -rf -- "$BUNDLE_DIR"', cleanup)
 
     def test_forbidden_tools_are_confined_to_optional_oracle_jobs(self) -> None:
         jobs = list(re.finditer(r"(?m)^  ([a-z][a-z0-9_]*):\n", self.source))
