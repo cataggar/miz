@@ -620,6 +620,113 @@ pub const RelocateError = error{
 } || Image.PreadError || Image.PwriteError || std.mem.Allocator.Error ||
     error{UnexpectedEndOfFile};
 
+pub const GrowPartitionResult = struct {
+    old_last_lba: u64,
+    new_last_lba: u64,
+    relocation: RelocationResult,
+};
+
+/// Relocates the backup GPT to the current end of `img`, then extends the
+/// selected partition to the new last usable LBA. The partition array is
+/// treated as opaque bytes: only the selected entry's `last_lba` field and
+/// the two GPT array/header checksums change. Partition ordering, GUIDs,
+/// attributes, names, vendor bytes, the protective MBR, and every unrelated
+/// entry remain byte-for-byte unchanged.
+pub fn growPartitionToEnd(
+    img: *Image,
+    io: Io,
+    allocator: std.mem.Allocator,
+    verified: VerifiedGpt,
+    table_index: u32,
+) !GrowPartitionResult {
+    var target: ?PartitionEntry = null;
+    for (verified.partitions) |partition| {
+        if (partition.table_index == table_index) {
+            target = partition;
+            break;
+        }
+    }
+    const selected = target orelse return error.PartitionNotFound;
+    for (verified.partitions) |partition| {
+        if (partition.table_index != table_index and
+            partition.last_lba > selected.last_lba)
+        {
+            return error.PartitionNotLast;
+        }
+    }
+
+    const relocation = try relocateBackup(img, io, allocator, verified);
+    if (selected.last_lba >= relocation.new_last_usable_lba) {
+        return error.NotEnoughSpace;
+    }
+
+    var primary_sector: [sector_size]u8 = undefined;
+    try preadExact(img.*, io, &primary_sector, sector_size);
+    var backup_sector: [sector_size]u8 = undefined;
+    try preadExact(
+        img.*,
+        io,
+        &backup_sector,
+        try sectorOffset(relocation.new_backup_lba),
+    );
+
+    const entry_size = std.mem.readInt(u32, primary_sector[84..88], .little);
+    if (entry_size < partition_entry_size or entry_size % 8 != 0) {
+        return error.UnsupportedPartitionEntrySize;
+    }
+    const array_bytes = try partitionArrayBytes(Header.decode(&primary_sector) catch
+        return error.InvalidPartitionArrayBounds);
+    const array_len = std.math.cast(usize, array_bytes) orelse
+        return error.PartitionArrayTooLarge;
+    const entry_offset_u64 = std.math.mul(
+        u64,
+        table_index,
+        entry_size,
+    ) catch return error.InvalidPartitionArrayBounds;
+    const entry_end = std.math.add(
+        u64,
+        entry_offset_u64,
+        partition_entry_size,
+    ) catch return error.InvalidPartitionArrayBounds;
+    if (entry_end > array_bytes) return error.PartitionNotFound;
+    const entry_offset = std.math.cast(usize, entry_offset_u64) orelse
+        return error.InvalidPartitionArrayBounds;
+
+    const primary_array_lba = std.mem.readInt(u64, primary_sector[72..80], .little);
+    const backup_array_lba = std.mem.readInt(u64, backup_sector[72..80], .little);
+    const array = try allocator.alloc(u8, array_len);
+    defer allocator.free(array);
+    try preadExact(img.*, io, array, try sectorOffset(primary_array_lba));
+    const current_last = std.mem.readInt(
+        u64,
+        array[entry_offset + 40 ..][0..8],
+        .little,
+    );
+    if (current_last != selected.last_lba) return error.SourceMetadataChanged;
+    std.mem.writeInt(
+        u64,
+        array[entry_offset + 40 ..][0..8],
+        relocation.new_last_usable_lba,
+        .little,
+    );
+    const array_crc = std.hash.crc.Crc32.hash(array);
+    std.mem.writeInt(u32, primary_sector[88..92], array_crc, .little);
+    std.mem.writeInt(u32, backup_sector[88..92], array_crc, .little);
+    updateHeaderChecksum(&primary_sector);
+    updateHeaderChecksum(&backup_sector);
+
+    try img.pwrite(io, array, try sectorOffset(primary_array_lba));
+    try img.pwrite(io, array, try sectorOffset(backup_array_lba));
+    try img.pwrite(io, &backup_sector, try sectorOffset(relocation.new_backup_lba));
+    try img.pwrite(io, &primary_sector, sector_size);
+
+    return .{
+        .old_last_lba = selected.last_lba,
+        .new_last_lba = relocation.new_last_usable_lba,
+        .relocation = relocation,
+    };
+}
+
 /// Relocates a verified backup GPT to the current end of `img` without
 /// changing any partition entry or partition extent. The partition array is
 /// copied as opaque bytes, and the protective MBR update preserves bootstrap

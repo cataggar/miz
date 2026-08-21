@@ -18,6 +18,7 @@ const Dir = std.Io.Dir;
 const Io = std.Io;
 const artifact_pipeline = vmiz.artifact_pipeline;
 const package_family = vmiz.package_family;
+const guid = vmiz.guid;
 
 const release = "20260731";
 const release_base = "https://cloud-images.ubuntu.com/releases/26.04/release-" ++ release;
@@ -52,6 +53,8 @@ const Profile = struct {
     work_dir: []const u8,
     efi_fallback: []const u8,
     pe_machine: u16,
+    root_partition_table_index: u32,
+    root_partition_type_guid: guid.Guid,
 };
 
 const profiles = [_]Profile{
@@ -66,6 +69,8 @@ const profiles = [_]Profile{
         .work_dir = ".scratch/ubuntu2604-x86_64",
         .efi_fallback = "BOOTX64.EFI",
         .pe_machine = 0x8664,
+        .root_partition_table_index = 3,
+        .root_partition_type_guid = guid.linux_root_x86_64,
     },
     .{
         .architecture = .aarch64,
@@ -78,6 +83,8 @@ const profiles = [_]Profile{
         .work_dir = ".scratch/ubuntu2604-aarch64",
         .efi_fallback = "BOOTAA64.EFI",
         .pe_machine = 0xaa64,
+        .root_partition_table_index = 2,
+        .root_partition_type_guid = guid.linux_root_aarch64,
     },
 };
 
@@ -1074,27 +1081,39 @@ pub fn main(init: std.process.Init) !void {
         return error.ChecksumMismatch;
     if (args.preflight_only) return;
 
-    for (&[_][]const u8{ "qemu-img", "virt-resize", "virt-customize", "virt-copy-in", "virt-cat", "virt-ls", "virt-filesystems", "virt-tar-in", "virt-tar-out", "guestfish", "tar", "cp", "ukify", "sbverify" }) |tool|
+    for (&[_][]const u8{ "qemu-img", "virt-customize", "virt-copy-in", "virt-cat", "virt-ls", "virt-filesystems", "virt-tar-in", "virt-tar-out", "guestfish", "tar", "cp", "ukify", "sbverify" }) |tool|
         try requireTool(allocator, io, tool);
     const config = try signingConfig(args);
 
     const mutable = try std.fs.path.join(allocator, &.{ work_dir, "customized.qcow2" });
     defer allocator.free(mutable);
-    const destination_root = switch (profile.architecture) {
-        .x86_64 => "/dev/sda4",
-        .aarch64 => "/dev/sda3",
-    };
-    const size_text = try std.fmt.allocPrint(allocator, "{d}", .{args.size});
-    defer allocator.free(size_text);
     Dir.cwd().deleteFile(io, mutable) catch {};
-    try run(allocator, io, &.{ "qemu-img", "create", "-f", "qcow2", mutable, size_text });
-    if (profile.architecture == .aarch64) {
-        try run(allocator, io, &.{ "virt-resize", "--expand", "/dev/sda1", "--no-expand-content", source_path, mutable });
-        try run(allocator, io, &.{ "guestfish", "--rw", "-a", mutable, "run", ":", "e2fsck-f", destination_root });
-        try run(allocator, io, &.{ "guestfish", "--rw", "-a", mutable, "run", ":", "resize2fs", destination_root });
-    } else {
-        try run(allocator, io, &.{ "virt-resize", "--expand", "/dev/sda1", source_path, mutable });
-    }
+    var source_image = try vmiz.Image.openPathReadOnlyStandalone(io, source_path);
+    defer source_image.close(io);
+    var mutable_image = try vmiz.Image.createExclusive(
+        io,
+        mutable,
+        .qcow2,
+        source_image.virtual_size,
+        .{},
+    );
+    try vmiz.copyAll(io, source_image, &mutable_image, allocator);
+    mutable_image.close(io);
+    const growth = try vmiz.root_resize.growExistingQcow2(
+        allocator,
+        io,
+        mutable,
+        .{
+            .target_size = args.size,
+            .filesystem_label = vmiz.root_resize.default_filesystem_label,
+        },
+    );
+    const destination_root = try std.fmt.allocPrint(
+        allocator,
+        "/dev/sda{d}",
+        .{growth.root_table_index + 1},
+    );
+    defer allocator.free(destination_root);
 
     var debz_customization = try customizeRootWithDebz(allocator, io, profile, mutable, work_dir, provenance_dir);
     defer debz_customization.deinit(allocator);
@@ -1253,6 +1272,10 @@ test "profiles pin immutable official sources for both architectures" {
         try std.testing.expect(std.mem.indexOf(u8, profile.source_name, "26.04") != null);
     }
     try std.testing.expectEqual(@as(u64, 5 * 1024 * 1024 * 1024), default_virtual_size);
+    try std.testing.expectEqual(@as(u32, 3), profiles[0].root_partition_table_index);
+    try std.testing.expectEqual(@as(u32, 2), profiles[1].root_partition_table_index);
+    try std.testing.expectEqualSlices(u8, &guid.linux_root_x86_64, &profiles[0].root_partition_type_guid);
+    try std.testing.expectEqualSlices(u8, &guid.linux_root_aarch64, &profiles[1].root_partition_type_guid);
 }
 
 test "Canonical keyring preparation uses a chmod-capable directory handle" {
