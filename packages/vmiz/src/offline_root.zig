@@ -29,6 +29,7 @@ pub const Architecture = enum {
 pub const NetworkPolicy = enum { disabled };
 pub const DevicePolicy = enum { minimal };
 pub const PidfdMode = enum { auto, force_unavailable, force_blocked, force_fd_exhaustion, force_unexpected };
+pub const PidfdOpenFn = *const fn (pid: i32) usize;
 const cleanup_timeout_ms: u64 = 90 * 1000;
 
 pub const Limits = struct {
@@ -130,6 +131,7 @@ pub const ExecutorOptions = struct {
     pre_chroot_delay_ms: u64 = 0,
     supervisor_timeout_ms_override: ?u64 = null,
     pidfd_mode: PidfdMode = .auto,
+    pidfd_open_fn: ?PidfdOpenFn = null,
     run_fn: ?*const fn (
         context: ?*anyopaque,
         allocator: Allocator,
@@ -440,7 +442,13 @@ pub const Executor = struct {
             },
         }
         try multi_reader.checkAnyError();
-        const term = waitUntilDeadline(self.io, &child, deadline, self.options.pidfd_mode) catch |err| {
+        const term = waitUntilDeadline(
+            self.io,
+            &child,
+            deadline,
+            self.options.pidfd_mode,
+            self.options.pidfd_open_fn,
+        ) catch |err| {
             killProcessGroup(&child);
             child.kill(self.io);
             if (err == error.Timeout) {
@@ -486,14 +494,18 @@ fn waitUntilDeadline(
     child: *std.process.Child,
     deadline: Io.Timeout,
     mode: PidfdMode,
+    pidfd_open_fn: ?PidfdOpenFn,
 ) !std.process.Child.Term {
     if (comptime builtin.os.tag != .linux) return child.wait(io);
     const pid = child.id orelse return error.Timeout;
     if (mode == .force_unexpected) return error.PidfdSetupFailed;
-    if (mode != .auto) return waitpidFallback(io, pid, deadline);
-    const opened = std.os.linux.pidfd_open(pid, 0);
+    if (mode != .auto) return waitpidFallback(io, child, pid, deadline);
+    const opened = if (pidfd_open_fn) |open_fn|
+        open_fn(@intCast(pid))
+    else
+        std.os.linux.pidfd_open(pid, 0);
     if (std.os.linux.errno(opened) != .SUCCESS) switch (std.os.linux.errno(opened)) {
-        .NOSYS, .INVAL, .PERM, .MFILE, .NFILE => return waitpidFallback(io, pid, deadline),
+        .NOSYS, .INVAL, .PERM, .MFILE, .NFILE => return waitpidFallback(io, child, pid, deadline),
         else => return error.PidfdSetupFailed,
     };
     const pidfd: i32 = @intCast(opened);
@@ -511,13 +523,14 @@ fn waitUntilDeadline(
         switch (std.os.linux.errno(poll_result)) {
             .SUCCESS => if (poll_result != 0) return child.wait(io),
             .INTR => {},
-            else => return waitpidFallback(io, pid, deadline),
+            else => return waitpidFallback(io, child, pid, deadline),
         }
     }
 }
 
 fn waitpidFallback(
     io: Io,
+    child: *std.process.Child,
     pid: std.os.linux.pid_t,
     deadline: Io.Timeout,
 ) !std.process.Child.Term {
@@ -525,6 +538,7 @@ fn waitpidFallback(
         const remaining = deadline.toDurationFromNow(io) orelse {
             var status: u32 = undefined;
             _ = std.os.linux.waitpid(pid, &status, 0);
+            clearReapedChild(io, child);
             return waitStatusTerm(status);
         };
         if (remaining.raw.nanoseconds <= 0) return error.Timeout;
@@ -532,7 +546,10 @@ fn waitpidFallback(
         const result = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
         switch (std.os.linux.errno(result)) {
             .SUCCESS => {
-                if (result != 0) return waitStatusTerm(status);
+                if (result != 0) {
+                    clearReapedChild(io, child);
+                    return waitStatusTerm(status);
+                }
             },
             .INTR => continue,
             else => return error.WaitpidFailed,
@@ -543,6 +560,16 @@ fn waitpidFallback(
         );
         try Io.sleep(io, Io.Duration.fromNanoseconds(sleep_ns), .awake);
     }
+}
+
+fn clearReapedChild(io: Io, child: *std.process.Child) void {
+    if (child.stdin) |file| file.close(io);
+    if (child.stdout) |file| file.close(io);
+    if (child.stderr) |file| file.close(io);
+    child.stdin = null;
+    child.stdout = null;
+    child.stderr = null;
+    child.id = null;
 }
 
 fn waitStatusTerm(status: u32) std.process.Child.Term {
@@ -938,6 +965,15 @@ fn expectNoResidualOfflineMounts(io: Io) !void {
     }
 }
 
+fn countOpenFds(io: Io) !usize {
+    var fd_dir = try Io.Dir.openDirAbsolute(io, "/proc/self/fd", .{ .iterate = true });
+    defer fd_dir.close(io);
+    var iterator = fd_dir.iterate();
+    var count: usize = 0;
+    while (try iterator.next(io)) |_| count += 1;
+    return count;
+}
+
 test "offline root rejects traversal and wildcard ambiguity" {
     try std.testing.expectError(error.InvalidGuestPath, normalizeGuestPath("/etc/../shadow"));
     try std.testing.expectError(error.InvalidDiscoveryPattern, blk: {
@@ -1241,6 +1277,29 @@ const FakeRunner = struct {
     }
 };
 
+fn fakePidfdErrno(errno: std.os.linux.E) usize {
+    return @bitCast(-@as(isize, @intCast(@intFromEnum(errno))));
+}
+
+fn fakePidfdEnosys(_: i32) usize {
+    return fakePidfdErrno(.NOSYS);
+}
+fn fakePidfdInval(_: i32) usize {
+    return fakePidfdErrno(.INVAL);
+}
+fn fakePidfdPerm(_: i32) usize {
+    return fakePidfdErrno(.PERM);
+}
+fn fakePidfdMfile(_: i32) usize {
+    return fakePidfdErrno(.MFILE);
+}
+fn fakePidfdNfile(_: i32) usize {
+    return fakePidfdErrno(.NFILE);
+}
+fn fakePidfdUnexpected(_: i32) usize {
+    return fakePidfdErrno(.BADF);
+}
+
 test "offline executor enforces architecture, allowlist, timeout, and failure" {
     const host = Architecture.host();
     const foreign: Architecture = if (host == .x86_64) .aarch64 else .x86_64;
@@ -1394,6 +1453,7 @@ test "privileged offline namespace contains PID1 and reaps descendants" {
         try std.testing.expectEqual(CommandOutcome.succeeded, repeated.outcome);
         try expectNoResidualOfflineMounts(io);
     }
+    const fds_before_fallbacks = try countOpenFds(io);
     for ([_]PidfdMode{ .force_unavailable, .force_blocked, .force_fd_exhaustion }) |mode| {
         var fallback_executor = try Executor.init(allocator, io, .{
             .root = &root,
@@ -1410,17 +1470,51 @@ test "privileged offline namespace contains PID1 and reaps descendants" {
         try std.testing.expectEqual(CommandOutcome.succeeded, completed.outcome);
         try expectNoResidualOfflineMounts(io);
     }
+    for ([_]PidfdOpenFn{
+        fakePidfdEnosys,
+        fakePidfdInval,
+        fakePidfdPerm,
+        fakePidfdMfile,
+        fakePidfdNfile,
+    }) |open_fn| {
+        var injected_executor = try Executor.init(allocator, io, .{
+            .root = &root,
+            .architecture = Architecture.host(),
+            .pidfd_open_fn = open_fn,
+        });
+        const completed = try injected_executor.runIsolated(
+            &.{ "/bin/sh", "-c", "exit 0" },
+            5 * 1000,
+        );
+        injected_executor.deinit();
+        var completed_result = completed;
+        defer completed_result.deinit(allocator);
+        try std.testing.expectEqual(CommandOutcome.succeeded, completed.outcome);
+        try expectNoResidualOfflineMounts(io);
+    }
+    var injected_unexpected_executor = try Executor.init(allocator, io, .{
+        .root = &root,
+        .architecture = Architecture.host(),
+        .pidfd_open_fn = fakePidfdUnexpected,
+    });
+    try std.testing.expectError(
+        error.PidfdSetupFailed,
+        injected_unexpected_executor.runIsolated(&.{ "/bin/sh", "-c", "exit 0" }, 5 * 1000),
+    );
+    injected_unexpected_executor.deinit();
+    try expectNoResidualOfflineMounts(io);
     var unexpected_executor = try Executor.init(allocator, io, .{
         .root = &root,
         .architecture = Architecture.host(),
         .pidfd_mode = .force_unexpected,
     });
-    defer unexpected_executor.deinit();
     try std.testing.expectError(
         error.PidfdSetupFailed,
         unexpected_executor.runIsolated(&.{ "/bin/sh", "-c", "exit 0" }, 5 * 1000),
     );
+    unexpected_executor.deinit();
     try expectNoResidualOfflineMounts(io);
+    try std.testing.expectEqual(fds_before_fallbacks, try countOpenFds(io));
     var stalled_executor = try Executor.init(allocator, io, .{
         .root = &root,
         .architecture = Architecture.host(),
@@ -1455,6 +1549,23 @@ test "privileged offline namespace contains PID1 and reaps descendants" {
         result.deinit(allocator);
     }
     try std.testing.expectEqual(CommandOutcome.timed_out, chatty.outcome);
+    try expectNoResidualOfflineMounts(io);
+    var quiet_executor = try Executor.init(allocator, io, .{
+        .root = &root,
+        .architecture = Architecture.host(),
+        .pidfd_mode = .force_unavailable,
+        .supervisor_timeout_ms_override = 1 * 1000,
+    });
+    defer quiet_executor.deinit();
+    const quiet = try quiet_executor.runIsolated(
+        &.{ "/bin/sh", "-c", "exec 1>&- 2>&-; sleep 10" },
+        5 * 1000,
+    );
+    defer {
+        var result = quiet;
+        result.deinit(allocator);
+    }
+    try std.testing.expectEqual(CommandOutcome.timed_out, quiet.outcome);
     try expectNoResidualOfflineMounts(io);
     Io.Dir.cwd().access(io, fixture, .{ .read = true, .execute = true }) catch
         return error.OfflineRootTeardownIncomplete;
