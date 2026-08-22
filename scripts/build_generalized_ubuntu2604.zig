@@ -1,13 +1,13 @@
 //! Build a generalized Ubuntu 26.04 Gen2 QCOW2 image from Canonical's
 //! immutable 20260731 cloud-image publication.
 //!
-//! The official cloud disk is the authoritative filesystem/package input.
-//! Its detached signature, signer fingerprint, checksum document, image, and
-//! package manifest are all pinned. A native offline-root transaction then
-//! switches the guest to the immutable Ubuntu snapshot, installs the Azure
-//! kernel/agent closure, writes an exact dpkg inventory, and generalizes the
-//! machine. The UKI is assembled and signed on the host so private signing
-//! material is never copied into the guest disk.
+//! The full flavor keeps the official cloud disk as its authoritative
+//! filesystem/package input. The core flavor uses the same signed disk only
+//! as its pinned GPT/ESP substrate and creates a fresh ubuntu-minimal root
+//! through embedded debz. Both flavors pin the detached signature, signer,
+//! checksum document, image, manifest, snapshot transactions, exact locks,
+//! and provenance. The UKI is assembled and signed on the host so private
+//! signing material is never copied into the guest disk.
 
 const std = @import("std");
 const vmiz = @import("vmiz");
@@ -39,6 +39,11 @@ const canonical_key_armor_sha256 = [_]u8{
 const sums_sha256 = "d562d59dac70f68d67d00e994db5cd89e49e9d93f7f80b4cb868a5eeb057ec36";
 const sums_signature_sha256 = "2bf5fae8be0c79cc30c5c10223f1d4790b6ef541240896bfe48c7ac57c3404ed";
 const default_virtual_size: u64 = 5 * 1024 * 1024 * 1024;
+// Both pinned Canonical QCOW2 inputs are exactly 3.5 GiB. Reusing that signed
+// GPT/ESP substrate without growing it gives core a 30% smaller virtual disk
+// than full while the fresh debz root leaves at least this much writable room.
+const core_virtual_size: u64 = 3584 * 1024 * 1024;
+const core_minimum_root_free_bytes: u64 = 768 * 1024 * 1024;
 const source_max_size: u64 = 2 * 1024 * 1024 * 1024;
 const manifest_max_size: u64 = 256 * 1024;
 const sums_max_size: u64 = 64 * 1024;
@@ -54,6 +59,24 @@ const Architecture = enum {
         if (std.mem.eql(u8, value, "x86_64") or std.mem.eql(u8, value, "amd64")) return .x86_64;
         if (std.mem.eql(u8, value, "aarch64") or std.mem.eql(u8, value, "arm64")) return .aarch64;
         return null;
+    }
+};
+
+const Flavor = enum {
+    full,
+    core,
+
+    fn parse(value: []const u8) ?Flavor {
+        if (std.mem.eql(u8, value, "full")) return .full;
+        if (std.mem.eql(u8, value, "core")) return .core;
+        return null;
+    }
+
+    fn defaultSize(self: Flavor) u64 {
+        return switch (self) {
+            .full => default_virtual_size,
+            .core => core_virtual_size,
+        };
     }
 };
 
@@ -127,6 +150,22 @@ const Profile = struct {
     pe_machine: u16,
     root_partition_table_index: u32,
     root_partition_type_guid: guid.Guid,
+
+    fn outputFor(self: *const Profile, flavor: Flavor) []const u8 {
+        if (flavor == .full) return self.output;
+        return switch (self.architecture) {
+            .x86_64 => "Ubuntu-26.04-x86_64.core.qcow2",
+            .aarch64 => "Ubuntu-26.04-aarch64.core.qcow2",
+        };
+    }
+
+    fn workDirFor(self: *const Profile, flavor: Flavor) []const u8 {
+        if (flavor == .full) return self.work_dir;
+        return switch (self.architecture) {
+            .x86_64 => ".scratch/ubuntu2604-x86_64-core",
+            .aarch64 => ".scratch/ubuntu2604-aarch64-core",
+        };
+    }
 };
 
 const profiles = [_]Profile{
@@ -173,15 +212,81 @@ const required_manifest_packages = [_][]const u8{
     "netplan.io",
 };
 
-const debz_packages = [_][]const u8{ "linux-azure", "walinuxagent" };
+const full_debz_packages = [_][]const u8{ "linux-azure", "walinuxagent" };
+const core_debz_packages = [_][]const u8{
+    "ubuntu-minimal",
+    "linux-azure",
+    "openssh-server",
+    "sudo",
+};
+const max_debz_packages = core_debz_packages.len;
+
+const core_required_packages = [_][]const u8{
+    "ubuntu-minimal",
+    "linux-azure",
+    "openssh-server",
+    "openssh-client",
+    "sudo",
+    "ca-certificates",
+};
+
+const core_forbidden_packages = [_][]const u8{
+    "cloud-init",
+    "walinuxagent",
+    "ubuntu-server",
+    "ubuntu-server-minimal",
+};
+
+const core_required_paths = [_][]const u8{
+    "/usr/sbin/vmizinit",
+    "/usr/sbin/azagent",
+    "/usr/sbin/sshd",
+    "/usr/bin/ssh-keygen",
+    "/etc/ssh/sshd_config.d/10-vmizinit.conf",
+    "/etc/waagent.conf",
+    "/var/lib/vmiz/ubuntu2604-package-lock.tsv",
+    "/var/lib/vmiz/ubuntu2604-core-provenance.json",
+    "/var/lib/vmiz/source-release",
+};
+
+const core_forbidden_paths = [_][]const u8{
+    "/usr/bin/cloud-init",
+    "/usr/sbin/waagent",
+    "/usr/bin/waagent",
+    "/var/lib/cloud",
+    "/var/lib/waagent",
+    "/var/lib/azagent/provisioned",
+    "/var/lib/dbus/machine-id",
+    "/etc/systemd/system/multi-user.target.wants/ssh.service",
+    "/etc/systemd/system/ssh.service",
+    "/etc/systemd/system/sockets.target.wants/ssh.socket",
+};
+
+const core_ssh_config =
+    "PasswordAuthentication no\n" ++
+    "KbdInteractiveAuthentication no\n" ++
+    "PermitEmptyPasswords no\n" ++
+    "PermitRootLogin prohibit-password\n" ++
+    "PubkeyAuthentication yes\n";
+
+const core_azagent_config =
+    "ResourceDisk.Format=y\n" ++
+    "ResourceDisk.Filesystem=xfs\n" ++
+    "ResourceDisk.MountPoint=/d\n" ++
+    "ResourceDisk.EnableSwap=n\n" ++
+    "DataDisk.Mount=y\n";
 
 const Args = struct {
     architecture: ?Architecture = null,
+    flavor: Flavor = .full,
     source: ?[]const u8 = null,
     output: ?[]const u8 = null,
     work_dir: ?[]const u8 = null,
     provenance_dir: ?[]const u8 = null,
     size: u64 = default_virtual_size,
+    size_explicit: bool = false,
+    vmizinit: ?[]const u8 = null,
+    azagent: ?[]const u8 = null,
     signing_certificate: ?[]const u8 = null,
     signing_certificate_sha256: ?[]const u8 = null,
     signing_key: ?[]const u8 = null,
@@ -192,12 +297,15 @@ const Args = struct {
 };
 
 const help =
-    \\Usage: zig build generalized-ubuntu2604 -Dubuntu2604-arch=<x86_64|aarch64> -- [options]
+    \\Usage: zig build generalized-ubuntu2604 -Dubuntu2604-arch=<x86_64|aarch64> -Dubuntu2604-flavor=<full|core> -- [options]
+    \\  --flavor <full|core>                    image flavor (default full)
     \\  --source <path>                         verified local Canonical .img
     \\  --output <path>                         output QCOW2
     \\  --work-dir <path>                       persistent download/work cache
     \\  --provenance-dir <path>                 release provenance sidecars
-    \\  --size <size>                           virtual size (default 5G)
+    \\  --size <size>                           virtual size (full 5G, core 3584M)
+    \\  --vmizinit <path>                       static guest PID 1 (core only)
+    \\  --azagent <path>                        static guest provisioning agent (core only)
     \\  --uki-signing-certificate <path>        Secure Boot certificate
     \\  --uki-signing-certificate-sha256 <hex>  DER certificate SHA-256
     \\  --uki-signing-key <path>                local signing key
@@ -224,6 +332,7 @@ fn packageFamilyRequest(
     cache_path: []const u8,
     state_path: []const u8,
     lock_path: []const u8,
+    installed_baseline: package_family.InstalledBaselinePolicy,
 ) package_family.Request {
     return .{
         .family = .debian,
@@ -249,7 +358,7 @@ fn packageFamilyRequest(
             .recommends = false,
             .allow_downgrade = false,
             .conffile = .keep_existing,
-            .installed_baseline = .require_locked,
+            .installed_baseline = installed_baseline,
             .deadline_ms = 30 * 60 * 1000,
         },
     };
@@ -354,6 +463,10 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
             args.architecture = Architecture.parse(argv[i]) orelse return error.InvalidArchitecture;
+        } else if (std.mem.eql(u8, arg, "--flavor")) {
+            i += 1;
+            if (i == argv.len) return error.MissingArgument;
+            args.flavor = Flavor.parse(argv[i]) orelse return error.InvalidFlavor;
         } else if (std.mem.eql(u8, arg, "--source")) {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
@@ -374,6 +487,15 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
             args.size = try vmiz.parseSize(argv[i]);
+            args.size_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--vmizinit")) {
+            i += 1;
+            if (i == argv.len) return error.MissingArgument;
+            args.vmizinit = argv[i];
+        } else if (std.mem.eql(u8, arg, "--azagent")) {
+            i += 1;
+            if (i == argv.len) return error.MissingArgument;
+            args.azagent = argv[i];
         } else if (std.mem.eql(u8, arg, "--uki-signing-certificate")) {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
@@ -406,7 +528,8 @@ fn parseArgs(argv: []const []const u8) !Args {
         } else return error.UnknownArgument;
     }
 
-    if (args.size < default_virtual_size) return error.ImageTooSmall;
+    if (!args.size_explicit) args.size = args.flavor.defaultSize();
+    if (args.size < args.flavor.defaultSize()) return error.ImageTooSmall;
     return args;
 }
 
@@ -901,9 +1024,19 @@ fn peMachine(bytes: []const u8) !u16 {
     return std.mem.readInt(u16, machine, .little);
 }
 
-fn validateExactLock(bytes: []const u8, profile: *const Profile) !void {
-    for (&[_][]const u8{ "linux-azure\t", "walinuxagent\t", "cloud-init\t", "openssh-server\t" }) |needle|
+fn requiredPackages(flavor: Flavor) []const []const u8 {
+    return switch (flavor) {
+        .full => &.{ "linux-azure", "walinuxagent", "cloud-init", "openssh-server" },
+        .core => &core_required_packages,
+    };
+}
+
+fn validateExactLock(bytes: []const u8, profile: *const Profile, flavor: Flavor) !void {
+    for (requiredPackages(flavor)) |package| {
+        const needle = try std.fmt.allocPrint(std.testing.allocator, "{s}\t", .{package});
+        defer std.testing.allocator.free(needle);
         if (std.mem.indexOf(u8, bytes, needle) == null) return error.ExactLockIncomplete;
+    }
     const expected_arch = try std.fmt.allocPrint(std.testing.allocator, "\t{s}\n", .{profile.ubuntu_architecture});
     defer std.testing.allocator.free(expected_arch);
     if (std.mem.indexOf(u8, bytes, expected_arch) == null) return error.ExactLockArchitectureMissing;
@@ -912,11 +1045,26 @@ fn validateExactLock(bytes: []const u8, profile: *const Profile) !void {
         .aarch64 => "\tamd64\n",
     };
     if (std.mem.indexOf(u8, bytes, foreign_arch) != null) return error.ForeignArchitecturePackage;
+    if (flavor == .core) {
+        for (&core_forbidden_packages) |package| {
+            const needle = try std.fmt.allocPrint(std.testing.allocator, "{s}\t", .{package});
+            defer std.testing.allocator.free(needle);
+            if (std.mem.indexOf(u8, bytes, needle) != null) return error.ForbiddenCorePackage;
+        }
+    }
 }
 
-fn validateExactLockRuntime(allocator: Allocator, bytes: []const u8, profile: *const Profile) !void {
-    for (&[_][]const u8{ "linux-azure\t", "walinuxagent\t", "cloud-init\t", "openssh-server\t" }) |needle|
+fn validateExactLockRuntime(
+    allocator: Allocator,
+    bytes: []const u8,
+    profile: *const Profile,
+    flavor: Flavor,
+) !void {
+    for (requiredPackages(flavor)) |package| {
+        const needle = try std.fmt.allocPrint(allocator, "{s}\t", .{package});
+        defer allocator.free(needle);
         if (std.mem.indexOf(u8, bytes, needle) == null) return error.ExactLockIncomplete;
+    }
     const expected_arch = try std.fmt.allocPrint(allocator, "\t{s}\n", .{profile.ubuntu_architecture});
     defer allocator.free(expected_arch);
     if (std.mem.indexOf(u8, bytes, expected_arch) == null) return error.ExactLockArchitectureMissing;
@@ -925,6 +1073,67 @@ fn validateExactLockRuntime(allocator: Allocator, bytes: []const u8, profile: *c
         .aarch64 => "\tamd64\n",
     };
     if (std.mem.indexOf(u8, bytes, foreign_arch) != null) return error.ForeignArchitecturePackage;
+    if (flavor == .core) {
+        for (&core_forbidden_packages) |package| {
+            const needle = try std.fmt.allocPrint(allocator, "{s}\t", .{package});
+            defer allocator.free(needle);
+            if (std.mem.indexOf(u8, bytes, needle) != null) return error.ForbiddenCorePackage;
+        }
+    }
+}
+
+fn validateInventoryAgainstExactLock(
+    allocator: Allocator,
+    inventory: []const u8,
+    exact_lock: []const u8,
+    profile: *const Profile,
+) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, exact_lock, .{});
+    defer parsed.deinit();
+    const target = parsed.value.object.get("target_architecture") orelse
+        return error.ExactLockIncomplete;
+    if (target != .string or !std.mem.eql(u8, target.string, profile.ubuntu_architecture))
+        return error.ExactLockArchitectureMissing;
+    const package_value = parsed.value.object.get("packages") orelse
+        return error.ExactLockIncomplete;
+    if (package_value != .array) return error.ExactLockIncomplete;
+
+    var inventory_count: usize = 0;
+    var lines = std.mem.splitScalar(u8, inventory, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const name = fields.next() orelse return error.InvalidPackageInventory;
+        const version = fields.next() orelse return error.InvalidPackageInventory;
+        const architecture = fields.next() orelse return error.InvalidPackageInventory;
+        if (fields.next() != null) return error.InvalidPackageInventory;
+        const normalized_name = if (std.mem.lastIndexOfScalar(u8, name, ':')) |separator|
+            if (std.mem.eql(u8, name[separator + 1 ..], architecture))
+                name[0..separator]
+            else
+                name
+        else
+            name;
+        var found = false;
+        for (package_value.array.items) |item| {
+            if (item != .object) return error.ExactLockIncomplete;
+            const locked_name = item.object.get("name") orelse return error.ExactLockIncomplete;
+            const locked_version = item.object.get("version") orelse return error.ExactLockIncomplete;
+            const locked_architecture = item.object.get("architecture") orelse return error.ExactLockIncomplete;
+            if (locked_name != .string or locked_version != .string or locked_architecture != .string)
+                return error.ExactLockIncomplete;
+            if (std.mem.eql(u8, normalized_name, locked_name.string) and
+                std.mem.eql(u8, version, locked_version.string) and
+                std.mem.eql(u8, architecture, locked_architecture.string))
+            {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.UnexpectedCorePackage;
+        inventory_count += 1;
+    }
+    if (inventory_count != package_value.array.items.len) return error.UnexpectedCorePackage;
 }
 
 const DebzEvidence = struct {
@@ -946,11 +1155,13 @@ const DebzEvidence = struct {
 
 const DebzCustomization = struct {
     root_path: []u8,
-    evidence: [debz_packages.len]DebzEvidence,
+    evidence: [max_debz_packages]DebzEvidence,
+    evidence_count: usize,
+    root_free_bytes: u64,
 
     fn deinit(self: *DebzCustomization, allocator: Allocator) void {
         allocator.free(self.root_path);
-        for (&self.evidence) |*item| item.deinit(allocator);
+        for (self.evidence[0..self.evidence_count]) |*item| item.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -979,7 +1190,7 @@ const NativeRoot = struct {
         self.* = undefined;
     }
 
-    fn finish(self: *NativeRoot) !void {
+    fn finish(self: *NativeRoot) !vmiz.ext4.FilesystemInfo {
         var commit_result = self.filesystem.commit() catch |err| {
             if (self.filesystem.recoveryArtifactPath()) |path| {
                 std.debug.print(
@@ -996,6 +1207,7 @@ const NativeRoot = struct {
             "native ext4 recovery artifact retained at {s}\n",
             .{commit_result.recovery_path},
         );
+        const filesystem_info = commit_result.filesystem;
         self.filesystem.deinit();
         self.filesystem_open = false;
         self.image.close(self.io);
@@ -1007,6 +1219,7 @@ const NativeRoot = struct {
             self.mutable_image,
         );
         Dir.cwd().deleteFile(self.io, self.raw_path) catch {};
+        return filesystem_info;
     }
 };
 
@@ -1117,14 +1330,21 @@ fn ukiCmdline(
     allocator: Allocator,
     root_guid: guid.Guid,
     profile: *const Profile,
+    flavor: Flavor,
 ) ![]u8 {
     var root_guid_text: [36]u8 = undefined;
-    const root_guid_value = guid.formatLower(&root_guid_text, root_guid);
-    return std.fmt.allocPrint(
-        allocator,
-        "root=PARTUUID={s} {s}",
-        .{ root_guid_value, profile.serial_console },
-    );
+    return switch (flavor) {
+        .full => std.fmt.allocPrint(
+            allocator,
+            "root=PARTUUID={s} {s}",
+            .{ guid.formatLower(&root_guid_text, root_guid), profile.serial_console },
+        ),
+        .core => std.fmt.allocPrint(
+            allocator,
+            "root=PARTUUID={s} init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=auto console=tty0 {s}",
+            .{ guid.formatLower(&root_guid_text, root_guid), profile.serial_console },
+        ),
+    };
 }
 
 fn labelEquals(label: [16]u8, expected: []const u8) bool {
@@ -1257,6 +1477,24 @@ fn validateNativeBootArtifacts(
     if (initrd.kind != .file or initrd.size == 0) return error.InitramfsMissing;
 }
 
+fn validateCoreKernelModules(
+    allocator: Allocator,
+    root: *offline_root.Root,
+    release_name: []const u8,
+) !void {
+    const modules_dep_path = try std.fmt.allocPrint(
+        allocator,
+        "/lib/modules/{s}/modules.dep",
+        .{release_name},
+    );
+    defer allocator.free(modules_dep_path);
+    const modules_dep = try root.readFile(modules_dep_path);
+    defer allocator.free(modules_dep);
+    for (&[_][]const u8{ "hv_netvsc.ko", "overlay.ko", "isofs.ko", "udf.ko", "xfs.ko" }) |module|
+        if (std.mem.indexOf(u8, modules_dep, module) == null)
+            return error.CoreKernelModuleMissing;
+}
+
 fn validateUkiBytes(
     fallback_bytes: []const u8,
     named_bytes: []const u8,
@@ -1266,10 +1504,28 @@ fn validateUkiBytes(
     if (try peMachine(fallback_bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
 }
 
+fn validateUkiContract(
+    allocator: Allocator,
+    bytes: []const u8,
+    expected_cmdline: []const u8,
+) !void {
+    var inspection = try vmiz.uki.inspect(allocator, bytes);
+    defer inspection.deinit(allocator);
+    if (inspection.security_directory == null) return error.UnsignedUki;
+    for (&[_][]const u8{ ".linux", ".initrd", ".osrel", ".uname" }) |name| {
+        const section = inspection.findSection(name) orelse return error.MissingUkiSection;
+        if (section.contents.len == 0) return error.EmptyUkiSection;
+    }
+    const cmdline = inspection.findSection(".cmdline") orelse return error.MissingUkiSection;
+    if (!std.mem.eql(u8, cmdline.contents, expected_cmdline))
+        return error.UnexpectedUkiCmdline;
+}
+
 fn customizeOfflineRoot(
     allocator: Allocator,
     io: Io,
     profile: *const Profile,
+    flavor: Flavor,
     root_path: []const u8,
     provenance_dir: []const u8,
 ) ![]u8 {
@@ -1291,14 +1547,6 @@ fn customizeOfflineRoot(
         .timeout_ms = 30 * 60 * 1000,
     });
     defer executor.deinit();
-
-    const directories = [_]offline_root.Operation{
-        .{ .create_directory = .{ .path = "/etc/ssh/sshd_config.d", .mode = 0o755 } },
-        .{ .create_directory = .{ .path = "/etc/cloud/cloud.cfg.d", .mode = 0o755 } },
-        .{ .create_directory = .{ .path = "/etc/netplan", .mode = 0o755 } },
-        .{ .create_directory = .{ .path = "/var/lib/vmiz", .mode = 0o755 } },
-    };
-    try root.apply(&directories);
 
     const ssh_config =
         "PasswordAuthentication no\n" ++
@@ -1334,15 +1582,33 @@ fn customizeOfflineRoot(
         "Logs.Verbose=n\n" ++
         "Extensions.Enabled=y\n" ++
         "AutoUpdate.Enabled=y\n";
-    try root.apply(&.{
-        .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-vmiz-generalized.conf", .source = .{ .inline_bytes = ssh_config } } },
-        .{ .write_file = .{ .path = "/etc/cloud/cloud.cfg.d/90-azure.cfg", .source = .{ .inline_bytes = cloud_config } } },
-        .{ .write_file = .{ .path = "/etc/netplan/50-cloud-init.yaml", .source = .{ .inline_bytes = netplan } } },
-        .{ .write_file = .{ .path = "/etc/waagent.conf", .source = .{ .inline_bytes = waagent } } },
-        .{ .replace_symlink = .{ .path = "/etc/resolv.conf", .target = "/run/systemd/resolve/stub-resolv.conf" } },
-    });
+    switch (flavor) {
+        .full => {
+            try root.apply(&.{
+                .{ .create_directory = .{ .path = "/etc/ssh/sshd_config.d", .mode = 0o755 } },
+                .{ .create_directory = .{ .path = "/etc/cloud/cloud.cfg.d", .mode = 0o755 } },
+                .{ .create_directory = .{ .path = "/etc/netplan", .mode = 0o755 } },
+                .{ .create_directory = .{ .path = "/var/lib/vmiz", .mode = 0o755 } },
+                .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-vmiz-generalized.conf", .source = .{ .inline_bytes = ssh_config } } },
+                .{ .write_file = .{ .path = "/etc/cloud/cloud.cfg.d/90-azure.cfg", .source = .{ .inline_bytes = cloud_config } } },
+                .{ .write_file = .{ .path = "/etc/netplan/50-cloud-init.yaml", .source = .{ .inline_bytes = netplan } } },
+                .{ .write_file = .{ .path = "/etc/waagent.conf", .source = .{ .inline_bytes = waagent } } },
+                .{ .replace_symlink = .{ .path = "/etc/resolv.conf", .target = "/run/systemd/resolve/stub-resolv.conf" } },
+            });
+        },
+        .core => {
+            try root.apply(&.{
+                .{ .create_directory = .{ .path = "/etc/ssh/sshd_config.d", .mode = 0o755 } },
+                .{ .create_directory = .{ .path = "/var/lib/vmiz", .mode = 0o755 } },
+                .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-vmizinit.conf", .source = .{ .inline_bytes = core_ssh_config }, .mode = 0o600 } },
+                .{ .write_file = .{ .path = "/etc/waagent.conf", .source = .{ .inline_bytes = core_azagent_config } } },
+                .{ .write_file = .{ .path = "/etc/resolv.conf", .source = .{ .inline_bytes = "" } } },
+            });
+        },
+    }
 
     try validateNativeBootArtifacts(allocator, &root, release_name);
+    if (flavor == .core) try validateCoreKernelModules(allocator, &root, release_name);
 
     var initramfs = try runOfflineCommand(&executor, .{ .update_initramfs = release_name });
     defer initramfs.deinit(allocator);
@@ -1367,33 +1633,54 @@ fn customizeOfflineRoot(
         } },
     });
 
-    var cloud_init = try runOfflineCommand(&executor, .{ .cloud_init_clean = .{ .logs = true } });
-    defer cloud_init.deinit(allocator);
+    var cloud_init: ?offline_root.CommandResult = if (flavor == .full)
+        try runOfflineCommand(&executor, .{ .cloud_init_clean = .{ .logs = true } })
+    else
+        null;
+    defer if (cloud_init) |*result| result.deinit(allocator);
     try root.apply(&.{
         .{ .remove = "/var/lib/dbus/machine-id" },
         .{ .remove = "/var/lib/systemd/random-seed" },
         .{ .cleanup = .{ .directory = "/etc/ssh", .pattern = "ssh_host_*" } },
-        .{ .cleanup = .{ .directory = "/var/lib/cloud", .pattern = "*" } },
-        .{ .cleanup = .{ .directory = "/var/lib/waagent", .pattern = "*" } },
         .{ .cleanup = .{ .directory = "/var/log/azure", .pattern = "*" } },
         .{ .cleanup = .{ .directory = "/var/log/journal", .pattern = "*" } },
         .{ .cleanup = .{ .directory = "/tmp", .pattern = "*" } },
         .{ .cleanup = .{ .directory = "/var/tmp", .pattern = "*" } },
     });
+    if (flavor == .full) {
+        try root.apply(&.{
+            .{ .cleanup = .{ .directory = "/var/lib/cloud", .pattern = "*" } },
+            .{ .cleanup = .{ .directory = "/var/lib/waagent", .pattern = "*" } },
+        });
+    } else {
+        try root.apply(&.{
+            .{ .remove = "/var/lib/cloud" },
+            .{ .remove = "/var/lib/waagent" },
+            .{ .remove = "/var/lib/azagent" },
+            .{ .remove = "/var/lib/dhcp" },
+            .{ .remove = "/var/lib/NetworkManager" },
+        });
+    }
 
     const modules_path = try std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{release_name});
     defer allocator.free(modules_path);
     const initrd_path = try std.fmt.allocPrint(allocator, "/boot/initrd.img-{s}", .{release_name});
     defer allocator.free(initrd_path);
-    for ([_][]const u8{
-        "/etc/ssh/ssh_host_*",
-        "/var/lib/cloud/*",
-        "/var/lib/waagent/*",
-        "/var/log/azure/*",
-        "/var/log/journal/*",
-        "/tmp/*",
+    const full_cleanup_patterns = [_][]const u8{
+        "/etc/ssh/ssh_host_*", "/var/lib/cloud/*",   "/var/lib/waagent/*",
+        "/var/log/azure/*",    "/var/log/journal/*", "/tmp/*",
         "/var/tmp/*",
-    }) |pattern| {
+    };
+    const core_cleanup_patterns = [_][]const u8{
+        "/etc/ssh/ssh_host_*",       "/var/lib/azagent/*", "/var/lib/dhcp/*",
+        "/var/lib/NetworkManager/*", "/var/log/azure/*",   "/var/log/journal/*",
+        "/tmp/*",                    "/var/tmp/*",
+    };
+    const cleanup_patterns: []const []const u8 = if (flavor == .full)
+        &full_cleanup_patterns
+    else
+        &core_cleanup_patterns;
+    for (cleanup_patterns) |pattern| {
         const slash = std.mem.lastIndexOfScalar(u8, pattern, '/') orelse return error.InvalidCleanupPattern;
         const directory = pattern[0..slash];
         const basename = pattern[slash + 1 ..];
@@ -1428,13 +1715,265 @@ fn customizeOfflineRoot(
     return release_name;
 }
 
+fn generalizationPolicy(flavor: Flavor) vmiz.os_customization.GeneralizationPolicy {
+    return switch (flavor) {
+        .full => .{ .azure = .{
+            .reset_hostname = false,
+            .clear_machine_id = false,
+            .remove_ssh_host_keys = false,
+            .remove_agent_state = false,
+            .remove_dhcp_leases = false,
+            .remove_resolver_configuration = false,
+            .clear_random_seed = false,
+            .remove_users = &.{"ubuntu"},
+        } },
+        .core => .{ .azure = .{ .remove_users = &.{"ubuntu"} } },
+    };
+}
+
+fn expectedElfMachine(profile: *const Profile) u16 {
+    return switch (profile.architecture) {
+        .x86_64 => 62,
+        .aarch64 => 183,
+    };
+}
+
+fn validateGuestElf(bytes: []const u8, profile: *const Profile) !void {
+    if (bytes.len < 20 or !std.mem.eql(u8, bytes[0..4], "\x7fELF") or bytes[5] != 1)
+        return error.InvalidGuestExecutable;
+    if (std.mem.readInt(u16, bytes[18..20], .little) != expectedElfMachine(profile))
+        return error.WrongGuestExecutableArchitecture;
+}
+
+fn removeIfPresent(filesystem: *vmiz.ext4_mountless.FileSystem, path: []const u8) !void {
+    filesystem.remove(path, true) catch |err| switch (err) {
+        error.PathNotFound => {},
+        else => return err,
+    };
+}
+
+fn injectCoreGuest(
+    allocator: Allocator,
+    io: Io,
+    filesystem: *vmiz.ext4_mountless.FileSystem,
+    profile: *const Profile,
+    vmizinit_path: []const u8,
+    azagent_path: []const u8,
+    evidence: []const DebzEvidence,
+) !void {
+    const vmizinit_bytes = try Dir.cwd().readFileAlloc(io, vmizinit_path, allocator, .limited(32 * 1024 * 1024));
+    defer allocator.free(vmizinit_bytes);
+    const azagent_bytes = try Dir.cwd().readFileAlloc(io, azagent_path, allocator, .limited(32 * 1024 * 1024));
+    defer allocator.free(azagent_bytes);
+    try validateGuestElf(vmizinit_bytes, profile);
+    try validateGuestElf(azagent_bytes, profile);
+
+    try filesystem.mkdir("/var/lib/vmiz/provenance", .{ .mode = 0o755 });
+    try filesystem.mkdir("/etc/ssh/sshd_config.d", .{ .mode = 0o755 });
+    try filesystem.write("/usr/sbin/vmizinit", vmizinit_bytes, .{ .mode = 0o755 });
+    try filesystem.write("/usr/sbin/azagent", azagent_bytes, .{ .mode = 0o755 });
+    for (&[_][]const u8{ "init", "poweroff", "reboot", "shutdown" }) |name| {
+        const path = try std.fmt.allocPrint(allocator, "/usr/sbin/{s}", .{name});
+        defer allocator.free(path);
+        try filesystem.symlink(path, "vmizinit", .{ .mode = 0o777 });
+    }
+    try filesystem.write(
+        "/etc/ssh/sshd_config.d/10-vmizinit.conf",
+        core_ssh_config,
+        .{ .mode = 0o600 },
+    );
+    try filesystem.write("/etc/waagent.conf", core_azagent_config, .{ .mode = 0o644 });
+    try filesystem.write("/etc/resolv.conf", "", .{ .mode = 0o644 });
+
+    for (evidence) |item| {
+        for ([_][]const u8{ item.lock_path, item.provenance_path }) |source| {
+            const destination = try std.fmt.allocPrint(
+                allocator,
+                "/var/lib/vmiz/provenance/{s}",
+                .{std.fs.path.basename(source)},
+            );
+            defer allocator.free(destination);
+            try filesystem.copyIn(source, destination, .{ .mode = 0o600 });
+        }
+    }
+    const contract = try std.json.Stringify.valueAlloc(allocator, .{
+        .schema = 1,
+        .type = "vmiz-ubuntu2604-core-provenance",
+        .flavor = "core",
+        .release = "26.04",
+        .snapshot = snapshot_base,
+        .debz_api_commit = package_family.debz_api_commit,
+        .package_roots = core_debz_packages,
+        .transaction_count = evidence.len,
+    }, .{ .whitespace = .indent_2 });
+    defer allocator.free(contract);
+    try filesystem.write(
+        "/var/lib/vmiz/ubuntu2604-core-provenance.json",
+        contract,
+        .{ .mode = 0o600 },
+    );
+}
+
+fn requireRootPath(filesystem: *const vmiz.ext4_mountless.FileSystem, path: []const u8) !void {
+    const entry = filesystem.stat(path) catch |err| switch (err) {
+        error.PathNotFound => return error.CoreRequiredPathMissing,
+        else => return err,
+    };
+    if (entry.kind != .file) return error.CoreRequiredPathMissing;
+}
+
+fn requireRootPathAbsent(filesystem: *const vmiz.ext4_mountless.FileSystem, path: []const u8) !void {
+    _ = filesystem.stat(path) catch |err| switch (err) {
+        error.PathNotFound => return,
+        else => return err,
+    };
+    return error.ForbiddenCorePath;
+}
+
+fn validateNoBakedIdentity(
+    allocator: Allocator,
+    filesystem: *const vmiz.ext4_mountless.FileSystem,
+    directory: []const u8,
+) !void {
+    const entries = filesystem.list(allocator, directory, 100_000) catch |err| switch (err) {
+        error.PathNotFound => return,
+        else => return err,
+    };
+    defer allocator.free(entries);
+    for (entries) |entry| {
+        const name = std.fs.path.basename(entry.path);
+        if (std.mem.eql(u8, name, "authorized_keys") or std.mem.startsWith(u8, name, "ssh_host_"))
+            return error.BakedIdentityState;
+        if (entry.kind == .directory) try validateNoBakedIdentity(allocator, filesystem, entry.path);
+    }
+}
+
+fn validateCoreRoot(
+    allocator: Allocator,
+    io: Io,
+    filesystem: *const vmiz.ext4_mountless.FileSystem,
+    profile: *const Profile,
+    evidence: []const DebzEvidence,
+) !void {
+    if (evidence.len != core_debz_packages.len) return error.InvalidDebzEvidence;
+    for (&core_required_paths) |path| try requireRootPath(filesystem, path);
+    for (&core_forbidden_paths) |path| try requireRootPathAbsent(filesystem, path);
+    const sbin = try filesystem.readLink(allocator, "/sbin", 1024);
+    defer allocator.free(sbin);
+    if (!std.mem.eql(u8, sbin, "usr/sbin")) return error.InvalidUsrMerge;
+    for (&[_][]const u8{ "init", "poweroff", "reboot", "shutdown" }) |name| {
+        const path = try std.fmt.allocPrint(allocator, "/usr/sbin/{s}", .{name});
+        defer allocator.free(path);
+        const target = try filesystem.readLink(allocator, path, 1024);
+        defer allocator.free(target);
+        if (!std.mem.eql(u8, target, "vmizinit")) return error.InvalidCoreInitLink;
+    }
+    const machine_id = try filesystem.read(allocator, "/etc/machine-id", 1024);
+    defer allocator.free(machine_id);
+    if (machine_id.len != 0) return error.BakedIdentityState;
+    const random_seed: ?[]u8 = filesystem.read(
+        allocator,
+        "/var/lib/systemd/random-seed",
+        1024 * 1024,
+    ) catch |err| switch (err) {
+        error.PathNotFound => null,
+        else => return err,
+    };
+    if (random_seed) |seed| {
+        defer allocator.free(seed);
+        if (seed.len != 0) return error.BakedIdentityState;
+    }
+    try validateNoBakedIdentity(allocator, filesystem, "/");
+
+    const ssh_config = try filesystem.read(allocator, "/etc/ssh/sshd_config.d/10-vmizinit.conf", 64 * 1024);
+    defer allocator.free(ssh_config);
+    for (&[_][]const u8{
+        "PasswordAuthentication no",
+        "KbdInteractiveAuthentication no",
+        "PermitRootLogin prohibit-password",
+        "PubkeyAuthentication yes",
+    }) |setting| if (std.mem.indexOf(u8, ssh_config, setting) == null)
+        return error.InvalidCoreSshConfiguration;
+    const azagent_config = try filesystem.read(allocator, "/etc/waagent.conf", 64 * 1024);
+    defer allocator.free(azagent_config);
+    for (&[_][]const u8{
+        "ResourceDisk.Format=y",
+        "ResourceDisk.Filesystem=xfs",
+        "ResourceDisk.EnableSwap=n",
+        "DataDisk.Mount=y",
+    }) |setting| if (std.mem.indexOf(u8, azagent_config, setting) == null)
+        return error.InvalidCoreAzagentConfiguration;
+
+    const inventory = try filesystem.read(
+        allocator,
+        "/var/lib/vmiz/ubuntu2604-package-lock.tsv",
+        4 * 1024 * 1024,
+    );
+    defer allocator.free(inventory);
+    try validateExactLockRuntime(allocator, inventory, profile, .core);
+    const final_exact_lock = try Dir.cwd().readFileAlloc(
+        io,
+        evidence[evidence.len - 1].lock_path,
+        allocator,
+        .limited(16 * 1024 * 1024),
+    );
+    defer allocator.free(final_exact_lock);
+    try validateInventoryAgainstExactLock(allocator, inventory, final_exact_lock, profile);
+
+    for (evidence) |item| {
+        const embedded_lock_path = try std.fmt.allocPrint(
+            allocator,
+            "/var/lib/vmiz/provenance/{s}",
+            .{std.fs.path.basename(item.lock_path)},
+        );
+        defer allocator.free(embedded_lock_path);
+        const embedded_lock = try filesystem.read(allocator, embedded_lock_path, 16 * 1024 * 1024);
+        defer allocator.free(embedded_lock);
+        const embedded_lock_sha256 = artifact_pipeline.formatSha256(
+            artifact_pipeline.sha256Bytes(embedded_lock),
+        );
+        if (!std.mem.eql(
+            u8,
+            &embedded_lock_sha256,
+            &item.lock_sha256,
+        )) return error.EmbeddedProvenanceMismatch;
+
+        const embedded_provenance_path = try std.fmt.allocPrint(
+            allocator,
+            "/var/lib/vmiz/provenance/{s}",
+            .{std.fs.path.basename(item.provenance_path)},
+        );
+        defer allocator.free(embedded_provenance_path);
+        const embedded_provenance = try filesystem.read(allocator, embedded_provenance_path, 16 * 1024 * 1024);
+        defer allocator.free(embedded_provenance);
+        const embedded_provenance_sha256 = artifact_pipeline.formatSha256(
+            artifact_pipeline.sha256Bytes(embedded_provenance),
+        );
+        if (!std.mem.eql(
+            u8,
+            &embedded_provenance_sha256,
+            &item.provenance_sha256,
+        )) return error.EmbeddedProvenanceMismatch;
+    }
+
+    const vmizinit = try filesystem.read(allocator, "/usr/sbin/vmizinit", 32 * 1024 * 1024);
+    defer allocator.free(vmizinit);
+    try validateGuestElf(vmizinit, profile);
+    const azagent = try filesystem.read(allocator, "/usr/sbin/azagent", 32 * 1024 * 1024);
+    defer allocator.free(azagent);
+    try validateGuestElf(azagent, profile);
+}
+
 fn customizeRootWithDebz(
     allocator: Allocator,
     io: Io,
     profile: *const Profile,
+    flavor: Flavor,
     mutable_image: []const u8,
     work_dir: []const u8,
     provenance_dir: []const u8,
+    vmizinit_path: ?[]const u8,
+    azagent_path: ?[]const u8,
 ) !DebzCustomization {
     const extraction = try std.fs.path.join(allocator, &.{ work_dir, "official-root" });
     defer allocator.free(extraction);
@@ -1461,12 +2000,6 @@ fn customizeRootWithDebz(
         return error.OfficialRootExtractionFailed;
     errdefer allocator.free(current);
 
-    for (&[_][]const u8{ "dev", "proc", "run", "sys" }) |name| {
-        const mountpoint = try std.fs.path.join(allocator, &.{ current, name });
-        defer allocator.free(mountpoint);
-        try Dir.cwd().createDirPath(io, mountpoint);
-    }
-
     const trusted_keyring = try std.fs.path.join(allocator, &.{ current, "usr/share/keyrings/ubuntu-archive-keyring.gpg" });
     defer allocator.free(trusted_keyring);
     const external_keyring = try std.fs.path.join(allocator, &.{ work_dir, "ubuntu-archive-keyring.gpg" });
@@ -1474,6 +2007,15 @@ fn customizeRootWithDebz(
     var trusted = try materializeTrustedKeyring(allocator, io, trusted_keyring, external_keyring);
     defer trusted.deinit(allocator);
     const absolute_keyring = trusted.path;
+    if (flavor == .core) {
+        try Dir.cwd().deleteTree(io, current);
+        try Dir.cwd().createDirPath(io, current);
+    }
+    for (&[_][]const u8{ "dev", "proc", "run", "sys" }) |name| {
+        const mountpoint = try std.fs.path.join(allocator, &.{ current, name });
+        defer allocator.free(mountpoint);
+        try Dir.cwd().createDirPath(io, mountpoint);
+    }
     const source_path = try std.fs.path.join(allocator, &.{ work_dir, "ubuntu-snapshot.sources" });
     defer allocator.free(source_path);
     const source_document = try std.fmt.allocPrint(allocator,
@@ -1506,13 +2048,21 @@ fn customizeRootWithDebz(
     const config_inputs = [_][]const u8{absolute_source_config};
     const keyring_inputs = [_][]const u8{absolute_keyring};
 
-    var evidence: [debz_packages.len]DebzEvidence = undefined;
+    const debz_packages: []const []const u8 = if (flavor == .full)
+        &full_debz_packages
+    else
+        &core_debz_packages;
+    var evidence: [max_debz_packages]DebzEvidence = undefined;
     var evidence_count: usize = 0;
     errdefer {
         for (evidence[0..evidence_count]) |*item| item.deinit(allocator);
     }
 
-    for (&debz_packages, 0..) |package, index| {
+    for (debz_packages, 0..) |package, index| {
+        const installed_baseline: package_family.InstalledBaselinePolicy =
+            if (flavor == .core and index == 0) .none else .require_locked;
+        const apply_operation: package_family.Operation =
+            if (flavor == .core and index == 0) .create else .customize;
         const packages = [_][]const u8{package};
         const transaction_dir = try std.fmt.allocPrint(allocator, "{s}/debz-{s}", .{ work_dir, package });
         defer allocator.free(transaction_dir);
@@ -1549,6 +2099,7 @@ fn customizeRootWithDebz(
             absolute_cache,
             absolute_state,
             absolute_lock,
+            installed_baseline,
         );
         try assertRequestSeparation(resolve_request);
         const resolved = try package_family.execute(allocator, io, .{}, resolve_request);
@@ -1579,7 +2130,7 @@ fn customizeRootWithDebz(
         errdefer if (!published_transferred) allocator.free(absolute_published);
 
         const customize_request = packageFamilyRequest(
-            .customize,
+            apply_operation,
             profile,
             &packages,
             absolute_stage,
@@ -1589,6 +2140,7 @@ fn customizeRootWithDebz(
             absolute_cache,
             absolute_state,
             absolute_lock,
+            installed_baseline,
         );
         try assertRequestSeparation(customize_request);
         const customized = try package_family.execute(allocator, io, .{}, customize_request);
@@ -1646,37 +2198,70 @@ fn customizeRootWithDebz(
         allocator,
         io,
         profile,
+        flavor,
         current,
         provenance_dir,
     );
     allocator.free(release_name);
     try native_root.filesystem.importHostTreeWithManifest(current, .{}, &host_manifest);
-    try native_root.filesystem.applyCustomization(.{
-        .services = &.{
-            .{ .name = "systemd-networkd.service", .state = .enabled },
-            .{ .name = "systemd-resolved.service", .state = .enabled },
-            .{ .name = "ssh.service", .state = .enabled },
-            .{ .name = "walinuxagent.service", .state = .enabled },
-        },
-    }, 0);
-    try native_root.filesystem.generalize(.{ .azure = .{
-        .reset_hostname = false,
-        .clear_machine_id = false,
-        .remove_ssh_host_keys = false,
-        .remove_agent_state = false,
-        .remove_dhcp_leases = false,
-        .remove_resolver_configuration = false,
-        .clear_random_seed = false,
-        .remove_users = &.{"ubuntu"},
-    } });
+    if (flavor == .full) {
+        try native_root.filesystem.applyCustomization(.{
+            .services = &.{
+                .{ .name = "systemd-networkd.service", .state = .enabled },
+                .{ .name = "systemd-resolved.service", .state = .enabled },
+                .{ .name = "ssh.service", .state = .enabled },
+                .{ .name = "walinuxagent.service", .state = .enabled },
+            },
+        }, 0);
+    } else {
+        try native_root.filesystem.applyCustomization(.{
+            .services = &.{
+                .{ .name = "ssh.service", .state = .disabled },
+            },
+        }, 0);
+        for (&[_][]const u8{
+            "/etc/systemd/system/ssh.service",
+            "/etc/systemd/system/multi-user.target.wants/ssh.service",
+            "/etc/systemd/system/sockets.target.wants/ssh.socket",
+        }) |path| try removeIfPresent(&native_root.filesystem, path);
+    }
+    try native_root.filesystem.generalize(generalizationPolicy(flavor));
+    if (flavor == .core) {
+        const vmizinit = vmizinit_path orelse return error.CoreGuestArtifactsRequired;
+        const azagent = azagent_path orelse return error.CoreGuestArtifactsRequired;
+        try injectCoreGuest(
+            allocator,
+            io,
+            &native_root.filesystem,
+            profile,
+            vmizinit,
+            azagent,
+            evidence[0..evidence_count],
+        );
+        try validateCoreRoot(
+            allocator,
+            io,
+            &native_root.filesystem,
+            profile,
+            evidence[0..evidence_count],
+        );
+    }
     if (native_root.filesystem.stat("/home/ubuntu")) |_| {
         return error.UserCleanupIncomplete;
     } else |err| switch (err) {
         error.PathNotFound => {},
         else => return error.UserCleanupIncomplete,
     }
-    try native_root.finish();
-    return .{ .root_path = current, .evidence = evidence };
+    const filesystem_info = try native_root.finish();
+    const root_free_bytes = @as(u64, filesystem_info.free_block_count) * 4096;
+    if (flavor == .core and root_free_bytes < core_minimum_root_free_bytes)
+        return error.CoreRootFreeSpaceTooSmall;
+    return .{
+        .root_path = current,
+        .evidence = evidence,
+        .evidence_count = evidence_count,
+        .root_free_bytes = root_free_bytes,
+    };
 }
 
 const restricted_root_entry = "var/lib/snapd/void";
@@ -1779,8 +2364,9 @@ fn writeProvenance(
     path: []const u8,
     profile: *const Profile,
     source_digest: [64]u8,
-    evidence: *const [debz_packages.len]DebzEvidence,
+    evidence: []const DebzEvidence,
 ) !void {
+    if (evidence.len != full_debz_packages.len) return error.InvalidDebzEvidence;
     const document = try std.fmt.allocPrint(allocator,
         \\{{"schema":1,"type":"vmiz-ubuntu2604-build-provenance","architecture":"{s}","release":"26.04","snapshot":{{"id":"release-{s}","base_url":"{s}/"}},"canonical_key_fingerprint":"{s}","sha256sums_signature_verified":true,"artifacts":{{"sha256sums":{{"filename":"SHA256SUMS","sha256":"{s}"}},"sha256sums_signature":{{"filename":"SHA256SUMS.gpg","sha256":"{s}"}},"source_image":{{"filename":"{s}","sha256":"{s}"}},"image_manifest":{{"filename":"{s}","sha256":"{s}"}}}},"debz":{{"api_commit":"{s}","baseline":{{"source":"canonical-image-dpkg-status","enforcement":"exact-final-closure"}},"transactions":[{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}},{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}}]}}}}
         \\
@@ -1817,11 +2403,66 @@ fn writeProvenance(
     try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = document });
 }
 
+fn writeCoreProvenance(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    profile: *const Profile,
+    source_digest: [64]u8,
+    evidence: []const DebzEvidence,
+    virtual_size: u64,
+    root_free_bytes: u64,
+) !void {
+    if (evidence.len != core_debz_packages.len) return error.InvalidDebzEvidence;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.print(
+        "{{\"schema\":1,\"type\":\"vmiz-ubuntu2604-build-provenance\",\"architecture\":\"{s}\",\"flavor\":\"core\",\"release\":\"26.04\",\"virtual_size\":{d},\"minimum_root_free_bytes\":{d},\"validated_root_free_bytes\":{d},\"snapshot\":{{\"id\":\"release-{s}\",\"base_url\":\"{s}/\"}},\"canonical_key_fingerprint\":\"{s}\",\"sha256sums_signature_verified\":true,\"artifacts\":{{\"sha256sums\":{{\"filename\":\"SHA256SUMS\",\"sha256\":\"{s}\"}},\"sha256sums_signature\":{{\"filename\":\"SHA256SUMS.gpg\",\"sha256\":\"{s}\"}},\"source_image\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"role\":\"signed-gpt-esp-substrate\"}},\"image_manifest\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}}},\"debz\":{{\"api_commit\":\"{s}\",\"baseline\":{{\"source\":\"empty-debz-root\",\"enforcement\":\"exact-final-closure\"}},\"package_roots\":[\"ubuntu-minimal\",\"linux-azure\",\"openssh-server\",\"sudo\"],\"transactions\":[",
+        .{
+            @tagName(profile.architecture),
+            virtual_size,
+            core_minimum_root_free_bytes,
+            root_free_bytes,
+            release,
+            release_base,
+            canonical_fingerprint_lower,
+            sums_sha256,
+            sums_signature_sha256,
+            profile.source_name,
+            source_digest,
+            profile.manifest_name,
+            profile.manifest_sha256,
+            package_family.debz_api_commit,
+        },
+    );
+    for (evidence, 0..) |item, index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try output.writer.print(
+            "{{\"package\":\"{s}\",\"exact_lock\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"digest_sha256\":\"{s}\"}},\"transaction_provenance\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"digest_sha256\":\"{s}\",\"lock_sha256\":\"{s}\"}}}}",
+            .{
+                item.package,
+                std.fs.path.basename(item.lock_path),
+                item.lock_sha256,
+                item.lock_digest_sha256,
+                std.fs.path.basename(item.provenance_path),
+                item.provenance_sha256,
+                item.provenance_digest_sha256,
+                item.provenance_lock_sha256,
+            },
+        );
+    }
+    try output.writer.writeAll("]}}\n");
+    const document = try output.toOwnedSlice();
+    defer allocator.free(document);
+    try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = document });
+}
+
 fn writeSigningProvenance(
     allocator: Allocator,
     io: Io,
     provenance_dir: []const u8,
     profile: *const Profile,
+    flavor: Flavor,
     config: uki_signing.Config,
     certificate: *const uki_signing.Certificate,
     signed: *const uki_signing.SignedUki,
@@ -1888,7 +2529,7 @@ fn writeSigningProvenance(
         .schema = 1,
         .type = "vmiz-uki-signing",
         .architecture = @tagName(profile.architecture),
-        .flavor = "full",
+        .flavor = @tagName(flavor),
         .uki_stub = .{
             .source_path = stub_source_path,
             .sha256 = stub_sha256,
@@ -1905,8 +2546,8 @@ fn writeSigningProvenance(
     defer allocator.free(json);
     const filename = try std.fmt.allocPrint(
         allocator,
-        "uki-signing-full-{s}.json",
-        .{@tagName(profile.architecture)},
+        "uki-signing-{s}-{s}.json",
+        .{ @tagName(flavor), @tagName(profile.architecture) },
     );
     defer allocator.free(filename);
     const path = try std.fs.path.join(allocator, &.{ provenance_dir, filename });
@@ -1921,6 +2562,7 @@ fn extractNativeBootInputs(
     work_dir: []const u8,
     extract_dir: []const u8,
     profile: *const Profile,
+    flavor: Flavor,
 ) ![]u8 {
     var native_root = try openNativeRoot(allocator, io, image_path, work_dir);
     defer native_root.deinit();
@@ -1930,7 +2572,7 @@ fn extractNativeBootInputs(
         4 * 1024 * 1024,
     );
     defer allocator.free(lock_bytes);
-    try validateExactLockRuntime(allocator, lock_bytes, profile);
+    try validateExactLockRuntime(allocator, lock_bytes, profile, flavor);
 
     const boot_entries = try native_root.filesystem.list(allocator, "/boot", 4096);
     defer allocator.free(boot_entries);
@@ -2028,6 +2670,7 @@ fn validateFinalNativeImage(
     image_path: []const u8,
     work_dir: []const u8,
     profile: *const Profile,
+    expected_cmdline: []const u8,
 ) !void {
     var image = try vmiz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
@@ -2047,6 +2690,7 @@ fn validateFinalNativeImage(
     const named_bytes = try filesystem.readFileAlloc(io, allocator, named);
     defer allocator.free(named_bytes);
     try validateUkiBytes(fallback_bytes, named_bytes, profile);
+    try validateUkiContract(allocator, fallback_bytes, expected_cmdline);
     _ = work_dir;
 }
 
@@ -2063,8 +2707,8 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     const profile = profileFor(architecture);
-    const work_dir = args.work_dir orelse profile.work_dir;
-    const output = args.output orelse profile.output;
+    const work_dir = args.work_dir orelse profile.workDirFor(args.flavor);
+    const output = args.output orelse profile.outputFor(args.flavor);
     try Dir.cwd().createDirPath(io, work_dir);
     const allocated_provenance_dir = if (args.provenance_dir == null)
         try std.fs.path.join(allocator, &.{ work_dir, "internal-provenance" })
@@ -2129,6 +2773,9 @@ pub fn main(init: std.process.Init) !void {
     Dir.cwd().deleteFile(io, mutable) catch {};
     var source_image = try vmiz.Image.openPathReadOnlyStandalone(io, source_path);
     defer source_image.close(io);
+    if (args.flavor == .core and source_image.virtual_size != core_virtual_size)
+        return error.UnexpectedCoreSubstrateSize;
+    if (args.size < source_image.virtual_size) return error.ImageTooSmall;
     var mutable_image = try vmiz.Image.createExclusive(
         io,
         mutable,
@@ -2138,16 +2785,28 @@ pub fn main(init: std.process.Init) !void {
     );
     try vmiz.copyAll(io, source_image, &mutable_image, allocator);
     mutable_image.close(io);
-    _ = try vmiz.root_resize.growExistingQcow2(
+    if (args.size > source_image.virtual_size) {
+        _ = try vmiz.root_resize.growExistingQcow2(
+            allocator,
+            io,
+            mutable,
+            .{
+                .target_size = args.size,
+                .filesystem_label = vmiz.root_resize.default_filesystem_label,
+            },
+        );
+    }
+    var debz_customization = try customizeRootWithDebz(
         allocator,
         io,
+        profile,
+        args.flavor,
         mutable,
-        .{
-            .target_size = args.size,
-            .filesystem_label = vmiz.root_resize.default_filesystem_label,
-        },
+        work_dir,
+        provenance_dir,
+        args.vmizinit,
+        args.azagent,
     );
-    var debz_customization = try customizeRootWithDebz(allocator, io, profile, mutable, work_dir, provenance_dir);
     defer debz_customization.deinit(allocator);
 
     const extract_dir = try std.fs.path.join(allocator, &.{ work_dir, "uki-input" });
@@ -2159,6 +2818,7 @@ pub fn main(init: std.process.Init) !void {
         work_dir,
         extract_dir,
         profile,
+        args.flavor,
     );
     defer allocator.free(release_name);
 
@@ -2169,7 +2829,7 @@ pub fn main(init: std.process.Init) !void {
     const os_release_host = try std.fs.path.join(allocator, &.{ extract_dir, "os-release" });
     defer allocator.free(os_release_host);
     const root_partition_guid = try rootPartitionGuid(allocator, io, mutable, profile);
-    const cmdline = try ukiCmdline(allocator, root_partition_guid, profile);
+    const cmdline = try ukiCmdline(allocator, root_partition_guid, profile, args.flavor);
     defer allocator.free(cmdline);
 
     const stub_path = args.uki_stub orelse profile.uki_stub_host_path;
@@ -2215,7 +2875,7 @@ pub fn main(init: std.process.Init) !void {
         init.environ_map,
         0,
         @tagName(profile.architecture),
-        "full",
+        @tagName(args.flavor),
         unsigned_bytes,
     );
     defer signed.deinit(allocator);
@@ -2227,7 +2887,7 @@ pub fn main(init: std.process.Init) !void {
     try insertSignedUki(allocator, io, mutable, signed_path, profile);
     try finalizeCompressedQcow2(allocator, io, mutable, output);
     try validateFinalQcow2(io, output, args.size);
-    try validateFinalNativeImage(allocator, io, output, work_dir, profile);
+    try validateFinalNativeImage(allocator, io, output, work_dir, profile, cmdline);
     var final_root = try openNativeRoot(allocator, io, output, work_dir);
     defer final_root.deinit();
     const os_release = try final_root.filesystem.read(allocator, "/etc/os-release", 64 * 1024);
@@ -2235,20 +2895,51 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.indexOf(u8, os_release, "VERSION_ID=\"26.04\"") == null) return error.WrongGuestRelease;
     const final_lock = try final_root.filesystem.read(allocator, "/var/lib/vmiz/ubuntu2604-package-lock.tsv", 4 * 1024 * 1024);
     defer allocator.free(final_lock);
-    try validateExactLockRuntime(allocator, final_lock, profile);
+    try validateExactLockRuntime(allocator, final_lock, profile, args.flavor);
+    if (args.flavor == .core) try validateCoreRoot(
+        allocator,
+        io,
+        &final_root.filesystem,
+        profile,
+        debz_customization.evidence[0..debz_customization.evidence_count],
+    );
     if (try peMachine(signed.bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
-    try writeSigningProvenance(allocator, io, provenance_dir, profile, config, &certificate, &signed, stub_path, &stub_sha256);
+    try writeSigningProvenance(
+        allocator,
+        io,
+        provenance_dir,
+        profile,
+        args.flavor,
+        config,
+        &certificate,
+        &signed,
+        stub_path,
+        &stub_sha256,
+    );
 
     const provenance_path = try std.fs.path.join(allocator, &.{ provenance_dir, "ubuntu2604-build-provenance.json" });
     defer allocator.free(provenance_path);
-    try writeProvenance(
-        allocator,
-        io,
-        provenance_path,
-        profile,
-        artifact_pipeline.formatSha256(source_metadata.sha256),
-        &debz_customization.evidence,
-    );
+    if (args.flavor == .full) {
+        try writeProvenance(
+            allocator,
+            io,
+            provenance_path,
+            profile,
+            artifact_pipeline.formatSha256(source_metadata.sha256),
+            debz_customization.evidence[0..debz_customization.evidence_count],
+        );
+    } else {
+        try writeCoreProvenance(
+            allocator,
+            io,
+            provenance_path,
+            profile,
+            artifact_pipeline.formatSha256(source_metadata.sha256),
+            debz_customization.evidence[0..debz_customization.evidence_count],
+            args.size,
+            debz_customization.root_free_bytes,
+        );
+    }
 }
 
 fn findAzureKernelRelease(listing: []const u8) ?[]const u8 {
@@ -2492,6 +3183,7 @@ test "package-family resolve and customize requests are exact-lock operations" {
         "/cache",
         "/state",
         "/state/linux-azure.lock",
+        .require_locked,
     );
     try std.testing.expectEqual(package_family.Family.debian, amd64.family);
     try std.testing.expectEqual(package_family.Distribution.ubuntu_26_04, amd64.distribution);
@@ -2516,6 +3208,7 @@ test "package-family resolve and customize requests are exact-lock operations" {
         "/cache",
         "/state",
         "/state/walinuxagent.lock",
+        .require_locked,
     );
     try std.testing.expectEqual(package_family.Architecture.arm64, arm64.inputs.architecture);
     try std.testing.expectEqual(
@@ -2526,6 +3219,25 @@ test "package-family resolve and customize requests are exact-lock operations" {
     try std.testing.expectEqualStrings("/inputs/ubuntu.sources", arm64.inputs.config_paths[0]);
     try std.testing.expectEqualStrings("/state/walinuxagent.lock", arm64.inputs.lock_input_path.?);
     try std.testing.expect(arm64.inputs.lock_output_path == null);
+
+    const core_create = packageFamilyRequest(
+        .create,
+        profileFor(.x86_64),
+        &.{"ubuntu-minimal"},
+        "/root-stage",
+        "/published",
+        &.{"/inputs/ubuntu.sources"},
+        &.{"/inputs/ubuntu.gpg"},
+        "/cache",
+        "/state",
+        "/state/ubuntu-minimal.lock",
+        .none,
+    );
+    try std.testing.expectEqual(package_family.Operation.create, core_create.operation);
+    try std.testing.expectEqual(
+        package_family.InstalledBaselinePolicy.none,
+        core_create.inputs.installed_baseline,
+    );
 }
 
 test "package-family requests reject keyrings overlapping staging and accept the external copy" {
@@ -2540,17 +3252,17 @@ test "package-family requests reject keyrings overlapping staging and accept the
 
     // The corrected requests resolve the keyring from an external host copy and
     // pass the shared separation policy for both resolve and customize.
-    const good_resolve = packageFamilyRequest(.resolve_lock, profile, &.{"linux-azure"}, resolve_root, resolve_published, &.{source_config}, &.{external_keyring}, cache, state, lock);
+    const good_resolve = packageFamilyRequest(.resolve_lock, profile, &.{"linux-azure"}, resolve_root, resolve_published, &.{source_config}, &.{external_keyring}, cache, state, lock, .require_locked);
     try assertRequestSeparation(good_resolve);
     try std.testing.expectEqualStrings(external_keyring, good_resolve.inputs.keyring_paths[0]);
-    const good_customize = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{external_keyring}, cache, state, lock);
+    const good_customize = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{external_keyring}, cache, state, lock, .require_locked);
     try assertRequestSeparation(good_customize);
     try std.testing.expectEqualStrings(external_keyring, good_customize.inputs.keyring_paths[0]);
 
     // The original blocker: a keyring read from inside the resolve root_stage is
     // rejected with the exact boundary message the protected aarch64 builder hit.
     const guest_keyring = resolve_root ++ "/usr/share/keyrings/ubuntu-archive-keyring.gpg";
-    const bad_resolve = packageFamilyRequest(.resolve_lock, profile, &.{"linux-azure"}, resolve_root, resolve_published, &.{source_config}, &.{guest_keyring}, cache, state, lock);
+    const bad_resolve = packageFamilyRequest(.resolve_lock, profile, &.{"linux-azure"}, resolve_root, resolve_published, &.{source_config}, &.{guest_keyring}, cache, state, lock, .require_locked);
     try std.testing.expectError(error.PackageFamilySeparationViolation, assertRequestSeparation(bad_resolve));
     try std.testing.expectEqualStrings(
         "debian keyring paths must be absolute and outside staging",
@@ -2558,13 +3270,13 @@ test "package-family requests reject keyrings overlapping staging and accept the
     );
 
     const staged_keyring = "/work/root-stage-0/usr/share/keyrings/ubuntu-archive-keyring.gpg";
-    const bad_customize = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{staged_keyring}, cache, state, lock);
+    const bad_customize = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{staged_keyring}, cache, state, lock, .require_locked);
     try std.testing.expectError(error.PackageFamilySeparationViolation, assertRequestSeparation(bad_customize));
 
     // A keyring under the publication root is rejected too, so a published guest
     // can never mutate the trusted input after debz consumes it.
     const published_keyring = "/work/root-debz-0/usr/share/keyrings/ubuntu-archive-keyring.gpg";
-    const published_overlap = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{published_keyring}, cache, state, lock);
+    const published_overlap = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{published_keyring}, cache, state, lock, .require_locked);
     try std.testing.expectError(error.PackageFamilySeparationViolation, assertRequestSeparation(published_overlap));
     try std.testing.expectEqualStrings(
         "debian keyring paths must be outside publication",
@@ -2738,6 +3450,35 @@ test "arguments accept Ubuntu and project architecture spellings" {
     try std.testing.expectError(error.ImageTooSmall, parseArgs(&.{ "--size", "4G" }));
 }
 
+test "flavor defaults preserve full names and isolate core outputs" {
+    const full = try parseArgs(&.{});
+    try std.testing.expectEqual(Flavor.full, full.flavor);
+    try std.testing.expectEqual(default_virtual_size, full.size);
+    const core_args = try parseArgs(&.{ "--flavor", "core" });
+    try std.testing.expectEqual(Flavor.core, core_args.flavor);
+    try std.testing.expectEqual(core_virtual_size, core_args.size);
+    try std.testing.expectError(
+        error.ImageTooSmall,
+        parseArgs(&.{ "--flavor", "core", "--size", "3G" }),
+    );
+    try std.testing.expectEqualStrings(
+        "Ubuntu-26.04-x86_64.qcow2",
+        profileFor(.x86_64).outputFor(.full),
+    );
+    try std.testing.expectEqualStrings(
+        "Ubuntu-26.04-x86_64.core.qcow2",
+        profileFor(.x86_64).outputFor(.core),
+    );
+    try std.testing.expectEqualStrings(
+        "Ubuntu-26.04-aarch64.core.qcow2",
+        profileFor(.aarch64).outputFor(.core),
+    );
+    try std.testing.expectEqualStrings(
+        ".scratch/ubuntu2604-aarch64-core",
+        profileFor(.aarch64).workDirFor(.core),
+    );
+}
+
 test "UKI signing configuration supports local and external modes exclusively" {
     const fingerprint = "1111111111111111111111111111111111111111111111111111111111111111";
     const local = try signingConfig(.{
@@ -2800,13 +3541,13 @@ test "Azure kernel discovery is architecture-neutral and exact" {
 
 test "UKI cmdline binds final root PARTUUID and native serial console" {
     const root_guid = guid.parse("11111111-2222-3333-4444-555555555555");
-    const x86_cmdline = try ukiCmdline(std.testing.allocator, root_guid, profileFor(.x86_64));
+    const x86_cmdline = try ukiCmdline(std.testing.allocator, root_guid, profileFor(.x86_64), .full);
     defer std.testing.allocator.free(x86_cmdline);
     try std.testing.expectEqualStrings(
         "root=PARTUUID=11111111-2222-3333-4444-555555555555 console=ttyS0,115200n8",
         x86_cmdline,
     );
-    const arm_cmdline = try ukiCmdline(std.testing.allocator, root_guid, profileFor(.aarch64));
+    const arm_cmdline = try ukiCmdline(std.testing.allocator, root_guid, profileFor(.aarch64), .full);
     defer std.testing.allocator.free(arm_cmdline);
     try std.testing.expectEqualStrings(
         "root=PARTUUID=11111111-2222-3333-4444-555555555555 console=ttyAMA0,115200n8",
@@ -2814,6 +3555,19 @@ test "UKI cmdline binds final root PARTUUID and native serial console" {
     );
     try std.testing.expect(std.mem.indexOf(u8, x86_cmdline, "LABEL=") == null);
     try std.testing.expect(std.mem.indexOf(u8, arm_cmdline, "ttyS0") == null);
+
+    const core_cmdline = try ukiCmdline(
+        std.testing.allocator,
+        root_guid,
+        profileFor(.aarch64),
+        .core,
+    );
+    defer std.testing.allocator.free(core_cmdline);
+    try std.testing.expectEqualStrings(
+        "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=auto console=tty0 console=ttyAMA0,115200n8",
+        core_cmdline,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, core_cmdline, "vmizinit.shell=on") == null);
 }
 
 test "native boot validation rejects missing modules.dep and initramfs" {
@@ -2896,12 +3650,178 @@ test "exact lock requires coherent Azure and provisioning packages" {
         "linux-azure\t7.0\tamd64\n" ++
         "openssh-server\t10.2\tamd64\n" ++
         "walinuxagent\t2.15\tall\n";
-    try validateExactLock(amd64_lock, profileFor(.x86_64));
+    try validateExactLock(amd64_lock, profileFor(.x86_64), .full);
     try std.testing.expectError(error.ForeignArchitecturePackage, validateExactLock(
         amd64_lock ++ "libc6\t2.43\tarm64\n",
         profileFor(.x86_64),
+        .full,
     ));
-    try std.testing.expectError(error.ExactLockIncomplete, validateExactLock("linux-azure\t7.0\tamd64\n", profileFor(.x86_64)));
+    try std.testing.expectError(
+        error.ExactLockIncomplete,
+        validateExactLock("linux-azure\t7.0\tamd64\n", profileFor(.x86_64), .full),
+    );
+}
+
+test "core package policy rejects server agents foreign packages and closure drift" {
+    const inventory =
+        "ca-certificates\t1\tall\n" ++
+        "linux-azure\t7.0\tamd64\n" ++
+        "openssh-client\t10.2\tamd64\n" ++
+        "openssh-server\t10.2\tamd64\n" ++
+        "sudo\t1.9\tamd64\n" ++
+        "ubuntu-minimal\t1\tamd64\n";
+    try validateExactLock(inventory, profileFor(.x86_64), .core);
+    try std.testing.expectError(
+        error.ForbiddenCorePackage,
+        validateExactLock(inventory ++ "cloud-init\t26.1\tall\n", profileFor(.x86_64), .core),
+    );
+
+    const exact_lock =
+        \\{"target_architecture":"amd64","packages":[
+        \\{"name":"ca-certificates","version":"1","architecture":"all"},
+        \\{"name":"linux-azure","version":"7.0","architecture":"amd64"},
+        \\{"name":"openssh-client","version":"10.2","architecture":"amd64"},
+        \\{"name":"openssh-server","version":"10.2","architecture":"amd64"},
+        \\{"name":"sudo","version":"1.9","architecture":"amd64"},
+        \\{"name":"ubuntu-minimal","version":"1","architecture":"amd64"}]}
+    ;
+    try validateInventoryAgainstExactLock(
+        std.testing.allocator,
+        inventory,
+        exact_lock,
+        profileFor(.x86_64),
+    );
+    try std.testing.expectError(
+        error.UnexpectedCorePackage,
+        validateInventoryAgainstExactLock(
+            std.testing.allocator,
+            inventory ++ "unexpected\t1\tall\n",
+            exact_lock,
+            profileFor(.x86_64),
+        ),
+    );
+}
+
+test "core guest contract uses architecture-correct static artifacts and full generalization" {
+    var elf: [20]u8 = @splat(0);
+    @memcpy(elf[0..4], "\x7fELF");
+    elf[5] = 1;
+    std.mem.writeInt(u16, elf[18..20], 62, .little);
+    try validateGuestElf(&elf, profileFor(.x86_64));
+    try std.testing.expectError(
+        error.WrongGuestExecutableArchitecture,
+        validateGuestElf(&elf, profileFor(.aarch64)),
+    );
+    switch (generalizationPolicy(.core)) {
+        .azure => |policy| {
+            try std.testing.expect(policy.clear_machine_id);
+            try std.testing.expect(policy.remove_ssh_host_keys);
+            try std.testing.expect(policy.remove_agent_state);
+            try std.testing.expect(policy.remove_dhcp_leases);
+            try std.testing.expect(policy.clear_random_seed);
+        },
+        .none => return error.CoreGeneralizationMissing,
+    }
+    switch (generalizationPolicy(.full)) {
+        .azure => |policy| {
+            try std.testing.expect(!policy.clear_machine_id);
+            try std.testing.expect(!policy.remove_agent_state);
+        },
+        .none => return error.FullGeneralizationMissing,
+    }
+}
+
+test "core injection writes static agents links configuration and embedded evidence" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const image_path = "test-ubuntu2604-core-injection.raw";
+    const spool_path = "test-ubuntu2604-core-injection.spool";
+    const vmizinit_path = "test-ubuntu2604-vmizinit";
+    const azagent_path = "test-ubuntu2604-azagent";
+    defer Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Dir.cwd().deleteFile(io, vmizinit_path) catch {};
+    defer Dir.cwd().deleteFile(io, azagent_path) catch {};
+
+    var elf: [20]u8 = @splat(0);
+    @memcpy(elf[0..4], "\x7fELF");
+    elf[5] = 1;
+    std.mem.writeInt(u16, elf[18..20], 62, .little);
+    try Dir.cwd().writeFile(io, .{ .sub_path = vmizinit_path, .data = &elf });
+    try Dir.cwd().writeFile(io, .{ .sub_path = azagent_path, .data = &elf });
+
+    const length: u64 = 32 * 1024 * 1024;
+    var image = try vmiz.Image.createExclusive(io, image_path, .raw, length, .{});
+    defer image.close(io);
+    var tree = vmiz.root_tree.RootTree.initMemory(allocator, io, .{});
+    defer tree.deinit();
+    for (&[_][]const u8{
+        "usr", "usr/sbin", "etc",          "etc/ssh", "etc/ssh/sshd_config.d",
+        "var", "var/lib",  "var/lib/vmiz",
+    }) |directory| try tree.putDirectory(directory, .{ .mode = 0o755 });
+    try tree.putSymlink("sbin", "usr/sbin", .{ .mode = 0o777 });
+    _ = try vmiz.ext4.populate(io, image.file, allocator, try tree.cursor(), .{
+        .length = length,
+        .label = "cloudimg-rootfs",
+    });
+
+    var filesystem = try vmiz.ext4_mountless.FileSystem.open(allocator, io, image.file, .{
+        .length = length,
+        .spool_path = spool_path,
+        .atomic_path = image_path,
+    });
+    defer filesystem.deinit();
+    var evidence: [core_debz_packages.len]DebzEvidence = undefined;
+    var initialized: usize = 0;
+    defer for (evidence[0..initialized]) |*item| item.deinit(allocator);
+    for (&core_debz_packages, 0..) |package, index| {
+        const lock_path = try std.fmt.allocPrint(allocator, "test-core-{d}.lock.json", .{index});
+        errdefer allocator.free(lock_path);
+        const provenance_path = try std.fmt.allocPrint(allocator, "test-core-{d}.transaction.json", .{index});
+        errdefer allocator.free(provenance_path);
+        try Dir.cwd().writeFile(io, .{ .sub_path = lock_path, .data = "{}" });
+        try Dir.cwd().writeFile(io, .{ .sub_path = provenance_path, .data = "{}" });
+        evidence[index] = .{
+            .package = package,
+            .lock_path = lock_path,
+            .lock_sha256 = @splat('1'),
+            .lock_digest_sha256 = @splat('a'),
+            .provenance_path = provenance_path,
+            .provenance_sha256 = @splat('2'),
+            .provenance_digest_sha256 = @splat('b'),
+            .provenance_lock_sha256 = @splat('a'),
+        };
+        initialized += 1;
+    }
+    defer for (evidence[0..initialized]) |item| {
+        Dir.cwd().deleteFile(io, item.lock_path) catch {};
+        Dir.cwd().deleteFile(io, item.provenance_path) catch {};
+    };
+
+    try injectCoreGuest(
+        allocator,
+        io,
+        &filesystem,
+        profileFor(.x86_64),
+        vmizinit_path,
+        azagent_path,
+        &evidence,
+    );
+    const injected = try filesystem.read(allocator, "/usr/sbin/vmizinit", 1024);
+    defer allocator.free(injected);
+    try std.testing.expectEqualSlices(u8, &elf, injected);
+    const init_target = try filesystem.readLink(allocator, "/usr/sbin/init", 1024);
+    defer allocator.free(init_target);
+    try std.testing.expectEqualStrings("vmizinit", init_target);
+    const ssh_config = try filesystem.read(
+        allocator,
+        "/etc/ssh/sshd_config.d/10-vmizinit.conf",
+        4096,
+    );
+    defer allocator.free(ssh_config);
+    try std.testing.expectEqualStrings(core_ssh_config, ssh_config);
+    _ = try filesystem.stat("/var/lib/vmiz/provenance/test-core-0.lock.json");
+    _ = try filesystem.stat("/var/lib/vmiz/ubuntu2604-core-provenance.json");
 }
 
 test "final native qcow2 validation covers the exact release size" {
@@ -3017,4 +3937,64 @@ test "provenance binds signed source metadata and validated debz evidence" {
         parsed.value.object.get("debz").?.object.get("baseline").?.object.get("source").?.string,
     );
     try std.testing.expectEqual(@as(usize, 4), parsed.value.object.get("artifacts").?.object.count());
+}
+
+test "core provenance binds flavor closure size and free-space evidence" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root_buffer[0..root_length], "core-provenance.json" },
+    );
+    defer std.testing.allocator.free(path);
+    var evidence: [core_debz_packages.len]DebzEvidence = undefined;
+    var initialized: usize = 0;
+    defer for (evidence[0..initialized]) |*item| item.deinit(std.testing.allocator);
+    for (&core_debz_packages, 0..) |package, index| {
+        evidence[index] = .{
+            .package = package,
+            .lock_path = try std.fmt.allocPrint(std.testing.allocator, "/state/{s}.lock", .{package}),
+            .lock_sha256 = @splat('1'),
+            .lock_digest_sha256 = @splat('a'),
+            .provenance_path = try std.fmt.allocPrint(std.testing.allocator, "/state/{s}.transaction.json", .{package}),
+            .provenance_sha256 = @splat('2'),
+            .provenance_digest_sha256 = @splat('b'),
+            .provenance_lock_sha256 = @splat('a'),
+        };
+        initialized += 1;
+    }
+    try writeCoreProvenance(
+        std.testing.allocator,
+        std.testing.io,
+        path,
+        profileFor(.aarch64),
+        @splat('5'),
+        &evidence,
+        core_virtual_size,
+        core_minimum_root_free_bytes + 4096,
+    );
+    const document = try Dir.cwd().readFileAlloc(
+        std.testing.io,
+        path,
+        std.testing.allocator,
+        .limited(64 * 1024),
+    );
+    defer std.testing.allocator.free(document);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, document, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("core", parsed.value.object.get("flavor").?.string);
+    try std.testing.expectEqual(
+        @as(i64, core_virtual_size),
+        parsed.value.object.get("virtual_size").?.integer,
+    );
+    try std.testing.expectEqual(
+        @as(usize, core_debz_packages.len),
+        parsed.value.object.get("debz").?.object.get("transactions").?.array.items.len,
+    );
+    try std.testing.expectEqualStrings(
+        "empty-debz-root",
+        parsed.value.object.get("debz").?.object.get("baseline").?.object.get("source").?.string,
+    );
 }
