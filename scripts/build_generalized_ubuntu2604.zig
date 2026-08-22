@@ -293,6 +293,7 @@ const Args = struct {
     signing_command: ?[]const u8 = null,
     signing_command_arg: ?[]const u8 = null,
     uki_stub: ?[]const u8 = null,
+    proxy: ?[]const u8 = null,
     preflight_only: bool = false,
 };
 
@@ -306,6 +307,7 @@ const help =
     \\  --size <size>                           virtual size (full 5G, core 3584M)
     \\  --vmizinit <path>                       static guest PID 1 (core only)
     \\  --azagent <path>                        static guest provisioning agent (core only)
+    \\  --proxy <url>                           reach the archive through this HTTP proxy
     \\  --uki-signing-certificate <path>        Secure Boot certificate
     \\  --uki-signing-certificate-sha256 <hex>  DER certificate SHA-256
     \\  --uki-signing-key <path>                local signing key
@@ -333,6 +335,7 @@ fn packageFamilyRequest(
     state_path: []const u8,
     lock_path: []const u8,
     installed_baseline: package_family.InstalledBaselinePolicy,
+    proxy: ?[]const u8,
 ) package_family.Request {
     return .{
         .family = .debian,
@@ -353,6 +356,7 @@ fn packageFamilyRequest(
             .state_path = state_path,
             .lock_input_path = if (operation == .resolve_lock) null else lock_path,
             .lock_output_path = if (operation == .resolve_lock) lock_path else null,
+            .proxy = proxy,
             .cache_mode = .online,
             .repository_policy = .strict_priority,
             .recommends = false,
@@ -520,6 +524,13 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
             args.uki_stub = argv[i];
+        } else if (std.mem.eql(u8, arg, "--proxy")) {
+            i += 1;
+            if (i == argv.len) return error.MissingArgument;
+            // Validated here rather than at first use, so a malformed proxy
+            // fails before the build downloads anything.
+            _ = try artifact_pipeline.parseProxy(argv[i]);
+            args.proxy = argv[i];
         } else if (std.mem.eql(u8, arg, "--preflight-only")) {
             args.preflight_only = true;
         } else if (std.mem.eql(u8, arg, "--help")) {
@@ -1974,6 +1985,7 @@ fn customizeRootWithDebz(
     provenance_dir: []const u8,
     vmizinit_path: ?[]const u8,
     azagent_path: ?[]const u8,
+    proxy: ?[]const u8,
 ) !DebzCustomization {
     const extraction = try std.fs.path.join(allocator, &.{ work_dir, "official-root" });
     defer allocator.free(extraction);
@@ -2100,6 +2112,7 @@ fn customizeRootWithDebz(
             absolute_state,
             absolute_lock,
             installed_baseline,
+            proxy,
         );
         try assertRequestSeparation(resolve_request);
         const resolved = try package_family.execute(allocator, io, .{}, resolve_request);
@@ -2141,6 +2154,7 @@ fn customizeRootWithDebz(
             absolute_state,
             absolute_lock,
             installed_baseline,
+            proxy,
         );
         try assertRequestSeparation(customize_request);
         const customized = try package_family.execute(allocator, io, .{}, customize_request);
@@ -2719,7 +2733,10 @@ pub fn main(init: std.process.Init) !void {
     try Dir.cwd().deleteTree(io, provenance_dir);
     try Dir.cwd().createDirPath(io, provenance_dir);
 
-    var https = artifact_pipeline.NativeHttpsDownloader.init(allocator, io);
+    var https = if (args.proxy) |proxy|
+        try artifact_pipeline.NativeHttpsDownloader.initProxied(allocator, io, proxy)
+    else
+        artifact_pipeline.NativeHttpsDownloader.init(allocator, io);
     defer https.deinit();
     const downloader = https.downloader();
 
@@ -2806,6 +2823,7 @@ pub fn main(init: std.process.Init) !void {
         provenance_dir,
         args.vmizinit,
         args.azagent,
+        args.proxy,
     );
     defer debz_customization.deinit(allocator);
 
@@ -3184,6 +3202,7 @@ test "package-family resolve and customize requests are exact-lock operations" {
         "/state",
         "/state/linux-azure.lock",
         .require_locked,
+        null,
     );
     try std.testing.expectEqual(package_family.Family.debian, amd64.family);
     try std.testing.expectEqual(package_family.Distribution.ubuntu_26_04, amd64.distribution);
@@ -3209,7 +3228,12 @@ test "package-family resolve and customize requests are exact-lock operations" {
         "/state",
         "/state/walinuxagent.lock",
         .require_locked,
+        // A proxy is an input like any other: it is either stated or absent,
+        // never inherited from the environment.
+        "http://127.0.0.1:18080",
     );
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", arm64.inputs.proxy.?);
+    try std.testing.expect(amd64.inputs.proxy == null);
     try std.testing.expectEqual(package_family.Architecture.arm64, arm64.inputs.architecture);
     try std.testing.expectEqual(
         package_family.InstalledBaselinePolicy.require_locked,
@@ -3232,6 +3256,7 @@ test "package-family resolve and customize requests are exact-lock operations" {
         "/state",
         "/state/ubuntu-minimal.lock",
         .none,
+        null,
     );
     try std.testing.expectEqual(package_family.Operation.create, core_create.operation);
     try std.testing.expectEqual(
@@ -3252,17 +3277,17 @@ test "package-family requests reject keyrings overlapping staging and accept the
 
     // The corrected requests resolve the keyring from an external host copy and
     // pass the shared separation policy for both resolve and customize.
-    const good_resolve = packageFamilyRequest(.resolve_lock, profile, &.{"linux-azure"}, resolve_root, resolve_published, &.{source_config}, &.{external_keyring}, cache, state, lock, .require_locked);
+    const good_resolve = packageFamilyRequest(.resolve_lock, profile, &.{"linux-azure"}, resolve_root, resolve_published, &.{source_config}, &.{external_keyring}, cache, state, lock, .require_locked, null);
     try assertRequestSeparation(good_resolve);
     try std.testing.expectEqualStrings(external_keyring, good_resolve.inputs.keyring_paths[0]);
-    const good_customize = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{external_keyring}, cache, state, lock, .require_locked);
+    const good_customize = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{external_keyring}, cache, state, lock, .require_locked, null);
     try assertRequestSeparation(good_customize);
     try std.testing.expectEqualStrings(external_keyring, good_customize.inputs.keyring_paths[0]);
 
     // The original blocker: a keyring read from inside the resolve root_stage is
     // rejected with the exact boundary message the protected aarch64 builder hit.
     const guest_keyring = resolve_root ++ "/usr/share/keyrings/ubuntu-archive-keyring.gpg";
-    const bad_resolve = packageFamilyRequest(.resolve_lock, profile, &.{"linux-azure"}, resolve_root, resolve_published, &.{source_config}, &.{guest_keyring}, cache, state, lock, .require_locked);
+    const bad_resolve = packageFamilyRequest(.resolve_lock, profile, &.{"linux-azure"}, resolve_root, resolve_published, &.{source_config}, &.{guest_keyring}, cache, state, lock, .require_locked, null);
     try std.testing.expectError(error.PackageFamilySeparationViolation, assertRequestSeparation(bad_resolve));
     try std.testing.expectEqualStrings(
         "debian keyring paths must be absolute and outside staging",
@@ -3270,13 +3295,13 @@ test "package-family requests reject keyrings overlapping staging and accept the
     );
 
     const staged_keyring = "/work/root-stage-0/usr/share/keyrings/ubuntu-archive-keyring.gpg";
-    const bad_customize = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{staged_keyring}, cache, state, lock, .require_locked);
+    const bad_customize = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{staged_keyring}, cache, state, lock, .require_locked, null);
     try std.testing.expectError(error.PackageFamilySeparationViolation, assertRequestSeparation(bad_customize));
 
     // A keyring under the publication root is rejected too, so a published guest
     // can never mutate the trusted input after debz consumes it.
     const published_keyring = "/work/root-debz-0/usr/share/keyrings/ubuntu-archive-keyring.gpg";
-    const published_overlap = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{published_keyring}, cache, state, lock, .require_locked);
+    const published_overlap = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{published_keyring}, cache, state, lock, .require_locked, null);
     try std.testing.expectError(error.PackageFamilySeparationViolation, assertRequestSeparation(published_overlap));
     try std.testing.expectEqualStrings(
         "debian keyring paths must be outside publication",

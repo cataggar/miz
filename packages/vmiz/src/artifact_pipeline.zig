@@ -177,6 +177,12 @@ pub const NativeHttpsDownloader = struct {
     sleep: ?Sleep = null,
     transport: ?NativeHttpsTransport = null,
     client: ?std.http.Client = null,
+    /// Storage for the parsed proxy, owned here because `std.http.Client`
+    /// holds a pointer to it for as long as the client exists. The client's
+    /// pointers are bound at fetch time rather than here, so they always name
+    /// this field at its current address even though `initProxied` returns by
+    /// value and a caller may then move or copy the downloader.
+    proxy: ?std.http.Client.Proxy = null,
 
     pub fn init(allocator: Allocator, io: Io) NativeHttpsDownloader {
         return .{
@@ -187,6 +193,24 @@ pub const NativeHttpsDownloader = struct {
                 .write_buffer_size = native_https_write_buffer_size,
             },
         };
+    }
+
+    /// As `init`, but reaching the artifact host through an HTTP proxy.
+    ///
+    /// The proxy is named explicitly rather than read from the environment, so
+    /// a build's egress path is a stated input like every other one and cannot
+    /// change because of an ambient variable. TLS is unaffected: the proxy is
+    /// asked to `CONNECT`, and the session is negotiated end to end with the
+    /// artifact host, so pinned digests and signature checks still verify the
+    /// bytes that host served.
+    pub fn initProxied(
+        allocator: Allocator,
+        io: Io,
+        proxy_url: []const u8,
+    ) !NativeHttpsDownloader {
+        var self = init(allocator, io);
+        self.proxy = try parseProxy(proxy_url);
+        return self;
     }
 
     pub fn deinit(self: *NativeHttpsDownloader) void {
@@ -267,9 +291,26 @@ pub const NativeHttpsDownloader = struct {
     ) !NativeHttpsResponse {
         if (self.transport) |transport|
             return transport.get(allocator, io, url, max_size, output);
-        if (self.client) |*client|
+        if (self.client) |*client| {
+            self.bindProxy();
             return fetchNativeHttps(client, url, max_size, output);
+        }
         return error.HttpsTransportUnavailable;
+    }
+
+    /// Points the client at this downloader's own proxy storage.
+    ///
+    /// Done here, where the downloader is behind a pointer and therefore at
+    /// its final address, because `initProxied` hands back a value: an
+    /// interior pointer taken there would name a copy the caller no longer
+    /// keeps. Both schemes are set, because a redirect may cross from one to
+    /// the other and the far side is unreachable either way without the proxy.
+    fn bindProxy(self: *NativeHttpsDownloader) void {
+        const proxy = if (self.proxy) |*proxy| proxy else return;
+        if (self.client) |*client| {
+            client.http_proxy = proxy;
+            client.https_proxy = proxy;
+        }
     }
 
     fn retry(self: *const NativeHttpsDownloader, io: Io, retry_count: *u8) !void {
@@ -378,6 +419,87 @@ fn isRetryableNativeHttpsError(err: anyerror) bool {
 fn validateHttpsUrl(value: []const u8) !void {
     const uri = std.Uri.parse(value) catch return error.InvalidHttpsUrl;
     try validateHttpsUri(uri);
+}
+
+/// Parses a proxy URL into the form `std.http.Client` wants.
+///
+/// `value` is borrowed, not copied: the returned host points into it, so it
+/// must outlive the client. Command-line arguments and environment values both
+/// do.
+///
+/// Credentials are refused rather than forwarded. A proxy that needs them is a
+/// proxy whose secret would have to travel in an argument or an environment
+/// variable to reach here, and neither is a place for one; debz refuses them
+/// on the same grounds, so a build cannot end up with vmiz accepting a
+/// credential-bearing proxy that debz would then reject.
+pub fn parseProxy(value: []const u8) !std.http.Client.Proxy {
+    const uri = std.Uri.parse(value) catch return error.InvalidProxyUrl;
+    const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.InvalidProxyUrl;
+    if (uri.user != null or uri.password != null) return error.CredentialBearingProxy;
+    const host = uri.host orelse return error.InvalidProxyUrl;
+    // A proxy is named, not fetched from, so the host is taken as written
+    // rather than percent-decoded into a fresh allocation.
+    const name = switch (host) {
+        .raw => |raw| raw,
+        .percent_encoded => |encoded| encoded,
+    };
+    std.Io.net.HostName.validate(name) catch return error.InvalidProxyUrl;
+    return .{
+        .protocol = protocol,
+        .host = .{ .bytes = name },
+        .authorization = null,
+        .port = uri.port orelse switch (protocol) {
+            .plain => 80,
+            .tls => 443,
+        },
+        // Anything less would send the artifact URL, and a plaintext body,
+        // to the proxy instead of tunnelling TLS through to the origin.
+        .supports_connect = true,
+    };
+}
+
+test "a proxy URL is parsed, and one carrying a credential is refused" {
+    const plain = try parseProxy("http://127.0.0.1:18080");
+    try std.testing.expectEqual(std.http.Client.Protocol.plain, plain.protocol);
+    try std.testing.expectEqual(@as(u16, 18080), plain.port);
+    try std.testing.expectEqualStrings("127.0.0.1", plain.host.bytes);
+    try std.testing.expect(plain.supports_connect);
+    try std.testing.expect(plain.authorization == null);
+
+    // Default ports come from the scheme, so a proxy may be named without one.
+    try std.testing.expectEqual(@as(u16, 80), (try parseProxy("http://proxy.example")).port);
+    try std.testing.expectEqual(@as(u16, 443), (try parseProxy("https://proxy.example")).port);
+
+    // Forwarding a credential would mean carrying it in an argument or an
+    // environment variable to get here. debz refuses these too.
+    try std.testing.expectError(
+        error.CredentialBearingProxy,
+        parseProxy("http://user:secret@proxy.example:8080"),
+    );
+    try std.testing.expectError(error.InvalidProxyUrl, parseProxy("ftp://proxy.example"));
+    try std.testing.expectError(error.InvalidProxyUrl, parseProxy("not a url"));
+    try std.testing.expectError(error.InvalidProxyUrl, parseProxy("http://"));
+}
+
+test "a proxied downloader points its client at the proxy it still owns" {
+    // `initProxied` returns by value, so the downloader a caller keeps is not
+    // the one the constructor built. The client must name the surviving copy.
+    var moved = try NativeHttpsDownloader.initProxied(
+        std.testing.allocator,
+        undefined,
+        "http://127.0.0.1:18080",
+    );
+    try std.testing.expect(moved.client.?.http_proxy == null);
+    moved.bindProxy();
+    try std.testing.expectEqual(&moved.proxy.?, moved.client.?.http_proxy.?);
+    try std.testing.expectEqual(&moved.proxy.?, moved.client.?.https_proxy.?);
+
+    // An unproxied downloader is left alone, so nothing can reach the network
+    // through a proxy that was never asked for.
+    var direct = NativeHttpsDownloader.init(std.testing.allocator, undefined);
+    direct.bindProxy();
+    try std.testing.expect(direct.client.?.http_proxy == null);
+    try std.testing.expect(direct.client.?.https_proxy == null);
 }
 
 fn validateHttpsUri(uri: std.Uri) !void {
