@@ -442,6 +442,7 @@ const Args = struct {
     uki_stub: ?[]const u8 = null,
     proxy: ?[]const u8 = null,
     authorized_key: ?[]const u8 = null,
+    raw_output: ?[]const u8 = null,
     preflight_only: bool = false,
 };
 
@@ -456,6 +457,7 @@ const help =
     \\  --vmizinit <path>                       static guest PID 1 (core, baremetal)
     \\  --azagent <path>                        static guest provisioning agent (core, baremetal)
     \\  --authorized-key <path>                 administrator public key (baremetal only)
+    \\  --raw-output <path>                     additional raw copy, for writing to a disk
     \\  --proxy <url>                           reach the archive through this HTTP proxy
     \\  --uki-signing-certificate <path>        Secure Boot certificate
     \\  --uki-signing-certificate-sha256 <hex>  DER certificate SHA-256
@@ -684,6 +686,10 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
             args.authorized_key = argv[i];
+        } else if (std.mem.eql(u8, arg, "--raw-output")) {
+            i += 1;
+            if (i == argv.len) return error.MissingArgument;
+            args.raw_output = argv[i];
         } else if (std.mem.eql(u8, arg, "--preflight-only")) {
             args.preflight_only = true;
         } else if (std.mem.eql(u8, arg, "--help")) {
@@ -2943,6 +2949,43 @@ fn scanCpioForModules(
     }
 }
 
+/// Writes the validated image's guest bytes out again, uncompressed.
+///
+/// A QCOW2 is the artifact everything else here validates, and it stays that:
+/// this is a second copy, produced only after the first has passed every gate,
+/// for the one consumer that cannot read the format -- `dd` onto a disk. Going
+/// through `vmiz.Image` rather than a converter keeps the two copies provably
+/// the same bytes, and keeps the promise that this builder shells out to
+/// nothing. It is staged and renamed for the same reason the QCOW2 is: a copy
+/// interrupted partway through must not be left at the name something else is
+/// about to write to a disk.
+fn writeRawCopy(
+    allocator: Allocator,
+    io: Io,
+    qcow2_path: []const u8,
+    raw_path: []const u8,
+) !void {
+    const staged = try std.fmt.allocPrint(allocator, "{s}.vmiz-raw-stage", .{raw_path});
+    defer allocator.free(staged);
+    Dir.cwd().deleteFile(io, staged) catch {};
+    errdefer Dir.cwd().deleteFile(io, staged) catch {};
+
+    try copyNativeImage(allocator, io, qcow2_path, staged, .raw);
+
+    var written = try vmiz.Image.openPathReadOnlyStandalone(io, staged);
+    const written_format = written.format;
+    const written_size = written.virtual_size;
+    written.close(io);
+    if (written_format != .raw) return error.InvalidRawCopy;
+
+    var source = try vmiz.Image.openPathReadOnlyStandalone(io, qcow2_path);
+    const source_size = source.virtual_size;
+    source.close(io);
+    if (written_size != source_size) return error.InvalidRawCopy;
+
+    try Dir.cwd().rename(staged, Dir.cwd(), raw_path, io);
+}
+
 fn espPartition(partitions: []const vmiz.gpt.PartitionEntry) !vmiz.gpt.PartitionEntry {
     var found: ?vmiz.gpt.PartitionEntry = null;
     for (partitions) |partition| {
@@ -3247,6 +3290,7 @@ pub fn main(init: std.process.Init) !void {
         debz_customization.evidence[0..debz_customization.evidence_count],
     );
     if (try peMachine(signed.bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
+    if (args.raw_output) |raw_path| try writeRawCopy(allocator, io, output, raw_path);
     try writeSigningProvenance(
         allocator,
         io,
@@ -3790,6 +3834,46 @@ test "native image conversion round trips and cleans failed publication stages" 
     );
     defer allocator.free(staged);
     try std.testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, staged, .{}));
+}
+
+test "the raw copy is the same guest bytes, published only once complete" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_length];
+    const seed_path = try std.fs.path.join(allocator, &.{ root, "seed.raw" });
+    defer allocator.free(seed_path);
+    const qcow_path = try std.fs.path.join(allocator, &.{ root, "image.qcow2" });
+    defer allocator.free(qcow_path);
+    const raw_path = try std.fs.path.join(allocator, &.{ root, "image.raw" });
+    defer allocator.free(raw_path);
+
+    var seed = try vmiz.Image.create(io, seed_path, .raw, 1024 * 1024, .{});
+    try seed.pwrite(io, "written-to-a-disk", 8192);
+    seed.close(io);
+    try copyNativeImage(allocator, io, seed_path, qcow_path, .qcow2);
+
+    try writeRawCopy(allocator, io, qcow_path, raw_path);
+    var raw = try vmiz.Image.openPathReadOnly(io, raw_path);
+    defer raw.close(io);
+    try std.testing.expectEqual(ImageFormat.raw, raw.format);
+    try std.testing.expectEqual(@as(u64, 1024 * 1024), raw.virtual_size);
+    var bytes: [17]u8 = undefined;
+    try std.testing.expectEqual(bytes.len, try raw.pread(io, &bytes, 8192));
+    try std.testing.expectEqualStrings("written-to-a-disk", &bytes);
+
+    // A failed copy leaves nothing at the published name: the next step writes
+    // whatever is there straight onto a disk.
+    const blocked = try std.fs.path.join(allocator, &.{ root, "blocked" });
+    defer allocator.free(blocked);
+    try Dir.cwd().createDirPath(io, blocked);
+    try std.testing.expectError(error.IsDir, writeRawCopy(allocator, io, qcow_path, blocked));
+    const staged_raw = try std.fmt.allocPrint(allocator, "{s}.vmiz-raw-stage", .{blocked});
+    defer allocator.free(staged_raw);
+    try std.testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, staged_raw, .{}));
 }
 
 test "arguments accept Ubuntu and project architecture spellings" {
