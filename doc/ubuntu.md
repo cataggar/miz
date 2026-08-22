@@ -392,9 +392,10 @@ core images; all publication work remains explicitly deferred.
 accept core keys or assets, and `scripts/ubuntu2604_publish.sh` is intentionally
 unchanged. Before dispatch:
 
-1. Create the required tag `Ubuntu-26.04-20260829` at the exact current
-   `main` commit. Lightweight and annotated tags are accepted; an existing tag
-   is never moved.
+1. Create or retarget the required tag `Ubuntu-26.04-20260822` to the exact
+   current `main` commit. Lightweight and annotated tags are accepted; force
+   push the tag when it already exists, then verify the remote resolves to the
+   current `main` commit before dispatch.
 2. Configure protected environment `ubuntu2604-signing`, restricted to
    `main` and requiring reviewers, with variables
    `VMIZ_AZURE_TENANT_ID`, `VMIZ_AZURE_CLIENT_ID`,
