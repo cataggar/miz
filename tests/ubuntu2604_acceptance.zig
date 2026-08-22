@@ -18,7 +18,8 @@ const Io = std.Io;
 const admin_username = "vmiztest";
 const boot_timeout_seconds: i64 = 8 * 60;
 const serial_limit: usize = 2 * 1024 * 1024;
-const gib: u64 = 1024 * 1024 * 1024;
+const mib: u64 = 1024 * 1024;
+const gib: u64 = 1024 * mib;
 
 const Architecture = enum {
     x86_64,
@@ -161,8 +162,7 @@ const Flavor = enum {
 const core_policy: FlavorPolicy = .{
     .x86_64_file_name = "Ubuntu-26.04-x86_64.core.qcow2",
     .aarch64_file_name = "Ubuntu-26.04-aarch64.core.qcow2",
-    // The builder can align its final evidence-based size here.
-    .virtual_size = 2 * gib,
+    .virtual_size = 3584 * mib,
     .result_schema = 2,
     .contracts = &core_contracts,
 };
@@ -2173,7 +2173,7 @@ test "Ubuntu 26.04 acceptance flavor policy preserves full and isolates core" {
     const full = Candidate{ .architecture = .x86_64, .flavor = .full };
     const core = Candidate{ .architecture = .x86_64, .flavor = .core };
     try std.testing.expectEqual(@as(u64, 5 * gib), full.expectedVirtualSize());
-    try std.testing.expectEqual(@as(u64, 2 * gib), core.expectedVirtualSize());
+    try std.testing.expectEqual(@as(u64, 3584 * mib), core.expectedVirtualSize());
     try std.testing.expect(core.expectedVirtualSize() < full.expectedVirtualSize());
     try std.testing.expectEqual(@as(u32, 1), full.flavor.policy().result_schema);
     try std.testing.expectEqual(@as(u32, 2), core.flavor.policy().result_schema);
