@@ -25,7 +25,7 @@ test "public consumer can model lock review and locked creation" {
         resolve.inputs.installed_baseline,
     );
     try std.testing.expectEqualStrings(
-        "80fa0069f51c0119279b305f5090f00ce72852c5",
+        "beac3f20dd93fd98863af71e8fe621d47db663f6",
         package_family.debz_api_commit,
     );
 }

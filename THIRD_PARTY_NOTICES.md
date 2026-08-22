@@ -46,14 +46,14 @@ https://github.com/cataggar/tls.zig/blob/2621e411af81c8b4d8fa5aaae08b9b183a80bb4
 ## debz
 
 Host-side Debian-family package operations embed `cataggar/debz` at immutable
-commit `80fa0069f51c0119279b305f5090f00ce72852c5`.
+commit `beac3f20dd93fd98863af71e8fe621d47db663f6`.
 
 Copyright (c) debz contributors.
 
 Licensed under the Apache License 2.0. See:
-https://github.com/cataggar/debz/blob/80fa0069f51c0119279b305f5090f00ce72852c5/LICENSE
+https://github.com/cataggar/debz/blob/beac3f20dd93fd98863af71e8fe621d47db663f6/LICENSE
 
 debz links its statically configured Debian-semantics libsolv dependency and
 system libc, liblzma, and libzstd through its Zig package build conventions.
 See debz's notices for the corresponding BSD-3-Clause and 0BSD terms:
-https://github.com/cataggar/debz/blob/80fa0069f51c0119279b305f5090f00ce72852c5/THIRD_PARTY_NOTICES
+https://github.com/cataggar/debz/blob/beac3f20dd93fd98863af71e8fe621d47db663f6/THIRD_PARTY_NOTICES
