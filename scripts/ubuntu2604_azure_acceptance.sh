@@ -907,8 +907,11 @@ for path in \
   /usr/sbin/cloud-init \
   /usr/bin/waagent \
   /usr/sbin/waagent \
+  /usr/sbin/WALinuxAgent.py \
   /usr/sbin/WALinuxAgent \
+  /etc/cloud \
   /usr/lib/python3/dist-packages/azurelinuxagent \
+  /usr/lib/python3/dist-packages/cloudinit \
   /var/lib/cloud \
   /run/cloud-init \
   /var/lib/waagent \
@@ -917,16 +920,30 @@ for path in \
 do
   test ! -e "$path"
 done
+self=$$
 for proc in /proc/[0-9]*; do
+  test "${proc##*/}" = "$self" && continue
   test -r "$proc/cmdline" || continue
   cmdline=$(tr '\000' ' ' <"$proc/cmdline")
   case "$cmdline" in
     *cloud-init*|*waagent*|*WALinuxAgent*|*azurelinuxagent*) exit 1 ;;
   esac
   executable=$(readlink "$proc/exe" 2>/dev/null || true)
+  test "$executable" != /usr/sbin/azagent
   case "$executable" in
     /usr/lib/systemd/systemd|/lib/systemd/systemd) exit 1 ;;
   esac
+done
+for status in /proc/[0-9]*/status; do
+  test -r "$status" || continue
+  ppid= state=
+  while read -r key value _; do
+    case "$key" in
+      PPid:) ppid=$value ;;
+      State:) state=$value ;;
+    esac
+  done <"$status"
+  test "$ppid" != 1 || test "$state" != Z
 done
 grep -Eq '^[[:space:]]*ResourceDisk.Format[[:space:]]*=[[:space:]]*y[[:space:]]*$' /etc/waagent.conf
 grep -Eq '^[[:space:]]*ResourceDisk.MountPoint[[:space:]]*=[[:space:]]*/d[[:space:]]*$' /etc/waagent.conf

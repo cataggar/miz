@@ -101,7 +101,10 @@ RELEASE_TAG_RE = re.compile(r"^Ubuntu-26\.04-[0-9]{8}$")
 SNAPSHOT_ID_RE = re.compile(r"^release-[0-9]{8}(?:\.[0-9]+)?$")
 CANONICAL_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{40}$")
 DEBZ_API_COMMIT = "9cabfc0f808a8beb4709d7e5b3ae7baf19d733d5"
-DEBZ_PACKAGES = ("linux-azure", "walinuxagent")
+FULL_DEBZ_PACKAGES = ("linux-azure", "walinuxagent")
+CORE_DEBZ_PACKAGES = ("ubuntu-minimal", "linux-azure", "openssh-server", "sudo")
+CORE_PACKAGE_ROOTS = CORE_DEBZ_PACKAGES
+DEBZ_PACKAGES = FULL_DEBZ_PACKAGES
 UBUNTU_PROVENANCE_FILENAME = "ubuntu2604-build-provenance.json"
 CANDIDATE_FIELDS = {
     "schema",
@@ -447,10 +450,12 @@ def parse_sha256sums(path: Path) -> dict[str, str]:
 def validate_ubuntu_provenance(
     root: Path,
     architecture: str,
+    flavor: str = "full",
+    virtual_size: int | None = None,
 ) -> dict[str, object]:
     path = root / UBUNTU_PROVENANCE_FILENAME
     document = read_json(path)
-    if set(document) != {
+    expected_fields = {
         "schema",
         "type",
         "architecture",
@@ -460,7 +465,17 @@ def validate_ubuntu_provenance(
         "sha256sums_signature_verified",
         "artifacts",
         "debz",
-    }:
+    }
+    if flavor == "core":
+        expected_fields |= {
+            "flavor",
+            "virtual_size",
+            "minimum_root_free_bytes",
+            "validated_root_free_bytes",
+        }
+    elif flavor != "full":
+        fail(f"unsupported Ubuntu provenance flavor: {flavor!r}")
+    if set(document) != expected_fields:
         fail("Ubuntu build provenance has unexpected fields")
     if (
         document.get("schema") != 1
@@ -469,6 +484,25 @@ def validate_ubuntu_provenance(
         or document.get("release") != "26.04"
     ):
         fail("invalid Ubuntu build provenance identity")
+    if flavor == "core":
+        provenance_virtual_size = document.get("virtual_size")
+        minimum_root_free_bytes = document.get("minimum_root_free_bytes")
+        validated_root_free_bytes = document.get("validated_root_free_bytes")
+        if (
+            document.get("flavor") != "core"
+            or type(provenance_virtual_size) is not int
+            or provenance_virtual_size <= 0
+            or (
+                virtual_size is not None
+                and provenance_virtual_size != virtual_size
+            )
+            or type(minimum_root_free_bytes) is not int
+            or minimum_root_free_bytes <= 0
+            or type(validated_root_free_bytes) is not int
+            or validated_root_free_bytes < minimum_root_free_bytes
+            or validated_root_free_bytes >= provenance_virtual_size
+        ):
+            fail("Ubuntu core size/free-space provenance is invalid")
 
     snapshot = document.get("snapshot")
     if not isinstance(snapshot, dict) or set(snapshot) != {"id", "base_url"}:
@@ -510,14 +544,25 @@ def validate_ubuntu_provenance(
     artifacts = document.get("artifacts")
     if not isinstance(artifacts, dict) or set(artifacts) != set(expected_artifacts):
         fail("Ubuntu source artifact bindings are not exact")
-    bindings = {
-        name: require_file_binding(
-            artifacts[name],
+    bindings = {}
+    for name, filename in expected_artifacts.items():
+        value = artifacts[name]
+        if name == "source_image" and flavor == "core":
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"filename", "sha256", "role"}
+                or value.get("role") != "signed-gpt-esp-substrate"
+            ):
+                fail("Ubuntu core source-image role is invalid")
+            value = {
+                "filename": value.get("filename"),
+                "sha256": value.get("sha256"),
+            }
+        bindings[name] = require_file_binding(
+            value,
             f"Ubuntu {name}",
             expected_filename=filename,
         )
-        for name, filename in expected_artifacts.items()
-    }
     checksum_path = require_bound_provenance_file(
         root, bindings["sha256sums"], "Ubuntu SHA256SUMS"
     )
@@ -536,28 +581,39 @@ def validate_ubuntu_provenance(
             fail(f"Ubuntu SHA256SUMS does not bind {binding['filename']}")
 
     debz = document.get("debz")
-    if not isinstance(debz, dict) or set(debz) != {
+    expected_debz_fields = {
         "api_commit",
         "baseline",
         "transactions",
-    }:
+    }
+    if flavor == "core":
+        expected_debz_fields.add("package_roots")
+    if not isinstance(debz, dict) or set(debz) != expected_debz_fields:
         fail("debz provenance binding is invalid")
     if debz.get("api_commit") != DEBZ_API_COMMIT:
         fail("debz API commit is not the embedded vmiz revision")
+    expected_baseline_source = (
+        "empty-debz-root" if flavor == "core" else "canonical-image-dpkg-status"
+    )
     if debz.get("baseline") != {
-        "source": "canonical-image-dpkg-status",
+        "source": expected_baseline_source,
         "enforcement": "exact-final-closure",
     }:
         fail("debz baseline provenance contract is invalid")
+    expected_packages = (
+        CORE_DEBZ_PACKAGES if flavor == "core" else FULL_DEBZ_PACKAGES
+    )
+    if flavor == "core" and debz.get("package_roots") != list(CORE_PACKAGE_ROOTS):
+        fail("Ubuntu core package roots are not exact or stably ordered")
     transactions = debz.get("transactions")
     if (
         not isinstance(transactions, list)
-        or len(transactions) != len(DEBZ_PACKAGES)
+        or len(transactions) != len(expected_packages)
         or [item.get("package") for item in transactions if isinstance(item, dict)]
-        != list(DEBZ_PACKAGES)
+        != list(expected_packages)
     ):
         fail("debz transaction set is not exact or stably ordered")
-    for item, package in zip(transactions, DEBZ_PACKAGES, strict=True):
+    for item, package in zip(transactions, expected_packages, strict=True):
         if not isinstance(item, dict) or set(item) != {
             "package",
             "exact_lock",
@@ -827,10 +883,15 @@ def candidate_command(args: argparse.Namespace) -> None:
     if asset.name != asset_name:
         fail(f"{args.key}: expected asset {asset_name}, got {asset.name}")
     source_commit = require_commit(args.source_commit)
+    if type(args.virtual_size) is not int or args.virtual_size <= 0:
+        fail("virtual size must be positive")
     provenance_root = args.provenance_dir.resolve()
     records = provenance_records(provenance_root)
     ubuntu_provenance = validate_ubuntu_provenance(
-        provenance_root, architecture
+        provenance_root,
+        architecture,
+        flavor,
+        args.virtual_size,
     )
     signing = validate_signing_provenance(provenance_root, architecture, flavor)
     digest = sha256(asset)
@@ -840,8 +901,6 @@ def candidate_command(args: argparse.Namespace) -> None:
         fail(f"{args.key}: build validation digest does not match candidate bytes")
     if asset.stat().st_size <= 0:
         fail("candidate asset must not be empty")
-    if type(args.virtual_size) is not int or args.virtual_size <= 0:
-        fail("virtual size must be positive")
     for label, value in (
         ("runner", args.runner),
         ("run ID", args.run_id),
@@ -980,7 +1039,10 @@ def verify_candidate(
     if not isinstance(ubuntu_provenance, dict):
         fail(f"{actual_key}: Ubuntu provenance binding is absent")
     actual_ubuntu_provenance = validate_ubuntu_provenance(
-        provenance_root, document["architecture"]
+        provenance_root,
+        document["architecture"],
+        document["flavor"],
+        virtual_size,
     )
     if ubuntu_provenance != actual_ubuntu_provenance:
         fail(f"{actual_key}: Ubuntu provenance binding does not match files")
