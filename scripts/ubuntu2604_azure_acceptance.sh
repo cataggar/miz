@@ -12,13 +12,17 @@ source "$script_dir/ubuntu2604_azure_acceptance_lib.sh"
 RELEASE_SCHEMA=${UBUNTU2604_RELEASE_SCHEMA:-scripts/ubuntu2604_release.py}
 
 command_name=${1:-run}
+if (( $# > 1 )); then
+  echo "usage: $0 run|cleanup" >&2
+  exit 2
+fi
 if [[ -z ${STATE_FILE:-} || -z ${GITHUB_RUN_ID:-} || -z ${GITHUB_RUN_ATTEMPT:-} || -z ${CANDIDATE_KEY:-} ]]; then
   echo "::error::Azure cleanup identity is incomplete"
   exit 1
 fi
 [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
 [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
-[[ "$CANDIDATE_KEY" =~ ^(x86_64|aarch64)-full$ ]]
+[[ "$CANDIDATE_KEY" =~ ^(x86_64|aarch64)-(full|core)$ ]]
 
 cleanup_group() {
   [[ -s "$STATE_FILE" ]] || return 0
@@ -92,18 +96,16 @@ if [[ -z ${CANDIDATE_DIR:-} || -z ${SOURCE_COMMIT:-} || -z ${ARCHITECTURE:-} ||
   exit 1
 fi
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-[[ "$ARCHITECTURE" =~ ^(x86_64|aarch64)$ ]]
-[[ "$FLAVOR" == full ]]
-[[ "$CANDIDATE_KEY" == "$ARCHITECTURE-$FLAVOR" ]]
+if ! ubuntu2604_validate_candidate_identity \
+    "$CANDIDATE_KEY" "$ARCHITECTURE" "$FLAVOR" "$ASSET_NAME"
+then
+  echo "::error::Ubuntu candidate identity is invalid"
+  exit 1
+fi
 [[ "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ ]]
 [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
 [[ -x "$VMIZ" ]]
 [[ -r "$RELEASE_SCHEMA" ]]
-case "$ARCHITECTURE" in
-  x86_64) expected_asset=Ubuntu-26.04-x86_64.qcow2 ;;
-  aarch64) expected_asset=Ubuntu-26.04-aarch64.qcow2 ;;
-esac
-[[ "$ASSET_NAME" == "$expected_asset" ]]
 
 report_error() {
   local status=$1 line=$2 command=$3
@@ -119,6 +121,10 @@ for tool in az azcopy curl python3 qemu-img sha256sum ssh ssh-keygen; do
     exit 1
   }
 done
+azure_contract_list=$(
+  python3 "$RELEASE_SCHEMA" azure-contracts --flavor "$FLAVOR"
+)
+[[ -n "$azure_contract_list" ]]
 
 grant_disk_write_access() {
   local disk_id=$1
@@ -440,6 +446,7 @@ python3 - \
   "$vhd_bytes" \
   "$vhd_current_size" \
   "$RESULT_DIR/vhd-info.json" <<'PY'
+import hashlib
 import json
 import sys
 
@@ -748,6 +755,27 @@ reboot_and_reconnect() {
   return 1
 }
 
+read_core_sshd_pid() {
+  ssh "${ssh_options[@]}" "$ssh_target" '/usr/bin/bash -s' <<'GUEST'
+set -euo pipefail
+for proc in /proc/[0-9]*; do
+  test -r "$proc/status" || continue
+  name= ppid=
+  while read -r key value _; do
+    case "$key" in
+      Name:) name=$value ;;
+      PPid:) ppid=$value ;;
+    esac
+  done <"$proc/status"
+  test "$name" = sshd && test "$ppid" = 1 || continue
+  case "$(tr '\000' ' ' <"$proc/cmdline")" in
+    *"/usr/sbin/sshd -D -e"*) printf '%s\n' "${proc##*/}"; exit 0 ;;
+  esac
+done
+exit 1
+GUEST
+}
+
 wait_for_ssh
 if ssh \
   -o BatchMode=yes \
@@ -830,8 +858,9 @@ if not found:
     raise SystemExit("release signing certificate is absent from UEFI db")
 PY
 ssh "${ssh_options[@]}" "$ssh_target" \
-  '/usr/bin/bash -s' <<'GUEST'
+  "/usr/bin/bash -s -- '$FLAVOR'" <<'GUEST'
 set -euo pipefail
+flavor=$1
 secure_boot=$(od -An -t u1 -j 4 -N 1 /sys/firmware/efi/efivars/SecureBoot-* | tr -d ' ')
 test "$secure_boot" = 1
 if ! test -r /sys/kernel/security/lockdown; then
@@ -841,7 +870,7 @@ grep -Eq '\[(integrity|confidentiality)\]' /sys/kernel/security/lockdown
 test -c /dev/tpm0
 test -c /dev/tpmrm0
 for module in hv_netvsc crc_itu_t udf isofs; do
-  if ! test -d "/sys/module/$module"; then
+  if ! test -d "/sys/module/$module" && [[ "$flavor" == full ]]; then
     sudo -n /usr/sbin/modprobe "$module"
   fi
   test -d "/sys/module/$module"
@@ -852,7 +881,133 @@ if printf '%s\n' "$dmesg_output" | grep -Eiq 'module verification failed|Loading
 fi
 GUEST
 
-ssh "${ssh_options[@]}" "$ssh_target" '/usr/bin/bash -s' <<'GUEST'
+if [[ "$FLAVOR" == core ]]; then
+  readarray -t core_identity < <(
+    ssh "${ssh_options[@]}" "$ssh_target" \
+      "/usr/bin/bash -s -- '$has_resource_disk'" <<'GUEST'
+set -Eeuo pipefail
+guest_error() {
+  status=$1
+  trap - ERR
+  printf 'guest acceptance failed at line %s: %s\n' "$2" "$3" >&2
+  exit "$status"
+}
+trap 'guest_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
+has_resource_disk=$1
+sudo -n /usr/bin/test /proc/1/exe -ef /sbin/vmizinit
+test -x /usr/sbin/azagent
+test -s /var/lib/azagent/provisioned
+test "$(cat /var/lib/azagent/provisioned)" = "$(cat /etc/hostname)"
+test ! -d /run/systemd/system
+for binary in cloud-init waagent WALinuxAgent; do
+  ! command -v "$binary" >/dev/null 2>&1
+done
+for path in \
+  /usr/bin/cloud-init \
+  /usr/sbin/cloud-init \
+  /usr/bin/waagent \
+  /usr/sbin/waagent \
+  /usr/sbin/WALinuxAgent.py \
+  /usr/sbin/WALinuxAgent \
+  /etc/cloud \
+  /usr/lib/python3/dist-packages/azurelinuxagent \
+  /usr/lib/python3/dist-packages/cloudinit \
+  /var/lib/cloud \
+  /run/cloud-init \
+  /var/lib/waagent \
+  /var/log/waagent.log \
+  /var/log/azure
+do
+  test ! -e "$path"
+done
+self=$$
+for proc in /proc/[0-9]*; do
+  test "${proc##*/}" = "$self" && continue
+  test -r "$proc/cmdline" || continue
+  cmdline=$(tr '\000' ' ' <"$proc/cmdline")
+  case "$cmdline" in
+    *cloud-init*|*waagent*|*WALinuxAgent*|*azurelinuxagent*) exit 1 ;;
+  esac
+  executable=$(readlink "$proc/exe" 2>/dev/null || true)
+  test "$executable" != /usr/sbin/azagent
+  case "$executable" in
+    /usr/lib/systemd/systemd|/lib/systemd/systemd) exit 1 ;;
+  esac
+done
+for status in /proc/[0-9]*/status; do
+  test -r "$status" || continue
+  ppid= state=
+  while read -r key value _; do
+    case "$key" in
+      PPid:) ppid=$value ;;
+      State:) state=$value ;;
+    esac
+  done <"$status"
+  test "$ppid" != 1 || test "$state" != Z
+done
+grep -Eq '^[[:space:]]*ResourceDisk.Format[[:space:]]*=[[:space:]]*y[[:space:]]*$' /etc/waagent.conf
+grep -Eq '^[[:space:]]*ResourceDisk.MountPoint[[:space:]]*=[[:space:]]*/d[[:space:]]*$' /etc/waagent.conf
+grep -Eq '^[[:space:]]*ResourceDisk.EnableSwap[[:space:]]*=[[:space:]]*n[[:space:]]*$' /etc/waagent.conf
+grep -Eq '^[[:space:]]*DataDisk.Mount[[:space:]]*=[[:space:]]*y[[:space:]]*$' /etc/waagent.conf
+if mountpoint -q /d; then
+  test "$has_resource_disk" = true
+  findmnt -n -o FSTYPE /d | grep -Eq '^(ext4|xfs)$'
+  test -f /d/DATALOSS_WARNING_README.txt
+  while read -r swap_path _; do
+    test "$swap_path" = Filename && continue
+    case "$swap_path" in
+      /d|/d/*) exit 1 ;;
+    esac
+  done </proc/swaps
+else
+  test "$has_resource_disk" = false
+fi
+! mountpoint -q /mnt
+test -s /etc/machine-id
+test -s /etc/ssh/ssh_host_ed25519_key.pub
+test -s /home/vmiztest/.ssh/authorized_keys
+machine_id=$(cat /etc/machine-id)
+read -r _ host_key_fingerprint _ < <(
+  /usr/bin/ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256
+)
+read -r authorized_keys_sha256 _ < <(
+  sha256sum /home/vmiztest/.ssh/authorized_keys
+)
+read -r sentinel_sha256 _ < <(
+  sha256sum /var/lib/azagent/provisioned
+)
+printf '%s\n' \
+  "$machine_id" \
+  "$host_key_fingerprint" \
+  "$authorized_keys_sha256" \
+  "$sentinel_sha256"
+GUEST
+  )
+  test "${#core_identity[@]}" -eq 4
+  initial_machine_id=${core_identity[0]}
+  initial_host_key_fingerprint=${core_identity[1]}
+  initial_authorized_keys_sha256=${core_identity[2]}
+  initial_sentinel_sha256=${core_identity[3]}
+  [[ "$initial_machine_id" =~ ^[0-9a-f]{32}$ ]]
+  [[ "$initial_host_key_fingerprint" == SHA256:* ]]
+  [[ "$initial_authorized_keys_sha256" =~ ^[0-9a-f]{64}$ ]]
+  [[ "$initial_sentinel_sha256" =~ ^[0-9a-f]{64}$ ]]
+
+  initial_sshd_pid=$(read_core_sshd_pid)
+  [[ "$initial_sshd_pid" =~ ^[0-9]+$ ]]
+  ssh "${ssh_options[@]}" "$ssh_target" \
+    "sudo -n /usr/bin/kill -KILL '$initial_sshd_pid'" >/dev/null 2>&1 || true
+  wait_for_ssh
+  restarted_sshd_pid=$(read_core_sshd_pid)
+  [[ "$restarted_sshd_pid" =~ ^[0-9]+$ ]]
+  test "$restarted_sshd_pid" != "$initial_sshd_pid"
+  test "$(az vm extension list \
+    --resource-group "$resource_group" \
+    --vm-name "$vm_name" \
+    --query 'length(@)' \
+    --output tsv)" = 0
+else
+  ssh "${ssh_options[@]}" "$ssh_target" '/usr/bin/bash -s' <<'GUEST'
 set -euo pipefail
 sudo -n /usr/bin/test /proc/1/exe -ef /usr/lib/systemd/systemd
 test ! -e /sbin/vmizinit
@@ -874,6 +1029,7 @@ grep -Eq '^[[:space:]]*ResourceDisk.EnableSwap[[:space:]]*=[[:space:]]*n[[:space
 ! mountpoint -q /mnt
 test "$(systemctl --failed --no-legend --plain | wc -l)" -eq 0
 GUEST
+fi
 test "$(az vm get-instance-view \
   --resource-group "$resource_group" \
   --name "$vm_name" \
@@ -896,7 +1052,43 @@ az vm disk attach \
   --output json >/dev/null
 boot_id=$(ssh "${ssh_options[@]}" "$ssh_target" 'cat /proc/sys/kernel/random/boot_id')
 reboot_and_reconnect "$boot_id"
-ssh "${ssh_options[@]}" "$ssh_target" '/usr/bin/bash -s' <<'GUEST'
+if [[ "$FLAVOR" == core ]]; then
+  readarray -t rebooted_identity < <(
+    ssh "${ssh_options[@]}" "$ssh_target" '/usr/bin/bash -s' <<'GUEST'
+set -euo pipefail
+sudo -n /usr/bin/test /proc/1/exe -ef /sbin/vmizinit
+test -s /var/lib/azagent/provisioned
+test "$(cat /var/lib/azagent/provisioned)" = "$(cat /etc/hostname)"
+test -s /etc/machine-id
+test -s /etc/ssh/ssh_host_ed25519_key.pub
+test -s /home/vmiztest/.ssh/authorized_keys
+test ! -d /run/systemd/system
+machine_id=$(cat /etc/machine-id)
+read -r _ host_key_fingerprint _ < <(
+  /usr/bin/ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256
+)
+read -r authorized_keys_sha256 _ < <(
+  sha256sum /home/vmiztest/.ssh/authorized_keys
+)
+read -r sentinel_sha256 _ < <(
+  sha256sum /var/lib/azagent/provisioned
+)
+printf '%s\n' \
+  "$machine_id" \
+  "$host_key_fingerprint" \
+  "$authorized_keys_sha256" \
+  "$sentinel_sha256"
+GUEST
+  )
+  test "${#rebooted_identity[@]}" -eq 4
+  test "${rebooted_identity[0]}" = "$initial_machine_id"
+  test "${rebooted_identity[1]}" = "$initial_host_key_fingerprint"
+  test "${rebooted_identity[2]}" = "$initial_authorized_keys_sha256"
+  test "${rebooted_identity[3]}" = "$initial_sentinel_sha256"
+  rebooted_sshd_pid=$(read_core_sshd_pid)
+  [[ "$rebooted_sshd_pid" =~ ^[0-9]+$ ]]
+else
+  ssh "${ssh_options[@]}" "$ssh_target" '/usr/bin/bash -s' <<'GUEST'
 set -euo pipefail
 for unit in cloud-final.service walinuxagent.service ssh.service systemd-networkd.service; do
   systemctl is-active --quiet "$unit"
@@ -904,6 +1096,7 @@ done
 cloud-init status --long | grep -Eq '^status:[[:space:]]*done$'
 test "$(systemctl --failed --no-legend --plain | wc -l)" -eq 0
 GUEST
+fi
 test "$(az vm get-instance-view \
   --resource-group "$resource_group" \
   --name "$vm_name" \
@@ -912,7 +1105,7 @@ test "$(az vm get-instance-view \
 
 expected_data_disk_size=$((data_disk_size_gib * 1073741824))
 data_device=$(ssh "${ssh_options[@]}" "$ssh_target" \
-  "/usr/bin/bash -s -- '$expected_data_disk_size'" <<'GUEST'
+  "/usr/bin/bash -s -- '$expected_data_disk_size' '$FLAVOR'" <<'GUEST'
 set -Eeuo pipefail
 guest_error() {
   status=$1
@@ -922,6 +1115,7 @@ guest_error() {
 }
 trap 'guest_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 expected_size=$1
+flavor=$2
 root_source=$(readlink -f "$(findmnt -n -o SOURCE /)")
 root_disk=$(lsblk -n -o PKNAME "$root_source")
 found=
@@ -948,6 +1142,10 @@ if lsblk -nr -o TYPE "$found" | tail -n +2 | grep -q '^part$'; then
 fi
 first_sector=$(sudo -n dd if="$found" bs=512 count=1 status=none | od -An -tx1 | tr -d ' \n')
 test -n "$first_sector"
+if [[ "$flavor" == core ]]; then
+  test "${#first_sector}" -eq 1024
+  test -z "${first_sector//0/}"
+fi
 if findmnt -rn -S "$found" >/dev/null; then
   exit 1
 fi
@@ -966,6 +1164,10 @@ for _ in {1..6}; do
   sleep 5
 done
 if [[ -s "$boot_log" ]]; then
+  if [[ "$FLAVOR" == core ]]; then
+    grep -Fq '[vmizinit] VMIZINIT_PID1_READY supervisor loop active' "$boot_log"
+    grep -Fq '[vmizinit] azagent completed successfully' "$boot_log"
+  fi
   if [[ "$ARCHITECTURE" == aarch64 ]]; then
     grep -Fq 'ttyAMA0' "$boot_log"
   fi
@@ -988,9 +1190,16 @@ python3 "$RELEASE_SCHEMA" azure-result \
   --image-version-id "$image_version_id" \
   --uefi-request "$uefi_request" \
   --uefi-response "$uefi_response" \
+  --contracts "$azure_contract_list" \
   --run-id "$GITHUB_RUN_ID" \
   --run-attempt "$GITHUB_RUN_ATTEMPT" \
   --output "$RESULT_DIR/azure-result.json"
+python3 "$RELEASE_SCHEMA" verify-azure-result \
+  --manifest "$manifest" \
+  --asset "$asset" \
+  --result "$RESULT_DIR/azure-result.json" \
+  --key "$CANDIDATE_KEY" \
+  --source-commit "$SOURCE_COMMIT" >/dev/null
 test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
 
 {
@@ -1002,5 +1211,6 @@ test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
   echo "- UKI SHA-256: \`$fallback_uki_sha256\`"
   echo "- Signing certificate SHA-256: \`$certificate_sha256\`"
   echo "- Azure: \`$AZURE_LOCATION\` / \`$AZURE_VM_SIZE\`"
-  echo "- Contracts: Trusted Launch, Secure Boot, vTPM, UEFI db signer, signed UKI, lockdown, modules, key-only SSH, Ready, root growth, resource/data disks, reboot, runtime identity"
+  echo "- Flavor: \`$FLAVOR\`"
+  echo "- Contracts: \`$azure_contract_list\`"
 } >>"$GITHUB_STEP_SUMMARY"

@@ -157,11 +157,12 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         certificate_der: bytes = CERTIFICATE_DER,
         signing_certificate_sha256: str = SIGNING_CERTIFICATE_SHA256,
     ) -> None:
-        architecture, flavor, asset_name = release.EXPECTED[key]
+        architecture, flavor, asset_name = release.CANDIDATE_EXPECTED[key]
         candidate_dir = self.candidates / key
         candidate_dir.mkdir(parents=True)
         asset = candidate_dir / asset_name
         asset.write_bytes((key + "\n").encode())
+        virtual_size = 2 * release.AZURE_VHD_ALIGNMENT
         provenance = candidate_dir / "internal-provenance"
         provenance.mkdir()
         source_architecture = "amd64" if architecture == "x86_64" else "arm64"
@@ -187,8 +188,13 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         signature_path.write_bytes(b"detached signature")
 
         debz_transactions = []
-        for index, package in enumerate(release.DEBZ_PACKAGES):
-            lock_digest = str(7 + index) * 64
+        debz_packages = (
+            release.CORE_DEBZ_PACKAGES
+            if flavor == "core"
+            else release.FULL_DEBZ_PACKAGES
+        )
+        for index, package in enumerate(debz_packages):
+            lock_digest = format(7 + index, "x") * 64
             lock_path = (
                 provenance
                 / f"debz-exact-lock-{package}-{source_architecture}.json"
@@ -297,12 +303,31 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             "debz": {
                 "api_commit": release.DEBZ_API_COMMIT,
                 "baseline": {
-                    "source": "canonical-image-dpkg-status",
+                    "source": (
+                        "empty-debz-root"
+                        if flavor == "core"
+                        else "canonical-image-dpkg-status"
+                    ),
                     "enforcement": "exact-final-closure",
                 },
                 "transactions": debz_transactions,
             },
         }
+        if flavor == "core":
+            provenance_document.update(
+                {
+                    "flavor": "core",
+                    "virtual_size": virtual_size,
+                    "minimum_root_free_bytes": 1024 * 1024,
+                    "validated_root_free_bytes": 1024 * 1024,
+                }
+            )
+            provenance_document["artifacts"]["source_image"]["role"] = (
+                "signed-gpt-esp-substrate"
+            )
+            provenance_document["debz"]["package_roots"] = list(
+                release.CORE_PACKAGE_ROOTS
+            )
         (provenance / release.UBUNTU_PROVENANCE_FILENAME).write_text(
             json.dumps(provenance_document), encoding="utf-8"
         )
@@ -362,7 +387,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                 flavor=flavor,
                 asset=asset,
                 validated_sha256=digest,
-                virtual_size=2 * release.AZURE_VHD_ALIGNMENT,
+                virtual_size=virtual_size,
                 source_commit=self.source_commit,
                 provenance_dir=provenance,
                 runner=f"ubuntu-{architecture}",
@@ -375,7 +400,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         azure_dir = self.azure / key
         azure_dir.mkdir(parents=True)
         vhd = azure_dir / "temporary.vhd"
-        current_size = 2 * release.AZURE_VHD_ALIGNMENT
+        current_size = virtual_size
         with vhd.open("wb") as stream:
             stream.seek(current_size)
             stream.write(fixed_vhd_footer(current_size))
@@ -440,7 +465,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         release.azure_result_command(self.azure_result_args(key))
 
     def azure_result_args(self, key: str):
-        _, _, asset_name = release.EXPECTED[key]
+        _, flavor, asset_name = release.CANDIDATE_EXPECTED[key]
         candidate_dir = self.candidates / key
         azure_dir = self.azure / key
         return types.SimpleNamespace(
@@ -459,6 +484,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             ),
             uefi_request=azure_dir / "request.json",
             uefi_response=azure_dir / "response.json",
+            contracts=",".join(release.azure_contracts(flavor)),
             run_id="100",
             run_attempt="1",
             output=azure_dir / "azure-result.json",
@@ -533,6 +559,174 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             candidate["virtual_size"],
         )
         self.assertEqual(set(azure["contracts"]), release.AZURE_CONTRACTS)
+        self.assertEqual(
+            candidate["azure_contracts"],
+            list(release.azure_contracts("full")),
+        )
+
+    def test_core_candidate_and_result_bind_flavor_metadata_and_contracts(self):
+        key = "x86_64-core"
+        self.make_bundle(key)
+        candidate_dir = self.candidates / key
+        candidate = json.loads(
+            (candidate_dir / "candidate.json").read_text(encoding="utf-8")
+        )
+        result_path = self.azure / key / "azure-result.json"
+        azure = release.validate_azure_result(
+            candidate_dir / "candidate.json",
+            candidate_dir / candidate["asset_name"],
+            result_path,
+            key=key,
+            source_commit=self.source_commit,
+        )
+        self.assertEqual(candidate["flavor"], "core")
+        self.assertEqual(
+            candidate["asset_name"],
+            "Ubuntu-26.04-x86_64.core.qcow2",
+        )
+        self.assertEqual(
+            candidate["azure_contracts"],
+            list(release.azure_contracts("core")),
+        )
+        for field in (
+            "source_commit",
+            "architecture",
+            "flavor",
+            "asset_name",
+        ):
+            self.assertEqual(azure[field], candidate[field])
+        self.assertEqual(azure["qcow_sha256"], candidate["sha256"])
+        self.assertEqual(
+            azure["certificate_sha256"],
+            candidate["uki_signing"]["certificate_sha256"],
+        )
+        self.assertEqual(
+            azure["signing_certificate_sha256"],
+            candidate["uki_signing"]["signing_certificate_sha256"],
+        )
+        self.assertEqual(
+            azure["fallback_uki_sha256"],
+            candidate["uki_signing"]["fallback_uki_sha256"],
+        )
+        self.assertEqual(azure["contracts"], candidate["azure_contracts"])
+
+    def test_full_azure_contract_set_is_unchanged(self):
+        self.assertEqual(
+            release.FULL_AZURE_CONTRACTS,
+            {
+                "matching-architecture-gen2",
+                "trusted-launch",
+                "secure-boot",
+                "vtpm",
+                "uefi-db-signer",
+                "signed-uki",
+                "kernel-lockdown",
+                "module-signatures",
+                "key-only-ssh",
+                "cloud-init-provisioning",
+                "agent-ready",
+                "root-growth",
+                "managed-data-disk",
+                "reboot-reconnect",
+                "runtime-release-identity",
+            },
+        )
+        self.assertEqual(release.AZURE_CONTRACTS, release.FULL_AZURE_CONTRACTS)
+
+    def test_core_azure_contract_set_covers_appliance_acceptance(self):
+        self.assertEqual(
+            release.CORE_AZURE_CONTRACTS,
+            {
+                "matching-architecture-gen2",
+                "trusted-launch",
+                "secure-boot",
+                "vtpm",
+                "uefi-db-signer",
+                "signed-uki",
+                "kernel-lockdown",
+                "module-signatures",
+                "key-only-ssh",
+                "azagent-provisioning",
+                "agent-ready",
+                "vmizinit-pid1",
+                "pid1-supervised-sshd",
+                "sshd-restart-reconnect",
+                "identity-persistence",
+                "root-growth",
+                "resource-disk",
+                "managed-data-disk-mount-only",
+                "reboot-reconnect",
+                "runtime-release-identity",
+                "no-cloud-init",
+                "no-walinuxagent",
+                "no-systemd-service-manager",
+            },
+        )
+
+    def test_azure_result_rejects_contracts_not_bound_to_core_candidate(self):
+        key = "x86_64-core"
+        self.make_bundle(key)
+        result_path = self.azure / key / "azure-result.json"
+        self.rewrite(
+            result_path,
+            lambda value: value.__setitem__(
+                "contracts", list(release.azure_contracts("full"))
+            ),
+        )
+        candidate_dir = self.candidates / key
+        with self.assertRaises(SystemExit):
+            release.validate_azure_result(
+                candidate_dir / "candidate.json",
+                candidate_dir / release.CANDIDATE_EXPECTED[key][2],
+                result_path,
+                key=key,
+                source_commit=self.source_commit,
+            )
+
+    def test_core_azure_result_rejects_candidate_binding_changes(self):
+        key = "x86_64-core"
+        mutations = {
+            "source_commit": "b" * 40,
+            "architecture": "aarch64",
+            "asset_name": "Ubuntu-26.04-aarch64.core.qcow2",
+            "qcow_sha256": "0" * 64,
+            "certificate_sha256": "1" * 64,
+            "signing_certificate_sha256": "2" * 64,
+            "fallback_uki_sha256": "9" * 64,
+        }
+        for field, replacement in mutations.items():
+            with self.subTest(field=field):
+                shutil.rmtree(self.candidates / key, ignore_errors=True)
+                shutil.rmtree(self.azure / key, ignore_errors=True)
+                self.make_bundle(key)
+                result_path = self.azure / key / "azure-result.json"
+                self.rewrite(
+                    result_path,
+                    lambda value, field=field, replacement=replacement: (
+                        value.__setitem__(field, replacement)
+                    ),
+                )
+                candidate_dir = self.candidates / key
+                with self.assertRaises(SystemExit):
+                    release.validate_azure_result(
+                        candidate_dir / "candidate.json",
+                        candidate_dir / release.CANDIDATE_EXPECTED[key][2],
+                        result_path,
+                        key=key,
+                        source_commit=self.source_commit,
+                    )
+
+    def test_azure_result_command_rejects_noncanonical_contract_argument(self):
+        key = "x86_64-core"
+        self.make_bundle(key)
+        args = self.azure_result_args(key)
+        args.contracts = ",".join(release.azure_contracts("full"))
+        with self.assertRaises(SystemExit):
+            release.azure_result_command(args)
+
+    def test_azure_contracts_reject_unknown_flavor(self):
+        with self.assertRaises(SystemExit):
+            release.azure_contracts("minimal")
 
     def test_candidate_rejects_validation_digest_mismatch(self):
         key = "x86_64-full"
@@ -586,6 +780,14 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         (self.azure / "aarch64-full" / "azure-result.json").unlink()
         with self.assertRaises(SystemExit):
             self.stage()
+
+    def test_stage_does_not_expand_publication_to_core_assets(self):
+        self.make_all()
+        self.make_bundle("x86_64-core")
+        with self.assertRaises(SystemExit):
+            self.stage()
+        self.assertEqual(set(release.EXPECTED), {"x86_64-full", "aarch64-full"})
+        self.assertEqual(len(release.RELEASE_ORDER), 2)
 
     def test_stage_rejects_extra_qcow_and_checksum_sidecar(self):
         self.make_all()
@@ -730,6 +932,64 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         )
         with self.assertRaises(SystemExit):
             release.validate_ubuntu_provenance(root, "x86_64")
+
+    def test_core_ubuntu_provenance_matches_builder_contract(self):
+        key = "aarch64-core"
+        self.make_bundle(key)
+        root = self.candidates / key / "internal-provenance"
+        document = release.validate_ubuntu_provenance(
+            root,
+            "aarch64",
+            "core",
+            2 * release.AZURE_VHD_ALIGNMENT,
+        )
+        self.assertEqual(document["flavor"], "core")
+        self.assertEqual(
+            document["artifacts"]["source_image"]["role"],
+            "signed-gpt-esp-substrate",
+        )
+        self.assertEqual(
+            document["debz"]["package_roots"],
+            list(release.CORE_PACKAGE_ROOTS),
+        )
+        self.assertEqual(
+            [item["package"] for item in document["debz"]["transactions"]],
+            list(release.CORE_DEBZ_PACKAGES),
+        )
+
+    def test_core_ubuntu_provenance_rejects_contract_changes(self):
+        key = "x86_64-core"
+        mutations = (
+            lambda value: value.__setitem__("flavor", "full"),
+            lambda value: value["artifacts"]["source_image"].__setitem__(
+                "role", "root-filesystem"
+            ),
+            lambda value: value["debz"].__setitem__(
+                "package_roots", list(reversed(release.CORE_PACKAGE_ROOTS))
+            ),
+            lambda value: value["debz"]["baseline"].__setitem__(
+                "source", "canonical-image-dpkg-status"
+            ),
+            lambda value: value.__setitem__("validated_root_free_bytes", 0),
+            lambda value: value.__setitem__(
+                "virtual_size", 3 * release.AZURE_VHD_ALIGNMENT
+            ),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                shutil.rmtree(self.candidates / key, ignore_errors=True)
+                shutil.rmtree(self.azure / key, ignore_errors=True)
+                self.make_bundle(key)
+                root = self.candidates / key / "internal-provenance"
+                metadata = root / release.UBUNTU_PROVENANCE_FILENAME
+                self.rewrite(metadata, mutate)
+                with self.assertRaises(SystemExit):
+                    release.validate_ubuntu_provenance(
+                        root,
+                        "x86_64",
+                        "core",
+                        2 * release.AZURE_VHD_ALIGNMENT,
+                    )
 
     def make_bundle_after_reset(self, key: str) -> None:
         shutil.rmtree(self.candidates / key)
