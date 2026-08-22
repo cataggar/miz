@@ -398,6 +398,9 @@ const baremetal_initramfs_modules =
     "mii\n" ++
     "r8152\n";
 
+/// The one account a bare-metal image ships with.
+const baremetal_admin_user = "g";
+
 /// vmizinit's documented replacement for its default access provider.
 const baremetal_access_provider_path = "/usr/local/sbin/vmizinit-access";
 
@@ -438,19 +441,21 @@ const Args = struct {
     signing_command_arg: ?[]const u8 = null,
     uki_stub: ?[]const u8 = null,
     proxy: ?[]const u8 = null,
+    authorized_key: ?[]const u8 = null,
     preflight_only: bool = false,
 };
 
 const help =
-    \\Usage: zig build generalized-ubuntu2604 -Dubuntu2604-arch=<x86_64|aarch64> -Dubuntu2604-flavor=<full|core> -- [options]
-    \\  --flavor <full|core>                    image flavor (default full)
+    \\Usage: zig build generalized-ubuntu2604 -Dubuntu2604-arch=<x86_64|aarch64> -Dubuntu2604-flavor=<full|core|baremetal> -- [options]
+    \\  --flavor <full|core|baremetal>          image flavor (default full)
     \\  --source <path>                         verified local Canonical .img
     \\  --output <path>                         output QCOW2
     \\  --work-dir <path>                       persistent download/work cache
     \\  --provenance-dir <path>                 release provenance sidecars
-    \\  --size <size>                           virtual size (full 5G, core 3584M)
-    \\  --vmizinit <path>                       static guest PID 1 (core only)
-    \\  --azagent <path>                        static guest provisioning agent (core only)
+    \\  --size <size>                           virtual size (full 5G, core 3584M, baremetal 5G)
+    \\  --vmizinit <path>                       static guest PID 1 (core, baremetal)
+    \\  --azagent <path>                        static guest provisioning agent (core, baremetal)
+    \\  --authorized-key <path>                 administrator public key (baremetal only)
     \\  --proxy <url>                           reach the archive through this HTTP proxy
     \\  --uki-signing-certificate <path>        Secure Boot certificate
     \\  --uki-signing-certificate-sha256 <hex>  DER certificate SHA-256
@@ -675,6 +680,10 @@ fn parseArgs(argv: []const []const u8) !Args {
             // fails before the build downloads anything.
             _ = try artifact_pipeline.parseProxy(argv[i]);
             args.proxy = argv[i];
+        } else if (std.mem.eql(u8, arg, "--authorized-key")) {
+            i += 1;
+            if (i == argv.len) return error.MissingArgument;
+            args.authorized_key = argv[i];
         } else if (std.mem.eql(u8, arg, "--preflight-only")) {
             args.preflight_only = true;
         } else if (std.mem.eql(u8, arg, "--help")) {
@@ -685,7 +694,37 @@ fn parseArgs(argv: []const []const u8) !Args {
 
     if (!args.size_explicit) args.size = args.flavor.defaultSize();
     if (args.size < args.flavor.defaultSize()) return error.ImageTooSmall;
+    // The key is the only way into a bare-metal image, so a missing one is a
+    // build that produces an unreachable machine. It is equally an error to
+    // offer a key to a flavor that would refuse to bake it: silently ignoring
+    // it would leave the caller believing an image is reachable when it is not.
+    if (args.flavor == .baremetal and args.authorized_key == null)
+        return error.AuthorizedKeyRequired;
+    if (args.flavor != .baremetal and args.authorized_key != null)
+        return error.AuthorizedKeyNotSupported;
     return args;
+}
+
+/// Reads and sanity-checks an OpenSSH public key given on the command line.
+///
+/// The check is deliberately shallow -- one line, a known key type, no
+/// terminator hiding a second entry -- because its purpose is to catch the
+/// path being wrong (a private key, a whole `known_hosts`, an empty file), not
+/// to re-verify the key material.
+fn readAuthorizedKey(allocator: Allocator, io: Io, path: []const u8) ![]u8 {
+    const bytes = Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return error.AuthorizedKeyMissing,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidAuthorizedKey;
+    if (std.mem.indexOfAny(u8, trimmed, "\r\n") != null) return error.InvalidAuthorizedKey;
+    const accepted = [_][]const u8{ "ssh-ed25519 ", "ssh-rsa ", "ecdsa-sha2-nistp", "sk-ssh-ed25519@", "sk-ecdsa-sha2-nistp" };
+    for (&accepted) |prefix| {
+        if (std.mem.startsWith(u8, trimmed, prefix)) return allocator.dupe(u8, trimmed);
+    }
+    return error.InvalidAuthorizedKey;
 }
 
 fn signingConfig(args: Args) !uki_signing.Config {
@@ -2016,10 +2055,20 @@ fn requireRootPathAbsent(filesystem: *const vmiz.ext4_mountless.FileSystem, path
     return error.ForbiddenCorePath;
 }
 
+/// Walks the finished root for identity that must not be built into an image.
+///
+/// Host keys are rejected for every flavor: they must differ per machine, and
+/// an image that ships one hands every machine built from it the same
+/// identity. Authorized keys are rejected only where identity arrives at boot
+/// -- on Azure, from OVF media, which makes a baked key both unnecessary and a
+/// way for one to outlive the provisioning that was supposed to replace it.
+/// Bare metal has no such media and no agent to read it, so the administrator
+/// key has to be in the image; that is the whole difference.
 fn validateNoBakedIdentity(
     allocator: Allocator,
     filesystem: *const vmiz.ext4_mountless.FileSystem,
     directory: []const u8,
+    flavor: Flavor,
 ) !void {
     const entries = filesystem.list(allocator, directory, 100_000) catch |err| switch (err) {
         error.PathNotFound => return,
@@ -2028,9 +2077,10 @@ fn validateNoBakedIdentity(
     defer allocator.free(entries);
     for (entries) |entry| {
         const name = std.fs.path.basename(entry.path);
-        if (std.mem.eql(u8, name, "authorized_keys") or std.mem.startsWith(u8, name, "ssh_host_"))
+        if (std.mem.startsWith(u8, name, "ssh_host_")) return error.BakedIdentityState;
+        if (flavor.azure() and std.mem.eql(u8, name, "authorized_keys"))
             return error.BakedIdentityState;
-        if (entry.kind == .directory) try validateNoBakedIdentity(allocator, filesystem, entry.path);
+        if (entry.kind == .directory) try validateNoBakedIdentity(allocator, filesystem, entry.path, flavor);
     }
 }
 
@@ -2039,10 +2089,18 @@ fn validateCoreRoot(
     io: Io,
     filesystem: *const vmiz.ext4_mountless.FileSystem,
     profile: *const Profile,
+    flavor: Flavor,
     evidence: []const DebzEvidence,
 ) !void {
-    if (evidence.len != core_debz_packages.len) return error.InvalidDebzEvidence;
+    if (evidence.len != flavor.debzPackages().len) return error.InvalidDebzEvidence;
     for (&core_required_paths) |path| try requireRootPath(filesystem, path);
+    if (flavor == .baremetal) {
+        // Without this the machine boots and never becomes reachable: vmizinit
+        // would fall back to sshd, which waits for a provisioning sentinel that
+        // nothing on bare metal ever writes.
+        try requireRootPath(filesystem, baremetal_access_provider_path);
+        try requireRootPath(filesystem, "/etc/initramfs-tools/initramfs.conf");
+    }
     for (&core_forbidden_paths) |path| try requireRootPathAbsent(filesystem, path);
     const sbin = try filesystem.readLink(allocator, "/sbin", 1024);
     defer allocator.free(sbin);
@@ -2069,7 +2127,7 @@ fn validateCoreRoot(
         defer allocator.free(seed);
         if (seed.len != 0) return error.BakedIdentityState;
     }
-    try validateNoBakedIdentity(allocator, filesystem, "/");
+    try validateNoBakedIdentity(allocator, filesystem, "/", flavor);
 
     const ssh_config = try filesystem.read(allocator, "/etc/ssh/sshd_config.d/10-vmizinit.conf", 64 * 1024);
     defer allocator.free(ssh_config);
@@ -2161,6 +2219,7 @@ fn customizeRootWithDebz(
     vmizinit_path: ?[]const u8,
     azagent_path: ?[]const u8,
     proxy: ?[]const u8,
+    authorized_key: ?[]const u8,
 ) !DebzCustomization {
     const extraction = try std.fs.path.join(allocator, &.{ work_dir, "official-root" });
     defer allocator.free(extraction);
@@ -2412,6 +2471,19 @@ fn customizeRootWithDebz(
         }) |path| try removeIfPresent(&native_root.filesystem, path);
     }
     try native_root.filesystem.generalize(generalizationPolicy(flavor));
+    // After generalization, which is what removes accounts: an administrator
+    // created before it would be taken straight back out again.
+    if (authorized_key) |key| {
+        try native_root.filesystem.applyCustomization(.{
+            .users = &.{.{
+                .name = baremetal_admin_user,
+                .shell = "/bin/bash",
+                .password = .locked,
+                .ssh_authorized_keys = &.{key},
+                .passwordless_sudo = true,
+            }},
+        }, 0);
+    }
     if (flavor.freshRoot()) {
         const vmizinit = vmizinit_path orelse return error.CoreGuestArtifactsRequired;
         const azagent = azagent_path orelse return error.CoreGuestArtifactsRequired;
@@ -2429,6 +2501,7 @@ fn customizeRootWithDebz(
             io,
             &native_root.filesystem,
             profile,
+            flavor,
             evidence[0..evidence_count],
         );
     }
@@ -2985,6 +3058,11 @@ pub fn main(init: std.process.Init) !void {
             },
         );
     }
+    const authorized_key: ?[]u8 = if (args.authorized_key) |path|
+        try readAuthorizedKey(allocator, io, path)
+    else
+        null;
+    defer if (authorized_key) |key| allocator.free(key);
     var debz_customization = try customizeRootWithDebz(
         allocator,
         io,
@@ -2996,6 +3074,7 @@ pub fn main(init: std.process.Init) !void {
         args.vmizinit,
         args.azagent,
         args.proxy,
+        authorized_key,
     );
     defer debz_customization.deinit(allocator);
 
@@ -3091,6 +3170,7 @@ pub fn main(init: std.process.Init) !void {
         io,
         &final_root.filesystem,
         profile,
+        args.flavor,
         debz_customization.evidence[0..debz_customization.evidence_count],
     );
     if (try peMachine(signed.bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
@@ -3676,6 +3756,95 @@ test "flavor defaults preserve full names and isolate core outputs" {
         ".scratch/ubuntu2604-aarch64-core",
         profileFor(.aarch64).workDirFor(.core),
     );
+}
+
+test "bare metal is named apart from core and requires exactly one administrator key" {
+    // A key is the only way into a bare-metal image. Building one without a key
+    // produces a machine nobody can reach; offering a key to a flavor that
+    // refuses to bake it would let the caller believe otherwise.
+    const baremetal_args = try parseArgs(&.{ "--flavor", "baremetal", "--authorized-key", "id_ed25519.pub" });
+    try std.testing.expectEqual(Flavor.baremetal, baremetal_args.flavor);
+    try std.testing.expectEqual(baremetal_virtual_size, baremetal_args.size);
+    try std.testing.expectError(
+        error.AuthorizedKeyRequired,
+        parseArgs(&.{ "--flavor", "baremetal" }),
+    );
+    try std.testing.expectError(
+        error.AuthorizedKeyNotSupported,
+        parseArgs(&.{ "--flavor", "core", "--authorized-key", "id_ed25519.pub" }),
+    );
+    try std.testing.expectError(
+        error.AuthorizedKeyNotSupported,
+        parseArgs(&.{ "--authorized-key", "id_ed25519.pub" }),
+    );
+
+    // The bare-metal artifact never shares a name or a scratch directory with
+    // core: they differ by kernel, and a stale one of either would be
+    // indistinguishable from a fresh build of the other.
+    try std.testing.expectEqualStrings(
+        "Ubuntu-26.04-aarch64.baremetal.qcow2",
+        profileFor(.aarch64).outputFor(.baremetal),
+    );
+    try std.testing.expectEqualStrings(
+        ".scratch/ubuntu2604-aarch64-baremetal",
+        profileFor(.aarch64).workDirFor(.baremetal),
+    );
+
+    // The flavor's structural claims, stated once so a later edit cannot
+    // quietly reverse them.
+    try std.testing.expect(Flavor.baremetal.freshRoot());
+    try std.testing.expect(!Flavor.baremetal.azure());
+    try std.testing.expect(Flavor.core.azure());
+    try std.testing.expectEqualStrings(nvidia_bos_kernel_suffix, Flavor.baremetal.kernelSuffix());
+    try std.testing.expectEqualStrings(azure_kernel_suffix, Flavor.core.kernelSuffix());
+}
+
+test "an administrator key is read only when it is one public key" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const dir_path = try std.fs.path.join(allocator, &.{ cwd, ".scratch/ubuntu-authorized-key" });
+    defer allocator.free(dir_path);
+    Io.Dir.cwd().deleteTree(io, dir_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_path);
+
+    const write = struct {
+        fn file(a: Allocator, i: Io, directory: []const u8, name: []const u8, contents: []const u8) ![]u8 {
+            const path = try std.fs.path.join(a, &.{ directory, name });
+            try Io.Dir.cwd().writeFile(i, .{ .sub_path = path, .data = contents });
+            return path;
+        }
+    };
+
+    const good = try write.file(allocator, io, dir_path, "id.pub", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA g@example\n");
+    defer allocator.free(good);
+    const key = try readAuthorizedKey(allocator, io, good);
+    defer allocator.free(key);
+    // Read back without the trailing newline, so the caller can place it in a
+    // file whose format it controls rather than inheriting whatever the source
+    // file happened to end with.
+    try std.testing.expectEqualStrings("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA g@example", key);
+
+    // A private key is the mistake worth catching: the paths differ by four
+    // characters and the consequence of baking the wrong one is severe.
+    const private = try write.file(allocator, io, dir_path, "id", "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbn\n-----END OPENSSH PRIVATE KEY-----\n");
+    defer allocator.free(private);
+    try std.testing.expectError(error.InvalidAuthorizedKey, readAuthorizedKey(allocator, io, private));
+
+    // Two keys in one file would silently authorize a second party.
+    const two = try write.file(allocator, io, dir_path, "two.pub", "ssh-ed25519 AAAA a@b\nssh-ed25519 BBBB c@d\n");
+    defer allocator.free(two);
+    try std.testing.expectError(error.InvalidAuthorizedKey, readAuthorizedKey(allocator, io, two));
+
+    const empty = try write.file(allocator, io, dir_path, "empty.pub", "\n");
+    defer allocator.free(empty);
+    try std.testing.expectError(error.InvalidAuthorizedKey, readAuthorizedKey(allocator, io, empty));
+
+    const missing = try std.fs.path.join(allocator, &.{ dir_path, "absent.pub" });
+    defer allocator.free(missing);
+    try std.testing.expectError(error.AuthorizedKeyMissing, readAuthorizedKey(allocator, io, missing));
 }
 
 test "UKI signing configuration supports local and external modes exclusively" {
