@@ -145,6 +145,8 @@ runs `azagent --skip-ready` for native-QEMU acceptance. Provisioned identity,
 authorized keys, host keys, and the sentinel must persist across reboot;
 separate instances must not inherit them from the candidate.
 
+`--proxy <url>` reaches the Canonical cloud image and the Ubuntu archive through an HTTP proxy, for a build host with no direct egress. It is named explicitly rather than read from `http_proxy` or `https_proxy`, so a build's egress path is a stated input like every other one and cannot change because of an ambient variable, and it is rejected before anything is downloaded if it is malformed. A proxy carrying a credential is refused, because the credential would have to travel in an argument or an environment variable to get here; debz refuses those on the same grounds. TLS is unaffected: the proxy is asked to `CONNECT`, the session is negotiated end to end with the origin, and the pinned digests and archive signatures still verify the bytes that origin served. The same value is passed to debz, so package download takes the same path the image download does.
+
 ## Local build
 
 Use Zig 0.16.0 or later on a matching native Ubuntu host. Install the same
