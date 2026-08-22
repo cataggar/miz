@@ -19,6 +19,11 @@ const Ubuntu2604Architecture = enum {
     aarch64,
 };
 
+const Ubuntu2604Flavor = enum {
+    core,
+    full,
+};
+
 pub const ImageFormat = image_build.Format;
 pub const ImageGeneration = image_build.Generation;
 pub const ImageBootMode = image_build.BootMode;
@@ -77,8 +82,13 @@ pub fn build(b: *std.Build) void {
     const ubuntu2604_architecture = b.option(
         Ubuntu2604Architecture,
         "ubuntu2604-arch",
-        "Ubuntu 26.04 server guest architecture: x86_64 (default) or aarch64",
+        "Ubuntu 26.04 guest architecture: x86_64 (default) or aarch64",
     ) orelse .x86_64;
+    const ubuntu2604_flavor = b.option(
+        Ubuntu2604Flavor,
+        "ubuntu2604-flavor",
+        "Ubuntu 26.04 guest flavor: full (default, cloud-init/systemd) or core (vmizinit/azagent)",
+    ) orelse .full;
     const bzip2z = b.dependency("bzip2z", .{
         .target = target,
         .optimize = optimize,
@@ -1137,13 +1147,18 @@ pub fn build(b: *std.Build) void {
         azurelinux_acceptance_step.dependOn(&run_azurelinux_acceptance_tests.step);
 
         // Opt-in native-QEMU acceptance for exactly one finalized Ubuntu
-        // 26.04 server candidate. The runtime image and signing identity are
-        // supplied by the release workflow.
+        // 26.04 full or core candidate. The runtime image and signing identity
+        // are supplied externally.
         const ubuntu2604_acceptance_options = b.addOptions();
         ubuntu2604_acceptance_options.addOption(
             []const u8,
             "ubuntu2604_architecture",
             @tagName(ubuntu2604_architecture),
+        );
+        ubuntu2604_acceptance_options.addOption(
+            []const u8,
+            "ubuntu2604_flavor",
+            @tagName(ubuntu2604_flavor),
         );
         const ubuntu2604_acceptance_tests = b.addTest(.{
             .root_module = b.createModule(.{
@@ -1163,7 +1178,7 @@ pub fn build(b: *std.Build) void {
         );
         const ubuntu2604_acceptance_step = b.step(
             "test-ubuntu2604-acceptance",
-            "Run native-QEMU acceptance for one finalized Ubuntu 26.04 server QCOW2",
+            "Run native-QEMU acceptance for one finalized Ubuntu 26.04 full or core QCOW2",
         );
         ubuntu2604_acceptance_step.dependOn(&run_ubuntu2604_acceptance_tests.step);
 
