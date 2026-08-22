@@ -950,10 +950,15 @@ test -s /etc/machine-id
 test -s /etc/ssh/ssh_host_ed25519_key.pub
 test -s /home/vmiztest/.ssh/authorized_keys
 machine_id=$(cat /etc/machine-id)
-set -- $(/usr/bin/ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256)
-host_key_fingerprint=$2
-authorized_keys_sha256=$(sha256sum /home/vmiztest/.ssh/authorized_keys | awk '{print $1}')
-sentinel_sha256=$(sha256sum /var/lib/azagent/provisioned | awk '{print $1}')
+read -r _ host_key_fingerprint _ < <(
+  /usr/bin/ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256
+)
+read -r authorized_keys_sha256 _ < <(
+  sha256sum /home/vmiztest/.ssh/authorized_keys
+)
+read -r sentinel_sha256 _ < <(
+  sha256sum /var/lib/azagent/provisioned
+)
 printf '%s\n' \
   "$machine_id" \
   "$host_key_fingerprint" \
@@ -1042,10 +1047,15 @@ test -s /etc/ssh/ssh_host_ed25519_key.pub
 test -s /home/vmiztest/.ssh/authorized_keys
 test ! -d /run/systemd/system
 machine_id=$(cat /etc/machine-id)
-set -- $(/usr/bin/ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256)
-host_key_fingerprint=$2
-authorized_keys_sha256=$(sha256sum /home/vmiztest/.ssh/authorized_keys | awk '{print $1}')
-sentinel_sha256=$(sha256sum /var/lib/azagent/provisioned | awk '{print $1}')
+read -r _ host_key_fingerprint _ < <(
+  /usr/bin/ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256
+)
+read -r authorized_keys_sha256 _ < <(
+  sha256sum /home/vmiztest/.ssh/authorized_keys
+)
+read -r sentinel_sha256 _ < <(
+  sha256sum /var/lib/azagent/provisioned
+)
 printf '%s\n' \
   "$machine_id" \
   "$host_key_fingerprint" \
