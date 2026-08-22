@@ -66,6 +66,65 @@ test {
     std.testing.refAllDecls(iso_build);
 }
 
+const Ubuntu2604CoreArtifacts = struct {
+    vmizinit: *std.Build.Step.Compile,
+    azagent: *std.Build.Step.Compile,
+};
+
+fn addUbuntu2604CoreArtifacts(
+    b: *std.Build,
+    architecture: Ubuntu2604Architecture,
+) Ubuntu2604CoreArtifacts {
+    const guest_target = b.resolveTargetQuery(.{
+        .cpu_arch = switch (architecture) {
+            .x86_64 => .x86_64,
+            .aarch64 => .aarch64,
+        },
+        .os_tag = .linux,
+    });
+    const cdrom_mod = b.createModule(.{
+        .root_source_file = b.path("azagent/cdrom.zig"),
+        .target = guest_target,
+        .optimize = .ReleaseSmall,
+    });
+    const vmizinit = b.addExecutable(.{
+        .name = b.fmt("ubuntu2604-vmizinit-{s}", .{@tagName(architecture)}),
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("vmizinit/init.zig"),
+            .target = guest_target,
+            .optimize = .ReleaseSmall,
+            .imports = &.{
+                .{ .name = "provisioning_media", .module = cdrom_mod },
+            },
+        }),
+        .linkage = .static,
+    });
+    const vmiz_guest_mod = b.createModule(.{
+        .root_source_file = b.path("packages/vmiz/src/root.zig"),
+        .target = guest_target,
+        .optimize = .ReleaseSmall,
+    });
+    const wireserver_guest_mod = b.createModule(.{
+        .root_source_file = b.path("wireserver/wireserver.zig"),
+        .target = guest_target,
+        .optimize = .ReleaseSmall,
+    });
+    const azagent = b.addExecutable(.{
+        .name = b.fmt("ubuntu2604-azagent-{s}", .{@tagName(architecture)}),
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("azagent/main.zig"),
+            .target = guest_target,
+            .optimize = .ReleaseSmall,
+            .imports = &.{
+                .{ .name = "wireserver", .module = wireserver_guest_mod },
+                .{ .name = "vmiz", .module = vmiz_guest_mod },
+            },
+        }),
+        .linkage = .static,
+    });
+    return .{ .vmizinit = vmizinit, .azagent = azagent };
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -1066,12 +1125,28 @@ pub fn build(b: *std.Build) void {
             .root_module = ubuntu2604_builder_mod,
         });
         b.installArtifact(ubuntu2604_builder_exe);
+        const ubuntu2604_core_x86_64 = if (ubuntu2604_flavor == .core)
+            addUbuntu2604CoreArtifacts(b, .x86_64)
+        else
+            null;
+        const ubuntu2604_core_aarch64 = if (ubuntu2604_flavor == .core)
+            addUbuntu2604CoreArtifacts(b, .aarch64)
+        else
+            null;
+        const selected_ubuntu2604_core = switch (ubuntu2604_architecture) {
+            .x86_64 => ubuntu2604_core_x86_64,
+            .aarch64 => ubuntu2604_core_aarch64,
+        };
 
         const ubuntu2604_check = b.step(
             "check-generalized-ubuntu2604",
-            "Compile the Ubuntu 26.04 builder for both guest architecture profiles",
+            "Compile the Ubuntu 26.04 builder and selected core guest artifacts",
         );
         ubuntu2604_check.dependOn(&ubuntu2604_builder_exe.step);
+        if (selected_ubuntu2604_core) |artifacts| {
+            ubuntu2604_check.dependOn(&artifacts.vmizinit.step);
+            ubuntu2604_check.dependOn(&artifacts.azagent.step);
+        }
 
         const ubuntu2604_tests = b.addTest(.{
             .root_module = ubuntu2604_builder_mod,
@@ -1086,7 +1161,16 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(ubuntu2604_check);
 
         const run_ubuntu2604 = b.addRunArtifact(ubuntu2604_builder_exe);
-        run_ubuntu2604.addArgs(&.{ "--architecture", @tagName(ubuntu2604_architecture) });
+        run_ubuntu2604.addArgs(&.{
+            "--architecture", @tagName(ubuntu2604_architecture),
+            "--flavor",       @tagName(ubuntu2604_flavor),
+        });
+        if (selected_ubuntu2604_core) |artifacts| {
+            run_ubuntu2604.addArg("--vmizinit");
+            run_ubuntu2604.addArtifactArg(artifacts.vmizinit);
+            run_ubuntu2604.addArg("--azagent");
+            run_ubuntu2604.addArtifactArg(artifacts.azagent);
+        }
         if (b.args) |args| run_ubuntu2604.addArgs(args);
         const ubuntu2604_step = b.step(
             "generalized-ubuntu2604",
@@ -1096,7 +1180,20 @@ pub fn build(b: *std.Build) void {
 
         inline for (.{ Ubuntu2604Architecture.x86_64, Ubuntu2604Architecture.aarch64 }) |architecture| {
             const run_arch = b.addRunArtifact(ubuntu2604_builder_exe);
-            run_arch.addArgs(&.{ "--architecture", @tagName(architecture) });
+            run_arch.addArgs(&.{
+                "--architecture", @tagName(architecture),
+                "--flavor",       @tagName(ubuntu2604_flavor),
+            });
+            const core_artifacts = switch (architecture) {
+                .x86_64 => ubuntu2604_core_x86_64,
+                .aarch64 => ubuntu2604_core_aarch64,
+            };
+            if (core_artifacts) |artifacts| {
+                run_arch.addArg("--vmizinit");
+                run_arch.addArtifactArg(artifacts.vmizinit);
+                run_arch.addArg("--azagent");
+                run_arch.addArtifactArg(artifacts.azagent);
+            }
             if (b.args) |args| run_arch.addArgs(args);
             const step_name = switch (architecture) {
                 .x86_64 => "generalized-ubuntu2604-amd64",
