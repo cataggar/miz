@@ -154,14 +154,13 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         # normalized with a targeted chown in the build step instead.
         self.assertNotIn("chmod", cleanup)
 
-    def test_release_identifier_is_the_next_immutable_tag(self) -> None:
-        # The workflow targets a single immutable release identifier across the
-        # concurrency group, tag, and title. Advancing it must be atomic and the
-        # superseded identifier must not linger anywhere in the workflow.
-        self.assertIn("group: ubuntu2604-release-20260828", self.source)
-        self.assertIn("RELEASE_TAG: Ubuntu-26.04-20260828", self.source)
-        self.assertIn("RELEASE_TITLE: Ubuntu Server 26.04 - 20260828", self.source)
-        self.assertNotIn("20260827", self.source)
+    def test_release_identifier_uses_the_current_date(self) -> None:
+        # The concurrency group, tag, and title use the same calendar date.
+        # The release tag may be retargeted before dispatch.
+        self.assertIn("group: ubuntu2604-release-20260822", self.source)
+        self.assertIn("RELEASE_TAG: Ubuntu-26.04-20260822", self.source)
+        self.assertIn("RELEASE_TITLE: Ubuntu Server 26.04 - 20260822", self.source)
+        self.assertIn("create or retarget RELEASE_TAG", self.source)
 
     def test_forbidden_tools_are_confined_to_optional_oracle_jobs(self) -> None:
         jobs = list(re.finditer(r"(?m)^  ([a-z][a-z0-9_]*):\n", self.source))

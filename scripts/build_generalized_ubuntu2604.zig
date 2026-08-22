@@ -3502,6 +3502,67 @@ test "UKI signing configuration supports local and external modes exclusively" {
     }));
 }
 
+fn makeMinimalSignablePe(allocator: Allocator) ![]u8 {
+    // Smallest PE32+ shape the native Authenticode signer accepts: an MZ/PE
+    // header with a PE32+ optional header whose data-directory count reaches the
+    // security (certificate) directory the signature is embedded into.
+    const image = try allocator.alloc(u8, 512);
+    @memset(image, 0);
+    image[0] = 'M';
+    image[1] = 'Z';
+    std.mem.writeInt(u32, image[0x3c..][0..4], 0x80, .little);
+    @memcpy(image[0x80..0x84], "PE\x00\x00");
+    std.mem.writeInt(u16, image[0x84..][0..2], 0x8664, .little);
+    std.mem.writeInt(u16, image[0x94..][0..2], 0xf0, .little);
+    std.mem.writeInt(u16, image[0x98..][0..2], 0x20b, .little);
+    std.mem.writeInt(u32, image[0x104..][0..4], 5, .little);
+    return image;
+}
+
+test "committed local UKI signing fixtures load and sign against the enrolled certificate" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // The safe, public, test-only signing identity the local end-to-end driver
+    // (scripts/ubuntu2604_local_e2e.sh) and its documentation pin. Guarding the
+    // committed PEM fixtures here keeps the local release gate reproducible: a
+    // silent fixture swap, a corrupted key, or a key/certificate mismatch all
+    // fail in `zig build test-generalized-ubuntu2604`, before any 5 GiB build.
+    var certificate = try vmiz.uki_signing.loadCertificateAlloc(allocator, io, .{
+        .host_path = "tests/fixtures/ubuntu2604-local-signing/signing-cert.pem",
+    });
+    defer certificate.deinit(allocator);
+    const expected = try uki_signing.parseFingerprint(
+        "74556e6a0b540eb0ed5a49d9e75a003987447699df59f1d68456548c47dc8009",
+    );
+    try std.testing.expectEqual(expected, certificate.sha256);
+
+    const key_pem = try Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/ubuntu2604-local-signing/signing-key.pem",
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(key_pem);
+    const key_der = try vmiz.authenticode.decodePrivateKeyPemAlloc(allocator, key_pem);
+    defer allocator.free(key_der);
+
+    // Exercise the exact native local-key path the builder uses: sign a minimal
+    // PE with the fixture key and re-derive the signer from the bytes. A key
+    // that does not belong to the enrolled certificate cannot verify here.
+    const image = try makeMinimalSignablePe(allocator);
+    defer allocator.free(image);
+    const signed = try vmiz.authenticode.signPeRsaSha256Alloc(
+        allocator,
+        image,
+        key_der,
+        certificate.der,
+    );
+    defer allocator.free(signed);
+    const signer = try vmiz.authenticode.verifyRsaSha256(signed);
+    try std.testing.expectEqualSlices(u8, certificate.der, signer.certificate_der);
+}
+
 test "signed source manifest contract rejects missing packages and foreign architecture" {
     const good =
         "cloud-init\t1\ncloud-guest-utils\t1\nopenssh-server\t1\nsudo\t1\nsystemd\t1\nnetplan.io\t1\nlibc6:amd64\t1\n";

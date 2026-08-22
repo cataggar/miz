@@ -11,7 +11,7 @@ const Dir = Io.Dir;
 pub const api_version: u32 = 4;
 pub const request_schema = "io.github.cataggar.vmiz.package-family.request.v4";
 pub const result_schema = "io.github.cataggar.vmiz.package-family.result.v4";
-pub const debz_api_commit = "9cabfc0f808a8beb4709d7e5b3ae7baf19d733d5";
+pub const debz_api_commit = "beac3f20dd93fd98863af71e8fe621d47db663f6";
 pub const rpmz_api_commit = "15b5e1291a9fc3eb3980a4088d757b9d0254d468";
 pub const rpm_lock_schema = "io.github.cataggar.vmiz.rpm-lock.v1";
 pub const rpm_provenance_schema = "io.github.cataggar.vmiz.rpm-provenance.v1";
@@ -187,7 +187,14 @@ pub fn execute(
     if (!compatible(backends.debian.capabilities))
         return failed(.incompatible_backend, "incompatible debz package-family capability schema", .disposable, null);
 
-    const backend_result = executeDebz(allocator, io, backends.debian, request) catch {
+    // Own every debz-side allocation in a scoped arena so the returned result
+    // (diagnostic message, provenance path, product items) is released on all
+    // exits without the embedder guessing whether each field is heap or literal.
+    // The one field that must outlive the arena, `provenance_path`, is duplicated
+    // into `allocator` at the success return below.
+    var debz_arena = std.heap.ArenaAllocator.init(allocator);
+    defer debz_arena.deinit();
+    const backend_result = executeDebz(debz_arena.allocator(), io, backends.debian, request) catch {
         return failed(
             .backend_unavailable,
             "embedded debz backend could not execute",
@@ -273,7 +280,7 @@ pub fn execute(
         .succeeded = true,
         .published = publishes(request.operation),
         .lock_path = lock_path,
-        .provenance_path = provenance_path,
+        .provenance_path = if (provenance_path) |path| try allocator.dupe(u8, path) else null,
     };
 }
 
@@ -640,6 +647,11 @@ const FakeProduct = struct {
     seen_operation: ?debz.ProductOperation = null,
     seen_packages: usize = 0,
     fail_status: ?debz.ProductExitStatus = null,
+    // When set, the failure summary is allocated with the caller's allocator,
+    // faithfully reproducing the real debz backend whose describeExecutorFailure
+    // heap-allocates the diagnostic message. Exercises the embedder's ownership
+    // of that escaping message (regression for the production customize leak).
+    heap_message: bool = false,
 
     fn interface(self: *FakeProduct) debz.ProductBackend {
         return .{ .context = self, .executeFn = executeProduct };
@@ -647,14 +659,23 @@ const FakeProduct = struct {
 
     fn executeProduct(
         context: *anyopaque,
-        _: Allocator,
+        allocator: Allocator,
         request: debz.ProductRequest,
     ) !debz.ProductResult {
         const self: *FakeProduct = @ptrCast(@alignCast(context));
         self.seen_operation = request.operation;
         self.seen_packages = request.packages.len;
-        if (self.fail_status) |status|
-            return debz.product_api.failure(request.operation, status, .transaction_failed, "credential=https://secret@example.invalid");
+        if (self.fail_status) |status| {
+            const message = if (self.heap_message)
+                try std.fmt.allocPrint(
+                    allocator,
+                    "backend stage failed: FileNotFound opening credential=https://secret@example.invalid state lock",
+                    .{},
+                )
+            else
+                "credential=https://secret@example.invalid";
+            return debz.product_api.failure(request.operation, status, .transaction_failed, message);
+        }
         if (request.options.lock_output_path orelse request.options.lock_input_path) |path| {
             if (request.options.lock_output_path != null)
                 try writeTestLock(self.io, path, request.options.architecture);
@@ -980,6 +1001,169 @@ test "backend diagnostics redact credentials and preserve recoverable stage" {
     try std.testing.expectEqual(FailureDisposition.recoverable, result.diagnostic.?.disposition);
     try std.testing.expect(std.mem.indexOf(u8, result.diagnostic.?.message, "secret") == null);
     _ = try Dir.cwd().statFile(io, paths.stage, .{});
+}
+
+test "customize failure reports exit 7 and frees the escaping debz diagnostic for both architectures" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    // Reproduces the production aarch64 customize failure (backend_failed / exit 7)
+    // for both request shapes. The fake backend heap-allocates its diagnostic
+    // summary exactly as the real debz backend does; running on the leak-checking
+    // testing allocator asserts the embedder owns and frees that escaping message.
+    for ([_]Architecture{ .arm64, .amd64 }) |architecture| {
+        const paths = try fixturePaths(allocator, io, @tagName(architecture));
+        defer allocator.free(paths.stage);
+        defer allocator.free(paths.output);
+        defer allocator.free(paths.state);
+        defer allocator.free(paths.lock);
+        defer Dir.cwd().deleteTree(io, paths.stage) catch {};
+        defer Dir.cwd().deleteTree(io, paths.output) catch {};
+        defer Dir.cwd().deleteTree(io, paths.state) catch {};
+        try Dir.cwd().createDir(io, paths.stage, .default_dir);
+        try Dir.cwd().createDir(io, paths.state, .default_dir);
+        var fake: FakeProduct = .{
+            .io = io,
+            .state_path = paths.state,
+            .lock_path = paths.lock,
+            .fail_status = .transaction,
+            .heap_message = true,
+        };
+        const result = try execute(allocator, io, .{
+            .debian = .{ .product_executor = fake.interface() },
+        }, .{
+            .family = .debian,
+            .distribution = .ubuntu_26_04,
+            .operation = .customize,
+            .packages = &.{"ubuntu-minimal"},
+            .inputs = .{
+                .root_stage = paths.stage,
+                .published_root = paths.output,
+                .architecture = architecture,
+                .source_paths = &.{"/inputs/ubuntu.sources"},
+                .keyring_paths = &.{"/inputs/ubuntu.gpg"},
+                .cache_path = "/cache/debz",
+                .state_path = paths.state,
+                .lock_input_path = paths.lock,
+                .credential_reference = "/run/credentials/debz",
+            },
+        });
+        try std.testing.expect(!result.succeeded);
+        try std.testing.expect(!result.published);
+        try std.testing.expectEqual(DiagnosticId.backend_failed, result.diagnostic.?.id);
+        try std.testing.expectEqual(@as(?u8, 7), result.diagnostic.?.backend_exit_status);
+        try std.testing.expectEqual(FailureDisposition.recoverable, result.diagnostic.?.disposition);
+        try std.testing.expect(std.mem.indexOf(u8, result.diagnostic.?.message, "secret") == null);
+        // A recoverable customize failure preserves the staged root for retry.
+        _ = try Dir.cwd().statFile(io, paths.stage, .{});
+    }
+}
+
+test "arm64 resolve then customize completes the exact-lock handoff without leaking" {
+    // Deterministic, offline arm64 equivalent of the production resolve->customize
+    // transition that failed at customize time (issue #455). A full arm64 image
+    // build is not reproducible on an x86_64 host (no aarch64 systemd-boot stub),
+    // so this drives the exact package-family boundary the builder drives, with
+    // arm64 request/lock/cache/root/state paths, across BOTH operations. The real
+    // debz lock-root provisioning (creating the absent var/lib/debz) is proven
+    // end to end by debz's production_backend_customize_test.zig; here the aim is
+    // vmiz's orchestration: resolve emits the exact lock, customize consumes that
+    // same lock, publication and provenance succeed, and nothing leaks.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const paths = try fixturePaths(allocator, io, "arm64-handoff");
+    defer allocator.free(paths.stage);
+    defer allocator.free(paths.output);
+    defer allocator.free(paths.state);
+    defer allocator.free(paths.lock);
+    defer Dir.cwd().deleteTree(io, paths.stage) catch {};
+    defer Dir.cwd().deleteTree(io, paths.output) catch {};
+    defer Dir.cwd().deleteTree(io, paths.state) catch {};
+    defer Dir.cwd().deleteFile(io, paths.lock) catch {};
+
+    // Stage the exact shape of an authenticated official Ubuntu arm64 root: it
+    // ships var/lib/dpkg but never var/lib/debz. That absence is what made the
+    // production transaction lock open into a missing parent and surface a bare
+    // FileNotFound the first time customize ran after resolve.
+    try Dir.cwd().createDir(io, paths.stage, .default_dir);
+    const dpkg_dir = try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg", .{paths.stage});
+    defer allocator.free(dpkg_dir);
+    try Dir.cwd().createDirPath(io, dpkg_dir);
+    try Dir.cwd().createDir(io, paths.state, .default_dir);
+    const debz_dir = try std.fmt.allocPrint(allocator, "{s}/var/lib/debz", .{paths.stage});
+    defer allocator.free(debz_dir);
+    try std.testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, debz_dir, .{}));
+
+    const config = [_][]const u8{"/inputs/ubuntu-snapshot.json"};
+    const keyring = [_][]const u8{"/inputs/ubuntu.gpg"};
+    const cache = "/cache/debz-arm64";
+
+    // --- resolve: the exact lock is written for the arm64 target ---
+    var resolver: FakeProduct = .{ .io = io, .state_path = paths.state, .lock_path = paths.lock };
+    const resolved = try execute(allocator, io, .{
+        .debian = .{ .product_executor = resolver.interface() },
+    }, .{
+        .family = .debian,
+        .distribution = .ubuntu_26_04,
+        .operation = .resolve_lock,
+        .packages = &.{"linux-azure"},
+        .inputs = .{
+            .root_stage = paths.stage,
+            .published_root = paths.output,
+            .architecture = .arm64,
+            .source_paths = &.{},
+            .config_paths = &config,
+            .keyring_paths = &keyring,
+            .cache_path = cache,
+            .state_path = paths.state,
+            .lock_output_path = paths.lock,
+        },
+    });
+    try std.testing.expect(resolved.succeeded);
+    try std.testing.expectEqual(debz.ProductOperation.plan, resolver.seen_operation.?);
+    try std.testing.expect(resolved.lock_path != null);
+    try std.testing.expectEqualStrings(paths.lock, resolved.lock_path.?);
+
+    // The emitted lock targets arm64, never the foreign architecture.
+    const lock_after_resolve = try Dir.cwd().readFileAlloc(io, paths.lock, allocator, .limited(1 << 20));
+    defer allocator.free(lock_after_resolve);
+    try std.testing.expect(std.mem.indexOf(u8, lock_after_resolve, "arm64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lock_after_resolve, "amd64") == null);
+
+    // --- customize: the same lock is consumed, the root is published ---
+    var customizer: FakeProduct = .{ .io = io, .state_path = paths.state, .lock_path = paths.lock };
+    const customized = try execute(allocator, io, .{
+        .debian = .{ .product_executor = customizer.interface() },
+    }, .{
+        .family = .debian,
+        .distribution = .ubuntu_26_04,
+        .operation = .customize,
+        .packages = &.{"linux-azure"},
+        .inputs = .{
+            .root_stage = paths.stage,
+            .published_root = paths.output,
+            .architecture = .arm64,
+            .source_paths = &.{},
+            .config_paths = &config,
+            .keyring_paths = &keyring,
+            .cache_path = cache,
+            .state_path = paths.state,
+            .lock_input_path = paths.lock,
+        },
+    });
+    try std.testing.expect(customized.succeeded);
+    try std.testing.expect(customized.published);
+    try std.testing.expect(customized.provenance_path != null);
+    // provenance_path must be owned by the caller's allocator (freed here); the
+    // production customize leak was exactly an unfreed escaping backend string.
+    defer allocator.free(customized.provenance_path.?);
+    const expected_provenance = try std.fmt.allocPrint(allocator, "{s}/transaction-result.json", .{paths.state});
+    defer allocator.free(expected_provenance);
+    try std.testing.expectEqualStrings(expected_provenance, customized.provenance_path.?);
+
+    // Exact-lock semantics: customize consumed the resolve output verbatim.
+    const lock_after_customize = try Dir.cwd().readFileAlloc(io, paths.lock, allocator, .limited(1 << 20));
+    defer allocator.free(lock_after_customize);
+    try std.testing.expectEqualSlices(u8, lock_after_resolve, lock_after_customize);
 }
 
 test "pathsOverlap matches containment in either direction but not siblings" {

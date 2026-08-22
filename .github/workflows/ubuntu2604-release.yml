@@ -9,9 +9,9 @@
 #   variables AZURE_LOCATION_X64, AZURE_LOCATION_ARM64, AZURE_VM_SIZE_X64, and
 #   AZURE_VM_SIZE_ARM64. The acceptance app's Entra federated credential subject
 #   is `repo:cataggar/vmiz:environment:ubuntu2604-release`.
-# Before dispatch, create RELEASE_TAG at the exact current `main` commit. The
-# workflow accepts lightweight or annotated tags, but never moves an existing
-# tag and publishes exactly the two QCOW2 assets declared below.
+# Before dispatch, create or retarget RELEASE_TAG to the exact current `main`
+# commit. The workflow accepts lightweight or annotated tags and publishes
+# exactly the two QCOW2 assets declared below.
 name: Build, validate, and publish Ubuntu 26.04 images
 
 on:
@@ -27,12 +27,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: ubuntu2604-release-20260828
+  group: ubuntu2604-release-20260822
   cancel-in-progress: false
 
 env:
-  RELEASE_TAG: Ubuntu-26.04-20260828
-  RELEASE_TITLE: Ubuntu Server 26.04 - 20260828
+  RELEASE_TAG: Ubuntu-26.04-20260822
+  RELEASE_TITLE: Ubuntu Server 26.04 - 20260822
 
 jobs:
   prepare:
