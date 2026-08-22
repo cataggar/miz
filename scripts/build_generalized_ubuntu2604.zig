@@ -2863,6 +2863,8 @@ fn extractNativeBootInputs(
     defer allocator.free(kernel);
     const initrd = try native_root.filesystem.read(allocator, initrd_guest, 256 * 1024 * 1024);
     defer allocator.free(initrd);
+    if (flavor == .baremetal)
+        try requireInitramfsModules(allocator, initrd, &baremetal_required_initramfs_modules);
     const os_release = try native_root.filesystem.read(allocator, "/usr/lib/os-release", 64 * 1024);
     defer allocator.free(os_release);
     const kernel_host = try std.fmt.allocPrint(allocator, "{s}/vmlinuz-{s}", .{ extract_dir, kernel_release });
@@ -2875,6 +2877,70 @@ fn extractNativeBootInputs(
     try Dir.cwd().writeFile(io, .{ .sub_path = initrd_host, .data = initrd });
     try Dir.cwd().writeFile(io, .{ .sub_path = os_release_host, .data = os_release });
     return kernel_release;
+}
+
+/// The drivers without which the machine cannot find its root or be reached.
+///
+/// Named separately from `/etc/initramfs-tools/modules` because that file is a
+/// request and this is the verification: `MODULES=most` is a heuristic, and an
+/// initramfs missing either of these boots into a machine that either cannot
+/// mount root or never appears on the network -- two failures that look
+/// identical from outside and are diagnosable only at the BMC console.
+const baremetal_required_initramfs_modules = [_][]const u8{ "nvme", "r8152" };
+
+/// Fails unless every named module is inside the built initramfs.
+///
+/// The image is the concatenation an initramfs may be: any number of
+/// uncompressed early cpio archives, then the compressed main archive. The
+/// leading archives are walked directly; whatever follows them is decompressed
+/// and walked the same way. Reading the image the builder is about to seal into
+/// the UKI, rather than the configuration that asked for it, is the point --
+/// the question is what the machine will boot, not what it was told to build.
+fn requireInitramfsModules(
+    allocator: Allocator,
+    image: []const u8,
+    required: []const []const u8,
+) !void {
+    const found = try allocator.alloc(bool, required.len);
+    defer allocator.free(found);
+    @memset(found, false);
+
+    var early = vmiz.cpio.Reader.init(image);
+    try scanCpioForModules(&early, required, found);
+    if (early.offset < image.len) {
+        const remainder = image[early.offset..];
+        if (remainder.len < 4 or
+            std.mem.readInt(u32, remainder[0..4], .little) != vmiz.zstd.zstd_magic)
+            return error.UnreadableInitramfs;
+        const decoded = vmiz.zstd.decodeAlloc(allocator, remainder) catch
+            return error.UnreadableInitramfs;
+        defer allocator.free(decoded.bytes);
+        var payload = vmiz.cpio.Reader.init(decoded.bytes);
+        try scanCpioForModules(&payload, required, found);
+    }
+
+    for (found, required) |present, name| {
+        if (!present) {
+            std.debug.print("[ubuntu2604] initramfs is missing {s}\n", .{name});
+            return error.InitramfsModuleMissing;
+        }
+    }
+}
+
+fn scanCpioForModules(
+    reader: *vmiz.cpio.Reader,
+    required: []const []const u8,
+    found: []bool,
+) !void {
+    while (reader.next() catch return) |entry| {
+        const name = std.fs.path.basename(entry.path);
+        // `.ko`, or `.ko` plus whatever the distribution compresses modules
+        // with -- `.ko.zst` on Ubuntu today, which is not a promise.
+        const stem = if (std.mem.indexOf(u8, name, ".ko")) |at| name[0..at] else continue;
+        for (required, 0..) |candidate, index| {
+            if (std.mem.eql(u8, stem, candidate)) found[index] = true;
+        }
+    }
 }
 
 fn espPartition(partitions: []const vmiz.gpt.PartitionEntry) !vmiz.gpt.PartitionEntry {
@@ -2966,6 +3032,13 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     const profile = profileFor(architecture);
+    // The NVIDIA BaseOS kernel is published for arm64 alone, because the
+    // machines it exists for are arm64. Saying so here turns a confusing
+    // package-resolution failure hours into the build into an immediate one.
+    if (args.flavor == .baremetal and architecture != .aarch64) {
+        std.debug.print("error: the baremetal flavor is aarch64 only\n", .{});
+        std.process.exit(1);
+    }
     const work_dir = args.work_dir orelse profile.workDirFor(args.flavor);
     const output = args.output orelse profile.outputFor(args.flavor);
     try Dir.cwd().createDirPath(io, work_dir);
@@ -3977,6 +4050,92 @@ test "kernel discovery is architecture-neutral, exact, and flavor-driven" {
     try std.testing.expect(findKernelRelease(nvidia_listing, azure_kernel_suffix) == null);
     try std.testing.expect(
         findKernelRelease("vmlinuz-7.0.0-1001-azure\n", nvidia_bos_kernel_suffix) == null,
+    );
+}
+
+test "the bare-metal initramfs is required to carry the drivers that reach the machine" {
+    const allocator = std.testing.allocator;
+
+    // An initramfs as initramfs-tools builds one: an uncompressed early cpio,
+    // then the compressed main archive. Both halves are searched, because
+    // which half a module lands in is not this builder's decision.
+    const pack = struct {
+        fn archive(a: Allocator, paths: []const []const u8) ![]u8 {
+            var buffer = std.array_list.Managed(u8).init(a);
+            errdefer buffer.deinit();
+            var writer = vmiz.cpio.Writer.init(&buffer, .newc);
+            for (paths) |path| try writer.append(.{
+                .path = path,
+                .content = "module",
+                .metadata = .{ .mode = 0o100644, .nlink = 1 },
+            });
+            try writer.finish();
+            return buffer.toOwnedSlice();
+        }
+
+        fn image(a: Allocator, early: []const []const u8, payload: []const []const u8) ![]u8 {
+            const early_bytes = try archive(a, early);
+            defer a.free(early_bytes);
+            const main_bytes = try archive(a, payload);
+            defer a.free(main_bytes);
+            var out: std.Io.Writer.Allocating = .init(a);
+            errdefer out.deinit();
+            try out.writer.writeAll(early_bytes);
+            try vmiz.zstd.writeRawFrameForSlice(&out.writer, main_bytes, null);
+            return out.toOwnedSlice();
+        }
+    };
+
+    const complete = try pack.image(
+        allocator,
+        &.{"kernel/drivers/net/usb/r8152.ko.zst"},
+        &.{ "kernel/drivers/nvme/host/nvme.ko.zst", "kernel/fs/ext4/ext4.ko.zst" },
+    );
+    defer allocator.free(complete);
+    try requireInitramfsModules(allocator, complete, &baremetal_required_initramfs_modules);
+
+    // The failure this exists to catch: an initramfs built the way an Azure
+    // image's would be, carrying neither the disk nor the NIC this machine has.
+    const azure_shaped = try pack.image(
+        allocator,
+        &.{},
+        &.{ "kernel/drivers/net/hyperv/hv_netvsc.ko.zst", "kernel/drivers/scsi/sd_mod.ko.zst" },
+    );
+    defer allocator.free(azure_shaped);
+    try std.testing.expectError(
+        error.InitramfsModuleMissing,
+        requireInitramfsModules(allocator, azure_shaped, &baremetal_required_initramfs_modules),
+    );
+
+    // Half of it is still a machine that does not come back: root without a
+    // network is as unreachable as a network without root.
+    const no_nic = try pack.image(allocator, &.{}, &.{"kernel/drivers/nvme/host/nvme.ko.zst"});
+    defer allocator.free(no_nic);
+    try std.testing.expectError(
+        error.InitramfsModuleMissing,
+        requireInitramfsModules(allocator, no_nic, &baremetal_required_initramfs_modules),
+    );
+
+    // A name that merely contains a required one is not that module.
+    const near_miss = try pack.image(
+        allocator,
+        &.{},
+        &.{ "kernel/drivers/nvme/host/nvme-core.ko.zst", "kernel/drivers/net/usb/r8152.ko.zst" },
+    );
+    defer allocator.free(near_miss);
+    try std.testing.expectError(
+        error.InitramfsModuleMissing,
+        requireInitramfsModules(allocator, near_miss, &baremetal_required_initramfs_modules),
+    );
+
+    // An image whose compressed half cannot be read fails closed rather than
+    // reporting the modules it could not look for as absent-but-fine.
+    var truncated = try allocator.dupe(u8, complete);
+    defer allocator.free(truncated);
+    @memset(truncated[truncated.len - 16 ..], 0);
+    try std.testing.expectError(
+        error.UnreadableInitramfs,
+        requireInitramfsModules(allocator, truncated[0 .. truncated.len - 8], &baremetal_required_initramfs_modules),
     );
 }
 
