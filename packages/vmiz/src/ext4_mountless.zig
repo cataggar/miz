@@ -774,9 +774,22 @@ pub const FileSystem = struct {
         try destination.writePositionalAll(self.io, bytes, 0);
     }
 
+    /// Regular files stage at a readable `0o644` floor -- so a guest mode of
+    /// `000` never yields an unreadable host input -- while preserving the
+    /// guest's execute bits. dpkg chroots into this staged tree and `execve`s
+    /// interpreters and maintainer scripts, and the kernel refuses to execute a
+    /// file that carries no execute bit at all, even for a CAP_DAC_OVERRIDE
+    /// root. Dropping the execute bits therefore made every chrooted maintainer
+    /// script fail with EACCES once the transaction lock stopped masking it.
+    fn stagingFileMode(guest_mode: u16) u16 {
+        return 0o644 | (guest_mode & 0o111);
+    }
+
     /// Materializes a bounded, tool-safe package root. Guest bytes are read
     /// through the ext4 tree, so mode `000` entries never become unreadable
-    /// host inputs; regular files receive ordinary readable staging modes.
+    /// host inputs; regular files receive ordinary readable staging modes and
+    /// retain the guest execute bits so a host package tool (dpkg) can chroot
+    /// into the tree and `execve` its interpreters and maintainer scripts.
     pub fn exportHostTree(
         self: *const FileSystem,
         destination: []const u8,
@@ -812,13 +825,13 @@ pub const FileSystem = struct {
                     );
                     defer self.allocator.free(bytes);
                     try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = host_path, .data = bytes });
-                    try Io.Dir.cwd().setFilePermissions(self.io, host_path, .fromMode(0o644), .{});
+                    try Io.Dir.cwd().setFilePermissions(self.io, host_path, .fromMode(stagingFileMode(entry.metadata.mode)), .{});
                 },
                 .hardlink => {
                     const bytes = try self.read(self.allocator, entry.path, options.max_file_bytes);
                     defer self.allocator.free(bytes);
                     try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = host_path, .data = bytes });
-                    try Io.Dir.cwd().setFilePermissions(self.io, host_path, .fromMode(0o644), .{});
+                    try Io.Dir.cwd().setFilePermissions(self.io, host_path, .fromMode(stagingFileMode(entry.metadata.mode)), .{});
                 },
                 .symlink => {
                     const target = try self.readLink(self.allocator, entry.path, options.max_file_bytes);
@@ -1869,6 +1882,78 @@ test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
         Io.Dir.cwd().deleteTree(io, recovery_path) catch {};
         allocator.free(recovery_path);
     }
+}
+
+test "exportHostTree preserves guest execute bits above the readable floor" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const image_path = "test-ext4-export-exec.raw";
+    const spool_path = "test-ext4-export-exec.spool";
+    const host_tree_path = "test-ext4-export-exec-host-tree";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, host_tree_path) catch {};
+
+    var image = try @import("image.zig").Image.createExclusive(
+        io,
+        image_path,
+        .raw,
+        32 * 1024 * 1024,
+        .{},
+    );
+    defer image.close(io);
+    var source_tree = root_tree.RootTree.initMemory(allocator, io, .{});
+    defer source_tree.deinit();
+    try source_tree.putDirectory("etc", .{ .mode = 0o755 });
+    try source_tree.putDirectory("usr", .{ .mode = 0o755 });
+    try source_tree.putDirectory("usr/bin", .{ .mode = 0o755 });
+    // An executable interpreter, a setuid binary, a plain data file, and a
+    // mode-000 secret. The interpreter models `/bin/sh` (dash): once the
+    // transaction lock stopped masking the customize, dpkg chrooted into this
+    // staged tree and could not `execve` an interpreter that had lost its
+    // execute bit (EACCES even for root).
+    try source_tree.putFileBytes("usr/bin/sh", "#!/marker\n", .{ .mode = 0o755 });
+    try source_tree.putFileBytes("usr/bin/mount", "elf", .{ .mode = 0o4755 });
+    try source_tree.putFileBytes("etc/data", "data", .{ .mode = 0o644 });
+    try source_tree.putFileBytes("etc/void", "secret", .{ .mode = 0 });
+    _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
+        .length = 32 * 1024 * 1024,
+        .label = "exec",
+        .uuid = [_]u8{0x53} ** 16,
+    });
+    var fs = try FileSystem.open(allocator, io, image.file, .{
+        .length = 32 * 1024 * 1024,
+        .spool_path = spool_path,
+        .atomic_path = image_path,
+    });
+    defer fs.deinit();
+    try fs.exportHostTree(host_tree_path, .{});
+
+    const hostMode = struct {
+        fn get(inner_io: Io, tree: []const u8, sub: []const u8) !u16 {
+            const joined = try std.fs.path.join(std.testing.allocator, &.{ tree, sub });
+            defer std.testing.allocator.free(joined);
+            const stat = try Io.Dir.cwd().statFile(inner_io, joined, .{});
+            return @as(u16, @intCast(stat.permissions.toMode() & 0o7777));
+        }
+    }.get;
+
+    // Executable guest files keep their execute bits so chrooted interpreters
+    // and maintainer scripts can run.
+    try std.testing.expectEqual(@as(u16, 0o755), try hostMode(io, host_tree_path, "usr/bin/sh"));
+    // Execute bits survive, but the setuid bit is not propagated to the staging
+    // tree -- the staged tree is a host-tool workspace, not a runnable system.
+    try std.testing.expectEqual(@as(u16, 0o755), try hostMode(io, host_tree_path, "usr/bin/mount"));
+    // Non-executable data keeps the plain readable staging mode.
+    try std.testing.expectEqual(@as(u16, 0o644), try hostMode(io, host_tree_path, "etc/data"));
+    // A mode-000 guest inode still stages at the readable floor.
+    try std.testing.expectEqual(@as(u16, 0o644), try hostMode(io, host_tree_path, "etc/void"));
+
+    // The unit-level policy the loop above enforces, pinned directly.
+    try std.testing.expectEqual(@as(u16, 0o755), FileSystem.stagingFileMode(0o755));
+    try std.testing.expectEqual(@as(u16, 0o755), FileSystem.stagingFileMode(0o4755));
+    try std.testing.expectEqual(@as(u16, 0o644), FileSystem.stagingFileMode(0o644));
+    try std.testing.expectEqual(@as(u16, 0o644), FileSystem.stagingFileMode(0));
 }
 
 test "mountless commit preserves the pinned Ubuntu descriptor-64 profile" {

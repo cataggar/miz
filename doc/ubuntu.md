@@ -289,7 +289,50 @@ bind every provenance sidecar into `candidate.json`, and reject private-key
 material. External `qemu-img` remains confined to acceptance-time inspection
 and the Azure fixed-VHD conversion boundary.
 
+### Local end-to-end release gate
+
+A protected release build must never be dispatched before the corrected
+candidate has been built and validated locally. `scripts/ubuntu2604_local_e2e.sh`
+runs the strongest feasible local reproduction: it drives the exact release
+builder entrypoint (`zig build generalized-ubuntu2604`) through base-image
+acquisition and signature verification, embedded debz customize, native UKI
+assembly, UKI signing, and standalone zstd QCOW2 finalization, then validates
+the finalized candidate exactly as the release workflow does (`vmiz check` plus
+`vmiz info --output=json` asserting `qcow2`, an exact 5 GiB virtual size, no
+backing file, and zstd cluster compression).
+
+The only deviation from the protected workflow is the signing identity: instead
+of the Azure Trusted Signing command, the gate signs with a safe, public,
+test-only self-signed key/cert committed under
+`tests/fixtures/ubuntu2604-local-signing/` (certificate DER SHA-256
+`74556e6a0b540eb0ed5a49d9e75a003987447699df59f1d68456548c47dc8009`). Those
+fixtures are guarded deterministically by `zig build test-generalized-ubuntu2604`
+(the test loads them through the native local-key path and verifies a signature
+against the enrolled certificate), so a corrupted or mismatched fixture fails
+before any multi-gigabyte build.
+
+```console
+ZIG=$(command -v zig) SEED_CACHE="$HOME/.cache/zig" \
+  scripts/ubuntu2604_local_e2e.sh x86_64
+```
+
+The driver isolates its privileged (`sudo`) build in an in-tree
+`.zig-global-cache`, writes the candidate and provenance under
+`.scratch/local-e2e/<arch>/`, and restores ownership afterward. It prints the
+finalized candidate size, SHA-256, and the validated `image-info.json` path.
+
+A full arm64 image build is only reproducible on a host with the aarch64
+systemd-boot stub (`/usr/lib/systemd/boot/efi/linuxaa64.efi.stub`); on an
+x86_64 host it is not. The arm64 resolve→customize transition that failed in
+production is instead covered deterministically and offline by
+`zig build test-package-family` (the arm64 exact-lock handoff through the
+package-family boundary) and by debz's `production_backend_customize_test.zig`
+(the real backend provisioning the absent `var/lib/debz` lock root). Run the
+full arm64 gate (`scripts/ubuntu2604_local_e2e.sh aarch64`) only on a matching
+aarch64 runner.
+
 ## Acceptance infrastructure
+
 
 Native acceptance is deliberately not emulation. Each architecture requires a
 matching Linux runner with readable and writable `/dev/kvm`, QEMU, OVMF or

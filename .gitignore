@@ -12,3 +12,5 @@ __pycache__/
 # and committing them feeds stale state back into the tests that create them.
 /test-*
 /.test-*.lock
+.scratch/
+.zig-global-cache/
