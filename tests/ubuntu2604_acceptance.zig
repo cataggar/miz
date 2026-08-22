@@ -1,8 +1,8 @@
 //! Opt-in native-QEMU acceptance for finalized Ubuntu 26.04 QCOW2 images.
 //!
 //! The selected build options and `VMIZ_UBUNTU2604_IMAGE` must agree on one
-//! of the two server release candidates. This deliberately refuses TCG: release
-//! acceptance is run only by a native x86_64 or AArch64 matrix entry.
+//! full or core candidate. This deliberately refuses TCG: acceptance is run
+//! only by a native x86_64 or AArch64 matrix entry.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -18,6 +18,7 @@ const Io = std.Io;
 const admin_username = "vmiztest";
 const boot_timeout_seconds: i64 = 8 * 60;
 const serial_limit: usize = 2 * 1024 * 1024;
+const gib: u64 = 1024 * 1024 * 1024;
 
 const Architecture = enum {
     x86_64,
@@ -90,20 +91,117 @@ const Architecture = enum {
     }
 };
 
+const full_contracts = [_][]const u8{
+    "matching-architecture-native-kvm",
+    "standalone-zstd-qcow2",
+    "gpt-layout",
+    "secure-boot",
+    "uefi-db-signer",
+    "signed-uki",
+    "vtpm",
+    "kernel-lockdown",
+    "module-signatures",
+    "tampered-uki-rejected",
+    "key-only-ssh",
+    "cloud-init-provisioning",
+    "walinuxagent",
+    "netplan-networkd",
+    "generalized-identity",
+    "root-growth",
+    "reboot-reconnect",
+    "clean-service-health",
+};
+
+const core_contracts = [_][]const u8{
+    "matching-architecture-native-kvm",
+    "standalone-zstd-qcow2",
+    "gpt-layout",
+    "secure-boot",
+    "uefi-db-signer",
+    "signed-uki",
+    "vtpm",
+    "kernel-lockdown",
+    "module-signatures",
+    "tampered-uki-rejected",
+    "key-only-ssh",
+    "local-ovf-azagent-skip-ready",
+    "azagent-provisioning",
+    "vmizinit-pid1",
+    "vmizinit-sshd-supervision",
+    "sshd-restart",
+    "persistent-provisioned-state",
+    "no-cloud-init",
+    "no-walinuxagent",
+    "generalized-identity",
+    "root-growth",
+    "reboot-reconnect",
+    "clean-service-health",
+};
+
+const FlavorPolicy = struct {
+    x86_64_file_name: []const u8,
+    aarch64_file_name: []const u8,
+    virtual_size: u64,
+    result_schema: u32,
+    contracts: []const []const u8,
+};
+
+const Flavor = enum {
+    core,
+    full,
+
+    fn policy(self: Flavor) *const FlavorPolicy {
+        return switch (self) {
+            .core => &core_policy,
+            .full => &full_policy,
+        };
+    }
+};
+
+const core_policy: FlavorPolicy = .{
+    .x86_64_file_name = "Ubuntu-26.04-x86_64.core.qcow2",
+    .aarch64_file_name = "Ubuntu-26.04-aarch64.core.qcow2",
+    // The builder can align its final evidence-based size here.
+    .virtual_size = 2 * gib,
+    .result_schema = 2,
+    .contracts = &core_contracts,
+};
+
+const full_policy: FlavorPolicy = .{
+    .x86_64_file_name = "Ubuntu-26.04-x86_64.qcow2",
+    .aarch64_file_name = "Ubuntu-26.04-aarch64.qcow2",
+    .virtual_size = 5 * gib,
+    .result_schema = 1,
+    .contracts = &full_contracts,
+};
+
 const Candidate = struct {
     architecture: Architecture,
+    flavor: Flavor,
 
     fn expectedFileName(self: Candidate) []const u8 {
+        const policy = self.flavor.policy();
         return switch (self.architecture) {
-            .x86_64 => "Ubuntu-26.04-x86_64.qcow2",
-            .aarch64 => "Ubuntu-26.04-aarch64.qcow2",
+            .x86_64 => policy.x86_64_file_name,
+            .aarch64 => policy.aarch64_file_name,
         };
     }
 
-    fn expectedVirtualSize(_: Candidate) u64 {
-        return 5 * 1024 * 1024 * 1024;
+    fn expectedVirtualSize(self: Candidate) u64 {
+        return self.flavor.policy().virtual_size;
+    }
+
+    fn contracts(self: Candidate) []const []const u8 {
+        return self.flavor.policy().contracts;
     }
 };
+
+fn hasContract(contracts: []const []const u8, expected: []const u8) bool {
+    for (contracts) |contract| {
+        if (std.mem.eql(u8, contract, expected)) return true;
+    }
+    return false;
+}
 
 const Firmware = qemu_host.FirmwarePair;
 
@@ -116,6 +214,19 @@ const GuestIdentity = struct {
         allocator.free(self.machine_id);
         allocator.free(self.ssh_fingerprint);
         allocator.free(self.boot_id);
+        self.* = undefined;
+    }
+};
+
+const CoreProvisionedState = struct {
+    account: []u8,
+    authorized_key_fingerprint: []u8,
+    sentinel: []u8,
+
+    fn deinit(self: *CoreProvisionedState, allocator: Allocator) void {
+        allocator.free(self.account);
+        allocator.free(self.authorized_key_fingerprint);
+        allocator.free(self.sentinel);
         self.* = undefined;
     }
 };
@@ -236,7 +347,11 @@ fn selectedCandidate() !Candidate {
         Architecture,
         build_options.ubuntu2604_architecture,
     ) orelse return error.InvalidBuildArchitecture;
-    return .{ .architecture = architecture };
+    const flavor = std.meta.stringToEnum(
+        Flavor,
+        build_options.ubuntu2604_flavor,
+    ) orelse return error.InvalidBuildFlavor;
+    return .{ .architecture = architecture, .flavor = flavor };
 }
 
 fn requireImageAlloc(
@@ -909,16 +1024,30 @@ fn validateFinalizedImage(
     if (!std.mem.startsWith(u8, cmdline, expected_prefix))
         return error.UnexpectedUkiCmdline;
 
-    const expected = try std.fmt.allocPrint(
-        allocator,
-        "{s}{s}",
-        .{ expected_prefix, candidate.architecture.serialConsole() },
-    );
-    defer allocator.free(expected);
-    if (!std.mem.eql(u8, cmdline, expected))
-        return error.UnexpectedUkiCmdline;
-    if (std.mem.indexOf(u8, cmdline, "init=/sbin/vmizinit") != null)
-        return error.ImageContainsVmizinitBootContract;
+    switch (candidate.flavor) {
+        .core => {
+            const expected = try std.fmt.allocPrint(
+                allocator,
+                "{s}init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=auto console=tty0 {s}",
+                .{ expected_prefix, candidate.architecture.serialConsole() },
+            );
+            defer allocator.free(expected);
+            if (!std.mem.eql(u8, cmdline, expected))
+                return error.UnexpectedCoreUkiCmdline;
+        },
+        .full => {
+            const expected = try std.fmt.allocPrint(
+                allocator,
+                "{s}{s}",
+                .{ expected_prefix, candidate.architecture.serialConsole() },
+            );
+            defer allocator.free(expected);
+            if (!std.mem.eql(u8, cmdline, expected))
+                return error.UnexpectedFullUkiCmdline;
+            if (std.mem.indexOf(u8, cmdline, "init=/sbin/vmizinit") != null)
+                return error.FullImageContainsVmizinitBootContract;
+        },
+    }
 
     const entries = try esp.listDirAlloc(io, allocator, "EFI/Linux");
     defer vmiz.fat32.freeDirEntries(allocator, entries);
@@ -1618,7 +1747,79 @@ fn verifyKeyOnlySsh(
     )) return error.SshPasswordAuthenticationEnabled;
 }
 
-const server_checks =
+const core_checks =
+    \\set -eu
+    \\sudo -n /usr/bin/test /proc/1/exe -ef /sbin/vmizinit
+    \\test -x /usr/sbin/azagent
+    \\test -f /var/lib/azagent/provisioned
+    \\test "$( . /etc/os-release; printf '%s' "$ID")" = ubuntu
+    \\test "$( . /etc/os-release; printf '%s' "$VERSION_ID")" = 26.04
+    \\for path in \
+    \\  /usr/bin/cloud-init /usr/sbin/cloud-init \
+    \\  /usr/bin/waagent /usr/sbin/waagent /usr/sbin/WALinuxAgent.py \
+    \\  /etc/cloud /var/lib/cloud /var/lib/waagent \
+    \\  /usr/lib/python3/dist-packages/cloudinit \
+    \\  /usr/lib/python3/dist-packages/azurelinuxagent
+    \\do
+    \\  test ! -e "$path"
+    \\done
+    \\self=$$
+    \\for proc in /proc/[0-9]*; do
+    \\  test "${proc##*/}" = "$self" && continue
+    \\  test -r "$proc/cmdline" || continue
+    \\  cmdline=$(tr '\000' ' ' < "$proc/cmdline")
+    \\  exe=$(readlink "$proc/exe" 2>/dev/null || true)
+    \\  test "$exe" != /usr/sbin/azagent
+    \\  cloud=cloud init=init wa=wa agent=agent upper=WALinux agent_name=Agent
+    \\  case "$cmdline" in
+    \\    *"$cloud-$init"*|*"$wa$agent"*|*"$upper$agent_name"*) exit 1 ;;
+    \\  esac
+    \\done
+    \\for status in /proc/[0-9]*/status; do
+    \\  test -r "$status" || continue
+    \\  ppid= state=
+    \\  while read -r key value _; do
+    \\    case "$key" in
+    \\      PPid:) ppid=$value ;;
+    \\      State:) state=$value ;;
+    \\    esac
+    \\  done < "$status"
+    \\  test "$ppid" != 1 || test "$state" != Z
+    \\done
+    \\find_sshd_master() {
+    \\  for proc in /proc/[0-9]*; do
+    \\    test -r "$proc/status" || continue
+    \\    name= ppid=
+    \\    while read -r key value _; do
+    \\      case "$key" in
+    \\        Name:) name=$value ;;
+    \\        PPid:) ppid=$value ;;
+    \\      esac
+    \\    done < "$proc/status"
+    \\    test "$name" = sshd && test "$ppid" = 1 || continue
+    \\    cmdline=$(tr '\000' ' ' < "$proc/cmdline")
+    \\    case "$cmdline" in
+    \\      *"/usr/sbin/sshd -D -e"*) printf '%s\n' "${proc##*/}"; return 0 ;;
+    \\    esac
+    \\  done
+    \\  return 1
+    \\}
+    \\find_sshd_master
+;
+
+fn readCoreSshdPid(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+) !i32 {
+    const output = try sshOutputAlloc(allocator, io, ssh_path, instance, core_checks);
+    defer allocator.free(output);
+    const pid_text = std.mem.trim(u8, output, " \t\r\n");
+    return std.fmt.parseInt(i32, pid_text, 10) catch error.InvalidSshdPid;
+}
+
+const full_checks =
     \\set -eu
     \\sudo -n /usr/bin/test /proc/1/exe -ef /usr/lib/systemd/systemd
     \\test ! -e /sbin/vmizinit
@@ -1643,10 +1844,150 @@ fn verifyFlavorRuntime(
     allocator: Allocator,
     io: Io,
     ssh_path: []const u8,
+    candidate: Candidate,
     instance: *const Instance,
 ) !void {
-    if (!try sshSucceeded(allocator, io, ssh_path, instance, server_checks))
-        return error.ServerServiceContractFailed;
+    switch (candidate.flavor) {
+        .core => _ = try readCoreSshdPid(allocator, io, ssh_path, instance),
+        .full => {
+            if (!try sshSucceeded(allocator, io, ssh_path, instance, full_checks))
+                return error.FullServiceContractFailed;
+        },
+    }
+}
+
+fn verifyCoreSshdRestart(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+) !void {
+    const initial_pid = try readCoreSshdPid(allocator, io, ssh_path, instance);
+    const kill_command = try std.fmt.allocPrint(
+        allocator,
+        "sudo -n /usr/bin/kill -KILL {d}",
+        .{initial_pid},
+    );
+    defer allocator.free(kill_command);
+    _ = sshSucceeded(allocator, io, ssh_path, instance, kill_command) catch false;
+
+    const deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(boot_timeout_seconds));
+    while (Io.Clock.awake.now(io).nanoseconds < deadline.nanoseconds) {
+        if (readCoreSshdPid(allocator, io, ssh_path, instance)) |new_pid| {
+            if (new_pid != initial_pid) {
+                try verifyAdminLogin(allocator, io, ssh_path, instance);
+                try verifyKeyOnlySsh(allocator, io, ssh_path, instance);
+                return;
+            }
+        } else |err| switch (err) {
+            error.SshCommandFailed => {},
+            else => return err,
+        }
+        if (!try qemuRunning(instance, deadline)) return error.QemuExitedEarly;
+        try Io.sleep(io, .fromSeconds(2), .awake);
+    }
+    return error.SshdDidNotRestart;
+}
+
+const core_provisioned_state_command =
+    \\set -eu
+    \\account=
+    \\while IFS=: read -r name _ uid gid _ home shell; do
+    \\  if test "$name" = vmiztest; then
+    \\    account="$name:$uid:$gid:$home:$shell"
+    \\    break
+    \\  fi
+    \\done < /etc/passwd
+    \\test -n "$account"
+    \\printf '%s\n' "$account"
+    \\set -- $(/usr/bin/ssh-keygen -lf /home/vmiztest/.ssh/authorized_keys -E sha256)
+    \\printf '%s\n' "$2"
+    \\sentinel=$(sudo -n /bin/cat /var/lib/azagent/provisioned)
+    \\test -n "$sentinel"
+    \\printf '%s\n' "$sentinel"
+;
+
+fn readCoreProvisionedStateAlloc(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+) !CoreProvisionedState {
+    const output = try sshOutputAlloc(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        core_provisioned_state_command,
+    );
+    defer allocator.free(output);
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    const account = std.mem.trim(
+        u8,
+        lines.next() orelse return error.InvalidCoreProvisionedState,
+        " \t\r",
+    );
+    const authorized_key_fingerprint = std.mem.trim(
+        u8,
+        lines.next() orelse return error.InvalidCoreProvisionedState,
+        " \t\r",
+    );
+    const sentinel = std.mem.trim(
+        u8,
+        lines.next() orelse return error.InvalidCoreProvisionedState,
+        " \t\r",
+    );
+    if (account.len == 0 or authorized_key_fingerprint.len == 0 or sentinel.len == 0)
+        return error.InvalidCoreProvisionedState;
+    while (lines.next()) |line| {
+        if (std.mem.trim(u8, line, " \t\r").len != 0)
+            return error.InvalidCoreProvisionedState;
+    }
+
+    const owned_account = try allocator.dupe(u8, account);
+    errdefer allocator.free(owned_account);
+    const owned_authorized_key_fingerprint = try allocator.dupe(
+        u8,
+        authorized_key_fingerprint,
+    );
+    errdefer allocator.free(owned_authorized_key_fingerprint);
+    return .{
+        .account = owned_account,
+        .authorized_key_fingerprint = owned_authorized_key_fingerprint,
+        .sentinel = try allocator.dupe(u8, sentinel),
+    };
+}
+
+fn publicKeyFingerprintAlloc(
+    allocator: Allocator,
+    io: Io,
+    ssh_keygen_path: []const u8,
+    public_key_path: []const u8,
+) ![]u8 {
+    const output = try commandOutputAlloc(
+        allocator,
+        io,
+        &.{ ssh_keygen_path, "-lf", public_key_path, "-E", "sha256" },
+    );
+    defer allocator.free(output);
+    var tokens = std.mem.tokenizeAny(u8, output, " \t\r\n");
+    _ = tokens.next() orelse return error.InvalidPublicKeyFingerprint;
+    return allocator.dupe(
+        u8,
+        tokens.next() orelse return error.InvalidPublicKeyFingerprint,
+    );
+}
+
+fn expectCoreProvisionedStateEqual(
+    expected: *const CoreProvisionedState,
+    actual: *const CoreProvisionedState,
+) !void {
+    try std.testing.expectEqualStrings(expected.account, actual.account);
+    try std.testing.expectEqualStrings(
+        expected.authorized_key_fingerprint,
+        actual.authorized_key_fingerprint,
+    );
+    try std.testing.expectEqualStrings(expected.sentinel, actual.sentinel);
 }
 
 fn verifyRootGrowth(
@@ -1743,19 +2084,107 @@ fn poweroff(
     return error.QemuDidNotExitCleanly;
 }
 
+fn writeAcceptanceResultValue(
+    allocator: Allocator,
+    io: Io,
+    result_path: []const u8,
+    value: anytype,
+) !void {
+    const result = try std.json.Stringify.valueAlloc(
+        allocator,
+        value,
+        .{ .whitespace = .indent_2 },
+    );
+    defer allocator.free(result);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = result_path,
+        .data = result,
+        .flags = .{ .truncate = true },
+    });
+}
+
+fn writeAcceptanceResult(
+    allocator: Allocator,
+    io: Io,
+    result_path: []const u8,
+    candidate: Candidate,
+    source_sha256: vmiz.artifact_pipeline.Digest,
+    certificate_sha256: vmiz.artifact_pipeline.Digest,
+    uki_sha256: vmiz.artifact_pipeline.Digest,
+) !void {
+    const source_sha256_hex = vmiz.artifact_pipeline.formatSha256(source_sha256);
+    const certificate_sha256_hex = vmiz.artifact_pipeline.formatSha256(
+        certificate_sha256,
+    );
+    const uki_sha256_hex = vmiz.artifact_pipeline.formatSha256(uki_sha256);
+    switch (candidate.flavor) {
+        .full => try writeAcceptanceResultValue(
+            allocator,
+            io,
+            result_path,
+            .{
+                .schema = candidate.flavor.policy().result_schema,
+                .type = "ubuntu2604-local-secure-boot-acceptance",
+                .candidate_sha256 = &source_sha256_hex,
+                .certificate_sha256 = &certificate_sha256_hex,
+                .fallback_uki_sha256 = &uki_sha256_hex,
+                .contracts = candidate.contracts(),
+            },
+        ),
+        .core => try writeAcceptanceResultValue(
+            allocator,
+            io,
+            result_path,
+            .{
+                .schema = candidate.flavor.policy().result_schema,
+                .type = "ubuntu2604-local-secure-boot-acceptance",
+                .architecture = @tagName(candidate.architecture),
+                .flavor = @tagName(candidate.flavor),
+                .virtual_size = candidate.expectedVirtualSize(),
+                .candidate_sha256 = &source_sha256_hex,
+                .certificate_sha256 = &certificate_sha256_hex,
+                .fallback_uki_sha256 = &uki_sha256_hex,
+                .contracts = candidate.contracts(),
+            },
+        ),
+    }
+}
+
 test "Ubuntu 26.04 acceptance candidate names are exact" {
     try std.testing.expectEqualStrings(
         "Ubuntu-26.04-x86_64.qcow2",
-        (Candidate{ .architecture = .x86_64 }).expectedFileName(),
+        (Candidate{ .architecture = .x86_64, .flavor = .full }).expectedFileName(),
     );
     try std.testing.expectEqualStrings(
         "Ubuntu-26.04-aarch64.qcow2",
-        (Candidate{ .architecture = .aarch64 }).expectedFileName(),
+        (Candidate{ .architecture = .aarch64, .flavor = .full }).expectedFileName(),
+    );
+    try std.testing.expectEqualStrings(
+        "Ubuntu-26.04-x86_64.core.qcow2",
+        (Candidate{ .architecture = .x86_64, .flavor = .core }).expectedFileName(),
+    );
+    try std.testing.expectEqualStrings(
+        "Ubuntu-26.04-aarch64.core.qcow2",
+        (Candidate{ .architecture = .aarch64, .flavor = .core }).expectedFileName(),
     );
 }
 
+test "Ubuntu 26.04 acceptance flavor policy preserves full and isolates core" {
+    const full = Candidate{ .architecture = .x86_64, .flavor = .full };
+    const core = Candidate{ .architecture = .x86_64, .flavor = .core };
+    try std.testing.expectEqual(@as(u64, 5 * gib), full.expectedVirtualSize());
+    try std.testing.expectEqual(@as(u64, 2 * gib), core.expectedVirtualSize());
+    try std.testing.expect(core.expectedVirtualSize() < full.expectedVirtualSize());
+    try std.testing.expectEqual(@as(u32, 1), full.flavor.policy().result_schema);
+    try std.testing.expectEqual(@as(u32, 2), core.flavor.policy().result_schema);
+    try std.testing.expectEqual(@as(usize, 18), full.contracts().len);
+    try std.testing.expectEqual(@as(usize, 23), core.contracts().len);
+    try std.testing.expect(hasContract(core.contracts(), "vmizinit-sshd-supervision"));
+    try std.testing.expect(hasContract(core.contracts(), "no-cloud-init"));
+}
+
 test "Ubuntu 26.04 configured acceptance prerequisites fail closed" {
-    const candidate = Candidate{ .architecture = .x86_64 };
+    const candidate = Candidate{ .architecture = .x86_64, .flavor = .core };
 
     try std.testing.expectError(
         error.NativeKvmRequiresLinux,
@@ -2021,8 +2450,8 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
     try verifyAdminLogin(allocator, io, ssh_path, &second);
     try verifyKeyOnlySsh(allocator, io, ssh_path, &first);
     try verifyKeyOnlySsh(allocator, io, ssh_path, &second);
-    try verifyFlavorRuntime(allocator, io, ssh_path, &first);
-    try verifyFlavorRuntime(allocator, io, ssh_path, &second);
+    try verifyFlavorRuntime(allocator, io, ssh_path, candidate, &first);
+    try verifyFlavorRuntime(allocator, io, ssh_path, candidate, &second);
     try verifyRootGrowth(allocator, io, ssh_path, &first, candidate.expectedVirtualSize());
     try verifyRootGrowth(allocator, io, ssh_path, &second, candidate.expectedVirtualSize());
     try verifyGuestSecureBoot(
@@ -2054,6 +2483,74 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         first_before.ssh_fingerprint,
         second_before.ssh_fingerprint,
     ));
+
+    var first_core_before: ?CoreProvisionedState = null;
+    defer if (first_core_before) |*state| state.deinit(allocator);
+    var second_core_before: ?CoreProvisionedState = null;
+    defer if (second_core_before) |*state| state.deinit(allocator);
+    if (candidate.flavor == .core) {
+        try waitForSerialMarker(
+            allocator,
+            io,
+            &first,
+            "explicit local provisioning media detected; WireServer Ready will be skipped",
+            5,
+        );
+        try waitForSerialMarker(
+            allocator,
+            io,
+            &second,
+            "explicit local provisioning media detected; WireServer Ready will be skipped",
+            5,
+        );
+        const first_public_key_fingerprint = try publicKeyFingerprintAlloc(
+            allocator,
+            io,
+            ssh_keygen_path,
+            first.public_key_path,
+        );
+        defer allocator.free(first_public_key_fingerprint);
+        const second_public_key_fingerprint = try publicKeyFingerprintAlloc(
+            allocator,
+            io,
+            ssh_keygen_path,
+            second.public_key_path,
+        );
+        defer allocator.free(second_public_key_fingerprint);
+
+        first_core_before = try readCoreProvisionedStateAlloc(
+            allocator,
+            io,
+            ssh_path,
+            &first,
+        );
+        second_core_before = try readCoreProvisionedStateAlloc(
+            allocator,
+            io,
+            ssh_path,
+            &second,
+        );
+        try std.testing.expectEqualStrings(
+            first_public_key_fingerprint,
+            first_core_before.?.authorized_key_fingerprint,
+        );
+        try std.testing.expectEqualStrings(
+            second_public_key_fingerprint,
+            second_core_before.?.authorized_key_fingerprint,
+        );
+        try std.testing.expect(!std.mem.eql(
+            u8,
+            first_core_before.?.authorized_key_fingerprint,
+            second_core_before.?.authorized_key_fingerprint,
+        ));
+        try std.testing.expect(!std.mem.eql(
+            u8,
+            first_core_before.?.sentinel,
+            second_core_before.?.sentinel,
+        ));
+        try verifyCoreSshdRestart(allocator, io, ssh_path, &first);
+        try verifyCoreSshdRestart(allocator, io, ssh_path, &second);
+    }
 
     var first_after = try rebootAndReadIdentity(
         allocator,
@@ -2088,8 +2585,40 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         second_before.ssh_fingerprint,
         second_after.ssh_fingerprint,
     );
-    try verifyFlavorRuntime(allocator, io, ssh_path, &first);
-    try verifyFlavorRuntime(allocator, io, ssh_path, &second);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        first_after.machine_id,
+        second_after.machine_id,
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        first_after.ssh_fingerprint,
+        second_after.ssh_fingerprint,
+    ));
+    try verifyAdminLogin(allocator, io, ssh_path, &first);
+    try verifyAdminLogin(allocator, io, ssh_path, &second);
+    try verifyKeyOnlySsh(allocator, io, ssh_path, &first);
+    try verifyKeyOnlySsh(allocator, io, ssh_path, &second);
+    try verifyFlavorRuntime(allocator, io, ssh_path, candidate, &first);
+    try verifyFlavorRuntime(allocator, io, ssh_path, candidate, &second);
+    if (candidate.flavor == .core) {
+        var first_core_after = try readCoreProvisionedStateAlloc(
+            allocator,
+            io,
+            ssh_path,
+            &first,
+        );
+        defer first_core_after.deinit(allocator);
+        var second_core_after = try readCoreProvisionedStateAlloc(
+            allocator,
+            io,
+            ssh_path,
+            &second,
+        );
+        defer second_core_after.deinit(allocator);
+        try expectCoreProvisionedStateEqual(&first_core_before.?, &first_core_after);
+        try expectCoreProvisionedStateEqual(&second_core_before.?, &second_core_after);
+    }
     try verifyGuestSecureBoot(
         allocator,
         io,
@@ -2190,46 +2719,13 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         source_sha256,
         (try vmiz.artifact_pipeline.hashFile(io, absolute_image)).sha256,
     );
-    const source_sha256_hex = vmiz.artifact_pipeline.formatSha256(source_sha256);
-    const certificate_sha256_hex = vmiz.artifact_pipeline.formatSha256(
-        certificate_sha256,
-    );
-    const uki_sha256_hex = vmiz.artifact_pipeline.formatSha256(uki_sha256);
-    const result = try std.json.Stringify.valueAlloc(
+    try writeAcceptanceResult(
         allocator,
-        .{
-            .schema = 1,
-            .type = "ubuntu2604-local-secure-boot-acceptance",
-            .candidate_sha256 = &source_sha256_hex,
-            .certificate_sha256 = &certificate_sha256_hex,
-            .fallback_uki_sha256 = &uki_sha256_hex,
-            .contracts = &.{
-                "matching-architecture-native-kvm",
-                "standalone-zstd-qcow2",
-                "gpt-layout",
-                "secure-boot",
-                "uefi-db-signer",
-                "signed-uki",
-                "vtpm",
-                "kernel-lockdown",
-                "module-signatures",
-                "tampered-uki-rejected",
-                "key-only-ssh",
-                "cloud-init-provisioning",
-                "walinuxagent",
-                "netplan-networkd",
-                "generalized-identity",
-                "root-growth",
-                "reboot-reconnect",
-                "clean-service-health",
-            },
-        },
-        .{ .whitespace = .indent_2 },
+        io,
+        result_path,
+        candidate,
+        source_sha256,
+        certificate_sha256,
+        uki_sha256,
     );
-    defer allocator.free(result);
-    try Dir.cwd().writeFile(io, .{
-        .sub_path = result_path,
-        .data = result,
-        .flags = .{ .truncate = true },
-    });
 }
