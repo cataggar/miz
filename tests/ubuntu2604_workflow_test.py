@@ -158,10 +158,10 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         # The workflow targets a single immutable release identifier across the
         # concurrency group, tag, and title. Advancing it must be atomic and the
         # superseded identifier must not linger anywhere in the workflow.
-        self.assertIn("group: ubuntu2604-release-20260828", self.source)
-        self.assertIn("RELEASE_TAG: Ubuntu-26.04-20260828", self.source)
-        self.assertIn("RELEASE_TITLE: Ubuntu Server 26.04 - 20260828", self.source)
-        self.assertNotIn("20260827", self.source)
+        self.assertIn("group: ubuntu2604-release-20260829", self.source)
+        self.assertIn("RELEASE_TAG: Ubuntu-26.04-20260829", self.source)
+        self.assertIn("RELEASE_TITLE: Ubuntu Server 26.04 - 20260829", self.source)
+        self.assertNotIn("20260828", self.source)
 
     def test_forbidden_tools_are_confined_to_optional_oracle_jobs(self) -> None:
         jobs = list(re.finditer(r"(?m)^  ([a-z][a-z0-9_]*):\n", self.source))

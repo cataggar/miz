@@ -66,7 +66,7 @@ The following inputs are compiled into the builder:
 - arm64 manifest SHA-256:
   `2889120db0432e8029f8f01622efb40ce964e434ba2c81e98937ad1e2616e4f5`
 - embedded debz API commit:
-  `9cabfc0f808a8beb4709d7e5b3ae7baf19d733d5`
+  `80fa0069f51c0119279b305f5090f00ce72852c5`
 
 The builder first verifies the pinned checksum files with its bounded native
 OpenPGP verifier. It embeds Canonical's ASCII-armored public key, pins the
@@ -349,7 +349,7 @@ core images; all publication work remains explicitly deferred.
 accept core keys or assets, and `scripts/ubuntu2604_publish.sh` is intentionally
 unchanged. Before dispatch:
 
-1. Create the required tag `Ubuntu-26.04-20260828` at the exact current
+1. Create the required tag `Ubuntu-26.04-20260829` at the exact current
    `main` commit. Lightweight and annotated tags are accepted; an existing tag
    is never moved.
 2. Configure protected environment `ubuntu2604-signing`, restricted to

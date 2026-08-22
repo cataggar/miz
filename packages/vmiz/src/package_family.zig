@@ -11,7 +11,7 @@ const Dir = Io.Dir;
 pub const api_version: u32 = 4;
 pub const request_schema = "io.github.cataggar.vmiz.package-family.request.v4";
 pub const result_schema = "io.github.cataggar.vmiz.package-family.result.v4";
-pub const debz_api_commit = "9cabfc0f808a8beb4709d7e5b3ae7baf19d733d5";
+pub const debz_api_commit = "80fa0069f51c0119279b305f5090f00ce72852c5";
 pub const rpmz_api_commit = "15b5e1291a9fc3eb3980a4088d757b9d0254d468";
 pub const rpm_lock_schema = "io.github.cataggar.vmiz.rpm-lock.v1";
 pub const rpm_provenance_schema = "io.github.cataggar.vmiz.rpm-provenance.v1";
@@ -187,7 +187,14 @@ pub fn execute(
     if (!compatible(backends.debian.capabilities))
         return failed(.incompatible_backend, "incompatible debz package-family capability schema", .disposable, null);
 
-    const backend_result = executeDebz(allocator, io, backends.debian, request) catch {
+    // Own every debz-side allocation in a scoped arena so the returned result
+    // (diagnostic message, provenance path, product items) is released on all
+    // exits without the embedder guessing whether each field is heap or literal.
+    // The one field that must outlive the arena, `provenance_path`, is duplicated
+    // into `allocator` at the success return below.
+    var debz_arena = std.heap.ArenaAllocator.init(allocator);
+    defer debz_arena.deinit();
+    const backend_result = executeDebz(debz_arena.allocator(), io, backends.debian, request) catch {
         return failed(
             .backend_unavailable,
             "embedded debz backend could not execute",
@@ -273,7 +280,7 @@ pub fn execute(
         .succeeded = true,
         .published = publishes(request.operation),
         .lock_path = lock_path,
-        .provenance_path = provenance_path,
+        .provenance_path = if (provenance_path) |path| try allocator.dupe(u8, path) else null,
     };
 }
 
@@ -640,6 +647,11 @@ const FakeProduct = struct {
     seen_operation: ?debz.ProductOperation = null,
     seen_packages: usize = 0,
     fail_status: ?debz.ProductExitStatus = null,
+    // When set, the failure summary is allocated with the caller's allocator,
+    // faithfully reproducing the real debz backend whose describeExecutorFailure
+    // heap-allocates the diagnostic message. Exercises the embedder's ownership
+    // of that escaping message (regression for the production customize leak).
+    heap_message: bool = false,
 
     fn interface(self: *FakeProduct) debz.ProductBackend {
         return .{ .context = self, .executeFn = executeProduct };
@@ -647,14 +659,23 @@ const FakeProduct = struct {
 
     fn executeProduct(
         context: *anyopaque,
-        _: Allocator,
+        allocator: Allocator,
         request: debz.ProductRequest,
     ) !debz.ProductResult {
         const self: *FakeProduct = @ptrCast(@alignCast(context));
         self.seen_operation = request.operation;
         self.seen_packages = request.packages.len;
-        if (self.fail_status) |status|
-            return debz.product_api.failure(request.operation, status, .transaction_failed, "credential=https://secret@example.invalid");
+        if (self.fail_status) |status| {
+            const message = if (self.heap_message)
+                try std.fmt.allocPrint(
+                    allocator,
+                    "backend stage failed: FileNotFound opening credential=https://secret@example.invalid state lock",
+                    .{},
+                )
+            else
+                "credential=https://secret@example.invalid";
+            return debz.product_api.failure(request.operation, status, .transaction_failed, message);
+        }
         if (request.options.lock_output_path orelse request.options.lock_input_path) |path| {
             if (request.options.lock_output_path != null)
                 try writeTestLock(self.io, path, request.options.architecture);
@@ -980,6 +1001,61 @@ test "backend diagnostics redact credentials and preserve recoverable stage" {
     try std.testing.expectEqual(FailureDisposition.recoverable, result.diagnostic.?.disposition);
     try std.testing.expect(std.mem.indexOf(u8, result.diagnostic.?.message, "secret") == null);
     _ = try Dir.cwd().statFile(io, paths.stage, .{});
+}
+
+test "customize failure reports exit 7 and frees the escaping debz diagnostic for both architectures" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    // Reproduces the production aarch64 customize failure (backend_failed / exit 7)
+    // for both request shapes. The fake backend heap-allocates its diagnostic
+    // summary exactly as the real debz backend does; running on the leak-checking
+    // testing allocator asserts the embedder owns and frees that escaping message.
+    for ([_]Architecture{ .arm64, .amd64 }) |architecture| {
+        const paths = try fixturePaths(allocator, io, @tagName(architecture));
+        defer allocator.free(paths.stage);
+        defer allocator.free(paths.output);
+        defer allocator.free(paths.state);
+        defer allocator.free(paths.lock);
+        defer Dir.cwd().deleteTree(io, paths.stage) catch {};
+        defer Dir.cwd().deleteTree(io, paths.output) catch {};
+        defer Dir.cwd().deleteTree(io, paths.state) catch {};
+        try Dir.cwd().createDir(io, paths.stage, .default_dir);
+        try Dir.cwd().createDir(io, paths.state, .default_dir);
+        var fake: FakeProduct = .{
+            .io = io,
+            .state_path = paths.state,
+            .lock_path = paths.lock,
+            .fail_status = .transaction,
+            .heap_message = true,
+        };
+        const result = try execute(allocator, io, .{
+            .debian = .{ .product_executor = fake.interface() },
+        }, .{
+            .family = .debian,
+            .distribution = .ubuntu_26_04,
+            .operation = .customize,
+            .packages = &.{"ubuntu-minimal"},
+            .inputs = .{
+                .root_stage = paths.stage,
+                .published_root = paths.output,
+                .architecture = architecture,
+                .source_paths = &.{"/inputs/ubuntu.sources"},
+                .keyring_paths = &.{"/inputs/ubuntu.gpg"},
+                .cache_path = "/cache/debz",
+                .state_path = paths.state,
+                .lock_input_path = paths.lock,
+                .credential_reference = "/run/credentials/debz",
+            },
+        });
+        try std.testing.expect(!result.succeeded);
+        try std.testing.expect(!result.published);
+        try std.testing.expectEqual(DiagnosticId.backend_failed, result.diagnostic.?.id);
+        try std.testing.expectEqual(@as(?u8, 7), result.diagnostic.?.backend_exit_status);
+        try std.testing.expectEqual(FailureDisposition.recoverable, result.diagnostic.?.disposition);
+        try std.testing.expect(std.mem.indexOf(u8, result.diagnostic.?.message, "secret") == null);
+        // A recoverable customize failure preserves the staged root for retry.
+        _ = try Dir.cwd().statFile(io, paths.stage, .{});
+    }
 }
 
 test "pathsOverlap matches containment in either direction but not siblings" {
