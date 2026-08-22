@@ -97,6 +97,51 @@ CORE_AZURE_CONTRACTS = {
     "no-systemd-service-manager",
 }
 AZURE_CONTRACTS = FULL_AZURE_CONTRACTS
+FULL_NATIVE_CONTRACTS = {
+    "matching-architecture-native-kvm",
+    "standalone-zstd-qcow2",
+    "gpt-layout",
+    "secure-boot",
+    "uefi-db-signer",
+    "signed-uki",
+    "vtpm",
+    "kernel-lockdown",
+    "module-signatures",
+    "tampered-uki-rejected",
+    "key-only-ssh",
+    "cloud-init-provisioning",
+    "walinuxagent",
+    "netplan-networkd",
+    "generalized-identity",
+    "root-growth",
+    "reboot-reconnect",
+    "clean-service-health",
+}
+CORE_NATIVE_CONTRACTS = {
+    "matching-architecture-native-kvm",
+    "standalone-zstd-qcow2",
+    "gpt-layout",
+    "secure-boot",
+    "uefi-db-signer",
+    "signed-uki",
+    "vtpm",
+    "kernel-lockdown",
+    "module-signatures",
+    "tampered-uki-rejected",
+    "key-only-ssh",
+    "local-ovf-azagent-skip-ready",
+    "azagent-provisioning",
+    "vmizinit-pid1",
+    "vmizinit-sshd-supervision",
+    "sshd-restart",
+    "persistent-provisioned-state",
+    "no-cloud-init",
+    "no-walinuxagent",
+    "generalized-identity",
+    "root-growth",
+    "reboot-reconnect",
+    "clean-service-health",
+}
 RELEASE_TAG_RE = re.compile(r"^Ubuntu-26\.04-[0-9]{8}$")
 SNAPSHOT_ID_RE = re.compile(r"^release-[0-9]{8}(?:\.[0-9]+)?$")
 CANONICAL_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -209,6 +254,14 @@ def azure_contracts(flavor: str) -> tuple[str, ...]:
     if flavor == "core":
         return tuple(sorted(CORE_AZURE_CONTRACTS))
     fail(f"unsupported Ubuntu flavor for Azure acceptance: {flavor!r}")
+
+
+def native_contracts(flavor: str) -> tuple[str, ...]:
+    if flavor == "full":
+        return tuple(sorted(FULL_NATIVE_CONTRACTS))
+    if flavor == "core":
+        return tuple(sorted(CORE_NATIVE_CONTRACTS))
+    fail(f"unsupported Ubuntu flavor for native acceptance: {flavor!r}")
 
 
 def validate_azure_uefi_settings(
@@ -1077,6 +1130,80 @@ def verify_candidate_command(args: argparse.Namespace) -> None:
     print(document["virtual_size"])
 
 
+def validate_native_result(
+    manifest_path: Path,
+    asset_path: Path,
+    result_path: Path,
+    *,
+    key: str | None = None,
+    source_commit: str | None = None,
+) -> dict[str, object]:
+    candidate = verify_candidate(
+        manifest_path,
+        asset_path,
+        key=key,
+        source_commit=source_commit,
+    )
+    result = read_json(result_path)
+    common_fields = {
+        "schema",
+        "type",
+        "candidate_sha256",
+        "certificate_sha256",
+        "fallback_uki_sha256",
+        "contracts",
+    }
+    flavor = candidate["flavor"]
+    expected_fields = common_fields
+    expected_schema = 1
+    if flavor == "core":
+        expected_fields = common_fields | {
+            "architecture",
+            "flavor",
+            "virtual_size",
+        }
+        expected_schema = 2
+    if set(result) != expected_fields:
+        fail(f"{candidate['key']}: native acceptance result has unexpected fields")
+    if (
+        result.get("schema") != expected_schema
+        or result.get("type") != "ubuntu2604-local-secure-boot-acceptance"
+        or result.get("candidate_sha256") != candidate["sha256"]
+        or result.get("certificate_sha256")
+        != candidate["uki_signing"]["certificate_sha256"]
+        or result.get("fallback_uki_sha256")
+        != candidate["uki_signing"]["fallback_uki_sha256"]
+    ):
+        fail(f"{candidate['key']}: native acceptance identity is invalid")
+    if flavor == "core" and (
+        result.get("architecture") != candidate["architecture"]
+        or result.get("flavor") != flavor
+        or result.get("virtual_size") != candidate["virtual_size"]
+    ):
+        fail(f"{candidate['key']}: native core identity is invalid")
+    expected_contracts = list(native_contracts(flavor))
+    contracts = result.get("contracts")
+    if (
+        not isinstance(contracts, list)
+        or len(contracts) != len(expected_contracts)
+        or set(contracts) != set(expected_contracts)
+    ):
+        fail(f"{candidate['key']}: native acceptance contracts are invalid")
+    return result
+
+
+def verify_native_result_command(args: argparse.Namespace) -> None:
+    result = validate_native_result(
+        args.manifest,
+        args.asset,
+        args.result,
+        key=args.key,
+        source_commit=args.source_commit,
+    )
+    print(result["candidate_sha256"])
+    print(",".join(result["contracts"]))
+
+
 def verify_vhd_command(args: argparse.Namespace) -> None:
     geometry = inspect_azure_vhd(args.info, args.vhd)
     print(geometry.current_size)
@@ -1777,6 +1904,14 @@ def parser() -> argparse.ArgumentParser:
     verify.add_argument("--key", required=True)
     verify.add_argument("--source-commit", required=True)
     verify.set_defaults(function=verify_candidate_command)
+
+    verify_native = commands.add_parser("verify-native-result")
+    verify_native.add_argument("--manifest", type=Path, required=True)
+    verify_native.add_argument("--asset", type=Path, required=True)
+    verify_native.add_argument("--result", type=Path, required=True)
+    verify_native.add_argument("--key", required=True)
+    verify_native.add_argument("--source-commit", required=True)
+    verify_native.set_defaults(function=verify_native_result_command)
 
     verify_vhd = commands.add_parser("verify-vhd")
     verify_vhd.add_argument("--info", type=Path, required=True)

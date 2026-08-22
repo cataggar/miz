@@ -1,25 +1,39 @@
 # Ubuntu 26.04 images
 
-The Ubuntu 26.04 release set contains two conventional Server images:
+vmiz has full and core Ubuntu 26.04 build flavors for both supported
+architectures:
 
-| vmiz architecture | Ubuntu architecture | Asset |
-| --- | --- | --- |
-| `x86_64` | `amd64` | `Ubuntu-26.04-x86_64.qcow2` |
-| `aarch64` | `arm64` | `Ubuntu-26.04-aarch64.qcow2` |
+| Flavor | vmiz architecture | Ubuntu architecture | Candidate | Default virtual size | Boot/provisioning |
+| --- | --- | --- | --- | --- | --- |
+| full | `x86_64` | `amd64` | `Ubuntu-26.04-x86_64.qcow2` | 5 GiB | systemd, cloud-init, WALinuxAgent |
+| full | `aarch64` | `arm64` | `Ubuntu-26.04-aarch64.qcow2` | 5 GiB | systemd, cloud-init, WALinuxAgent |
+| core | `x86_64` | `amd64` | `Ubuntu-26.04-x86_64.core.qcow2` | 3584 MiB | vmizinit, azagent |
+| core | `aarch64` | `arm64` | `Ubuntu-26.04-aarch64.core.qcow2` | 3584 MiB | vmizinit, azagent |
 
-Both are full, generalized Ubuntu Server images. There is no Ubuntu core
-flavor in this release.
+Only the two full images are currently release assets. Core candidates are
+built, signed, and accepted by a separate protected validation workflow, but
+are retained only as short-lived workflow artifacts. Core publication,
+release assets, tags, and catalog aliases are deferred to a follow-up.
 
 ## Immutable source and package provenance
 
 `scripts/build_generalized_ubuntu2604.zig` uses Canonical's immutable
-`release-20260731` cloud-image publication. The official server cloud disk,
-not a root tarball reconstructed from packages, is the authoritative
-filesystem and initial package input. The builder then extracts that root and
-passes a bounded, readable staging view to the embedded
-`vmiz.package_family` debz backend against
-`https://snapshot.ubuntu.com/ubuntu/20260731T000000Z` to install the coherent
-`linux-azure` and `walinuxagent` closures.
+`release-20260731` cloud-image publication and
+`https://snapshot.ubuntu.com/ubuntu/20260731T000000Z`.
+
+For full, the official server cloud disk is the authoritative filesystem and
+installed-package baseline. The embedded `vmiz.package_family` debz backend
+adds exact `linux-azure` and `walinuxagent` closures without reconstructing the
+root from packages.
+
+For core, the same signed cloud disk is used only as the pinned Gen2 GPT and
+EFI-system-partition substrate. The server root is discarded and a fresh root
+is assembled from an empty debz baseline with exact package roots, in stable
+order: `ubuntu-minimal`, `linux-azure`, `openssh-server`, and `sudo`. The
+resolved closure must also contain `openssh-client` and `ca-certificates`, and
+must not contain cloud-init, WALinuxAgent, `ubuntu-server`, or
+`ubuntu-server-minimal`. This source/package decision is part of core
+provenance and is not inferred from mutable archive state.
 
 The package-root round trip is native: the mutable QCOW2 is converted to a
 raw staging image, `vmiz.ext4_mountless.FileSystem` reads the selected ext4
@@ -65,25 +79,30 @@ selected image and manifest. It separately hashes downloaded or `--source`
 image bytes. The manifest must contain the expected architecture and the
 systemd, cloud-init, cloud-guest-utils, OpenSSH, sudo, and netplan packages.
 
-Each of `linux-azure` and `walinuxagent` is a separate debz transaction:
-resolve an exact closure lock from the Canonical image's installed dpkg
-baseline, apply that same lock with strict repository priority and no
-recommends or downgrades, and retain both the exact lock and
-`transaction-result.json`. Missing baseline packages, versions, or
-architectures fail lock generation. The transaction provenance's `lock_sha256` must
-equal the lock's semantic digest. The final sorted dpkg inventory at
-`/var/lib/vmiz/ubuntu2604-package-lock.tsv` must contain the Azure kernel,
-agent, cloud-init, and OpenSSH for the selected architecture and no foreign
-amd64/arm64 packages. The native inspection records the selected kernel,
-initramfs, modules directory, and exact lock digest in
+Every requested package is a separate debz transaction. Full resolves
+`linux-azure` and `walinuxagent` from the Canonical image's installed dpkg
+baseline. Core resolves its four package roots from the empty root. Both apply
+the same exact lock with strict repository priority and no recommends or
+downgrades, and retain the exact lock and `transaction-result.json`. Missing
+baseline packages, versions, architectures, or closure members fail the
+build. The transaction provenance's `lock_sha256` must equal the lock's
+semantic digest. The final sorted dpkg inventory at
+`/var/lib/vmiz/ubuntu2604-package-lock.tsv` must match the selected flavor and
+architecture with no foreign amd64/arm64 packages. Native inspection records
+the selected kernel, initramfs, modules directory, and exact lock digest in
 `internal-provenance/ubuntu2604-boot-input-evidence.json`.
 
 ## Guest and disk contract
 
-The output is a standalone, zstd-compressed QCOW2 with an exact default
-virtual size of 5 GiB. It retains the Canonical Gen2 GPT layout: the root is
-`/dev/sda1` and the EFI system partition is `/dev/sda15`. Firmware directly
-loads the signed architecture-specific UKI from both the fallback path
+Each output is a standalone, zstd-compressed QCOW2. Full has an exact default
+virtual size of 5 GiB. Core is exactly 3584 MiB: the size of the pinned signed
+substrate, 30% smaller than full. Its fresh root must retain at least 768 MiB
+free after package installation and final injection; the measured free bytes,
+minimum, and virtual size are provenance fields and validation gates.
+
+Both flavors retain the Canonical Gen2 GPT layout: the root is `/dev/sda1` and
+the EFI system partition is `/dev/sda15`. Firmware directly loads the signed
+architecture-specific UKI from both the fallback path
 (`EFI/BOOT/BOOTX64.EFI` or `EFI/BOOT/BOOTAA64.EFI`) and the corresponding
 `EFI/Linux/` path; shim and GRUB are not required for this boot path.
 
@@ -93,7 +112,7 @@ non-Azure active kernel, missing modules, wrong PE architecture, invalid
 signature, missing final UKI, wrong Ubuntu release, backing file, or wrong
 virtual size.
 
-The generalized guest uses:
+The generalized full guest uses:
 
 - systemd, cloud-init with only the Azure datasource, and WALinuxAgent with
   agent provisioning enabled while resource-disk formatting and swap remain
@@ -108,6 +127,23 @@ The generalized guest uses:
 First boot regenerates per-instance identity and host keys. Acceptance launches
 two instances to prove those identities differ, remain stable across reboot,
 and are not inherited from the candidate.
+
+The generalized core guest has no systemd service manager, cloud-init, or
+WALinuxAgent state. The builder injects architecture-matched static
+`/usr/sbin/vmizinit` and `/usr/sbin/azagent` binaries. The signed UKI selects
+`init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=auto`.
+`vmizinit` is PID 1: it mounts the required kernel filesystems, initializes
+networking, generates a machine ID and SSH host keys when absent, supervises
+`sshd -D -e`, restarts it after failure, and launches `azagent`.
+
+`azagent` reads Azure's OVF provisioning media, creates the requested
+administrator with key-only SSH and passwordless sudo, persists
+`/var/lib/azagent/provisioned`, grows the root, formats the Azure resource disk
+as XFS at `/d` without swap, mounts managed data disks without formatting
+them, and reports Ready in Azure. Explicitly marked local OVF media instead
+runs `azagent --skip-ready` for native-QEMU acceptance. Provisioned identity,
+authorized keys, host keys, and the sentinel must persist across reboot;
+separate instances must not inherit them from the candidate.
 
 ## Local build
 
@@ -142,8 +178,8 @@ invokes `openssl`, `sbsign`, or `sbverify`. Standalone zstd-compressed QCOW2
 finalization is native as well; all resize, copy, GPT, filesystem mutation, and
 final structural validation before publication run without `qemu-img`.
 
-The full build runs the bounded guest-tool allowlist in a private mount, PID,
-and network namespace, so it must be invoked with `sudo` on Linux. The executor
+A complete build runs the bounded guest-tool allowlist in a private mount,
+PID, and network namespace, so it must be invoked with `sudo` on Linux. The executor
 establishes and tears down the namespace using direct, audited Linux syscalls
 (`clone`, `mount`, `mknod`, and `chroot`) rather than `util-linux` command
 helpers such as `unshare`, `mount`, `umount`, or `setsid`. It mounts only
@@ -159,6 +195,8 @@ verifiers with:
 ```console
 zig build -Dubuntu2604-arch=x86_64 generalized-ubuntu2604 -- --preflight-only
 zig build -Dubuntu2604-arch=aarch64 generalized-ubuntu2604 -- --preflight-only
+zig build -Dubuntu2604-arch=x86_64 -Dubuntu2604-flavor=core generalized-ubuntu2604 -- --preflight-only
+zig build -Dubuntu2604-arch=aarch64 -Dubuntu2604-flavor=core generalized-ubuntu2604 -- --preflight-only
 ```
 
 Release artifacts are fetched by vmiz's native HTTPS downloader. It accepts
@@ -170,8 +208,8 @@ verification gates. The bounded request-buffer sizing for signed redirects is
 informed by [`ghr`'s MIT-licensed HTTP implementation](https://github.com/cataggar/ghr/blob/main/src/http.zig);
 vmiz does not vendor that code.
 
-A full build requires signing. For local development, supply exactly one
-certificate and private key:
+A complete image build requires signing. For local development, supply exactly
+one certificate and private key:
 
 ```console
 sudo -E zig build -Dubuntu2604-arch=x86_64 generalized-ubuntu2604 -- \
@@ -184,6 +222,32 @@ sudo -E zig build -Dubuntu2604-arch=x86_64 generalized-ubuntu2604 -- \
 sudo -E zig build -Dubuntu2604-arch=aarch64 generalized-ubuntu2604 -- \
   --provenance-dir artifacts/aarch64/internal-provenance \
   --output artifacts/aarch64/Ubuntu-26.04-aarch64.qcow2 \
+  --uki-signing-certificate test.pem \
+  --uki-signing-certificate-sha256 <canonical-DER-SHA-256> \
+  --uki-signing-key test.key
+```
+
+Build core explicitly for both architectures; the flavor selects the exact
+3584 MiB size, core asset name, static guest binaries, and empty-root package
+policy:
+
+```console
+sudo -E zig build \
+  -Dubuntu2604-arch=x86_64 \
+  -Dubuntu2604-flavor=core \
+  generalized-ubuntu2604 -- \
+  --provenance-dir artifacts/x86_64-core/internal-provenance \
+  --output artifacts/x86_64-core/Ubuntu-26.04-x86_64.core.qcow2 \
+  --uki-signing-certificate test.pem \
+  --uki-signing-certificate-sha256 <canonical-DER-SHA-256> \
+  --uki-signing-key test.key
+
+sudo -E zig build \
+  -Dubuntu2604-arch=aarch64 \
+  -Dubuntu2604-flavor=core \
+  generalized-ubuntu2604 -- \
+  --provenance-dir artifacts/aarch64-core/internal-provenance \
+  --output artifacts/aarch64-core/Ubuntu-26.04-aarch64.core.qcow2 \
   --uki-signing-certificate test.pem \
   --uki-signing-certificate-sha256 <canonical-DER-SHA-256> \
   --uki-signing-key test.key
@@ -209,20 +273,21 @@ The external command must be absolute. Local-key and external-command modes
 are mutually exclusive. Private signing material is never copied into the
 guest.
 
-Without overrides, outputs are written in the current directory and work is
+Without overrides, outputs are written in the current directory. Full work is
 cached under `.scratch/ubuntu2604-x86_64` or
-`.scratch/ubuntu2604-aarch64`. A provenance directory contains the verified
-`SHA256SUMS`, signature, architecture manifest,
-`ubuntu2604-build-provenance.json`, `uki-signing-full-<architecture>.json`,
-and, for both `linux-azure` and `walinuxagent`,
-`debz-exact-lock-<package>-<amd64|arm64>.json` plus
-`debz-transaction-provenance-<package>-<amd64|arm64>.json`.
+`.scratch/ubuntu2604-aarch64`; core uses the corresponding `-core` suffix. A
+provenance directory contains the verified `SHA256SUMS`, signature,
+architecture manifest, `ubuntu2604-build-provenance.json`,
+`uki-signing-<flavor>-<architecture>.json`, and exact-lock plus transaction
+provenance files for every flavor-specific package root.
 
 The build validates the source chain before modification and revalidates the
 final QCOW2, GPT partitions, Ubuntu identity, package inventory, UKI locations,
-PE architecture, and signature. The release workflow additionally runs
-`qemu-img check`, requires zstd compression and no backing file, binds every
-provenance sidecar into `candidate.json`, and rejects private-key material.
+PE architecture, and signature. Both workflows additionally use native
+`vmiz check` and `vmiz info` to require zstd compression and no backing file,
+bind every provenance sidecar into `candidate.json`, and reject private-key
+material. External `qemu-img` remains confined to acceptance-time inspection
+and the Azure fixed-VHD conversion boundary.
 
 ## Acceptance infrastructure
 
@@ -251,10 +316,38 @@ identity, agent Ready state, root growth, data disk, reboot, vTPM, lockdown,
 and module signatures. Cleanup deletes only the expected resource group with
 the exact run ownership tags.
 
-## Release workflow
+Core acceptance adds the vmizinit PID-1 and SSH-supervision contract, local
+OVF `azagent --skip-ready`, Azure Ready reporting, provisioning and identity
+persistence, resource-disk formatting, managed-data-disk mount-only behavior,
+and explicit absence of cloud-init, WALinuxAgent, and a systemd service
+manager.
+
+## Core validation workflow
+
+`.github/workflows/ubuntu2604-core-validation.yml` is a separate manually
+dispatched workflow restricted to `main`. It uses the same protected
+`ubuntu2604-signing` and `ubuntu2604-release` environments and OIDC subjects
+described below, with serialized non-cancelling concurrency. No tag is
+required.
+
+The workflow builds and signs exactly `x86_64-core` and `aarch64-core`, then
+requires both native-QEMU jobs and both Azure Trusted Launch jobs. Candidate
+reuse accepts only a completed manual run of this same workflow at the exact
+current remote `main` commit and exact run attempt, with both named build jobs
+successful and exactly two nonempty, unexpired candidate artifacts.
+
+Candidates, native results, Azure results, and a final digest-bound
+two-architecture validation manifest are uploaded only as workflow artifacts.
+The workflow has no publish job, release command, tag contract, release asset,
+or catalog mutation. Successful protected validation does not itself publish
+core images; all publication work remains explicitly deferred.
+
+## Full/server release workflow
 
 `.github/workflows/ubuntu2604-release.yml` is manually dispatched from
-`main`. Before dispatch:
+`main` and still publishes exactly the two full/server assets. It does not
+accept core keys or assets, and `scripts/ubuntu2604_publish.sh` is intentionally
+unchanged. Before dispatch:
 
 1. Create the required tag `Ubuntu-26.04-20260828` at the exact current
    `main` commit. Lightweight and annotated tags are accepted; an existing tag

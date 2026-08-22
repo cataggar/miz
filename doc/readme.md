@@ -20,7 +20,7 @@
 ## Platform images
 
 - [Azure Linux images](azure-linux.md)
-- [Ubuntu 26.04 images](ubuntu.md)
+- [Ubuntu 26.04 full and core images](ubuntu.md)
 - [FreeBSD images](freebsd.md)
 
 ## Development

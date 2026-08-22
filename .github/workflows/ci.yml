@@ -40,6 +40,14 @@ jobs:
       - name: FreeBSD release workflow unit tests
         run: python3 -m unittest discover -s tests -p freebsd15_release_test.py
 
+      - name: Ubuntu release and validation workflow unit tests
+        run: |
+          python3 -m unittest \
+            tests.ubuntu2604_release_test \
+            tests.ubuntu2604_workflow_test \
+            tests.ubuntu2604_core_workflow_test \
+            tests.ubuntu2604_azure_acceptance_test
+
       - name: zig build
         run: zig build
 
