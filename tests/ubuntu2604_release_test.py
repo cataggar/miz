@@ -610,6 +610,110 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         )
         self.assertEqual(azure["contracts"], candidate["azure_contracts"])
 
+    def test_core_native_result_binds_candidate_identity_and_contracts(self):
+        key = "aarch64-core"
+        self.make_bundle(key)
+        candidate_dir = self.candidates / key
+        candidate = json.loads(
+            (candidate_dir / "candidate.json").read_text(encoding="utf-8")
+        )
+        native_path = candidate_dir / "native-result.json"
+        native_path.write_text(
+            json.dumps(
+                {
+                    "schema": 2,
+                    "type": "ubuntu2604-local-secure-boot-acceptance",
+                    "architecture": candidate["architecture"],
+                    "flavor": candidate["flavor"],
+                    "virtual_size": candidate["virtual_size"],
+                    "candidate_sha256": candidate["sha256"],
+                    "certificate_sha256": candidate["uki_signing"][
+                        "certificate_sha256"
+                    ],
+                    "fallback_uki_sha256": candidate["uki_signing"][
+                        "fallback_uki_sha256"
+                    ],
+                    "contracts": list(release.native_contracts("core")),
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = release.validate_native_result(
+            candidate_dir / "candidate.json",
+            candidate_dir / candidate["asset_name"],
+            native_path,
+            key=key,
+            source_commit=self.source_commit,
+        )
+        self.assertEqual(result["architecture"], "aarch64")
+        self.assertEqual(result["flavor"], "core")
+        self.assertEqual(
+            set(result["contracts"]),
+            release.CORE_NATIVE_CONTRACTS,
+        )
+
+        for field, replacement in (
+            ("schema", 1),
+            ("architecture", "x86_64"),
+            ("virtual_size", candidate["virtual_size"] + 1),
+            ("candidate_sha256", "0" * 64),
+            ("contracts", list(release.native_contracts("full"))),
+        ):
+            with self.subTest(field=field):
+                document = json.loads(native_path.read_text(encoding="utf-8"))
+                document[field] = replacement
+                native_path.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertRaises(SystemExit):
+                    release.validate_native_result(
+                        candidate_dir / "candidate.json",
+                        candidate_dir / candidate["asset_name"],
+                        native_path,
+                        key=key,
+                        source_commit=self.source_commit,
+                    )
+                document[field] = (
+                    2
+                    if field == "schema"
+                    else candidate["architecture"]
+                    if field == "architecture"
+                    else candidate["virtual_size"]
+                    if field == "virtual_size"
+                    else candidate["sha256"]
+                    if field == "candidate_sha256"
+                    else list(release.native_contracts("core"))
+                )
+                native_path.write_text(json.dumps(document), encoding="utf-8")
+
+    def test_core_native_contract_set_covers_appliance_acceptance(self):
+        self.assertEqual(
+            release.CORE_NATIVE_CONTRACTS,
+            {
+                "matching-architecture-native-kvm",
+                "standalone-zstd-qcow2",
+                "gpt-layout",
+                "secure-boot",
+                "uefi-db-signer",
+                "signed-uki",
+                "vtpm",
+                "kernel-lockdown",
+                "module-signatures",
+                "tampered-uki-rejected",
+                "key-only-ssh",
+                "local-ovf-azagent-skip-ready",
+                "azagent-provisioning",
+                "vmizinit-pid1",
+                "vmizinit-sshd-supervision",
+                "sshd-restart",
+                "persistent-provisioned-state",
+                "no-cloud-init",
+                "no-walinuxagent",
+                "generalized-identity",
+                "root-growth",
+                "reboot-reconnect",
+                "clean-service-health",
+            },
+        )
+
     def test_full_azure_contract_set_is_unchanged(self):
         self.assertEqual(
             release.FULL_AZURE_CONTRACTS,
