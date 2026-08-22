@@ -48,8 +48,13 @@ EXPECTED = {
     "x86_64-full": ("x86_64", "full", "Ubuntu-26.04-x86_64.qcow2"),
     "aarch64-full": ("aarch64", "full", "Ubuntu-26.04-aarch64.qcow2"),
 }
+CANDIDATE_EXPECTED = {
+    **EXPECTED,
+    "x86_64-core": ("x86_64", "core", "Ubuntu-26.04-x86_64.core.qcow2"),
+    "aarch64-core": ("aarch64", "core", "Ubuntu-26.04-aarch64.core.qcow2"),
+}
 RELEASE_ORDER = tuple(EXPECTED)
-AZURE_CONTRACTS = {
+FULL_AZURE_CONTRACTS = {
     "matching-architecture-gen2",
     "trusted-launch",
     "secure-boot",
@@ -66,6 +71,32 @@ AZURE_CONTRACTS = {
     "reboot-reconnect",
     "runtime-release-identity",
 }
+CORE_AZURE_CONTRACTS = {
+    "matching-architecture-gen2",
+    "trusted-launch",
+    "secure-boot",
+    "vtpm",
+    "uefi-db-signer",
+    "signed-uki",
+    "kernel-lockdown",
+    "module-signatures",
+    "key-only-ssh",
+    "azagent-provisioning",
+    "agent-ready",
+    "vmizinit-pid1",
+    "pid1-supervised-sshd",
+    "sshd-restart-reconnect",
+    "identity-persistence",
+    "root-growth",
+    "resource-disk",
+    "managed-data-disk-mount-only",
+    "reboot-reconnect",
+    "runtime-release-identity",
+    "no-cloud-init",
+    "no-walinuxagent",
+    "no-systemd-service-manager",
+}
+AZURE_CONTRACTS = FULL_AZURE_CONTRACTS
 RELEASE_TAG_RE = re.compile(r"^Ubuntu-26\.04-[0-9]{8}$")
 SNAPSHOT_ID_RE = re.compile(r"^release-[0-9]{8}(?:\.[0-9]+)?$")
 CANONICAL_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -83,6 +114,7 @@ CANDIDATE_FIELDS = {
     "sha256",
     "bytes",
     "virtual_size",
+    "azure_contracts",
     "build_validation",
     "provenance",
     "ubuntu_provenance",
@@ -166,6 +198,14 @@ def has_exact_contracts(value: object, expected: set[str]) -> bool:
         and all(isinstance(item, str) for item in value)
         and set(value) == expected
     )
+
+
+def azure_contracts(flavor: str) -> tuple[str, ...]:
+    if flavor == "full":
+        return tuple(sorted(FULL_AZURE_CONTRACTS))
+    if flavor == "core":
+        return tuple(sorted(CORE_AZURE_CONTRACTS))
+    fail(f"unsupported Ubuntu flavor for Azure acceptance: {flavor!r}")
 
 
 def validate_azure_uefi_settings(
@@ -322,11 +362,11 @@ def validate_identity(
     if set(document) != expected_fields:
         fail(f"invalid {expected_type} fields")
     actual_key = document.get("key")
-    if not isinstance(actual_key, str) or actual_key not in EXPECTED:
+    if not isinstance(actual_key, str) or actual_key not in CANDIDATE_EXPECTED:
         fail(f"invalid candidate key: {actual_key!r}")
     if key is not None and actual_key != key:
         fail(f"candidate key mismatch: expected {key}, got {actual_key}")
-    architecture, flavor, asset_name = EXPECTED[actual_key]
+    architecture, flavor, asset_name = CANDIDATE_EXPECTED[actual_key]
     if document.get("architecture") != architecture:
         fail(f"{actual_key}: architecture mismatch")
     if document.get("flavor") != flavor:
@@ -779,9 +819,9 @@ def candidate_command(args: argparse.Namespace) -> None:
     asset = args.asset.resolve()
     if not asset.is_file():
         fail(f"candidate asset is missing: {asset}")
-    if args.key not in EXPECTED:
+    if args.key not in CANDIDATE_EXPECTED:
         fail(f"unknown candidate key: {args.key}")
-    architecture, flavor, asset_name = EXPECTED[args.key]
+    architecture, flavor, asset_name = CANDIDATE_EXPECTED[args.key]
     if args.architecture != architecture or args.flavor != flavor:
         fail(f"{args.key}: architecture/flavor arguments do not match")
     if asset.name != asset_name:
@@ -822,6 +862,7 @@ def candidate_command(args: argparse.Namespace) -> None:
             "sha256": digest,
             "bytes": asset.stat().st_size,
             "virtual_size": args.virtual_size,
+            "azure_contracts": list(azure_contracts(flavor)),
             "build_validation": {
                 "status": "success",
                 "validated_sha256": args.validated_sha256,
@@ -870,6 +911,9 @@ def verify_candidate(
     virtual_size = document.get("virtual_size")
     if type(virtual_size) is not int or virtual_size <= 0:
         fail(f"{actual_key}: invalid virtual size")
+    expected_azure_contracts = list(azure_contracts(document["flavor"]))
+    if document.get("azure_contracts") != expected_azure_contracts:
+        fail(f"{actual_key}: Azure acceptance contract binding is invalid")
     build_validation = document.get("build_validation")
     if (
         not isinstance(build_validation, dict)
@@ -1077,6 +1121,12 @@ def azure_result_command(args: argparse.Namespace) -> None:
         response,
         candidate["uki_signing"]["certificate_sha256"],
     )
+    provided_contracts = tuple(item.strip() for item in args.contracts.split(","))
+    expected_contracts = azure_contracts(candidate["flavor"])
+    if provided_contracts != expected_contracts:
+        fail("Azure contracts do not exactly match the candidate flavor")
+    if candidate["azure_contracts"] != list(provided_contracts):
+        fail("Azure contracts do not match candidate metadata")
     for label, value in (
         ("Azure location", args.location),
         ("Azure VM size", args.vm_size),
@@ -1115,13 +1165,176 @@ def azure_result_command(args: argparse.Namespace) -> None:
             "location": args.location,
             "vm_size": args.vm_size,
             "resource_group": args.resource_group,
-            "contracts": sorted(AZURE_CONTRACTS),
+            "contracts": list(provided_contracts),
             "workflow": {
                 "run_id": args.run_id,
                 "run_attempt": args.run_attempt,
             },
         },
     )
+
+
+def validate_azure_result(
+    manifest_path: Path,
+    asset_path: Path,
+    result_path: Path,
+    *,
+    key: str | None = None,
+    source_commit: str | None = None,
+) -> dict[str, object]:
+    candidate = verify_candidate(
+        manifest_path,
+        asset_path,
+        key=key,
+        source_commit=source_commit,
+    )
+    result = read_json(result_path)
+    actual_key, _, flavor, asset_name = validate_identity(
+        result,
+        expected_type="ubuntu2604-azure-acceptance",
+        key=candidate["key"],
+        source_commit=candidate["source_commit"],
+    )
+    digest = require_sha256(candidate.get("sha256"), f"{actual_key} candidate digest")
+    if result.get("status") != "success":
+        fail(f"{actual_key}: Azure acceptance is not explicitly successful")
+    if (
+        result.get("qcow_sha256") != digest
+        or result.get("azure_accepted_sha256") != digest
+    ):
+        fail(f"{actual_key}: Azure acceptance did not validate candidate bytes")
+    signing = candidate.get("uki_signing")
+    if not isinstance(signing, dict):
+        fail(f"{actual_key}: UKI signing binding is absent")
+    if (
+        result.get("certificate_sha256") != signing.get("certificate_sha256")
+        or result.get("signing_certificate_sha256")
+        != signing.get("signing_certificate_sha256")
+        or result.get("fallback_uki_sha256") != signing.get("fallback_uki_sha256")
+    ):
+        fail(f"{actual_key}: Azure acceptance did not bind the signed UKI identity")
+    certificate_sha256 = require_sha256(
+        signing.get("certificate_sha256"),
+        f"{actual_key} signing certificate fingerprint",
+    )
+    validate_azure_uefi_settings(result.get("uefi_settings"), certificate_sha256)
+    if (
+        not isinstance(result.get("image_version_id"), str)
+        or not result["image_version_id"].startswith("/subscriptions/")
+    ):
+        fail(f"{actual_key}: Azure gallery image-version identity is absent")
+    for field, label in (
+        ("location", "location"),
+        ("vm_size", "VM size"),
+        ("resource_group", "resource group"),
+    ):
+        if not isinstance(result.get(field), str) or not result[field]:
+            fail(f"{actual_key}: Azure {label} is absent")
+    workflow = result.get("workflow")
+    if (
+        not isinstance(workflow, dict)
+        or set(workflow) != {"run_id", "run_attempt"}
+        or any(
+            not isinstance(workflow.get(field), str) or not workflow[field]
+            for field in ("run_id", "run_attempt")
+        )
+    ):
+        fail(f"{actual_key}: Azure workflow identity is absent")
+    expected_contracts = list(azure_contracts(flavor))
+    if candidate.get("azure_contracts") != expected_contracts:
+        fail(f"{actual_key}: candidate Azure contract binding is invalid")
+    if result.get("contracts") != expected_contracts:
+        fail(f"{actual_key}: Azure contracts do not match candidate metadata")
+
+    conversion = result.get("conversion")
+    if (
+        not isinstance(conversion, dict)
+        or set(conversion)
+        != {
+            "schema",
+            "type",
+            "key",
+            "status",
+            "tool",
+            "operation",
+            "source",
+            "parameters",
+            "result",
+        }
+        or conversion.get("schema") != 1
+        or conversion.get("type") != "vmiz-azure-vhd-conversion"
+        or conversion.get("key") != actual_key
+        or conversion.get("status") != "success"
+        or conversion.get("tool") != "vmiz"
+        or conversion.get("operation") != "azure derive"
+    ):
+        fail(f"{actual_key}: Azure VHD conversion attestation is invalid")
+    if conversion.get("source") != {
+        "asset_name": asset_name,
+        "sha256_before": digest,
+        "sha256_after": digest,
+        "bytes": candidate["bytes"],
+        "virtual_size": candidate["virtual_size"],
+    }:
+        fail(f"{actual_key}: Azure VHD conversion source binding is invalid")
+    if conversion.get("parameters") != {
+        "input_sha256": digest,
+        "expected_virtual_size": candidate["virtual_size"],
+        "output_format": "vpc-fixed",
+        "vhd_alignment_bytes": AZURE_VHD_ALIGNMENT,
+        "vhd_footer_bytes": VHD_FOOTER_BYTES,
+    }:
+        fail(f"{actual_key}: Azure VHD conversion parameters are invalid")
+    conversion_result = conversion.get("result")
+    if not isinstance(conversion_result, dict) or set(conversion_result) != {
+        "sha256",
+        "bytes",
+        "current_size",
+        "qemu_virtual_size",
+        "qemu_info_sha256",
+    }:
+        fail(f"{actual_key}: Azure VHD conversion result is invalid")
+    require_sha256(conversion_result.get("sha256"), f"{actual_key} VHD digest")
+    require_sha256(
+        conversion_result.get("qemu_info_sha256"),
+        f"{actual_key} qemu VHD info digest",
+    )
+    derived_vhd_bytes = conversion_result.get("bytes")
+    derived_vhd_current_size = conversion_result.get("current_size")
+    qemu_virtual_size = conversion_result.get("qemu_virtual_size")
+    expected_vhd_current_size = (
+        (candidate["virtual_size"] + AZURE_VHD_ALIGNMENT - 1)
+        // AZURE_VHD_ALIGNMENT
+        * AZURE_VHD_ALIGNMENT
+    )
+    if (
+        type(derived_vhd_bytes) is not int
+        or type(derived_vhd_current_size) is not int
+        or type(qemu_virtual_size) is not int
+        or derived_vhd_current_size <= 0
+        or derived_vhd_current_size != expected_vhd_current_size
+        or derived_vhd_bytes != derived_vhd_current_size + VHD_FOOTER_BYTES
+        or qemu_virtual_size <= 0
+    ):
+        fail(f"{actual_key}: derived VHD size binding is absent")
+    return result
+
+
+def verify_azure_result_command(args: argparse.Namespace) -> None:
+    result = validate_azure_result(
+        args.manifest,
+        args.asset,
+        args.result,
+        key=args.key,
+        source_commit=args.source_commit,
+    )
+    print(result["qcow_sha256"])
+    print(result["flavor"])
+    print(",".join(result["contracts"]))
+
+
+def azure_contracts_command(args: argparse.Namespace) -> None:
+    print(",".join(azure_contracts(args.flavor)))
 
 
 def find_documents(root: Path, filename: str) -> dict[str, tuple[Path, dict[str, object]]]:
@@ -1182,7 +1395,14 @@ def _stage_into(args: argparse.Namespace, output: Path, notes: Path) -> None:
             source_commit=source_commit,
         )
 
-        _, azure = azure_results[key]
+        azure_path, azure = azure_results[key]
+        azure = validate_azure_result(
+            manifest_path,
+            asset_path,
+            azure_path,
+            key=key,
+            source_commit=source_commit,
+        )
         validate_identity(
             azure,
             expected_type="ubuntu2604-azure-acceptance",
@@ -1246,7 +1466,7 @@ def _stage_into(args: argparse.Namespace, output: Path, notes: Path) -> None:
         ):
             fail("release candidates do not share one Artifact Signing identity")
         contracts = azure.get("contracts")
-        if not has_exact_contracts(contracts, AZURE_CONTRACTS):
+        if contracts != candidate["azure_contracts"]:
             fail(f"{key}: Azure contract results are absent")
         conversion = azure.get("conversion")
         if (
@@ -1501,6 +1721,10 @@ def parser() -> argparse.ArgumentParser:
     verify_vhd.add_argument("--vhd", type=Path, required=True)
     verify_vhd.set_defaults(function=verify_vhd_command)
 
+    contracts = commands.add_parser("azure-contracts")
+    contracts.add_argument("--flavor", choices=("full", "core"), required=True)
+    contracts.set_defaults(function=azure_contracts_command)
+
     azure = commands.add_parser("azure-result")
     azure.add_argument("--manifest", type=Path, required=True)
     azure.add_argument("--asset", type=Path, required=True)
@@ -1528,10 +1752,23 @@ def parser() -> argparse.ArgumentParser:
     azure.add_argument("--image-version-id", required=True)
     azure.add_argument("--uefi-request", type=Path, required=True)
     azure.add_argument("--uefi-response", type=Path, required=True)
+    azure.add_argument(
+        "--contracts",
+        required=True,
+        help="canonical comma-separated Azure contracts reported by the harness",
+    )
     azure.add_argument("--run-id", required=True)
     azure.add_argument("--run-attempt", required=True)
     azure.add_argument("--output", type=Path, required=True)
     azure.set_defaults(function=azure_result_command)
+
+    verify_azure = commands.add_parser("verify-azure-result")
+    verify_azure.add_argument("--manifest", type=Path, required=True)
+    verify_azure.add_argument("--asset", type=Path, required=True)
+    verify_azure.add_argument("--result", type=Path, required=True)
+    verify_azure.add_argument("--key", required=True)
+    verify_azure.add_argument("--source-commit", required=True)
+    verify_azure.set_defaults(function=verify_azure_result_command)
 
     stage = commands.add_parser("stage")
     stage.add_argument("--candidates", type=Path, required=True)

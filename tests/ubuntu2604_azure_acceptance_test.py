@@ -31,6 +31,16 @@ class UbuntuAzureAcceptanceTests(unittest.TestCase):
             "CANDIDATE_KEY": key,
         }
 
+    def run_library(self, command: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "-c", f'source "$ACCEPTANCE_LIBRARY"; {command}'],
+            cwd=ROOT,
+            env={**os.environ, "ACCEPTANCE_LIBRARY": str(LIBRARY)},
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
     def write_az(self, tags: dict[str, str]) -> Path:
         az = self.scratch / "bin" / "az"
         az.write_text(
@@ -58,16 +68,77 @@ else:
         os.environ["DELETE_MARKER"] = str(marker)
         return marker
 
-    def test_only_two_full_candidates_are_accepted(self) -> None:
+    def test_cleanup_accepts_full_and_core_candidate_keys(self) -> None:
+        for key in (
+            "x86_64-full",
+            "aarch64-full",
+            "x86_64-core",
+            "aarch64-core",
+        ):
+            with self.subTest(key=key):
+                result = subprocess.run(
+                    [str(SCRIPT), "cleanup"],
+                    cwd=ROOT,
+                    env=self.environment(key),
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cleanup_rejects_unknown_candidate_key(self) -> None:
         result = subprocess.run(
             [str(SCRIPT), "cleanup"],
             cwd=ROOT,
-            env=self.environment("x86_64-core"),
+            env=self.environment("riscv64-core"),
             check=False,
             capture_output=True,
             text=True,
         )
         self.assertNotEqual(result.returncode, 0)
+
+    def test_rejects_extra_command_arguments(self) -> None:
+        result = subprocess.run(
+            [str(SCRIPT), "cleanup", "unexpected"],
+            cwd=ROOT,
+            env=self.environment(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage:", result.stderr)
+
+    def test_candidate_identity_helper_requires_exact_flavor_asset_tuple(self) -> None:
+        valid = {
+            "x86_64-full": "Ubuntu-26.04-x86_64.qcow2",
+            "aarch64-full": "Ubuntu-26.04-aarch64.qcow2",
+            "x86_64-core": "Ubuntu-26.04-x86_64.core.qcow2",
+            "aarch64-core": "Ubuntu-26.04-aarch64.core.qcow2",
+        }
+        for key, asset in valid.items():
+            architecture, flavor = key.split("-")
+            with self.subTest(key=key):
+                result = self.run_library(
+                    "ubuntu2604_validate_candidate_identity "
+                    f"{key} {architecture} {flavor} {asset}"
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                asset_result = self.run_library(
+                    f"ubuntu2604_expected_asset {architecture} {flavor}"
+                )
+                self.assertEqual(asset_result.stdout.strip(), asset)
+
+        for command in (
+            "ubuntu2604_validate_candidate_identity "
+            "x86_64-core x86_64 full Ubuntu-26.04-x86_64.core.qcow2",
+            "ubuntu2604_validate_candidate_identity "
+            "x86_64-core x86_64 core Ubuntu-26.04-x86_64.qcow2",
+            "ubuntu2604_validate_candidate_identity "
+            "riscv64-core riscv64 core Ubuntu-26.04-riscv64.core.qcow2",
+        ):
+            with self.subTest(command=command):
+                self.assertNotEqual(self.run_library(command).returncode, 0)
 
     def test_curl_auth_header_is_private_bearer_header(self) -> None:
         header = self.scratch / "auth-header"
@@ -113,6 +184,55 @@ else:
         self.assertIn('--vhd-info "$RESULT_DIR/vhd-info.json"', harness)
         self.assertIn('--conversion-attestation "$conversion_attestation"', harness)
         self.assertNotIn("--vhd-current-size", harness)
+
+    def test_core_contract_checks_are_explicit_and_full_checks_are_preserved(
+        self,
+    ) -> None:
+        harness = SCRIPT.read_text(encoding="utf-8")
+        core = harness.split(
+            'if [[ "$FLAVOR" == core ]]; then\n  readarray -t core_identity',
+            1,
+        )[1].split(
+            '\nelse\n  ssh "${ssh_options[@]}" "$ssh_target" '
+            "'/usr/bin/bash -s' <<'GUEST'",
+            1,
+        )[0]
+        for required in (
+            "/proc/1/exe -ef /sbin/vmizinit",
+            "test -x /usr/sbin/azagent",
+            "test -s /var/lib/azagent/provisioned",
+            "ResourceDisk.Format",
+            "DataDisk.Mount",
+            "/var/lib/cloud",
+            "/var/lib/waagent",
+            "/var/log/azure",
+            "test ! -d /run/systemd/system",
+            "initial_machine_id",
+            "initial_host_key_fingerprint",
+            "initial_authorized_keys_sha256",
+            "initial_sentinel_sha256",
+        ):
+            self.assertIn(required, core)
+        self.assertNotIn("systemctl is-active", core)
+        self.assertIn("/usr/sbin/sshd -D -e", harness)
+        self.assertIn("read_core_sshd_pid", harness)
+        self.assertIn("/usr/bin/kill -KILL", harness)
+        self.assertIn("az vm extension list", harness)
+        self.assertIn('test -z "${first_sector//0/}"', harness)
+        self.assertIn(
+            'python3 "$RELEASE_SCHEMA" verify-azure-result',
+            harness,
+        )
+        self.assertIn('--contracts "$azure_contract_list"', harness)
+
+        full = harness.split(
+            '\nelse\n  ssh "${ssh_options[@]}" "$ssh_target" '
+            "'/usr/bin/bash -s' <<'GUEST'",
+            1,
+        )[1].split("\nfi\n", 1)[0]
+        self.assertIn("/proc/1/exe -ef /usr/lib/systemd/systemd", full)
+        self.assertIn("cloud-init status --wait", full)
+        self.assertIn("walinuxagent.service", full)
 
     def test_cleanup_requires_exact_ownership_tags(self) -> None:
         env = self.environment()
