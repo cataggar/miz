@@ -6598,11 +6598,28 @@ fn buildPlan(
         },
     };
 
+    // Resolve parents and hardlink targets through a path index instead of the
+    // old per-entry linear `findNodeIndexByPath` scans. At production root scale
+    // the tree walk yields tens of thousands of entries, and those scans made
+    // both this parent pass and the hardlink pass below quadratic, stalling
+    // `finish()` for many minutes before it could write anything. Paths are
+    // unique here (duplicates were just rejected), so a direct path->node-index
+    // map is exact. The root's empty path is inserted first and kept, so a stray
+    // empty-path entry cannot shadow it -- matching the old first-match scan.
+    var path_index = std.StringHashMap(usize).init(allocator);
+    defer path_index.deinit();
+    try path_index.ensureTotalCapacity(@intCast(nodes.len));
+    path_index.putAssumeCapacity(nodes[0].path, 0);
+    for (entries_list.items, 0..) |entry, index| {
+        const gop = path_index.getOrPutAssumeCapacity(entry.path);
+        if (!gop.found_existing) gop.value_ptr.* = index + 1;
+    }
+
     var next_inode = first_non_reserved_inode;
     var inode_count: usize = 1;
     for (entries_list.items, 0..) |*entry, index| {
         const parent_path = pathParent(entry.path);
-        const parent_index = findNodeIndexByPath(nodes[0 .. index + 1], parent_path) orelse return error.MissingParentDirectory;
+        const parent_index = path_index.get(parent_path) orelse return error.MissingParentDirectory;
         if (nodes[parent_index].kind != .directory) return error.ParentNotDirectory;
         const owns_inode = entry.kind != .hardlink;
         nodes[index + 1] = .{
@@ -6635,7 +6652,7 @@ fn buildPlan(
 
     for (nodes) |*node| {
         if (node.owns_inode) continue;
-        const target_index = findNodeIndexByPath(nodes, node.hardlink_target) orelse
+        const target_index = path_index.get(node.hardlink_target) orelse
             return error.MissingHardlinkTarget;
         // Only a regular file may be shared. Linking a directory would create
         // a cycle no `fsck` accepts, and every other kind carries its whole
@@ -8188,13 +8205,15 @@ fn validateTreeEntry(entry: FileTreeView.Entry) PopulateError!void {
 }
 
 fn sortOwnedEntries(entries: []OwnedEntry) void {
-    var i: usize = 1;
-    while (i < entries.len) : (i += 1) {
-        var j = i;
-        while (j > 0 and ownedEntryLess(entries[j], entries[j - 1])) : (j -= 1) {
-            std.mem.swap(OwnedEntry, &entries[j], &entries[j - 1]);
-        }
-    }
+    // A stable O(n log n) sort. Entries are keyed by (depth, path) with unique
+    // paths, so the order is total and the result matches the previous insertion
+    // sort -- but without its O(n^2) blowup, which by itself stalled a
+    // production-scale root for many minutes before `finish()` could run.
+    std.mem.sort(OwnedEntry, entries, {}, ownedEntryLessThan);
+}
+
+fn ownedEntryLessThan(_: void, a: OwnedEntry, b: OwnedEntry) bool {
+    return ownedEntryLess(a, b);
 }
 
 fn hasDuplicatePaths(entries: []const OwnedEntry) bool {
@@ -8229,13 +8248,6 @@ fn pathParent(path: []const u8) []const u8 {
 fn pathBase(path: []const u8) []const u8 {
     const index = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
     return path[index + 1 ..];
-}
-
-fn findNodeIndexByPath(nodes: []const Node, path: []const u8) ?usize {
-    for (nodes, 0..) |node, index| {
-        if (std.mem.eql(u8, node.path, path)) return index;
-    }
-    return null;
 }
 
 fn assignDirectoryLinkCounts(nodes: []Node) error{TooManyDirectoryLinks}!void {
@@ -13197,6 +13209,107 @@ test "the writer emits hardlinks devices and FIFOs that fsck and the general imp
     const bytes = try readGeneralEntryAlloc(allocator, alias);
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings("hello", bytes);
+}
+
+test "buildPlan resolves deep nesting and both hardlink directions from scrambled input" {
+    // Regression for the quadratic `buildPlan` passes that stalled `finish()`
+    // for many minutes on a production-scale root (issue #455): the O(n^2)
+    // `sortOwnedEntries` insertion sort and the two per-entry
+    // `findNodeIndexByPath` scans (parent + hardlink target) are now a stable
+    // O(n log n) sort and O(1) path-index lookups. This locks in that the
+    // rewrite is still exact -- entries handed to the writer in scrambled order
+    // are ordered so every parent precedes its children, deep parents resolve
+    // across many levels, and a hardlink resolves whether its target sorts
+    // before it (forward) or after it (backward).
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "test-ext4-buildplan-scramble.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // Directories and files are listed children-before-parents and deep-first,
+    // and the hardlinks appear before their targets, so a correct build depends
+    // entirely on the sort/lookup rewrite rather than on input order.
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "z/sub/inner.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 5, .bytes = "inner" },
+        .{ .path = "a/b/c/deep.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "deep" },
+        .{ .path = "a/link_fwd", .kind = .hardlink, .mode = 0o644, .uid = 0, .gid = 0, .hardlink_target = "z/target.txt" },
+        .{ .path = "m/n/o/p/leaf.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "leaf" },
+        .{ .path = "a/b/c", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "z/target.txt", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 9, .bytes = "ZZZtarget" },
+        .{ .path = "a/b", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "m/n/o/p", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "z/link_back", .kind = .hardlink, .mode = 0o644, .uid = 0, .gid = 0, .hardlink_target = "a/file1" },
+        .{ .path = "a", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "m/n/o", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "z/sub", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "a/file1", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 8, .bytes = "AAAfile1" },
+        .{ .path = "m", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "m/n", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "z", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+    });
+    tree.bind();
+
+    const length = 16 * 1024 * 1024;
+    {
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+        defer file.close(io);
+        _ = try populate(io, file, allocator, &tree.view, .{
+            .length = length,
+            .uuid = [_]u8{0x3c} ** 16,
+            .timestamp = 1_700_000_000,
+        });
+    }
+    // Real e2fsck accepts the image only if every parent link, `..` back-link,
+    // and directory link count is correct -- the structural payoff of the
+    // rewrite across all depths.
+    try expectE2fsckClean(path);
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var reader = try openGeneral(io, file, allocator, .{});
+    defer reader.deinit();
+    var imported = try scanReadable(&reader, io, allocator, .{ .available_length = length });
+    defer imported.deinit();
+
+    // Deeply nested files resolved their parents across several levels.
+    for ([_]struct { path: []const u8, bytes: []const u8 }{
+        .{ .path = "a/b/c/deep.txt", .bytes = "deep" },
+        .{ .path = "m/n/o/p/leaf.txt", .bytes = "leaf" },
+        .{ .path = "z/sub/inner.txt", .bytes = "inner" },
+    }) |want| {
+        const entry = findGeneralEntry(&imported, want.path).?;
+        try std.testing.expectEqual(GeneralKind.file, entry.kind);
+        const got = try readGeneralEntryAlloc(allocator, entry);
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings(want.bytes, got);
+    }
+
+    // Forward hardlink: its target `z/target.txt` sorts after `a/link_fwd`, so
+    // the target's node is built later; the writer still shares one inode. The
+    // general importer credits the content to the first sorted name.
+    {
+        const owner = findGeneralEntry(&imported, "a/link_fwd").?;
+        const link = findGeneralEntry(&imported, "z/target.txt").?;
+        try std.testing.expectEqual(GeneralKind.file, owner.kind);
+        try std.testing.expectEqual(GeneralKind.hardlink, link.kind);
+        try std.testing.expectEqualStrings("a/link_fwd", link.hardlink_target);
+        const got = try readGeneralEntryAlloc(allocator, owner);
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings("ZZZtarget", got);
+    }
+
+    // Backward hardlink: its target `a/file1` sorts before `z/link_back`, so the
+    // target already has an inode when the link is resolved.
+    {
+        const owner = findGeneralEntry(&imported, "a/file1").?;
+        const link = findGeneralEntry(&imported, "z/link_back").?;
+        try std.testing.expectEqual(GeneralKind.file, owner.kind);
+        try std.testing.expectEqual(GeneralKind.hardlink, link.kind);
+        try std.testing.expectEqualStrings("a/file1", link.hardlink_target);
+        const got = try readGeneralEntryAlloc(allocator, owner);
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings("AAAfile1", got);
+    }
 }
 
 test "the writer refuses hardlink and device entries it cannot represent" {
