@@ -55,6 +55,15 @@ has no libguestfs, guestfish, supermin, or libguestfs `virt-*` dependency;
 mode-`000` entries are read from ext4 bytes rather than made readable on the
 host, while their original metadata remains in the native tree.
 
+Each package root is a separate debz transaction with its own dpkg admin
+state, discarded after it publishes so no stage inherits another's installed
+baseline. The downloaded objects are not: every stage reads and writes one
+`debz-cache` directory in the work dir, kept between stages and between runs.
+Objects there are named by their own SHA-256 and the sources document pins an
+immutable snapshot, so a cache hit cannot change what a stage resolves to or
+installs, and repository signatures are verified and recorded in provenance
+either way. Deleting the work dir is still a full cold build.
+
 The root partition is selected by the validated GPT name
 `cloudimg-rootfs` and the ext4 filesystem label, not by a fixed `/dev/sdaN`
 slot; Canonical's populated partition slots differ between image revisions.
