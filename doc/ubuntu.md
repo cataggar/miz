@@ -505,6 +505,20 @@ persistence, resource-disk formatting, managed-data-disk mount-only behavior,
 and explicit absence of cloud-init, WALinuxAgent, and a systemd service
 manager.
 
+Native core acceptance additionally asserts a Binder workload contract set
+under Secure Boot/lockdown: the in-tree `binder_linux` module is loaded at
+boot from the pinned Ubuntu module tree (not `updates`/DKMS), carries signer
+evidence and no taint, and dmesg has no unsigned-module, lockdown, or
+out-of-tree binder implementation failures; binderfs is mounted with a
+`binder` filesystem type and dynamically creates `binder-control` plus the
+`binder`, `hwbinder`, and `vndbinder` devices; and a tiny statically linked,
+architecture-neutral probe opens each of those devices and performs
+`BINDER_VERSION` to confirm usability rather than only checking paths. These
+contracts bumped the core-only native result schema so an older result cannot
+satisfy them, and they assume the boot-time module autoload, binderfs mount,
+and device creation are provided by the image itself; wiring that into the
+core image build is left to a companion change.
+
 ## Core validation workflow
 
 `.github/workflows/ubuntu2604-core-validation.yml` is a separate manually

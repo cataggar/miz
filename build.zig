@@ -133,6 +133,33 @@ fn addUbuntu2604CoreArtifacts(
     return .{ .vmizinit = vmizinit, .azagent = azagent };
 }
 
+/// A tiny statically linked binary that native Ubuntu 26.04 core acceptance
+/// pushes into the running guest over SSH to confirm Binder workload device
+/// usability (open + `BINDER_VERSION`) rather than only checking paths. It
+/// is acceptance tooling, not an image artifact: `build_generalized_ubuntu2604`
+/// never receives it, unlike `vmizinit`/`azagent` above.
+fn addUbuntu2604BinderProbe(
+    b: *std.Build,
+    architecture: Ubuntu2604Architecture,
+) *std.Build.Step.Compile {
+    const guest_target = b.resolveTargetQuery(.{
+        .cpu_arch = switch (architecture) {
+            .x86_64 => .x86_64,
+            .aarch64 => .aarch64,
+        },
+        .os_tag = .linux,
+    });
+    return b.addExecutable(.{
+        .name = b.fmt("ubuntu2604-binder-probe-{s}", .{@tagName(architecture)}),
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/ubuntu2604_binder_probe.zig"),
+            .target = guest_target,
+            .optimize = .ReleaseSmall,
+        }),
+        .linkage = .static,
+    });
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -1282,6 +1309,23 @@ pub fn build(b: *std.Build) void {
             "ubuntu2604_flavor",
             @tagName(ubuntu2604_flavor),
         );
+        // Binder device usability is a core-only native acceptance contract,
+        // so the probe is only cross-built for the core flavor; the option
+        // resolves to an empty path otherwise and the acceptance test never
+        // reads it in that case.
+        if (ubuntu2604_flavor == .core) {
+            const ubuntu2604_binder_probe = addUbuntu2604BinderProbe(b, ubuntu2604_architecture);
+            ubuntu2604_acceptance_options.addOptionPath(
+                "ubuntu2604_binder_probe_path",
+                ubuntu2604_binder_probe.getEmittedBin(),
+            );
+        } else {
+            ubuntu2604_acceptance_options.addOption(
+                []const u8,
+                "ubuntu2604_binder_probe_path",
+                "",
+            );
+        }
         const ubuntu2604_acceptance_tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path("tests/ubuntu2604_acceptance.zig"),

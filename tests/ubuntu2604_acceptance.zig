@@ -137,6 +137,10 @@ const core_contracts = [_][]const u8{
     "root-growth",
     "reboot-reconnect",
     "clean-service-health",
+    "signed-binder-module",
+    "binder-boot-required",
+    "binderfs-dynamic-devices",
+    "binder-device-usability",
 };
 
 const FlavorPolicy = struct {
@@ -163,7 +167,9 @@ const core_policy: FlavorPolicy = .{
     .x86_64_file_name = "Ubuntu-26.04-x86_64.core.qcow2",
     .aarch64_file_name = "Ubuntu-26.04-aarch64.core.qcow2",
     .virtual_size = 3584 * mib,
-    .result_schema = 2,
+    // Bumped from 2 so that a result recorded before the Binder workload
+    // contracts existed can never satisfy the current core contract set.
+    .result_schema = 3,
     .contracts = &core_contracts,
 };
 
@@ -1503,6 +1509,318 @@ fn verifyGuestSecureBoot(
     allocator.free(output);
 }
 
+// --- Binder workload native acceptance (core flavor only) ---
+//
+// These checks assume the finished core image loads `binder_linux` at boot,
+// mounts binderfs at `binderfs_mount_point`, and creates the dynamic devices
+// named in `binder_dynamic_device_names` inside it. `binder_linux` itself is
+// already present in the pinned Ubuntu kernel module tree the core flavor
+// installs (in-tree since Linux 4.9, shipped by the same `linux-azure`
+// metapackage the core flavor already requires), but the module-autoload,
+// binderfs-mount, and device-creation boot wiring is not added by this
+// branch: `scripts/build_generalized_ubuntu2604.zig` is untouched here, and
+// that wiring is left to a companion follow-up change. Until that lands,
+// these checks describe the contract the finished image must satisfy; they
+// do not themselves make an unmodified image satisfy it, and are expected to
+// fail against one. The exact assumed mount point is likewise a documented
+// assumption pending that companion change, not something enforced elsewhere
+// in this repository.
+const binder_module_name = "binder_linux";
+const binderfs_mount_point = "/dev/binderfs";
+const binder_dynamic_device_names = [_][]const u8{ "binder", "hwbinder", "vndbinder" };
+const binder_probe_remote_path = "/tmp/ubuntu2604-binder-probe";
+
+// Satisfies both `signed-binder-module` and `binder-boot-required`: the
+// module must already be loaded at boot, so unlike the optional modules
+// checked in `verifyGuestSecureBoot`, there is no modprobe fallback here.
+const signed_binder_module_checks =
+    \\set -eu
+    \\test -d /sys/module/binder_linux
+    \\module_path=$(modinfo -n binder_linux)
+    \\case "$module_path" in
+    \\  /lib/modules/*/kernel/*|/usr/lib/modules/*/kernel/*) : ;;
+    \\  *) exit 1 ;;
+    \\esac
+    \\case "$module_path" in
+    \\  */updates/*) exit 1 ;;
+    \\esac
+    \\signer=$(modinfo -F signer binder_linux 2>/dev/null || true)
+    \\sig_key=$(modinfo -F sig_key binder_linux 2>/dev/null || true)
+    \\sig_hashalgo=$(modinfo -F sig_hashalgo binder_linux 2>/dev/null || true)
+    \\test -n "$signer$sig_key$sig_hashalgo"
+    \\taint=$(cat /sys/module/binder_linux/taint 2>/dev/null || true)
+    \\test -z "$taint"
+    \\dmesg_output=$(sudo -n /usr/bin/dmesg) || exit 1
+    \\if printf '%s\n' "$dmesg_output" | grep -Eiq 'module verification failed|Loading of unsigned module|Lockdown:.*unsigned|anbox'; then
+    \\  exit 1
+    \\fi
+;
+
+fn verifyGuestSignedBinderModule(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+) !void {
+    const output = sshOutputAlloc(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        signed_binder_module_checks,
+    ) catch return error.GuestSignedBinderModuleContractFailed;
+    allocator.free(output);
+}
+
+const binderfs_dynamic_device_checks =
+    \\set -eu
+    \\test "$(findmnt -n -o FSTYPE --target /dev/binderfs)" = binder
+    \\test -c /dev/binderfs/binder-control
+    \\test -c /dev/binderfs/binder
+    \\test -c /dev/binderfs/hwbinder
+    \\test -c /dev/binderfs/vndbinder
+;
+
+fn verifyGuestBinderfsDevices(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+) !void {
+    const output = sshOutputAlloc(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        binderfs_dynamic_device_checks,
+    ) catch return error.GuestBinderfsDeviceContractFailed;
+    allocator.free(output);
+}
+
+fn sshWithStdinAlloc(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+    command: []const u8,
+    stdin_data: []const u8,
+) ![]u8 {
+    const port_text = try std.fmt.allocPrint(allocator, "{d}", .{instance.port});
+    defer allocator.free(port_text);
+    var child = try std.process.spawn(io, .{
+        .argv = &.{
+            ssh_path,
+            "-i",
+            instance.private_key_path,
+            "-p",
+            port_text,
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "ConnectionAttempts=1",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+            "-o",
+            "PasswordAuthentication=no",
+            "-o",
+            "NumberOfPasswordPrompts=0",
+            "-o",
+            "PreferredAuthentications=publickey",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            admin_username ++ "@127.0.0.1",
+            command,
+        },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    defer child.kill(io);
+
+    var stdin = child.stdin.?;
+    child.stdin = null;
+    try stdin.writeStreamingAll(io, stdin_data);
+    stdin.close(io);
+
+    var streams_buffer: Io.File.MultiReader.Buffer(2) = undefined;
+    var streams: Io.File.MultiReader = undefined;
+    streams.init(allocator, io, streams_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer streams.deinit();
+    const stdout_reader = streams.reader(0);
+    const stderr_reader = streams.reader(1);
+    while (streams.fill(256, .none)) |_| {
+        if (stdout_reader.buffered().len > 512 * 1024 or stderr_reader.buffered().len > 16 * 1024) {
+            return error.SshStreamTooLarge;
+        }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    }
+    try streams.checkAnyError();
+    const term = try child.wait(io);
+    const stdout = try streams.toOwnedSlice(0);
+    errdefer allocator.free(stdout);
+    const stderr = try streams.toOwnedSlice(1);
+    defer allocator.free(stderr);
+    switch (term) {
+        .exited => |code| if (code == 0) return stdout,
+        else => {},
+    }
+    if (stderr.len != 0) {
+        std.debug.print("SSH command with stdin failed for {s}:\n{s}\n", .{
+            instance.label,
+            stderr,
+        });
+    }
+    allocator.free(stdout);
+    return error.SshCommandFailed;
+}
+
+fn pushBinderProbeBinary(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+) !void {
+    const probe_bytes = try Dir.cwd().readFileAlloc(
+        io,
+        binderProbeHostPath(),
+        allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer allocator.free(probe_bytes);
+
+    const encoded_len = std.base64.standard.Encoder.calcSize(probe_bytes.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, probe_bytes);
+
+    const push_command = "base64 -d > " ++ binder_probe_remote_path ++
+        " && chmod 0755 " ++ binder_probe_remote_path;
+    const output = try sshWithStdinAlloc(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        push_command,
+        encoded,
+    );
+    allocator.free(output);
+}
+
+fn binderProbeHostPath() []const u8 {
+    return build_options.ubuntu2604_binder_probe_path;
+}
+
+const BinderProbeStatus = enum { ok, open_failed, ioctl_failed };
+
+const BinderProbeLine = struct {
+    device: []const u8,
+    status: BinderProbeStatus,
+};
+
+/// Parses one `device=<path> status=(ok|open-failed|ioctl-failed)[ ...]`
+/// line emitted by `tests/ubuntu2604_binder_probe.zig`. Pure and
+/// allocation-free so it is directly unit-testable without KVM.
+fn parseBinderProbeLine(line: []const u8) !BinderProbeLine {
+    const device_prefix = "device=";
+    if (!std.mem.startsWith(u8, line, device_prefix)) return error.UnparseableBinderProbeLine;
+    const after_device = line[device_prefix.len..];
+    const status_marker = " status=";
+    const status_index = std.mem.indexOf(u8, after_device, status_marker) orelse
+        return error.UnparseableBinderProbeLine;
+    const device = after_device[0..status_index];
+    if (device.len == 0) return error.UnparseableBinderProbeLine;
+    const rest = after_device[status_index + status_marker.len ..];
+    const status_end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+    const status_text = rest[0..status_end];
+    const status: BinderProbeStatus = if (std.mem.eql(u8, status_text, "ok"))
+        .ok
+    else if (std.mem.eql(u8, status_text, "open-failed"))
+        .open_failed
+    else if (std.mem.eql(u8, status_text, "ioctl-failed"))
+        .ioctl_failed
+    else
+        return error.UnparseableBinderProbeLine;
+    return .{ .device = device, .status = status };
+}
+
+/// Confirms every path in `expected_devices` appears exactly once in the
+/// probe's stdout with `status=ok`. Pure aside from the small allocator-backed
+/// lookup table, so failure cases (missing device, duplicate line, unusable
+/// device, garbage output) are all directly unit-testable without KVM.
+fn verifyBinderProbeOutput(
+    allocator: Allocator,
+    output: []const u8,
+    expected_devices: []const []const u8,
+) !void {
+    var found = std.StringHashMap(BinderProbeStatus).init(allocator);
+    defer found.deinit();
+
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        const parsed = try parseBinderProbeLine(line);
+        if (found.contains(parsed.device)) return error.DuplicateBinderProbeDevice;
+        try found.put(parsed.device, parsed.status);
+    }
+
+    for (expected_devices) |device| {
+        const status = found.get(device) orelse return error.MissingBinderProbeDevice;
+        if (status != .ok) return error.BinderDeviceNotUsable;
+    }
+}
+
+fn verifyGuestBinderDeviceUsability(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+) !void {
+    try pushBinderProbeBinary(allocator, io, ssh_path, instance);
+
+    var device_paths: [binder_dynamic_device_names.len][]u8 = undefined;
+    var built: usize = 0;
+    defer for (device_paths[0..built]) |path| allocator.free(path);
+    for (binder_dynamic_device_names, 0..) |name, i| {
+        device_paths[i] = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}",
+            .{ binderfs_mount_point, name },
+        );
+        built = i + 1;
+    }
+
+    var command_buffer = std.array_list.Managed(u8).init(allocator);
+    defer command_buffer.deinit();
+    try command_buffer.appendSlice("sudo -n " ++ binder_probe_remote_path);
+    for (device_paths) |path| {
+        try command_buffer.append(' ');
+        try command_buffer.appendSlice(path);
+    }
+
+    const output = try sshOutputAlloc(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        command_buffer.items,
+    );
+    defer allocator.free(output);
+
+    var expected: [binder_dynamic_device_names.len][]const u8 = undefined;
+    for (device_paths, 0..) |path, i| expected[i] = path;
+    verifyBinderProbeOutput(allocator, output, &expected) catch
+        return error.GuestBinderDeviceUsabilityContractFailed;
+}
+
 fn qemuRunning(instance: *const Instance, deadline: Io.Timestamp) !bool {
     const spawned = &(instance.spawned orelse return error.QemuNotStarted);
     return spawned.client.queryRunningUntil(deadline);
@@ -2104,11 +2422,19 @@ test "Ubuntu 26.04 acceptance flavor policy preserves full and isolates core" {
     try std.testing.expectEqual(@as(u64, 3584 * mib), core.expectedVirtualSize());
     try std.testing.expect(core.expectedVirtualSize() < full.expectedVirtualSize());
     try std.testing.expectEqual(@as(u32, 1), full.flavor.policy().result_schema);
-    try std.testing.expectEqual(@as(u32, 2), core.flavor.policy().result_schema);
+    try std.testing.expectEqual(@as(u32, 3), core.flavor.policy().result_schema);
     try std.testing.expectEqual(@as(usize, 18), full.contracts().len);
-    try std.testing.expectEqual(@as(usize, 23), core.contracts().len);
+    try std.testing.expectEqual(@as(usize, 27), core.contracts().len);
     try std.testing.expect(hasContract(core.contracts(), "vmizinit-sshd-supervision"));
     try std.testing.expect(hasContract(core.contracts(), "no-cloud-init"));
+    try std.testing.expect(hasContract(core.contracts(), "signed-binder-module"));
+    try std.testing.expect(hasContract(core.contracts(), "binder-boot-required"));
+    try std.testing.expect(hasContract(core.contracts(), "binderfs-dynamic-devices"));
+    try std.testing.expect(hasContract(core.contracts(), "binder-device-usability"));
+    try std.testing.expect(!hasContract(full.contracts(), "signed-binder-module"));
+    try std.testing.expect(!hasContract(full.contracts(), "binder-boot-required"));
+    try std.testing.expect(!hasContract(full.contracts(), "binderfs-dynamic-devices"));
+    try std.testing.expect(!hasContract(full.contracts(), "binder-device-usability"));
 }
 
 test "Ubuntu 26.04 configured acceptance prerequisites fail closed" {
@@ -2168,6 +2494,115 @@ test "EFI db parser finds the exact enrolled DER certificate" {
     try std.testing.expect(!efiDbContainsCertificate(variable[0 .. variable.len - 1], digest));
     variable[list_offset] = 0;
     try std.testing.expect(!efiDbContainsCertificate(&variable, digest));
+}
+
+test "signed Binder module script pins the module tree and requires evidence" {
+    try std.testing.expect(std.mem.indexOf(u8, signed_binder_module_checks, binder_module_name) != null);
+    try std.testing.expect(std.mem.indexOf(u8, signed_binder_module_checks, "/sys/module/binder_linux") != null);
+    try std.testing.expect(std.mem.indexOf(u8, signed_binder_module_checks, "*/updates/*") != null);
+    try std.testing.expect(std.mem.indexOf(u8, signed_binder_module_checks, "modinfo -F signer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, signed_binder_module_checks, "taint") != null);
+    try std.testing.expect(std.mem.indexOf(u8, signed_binder_module_checks, "anbox") != null);
+    try std.testing.expect(std.mem.indexOf(u8, signed_binder_module_checks, "modprobe") == null);
+}
+
+test "binderfs device script checks the assumed mount point and every dynamic device" {
+    try std.testing.expect(std.mem.indexOf(u8, binderfs_dynamic_device_checks, binderfs_mount_point) != null);
+    try std.testing.expect(std.mem.indexOf(u8, binderfs_dynamic_device_checks, "binder-control") != null);
+    for (binder_dynamic_device_names) |name| {
+        try std.testing.expect(std.mem.indexOf(u8, binderfs_dynamic_device_checks, name) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, binderfs_dynamic_device_checks, "FSTYPE") != null);
+}
+
+test "Binder probe line parser accepts every reported status" {
+    const ok = try parseBinderProbeLine("device=/dev/binderfs/binder status=ok protocol_version=8");
+    try std.testing.expectEqualStrings("/dev/binderfs/binder", ok.device);
+    try std.testing.expectEqual(BinderProbeStatus.ok, ok.status);
+
+    const open_failed = try parseBinderProbeLine("device=/dev/binderfs/hwbinder status=open-failed errno=13");
+    try std.testing.expectEqualStrings("/dev/binderfs/hwbinder", open_failed.device);
+    try std.testing.expectEqual(BinderProbeStatus.open_failed, open_failed.status);
+
+    const ioctl_failed = try parseBinderProbeLine("device=/dev/binderfs/vndbinder status=ioctl-failed errno=25");
+    try std.testing.expectEqualStrings("/dev/binderfs/vndbinder", ioctl_failed.device);
+    try std.testing.expectEqual(BinderProbeStatus.ioctl_failed, ioctl_failed.status);
+
+    // A trailing device with no fields after `status=` is still valid.
+    const bare = try parseBinderProbeLine("device=/dev/binderfs/binder status=ok");
+    try std.testing.expectEqual(BinderProbeStatus.ok, bare.status);
+}
+
+test "Binder probe line parser rejects malformed or unknown lines" {
+    try std.testing.expectError(error.UnparseableBinderProbeLine, parseBinderProbeLine(""));
+    try std.testing.expectError(error.UnparseableBinderProbeLine, parseBinderProbeLine("not a probe line"));
+    try std.testing.expectError(
+        error.UnparseableBinderProbeLine,
+        parseBinderProbeLine("device= status=ok"),
+    );
+    try std.testing.expectError(
+        error.UnparseableBinderProbeLine,
+        parseBinderProbeLine("device=/dev/binderfs/binder statuz=ok"),
+    );
+    try std.testing.expectError(
+        error.UnparseableBinderProbeLine,
+        parseBinderProbeLine("device=/dev/binderfs/binder status=unusable"),
+    );
+}
+
+test "Binder probe output verification accepts exactly the expected usable devices" {
+    const allocator = std.testing.allocator;
+    const output =
+        "device=/dev/binderfs/binder status=ok protocol_version=8\n" ++
+        "device=/dev/binderfs/hwbinder status=ok protocol_version=8\n" ++
+        "device=/dev/binderfs/vndbinder status=ok protocol_version=8\n";
+    try verifyBinderProbeOutput(allocator, output, &.{
+        "/dev/binderfs/binder",
+        "/dev/binderfs/hwbinder",
+        "/dev/binderfs/vndbinder",
+    });
+}
+
+test "Binder probe output verification fails closed on a missing device" {
+    const allocator = std.testing.allocator;
+    const output = "device=/dev/binderfs/binder status=ok protocol_version=8\n";
+    try std.testing.expectError(error.MissingBinderProbeDevice, verifyBinderProbeOutput(
+        allocator,
+        output,
+        &.{ "/dev/binderfs/binder", "/dev/binderfs/hwbinder" },
+    ));
+}
+
+test "Binder probe output verification fails closed on an unusable device" {
+    const allocator = std.testing.allocator;
+    const output = "device=/dev/binderfs/binder status=open-failed errno=13\n";
+    try std.testing.expectError(error.BinderDeviceNotUsable, verifyBinderProbeOutput(
+        allocator,
+        output,
+        &.{"/dev/binderfs/binder"},
+    ));
+}
+
+test "Binder probe output verification fails closed on a duplicated device line" {
+    const allocator = std.testing.allocator;
+    const output =
+        "device=/dev/binderfs/binder status=ok protocol_version=8\n" ++
+        "device=/dev/binderfs/binder status=ok protocol_version=8\n";
+    try std.testing.expectError(error.DuplicateBinderProbeDevice, verifyBinderProbeOutput(
+        allocator,
+        output,
+        &.{"/dev/binderfs/binder"},
+    ));
+}
+
+test "Binder probe output verification fails closed on unparseable garbage output" {
+    const allocator = std.testing.allocator;
+    const output = "the probe did not run\n";
+    try std.testing.expectError(error.UnparseableBinderProbeLine, verifyBinderProbeOutput(
+        allocator,
+        output,
+        &.{"/dev/binderfs/binder"},
+    ));
 }
 
 test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" {
@@ -2396,6 +2831,15 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         &second,
         certificate_sha256,
     );
+
+    if (candidate.flavor == .core) {
+        try verifyGuestSignedBinderModule(allocator, io, ssh_path, &first);
+        try verifyGuestSignedBinderModule(allocator, io, ssh_path, &second);
+        try verifyGuestBinderfsDevices(allocator, io, ssh_path, &first);
+        try verifyGuestBinderfsDevices(allocator, io, ssh_path, &second);
+        try verifyGuestBinderDeviceUsability(allocator, io, ssh_path, &first);
+        try verifyGuestBinderDeviceUsability(allocator, io, ssh_path, &second);
+    }
 
     var first_before = try readGuestIdentityAlloc(allocator, io, ssh_path, &first);
     defer first_before.deinit(allocator);

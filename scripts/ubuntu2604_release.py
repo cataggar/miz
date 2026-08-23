@@ -141,6 +141,10 @@ CORE_NATIVE_CONTRACTS = {
     "root-growth",
     "reboot-reconnect",
     "clean-service-health",
+    "signed-binder-module",
+    "binder-boot-required",
+    "binderfs-dynamic-devices",
+    "binder-device-usability",
 }
 RELEASE_TAG_RE = re.compile(r"^Ubuntu-26\.04-[0-9]{8}$")
 SNAPSHOT_ID_RE = re.compile(r"^release-[0-9]{8}(?:\.[0-9]+)?$")
@@ -1152,7 +1156,7 @@ def validate_native_result(
             "flavor",
             "virtual_size",
         }
-        expected_schema = 2
+        expected_schema = 3
     if set(result) != expected_fields:
         fail(f"{candidate['key']}: native acceptance result has unexpected fields")
     if (
