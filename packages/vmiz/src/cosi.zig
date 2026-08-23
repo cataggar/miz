@@ -1,8 +1,8 @@
 //! COSI (Composable OS Image) writer.
 //!
-//! Partition payloads are emitted as standard `.raw.zst` members, so
-//! repetitive GPT/filesystem regions shrink while remaining decodable by
-//! standard zstd tooling.
+//! Partition payloads are emitted as standard `.raw.zst` members using
+//! `zstd.zig`'s deterministic libzstd wrapper, so repetitive GPT/filesystem
+//! regions shrink while remaining decodable by standard zstd tooling.
 //!
 //! The emitted `metadata.json` schema is verified against Azure Linux Image
 //! Tools' real implementation:
@@ -274,6 +274,7 @@ fn streamCompressedRegionWriter(writer: *std.Io.Writer, img: Image, io: Io, offs
         .content_size = length,
         .skippable_payload = image_id,
     });
+    defer encoder.deinit();
     var done: u64 = 0;
     while (done < length) {
         const remaining = length - done;
@@ -812,6 +813,9 @@ test "write builds a COSI tarball with GPT metadata and compressed zstd partitio
     const decoded_root = try zstd.decodeAlloc(std.testing.allocator, root_entry.bytes);
     defer std.testing.allocator.free(decoded_root.bytes);
 
+    try std.testing.expectEqual(disk_guid, decoded_gpt.payload.?);
+    try std.testing.expectEqual(disk_guid, decoded_esp.payload.?);
+    try std.testing.expectEqual(disk_guid, decoded_root.payload.?);
     try std.testing.expectEqualSlices(u8, esp_bytes, decoded_esp.bytes);
     var root_reader = try ext4.open(io, img.file, std.testing.allocator, .{ .offset = placements[1].first_lba * gpt.sector_size });
     defer root_reader.deinit();

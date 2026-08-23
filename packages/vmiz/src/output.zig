@@ -345,7 +345,10 @@ const Sink = struct {
                 allocator.destroy(gzip.compressor);
                 allocator.free(gzip.history);
             },
-            .zstd => |zstd_state| allocator.free(zstd_state.block),
+            .zstd => |*zstd_state| {
+                zstd_state.encoder.deinit();
+                allocator.free(zstd_state.block);
+            },
         }
         self.* = undefined;
     }
