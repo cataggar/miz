@@ -115,6 +115,35 @@ if [[ "$FLAVOR" == core ]]; then
     echo "::error::Binder device probe binary is not executable"
     exit 1
   }
+  # The core image never embeds an Android OCI runtime or bundle; both are
+  # required, digest-bound external inputs supplied at acceptance time. A
+  # missing input fails closed here, before any Azure resource is created,
+  # rather than silently skipping the Android container smoke contract.
+  if [[ -z ${VMIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT:-} ||
+        -z ${VMIZ_UBUNTU2604_ANDROID_RUNTIME:-} ||
+        -z ${VMIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256:-} ||
+        -z ${VMIZ_UBUNTU2604_ANDROID_BUNDLE:-} ||
+        -z ${VMIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256:-} ||
+        -z ${VMIZ_UBUNTU2604_ANDROID_CONFIG_SHA256:-} ]]; then
+    echo "::error::Core Azure acceptance requires digest-bound external Android container smoke inputs"
+    exit 1
+  fi
+  [[ "$VMIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+  [[ "$VMIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256" =~ ^[0-9a-f]{64}$ ]]
+  [[ "$VMIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+  [[ "$VMIZ_UBUNTU2604_ANDROID_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]]
+  [[ -f "$VMIZ_UBUNTU2604_ANDROID_RUNTIME" ]] || {
+    echo "::error::Android container runtime artifact is absent"
+    exit 1
+  }
+  [[ -f "$VMIZ_UBUNTU2604_ANDROID_BUNDLE" ]] || {
+    echo "::error::Android container bundle artifact is absent"
+    exit 1
+  }
+  android_runtime_sha256=$(sha256sum "$VMIZ_UBUNTU2604_ANDROID_RUNTIME" | awk '{print $1}')
+  test "$android_runtime_sha256" = "$VMIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256"
+  android_bundle_sha256=$(sha256sum "$VMIZ_UBUNTU2604_ANDROID_BUNDLE" | awk '{print $1}')
+  test "$android_bundle_sha256" = "$VMIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256"
 fi
 
 report_error() {
@@ -1131,6 +1160,186 @@ test "$(az vm get-instance-view \
   --query "instanceView.vmAgent.statuses[?code=='ProvisioningState/succeeded'].code | [0]" \
   --output tsv)" = ProvisioningState/succeeded
 
+# --- Android container boot-completion smoke (core flavor only) ---
+#
+# The core image never embeds an Android OCI runtime or bundle: both are
+# supplied externally, at acceptance time, as the digest-bound artifacts
+# validated above. This transfers only the two artifacts already verified,
+# launches them with the required BinderFS and DMA-heap access, and binds
+# their provenance into the Azure acceptance result. Remote paths and the
+# container id match the native acceptance harness (tests/ubuntu2604_acceptance.zig)
+# so both paths exercise the same guest-side contract.
+if [[ "$FLAVOR" == core ]]; then
+  case "$ARCHITECTURE" in
+    x86_64) android_expected_abi=x86_64 ;;
+    aarch64) android_expected_abi=arm64-v8a ;;
+    *) exit 1 ;;
+  esac
+  android_runtime_remote=/tmp/ubuntu2604-android-runtime
+  android_bundle_archive_remote=/tmp/ubuntu2604-android-bundle.tar
+  android_bundle_remote_dir=/tmp/ubuntu2604-android-bundle
+  android_container_id=vmiz-android-smoke
+  android_poll_interval=5
+  android_boot_timeout=240
+  android_stop_timeout=60
+
+  # Decides whether the guest-reported container state permits issuing
+  # `delete` without `--force`. Never force-removes a running container:
+  # if it never reaches "stopped" within the bounded timeout, this returns
+  # failure and the caller fails closed instead of forcing removal.
+  android_stop_container() {
+    ssh "${ssh_options[@]}" "$ssh_target" \
+      "sudo -n '$android_runtime_remote' kill $android_container_id TERM" \
+      >/dev/null 2>&1 || true
+    local elapsed=0 status
+    while (( elapsed < android_stop_timeout )); do
+      status=$(
+        ssh "${ssh_options[@]}" "$ssh_target" \
+          "sudo -n '$android_runtime_remote' state $android_container_id 2>/dev/null || printf '{\"status\":\"stopped\"}'" \
+          2>/dev/null |
+          python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin).get("status", ""))
+except Exception:
+    print("")' 2>/dev/null || true
+      )
+      if [[ "$status" == stopped ]]; then
+        ssh "${ssh_options[@]}" "$ssh_target" \
+          "sudo -n '$android_runtime_remote' delete $android_container_id"
+        return 0
+      fi
+      sleep "$android_poll_interval"
+      elapsed=$((elapsed + android_poll_interval))
+    done
+    return 1
+  }
+
+  # Bounded diagnostics only: container state plus a size-limited dmesg
+  # tail, never an unbounded capture.
+  android_capture_diagnostics() {
+    {
+      ssh "${ssh_options[@]}" "$ssh_target" \
+        "sudo -n '$android_runtime_remote' state $android_container_id 2>&1 || true"
+      ssh "${ssh_options[@]}" "$ssh_target" \
+        "sudo -n /usr/bin/dmesg 2>&1 | tail -c 8192 || true"
+    } 2>&1 | tail -c 8192
+  }
+
+  # Polls bounded `getprop sys.boot_completed`; never blocks past the
+  # bounded timeout.
+  android_wait_boot_completed() {
+    local elapsed=0 property
+    while (( elapsed < android_boot_timeout )); do
+      property=$(
+        ssh "${ssh_options[@]}" "$ssh_target" \
+          "sudo -n '$android_runtime_remote' exec $android_container_id -- /system/bin/getprop sys.boot_completed" \
+          2>/dev/null || true
+      )
+      if [[ "$(printf '%s' "$property" | tr -d '[:space:]')" == 1 ]]; then
+        return 0
+      fi
+      sleep "$android_poll_interval"
+      elapsed=$((elapsed + android_poll_interval))
+    done
+    return 1
+  }
+
+  base64 -w0 "$VMIZ_UBUNTU2604_ANDROID_RUNTIME" | ssh "${ssh_options[@]}" "$ssh_target" \
+    "/usr/bin/bash -s -- '$android_runtime_remote'" <<'GUEST'
+set -euo pipefail
+remote=$1
+rm -f -- "$remote"
+umask 077
+base64 -d >"$remote"
+chmod 0755 "$remote"
+GUEST
+  android_runtime_remote_sha256=$(
+    ssh "${ssh_options[@]}" "$ssh_target" "sha256sum '$android_runtime_remote'" |
+      awk '{print $1}'
+  )
+  test "$android_runtime_remote_sha256" = "$android_runtime_sha256"
+
+  base64 -w0 "$VMIZ_UBUNTU2604_ANDROID_BUNDLE" | ssh "${ssh_options[@]}" "$ssh_target" \
+    "/usr/bin/bash -s -- '$android_bundle_archive_remote'" <<'GUEST'
+set -euo pipefail
+remote=$1
+rm -f -- "$remote"
+umask 077
+base64 -d >"$remote"
+chmod 0600 "$remote"
+GUEST
+  android_bundle_remote_sha256=$(
+    ssh "${ssh_options[@]}" "$ssh_target" "sha256sum '$android_bundle_archive_remote'" |
+      awk '{print $1}'
+  )
+  test "$android_bundle_remote_sha256" = "$android_bundle_sha256"
+
+  ssh "${ssh_options[@]}" "$ssh_target" \
+    "/usr/bin/bash -s -- '$android_bundle_archive_remote' '$android_bundle_remote_dir'" <<'GUEST'
+set -euo pipefail
+archive=$1
+dir=$2
+sudo -n rm -rf -- "$dir"
+sudo -n mkdir -p -- "$dir"
+sudo -n tar -xf "$archive" -C "$dir"
+GUEST
+
+  android_config_json_file="$RESULT_DIR/android-bundle-config.json"
+  ssh "${ssh_options[@]}" "$ssh_target" \
+    "sudo -n cat -- '$android_bundle_remote_dir/config.json'" \
+    >"$android_config_json_file"
+  test "$(sha256sum "$android_config_json_file" | awk '{print $1}')" = \
+    "$VMIZ_UBUNTU2604_ANDROID_CONFIG_SHA256"
+  python3 - "$android_config_json_file" <<'PY'
+import json
+import sys
+
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+mounts = config.get("mounts")
+if not isinstance(mounts, list):
+    raise SystemExit("Android bundle config has no mounts array")
+destinations = {
+    mount.get("destination")
+    for mount in mounts
+    if isinstance(mount, dict) and isinstance(mount.get("destination"), str)
+}
+if "/dev/binderfs" not in destinations:
+    raise SystemExit("Android bundle config does not mount /dev/binderfs")
+if not any(d.startswith("/dev/dma_heap") for d in destinations):
+    raise SystemExit("Android bundle config does not mount a DMA-heap device")
+PY
+
+  ssh "${ssh_options[@]}" "$ssh_target" \
+    "sudo -n '$android_runtime_remote' run --id $android_container_id --bundle '$android_bundle_remote_dir' --detach"
+
+  if ! android_wait_boot_completed; then
+    echo "::error::Android container did not report sys.boot_completed within the bounded timeout"
+    echo "--- Android container smoke diagnostics ---" >&2
+    android_capture_diagnostics >&2 || true
+    echo "--- end diagnostics ---" >&2
+    android_stop_container || true
+    exit 1
+  fi
+
+  android_abilist=$(
+    ssh "${ssh_options[@]}" "$ssh_target" \
+      "sudo -n '$android_runtime_remote' exec $android_container_id -- /system/bin/getprop ro.product.cpu.abilist"
+  )
+  case ",$(printf '%s' "$android_abilist" | tr -d '[:space:]')," in
+    *",$android_expected_abi,"*) ;;
+    *)
+      echo "::error::Android container ABI list does not report $android_expected_abi"
+      android_stop_container || true
+      exit 1
+      ;;
+  esac
+
+  if ! android_stop_container; then
+    echo "::error::Android container did not stop gracefully within the bounded timeout"
+    exit 1
+  fi
+fi
+
 data_disk_size_gib=4
 az disk create \
   --resource-group "$resource_group" \
@@ -1272,6 +1481,15 @@ else
   echo "::warning::Azure managed boot diagnostics did not return a serial log"
 fi
 
+android_smoke_args=()
+if [[ "$FLAVOR" == core ]]; then
+  android_smoke_args=(
+    --android-smoke-source-commit "$VMIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT"
+    --android-smoke-runtime-sha256 "$android_runtime_sha256"
+    --android-smoke-bundle-sha256 "$android_bundle_sha256"
+    --android-smoke-config-sha256 "$VMIZ_UBUNTU2604_ANDROID_CONFIG_SHA256"
+  )
+fi
 python3 "$RELEASE_SCHEMA" azure-result \
   --manifest "$manifest" \
   --asset "$asset" \
@@ -1289,6 +1507,7 @@ python3 "$RELEASE_SCHEMA" azure-result \
   --contracts "$azure_contract_list" \
   --run-id "$GITHUB_RUN_ID" \
   --run-attempt "$GITHUB_RUN_ATTEMPT" \
+  "${android_smoke_args[@]}" \
   --output "$RESULT_DIR/azure-result.json"
 python3 "$RELEASE_SCHEMA" verify-azure-result \
   --manifest "$manifest" \
@@ -1310,6 +1529,9 @@ test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
   echo "- Flavor: \`$FLAVOR\`"
   if [[ "$FLAVOR" == core ]]; then
     echo "- Binder device probe SHA-256: \`$binder_probe_sha256\`"
+    echo "- Android container smoke: runtime SHA-256 \`$android_runtime_sha256\`;" \
+      "bundle SHA-256 \`$android_bundle_sha256\`;" \
+      "source commit \`$VMIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT\`"
   fi
   echo "- Contracts: \`$azure_contract_list\`"
 } >>"$GITHUB_STEP_SUMMARY"

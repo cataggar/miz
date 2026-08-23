@@ -141,6 +141,10 @@ const core_contracts = [_][]const u8{
     "binder-boot-required",
     "binderfs-dynamic-devices",
     "binder-device-usability",
+    "android-smoke-artifact-provenance",
+    "android-container-boot-completed",
+    "android-container-abi-match",
+    "android-smoke-graceful-stop",
 };
 
 const FlavorPolicy = struct {
@@ -167,9 +171,10 @@ const core_policy: FlavorPolicy = .{
     .x86_64_file_name = "Ubuntu-26.04-x86_64.core.qcow2",
     .aarch64_file_name = "Ubuntu-26.04-aarch64.core.qcow2",
     .virtual_size = 3584 * mib,
-    // Bumped from 2 so that a result recorded before the Binder workload
-    // contracts existed can never satisfy the current core contract set.
-    .result_schema = 3,
+    // Bumped from 3 so that a result recorded before the Android container
+    // boot-completion smoke contracts existed can never satisfy the current
+    // core contract set.
+    .result_schema = 4,
     .contracts = &core_contracts,
 };
 
@@ -1821,6 +1826,460 @@ fn verifyGuestBinderDeviceUsability(
         return error.GuestBinderDeviceUsabilityContractFailed;
 }
 
+// --- Android container boot-completion smoke (core flavor only) ---
+//
+// The core image never embeds an Android OCI runtime or bundle: both are
+// supplied externally, at acceptance time, as a digest-bound artifact this
+// harness never publishes or persists into the QCOW2. Preparing that
+// runtime and bundle is out of scope for this repository; this section only
+// transfers the two artifacts the caller already verified, launches them
+// with the required BinderFS and DMA-heap access, and binds their
+// provenance into the acceptance result so a result recorded before this
+// contract existed can never satisfy the current core contract set. Callers
+// that cannot supply a real bundle must fail closed via
+// `requireAndroidSmokeInputsAlloc` rather than skip this contract.
+const android_smoke_runtime_remote_path = "/tmp/ubuntu2604-android-runtime";
+const android_smoke_bundle_archive_remote_path = "/tmp/ubuntu2604-android-bundle.tar";
+const android_smoke_bundle_remote_dir = "/tmp/ubuntu2604-android-bundle";
+const android_smoke_container_id = "vmiz-android-smoke";
+const android_smoke_boot_property = "sys.boot_completed";
+const android_smoke_abilist_property = "ro.product.cpu.abilist";
+const android_smoke_binderfs_mount_destination = "/dev/binderfs";
+const android_smoke_dma_heap_mount_prefix = "/dev/dma_heap";
+const android_smoke_poll_interval_seconds: u32 = 5;
+const android_smoke_boot_timeout_seconds: u32 = 240;
+const android_smoke_stop_timeout_seconds: u32 = 60;
+const android_smoke_diagnostics_byte_limit: usize = 8192;
+
+// Fully comptime-known guest commands, named so their exact contents are
+// directly unit-testable without SSH: in particular, that stop/delete never
+// spell `--force` and that launch always detaches instead of blocking.
+const android_smoke_extract_command = "set -eu; sudo -n rm -rf -- '" ++
+    android_smoke_bundle_remote_dir ++ "' && sudo -n mkdir -p -- '" ++
+    android_smoke_bundle_remote_dir ++ "' && sudo -n tar -xf '" ++
+    android_smoke_bundle_archive_remote_path ++ "' -C '" ++ android_smoke_bundle_remote_dir ++ "'";
+const android_smoke_config_command = "sudo -n cat -- '" ++
+    android_smoke_bundle_remote_dir ++ "/config.json'";
+const android_smoke_launch_command = "sudo -n '" ++ android_smoke_runtime_remote_path ++
+    "' run --id " ++ android_smoke_container_id ++ " --bundle '" ++
+    android_smoke_bundle_remote_dir ++ "' --detach";
+const android_smoke_boot_poll_command = "sudo -n '" ++ android_smoke_runtime_remote_path ++
+    "' exec " ++ android_smoke_container_id ++ " -- /system/bin/getprop " ++
+    android_smoke_boot_property;
+const android_smoke_abi_command = "sudo -n '" ++ android_smoke_runtime_remote_path ++
+    "' exec " ++ android_smoke_container_id ++ " -- /system/bin/getprop " ++
+    android_smoke_abilist_property;
+const android_smoke_kill_command = "sudo -n '" ++ android_smoke_runtime_remote_path ++
+    "' kill " ++ android_smoke_container_id ++ " TERM";
+const android_smoke_state_command = "sudo -n '" ++ android_smoke_runtime_remote_path ++
+    "' state " ++ android_smoke_container_id ++ " 2>/dev/null || printf '{\"status\":\"stopped\"}'";
+const android_smoke_delete_command = "sudo -n '" ++ android_smoke_runtime_remote_path ++
+    "' delete " ++ android_smoke_container_id;
+
+/// Required, digest-bound provenance for the externally supplied Android OCI
+/// runtime and bundle. Every field is read once, up front, alongside the
+/// other required acceptance inputs, so this contract fails closed with a
+/// clear error rather than silently skipping when the artifacts are absent.
+const AndroidSmokeInputs = struct {
+    source_commit: []u8,
+    runtime_path: []u8,
+    runtime_sha256: vmiz.artifact_pipeline.Digest,
+    bundle_path: []u8,
+    bundle_sha256: vmiz.artifact_pipeline.Digest,
+    config_sha256: vmiz.artifact_pipeline.Digest,
+
+    fn deinit(self: *AndroidSmokeInputs, allocator: Allocator) void {
+        allocator.free(self.source_commit);
+        allocator.free(self.runtime_path);
+        allocator.free(self.bundle_path);
+        self.* = undefined;
+    }
+};
+
+fn isLowerHexDigit(value: u8) bool {
+    return (value >= '0' and value <= '9') or (value >= 'a' and value <= 'f');
+}
+
+fn requireAndroidSmokeInputsAlloc(allocator: Allocator) !AndroidSmokeInputs {
+    const source_commit = try requireEnvAlloc(
+        allocator,
+        "VMIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT",
+    );
+    errdefer allocator.free(source_commit);
+    if (source_commit.len != 40) return error.InvalidAndroidSmokeSourceCommit;
+    for (source_commit) |c| {
+        if (!isLowerHexDigit(c)) return error.InvalidAndroidSmokeSourceCommit;
+    }
+
+    const runtime_path = try requireEnvAlloc(allocator, "VMIZ_UBUNTU2604_ANDROID_RUNTIME");
+    errdefer allocator.free(runtime_path);
+    const runtime_sha256_text = try requireEnvAlloc(
+        allocator,
+        "VMIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256",
+    );
+    defer allocator.free(runtime_sha256_text);
+    const runtime_sha256 = vmiz.artifact_pipeline.parseSha256(runtime_sha256_text) catch
+        return error.InvalidAndroidSmokeDigest;
+
+    const bundle_path = try requireEnvAlloc(allocator, "VMIZ_UBUNTU2604_ANDROID_BUNDLE");
+    errdefer allocator.free(bundle_path);
+    const bundle_sha256_text = try requireEnvAlloc(
+        allocator,
+        "VMIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256",
+    );
+    defer allocator.free(bundle_sha256_text);
+    const bundle_sha256 = vmiz.artifact_pipeline.parseSha256(bundle_sha256_text) catch
+        return error.InvalidAndroidSmokeDigest;
+
+    const config_sha256_text = try requireEnvAlloc(
+        allocator,
+        "VMIZ_UBUNTU2604_ANDROID_CONFIG_SHA256",
+    );
+    defer allocator.free(config_sha256_text);
+    const config_sha256 = vmiz.artifact_pipeline.parseSha256(config_sha256_text) catch
+        return error.InvalidAndroidSmokeDigest;
+
+    return .{
+        .source_commit = source_commit,
+        .runtime_path = runtime_path,
+        .runtime_sha256 = runtime_sha256,
+        .bundle_path = bundle_path,
+        .bundle_sha256 = bundle_sha256,
+        .config_sha256 = config_sha256,
+    };
+}
+
+/// Maps the acceptance architecture to the ABI string the Android container
+/// must report through `ro.product.cpu.abilist`. Pure and unit-tested
+/// without KVM.
+fn androidContainerAbi(architecture: Architecture) []const u8 {
+    return switch (architecture) {
+        .x86_64 => "x86_64",
+        .aarch64 => "arm64-v8a",
+    };
+}
+
+/// Confirms the guest-reported ABI list contains the ABI required for
+/// `architecture`. Pure aside from the caller-supplied text, so mismatched,
+/// empty, and malformed ABI lists are all directly unit-testable.
+fn verifyAndroidAbilist(abilist_output: []const u8, architecture: Architecture) !void {
+    const expected = androidContainerAbi(architecture);
+    const trimmed = std.mem.trim(u8, abilist_output, " \t\r\n");
+    var entries = std.mem.splitScalar(u8, trimmed, ',');
+    while (entries.next()) |abi| {
+        if (std.mem.eql(u8, abi, expected)) return;
+    }
+    return error.AndroidContainerAbiMismatch;
+}
+
+const AndroidBootPollOutcome = enum { boot_completed, retry, timed_out };
+
+/// Classifies one `getprop sys.boot_completed` observation. Pure and
+/// unit-tested directly: this is what guarantees the poll loop below always
+/// terminates instead of spinning past its bounded timeout.
+fn classifyAndroidBootPoll(
+    boot_completed_property: []const u8,
+    elapsed_seconds: u32,
+    timeout_seconds: u32,
+) AndroidBootPollOutcome {
+    const trimmed = std.mem.trim(u8, boot_completed_property, " \t\r\n");
+    if (std.mem.eql(u8, trimmed, "1")) return .boot_completed;
+    if (elapsed_seconds >= timeout_seconds) return .timed_out;
+    return .retry;
+}
+
+/// Confirms the bundle's `config.json` requests the BinderFS mount and a
+/// DMA-heap mount this contract requires, without vmiz constructing those
+/// mounts itself (bundle preparation belongs to the artifact this contract
+/// only consumes). Pure JSON parsing, unit-tested directly without KVM.
+fn verifyAndroidBundleConfigRequestsRequiredDevices(
+    allocator: Allocator,
+    config_json: []const u8,
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, config_json, .{}) catch
+        return error.InvalidAndroidBundleConfig;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidAndroidBundleConfig,
+    };
+    const mounts_value = root.get("mounts") orelse return error.MissingAndroidBundleMounts;
+    const mounts = switch (mounts_value) {
+        .array => |array| array,
+        else => return error.InvalidAndroidBundleMounts,
+    };
+    var has_binderfs = false;
+    var has_dma_heap = false;
+    for (mounts.items) |mount_value| {
+        const mount = switch (mount_value) {
+            .object => |object| object,
+            else => continue,
+        };
+        const destination_value = mount.get("destination") orelse continue;
+        const destination = switch (destination_value) {
+            .string => |text| text,
+            else => continue,
+        };
+        if (std.mem.eql(u8, destination, android_smoke_binderfs_mount_destination))
+            has_binderfs = true;
+        if (std.mem.startsWith(u8, destination, android_smoke_dma_heap_mount_prefix))
+            has_dma_heap = true;
+    }
+    if (!has_binderfs) return error.AndroidBundleMissingBinderfsMount;
+    if (!has_dma_heap) return error.AndroidBundleMissingDmaHeapMount;
+}
+
+/// Decides whether the guest-reported container state permits issuing
+/// `delete` without `--force`. Absent or unparseable state is treated as
+/// *not* ready, never as ready: the caller must keep waiting (and
+/// eventually fail closed) rather than risk a forced removal of a container
+/// that might still be running. Pure and unit-tested directly.
+fn androidSmokeReadyForDelete(status: ?[]const u8) bool {
+    const value = status orelse return false;
+    return std.mem.eql(u8, value, "stopped");
+}
+
+/// Extracts the `status` field from a `runz state` JSON document. Returns
+/// `null` (never an error) for anything unparseable, so the caller always
+/// falls through to the conservative "not ready" branch above.
+fn extractAndroidContainerStatusAlloc(
+    allocator: Allocator,
+    state_output: []const u8,
+) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, state_output, .{}) catch
+        return null;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const status_value = object.get("status") orelse return null;
+    return switch (status_value) {
+        .string => |text| try allocator.dupe(u8, text),
+        else => null,
+    };
+}
+
+fn pushFileBase64Alloc(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+    local_path: []const u8,
+    remote_path: []const u8,
+    remote_mode: []const u8,
+) !void {
+    const bytes = try Dir.cwd().readFileAlloc(
+        io,
+        local_path,
+        allocator,
+        .limited(256 * 1024 * 1024),
+    );
+    defer allocator.free(bytes);
+    const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+
+    const push_command = try std.fmt.allocPrint(
+        allocator,
+        "rm -f -- '{s}' && (umask 077; base64 -d >'{s}') && chmod {s} '{s}'",
+        .{ remote_path, remote_path, remote_mode, remote_path },
+    );
+    defer allocator.free(push_command);
+    const output = try sshWithStdinAlloc(allocator, io, ssh_path, instance, push_command, encoded);
+    allocator.free(output);
+}
+
+fn verifyRemoteFileDigest(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+    remote_path: []const u8,
+    expected: vmiz.artifact_pipeline.Digest,
+) !void {
+    const command = try std.fmt.allocPrint(
+        allocator,
+        "sha256sum -- '{s}' | awk '{{print $1}}'",
+        .{remote_path},
+    );
+    defer allocator.free(command);
+    const output = try sshOutputAlloc(allocator, io, ssh_path, instance, command);
+    defer allocator.free(output);
+    const trimmed = std.mem.trim(u8, output, " \t\r\n");
+    const actual = vmiz.artifact_pipeline.parseSha256(trimmed) catch
+        return error.AndroidSmokeRemoteDigestUnparseable;
+    if (!std.mem.eql(u8, &actual, &expected)) return error.AndroidSmokeRemoteDigestMismatch;
+}
+
+fn captureAndroidSmokeDiagnosticsAlloc(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+) ![]u8 {
+    const command = std.fmt.comptimePrint(
+        "{{ sudo -n '{s}' state {s} 2>&1 || true; " ++
+            "sudo -n /usr/bin/dmesg 2>&1 | tail -c {d} || true; }} | tail -c {d}",
+        .{
+            android_smoke_runtime_remote_path,
+            android_smoke_container_id,
+            android_smoke_diagnostics_byte_limit,
+            android_smoke_diagnostics_byte_limit,
+        },
+    );
+    return sshOutputAlloc(allocator, io, ssh_path, instance, command) catch
+        allocator.dupe(u8, "android container smoke diagnostics were unavailable\n");
+}
+
+fn pollAndroidBootCompleted(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+    architecture: Architecture,
+) !void {
+    var elapsed_seconds: u32 = 0;
+    while (true) {
+        const output = sshOutputAlloc(allocator, io, ssh_path, instance, android_smoke_boot_poll_command) catch
+            try allocator.dupe(u8, "");
+        defer allocator.free(output);
+        switch (classifyAndroidBootPoll(output, elapsed_seconds, android_smoke_boot_timeout_seconds)) {
+            .boot_completed => break,
+            .timed_out => return error.AndroidContainerBootTimedOut,
+            .retry => {
+                try Io.sleep(io, .fromSeconds(android_smoke_poll_interval_seconds), .awake);
+                elapsed_seconds += android_smoke_poll_interval_seconds;
+            },
+        }
+    }
+
+    const abi_output = try sshOutputAlloc(allocator, io, ssh_path, instance, android_smoke_abi_command);
+    defer allocator.free(abi_output);
+    try verifyAndroidAbilist(abi_output, architecture);
+}
+
+fn stopAndroidContainerGracefully(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+) !void {
+    if (sshOutputAlloc(allocator, io, ssh_path, instance, android_smoke_kill_command)) |output| {
+        allocator.free(output);
+    } else |err| switch (err) {
+        // The container may already have exited on its own; the state poll
+        // below is the source of truth for whether it is safe to delete.
+        error.SshCommandFailed => {},
+        else => return err,
+    }
+
+    const max_attempts = android_smoke_stop_timeout_seconds / android_smoke_poll_interval_seconds;
+    var attempt: u32 = 0;
+    var stopped = false;
+    while (attempt < max_attempts) : (attempt += 1) {
+        const state_output = try sshOutputAlloc(allocator, io, ssh_path, instance, android_smoke_state_command);
+        defer allocator.free(state_output);
+        const status = extractAndroidContainerStatusAlloc(allocator, state_output) catch null;
+        defer if (status) |value| allocator.free(value);
+        if (androidSmokeReadyForDelete(status)) {
+            stopped = true;
+            break;
+        }
+        try Io.sleep(io, .fromSeconds(android_smoke_poll_interval_seconds), .awake);
+    }
+    // Never force-remove a running Android container: if it never reaches
+    // "stopped" within the bounded timeout, this contract fails closed
+    // instead of issuing a forced delete.
+    if (!stopped) return error.AndroidContainerDidNotStopGracefully;
+
+    const delete_output = try sshOutputAlloc(allocator, io, ssh_path, instance, android_smoke_delete_command);
+    allocator.free(delete_output);
+}
+
+fn verifyGuestAndroidContainerSmoke(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+    architecture: Architecture,
+    smoke: *const AndroidSmokeInputs,
+) !void {
+    if (!std.mem.eql(
+        u8,
+        &(try vmiz.artifact_pipeline.hashFile(io, smoke.runtime_path)).sha256,
+        &smoke.runtime_sha256,
+    )) return error.AndroidSmokeRuntimeDigestMismatch;
+    if (!std.mem.eql(
+        u8,
+        &(try vmiz.artifact_pipeline.hashFile(io, smoke.bundle_path)).sha256,
+        &smoke.bundle_sha256,
+    )) return error.AndroidSmokeBundleDigestMismatch;
+
+    try pushFileBase64Alloc(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        smoke.runtime_path,
+        android_smoke_runtime_remote_path,
+        "0755",
+    );
+    try verifyRemoteFileDigest(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        android_smoke_runtime_remote_path,
+        smoke.runtime_sha256,
+    );
+
+    try pushFileBase64Alloc(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        smoke.bundle_path,
+        android_smoke_bundle_archive_remote_path,
+        "0600",
+    );
+    try verifyRemoteFileDigest(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        android_smoke_bundle_archive_remote_path,
+        smoke.bundle_sha256,
+    );
+
+    const extract_output = try sshOutputAlloc(allocator, io, ssh_path, instance, android_smoke_extract_command);
+    allocator.free(extract_output);
+
+    const config_json = try sshOutputAlloc(allocator, io, ssh_path, instance, android_smoke_config_command);
+    defer allocator.free(config_json);
+    const config_digest = vmiz.artifact_pipeline.sha256Bytes(config_json);
+    if (!std.mem.eql(u8, &config_digest, &smoke.config_sha256))
+        return error.AndroidSmokeConfigDigestMismatch;
+    try verifyAndroidBundleConfigRequestsRequiredDevices(allocator, config_json);
+
+    const launch_output = try sshOutputAlloc(allocator, io, ssh_path, instance, android_smoke_launch_command);
+    allocator.free(launch_output);
+
+    pollAndroidBootCompleted(allocator, io, ssh_path, instance, architecture) catch |err| {
+        const diagnostics = try captureAndroidSmokeDiagnosticsAlloc(allocator, io, ssh_path, instance);
+        defer allocator.free(diagnostics);
+        std.debug.print(
+            "\n--- Android container smoke diagnostics ({s}) ---\n{s}\n--- end diagnostics ---\n",
+            .{ instance.label, diagnostics },
+        );
+        stopAndroidContainerGracefully(allocator, io, ssh_path, instance) catch {};
+        return err;
+    };
+
+    try stopAndroidContainerGracefully(allocator, io, ssh_path, instance);
+}
+
 fn qemuRunning(instance: *const Instance, deadline: Io.Timestamp) !bool {
     const spawned = &(instance.spawned orelse return error.QemuNotStarted);
     return spawned.client.queryRunningUntil(deadline);
@@ -2357,6 +2816,7 @@ fn writeAcceptanceResult(
     source_sha256: vmiz.artifact_pipeline.Digest,
     certificate_sha256: vmiz.artifact_pipeline.Digest,
     uki_sha256: vmiz.artifact_pipeline.Digest,
+    android_smoke: ?*const AndroidSmokeInputs,
 ) !void {
     const source_sha256_hex = vmiz.artifact_pipeline.formatSha256(source_sha256);
     const certificate_sha256_hex = vmiz.artifact_pipeline.formatSha256(
@@ -2364,35 +2824,57 @@ fn writeAcceptanceResult(
     );
     const uki_sha256_hex = vmiz.artifact_pipeline.formatSha256(uki_sha256);
     switch (candidate.flavor) {
-        .full => try writeAcceptanceResultValue(
-            allocator,
-            io,
-            result_path,
-            .{
-                .schema = candidate.flavor.policy().result_schema,
-                .type = "ubuntu2604-local-secure-boot-acceptance",
-                .candidate_sha256 = &source_sha256_hex,
-                .certificate_sha256 = &certificate_sha256_hex,
-                .fallback_uki_sha256 = &uki_sha256_hex,
-                .contracts = candidate.contracts(),
-            },
-        ),
-        .core => try writeAcceptanceResultValue(
-            allocator,
-            io,
-            result_path,
-            .{
-                .schema = candidate.flavor.policy().result_schema,
-                .type = "ubuntu2604-local-secure-boot-acceptance",
-                .architecture = @tagName(candidate.architecture),
-                .flavor = @tagName(candidate.flavor),
-                .virtual_size = candidate.expectedVirtualSize(),
-                .candidate_sha256 = &source_sha256_hex,
-                .certificate_sha256 = &certificate_sha256_hex,
-                .fallback_uki_sha256 = &uki_sha256_hex,
-                .contracts = candidate.contracts(),
-            },
-        ),
+        .full => {
+            if (android_smoke != null) return error.UnexpectedAndroidSmokeProvenance;
+            try writeAcceptanceResultValue(
+                allocator,
+                io,
+                result_path,
+                .{
+                    .schema = candidate.flavor.policy().result_schema,
+                    .type = "ubuntu2604-local-secure-boot-acceptance",
+                    .candidate_sha256 = &source_sha256_hex,
+                    .certificate_sha256 = &certificate_sha256_hex,
+                    .fallback_uki_sha256 = &uki_sha256_hex,
+                    .contracts = candidate.contracts(),
+                },
+            );
+        },
+        .core => {
+            const smoke = android_smoke orelse return error.MissingAndroidSmokeProvenance;
+            const runtime_sha256_hex = vmiz.artifact_pipeline.formatSha256(smoke.runtime_sha256);
+            const bundle_sha256_hex = vmiz.artifact_pipeline.formatSha256(smoke.bundle_sha256);
+            const config_sha256_hex = vmiz.artifact_pipeline.formatSha256(smoke.config_sha256);
+            const candidate_key = try std.fmt.allocPrint(allocator, "{s}-{s}", .{
+                @tagName(candidate.architecture),
+                @tagName(candidate.flavor),
+            });
+            defer allocator.free(candidate_key);
+            try writeAcceptanceResultValue(
+                allocator,
+                io,
+                result_path,
+                .{
+                    .schema = candidate.flavor.policy().result_schema,
+                    .type = "ubuntu2604-local-secure-boot-acceptance",
+                    .architecture = @tagName(candidate.architecture),
+                    .flavor = @tagName(candidate.flavor),
+                    .virtual_size = candidate.expectedVirtualSize(),
+                    .candidate_sha256 = &source_sha256_hex,
+                    .certificate_sha256 = &certificate_sha256_hex,
+                    .fallback_uki_sha256 = &uki_sha256_hex,
+                    .android_smoke = .{
+                        .source_commit = smoke.source_commit,
+                        .runtime_sha256 = &runtime_sha256_hex,
+                        .bundle_sha256 = &bundle_sha256_hex,
+                        .config_sha256 = &config_sha256_hex,
+                        .architecture = @tagName(candidate.architecture),
+                        .candidate_key = candidate_key,
+                    },
+                    .contracts = candidate.contracts(),
+                },
+            );
+        },
     }
 }
 
@@ -2422,19 +2904,27 @@ test "Ubuntu 26.04 acceptance flavor policy preserves full and isolates core" {
     try std.testing.expectEqual(@as(u64, 3584 * mib), core.expectedVirtualSize());
     try std.testing.expect(core.expectedVirtualSize() < full.expectedVirtualSize());
     try std.testing.expectEqual(@as(u32, 1), full.flavor.policy().result_schema);
-    try std.testing.expectEqual(@as(u32, 3), core.flavor.policy().result_schema);
+    try std.testing.expectEqual(@as(u32, 4), core.flavor.policy().result_schema);
     try std.testing.expectEqual(@as(usize, 18), full.contracts().len);
-    try std.testing.expectEqual(@as(usize, 27), core.contracts().len);
+    try std.testing.expectEqual(@as(usize, 31), core.contracts().len);
     try std.testing.expect(hasContract(core.contracts(), "vmizinit-sshd-supervision"));
     try std.testing.expect(hasContract(core.contracts(), "no-cloud-init"));
     try std.testing.expect(hasContract(core.contracts(), "signed-binder-module"));
     try std.testing.expect(hasContract(core.contracts(), "binder-boot-required"));
     try std.testing.expect(hasContract(core.contracts(), "binderfs-dynamic-devices"));
     try std.testing.expect(hasContract(core.contracts(), "binder-device-usability"));
+    try std.testing.expect(hasContract(core.contracts(), "android-smoke-artifact-provenance"));
+    try std.testing.expect(hasContract(core.contracts(), "android-container-boot-completed"));
+    try std.testing.expect(hasContract(core.contracts(), "android-container-abi-match"));
+    try std.testing.expect(hasContract(core.contracts(), "android-smoke-graceful-stop"));
     try std.testing.expect(!hasContract(full.contracts(), "signed-binder-module"));
     try std.testing.expect(!hasContract(full.contracts(), "binder-boot-required"));
     try std.testing.expect(!hasContract(full.contracts(), "binderfs-dynamic-devices"));
     try std.testing.expect(!hasContract(full.contracts(), "binder-device-usability"));
+    try std.testing.expect(!hasContract(full.contracts(), "android-smoke-artifact-provenance"));
+    try std.testing.expect(!hasContract(full.contracts(), "android-container-boot-completed"));
+    try std.testing.expect(!hasContract(full.contracts(), "android-container-abi-match"));
+    try std.testing.expect(!hasContract(full.contracts(), "android-smoke-graceful-stop"));
 }
 
 test "Ubuntu 26.04 configured acceptance prerequisites fail closed" {
@@ -2605,6 +3095,188 @@ test "Binder probe output verification fails closed on unparseable garbage outpu
     ));
 }
 
+test "Android container smoke contracts are present only for core" {
+    const full = Candidate{ .architecture = .x86_64, .flavor = .full };
+    const core = Candidate{ .architecture = .x86_64, .flavor = .core };
+    for ([_][]const u8{
+        "android-smoke-artifact-provenance",
+        "android-container-boot-completed",
+        "android-container-abi-match",
+        "android-smoke-graceful-stop",
+    }) |contract| {
+        try std.testing.expect(hasContract(core.contracts(), contract));
+        try std.testing.expect(!hasContract(full.contracts(), contract));
+    }
+}
+
+test "Android container ABI mapping matches the acceptance architectures" {
+    try std.testing.expectEqualStrings("x86_64", androidContainerAbi(.x86_64));
+    try std.testing.expectEqualStrings("arm64-v8a", androidContainerAbi(.aarch64));
+}
+
+test "Android ABI list verification accepts the expected ABI among several" {
+    try verifyAndroidAbilist("x86_64,x86\n", .x86_64);
+    try verifyAndroidAbilist("arm64-v8a,armeabi-v7a,armeabi\n", .aarch64);
+}
+
+test "Android ABI list verification rejects a mismatched or empty ABI list" {
+    try std.testing.expectError(
+        error.AndroidContainerAbiMismatch,
+        verifyAndroidAbilist("armeabi-v7a,armeabi\n", .aarch64),
+    );
+    try std.testing.expectError(
+        error.AndroidContainerAbiMismatch,
+        verifyAndroidAbilist("\n", .x86_64),
+    );
+}
+
+test "Android boot poll classification reports completion, retry, and a bounded timeout" {
+    try std.testing.expectEqual(
+        AndroidBootPollOutcome.boot_completed,
+        classifyAndroidBootPoll("1\n", 0, 240),
+    );
+    try std.testing.expectEqual(
+        AndroidBootPollOutcome.retry,
+        classifyAndroidBootPoll("0\n", 5, 240),
+    );
+    try std.testing.expectEqual(
+        AndroidBootPollOutcome.retry,
+        classifyAndroidBootPoll("", 5, 240),
+    );
+    try std.testing.expectEqual(
+        AndroidBootPollOutcome.timed_out,
+        classifyAndroidBootPoll("0\n", 240, 240),
+    );
+    try std.testing.expectEqual(
+        AndroidBootPollOutcome.timed_out,
+        classifyAndroidBootPoll("", 245, 240),
+    );
+}
+
+test "Android bundle config verification accepts BinderFS and DMA-heap mounts" {
+    const allocator = std.testing.allocator;
+    const config =
+        \\{"mounts":[
+        \\  {"destination":"/dev/binderfs","type":"bind"},
+        \\  {"destination":"/dev/dma_heap/system","type":"bind"}
+        \\]}
+    ;
+    try verifyAndroidBundleConfigRequestsRequiredDevices(allocator, config);
+}
+
+test "Android bundle config verification rejects a missing BinderFS mount" {
+    const allocator = std.testing.allocator;
+    const config =
+        \\{"mounts":[{"destination":"/dev/dma_heap/system","type":"bind"}]}
+    ;
+    try std.testing.expectError(
+        error.AndroidBundleMissingBinderfsMount,
+        verifyAndroidBundleConfigRequestsRequiredDevices(allocator, config),
+    );
+}
+
+test "Android bundle config verification rejects a missing DMA-heap mount" {
+    const allocator = std.testing.allocator;
+    const config =
+        \\{"mounts":[{"destination":"/dev/binderfs","type":"bind"}]}
+    ;
+    try std.testing.expectError(
+        error.AndroidBundleMissingDmaHeapMount,
+        verifyAndroidBundleConfigRequestsRequiredDevices(allocator, config),
+    );
+}
+
+test "Android bundle config verification rejects malformed or missing mounts" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidAndroidBundleConfig,
+        verifyAndroidBundleConfigRequestsRequiredDevices(allocator, "not json"),
+    );
+    try std.testing.expectError(
+        error.MissingAndroidBundleMounts,
+        verifyAndroidBundleConfigRequestsRequiredDevices(allocator, "{}"),
+    );
+    try std.testing.expectError(
+        error.InvalidAndroidBundleMounts,
+        verifyAndroidBundleConfigRequestsRequiredDevices(allocator, "{\"mounts\":5}"),
+    );
+}
+
+test "Android bundle config verification skips malformed mount entries but still finds the rest" {
+    const allocator = std.testing.allocator;
+    const config =
+        \\{"mounts":[
+        \\  "not-an-object",
+        \\  {"type":"bind"},
+        \\  {"destination":5},
+        \\  {"destination":"/dev/binderfs"},
+        \\  {"destination":"/dev/dma_heap/system"}
+        \\]}
+    ;
+    try verifyAndroidBundleConfigRequestsRequiredDevices(allocator, config);
+}
+
+test "Android container status extraction parses status and fails closed to null otherwise" {
+    const allocator = std.testing.allocator;
+    const stopped = try extractAndroidContainerStatusAlloc(allocator, "{\"status\":\"stopped\"}");
+    defer if (stopped) |value| allocator.free(value);
+    try std.testing.expectEqualStrings("stopped", stopped.?);
+
+    try std.testing.expectEqual(
+        @as(?[]u8, null),
+        try extractAndroidContainerStatusAlloc(allocator, "not json"),
+    );
+    try std.testing.expectEqual(
+        @as(?[]u8, null),
+        try extractAndroidContainerStatusAlloc(allocator, "{}"),
+    );
+    try std.testing.expectEqual(
+        @as(?[]u8, null),
+        try extractAndroidContainerStatusAlloc(allocator, "{\"status\":5}"),
+    );
+}
+
+test "Android smoke graceful-stop safety only allows delete once stopped is confirmed" {
+    try std.testing.expect(androidSmokeReadyForDelete("stopped"));
+    try std.testing.expect(!androidSmokeReadyForDelete("running"));
+    try std.testing.expect(!androidSmokeReadyForDelete("created"));
+    try std.testing.expect(!androidSmokeReadyForDelete(null));
+}
+
+test "Android smoke guest commands never force-remove and always detach on launch" {
+    try std.testing.expect(std.mem.indexOf(u8, android_smoke_delete_command, "--force") == null);
+    try std.testing.expect(std.mem.indexOf(u8, android_smoke_kill_command, "--force") == null);
+    try std.testing.expect(std.mem.indexOf(u8, android_smoke_kill_command, "TERM") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_smoke_kill_command, "KILL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, android_smoke_launch_command, "--detach") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, android_smoke_launch_command, android_smoke_container_id) != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, android_smoke_boot_poll_command, "/system/bin/getprop") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, android_smoke_boot_poll_command, android_smoke_boot_property) != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, android_smoke_abi_command, android_smoke_abilist_property) != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, android_smoke_extract_command, android_smoke_bundle_archive_remote_path) != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, android_smoke_config_command, "config.json") != null,
+    );
+}
+
+test "Android smoke required inputs fail closed rather than skip when absent" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.RequiredEnvironmentMissing,
+        requireAndroidSmokeInputsAlloc(allocator),
+    );
+}
+
 test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2683,6 +3355,14 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         "VMIZ_UBUNTU2604_ACCEPTANCE_RESULT",
     );
     defer allocator.free(result_path);
+    // Required only for the core flavor, and required (never skipped) when
+    // it is: the Android container boot-completion smoke has no
+    // success-shaped fallback for a missing artifact.
+    var android_smoke: ?AndroidSmokeInputs = if (candidate.flavor == .core)
+        try requireAndroidSmokeInputsAlloc(allocator)
+    else
+        null;
+    defer if (android_smoke) |*value| value.deinit(allocator);
     var firmware = try requireFirmwareAlloc(
         allocator,
         io,
@@ -2839,6 +3519,24 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         try verifyGuestBinderfsDevices(allocator, io, ssh_path, &second);
         try verifyGuestBinderDeviceUsability(allocator, io, ssh_path, &first);
         try verifyGuestBinderDeviceUsability(allocator, io, ssh_path, &second);
+
+        const smoke = &android_smoke.?;
+        try verifyGuestAndroidContainerSmoke(
+            allocator,
+            io,
+            ssh_path,
+            &first,
+            candidate.architecture,
+            smoke,
+        );
+        try verifyGuestAndroidContainerSmoke(
+            allocator,
+            io,
+            ssh_path,
+            &second,
+            candidate.architecture,
+            smoke,
+        );
     }
 
     var first_before = try readGuestIdentityAlloc(allocator, io, ssh_path, &first);
@@ -3099,5 +3797,6 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         source_sha256,
         certificate_sha256,
         uki_sha256,
+        if (android_smoke != null) &android_smoke.? else null,
     );
 }

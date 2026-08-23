@@ -9,6 +9,18 @@
 #   variables AZURE_LOCATION_X64, AZURE_LOCATION_ARM64, AZURE_VM_SIZE_X64, and
 #   AZURE_VM_SIZE_ARM64. The acceptance app's Entra federated credential subject
 #   is `repo:cataggar/vmiz:environment:ubuntu2604-release`.
+# - The Android container boot-completion smoke required by core acceptance
+#   reads separate, non-environment-scoped repository secrets so the
+#   native-QEMU job (which needs no Azure credential) can use them without a
+#   protected-environment gate: ANDROID_RUNTIME_SOURCE_COMMIT,
+#   ANDROID_RUNTIME_URL, ANDROID_RUNTIME_SHA256, ANDROID_BUNDLE_URL,
+#   ANDROID_BUNDLE_SHA256, and ANDROID_BUNDLE_CONFIG_SHA256, naming a
+#   digest-bound external Android OCI runtime binary and bundle archive that
+#   the core image never embeds. An optional ANDROID_ARTIFACT_TOKEN secret is
+#   sent via curl's OAuth2 authorization option when the artifacts are hosted
+#   privately; its absence is not itself a failure, but a missing or
+#   malformed required secret is -- this contract fails explicitly rather
+#   than skipping the smoke.
 # This workflow validates core candidates and uploads workflow artifacts. It
 # never creates or moves tags, creates a GitHub release, or publishes assets.
 name: Validate Ubuntu 26.04 core images
@@ -510,6 +522,54 @@ jobs:
           echo "VMIZ_UBUNTU2604_SIGNING_CERTIFICATE=$GITHUB_WORKSPACE/$RESULT_DIR/signing-certificate.pem" >> "$GITHUB_ENV"
           echo "VMIZ_UBUNTU2604_ACCEPTANCE_RESULT=$GITHUB_WORKSPACE/$RESULT_DIR/native-result.json" >> "$GITHUB_ENV"
 
+      - name: Fetch and verify digest-bound Android container smoke inputs
+        env:
+          ANDROID_RUNTIME_SOURCE_COMMIT_VALUE: ${{ secrets.ANDROID_RUNTIME_SOURCE_COMMIT }}
+          ANDROID_RUNTIME_URL_VALUE: ${{ secrets.ANDROID_RUNTIME_URL }}
+          ANDROID_RUNTIME_SHA256_VALUE: ${{ secrets.ANDROID_RUNTIME_SHA256 }}
+          ANDROID_BUNDLE_URL_VALUE: ${{ secrets.ANDROID_BUNDLE_URL }}
+          ANDROID_BUNDLE_SHA256_VALUE: ${{ secrets.ANDROID_BUNDLE_SHA256 }}
+          ANDROID_BUNDLE_CONFIG_SHA256_VALUE: ${{ secrets.ANDROID_BUNDLE_CONFIG_SHA256 }}
+          ANDROID_ARTIFACT_TOKEN_VALUE: ${{ secrets.ANDROID_ARTIFACT_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The core image never embeds an Android OCI runtime or bundle;
+          # both are required, digest-bound external inputs. A missing or
+          # malformed secret fails closed here rather than silently
+          # skipping the boot-completion smoke.
+          if [[ -z "$ANDROID_RUNTIME_SOURCE_COMMIT_VALUE" || -z "$ANDROID_RUNTIME_URL_VALUE" ||
+                -z "$ANDROID_RUNTIME_SHA256_VALUE" || -z "$ANDROID_BUNDLE_URL_VALUE" ||
+                -z "$ANDROID_BUNDLE_SHA256_VALUE" || -z "$ANDROID_BUNDLE_CONFIG_SHA256_VALUE" ]]; then
+            echo "::error::Core native acceptance requires digest-bound external Android container smoke secrets"
+            exit 1
+          fi
+          [[ "$ANDROID_RUNTIME_SOURCE_COMMIT_VALUE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ANDROID_RUNTIME_SHA256_VALUE" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$ANDROID_BUNDLE_SHA256_VALUE" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$ANDROID_BUNDLE_CONFIG_SHA256_VALUE" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$ANDROID_RUNTIME_URL_VALUE" =~ ^https:// ]]
+          [[ "$ANDROID_BUNDLE_URL_VALUE" =~ ^https:// ]]
+          auth_header=()
+          if [[ -n "$ANDROID_ARTIFACT_TOKEN_VALUE" ]]; then
+            auth_header=(--oauth2-bearer "$ANDROID_ARTIFACT_TOKEN_VALUE")
+          fi
+          runtime_path="$GITHUB_WORKSPACE/$RESULT_DIR/android-runtime"
+          bundle_path="$GITHUB_WORKSPACE/$RESULT_DIR/android-bundle.tar"
+          curl --fail --silent --show-error --location "${auth_header[@]}" \
+            --output "$runtime_path" "$ANDROID_RUNTIME_URL_VALUE"
+          curl --fail --silent --show-error --location "${auth_header[@]}" \
+            --output "$bundle_path" "$ANDROID_BUNDLE_URL_VALUE"
+          test "$(sha256sum "$runtime_path" | awk '{print $1}')" = "$ANDROID_RUNTIME_SHA256_VALUE"
+          test "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$ANDROID_BUNDLE_SHA256_VALUE"
+          {
+            echo "VMIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT=$ANDROID_RUNTIME_SOURCE_COMMIT_VALUE"
+            echo "VMIZ_UBUNTU2604_ANDROID_RUNTIME=$runtime_path"
+            echo "VMIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256=$ANDROID_RUNTIME_SHA256_VALUE"
+            echo "VMIZ_UBUNTU2604_ANDROID_BUNDLE=$bundle_path"
+            echo "VMIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256=$ANDROID_BUNDLE_SHA256_VALUE"
+            echo "VMIZ_UBUNTU2604_ANDROID_CONFIG_SHA256=$ANDROID_BUNDLE_CONFIG_SHA256_VALUE"
+          } >> "$GITHUB_ENV"
+
       - name: Run matching-architecture native Secure Boot core acceptance
         run: |
           set -euo pipefail
@@ -686,6 +746,55 @@ jobs:
             -femit-bin="$BINDER_PROBE" \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           test -x "$BINDER_PROBE"
+
+      - name: Fetch and verify digest-bound Android container smoke inputs
+        env:
+          ANDROID_RUNTIME_SOURCE_COMMIT_VALUE: ${{ secrets.ANDROID_RUNTIME_SOURCE_COMMIT }}
+          ANDROID_RUNTIME_URL_VALUE: ${{ secrets.ANDROID_RUNTIME_URL }}
+          ANDROID_RUNTIME_SHA256_VALUE: ${{ secrets.ANDROID_RUNTIME_SHA256 }}
+          ANDROID_BUNDLE_URL_VALUE: ${{ secrets.ANDROID_BUNDLE_URL }}
+          ANDROID_BUNDLE_SHA256_VALUE: ${{ secrets.ANDROID_BUNDLE_SHA256 }}
+          ANDROID_BUNDLE_CONFIG_SHA256_VALUE: ${{ secrets.ANDROID_BUNDLE_CONFIG_SHA256 }}
+          ANDROID_ARTIFACT_TOKEN_VALUE: ${{ secrets.ANDROID_ARTIFACT_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The core image never embeds an Android OCI runtime or bundle;
+          # both are required, digest-bound external inputs. A missing or
+          # malformed secret fails closed here rather than silently
+          # skipping the boot-completion smoke.
+          if [[ -z "$ANDROID_RUNTIME_SOURCE_COMMIT_VALUE" || -z "$ANDROID_RUNTIME_URL_VALUE" ||
+                -z "$ANDROID_RUNTIME_SHA256_VALUE" || -z "$ANDROID_BUNDLE_URL_VALUE" ||
+                -z "$ANDROID_BUNDLE_SHA256_VALUE" || -z "$ANDROID_BUNDLE_CONFIG_SHA256_VALUE" ]]; then
+            echo "::error::Core Azure acceptance requires digest-bound external Android container smoke secrets"
+            exit 1
+          fi
+          [[ "$ANDROID_RUNTIME_SOURCE_COMMIT_VALUE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ANDROID_RUNTIME_SHA256_VALUE" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$ANDROID_BUNDLE_SHA256_VALUE" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$ANDROID_BUNDLE_CONFIG_SHA256_VALUE" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$ANDROID_RUNTIME_URL_VALUE" =~ ^https:// ]]
+          [[ "$ANDROID_BUNDLE_URL_VALUE" =~ ^https:// ]]
+          auth_header=()
+          if [[ -n "$ANDROID_ARTIFACT_TOKEN_VALUE" ]]; then
+            auth_header=(--oauth2-bearer "$ANDROID_ARTIFACT_TOKEN_VALUE")
+          fi
+          mkdir -p "$RESULT_DIR"
+          runtime_path="$GITHUB_WORKSPACE/$RESULT_DIR/android-runtime"
+          bundle_path="$GITHUB_WORKSPACE/$RESULT_DIR/android-bundle.tar"
+          curl --fail --silent --show-error --location "${auth_header[@]}" \
+            --output "$runtime_path" "$ANDROID_RUNTIME_URL_VALUE"
+          curl --fail --silent --show-error --location "${auth_header[@]}" \
+            --output "$bundle_path" "$ANDROID_BUNDLE_URL_VALUE"
+          test "$(sha256sum "$runtime_path" | awk '{print $1}')" = "$ANDROID_RUNTIME_SHA256_VALUE"
+          test "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$ANDROID_BUNDLE_SHA256_VALUE"
+          {
+            echo "VMIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT=$ANDROID_RUNTIME_SOURCE_COMMIT_VALUE"
+            echo "VMIZ_UBUNTU2604_ANDROID_RUNTIME=$runtime_path"
+            echo "VMIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256=$ANDROID_RUNTIME_SHA256_VALUE"
+            echo "VMIZ_UBUNTU2604_ANDROID_BUNDLE=$bundle_path"
+            echo "VMIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256=$ANDROID_BUNDLE_SHA256_VALUE"
+            echo "VMIZ_UBUNTU2604_ANDROID_CONFIG_SHA256=$ANDROID_BUNDLE_CONFIG_SHA256_VALUE"
+          } >> "$GITHUB_ENV"
 
       - name: Run exact-digest Azure Trusted Launch core acceptance
         env:
