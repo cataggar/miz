@@ -909,6 +909,7 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             self.assertIn(f"  {job}:\n", workflow)
         self.assertNotIn("\n    needs:", workflow)
         self.assertEqual(workflow.count("fail-fast: false"), 2)
+        self.assertEqual(workflow.count("name: build + test"), 1)
         self.assertIn("zig build test-ci --summary all", workflow)
         self.assertEqual(
             workflow.count("run: zig build test-vm-backend --summary all"),

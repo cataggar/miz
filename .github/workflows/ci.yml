@@ -48,7 +48,8 @@ jobs:
             tests.ubuntu2604_azure_acceptance_test
 
   zig-tests:
-    name: build + Zig test suite
+    # Keep the protected-branch context stable while changing the job graph.
+    name: build + test
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
