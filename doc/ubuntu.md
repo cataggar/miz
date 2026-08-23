@@ -470,7 +470,7 @@ core images; all publication work remains explicitly deferred.
 accept core keys or assets, and `scripts/ubuntu2604_publish.sh` is intentionally
 unchanged. Before dispatch:
 
-1. Create or retarget the required tag `Ubuntu-26.04-20260822` to the exact
+1. Create or retarget the required tag `Ubuntu-26.04-20260829` to the exact
    current `main` commit. Lightweight and annotated tags are accepted; force
    push the tag when it already exists, then verify the remote resolves to the
    current `main` commit before dispatch.

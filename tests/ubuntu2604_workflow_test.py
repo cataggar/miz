@@ -157,9 +157,9 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
     def test_release_identifier_uses_the_current_date(self) -> None:
         # The concurrency group, tag, and title use the same calendar date.
         # The release tag may be retargeted before dispatch.
-        self.assertIn("group: ubuntu2604-release-20260822", self.source)
-        self.assertIn("RELEASE_TAG: Ubuntu-26.04-20260822", self.source)
-        self.assertIn("RELEASE_TITLE: Ubuntu Server 26.04 - 20260822", self.source)
+        self.assertIn("group: ubuntu2604-release-20260829", self.source)
+        self.assertIn("RELEASE_TAG: Ubuntu-26.04-20260829", self.source)
+        self.assertIn("RELEASE_TITLE: Ubuntu Server 26.04 - 20260829", self.source)
         self.assertIn("create or retarget RELEASE_TAG", self.source)
 
     def test_forbidden_tools_are_confined_to_optional_oracle_jobs(self) -> None:

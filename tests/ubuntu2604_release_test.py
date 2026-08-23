@@ -485,7 +485,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         for key in release.EXPECTED:
             self.make_bundle(key)
 
-    def stage(self, release_tag: str = "Ubuntu-26.04-20260822"):
+    def stage(self, release_tag: str = "Ubuntu-26.04-20260829"):
         output = self.root / "staged"
         notes = self.root / "release-notes.md"
         release.stage_command(
