@@ -291,6 +291,11 @@ const baremetal_debz_packages = [_][]const u8{
     "ubuntu-minimal",
     baremetal_image_package,
     baremetal_modules_package,
+    // The generator this flavor configures and then runs. The core flavor gets
+    // it transitively through the linux-azure meta-package, but a bare
+    // linux-image binary package pulls in no initramfs tool of its own, so
+    // bare-metal has to name it or `update-initramfs` is simply absent.
+    "initramfs-tools",
     "openssh-server",
     "sudo",
 };
@@ -309,6 +314,7 @@ const baremetal_required_packages = [_][]const u8{
     "ubuntu-minimal",
     baremetal_image_package,
     baremetal_modules_package,
+    "initramfs-tools",
     "openssh-server",
     "openssh-client",
     "sudo",
