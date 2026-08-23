@@ -1627,6 +1627,7 @@ const Session = struct {
     }
 
     fn createDevices(self: *Session, dev_path: []const u8) !void {
+        const mknod = try findRequiredTool(self.io, mknod_candidates);
         const devices = [_]struct {
             name: []const u8,
             major: []const u8,
@@ -1644,7 +1645,7 @@ const Session = struct {
             );
             defer self.allocator.free(path);
             try self.runSuccess(&.{
-                findTool(self.io, mknod_candidates).?,
+                mknod,
                 "-m",
                 "666",
                 path,
@@ -3616,11 +3617,48 @@ fn findTool(io: Io, candidates: []const []const u8) ?[]const u8 {
         const stat = Io.Dir.cwd().statFile(
             io,
             path,
-            .{ .follow_symlinks = false },
+            .{ .follow_symlinks = true },
         ) catch continue;
         if (stat.kind == .file) return path;
     }
     return null;
+}
+
+fn findRequiredTool(io: Io, candidates: []const []const u8) ![]const u8 {
+    return findTool(io, candidates) orelse error.RequiredToolNotFound;
+}
+
+test "findTool accepts a regular file reached through a symlink" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "tool", .data = "" });
+    try tmp.dir.symLink(io, "tool", "tool-link", .{});
+
+    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const link_path = try std.fs.path.join(
+        allocator,
+        &.{ root_buf[0..root_len], "tool-link" },
+    );
+    defer allocator.free(link_path);
+
+    try std.testing.expectEqualStrings(
+        link_path,
+        findTool(io, &.{link_path}) orelse return error.TestUnexpectedResult,
+    );
+}
+
+test "findRequiredTool returns an error when no candidate exists" {
+    try std.testing.expectError(
+        error.RequiredToolNotFound,
+        findRequiredTool(std.testing.io, &.{
+            "/vmiz-test/no-such-tool",
+            "/vmiz-test/no-such-tool-either",
+        }),
+    );
 }
 
 fn hasRequiredCapabilities() bool {
