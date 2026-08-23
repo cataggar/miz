@@ -1672,12 +1672,65 @@ fn runOfflineCommand(
     return executor.execute(command);
 }
 
+/// Resolves the guest directory holding `release_name`'s kernel modules.
+///
+/// An Ubuntu 26.04 root is merged-usr: the modules really live under
+/// `/usr/lib/modules`, and `/lib` is only a compatibility symlink to `usr/lib`.
+/// `offline_root` refuses to walk a symlink in an intermediate component on
+/// purpose -- that refusal is what stops a package escaping the root through
+/// one -- so asking it for `/lib/modules/...` fails with `NotDirectory` instead
+/// of landing on the real directory. Ask for the canonical location first and
+/// keep the split-usr spelling as a fallback, so a root that never merged still
+/// validates.
+fn kernelModulesPath(
+    allocator: Allocator,
+    root: *offline_root.Root,
+    release_name: []const u8,
+) ![]u8 {
+    const merged = try std.fmt.allocPrint(allocator, "/usr/lib/modules/{s}", .{release_name});
+    if (root.inspect(merged)) |inspection| {
+        allocator.free(inspection.path);
+        if (inspection.kind == .directory) return merged;
+    } else |err| switch (err) {
+        error.PathNotFound, error.FileNotFound, error.NotDirectory => {},
+        else => {
+            allocator.free(merged);
+            return err;
+        },
+    }
+    allocator.free(merged);
+    return std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{release_name});
+}
+
+/// The `kernelModulesPath` rule for the built image rather than the staging
+/// root. The mountless ext4 reader resolves a path by exact node lookup and
+/// never expands a symlink either, so `/lib/modules/...` misses the same way --
+/// here as `PathNotFound`.
+fn nativeKernelModulesPath(
+    allocator: Allocator,
+    filesystem: *const vmiz.ext4_mountless.FileSystem,
+    release_name: []const u8,
+) ![]u8 {
+    const merged = try std.fmt.allocPrint(allocator, "/usr/lib/modules/{s}", .{release_name});
+    if (filesystem.stat(merged)) |entry| {
+        if (entry.kind == .directory) return merged;
+    } else |err| switch (err) {
+        error.PathNotFound, error.NotDirectory => {},
+        else => {
+            allocator.free(merged);
+            return err;
+        },
+    }
+    allocator.free(merged);
+    return std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{release_name});
+}
+
 fn validateNativeBootArtifacts(
     allocator: Allocator,
     root: *offline_root.Root,
     release_name: []const u8,
 ) !void {
-    const modules_path = try std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{release_name});
+    const modules_path = try kernelModulesPath(allocator, root, release_name);
     defer allocator.free(modules_path);
     const modules = try root.discover(modules_path, "*");
     defer root.freeFound(modules);
@@ -1705,10 +1758,12 @@ fn validateCoreKernelModules(
     root: *offline_root.Root,
     release_name: []const u8,
 ) !void {
+    const modules_path = try kernelModulesPath(allocator, root, release_name);
+    defer allocator.free(modules_path);
     const modules_dep_path = try std.fmt.allocPrint(
         allocator,
-        "/lib/modules/{s}/modules.dep",
-        .{release_name},
+        "{s}/modules.dep",
+        .{modules_path},
     );
     defer allocator.free(modules_dep_path);
     const modules_dep = try root.readFile(modules_dep_path);
@@ -1899,7 +1954,7 @@ fn customizeOfflineRoot(
         });
     }
 
-    const modules_path = try std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{release_name});
+    const modules_path = try kernelModulesPath(allocator, &root, release_name);
     defer allocator.free(modules_path);
     const initrd_path = try std.fmt.allocPrint(allocator, "/boot/initrd.img-{s}", .{release_name});
     defer allocator.free(initrd_path);
@@ -2859,7 +2914,11 @@ fn extractNativeBootInputs(
     }
     const kernel_release = release_name orelse return error.ExpectedKernelMissing;
     errdefer allocator.free(kernel_release);
-    const modules_guest = try std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{kernel_release});
+    const modules_guest = try nativeKernelModulesPath(
+        allocator,
+        &native_root.filesystem,
+        kernel_release,
+    );
     defer allocator.free(modules_guest);
     const modules = try native_root.filesystem.list(allocator, modules_guest, 4096);
     defer allocator.free(modules);
@@ -4334,6 +4393,66 @@ test "native boot validation rejects missing modules.dep and initramfs" {
         error.InitramfsMissing,
         validateNativeBootArtifacts(allocator, &root, "7.0.0-1001-azure"),
     );
+}
+
+test "native boot validation follows a merged-usr root" {
+    // The production shape: the modules really live under `/usr/lib/modules`
+    // and `/lib` is only a compatibility symlink. `offline_root` refuses to walk
+    // that symlink, so validating through `/lib/modules` reported the modules of
+    // a correctly built root as missing -- `error.NotDirectory` raised after
+    // dpkg had already succeeded.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const root_path = try std.fs.path.join(allocator, &.{ cwd, ".scratch/ubuntu-merged-usr-boot-validation" });
+    defer allocator.free(root_path);
+    Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, root_path);
+    var root = try offline_root.Root.init(allocator, io, root_path, .{});
+    defer root.deinit();
+    const kernel_release = "7.0.0-2015-nvidia-bos-64k";
+    try root.createDirectory("/usr/lib/modules/" ++ kernel_release, 0o755);
+    try root.createDirectory("/boot", 0o755);
+    try root.writeFile(.{
+        .path = "/usr/lib/modules/" ++ kernel_release ++ "/kernel",
+        .source = .{ .inline_bytes = "module" },
+    });
+    try root.writeFile(.{
+        .path = "/usr/lib/modules/" ++ kernel_release ++ "/modules.dep",
+        .source = .{ .inline_bytes = "kernel/drivers/net/hv_netvsc.ko:\n" },
+    });
+    try root.writeFile(.{
+        .path = "/boot/initrd.img-" ++ kernel_release,
+        .source = .{ .inline_bytes = "initrd" },
+    });
+    try root.replaceSymlink("/lib", "usr/lib");
+
+    // The symlink is genuinely unwalkable, so the old spelling cannot work and
+    // the resolver stays as strict as it was.
+    try std.testing.expectError(
+        error.NotDirectory,
+        root.discover("/lib/modules/" ++ kernel_release, "*"),
+    );
+
+    const resolved = try kernelModulesPath(allocator, &root, kernel_release);
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings("/usr/lib/modules/" ++ kernel_release, resolved);
+    try validateNativeBootArtifacts(allocator, &root, kernel_release);
+
+    // A root that never merged keeps the `/lib` spelling.
+    const split_path = try std.fs.path.join(allocator, &.{ cwd, ".scratch/ubuntu-split-usr-boot-validation" });
+    defer allocator.free(split_path);
+    Io.Dir.cwd().deleteTree(io, split_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, split_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, split_path);
+    var split = try offline_root.Root.init(allocator, io, split_path, .{});
+    defer split.deinit();
+    try split.createDirectory("/lib/modules/" ++ kernel_release, 0o755);
+    const split_resolved = try kernelModulesPath(allocator, &split, kernel_release);
+    defer allocator.free(split_resolved);
+    try std.testing.expectEqualStrings("/lib/modules/" ++ kernel_release, split_resolved);
 }
 
 test "native ESP UKI validation preserves exact signed bytes and machine" {
