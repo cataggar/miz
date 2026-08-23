@@ -38,6 +38,15 @@ must not contain cloud-init, WALinuxAgent, `ubuntu-server`, or
 `ubuntu-server-minimal`. This source/package decision is part of core
 provenance and is not inferred from mutable archive state.
 
+For bare metal, the root is assembled the same way, in stable order:
+`ubuntu-minimal`, the pinned NVIDIA BaseOS `linux-image` and `linux-modules`
+binary packages, `initramfs-tools`, `openssh-server`, `sudo`, and
+`ca-certificates`. The last two are named explicitly because core reached
+both through `linux-azure`, which bare metal forbids -- a second kernel in
+`/boot` would make the release the UKI is built from ambiguous. The resolved
+closure must also contain `openssh-client`, and must not contain cloud-init,
+WALinuxAgent, `ubuntu-server`, `ubuntu-server-minimal`, or `linux-azure`.
+
 The package-root round trip is native: the mutable QCOW2 is converted to a
 raw staging image, `vmiz.ext4_mountless.FileSystem` reads the selected ext4
 partition without mounting it, and the package-safe staging view is imported
