@@ -854,29 +854,26 @@ def validate_signing_provenance(
     )
 
     files = document.get("files")
-    if not isinstance(files, list) or len(files) < 2:
+    if not isinstance(files, list) or len(files) != 1:
         fail("UKI signing provenance file bindings are absent")
     fallback_path = (
         "EFI/BOOT/BOOTX64.EFI"
         if architecture == "x86_64"
         else "EFI/BOOT/BOOTAA64.EFI"
     )
-    seen: set[str] = set()
-    named_digests: set[str] = set()
-    named_operations: dict[str, set[str]] = {}
+    # Only the fallback path is ever loaded: firmware boots one binary, and a generalized image
+    # comes up on fresh NVRAM, so it takes the removable-media path. There is no second record to
+    # cross-reference, and there never was anything to learn from one -- the builder derived both
+    # from a single signing operation, so agreement between them was a foregone conclusion. What
+    # binds the shipped bytes to the signer is the per-record digest chain below, and the builder's
+    # own check that the UKI read back out of the finalized image is the signed artifact.
     fallback_digest: str | None = None
-    fallback_operation: str | None = None
     for record in files:
         if not isinstance(record, dict):
             fail("invalid UKI signing file record")
         uki_path = record.get("path")
-        if not isinstance(uki_path, str) or uki_path in seen:
-            fail("invalid or duplicate UKI signing path")
-        if uki_path != fallback_path and not (
-            uki_path.startswith("EFI/Linux/") and uki_path.lower().endswith(".efi")
-        ):
+        if uki_path != fallback_path:
             fail(f"unexpected UKI signing path: {uki_path}")
-        seen.add(uki_path)
         unsigned = require_sha256(
             record.get("unsigned_sha256"), f"{uki_path} unsigned UKI digest"
         )
@@ -893,16 +890,9 @@ def validate_signing_provenance(
             fail(f"{uki_path}: invalid Artifact Signing operation ID")
         if record.get("signing_certificate_sha256") != signing_certificate_sha256:
             fail(f"{uki_path}: Artifact Signing leaf fingerprint mismatch")
-        if uki_path == fallback_path:
-            fallback_digest = signed
-            fallback_operation = operation_id
-        else:
-            named_digests.add(signed)
-            named_operations.setdefault(signed, set()).add(operation_id)
-    if fallback_digest is None or fallback_digest not in named_digests:
-        fail("fallback UKI is not byte-identical to a named signed UKI")
-    if fallback_operation not in named_operations[fallback_digest]:
-        fail("fallback UKI does not retain its named UKI signing operation")
+        fallback_digest = signed
+    if fallback_digest is None:
+        fail("fallback UKI signing record is absent")
     return {
         "certificate_sha256": certificate_sha256,
         "certificate_der_base64": certificate_der_base64,

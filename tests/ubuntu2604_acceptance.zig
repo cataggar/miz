@@ -647,41 +647,8 @@ fn verifyUkiSignatures(
         .length = (partition.last_lba - partition.first_lba + 1) *
             vmiz.gpt.sector_size,
     });
-    const entries = try esp.listDirAlloc(io, allocator, "EFI/Linux");
-    defer vmiz.fat32.freeDirEntries(allocator, entries);
-    var index: usize = 0;
-    for (entries) |entry| {
-        if (entry.kind != .file or entry.name.len <= 4 or
-            !std.ascii.eqlIgnoreCase(entry.name[entry.name.len - 4 ..], ".efi"))
-        {
-            continue;
-        }
-        const path = try std.fmt.allocPrint(allocator, "EFI/Linux/{s}", .{entry.name});
-        defer allocator.free(path);
-        const bytes = try esp.readFileAlloc(io, allocator, path);
-        defer allocator.free(bytes);
-        const extracted = try std.fmt.allocPrint(
-            allocator,
-            "{s}/uki-{d}.efi",
-            .{ scratch_path, index },
-        );
-        defer allocator.free(extracted);
-        try Dir.cwd().writeFile(io, .{
-            .sub_path = extracted,
-            .data = bytes,
-            .flags = .{ .truncate = true, .permissions = .fromMode(0o600) },
-        });
-        defer Dir.cwd().deleteFile(io, extracted) catch {};
-        try runCommand(allocator, io, &.{
-            sbverify_path,
-            "--cert",
-            certificate_path,
-            extracted,
-        });
-        index += 1;
-    }
-    if (index == 0) return error.MissingNamedUki;
-
+    // The image carries one signed UKI, at the fallback path firmware loads. Verifying that one is
+    // the whole job; the EFI/Linux duplicate this used to walk no longer exists.
     const fallback = try esp.readFileAlloc(
         io,
         allocator,
@@ -823,36 +790,7 @@ fn createTamperedOverlay(
         .length = (partition.last_lba - partition.first_lba + 1) *
             vmiz.gpt.sector_size,
     });
-    const entries = try esp.listDirAlloc(io, allocator, "EFI/Linux");
-    defer vmiz.fat32.freeDirEntries(allocator, entries);
-    var index: usize = 0;
-    for (entries) |entry| {
-        if (entry.kind != .file or entry.name.len <= 4 or
-            !std.ascii.eqlIgnoreCase(entry.name[entry.name.len - 4 ..], ".efi"))
-        {
-            continue;
-        }
-        const path = try std.fmt.allocPrint(allocator, "EFI/Linux/{s}", .{entry.name});
-        defer allocator.free(path);
-        const signed = try esp.readFileAlloc(io, allocator, path);
-        defer allocator.free(signed);
-        const tampered = try tamperUkiCmdlineAlloc(allocator, signed);
-        defer allocator.free(tampered);
-        try requireRejectedUkiSignature(
-            allocator,
-            io,
-            sbverify_path,
-            certificate_path,
-            scratch_path,
-            index,
-            tampered,
-        );
-        try esp.deletePath(io, path);
-        try esp.writeFile(io, path, tampered);
-        index += 1;
-    }
-    if (index == 0) return error.MissingNamedUki;
-
+    // Tamper with the one signed UKI the image carries, at the path firmware loads.
     const fallback_path = candidate.architecture.fallbackUkiPath();
     const signed_fallback = try esp.readFileAlloc(io, allocator, fallback_path);
     defer allocator.free(signed_fallback);
@@ -864,7 +802,7 @@ fn createTamperedOverlay(
         sbverify_path,
         certificate_path,
         scratch_path,
-        index,
+        0,
         tampered_fallback,
     );
     try esp.deletePath(io, fallback_path);
@@ -1049,32 +987,22 @@ fn validateFinalizedImage(
         },
     }
 
-    const entries = try esp.listDirAlloc(io, allocator, "EFI/Linux");
+    // The signed UKI exists once, at the path firmware loads. Assert the duplicate that used to sit
+    // under EFI/Linux is absent rather than merely unread: two 62 MiB copies do not fit on this ESP,
+    // so a reappearance is a build regression that would fail late, at the second write.
+    const entries = esp.listDirAlloc(io, allocator, "EFI/Linux") catch |err| switch (err) {
+        error.PathNotFound => return vmiz.artifact_pipeline.sha256Bytes(uki),
+        else => return err,
+    };
     defer vmiz.fat32.freeDirEntries(allocator, entries);
-    var named_count: usize = 0;
-    var fallback_matches_named = false;
     for (entries) |entry| {
         if (entry.kind != .file or entry.name.len <= 4 or
             !std.ascii.eqlIgnoreCase(entry.name[entry.name.len - 4 ..], ".efi"))
         {
             continue;
         }
-        named_count += 1;
-        const named_path = try std.fmt.allocPrint(
-            allocator,
-            "EFI/Linux/{s}",
-            .{entry.name},
-        );
-        defer allocator.free(named_path);
-        const named = try esp.readFileAlloc(io, allocator, named_path);
-        defer allocator.free(named);
-        var named_inspection = try vmiz.uki.inspect(allocator, named);
-        defer named_inspection.deinit(allocator);
-        if (named_inspection.security_directory == null) return error.UnsignedUki;
-        if (std.mem.eql(u8, named, uki)) fallback_matches_named = true;
+        return error.StaleNamedUkiPresent;
     }
-    if (named_count == 0) return error.MissingNamedUki;
-    if (!fallback_matches_named) return error.FallbackUkiMismatch;
     return vmiz.artifact_pipeline.sha256Bytes(uki);
 }
 

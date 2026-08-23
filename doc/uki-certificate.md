@@ -70,7 +70,9 @@ The image must have:
 - a readable FAT32 ESP;
 - exactly one architecture fallback, either `EFI/BOOT/BOOTX64.EFI` or
   `EFI/BOOT/BOOTAA64.EFI`;
-- at least one regular `EFI/Linux/*.efi` UKI;
+- any number of regular `EFI/Linux/*.efi` UKIs, including none -- that
+  directory only exists for images that ship a boot loader to scan it, and an
+  image booted straight through the fallback has no reason to carry one;
 - a structurally valid Authenticode signature on every selected UKI;
 - one PE architecture and one byte-identical signer certificate across the
   fallback and all named UKIs.
