@@ -105,9 +105,13 @@ minimum, and virtual size are provenance fields and validation gates.
 
 Both flavors retain the Canonical Gen2 GPT layout: the root is `/dev/sda1` and
 the EFI system partition is `/dev/sda15`. Firmware directly loads the signed
-architecture-specific UKI from both the fallback path
-(`EFI/BOOT/BOOTX64.EFI` or `EFI/BOOT/BOOTAA64.EFI`) and the corresponding
-`EFI/Linux/` path; shim and GRUB are not required for this boot path.
+architecture-specific UKI from the removable-media fallback path
+(`EFI/BOOT/BOOTX64.EFI` or `EFI/BOOT/BOOTAA64.EFI`); shim and GRUB are not
+required for this boot path. That is the only copy. Firmware loads one binary,
+and a generalized image boots on fresh NVRAM, so the fallback is the path it
+takes. `EFI/Linux/` is the Boot Loader Specification type 2 directory, which
+needs a boot loader to scan it, and these images ship none -- a duplicate there
+would never be read, and at 62 MiB it does not fit beside the copy that boots.
 
 The UKI combines the installed kernel, its newly generated initramfs, and
 matching `/lib/modules/<release>`. Which kernel is the right one is a property

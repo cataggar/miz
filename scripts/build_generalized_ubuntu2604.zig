@@ -1805,12 +1805,16 @@ fn validateCoreKernelModules(
             return error.CoreKernelModuleMissing;
 }
 
+/// `signed_bytes` is what the signer returned, so this is the binding that matters: the UKI carried
+/// by the finalized image is byte-for-byte the artifact that was signed, not merely something that
+/// parses as a UKI. Comparing the ESP copy against a second ESP copy could never establish that,
+/// because the builder writes both in the same pass.
 fn validateUkiBytes(
     fallback_bytes: []const u8,
-    named_bytes: []const u8,
+    signed_bytes: []const u8,
     profile: *const Profile,
 ) !void {
-    if (!std.mem.eql(u8, fallback_bytes, named_bytes)) return error.FinalUkiMissing;
+    if (!std.mem.eql(u8, fallback_bytes, signed_bytes)) return error.FinalUkiMissing;
     if (try peMachine(fallback_bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
 }
 
@@ -2849,8 +2853,6 @@ fn writeSigningProvenance(
     const signing_fingerprint: ?[]const u8 = if (metadata != null) &provider_fingerprint else null;
     const fallback_path = try std.fmt.allocPrint(allocator, "EFI/BOOT/{s}", .{profile.efi_fallback});
     defer allocator.free(fallback_path);
-    const named_path = try std.fmt.allocPrint(allocator, "EFI/Linux/{s}", .{profile.efi_fallback});
-    defer allocator.free(named_path);
     const Record = struct {
         path: []const u8,
         unsigned_sha256: []const u8,
@@ -2861,15 +2863,6 @@ fn writeSigningProvenance(
         signing_certificate_sha256: ?[]const u8,
     };
     const records = [_]Record{
-        .{
-            .path = named_path,
-            .unsigned_sha256 = &unsigned_hex,
-            .signed_sha256 = &signed_hex,
-            .finalized_sha256 = &signed_hex,
-            .signed_bytes = signed.bytes.len,
-            .signing_operation_id = operation_id,
-            .signing_certificate_sha256 = signing_fingerprint,
-        },
         .{
             .path = fallback_path,
             .unsigned_sha256 = &unsigned_hex,
@@ -3113,23 +3106,22 @@ fn insertSignedUki(
         .offset = esp.first_lba * vmiz.gpt.sector_size,
         .length = (esp.last_lba - esp.first_lba + 1) * vmiz.gpt.sector_size,
     });
-    try filesystem.createDir(io, "EFI/Linux");
     try filesystem.createDir(io, "EFI/BOOT");
     const signed = try Dir.cwd().readFileAlloc(io, signed_path, allocator, .limited(256 * 1024 * 1024));
     defer allocator.free(signed);
-    const named = try std.fmt.allocPrint(allocator, "EFI/Linux/{s}", .{profile.efi_fallback});
-    defer allocator.free(named);
     const fallback = try std.fmt.allocPrint(allocator, "EFI/BOOT/{s}", .{profile.efi_fallback});
     defer allocator.free(fallback);
-    filesystem.deletePath(io, named) catch |err| switch (err) {
-        error.PathNotFound => {},
-        else => return err,
-    };
-    filesystem.deletePath(io, fallback) catch |err| switch (err) {
-        error.PathNotFound => {},
-        else => return err,
-    };
-    try filesystem.writeFile(io, named, signed);
+    // Older images carried a duplicate under EFI/Linux. Nothing loads it -- that is the Boot Loader
+    // Specification type 2 directory, which needs a boot loader to scan it, and this image ships
+    // none -- and at 62 MiB the copy no longer fits beside the one that boots.
+    const stale_named = try std.fmt.allocPrint(allocator, "EFI/Linux/{s}", .{profile.efi_fallback});
+    defer allocator.free(stale_named);
+    for ([_][]const u8{ fallback, stale_named }) |path| {
+        filesystem.deletePath(io, path) catch |err| switch (err) {
+            error.PathNotFound => {},
+            else => return err,
+        };
+    }
     try filesystem.writeFile(io, fallback, signed);
 }
 
@@ -3137,7 +3129,7 @@ fn validateFinalNativeImage(
     allocator: Allocator,
     io: Io,
     image_path: []const u8,
-    work_dir: []const u8,
+    signed_bytes: []const u8,
     profile: *const Profile,
     expected_cmdline: []const u8,
 ) !void {
@@ -3152,15 +3144,33 @@ fn validateFinalNativeImage(
     });
     const fallback = try std.fmt.allocPrint(allocator, "EFI/BOOT/{s}", .{profile.efi_fallback});
     defer allocator.free(fallback);
-    const named = try std.fmt.allocPrint(allocator, "EFI/Linux/{s}", .{profile.efi_fallback});
-    defer allocator.free(named);
     const fallback_bytes = try filesystem.readFileAlloc(io, allocator, fallback);
     defer allocator.free(fallback_bytes);
-    const named_bytes = try filesystem.readFileAlloc(io, allocator, named);
-    defer allocator.free(named_bytes);
-    try validateUkiBytes(fallback_bytes, named_bytes, profile);
+    try validateUkiBytes(fallback_bytes, signed_bytes, profile);
     try validateUkiContract(allocator, fallback_bytes, expected_cmdline);
-    _ = work_dir;
+    try validateNoStaleNamedUki(allocator, io, &filesystem, profile);
+}
+
+/// The duplicate under EFI/Linux is gone, and it has to stay gone. A leftover from an earlier build
+/// would be a second bootable-looking UKI that nothing keeps in step with the one that actually
+/// boots, and on this ESP the two do not fit together anyway.
+fn validateNoStaleNamedUki(
+    allocator: Allocator,
+    io: Io,
+    filesystem: *vmiz.fat32.FileSystem,
+    profile: *const Profile,
+) !void {
+    const entries = filesystem.listDirAlloc(io, allocator, "EFI/Linux") catch |err| switch (err) {
+        error.PathNotFound => return,
+        else => return err,
+    };
+    defer vmiz.fat32.freeDirEntries(allocator, entries);
+    for (entries) |entry| {
+        if (entry.kind != .file) continue;
+        // FAT is case-insensitive, so a stale copy can resurface under any spelling.
+        if (std.ascii.eqlIgnoreCase(entry.name, profile.efi_fallback))
+            return error.StaleNamedUkiPresent;
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -3373,7 +3383,7 @@ pub fn main(init: std.process.Init) !void {
     try insertSignedUki(allocator, io, mutable, signed_path, profile);
     try finalizeCompressedQcow2(allocator, io, mutable, output);
     try validateFinalQcow2(io, output, args.size);
-    try validateFinalNativeImage(allocator, io, output, work_dir, profile, cmdline);
+    try validateFinalNativeImage(allocator, io, output, signed.bytes, profile, cmdline);
     var final_root = try openNativeRoot(allocator, io, output, work_dir);
     defer final_root.deinit();
     const os_release = try final_root.filesystem.read(allocator, "/etc/os-release", 64 * 1024);

@@ -141,35 +141,39 @@ pub fn extractAlloc(
     }
     if (candidates.items.len == 0) return error.MissingFallbackUki;
 
-    const linux_entries = filesystem.listDirAllocLimited(
+    // A named UKI is optional. `EFI/Linux` is the Boot Loader Specification type 2 directory, which
+    // only exists for images that ship a boot loader to scan it; an image booted straight through
+    // the removable-media fallback has no reason to carry one. What the extraction requires is the
+    // binary firmware will actually load, and that every UKI present agrees on one signer and one
+    // architecture -- neither of which needs a second copy.
+    const linux_entries: ?[]fat32.DirEntry = filesystem.listDirAllocLimited(
         io,
         allocator,
         "EFI/Linux",
         max_uki_directory_entries,
     ) catch |err| switch (err) {
-        error.PathNotFound => return error.MissingNamedUki,
+        error.PathNotFound => null,
         else => return err,
     };
-    defer fat32.freeDirEntries(allocator, linux_entries);
-    var named_count: usize = 0;
-    for (linux_entries) |entry| {
-        if (entry.kind != .file or entry.name.len <= 4 or
-            !std.ascii.eqlIgnoreCase(entry.name[entry.name.len - 4 ..], ".efi"))
-        {
-            continue;
+    defer if (linux_entries) |entries| fat32.freeDirEntries(allocator, entries);
+    if (linux_entries) |entries| {
+        for (entries) |entry| {
+            if (entry.kind != .file or entry.name.len <= 4 or
+                !std.ascii.eqlIgnoreCase(entry.name[entry.name.len - 4 ..], ".efi"))
+            {
+                continue;
+            }
+            if (entry.size > options.max_uki_bytes) return error.UkiTooLarge;
+            try candidates.append(.{
+                .path = try std.fmt.allocPrint(
+                    allocator,
+                    "EFI/Linux/{s}",
+                    .{entry.name},
+                ),
+                .size = entry.size,
+            });
         }
-        if (entry.size > options.max_uki_bytes) return error.UkiTooLarge;
-        try candidates.append(.{
-            .path = try std.fmt.allocPrint(
-                allocator,
-                "EFI/Linux/{s}",
-                .{entry.name},
-            ),
-            .size = entry.size,
-        });
-        named_count += 1;
     }
-    if (named_count == 0) return error.MissingNamedUki;
     std.mem.sort(Candidate, candidates.items, {}, lessCandidate);
 
     var certificate_der: ?[]u8 = null;
@@ -220,7 +224,7 @@ pub fn extractAlloc(
         }
     }
 
-    const certificate = certificate_der orelse return error.MissingNamedUki;
+    const certificate = certificate_der orelse return error.MissingSignedUki;
     const digest = artifact_pipeline.sha256Bytes(certificate);
     if (options.expected_sha256) |expected| {
         if (!std.mem.eql(u8, &digest, &expected))

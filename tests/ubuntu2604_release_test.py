@@ -356,15 +356,6 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             "signature_verification": "success",
             "files": [
                 {
-                    "path": f"EFI/Linux/vmiz-{key}.efi",
-                    "unsigned_sha256": "2" * 64,
-                    "signed_sha256": "3" * 64,
-                    "finalized_sha256": "3" * 64,
-                    "signed_bytes": 4096,
-                    "signing_operation_id": OPERATION_ID,
-                    "signing_certificate_sha256": signing_certificate_sha256,
-                },
-                {
                     "path": fallback,
                     "unsigned_sha256": "2" * 64,
                     "signed_sha256": "3" * 64,
