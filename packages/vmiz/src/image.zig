@@ -30,6 +30,12 @@ pub const OpenError = error{
 } || block_device.ProbeError || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError ||
     vhd.Footer.DecodeError || vhd.DynamicHeader.DecodeError || vhdx.OpenError || qcow2.OpenError;
 
+pub const OpenDeviceForWriteError = error{
+    BlockDeviceWriteNotPermitted,
+    NotBlockDevice,
+    DestinationTooSmall,
+} || block_device.ProbeError || Io.File.OpenError || Io.File.StatError;
+
 pub const CreateError = error{
     SizeNotSectorAligned,
     UnsupportedFormatForCreate,
@@ -96,9 +102,8 @@ pub const DeviceInfo = struct {
     /// device-backed raw image.
     geometry: block_device.Geometry,
     /// Whether the caller explicitly opted in to writing through the device
-    /// node. False unless `OpenOptions.allow_device_write` was set, in which
-    /// case every mutating operation fails with
-    /// `error.BlockDeviceWriteNotPermitted`.
+    /// node via `OpenOptions` or `DeviceWriteOptions`. When false, every
+    /// mutating operation fails with `error.BlockDeviceWriteNotPermitted`.
     write_allowed: bool,
 };
 
@@ -114,6 +119,12 @@ pub const OpenOptions = struct {
     /// block-device node. Without it, a device is opened read-only even when
     /// `write` is set, so that inspecting a live disk can never damage it by
     /// accident.
+    allow_device_write: bool = false,
+};
+
+pub const DeviceWriteOptions = struct {
+    /// Required acknowledgement that opening this destination permits raw
+    /// writes to the entire device.
     allow_device_write: bool = false,
 };
 
@@ -193,6 +204,36 @@ pub const Image = struct {
         return openFileWithPath(io, file, path, options);
     }
 
+    /// Opens an existing block device as a raw write destination. Unlike
+    /// `create`, this never truncates or initializes the target. The caller
+    /// must explicitly allow device writes and provide the source virtual size
+    /// so a destination that is too small is rejected before any bytes land.
+    pub fn openDeviceForWrite(
+        io: Io,
+        path: []const u8,
+        source_virtual_size: u64,
+        options: DeviceWriteOptions,
+    ) OpenDeviceForWriteError!Image {
+        if (!options.allow_device_write) return error.BlockDeviceWriteNotPermitted;
+
+        // Refuse ordinary paths before opening anything writable. The opened
+        // handle is checked again below so a path replacement cannot turn
+        // this deliberate device operation into a regular-file write.
+        const path_stat = try Io.Dir.cwd().statFile(io, path, .{});
+        if (path_stat.kind != .block_device) return error.NotBlockDevice;
+
+        const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+        errdefer file.close(io);
+        if ((try file.stat(io)).kind != .block_device) return error.NotBlockDevice;
+
+        return deviceWriteImage(
+            file,
+            try block_device.probe(file),
+            source_virtual_size,
+            options,
+        );
+    }
+
     /// Takes ownership of `file` (closing the returned `Image` closes it).
     pub fn openFile(io: Io, file: Io.File) OpenError!Image {
         return openFileWithPath(io, file, null, .{});
@@ -263,6 +304,26 @@ pub const Image = struct {
         var image = try sniffFormat(io, file, path, standalone_qcow2, source.sizeBytes());
         image.device = source.deviceInfo();
         return image;
+    }
+
+    fn deviceWriteImage(
+        file: Io.File,
+        geometry: block_device.Geometry,
+        source_virtual_size: u64,
+        options: DeviceWriteOptions,
+    ) OpenDeviceForWriteError!Image {
+        if (!options.allow_device_write) return error.BlockDeviceWriteNotPermitted;
+        if (source_virtual_size > geometry.size_bytes) return error.DestinationTooSmall;
+        return .{
+            .file = file,
+            .format = .raw,
+            .data_offset = 0,
+            .virtual_size = geometry.size_bytes,
+            .device = .{
+                .geometry = geometry,
+                .write_allowed = true,
+            },
+        };
     }
 
     /// Sniffs the format at `source`'s authoritative size. Every read stays
@@ -1477,6 +1538,15 @@ fn openAsSyntheticDevice(
     } });
 }
 
+fn openSyntheticDeviceForWrite(
+    file: Io.File,
+    geometry: block_device.Geometry,
+    source_virtual_size: u64,
+    options: DeviceWriteOptions,
+) OpenDeviceForWriteError!Image {
+    return Image.deviceWriteImage(file, geometry, source_virtual_size, options);
+}
+
 test "a device-backed image takes its size from the kernel probe, not from stat" {
     const io = std.testing.io;
     const path = "test-device-size.img";
@@ -1618,6 +1688,100 @@ test "a device opened with the write opt-in writes through" {
     try std.testing.expectEqualSlices(u8, "installed system", &buf);
 }
 
+test "openDeviceForWrite requires explicit device-write opt-in" {
+    const io = std.testing.io;
+    const path = "test-device-destination-opt-in.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    {
+        var backing = try Image.create(io, path, .raw, 64 * 1024, .{});
+        backing.close(io);
+    }
+
+    try std.testing.expectError(
+        error.BlockDeviceWriteNotPermitted,
+        Image.openDeviceForWrite(io, path, 4096, .{}),
+    );
+}
+
+test "openDeviceForWrite rejects a regular file" {
+    const io = std.testing.io;
+    const path = "test-device-destination-regular.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    {
+        const file = try Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, "ordinary file", 0);
+    }
+
+    try std.testing.expectError(
+        error.NotBlockDevice,
+        Image.openDeviceForWrite(io, path, 4096, .{ .allow_device_write = true }),
+    );
+
+    var bytes: [13]u8 = undefined;
+    const file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    _ = try file.readPositionalAll(io, &bytes, 0);
+    try std.testing.expectEqualSlices(u8, "ordinary file", &bytes);
+}
+
+test "openDeviceForWrite is raw and sized from kernel geometry" {
+    const io = std.testing.io;
+    const path = "test-device-destination-geometry.vhd";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const device_size: u64 = 2 * 1024 * 1024;
+    {
+        // Device destinations are raw even when their current bytes happen to
+        // contain a recognizable container footer.
+        var backing = try Image.create(io, path, .vhd, device_size, .{ .vhd_subformat = .fixed });
+        backing.close(io);
+    }
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    var img = try openSyntheticDeviceForWrite(file, .{
+        .size_bytes = device_size,
+        .logical_sector_size = 4096,
+    }, 1024 * 1024, .{ .allow_device_write = true });
+    defer img.close(io);
+
+    try std.testing.expectEqual(Format.raw, img.format);
+    try std.testing.expectEqual(@as(u64, 0), img.data_offset);
+    try std.testing.expectEqual(device_size, img.virtual_size);
+    try std.testing.expectEqual(device_size, img.device.?.geometry.size_bytes);
+    try std.testing.expectEqual(@as(u32, 4096), img.device.?.geometry.logical_sector_size);
+    try std.testing.expect(img.device.?.write_allowed);
+}
+
+test "openDeviceForWrite rejects an oversized source before writing" {
+    const io = std.testing.io;
+    const path = "test-device-destination-too-small.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const device_size: u64 = 64 * 1024;
+    {
+        var backing = try Image.create(io, path, .raw, device_size, .{});
+        defer backing.close(io);
+        try backing.pwrite(io, "unchanged", 0);
+    }
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    try std.testing.expectError(
+        error.DestinationTooSmall,
+        openSyntheticDeviceForWrite(file, .{
+            .size_bytes = device_size,
+            .logical_sector_size = 512,
+        }, device_size + 512, .{ .allow_device_write = true }),
+    );
+
+    var bytes: [9]u8 = undefined;
+    _ = try file.readPositionalAll(io, &bytes, 0);
+    try std.testing.expectEqualSlices(u8, "unchanged", &bytes);
+}
+
 test "resize is rejected on a device-backed image" {
     const io = std.testing.io;
     const path = "test-device-resize.img";
@@ -1630,10 +1794,10 @@ test "resize is rejected on a device-backed image" {
     }
 
     const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
-    var img = try openAsSyntheticDevice(io, file, .{
+    var img = try openSyntheticDeviceForWrite(file, .{
         .size_bytes = device_size,
         .logical_sector_size = 512,
-    }, true);
+    }, device_size, .{ .allow_device_write = true });
     defer img.close(io);
 
     // Rejected for every direction, including the no-op, so the diagnostic
