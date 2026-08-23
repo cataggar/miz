@@ -14,8 +14,8 @@
             .hash = "tls-0.1.0-ER2e0vpTBgCVdP6tvFCii9_PFjATLb23ht2_xbGy5mYU",
         },
         .debz = .{
-            .url = "git+https://github.com/cataggar/debz.git#beac3f20dd93fd98863af71e8fe621d47db663f6",
-            .hash = "debz-0.2.0-Mmw8sHxcGQBILy9-THk2f2VPVajOvjcBeevWhXYnytQW",
+            .url = "git+https://github.com/cataggar/debz.git#7396eaeffc6a31b88dcd3c98936f3a22e2050797",
+            .hash = "debz-0.2.0-Mmw8sNe3GQCFUHLewXfEZYSaGg1rKOgp45YG5T7rl0Eg",
         },
         .rpmz = .{
             .url = "git+https://github.com/cataggar/rpmz#15b5e1291a9fc3eb3980a4088d757b9d0254d468",

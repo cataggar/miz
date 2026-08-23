@@ -1666,15 +1666,77 @@ fn ensureL1Capacity(file: Io.File, io: Io, info: *Info, new_l1_size: u32, new_l1
     try setClusterRangeRefcount(file, io, info.*, old_l1_offset / info.cluster_size, old_l1_clusters, 0);
 }
 
+/// Bytes of refcount entries pulled per read while searching for a free
+/// cluster. One 64 KiB cluster of refcount block holds 32,768 entries, so a
+/// scan costs a handful of reads rather than one per cluster examined.
+const refcount_scan_chunk_bytes = 16 * 1024;
+
+/// Returns the lowest cluster index below `limit` whose refcount is zero, or
+/// null when every cluster below `limit` is taken.
+///
+/// This answers exactly what probing `readRefcountByClusterIndex` for each
+/// index in turn would answer -- same lowest-free-first choice, so the on-disk
+/// layout is unchanged -- but reads each refcount block in chunks instead of
+/// two bytes at a time. Allocation restarts this search from cluster zero on
+/// every call, so a two-byte probe made filling an image quadratic in syscalls:
+/// a 5 GiB image spent hours issuing ~25,000 reads per second, of 2 and 8
+/// bytes, while writing almost nothing.
+fn findFreeClusterIndex(
+    file: Io.File,
+    io: Io,
+    info: Info,
+    limit: u64,
+) (Io.File.ReadPositionalError || error{MissingRefcountBlock})!?u64 {
+    return findFreeClusterIndexChunked(file, io, info, limit, refcount_scan_chunk_bytes);
+}
+
+/// `findFreeClusterIndex` with the read size exposed, so a test can drive the
+/// multi-chunk and chunk-boundary paths without allocating the half-gigabyte
+/// image a 16 KiB chunk would otherwise need to cross.
+fn findFreeClusterIndexChunked(
+    file: Io.File,
+    io: Io,
+    info: Info,
+    limit: u64,
+    chunk_bytes: usize,
+) (Io.File.ReadPositionalError || error{MissingRefcountBlock})!?u64 {
+    std.debug.assert(chunk_bytes >= 2 and chunk_bytes % 2 == 0);
+    const entries_per_block = refcountBlockEntries(info);
+    var buffer: [refcount_scan_chunk_bytes]u8 = undefined;
+    const chunk = @min(chunk_bytes, buffer.len);
+    var cluster_index: u64 = 0;
+    while (cluster_index < limit) {
+        const table_index = cluster_index / entries_per_block;
+        // Past the last block, and an unbacked block, both read as refcount
+        // zero, so the first such cluster is the free one.
+        if (table_index >= info.refcount_block_count) return cluster_index;
+        const block_offset = try readU64(file, io, info.refcount_table_offset + table_index * 8);
+        if (block_offset == 0) return cluster_index;
+        if (!isAligned(block_offset, info.cluster_size)) return error.MissingRefcountBlock;
+
+        const block_start = table_index * entries_per_block;
+        const block_end = @min(limit, block_start + entries_per_block);
+        while (cluster_index < block_end) {
+            const wanted: usize = @intCast(@min((block_end - cluster_index) * 2, chunk));
+            const entries = buffer[0..wanted];
+            _ = try file.readPositionalAll(io, entries, block_offset + (cluster_index - block_start) * 2);
+            var offset: usize = 0;
+            while (offset < entries.len) : (offset += 2) {
+                if (entries[offset] == 0 and entries[offset + 1] == 0)
+                    return cluster_index + offset / 2;
+            }
+            cluster_index += entries.len / 2;
+        }
+    }
+    return null;
+}
+
 fn allocateCluster(file: Io.File, io: Io, info: *Info) PwriteError!u64 {
     var existing_clusters = divCeil(info.file_size, info.cluster_size);
-    var cluster_index: u64 = 0;
-    while (cluster_index < existing_clusters) : (cluster_index += 1) {
-        if (try readRefcountByClusterIndex(file, io, info.*, cluster_index) == 0) {
-            try writeRefcountByClusterIndex(file, io, info.*, cluster_index, 1);
-            try zeroRange(file, io, cluster_index * info.cluster_size, info.cluster_size);
-            return cluster_index * info.cluster_size;
-        }
+    if (try findFreeClusterIndex(file, io, info.*, existing_clusters)) |cluster_index| {
+        try writeRefcountByClusterIndex(file, io, info.*, cluster_index, 1);
+        try zeroRange(file, io, cluster_index * info.cluster_size, info.cluster_size);
+        return cluster_index * info.cluster_size;
     }
 
     while (existing_clusters >= maxAddressableHostClusters(info.*)) {
@@ -2799,6 +2861,70 @@ test "open rejects encrypted qcow2 images" {
     defer file.close(io);
 
     try std.testing.expectError(error.EncryptionNotSupported, open(io, file));
+}
+
+/// The search `allocateCluster` used before it read in chunks: probe every
+/// cluster in turn and take the first free one. Kept as the oracle the chunked
+/// search is measured against.
+fn probeFreeClusterIndex(file: Io.File, io: Io, info: Info, limit: u64) !?u64 {
+    var cluster_index: u64 = 0;
+    while (cluster_index < limit) : (cluster_index += 1) {
+        if (try readRefcountByClusterIndex(file, io, info, cluster_index) == 0)
+            return cluster_index;
+    }
+    return null;
+}
+
+test "chunked free-cluster search answers exactly what the per-cluster probe answered" {
+    const io = std.testing.io;
+    const path = "test-qcow2-free-cluster-search.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    var info = try create(io, file, 16 * (1 << default_cluster_bits));
+    var guest_cluster: u64 = 0;
+    while (guest_cluster < 16) : (guest_cluster += 1)
+        try pwrite(file, io, &info, "payload", guest_cluster * info.cluster_size);
+
+    const limit = divCeil(info.file_size, info.cluster_size);
+    try std.testing.expect(limit > 4);
+
+    // Chunk sizes chosen to land the boundary mid-scan: 2 bytes is one entry
+    // per read, 6 is an odd multiple, and the default covers the whole image
+    // in a single read.
+    const chunk_sizes = [_]usize{ 2, 6, 64, refcount_scan_chunk_bytes };
+
+    // Agreement on the untouched image.
+    for (chunk_sizes) |chunk| try std.testing.expectEqual(
+        try probeFreeClusterIndex(file, io, info, limit),
+        try findFreeClusterIndexChunked(file, io, info, limit, chunk),
+    );
+
+    // Agreement with a hole at every position. This is what makes the answer
+    // lowest-free-first rather than merely some free cluster, and it is the
+    // property the on-disk layout depends on: a scan that skipped a hole would
+    // silently relocate data compared with the previous implementation.
+    var hole: u64 = 0;
+    while (hole < limit) : (hole += 1) {
+        const original = try readRefcountByClusterIndex(file, io, info, hole);
+        if (original == 0) continue;
+        try writeRefcountByClusterIndex(file, io, info, hole, 0);
+        const expected = try probeFreeClusterIndex(file, io, info, limit);
+        try std.testing.expectEqual(@as(?u64, hole), expected);
+        for (chunk_sizes) |chunk| try std.testing.expectEqual(
+            expected,
+            try findFreeClusterIndexChunked(file, io, info, limit, chunk),
+        );
+        try writeRefcountByClusterIndex(file, io, info, hole, original);
+    }
+
+    // A fully allocated range has no answer, which is what sends the caller on
+    // to grow the file.
+    for (chunk_sizes) |chunk| try std.testing.expectEqual(
+        try probeFreeClusterIndex(file, io, info, limit),
+        try findFreeClusterIndexChunked(file, io, info, limit, chunk),
+    );
 }
 
 test "check detects referenced clusters with zero refcounts" {

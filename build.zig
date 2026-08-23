@@ -246,6 +246,11 @@ pub fn build(b: *std.Build) void {
 
     const vmiz_tests = b.addTest(.{ .root_module = host_vmiz_mod });
     const run_vmiz_tests = b.addRunArtifact(vmiz_tests);
+    // The vmiz package's own tests -- image formats, qcow2, ext4, offline root
+    // -- are otherwise reachable only through the aggregate `test` step, which
+    // makes a targeted change to one of them expensive to verify.
+    const vmiz_test_step = b.step("test-vmiz", "Run the vmiz package's tests");
+    vmiz_test_step.dependOn(&run_vmiz_tests.step);
     const package_family_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("packages/vmiz/src/package_family.zig"),
