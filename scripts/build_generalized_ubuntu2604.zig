@@ -413,12 +413,18 @@ const baremetal_access_provider_path = "/usr/local/sbin/vmizinit-access";
 //
 // This is the extension point vmizinit documents for exactly that case: a
 // provider that brings its own credential path and is started without waiting.
+// The root is expanded before access starts, using azagent's resize-only mode
+// so no Azure provisioning or disk setup is attempted. Resize is best-effort
+// at this boundary, but `set -e` still protects every other provider step.
 // Host keys are still not baked, because they must differ per machine, so they
 // are generated here on first boot. `/run/sshd` is created here too: vmizinit
 // creates it only on the path this replaces.
 const baremetal_access_provider =
     "#!/bin/sh\n" ++
     "set -e\n" ++
+    "if ! /usr/sbin/azagent --resize-root-only; then\n" ++
+    "    echo \"vmizinit-access: warning: root resize failed; continuing boot\" >&2\n" ++
+    "fi\n" ++
     "[ -f /etc/ssh/ssh_host_ed25519_key ] || /usr/bin/ssh-keygen -A\n" ++
     "mkdir -p /run/sshd\n" ++
     "exec /usr/sbin/sshd -D -e\n";
@@ -3954,6 +3960,20 @@ test "bare metal is named apart from core and requires exactly one administrator
     try std.testing.expect(Flavor.core.azure());
     try std.testing.expectEqualStrings(nvidia_bos_kernel_suffix, Flavor.baremetal.kernelSuffix());
     try std.testing.expectEqualStrings(azure_kernel_suffix, Flavor.core.kernelSuffix());
+}
+
+test "bare-metal access resizes root best-effort before starting sshd" {
+    try std.testing.expectEqualStrings(
+        "#!/bin/sh\n" ++
+            "set -e\n" ++
+            "if ! /usr/sbin/azagent --resize-root-only; then\n" ++
+            "    echo \"vmizinit-access: warning: root resize failed; continuing boot\" >&2\n" ++
+            "fi\n" ++
+            "[ -f /etc/ssh/ssh_host_ed25519_key ] || /usr/bin/ssh-keygen -A\n" ++
+            "mkdir -p /run/sshd\n" ++
+            "exec /usr/sbin/sshd -D -e\n",
+        baremetal_access_provider,
+    );
 }
 
 test "an administrator key is read only when it is one public key" {

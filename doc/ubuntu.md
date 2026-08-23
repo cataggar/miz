@@ -170,10 +170,13 @@ The administrator `g` is created at build time from `--authorized-key`, with a
 locked password and passwordless sudo, and the image ships
 `/usr/local/sbin/vmizinit-access`: the replacement access provider vmizinit
 documents for exactly this case, started without waiting on a sentinel because
-it brings its own credential path. It generates the host keys on first boot,
-creates `/run/sshd` -- which vmizinit does only on the path it replaces -- and
-execs `sshd -D -e`. Networking needs no configuration: vmizinit runs its own
-DHCP client on the first non-loopback interface.
+it brings its own credential path. Before generating host keys, it synchronously
+runs `azagent --resize-root-only`; a resize failure emits a warning and does not
+prevent access, while every other provider setup failure remains fatal. It then
+generates the host keys on first boot, creates `/run/sshd` -- which vmizinit
+does only on the path it replaces -- and execs `sshd -D -e`. Networking needs
+no configuration: vmizinit runs its own DHCP client on the first non-loopback
+interface.
 
 `validateNoBakedIdentity` refuses SSH host keys for every flavor, because they
 must differ per machine. It refuses authorized keys only where identity
