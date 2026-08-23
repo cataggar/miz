@@ -27,14 +27,15 @@ pub const Format = @import("formats.zig").Format;
 pub const OpenError = error{
     UnsupportedVhdDiskType,
     InvalidBlockSize,
-} || block_device.ProbeError || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError ||
+    NotBlockDevice,
+} || block_device.PreflightError || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError ||
     vhd.Footer.DecodeError || vhd.DynamicHeader.DecodeError || vhdx.OpenError || qcow2.OpenError;
 
 pub const OpenDeviceForWriteError = error{
     BlockDeviceWriteNotPermitted,
     NotBlockDevice,
     DestinationTooSmall,
-} || block_device.ProbeError || Io.File.OpenError || Io.File.StatError;
+} || block_device.PreflightError || Io.File.OpenError || Io.File.StatError;
 
 pub const CreateError = error{
     SizeNotSectorAligned,
@@ -105,6 +106,17 @@ pub const DeviceInfo = struct {
     /// node via `OpenOptions` or `DeviceWriteOptions`. When false, every
     /// mutating operation fails with `error.BlockDeviceWriteNotPermitted`.
     write_allowed: bool,
+    /// Safety and inventory data captured while the device was still open
+    /// read-only. Present for the dedicated destructive-write constructor.
+    preflight: ?block_device.PreflightReport = null,
+    preflight_allocator: ?std.mem.Allocator = null,
+
+    fn deinit(self: *DeviceInfo) void {
+        if (self.preflight) |*report| {
+            report.deinit(self.preflight_allocator.?);
+        }
+        self.* = undefined;
+    }
 };
 
 pub const OpenOptions = struct {
@@ -120,12 +132,21 @@ pub const OpenOptions = struct {
     /// `write` is set, so that inspecting a live disk can never damage it by
     /// accident.
     allow_device_write: bool = false,
+    /// Owns any preflight report attached to a writable device-backed image.
+    allocator: std.mem.Allocator = std.heap.page_allocator,
+    /// Only advisory policies may consult this. Mandatory refusals remain.
+    force: bool = false,
 };
 
 pub const DeviceWriteOptions = struct {
     /// Required acknowledgement that opening this destination permits raw
     /// writes to the entire device.
     allow_device_write: bool = false,
+    /// Only advisory policies may consult this. Mandatory size, mount,
+    /// holder, and running-root refusals are never relaxed.
+    force: bool = false,
+    /// Owns the preflight report attached to the returned `Image`.
+    allocator: std.mem.Allocator = std.heap.page_allocator,
 };
 
 /// Where an image's authoritative size comes from, resolved once at open
@@ -151,6 +172,73 @@ const Source = union(enum) {
         };
     }
 };
+
+const PreparedDevice = struct {
+    geometry: block_device.Geometry,
+    number: block_device.DeviceNumber,
+    report: block_device.PreflightReport,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *PreparedDevice) void {
+        self.report.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+fn prepareDeviceForWrite(
+    allocator: std.mem.Allocator,
+    io: Io,
+    read_only_file: Io.File,
+    source_virtual_size: ?u64,
+    force: bool,
+) block_device.PreflightError!PreparedDevice {
+    const geometry = try block_device.probe(read_only_file);
+    const required_size = source_virtual_size orelse geometry.size_bytes;
+    if (required_size > geometry.size_bytes) return error.DestinationTooSmall;
+    const number = try block_device.deviceNumber(read_only_file);
+
+    const mountinfo = try block_device.readMountInfo(allocator);
+    defer allocator.free(mountinfo);
+    var class_block_dir = Io.Dir.openDirAbsolute(io, "/sys/class/block", .{ .iterate = true }) catch
+        return error.BlockDeviceSysfsUnavailable;
+    defer class_block_dir.close(io);
+
+    return .{
+        .geometry = geometry,
+        .number = number,
+        .report = try block_device.preflight(
+            allocator,
+            io,
+            read_only_file,
+            geometry,
+            required_size,
+            number,
+            mountinfo,
+            class_block_dir,
+            .{ .force = force },
+        ),
+        .allocator = allocator,
+    };
+}
+
+fn verifyPreparedDevice(
+    io: Io,
+    writable_file: Io.File,
+    prepared: PreparedDevice,
+) (block_device.PreflightError || Io.File.StatError)!void {
+    if ((try writable_file.stat(io)).kind != .block_device) {
+        return error.BlockDeviceChangedDuringOpen;
+    }
+    if (!(try block_device.deviceNumber(writable_file)).eql(prepared.number)) {
+        return error.BlockDeviceChangedDuringOpen;
+    }
+    const geometry = try block_device.probe(writable_file);
+    if (geometry.size_bytes != prepared.geometry.size_bytes or
+        geometry.logical_sector_size != prepared.geometry.logical_sector_size)
+    {
+        return error.BlockDeviceChangedDuringOpen;
+    }
+}
 
 pub const Image = struct {
     file: Io.File,
@@ -195,12 +283,42 @@ pub const Image = struct {
             path_stat.kind == .block_device
         else |_|
             false;
+        if (path_is_device and options.write and options.allow_device_write) {
+            var read_only_file: ?Io.File = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+            defer if (read_only_file) |file| file.close(io);
+            if ((try read_only_file.?.stat(io)).kind != .block_device) return error.NotBlockDevice;
+            var prepared = try prepareDeviceForWrite(
+                options.allocator,
+                io,
+                read_only_file.?,
+                null,
+                options.force,
+            );
+            errdefer prepared.deinit();
+            read_only_file.?.close(io);
+            read_only_file = null;
+
+            const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+            errdefer file.close(io);
+            try verifyPreparedDevice(io, file, prepared);
+            var image = try openFileFromSource(io, file, path, options.standalone_qcow2, .{
+                .device = .{
+                    .geometry = prepared.geometry,
+                    .write_allowed = true,
+                },
+            });
+            image.attachPreflight(prepared);
+            return image;
+        }
         const write = options.write and (!path_is_device or options.allow_device_write);
 
         const file = try Io.Dir.cwd().openFile(io, path, .{
             .mode = if (write) .read_write else .read_only,
         });
         errdefer file.close(io);
+        if (write and (try file.stat(io)).kind == .block_device) {
+            return error.BlockDeviceChangedDuringOpen;
+        }
         return openFileWithPath(io, file, path, options);
     }
 
@@ -222,16 +340,32 @@ pub const Image = struct {
         const path_stat = try Io.Dir.cwd().statFile(io, path, .{});
         if (path_stat.kind != .block_device) return error.NotBlockDevice;
 
+        var read_only_file: ?Io.File = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+        defer if (read_only_file) |file| file.close(io);
+        if ((try read_only_file.?.stat(io)).kind != .block_device) return error.NotBlockDevice;
+        var prepared = try prepareDeviceForWrite(
+            options.allocator,
+            io,
+            read_only_file.?,
+            source_virtual_size,
+            options.force,
+        );
+        errdefer prepared.deinit();
+        read_only_file.?.close(io);
+        read_only_file = null;
+
         const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
         errdefer file.close(io);
-        if ((try file.stat(io)).kind != .block_device) return error.NotBlockDevice;
+        try verifyPreparedDevice(io, file, prepared);
 
-        return deviceWriteImage(
+        var image = try deviceWriteImage(
             file,
-            try block_device.probe(file),
+            prepared.geometry,
             source_virtual_size,
             options,
         );
+        image.attachPreflight(prepared);
+        return image;
     }
 
     /// Takes ownership of `file` (closing the returned `Image` closes it).
@@ -243,6 +377,25 @@ pub const Image = struct {
     /// handle. Only writes through a device when the caller opted in with
     /// `options.allow_device_write` *and* opened the handle writable.
     pub fn openFileWithOptions(io: Io, file: Io.File, options: OpenOptions) OpenError!Image {
+        const file_stat = try file.stat(io);
+        if (file_stat.kind == .block_device and options.write and options.allow_device_write) {
+            var prepared = try prepareDeviceForWrite(
+                options.allocator,
+                io,
+                file,
+                null,
+                options.force,
+            );
+            errdefer prepared.deinit();
+            var image = try openFileFromSource(io, file, null, options.standalone_qcow2, .{
+                .device = .{
+                    .geometry = prepared.geometry,
+                    .write_allowed = true,
+                },
+            });
+            image.attachPreflight(prepared);
+            return image;
+        }
         return openFileWithPath(io, file, null, options);
     }
 
@@ -324,6 +477,11 @@ pub const Image = struct {
                 .write_allowed = true,
             },
         };
+    }
+
+    fn attachPreflight(self: *Image, prepared: PreparedDevice) void {
+        self.device.?.preflight = prepared.report;
+        self.device.?.preflight_allocator = prepared.allocator;
     }
 
     /// Sniffs the format at `source`'s authoritative size. Every read stays
@@ -686,7 +844,16 @@ pub const Image = struct {
 
     pub fn close(self: *Image, io: Io) void {
         self.file.close(io);
+        if (self.device) |*device| device.deinit();
         self.* = undefined;
+    }
+
+    /// Safety and inventory data collected before the writable device handle
+    /// was created. Callers should print this before beginning the copy.
+    pub fn devicePreflight(self: *const Image) ?*const block_device.PreflightReport {
+        const device = self.device orelse return null;
+        if (device.preflight) |*report| return report;
+        return null;
     }
 
     pub const ResizeError = error{
