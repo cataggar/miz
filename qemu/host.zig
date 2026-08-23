@@ -210,47 +210,73 @@ pub fn findExecutableInPathValueAlloc(
     return null;
 }
 
+/// Encodings to try, cheapest to use first. Raw firmware needs no materialization, so it wins a tie
+/// between packaged candidates.
+const firmware_encoding_preference = [_]FirmwareEncoding{ .raw, .bzip2 };
+
+const raw_firmware_only = [_]FirmwareEncoding{.raw};
+
+fn explicitFirmwareSourcePairAlloc(
+    allocator: std.mem.Allocator,
+    io: Io,
+    options: FirmwareSearchOptions,
+) !?FirmwareSourcePair {
+    if (options.explicit_code_path == null and options.explicit_vars_path == null)
+        return null;
+    if (options.explicit_code_path == null or options.explicit_vars_path == null)
+        return error.IncompleteFirmwareOverride;
+
+    if (!try regularFileReadable(io, options.explicit_code_path.?) or
+        !try regularFileReadable(io, options.explicit_vars_path.?))
+    {
+        return error.FirmwareNotReadable;
+    }
+    if (options.secure_boot and
+        !firmwareCodeNameIndicatesSecureBoot(options.explicit_code_path.?))
+    {
+        return error.FirmwareNotSecureBootCapable;
+    }
+
+    return @as(?FirmwareSourcePair, try ownedSourcePairAlloc(
+        allocator,
+        options.explicit_code_path.?,
+        options.explicit_vars_path.?,
+        .raw,
+    ));
+}
+
 pub fn findFirmwareSourcePairAlloc(
     allocator: std.mem.Allocator,
     io: Io,
     options: FirmwareSearchOptions,
 ) !?FirmwareSourcePair {
-    if (options.explicit_code_path != null or options.explicit_vars_path != null) {
-        if (options.explicit_code_path == null or options.explicit_vars_path == null)
-            return error.IncompleteFirmwareOverride;
-
-        if (!try regularFileReadable(io, options.explicit_code_path.?) or
-            !try regularFileReadable(io, options.explicit_vars_path.?))
-        {
-            return error.FirmwareNotReadable;
-        }
-        if (options.secure_boot and
-            !firmwareCodeNameIndicatesSecureBoot(options.explicit_code_path.?))
-        {
-            return error.FirmwareNotSecureBootCapable;
-        }
-
-        return @as(?FirmwareSourcePair, try ownedSourcePairAlloc(
-            allocator,
-            options.explicit_code_path.?,
-            options.explicit_vars_path.?,
-            .raw,
-        ));
-    }
-
-    if (try findAutomaticFirmwareSourceAlloc(allocator, io, options, .raw)) |pair|
-        return pair;
-    return findAutomaticFirmwareSourceAlloc(allocator, io, options, .bzip2);
+    if (try explicitFirmwareSourcePairAlloc(allocator, io, options)) |pair| return pair;
+    return findAutomaticFirmwareSourceAlloc(
+        allocator,
+        io,
+        options,
+        &firmware_encoding_preference,
+    );
 }
 
-/// Compatibility helper for existing callers that require raw firmware paths.
+/// Compatibility helper for existing callers that require raw firmware paths. These callers cannot
+/// consume a compressed pair at all, so the search stays raw-only rather than stopping at a nearer
+/// compressed pair and reporting that no firmware exists.
 pub fn findFirmwarePairAlloc(
     allocator: std.mem.Allocator,
     io: Io,
     options: FirmwareSearchOptions,
 ) !?FirmwarePair {
-    var sources = try findFirmwareSourcePairAlloc(allocator, io, options) orelse
-        return null;
+    var sources = sources: {
+        if (try explicitFirmwareSourcePairAlloc(allocator, io, options)) |pair|
+            break :sources pair;
+        break :sources try findAutomaticFirmwareSourceAlloc(
+            allocator,
+            io,
+            options,
+            &raw_firmware_only,
+        ) orelse return null;
+    };
     defer sources.deinit(allocator);
     if (sources.code.encoding != .raw or sources.vars.encoding != .raw) return null;
 
@@ -263,6 +289,45 @@ pub fn findFirmwarePairAlloc(
 }
 
 fn findAutomaticFirmwareSourceAlloc(
+    allocator: std.mem.Allocator,
+    io: Io,
+    options: FirmwareSearchOptions,
+    encodings: []const FirmwareEncoding,
+) !?FirmwareSourcePair {
+    // Firmware that ships with the QEMU build in use always wins. A package is self-contained so
+    // that its emulator and its firmware match, and pairing it with the distribution's EDK2 is the
+    // kind of mismatch that surfaces as an unexplained guest boot failure. Preferring raw over
+    // compressed only saves a materialization step, so it decides between packaged candidates and
+    // never promotes the system fallback ahead of them.
+    for (encodings) |encoding| {
+        if (try findPackagedFirmwareSourceAlloc(
+            allocator,
+            io,
+            options,
+            encoding,
+        )) |pair| return pair;
+    }
+
+    if (!options.include_system_candidates) return null;
+
+    for (encodings) |encoding| {
+        for (systemFirmwareCandidates(
+            options.architecture,
+            options.secure_boot,
+        )) |candidate| {
+            if (try readableEncodedPairAlloc(
+                allocator,
+                io,
+                candidate.code,
+                candidate.vars,
+                encoding,
+            )) |pair| return pair;
+        }
+    }
+    return null;
+}
+
+fn findPackagedFirmwareSourceAlloc(
     allocator: std.mem.Allocator,
     io: Io,
     options: FirmwareSearchOptions,
@@ -279,49 +344,31 @@ fn findAutomaticFirmwareSourceAlloc(
         )) |pair| return pair;
     }
 
-    if (options.qemu_path) |qemu_path| {
-        if (std.fs.path.dirname(qemu_path)) |bin_dir| {
-            const adjacent_share = try std.fs.path.join(allocator, &.{ bin_dir, "share" });
-            defer allocator.free(adjacent_share);
-            if (try findFirmwareInDataDirAlloc(
-                allocator,
-                io,
-                adjacent_share,
-                options.architecture,
-                options.secure_boot,
-                encoding,
-            )) |pair| return pair;
+    const qemu_path = options.qemu_path orelse return null;
+    const bin_dir = std.fs.path.dirname(qemu_path) orelse return null;
 
-            if (std.fs.path.dirname(bin_dir)) |prefix| {
-                const prefix_share = try std.fs.path.join(allocator, &.{ prefix, "share", "qemu" });
-                defer allocator.free(prefix_share);
-                if (try findFirmwareInDataDirAlloc(
-                    allocator,
-                    io,
-                    prefix_share,
-                    options.architecture,
-                    options.secure_boot,
-                    encoding,
-                )) |pair| return pair;
-            }
-        }
-    }
+    const adjacent_share = try std.fs.path.join(allocator, &.{ bin_dir, "share" });
+    defer allocator.free(adjacent_share);
+    if (try findFirmwareInDataDirAlloc(
+        allocator,
+        io,
+        adjacent_share,
+        options.architecture,
+        options.secure_boot,
+        encoding,
+    )) |pair| return pair;
 
-    if (options.include_system_candidates) {
-        for (systemFirmwareCandidates(
-            options.architecture,
-            options.secure_boot,
-        )) |candidate| {
-            if (try readableEncodedPairAlloc(
-                allocator,
-                io,
-                candidate.code,
-                candidate.vars,
-                encoding,
-            )) |pair| return pair;
-        }
-    }
-    return null;
+    const prefix = std.fs.path.dirname(bin_dir) orelse return null;
+    const prefix_share = try std.fs.path.join(allocator, &.{ prefix, "share", "qemu" });
+    defer allocator.free(prefix_share);
+    return findFirmwareInDataDirAlloc(
+        allocator,
+        io,
+        prefix_share,
+        options.architecture,
+        options.secure_boot,
+        encoding,
+    );
 }
 
 fn systemFirmwareCandidates(
@@ -937,6 +984,87 @@ test "raw firmware wins over compressed firmware in an earlier directory" {
     try std.testing.expectEqualStrings("raw", std.fs.path.basename(
         std.fs.path.dirname(pair.code.path).?,
     ));
+}
+
+test "packaged compressed firmware outranks the system fallback" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "share", .default_dir);
+
+    for ([_][]const u8{
+        "share/edk2-x86_64-code.fd.bz2",
+        "share/edk2-i386-vars.fd.bz2",
+        "share/edk2-aarch64-code.fd.bz2",
+        "share/edk2-arm-vars.fd.bz2",
+    }) |path| {
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "compressed" });
+    }
+
+    const data_dir = try tmp.dir.realPathFileAlloc(io, "share", allocator);
+    defer allocator.free(data_dir);
+
+    // A host that has its own EDK2 installed must not have it substituted for the firmware the
+    // package shipped, even though the system copy is raw and the packaged one has to be
+    // decompressed first.
+    for ([_]GuestArchitecture{ .x86_64, .aarch64 }) |architecture| {
+        var pair = (try findFirmwareSourcePairAlloc(allocator, io, .{
+            .architecture = architecture,
+            .data_dirs = &.{data_dir},
+            .include_system_candidates = true,
+        })).?;
+        defer pair.deinit(allocator);
+        try std.testing.expectEqual(FirmwareEncoding.bzip2, pair.code.encoding);
+        try std.testing.expectEqualStrings("share", std.fs.path.basename(
+            std.fs.path.dirname(pair.code.path).?,
+        ));
+    }
+}
+
+test "the raw-only helper reaches past a nearer compressed pair" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "compressed", .default_dir);
+    try tmp.dir.createDir(io, "raw", .default_dir);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "compressed/edk2-x86_64-code.fd.bz2",
+        .data = "compressed-code",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "compressed/edk2-i386-vars.fd.bz2",
+        .data = "compressed-vars",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "raw/edk2-x86_64-code.fd",
+        .data = "raw-code",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "raw/edk2-i386-vars.fd",
+        .data = "raw-vars",
+    });
+
+    const compressed = try tmp.dir.realPathFileAlloc(io, "compressed", allocator);
+    defer allocator.free(compressed);
+    const raw = try tmp.dir.realPathFileAlloc(io, "raw", allocator);
+    defer allocator.free(raw);
+
+    var pair = (try findFirmwarePairAlloc(allocator, io, .{
+        .data_dirs = &.{ compressed, raw },
+        .include_system_candidates = false,
+    })).?;
+    defer pair.deinit(allocator);
+    try std.testing.expectEqualStrings("raw", std.fs.path.basename(
+        std.fs.path.dirname(pair.code_path).?,
+    ));
+
+    // A caller that cannot decompress gets nothing rather than a path it cannot open.
+    try std.testing.expect(try findFirmwarePairAlloc(allocator, io, .{
+        .data_dirs = &.{compressed},
+        .include_system_candidates = false,
+    }) == null);
 }
 
 test "materialize compressed firmware and preserve existing vars" {
