@@ -1853,7 +1853,9 @@ const android_smoke_diagnostics_byte_limit: usize = 8192;
 
 // Fully comptime-known guest commands, named so their exact contents are
 // directly unit-testable without SSH: in particular, that stop/delete never
-// spell `--force` and that launch always detaches instead of blocking.
+// spell `--force`, that launch always detaches instead of blocking, and that
+// the state query never carries a success-shaped fallback that could paper
+// over a failed, absent, or malformed query result.
 const android_smoke_extract_command = "set -eu; sudo -n rm -rf -- '" ++
     android_smoke_bundle_remote_dir ++ "' && sudo -n mkdir -p -- '" ++
     android_smoke_bundle_remote_dir ++ "' && sudo -n tar -xf '" ++
@@ -1871,8 +1873,14 @@ const android_smoke_abi_command = "sudo -n '" ++ android_smoke_runtime_remote_pa
     android_smoke_abilist_property;
 const android_smoke_kill_command = "sudo -n '" ++ android_smoke_runtime_remote_path ++
     "' kill " ++ android_smoke_container_id ++ " TERM";
+// No `|| printf ...` fallback here: a failed, timed-out, or permission-denied
+// state query must surface as a command failure to the caller rather than a
+// synthetic success-shaped `{"status":"stopped"}` result. The caller (see
+// `stopAndroidContainerGracefully`) treats every such failure as "not yet
+// stopped" and keeps polling within its bounded timeout instead of ever
+// authorizing delete on the strength of a query it could not confirm.
 const android_smoke_state_command = "sudo -n '" ++ android_smoke_runtime_remote_path ++
-    "' state " ++ android_smoke_container_id ++ " 2>/dev/null || printf '{\"status\":\"stopped\"}'";
+    "' state " ++ android_smoke_container_id ++ " 2>/dev/null";
 const android_smoke_delete_command = "sudo -n '" ++ android_smoke_runtime_remote_path ++
     "' delete " ++ android_smoke_container_id;
 
@@ -2179,7 +2187,16 @@ fn stopAndroidContainerGracefully(
     var attempt: u32 = 0;
     var stopped = false;
     while (attempt < max_attempts) : (attempt += 1) {
-        const state_output = try sshOutputAlloc(allocator, io, ssh_path, instance, android_smoke_state_command);
+        // A failed state query (permission error, transient SSH failure, the
+        // runtime itself erroring out, ...) is captured here and folded into
+        // empty output, exactly like a transient boot-poll failure above.
+        // `extractAndroidContainerStatusAlloc` treats empty output as
+        // unparseable and returns `null`, so a query failure can never be
+        // read as confirmation the container stopped, and this loop keeps
+        // polling within its bounded timeout instead of aborting early or
+        // fabricating a "stopped" result.
+        const state_output = sshOutputAlloc(allocator, io, ssh_path, instance, android_smoke_state_command) catch
+            try allocator.dupe(u8, "");
         defer allocator.free(state_output);
         const status = extractAndroidContainerStatusAlloc(allocator, state_output) catch null;
         defer if (status) |value| allocator.free(value);
@@ -3241,6 +3258,57 @@ test "Android smoke graceful-stop safety only allows delete once stopped is conf
     try std.testing.expect(!androidSmokeReadyForDelete("running"));
     try std.testing.expect(!androidSmokeReadyForDelete("created"));
     try std.testing.expect(!androidSmokeReadyForDelete(null));
+}
+
+// Regression coverage for a code-review finding: the state-query command
+// used to fall back to a synthetic `{"status":"stopped"}` on any query
+// failure (`... || printf '{"status":"stopped"}'`), which could turn a
+// permission error, a transient SSH failure, or any other query failure
+// into a false confirmation and authorize `delete` on a container that
+// might still be running. These tests exercise the actual, generated
+// `android_smoke_state_command` string plus the exact extraction/readiness
+// helpers `stopAndroidContainerGracefully` calls, so a regression that
+// reintroduces any success-shaped fallback fails these tests.
+test "Android smoke state-query command never carries a synthetic stopped fallback" {
+    try std.testing.expect(std.mem.indexOf(u8, android_smoke_state_command, "||") == null);
+    try std.testing.expect(std.mem.indexOf(u8, android_smoke_state_command, "printf") == null);
+    try std.testing.expect(std.mem.indexOf(u8, android_smoke_state_command, "stopped") == null);
+    try std.testing.expectEqualStrings(
+        "sudo -n '" ++ android_smoke_runtime_remote_path ++ "' state " ++
+            android_smoke_container_id ++ " 2>/dev/null",
+        android_smoke_state_command,
+    );
+}
+
+test "Android smoke graceful-stop safety refuses delete for every failed or malformed state shape" {
+    const allocator = std.testing.allocator;
+    // A state query that fails outright (permission error, transient SSH
+    // failure, runtime error, ...) is folded into empty output by
+    // `stopAndroidContainerGracefully`; confirm that shape, alongside every
+    // other unparseable or non-terminal shape, never reads as "stopped".
+    const non_terminal_outputs = [_][]const u8{
+        "", // the state query failed and produced no output at all
+        "\n", // whitespace-only output
+        "not json", // malformed output
+        "{}", // valid JSON missing the status field entirely
+        "{\"status\":5}", // status present but not a string
+        "{\"status\":\"running\"}",
+        "{\"status\":\"created\"}",
+        "{\"status\":\"paused\"}",
+        "{\"status\":\"error\"}",
+        "{\"status\":\"Stopped\"}", // case must match exactly
+        "{\"status\":\"stopped \"}", // trailing whitespace must not match
+    };
+    for (non_terminal_outputs) |output| {
+        const status = try extractAndroidContainerStatusAlloc(allocator, output);
+        defer if (status) |value| allocator.free(value);
+        try std.testing.expect(!androidSmokeReadyForDelete(status));
+    }
+
+    // Only an exact, runtime-confirmed "stopped" status authorizes delete.
+    const confirmed = try extractAndroidContainerStatusAlloc(allocator, "{\"status\":\"stopped\"}");
+    defer if (confirmed) |value| allocator.free(value);
+    try std.testing.expect(androidSmokeReadyForDelete(confirmed));
 }
 
 test "Android smoke guest commands never force-remove and always detach on launch" {

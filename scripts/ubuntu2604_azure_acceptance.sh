@@ -1186,7 +1186,14 @@ if [[ "$FLAVOR" == core ]]; then
   # Decides whether the guest-reported container state permits issuing
   # `delete` without `--force`. Never force-removes a running container:
   # if it never reaches "stopped" within the bounded timeout, this returns
-  # failure and the caller fails closed instead of forcing removal.
+  # failure and the caller fails closed instead of forcing removal. The
+  # remote state query carries no `|| printf ...` success-shaped fallback:
+  # a failed query (permission error, transient SSH failure, runtime error,
+  # ...) yields no parseable "stopped" status here, so it is folded by the
+  # python3 parser below into an empty string exactly like any other
+  # malformed or absent output, and the loop below keeps polling within its
+  # bounded timeout rather than authorizing delete on a query it could not
+  # confirm.
   android_stop_container() {
     ssh "${ssh_options[@]}" "$ssh_target" \
       "sudo -n '$android_runtime_remote' kill $android_container_id TERM" \
@@ -1195,7 +1202,7 @@ if [[ "$FLAVOR" == core ]]; then
     while (( elapsed < android_stop_timeout )); do
       status=$(
         ssh "${ssh_options[@]}" "$ssh_target" \
-          "sudo -n '$android_runtime_remote' state $android_container_id 2>/dev/null || printf '{\"status\":\"stopped\"}'" \
+          "sudo -n '$android_runtime_remote' state $android_container_id 2>/dev/null" \
           2>/dev/null |
           python3 -c 'import json, sys
 try:
