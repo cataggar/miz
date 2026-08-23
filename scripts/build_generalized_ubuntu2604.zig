@@ -291,6 +291,11 @@ const baremetal_debz_packages = [_][]const u8{
     "ubuntu-minimal",
     baremetal_image_package,
     baremetal_modules_package,
+    // The generator this flavor configures and then runs. The core flavor gets
+    // it transitively through the linux-azure meta-package, but a bare
+    // linux-image binary package pulls in no initramfs tool of its own, so
+    // bare-metal has to name it or `update-initramfs` is simply absent.
+    "initramfs-tools",
     "openssh-server",
     "sudo",
 };
@@ -309,6 +314,7 @@ const baremetal_required_packages = [_][]const u8{
     "ubuntu-minimal",
     baremetal_image_package,
     baremetal_modules_package,
+    "initramfs-tools",
     "openssh-server",
     "openssh-client",
     "sudo",
@@ -1725,7 +1731,11 @@ fn nativeKernelModulesPath(
     return std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{release_name});
 }
 
-fn validateNativeBootArtifacts(
+/// The kernel artifacts `update-initramfs` reads: the module tree and the
+/// dependency index built from it. Checked before the initramfs is generated,
+/// so a root missing its modules says exactly that instead of surfacing later
+/// as an initramfs that could not be built.
+fn validateKernelModuleArtifacts(
     allocator: Allocator,
     root: *offline_root.Root,
     release_name: []const u8,
@@ -1743,6 +1753,19 @@ fn validateNativeBootArtifacts(
     };
     defer allocator.free(modules_dep.path);
     if (modules_dep.kind != .file) return error.KernelModulesDependencyMissing;
+}
+
+/// The initramfs `update-initramfs` writes.
+///
+/// Only meaningful once it has actually run. A root the kernel package was
+/// unpacked into carries `/boot/initrd.img` as a symlink to an image that does
+/// not exist yet -- the package ships the link, the generator supplies the
+/// target -- so checking this before generating is guaranteed to fail.
+fn validateInitramfs(
+    allocator: Allocator,
+    root: *offline_root.Root,
+    release_name: []const u8,
+) !void {
     const initrd_path = try std.fmt.allocPrint(allocator, "/boot/initrd.img-{s}", .{release_name});
     defer allocator.free(initrd_path);
     const initrd = root.inspect(initrd_path) catch |err| switch (err) {
@@ -1751,6 +1774,15 @@ fn validateNativeBootArtifacts(
     };
     defer allocator.free(initrd.path);
     if (initrd.kind != .file or initrd.size == 0) return error.InitramfsMissing;
+}
+
+fn validateNativeBootArtifacts(
+    allocator: Allocator,
+    root: *offline_root.Root,
+    release_name: []const u8,
+) !void {
+    try validateKernelModuleArtifacts(allocator, root, release_name);
+    try validateInitramfs(allocator, root, release_name);
 }
 
 fn validateCoreKernelModules(
@@ -1899,11 +1931,15 @@ fn customizeOfflineRoot(
         },
     }
 
-    try validateNativeBootArtifacts(allocator, &root, release_name);
+    // The module tree is `update-initramfs`'s input, so it is checked here;
+    // the initramfs it produces is checked below, once it exists.
+    try validateKernelModuleArtifacts(allocator, &root, release_name);
     if (flavor.freshRoot()) try validateCoreKernelModules(allocator, &root, release_name);
 
     var initramfs = try runOfflineCommand(&executor, .{ .update_initramfs = release_name });
     defer initramfs.deinit(allocator);
+
+    try validateInitramfs(allocator, &root, release_name);
 
     var package_query = try runOfflineCommand(&executor, .dpkg_query);
     defer package_query.deinit(allocator);
@@ -4453,6 +4489,69 @@ test "native boot validation follows a merged-usr root" {
     const split_resolved = try kernelModulesPath(allocator, &split, kernel_release);
     defer allocator.free(split_resolved);
     try std.testing.expectEqualStrings("/lib/modules/" ++ kernel_release, split_resolved);
+}
+
+test "the initramfs is validated as a generated artifact, not an unpacked one" {
+    // The ordering this exists to hold: a root the kernel package was unpacked
+    // into has `/boot/initrd.img` pointing at an image that does not exist
+    // yet, because the package ships the link and `update-initramfs` supplies
+    // the target. Validating the initramfs before running the generator is
+    // therefore guaranteed to fail on exactly the roots the builder produces.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const root_path = try std.fs.path.join(allocator, &.{ cwd, ".scratch/ubuntu-initramfs-ordering" });
+    defer allocator.free(root_path);
+    Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, root_path);
+    var root = try offline_root.Root.init(allocator, io, root_path, .{});
+    defer root.deinit();
+    const kernel_release = "7.0.0-2015-nvidia-bos-64k";
+
+    // A root as the kernel package leaves it: modules present, and a dangling
+    // `/boot/initrd.img` whose target has not been generated.
+    try root.createDirectory("/usr/lib/modules/" ++ kernel_release, 0o755);
+    try root.createDirectory("/boot", 0o755);
+    try root.writeFile(.{
+        .path = "/usr/lib/modules/" ++ kernel_release ++ "/kernel",
+        .source = .{ .inline_bytes = "module" },
+    });
+    try root.writeFile(.{
+        .path = "/usr/lib/modules/" ++ kernel_release ++ "/modules.dep",
+        .source = .{ .inline_bytes = "kernel/drivers/net/hv_netvsc.ko:\n" },
+    });
+    try root.replaceSymlink("/boot/initrd.img", "initrd.img-" ++ kernel_release);
+
+    // The generator's inputs are ready, so this passes and the build proceeds
+    // to build the initramfs.
+    try validateKernelModuleArtifacts(allocator, &root, kernel_release);
+
+    // Its output is not ready, which is the whole reason it has to be checked
+    // afterwards. The dangling link must not be mistaken for the image.
+    try std.testing.expectError(
+        error.InitramfsMissing,
+        validateInitramfs(allocator, &root, kernel_release),
+    );
+
+    // An empty image is a failed generation, not a successful one.
+    try root.writeFile(.{
+        .path = "/boot/initrd.img-" ++ kernel_release,
+        .source = .{ .inline_bytes = "" },
+    });
+    try std.testing.expectError(
+        error.InitramfsMissing,
+        validateInitramfs(allocator, &root, kernel_release),
+    );
+
+    // What `update-initramfs` leaves behind.
+    try root.writeFile(.{
+        .path = "/boot/initrd.img-" ++ kernel_release,
+        .source = .{ .inline_bytes = "initramfs" },
+    });
+    try validateInitramfs(allocator, &root, kernel_release);
+    try validateNativeBootArtifacts(allocator, &root, kernel_release);
 }
 
 test "native ESP UKI validation preserves exact signed bytes and machine" {
