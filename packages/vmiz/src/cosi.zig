@@ -1,9 +1,8 @@
 //! COSI (Composable OS Image) writer.
 //!
-//! Partition payloads are emitted as real `.raw.zst` members using
-//! `zstd.zig`'s small built-in encoder, so repetitive GPT/filesystem regions
-//! shrink while
-//! remaining decodable by standard zstd tooling.
+//! Partition payloads are emitted as standard `.raw.zst` members, so
+//! repetitive GPT/filesystem regions shrink while remaining decodable by
+//! standard zstd tooling.
 //!
 //! The emitted `metadata.json` schema is verified against Azure Linux Image
 //! Tools' real implementation:

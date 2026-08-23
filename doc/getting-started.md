@@ -3,10 +3,12 @@
 ## Requirements
 
 - Zig **0.16.0** or later.
-- `zig build test` requires the `zstd` CLI for encoder interoperability tests.
-  On Debian-family systems, install `zstd` and `libzstd-dev` together from the
-  same distribution repository so the CLI and system library use the same
-  zstd source version:
+- `zig build` requires the system `libzstd` development package.
+- `zig build test` additionally requires the `zstd` CLI for interoperability
+  coverage. On Debian-family systems, install `libzstd-dev` and `zstd`
+  together from the same distribution repository so the linked library and CLI
+  stay aligned. `liblzma-dev` is also needed for the host package-family
+  integration and its repository tests:
 
   ```console
   sudo apt-get update

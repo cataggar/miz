@@ -32,10 +32,9 @@ const zstd = @import("zstd.zig");
 
 pub const Format = @import("formats.zig").Format;
 
-/// How the raw bytes are encoded on the way out. `zstd` uses the in-tree
-/// encoder that also backs COSI output; it emits spec-compliant frames but
-/// is a much smaller encoder than gzip's, so `gzip` remains the default
-/// choice for published artifacts.
+/// How the raw bytes are encoded on the way out. `zstd` emits a standard
+/// zstd stream and also backs COSI output. `gzip` remains the default choice
+/// for published artifacts because it is the most widely supported option.
 pub const Compression = enum {
     none,
     gzip,
