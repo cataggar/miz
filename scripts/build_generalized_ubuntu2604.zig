@@ -4905,7 +4905,7 @@ test "core kernel config validation requires every Binder-enabling line" {
     // Every required line present: the config core's Binder support needs.
     try root.writeFile(.{
         .path = "/boot/config-" ++ kernel_release,
-        .source = .{ .inline_bytes = 
+        .source = .{ .inline_bytes =
         \\CONFIG_ANDROID=y
         \\CONFIG_ANDROID_BINDER_IPC=m
         \\CONFIG_ANDROID_BINDERFS=m
@@ -4920,7 +4920,7 @@ test "core kernel config validation requires every Binder-enabling line" {
     // expects to load, must be rejected just as absence would be.
     try root.writeFile(.{
         .path = "/boot/config-" ++ kernel_release,
-        .source = .{ .inline_bytes = 
+        .source = .{ .inline_bytes =
         \\CONFIG_ANDROID_BINDER_IPC=y
         \\CONFIG_ANDROID_BINDERFS=m
         \\CONFIG_ANDROID_BINDER_DEVICES=""
@@ -4937,7 +4937,7 @@ test "core kernel config validation requires every Binder-enabling line" {
     // must not race with: the kernel would already own `/dev/binder`.
     try root.writeFile(.{
         .path = "/boot/config-" ++ kernel_release,
-        .source = .{ .inline_bytes = 
+        .source = .{ .inline_bytes =
         \\CONFIG_ANDROID_BINDER_IPC=m
         \\CONFIG_ANDROID_BINDERFS=m
         \\CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"
