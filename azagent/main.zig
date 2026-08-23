@@ -106,34 +106,70 @@ const ReadyMode = enum {
     skip,
 };
 
+const InvocationMode = enum {
+    provision,
+    resize_root_only,
+};
+
 const Options = struct {
+    invocation_mode: InvocationMode = .provision,
     ready_mode: ReadyMode = .azure,
 };
 
-fn parseOption(options: *Options, arg: []const u8) error{InvalidArgument}!void {
+const OptionError = error{
+    InvalidArgument,
+    IncompatibleArguments,
+};
+
+fn parseOption(options: *Options, arg: []const u8) OptionError!void {
     if (std.mem.eql(u8, arg, "--skip-ready")) {
+        if (options.invocation_mode == .resize_root_only) return error.IncompatibleArguments;
         options.ready_mode = .skip;
+    } else if (std.mem.eql(u8, arg, "--resize-root-only")) {
+        if (options.ready_mode == .skip) return error.IncompatibleArguments;
+        options.invocation_mode = .resize_root_only;
     } else {
         return error.InvalidArgument;
     }
 }
 
-fn parseOptions(args: []const []const u8) error{InvalidArgument}!Options {
+fn parseOptions(args: []const []const u8) OptionError!Options {
     var options: Options = .{};
     for (args[1..]) |arg| try parseOption(&options, arg);
     return options;
 }
 
+const ResizeMode = enum {
+    best_effort,
+    required,
+};
+
 const InvocationPlan = struct {
-    provision_locally: bool,
+    run_provisioning: bool,
+    configure_disks: bool,
+    resize_root: ResizeMode,
     acknowledge_ready: bool,
 };
 
-fn invocationPlan(already_provisioned: bool, ready_mode: ReadyMode) InvocationPlan {
-    return .{
-        .provision_locally = !already_provisioned,
-        .acknowledge_ready = ready_mode == .azure,
+fn invocationPlan(options: Options) InvocationPlan {
+    return switch (options.invocation_mode) {
+        .provision => .{
+            .run_provisioning = true,
+            .configure_disks = true,
+            .resize_root = .best_effort,
+            .acknowledge_ready = options.ready_mode == .azure,
+        },
+        .resize_root_only => .{
+            .run_provisioning = false,
+            .configure_disks = false,
+            .resize_root = .required,
+            .acknowledge_ready = false,
+        },
     };
+}
+
+fn shouldProvision(plan: InvocationPlan, already_provisioned: bool) bool {
+    return plan.run_provisioning and !already_provisioned;
 }
 
 fn reportHealth(allocator: std.mem.Allocator, client: *wireserver.Client) !void {
@@ -158,8 +194,12 @@ pub fn main(init: std.process.Init) !void {
     var options: Options = .{};
     for (init.minimal.args.vector[1..]) |arg| {
         const parsed = std.mem.span(arg);
-        parseOption(&options, parsed) catch {
-            std.debug.print("azagent: unknown argument: {s}\nusage: azagent [--skip-ready]\n", .{parsed});
+        parseOption(&options, parsed) catch |err| {
+            switch (err) {
+                error.InvalidArgument => std.debug.print("azagent: unknown argument: {s}\n", .{parsed}),
+                error.IncompatibleArguments => std.debug.print("azagent: --skip-ready and --resize-root-only cannot be used together\n", .{}),
+            }
+            std.debug.print("usage: azagent [--skip-ready | --resize-root-only]\n", .{});
             std.process.exit(2);
         };
     }
@@ -167,6 +207,15 @@ pub fn main(init: std.process.Init) !void {
     if (std.os.linux.geteuid() != 0) {
         std.debug.print("azagent: must run as root\n", .{});
         std.process.exit(1);
+    }
+
+    const plan = invocationPlan(options);
+    if (plan.resize_root == .required) {
+        rootResizeSetup(gpa, io) catch |err| {
+            std.debug.print("azagent: failed to grow the root partition/filesystem: {t}\n", .{err});
+            std.process.exit(1);
+        };
+        return;
     }
 
     var etc_dir = try std.Io.Dir.cwd().openDir(io, "/etc", .{});
@@ -181,8 +230,7 @@ pub fn main(init: std.process.Init) !void {
     const now = std.Io.Clock.real.now(io);
     const now_unix_seconds: i64 = @intCast(@divTrunc(now.nanoseconds, 1_000_000_000));
 
-    const plan = invocationPlan(try isProvisioned(gpa, var_dir, io), options.ready_mode);
-    if (plan.provision_locally) {
+    if (shouldProvision(plan, try isProvisioned(gpa, var_dir, io))) {
         const ovf_env_xml = cdrom.readOvfEnv(gpa, io) catch |err| {
             std.debug.print("azagent: failed to read ovf-env.xml from the provisioning media: {t}\n", .{err});
             std.process.exit(1);
@@ -209,14 +257,18 @@ pub fn main(init: std.process.Init) !void {
     // Unlike `provision` above, disk activation runs on every boot: Azure
     // can reallocate the temporary disk or attach managed data disks across
     // a VM's lifetime. Failures remain best-effort so the OS stays usable.
-    driveMountSetupBestEffort(gpa, io, now_unix_seconds, parsed_waagent_conf);
+    if (plan.configure_disks) {
+        driveMountSetupBestEffort(gpa, io, now_unix_seconds, parsed_waagent_conf);
+    }
 
     // Same "every boot, best-effort" reasoning applies to growing the root
     // partition/filesystem (issue #130): the platform can deploy a larger
     // OS disk than the image was built at, and that's a redeploy-time
     // event, not a first-boot-only one. Not gated by any `waagent.conf`
     // toggle either -- real waagent has no growpart-equivalent conf key.
-    rootResizeSetupBestEffort(gpa, io);
+    if (plan.resize_root == .best_effort) {
+        rootResizeSetupBestEffort(gpa, io);
+    }
 
     if (plan.acknowledge_ready) {
         var client: wireserver.Client = .init(gpa, io);
@@ -426,25 +478,41 @@ test "provision runs the full sequence end to end against scoped temp directorie
     });
 }
 
-test "options require explicit skip-ready and reject unknown arguments" {
+test "options select explicit modes and reject unknown or incompatible arguments" {
     try std.testing.expectEqual(ReadyMode.azure, (try parseOptions(&.{"azagent"})).ready_mode);
     try std.testing.expectEqual(ReadyMode.skip, (try parseOptions(&.{ "azagent", "--skip-ready" })).ready_mode);
+    try std.testing.expectEqual(InvocationMode.resize_root_only, (try parseOptions(&.{ "azagent", "--resize-root-only" })).invocation_mode);
     try std.testing.expectError(error.InvalidArgument, parseOptions(&.{ "azagent", "--offline" }));
+    try std.testing.expectError(error.IncompatibleArguments, parseOptions(&.{ "azagent", "--skip-ready", "--resize-root-only" }));
+    try std.testing.expectError(error.IncompatibleArguments, parseOptions(&.{ "azagent", "--resize-root-only", "--skip-ready" }));
 }
 
-test "invocation plan separates local provisioning from Ready acknowledgement" {
+test "invocation plan preserves default and skip-ready behavior" {
+    const default_plan = invocationPlan(.{});
     try std.testing.expectEqual(InvocationPlan{
-        .provision_locally = true,
+        .run_provisioning = true,
+        .configure_disks = true,
+        .resize_root = .best_effort,
         .acknowledge_ready = true,
-    }, invocationPlan(false, .azure));
+    }, default_plan);
+    try std.testing.expect(shouldProvision(default_plan, false));
+    try std.testing.expect(!shouldProvision(default_plan, true));
+
     try std.testing.expectEqual(InvocationPlan{
-        .provision_locally = false,
-        .acknowledge_ready = true,
-    }, invocationPlan(true, .azure));
-    try std.testing.expectEqual(InvocationPlan{
-        .provision_locally = false,
+        .run_provisioning = true,
+        .configure_disks = true,
+        .resize_root = .best_effort,
         .acknowledge_ready = false,
-    }, invocationPlan(true, .skip));
+    }, invocationPlan(.{ .ready_mode = .skip }));
+}
+
+test "resize-root-only plan is isolated and treats resize errors as fatal" {
+    try std.testing.expectEqual(InvocationPlan{
+        .run_provisioning = false,
+        .configure_disks = false,
+        .resize_root = .required,
+        .acknowledge_ready = false,
+    }, invocationPlan(.{ .invocation_mode = .resize_root_only }));
 }
 
 test "Ready acknowledgement is skipped only explicitly and failures remain retriable" {
@@ -480,7 +548,7 @@ test "a local provisioning sentinel makes repeated invocation retry-safe" {
 
     try sentinel.writeSentinel(var_dir, io, "host");
     try std.testing.expect(try isProvisioned(allocator, var_dir, io));
-    const retry = invocationPlan(true, .azure);
-    try std.testing.expect(!retry.provision_locally);
+    const retry = invocationPlan(.{});
+    try std.testing.expect(!shouldProvision(retry, true));
     try std.testing.expect(retry.acknowledge_ready);
 }
