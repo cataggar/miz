@@ -7,17 +7,15 @@
 //! module.
 //!
 //! It exists as its own module because both executing backends need it and
-//! they reach the package manager by different routes: `unsafe_chroot` renders
-//! a repository file inside a worker that has already re-execed as root, and
-//! `vm` seals the material onto a block device backed by anonymous memory. The
-//! rules about what counts as usable material, how large it may be, and what is
-//! left behind afterwards are properties of the credential rather than of
-//! either route, so a second copy of them in the second backend would be a
-//! second copy that could drift.
+//! they reach the package manager by different routes: `unsafe_chroot` carries
+//! environment material over an anonymous pipe and reads file material inside
+//! its worker, while `vm` seals the material onto a block device backed by
+//! anonymous memory. The rules about what counts as usable material, how large
+//! it may be, and what is left behind afterwards are properties of the
+//! credential rather than of either route, so a second copy of them in the
+//! second backend would be a second copy that could drift.
 
 const std = @import("std");
-const builtin = @import("builtin");
-
 const customize = @import("customize.zig");
 
 const Allocator = std.mem.Allocator;
@@ -30,23 +28,11 @@ pub const Error = error{
 
 /// Reads what `source` names, returning an exact allocation the caller owns and
 /// is responsible for zeroing.
-///
-/// `scrub` overwrites a consumed environment variable in the calling process's
-/// own environment. It is a parameter rather than a rule because the two
-/// backends stand in different places. The chroot worker is PID 1 in its
-/// namespace and mounts a real `proc` inside the target root, so a variable
-/// left in its environment is readable through `/proc/1/environ` by every
-/// package scriptlet and dracut module that runs afterwards -- target-supplied
-/// code running as root, after the repository file has been deleted. The VM
-/// backend runs in the caller's own process and gives the guest no view of it,
-/// so scrubbing there would erase a variable belonging to the program that
-/// called the library, to protect against a reader that does not exist.
 pub fn readMaterial(
     allocator: Allocator,
     io: Io,
     environ: std.process.Environ,
     source: customize.CredentialSource,
-    scrub: bool,
 ) ![]u8 {
     switch (source) {
         .host_path => |host_path| {
@@ -59,7 +45,7 @@ pub fn readMaterial(
             // Unconditional, not an `errdefer`: the untrimmed read is a copy of
             // the secret and does not outlive this function on either path.
             defer {
-                @memset(bytes, 0);
+                std.crypto.secureZero(u8, bytes);
                 allocator.free(bytes);
             }
             const trimmed = std.mem.trimEnd(u8, bytes, "\r\n");
@@ -78,15 +64,21 @@ pub fn readMaterial(
                 allocator,
                 name,
             ) catch return error.CredentialSourceUnreadable;
-            errdefer {
-                @memset(value, 0);
-                allocator.free(value);
-            }
+            errdefer deinitMaterial(allocator, value);
             if (!validMaterial(value)) return error.CredentialMaterialUnusable;
-            if (scrub) scrubEnvironmentValue(environ, name);
             return value;
         },
     }
+}
+
+/// Clears and releases material returned by `readMaterial`.
+pub fn deinitMaterial(allocator: Allocator, material: []u8) void {
+    scrubMaterial(material);
+    allocator.free(material);
+}
+
+pub fn scrubMaterial(material: []u8) void {
+    std.crypto.secureZero(u8, material);
 }
 
 /// Whether material can be written into a repository file at all.
@@ -104,12 +96,6 @@ pub fn validMaterial(bytes: []const u8) bool {
     return true;
 }
 
-pub fn scrubEnvironmentValue(environ: std.process.Environ, name: []const u8) void {
-    if (builtin.os.tag == .windows) return;
-    const value = std.process.Environ.getPosix(environ, name) orelse return;
-    @memset(@constCast(value), 0);
-}
-
 test "material is refused for the reasons a repository file would be misread" {
     try std.testing.expect(validMaterial("s3cr3t"));
     try std.testing.expect(!validMaterial(""));
@@ -119,4 +105,32 @@ test "material is refused for the reasons a repository file would be misread" {
 
     const oversized = [_]u8{'x'} ** (customize.max_credential_material_bytes + 1);
     try std.testing.expect(!validMaterial(&oversized));
+}
+
+test "environment material is copied from immutable storage" {
+    const block = [_:null]?[*:0]const u8{
+        "VMIZ_TEST_CREDENTIAL=s3cr3t-from-read-only-storage",
+    };
+    const environ = std.process.Environ{ .block = .{ .slice = &block } };
+
+    const material = try readMaterial(
+        std.testing.allocator,
+        std.testing.io,
+        environ,
+        .{ .host_environment = "VMIZ_TEST_CREDENTIAL" },
+    );
+    defer deinitMaterial(std.testing.allocator, material);
+
+    try std.testing.expectEqualStrings("s3cr3t-from-read-only-storage", material);
+    material[0] = 'S';
+    try std.testing.expectEqualStrings(
+        "s3cr3t-from-read-only-storage",
+        std.process.Environ.getPosix(environ, "VMIZ_TEST_CREDENTIAL").?,
+    );
+}
+
+test "owned material is zero after scrubbing" {
+    var material = "s3cr3t".*;
+    scrubMaterial(&material);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** material.len), &material);
 }

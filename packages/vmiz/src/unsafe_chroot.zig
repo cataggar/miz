@@ -225,16 +225,19 @@ pub fn runParent(
     };
     var environment = try baseEnvironment(allocator);
     defer environment.deinit();
-    // The worker's environment is built rather than inherited, so a declared
-    // credential variable has to be forwarded by name. The exception is exactly
-    // as wide as the plan says it is, and the plan hash covers the names. It
-    // goes no further: the worker builds a fresh environment for every command
-    // it runs, from `baseEnvironment` alone.
-    try forwardCredentialVariables(allocator, options.environ, &environment, manifest);
+    var environment_credentials = try sealEnvironmentCredentials(
+        allocator,
+        options.environ,
+        manifest,
+    );
+    defer if (environment_credentials) |bytes| credential_mod.deinitMaterial(allocator, bytes);
     var child = std.process.spawn(io, .{
         .argv = &argv,
         .environ_map = &environment,
-        .stdin = .ignore,
+        // Environment-backed credentials travel through an anonymous pipe,
+        // never the worker's environment block. The worker reads the pipe into
+        // owned writable memory and clears each value as it consumes it.
+        .stdin = .pipe,
         // Piped rather than inherited so the parent has somewhere to enforce
         // its own bound. `Child.wait` takes no deadline, so a parent that
         // handed the worker its own descriptors would have nothing left to do
@@ -250,6 +253,18 @@ pub fn runParent(
         lease_active = false;
         return err;
     };
+    var child_stdin = child.stdin.?;
+    child.stdin = null;
+    if (environment_credentials) |bytes| {
+        child_stdin.writeStreamingAll(io, bytes) catch |err| {
+            child_stdin.close(io);
+            child.kill(io);
+            return err;
+        };
+        credential_mod.deinitMaterial(allocator, bytes);
+        environment_credentials = null;
+    }
+    child_stdin.close(io);
     const supervision = superviseWorker(
         allocator,
         io,
@@ -322,8 +337,15 @@ pub fn workerMain(init: std.process.Init, manifest_path: []const u8) !void {
         bytes,
         .{ .ignore_unknown_fields = false },
     );
+    var environment_credentials = try readEnvironmentCredentials(
+        init.gpa,
+        init.io,
+        countEnvironmentCredentials(parsed.value),
+    );
+    defer environment_credentials.deinit();
     try writeBytes(init.io, parsed.value.status_path, worker_started_text);
     var executor = Executor.system(init.minimal.environ);
+    executor.environment_credentials = &environment_credentials;
     // The remainder the parent measured, restarted here as this process's own
     // budget. One conversion, at the start, so every command the worker runs
     // shares the deadline instead of each getting the whole of what is left.
@@ -1738,21 +1760,24 @@ const Session = struct {
                 repository.id,
             );
             defer self.allocator.free(path);
-            var material: ?vm_control.BasicMaterial = null;
-            defer if (material) |resolved| {
+            var password: ?[]u8 = null;
+            defer if (password) |bytes| {
                 // The only copy this process makes of the material. tdnf reads
                 // it back from the file, which lives on the private tmpfs at
                 // <root>/run and is unmounted before anything is published.
-                @memset(@constCast(resolved.password), 0);
-                self.allocator.free(resolved.password);
+                credential_mod.deinitMaterial(self.allocator, bytes);
             };
+            var material: ?vm_control.BasicMaterial = null;
             if (repository.credential) |credential| {
-                material = switch (credential) {
-                    .basic => |basic| .{
-                        .username = basic.username,
-                        .password = try self.readCredentialMaterial(basic.password),
+                switch (credential) {
+                    .basic => |basic| {
+                        password = try self.readCredentialMaterial(basic.password);
+                        material = .{
+                            .username = basic.username,
+                            .password = password.?,
+                        };
                     },
-                };
+                }
             }
             const body = try vm_control.renderRepositoryBody(
                 self.allocator,
@@ -1777,16 +1802,19 @@ const Session = struct {
         self: *Session,
         source: customize.CredentialSource,
     ) ![]u8 {
-        // Scrubbing, because this worker is PID 1 in the namespace and mounts
-        // a real `proc` inside the target root. See `credential.readMaterial`
-        // for why that is a decision rather than a rule.
-        return credential_mod.readMaterial(
-            self.allocator,
-            self.io,
-            self.executor.environ,
-            source,
-            true,
-        );
+        return switch (source) {
+            .host_path => credential_mod.readMaterial(
+                self.allocator,
+                self.io,
+                .empty,
+                source,
+            ),
+            .host_environment => {
+                const credentials = self.executor.environment_credentials orelse
+                    return error.CredentialSourceUnreadable;
+                return credentials.take();
+            },
+        };
     }
 
     fn removeRepositoryFiles(self: *Session) !void {
@@ -2568,6 +2596,7 @@ const Executor = struct {
     /// exactly like running a command, so it belongs to the same seam. Tests
     /// get `.empty` and so cannot accidentally read the developer's shell.
     environ: std.process.Environ = .empty,
+    environment_credentials: ?*EnvironmentCredentials = null,
     /// The run's remaining budget, resolved once. Held here rather than passed
     /// at each call site because it is one budget for the whole worker: a
     /// deadline every command got a fresh copy of would bound nothing.
@@ -2606,14 +2635,9 @@ const Executor = struct {
     }
 };
 
-/// The environment the worker runs under, and the environment it hands to every
-/// command it runs. Built rather than inherited in both directions. A credential
-/// variable is forwarded into the first and deliberately not into the second:
-/// the worker consumes it, and nothing it spawns -- least of all a package
-/// scriptlet or a dracut module, which are target-supplied code running as root
-/// against the image about to be published -- ever sees it. The repository file
-/// is deleted before the initramfs is regenerated; a variable left in the
-/// environment would have outlived the channel it was meant to travel on.
+/// The environment the worker and every command it runs receive. Built rather
+/// than inherited in both directions. Credentials use a separate anonymous
+/// pipe, so neither this environment nor `/proc/1/environ` contains them.
 fn baseEnvironment(allocator: Allocator) !std.process.Environ.Map {
     var environment = std.process.Environ.Map.init(allocator);
     errdefer environment.deinit();
@@ -3298,25 +3322,43 @@ fn validEnvironmentName(name: []const u8) bool {
     return true;
 }
 
-/// Overwrites a variable's value in the process's own environment block, in
-/// place. The name is left behind because it is not a secret and is already in
-/// the plan; only the material goes.
-///
-/// This narrows the window rather than making the backend safe. `unsafe_chroot`
-/// runs package scriptlets as root against the host kernel and says so: code
-/// that wants the credential can leave the chroot and read the file a
-/// `host_path` credential names. The point is that a secret should not sit in a
-/// process image for the length of a run when the run needed it once.
-/// Copies the value of every variable a declared credential names into the
-/// worker's environment, and refuses now rather than after the image has been
-/// mounted and half mutated. An unset variable is a declaration the host cannot
-/// honour, which is a refusal, not an empty password.
-fn forwardCredentialVariables(
+const environment_credential_magic = "VMIZENV1";
+
+fn countEnvironmentCredentials(manifest: Manifest) usize {
+    var count: usize = 0;
+    for (manifest.packages.repositories) |repository| {
+        const credential = repository.credential orelse continue;
+        switch (credential) {
+            .basic => |basic| switch (basic.password) {
+                .host_environment => count += 1,
+                .host_path => {},
+            },
+        }
+    }
+    return count;
+}
+
+/// Resolves only environment-backed credentials in the parent, immediately
+/// frames them for the pipe, and clears every temporary allocation. File-backed
+/// sources remain references and are still opened by the worker at point of use.
+fn sealEnvironmentCredentials(
     allocator: Allocator,
     environ: std.process.Environ,
-    map: *std.process.Environ.Map,
     manifest: Manifest,
-) !void {
+) !?[]u8 {
+    const count = countEnvironmentCredentials(manifest);
+    if (count == 0) return null;
+    if (count > std.math.maxInt(u32)) return error.CredentialMaterialUnusable;
+
+    var bytes: std.array_list.Managed(u8) = .init(allocator);
+    errdefer {
+        std.crypto.secureZero(u8, bytes.items);
+        bytes.deinit();
+    }
+    try bytes.appendSlice(environment_credential_magic);
+    var encoded_count: [4]u8 = undefined;
+    std.mem.writeInt(u32, &encoded_count, @intCast(count), .little);
+    try bytes.appendSlice(&encoded_count);
     for (manifest.packages.repositories) |repository| {
         const credential = repository.credential orelse continue;
         const name = switch (credential) {
@@ -3327,13 +3369,100 @@ fn forwardCredentialVariables(
         };
         const value = std.process.Environ.getAlloc(environ, allocator, name) catch
             return error.CredentialSourceUnreadable;
-        defer {
-            @memset(value, 0);
-            allocator.free(value);
-        }
+        defer credential_mod.deinitMaterial(allocator, value);
         if (!credential_mod.validMaterial(value)) return error.CredentialMaterialUnusable;
-        try map.put(name, value);
+        var length: [4]u8 = undefined;
+        std.mem.writeInt(u32, &length, @intCast(value.len), .little);
+        try bytes.appendSlice(&length);
+        try bytes.appendSlice(value);
     }
+    return try bytes.toOwnedSlice();
+}
+
+const EnvironmentCredentials = struct {
+    allocator: Allocator,
+    bytes: []u8,
+    offset: usize,
+    remaining: u32,
+
+    fn init(allocator: Allocator, bytes: []u8, expected_count: usize) !EnvironmentCredentials {
+        if (expected_count > std.math.maxInt(u32)) return error.CredentialSourceUnreadable;
+        if (bytes.len < environment_credential_magic.len + 4 or
+            !std.mem.eql(u8, bytes[0..environment_credential_magic.len], environment_credential_magic))
+        {
+            return error.CredentialSourceUnreadable;
+        }
+        const count_offset = environment_credential_magic.len;
+        const count = std.mem.readInt(u32, bytes[count_offset..][0..4], .little);
+        if (count != expected_count) return error.CredentialSourceUnreadable;
+
+        var offset = count_offset + 4;
+        var remaining = count;
+        while (remaining > 0) : (remaining -= 1) {
+            if (offset + 4 > bytes.len) return error.CredentialSourceUnreadable;
+            const length = std.mem.readInt(u32, bytes[offset..][0..4], .little);
+            offset += 4;
+            if (length > customize.max_credential_material_bytes or
+                length > bytes.len - offset or
+                !credential_mod.validMaterial(bytes[offset..][0..length]))
+            {
+                return error.CredentialMaterialUnusable;
+            }
+            offset += length;
+        }
+        if (offset != bytes.len) return error.CredentialSourceUnreadable;
+        return .{
+            .allocator = allocator,
+            .bytes = bytes,
+            .offset = count_offset + 4,
+            .remaining = count,
+        };
+    }
+
+    fn take(self: *EnvironmentCredentials) ![]u8 {
+        if (self.remaining == 0) return error.CredentialSourceUnreadable;
+        const length = std.mem.readInt(u32, self.bytes[self.offset..][0..4], .little);
+        self.offset += 4;
+        const source = self.bytes[self.offset..][0..length];
+        const material = try self.allocator.dupe(u8, source);
+        credential_mod.scrubMaterial(source);
+        self.offset += length;
+        self.remaining -= 1;
+        return material;
+    }
+
+    fn deinit(self: *EnvironmentCredentials) void {
+        credential_mod.deinitMaterial(self.allocator, self.bytes);
+        self.* = undefined;
+    }
+};
+
+fn readEnvironmentCredentials(
+    allocator: Allocator,
+    io: Io,
+    expected_count: usize,
+) !EnvironmentCredentials {
+    var buffer: [4096]u8 = undefined;
+    var reader = Io.File.stdin().readerStreaming(io, &buffer);
+    const max_bytes = std.math.add(
+        usize,
+        environment_credential_magic.len + 4,
+        try std.math.mul(
+            usize,
+            expected_count,
+            4 + customize.max_credential_material_bytes,
+        ),
+    ) catch return error.CredentialMaterialUnusable;
+    const bytes = try reader.interface.allocRemaining(
+        allocator,
+        .limited(max_bytes),
+    );
+    errdefer credential_mod.deinitMaterial(allocator, bytes);
+    if (expected_count == 0 and bytes.len == 0) {
+        const empty = try allocator.dupe(u8, environment_credential_magic ++ "\x00\x00\x00\x00");
+        return EnvironmentCredentials.init(allocator, empty, 0);
+    }
+    return EnvironmentCredentials.init(allocator, bytes, expected_count);
 }
 
 fn writeBytesExclusive(
@@ -4899,6 +5028,17 @@ test "no credential material reaches anything the run publishes" {
     const block = [_:null]?[*:0]const u8{
         "VMIZ_TEST_SENTINEL=" ++ variable_material,
     };
+    const sealed_environment = (try sealEnvironmentCredentials(
+        allocator,
+        .{ .block = .{ .slice = &block } },
+        manifest,
+    )).?;
+    var environment_credentials = try EnvironmentCredentials.init(
+        allocator,
+        sealed_environment,
+        1,
+    );
+    defer environment_credentials.deinit();
     var context = FakeExecutorContext{
         .allocator = allocator,
         .io = io,
@@ -4911,7 +5051,7 @@ test "no credential material reaches anything the run publishes" {
     const result = try executeManifest(allocator, io, manifest, .{
         .context = &context,
         .runFn = FakeExecutorContext.run,
-        .environ = .{ .block = .{ .slice = &block } },
+        .environment_credentials = &environment_credentials,
     });
     try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
 
@@ -5025,45 +5165,8 @@ test "nothing the worker runs inherits the worker's environment" {
     }
 }
 
-test "a consumed credential variable stops existing" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    var entry = "VMIZ_TEST_CREDENTIAL=s3cr3t-from-a-variable".*;
-    var other = "PATH=/usr/bin".*;
-    const block = [_:null]?[*:0]const u8{ &entry, &other };
-    const environ = std.process.Environ{ .block = .{ .slice = &block } };
-
-    try std.testing.expectEqualStrings(
-        "s3cr3t-from-a-variable",
-        std.process.Environ.getPosix(environ, "VMIZ_TEST_CREDENTIAL").?,
-    );
-    credential_mod.scrubEnvironmentValue(environ, "VMIZ_TEST_CREDENTIAL");
-
-    // Gone from the block, and gone from the bytes the block points at, which
-    // is what `/proc/<pid>/environ` reads.
-    try std.testing.expectEqualStrings(
-        "",
-        std.process.Environ.getPosix(environ, "VMIZ_TEST_CREDENTIAL").?,
-    );
-    try std.testing.expect(
-        std.mem.indexOf(u8, &entry, "s3cr3t-from-a-variable") == null,
-    );
-
-    // And nothing else is disturbed: the worker still has to run commands.
-    try std.testing.expectEqualStrings(
-        "/usr/bin",
-        std.process.Environ.getPosix(environ, "PATH").?,
-    );
-    credential_mod.scrubEnvironmentValue(environ, "VMIZ_NOT_DECLARED");
-}
-
-test "a credential the host cannot resolve is a refusal, not an empty password" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
-
-    var map = std.process.Environ.Map.init(allocator);
-    defer map.deinit();
-
+test "environment credentials use owned pipe storage and are scrubbed when consumed" {
+    const allocator = std.testing.allocator;
     const environment_credential = customize.RepositoryCredential{ .basic = .{
         .username = "builder",
         .password = .{ .host_environment = "VMIZ_TEST_CREDENTIAL" },
@@ -5087,22 +5190,34 @@ test "a credential the host cannot resolve is a refusal, not an empty password" 
         .initramfs = .unchanged,
     };
 
-    // The parent's environment is built, not inherited, so a variable it cannot
-    // read is refused before the image is opened rather than forwarded as "".
+    // An unset declaration is refused before the image is opened rather than
+    // transported as an empty password.
     try std.testing.expectError(
         error.CredentialSourceUnreadable,
-        forwardCredentialVariables(allocator, .empty, &map, manifest),
+        sealEnvironmentCredentials(allocator, .empty, manifest),
     );
-    try std.testing.expect(map.get("VMIZ_TEST_CREDENTIAL") == null);
 
+    // The source is a string literal: resolving it must never write through
+    // the const environment view.
     const block = [_:null]?[*:0]const u8{
         "VMIZ_TEST_CREDENTIAL=s3cr3t-from-a-variable",
     };
     const environ = std.process.Environ{ .block = .{ .slice = &block } };
-    try forwardCredentialVariables(allocator, environ, &map, manifest);
+    const sealed = (try sealEnvironmentCredentials(allocator, environ, manifest)).?;
+    var credentials = try EnvironmentCredentials.init(allocator, sealed, 1);
+    defer credentials.deinit();
+    const material = try credentials.take();
+    defer credential_mod.deinitMaterial(allocator, material);
+    try std.testing.expectEqualStrings("s3cr3t-from-a-variable", material);
     try std.testing.expectEqualStrings(
         "s3cr3t-from-a-variable",
-        map.get("VMIZ_TEST_CREDENTIAL").?,
+        std.process.Environ.getPosix(environ, "VMIZ_TEST_CREDENTIAL").?,
+    );
+    const value_offset = environment_credential_magic.len + 4 + 4;
+    try std.testing.expectEqualSlices(
+        u8,
+        &([_]u8{0} ** "s3cr3t-from-a-variable".len),
+        sealed[value_offset..][0.."s3cr3t-from-a-variable".len],
     );
 
     // A newline would end the `password=` line and let whatever followed be
@@ -5110,20 +5225,17 @@ test "a credential the host cannot resolve is a refusal, not an empty password" 
     const injecting = [_:null]?[*:0]const u8{
         "VMIZ_TEST_CREDENTIAL=s3cr3t\nenabled=0",
     };
-    var injecting_map = std.process.Environ.Map.init(allocator);
-    defer injecting_map.deinit();
     try std.testing.expectError(
         error.CredentialMaterialUnusable,
-        forwardCredentialVariables(
+        sealEnvironmentCredentials(
             allocator,
             .{ .block = .{ .slice = &injecting } },
-            &injecting_map,
             manifest,
         ),
     );
 
-    // A repository whose credential is a file needs nothing forwarded: the
-    // worker reads the file itself, so nothing is put in the environment.
+    // A file credential stays a path for the worker to open at point of use;
+    // it is not copied into the environment transport.
     var file_repositories = [_]customize.PackageRepository{.{
         .id = "base",
         .urls = &.{"https://packages.example.invalid"},
@@ -5135,10 +5247,9 @@ test "a credential the host cannot resolve is a refusal, not an empty password" 
     }};
     var file_manifest = manifest;
     file_manifest.packages = .{ .repositories = &file_repositories };
-    var file_map = std.process.Environ.Map.init(allocator);
-    defer file_map.deinit();
-    try forwardCredentialVariables(allocator, .empty, &file_map, file_manifest);
-    try std.testing.expectEqual(@as(usize, 0), file_map.count());
+    try std.testing.expect(
+        try sealEnvironmentCredentials(allocator, .empty, file_manifest) == null,
+    );
 }
 
 test "the privilege boundary re-checks a credential it is handed" {

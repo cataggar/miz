@@ -587,13 +587,12 @@ fn sealCredentialMaterial(
     environ: std.process.Environ,
     repositories: []const customize.PackageRepository,
 ) !?[]u8 {
-    var passwords: std.array_list.Managed([]const u8) = .init(allocator);
+    var passwords: std.array_list.Managed([]u8) = .init(allocator);
     // The material is in this process's heap for exactly as long as it takes
     // to seal it into the device, and is overwritten either way.
     defer {
         for (passwords.items) |password| {
-            @memset(@constCast(password), 0);
-            allocator.free(password);
+            credential_mod.deinitMaterial(allocator, password);
         }
         passwords.deinit();
     }
@@ -602,15 +601,11 @@ fn sealCredentialMaterial(
         const source = switch (declared) {
             .basic => |basic| basic.password,
         };
-        // Not scrubbed: this runs in the caller's process rather than in a
-        // worker that is PID 1 with a target `proc` mounted. See
-        // `credential.readMaterial`.
         try passwords.append(try credential_mod.readMaterial(
             allocator,
             io,
             environ,
             source,
-            false,
         ));
     }
     if (passwords.items.len == 0) return null;
