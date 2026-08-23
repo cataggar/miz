@@ -298,6 +298,11 @@ const baremetal_debz_packages = [_][]const u8{
     "initramfs-tools",
     "openssh-server",
     "sudo",
+    // The trust store. Core resolves it transitively from its own roots, but
+    // nothing bare-metal installs pulls it in, so naming it here is the only
+    // thing standing between the finished root and an image whose every HTTPS
+    // client fails for want of a CA bundle.
+    "ca-certificates",
 };
 const max_debz_packages = baremetal_debz_packages.len;
 
@@ -2261,7 +2266,7 @@ fn validateCoreRoot(
         4 * 1024 * 1024,
     );
     defer allocator.free(inventory);
-    try validateExactLockRuntime(allocator, inventory, profile, .core);
+    try validateExactLockRuntime(allocator, inventory, profile, flavor);
     const final_exact_lock = try Dir.cwd().readFileAlloc(
         io,
         evidence[evidence.len - 1].lock_path,
