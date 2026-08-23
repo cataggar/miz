@@ -100,10 +100,12 @@ pub fn findRootDevice(allocator: Allocator, io: std.Io, proc_mounts_content: []c
     const partition_name = root_mount.partition_name;
 
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const link_len = try class_block_dir.readLink(io, partition_name, &link_buf);
-    const link_target = link_buf[0..link_len];
-    const parent = std.fs.path.dirname(link_target) orelse return error.RootDiskNameNotFound;
-    const disk_name = std.fs.path.basename(parent);
+    const disk_name = vmiz.block_device.parentDiskName(
+        io,
+        class_block_dir,
+        partition_name,
+        &link_buf,
+    ) catch return error.RootDiskNameNotFound;
 
     var partition_attr_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const partition_attr_path = try std.fmt.bufPrint(&partition_attr_path_buf, "{s}/partition", .{partition_name});
