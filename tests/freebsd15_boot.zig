@@ -296,13 +296,43 @@ const ssh_capture_script =
     "exec \"$@\" > >(/usr/bin/tail -c 65536) " ++
     "2> >(/usr/bin/tail -c 65536 >&2)";
 
+// Bounds the workload without delegating expiry to `timeout`, whose reach differs between coreutils
+// implementations. GNU `timeout` runs the child in a fresh process group and signals the group, so a
+// grandchild that ignores SIGTERM is still killed on escalation. The uutils rewrite that Ubuntu 26.04
+// ships signals only its direct child, so such a grandchild survives, keeps the inherited capture
+// pipes open, and leaves the reader blocked on an EOF that never arrives. The run then hangs forever
+// rather than failing, which defeats the point of bounding these commands at all.
+//
+// Job control puts the workload in a process group of its own so the escalation can address every
+// descendant with one signal. The watchdog records expiry through the marker file, and the workload's
+// own fate distinguishes a polite shutdown from a kill. The exit trap reaps the watchdog and clears
+// the workload group even if its leader exits first or the wrapper itself is interrupted.
 const timeout_wrapper_script =
-    "completion_file=$1; started_file=$2; timeout_file=$3; shift 3; " ++
-    ": > \"$started_file\" || exit 125; timed_out=; " ++
-    "trap 'timed_out=1; : > \"$timeout_file\"' TERM; " ++
-    "\"$@\"; status=$?; trap - TERM; " ++
-    "if [ -z \"$timed_out\" ]; then " ++
-    "printf '%s\\n' \"$status\" > \"$completion_file\" || exit 125; fi; " ++
+    "completion_file=$1; started_file=$2; timeout_file=$3; " ++
+    "limit=$4; grace=$5; shift 5; " ++
+    ": > \"$started_file\" || exit 125; " ++
+    "workload= watchdog=; " ++
+    "cleanup() { " ++
+    "trap - EXIT HUP INT TERM; " ++
+    "if [ -n \"$watchdog\" ]; then " ++
+    "kill -KILL -\"$watchdog\" 2>/dev/null; wait \"$watchdog\" 2>/dev/null; fi; " ++
+    "if [ -n \"$workload\" ]; then " ++
+    "kill -KILL -\"$workload\" 2>/dev/null; wait \"$workload\" 2>/dev/null; fi; " ++
+    "}; " ++
+    "trap cleanup EXIT; " ++
+    "trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; " ++
+    "set -m; " ++
+    "\"$@\" & workload=$!; " ++
+    "{ sleep \"$limit\"; kill -0 -\"$workload\" 2>/dev/null || exit 0; " ++
+    ": > \"$timeout_file\"; kill -TERM -\"$workload\" 2>/dev/null; " ++
+    "sleep \"$grace\"; kill -KILL -\"$workload\" 2>/dev/null; } " ++
+    ">/dev/null 2>&1 & watchdog=$!; " ++
+    "wait \"$workload\" 2>/dev/null; status=$?; " ++
+    "kill -KILL -\"$watchdog\" 2>/dev/null; wait \"$watchdog\" 2>/dev/null; " ++
+    "watchdog=; " ++
+    "if [ -e \"$timeout_file\" ]; then " ++
+    "if [ \"$status\" -eq 137 ]; then exit 137; fi; exit 124; fi; " ++
+    "printf '%s\\n' \"$status\" > \"$completion_file\" || exit 125; " ++
     "exit \"$status\"";
 
 const TimeoutEvidence = struct {
@@ -401,12 +431,6 @@ fn runTimedCommandAlloc(
         &.{ marker_path, "timed-out" },
     );
     defer allocator.free(timeout_path);
-    const kill_after_arg = try std.fmt.allocPrint(
-        allocator,
-        "--kill-after={s}",
-        .{kill_after_text},
-    );
-    defer allocator.free(kill_after_arg);
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
@@ -415,9 +439,6 @@ fn runTimedCommandAlloc(
         "-c",
         ssh_capture_script,
         "vmiz-ssh-capture",
-        "/usr/bin/timeout",
-        kill_after_arg,
-        timeout_text,
         "/bin/bash",
         "-c",
         timeout_wrapper_script,
@@ -425,6 +446,8 @@ fn runTimedCommandAlloc(
         completion_path,
         started_path,
         timeout_path,
+        timeout_text,
+        kill_after_text,
     });
     try argv.appendSlice(allocator, command_argv);
     const result = try std.process.run(allocator, io, .{
@@ -1509,6 +1532,7 @@ test "timeout wrapper distinguishes completion, expiry, and SIGKILL escalation" 
         std.process.Child.Term{ .exited = 124 },
         expired.term,
     );
+    try std.testing.expectEqualStrings("", expired.stderr);
     const expired_diagnostic = try sshFailureDiagnosticAlloc(
         allocator,
         expired,
@@ -1536,6 +1560,7 @@ test "timeout wrapper distinguishes completion, expiry, and SIGKILL escalation" 
     try std.testing.expect(escalated.timedOut());
     try std.testing.expect(escalated.timeout_evidence.completed_status == null);
     try std.testing.expectEqual(@as(?u8, 137), shellStatus(escalated.term));
+    try std.testing.expectEqualStrings("", escalated.stderr);
     const escalated_diagnostic = try sshFailureDiagnosticAlloc(
         allocator,
         escalated,
@@ -1546,6 +1571,115 @@ test "timeout wrapper distinguishes completion, expiry, and SIGKILL escalation" 
         escalated_diagnostic,
         "timed out after 15 seconds",
     ) != null);
+}
+
+test "timeout escalation reaches a grandchild that ignores SIGTERM" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var marker_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const marker_length = try tmp.dir.realPath(io, &marker_buffer);
+    const group_path = try std.fs.path.join(
+        allocator,
+        &.{ marker_buffer[0..marker_length], "group" },
+    );
+    defer allocator.free(group_path);
+
+    // The workload leads its own process group, so its pid names the group that escalation has to
+    // clear. Signalling only the direct child leaves the backgrounded grandchild holding the
+    // captured pipes, which is what wedges a run instead of failing it.
+    const command = try std.fmt.allocPrint(
+        allocator,
+        "printf '%s\\n' \"$$\" > '{s}'; " ++
+            "/bin/bash -c \"trap '' TERM; while :; do /bin/sleep 1; done\" & " ++
+            "trap '' TERM; while :; do /bin/sleep 1; done",
+        .{group_path},
+    );
+    defer allocator.free(command);
+
+    var escalated = try runTimedCommandAlloc(
+        allocator,
+        io,
+        .readiness,
+        "0.5s",
+        "0.1s",
+        &.{ "/bin/bash", "-c", command },
+    );
+    defer escalated.deinit(allocator);
+    try std.testing.expect(escalated.timedOut());
+    try std.testing.expectEqual(@as(?u8, 137), shellStatus(escalated.term));
+
+    const group_text = try tmp.dir.readFileAlloc(io, "group", allocator, .limited(32));
+    defer allocator.free(group_text);
+    const group_id = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, group_text, " \t\r\n"),
+        10,
+    );
+    try expectProcessGroupGone(io, group_id);
+}
+
+test "timeout wrapper cleans up descendants after successful leader exit" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var marker_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const marker_length = try tmp.dir.realPath(io, &marker_buffer);
+    const group_path = try std.fs.path.join(
+        allocator,
+        &.{ marker_buffer[0..marker_length], "group" },
+    );
+    defer allocator.free(group_path);
+
+    const command = try std.fmt.allocPrint(
+        allocator,
+        "printf '%s\\n' \"$$\" > '{s}'; " ++
+            "/bin/bash -c \"trap '' TERM; exec >/dev/null 2>&1; " ++
+            "while :; do /bin/sleep 1; done\" &",
+        .{group_path},
+    );
+    defer allocator.free(command);
+
+    var completed = try runTimedCommandAlloc(
+        allocator,
+        io,
+        .readiness,
+        "2s",
+        "0.1s",
+        &.{ "/bin/bash", "-c", command },
+    );
+    defer completed.deinit(allocator);
+    try std.testing.expect(completed.succeeded());
+    try std.testing.expectEqualStrings("", completed.stderr);
+
+    const group_text = try tmp.dir.readFileAlloc(io, "group", allocator, .limited(32));
+    defer allocator.free(group_text);
+    const group_id = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, group_text, " \t\r\n"),
+        10,
+    );
+    try expectProcessGroupGone(io, group_id);
+}
+
+fn expectProcessGroupGone(io: Io, group_id: std.posix.pid_t) !void {
+    // Signal 0 runs the permission and existence check without delivering anything, which is how
+    // POSIX asks whether a process group still has members. The signal enum is non-exhaustive
+    // because it carries no name for a signal that is never delivered.
+    const existence_probe: std.posix.SIG = @enumFromInt(0);
+    var attempt: usize = 0;
+    while (attempt < 200) : (attempt += 1) {
+        std.posix.kill(-group_id, existence_probe) catch |err| switch (err) {
+            error.ProcessNotFound => return,
+            else => return err,
+        };
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.WorkloadProcessGroupSurvivedEscalation;
 }
 
 test "expensive package contract runs once while static evidence repeats" {
