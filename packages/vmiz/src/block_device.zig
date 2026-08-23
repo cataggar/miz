@@ -22,6 +22,10 @@ const blkgetsize64: u32 = 0x80081272;
 /// reports the logical (smallest addressable) sector size as a C `int`.
 const blkssget: u32 = 0x1268;
 
+/// The Linux `BLKRRPART` ioctl request code (`_IO(0x12, 95)`), which asks
+/// the kernel to discard its cached partition layout and read it again.
+const blkrrpart: u32 = 0x125F;
+
 /// Smallest logical sector size any supported disk layout can use: every
 /// partition table this library writes addresses 512-byte LBAs at minimum.
 pub const min_logical_sector_size: u32 = 512;
@@ -45,6 +49,12 @@ pub const ProbeError = error{
     InvalidLogicalSectorSize,
     UnalignedBlockDeviceSize,
     BlockDeviceChangedDuringOpen,
+};
+
+pub const ReReadPartitionTableError = error{
+    UnsupportedBlockDevice,
+    BlockDeviceBusy,
+    PartitionTableRefreshFailed,
 };
 
 pub const Geometry = struct {
@@ -194,6 +204,35 @@ fn probeLinux(file: Io.File) ProbeError!Geometry {
     }
 
     return geometryFrom(size_bytes, logical_sector_size);
+}
+
+const IoctlFn = *const fn (?*anyopaque, std.os.linux.fd_t, u32, usize) usize;
+
+fn systemIoctl(_: ?*anyopaque, fd: std.os.linux.fd_t, request: u32, argument: usize) usize {
+    return std.os.linux.ioctl(fd, request, argument);
+}
+
+fn reReadPartitionTableLinux(
+    file: Io.File,
+    context: ?*anyopaque,
+    ioctl_fn: IoctlFn,
+) ReReadPartitionTableError!void {
+    switch (std.os.linux.errno(ioctl_fn(context, file.handle, blkrrpart, 0))) {
+        .SUCCESS => {},
+        .BUSY => return error.BlockDeviceBusy,
+        else => return error.PartitionTableRefreshFailed,
+    }
+}
+
+/// Asks the kernel to re-read the partition table from an already-open whole
+/// block device. `BlockDeviceBusy` is distinct because it means a partition
+/// is still in use; every other ioctl failure is reported without being
+/// silently treated as success.
+pub fn reReadPartitionTable(file: Io.File) ReReadPartitionTableError!void {
+    return switch (builtin.os.tag) {
+        .linux => reReadPartitionTableLinux(file, null, systemIoctl),
+        else => error.UnsupportedBlockDevice,
+    };
 }
 
 /// Returns the kernel major/minor pair for an already-open block-device
@@ -809,6 +848,51 @@ test "geometryFrom rejects implausible sector sizes" {
 
 test "geometryFrom rejects a size that is not a whole number of sectors" {
     try std.testing.expectError(error.UnalignedBlockDeviceSize, geometryFrom(4096 + 512, 4096));
+}
+
+const TestIoctl = struct {
+    calls: usize = 0,
+    result: std.os.linux.E = .SUCCESS,
+    request: ?u32 = null,
+    argument: ?usize = null,
+
+    fn call(context: ?*anyopaque, _: std.os.linux.fd_t, request: u32, argument: usize) usize {
+        const self: *TestIoctl = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        self.request = request;
+        self.argument = argument;
+        if (self.result == .SUCCESS) return 0;
+        const errno_value: isize = @intCast(@intFromEnum(self.result));
+        return @bitCast(-errno_value);
+    }
+};
+
+test "reReadPartitionTable issues BLKRRPART and reports ioctl results" {
+    const file = Io.File{ .handle = 123, .flags = .{ .nonblocking = false } };
+    var ioctl = TestIoctl{};
+
+    try reReadPartitionTableLinux(file, &ioctl, TestIoctl.call);
+    try std.testing.expectEqual(@as(usize, 1), ioctl.calls);
+    try std.testing.expectEqual(blkrrpart, ioctl.request.?);
+    try std.testing.expectEqual(@as(usize, 0), ioctl.argument.?);
+
+    ioctl.result = .IO;
+    try std.testing.expectError(
+        error.PartitionTableRefreshFailed,
+        reReadPartitionTableLinux(file, &ioctl, TestIoctl.call),
+    );
+    try std.testing.expectEqual(@as(usize, 2), ioctl.calls);
+}
+
+test "reReadPartitionTable preserves EBUSY as a distinct result" {
+    const file = Io.File{ .handle = 123, .flags = .{ .nonblocking = false } };
+    var ioctl = TestIoctl{ .result = .BUSY };
+
+    try std.testing.expectError(
+        error.BlockDeviceBusy,
+        reReadPartitionTableLinux(file, &ioctl, TestIoctl.call),
+    );
+    try std.testing.expectEqual(@as(usize, 1), ioctl.calls);
 }
 
 fn addTestSysfsDevice(

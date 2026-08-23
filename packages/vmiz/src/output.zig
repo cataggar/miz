@@ -593,7 +593,7 @@ test "sparse source regions become zeros in the stream, not gaps" {
         defer raw.close(io);
         var qcow = try Image.create(io, qcow2_path, .qcow2, size, .{});
         defer qcow.close(io);
-        try image_mod.copyAll(io, raw, &qcow, allocator);
+        _ = try image_mod.copyAll(io, raw, &qcow, allocator);
     }
 
     var src = try Image.openPathReadOnly(io, qcow2_path);

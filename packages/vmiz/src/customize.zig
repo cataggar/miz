@@ -14938,7 +14938,7 @@ test "native-edit tracks qcow2 backing files and rejects output aliases" {
             .{},
         );
         defer base.close(io);
-        try image_mod.copyAll(io, raw, &base, std.testing.allocator);
+        _ = try image_mod.copyAll(io, raw, &base, std.testing.allocator);
     }
     {
         var overlay = try image_mod.Image.createExclusive(

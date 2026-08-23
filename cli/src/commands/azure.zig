@@ -188,7 +188,7 @@ fn runFixup(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
         }
     }
 
-    vmiz.copyAll(io, src, &dst, gpa) catch |err|
+    _ = vmiz.copyAll(io, src, &dst, gpa) catch |err|
         return fail("azure fixup: conversion failed: {s}", .{@errorName(err)});
 
     const outcome = finishFixup(&dst, io, gpa, generation, output_path);
