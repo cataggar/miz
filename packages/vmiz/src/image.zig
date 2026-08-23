@@ -93,6 +93,14 @@ const DynamicState = struct {
 
 const VhdxState = vhdx.Info;
 
+const CopyPolicy = enum {
+    /// The destination already reads as zero wherever no bytes have been
+    /// written, so all-zero chunks may stay sparse.
+    skip_zero_chunks,
+    /// The destination may contain old data, so zero chunks must overwrite it.
+    write_zero_chunks,
+};
+
 /// Extra state carried by images whose bytes live on a block-device node
 /// (`/dev/nvme0n1`, `/dev/sda`, `/dev/mapper/vg-lv`, ...) rather than in a
 /// regular file.
@@ -842,6 +850,13 @@ pub const Image = struct {
         try self.file.writePositionalAll(io, buffer, self.data_offset + offset);
     }
 
+    fn copyPolicy(self: Image) CopyPolicy {
+        return if (self.device == null)
+            .skip_zero_chunks
+        else
+            .write_zero_chunks;
+    }
+
     pub fn close(self: *Image, io: Io) void {
         self.file.close(io);
         if (self.device) |*device| device.deinit();
@@ -1183,13 +1198,16 @@ pub const CopyError = Image.PreadError || Image.PwriteError ||
 /// allocation state as writes land, and that updated state must remain
 /// visible to the caller after this returns.
 ///
-/// All-zero chunks are skipped rather than written, so converting into a
-/// sparse image stays sparse instead of eagerly allocating every block it
-/// touches. For sparse destination formats, the chunk size is aligned to the
-/// format's allocation unit so a mostly-zero chunk cannot force adjacent
-/// blocks or clusters to be allocated just because one contains live data.
+/// All-zero chunks are skipped for ordinary file destinations, so converting
+/// into a sparse image stays sparse instead of eagerly allocating every block
+/// it touches. Device destinations explicitly write those chunks because they
+/// may contain stale data. For sparse destination formats, the chunk size is
+/// aligned to the format's allocation unit so a mostly-zero chunk cannot force
+/// adjacent blocks or clusters to be allocated just because one contains live
+/// data.
 pub fn copyAll(io: Io, src: Image, dst: *Image, allocator: std.mem.Allocator) CopyError!void {
     if (dst.virtual_size < src.virtual_size) return error.DestinationTooSmall;
+    const copy_policy = dst.copyPolicy();
     const chunk_size: usize = if (dst.dynamic) |d|
         d.block_size
     else if (dst.vhdx) |v|
@@ -1207,7 +1225,7 @@ pub fn copyAll(io: Io, src: Image, dst: *Image, allocator: std.mem.Allocator) Co
         const n: usize = @intCast(@min(remaining, chunk_size));
         const got = try src.pread(io, buf[0..n], offset);
         if (got != n) return error.UnexpectedEndOfFile;
-        if (!isAllZero(buf[0..n])) {
+        if (copy_policy == .write_zero_chunks or !isAllZero(buf[0..n])) {
             try dst.pwrite(io, buf[0..n], offset);
         }
         offset += n;
@@ -1334,34 +1352,40 @@ test "convert raw to fixed vhd round-trips data" {
     try std.testing.expectEqualSlices(u8, "some payload bytes", &buf);
 }
 
-test "convert raw to dynamic vhd stays sparse for zero regions" {
+test "convert raw to dynamic vhd keeps full and final partial zero regions sparse" {
     const io = std.testing.io;
-    const src_path = "test-convert-sparse-src.img";
-    const dst_path = "test-convert-sparse-dst.vhd";
-    defer Io.Dir.cwd().deleteFile(io, src_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, dst_path) catch {};
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const src_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "source.img" });
+    defer allocator.free(src_path);
+    const dst_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "destination.vhd" });
+    defer allocator.free(dst_path);
 
-    // 4 blocks' worth of raw, all zero except a few bytes in block 1.
-    const size: u64 = 4 * @as(u64, vhd.default_block_size);
+    // The first block and final partial block are zero; only block 1 has data.
+    const size: u64 = 2 * @as(u64, vhd.default_block_size) + 512;
     var src = try Image.create(io, src_path, .raw, size, .{});
     try src.pwrite(io, "only-block-1", vhd.default_block_size + 123);
 
     var dst = try Image.create(io, dst_path, .vhd, size, .{ .vhd_subformat = .dynamic });
-    try copyAll(io, src, &dst, std.testing.allocator);
+    try copyAll(io, src, &dst, allocator);
     src.close(io);
 
-    const extents = try dst.mapExtents(io, std.testing.allocator);
-    defer std.testing.allocator.free(extents);
+    const extents = try dst.mapExtents(io, allocator);
+    defer allocator.free(extents);
     dst.close(io);
 
-    // Only the block actually touched should be allocated; the rest of the
-    // 4-block disk should stay sparse.
+    // Only the block actually touched should be allocated; both the full
+    // leading block and the partial final block stay sparse.
     try std.testing.expectEqual(@as(usize, 3), extents.len);
     try std.testing.expectEqual(false, extents[0].allocated);
     try std.testing.expectEqual(true, extents[1].allocated);
     try std.testing.expectEqual(@as(u64, vhd.default_block_size), extents[1].offset);
     try std.testing.expectEqual(@as(u64, vhd.default_block_size), extents[1].length);
     try std.testing.expectEqual(false, extents[2].allocated);
+    try std.testing.expectEqual(@as(u64, 512), extents[2].length);
 }
 
 test "convert raw to qcow2 allocates only non-zero clusters" {
@@ -1712,6 +1736,65 @@ fn openSyntheticDeviceForWrite(
     options: DeviceWriteOptions,
 ) OpenDeviceForWriteError!Image {
     return Image.deviceWriteImage(file, geometry, source_virtual_size, options);
+}
+
+test "copyAll overwrites full and final partial zero chunks on a used device" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const src_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "source.img" });
+    defer allocator.free(src_path);
+    const dst_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "destination.img" });
+    defer allocator.free(dst_path);
+
+    const raw_chunk_size: u64 = 4 * 1024 * 1024;
+    const source_size: u64 = 2 * raw_chunk_size + 512;
+    const device_size: u64 = source_size + 4096;
+    const payload = "nonzero middle chunk";
+
+    var src = try Image.create(io, src_path, .raw, source_size, .{});
+    defer src.close(io);
+    try src.pwrite(io, payload, raw_chunk_size + 1024);
+
+    {
+        var backing = try Image.create(io, dst_path, .raw, device_size, .{});
+        defer backing.close(io);
+        const pattern = [_]u8{0xa5} ** (64 * 1024);
+        var offset: u64 = 0;
+        while (offset < device_size) {
+            const n: usize = @intCast(@min(device_size - offset, pattern.len));
+            try backing.pwrite(io, pattern[0..n], offset);
+            offset += n;
+        }
+    }
+
+    const file = try Io.Dir.cwd().openFile(io, dst_path, .{ .mode = .read_write });
+    var dst = try openSyntheticDeviceForWrite(file, .{
+        .size_bytes = device_size,
+        .logical_sector_size = 512,
+    }, source_size, .{ .allow_device_write = true });
+    defer dst.close(io);
+
+    try copyAll(io, src, &dst, allocator);
+
+    var leading: [64]u8 = undefined;
+    _ = try dst.pread(io, &leading, 0);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** leading.len), &leading);
+
+    var copied_payload: [payload.len]u8 = undefined;
+    _ = try dst.pread(io, &copied_payload, raw_chunk_size + 1024);
+    try std.testing.expectEqualSlices(u8, payload, &copied_payload);
+
+    var final_partial: [512]u8 = undefined;
+    _ = try dst.pread(io, &final_partial, 2 * raw_chunk_size);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** final_partial.len), &final_partial);
+
+    var past_source: [64]u8 = undefined;
+    _ = try dst.pread(io, &past_source, source_size);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xa5} ** past_source.len), &past_source);
 }
 
 test "a device-backed image takes its size from the kernel probe, not from stat" {
