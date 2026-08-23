@@ -9868,12 +9868,11 @@ fn openDeclaredRegistry(
     // material this frame read is dead the moment it returns -- successfully
     // or not.
     defer if (material) |bytes| {
-        std.crypto.secureZero(u8, bytes);
-        allocator.free(bytes);
+        credential_mod.deinitMaterial(allocator, bytes);
     };
     var supplied: ?oci.auth.SuppliedCredential = null;
     if (access.credential) |declared| {
-        material = try credential_mod.readMaterial(allocator, io, environ, declared.password, false);
+        material = try credential_mod.readMaterial(allocator, io, environ, declared.password);
         supplied = .{ .username = declared.username, .secret = material.? };
     }
     return oci.registry.Source.init(io, allocator, environ, source_reference, .{
