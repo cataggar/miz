@@ -548,6 +548,48 @@ fn assertRequestSeparation(request: package_family.Request) !void {
     }
 }
 
+fn privateCacheDirPermissions() std.Io.File.Permissions {
+    return if (@import("builtin").os.tag == .windows) .default_dir else .fromMode(0o700);
+}
+
+fn privateCacheFilePermissions() std.Io.File.Permissions {
+    return if (@import("builtin").os.tag == .windows) .default_file else .fromMode(0o600);
+}
+
+/// Remove only abandoned debz staging files from a persistent shared cache.
+/// Each namespace's writer lock prevents cleanup from racing another build;
+/// verified objects and metadata manifests are deliberately left untouched.
+fn cleanupSharedDebzCacheStaging(io: Io, cache_path: []const u8) !void {
+    var cache = try Dir.cwd().openDir(io, cache_path, .{ .follow_symlinks = false });
+    defer cache.close(io);
+
+    for (&[_][]const u8{ "metadata-v1", "packages-v1" }) |namespace_name| {
+        var namespace = cache.openDir(io, namespace_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer namespace.close(io);
+
+        namespace.createDir(io, "locks", privateCacheDirPermissions()) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        var locks = try namespace.openDir(io, "locks", .{ .follow_symlinks = false });
+        defer locks.close(io);
+        const writer_lock = try locks.createFile(io, "writer.lock", .{
+            .read = true,
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+            .permissions = privateCacheFilePermissions(),
+        });
+        defer writer_lock.close(io);
+
+        try namespace.deleteTree(io, "staging");
+        try namespace.createDir(io, "staging", privateCacheDirPermissions());
+    }
+}
+
 const TrustedKeyring = struct {
     /// Absolute host path of the validated keyring copy.
     path: [:0]u8,
@@ -2406,6 +2448,20 @@ fn customizeRootWithDebz(
     const config_inputs = [_][]const u8{absolute_source_config};
     const keyring_inputs = [_][]const u8{absolute_keyring};
 
+    // One content-addressed cache for every stage, kept across runs. Objects are
+    // named by their own SHA-256 and the sources document pins an immutable
+    // snapshot, so a hit cannot change what a stage resolves to or installs --
+    // the same argument `acquireVerified` already reuses the cloud image on.
+    // Per-stage `state` stays per-stage and is still discarded: it is dpkg
+    // admin state, not content, and reusing it across transactions would carry
+    // one stage's installed baseline into the next.
+    const shared_cache = try std.fs.path.join(allocator, &.{ work_dir, "debz-cache" });
+    defer allocator.free(shared_cache);
+    try Dir.cwd().createDirPath(io, shared_cache);
+    try cleanupSharedDebzCacheStaging(io, shared_cache);
+    const absolute_cache = try Dir.cwd().realPathFileAlloc(io, shared_cache, allocator);
+    defer allocator.free(absolute_cache);
+
     const debz_packages: []const []const u8 = flavor.debzPackages();
     var evidence: [max_debz_packages]DebzEvidence = undefined;
     var evidence_count: usize = 0;
@@ -2423,15 +2479,10 @@ fn customizeRootWithDebz(
         defer allocator.free(transaction_dir);
         try Dir.cwd().deleteTree(io, transaction_dir);
         try Dir.cwd().createDirPath(io, transaction_dir);
-        const cache = try std.fs.path.join(allocator, &.{ transaction_dir, "cache" });
-        defer allocator.free(cache);
         const state = try std.fs.path.join(allocator, &.{ transaction_dir, "state" });
         defer allocator.free(state);
-        try Dir.cwd().createDirPath(io, cache);
         try Dir.cwd().createDirPath(io, state);
 
-        const absolute_cache = try Dir.cwd().realPathFileAlloc(io, cache, allocator);
-        defer allocator.free(absolute_cache);
         const absolute_state = try Dir.cwd().realPathFileAlloc(io, state, allocator);
         defer allocator.free(absolute_state);
         const absolute_resolve_root = try Dir.cwd().realPathFileAlloc(io, current, allocator);
@@ -3794,6 +3845,110 @@ test "package-family requests reject keyrings overlapping staging and accept the
         "debian keyring paths must be outside publication",
         package_family.requestViolation(published_overlap).?,
     );
+}
+
+test "the shared debz cache outlives per-stage deletion and stays outside every publication" {
+    const profile = profileFor(.aarch64);
+    const work_dir = "/work";
+    const shared_cache = work_dir ++ "/debz-cache";
+
+    // The per-stage transaction directory is deleted at the top of every stage.
+    // The cache has to sit beside it, not inside it, or each stage would throw
+    // away the objects the previous one just fetched. Both flavors share the
+    // `debz-` prefix, so a package literally named `cache` would collide with
+    // the shared directory and be deleted along with its own stage.
+    for (&[_][]const []const u8{ &core_debz_packages, &baremetal_debz_packages }) |packages| {
+        for (packages) |package| {
+            var buffer: [128]u8 = undefined;
+            const transaction_dir = try std.fmt.bufPrint(&buffer, "{s}/debz-{s}", .{ work_dir, package });
+            try std.testing.expect(!package_family.pathsOverlap(transaction_dir, shared_cache));
+        }
+    }
+
+    // Sharing one cache across stages must not weaken the boundary: every
+    // request still has to keep the cache out of what it publishes.
+    const config = work_dir ++ "/ubuntu-snapshot.json";
+    const keyring = work_dir ++ "/ubuntu-archive-keyring.gpg";
+    for (&baremetal_debz_packages, 0..) |package, index| {
+        var stage_buffer: [128]u8 = undefined;
+        const stage = try std.fmt.bufPrint(&stage_buffer, "{s}/root-stage-{d}", .{ work_dir, index });
+        var published_buffer: [128]u8 = undefined;
+        const published = try std.fmt.bufPrint(&published_buffer, "{s}/root-debz-{d}", .{ work_dir, index });
+        var state_buffer: [128]u8 = undefined;
+        const state = try std.fmt.bufPrint(&state_buffer, "{s}/debz-{s}/state", .{ work_dir, package });
+        var lock_buffer: [128]u8 = undefined;
+        const lock = try std.fmt.bufPrint(&lock_buffer, "{s}/debz-{s}/exact-lock.json", .{ work_dir, package });
+        const packages = [_][]const u8{package};
+
+        const resolve = packageFamilyRequest(.resolve_lock, profile, &packages, stage, published, &.{config}, &.{keyring}, shared_cache, state, lock, .require_locked, null);
+        try assertRequestSeparation(resolve);
+        try std.testing.expectEqualStrings(shared_cache, resolve.inputs.cache_path);
+        const customize = packageFamilyRequest(.customize, profile, &packages, stage, published, &.{config}, &.{keyring}, shared_cache, state, lock, .require_locked, null);
+        try assertRequestSeparation(customize);
+        try std.testing.expectEqualStrings(shared_cache, customize.inputs.cache_path);
+
+        // Each stage keeps its own dpkg admin state, which is what makes
+        // sharing the content cache safe rather than a baseline leak.
+        try std.testing.expect(!package_family.pathsOverlap(state, shared_cache));
+    }
+
+    // A cache placed under a publication root is still refused.
+    const bad = packageFamilyRequest(.customize, profile, &.{"sudo"}, work_dir ++ "/root-stage-0", work_dir ++ "/root-debz-0", &.{config}, &.{keyring}, work_dir ++ "/root-debz-0/cache", work_dir ++ "/debz-sudo/state", work_dir ++ "/debz-sudo/exact-lock.json", .require_locked, null);
+    try std.testing.expectError(error.PackageFamilySeparationViolation, assertRequestSeparation(bad));
+}
+
+test "shared debz cache startup removes only abandoned staging files" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+
+    for (&[_][]const u8{ "metadata-v1", "packages-v1" }) |namespace| {
+        var path_buffer: [128]u8 = undefined;
+        const staging = try std.fmt.bufPrint(&path_buffer, "cache/{s}/staging", .{namespace});
+        try temporary.dir.createDirPath(io, staging);
+        var locks_buffer: [128]u8 = undefined;
+        const locks = try std.fmt.bufPrint(&locks_buffer, "cache/{s}/locks", .{namespace});
+        try temporary.dir.createDirPath(io, locks);
+        var objects_buffer: [128]u8 = undefined;
+        const objects = try std.fmt.bufPrint(&objects_buffer, "cache/{s}/objects", .{namespace});
+        try temporary.dir.createDirPath(io, objects);
+        var abandoned_buffer: [160]u8 = undefined;
+        const abandoned = try std.fmt.bufPrint(&abandoned_buffer, "{s}/abandoned.tmp", .{staging});
+        try temporary.dir.writeFile(io, .{ .sub_path = abandoned, .data = "partial" });
+        var object_buffer: [160]u8 = undefined;
+        const object = try std.fmt.bufPrint(&object_buffer, "{s}/verified-object", .{objects});
+        try temporary.dir.writeFile(io, .{ .sub_path = object, .data = "verified" });
+    }
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try temporary.dir.realPath(io, &root_buffer)];
+    const cache_path = try std.fs.path.join(std.testing.allocator, &.{ root, "cache" });
+    defer std.testing.allocator.free(cache_path);
+
+    {
+        var locks = try temporary.dir.openDir(io, "cache/metadata-v1/locks", .{});
+        defer locks.close(io);
+        const writer_lock = try locks.createFile(io, "writer.lock", .{
+            .read = true,
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        });
+        defer writer_lock.close(io);
+        try std.testing.expectError(error.WouldBlock, cleanupSharedDebzCacheStaging(io, cache_path));
+        _ = try temporary.dir.statFile(io, "cache/metadata-v1/staging/abandoned.tmp", .{});
+    }
+
+    try cleanupSharedDebzCacheStaging(io, cache_path);
+
+    for (&[_][]const u8{ "metadata-v1", "packages-v1" }) |namespace| {
+        var abandoned_buffer: [160]u8 = undefined;
+        const abandoned = try std.fmt.bufPrint(&abandoned_buffer, "cache/{s}/staging/abandoned.tmp", .{namespace});
+        try std.testing.expectError(error.FileNotFound, temporary.dir.statFile(io, abandoned, .{}));
+        var object_buffer: [160]u8 = undefined;
+        const object = try std.fmt.bufPrint(&object_buffer, "cache/{s}/objects/verified-object", .{namespace});
+        _ = try temporary.dir.statFile(io, object, .{});
+    }
 }
 
 test "trusted keyring copy is bounded, read-only, and immune to guest mutation" {
