@@ -3207,6 +3207,42 @@ const baremetal_required_initramfs_modules = [_][]const u8{ "nvme", "r8152" };
 /// stays a `.core`-only list rather than joining the one above.
 const core_required_initramfs_modules = [_][]const u8{android_binder_module_name};
 
+/// The gzip header mkinitramfs falls back to, as it appears on disk.
+const initramfs_gzip_magic: u16 = 0x8b1f;
+
+/// Decompresses the compressed archive that follows an initramfs's leading
+/// uncompressed cpio archives.
+///
+/// `COMPRESS` in `initramfs.conf` is a request, not a record. `mkinitramfs`
+/// checks for the configured compressor on `PATH` and, not finding it, warns
+/// and uses gzip instead -- so a root that asks for zstd without installing the
+/// `zstd` binary silently produces a gzip initramfs. Sniffing the bytes is
+/// therefore the only way to read the archive the machine will actually boot,
+/// which is the same reason this check reads the image rather than the
+/// configuration that asked for it.
+fn decompressInitramfsTail(allocator: Allocator, tail: []const u8) ![]u8 {
+    if (tail.len >= 4 and
+        std.mem.readInt(u32, tail[0..4], .little) == vmiz.zstd.zstd_magic)
+    {
+        const decoded = vmiz.zstd.decodeAlloc(allocator, tail) catch
+            return error.UnreadableInitramfs;
+        return decoded.bytes;
+    }
+    if (tail.len >= 2 and
+        std.mem.readInt(u16, tail[0..2], .little) == initramfs_gzip_magic)
+    {
+        var input: std.Io.Reader = .fixed(tail);
+        var output = std.Io.Writer.Allocating.init(allocator);
+        errdefer output.deinit();
+        var window: [std.compress.flate.max_window_len]u8 = undefined;
+        var decompress = std.compress.flate.Decompress.init(&input, .gzip, &window);
+        _ = decompress.reader.streamRemaining(&output.writer) catch
+            return error.UnreadableInitramfs;
+        return output.toOwnedSlice();
+    }
+    return error.UnreadableInitramfs;
+}
+
 /// Fails unless every named module is inside the built initramfs.
 ///
 /// The image is the concatenation an initramfs may be: any number of
@@ -3227,14 +3263,9 @@ fn requireInitramfsModules(
     var early = vmiz.cpio.Reader.init(image);
     try scanCpioForModules(&early, required, found);
     if (early.offset < image.len) {
-        const remainder = image[early.offset..];
-        if (remainder.len < 4 or
-            std.mem.readInt(u32, remainder[0..4], .little) != vmiz.zstd.zstd_magic)
-            return error.UnreadableInitramfs;
-        const decoded = vmiz.zstd.decodeAlloc(allocator, remainder) catch
-            return error.UnreadableInitramfs;
-        defer allocator.free(decoded.bytes);
-        var payload = vmiz.cpio.Reader.init(decoded.bytes);
+        const decoded = try decompressInitramfsTail(allocator, image[early.offset..]);
+        defer allocator.free(decoded);
+        var payload = vmiz.cpio.Reader.init(decoded);
         try scanCpioForModules(&payload, required, found);
     }
 
@@ -4596,6 +4627,12 @@ test "the bare-metal initramfs is required to carry the drivers that reach the m
             var buffer = std.array_list.Managed(u8).init(a);
             errdefer buffer.deinit();
             var writer = vmiz.cpio.Writer.init(&buffer, .newc);
+            // Every archive initramfs-tools writes opens with the root entry.
+            try writer.append(.{
+                .path = ".",
+                .content = "",
+                .metadata = .{ .mode = 0o040755, .nlink = 1 },
+            });
             for (paths) |path| try writer.append(.{
                 .path = path,
                 .content = "module",
@@ -4614,6 +4651,35 @@ test "the bare-metal initramfs is required to carry the drivers that reach the m
             errdefer out.deinit();
             try out.writer.writeAll(early_bytes);
             try vmiz.zstd.writeRawFrameForSlice(&out.writer, main_bytes, null);
+            return out.toOwnedSlice();
+        }
+
+        /// The same image as `image`, compressed the way `mkinitramfs` does
+        /// when the configured compressor is not installed in the root.
+        fn gzipImage(a: Allocator, early: []const []const u8, payload: []const []const u8) ![]u8 {
+            const early_bytes = try archive(a, early);
+            defer a.free(early_bytes);
+            const main_bytes = try archive(a, payload);
+            defer a.free(main_bytes);
+            var out: std.Io.Writer.Allocating = .init(a);
+            errdefer out.deinit();
+            try out.writer.writeAll(early_bytes);
+            var history: [std.compress.flate.max_window_len]u8 = undefined;
+            var compressor = try std.compress.flate.Compress.init(&out.writer, &history, .gzip, .default);
+            try compressor.writer.writeAll(main_bytes);
+            try compressor.finish();
+            return out.toOwnedSlice();
+        }
+
+        /// An early archive followed by a tail carrying an arbitrary magic, so
+        /// an unrecognized compressor can be distinguished from a readable one.
+        fn taggedImage(a: Allocator, early: []const []const u8, magic: []const u8) ![]u8 {
+            const early_bytes = try archive(a, early);
+            defer a.free(early_bytes);
+            var out: std.Io.Writer.Allocating = .init(a);
+            errdefer out.deinit();
+            try out.writer.writeAll(early_bytes);
+            try out.writer.writeAll(magic);
             return out.toOwnedSlice();
         }
     };
@@ -4668,6 +4734,44 @@ test "the bare-metal initramfs is required to carry the drivers that reach the m
     try std.testing.expectError(
         error.UnreadableInitramfs,
         requireInitramfsModules(allocator, truncated[0 .. truncated.len - 8], &baremetal_required_initramfs_modules),
+    );
+
+    // `COMPRESS=zstd` is what the root asks for; gzip is what it gets when the
+    // `zstd` binary is not installed, because `mkinitramfs` warns and falls
+    // back rather than failing. A real aarch64 bare-metal root produced exactly
+    // this, and reading only zstd rejected a perfectly bootable initramfs.
+    const gzipped = try pack.gzipImage(
+        allocator,
+        &.{"kernel/drivers/net/usb/r8152.ko.zst"},
+        &.{ "kernel/drivers/nvme/host/nvme.ko.zst", "kernel/fs/ext4/ext4.ko.zst" },
+    );
+    defer allocator.free(gzipped);
+    try requireInitramfsModules(allocator, gzipped, &baremetal_required_initramfs_modules);
+
+    // The fallback is read, not merely tolerated: a gzip image missing a
+    // required driver is still rejected for the right reason.
+    const gzipped_no_nic = try pack.gzipImage(
+        allocator,
+        &.{},
+        &.{"kernel/drivers/nvme/host/nvme.ko.zst"},
+    );
+    defer allocator.free(gzipped_no_nic);
+    try std.testing.expectError(
+        error.InitramfsModuleMissing,
+        requireInitramfsModules(allocator, gzipped_no_nic, &baremetal_required_initramfs_modules),
+    );
+
+    // A compressor neither branch recognizes is refused rather than silently
+    // treated as an archive with nothing in it.
+    const unknown = try pack.taggedImage(
+        allocator,
+        &.{"kernel/drivers/net/usb/r8152.ko.zst"},
+        &.{ 0xfd, 0x37, 0x7a, 0x58 },
+    );
+    defer allocator.free(unknown);
+    try std.testing.expectError(
+        error.UnreadableInitramfs,
+        requireInitramfsModules(allocator, unknown, &baremetal_required_initramfs_modules),
     );
 }
 
