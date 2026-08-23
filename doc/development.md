@@ -163,6 +163,7 @@ vmiz/
         create.zig            # `vmiz create`
         info.zig              # `vmiz info`
         convert.zig           # `vmiz convert`
+        write.zig             # Linux block-device writer (`vmiz write`)
         resize.zig            # `vmiz resize`
         check.zig             # `vmiz check`
         map.zig               # `vmiz map`
