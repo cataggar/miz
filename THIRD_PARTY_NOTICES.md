@@ -32,6 +32,22 @@ Copyright (c) 2026 Peter Marreck.
 Licensed under the MIT License. See:
 https://github.com/cataggar/bzip2z/blob/05f6d4e34df2da2729490aee2a5bbe43b5ce94f6/LICENSE
 
+## zstd
+
+Host/public vmiz module graphs link `cataggar/zstd` from its Zig 0.16 branch
+at immutable commit `45b6dfcd9d0ffdba99fb653c66b233179b9f7229` as a static,
+single-threaded library (`tools=false`, `shared=false`, `multithread=false`).
+Private guest-root builds reuse only the public headers and do not link the
+library or libc.
+
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+Licensed under the BSD License for Zstandard software. See:
+https://github.com/cataggar/zstd/blob/45b6dfcd9d0ffdba99fb653c66b233179b9f7229/LICENSE
+
+The upstream CLI utility sources are GPL-2.0 (`COPYING`), but this repository
+does not build them because the dependency is configured with `tools=false`.
+
 ## tls.zig (test fixture only)
 
 The deterministic OCI registry TLS fixture uses `cataggar/tls.zig` at commit

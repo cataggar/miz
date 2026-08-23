@@ -74,6 +74,29 @@ test {
     std.testing.refAllDecls(iso_build);
 }
 
+fn zstdDependency(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Dependency {
+    return b.dependency("zstd", .{
+        .target = target,
+        .optimize = optimize,
+        .tools = false,
+        .shared = false,
+        .multithread = false,
+    });
+}
+
+fn addZstdHeaders(module: *std.Build.Module, dependency: *std.Build.Dependency) void {
+    module.addIncludePath(dependency.path("lib"));
+}
+
+fn addZstdLibrary(module: *std.Build.Module, dependency: *std.Build.Dependency) void {
+    addZstdHeaders(module, dependency);
+    module.linkLibrary(dependency.artifact("zstd"));
+}
+
 const Ubuntu2604CoreArtifacts = struct {
     vmizinit: *std.Build.Step.Compile,
     azagent: *std.Build.Step.Compile,
@@ -90,6 +113,7 @@ fn addUbuntu2604CoreArtifacts(
         },
         .os_tag = .linux,
     });
+    const guest_zstd = zstdDependency(b, guest_target, .ReleaseSmall);
     const cdrom_mod = b.createModule(.{
         .root_source_file = b.path("azagent/cdrom.zig"),
         .target = guest_target,
@@ -112,6 +136,7 @@ fn addUbuntu2604CoreArtifacts(
         .target = guest_target,
         .optimize = .ReleaseSmall,
     });
+    addZstdHeaders(vmiz_guest_mod, guest_zstd);
     const wireserver_guest_mod = b.createModule(.{
         .root_source_file = b.path("wireserver/wireserver.zig"),
         .target = guest_target,
@@ -200,6 +225,8 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
+    const zstd_dependency = zstdDependency(b, target, optimize);
+    const host_zstd_dependency = zstdDependency(b, b.graph.host, optimize);
 
     // ---- packages/vmiz: the core disk-image library ----
     const vmiz_mod = b.addModule("vmiz", .{
@@ -207,22 +234,26 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    _ = b.addModule("zvmi", .{
+    addZstdLibrary(vmiz_mod, zstd_dependency);
+    const zvmi_mod = b.addModule("zvmi", .{
         .root_source_file = b.path("packages/vmiz/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    addZstdLibrary(zvmi_mod, zstd_dependency);
     const host_vmiz_mod = b.addModule("vmiz_host", .{
         .root_source_file = b.path("packages/vmiz/src/root.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     });
+    addZstdLibrary(host_vmiz_mod, host_zstd_dependency);
     host_vmiz_mod.addImport("debz", debz_mod);
     const host_zvmi_mod = b.addModule("zvmi_host", .{
         .root_source_file = b.path("packages/vmiz/src/root.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     });
+    addZstdLibrary(host_zvmi_mod, host_zstd_dependency);
     host_zvmi_mod.addImport("debz", debz_mod);
     const package_family_mod = b.createModule(.{
         .root_source_file = b.path("packages/vmiz/src/package_family.zig"),
@@ -1046,6 +1077,7 @@ pub fn build(b: *std.Build) void {
     // meaningful on Linux.  The zstd_max_preload shared library is also
     // Linux-specific. ----
     if (b.graph.host.result.os.tag == .linux) {
+        const guest_zstd_dependency = zstdDependency(b, vmizinit_target, .ReleaseSmall);
 
         // Guest-targeted azagent for embedding in the generalized image.
         // It follows -Dazurelinux-arch and is static/ReleaseSmall, matching
@@ -1055,6 +1087,7 @@ pub fn build(b: *std.Build) void {
             .target = vmizinit_target,
             .optimize = .ReleaseSmall,
         });
+        addZstdHeaders(vmiz_guest_mod, guest_zstd_dependency);
         const wireserver_guest_mod = b.createModule(.{
             .root_source_file = b.path("wireserver/wireserver.zig"),
             .target = vmizinit_target,

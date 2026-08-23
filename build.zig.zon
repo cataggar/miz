@@ -21,6 +21,10 @@
             .url = "git+https://github.com/cataggar/rpmz#15b5e1291a9fc3eb3980a4088d757b9d0254d468",
             .hash = "rpmz-0.1.0-5KEwN2CRkQA-qHdelei8dHxBU3le6kPBVZt10YEqN1Ov",
         },
+        .zstd = .{
+            .url = "git+https://github.com/cataggar/zstd#45b6dfcd9d0ffdba99fb653c66b233179b9f7229",
+            .hash = "zstd-1.6.0-Nyx42k_XOwDtCIdYiccjJJbSdlkUV7Q6gfo1ijJqJWtf",
+        },
     },
 
     .paths = .{
