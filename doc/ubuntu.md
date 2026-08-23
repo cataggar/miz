@@ -62,7 +62,9 @@ baseline. The downloaded objects are not: every stage reads and writes one
 Objects there are named by their own SHA-256 and the sources document pins an
 immutable snapshot, so a cache hit cannot change what a stage resolves to or
 installs, and repository signatures are verified and recorded in provenance
-either way. Deleting the work dir is still a full cold build.
+either way. At startup, abandoned staging files are removed under each cache
+namespace's writer lock without touching verified objects or manifests.
+Deleting the work dir is still a full cold build.
 
 The root partition is selected by the validated GPT name
 `cloudimg-rootfs` and the ext4 filesystem label, not by a fixed `/dev/sdaN`

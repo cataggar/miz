@@ -548,6 +548,48 @@ fn assertRequestSeparation(request: package_family.Request) !void {
     }
 }
 
+fn privateCacheDirPermissions() std.Io.File.Permissions {
+    return if (@import("builtin").os.tag == .windows) .default_dir else .fromMode(0o700);
+}
+
+fn privateCacheFilePermissions() std.Io.File.Permissions {
+    return if (@import("builtin").os.tag == .windows) .default_file else .fromMode(0o600);
+}
+
+/// Remove only abandoned debz staging files from a persistent shared cache.
+/// Each namespace's writer lock prevents cleanup from racing another build;
+/// verified objects and metadata manifests are deliberately left untouched.
+fn cleanupSharedDebzCacheStaging(io: Io, cache_path: []const u8) !void {
+    var cache = try Dir.cwd().openDir(io, cache_path, .{ .follow_symlinks = false });
+    defer cache.close(io);
+
+    for (&[_][]const u8{ "metadata-v1", "packages-v1" }) |namespace_name| {
+        var namespace = cache.openDir(io, namespace_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer namespace.close(io);
+
+        namespace.createDir(io, "locks", privateCacheDirPermissions()) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        var locks = try namespace.openDir(io, "locks", .{ .follow_symlinks = false });
+        defer locks.close(io);
+        const writer_lock = try locks.createFile(io, "writer.lock", .{
+            .read = true,
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+            .permissions = privateCacheFilePermissions(),
+        });
+        defer writer_lock.close(io);
+
+        try namespace.deleteTree(io, "staging");
+        try namespace.createDir(io, "staging", privateCacheDirPermissions());
+    }
+}
+
 const TrustedKeyring = struct {
     /// Absolute host path of the validated keyring copy.
     path: [:0]u8,
@@ -2416,6 +2458,7 @@ fn customizeRootWithDebz(
     const shared_cache = try std.fs.path.join(allocator, &.{ work_dir, "debz-cache" });
     defer allocator.free(shared_cache);
     try Dir.cwd().createDirPath(io, shared_cache);
+    try cleanupSharedDebzCacheStaging(io, shared_cache);
     const absolute_cache = try Dir.cwd().realPathFileAlloc(io, shared_cache, allocator);
     defer allocator.free(absolute_cache);
 
@@ -3852,6 +3895,60 @@ test "the shared debz cache outlives per-stage deletion and stays outside every 
     // A cache placed under a publication root is still refused.
     const bad = packageFamilyRequest(.customize, profile, &.{"sudo"}, work_dir ++ "/root-stage-0", work_dir ++ "/root-debz-0", &.{config}, &.{keyring}, work_dir ++ "/root-debz-0/cache", work_dir ++ "/debz-sudo/state", work_dir ++ "/debz-sudo/exact-lock.json", .require_locked, null);
     try std.testing.expectError(error.PackageFamilySeparationViolation, assertRequestSeparation(bad));
+}
+
+test "shared debz cache startup removes only abandoned staging files" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+
+    for (&[_][]const u8{ "metadata-v1", "packages-v1" }) |namespace| {
+        var path_buffer: [128]u8 = undefined;
+        const staging = try std.fmt.bufPrint(&path_buffer, "cache/{s}/staging", .{namespace});
+        try temporary.dir.createDirPath(io, staging);
+        var locks_buffer: [128]u8 = undefined;
+        const locks = try std.fmt.bufPrint(&locks_buffer, "cache/{s}/locks", .{namespace});
+        try temporary.dir.createDirPath(io, locks);
+        var objects_buffer: [128]u8 = undefined;
+        const objects = try std.fmt.bufPrint(&objects_buffer, "cache/{s}/objects", .{namespace});
+        try temporary.dir.createDirPath(io, objects);
+        var abandoned_buffer: [160]u8 = undefined;
+        const abandoned = try std.fmt.bufPrint(&abandoned_buffer, "{s}/abandoned.tmp", .{staging});
+        try temporary.dir.writeFile(io, .{ .sub_path = abandoned, .data = "partial" });
+        var object_buffer: [160]u8 = undefined;
+        const object = try std.fmt.bufPrint(&object_buffer, "{s}/verified-object", .{objects});
+        try temporary.dir.writeFile(io, .{ .sub_path = object, .data = "verified" });
+    }
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try temporary.dir.realPath(io, &root_buffer)];
+    const cache_path = try std.fs.path.join(std.testing.allocator, &.{ root, "cache" });
+    defer std.testing.allocator.free(cache_path);
+
+    {
+        var locks = try temporary.dir.openDir(io, "cache/metadata-v1/locks", .{});
+        defer locks.close(io);
+        const writer_lock = try locks.createFile(io, "writer.lock", .{
+            .read = true,
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        });
+        defer writer_lock.close(io);
+        try std.testing.expectError(error.WouldBlock, cleanupSharedDebzCacheStaging(io, cache_path));
+        _ = try temporary.dir.statFile(io, "cache/metadata-v1/staging/abandoned.tmp", .{});
+    }
+
+    try cleanupSharedDebzCacheStaging(io, cache_path);
+
+    for (&[_][]const u8{ "metadata-v1", "packages-v1" }) |namespace| {
+        var abandoned_buffer: [160]u8 = undefined;
+        const abandoned = try std.fmt.bufPrint(&abandoned_buffer, "cache/{s}/staging/abandoned.tmp", .{namespace});
+        try std.testing.expectError(error.FileNotFound, temporary.dir.statFile(io, abandoned, .{}));
+        var object_buffer: [160]u8 = undefined;
+        const object = try std.fmt.bufPrint(&object_buffer, "cache/{s}/objects/verified-object", .{namespace});
+        _ = try temporary.dir.statFile(io, object, .{});
+    }
 }
 
 test "trusted keyring copy is bounded, read-only, and immune to guest mutation" {
