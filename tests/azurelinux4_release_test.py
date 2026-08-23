@@ -867,13 +867,14 @@ class AzureLinuxReleaseTest(unittest.TestCase):
     def test_ci_actions_are_pinned_to_audited_commits(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         actions = re.findall(
-            r"^[ \t]*-?[ \t]*uses:[ \t]+(\S+)[ \t]+#[ \t]+(\S+)$",
+            r"^[ \t]*-?[ \t]*uses:[ \t]+(\S+)"
+            r"(?:[ \t]+#[ \t]+(\S+))?$",
             workflow,
             re.MULTILINE,
         )
         self.assertEqual(
-            actions,
-            [
+            set(actions),
+            {
                 (
                     "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
                     "v4",
@@ -883,10 +884,44 @@ class AzureLinuxReleaseTest(unittest.TestCase):
                     "7d8c3ef0886dd428a97727fce3b74909d6eace78",
                     "v0.6.6",
                 ),
-            ],
+                (
+                    "actions/cache@"
+                    "0057852bfaa89a56745cba8c7296529d2fc39830",
+                    "v4",
+                ),
+            },
         )
-        for action, _ in actions:
+        self.assertEqual(len(actions), 13)
+        for action, version in actions:
+            self.assertTrue(version)
             self.assertRegex(action, r"@[0-9a-f]{40}$")
+
+    def test_ci_heavy_phases_are_independent_jobs(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        for job in (
+            "quality",
+            "zig-tests",
+            "vm-backend",
+            "windows",
+            "unsafe-chroot",
+            "vm-boot",
+        ):
+            self.assertIn(f"  {job}:\n", workflow)
+        self.assertNotIn("\n    needs:", workflow)
+        self.assertEqual(workflow.count("fail-fast: false"), 2)
+        self.assertIn("zig build test-ci --summary all", workflow)
+        self.assertEqual(
+            workflow.count("run: zig build test-vm-backend --summary all"),
+            1,
+        )
+        self.assertEqual(
+            workflow.count(
+                "run: zig build test-unsafe-chroot-integration --summary all"
+            ),
+            1,
+        )
+        self.assertEqual(workflow.count("zig build test-vm-real-boot"), 3)
+        self.assertIn("cancel-in-progress: true", workflow)
 
     def test_release_workflow_uses_hosted_architecture_runners(self):
         workflow = (ROOT / ".github/workflows/azurelinux4-release.yml").read_text()

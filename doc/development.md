@@ -260,7 +260,13 @@ vmiz/
 
 ## CI
 
-`.github/workflows/ci.yml` runs the required `zig fmt --check`, `zig build`, and `zig build test` checks on every pull request and push to `main`. It also boots a real guest through the `vm` customization backend, both same- and cross-architecture (see below).
+`.github/workflows/ci.yml` runs the required formatting, Python workflow,
+build, and Zig checks on every pull request and push to `main`. The main suite
+uses `zig build test-ci`; it preserves the `zig build test` graph except for
+the VM-backend and privileged unsafe-chroot integrations, which run once in
+dedicated parallel jobs. Windows cross-builds and the native,
+cross-architecture, and modular real-VM boots also run as independent matrix
+shards (see below).
 
 ### The vm backend's tests
 
