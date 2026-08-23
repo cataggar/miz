@@ -93,6 +93,7 @@ pub const Image = image_mod.Image;
 pub const Info = image_mod.Info;
 pub const CreateOptions = image_mod.CreateOptions;
 pub const OpenOptions = image_mod.OpenOptions;
+pub const DeviceWriteOptions = image_mod.DeviceWriteOptions;
 pub const DeviceInfo = image_mod.DeviceInfo;
 pub const VhdSubformat = image_mod.VhdSubformat;
 pub const copyAll = image_mod.copyAll;

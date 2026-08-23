@@ -99,3 +99,30 @@ fn fail(comptime format: []const u8, args: anytype) u8 {
     std.debug.print(format ++ "\n", args);
     return 1;
 }
+
+test "convert still refuses a block-device destination through Image.create" {
+    const io = std.testing.io;
+    const destination = blockDevicePathForTest(io) orelse return error.SkipZigTest;
+    const source = "test-convert-device-source.raw";
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+
+    var src = try vmiz.Image.create(io, source, .raw, 4096, .{});
+    src.close(io);
+
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        run(std.testing.allocator, io, &.{ "-f", "raw", "-O", "raw", source, destination }),
+    );
+    try std.testing.expectEqual(
+        std.Io.File.Kind.block_device,
+        (try std.Io.Dir.cwd().statFile(io, destination, .{})).kind,
+    );
+}
+
+fn blockDevicePathForTest(io: std.Io) ?[]const u8 {
+    for ([_][]const u8{ "/dev/loop0", "/dev/sda", "/dev/vda", "/dev/nvme0n1" }) |path| {
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch continue;
+        if (stat.kind == .block_device) return path;
+    }
+    return null;
+}
