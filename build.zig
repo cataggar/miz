@@ -923,6 +923,14 @@ pub fn build(b: *std.Build) void {
     vmizguest_test_step.dependOn(&run_vmizguest_tests.step);
 
     const test_step = b.step("test", "Run all tests");
+    const ci_test_step = b.step(
+        "test-ci",
+        "Run CI tests except integrations assigned to dedicated jobs",
+    );
+    const aggregate_test_steps = [_]*std.Build.Step{
+        test_step,
+        ci_test_step,
+    };
 
     const build_api_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -1118,8 +1126,10 @@ pub fn build(b: *std.Build) void {
         const run_builder_tests = b.addRunArtifact(builder_tests);
         const builder_test_step = b.step("test-generalized-azurelinux4", "Run build_generalized_azurelinux4 unit tests");
         builder_test_step.dependOn(&run_builder_tests.step);
-        test_step.dependOn(&run_builder_tests.step);
-        test_step.dependOn(generalized_check_step);
+        for (aggregate_test_steps) |aggregate_test_step| {
+            aggregate_test_step.dependOn(&run_builder_tests.step);
+            aggregate_test_step.dependOn(generalized_check_step);
+        }
 
         // ---- Ubuntu 26.04: immutable Canonical cloud-image input, Azure
         // package customization, host-side signed UKI, and standalone zstd
@@ -1170,8 +1180,10 @@ pub fn build(b: *std.Build) void {
             "Run focused Ubuntu 26.04 builder tests",
         );
         ubuntu2604_test_step.dependOn(&run_ubuntu2604_tests.step);
-        test_step.dependOn(&run_ubuntu2604_tests.step);
-        test_step.dependOn(ubuntu2604_check);
+        for (aggregate_test_steps) |aggregate_test_step| {
+            aggregate_test_step.dependOn(&run_ubuntu2604_tests.step);
+            aggregate_test_step.dependOn(ubuntu2604_check);
+        }
 
         const run_ubuntu2604 = b.addRunArtifact(ubuntu2604_builder_exe);
         run_ubuntu2604.addArgs(&.{
@@ -1339,43 +1351,53 @@ pub fn build(b: *std.Build) void {
         freebsd_aarch64_builder_test_step.dependOn(
             &run_freebsd_builder_tests.step,
         );
-        test_step.dependOn(&run_freebsd_builder_tests.step);
+        for (aggregate_test_steps) |aggregate_test_step| {
+            aggregate_test_step.dependOn(&run_freebsd_builder_tests.step);
+        }
     }
 
-    test_step.dependOn(&run_vmiz_tests.step);
-    test_step.dependOn(&run_host_package_family_tests.step);
-    test_step.dependOn(&run_oci_registry_tests.step);
-    test_step.dependOn(&run_wireserver_tests.step);
-    test_step.dependOn(&run_qemu_host_tests.step);
-    test_step.dependOn(&run_azagent_tests.step);
-    test_step.dependOn(&run_cli_tests.step);
-    test_step.dependOn(&run_image_builder_tests.step);
-    test_step.dependOn(&run_preserved_image_builder_tests.step);
-    test_step.dependOn(&run_preserved_image_wire_tests.step);
-    test_step.dependOn(&run_input_validator_tests.step);
-    test_step.dependOn(&run_image_status_check_tests.step);
-    test_step.dependOn(&run_qmp_mod_tests.step);
-    test_step.dependOn(&run_qmp_exe_tests.step);
-    test_step.dependOn(&run_qmp_codegen_tests.step);
-    test_step.dependOn(&run_qmp_schema_tests.step);
-    test_step.dependOn(&run_boot_smoke_tests.step);
-    test_step.dependOn(&run_freebsd_boot_tests.step);
+    for (aggregate_test_steps) |aggregate_test_step| {
+        aggregate_test_step.dependOn(&run_vmiz_tests.step);
+        aggregate_test_step.dependOn(&run_host_package_family_tests.step);
+        aggregate_test_step.dependOn(&run_oci_registry_tests.step);
+        aggregate_test_step.dependOn(&run_wireserver_tests.step);
+        aggregate_test_step.dependOn(&run_qemu_host_tests.step);
+        aggregate_test_step.dependOn(&run_azagent_tests.step);
+        aggregate_test_step.dependOn(&run_cli_tests.step);
+        aggregate_test_step.dependOn(&run_image_builder_tests.step);
+        aggregate_test_step.dependOn(&run_preserved_image_builder_tests.step);
+        aggregate_test_step.dependOn(&run_preserved_image_wire_tests.step);
+        aggregate_test_step.dependOn(&run_input_validator_tests.step);
+        aggregate_test_step.dependOn(&run_image_status_check_tests.step);
+        aggregate_test_step.dependOn(&run_qmp_mod_tests.step);
+        aggregate_test_step.dependOn(&run_qmp_exe_tests.step);
+        aggregate_test_step.dependOn(&run_qmp_codegen_tests.step);
+        aggregate_test_step.dependOn(&run_qmp_schema_tests.step);
+        aggregate_test_step.dependOn(&run_boot_smoke_tests.step);
+        aggregate_test_step.dependOn(&run_freebsd_boot_tests.step);
+        aggregate_test_step.dependOn(&run_nbd_mod_tests.step);
+        aggregate_test_step.dependOn(&run_nbd_exe_tests.step);
+        aggregate_test_step.dependOn(&run_nbd_server_tests.step);
+        aggregate_test_step.dependOn(&run_qcow2_mod_tests.step);
+        aggregate_test_step.dependOn(&run_qcow2_exe_tests.step);
+        aggregate_test_step.dependOn(&run_vmizinit_tests.step);
+        aggregate_test_step.dependOn(&run_vmizguest_tests.step);
+        aggregate_test_step.dependOn(vmizguest_step);
+        aggregate_test_step.dependOn(&run_build_api_tests.step);
+        aggregate_test_step.dependOn(&build_api_consumer_check.step);
+        aggregate_test_step.dependOn(&package_family_consumer_check.step);
+        aggregate_test_step.dependOn(&rename_compatibility_consumer_check.step);
+        aggregate_test_step.dependOn(&build_api_diagnostics_check.step);
+        aggregate_test_step.dependOn(
+            &build_api_execution_diagnostics_check.step,
+        );
+        aggregate_test_step.dependOn(
+            &build_api_preserved_diagnostics_check.step,
+        );
+        aggregate_test_step.dependOn(
+            &build_api_preserved_vm_diagnostics_check.step,
+        );
+    }
     test_step.dependOn(&run_unsafe_chroot_integration.step);
     test_step.dependOn(&run_vm_backend_integration.step);
-    test_step.dependOn(&run_nbd_mod_tests.step);
-    test_step.dependOn(&run_nbd_exe_tests.step);
-    test_step.dependOn(&run_nbd_server_tests.step);
-    test_step.dependOn(&run_qcow2_mod_tests.step);
-    test_step.dependOn(&run_qcow2_exe_tests.step);
-    test_step.dependOn(&run_vmizinit_tests.step);
-    test_step.dependOn(&run_vmizguest_tests.step);
-    test_step.dependOn(vmizguest_step);
-    test_step.dependOn(&run_build_api_tests.step);
-    test_step.dependOn(&build_api_consumer_check.step);
-    test_step.dependOn(&package_family_consumer_check.step);
-    test_step.dependOn(&rename_compatibility_consumer_check.step);
-    test_step.dependOn(&build_api_diagnostics_check.step);
-    test_step.dependOn(&build_api_execution_diagnostics_check.step);
-    test_step.dependOn(&build_api_preserved_diagnostics_check.step);
-    test_step.dependOn(&build_api_preserved_vm_diagnostics_check.step);
 }
