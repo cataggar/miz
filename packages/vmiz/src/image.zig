@@ -157,6 +157,38 @@ pub const DeviceWriteOptions = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
 };
 
+pub const DeviceWriteOutcome = enum {
+    partition_table_refreshed,
+    partition_table_stale_busy,
+    partition_table_stale_unsupported,
+    partition_table_stale_failed,
+
+    pub fn message(self: DeviceWriteOutcome) []const u8 {
+        return switch (self) {
+            .partition_table_refreshed => "The kernel partition table was refreshed. Partition device nodes may still be settling.",
+            .partition_table_stale_busy => "The data on the device is correct and durable, but the kernel partition table could not be refreshed because the device is busy. The kernel's view is stale; detach and reattach the device before using its partitions.",
+            .partition_table_stale_unsupported => "The data on the device is correct and durable, but this platform cannot refresh the kernel partition table. The kernel's view may be stale; detach and reattach the device before using its partitions.",
+            .partition_table_stale_failed => "The data on the device is correct and durable, but the kernel partition table refresh failed. The kernel's view is stale; detach and reattach the device before using its partitions.",
+        };
+    }
+
+    /// A non-null message means the bytes are durable but the kernel is still
+    /// using its old partition layout. Device-write commands must show this
+    /// instead of reporting plain success.
+    pub fn warning(self: DeviceWriteOutcome) ?[]const u8 {
+        return switch (self) {
+            .partition_table_refreshed => null,
+            else => self.message(),
+        };
+    }
+};
+
+pub const CopyResult = struct {
+    /// Null for ordinary file destinations. Device destinations are always
+    /// flushed before this result is returned.
+    device_write: ?DeviceWriteOutcome = null,
+};
+
 /// Where an image's authoritative size comes from, resolved once at open
 /// time and then used in place of the `stat` size for format sniffing.
 const Source = union(enum) {
@@ -863,6 +895,43 @@ pub const Image = struct {
         self.* = undefined;
     }
 
+    pub const FinishDeviceWriteError = error{
+        BlockDeviceWriteNotPermitted,
+    } || Io.File.SyncError;
+
+    /// Makes all bytes written through a writable device-backed image durable,
+    /// then asks the kernel to re-read the device's partition table. Refresh
+    /// failure is a reportable partial-success outcome rather than a write
+    /// failure because the flushed bytes on the device are already correct.
+    ///
+    /// Returns null for an ordinary file, preserving existing file-copy
+    /// behavior. Call this again after any post-copy device mutations.
+    pub fn finishDeviceWrite(
+        self: *Image,
+        io: Io,
+    ) FinishDeviceWriteError!?DeviceWriteOutcome {
+        return self.finishDeviceWriteWith(io, .{});
+    }
+
+    fn finishDeviceWriteWith(
+        self: *Image,
+        io: Io,
+        operations: DeviceWriteOperations,
+    ) FinishDeviceWriteError!?DeviceWriteOutcome {
+        const device = self.device orelse return null;
+        if (!device.write_allowed) return error.BlockDeviceWriteNotPermitted;
+
+        try operations.sync_fn(operations.context, self.file, io);
+        operations.re_read_partition_table_fn(operations.context, self.file) catch |err| {
+            return switch (err) {
+                error.BlockDeviceBusy => .partition_table_stale_busy,
+                error.UnsupportedBlockDevice => .partition_table_stale_unsupported,
+                error.PartitionTableRefreshFailed => .partition_table_stale_failed,
+            };
+        };
+        return .partition_table_refreshed;
+    }
+
     /// Safety and inventory data collected before the writable device handle
     /// was created. Callers should print this before beginning the copy.
     pub fn devicePreflight(self: *const Image) ?*const block_device.PreflightReport {
@@ -1189,8 +1258,29 @@ fn randomUuid(io: Io) [16]u8 {
     return bytes;
 }
 
+const DeviceWriteOperations = struct {
+    context: ?*anyopaque = null,
+    sync_fn: *const fn (?*anyopaque, Io.File, Io) Io.File.SyncError!void = syncDevice,
+    re_read_partition_table_fn: *const fn (
+        ?*anyopaque,
+        Io.File,
+    ) block_device.ReReadPartitionTableError!void = reReadPartitionTable,
+
+    fn syncDevice(_: ?*anyopaque, file: Io.File, io: Io) Io.File.SyncError!void {
+        try file.sync(io);
+    }
+
+    fn reReadPartitionTable(
+        _: ?*anyopaque,
+        file: Io.File,
+    ) block_device.ReReadPartitionTableError!void {
+        try block_device.reReadPartitionTable(file);
+    }
+};
+
 pub const CopyError = Image.PreadError || Image.PwriteError ||
-    std.mem.Allocator.Error || error{ UnexpectedEndOfFile, DestinationTooSmall };
+    Image.FinishDeviceWriteError || std.mem.Allocator.Error ||
+    error{ UnexpectedEndOfFile, DestinationTooSmall };
 
 /// Copies all `src` virtual-disk bytes into `*dst` (which must already have
 /// been created with at least `src`'s virtual size). Used by `vmiz convert`.
@@ -1204,8 +1294,25 @@ pub const CopyError = Image.PreadError || Image.PwriteError ||
 /// may contain stale data. For sparse destination formats, the chunk size is
 /// aligned to the format's allocation unit so a mostly-zero chunk cannot force
 /// adjacent blocks or clusters to be allocated just because one contains live
-/// data.
-pub fn copyAll(io: Io, src: Image, dst: *Image, allocator: std.mem.Allocator) CopyError!void {
+/// data. A device destination is flushed and its partition table is refreshed
+/// before return; callers must inspect `CopyResult.device_write` so a stale
+/// kernel partition view is reported as partial success rather than hidden.
+pub fn copyAll(
+    io: Io,
+    src: Image,
+    dst: *Image,
+    allocator: std.mem.Allocator,
+) CopyError!CopyResult {
+    return copyAllWithDeviceWriteOperations(io, src, dst, allocator, .{});
+}
+
+fn copyAllWithDeviceWriteOperations(
+    io: Io,
+    src: Image,
+    dst: *Image,
+    allocator: std.mem.Allocator,
+    operations: DeviceWriteOperations,
+) CopyError!CopyResult {
     if (dst.virtual_size < src.virtual_size) return error.DestinationTooSmall;
     const copy_policy = dst.copyPolicy();
     const chunk_size: usize = if (dst.dynamic) |d|
@@ -1230,6 +1337,7 @@ pub fn copyAll(io: Io, src: Image, dst: *Image, allocator: std.mem.Allocator) Co
         }
         offset += n;
     }
+    return .{ .device_write = try dst.finishDeviceWriteWith(io, operations) };
 }
 
 /// Public because the streaming output path in `output.zig` needs exactly
@@ -1341,7 +1449,7 @@ test "convert raw to fixed vhd round-trips data" {
     try src.pwrite(io, "some payload bytes", 4096);
 
     var dst = try Image.create(io, dst_path, .vhd, size, .{ .vhd_subformat = .fixed });
-    try copyAll(io, src, &dst, std.testing.allocator);
+    _ = try copyAll(io, src, &dst, std.testing.allocator);
     src.close(io);
     dst.close(io);
 
@@ -1370,7 +1478,7 @@ test "convert raw to dynamic vhd keeps full and final partial zero regions spars
     try src.pwrite(io, "only-block-1", vhd.default_block_size + 123);
 
     var dst = try Image.create(io, dst_path, .vhd, size, .{ .vhd_subformat = .dynamic });
-    try copyAll(io, src, &dst, allocator);
+    _ = try copyAll(io, src, &dst, allocator);
     src.close(io);
 
     const extents = try dst.mapExtents(io, allocator);
@@ -1401,7 +1509,7 @@ test "convert raw to qcow2 allocates only non-zero clusters" {
     try src.pwrite(io, "only-cluster-1", cluster_size + 123);
 
     var dst = try Image.create(io, dst_path, .qcow2, size, .{});
-    try copyAll(io, src, &dst, std.testing.allocator);
+    _ = try copyAll(io, src, &dst, std.testing.allocator);
     src.close(io);
 
     const extents = try dst.mapExtents(io, std.testing.allocator);
@@ -1738,6 +1846,196 @@ fn openSyntheticDeviceForWrite(
     return Image.deviceWriteImage(file, geometry, source_virtual_size, options);
 }
 
+const TestDeviceWriteOperations = struct {
+    sync_attempts: usize = 0,
+    refresh_attempts: usize = 0,
+    sequence: usize = 0,
+    order_valid: bool = true,
+    sync_failure: ?Io.File.SyncError = null,
+    refresh_failure: ?block_device.ReReadPartitionTableError = null,
+
+    fn sync(context: ?*anyopaque, _: Io.File, _: Io) Io.File.SyncError!void {
+        const self: *TestDeviceWriteOperations = @ptrCast(@alignCast(context.?));
+        self.sync_attempts += 1;
+        self.order_valid = self.order_valid and self.sequence == 0;
+        self.sequence = 1;
+        if (self.sync_failure) |err| return err;
+    }
+
+    fn refresh(
+        context: ?*anyopaque,
+        _: Io.File,
+    ) block_device.ReReadPartitionTableError!void {
+        const self: *TestDeviceWriteOperations = @ptrCast(@alignCast(context.?));
+        self.refresh_attempts += 1;
+        self.order_valid = self.order_valid and self.sequence == 1;
+        self.sequence = 2;
+        if (self.refresh_failure) |err| return err;
+    }
+
+    fn operations(self: *TestDeviceWriteOperations) DeviceWriteOperations {
+        return .{
+            .context = self,
+            .sync_fn = sync,
+            .re_read_partition_table_fn = refresh,
+        };
+    }
+};
+
+test "copyAll flushes a device before refreshing its partition table" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_file = try tmp.dir.createFile(io, "source.img", .{ .truncate = true, .read = true });
+    try source_file.setLength(io, 4096);
+    var source = try Image.openFile(io, source_file);
+    defer source.close(io);
+    try source.pwrite(io, "durable payload", 512);
+
+    const destination_file = try tmp.dir.createFile(io, "destination.img", .{ .truncate = true, .read = true });
+    try destination_file.setLength(io, 4096);
+    var destination = try openSyntheticDeviceForWrite(destination_file, .{
+        .size_bytes = 4096,
+        .logical_sector_size = 512,
+    }, 4096, .{ .allow_device_write = true });
+    defer destination.close(io);
+
+    var operations = TestDeviceWriteOperations{};
+    const result = try copyAllWithDeviceWriteOperations(
+        io,
+        source,
+        &destination,
+        allocator,
+        operations.operations(),
+    );
+
+    try std.testing.expectEqual(
+        DeviceWriteOutcome.partition_table_refreshed,
+        result.device_write.?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), operations.sync_attempts);
+    try std.testing.expectEqual(@as(usize, 1), operations.refresh_attempts);
+    try std.testing.expectEqual(@as(usize, 2), operations.sequence);
+    try std.testing.expect(operations.order_valid);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.device_write.?.message(),
+        "may still be settling",
+    ) != null);
+}
+
+test "copyAll propagates a device flush failure without attempting refresh" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_file = try tmp.dir.createFile(io, "source.img", .{ .truncate = true, .read = true });
+    try source_file.setLength(io, 512);
+    var source = try Image.openFile(io, source_file);
+    defer source.close(io);
+
+    const destination_file = try tmp.dir.createFile(io, "destination.img", .{ .truncate = true, .read = true });
+    try destination_file.setLength(io, 512);
+    var destination = try openSyntheticDeviceForWrite(destination_file, .{
+        .size_bytes = 512,
+        .logical_sector_size = 512,
+    }, 512, .{ .allow_device_write = true });
+    defer destination.close(io);
+
+    var operations = TestDeviceWriteOperations{ .sync_failure = error.NoSpaceLeft };
+    try std.testing.expectError(
+        error.NoSpaceLeft,
+        copyAllWithDeviceWriteOperations(
+            io,
+            source,
+            &destination,
+            allocator,
+            operations.operations(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), operations.sync_attempts);
+    try std.testing.expectEqual(@as(usize, 0), operations.refresh_attempts);
+}
+
+test "device finish reports stale partition outcomes without losing durable success" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile(io, "destination.img", .{ .truncate = true, .read = true });
+    try file.setLength(io, 512);
+    var destination = try openSyntheticDeviceForWrite(file, .{
+        .size_bytes = 512,
+        .logical_sector_size = 512,
+    }, 512, .{ .allow_device_write = true });
+    defer destination.close(io);
+
+    var busy = TestDeviceWriteOperations{ .refresh_failure = error.BlockDeviceBusy };
+    try std.testing.expectEqual(
+        DeviceWriteOutcome.partition_table_stale_busy,
+        (try destination.finishDeviceWriteWith(io, busy.operations())).?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), busy.sync_attempts);
+    try std.testing.expectEqual(@as(usize, 1), busy.refresh_attempts);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        DeviceWriteOutcome.partition_table_stale_busy.warning().?,
+        "data on the device is correct and durable",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        DeviceWriteOutcome.partition_table_stale_busy.warning().?,
+        "detach and reattach",
+    ) != null);
+
+    var failed = TestDeviceWriteOperations{ .refresh_failure = error.PartitionTableRefreshFailed };
+    try std.testing.expectEqual(
+        DeviceWriteOutcome.partition_table_stale_failed,
+        (try destination.finishDeviceWriteWith(io, failed.operations())).?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), failed.sync_attempts);
+    try std.testing.expectEqual(@as(usize, 1), failed.refresh_attempts);
+}
+
+test "copyAll preserves ordinary file behavior without device finalization" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_file = try tmp.dir.createFile(io, "source.img", .{ .truncate = true, .read = true });
+    try source_file.setLength(io, 512);
+    var source = try Image.openFile(io, source_file);
+    defer source.close(io);
+    try source.pwrite(io, "ordinary file", 0);
+
+    const destination_file = try tmp.dir.createFile(io, "destination.img", .{ .truncate = true, .read = true });
+    try destination_file.setLength(io, 512);
+    var destination = try Image.openFile(io, destination_file);
+    defer destination.close(io);
+
+    var operations = TestDeviceWriteOperations{
+        .sync_failure = error.NoSpaceLeft,
+        .refresh_failure = error.PartitionTableRefreshFailed,
+    };
+    const result = try copyAllWithDeviceWriteOperations(
+        io,
+        source,
+        &destination,
+        std.testing.allocator,
+        operations.operations(),
+    );
+    try std.testing.expectEqual(@as(?DeviceWriteOutcome, null), result.device_write);
+    try std.testing.expectEqual(@as(usize, 0), operations.sync_attempts);
+    try std.testing.expectEqual(@as(usize, 0), operations.refresh_attempts);
+
+    var payload: ["ordinary file".len]u8 = undefined;
+    _ = try destination.pread(io, &payload, 0);
+    try std.testing.expectEqualStrings("ordinary file", &payload);
+}
+
 test "copyAll overwrites full and final partial zero chunks on a used device" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
@@ -1778,7 +2076,7 @@ test "copyAll overwrites full and final partial zero chunks on a used device" {
     }, source_size, .{ .allow_device_write = true });
     defer dst.close(io);
 
-    try copyAll(io, src, &dst, allocator);
+    _ = try copyAll(io, src, &dst, allocator);
 
     var leading: [64]u8 = undefined;
     _ = try dst.pread(io, &leading, 0);

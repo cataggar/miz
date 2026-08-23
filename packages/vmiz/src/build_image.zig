@@ -1143,7 +1143,7 @@ fn convertRawToOutput(
     var dst = try Image.create(io, output_path, output_format, disk_size, effective_create_options);
     defer dst.close(io);
 
-    try image_mod.copyAll(io, src, &dst, allocator);
+    _ = try image_mod.copyAll(io, src, &dst, allocator);
 }
 
 fn logStep(options: BuildImageOptions, message: []const u8) void {

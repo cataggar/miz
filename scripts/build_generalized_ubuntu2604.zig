@@ -1463,7 +1463,7 @@ fn copyNativeImage(
         if (destination_open) destination.close(io);
         Dir.cwd().deleteFile(io, destination_path) catch {};
     }
-    try vmiz.copyAll(io, source, &destination, allocator);
+    _ = try vmiz.copyAll(io, source, &destination, allocator);
     try destination.file.sync(io);
     destination.close(io);
     destination_open = false;
@@ -3262,7 +3262,7 @@ pub fn main(init: std.process.Init) !void {
         source_image.virtual_size,
         .{},
     );
-    try vmiz.copyAll(io, source_image, &mutable_image, allocator);
+    _ = try vmiz.copyAll(io, source_image, &mutable_image, allocator);
     mutable_image.close(io);
     if (args.size > source_image.virtual_size) {
         _ = try vmiz.root_resize.growExistingQcow2(

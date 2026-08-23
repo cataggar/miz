@@ -81,7 +81,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             return fail("convert: failed to create '{s}': {s}", .{ dst_path, @errorName(err) });
         defer dst.close(io);
 
-        vmiz.copyAll(io, src, &dst, gpa) catch |err|
+        _ = vmiz.copyAll(io, src, &dst, gpa) catch |err|
             return fail("convert: copy failed: {s}", .{@errorName(err)});
         return 0;
     }

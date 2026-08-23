@@ -258,7 +258,7 @@ pub fn growExistingQcow2(
     var raw_open = true;
     defer if (raw_open) raw.close(io);
 
-    try image_mod.copyAll(io, source, &raw, allocator);
+    _ = try image_mod.copyAll(io, source, &raw, allocator);
     const grow_result = try gpt.growPartitionToEnd(
         &raw,
         io,
@@ -325,7 +325,7 @@ pub fn growExistingQcow2(
     );
     var output_open = true;
     defer if (output_open) output.close(io);
-    try image_mod.copyAll(io, raw_source, &output, allocator);
+    _ = try image_mod.copyAll(io, raw_source, &output, allocator);
 
     const check = try output.check(io);
     if (!check.ok) return error.FinalImageInvalid;
@@ -440,7 +440,7 @@ test "grows a labeled root in a standalone QCOW2 transactionally" {
     @memcpy(stock_gdt[0..32], &first_descriptor);
     try raw.file.writePositionalAll(io, &stock_gdt, root_offset + 4096);
     var qcow = try Image.create(io, qcow_path, .qcow2, old_size, .{});
-    try image_mod.copyAll(io, raw, &qcow, allocator);
+    _ = try image_mod.copyAll(io, raw, &qcow, allocator);
     qcow.close(io);
     raw.close(io);
     raw_open = false;

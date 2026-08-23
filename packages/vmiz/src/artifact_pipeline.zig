@@ -1238,7 +1238,7 @@ pub fn deriveFixedVhd(
     defer if (finalized_open) finalized.close(io);
     try validateStageBounded(io, stage.file, options.max_output_size);
 
-    try image.copyAll(io, source_image, &finalized, allocator);
+    _ = try image.copyAll(io, source_image, &finalized, allocator);
     const relocation = try gpt.relocateBackup(
         &finalized,
         io,

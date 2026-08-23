@@ -24,6 +24,7 @@ const ext4 = vmiz.ext4;
 const xfs = vmiz.xfs;
 const xfs_writer = vmiz.xfs_writer;
 const tree_cursor = vmiz.tree_cursor;
+const block_device = vmiz.block_device;
 const Image = vmiz.Image;
 
 pub const Filesystem = enum {
@@ -235,7 +236,6 @@ fn prepareXfsMbr(io: std.Io, allocator: Allocator, file: std.Io.File, total_sect
     table.disk_signature = @truncate(@as(u64, @bitCast(now_unix_seconds)));
     const encoded = table.encode();
     try file.writePositionalAll(io, &encoded, 0);
-    reReadPartitionTable(file);
     return .{
         .offset = @as(u64, partition_start_lba) * mbr.sector_size,
         .length = @as(u64, sector_count) * mbr.sector_size,
@@ -276,14 +276,7 @@ fn ensureFormattedMbr(io: std.Io, allocator: Allocator, file: std.Io.File, total
         .timestamp = std.math.cast(u32, now_unix_seconds) orelse 0,
     });
 
-    // Tell the kernel to re-read the partition table so the partition
-    // device node (e.g. `/dev/sdb1`) actually appears/updates before
-    // `setup` tries to mount it -- matching real waagent's own
-    // `reread_partition_table` step after (re)partitioning. Best-effort:
-    // some environments return an error here even though the partition
-    // table was written correctly, in which case the caller's subsequent
-    // mount attempt is the real test.
-    reReadPartitionTable(file);
+    try finishPartitionWrite(io, file);
 }
 
 fn resourceGuid(now_unix_seconds: i64, total_sectors: u64, salt: u8) guid_codec.Guid {
@@ -379,7 +372,6 @@ fn prepareXfsGpt(io: std.Io, allocator: Allocator, file: std.Io.File, total_sect
         .name_utf16le = gpt.asciiName("resource"),
     }};
     try gpt.writeGptPlaced(&img, io, resourceGuid(now_unix_seconds, total_sectors, 0), &specs);
-    reReadPartitionTable(file);
     return .{
         .offset = placement.first_lba * gpt.sector_size,
         .length = partition_sectors * gpt.sector_size,
@@ -470,15 +462,16 @@ fn ensureFormattedGpt(io: std.Io, allocator: Allocator, file: std.Io.File, total
         .label = "resource",
         .timestamp = std.math.cast(u32, now_unix_seconds) orelse 0,
     });
-    reReadPartitionTable(file);
+    try finishPartitionWrite(io, file);
 }
 
-/// The Linux `BLKRRPART` ioctl request code (`_IO(0x12, 95)`), used to ask
-/// the kernel to re-read a block device's partition table.
-const blkrrpart: u32 = 0x125F;
-
-fn reReadPartitionTable(file: std.Io.File) void {
-    _ = linux.ioctl(file.handle, blkrrpart, 0);
+fn finishPartitionWrite(io: std.Io, file: std.Io.File) !void {
+    // Unit tests use ordinary files as disk images. Only a real block device
+    // needs the kernel refresh, and preserving the file path's old behavior
+    // keeps those tests non-privileged.
+    if ((try file.stat(io)).kind != .block_device) return;
+    try file.sync(io);
+    try block_device.reReadPartitionTable(file);
 }
 
 /// Mounts `device_path` (e.g. `/dev/sdb1`) at `mount_point` via a direct
@@ -717,6 +710,7 @@ pub fn setupDevice(options: SetupDeviceOptions) !void {
                     .ext4 => try ensureFormatted(options.io, options.allocator, device_file, total_sectors, options.now_unix_seconds),
                     .xfs => if (try prepareXfs(options.io, options.allocator, device_file, total_sectors, options.now_unix_seconds)) |region| {
                         try formatXfs(options.allocator, options.io, device_file, region, options.now_unix_seconds, total_sectors);
+                        try finishPartitionWrite(options.io, device_file);
                     },
                 }
             },

@@ -96,6 +96,8 @@ pub const OpenOptions = image_mod.OpenOptions;
 pub const DeviceWriteOptions = image_mod.DeviceWriteOptions;
 pub const DeviceInfo = image_mod.DeviceInfo;
 pub const DevicePreflightReport = block_device.PreflightReport;
+pub const DeviceWriteOutcome = image_mod.DeviceWriteOutcome;
+pub const CopyResult = image_mod.CopyResult;
 pub const VhdSubformat = image_mod.VhdSubformat;
 pub const copyAll = image_mod.copyAll;
 

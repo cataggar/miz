@@ -1011,7 +1011,7 @@ pub fn rebuild(
     raw_exists = true;
     var raw_open = true;
     defer if (raw_open) raw.close(io);
-    try image_mod.copyAll(io, source, &raw, allocator);
+    _ = try image_mod.copyAll(io, source, &raw, allocator);
     source.close(io);
     source_open = false;
 
@@ -1175,7 +1175,7 @@ fn transactRawInternal(
     raw_exists = true;
     var raw_open = true;
     defer if (raw_open) raw.close(io);
-    try image_mod.copyAll(io, source, &raw, allocator);
+    _ = try image_mod.copyAll(io, source, &raw, allocator);
     source.close(io);
     source_open = false;
     const raw_inode = (try raw.file.stat(io)).inode;
@@ -2236,7 +2236,7 @@ fn publishRawStaging(
     output_stage_exists.* = true;
     var output_open = true;
     defer if (output_open) output.close(io);
-    try image_mod.copyAll(io, raw_source, &output, allocator);
+    _ = try image_mod.copyAll(io, raw_source, &output, allocator);
     const output_inode = (try output.file.stat(io)).inode;
     output.close(io);
     output_open = false;
@@ -3530,7 +3530,7 @@ test "strict rebuild flattens a backed qcow2 source without changing its chain" 
         defer raw.close(io);
         var base = try Image.createExclusive(io, base_path, .qcow2, test_disk_size, .{});
         defer base.close(io);
-        try image_mod.copyAll(io, raw, &base, std.testing.allocator);
+        _ = try image_mod.copyAll(io, raw, &base, std.testing.allocator);
     }
     {
         var overlay = try Image.createExclusive(io, source_path, .qcow2, test_disk_size, .{});
@@ -4441,7 +4441,7 @@ test "preserved editor publishes standalone qcow2 and cleans failed staging" {
         defer raw.close(io);
         var qcow = try Image.createExclusive(io, base_path, .qcow2, test_disk_size, .{});
         defer qcow.close(io);
-        try image_mod.copyAll(io, raw, &qcow, std.testing.allocator);
+        _ = try image_mod.copyAll(io, raw, &qcow, std.testing.allocator);
     }
     {
         var overlay = try Image.createExclusive(io, source_path, .qcow2, test_disk_size, .{});

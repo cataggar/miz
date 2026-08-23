@@ -725,7 +725,7 @@ fn convertStaged(
     // plausible size, and fails somewhere the operator will not look.
     errdefer std.Io.Dir.cwd().deleteFile(io, request.destination.path) catch {};
     defer destination.close(io);
-    try vmiz.copyAll(io, staged, &destination, gpa);
+    _ = try vmiz.copyAll(io, staged, &destination, gpa);
 }
 
 /// Reads through the image's guest-visible address space rather than the host
