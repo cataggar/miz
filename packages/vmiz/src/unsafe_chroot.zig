@@ -3258,6 +3258,17 @@ fn writeBytes(io: Io, path: []const u8, bytes: []const u8) !void {
     try file.writePositionalAll(io, bytes, 0);
 }
 
+fn temporaryTestPath(
+    allocator: Allocator,
+    io: Io,
+    temporary: *std.testing.TmpDir,
+    sub_path: []const u8,
+) ![]const u8 {
+    var root_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    return std.fs.path.join(allocator, &.{ root_buffer[0..root_length], sub_path });
+}
+
 const default_repository_permissions: Io.File.Permissions = .default_file;
 /// umask can only clear bits, so this is 0o600 or narrower however the caller's
 /// process is configured. It can never come out more permissive.
@@ -3836,8 +3847,11 @@ test "worker policy accepts updates and still refuses an unnamed selective updat
 
 test "worker status distinguishes startup cleanup and operation outcomes" {
     const io = std.testing.io;
-    const status_path = "test-unsafe-chroot.status";
-    defer Io.Dir.cwd().deleteFile(io, status_path) catch {};
+    const allocator = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const status_path = try temporaryTestPath(allocator, io, &temporary, "status");
+    defer allocator.free(status_path);
     try std.testing.expectEqual(
         WorkerOutcome.never_started,
         classifyWorkerOutcome(io, status_path, .{ .exited = 1 }),
@@ -3879,10 +3893,10 @@ test "worker executes policy with strict reverse cleanup" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root_path = "test-unsafe-chroot-root";
-    const raw_path = "test-unsafe-chroot-stage.raw";
-    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+    const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
     const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
         .exclusive = true,
         .read = true,
@@ -4264,10 +4278,10 @@ test "the root mount is spelled with the manifest's declared filesystem, not a h
     };
     for (cases) |case| {
         errdefer std.debug.print("case: {s}\n", .{case.why});
-        const root_path = "test-unsafe-chroot-root-filesystem-root";
-        const raw_path = "test-unsafe-chroot-root-filesystem-stage.raw";
-        defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
-        defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+        const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
         const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
             .exclusive = true,
             .read = true,
@@ -4325,10 +4339,10 @@ test "hooks run where the plan says they run, and stop existing when they are do
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root_path = "test-unsafe-chroot-hook-order-root";
-    const raw_path = "test-unsafe-chroot-hook-order-stage.raw";
-    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+    const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
     const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
         .exclusive = true,
         .read = true,
@@ -4474,10 +4488,10 @@ test "a hook that fails fails the run" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root_path = "test-unsafe-chroot-hook-failure-root";
-    const raw_path = "test-unsafe-chroot-hook-failure-stage.raw";
-    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+    const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
     const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
         .exclusive = true,
         .read = true,
@@ -4545,12 +4559,11 @@ test "a hook source is read on the host, not from inside the target" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root_path = "test-unsafe-chroot-hook-source-root";
-    const raw_path = "test-unsafe-chroot-hook-source-stage.raw";
-    const script_path = "test-unsafe-chroot-hook-source.sh";
-    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, script_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+    const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
+    const script_path = try temporaryTestPath(allocator, io, &temporary, "hook.sh");
     const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
         .exclusive = true,
         .read = true,
@@ -4724,12 +4737,11 @@ test "a credential reaches tdnf without reaching anything that outlives the run"
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root_path = "test-unsafe-chroot-credential-root";
-    const raw_path = "test-unsafe-chroot-credential-stage.raw";
-    const secret_path = "test-unsafe-chroot-credential-secret";
-    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, secret_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+    const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
+    const secret_path = try temporaryTestPath(allocator, io, &temporary, "secret");
     const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
         .exclusive = true,
         .read = true,
@@ -4744,12 +4756,7 @@ test "a credential reaches tdnf without reaching anything that outlives the run"
         .sub_path = secret_path,
         .data = "s3cr3t-from-a-file\n",
     });
-    var cwd_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd_length = try std.process.currentPath(io, &cwd_buffer);
-    const absolute_secret = try std.fs.path.join(
-        allocator,
-        &.{ cwd_buffer[0..cwd_length], secret_path },
-    );
+    const absolute_secret = secret_path;
 
     const repositories = [_]customize.PackageRepository{.{
         .id = "base",
@@ -4826,12 +4833,11 @@ test "no credential material reaches anything the run publishes" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root_path = "test-unsafe-chroot-sentinel-root";
-    const raw_path = "test-unsafe-chroot-sentinel-stage.raw";
-    const secret_path = "test-unsafe-chroot-sentinel-secret";
-    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, secret_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+    const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
+    const secret_path = try temporaryTestPath(allocator, io, &temporary, "secret");
     const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
         .exclusive = true,
         .read = true,
@@ -4848,12 +4854,7 @@ test "no credential material reaches anything the run publishes" {
         .sub_path = secret_path,
         .data = file_material ++ "\n",
     });
-    var cwd_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd_length = try std.process.currentPath(io, &cwd_buffer);
-    const absolute_secret = try std.fs.path.join(
-        allocator,
-        &.{ cwd_buffer[0..cwd_length], secret_path },
-    );
+    const absolute_secret = secret_path;
 
     const repositories = [_]customize.PackageRepository{
         .{
@@ -4970,8 +4971,14 @@ test "nothing the worker runs inherits the worker's environment" {
 
     const env_tool = findTool(std.testing.io, &.{ "/usr/bin/env", "/bin/env" }) orelse
         return error.SkipZigTest;
-    const stdin_path = "test-unsafe-chroot-environment-stdin";
-    defer Io.Dir.cwd().deleteFile(std.testing.io, stdin_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const stdin_path = try temporaryTestPath(
+        allocator,
+        std.testing.io,
+        &temporary,
+        "stdin",
+    );
     try Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = stdin_path, .data = "" });
 
     // Both branches that can be observed: `runSystem` spawns three different
@@ -5251,10 +5258,10 @@ test "the key rpm derived from imported trust is recorded, and never pinned" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root_path = "test-unsafe-chroot-trust-key-root";
-    const raw_path = "test-unsafe-chroot-trust-key-stage.raw";
-    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+    const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
     const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
         .exclusive = true,
         .read = true,
@@ -5341,10 +5348,10 @@ test "worker separates a generator it cannot drive from a target that lacks one"
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root_path = "test-unsafe-chroot-generator-root";
-    const raw_path = "test-unsafe-chroot-generator-stage.raw";
-    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+    const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
     const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
         .exclusive = true,
         .read = true,
@@ -5441,10 +5448,10 @@ test "worker regenerates every installed kernel when the policy names none" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root_path = "test-unsafe-chroot-discovery-root";
-    const raw_path = "test-unsafe-chroot-discovery-stage.raw";
-    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+    const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
     const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
         .exclusive = true,
         .read = true,
@@ -5603,8 +5610,12 @@ test "worker regenerates every installed kernel when the policy names none" {
     // behind, and writing the file over it would fail in the fake's setup
     // rather than in discovery -- the test would pass without proving
     // anything.
-    const unreadable_root = "test-unsafe-chroot-unreadable-modules-root";
-    defer Io.Dir.cwd().deleteTree(io, unreadable_root) catch {};
+    const unreadable_root = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "unreadable-root",
+    );
     var unreadable_manifest = derived_manifest;
     unreadable_manifest.root_path = unreadable_root;
     var unreadable_context = FakeExecutorContext{
@@ -5626,8 +5637,12 @@ test "worker regenerates every installed kernel when the policy names none" {
     // searched is not evidence that the kernel inside it has no modules. If
     // the probe skipped it the set would come up empty, and an empty set is
     // exactly what `nothing_to_regenerate` accepts.
-    const locked_root = "test-unsafe-chroot-locked-release-root";
-    defer Io.Dir.cwd().deleteTree(io, locked_root) catch {};
+    const locked_root = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "locked-root",
+    );
     var locked_manifest = derived_manifest;
     locked_manifest.root_path = locked_root;
     var locked_context = FakeExecutorContext{
@@ -5659,10 +5674,10 @@ test "worker places kernel-module configuration after packages and before dracut
     // inherited one.
     const previous_umask = std.os.linux.syscall1(.umask, 0);
     defer _ = std.os.linux.syscall1(.umask, previous_umask);
-    const root_path = "test-unsafe-chroot-modules-root";
-    const raw_path = "test-unsafe-chroot-modules-stage.raw";
-    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+    const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
     const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
         .exclusive = true,
         .read = true,
@@ -5749,10 +5764,10 @@ test "worker refuses a target root outside the package family it can drive" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root_path = "test-unsafe-chroot-family-root";
-    const raw_path = "test-unsafe-chroot-family-stage.raw";
-    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+    const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
     const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
         .exclusive = true,
         .read = true,
@@ -5842,10 +5857,11 @@ test "worker installs the declared resolver and none without package actions" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root_path = "test-unsafe-chroot-resolver-root";
-    const raw_path = "test-unsafe-chroot-resolver-stage.raw";
-    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+    const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
+    const resolver_path = try joinGuest(allocator, root_path, "/run/vmiz-resolv.conf");
     const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
         .exclusive = true,
         .read = true,
@@ -5905,7 +5921,7 @@ test "worker installs the declared resolver and none without package actions" {
     );
     try std.testing.expect(!containsArg(
         declared_context.unmounts.items,
-        root_path ++ "/run/vmiz-resolv.conf",
+        resolver_path,
     ));
 
     var idle = declared;
@@ -5927,7 +5943,7 @@ test "worker installs the declared resolver and none without package actions" {
     try std.testing.expectEqual(@as(usize, 5), idle_context.unmounts.items.len);
     try std.testing.expect(!containsArg(
         idle_context.unmounts.items,
-        root_path ++ "/run/vmiz-resolv.conf",
+        resolver_path,
     ));
 
     // A manifest the worker will not honour is refused before it creates,
@@ -5936,8 +5952,12 @@ test "worker installs the declared resolver and none without package actions" {
     // policy is *run* would arrive after the bytes it guards had been placed --
     // and an untouched root path is the only assertion that cannot pass by
     // accident, since every later refusal leaves one behind.
-    const refused_root = "test-unsafe-chroot-resolver-refused-root";
-    defer Io.Dir.cwd().deleteTree(io, refused_root) catch {};
+    const refused_root = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "refused-root",
+    );
     var refused = declared;
     refused.root_path = refused_root;
     refused.packages.resolver = .{ .nameservers = &.{"127.0.0.53"} };
@@ -6697,10 +6717,10 @@ test "a relabel runs last, with the policy the target names" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root_path = "test-unsafe-chroot-relabel-root";
-    const raw_path = "test-unsafe-chroot-relabel-stage.raw";
-    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+    const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
     const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
         .exclusive = true,
         .read = true,
@@ -6819,10 +6839,10 @@ test "a relabel records the mode the target will boot under" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root_path = "test-unsafe-chroot-permissive-root";
-    const raw_path = "test-unsafe-chroot-permissive-stage.raw";
-    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+    const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
     const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
         .exclusive = true,
         .read = true,
@@ -6896,30 +6916,18 @@ test "a relabel a target cannot satisfy fails the run rather than skipping it" {
 
     const cases = [_]struct {
         layout: FakeSelinuxLayout,
-        root: []const u8,
-        raw: []const u8,
     }{
-        .{
-            .layout = .none,
-            .root = "test-unsafe-chroot-relabel-none-root",
-            .raw = "test-unsafe-chroot-relabel-none-stage.raw",
-        },
-        .{
-            .layout = .no_policy_named,
-            .root = "test-unsafe-chroot-relabel-unnamed-root",
-            .raw = "test-unsafe-chroot-relabel-unnamed-stage.raw",
-        },
-        .{
-            .layout = .missing_contexts,
-            .root = "test-unsafe-chroot-relabel-contexts-root",
-            .raw = "test-unsafe-chroot-relabel-contexts-stage.raw",
-        },
+        .{ .layout = .none },
+        .{ .layout = .no_policy_named },
+        .{ .layout = .missing_contexts },
     };
 
     for (cases) |case| {
-        defer Io.Dir.cwd().deleteTree(io, case.root) catch {};
-        defer Io.Dir.cwd().deleteFile(io, case.raw) catch {};
-        const raw_file = try Io.Dir.cwd().createFile(io, case.raw, .{
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+        const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
+        const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
             .exclusive = true,
             .read = true,
         });
@@ -6928,8 +6936,8 @@ test "a relabel a target cannot satisfy fails the run rather than skipping it" {
         raw_file.close(io);
 
         const manifest = Manifest{
-            .raw_path = case.raw,
-            .root_path = case.root,
+            .raw_path = raw_path,
+            .root_path = root_path,
             .status_path = "unused.status",
             .report_path = "unused-report.json",
             .stage_inode = raw_inode,
@@ -6943,7 +6951,7 @@ test "a relabel a target cannot satisfy fails the run rather than skipping it" {
         var context = FakeExecutorContext{
             .allocator = allocator,
             .io = io,
-            .root_path = case.root,
+            .root_path = root_path,
             .unmounts = .init(allocator),
             .timeline = .init(allocator),
             .plant_selinux = case.layout,
@@ -7032,24 +7040,16 @@ test "a configuration change decides the relabel from what the target already is
         },
     };
 
-    for (cases, 0..) |case, index| {
+    for (cases) |case| {
         errdefer std.debug.print("case: {s}\n", .{case.why});
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena_state.deinit();
         const allocator = arena_state.allocator();
         const io = std.testing.io;
-        const root_path = try std.fmt.allocPrint(
-            allocator,
-            "test-unsafe-chroot-configure-{d}-root",
-            .{index},
-        );
-        const raw_path = try std.fmt.allocPrint(
-            allocator,
-            "test-unsafe-chroot-configure-{d}-stage.raw",
-            .{index},
-        );
-        defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
-        defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        const root_path = try temporaryTestPath(allocator, io, &temporary, "root");
+        const raw_path = try temporaryTestPath(allocator, io, &temporary, "stage.raw");
         const raw_file = try Io.Dir.cwd().createFile(io, raw_path, .{
             .exclusive = true,
             .read = true,
