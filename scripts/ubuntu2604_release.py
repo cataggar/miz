@@ -95,6 +95,11 @@ CORE_AZURE_CONTRACTS = {
     "no-cloud-init",
     "no-walinuxagent",
     "no-systemd-service-manager",
+    "binder-module-signed",
+    "no-dkms-binder-module",
+    "no-anbox-evidence",
+    "binderfs-mounted",
+    "binder-devices-usable",
 }
 AZURE_CONTRACTS = FULL_AZURE_CONTRACTS
 FULL_NATIVE_CONTRACTS = {

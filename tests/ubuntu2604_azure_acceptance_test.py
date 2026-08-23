@@ -234,6 +234,74 @@ else:
         self.assertIn("cloud-init status --wait", full)
         self.assertIn("walinuxagent.service", full)
 
+    def test_binder_probe_is_required_only_for_core_flavor(self) -> None:
+        harness = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            'if [[ "$FLAVOR" == core ]]; then\n'
+            "  if [[ -z ${BINDER_PROBE:-} ]]; then\n"
+            "    echo \"::error::Core Azure acceptance requires a Binder "
+            'device probe binary"',
+            harness,
+        )
+        self.assertIn('[[ -x "$BINDER_PROBE" ]]', harness)
+        self.assertIn("base64", harness)
+
+    def test_core_binder_module_trust_checks_reject_dkms_and_anbox_evidence(
+        self,
+    ) -> None:
+        harness = SCRIPT.read_text(encoding="utf-8")
+        module_block = harness.split(
+            'if [[ "$flavor" == core ]]; then\n  module_info=', 1
+        )[1].split("\nfi\nGUEST", 1)[0]
+        self.assertIn("/usr/sbin/modinfo binder_linux", module_block)
+        self.assertIn("/lib/modules/*/kernel/*", module_block)
+        self.assertIn("*/updates/dkms/*", module_block)
+        self.assertIn('test -n "$module_signer"', module_block)
+        self.assertIn('test "$module_sig_id" = "PKCS#7"', module_block)
+        self.assertIn("grep -iq anbox", module_block)
+        self.assertIn("dkms status", module_block)
+        self.assertIn("/sys/module/binder_linux/taint", module_block)
+        self.assertIn('test -z "$module_taint"', module_block)
+        self.assertIn(
+            "binder_linux:.*(verification failed|taint)", module_block
+        )
+
+    def test_core_binderfs_and_device_usability_are_probed(self) -> None:
+        harness = SCRIPT.read_text(encoding="utf-8")
+        binder_section = harness.split(
+            'if [[ "$FLAVOR" == core ]]; then\n  binder_probe_remote=', 1
+        )[1].split("\nfi\n\nif", 1)[0]
+        self.assertIn("binder_probe_sha256=$(sha256sum", binder_section)
+        self.assertIn("base64 -w0 \"$BINDER_PROBE\"", binder_section)
+        self.assertIn("binder_probe_remote_sha256", binder_section)
+        self.assertIn(
+            'test "$binder_probe_remote_sha256" = "$binder_probe_sha256"',
+            binder_section,
+        )
+        self.assertIn('binderfs_mount=/dev/binderfs', binder_section)
+        self.assertIn(
+            'test "$(findmnt -n -o FSTYPE "$binderfs_mount")" = binder',
+            binder_section,
+        )
+        self.assertIn('test -c "$binderfs_mount/binder-control"', binder_section)
+        for device in ("binder", "hwbinder", "vndbinder"):
+            self.assertIn(device, binder_section)
+        self.assertIn('sudo -n "$probe" version', binder_section)
+        self.assertIn(
+            'sudo -n "$probe" alloc "$binderfs_mount/binder-control"',
+            binder_section,
+        )
+        self.assertIn("vmiz-acceptance-probe", binder_section)
+
+    def test_binder_probe_binary_exists_and_targets_public_uapi_constants(
+        self,
+    ) -> None:
+        probe = (ROOT / "tests" / "binder_probe.zig").read_text(encoding="utf-8")
+        self.assertIn("const BINDER_VERSION: u32 = 0xc0046209;", probe)
+        self.assertIn("const BINDER_CTL_ADD: u32 = 0xc1086201;", probe)
+        self.assertIn("protocol_version", probe)
+        self.assertNotIn("anbox", probe.lower())
+
     def test_cleanup_requires_exact_ownership_tags(self) -> None:
         env = self.environment()
         tags = {

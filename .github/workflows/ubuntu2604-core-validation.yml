@@ -607,6 +607,7 @@ jobs:
       STATE_FILE: .validation/azure/${{ matrix.key }}/resource-group
       AZURE_LOCATION: ${{ vars[matrix.location_variable] }}
       AZURE_VM_SIZE: ${{ vars[matrix.size_variable] }}
+      BINDER_PROBE: ${{ github.workspace }}/zig-out/bin/binder-probe-${{ matrix.key }}
     steps:
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -671,6 +672,20 @@ jobs:
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           zig build -Doptimize=ReleaseSafe
           test -x zig-out/bin/vmiz
+
+      - name: Build Binder device usability probe
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build-exe \
+            -target "$ARCHITECTURE-linux" \
+            -O ReleaseSmall \
+            -static \
+            tests/binder_probe.zig \
+            -femit-bin="$BINDER_PROBE" \
+            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          test -x "$BINDER_PROBE"
 
       - name: Run exact-digest Azure Trusted Launch core acceptance
         env:
