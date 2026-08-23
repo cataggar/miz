@@ -126,6 +126,27 @@ class Ubuntu2604CoreWorkflowTests(unittest.TestCase):
         self.assertIn("FLAVOR: core", azure)
         self.assertIn("ubuntu2604_azure_acceptance.sh run", azure)
 
+    def test_binder_probe_is_built_for_the_matching_guest_architecture(self) -> None:
+        azure = self.job("azure_acceptance", "validate")
+        self.assertIn(
+            "BINDER_PROBE: ${{ github.workspace }}/zig-out/bin/binder-probe-${{ matrix.key }}",
+            azure,
+        )
+        self.assertIn("- name: Build Binder device usability probe", azure)
+        build_probe = azure.split(
+            "- name: Build Binder device usability probe", 1
+        )[1].split("- name: Run exact-digest", 1)[0]
+        self.assertIn('-target "$ARCHITECTURE-linux"', build_probe)
+        self.assertIn("-static", build_probe)
+        self.assertIn("tests/binder_probe.zig", build_probe)
+        self.assertIn('-femit-bin="$BINDER_PROBE"', build_probe)
+        self.assertIn('test -x "$BINDER_PROBE"', build_probe)
+        # The probe must be built before it is required by acceptance.
+        self.assertLess(
+            azure.index("Build Binder device usability probe"),
+            azure.index("Run exact-digest Azure Trusted Launch core acceptance"),
+        )
+
     def test_core_size_contract_is_aligned_across_builder_and_acceptance(self) -> None:
         builder = (
             ROOT / "scripts" / "build_generalized_ubuntu2604.zig"

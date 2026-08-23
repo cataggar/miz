@@ -759,6 +759,11 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                 "no-cloud-init",
                 "no-walinuxagent",
                 "no-systemd-service-manager",
+                "binder-module-signed",
+                "no-dkms-binder-module",
+                "no-anbox-evidence",
+                "binderfs-mounted",
+                "binder-devices-usable",
             },
         )
 

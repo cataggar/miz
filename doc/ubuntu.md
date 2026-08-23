@@ -519,6 +519,18 @@ satisfy them, and they assume the boot-time module autoload, binderfs mount,
 and device creation are provided by the image itself; wiring that into the
 core image build is left to a companion change.
 
+Core Azure acceptance additionally verifies the official in-tree Binder IPC
+module (`binder_linux`) under Secure Boot and lockdown: it must load from
+under `/lib/modules`, never from a DKMS/out-of-tree path, carry a non-empty
+`PKCS#7` signer, and be untainted, with no Anbox-style evidence anywhere in
+module metadata, loaded-module state, `dkms status`, or the boot log.
+Acceptance then asserts binderfs is mounted and that `binder-control`,
+`binder`, `hwbinder`, and `vndbinder` exist as dynamic character devices, and
+proves real device usability by transferring a small static probe binary
+(`tests/binder_probe.zig`, matched to the candidate's own architecture) over
+SSH, verifying its checksum, and using it to query the fixed devices and
+allocate and query a new dynamic Binder device through `binder-control`.
+
 ## Core validation workflow
 
 `.github/workflows/ubuntu2604-core-validation.yml` is a separate manually
@@ -532,6 +544,10 @@ requires both native-QEMU jobs and both Azure Trusted Launch jobs. Candidate
 reuse accepts only a completed manual run of this same workflow at the exact
 current remote `main` commit and exact run attempt, with both named build jobs
 successful and exactly two nonempty, unexpired candidate artifacts.
+
+The core Azure acceptance jobs also build the Binder device usability probe
+from source for the matching guest architecture before running acceptance,
+so no prebuilt probe binary is stored or published.
 
 Candidates, native results, Azure results, and a final digest-bound
 two-architecture validation manifest are uploaded only as workflow artifacts.

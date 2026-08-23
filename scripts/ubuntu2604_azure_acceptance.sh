@@ -106,6 +106,16 @@ fi
 [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
 [[ -x "$VMIZ" ]]
 [[ -r "$RELEASE_SCHEMA" ]]
+if [[ "$FLAVOR" == core ]]; then
+  if [[ -z ${BINDER_PROBE:-} ]]; then
+    echo "::error::Core Azure acceptance requires a Binder device probe binary"
+    exit 1
+  fi
+  [[ -x "$BINDER_PROBE" ]] || {
+    echo "::error::Binder device probe binary is not executable"
+    exit 1
+  }
+fi
 
 report_error() {
   local status=$1 line=$2 command=$3
@@ -115,7 +125,7 @@ report_error() {
 }
 trap 'report_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
-for tool in az azcopy curl python3 qemu-img sha256sum ssh ssh-keygen; do
+for tool in az azcopy base64 curl python3 qemu-img sha256sum ssh ssh-keygen; do
   command -v "$tool" >/dev/null || {
     echo "::error::Required Azure acceptance tool $tool is unavailable"
     exit 1
@@ -879,7 +889,92 @@ dmesg_output=$(sudo -n /usr/bin/dmesg) || exit 1
 if printf '%s\n' "$dmesg_output" | grep -Eiq 'module verification failed|Loading of unsigned module|Lockdown:.*unsigned'; then
   exit 1
 fi
+if [[ "$flavor" == core ]]; then
+  module_info=$(/usr/sbin/modinfo binder_linux)
+  module_filename=$(printf '%s\n' "$module_info" | awk -F': +' '/^filename:/{print $2; exit}')
+  module_signer=$(printf '%s\n' "$module_info" | awk -F': +' '/^signer:/{print $2; exit}')
+  module_sig_id=$(printf '%s\n' "$module_info" | awk -F': +' '/^sig_id:/{print $2; exit}')
+  # Official in-tree module only: reject a DKMS/out-of-tree build path.
+  case "$module_filename" in
+    /lib/modules/*/kernel/*) ;;
+    *) exit 1 ;;
+  esac
+  case "$module_filename" in
+    */updates/dkms/*) exit 1 ;;
+  esac
+  test -n "$module_signer"
+  test "$module_sig_id" = "PKCS#7"
+  if printf '%s\n' "$module_info" | grep -iq anbox; then
+    exit 1
+  fi
+  if command -v dkms >/dev/null 2>&1 && /usr/sbin/dkms status | grep -Eq '.'; then
+    exit 1
+  fi
+  if grep -iq anbox /proc/modules; then
+    exit 1
+  fi
+  # An untainted module is neither out-of-tree (O) nor unsigned (E), among
+  # other kernel-integrity flags; the official signed driver carries none.
+  module_taint=$(cat /sys/module/binder_linux/taint 2>/dev/null || true)
+  test -z "$module_taint"
+  if printf '%s\n' "$dmesg_output" |
+      grep -Eiq 'anbox|binder_linux:.*(verification failed|taint)'; then
+    exit 1
+  fi
+fi
 GUEST
+
+if [[ "$FLAVOR" == core ]]; then
+  binder_probe_remote=/home/vmiztest/.vmiz-binder-probe
+  binder_probe_sha256=$(sha256sum "$BINDER_PROBE" | awk '{print $1}')
+  base64 -w0 "$BINDER_PROBE" | ssh "${ssh_options[@]}" "$ssh_target" \
+    "/usr/bin/bash -s -- '$binder_probe_remote'" <<'GUEST'
+set -euo pipefail
+remote=$1
+rm -f -- "$remote"
+umask 077
+base64 -d >"$remote"
+chmod 0700 "$remote"
+GUEST
+  binder_probe_remote_sha256=$(
+    ssh "${ssh_options[@]}" "$ssh_target" "sha256sum '$binder_probe_remote'" |
+      awk '{print $1}'
+  )
+  test "$binder_probe_remote_sha256" = "$binder_probe_sha256"
+
+  ssh "${ssh_options[@]}" "$ssh_target" \
+    "/usr/bin/bash -s -- '$binder_probe_remote'" <<'GUEST'
+set -Eeuo pipefail
+guest_error() {
+  status=$1
+  trap - ERR
+  printf 'guest acceptance failed at line %s: %s\n' "$2" "$3" >&2
+  exit "$status"
+}
+trap 'guest_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
+probe=$1
+
+# binderfs must be the real dynamic Android IPC filesystem, not a fixed set
+# of legacy static device nodes.
+binderfs_mount=/dev/binderfs
+test -d "$binderfs_mount"
+test "$(findmnt -n -o FSTYPE "$binderfs_mount")" = binder
+test -c "$binderfs_mount/binder-control"
+for device in binder hwbinder vndbinder; do
+  test -c "$binderfs_mount/$device"
+done
+
+# A real, driver-backed BINDER_VERSION ioctl on each fixed device, and a
+# real BINDER_CTL_ADD dynamic allocation through binder-control.
+sudo -n /usr/bin/chmod 0755 "$probe"
+for device in binder hwbinder vndbinder; do
+  sudo -n "$probe" version "$binderfs_mount/$device"
+done
+sudo -n "$probe" alloc "$binderfs_mount/binder-control" vmiz-acceptance-probe
+sudo -n "$probe" version "$binderfs_mount/vmiz-acceptance-probe"
+sudo -n /usr/bin/rm -f -- "$binderfs_mount/vmiz-acceptance-probe" "$probe"
+GUEST
+fi
 
 if [[ "$FLAVOR" == core ]]; then
   readarray -t core_identity < <(
@@ -1167,6 +1262,7 @@ if [[ -s "$boot_log" ]]; then
   if [[ "$FLAVOR" == core ]]; then
     grep -Fq '[vmizinit] VMIZINIT_PID1_READY supervisor loop active' "$boot_log"
     grep -Fq '[vmizinit] azagent completed successfully' "$boot_log"
+    ! grep -Eiq 'anbox|binder_linux:.*(verification failed|taint)' "$boot_log"
   fi
   if [[ "$ARCHITECTURE" == aarch64 ]]; then
     grep -Fq 'ttyAMA0' "$boot_log"
@@ -1212,5 +1308,8 @@ test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
   echo "- Signing certificate SHA-256: \`$certificate_sha256\`"
   echo "- Azure: \`$AZURE_LOCATION\` / \`$AZURE_VM_SIZE\`"
   echo "- Flavor: \`$FLAVOR\`"
+  if [[ "$FLAVOR" == core ]]; then
+    echo "- Binder device probe SHA-256: \`$binder_probe_sha256\`"
+  fi
   echo "- Contracts: \`$azure_contract_list\`"
 } >>"$GITHUB_STEP_SUMMARY"
