@@ -1143,6 +1143,75 @@ test "growLastPartition extends the last partition and relocates the backup head
     try std.testing.expectEqual(grown_last_usable_lba, backup_header.last_usable_lba);
 }
 
+test "sparse multi-terabyte GPT growth uses 64-bit offsets and validates both copies" {
+    const io = std.testing.io;
+    const path = "test-gpt-grow-sparse-multiterabyte.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const initial_size: u64 = 64 * 1024 * 1024;
+    const grown_size: u64 = 4 * 1024 * 1024 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, initial_size, .{});
+    defer img.close(io);
+
+    const total_sectors = initial_size / sector_size;
+    const first_usable_lba: u64 = 2 + partition_array_sectors;
+    const initial_last_usable_lba = total_sectors - 2 - partition_array_sectors;
+    const specs = [_]PartitionSpec{.{
+        .type_guid = guid.linux_filesystem_data,
+        .unique_guid = guid.parse("44444444-4444-4444-4444-444444444444"),
+        .size_sectors = initial_last_usable_lba - first_usable_lba + 1,
+        .name_utf16le = asciiName("root"),
+    }};
+    var placements: [specs.len]Placement = undefined;
+    const disk_guid = guid.parse("55555555-5555-5555-5555-555555555555");
+    try writeGpt(&img, io, disk_guid, &specs, &placements);
+    const old_backup_lba = total_sectors - 1;
+
+    // setLength creates a sparse logical disk; only the GPT sectors at the
+    // beginning and end are written during this test.
+    try img.resize(io, grown_size);
+    try std.testing.expectEqual(grown_size, (try img.file.stat(io)).size);
+
+    const before = try readGpt(img, io, std.testing.allocator);
+    defer std.testing.allocator.free(before.partitions);
+    try growLastPartition(&img, io, disk_guid, before.partitions);
+
+    var after = try readVerifiedGpt(
+        img,
+        io,
+        std.testing.allocator,
+        1024 * 1024,
+    );
+    defer after.deinit(std.testing.allocator);
+
+    const grown_total_sectors = grown_size / sector_size;
+    const new_backup_lba = grown_total_sectors - 1;
+    const grown_last_usable_lba =
+        grown_total_sectors - 2 - partition_array_sectors;
+    try std.testing.expect(new_backup_lba > std.math.maxInt(u32));
+    try std.testing.expect(new_backup_lba > old_backup_lba);
+    try std.testing.expectEqual(new_backup_lba, after.primary_header.backup_lba);
+    try std.testing.expectEqual(new_backup_lba, after.backup_header.current_lba);
+    try std.testing.expectEqual(@as(u64, 1), after.backup_header.backup_lba);
+    try std.testing.expectEqual(@as(usize, 1), after.partitions.len);
+    try std.testing.expectEqual(grown_last_usable_lba, after.partitions[0].last_lba);
+    try std.testing.expectEqual(
+        std.hash.crc.Crc32.hash(after.partition_array),
+        after.primary_header.partition_array_crc32,
+    );
+    try std.testing.expectEqual(
+        after.primary_header.partition_array_crc32,
+        after.backup_header.partition_array_crc32,
+    );
+
+    const retry = try readGpt(img, io, std.testing.allocator);
+    defer std.testing.allocator.free(retry.partitions);
+    try std.testing.expectError(
+        error.NotEnoughSpace,
+        growLastPartition(&img, io, disk_guid, retry.partitions),
+    );
+}
+
 test "growLastPartition rejects a disk that hasn't actually grown" {
     const io = std.testing.io;
     const path = "test-gpt-grow-noop.img";

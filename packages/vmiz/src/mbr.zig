@@ -137,7 +137,7 @@ pub fn protectiveMbr(disk_total_sectors: u64) Mbr {
         .bootable = false,
         .start_chs = chsForLba(1),
         .partition_type = .gpt_protective,
-        .end_chs = chsForLba(1 + size_sectors - 1),
+        .end_chs = chsForLba(size_sectors),
         .first_lba = 1,
         .sector_count = size_sectors,
     };
@@ -236,6 +236,12 @@ test "protectiveMbr encode/decode round-trip" {
     try std.testing.expectEqual(@as(u32, 1), decoded.entries[0].first_lba);
     try std.testing.expectEqual(@as(u32, total_sectors - 1), decoded.entries[0].sector_count);
     try std.testing.expectEqual(PartitionType.empty, decoded.entries[1].partition_type);
+}
+
+test "protectiveMbr saturates safely for multi-terabyte disks" {
+    const mbr = protectiveMbr(8 * 1024 * 1024 * 1024);
+    try std.testing.expectEqual(std.math.maxInt(u32), mbr.entries[0].sector_count);
+    try std.testing.expectEqual([_]u8{ 0xFE, 0xFF, 0xFF }, mbr.entries[0].end_chs);
 }
 
 test "singleLinuxPartitionMbr encode/decode round-trip" {

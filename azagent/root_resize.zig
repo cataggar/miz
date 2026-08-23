@@ -50,20 +50,36 @@ pub const RootDevice = struct {
     /// partition table entry about to be grown really is the mounted
     /// root, not just assumed from table position.
     partition_number: u32,
+    /// Owned. Filesystem type reported for `/` by `/proc/mounts`.
+    filesystem_type: []u8,
+
+    pub fn deinit(self: RootDevice, allocator: Allocator) void {
+        allocator.free(self.disk_name);
+        allocator.free(self.partition_name);
+        allocator.free(self.filesystem_type);
+    }
 };
 
-/// Pure parser: finds the device-path field (first whitespace-separated
-/// column) of the `/proc/mounts` line whose mount point (second column) is
-/// exactly `/`, and returns its basename (e.g. `/dev/sda2` -> `sda2`,
-/// `/dev/nvme0n1p2` -> `nvme0n1p2`). Borrows from `content`.
-fn rootPartitionNameFromMounts(content: []const u8) error{RootMountNotFound}![]const u8 {
+const RootMount = struct {
+    partition_name: []const u8,
+    filesystem_type: []const u8,
+};
+
+/// Pure parser: finds the `/proc/mounts` line whose mount point is exactly
+/// `/`, returning the device basename and filesystem type. Borrows from
+/// `content`.
+fn rootMountFromMounts(content: []const u8) error{RootMountNotFound}!RootMount {
     var lines = std.mem.tokenizeScalar(u8, content, '\n');
     while (lines.next()) |line| {
         var fields = std.mem.tokenizeScalar(u8, line, ' ');
         const device = fields.next() orelse continue;
         const mount_point = fields.next() orelse continue;
+        const filesystem_type = fields.next() orelse continue;
         if (std.mem.eql(u8, mount_point, "/")) {
-            return std.fs.path.basename(device);
+            return .{
+                .partition_name = std.fs.path.basename(device),
+                .filesystem_type = filesystem_type,
+            };
         }
     }
     return error.RootMountNotFound;
@@ -80,7 +96,8 @@ fn rootPartitionNameFromMounts(content: []const u8) error{RootMountNotFound}![]c
 /// robust across `sdXN`/`vdXN`/`nvme0n1pN`/`mmcblk0pN` naming schemes
 /// without hand-parsing the partition name itself.
 pub fn findRootDevice(allocator: Allocator, io: std.Io, proc_mounts_content: []const u8, class_block_dir: std.Io.Dir) !RootDevice {
-    const partition_name = try rootPartitionNameFromMounts(proc_mounts_content);
+    const root_mount = try rootMountFromMounts(proc_mounts_content);
+    const partition_name = root_mount.partition_name;
 
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
     const link_len = try class_block_dir.readLink(io, partition_name, &link_buf);
@@ -94,10 +111,17 @@ pub fn findRootDevice(allocator: Allocator, io: std.Io, proc_mounts_content: []c
     defer allocator.free(partition_number_content);
     const partition_number = try std.fmt.parseInt(u32, std.mem.trim(u8, partition_number_content, " \t\r\n"), 10);
 
+    const owned_disk_name = try allocator.dupe(u8, disk_name);
+    errdefer allocator.free(owned_disk_name);
+    const owned_partition_name = try allocator.dupe(u8, partition_name);
+    errdefer allocator.free(owned_partition_name);
+    const owned_filesystem_type = try allocator.dupe(u8, root_mount.filesystem_type);
+
     return .{
-        .disk_name = try allocator.dupe(u8, disk_name),
-        .partition_name = try allocator.dupe(u8, partition_name),
+        .disk_name = owned_disk_name,
+        .partition_name = owned_partition_name,
         .partition_number = partition_number,
+        .filesystem_type = owned_filesystem_type,
     };
 }
 
@@ -285,6 +309,12 @@ fn updateKernelPartition(
 /// directly.
 const ext4_ioc_resize_fs: u32 = 0x40086610;
 
+fn ensureSupportedRootFilesystem(filesystem_type: []const u8) !void {
+    if (!std.mem.eql(u8, filesystem_type, "ext4")) {
+        return error.UnsupportedRootFilesystem;
+    }
+}
+
 /// Issues `EXT4_IOC_RESIZE_FS` against the filesystem mounted at
 /// `mount_point_path` (always `"/"` for this module's use), asking the
 /// kernel to grow it live to `new_block_count` (4096-byte) blocks.
@@ -306,6 +336,8 @@ fn onlineResizeExt4(mount_point_path: [:0]const u8, new_block_count: u64) !void 
 /// `disk_file` must be an already-open, read-write handle to the *whole
 /// disk* device node (e.g. `/dev/sda`), not the partition node.
 fn growRoot(io: std.Io, allocator: Allocator, disk_file: std.Io.File, part_path: [:0]const u8, root: RootDevice) !void {
+    try ensureSupportedRootFilesystem(root.filesystem_type);
+
     const real_size = try resource_disk.blockDeviceSizeBytes(disk_file);
     var img = Image{ .file = disk_file, .format = .raw, .data_offset = 0, .virtual_size = real_size };
 
@@ -350,8 +382,7 @@ pub fn setup(options: SetupOptions) !void {
     defer options.allocator.free(mounts_content);
 
     const root = try findRootDevice(options.allocator, options.io, mounts_content, options.class_block_dir);
-    defer options.allocator.free(root.disk_name);
-    defer options.allocator.free(root.partition_name);
+    defer root.deinit(options.allocator);
 
     var disk_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const disk_path = try std.fmt.bufPrintZ(&disk_path_buf, "/dev/{s}", .{root.disk_name});
@@ -364,7 +395,7 @@ pub fn setup(options: SetupOptions) !void {
     try growRoot(options.io, options.allocator, disk_file, part_path, root);
 }
 
-test "rootPartitionNameFromMounts finds the device mounted at /" {
+test "rootMountFromMounts finds the ext4 device mounted at /" {
     const content =
         \\/dev/sda3 / ext4 rw,relatime 0 0
         \\devtmpfs /dev devtmpfs rw,nosuid,size=4096k,nr_inodes=4094394,mode=755 0 0
@@ -372,17 +403,29 @@ test "rootPartitionNameFromMounts finds the device mounted at /" {
         \\/dev/sda1 /boot/efi vfat rw,relatime 0 0
         \\
     ;
-    try std.testing.expectEqualStrings("sda3", try rootPartitionNameFromMounts(content));
+    const root_mount = try rootMountFromMounts(content);
+    try std.testing.expectEqualStrings("sda3", root_mount.partition_name);
+    try std.testing.expectEqualStrings("ext4", root_mount.filesystem_type);
 }
 
-test "rootPartitionNameFromMounts handles nvme-style partition names" {
+test "rootMountFromMounts handles nvme-style partition names" {
     const content = "/dev/nvme0n1p2 / ext4 rw,relatime 0 0\n";
-    try std.testing.expectEqualStrings("nvme0n1p2", try rootPartitionNameFromMounts(content));
+    const root_mount = try rootMountFromMounts(content);
+    try std.testing.expectEqualStrings("nvme0n1p2", root_mount.partition_name);
+    try std.testing.expectEqualStrings("ext4", root_mount.filesystem_type);
 }
 
-test "rootPartitionNameFromMounts returns an error when nothing is mounted at /" {
+test "rootMountFromMounts returns an error when nothing is mounted at /" {
     const content = "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n";
-    try std.testing.expectError(error.RootMountNotFound, rootPartitionNameFromMounts(content));
+    try std.testing.expectError(error.RootMountNotFound, rootMountFromMounts(content));
+}
+
+test "only ext4 root filesystems are accepted for online resize" {
+    try ensureSupportedRootFilesystem("ext4");
+    try std.testing.expectError(
+        error.UnsupportedRootFilesystem,
+        ensureSupportedRootFilesystem("xfs"),
+    );
 }
 
 test "growMbrRoot preserves BIOS bootstrap code and returns an extent on retry" {
@@ -411,6 +454,45 @@ test "growMbrRoot preserves BIOS bootstrap code and returns an extent on retry" 
     try std.testing.expectEqual(first_extent, retry_extent);
 }
 
+test "growGptRoot returns the final extent on first growth and retry" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "test-root-resize-gpt.img";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const initial_size: u64 = 64 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, initial_size, .{});
+    defer img.close(io);
+
+    const first_usable_lba: u64 = 2 + gpt.partition_array_sectors;
+    const initial_last_usable_lba =
+        initial_size / gpt.sector_size - 2 - gpt.partition_array_sectors;
+    const specs = [_]gpt.PartitionSpec{.{
+        .type_guid = vmiz.guid.linux_filesystem_data,
+        .unique_guid = vmiz.guid.parse("99999999-9999-9999-9999-999999999999"),
+        .size_sectors = initial_last_usable_lba - first_usable_lba + 1,
+    }};
+    var placements: [specs.len]gpt.Placement = undefined;
+    try gpt.writeGpt(
+        &img,
+        io,
+        vmiz.guid.parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        &specs,
+        &placements,
+    );
+
+    const grown_size: u64 = 128 * 1024 * 1024;
+    try img.resize(io, grown_size);
+    const first_extent = try growGptRoot(allocator, io, &img, 1);
+    try std.testing.expectEqual(
+        grown_size - (1 + gpt.partition_array_sectors) * gpt.sector_size,
+        first_extent.start_bytes + first_extent.length_bytes,
+    );
+
+    const retry_extent = try growGptRoot(allocator, io, &img, 1);
+    try std.testing.expectEqual(first_extent, retry_extent);
+}
+
 test "kernel partition resize is required only when its cached size is smaller" {
     try std.testing.expect(try partitionNeedsKernelResize(8 * 1024, 16 * 1024));
     try std.testing.expect(!try partitionNeedsKernelResize(16 * 1024, 16 * 1024));
@@ -436,12 +518,12 @@ test "findRootDevice resolves disk name and partition number via a synthetic /sy
     const mounts_content = "/dev/sda2 / ext4 rw,relatime 0 0\n";
 
     const root = try findRootDevice(std.testing.allocator, io, mounts_content, class_block_dir);
-    defer std.testing.allocator.free(root.disk_name);
-    defer std.testing.allocator.free(root.partition_name);
+    defer root.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("sda", root.disk_name);
     try std.testing.expectEqualStrings("sda2", root.partition_name);
     try std.testing.expectEqual(@as(u32, 2), root.partition_number);
+    try std.testing.expectEqualStrings("ext4", root.filesystem_type);
 }
 
 test "findRootDevice handles nvme-style symlink targets" {
@@ -460,10 +542,10 @@ test "findRootDevice handles nvme-style symlink targets" {
     const mounts_content = "/dev/nvme0n1p1 / ext4 rw,relatime 0 0\n";
 
     const root = try findRootDevice(std.testing.allocator, io, mounts_content, class_block_dir);
-    defer std.testing.allocator.free(root.disk_name);
-    defer std.testing.allocator.free(root.partition_name);
+    defer root.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("nvme0n1", root.disk_name);
     try std.testing.expectEqualStrings("nvme0n1p1", root.partition_name);
     try std.testing.expectEqual(@as(u32, 1), root.partition_number);
+    try std.testing.expectEqualStrings("ext4", root.filesystem_type);
 }

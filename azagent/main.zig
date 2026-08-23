@@ -360,10 +360,7 @@ fn driveMountSetup(allocator: std.mem.Allocator, io: std.Io, now_unix_seconds: i
         );
         break :root null;
     };
-    defer if (root) |device| {
-        allocator.free(device.disk_name);
-        allocator.free(device.partition_name);
-    };
+    defer if (root) |device| device.deinit(allocator);
 
     try drive_mounts.setup(.{
         .allocator = allocator,
