@@ -1,0 +1,236 @@
+Package: base-dep
+Version: 1.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Filename: pool/main/base-dep_1.0-1_arm64.deb
+Size: 606
+SHA256: e9c466cb01d4a5e0c0eb9e5564f5e7d27859d195eff82beb7745c402f12aaca7
+Description: debz hermetic fixture base-dep
+
+Package: pre-app
+Version: 1.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Pre-Depends: base-dep
+Filename: pool/main/pre-app_1.0-1_arm64.deb
+Size: 616
+SHA256: 7a8328220c132cd1738f64353a42e37578858466ac2b3a2f829e887474ceb5a7
+Description: debz hermetic fixture pre-app
+
+Package: alt-a
+Version: 1.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Filename: pool/main/alt-a_1.0-1_arm64.deb
+Size: 600
+SHA256: b415beef9c53ada1d29866a4d02a900a161f83859dc39343f8ad4cd197cc082c
+Description: debz hermetic fixture alt-a
+
+Package: alt-b
+Version: 2.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Filename: pool/main/alt-b_2.0-1_arm64.deb
+Size: 600
+SHA256: d7f6037674f2ef2f92145c641e1b5bb4c67e0b0b47db04ee3f61891ff10ef1d2
+Description: debz hermetic fixture alt-b
+
+Package: alt-consumer
+Version: 1.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Depends: alt-a | alt-b
+Filename: pool/main/alt-consumer_1.0-1_arm64.deb
+Size: 624
+SHA256: a447cdc70b7d74f666599e3bc339ff67c9e7ee5619d0cb830787a1b7b973b51c
+Description: debz hermetic fixture alt-consumer
+
+Package: virtual-provider
+Version: 2.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Provides: virtual-api (= 2.0)
+Filename: pool/main/virtual-provider_2.0-1_arm64.deb
+Size: 630
+SHA256: 8b5531008c9ec67f46e58516702ffa535db9493d94bab2ffc5eb9bf7abe9430a
+Description: debz hermetic fixture virtual-provider
+
+Package: virtual-consumer
+Version: 1.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Depends: virtual-api (>= 2.0)
+Filename: pool/main/virtual-consumer_1.0-1_arm64.deb
+Size: 634
+SHA256: 1a1badc24a93eee5119a52eba0efc68f66c74d4d04359e4ee901e3f99e374d18
+Description: debz hermetic fixture virtual-consumer
+
+Package: recommended-addon
+Version: 1.0-1
+Architecture: all
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Filename: pool/main/recommended-addon_1.0-1_all.deb
+Size: 614
+SHA256: 47242de8bfa4bc56b3884dd1f3fe9a5711408b36c5878cb167b11ab4d75696ac
+Description: debz hermetic fixture recommended-addon
+
+Package: recommend-app
+Version: 1.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Recommends: recommended-addon
+Filename: pool/main/recommend-app_1.0-1_arm64.deb
+Size: 624
+SHA256: 98afe23c0fbd4829e5d9f0fdca73ce8216ab6ac0713f854db9229ab02d64f5f2
+Description: debz hermetic fixture recommend-app
+
+Package: conflict-old
+Version: 1.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Conflicts: conflict-new
+Filename: pool/main/conflict-old_1.0-1_arm64.deb
+Size: 622
+SHA256: 79c0b6a94266fd4f659ecfce0a0aa70766b965daea2a1783524d68f39c0cbba0
+Description: debz hermetic fixture conflict-old
+
+Package: conflict-new
+Version: 2.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Conflicts: conflict-old
+Breaks: conflict-old
+Replaces: conflict-old
+Filename: pool/main/conflict-new_2.0-1_arm64.deb
+Size: 636
+SHA256: f4d27aeee78ada962872863b3c6f259b37342595154eee002560a603867845a4
+Description: debz hermetic fixture conflict-new
+
+Package: essential-core
+Version: 1.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Essential: yes
+Filename: pool/main/essential-core_1.0-1_arm64.deb
+Size: 618
+SHA256: a85983d6a1a7a2dec6dc31b206272df024944a22f8b6b63f28e1d83463595ad6
+Description: debz hermetic fixture essential-core
+
+Package: protected-core
+Version: 1.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Protected: yes
+Filename: pool/main/protected-core_1.0-1_arm64.deb
+Size: 618
+SHA256: dd5d372ae6605f96226afe86a5f5916b95f8568588bf029d2750ecb59b0f1e53
+Description: debz hermetic fixture protected-core
+
+Package: multi-lib
+Version: 1.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Multi-Arch: same
+Filename: pool/main/multi-lib_1.0-1_arm64.deb
+Size: 616
+SHA256: ec35abb2a2a705e3e36226277997d3f91012b7c9b935a83adf00317d8792cb79
+Description: debz hermetic fixture multi-lib
+
+Package: cycle-a
+Version: 1.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Depends: cycle-b
+Filename: pool/main/cycle-a_1.0-1_arm64.deb
+Size: 612
+SHA256: 485b307753332251cc24345121335e8f2055fa18f36e3121d039628c463950cc
+Description: debz hermetic fixture cycle-a
+
+Package: cycle-b
+Version: 1.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Depends: cycle-a
+Filename: pool/main/cycle-b_1.0-1_arm64.deb
+Size: 612
+SHA256: 908c16e9e6642576626bde7136171fde6f1815b949e0275e3df9aa2112fe71a1
+Description: debz hermetic fixture cycle-b
+
+Package: fixture-upgrade
+Version: 1.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Filename: pool/main/fixture-upgrade_1.0-1_arm64.deb
+Size: 610
+SHA256: 410c842bbc87d398d94a01bd1e68e7e08788bd4a9bd663c59caae1ce9e6527ee
+Description: debz hermetic fixture fixture-upgrade
+
+Package: fixture-upgrade
+Version: 2.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Filename: pool/main/fixture-upgrade_2.0-1_arm64.deb
+Size: 610
+SHA256: e752678bfdffa51bee7384289fa298d6152c0a6224c8724ab394ba365cce8197
+Description: debz hermetic fixture fixture-upgrade
+
+Package: conffile-pkg
+Version: 1.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Filename: pool/main/conffile-pkg_1.0-1_arm64.deb
+Size: 622
+SHA256: 00daa816408a95f0b84afd61cd7857977cb1d584d1cc8f2e822bdfc840db7649
+Description: debz hermetic fixture conffile-pkg
+
+Package: trigger-pkg
+Version: 1.0-1ubuntu1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Filename: pool/main/trigger-pkg_1.0-1ubuntu1_arm64.deb
+Size: 668
+SHA256: 5350a941bdb424312a3feb2791a374bf751badb538d6183307068fa53372f9a0
+Description: debz hermetic fixture trigger-pkg
+
+Package: fail-script
+Version: 1.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Filename: pool/main/fail-script_1.0-1_arm64.deb
+Size: 646
+SHA256: 34ea63a3a405135f70868f1b956aecb12108cbb6afa56363d2d27e280eaa16e0
+Description: debz hermetic fixture fail-script
+
+Package: scenario-main
+Version: 1.0-1
+Architecture: arm64
+Maintainer: debz fixture <fixture.invalid>
+Installed-Size: 1
+Depends: base-dep
+Recommends: recommended-addon
+Filename: pool/main/scenario-main_1.0-1_arm64.deb
+Size: 638
+SHA256: 43afa4a1ff5a9a789a146f68fa77ae8ba54910ab088251778a223da206c69e86
+Description: debz hermetic fixture scenario-main
+

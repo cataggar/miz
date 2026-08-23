@@ -1,0 +1,5 @@
+suite=ubuntu-26.04
+architecture=arm64
+release_sha256=e82e7e9bc874ee5424c3fa96a5069bf2085fcad71b6838a57e32de8ec0a8d9d4
+packages_sha256=5cb057468a455915f16465fd45a8eb1baa211344f19d453297a7a6a76ee952d0
+signer=fcd01b8ef26ce414115b1433f5322dace233beb8

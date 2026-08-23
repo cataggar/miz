@@ -1,0 +1,24 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+Origin: debz hermetic ubuntu-26.04
+Label: debz integration fixture
+Suite: ubuntu-26.04
+Codename: ubuntu-26.04
+Date: Mon, 01 Jan 2024 00:00:00 +0000
+Valid-Until: Thu, 01 Jan 2037 00:00:00 +0000
+Architectures: arm64
+Components: main
+Acquire-By-Hash: no
+SHA256:
+ 5cb057468a455915f16465fd45a8eb1baa211344f19d453297a7a6a76ee952d0 6905 main/binary-arm64/Packages
+-----BEGIN PGP SIGNATURE-----
+
+wsBzBAEBCAAdBQJlU/EAFiEEYuTTadH0wUnEcEpGzFyzjcZDuSQACgkQzFyzjcZD
+uSSk4gf+LxYQFm03M/wqzqhLvih45AHqgoFFD/gT8n+/7TSHJtmLpKyBBOy8Yks4
+3OZb428YVhWRP/3DrJyEX413td7g2V+J8bQwjFN1GJBTR7vYVLP7/dydAW45OE8S
+qt+fKA3WPL1xO+PLxgHKoo572ZU+b6CiHvF+XJ9m00OQWzI0At5XS/ZICIaM0+vO
+um2Il+H3zqkSpssMrnCj+RaEmqsU6K16pCIstIhzoBwf9jNKf0Lj8Q69shDUotyQ
+Kcx9rMiac+51OjMXXFkmECaGzeXvNEQLBYSlqQG3aoL5gKWdcg1hEwxZnJVYjdYp
+HQo5PQ8TYxI+J3L9+jAteTqFb0KELw==
+-----END PGP SIGNATURE-----

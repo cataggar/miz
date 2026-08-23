@@ -12,6 +12,10 @@
 const std = @import("std");
 const vmiz = @import("vmiz");
 const uki_signing = @import("uki_signing.zig");
+// Test-only import used by the arm64 resolve->customize integration test to
+// drive the embedded debz product backend with a deterministic process runner.
+// The builder executable references `debz` only inside `test` blocks.
+const debz = @import("debz");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -3745,6 +3749,223 @@ test "package-family resolve and customize requests are exact-lock operations" {
         package_family.InstalledBaselinePolicy.none,
         core_create.inputs.installed_baseline,
     );
+}
+
+// A deterministic dpkg contract for the arm64 integration test: every phase
+// reports a clean exit and records the customized package as fully installed in
+// the staged dpkg status, exactly as dpkg would. The executor's exact-lock
+// post-verification then observes the locked closure, so a customize install
+// completes without a real chroot while still exercising the arm64 lock
+// provisioning, atomic publication, and provenance binding.
+const SuccessfulArmProcess = struct {
+    io: std.Io,
+    dir: std.Io.Dir,
+    status_sub_path: []const u8,
+    status: []const u8,
+
+    fn interface(self: *SuccessfulArmProcess) debz.transaction_executor.ProcessRunner {
+        return .{ .context = self, .runFn = run };
+    }
+
+    fn run(
+        context: *anyopaque,
+        _: debz.transaction_executor.Invocation,
+    ) !debz.transaction_executor.ProcessResult {
+        const self: *SuccessfulArmProcess = @ptrCast(@alignCast(context));
+        try self.dir.writeFile(self.io, .{ .sub_path = self.status_sub_path, .data = self.status });
+        return .{ .termination = .{ .exited = 0 } };
+    }
+};
+
+// Deterministic arm64 counterpart to the x86_64 5 GiB end-to-end gate. It
+// reproduces the exact aarch64 production transition that failed in the Ubuntu
+// 26.04 release run (issue #455): a successful resolve followed by the first
+// customize, where the authenticated root shipped var/lib/dpkg but never
+// var/lib/debz and the transaction lock adapter walked into a missing parent,
+// surfacing a bare `backend_failed: FileNotFound` (exit 7) that also leaked
+// every working buffer. The signed arm64 repository is generated offline by
+// debz's tools/generate-integration-repository.py and committed under
+// tests/fixtures so this runs with no network and no host package manager.
+// std.testing.allocator asserts the whole resolve->customize path is leak free.
+test "arm64 package-family resolve then customize provisions the debz lock root without leaking" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const profile = profileFor(.aarch64);
+
+    // Absolute path to the committed, signed arm64 integration repository and
+    // its trusted keyring. Both live outside every root_stage and publication
+    // root, so the boundary's path-separation policy accepts them.
+    const repo_abs = try Dir.cwd().realPathFileAlloc(
+        io,
+        "tests/fixtures/ubuntu2604-arm64-repo/repo",
+        allocator,
+    );
+    defer allocator.free(repo_abs);
+    const keyring_abs = try std.fmt.allocPrint(allocator, "{s}/fixture-keyring.gpg", .{repo_abs});
+    defer allocator.free(keyring_abs);
+
+    // The transaction directory layout mirrors the production builder: the
+    // resolve root, the private customize stage, the publication root, the
+    // cache, the state, the exact lock, and the deb822 source configuration are
+    // all siblings so every input stays outside both roots.
+    var workspace = std.testing.tmpDir(.{});
+    defer workspace.cleanup();
+    var work_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const work = work_buffer[0..try workspace.dir.realPath(io, &work_buffer)];
+
+    // The authenticated Ubuntu root ships var/lib/dpkg but never var/lib/debz:
+    // the exact condition that surfaced FileNotFound on aarch64.
+    try workspace.dir.createDirPath(io, "official-root/var/lib/dpkg");
+    try workspace.dir.writeFile(io, .{ .sub_path = "official-root/var/lib/dpkg/status", .data = "" });
+    try workspace.dir.createDirPath(io, "cache");
+    try workspace.dir.createDirPath(io, "state");
+
+    // deb822 source plus the immutable source config, written exactly as the
+    // builder writes them: source_paths stays empty and config_paths carries a
+    // pinned, immutable file:// snapshot the boundary reads.
+    const sources_doc = try std.fmt.allocPrint(allocator,
+        \\Types: deb
+        \\URIs: file://{s}
+        \\Suites: ubuntu-26.04
+        \\Components: main
+        \\Architectures: arm64
+        \\Signed-By: {s}
+        \\
+    , .{ repo_abs, keyring_abs });
+    defer allocator.free(sources_doc);
+    try workspace.dir.writeFile(io, .{ .sub_path = "arm64.sources", .data = sources_doc });
+    const sources_abs = try std.fmt.allocPrint(allocator, "{s}/arm64.sources", .{work});
+    defer allocator.free(sources_abs);
+    const config_doc = try std.fmt.allocPrint(
+        allocator,
+        "{{\"source_path\":\"{s}\",\"immutable\":true}}",
+        .{sources_abs},
+    );
+    defer allocator.free(config_doc);
+    try workspace.dir.writeFile(io, .{ .sub_path = "arm64.json", .data = config_doc });
+
+    const config_abs = try std.fmt.allocPrint(allocator, "{s}/arm64.json", .{work});
+    defer allocator.free(config_abs);
+    const cache_abs = try std.fmt.allocPrint(allocator, "{s}/cache", .{work});
+    defer allocator.free(cache_abs);
+    const state_abs = try std.fmt.allocPrint(allocator, "{s}/state", .{work});
+    defer allocator.free(state_abs);
+    const lock_abs = try std.fmt.allocPrint(allocator, "{s}/exact-lock.json", .{work});
+    defer allocator.free(lock_abs);
+    const official_root_abs = try std.fmt.allocPrint(allocator, "{s}/official-root", .{work});
+    defer allocator.free(official_root_abs);
+    const resolve_published_abs = try std.fmt.allocPrint(allocator, "{s}/resolve-published-unused", .{work});
+    defer allocator.free(resolve_published_abs);
+
+    const config_inputs = [_][]const u8{config_abs};
+    const keyring_inputs = [_][]const u8{keyring_abs};
+    const packages = [_][]const u8{"base-dep"};
+
+    // The staged dpkg status the mock dpkg records once the customize applies:
+    // the full arm64 exact-lock closure fully installed. base-dep pulls in the
+    // fixture's essential package essential-core, so both must be present for
+    // the executor's exact-lock post-verification to accept the transaction.
+    const installed_status =
+        "Package: base-dep\n" ++
+        "Status: install ok installed\n" ++
+        "Priority: optional\n" ++
+        "Architecture: arm64\n" ++
+        "Version: 1.0-1\n\n" ++
+        "Package: essential-core\n" ++
+        "Status: install ok installed\n" ++
+        "Priority: optional\n" ++
+        "Essential: yes\n" ++
+        "Architecture: arm64\n" ++
+        "Version: 1.0-1\n\n";
+
+    // Inject the embedded debz product backend with a deterministic clock inside
+    // the fixture InRelease validity window (Date 2024, Valid-Until 2037) and a
+    // dpkg contract that always succeeds. This is the same backend the builder
+    // runs in production, only its process runner and clock are pinned.
+    var process = SuccessfulArmProcess{
+        .io = io,
+        .dir = workspace.dir,
+        .status_sub_path = "root-stage/var/lib/dpkg/status",
+        .status = installed_status,
+    };
+    var backend: debz.ProductionBackend = .{
+        .io = io,
+        .now_unix = 1_735_689_600,
+        .process_runner = process.interface(),
+    };
+    const backends = package_family.BackendSet{ .debian = .{ .product_executor = backend.interface() } };
+
+    // Resolve: a real arm64 solve against the signed repository. It authenticates
+    // the release, downloads and verifies base-dep, and writes the exact lock the
+    // customize consumes. This is the stage that succeeded in production.
+    const resolve_request = packageFamilyRequest(
+        .resolve_lock,
+        profile,
+        &packages,
+        official_root_abs,
+        resolve_published_abs,
+        &config_inputs,
+        &keyring_inputs,
+        cache_abs,
+        state_abs,
+        lock_abs,
+        .none,
+        null,
+    );
+    try assertRequestSeparation(resolve_request);
+    try std.testing.expectEqual(package_family.Architecture.arm64, resolve_request.inputs.architecture);
+    const resolved = try package_family.execute(allocator, io, backends, resolve_request);
+    try requireSucceeded(resolved);
+    try std.testing.expect(resolved.lock_path != null);
+    try std.testing.expectEqualStrings(lock_abs, resolved.lock_path.?);
+
+    // The exact lock records the arm64 architecture it was resolved for, proving
+    // the request shape and the produced artifact are both aarch64.
+    const lock_bytes = try Dir.cwd().readFileAlloc(io, lock_abs, allocator, .limited(1 << 20));
+    defer allocator.free(lock_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, lock_bytes, "arm64") != null);
+
+    // Customize: consume the exact lock and apply it to a private stage that,
+    // like the official root, has var/lib/dpkg but not var/lib/debz. This is the
+    // first customize after resolve: the exact operation that failed on aarch64.
+    try workspace.dir.createDirPath(io, "root-stage/var/lib/dpkg");
+    try workspace.dir.writeFile(io, .{ .sub_path = "root-stage/var/lib/dpkg/status", .data = "" });
+    const stage_abs = try std.fmt.allocPrint(allocator, "{s}/root-stage", .{work});
+    defer allocator.free(stage_abs);
+    const published_abs = try std.fmt.allocPrint(allocator, "{s}/root-debz-0", .{work});
+    defer allocator.free(published_abs);
+
+    const customize_request = packageFamilyRequest(
+        .customize,
+        profile,
+        &packages,
+        stage_abs,
+        published_abs,
+        &config_inputs,
+        &keyring_inputs,
+        cache_abs,
+        state_abs,
+        lock_abs,
+        .none,
+        null,
+    );
+    try assertRequestSeparation(customize_request);
+    try std.testing.expectEqual(package_family.Architecture.arm64, customize_request.inputs.architecture);
+    try std.testing.expect(customize_request.inputs.lock_input_path != null);
+    const customized = try package_family.execute(allocator, io, backends, customize_request);
+    try requireSucceeded(customized);
+    try std.testing.expect(customized.published);
+    try std.testing.expect(customized.provenance_path != null);
+    defer allocator.free(customized.provenance_path.?);
+    const expected_provenance = try std.fmt.allocPrint(allocator, "{s}/transaction-result.json", .{state_abs});
+    defer allocator.free(expected_provenance);
+    try std.testing.expectEqualStrings(expected_provenance, customized.provenance_path.?);
+
+    // The transaction lock adapter provisioned var/lib/debz under the published
+    // root: the fix for the FileNotFound regression. Before the fix this
+    // directory never existed and the lock acquisition failed closed at exit 7.
+    var provisioned = try workspace.dir.openDir(io, "root-debz-0/var/lib/debz", .{ .follow_symlinks = false });
+    provisioned.close(io);
 }
 
 test "package-family requests reject keyrings overlapping staging and accept the external copy" {

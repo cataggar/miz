@@ -1131,6 +1131,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "vmiz", .module = host_vmiz_mod },
+                // Test-only: the arm64 resolve->customize integration test drives
+                // the embedded debz product backend directly with a deterministic
+                // process runner. The builder executable itself never references
+                // debz outside `test` blocks, so this import does not change it.
+                .{ .name = "debz", .module = debz_mod },
             },
         });
         const ubuntu2604_builder_exe = b.addExecutable(.{
