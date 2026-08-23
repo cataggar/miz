@@ -612,7 +612,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         native_path.write_text(
             json.dumps(
                 {
-                    "schema": 2,
+                    "schema": 3,
                     "type": "ubuntu2604-local-secure-boot-acceptance",
                     "architecture": candidate["architecture"],
                     "flavor": candidate["flavor"],
@@ -663,7 +663,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                         source_commit=self.source_commit,
                     )
                 document[field] = (
-                    2
+                    3
                     if field == "schema"
                     else candidate["architecture"]
                     if field == "architecture"
@@ -702,6 +702,10 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                 "root-growth",
                 "reboot-reconnect",
                 "clean-service-health",
+                "signed-binder-module",
+                "binder-boot-required",
+                "binderfs-dynamic-devices",
+                "binder-device-usability",
             },
         )
 
