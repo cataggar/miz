@@ -1,5 +1,5 @@
 //! `vmiz`: a qemu-img-like CLI over the `vmiz` library. Supports `create`,
-//! `info`, `convert`, `resize`, `check`, `map`, `build-image`, `build-iso`,
+//! `info`, `convert`, `write`, `resize`, `check`, `map`, `build-image`, `build-iso`,
 //! `recustomize-iso`, `resize-root`, `azure`, `cosi`, `oci`, `qemu`, and release signing over
 //! `raw`, `vhd`, `vhdx`, and `qcow2`.
 
@@ -9,6 +9,7 @@ const vmiz = @import("vmiz");
 const create_cmd = @import("commands/create.zig");
 const info_cmd = @import("commands/info.zig");
 const convert_cmd = @import("commands/convert.zig");
+const write_cmd = @import("commands/write.zig");
 const resize_cmd = @import("commands/resize.zig");
 const resize_root_cmd = @import("commands/resize_root.zig");
 const check_cmd = @import("commands/check.zig");
@@ -31,6 +32,7 @@ const usage =
     \\  create -f <format> [-o subformat=fixed|dynamic] <file> <size>
     \\  info [--output=human|json] <file>
     \\  convert -f <src_format> -O <dst_format> [-o subformat=fixed|dynamic] [--compress-level <1-9>] <src> <dst|->
+    \\  write --allow-device-write [--yes] <src> <block-device>  # Linux only
     \\  resize <file> [+]<size>
     \\  resize-root [--label <label>] <file.qcow2> [+]<size>
     \\  check <file>
@@ -83,6 +85,7 @@ fn run(
     if (std.mem.eql(u8, command, "create")) return create_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "info")) return info_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "convert")) return convert_cmd.run(gpa, io, rest);
+    if (std.mem.eql(u8, command, "write")) return write_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "resize")) return resize_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "resize-root") or std.mem.eql(u8, command, "grow-root")) {
         return resize_root_cmd.run(gpa, io, rest);
@@ -111,6 +114,7 @@ test {
     _ = create_cmd;
     _ = info_cmd;
     _ = convert_cmd;
+    _ = write_cmd;
     _ = resize_cmd;
     _ = resize_root_cmd;
     _ = check_cmd;
@@ -125,4 +129,16 @@ test {
     _ = sign_cmd;
     _ = oci_cmd;
     _ = uki_cmd;
+}
+
+test "main dispatches write help" {
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        run(
+            std.testing.allocator,
+            std.testing.io,
+            std.process.Environ.empty,
+            &.{ "write", "--help" },
+        ),
+    );
 }

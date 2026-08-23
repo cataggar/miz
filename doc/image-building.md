@@ -44,6 +44,8 @@ vmiz convert -f raw -O vhdx disk.img disk.vhdx
 vmiz convert -f vhdx -O vhd -o subformat=fixed disk.vhdx disk.vhd  # import a VHDX (e.g. Hyper-V export)
 vmiz convert -O raw.gz disk.qcow2 disk.raw.gz    # compressed while writing, never a full raw on disk
 vmiz convert -O raw.gz -o - disk.qcow2 - | ssh host 'cat > disk.raw.gz'
+vmiz write --allow-device-write image.qcow2 <block-device>  # Linux: preflight, confirm, write, flush, refresh partitions
+vmiz write --allow-device-write --yes image.vhdx <block-device>  # non-interactive acknowledgement
 vmiz resize disk.vhdx +4G
 vmiz resize disk.vhd +4G
 vmiz check disk.vhd
@@ -75,6 +77,17 @@ vmiz capture --source disk.qcow2 --source-root gpt:2 -O raw -o captured.raw --dr
 vmiz qemu AzureLinux
 vmiz qemu AzureLinux --snapshot
 ```
+
+`vmiz write` is the only CLI path that writes a complete image to an existing
+block device. It accepts raw, VHD, VHDX, and qcow2 sources without first
+materializing a temporary raw file. The command requires
+`--allow-device-write`, checks size, mounts, holders, and the running root
+before opening the destination writable, inventories what is already on the
+target, writes source zero regions explicitly, flushes the device, and uses
+the native Linux partition-table refresh ioctl. A refresh failure is reported
+as partial success with exit status 2 because the bytes are durable but the
+kernel view is stale. `vmiz convert` and `Image.create` continue to refuse
+device destinations.
 
 OCI ingestion defaults to 64 MiB compressed blobs, 128 MiB decompressed
 layers, and 512 MiB docker/podman save archives. Deliberately larger trusted
