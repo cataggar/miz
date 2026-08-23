@@ -531,6 +531,41 @@ proves real device usability by transferring a small static probe binary
 SSH, verifying its checksum, and using it to query the fixed devices and
 allocate and query a new dynamic Binder device through `binder-control`.
 
+### Android container boot-completion smoke
+
+Core acceptance -- both native-QEMU and Azure -- additionally runs a minimal
+Android container boot-completion smoke, in both cases on top of the Binder
+workload contracts above. The core image never embeds an Android OCI runtime
+or bundle: both are required, digest-bound external inputs supplied only at
+acceptance time, transferred over SSH, and verified by checksum before use.
+Missing or malformed inputs fail the acceptance run closed; there is no
+success-shaped fallback that skips the contract.
+
+Acceptance pushes the externally supplied runtime binary and bundle archive
+to the guest, extracts the bundle, verifies the extracted `config.json`
+against its own pinned digest, and confirms the bundle requests both a
+BinderFS and a DMA-heap mount before launching anything. The container is
+then launched detached, and acceptance polls `/system/bin/getprop
+sys.boot_completed` on a bounded interval until it reports `1` or a bounded
+timeout elapses; on either outcome it captures size-limited container-state
+and `dmesg` diagnostics rather than an unbounded log. Once booted,
+`ro.product.cpu.abilist` is checked against the ABI required for the
+candidate's own architecture (`x86_64` or `arm64-v8a`), so a container built
+for the wrong architecture fails the contract instead of merely appearing to
+boot. Acceptance then stops the container gracefully -- signal, then a
+bounded poll for a `stopped` state -- and only then deletes it; it never
+force-removes a container that has not confirmed it stopped.
+
+The runtime's pinned source commit and the runtime, bundle, and config
+digests are bound into the acceptance result the same way every other
+core-only input is: a native result missing them, or an Azure result missing
+them, fails validation, and the core-only result schema and Azure/native
+contract sets were bumped so an older result recorded before this contract
+existed can never satisfy the current one. Native and Azure acceptance run
+this smoke independently and use differently worded contract names for the
+same behavior, matching the existing native/Azure Binder contract split
+above.
+
 ## Core validation workflow
 
 `.github/workflows/ubuntu2604-core-validation.yml` is a separate manually
@@ -548,6 +583,18 @@ successful and exactly two nonempty, unexpired candidate artifacts.
 The core Azure acceptance jobs also build the Binder device usability probe
 from source for the matching guest architecture before running acceptance,
 so no prebuilt probe binary is stored or published.
+
+Both the native-QEMU and Azure jobs additionally fetch the digest-bound
+Android container runtime and bundle from plain repository secrets before
+acceptance: the pinned source commit, runtime and bundle download locations,
+their SHA-256 digests, and the extracted `config.json` digest. These secrets
+are deliberately not scoped to the `ubuntu2604-release` environment, so the
+native-QEMU job -- which needs no Azure credential -- can read them without
+gaining a protected-environment grant. An optional bearer-token secret is
+sent only when configured, for artifacts hosted privately; every other input
+above is required, and a missing or malformed one fails the job before any
+Azure resource is created or any guest command is run, rather than skipping
+the smoke.
 
 Candidates, native results, Azure results, and a final digest-bound
 two-architecture validation manifest are uploaded only as workflow artifacts.

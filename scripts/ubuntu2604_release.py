@@ -100,6 +100,10 @@ CORE_AZURE_CONTRACTS = {
     "no-anbox-evidence",
     "binderfs-mounted",
     "binder-devices-usable",
+    "android-smoke-provenance-bound",
+    "android-container-boot-completed",
+    "android-container-abi-matched",
+    "android-container-graceful-stop",
 }
 AZURE_CONTRACTS = FULL_AZURE_CONTRACTS
 FULL_NATIVE_CONTRACTS = {
@@ -150,6 +154,10 @@ CORE_NATIVE_CONTRACTS = {
     "binder-boot-required",
     "binderfs-dynamic-devices",
     "binder-device-usability",
+    "android-smoke-artifact-provenance",
+    "android-container-boot-completed",
+    "android-container-abi-match",
+    "android-smoke-graceful-stop",
 }
 RELEASE_TAG_RE = re.compile(r"^Ubuntu-26\.04-[0-9]{8}$")
 SNAPSHOT_ID_RE = re.compile(r"^release-[0-9]{8}(?:\.[0-9]+)?$")
@@ -248,6 +256,36 @@ def require_commit(value: object, label: str = "source_commit") -> str:
     return value
 
 
+ANDROID_SMOKE_FIELDS = {
+    "source_commit",
+    "runtime_sha256",
+    "bundle_sha256",
+    "config_sha256",
+    "architecture",
+    "candidate_key",
+}
+
+
+def require_android_smoke(
+    value: object,
+    *,
+    architecture: str,
+    key: str,
+    label: str,
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != ANDROID_SMOKE_FIELDS:
+        fail(f"{label}: android_smoke provenance is invalid")
+    require_commit(value.get("source_commit"), f"{label} android_smoke source commit")
+    require_sha256(value.get("runtime_sha256"), f"{label} android_smoke runtime digest")
+    require_sha256(value.get("bundle_sha256"), f"{label} android_smoke bundle digest")
+    require_sha256(value.get("config_sha256"), f"{label} android_smoke config digest")
+    if value.get("architecture") != architecture:
+        fail(f"{label}: android_smoke architecture mismatch")
+    if value.get("candidate_key") != key:
+        fail(f"{label}: android_smoke candidate key mismatch")
+    return value
+
+
 def has_exact_contracts(value: object, expected: set[str]) -> bool:
     return (
         isinstance(value, list)
@@ -263,6 +301,16 @@ def azure_contracts(flavor: str) -> tuple[str, ...]:
     if flavor == "core":
         return tuple(sorted(CORE_AZURE_CONTRACTS))
     fail(f"unsupported Ubuntu flavor for Azure acceptance: {flavor!r}")
+
+
+def azure_result_fields(flavor: str) -> set[str]:
+    # The core flavor's Azure result additionally binds `android_smoke`
+    # provenance; requiring the field exactly for core (never for full)
+    # keeps a result recorded before this contract existed from ever
+    # satisfying the current core Azure contract set.
+    if flavor == "core":
+        return AZURE_RESULT_FIELDS | {"android_smoke"}
+    return AZURE_RESULT_FIELDS
 
 
 def native_contracts(flavor: str) -> tuple[str, ...]:
@@ -419,19 +467,19 @@ def validate_identity(
 ) -> tuple[str, str, str, str]:
     if document.get("schema") != 1 or document.get("type") != expected_type:
         fail(f"invalid {expected_type} schema")
-    expected_fields = (
-        CANDIDATE_FIELDS
-        if expected_type == "ubuntu2604-candidate"
-        else AZURE_RESULT_FIELDS
-    )
-    if set(document) != expected_fields:
-        fail(f"invalid {expected_type} fields")
     actual_key = document.get("key")
     if not isinstance(actual_key, str) or actual_key not in CANDIDATE_EXPECTED:
         fail(f"invalid candidate key: {actual_key!r}")
+    architecture, flavor, asset_name = CANDIDATE_EXPECTED[actual_key]
+    expected_fields = (
+        CANDIDATE_FIELDS
+        if expected_type == "ubuntu2604-candidate"
+        else azure_result_fields(flavor)
+    )
+    if set(document) != expected_fields:
+        fail(f"invalid {expected_type} fields")
     if key is not None and actual_key != key:
         fail(f"candidate key mismatch: expected {key}, got {actual_key}")
-    architecture, flavor, asset_name = CANDIDATE_EXPECTED[actual_key]
     if document.get("architecture") != architecture:
         fail(f"{actual_key}: architecture mismatch")
     if document.get("flavor") != flavor:
@@ -1160,8 +1208,12 @@ def validate_native_result(
             "architecture",
             "flavor",
             "virtual_size",
+            "android_smoke",
         }
-        expected_schema = 3
+        # Bumped from 3 so that a result recorded before the Android
+        # container boot-completion smoke contracts existed can never
+        # satisfy the current core contract set.
+        expected_schema = 4
     if set(result) != expected_fields:
         fail(f"{candidate['key']}: native acceptance result has unexpected fields")
     if (
@@ -1180,6 +1232,13 @@ def validate_native_result(
         or result.get("virtual_size") != candidate["virtual_size"]
     ):
         fail(f"{candidate['key']}: native core identity is invalid")
+    if flavor == "core":
+        require_android_smoke(
+            result.get("android_smoke"),
+            architecture=candidate["architecture"],
+            key=candidate["key"],
+            label=candidate["key"],
+        )
     expected_contracts = list(native_contracts(flavor))
     contracts = result.get("contracts")
     if (
@@ -1329,37 +1388,67 @@ def azure_result_command(args: argparse.Namespace) -> None:
         or not args.image_version_id.startswith("/subscriptions/")
     ):
         fail("Azure gallery image-version identity is absent")
-    write_json(
-        args.output,
-        {
-            "schema": 1,
-            "type": "ubuntu2604-azure-acceptance",
-            "key": candidate["key"],
-            "architecture": candidate["architecture"],
-            "flavor": candidate["flavor"],
-            "asset_name": candidate["asset_name"],
-            "source_commit": candidate["source_commit"],
-            "qcow_sha256": candidate["sha256"],
-            "azure_accepted_sha256": sha256(args.asset),
-            "conversion": conversion,
-            "certificate_sha256": candidate["uki_signing"]["certificate_sha256"],
-            "signing_certificate_sha256": candidate["uki_signing"][
-                "signing_certificate_sha256"
-            ],
-            "fallback_uki_sha256": candidate["uki_signing"]["fallback_uki_sha256"],
-            "image_version_id": args.image_version_id,
-            "uefi_settings": request_uefi,
-            "status": "success",
-            "location": args.location,
-            "vm_size": args.vm_size,
-            "resource_group": args.resource_group,
-            "contracts": list(provided_contracts),
-            "workflow": {
-                "run_id": args.run_id,
-                "run_attempt": args.run_attempt,
-            },
-        },
+    android_smoke_args = (
+        args.android_smoke_source_commit,
+        args.android_smoke_runtime_sha256,
+        args.android_smoke_bundle_sha256,
+        args.android_smoke_config_sha256,
     )
+    android_smoke = None
+    if candidate["flavor"] == "core":
+        android_smoke = {
+            "source_commit": require_commit(
+                args.android_smoke_source_commit,
+                "android_smoke source commit",
+            ),
+            "runtime_sha256": require_sha256(
+                args.android_smoke_runtime_sha256,
+                "android_smoke runtime digest",
+            ),
+            "bundle_sha256": require_sha256(
+                args.android_smoke_bundle_sha256,
+                "android_smoke bundle digest",
+            ),
+            "config_sha256": require_sha256(
+                args.android_smoke_config_sha256,
+                "android_smoke config digest",
+            ),
+            "architecture": candidate["architecture"],
+            "candidate_key": candidate["key"],
+        }
+    elif any(value is not None for value in android_smoke_args):
+        fail("android_smoke provenance is only valid for the core flavor")
+    document = {
+        "schema": 1,
+        "type": "ubuntu2604-azure-acceptance",
+        "key": candidate["key"],
+        "architecture": candidate["architecture"],
+        "flavor": candidate["flavor"],
+        "asset_name": candidate["asset_name"],
+        "source_commit": candidate["source_commit"],
+        "qcow_sha256": candidate["sha256"],
+        "azure_accepted_sha256": sha256(args.asset),
+        "conversion": conversion,
+        "certificate_sha256": candidate["uki_signing"]["certificate_sha256"],
+        "signing_certificate_sha256": candidate["uki_signing"][
+            "signing_certificate_sha256"
+        ],
+        "fallback_uki_sha256": candidate["uki_signing"]["fallback_uki_sha256"],
+        "image_version_id": args.image_version_id,
+        "uefi_settings": request_uefi,
+        "status": "success",
+        "location": args.location,
+        "vm_size": args.vm_size,
+        "resource_group": args.resource_group,
+        "contracts": list(provided_contracts),
+        "workflow": {
+            "run_id": args.run_id,
+            "run_attempt": args.run_attempt,
+        },
+    }
+    if android_smoke is not None:
+        document["android_smoke"] = android_smoke
+    write_json(args.output, document)
 
 
 def validate_azure_result(
@@ -1386,6 +1475,13 @@ def validate_azure_result(
     digest = require_sha256(candidate.get("sha256"), f"{actual_key} candidate digest")
     if result.get("status") != "success":
         fail(f"{actual_key}: Azure acceptance is not explicitly successful")
+    if flavor == "core":
+        require_android_smoke(
+            result.get("android_smoke"),
+            architecture=candidate["architecture"],
+            key=actual_key,
+            label=actual_key,
+        )
     if (
         result.get("qcow_sha256") != digest
         or result.get("azure_accepted_sha256") != digest
@@ -1948,6 +2044,26 @@ def parser() -> argparse.ArgumentParser:
     azure.add_argument("--image-version-id", required=True)
     azure.add_argument("--uefi-request", type=Path, required=True)
     azure.add_argument("--uefi-response", type=Path, required=True)
+    azure.add_argument(
+        "--android-smoke-source-commit",
+        default=None,
+        help="pinned source commit for the externally supplied Android runtime and bundle; required for the core flavor only",
+    )
+    azure.add_argument(
+        "--android-smoke-runtime-sha256",
+        default=None,
+        help="SHA-256 of the externally supplied Android OCI runtime binary; required for the core flavor only",
+    )
+    azure.add_argument(
+        "--android-smoke-bundle-sha256",
+        default=None,
+        help="SHA-256 of the externally supplied Android OCI bundle archive; required for the core flavor only",
+    )
+    azure.add_argument(
+        "--android-smoke-config-sha256",
+        default=None,
+        help="SHA-256 of the extracted Android OCI bundle config.json; required for the core flavor only",
+    )
     azure.add_argument(
         "--contracts",
         required=True,

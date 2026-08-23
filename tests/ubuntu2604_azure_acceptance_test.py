@@ -335,6 +335,75 @@ else:
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(marker.exists())
 
+    # Regression coverage for a code-review finding: the Android container
+    # state query used to fall back to a synthetic `{"status":"stopped"}`
+    # whenever the query itself failed
+    # (`state $android_container_id 2>/dev/null || printf ...`), which could
+    # turn a permission error, a transient SSH failure, or any other query
+    # failure into a false confirmation and authorize `delete` on a
+    # container that might still be running. These tests exercise the
+    # actual generated remote command and the actual python3 status parser
+    # embedded in the harness, so a regression that reintroduces any
+    # success-shaped fallback fails them.
+    def test_android_state_query_never_carries_a_synthetic_stopped_fallback(
+        self,
+    ) -> None:
+        harness = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            "\"sudo -n '$android_runtime_remote' state $android_container_id"
+            ' 2>/dev/null" \\',
+            harness,
+        )
+        self.assertNotIn(
+            "state $android_container_id 2>/dev/null || printf", harness
+        )
+        self.assertNotIn('printf \'{\\"status\\":\\"stopped\\"}\'', harness)
+
+    def test_android_state_query_parser_never_reports_stopped_for_failed_or_malformed_output(
+        self,
+    ) -> None:
+        harness = SCRIPT.read_text(encoding="utf-8")
+        python_source = harness.split("python3 -c '", 1)[1].split(
+            "' 2>/dev/null || true", 1
+        )[0]
+        self.assertIn('json.load(sys.stdin).get("status", "")', python_source)
+
+        non_terminal_inputs = (
+            "",  # the state query failed and produced no output at all
+            "\n",  # whitespace-only output
+            "not json",  # malformed output
+            "{}",  # valid JSON missing the status field entirely
+            '{"status":"running"}',
+            '{"status":"created"}',
+            '{"status":"paused"}',
+            '{"status":"error"}',
+            '{"status":"Stopped"}',  # case must match exactly
+            '{"status":"stopped "}',  # trailing whitespace must not match
+        )
+        for stdin_text in non_terminal_inputs:
+            with self.subTest(stdin=stdin_text):
+                result = subprocess.run(
+                    ["python3", "-c", python_source],
+                    input=stdin_text,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                # Mirror bash's `$(...)` command substitution, which strips
+                # only trailing newlines and nothing else, so this matches
+                # exactly what `android_stop_container`'s `[[ "$status" ==
+                # stopped ]]` comparison actually sees.
+                self.assertNotEqual(result.stdout.rstrip("\n"), "stopped")
+
+        confirmed = subprocess.run(
+            ["python3", "-c", python_source],
+            input='{"status":"stopped"}',
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(confirmed.stdout.rstrip("\n"), "stopped")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -459,6 +459,21 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         _, flavor, asset_name = release.CANDIDATE_EXPECTED[key]
         candidate_dir = self.candidates / key
         azure_dir = self.azure / key
+        android_smoke = (
+            {
+                "android_smoke_source_commit": self.source_commit,
+                "android_smoke_runtime_sha256": "6" * 64,
+                "android_smoke_bundle_sha256": "7" * 64,
+                "android_smoke_config_sha256": "8" * 64,
+            }
+            if flavor == "core"
+            else {
+                "android_smoke_source_commit": None,
+                "android_smoke_runtime_sha256": None,
+                "android_smoke_bundle_sha256": None,
+                "android_smoke_config_sha256": None,
+            }
+        )
         return types.SimpleNamespace(
             manifest=candidate_dir / "candidate.json",
             asset=candidate_dir / asset_name,
@@ -479,6 +494,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             run_id="100",
             run_attempt="1",
             output=azure_dir / "azure-result.json",
+            **android_smoke,
         )
 
     def make_all(self) -> None:
@@ -608,11 +624,19 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         candidate = json.loads(
             (candidate_dir / "candidate.json").read_text(encoding="utf-8")
         )
+        android_smoke = {
+            "source_commit": self.source_commit,
+            "runtime_sha256": "6" * 64,
+            "bundle_sha256": "7" * 64,
+            "config_sha256": "8" * 64,
+            "architecture": candidate["architecture"],
+            "candidate_key": key,
+        }
         native_path = candidate_dir / "native-result.json"
         native_path.write_text(
             json.dumps(
                 {
-                    "schema": 3,
+                    "schema": 4,
                     "type": "ubuntu2604-local-secure-boot-acceptance",
                     "architecture": candidate["architecture"],
                     "flavor": candidate["flavor"],
@@ -625,6 +649,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                         "fallback_uki_sha256"
                     ],
                     "contracts": list(release.native_contracts("core")),
+                    "android_smoke": android_smoke,
                 }
             ),
             encoding="utf-8",
@@ -642,6 +667,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             set(result["contracts"]),
             release.CORE_NATIVE_CONTRACTS,
         )
+        self.assertEqual(result["android_smoke"], android_smoke)
 
         for field, replacement in (
             ("schema", 1),
@@ -649,8 +675,11 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             ("virtual_size", candidate["virtual_size"] + 1),
             ("candidate_sha256", "0" * 64),
             ("contracts", list(release.native_contracts("full"))),
+            ("android_smoke", {**android_smoke, "architecture": "x86_64"}),
+            ("android_smoke", {**android_smoke, "candidate_key": "x86_64-core"}),
+            ("android_smoke", {**android_smoke, "runtime_sha256": "F" * 64}),
         ):
-            with self.subTest(field=field):
+            with self.subTest(field=field, replacement=replacement):
                 document = json.loads(native_path.read_text(encoding="utf-8"))
                 document[field] = replacement
                 native_path.write_text(json.dumps(document), encoding="utf-8")
@@ -663,7 +692,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                         source_commit=self.source_commit,
                     )
                 document[field] = (
-                    3
+                    4
                     if field == "schema"
                     else candidate["architecture"]
                     if field == "architecture"
@@ -671,6 +700,8 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                     if field == "virtual_size"
                     else candidate["sha256"]
                     if field == "candidate_sha256"
+                    else android_smoke
+                    if field == "android_smoke"
                     else list(release.native_contracts("core"))
                 )
                 native_path.write_text(json.dumps(document), encoding="utf-8")
@@ -706,6 +737,10 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                 "binder-boot-required",
                 "binderfs-dynamic-devices",
                 "binder-device-usability",
+                "android-smoke-artifact-provenance",
+                "android-container-boot-completed",
+                "android-container-abi-match",
+                "android-smoke-graceful-stop",
             },
         )
 
@@ -764,6 +799,10 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                 "no-anbox-evidence",
                 "binderfs-mounted",
                 "binder-devices-usable",
+                "android-smoke-provenance-bound",
+                "android-container-boot-completed",
+                "android-container-abi-matched",
+                "android-container-graceful-stop",
             },
         )
 
@@ -819,6 +858,129 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                         key=key,
                         source_commit=self.source_commit,
                     )
+
+    def test_core_azure_result_binds_android_smoke_provenance(self):
+        key = "x86_64-core"
+        self.make_bundle(key)
+        result_path = self.azure / key / "azure-result.json"
+        document = json.loads(result_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            document["android_smoke"],
+            {
+                "source_commit": self.source_commit,
+                "runtime_sha256": "6" * 64,
+                "bundle_sha256": "7" * 64,
+                "config_sha256": "8" * 64,
+                "architecture": "x86_64",
+                "candidate_key": key,
+            },
+        )
+        candidate_dir = self.candidates / key
+        result = release.validate_azure_result(
+            candidate_dir / "candidate.json",
+            candidate_dir / release.CANDIDATE_EXPECTED[key][2],
+            result_path,
+            key=key,
+            source_commit=self.source_commit,
+        )
+        self.assertEqual(result["android_smoke"]["candidate_key"], key)
+
+    def test_full_azure_result_never_carries_android_smoke_provenance(self):
+        key = "x86_64-full"
+        self.make_bundle(key)
+        result_path = self.azure / key / "azure-result.json"
+        document = json.loads(result_path.read_text(encoding="utf-8"))
+        self.assertNotIn("android_smoke", document)
+        candidate_dir = self.candidates / key
+        # Injecting android_smoke into a full-flavor result must be rejected:
+        # the full azure result field set is exact and does not include it.
+        self.rewrite(
+            result_path,
+            lambda value: value.__setitem__(
+                "android_smoke",
+                {
+                    "source_commit": self.source_commit,
+                    "runtime_sha256": "6" * 64,
+                    "bundle_sha256": "7" * 64,
+                    "config_sha256": "8" * 64,
+                    "architecture": "x86_64",
+                    "candidate_key": key,
+                },
+            ),
+        )
+        with self.assertRaises(SystemExit):
+            release.validate_azure_result(
+                candidate_dir / "candidate.json",
+                candidate_dir / release.CANDIDATE_EXPECTED[key][2],
+                result_path,
+                key=key,
+                source_commit=self.source_commit,
+            )
+
+    def test_azure_result_command_rejects_android_smoke_args_for_full_flavor(self):
+        key = "x86_64-full"
+        self.make_bundle(key)
+        args = self.azure_result_args(key)
+        args.android_smoke_source_commit = self.source_commit
+        with self.assertRaises(SystemExit):
+            release.azure_result_command(args)
+
+    def test_azure_result_command_requires_android_smoke_args_for_core_flavor(self):
+        key = "x86_64-core"
+        self.make_bundle(key)
+        for field in (
+            "android_smoke_source_commit",
+            "android_smoke_runtime_sha256",
+            "android_smoke_bundle_sha256",
+            "android_smoke_config_sha256",
+        ):
+            with self.subTest(field=field):
+                args = self.azure_result_args(key)
+                setattr(args, field, None)
+                with self.assertRaises(SystemExit):
+                    release.azure_result_command(args)
+
+    def test_core_azure_result_rejects_android_smoke_provenance_mismatches(self):
+        key = "x86_64-core"
+        self.make_bundle(key)
+        result_path = self.azure / key / "azure-result.json"
+        candidate_dir = self.candidates / key
+        mutations = {
+            "source_commit": "not-a-commit",
+            "runtime_sha256": "F" * 64,
+            "bundle_sha256": "not-a-digest",
+            "architecture": "aarch64",
+            "candidate_key": "aarch64-core",
+        }
+        for field, replacement in mutations.items():
+            with self.subTest(field=field):
+                self.rewrite(
+                    result_path,
+                    lambda value, field=field, replacement=replacement: (
+                        value["android_smoke"].__setitem__(field, replacement)
+                    ),
+                )
+                with self.assertRaises(SystemExit):
+                    release.validate_azure_result(
+                        candidate_dir / "candidate.json",
+                        candidate_dir / release.CANDIDATE_EXPECTED[key][2],
+                        result_path,
+                        key=key,
+                        source_commit=self.source_commit,
+                    )
+                self.rewrite(
+                    result_path,
+                    lambda value, key=key: value["android_smoke"].update(
+                        {
+                            "source_commit": self.source_commit,
+                            "runtime_sha256": "6" * 64,
+                            "bundle_sha256": "7" * 64,
+                            "config_sha256": "8" * 64,
+                            "architecture": "x86_64",
+                            "candidate_key": key,
+                        }
+                    ),
+                )
 
     def test_azure_result_command_rejects_noncanonical_contract_argument(self):
         key = "x86_64-core"
