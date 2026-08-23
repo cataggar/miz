@@ -14,6 +14,10 @@
 //!     exec.
 //!   - supervise provisioning, foreground sshd, and an optional diagnostic
 //!     serial shell as direct children, reaping every exited child
+//!   - opt-in (`vmizinit.binder=required`) signed Binder boot setup for a
+//!     core Android-container image: load binder_linux, mount binderfs, and
+//!     create the binder/hwbinder/vndbinder control devices, failing closed
+//!     (no service startup, no readiness announcement) if that fails
 //! Root stays mounted read-only by default (matches the dm-verity/immutable
 //! image philosophy elsewhere in this project). `vmizinit.mode=persistent`
 //! opts into a writable root for generalized VM images whose provisioned
@@ -283,13 +287,24 @@ const AzurePolicy = enum {
     off,
 };
 
+/// Whether the signed Binder boot setup below (module load, binderfs mount,
+/// binder/hwbinder/vndbinder device creation) is required for this boot.
+/// Opt-in and disabled by default: only a core Android-container image with
+/// the matching kernel and packaged module should ever set `required`.
+const BinderPolicy = enum {
+    disabled,
+    required,
+};
+
 const BootConfig = struct {
     mode: BootMode = .immutable,
     azure_policy: AzurePolicy = .auto,
     shell_enabled: bool = false,
+    binder_policy: BinderPolicy = .disabled,
     invalid_mode: ?[]const u8 = null,
     invalid_azure_policy: ?[]const u8 = null,
     invalid_shell: ?[]const u8 = null,
+    invalid_binder_policy: ?[]const u8 = null,
 };
 
 fn parseBootConfig(cmdline: []const u8) BootConfig {
@@ -331,6 +346,19 @@ fn parseBootConfig(cmdline: []const u8) BootConfig {
             } else {
                 config.shell_enabled = false;
                 config.invalid_shell = value;
+            }
+            // No legacy zvminit.* alias: this option is new, unlike mode/azure/shell.
+        } else if (std.mem.startsWith(u8, token, "vmizinit.binder=")) {
+            const value = token["vmizinit.binder=".len..];
+            if (std.mem.eql(u8, value, "required")) {
+                config.binder_policy = .required;
+                config.invalid_binder_policy = null;
+            } else if (std.mem.eql(u8, value, "disabled")) {
+                config.binder_policy = .disabled;
+                config.invalid_binder_policy = null;
+            } else {
+                config.binder_policy = .disabled;
+                config.invalid_binder_policy = value;
             }
         }
     }
@@ -389,6 +417,12 @@ fn readBootConfig() BootConfig {
         const msg = std.fmt.bufPrint(&msg_buf, "[vmizinit] invalid vmizinit.shell={s}; keeping diagnostic shell off\r\n", .{value}) catch "[vmizinit] invalid vmizinit.shell; keeping diagnostic shell off\r\n";
         writeStr(msg);
         config.invalid_shell = null;
+    }
+    if (config.invalid_binder_policy) |value| {
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "[vmizinit] invalid vmizinit.binder={s}; keeping binder disabled\r\n", .{value}) catch "[vmizinit] invalid vmizinit.binder; keeping binder disabled\r\n";
+        writeStr(msg);
+        config.invalid_binder_policy = null;
     }
     return config;
 }
@@ -772,6 +806,213 @@ fn loadBootModules(mode: BootMode) void {
     loadModuleAt(gpa, release, "kernel/lib/crc/crc-itu-t.ko.xz");
     loadModuleAt(gpa, release, "kernel/fs/udf/udf.ko.xz");
     loadModuleAt(gpa, release, "kernel/fs/isofs/isofs.ko.xz");
+}
+
+// ============================== Binder boot setup ==============================
+// Opt-in via `vmizinit.binder=required` (default: disabled). A core
+// Android-container image with the matching signed kernel module sets this
+// so an in-guest Binder workload has a working IPC transport before any
+// service starts: load binder_linux, mount binderfs, and create the
+// binder/hwbinder/vndbinder control devices.
+//
+// This is deliberately not built on loadModuleAt() above: that path only
+// ever handles a raw, uncompressed-after-decompress `.ko.xz` and a plain
+// init_module(), which is fine for this appliance's own best-effort modules
+// but wrong for a package-signed one. Ubuntu ships binder_linux compressed
+// and signed as `binder_linux.ko.zst`; finit_module()'s
+// MODULE_INIT_COMPRESSED_FILE flag asks the kernel itself to decompress the
+// file (CONFIG_MODULE_DECOMPRESS) before running its normal
+// signature-verified load path, so vmizinit never touches -- and so never
+// risks corrupting -- the signed bytes.
+const android_binder_module_name = "binder_linux";
+const binderfs_mount_point = "/dev/binderfs";
+const binder_control_path = binderfs_mount_point ++ "/binder-control";
+
+/// finit_module(2) flag telling the kernel the supplied file descriptor is
+/// compressed and should be decompressed in-kernel before the normal
+/// signature-verified module load path runs.
+const MODULE_INIT_COMPRESSED_FILE: u32 = 4;
+
+/// From <linux/android/binderfs.h>: BINDERFS_MAX_NAME is 255, so `name` holds
+/// up to 255 bytes plus a trailing NUL.
+const binderfs_max_name = 255;
+
+/// Mirrors `struct binderfs_device` from <linux/android/binderfs.h>.
+const BinderfsDevice = extern struct {
+    name: [binderfs_max_name + 1]u8,
+    major: u32,
+    minor: u32,
+};
+
+/// `_IOWR('b', 1, struct binderfs_device)` per <linux/android/binderfs.h>,
+/// computed the same way the kernel's own ioctl.h macros would rather than
+/// hand-encoded, so it stays correct if `BinderfsDevice`'s layout ever
+/// changes.
+const binder_ctl_add: u32 = linux.IOCTL.IOWR('b', 1, BinderfsDevice);
+
+const BinderDeviceName = enum {
+    binder,
+    hwbinder,
+    vndbinder,
+
+    fn asBytes(self: BinderDeviceName) []const u8 {
+        return switch (self) {
+            .binder => "binder",
+            .hwbinder => "hwbinder",
+            .vndbinder => "vndbinder",
+        };
+    }
+};
+
+/// Every binderfs-backed device this appliance's Binder workload needs.
+const binder_devices = [_]BinderDeviceName{ .binder, .hwbinder, .vndbinder };
+
+const BinderModuleCandidate = struct {
+    rel_path: []const u8,
+    flags: u32,
+};
+
+/// Candidates are tried in order: the compressed module Ubuntu actually
+/// ships first (asking the kernel to decompress and verify it), then a
+/// plain uncompressed `.ko` as a fallback for any kernel that ships
+/// binder_linux that way instead.
+fn binderModuleCandidates() [2]BinderModuleCandidate {
+    return .{
+        .{ .rel_path = "kernel/drivers/android/" ++ android_binder_module_name ++ ".ko.zst", .flags = MODULE_INIT_COMPRESSED_FILE },
+        .{ .rel_path = "kernel/drivers/android/" ++ android_binder_module_name ++ ".ko", .flags = 0 },
+    };
+}
+
+/// The state-machine decision, separated from the syscalls that produce
+/// `linux.E` values so it can be tested on a build host: an `errno` result is
+/// meaningless without knowing which value this particular step tolerates as
+/// "already done".
+fn binderStepResult(e: linux.E, already_done: linux.E) BinderStepResult {
+    return if (e == .SUCCESS or e == already_done) .ok else .failed;
+}
+
+const BinderStepResult = enum { ok, failed };
+
+const BinderSetupOutcome = enum {
+    /// `vmizinit.binder=required` was not set; nothing was attempted.
+    not_requested,
+    /// Module loaded, binderfs mounted, and all three control devices exist.
+    ready,
+    /// Required, but at least one step failed.
+    failed,
+};
+
+/// Pure fail-closed policy: a disabled policy never blocks anything, and a
+/// required policy is `.ready` only if every step succeeded (including
+/// having already been done, e.g. a second call after the module was already
+/// loaded), `.failed` otherwise.
+fn binderSetupOutcome(
+    policy: BinderPolicy,
+    module: BinderStepResult,
+    mount: BinderStepResult,
+    devices: BinderStepResult,
+) BinderSetupOutcome {
+    if (policy != .required) return .not_requested;
+    if (module == .failed or mount == .failed or devices == .failed) return .failed;
+    return .ready;
+}
+
+/// Whether service startup (azagent, the access provider) should proceed
+/// given the base gate already in effect (immutable mode, or persistent mode
+/// with a writable root) and this boot's Binder setup outcome. A required
+/// policy that failed always fails closed, regardless of the base gate.
+fn servicesAllowedAfterBinderSetup(base_allowed: bool, outcome: BinderSetupOutcome) bool {
+    return base_allowed and outcome != .failed;
+}
+
+fn binderModuleAlreadyLoaded() bool {
+    return linux.errno(linux.access("/sys/module/" ++ android_binder_module_name, linux.F_OK)) == .SUCCESS;
+}
+
+fn finitModuleAt(release: []const u8, rel_path: []const u8, flags: u32) linux.E {
+    var path_buf: [256:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/lib/modules/{s}/{s}", .{ release, rel_path }) catch return .NAMETOOLONG;
+
+    const fd_rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    const open_error = linux.errno(fd_rc);
+    if (open_error != .SUCCESS) return open_error;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+
+    const rc = linux.syscall3(.finit_module, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(""), @as(usize, flags));
+    return linux.errno(rc);
+}
+
+fn loadBinderModule(release: []const u8) linux.E {
+    if (binderModuleAlreadyLoaded()) return .EXIST;
+    var last_error: linux.E = .NOENT;
+    for (binderModuleCandidates()) |candidate| {
+        const e = finitModuleAt(release, candidate.rel_path, candidate.flags);
+        if (e == .SUCCESS or e == .EXIST) return e;
+        last_error = e;
+    }
+    return last_error;
+}
+
+fn mountBinderfs() linux.E {
+    return linux.errno(linux.mount("binder", binderfs_mount_point, "binder", 0, 0));
+}
+
+fn ensureBinderDevice(device: BinderDeviceName) linux.E {
+    const fd_rc = linux.open(binder_control_path, .{ .ACCMODE = .RDONLY }, 0);
+    const open_error = linux.errno(fd_rc);
+    if (open_error != .SUCCESS) return open_error;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+
+    var request: BinderfsDevice = std.mem.zeroes(BinderfsDevice);
+    const name = device.asBytes();
+    @memcpy(request.name[0..name.len], name);
+
+    return linux.errno(linux.ioctl(fd, binder_ctl_add, @intFromPtr(&request)));
+}
+
+/// Runs once, after /proc, /sys, and /dev are mounted (main() mounts those
+/// before this is reached) and the boot command line has been parsed. Every
+/// step tolerates "already done" (module already loaded, binderfs already
+/// mounted, a control device that already exists), so calling this more than
+/// once -- or racing a kernel that already brought Binder up -- is a no-op
+/// rather than a spurious failure.
+fn configureBinder(policy: BinderPolicy) BinderSetupOutcome {
+    if (policy != .required) return .not_requested;
+
+    var uts: linux.utsname = undefined;
+    if (linux.errno(linux.uname(&uts)) != .SUCCESS) {
+        writeStr("[vmizinit] binder required: uname failed\r\n");
+        return .failed;
+    }
+    const release = std.mem.sliceTo(&uts.release, 0);
+
+    const module = binderStepResult(loadBinderModule(release), .EXIST);
+    if (module == .failed) writeStr("[vmizinit] binder required: loading binder_linux failed\r\n");
+
+    mkdirIgnoreExists(binderfs_mount_point);
+    const mount = binderStepResult(mountBinderfs(), .BUSY);
+    if (mount == .failed) writeStr("[vmizinit] binder required: mounting binderfs failed\r\n");
+
+    var devices: BinderStepResult = .ok;
+    if (mount == .ok) {
+        for (binder_devices) |device| {
+            const e = ensureBinderDevice(device);
+            if (binderStepResult(e, .EXIST) == .failed) {
+                devices = .failed;
+                writeErrno("[vmizinit] binder required: BINDER_CTL_ADD failed", e);
+            }
+        }
+    } else {
+        devices = .failed;
+    }
+
+    const outcome = binderSetupOutcome(policy, module, mount, devices);
+    if (outcome == .ready) {
+        writeStr("[vmizinit] binder ready: binderfs mounted, binder/hwbinder/vndbinder available\r\n");
+    }
+    return outcome;
 }
 
 // ============================== networking ==============================
@@ -1504,6 +1745,7 @@ const Supervisor = struct {
     cached: ?AzureDecision,
     persist_detection: bool,
     services_allowed: bool,
+    binder_setup_failed: bool,
     shell_enabled: bool,
     console_path: [*:0]const u8,
 
@@ -1690,6 +1932,7 @@ fn initializeSupervisor(
     cached: ?AzureDecision,
     persist_detection: bool,
     services_allowed: bool,
+    binder_setup_failed: bool,
     console_path: [*:0]const u8,
 ) Supervisor {
     const media: provisioning_media.ProbeResult = if (boot_config.azure_policy == .auto and services_allowed)
@@ -1711,6 +1954,7 @@ fn initializeSupervisor(
         .cached = cached,
         .persist_detection = persist_detection,
         .services_allowed = services_allowed,
+        .binder_setup_failed = binder_setup_failed,
         .shell_enabled = boot_config.shell_enabled,
         .console_path = console_path,
     };
@@ -1769,7 +2013,17 @@ fn supervisorLoop(supervisor: *Supervisor) noreturn {
     } else {
         writeStr("[vmizinit] diagnostic root shell disabled\r\n");
     }
-    writeStr("[vmizinit] VMIZINIT_PID1_READY supervisor loop active\r\n");
+    // A required Binder policy that failed to come up stops readiness
+    // rather than silently degrading like other best-effort boot steps:
+    // the machine still runs (reaping children, honoring shutdown, and an
+    // explicitly enabled diagnostic shell), but never announces itself
+    // ready and never starts azagent or the access provider (see
+    // services_allowed above).
+    if (supervisor.binder_setup_failed) {
+        writeStr("[vmizinit] binder required but unavailable; supervisor loop active but not ready\r\n");
+    } else {
+        writeStr("[vmizinit] VMIZINIT_PID1_READY supervisor loop active\r\n");
+    }
 
     while (true) {
         reapChildren(supervisor);
@@ -1848,6 +2102,7 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
     const boot_mode = boot_config.mode;
     const persistent_root_ready = if (boot_mode == .persistent) remountRootWritable() else false;
     loadBootModules(boot_mode);
+    const binder_outcome = configureBinder(boot_config.binder_policy);
     mountIgnoreBusy("tmpfs", "/tmp", "tmpfs", 0);
     if (boot_mode == .immutable) {
         mountImmutableWritableOverlays();
@@ -1874,7 +2129,8 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
         identity,
         cached,
         persist_detection,
-        boot_mode == .immutable or persistent_root_ready,
+        servicesAllowedAfterBinderSetup(boot_mode == .immutable or persistent_root_ready, binder_outcome),
+        binder_outcome == .failed,
         console_path,
     );
     supervisorLoop(&supervisor);
@@ -1936,6 +2192,33 @@ test "parseBootConfig rejects invalid values with safe defaults" {
     try std.testing.expectEqualStrings("yes", config.invalid_shell.?);
 }
 
+test "parseBootConfig defaults binder policy to disabled and accepts required independently of other options" {
+    const default_config = parseBootConfig("root=/dev/sda2 console=ttyS0");
+    try std.testing.expectEqual(BinderPolicy.disabled, default_config.binder_policy);
+
+    const required = parseBootConfig("vmizinit.mode=persistent vmizinit.azure=on vmizinit.binder=required console=ttyS0");
+    try std.testing.expectEqual(BinderPolicy.required, required.binder_policy);
+    try std.testing.expectEqual(BootMode.persistent, required.mode);
+    try std.testing.expectEqual(AzurePolicy.on, required.azure_policy);
+
+    const explicit_disabled = parseBootConfig("vmizinit.binder=disabled");
+    try std.testing.expectEqual(BinderPolicy.disabled, explicit_disabled.binder_policy);
+}
+
+test "parseBootConfig uses the last binder value and rejects invalid ones with a safe default" {
+    const last_wins = parseBootConfig("vmizinit.binder=required vmizinit.binder=disabled");
+    try std.testing.expectEqual(BinderPolicy.disabled, last_wins.binder_policy);
+    try std.testing.expectEqual(@as(?[]const u8, null), last_wins.invalid_binder_policy);
+
+    const invalid = parseBootConfig("vmizinit.binder=maybe");
+    try std.testing.expectEqual(BinderPolicy.disabled, invalid.binder_policy);
+    try std.testing.expectEqualStrings("maybe", invalid.invalid_binder_policy.?);
+
+    const recovered = parseBootConfig("vmizinit.binder=maybe vmizinit.binder=required");
+    try std.testing.expectEqual(BinderPolicy.required, recovered.binder_policy);
+    try std.testing.expectEqual(@as(?[]const u8, null), recovered.invalid_binder_policy);
+}
+
 test "serial console discovery prefers the last serial cmdline entry then active console" {
     try std.testing.expectEqualStrings(
         "ttyAMA1",
@@ -1954,6 +2237,61 @@ test "access provider restart backoff is exponential and bounded" {
     try std.testing.expectEqual(@as(u32, 16), nextAccessBackoff(8));
     try std.testing.expectEqual(access_max_backoff_seconds, nextAccessBackoff(16));
     try std.testing.expectEqual(access_max_backoff_seconds, nextAccessBackoff(access_max_backoff_seconds));
+}
+
+test "binder module candidates try kernel-decompressed .ko.zst before a plain .ko fallback" {
+    const candidates = binderModuleCandidates();
+    try std.testing.expectEqual(@as(usize, 2), candidates.len);
+    try std.testing.expect(std.mem.endsWith(u8, candidates[0].rel_path, "binder_linux.ko.zst"));
+    try std.testing.expectEqual(MODULE_INIT_COMPRESSED_FILE, candidates[0].flags);
+    try std.testing.expect(std.mem.endsWith(u8, candidates[1].rel_path, "binder_linux.ko"));
+    try std.testing.expect(!std.mem.endsWith(u8, candidates[1].rel_path, ".zst"));
+    try std.testing.expectEqual(@as(u32, 0), candidates[1].flags);
+}
+
+test "binder devices are created in binder hwbinder vndbinder order" {
+    try std.testing.expectEqual(@as(usize, 3), binder_devices.len);
+    try std.testing.expectEqualStrings("binder", binder_devices[0].asBytes());
+    try std.testing.expectEqualStrings("hwbinder", binder_devices[1].asBytes());
+    try std.testing.expectEqualStrings("vndbinder", binder_devices[2].asBytes());
+}
+
+test "BINDER_CTL_ADD matches the kernel's binderfs_device layout and _IOWR encoding" {
+    // struct binderfs_device { char name[256]; __u32 major; __u32 minor; };
+    try std.testing.expectEqual(@as(usize, 264), @sizeOf(BinderfsDevice));
+    // _IOWR('b', 1, struct binderfs_device) per <linux/android/binderfs.h>.
+    try std.testing.expectEqual(@as(u32, 0xC1086201), binder_ctl_add);
+}
+
+test "binder step results tolerate exactly the already-done errno for that step" {
+    try std.testing.expectEqual(BinderStepResult.ok, binderStepResult(.SUCCESS, .EXIST));
+    try std.testing.expectEqual(BinderStepResult.ok, binderStepResult(.EXIST, .EXIST));
+    try std.testing.expectEqual(BinderStepResult.failed, binderStepResult(.NOENT, .EXIST));
+    try std.testing.expectEqual(BinderStepResult.failed, binderStepResult(.BUSY, .EXIST));
+
+    try std.testing.expectEqual(BinderStepResult.ok, binderStepResult(.SUCCESS, .BUSY));
+    try std.testing.expectEqual(BinderStepResult.ok, binderStepResult(.BUSY, .BUSY));
+    try std.testing.expectEqual(BinderStepResult.failed, binderStepResult(.NODEV, .BUSY));
+}
+
+test "binder setup outcome is not_requested when disabled and fails closed on any required step failure" {
+    try std.testing.expectEqual(BinderSetupOutcome.not_requested, binderSetupOutcome(.disabled, .failed, .failed, .failed));
+    try std.testing.expectEqual(BinderSetupOutcome.not_requested, binderSetupOutcome(.disabled, .ok, .ok, .ok));
+
+    try std.testing.expectEqual(BinderSetupOutcome.ready, binderSetupOutcome(.required, .ok, .ok, .ok));
+    try std.testing.expectEqual(BinderSetupOutcome.failed, binderSetupOutcome(.required, .failed, .ok, .ok));
+    try std.testing.expectEqual(BinderSetupOutcome.failed, binderSetupOutcome(.required, .ok, .failed, .ok));
+    try std.testing.expectEqual(BinderSetupOutcome.failed, binderSetupOutcome(.required, .ok, .ok, .failed));
+}
+
+test "servicesAllowedAfterBinderSetup fails closed only on a failed required binder outcome" {
+    try std.testing.expect(servicesAllowedAfterBinderSetup(true, .not_requested));
+    try std.testing.expect(servicesAllowedAfterBinderSetup(true, .ready));
+    try std.testing.expect(!servicesAllowedAfterBinderSetup(true, .failed));
+    // A base gate that was already closed (e.g. persistent mode without a
+    // writable root) stays closed regardless of the binder outcome.
+    try std.testing.expect(!servicesAllowedAfterBinderSetup(false, .ready));
+    try std.testing.expect(!servicesAllowedAfterBinderSetup(false, .not_requested));
 }
 
 test "service gates require provisionable media for azagent and sentinel for sshd" {

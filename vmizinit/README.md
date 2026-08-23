@@ -6,6 +6,21 @@ A minimal (~160 KB), statically-linked PID 1 replacement for real-boot testing o
 
 - Mounts `/proc`, `/sys`, `/dev`, and `/run`. Immutable mode is the default: root stays read-only, `/var` and `/tmp` use tmpfs, and `/etc` uses a tmpfs-backed overlay. The opt-in `vmizinit.mode=persistent` kernel option instead remounts root read-write, leaves `/etc`, `/var`, and `/home` persistent, and mounts only `/tmp` as tmpfs. If `/etc/machine-id` is empty after image generalization, vmizinit generates and persists a new 128-bit machine ID.
 - Loads the kernel modules this appliance needs directly via a raw `init_module()` syscall (decompressing the shipped `.ko.xz` with `std.compress.xz`): `overlay` for immutable `/etc`, `hv_netvsc` for Hyper-V networking, and `crc-itu-t`/`udf`/`isofs` for Azure's provisioning DVD. There's no udev/mdev daemon to drive `request_module()` through modprobe/kmod, so vmizinit loads the fixed dependency order itself.
+- The opt-in `vmizinit.binder=required` kernel option (default `disabled`)
+  turns on signed Binder boot setup for an Android-container Binder
+  workload, run once the required kernel filesystems are mounted and before
+  services start. It is deliberately not the raw `.ko.xz`/`init_module()`
+  path above: the packaged module is Ubuntu's signed, zstd-compressed
+  `binder_linux.ko.zst`, so vmizinit calls `finit_module()` directly against
+  the packaged file with `MODULE_INIT_COMPRESSED_FILE`, letting the kernel
+  itself decompress and verify the signature rather than ever touching the
+  signed bytes. It then mounts binderfs at `/dev/binderfs` and creates
+  `binder`, `hwbinder`, and `vndbinder` through binderfs's `BINDER_CTL_ADD`
+  device-control ioctl. Every step tolerates already having been done, so
+  repeating setup across a restart is not a failure. When required, any step
+  failing is fatal to readiness: vmizinit suppresses its ready line and does
+  not start `sshd` or `azagent`, rather than booting into a machine that
+  looks up but has no working Binder workload.
 - Mounts the ESP, sets the hostname, brings up loopback, then runs a small
   DHCP client on the first non-`lo` interface it finds and writes
   `/etc/resolv.conf`. DHCP replies are received on a raw `AF_PACKET` socket
@@ -113,6 +128,14 @@ vmiz build-image --iso <azurelinux.iso> --container <oci-layout-with-vmizinit-ag
 `vmizinit.shell=off` is also the default. Add `vmizinit.shell=on` only to a
 temporary diagnostic boot command line when unauthenticated serial root access
 is acceptable. Released builder command lines intentionally omit it.
+
+`vmizinit.binder=disabled` is the default, and an invalid value is treated the
+same way. Add `vmizinit.binder=required` to a Binder-capable image's kernel
+options (alongside `linux-azure`'s signed `binder_linux` module, kernel
+config, and initramfs contents, all validated at build time -- see
+[`doc/ubuntu.md`](../doc/ubuntu.md)) to have vmizinit load the module, mount
+binderfs, and create its devices before starting services, and to fail
+closed on any setup step required mode cannot complete.
 
 The `/sbin/poweroff`, `/sbin/reboot`, and `/sbin/shutdown` helper links signal
 PID 1 so the same complete child-drain path is used rather than rebooting

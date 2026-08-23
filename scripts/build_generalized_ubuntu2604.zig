@@ -280,6 +280,30 @@ const core_debz_packages = [_][]const u8{
     "openssh-server",
     "sudo",
 };
+
+// The official in-tree module name Ubuntu packages Android Binder support
+// as. `linux-azure` pulls it in transitively through
+// `linux-modules-extra-*-azure`, so no additional debz package root is
+// needed -- only validating that the module, its kernel config, and its
+// signature are what core actually ships.
+const android_binder_module_name = "binder_linux";
+
+// The `linux-azure` kernel config lines core's signed Binder support depends
+// on. `CONFIG_ANDROID_BINDER_IPC`/`CONFIG_ANDROID_BINDERFS` must be built as
+// modules (not builtin, not absent) so `binder_linux` ships as the loadable,
+// signed module vmizinit loads; `CONFIG_ANDROID_BINDER_DEVICES=""` keeps the
+// kernel from creating any binder device itself, since device creation is
+// vmizinit's job through binderfs, not a kernel command-line default; and
+// `CONFIG_MODULE_DECOMPRESS=y` is what lets vmizinit ask the kernel to
+// decompress and verify the packaged `.ko.zst` through `finit_module()`
+// without ever touching the signed bytes itself.
+const core_required_kernel_config = [_][]const u8{
+    "CONFIG_ANDROID_BINDER_IPC=m",
+    "CONFIG_ANDROID_BINDERFS=m",
+    "CONFIG_ANDROID_BINDER_DEVICES=\"\"",
+    "CONFIG_MODULE_DECOMPRESS=y",
+};
+
 // There is no `linux-nvidia-bos` meta package in the pinned snapshot -- the
 // only ones published are for builds that postdate it -- so the versioned
 // binary package is named directly. That name *is* the kernel release, which
@@ -331,6 +355,11 @@ const core_forbidden_packages = [_][]const u8{
     "walinuxagent",
     "ubuntu-server",
     "ubuntu-server-minimal",
+    // Out-of-tree Binder implementations: core's Binder workload must run
+    // only the official in-tree, signed module resolved above, never a
+    // DKMS-built shadow copy layered on top of it.
+    "anbox-modules-dkms",
+    "anbox-modules",
 };
 
 // Bare metal forbids everything core does, and `linux-azure` besides: pulling
@@ -341,6 +370,8 @@ const baremetal_forbidden_packages = [_][]const u8{
     "walinuxagent",
     "ubuntu-server",
     "ubuntu-server-minimal",
+    "anbox-modules-dkms",
+    "anbox-modules",
     "linux-azure",
 };
 
@@ -382,6 +413,14 @@ const core_azagent_config =
     "ResourceDisk.MountPoint=/d\n" ++
     "ResourceDisk.EnableSwap=n\n" ++
     "DataDisk.Mount=y\n";
+
+// Requests `binder_linux` explicitly rather than relying on `MODULES=most`'s
+// heuristics: an Android-container Binder workload needs it in the initramfs
+// module set `update-initramfs` builds, and this is checked below by both
+// `validateCoreKernelModules` (against the tree's `modules.dep`) and
+// `requireInitramfsModules` (against the generated initramfs itself, once it
+// exists).
+const core_initramfs_modules = android_binder_module_name ++ "\n";
 
 // An Azure VM's root is virtio or SCSI and its NIC is netvsc, so a
 // dependency-pruned initramfs built in that context carries neither the NVMe
@@ -1836,6 +1875,7 @@ fn validateCoreKernelModules(
     allocator: Allocator,
     root: *offline_root.Root,
     release_name: []const u8,
+    flavor: Flavor,
 ) !void {
     const modules_path = try kernelModulesPath(allocator, root, release_name);
     defer allocator.free(modules_path);
@@ -1850,6 +1890,100 @@ fn validateCoreKernelModules(
     for (&[_][]const u8{ "hv_netvsc.ko", "overlay.ko", "isofs.ko", "udf.ko", "xfs.ko" }) |module|
         if (std.mem.indexOf(u8, modules_dep, module) == null)
             return error.CoreKernelModuleMissing;
+    // Binder is an Azure-kernel-only capability: bare metal boots the NVIDIA
+    // BaseOS kernel and never claims Binder support, so this stays scoped to
+    // `.core` rather than joining the shared list above.
+    if (flavor == .core and std.mem.indexOf(u8, modules_dep, android_binder_module_name ++ ".ko") == null)
+        return error.CoreKernelModuleMissing;
+}
+
+/// The kernel's own trailer, appended after `struct module_signature` at the
+/// very end of a signed `.ko` (see <linux/module_signature.h>). Checking for
+/// it is a structural "is this module signed" check, not a cryptographic
+/// one: verifying a specific signer would mean pinning a certificate
+/// identity nothing in this build independently establishes, and the actual
+/// verification is the kernel's own signature-enforcing module loader.
+const module_signature_marker = "~Module signature appended~\n";
+
+fn hasModuleSignatureMarker(bytes: []const u8) bool {
+    return std.mem.endsWith(u8, bytes, module_signature_marker);
+}
+
+/// What was found and recorded about the packaged `binder_linux` module:
+/// used both to fail the build if it is missing, out-of-tree-shadowed, or
+/// unsigned, and to extend the boot-input evidence document with something
+/// checkable about it.
+const AndroidBinderModuleEvidence = struct {
+    path: []u8,
+    sha256: [64]u8,
+    signed: bool,
+};
+
+/// Locates the packaged `binder_linux` module under the kernel's own module
+/// tree, rejects a DKMS-built shadow copy that would otherwise take priority
+/// over it (`depmod`'s `updates/dkms` overlay directory), and confirms the
+/// packaged bytes carry the kernel's module-signing trailer. Deliberately
+/// does not decompress `.ko.zst` bytes for anything other than this
+/// structural check: the packaged bytes are exactly what get evidenced here
+/// and what vmizinit's `finit_module()` hands the kernel unmodified at boot.
+fn validateAndroidBinderModule(
+    allocator: Allocator,
+    root: *offline_root.Root,
+    release_name: []const u8,
+) !AndroidBinderModuleEvidence {
+    const modules_path = try kernelModulesPath(allocator, root, release_name);
+    defer allocator.free(modules_path);
+
+    const shadow_dir = try std.fmt.allocPrint(allocator, "{s}/updates/dkms", .{modules_path});
+    defer allocator.free(shadow_dir);
+    const shadow = root.discover(shadow_dir, "*") catch |err| switch (err) {
+        error.FileNotFound, error.NotDirectory => &.{},
+        else => return err,
+    };
+    defer root.freeFound(shadow);
+    if (shadow.len != 0) return error.ShadowBinderModulePresent;
+
+    const android_dir = try std.fmt.allocPrint(allocator, "{s}/kernel/drivers/android", .{modules_path});
+    defer allocator.free(android_dir);
+    const found = root.discover(android_dir, android_binder_module_name ++ ".ko*") catch |err| switch (err) {
+        error.FileNotFound, error.NotDirectory => return error.AndroidBinderModuleMissing,
+        else => return err,
+    };
+    defer root.freeFound(found);
+    if (found.len != 1) return error.AndroidBinderModuleMissing;
+
+    const module_path = try allocator.dupe(u8, found[0].path);
+    errdefer allocator.free(module_path);
+    const packaged = try root.readFile(module_path);
+    defer allocator.free(packaged);
+    const sha256 = artifact_pipeline.formatSha256(artifact_pipeline.sha256Bytes(packaged));
+
+    const signed = if (std.mem.endsWith(u8, module_path, ".zst")) signed: {
+        const decoded = vmiz.zstd.decodeAlloc(allocator, packaged) catch return error.AndroidBinderModuleUnreadable;
+        defer allocator.free(decoded.bytes);
+        break :signed hasModuleSignatureMarker(decoded.bytes);
+    } else hasModuleSignatureMarker(packaged);
+    if (!signed) return error.AndroidBinderModuleUnsigned;
+
+    return .{ .path = module_path, .sha256 = sha256, .signed = signed };
+}
+
+/// The `/boot/config-<release>` lines core's signed Binder support depends
+/// on must be present verbatim, the same way `validateCoreKernelModules`
+/// checks `modules.dep`: a plain substring search, since Ubuntu's kernel
+/// config is one setting per line and each of these is specific enough that
+/// a false-positive substring match is not a realistic concern.
+fn validateCoreKernelConfig(
+    allocator: Allocator,
+    root: *offline_root.Root,
+    release_name: []const u8,
+) !void {
+    const config_path = try std.fmt.allocPrint(allocator, "/boot/config-{s}", .{release_name});
+    defer allocator.free(config_path);
+    const config = try root.readFile(config_path);
+    defer allocator.free(config);
+    for (&core_required_kernel_config) |line|
+        if (std.mem.indexOf(u8, config, line) == null) return error.CoreKernelConfigMissing;
 }
 
 /// `signed_bytes` is what the signer returned, so this is the binding that matters: the UKI carried
@@ -1960,10 +2094,12 @@ fn customizeOfflineRoot(
         .core => {
             try root.apply(&.{
                 .{ .create_directory = .{ .path = "/etc/ssh/sshd_config.d", .mode = 0o755 } },
+                .{ .create_directory = .{ .path = "/etc/initramfs-tools", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/var/lib/vmiz", .mode = 0o755 } },
                 .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-vmizinit.conf", .source = .{ .inline_bytes = core_ssh_config }, .mode = 0o600 } },
                 .{ .write_file = .{ .path = "/etc/waagent.conf", .source = .{ .inline_bytes = core_azagent_config } } },
                 .{ .write_file = .{ .path = "/etc/resolv.conf", .source = .{ .inline_bytes = "" } } },
+                .{ .write_file = .{ .path = "/etc/initramfs-tools/modules", .source = .{ .inline_bytes = core_initramfs_modules } } },
             });
         },
         .baremetal => {
@@ -1985,7 +2121,14 @@ fn customizeOfflineRoot(
     // The module tree is `update-initramfs`'s input, so it is checked here;
     // the initramfs it produces is checked below, once it exists.
     try validateKernelModuleArtifacts(allocator, &root, release_name);
-    if (flavor.freshRoot()) try validateCoreKernelModules(allocator, &root, release_name);
+    if (flavor.freshRoot()) try validateCoreKernelModules(allocator, &root, release_name, flavor);
+
+    var binder_evidence: ?AndroidBinderModuleEvidence = null;
+    defer if (binder_evidence) |*evidence| allocator.free(evidence.path);
+    if (flavor == .core) {
+        try validateCoreKernelConfig(allocator, &root, release_name);
+        binder_evidence = try validateAndroidBinderModule(allocator, &root, release_name);
+    }
 
     var initramfs = try runOfflineCommand(&executor, .{ .update_initramfs = release_name });
     defer initramfs.deinit(allocator);
@@ -2078,6 +2221,15 @@ fn customizeOfflineRoot(
     const lock_sha256 = artifact_pipeline.formatSha256(lock_hash);
     const kernel_path = try std.fmt.allocPrint(allocator, "/boot/vmlinuz-{s}", .{release_name});
     defer allocator.free(kernel_path);
+    // Structural evidence only: this records that the required kernel config
+    // lines were present and that the packaged module carries a signature
+    // trailer, not a specific signer identity -- nothing here independently
+    // establishes what that signer should be, so asserting one would be
+    // invented, not verified.
+    const binder_kernel_config_verified: ?bool = if (flavor == .core) true else null;
+    const binder_module_path: ?[]const u8 = if (binder_evidence) |e| e.path else null;
+    const binder_module_sha256: ?[]const u8 = if (binder_evidence) |*e| @as([]const u8, &e.sha256) else null;
+    const binder_module_signed: ?bool = if (binder_evidence) |e| e.signed else null;
     const evidence = try std.json.Stringify.valueAlloc(allocator, .{
         .schema = 1,
         .type = "vmiz-ubuntu2604-boot-input-evidence",
@@ -2088,6 +2240,10 @@ fn customizeOfflineRoot(
         .modules = modules_path,
         .package_lock = "/var/lib/vmiz/ubuntu2604-package-lock.tsv",
         .package_lock_sha256 = @as([]const u8, &lock_sha256),
+        .binder_kernel_config_verified = binder_kernel_config_verified,
+        .binder_module_path = binder_module_path,
+        .binder_module_sha256 = binder_module_sha256,
+        .binder_module_signed = binder_module_signed,
     }, .{ .whitespace = .indent_2 });
     defer allocator.free(evidence);
     try Dir.cwd().writeFile(io, .{ .sub_path = evidence_path, .data = evidence });
@@ -3021,6 +3177,8 @@ fn extractNativeBootInputs(
     defer allocator.free(initrd);
     if (flavor == .baremetal)
         try requireInitramfsModules(allocator, initrd, &baremetal_required_initramfs_modules);
+    if (flavor == .core)
+        try requireInitramfsModules(allocator, initrd, &core_required_initramfs_modules);
     const os_release = try native_root.filesystem.read(allocator, "/usr/lib/os-release", 64 * 1024);
     defer allocator.free(os_release);
     const kernel_host = try std.fmt.allocPrint(allocator, "{s}/vmlinuz-{s}", .{ extract_dir, kernel_release });
@@ -3043,6 +3201,11 @@ fn extractNativeBootInputs(
 /// mount root or never appears on the network -- two failures that look
 /// identical from outside and are diagnosable only at the BMC console.
 const baremetal_required_initramfs_modules = [_][]const u8{ "nvme", "r8152" };
+
+/// The Android-container Binder driver core's boot depends on. Bare metal
+/// has no such requirement -- it boots no Binder workload at all -- so this
+/// stays a `.core`-only list rather than joining the one above.
+const core_required_initramfs_modules = [_][]const u8{android_binder_module_name};
 
 /// Fails unless every named module is inside the built initramfs.
 ///
@@ -4722,6 +4885,255 @@ test "the initramfs is validated as a generated artifact, not an unpacked one" {
     });
     try validateInitramfs(allocator, &root, kernel_release);
     try validateNativeBootArtifacts(allocator, &root, kernel_release);
+}
+
+test "core kernel config validation requires every Binder-enabling line" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const root_path = try std.fs.path.join(allocator, &.{ cwd, ".scratch/ubuntu-core-kernel-config" });
+    defer allocator.free(root_path);
+    Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, root_path);
+    var root = try offline_root.Root.init(allocator, io, root_path, .{});
+    defer root.deinit();
+    const kernel_release = "7.0.0-1001-azure";
+    try root.createDirectory("/boot", 0o755);
+
+    // Every required line present: the config core's Binder support needs.
+    try root.writeFile(.{
+        .path = "/boot/config-" ++ kernel_release,
+        .source = .{ .inline_bytes = 
+        \\CONFIG_ANDROID=y
+        \\CONFIG_ANDROID_BINDER_IPC=m
+        \\CONFIG_ANDROID_BINDERFS=m
+        \\CONFIG_ANDROID_BINDER_DEVICES=""
+        \\CONFIG_MODULE_DECOMPRESS=y
+        \\
+        },
+    });
+    try validateCoreKernelConfig(allocator, &root, kernel_release);
+
+    // Binder built directly in, rather than as the loadable module vmizinit
+    // expects to load, must be rejected just as absence would be.
+    try root.writeFile(.{
+        .path = "/boot/config-" ++ kernel_release,
+        .source = .{ .inline_bytes = 
+        \\CONFIG_ANDROID_BINDER_IPC=y
+        \\CONFIG_ANDROID_BINDERFS=m
+        \\CONFIG_ANDROID_BINDER_DEVICES=""
+        \\CONFIG_MODULE_DECOMPRESS=y
+        \\
+        },
+    });
+    try std.testing.expectError(
+        error.CoreKernelConfigMissing,
+        validateCoreKernelConfig(allocator, &root, kernel_release),
+    );
+
+    // A default device name is exactly the drift `vmizinit.binder=required`
+    // must not race with: the kernel would already own `/dev/binder`.
+    try root.writeFile(.{
+        .path = "/boot/config-" ++ kernel_release,
+        .source = .{ .inline_bytes = 
+        \\CONFIG_ANDROID_BINDER_IPC=m
+        \\CONFIG_ANDROID_BINDERFS=m
+        \\CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"
+        \\CONFIG_MODULE_DECOMPRESS=y
+        \\
+        },
+    });
+    try std.testing.expectError(
+        error.CoreKernelConfigMissing,
+        validateCoreKernelConfig(allocator, &root, kernel_release),
+    );
+}
+
+test "the packaged Android Binder module must be present signed and never DKMS-shadowed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const root_path = try std.fs.path.join(allocator, &.{ cwd, ".scratch/ubuntu-android-binder-module" });
+    defer allocator.free(root_path);
+    Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, root_path);
+    var root = try offline_root.Root.init(allocator, io, root_path, .{});
+    defer root.deinit();
+    const kernel_release = "7.0.0-1001-azure";
+    const android_dir = "/usr/lib/modules/" ++ kernel_release ++ "/kernel/drivers/android";
+    try root.createDirectory(android_dir, 0o755);
+    const signed_bytes = "binder-module-bytes" ++ module_signature_marker;
+    const unsigned_bytes = "binder-module-bytes-without-a-trailer";
+
+    // Nothing packaged yet: the offline root has no such module.
+    try std.testing.expectError(
+        error.AndroidBinderModuleMissing,
+        validateAndroidBinderModule(allocator, &root, kernel_release),
+    );
+
+    // The plain, uncompressed shape: signed and accepted.
+    try root.writeFile(.{
+        .path = android_dir ++ "/binder_linux.ko",
+        .source = .{ .inline_bytes = signed_bytes },
+    });
+    {
+        const evidence = try validateAndroidBinderModule(allocator, &root, kernel_release);
+        defer allocator.free(evidence.path);
+        try std.testing.expectEqualStrings(android_dir ++ "/binder_linux.ko", evidence.path);
+        try std.testing.expect(evidence.signed);
+    }
+    try root.remove(android_dir ++ "/binder_linux.ko", false);
+
+    // Signed, but Ubuntu-shaped: zstd-compressed, with the marker recovered
+    // only once the kernel-decompressed bytes are inspected.
+    {
+        var compressed: std.Io.Writer.Allocating = .init(allocator);
+        defer compressed.deinit();
+        try vmiz.zstd.writeRawFrameForSlice(&compressed.writer, signed_bytes, null);
+        try root.writeFile(.{
+            .path = android_dir ++ "/binder_linux.ko.zst",
+            .source = .{ .inline_bytes = compressed.written() },
+        });
+    }
+    {
+        const evidence = try validateAndroidBinderModule(allocator, &root, kernel_release);
+        defer allocator.free(evidence.path);
+        try std.testing.expectEqualStrings(android_dir ++ "/binder_linux.ko.zst", evidence.path);
+        try std.testing.expect(evidence.signed);
+    }
+
+    // Two candidates at once is exactly as unresolvable as none: which one
+    // vmizinit would load is not this builder's call to make silently.
+    try root.writeFile(.{
+        .path = android_dir ++ "/binder_linux.ko",
+        .source = .{ .inline_bytes = signed_bytes },
+    });
+    try std.testing.expectError(
+        error.AndroidBinderModuleMissing,
+        validateAndroidBinderModule(allocator, &root, kernel_release),
+    );
+    try root.remove(android_dir ++ "/binder_linux.ko", false);
+    try root.remove(android_dir ++ "/binder_linux.ko.zst", false);
+
+    // A packaged module missing the kernel's own signing trailer: structurally
+    // unsigned, regardless of what the build otherwise believes about it.
+    try root.writeFile(.{
+        .path = android_dir ++ "/binder_linux.ko",
+        .source = .{ .inline_bytes = unsigned_bytes },
+    });
+    try std.testing.expectError(
+        error.AndroidBinderModuleUnsigned,
+        validateAndroidBinderModule(allocator, &root, kernel_release),
+    );
+    try root.remove(android_dir ++ "/binder_linux.ko", false);
+
+    // A DKMS-built shadow tree overriding the in-tree module: rejected even
+    // when a legitimate, signed module is also present alongside it.
+    try root.writeFile(.{
+        .path = android_dir ++ "/binder_linux.ko",
+        .source = .{ .inline_bytes = signed_bytes },
+    });
+    try root.createDirectory("/usr/lib/modules/" ++ kernel_release ++ "/updates/dkms", 0o755);
+    try root.writeFile(.{
+        .path = "/usr/lib/modules/" ++ kernel_release ++ "/updates/dkms/anbox_binder.ko",
+        .source = .{ .inline_bytes = signed_bytes },
+    });
+    try std.testing.expectError(
+        error.ShadowBinderModulePresent,
+        validateAndroidBinderModule(allocator, &root, kernel_release),
+    );
+}
+
+test "core kernel module validation additionally requires the Binder module, bare metal does not" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const root_path = try std.fs.path.join(allocator, &.{ cwd, ".scratch/ubuntu-core-binder-modules-dep" });
+    defer allocator.free(root_path);
+    Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    try Io.Dir.cwd().createDirPath(io, root_path);
+    var root = try offline_root.Root.init(allocator, io, root_path, .{});
+    defer root.deinit();
+    const kernel_release = "7.0.0-1001-azure";
+    try root.createDirectory("/usr/lib/modules/" ++ kernel_release, 0o755);
+    try root.writeFile(.{
+        .path = "/usr/lib/modules/" ++ kernel_release ++ "/modules.dep",
+        .source = .{ .inline_bytes = "kernel/drivers/net/hv_netvsc.ko:\nkernel/fs/overlayfs/overlay.ko:\nkernel/fs/isofs/isofs.ko:\nkernel/fs/udf/udf.ko:\nkernel/fs/xfs/xfs.ko:\n" },
+    });
+
+    // Every other required core module is present, but Binder's is not.
+    try std.testing.expectError(
+        error.CoreKernelModuleMissing,
+        validateCoreKernelModules(allocator, &root, kernel_release, .core),
+    );
+
+    // Bare metal never claims Binder support, so the same tree passes for it.
+    try validateCoreKernelModules(allocator, &root, kernel_release, .baremetal);
+
+    try root.writeFile(.{
+        .path = "/usr/lib/modules/" ++ kernel_release ++ "/modules.dep",
+        .source = .{ .inline_bytes = "kernel/drivers/net/hv_netvsc.ko:\nkernel/fs/overlayfs/overlay.ko:\nkernel/fs/isofs/isofs.ko:\nkernel/fs/udf/udf.ko:\nkernel/fs/xfs/xfs.ko:\nkernel/drivers/android/binder_linux.ko:\n" },
+    });
+    try validateCoreKernelModules(allocator, &root, kernel_release, .core);
+}
+
+test "core initramfs validation requires the packaged Binder module" {
+    const allocator = std.testing.allocator;
+    const pack = struct {
+        fn archive(a: Allocator, paths: []const []const u8) ![]u8 {
+            var buffer = std.array_list.Managed(u8).init(a);
+            errdefer buffer.deinit();
+            var writer = vmiz.cpio.Writer.init(&buffer, .newc);
+            for (paths) |path| try writer.append(.{
+                .path = path,
+                .content = "module",
+                .metadata = .{ .mode = 0o100644, .nlink = 1 },
+            });
+            try writer.finish();
+            return buffer.toOwnedSlice();
+        }
+
+        fn image(a: Allocator, payload: []const []const u8) ![]u8 {
+            const main_bytes = try archive(a, payload);
+            defer a.free(main_bytes);
+            var out: std.Io.Writer.Allocating = .init(a);
+            errdefer out.deinit();
+            try vmiz.zstd.writeRawFrameForSlice(&out.writer, main_bytes, null);
+            return out.toOwnedSlice();
+        }
+    };
+
+    const missing_binder = try pack.image(allocator, &.{"kernel/fs/ext4/ext4.ko.zst"});
+    defer allocator.free(missing_binder);
+    try std.testing.expectError(
+        error.InitramfsModuleMissing,
+        requireInitramfsModules(allocator, missing_binder, &core_required_initramfs_modules),
+    );
+
+    const with_binder = try pack.image(allocator, &.{ "kernel/fs/ext4/ext4.ko.zst", "kernel/drivers/android/binder_linux.ko.zst" });
+    defer allocator.free(with_binder);
+    try requireInitramfsModules(allocator, with_binder, &core_required_initramfs_modules);
+}
+
+test "core package policy rejects Anbox DKMS shadow packages" {
+    const inventory =
+        "ca-certificates\t1\tall\n" ++
+        "linux-azure\t7.0\tamd64\n" ++
+        "openssh-client\t10.2\tamd64\n" ++
+        "openssh-server\t10.2\tamd64\n" ++
+        "sudo\t1.9\tamd64\n" ++
+        "ubuntu-minimal\t1\tamd64\n";
+    try validateExactLock(inventory, profileFor(.x86_64), .core);
+    try std.testing.expectError(
+        error.ForbiddenCorePackage,
+        validateExactLock(inventory ++ "anbox-modules-dkms\t1\tamd64\n", profileFor(.x86_64), .core),
+    );
 }
 
 test "native ESP UKI validation preserves exact signed bytes and machine" {

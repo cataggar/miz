@@ -175,6 +175,48 @@ separate instances must not inherit them from the candidate.
 
 `--proxy <url>` reaches the Canonical cloud image and the Ubuntu archive through an HTTP proxy, for a build host with no direct egress. It is named explicitly rather than read from `http_proxy` or `https_proxy`, so a build's egress path is a stated input like every other one and cannot change because of an ambient variable, and it is rejected before anything is downloaded if it is malformed. A proxy carrying a credential is refused, because the credential would have to travel in an argument or an environment variable to get here; debz refuses those on the same grounds. TLS is unaffected: the proxy is asked to `CONNECT`, the session is negotiated end to end with the origin, and the pinned digests and archive signatures still verify the bytes that origin served. The same value is passed to debz, so package download takes the same path the image download does.
 
+### Signed Binder boot
+
+Core's kernel is checked against four `/boot/config-<release>` lines:
+`CONFIG_ANDROID_BINDER_IPC=m` and `CONFIG_ANDROID_BINDERFS=m` so Binder ships
+as the loadable, signed `binder_linux` module rather than builtin or absent;
+`CONFIG_ANDROID_BINDER_DEVICES=""` so the kernel creates no binder device on
+its own, leaving device creation entirely to vmizinit through binderfs; and
+`CONFIG_MODULE_DECOMPRESS=y`, which is what lets the kernel decompress and
+verify the packaged, signed `.ko.zst` on vmizinit's behalf.
+
+The builder locates the packaged `binder_linux` module under the kernel's own
+module tree, rejects the build if a DKMS-built shadow tree
+(`updates/dkms/`) is present at all -- an Anbox-style out-of-tree Binder
+implementation is exactly what this refuses to boot -- and confirms the
+packaged bytes end in the kernel's own module-signing trailer before
+recording their path and digest as boot-input evidence. It asserts only that
+the module is signed, not by whom: the running kernel's own signature
+enforcement is the actual verifier. `anbox-modules-dkms` and `anbox-modules`
+are also forbidden core package names, checked the same way every other
+forbidden package is. Core's `/etc/initramfs-tools/modules` requests
+`binder_linux` explicitly, and the generated initramfs is read back and
+required to contain it, the same way bare metal's is checked for `nvme` and
+`r8152`.
+
+None of this runs anything at boot by itself. A Binder workload is opt-in:
+the UKI cmdline only requests it when built with `vmizinit.binder=required`
+added alongside the flavor's other `vmizinit.*` options. When present,
+vmizinit -- after mounting the required kernel filesystems and before
+starting `sshd` or `azagent` -- loads `binder_linux` with `finit_module()`
+against the packaged, possibly `.ko.zst`-compressed module file (asking the
+kernel to decompress and verify it, never decompressing or touching the
+signed bytes itself), mounts binderfs at `/dev/binderfs`, and creates
+`binder`, `hwbinder`, and `vndbinder` through binderfs's `BINDER_CTL_ADD`
+device-control ioctl. Every step tolerates already having been done (an
+already-loaded module, an already-mounted binderfs, an already-created
+device), so a restart or a race with a previous boot's partial setup is not a
+failure. A required-mode failure at any step is fatal to readiness: vmizinit
+never prints its ready line and never starts `sshd` or `azagent`, rather than
+booting into a machine that looks up but has no working Binder workload.
+`vmizinit.binder=disabled` (also the default when the option is absent) skips
+all of this.
+
 ### Bare metal
 
 The bare-metal guest is the core guest on a physical machine, and every
