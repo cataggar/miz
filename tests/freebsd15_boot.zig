@@ -305,11 +305,22 @@ const ssh_capture_script =
 //
 // Job control puts the workload in a process group of its own so the escalation can address every
 // descendant with one signal. The watchdog records expiry through the marker file, and the workload's
-// own fate distinguishes a polite shutdown from a kill.
+// own fate distinguishes a polite shutdown from a kill. The exit trap reaps the watchdog and clears
+// the workload group even if its leader exits first or the wrapper itself is interrupted.
 const timeout_wrapper_script =
     "completion_file=$1; started_file=$2; timeout_file=$3; " ++
     "limit=$4; grace=$5; shift 5; " ++
     ": > \"$started_file\" || exit 125; " ++
+    "workload= watchdog=; " ++
+    "cleanup() { " ++
+    "trap - EXIT HUP INT TERM; " ++
+    "if [ -n \"$watchdog\" ]; then " ++
+    "kill -KILL -\"$watchdog\" 2>/dev/null; wait \"$watchdog\" 2>/dev/null; fi; " ++
+    "if [ -n \"$workload\" ]; then " ++
+    "kill -KILL -\"$workload\" 2>/dev/null; wait \"$workload\" 2>/dev/null; fi; " ++
+    "}; " ++
+    "trap cleanup EXIT; " ++
+    "trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; " ++
     "set -m; " ++
     "\"$@\" & workload=$!; " ++
     "{ sleep \"$limit\"; kill -0 -\"$workload\" 2>/dev/null || exit 0; " ++
@@ -318,6 +329,7 @@ const timeout_wrapper_script =
     ">/dev/null 2>&1 & watchdog=$!; " ++
     "wait \"$workload\" 2>/dev/null; status=$?; " ++
     "kill -KILL -\"$watchdog\" 2>/dev/null; wait \"$watchdog\" 2>/dev/null; " ++
+    "watchdog=; " ++
     "if [ -e \"$timeout_file\" ]; then " ++
     "if [ \"$status\" -eq 137 ]; then exit 137; fi; exit 124; fi; " ++
     "printf '%s\\n' \"$status\" > \"$completion_file\" || exit 125; " ++
@@ -1520,6 +1532,7 @@ test "timeout wrapper distinguishes completion, expiry, and SIGKILL escalation" 
         std.process.Child.Term{ .exited = 124 },
         expired.term,
     );
+    try std.testing.expectEqualStrings("", expired.stderr);
     const expired_diagnostic = try sshFailureDiagnosticAlloc(
         allocator,
         expired,
@@ -1547,6 +1560,7 @@ test "timeout wrapper distinguishes completion, expiry, and SIGKILL escalation" 
     try std.testing.expect(escalated.timedOut());
     try std.testing.expect(escalated.timeout_evidence.completed_status == null);
     try std.testing.expectEqual(@as(?u8, 137), shellStatus(escalated.term));
+    try std.testing.expectEqualStrings("", escalated.stderr);
     const escalated_diagnostic = try sshFailureDiagnosticAlloc(
         allocator,
         escalated,
@@ -1596,6 +1610,51 @@ test "timeout escalation reaches a grandchild that ignores SIGTERM" {
     defer escalated.deinit(allocator);
     try std.testing.expect(escalated.timedOut());
     try std.testing.expectEqual(@as(?u8, 137), shellStatus(escalated.term));
+
+    const group_text = try tmp.dir.readFileAlloc(io, "group", allocator, .limited(32));
+    defer allocator.free(group_text);
+    const group_id = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, group_text, " \t\r\n"),
+        10,
+    );
+    try expectProcessGroupGone(io, group_id);
+}
+
+test "timeout wrapper cleans up descendants after successful leader exit" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var marker_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const marker_length = try tmp.dir.realPath(io, &marker_buffer);
+    const group_path = try std.fs.path.join(
+        allocator,
+        &.{ marker_buffer[0..marker_length], "group" },
+    );
+    defer allocator.free(group_path);
+
+    const command = try std.fmt.allocPrint(
+        allocator,
+        "printf '%s\\n' \"$$\" > '{s}'; " ++
+            "/bin/bash -c \"trap '' TERM; exec >/dev/null 2>&1; " ++
+            "while :; do /bin/sleep 1; done\" &",
+        .{group_path},
+    );
+    defer allocator.free(command);
+
+    var completed = try runTimedCommandAlloc(
+        allocator,
+        io,
+        .readiness,
+        "2s",
+        "0.1s",
+        &.{ "/bin/bash", "-c", command },
+    );
+    defer completed.deinit(allocator);
+    try std.testing.expect(completed.succeeded());
+    try std.testing.expectEqualStrings("", completed.stderr);
 
     const group_text = try tmp.dir.readFileAlloc(io, "group", allocator, .limited(32));
     defer allocator.free(group_text);
