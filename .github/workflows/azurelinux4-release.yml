@@ -1,4 +1,4 @@
-name: Build, validate, and publish Azure Linux 4 images
+name: Publish Azure Linux 4 images
 
 on:
   workflow_dispatch:
