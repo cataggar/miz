@@ -164,7 +164,7 @@ pub const SpecError = error{
     /// after the data), `vhdx` (BAT), and `qcow2` (L1/L2 and refcount
     /// tables) all require.
     FormatRequiresSeekableOutput,
-    /// The in-tree zstd encoder has a single fixed strategy, so there is no
+    /// Zstd output uses one pinned deterministic parameter set, so there is no
     /// level to select. Rejected rather than silently ignored.
     CompressionLevelNotSupportedForZstd,
 } || LevelError;

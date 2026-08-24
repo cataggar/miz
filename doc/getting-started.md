@@ -3,16 +3,15 @@
 ## Requirements
 
 - Zig **0.16.0** or later.
-- `zig build` requires the system `libzstd` development package.
+- `zig build` compiles the pinned static libzstd dependency from
+  `build.zig.zon`; no system libzstd development package is needed for vmiz's
+  zstd wrapper.
 - `zig build test` additionally requires the `zstd` CLI for interoperability
-  coverage. On Debian-family systems, install `libzstd-dev` and `zstd`
-  together from the same distribution repository so the linked library and CLI
-  stay aligned. `liblzma-dev` is also needed for the host package-family
-  integration and its repository tests:
+  coverage. On Debian-family systems:
 
   ```console
   sudo apt-get update
-  sudo apt-get install -y --no-install-recommends liblzma-dev libzstd-dev zstd
+  sudo apt-get install -y --no-install-recommends zstd
   ```
 
 - `vmiz qemu` additionally requires [ghr](https://github.com/cataggar/ghr) for automatic known-image download. Install the packaged QEMU build with `ghr install cataggar/qemu`, or provide a system QEMU/UEFI installation.

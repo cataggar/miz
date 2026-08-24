@@ -2,12 +2,16 @@
 //!
 //! Compressed frames pin every setting that affects their wire representation.
 //! Raw stored frames remain native so callers can request framing without
-//! compression.
+//! compression. Compressed operations return `error.ZstdUnavailable` in
+//! libc-free module graphs that intentionally include headers without linking
+//! libzstd; raw framing remains available there.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @cImport({
     @cInclude("zstd.h");
 });
+const Context = if (builtin.link_libc) ?*c.ZSTD_CCtx else ?*anyopaque;
 
 pub const zstd_magic: u32 = 0xFD2F_B528;
 pub const skippable_magic: u32 = 0x184D_2A50;
@@ -54,6 +58,7 @@ pub const ZstdError = error{
     ZstdSequenceProducerFailed,
     ZstdExternalSequencesInvalid,
     ZstdUnknownError,
+    ZstdUnavailable,
 };
 
 pub const Error = std.Io.Writer.Error || ZstdError || error{
@@ -96,7 +101,7 @@ pub const FrameEncoder = struct {
     written: u64 = 0,
     fill: usize = 0,
     compression: Compression,
-    cctx: ?*c.ZSTD_CCtx = null,
+    cctx: Context = null,
     finished: bool = false,
 
     pub fn init(
@@ -107,48 +112,56 @@ pub const FrameEncoder = struct {
         if (block_buffer.len == 0) return error.EmptyBlockBuffer;
         const bounded_buffer = block_buffer[0..@min(block_buffer.len, max_block_size)];
 
-        var cctx: ?*c.ZSTD_CCtx = null;
+        var cctx: Context = null;
         if (options.compression == .compressed) {
-            const context = c.ZSTD_createCCtx() orelse return error.ZstdMemoryAllocation;
-            errdefer _ = c.ZSTD_freeCCtx(context);
+            if (builtin.link_libc) {
+                const context = c.ZSTD_createCCtx() orelse return error.ZstdMemoryAllocation;
+                errdefer _ = c.ZSTD_freeCCtx(context);
 
-            _ = try checkZstd(c.ZSTD_CCtx_setParameter(
-                context,
-                c.ZSTD_c_compressionLevel,
-                compression_level,
-            ));
-            _ = try checkZstd(c.ZSTD_CCtx_setParameter(
-                context,
-                c.ZSTD_c_windowLog,
-                window_log,
-            ));
-            _ = try checkZstd(c.ZSTD_CCtx_setParameter(
-                context,
-                c.ZSTD_c_contentSizeFlag,
-                1,
-            ));
-            _ = try checkZstd(c.ZSTD_CCtx_setParameter(
-                context,
-                c.ZSTD_c_checksumFlag,
-                0,
-            ));
-            _ = try checkZstd(c.ZSTD_CCtx_setParameter(
-                context,
-                c.ZSTD_c_dictIDFlag,
-                0,
-            ));
-            _ = try checkZstd(c.ZSTD_CCtx_setParameter(
-                context,
-                c.ZSTD_c_nbWorkers,
-                0,
-            ));
-            _ = try checkZstd(c.ZSTD_CCtx_setPledgedSrcSize(
-                context,
-                @intCast(options.content_size),
-            ));
-            cctx = context;
+                _ = try checkZstd(c.ZSTD_CCtx_setParameter(
+                    context,
+                    c.ZSTD_c_compressionLevel,
+                    compression_level,
+                ));
+                _ = try checkZstd(c.ZSTD_CCtx_setParameter(
+                    context,
+                    c.ZSTD_c_windowLog,
+                    window_log,
+                ));
+                _ = try checkZstd(c.ZSTD_CCtx_setParameter(
+                    context,
+                    c.ZSTD_c_contentSizeFlag,
+                    1,
+                ));
+                _ = try checkZstd(c.ZSTD_CCtx_setParameter(
+                    context,
+                    c.ZSTD_c_checksumFlag,
+                    0,
+                ));
+                _ = try checkZstd(c.ZSTD_CCtx_setParameter(
+                    context,
+                    c.ZSTD_c_dictIDFlag,
+                    0,
+                ));
+                _ = try checkZstd(c.ZSTD_CCtx_setParameter(
+                    context,
+                    c.ZSTD_c_nbWorkers,
+                    0,
+                ));
+                _ = try checkZstd(c.ZSTD_CCtx_setPledgedSrcSize(
+                    context,
+                    @intCast(options.content_size),
+                ));
+                cctx = context;
+            } else {
+                return error.ZstdUnavailable;
+            }
         }
-        errdefer if (cctx) |context| _ = c.ZSTD_freeCCtx(context);
+        errdefer if (builtin.link_libc) {
+            if (cctx) |context| {
+                _ = c.ZSTD_freeCCtx(context);
+            }
+        };
 
         if (options.skippable_payload) |payload| try writeSkippableFrame(writer, payload);
         if (options.compression == .raw) try writeFrameHeader(writer, options.content_size);
@@ -170,7 +183,10 @@ pub const FrameEncoder = struct {
         if (count > self.content_size - self.written) return error.ContentSizeExceeded;
 
         switch (self.compression) {
-            .compressed => try self.compressInput(bytes),
+            .compressed => if (builtin.link_libc)
+                try self.compressInput(bytes)
+            else
+                return error.ZstdUnavailable,
             .raw => self.bufferRaw(bytes) catch |err| {
                 self.fail();
                 return err;
@@ -188,7 +204,10 @@ pub const FrameEncoder = struct {
         while (remaining > 0) {
             const take: usize = @intCast(@min(remaining, zero_chunk.len));
             switch (self.compression) {
-                .compressed => try self.compressInput(zero_chunk[0..take]),
+                .compressed => if (builtin.link_libc)
+                    try self.compressInput(zero_chunk[0..take])
+                else
+                    return error.ZstdUnavailable,
                 .raw => self.bufferRaw(zero_chunk[0..take]) catch |err| {
                     self.fail();
                     return err;
@@ -207,7 +226,10 @@ pub const FrameEncoder = struct {
         if (self.written != self.content_size) return error.ContentSizeMismatch;
 
         switch (self.compression) {
-            .compressed => try self.finishCompressed(),
+            .compressed => if (builtin.link_libc)
+                try self.finishCompressed()
+            else
+                return error.ZstdUnavailable,
             .raw => self.flushRawBlock(true) catch |err| {
                 self.fail();
                 return err;
@@ -290,8 +312,12 @@ pub const FrameEncoder = struct {
     }
 
     fn releaseContext(self: *FrameEncoder) void {
-        if (self.cctx) |context| {
-            _ = c.ZSTD_freeCCtx(context);
+        if (builtin.link_libc) {
+            if (self.cctx) |context| {
+                _ = c.ZSTD_freeCCtx(context);
+                self.cctx = null;
+            }
+        } else {
             self.cctx = null;
         }
     }
@@ -306,17 +332,20 @@ pub fn frameHeaderSize() usize {
 pub fn compressionBound(
     uncompressed_size: u64,
     include_skippable: bool,
-) error{SizeOverflow}!u64 {
-    const source_size = std.math.cast(usize, uncompressed_size) orelse
-        return error.SizeOverflow;
-    const bound = c.ZSTD_compressBound(source_size);
-    if (c.ZSTD_isError(bound) != 0) return error.SizeOverflow;
+) error{ SizeOverflow, ZstdUnavailable }!u64 {
+    if (builtin.link_libc) {
+        const source_size = std.math.cast(usize, uncompressed_size) orelse
+            return error.SizeOverflow;
+        const bound = c.ZSTD_compressBound(source_size);
+        if (c.ZSTD_isError(bound) != 0) return error.SizeOverflow;
 
-    const prefix: u64 = if (include_skippable)
-        8 + @as(u64, skippable_payload_len)
-    else
-        0;
-    return std.math.add(u64, @intCast(bound), prefix) catch error.SizeOverflow;
+        const prefix: u64 = if (include_skippable)
+            8 + @as(u64, skippable_payload_len)
+        else
+            0;
+        return std.math.add(u64, @intCast(bound), prefix) catch error.SizeOverflow;
+    }
+    return error.ZstdUnavailable;
 }
 
 /// Strict upper bound for either encoder mode when raw frames use blocks no
@@ -326,12 +355,14 @@ pub fn maxEncodedSizeForBlockSize(
     block_size: usize,
     include_skippable: bool,
 ) error{SizeOverflow}!u64 {
-    const compressed_bound = try compressionBound(uncompressed_size, include_skippable);
     const raw_bound = try rawEncodedSizeForBlockSize(
         uncompressed_size,
         block_size,
         include_skippable,
     );
+    if (!builtin.link_libc) return raw_bound;
+    const compressed_bound = compressionBound(uncompressed_size, include_skippable) catch
+        return error.SizeOverflow;
     return @max(compressed_bound, raw_bound);
 }
 
@@ -496,6 +527,14 @@ pub fn decodeAlloc(
 }
 
 fn decodeFrameAlloc(
+    allocator: std.mem.Allocator,
+    frame: []const u8,
+) DecodeError![]u8 {
+    if (builtin.link_libc) return decodeFrameAllocLinked(allocator, frame);
+    return error.ZstdUnavailable;
+}
+
+fn decodeFrameAllocLinked(
     allocator: std.mem.Allocator,
     frame: []const u8,
 ) DecodeError![]u8 {

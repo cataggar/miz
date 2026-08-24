@@ -255,6 +255,12 @@ pub fn build(b: *std.Build) void {
     });
     addZstdLibrary(host_zvmi_mod, host_zstd_dependency);
     host_zvmi_mod.addImport("debz", debz_mod);
+    const static_host_vmiz_mod = b.createModule(.{
+        .root_source_file = b.path("packages/vmiz/src/root.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    addZstdHeaders(static_host_vmiz_mod, host_zstd_dependency);
     const package_family_mod = b.createModule(.{
         .root_source_file = b.path("packages/vmiz/src/package_family.zig"),
         .target = b.graph.host,
@@ -381,13 +387,19 @@ pub fn build(b: *std.Build) void {
     // natively testable via `zig build test` on any host.
     // Imports `vmiz` too (issue #113's resource-disk setup reuses
     // `mbr.zig`/`ext4.zig` directly against a real block device). ----
+    const azagent_vmiz_mod = b.createModule(.{
+        .root_source_file = b.path("packages/vmiz/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addZstdHeaders(azagent_vmiz_mod, zstd_dependency);
     const azagent_mod = b.createModule(.{
         .root_source_file = b.path("azagent/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "wireserver", .module = wireserver_mod },
-            .{ .name = "vmiz", .module = vmiz_mod },
+            .{ .name = "vmiz", .module = azagent_vmiz_mod },
         },
     });
 
@@ -513,6 +525,7 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
+    addZstdLibrary(preserved_image_wire_mod, host_zstd_dependency);
     const preserved_image_builder_exe = b.addExecutable(.{
         .name = "vmiz-preserved-image-builder",
         .root_module = b.createModule(.{
@@ -654,7 +667,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = vmiz_mod },
+                .{ .name = "vmiz", .module = static_host_vmiz_mod },
             },
         }),
         .linkage = .static,
@@ -677,7 +690,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = vmiz_mod },
+                .{ .name = "vmiz", .module = static_host_vmiz_mod },
             },
         }),
         .linkage = .static,
@@ -698,7 +711,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = vmiz_mod },
+                .{ .name = "vmiz", .module = static_host_vmiz_mod },
             },
         }),
         .linkage = .static,

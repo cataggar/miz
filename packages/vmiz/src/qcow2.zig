@@ -33,9 +33,7 @@
 
 const std = @import("std");
 const Io = std.Io;
-/// Repo-local streaming zstd encoder (`zstd.zig`). Zig's standard library
-/// ships only a zstd *decoder*, so emitting compressed clusters relies on
-/// this bounded, deterministic `FrameEncoder`.
+/// Repo-local deterministic framing wrapper backed by linked libzstd.
 const zstd_enc = @import("zstd.zig");
 
 pub const file_signature: [4]u8 = .{ 'Q', 'F', 'I', 0xFB };
@@ -2143,9 +2141,13 @@ pub fn writeStandaloneCompressed(
     const block_size = @min(cs_usize, zstd_enc.max_block_size);
     const block_buffer = try allocator.alloc(u8, block_size);
     defer allocator.free(block_buffer);
+    const max_comp_u64 = zstd_enc.compressionBound(cs, false) catch |err| switch (err) {
+        error.SizeOverflow => return error.ImageTooLarge,
+        error.ZstdUnavailable => return error.ZstdUnavailable,
+    };
     const max_comp = std.math.cast(
         usize,
-        zstd_enc.maxEncodedSizeForBlockSize(cs, block_size, false) catch return error.ImageTooLarge,
+        max_comp_u64,
     ) orelse return error.ImageTooLarge;
     // Round the scratch buffer up to a full sector: a compressed payload may
     // occupy up to `max_comp` bytes, and we zero-pad the tail to a 512-byte
@@ -2164,6 +2166,7 @@ pub fn writeStandaloneCompressed(
 
         var frame_writer = Io.Writer.fixed(comp_buf);
         var encoder = try zstd_enc.FrameEncoder.init(&frame_writer, block_buffer, .{ .content_size = cs });
+        defer encoder.deinit();
         try encoder.writeAll(cluster_buf);
         try encoder.finish();
         const compressed_len = frame_writer.end;
@@ -3253,11 +3256,8 @@ fn writeCompressedFixture(io: Io, path: []const u8) !u64 {
     return writeCompressedClusterFixture(io, path, 0, compressed);
 }
 
-/// Builds a minimal valid zstd frame decompressing to `bytes`, using this
-/// repo's small built-in zstd encoder (`zstd.zig`, already used by
-/// `squashfs.zig`/`cosi.zig` test fixtures for the same reason: Zig's
-/// standard library only ships a zstd *decoder*
-/// (`std.compress.zstd.Decompress`), not an encoder).
+/// Builds a zstd frame decompressing to `bytes` with the same deterministic
+/// linked-libzstd wrapper used by production writers.
 fn zstdCompress(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     var out = try std.Io.Writer.Allocating.initCapacity(allocator, @max(@as(usize, 64), bytes.len));
     errdefer out.deinit();

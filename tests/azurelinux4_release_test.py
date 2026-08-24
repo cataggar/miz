@@ -826,11 +826,31 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         )
         self.assertEqual(
             {name for name, _, _, _ in dependencies},
-            {"bzip2z", "tls", "debz", "rpmz"},
+            {"bzip2z", "tls", "debz", "rpmz", "zstd"},
         )
-        self.assertEqual(len(dependencies), 4)
+        self.assertEqual(len(dependencies), 5)
         for name, _, _, hash_value in dependencies:
             self.assertTrue(hash_value.startswith(f"{name}-"), hash_value)
+        by_name = {
+            name: (url, commit, hash_value)
+            for name, url, commit, hash_value in dependencies
+        }
+        self.assertEqual(
+            by_name["zstd"][0],
+            "git+https://github.com/cataggar/zstd"
+            "#45b6dfcd9d0ffdba99fb653c66b233179b9f7229",
+        )
+
+        build = (ROOT / "build.zig").read_text()
+        zstd_dependency = build.split("fn zstdDependency(", 1)[1].split(
+            "\n}\n", 1
+        )[0]
+        for option in (
+            ".tools = false",
+            ".shared = false",
+            ".multithread = false",
+        ):
+            self.assertIn(option, zstd_dependency)
 
     def test_azure_acceptance_allows_arm64_without_temporary_resource_disk(self):
         script = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()
@@ -1071,7 +1091,7 @@ class AzureLinuxReleaseTest(unittest.TestCase):
     def test_getting_started_documents_linked_zstd_requirements(self):
         guide = (ROOT / "doc/getting-started.md").read_text()
         self.assertIn(
-            "`zig build` requires the system `libzstd` development package.",
+            "`zig build` compiles the pinned static libzstd dependency",
             guide,
         )
         self.assertIn(
@@ -1079,16 +1099,12 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             guide,
         )
         self.assertIn(
-            "install `libzstd-dev` and `zstd`",
-            guide,
-        )
-        self.assertIn(
-            "same distribution repository so the linked library and CLI",
+            "no system libzstd development package is needed",
             guide,
         )
         self.assertIn(
             "sudo apt-get install -y --no-install-recommends "
-            "liblzma-dev libzstd-dev zstd",
+            "zstd",
             guide,
         )
 
@@ -1102,9 +1118,9 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertNotIn("minimal private raw-block zstd codec", development)
 
         package_family = (ROOT / "doc/debian-package-family.md").read_text()
-        self.assertIn("Host builds require libzstd.", package_family)
+        self.assertIn("pinned static\nlibzstd dependency", package_family)
         self.assertIn(
-            "debz's liblzma/libzstd development-library",
+            "debz's\nliblzma/libzstd dependencies",
             package_family,
         )
 
