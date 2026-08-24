@@ -56,7 +56,9 @@
 const std = @import("std");
 const limits_mod = @import("limits.zig");
 const tree_cursor = @import("tree_cursor.zig");
+const image_mod = @import("image.zig");
 const Io = std.Io;
+const Image = image_mod.Image;
 
 /// The scan shares the importer's limit defaults so a source that scans is a
 /// source that imports.
@@ -152,6 +154,8 @@ const feature_ro_compat_shared_blocks: u32 = 0x4000;
 const feature_ro_compat_verity: u32 = 0x8000;
 const feature_ro_compat_orphan_present: u32 = 0x0001_0000;
 const orphan_block_magic: u32 = 0x0B10_CA04;
+const bg_flag_inode_uninit: u16 = 0x0001;
+const bg_flag_block_uninit: u16 = 0x0002;
 pub const writer_feature_compat: u32 = feature_compat_ext_attr | feature_compat_dir_index;
 pub const writer_feature_incompat: u32 = feature_incompat_filetype | feature_incompat_extents;
 /// Always set by this writer. `EXTRA_ISIZE` asserts that every inode has at
@@ -2413,6 +2417,1288 @@ fn prepareResizeInodeLegacy(
         setInodeChecksumSeed(inode, checksum_seed, resize_inode);
     }
     return dindir_block;
+}
+
+pub const UuidRewriteOptions = struct {
+    offset: u64 = 0,
+    /// Bytes the filesystem is allowed to occupy inside `file` or `image`.
+    length: u64,
+    uuid: [16]u8,
+};
+
+pub const UuidRewriteProfile = enum {
+    vmiz_ext4_v1,
+    ubuntu_pinned_v1,
+};
+
+pub const UuidRewriteReport = struct {
+    profile: UuidRewriteProfile,
+    before: GeneralFilesystemIdentity,
+    after: GeneralFilesystemIdentity,
+    checksum_seed_changed: bool,
+};
+
+pub const UuidRewriteError = GeneralOpenError || GeneralScanError || Io.File.WritePositionalError || error{
+    InvalidRange,
+    UnsupportedIdentityProfile,
+    BadSuperblockChecksum,
+    BadBackupSuperblock,
+    BadBackupGroupDescriptors,
+    BadGroupDescriptorChecksum,
+    BadBitmapChecksum,
+    BadInodeChecksum,
+    BadXattrChecksum,
+    BadDirectoryChecksum,
+    BadExtentChecksum,
+    BadOrphanFileChecksum,
+    BadJournalSuperblock,
+    IdentityRewriteVerificationFailed,
+};
+
+pub const UuidRewriteImageError = UuidRewriteError || Image.PwriteError;
+
+const UuidRewriteBlock = struct {
+    offset: u64,
+    bytes: []u8,
+};
+
+const UuidRewriteBackupSuperblock = struct {
+    offset: u64,
+    bytes: [superblock_size]u8,
+};
+
+const UuidRewriteInode = struct {
+    kind: GeneralKind,
+    size: u64,
+    flags: u32,
+    generation: u32,
+    file_acl_block: u32,
+    block_bytes: [60]u8,
+
+    fn isFastSymlink(self: UuidRewriteInode) bool {
+        return self.kind == .symlink and self.size < 60 and
+            (self.flags & inode_flag_extents) == 0;
+    }
+};
+
+const UuidRewriteExtentWalk = struct {
+    extents: []Extent,
+    tree_blocks: []u64,
+
+    fn deinit(self: *UuidRewriteExtentWalk, allocator: std.mem.Allocator) void {
+        allocator.free(self.extents);
+        allocator.free(self.tree_blocks);
+        self.* = undefined;
+    }
+};
+
+const UuidRewritePlan = struct {
+    allocator: std.mem.Allocator,
+    profile: UuidRewriteProfile,
+    before: GeneralFilesystemIdentity,
+    after: GeneralFilesystemIdentity,
+    checksum_seed_changed: bool,
+    primary_superblock_offset: u64,
+    primary_superblock: [superblock_size]u8,
+    primary_superblock_changed: bool = false,
+    backup_superblocks: []UuidRewriteBackupSuperblock = &.{},
+    primary_gdt_offset: u64,
+    primary_gdt: []u8 = &.{},
+    primary_gdt_changed: bool = false,
+    backup_gdt_offsets: []u64 = &.{},
+    block_writes: std.array_list.Managed(UuidRewriteBlock),
+    block_write_index: std.AutoHashMap(u64, usize),
+
+    fn init(
+        allocator: std.mem.Allocator,
+        profile: UuidRewriteProfile,
+        before: GeneralFilesystemIdentity,
+        after: GeneralFilesystemIdentity,
+        checksum_seed_changed: bool,
+        primary_superblock_offset: u64,
+        primary_gdt_offset: u64,
+    ) UuidRewritePlan {
+        return .{
+            .allocator = allocator,
+            .profile = profile,
+            .before = before,
+            .after = after,
+            .checksum_seed_changed = checksum_seed_changed,
+            .primary_superblock_offset = primary_superblock_offset,
+            .primary_superblock = undefined,
+            .primary_gdt_offset = primary_gdt_offset,
+            .block_writes = .init(allocator),
+            .block_write_index = .init(allocator),
+        };
+    }
+
+    fn deinit(self: *UuidRewritePlan) void {
+        for (self.block_writes.items) |write| self.allocator.free(write.bytes);
+        self.block_writes.deinit();
+        self.block_write_index.deinit();
+        self.allocator.free(self.backup_superblocks);
+        self.allocator.free(self.primary_gdt);
+        self.allocator.free(self.backup_gdt_offsets);
+        self.* = undefined;
+    }
+
+    fn writeCount(self: *const UuidRewritePlan) usize {
+        return self.block_writes.items.len +
+            (if (self.primary_gdt_changed) 1 + self.backup_gdt_offsets.len else 0) +
+            (if (self.primary_superblock_changed) 1 + self.backup_superblocks.len else 0);
+    }
+
+    fn stageBlock(
+        self: *UuidRewritePlan,
+        reader: *Reader,
+        io: Io,
+        block_number: u64,
+    ) UuidRewriteError![]u8 {
+        const offset = reader.blockOffset(block_number);
+        if (self.block_write_index.get(offset)) |index| {
+            return self.block_writes.items[index].bytes;
+        }
+        const bytes = try self.allocator.alloc(u8, reader.block_size);
+        errdefer self.allocator.free(bytes);
+        try reader.readAll(io, bytes, offset);
+        try self.block_writes.append(.{ .offset = offset, .bytes = bytes });
+        try self.block_write_index.put(offset, self.block_writes.items.len - 1);
+        return bytes;
+    }
+};
+
+pub fn rewriteUuid(
+    io: Io,
+    file: Io.File,
+    allocator: std.mem.Allocator,
+    options: UuidRewriteOptions,
+) UuidRewriteError!UuidRewriteReport {
+    if (options.length == 0) return error.InvalidRange;
+    _ = std.math.add(u64, options.offset, options.length) catch return error.InvalidRange;
+
+    var reader = try openGeneral(io, file, allocator, .{ .offset = options.offset });
+    defer reader.deinit();
+    var plan = try buildUuidRewritePlan(&reader, io, allocator, options);
+    defer plan.deinit();
+
+    var target = file;
+    try applyUuidRewritePlanToFile(&plan, io, &target);
+
+    var verify_reader = try openGeneral(io, file, allocator, .{ .offset = options.offset });
+    defer verify_reader.deinit();
+    var verify_plan = try buildUuidRewritePlan(&verify_reader, io, allocator, options);
+    defer verify_plan.deinit();
+    if (verify_plan.writeCount() != 0 or
+        verify_plan.profile != plan.profile or
+        !generalIdentitiesEqual(verify_plan.before, plan.after))
+    {
+        return error.IdentityRewriteVerificationFailed;
+    }
+
+    return .{
+        .profile = plan.profile,
+        .before = plan.before,
+        .after = verify_plan.before,
+        .checksum_seed_changed = plan.checksum_seed_changed,
+    };
+}
+
+pub fn rewriteUuidImage(
+    io: Io,
+    image: *Image,
+    allocator: std.mem.Allocator,
+    options: UuidRewriteOptions,
+) UuidRewriteImageError!UuidRewriteReport {
+    if (options.length == 0) return error.InvalidRange;
+    const end = std.math.add(u64, options.offset, options.length) catch
+        return error.InvalidRange;
+    if (end > image.virtual_size) return error.InvalidRange;
+
+    var reader = try openGeneralReadOnlySource(
+        io,
+        image.file,
+        .{
+            .ctx = image,
+            .read_at_fn = readUuidRewriteImageAt,
+        },
+        allocator,
+        .{ .offset = options.offset },
+    );
+    defer reader.deinit();
+    var plan = try buildUuidRewritePlan(&reader, io, allocator, options);
+    defer plan.deinit();
+
+    try applyUuidRewritePlanToImage(&plan, io, image);
+
+    var verify_reader = try openGeneralReadOnlySource(
+        io,
+        image.file,
+        .{
+            .ctx = image,
+            .read_at_fn = readUuidRewriteImageAt,
+        },
+        allocator,
+        .{ .offset = options.offset },
+    );
+    defer verify_reader.deinit();
+    var verify_plan = try buildUuidRewritePlan(&verify_reader, io, allocator, options);
+    defer verify_plan.deinit();
+    if (verify_plan.writeCount() != 0 or
+        verify_plan.profile != plan.profile or
+        !generalIdentitiesEqual(verify_plan.before, plan.after))
+    {
+        return error.IdentityRewriteVerificationFailed;
+    }
+
+    return .{
+        .profile = plan.profile,
+        .before = plan.before,
+        .after = verify_plan.before,
+        .checksum_seed_changed = plan.checksum_seed_changed,
+    };
+}
+
+fn applyUuidRewritePlanToFile(
+    plan: *const UuidRewritePlan,
+    io: Io,
+    file: *Io.File,
+) Io.File.WritePositionalError!void {
+    for (plan.block_writes.items) |write| {
+        try file.writePositionalAll(io, write.bytes, write.offset);
+    }
+    if (plan.primary_gdt_changed) {
+        try file.writePositionalAll(io, plan.primary_gdt, plan.primary_gdt_offset);
+        for (plan.backup_gdt_offsets) |offset| {
+            try file.writePositionalAll(io, plan.primary_gdt, offset);
+        }
+    }
+    if (plan.primary_superblock_changed) {
+        for (plan.backup_superblocks) |backup| {
+            try file.writePositionalAll(io, &backup.bytes, backup.offset);
+        }
+        try file.writePositionalAll(
+            io,
+            &plan.primary_superblock,
+            plan.primary_superblock_offset,
+        );
+    }
+}
+
+fn readUuidRewriteImageAt(
+    ctx: *const anyopaque,
+    io: Io,
+    buffer: []u8,
+    offset: u64,
+) !usize {
+    const image: *const Image = @ptrCast(@alignCast(ctx));
+    return image.pread(io, buffer, offset);
+}
+
+fn applyUuidRewritePlanToImage(
+    plan: *const UuidRewritePlan,
+    io: Io,
+    image: *Image,
+) Image.PwriteError!void {
+    for (plan.block_writes.items) |write| {
+        try image.pwrite(io, write.bytes, write.offset);
+    }
+    if (plan.primary_gdt_changed) {
+        try image.pwrite(io, plan.primary_gdt, plan.primary_gdt_offset);
+        for (plan.backup_gdt_offsets) |offset| {
+            try image.pwrite(io, plan.primary_gdt, offset);
+        }
+    }
+    if (plan.primary_superblock_changed) {
+        for (plan.backup_superblocks) |backup| {
+            try image.pwrite(io, &backup.bytes, backup.offset);
+        }
+        try image.pwrite(io, &plan.primary_superblock, plan.primary_superblock_offset);
+    }
+}
+
+fn generalIdentitiesEqual(lhs: GeneralFilesystemIdentity, rhs: GeneralFilesystemIdentity) bool {
+    return lhs.profile == rhs.profile and
+        std.mem.eql(u8, &lhs.uuid, &rhs.uuid) and
+        std.mem.eql(u8, &lhs.label, &rhs.label) and
+        lhs.block_size == rhs.block_size and
+        lhs.filesystem_length == rhs.filesystem_length and
+        lhs.inode_size == rhs.inode_size and
+        lhs.descriptor_size == rhs.descriptor_size and
+        lhs.feature_compat == rhs.feature_compat and
+        lhs.feature_incompat == rhs.feature_incompat and
+        lhs.feature_ro_compat == rhs.feature_ro_compat and
+        lhs.checksum_seed == rhs.checksum_seed and
+        lhs.orphan_file_inode == rhs.orphan_file_inode and
+        lhs.has_journal == rhs.has_journal;
+}
+
+fn buildUuidRewritePlan(
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    options: UuidRewriteOptions,
+) UuidRewriteError!UuidRewritePlan {
+    var primary_superblock: [superblock_size]u8 = undefined;
+    try reader.readAll(io, &primary_superblock, reader.offset + superblock_offset);
+
+    const stored_superblock_checksum = readInt(u32, primary_superblock[0x3FC..0x400]);
+    var checked_superblock = primary_superblock;
+    setSuperblockChecksum(&checked_superblock);
+    if (stored_superblock_checksum != readInt(u32, checked_superblock[0x3FC..0x400])) {
+        return error.BadSuperblockChecksum;
+    }
+
+    var before = try validateGeneralSuperblock(reader, io, .{
+        .available_length = options.length,
+    });
+    const profile = resolveUuidRewriteProfile(reader, &primary_superblock) orelse
+        return error.UnsupportedIdentityProfile;
+    before.profile = switch (profile) {
+        .vmiz_ext4_v1 => .vmiz_ext4_v1,
+        .ubuntu_pinned_v1 => .ext4_general_v1,
+    };
+    if (before.has_journal and
+        (readInt(u32, primary_superblock[0xE0..0xE4]) != journal_inode or
+            !allZero(primary_superblock[0xD0..0xE0]) or
+            readInt(u8, primary_superblock[0xFD..0xFE]) != jnl_backup_type_blocks))
+    {
+        return error.BadJournalSuperblock;
+    }
+
+    const before_checksum_seed = checksumSeed(
+        &primary_superblock,
+        before.uuid,
+        reader.feature_incompat,
+    );
+    const after_checksum_seed = rewrittenChecksumSeed(
+        before.uuid,
+        before_checksum_seed,
+        reader.feature_incompat,
+        options.uuid,
+    );
+    var after = before;
+    after.uuid = options.uuid;
+    after.checksum_seed = after_checksum_seed;
+
+    var plan = UuidRewritePlan.init(
+        allocator,
+        profile,
+        before,
+        after,
+        after_checksum_seed != before_checksum_seed,
+        reader.offset + superblock_offset,
+        reader.offset + reader.block_size,
+    );
+    errdefer plan.deinit();
+
+    plan.primary_superblock = primary_superblock;
+    @memcpy(plan.primary_superblock[0x68..0x78], &options.uuid);
+    if (reader.feature_incompat & feature_incompat_csum_seed != 0 and
+        plan.checksum_seed_changed)
+    {
+        writeInt(u32, plan.primary_superblock[0x270..0x274], after_checksum_seed);
+    }
+    writeInt(u16, plan.primary_superblock[0x5A..0x5C], 0);
+    setSuperblockChecksum(&plan.primary_superblock);
+    plan.primary_superblock_changed = !std.mem.eql(
+        u8,
+        &plan.primary_superblock,
+        &primary_superblock,
+    );
+
+    const group_count: u32 = @intCast(reader.groups.len);
+    const gdt_bytes = std.math.mul(u64, group_count, reader.descriptor_size) catch
+        return error.FilesystemTooLargeToImport;
+    const gdt_storage_bytes = @as(usize, blocksForBytes(gdt_bytes, reader.block_size)) *
+        reader.block_size;
+    plan.primary_gdt = try allocator.alloc(u8, gdt_storage_bytes);
+    try reader.readAll(io, plan.primary_gdt, plan.primary_gdt_offset);
+    const block_bitmap_zero_checksums = try allocator.alloc(bool, reader.groups.len);
+    defer allocator.free(block_bitmap_zero_checksums);
+    const inode_bitmap_full_checksums = try allocator.alloc(bool, reader.groups.len);
+    defer allocator.free(inode_bitmap_full_checksums);
+    const inode_bitmap_zero_checksums = try allocator.alloc(bool, reader.groups.len);
+    defer allocator.free(inode_bitmap_zero_checksums);
+
+    try validateUuidRewriteGroupDescriptors(
+        reader,
+        io,
+        plan.primary_gdt,
+        before_checksum_seed,
+        block_bitmap_zero_checksums,
+        inode_bitmap_full_checksums,
+        inode_bitmap_zero_checksums,
+    );
+    try validateUuidRewriteBackups(
+        reader,
+        io,
+        allocator,
+        &plan,
+        primary_superblock,
+    );
+    if (plan.checksum_seed_changed) {
+        try rewriteUuidRewriteGroupDescriptors(
+            reader,
+            io,
+            plan.primary_gdt,
+            after_checksum_seed,
+            block_bitmap_zero_checksums,
+            inode_bitmap_full_checksums,
+            inode_bitmap_zero_checksums,
+        );
+        plan.primary_gdt_changed = true;
+    }
+
+    try scanUuidRewriteInodes(
+        &plan,
+        reader,
+        io,
+        before_checksum_seed,
+        after_checksum_seed,
+    );
+    return plan;
+}
+
+fn resolveUuidRewriteProfile(
+    reader: *const Reader,
+    sb: *const [superblock_size]u8,
+) ?UuidRewriteProfile {
+    const compat = reader.feature_compat;
+    const incompat = reader.feature_incompat;
+    const ro_compat = reader.feature_ro_compat;
+    const compact_compat = writer_feature_compat |
+        if (compat & feature_compat_has_journal != 0)
+            feature_compat_has_journal
+        else
+            0;
+    if (reader.block_size == default_block_size and
+        reader.blocks_per_group == default_blocks_per_group and
+        reader.inode_size == writer_inode_size and
+        reader.descriptor_size == group_desc_size and
+        compat == compact_compat and
+        incompat == writer_feature_incompat and
+        ro_compat & writer_feature_ro_compat_base == writer_feature_ro_compat_base and
+        ro_compat & ~(writer_feature_ro_compat_base | writer_feature_ro_compat_optional) == 0 and
+        readInt(u16, sb[0x5A..0x5C]) == 0 and
+        readInt(u8, sb[0xFC..0xFD]) == dx_hash_half_md4 and
+        readInt(u16, sb[0xFE..0x100]) == group_desc_size and
+        readInt(u8, sb[0x175..0x176]) == super_checksum_type_crc32c)
+    {
+        return .vmiz_ext4_v1;
+    }
+    if (reader.block_size == default_block_size and
+        reader.blocks_per_group == default_blocks_per_group and
+        reader.inode_size == writer_inode_size and
+        reader.descriptor_size == 64 and
+        compat == 0x103c and
+        incompat == 0x22c2 and
+        ro_compat == 0x046b and
+        readInt(u16, sb[0x5A..0x5C]) == 0 and
+        readInt(u8, sb[0xFC..0xFD]) == dx_hash_half_md4 and
+        readInt(u16, sb[0xFE..0x100]) == 64 and
+        readInt(u8, sb[0x175..0x176]) == super_checksum_type_crc32c)
+    {
+        return .ubuntu_pinned_v1;
+    }
+    return null;
+}
+
+fn rewrittenChecksumSeed(
+    old_uuid: [16]u8,
+    current_checksum_seed: u32,
+    incompat: u32,
+    new_uuid: [16]u8,
+) u32 {
+    if (incompat & feature_incompat_csum_seed == 0) {
+        return ext4Crc32c(&.{&new_uuid});
+    }
+    if (current_checksum_seed == ext4Crc32c(&.{&old_uuid})) {
+        return ext4Crc32c(&.{&new_uuid});
+    }
+    return current_checksum_seed;
+}
+
+const UuidRewriteInodeLocation = struct {
+    block_number: u64,
+    block_offset: u64,
+    entry_offset: usize,
+};
+
+fn uuidRewriteInodeLocation(
+    reader: *const Reader,
+    inode_number: u32,
+) UuidRewriteInodeLocation {
+    const group_index = (inode_number - 1) / reader.inodes_per_group;
+    const index_in_group = (inode_number - 1) % reader.inodes_per_group;
+    const table_byte_offset = @as(u64, index_in_group) * reader.inode_size;
+    const block_number = reader.groups[group_index].inode_table_block +
+        table_byte_offset / reader.block_size;
+    const block_offset = reader.blockOffset(block_number);
+    const entry_offset: usize = @intCast(table_byte_offset % reader.block_size);
+    return .{
+        .block_number = block_number,
+        .block_offset = block_offset,
+        .entry_offset = entry_offset,
+    };
+}
+
+fn readUuidRewriteRawInode(
+    reader: *Reader,
+    io: Io,
+    inode_number: u32,
+    storage: *[max_supported_reader_inode_size]u8,
+) UuidRewriteError![]u8 {
+    const location = uuidRewriteInodeLocation(reader, inode_number);
+    const raw = storage[0..reader.inode_size];
+    try reader.readAll(io, raw, location.block_offset + location.entry_offset);
+    return raw;
+}
+
+fn stageUuidRewriteRawInode(
+    plan: *UuidRewritePlan,
+    reader: *Reader,
+    io: Io,
+    inode_number: u32,
+) UuidRewriteError![]u8 {
+    const location = uuidRewriteInodeLocation(reader, inode_number);
+    const block = try plan.stageBlock(reader, io, location.block_number);
+    return block[location.entry_offset .. location.entry_offset + reader.inode_size];
+}
+
+fn rawInodeStoredChecksum(raw: []const u8) u32 {
+    const wide = raw.len >= 132 and readInt(u16, raw[128..130]) >= 4;
+    return readInt(u16, raw[124..126]) |
+        (@as(u32, if (wide) readInt(u16, raw[130..132]) else 0) << 16);
+}
+
+fn parseUuidRewriteInode(
+    inode_number: u32,
+    raw: []const u8,
+) UuidRewriteError!UuidRewriteInode {
+    const inode = try parseGeneralInode(inode_number, raw);
+    return .{
+        .kind = inode.kind,
+        .size = inode.size,
+        .flags = inode.flags,
+        .generation = readInt(u32, raw[100..104]),
+        .file_acl_block = inode.file_acl_block,
+        .block_bytes = inode.block_bytes,
+    };
+}
+
+fn validateUuidRewriteGroupDescriptors(
+    reader: *Reader,
+    io: Io,
+    gdt: []u8,
+    checksum_seed: u32,
+    block_bitmap_zero_checksums: []bool,
+    inode_bitmap_full_checksums: []bool,
+    inode_bitmap_zero_checksums: []bool,
+) UuidRewriteError!void {
+    const descriptor_size: usize = @intCast(reader.descriptor_size);
+    var block_bitmap: [default_block_size]u8 = undefined;
+    var inode_bitmap: [default_block_size]u8 = undefined;
+    var group_index: usize = 0;
+    while (group_index < reader.groups.len) : (group_index += 1) {
+        const descriptor = gdt[group_index * descriptor_size ..][0..descriptor_size];
+        const bg_flags = readInt(u16, descriptor[0x12..0x14]);
+        var descriptor_copy: [64]u8 = [_]u8{0} ** 64;
+        @memcpy(descriptor_copy[0..descriptor_size], descriptor);
+        const stored_descriptor_checksum = readInt(u16, descriptor_copy[0x1E..0x20]);
+        writeInt(u16, descriptor_copy[0x1E..0x20], 0);
+        var group_le = std.mem.nativeToLittle(u32, @intCast(group_index));
+        const expected_descriptor_checksum = ext4Crc32cSeed(checksum_seed, &.{
+            std.mem.asBytes(&group_le),
+            descriptor_copy[0..descriptor_size],
+        });
+        if (stored_descriptor_checksum != @as(u16, @truncate(expected_descriptor_checksum))) {
+            return error.BadGroupDescriptorChecksum;
+        }
+
+        try reader.readAll(
+            io,
+            &block_bitmap,
+            reader.blockOffset(reader.groups[group_index].block_bitmap_block),
+        );
+        try reader.readAll(
+            io,
+            &inode_bitmap,
+            reader.blockOffset(reader.groups[group_index].inode_bitmap_block),
+        );
+        const block_checksum = ext4Crc32cSeed(
+            checksum_seed,
+            &.{block_bitmap[0 .. default_blocks_per_group / 8]},
+        );
+        const block_checksum_zero = readInt(u16, descriptor[0x18..0x1A]) == 0 and
+            (reader.descriptor_size != 64 or readInt(u16, descriptor[0x38..0x3A]) == 0);
+        const inode_checksum_short = ext4Crc32cSeed(
+            checksum_seed,
+            &.{inode_bitmap[0 .. reader.inodes_per_group / 8]},
+        );
+        const inode_checksum_full = ext4Crc32cSeed(checksum_seed, &.{&inode_bitmap});
+        if (!(bg_flags & bg_flag_block_uninit != 0 and block_checksum_zero) and
+            readInt(u16, descriptor[0x18..0x1A]) != @as(u16, @truncate(block_checksum)))
+        {
+            return error.BadBitmapChecksum;
+        }
+        const inode_checksum_zero = readInt(u16, descriptor[0x1A..0x1C]) == 0 and
+            (reader.descriptor_size != 64 or readInt(u16, descriptor[0x3A..0x3C]) == 0);
+        if (!(bg_flags & bg_flag_inode_uninit != 0 and inode_checksum_zero) and
+            (readInt(u16, descriptor[0x1A..0x1C]) != @as(u16, @truncate(inode_checksum_short)) and
+                readInt(u16, descriptor[0x1A..0x1C]) != @as(u16, @truncate(inode_checksum_full))))
+        {
+            return error.BadBitmapChecksum;
+        }
+        const use_full_inode_bitmap = readInt(u16, descriptor[0x1A..0x1C]) ==
+            @as(u16, @truncate(inode_checksum_full));
+        if (reader.descriptor_size == 64 and
+            ((!(bg_flags & bg_flag_block_uninit != 0 and block_checksum_zero) and
+                readInt(u16, descriptor[0x38..0x3A]) != @as(u16, @truncate(block_checksum >> 16))) or
+                (!(bg_flags & bg_flag_inode_uninit != 0 and inode_checksum_zero) and
+                    readInt(u16, descriptor[0x3A..0x3C]) != @as(u16, @truncate(
+                        (if (use_full_inode_bitmap) inode_checksum_full else inode_checksum_short) >> 16,
+                    )))))
+        {
+            return error.BadBitmapChecksum;
+        }
+        block_bitmap_zero_checksums[group_index] = bg_flags & bg_flag_block_uninit != 0 and
+            block_checksum_zero;
+        inode_bitmap_full_checksums[group_index] = use_full_inode_bitmap;
+        inode_bitmap_zero_checksums[group_index] = bg_flags & bg_flag_inode_uninit != 0 and
+            inode_checksum_zero;
+    }
+}
+
+fn rewriteUuidRewriteGroupDescriptors(
+    reader: *Reader,
+    io: Io,
+    gdt: []u8,
+    checksum_seed: u32,
+    block_bitmap_zero_checksums: []const bool,
+    inode_bitmap_full_checksums: []const bool,
+    inode_bitmap_zero_checksums: []const bool,
+) UuidRewriteError!void {
+    const descriptor_size: usize = @intCast(reader.descriptor_size);
+    var block_bitmap: [default_block_size]u8 = undefined;
+    var inode_bitmap: [default_block_size]u8 = undefined;
+    var group_index: usize = 0;
+    while (group_index < reader.groups.len) : (group_index += 1) {
+        const descriptor = gdt[group_index * descriptor_size ..][0..descriptor_size];
+        try reader.readAll(
+            io,
+            &block_bitmap,
+            reader.blockOffset(reader.groups[group_index].block_bitmap_block),
+        );
+        try reader.readAll(
+            io,
+            &inode_bitmap,
+            reader.blockOffset(reader.groups[group_index].inode_bitmap_block),
+        );
+        if (block_bitmap_zero_checksums[group_index]) {
+            writeInt(u16, descriptor[0x18..0x1A], 0);
+            if (reader.descriptor_size == 64) writeInt(u16, descriptor[0x38..0x3A], 0);
+        } else {
+            const block_checksum = ext4Crc32cSeed(checksum_seed, &.{&block_bitmap});
+            writeInt(u16, descriptor[0x18..0x1A], @truncate(block_checksum));
+            if (reader.descriptor_size == 64) {
+                writeInt(u16, descriptor[0x38..0x3A], @truncate(block_checksum >> 16));
+            }
+        }
+        if (inode_bitmap_zero_checksums[group_index]) {
+            writeInt(u16, descriptor[0x1A..0x1C], 0);
+            if (reader.descriptor_size == 64) writeInt(u16, descriptor[0x3A..0x3C], 0);
+        } else {
+            const inode_checksum = ext4Crc32cSeed(
+                checksum_seed,
+                if (inode_bitmap_full_checksums[group_index])
+                    &.{inode_bitmap[0..]}
+                else
+                    &.{inode_bitmap[0 .. reader.inodes_per_group / 8]},
+            );
+            writeInt(u16, descriptor[0x1A..0x1C], @truncate(inode_checksum));
+            if (reader.descriptor_size == 64) {
+                writeInt(u16, descriptor[0x3A..0x3C], @truncate(inode_checksum >> 16));
+            }
+        }
+        setGeneralDescriptorChecksum(
+            descriptor,
+            reader.descriptor_size,
+            checksum_seed,
+            @intCast(group_index),
+        );
+    }
+}
+
+fn validateUuidRewriteBackups(
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    plan: *UuidRewritePlan,
+    original_superblock: [superblock_size]u8,
+) UuidRewriteError!void {
+    var backup_superblocks = std.array_list.Managed(UuidRewriteBackupSuperblock).init(allocator);
+    errdefer backup_superblocks.deinit();
+    var backup_gdt_offsets = std.array_list.Managed(u64).init(allocator);
+    errdefer backup_gdt_offsets.deinit();
+
+    const backup_gdt = try allocator.alloc(u8, plan.primary_gdt.len);
+    defer allocator.free(backup_gdt);
+
+    var group: u32 = 1;
+    while (group < reader.groups.len) : (group += 1) {
+        if (!isSparseSuperGroup(group)) continue;
+        const group_start = @as(u64, group) * reader.blocks_per_group;
+
+        var backup_superblock: [superblock_size]u8 = undefined;
+        try reader.readAll(io, &backup_superblock, reader.blockOffset(group_start));
+        const stored_checksum = readInt(u32, backup_superblock[0x3FC..0x400]);
+        var checked_backup = backup_superblock;
+        setSuperblockChecksum(&checked_backup);
+        if (stored_checksum != readInt(u32, checked_backup[0x3FC..0x400]) or
+            readInt(u16, backup_superblock[0x5A..0x5C]) != @as(u16, @intCast(group)) or
+            !std.mem.eql(u8, original_superblock[0..0x3A], backup_superblock[0..0x3A]) or
+            !std.mem.eql(u8, original_superblock[0x3C..0x5A], backup_superblock[0x3C..0x5A]) or
+            !std.mem.eql(u8, original_superblock[0x5C..0x3FC], backup_superblock[0x5C..0x3FC]))
+        {
+            return error.BadBackupSuperblock;
+        }
+        if (plan.primary_superblock_changed) {
+            var updated_backup = backup_superblock;
+            @memcpy(updated_backup[0x68..0x78], &plan.after.uuid);
+            if (reader.feature_incompat & feature_incompat_csum_seed != 0 and
+                plan.checksum_seed_changed)
+            {
+                writeInt(u32, updated_backup[0x270..0x274], plan.after.checksum_seed);
+            }
+            setSuperblockChecksum(&updated_backup);
+            try backup_superblocks.append(.{
+                .offset = reader.blockOffset(group_start),
+                .bytes = updated_backup,
+            });
+        }
+
+        try reader.readAll(io, backup_gdt, reader.blockOffset(group_start + 1));
+        if (!std.mem.eql(u8, backup_gdt, plan.primary_gdt)) {
+            return error.BadBackupGroupDescriptors;
+        }
+        if (plan.checksum_seed_changed) {
+            try backup_gdt_offsets.append(reader.blockOffset(group_start + 1));
+        }
+    }
+
+    plan.backup_superblocks = try backup_superblocks.toOwnedSlice();
+    plan.backup_gdt_offsets = try backup_gdt_offsets.toOwnedSlice();
+}
+
+fn scanUuidRewriteInodes(
+    plan: *UuidRewritePlan,
+    reader: *Reader,
+    io: Io,
+    before_checksum_seed: u32,
+    after_checksum_seed: u32,
+) UuidRewriteError!void {
+    var rewritten_xattr_blocks = std.AutoHashMap(u64, void).init(plan.allocator);
+    defer rewritten_xattr_blocks.deinit();
+
+    const resize_inode_enabled = plan.before.feature_compat & feature_compat_resize_inode != 0;
+    const orphan_inode_number = plan.before.orphan_file_inode;
+    var saw_journal = !plan.before.has_journal;
+    var saw_orphan = orphan_inode_number == null;
+
+    var inode_bitmap: [default_block_size]u8 = undefined;
+    var raw_storage: [max_supported_reader_inode_size]u8 = undefined;
+    var group_index: usize = 0;
+    while (group_index < reader.groups.len) : (group_index += 1) {
+        try reader.readAll(
+            io,
+            &inode_bitmap,
+            reader.blockOffset(reader.groups[group_index].inode_bitmap_block),
+        );
+        var bit: u32 = 0;
+        while (bit < reader.inodes_per_group and
+            @as(u64, @intCast(group_index)) * reader.inodes_per_group + bit < reader.total_inodes) : (bit += 1)
+        {
+            if (!bitmapIsSet(&inode_bitmap, bit)) continue;
+            const inode_number = @as(u32, @intCast(group_index)) *
+                reader.inodes_per_group + bit + 1;
+            const raw = try readUuidRewriteRawInode(reader, io, inode_number, &raw_storage);
+            const reserved_untyped = inode_number < first_non_reserved_inode and
+                readInt(u16, raw[0..2]) == 0;
+            if (reserved_untyped and allZero(raw)) {
+                continue;
+            }
+            var checked: [max_supported_reader_inode_size]u8 = undefined;
+            @memcpy(checked[0..raw.len], raw);
+            setInodeChecksumSeed(checked[0..raw.len], before_checksum_seed, inode_number);
+            if (rawInodeStoredChecksum(raw) != rawInodeStoredChecksum(checked[0..raw.len])) {
+                return error.BadInodeChecksum;
+            }
+
+            if (plan.checksum_seed_changed) {
+                const staged = try stageUuidRewriteRawInode(plan, reader, io, inode_number);
+                setInodeChecksumSeed(staged, after_checksum_seed, inode_number);
+            }
+            if (reserved_untyped) continue;
+            const inode = try parseUuidRewriteInode(inode_number, raw);
+            if (inode.file_acl_block != 0) {
+                if (!plan.checksum_seed_changed or !rewritten_xattr_blocks.contains(inode.file_acl_block)) {
+                    try validateAndMaybeRewriteXattrBlock(
+                        plan,
+                        reader,
+                        io,
+                        inode.file_acl_block,
+                        before_checksum_seed,
+                        after_checksum_seed,
+                    );
+                    if (plan.checksum_seed_changed) {
+                        try rewritten_xattr_blocks.put(inode.file_acl_block, {});
+                    }
+                }
+            }
+
+            const has_extents = inode.flags & inode_flag_extents != 0;
+            if (has_extents) {
+                var walk = try collectValidatedExtentEntries(
+                    reader,
+                    io,
+                    plan.allocator,
+                    inode_number,
+                    inode.generation,
+                    before_checksum_seed,
+                    inode.block_bytes[0..],
+                );
+                defer walk.deinit(plan.allocator);
+
+                if (plan.checksum_seed_changed) {
+                    for (walk.tree_blocks) |block_number| {
+                        const block = try plan.stageBlock(reader, io, block_number);
+                        setExtentBlockChecksumSeed(
+                            block,
+                            after_checksum_seed,
+                            inode_number,
+                            inode.generation,
+                        );
+                    }
+                }
+                if (inode.kind == .directory) {
+                    try validateAndMaybeRewriteDirectory(
+                        plan,
+                        reader,
+                        io,
+                        inode,
+                        inode_number,
+                        walk.extents,
+                        before_checksum_seed,
+                        after_checksum_seed,
+                    );
+                }
+                if (plan.before.has_journal and inode_number == journal_inode) {
+                    saw_journal = true;
+                    try validateAndMaybeRewriteJournalSuperblock(
+                        plan,
+                        reader,
+                        io,
+                        walk.extents,
+                    );
+                }
+                if (orphan_inode_number) |orphan| {
+                    if (inode_number == orphan) {
+                        saw_orphan = true;
+                        try validateAndMaybeRewriteOrphanBlocks(
+                            plan,
+                            reader,
+                            io,
+                            inode_number,
+                            inode.generation,
+                            inode.size,
+                            walk.extents,
+                            before_checksum_seed,
+                            after_checksum_seed,
+                        );
+                    }
+                }
+                continue;
+            }
+
+            switch (inode.kind) {
+                .directory => return error.UnsupportedDirectoryLayout,
+                .file => {
+                    if (!(resize_inode_enabled and inode_number == resize_inode)) {
+                        return error.UnsupportedBlockMappedInode;
+                    }
+                },
+                .symlink => if (!inode.isFastSymlink()) return error.UnsupportedInodeLayout,
+                .block_device, .char_device, .fifo => if (inode.flags != 0) {
+                    return error.UnsupportedInodeLayout;
+                },
+                .hardlink => unreachable,
+            }
+        }
+    }
+
+    if (!saw_journal) return error.BadJournalSuperblock;
+    if (!saw_orphan) return error.UnsupportedInodeLayout;
+}
+
+fn validateAndMaybeRewriteXattrBlock(
+    plan: *UuidRewritePlan,
+    reader: *Reader,
+    io: Io,
+    block_number: u64,
+    before_checksum_seed: u32,
+    after_checksum_seed: u32,
+) UuidRewriteError!void {
+    var storage: [default_block_size]u8 = undefined;
+    const block = if (plan.checksum_seed_changed)
+        try plan.stageBlock(reader, io, block_number)
+    else blk: {
+        try reader.readAll(io, &storage, reader.blockOffset(block_number));
+        break :blk storage[0..];
+    };
+    if (readInt(u32, block[0..4]) != ext4_xattr_magic) return error.UnsupportedXattrLayout;
+    var checked: [default_block_size]u8 = undefined;
+    @memcpy(&checked, block);
+    setXattrBlockChecksumSeed(&checked, before_checksum_seed, block_number);
+    if (readInt(u32, block[0x10..0x14]) != readInt(u32, checked[0x10..0x14])) {
+        return error.BadXattrChecksum;
+    }
+    if (plan.checksum_seed_changed) {
+        setXattrBlockChecksumSeed(block, after_checksum_seed, block_number);
+    }
+}
+
+fn collectValidatedExtentEntries(
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    inode_number: u32,
+    generation: u32,
+    checksum_seed: u32,
+    root_bytes: []const u8,
+) UuidRewriteError!UuidRewriteExtentWalk {
+    var extents = std.array_list.Managed(Extent).init(allocator);
+    errdefer extents.deinit();
+    var tree_blocks = std.array_list.Managed(u64).init(allocator);
+    errdefer tree_blocks.deinit();
+    try appendValidatedExtentEntries(
+        reader,
+        io,
+        inode_number,
+        generation,
+        checksum_seed,
+        root_bytes,
+        max_inline_extents,
+        null,
+        false,
+        &extents,
+        &tree_blocks,
+    );
+    return .{
+        .extents = try extents.toOwnedSlice(),
+        .tree_blocks = try tree_blocks.toOwnedSlice(),
+    };
+}
+
+fn appendValidatedExtentEntries(
+    reader: *Reader,
+    io: Io,
+    inode_number: u32,
+    generation: u32,
+    checksum_seed: u32,
+    node_bytes: []const u8,
+    capacity: usize,
+    expected_depth: ?u16,
+    external: bool,
+    extents: *std.array_list.Managed(Extent),
+    tree_blocks: *std.array_list.Managed(u64),
+) UuidRewriteError!void {
+    const header = try parseExtentHeader(node_bytes[0..extent_header_size]);
+    if (header.max != capacity or header.entries > header.max or
+        header.depth > max_supported_extent_depth or header.generation != 0)
+    {
+        return error.UnsupportedExtentLayout;
+    }
+    if (expected_depth) |depth| {
+        if (header.depth != depth) return error.UnsupportedExtentLayout;
+    }
+    if (header.depth > 0 and header.entries == 0) return error.UnsupportedExtentLayout;
+
+    if (external) {
+        const tail_offset = extentTailOffset(header.max);
+        if (tail_offset + extent_tail_size > node_bytes.len) {
+            return error.UnsupportedExtentLayout;
+        }
+        var checked: [default_block_size]u8 = undefined;
+        @memcpy(&checked, node_bytes);
+        setExtentBlockChecksumSeed(&checked, checksum_seed, inode_number, generation);
+        if (readInt(u32, node_bytes[tail_offset .. tail_offset + 4]) !=
+            readInt(u32, checked[tail_offset .. tail_offset + 4]))
+        {
+            return error.BadExtentChecksum;
+        }
+    }
+
+    const unused_start = extent_header_size + @as(usize, header.entries) * extent_entry_size;
+    const unused_end = if (external)
+        extentTailOffset(header.max)
+    else
+        extent_header_size + capacity * extent_entry_size;
+    if (!allZero(node_bytes[unused_start..unused_end])) {
+        return error.UnsupportedExtentLayout;
+    }
+
+    if (header.depth == 0) {
+        var index: usize = 0;
+        while (index < header.entries) : (index += 1) {
+            const base = extent_header_size + index * extent_entry_size;
+            const raw_count = readInt(u16, node_bytes[base + 4 .. base + 6]);
+            if (raw_count == 0 or raw_count > 0x8000) return error.UnsupportedExtent;
+            try extents.append(decodeExtent(node_bytes[base .. base + extent_entry_size]));
+        }
+        return;
+    }
+
+    var previous_key: ?u32 = null;
+    var index: usize = 0;
+    while (index < header.entries) : (index += 1) {
+        const base = extent_header_size + index * extent_entry_size;
+        const child = decodeExtentIndex(node_bytes[base .. base + extent_entry_size]);
+        if (!allZero(node_bytes[base + 10 .. base + 12]) or
+            (previous_key != null and child.logical_block <= previous_key.?))
+        {
+            return error.UnsupportedExtentLayout;
+        }
+        if (child.leaf_block == 0 or child.leaf_block >= reader.total_blocks) {
+            return error.UnsupportedExtent;
+        }
+        previous_key = child.logical_block;
+        try tree_blocks.append(child.leaf_block);
+
+        var block: [default_block_size]u8 = undefined;
+        try reader.readAll(io, &block, reader.blockOffset(child.leaf_block));
+        const before = extents.items.len;
+        try appendValidatedExtentEntries(
+            reader,
+            io,
+            inode_number,
+            generation,
+            checksum_seed,
+            &block,
+            extentEntriesPerBlock(reader.block_size),
+            header.depth - 1,
+            true,
+            extents,
+            tree_blocks,
+        );
+        if (extents.items.len == before or
+            extents.items[before].logical_block != child.logical_block)
+        {
+            return error.UnsupportedExtentLayout;
+        }
+    }
+}
+
+fn validateAndMaybeRewriteDirectory(
+    plan: *UuidRewritePlan,
+    reader: *Reader,
+    io: Io,
+    inode: UuidRewriteInode,
+    inode_number: u32,
+    extents: []const Extent,
+    before_checksum_seed: u32,
+    after_checksum_seed: u32,
+) UuidRewriteError!void {
+    if (inode.size == 0 or inode.size % reader.block_size != 0) {
+        return error.UnsupportedDirectoryLayout;
+    }
+    const directory_block_count = inode.size / reader.block_size;
+    var block_storage: [default_block_size]u8 = undefined;
+    var logical_block: u32 = 0;
+    while (logical_block < directory_block_count) : (logical_block += 1) {
+        const physical = findPhysicalBlock(extents, logical_block) orelse
+            return error.UnsupportedDirectoryLayout;
+        const block = if (plan.checksum_seed_changed)
+            try plan.stageBlock(reader, io, physical)
+        else blk: {
+            try reader.readAll(io, &block_storage, reader.blockOffset(physical));
+            break :blk block_storage[0..];
+        };
+        try validateAndMaybeRewriteDirectoryBlock(
+            block,
+            logical_block,
+            reader.block_size,
+            inode.flags,
+            inode_number,
+            inode.generation,
+            before_checksum_seed,
+            after_checksum_seed,
+            plan.checksum_seed_changed,
+        );
+    }
+}
+
+fn validateAndMaybeRewriteDirectoryBlock(
+    block: []u8,
+    logical_block: u32,
+    block_size: u32,
+    flags: u32,
+    inode_number: u32,
+    generation: u32,
+    before_checksum_seed: u32,
+    after_checksum_seed: u32,
+    rewrite: bool,
+) UuidRewriteError!void {
+    const tail = block[block.len - 12 ..];
+    const is_leaf = readInt(u32, tail[0..4]) == 0 and
+        readInt(u16, tail[4..6]) == 12 and
+        tail[6] == 0 and tail[7] == dir_ft_checksum;
+    if (is_leaf) {
+        var checked: [default_block_size]u8 = undefined;
+        @memcpy(&checked, block);
+        setDirectoryLeafChecksumSeed(&checked, before_checksum_seed, inode_number, generation);
+        if (readInt(u32, block[block.len - 4 ..]) !=
+            readInt(u32, checked[checked.len - 4 ..]))
+        {
+            return error.BadDirectoryChecksum;
+        }
+        if (rewrite) {
+            setDirectoryLeafChecksumSeed(block, after_checksum_seed, inode_number, generation);
+        }
+        return;
+    }
+
+    if (flags & inode_flag_index == 0) return error.UnsupportedDirectoryLayout;
+    const count_offset: usize = if (logical_block == 0) 32 else 8;
+    const expected_limit = if (logical_block == 0)
+        dxRootLimit(block_size)
+    else
+        dxNodeLimit(block_size);
+    if (logical_block == 0 and
+        (block[28] != dx_hash_half_md4 or block[29] != 8 or
+            block[30] > max_supported_extent_depth or block[31] != 0))
+    {
+        return error.UnsupportedDirectoryLayout;
+    }
+    const limit = readInt(u16, block[count_offset .. count_offset + 2]);
+    const count = readInt(u16, block[count_offset + 2 .. count_offset + 4]);
+    if (limit != expected_limit or count == 0 or count > limit) {
+        return error.UnsupportedDirectoryLayout;
+    }
+    const tail_offset = count_offset + @as(usize, limit) * 8;
+    const used_end = count_offset + @as(usize, count) * 8;
+    if (tail_offset + 8 > block.len or
+        !allZero(block[used_end..tail_offset]) or
+        !allZero(block[tail_offset .. tail_offset + 4]))
+    {
+        return error.UnsupportedDirectoryLayout;
+    }
+    var checked: [default_block_size]u8 = undefined;
+    @memcpy(&checked, block);
+    setDxChecksumSeed(
+        &checked,
+        count_offset,
+        count,
+        limit,
+        before_checksum_seed,
+        inode_number,
+        generation,
+    );
+    if (readInt(u32, block[tail_offset + 4 .. tail_offset + 8]) !=
+        readInt(u32, checked[tail_offset + 4 .. tail_offset + 8]))
+    {
+        return error.BadDirectoryChecksum;
+    }
+    if (rewrite) {
+        setDxChecksumSeed(
+            block,
+            count_offset,
+            count,
+            limit,
+            after_checksum_seed,
+            inode_number,
+            generation,
+        );
+    }
+}
+
+fn validateAndMaybeRewriteJournalSuperblock(
+    plan: *UuidRewritePlan,
+    reader: *Reader,
+    io: Io,
+    extents: []const Extent,
+) UuidRewriteError!void {
+    const physical = findPhysicalBlock(extents, 0) orelse return error.BadJournalSuperblock;
+    var storage: [default_block_size]u8 = undefined;
+    const block = if (!std.mem.eql(u8, &plan.before.uuid, &plan.after.uuid))
+        try plan.stageBlock(reader, io, physical)
+    else blk: {
+        try reader.readAll(io, &storage, reader.blockOffset(physical));
+        break :blk storage[0..];
+    };
+    if (std.mem.readInt(u32, block[0x00..0x04], .big) != jbd2_magic or
+        std.mem.readInt(u32, block[0x04..0x08], .big) != jbd2_superblock_v2 or
+        !std.mem.eql(u8, block[0x30..0x40], &plan.before.uuid))
+    {
+        return error.BadJournalSuperblock;
+    }
+    if (!std.mem.eql(u8, &plan.before.uuid, &plan.after.uuid)) {
+        @memcpy(block[0x30..0x40], &plan.after.uuid);
+    }
+}
+
+fn validateAndMaybeRewriteOrphanBlocks(
+    plan: *UuidRewritePlan,
+    reader: *Reader,
+    io: Io,
+    inode_number: u32,
+    generation: u32,
+    inode_size: u64,
+    extents: []const Extent,
+    before_checksum_seed: u32,
+    after_checksum_seed: u32,
+) UuidRewriteError!void {
+    if (inode_size == 0 or inode_size % reader.block_size != 0) {
+        return error.UnsupportedInodeLayout;
+    }
+    var storage: [default_block_size]u8 = undefined;
+    var logical: u32 = 0;
+    const block_count = inode_size / reader.block_size;
+    while (logical < block_count) : (logical += 1) {
+        const physical = findPhysicalBlock(extents, logical) orelse
+            return error.UnsupportedInodeLayout;
+        const block = if (plan.checksum_seed_changed)
+            try plan.stageBlock(reader, io, physical)
+        else blk: {
+            try reader.readAll(io, &storage, reader.blockOffset(physical));
+            break :blk storage[0..];
+        };
+        if (readInt(u32, block[block.len - 8 .. block.len - 4]) != orphan_block_magic) {
+            return error.BadOrphanFileChecksum;
+        }
+        var checked: [default_block_size]u8 = undefined;
+        @memcpy(&checked, block);
+        var inode_le = std.mem.nativeToLittle(u32, inode_number);
+        var generation_le = std.mem.nativeToLittle(u32, generation);
+        var block_le = std.mem.nativeToLittle(u64, physical);
+        const before_checksum = ext4Crc32cSeed(before_checksum_seed, &.{
+            std.mem.asBytes(&inode_le),
+            std.mem.asBytes(&generation_le),
+            std.mem.asBytes(&block_le),
+            checked[0 .. checked.len - 8],
+        });
+        if (readInt(u32, block[block.len - 4 ..]) != before_checksum) {
+            return error.BadOrphanFileChecksum;
+        }
+        if (plan.checksum_seed_changed) {
+            const after_checksum = ext4Crc32cSeed(after_checksum_seed, &.{
+                std.mem.asBytes(&inode_le),
+                std.mem.asBytes(&generation_le),
+                std.mem.asBytes(&block_le),
+                block[0 .. block.len - 8],
+            });
+            writeInt(u32, block[block.len - 4 ..], after_checksum);
+        }
+    }
 }
 
 pub const OpenOptions = struct {
@@ -11077,6 +12363,329 @@ pub fn expectE2fsckClean(path: []const u8) !void {
             return error.TestUnexpectedResult;
         },
     }
+}
+
+fn copyFileRangeToPath(
+    io: Io,
+    file: Io.File,
+    offset: u64,
+    length: u64,
+    path: []const u8,
+) !void {
+    const output = try Io.Dir.cwd().createFile(io, path, .{
+        .read = true,
+        .truncate = true,
+    });
+    defer output.close(io);
+
+    var buffer: [64 * 1024]u8 = undefined;
+    var copied: u64 = 0;
+    while (copied < length) {
+        const want: usize = @intCast(@min(@as(u64, buffer.len), length - copied));
+        const got = try file.readPositionalAll(io, buffer[0..want], offset + copied);
+        if (got != want) return error.UnexpectedEndOfFile;
+        try output.writePositionalAll(io, buffer[0..got], copied);
+        copied += got;
+    }
+}
+
+fn copyImageRangeToPath(
+    io: Io,
+    image: *Image,
+    offset: u64,
+    length: u64,
+    path: []const u8,
+) !void {
+    const output = try Io.Dir.cwd().createFile(io, path, .{
+        .read = true,
+        .truncate = true,
+    });
+    defer output.close(io);
+
+    var buffer: [64 * 1024]u8 = undefined;
+    var copied: u64 = 0;
+    while (copied < length) {
+        const want: usize = @intCast(@min(@as(u64, buffer.len), length - copied));
+        const got = try image.pread(io, buffer[0..want], offset + copied);
+        if (got != want) return error.UnexpectedEndOfFile;
+        try output.writePositionalAll(io, buffer[0..got], copied);
+        copied += got;
+    }
+}
+
+fn crc32FileRange(
+    io: Io,
+    file: Io.File,
+    offset: u64,
+    length: u64,
+) !u32 {
+    var hasher = std.hash.crc.Crc32.init();
+    var buffer: [64 * 1024]u8 = undefined;
+    var copied: u64 = 0;
+    while (copied < length) {
+        const want: usize = @intCast(@min(@as(u64, buffer.len), length - copied));
+        const got = try file.readPositionalAll(io, buffer[0..want], offset + copied);
+        if (got != want) return error.UnexpectedEndOfFile;
+        hasher.update(buffer[0..got]);
+        copied += got;
+    }
+    return hasher.final();
+}
+
+fn readJournalSuperblockUuid(reader: *Reader, io: Io) ![16]u8 {
+    const inode = try reader.readInode(io, journal_inode);
+    const extents = try reader.readInodeExtentsAlloc(io, std.testing.allocator, inode);
+    defer std.testing.allocator.free(extents);
+    const physical = findPhysicalBlock(extents, 0) orelse return error.NotFound;
+    var block: [default_block_size]u8 = undefined;
+    try reader.readAll(io, &block, reader.blockOffset(physical));
+    var uuid: [16]u8 = undefined;
+    @memcpy(&uuid, block[0x30..0x40]);
+    return uuid;
+}
+
+test "rewriteUuid updates a vmiz ext4 region and its journal identity" {
+    const io = std.testing.io;
+    const path = "test-ext4-uuid-rewrite-vmiz.raw";
+    const extracted_path = "test-ext4-uuid-rewrite-vmiz.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, extracted_path) catch {};
+
+    const offset: u64 = 1024 * 1024;
+    const length: u64 = 256 * 1024 * 1024;
+    const old_uuid = [_]u8{0x31} ** 16;
+    const new_uuid = [_]u8{0x42} ** 16;
+    const xattrs = [_]Xattr{.{ .name = "user.tag", .value = "rewrite" }};
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{
+            .path = "etc/hostname",
+            .kind = .file,
+            .mode = 0o644,
+            .uid = 0,
+            .gid = 0,
+            .size = 10,
+            .bytes = "vmiz-test\n",
+            .xattrs = &xattrs,
+        },
+        .{ .path = "usr", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{
+            .path = "usr/payload.bin",
+            .kind = .file,
+            .mode = 0o644,
+            .uid = 0,
+            .gid = 0,
+            .size = 3 * 1024 * 1024,
+            .generator = .pattern,
+        },
+        .{
+            .path = "link",
+            .kind = .symlink,
+            .mode = 0o777,
+            .uid = 0,
+            .gid = 0,
+            .size = 12,
+            .bytes = "etc/hostname",
+        },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .offset = offset,
+        .length = length,
+        .uuid = old_uuid,
+        .journal = .{ .enabled = true },
+    });
+
+    const report = try rewriteUuid(io, file, std.testing.allocator, .{
+        .offset = offset,
+        .length = length,
+        .uuid = new_uuid,
+    });
+    try std.testing.expectEqual(UuidRewriteProfile.vmiz_ext4_v1, report.profile);
+    try std.testing.expectEqual(SourceProfile.vmiz_ext4_v1, report.before.profile);
+    try std.testing.expectEqual(SourceProfile.vmiz_ext4_v1, report.after.profile);
+    try std.testing.expect(report.checksum_seed_changed);
+    try std.testing.expectEqualSlices(u8, &old_uuid, &report.before.uuid);
+    try std.testing.expectEqualSlices(u8, &new_uuid, &report.after.uuid);
+    try std.testing.expectEqual(ext4Crc32c(&.{&old_uuid}), report.before.checksum_seed);
+    try std.testing.expectEqual(ext4Crc32c(&.{&new_uuid}), report.after.checksum_seed);
+
+    var superblock: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &superblock, offset + superblock_offset);
+    try std.testing.expectEqualSlices(u8, &new_uuid, superblock[0x68..0x78]);
+
+    var backup_superblock: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(
+        io,
+        &backup_superblock,
+        offset + @as(u64, default_blocks_per_group) * default_block_size,
+    );
+    try std.testing.expectEqualSlices(u8, &new_uuid, backup_superblock[0x68..0x78]);
+    try std.testing.expectEqual(@as(u16, 1), readInt(u16, backup_superblock[0x5A..0x5C]));
+
+    var reader = try openGeneral(io, file, std.testing.allocator, .{ .offset = offset });
+    defer reader.deinit();
+    try std.testing.expectEqualSlices(u8, &new_uuid, &try readJournalSuperblockUuid(&reader, io));
+
+    try copyFileRangeToPath(io, file, offset, report.after.filesystem_length, extracted_path);
+    expectE2fsckClean(extracted_path) catch |err| if (err != error.SkipZigTest) return err;
+}
+
+test "rewriteUuidImage preserves arbitrary checksum seeds" {
+    const io = std.testing.io;
+    const path = "test-ext4-uuid-rewrite-image.raw";
+    const extracted_path = "test-ext4-uuid-rewrite-image.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, extracted_path) catch {};
+
+    const offset: u64 = 1024 * 1024;
+    const length: u64 = 256 * 1024 * 1024;
+    const image_size = offset + length + 1024 * 1024;
+    const old_uuid = [_]u8{0x51} ** 16;
+    const new_uuid = [_]u8{0x63} ** 16;
+    const checksum_seed: u32 = 0xA1B2_C3D4;
+
+    var image = try Image.create(io, path, .raw, image_size, .{});
+    defer image.close(io);
+    var tree = journalTestTree();
+    tree.bind();
+    _ = try populate(io, image.file, std.testing.allocator, &tree.view, .{
+        .offset = offset,
+        .length = length,
+        .uuid = old_uuid,
+        .journal = .{ .enabled = true },
+        .preserve_feature_ro_compat = 0x046b,
+        .preserve_feature_compat = 0x103c,
+        .preserve_feature_incompat = 0x22c2,
+        .descriptor_size = 64,
+        .preserve_checksum_seed = checksum_seed,
+    });
+
+    const report = try rewriteUuidImage(io, &image, std.testing.allocator, .{
+        .offset = offset,
+        .length = length,
+        .uuid = new_uuid,
+    });
+    try std.testing.expectEqual(UuidRewriteProfile.ubuntu_pinned_v1, report.profile);
+    try std.testing.expectEqual(SourceProfile.ext4_general_v1, report.before.profile);
+    try std.testing.expectEqual(SourceProfile.ext4_general_v1, report.after.profile);
+    try std.testing.expect(!report.checksum_seed_changed);
+    try std.testing.expectEqual(checksum_seed, report.before.checksum_seed);
+    try std.testing.expectEqual(checksum_seed, report.after.checksum_seed);
+    try std.testing.expectEqualSlices(u8, &new_uuid, &report.after.uuid);
+
+    var superblock: [superblock_size]u8 = undefined;
+    _ = try image.pread(io, &superblock, offset + superblock_offset);
+    try std.testing.expectEqualSlices(u8, &new_uuid, superblock[0x68..0x78]);
+
+    var backup_superblock: [superblock_size]u8 = undefined;
+    _ = try image.pread(
+        io,
+        &backup_superblock,
+        offset + @as(u64, default_blocks_per_group) * default_block_size,
+    );
+    try std.testing.expectEqualSlices(u8, &new_uuid, backup_superblock[0x68..0x78]);
+
+    var reader = try openGeneralReadOnlySource(
+        io,
+        image.file,
+        .{
+            .ctx = &image,
+            .read_at_fn = readUuidRewriteImageAt,
+        },
+        std.testing.allocator,
+        .{ .offset = offset },
+    );
+    defer reader.deinit();
+    try std.testing.expectEqualSlices(u8, &new_uuid, &try readJournalSuperblockUuid(&reader, io));
+
+    try copyImageRangeToPath(io, &image, offset, report.after.filesystem_length, extracted_path);
+    expectE2fsckClean(extracted_path) catch |err| if (err != error.SkipZigTest) return err;
+}
+
+test "rewriteUuid updates UUID-derived checksum seeds on a real e2fsprogs profile" {
+    const io = std.testing.io;
+    const path = "test-ext4-uuid-rewrite-mke2fs.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const length: u64 = 256 * 1024 * 1024;
+    const new_uuid = [_]u8{0x74} ** 16;
+    var blocks_text: [32]u8 = undefined;
+    runExternalToolChecked(std.testing.allocator, "mke2fs", &.{
+        "-q",
+        "-F",
+        "-t",
+        "ext4",
+        "-b",
+        "4096",
+        "-O",
+        "64bit,flex_bg,metadata_csum,metadata_csum_seed,orphan_file,resize_inode,dir_index,has_journal",
+        path,
+        try std.fmt.bufPrint(&blocks_text, "{d}", .{length / default_block_size}),
+    }) catch |err| switch (err) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    const report = try rewriteUuid(io, file, std.testing.allocator, .{
+        .length = length,
+        .uuid = new_uuid,
+    });
+    try std.testing.expectEqual(UuidRewriteProfile.ubuntu_pinned_v1, report.profile);
+    try std.testing.expect(report.checksum_seed_changed);
+    try std.testing.expectEqual(ext4Crc32c(&.{&report.before.uuid}), report.before.checksum_seed);
+    try std.testing.expectEqual(ext4Crc32c(&.{&new_uuid}), report.after.checksum_seed);
+    try std.testing.expectEqualSlices(u8, &new_uuid, &report.after.uuid);
+    expectE2fsckClean(path) catch |err| if (err != error.SkipZigTest) return err;
+}
+
+test "rewriteUuid refuses unsupported checksum-seed layouts before mutating" {
+    const io = std.testing.io;
+    const path = "test-ext4-uuid-rewrite-unsupported.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const length: u64 = 64 * 1024 * 1024;
+    const old_uuid = [_]u8{0x19} ** 16;
+    const new_uuid = [_]u8{0x91} ** 16;
+    var tree = journalTestTree();
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = length,
+        .uuid = old_uuid,
+    });
+
+    var superblock: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &superblock, superblock_offset);
+    writeInt(
+        u32,
+        superblock[0x60..0x64],
+        readInt(u32, superblock[0x60..0x64]) | feature_incompat_csum_seed,
+    );
+    writeInt(u32, superblock[0x270..0x274], 0x1234_5678);
+    setSuperblockChecksum(&superblock);
+    try file.writePositionalAll(io, &superblock, superblock_offset);
+
+    const before_crc = try crc32FileRange(io, file, 0, length);
+    try std.testing.expectError(error.UnsupportedIdentityProfile, rewriteUuid(
+        io,
+        file,
+        std.testing.allocator,
+        .{ .length = length, .uuid = new_uuid },
+    ));
+    const after_crc = try crc32FileRange(io, file, 0, length);
+    try std.testing.expectEqual(before_crc, after_crc);
+
+    var after_superblock: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &after_superblock, superblock_offset);
+    try std.testing.expectEqualSlices(u8, &superblock, &after_superblock);
 }
 
 test "Editor edits (deletes, recursive tree removal, and overwrite) pass a real e2fsck -f check" {

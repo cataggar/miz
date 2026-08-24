@@ -76,6 +76,29 @@ incompat `0x22c2`, and ro-compat `0x046b`) is supported. Commits rebuild its
 e2fsprogs-style `resize_inode` reservation and empty `orphan_file` inode,
 including seeded metadata checksums, rather than dropping those structures.
 
+## Rewrite an ext4 filesystem UUID in place
+
+`vmiz.ext4.rewriteUuid` rewrites an existing ext4 filesystem's UUID inside a
+declared byte range, updates sparse-super backup copies, refreshes every
+UUID-derived checksum dependency the supported native profiles require, rereads
+the result, and returns the old/new identity report:
+
+```zig
+const report = try vmiz.ext4.rewriteUuid(io, image.file, allocator, .{
+    .offset = root_offset,
+    .length = root_partition_length,
+    .uuid = [_]u8{0x42} ** 16,
+});
+_ = report.before;
+_ = report.after;
+```
+
+`vmiz.ext4.rewriteUuidImage` provides the same operation through
+`vmiz.Image`. Both paths reject unsupported feature/layout combinations before
+writing. When `metadata_csum_seed` stores a UUID-derived seed, the seed and all
+seeded metadata checksums are rewritten to match the new UUID; an explicit
+non-derived seed is preserved.
+
 ## Inspect UKI signing certificates
 
 Open a supported disk format with `vmiz.Image`, then use
