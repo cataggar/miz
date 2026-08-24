@@ -1683,15 +1683,39 @@ fn replaceAtomicPathAfterExchange(
     return replaceAtomicPathBeforePublish(ctx_ptr);
 }
 
+fn temporaryTestPath(
+    allocator: Allocator,
+    io: Io,
+    temporary: *std.testing.TmpDir,
+    sub_path: []const u8,
+) ![]const u8 {
+    var root_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    return std.fs.path.join(allocator, &.{ root_buffer[0..root_length], sub_path });
+}
+
 test "atomic commit preserves host image mode timestamps and xattrs" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const parent_path = "test-ext4-mountless-host-metadata-parent";
-    const image_path = "test-ext4-mountless-host-metadata-parent/image.raw";
-    const spool_path = "test-ext4-mountless-host-metadata.spool";
-    defer Io.Dir.cwd().deleteTree(io, parent_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const parent_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-host-metadata-parent",
+    );
+    defer allocator.free(parent_path);
+    const image_path = try std.fs.path.join(allocator, &.{ parent_path, "image.raw" });
+    defer allocator.free(image_path);
+    const spool_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-host-metadata.spool",
+    );
+    defer allocator.free(spool_path);
     try Io.Dir.cwd().createDirPath(io, parent_path);
 
     var image = try @import("image.zig").Image.createExclusive(
@@ -1775,12 +1799,29 @@ test "atomic commit preserves host image mode timestamps and xattrs" {
 test "atomic commit detects a replacement between validation and exchange" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const image_path = "test-ext4-mountless-publish-race.raw";
-    const replacement_path = "test-ext4-mountless-publish-race-replacement.raw";
-    const spool_path = "test-ext4-mountless-publish-race.spool";
-    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, replacement_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const image_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-publish-race.raw",
+    );
+    defer allocator.free(image_path);
+    const replacement_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-publish-race-replacement.raw",
+    );
+    defer allocator.free(replacement_path);
+    const spool_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-publish-race.spool",
+    );
+    defer allocator.free(spool_path);
 
     var image = try @import("image.zig").Image.createExclusive(
         io,
@@ -1823,12 +1864,29 @@ test "atomic commit detects a replacement between validation and exchange" {
 test "atomic commit preserves a replacement after exchange and leaves recovery artifacts" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const image_path = "test-ext4-mountless-after-exchange-race.raw";
-    const replacement_path = "test-ext4-mountless-after-exchange-race-replacement.raw";
-    const spool_path = "test-ext4-mountless-after-exchange-race.spool";
-    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, replacement_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const image_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-after-exchange-race.raw",
+    );
+    defer allocator.free(image_path);
+    const replacement_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-after-exchange-race-replacement.raw",
+    );
+    defer allocator.free(replacement_path);
+    const spool_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-after-exchange-race.spool",
+    );
+    defer allocator.free(spool_path);
 
     var image = try @import("image.zig").Image.createExclusive(
         io,
@@ -1880,10 +1938,22 @@ test "atomic commit preserves a replacement after exchange and leaves recovery a
 test "durability failure exposes recovery path before filesystem teardown" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const image_path = "test-ext4-mountless-durability-failure.raw";
-    const spool_path = "test-ext4-mountless-durability-failure.spool";
-    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const image_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-durability-failure.raw",
+    );
+    defer allocator.free(image_path);
+    const spool_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-durability-failure.spool",
+    );
+    defer allocator.free(spool_path);
 
     var image = try @import("image.zig").Image.createExclusive(
         io,
@@ -1921,16 +1991,18 @@ test "durability failure exposes recovery path before filesystem teardown" {
 test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const image_path = "test-ext4-mountless.raw";
-    const spool_path = "test-ext4-mountless.spool";
-    const copy_in_path = "test-ext4-mountless-copy-in";
-    const copy_out_path = "test-ext4-mountless-copy-out";
-    const host_tree_path = "test-ext4-mountless-host-tree";
-    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, copy_in_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, copy_out_path) catch {};
-    defer Io.Dir.cwd().deleteTree(io, host_tree_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const image_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-mountless.raw");
+    defer allocator.free(image_path);
+    const spool_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-mountless.spool");
+    defer allocator.free(spool_path);
+    const copy_in_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-mountless-copy-in");
+    defer allocator.free(copy_in_path);
+    const copy_out_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-mountless-copy-out");
+    defer allocator.free(copy_out_path);
+    const host_tree_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-mountless-host-tree");
+    defer allocator.free(host_tree_path);
 
     var image = try @import("image.zig").Image.createExclusive(
         io,
@@ -1994,12 +2066,14 @@ test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
 test "importHostTree frees excluded top-level directory names (#455)" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const image_path = "test-ext4-import-excluded.raw";
-    const spool_path = "test-ext4-import-excluded.spool";
-    const host_tree_path = "test-ext4-import-excluded-host";
-    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
-    defer Io.Dir.cwd().deleteTree(io, host_tree_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const image_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-import-excluded.raw");
+    defer allocator.free(image_path);
+    const spool_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-import-excluded.spool");
+    defer allocator.free(spool_path);
+    const host_tree_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-import-excluded-host");
+    defer allocator.free(host_tree_path);
 
     var image = try @import("image.zig").Image.createExclusive(
         io,
@@ -2034,7 +2108,9 @@ test "importHostTree frees excluded top-level directory names (#455)" {
         defer allocator.free(path);
         try Io.Dir.cwd().createDirPath(io, path);
     }
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = host_tree_path ++ "/etc/hostname", .data = "new" });
+    const hostname_path = try std.fs.path.join(allocator, &.{ host_tree_path, "etc/hostname" });
+    defer allocator.free(hostname_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = hostname_path, .data = "new" });
 
     try fs.importHostTree(host_tree_path, .{});
 
@@ -2049,12 +2125,14 @@ test "importHostTree frees excluded top-level directory names (#455)" {
 test "exportHostTree preserves guest execute bits above the readable floor" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const image_path = "test-ext4-export-exec.raw";
-    const spool_path = "test-ext4-export-exec.spool";
-    const host_tree_path = "test-ext4-export-exec-host-tree";
-    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
-    defer Io.Dir.cwd().deleteTree(io, host_tree_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const image_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-export-exec.raw");
+    defer allocator.free(image_path);
+    const spool_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-export-exec.spool");
+    defer allocator.free(spool_path);
+    const host_tree_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-export-exec-host-tree");
+    defer allocator.free(host_tree_path);
 
     var image = try @import("image.zig").Image.createExclusive(
         io,
@@ -2121,12 +2199,19 @@ test "exportHostTree preserves guest execute bits above the readable floor" {
 test "mountless commit preserves the pinned Ubuntu descriptor-64 profile" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const image_path = "test-ext4-mountless-pinned.raw";
-    const spool_path = "test-ext4-mountless-pinned.spool";
-    const reopen_spool_path = "test-ext4-mountless-pinned-reopen.spool";
-    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, reopen_spool_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const image_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-mountless-pinned.raw");
+    defer allocator.free(image_path);
+    const spool_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-mountless-pinned.spool");
+    defer allocator.free(spool_path);
+    const reopen_spool_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-pinned-reopen.spool",
+    );
+    defer allocator.free(reopen_spool_path);
 
     const length: u64 = 64 * 1024 * 1024;
     var image = try @import("image.zig").Image.createExclusive(
@@ -2207,14 +2292,26 @@ test "mountless commit preserves the pinned Ubuntu descriptor-64 profile" {
 test "mountless round trip preserves security metadata and special nodes" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const image_path = "test-ext4-mountless-fidelity.raw";
-    const spool_path = "test-ext4-mountless-fidelity.spool";
-    const reopen_spool_path = "test-ext4-mountless-fidelity-reopen.spool";
-    const host_tree_path = "test-ext4-mountless-fidelity-host-tree";
-    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, reopen_spool_path) catch {};
-    defer Io.Dir.cwd().deleteTree(io, host_tree_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const image_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-mountless-fidelity.raw");
+    defer allocator.free(image_path);
+    const spool_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-mountless-fidelity.spool");
+    defer allocator.free(spool_path);
+    const reopen_spool_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-fidelity-reopen.spool",
+    );
+    defer allocator.free(reopen_spool_path);
+    const host_tree_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-fidelity-host-tree",
+    );
+    defer allocator.free(host_tree_path);
 
     var image = try @import("image.zig").Image.createExclusive(
         io,
@@ -2267,8 +2364,13 @@ test "mountless round trip preserves security metadata and special nodes" {
         .root_xattrs = &xattrs,
     });
 
-    const probe_spool_path = "test-ext4-mountless-fidelity-probe.spool";
-    defer Io.Dir.cwd().deleteFile(io, probe_spool_path) catch {};
+    const probe_spool_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-fidelity-probe.spool",
+    );
+    defer allocator.free(probe_spool_path);
     var probe_diagnostic = limits_mod.Diagnostic{};
     var probe = try FileSystem.open(allocator, io, image.file, .{
         .length = 64 * 1024 * 1024,
@@ -2400,12 +2502,29 @@ test "mountless round trip preserves security metadata and special nodes" {
 test "atomic commit rejects replacement of the source path after open" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const image_path = "test-ext4-mountless-source-replaced.raw";
-    const replacement_path = "test-ext4-mountless-source-replacement.raw";
-    const spool_path = "test-ext4-mountless-source-replaced.spool";
-    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, replacement_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const image_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-source-replaced.raw",
+    );
+    defer allocator.free(image_path);
+    const replacement_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-source-replacement.raw",
+    );
+    defer allocator.free(replacement_path);
+    const spool_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-source-replaced.spool",
+    );
+    defer allocator.free(spool_path);
 
     var image = try @import("image.zig").Image.createExclusive(io, image_path, .raw, 32 * 1024 * 1024, .{});
     var image_open = true;
@@ -2439,12 +2558,29 @@ test "atomic commit rejects replacement of the source path after open" {
 test "mountless open rejects an atomic final-component symlink" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const image_path = "test-ext4-mountless-atomic-symlink.raw";
-    const symlink_path = "test-ext4-mountless-atomic-symlink";
-    const spool_path = "test-ext4-mountless-atomic-symlink.spool";
-    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, symlink_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const image_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-atomic-symlink.raw",
+    );
+    defer allocator.free(image_path);
+    const symlink_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-atomic-symlink",
+    );
+    defer allocator.free(symlink_path);
+    const spool_path = try temporaryTestPath(
+        allocator,
+        io,
+        &temporary,
+        "test-ext4-mountless-atomic-symlink.spool",
+    );
+    defer allocator.free(spool_path);
 
     var image = try @import("image.zig").Image.createExclusive(
         io,
@@ -2475,10 +2611,12 @@ test "mountless open rejects an atomic final-component symlink" {
 test "read follows a merged-usr symlink, and cannot be walked out of the tree" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const image_path = "test-ext4-resolve-symlink.raw";
-    const spool_path = "test-ext4-resolve-symlink.spool";
-    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const image_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-resolve-symlink.raw");
+    defer allocator.free(image_path);
+    const spool_path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-resolve-symlink.spool");
+    defer allocator.free(spool_path);
 
     var image = try @import("image.zig").Image.createExclusive(
         io,
