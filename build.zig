@@ -212,6 +212,12 @@ pub fn build(b: *std.Build) void {
         "optimize",
         "Prioritize performance, safety, or binary size",
     ) orelse default_optimize;
+    // CI invokes this with test-ci, whose generalized-image checks and
+    // vmizguest step already compile the remaining production artifacts.
+    const ci_production_entrypoint_check = b.step(
+        "check-ci-production-entrypoints",
+        "Compile production entry points not already reached by test-ci",
+    );
     const azurelinux_architecture = b.option(
         AzureLinuxArchitecture,
         "azurelinux-arch",
@@ -434,6 +440,7 @@ pub fn build(b: *std.Build) void {
             .linkage = .static,
         });
         b.installArtifact(azagent_exe);
+        ci_production_entrypoint_check.dependOn(&azagent_exe.step);
     }
 
     const azagent_tests = b.addTest(.{ .root_module = azagent_mod });
@@ -455,6 +462,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    ci_production_entrypoint_check.dependOn(&cli_exe.step);
     const install_cli = b.addInstallArtifact(cli_exe, .{});
     b.getInstallStep().dependOn(&install_cli.step);
 
@@ -486,6 +494,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(image_builder_exe);
+    ci_production_entrypoint_check.dependOn(&image_builder_exe.step);
     const image_builder_tests = b.addTest(.{
         .root_module = image_builder_exe.root_module,
     });
@@ -509,6 +518,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(iso_builder_exe);
+    ci_production_entrypoint_check.dependOn(&iso_builder_exe.step);
     const iso_builder_tests = b.addTest(.{
         .root_module = iso_builder_exe.root_module,
     });
@@ -534,6 +544,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(recustomize_iso_builder_exe);
+    ci_production_entrypoint_check.dependOn(
+        &recustomize_iso_builder_exe.step,
+    );
     const recustomize_iso_builder_tests = b.addTest(.{
         .root_module = recustomize_iso_builder_exe.root_module,
     });
@@ -563,6 +576,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(preserved_image_builder_exe);
+    ci_production_entrypoint_check.dependOn(
+        &preserved_image_builder_exe.step,
+    );
     const preserved_image_builder_tests = b.addTest(.{
         .root_module = preserved_image_builder_exe.root_module,
     });
@@ -596,6 +612,7 @@ pub fn build(b: *std.Build) void {
         .root_module = input_validator_mod,
     });
     b.installArtifact(input_validator_exe);
+    ci_production_entrypoint_check.dependOn(&input_validator_exe.step);
     const input_validator_tests = b.addTest(.{ .root_module = input_validator_mod });
     const run_input_validator_tests = b.addRunArtifact(input_validator_tests);
 
@@ -609,6 +626,7 @@ pub fn build(b: *std.Build) void {
         .root_module = image_status_check_mod,
     });
     b.installArtifact(image_status_check_exe);
+    ci_production_entrypoint_check.dependOn(&image_status_check_exe.step);
     const image_status_check_tests = b.addTest(.{ .root_module = image_status_check_mod });
     const run_image_status_check_tests = b.addRunArtifact(image_status_check_tests);
 
@@ -630,6 +648,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(qmp_exe);
+    ci_production_entrypoint_check.dependOn(&qmp_exe.step);
 
     // Offline QAPI-schema-to-Zig-bindings generator. Not part of the default
     // build graph's dependency chain on qapi/*.json; run manually against a
@@ -644,6 +663,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(qapi_codegen_exe);
+    ci_production_entrypoint_check.dependOn(&qapi_codegen_exe.step);
 
     const run_qapi_codegen = b.addRunArtifact(qapi_codegen_exe);
     run_qapi_codegen.step.dependOn(b.getInstallStep());
@@ -848,6 +868,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(nbd_exe);
+    ci_production_entrypoint_check.dependOn(&nbd_exe.step);
 
     const nbd_mod_tests = b.addTest(.{ .root_module = nbd_mod });
     const run_nbd_mod_tests = b.addRunArtifact(nbd_mod_tests);
@@ -881,6 +902,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(qcow2_exe);
+    ci_production_entrypoint_check.dependOn(&qcow2_exe.step);
 
     const qcow2_mod_tests = b.addTest(.{ .root_module = qcow2_mod });
     const run_qcow2_mod_tests = b.addRunArtifact(qcow2_mod_tests);
@@ -1433,6 +1455,7 @@ pub fn build(b: *std.Build) void {
             .root_module = freebsd_builder_mod,
         });
         b.installArtifact(freebsd_builder_exe);
+        ci_production_entrypoint_check.dependOn(&freebsd_builder_exe.step);
 
         const run_freebsd_builder = b.addRunArtifact(freebsd_builder_exe);
         if (b.args) |args| run_freebsd_builder.addArgs(args);
