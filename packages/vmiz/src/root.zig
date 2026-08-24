@@ -5,7 +5,8 @@
 //! support.
 //!
 //! Milestone 7 status: raw + fixed/dynamic vhd read/write, MBR + GPT
-//! partition table read/write, FAT32 filesystem read/write, native ESP
+//! partition table read/write, native FAT boot-sector identity read/rewrite,
+//! FAT32 filesystem read/write, native ESP
 //! bootloader population (copy EFI binaries + generate grub.cfg/BLS),
 //! Secure Boot MOK asset plumbing, UKI generation, dm-verity hash-tree
 //! generation + kernel cmdline/COSI metadata wiring,
@@ -30,6 +31,7 @@ const std = @import("std");
 pub const vhd = @import("vhd.zig");
 pub const vhdx = @import("vhdx.zig");
 pub const qcow2 = @import("qcow2.zig");
+pub const fat = @import("fat.zig");
 pub const fat32 = @import("fat32.zig");
 pub const iso9660 = @import("iso9660.zig");
 pub const squashfs = @import("squashfs.zig");
