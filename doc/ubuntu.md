@@ -550,6 +550,45 @@ until this protocol is run on the designated production benchmark host. Do
 not record a replacement baseline from a different architecture, cold cache,
 unreviewed lock set, or incomplete signing/boot environment.
 
+The manual **Benchmark Ubuntu 26.04 aarch64 image** workflow makes this
+protocol reproducible on the repository's `ubuntu-24.04-arm` hosted runner.
+It is dispatch-only, restricted to the current `main` commit, and has only
+read access to repository contents. Before measurement it uses the production
+builder once with networking to acquire and verify the pinned Canonical
+publication, resolve all seven exact locks, and populate the content-addressed
+debz cache. It then deletes that staging image and all mutable staging state,
+checks that at least 30 GiB is free, and runs the benchmark inside a new
+network namespace. Thus the required warm-up and three measured builds cannot
+reach the network and consume only the verified source, exact locks, and warm
+cache from the staging build.
+
+The workflow uses the repository's public test-only UKI signing fixture for
+one fixed signing identity across the complete session and a newly generated
+administrator SSH key. Neither private key is included in artifact paths, an
+explicit content scan rejects private-key material before upload, and all key
+copies are removed in the unconditional cleanup step. The uploaded artifact
+contains the summary, phase/resource timings, exact input/cache/lock
+inventories, provenance, validation logs, staging evidence, and an explicit
+8m50s non-regression gate, including partial evidence after a failure.
+
+GitHub's standard hosted ARM image carries many unrelated preinstalled tool
+stacks. The workflow removes only disposable hosted-runner tool directories
+before installing its pinned dependencies, requires at least 36 GiB free
+before the staging build, and rechecks the benchmark's 30 GiB minimum after
+staging data is pruned. A runner image that cannot meet either threshold fails
+before a measured run instead of weakening the storage contract.
+
+There is no repository bare-metal boot harness. The full/core native-QEMU
+acceptance suite intentionally rejects this different flavor, so the workflow
+does not claim boot acceptance. It runs the benchmark's production
+filesystem, package-closure, provenance, signature, QCOW2, and raw-image
+validation. Physical-machine boot acceptance remains a separate optional
+`--acceptance-command` input when such a harness becomes available.
+
+Because `workflow_dispatch` definitions are loaded from the default branch,
+review and merge the workflow before triggering it. Do not run a branch copy
+or treat the networked staging build as a benchmark result.
+
 #### Raw-materialization optimization evidence
 
 The source-allocation-unit raw-copy change was also measured locally before
