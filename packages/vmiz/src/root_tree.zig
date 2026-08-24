@@ -594,26 +594,47 @@ pub const RootTree = struct {
     }
 
     fn removeInternal(self: *RootTree, path: []const u8, recursive: bool) bool {
+        // Every ancestor of a node is materialized as a directory (see
+        // `prepareParents`), so a path missing from `path_index` has no
+        // descendants, and a non-directory node never has children. In both
+        // cases a "recursive" removal can touch at most the exact node, so we
+        // resolve it in O(1) through the index instead of scanning the whole
+        // tree. Production-scale customize issues tens of thousands of
+        // overlays; the old full scan here made that path O(n^2).
+        const existing = self.path_index.get(path);
+        if (!recursive or existing == null or
+            self.nodes.items[existing.?].kind != .directory)
+        {
+            const index = existing orelse return false;
+            return self.removeNodeAt(index);
+        }
+        // Recursively dropping an existing directory subtree is the only case
+        // that can reach descendants, and it is rare on the customize path.
         var removed = false;
         var index: usize = 0;
         while (index < self.nodes.items.len) {
-            if (std.mem.eql(u8, path, self.nodes.items[index].path) or
-                (recursive and pathEqualsOrDescendant(path, self.nodes.items[index].path)))
-            {
-                _ = self.path_index.remove(self.nodes.items[index].path);
-                var node = self.nodes.swapRemove(index);
-                self.total_node_bytes -= node.size();
-                self.freeNode(&node);
-                if (index < self.nodes.items.len) {
-                    self.path_index.putAssumeCapacity(self.nodes.items[index].path, index);
-                }
+            if (pathEqualsOrDescendant(path, self.nodes.items[index].path)) {
+                _ = self.removeNodeAt(index);
                 removed = true;
             } else {
                 index += 1;
             }
         }
-        if (removed) self.sorted = false;
         return removed;
+    }
+
+    /// Removes exactly the node at `index` via swap-remove, keeping
+    /// `path_index`, `total_node_bytes`, and `sorted` consistent.
+    fn removeNodeAt(self: *RootTree, index: usize) bool {
+        _ = self.path_index.remove(self.nodes.items[index].path);
+        var node = self.nodes.swapRemove(index);
+        self.total_node_bytes -= node.size();
+        self.freeNode(&node);
+        if (index < self.nodes.items.len) {
+            self.path_index.putAssumeCapacity(self.nodes.items[index].path, index);
+        }
+        self.sorted = false;
+        return true;
     }
 
     pub fn importExt4View(self: *RootTree, source: *tree_cursor.Cursor) !void {
@@ -1571,21 +1592,74 @@ pub const RootTree = struct {
             }
             parents.deinit();
         }
-        if (self.overlayBreaksHardlinks(owned_path, kind, parents.items)) {
-            return error.HardlinkTargetInUse;
-        }
 
-        var remaining_nodes: usize = 0;
-        var final_bytes = payloadSize(payload);
-        for (self.nodes.items) |node| {
-            if (removedByOverlay(node.path, owned_path, kind, parents.items)) continue;
-            remaining_nodes += 1;
-            final_bytes = std.math.add(u64, final_bytes, node.size()) catch return error.TotalContentLimitExceeded;
+        // Overlaying a node removes at most: the destination node, any
+        // descendants of the destination (only when a non-directory shadows an
+        // existing directory), and any non-directory ancestor that must become
+        // a directory. Only a `.file` node is ever a hardlink target, and
+        // replacing a file with another file at the same path is explicitly
+        // allowed, so the common customize overlays -- a new file, a changed
+        // file, or a re-published symlink -- provably break no hardlink and
+        // drop no descendants. Detect that case and account for it in O(1) via
+        // the path index and the running byte total, falling back to the full
+        // O(n) scan only for the rare directory-shadowing / ancestor-
+        // replacement cases. The old unconditional scans made production-scale
+        // customize (tens of thousands of overlays) O(n^2).
+        const existing_index = self.findIndex(owned_path);
+        var has_replace_parent = false;
+        for (parents.items) |parent| {
+            if (parent.replace_existing) {
+                has_replace_parent = true;
+                break;
+            }
         }
-        const additions = std.math.add(usize, parents.items.len, 1) catch
-            return error.NodeLimitExceeded;
-        const final_node_count = std.math.add(usize, remaining_nodes, additions) catch
-            return error.NodeLimitExceeded;
+        const shadows_directory = kind != .directory and
+            if (existing_index) |i| self.nodes.items[i].kind == .directory else false;
+        const replaces_file_with_other = if (existing_index) |i|
+            self.nodes.items[i].kind == .file and kind != .file
+        else
+            false;
+
+        var final_bytes: u64 = undefined;
+        var final_node_count: usize = undefined;
+        if (has_replace_parent or shadows_directory or replaces_file_with_other) {
+            if (self.overlayBreaksHardlinks(owned_path, kind, parents.items)) {
+                return error.HardlinkTargetInUse;
+            }
+            var remaining_nodes: usize = 0;
+            var scanned_bytes = payloadSize(payload);
+            for (self.nodes.items) |node| {
+                if (removedByOverlay(node.path, owned_path, kind, parents.items)) continue;
+                remaining_nodes += 1;
+                scanned_bytes = std.math.add(u64, scanned_bytes, node.size()) catch
+                    return error.TotalContentLimitExceeded;
+            }
+            final_bytes = scanned_bytes;
+            const additions = std.math.add(usize, parents.items.len, 1) catch
+                return error.NodeLimitExceeded;
+            final_node_count = std.math.add(usize, remaining_nodes, additions) catch
+                return error.NodeLimitExceeded;
+        } else {
+            // Fast path: nothing removed here can be a live hardlink target and
+            // no descendants are dropped, so `overlayBreaksHardlinks` is
+            // necessarily false. Every entry in `parents.items` is a brand-new
+            // directory (none replace an existing node), and the destination is
+            // the only node that might be swapped out.
+            const removed_count: usize = if (existing_index != null) 1 else 0;
+            const removed_bytes: u64 = if (existing_index) |i| self.nodes.items[i].size() else 0;
+            const additions = std.math.add(usize, parents.items.len, 1) catch
+                return error.NodeLimitExceeded;
+            final_node_count = std.math.add(
+                usize,
+                self.nodes.items.len - removed_count,
+                additions,
+            ) catch return error.NodeLimitExceeded;
+            final_bytes = std.math.add(
+                u64,
+                self.total_node_bytes - removed_bytes,
+                payloadSize(payload),
+            ) catch return error.TotalContentLimitExceeded;
+        }
         limits_mod.observe(self.diagnostic, .nodes, final_node_count);
         if (final_node_count > self.limits.max_nodes) {
             return limits_mod.exceeded(
@@ -4067,4 +4141,110 @@ test "indexed append import survives sort overlay and hardlink promotion" {
     defer std.testing.allocator.free(promoted);
     try std.testing.expectEqualStrings("new", promoted);
     try std.testing.expectEqual(@as(u64, 3), tree.total_node_bytes);
+}
+
+fn sumRootTreeNodeBytes(tree: *const RootTree) u64 {
+    var total: u64 = 0;
+    for (tree.nodes.items) |node| total += node.size();
+    return total;
+}
+
+test "putNode customize-scale overlays stay correct across fast and slow paths (#455)" {
+    const io = std.testing.io;
+    const spool_path = "test-root-tree-putnode-scale.spool";
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
+    defer tree.deinit();
+
+    // A production root holds ~150k nodes and customize re-overlays tens of
+    // thousands of files and symlinks. The old putNode scanned every node on
+    // every call, so that transition was O(n^2) and stalled the build. This
+    // test drives the same overlay shapes on a smaller tree and pins the
+    // correctness of the O(1) fast path (and the O(n) fallback) so the fix
+    // cannot silently regress the node/byte accounting or hardlink safety.
+    const dir_count = 32;
+    const files_per_dir = 32; // 1024 leaf files across nested directories.
+    var d: usize = 0;
+    while (d < dir_count) : (d += 1) {
+        var dir_buf: [64]u8 = undefined;
+        const dir = try std.fmt.bufPrint(&dir_buf, "usr/lib/d{d}", .{d});
+        try tree.putDirectory(dir, .{ .mode = 0o755 });
+        var f: usize = 0;
+        while (f < files_per_dir) : (f += 1) {
+            var path_buf: [96]u8 = undefined;
+            const p = try std.fmt.bufPrint(&path_buf, "usr/lib/d{d}/f{d}", .{ d, f });
+            try tree.putFileBytes(p, "base", .{ .mode = 0o644 });
+        }
+    }
+    try tree.putFileBytes("usr/bin/tool", "tool-v1", .{ .mode = 0o755 });
+    try tree.putHardlink("usr/bin/tool-alias", "usr/bin/tool", .{ .mode = 0o755 });
+    try tree.putSymlink("usr/bin/link", "tool", .{ .mode = 0o777 });
+
+    const base_nodes = tree.nodeCount();
+    try std.testing.expectEqual(sumRootTreeNodeBytes(&tree), tree.total_node_bytes);
+
+    // Fast path: overwrite every file in place (file -> file) and re-publish
+    // the symlink. None of these can break a hardlink or drop a descendant, so
+    // the node count is unchanged and the running byte total stays exact.
+    d = 0;
+    while (d < dir_count) : (d += 1) {
+        var f: usize = 0;
+        while (f < files_per_dir) : (f += 1) {
+            var path_buf: [96]u8 = undefined;
+            const p = try std.fmt.bufPrint(&path_buf, "usr/lib/d{d}/f{d}", .{ d, f });
+            try tree.putFileBytes(p, "changed-content", .{ .mode = 0o644 });
+        }
+    }
+    try tree.putSymlink("usr/bin/link", "tool", .{ .mode = 0o777 });
+    try std.testing.expectEqual(base_nodes, tree.nodeCount());
+    try std.testing.expectEqual(sumRootTreeNodeBytes(&tree), tree.total_node_bytes);
+
+    // Fast path: overwriting a hardlink target with another file is allowed
+    // (the overlay exception), so it must not raise HardlinkTargetInUse. The
+    // alias stays a hardlink to the target, and the target now holds the new
+    // content.
+    try tree.putFileBytes("usr/bin/tool", "tool-v2-longer", .{ .mode = 0o755 });
+    try std.testing.expectEqual(Kind.hardlink, tree.findNode("usr/bin/tool-alias").?.kind);
+    const tool = try tree.readFileAlloc(std.testing.allocator, "usr/bin/tool", 64);
+    defer std.testing.allocator.free(tool);
+    try std.testing.expectEqualStrings("tool-v2-longer", tool);
+    try std.testing.expectEqual(base_nodes, tree.nodeCount());
+    try std.testing.expectEqual(sumRootTreeNodeBytes(&tree), tree.total_node_bytes);
+
+    // Fast path: add brand-new leaves (no removal at all). Two new directories
+    // (opt, opt/new) are materialized alongside the 512 files.
+    const before_new = tree.nodeCount();
+    var n: usize = 0;
+    while (n < 512) : (n += 1) {
+        var path_buf: [96]u8 = undefined;
+        const p = try std.fmt.bufPrint(&path_buf, "opt/new/g{d}", .{n});
+        try tree.putFileBytes(p, "fresh", .{ .mode = 0o644 });
+    }
+    try std.testing.expectEqual(before_new + 512 + 2, tree.nodeCount());
+    try std.testing.expectEqual(sumRootTreeNodeBytes(&tree), tree.total_node_bytes);
+
+    // Slow path (replaces_file_with_other): replacing the hardlink target with a
+    // non-file must be detected as breaking the surviving alias.
+    try std.testing.expectError(
+        error.HardlinkTargetInUse,
+        tree.putSymlink("usr/bin/tool", "elsewhere", .{ .mode = 0o777 }),
+    );
+    try std.testing.expectEqual(sumRootTreeNodeBytes(&tree), tree.total_node_bytes);
+
+    // Slow path (shadows_directory): a file overlaid on an existing directory
+    // drops the whole subtree; the accounting must stay exact.
+    const before_shadow = tree.nodeCount();
+    try tree.putFileBytes("usr/lib/d0", "flat", .{ .mode = 0o644 });
+    try std.testing.expectEqual(before_shadow - files_per_dir, tree.nodeCount());
+    try std.testing.expect(tree.findNode("usr/lib/d0/f0") == null);
+    try std.testing.expectEqual(Kind.file, tree.findNode("usr/lib/d0").?.kind);
+    try std.testing.expectEqual(sumRootTreeNodeBytes(&tree), tree.total_node_bytes);
+
+    // Slow path (has_replace_parent): creating a child under a path that is
+    // currently a file forces that ancestor to be replaced by a directory.
+    try tree.putFileBytes("usr/lib/d0/child", "nested", .{ .mode = 0o644 });
+    try std.testing.expectEqual(Kind.directory, tree.findNode("usr/lib/d0").?.kind);
+    try std.testing.expect(tree.findNode("usr/lib/d0/child") != null);
+    try std.testing.expectEqual(sumRootTreeNodeBytes(&tree), tree.total_node_bytes);
 }
