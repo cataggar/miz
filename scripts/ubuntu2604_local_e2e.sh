@@ -110,7 +110,7 @@ if data.get("compression-type") != "zstd":
 print("candidate is a standalone zstd QCOW2 at the exact requested virtual size")
 PY
 
-digest=$(sha256sum "$OUTPUT" | awk '{print $1}')
+digest=$(sha256sum "$OUTPUT" | cut -d' ' -f1)
 [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
 printf '%s\n' "$digest" > "$PROVENANCE_DIR/build-validated-digest"
 
