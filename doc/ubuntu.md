@@ -413,6 +413,45 @@ The external command must be absolute. Local-key and external-command modes
 are mutually exclusive. Private signing material is never copied into the
 guest.
 
+Image phase timing is opt-in. Add `--timing-output <path>` to a complete build
+to atomically write JSON without changing normal stdout. The option is
+disabled by default; timing-file serialization, write, and rename failures
+fail the build rather than being ignored.
+
+The stable `vmiz-ubuntu2604-image-phase-timing` schema has
+`schema: 1`, `clock: "monotonic"`,
+`duration_unit: "nanoseconds"`, an overall `status`, optional
+`failed_phase`/`failed_item`/`error_name`, and an execution-ordered `phases`
+array. Each phase record contains `name`, optional `item`, `elapsed_ns`,
+`outcome` (`success`, `failure`, or `skipped`), and optional `error_name`.
+Phase names are:
+
+- `input_acquisition` (pinned publication inputs and signing configuration)
+- `source_qcow2_setup` (source copy, QCOW2 creation, and requested growth)
+- `debz_transaction` (one resolve/apply transaction per package root, named by
+  `item`)
+- `debz_aggregate` (root export, trusted keyring and pinned snapshot setup,
+  and all nested transactions)
+- `initramfs_ext4_import` (offline-root finalization and mountless ext4 import)
+- `uki_assembly` (boot-input extraction and unsigned UKI generation)
+- `uki_signing` (signer preparation, signing, and signature verification)
+- `qcow2_finalization` (UKI insertion, compression, and structural validation)
+- `final_image_validation` (final guest identity and package checks)
+- `raw_image_materialization` (recorded as skipped without `--raw-output`)
+- `provenance_output`
+- `total_runtime`
+
+For example:
+
+```console
+sudo -E zig build \
+  -Dubuntu2604-arch=aarch64 \
+  -Dubuntu2604-flavor=baremetal \
+  generalized-ubuntu2604 -- \
+  ... \
+  --timing-output artifacts/aarch64-baremetal/image-timing.json
+```
+
 Without overrides, outputs are written in the current directory. Full work is
 cached under `.scratch/ubuntu2604-x86_64` or
 `.scratch/ubuntu2604-aarch64`; core uses the corresponding `-core` suffix. A
