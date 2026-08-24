@@ -66,6 +66,11 @@ pub const HostTreeManifest = struct {
 
 pub const Error = anyerror;
 
+/// Linux's `SYMLOOP_MAX`. A guest root that needs more hops than the kernel
+/// would give it is not a root this reader should try harder than the kernel to
+/// understand.
+const max_symlink_hops = 40;
+
 const CommitProfile = struct {
     descriptor_size: u16,
     feature_compat: u32,
@@ -632,21 +637,134 @@ pub const FileSystem = struct {
         return result.toOwnedSlice();
     }
 
+    /// Resolves `path` the way `open(2)` does: every component is followed
+    /// through symlinks, the last one included. A merged-usr root reached this
+    /// reader through `/etc/os-release`, which is a symlink to
+    /// `../usr/lib/os-release`, and every caller that wants a file wants the
+    /// file rather than the link.
+    ///
+    /// Resolution stays inside the tree by construction. An absolute target
+    /// restarts at the tree root rather than the host's, and `..` at the root
+    /// stays at the root, so no target a guest package ships can name anything
+    /// outside the image.
+    ///
+    /// The returned tree-relative path belongs to the caller.
+    pub fn resolvePath(
+        self: *const FileSystem,
+        allocator: Allocator,
+        path: []const u8,
+    ) Error![]u8 {
+        var resolved = std.array_list.Managed(u8).init(allocator);
+        errdefer resolved.deinit();
+        var pending = std.array_list.Managed(u8).init(allocator);
+        defer pending.deinit();
+        var rebuilt = std.array_list.Managed(u8).init(allocator);
+        defer rebuilt.deinit();
+
+        try pending.appendSlice(try normalizePath(path));
+        var cursor: usize = 0;
+        var hops: usize = 0;
+
+        while (cursor < pending.items.len) {
+            const end = std.mem.indexOfScalarPos(u8, pending.items, cursor, '/') orelse
+                pending.items.len;
+            const component = pending.items[cursor..end];
+            const remainder = @min(end + 1, pending.items.len);
+
+            if (component.len == 0 or std.mem.eql(u8, component, ".")) {
+                cursor = remainder;
+                continue;
+            }
+            if (std.mem.eql(u8, component, "..")) {
+                resolved.shrinkRetainingCapacity(
+                    std.mem.lastIndexOfScalar(u8, resolved.items, '/') orelse 0,
+                );
+                cursor = remainder;
+                continue;
+            }
+
+            const parent_len = resolved.items.len;
+            if (parent_len != 0) try resolved.append('/');
+            try resolved.appendSlice(component);
+
+            const entry = self.tree.findNode(resolved.items) orelse return error.PathNotFound;
+            switch (entry.kind) {
+                .directory => cursor = remainder,
+                .symlink => {
+                    hops += 1;
+                    if (hops > max_symlink_hops) return error.SymlinkLoop;
+                    const target = try self.readSymlinkTarget(allocator, resolved.items, entry);
+                    defer allocator.free(target);
+                    if (target.len == 0) return error.PathNotFound;
+
+                    // The link itself is gone from the path either way: an
+                    // absolute target replaces everything, a relative one is
+                    // read from the directory the link sits in.
+                    if (target[0] == '/') {
+                        resolved.clearRetainingCapacity();
+                    } else {
+                        resolved.shrinkRetainingCapacity(parent_len);
+                    }
+                    rebuilt.clearRetainingCapacity();
+                    try rebuilt.appendSlice(target);
+                    if (remainder < pending.items.len) {
+                        try rebuilt.append('/');
+                        try rebuilt.appendSlice(pending.items[remainder..]);
+                    }
+                    std.mem.swap(std.array_list.Managed(u8), &pending, &rebuilt);
+                    cursor = 0;
+                },
+                .hardlink => {
+                    // A hardlink names a second path to one inode, so it is a
+                    // leaf and there is nothing left to walk after it.
+                    if (remainder < pending.items.len) return error.NotDirectory;
+                    const target = switch (entry.payload) {
+                        .hardlink_target => |target| target,
+                        else => return error.NotRegularFile,
+                    };
+                    resolved.clearRetainingCapacity();
+                    try resolved.appendSlice(target);
+                    cursor = remainder;
+                },
+                else => {
+                    if (remainder < pending.items.len) return error.NotDirectory;
+                    cursor = remainder;
+                },
+            }
+        }
+        return resolved.toOwnedSlice();
+    }
+
+    fn readSymlinkTarget(
+        self: *const FileSystem,
+        allocator: Allocator,
+        relative: []const u8,
+        entry: Entry,
+    ) Error![]u8 {
+        const target_size = switch (entry.payload) {
+            .content => |content| content.size,
+            else => return error.NotSymlink,
+        };
+        const length = std.math.cast(usize, target_size) orelse return error.FileLimitExceeded;
+        const bytes = try allocator.alloc(u8, length);
+        errdefer allocator.free(bytes);
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const count = try self.tree.readNodeContent(relative, bytes[offset..], offset);
+            if (count == 0) return error.UnexpectedSourceLength;
+            offset += count;
+        }
+        return bytes;
+    }
+
     pub fn read(
         self: *const FileSystem,
         allocator: Allocator,
         path: []const u8,
         max_bytes: u64,
     ) Error![]u8 {
-        var relative = try normalizePath(path);
-        if (self.tree.findNode(relative)) |entry| {
-            if (entry.kind == .hardlink) {
-                relative = switch (entry.payload) {
-                    .hardlink_target => |target| target,
-                    else => return error.NotRegularFile,
-                };
-            }
-        }
+        const relative = try self.resolvePath(allocator, path);
+        defer allocator.free(relative);
         return self.tree.readFileAlloc(allocator, relative, max_bytes) catch |err| switch (err) {
             error.MissingNode => error.PathNotFound,
             error.NotRegularFile => error.NotRegularFile,
@@ -662,22 +780,8 @@ pub const FileSystem = struct {
     ) Error![]u8 {
         const entry = try self.stat(path);
         if (entry.kind != .symlink) return error.NotSymlink;
-        const target_size = switch (entry.payload) {
-            .content => |content| content.size,
-            else => return error.NotSymlink,
-        };
-        if (target_size > max_bytes) return error.FileLimitExceeded;
-        const relative = try normalizePath(path);
-        const bytes = try allocator.alloc(u8, std.math.cast(usize, target_size) orelse
-            return error.FileLimitExceeded);
-        errdefer allocator.free(bytes);
-        var offset: usize = 0;
-        while (offset < bytes.len) {
-            const count = try self.tree.readNodeContent(relative, bytes[offset..], offset);
-            if (count == 0) return error.UnexpectedSourceLength;
-            offset += count;
-        }
-        return bytes;
+        if (entry.size() > max_bytes) return error.FileLimitExceeded;
+        return self.readSymlinkTarget(allocator, try normalizePath(path), entry);
     }
 
     pub fn write(
@@ -2366,4 +2470,82 @@ test "mountless open rejects an atomic final-component symlink" {
             .atomic_path = symlink_path,
         }),
     );
+}
+
+test "read follows a merged-usr symlink, and cannot be walked out of the tree" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const image_path = "test-ext4-resolve-symlink.raw";
+    const spool_path = "test-ext4-resolve-symlink.spool";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+
+    var image = try @import("image.zig").Image.createExclusive(
+        io,
+        image_path,
+        .raw,
+        32 * 1024 * 1024,
+        .{},
+    );
+    defer image.close(io);
+    var tree = root_tree.RootTree.initMemory(allocator, io, .{});
+    defer tree.deinit();
+    try tree.putDirectory("usr", .{ .mode = 0o755 });
+    try tree.putDirectory("usr/lib", .{ .mode = 0o755 });
+    try tree.putFileBytes(
+        "usr/lib/os-release",
+        "VERSION_ID=\"26.04\"\n",
+        .{ .mode = 0o644 },
+    );
+    try tree.putDirectory("etc", .{ .mode = 0o755 });
+    // Exactly what Ubuntu 26.04 ships, and what stopped the bare-metal build.
+    try tree.putSymlink("etc/os-release", "../usr/lib/os-release", .{ .mode = 0o777 });
+    // A directory component that is itself a link, the shape #505 hit.
+    try tree.putSymlink("lib", "usr/lib", .{ .mode = 0o777 });
+    try tree.putSymlink("etc/absolute", "/usr/lib/os-release", .{ .mode = 0o777 });
+    // `..` past the root clamps to the root rather than escaping the image.
+    try tree.putSymlink("etc/escape", "../../../../usr/lib/os-release", .{ .mode = 0o777 });
+    try tree.putSymlink("etc/loop", "loop", .{ .mode = 0o777 });
+    try tree.putSymlink("etc/dangling", "nowhere", .{ .mode = 0o777 });
+    _ = try ext4.populate(io, image.file, allocator, try tree.cursor(), .{
+        .length = 32 * 1024 * 1024,
+    });
+
+    var fs = try FileSystem.open(allocator, io, image.file, .{
+        .length = 32 * 1024 * 1024,
+        .spool_path = spool_path,
+        .atomic_path = image_path,
+    });
+    defer fs.deinit();
+
+    for ([_][]const u8{
+        "/etc/os-release",
+        "/etc/absolute",
+        "/etc/escape",
+        "/lib/os-release",
+        "/usr/lib/os-release",
+    }) |path| {
+        const bytes = try fs.read(allocator, path, 4096);
+        defer allocator.free(bytes);
+        try std.testing.expectEqualStrings("VERSION_ID=\"26.04\"\n", bytes);
+    }
+
+    try std.testing.expectError(error.SymlinkLoop, fs.read(allocator, "/etc/loop", 4096));
+    try std.testing.expectError(error.PathNotFound, fs.read(allocator, "/etc/dangling", 4096));
+    try std.testing.expectError(
+        error.NotDirectory,
+        fs.read(allocator, "/usr/lib/os-release/deeper", 4096),
+    );
+    try std.testing.expectError(error.NotRegularFile, fs.read(allocator, "/usr/lib", 4096));
+
+    // The link itself stays reachable: resolution belongs to `read`, not to
+    // every reader of the tree.
+    const target = try fs.readLink(allocator, "/etc/os-release", 4096);
+    defer allocator.free(target);
+    try std.testing.expectEqualStrings("../usr/lib/os-release", target);
+    try std.testing.expectEqual(Kind.symlink, (try fs.stat("/etc/os-release")).kind);
+
+    const resolved = try fs.resolvePath(allocator, "/etc/os-release");
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings("usr/lib/os-release", resolved);
 }
