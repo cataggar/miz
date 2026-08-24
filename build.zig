@@ -187,7 +187,31 @@ fn addUbuntu2604BinderProbe(
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // `std.Build.standardOptimizeOption` with no explicit flag, except the
+    // fallback is ReleaseSafe rather than Debug. What this repository builds
+    // is image tooling -- decompression, hashing, dependency solving, ext4
+    // and QCOW2 writes -- and Debug makes that an order of magnitude slower:
+    // a bare-metal aarch64 Ubuntu image takes about 36 minutes at Debug
+    // against about 6 optimized, on one machine with one warm package cache.
+    // Every release workflow already passes `-Doptimize=ReleaseSafe`, so the
+    // Debug default only ever applied to invocations that had no reason to
+    // want it, including `zig build generalized-ubuntu2604`. Safety checks
+    // stay on: this parses archives it did not write and produces filesystem
+    // images a machine boots from.
+    //
+    // Spelled out rather than passing `preferred_optimize_mode`, which would
+    // withdraw `-Doptimize` in favour of a `-Drelease` bool and break every
+    // caller that names a mode.
+    const default_optimize: std.builtin.OptimizeMode = switch (b.release_mode) {
+        .off, .any, .safe => .ReleaseSafe,
+        .fast => .ReleaseFast,
+        .small => .ReleaseSmall,
+    };
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size",
+    ) orelse default_optimize;
     const azurelinux_architecture = b.option(
         AzureLinuxArchitecture,
         "azurelinux-arch",
