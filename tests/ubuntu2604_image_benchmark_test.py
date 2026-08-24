@@ -462,21 +462,47 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
     def test_correctness_comparison_rejects_any_contract_change(self):
         reference = {"closure": "a", "acceptance": {"status": "success"}}
         benchmark.compare_correctness(reference, dict(reference))
-        with self.assertRaises(benchmark.BenchmarkError):
+        with self.assertRaisesRegex(
+            benchmark.BenchmarkError,
+            r"\$\.closure: reference=\"a\", candidate=\"b\"",
+        ):
             benchmark.compare_correctness(
                 reference,
                 {"closure": "b", "acceptance": {"status": "success"}},
             )
 
+    def test_correctness_diagnostics_report_all_safe_field_paths(self):
+        reference = {
+            "profile": {"source_sha256": "a" * 64},
+            "acceptance": {"command": "/private/reference/signing-key.pem"},
+        }
+        candidate = {
+            "profile": {"source_sha256": "b" * 64},
+            "acceptance": {"command": "/private/candidate/signing-key.pem"},
+        }
+        with self.assertRaises(benchmark.BenchmarkError) as raised:
+            benchmark.compare_correctness(reference, candidate)
+        message = str(raised.exception)
+        self.assertIn("$.acceptance.command", message)
+        self.assertIn("$.profile.source_sha256", message)
+        self.assertIn("a" * 64, message)
+        self.assertIn("b" * 64, message)
+        self.assertIn("<absolute-path sha256=", message)
+        self.assertNotIn("/private/", message)
+
     def test_transaction_correctness_uses_semantic_identity(self):
         package = benchmark.PACKAGE_ROOTS[0]
-        digest = "a" * 64
         lock_digest = "b" * 64
         contracts = []
         file_records = []
-        for run_name in ("run-warmup", "run-measured-01"):
+        transaction_digests = ("a" * 64, "c" * 64)
+        for run_name, transaction_digest in zip(
+            ("run-warmup", "run-measured-01"),
+            transaction_digests,
+            strict=True,
+        ):
             path = self.root / f"{run_name}.json"
-            run_root = self.root / run_name / "work/root-stage-0"
+            run_root = (self.root / run_name / "work/root-stage-0").resolve()
             path.write_text(
                 json.dumps(
                     {
@@ -484,14 +510,15 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
                         "version": 1,
                         "target_architecture": benchmark.UBUNTU_ARCHITECTURE,
                         "lock_sha256": lock_digest,
-                        "digest_sha256": digest,
+                        "digest_sha256": transaction_digest,
                         "outcome": "succeeded",
                         "commands": [
                             {
                                 "argv": [
                                     "dpkg",
                                     f"--root={run_root}",
-                                ]
+                                ],
+                                "command_sha256": transaction_digest,
                             }
                         ],
                         "final_verification": {"status": "exact_match"},
@@ -503,7 +530,7 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
                 path,
                 {
                     "sha256": benchmark.sha256(path),
-                    "digest_sha256": digest,
+                    "digest_sha256": transaction_digest,
                 },
                 lock_digest,
                 package,
@@ -519,16 +546,25 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
         }
         benchmark.compare_correctness(reference, candidate)
         self.assertNotIn("file_sha256", contracts[0])
+        self.assertIn("semantic_digest_sha256", contracts[0])
         self.assertNotEqual(
             file_records[0]["file_sha256"],
             file_records[1]["file_sha256"],
+        )
+        self.assertEqual(
+            file_records[0]["transaction_digest_sha256"],
+            transaction_digests[0],
+        )
+        self.assertEqual(
+            file_records[1]["transaction_digest_sha256"],
+            transaction_digests[1],
         )
         with self.assertRaises(benchmark.BenchmarkError):
             benchmark.validate_transaction(
                 self.root / "run-warmup.json",
                 {
                     "sha256": "0" * 64,
-                    "digest_sha256": digest,
+                    "digest_sha256": transaction_digests[0],
                 },
                 lock_digest,
                 package,
@@ -538,7 +574,7 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
                 self.root / "run-warmup.json",
                 {
                     "sha256": file_records[0]["file_sha256"],
-                    "digest_sha256": digest,
+                    "digest_sha256": transaction_digests[0],
                 },
                 "e" * 64,
                 package,
@@ -546,7 +582,7 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
 
         changed_digest = json.loads(json.dumps(candidate))
         changed_digest["provenance"]["transaction_provenance"][0][
-            "digest_sha256"
+            "semantic_digest_sha256"
         ] = "c" * 64
         with self.assertRaises(benchmark.BenchmarkError):
             benchmark.compare_correctness(reference, changed_digest)
@@ -557,6 +593,87 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
         ] = "d" * 64
         with self.assertRaises(benchmark.BenchmarkError):
             benchmark.compare_correctness(reference, changed_lock)
+
+        changed_command_path = self.root / "changed-command.json"
+        changed_command = json.loads(
+            (self.root / "run-measured-01.json").read_text(encoding="utf-8")
+        )
+        changed_command["commands"][0]["argv"].append("--force-confnew")
+        changed_command_path.write_text(
+            json.dumps(changed_command), encoding="utf-8"
+        )
+        changed_contract, _ = benchmark.validate_transaction(
+            changed_command_path,
+            {
+                "sha256": benchmark.sha256(changed_command_path),
+                "digest_sha256": transaction_digests[1],
+            },
+            lock_digest,
+            package,
+        )
+        with self.assertRaises(benchmark.BenchmarkError):
+            benchmark.compare_correctness(
+                reference,
+                {
+                    "provenance": {
+                        "transaction_provenance": [changed_contract]
+                    }
+                },
+            )
+
+    def test_correctness_rejects_each_semantic_contract_change(self):
+        reference = {
+            "profile": {"source_sha256": "a" * 64},
+            "image": {
+                "format": "qcow2",
+                "compression_type": "zstd",
+                "virtual_size": benchmark.VIRTUAL_SIZE,
+            },
+            "raw_output": {
+                "format": "raw",
+                "virtual_size": benchmark.VIRTUAL_SIZE,
+                "structural_validation": "vmiz-check-and-info",
+            },
+            "provenance": {
+                "closure_sha256": "b" * 64,
+                "transaction_provenance": [
+                    {
+                        "semantic_digest_sha256": "c" * 64,
+                        "lock_sha256": "d" * 64,
+                    }
+                ],
+                "signing": {"certificate_sha256": "e" * 64},
+            },
+        }
+        changes = {
+            "source": lambda value: value["profile"].__setitem__(
+                "source_sha256", "f" * 64
+            ),
+            "closure": lambda value: value["provenance"].__setitem__(
+                "closure_sha256", "f" * 64
+            ),
+            "transaction digest": lambda value: value["provenance"][
+                "transaction_provenance"
+            ][0].__setitem__("semantic_digest_sha256", "f" * 64),
+            "lock": lambda value: value["provenance"][
+                "transaction_provenance"
+            ][0].__setitem__("lock_sha256", "f" * 64),
+            "signing": lambda value: value["provenance"]["signing"].__setitem__(
+                "certificate_sha256", "f" * 64
+            ),
+            "image": lambda value: value["image"].__setitem__(
+                "compression_type", "none"
+            ),
+            "raw structure": lambda value: value["raw_output"].__setitem__(
+                "structural_validation", "size-only"
+            ),
+        }
+        for label, change in changes.items():
+            with self.subTest(label=label):
+                candidate = json.loads(json.dumps(reference))
+                change(candidate)
+                with self.assertRaises(benchmark.BenchmarkError):
+                    benchmark.compare_correctness(reference, candidate)
 
     def test_summary_generation_uses_three_measured_medians(self):
         values = {phase: 10 for phase in benchmark.PHASE_ORDER}
