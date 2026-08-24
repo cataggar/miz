@@ -423,6 +423,7 @@ pub const PopulateError = std.mem.Allocator.Error || Io.File.ReadPositionalError
     MissingHardlinkTarget,
     UnsupportedHardlinkTarget,
     TooManyHardlinks,
+    TooManyDirectoryLinks,
     InvalidDeviceEntry,
     TimestampOutOfRange,
     NotEnoughSpace,
@@ -6645,7 +6646,23 @@ fn buildPlan(
             return error.TooManyHardlinks;
     }
 
+    // `buildDirectoryPayloads` attaches an owned `dir_bytes` to every directory
+    // node and the loop further below attaches an `xattr_block_bytes` to nodes
+    // carrying xattrs. The array-only `errdefer` above frees the `nodes` slice
+    // but not these per-node buffers, so without this any error return from here
+    // on -- including a partial failure inside `buildDirectoryPayloads` itself --
+    // would strand them (at production root scale that is tens of thousands of
+    // leaked allocations). On success `WriterPlan.deinit` releases them instead.
+    // `nodes[0].xattrs` aliases `root_xattrs`, which has its own errdefer; the
+    // remaining path/name slices stay borrowed from `entries`.
+    errdefer for (nodes, 0..) |node, node_index| {
+        if (node.dir_bytes) |bytes| allocator.free(bytes);
+        if (node.xattr_block_bytes) |bytes| allocator.free(bytes);
+        if (node_index != 0) freeOwnedXattrSlice(allocator, node.xattrs);
+    };
+
     try buildDirectoryPayloads(allocator, nodes, options.block_size);
+    try assignDirectoryLinkCounts(nodes);
 
     var data_blocks_needed: u32 = 0;
     var feature_ro_compat: u32 = writer_feature_ro_compat_base |
@@ -6658,7 +6675,6 @@ fn buildPlan(
                 node.size_on_disk = node.dir_bytes.?.len;
                 node.data_block_count = @intCast(node.size_on_disk / options.block_size);
                 data_blocks_needed += node.data_block_count;
-                node.link_count = countDirectoryLinks(nodes, node.inode);
             },
             .file => {
                 node.size_on_disk = node.declared_size;
@@ -6726,8 +6742,15 @@ fn buildPlan(
     data_blocks_needed = std.math.add(u32, data_blocks_needed, journal_blocks) catch
         return error.NotEnoughSpace;
     if (profile.has_orphan_file) {
-        const orphan_inode = options.preserve_orphan_file_inode orelse next_inode;
-        if (orphan_inode < next_inode) return error.UnsupportedFeatures;
+        // The orphan file is an empty system file -- imports reject any source
+        // that still lists orphan inodes -- referenced only by the superblock's
+        // `s_orphan_file_inum`, which is rewritten from this node's inode. A real
+        // mkfs.ext4 image parks it at a low, fixed inode, but this writer hands
+        // the low inodes to tree nodes, so a preserved low number would collide
+        // with the tree. When it falls inside the tree's range, relocate the
+        // orphan file to the first inode past the tree instead of failing; a
+        // preserved number already at or above the tree is kept as-is.
+        const orphan_inode = @max(options.preserve_orphan_file_inode orelse next_inode, next_inode);
         const orphan = try buildOrphanFileNode(
             allocator,
             orphan_inode,
@@ -8215,15 +8238,25 @@ fn findNodeIndexByPath(nodes: []const Node, path: []const u8) ?usize {
     return null;
 }
 
-fn countDirectoryLinks(nodes: []const Node, dir_inode: u32) u16 {
-    var count: u16 = 2;
-    for (nodes) |node| {
-        if (node.kind == .directory and node.inode != dir_inode) {
-            const parent_inode = nodes[node.parent_index].inode;
-            if (parent_inode == dir_inode) count += 1;
-        }
+fn assignDirectoryLinkCounts(nodes: []Node) error{TooManyDirectoryLinks}!void {
+    // A directory's link count is two -- its own `.` entry and the entry that
+    // names it in its parent -- plus one for every immediate subdirectory,
+    // whose `..` entry links back to it. Counting each directory on its own
+    // rescans every node, making the whole pass quadratic; at production root
+    // scale (tens of thousands of directories) that stalls the writer for many
+    // minutes. Accumulating each subdirectory into its parent stays linear.
+    for (nodes) |*node| {
+        if (node.kind == .directory) node.link_count = 2;
     }
-    return count;
+    for (nodes, 0..) |*node, index| {
+        if (node.kind != .directory) continue;
+        const parent_index = node.parent_index;
+        // The root directory is its own parent; skip the self-reference so it
+        // is never counted as one of its own subdirectories.
+        if (parent_index == index) continue;
+        nodes[parent_index].link_count = std.math.add(u16, nodes[parent_index].link_count, 1) catch
+            return error.TooManyDirectoryLinks;
+    }
 }
 
 fn blocksForBytes(bytes: u64, block_size: u32) u32 {
@@ -8584,19 +8617,24 @@ fn freeOwnedXattrSlice(allocator: std.mem.Allocator, xattrs: []OwnedXattr) void 
 
 fn dupXattrs(allocator: std.mem.Allocator, xattrs: []const Xattr) PopulateError![]OwnedXattr {
     const owned = try allocator.alloc(OwnedXattr, xattrs.len);
+    // `owned` starts uninitialized, so the cleanup must only touch the prefix
+    // that has actually been populated -- freeing the undefined tail segfaults.
+    var initialized: usize = 0;
     errdefer {
-        var index: usize = 0;
-        while (index < xattrs.len) : (index += 1) {
-            allocator.free(owned[index].name);
-            allocator.free(owned[index].value);
+        for (owned[0..initialized]) |xattr| {
+            allocator.free(xattr.name);
+            allocator.free(xattr.value);
         }
         allocator.free(owned);
     }
     for (xattrs, 0..) |xattr, index| {
-        owned[index] = .{
-            .name = try allocator.dupe(u8, xattr.name),
-            .value = try allocator.dupe(u8, xattr.value),
-        };
+        const name = try allocator.dupe(u8, xattr.name);
+        // Frees the just-duped name if duping the value below fails, so a
+        // partially built entry never leaks.
+        errdefer allocator.free(name);
+        const value = try allocator.dupe(u8, xattr.value);
+        owned[index] = .{ .name = name, .value = value };
+        initialized = index + 1;
     }
     return owned;
 }
@@ -9397,6 +9435,61 @@ test "reader exposes inode link counts" {
     try std.testing.expectEqual(@as(u16, 3), parent_inode.link_count);
 }
 
+test "directory link counts stay correct across many subdirectories" {
+    // Regression for the quadratic `countDirectoryLinks` stall: the link-count
+    // pass was rewritten to a single linear accumulation
+    // (`assignDirectoryLinkCounts`). This locks in that a directory with
+    // several immediate subdirectories still reports exactly `2 + subdir_count`,
+    // that deeper nesting accumulates onto the correct parent, that a directory
+    // holding only regular files stays a leaf, and that the root is counted
+    // from its own children instead of itself.
+    const io = std.testing.io;
+    const path = "test-ext4-link-count-fan.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "fan", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "fan/a", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "fan/a/deep", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "fan/b", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "fan/c", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "solo", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "solo/file", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "test" },
+    });
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 8 * 1024 * 1024 });
+
+    var reader = try open(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+
+    // `fan` has three immediate subdirectories (a, b, c): 2 + 3 == 5.
+    const fan_inode = try reader.readInode(io, try reader.lookupPath(io, "fan"));
+    try std.testing.expectEqual(@as(u16, 5), fan_inode.link_count);
+
+    // `fan/a` has a single subdirectory (deep): 2 + 1 == 3.
+    const a_inode = try reader.readInode(io, try reader.lookupPath(io, "fan/a"));
+    try std.testing.expectEqual(@as(u16, 3), a_inode.link_count);
+
+    // Leaf directories keep the baseline count of 2.
+    const deep_inode = try reader.readInode(io, try reader.lookupPath(io, "fan/a/deep"));
+    try std.testing.expectEqual(@as(u16, 2), deep_inode.link_count);
+    const b_inode = try reader.readInode(io, try reader.lookupPath(io, "fan/b"));
+    try std.testing.expectEqual(@as(u16, 2), b_inode.link_count);
+
+    // A directory that only holds a regular file is still a leaf: files add no
+    // `..` backlink, so the count stays 2.
+    const solo_inode = try reader.readInode(io, try reader.lookupPath(io, "solo"));
+    try std.testing.expectEqual(@as(u16, 2), solo_inode.link_count);
+
+    // The root is counted from its own immediate subdirectories (fan, solo),
+    // never from itself: 2 + 2 == 4.
+    const root_dir_inode = try reader.readInode(io, root_inode);
+    try std.testing.expectEqual(@as(u16, 4), root_dir_inode.link_count);
+}
+
 test "strict writer-compatible scan exposes deterministic owned view" {
     const io = std.testing.io;
     const path = "test-ext4-strict-scan.img";
@@ -9733,6 +9826,98 @@ test "synthetic pinned profiles preserve source orphan inode numbers" {
         try std.testing.expectEqual(@as(?u32, case.inode), imported.identity.orphan_file_inode);
         try expectE2fsckClean(case.path);
     }
+}
+
+test "orphan file relocates past the tree when its preserved inode collides" {
+    // Regression for the production customize failure: a real mkfs.ext4 image
+    // parks the orphan file at a low, fixed inode, but this writer hands the low
+    // inodes to tree nodes. Re-serializing a full customized root then preserved
+    // an orphan inode below `next_inode`, which used to abort the whole build
+    // with `error.UnsupportedFeatures` (and strand tens of thousands of
+    // allocations on the way out). The orphan file is an empty system file
+    // referenced only by `s_orphan_file_inum`, so it must be relocated to a
+    // fresh inode past the tree and the superblock pointer rewritten instead.
+    const io = std.testing.io;
+    const path = "test-ext4-orphan-relocate.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // Enough owning inodes that `next_inode` climbs well past the low orphan
+    // inode we preserve, reproducing the collision the fix resolves.
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "a", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "a/f1", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "one!" },
+        .{ .path = "a/f2", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "two!" },
+        .{ .path = "b", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "b/f3", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "3rd!" },
+    });
+    tree.bind();
+
+    // `first_non_reserved_inode` is the first inode the tree hands out, so
+    // preserving it guarantees a collision with a real tree node.
+    const low_orphan_inode: u32 = first_non_reserved_inode;
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    // Must succeed -- this is the exact populate that previously aborted.
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = 64 * 1024 * 1024,
+        .uuid = [_]u8{0x5C} ** 16,
+        .journal = .{ .enabled = true },
+        .preserve_feature_ro_compat = 0x046b,
+        .preserve_feature_compat = 0x103c,
+        .preserve_feature_incompat = 0x22c2,
+        .descriptor_size = 64,
+        .preserve_checksum_seed = 0xA1B2_C3D4,
+        .preserve_orphan_file_inode = low_orphan_inode,
+    });
+
+    var sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &sb, superblock_offset);
+    const relocated = readInt(u32, sb[0x280..0x284]);
+    // Never left at the colliding low inode.
+    try std.testing.expect(relocated > low_orphan_inode);
+
+    // The image still imports cleanly with the orphan file intact.
+    var reader = try openGeneral(io, file, std.testing.allocator, .{});
+    defer reader.deinit();
+    var imported = try scanReadable(&reader, io, std.testing.allocator, .{
+        .available_length = 64 * 1024 * 1024,
+    });
+    defer imported.deinit();
+    try std.testing.expectEqual(@as(?u32, relocated), imported.identity.orphan_file_inode);
+
+    // Bonus fsck validation where e2fsck exists; the assertions above are the
+    // load-bearing checks and always run.
+    expectE2fsckClean(path) catch |err| if (err != error.SkipZigTest) return err;
+}
+
+fn populateForAllocationFailureCheck(allocator: std.mem.Allocator, io: Io, path: []const u8) !void {
+    const attrs = [_]Xattr{.{ .name = "user.k", .value = "v" }};
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{
+        .{ .path = "d1", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "d1/a", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .path = "d1/a/file", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 5, .bytes = "hello", .xattrs = &attrs },
+        .{ .path = "d2", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
+    });
+    tree.bind();
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, allocator, &tree.view, .{ .length = 8 * 1024 * 1024 });
+}
+
+test "populate cleans up ext4 writer allocations on every allocation-failure path" {
+    // Guards the buildPlan error-path cleanup (the per-node `dir_bytes` /
+    // `xattr_block_bytes` errdefer): failing each allocation in turn must leave
+    // no leaked blocks -- exactly the defect that dumped tens of thousands of
+    // leak reports when the customize commit aborted at production scale.
+    const io = std.testing.io;
+    const path = "test-ext4-alloc-failure.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        populateForAllocationFailureCheck,
+        .{ io, path },
+    );
 }
 
 test "populate respects non-zero partition-relative offsets" {
