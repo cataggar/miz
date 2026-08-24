@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const vmiz = @import("vmiz");
+const image_phase_timing = @import("image_phase_timing.zig");
 const uki_signing = @import("uki_signing.zig");
 
 const Allocator = std.mem.Allocator;
@@ -21,6 +22,10 @@ const offline_root = vmiz.offline_root;
 const package_family = vmiz.package_family;
 const guid = vmiz.guid;
 const ImageFormat = vmiz.Format;
+
+test {
+    std.testing.refAllDecls(image_phase_timing);
+}
 
 const release = "20260731";
 const release_base = "https://cloud-images.ubuntu.com/releases/26.04/release-" ++ release;
@@ -499,6 +504,7 @@ const Args = struct {
     proxy: ?[]const u8 = null,
     authorized_key: ?[]const u8 = null,
     raw_output: ?[]const u8 = null,
+    timing_output: ?[]const u8 = null,
     preflight_only: bool = false,
 };
 
@@ -514,6 +520,7 @@ const help =
     \\  --azagent <path>                        static guest provisioning agent (core, baremetal)
     \\  --authorized-key <path>                 administrator public key (baremetal only)
     \\  --raw-output <path>                     additional raw copy, for writing to a disk
+    \\  --timing-output <path>                  write opt-in machine-readable phase timing JSON
     \\  --proxy <url>                           reach the archive through this HTTP proxy
     \\  --uki-signing-certificate <path>        Secure Boot certificate
     \\  --uki-signing-certificate-sha256 <hex>  DER certificate SHA-256
@@ -787,6 +794,10 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
             args.raw_output = argv[i];
+        } else if (std.mem.eql(u8, arg, "--timing-output")) {
+            i += 1;
+            if (i == argv.len) return error.MissingArgument;
+            args.timing_output = argv[i];
         } else if (std.mem.eql(u8, arg, "--preflight-only")) {
             args.preflight_only = true;
         } else if (std.mem.eql(u8, arg, "--help")) {
@@ -849,6 +860,18 @@ fn signingConfig(args: Args) !uki_signing.Config {
         .certificate_path = certificate,
         .expected_certificate_sha256 = try uki_signing.parseFingerprint(certificate_sha256),
         .mode = mode,
+    };
+}
+
+fn readUkiStub(allocator: Allocator, io: Io, path: []const u8) ![]u8 {
+    return Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(vmiz.uki.limits.max_stub_size),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return error.UkiStubMissing,
+        else => return err,
     };
 }
 
@@ -2520,6 +2543,7 @@ fn validateCoreRoot(
 fn customizeRootWithDebz(
     allocator: Allocator,
     io: Io,
+    timing: *image_phase_timing.Recorder,
     profile: *const Profile,
     flavor: Flavor,
     mutable_image: []const u8,
@@ -2530,6 +2554,10 @@ fn customizeRootWithDebz(
     proxy: ?[]const u8,
     authorized_key: ?[]const u8,
 ) !DebzCustomization {
+    var debz_aggregate = timing.begin(.debz_aggregate, null);
+    defer debz_aggregate.end();
+    errdefer |err| debz_aggregate.fail(@errorName(err));
+
     const extraction = try std.fs.path.join(allocator, &.{ work_dir, "official-root" });
     defer allocator.free(extraction);
     try Dir.cwd().deleteTree(io, extraction);
@@ -2625,6 +2653,10 @@ fn customizeRootWithDebz(
     }
 
     for (debz_packages, 0..) |package, index| {
+        var debz_transaction = timing.begin(.debz_transaction, package);
+        defer debz_transaction.end();
+        errdefer |err| debz_transaction.fail(@errorName(err));
+
         const installed_baseline: package_family.InstalledBaselinePolicy =
             if (flavor.freshRoot() and index == 0) .none else .require_locked;
         const apply_operation: package_family.Operation =
@@ -2753,10 +2785,15 @@ fn customizeRootWithDebz(
         allocator.free(current);
         current = absolute_published;
         published_transferred = true;
+        debz_transaction.succeed();
     }
 
     try assertTrustedKeyringUnchanged(io, trusted);
+    debz_aggregate.succeed();
 
+    var initramfs_import = timing.begin(.initramfs_ext4_import, null);
+    defer initramfs_import.end();
+    errdefer |err| initramfs_import.fail(@errorName(err));
     const release_name = try customizeOfflineRoot(
         allocator,
         io,
@@ -2833,6 +2870,7 @@ fn customizeRootWithDebz(
     const root_free_bytes = @as(u64, filesystem_info.free_block_count) * 4096;
     if (flavor.freshRoot() and root_free_bytes < core_minimum_root_free_bytes)
         return error.CoreRootFreeSpaceTooSmall;
+    initramfs_import.succeed();
     return .{
         .root_path = current,
         .evidence = evidence,
@@ -3443,7 +3481,6 @@ fn validateNoStaleNamedUki(
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-    const io = init.io;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     const args = parseArgs(argv[1..]) catch |err| {
         std.debug.print("error: {s}\n{s}", .{ @errorName(err), help });
@@ -3453,7 +3490,6 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("error: --architecture is required\n", .{});
         std.process.exit(1);
     };
-    const profile = profileFor(architecture);
     // The NVIDIA BaseOS kernel is published for arm64 alone, because the
     // machines it exists for are arm64. Saying so here turns a confusing
     // package-resolution failure hours into the build into an immediate one.
@@ -3461,6 +3497,40 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("error: the baremetal flavor is aarch64 only\n", .{});
         std.process.exit(1);
     }
+    var timing = image_phase_timing.Recorder.init(
+        allocator,
+        init.io,
+        args.timing_output,
+    );
+    var total_runtime = timing.begin(.total_runtime, null);
+    buildImage(init, args, architecture, &timing) catch |err| {
+        total_runtime.fail(@errorName(err));
+        timing.write(.failure) catch |timing_err| {
+            const failed_phase = timing.failedPhase() orelse .total_runtime;
+            std.debug.print(
+                "error: image phase {s} failed with {s}; timing output failed with {s}\n",
+                .{ @tagName(failed_phase), @errorName(err), @errorName(timing_err) },
+            );
+            return timing_err;
+        };
+        return err;
+    };
+    total_runtime.succeed();
+    try timing.write(.success);
+}
+
+fn buildImage(
+    init: std.process.Init,
+    args: Args,
+    architecture: Architecture,
+    timing: *image_phase_timing.Recorder,
+) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const profile = profileFor(architecture);
+    var input_acquisition = timing.begin(.input_acquisition, null);
+    defer input_acquisition.end();
+    errdefer |err| input_acquisition.fail(@errorName(err));
     const work_dir = args.work_dir orelse profile.workDirFor(args.flavor);
     const output = args.output orelse profile.outputFor(args.flavor);
     try Dir.cwd().createDirPath(io, work_dir);
@@ -3521,12 +3591,24 @@ pub fn main(init: std.process.Init) !void {
     const source_metadata = try artifact_pipeline.hashFile(io, source_path);
     if (!std.mem.eql(u8, &source_metadata.sha256, &(try artifact_pipeline.parseSha256(profile.source_sha256))))
         return error.ChecksumMismatch;
-    if (args.preflight_only) return;
+    if (args.preflight_only) {
+        input_acquisition.succeed();
+        return;
+    }
 
     const config = try signingConfig(args);
+    const authorized_key: ?[]u8 = if (args.authorized_key) |path|
+        try readAuthorizedKey(allocator, io, path)
+    else
+        null;
+    defer if (authorized_key) |key| allocator.free(key);
+    input_acquisition.succeed();
 
     const mutable = try std.fs.path.join(allocator, &.{ work_dir, "customized.qcow2" });
     defer allocator.free(mutable);
+    var source_setup = timing.begin(.source_qcow2_setup, null);
+    defer source_setup.end();
+    errdefer |err| source_setup.fail(@errorName(err));
     Dir.cwd().deleteFile(io, mutable) catch {};
     var source_image = try vmiz.Image.openPathReadOnlyStandalone(io, source_path);
     defer source_image.close(io);
@@ -3553,14 +3635,11 @@ pub fn main(init: std.process.Init) !void {
             },
         );
     }
-    const authorized_key: ?[]u8 = if (args.authorized_key) |path|
-        try readAuthorizedKey(allocator, io, path)
-    else
-        null;
-    defer if (authorized_key) |key| allocator.free(key);
+    source_setup.succeed();
     var debz_customization = try customizeRootWithDebz(
         allocator,
         io,
+        timing,
         profile,
         args.flavor,
         mutable,
@@ -3573,6 +3652,9 @@ pub fn main(init: std.process.Init) !void {
     );
     defer debz_customization.deinit(allocator);
 
+    var uki_assembly = timing.begin(.uki_assembly, null);
+    defer uki_assembly.end();
+    errdefer |err| uki_assembly.fail(@errorName(err));
     const extract_dir = try std.fs.path.join(allocator, &.{ work_dir, "uki-input" });
     defer allocator.free(extract_dir);
     const release_name = try extractNativeBootInputs(
@@ -3597,10 +3679,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(cmdline);
 
     const stub_path = args.uki_stub orelse profile.uki_stub_host_path;
-    const stub_bytes = Dir.cwd().readFileAlloc(io, stub_path, allocator, .limited(vmiz.uki.limits.max_stub_size)) catch |err| switch (err) {
-        error.FileNotFound => return error.UkiStubMissing,
-        else => return err,
-    };
+    const stub_bytes = try readUkiStub(allocator, io, stub_path);
     defer allocator.free(stub_bytes);
     if (try peMachine(stub_bytes) != profile.pe_machine) return error.WrongStubArchitecture;
     const stub_sha256 = artifact_pipeline.formatSha256(artifact_pipeline.sha256Bytes(stub_bytes));
@@ -3625,7 +3704,11 @@ pub fn main(init: std.process.Init) !void {
     const unsigned_uki = try std.fs.path.join(allocator, &.{ work_dir, "ubuntu2604.unsigned.efi" });
     defer allocator.free(unsigned_uki);
     try Dir.cwd().writeFile(io, .{ .sub_path = unsigned_uki, .data = unsigned_bytes });
+    uki_assembly.succeed();
 
+    var uki_signing_phase = timing.begin(.uki_signing, null);
+    defer uki_signing_phase.end();
+    errdefer |err| uki_signing_phase.fail(@errorName(err));
     const signing_scratch = try std.fs.path.join(allocator, &.{ work_dir, "signing" });
     defer allocator.free(signing_scratch);
     try uki_signing.prepareScratchDirectory(io, signing_scratch);
@@ -3647,11 +3730,19 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(signed_path);
     try Dir.cwd().writeFile(io, .{ .sub_path = signed_path, .data = signed.bytes });
     try uki_signing.verifyBytes(allocator, io, config, signed.bytes);
+    uki_signing_phase.succeed();
 
+    var qcow2_finalization = timing.begin(.qcow2_finalization, null);
+    defer qcow2_finalization.end();
+    errdefer |err| qcow2_finalization.fail(@errorName(err));
     try insertSignedUki(allocator, io, mutable, signed_path, profile);
     try finalizeCompressedQcow2(allocator, io, mutable, output);
     try validateFinalQcow2(io, output, args.size);
     try validateFinalNativeImage(allocator, io, output, signed.bytes, profile, cmdline);
+    qcow2_finalization.succeed();
+    var final_image_validation = timing.begin(.final_image_validation, null);
+    defer final_image_validation.end();
+    errdefer |err| final_image_validation.fail(@errorName(err));
     var final_root = try openNativeRoot(allocator, io, output, work_dir);
     defer final_root.deinit();
     const os_release = try final_root.filesystem.read(allocator, "/etc/os-release", 64 * 1024);
@@ -3669,7 +3760,19 @@ pub fn main(init: std.process.Init) !void {
         debz_customization.evidence[0..debz_customization.evidence_count],
     );
     if (try peMachine(signed.bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
-    if (args.raw_output) |raw_path| try writeRawCopy(allocator, io, output, raw_path);
+    final_image_validation.succeed();
+    if (args.raw_output) |raw_path| {
+        var raw_materialization = timing.begin(.raw_image_materialization, null);
+        defer raw_materialization.end();
+        errdefer |err| raw_materialization.fail(@errorName(err));
+        try writeRawCopy(allocator, io, output, raw_path);
+        raw_materialization.succeed();
+    } else {
+        timing.skip(.raw_image_materialization, null);
+    }
+    var provenance_output = timing.begin(.provenance_output, null);
+    defer provenance_output.end();
+    errdefer |err| provenance_output.fail(@errorName(err));
     try writeSigningProvenance(
         allocator,
         io,
@@ -3707,6 +3810,7 @@ pub fn main(init: std.process.Init) !void {
             debz_customization.evidence[0..debz_customization.evidence_count],
         );
     }
+    provenance_output.succeed();
 }
 
 /// The `/boot` scan that `extractNativeBootInputs` performs, separated so it
@@ -4369,6 +4473,11 @@ test "arguments accept Ubuntu and project architecture spellings" {
         "candidate/internal-provenance",
         (try parseArgs(&.{ "--provenance-dir", "candidate/internal-provenance" })).provenance_dir.?,
     );
+    try std.testing.expectEqualStrings(
+        "candidate/image-timing.json",
+        (try parseArgs(&.{ "--timing-output", "candidate/image-timing.json" })).timing_output.?,
+    );
+    try std.testing.expectError(error.MissingArgument, parseArgs(&.{"--timing-output"}));
     try std.testing.expectError(error.ImageTooSmall, parseArgs(&.{ "--size", "4G" }));
 }
 
