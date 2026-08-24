@@ -236,6 +236,7 @@ const imax_pct: u8 = 25;
 const fmt_dev: u8 = 0;
 const fmt_local: u8 = 1;
 const fmt_extents: u8 = 2;
+const fmt_btree: u8 = 3;
 
 const null_ino32: u32 = 0xffff_ffff;
 const null_fsblock: u32 = 0xffff_ffff;
@@ -1849,6 +1850,7 @@ fn writeLog(ctx: *WriteCtx) WriteError!void {
 
 const testing = std.testing;
 const xfs = @import("xfs.zig");
+const identity_rewrite = @import("identity_rewrite.zig");
 const Io = std.Io;
 
 /// A minimal in-memory `Cursor` a test drives from a flat entry slice.
@@ -2532,6 +2534,537 @@ test "layoutFile enforces the 21-bit single-extent block-count bound" {
     var too_big = node;
     too_big.size = (max_extent_blocks + 1) * block_size;
     try testing.expectError(error.FileTooLarge, layoutFile(&too_big, 0));
+}
+
+const rewrite_new_uuid = [16]u8{
+    0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+};
+const rewrite_meta_uuid = [16]u8{
+    0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10, 0x20,
+    0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0,
+};
+const meta_uuid_incompat_bit: u32 = 1 << 2;
+const finobt_ro_compat_bit: u32 = 1 << 0;
+
+fn testMaskLow(bits: u6) u64 {
+    if (bits >= 64) return std.math.maxInt(u64);
+    return (@as(u64, 1) << bits) - 1;
+}
+
+fn superblockAginoBits(sb: xfs.Superblock) u6 {
+    return @intCast(@as(u32, sb.ag_block_log) + @as(u32, sb.inode_per_block_log));
+}
+
+fn superblockAgBlockCount(sb: xfs.Superblock, agno: u32) u64 {
+    if (agno + 1 == sb.ag_count) {
+        return sb.data_blocks - @as(u64, sb.ag_count - 1) * sb.ag_blocks;
+    }
+    return sb.ag_blocks;
+}
+
+fn fsblockOffsetFromSuperblock(sb: xfs.Superblock, fsblock: u64) !u64 {
+    const ag_block_log: u6 = @intCast(sb.ag_block_log);
+    const agno = fsblock >> ag_block_log;
+    const agbno = fsblock & testMaskLow(ag_block_log);
+    if (agno >= sb.ag_count or agbno >= superblockAgBlockCount(sb, @intCast(agno))) return error.TestUnexpectedResult;
+    return (agno * sb.ag_blocks + agbno) * sb.block_size;
+}
+
+fn inodeOffsetFromSuperblock(sb: xfs.Superblock, ino: u64) !u64 {
+    const agino_bits = superblockAginoBits(sb);
+    const inode_per_block_log: u6 = @intCast(sb.inode_per_block_log);
+    const agino = ino & testMaskLow(agino_bits);
+    const agno = ino >> agino_bits;
+    const agbno = agino >> inode_per_block_log;
+    const offset_in_block = agino & testMaskLow(inode_per_block_log);
+    if (agno >= sb.ag_count or agbno >= superblockAgBlockCount(sb, @intCast(agno))) return error.TestUnexpectedResult;
+    const fsblock_byte = (agno * sb.ag_blocks + agbno) * sb.block_size;
+    return fsblock_byte + offset_in_block * sb.inode_size;
+}
+
+fn readWholeFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const io = std.testing.io;
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    const stat = try file.stat(io);
+    const bytes = try allocator.alloc(u8, @intCast(stat.size));
+    errdefer allocator.free(bytes);
+    _ = try file.readPositionalAll(io, bytes, 0);
+    return bytes;
+}
+
+const ExtentLocation = struct { start_block: u64, block_count: u64 };
+
+fn decodeExtentRecord(rec: []const u8) ExtentLocation {
+    const l0 = std.mem.readInt(u64, rec[0..8], .big);
+    const l1 = std.mem.readInt(u64, rec[8..16], .big);
+    return .{
+        .start_block = ((l0 & 0x1ff) << 43) | (l1 >> 21),
+        .block_count = l1 & ((@as(u64, 1) << 21) - 1),
+    };
+}
+
+fn firstExtentForInode(file: Io.File, sb: xfs.Superblock, ino: u64) !ExtentLocation {
+    var inode: [inode_size]u8 = undefined;
+    _ = try file.readPositionalAll(std.testing.io, &inode, try inodeOffsetFromSuperblock(sb, ino));
+    return decodeExtentRecord(inode[176..192]);
+}
+
+fn expectStoredCrc(block: []const u8, crc_offset: usize) !void {
+    try testing.expectEqual(
+        computeCrc32c(block, crc_offset),
+        std.mem.readInt(u32, block[crc_offset..][0..4], .little),
+    );
+}
+
+fn buildSimpleRewriteImage(allocator: std.mem.Allocator) ![]u8 {
+    var entries = [_]FixtureEntry{
+        .{ .path = "file.txt", .kind = .file, .mode = 0o644, .size = 5, .content = "hello" },
+        .{ .path = "dir", .kind = .directory, .mode = 0o755 },
+        .{ .path = "dir/nested.txt", .kind = .file, .mode = 0o600, .size = 6, .content = "nested" },
+        .{ .path = "link", .kind = .symlink, .size = 8, .content = "file.txt" },
+    };
+    var fc = FixtureCursor{ .entries = &entries };
+    var cur = fc.cursor();
+    const opts = PopulateOptions{
+        .format = .{
+            .length = 160 * 1024 * 1024,
+            .uuid = xfs.test_fs_uuid,
+            .label = "rewrite",
+            .timestamp = .{ .sec = 1_600_000_000, .nsec = 123456789 },
+        },
+        .root = .{ .mode = 0o755, .uid = 0, .gid = 0 },
+    };
+    const buffer = try allocator.alloc(u8, opts.format.length);
+    errdefer allocator.free(buffer);
+    @memset(buffer, 0);
+    try populate(allocator, buffer, &cur, opts);
+    return buffer;
+}
+
+fn buildComplexRewriteImage(allocator: std.mem.Allocator, length: u64) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const big_bin = try a.alloc(u8, 5000);
+    for (big_bin, 0..) |*b, i| b.* = @intCast((i * 7 + 3) & 0xff);
+    const long_target = try a.alloc(u8, 500);
+    for (long_target, 0..) |*b, i| b.* = 'a' + @as(u8, @intCast(i % 26));
+
+    const file_xattrs = [_]tree_cursor.Xattr{
+        .{ .name = "user.color", .value = "blue" },
+        .{ .name = "trusted.seal", .value = "xyz" },
+    };
+
+    var list = std.ArrayListUnmanaged(FixtureEntry).empty;
+    try list.append(a, .{ .path = "file.txt", .kind = .file, .mode = 0o640, .uid = 1000, .gid = 1000, .size = 12, .content = "hello world\n" });
+    try list.append(a, .{ .path = "big.bin", .kind = .file, .mode = 0o644, .size = 5000, .content = big_bin });
+    try list.append(a, .{ .path = "attrs.txt", .kind = .file, .mode = 0o644, .size = 3, .content = "abc", .xattrs = &file_xattrs });
+    try list.append(a, .{ .path = "dir", .kind = .directory, .mode = 0o755 });
+    try list.append(a, .{ .path = "dir/nested.txt", .kind = .file, .mode = 0o644, .size = 6, .content = "nested" });
+    try list.append(a, .{ .path = "longlink", .kind = .symlink, .size = 500, .content = long_target });
+    try list.append(a, .{ .path = "bigdir", .kind = .directory, .mode = 0o755 });
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        const name = try std.fmt.allocPrint(a, "bigdir/entry_{d:0>3}", .{i});
+        try list.append(a, .{ .path = name, .kind = .file, .mode = 0o644, .size = 0 });
+    }
+
+    var fc = FixtureCursor{ .entries = list.items };
+    var cur = fc.cursor();
+    const opts = PopulateOptions{
+        .format = .{
+            .length = length,
+            .uuid = xfs.test_fs_uuid,
+            .label = "rewrite",
+            .timestamp = .{ .sec = 1_600_000_000, .nsec = 123456789 },
+        },
+        .root = .{ .mode = 0o755, .uid = 0, .gid = 0 },
+    };
+    const buffer = try allocator.alloc(u8, length);
+    errdefer allocator.free(buffer);
+    @memset(buffer, 0);
+    try populate(allocator, buffer, &cur, opts);
+    return buffer;
+}
+
+fn rewriteUuidOnly(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    available_length: u64,
+    new_uuid: [16]u8,
+) !xfs.RewriteUuidReport {
+    const io = std.testing.io;
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    return xfs.rewriteFilesystemUuid(io, file, allocator, .{
+        .available_length = available_length,
+        .new_uuid = new_uuid,
+    });
+}
+
+fn convertWriterImageToMetaUuid(path: []const u8, meta_uuid: [16]u8) !void {
+    const io = std.testing.io;
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+
+    var reader = try xfs.Reader.openFile(testing.allocator, io, file);
+    defer reader.close(io);
+    const sb = reader.superblock;
+
+    var agno: u32 = 0;
+    while (agno < sb.ag_count) : (agno += 1) {
+        const ag_offset = @as(u64, agno) * sb.ag_blocks * sb.block_size;
+
+        var superblock: [512]u8 = undefined;
+        _ = try file.readPositionalAll(io, &superblock, ag_offset);
+        beU32(&superblock, 216, std.mem.readInt(u32, superblock[216..220], .big) | meta_uuid_incompat_bit);
+        @memcpy(superblock[248..264], &meta_uuid);
+        writeCrc(&superblock, 224);
+        try file.writePositionalAll(io, &superblock, ag_offset);
+
+        const sector = try testing.allocator.alloc(u8, sb.sector_size);
+        defer testing.allocator.free(sector);
+
+        _ = try file.readPositionalAll(io, sector, ag_offset + sb.sector_size);
+        @memcpy(sector[64..80], &meta_uuid);
+        writeCrc(sector, 216);
+        try file.writePositionalAll(io, sector, ag_offset + sb.sector_size);
+        const bno_root = std.mem.readInt(u32, sector[16..20], .big);
+        const cnt_root = std.mem.readInt(u32, sector[20..24], .big);
+
+        _ = try file.readPositionalAll(io, sector, ag_offset + 2 * sb.sector_size);
+        @memcpy(sector[296..312], &meta_uuid);
+        writeCrc(sector, 312);
+        try file.writePositionalAll(io, sector, ag_offset + 2 * sb.sector_size);
+        const inobt_root = std.mem.readInt(u32, sector[20..24], .big);
+
+        _ = try file.readPositionalAll(io, sector, ag_offset + 3 * sb.sector_size);
+        @memcpy(sector[8..24], &meta_uuid);
+        writeCrc(sector, 32);
+        try file.writePositionalAll(io, sector, ag_offset + 3 * sb.sector_size);
+
+        const roots = [_]u32{ bno_root, cnt_root, inobt_root };
+        for (roots) |root_agbno| {
+            var block: [block_size]u8 = undefined;
+            const fsblock = (@as(u64, agno) << @intCast(sb.ag_block_log)) | root_agbno;
+            _ = try file.readPositionalAll(io, &block, try fsblockOffsetFromSuperblock(sb, fsblock));
+            @memcpy(block[32..48], &meta_uuid);
+            writeCrc(&block, 52);
+            try file.writePositionalAll(io, &block, try fsblockOffsetFromSuperblock(sb, fsblock));
+        }
+
+        var inobt_block: [block_size]u8 = undefined;
+        _ = try file.readPositionalAll(
+            io,
+            &inobt_block,
+            try fsblockOffsetFromSuperblock(sb, (@as(u64, agno) << @intCast(sb.ag_block_log)) | inobt_root),
+        );
+        const numrecs = std.mem.readInt(u16, inobt_block[6..8], .big);
+        var index: usize = 0;
+        while (index < numrecs) : (index += 1) {
+            const rec = inobt_block[56 + index * 16 ..][0..16];
+            const start_agino = std.mem.readInt(u32, rec[0..4], .big);
+            const first_ino = (@as(u64, agno) << superblockAginoBits(sb)) | start_agino;
+            var slot: u64 = 0;
+            while (slot < 64) : (slot += 1) {
+                var inode: [inode_size]u8 = undefined;
+                _ = try file.readPositionalAll(io, &inode, try inodeOffsetFromSuperblock(sb, first_ino + slot));
+                @memcpy(inode[160..176], &meta_uuid);
+                writeCrc(&inode, 100);
+                try file.writePositionalAll(io, &inode, try inodeOffsetFromSuperblock(sb, first_ino + slot));
+            }
+        }
+    }
+}
+
+fn convertBigBinToBtree(path: []const u8) !u64 {
+    const io = std.testing.io;
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+
+    var reader = try xfs.Reader.openFile(testing.allocator, io, file);
+    defer reader.close(io);
+    const sb = reader.superblock;
+    const big_stat = try reader.statPath(io, "big.bin");
+    const big_extent = try firstExtentForInode(file, sb, big_stat.ino);
+
+    var bnobt_root: [block_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &bnobt_root, try fsblockOffsetFromSuperblock(sb, 1));
+    const leaf_fsblock = std.mem.readInt(u32, bnobt_root[56..60], .big);
+
+    var leaf: [block_size]u8 = [_]u8{0} ** block_size;
+    beU32(&leaf, 0, 0x424d_4133);
+    beU16(&leaf, 4, 0);
+    beU16(&leaf, 6, 1);
+    beU64(&leaf, 24, @as(u64, leaf_fsblock) * (block_size / sector_size));
+    @memcpy(leaf[40..56], &sb.uuid);
+    beU64(&leaf, 56, big_stat.ino);
+    encodeExtent(leaf[72..][0..16], 0, big_extent.start_block, big_extent.block_count, false);
+    writeCrc(&leaf, 64);
+    try file.writePositionalAll(io, &leaf, try fsblockOffsetFromSuperblock(sb, leaf_fsblock));
+
+    var inode: [inode_size]u8 = undefined;
+    const inode_offset = try inodeOffsetFromSuperblock(sb, big_stat.ino);
+    _ = try file.readPositionalAll(io, &inode, inode_offset);
+    inode[5] = fmt_btree;
+    @memset(inode[176..inode_size], 0);
+    const root_maxrecs = (literal_area - 4) / (8 + 8);
+    const ptr_offset = 176 + 4 + root_maxrecs * 8;
+    beU16(&inode, 176, 1);
+    beU16(&inode, 178, 1);
+    beU64(&inode, ptr_offset, leaf_fsblock);
+    writeCrc(&inode, 100);
+    try file.writePositionalAll(io, &inode, inode_offset);
+    return leaf_fsblock;
+}
+
+fn runXfsDbUuidQuery(allocator: std.mem.Allocator, path: []const u8) !?std.process.RunResult {
+    const candidates = [_][]const u8{ "xfs_db", "/sbin/xfs_db", "/usr/sbin/xfs_db" };
+    for (candidates) |bin| {
+        const result = std.process.run(allocator, std.testing.io, .{
+            .argv = &.{ bin, "-r", "-c", "sb 0", "-c", "p uuid", "-c", "sb 1", "-c", "p uuid", path },
+            .cwd = .{ .path = "." },
+        }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        return result;
+    }
+    return null;
+}
+
+test "rewriteFilesystemUuid rewrites writer metadata across allocation groups and preserves unrelated bytes" {
+    const allocator = testing.allocator;
+    const length: u64 = 160 * 1024 * 1024 + 123 * 1024;
+    const buffer = try buildComplexRewriteImage(allocator, length);
+    defer allocator.free(buffer);
+
+    const filesystem_length = std.mem.readInt(u64, buffer[8..16], .big) * std.mem.readInt(u32, buffer[4..8], .big);
+    @memset(buffer[@intCast(filesystem_length)..], 0xA5);
+    const original = try allocator.dupe(u8, buffer);
+    defer allocator.free(original);
+
+    const path = "test-xfs-rewrite-preserve.img";
+    try writeFixtureFile(path, buffer);
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    const report = try rewriteUuidOnly(allocator, path, length, rewrite_new_uuid);
+    try testing.expectEqualSlices(u8, &xfs.test_fs_uuid, &report.old_identity.uuid);
+    try testing.expectEqualSlices(u8, &rewrite_new_uuid, &report.new_identity.uuid);
+    try testing.expect(!report.old_identity.uses_meta_uuid);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &report.new_identity.meta_uuid);
+
+    const rewritten = try readWholeFileAlloc(allocator, path);
+    defer allocator.free(rewritten);
+    try testing.expectEqualSlices(u8, original[@intCast(filesystem_length)..], rewritten[@intCast(filesystem_length)..]);
+
+    const io = std.testing.io;
+    var reader = try xfs.Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+    try testing.expectEqualSlices(u8, &rewrite_new_uuid, &reader.superblock.uuid);
+
+    var tree = try xfs.scanReadable(&reader, io, allocator, .{ .available_length = length });
+    defer tree.deinit();
+    try testing.expectEqualSlices(u8, &rewrite_new_uuid, &tree.identity.uuid);
+    const file_txt = findRt(&tree, "file.txt").?;
+    const file_txt_bytes = try readRt(allocator, file_txt);
+    defer allocator.free(file_txt_bytes);
+    try testing.expectEqualStrings("hello world\n", file_txt_bytes);
+    const longlink = findRt(&tree, "longlink").?;
+    const long_target = try readRt(allocator, longlink);
+    defer allocator.free(long_target);
+    try testing.expectEqual(@as(usize, 500), long_target.len);
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    const bigdir_stat = try reader.statPath(io, "bigdir");
+    const longlink_stat = try reader.statPath(io, "longlink");
+    const bigdir_extent = try firstExtentForInode(file, reader.superblock, bigdir_stat.ino);
+    const longlink_extent = try firstExtentForInode(file, reader.superblock, longlink_stat.ino);
+
+    var ag1_sb: [512]u8 = undefined;
+    _ = try file.readPositionalAll(io, &ag1_sb, reader.superblock.ag_blocks * reader.superblock.block_size);
+    try testing.expectEqualSlices(u8, &rewrite_new_uuid, ag1_sb[32..48]);
+    try expectStoredCrc(&ag1_sb, 224);
+
+    var dir_block: [block_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &dir_block, try fsblockOffsetFromSuperblock(reader.superblock, bigdir_extent.start_block));
+    try testing.expectEqualSlices(u8, &rewrite_new_uuid, dir_block[24..40]);
+    try expectStoredCrc(&dir_block, 4);
+
+    var symlink_block: [block_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &symlink_block, try fsblockOffsetFromSuperblock(reader.superblock, longlink_extent.start_block));
+    try testing.expectEqualSlices(u8, &rewrite_new_uuid, symlink_block[16..32]);
+    try expectStoredCrc(&symlink_block, 12);
+}
+
+test "rewriteFilesystemUuid updates bmap btree UUID and CRC" {
+    const allocator = testing.allocator;
+    const path = "test-xfs-rewrite-btree.img";
+    const buffer = try buildComplexRewriteImage(allocator, 160 * 1024 * 1024);
+    defer allocator.free(buffer);
+    try writeFixtureFile(path, buffer);
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    const leaf_fsblock = try convertBigBinToBtree(path);
+    const report = try rewriteUuidOnly(allocator, path, 160 * 1024 * 1024, rewrite_new_uuid);
+    try testing.expectEqualSlices(u8, &rewrite_new_uuid, &report.new_identity.uuid);
+
+    const io = std.testing.io;
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    var reader = try xfs.Reader.openFile(allocator, io, file);
+    defer reader.close(io);
+
+    var tree = try xfs.scanReadable(&reader, io, allocator, .{ .available_length = 160 * 1024 * 1024 });
+    defer tree.deinit();
+    const big = findRt(&tree, "big.bin").?;
+    const big_bytes = try readRt(allocator, big);
+    defer allocator.free(big_bytes);
+    try testing.expectEqual(@as(usize, 5000), big_bytes.len);
+
+    var leaf: [block_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &leaf, try fsblockOffsetFromSuperblock(reader.superblock, leaf_fsblock));
+    try testing.expectEqualSlices(u8, &rewrite_new_uuid, leaf[40..56]);
+    try expectStoredCrc(&leaf, 64);
+}
+
+test "rewriteFilesystemUuid rewrites META_UUID mode" {
+    const allocator = testing.allocator;
+    const length: u64 = 160 * 1024 * 1024;
+    const path = "test-xfs-rewrite-meta-uuid.img";
+    const buffer = try buildSimpleRewriteImage(allocator);
+    defer allocator.free(buffer);
+    try writeFixtureFile(path, buffer);
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    try convertWriterImageToMetaUuid(path, rewrite_meta_uuid);
+
+    const report = try rewriteUuidOnly(allocator, path, length, rewrite_new_uuid);
+    try testing.expect(report.old_identity.uses_meta_uuid);
+    try testing.expectEqualSlices(u8, &rewrite_meta_uuid, &report.old_identity.meta_uuid);
+    try testing.expectEqualSlices(u8, &rewrite_new_uuid, &report.new_identity.meta_uuid);
+
+    const io = std.testing.io;
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    var reader = try xfs.Reader.openFile(allocator, io, file);
+    defer reader.close(io);
+    try testing.expectEqualSlices(u8, &rewrite_new_uuid, &reader.superblock.uuid);
+    try testing.expectEqualSlices(u8, &rewrite_new_uuid, &reader.superblock.meta_uuid);
+
+    var inode: [inode_size]u8 = undefined;
+    const file_stat = try reader.statPath(io, "file.txt");
+    _ = try file.readPositionalAll(io, &inode, try inodeOffsetFromSuperblock(reader.superblock, file_stat.ino));
+    try testing.expectEqualSlices(u8, &rewrite_new_uuid, inode[160..176]);
+    try expectStoredCrc(&inode, 100);
+
+    var log_header: [sector_size]u8 = undefined;
+    const log_offset = try fsblockOffsetFromSuperblock(reader.superblock, reader.superblock.log_start);
+    _ = try file.readPositionalAll(io, &log_header, log_offset);
+    try testing.expectEqualSlices(u8, &rewrite_new_uuid, log_header[304..320]);
+}
+
+test "rewriteFilesystemUuid refuses malformed or unsupported images before mutation" {
+    const allocator = testing.allocator;
+
+    const unsupported_path = "test-xfs-rewrite-unsupported.img";
+    const unsupported = try buildSimpleRewriteImage(allocator);
+    defer allocator.free(unsupported);
+    try writeFixtureFile(unsupported_path, unsupported);
+    defer Io.Dir.cwd().deleteFile(std.testing.io, unsupported_path) catch {};
+    {
+        const io = std.testing.io;
+        const file = try Io.Dir.cwd().openFile(io, unsupported_path, .{ .mode = .read_write });
+        defer file.close(io);
+        var superblock: [512]u8 = undefined;
+        _ = try file.readPositionalAll(io, &superblock, 0);
+        beU32(&superblock, 212, std.mem.readInt(u32, superblock[212..216], .big) | finobt_ro_compat_bit);
+        writeCrc(&superblock, 224);
+        try file.writePositionalAll(io, &superblock, 0);
+        var ag1: [512]u8 = undefined;
+        _ = try file.readPositionalAll(io, &ag1, 80 * 1024 * 1024);
+        beU32(&ag1, 212, std.mem.readInt(u32, ag1[212..216], .big) | finobt_ro_compat_bit);
+        writeCrc(&ag1, 224);
+        try file.writePositionalAll(io, &ag1, 80 * 1024 * 1024);
+    }
+    const unsupported_before = try readWholeFileAlloc(allocator, unsupported_path);
+    defer allocator.free(unsupported_before);
+    try testing.expectError(
+        error.UnsupportedReadonlyMetadataFeature,
+        rewriteUuidOnly(allocator, unsupported_path, 160 * 1024 * 1024, rewrite_new_uuid),
+    );
+    const unsupported_after = try readWholeFileAlloc(allocator, unsupported_path);
+    defer allocator.free(unsupported_after);
+    try testing.expectEqualSlices(u8, unsupported_before, unsupported_after);
+
+    const malformed_path = "test-xfs-rewrite-malformed.img";
+    const malformed = try buildComplexRewriteImage(allocator, 160 * 1024 * 1024);
+    defer allocator.free(malformed);
+    try writeFixtureFile(malformed_path, malformed);
+    defer Io.Dir.cwd().deleteFile(std.testing.io, malformed_path) catch {};
+    {
+        const io = std.testing.io;
+        const file = try Io.Dir.cwd().openFile(io, malformed_path, .{ .mode = .read_write });
+        defer file.close(io);
+        var reader = try xfs.Reader.openFile(allocator, io, file);
+        defer reader.close(io);
+        const dir_stat = try reader.statPath(io, "bigdir");
+        const dir_extent = try firstExtentForInode(file, reader.superblock, dir_stat.ino);
+        var block: [block_size]u8 = undefined;
+        _ = try file.readPositionalAll(io, &block, try fsblockOffsetFromSuperblock(reader.superblock, dir_extent.start_block));
+        block[80] ^= 0xff;
+        try file.writePositionalAll(io, &block, try fsblockOffsetFromSuperblock(reader.superblock, dir_extent.start_block));
+    }
+    const malformed_before = try readWholeFileAlloc(allocator, malformed_path);
+    defer allocator.free(malformed_before);
+    try testing.expectError(
+        error.DirectoryChecksumMismatch,
+        rewriteUuidOnly(allocator, malformed_path, 160 * 1024 * 1024, rewrite_new_uuid),
+    );
+    const malformed_after = try readWholeFileAlloc(allocator, malformed_path);
+    defer allocator.free(malformed_after);
+    try testing.expectEqualSlices(u8, malformed_before, malformed_after);
+}
+
+test "rewriteFilesystemUuid passes xfs_repair and xfs_db when available" {
+    const allocator = testing.allocator;
+    const path = "test-xfs-rewrite-external.img";
+    const buffer = try buildSimpleRewriteImage(allocator);
+    defer allocator.free(buffer);
+    try writeFixtureFile(path, buffer);
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    _ = try rewriteUuidOnly(allocator, path, 160 * 1024 * 1024, rewrite_new_uuid);
+
+    var validated_any = false;
+    const maybe_repair = try xfs.runXfsRepair(allocator, path);
+    if (maybe_repair) |result| {
+        validated_any = true;
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        switch (result.term) {
+            .exited => |code| try testing.expectEqual(@as(u8, 0), code),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    const maybe_result = try runXfsDbUuidQuery(allocator, path);
+    if (maybe_result) |result| {
+        validated_any = true;
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        switch (result.term) {
+            .exited => |code| try testing.expectEqual(@as(u8, 0), code),
+            else => return error.TestUnexpectedResult,
+        }
+        var uuid_text: [identity_rewrite.canonical_uuid_bytes]u8 = undefined;
+        const expected = identity_rewrite.formatFilesystemUuid(&uuid_text, &rewrite_new_uuid);
+        try testing.expect(std.mem.count(u8, result.stdout, expected) >= 2);
+    }
+
+    if (!validated_any) return error.SkipZigTest;
 }
 
 fn findRt(tree: *xfs.Tree, path: []const u8) ?xfs.Entry {

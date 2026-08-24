@@ -99,6 +99,29 @@ writing. When `metadata_csum_seed` stores a UUID-derived seed, the seed and all
 seeded metadata checksums are rewritten to match the new UUID; an explicit
 non-derived seed is preserved.
 
+## Rewrite an XFS filesystem UUID in place
+
+`vmiz.xfs.rewriteFilesystemUuid` validates a supported XFS v5 layout in full,
+rewrites the public UUID plus every UUID-bearing metadata structure that is
+tied to it, re-reads the result, and returns the old/new identity report:
+
+```zig
+const report = try vmiz.xfs.rewriteFilesystemUuid(io, image.file, allocator, .{
+    .offset = root_offset,
+    .available_length = root_partition_length,
+    .new_uuid = [_]u8{
+        0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    },
+});
+```
+The rewrite is native and mount-free: no `xfs_admin`, `xfs_db`, `xfs_repair`,
+or kernel mount is required. Unsupported readonly-metadata features, sparse
+inode mode, unsupported AG btree layouts, malformed metadata CRCs, and log
+layouts outside the supported set are refused before any mutation, and bytes
+outside the touched metadata structures are preserved.
+outside the touched metadata structures are preserved.
+
 ## Inspect UKI signing certificates
 
 Open a supported disk format with `vmiz.Image`, then use
