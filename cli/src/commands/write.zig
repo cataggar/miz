@@ -1199,7 +1199,7 @@ fn scanFatPartition(
     source: *const vmiz.Image,
     partition: *PartitionRewrite,
 ) !void {
-    var filesystem = try vmiz.fat32.open(source, io, .{
+    var filesystem = try vmiz.fat32.open(@constCast(source), io, .{
         .offset = partition.partition_offset,
         .length = partition.partition_length,
     });
@@ -1874,12 +1874,14 @@ fn verifyFreshIdentityDestination(
             .length = state.partitions[esp_index].partition_length,
         });
         const tree = try filesystem.scanTree(allocator, .{});
-        const metadata = try synthesizedFatRootMetadata(allocator, tree.label);
-        defer metadata.deinit(allocator);
+        root_tree.setRootMetadata(.{
+            .mode = tree.metadata.directory_mode,
+            .uid = tree.metadata.uid,
+            .gid = tree.metadata.gid,
+        });
         try root_tree.importExt4ViewBorrowed(
             allocator,
             tree.fileTreeView(),
-            metadata,
         );
         var esp_plan = state.plan;
         esp_plan.tree_is_esp = true;
@@ -3076,7 +3078,7 @@ const FakeOperations = struct {
         self.new_uuids_seen = identity_options.new_uuids;
         self.allow_duplicate_identifiers_seen = identity_options.allow_duplicate_identifiers;
         if (self.real_prepare_identity) {
-            return prepareSourceIdentity(
+            return prepareIdentity(
                 null,
                 allocator,
                 io,
@@ -3451,8 +3453,8 @@ fn createFreshIdentityTestImage(
     const root_last_lba = total_size / vmiz.gpt.sector_size -
         2 - vmiz.gpt.partition_array_sectors;
 
-    const specs = if (options.include_esp)
-        [_]vmiz.gpt.PlacedPartitionSpec{
+    if (options.include_esp) {
+        const specs = [_]vmiz.gpt.PlacedPartitionSpec{
             .{
                 .type_guid = vmiz.guid.esp,
                 .unique_guid = old_esp_partition_guid,
@@ -3465,17 +3467,17 @@ fn createFreshIdentityTestImage(
                 .placement = .{ .first_lba = root_first_lba, .last_lba = root_last_lba },
                 .name_utf16le = vmiz.gpt.asciiName("root"),
             },
-        }
-    else
-        [_]vmiz.gpt.PlacedPartitionSpec{
-            .{
-                .type_guid = vmiz.guid.linux_root_x86_64,
-                .unique_guid = old_root_partition_guid,
-                .placement = .{ .first_lba = root_first_lba, .last_lba = root_last_lba },
-                .name_utf16le = vmiz.gpt.asciiName("root"),
-            },
         };
-    try vmiz.gpt.writeGptPlaced(&image, io, old_disk_guid, &specs);
+        try vmiz.gpt.writeGptPlaced(&image, io, old_disk_guid, &specs);
+    } else {
+        const specs = [_]vmiz.gpt.PlacedPartitionSpec{.{
+            .type_guid = vmiz.guid.linux_root_x86_64,
+            .unique_guid = old_root_partition_guid,
+            .placement = .{ .first_lba = root_first_lba, .last_lba = root_last_lba },
+            .name_utf16le = vmiz.gpt.asciiName("root"),
+        }};
+        try vmiz.gpt.writeGptPlaced(&image, io, old_disk_guid, &specs);
+    }
 
     var root_tree = vmiz.root_tree.RootTree.initMemory(allocator, io, .{});
     defer root_tree.deinit();
@@ -3595,7 +3597,7 @@ fn prepareFreshIdentityForTest(
     defer source.close(io);
     var report = testReport();
     const detected = try detectGpt(null, source, io, allocator);
-    return prepareSourceIdentity(
+    return prepareIdentity(
         null,
         allocator,
         io,
