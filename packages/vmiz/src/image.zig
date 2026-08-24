@@ -1329,9 +1329,13 @@ pub const CopyError = CopyBytesError || Image.FinishDeviceWriteError;
 /// may contain stale data. For sparse destination formats, the chunk size is
 /// aligned to the format's allocation unit so a mostly-zero chunk cannot force
 /// adjacent blocks or clusters to be allocated just because one contains live
-/// data. A device destination is flushed and its partition table is refreshed
-/// before return; callers must inspect `CopyResult.device_write` so a stale
-/// kernel partition view is reported as partial success rather than hidden.
+/// data. Raw file destinations are read in larger buffers but zero-tested at
+/// the source format's allocation unit, then adjacent non-zero units are
+/// coalesced into writes. This preserves raw-file holes without multiplying
+/// source reads or destination writes. A device destination is flushed and its
+/// partition table is refreshed before return; callers must inspect
+/// `CopyResult.device_write` so a stale kernel partition view is reported as
+/// partial success rather than hidden.
 pub fn copyAll(
     io: Io,
     src: Image,
@@ -1372,27 +1376,84 @@ pub fn copyAllBytes(
 ) CopyBytesError!void {
     if (dst.virtual_size < src.virtual_size) return error.DestinationTooSmall;
     const copy_policy = dst.copyPolicy();
-    const chunk_size: usize = if (dst.dynamic) |d|
+    const layout = copyLayout(src, dst.*);
+    const buf = try allocator.alloc(u8, layout.buffer_size);
+    defer allocator.free(buf);
+
+    var offset: u64 = 0;
+    while (offset < src.virtual_size) {
+        const remaining = src.virtual_size - offset;
+        const n: usize = @intCast(@min(remaining, layout.buffer_size));
+        const got = try src.pread(io, buf[0..n], offset);
+        if (got != n) return error.UnexpectedEndOfFile;
+        if (copy_policy == .write_zero_chunks) {
+            try dst.pwrite(io, buf[0..n], offset);
+        } else {
+            try writeNonZeroRuns(io, dst, buf[0..n], offset, layout.zero_chunk_size);
+        }
+        offset += n;
+    }
+}
+
+const CopyLayout = struct {
+    buffer_size: usize,
+    zero_chunk_size: usize,
+};
+
+fn copyLayout(src: Image, dst: Image) CopyLayout {
+    const default_chunk_size = 4 * 1024 * 1024;
+    const buffer_size: usize = if (dst.dynamic) |d|
         d.block_size
     else if (dst.vhdx) |v|
         v.block_size
     else if (dst.qcow2) |q|
         @intCast(q.cluster_size)
     else
-        4 * 1024 * 1024;
-    const buf = try allocator.alloc(u8, chunk_size);
-    defer allocator.free(buf);
+        default_chunk_size;
 
-    var offset: u64 = 0;
-    while (offset < src.virtual_size) {
-        const remaining = src.virtual_size - offset;
-        const n: usize = @intCast(@min(remaining, chunk_size));
-        const got = try src.pread(io, buf[0..n], offset);
-        if (got != n) return error.UnexpectedEndOfFile;
-        if (copy_policy == .write_zero_chunks or !isAllZero(buf[0..n])) {
-            try dst.pwrite(io, buf[0..n], offset);
+    var zero_chunk_size = buffer_size;
+    if (dst.format == .raw and dst.device == null) {
+        const source_allocation_unit: ?u64 = if (src.dynamic) |d|
+            d.block_size
+        else if (src.vhdx) |v|
+            v.block_size
+        else if (src.qcow2) |q|
+            if (q.incompatible_features & qcow2.incompatible_extl2 != 0)
+                q.cluster_size / 32
+            else
+                q.cluster_size
+        else
+            null;
+        if (source_allocation_unit) |unit| {
+            zero_chunk_size = @intCast(@min(unit, buffer_size));
         }
-        offset += n;
+    }
+    return .{ .buffer_size = buffer_size, .zero_chunk_size = zero_chunk_size };
+}
+
+fn writeNonZeroRuns(
+    io: Io,
+    dst: *Image,
+    buffer: []const u8,
+    offset: u64,
+    zero_chunk_size: usize,
+) Image.PwriteError!void {
+    var index: usize = 0;
+    while (index < buffer.len) {
+        const chunk_end = @min(index + zero_chunk_size, buffer.len);
+        if (isAllZero(buffer[index..chunk_end])) {
+            index = chunk_end;
+            continue;
+        }
+
+        const run_start = index;
+        index = chunk_end;
+        while (index < buffer.len) {
+            const next_end = @min(index + zero_chunk_size, buffer.len);
+            if (isAllZero(buffer[index..next_end])) break;
+            index = next_end;
+        }
+        try dst.pwrite(io, buffer[run_start..index], offset + run_start);
     }
 }
 
@@ -1441,10 +1502,26 @@ fn copyAllWithFinalizationAndDeviceWriteOperations(
 /// Public because the streaming output path in `output.zig` needs exactly
 /// the same "is this chunk worth writing" test that `copyAll` uses.
 pub fn isAllZero(buf: []const u8) bool {
-    for (buf) |b| {
-        if (b != 0) return false;
+    const word_bytes = buf.len - buf.len % @sizeOf(usize);
+    for (std.mem.bytesAsSlice(usize, buf[0..word_bytes])) |word| {
+        if (word != 0) return false;
+    }
+    for (buf[word_bytes..]) |byte| {
+        if (byte != 0) return false;
     }
     return true;
+}
+
+test "zero detection covers unaligned words and trailing bytes" {
+    var bytes = [_]u8{0} ** (2 * @sizeOf(usize) + 3);
+    try std.testing.expect(isAllZero(bytes[1..]));
+
+    bytes[1 + @sizeOf(usize)] = 1;
+    try std.testing.expect(!isAllZero(bytes[1..]));
+    bytes[1 + @sizeOf(usize)] = 0;
+
+    bytes[bytes.len - 1] = 1;
+    try std.testing.expect(!isAllZero(bytes[1..]));
 }
 
 test "create raw image, then open and read back zeros" {
@@ -1620,6 +1697,74 @@ test "convert raw to qcow2 allocates only non-zero clusters" {
     try std.testing.expectEqual(cluster_size, extents[1].offset);
     try std.testing.expectEqual(cluster_size, extents[1].length);
     try std.testing.expectEqual(false, extents[2].allocated);
+}
+
+test "convert qcow2 to raw preserves zero clusters and a partial final cluster" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const src_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "source.qcow2" });
+    defer allocator.free(src_path);
+    const small_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "small.raw" });
+    defer allocator.free(small_path);
+    const dst_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "destination.raw" });
+    defer allocator.free(dst_path);
+
+    const cluster_size: usize = 1 << qcow2.default_cluster_bits;
+    const size: u64 = 4 * @as(u64, cluster_size) + 512;
+    var src = try Image.create(io, src_path, .qcow2, size, .{});
+    defer src.close(io);
+
+    try src.pwrite(io, "first-cluster", 17);
+    const zero_cluster = try allocator.alloc(u8, cluster_size);
+    defer allocator.free(zero_cluster);
+    @memset(zero_cluster, 0);
+    try src.pwrite(io, zero_cluster, cluster_size);
+    try src.pwrite(io, "fourth-cluster", 3 * @as(u64, cluster_size) + 29);
+    try src.pwrite(io, "tail", size - 4);
+
+    const source_extents = try src.mapExtents(io, allocator);
+    defer allocator.free(source_extents);
+    try std.testing.expectEqual(@as(usize, 3), source_extents.len);
+    try std.testing.expectEqual(true, source_extents[0].allocated);
+    try std.testing.expectEqual(2 * @as(u64, cluster_size), source_extents[0].length);
+    try std.testing.expectEqual(false, source_extents[1].allocated);
+    try std.testing.expectEqual(@as(u64, cluster_size), source_extents[1].length);
+    try std.testing.expectEqual(true, source_extents[2].allocated);
+    try std.testing.expectEqual(@as(u64, cluster_size) + 512, source_extents[2].length);
+
+    var too_small = try Image.create(io, small_path, .raw, size - 512, .{});
+    try std.testing.expectError(
+        error.DestinationTooSmall,
+        copyAllBytes(io, src, &too_small, allocator),
+    );
+    too_small.close(io);
+
+    var dst = try Image.create(io, dst_path, .raw, size, .{});
+    defer dst.close(io);
+    const layout = copyLayout(src, dst);
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), layout.buffer_size);
+    try std.testing.expectEqual(cluster_size, layout.zero_chunk_size);
+    try copyAllBytes(io, src, &dst, allocator);
+    try std.testing.expectEqual(size, (try dst.file.stat(io)).size);
+
+    const expected = try allocator.alloc(u8, @intCast(size));
+    defer allocator.free(expected);
+    @memset(expected, 0);
+    @memcpy(expected[17..][0.."first-cluster".len], "first-cluster");
+    @memcpy(
+        expected[3 * cluster_size + 29 ..][0.."fourth-cluster".len],
+        "fourth-cluster",
+    );
+    @memcpy(expected[expected.len - 4 ..], "tail");
+
+    const actual = try allocator.alloc(u8, @intCast(size));
+    defer allocator.free(actual);
+    try std.testing.expectEqual(actual.len, try dst.pread(io, actual, 0));
+    try std.testing.expectEqualSlices(u8, expected, actual);
 }
 
 test "create dynamic vhd, write across blocks, reopen and read back" {
