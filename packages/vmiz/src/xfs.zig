@@ -95,6 +95,20 @@ const dir3_data_magic: u32 = 0x5844_4433;
 const symlink_magic: u32 = 0x5853_4c4d;
 /// `XFS_BMAP_CRC_MAGIC`, big-endian bytes "BMA3": long-form bmap btree block.
 const bmap_btree_magic: u32 = 0x424d_4133;
+/// `XFS_AGF_MAGIC`, big-endian bytes "XAGF".
+const agf_magic: u32 = 0x5841_4746;
+/// `XFS_AGI_MAGIC`, big-endian bytes "XAGI".
+const agi_magic: u32 = 0x5841_4749;
+/// `XFS_AGFL_MAGIC`, big-endian bytes "XAFL".
+const agfl_magic: u32 = 0x5841_464c;
+/// `XFS_ABTB_CRC_MAGIC`, big-endian bytes "AB3B": free-space bno btree.
+const bnobt_magic: u32 = 0x4142_3342;
+/// `XFS_ABTC_CRC_MAGIC`, big-endian bytes "AB3C": free-space cnt btree.
+const cntbt_magic: u32 = 0x4142_3343;
+/// `XFS_IBT_CRC_MAGIC`, big-endian bytes "IAB3": inode btree.
+const inobt_magic: u32 = 0x4941_4233;
+/// `XLOG_HEADER_MAGIC_NUM`.
+const log_magic: u32 = 0xfeed_babe;
 
 const superblock_size: usize = 512;
 const dinode_v3_core_size: usize = 176;
@@ -106,6 +120,28 @@ const symlink_header_size: usize = 56;
 const symlink_owner_offset: usize = 32;
 const bmbt_long_header_size: usize = 72;
 const bmbt_rec_size: usize = 16;
+const short_btree_header_size: usize = 56;
+const short_btree_blkno_offset: usize = 16;
+const short_btree_uuid_offset: usize = 32;
+const short_btree_owner_offset: usize = 48;
+const short_btree_crc_offset: usize = 52;
+const dir3_block_blkno_offset: usize = 8;
+const dir3_block_uuid_offset: usize = 24;
+const dir3_block_owner_offset: usize = 40;
+const bmbt_long_blkno_offset: usize = 24;
+const bmbt_long_uuid_offset: usize = 40;
+const agf_uuid_offset: usize = 64;
+const agf_crc_offset: usize = 216;
+const agi_uuid_offset: usize = 296;
+const agi_crc_offset: usize = 312;
+const agfl_uuid_offset: usize = 8;
+const agfl_crc_offset: usize = 32;
+const log_header_uuid_offset: usize = 304;
+const superblock_uuid_offset: usize = 32;
+const superblock_meta_uuid_offset: usize = 248;
+const inode_ino_offset: usize = 152;
+const inode_uuid_offset: usize = 160;
+const basic_block_size: u32 = 512;
 /// `struct xfs_bmdr_block` (the inode-literal-area btree root header):
 /// bb_level(be16,0) + bb_numrecs(be16,2) = 4 bytes.
 const bmdr_header_size: usize = 4;
@@ -1711,6 +1747,855 @@ pub fn scanReadable(reader: *Reader, io: Io, allocator: std.mem.Allocator, optio
     defer scanner.deinit();
     try scanner.scan();
     return scanner.finish();
+}
+
+pub const RewriteUuidIdentity = struct {
+    uuid: [16]u8,
+    meta_uuid: [16]u8,
+    uses_meta_uuid: bool,
+};
+
+pub const RewriteUuidReport = struct {
+    old_identity: RewriteUuidIdentity,
+    new_identity: RewriteUuidIdentity,
+    /// Exact on-disk 12-byte label field, including embedded/trailing NUL
+    /// bytes.
+    label: [12]u8,
+    block_size: u32,
+    inode_size: u16,
+    filesystem_length: u64,
+    ag_count: u32,
+};
+
+pub const RewriteUuidOptions = struct {
+    offset: u64 = 0,
+    /// Bytes the filesystem is allowed to occupy. A real partition or device
+    /// can be larger than the filesystem inside it.
+    available_length: u64,
+    new_uuid: [16]u8,
+};
+
+pub const RewriteUuidError = OpenError || ReadError || InodeError || ExtentError ||
+    DirectoryError || SymlinkError || XattrError || Io.File.WritePositionalError ||
+    std.mem.Allocator.Error || error{
+    InvalidFilesystemLength,
+    FilesystemExceedsPartition,
+    UnsupportedReadonlyMetadataFeature,
+    UnsupportedSparseInodesFeature,
+    UnsupportedFreeSpaceBtreeLayout,
+    UnsupportedInodeBtreeLayout,
+    UnsupportedFreeInodeBtreeLayout,
+    UnsupportedLogFeature,
+    UnsupportedLogLayout,
+    AllocationGroupChecksumMismatch,
+    AllocationGroupMagicMismatch,
+    InvalidAllocationGroupLayout,
+    MetadataChecksumMismatch,
+    MetadataIdentityMismatch,
+    MetadataBlockAddressMismatch,
+    DuplicateInodeChunk,
+    DuplicateMetadataBlock,
+};
+
+const RewritePatch = union(enum) {
+    superblock: u64,
+    agf: struct { offset: u64, length: u16 },
+    agi: struct { offset: u64, length: u16 },
+    agfl: struct { offset: u64, length: u16 },
+    short_btree: struct { offset: u64, length: u32 },
+    inode: struct { offset: u64, length: u16 },
+    dir_block: struct { offset: u64, length: u32 },
+    symlink_block: struct { offset: u64, length: u32 },
+    bmap_btree: struct { offset: u64, length: u32 },
+    log_header: struct { offset: u64, length: u16 },
+};
+
+fn rewritePatchOffset(patch: RewritePatch) u64 {
+    return switch (patch) {
+        .superblock => |offset| offset,
+        inline else => |entry| entry.offset,
+    };
+}
+
+fn rewritePatchLength(patch: RewritePatch) usize {
+    return switch (patch) {
+        .superblock => superblock_size,
+        .agf => |entry| entry.length,
+        .agi => |entry| entry.length,
+        .agfl => |entry| entry.length,
+        .short_btree => |entry| entry.length,
+        .inode => |entry| entry.length,
+        .dir_block => |entry| entry.length,
+        .symlink_block => |entry| entry.length,
+        .bmap_btree => |entry| entry.length,
+        .log_header => |entry| entry.length,
+    };
+}
+
+const RewritePlan = struct {
+    allocator: std.mem.Allocator,
+    patches: std.array_list.Managed(RewritePatch),
+    seen_offsets: std.AutoHashMap(u64, void),
+    old_identity: RewriteUuidIdentity,
+    new_identity: RewriteUuidIdentity,
+    label: [12]u8,
+    block_size: u32,
+    inode_size: u16,
+    filesystem_length: u64,
+    ag_count: u32,
+    metadata_uuid: [16]u8,
+    used_inode_count: u64 = 0,
+    max_patch_bytes: usize = superblock_size,
+
+    fn init(allocator: std.mem.Allocator, sb: Superblock, filesystem_length: u64, new_uuid: [16]u8) RewritePlan {
+        const uses_meta_uuid = sb.features_incompat & incompat_meta_uuid != 0;
+        return .{
+            .allocator = allocator,
+            .patches = .init(allocator),
+            .seen_offsets = .init(allocator),
+            .old_identity = .{
+                .uuid = sb.uuid,
+                .meta_uuid = sb.meta_uuid,
+                .uses_meta_uuid = uses_meta_uuid,
+            },
+            .new_identity = .{
+                .uuid = new_uuid,
+                .meta_uuid = if (uses_meta_uuid) new_uuid else sb.meta_uuid,
+                .uses_meta_uuid = uses_meta_uuid,
+            },
+            .label = sb.label,
+            .block_size = sb.block_size,
+            .inode_size = sb.inode_size,
+            .filesystem_length = filesystem_length,
+            .ag_count = sb.ag_count,
+            .metadata_uuid = if (uses_meta_uuid) sb.meta_uuid else sb.uuid,
+        };
+    }
+
+    fn deinit(self: *RewritePlan) void {
+        self.patches.deinit();
+        self.seen_offsets.deinit();
+        self.* = undefined;
+    }
+
+    fn addPatch(self: *RewritePlan, patch: RewritePatch) !void {
+        const offset = rewritePatchOffset(patch);
+        if (self.seen_offsets.contains(offset)) return error.DuplicateMetadataBlock;
+        try self.seen_offsets.put(offset, {});
+        try self.patches.append(patch);
+        self.max_patch_bytes = @max(self.max_patch_bytes, rewritePatchLength(patch));
+    }
+
+    fn report(self: *const RewritePlan) RewriteUuidReport {
+        return .{
+            .old_identity = self.old_identity,
+            .new_identity = self.new_identity,
+            .label = self.label,
+            .block_size = self.block_size,
+            .inode_size = self.inode_size,
+            .filesystem_length = self.filesystem_length,
+            .ag_count = self.ag_count,
+        };
+    }
+};
+
+fn agBaseByteOffset(sb: Superblock, agno: u32) u64 {
+    return @as(u64, agno) * sb.ag_blocks * sb.block_size;
+}
+
+fn agFsblock(sb: Superblock, agno: u32, agbno: u32) RewriteUuidError!u64 {
+    if (agno >= sb.ag_count or agbno >= sb.agBlockCount(agno)) return error.InvalidAllocationGroupLayout;
+    return (@as(u64, agno) << @intCast(sb.ag_block_log)) | agbno;
+}
+
+fn validateMetadataUuid(bytes: []const u8, expected: *const [16]u8) RewriteUuidError!void {
+    if (!std.mem.eql(u8, bytes, expected)) return error.MetadataIdentityMismatch;
+}
+
+fn validateMetadataDaddr(reader: *Reader, stored: u64, fsblock: u64) RewriteUuidError!void {
+    const byte_offset = try reader.fsBlockOffset(fsblock);
+    if (stored != byte_offset / basic_block_size) return error.MetadataBlockAddressMismatch;
+}
+
+fn validateRewriteGeometry(sb: Superblock, available_length: u64) RewriteUuidError!u64 {
+    const filesystem_length = std.math.mul(u64, sb.data_blocks, sb.block_size) catch
+        return error.InvalidFilesystemLength;
+    if (filesystem_length > available_length) return error.FilesystemExceedsPartition;
+    if (sb.sector_size < 336 or !std.math.isPowerOfTwo(sb.sector_size)) {
+        return error.InvalidAllocationGroupLayout;
+    }
+    if (sb.block_size % sb.sector_size != 0 or sb.inode_size < dinode_v3_core_size or
+        sb.block_size % sb.inode_size != 0 or sb.inodes_per_block == 0 or
+        sb.block_size / sb.inode_size != sb.inodes_per_block or
+        64 % sb.inodes_per_block != 0)
+    {
+        return error.InvalidAllocationGroupLayout;
+    }
+    if (sb.features_ro_compat != 0) return error.UnsupportedReadonlyMetadataFeature;
+    if (sb.features_incompat & incompat_spinodes != 0) return error.UnsupportedSparseInodesFeature;
+    if (sb.features_log_incompat != 0) return error.UnsupportedLogFeature;
+    if ((sb.log_blocks == 0) != (sb.log_start == 0)) return error.UnsupportedLogLayout;
+    if (sb.log_blocks != 0) {
+        const ag_block_log: u6 = @intCast(sb.ag_block_log);
+        const log_agno: u32 = @intCast(sb.log_start >> ag_block_log);
+        const log_agbno = sb.log_start & maskLow(ag_block_log);
+        if (log_agno >= sb.ag_count) return error.UnsupportedLogLayout;
+        const log_end = std.math.add(u64, log_agbno, sb.log_blocks) catch
+            return error.UnsupportedLogLayout;
+        if (log_end > sb.agBlockCount(log_agno)) return error.UnsupportedLogLayout;
+    }
+    return filesystem_length;
+}
+
+fn hasAnyNonZero(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        if (byte != 0) return true;
+    }
+    return false;
+}
+
+fn readValidatedShortBtreeBlock(
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    plan: *RewritePlan,
+    fsblock: u64,
+    expected_magic: u32,
+    expected_owner: u32,
+) RewriteUuidError![]u8 {
+    const block = try allocator.alloc(u8, reader.superblock.block_size);
+    errdefer allocator.free(block);
+    try reader.readFsBlock(io, fsblock, block);
+    if (std.mem.readInt(u32, block[0..4], .big) != expected_magic) return error.AllocationGroupMagicMismatch;
+    if (!verifyCrc32c(block, short_btree_crc_offset)) return error.MetadataChecksumMismatch;
+    try validateMetadataDaddr(reader, std.mem.readInt(u64, block[short_btree_blkno_offset..][0..8], .big), fsblock);
+    try validateMetadataUuid(block[short_btree_uuid_offset..][0..16], &plan.metadata_uuid);
+    if (std.mem.readInt(u32, block[short_btree_owner_offset..][0..4], .big) != expected_owner) {
+        return error.InvalidAllocationGroupLayout;
+    }
+    try plan.addPatch(.{ .short_btree = .{
+        .offset = reader.offset + try reader.fsBlockOffset(fsblock),
+        .length = reader.superblock.block_size,
+    } });
+    return block;
+}
+
+fn planRemoteSymlink(
+    plan: *RewritePlan,
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    inode: ParsedInode,
+) RewriteUuidError!void {
+    const extents = try readExtents(reader, io, allocator, inode.ino, inode.data_format, inode.data_extents, inode.dataForkBytes());
+    defer allocator.free(extents);
+    if (extents.len == 0 or extents.len > max_symlink_maps) return error.UnsupportedSymlinkFormat;
+
+    const block = try allocator.alloc(u8, reader.superblock.block_size);
+    defer allocator.free(block);
+    var written: u64 = 0;
+
+    for (extents) |extent| {
+        if (extent.unwritten or extent.block_count != 1) return error.UnsupportedSymlinkFormat;
+        try reader.readFsBlock(io, extent.start_block, block);
+        if (std.mem.readInt(u32, block[0..4], .big) != symlink_magic) return error.UnsupportedSymlinkFormat;
+        if (!verifyCrc32c(block, 12)) return error.SymlinkChecksumMismatch;
+        try validateMetadataUuid(block[16..32], &plan.metadata_uuid);
+        if (std.mem.readInt(u64, block[symlink_owner_offset..][0..8], .big) != inode.ino) {
+            return error.InvalidSymlinkLayout;
+        }
+        try validateMetadataDaddr(
+            reader,
+            std.mem.readInt(u64, block[40..48], .big),
+            extent.start_block,
+        );
+        const block_offset = std.mem.readInt(u32, block[4..8], .big);
+        const chunk_bytes = std.mem.readInt(u32, block[8..12], .big);
+        if (block_offset != written or @as(u64, block_offset) + chunk_bytes > inode.size) {
+            return error.InvalidSymlinkLayout;
+        }
+        const chunk_len: usize = @intCast(chunk_bytes);
+        if (symlink_header_size + chunk_len > block.len) return error.InvalidSymlinkLayout;
+        written += chunk_bytes;
+        try plan.addPatch(.{ .symlink_block = .{
+            .offset = reader.offset + try reader.fsBlockOffset(extent.start_block),
+            .length = reader.superblock.block_size,
+        } });
+    }
+    if (written != inode.size) return error.InvalidSymlinkLayout;
+}
+
+fn planBlockDirectory(
+    plan: *RewritePlan,
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    inode: ParsedInode,
+) RewriteUuidError!void {
+    const extents = try readExtents(reader, io, allocator, inode.ino, inode.data_format, inode.data_extents, inode.dataForkBytes());
+    defer allocator.free(extents);
+    const dir_block_size = reader.superblock.dirBlockSize();
+    const fsb_per_dirblock = dir_block_size / reader.superblock.block_size;
+    if (extents.len != 1 or extents[0].logical_block != 0 or
+        extents[0].block_count != fsb_per_dirblock or extents[0].unwritten)
+    {
+        return error.UnsupportedDirectoryFormat;
+    }
+
+    const block = try allocator.alloc(u8, dir_block_size);
+    defer allocator.free(block);
+    var done: usize = 0;
+    var index: u64 = 0;
+    while (index < fsb_per_dirblock) : (index += 1) {
+        try reader.readFsBlock(io, extents[0].start_block + index, block[done..][0..reader.superblock.block_size]);
+        done += reader.superblock.block_size;
+    }
+    const magic_value = std.mem.readInt(u32, block[0..4], .big);
+    if (magic_value == dir3_data_magic or magic_value != dir3_block_magic) return error.UnsupportedDirectoryFormat;
+    if (!verifyCrc32c(block, 4)) return error.DirectoryChecksumMismatch;
+    try validateMetadataUuid(block[dir3_block_uuid_offset..][0..16], &plan.metadata_uuid);
+    if (std.mem.readInt(u64, block[dir3_block_owner_offset..][0..8], .big) != inode.ino) {
+        return error.InvalidDirectoryLayout;
+    }
+    try validateMetadataDaddr(
+        reader,
+        std.mem.readInt(u64, block[dir3_block_blkno_offset..][0..8], .big),
+        extents[0].start_block,
+    );
+
+    const children = try readBlockFormatDirectory(allocator, block, inode.ino);
+    defer {
+        for (children) |child| allocator.free(child.name);
+        allocator.free(children);
+    }
+    try plan.addPatch(.{ .dir_block = .{
+        .offset = reader.offset + try reader.fsBlockOffset(extents[0].start_block),
+        .length = dir_block_size,
+    } });
+}
+
+fn walkBtreeNodeForRewrite(
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    plan: *RewritePlan,
+    ino: u64,
+    fsblock: u64,
+    level: u16,
+    extents: *std.array_list.Managed(Extent),
+) RewriteUuidError!void {
+    const block = try allocator.alloc(u8, reader.superblock.block_size);
+    defer allocator.free(block);
+    try reader.readFsBlock(io, fsblock, block);
+
+    if (std.mem.readInt(u32, block[0..4], .big) != bmap_btree_magic) return error.UnsupportedExtentLayout;
+    if (!verifyCrc32c(block, bmbt_long_crc_offset)) return error.BtreeBlockChecksumMismatch;
+    try validateMetadataDaddr(
+        reader,
+        std.mem.readInt(u64, block[bmbt_long_blkno_offset..][0..8], .big),
+        fsblock,
+    );
+    try validateMetadataUuid(block[bmbt_long_uuid_offset..][0..16], &plan.metadata_uuid);
+    if (std.mem.readInt(u64, block[bmbt_long_owner_offset..][0..8], .big) != ino) {
+        return error.InvalidExtent;
+    }
+    const block_level = std.mem.readInt(u16, block[4..6], .big);
+    if (block_level != level) return error.UnsupportedExtentLayout;
+    const numrecs = std.mem.readInt(u16, block[6..8], .big);
+    const body = block[bmbt_long_header_size..];
+
+    try plan.addPatch(.{ .bmap_btree = .{
+        .offset = reader.offset + try reader.fsBlockOffset(fsblock),
+        .length = reader.superblock.block_size,
+    } });
+
+    if (level == 0) {
+        if (@as(usize, numrecs) * bmbt_rec_size > body.len) return error.UnsupportedExtentLayout;
+        var index: usize = 0;
+        while (index < numrecs) : (index += 1) {
+            const rec = body[index * bmbt_rec_size ..][0..bmbt_rec_size];
+            try appendValidatedExtent(reader, extents, decodeBmbtRec(rec));
+        }
+        return;
+    }
+
+    const maxrecs = body.len / (bmbt_key_size + bmbt_ptr_size);
+    if (@as(usize, numrecs) > maxrecs) return error.UnsupportedExtentLayout;
+    const ptr_area = body[maxrecs * bmbt_key_size ..][0 .. maxrecs * bmbt_ptr_size];
+    var index: usize = 0;
+    while (index < numrecs) : (index += 1) {
+        const child = std.mem.readInt(u64, ptr_area[index * bmbt_ptr_size ..][0..8], .big);
+        try walkBtreeNodeForRewrite(reader, io, allocator, plan, ino, child, level - 1, extents);
+    }
+}
+
+fn readExtentsForRewrite(
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    plan: *RewritePlan,
+    ino: u64,
+    data_format: u8,
+    data_extents: u64,
+    data_fork_bytes: []const u8,
+) RewriteUuidError![]Extent {
+    var extents = std.array_list.Managed(Extent).init(allocator);
+    errdefer extents.deinit();
+
+    switch (data_format) {
+        fmt_extents => {
+            const needed = std.math.mul(
+                usize,
+                std.math.cast(usize, data_extents) orelse return error.UnsupportedExtentLayout,
+                bmbt_rec_size,
+            ) catch return error.UnsupportedExtentLayout;
+            if (needed > data_fork_bytes.len) return error.UnsupportedExtentLayout;
+            var index: usize = 0;
+            while (index < data_extents) : (index += 1) {
+                const rec = data_fork_bytes[index * bmbt_rec_size ..][0..bmbt_rec_size];
+                try appendValidatedExtent(reader, &extents, decodeBmbtRec(rec));
+            }
+        },
+        fmt_btree => {
+            if (data_fork_bytes.len < bmdr_header_size) return error.UnsupportedExtentLayout;
+            const level = std.mem.readInt(u16, data_fork_bytes[0..2], .big);
+            const numrecs = std.mem.readInt(u16, data_fork_bytes[2..4], .big);
+            if (level == 0 or level > max_extent_depth) return error.UnsupportedExtentDepth;
+            const body = data_fork_bytes[bmdr_header_size..];
+            const maxrecs = body.len / (bmbt_key_size + bmbt_ptr_size);
+            if (@as(usize, numrecs) > maxrecs) return error.UnsupportedExtentLayout;
+            const ptr_area = body[maxrecs * bmbt_key_size ..][0 .. maxrecs * bmbt_ptr_size];
+            var index: usize = 0;
+            while (index < numrecs) : (index += 1) {
+                const child = std.mem.readInt(u64, ptr_area[index * bmbt_ptr_size ..][0..8], .big);
+                try walkBtreeNodeForRewrite(reader, io, allocator, plan, ino, child, level - 1, &extents);
+            }
+        },
+        else => return error.UnsupportedExtentLayout,
+    }
+
+    const owned = try extents.toOwnedSlice();
+    std.mem.sort(Extent, owned, {}, struct {
+        fn lessThan(_: void, lhs: Extent, rhs: Extent) bool {
+            return lhs.logical_block < rhs.logical_block;
+        }
+    }.lessThan);
+    var index: usize = 1;
+    while (index < owned.len) : (index += 1) {
+        const prev = owned[index - 1];
+        if (owned[index].logical_block < prev.logical_block + prev.block_count) {
+            allocator.free(owned);
+            return error.InvalidExtent;
+        }
+    }
+    return owned;
+}
+
+fn planUsedInodeMetadata(
+    plan: *RewritePlan,
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    inode: ParsedInode,
+) RewriteUuidError!void {
+    switch (inode.kind) {
+        .directory => switch (inode.data_format) {
+            fmt_local => {
+                const children = try readShortformDirectory(allocator, inode.dataForkBytes());
+                defer {
+                    for (children) |child| allocator.free(child.name);
+                    allocator.free(children);
+                }
+            },
+            fmt_extents => try planBlockDirectory(plan, reader, io, allocator, inode),
+            else => return error.UnsupportedDirectoryFormat,
+        },
+        .file => switch (inode.data_format) {
+            fmt_local => if (inode.dataForkBytes().len < inode.size) return error.InvalidInodeLayout,
+            fmt_extents, fmt_btree => {
+                const extents = try readExtentsForRewrite(
+                    reader,
+                    io,
+                    allocator,
+                    plan,
+                    inode.ino,
+                    inode.data_format,
+                    inode.data_extents,
+                    inode.dataForkBytes(),
+                );
+                allocator.free(extents);
+            },
+            else => return error.UnsupportedExtentLayout,
+        },
+        .symlink => switch (inode.data_format) {
+            fmt_local => if (inode.dataForkBytes().len < inode.size) return error.InvalidSymlinkLayout,
+            fmt_extents => try planRemoteSymlink(plan, reader, io, allocator, inode),
+            else => return error.UnsupportedSymlinkFormat,
+        },
+        .block_device, .char_device => _ = try readDeviceNumbers(inode),
+        .fifo, .socket => {},
+        .hardlink => unreachable,
+    }
+
+    const xattrs = try readXattrs(allocator, inode);
+    defer freeXattrs(allocator, xattrs);
+}
+
+fn planInodeChunk(
+    plan: *RewritePlan,
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    agno: u32,
+    start_agino: u32,
+    free_mask: u64,
+) RewriteUuidError!void {
+    if (start_agino % 64 != 0) return error.UnsupportedInodeBtreeLayout;
+    const max_agino = maskLow(reader.superblock.aginoBits());
+    const last_agino = std.math.add(u64, start_agino, 63) catch
+        return error.UnsupportedInodeBtreeLayout;
+    if (last_agino > max_agino) return error.UnsupportedInodeBtreeLayout;
+
+    const first_ino = (@as(u64, agno) << reader.superblock.aginoBits()) | start_agino;
+    const raw = try allocator.alloc(u8, reader.superblock.inode_size);
+    defer allocator.free(raw);
+
+    var slot: u64 = 0;
+    while (slot < 64) : (slot += 1) {
+        const ino = first_ino + slot;
+        const inode_offset = try reader.inodeOffset(ino);
+        try reader.readAt(io, raw, inode_offset);
+        if (raw.len != reader.superblock.inode_size or raw.len < dinode_v3_core_size) {
+            return error.InvalidInodeLayout;
+        }
+        if (std.mem.readInt(u16, raw[0..2], .big) != dinode_magic) return error.BadDinodeMagic;
+        if (raw[4] != 3) return error.UnsupportedInodeVersion;
+        if (!verifyCrc32c(raw, dinode_crc_offset)) return error.InodeChecksumMismatch;
+        if (std.mem.readInt(u64, raw[inode_ino_offset..][0..8], .big) != ino) {
+            return error.InodeIdentityMismatch;
+        }
+        try validateMetadataUuid(raw[inode_uuid_offset..][0..16], &plan.metadata_uuid);
+        try plan.addPatch(.{ .inode = .{
+            .offset = reader.offset + inode_offset,
+            .length = reader.superblock.inode_size,
+        } });
+
+        if ((free_mask & (@as(u64, 1) << @intCast(slot))) != 0) continue;
+
+        var inode = try parseInode(reader.superblock, ino, raw, allocator);
+        defer inode.deinit(allocator);
+        try planUsedInodeMetadata(plan, reader, io, allocator, inode);
+        plan.used_inode_count += 1;
+    }
+}
+
+fn planAllocationGroup(
+    plan: *RewritePlan,
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    agno: u32,
+) RewriteUuidError!void {
+    const sb = reader.superblock;
+    const ag_offset = agBaseByteOffset(sb, agno);
+    const sector = try allocator.alloc(u8, sb.sector_size);
+    defer allocator.free(sector);
+
+    try reader.readAt(io, sector, ag_offset + sb.sector_size);
+    if (std.mem.readInt(u32, sector[0..4], .big) != agf_magic) return error.AllocationGroupMagicMismatch;
+    if (!verifyCrc32c(sector, agf_crc_offset)) return error.AllocationGroupChecksumMismatch;
+    if (std.mem.readInt(u32, sector[4..8], .big) != 1 or
+        std.mem.readInt(u32, sector[8..12], .big) != agno or
+        std.mem.readInt(u32, sector[12..16], .big) != sb.agBlockCount(agno))
+    {
+        return error.InvalidAllocationGroupLayout;
+    }
+    try validateMetadataUuid(sector[agf_uuid_offset..][0..16], &plan.metadata_uuid);
+    const rmap_root = std.mem.readInt(u32, sector[24..28], .big);
+    const bno_level = std.mem.readInt(u32, sector[28..32], .big);
+    const cnt_level = std.mem.readInt(u32, sector[32..36], .big);
+    const rmap_level = std.mem.readInt(u32, sector[36..40], .big);
+    if (rmap_root != 0 or rmap_level != 0 or
+        std.mem.readInt(u32, sector[80..84], .big) != 0 or
+        std.mem.readInt(u32, sector[84..88], .big) != 0 or
+        std.mem.readInt(u32, sector[88..92], .big) != 0 or
+        std.mem.readInt(u32, sector[92..96], .big) != 0)
+    {
+        return error.UnsupportedReadonlyMetadataFeature;
+    }
+    if (bno_level != 1 or cnt_level != 1) return error.UnsupportedFreeSpaceBtreeLayout;
+    try plan.addPatch(.{ .agf = .{
+        .offset = reader.offset + ag_offset + sb.sector_size,
+        .length = sb.sector_size,
+    } });
+
+    const bno_root = std.mem.readInt(u32, sector[16..20], .big);
+    const cnt_root = std.mem.readInt(u32, sector[20..24], .big);
+    const bnobt_block = try readValidatedShortBtreeBlock(reader, io, allocator, plan, try agFsblock(sb, agno, bno_root), bnobt_magic, agno);
+    defer allocator.free(bnobt_block);
+    if (std.mem.readInt(u16, bnobt_block[4..6], .big) != 0) return error.UnsupportedFreeSpaceBtreeLayout;
+    const cntbt_block = try readValidatedShortBtreeBlock(reader, io, allocator, plan, try agFsblock(sb, agno, cnt_root), cntbt_magic, agno);
+    defer allocator.free(cntbt_block);
+    if (std.mem.readInt(u16, cntbt_block[4..6], .big) != 0) return error.UnsupportedFreeSpaceBtreeLayout;
+
+    try reader.readAt(io, sector, ag_offset + 2 * sb.sector_size);
+    if (std.mem.readInt(u32, sector[0..4], .big) != agi_magic) return error.AllocationGroupMagicMismatch;
+    if (!verifyCrc32c(sector, agi_crc_offset)) return error.AllocationGroupChecksumMismatch;
+    if (std.mem.readInt(u32, sector[4..8], .big) != 1 or
+        std.mem.readInt(u32, sector[8..12], .big) != agno or
+        std.mem.readInt(u32, sector[12..16], .big) != sb.agBlockCount(agno))
+    {
+        return error.InvalidAllocationGroupLayout;
+    }
+    try validateMetadataUuid(sector[agi_uuid_offset..][0..16], &plan.metadata_uuid);
+    if (std.mem.readInt(u32, sector[332..336], .big) != 0 or
+        std.mem.readInt(u32, sector[328..332], .big) != 0)
+    {
+        return error.UnsupportedFreeInodeBtreeLayout;
+    }
+    const inode_level = std.mem.readInt(u32, sector[24..28], .big);
+    if (inode_level != 1) return error.UnsupportedInodeBtreeLayout;
+    try plan.addPatch(.{ .agi = .{
+        .offset = reader.offset + ag_offset + 2 * sb.sector_size,
+        .length = sb.sector_size,
+    } });
+
+    const inobt_root = std.mem.readInt(u32, sector[20..24], .big);
+    const inode_count = std.mem.readInt(u32, sector[16..20], .big);
+    const free_count = std.mem.readInt(u32, sector[28..32], .big);
+    const inobt_block = try readValidatedShortBtreeBlock(reader, io, allocator, plan, try agFsblock(sb, agno, inobt_root), inobt_magic, agno);
+    defer allocator.free(inobt_block);
+    if (std.mem.readInt(u16, inobt_block[4..6], .big) != 0) return error.UnsupportedInodeBtreeLayout;
+
+    const numrecs = std.mem.readInt(u16, inobt_block[6..8], .big);
+    if (short_btree_header_size + @as(usize, numrecs) * 16 > inobt_block.len) {
+        return error.UnsupportedInodeBtreeLayout;
+    }
+
+    var count_sum: u32 = 0;
+    var free_sum: u32 = 0;
+    var previous_end: ?u64 = null;
+    var index: usize = 0;
+    while (index < numrecs) : (index += 1) {
+        const rec = inobt_block[short_btree_header_size + index * 16 ..][0..16];
+        const start_agino = std.mem.readInt(u32, rec[0..4], .big);
+        const rec_freecount = std.mem.readInt(u32, rec[4..8], .big);
+        const free_mask = std.mem.readInt(u64, rec[8..16], .big);
+        if (@popCount(free_mask) != rec_freecount) return error.UnsupportedInodeBtreeLayout;
+        if (previous_end) |end| {
+            if (start_agino < end) return error.DuplicateInodeChunk;
+        }
+        previous_end = std.math.add(u64, start_agino, 64) catch
+            return error.UnsupportedInodeBtreeLayout;
+        count_sum = std.math.add(u32, count_sum, 64) catch
+            return error.InvalidAllocationGroupLayout;
+        free_sum = std.math.add(u32, free_sum, rec_freecount) catch
+            return error.InvalidAllocationGroupLayout;
+        try planInodeChunk(plan, reader, io, allocator, agno, start_agino, free_mask);
+    }
+    if (count_sum != inode_count or free_sum != free_count) return error.InvalidAllocationGroupLayout;
+
+    try reader.readAt(io, sector, ag_offset + 3 * sb.sector_size);
+    if (std.mem.readInt(u32, sector[0..4], .big) != agfl_magic) return error.AllocationGroupMagicMismatch;
+    if (!verifyCrc32c(sector, agfl_crc_offset)) return error.AllocationGroupChecksumMismatch;
+    if (std.mem.readInt(u32, sector[4..8], .big) != agno) return error.InvalidAllocationGroupLayout;
+    try validateMetadataUuid(sector[agfl_uuid_offset..][0..16], &plan.metadata_uuid);
+    try plan.addPatch(.{ .agfl = .{
+        .offset = reader.offset + ag_offset + 3 * sb.sector_size,
+        .length = sb.sector_size,
+    } });
+}
+
+fn planLog(
+    plan: *RewritePlan,
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+) RewriteUuidError!void {
+    const sb = reader.superblock;
+    if (sb.log_blocks == 0) return;
+
+    const log_bytes = std.math.mul(u64, sb.log_blocks, sb.block_size) catch
+        return error.InvalidFilesystemLength;
+    const sector = try allocator.alloc(u8, sb.sector_size);
+    defer allocator.free(sector);
+    const log_offset = try reader.fsBlockOffset(sb.log_start);
+    var sector_index: u64 = 0;
+    while (sector_index * sb.sector_size < log_bytes) : (sector_index += 1) {
+        try reader.readAt(io, sector, log_offset + sector_index * sb.sector_size);
+        if (sector_index == 0) {
+            if (std.mem.readInt(u32, sector[0..4], .big) != log_magic) return error.UnsupportedLogLayout;
+            if (std.mem.readInt(u32, sector[300..304], .big) != 1) return error.UnsupportedLogLayout;
+            try validateMetadataUuid(sector[log_header_uuid_offset..][0..16], &plan.old_identity.uuid);
+            continue;
+        }
+        if (sector_index == 1) continue;
+        if (hasAnyNonZero(sector)) return error.UnsupportedLogLayout;
+    }
+
+    try plan.addPatch(.{ .log_header = .{
+        .offset = reader.offset + log_offset,
+        .length = sb.sector_size,
+    } });
+}
+
+fn buildRewritePlan(
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    options: RewriteUuidOptions,
+) RewriteUuidError!RewritePlan {
+    const filesystem_length = try validateRewriteGeometry(reader.superblock, options.available_length);
+    var plan = RewritePlan.init(allocator, reader.superblock, filesystem_length, options.new_uuid);
+    errdefer plan.deinit();
+
+    var agno: u32 = 0;
+    while (agno < reader.superblock.ag_count) : (agno += 1) {
+        const ag_offset = agBaseByteOffset(reader.superblock, agno);
+        var raw_sb: [superblock_size]u8 = undefined;
+        try reader.readAt(io, &raw_sb, ag_offset);
+        const parsed = try parseSuperblock(&raw_sb);
+        if (!std.meta.eql(parsed, reader.superblock)) return error.InvalidAllocationGroupLayout;
+        try plan.addPatch(.{ .superblock = reader.offset + ag_offset });
+        try planAllocationGroup(&plan, reader, io, allocator, agno);
+    }
+
+    try planLog(&plan, reader, io, allocator);
+    return plan;
+}
+
+fn applyRewritePatch(
+    file: Io.File,
+    io: Io,
+    scratch: []u8,
+    plan: *const RewritePlan,
+    patch: RewritePatch,
+) RewriteUuidError!void {
+    const offset = rewritePatchOffset(patch);
+    const length = rewritePatchLength(patch);
+    const buffer = scratch[0..length];
+    _ = try file.readPositionalAll(io, buffer, offset);
+
+    switch (patch) {
+        .superblock => {
+            @memcpy(buffer[superblock_uuid_offset..][0..16], &plan.new_identity.uuid);
+            if (plan.old_identity.uses_meta_uuid) {
+                @memcpy(buffer[superblock_meta_uuid_offset..][0..16], &plan.new_identity.meta_uuid);
+            }
+            writeCrc(buffer, 224);
+        },
+        .agf => {
+            @memcpy(buffer[agf_uuid_offset..][0..16], &plan.new_identity.uuid);
+            writeCrc(buffer, agf_crc_offset);
+        },
+        .agi => {
+            @memcpy(buffer[agi_uuid_offset..][0..16], &plan.new_identity.uuid);
+            writeCrc(buffer, agi_crc_offset);
+        },
+        .agfl => {
+            @memcpy(buffer[agfl_uuid_offset..][0..16], &plan.new_identity.uuid);
+            writeCrc(buffer, agfl_crc_offset);
+        },
+        .short_btree => {
+            @memcpy(buffer[short_btree_uuid_offset..][0..16], &plan.new_identity.uuid);
+            writeCrc(buffer, short_btree_crc_offset);
+        },
+        .inode => {
+            @memcpy(buffer[inode_uuid_offset..][0..16], &plan.new_identity.uuid);
+            writeCrc(buffer, dinode_crc_offset);
+        },
+        .dir_block => {
+            @memcpy(buffer[dir3_block_uuid_offset..][0..16], &plan.new_identity.uuid);
+            writeCrc(buffer, 4);
+        },
+        .symlink_block => {
+            @memcpy(buffer[16..32], &plan.new_identity.uuid);
+            writeCrc(buffer, 12);
+        },
+        .bmap_btree => {
+            @memcpy(buffer[bmbt_long_uuid_offset..][0..16], &plan.new_identity.uuid);
+            writeCrc(buffer, bmbt_long_crc_offset);
+        },
+        .log_header => {
+            @memcpy(buffer[log_header_uuid_offset..][0..16], &plan.new_identity.uuid);
+        },
+    }
+
+    try file.writePositionalAll(io, buffer, offset);
+}
+
+fn executeRewritePlan(
+    reader: *Reader,
+    io: Io,
+    allocator: std.mem.Allocator,
+    plan: *const RewritePlan,
+) RewriteUuidError!void {
+    const scratch = try allocator.alloc(u8, plan.max_patch_bytes);
+    defer allocator.free(scratch);
+
+    for (plan.patches.items) |patch| {
+        switch (patch) {
+            .superblock => {},
+            else => try applyRewritePatch(reader.file, io, scratch, plan, patch),
+        }
+    }
+    for (plan.patches.items) |patch| {
+        const offset = switch (patch) {
+            .superblock => |value| value,
+            else => continue,
+        };
+        if (offset == reader.offset) continue;
+        try applyRewritePatch(reader.file, io, scratch, plan, patch);
+    }
+    for (plan.patches.items) |patch| {
+        const offset = switch (patch) {
+            .superblock => |value| value,
+            else => continue,
+        };
+        if (offset != reader.offset) continue;
+        try applyRewritePatch(reader.file, io, scratch, plan, patch);
+    }
+}
+
+/// Strictly rewrites an existing XFS v5 filesystem's public UUID in place.
+///
+/// The supported mutation profile is intentionally narrower than the general
+/// read-only importer: every metadata structure whose identity is tied to the
+/// filesystem UUID is validated first, the rewrite is refused on the first
+/// unsupported feature or structure, and only then are the UUID-bearing
+/// structures rewritten in place and re-read for verification.
+pub fn rewriteFilesystemUuid(
+    io: Io,
+    file: Io.File,
+    allocator: std.mem.Allocator,
+    options: RewriteUuidOptions,
+) RewriteUuidError!RewriteUuidReport {
+    var reader = try Reader.openFileAt(allocator, io, file, options.offset);
+    defer reader.close(io);
+
+    var plan = try buildRewritePlan(&reader, io, allocator, options);
+    defer plan.deinit();
+    const report = plan.report();
+
+    const no_change = std.mem.eql(u8, &report.old_identity.uuid, &report.new_identity.uuid) and
+        (!report.old_identity.uses_meta_uuid or
+            std.mem.eql(u8, &report.old_identity.meta_uuid, &report.new_identity.meta_uuid));
+    if (no_change) return report;
+
+    try executeRewritePlan(&reader, io, allocator, &plan);
+
+    var verified_reader = try Reader.openFileAt(allocator, io, file, options.offset);
+    defer verified_reader.close(io);
+    var verified = try buildRewritePlan(&verified_reader, io, allocator, options);
+    defer verified.deinit();
+    const verified_report = verified.report();
+    if (!std.mem.eql(u8, &verified_report.old_identity.uuid, &report.new_identity.uuid) or
+        !std.mem.eql(u8, &verified_report.old_identity.meta_uuid, &report.new_identity.meta_uuid) or
+        verified_report.old_identity.uses_meta_uuid != report.new_identity.uses_meta_uuid)
+    {
+        return error.MetadataIdentityMismatch;
+    }
+    return report;
 }
 
 const Scanner = struct {
