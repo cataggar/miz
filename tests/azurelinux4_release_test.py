@@ -947,18 +947,36 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertNotIn("\n    needs:", workflow)
         self.assertEqual(workflow.count("fail-fast: false"), 2)
         self.assertEqual(workflow.count("name: build + test"), 1)
-        self.assertIn("zig build test-ci --summary all", workflow)
+        self.assertIn("run: zig build -Doptimize=Debug", workflow)
+        self.assertIn(
+            "zig build test-package-family -Doptimize=Debug",
+            workflow,
+        )
+        self.assertIn(
+            "zig build test-ci -Doptimize=Debug --summary all",
+            workflow,
+        )
         self.assertEqual(
-            workflow.count("run: zig build test-vm-backend --summary all"),
+            workflow.count(
+                "run: zig build test-vm-backend "
+                "-Doptimize=Debug --summary all"
+            ),
             1,
         )
         self.assertEqual(
             workflow.count(
-                "run: zig build test-unsafe-chroot-integration --summary all"
+                "run: zig build test-unsafe-chroot-integration "
+                "-Doptimize=Debug --summary all"
             ),
             1,
         )
         self.assertEqual(workflow.count("zig build test-vm-real-boot"), 3)
+        self.assertEqual(
+            workflow.count("-Doptimize=${{ matrix.optimize }} --summary all"),
+            3,
+        )
+        self.assertEqual(workflow.count("optimize: Debug"), 2)
+        self.assertEqual(workflow.count("optimize: ReleaseSafe"), 1)
         self.assertIn("cancel-in-progress: true", workflow)
 
     def test_release_workflow_uses_hosted_architecture_runners(self):
