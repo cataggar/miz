@@ -84,10 +84,19 @@ pub fn looksLikeArchive(data: []const u8) bool {
 /// Rejects names that could escape an extraction root.  A single leading
 /// `./` is common in real initramfs archives and is safe, so it is accepted;
 /// all remaining components must be non-empty and non-special.
+///
+/// The archive root itself is safe and must be accepted.  `find . | cpio` and
+/// `mkinitramfs` both emit `.` as the first entry of every archive they build,
+/// and it names the extraction directory that already exists rather than
+/// anything outside it.  Rejecting it made every real archive unreadable at
+/// entry zero, which is not a refusal to extract something dangerous but a
+/// refusal to read anything at all.
 pub fn isSafePath(path: []const u8) bool {
+    if (path.len == 0) return false;
     var normalized = path;
     while (std.mem.startsWith(u8, normalized, "./")) normalized = normalized[2..];
-    if (normalized.len == 0 or normalized[0] == '/') return false;
+    if (normalized.len == 0 or std.mem.eql(u8, normalized, ".")) return true;
+    if (normalized[0] == '/') return false;
 
     var components = std.mem.splitScalar(u8, normalized, '/');
     while (components.next()) |component| {
@@ -406,6 +415,37 @@ test "writer rejects unsafe names and reader rejects unsafe metadata" {
     @memcpy(unsafe[header_size .. header_size + "../x".len], "../x");
     var reader = Reader.init(unsafe);
     try std.testing.expectError(error.InvalidPath, reader.next());
+}
+
+test "the archive root entry is readable, and nothing that escapes it is" {
+    // `mkinitramfs` and `find . | cpio` both write `.` as the first entry of
+    // every archive. Refusing it stopped every real initramfs at entry zero.
+    try std.testing.expect(isSafePath("."));
+    try std.testing.expect(isSafePath("./"));
+    try std.testing.expect(isSafePath("./usr/lib/modules"));
+    try std.testing.expect(isSafePath("usr/lib/modules"));
+
+    // Accepting the root is not accepting a bare component named `.` anywhere
+    // else, nor anything that leaves the extraction directory.
+    try std.testing.expect(!isSafePath("usr/./lib"));
+    try std.testing.expect(!isSafePath("./.."));
+    try std.testing.expect(!isSafePath(".."));
+    try std.testing.expect(!isSafePath("../escape"));
+    try std.testing.expect(!isSafePath("/absolute"));
+    try std.testing.expect(!isSafePath(""));
+
+    // The whole point: an archive shaped like a real one is walked to its end
+    // rather than abandoned at the entry every archive starts with.
+    const archive = try buildArchiveForTest(std.testing.allocator, .newc, &.{
+        .{ .path = ".", .content = "" },
+        .{ .path = "./usr/lib/modules/nvme.ko.zst", .content = "module" },
+    });
+    defer std.testing.allocator.free(archive);
+    var reader = Reader.init(archive);
+    var seen: usize = 0;
+    while (try reader.next()) |_| seen += 1;
+    try std.testing.expectEqual(@as(usize, 2), seen);
+    try std.testing.expectEqual(archive.len, reader.offset);
 }
 
 test "reader rejects truncated archives, missing trailers, and trailing bytes" {
