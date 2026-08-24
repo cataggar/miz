@@ -460,7 +460,10 @@ pinned 20260731 Ubuntu 26.04 source, `aarch64`, `baremetal`, the exact 5 GiB
 size, and `ReleaseSafe`. It performs one warm-up and exactly three measured
 runs. Every run has a fresh work and output directory; only the explicitly
 named debz content-addressed cache, fixed package locks, and Zig compilation
-cache are reused.
+cache are reused. Every production-builder invocation also uses the fixed
+`artifact/Ubuntu-26.04-aarch64.baremetal.raw` path, so the measured interval
+includes the required `raw_image_materialization` phase rather than recording
+it as skipped.
 
 Prerequisites:
 
@@ -523,19 +526,23 @@ to a different product flavor.
 
 Each run retains timing JSON, host wall/user/system and resource counters,
 build/check logs, source manifest, exact locks, transaction and signing
-provenance, boot-input evidence, image metadata, package name/version/hash
-closure, and a run manifest. Linux `/proc` descendant sampling supplies
-available read/write byte counters; block input/output counters come from
-`getrusage`. After all validation and cross-run correctness comparison for a
-run, cleanup removes only its exactly resolved `work` directory and QCOW2.
-Use `--keep-images` only when the large candidates are needed for separate
+provenance, boot-input evidence, QCOW2 and raw image metadata, package
+name/version/hash closure, and a run manifest. The raw output must be a
+non-symlink regular file with an exact 5 GiB size and must pass the applicable
+native `vmiz check` and `vmiz info` validation after the measured builder
+process exits. Linux `/proc` descendant sampling supplies available read/write
+byte counters; block input/output counters come from `getrusage`. After all
+validation and cross-run correctness comparison for a run, cleanup removes
+only its exactly resolved `work` directory, QCOW2, and raw output. Use
+`--keep-images` only when both large candidates are needed for separate
 inspection.
 
 `benchmark-summary.json` and `benchmark-summary.txt` report medians for every
 phase, total time, wall/user/system time, peak RSS, I/O, and correctness.
 Package closure, provenance/manifest contracts, filesystem/image constraints,
 boot-input evidence, and acceptance result must match the warm-up reference.
-QCOW2 SHA-256 values are retained but are not compared: bare-metal QCOW2
+QCOW2 SHA-256 values and raw structural metadata are retained as evidence.
+Raw byte hashes are not computed, and no image bytes are compared: bare-metal
 output has no documented byte-identical reproducibility contract.
 
 The historical 8m50s ReleaseSafe result remains the non-regression ceiling

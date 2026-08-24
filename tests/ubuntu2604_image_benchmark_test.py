@@ -119,7 +119,7 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
             )
         return locks
 
-    def timing_document(self):
+    def timing_document(self, raw_outcome="success"):
         phases = []
         elapsed = 1
         for key in benchmark.PHASE_ORDER:
@@ -133,7 +133,7 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
                     "item": item,
                     "elapsed_ns": elapsed,
                     "outcome": (
-                        "skipped"
+                        raw_outcome
                         if name == "raw_image_materialization"
                         else "success"
                     ),
@@ -179,7 +179,7 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
             args,
             work_dir=self.root / "work",
             provenance_dir=self.root / "provenance",
-            image=self.root / benchmark.ASSET_NAME,
+            image=self.root / "artifact" / benchmark.ASSET_NAME,
             timing=self.root / "timing.json",
         )
         self.assertIn("-Doptimize=ReleaseSafe", command)
@@ -187,6 +187,11 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
         self.assertIn("-Dubuntu2604-flavor=baremetal", command)
         self.assertIn("--debz-lock-dir", command)
         self.assertIn("--offline", command)
+        raw_index = command.index("--raw-output")
+        self.assertEqual(
+            command[raw_index + 1],
+            str(self.root / "artifact" / benchmark.RAW_ASSET_NAME),
+        )
 
     def test_run_directory_must_be_new(self):
         output = self.root / "new-output"
@@ -199,12 +204,23 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
         (run / "artifact").mkdir(parents=True)
         (run / "work").mkdir()
         image = run / "artifact" / benchmark.ASSET_NAME
+        raw_output = run / "artifact" / benchmark.RAW_ASSET_NAME
         image.write_bytes(b"image")
+        raw_output.write_bytes(b"raw")
         outside = self.root / "outside"
         outside.mkdir()
         with self.assertRaises(benchmark.BenchmarkError):
             benchmark.cleanup_decisions(
-                run, image, outside, keep_images=False
+                run, image, raw_output, outside, keep_images=False
+            )
+        (outside / benchmark.RAW_ASSET_NAME).write_bytes(b"raw")
+        with self.assertRaises(benchmark.BenchmarkError):
+            benchmark.cleanup_decisions(
+                run,
+                image,
+                outside / benchmark.RAW_ASSET_NAME,
+                run / "work",
+                keep_images=False,
             )
 
     def test_cleanup_removes_only_validated_large_targets(self):
@@ -213,15 +229,22 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
         work = run / "work"
         work.mkdir()
         image = run / "artifact" / benchmark.ASSET_NAME
+        raw_output = run / "artifact" / benchmark.RAW_ASSET_NAME
         image.write_bytes(b"image")
+        raw_output.write_bytes(b"raw")
         removed = benchmark.cleanup_run(
-            run, image, work, keep_images=False
+            run, image, raw_output, work, keep_images=False
         )
         self.assertEqual(
             removed,
-            [f"artifact/{benchmark.ASSET_NAME}", "work"],
+            [
+                f"artifact/{benchmark.ASSET_NAME}",
+                f"artifact/{benchmark.RAW_ASSET_NAME}",
+                "work",
+            ],
         )
         self.assertFalse(image.exists())
+        self.assertFalse(raw_output.exists())
         self.assertFalse(work.exists())
 
     def test_keep_images_still_discards_only_work_directory(self):
@@ -230,10 +253,15 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
         work = run / "work"
         work.mkdir()
         image = run / "artifact" / benchmark.ASSET_NAME
+        raw_output = run / "artifact" / benchmark.RAW_ASSET_NAME
         image.write_bytes(b"image")
-        removed = benchmark.cleanup_run(run, image, work, keep_images=True)
+        raw_output.write_bytes(b"raw")
+        removed = benchmark.cleanup_run(
+            run, image, raw_output, work, keep_images=True
+        )
         self.assertEqual(removed, ["work"])
         self.assertTrue(image.exists())
+        self.assertTrue(raw_output.exists())
 
     def test_warm_cache_verifies_content_addressed_objects(self):
         cache, package_digest = self.make_cache()
@@ -281,6 +309,49 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
         with self.assertRaises(benchmark.BenchmarkError):
             benchmark.load_timing(path)
 
+    def test_timing_schema_requires_successful_raw_materialization(self):
+        path = self.root / "timing.json"
+        path.write_text(
+            json.dumps(self.timing_document(raw_outcome="skipped")),
+            encoding="utf-8",
+        )
+        with self.assertRaises(benchmark.BenchmarkError):
+            benchmark.load_timing(path)
+
+    def test_raw_output_requires_exact_regular_5_gib_file(self):
+        raw_output = self.root / benchmark.RAW_ASSET_NAME
+        with raw_output.open("wb") as stream:
+            stream.truncate(benchmark.VIRTUAL_SIZE)
+        info = self.root / "raw-info.json"
+        info.write_text(
+            json.dumps(
+                {
+                    "filename": str(raw_output),
+                    "format": "raw",
+                    "virtual-size": benchmark.VIRTUAL_SIZE,
+                    "actual-size": benchmark.VIRTUAL_SIZE,
+                    "subformat": None,
+                    "backing-filename": None,
+                    "format-specific": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        metadata = benchmark.validate_raw_output(raw_output, info)
+        self.assertEqual(metadata["filename"], benchmark.RAW_ASSET_NAME)
+        self.assertEqual(metadata["bytes"], benchmark.VIRTUAL_SIZE)
+        self.assertFalse(metadata["byte_hash_recorded"])
+        os.truncate(raw_output, benchmark.VIRTUAL_SIZE - 1)
+        with self.assertRaises(benchmark.BenchmarkError):
+            benchmark.validate_raw_output(raw_output, info)
+        raw_output.unlink()
+        target = self.root / "raw-target"
+        with target.open("wb") as stream:
+            stream.truncate(benchmark.VIRTUAL_SIZE)
+        raw_output.symlink_to(target)
+        with self.assertRaises(benchmark.BenchmarkError):
+            benchmark.validate_raw_output(raw_output, info)
+
     def test_median_calculation_is_integer_and_stable(self):
         self.assertEqual(benchmark.median_int([9, 1, 5]), 5)
         self.assertEqual(benchmark.median_int([10, 2]), 6)
@@ -323,6 +394,16 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
                     "correctness_sha256": "a" * 64,
                     "image_sha256": str(index) * 64,
                     "image_bytes": 1,
+                    "raw_output": {
+                        "filename": benchmark.RAW_ASSET_NAME,
+                        "format": "raw",
+                        "bytes": benchmark.VIRTUAL_SIZE,
+                        "virtual_size": benchmark.VIRTUAL_SIZE,
+                        "structural_validation": "vmiz-check-and-info",
+                        "byte_hash_recorded": False,
+                        "byte_reproducibility_compared": False,
+                        "retention_policy": "delete-after-validation",
+                    },
                     "evidence": f"run-{index}/evidence",
                     "cleanup": [],
                 }
@@ -338,6 +419,13 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
             summary["medians"]["phase_elapsed_ns"]["total_runtime"], 20
         )
         self.assertEqual(summary["medians"]["resources"]["wall_ns"], 20)
+        self.assertEqual(
+            summary["runs"][0]["raw_output"]["virtual_size"],
+            benchmark.VIRTUAL_SIZE,
+        )
+        self.assertFalse(
+            summary["runs"][0]["raw_output"]["byte_reproducibility_compared"]
+        )
         readable = benchmark.readable_summary(summary)
         self.assertIn("Status: valid", readable)
         self.assertIn("Median total phase time", readable)

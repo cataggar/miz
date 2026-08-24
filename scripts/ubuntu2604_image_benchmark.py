@@ -38,6 +38,7 @@ SUMS_SIGNATURE_SHA256 = (
 DEBZ_API_COMMIT = "beac3f20dd93fd98863af71e8fe621d47db663f6"
 CANONICAL_FINGERPRINT = "d2eb44626fddc30b513d5bb71a5d6c4c7db87c81"
 ASSET_NAME = "Ubuntu-26.04-aarch64.baremetal.qcow2"
+RAW_ASSET_NAME = "Ubuntu-26.04-aarch64.baremetal.raw"
 PACKAGE_ROOTS = (
     "ubuntu-minimal",
     "linux-image-7.0.0-2015-nvidia-bos-64k",
@@ -228,32 +229,51 @@ def is_within(path: Path, parent: Path) -> bool:
 
 
 def require_run_path(path: Path, run_dir: Path, expected_relative: str) -> Path:
-    resolved_run = run_dir.resolve(strict=True)
+    try:
+        resolved_run = run_dir.resolve(strict=True)
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        fail(f"unsafe benchmark cleanup path: {path}")
     if run_dir.is_symlink():
         fail(f"unsafe benchmark cleanup path: {path}")
-    resolved = path.resolve(strict=True)
     expected = resolved_run / expected_relative
     if resolved != expected or not is_within(resolved, resolved_run):
         fail(f"benchmark cleanup escaped its run directory: {path}")
     return resolved
 
 
+def path_exists_or_symlink(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
 def cleanup_decisions(
     run_dir: Path,
     image: Path,
+    raw_output: Path,
     work_dir: Path,
     *,
     keep_images: bool,
 ) -> list[tuple[str, Path]]:
     decisions: list[tuple[str, Path]] = []
-    if image.exists() and not keep_images:
+    if path_exists_or_symlink(image) and not keep_images:
         decisions.append(
             (
                 "file",
                 require_run_path(image, run_dir, f"artifact/{ASSET_NAME}"),
             )
         )
-    if work_dir.exists():
+    if path_exists_or_symlink(raw_output) and not keep_images:
+        decisions.append(
+            (
+                "file",
+                require_run_path(
+                    raw_output,
+                    run_dir,
+                    f"artifact/{RAW_ASSET_NAME}",
+                ),
+            )
+        )
+    if path_exists_or_symlink(work_dir):
         decisions.append(("tree", require_run_path(work_dir, run_dir, "work")))
     return decisions
 
@@ -261,13 +281,18 @@ def cleanup_decisions(
 def cleanup_run(
     run_dir: Path,
     image: Path,
+    raw_output: Path,
     work_dir: Path,
     *,
     keep_images: bool,
 ) -> list[str]:
     removed: list[str] = []
     for kind, target in cleanup_decisions(
-        run_dir, image, work_dir, keep_images=keep_images
+        run_dir,
+        image,
+        raw_output,
+        work_dir,
+        keep_images=keep_images,
     ):
         if kind == "file":
             target.unlink()
@@ -506,6 +531,8 @@ def load_timing(path: Path) -> dict[str, object]:
             fail(f"timing phase {name} unexpectedly has an item")
         if key in values:
             fail(f"timing JSON contains duplicate phase {key}")
+        if key == "raw_image_materialization" and outcome != "success":
+            fail("timing JSON raw_image_materialization was not successful")
         values[key] = elapsed
     if tuple(debz_items) != PACKAGE_ROOTS:
         fail("timing JSON does not contain the exact ordered package transactions")
@@ -672,6 +699,52 @@ def validate_image_info(path: Path) -> dict[str, object]:
         "virtual_size": VIRTUAL_SIZE,
         "compression_type": "zstd",
         "backing_file": None,
+    }
+
+
+def validate_raw_file(path: Path) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        fail(f"raw benchmark output is missing: {path}")
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        fail(f"raw benchmark output must be a non-symlink regular file: {path}")
+    if metadata.st_size != VIRTUAL_SIZE:
+        fail("raw benchmark output does not have the exact 5 GiB virtual size")
+    return metadata
+
+
+def validate_raw_output(path: Path, info_path: Path) -> dict[str, object]:
+    metadata = validate_raw_file(path)
+    info = read_json(info_path)
+    if (
+        set(info)
+        != {
+            "filename",
+            "format",
+            "virtual-size",
+            "actual-size",
+            "subformat",
+            "backing-filename",
+            "format-specific",
+        }
+        or info.get("filename") != str(path)
+        or info.get("format") != "raw"
+        or info.get("virtual-size") != VIRTUAL_SIZE
+        or info.get("actual-size") != VIRTUAL_SIZE
+        or info.get("subformat") is not None
+        or info.get("backing-filename") is not None
+        or info.get("format-specific") is not None
+    ):
+        fail("raw benchmark output metadata is invalid")
+    return {
+        "filename": RAW_ASSET_NAME,
+        "format": "raw",
+        "bytes": metadata.st_size,
+        "virtual_size": VIRTUAL_SIZE,
+        "structural_validation": "vmiz-check-and-info",
+        "byte_hash_recorded": False,
+        "byte_reproducibility_compared": False,
     }
 
 
@@ -947,6 +1020,7 @@ def build_summary(
             "warmup_runs": 1,
             "measured_runs": MEASURED_RUNS,
             "network_policy": "offline",
+            "raw_image_materialization": "required",
         },
         "source_commit": source_commit,
         "host": host,
@@ -969,7 +1043,7 @@ def build_summary(
         "correctness": {
             "status": "identical",
             "reference_sha256": runs[0]["correctness_sha256"],
-            "byte_hash_comparison": "not-applicable-no-baremetal-byte-reproducibility-contract",
+            "byte_hash_comparison": "not-applicable-no-image-byte-reproducibility-contract",
         },
         "runs": [
             {
@@ -978,6 +1052,7 @@ def build_summary(
                 "evidence": run["evidence"],
                 "image_sha256": run["image_sha256"],
                 "image_bytes": run["image_bytes"],
+                "raw_output": run["raw_output"],
                 "cleanup": run["cleanup"],
             }
             for run in runs
@@ -1017,8 +1092,9 @@ def readable_summary(summary: dict[str, object]) -> str:
             "Correctness: package name/version/hash closure, provenance, "
             "manifest, boot-input evidence, image structure, and acceptance "
             "result were identical.",
-            "QCOW2 byte hashes are recorded but not compared because bare-metal "
-            "output has no documented byte-reproducibility contract.",
+            "QCOW2 byte hashes are recorded and raw output metadata is retained. "
+            "Image bytes are not compared because bare-metal output has no "
+            "documented byte-reproducibility contract.",
             "",
         ]
     )
@@ -1186,6 +1262,7 @@ def benchmark_command(
     image: Path,
     timing: Path,
 ) -> list[str]:
+    raw_output = image.parent / RAW_ASSET_NAME
     command = [
         str(args.zig),
         "build",
@@ -1200,6 +1277,8 @@ def benchmark_command(
         str(provenance_dir),
         "--output",
         str(image),
+        "--raw-output",
+        str(raw_output),
         "--source",
         str(args.source.resolve()),
         "--size",
@@ -1255,6 +1334,7 @@ def run_once(
     shutil.copyfile(args.sha256sums_signature, work_dir / "SHA256SUMS.gpg")
     shutil.copyfile(args.manifest, work_dir / MANIFEST_NAME)
     image = artifact_dir / ASSET_NAME
+    raw_output = artifact_dir / RAW_ASSET_NAME
     timing_path = evidence_dir / "timing.json"
     resources_path = evidence_dir / "resources.json"
     build_log = evidence_dir / "build.log"
@@ -1279,6 +1359,7 @@ def run_once(
     timing = load_timing(timing_path)
     if not image.is_file() or image.stat().st_size <= 0:
         fail(f"{name} did not produce the expected image")
+    validate_raw_file(raw_output)
     vmiz = repo / "zig-out" / "bin" / "vmiz"
     check_log = evidence_dir / "vmiz-check.log"
     run_logged(
@@ -1300,6 +1381,29 @@ def run_once(
     if result.returncode != 0:
         fail(f"{name} vmiz info failed: {result.stderr.decode(errors='replace')}")
     image_contract = validate_image_info(image_info_path)
+    raw_check_log = evidence_dir / "raw-vmiz-check.log"
+    run_logged(
+        [str(vmiz), "check", str(raw_output)],
+        cwd=repo,
+        env=env,
+        log_path=raw_check_log,
+    )
+    raw_info_path = evidence_dir / "raw-image-info.json"
+    with raw_info_path.open("wb") as output:
+        result = subprocess.run(
+            [str(vmiz), "info", "--output=json", str(raw_output)],
+            cwd=repo,
+            env=env,
+            stdout=output,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    if result.returncode != 0:
+        fail(f"{name} raw vmiz info failed: {result.stderr.decode(errors='replace')}")
+    raw_output_record = validate_raw_output(raw_output, raw_info_path)
+    raw_output_record["retention_policy"] = (
+        "keep" if args.keep_images else "delete-after-validation"
+    )
     provenance_contract = validate_provenance(
         provenance_dir,
         lock_set,
@@ -1320,6 +1424,11 @@ def run_once(
             "source_sha256": SOURCE_SHA256,
         },
         "image": image_contract,
+        "raw_output": {
+            "format": raw_output_record["format"],
+            "virtual_size": raw_output_record["virtual_size"],
+            "structural_validation": raw_output_record["structural_validation"],
+        },
         "provenance": provenance_contract,
         "package_closure_sha256": lock_set["closure_sha256"],
         "acceptance": acceptance,
@@ -1348,6 +1457,7 @@ def run_once(
             "sha256": image_digest,
             "byte_reproducibility_compared": False,
         },
+        "raw_output": raw_output_record,
         "correctness_sha256": canonical_digest(correctness),
         "cache_inventory_sha256": cache_inventory["inventory_sha256"],
     }
@@ -1355,6 +1465,7 @@ def run_once(
     removed = cleanup_run(
         run_dir,
         image,
+        raw_output,
         work_dir,
         keep_images=args.keep_images,
     )
@@ -1366,6 +1477,7 @@ def run_once(
         "correctness_sha256": evidence_manifest["correctness_sha256"],
         "image_sha256": image_digest,
         "image_bytes": image_size,
+        "raw_output": raw_output_record,
         "evidence": evidence_dir.relative_to(session).as_posix(),
         "cleanup": removed,
     }
