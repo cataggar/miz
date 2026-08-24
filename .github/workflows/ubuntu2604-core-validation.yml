@@ -452,6 +452,8 @@ jobs:
             *) exit 1 ;;
           esac
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
+          test -c /dev/kvm
+          sudo chown "$(id -u):$(id -g)" /dev/kvm
           test -r /dev/kvm
           test -w /dev/kvm
           for tool in qemu-img sbverify ssh ssh-keygen swtpm virt-fw-vars; do
