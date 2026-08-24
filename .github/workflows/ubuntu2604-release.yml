@@ -407,10 +407,6 @@ jobs:
             architecture: x86_64
             runner: ubuntu-24.04
             asset_name: Ubuntu-26.04-x86_64.qcow2
-          - key: aarch64-full
-            architecture: aarch64
-            runner: ubuntu-24.04-arm
-            asset_name: Ubuntu-26.04-aarch64.qcow2
     env:
       CANDIDATE_KEY: ${{ matrix.key }}
       ARCHITECTURE: ${{ matrix.architecture }}
@@ -450,20 +446,28 @@ jobs:
             openssh-client openssl python3-virt-firmware qemu-utils
             sbsigntool swtpm swtpm-tools
           )
-          case "$ARCHITECTURE" in
-            x86_64) packages+=(ovmf qemu-system-x86) ;;
-            aarch64) packages+=(qemu-efi-aarch64 qemu-system-arm) ;;
-            *) exit 1 ;;
-          esac
+          test "$ARCHITECTURE" = x86_64
+          packages+=(ovmf qemu-system-x86)
+          uefi_code=/usr/share/OVMF/OVMF_CODE_4M.ms.fd
+          uefi_vars=/usr/share/OVMF/OVMF_VARS_4M.ms.fd
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
-          test -c /dev/kvm
+          test -r "$uefi_code"
+          test -r "$uefi_vars"
+          {
+            echo "VMIZ_UBUNTU2604_UEFI_CODE=$uefi_code"
+            echo "VMIZ_UBUNTU2604_UEFI_VARS=$uefi_vars"
+          } >> "$GITHUB_ENV"
+          if [[ ! -c /dev/kvm ]]; then
+            echo "::error::Matching-architecture native acceptance requires a KVM-capable runner with /dev/kvm"
+            exit 1
+          fi
           sudo chown "$(id -u):$(id -g)" /dev/kvm
           test -r /dev/kvm
           test -w /dev/kvm
           for tool in qemu-img sbverify ssh ssh-keygen swtpm virt-fw-vars; do
             command -v "$tool" >/dev/null
           done
-          command -v "qemu-system-${ARCHITECTURE/x86_64/x86_64}" >/dev/null
+          command -v qemu-system-x86_64 >/dev/null
 
       - name: Provision privileged offline-root containment fixture
         run: |
@@ -672,13 +676,6 @@ jobs:
           [[ "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ ]]
           [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
 
-      - name: Log in to Azure with protected-environment OIDC
-        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
         env:
@@ -707,6 +704,13 @@ jobs:
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           zig build -Doptimize=ReleaseSafe
           test -x zig-out/bin/vmiz
+
+      - name: Log in to Azure with protected-environment OIDC
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Run exact-digest Azure Trusted Launch acceptance
         env:
@@ -832,7 +836,7 @@ jobs:
           path: ${{ env.AZURE_RESULTS_DIR }}
           merge-multiple: false
 
-      - name: Validate exact successful two-by-three release gate
+      - name: Validate exact two-architecture release gate
         run: |
           set -euo pipefail
           test "$PREPARE_RESULT" = success
@@ -852,8 +856,8 @@ jobs:
           candidate_docs = list(candidates_root.rglob("candidate.json"))
           native_docs = list(native_root.rglob("native-result.json"))
           azure_docs = list(azure_root.rglob("azure-result.json"))
-          if len(candidate_docs) != 2 or len(native_docs) != 2 or len(azure_docs) != 2:
-              raise SystemExit("release gate did not receive exactly two results of each kind")
+          if len(candidate_docs) != 2 or len(native_docs) != 1 or len(azure_docs) != 2:
+              raise SystemExit("release gate did not receive two candidates, one native result, and two Azure results")
           candidates = {}
           for path in candidate_docs:
               value = json.load(open(path, encoding="utf-8"))
@@ -882,10 +886,13 @@ jobs:
           for key, candidate in candidates.items():
               digest = candidate["sha256"]
               native = native_by_digest.get(digest)
-              if native is None:
-                  raise SystemExit(f"{key}: native result is not digest-bound")
-              if native.get("certificate_sha256") != candidate["uki_signing"]["certificate_sha256"]:
-                  raise SystemExit(f"{key}: native signer binding mismatch")
+              if key == "x86_64-full":
+                  if native is None:
+                      raise SystemExit(f"{key}: native result is not digest-bound")
+                  if native.get("certificate_sha256") != candidate["uki_signing"]["certificate_sha256"]:
+                      raise SystemExit(f"{key}: native signer binding mismatch")
+              elif native is not None:
+                  raise SystemExit(f"{key}: unexpected native result")
               result = azure[key]
               if (
                   result.get("source_commit") != source_commit

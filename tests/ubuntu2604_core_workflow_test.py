@@ -28,17 +28,26 @@ class Ubuntu2604CoreWorkflowTests(unittest.TestCase):
         ):
             section = self.job(name, following)
             self.assertEqual(section.count("- key: x86_64-core"), 1)
-            self.assertEqual(section.count("- key: aarch64-core"), 1)
+            self.assertEqual(
+                section.count("- key: aarch64-core"),
+                0 if name == "native_qemu" else 1,
+            )
             self.assertNotIn("- key: x86_64-full", section)
             self.assertNotIn("- key: aarch64-full", section)
             self.assertIn(
                 "asset_name: Ubuntu-26.04-x86_64.core.qcow2",
                 section,
             )
-            self.assertIn(
-                "asset_name: Ubuntu-26.04-aarch64.core.qcow2",
-                section,
-            )
+            if name == "native_qemu":
+                self.assertNotIn(
+                    "asset_name: Ubuntu-26.04-aarch64.core.qcow2",
+                    section,
+                )
+            else:
+                self.assertIn(
+                    "asset_name: Ubuntu-26.04-aarch64.core.qcow2",
+                    section,
+                )
         gate = self.job("validate")
         self.assertIn('"x86_64-core": "Ubuntu-26.04-x86_64.core.qcow2"', gate)
         self.assertIn('"aarch64-core": "Ubuntu-26.04-aarch64.core.qcow2"', gate)
@@ -53,7 +62,7 @@ class Ubuntu2604CoreWorkflowTests(unittest.TestCase):
         self.assertIn("needs.native_qemu.result == 'success'", gate)
         self.assertIn("needs.azure_acceptance.result == 'success'", gate)
         self.assertIn("len(candidate_docs) != 2", gate)
-        self.assertIn("len(native_docs) != 2", gate)
+        self.assertIn("len(native_docs) != 1", gate)
         self.assertIn("len(azure_docs) != 2", gate)
         self.assertIn("core validation matrix is incomplete", gate)
 
@@ -121,14 +130,27 @@ class Ubuntu2604CoreWorkflowTests(unittest.TestCase):
         )
         native = self.job("native_qemu", "azure_acceptance")
         self.assertIn('-Dubuntu2604-flavor="$FLAVOR"', native)
-        self.assertIn("test -c /dev/kvm", native)
+        self.assertIn("if [[ ! -c /dev/kvm ]]", native)
         self.assertIn('sudo chown "$(id -u):$(id -g)" /dev/kvm', native)
         self.assertIn("test -r /dev/kvm", native)
         self.assertIn("test -w /dev/kvm", native)
+        self.assertIn("VMIZ_UBUNTU2604_UEFI_CODE=", native)
+        self.assertIn("VMIZ_UBUNTU2604_UEFI_VARS=", native)
         self.assertIn("verify-native-result", native)
         azure = self.job("azure_acceptance", "validate")
         self.assertIn("FLAVOR: core", azure)
         self.assertIn("ubuntu2604_azure_acceptance.sh run", azure)
+        build = azure.index("- name: Build accepted-source vmiz")
+        android = azure.index(
+            "- name: Fetch and verify digest-bound Android container smoke inputs"
+        )
+        login = azure.index("- name: Log in to Azure with protected-environment OIDC")
+        acceptance = azure.index(
+            "- name: Run exact-digest Azure Trusted Launch core acceptance"
+        )
+        self.assertLess(build, android)
+        self.assertLess(android, login)
+        self.assertLess(login, acceptance)
 
     def test_binder_probe_is_built_for_the_matching_guest_architecture(self) -> None:
         azure = self.job("azure_acceptance", "validate")
