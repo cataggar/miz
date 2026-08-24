@@ -507,6 +507,7 @@ const Args = struct {
     raw_output: ?[]const u8 = null,
     timing_output: ?[]const u8 = null,
     debz_cache: ?[]const u8 = null,
+    debz_input_dir: ?[]const u8 = null,
     debz_lock_dir: ?[]const u8 = null,
     offline: bool = false,
     preflight_only: bool = false,
@@ -526,6 +527,7 @@ const help =
     \\  --raw-output <path>                     additional raw copy, for writing to a disk
     \\  --timing-output <path>                  write opt-in machine-readable phase timing JSON
     \\  --debz-cache <path>                     shared content-addressed debz cache
+    \\  --debz-input-dir <path>                 stable repository documents/keyring directory
     \\  --debz-lock-dir <path>                  fixed exact-lock inputs, one per package root
     \\  --offline                               require local pinned inputs and cache-only debz
     \\  --proxy <url>                           reach the archive through this HTTP proxy
@@ -810,6 +812,10 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
             args.debz_cache = argv[i];
+        } else if (std.mem.eql(u8, arg, "--debz-input-dir")) {
+            i += 1;
+            if (i == argv.len) return error.MissingArgument;
+            args.debz_input_dir = argv[i];
         } else if (std.mem.eql(u8, arg, "--debz-lock-dir")) {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
@@ -1795,8 +1801,24 @@ fn openNativeRoot(
     };
 }
 
-fn requireSucceeded(result: package_family.Result) !void {
+fn requireSucceeded(
+    result: package_family.Result,
+    request: package_family.Request,
+    package: []const u8,
+) !void {
     if (!result.succeeded or result.diagnostic != null) {
+        std.debug.print(
+            "debz transaction package={s} operation={s} cache_mode={s} cache={s} config={s} keyring={s} lock={s}\n",
+            .{
+                package,
+                @tagName(request.operation),
+                @tagName(request.inputs.cache_mode),
+                request.inputs.cache_path,
+                request.inputs.config_paths[0],
+                request.inputs.keyring_paths[0],
+                request.inputs.lock_input_path orelse request.inputs.lock_output_path orelse "none",
+            },
+        );
         if (result.diagnostic) |diagnostic| {
             std.debug.print("debz {s}: {s}", .{ @tagName(diagnostic.id), diagnostic.message });
             if (diagnostic.backend_exit_status) |status|
@@ -2617,6 +2639,7 @@ fn customizeRootWithDebz(
     azagent_path: ?[]const u8,
     proxy: ?[]const u8,
     debz_cache: ?[]const u8,
+    debz_input_dir: ?[]const u8,
     debz_lock_dir: ?[]const u8,
     offline: bool,
     authorized_key: ?[]const u8,
@@ -2650,9 +2673,16 @@ fn customizeRootWithDebz(
         return error.OfficialRootExtractionFailed;
     errdefer allocator.free(current);
 
+    const repository_input_dir = debz_input_dir orelse work_dir;
+    try Dir.cwd().createDirPath(io, repository_input_dir);
+    const repository_input_stat = try Dir.cwd().statFile(io, repository_input_dir, .{ .follow_symlinks = false });
+    if (repository_input_stat.kind != .directory) return error.DebzInputDirNotDirectory;
+    const absolute_repository_input_dir = try Dir.cwd().realPathFileAlloc(io, repository_input_dir, allocator);
+    defer allocator.free(absolute_repository_input_dir);
+
     const trusted_keyring = try std.fs.path.join(allocator, &.{ current, "usr/share/keyrings/ubuntu-archive-keyring.gpg" });
     defer allocator.free(trusted_keyring);
-    const external_keyring = try std.fs.path.join(allocator, &.{ work_dir, "ubuntu-archive-keyring.gpg" });
+    const external_keyring = try std.fs.path.join(allocator, &.{ absolute_repository_input_dir, "ubuntu-archive-keyring.gpg" });
     defer allocator.free(external_keyring);
     var trusted = try materializeTrustedKeyring(allocator, io, trusted_keyring, external_keyring);
     defer trusted.deinit(allocator);
@@ -2666,7 +2696,7 @@ fn customizeRootWithDebz(
         defer allocator.free(mountpoint);
         try Dir.cwd().createDirPath(io, mountpoint);
     }
-    const source_path = try std.fs.path.join(allocator, &.{ work_dir, "ubuntu-snapshot.sources" });
+    const source_path = try std.fs.path.join(allocator, &.{ absolute_repository_input_dir, "ubuntu-snapshot.sources" });
     defer allocator.free(source_path);
     const source_document = try std.fmt.allocPrint(allocator,
         \\Types: deb
@@ -2681,7 +2711,7 @@ fn customizeRootWithDebz(
     try Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = source_document });
     const absolute_source = try Dir.cwd().realPathFileAlloc(io, source_path, allocator);
     defer allocator.free(absolute_source);
-    const source_config_path = try std.fs.path.join(allocator, &.{ work_dir, "ubuntu-snapshot.json" });
+    const source_config_path = try std.fs.path.join(allocator, &.{ absolute_repository_input_dir, "ubuntu-snapshot.json" });
     defer allocator.free(source_config_path);
     const source_config = try std.json.Stringify.valueAlloc(allocator, .{
         .source_path = absolute_source,
@@ -2786,7 +2816,7 @@ fn customizeRootWithDebz(
             );
             try assertRequestSeparation(resolve_request);
             const resolved = try package_family.execute(allocator, io, .{}, resolve_request);
-            try requireSucceeded(resolved);
+            try requireSucceeded(resolved, resolve_request, package);
             if (resolved.lock_path == null or !std.mem.eql(u8, resolved.lock_path.?, absolute_lock))
                 return error.DebzLockMismatch;
         }
@@ -2830,7 +2860,7 @@ fn customizeRootWithDebz(
         );
         try assertRequestSeparation(customize_request);
         const customized = try package_family.execute(allocator, io, .{}, customize_request);
-        try requireSucceeded(customized);
+        try requireSucceeded(customized, customize_request, package);
         if (!customized.published or customized.provenance_path == null)
             return error.DebzProvenanceMissing;
         defer allocator.free(customized.provenance_path.?);
@@ -3734,6 +3764,7 @@ fn buildImage(
         args.azagent,
         args.proxy,
         args.debz_cache,
+        args.debz_input_dir,
         args.debz_lock_dir,
         args.offline,
         authorized_key,
@@ -4590,12 +4621,15 @@ test "arguments accept Ubuntu and project architecture spellings" {
         "ubuntu.img",
         "--debz-cache",
         "/cache",
+        "--debz-input-dir",
+        "/repository-inputs",
         "--debz-lock-dir",
         "/locks",
         "--offline",
     });
     try std.testing.expect(offline.offline);
     try std.testing.expectEqualStrings("/cache", offline.debz_cache.?);
+    try std.testing.expectEqualStrings("/repository-inputs", offline.debz_input_dir.?);
     try std.testing.expectEqualStrings("/locks", offline.debz_lock_dir.?);
     try std.testing.expectError(error.OfflineSourceRequired, parseArgs(&.{"--offline"}));
     try std.testing.expectError(
