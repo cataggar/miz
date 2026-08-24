@@ -1,7 +1,7 @@
 //! Native Zig qcow2 image reader.
 //!
-//! A dependency-free, clean-room implementation of the qcow2 on-disk format
-//! (see `docs/interop/qcow2.rst` in the QEMU tree). No QEMU C code is used.
+//! A clean-room implementation of the qcow2 on-disk format (see
+//! `docs/interop/qcow2.rst` in the QEMU tree). No QEMU C code is used.
 //!
 //! Scope: read path for v2/v3 images, including standard, zero, unallocated,
 //! and compressed clusters, backing-file chains, and Extended L2 Entries
