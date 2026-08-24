@@ -88,7 +88,8 @@ vmiz/
                               #   `vmiz azure deprovision`; issue #110)
         tar.zig                # minimal private USTAR reader/writer shared by
                               #   OCI layer ingestion and COSI packaging
-        zstd.zig               # minimal private raw-block zstd codec for COSI
+        zstd.zig               # zstd support shared by COSI, SquashFS,
+                              #   and streaming raw.zst output
         cosi.zig               # COSI writer (tar + metadata.json + raw.zst parts)
         build_image.zig        # ISO + OCI -> raw/fixed-VHD orchestration;
                               #   materializeCustomizedRootTree is shared with

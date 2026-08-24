@@ -9,8 +9,9 @@ do not import or link debz. Build consumers that need this API use the
 host-targeted `vmiz_host` module; the cross-target `vmiz` module stays free of
 host package-manager linkage. The pre-rename `zvmi` and `zvmi_host` module
 names remain compatibility aliases over the same sources, while new consumers
-should use `vmiz` and `vmiz_host`. Host builds require the liblzma and libzstd
-development libraries that debz declares through its Zig build module.
+should use `vmiz` and `vmiz_host`. The public modules link vmiz's pinned static
+libzstd dependency. Package-family consumers additionally pick up debz's
+liblzma/libzstd dependencies through its Zig build module.
 
 The version 3 request makes the staged and published root, native/foreign
 architectures, repository sources, keyrings, configuration, cache, state,

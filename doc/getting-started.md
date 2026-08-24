@@ -3,14 +3,15 @@
 ## Requirements
 
 - Zig **0.16.0** or later.
-- `zig build test` requires the `zstd` CLI for encoder interoperability tests.
-  On Debian-family systems, install `zstd` and `libzstd-dev` together from the
-  same distribution repository so the CLI and system library use the same
-  zstd source version:
+- `zig build` compiles the pinned static libzstd dependency from
+  `build.zig.zon`; no system libzstd development package is needed for vmiz's
+  zstd wrapper.
+- `zig build test` additionally requires the `zstd` CLI for interoperability
+  coverage. On Debian-family systems:
 
   ```console
   sudo apt-get update
-  sudo apt-get install -y --no-install-recommends liblzma-dev libzstd-dev zstd
+  sudo apt-get install -y --no-install-recommends zstd
   ```
 
 - `vmiz qemu` additionally requires [ghr](https://github.com/cataggar/ghr) for automatic known-image download. Install the packaged QEMU build with `ghr install cataggar/qemu`, or provide a system QEMU/UEFI installation.

@@ -9,7 +9,7 @@ pub fn describeOutputError(err: vmiz.output.SpecError) []const u8 {
     return switch (err) {
         error.CompressionRequiresRawFormat => "compressed output is produced while the image is written, and only raw is written in a single forward pass (use raw.gz or raw.zst)",
         error.FormatRequiresSeekableOutput => "stdout cannot be seeked backwards, and vhd (trailing footer), vhdx (BAT), and qcow2 (L1 and refcount tables) all amend metadata after the data (use raw, raw.gz, or raw.zst)",
-        error.CompressionLevelNotSupportedForZstd => "--compress-level applies to gzip only; the in-tree zstd encoder has a single fixed strategy",
+        error.CompressionLevelNotSupportedForZstd => "--compress-level applies to gzip only; zstd output uses fixed deterministic parameters",
         error.CompressionLevelOutOfRange => "--compress-level must be 1 (fastest) through 9 (smallest)",
     };
 }

@@ -32,10 +32,9 @@ const zstd = @import("zstd.zig");
 
 pub const Format = @import("formats.zig").Format;
 
-/// How the raw bytes are encoded on the way out. `zstd` uses the in-tree
-/// encoder that also backs COSI output; it emits spec-compliant frames but
-/// is a much smaller encoder than gzip's, so `gzip` remains the default
-/// choice for published artifacts.
+/// How the raw bytes are encoded on the way out. `zstd` emits a standard
+/// zstd stream and also backs COSI output. `gzip` remains the default choice
+/// for published artifacts because it is the most widely supported option.
 pub const Compression = enum {
     none,
     gzip,
@@ -165,7 +164,7 @@ pub const SpecError = error{
     /// after the data), `vhdx` (BAT), and `qcow2` (L1/L2 and refcount
     /// tables) all require.
     FormatRequiresSeekableOutput,
-    /// The in-tree zstd encoder has a single fixed strategy, so there is no
+    /// Zstd output uses one pinned deterministic parameter set, so there is no
     /// level to select. Rejected rather than silently ignored.
     CompressionLevelNotSupportedForZstd,
 } || LevelError;
@@ -346,7 +345,10 @@ const Sink = struct {
                 allocator.destroy(gzip.compressor);
                 allocator.free(gzip.history);
             },
-            .zstd => |zstd_state| allocator.free(zstd_state.block),
+            .zstd => |*zstd_state| {
+                zstd_state.encoder.deinit();
+                allocator.free(zstd_state.block);
+            },
         }
         self.* = undefined;
     }

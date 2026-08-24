@@ -815,6 +815,43 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertNotIn("mirrors.kernel.org/sourceware/bzip2", manifest)
         self.assertFalse((ROOT / "vendor/zig-bzip2").exists())
 
+    def test_build_manifest_dependencies_are_git_pinned(self):
+        manifest = (ROOT / "build.zig.zon").read_text()
+        dependencies = re.findall(
+            r'\.([a-z0-9_]+)\s*=\s*\.\{\s*'
+            r'\.url\s*=\s*"(git\+https://[^"#]+(?:\.git)?#([0-9a-f]{40}))",\s*'
+            r'\.hash\s*=\s*"([^"]+)"',
+            manifest,
+            re.S,
+        )
+        self.assertEqual(
+            {name for name, _, _, _ in dependencies},
+            {"bzip2z", "tls", "debz", "rpmz", "zstd"},
+        )
+        self.assertEqual(len(dependencies), 5)
+        for name, _, _, hash_value in dependencies:
+            self.assertTrue(hash_value.startswith(f"{name}-"), hash_value)
+        by_name = {
+            name: (url, commit, hash_value)
+            for name, url, commit, hash_value in dependencies
+        }
+        self.assertEqual(
+            by_name["zstd"][0],
+            "git+https://github.com/cataggar/zstd"
+            "#45b6dfcd9d0ffdba99fb653c66b233179b9f7229",
+        )
+
+        build = (ROOT / "build.zig").read_text()
+        zstd_dependency = build.split("fn zstdDependency(", 1)[1].split(
+            "\n}\n", 1
+        )[0]
+        for option in (
+            ".tools = false",
+            ".shared = false",
+            ".multithread = false",
+        ):
+            self.assertIn(option, zstd_dependency)
+
     def test_azure_acceptance_allows_arm64_without_temporary_resource_disk(self):
         script = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()
         self.assertIn('restriction.get("type") == "Location"', script)
@@ -1050,6 +1087,51 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertEqual(headings, ["# vmiz", "## Install", "## Documentation"])
         self.assertLess(len(readme.splitlines()), 60)
         self.assertIn("[Documentation index](doc/readme.md)", readme)
+
+    def test_getting_started_documents_linked_zstd_requirements(self):
+        guide = (ROOT / "doc/getting-started.md").read_text()
+        self.assertIn(
+            "`zig build` compiles the pinned static libzstd dependency",
+            guide,
+        )
+        self.assertIn(
+            "`zig build test` additionally requires the `zstd` CLI",
+            guide,
+        )
+        self.assertIn(
+            "no system libzstd development package is needed",
+            guide,
+        )
+        self.assertIn(
+            "sudo apt-get install -y --no-install-recommends "
+            "zstd",
+            guide,
+        )
+
+    def test_zstd_docs_and_comments_avoid_private_subset_wording(self):
+        development = (ROOT / "doc/development.md").read_text()
+        self.assertIn(
+            "zstd.zig               # zstd support shared by COSI, SquashFS,",
+            development,
+        )
+        self.assertIn("and streaming raw.zst output", development)
+        self.assertNotIn("minimal private raw-block zstd codec", development)
+
+        package_family = (ROOT / "doc/debian-package-family.md").read_text()
+        self.assertIn("pinned static\nlibzstd dependency", package_family)
+        self.assertIn(
+            "debz's\nliblzma/libzstd dependencies",
+            package_family,
+        )
+
+        cosi = (ROOT / "packages/vmiz/src/cosi.zig").read_text()
+        self.assertIn("standard `.raw.zst` members", cosi)
+        self.assertNotIn("small built-in encoder", cosi)
+
+        output = (ROOT / "packages/vmiz/src/output.zig").read_text()
+        self.assertIn("`zstd` emits a standard", output)
+        self.assertNotIn("in-tree\n/// encoder", output)
+        self.assertNotIn("much smaller encoder", output)
 
     def test_cli_release_packages_documentation(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
