@@ -908,9 +908,9 @@ fn acquire(
     offline: bool,
 ) !void {
     if (offline) {
-        const stat = Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound => return error.OfflineInputMissing,
-            else => return err,
+        const stat = Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| return switch (err) {
+            error.FileNotFound => error.OfflineInputMissing,
+            else => err,
         };
         if (stat.kind != .file) return error.OfflineInputNotRegularFile;
         if (stat.size == 0 or stat.size > max_size) return error.OfflineInputSizeInvalid;
@@ -934,9 +934,9 @@ fn copyExactLockInput(
     source: []const u8,
     destination: []const u8,
 ) !void {
-    const stat = Dir.cwd().statFile(io, source, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return error.DebzExactLockMissing,
-        else => return err,
+    const stat = Dir.cwd().statFile(io, source, .{ .follow_symlinks = false }) catch |err| return switch (err) {
+        error.FileNotFound => error.DebzExactLockMissing,
+        else => err,
     };
     if (stat.kind != .file) return error.DebzExactLockNotRegularFile;
     if (stat.size == 0 or stat.size > exact_lock_max_size)
@@ -2711,9 +2711,9 @@ fn customizeRootWithDebz(
         try std.fs.path.join(allocator, &.{ work_dir, "debz-cache" });
     defer allocator.free(shared_cache);
     if (offline) {
-        const cache_stat = Dir.cwd().statFile(io, shared_cache, .{ .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound => return error.DebzOfflineCacheMissing,
-            else => return err,
+        const cache_stat = Dir.cwd().statFile(io, shared_cache, .{ .follow_symlinks = false }) catch |err| return switch (err) {
+            error.FileNotFound => error.DebzOfflineCacheMissing,
+            else => err,
         };
         if (cache_stat.kind != .directory) return error.DebzOfflineCacheNotDirectory;
     } else {
