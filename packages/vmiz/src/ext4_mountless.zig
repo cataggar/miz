@@ -1028,7 +1028,10 @@ pub const FileSystem = struct {
             else
                 try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ relative, entry.name });
             errdefer self.allocator.free(child);
-            if (excludedTopLevel(child, options.excluded_top_level)) continue;
+            if (excludedTopLevel(child, options.excluded_top_level)) {
+                self.allocator.free(child);
+                continue;
+            }
             try seen.put(try self.allocator.dupe(u8, child), {});
             const child_host = try std.fs.path.join(self.allocator, &.{ host_path, entry.name });
             defer self.allocator.free(child_host);
@@ -1882,6 +1885,61 @@ test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
         Io.Dir.cwd().deleteTree(io, recovery_path) catch {};
         allocator.free(recovery_path);
     }
+}
+
+test "importHostTree frees excluded top-level directory names (#455)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const image_path = "test-ext4-import-excluded.raw";
+    const spool_path = "test-ext4-import-excluded.spool";
+    const host_tree_path = "test-ext4-import-excluded-host";
+    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, host_tree_path) catch {};
+
+    var image = try @import("image.zig").Image.createExclusive(
+        io,
+        image_path,
+        .raw,
+        32 * 1024 * 1024,
+        .{},
+    );
+    defer image.close(io);
+    var source_tree = root_tree.RootTree.initMemory(allocator, io, .{});
+    defer source_tree.deinit();
+    try source_tree.putDirectory("etc", .{ .mode = 0o755 });
+    try source_tree.putFileBytes("etc/hostname", "old", .{ .mode = 0o644 });
+    _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
+        .length = 32 * 1024 * 1024,
+        .label = "mountless",
+        .uuid = [_]u8{0x52} ** 16,
+    });
+    var fs = try FileSystem.open(allocator, io, image.file, .{
+        .length = 32 * 1024 * 1024,
+        .spool_path = spool_path,
+        .atomic_path = image_path,
+    });
+    defer fs.deinit();
+
+    // A production root carries the runtime mount points dev/proc/run/sys as
+    // top-level directories. Importing them exercises the early `continue` that
+    // skips excluded entries; std.testing.allocator fails this test if that path
+    // leaks the duplicated entry name, as it did before #455.
+    for ([_][]const u8{ "etc", "dev", "proc", "run", "sys" }) |dir| {
+        const path = try std.fs.path.join(allocator, &.{ host_tree_path, dir });
+        defer allocator.free(path);
+        try Io.Dir.cwd().createDirPath(io, path);
+    }
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = host_tree_path ++ "/etc/hostname", .data = "new" });
+
+    try fs.importHostTree(host_tree_path, .{});
+
+    // The real file imported; the excluded runtime directories were skipped.
+    try std.testing.expectEqual(@as(u16, 0o644), (try fs.stat("/etc/hostname")).metadata.mode);
+    try std.testing.expectError(error.PathNotFound, fs.stat("/dev"));
+    try std.testing.expectError(error.PathNotFound, fs.stat("/proc"));
+    try std.testing.expectError(error.PathNotFound, fs.stat("/run"));
+    try std.testing.expectError(error.PathNotFound, fs.stat("/sys"));
 }
 
 test "exportHostTree preserves guest execute bits above the readable floor" {
