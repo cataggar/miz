@@ -351,6 +351,14 @@ pub const ResizeOptions = struct {
     length: u64,
 };
 
+pub const ResizePreflight = struct {
+    /// Identity and geometry of the filesystem before growth.
+    filesystem: FilesystemInfo,
+    existing_length: u64,
+    requested_length: u64,
+    uuid: [16]u8,
+};
+
 pub const FilesystemInfo = struct {
     block_count: u32,
     free_block_count: u32,
@@ -478,6 +486,8 @@ pub const ResizeError = PopulateError || OpenError || Io.File.ReadPositionalErro
     ResizeInodeNotSupported,
     FilesystemTooLarge,
 };
+
+pub const ResizePreflightError = ResizeError || error{GrowthNotRequested};
 
 const OwnedEntry = struct {
     path: []u8,
@@ -1511,6 +1521,75 @@ fn buildOrphanFileNode(
 /// stock distro layouts use the preservation path below, which leaves
 /// existing metadata and file extents in place.
 pub fn resize(io: Io, file: Io.File, allocator: std.mem.Allocator, options: ResizeOptions) ResizeError!FilesystemInfo {
+    return (try resizeImpl(io, file, allocator, options, true)).grown;
+}
+
+/// Validate an ext4 growth operation without changing the file. This follows
+/// the same parsing, feature checks, geometry planning, and metadata reads as
+/// `resize`, including validation of legacy resize-inode mappings.
+pub fn preflightResize(
+    io: Io,
+    file: Io.File,
+    allocator: std.mem.Allocator,
+    options: ResizeOptions,
+) ResizePreflightError!ResizePreflight {
+    const result = try resizeImpl(io, file, allocator, options, false);
+    if (options.length == result.existing_length) return error.GrowthNotRequested;
+    return .{
+        .filesystem = result.existing,
+        .existing_length = result.existing_length,
+        .requested_length = options.length,
+        .uuid = result.uuid,
+    };
+}
+
+const ResizeResult = struct {
+    grown: FilesystemInfo,
+    existing: FilesystemInfo,
+    existing_length: u64,
+    uuid: [16]u8,
+};
+
+fn filesystemInfoFromSuperblock(
+    sb: [superblock_size]u8,
+    compat: u32,
+    incompat: u32,
+    ro_compat: u32,
+) error{FilesystemTooLarge}!FilesystemInfo {
+    const total_blocks = @as(u64, readInt(u32, sb[0x04..0x08])) +
+        if (incompat & feature_incompat_64bit != 0)
+            (@as(u64, readInt(u32, sb[0x150..0x154])) << 32)
+        else
+            0;
+    const block_count = std.math.cast(u32, total_blocks) orelse
+        return error.FilesystemTooLarge;
+    return .{
+        .block_count = block_count,
+        .free_block_count = readInt(u32, sb[0x0C..0x10]),
+        .inode_count = readInt(u32, sb[0x00..0x04]),
+        .free_inode_count = readInt(u32, sb[0x10..0x14]),
+        .group_count = blocksToGroups(block_count, readInt(u32, sb[0x20..0x24])),
+        .feature_compat = compat,
+        .feature_incompat = incompat,
+        .feature_ro_compat = ro_compat,
+        .journal_block_count = if (compat & feature_compat_has_journal != 0)
+            blocksForBytes(
+                (@as(u64, readInt(u32, sb[0x148..0x14C])) << 32) |
+                    readInt(u32, sb[0x14C..0x150]),
+                default_block_size,
+            )
+        else
+            0,
+    };
+}
+
+fn resizeImpl(
+    io: Io,
+    file: Io.File,
+    allocator: std.mem.Allocator,
+    options: ResizeOptions,
+    mutate: bool,
+) ResizeError!ResizeResult {
     if (options.length == 0 or options.length % default_block_size != 0) return error.InvalidRange;
 
     var sb: [superblock_size]u8 = undefined;
@@ -1526,8 +1605,11 @@ pub fn resize(io: Io, file: Io.File, allocator: std.mem.Allocator, options: Resi
         const raw = readInt(u16, sb[0xFE..0x100]);
         break :blk if (raw == 0) @as(u16, 32) else raw;
     };
-    const old_length = @as(u64, readInt(u32, sb[0x04..0x08])) *
-        (@as(u64, 1024) << @intCast(readInt(u32, sb[0x18..0x1C])));
+    var uuid: [16]u8 = undefined;
+    @memcpy(&uuid, sb[0x68..0x78]);
+    const existing = filesystemInfoFromSuperblock(sb, compat, incompat, ro_compat) catch
+        return error.FilesystemTooLarge;
+    const old_length = @as(u64, existing.block_count) * default_block_size;
     if (ro_compat & feature_ro_compat_sparse_super == 0 and
         options.length > old_length)
     {
@@ -1537,7 +1619,24 @@ pub fn resize(io: Io, file: Io.File, allocator: std.mem.Allocator, options: Resi
         incompat & (feature_incompat_64bit | feature_incompat_flex_bg | feature_incompat_csum_seed) != 0 or
         compat & feature_compat_resize_inode != 0)
     {
-        return resizeGeneral(io, file, allocator, options, sb, compat, incompat, ro_compat, descriptor_size);
+        const grown = try resizeGeneral(
+            io,
+            file,
+            allocator,
+            options,
+            sb,
+            compat,
+            incompat,
+            ro_compat,
+            descriptor_size,
+            mutate,
+        );
+        return .{
+            .grown = grown,
+            .existing = existing,
+            .existing_length = old_length,
+            .uuid = uuid,
+        };
     }
     if (compat & ~(writer_feature_compat | feature_compat_has_journal) != 0) return error.UnsupportedFeatures;
     // A journal needs nothing special here. Its inode and its blocks live
@@ -1566,15 +1665,10 @@ pub fn resize(io: Io, file: Io.File, allocator: std.mem.Allocator, options: Resi
     if (new_total_blocks < old_total_blocks) return error.ShrinkNotSupported;
     if (new_total_blocks == old_total_blocks) {
         return .{
-            .block_count = old_total_blocks,
-            .free_block_count = readInt(u32, sb[0x0C..0x10]),
-            .inode_count = readInt(u32, sb[0x00..0x04]),
-            .free_inode_count = readInt(u32, sb[0x10..0x14]),
-            .group_count = blocksToGroups(old_total_blocks, readInt(u32, sb[0x20..0x24])),
-            .feature_compat = compat,
-            .feature_incompat = incompat,
-            .feature_ro_compat = ro_compat,
-            .journal_block_count = journal_block_count,
+            .grown = existing,
+            .existing = existing,
+            .existing_length = old_length,
+            .uuid = uuid,
         };
     }
 
@@ -1620,9 +1714,11 @@ pub fn resize(io: Io, file: Io.File, allocator: std.mem.Allocator, options: Resi
     }
 
     const stat = try file.stat(io);
-    if (stat.size < options.offset + options.length) try file.setLength(io, options.offset + options.length);
+    if (mutate and stat.size < options.offset + options.length) {
+        try file.setLength(io, options.offset + options.length);
+    }
 
-    if (new_group_count > old_group_count) {
+    if (mutate and new_group_count > old_group_count) {
         var group_index = old_group_count;
         while (group_index < new_group_count) : (group_index += 1) {
             var zero_block: [default_block_size]u8 = [_]u8{0} ** default_block_size;
@@ -1633,14 +1729,14 @@ pub fn resize(io: Io, file: Io.File, allocator: std.mem.Allocator, options: Resi
         }
     }
 
-    try writeBitmaps(io, file, new_layout, options.offset, &.{}, &.{});
+    if (mutate) try writeBitmaps(io, file, new_layout, options.offset, &.{}, &.{});
 
-    var uuid: [16]u8 = undefined;
-    @memcpy(&uuid, sb[0x68..0x78]);
-    try writeGroupDescriptorTables(io, file, new_layout, options.offset, .{
-        .length = 0,
-        .uuid = uuid,
-    }, &.{}, &.{});
+    if (mutate) {
+        try writeGroupDescriptorTables(io, file, new_layout, options.offset, .{
+            .length = 0,
+            .uuid = uuid,
+        }, &.{}, &.{});
+    }
 
     writeInt(u32, sb[0x00..0x04], new_group_count * inodes_per_group);
     writeInt(u32, sb[0x04..0x08], new_total_blocks);
@@ -1651,24 +1747,31 @@ pub fn resize(io: Io, file: Io.File, allocator: std.mem.Allocator, options: Resi
     writeInt(u32, sb[0x28..0x2C], inodes_per_group);
     writeInt(u16, sb[0x5A..0x5C], 0);
     setSuperblockChecksum(&sb);
-    try file.writePositionalAll(io, &sb, options.offset + superblock_offset);
-    for (new_layout.groups) |group| {
-        if (group.index == 0 or !group.has_super_copy) continue;
-        writeInt(u16, sb[0x5A..0x5C], @intCast(group.index));
-        setSuperblockChecksum(&sb);
-        try file.writePositionalAll(io, &sb, options.offset + group.start_block * default_block_size);
+    if (mutate) {
+        try file.writePositionalAll(io, &sb, options.offset + superblock_offset);
+        for (new_layout.groups) |group| {
+            if (group.index == 0 or !group.has_super_copy) continue;
+            writeInt(u16, sb[0x5A..0x5C], @intCast(group.index));
+            setSuperblockChecksum(&sb);
+            try file.writePositionalAll(io, &sb, options.offset + group.start_block * default_block_size);
+        }
     }
 
     return .{
-        .block_count = new_total_blocks,
-        .free_block_count = countFreeBlocks(new_layout.groups),
-        .inode_count = new_group_count * inodes_per_group,
-        .free_inode_count = countFreeInodes(new_layout.groups, inodes_per_group),
-        .group_count = new_group_count,
-        .feature_compat = compat,
-        .feature_incompat = incompat,
-        .feature_ro_compat = ro_compat,
-        .journal_block_count = journal_block_count,
+        .grown = .{
+            .block_count = new_total_blocks,
+            .free_block_count = countFreeBlocks(new_layout.groups),
+            .inode_count = new_group_count * inodes_per_group,
+            .free_inode_count = countFreeInodes(new_layout.groups, inodes_per_group),
+            .group_count = new_group_count,
+            .feature_compat = compat,
+            .feature_incompat = incompat,
+            .feature_ro_compat = ro_compat,
+            .journal_block_count = journal_block_count,
+        },
+        .existing = existing,
+        .existing_length = old_length,
+        .uuid = uuid,
     };
 }
 
@@ -1687,6 +1790,7 @@ fn resizeGeneral(
     incompat: u32,
     ro_compat: u32,
     descriptor_size: u16,
+    mutate: bool,
 ) ResizeError!FilesystemInfo {
     if (options.length == 0 or options.length % default_block_size != 0) return error.InvalidRange;
     if (readInt(u16, sb[0x38..0x3A]) != super_magic) return error.BadMagic;
@@ -1720,27 +1824,11 @@ fn resizeGeneral(
         return error.FilesystemTooLarge;
     if (new_total_blocks < old_total_blocks) return error.ShrinkNotSupported;
     if (new_total_blocks == old_total_blocks) {
-        return .{
-            .block_count = @intCast(old_total_blocks),
-            .free_block_count = readInt(u32, sb[0x0C..0x10]),
-            .inode_count = readInt(u32, sb[0x00..0x04]),
-            .free_inode_count = readInt(u32, sb[0x10..0x14]),
-            .group_count = blocksToGroups(@intCast(old_total_blocks), readInt(u32, sb[0x20..0x24])),
-            .feature_compat = compat,
-            .feature_incompat = incompat,
-            .feature_ro_compat = ro_compat,
-            .journal_block_count = if (compat & feature_compat_has_journal != 0)
-                blocksForBytes(
-                    (@as(u64, readInt(u32, sb[0x148..0x14C])) << 32) |
-                        readInt(u32, sb[0x14C..0x150]),
-                    default_block_size,
-                )
-            else
-                0,
-        };
+        return filesystemInfoFromSuperblock(sb, compat, incompat, ro_compat) catch
+            return error.FilesystemTooLarge;
     }
     const current_stat = try file.stat(io);
-    if (current_stat.size < options.offset + options.length) {
+    if (mutate and current_stat.size < options.offset + options.length) {
         try file.setLength(io, options.offset + options.length);
     }
 
@@ -1903,11 +1991,13 @@ fn resizeGeneral(
         while (bit < end_new_bit) : (bit += 1) clearBitmapBit(&bitmap, bit);
         bit = end_new_bit;
         while (bit < default_block_size * 8) : (bit += 1) setBitmapBit(&bitmap, bit);
-        try file.writePositionalAll(
-            io,
-            &bitmap,
-            options.offset + @as(u64, block_bitmap) * default_block_size,
-        );
+        if (mutate) {
+            try file.writePositionalAll(
+                io,
+                &bitmap,
+                options.offset + @as(u64, block_bitmap) * default_block_size,
+            );
+        }
         const added = extended_last_end - old_total_blocks;
         free_blocks += added;
         const old_free_blocks = @as(u32, readInt(u16, descriptor[0x0C..0x0E])) +
@@ -1969,21 +2059,27 @@ fn resizeGeneral(
         while (bit < metadata_blocks) : (bit += 1) setBitmapBit(&block_bitmap_bytes, bit);
         bit = group_block_count;
         while (bit < default_block_size * 8) : (bit += 1) setBitmapBit(&block_bitmap_bytes, bit);
-        try file.writePositionalAll(io, &block_bitmap_bytes, options.offset + block_bitmap * default_block_size);
+        if (mutate) {
+            try file.writePositionalAll(io, &block_bitmap_bytes, options.offset + block_bitmap * default_block_size);
+        }
 
         var inode_bitmap_bytes: [default_block_size]u8 = [_]u8{0} ** default_block_size;
         bit = inodes_per_group;
         while (bit < default_block_size * 8) : (bit += 1) setBitmapBit(&inode_bitmap_bytes, bit);
-        try file.writePositionalAll(io, &inode_bitmap_bytes, options.offset + inode_bitmap * default_block_size);
+        if (mutate) {
+            try file.writePositionalAll(io, &inode_bitmap_bytes, options.offset + inode_bitmap * default_block_size);
+        }
 
         const zero_block: [default_block_size]u8 = [_]u8{0} ** default_block_size;
-        var table_block: u32 = 0;
-        while (table_block < inode_table_blocks) : (table_block += 1) {
-            try file.writePositionalAll(
-                io,
-                &zero_block,
-                options.offset + (inode_table + table_block) * default_block_size,
-            );
+        if (mutate) {
+            var table_block: u32 = 0;
+            while (table_block < inode_table_blocks) : (table_block += 1) {
+                try file.writePositionalAll(
+                    io,
+                    &zero_block,
+                    options.offset + (inode_table + table_block) * default_block_size,
+                );
+            }
         }
 
         const base = @as(usize, group_index) * descriptor_size_usize;
@@ -2011,15 +2107,17 @@ fn resizeGeneral(
         free_inodes += inodes_per_group;
     }
 
-    try file.writePositionalAll(io, gdt, options.offset + default_block_size);
     var group: u32 = 1;
-    while (group < new_group_count) : (group += 1) {
-        if (!isSparseSuperGroup(group)) continue;
-        try file.writePositionalAll(
-            io,
-            gdt,
-            options.offset + (@as(u64, group) * blocks_per_group + 1) * default_block_size,
-        );
+    if (mutate) {
+        try file.writePositionalAll(io, gdt, options.offset + default_block_size);
+        while (group < new_group_count) : (group += 1) {
+            if (!isSparseSuperGroup(group)) continue;
+            try file.writePositionalAll(
+                io,
+                gdt,
+                options.offset + (@as(u64, group) * blocks_per_group + 1) * default_block_size,
+            );
+        }
     }
 
     var updated_sb = sb;
@@ -2034,48 +2132,52 @@ fn resizeGeneral(
     writeInt(u16, updated_sb[0xCE..0xD0], @intCast(reserved_gdt_blocks));
     writeInt(u16, updated_sb[0x5A..0x5C], 0);
     setSuperblockChecksum(&updated_sb);
-    try file.writePositionalAll(io, &updated_sb, options.offset + superblock_offset);
-    group = 1;
-    while (group < new_group_count) : (group += 1) {
-        if (!isSparseSuperGroup(group)) continue;
-        var backup_sb = updated_sb;
-        writeInt(u16, backup_sb[0x5A..0x5C], @intCast(group));
-        setSuperblockChecksum(&backup_sb);
-        try file.writePositionalAll(
-            io,
-            &backup_sb,
-            options.offset + @as(u64, group) * blocks_per_group * default_block_size,
-        );
+    if (mutate) {
+        try file.writePositionalAll(io, &updated_sb, options.offset + superblock_offset);
+        group = 1;
+        while (group < new_group_count) : (group += 1) {
+            if (!isSparseSuperGroup(group)) continue;
+            var backup_sb = updated_sb;
+            writeInt(u16, backup_sb[0x5A..0x5C], @intCast(group));
+            setSuperblockChecksum(&backup_sb);
+            try file.writePositionalAll(
+                io,
+                &backup_sb,
+                options.offset + @as(u64, group) * blocks_per_group * default_block_size,
+            );
+        }
     }
-    if (resize_inode_bytes) |bytes| {
-        const group_zero = gdt[0..descriptor_size_usize];
-        const inode_table_block = ext4DescriptorBlock(
-            group_zero,
-            descriptor_size,
-            incompat,
-            2,
-        );
-        const inode_offset = options.offset +
-            inode_table_block * default_block_size +
-            (resize_inode - 1) * inode_size;
-        try file.writePositionalAll(io, bytes, inode_offset);
-        const dindir_block = std.mem.readInt(u32, bytes[40 + 13 * 4 ..][0..4], .little);
-        try file.writePositionalAll(
-            io,
-            resize_inode_dindir_bytes.?,
-            options.offset + @as(u64, dindir_block) * default_block_size,
-        );
-        if (resize_inode_reserved_bytes) |reserved_bytes| {
-            var index: usize = 0;
-            while (index < reserved_bytes.len / default_block_size) : (index += 1) {
-                const block = @as(u64, new_gdt_blocks) +
-                    @as(u64, index) +
-                    readInt(u32, sb[0x14..0x18]) + 1;
-                try file.writePositionalAll(
-                    io,
-                    reserved_bytes[index * default_block_size ..][0..default_block_size],
-                    options.offset + block * default_block_size,
-                );
+    if (mutate) {
+        if (resize_inode_bytes) |bytes| {
+            const group_zero = gdt[0..descriptor_size_usize];
+            const inode_table_block = ext4DescriptorBlock(
+                group_zero,
+                descriptor_size,
+                incompat,
+                2,
+            );
+            const inode_offset = options.offset +
+                inode_table_block * default_block_size +
+                (resize_inode - 1) * inode_size;
+            try file.writePositionalAll(io, bytes, inode_offset);
+            const dindir_block = std.mem.readInt(u32, bytes[40 + 13 * 4 ..][0..4], .little);
+            try file.writePositionalAll(
+                io,
+                resize_inode_dindir_bytes.?,
+                options.offset + @as(u64, dindir_block) * default_block_size,
+            );
+            if (resize_inode_reserved_bytes) |reserved_bytes| {
+                var index: usize = 0;
+                while (index < reserved_bytes.len / default_block_size) : (index += 1) {
+                    const block = @as(u64, new_gdt_blocks) +
+                        @as(u64, index) +
+                        readInt(u32, sb[0x14..0x18]) + 1;
+                    try file.writePositionalAll(
+                        io,
+                        reserved_bytes[index * default_block_size ..][0..default_block_size],
+                        options.offset + block * default_block_size,
+                    );
+                }
             }
         }
     }
@@ -9788,7 +9890,14 @@ test "a real e2fsprogs pinned profile survives import and native growth" {
     try std.testing.expectEqual(@as(usize, 1), imported.nodeCount());
     try expectE2fsckClean(path);
 
-    _ = try resize(io, file, std.testing.allocator, .{ .length = 9 * 1024 * 1024 * 1024 });
+    const grown_length: u64 = 9 * 1024 * 1024 * 1024;
+    const preflight = try preflightResize(io, file, std.testing.allocator, .{ .length = grown_length });
+    try std.testing.expectEqual(length, preflight.existing_length);
+    try std.testing.expectEqual(grown_length, preflight.requested_length);
+    try std.testing.expectEqual(raw_compat, preflight.filesystem.feature_compat);
+    try std.testing.expectEqual(raw_incompat, preflight.filesystem.feature_incompat);
+    try std.testing.expectEqual(raw_ro_compat, preflight.filesystem.feature_ro_compat);
+    _ = try resize(io, file, std.testing.allocator, .{ .length = grown_length });
     try expectE2fsckClean(path);
 }
 
@@ -11969,6 +12078,18 @@ test "resize grows a journalled filesystem and leaves its journal intact" {
             .journal = .{ .enabled = true },
         });
 
+        const before = try file.stat(io);
+        const fingerprint_before = try testFileFingerprint(io, file);
+        const preflight = try preflightResize(io, file, std.testing.allocator, .{ .length = grown_size });
+        const after_preflight = try file.stat(io);
+        try std.testing.expectEqual(before.size, after_preflight.size);
+        try std.testing.expectEqual(fingerprint_before, try testFileFingerprint(io, file));
+        try std.testing.expectEqual(original_size, preflight.existing_length);
+        try std.testing.expectEqual(grown_size, preflight.requested_length);
+        try std.testing.expectEqual(journal_test_uuid, preflight.uuid);
+        try std.testing.expectEqual(@as(u32, original_size / default_block_size), preflight.filesystem.block_count);
+        try std.testing.expectEqual(@as(u32, 1024), preflight.filesystem.journal_block_count);
+
         const grown = try resize(io, file, std.testing.allocator, .{ .length = grown_size });
         try std.testing.expectEqual(@as(u32, grown_size / default_block_size), grown.block_count);
         try std.testing.expectEqual(
@@ -11990,6 +12111,90 @@ test "resize grows a journalled filesystem and leaves its journal intact" {
     const hostname = try reader.readFileAlloc(io, std.testing.allocator, "etc/hostname");
     defer std.testing.allocator.free(hostname);
     try std.testing.expectEqualSlices(u8, "vmiz-test\n", hostname);
+}
+
+fn testFileFingerprint(io: Io, file: Io.File) !u64 {
+    const stat = try file.stat(io);
+    var hash = std.hash.Wyhash.init(0);
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < stat.size) {
+        const length: usize = @intCast(@min(buffer.len, stat.size - offset));
+        _ = try file.readPositionalAll(io, buffer[0..length], offset);
+        hash.update(buffer[0..length]);
+        offset += length;
+    }
+    return hash.final();
+}
+
+test "resize preflight reports explicit range and format errors" {
+    const io = std.testing.io;
+    const path = "test-ext4-resize-preflight-errors.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = journalTestTree();
+    tree.bind();
+    const length: u64 = 64 * 1024 * 1024;
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = length,
+        .uuid = journal_test_uuid,
+    });
+
+    try std.testing.expectError(
+        error.InvalidRange,
+        preflightResize(io, file, std.testing.allocator, .{ .length = length + 1 }),
+    );
+    try std.testing.expectError(
+        error.ShrinkNotSupported,
+        preflightResize(io, file, std.testing.allocator, .{ .length = length - default_block_size }),
+    );
+    try std.testing.expectError(
+        error.GrowthNotRequested,
+        preflightResize(io, file, std.testing.allocator, .{ .length = length }),
+    );
+
+    var sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &sb, superblock_offset);
+    writeInt(u16, sb[0x38..0x3A], 0);
+    try file.writePositionalAll(io, &sb, superblock_offset);
+    try std.testing.expectError(
+        error.BadMagic,
+        preflightResize(io, file, std.testing.allocator, .{ .length = 2 * length }),
+    );
+}
+
+test "resize preflight rejects unsupported profiles without mutation" {
+    const io = std.testing.io;
+    const path = "test-ext4-resize-preflight-unsupported.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var tree = journalTestTree();
+    tree.bind();
+    const length: u64 = 64 * 1024 * 1024;
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{
+        .length = length,
+        .uuid = journal_test_uuid,
+    });
+
+    var sb: [superblock_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &sb, superblock_offset);
+    writeInt(u32, sb[0x60..0x64], readInt(u32, sb[0x60..0x64]) | 0x8000_0000);
+    setSuperblockChecksum(&sb);
+    try file.writePositionalAll(io, &sb, superblock_offset);
+
+    const stat_before = try file.stat(io);
+    const fingerprint_before = try testFileFingerprint(io, file);
+    try std.testing.expectError(
+        error.UnsupportedFeatures,
+        preflightResize(io, file, std.testing.allocator, .{ .length = 4 * length }),
+    );
+    const stat_after = try file.stat(io);
+    try std.testing.expectEqual(stat_before.size, stat_after.size);
+    try std.testing.expectEqual(fingerprint_before, try testFileFingerprint(io, file));
 }
 
 test "resize supports a resize_inode filesystem without moving its data" {
@@ -12036,6 +12241,16 @@ test "resize rejects non-sparse-super growth before mutation" {
     writeInt(u32, sb[0x64..0x68], readInt(u32, sb[0x64..0x68]) & ~feature_ro_compat_sparse_super);
     setSuperblockChecksum(&sb);
     try file.writePositionalAll(io, &sb, superblock_offset);
+
+    const stat_before = try file.stat(io);
+    const fingerprint_before = try testFileFingerprint(io, file);
+    try std.testing.expectError(
+        error.UnsupportedResizeLayout,
+        preflightResize(io, file, std.testing.allocator, .{ .length = 256 * 1024 * 1024 }),
+    );
+    const stat_after = try file.stat(io);
+    try std.testing.expectEqual(stat_before.size, stat_after.size);
+    try std.testing.expectEqual(fingerprint_before, try testFileFingerprint(io, file));
 
     try std.testing.expectError(
         error.UnsupportedResizeLayout,
