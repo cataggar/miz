@@ -84,7 +84,7 @@ pub const Inputs = struct {
     allow_downgrade: bool = false,
     conffile: ConffilePolicy = .keep_existing,
     installed_baseline: InstalledBaselinePolicy = .none,
-    deadline_ms: u64 = 300_000,
+    deadline_ms: ?u64 = null,
     lock_wait_ms: u64 = 30_000,
     rpm: ?RpmOptions = null,
 };
@@ -476,7 +476,8 @@ fn invalidRequestMessage(request: Request) ?[]const u8 {
     if (request.inputs.credential_reference) |path|
         if (!absolute(path) or overlaps(request.inputs.root_stage, path))
             return "credential reference must be absolute and outside staging";
-    if (request.inputs.deadline_ms == 0) return "package-family deadline must be nonzero";
+    if (request.inputs.deadline_ms != null and request.inputs.deadline_ms.? == 0)
+        return "package-family deadline must be nonzero";
     return null;
 }
 

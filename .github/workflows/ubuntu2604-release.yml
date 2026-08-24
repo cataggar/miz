@@ -12,7 +12,7 @@
 # Before dispatch, create or retarget RELEASE_TAG to the exact current `main`
 # commit. The workflow accepts lightweight or annotated tags and publishes
 # exactly the two QCOW2 assets declared below.
-name: Build, validate, and publish Ubuntu 26.04 images
+name: Publish Ubuntu 26.04 images
 
 on:
   workflow_dispatch:

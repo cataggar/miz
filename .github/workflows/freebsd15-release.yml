@@ -1,4 +1,4 @@
-name: Build, validate, and publish FreeBSD 15.1 images
+name: Publish FreeBSD 15.1 images
 
 on:
   workflow_dispatch:
