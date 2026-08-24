@@ -47,6 +47,7 @@ vmiz convert -O raw.gz -o - disk.qcow2 - | ssh host 'cat > disk.raw.gz'
 vmiz write --allow-device-write image.qcow2 <block-device>  # Linux: preflight, confirm, write, flush, refresh partitions
 vmiz write --allow-device-write --yes image.vhdx <block-device>  # non-interactive acknowledgement
 vmiz write --allow-device-write --grow-root image.raw <block-device>  # also grow GPT root + ext4 offline
+vmiz write --allow-device-write --expect-serial <serial> image.raw <block-device>  # require the writable disk's exact sysfs serial
 vmiz resize disk.vhdx +4G
 vmiz resize disk.vhd +4G
 vmiz check disk.vhd
@@ -84,11 +85,17 @@ block device. It accepts raw, VHD, VHDX, and qcow2 sources without first
 materializing a temporary raw file. The command requires
 `--allow-device-write`, checks size, mounts, holders, and the running root
 before opening the destination writable, inventories what is already on the
-target, writes source zero regions explicitly, flushes the device, and uses
-the native Linux partition-table refresh ioctl. A refresh failure is reported
-as partial success with exit status 2 because the bytes are durable but the
-kernel view is stale. `vmiz convert` and `Image.create` continue to refuse
-device destinations.
+target, and prints the supplied path with the resolved whole-disk serial (or
+clearly reports that no serial is available). `--expect-serial <serial>`
+requires an exact match after the destination is opened writable and before
+any invalidation or copy. Identity is resolved from the opened descriptor's
+major/minor through sysfs; partition destinations use their containing whole
+disk's serial. Devices without serials remain writable when the option is not
+used. The command writes source zero regions explicitly, flushes the device,
+and uses the native Linux partition-table refresh ioctl. A refresh failure is
+reported as partial success with exit status 2 because the bytes are durable
+but the kernel view is stale. `vmiz convert` and `Image.create` continue to
+refuse device destinations.
 
 With `--grow-root`, `vmiz write` additionally requires a strictly valid GPT
 raw source with exactly one supported ext4 root partition, and requires that

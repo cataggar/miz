@@ -1,11 +1,11 @@
-//! `vmiz write --allow-device-write [--yes] [--grow-root] <source> <block-device>`
+//! `vmiz write --allow-device-write [--yes] [--grow-root] [--expect-serial <serial>] <source> <block-device>`
 
 const std = @import("std");
 const builtin = @import("builtin");
 const vmiz = @import("vmiz");
 
 const help_text =
-    \\usage: vmiz write --allow-device-write [--yes] [--grow-root] <source> <block-device>
+    \\usage: vmiz write --allow-device-write [--yes] [--grow-root] [--expect-serial <serial>] <source> <block-device>
     \\
     \\Writes a raw, VHD, VHDX, or qcow2 image directly to an existing Linux
     \\block device. The source format is detected automatically.
@@ -15,6 +15,9 @@ const help_text =
     \\  --yes                 Skip the final interactive confirmation.
     \\  --grow-root           Offline-grow the single supported GPT ext4 root
     \\                        in a raw source to fill the destination.
+    \\  --expect-serial <serial>
+    \\                        Require an exact match against the writable
+    \\                        destination's whole-disk sysfs serial.
     \\
     \\The command checks the target while it is read-only, refuses a target
     \\that is too small or in use, writes zero regions explicitly, flushes the
@@ -44,6 +47,7 @@ const Operations = struct {
         []const u8,
         u64,
         bool,
+        ?[]const u8,
     ) anyerror!vmiz.Image = openDestination,
     preflight_report_fn: *const fn (
         ?*anyopaque,
@@ -147,16 +151,28 @@ fn runWithOperations(
     var allow_device_write = false;
     var yes = false;
     var grow_root = false;
+    var expected_serial: ?[]const u8 = null;
     var positional: [2][]const u8 = undefined;
     var positional_count: usize = 0;
 
-    for (args) |arg| {
+    var arg_index: usize = 0;
+    while (arg_index < args.len) : (arg_index += 1) {
+        const arg = args[arg_index];
         if (std.mem.eql(u8, arg, "--allow-device-write")) {
             allow_device_write = true;
         } else if (std.mem.eql(u8, arg, "--yes")) {
             yes = true;
         } else if (std.mem.eql(u8, arg, "--grow-root")) {
             grow_root = true;
+        } else if (std.mem.eql(u8, arg, "--expect-serial")) {
+            arg_index += 1;
+            if (arg_index >= args.len or args[arg_index].len == 0) {
+                return fail(
+                    "write: --expect-serial requires a non-empty value\n\n{s}",
+                    .{help_text},
+                );
+            }
+            expected_serial = args[arg_index];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print("{s}", .{help_text});
             return 0;
@@ -195,7 +211,19 @@ fn runWithOperations(
         destination_path,
         source.virtual_size,
         allow_device_write,
+        expected_serial,
     ) catch |err| {
+        if (expected_serial) |expected| switch (err) {
+            error.DeviceSerialUnavailable => return fail(
+                "write: refused destination '{s}': whole-disk serial is unavailable; expected exact serial '{s}'",
+                .{ destination_path, expected },
+            ),
+            error.DeviceSerialMismatch => return fail(
+                "write: refused destination '{s}': writable whole-disk serial does not exactly match expected serial '{s}'",
+                .{ destination_path, expected },
+            ),
+            else => {},
+        };
         if (describeWriteFailure(err)) |message| {
             return fail("write: refused destination '{s}': {s}", .{ destination_path, message });
         }
@@ -538,9 +566,11 @@ fn openDestination(
     path: []const u8,
     source_virtual_size: u64,
     allow_device_write: bool,
+    expected_serial: ?[]const u8,
 ) anyerror!vmiz.Image {
     return vmiz.Image.openDeviceForWrite(io, path, source_virtual_size, .{
         .allow_device_write = allow_device_write,
+        .expected_serial = expected_serial,
         .allocator = allocator,
     });
 }
@@ -997,13 +1027,17 @@ fn formatPreflightReport(
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
     const writer = &out.writer;
+    try writer.print("write: destination preflight for '{s}':\n", .{destination_path});
+    if (report.whole_disk_serial) |serial| {
+        try writer.print("  stable identifier: whole-disk serial '{s}'\n", .{serial});
+    } else {
+        try writer.writeAll("  stable identifier: whole-disk serial unavailable\n");
+    }
     try writer.print(
-        "write: destination preflight for '{s}':\n" ++
-            "  kernel device: {s} (whole disk: {s})\n" ++
+        "  kernel device: {s} (whole disk: {s})\n" ++
             "  size: {d} bytes; logical sector: {d} bytes\n" ++
             "  removable: {s}; transport: {s}\n",
         .{
-            destination_path,
             report.target_name,
             report.whole_disk_name,
             report.geometry.size_bytes,
@@ -1217,6 +1251,7 @@ const FakeOperations = struct {
     durable_calls: usize = 0,
     finish_calls: usize = 0,
     allow_device_write_seen: bool = false,
+    expected_serial_seen: ?[]const u8 = null,
     real_pipeline: bool = false,
     events: [16]u8 = undefined,
     event_count: usize = 0,
@@ -1237,10 +1272,12 @@ const FakeOperations = struct {
         path: []const u8,
         _: u64,
         allow_device_write: bool,
+        expected_serial: ?[]const u8,
     ) anyerror!vmiz.Image {
         const self: *FakeOperations = @ptrCast(@alignCast(context.?));
         self.open_calls += 1;
         self.allow_device_write_seen = allow_device_write;
+        self.expected_serial_seen = expected_serial;
         if (self.open_error) |err| return err;
         return vmiz.Image.openPath(io, path);
     }
@@ -1472,6 +1509,7 @@ fn testReport() vmiz.DevicePreflightReport {
     return .{
         .target_name = @constCast("test-target"),
         .whole_disk_name = @constCast("test-disk"),
+        .whole_disk_serial = null,
         .geometry = .{ .size_bytes = 16 * 1024 * 1024, .logical_sector_size = 512 },
         .removable = true,
         .transport = .usb,
@@ -1584,6 +1622,60 @@ test "write requires explicit device-write opt-in before opening anything" {
         ),
     );
     try std.testing.expectEqual(@as(usize, 0), fake.open_calls);
+}
+
+test "write expect-serial parser rejects missing and empty values" {
+    var fake = FakeOperations{};
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        runWithOperations(
+            std.testing.allocator,
+            std.testing.io,
+            &.{ "--allow-device-write", "--expect-serial" },
+            fake.operations(),
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        runWithOperations(
+            std.testing.allocator,
+            std.testing.io,
+            &.{ "--allow-device-write", "--expect-serial", "" },
+            fake.operations(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake.open_calls);
+}
+
+test "write passes expect-serial to the writable destination open" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const source = "test-write-expect-serial-source.raw";
+    const target = "test-write-expect-serial-target.raw";
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, target) catch {};
+    try createRawTestImage(io, source);
+    try createRawTestImage(io, target);
+    var report = testReport();
+    var fake = FakeOperations{ .report = &report };
+
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        runWithOperations(
+            std.testing.allocator,
+            io,
+            &.{
+                "--allow-device-write",
+                "--yes",
+                "--expect-serial",
+                "SERIAL-001",
+                source,
+                target,
+            },
+            fake.operations(),
+        ),
+    );
+    try std.testing.expectEqualStrings("SERIAL-001", fake.expected_serial_seen.?);
 }
 
 test "write accepts every supported source image format" {
@@ -2361,6 +2453,7 @@ test "write preflight output inventories the target" {
     @memcpy(partition.filesystem.identifier[0..9], "1234-5678");
     var partitions = [_]vmiz.block_device.PartitionReport{partition};
     var report = testReport();
+    report.whole_disk_serial = @constCast("SERIAL-001");
     report.partition_table = .gpt;
     report.device_signatures.ext4 = true;
     report.gpt_disk_guid_len = 36;
@@ -2377,6 +2470,16 @@ test "write preflight output inventories the target" {
 
     const text = try formatPreflightReport(std.testing.allocator, "target", &report);
     defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text,
+        "destination preflight for 'target'",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text,
+        "stable identifier: whole-disk serial 'SERIAL-001'",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "transport: usb") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "partition table: gpt") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "disk GUID: 99999999-8888-7777-6666-555555555555") != null);
@@ -2386,6 +2489,19 @@ test "write preflight output inventories the target" {
     try std.testing.expect(std.mem.indexOf(u8, text, "name=\"EFI\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "signatures: fat") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "filesystem: fat 1234-5678") != null);
+
+    report.whole_disk_serial = null;
+    const unavailable_text = try formatPreflightReport(
+        std.testing.allocator,
+        "/dev/test",
+        &report,
+    );
+    defer std.testing.allocator.free(unavailable_text);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        unavailable_text,
+        "stable identifier: whole-disk serial unavailable",
+    ) != null);
 }
 
 test "write source identity output reports visible collisions" {
