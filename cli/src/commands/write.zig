@@ -512,10 +512,22 @@ fn runWithOperations(
         std.debug.print("write: partial success: {s}\n", .{warning});
         return 2;
     }
-    std.debug.print(
-        "write: wrote and flushed {d} bytes. {s}\n",
-        .{ source.virtual_size, outcome.message() },
-    );
+    if (growth_plan) |plan| {
+        std.debug.print(
+            "write: wrote {d} source bytes, finalized a {d}-byte root partition with a {d}-byte ext4 filesystem, and flushed the device. {s}\n",
+            .{
+                source.virtual_size,
+                plan.final_partition_length,
+                plan.final_filesystem_length,
+                outcome.message(),
+            },
+        );
+    } else {
+        std.debug.print(
+            "write: wrote and flushed {d} bytes. {s}\n",
+            .{ source.virtual_size, outcome.message() },
+        );
+    }
     return 0;
 }
 
@@ -1502,6 +1514,22 @@ fn createRootGptTestImage(
     path: []const u8,
     size: u64,
 ) !void {
+    return createRootGptTestImageWithFilesystemLength(
+        allocator,
+        io,
+        path,
+        size,
+        null,
+    );
+}
+
+fn createRootGptTestImageWithFilesystemLength(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    size: u64,
+    requested_filesystem_length: ?u64,
+) !void {
     var image = try vmiz.Image.create(io, path, .raw, size, .{});
     defer image.close(io);
     const first_lba: u64 = 2048;
@@ -1527,8 +1555,9 @@ fn createRootGptTestImage(
     try tree.putFileBytes("marker", "preserve me", .{ .mode = 0o644 });
     const partition_length = (last_lba - first_lba + 1) *
         vmiz.gpt.sector_size;
-    const filesystem_length = partition_length /
-        vmiz.ext4.default_block_size * vmiz.ext4.default_block_size;
+    const filesystem_length = requested_filesystem_length orelse
+        partition_length / vmiz.ext4.default_block_size *
+            vmiz.ext4.default_block_size;
     _ = try vmiz.ext4.populate(
         io,
         image.file,
@@ -2143,6 +2172,63 @@ test "write grow-root accepts an already-full partition and filesystem as a no-o
     try std.testing.expectEqualStrings("dpixrvqf", fake.eventSlice());
     try std.testing.expectEqual(@as(usize, 0), fake.grow_partition_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.resize_calls);
+}
+
+test "write grow-root fills a smaller filesystem in a same-size full partition" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const source = "test-write-command-grow-filesystem-source.raw";
+    const target = "test-write-command-grow-filesystem-target.raw";
+    const size: u64 = 64 * 1024 * 1024;
+    const initial_filesystem_length: u64 = 48 * 1024 * 1024;
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, target) catch {};
+    try createRootGptTestImageWithFilesystemLength(
+        std.testing.allocator,
+        io,
+        source,
+        size,
+        initial_filesystem_length,
+    );
+    try createRawTestImageWithSize(io, target, size);
+    var report = testReport();
+    var fake = FakeOperations{ .report = &report, .real_pipeline = true };
+
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        runWithOperations(
+            std.testing.allocator,
+            io,
+            &.{ "--allow-device-write", "--yes", "--grow-root", source, target },
+            fake.operations(),
+        ),
+    );
+    try std.testing.expectEqualStrings("dpixrevqf", fake.eventSlice());
+    try std.testing.expectEqual(@as(usize, 0), fake.grow_partition_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.resize_calls);
+
+    var destination = try vmiz.Image.openPathReadOnly(io, target);
+    defer destination.close(io);
+    var gpt = try vmiz.gpt.readVerifiedGpt(
+        destination,
+        io,
+        std.testing.allocator,
+        vmiz.gpt.default_max_partition_array_bytes,
+    );
+    defer gpt.deinit(std.testing.allocator);
+    const root = try vmiz.root_resize.selectRoot(
+        std.testing.allocator,
+        io,
+        &destination,
+        gpt,
+        .{ .require_last_partition = true },
+    );
+    try std.testing.expect(root.filesystem_length > initial_filesystem_length);
+    try std.testing.expectEqual(
+        root.partition_length / vmiz.ext4.default_block_size *
+            vmiz.ext4.default_block_size,
+        root.filesystem_length,
+    );
 }
 
 test "write grow-root rejects selection and ext4 preflight failures before mutation" {

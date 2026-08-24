@@ -1595,6 +1595,8 @@ fn resizeImpl(
     mutate: bool,
 ) ResizeError!ResizeResult {
     if (options.length == 0 or options.length % default_block_size != 0) return error.InvalidRange;
+    const range_end = std.math.add(u64, options.offset, options.length) catch
+        return error.InvalidRange;
 
     var sb: [superblock_size]u8 = undefined;
     _ = try file.readPositionalAll(io, &sb, options.offset + superblock_offset);
@@ -1718,8 +1720,8 @@ fn resizeImpl(
     }
 
     const stat = try file.stat(io);
-    if (mutate and stat.size < options.offset + options.length) {
-        file.setLength(io, options.offset + options.length) catch |err| switch (err) {
+    if (mutate and stat.size < range_end) {
+        file.setLength(io, range_end) catch |err| switch (err) {
             error.NonResizable => {},
             else => return err,
         };
@@ -1800,6 +1802,8 @@ fn resizeGeneral(
     mutate: bool,
 ) ResizeError!FilesystemInfo {
     if (options.length == 0 or options.length % default_block_size != 0) return error.InvalidRange;
+    const range_end = std.math.add(u64, options.offset, options.length) catch
+        return error.InvalidRange;
     if (readInt(u16, sb[0x38..0x3A]) != super_magic) return error.BadMagic;
     if (readInt(u32, sb[0x4C..0x50]) != rev_dynamic) return error.UnsupportedRevision;
     if (readInt(u32, sb[0x18..0x1C]) != 2) return error.UnsupportedBlockSize;
@@ -1835,8 +1839,8 @@ fn resizeGeneral(
             return error.FilesystemTooLarge;
     }
     const current_stat = try file.stat(io);
-    if (mutate and current_stat.size < options.offset + options.length) {
-        file.setLength(io, options.offset + options.length) catch |err| switch (err) {
+    if (mutate and current_stat.size < range_end) {
+        file.setLength(io, range_end) catch |err| switch (err) {
             error.NonResizable => {},
             else => return err,
         };
