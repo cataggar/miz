@@ -1587,8 +1587,9 @@ fn buildIdentityRewritePlan(state: *IdentityRewriteState) !void {
     }
     if (state.esp_partition_index) |esp_index| {
         const mount_point = state.partitions[esp_index].mount_point orelse return error.InvalidIdentityPlan;
-        state.esp_roots = try arena.alloc([]const u8, 1);
-        state.esp_roots[0] = mount_point;
+        var esp_roots = try arena.alloc([]const u8, 1);
+        esp_roots[0] = mount_point;
+        state.esp_roots = esp_roots;
     } else {
         state.esp_roots = &.{};
     }
@@ -1800,7 +1801,10 @@ fn verifyFreshIdentityDestination(
     var inventory = try vmiz.block_device.inspectIdentityInventory(
         allocator,
         io,
-        destination.*,
+        .{
+            .ctx = destination,
+            .read_at_fn = sourceImageReadAt,
+        },
         vmiz.gpt.default_max_partition_array_bytes,
     );
     defer inventory.deinit(allocator);
@@ -1832,10 +1836,19 @@ fn verifyFreshIdentityDestination(
     const root_partition = &state.partitions[state.root_partition_index];
     switch (root_partition.filesystem_kind) {
         .ext4 => {
-            var readable = try vmiz.ext4.openGeneralReadOnlySource(destination.*, io, .{
-                .offset = root_partition.partition_offset,
-                .length = ext4PopulateLength(root_partition, state),
-            });
+            var readable = try vmiz.ext4.openGeneralReadOnlySource(
+                io,
+                destination.file,
+                .{
+                    .ctx = destination,
+                    .read_at_fn = sourceImageReadAt,
+                },
+                allocator,
+                .{
+                    .offset = root_partition.partition_offset,
+                    .length = ext4PopulateLength(root_partition, state),
+                },
+            );
             const tree = try readable.scanReadable(io, allocator);
             var root_tree = vmiz.root_tree.RootTree{};
             defer root_tree.deinit(allocator);
@@ -3572,10 +3585,19 @@ fn readExt4PartitionFileAlloc(
     length: u64,
     path: []const u8,
 ) ![]u8 {
-    var readable = try vmiz.ext4.openGeneralReadOnlySource(image, io, .{
-        .offset = offset,
-        .length = length,
-    });
+    var readable = try vmiz.ext4.openGeneralReadOnlySource(
+        io,
+        image.file,
+        .{
+            .ctx = &image,
+            .read_at_fn = sourceImageReadAt,
+        },
+        allocator,
+        .{
+            .offset = offset,
+            .length = length,
+        },
+    );
     const tree = try readable.scanReadable(io, allocator);
     var root_tree = vmiz.root_tree.RootTree{};
     defer root_tree.deinit(allocator);
@@ -4605,7 +4627,11 @@ test "write new-uuids prepares unique fresh identifiers" {
     defer prepared.deinit(std.testing.allocator);
     try std.testing.expect(prepared.refusal_message == null);
     const state: *IdentityRewriteState = @ptrCast(@alignCast(prepared.context.?));
-    try std.testing.expect(!vmiz.guid.eql(state.gpt_replacements.?.disk_guid, old_disk_guid));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &state.gpt_replacements.?.disk_guid,
+        &old_disk_guid,
+    ));
     try std.testing.expect(state.partitions.len == 2);
     try std.testing.expect(!std.mem.eql(u8, state.partitions[0].new_partition_guid_text, state.partitions[1].new_partition_guid_text));
     try std.testing.expect(!std.mem.eql(u8, state.partitions[0].new_partition_guid_text, state.partitions[0].old_partition_guid_text));
@@ -4677,7 +4703,7 @@ test "write new-uuids refuses unsupported filesystem inventory" {
     var detected = try detectGpt(null, source, io, allocator);
     defer detected.deinit(allocator);
     const verified = switch (detected) {
-        .gpt => |gpt| gpt,
+        .verified => |gpt| gpt,
         .not_gpt => unreachable,
     };
     var report = testReport();
