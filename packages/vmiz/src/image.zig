@@ -184,9 +184,18 @@ pub const DeviceWriteOutcome = enum {
 };
 
 pub const CopyResult = struct {
-    /// Null for ordinary file destinations. Device destinations are always
-    /// flushed before this result is returned.
+    /// True when a device destination was durably flushed.
+    device_flushed: bool = false,
+    /// The partition refresh outcome when requested; null for ordinary files
+    /// and when `.flush_device` intentionally defers the refresh.
     device_write: ?DeviceWriteOutcome = null,
+};
+
+pub const CopyFinalization = enum {
+    /// Make device writes durable without refreshing the kernel partition view.
+    flush_device,
+    /// Make device writes durable and refresh the kernel partition view.
+    finish_device_write,
 };
 
 /// Where an image's authoritative size comes from, resolved once at open
@@ -895,9 +904,33 @@ pub const Image = struct {
         self.* = undefined;
     }
 
-    pub const FinishDeviceWriteError = error{
+    pub const FlushDeviceWriteError = error{
         BlockDeviceWriteNotPermitted,
     } || Io.File.SyncError;
+    pub const FinishDeviceWriteError = FlushDeviceWriteError;
+
+    /// Makes all bytes written through a writable device-backed image durable
+    /// without asking the kernel to re-read its partition table.
+    ///
+    /// Returns false for an ordinary file.
+    pub fn flushDeviceWrite(
+        self: *Image,
+        io: Io,
+    ) FlushDeviceWriteError!bool {
+        return self.flushDeviceWriteWith(io, .{});
+    }
+
+    fn flushDeviceWriteWith(
+        self: *Image,
+        io: Io,
+        operations: DeviceWriteOperations,
+    ) FlushDeviceWriteError!bool {
+        const device = self.device orelse return false;
+        if (!device.write_allowed) return error.BlockDeviceWriteNotPermitted;
+
+        try operations.sync_fn(operations.context, self.file, io);
+        return true;
+    }
 
     /// Makes all bytes written through a writable device-backed image durable,
     /// then asks the kernel to re-read the device's partition table. Refresh
@@ -921,7 +954,7 @@ pub const Image = struct {
         const device = self.device orelse return null;
         if (!device.write_allowed) return error.BlockDeviceWriteNotPermitted;
 
-        try operations.sync_fn(operations.context, self.file, io);
+        _ = try self.flushDeviceWriteWith(io, operations);
         operations.re_read_partition_table_fn(operations.context, self.file) catch |err| {
             return switch (err) {
                 error.BlockDeviceBusy => .partition_table_stale_busy,
@@ -1306,11 +1339,49 @@ pub fn copyAll(
     return copyAllWithDeviceWriteOperations(io, src, dst, allocator, .{});
 }
 
+/// Copies all bytes and applies the requested device finalization. Use
+/// `.flush_device` when post-copy mutations must complete before the final
+/// `Image.finishDeviceWrite` partition-table refresh.
+pub fn copyAllWithFinalization(
+    io: Io,
+    src: Image,
+    dst: *Image,
+    allocator: std.mem.Allocator,
+    finalization: CopyFinalization,
+) CopyError!CopyResult {
+    return copyAllWithFinalizationAndDeviceWriteOperations(
+        io,
+        src,
+        dst,
+        allocator,
+        finalization,
+        .{},
+    );
+}
+
 fn copyAllWithDeviceWriteOperations(
     io: Io,
     src: Image,
     dst: *Image,
     allocator: std.mem.Allocator,
+    operations: DeviceWriteOperations,
+) CopyError!CopyResult {
+    return copyAllWithFinalizationAndDeviceWriteOperations(
+        io,
+        src,
+        dst,
+        allocator,
+        .finish_device_write,
+        operations,
+    );
+}
+
+fn copyAllWithFinalizationAndDeviceWriteOperations(
+    io: Io,
+    src: Image,
+    dst: *Image,
+    allocator: std.mem.Allocator,
+    finalization: CopyFinalization,
     operations: DeviceWriteOperations,
 ) CopyError!CopyResult {
     if (dst.virtual_size < src.virtual_size) return error.DestinationTooSmall;
@@ -1337,7 +1408,20 @@ fn copyAllWithDeviceWriteOperations(
         }
         offset += n;
     }
-    return .{ .device_write = try dst.finishDeviceWriteWith(io, operations) };
+    return switch (finalization) {
+        .flush_device => blk: {
+            break :blk .{
+                .device_flushed = try dst.flushDeviceWriteWith(io, operations),
+            };
+        },
+        .finish_device_write => blk: {
+            const outcome = try dst.finishDeviceWriteWith(io, operations);
+            break :blk .{
+                .device_flushed = outcome != null,
+                .device_write = outcome,
+            };
+        },
+    };
 }
 
 /// Public because the streaming output path in `output.zig` needs exactly
@@ -1850,15 +1934,17 @@ const TestDeviceWriteOperations = struct {
     sync_attempts: usize = 0,
     refresh_attempts: usize = 0,
     sequence: usize = 0,
+    expected_sync_sequence: usize = 0,
     order_valid: bool = true,
+    refresh_allowed: bool = true,
     sync_failure: ?Io.File.SyncError = null,
     refresh_failure: ?block_device.ReReadPartitionTableError = null,
 
     fn sync(context: ?*anyopaque, _: Io.File, _: Io) Io.File.SyncError!void {
         const self: *TestDeviceWriteOperations = @ptrCast(@alignCast(context.?));
         self.sync_attempts += 1;
-        self.order_valid = self.order_valid and self.sequence == 0;
-        self.sequence = 1;
+        self.order_valid = self.order_valid and self.sequence == self.expected_sync_sequence;
+        self.sequence += 1;
         if (self.sync_failure) |err| return err;
     }
 
@@ -1868,8 +1954,10 @@ const TestDeviceWriteOperations = struct {
     ) block_device.ReReadPartitionTableError!void {
         const self: *TestDeviceWriteOperations = @ptrCast(@alignCast(context.?));
         self.refresh_attempts += 1;
-        self.order_valid = self.order_valid and self.sequence == 1;
-        self.sequence = 2;
+        self.order_valid = self.order_valid and
+            self.refresh_allowed and
+            self.sequence == self.expected_sync_sequence + 1;
+        self.sequence += 1;
         if (self.refresh_failure) |err| return err;
     }
 
@@ -1915,6 +2003,7 @@ test "copyAll flushes a device before refreshing its partition table" {
         DeviceWriteOutcome.partition_table_refreshed,
         result.device_write.?,
     );
+    try std.testing.expect(result.device_flushed);
     try std.testing.expectEqual(@as(usize, 1), operations.sync_attempts);
     try std.testing.expectEqual(@as(usize, 1), operations.refresh_attempts);
     try std.testing.expectEqual(@as(usize, 2), operations.sequence);
@@ -1924,6 +2013,52 @@ test "copyAll flushes a device before refreshing its partition table" {
         result.device_write.?.message(),
         "may still be settling",
     ) != null);
+}
+
+test "copy finalization can defer partition refresh until after mutations" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_file = try tmp.dir.createFile(io, "source.img", .{ .truncate = true, .read = true });
+    try source_file.setLength(io, 512);
+    var source = try Image.openFile(io, source_file);
+    defer source.close(io);
+    try source.pwrite(io, "payload", 0);
+
+    const destination_file = try tmp.dir.createFile(io, "destination.img", .{ .truncate = true, .read = true });
+    try destination_file.setLength(io, 512);
+    var destination = try openSyntheticDeviceForWrite(destination_file, .{
+        .size_bytes = 512,
+        .logical_sector_size = 512,
+    }, 512, .{ .allow_device_write = true });
+    defer destination.close(io);
+
+    var operations = TestDeviceWriteOperations{ .refresh_allowed = false };
+    const copy_result = try copyAllWithFinalizationAndDeviceWriteOperations(
+        io,
+        source,
+        &destination,
+        std.testing.allocator,
+        .flush_device,
+        operations.operations(),
+    );
+    try std.testing.expect(copy_result.device_flushed);
+    try std.testing.expectEqual(@as(?DeviceWriteOutcome, null), copy_result.device_write);
+    try std.testing.expectEqual(@as(usize, 1), operations.sync_attempts);
+    try std.testing.expectEqual(@as(usize, 0), operations.refresh_attempts);
+
+    try destination.pwrite(io, "post-copy mutation", 128);
+    operations.refresh_allowed = true;
+    operations.expected_sync_sequence = 1;
+    try std.testing.expectEqual(
+        DeviceWriteOutcome.partition_table_refreshed,
+        (try destination.finishDeviceWriteWith(io, operations.operations())).?,
+    );
+    try std.testing.expectEqual(@as(usize, 2), operations.sync_attempts);
+    try std.testing.expectEqual(@as(usize, 1), operations.refresh_attempts);
+    try std.testing.expectEqual(@as(usize, 3), operations.sequence);
+    try std.testing.expect(operations.order_valid);
 }
 
 test "copyAll propagates a device flush failure without attempting refresh" {
@@ -2028,6 +2163,7 @@ test "copyAll preserves ordinary file behavior without device finalization" {
         operations.operations(),
     );
     try std.testing.expectEqual(@as(?DeviceWriteOutcome, null), result.device_write);
+    try std.testing.expect(!result.device_flushed);
     try std.testing.expectEqual(@as(usize, 0), operations.sync_attempts);
     try std.testing.expectEqual(@as(usize, 0), operations.refresh_attempts);
 
