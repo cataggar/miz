@@ -11,6 +11,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const guid = @import("guid.zig");
+const identity_rewrite = @import("identity_rewrite.zig");
 const mbr = @import("mbr.zig");
 
 /// The Linux `BLKGETSIZE64` ioctl request code (`_IOR(0x12, 114, size_t)`),
@@ -101,16 +103,74 @@ pub const Signatures = packed struct {
     lvm2: bool = false,
 };
 
+pub const FilesystemIdentityKind = enum {
+    none,
+    fat,
+    ext4,
+    xfs,
+    ambiguous,
+};
+
+pub const FilesystemIdentity = struct {
+    kind: FilesystemIdentityKind = .none,
+    identifier: [identity_rewrite.canonical_uuid_bytes]u8 =
+        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes,
+    identifier_len: u8 = 0,
+
+    pub fn identifierText(self: *const FilesystemIdentity) ?[]const u8 {
+        return switch (self.kind) {
+            .fat, .ext4, .xfs => if (self.identifier_len == 0)
+                null
+            else
+                self.identifier[0..self.identifier_len],
+            .none, .ambiguous => null,
+        };
+    }
+};
+
 pub const PartitionReport = struct {
     table_index: u32,
     first_lba: u64,
     last_lba: u64,
     name: [72]u8 = [_]u8{0} ** 72,
     name_len: u8 = 0,
+    gpt_unique_guid: [identity_rewrite.canonical_uuid_bytes]u8 =
+        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes,
+    gpt_unique_guid_len: u8 = 0,
+    filesystem: FilesystemIdentity = .{},
     signatures: Signatures = .{},
 
     pub fn partitionName(self: *const PartitionReport) []const u8 {
         return self.name[0..self.name_len];
+    }
+
+    pub fn gptUniqueGuid(self: *const PartitionReport) ?[]const u8 {
+        return if (self.gpt_unique_guid_len == 0)
+            null
+        else
+            self.gpt_unique_guid[0..self.gpt_unique_guid_len];
+    }
+};
+
+pub const IdentityInventory = struct {
+    partition_table: PartitionTable,
+    partitions: []PartitionReport,
+    device_signatures: Signatures,
+    gpt_disk_guid: [identity_rewrite.canonical_uuid_bytes]u8 =
+        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes,
+    gpt_disk_guid_len: u8 = 0,
+    device_filesystem: FilesystemIdentity = .{},
+
+    pub fn deinit(self: *IdentityInventory, allocator: std.mem.Allocator) void {
+        allocator.free(self.partitions);
+        self.* = undefined;
+    }
+
+    pub fn gptDiskGuid(self: *const IdentityInventory) ?[]const u8 {
+        return if (self.gpt_disk_guid_len == 0)
+            null
+        else
+            self.gpt_disk_guid[0..self.gpt_disk_guid_len];
     }
 };
 
@@ -125,6 +185,10 @@ pub const PreflightReport = struct {
     partition_table: PartitionTable,
     partitions: []PartitionReport,
     device_signatures: Signatures,
+    gpt_disk_guid: [identity_rewrite.canonical_uuid_bytes]u8 =
+        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes,
+    gpt_disk_guid_len: u8 = 0,
+    device_filesystem: FilesystemIdentity = .{},
 
     pub fn deinit(self: *PreflightReport, allocator: std.mem.Allocator) void {
         allocator.free(self.target_name);
@@ -132,6 +196,82 @@ pub const PreflightReport = struct {
         allocator.free(self.partitions);
         self.* = undefined;
     }
+
+    pub fn gptDiskGuid(self: *const PreflightReport) ?[]const u8 {
+        return if (self.gpt_disk_guid_len == 0)
+            null
+        else
+            self.gpt_disk_guid[0..self.gpt_disk_guid_len];
+    }
+};
+
+pub const ReadAtSource = struct {
+    ctx: *const anyopaque,
+    read_at_fn: *const fn (
+        ctx: *const anyopaque,
+        io: Io,
+        buffer: []u8,
+        offset: u64,
+    ) anyerror!usize,
+};
+
+pub const InventoryError = std.mem.Allocator.Error || error{
+    DeviceInspectionFailed,
+};
+
+pub const CollisionKind = enum {
+    gpt_disk_guid,
+    gpt_partition_guid,
+    filesystem_identifier,
+};
+
+pub const Collision = struct {
+    kind: CollisionKind,
+    identifier: [identity_rewrite.canonical_uuid_bytes]u8 =
+        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes,
+    identifier_len: u8 = 0,
+    source_partition_table_index: ?u32 = null,
+    source_filesystem: FilesystemIdentityKind = .none,
+    visible_device_name: []u8,
+    visible_partition_table_index: ?u32 = null,
+    visible_filesystem: FilesystemIdentityKind = .none,
+
+    pub fn identifierText(self: *const Collision) []const u8 {
+        return self.identifier[0..self.identifier_len];
+    }
+};
+
+pub const CollisionReport = struct {
+    collisions: []Collision,
+    scanned_visible_disks: usize = 0,
+
+    pub fn deinit(self: *CollisionReport, allocator: std.mem.Allocator) void {
+        for (self.collisions) |collision| allocator.free(collision.visible_device_name);
+        allocator.free(self.collisions);
+        self.* = undefined;
+    }
+};
+
+pub const CollisionError = InventoryError || ProbeError || error{
+    UnsupportedBlockDevicePreflight,
+    BlockDeviceSysfsUnavailable,
+    InvalidBlockDeviceSysfs,
+    VisibleDeviceUnavailable,
+    VisibleDeviceNotBlockDevice,
+};
+
+pub const OpenedVisibleDevice = struct {
+    file: Io.File,
+    geometry: Geometry,
+};
+
+pub const VisibleDeviceOpener = struct {
+    context: ?*anyopaque = null,
+    open_fn: *const fn (
+        context: ?*anyopaque,
+        io: Io,
+        device_name: []const u8,
+    ) CollisionError!OpenedVisibleDevice = openVisibleDeviceFromDev,
 };
 
 pub const PreflightOptions = struct {
@@ -585,37 +725,182 @@ fn removableFor(io: Io, class_block_dir: Io.Dir, whole_disk_name: []const u8) Pr
     return error.InvalidBlockDeviceSysfs;
 }
 
-fn matchAt(file: Io.File, io: Io, region_offset: u64, region_length: u64, offset: u64, value: []const u8) PreflightError!bool {
-    if (offset > region_length or value.len > region_length - offset or value.len > 16) return false;
-    var buf: [16]u8 = undefined;
-    const got = file.readPositionalAll(io, buf[0..value.len], region_offset + offset) catch
-        return error.DeviceInspectionFailed;
-    return got == value.len and std.mem.eql(u8, buf[0..value.len], value);
+fn fileReadAt(
+    ctx: *const anyopaque,
+    io: Io,
+    buffer: []u8,
+    offset: u64,
+) anyerror!usize {
+    const file: *const Io.File = @ptrCast(@alignCast(ctx));
+    return file.readPositionalAll(io, buffer, offset);
 }
 
-fn inspectSignatures(
-    file: Io.File,
+fn readAtExact(
+    source: ReadAtSource,
+    io: Io,
+    buffer: []u8,
+    offset: u64,
+) InventoryError!void {
+    const got = source.read_at_fn(source.ctx, io, buffer, offset) catch
+        return error.DeviceInspectionFailed;
+    if (got != buffer.len) return error.DeviceInspectionFailed;
+}
+
+fn matchAt(
+    source: ReadAtSource,
     io: Io,
     region_offset: u64,
     region_length: u64,
-) PreflightError!Signatures {
+    offset: u64,
+    value: []const u8,
+) InventoryError!bool {
+    if (offset > region_length or value.len > region_length - offset or value.len > 16) return false;
+    var buf: [16]u8 = undefined;
+    try readAtExact(source, io, buf[0..value.len], region_offset + offset);
+    return std.mem.eql(u8, buf[0..value.len], value);
+}
+
+fn inspectSignatures(
+    source: ReadAtSource,
+    io: Io,
+    region_offset: u64,
+    region_length: u64,
+) InventoryError!Signatures {
     var signatures = Signatures{};
-    signatures.xfs = try matchAt(file, io, region_offset, region_length, 0, "XFSB");
-    signatures.ntfs = try matchAt(file, io, region_offset, region_length, 3, "NTFS    ");
+    signatures.xfs = try matchAt(source, io, region_offset, region_length, 0, "XFSB");
+    signatures.ntfs = try matchAt(source, io, region_offset, region_length, 3, "NTFS    ");
     signatures.fat =
-        try matchAt(file, io, region_offset, region_length, 54, "FAT16   ") or
-        try matchAt(file, io, region_offset, region_length, 82, "FAT32   ");
-    signatures.ext4 = try matchAt(file, io, region_offset, region_length, 1024 + 0x38, &.{ 0x53, 0xEF });
-    signatures.btrfs = try matchAt(file, io, region_offset, region_length, 64 * 1024 + 0x40, "_BHRfS_M");
-    signatures.luks = try matchAt(file, io, region_offset, region_length, 0, "LUKS\xba\xbe");
+        try matchAt(source, io, region_offset, region_length, 54, "FAT16   ") or
+        try matchAt(source, io, region_offset, region_length, 82, "FAT32   ");
+    signatures.ext4 = try matchAt(source, io, region_offset, region_length, 1024 + 0x38, &.{ 0x53, 0xEF });
+    signatures.btrfs = try matchAt(source, io, region_offset, region_length, 64 * 1024 + 0x40, "_BHRfS_M");
+    signatures.luks = try matchAt(source, io, region_offset, region_length, 0, "LUKS\xba\xbe");
     signatures.lvm2 =
-        try matchAt(file, io, region_offset, region_length, 512, "LABELONE") and
-        try matchAt(file, io, region_offset, region_length, 512 + 24, "LVM2 001");
+        try matchAt(source, io, region_offset, region_length, 512, "LABELONE") and
+        try matchAt(source, io, region_offset, region_length, 512 + 24, "LVM2 001");
     inline for (.{ 4096, 8192, 16384, 65536 }) |page_size| {
         signatures.swap = signatures.swap or
-            try matchAt(file, io, region_offset, region_length, page_size - 10, "SWAPSPACE2");
+            try matchAt(source, io, region_offset, region_length, page_size - 10, "SWAPSPACE2");
     }
     return signatures;
+}
+
+fn copyIdentifierText(buffer: *[identity_rewrite.canonical_uuid_bytes]u8, text: []const u8) u8 {
+    @memcpy(buffer[0..text.len], text);
+    return @intCast(text.len);
+}
+
+fn copyGuidText(buffer: *[identity_rewrite.canonical_uuid_bytes]u8, value: guid.Guid) u8 {
+    var guid_text: [identity_rewrite.canonical_uuid_bytes]u8 = undefined;
+    return copyIdentifierText(buffer, guid.formatLower(&guid_text, value));
+}
+
+fn setFilesystemUuidIdentity(
+    identity: *FilesystemIdentity,
+    kind: FilesystemIdentityKind,
+    bytes: *const [16]u8,
+) void {
+    var uuid_text: [identity_rewrite.canonical_uuid_bytes]u8 = undefined;
+    identity.kind = kind;
+    identity.identifier_len = copyIdentifierText(
+        &identity.identifier,
+        identity_rewrite.formatFilesystemUuid(&uuid_text, bytes),
+    );
+}
+
+fn setFatVolumeIdentity(identity: *FilesystemIdentity, volume_id: u32) void {
+    var serial_text: [identity_rewrite.fat_serial_bytes]u8 = undefined;
+    identity.kind = .fat;
+    identity.identifier_len = copyIdentifierText(
+        &identity.identifier,
+        identity_rewrite.formatFatVolumeSerial(&serial_text, volume_id),
+    );
+}
+
+fn inspectFatIdentity(
+    source: ReadAtSource,
+    io: Io,
+    region_offset: u64,
+    region_length: u64,
+) InventoryError!FilesystemIdentity {
+    var identity = FilesystemIdentity{ .kind = .fat };
+    if (region_length < 512) return identity;
+
+    var boot: [512]u8 = undefined;
+    try readAtExact(source, io, &boot, region_offset);
+    if (boot[510] != 0x55 or boot[511] != 0xAA) return identity;
+
+    if (std.mem.eql(u8, boot[82..90], "FAT32   ")) {
+        if (boot[66] == 0x29) {
+            setFatVolumeIdentity(&identity, std.mem.readInt(u32, boot[67..71], .little));
+        }
+        return identity;
+    }
+    if (std.mem.eql(u8, boot[54..62], "FAT16   ")) {
+        if (boot[38] == 0x29) {
+            setFatVolumeIdentity(&identity, std.mem.readInt(u32, boot[39..43], .little));
+        }
+        return identity;
+    }
+    return identity;
+}
+
+fn inspectExt4Identity(
+    source: ReadAtSource,
+    io: Io,
+    region_offset: u64,
+    region_length: u64,
+) InventoryError!FilesystemIdentity {
+    if (region_length < 1024 + 0x78) return error.DeviceInspectionFailed;
+
+    var superblock: [0x78]u8 = undefined;
+    try readAtExact(source, io, &superblock, region_offset + 1024);
+    if (std.mem.readInt(u16, superblock[0x38..0x3A], .little) != 0xEF53) {
+        return .{};
+    }
+
+    var uuid: [16]u8 = undefined;
+    @memcpy(&uuid, superblock[0x68..0x78]);
+    var identity = FilesystemIdentity{};
+    setFilesystemUuidIdentity(&identity, .ext4, &uuid);
+    return identity;
+}
+
+fn inspectXfsIdentity(
+    source: ReadAtSource,
+    io: Io,
+    region_offset: u64,
+    region_length: u64,
+) InventoryError!FilesystemIdentity {
+    if (region_length < 120) return error.DeviceInspectionFailed;
+
+    var superblock: [120]u8 = undefined;
+    try readAtExact(source, io, &superblock, region_offset);
+    if (!std.mem.eql(u8, superblock[0..4], "XFSB")) return .{};
+
+    var uuid: [16]u8 = undefined;
+    @memcpy(&uuid, superblock[32..48]);
+    var identity = FilesystemIdentity{};
+    setFilesystemUuidIdentity(&identity, .xfs, &uuid);
+    return identity;
+}
+
+fn inspectFilesystemIdentity(
+    source: ReadAtSource,
+    io: Io,
+    region_offset: u64,
+    region_length: u64,
+    signatures: Signatures,
+) InventoryError!FilesystemIdentity {
+    const recognized =
+        @as(u3, @intFromBool(signatures.fat)) +
+        @as(u3, @intFromBool(signatures.ext4)) +
+        @as(u3, @intFromBool(signatures.xfs));
+    if (recognized == 0) return .{};
+    if (recognized > 1) return .{ .kind = .ambiguous };
+    if (signatures.fat) return inspectFatIdentity(source, io, region_offset, region_length);
+    if (signatures.ext4) return inspectExt4Identity(source, io, region_offset, region_length);
+    return inspectXfsIdentity(source, io, region_offset, region_length);
 }
 
 fn decodeGptName(entry: []const u8, report: *PartitionReport) void {
@@ -628,41 +913,44 @@ fn decodeGptName(entry: []const u8, report: *PartitionReport) void {
     }
 }
 
-fn inspectContents(
+pub fn inspectIdentityInventory(
     allocator: std.mem.Allocator,
     io: Io,
-    file: Io.File,
-    geometry: Geometry,
-) PreflightError!struct {
-    table: PartitionTable,
-    partitions: []PartitionReport,
-    signatures: Signatures,
-} {
+    source: ReadAtSource,
+    size_bytes: u64,
+) InventoryError!IdentityInventory {
     var partitions = std.array_list.Managed(PartitionReport).init(allocator);
     errdefer partitions.deinit();
 
     var sector0: [mbr.sector_size]u8 = undefined;
-    const sector0_len = file.readPositionalAll(io, &sector0, 0) catch
-        return error.DeviceInspectionFailed;
-    const has_mbr = sector0_len == sector0.len and
-        std.mem.eql(u8, sector0[510..512], &mbr.boot_signature);
+    const has_mbr = blk: {
+        if (size_bytes < sector0.len) break :blk false;
+        try readAtExact(source, io, &sector0, 0);
+        break :blk std.mem.eql(u8, sector0[510..512], &mbr.boot_signature);
+    };
 
     var gpt_header: [mbr.sector_size]u8 = undefined;
-    const gpt_len = if (geometry.size_bytes >= 2 * mbr.sector_size)
-        file.readPositionalAll(io, &gpt_header, mbr.sector_size) catch
-            return error.DeviceInspectionFailed
-    else
-        0;
-    const has_gpt = gpt_len == gpt_header.len and
-        std.mem.eql(u8, gpt_header[0..8], "EFI PART");
+    const has_gpt = blk: {
+        if (size_bytes < 2 * mbr.sector_size) break :blk false;
+        try readAtExact(source, io, &gpt_header, mbr.sector_size);
+        break :blk std.mem.eql(u8, gpt_header[0..8], "EFI PART");
+    };
 
     const table: PartitionTable = if (has_gpt) .gpt else if (has_mbr) .mbr else .none;
+    var gpt_disk_guid_len: u8 = 0;
+    var gpt_disk_guid: [identity_rewrite.canonical_uuid_bytes]u8 =
+        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes;
     if (has_gpt) {
         const entry_lba = std.mem.readInt(u64, gpt_header[72..80], .little);
         const entry_count = std.mem.readInt(u32, gpt_header[80..84], .little);
         const entry_size = std.mem.readInt(u32, gpt_header[84..88], .little);
         if (entry_size < 128 or entry_size > 4096 or entry_count > 4096) {
             return error.DeviceInspectionFailed;
+        }
+        var disk_guid: guid.Guid = undefined;
+        @memcpy(&disk_guid, gpt_header[56..72]);
+        if (!std.mem.eql(u8, &disk_guid, &guid.nil)) {
+            gpt_disk_guid_len = copyGuidText(&gpt_disk_guid, disk_guid);
         }
         const entry_offset = std.math.mul(u64, entry_lba, mbr.sector_size) catch
             return error.DeviceInspectionFailed;
@@ -674,12 +962,10 @@ fn inspectContents(
                 entry_offset,
                 std.math.mul(u64, index, entry_size) catch return error.DeviceInspectionFailed,
             ) catch return error.DeviceInspectionFailed;
-            if (offset > geometry.size_bytes or entry_size > geometry.size_bytes - offset) {
+            if (offset > size_bytes or entry_size > size_bytes - offset) {
                 return error.DeviceInspectionFailed;
             }
-            const got = file.readPositionalAll(io, entry_buf[0..entry_size], offset) catch
-                return error.DeviceInspectionFailed;
-            if (got != entry_size) return error.DeviceInspectionFailed;
+            try readAtExact(source, io, entry_buf[0..entry_size], offset);
             if (std.mem.allEqual(u8, entry_buf[0..16], 0)) continue;
 
             var report = PartitionReport{
@@ -687,6 +973,11 @@ fn inspectContents(
                 .first_lba = std.mem.readInt(u64, entry_buf[32..40], .little),
                 .last_lba = std.mem.readInt(u64, entry_buf[40..48], .little),
             };
+            var unique_guid: guid.Guid = undefined;
+            @memcpy(&unique_guid, entry_buf[16..32]);
+            if (!std.mem.eql(u8, &unique_guid, &guid.nil)) {
+                report.gpt_unique_guid_len = copyGuidText(&report.gpt_unique_guid, unique_guid);
+            }
             if (report.last_lba < report.first_lba) return error.DeviceInspectionFailed;
             decodeGptName(entry_buf[0..128], &report);
             const region_offset = std.math.mul(u64, report.first_lba, mbr.sector_size) catch
@@ -699,10 +990,17 @@ fn inspectContents(
             ) catch return error.DeviceInspectionFailed;
             const region_length = std.math.mul(u64, sector_count, mbr.sector_size) catch
                 return error.DeviceInspectionFailed;
-            if (region_offset > geometry.size_bytes or region_length > geometry.size_bytes - region_offset) {
+            if (region_offset > size_bytes or region_length > size_bytes - region_offset) {
                 return error.DeviceInspectionFailed;
             }
-            report.signatures = try inspectSignatures(file, io, region_offset, region_length);
+            report.signatures = try inspectSignatures(source, io, region_offset, region_length);
+            report.filesystem = try inspectFilesystemIdentity(
+                source,
+                io,
+                region_offset,
+                region_length,
+                report.signatures,
+            );
             try partitions.append(report);
         }
     } else if (has_mbr) {
@@ -716,23 +1014,47 @@ fn inspectContents(
                 return error.DeviceInspectionFailed;
             const region_length = std.math.mul(u64, entry.sector_count, mbr.sector_size) catch
                 return error.DeviceInspectionFailed;
-            if (region_offset > geometry.size_bytes or region_length > geometry.size_bytes - region_offset) {
+            if (region_offset > size_bytes or region_length > size_bytes - region_offset) {
                 return error.DeviceInspectionFailed;
             }
-            try partitions.append(.{
+            var report = PartitionReport{
                 .table_index = @intCast(index),
                 .first_lba = first_lba,
                 .last_lba = last_lba,
-                .signatures = try inspectSignatures(file, io, region_offset, region_length),
-            });
+                .signatures = try inspectSignatures(source, io, region_offset, region_length),
+            };
+            report.filesystem = try inspectFilesystemIdentity(
+                source,
+                io,
+                region_offset,
+                region_length,
+                report.signatures,
+            );
+            try partitions.append(report);
         }
     }
 
+    const device_signatures = try inspectSignatures(source, io, 0, size_bytes);
     return .{
-        .table = table,
+        .partition_table = table,
         .partitions = try partitions.toOwnedSlice(),
-        .signatures = try inspectSignatures(file, io, 0, geometry.size_bytes),
+        .device_signatures = device_signatures,
+        .gpt_disk_guid = gpt_disk_guid,
+        .gpt_disk_guid_len = gpt_disk_guid_len,
+        .device_filesystem = try inspectFilesystemIdentity(source, io, 0, size_bytes, device_signatures),
     };
+}
+
+pub fn inspectFileIdentityInventory(
+    allocator: std.mem.Allocator,
+    io: Io,
+    file: Io.File,
+    size_bytes: u64,
+) InventoryError!IdentityInventory {
+    return inspectIdentityInventory(allocator, io, .{
+        .ctx = &file,
+        .read_at_fn = fileReadAt,
+    }, size_bytes);
 }
 
 /// Applies every destructive-write refusal against injected mountinfo and
@@ -789,18 +1111,273 @@ pub fn preflight(
         if (try deviceHasHolders(io, class_block_dir, name)) return error.TargetHasHolders;
     }
 
-    const contents = try inspectContents(allocator, io, read_only_file, geometry);
-    errdefer allocator.free(contents.partitions);
+    var contents = try inspectFileIdentityInventory(allocator, io, read_only_file, geometry.size_bytes);
+    errdefer contents.deinit(allocator);
     return .{
         .target_name = target_name,
         .whole_disk_name = whole_disk_name,
         .geometry = geometry,
         .removable = try removableFor(io, class_block_dir, whole_disk_name),
         .transport = try transportFor(io, class_block_dir, whole_disk_name),
-        .partition_table = contents.table,
+        .partition_table = contents.partition_table,
         .partitions = contents.partitions,
-        .device_signatures = contents.signatures,
+        .device_signatures = contents.device_signatures,
+        .gpt_disk_guid = contents.gpt_disk_guid,
+        .gpt_disk_guid_len = contents.gpt_disk_guid_len,
+        .device_filesystem = contents.device_filesystem,
     };
+}
+
+fn identifierEql(a: []const u8, b: []const u8) bool {
+    return a.len == b.len and std.ascii.eqlIgnoreCase(a, b);
+}
+
+fn visibleDeviceNameLess(_: void, a: []u8, b: []u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
+fn collectVisibleWholeDisks(
+    allocator: std.mem.Allocator,
+    io: Io,
+    class_block_dir: Io.Dir,
+    excluded_whole_disk_name: []const u8,
+) CollisionError!NameSet {
+    var whole_disks = NameSet.init(allocator);
+    errdefer whole_disks.deinit();
+
+    var iterator = class_block_dir.iterate();
+    while (iterator.next(io) catch return error.InvalidBlockDeviceSysfs) |entry| {
+        if (std.mem.eql(u8, entry.name, excluded_whole_disk_name)) continue;
+        if ((isPartition(io, class_block_dir, entry.name) catch
+            return error.InvalidBlockDeviceSysfs))
+        {
+            continue;
+        }
+        _ = try whole_disks.append(entry.name);
+    }
+    std.mem.sort([]u8, whole_disks.items.items, {}, visibleDeviceNameLess);
+    return whole_disks;
+}
+
+fn appendCollision(
+    collisions: *std.array_list.Managed(Collision),
+    allocator: std.mem.Allocator,
+    kind: CollisionKind,
+    identifier: []const u8,
+    source_partition_table_index: ?u32,
+    source_filesystem: FilesystemIdentityKind,
+    visible_device_name: []const u8,
+    visible_partition_table_index: ?u32,
+    visible_filesystem: FilesystemIdentityKind,
+) std.mem.Allocator.Error!void {
+    var collision = Collision{
+        .kind = kind,
+        .source_partition_table_index = source_partition_table_index,
+        .source_filesystem = source_filesystem,
+        .visible_device_name = try allocator.dupe(u8, visible_device_name),
+        .visible_partition_table_index = visible_partition_table_index,
+        .visible_filesystem = visible_filesystem,
+    };
+    errdefer allocator.free(collision.visible_device_name);
+    collision.identifier_len = copyIdentifierText(&collision.identifier, identifier);
+    try collisions.append(collision);
+}
+
+fn appendFilesystemCollisions(
+    collisions: *std.array_list.Managed(Collision),
+    allocator: std.mem.Allocator,
+    source_filesystem: FilesystemIdentity,
+    source_partition_table_index: ?u32,
+    visible_device_name: []const u8,
+    visible: *const IdentityInventory,
+) std.mem.Allocator.Error!void {
+    const identifier = source_filesystem.identifierText() orelse return;
+
+    if (visible.device_filesystem.identifierText()) |visible_identifier| {
+        if (identifierEql(identifier, visible_identifier)) {
+            try appendCollision(
+                collisions,
+                allocator,
+                .filesystem_identifier,
+                identifier,
+                source_partition_table_index,
+                source_filesystem.kind,
+                visible_device_name,
+                null,
+                visible.device_filesystem.kind,
+            );
+        }
+    }
+
+    for (visible.partitions) |partition| {
+        const visible_identifier = partition.filesystem.identifierText() orelse continue;
+        if (!identifierEql(identifier, visible_identifier)) continue;
+        try appendCollision(
+            collisions,
+            allocator,
+            .filesystem_identifier,
+            identifier,
+            source_partition_table_index,
+            source_filesystem.kind,
+            visible_device_name,
+            partition.table_index,
+            partition.filesystem.kind,
+        );
+    }
+}
+
+fn compareIdentityCollisions(
+    collisions: *std.array_list.Managed(Collision),
+    allocator: std.mem.Allocator,
+    source: *const IdentityInventory,
+    visible_device_name: []const u8,
+    visible: *const IdentityInventory,
+) std.mem.Allocator.Error!void {
+    if (source.gptDiskGuid()) |source_guid| {
+        if (visible.gptDiskGuid()) |visible_guid| {
+            if (identifierEql(source_guid, visible_guid)) {
+                try appendCollision(
+                    collisions,
+                    allocator,
+                    .gpt_disk_guid,
+                    source_guid,
+                    null,
+                    .none,
+                    visible_device_name,
+                    null,
+                    .none,
+                );
+            }
+        }
+    }
+
+    for (source.partitions) |source_partition| {
+        if (source_partition.gptUniqueGuid()) |source_guid| {
+            for (visible.partitions) |visible_partition| {
+                const visible_guid = visible_partition.gptUniqueGuid() orelse continue;
+                if (!identifierEql(source_guid, visible_guid)) continue;
+                try appendCollision(
+                    collisions,
+                    allocator,
+                    .gpt_partition_guid,
+                    source_guid,
+                    source_partition.table_index,
+                    .none,
+                    visible_device_name,
+                    visible_partition.table_index,
+                    .none,
+                );
+            }
+        }
+    }
+
+    try appendFilesystemCollisions(
+        collisions,
+        allocator,
+        source.device_filesystem,
+        null,
+        visible_device_name,
+        visible,
+    );
+    for (source.partitions) |source_partition| {
+        try appendFilesystemCollisions(
+            collisions,
+            allocator,
+            source_partition.filesystem,
+            source_partition.table_index,
+            visible_device_name,
+            visible,
+        );
+    }
+}
+
+fn openVisibleDeviceFromDev(
+    _: ?*anyopaque,
+    io: Io,
+    device_name: []const u8,
+) CollisionError!OpenedVisibleDevice {
+    var dev_dir = Io.Dir.openDirAbsolute(io, "/dev", .{}) catch
+        return error.VisibleDeviceUnavailable;
+    defer dev_dir.close(io);
+
+    const file = dev_dir.openFile(io, device_name, .{ .mode = .read_only }) catch
+        return error.VisibleDeviceUnavailable;
+    errdefer file.close(io);
+    if ((file.stat(io) catch return error.VisibleDeviceUnavailable).kind != .block_device) {
+        return error.VisibleDeviceNotBlockDevice;
+    }
+    return .{ .file = file, .geometry = try probe(file) };
+}
+
+pub fn findVisibleIdentityCollisions(
+    allocator: std.mem.Allocator,
+    io: Io,
+    source: *const IdentityInventory,
+    class_block_dir: Io.Dir,
+    excluded_whole_disk_name: []const u8,
+    opener: VisibleDeviceOpener,
+) CollisionError!CollisionReport {
+    var whole_disks = try collectVisibleWholeDisks(
+        allocator,
+        io,
+        class_block_dir,
+        excluded_whole_disk_name,
+    );
+    defer whole_disks.deinit();
+
+    var collisions = std.array_list.Managed(Collision).init(allocator);
+    errdefer {
+        for (collisions.items) |collision| allocator.free(collision.visible_device_name);
+        collisions.deinit();
+    }
+
+    for (whole_disks.items.items) |whole_disk_name| {
+        var visible_device = try opener.open_fn(opener.context, io, whole_disk_name);
+        defer visible_device.file.close(io);
+
+        var visible = try inspectFileIdentityInventory(
+            allocator,
+            io,
+            visible_device.file,
+            visible_device.geometry.size_bytes,
+        );
+        defer visible.deinit(allocator);
+
+        try compareIdentityCollisions(
+            &collisions,
+            allocator,
+            source,
+            whole_disk_name,
+            &visible,
+        );
+    }
+
+    return .{
+        .collisions = try collisions.toOwnedSlice(),
+        .scanned_visible_disks = whole_disks.items.items.len,
+    };
+}
+
+pub fn findLinuxVisibleIdentityCollisions(
+    allocator: std.mem.Allocator,
+    io: Io,
+    source: *const IdentityInventory,
+    excluded_whole_disk_name: []const u8,
+) CollisionError!CollisionReport {
+    if (builtin.os.tag != .linux) return error.UnsupportedBlockDevicePreflight;
+
+    var class_block_dir = Io.Dir.openDirAbsolute(io, "/sys/class/block", .{ .iterate = true }) catch
+        return error.BlockDeviceSysfsUnavailable;
+    defer class_block_dir.close(io);
+
+    return findVisibleIdentityCollisions(
+        allocator,
+        io,
+        source,
+        class_block_dir,
+        excluded_whole_disk_name,
+        .{},
+    );
 }
 
 /// Validates the raw ioctl answers and turns them into a `Geometry`. Split
@@ -968,12 +1545,59 @@ fn createTestDisk(io: Io, root: Io.Dir, size: u64) !Io.File {
     return file;
 }
 
+fn createNamedTestDisk(io: Io, root: Io.Dir, path: []const u8, size: u64) !Io.File {
+    const file = try root.createFile(io, path, .{ .read = true });
+    try file.setLength(io, size);
+    return file;
+}
+
+const test_gpt_disk_guid = guid.parse("99999999-8888-7777-6666-555555555555");
+const test_gpt_partition_guid = guid.parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+const test_ext4_uuid = [16]u8{
+    0x11, 0x11, 0x11, 0x11,
+    0x22, 0x22, 0x33, 0x33,
+    0x44, 0x44, 0x55, 0x55,
+    0x55, 0x55, 0x55, 0x55,
+};
+const test_fat_volume_id: u32 = 0x1234_5678;
+const test_xfs_uuid = [16]u8{
+    0x01, 0x02, 0x03, 0x04,
+    0x05, 0x06, 0x07, 0x08,
+    0x09, 0x0A, 0x0B, 0x0C,
+    0x0D, 0x0E, 0x0F, 0x10,
+};
+
+fn writeTestExt4Identity(io: Io, file: Io.File, region_offset: u64) !void {
+    var superblock = [_]u8{0} ** 0x78;
+    std.mem.writeInt(u16, superblock[0x38..0x3A], 0xEF53, .little);
+    @memcpy(superblock[0x68..0x78], &test_ext4_uuid);
+    try file.writePositionalAll(io, &superblock, region_offset + 1024);
+}
+
+fn writeTestFatIdentity(io: Io, file: Io.File, region_offset: u64) !void {
+    var boot = [_]u8{0} ** 512;
+    boot[510] = 0x55;
+    boot[511] = 0xAA;
+    boot[66] = 0x29;
+    std.mem.writeInt(u32, boot[67..71], test_fat_volume_id, .little);
+    @memcpy(boot[82..90], "FAT32   ");
+    try file.writePositionalAll(io, &boot, region_offset);
+}
+
+fn writeTestXfsIdentity(io: Io, file: Io.File, region_offset: u64) !void {
+    var superblock = [_]u8{0} ** 120;
+    @memcpy(superblock[0..4], "XFSB");
+    @memcpy(superblock[32..48], &test_xfs_uuid);
+    try file.writePositionalAll(io, &superblock, region_offset);
+}
+
 fn writeTestGpt(io: Io, file: Io.File) !void {
     const protective = mbr.protectiveMbr(4096).encode();
     try file.writePositionalAll(io, &protective, 0);
 
     var header = [_]u8{0} ** mbr.sector_size;
     header[0..8].* = "EFI PART".*;
+    @memcpy(header[56..72], &test_gpt_disk_guid);
     std.mem.writeInt(u64, header[72..80], 2, .little);
     std.mem.writeInt(u32, header[80..84], 1, .little);
     std.mem.writeInt(u32, header[84..88], 128, .little);
@@ -981,12 +1605,32 @@ fn writeTestGpt(io: Io, file: Io.File) !void {
 
     var entry = [_]u8{0} ** 128;
     entry[0] = 1;
+    @memcpy(entry[16..32], &test_gpt_partition_guid);
     std.mem.writeInt(u64, entry[32..40], 2048, .little);
     std.mem.writeInt(u64, entry[40..48], 3071, .little);
     for ("root", 0..) |c, i| std.mem.writeInt(u16, entry[56 + i * 2 ..][0..2], c, .little);
     try file.writePositionalAll(io, &entry, 2 * mbr.sector_size);
-    try file.writePositionalAll(io, &.{ 0x53, 0xEF }, 2048 * mbr.sector_size + 1024 + 0x38);
+    try writeTestExt4Identity(io, file, 2048 * mbr.sector_size);
 }
+
+const TestVisibleDeviceOpener = struct {
+    dev_dir: Io.Dir,
+
+    fn open(context: ?*anyopaque, io: Io, device_name: []const u8) CollisionError!OpenedVisibleDevice {
+        const self: *TestVisibleDeviceOpener = @ptrCast(@alignCast(context.?));
+        const file = self.dev_dir.openFile(io, device_name, .{ .mode = .read_only }) catch
+            return error.VisibleDeviceUnavailable;
+        errdefer file.close(io);
+        const stat = file.stat(io) catch return error.VisibleDeviceUnavailable;
+        return .{
+            .file = file,
+            .geometry = .{
+                .size_bytes = stat.size,
+                .logical_sector_size = 512,
+            },
+        };
+    }
+};
 
 test "preflight rejects a source larger than the target before consulting sysfs" {
     const io = std.testing.io;
@@ -1217,9 +1861,144 @@ test "safe preflight reports transport, removability, GPT name, and filesystem s
     try std.testing.expect(report.removable);
     try std.testing.expectEqual(Transport.usb, report.transport);
     try std.testing.expectEqual(PartitionTable.gpt, report.partition_table);
+    var disk_guid_text: [identity_rewrite.canonical_uuid_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        guid.formatLower(&disk_guid_text, test_gpt_disk_guid),
+        report.gptDiskGuid().?,
+    );
     try std.testing.expectEqual(@as(usize, 1), report.partitions.len);
     try std.testing.expectEqualStrings("root", report.partitions[0].partitionName());
+    var partition_guid_text: [identity_rewrite.canonical_uuid_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        guid.formatLower(&partition_guid_text, test_gpt_partition_guid),
+        report.partitions[0].gptUniqueGuid().?,
+    );
     try std.testing.expect(report.partitions[0].signatures.ext4);
+    try std.testing.expectEqual(FilesystemIdentityKind.ext4, report.partitions[0].filesystem.kind);
+    var filesystem_uuid_text: [identity_rewrite.canonical_uuid_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        identity_rewrite.formatFilesystemUuid(&filesystem_uuid_text, &test_ext4_uuid),
+        report.partitions[0].filesystem.identifierText().?,
+    );
+}
+
+test "identity inventory recognizes FAT and XFS filesystem identifiers" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const fat = try createNamedTestDisk(io, tmp.dir, "fat.img", 2 * 1024 * 1024);
+    defer fat.close(io);
+    try writeTestFatIdentity(io, fat, 0);
+    var fat_inventory = try inspectFileIdentityInventory(allocator, io, fat, 2 * 1024 * 1024);
+    defer fat_inventory.deinit(allocator);
+    try std.testing.expectEqual(FilesystemIdentityKind.fat, fat_inventory.device_filesystem.kind);
+    var fat_serial_text: [identity_rewrite.fat_serial_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        identity_rewrite.formatFatVolumeSerial(&fat_serial_text, test_fat_volume_id),
+        fat_inventory.device_filesystem.identifierText().?,
+    );
+
+    const xfs_file = try createNamedTestDisk(io, tmp.dir, "xfs.img", 2 * 1024 * 1024);
+    defer xfs_file.close(io);
+    try writeTestXfsIdentity(io, xfs_file, 0);
+    var xfs_inventory = try inspectFileIdentityInventory(allocator, io, xfs_file, 2 * 1024 * 1024);
+    defer xfs_inventory.deinit(allocator);
+    try std.testing.expectEqual(FilesystemIdentityKind.xfs, xfs_inventory.device_filesystem.kind);
+    var xfs_uuid_text: [identity_rewrite.canonical_uuid_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        identity_rewrite.formatFilesystemUuid(&xfs_uuid_text, &test_xfs_uuid),
+        xfs_inventory.device_filesystem.identifierText().?,
+    );
+}
+
+test "visible identity collisions exclude the destination whole-disk hierarchy" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var class_block_dir = try createTestTree(io, tmp.dir);
+    defer class_block_dir.close(io);
+
+    try addTestSysfsDevice(
+        allocator,
+        io,
+        tmp.dir,
+        "sdb",
+        "pci/host0/target0/block/sdb",
+        .{ .major = 8, .minor = 16 },
+        null,
+        false,
+        &.{},
+        &.{},
+    );
+    try addTestSysfsDevice(
+        allocator,
+        io,
+        tmp.dir,
+        "sdb1",
+        "pci/host0/target0/block/sdb/sdb1",
+        .{ .major = 8, .minor = 17 },
+        1,
+        false,
+        &.{},
+        &.{},
+    );
+    try addTestSysfsDevice(
+        allocator,
+        io,
+        tmp.dir,
+        "sdc",
+        "pci/host1/target1/block/sdc",
+        .{ .major = 8, .minor = 32 },
+        null,
+        false,
+        &.{},
+        &.{},
+    );
+
+    try tmp.dir.createDirPath(io, "dev");
+    var dev_dir = try tmp.dir.openDir(io, "dev", .{});
+    defer dev_dir.close(io);
+
+    const source = try createNamedTestDisk(io, tmp.dir, "source.img", 2 * 1024 * 1024);
+    defer source.close(io);
+    try writeTestGpt(io, source);
+
+    const excluded = try createNamedTestDisk(io, tmp.dir, "dev/sdb", 2 * 1024 * 1024);
+    defer excluded.close(io);
+    try writeTestGpt(io, excluded);
+
+    const visible = try createNamedTestDisk(io, tmp.dir, "dev/sdc", 2 * 1024 * 1024);
+    defer visible.close(io);
+    try writeTestGpt(io, visible);
+
+    var source_inventory = try inspectFileIdentityInventory(allocator, io, source, 2 * 1024 * 1024);
+    defer source_inventory.deinit(allocator);
+
+    var opener = TestVisibleDeviceOpener{ .dev_dir = dev_dir };
+    var collisions = try findVisibleIdentityCollisions(
+        allocator,
+        io,
+        &source_inventory,
+        class_block_dir,
+        "sdb",
+        .{
+            .context = &opener,
+            .open_fn = TestVisibleDeviceOpener.open,
+        },
+    );
+    defer collisions.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), collisions.scanned_visible_disks);
+    try std.testing.expectEqual(@as(usize, 3), collisions.collisions.len);
+    try std.testing.expectEqual(CollisionKind.gpt_disk_guid, collisions.collisions[0].kind);
+    try std.testing.expectEqual(CollisionKind.gpt_partition_guid, collisions.collisions[1].kind);
+    try std.testing.expectEqual(CollisionKind.filesystem_identifier, collisions.collisions[2].kind);
+    for (collisions.collisions) |collision| {
+        try std.testing.expectEqualStrings("sdc", collision.visible_device_name);
+    }
 }
 
 test "parentDiskName handles nvme and mmc partition names through sysfs" {

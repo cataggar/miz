@@ -36,6 +36,13 @@ const Operations = struct {
         ?*anyopaque,
         *const vmiz.Image,
     ) ?*const vmiz.DevicePreflightReport = preflightReport,
+    source_identity_report_fn: *const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+        std.Io,
+        *const vmiz.Image,
+        *const vmiz.DevicePreflightReport,
+    ) anyerror![]u8 = sourceIdentityReport,
     confirm_fn: *const fn (
         ?*anyopaque,
         std.Io,
@@ -163,6 +170,21 @@ fn runWithOperations(
     };
     defer gpa.free(report_text);
     std.debug.print("{s}", .{report_text});
+
+    const source_report_text = operations.source_identity_report_fn(
+        operations.context,
+        gpa,
+        io,
+        &source,
+        report,
+    ) catch |err| {
+        return fail(
+            "write: source identity inspection failed: {s}; no data was written",
+            .{@errorName(err)},
+        );
+    };
+    defer gpa.free(source_report_text);
+    if (source_report_text.len != 0) std.debug.print("{s}", .{source_report_text});
 
     var detected = operations.detect_gpt_fn(
         operations.context,
@@ -311,6 +333,40 @@ fn preflightReport(
     return image.devicePreflight();
 }
 
+fn sourceImageReadAt(
+    ctx: *const anyopaque,
+    io: std.Io,
+    buffer: []u8,
+    offset: u64,
+) anyerror!usize {
+    const image: *const vmiz.Image = @ptrCast(@alignCast(ctx));
+    return image.pread(io, buffer, offset);
+}
+
+fn sourceIdentityReport(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: *const vmiz.Image,
+    destination_report: *const vmiz.DevicePreflightReport,
+) anyerror![]u8 {
+    var inventory = try vmiz.block_device.inspectIdentityInventory(allocator, io, .{
+        .ctx = source,
+        .read_at_fn = sourceImageReadAt,
+    }, source.virtual_size);
+    defer inventory.deinit(allocator);
+
+    var collisions = try vmiz.block_device.findLinuxVisibleIdentityCollisions(
+        allocator,
+        io,
+        &inventory,
+        destination_report.whole_disk_name,
+    );
+    defer collisions.deinit(allocator);
+
+    return formatSourceIdentityReport(allocator, &inventory, &collisions);
+}
+
 fn confirm(_: ?*anyopaque, io: std.Io, destination_path: []const u8) anyerror!bool {
     std.debug.print(
         "write: overwrite all existing data on '{s}'? [y/N] ",
@@ -415,8 +471,7 @@ fn formatPreflightReport(
         "write: destination preflight for '{s}':\n" ++
             "  kernel device: {s} (whole disk: {s})\n" ++
             "  size: {d} bytes; logical sector: {d} bytes\n" ++
-            "  removable: {s}; transport: {s}\n" ++
-            "  partition table: {s}; device signatures: ",
+            "  removable: {s}; transport: {s}\n",
         .{
             destination_path,
             report.target_name,
@@ -425,29 +480,113 @@ fn formatPreflightReport(
             report.geometry.logical_sector_size,
             if (report.removable) "yes" else "no",
             @tagName(report.transport),
-            @tagName(report.partition_table),
         },
     );
-    try writeSignatures(writer, report.device_signatures);
-    try writer.writeByte('\n');
+    try writeIdentityInventory(
+        writer,
+        report.partition_table,
+        report.gptDiskGuid(),
+        report.device_signatures,
+        report.device_filesystem,
+        report.partitions,
+    );
+    return out.toOwnedSlice();
+}
 
-    if (report.partitions.len == 0) {
-        try writer.writeAll("  partitions: none\n");
+fn formatSourceIdentityReport(
+    allocator: std.mem.Allocator,
+    inventory: *const vmiz.block_device.IdentityInventory,
+    collisions: *const vmiz.block_device.CollisionReport,
+) ![]u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("write: source identity inventory:\n");
+    try writeIdentityInventory(
+        writer,
+        inventory.partition_table,
+        inventory.gptDiskGuid(),
+        inventory.device_signatures,
+        inventory.device_filesystem,
+        inventory.partitions,
+    );
+
+    try writer.print(
+        "write: visible-device identifier collisions ({d} whole disk{s} scanned):\n",
+        .{
+            collisions.scanned_visible_disks,
+            if (collisions.scanned_visible_disks == 1) "" else "s",
+        },
+    );
+    if (collisions.collisions.len == 0) {
+        try writer.writeAll("  none\n");
     } else {
-        for (report.partitions) |partition| {
-            try writer.print(
-                "  partition {d}: LBA {d}-{d}",
-                .{ partition.table_index + 1, partition.first_lba, partition.last_lba },
-            );
-            if (partition.partitionName().len != 0) {
-                try writer.print(" name=\"{s}\"", .{partition.partitionName()});
-            }
-            try writer.writeAll("; signatures: ");
-            try writeSignatures(writer, partition.signatures);
-            try writer.writeByte('\n');
+        for (collisions.collisions) |collision| {
+            try writeCollision(writer, collision);
         }
     }
     return out.toOwnedSlice();
+}
+
+fn writeIdentityInventory(
+    writer: *std.Io.Writer,
+    partition_table: vmiz.block_device.PartitionTable,
+    gpt_disk_guid: ?[]const u8,
+    device_signatures: vmiz.block_device.Signatures,
+    device_filesystem: vmiz.block_device.FilesystemIdentity,
+    partitions: []const vmiz.block_device.PartitionReport,
+) !void {
+    try writer.print("  partition table: {s}", .{@tagName(partition_table)});
+    if (gpt_disk_guid) |disk_guid| try writer.print("; disk GUID: {s}", .{disk_guid});
+    try writer.writeAll("; device signatures: ");
+    try writeSignatures(writer, device_signatures);
+    if (device_filesystem.kind != .none) {
+        try writer.writeAll("; device filesystem: ");
+        try writeFilesystemIdentity(writer, device_filesystem);
+    }
+    try writer.writeByte('\n');
+
+    if (partitions.len == 0) {
+        try writer.writeAll("  partitions: none\n");
+        return;
+    }
+
+    for (partitions) |partition| {
+        try writer.print(
+            "  partition {d}: LBA {d}-{d}",
+            .{ partition.table_index + 1, partition.first_lba, partition.last_lba },
+        );
+        if (partition.gptUniqueGuid()) |unique_guid| {
+            try writer.print(" guid={s}", .{unique_guid});
+        }
+        if (partition.partitionName().len != 0) {
+            try writer.print(" name=\"{s}\"", .{partition.partitionName()});
+        }
+        try writer.writeAll("; signatures: ");
+        try writeSignatures(writer, partition.signatures);
+        if (partition.filesystem.kind != .none) {
+            try writer.writeAll("; filesystem: ");
+            try writeFilesystemIdentity(writer, partition.filesystem);
+        }
+        try writer.writeByte('\n');
+    }
+}
+
+fn writeFilesystemIdentity(
+    writer: *std.Io.Writer,
+    identity: vmiz.block_device.FilesystemIdentity,
+) !void {
+    switch (identity.kind) {
+        .none => try writer.writeAll("none"),
+        .ambiguous => try writer.writeAll("ambiguous"),
+        .fat, .ext4, .xfs => if (identity.identifierText()) |identifier|
+            try writer.print(
+                "{s} {s}",
+                .{ @tagName(identity.kind), identifier },
+            )
+        else
+            try writer.print("{s} (no identifier)", .{@tagName(identity.kind)}),
+    }
 }
 
 fn writeSignatures(writer: *std.Io.Writer, signatures: vmiz.block_device.Signatures) !void {
@@ -460,6 +599,57 @@ fn writeSignatures(writer: *std.Io.Writer, signatures: vmiz.block_device.Signatu
         }
     }
     if (first) try writer.writeAll("none");
+}
+
+fn writeCollision(writer: *std.Io.Writer, collision: vmiz.block_device.Collision) !void {
+    try writer.writeAll("  ");
+    switch (collision.kind) {
+        .gpt_disk_guid => try writer.print(
+            "source disk GUID {s} already exists on {s}\n",
+            .{ collision.identifierText(), collision.visible_device_name },
+        ),
+        .gpt_partition_guid => try writer.print(
+            "source partition {d} GUID {s} already exists on {s} partition {d}\n",
+            .{
+                collision.source_partition_table_index.? + 1,
+                collision.identifierText(),
+                collision.visible_device_name,
+                collision.visible_partition_table_index.? + 1,
+            },
+        ),
+        .filesystem_identifier => {
+            if (collision.source_partition_table_index) |source_partition| {
+                try writer.print(
+                    "source partition {d} {s} identifier {s} already exists on {s}",
+                    .{
+                        source_partition + 1,
+                        @tagName(collision.source_filesystem),
+                        collision.identifierText(),
+                        collision.visible_device_name,
+                    },
+                );
+            } else {
+                try writer.print(
+                    "source device {s} identifier {s} already exists on {s}",
+                    .{
+                        @tagName(collision.source_filesystem),
+                        collision.identifierText(),
+                        collision.visible_device_name,
+                    },
+                );
+            }
+            if (collision.visible_partition_table_index) |visible_partition| {
+                try writer.print(
+                    " partition {d}",
+                    .{visible_partition + 1},
+                );
+            }
+            if (collision.visible_filesystem != .none) {
+                try writer.print(" ({s})", .{@tagName(collision.visible_filesystem)});
+            }
+            try writer.writeByte('\n');
+        },
+    }
 }
 
 fn fail(comptime format: []const u8, args: anytype) u8 {
@@ -477,6 +667,7 @@ const FakeOperations = struct {
     finish_error: ?anyerror = null,
     outcome: ?vmiz.DeviceWriteOutcome = .partition_table_refreshed,
     report: ?*const vmiz.DevicePreflightReport = null,
+    source_identity_report_text: []const u8 = "",
     confirm_result: bool = true,
     expected_format: ?vmiz.Format = null,
     open_calls: usize = 0,
@@ -520,6 +711,17 @@ const FakeOperations = struct {
     ) ?*const vmiz.DevicePreflightReport {
         const self: *FakeOperations = @ptrCast(@alignCast(context.?));
         return self.report;
+    }
+
+    fn sourceIdentityReportFake(
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        _: std.Io,
+        _: *const vmiz.Image,
+        _: *const vmiz.DevicePreflightReport,
+    ) anyerror![]u8 {
+        const self: *FakeOperations = @ptrCast(@alignCast(context.?));
+        return allocator.dupe(u8, self.source_identity_report_text);
     }
 
     fn confirmFake(
@@ -624,6 +826,7 @@ const FakeOperations = struct {
             .context = self,
             .open_destination_fn = openDestinationFake,
             .preflight_report_fn = preflightReportFake,
+            .source_identity_report_fn = sourceIdentityReportFake,
             .confirm_fn = confirmFake,
             .detect_gpt_fn = detectGptFake,
             .invalidate_fn = invalidateFake,
@@ -1174,20 +1377,106 @@ test "write preflight output inventories the target" {
         .first_lba = 2048,
         .last_lba = 4095,
         .name_len = 3,
+        .gpt_unique_guid_len = 36,
+        .filesystem = .{
+            .kind = .fat,
+            .identifier_len = 9,
+        },
         .signatures = .{ .fat = true },
     };
     @memcpy(partition.name[0..3], "EFI");
+    @memcpy(partition.gpt_unique_guid[0..36], "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    @memcpy(partition.filesystem.identifier[0..9], "1234-5678");
     var partitions = [_]vmiz.block_device.PartitionReport{partition};
     var report = testReport();
     report.partition_table = .gpt;
     report.device_signatures.ext4 = true;
+    report.gpt_disk_guid_len = 36;
+    @memcpy(report.gpt_disk_guid[0..36], "99999999-8888-7777-6666-555555555555");
+    report.device_filesystem = .{
+        .kind = .ext4,
+        .identifier_len = 36,
+    };
+    @memcpy(
+        report.device_filesystem.identifier[0..36],
+        "11111111-2222-3333-4444-555555555555",
+    );
     report.partitions = &partitions;
 
     const text = try formatPreflightReport(std.testing.allocator, "target", &report);
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "transport: usb") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "partition table: gpt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "disk GUID: 99999999-8888-7777-6666-555555555555") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "device signatures: ext4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "device filesystem: ext4 11111111-2222-3333-4444-555555555555") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "guid=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "name=\"EFI\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "signatures: fat") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "filesystem: fat 1234-5678") != null);
+}
+
+test "write source identity output reports visible collisions" {
+    var partition = vmiz.block_device.PartitionReport{
+        .table_index = 0,
+        .first_lba = 2048,
+        .last_lba = 4095,
+        .gpt_unique_guid_len = 36,
+        .filesystem = .{
+            .kind = .ext4,
+            .identifier_len = 36,
+        },
+    };
+    @memcpy(partition.gpt_unique_guid[0..36], "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    @memcpy(
+        partition.filesystem.identifier[0..36],
+        "11111111-2222-3333-4444-555555555555",
+    );
+    var partitions = [_]vmiz.block_device.PartitionReport{partition};
+    var inventory = vmiz.block_device.IdentityInventory{
+        .partition_table = .gpt,
+        .partitions = &partitions,
+        .device_signatures = .{},
+        .gpt_disk_guid_len = 36,
+    };
+    @memcpy(inventory.gpt_disk_guid[0..36], "99999999-8888-7777-6666-555555555555");
+
+    var collisions = [_]vmiz.block_device.Collision{
+        .{
+            .kind = .gpt_disk_guid,
+            .identifier_len = 36,
+            .visible_device_name = @constCast("sdc"),
+        },
+        .{
+            .kind = .gpt_partition_guid,
+            .identifier_len = 36,
+            .source_partition_table_index = 0,
+            .visible_device_name = @constCast("sdc"),
+            .visible_partition_table_index = 1,
+        },
+        .{
+            .kind = .filesystem_identifier,
+            .identifier_len = 36,
+            .source_partition_table_index = 0,
+            .source_filesystem = .ext4,
+            .visible_device_name = @constCast("sdc"),
+            .visible_partition_table_index = 1,
+            .visible_filesystem = .xfs,
+        },
+    };
+    @memcpy(collisions[0].identifier[0..36], inventory.gpt_disk_guid[0..36]);
+    @memcpy(collisions[1].identifier[0..36], partition.gpt_unique_guid[0..36]);
+    @memcpy(collisions[2].identifier[0..36], partition.filesystem.identifier[0..36]);
+    const report = vmiz.block_device.CollisionReport{
+        .collisions = &collisions,
+        .scanned_visible_disks = 2,
+    };
+
+    const text = try formatSourceIdentityReport(std.testing.allocator, &inventory, &report);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "source identity inventory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "visible-device identifier collisions (2 whole disks scanned)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "source disk GUID 99999999-8888-7777-6666-555555555555 already exists on sdc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "source partition 1 GUID aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee already exists on sdc partition 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "source partition 1 ext4 identifier 11111111-2222-3333-4444-555555555555 already exists on sdc partition 2 (xfs)") != null);
 }
