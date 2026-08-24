@@ -9210,8 +9210,10 @@ fn dirHash(name: []const u8) u32 {
 
 test "populate ext4 and round-trip a small tree with a multi-extent file" {
     const io = std.testing.io;
-    const path = "test-ext4-roundtrip.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-roundtrip.img");
+    defer std.testing.allocator.free(path);
 
     const fs_size: u64 = 160 * 1024 * 1024;
     const big_size: u64 = 130 * 1024 * 1024;
@@ -9298,8 +9300,10 @@ test "symlink targets at the 60-byte fast-symlink boundary round-trip correctly"
     // The real ext4 limit is `strlen <= 59` for fast symlinks; anything
     // longer must be stored as a regular (data-block-backed) symlink.
     const io = std.testing.io;
-    const path = "test-ext4-symlink-boundary.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-symlink-boundary.img");
+    defer std.testing.allocator.free(path);
 
     const target_59 = "a" ** 59;
     const target_60 = "a" ** 60;
@@ -9360,8 +9364,10 @@ test "symlink targets at the 60-byte fast-symlink boundary round-trip correctly"
 
 test "populate round-trips files that require extent index blocks" {
     const io = std.testing.io;
-    const path = "test-ext4-multilevel-extents.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-multilevel-extents.img");
+    defer std.testing.allocator.free(path);
 
     const fs_size: u64 = 768 * 1024 * 1024;
     const big_size: u64 = 544 * 1024 * 1024;
@@ -9492,8 +9498,10 @@ test "synthetic extent trees encode and decode beyond depth one" {
 
 test "reader rejects missing paths and wrong node kinds" {
     const io = std.testing.io;
-    const path = "test-ext4-errors.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-errors.img");
+    defer std.testing.allocator.free(path);
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "dir", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
@@ -9515,8 +9523,10 @@ test "reader rejects missing paths and wrong node kinds" {
 
 test "reader exposes inode link counts" {
     const io = std.testing.io;
-    const path = "test-ext4-link-count.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-link-count.img");
+    defer std.testing.allocator.free(path);
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "empty-dir", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
@@ -9558,8 +9568,10 @@ test "directory link counts stay correct across many subdirectories" {
     // holding only regular files stays a leaf, and that the root is counted
     // from its own children instead of itself.
     const io = std.testing.io;
-    const path = "test-ext4-link-count-fan.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-link-count-fan.img");
+    defer std.testing.allocator.free(path);
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "fan", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
@@ -9606,8 +9618,10 @@ test "directory link counts stay correct across many subdirectories" {
 
 test "strict writer-compatible scan exposes deterministic owned view" {
     const io = std.testing.io;
-    const path = "test-ext4-strict-scan.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-strict-scan.img");
+    defer std.testing.allocator.free(path);
 
     const attrs = [_]Xattr{.{ .name = "user.test", .value = "value" }};
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
@@ -9647,8 +9661,10 @@ test "strict writer-compatible scan exposes deterministic owned view" {
 
 test "strict writer-compatible scan rejects divergent inode timestamps" {
     const io = std.testing.io;
-    const path = "test-ext4-strict-timestamp.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-strict-timestamp.img");
+    defer std.testing.allocator.free(path);
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "file", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "test" },
@@ -9687,8 +9703,10 @@ test "strict writer-compatible scan rejects divergent inode timestamps" {
 
 test "reader opens read-only-safe 64-byte group descriptor ext4 images" {
     const io = std.testing.io;
-    const path = "test-ext4-reader-64byte-gdt.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-reader-64byte-gdt.img");
+    defer std.testing.allocator.free(path);
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
@@ -9718,8 +9736,10 @@ test "reader opens read-only-safe 64-byte group descriptor ext4 images" {
 
 test "the pinned Ubuntu 64-bit profile rebuilds resize and orphan metadata" {
     const io = std.testing.io;
-    const path = "test-ext4-pinned-profile.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-pinned-profile.img");
+    defer std.testing.allocator.free(path);
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
@@ -9789,8 +9809,10 @@ test "the pinned Ubuntu 64-bit profile rebuilds resize and orphan metadata" {
 
 test "a real e2fsprogs pinned profile survives import and native growth" {
     const io = std.testing.io;
-    const path = "test-ext4-pinned-mke2fs.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-pinned-mke2fs.img");
+    defer std.testing.allocator.free(path);
     const length: u64 = 64 * 1024 * 1024;
     var blocks_text: [32]u8 = undefined;
     try runExternalToolChecked(std.testing.allocator, "mke2fs", &.{
@@ -9927,13 +9949,16 @@ fn populateSyntheticPinnedOrphan(
 
 test "synthetic pinned profiles preserve source orphan inode numbers" {
     const io = std.testing.io;
-    for ([_]struct { path: []const u8, inode: u32 }{
-        .{ .path = "test-ext4-pinned-orphan-12.img", .inode = 12 },
-        .{ .path = "test-ext4-pinned-orphan-706.img", .inode = 706 },
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    for ([_]struct { name: []const u8, inode: u32 }{
+        .{ .name = "test-ext4-pinned-orphan-12.img", .inode = 12 },
+        .{ .name = "test-ext4-pinned-orphan-706.img", .inode = 706 },
     }) |case| {
-        defer Io.Dir.cwd().deleteFile(io, case.path) catch {};
-        try populateSyntheticPinnedOrphan(io, case.path, case.inode);
-        const file = try Io.Dir.cwd().openFile(io, case.path, .{ .mode = .read_write });
+        const path = try temporaryTestPath(std.testing.allocator, io, &temporary, case.name);
+        defer std.testing.allocator.free(path);
+        try populateSyntheticPinnedOrphan(io, path, case.inode);
+        const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
         defer file.close(io);
         var sb: [superblock_size]u8 = undefined;
         _ = try file.readPositionalAll(io, &sb, superblock_offset);
@@ -9945,7 +9970,7 @@ test "synthetic pinned profiles preserve source orphan inode numbers" {
         });
         defer imported.deinit();
         try std.testing.expectEqual(@as(?u32, case.inode), imported.identity.orphan_file_inode);
-        try expectE2fsckClean(case.path);
+        try expectE2fsckClean(path);
     }
 }
 
@@ -9959,8 +9984,10 @@ test "orphan file relocates past the tree when its preserved inode collides" {
     // referenced only by `s_orphan_file_inum`, so it must be relocated to a
     // fresh inode past the tree and the superblock pointer rewritten instead.
     const io = std.testing.io;
-    const path = "test-ext4-orphan-relocate.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-orphan-relocate.img");
+    defer std.testing.allocator.free(path);
 
     // Enough owning inodes that `next_inode` climbs well past the low orphan
     // inode we preserve, reproducing the collision the fix resolves.
@@ -10032,8 +10059,10 @@ test "populate cleans up ext4 writer allocations on every allocation-failure pat
     // no leaked blocks -- exactly the defect that dumped tens of thousands of
     // leak reports when the customize commit aborted at production scale.
     const io = std.testing.io;
-    const path = "test-ext4-alloc-failure.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-alloc-failure.img");
+    defer std.testing.allocator.free(path);
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         populateForAllocationFailureCheck,
@@ -10043,8 +10072,10 @@ test "populate cleans up ext4 writer allocations on every allocation-failure pat
 
 test "populate respects non-zero partition-relative offsets" {
     const io = std.testing.io;
-    const path = "test-ext4-offset.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-offset.img");
+    defer std.testing.allocator.free(path);
 
     const prefix_off: u64 = 1 * 1024 * 1024;
     const fs_len: u64 = 8 * 1024 * 1024;
@@ -10087,8 +10118,10 @@ test "populate respects non-zero partition-relative offsets" {
 
 test "populate round-trips empty regular files" {
     const io = std.testing.io;
-    const path = "test-ext4-empty.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-empty.img");
+    defer std.testing.allocator.free(path);
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "empty", .kind = .file, .mode = 0o640, .uid = 7, .gid = 8, .size = 0 },
@@ -10113,8 +10146,10 @@ test "populate round-trips empty regular files" {
 
 test "populate round-trips xattrs and metadata checksums" {
     const io = std.testing.io;
-    const path = "test-ext4-xattrs.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-xattrs.img");
+    defer std.testing.allocator.free(path);
 
     const selinux = [_]Xattr{
         .{ .name = "security.selinux", .value = "system_u:object_r:bin_t:s0" },
@@ -10187,8 +10222,10 @@ test "populate round-trips xattrs and metadata checksums" {
 
 test "large directories use htree indexing" {
     const io = std.testing.io;
-    const path = "test-ext4-htree.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-htree.img");
+    defer std.testing.allocator.free(path);
 
     var entries = std.array_list.Managed(InMemoryEntry).init(std.testing.allocator);
     defer entries.deinit();
@@ -10275,8 +10312,10 @@ test "large directories use htree indexing" {
 
 test "very large directories use multi-level htree indexing" {
     const io = std.testing.io;
-    const path = "test-ext4-multilevel-htree.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-multilevel-htree.img");
+    defer std.testing.allocator.free(path);
 
     const entry_count = 8_200;
     var entries = std.array_list.Managed(InMemoryEntry).init(std.testing.allocator);
@@ -10362,8 +10401,10 @@ test "very large directories use multi-level htree indexing" {
 
 test "resize grows ext4 filesystems in place" {
     const io = std.testing.io;
-    const path = "test-ext4-resize.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-resize.img");
+    defer std.testing.allocator.free(path);
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
@@ -10393,8 +10434,10 @@ test "resize grows ext4 filesystems in place" {
 
 test "Editor.open loads live free-space state and a no-op flush leaves the image untouched" {
     const io = std.testing.io;
-    const path = "test-ext4-editor-open.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-editor-open.img");
+    defer std.testing.allocator.free(path);
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
@@ -10439,8 +10482,10 @@ test "Editor.open loads live free-space state and a no-op flush leaves the image
 
 test "Editor.open rejects images with a foreign group descriptor layout" {
     const io = std.testing.io;
-    const path = "test-ext4-editor-reject.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-editor-reject.img");
+    defer std.testing.allocator.free(path);
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
@@ -10467,8 +10512,10 @@ test "Editor.open rejects images with a foreign group descriptor layout" {
 
 test "Editor frees an inode's extent-tree blocks (leaf, index, and xattr) and reuses them" {
     const io = std.testing.io;
-    const path = "test-ext4-editor-free-extents.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-editor-free-extents.img");
+    defer std.testing.allocator.free(path);
 
     // Large enough to force real extent index blocks (see "populate round-trips
     // files that require extent index blocks"), so freeing exercises the
@@ -10545,8 +10592,10 @@ test "splitParentAndName splits paths and rejects the root" {
 
 test "Editor removes directory entries by splicing, across a large htree-indexed directory" {
     const io = std.testing.io;
-    const path = "test-ext4-editor-unlink-htree.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-editor-unlink-htree.img");
+    defer std.testing.allocator.free(path);
 
     var entries = std.array_list.Managed(InMemoryEntry).init(std.testing.allocator);
     defer entries.deinit();
@@ -10602,8 +10651,10 @@ test "Editor removes directory entries by splicing, across a large htree-indexed
 
 test "Editor.deleteFile removes a regular file, frees its inode/blocks, and leaves siblings intact" {
     const io = std.testing.io;
-    const path = "test-ext4-editor-deletefile.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-editor-deletefile.img");
+    defer std.testing.allocator.free(path);
 
     const big_size: u64 = 544 * 1024 * 1024;
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
@@ -10670,8 +10721,10 @@ test "Editor.deleteFile removes a regular file, frees its inode/blocks, and leav
 
 test "Editor.deleteTree recursively removes a directory and adjusts the parent's link count" {
     const io = std.testing.io;
-    const path = "test-ext4-editor-deletetree.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-editor-deletetree.img");
+    defer std.testing.allocator.free(path);
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "keep", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
@@ -10728,8 +10781,10 @@ test "Editor.deleteTree recursively removes a directory and adjusts the parent's
 
 test "Editor frees inodes with valid metadata checksums" {
     const io = std.testing.io;
-    const path = "test-ext4-editor-free-inode-checksum.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-editor-free-inode-checksum.img");
+    defer std.testing.allocator.free(path);
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "remove-file", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "gone" },
@@ -10775,8 +10830,10 @@ test "Editor frees inodes with valid metadata checksums" {
 
 test "Editor.writeFile overwrites content, preserves xattrs, and handles growth/shrink" {
     const io = std.testing.io;
-    const path = "test-ext4-editor-writefile.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-editor-writefile.img");
+    defer std.testing.allocator.free(path);
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
@@ -10851,8 +10908,10 @@ test "Editor.writeFile overwrites content, preserves xattrs, and handles growth/
 
 test "Editor.writeFile rolls back and reports TooManyExtents when free space is too fragmented" {
     const io = std.testing.io;
-    const path = "test-ext4-editor-writefile-fragmented.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-editor-writefile-fragmented.img");
+    defer std.testing.allocator.free(path);
 
     var entries = std.array_list.Managed(InMemoryEntry).init(std.testing.allocator);
     defer entries.deinit();
@@ -10910,8 +10969,10 @@ test "Editor.writeFile rolls back and reports TooManyExtents when free space is 
 
 test "Editor.flush keeps sparse-super backup superblocks and GDT copies in sync with the primary" {
     const io = std.testing.io;
-    const path = "test-ext4-editor-flush-backups.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-editor-flush-backups.img");
+    defer std.testing.allocator.free(path);
 
     // >= 3 groups (each default_blocks_per_group is 128 MiB), so group 1 has
     // a real sparse-super backup copy distinct from the primary in group 0.
@@ -11020,8 +11081,10 @@ pub fn expectE2fsckClean(path: []const u8) !void {
 
 test "Editor edits (deletes, recursive tree removal, and overwrite) pass a real e2fsck -f check" {
     const io = std.testing.io;
-    const path = "test-ext4-editor-e2fsck.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-editor-e2fsck.img");
+    defer std.testing.allocator.free(path);
 
     var entries = std.array_list.Managed(InMemoryEntry).init(std.testing.allocator);
     defer entries.deinit();
@@ -11178,8 +11241,10 @@ fn expectMinimalPopulateLength(
 
 test "the minimum size is the smallest one that populates, and it really populates" {
     const io = std.testing.io;
-    const path = "test-ext4-minimum-size.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-minimum-size.img");
+    defer std.testing.allocator.free(path);
 
     var tree = minimumSizeTestTree();
     tree.bind();
@@ -11629,8 +11694,8 @@ fn dumpInodeAlloc(
     scratch_path: []const u8,
     max_bytes: usize,
 ) !?[]u8 {
-    var command: [64]u8 = undefined;
-    const request = try std.fmt.bufPrint(&command, "dump <{d}> {s}", .{ inode_number, scratch_path });
+    const request = try std.fmt.allocPrint(allocator, "dump <{d}> {s}", .{ inode_number, scratch_path });
+    defer allocator.free(request);
     const output = (try runToolCapture(allocator, "debugfs", &.{ "-R", request, image_path })) orelse
         return null;
     allocator.free(output);
@@ -11672,10 +11737,12 @@ test "the default journal size follows mke2fs's own ladder" {
 
 test "the writer stays journal-less unless asked, and a journal moves no file" {
     const io = std.testing.io;
-    const plain_path = "test-ext4-journal-absent.img";
-    const journalled_path = "test-ext4-journal-present.img";
-    defer Io.Dir.cwd().deleteFile(io, plain_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, journalled_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const plain_path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-journal-absent.img");
+    defer std.testing.allocator.free(plain_path);
+    const journalled_path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-journal-present.img");
+    defer std.testing.allocator.free(journalled_path);
 
     const fs_size: u64 = 64 * 1024 * 1024;
     var plain_tree = journalTestTree();
@@ -11730,8 +11797,10 @@ test "the writer stays journal-less unless asked, and a journal moves no file" {
 
 test "a journalled filesystem passes e2fsck and reports the journal e2fsprogs expects" {
     const io = std.testing.io;
-    const path = "test-ext4-journal-e2fsck.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-journal-e2fsck.img");
+    defer std.testing.allocator.free(path);
 
     var tree = journalTestTree();
     tree.bind();
@@ -11772,10 +11841,12 @@ test "a journalled filesystem passes e2fsck and reports the journal e2fsprogs ex
 
 test "the JBD2 superblock is byte-identical to the one mke2fs writes" {
     const io = std.testing.io;
-    const ours_path = "test-ext4-journal-ours.img";
-    const theirs_path = "test-ext4-journal-mke2fs.img";
-    defer Io.Dir.cwd().deleteFile(io, ours_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, theirs_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const ours_path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-journal-ours.img");
+    defer std.testing.allocator.free(ours_path);
+    const theirs_path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-journal-mke2fs.img");
+    defer std.testing.allocator.free(theirs_path);
 
     // 64 MiB, so both writers land on the ladder's 1024-block tier without
     // either being told a size.
@@ -11809,21 +11880,35 @@ test "the JBD2 superblock is byte-identical to the one mke2fs writes" {
         else => return err,
     };
 
+    const ours_dump_path = try temporaryTestPath(
+        std.testing.allocator,
+        io,
+        &temporary,
+        "test-ext4-journal-ours.jbd2",
+    );
+    defer std.testing.allocator.free(ours_dump_path);
     const ours = (try dumpInodeAlloc(
         std.testing.allocator,
         io,
         ours_path,
         journal_inode,
-        "test-ext4-journal-ours.jbd2",
+        ours_dump_path,
         1024,
     )) orelse return error.SkipZigTest;
     defer std.testing.allocator.free(ours);
+    const theirs_dump_path = try temporaryTestPath(
+        std.testing.allocator,
+        io,
+        &temporary,
+        "test-ext4-journal-mke2fs.jbd2",
+    );
+    defer std.testing.allocator.free(theirs_dump_path);
     const theirs = (try dumpInodeAlloc(
         std.testing.allocator,
         io,
         theirs_path,
         journal_inode,
-        "test-ext4-journal-mke2fs.jbd2",
+        theirs_dump_path,
         1024,
     )) orelse return error.SkipZigTest;
     defer std.testing.allocator.free(theirs);
@@ -11847,8 +11932,10 @@ test "the JBD2 superblock is byte-identical to the one mke2fs writes" {
 
 test "the journal inode carries the layout e2fsprogs and the kernel read" {
     const io = std.testing.io;
-    const path = "test-ext4-journal-inode.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-journal-inode.img");
+    defer std.testing.allocator.free(path);
 
     var tree = journalTestTree();
     tree.bind();
@@ -11890,8 +11977,10 @@ test "the journal inode carries the layout e2fsprogs and the kernel read" {
 
 test "the writer names every journal size it refuses" {
     const io = std.testing.io;
-    const path = "test-ext4-journal-refusals.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-journal-refusals.img");
+    defer std.testing.allocator.free(path);
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
 
@@ -11944,8 +12033,10 @@ test "the writer names every journal size it refuses" {
 
 test "without an inode ratio a filesystem gets only the inodes its content needs" {
     const io = std.testing.io;
-    const path = "test-ext4-inodes-content.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-inodes-content.img");
+    defer std.testing.allocator.free(path);
 
     var tree = journalTestTree();
     tree.bind();
@@ -11962,8 +12053,10 @@ test "without an inode ratio a filesystem gets only the inodes its content needs
 
 test "an inode ratio gives a filesystem the inodes its size warrants" {
     const io = std.testing.io;
-    const path = "test-ext4-inodes-ratio.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-inodes-ratio.img");
+    defer std.testing.allocator.free(path);
 
     var tree = journalTestTree();
     tree.bind();
@@ -11981,8 +12074,10 @@ test "an inode ratio gives a filesystem the inodes its size warrants" {
 
 test "an inode ratio is a floor, so content that needs more inodes still gets them" {
     const io = std.testing.io;
-    const path = "test-ext4-inodes-floor.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-inodes-floor.img");
+    defer std.testing.allocator.free(path);
 
     // Far more files than a 16 MiB filesystem's ratio would allow for: at
     // 16384 bytes per inode that budget is 1024, and this needs more.
@@ -12006,8 +12101,10 @@ test "an inode ratio is a floor, so content that needs more inodes still gets th
 
 test "an inode ratio of zero is refused rather than dividing by it" {
     const io = std.testing.io;
-    const path = "test-ext4-inodes-zero.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-inodes-zero.img");
+    defer std.testing.allocator.free(path);
 
     var tree = journalTestTree();
     tree.bind();
@@ -12041,8 +12138,10 @@ test "an inode ratio raises the minimum size, because the inode table is bigger"
 
 test "an explicit journal size is honoured and still passes e2fsck" {
     const io = std.testing.io;
-    const path = "test-ext4-journal-explicit.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-journal-explicit.img");
+    defer std.testing.allocator.free(path);
 
     var tree = journalTestTree();
     tree.bind();
@@ -12062,8 +12161,10 @@ test "an explicit journal size is honoured and still passes e2fsck" {
 
 test "resize grows a journalled filesystem and leaves its journal intact" {
     const io = std.testing.io;
-    const path = "test-ext4-journal-resize.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-journal-resize.img");
+    defer std.testing.allocator.free(path);
 
     var tree = journalTestTree();
     tree.bind();
@@ -12129,8 +12230,10 @@ fn testFileFingerprint(io: Io, file: Io.File) !u64 {
 
 test "resize preflight reports explicit range and format errors" {
     const io = std.testing.io;
-    const path = "test-ext4-resize-preflight-errors.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-resize-preflight-errors.img");
+    defer std.testing.allocator.free(path);
 
     var tree = journalTestTree();
     tree.bind();
@@ -12167,8 +12270,10 @@ test "resize preflight reports explicit range and format errors" {
 
 test "resize preflight rejects unsupported profiles without mutation" {
     const io = std.testing.io;
-    const path = "test-ext4-resize-preflight-unsupported.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-resize-preflight-unsupported.img");
+    defer std.testing.allocator.free(path);
 
     var tree = journalTestTree();
     tree.bind();
@@ -12199,8 +12304,10 @@ test "resize preflight rejects unsupported profiles without mutation" {
 
 test "resize supports a resize_inode filesystem without moving its data" {
     const io = std.testing.io;
-    const path = "test-ext4-journal-resize-inode.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-journal-resize-inode.img");
+    defer std.testing.allocator.free(path);
 
     var tree = journalTestTree();
     tree.bind();
@@ -12225,8 +12332,10 @@ test "resize supports a resize_inode filesystem without moving its data" {
 
 test "resize rejects non-sparse-super growth before mutation" {
     const io = std.testing.io;
-    const path = "test-ext4-resize-non-sparse.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-resize-non-sparse.img");
+    defer std.testing.allocator.free(path);
 
     var tree = journalTestTree();
     tree.bind();
@@ -12263,8 +12372,10 @@ test "resize rejects non-sparse-super growth before mutation" {
 
 test "resize uses a metadata checksum seed for stock group metadata" {
     const io = std.testing.io;
-    const path = "test-ext4-resize-csum-seed.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-resize-csum-seed.img");
+    defer std.testing.allocator.free(path);
 
     var tree = journalTestTree();
     tree.bind();
@@ -12354,8 +12465,10 @@ test "resize uses a metadata checksum seed for stock group metadata" {
 
 test "resize reserves resize_inode GDT space in appended sparse-super groups" {
     const io = std.testing.io;
-    const path = "test-ext4-resize-inode-gdt-expansion.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-resize-inode-gdt-expansion.img");
+    defer std.testing.allocator.free(path);
 
     var tree = journalTestTree();
     tree.bind();
@@ -12433,8 +12546,10 @@ test "resize reserves resize_inode GDT space in appended sparse-super groups" {
 
 test "resize_inode mapping is shortened when the primary GDT consumes a reservation" {
     const io = std.testing.io;
-    const path = "test-ext4-resize-inode-consume.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-resize-inode-consume.img");
+    defer std.testing.allocator.free(path);
 
     var tree = journalTestTree();
     tree.bind();
@@ -12476,8 +12591,10 @@ test "resize_inode mapping is shortened when the primary GDT consumes a reservat
 
 test "malformed resize_inode mapping is rejected before mutation" {
     const io = std.testing.io;
-    const path = "test-ext4-resize-inode-malformed.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-resize-inode-malformed.img");
+    defer std.testing.allocator.free(path);
 
     var tree = journalTestTree();
     tree.bind();
@@ -12525,8 +12642,10 @@ test "malformed resize_inode mapping is rejected before mutation" {
 
 test "a journalled image is a distinct profile the strict scan refuses" {
     const io = std.testing.io;
-    const path = "test-ext4-journal-profile.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-journal-profile.img");
+    defer std.testing.allocator.free(path);
 
     var tree = journalTestTree();
     tree.bind();
@@ -12842,8 +12961,10 @@ fn expectDirNames(entries: []const DirEntry, expected: []const []const u8) !void
 
 test "a strict scan reports peaks and names the limit that stopped it" {
     const io = std.testing.io;
-    const path = "test-ext4-strict-limits.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-strict-limits.img");
+    defer std.testing.allocator.free(path);
 
     const attrs = [_]Xattr{.{ .name = "user.test", .value = "value" }};
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
@@ -12961,6 +13082,17 @@ fn writeFixtureFile(io: Io, path: []const u8, bytes: []const u8) !void {
     try file.writePositionalAll(io, bytes, 0);
 }
 
+fn temporaryTestPath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    temporary: *std.testing.TmpDir,
+    sub_path: []const u8,
+) ![]const u8 {
+    var root_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    return std.fs.path.join(allocator, &.{ root_buffer[0..root_length], sub_path });
+}
+
 fn findGeneralEntry(tree: *GeneralTree, path: []const u8) ?GeneralEntry {
     var index: usize = 0;
     while (index < tree.nodeCount()) : (index += 1) {
@@ -12996,46 +13128,86 @@ fn expectGeneralXattr(entry: GeneralEntry, name: []const u8, value: []const u8) 
     return error.TestUnexpectedResult;
 }
 
-const stock_fixture_source = "test-ext4-general-src";
-const stock_fixture_image = "test-ext4-general.img";
+const stock_fixture_source_name = "test-ext4-general-src";
+const stock_fixture_image_name = "test-ext4-general.img";
+const stock_fixture_xattr_name = "test-ext4-general-xattr.bin";
+const stock_fixture_script_name = "test-ext4-general-debugfs.txt";
 const stock_fixture_bytes: u64 = 16 * 1024 * 1024;
 const stock_long_symlink_target = "../" ++ ("deep/" ** 20) ++ "target";
+
+const StockFixturePaths = struct {
+    source: []const u8,
+    image: []const u8,
+    big_xattr: []const u8,
+    script: []const u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: Io,
+        temporary: *std.testing.TmpDir,
+    ) !StockFixturePaths {
+        return .{
+            .source = try temporaryTestPath(allocator, io, temporary, stock_fixture_source_name),
+            .image = try temporaryTestPath(allocator, io, temporary, stock_fixture_image_name),
+            .big_xattr = try temporaryTestPath(allocator, io, temporary, stock_fixture_xattr_name),
+            .script = try temporaryTestPath(allocator, io, temporary, stock_fixture_script_name),
+        };
+    }
+
+    fn deinit(self: *StockFixturePaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.source);
+        allocator.free(self.image);
+        allocator.free(self.big_xattr);
+        allocator.free(self.script);
+        self.* = undefined;
+    }
+};
 
 /// Builds a filesystem with `mke2fs`'s own ext4 defaults from a populated
 /// directory, then adds through `debugfs` the things a directory cannot carry
 /// without privileges: device nodes, a FIFO, fixed ownership and timestamps,
 /// and both inline and block-backed extended attributes.
-fn buildStockFixture(allocator: std.mem.Allocator, io: Io) !void {
+fn buildStockFixture(
+    allocator: std.mem.Allocator,
+    io: Io,
+    paths: *const StockFixturePaths,
+) !void {
     const cwd = Io.Dir.cwd();
-    cwd.deleteTree(io, stock_fixture_source) catch {};
-    cwd.deleteFile(io, stock_fixture_image) catch {};
-    try cwd.createDirPath(io, stock_fixture_source ++ "/etc/rc.d");
-    try cwd.createDirPath(io, stock_fixture_source ++ "/usr/bin");
-    try cwd.createDirPath(io, stock_fixture_source ++ "/usr/lib");
-    try cwd.createDirPath(io, stock_fixture_source ++ "/var/empty");
-    try cwd.createDirPath(io, stock_fixture_source ++ "/dev");
-    try writeFixtureFile(io, stock_fixture_source ++ "/etc/hostname", "vmiz-general\n");
+    for ([_][]const u8{ "etc/rc.d", "usr/bin", "usr/lib", "var/empty", "dev" }) |suffix| {
+        const dir_path = try std.fs.path.join(allocator, &.{ paths.source, suffix });
+        defer allocator.free(dir_path);
+        try cwd.createDirPath(io, dir_path);
+    }
+    const hostname_path = try std.fs.path.join(allocator, &.{ paths.source, "etc/hostname" });
+    defer allocator.free(hostname_path);
+    try writeFixtureFile(io, hostname_path, "vmiz-general\n");
 
     const tool_bytes = try allocator.alloc(u8, 9000);
     defer allocator.free(tool_bytes);
     for (tool_bytes, 0..) |*byte, index| byte.* = @truncate(index * 7 + 3);
-    try writeFixtureFile(io, stock_fixture_source ++ "/usr/bin/tool", tool_bytes);
+    const tool_path = try std.fs.path.join(allocator, &.{ paths.source, "usr/bin/tool" });
+    defer allocator.free(tool_path);
+    try writeFixtureFile(io, tool_path, tool_bytes);
+    const tool_alias_path = try std.fs.path.join(allocator, &.{ paths.source, "usr/bin/tool-alias" });
+    defer allocator.free(tool_alias_path);
     try cwd.hardLink(
-        stock_fixture_source ++ "/usr/bin/tool",
+        tool_path,
         cwd,
-        stock_fixture_source ++ "/usr/bin/tool-alias",
+        tool_alias_path,
         io,
         .{},
     );
-    try cwd.symLink(io, "../bin/tool", stock_fixture_source ++ "/usr/lib/short", .{});
-    try cwd.symLink(io, stock_long_symlink_target, stock_fixture_source ++ "/usr/lib/long", .{});
+    const short_link_path = try std.fs.path.join(allocator, &.{ paths.source, "usr/lib/short" });
+    defer allocator.free(short_link_path);
+    try cwd.symLink(io, "../bin/tool", short_link_path, .{});
+    const long_link_path = try std.fs.path.join(allocator, &.{ paths.source, "usr/lib/long" });
+    defer allocator.free(long_link_path);
+    try cwd.symLink(io, stock_long_symlink_target, long_link_path, .{});
 
-    const big_xattr_path = "test-ext4-general-xattr.bin";
-    defer cwd.deleteFile(io, big_xattr_path) catch {};
     const big_xattr = try allocator.alloc(u8, 300);
     defer allocator.free(big_xattr);
     @memset(big_xattr, 'x');
-    try writeFixtureFile(io, big_xattr_path, big_xattr);
+    try writeFixtureFile(io, paths.big_xattr, big_xattr);
 
     var size_text: [32]u8 = undefined;
     try runExternalToolChecked(allocator, "mke2fs", &.{
@@ -13047,15 +13219,13 @@ fn buildStockFixture(allocator: std.mem.Allocator, io: Io) !void {
         "-I",
         "256",
         "-d",
-        stock_fixture_source,
-        stock_fixture_image,
+        paths.source,
+        paths.image,
         // mke2fs counts in filesystem blocks, which `-b 4096` just set.
         try std.fmt.bufPrint(&size_text, "{d}", .{stock_fixture_bytes / 4096}),
     });
 
-    const script_path = "test-ext4-general-debugfs.txt";
-    defer cwd.deleteFile(io, script_path) catch {};
-    try writeFixtureFile(io, script_path,
+    const script = try std.fmt.allocPrint(allocator,
         \\cd /dev
         \\mknod console c 5 1
         \\mknod loop0 b 7 0
@@ -13073,34 +13243,33 @@ fn buildStockFixture(allocator: std.mem.Allocator, io: Io) !void {
         \\sif /etc/hostname ctime @1300000000
         \\ea_set /etc/hostname security.selinux system_u:object_r:etc_t:s0
         \\ea_set /etc/hostname user.small inline
-        \\ea_set -f test-ext4-general-xattr.bin /usr/bin/tool user.big
+        \\ea_set -f {s} /usr/bin/tool user.big
         \\quit
         \\
-    );
+    , .{paths.big_xattr});
+    defer allocator.free(script);
+    try writeFixtureFile(io, paths.script, script);
     try runExternalToolChecked(allocator, "debugfs", &.{
         "-w",
         "-f",
-        script_path,
-        stock_fixture_image,
+        paths.script,
+        paths.image,
     });
-}
-
-fn removeStockFixture(io: Io) void {
-    const cwd = Io.Dir.cwd();
-    cwd.deleteTree(io, stock_fixture_source) catch {};
-    cwd.deleteFile(io, stock_fixture_image) catch {};
 }
 
 test "the general importer reads a stock mke2fs ext4 filesystem in full" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    defer removeStockFixture(io);
-    buildStockFixture(allocator, io) catch |err| switch (err) {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var paths = try StockFixturePaths.init(allocator, io, &temporary);
+    defer paths.deinit(allocator);
+    buildStockFixture(allocator, io, &paths) catch |err| switch (err) {
         error.SkipZigTest => return error.SkipZigTest,
         else => return err,
     };
 
-    const file = try Io.Dir.cwd().openFile(io, stock_fixture_image, .{});
+    const file = try Io.Dir.cwd().openFile(io, paths.image, .{});
     defer file.close(io);
     var reader = try openGeneral(io, file, allocator, .{});
     defer reader.deinit();
@@ -13279,8 +13448,10 @@ fn writeGeneralFixture(io: Io, path: []const u8, length: u64) !Io.File {
 
 test "the general importer accepts this module's own output and reports its profile" {
     const io = std.testing.io;
-    const path = "test-ext4-general-self.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-general-self.img");
+    defer std.testing.allocator.free(path);
     const length = 8 * 1024 * 1024;
     const file = try writeGeneralFixture(io, path, length);
     defer file.close(io);
@@ -13320,8 +13491,10 @@ test "the general importer accepts this module's own output and reports its prof
 
 test "the general importer refuses a source the journal still owns" {
     const io = std.testing.io;
-    const path = "test-ext4-general-dirty.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-general-dirty.img");
+    defer std.testing.allocator.free(path);
     const length = 8 * 1024 * 1024;
     const file = try writeGeneralFixture(io, path, length);
     defer file.close(io);
@@ -13343,8 +13516,10 @@ test "the general importer refuses a source the journal still owns" {
 
 test "the general importer refuses a source with orphan inodes pending" {
     const io = std.testing.io;
-    const path = "test-ext4-general-orphan.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-general-orphan.img");
+    defer std.testing.allocator.free(path);
     const length = 8 * 1024 * 1024;
     const file = try writeGeneralFixture(io, path, length);
     defer file.close(io);
@@ -13366,8 +13541,10 @@ test "the general importer refuses a source with orphan inodes pending" {
 test "the writer emits hardlinks devices and FIFOs that fsck and the general importer accept" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const path = "test-ext4-writer-special.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-writer-special.img");
+    defer std.testing.allocator.free(path);
 
     const attrs = [_]Xattr{.{ .name = "security.selinux", .value = "system_u:object_r:device_t:s0" }};
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
@@ -13438,8 +13615,10 @@ test "buildPlan resolves deep nesting and both hardlink directions from scramble
     // before it (forward) or after it (backward).
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const path = "test-ext4-buildplan-scramble.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-buildplan-scramble.img");
+    defer std.testing.allocator.free(path);
 
     // Directories and files are listed children-before-parents and deep-first,
     // and the hardlinks appear before their targets, so a correct build depends
@@ -13529,8 +13708,10 @@ test "buildPlan resolves deep nesting and both hardlink directions from scramble
 
 test "the writer refuses hardlink and device entries it cannot represent" {
     const io = std.testing.io;
-    const path = "test-ext4-writer-special-reject.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-writer-special-reject.img");
+    defer std.testing.allocator.free(path);
 
     const Case = struct { entries: []const InMemoryEntry, expected: anyerror };
     const dangling = [_]InMemoryEntry{
@@ -13567,8 +13748,10 @@ test "the writer refuses hardlink and device entries it cannot represent" {
 
 test "the writer emits 256-byte inodes carrying the extra fields e2fsprogs reads" {
     const io = std.testing.io;
-    const path = "test-ext4-inode256.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-inode256.img");
+    defer std.testing.allocator.free(path);
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "file", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 5, .bytes = "hello" },
@@ -13611,8 +13794,10 @@ test "the writer emits 256-byte inodes carrying the extra fields e2fsprogs reads
 
 test "timestamps past 2038 survive a round trip through the extra epoch bits" {
     const io = std.testing.io;
-    const path = "test-ext4-epoch.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-epoch.img");
+    defer std.testing.allocator.free(path);
 
     // One value in each representable epoch, plus one before the 1970 origin,
     // because the seconds field is read back signed.
@@ -13652,8 +13837,10 @@ test "timestamps past 2038 survive a round trip through the extra epoch bits" {
 
 test "creation times and sub-second precision survive a round trip" {
     const io = std.testing.io;
-    const path = "test-ext4-crtime.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-crtime.img");
+    defer std.testing.allocator.free(path);
 
     const build_time: u32 = 1_717_171_717;
     const created: i64 = 1_300_000_000;
@@ -13732,8 +13919,10 @@ test "creation times and sub-second precision survive a round trip" {
 
 test "a sub-second part that would overlap the epoch bits is refused" {
     const io = std.testing.io;
-    const path = "test-ext4-nsec-refused.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-nsec-refused.img");
+    defer std.testing.allocator.free(path);
 
     // The `i_*_extra` word gives the nanoseconds thirty bits above the two
     // epoch bits. A billion still fits in thirty bits, so this is not caught
@@ -13754,8 +13943,10 @@ test "a sub-second part that would overlap the epoch bits is refused" {
 
 test "the writer refuses a timestamp no inode can represent" {
     const io = std.testing.io;
-    const path = "test-ext4-epoch-refused.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-epoch-refused.img");
+    defer std.testing.allocator.free(path);
 
     // 2446-05-10 is the last second the two epoch bits reach; 1901-12-13 is
     // the first. A value outside that window has to be named, not wrapped.
@@ -13790,8 +13981,10 @@ test "encodeInodeTime inverts decodeInodeTime across every epoch boundary" {
 
 test "strict writer-compatible scan rejects a tampered inode epoch" {
     const io = std.testing.io;
-    const path = "test-ext4-strict-epoch.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-strict-epoch.img");
+    defer std.testing.allocator.free(path);
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "file", .kind = .file, .mode = 0o644, .uid = 0, .gid = 0, .size = 4, .bytes = "test" },
