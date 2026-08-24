@@ -32,7 +32,7 @@ const usage =
     \\  create -f <format> [-o subformat=fixed|dynamic] <file> <size>
     \\  info [--output=human|json] <file>
     \\  convert -f <src_format> -O <dst_format> [-o subformat=fixed|dynamic] [--compress-level <1-9>] <src> <dst|->
-    \\  write --allow-device-write [--yes] <src> <block-device>  # Linux only
+    \\  write --allow-device-write [--yes] [--grow-root] [--new-uuids] [--allow-duplicate-identifiers] <src> <block-device>  # Linux only
     \\  resize <file> [+]<size>
     \\  resize-root [--label <label>] <file.qcow2> [+]<size>
     \\  check <file>
