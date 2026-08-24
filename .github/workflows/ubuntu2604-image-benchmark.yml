@@ -1,0 +1,357 @@
+# Opt-in production benchmark for issue #550. Dispatch only after the reviewed
+# workflow is merged to main; it intentionally does not run in normal CI.
+name: Benchmark Ubuntu 26.04 aarch64 image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ubuntu2604-production-image-benchmark
+  cancel-in-progress: false
+
+env:
+  BENCHMARK_OUTPUT: .scratch/ubuntu2604-production-benchmark-${{ github.run_id }}-${{ github.run_attempt }}
+  EVIDENCE_ROOT: .scratch/ubuntu2604-production-benchmark-evidence
+  INPUT_ROOT: .scratch/ubuntu2604-production-benchmark-inputs
+  SIGNING_ROOT: .scratch/ubuntu2604-production-benchmark-signing
+  STAGING_ROOT: .scratch/ubuntu2604-production-benchmark-staging
+  TEST_CERTIFICATE_SHA256: "74556e6a0b540eb0ed5a49d9e75a003987447699df59f1d68456548c47dc8009"
+  STAGING_MINIMUM_FREE_BYTES: "38654705664"
+  MEASURED_MINIMUM_FREE_BYTES: "32212254720"
+  NON_REGRESSION_CEILING_NS: "530000000000"
+
+jobs:
+  benchmark:
+    name: native aarch64 production benchmark
+    if: github.repository == 'cataggar/vmiz' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    steps:
+      - name: Check out exact main source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind the benchmark to current main
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse HEAD)
+          test "$commit" = "$GITHUB_SHA"
+          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$commit"
+          test "$(git status --porcelain --untracked-files=no)" = ""
+
+      - name: Reclaim disposable hosted-runner tools and preflight disk
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_ROOT"
+          df -hT > "$EVIDENCE_ROOT/disk-before-cleanup.txt"
+          for path in \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/.ghcup \
+            /usr/local/lib/android \
+            /usr/local/share/boost \
+            /usr/share/dotnet
+          do
+            if [[ -e "$path" ]]; then
+              sudo rm -rf -- "$path"
+            fi
+          done
+          sudo apt-get clean
+          available=$(df -PB1 "$GITHUB_WORKSPACE" | awk 'NR == 2 {print $4}')
+          [[ "$available" =~ ^[0-9]+$ ]]
+          printf 'available_bytes=%s\nrequired_bytes=%s\n' \
+            "$available" "$STAGING_MINIMUM_FREE_BYTES" \
+            > "$EVIDENCE_ROOT/staging-disk-preflight.txt"
+          test "$available" -ge "$STAGING_MINIMUM_FREE_BYTES"
+          df -hT > "$EVIDENCE_ROOT/disk-after-cleanup.txt"
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Install benchmark host dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            file jq openssh-client python3 systemd-boot-efi
+          test "$(uname -m)" = aarch64
+          test -x /usr/bin/unshare
+          test -f /usr/lib/systemd/boot/efi/linuxaa64.efi.stub
+          zig_path=$(readlink -f "$(command -v zig)")
+          test -x "$zig_path"
+          test "$(zig version)" = 0.16.0
+          echo "ZIG_BIN=$zig_path" >> "$GITHUB_ENV"
+
+      - name: Prepare one fixed non-secret test identity
+        run: |
+          set -euo pipefail
+          rm -rf -- "$SIGNING_ROOT"
+          mkdir -m 0700 "$SIGNING_ROOT"
+          install -m 0600 \
+            tests/fixtures/ubuntu2604-local-signing/signing-key.pem \
+            "$SIGNING_ROOT/signing-key.pem"
+          install -m 0644 \
+            tests/fixtures/ubuntu2604-local-signing/signing-cert.pem \
+            "$SIGNING_ROOT/signing-cert.pem"
+          ssh-keygen -q -t ed25519 -N '' \
+            -C "vmiz-benchmark-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            -f "$SIGNING_ROOT/administrator"
+          chmod 0600 "$SIGNING_ROOT/administrator"
+          chmod 0644 "$SIGNING_ROOT/administrator.pub"
+          echo "SIGNING_KEY=$SIGNING_ROOT/signing-key.pem" >> "$GITHUB_ENV"
+          echo "SIGNING_CERTIFICATE=$SIGNING_ROOT/signing-cert.pem" >> "$GITHUB_ENV"
+          echo "AUTHORIZED_KEY=$SIGNING_ROOT/administrator.pub" >> "$GITHUB_ENV"
+
+      - name: Warm Zig dependencies and verify the test signer
+        run: |
+          set -euo pipefail
+          export ZIG_GLOBAL_CACHE_DIR="$INPUT_ROOT/zig-global-cache"
+          export ZIG_LOCAL_CACHE_DIR="$STAGING_ROOT/zig-local-cache"
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
+          "$ZIG_BIN" build --fetch --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          "$ZIG_BIN" build install-vmiz -Doptimize=ReleaseSafe
+          actual=$(zig-out/bin/vmiz uki fingerprint "$SIGNING_CERTIFICATE")
+          test "$actual" = "$TEST_CERTIFICATE_SHA256"
+
+      - name: Stage verified publication inputs, exact locks, and warm debz cache
+        run: |
+          set -euo pipefail
+          export ZIG_GLOBAL_CACHE_DIR="$INPUT_ROOT/zig-global-cache"
+          export ZIG_LOCAL_CACHE_DIR="$STAGING_ROOT/zig-local-cache"
+          work="$STAGING_ROOT/work"
+          provenance="$STAGING_ROOT/provenance"
+          output="$STAGING_ROOT/Ubuntu-26.04-aarch64.baremetal.qcow2"
+          cache="$STAGING_ROOT/debz-cache"
+          mkdir -p "$work" "$provenance" "$INPUT_ROOT/locks"
+          sudo -E "$ZIG_BIN" build \
+            -Doptimize=ReleaseSafe \
+            -Dubuntu2604-arch=aarch64 \
+            -Dubuntu2604-flavor=baremetal \
+            generalized-ubuntu2604 -- \
+            --work-dir "$work" \
+            --provenance-dir "$provenance" \
+            --output "$output" \
+            --size 5368709120 \
+            --authorized-key "$AUTHORIZED_KEY" \
+            --uki-stub /usr/lib/systemd/boot/efi/linuxaa64.efi.stub \
+            --uki-signing-certificate "$SIGNING_CERTIFICATE" \
+            --uki-signing-certificate-sha256 "$TEST_CERTIFICATE_SHA256" \
+            --uki-signing-key "$SIGNING_KEY" \
+            --debz-cache "$cache" \
+            --timing-output "$EVIDENCE_ROOT/staging-timing.json" \
+            2>&1 | tee "$EVIDENCE_ROOT/staging-build.log"
+          sudo chown -R "$(id -u):$(id -g)" \
+            "$STAGING_ROOT" "$INPUT_ROOT" "$EVIDENCE_ROOT"
+
+          install -m 0644 "$work/SHA256SUMS" "$INPUT_ROOT/SHA256SUMS"
+          install -m 0644 "$work/SHA256SUMS.gpg" "$INPUT_ROOT/SHA256SUMS.gpg"
+          install -m 0644 \
+            "$work/ubuntu-26.04-server-cloudimg-arm64.img" \
+            "$INPUT_ROOT/ubuntu-26.04-server-cloudimg-arm64.img"
+          install -m 0644 \
+            "$work/ubuntu-26.04-server-cloudimg-arm64.manifest" \
+            "$INPUT_ROOT/ubuntu-26.04-server-cloudimg-arm64.manifest"
+          install -m 0644 \
+            "$provenance"/debz-exact-lock-*-arm64.json \
+            "$INPUT_ROOT/locks/"
+          mv "$cache" "$INPUT_ROOT/debz-cache"
+          install -m 0644 \
+            "$provenance/ubuntu2604-build-provenance.json" \
+            "$EVIDENCE_ROOT/staging-build-provenance.json"
+
+          python3 - "$INPUT_ROOT" <<'PY'
+          import sys
+          from pathlib import Path
+          from scripts import ubuntu2604_image_benchmark as benchmark
+
+          root = Path(sys.argv[1])
+          inventory = benchmark.verify_warm_cache(root / "debz-cache")
+          locks = benchmark.verify_lock_set(
+              root / "locks", inventory["_package_object_names"]
+          )
+          if len(locks["locks"]) != len(benchmark.PACKAGE_ROOTS):
+              raise SystemExit("staging did not produce the exact benchmark lock set")
+          PY
+
+          sudo rm -rf -- "$STAGING_ROOT"
+          sudo apt-get clean
+          sudo rm -rf -- /var/lib/apt/lists/*
+          available=$(df -PB1 "$GITHUB_WORKSPACE" | awk 'NR == 2 {print $4}')
+          [[ "$available" =~ ^[0-9]+$ ]]
+          printf 'available_bytes=%s\nrequired_bytes=%s\n' \
+            "$available" "$MEASURED_MINIMUM_FREE_BYTES" \
+            > "$EVIDENCE_ROOT/measured-disk-preflight.txt"
+          test "$available" -ge "$MEASURED_MINIMUM_FREE_BYTES"
+          df -hT > "$EVIDENCE_ROOT/disk-after-staging.txt"
+
+      - name: Run one warm-up and three measured builds without networking
+        run: |
+          set -euo pipefail
+          test ! -e "$BENCHMARK_OUTPUT"
+          sudo -E /usr/bin/unshare --net -- \
+            python3 scripts/ubuntu2604_image_benchmark.py \
+              --output-root "$BENCHMARK_OUTPUT" \
+              --source "$INPUT_ROOT/ubuntu-26.04-server-cloudimg-arm64.img" \
+              --sha256sums "$INPUT_ROOT/SHA256SUMS" \
+              --sha256sums-signature "$INPUT_ROOT/SHA256SUMS.gpg" \
+              --manifest "$INPUT_ROOT/ubuntu-26.04-server-cloudimg-arm64.manifest" \
+              --debz-cache "$INPUT_ROOT/debz-cache" \
+              --debz-lock-dir "$INPUT_ROOT/locks" \
+              --authorized-key "$AUTHORIZED_KEY" \
+              --uki-stub /usr/lib/systemd/boot/efi/linuxaa64.efi.stub \
+              --signing-certificate "$SIGNING_CERTIFICATE" \
+              --signing-certificate-sha256 "$TEST_CERTIFICATE_SHA256" \
+              --signing-key "$SIGNING_KEY" \
+              --zig "$ZIG_BIN" \
+              --zig-global-cache "$INPUT_ROOT/zig-global-cache" \
+            2>&1 | tee "$EVIDENCE_ROOT/benchmark-driver.log"
+
+      - name: Record and enforce the production non-regression gate
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_ROOT"
+          sudo chown -R "$(id -u):$(id -g)" \
+            "$BENCHMARK_OUTPUT" "$EVIDENCE_ROOT" 2>/dev/null || true
+          python3 - \
+            "$BENCHMARK_OUTPUT/benchmark-summary.json" \
+            "$BENCHMARK_OUTPUT/benchmark-status.json" \
+            "$EVIDENCE_ROOT/non-regression-gate.json" \
+            "$GITHUB_STEP_SUMMARY" \
+            "$NON_REGRESSION_CEILING_NS" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          summary_path, status_path, gate_path, step_summary_path = map(
+              Path, sys.argv[1:5]
+          )
+          ceiling = int(sys.argv[5])
+          gate = {
+              "schema": 1,
+              "type": "vmiz-ubuntu2604-production-benchmark-gate",
+              "ceiling_ns": ceiling,
+              "status": "invalid",
+          }
+          lines = ["## Ubuntu 26.04 production image benchmark", ""]
+          if summary_path.is_file():
+              summary = json.loads(summary_path.read_text(encoding="utf-8"))
+              phases = summary["medians"]["phase_elapsed_ns"]
+              total = phases["total_runtime"]
+              raw = phases["raw_image_materialization"]
+              gate.update(
+                  {
+                      "benchmark_status": summary["status"],
+                      "source_commit": summary["source_commit"],
+                      "median_total_ns": total,
+                      "median_raw_image_materialization_ns": raw,
+                      "status": "pass" if total <= ceiling else "fail",
+                  }
+              )
+              lines.extend(
+                  [
+                      f"- Source: `{summary['source_commit']}`",
+                      "- Protocol: one warm-up plus three measured offline runs",
+                      f"- Median total: `{total / 1e9:.3f} s`",
+                      f"- Median raw materialization: `{raw / 1e9:.3f} s`",
+                      f"- Ceiling: `{ceiling / 1e9:.3f} s`",
+                      f"- Gate: **{gate['status']}**",
+                      "- Boot acceptance: unavailable for the bare-metal flavor; "
+                      "the benchmark ran native image/filesystem/provenance validation",
+                  ]
+              )
+          else:
+              status = (
+                  json.loads(status_path.read_text(encoding="utf-8"))
+                  if status_path.is_file()
+                  else {"status": "missing"}
+              )
+              gate["benchmark_status"] = status
+              lines.append(f"- Benchmark did not complete: `{status}`")
+          gate_path.write_text(
+              json.dumps(gate, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          with step_summary_path.open("a", encoding="utf-8") as output:
+              output.write("\n".join(lines) + "\n")
+          if gate["status"] != "pass":
+              raise SystemExit("production image benchmark did not pass")
+          PY
+
+      - name: Prove upload evidence excludes private key material
+        id: private-material-check
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - "$EVIDENCE_ROOT" "$BENCHMARK_OUTPUT" <<'PY'
+          import sys
+          from pathlib import Path
+
+          roots = [Path(value) for value in sys.argv[1:]]
+          markers = (
+              b"-----BEGIN PRIVATE KEY-----",
+              b"-----BEGIN RSA PRIVATE KEY-----",
+              b"-----BEGIN OPENSSH PRIVATE KEY-----",
+          )
+          evidence_root, benchmark_root = roots
+          paths = list(evidence_root.rglob("*")) if evidence_root.exists() else []
+          for name in (
+              "benchmark-status.json",
+              "benchmark-summary.json",
+              "benchmark-summary.txt",
+              "inputs.json",
+              "cache-inventory.json",
+              "package-lock-set.json",
+              "host.json",
+              "preflight-build.log",
+          ):
+              paths.append(benchmark_root / name)
+          paths.extend(benchmark_root.glob("run-*/evidence/**/*"))
+          for path in paths:
+              if not path.is_file():
+                  continue
+              with path.open("rb") as stream:
+                  prefix = stream.read(1024 * 1024)
+              if any(marker in prefix for marker in markers):
+                  raise SystemExit(f"private material found in evidence: {path}")
+          PY
+
+      - name: Upload benchmark timing, provenance, and logs
+        if: always() && steps.private-material-check.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ubuntu2604-production-benchmark-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.EVIDENCE_ROOT }}/
+            ${{ env.BENCHMARK_OUTPUT }}/benchmark-status.json
+            ${{ env.BENCHMARK_OUTPUT }}/benchmark-summary.json
+            ${{ env.BENCHMARK_OUTPUT }}/benchmark-summary.txt
+            ${{ env.BENCHMARK_OUTPUT }}/inputs.json
+            ${{ env.BENCHMARK_OUTPUT }}/cache-inventory.json
+            ${{ env.BENCHMARK_OUTPUT }}/package-lock-set.json
+            ${{ env.BENCHMARK_OUTPUT }}/host.json
+            ${{ env.BENCHMARK_OUTPUT }}/preflight-build.log
+            ${{ env.BENCHMARK_OUTPUT }}/run-*/evidence/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Remove benchmark state and private material
+        if: always()
+        run: |
+          sudo rm -rf -- \
+            "$BENCHMARK_OUTPUT" \
+            "$INPUT_ROOT" \
+            "$SIGNING_ROOT" \
+            "$STAGING_ROOT"
