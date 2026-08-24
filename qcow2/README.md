@@ -1,8 +1,8 @@
 # qcow2 — native Zig qcow2 reader
 
-A dependency-free, clean-room implementation of the [qcow2](../../docs/interop/qcow2.rst)
-disk image format in Zig. No QEMU C code, no libvirt, no external dependencies —
-just `@import("qcow2")` in your `build.zig`.
+A clean-room implementation of the [qcow2](../../docs/interop/qcow2.rst) disk
+image format in Zig. No QEMU C code and no libvirt — just `@import("qcow2")`
+in your `build.zig`.
 
 Part of the Zig-on-QEMU experiment (see issue #2). MIT licensed.
 
