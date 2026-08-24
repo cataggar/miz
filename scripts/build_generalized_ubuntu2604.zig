@@ -60,6 +60,7 @@ const sums_max_size: u64 = 64 * 1024;
 const signature_max_size: u64 = 16 * 1024;
 const public_key_max_size: usize = 4 * 1024;
 const keyring_max_size: usize = 1024 * 1024;
+const exact_lock_max_size: u64 = 16 * 1024 * 1024;
 
 /// The Ubuntu kernel flavors this builder knows how to boot. The suffix is
 /// how the finished root is searched for its kernel, so naming the wrong one
@@ -505,6 +506,9 @@ const Args = struct {
     authorized_key: ?[]const u8 = null,
     raw_output: ?[]const u8 = null,
     timing_output: ?[]const u8 = null,
+    debz_cache: ?[]const u8 = null,
+    debz_lock_dir: ?[]const u8 = null,
+    offline: bool = false,
     preflight_only: bool = false,
 };
 
@@ -521,6 +525,9 @@ const help =
     \\  --authorized-key <path>                 administrator public key (baremetal only)
     \\  --raw-output <path>                     additional raw copy, for writing to a disk
     \\  --timing-output <path>                  write opt-in machine-readable phase timing JSON
+    \\  --debz-cache <path>                     shared content-addressed debz cache
+    \\  --debz-lock-dir <path>                  fixed exact-lock inputs, one per package root
+    \\  --offline                               require local pinned inputs and cache-only debz
     \\  --proxy <url>                           reach the archive through this HTTP proxy
     \\  --uki-signing-certificate <path>        Secure Boot certificate
     \\  --uki-signing-certificate-sha256 <hex>  DER certificate SHA-256
@@ -550,6 +557,7 @@ fn packageFamilyRequest(
     lock_path: []const u8,
     installed_baseline: package_family.InstalledBaselinePolicy,
     proxy: ?[]const u8,
+    offline: bool,
 ) package_family.Request {
     return .{
         .family = .debian,
@@ -571,7 +579,7 @@ fn packageFamilyRequest(
             .lock_input_path = if (operation == .resolve_lock) null else lock_path,
             .lock_output_path = if (operation == .resolve_lock) lock_path else null,
             .proxy = proxy,
-            .cache_mode = .online,
+            .cache_mode = if (offline) .offline else .online,
             .repository_policy = .strict_priority,
             .recommends = false,
             .allow_downgrade = false,
@@ -798,6 +806,16 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
             args.timing_output = argv[i];
+        } else if (std.mem.eql(u8, arg, "--debz-cache")) {
+            i += 1;
+            if (i == argv.len) return error.MissingArgument;
+            args.debz_cache = argv[i];
+        } else if (std.mem.eql(u8, arg, "--debz-lock-dir")) {
+            i += 1;
+            if (i == argv.len) return error.MissingArgument;
+            args.debz_lock_dir = argv[i];
+        } else if (std.mem.eql(u8, arg, "--offline")) {
+            args.offline = true;
         } else if (std.mem.eql(u8, arg, "--preflight-only")) {
             args.preflight_only = true;
         } else if (std.mem.eql(u8, arg, "--help")) {
@@ -816,6 +834,10 @@ fn parseArgs(argv: []const []const u8) !Args {
         return error.AuthorizedKeyRequired;
     if (args.flavor != .baremetal and args.authorized_key != null)
         return error.AuthorizedKeyNotSupported;
+    if (args.offline and args.source == null)
+        return error.OfflineSourceRequired;
+    if (args.offline and args.proxy != null)
+        return error.OfflineProxyNotSupported;
     return args;
 }
 
@@ -883,13 +905,55 @@ fn acquire(
     sha256: []const u8,
     max_size: u64,
     downloader: artifact_pipeline.Downloader,
+    offline: bool,
 ) !void {
+    if (offline) {
+        const stat = Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return error.OfflineInputMissing,
+            else => return err,
+        };
+        if (stat.kind != .file) return error.OfflineInputNotRegularFile;
+        if (stat.size == 0 or stat.size > max_size) return error.OfflineInputSizeInvalid;
+        const metadata = try artifact_pipeline.hashFile(io, path);
+        const expected = try artifact_pipeline.parseSha256(sha256);
+        if (!std.mem.eql(u8, &metadata.sha256, &expected))
+            return error.ChecksumMismatch;
+        return;
+    }
     _ = try artifact_pipeline.acquireVerified(allocator, io, .{
         .url = url,
         .destination_path = path,
         .expected_sha256 = try artifact_pipeline.parseSha256(sha256),
         .max_size = max_size,
     }, downloader);
+}
+
+fn copyExactLockInput(
+    allocator: Allocator,
+    io: Io,
+    source: []const u8,
+    destination: []const u8,
+) !void {
+    const stat = Dir.cwd().statFile(io, source, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return error.DebzExactLockMissing,
+        else => return err,
+    };
+    if (stat.kind != .file) return error.DebzExactLockNotRegularFile;
+    if (stat.size == 0 or stat.size > exact_lock_max_size)
+        return error.DebzExactLockSizeInvalid;
+    var file = try Dir.cwd().openFile(io, source, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    const bytes = try reader.interface.allocRemaining(
+        allocator,
+        .limited(exact_lock_max_size),
+    );
+    defer allocator.free(bytes);
+    try Dir.cwd().writeFile(io, .{ .sub_path = destination, .data = bytes });
 }
 
 fn copyBoundedFile(
@@ -2552,6 +2616,9 @@ fn customizeRootWithDebz(
     vmizinit_path: ?[]const u8,
     azagent_path: ?[]const u8,
     proxy: ?[]const u8,
+    debz_cache: ?[]const u8,
+    debz_lock_dir: ?[]const u8,
+    offline: bool,
     authorized_key: ?[]const u8,
 ) !DebzCustomization {
     var debz_aggregate = timing.begin(.debz_aggregate, null);
@@ -2638,9 +2705,20 @@ fn customizeRootWithDebz(
     // Per-stage `state` stays per-stage and is still discarded: it is dpkg
     // admin state, not content, and reusing it across transactions would carry
     // one stage's installed baseline into the next.
-    const shared_cache = try std.fs.path.join(allocator, &.{ work_dir, "debz-cache" });
+    const shared_cache = if (debz_cache) |path|
+        try allocator.dupe(u8, path)
+    else
+        try std.fs.path.join(allocator, &.{ work_dir, "debz-cache" });
     defer allocator.free(shared_cache);
-    try Dir.cwd().createDirPath(io, shared_cache);
+    if (offline) {
+        const cache_stat = Dir.cwd().statFile(io, shared_cache, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return error.DebzOfflineCacheMissing,
+            else => return err,
+        };
+        if (cache_stat.kind != .directory) return error.DebzOfflineCacheNotDirectory;
+    } else {
+        try Dir.cwd().createDirPath(io, shared_cache);
+    }
     try cleanupSharedDebzCacheStaging(io, shared_cache);
     const absolute_cache = try Dir.cwd().realPathFileAlloc(io, shared_cache, allocator);
     defer allocator.free(absolute_cache);
@@ -2680,26 +2758,38 @@ fn customizeRootWithDebz(
         defer allocator.free(absolute_dummy);
         const absolute_lock = try std.fs.path.join(allocator, &.{ absolute_transaction, "exact-lock.json" });
         defer allocator.free(absolute_lock);
-
-        const resolve_request = packageFamilyRequest(
-            .resolve_lock,
-            profile,
-            &packages,
-            absolute_resolve_root,
-            absolute_dummy,
-            &config_inputs,
-            &keyring_inputs,
-            absolute_cache,
-            absolute_state,
-            absolute_lock,
-            installed_baseline,
-            proxy,
+        const lock_filename = try std.fmt.allocPrint(
+            allocator,
+            "debz-exact-lock-{s}-{s}.json",
+            .{ package, profile.ubuntu_architecture },
         );
-        try assertRequestSeparation(resolve_request);
-        const resolved = try package_family.execute(allocator, io, .{}, resolve_request);
-        try requireSucceeded(resolved);
-        if (resolved.lock_path == null or !std.mem.eql(u8, resolved.lock_path.?, absolute_lock))
-            return error.DebzLockMismatch;
+        defer allocator.free(lock_filename);
+        if (debz_lock_dir) |lock_dir| {
+            const lock_input = try std.fs.path.join(allocator, &.{ lock_dir, lock_filename });
+            defer allocator.free(lock_input);
+            try copyExactLockInput(allocator, io, lock_input, absolute_lock);
+        } else {
+            const resolve_request = packageFamilyRequest(
+                .resolve_lock,
+                profile,
+                &packages,
+                absolute_resolve_root,
+                absolute_dummy,
+                &config_inputs,
+                &keyring_inputs,
+                absolute_cache,
+                absolute_state,
+                absolute_lock,
+                installed_baseline,
+                proxy,
+                offline,
+            );
+            try assertRequestSeparation(resolve_request);
+            const resolved = try package_family.execute(allocator, io, .{}, resolve_request);
+            try requireSucceeded(resolved);
+            if (resolved.lock_path == null or !std.mem.eql(u8, resolved.lock_path.?, absolute_lock))
+                return error.DebzLockMismatch;
+        }
 
         const stage = try std.fmt.allocPrint(allocator, "{s}/root-stage-{d}", .{ work_dir, index });
         defer allocator.free(stage);
@@ -2736,6 +2826,7 @@ fn customizeRootWithDebz(
             absolute_lock,
             installed_baseline,
             proxy,
+            offline,
         );
         try assertRequestSeparation(customize_request);
         const customized = try package_family.execute(allocator, io, .{}, customize_request);
@@ -2751,12 +2842,6 @@ fn customizeRootWithDebz(
 
         const lock_metadata = try artifact_pipeline.hashFile(io, absolute_lock);
         const provenance_metadata = try artifact_pipeline.hashFile(io, expected_provenance);
-        const lock_filename = try std.fmt.allocPrint(
-            allocator,
-            "debz-exact-lock-{s}-{s}.json",
-            .{ package, profile.ubuntu_architecture },
-        );
-        defer allocator.free(lock_filename);
         const provenance_filename = try std.fmt.allocPrint(
             allocator,
             "debz-transaction-provenance-{s}-{s}.json",
@@ -3554,8 +3639,8 @@ fn buildImage(
     defer allocator.free(sums_path);
     const signature_path = try std.fs.path.join(allocator, &.{ work_dir, "SHA256SUMS.gpg" });
     defer allocator.free(signature_path);
-    try acquire(allocator, io, release_base ++ "/SHA256SUMS", sums_path, sums_sha256, sums_max_size, downloader);
-    try acquire(allocator, io, release_base ++ "/SHA256SUMS.gpg", signature_path, sums_signature_sha256, signature_max_size, downloader);
+    try acquire(allocator, io, release_base ++ "/SHA256SUMS", sums_path, sums_sha256, sums_max_size, downloader, args.offline);
+    try acquire(allocator, io, release_base ++ "/SHA256SUMS.gpg", signature_path, sums_signature_sha256, signature_max_size, downloader, args.offline);
     try verifyCanonicalPublication(allocator, io, sums_path, signature_path);
     const sums = try Dir.cwd().readFileAlloc(io, sums_path, allocator, .limited(sums_max_size));
     defer allocator.free(sums);
@@ -3566,7 +3651,7 @@ fn buildImage(
     defer allocator.free(manifest_path);
     const manifest_url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ release_base, profile.manifest_name });
     defer allocator.free(manifest_url);
-    try acquire(allocator, io, manifest_url, manifest_path, profile.manifest_sha256, manifest_max_size, downloader);
+    try acquire(allocator, io, manifest_url, manifest_path, profile.manifest_sha256, manifest_max_size, downloader, args.offline);
     const manifest = try Dir.cwd().readFileAlloc(io, manifest_path, allocator, .limited(manifest_max_size));
     defer allocator.free(manifest);
     try validateManifestRuntime(allocator, manifest, profile);
@@ -3584,7 +3669,7 @@ fn buildImage(
         const path = try std.fs.path.join(allocator, &.{ work_dir, profile.source_name });
         const url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ release_base, profile.source_name });
         defer allocator.free(url);
-        try acquire(allocator, io, url, path, profile.source_sha256, source_max_size, downloader);
+        try acquire(allocator, io, url, path, profile.source_sha256, source_max_size, downloader, args.offline);
         break :blk path;
     };
     defer if (args.source == null) allocator.free(source_path);
@@ -3648,6 +3733,9 @@ fn buildImage(
         args.vmizinit,
         args.azagent,
         args.proxy,
+        args.debz_cache,
+        args.debz_lock_dir,
+        args.offline,
         authorized_key,
     );
     defer debz_customization.deinit(allocator);
@@ -3899,6 +3987,7 @@ test "both architecture profiles acquire through the shared native HTTPS downloa
             &digest,
             1024,
             https.downloader(),
+            false,
         );
         const metadata = try artifact_pipeline.hashFile(io, output_path);
         try std.testing.expectEqualSlices(u8, &expected_digest, &metadata.sha256);
@@ -4058,6 +4147,7 @@ test "package-family resolve and customize requests are exact-lock operations" {
         "/state/linux-azure.lock",
         .require_locked,
         null,
+        false,
     );
     try std.testing.expectEqual(package_family.Family.debian, amd64.family);
     try std.testing.expectEqual(package_family.Distribution.ubuntu_26_04, amd64.distribution);
@@ -4087,6 +4177,7 @@ test "package-family resolve and customize requests are exact-lock operations" {
         // A proxy is an input like any other: it is either stated or absent,
         // never inherited from the environment.
         "http://127.0.0.1:18080",
+        false,
     );
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", arm64.inputs.proxy.?);
     try std.testing.expect(amd64.inputs.proxy == null);
@@ -4114,12 +4205,29 @@ test "package-family resolve and customize requests are exact-lock operations" {
         "/state/ubuntu-minimal.lock",
         .none,
         null,
+        false,
     );
     try std.testing.expectEqual(package_family.Operation.create, core_create.operation);
     try std.testing.expectEqual(
         package_family.InstalledBaselinePolicy.none,
         core_create.inputs.installed_baseline,
     );
+    const offline = packageFamilyRequest(
+        .customize,
+        profileFor(.aarch64),
+        &.{"sudo"},
+        "/root-stage",
+        "/published",
+        &.{"/inputs/ubuntu.sources"},
+        &.{"/inputs/ubuntu.gpg"},
+        "/cache",
+        "/state",
+        "/state/sudo.lock",
+        .require_locked,
+        null,
+        true,
+    );
+    try std.testing.expectEqual(package_family.CacheMode.offline, offline.inputs.cache_mode);
 }
 
 test "package-family requests reject keyrings overlapping staging and accept the external copy" {
@@ -4134,17 +4242,17 @@ test "package-family requests reject keyrings overlapping staging and accept the
 
     // The corrected requests resolve the keyring from an external host copy and
     // pass the shared separation policy for both resolve and customize.
-    const good_resolve = packageFamilyRequest(.resolve_lock, profile, &.{"linux-azure"}, resolve_root, resolve_published, &.{source_config}, &.{external_keyring}, cache, state, lock, .require_locked, null);
+    const good_resolve = packageFamilyRequest(.resolve_lock, profile, &.{"linux-azure"}, resolve_root, resolve_published, &.{source_config}, &.{external_keyring}, cache, state, lock, .require_locked, null, false);
     try assertRequestSeparation(good_resolve);
     try std.testing.expectEqualStrings(external_keyring, good_resolve.inputs.keyring_paths[0]);
-    const good_customize = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{external_keyring}, cache, state, lock, .require_locked, null);
+    const good_customize = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{external_keyring}, cache, state, lock, .require_locked, null, false);
     try assertRequestSeparation(good_customize);
     try std.testing.expectEqualStrings(external_keyring, good_customize.inputs.keyring_paths[0]);
 
     // The original blocker: a keyring read from inside the resolve root_stage is
     // rejected with the exact boundary message the protected aarch64 builder hit.
     const guest_keyring = resolve_root ++ "/usr/share/keyrings/ubuntu-archive-keyring.gpg";
-    const bad_resolve = packageFamilyRequest(.resolve_lock, profile, &.{"linux-azure"}, resolve_root, resolve_published, &.{source_config}, &.{guest_keyring}, cache, state, lock, .require_locked, null);
+    const bad_resolve = packageFamilyRequest(.resolve_lock, profile, &.{"linux-azure"}, resolve_root, resolve_published, &.{source_config}, &.{guest_keyring}, cache, state, lock, .require_locked, null, false);
     try std.testing.expectError(error.PackageFamilySeparationViolation, assertRequestSeparation(bad_resolve));
     try std.testing.expectEqualStrings(
         "debian keyring paths must be absolute and outside staging",
@@ -4152,13 +4260,13 @@ test "package-family requests reject keyrings overlapping staging and accept the
     );
 
     const staged_keyring = "/work/root-stage-0/usr/share/keyrings/ubuntu-archive-keyring.gpg";
-    const bad_customize = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{staged_keyring}, cache, state, lock, .require_locked, null);
+    const bad_customize = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{staged_keyring}, cache, state, lock, .require_locked, null, false);
     try std.testing.expectError(error.PackageFamilySeparationViolation, assertRequestSeparation(bad_customize));
 
     // A keyring under the publication root is rejected too, so a published guest
     // can never mutate the trusted input after debz consumes it.
     const published_keyring = "/work/root-debz-0/usr/share/keyrings/ubuntu-archive-keyring.gpg";
-    const published_overlap = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{published_keyring}, cache, state, lock, .require_locked, null);
+    const published_overlap = packageFamilyRequest(.customize, profile, &.{"linux-azure"}, "/work/root-stage-0", "/work/root-debz-0", &.{source_config}, &.{published_keyring}, cache, state, lock, .require_locked, null, false);
     try std.testing.expectError(error.PackageFamilySeparationViolation, assertRequestSeparation(published_overlap));
     try std.testing.expectEqualStrings(
         "debian keyring paths must be outside publication",
@@ -4199,10 +4307,10 @@ test "the shared debz cache outlives per-stage deletion and stays outside every 
         const lock = try std.fmt.bufPrint(&lock_buffer, "{s}/debz-{s}/exact-lock.json", .{ work_dir, package });
         const packages = [_][]const u8{package};
 
-        const resolve = packageFamilyRequest(.resolve_lock, profile, &packages, stage, published, &.{config}, &.{keyring}, shared_cache, state, lock, .require_locked, null);
+        const resolve = packageFamilyRequest(.resolve_lock, profile, &packages, stage, published, &.{config}, &.{keyring}, shared_cache, state, lock, .require_locked, null, false);
         try assertRequestSeparation(resolve);
         try std.testing.expectEqualStrings(shared_cache, resolve.inputs.cache_path);
-        const customize = packageFamilyRequest(.customize, profile, &packages, stage, published, &.{config}, &.{keyring}, shared_cache, state, lock, .require_locked, null);
+        const customize = packageFamilyRequest(.customize, profile, &packages, stage, published, &.{config}, &.{keyring}, shared_cache, state, lock, .require_locked, null, false);
         try assertRequestSeparation(customize);
         try std.testing.expectEqualStrings(shared_cache, customize.inputs.cache_path);
 
@@ -4212,7 +4320,7 @@ test "the shared debz cache outlives per-stage deletion and stays outside every 
     }
 
     // A cache placed under a publication root is still refused.
-    const bad = packageFamilyRequest(.customize, profile, &.{"sudo"}, work_dir ++ "/root-stage-0", work_dir ++ "/root-debz-0", &.{config}, &.{keyring}, work_dir ++ "/root-debz-0/cache", work_dir ++ "/debz-sudo/state", work_dir ++ "/debz-sudo/exact-lock.json", .require_locked, null);
+    const bad = packageFamilyRequest(.customize, profile, &.{"sudo"}, work_dir ++ "/root-stage-0", work_dir ++ "/root-debz-0", &.{config}, &.{keyring}, work_dir ++ "/root-debz-0/cache", work_dir ++ "/debz-sudo/state", work_dir ++ "/debz-sudo/exact-lock.json", .require_locked, null, false);
     try std.testing.expectError(error.PackageFamilySeparationViolation, assertRequestSeparation(bad));
 }
 
@@ -4476,6 +4584,23 @@ test "arguments accept Ubuntu and project architecture spellings" {
     try std.testing.expectEqualStrings(
         "candidate/image-timing.json",
         (try parseArgs(&.{ "--timing-output", "candidate/image-timing.json" })).timing_output.?,
+    );
+    const offline = try parseArgs(&.{
+        "--source",
+        "ubuntu.img",
+        "--debz-cache",
+        "/cache",
+        "--debz-lock-dir",
+        "/locks",
+        "--offline",
+    });
+    try std.testing.expect(offline.offline);
+    try std.testing.expectEqualStrings("/cache", offline.debz_cache.?);
+    try std.testing.expectEqualStrings("/locks", offline.debz_lock_dir.?);
+    try std.testing.expectError(error.OfflineSourceRequired, parseArgs(&.{"--offline"}));
+    try std.testing.expectError(
+        error.OfflineProxyNotSupported,
+        parseArgs(&.{ "--source", "ubuntu.img", "--offline", "--proxy", "http://127.0.0.1:8080" }),
     );
     try std.testing.expectError(error.MissingArgument, parseArgs(&.{"--timing-output"}));
     try std.testing.expectError(error.ImageTooSmall, parseArgs(&.{ "--size", "4G" }));
