@@ -1,11 +1,11 @@
-//! `vmiz write --allow-device-write [--yes] <source> <block-device>`
+//! `vmiz write --allow-device-write [--yes] [--grow-root] <source> <block-device>`
 
 const std = @import("std");
 const builtin = @import("builtin");
 const vmiz = @import("vmiz");
 
 const help_text =
-    \\usage: vmiz write --allow-device-write [--yes] <source> <block-device>
+    \\usage: vmiz write --allow-device-write [--yes] [--grow-root] <source> <block-device>
     \\
     \\Writes a raw, VHD, VHDX, or qcow2 image directly to an existing Linux
     \\block device. The source format is detected automatically.
@@ -13,14 +13,27 @@ const help_text =
     \\  --allow-device-write  Required acknowledgement that the destination
     \\                        device will be overwritten.
     \\  --yes                 Skip the final interactive confirmation.
+    \\  --grow-root           Offline-grow the single supported GPT ext4 root
+    \\                        in a raw source to fill the destination.
     \\
     \\The command checks the target while it is read-only, refuses a target
     \\that is too small or in use, writes zero regions explicitly, flushes the
     \\device, and asks the kernel to re-read its partition table. A stale
     \\kernel partition view is reported as partial success with exit status 2.
+    \\Root growth is native and offline; it does not require resize2fs or
+    \\cloud-init in the guest.
     \\The separate `vmiz convert` command remains unable to write devices.
     \\
 ;
+
+const RootGrowthPlan = struct {
+    root: vmiz.root_resize.RootSelection,
+    final_last_lba: u64,
+    final_partition_length: u64,
+    final_filesystem_length: u64,
+    grow_partition: bool,
+    grow_filesystem: bool,
+};
 
 const Operations = struct {
     context: ?*anyopaque = null,
@@ -73,12 +86,47 @@ const Operations = struct {
         std.mem.Allocator,
         vmiz.gpt.VerifiedGpt,
     ) anyerror!vmiz.gpt.RelocationResult = relocateBackup,
+    plan_root_growth_fn: *const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+        std.Io,
+        *const vmiz.Image,
+        u64,
+        vmiz.gpt.VerifiedGpt,
+    ) anyerror!RootGrowthPlan = planRootGrowth,
+    grow_partition_fn: *const fn (
+        ?*anyopaque,
+        *vmiz.Image,
+        std.Io,
+        std.mem.Allocator,
+        vmiz.gpt.VerifiedGpt,
+        u32,
+    ) anyerror!vmiz.gpt.GrowPartitionResult = growPartition,
+    resize_ext4_fn: *const fn (
+        ?*anyopaque,
+        std.Io,
+        std.Io.File,
+        std.mem.Allocator,
+        vmiz.ext4.ResizeOptions,
+    ) anyerror!vmiz.ext4.FilesystemInfo = resizeExt4,
     verify_fn: *const fn (
         ?*anyopaque,
         vmiz.Image,
         std.Io,
         std.mem.Allocator,
     ) anyerror!vmiz.gpt.VerifiedGpt = verifyGpt,
+    verify_root_fn: *const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+        std.Io,
+        *const vmiz.Image,
+        vmiz.gpt.VerifiedGpt,
+    ) anyerror!vmiz.root_resize.RootSelection = verifyRoot,
+    durable_fn: *const fn (
+        ?*anyopaque,
+        *vmiz.Image,
+        std.Io,
+    ) anyerror!bool = makeDurable,
     finish_fn: *const fn (
         ?*anyopaque,
         *vmiz.Image,
@@ -98,6 +146,7 @@ fn runWithOperations(
 ) u8 {
     var allow_device_write = false;
     var yes = false;
+    var grow_root = false;
     var positional: [2][]const u8 = undefined;
     var positional_count: usize = 0;
 
@@ -106,6 +155,8 @@ fn runWithOperations(
             allow_device_write = true;
         } else if (std.mem.eql(u8, arg, "--yes")) {
             yes = true;
+        } else if (std.mem.eql(u8, arg, "--grow-root")) {
+            grow_root = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print("{s}", .{help_text});
             return 0;
@@ -199,6 +250,41 @@ fn runWithOperations(
     };
     defer detected.deinit(gpa);
 
+    var growth_plan: ?RootGrowthPlan = null;
+    if (grow_root) {
+        const verified = switch (detected) {
+            .not_gpt => return fail(
+                "write: --grow-root requires a verified GPT source; no data was written",
+                .{},
+            ),
+            .verified => |verified| verified,
+        };
+        growth_plan = operations.plan_root_growth_fn(
+            operations.context,
+            gpa,
+            io,
+            &source,
+            destination.virtual_size,
+            verified,
+        ) catch |err| {
+            return fail(
+                "write: root growth preflight failed: {s}; no data was written",
+                .{@errorName(err)},
+            );
+        };
+        const plan = growth_plan.?;
+        std.debug.print(
+            "write: root GPT table index {d}, partition LBA {d} -> {d}, filesystem {d} -> {d} bytes\n",
+            .{
+                plan.root.table_index,
+                plan.root.last_lba,
+                plan.final_last_lba,
+                plan.root.filesystem_length,
+                plan.final_filesystem_length,
+            },
+        );
+    }
+
     if (!yes) {
         const approved = operations.confirm_fn(
             operations.context,
@@ -215,7 +301,10 @@ fn runWithOperations(
         &destination,
         io,
     ) catch |err| {
-        return fail(
+        return failAfterMutation(
+            operations,
+            &destination,
+            io,
             "write: failed to invalidate stale destination partition metadata: {s}; the device may be partially modified",
             .{@errorName(err)},
         );
@@ -232,7 +321,10 @@ fn runWithOperations(
         &destination,
         gpa,
     ) catch |err| {
-        return fail(
+        return failAfterMutation(
+            operations,
+            &destination,
+            io,
             "write: data copy failed: {s}; the device may be partially written",
             .{@errorName(err)},
         );
@@ -241,15 +333,55 @@ fn runWithOperations(
     switch (detected) {
         .not_gpt => {},
         .verified => |verified| {
-            const relocation = operations.relocate_fn(
+            const plan = growth_plan;
+            var grow_result: ?vmiz.gpt.GrowPartitionResult = null;
+            const relocation = if (plan) |root_plan| blk: {
+                if (root_plan.grow_partition) {
+                    grow_result = operations.grow_partition_fn(
+                        operations.context,
+                        &destination,
+                        io,
+                        gpa,
+                        verified,
+                        root_plan.root.table_index,
+                    ) catch |err| {
+                        return failAfterMutation(
+                            operations,
+                            &destination,
+                            io,
+                            "write: root partition growth failed: {s}; the device was modified",
+                            .{@errorName(err)},
+                        );
+                    };
+                    break :blk grow_result.?.relocation;
+                }
+                break :blk operations.relocate_fn(
+                    operations.context,
+                    &destination,
+                    io,
+                    gpa,
+                    verified,
+                ) catch |err| {
+                    return failAfterMutation(
+                        operations,
+                        &destination,
+                        io,
+                        "write: backup GPT relocation failed: {s}; the device was modified",
+                        .{@errorName(err)},
+                    );
+                };
+            } else operations.relocate_fn(
                 operations.context,
                 &destination,
                 io,
                 gpa,
                 verified,
             ) catch |err| {
-                return fail(
-                    "write: backup GPT relocation failed: {s}; the device was copied but may contain incomplete GPT metadata",
+                return failAfterMutation(
+                    operations,
+                    &destination,
+                    io,
+                    "write: backup GPT relocation failed: {s}; the device was modified",
                     .{@errorName(err)},
                 );
             };
@@ -262,24 +394,93 @@ fn runWithOperations(
                 },
             );
 
+            if (plan) |root_plan| {
+                if (root_plan.grow_filesystem) {
+                    _ = operations.resize_ext4_fn(
+                        operations.context,
+                        io,
+                        destination.file,
+                        gpa,
+                        .{
+                            .offset = root_plan.root.byte_offset,
+                            .length = root_plan.final_filesystem_length,
+                        },
+                    ) catch |err| {
+                        return failAfterMutation(
+                            operations,
+                            &destination,
+                            io,
+                            "write: offline ext4 root resize failed: {s}; the device was modified",
+                            .{@errorName(err)},
+                        );
+                    };
+                } else {
+                    std.debug.print("write: root filesystem already fills its final block-aligned extent\n", .{});
+                }
+            }
+
             var destination_gpt = operations.verify_fn(
                 operations.context,
                 destination,
                 io,
                 gpa,
             ) catch |err| {
-                return fail(
+                return failAfterMutation(
+                    operations,
+                    &destination,
+                    io,
                     "write: destination GPT verification failed after copy: {s}; the device was modified",
                     .{@errorName(err)},
                 );
             };
             defer destination_gpt.deinit(gpa);
-            if (!std.mem.eql(
+            if (plan) |root_plan| {
+                verifyGrownGptInvariant(
+                    verified,
+                    destination_gpt,
+                    root_plan,
+                ) catch |err| {
+                    return failAfterMutation(
+                        operations,
+                        &destination,
+                        io,
+                        "write: grown GPT invariant verification failed: {s}; the device was modified",
+                        .{@errorName(err)},
+                    );
+                };
+                const destination_root = operations.verify_root_fn(
+                    operations.context,
+                    gpa,
+                    io,
+                    &destination,
+                    destination_gpt,
+                ) catch |err| {
+                    return failAfterMutation(
+                        operations,
+                        &destination,
+                        io,
+                        "write: grown ext4 root verification failed: {s}; the device was modified",
+                        .{@errorName(err)},
+                    );
+                };
+                verifyGrownRoot(root_plan, destination_root) catch |err| {
+                    return failAfterMutation(
+                        operations,
+                        &destination,
+                        io,
+                        "write: grown root identity verification failed: {s}; the device was modified",
+                        .{@errorName(err)},
+                    );
+                };
+            } else if (!std.mem.eql(
                 u8,
                 verified.partition_array,
                 destination_gpt.partition_array,
             )) {
-                return fail(
+                return failAfterMutation(
+                    operations,
+                    &destination,
+                    io,
                     "write: destination GPT verification failed after copy: opaque partition array changed; the device was modified",
                     .{},
                 );
@@ -292,11 +493,17 @@ fn runWithOperations(
         &destination,
         io,
     ) catch |err| {
-        return fail(
+        return failAfterMutation(
+            operations,
+            &destination,
+            io,
             "write: device finalization failed: {s}; the device was modified",
             .{@errorName(err)},
         );
-    }) orelse return fail(
+    }) orelse return failAfterMutation(
+        operations,
+        &destination,
+        io,
         "write: device finalization did not report an outcome; the device may be partially written",
         .{},
     );
@@ -305,10 +512,22 @@ fn runWithOperations(
         std.debug.print("write: partial success: {s}\n", .{warning});
         return 2;
     }
-    std.debug.print(
-        "write: wrote and flushed {d} bytes. {s}\n",
-        .{ source.virtual_size, outcome.message() },
-    );
+    if (growth_plan) |plan| {
+        std.debug.print(
+            "write: wrote {d} source bytes, finalized a {d}-byte root partition with a {d}-byte ext4 filesystem, and flushed the device. {s}\n",
+            .{
+                source.virtual_size,
+                plan.final_partition_length,
+                plan.final_filesystem_length,
+                outcome.message(),
+            },
+        );
+    } else {
+        std.debug.print(
+            "write: wrote and flushed {d} bytes. {s}\n",
+            .{ source.virtual_size, outcome.message() },
+        );
+    }
     return 0;
 }
 
@@ -426,6 +645,125 @@ fn relocateBackup(
     return vmiz.gpt.relocateBackup(destination, io, allocator, verified);
 }
 
+fn planRootGrowth(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: *const vmiz.Image,
+    destination_size: u64,
+    verified: vmiz.gpt.VerifiedGpt,
+) anyerror!RootGrowthPlan {
+    if (source.format != .raw) return error.RootGrowthPreflightRequiresRawSource;
+    if (destination_size == 0 or destination_size % vmiz.gpt.sector_size != 0) {
+        return error.ImageNotSectorAligned;
+    }
+    const root = try vmiz.root_resize.selectRoot(
+        allocator,
+        io,
+        source,
+        verified,
+        .{ .require_last_partition = true },
+    );
+    const array_sectors = try std.math.divCeil(
+        u64,
+        @intCast(verified.partition_array.len),
+        vmiz.gpt.sector_size,
+    );
+    const destination_sectors = destination_size / vmiz.gpt.sector_size;
+    if (destination_sectors <= array_sectors + 1) return error.InvalidPartitionArrayBounds;
+    const backup_lba = destination_sectors - 1;
+    const backup_array_lba = backup_lba - array_sectors;
+    if (backup_array_lba == 0) return error.InvalidPartitionArrayBounds;
+    const final_last_lba = backup_array_lba - 1;
+    if (final_last_lba < root.last_lba or final_last_lba < root.first_lba) {
+        return error.DestinationTooSmall;
+    }
+    const partition_sectors = std.math.add(
+        u64,
+        final_last_lba - root.first_lba,
+        1,
+    ) catch return error.InvalidPartitionBounds;
+    const final_partition_length = std.math.mul(
+        u64,
+        partition_sectors,
+        vmiz.gpt.sector_size,
+    ) catch return error.InvalidPartitionBounds;
+    const final_filesystem_length =
+        final_partition_length / vmiz.ext4.default_block_size *
+        vmiz.ext4.default_block_size;
+    if (final_filesystem_length == 0 or
+        final_filesystem_length > final_partition_length or
+        final_filesystem_length < root.filesystem_length)
+    {
+        return error.InvalidRange;
+    }
+
+    const preflight = vmiz.ext4.preflightResize(
+        io,
+        source.file,
+        allocator,
+        .{
+            .offset = root.byte_offset,
+            .length = final_filesystem_length,
+        },
+    ) catch |err| switch (err) {
+        error.GrowthNotRequested => {
+            return .{
+                .root = root,
+                .final_last_lba = final_last_lba,
+                .final_partition_length = final_partition_length,
+                .final_filesystem_length = final_filesystem_length,
+                .grow_partition = final_last_lba != root.last_lba,
+                .grow_filesystem = false,
+            };
+        },
+        else => return err,
+    };
+    if (preflight.existing_length != root.filesystem_length or
+        !std.mem.eql(u8, &preflight.uuid, &root.filesystem_uuid) or
+        preflight.filesystem.feature_compat != root.filesystem_feature_compat or
+        preflight.filesystem.feature_incompat != root.filesystem_feature_incompat or
+        preflight.filesystem.feature_ro_compat != root.filesystem_feature_ro_compat)
+    {
+        return error.FilesystemIdentityChanged;
+    }
+    return .{
+        .root = root,
+        .final_last_lba = final_last_lba,
+        .final_partition_length = final_partition_length,
+        .final_filesystem_length = final_filesystem_length,
+        .grow_partition = final_last_lba != root.last_lba,
+        .grow_filesystem = true,
+    };
+}
+
+fn growPartition(
+    _: ?*anyopaque,
+    destination: *vmiz.Image,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    verified: vmiz.gpt.VerifiedGpt,
+    table_index: u32,
+) anyerror!vmiz.gpt.GrowPartitionResult {
+    return vmiz.gpt.growPartitionToEnd(
+        destination,
+        io,
+        allocator,
+        verified,
+        table_index,
+    );
+}
+
+fn resizeExt4(
+    _: ?*anyopaque,
+    io: std.Io,
+    file: std.Io.File,
+    allocator: std.mem.Allocator,
+    options: vmiz.ext4.ResizeOptions,
+) anyerror!vmiz.ext4.FilesystemInfo {
+    return vmiz.ext4.resize(io, file, allocator, options);
+}
+
 fn verifyGpt(
     _: ?*anyopaque,
     destination: vmiz.Image,
@@ -440,12 +778,204 @@ fn verifyGpt(
     );
 }
 
+fn verifyRoot(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    destination: *const vmiz.Image,
+    verified: vmiz.gpt.VerifiedGpt,
+) anyerror!vmiz.root_resize.RootSelection {
+    return vmiz.root_resize.selectRoot(
+        allocator,
+        io,
+        destination,
+        verified,
+        .{ .require_last_partition = true },
+    );
+}
+
+fn makeDurable(
+    _: ?*anyopaque,
+    destination: *vmiz.Image,
+    io: std.Io,
+) anyerror!bool {
+    return destination.flushDeviceWrite(io);
+}
+
 fn finishDeviceWrite(
     _: ?*anyopaque,
     destination: *vmiz.Image,
     io: std.Io,
 ) anyerror!?vmiz.DeviceWriteOutcome {
     return destination.finishDeviceWrite(io);
+}
+
+fn failAfterMutation(
+    operations: Operations,
+    destination: *vmiz.Image,
+    io: std.Io,
+    comptime format: []const u8,
+    args: anytype,
+) u8 {
+    _ = operations.durable_fn(
+        operations.context,
+        destination,
+        io,
+    ) catch |durability_err| {
+        std.debug.print(
+            "write: failed to make partial device writes durable: {s}\n",
+            .{@errorName(durability_err)},
+        );
+        return fail(format, args);
+    };
+    return fail(format, args);
+}
+
+fn bytesEqualExcept(
+    before: []const u8,
+    after: []const u8,
+    allowed_ranges: []const [2]usize,
+) bool {
+    if (before.len != after.len) return false;
+    for (before, after, 0..) |before_byte, after_byte, index| {
+        var allowed = false;
+        for (allowed_ranges) |range| {
+            if (index >= range[0] and index < range[1]) {
+                allowed = true;
+                break;
+            }
+        }
+        if (!allowed and before_byte != after_byte) return false;
+    }
+    return true;
+}
+
+fn verifyGrownGptInvariant(
+    source: vmiz.gpt.VerifiedGpt,
+    destination: vmiz.gpt.VerifiedGpt,
+    plan: RootGrowthPlan,
+) !void {
+    const entry_size: usize = source.primary_header.partition_entry_size;
+    const entry_offset = std.math.mul(
+        usize,
+        plan.root.table_index,
+        entry_size,
+    ) catch return error.InvalidPartitionArrayBounds;
+    const last_lba_start = std.math.add(
+        usize,
+        entry_offset,
+        40,
+    ) catch return error.InvalidPartitionArrayBounds;
+    const last_lba_end = std.math.add(
+        usize,
+        last_lba_start,
+        8,
+    ) catch return error.InvalidPartitionArrayBounds;
+    if (last_lba_end > source.partition_array.len) return error.InvalidPartitionArrayBounds;
+    const partition_allowed = [_][2]usize{.{ last_lba_start, last_lba_end }};
+    if (!bytesEqualExcept(
+        source.partition_array,
+        destination.partition_array,
+        &partition_allowed,
+    )) return error.UnexpectedPartitionArrayChange;
+    if (std.mem.readInt(
+        u64,
+        destination.partition_array[last_lba_start..][0..8],
+        .little,
+    ) != plan.final_last_lba) return error.PartitionLengthMismatch;
+
+    const primary_allowed = [_][2]usize{
+        .{ 16, 20 },
+        .{ 32, 40 },
+        .{ 48, 56 },
+        .{ 88, 92 },
+    };
+    const backup_allowed = [_][2]usize{
+        .{ 16, 20 },
+        .{ 24, 40 },
+        .{ 48, 56 },
+        .{ 72, 80 },
+        .{ 88, 92 },
+    };
+    const protective_offset = vmiz.mbr.partition_table_offset +
+        @as(usize, source.protective_entry_index) * vmiz.mbr.entry_size;
+    const mbr_allowed = [_][2]usize{
+        .{ protective_offset + 5, protective_offset + 8 },
+        .{ protective_offset + 12, protective_offset + 16 },
+    };
+    if (!bytesEqualExcept(
+        &source.primary_header_sector,
+        &destination.primary_header_sector,
+        &primary_allowed,
+    ) or !bytesEqualExcept(
+        &source.backup_header_sector,
+        &destination.backup_header_sector,
+        &backup_allowed,
+    ) or !bytesEqualExcept(
+        &source.protective_mbr_sector,
+        &destination.protective_mbr_sector,
+        &mbr_allowed,
+    )) return error.UnexpectedGptMetadataChange;
+
+    const array_sectors = std.math.divCeil(
+        u64,
+        @intCast(source.partition_array.len),
+        vmiz.gpt.sector_size,
+    ) catch return error.InvalidPartitionArrayBounds;
+    const expected_backup_lba = std.math.add(
+        u64,
+        plan.final_last_lba,
+        array_sectors + 1,
+    ) catch return error.InvalidPartitionArrayBounds;
+    if (!std.mem.eql(
+        u8,
+        &source.primary_header.disk_guid,
+        &destination.primary_header.disk_guid,
+    ) or destination.primary_header.last_usable_lba != plan.final_last_lba or
+        destination.primary_header.backup_lba != expected_backup_lba or
+        destination.primary_header.backup_lba !=
+            destination.backup_header.current_lba or
+        destination.backup_header.backup_lba !=
+            destination.primary_header.current_lba)
+    {
+        return error.GptGeometryMismatch;
+    }
+}
+
+fn verifyGrownRoot(
+    plan: RootGrowthPlan,
+    actual: vmiz.root_resize.RootSelection,
+) !void {
+    if (actual.table_index != plan.root.table_index or
+        actual.first_lba != plan.root.first_lba or
+        actual.last_lba != plan.final_last_lba or
+        actual.partition_length != plan.final_partition_length)
+    {
+        return error.PartitionGeometryMismatch;
+    }
+    if (!std.mem.eql(
+        u8,
+        &actual.partition_type_guid,
+        &plan.root.partition_type_guid,
+    ) or !std.mem.eql(
+        u8,
+        &actual.unique_partition_guid,
+        &plan.root.unique_partition_guid,
+    ) or !std.mem.eql(
+        u8,
+        &actual.filesystem_uuid,
+        &plan.root.filesystem_uuid,
+    ) or !std.mem.eql(
+        u8,
+        &actual.filesystem_label,
+        &plan.root.filesystem_label,
+    ) or actual.filesystem_feature_compat != plan.root.filesystem_feature_compat or
+        actual.filesystem_feature_incompat != plan.root.filesystem_feature_incompat or
+        actual.filesystem_feature_ro_compat != plan.root.filesystem_feature_ro_compat or
+        actual.filesystem_length != plan.final_filesystem_length)
+    {
+        return error.FilesystemIdentityChanged;
+    }
 }
 
 fn describeWriteFailure(err: anyerror) ?[]const u8 {
@@ -663,7 +1193,12 @@ const FakeOperations = struct {
     invalidate_error: ?anyerror = null,
     copy_error: ?anyerror = null,
     relocate_error: ?anyerror = null,
+    plan_root_error: ?anyerror = null,
+    grow_partition_error: ?anyerror = null,
+    resize_error: ?anyerror = null,
     verify_error: ?anyerror = null,
+    verify_root_error: ?anyerror = null,
+    durable_error: ?anyerror = null,
     finish_error: ?anyerror = null,
     outcome: ?vmiz.DeviceWriteOutcome = .partition_table_refreshed,
     report: ?*const vmiz.DevicePreflightReport = null,
@@ -675,10 +1210,15 @@ const FakeOperations = struct {
     detect_calls: usize = 0,
     invalidate_calls: usize = 0,
     copy_calls: usize = 0,
+    plan_root_calls: usize = 0,
+    grow_partition_calls: usize = 0,
+    resize_calls: usize = 0,
+    verify_root_calls: usize = 0,
+    durable_calls: usize = 0,
     finish_calls: usize = 0,
     allow_device_write_seen: bool = false,
     real_pipeline: bool = false,
-    events: [8]u8 = undefined,
+    events: [16]u8 = undefined,
     event_count: usize = 0,
 
     fn record(self: *FakeOperations, event: u8) void {
@@ -797,6 +1337,64 @@ const FakeOperations = struct {
         return relocateBackup(null, destination, io, allocator, verified);
     }
 
+    fn planRootGrowthFake(
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        source: *const vmiz.Image,
+        destination_size: u64,
+        verified: vmiz.gpt.VerifiedGpt,
+    ) anyerror!RootGrowthPlan {
+        const self: *FakeOperations = @ptrCast(@alignCast(context.?));
+        self.plan_root_calls += 1;
+        self.record('p');
+        if (self.plan_root_error) |err| return err;
+        return planRootGrowth(
+            null,
+            allocator,
+            io,
+            source,
+            destination_size,
+            verified,
+        );
+    }
+
+    fn growPartitionFake(
+        context: ?*anyopaque,
+        destination: *vmiz.Image,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        verified: vmiz.gpt.VerifiedGpt,
+        table_index: u32,
+    ) anyerror!vmiz.gpt.GrowPartitionResult {
+        const self: *FakeOperations = @ptrCast(@alignCast(context.?));
+        self.grow_partition_calls += 1;
+        self.record('g');
+        if (self.grow_partition_error) |err| return err;
+        return growPartition(
+            null,
+            destination,
+            io,
+            allocator,
+            verified,
+            table_index,
+        );
+    }
+
+    fn resizeExt4Fake(
+        context: ?*anyopaque,
+        io: std.Io,
+        file: std.Io.File,
+        allocator: std.mem.Allocator,
+        options: vmiz.ext4.ResizeOptions,
+    ) anyerror!vmiz.ext4.FilesystemInfo {
+        const self: *FakeOperations = @ptrCast(@alignCast(context.?));
+        self.resize_calls += 1;
+        self.record('e');
+        if (self.resize_error) |err| return err;
+        return resizeExt4(null, io, file, allocator, options);
+    }
+
     fn verifyFake(
         context: ?*anyopaque,
         destination: vmiz.Image,
@@ -807,6 +1405,33 @@ const FakeOperations = struct {
         self.record('v');
         if (self.verify_error) |err| return err;
         return verifyGpt(null, destination, io, allocator);
+    }
+
+    fn verifyRootFake(
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        destination: *const vmiz.Image,
+        verified: vmiz.gpt.VerifiedGpt,
+    ) anyerror!vmiz.root_resize.RootSelection {
+        const self: *FakeOperations = @ptrCast(@alignCast(context.?));
+        self.verify_root_calls += 1;
+        self.record('q');
+        if (self.verify_root_error) |err| return err;
+        return verifyRoot(null, allocator, io, destination, verified);
+    }
+
+    fn durableFake(
+        context: ?*anyopaque,
+        destination: *vmiz.Image,
+        io: std.Io,
+    ) anyerror!bool {
+        const self: *FakeOperations = @ptrCast(@alignCast(context.?));
+        self.durable_calls += 1;
+        self.record('u');
+        if (self.durable_error) |err| return err;
+        if (self.real_pipeline) return makeDurable(null, destination, io);
+        return true;
     }
 
     fn finishFake(
@@ -832,7 +1457,12 @@ const FakeOperations = struct {
             .invalidate_fn = invalidateFake,
             .copy_fn = copyFake,
             .relocate_fn = relocateFake,
+            .plan_root_growth_fn = planRootGrowthFake,
+            .grow_partition_fn = growPartitionFake,
+            .resize_ext4_fn = resizeExt4Fake,
             .verify_fn = verifyFake,
+            .verify_root_fn = verifyRootFake,
+            .durable_fn = durableFake,
             .finish_fn = finishFake,
         };
     }
@@ -852,7 +1482,11 @@ fn testReport() vmiz.DevicePreflightReport {
 }
 
 fn createRawTestImage(io: std.Io, path: []const u8) !void {
-    var image = try vmiz.Image.create(io, path, .raw, 16 * 1024 * 1024, .{});
+    return createRawTestImageWithSize(io, path, 16 * 1024 * 1024);
+}
+
+fn createRawTestImageWithSize(io: std.Io, path: []const u8, size: u64) !void {
+    var image = try vmiz.Image.create(io, path, .raw, size, .{});
     image.close(io);
 }
 
@@ -871,6 +1505,70 @@ fn createGptTestImage(io: std.Io, path: []const u8, size: u64) !void {
         vmiz.guid.parse("99999999-8888-7777-6666-555555555555"),
         &specs,
         &placements,
+    );
+}
+
+fn createRootGptTestImage(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    size: u64,
+) !void {
+    return createRootGptTestImageWithFilesystemLength(
+        allocator,
+        io,
+        path,
+        size,
+        null,
+    );
+}
+
+fn createRootGptTestImageWithFilesystemLength(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    size: u64,
+    requested_filesystem_length: ?u64,
+) !void {
+    var image = try vmiz.Image.create(io, path, .raw, size, .{});
+    defer image.close(io);
+    const first_lba: u64 = 2048;
+    const last_lba = size / vmiz.gpt.sector_size -
+        2 - vmiz.gpt.partition_array_sectors;
+    const specs = [_]vmiz.gpt.PlacedPartitionSpec{.{
+        .type_guid = vmiz.guid.linux_root_x86_64,
+        .unique_guid = vmiz.guid.parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+        .placement = .{
+            .first_lba = first_lba,
+            .last_lba = last_lba,
+        },
+        .name_utf16le = vmiz.gpt.asciiName("root"),
+    }};
+    try vmiz.gpt.writeGptPlaced(
+        &image,
+        io,
+        vmiz.guid.parse("99999999-8888-7777-6666-555555555555"),
+        &specs,
+    );
+    var tree = vmiz.root_tree.RootTree.initMemory(allocator, io, .{});
+    defer tree.deinit();
+    try tree.putFileBytes("marker", "preserve me", .{ .mode = 0o644 });
+    const partition_length = (last_lba - first_lba + 1) *
+        vmiz.gpt.sector_size;
+    const filesystem_length = requested_filesystem_length orelse
+        partition_length / vmiz.ext4.default_block_size *
+            vmiz.ext4.default_block_size;
+    _ = try vmiz.ext4.populate(
+        io,
+        image.file,
+        allocator,
+        try tree.cursor(),
+        .{
+            .offset = first_lba * vmiz.gpt.sector_size,
+            .length = filesystem_length,
+            .label = "vmiz-root",
+            .uuid = [_]u8{0x55} ** 16,
+        },
     );
 }
 
@@ -1078,7 +1776,7 @@ test "write fails copy or flush errors after warning about partial mutation" {
     );
     try std.testing.expectEqual(@as(usize, 1), fake.copy_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.finish_calls);
-    try std.testing.expectEqualStrings("dix", fake.eventSlice());
+    try std.testing.expectEqualStrings("dixu", fake.eventSlice());
 }
 
 test "write orders confirmation, invalidation, copy, and one final refresh" {
@@ -1307,7 +2005,7 @@ test "write stops at invalidation and finalization errors in the correct phase" 
             invalidate_fake.operations(),
         ),
     );
-    try std.testing.expectEqualStrings("di", invalidate_fake.eventSlice());
+    try std.testing.expectEqualStrings("diu", invalidate_fake.eventSlice());
 
     var finish_fake = FakeOperations{
         .report = &report,
@@ -1322,7 +2020,7 @@ test "write stops at invalidation and finalization errors in the correct phase" 
             finish_fake.operations(),
         ),
     );
-    try std.testing.expectEqualStrings("dixf", finish_fake.eventSlice());
+    try std.testing.expectEqualStrings("dixfu", finish_fake.eventSlice());
 }
 
 test "write does not finalize an unverified relocated GPT" {
@@ -1350,7 +2048,7 @@ test "write does not finalize an unverified relocated GPT" {
             relocate_fake.operations(),
         ),
     );
-    try std.testing.expectEqualStrings("dixr", relocate_fake.eventSlice());
+    try std.testing.expectEqualStrings("dixru", relocate_fake.eventSlice());
     try std.testing.expectEqual(@as(usize, 0), relocate_fake.finish_calls);
 
     var verify_fake = FakeOperations{
@@ -1367,8 +2065,282 @@ test "write does not finalize an unverified relocated GPT" {
             verify_fake.operations(),
         ),
     );
-    try std.testing.expectEqualStrings("dixrv", verify_fake.eventSlice());
+    try std.testing.expectEqualStrings("dixrvu", verify_fake.eventSlice());
     try std.testing.expectEqual(@as(usize, 0), verify_fake.finish_calls);
+}
+
+test "write grow-root preflights before confirmation and mutates in order" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const source = "test-write-command-grow-order-source.raw";
+    const target = "test-write-command-grow-order-target.raw";
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, target) catch {};
+    try createRootGptTestImage(std.testing.allocator, io, source, 64 * 1024 * 1024);
+    try createRawTestImageWithSize(io, target, 96 * 1024 * 1024);
+    var report = testReport();
+    var fake = FakeOperations{ .report = &report, .real_pipeline = true };
+
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        runWithOperations(
+            std.testing.allocator,
+            io,
+            &.{ "--grow-root", "--allow-device-write", source, target },
+            fake.operations(),
+        ),
+    );
+    try std.testing.expectEqualStrings("dpcixgevqf", fake.eventSlice());
+    try std.testing.expectEqual(@as(usize, 1), fake.finish_calls);
+}
+
+test "write grow-root grows GPT and ext4 offline on a larger file stand-in" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const source = "test-write-command-grow-source.raw";
+    const target = "test-write-command-grow-target.raw";
+    const source_size: u64 = 64 * 1024 * 1024;
+    const target_size: u64 = 96 * 1024 * 1024;
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, target) catch {};
+    try createRootGptTestImage(allocator, io, source, source_size);
+    try createRawTestImageWithSize(io, target, target_size);
+    var report = testReport();
+    var fake = FakeOperations{ .report = &report, .real_pipeline = true };
+
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        runWithOperations(
+            allocator,
+            io,
+            &.{ "--allow-device-write", "--yes", "--grow-root", source, target },
+            fake.operations(),
+        ),
+    );
+    var destination = try vmiz.Image.openPathReadOnly(io, target);
+    defer destination.close(io);
+    var gpt = try vmiz.gpt.readVerifiedGpt(
+        destination,
+        io,
+        allocator,
+        vmiz.gpt.default_max_partition_array_bytes,
+    );
+    defer gpt.deinit(allocator);
+    const root = try vmiz.root_resize.selectRoot(
+        allocator,
+        io,
+        &destination,
+        gpt,
+        .{ .require_last_partition = true },
+    );
+    try std.testing.expectEqual(
+        target_size / vmiz.gpt.sector_size -
+            vmiz.gpt.partition_array_sectors - 2,
+        root.last_lba,
+    );
+    try std.testing.expectEqual(
+        root.partition_length / vmiz.ext4.default_block_size *
+            vmiz.ext4.default_block_size,
+        root.filesystem_length,
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.resize_calls);
+}
+
+test "write grow-root accepts an already-full partition and filesystem as a no-op" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const source = "test-write-command-grow-full-source.raw";
+    const target = "test-write-command-grow-full-target.raw";
+    const size: u64 = 64 * 1024 * 1024;
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, target) catch {};
+    try createRootGptTestImage(std.testing.allocator, io, source, size);
+    try createRawTestImageWithSize(io, target, size);
+    var report = testReport();
+    var fake = FakeOperations{ .report = &report, .real_pipeline = true };
+
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        runWithOperations(
+            std.testing.allocator,
+            io,
+            &.{ "--allow-device-write", "--yes", "--grow-root", source, target },
+            fake.operations(),
+        ),
+    );
+    try std.testing.expectEqualStrings("dpixrvqf", fake.eventSlice());
+    try std.testing.expectEqual(@as(usize, 0), fake.grow_partition_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.resize_calls);
+}
+
+test "write grow-root fills a smaller filesystem in a same-size full partition" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const source = "test-write-command-grow-filesystem-source.raw";
+    const target = "test-write-command-grow-filesystem-target.raw";
+    const size: u64 = 64 * 1024 * 1024;
+    const initial_filesystem_length: u64 = 48 * 1024 * 1024;
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, target) catch {};
+    try createRootGptTestImageWithFilesystemLength(
+        std.testing.allocator,
+        io,
+        source,
+        size,
+        initial_filesystem_length,
+    );
+    try createRawTestImageWithSize(io, target, size);
+    var report = testReport();
+    var fake = FakeOperations{ .report = &report, .real_pipeline = true };
+
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        runWithOperations(
+            std.testing.allocator,
+            io,
+            &.{ "--allow-device-write", "--yes", "--grow-root", source, target },
+            fake.operations(),
+        ),
+    );
+    try std.testing.expectEqualStrings("dpixrevqf", fake.eventSlice());
+    try std.testing.expectEqual(@as(usize, 0), fake.grow_partition_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.resize_calls);
+
+    var destination = try vmiz.Image.openPathReadOnly(io, target);
+    defer destination.close(io);
+    var gpt = try vmiz.gpt.readVerifiedGpt(
+        destination,
+        io,
+        std.testing.allocator,
+        vmiz.gpt.default_max_partition_array_bytes,
+    );
+    defer gpt.deinit(std.testing.allocator);
+    const root = try vmiz.root_resize.selectRoot(
+        std.testing.allocator,
+        io,
+        &destination,
+        gpt,
+        .{ .require_last_partition = true },
+    );
+    try std.testing.expect(root.filesystem_length > initial_filesystem_length);
+    try std.testing.expectEqual(
+        root.partition_length / vmiz.ext4.default_block_size *
+            vmiz.ext4.default_block_size,
+        root.filesystem_length,
+    );
+}
+
+test "write grow-root rejects selection and ext4 preflight failures before mutation" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const source = "test-write-command-grow-preflight-source.raw";
+    const target = "test-write-command-grow-preflight-target.raw";
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, target) catch {};
+    try createGptTestImage(io, source, 64 * 1024 * 1024);
+    try createRawTestImageWithSize(io, target, 96 * 1024 * 1024);
+    var report = testReport();
+
+    for ([_]anyerror{
+        error.RootFilesystemNotFound,
+        error.AmbiguousRootFilesystem,
+        error.RootPartitionNotLast,
+        error.UnsupportedFeatures,
+        error.UnsupportedResizeLayout,
+    }) |preflight_error| {
+        var fake = FakeOperations{
+            .report = &report,
+            .plan_root_error = preflight_error,
+            .real_pipeline = true,
+        };
+        try std.testing.expectEqual(
+            @as(u8, 1),
+            runWithOperations(
+                std.testing.allocator,
+                io,
+                &.{ "--allow-device-write", "--grow-root", source, target },
+                fake.operations(),
+            ),
+        );
+        try std.testing.expectEqualStrings("dp", fake.eventSlice());
+        try std.testing.expectEqual(@as(usize, 0), fake.confirm_calls);
+        try std.testing.expectEqual(@as(usize, 0), fake.invalidate_calls);
+    }
+}
+
+test "write grow-root failures after mutation are made durable without finalizing" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const source = "test-write-command-grow-errors-source.raw";
+    const target = "test-write-command-grow-errors-target.raw";
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, target) catch {};
+    try createRootGptTestImage(std.testing.allocator, io, source, 64 * 1024 * 1024);
+    try createRawTestImageWithSize(io, target, 96 * 1024 * 1024);
+    var report = testReport();
+
+    var resize_fake = FakeOperations{
+        .report = &report,
+        .real_pipeline = true,
+        .resize_error = error.InputOutput,
+    };
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        runWithOperations(
+            std.testing.allocator,
+            io,
+            &.{ "--allow-device-write", "--yes", "--grow-root", source, target },
+            resize_fake.operations(),
+        ),
+    );
+    try std.testing.expectEqualStrings("dpixgeu", resize_fake.eventSlice());
+    try std.testing.expectEqual(@as(usize, 0), resize_fake.finish_calls);
+
+    try createRawTestImageWithSize(io, target, 96 * 1024 * 1024);
+    var verify_fake = FakeOperations{
+        .report = &report,
+        .real_pipeline = true,
+        .verify_root_error = error.FilesystemIdentityChanged,
+    };
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        runWithOperations(
+            std.testing.allocator,
+            io,
+            &.{ "--allow-device-write", "--yes", "--grow-root", source, target },
+            verify_fake.operations(),
+        ),
+    );
+    try std.testing.expectEqualStrings("dpixgevqu", verify_fake.eventSlice());
+    try std.testing.expectEqual(@as(usize, 0), verify_fake.finish_calls);
+}
+
+test "write grow-root preserves refresh partial success" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const source = "test-write-command-grow-refresh-source.raw";
+    const target = "test-write-command-grow-refresh-target.raw";
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, target) catch {};
+    try createRootGptTestImage(std.testing.allocator, io, source, 64 * 1024 * 1024);
+    try createRawTestImageWithSize(io, target, 96 * 1024 * 1024);
+    var report = testReport();
+    var fake = FakeOperations{
+        .report = &report,
+        .real_pipeline = true,
+        .outcome = .partition_table_stale_busy,
+    };
+    try std.testing.expectEqual(
+        @as(u8, 2),
+        runWithOperations(
+            std.testing.allocator,
+            io,
+            &.{ "--allow-device-write", "--yes", "--grow-root", source, target },
+            fake.operations(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.finish_calls);
 }
 
 test "write preflight output inventories the target" {
