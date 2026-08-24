@@ -12,11 +12,12 @@ import re
 import resource
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 
 SCHEMA = 1
@@ -77,6 +78,13 @@ TIMING_PHASES = {
     "total_runtime",
 }
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+DEBZ_SNAPSHOT_BASE = "https://snapshot.ubuntu.com/ubuntu/20260731T000000Z"
+DEBZ_SUITES = ("resolute", "resolute-updates", "resolute-security")
+DEBZ_COMPONENTS = ("main", "restricted", "universe", "multiverse")
+DEBZ_REFRESH_SNAPSHOT = "repository-refresh-v2"
+DEBZ_POLICY_SNAPSHOT = "repository-policy-v1"
+DEBZ_AGGREGATE_SNAPSHOT = "multi-repository-v1"
+DEBZ_UNBOUNDED_DEADLINE_MS = (1 << 63) - 1
 
 
 class BenchmarkError(RuntimeError):
@@ -151,6 +159,7 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sha256sums-signature", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--debz-cache", type=Path, required=True)
+    parser.add_argument("--debz-input-dir", type=Path, required=True)
     parser.add_argument("--debz-lock-dir", type=Path, required=True)
     parser.add_argument("--authorized-key", type=Path, required=True)
     parser.add_argument("--uki-stub", type=Path, required=True)
@@ -191,6 +200,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "sha256sums_signature",
         "manifest",
         "debz_cache",
+        "debz_input_dir",
         "debz_lock_dir",
         "authorized_key",
         "uki_stub",
@@ -337,6 +347,9 @@ def verify_warm_cache(cache: Path) -> dict[str, object]:
     metadata_objects = verify_cache_objects(
         cache / "metadata-v1" / "objects", "metadata"
     )
+    metadata_by_digest = {
+        str(item["path"]): item for item in metadata_objects
+    }
     package_objects = verify_cache_objects(
         cache / "packages-v1" / "objects", "package"
     )
@@ -348,15 +361,96 @@ def verify_warm_cache(cache: Path) -> dict[str, object]:
     manifest_records = []
     for path in manifest_entries:
         metadata = path.lstat()
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-            fail(f"metadata manifest is not a regular file: {path}")
-        if metadata.st_size <= 0:
-            fail(f"metadata manifest is empty: {path}")
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or SHA256_RE.fullmatch(path.name) is None
+        ):
+            fail(f"metadata manifest is not a CAS-keyed regular file: {path}")
+        if metadata.st_size <= 0 or metadata.st_size > 4096:
+            fail(f"metadata manifest size is invalid: {path}")
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as error:
+            fail(f"cannot read metadata manifest {path}: {error}")
+        if len(lines) != 8 or lines[0] != "debz-metadata-manifest-v1":
+            fail(f"metadata manifest has the wrong schema: {path}")
+        fields = {}
+        for line in lines[1:]:
+            name, separator, value = line.partition("=")
+            if not separator or name in fields:
+                fail(f"metadata manifest has invalid fields: {path}")
+            fields[name] = value
+        if set(fields) != {
+            "repository",
+            "snapshot",
+            "digest",
+            "size",
+            "verification",
+            "verified-at",
+            "verifier-input",
+        }:
+            fail(f"metadata manifest has unexpected fields: {path}")
+        repository = require_sha256(
+            fields["repository"], f"metadata manifest {path.name} repository"
+        )
+        snapshot = fields["snapshot"]
+        if (
+            not snapshot
+            or len(snapshot) > 255
+            or any(
+                not (
+                    character.isascii()
+                    and (character.isalnum() or character in "-_.")
+                )
+                for character in snapshot
+            )
+        ):
+            fail(f"metadata manifest {path.name} snapshot is invalid")
+        if path.name != debz_manifest_name(repository, snapshot):
+            fail(f"metadata manifest filename does not match its cache key: {path}")
+        object_digest = require_sha256(
+            fields["digest"], f"metadata manifest {path.name} object"
+        )
+        try:
+            object_size = int(fields["size"])
+            int(fields["verified-at"])
+        except ValueError:
+            fail(f"metadata manifest has invalid numeric fields: {path}")
+        if object_size <= 0:
+            fail(f"metadata manifest has invalid object size: {path}")
+        if fields["verification"] not in {
+            "unauthenticated_release",
+            "in_release",
+            "detached_release",
+            "trusted_snapshot",
+        }:
+            fail(f"metadata manifest has invalid verification mode: {path}")
+        verifier = fields["verifier-input"]
+        if verifier != "-":
+            require_sha256(
+                verifier, f"metadata manifest {path.name} verifier input"
+            )
+        referenced = metadata_by_digest.get(object_digest)
+        if referenced is None:
+            fail(
+                f"metadata manifest {path.name} references missing object "
+                f"{object_digest}"
+            )
+        if object_size != referenced["bytes"]:
+            fail(
+                f"metadata manifest {path.name} object size differs from "
+                f"{object_digest}"
+            )
         manifest_records.append(
             {
                 "path": path.name,
                 "bytes": metadata.st_size,
                 "sha256": sha256(path),
+                "repository": repository,
+                "snapshot": snapshot,
+                "object_sha256": object_digest,
+                "object_bytes": object_size,
             }
         )
     if not manifest_records:
@@ -369,6 +463,13 @@ def verify_warm_cache(cache: Path) -> dict[str, object]:
         "metadata_manifests": len(manifest_records),
         "package_objects": len(package_objects),
         "package_bytes": sum(item["bytes"] for item in package_objects),
+        "object_inventory_sha256": canonical_digest(
+            {
+                "metadata": metadata_objects,
+                "packages": package_objects,
+            }
+        ),
+        "manifest_inventory_sha256": canonical_digest(manifest_records),
         "inventory_sha256": canonical_digest(
             {
                 "metadata": metadata_objects,
@@ -378,7 +479,125 @@ def verify_warm_cache(cache: Path) -> dict[str, object]:
         ),
     }
     public["_package_object_names"] = {item["path"] for item in package_objects}
+    public["_metadata_manifests"] = {
+        item["path"]: item for item in manifest_records
+    }
     return public
+
+
+def debz_hash_part(digest: Any, value: str) -> None:
+    encoded = value.encode()
+    digest.update(struct.pack(">Q", len(encoded)))
+    digest.update(encoded)
+
+
+def debz_hash_int(digest: Any, value: int) -> None:
+    digest.update(struct.pack(">q", value))
+
+
+# Mirrors the pinned debz repository_policy identity: Signed-By is deliberately
+# part of the key, while config file location and credentials are not.
+def debz_repository_id(
+    *,
+    suite: str,
+    component: str,
+    keyring_path: Path,
+) -> str:
+    digest = hashlib.sha256()
+    for value in (
+        "enabled",
+        DEBZ_SNAPSHOT_BASE,
+        suite,
+        component,
+        UBUNTU_ARCHITECTURE,
+        str(keyring_path),
+    ):
+        debz_hash_part(digest, value)
+    debz_hash_int(digest, 500)
+    for value in ("", "immutable_url", "", "direct"):
+        debz_hash_part(digest, value)
+    for value in (
+        DEBZ_UNBOUNDED_DEADLINE_MS,
+        DEBZ_UNBOUNDED_DEADLINE_MS,
+        DEBZ_UNBOUNDED_DEADLINE_MS,
+    ):
+        debz_hash_int(digest, value)
+    return digest.hexdigest()
+
+
+def debz_manifest_name(repository: str, snapshot: str) -> str:
+    return hashlib.sha256(
+        repository.encode() + b"\0" + snapshot.encode()
+    ).hexdigest()
+
+
+def benchmark_cache_requirements(input_dir: Path) -> list[dict[str, str]]:
+    keyring = input_dir.resolve() / "ubuntu-archive-keyring.gpg"
+    repositories = sorted(
+        debz_repository_id(
+            suite=suite,
+            component=component,
+            keyring_path=keyring,
+        )
+        for suite in DEBZ_SUITES
+        for component in DEBZ_COMPONENTS
+    )
+    requirements = []
+    for repository in repositories:
+        for phase, snapshot in (
+            ("repository-refresh", DEBZ_REFRESH_SNAPSHOT),
+            ("repository-policy", DEBZ_POLICY_SNAPSHOT),
+        ):
+            requirements.append(
+                {
+                    "phase": phase,
+                    "repository": repository,
+                    "snapshot": snapshot,
+                    "filename": debz_manifest_name(repository, snapshot),
+                }
+            )
+    configuration = hashlib.sha256()
+    debz_hash_part(configuration, "debz-multi-repository-configuration-v1")
+    for repository in repositories:
+        debz_hash_part(configuration, repository)
+    configuration_id = configuration.hexdigest()
+    requirements.append(
+        {
+            "phase": "repository-aggregate",
+            "repository": configuration_id,
+            "snapshot": DEBZ_AGGREGATE_SNAPSHOT,
+            "filename": debz_manifest_name(
+                configuration_id, DEBZ_AGGREGATE_SNAPSHOT
+            ),
+        }
+    )
+    return requirements
+
+
+def verify_benchmark_cache(cache: Path, input_dir: Path) -> dict[str, object]:
+    inventory = verify_warm_cache(cache)
+    manifests = inventory["_metadata_manifests"]
+    for requirement in benchmark_cache_requirements(input_dir):
+        manifest = manifests.get(requirement["filename"])
+        if manifest is None:
+            fail(
+                "warm debz cache is missing metadata manifest "
+                f"{requirement['filename']} for phase {requirement['phase']}, "
+                f"repository {requirement['repository']}, snapshot "
+                f"{requirement['snapshot']}; repository identity binds Signed-By "
+                f"{input_dir.resolve() / 'ubuntu-archive-keyring.gpg'}"
+            )
+        if (
+            manifest["repository"] != requirement["repository"]
+            or manifest["snapshot"] != requirement["snapshot"]
+        ):
+            fail(
+                f"warm debz cache metadata manifest {requirement['filename']} "
+                f"does not bind phase {requirement['phase']} to repository "
+                f"{requirement['repository']} and snapshot "
+                f"{requirement['snapshot']}"
+            )
+    return inventory
 
 
 def lock_filename(package: str) -> str:
@@ -1153,6 +1372,12 @@ def preflight(
         ),
         "zig": regular_file(args.zig, "Zig executable"),
     }
+    if args.debz_input_dir.is_symlink() or not args.debz_input_dir.is_dir():
+        fail("debz input directory must be a non-symlink directory")
+    inputs["debz_repository_inputs"] = {
+        "path": str(args.debz_input_dir.resolve()),
+        "cache_identity": "stable-signed-by-path",
+    }
     if not os.access(args.zig, os.X_OK):
         fail("Zig path is not executable")
     if args.signing_key is not None:
@@ -1168,7 +1393,9 @@ def preflight(
         )
         if not os.access(args.acceptance_command, os.X_OK):
             fail("acceptance command is not executable")
-    cache_inventory = verify_warm_cache(args.debz_cache)
+    cache_inventory = verify_benchmark_cache(
+        args.debz_cache, args.debz_input_dir
+    )
     lock_set = verify_lock_set(
         args.debz_lock_dir,
         cache_inventory["_package_object_names"],  # type: ignore[arg-type]
@@ -1293,6 +1520,8 @@ def benchmark_command(
         args.signing_certificate_sha256,
         "--debz-cache",
         str(args.debz_cache.resolve()),
+        "--debz-input-dir",
+        str(args.debz_input_dir.resolve()),
         "--debz-lock-dir",
         str(args.debz_lock_dir.resolve()),
         "--timing-output",
@@ -1353,9 +1582,16 @@ def run_once(
     write_json(resources_path, resources)
     if resources["status"] != "success":
         fail(f"{name} build failed; benchmark is invalid")
-    cache_after = verify_warm_cache(args.debz_cache)
-    if cache_after["inventory_sha256"] != cache_inventory["inventory_sha256"]:
-        fail(f"{name} changed the verified content-addressed cache inventory")
+    cache_after = verify_benchmark_cache(
+        args.debz_cache, args.debz_input_dir
+    )
+    # Cache-only refresh may republish validated manifests with a new
+    # verified-at timestamp; the content-addressed objects must not change.
+    if (
+        cache_after["object_inventory_sha256"]
+        != cache_inventory["object_inventory_sha256"]
+    ):
+        fail(f"{name} changed the verified content-addressed cache objects")
     timing = load_timing(timing_path)
     if not image.is_file() or image.stat().st_size <= 0:
         fail(f"{name} did not produce the expected image")
