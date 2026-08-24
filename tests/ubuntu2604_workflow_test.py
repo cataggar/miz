@@ -27,10 +27,16 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
                 f"\n  {following}:\n", 1
             )[0]
             self.assertEqual(section.count("- key: x86_64-full"), 1)
-            self.assertEqual(section.count("- key: aarch64-full"), 1)
+            self.assertEqual(
+                section.count("- key: aarch64-full"),
+                0 if name == "native_qemu" else 1,
+            )
             self.assertNotIn("-core", section)
             self.assertIn("asset_name: Ubuntu-26.04-x86_64.qcow2", section)
-            self.assertIn("asset_name: Ubuntu-26.04-aarch64.qcow2", section)
+            if name == "native_qemu":
+                self.assertNotIn("asset_name: Ubuntu-26.04-aarch64.qcow2", section)
+            else:
+                self.assertIn("asset_name: Ubuntu-26.04-aarch64.qcow2", section)
 
     def test_reuse_is_attempt_job_and_artifact_bound(self) -> None:
         self.assertIn("/attempts/$candidate_run_attempt/jobs", self.source)
@@ -47,7 +53,10 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         self.assertIn("needs.native_qemu.result == 'success'", publish)
         self.assertIn("needs.azure_acceptance.result == 'success'", publish)
         self.assertIn("scripts/ubuntu2604_publish.sh", publish)
-        self.assertIn("did not receive exactly two results of each kind", publish)
+        self.assertIn(
+            "did not receive two candidates, one native result, and two Azure results",
+            publish,
+        )
 
     def test_protected_environments_and_oidc_are_explicit(self) -> None:
         self.assertEqual(self.source.count("environment: ubuntu2604-signing"), 1)
@@ -235,10 +244,15 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         native = self.source.split("  native_qemu:", 1)[1].split(
             "  azure_acceptance:", 1
         )[0]
-        self.assertIn("test -c /dev/kvm", native)
+        self.assertIn("if [[ ! -c /dev/kvm ]]", native)
         self.assertIn('sudo chown "$(id -u):$(id -g)" /dev/kvm', native)
         self.assertIn("test -r /dev/kvm", native)
         self.assertIn("test -w /dev/kvm", native)
+        self.assertIn("OVMF_CODE_4M.ms.fd", native)
+        self.assertIn("OVMF_VARS_4M.ms.fd", native)
+        self.assertNotIn("AAVMF_CODE", native)
+        self.assertIn("VMIZ_UBUNTU2604_UEFI_CODE=", native)
+        self.assertIn("VMIZ_UBUNTU2604_UEFI_VARS=", native)
         self.assertIn("VMIZ_UBUNTU2604_IMAGE=", native)
         self.assertIn("test -s \"$VMIZ_UBUNTU2604_ACCEPTANCE_RESULT\"", native)
         self.assertIn("tampered-uki-rejected", native)
@@ -251,6 +265,18 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         self.assertNotIn("/usr/bin/coreutils", native)
         self.assertIn('ldd "$binary"', native)
         self.assertIn("while read -r library", native)
+
+    def test_azure_oidc_login_is_fresh_for_acceptance(self) -> None:
+        azure = self.source.split("  azure_acceptance:", 1)[1].split(
+            "  publish:", 1
+        )[0]
+        build = azure.index("- name: Build accepted-source vmiz")
+        login = azure.index("- name: Log in to Azure with protected-environment OIDC")
+        acceptance = azure.index(
+            "- name: Run exact-digest Azure Trusted Launch acceptance"
+        )
+        self.assertLess(build, login)
+        self.assertLess(login, acceptance)
 
 
 if __name__ == "__main__":

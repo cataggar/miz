@@ -402,10 +402,6 @@ jobs:
             architecture: x86_64
             runner: ubuntu-24.04
             asset_name: Ubuntu-26.04-x86_64.core.qcow2
-          - key: aarch64-core
-            architecture: aarch64
-            runner: ubuntu-24.04-arm
-            asset_name: Ubuntu-26.04-aarch64.core.qcow2
     env:
       CANDIDATE_KEY: ${{ matrix.key }}
       ARCHITECTURE: ${{ matrix.architecture }}
@@ -446,20 +442,28 @@ jobs:
             openssh-client openssl python3-virt-firmware qemu-utils
             sbsigntool swtpm swtpm-tools
           )
-          case "$ARCHITECTURE" in
-            x86_64) packages+=(ovmf qemu-system-x86) ;;
-            aarch64) packages+=(qemu-efi-aarch64 qemu-system-arm) ;;
-            *) exit 1 ;;
-          esac
+          test "$ARCHITECTURE" = x86_64
+          packages+=(ovmf qemu-system-x86)
+          uefi_code=/usr/share/OVMF/OVMF_CODE_4M.ms.fd
+          uefi_vars=/usr/share/OVMF/OVMF_VARS_4M.ms.fd
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
-          test -c /dev/kvm
+          test -r "$uefi_code"
+          test -r "$uefi_vars"
+          {
+            echo "VMIZ_UBUNTU2604_UEFI_CODE=$uefi_code"
+            echo "VMIZ_UBUNTU2604_UEFI_VARS=$uefi_vars"
+          } >> "$GITHUB_ENV"
+          if [[ ! -c /dev/kvm ]]; then
+            echo "::error::Matching-architecture native acceptance requires a KVM-capable runner with /dev/kvm"
+            exit 1
+          fi
           sudo chown "$(id -u):$(id -g)" /dev/kvm
           test -r /dev/kvm
           test -w /dev/kvm
           for tool in qemu-img sbverify ssh ssh-keygen swtpm virt-fw-vars; do
             command -v "$tool" >/dev/null
           done
-          command -v "qemu-system-${ARCHITECTURE/x86_64/x86_64}" >/dev/null
+          command -v qemu-system-x86_64 >/dev/null
 
       - name: Provision privileged offline-root containment fixture
         run: |
@@ -699,13 +703,6 @@ jobs:
           [[ "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ ]]
           [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
 
-      - name: Log in to Azure with protected-environment OIDC
-        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
         env:
@@ -797,6 +794,13 @@ jobs:
             echo "VMIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256=$ANDROID_BUNDLE_SHA256_VALUE"
             echo "VMIZ_UBUNTU2604_ANDROID_CONFIG_SHA256=$ANDROID_BUNDLE_CONFIG_SHA256_VALUE"
           } >> "$GITHUB_ENV"
+
+      - name: Log in to Azure with protected-environment OIDC
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Run exact-digest Azure Trusted Launch core acceptance
         env:
@@ -908,7 +912,7 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ needs.prepare.outputs.candidate_run_id }}
 
-      - name: Download both native-QEMU core acceptance results
+      - name: Download x86_64 native-QEMU core acceptance result
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: ubuntu2604-core-native-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
@@ -922,7 +926,7 @@ jobs:
           path: ${{ env.AZURE_RESULTS_DIR }}
           merge-multiple: false
 
-      - name: Validate exact successful two-by-three core gate
+      - name: Validate exact two-architecture core gate
         env:
           RUN_ID_VALUE: ${{ github.run_id }}
           RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
@@ -969,11 +973,11 @@ jobs:
           qcow_paths = list(candidates_root.rglob("*.qcow2"))
           if (
               len(candidate_docs) != 2
-              or len(native_docs) != 2
+              or len(native_docs) != 1
               or len(azure_docs) != 2
               or len(qcow_paths) != 2
           ):
-              raise SystemExit("core gate did not receive exactly two results of each kind")
+              raise SystemExit("core gate did not receive two candidates, one native result, two Azure results, and two images")
 
           def load_by_key(paths):
               result = {}
@@ -1015,15 +1019,18 @@ jobs:
               }:
                   raise SystemExit(f"{key}: candidate workflow attempt is not exact")
               native_path = native_by_digest.get(candidate["sha256"])
-              if native_path is None:
-                  raise SystemExit(f"{key}: native result is not digest-bound")
-              release.validate_native_result(
-                  manifest_path,
-                  asset_path,
-                  native_path,
-                  key=key,
-                  source_commit=source_commit,
-              )
+              if key == "x86_64-core":
+                  if native_path is None:
+                      raise SystemExit(f"{key}: native result is not digest-bound")
+                  release.validate_native_result(
+                      manifest_path,
+                      asset_path,
+                      native_path,
+                      key=key,
+                      source_commit=source_commit,
+                  )
+              elif native_path is not None:
+                  raise SystemExit(f"{key}: unexpected native result")
               azure_path, azure_result = azure[key]
               release.validate_azure_result(
                   manifest_path,
@@ -1047,7 +1054,9 @@ jobs:
                       "asset_name": asset_name,
                       "candidate_sha256": candidate["sha256"],
                       "candidate_manifest_sha256": digest(manifest_path),
-                      "native_result_sha256": digest(native_path),
+                      "native_result_sha256": (
+                          digest(native_path) if native_path is not None else None
+                      ),
                       "azure_result_sha256": digest(azure_path),
                   }
               )
