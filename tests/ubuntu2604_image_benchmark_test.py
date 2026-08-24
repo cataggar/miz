@@ -468,6 +468,96 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
                 {"closure": "b", "acceptance": {"status": "success"}},
             )
 
+    def test_transaction_correctness_uses_semantic_identity(self):
+        package = benchmark.PACKAGE_ROOTS[0]
+        digest = "a" * 64
+        lock_digest = "b" * 64
+        contracts = []
+        file_records = []
+        for run_name in ("run-warmup", "run-measured-01"):
+            path = self.root / f"{run_name}.json"
+            run_root = self.root / run_name / "work/root-stage-0"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema": "https://debz.dev/schema/transaction-result-v1",
+                        "version": 1,
+                        "target_architecture": benchmark.UBUNTU_ARCHITECTURE,
+                        "lock_sha256": lock_digest,
+                        "digest_sha256": digest,
+                        "outcome": "succeeded",
+                        "commands": [
+                            {
+                                "argv": [
+                                    "dpkg",
+                                    f"--root={run_root}",
+                                ]
+                            }
+                        ],
+                        "final_verification": {"status": "exact_match"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            contract, file_record = benchmark.validate_transaction(
+                path,
+                {
+                    "sha256": benchmark.sha256(path),
+                    "digest_sha256": digest,
+                },
+                lock_digest,
+                package,
+            )
+            contracts.append(contract)
+            file_records.append(file_record)
+
+        reference = {
+            "provenance": {"transaction_provenance": [contracts[0]]}
+        }
+        candidate = {
+            "provenance": {"transaction_provenance": [contracts[1]]}
+        }
+        benchmark.compare_correctness(reference, candidate)
+        self.assertNotIn("file_sha256", contracts[0])
+        self.assertNotEqual(
+            file_records[0]["file_sha256"],
+            file_records[1]["file_sha256"],
+        )
+        with self.assertRaises(benchmark.BenchmarkError):
+            benchmark.validate_transaction(
+                self.root / "run-warmup.json",
+                {
+                    "sha256": "0" * 64,
+                    "digest_sha256": digest,
+                },
+                lock_digest,
+                package,
+            )
+        with self.assertRaises(benchmark.BenchmarkError):
+            benchmark.validate_transaction(
+                self.root / "run-warmup.json",
+                {
+                    "sha256": file_records[0]["file_sha256"],
+                    "digest_sha256": digest,
+                },
+                "e" * 64,
+                package,
+            )
+
+        changed_digest = json.loads(json.dumps(candidate))
+        changed_digest["provenance"]["transaction_provenance"][0][
+            "digest_sha256"
+        ] = "c" * 64
+        with self.assertRaises(benchmark.BenchmarkError):
+            benchmark.compare_correctness(reference, changed_digest)
+
+        changed_lock = json.loads(json.dumps(candidate))
+        changed_lock["provenance"]["transaction_provenance"][0][
+            "lock_sha256"
+        ] = "d" * 64
+        with self.assertRaises(benchmark.BenchmarkError):
+            benchmark.compare_correctness(reference, changed_lock)
+
     def test_summary_generation_uses_three_measured_medians(self):
         values = {phase: 10 for phase in benchmark.PHASE_ORDER}
         resources = {

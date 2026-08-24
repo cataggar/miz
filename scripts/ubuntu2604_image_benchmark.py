@@ -972,7 +972,7 @@ def validate_transaction(
     binding: dict[str, object],
     lock_digest: str,
     package: str,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, str]]:
     file_digest = sha256(path)
     if file_digest != binding.get("sha256"):
         fail(f"{package} transaction provenance file hash mismatch")
@@ -992,12 +992,18 @@ def validate_transaction(
         or final.get("status") != "exact_match"
     ):
         fail(f"{package} transaction provenance does not prove exact success")
-    return {
-        "package": package,
-        "file_sha256": file_digest,
-        "digest_sha256": provenance_digest,
-        "lock_sha256": lock_digest,
-    }
+    return (
+        {
+            "package": package,
+            "digest_sha256": provenance_digest,
+            "lock_sha256": lock_digest,
+        },
+        {
+            "package": package,
+            "filename": path.name,
+            "file_sha256": file_digest,
+        },
+    )
 
 
 def validate_provenance(
@@ -1005,7 +1011,7 @@ def validate_provenance(
     lock_set: dict[str, object],
     *,
     certificate_sha256: str,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], list[dict[str, str]]]:
     if root.is_symlink() or not root.is_dir():
         fail("provenance directory is missing or unsafe")
     build = read_json(root / "ubuntu2604-build-provenance.json")
@@ -1104,6 +1110,7 @@ def validate_provenance(
         item["package"]: item for item in lock_set["locks"]  # type: ignore[index]
     }
     transaction_contracts = []
+    transaction_files = []
     for package, transaction in zip(PACKAGE_ROOTS, transactions, strict=True):
         if not isinstance(transaction, dict) or transaction.get("package") != package:
             fail("Ubuntu debz transactions are not stably ordered")
@@ -1125,14 +1132,14 @@ def validate_provenance(
         lock_digest = str(expected_lock["digest_sha256"])
         if provenance_binding.get("lock_sha256") != lock_digest:
             fail(f"{package} transaction is not bound to its exact lock")
-        transaction_contracts.append(
-            validate_transaction(
-                root / str(provenance_binding.get("filename")),
-                provenance_binding,
-                lock_digest,
-                package,
-            )
+        transaction_contract, transaction_file = validate_transaction(
+            root / str(provenance_binding.get("filename")),
+            provenance_binding,
+            lock_digest,
+            package,
         )
+        transaction_contracts.append(transaction_contract)
+        transaction_files.append(transaction_file)
     boot = read_json(root / "ubuntu2604-boot-input-evidence.json")
     if (
         boot.get("schema") != 1
@@ -1161,24 +1168,27 @@ def validate_provenance(
     if not isinstance(stub, dict):
         fail("UKI stub provenance is missing")
     stub_sha256 = require_sha256(stub.get("sha256"), "UKI stub digest")
-    return {
-        "source_artifacts": expected_artifacts,
-        "package_roots": list(PACKAGE_ROOTS),
-        "lock_set_sha256": canonical_digest(lock_set["locks"]),
-        "transaction_provenance": transaction_contracts,
-        "closure_sha256": lock_set["closure_sha256"],
-        "virtual_size": VIRTUAL_SIZE,
-        "minimum_root_free_bytes": minimum_free,
-        "validated_root_free_bytes": validated_free,
-        "kernel_release": boot["kernel_release"],
-        "embedded_package_inventory_sha256": package_lock_sha256,
-        "signing": {
-            "mode": signing.get("signer_mode"),
-            "certificate_sha256": certificate_sha256,
-            "uki_stub_sha256": stub_sha256,
-            "signature_verification": "success",
+    return (
+        {
+            "source_artifacts": expected_artifacts,
+            "package_roots": list(PACKAGE_ROOTS),
+            "lock_set_sha256": canonical_digest(lock_set["locks"]),
+            "transaction_provenance": transaction_contracts,
+            "closure_sha256": lock_set["closure_sha256"],
+            "virtual_size": VIRTUAL_SIZE,
+            "minimum_root_free_bytes": minimum_free,
+            "validated_root_free_bytes": validated_free,
+            "kernel_release": boot["kernel_release"],
+            "embedded_package_inventory_sha256": package_lock_sha256,
+            "signing": {
+                "mode": signing.get("signer_mode"),
+                "certificate_sha256": certificate_sha256,
+                "uki_stub_sha256": stub_sha256,
+                "signature_verification": "success",
+            },
         },
-    }
+        transaction_files,
+    )
 
 
 def compare_correctness(
@@ -1640,7 +1650,7 @@ def run_once(
     raw_output_record["retention_policy"] = (
         "keep" if args.keep_images else "delete-after-validation"
     )
-    provenance_contract = validate_provenance(
+    provenance_contract, transaction_provenance_files = validate_provenance(
         provenance_dir,
         lock_set,
         certificate_sha256=args.signing_certificate_sha256,
@@ -1694,6 +1704,7 @@ def run_once(
             "byte_reproducibility_compared": False,
         },
         "raw_output": raw_output_record,
+        "transaction_provenance_files": transaction_provenance_files,
         "correctness_sha256": canonical_digest(correctness),
         "cache_inventory_sha256": cache_inventory["inventory_sha256"],
     }
