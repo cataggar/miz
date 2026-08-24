@@ -570,7 +570,6 @@ fn packageFamilyRequest(
             .allow_downgrade = false,
             .conffile = .keep_existing,
             .installed_baseline = installed_baseline,
-            .deadline_ms = 30 * 60 * 1000,
         },
     };
 }
@@ -3968,6 +3967,7 @@ test "package-family resolve and customize requests are exact-lock operations" {
     try std.testing.expectEqualStrings("/inputs/ubuntu.sources", amd64.inputs.config_paths[0]);
     try std.testing.expectEqualStrings("/state/linux-azure.lock", amd64.inputs.lock_output_path.?);
     try std.testing.expect(amd64.inputs.lock_input_path == null);
+    try std.testing.expect(amd64.inputs.deadline_ms == null);
     const arm64 = packageFamilyRequest(
         .customize,
         profileFor(.aarch64),
@@ -3995,6 +3995,7 @@ test "package-family resolve and customize requests are exact-lock operations" {
     try std.testing.expectEqualStrings("/inputs/ubuntu.sources", arm64.inputs.config_paths[0]);
     try std.testing.expectEqualStrings("/state/walinuxagent.lock", arm64.inputs.lock_input_path.?);
     try std.testing.expect(arm64.inputs.lock_output_path == null);
+    try std.testing.expect(arm64.inputs.deadline_ms == null);
 
     const core_create = packageFamilyRequest(
         .create,
