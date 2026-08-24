@@ -25,6 +25,7 @@ pub const signature: [8]u8 = "EFI PART".*;
 /// Sectors occupied by the (default 128-entry, 128-byte-entry) partition
 /// array: 128*128 / 512 = 32.
 pub const partition_array_sectors: u64 = (default_num_partition_entries * partition_entry_size) / sector_size;
+pub const default_max_partition_array_bytes: u64 = 1024 * 1024;
 
 pub const Header = struct {
     revision: u32 = 0x0001_0000,
@@ -422,6 +423,19 @@ pub const VerifiedGpt = struct {
     }
 };
 
+pub const DetectedGpt = union(enum) {
+    not_gpt,
+    verified: VerifiedGpt,
+
+    pub fn deinit(self: *DetectedGpt, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .not_gpt => {},
+            .verified => |*verified| verified.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
 pub const VerifyError = error{
     ImageNotSectorAligned,
     InvalidProtectiveMbr,
@@ -435,6 +449,131 @@ pub const VerifyError = error{
     InvalidPartitionBounds,
     OverlappingPartitions,
 } || ReadError || mbr.Mbr.DecodeError;
+
+/// Detects whether an image is a GPT source and strictly verifies it when it
+/// is. A protective partition entry or a primary GPT signature is enough to
+/// classify the image as GPT-shaped, so damaged GPT metadata is reported as
+/// an error rather than silently treated as a non-GPT image.
+pub fn detectVerifiedGpt(
+    img: Image,
+    io: Io,
+    allocator: std.mem.Allocator,
+    max_partition_array_bytes: u64,
+) VerifyError!DetectedGpt {
+    var first_blocks: [2 * sector_size]u8 = [_]u8{0} ** (2 * sector_size);
+    const available = @min(img.virtual_size, first_blocks.len);
+    if (available != 0) {
+        const available_len: usize = @intCast(available);
+        if (try img.pread(io, first_blocks[0..available_len], 0) != available_len) {
+            return error.UnexpectedEndOfFile;
+        }
+    }
+
+    var has_protective_entry = false;
+    if (available >= sector_size) {
+        for (0..4) |i| {
+            const entry_offset = mbr.partition_table_offset + i * mbr.entry_size;
+            if (first_blocks[entry_offset + 4] == @intFromEnum(mbr.PartitionType.gpt_protective)) {
+                has_protective_entry = true;
+                break;
+            }
+        }
+    }
+    const has_primary_signature = available >= 2 * sector_size and
+        std.mem.eql(u8, first_blocks[sector_size .. sector_size + signature.len], &signature);
+    if (!has_protective_entry and !has_primary_signature) return .not_gpt;
+
+    return .{ .verified = try readVerifiedGpt(
+        img,
+        io,
+        allocator,
+        max_partition_array_bytes,
+    ) };
+}
+
+pub const InvalidateDestinationError = error{
+    ImageNotSectorAligned,
+    InvalidPartitionArrayLimit,
+    UnexpectedEndOfFile,
+} || Image.PreadError || Image.PwriteError;
+
+/// Erases possible GPT/MBR metadata before a destructive image copy.
+///
+/// The start range covers the MBR, primary header, and the maximum accepted
+/// partition array. The end range covers an array of the same size plus the
+/// final backup header. If a primary GPT header advertises metadata elsewhere,
+/// those ranges are erased too, preventing an old smaller table from surviving
+/// between the copied image and the destination's physical end.
+pub fn invalidateDestinationPartitionStructures(
+    img: *Image,
+    io: Io,
+    max_partition_array_bytes: u64,
+) InvalidateDestinationError!void {
+    if (img.virtual_size == 0 or img.virtual_size % sector_size != 0) {
+        return error.ImageNotSectorAligned;
+    }
+    if (max_partition_array_bytes == 0) {
+        return error.InvalidPartitionArrayLimit;
+    }
+
+    const array_sectors = std.math.divCeil(
+        u64,
+        max_partition_array_bytes,
+        sector_size,
+    ) catch return error.InvalidPartitionArrayLimit;
+    const start_sectors = std.math.add(u64, array_sectors, 2) catch
+        return error.InvalidPartitionArrayLimit;
+    const end_sectors = std.math.add(u64, array_sectors, 1) catch
+        return error.InvalidPartitionArrayLimit;
+    const total_sectors = img.virtual_size / sector_size;
+
+    var primary_sector: [sector_size]u8 = undefined;
+    var has_primary_sector = false;
+    if (total_sectors > 1) {
+        try preadExact(img.*, io, &primary_sector, sector_size);
+        has_primary_sector = true;
+    }
+
+    if (has_primary_sector) {
+        const primary = Header.decode(&primary_sector) catch null;
+        if (primary) |header| {
+            try eraseSectorRange(
+                img,
+                io,
+                header.partition_entry_lba,
+                array_sectors,
+                total_sectors,
+            );
+
+            if (header.backup_lba < total_sectors) {
+                const backup_start = header.backup_lba -|
+                    @min(header.backup_lba, array_sectors);
+                try eraseSectorRange(
+                    img,
+                    io,
+                    backup_start,
+                    header.backup_lba - backup_start + 1,
+                    total_sectors,
+                );
+            }
+        }
+    }
+
+    try eraseSectorRange(
+        img,
+        io,
+        total_sectors -| end_sectors,
+        @min(total_sectors, end_sectors),
+        total_sectors,
+    );
+    try eraseSectorRange(
+        img,
+        io,
+        0,
+        @min(total_sectors, start_sectors),
+        total_sectors,
+    );
+}
 
 /// Strictly validates the protective MBR and both GPT copies. Unlike
 /// `readGpt`, this is intended for image publication and conversion, where a
@@ -907,6 +1046,38 @@ fn preadExact(
     }
 }
 
+fn writeZeros(
+    img: *Image,
+    io: Io,
+    offset: u64,
+    len: u64,
+) Image.PwriteError!void {
+    const zeros: [64 * 1024]u8 = [_]u8{0} ** (64 * 1024);
+    var written: u64 = 0;
+    while (written < len) {
+        const chunk_len: usize = @intCast(@min(len - written, zeros.len));
+        try img.pwrite(io, zeros[0..chunk_len], offset + written);
+        written += chunk_len;
+    }
+}
+
+fn eraseSectorRange(
+    img: *Image,
+    io: Io,
+    start_lba: u64,
+    sector_count: u64,
+    total_sectors: u64,
+) Image.PwriteError!void {
+    if (start_lba >= total_sectors or sector_count == 0) return;
+    const bounded_count = @min(sector_count, total_sectors - start_lba);
+    try writeZeros(
+        img,
+        io,
+        start_lba * sector_size,
+        bounded_count * sector_size,
+    );
+}
+
 fn protectiveSectorCount(total_sectors: u64) u32 {
     return @intCast(@min(total_sectors - 1, std.math.maxInt(u32)));
 }
@@ -918,6 +1089,187 @@ fn updateHeaderChecksum(buf: *[sector_size]u8) void {
     buf[16..20].* = .{ 0, 0, 0, 0 };
     const checksum = std.hash.crc.Crc32.hash(buf[0..encoded_header_size]);
     std.mem.writeInt(u32, buf[16..20], checksum, .little);
+}
+
+test "invalidateDestinationPartitionStructures clears both GPT metadata regions" {
+    const io = std.testing.io;
+    const path = "test-gpt-destination-invalidate.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const array_bytes: u64 =
+        default_num_partition_entries * partition_entry_size;
+    const start_len: usize = @intCast(2 * sector_size + array_bytes);
+    const end_len: usize = @intCast(sector_size + array_bytes);
+    const size: u64 = 2 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, size, .{});
+    defer img.close(io);
+
+    const stale_start = [_]u8{0xa5} ** start_len;
+    const stale_end = [_]u8{0x5a} ** end_len;
+    const start_guard = [_]u8{0x3c} ** sector_size;
+    const end_guard = [_]u8{0xc3} ** sector_size;
+    const end_guard_offset = size - end_len - sector_size;
+    try img.pwrite(io, &stale_start, 0);
+    try img.pwrite(io, &stale_end, size - end_len);
+    try img.pwrite(io, &start_guard, start_len);
+    try img.pwrite(io, &end_guard, end_guard_offset);
+
+    try invalidateDestinationPartitionStructures(&img, io, array_bytes);
+
+    var cleared_start: [start_len]u8 = undefined;
+    var cleared_end: [end_len]u8 = undefined;
+    var preserved_start_guard: [sector_size]u8 = undefined;
+    var preserved_end_guard: [sector_size]u8 = undefined;
+    try preadExact(img, io, &cleared_start, 0);
+    try preadExact(img, io, &cleared_end, size - end_len);
+    try preadExact(img, io, &preserved_start_guard, start_len);
+    try preadExact(img, io, &preserved_end_guard, end_guard_offset);
+    try std.testing.expect(std.mem.allEqual(u8, &cleared_start, 0));
+    try std.testing.expect(std.mem.allEqual(u8, &cleared_end, 0));
+    try std.testing.expectEqualSlices(u8, &start_guard, &preserved_start_guard);
+    try std.testing.expectEqualSlices(u8, &end_guard, &preserved_end_guard);
+}
+
+test "invalidateDestinationPartitionStructures clears small destinations safely" {
+    const io = std.testing.io;
+    const path = "test-gpt-destination-invalid-geometry.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const array_bytes: u64 =
+        default_num_partition_entries * partition_entry_size;
+    const metadata_sectors =
+        2 * (array_bytes / sector_size) + 3;
+    var img = try Image.create(
+        io,
+        path,
+        .raw,
+        metadata_sectors * sector_size,
+        .{},
+    );
+    defer img.close(io);
+
+    try img.pwrite(io, &([_]u8{0xa5} ** sector_size), 0);
+    try invalidateDestinationPartitionStructures(&img, io, array_bytes);
+    var first_sector: [sector_size]u8 = undefined;
+    try preadExact(img, io, &first_sector, 0);
+    try std.testing.expect(std.mem.allEqual(u8, &first_sector, 0));
+    try std.testing.expectError(
+        error.InvalidPartitionArrayLimit,
+        invalidateDestinationPartitionStructures(&img, io, 0),
+    );
+
+    img.virtual_size -= 1;
+    try std.testing.expectError(
+        error.ImageNotSectorAligned,
+        invalidateDestinationPartitionStructures(&img, io, array_bytes),
+    );
+}
+
+test "invalidateDestinationPartitionStructures clears an advertised intermediate backup" {
+    const io = std.testing.io;
+    const path = "test-gpt-destination-intermediate-backup.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const size: u64 = 8 * 1024 * 1024;
+    const advertised_backup_lba: u64 = 4095;
+    const array_bytes: u64 =
+        default_num_partition_entries * partition_entry_size;
+    var img = try Image.create(io, path, .raw, size, .{});
+    defer img.close(io);
+
+    var primary: [sector_size]u8 = [_]u8{0} ** sector_size;
+    @memcpy(primary[0..signature.len], &signature);
+    std.mem.writeInt(u32, primary[8..12], 0x0001_0000, .little);
+    std.mem.writeInt(u32, primary[12..16], header_size, .little);
+    std.mem.writeInt(u64, primary[32..40], advertised_backup_lba, .little);
+    std.mem.writeInt(u64, primary[72..80], 2, .little);
+    updateHeaderChecksum(&primary);
+    try img.pwrite(io, &primary, sector_size);
+    try img.pwrite(
+        io,
+        &([_]u8{0xa5} ** sector_size),
+        advertised_backup_lba * sector_size,
+    );
+
+    try invalidateDestinationPartitionStructures(&img, io, array_bytes);
+
+    var backup: [sector_size]u8 = undefined;
+    try preadExact(
+        img,
+        io,
+        &backup,
+        advertised_backup_lba * sector_size,
+    );
+    try std.testing.expect(std.mem.allEqual(u8, &backup, 0));
+}
+
+test "detectVerifiedGpt passes through non-GPT and rejects malformed GPT" {
+    const io = std.testing.io;
+    const path = "test-gpt-detect.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const size: u64 = 8 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, size, .{});
+    defer img.close(io);
+
+    var blank = try detectVerifiedGpt(
+        img,
+        io,
+        std.testing.allocator,
+        default_max_partition_array_bytes,
+    );
+    defer blank.deinit(std.testing.allocator);
+    try std.testing.expect(blank == .not_gpt);
+
+    const protective = mbr.protectiveMbr(size / sector_size).encode();
+    try img.pwrite(io, &protective, 0);
+    try std.testing.expectError(
+        error.BadSignature,
+        detectVerifiedGpt(
+            img,
+            io,
+            std.testing.allocator,
+            default_max_partition_array_bytes,
+        ),
+    );
+
+    const disk_guid = guid.parse("99999999-8888-7777-6666-555555555555");
+    const entries = [_]PartitionEntry{.{
+        .partition_type_guid = guid.linux_filesystem_data,
+        .unique_partition_guid = guid.parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+        .first_lba = 2048,
+        .last_lba = 4095,
+    }};
+    try writePartitionTables(&img, io, disk_guid, &entries);
+    var detected = try detectVerifiedGpt(
+        img,
+        io,
+        std.testing.allocator,
+        default_max_partition_array_bytes,
+    );
+    defer detected.deinit(std.testing.allocator);
+    try std.testing.expect(detected == .verified);
+    const relocation = try relocateBackup(
+        &img,
+        io,
+        std.testing.allocator,
+        detected.verified,
+    );
+    try std.testing.expect(!relocation.was_relocated);
+
+    var primary: [sector_size]u8 = undefined;
+    try preadExact(img, io, &primary, sector_size);
+    primary[16] ^= 0xff;
+    try img.pwrite(io, &primary, sector_size);
+    try std.testing.expectError(
+        error.BadHeaderChecksum,
+        detectVerifiedGpt(
+            img,
+            io,
+            std.testing.allocator,
+            default_max_partition_array_bytes,
+        ),
+    );
 }
 
 test "readVerifiedGpt and relocateBackup preserve partition bytes and extents" {

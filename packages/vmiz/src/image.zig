@@ -1311,9 +1311,11 @@ const DeviceWriteOperations = struct {
     }
 };
 
-pub const CopyError = Image.PreadError || Image.PwriteError ||
-    Image.FinishDeviceWriteError || std.mem.Allocator.Error ||
+pub const CopyBytesError = Image.PreadError || Image.PwriteError ||
+    std.mem.Allocator.Error ||
     error{ UnexpectedEndOfFile, DestinationTooSmall };
+
+pub const CopyError = CopyBytesError || Image.FinishDeviceWriteError;
 
 /// Copies all `src` virtual-disk bytes into `*dst` (which must already have
 /// been created with at least `src`'s virtual size). Used by `vmiz convert`.
@@ -1359,6 +1361,41 @@ pub fn copyAllWithFinalization(
     );
 }
 
+/// Copies all virtual-disk bytes without synchronizing or refreshing a device
+/// destination. Callers can then mutate the completed destination before one
+/// final `Image.finishDeviceWrite`.
+pub fn copyAllBytes(
+    io: Io,
+    src: Image,
+    dst: *Image,
+    allocator: std.mem.Allocator,
+) CopyBytesError!void {
+    if (dst.virtual_size < src.virtual_size) return error.DestinationTooSmall;
+    const copy_policy = dst.copyPolicy();
+    const chunk_size: usize = if (dst.dynamic) |d|
+        d.block_size
+    else if (dst.vhdx) |v|
+        v.block_size
+    else if (dst.qcow2) |q|
+        @intCast(q.cluster_size)
+    else
+        4 * 1024 * 1024;
+    const buf = try allocator.alloc(u8, chunk_size);
+    defer allocator.free(buf);
+
+    var offset: u64 = 0;
+    while (offset < src.virtual_size) {
+        const remaining = src.virtual_size - offset;
+        const n: usize = @intCast(@min(remaining, chunk_size));
+        const got = try src.pread(io, buf[0..n], offset);
+        if (got != n) return error.UnexpectedEndOfFile;
+        if (copy_policy == .write_zero_chunks or !isAllZero(buf[0..n])) {
+            try dst.pwrite(io, buf[0..n], offset);
+        }
+        offset += n;
+    }
+}
+
 fn copyAllWithDeviceWriteOperations(
     io: Io,
     src: Image,
@@ -1384,30 +1421,7 @@ fn copyAllWithFinalizationAndDeviceWriteOperations(
     finalization: CopyFinalization,
     operations: DeviceWriteOperations,
 ) CopyError!CopyResult {
-    if (dst.virtual_size < src.virtual_size) return error.DestinationTooSmall;
-    const copy_policy = dst.copyPolicy();
-    const chunk_size: usize = if (dst.dynamic) |d|
-        d.block_size
-    else if (dst.vhdx) |v|
-        v.block_size
-    else if (dst.qcow2) |q|
-        @intCast(q.cluster_size)
-    else
-        4 * 1024 * 1024;
-    const buf = try allocator.alloc(u8, chunk_size);
-    defer allocator.free(buf);
-
-    var offset: u64 = 0;
-    while (offset < src.virtual_size) {
-        const remaining = src.virtual_size - offset;
-        const n: usize = @intCast(@min(remaining, chunk_size));
-        const got = try src.pread(io, buf[0..n], offset);
-        if (got != n) return error.UnexpectedEndOfFile;
-        if (copy_policy == .write_zero_chunks or !isAllZero(buf[0..n])) {
-            try dst.pwrite(io, buf[0..n], offset);
-        }
-        offset += n;
-    }
+    try copyAllBytes(io, src, dst, allocator);
     return switch (finalization) {
         .flush_device => blk: {
             break :blk .{
@@ -2058,6 +2072,40 @@ test "copy finalization can defer partition refresh until after mutations" {
     try std.testing.expectEqual(@as(usize, 2), operations.sync_attempts);
     try std.testing.expectEqual(@as(usize, 1), operations.refresh_attempts);
     try std.testing.expectEqual(@as(usize, 3), operations.sequence);
+    try std.testing.expect(operations.order_valid);
+}
+
+test "copyAllBytes leaves one final flush and refresh for its caller" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_file = try tmp.dir.createFile(io, "source.img", .{ .truncate = true, .read = true });
+    try source_file.setLength(io, 512);
+    var source = try Image.openFile(io, source_file);
+    defer source.close(io);
+    try source.pwrite(io, "payload", 0);
+
+    const destination_file = try tmp.dir.createFile(io, "destination.img", .{ .truncate = true, .read = true });
+    try destination_file.setLength(io, 1024);
+    var destination = try openSyntheticDeviceForWrite(destination_file, .{
+        .size_bytes = 1024,
+        .logical_sector_size = 512,
+    }, 512, .{ .allow_device_write = true });
+    defer destination.close(io);
+
+    var operations = TestDeviceWriteOperations{};
+    try copyAllBytes(io, source, &destination, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), operations.sync_attempts);
+    try std.testing.expectEqual(@as(usize, 0), operations.refresh_attempts);
+
+    try destination.pwrite(io, "post-copy mutation", 768);
+    try std.testing.expectEqual(
+        DeviceWriteOutcome.partition_table_refreshed,
+        (try destination.finishDeviceWriteWith(io, operations.operations())).?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), operations.sync_attempts);
+    try std.testing.expectEqual(@as(usize, 1), operations.refresh_attempts);
     try std.testing.expect(operations.order_valid);
 }
 
