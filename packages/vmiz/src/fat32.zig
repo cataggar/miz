@@ -2238,10 +2238,23 @@ const TreeScanner = struct {
     }
 };
 
+fn temporaryTestPath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    temporary: *std.testing.TmpDir,
+    sub_path: []const u8,
+) ![]const u8 {
+    var root_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    return std.fs.path.join(allocator, &.{ root_buffer[0..root_length], sub_path });
+}
+
 test "format writes FAT32 boot sector, FSInfo, backup boot sector, and root FAT anchor" {
     const io = std.testing.io;
-    const path = "test-fat32-format.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-format.img");
+    defer std.testing.allocator.free(path);
 
     const partition_offset: u64 = 1024 * 1024;
     const partition_len: u64 = 64 * 1024 * 1024;
@@ -2283,8 +2296,10 @@ test "format writes FAT32 boot sector, FSInfo, backup boot sector, and root FAT 
 
 test "format, write nested tree with VFAT long names, list, and read back" {
     const io = std.testing.io;
-    const path = "test-fat32-roundtrip.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-roundtrip.img");
+    defer std.testing.allocator.free(path);
 
     const partition_offset: u64 = 2 * 1024 * 1024;
     const partition_len: u64 = 96 * 1024 * 1024;
@@ -2328,8 +2343,10 @@ test "format, write nested tree with VFAT long names, list, and read back" {
 
 test "FAT32 path lookup is case-insensitive for mixed-case names" {
     const io = std.testing.io;
-    const path = "test-fat32-casefold.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-casefold.img");
+    defer std.testing.allocator.free(path);
 
     const partition_len: u64 = 64 * 1024 * 1024;
     var img = try Image.create(io, path, .raw, partition_len, .{});
@@ -2352,8 +2369,10 @@ test "FAT32 path lookup is case-insensitive for mixed-case names" {
 
 test "directory enumeration rejects cyclic FAT chains" {
     const io = std.testing.io;
-    const path = "test-fat32-cyclic-directory.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-cyclic-directory.img");
+    defer std.testing.allocator.free(path);
     const partition_len: u64 = 64 * 1024 * 1024;
     var img = try Image.create(io, path, .raw, partition_len, .{});
     defer img.close(io);
@@ -2382,8 +2401,10 @@ test "directory enumeration rejects cyclic FAT chains" {
 
 test "directory enumeration rejects invalid UTF-16 long names" {
     const io = std.testing.io;
-    const path = "test-fat32-invalid-long-name.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-invalid-long-name.img");
+    defer std.testing.allocator.free(path);
     const partition_len: u64 = 64 * 1024 * 1024;
     var img = try Image.create(io, path, .raw, partition_len, .{});
     defer img.close(io);
@@ -2421,8 +2442,10 @@ test "directory enumeration rejects invalid UTF-16 long names" {
 
 test "directory enumeration rejects separator-bearing long names" {
     const io = std.testing.io;
-    const path = "test-fat32-separator-long-name.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-separator-long-name.img");
+    defer std.testing.allocator.free(path);
     const partition_len: u64 = 64 * 1024 * 1024;
     var img = try Image.create(io, path, .raw, partition_len, .{});
     defer img.close(io);
@@ -2460,8 +2483,10 @@ test "directory enumeration rejects separator-bearing long names" {
 
 test "directory enumeration rejects case-insensitive duplicate names" {
     const io = std.testing.io;
-    const path = "test-fat32-duplicate-name.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-duplicate-name.img");
+    defer std.testing.allocator.free(path);
     const partition_len: u64 = 64 * 1024 * 1024;
     var img = try Image.create(io, path, .raw, partition_len, .{});
     defer img.close(io);
@@ -2495,8 +2520,10 @@ test "directory enumeration rejects case-insensitive duplicate names" {
 
 test "file reads reject nonempty entries without a data cluster" {
     const io = std.testing.io;
-    const path = "test-fat32-invalid-file-cluster.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-invalid-file-cluster.img");
+    defer std.testing.allocator.free(path);
     const partition_len: u64 = 64 * 1024 * 1024;
     var img = try Image.create(io, path, .raw, partition_len, .{});
     defer img.close(io);
@@ -2535,8 +2562,10 @@ test "file reads reject nonempty entries without a data cluster" {
 
 test "delete frees directory entries and FAT chains for reuse" {
     const io = std.testing.io;
-    const path = "test-fat32-delete.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-delete.img");
+    defer std.testing.allocator.free(path);
 
     const partition_len: u64 = 64 * 1024 * 1024;
     var img = try Image.create(io, path, .raw, partition_len, .{});
@@ -2605,8 +2634,10 @@ test "delete frees directory entries and FAT chains for reuse" {
 
 test "deleteTree removes nested directories and reuses freed clusters" {
     const io = std.testing.io;
-    const path = "test-fat32-delete-tree.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-delete-tree.img");
+    defer std.testing.allocator.free(path);
 
     const partition_len: u64 = 64 * 1024 * 1024;
     var img = try Image.create(io, path, .raw, partition_len, .{});
@@ -2687,8 +2718,10 @@ test "deleteTree removes nested directories and reuses freed clusters" {
 
 test "truncate shrinks files and frees unused clusters" {
     const io = std.testing.io;
-    const path = "test-fat32-truncate.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-truncate.img");
+    defer std.testing.allocator.free(path);
 
     const partition_len: u64 = 64 * 1024 * 1024;
     var img = try Image.create(io, path, .raw, partition_len, .{});
@@ -2748,8 +2781,10 @@ test "truncate shrinks files and frees unused clusters" {
 
 test "streaming writes match whole-buffer writes" {
     const io = std.testing.io;
-    const path = "test-fat32-stream.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-stream.img");
+    defer std.testing.allocator.free(path);
 
     const partition_len: u64 = 64 * 1024 * 1024;
     var img = try Image.create(io, path, .raw, partition_len, .{});
@@ -2793,8 +2828,10 @@ test "streaming writes match whole-buffer writes" {
 test "scanTree reads a FAT volume out in parent-before-child order" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const path = "test-fat32-scan-tree.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-scan-tree.img");
+    defer std.testing.allocator.free(path);
 
     const partition_offset: u64 = 1024 * 1024;
     const partition_len: u64 = 64 * 1024 * 1024;
@@ -2874,8 +2911,10 @@ test "scanTree reads a FAT volume out in parent-before-child order" {
 test "scanTree synthesizes exactly the metadata it is given" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const path = "test-fat32-scan-metadata.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-scan-metadata.img");
+    defer std.testing.allocator.free(path);
 
     const partition_offset: u64 = 0;
     const partition_len: u64 = 64 * 1024 * 1024;
@@ -2926,8 +2965,10 @@ test "scanTree synthesizes exactly the metadata it is given" {
 test "scanTree accounts every limit it enforces" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const path = "test-fat32-scan-limits.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-scan-limits.img");
+    defer std.testing.allocator.free(path);
 
     const partition_len: u64 = 64 * 1024 * 1024;
     var image = try Image.create(io, path, .raw, partition_len, .{});
@@ -2976,8 +3017,10 @@ test "scanTree accounts every limit it enforces" {
 test "scanTree refuses a directory that contains itself" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const path = "test-fat32-scan-cycle.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-scan-cycle.img");
+    defer std.testing.allocator.free(path);
 
     const partition_len: u64 = 64 * 1024 * 1024;
     var image = try Image.create(io, path, .raw, partition_len, .{});
@@ -3067,8 +3110,10 @@ test "content above the cluster floor grows the volume by what it needs" {
 
 test "the length a volume is sized to is one format accepts and can be filled to" {
     const io = std.testing.io;
-    const path = "test-fat32-minimum-round-trip.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat32-minimum-round-trip.img");
+    defer std.testing.allocator.free(path);
 
     // Two files large enough that the data area, not the 65525-cluster
     // floor, decides the answer.
