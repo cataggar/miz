@@ -550,6 +550,38 @@ until this protocol is run on the designated production benchmark host. Do
 not record a replacement baseline from a different architecture, cold cache,
 unreviewed lock set, or incomplete signing/boot environment.
 
+#### Raw-materialization optimization evidence
+
+The source-allocation-unit raw-copy change was also measured locally before
+merge because the production benchmark requires native aarch64. This is
+supporting evidence for the exact `vmiz.copyAll` implementation called by
+`writeRawCopy`, not a replacement production result and not evidence that the
+8m50s gate has passed.
+
+The deterministic fixture had a 5 GiB virtual size and 64 KiB QCOW2 clusters.
+Its four equal virtual-size quarters were dense data, one allocated cluster in
+four, one allocated cluster per 4 MiB, and all zero. The resulting QCOW2 was
+1,699,610,624 logical bytes. On x86_64 Linux 6.18/XFS, an Intel Xeon Platinum
+8370C, and Zig 0.16.0 ReleaseSafe, one warm-up was followed by five measured
+runs with the source resident in the page cache:
+
+| Median / result | Before | After |
+|---|---:|---:|
+| wall time | 5.242s | 2.542s |
+| user CPU | 1.533s | 1.053s |
+| system CPU | 1.558s | 0.789s |
+| output blocks written (512-byte units) | 7,864,320 | 3,317,760 |
+| raw allocated bytes | 4,026,531,840 | 1,698,787,328 |
+
+The raw logical size remained exactly 5,368,709,120 bytes, and both versions
+had SHA-256
+`468fc8eeefff28eafb559ec48d50e441f48d769cb717cdf25fd4a6f2fd053672`.
+Thus the local median improved by 51.5% while output I/O fell by 57.8%.
+Focused tests additionally cover allocated zero and unallocated QCOW2
+clusters, a partial final cluster, exact content and size, and undersized
+destination failure. The native aarch64 production benchmark must still
+confirm the whole-image effect.
+
 Without overrides, outputs are written in the current directory. Full work is
 cached under `.scratch/ubuntu2604-x86_64` or
 `.scratch/ubuntu2604-aarch64`; core uses the corresponding `-core` suffix. A
