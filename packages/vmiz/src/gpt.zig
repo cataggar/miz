@@ -765,6 +765,333 @@ pub const GrowPartitionResult = struct {
     relocation: RelocationResult,
 };
 
+pub const ReplacementGuids = struct {
+    disk_guid: guid.Guid,
+    /// One GUID per non-empty partition, in `VerifiedGpt.partitions` table order.
+    partition_guids: []const guid.Guid,
+};
+
+pub const OwnedReplacementGuids = struct {
+    disk_guid: guid.Guid,
+    partition_guids: []guid.Guid,
+
+    pub fn borrowed(self: OwnedReplacementGuids) ReplacementGuids {
+        return .{
+            .disk_guid = self.disk_guid,
+            .partition_guids = self.partition_guids,
+        };
+    }
+
+    pub fn deinit(self: *OwnedReplacementGuids, allocator: std.mem.Allocator) void {
+        allocator.free(self.partition_guids);
+        self.* = undefined;
+    }
+};
+
+pub const PartitionGuidRewrite = struct {
+    table_index: u32,
+    partition_type_guid: guid.Guid,
+    first_lba: u64,
+    last_lba: u64,
+    attributes: u64 = 0,
+    name_utf16le: [36]u16 = [_]u16{0} ** 36,
+    old_unique_guid: guid.Guid,
+    new_unique_guid: guid.Guid,
+};
+
+pub const IdentityRewriteReport = struct {
+    old_disk_guid: guid.Guid,
+    new_disk_guid: guid.Guid,
+    partitions: []PartitionGuidRewrite,
+
+    pub fn deinit(self: *IdentityRewriteReport, allocator: std.mem.Allocator) void {
+        allocator.free(self.partitions);
+        self.* = undefined;
+    }
+};
+
+pub const IdentityRewriteValidationError = error{
+    InvalidSourceDiskGuid,
+    InvalidSourcePartitionGuid,
+    DuplicateSourcePartitionGuid,
+    InvalidReplacementCount,
+    InvalidReplacementGuid,
+    DuplicateReplacementGuid,
+    ReplacementGuidCollidesWithSource,
+};
+
+pub const GenerateReplacementGuidsError = IdentityRewriteValidationError || std.mem.Allocator.Error;
+
+pub const RewriteIdentityError = IdentityRewriteValidationError || error{
+    SourceMetadataChanged,
+    InvalidPartitionArrayBounds,
+    UnexpectedEndOfFile,
+} || Image.PreadError || Image.PwriteError || std.mem.Allocator.Error;
+
+/// Generates a fresh disk GUID plus one fresh partition GUID per non-empty
+/// GPT entry. The result owns the partition-guid slice and can be passed to
+/// `rewriteIdentity` via `borrowed()`.
+pub fn generateReplacementGuids(
+    allocator: std.mem.Allocator,
+    io: Io,
+    verified: VerifiedGpt,
+) GenerateReplacementGuidsError!OwnedReplacementGuids {
+    try validateSourceIdentity(verified);
+    const partition_guids = try allocator.alloc(guid.Guid, verified.partitions.len);
+    errdefer allocator.free(partition_guids);
+
+    const disk_guid = generateFreshGuid(io, verified, null, partition_guids[0..0]);
+    for (partition_guids, 0..) |*partition_guid, i| {
+        partition_guid.* = generateFreshGuid(
+            io,
+            verified,
+            disk_guid,
+            partition_guids[0..i],
+        );
+    }
+
+    return .{
+        .disk_guid = disk_guid,
+        .partition_guids = partition_guids,
+    };
+}
+
+/// Rewrites the disk GUID and every non-empty partition unique GUID in an
+/// already verified GPT while preserving all other GPT/MBR bytes and the
+/// current GPT geometry. `replacement.partition_guids` must be in
+/// `VerifiedGpt.partitions` table order.
+pub fn rewriteIdentity(
+    img: *Image,
+    io: Io,
+    allocator: std.mem.Allocator,
+    verified: VerifiedGpt,
+    replacement: ReplacementGuids,
+) RewriteIdentityError!IdentityRewriteReport {
+    try validateReplacementGuids(verified, replacement);
+    try verifySourceMetadataUnchanged(img, io, allocator, verified);
+
+    const entry_size_u64: u64 = verified.primary_header.partition_entry_size;
+    const updated_array = try allocator.dupe(u8, verified.partition_array);
+    defer allocator.free(updated_array);
+
+    const rewrites = try allocator.alloc(
+        PartitionGuidRewrite,
+        verified.partitions.len,
+    );
+    errdefer allocator.free(rewrites);
+
+    for (verified.partitions, replacement.partition_guids, 0..) |partition, new_guid, i| {
+        const guid_offset_u64 = std.math.add(
+            u64,
+            std.math.mul(u64, partition.table_index, entry_size_u64) catch
+                return error.InvalidPartitionArrayBounds,
+            16,
+        ) catch return error.InvalidPartitionArrayBounds;
+        const guid_end_u64 = std.math.add(
+            u64,
+            guid_offset_u64,
+            @as(u64, @sizeOf(guid.Guid)),
+        ) catch return error.InvalidPartitionArrayBounds;
+        if (guid_end_u64 > updated_array.len) return error.InvalidPartitionArrayBounds;
+        const guid_offset = std.math.cast(usize, guid_offset_u64) orelse
+            return error.InvalidPartitionArrayBounds;
+
+        updated_array[guid_offset..][0..@sizeOf(guid.Guid)].* = new_guid;
+        rewrites[i] = .{
+            .table_index = partition.table_index,
+            .partition_type_guid = partition.partition_type_guid,
+            .first_lba = partition.first_lba,
+            .last_lba = partition.last_lba,
+            .attributes = partition.attributes,
+            .name_utf16le = partition.name_utf16le,
+            .old_unique_guid = partition.unique_partition_guid,
+            .new_unique_guid = new_guid,
+        };
+    }
+
+    const array_crc = std.hash.crc.Crc32.hash(updated_array);
+    var primary_sector = verified.primary_header_sector;
+    primary_sector[56..72].* = replacement.disk_guid;
+    std.mem.writeInt(u32, primary_sector[88..92], array_crc, .little);
+    updateHeaderChecksum(&primary_sector);
+
+    var backup_sector = verified.backup_header_sector;
+    backup_sector[56..72].* = replacement.disk_guid;
+    std.mem.writeInt(u32, backup_sector[88..92], array_crc, .little);
+    updateHeaderChecksum(&backup_sector);
+
+    try img.pwrite(
+        io,
+        updated_array,
+        try sectorOffset(verified.primary_header.partition_entry_lba),
+    );
+    try img.pwrite(
+        io,
+        updated_array,
+        try sectorOffset(verified.backup_header.partition_entry_lba),
+    );
+    try img.pwrite(
+        io,
+        &backup_sector,
+        try sectorOffset(verified.backup_header.current_lba),
+    );
+    try img.pwrite(
+        io,
+        &primary_sector,
+        try sectorOffset(verified.primary_header.current_lba),
+    );
+
+    return .{
+        .old_disk_guid = verified.primary_header.disk_guid,
+        .new_disk_guid = replacement.disk_guid,
+        .partitions = rewrites,
+    };
+}
+
+fn validateSourceIdentity(verified: VerifiedGpt) IdentityRewriteValidationError!void {
+    if (guidEql(verified.primary_header.disk_guid, guid.nil)) {
+        return error.InvalidSourceDiskGuid;
+    }
+    for (verified.partitions, 0..) |partition, i| {
+        if (guidEql(partition.unique_partition_guid, guid.nil)) {
+            return error.InvalidSourcePartitionGuid;
+        }
+        for (verified.partitions[0..i]) |existing| {
+            if (guidEql(partition.unique_partition_guid, existing.unique_partition_guid)) {
+                return error.DuplicateSourcePartitionGuid;
+            }
+        }
+    }
+}
+
+fn validateReplacementGuids(
+    verified: VerifiedGpt,
+    replacement: ReplacementGuids,
+) IdentityRewriteValidationError!void {
+    try validateSourceIdentity(verified);
+    if (replacement.partition_guids.len != verified.partitions.len) {
+        return error.InvalidReplacementCount;
+    }
+    if (guidEql(replacement.disk_guid, guid.nil)) return error.InvalidReplacementGuid;
+    if (sourceContainsGuid(verified, replacement.disk_guid)) {
+        return error.ReplacementGuidCollidesWithSource;
+    }
+
+    for (replacement.partition_guids, 0..) |new_guid, i| {
+        if (guidEql(new_guid, guid.nil)) return error.InvalidReplacementGuid;
+        if (sourceContainsGuid(verified, new_guid)) {
+            return error.ReplacementGuidCollidesWithSource;
+        }
+        if (guidEql(new_guid, replacement.disk_guid)) {
+            return error.DuplicateReplacementGuid;
+        }
+        for (replacement.partition_guids[0..i]) |existing| {
+            if (guidEql(new_guid, existing)) return error.DuplicateReplacementGuid;
+        }
+    }
+}
+
+fn verifySourceMetadataUnchanged(
+    img: *Image,
+    io: Io,
+    allocator: std.mem.Allocator,
+    verified: VerifiedGpt,
+) RewriteIdentityError!void {
+    var current_primary: [sector_size]u8 = undefined;
+    try preadExact(
+        img.*,
+        io,
+        &current_primary,
+        try sectorOffset(verified.primary_header.current_lba),
+    );
+    if (!std.mem.eql(u8, &current_primary, &verified.primary_header_sector)) {
+        return error.SourceMetadataChanged;
+    }
+
+    var current_backup: [sector_size]u8 = undefined;
+    try preadExact(
+        img.*,
+        io,
+        &current_backup,
+        try sectorOffset(verified.backup_header.current_lba),
+    );
+    if (!std.mem.eql(u8, &current_backup, &verified.backup_header_sector)) {
+        return error.SourceMetadataChanged;
+    }
+
+    var current_mbr: [sector_size]u8 = undefined;
+    try preadExact(img.*, io, &current_mbr, 0);
+    if (!std.mem.eql(u8, &current_mbr, &verified.protective_mbr_sector)) {
+        return error.SourceMetadataChanged;
+    }
+
+    const current_array = try allocator.alloc(u8, verified.partition_array.len);
+    defer allocator.free(current_array);
+
+    try preadExact(
+        img.*,
+        io,
+        current_array,
+        try sectorOffset(verified.primary_header.partition_entry_lba),
+    );
+    if (!std.mem.eql(u8, current_array, verified.partition_array)) {
+        return error.SourceMetadataChanged;
+    }
+
+    try preadExact(
+        img.*,
+        io,
+        current_array,
+        try sectorOffset(verified.backup_header.partition_entry_lba),
+    );
+    if (!std.mem.eql(u8, current_array, verified.partition_array)) {
+        return error.SourceMetadataChanged;
+    }
+}
+
+fn generateFreshGuid(
+    io: Io,
+    verified: VerifiedGpt,
+    disk_guid: ?guid.Guid,
+    partition_guids: []const guid.Guid,
+) guid.Guid {
+    while (true) {
+        const candidate = randomGuid(io);
+        if (sourceContainsGuid(verified, candidate)) continue;
+        if (disk_guid) |new_disk_guid| {
+            if (guidEql(candidate, new_disk_guid)) continue;
+        }
+        var duplicate = false;
+        for (partition_guids) |existing| {
+            if (guidEql(candidate, existing)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) return candidate;
+    }
+}
+
+fn sourceContainsGuid(verified: VerifiedGpt, candidate: guid.Guid) bool {
+    if (guidEql(candidate, verified.primary_header.disk_guid)) return true;
+    for (verified.partitions) |partition| {
+        if (guidEql(candidate, partition.unique_partition_guid)) return true;
+    }
+    return false;
+}
+
+fn guidEql(a: guid.Guid, b: guid.Guid) bool {
+    return std.mem.eql(u8, &a, &b);
+}
+
+fn randomGuid(io: Io) guid.Guid {
+    var bytes: guid.Guid = undefined;
+    Io.random(io, &bytes);
+    bytes[7] = (bytes[7] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    return bytes;
+}
+
 /// Relocates the backup GPT to the current end of `img`, then extends the
 /// selected partition to the new last usable LBA. The partition array is
 /// treated as opaque bytes: only the selected entry's `last_lba` field and
@@ -1089,6 +1416,108 @@ fn updateHeaderChecksum(buf: *[sector_size]u8) void {
     buf[16..20].* = .{ 0, 0, 0, 0 };
     const checksum = std.hash.crc.Crc32.hash(buf[0..encoded_header_size]);
     std.mem.writeInt(u32, buf[16..20], checksum, .little);
+}
+
+const TestRawPartitionEntry = struct {
+    entry: PartitionEntry,
+    opaque_tail: []const u8 = &.{},
+};
+
+const TestOpaqueTail = struct {
+    table_index: u32,
+    bytes: []const u8,
+};
+
+fn writeCustomPartitionTablesForTest(
+    img: *Image,
+    io: Io,
+    disk_guid: guid.Guid,
+    entry_size: u32,
+    num_entries: u32,
+    entries: []const TestRawPartitionEntry,
+    unused_tails: []const TestOpaqueTail,
+) !void {
+    const entry_size_usize: usize = @intCast(entry_size);
+    const num_entries_usize: usize = @intCast(num_entries);
+    std.debug.assert(entry_size >= partition_entry_size);
+    std.debug.assert(entry_size % 8 == 0);
+    std.debug.assert(entries.len <= num_entries_usize);
+
+    const total_sectors = img.virtual_size / sector_size;
+    const array_bytes: u64 = @as(u64, num_entries) * entry_size;
+    const array_sectors = std.math.divCeil(u64, array_bytes, sector_size) catch unreachable;
+    const first_usable_lba: u64 = 2 + array_sectors;
+    const backup_array_lba = total_sectors - 1 - array_sectors;
+    const last_usable_lba = backup_array_lba - 1;
+    const array_len: usize = @intCast(array_bytes);
+    const array = try std.testing.allocator.alloc(u8, array_len);
+    defer std.testing.allocator.free(array);
+    @memset(array, 0);
+
+    var previous_last_lba = first_usable_lba - 1;
+    for (entries, 0..) |fixture, i| {
+        if (fixture.entry.first_lba < first_usable_lba or
+            fixture.entry.last_lba < fixture.entry.first_lba or
+            fixture.entry.last_lba > last_usable_lba or
+            (i > 0 and fixture.entry.first_lba <= previous_last_lba))
+        {
+            return error.InvalidPlacement;
+        }
+        previous_last_lba = fixture.entry.last_lba;
+
+        const entry_offset = i * entry_size_usize;
+        fixture.entry.encode(array[entry_offset..][0..partition_entry_size]);
+        const opaque_bytes = array[entry_offset + partition_entry_size .. entry_offset + entry_size_usize];
+        std.debug.assert(fixture.opaque_tail.len <= opaque_bytes.len);
+        @memcpy(opaque_bytes[0..fixture.opaque_tail.len], fixture.opaque_tail);
+    }
+
+    for (unused_tails) |unused| {
+        const table_index: usize = @intCast(unused.table_index);
+        std.debug.assert(table_index < num_entries_usize);
+        std.debug.assert(table_index >= entries.len);
+        const entry_offset = table_index * entry_size_usize;
+        const opaque_bytes = array[entry_offset + partition_entry_size .. entry_offset + entry_size_usize];
+        std.debug.assert(unused.bytes.len <= opaque_bytes.len);
+        @memcpy(opaque_bytes[0..unused.bytes.len], unused.bytes);
+    }
+
+    const array_crc = std.hash.crc.Crc32.hash(array);
+    const primary = Header{
+        .current_lba = 1,
+        .backup_lba = total_sectors - 1,
+        .first_usable_lba = first_usable_lba,
+        .last_usable_lba = last_usable_lba,
+        .disk_guid = disk_guid,
+        .partition_entry_lba = 2,
+        .num_partition_entries = num_entries,
+        .partition_entry_size = entry_size,
+        .partition_array_crc32 = array_crc,
+    };
+    const backup = Header{
+        .current_lba = total_sectors - 1,
+        .backup_lba = 1,
+        .first_usable_lba = first_usable_lba,
+        .last_usable_lba = last_usable_lba,
+        .disk_guid = disk_guid,
+        .partition_entry_lba = backup_array_lba,
+        .num_partition_entries = num_entries,
+        .partition_entry_size = entry_size,
+        .partition_array_crc32 = array_crc,
+    };
+
+    const protective_mbr = mbr.protectiveMbr(total_sectors).encode();
+    try img.pwrite(io, &protective_mbr, 0);
+    try img.pwrite(io, &primary.encode(), sector_size);
+    try img.pwrite(io, array, 2 * sector_size);
+    try img.pwrite(io, array, backup_array_lba * sector_size);
+    try img.pwrite(io, &backup.encode(), (total_sectors - 1) * sector_size);
+}
+
+fn testEntrySlice(array: []const u8, entry_size: u32, table_index: u32) []const u8 {
+    const entry_size_usize: usize = @intCast(entry_size);
+    const start = @as(usize, @intCast(table_index)) * entry_size_usize;
+    return array[start .. start + entry_size_usize];
 }
 
 test "invalidateDestinationPartitionStructures clears both GPT metadata regions" {
@@ -1686,6 +2115,324 @@ test "readGpt rejects truncated headers and partition arrays" {
         try img.pwrite(io, &encoded, sector_size);
         try std.testing.expectError(error.InvalidPartitionArrayBounds, readGpt(img, io, std.testing.allocator));
     }
+}
+
+test "rewriteIdentity preserves opaque GPT entry bytes on same-size disks" {
+    const io = std.testing.io;
+    const path = "test-gpt-identity-rewrite-same-size.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const disk_size: u64 = 32 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, disk_size, .{});
+    defer img.close(io);
+
+    const entry_size: u32 = 160;
+    const num_entries: u32 = 4;
+    const disk_guid = guid.parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    const entries = [_]TestRawPartitionEntry{
+        .{ .entry = .{
+            .partition_type_guid = guid.esp,
+            .unique_partition_guid = guid.parse("11111111-1111-1111-1111-111111111111"),
+            .first_lba = 2048,
+            .last_lba = 4095,
+            .attributes = 0x0123_4567_89ab_cdef,
+            .name_utf16le = asciiName("EFI System"),
+        }, .opaque_tail = &([_]u8{0xa1} ** 32) },
+        .{ .entry = .{
+            .partition_type_guid = guid.linux_filesystem_data,
+            .unique_partition_guid = guid.parse("22222222-2222-2222-2222-222222222222"),
+            .first_lba = 8192,
+            .last_lba = 32767,
+            .attributes = 0xfedc_ba98_7654_3210,
+            .name_utf16le = asciiName("root"),
+        }, .opaque_tail = &([_]u8{0xb2} ** 32) },
+    };
+    const unused_tails = [_]TestOpaqueTail{
+        .{ .table_index = 2, .bytes = &([_]u8{0xc3} ** 32) },
+        .{ .table_index = 3, .bytes = &([_]u8{0xd4} ** 32) },
+    };
+    try writeCustomPartitionTablesForTest(
+        &img,
+        io,
+        disk_guid,
+        entry_size,
+        num_entries,
+        &entries,
+        &unused_tails,
+    );
+
+    var mbr_sector: [sector_size]u8 = undefined;
+    try preadExact(img, io, &mbr_sector, 0);
+    mbr_sector[17] = 0x7a;
+    std.mem.writeInt(u32, mbr_sector[0x1B8..0x1BC], 0x7856_3412, .little);
+    try img.pwrite(io, &mbr_sector, 0);
+
+    var verified = try readVerifiedGpt(
+        img,
+        io,
+        std.testing.allocator,
+        default_max_partition_array_bytes,
+    );
+    defer verified.deinit(std.testing.allocator);
+
+    const replacement_partition_guids = [_]guid.Guid{
+        guid.parse("33333333-3333-3333-3333-333333333333"),
+        guid.parse("44444444-4444-4444-4444-444444444444"),
+    };
+    const replacement = ReplacementGuids{
+        .disk_guid = guid.parse("55555555-5555-5555-5555-555555555555"),
+        .partition_guids = &replacement_partition_guids,
+    };
+    var report = try rewriteIdentity(
+        &img,
+        io,
+        std.testing.allocator,
+        verified,
+        replacement,
+    );
+    defer report.deinit(std.testing.allocator);
+
+    var after = try readVerifiedGpt(
+        img,
+        io,
+        std.testing.allocator,
+        default_max_partition_array_bytes,
+    );
+    defer after.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), report.partitions.len);
+    try std.testing.expectEqualSlices(u8, &disk_guid, &report.old_disk_guid);
+    try std.testing.expectEqualSlices(u8, &replacement.disk_guid, &report.new_disk_guid);
+    for (report.partitions, verified.partitions, replacement_partition_guids) |rewrite, before, expected_new| {
+        try std.testing.expectEqual(before.table_index, rewrite.table_index);
+        try std.testing.expectEqualSlices(u8, &before.partition_type_guid, &rewrite.partition_type_guid);
+        try std.testing.expectEqual(before.first_lba, rewrite.first_lba);
+        try std.testing.expectEqual(before.last_lba, rewrite.last_lba);
+        try std.testing.expectEqual(before.attributes, rewrite.attributes);
+        try std.testing.expectEqualSlices(u16, &before.name_utf16le, &rewrite.name_utf16le);
+        try std.testing.expectEqualSlices(u8, &before.unique_partition_guid, &rewrite.old_unique_guid);
+        try std.testing.expectEqualSlices(u8, &expected_new, &rewrite.new_unique_guid);
+    }
+
+    try std.testing.expectEqual(verified.primary_header.current_lba, after.primary_header.current_lba);
+    try std.testing.expectEqual(verified.primary_header.backup_lba, after.primary_header.backup_lba);
+    try std.testing.expectEqual(verified.primary_header.first_usable_lba, after.primary_header.first_usable_lba);
+    try std.testing.expectEqual(verified.primary_header.last_usable_lba, after.primary_header.last_usable_lba);
+    try std.testing.expectEqual(verified.primary_header.partition_entry_lba, after.primary_header.partition_entry_lba);
+    try std.testing.expectEqual(verified.primary_header.num_partition_entries, after.primary_header.num_partition_entries);
+    try std.testing.expectEqual(verified.primary_header.partition_entry_size, after.primary_header.partition_entry_size);
+    try std.testing.expectEqual(verified.backup_header.current_lba, after.backup_header.current_lba);
+    try std.testing.expectEqual(verified.backup_header.partition_entry_lba, after.backup_header.partition_entry_lba);
+    try std.testing.expectEqualSlices(u8, &verified.protective_mbr_sector, &after.protective_mbr_sector);
+    try std.testing.expectEqualSlices(u8, &replacement.disk_guid, &after.primary_header.disk_guid);
+    try std.testing.expectEqualSlices(u8, &replacement.disk_guid, &after.backup_header.disk_guid);
+    try std.testing.expectEqual(
+        std.hash.crc.Crc32.hash(after.partition_array),
+        after.primary_header.partition_array_crc32,
+    );
+    try std.testing.expectEqual(
+        after.primary_header.partition_array_crc32,
+        after.backup_header.partition_array_crc32,
+    );
+
+    for (after.partitions, verified.partitions, replacement_partition_guids) |rewritten, before, expected_new| {
+        try std.testing.expectEqual(before.table_index, rewritten.table_index);
+        try std.testing.expectEqualSlices(u8, &before.partition_type_guid, &rewritten.partition_type_guid);
+        try std.testing.expectEqual(before.first_lba, rewritten.first_lba);
+        try std.testing.expectEqual(before.last_lba, rewritten.last_lba);
+        try std.testing.expectEqual(before.attributes, rewritten.attributes);
+        try std.testing.expectEqualSlices(u16, &before.name_utf16le, &rewritten.name_utf16le);
+        try std.testing.expectEqualSlices(u8, &expected_new, &rewritten.unique_partition_guid);
+    }
+
+    for (verified.partitions, replacement_partition_guids) |before, expected_new| {
+        const before_entry = testEntrySlice(
+            verified.partition_array,
+            entry_size,
+            before.table_index,
+        );
+        const after_entry = testEntrySlice(
+            after.partition_array,
+            entry_size,
+            before.table_index,
+        );
+        try std.testing.expectEqualSlices(u8, before_entry[0..16], after_entry[0..16]);
+        try std.testing.expectEqualSlices(u8, before_entry[32..], after_entry[32..]);
+        try std.testing.expectEqualSlices(u8, &expected_new, after_entry[16..32]);
+    }
+    for (unused_tails) |unused| {
+        try std.testing.expectEqualSlices(
+            u8,
+            testEntrySlice(verified.partition_array, entry_size, unused.table_index),
+            testEntrySlice(after.partition_array, entry_size, unused.table_index),
+        );
+    }
+}
+
+test "rewriteIdentity preserves relocated GPT geometry with generated GUIDs" {
+    const io = std.testing.io;
+    const path = "test-gpt-identity-rewrite-relocated.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const initial_size: u64 = 32 * 1024 * 1024 - sector_size;
+    var img = try Image.create(io, path, .raw, initial_size, .{});
+    defer img.close(io);
+
+    const disk_guid = guid.parse("66666666-6666-6666-6666-666666666666");
+    const entries = [_]PartitionEntry{
+        .{
+            .partition_type_guid = guid.esp,
+            .unique_partition_guid = guid.parse("77777777-7777-7777-7777-777777777777"),
+            .first_lba = 2048,
+            .last_lba = 4095,
+            .attributes = 0x1,
+            .name_utf16le = asciiName("efi"),
+        },
+        .{
+            .partition_type_guid = guid.linux_filesystem_data,
+            .unique_partition_guid = guid.parse("88888888-8888-8888-8888-888888888888"),
+            .first_lba = 8192,
+            .last_lba = 24575,
+            .attributes = 0x8000_0000_0000_0000,
+            .name_utf16le = asciiName("root"),
+        },
+    };
+    try writePartitionTables(&img, io, disk_guid, &entries);
+
+    var mbr_sector: [sector_size]u8 = undefined;
+    try preadExact(img, io, &mbr_sector, 0);
+    mbr_sector[23] = 0x9d;
+    try img.pwrite(io, &mbr_sector, 0);
+
+    var verified = try readVerifiedGpt(
+        img,
+        io,
+        std.testing.allocator,
+        default_max_partition_array_bytes,
+    );
+    defer verified.deinit(std.testing.allocator);
+
+    const relocated_size: u64 = 48 * 1024 * 1024;
+    try img.resize(io, relocated_size);
+    const relocation = try relocateBackup(
+        &img,
+        io,
+        std.testing.allocator,
+        verified,
+    );
+    try std.testing.expect(relocation.was_relocated);
+
+    var relocated = try readVerifiedGpt(
+        img,
+        io,
+        std.testing.allocator,
+        default_max_partition_array_bytes,
+    );
+    defer relocated.deinit(std.testing.allocator);
+
+    var generated = try generateReplacementGuids(
+        std.testing.allocator,
+        io,
+        relocated,
+    );
+    defer generated.deinit(std.testing.allocator);
+    try std.testing.expect(!sourceContainsGuid(relocated, generated.disk_guid));
+    for (generated.partition_guids) |new_guid| {
+        try std.testing.expect(!sourceContainsGuid(relocated, new_guid));
+    }
+
+    var report = try rewriteIdentity(
+        &img,
+        io,
+        std.testing.allocator,
+        relocated,
+        generated.borrowed(),
+    );
+    defer report.deinit(std.testing.allocator);
+
+    var after = try readVerifiedGpt(
+        img,
+        io,
+        std.testing.allocator,
+        default_max_partition_array_bytes,
+    );
+    defer after.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(relocated.primary_header.backup_lba, after.primary_header.backup_lba);
+    try std.testing.expectEqual(relocated.primary_header.last_usable_lba, after.primary_header.last_usable_lba);
+    try std.testing.expectEqual(relocated.primary_header.partition_entry_lba, after.primary_header.partition_entry_lba);
+    try std.testing.expectEqual(relocated.backup_header.partition_entry_lba, after.backup_header.partition_entry_lba);
+    try std.testing.expectEqualSlices(u8, &relocated.protective_mbr_sector, &after.protective_mbr_sector);
+    try std.testing.expectEqualSlices(u8, &generated.disk_guid, &after.primary_header.disk_guid);
+    try std.testing.expectEqualSlices(u8, &generated.disk_guid, &after.backup_header.disk_guid);
+    try std.testing.expectEqual(@as(usize, relocated.partitions.len), report.partitions.len);
+    for (after.partitions, relocated.partitions, generated.partition_guids) |rewritten, before, expected_new| {
+        try std.testing.expectEqual(before.table_index, rewritten.table_index);
+        try std.testing.expectEqual(before.first_lba, rewritten.first_lba);
+        try std.testing.expectEqual(before.last_lba, rewritten.last_lba);
+        try std.testing.expectEqual(before.attributes, rewritten.attributes);
+        try std.testing.expectEqualSlices(u8, &expected_new, &rewritten.unique_partition_guid);
+    }
+}
+
+test "rewriteIdentity refuses when source GPT metadata changed" {
+    const io = std.testing.io;
+    const path = "test-gpt-identity-rewrite-source-changed.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const disk_size: u64 = 16 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, disk_size, .{});
+    defer img.close(io);
+
+    const disk_guid = guid.parse("99999999-9999-9999-9999-999999999999");
+    const entries = [_]PartitionEntry{.{
+        .partition_type_guid = guid.linux_filesystem_data,
+        .unique_partition_guid = guid.parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"),
+        .first_lba = 2048,
+        .last_lba = 8191,
+        .name_utf16le = asciiName("root"),
+    }};
+    try writePartitionTables(&img, io, disk_guid, &entries);
+
+    var verified = try readVerifiedGpt(
+        img,
+        io,
+        std.testing.allocator,
+        default_max_partition_array_bytes,
+    );
+    defer verified.deinit(std.testing.allocator);
+
+    var one: [1]u8 = undefined;
+    const mutate_offset = try std.math.add(
+        u64,
+        try sectorOffset(verified.primary_header.partition_entry_lba),
+        40,
+    );
+    try preadExact(img, io, &one, mutate_offset);
+    one[0] ^= 0xff;
+    try img.pwrite(io, &one, mutate_offset);
+
+    const replacement_partition_guids = [_]guid.Guid{
+        guid.parse("bbbbbbbb-2222-3333-4444-cccccccccccc"),
+    };
+    try std.testing.expectError(
+        error.SourceMetadataChanged,
+        rewriteIdentity(
+            &img,
+            io,
+            std.testing.allocator,
+            verified,
+            .{
+                .disk_guid = guid.parse("cccccccc-3333-4444-5555-dddddddddddd"),
+                .partition_guids = &replacement_partition_guids,
+            },
+        ),
+    );
+
+    var primary_header_sector: [sector_size]u8 = undefined;
+    try preadExact(img, io, &primary_header_sector, sector_size);
+    const header = try Header.decode(&primary_header_sector);
+    try std.testing.expectEqualSlices(u8, &disk_guid, &header.disk_guid);
 }
 
 test "writeGpt rejects a layout that doesn't fit" {
