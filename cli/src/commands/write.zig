@@ -64,6 +64,13 @@ const PreparedIdentity = struct {
         ?*anyopaque,
         std.mem.Allocator,
     ) void = preparedIdentityDeinitNoop,
+
+    fn deinit(self: *PreparedIdentity, allocator: std.mem.Allocator) void {
+        self.deinit_fn(self.context, allocator);
+        allocator.free(self.report_text);
+        if (self.refusal_message) |message| allocator.free(message);
+        self.* = undefined;
+    }
 };
 
 const Operations = struct {
@@ -1055,7 +1062,8 @@ fn duplicateTrimmedLabel(
     field: []const u8,
 ) !?[]const u8 {
     const label = vmiz.identity_rewrite.trimLabel(field) orelse return null;
-    return allocator.dupe(u8, label);
+    const copy = try allocator.dupe(u8, label);
+    return copy;
 }
 
 fn copyLabelText(
@@ -4655,7 +4663,10 @@ test "write new-uuids refuses unsupported filesystem inventory" {
     var inventory = try vmiz.block_device.inspectIdentityInventory(
         allocator,
         io,
-        source,
+        .{
+            .ctx = &source,
+            .read_at_fn = sourceImageReadAt,
+        },
         vmiz.gpt.default_max_partition_array_bytes,
     );
     defer inventory.deinit(allocator);
@@ -4764,7 +4775,10 @@ test "write new-uuids rewrites identities and verifies supported references" {
     var inventory = try vmiz.block_device.inspectIdentityInventory(
         allocator,
         io,
-        destination,
+        .{
+            .ctx = &destination,
+            .read_at_fn = sourceImageReadAt,
+        },
         vmiz.gpt.default_max_partition_array_bytes,
     );
     defer inventory.deinit(allocator);
