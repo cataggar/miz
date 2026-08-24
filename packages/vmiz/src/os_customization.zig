@@ -270,6 +270,16 @@ fn applyHostname(tree: *RootTree, hostname: []const u8) !void {
     try tree.putFileBytes("etc/hostname", value, replacementMetadata(tree, "etc/hostname", 0o644));
 }
 
+/// The `sp_lstchg` field for a newly created account.
+///
+/// Returns an empty field -- shadow(5)'s "aging disabled" -- rather than the
+/// literal 0 that would otherwise mean the password is already expired.
+fn formatShadowLastChange(buf: []u8, source_date_epoch: u64) []const u8 {
+    const days = source_date_epoch / 86_400;
+    if (days == 0) return "";
+    return std.fmt.bufPrint(buf, "{d}", .{days}) catch "";
+}
+
 fn applyAccounts(
     allocator: Allocator,
     tree: *RootTree,
@@ -331,11 +341,21 @@ fn applyAccounts(
             .locked => "!",
             .prehashed => |hash| hash,
         };
+        // shadow(5) gives a last-change day of 0 a special meaning: the
+        // password must be changed at the next login. For an account whose
+        // password is locked and whose only credential is an SSH key that is
+        // a lockout with no way back in -- sshd accepts the key and PAM then
+        // refuses the session with "password change required but no TTY
+        // available". A build with SOURCE_DATE_EPOCH at or below one day lands
+        // exactly there. An empty field disables aging instead, which is what
+        // a key-only account wants and is just as reproducible.
+        var last_change_buf: [24]u8 = undefined;
+        const last_change = formatShadowLastChange(&last_change_buf, source_date_epoch);
         shadow = try appendFormatted(
             allocator,
             shadow,
-            "{s}:{s}:{d}:0:99999:7:::\n",
-            .{ user.name, password, source_date_epoch / 86_400 },
+            "{s}:{s}:{s}:0:99999:7:::\n",
+            .{ user.name, password, last_change },
         );
         for (user.secondary_groups) |group_name| {
             const updated = try addGroupMember(allocator, group_file, group_name, user.name);
@@ -1213,4 +1233,19 @@ test "Azure generalization does not infer a home for an absent user" {
     } });
 
     try std.testing.expect(tree.findNode("home/alice/authorized_keys") != null);
+}
+
+test "a created account is never born with an expired password" {
+    var buf: [24]u8 = undefined;
+
+    // A build with no meaningful clock must not emit 0: shadow(5) reads that
+    // as "must change password at next login", which PAM enforces even when
+    // the user authenticated with a key, locking the account out entirely.
+    try std.testing.expectEqualStrings("", formatShadowLastChange(&buf, 0));
+    try std.testing.expectEqualStrings("", formatShadowLastChange(&buf, 86_399));
+
+    // A real timestamp still records the day it was set, so an image built
+    // with SOURCE_DATE_EPOCH keeps reporting a truthful last-change date.
+    try std.testing.expectEqualStrings("1", formatShadowLastChange(&buf, 86_400));
+    try std.testing.expectEqualStrings("19000", formatShadowLastChange(&buf, 19_000 * 86_400));
 }
