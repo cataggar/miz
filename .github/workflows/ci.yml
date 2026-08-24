@@ -64,19 +64,14 @@ jobs:
           tools: |
             cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
-      - name: zig build
-        run: zig build -Doptimize=Debug
-
-      - name: Hermetic Debian-family package backend acceptance
+      - name: Build production artifacts and run Zig tests
         run: |
           if grep -n 'std\.process\.spawn' packages/vmiz/src/package_family.zig; then
             echo "production package-family path must not spawn debz" >&2
             exit 1
           fi
-          zig build test-package-family -Doptimize=Debug
-
-      - name: zig build test-ci
-        run: zig build test-ci -Doptimize=Debug --summary all
+          zig build check-ci-production-entrypoints test-package-family test-ci \
+            -Doptimize=Debug --summary all
 
   vm-backend:
     name: VM backend integration

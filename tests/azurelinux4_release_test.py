@@ -947,15 +947,19 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertNotIn("\n    needs:", workflow)
         self.assertEqual(workflow.count("fail-fast: false"), 2)
         self.assertEqual(workflow.count("name: build + test"), 1)
-        self.assertIn("run: zig build -Doptimize=Debug", workflow)
         self.assertIn(
-            "zig build test-package-family -Doptimize=Debug",
+            "grep -n 'std\\.process\\.spawn' "
+            "packages/vmiz/src/package_family.zig",
             workflow,
         )
         self.assertIn(
-            "zig build test-ci -Doptimize=Debug --summary all",
+            "zig build check-ci-production-entrypoints "
+            "test-package-family test-ci \\\n"
+            "            -Doptimize=Debug --summary all",
             workflow,
         )
+        self.assertNotIn("run: zig build -Doptimize=Debug", workflow)
+        self.assertEqual(workflow.count("zig build test-ci"), 0)
         self.assertEqual(
             workflow.count(
                 "run: zig build test-vm-backend "
