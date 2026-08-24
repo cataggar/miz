@@ -3139,13 +3139,26 @@ test "root timestamps affect manifests and unsupported ext4 metadata is explicit
     try std.testing.expectError(error.Ext4RootMetadataUnsupported, tree.ext4View());
 }
 
+fn temporaryTestPath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    temporary: *std.testing.TmpDir,
+    sub_path: []const u8,
+) ![]const u8 {
+    var root_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    return std.fs.path.join(allocator, &.{ root_buffer[0..root_length], sub_path });
+}
+
 test "owned tree populates FAT32 with an explicit metadata-loss policy" {
     const Image = @import("image.zig").Image;
     const io = std.testing.io;
-    const spool_path = "test-root-tree-fat32.spool";
-    const image_path = "test-root-tree-fat32.img";
-    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const spool_path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-root-tree-fat32.spool");
+    defer std.testing.allocator.free(spool_path);
+    const image_path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-root-tree-fat32.img");
+    defer std.testing.allocator.free(image_path);
 
     var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
     defer tree.deinit();
@@ -3176,8 +3189,10 @@ test "owned tree populates FAT32 with an explicit metadata-loss policy" {
 
 test "FAT32 preflight rejects semantic node loss and folded path collisions" {
     const io = std.testing.io;
-    const spool_path = "test-root-tree-fat32-preflight.spool";
-    defer Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const spool_path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-root-tree-fat32-preflight.spool");
+    defer std.testing.allocator.free(spool_path);
     var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
     defer tree.deinit();
 
@@ -3847,9 +3862,12 @@ test "a FAT mount carries only the metadata the scan synthesized" {
 test "a tree's FAT32 size is one the tree fits in, and one byte less is not" {
     const Image = @import("image.zig").Image;
     const io = std.testing.io;
-    const spool_path = "test-root-tree-fat-size.spool";
-    const image_path = "test-root-tree-fat-size.img";
-    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const spool_path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-root-tree-fat-size.spool");
+    defer std.testing.allocator.free(spool_path);
+    const image_path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-root-tree-fat-size.img");
+    defer std.testing.allocator.free(image_path);
 
     var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
     defer tree.deinit();
@@ -3888,8 +3906,8 @@ test "a tree's FAT32 size is one the tree fits in, and one byte less is not" {
     const alignment: u64 = 1024 * 1024;
     try std.testing.expect(length > alignment);
     const too_small = length - alignment;
-    const short_path = "test-root-tree-fat-size-short.img";
-    defer Io.Dir.cwd().deleteFile(io, short_path) catch {};
+    const short_path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-root-tree-fat-size-short.img");
+    defer std.testing.allocator.free(short_path);
     var short_img = try Image.create(io, short_path, .raw, too_small, .{});
     defer short_img.close(io);
     try fat32.format(&short_img, io, .{
@@ -3903,7 +3921,10 @@ test "a tree's FAT32 size is one the tree fits in, and one byte less is not" {
 
 test "a FAT32 size accounts for a directory whose sibling sorts between it and its children" {
     const io = std.testing.io;
-    const spool_path = "test-root-tree-fat-interleaved.spool";
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const spool_path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-root-tree-fat-interleaved.spool");
+    defer std.testing.allocator.free(spool_path);
 
     var tree = try RootTree.init(std.testing.allocator, io, spool_path, .{});
     defer tree.deinit();
@@ -3923,8 +3944,8 @@ test "a FAT32 size accounts for a directory whose sibling sorts between it and i
 
     // Sizing succeeded; check the size it produced is one the tree fits in.
     const Image = @import("image.zig").Image;
-    const image_path = "test-root-tree-fat-interleaved.img";
-    defer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    const image_path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-root-tree-fat-interleaved.img");
+    defer std.testing.allocator.free(image_path);
     var img = try Image.create(io, image_path, .raw, length, .{});
     defer img.close(io);
     try fat32.format(&img, io, .{

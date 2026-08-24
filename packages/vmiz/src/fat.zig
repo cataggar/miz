@@ -546,8 +546,21 @@ fn fat32LargeSectorLayout() TestLayout {
     };
 }
 
+fn temporaryTestPath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    temporary: *std.testing.TmpDir,
+    sub_path: []const u8,
+) ![]const u8 {
+    var root_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    return std.fs.path.join(allocator, &.{ root_buffer[0..root_length], sub_path });
+}
+
 test "fat identity supports FAT12, FAT16, and FAT32 boot layouts" {
     const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
     const cases = [_]struct {
         path: []const u8,
         layout: TestLayout,
@@ -576,10 +589,11 @@ test "fat identity supports FAT12, FAT16, and FAT32 boot layouts" {
 
     for (cases, 0..) |case, index| {
         {
-            defer Io.Dir.cwd().deleteFile(io, case.path) catch {};
+            const path = try temporaryTestPath(std.testing.allocator, io, &temporary, case.path);
+            defer std.testing.allocator.free(path);
             var volume = try createTestVolume(
                 io,
-                case.path,
+                path,
                 case.layout,
                 @as(u64, case.layout.bytes_per_sector) * 2,
                 @intCast(0x40 + index),
@@ -607,8 +621,10 @@ test "fat identity supports FAT12, FAT16, and FAT32 boot layouts" {
 
 test "fat identity refuses inconsistent FAT32 backup boot sectors" {
     const io = std.testing.io;
-    const path = "test-fat-identity-backup-mismatch.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat-identity-backup-mismatch.img");
+    defer std.testing.allocator.free(path);
 
     const layout = fat32Layout();
     var volume = try createTestVolume(io, path, layout, 4 * 512, 0x55);
@@ -633,8 +649,10 @@ test "fat identity refuses inconsistent FAT32 backup boot sectors" {
 
 test "fat identity preserves unrelated bytes in and around rewritten boot sectors" {
     const io = std.testing.io;
-    const path = "test-fat-identity-preserve.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat-identity-preserve.img");
+    defer std.testing.allocator.free(path);
 
     const layout = fat32LargeSectorLayout();
     const region_offset: u64 = 3 * 4_096;
@@ -673,8 +691,10 @@ test "fat identity refuses malformed input before writing" {
     const io = std.testing.io;
 
     {
-        const path = "test-fat-identity-invalid-volume-id.img";
-        defer Io.Dir.cwd().deleteFile(io, path) catch {};
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat-identity-invalid-volume-id.img");
+        defer std.testing.allocator.free(path);
 
         const layout = fat12Layout();
         var volume = try createTestVolume(io, path, layout, 2 * 512, 0x31);
@@ -694,8 +714,10 @@ test "fat identity refuses malformed input before writing" {
     }
 
     {
-        const path = "test-fat-identity-invalid-signature.img";
-        defer Io.Dir.cwd().deleteFile(io, path) catch {};
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat-identity-invalid-signature.img");
+        defer std.testing.allocator.free(path);
 
         const layout = fat16Layout();
         var volume = try createTestVolume(io, path, layout, 2 * 2_048, 0x4B);
@@ -723,8 +745,10 @@ test "fat identity refuses malformed input before writing" {
 
 test "fat identity rereads, verifies, and reports the rewritten serial" {
     const io = std.testing.io;
-    const path = "test-fat-identity-verify.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-fat-identity-verify.img");
+    defer std.testing.allocator.free(path);
 
     const layout = fat32Layout();
     const region_offset: u64 = 8 * 512;
