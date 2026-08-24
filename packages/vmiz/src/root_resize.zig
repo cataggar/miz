@@ -76,36 +76,68 @@ fn labelBytes(label: *const [16]u8) []const u8 {
     return label[0..];
 }
 
-fn supportedRootType(type_guid: guid.Guid) bool {
-    return std.mem.eql(u8, &type_guid, &guid.linux_root_x86_64) or
-        std.mem.eql(u8, &type_guid, &guid.linux_root_aarch64) or
-        std.mem.eql(u8, &type_guid, &guid.linux_filesystem_data);
-}
-
-const RootSelection = struct {
-    partition: gpt.PartitionEntry,
-    reader_uuid: [16]u8,
-    reader_label: [16]u8,
-    reader_feature_compat: u32,
-    reader_feature_incompat: u32,
-    reader_feature_ro_compat: u32,
+pub const RootSelectionOptions = struct {
+    allow_root_x86_64: bool = true,
+    allow_root_aarch64: bool = true,
+    allow_linux_filesystem_data: bool = false,
+    filesystem_label: ?[]const u8 = null,
+    require_last_partition: bool = false,
 };
 
-fn selectRoot(
+pub const RootSelection = struct {
+    table_index: u32,
+    partition_type_guid: guid.Guid,
+    unique_partition_guid: guid.Guid,
+    first_lba: u64,
+    last_lba: u64,
+    byte_offset: u64,
+    partition_length: u64,
+    filesystem_uuid: [16]u8,
+    filesystem_label: [16]u8,
+    filesystem_feature_compat: u32,
+    filesystem_feature_incompat: u32,
+    filesystem_feature_ro_compat: u32,
+    filesystem_length: u64,
+};
+
+fn selectedRootType(type_guid: guid.Guid, options: RootSelectionOptions) bool {
+    return (options.allow_root_x86_64 and
+        std.mem.eql(u8, &type_guid, &guid.linux_root_x86_64)) or
+        (options.allow_root_aarch64 and
+            std.mem.eql(u8, &type_guid, &guid.linux_root_aarch64)) or
+        (options.allow_linux_filesystem_data and
+            std.mem.eql(u8, &type_guid, &guid.linux_filesystem_data));
+}
+
+/// Selects exactly one permitted GPT partition containing ext4 without
+/// modifying the image. Linux filesystem-data partitions are excluded unless
+/// the caller deliberately opts in.
+pub fn selectRoot(
     allocator: std.mem.Allocator,
     io: Io,
     image: *const Image,
     parsed: gpt.VerifiedGpt,
-    filesystem_label: []const u8,
+    options: RootSelectionOptions,
 ) !RootSelection {
-    if (filesystem_label.len == 0 or filesystem_label.len > 16) {
-        return error.InvalidFilesystemLabel;
+    if (!options.allow_root_x86_64 and
+        !options.allow_root_aarch64 and
+        !options.allow_linux_filesystem_data)
+    {
+        return error.NoRootPartitionTypes;
+    }
+    if (options.filesystem_label) |filesystem_label| {
+        if (filesystem_label.len == 0 or filesystem_label.len > 16) {
+            return error.InvalidFilesystemLabel;
+        }
     }
 
     var context = ReadContext{ .image = image, .io = io };
     var selected: ?RootSelection = null;
     for (parsed.partitions) |partition| {
-        if (!supportedRootType(partition.partition_type_guid)) continue;
+        if (!selectedRootType(partition.partition_type_guid, options)) continue;
+        if (partition.last_lba < partition.first_lba) {
+            return error.InvalidPartitionBounds;
+        }
         const offset = std.math.mul(
             u64,
             partition.first_lba,
@@ -126,8 +158,10 @@ fn selectRoot(
         };
         defer reader.deinit();
 
-        if (!std.mem.eql(u8, labelBytes(&reader.label), filesystem_label)) {
-            continue;
+        if (options.filesystem_label) |filesystem_label| {
+            if (!std.mem.eql(u8, labelBytes(&reader.label), filesystem_label)) {
+                continue;
+            }
         }
         if (selected != null) return error.AmbiguousRootFilesystem;
 
@@ -145,15 +179,32 @@ fn selectRoot(
             return error.FilesystemExceedsPartition;
         }
         selected = .{
-            .partition = partition,
-            .reader_uuid = reader.uuid,
-            .reader_label = reader.label,
-            .reader_feature_compat = reader.feature_compat,
-            .reader_feature_incompat = reader.feature_incompat,
-            .reader_feature_ro_compat = reader.feature_ro_compat,
+            .table_index = partition.table_index,
+            .partition_type_guid = partition.partition_type_guid,
+            .unique_partition_guid = partition.unique_partition_guid,
+            .first_lba = partition.first_lba,
+            .last_lba = partition.last_lba,
+            .byte_offset = offset,
+            .partition_length = partition_length,
+            .filesystem_uuid = reader.uuid,
+            .filesystem_label = reader.label,
+            .filesystem_feature_compat = reader.feature_compat,
+            .filesystem_feature_incompat = reader.feature_incompat,
+            .filesystem_feature_ro_compat = reader.feature_ro_compat,
+            .filesystem_length = filesystem_length,
         };
     }
-    return selected orelse error.RootFilesystemNotFound;
+    const root = selected orelse return error.RootFilesystemNotFound;
+    if (options.require_last_partition) {
+        for (parsed.partitions) |partition| {
+            if (partition.table_index != root.table_index and
+                partition.last_lba > root.last_lba)
+            {
+                return error.RootPartitionNotLast;
+            }
+        }
+    }
+    return root;
 }
 
 fn expectFilesystemIdentity(
@@ -176,11 +227,11 @@ fn expectFilesystemIdentity(
         .{ .offset = offset },
     );
     defer reader.deinit();
-    if (!std.mem.eql(u8, &reader.uuid, &expected.reader_uuid) or
-        !std.mem.eql(u8, &reader.label, &expected.reader_label) or
-        reader.feature_compat != expected.reader_feature_compat or
-        reader.feature_incompat != expected.reader_feature_incompat or
-        reader.feature_ro_compat != expected.reader_feature_ro_compat)
+    if (!std.mem.eql(u8, &reader.uuid, &expected.filesystem_uuid) or
+        !std.mem.eql(u8, &reader.label, &expected.filesystem_label) or
+        reader.feature_compat != expected.filesystem_feature_compat or
+        reader.feature_incompat != expected.filesystem_feature_incompat or
+        reader.feature_ro_compat != expected.filesystem_feature_ro_compat)
     {
         return error.FilesystemIdentityChanged;
     }
@@ -224,26 +275,15 @@ pub fn growExistingQcow2(
         io,
         &source,
         source_gpt,
-        options.filesystem_label,
+        .{
+            .allow_linux_filesystem_data = true,
+            .filesystem_label = options.filesystem_label,
+            .require_last_partition = true,
+        },
     );
-    for (source_gpt.partitions) |partition| {
-        if (partition.table_index != root.partition.table_index and
-            partition.last_lba > root.partition.last_lba)
-        {
-            return error.RootPartitionNotLast;
-        }
-    }
 
-    const root_offset = std.math.mul(
-        u64,
-        root.partition.first_lba,
-        gpt.sector_size,
-    ) catch return error.InvalidPartitionBounds;
-    const old_root_length = std.math.mul(
-        u64,
-        root.partition.last_lba - root.partition.first_lba + 1,
-        gpt.sector_size,
-    ) catch return error.InvalidPartitionBounds;
+    const root_offset = root.byte_offset;
+    const old_root_length = root.partition_length;
 
     const raw_path = try temporarySiblingPath(allocator, io, path, "raw");
     defer allocator.free(raw_path);
@@ -264,13 +304,13 @@ pub fn growExistingQcow2(
         io,
         allocator,
         source_gpt,
-        root.partition.table_index,
+        root.table_index,
     );
 
     const grown_root_last_lba = grow_result.new_last_lba;
     const new_root_length = std.math.mul(
         u64,
-        grown_root_last_lba - root.partition.first_lba + 1,
+        grown_root_last_lba - root.first_lba + 1,
         gpt.sector_size,
     ) catch return error.InvalidPartitionBounds;
     const new_filesystem_length = new_root_length -
@@ -290,7 +330,7 @@ pub fn growExistingQcow2(
     defer raw_gpt.deinit(allocator);
     var grown_partition: ?gpt.PartitionEntry = null;
     for (raw_gpt.partitions) |partition| {
-        if (partition.table_index == root.partition.table_index) {
+        if (partition.table_index == root.table_index) {
             grown_partition = partition;
             break;
         }
@@ -354,14 +394,226 @@ pub fn growExistingQcow2(
     return .{
         .old_virtual_size = old_virtual_size,
         .new_virtual_size = options.target_size,
-        .root_table_index = root.partition.table_index,
+        .root_table_index = root.table_index,
         .root_offset = root_offset,
         .old_root_length = old_root_length,
         .new_root_length = new_root_length,
         .new_filesystem_length = new_filesystem_length,
-        .filesystem_uuid = root.reader_uuid,
-        .filesystem_label = root.reader_label,
+        .filesystem_uuid = root.filesystem_uuid,
+        .filesystem_label = root.filesystem_label,
     };
+}
+
+const SelectionFixturePartition = struct {
+    type_guid: guid.Guid,
+    unique_guid: guid.Guid,
+    first_lba: u64,
+    last_lba: u64,
+    filesystem_label: ?[]const u8 = null,
+    filesystem_uuid: [16]u8 = [_]u8{0} ** 16,
+};
+
+fn createSelectionFixture(
+    allocator: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+    disk_size: u64,
+    partitions: []const SelectionFixturePartition,
+) !void {
+    var image = try Image.create(io, path, .raw, disk_size, .{});
+    defer image.close(io);
+
+    const specs = try allocator.alloc(gpt.PlacedPartitionSpec, partitions.len);
+    defer allocator.free(specs);
+    for (partitions, 0..) |partition, index| {
+        specs[index] = .{
+            .type_guid = partition.type_guid,
+            .unique_guid = partition.unique_guid,
+            .placement = .{
+                .first_lba = partition.first_lba,
+                .last_lba = partition.last_lba,
+            },
+        };
+    }
+    try gpt.writeGptPlaced(
+        &image,
+        io,
+        guid.parse("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"),
+        specs,
+    );
+
+    const root_tree = @import("root_tree.zig");
+    var tree = root_tree.RootTree.initMemory(allocator, io, .{});
+    defer tree.deinit();
+    for (partitions) |partition| {
+        const label = partition.filesystem_label orelse continue;
+        const offset = partition.first_lba * gpt.sector_size;
+        const length = (partition.last_lba - partition.first_lba + 1) *
+            gpt.sector_size;
+        _ = try ext4.populate(io, image.file, allocator, try tree.cursor(), .{
+            .offset = offset,
+            .length = length,
+            .label = label,
+            .uuid = partition.filesystem_uuid,
+        });
+    }
+}
+
+test "root selection defaults to discoverable root GUIDs and returns stable metadata" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "test-root-selection-metadata.raw";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const data_uuid = [_]u8{0x11} ** 16;
+    const root_uuid = [_]u8{0x22} ** 16;
+    const partitions = [_]SelectionFixturePartition{
+        .{
+            .type_guid = guid.linux_filesystem_data,
+            .unique_guid = guid.parse("11111111-1111-1111-1111-111111111111"),
+            .first_lba = 2048,
+            .last_lba = 67_583,
+            .filesystem_label = "data",
+            .filesystem_uuid = data_uuid,
+        },
+        .{
+            .type_guid = guid.linux_root_x86_64,
+            .unique_guid = guid.parse("22222222-2222-2222-2222-222222222222"),
+            .first_lba = 67_584,
+            .last_lba = 133_119,
+            .filesystem_label = "rootfs",
+            .filesystem_uuid = root_uuid,
+        },
+    };
+    try createSelectionFixture(allocator, io, path, 96 * 1024 * 1024, &partitions);
+
+    var image = try Image.openPathReadOnly(io, path);
+    defer image.close(io);
+    var parsed = try gpt.readVerifiedGpt(image, io, allocator, max_partition_array_bytes);
+    defer parsed.deinit(allocator);
+    const root = try selectRoot(allocator, io, &image, parsed, .{});
+
+    try std.testing.expectEqual(@as(u32, 1), root.table_index);
+    try std.testing.expectEqual(partitions[1].first_lba, root.first_lba);
+    try std.testing.expectEqual(partitions[1].last_lba, root.last_lba);
+    try std.testing.expectEqual(
+        partitions[1].first_lba * gpt.sector_size,
+        root.byte_offset,
+    );
+    try std.testing.expectEqual(
+        (partitions[1].last_lba - partitions[1].first_lba + 1) * gpt.sector_size,
+        root.partition_length,
+    );
+    try std.testing.expectEqualSlices(u8, &guid.linux_root_x86_64, &root.partition_type_guid);
+    try std.testing.expectEqualSlices(u8, &root_uuid, &root.filesystem_uuid);
+    try std.testing.expectEqualStrings("rootfs", labelBytes(&root.filesystem_label));
+    try std.testing.expect(root.filesystem_length <= root.partition_length);
+}
+
+test "root selection requires deliberate Linux filesystem-data opt in" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "test-root-selection-linux-data.raw";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const filesystem_uuid = [_]u8{0x33} ** 16;
+    const partitions = [_]SelectionFixturePartition{.{
+        .type_guid = guid.linux_filesystem_data,
+        .unique_guid = guid.parse("33333333-3333-3333-3333-333333333333"),
+        .first_lba = 2048,
+        .last_lba = 67_583,
+        .filesystem_label = default_filesystem_label,
+        .filesystem_uuid = filesystem_uuid,
+    }};
+    try createSelectionFixture(allocator, io, path, 48 * 1024 * 1024, &partitions);
+
+    var image = try Image.openPathReadOnly(io, path);
+    defer image.close(io);
+    var parsed = try gpt.readVerifiedGpt(image, io, allocator, max_partition_array_bytes);
+    defer parsed.deinit(allocator);
+    try std.testing.expectError(
+        error.RootFilesystemNotFound,
+        selectRoot(allocator, io, &image, parsed, .{}),
+    );
+    const root = try selectRoot(allocator, io, &image, parsed, .{
+        .allow_root_x86_64 = false,
+        .allow_root_aarch64 = false,
+        .allow_linux_filesystem_data = true,
+        .filesystem_label = default_filesystem_label,
+    });
+    try std.testing.expectEqualSlices(u8, &filesystem_uuid, &root.filesystem_uuid);
+}
+
+test "root selection reports ambiguity and a selected root that is not last" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const ambiguous_path = "test-root-selection-ambiguous.raw";
+    const non_last_path = "test-root-selection-not-last.raw";
+    defer Io.Dir.cwd().deleteFile(io, ambiguous_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, non_last_path) catch {};
+
+    const ambiguous = [_]SelectionFixturePartition{
+        .{
+            .type_guid = guid.linux_root_x86_64,
+            .unique_guid = guid.parse("44444444-4444-4444-4444-444444444444"),
+            .first_lba = 2048,
+            .last_lba = 67_583,
+            .filesystem_label = "root-a",
+        },
+        .{
+            .type_guid = guid.linux_root_aarch64,
+            .unique_guid = guid.parse("55555555-5555-5555-5555-555555555555"),
+            .first_lba = 67_584,
+            .last_lba = 133_119,
+            .filesystem_label = "root-b",
+        },
+    };
+    try createSelectionFixture(allocator, io, ambiguous_path, 96 * 1024 * 1024, &ambiguous);
+    var ambiguous_image = try Image.openPathReadOnly(io, ambiguous_path);
+    defer ambiguous_image.close(io);
+    var ambiguous_gpt = try gpt.readVerifiedGpt(
+        ambiguous_image,
+        io,
+        allocator,
+        max_partition_array_bytes,
+    );
+    defer ambiguous_gpt.deinit(allocator);
+    try std.testing.expectError(
+        error.AmbiguousRootFilesystem,
+        selectRoot(allocator, io, &ambiguous_image, ambiguous_gpt, .{}),
+    );
+
+    const non_last = [_]SelectionFixturePartition{
+        .{
+            .type_guid = guid.linux_root_x86_64,
+            .unique_guid = guid.parse("66666666-6666-6666-6666-666666666666"),
+            .first_lba = 2048,
+            .last_lba = 67_583,
+            .filesystem_label = "rootfs",
+        },
+        .{
+            .type_guid = guid.esp,
+            .unique_guid = guid.parse("77777777-7777-7777-7777-777777777777"),
+            .first_lba = 67_584,
+            .last_lba = 69_631,
+        },
+    };
+    try createSelectionFixture(allocator, io, non_last_path, 48 * 1024 * 1024, &non_last);
+    var non_last_image = try Image.openPathReadOnly(io, non_last_path);
+    defer non_last_image.close(io);
+    var non_last_gpt = try gpt.readVerifiedGpt(
+        non_last_image,
+        io,
+        allocator,
+        max_partition_array_bytes,
+    );
+    defer non_last_gpt.deinit(allocator);
+    try std.testing.expectError(
+        error.RootPartitionNotLast,
+        selectRoot(allocator, io, &non_last_image, non_last_gpt, .{
+            .require_last_partition = true,
+        }),
+    );
 }
 
 test "grows a labeled root in a standalone QCOW2 transactionally" {
