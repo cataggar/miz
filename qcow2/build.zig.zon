@@ -1,0 +1,17 @@
+.{
+    .name = .qcow2,
+    .version = "0.1.0",
+    // Distinct from vmiz's own: this is a separate package that happens to
+    // live in the same repository, and a shared fingerprint would make them
+    // the same package to the build system.
+    .fingerprint = 0xc0215423c28c4221,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+    },
+}
