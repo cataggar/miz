@@ -1065,10 +1065,57 @@ fn setIfaceAddr(fd: i32, name: []const u8, request: u32, addr_be: u32) void {
     _ = linux.ioctl(fd, request, @intFromPtr(&req));
 }
 
-fn findPrimaryInterface(buf: []u8) ?[]const u8 {
+/// The largest number of interfaces vmizinit will consider for DHCP.
+///
+/// A cloud VM has one. A bare-metal accelerator node has dozens once its
+/// fabric NICs bind — the machines this flavor targets bring up 38 — so the
+/// bound is generous, and any interface past it is simply not considered.
+const max_candidate_interfaces = 64;
+
+/// How long to let links settle before concluding that none has carrier.
+const carrier_settle_seconds: u32 = 5;
+
+/// The non-loopback interfaces this machine currently has, in a stable order.
+const InterfaceList = struct {
+    names: [max_candidate_interfaces][linux.IFNAMESIZE]u8 = undefined,
+    lens: [max_candidate_interfaces]u8 = [_]u8{0} ** max_candidate_interfaces,
+    count: usize = 0,
+
+    fn name(self: *const InterfaceList, index: usize) []const u8 {
+        return self.names[index][0..self.lens[index]];
+    }
+
+    fn append(self: *InterfaceList, candidate: []const u8) void {
+        if (self.count == max_candidate_interfaces) return;
+        if (candidate.len == 0 or candidate.len > linux.IFNAMESIZE) return;
+        @memcpy(self.names[self.count][0..candidate.len], candidate);
+        self.lens[self.count] = @intCast(candidate.len);
+        self.count += 1;
+    }
+
+    /// Sorted so that which interface a machine tries first does not depend on
+    /// the order `getdents` happened to hand back.
+    fn sort(self: *InterfaceList) void {
+        var i: usize = 1;
+        while (i < self.count) : (i += 1) {
+            var j = i;
+            while (j > 0 and std.mem.order(u8, self.name(j), self.name(j - 1)) == .lt) : (j -= 1) {
+                const swap_name = self.names[j];
+                self.names[j] = self.names[j - 1];
+                self.names[j - 1] = swap_name;
+                const swap_len = self.lens[j];
+                self.lens[j] = self.lens[j - 1];
+                self.lens[j - 1] = swap_len;
+            }
+        }
+    }
+};
+
+/// Every non-loopback interface the kernel currently exposes.
+fn collectInterfaces(list: *InterfaceList) void {
     const dir_fd_rc = linux.open("/sys/class/net", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
     const dir_fd: i32 = @intCast(dir_fd_rc);
-    if (linux.errno(dir_fd_rc) != .SUCCESS) return null;
+    if (linux.errno(dir_fd_rc) != .SUCCESS) return;
     defer _ = linux.close(dir_fd);
 
     var dirent_buf: [2048]u8 align(8) = undefined;
@@ -1080,15 +1127,53 @@ fn findPrimaryInterface(buf: []u8) ?[]const u8 {
         while (offset < @as(usize, @intCast(n_read))) {
             const d: *align(1) linux.dirent64 = @ptrCast(&dirent_buf[offset]);
             const name_ptr: [*:0]const u8 = @ptrCast(&d.name);
-            const name = std.mem.span(name_ptr);
-            if (!std.mem.eql(u8, name, "lo") and !std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..") and name.len <= buf.len) {
-                @memcpy(buf[0..name.len], name);
-                return buf[0..name.len];
-            }
+            const entry = std.mem.span(name_ptr);
+            const skip = std.mem.eql(u8, entry, "lo") or
+                std.mem.eql(u8, entry, ".") or
+                std.mem.eql(u8, entry, "..");
+            if (!skip) list.append(entry);
             offset += d.reclen;
         }
     }
-    return null;
+    list.sort();
+}
+
+/// `/sys/class/net/<iface>/carrier`, or null when the kernel declines to
+/// answer: it fails with EINVAL while the link is administratively down, and
+/// some synthetic NICs never report carrier at all.
+fn readCarrier(iface: []const u8) ?bool {
+    var path_buf: [linux.IFNAMESIZE + 32]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/sys/class/net/{s}/carrier", .{iface}) catch return null;
+    var value: [8]u8 = undefined;
+    const contents = readBoundedFile(path.ptr, &value) orelse return null;
+    if (contents.len == 0) return null;
+    return contents[0] == '1';
+}
+
+/// Which interfaces are worth a DHCP attempt, in the order to try them.
+///
+/// Preferring carrier is what keeps a bare-metal node reachable. Exactly one
+/// of its interfaces is cabled to the provisioning network, a DHCP attempt on
+/// a dark fabric port burns fifteen seconds before it fails, and picking wrong
+/// costs the machine its only way in. When nothing reports carrier — synthetic
+/// NICs on some hypervisors never do — every interface is tried instead, which
+/// is what this code did unconditionally before it could tell the difference.
+fn dhcpCandidateOrder(carriers: []const ?bool, out: []u8) []const u8 {
+    var count: usize = 0;
+    for (carriers, 0..) |carrier, index| {
+        if ((carrier orelse false) and count < out.len) {
+            out[count] = @intCast(index);
+            count += 1;
+        }
+    }
+    if (count != 0) return out[0..count];
+    for (carriers, 0..) |_, index| {
+        if (count < out.len) {
+            out[count] = @intCast(index);
+            count += 1;
+        }
+    }
+    return out[0..count];
 }
 
 const DhcpResult = struct {
@@ -1500,38 +1585,72 @@ fn setupNetworking() NetworkResult {
         _ = linux.close(lo_sock);
     }
 
-    var iface_buf: [linux.IFNAMESIZE]u8 = undefined;
-    const iface = findPrimaryInterface(&iface_buf) orelse {
+    var list: InterfaceList = .{};
+    collectInterfaces(&list);
+    if (list.count == 0) {
         writeStr("[vmizinit] no non-lo network interface found\r\n");
         return .{};
-    };
-    var msg_buf: [96]u8 = undefined;
-    const msg = std.fmt.bufPrint(&msg_buf, "[vmizinit] running DHCP on {s}\r\n", .{iface}) catch "[vmizinit] running DHCP\r\n";
-    writeStr(msg);
-
-    const attempt = runDhcp(iface);
-    const network_result: NetworkResult = .{
-        .dhcp_acknowledged = attempt.lease != null,
-        .saw_option_245 = attempt.saw_option_245,
-    };
-    const lease = attempt.lease orelse return network_result;
+    }
 
     const ctl_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM, 0);
     const ctl: i32 = @intCast(ctl_rc);
-    if (linux.errno(ctl_rc) != .SUCCESS) return network_result;
+    if (linux.errno(ctl_rc) != .SUCCESS) return .{};
     defer _ = linux.close(ctl);
 
-    setIfaceAddr(ctl, iface, linux.SIOCSIFADDR, lease.your_ip);
-    setIfaceAddr(ctl, iface, linux.SIOCSIFNETMASK, lease.subnet_mask);
-    ifUp(ctl, iface);
+    // Carrier only means anything once the link is administratively up, so
+    // raise every candidate first, then let the slowest PHY settle instead of
+    // judging the whole machine on one reading.
+    var index: usize = 0;
+    while (index < list.count) : (index += 1) ifUp(ctl, list.name(index));
 
-    if (lease.router != 0) addDefaultRoute(iface, lease.router);
-    writeResolvConf(lease.dns);
+    var carriers: [max_candidate_interfaces]?bool = [_]?bool{null} ** max_candidate_interfaces;
+    var waited: u32 = 0;
+    while (true) {
+        var any_carrier = false;
+        index = 0;
+        while (index < list.count) : (index += 1) {
+            carriers[index] = readCarrier(list.name(index));
+            if (carriers[index] orelse false) any_carrier = true;
+        }
+        if (any_carrier or waited >= carrier_settle_seconds) break;
+        const req: linux.timespec = .{ .sec = 1, .nsec = 0 };
+        _ = linux.nanosleep(&req, null);
+        waited += 1;
+    }
 
-    const ip_bytes = std.mem.asBytes(&lease.your_ip);
-    var ok_buf: [96]u8 = undefined;
-    const ok_msg = std.fmt.bufPrint(&ok_buf, "[vmizinit] {s} configured: {d}.{d}.{d}.{d}\r\n", .{ iface, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3] }) catch "[vmizinit] network configured\r\n";
-    writeStr(ok_msg);
+    var order_buf: [max_candidate_interfaces]u8 = undefined;
+    const order = dhcpCandidateOrder(carriers[0..list.count], &order_buf);
+
+    var network_result: NetworkResult = .{};
+    for (order) |candidate| {
+        const iface = list.name(candidate);
+        var msg_buf: [96]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "[vmizinit] running DHCP on {s}\r\n", .{iface}) catch "[vmizinit] running DHCP\r\n";
+        writeStr(msg);
+
+        const attempt = runDhcp(iface);
+        // Azure is identified by a DHCP option, and the interface that offers
+        // it need not be the one that ends up leasing, so keep the evidence
+        // from every attempt rather than only the successful one.
+        network_result.saw_option_245 = network_result.saw_option_245 or attempt.saw_option_245;
+        const lease = attempt.lease orelse continue;
+        network_result.dhcp_acknowledged = true;
+
+        setIfaceAddr(ctl, iface, linux.SIOCSIFADDR, lease.your_ip);
+        setIfaceAddr(ctl, iface, linux.SIOCSIFNETMASK, lease.subnet_mask);
+        ifUp(ctl, iface);
+
+        if (lease.router != 0) addDefaultRoute(iface, lease.router);
+        writeResolvConf(lease.dns);
+
+        const ip_bytes = std.mem.asBytes(&lease.your_ip);
+        var ok_buf: [96]u8 = undefined;
+        const ok_msg = std.fmt.bufPrint(&ok_buf, "[vmizinit] {s} configured: {d}.{d}.{d}.{d}\r\n", .{ iface, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3] }) catch "[vmizinit] network configured\r\n";
+        writeStr(ok_msg);
+        return network_result;
+    }
+
+    writeStr("[vmizinit] dhcp: no interface accepted a lease\r\n");
     return network_result;
 }
 
@@ -2530,4 +2649,49 @@ test "DHCP parser ignores malformed or truncated option 245" {
     buf[base_len + 1] = 1;
     buf[base_len + 2] = 2;
     try std.testing.expect(!parseDhcpReply(&buf, base_len + 3, xid).?.has_option_245);
+}
+
+test "dhcp candidates prefer the interfaces reporting carrier" {
+    var out: [8]u8 = undefined;
+
+    // A bare-metal node: dark fabric ports either side of the one cabled NIC.
+    const mixed = [_]?bool{ false, false, true, false };
+    try std.testing.expectEqualSlices(u8, &.{2}, dhcpCandidateOrder(&mixed, &out));
+
+    // More than one live link: both are tried, in the list's stable order.
+    const several = [_]?bool{ true, false, true };
+    try std.testing.expectEqualSlices(u8, &.{ 0, 2 }, dhcpCandidateOrder(&several, &out));
+
+    // Nothing reports carrier, including interfaces that never answer at all.
+    // Falling back to trying everything preserves the behavior this function
+    // replaced, so a hypervisor with synthetic NICs still gets an address.
+    const silent = [_]?bool{ null, false, null };
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2 }, dhcpCandidateOrder(&silent, &out));
+
+    // A machine with no interfaces at all must not produce a candidate.
+    const none = [_]?bool{};
+    try std.testing.expectEqual(@as(usize, 0), dhcpCandidateOrder(&none, &out).len);
+}
+
+test "interface order does not depend on readdir order" {
+    var list: InterfaceList = .{};
+    list.append("enxb4e9b8888d30");
+    list.append("enP1p3s0f0np0");
+    list.append("enx3eb3994d4bf7");
+    list.sort();
+
+    try std.testing.expectEqual(@as(usize, 3), list.count);
+    try std.testing.expectEqualStrings("enP1p3s0f0np0", list.name(0));
+    try std.testing.expectEqualStrings("enx3eb3994d4bf7", list.name(1));
+    try std.testing.expectEqualStrings("enxb4e9b8888d30", list.name(2));
+}
+
+test "interface list is bounded and rejects unusable names" {
+    var list: InterfaceList = .{};
+    list.append("");
+    try std.testing.expectEqual(@as(usize, 0), list.count);
+
+    var added: usize = 0;
+    while (added < max_candidate_interfaces + 8) : (added += 1) list.append("eth0");
+    try std.testing.expectEqual(max_candidate_interfaces, list.count);
 }
