@@ -235,6 +235,8 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         native = self.source.split("  native_qemu:", 1)[1].split(
             "  azure_acceptance:", 1
         )[0]
+        self.assertIn("test -c /dev/kvm", native)
+        self.assertIn('sudo chown "$(id -u):$(id -g)" /dev/kvm', native)
         self.assertIn("test -r /dev/kvm", native)
         self.assertIn("test -w /dev/kvm", native)
         self.assertIn("VMIZ_UBUNTU2604_IMAGE=", native)
