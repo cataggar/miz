@@ -133,8 +133,9 @@ jobs:
           work="$STAGING_ROOT/work"
           provenance="$STAGING_ROOT/provenance"
           output="$STAGING_ROOT/Ubuntu-26.04-aarch64.baremetal.qcow2"
-          cache="$STAGING_ROOT/debz-cache"
-          mkdir -p "$work" "$provenance" "$INPUT_ROOT/locks"
+          cache="$INPUT_ROOT/debz-cache"
+          debz_inputs="$INPUT_ROOT/debz-inputs"
+          mkdir -p "$work" "$provenance" "$INPUT_ROOT/locks" "$debz_inputs"
           sudo -E "$ZIG_BIN" build \
             -Doptimize=ReleaseSafe \
             -Dubuntu2604-arch=aarch64 \
@@ -150,6 +151,7 @@ jobs:
             --uki-signing-certificate-sha256 "$TEST_CERTIFICATE_SHA256" \
             --uki-signing-key "$SIGNING_KEY" \
             --debz-cache "$cache" \
+            --debz-input-dir "$debz_inputs" \
             --timing-output "$EVIDENCE_ROOT/staging-timing.json" \
             2>&1 | tee "$EVIDENCE_ROOT/staging-build.log"
           sudo chown -R "$(id -u):$(id -g)" \
@@ -166,7 +168,6 @@ jobs:
           install -m 0644 \
             "$provenance"/debz-exact-lock-*-arm64.json \
             "$INPUT_ROOT/locks/"
-          mv "$cache" "$INPUT_ROOT/debz-cache"
           install -m 0644 \
             "$provenance/ubuntu2604-build-provenance.json" \
             "$EVIDENCE_ROOT/staging-build-provenance.json"
@@ -177,7 +178,9 @@ jobs:
           from scripts import ubuntu2604_image_benchmark as benchmark
 
           root = Path(sys.argv[1])
-          inventory = benchmark.verify_warm_cache(root / "debz-cache")
+          inventory = benchmark.verify_benchmark_cache(
+              root / "debz-cache", root / "debz-inputs"
+          )
           locks = benchmark.verify_lock_set(
               root / "locks", inventory["_package_object_names"]
           )
@@ -208,6 +211,7 @@ jobs:
               --sha256sums-signature "$INPUT_ROOT/SHA256SUMS.gpg" \
               --manifest "$INPUT_ROOT/ubuntu-26.04-server-cloudimg-arm64.manifest" \
               --debz-cache "$INPUT_ROOT/debz-cache" \
+              --debz-input-dir "$INPUT_ROOT/debz-inputs" \
               --debz-lock-dir "$INPUT_ROOT/locks" \
               --authorized-key "$AUTHORIZED_KEY" \
               --uki-stub /usr/lib/systemd/boot/efi/linuxaa64.efi.stub \

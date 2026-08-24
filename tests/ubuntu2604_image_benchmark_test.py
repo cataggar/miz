@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import unittest
 from pathlib import Path
@@ -42,9 +43,11 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
             path.write_text(name, encoding="utf-8")
             paths[name] = path
         cache = self.root / "cache"
+        debz_inputs = self.root / "debz-inputs"
         locks = self.root / "locks"
         global_cache = self.root / "zig-global"
         cache.mkdir()
+        debz_inputs.mkdir()
         locks.mkdir()
         return [
             "--output-root",
@@ -59,6 +62,8 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
             str(paths["manifest"]),
             "--debz-cache",
             str(cache),
+            "--debz-input-dir",
+            str(debz_inputs),
             "--debz-lock-dir",
             str(locks),
             "--authorized-key",
@@ -77,7 +82,7 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
             str(global_cache),
         ]
 
-    def make_cache(self):
+    def make_cache(self, input_dir=None):
         cache = self.root / "cache-fixture"
         metadata = cache / "metadata-v1" / "objects"
         manifests = cache / "metadata-v1" / "manifests"
@@ -91,7 +96,35 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
         package_bytes = b"package"
         package_digest = hashlib.sha256(package_bytes).hexdigest()
         (packages / package_digest).write_bytes(package_bytes)
-        (manifests / "fixture.json").write_text("{}", encoding="utf-8")
+        if input_dir is None:
+            requirements = [
+                {
+                    "repository": "a" * 64,
+                    "snapshot": "fixture",
+                    "filename": benchmark.debz_manifest_name(
+                        "a" * 64, "fixture"
+                    ),
+                }
+            ]
+        else:
+            requirements = benchmark.benchmark_cache_requirements(input_dir)
+        for requirement in requirements:
+            (manifests / requirement["filename"]).write_text(
+                "\n".join(
+                    [
+                        "debz-metadata-manifest-v1",
+                        f"repository={requirement['repository']}",
+                        f"snapshot={requirement['snapshot']}",
+                        f"digest={metadata_digest}",
+                        f"size={len(metadata_bytes)}",
+                        "verification=trusted_snapshot",
+                        "verified-at=0",
+                        "verifier-input=-",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
         return cache, package_digest
 
     def make_locks(self, package_digest):
@@ -186,6 +219,7 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
         self.assertIn("-Dubuntu2604-arch=aarch64", command)
         self.assertIn("-Dubuntu2604-flavor=baremetal", command)
         self.assertIn("--debz-lock-dir", command)
+        self.assertIn("--debz-input-dir", command)
         self.assertIn("--offline", command)
         raw_index = command.index("--raw-output")
         self.assertEqual(
@@ -272,6 +306,73 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
         package.write_bytes(b"corrupt")
         with self.assertRaises(benchmark.BenchmarkError):
             benchmark.verify_warm_cache(cache)
+
+    def test_cache_manifests_bind_the_stable_signed_by_path(self):
+        stable = self.root / "stable-inputs"
+        stable.mkdir()
+        cache, _ = self.make_cache(stable)
+        inventory = benchmark.verify_benchmark_cache(cache, stable)
+        self.assertEqual(inventory["metadata_manifests"], 25)
+
+        measured_work_inputs = self.root / "run-warmup" / "work"
+        measured_work_inputs.mkdir(parents=True)
+        stable_requirements = {
+            item["filename"]
+            for item in benchmark.benchmark_cache_requirements(stable)
+        }
+        measured_requirements = {
+            item["filename"]
+            for item in benchmark.benchmark_cache_requirements(
+                measured_work_inputs
+            )
+        }
+        self.assertTrue(stable_requirements.isdisjoint(measured_requirements))
+        with self.assertRaisesRegex(
+            benchmark.BenchmarkError,
+            r"missing metadata manifest [0-9a-f]{64} for phase "
+            r"repository-refresh.*identity binds Signed-By",
+        ):
+            benchmark.verify_benchmark_cache(cache, measured_work_inputs)
+
+    def test_cache_manifest_reports_its_missing_metadata_object(self):
+        cache, _ = self.make_cache()
+        manifest = next((cache / "metadata-v1" / "manifests").iterdir())
+        contents = manifest.read_text(encoding="utf-8")
+        manifest.write_text(
+            re.sub(
+                r"(?m)^digest=[0-9a-f]{64}$",
+                f"digest={'f' * 64}",
+                contents,
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            benchmark.BenchmarkError,
+            r"metadata manifest [0-9a-f]{64} references missing object "
+            r"[0-9a-f]{64}",
+        ):
+            benchmark.verify_warm_cache(cache)
+
+    def test_manifest_refresh_does_not_change_cas_object_inventory(self):
+        stable = self.root / "stable-inputs"
+        stable.mkdir()
+        cache, _ = self.make_cache(stable)
+        before = benchmark.verify_benchmark_cache(cache, stable)
+        manifest = next((cache / "metadata-v1" / "manifests").iterdir())
+        contents = manifest.read_text(encoding="utf-8")
+        manifest.write_text(
+            contents.replace("verified-at=0", "verified-at=1"),
+            encoding="utf-8",
+        )
+        after = benchmark.verify_benchmark_cache(cache, stable)
+        self.assertEqual(
+            before["object_inventory_sha256"],
+            after["object_inventory_sha256"],
+        )
+        self.assertNotEqual(
+            before["manifest_inventory_sha256"],
+            after["manifest_inventory_sha256"],
+        )
 
     def test_lock_set_fails_closed_on_cache_miss(self):
         cache, package_digest = self.make_cache()

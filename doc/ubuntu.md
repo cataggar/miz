@@ -66,6 +66,13 @@ either way. At startup, abandoned staging files are removed under each cache
 namespace's writer lock without touching verified objects or manifests.
 Deleting the work dir is still a full cold build.
 
+debz metadata manifests are keyed by the normalized repository identity,
+including the absolute `Signed-By` keyring path. A cache staged for later
+offline use must therefore pass the same `--debz-input-dir` to both builds;
+that directory holds only the regenerated source documents and validated
+public Ubuntu keyring. Package transaction state remains per-stage and is
+never copied between runs.
+
 The root partition is selected by the validated GPT name
 `cloudimg-rootfs` and the ext4 filesystem label, not by a fixed `/dev/sdaN`
 slot; Canonical's populated partition slots differ between image revisions.
