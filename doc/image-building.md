@@ -46,6 +46,7 @@ vmiz convert -O raw.gz disk.qcow2 disk.raw.gz    # compressed while writing, nev
 vmiz convert -O raw.gz -o - disk.qcow2 - | ssh host 'cat > disk.raw.gz'
 vmiz write --allow-device-write image.qcow2 <block-device>  # Linux: preflight, confirm, write, flush, refresh partitions
 vmiz write --allow-device-write --yes image.vhdx <block-device>  # non-interactive acknowledgement
+vmiz write --allow-device-write --grow-root image.raw <block-device>  # also grow GPT root + ext4 offline
 vmiz resize disk.vhdx +4G
 vmiz resize disk.vhd +4G
 vmiz check disk.vhd
@@ -88,6 +89,14 @@ the native Linux partition-table refresh ioctl. A refresh failure is reported
 as partial success with exit status 2 because the bytes are durable but the
 kernel view is stale. `vmiz convert` and `Image.create` continue to refuse
 device destinations.
+
+With `--grow-root`, `vmiz write` additionally requires a strictly valid GPT
+raw source with exactly one supported ext4 root partition, and requires that
+partition to be the last partition. Before confirmation it validates the
+destination-sized GPT and ext4 growth plan without writing data. After the
+copy it extends that partition and its filesystem offline using vmiz's native
+writers; the guest does not need `resize2fs`, cloud-init, or a first-boot
+resize service.
 
 OCI ingestion defaults to 64 MiB compressed blobs, 128 MiB decompressed
 layers, and 512 MiB docker/podman save archives. Deliberately larger trusted

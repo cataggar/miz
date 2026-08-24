@@ -1719,7 +1719,10 @@ fn resizeImpl(
 
     const stat = try file.stat(io);
     if (mutate and stat.size < options.offset + options.length) {
-        try file.setLength(io, options.offset + options.length);
+        file.setLength(io, options.offset + options.length) catch |err| switch (err) {
+            error.NonResizable => {},
+            else => return err,
+        };
     }
 
     if (mutate and new_group_count > old_group_count) {
@@ -1833,7 +1836,10 @@ fn resizeGeneral(
     }
     const current_stat = try file.stat(io);
     if (mutate and current_stat.size < options.offset + options.length) {
-        try file.setLength(io, options.offset + options.length);
+        file.setLength(io, options.offset + options.length) catch |err| switch (err) {
+            error.NonResizable => {},
+            else => return err,
+        };
     }
 
     const blocks_per_group = readInt(u32, sb[0x20..0x24]);
