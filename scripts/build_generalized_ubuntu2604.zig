@@ -2981,23 +2981,37 @@ fn writeProvenance(
     try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = document });
 }
 
-fn writeCoreProvenance(
+/// Provenance for the flavors that build their root from scratch with debz.
+/// The package roots and the transaction evidence both come from the flavor
+/// rather than from one flavor's hardcoded list, because `core` and
+/// `baremetal` install different closures and a document that named core's
+/// roots under a bare-metal build would describe an image that was never
+/// built.
+fn writeFreshRootProvenance(
     allocator: Allocator,
     io: Io,
     path: []const u8,
     profile: *const Profile,
+    flavor: Flavor,
     source_digest: [64]u8,
     evidence: []const DebzEvidence,
     virtual_size: u64,
     root_free_bytes: u64,
 ) !void {
-    if (evidence.len != core_debz_packages.len) return error.InvalidDebzEvidence;
+    const package_roots = flavor.debzPackages();
+    // Count alone would let a transaction for the wrong package pass, so the
+    // evidence has to name this flavor's roots in the order they were applied.
+    if (evidence.len != package_roots.len) return error.InvalidDebzEvidence;
+    for (evidence, package_roots) |item, root| {
+        if (!std.mem.eql(u8, item.package, root)) return error.InvalidDebzEvidence;
+    }
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try output.writer.print(
-        "{{\"schema\":1,\"type\":\"vmiz-ubuntu2604-build-provenance\",\"architecture\":\"{s}\",\"flavor\":\"core\",\"release\":\"26.04\",\"virtual_size\":{d},\"minimum_root_free_bytes\":{d},\"validated_root_free_bytes\":{d},\"snapshot\":{{\"id\":\"release-{s}\",\"base_url\":\"{s}/\"}},\"canonical_key_fingerprint\":\"{s}\",\"sha256sums_signature_verified\":true,\"artifacts\":{{\"sha256sums\":{{\"filename\":\"SHA256SUMS\",\"sha256\":\"{s}\"}},\"sha256sums_signature\":{{\"filename\":\"SHA256SUMS.gpg\",\"sha256\":\"{s}\"}},\"source_image\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"role\":\"signed-gpt-esp-substrate\"}},\"image_manifest\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}}},\"debz\":{{\"api_commit\":\"{s}\",\"baseline\":{{\"source\":\"empty-debz-root\",\"enforcement\":\"exact-final-closure\"}},\"package_roots\":[\"ubuntu-minimal\",\"linux-azure\",\"openssh-server\",\"sudo\"],\"transactions\":[",
+        "{{\"schema\":1,\"type\":\"vmiz-ubuntu2604-build-provenance\",\"architecture\":\"{s}\",\"flavor\":\"{s}\",\"release\":\"26.04\",\"virtual_size\":{d},\"minimum_root_free_bytes\":{d},\"validated_root_free_bytes\":{d},\"snapshot\":{{\"id\":\"release-{s}\",\"base_url\":\"{s}/\"}},\"canonical_key_fingerprint\":\"{s}\",\"sha256sums_signature_verified\":true,\"artifacts\":{{\"sha256sums\":{{\"filename\":\"SHA256SUMS\",\"sha256\":\"{s}\"}},\"sha256sums_signature\":{{\"filename\":\"SHA256SUMS.gpg\",\"sha256\":\"{s}\"}},\"source_image\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"role\":\"signed-gpt-esp-substrate\"}},\"image_manifest\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}}},\"debz\":{{\"api_commit\":\"{s}\",\"baseline\":{{\"source\":\"empty-debz-root\",\"enforcement\":\"exact-final-closure\"}},\"package_roots\":[",
         .{
             @tagName(profile.architecture),
+            @tagName(flavor),
             virtual_size,
             core_minimum_root_free_bytes,
             root_free_bytes,
@@ -3013,6 +3027,11 @@ fn writeCoreProvenance(
             package_family.debz_api_commit,
         },
     );
+    for (package_roots, 0..) |root, index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try output.writer.print("\"{s}\"", .{root});
+    }
+    try output.writer.writeAll("],\"transactions\":[");
     for (evidence, 0..) |item, index| {
         if (index != 0) try output.writer.writeByte(',');
         try output.writer.print(
@@ -3667,7 +3686,19 @@ pub fn main(init: std.process.Init) !void {
 
     const provenance_path = try std.fs.path.join(allocator, &.{ provenance_dir, "ubuntu2604-build-provenance.json" });
     defer allocator.free(provenance_path);
-    if (args.flavor == .full) {
+    if (args.flavor.freshRoot()) {
+        try writeFreshRootProvenance(
+            allocator,
+            io,
+            provenance_path,
+            profile,
+            args.flavor,
+            artifact_pipeline.formatSha256(source_metadata.sha256),
+            debz_customization.evidence[0..debz_customization.evidence_count],
+            args.size,
+            debz_customization.root_free_bytes,
+        );
+    } else {
         try writeProvenance(
             allocator,
             io,
@@ -3675,17 +3706,6 @@ pub fn main(init: std.process.Init) !void {
             profile,
             artifact_pipeline.formatSha256(source_metadata.sha256),
             debz_customization.evidence[0..debz_customization.evidence_count],
-        );
-    } else {
-        try writeCoreProvenance(
-            allocator,
-            io,
-            provenance_path,
-            profile,
-            artifact_pipeline.formatSha256(source_metadata.sha256),
-            debz_customization.evidence[0..debz_customization.evidence_count],
-            args.size,
-            debz_customization.root_free_bytes,
         );
     }
 }
@@ -5562,14 +5582,88 @@ test "provenance binds signed source metadata and validated debz evidence" {
     try std.testing.expectEqual(@as(usize, 4), parsed.value.object.get("artifacts").?.object.count());
 }
 
-test "core provenance binds flavor closure size and free-space evidence" {
+test "fresh-root provenance binds flavor closure size and free-space evidence" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(std.testing.io, &root_buffer);
+    // Both fresh-root flavors, because `baremetal` installs seven package
+    // roots against core's four and a writer that only fits one of them
+    // fails the other at the very end of a finished build.
+    for ([_]Flavor{ .core, .baremetal }) |flavor| {
+        const package_roots = flavor.debzPackages();
+        const path = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{s}/{s}-provenance.json",
+            .{ root_buffer[0..root_length], @tagName(flavor) },
+        );
+        defer std.testing.allocator.free(path);
+        var evidence: [max_debz_packages]DebzEvidence = undefined;
+        var initialized: usize = 0;
+        defer for (evidence[0..initialized]) |*item| item.deinit(std.testing.allocator);
+        for (package_roots, 0..) |package, index| {
+            evidence[index] = .{
+                .package = package,
+                .lock_path = try std.fmt.allocPrint(std.testing.allocator, "/state/{s}.lock", .{package}),
+                .lock_sha256 = @splat('1'),
+                .lock_digest_sha256 = @splat('a'),
+                .provenance_path = try std.fmt.allocPrint(std.testing.allocator, "/state/{s}.transaction.json", .{package}),
+                .provenance_sha256 = @splat('2'),
+                .provenance_digest_sha256 = @splat('b'),
+                .provenance_lock_sha256 = @splat('a'),
+            };
+            initialized += 1;
+        }
+        try writeFreshRootProvenance(
+            std.testing.allocator,
+            std.testing.io,
+            path,
+            profileFor(.aarch64),
+            flavor,
+            @splat('5'),
+            evidence[0..package_roots.len],
+            flavor.defaultSize(),
+            core_minimum_root_free_bytes + 4096,
+        );
+        const document = try Dir.cwd().readFileAlloc(
+            std.testing.io,
+            path,
+            std.testing.allocator,
+            .limited(64 * 1024),
+        );
+        defer std.testing.allocator.free(document);
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, document, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(@tagName(flavor), parsed.value.object.get("flavor").?.string);
+        try std.testing.expectEqual(
+            @as(i64, @intCast(flavor.defaultSize())),
+            parsed.value.object.get("virtual_size").?.integer,
+        );
+        const debz_object = parsed.value.object.get("debz").?.object;
+        try std.testing.expectEqual(
+            package_roots.len,
+            debz_object.get("transactions").?.array.items.len,
+        );
+        // The declared roots are this flavor's, not another flavor's.
+        const declared = debz_object.get("package_roots").?.array.items;
+        try std.testing.expectEqual(package_roots.len, declared.len);
+        for (declared, package_roots) |item, expected|
+            try std.testing.expectEqualStrings(expected, item.string);
+        try std.testing.expectEqualStrings(
+            "empty-debz-root",
+            debz_object.get("baseline").?.object.get("source").?.string,
+        );
+    }
+}
+
+test "fresh-root provenance rejects evidence that is not this flavor's roots" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_length = try temporary.dir.realPath(std.testing.io, &root_buffer);
     const path = try std.fs.path.join(
         std.testing.allocator,
-        &.{ root_buffer[0..root_length], "core-provenance.json" },
+        &.{ root_buffer[0..root_length], "mismatched-provenance.json" },
     );
     defer std.testing.allocator.free(path);
     var evidence: [core_debz_packages.len]DebzEvidence = undefined;
@@ -5588,36 +5682,30 @@ test "core provenance binds flavor closure size and free-space evidence" {
         };
         initialized += 1;
     }
-    try writeCoreProvenance(
+    // Core's evidence offered for a bare-metal build: the wrong count.
+    try std.testing.expectError(error.InvalidDebzEvidence, writeFreshRootProvenance(
         std.testing.allocator,
         std.testing.io,
         path,
         profileFor(.aarch64),
+        .baremetal,
+        @splat('5'),
+        &evidence,
+        baremetal_virtual_size,
+        core_minimum_root_free_bytes + 4096,
+    ));
+    // Right count, wrong package: the last transaction names something core
+    // never installs, which a count-only check would have accepted.
+    evidence[core_debz_packages.len - 1].package = "ca-certificates";
+    try std.testing.expectError(error.InvalidDebzEvidence, writeFreshRootProvenance(
+        std.testing.allocator,
+        std.testing.io,
+        path,
+        profileFor(.aarch64),
+        .core,
         @splat('5'),
         &evidence,
         core_virtual_size,
         core_minimum_root_free_bytes + 4096,
-    );
-    const document = try Dir.cwd().readFileAlloc(
-        std.testing.io,
-        path,
-        std.testing.allocator,
-        .limited(64 * 1024),
-    );
-    defer std.testing.allocator.free(document);
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, document, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("core", parsed.value.object.get("flavor").?.string);
-    try std.testing.expectEqual(
-        @as(i64, core_virtual_size),
-        parsed.value.object.get("virtual_size").?.integer,
-    );
-    try std.testing.expectEqual(
-        @as(usize, core_debz_packages.len),
-        parsed.value.object.get("debz").?.object.get("transactions").?.array.items.len,
-    );
-    try std.testing.expectEqualStrings(
-        "empty-debz-root",
-        parsed.value.object.get("debz").?.object.get("baseline").?.object.get("source").?.string,
-    );
+    ));
 }
