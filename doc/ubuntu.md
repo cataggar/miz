@@ -660,7 +660,7 @@ The only deviation from the protected workflow is the signing identity: instead
 of the Azure Trusted Signing command, the gate signs with a safe, public,
 test-only self-signed key/cert committed under
 `tests/fixtures/ubuntu2604-local-signing/` (certificate DER SHA-256
-`74556e6a0b540eb0ed5a49d9e75a003987447699df59f1d68456548c47dc8009`). Those
+`8ca3b80b1a2272a4f3a6d13246a65cfdd89764eb83beb8a0709e3cf591490279`). Those
 fixtures are guarded deterministically by `zig build test-generalized-ubuntu2604`
 (the test loads them through the native local-key path and verifies a signature
 against the enrolled certificate), so a corrupted or mismatched fixture fails

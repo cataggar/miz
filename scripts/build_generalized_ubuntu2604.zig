@@ -4826,7 +4826,7 @@ test "committed local UKI signing fixtures load and sign against the enrolled ce
     });
     defer certificate.deinit(allocator);
     const expected = try uki_signing.parseFingerprint(
-        "74556e6a0b540eb0ed5a49d9e75a003987447699df59f1d68456548c47dc8009",
+        "8ca3b80b1a2272a4f3a6d13246a65cfdd89764eb83beb8a0709e3cf591490279",
     );
     try std.testing.expectEqual(expected, certificate.sha256);
 

@@ -18,16 +18,20 @@ Existing automation and stored identifiers must be migrated before using a
 ## Commands, packages, and builds
 
 - Replace every `vmiz` or `zvmi` CLI invocation with `miz`.
-- Replace executable and helper names with `miz`, `mizinit`, `mizguest`,
+- Replace executable and helper names with `miz`, `mizinit`,
+  `miz-guest-agent-x86_64`, `miz-guest-agent-aarch64`,
   `miz-image-builder`, `miz-iso-builder`, and
-  `miz-recustomize-iso-builder`.
+  `miz-recustomize-iso-builder`. `mizguest` is the build step that compiles
+  both architecture-specific guest-agent executables; it is not an executable
+  name. The default `install` step installs both executables.
 - Update Zig dependency URLs and package names. Replace imports of `vmiz` or
   `zvmi` with `miz`, `vmiz_host` or `zvmi_host` with `miz_host`, and
   `vmiz-package-family-host` or `zvmi-package-family-host` with
   `miz-package-family-host`. The old module names are not registered.
 - Update build steps, options, and artifact paths, including `mizguest`,
-  `test-mizguest`, `test-mizinit`, `--mizinit`, `zig-out/bin/mizguest`, and
-  `zig-out/bin/mizinit`.
+  `test-mizguest`, `test-mizinit`, `--mizinit`, `zig-out/bin/mizinit`,
+  `zig-out/bin/miz-guest-agent-x86_64`, and
+  `zig-out/bin/miz-guest-agent-aarch64`.
 
 ## Configuration and boot contracts
 
@@ -36,8 +40,10 @@ Existing automation and stored identifiers must be migrated before using a
 - Replace guest executable paths such as `/sbin/vmizinit` and
   `/usr/sbin/vmizinit` with `/sbin/mizinit` and `/usr/sbin/mizinit`.
   Replace `/usr/local/sbin/vmizinit-access` with
-  `/usr/local/sbin/mizinit-access`, and replace every `vmizguest` path
-  component with `mizguest`.
+  `/usr/local/sbin/mizinit-access`. Rename the repository source directory
+  `vmizguest/` to `mizguest/`, and replace the VM initramfs runtime path
+  `/vmiz-guest-agent` (including `rdinit=/vmiz-guest-agent`) with
+  `/miz-guest-agent`.
 - Replace kernel options in the `vmizinit.*` namespace with `mizinit.*`,
   including `init=/sbin/mizinit`.
 - Rename state and marker paths: `.vmiz/` to `.miz/`, `/etc/vmiz` to
