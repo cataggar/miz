@@ -166,29 +166,54 @@ const PartitionExtent = struct {
     }
 };
 
-/// Grows the GPT root partition (identified as the *last* entry in the
-/// table, matching both miz-built images and real Azure Linux images) to
-/// the disk's new, larger end. Always returns the resulting partition
-/// extent, including when the table was already grown, so callers can
-/// retry the kernel and filesystem resize steps after an earlier failure.
+/// Grows the GPT root partition selected by its kernel partition number to
+/// the disk's new, larger end. The source-sized view lets strict GPT
+/// verification find the old backup table after the block device has grown.
+/// Always returns the resulting partition extent, including when the table
+/// was already grown, so callers can retry the kernel and filesystem resize
+/// steps after an earlier failure.
 fn growGptRoot(allocator: Allocator, io: std.Io, img: *Image, partition_number: u32) !PartitionExtent {
     const parsed = try gpt.readGpt(img.*, io, allocator);
     defer allocator.free(parsed.partitions);
-    if (parsed.partitions.len == 0) return error.RootPartitionNotFound;
+    if (partition_number == 0) return error.RootPartitionPositionMismatch;
 
-    // Safety cross-check: the root partition's kernel-reported partition
-    // number should match its position in the table. Fail loudly rather
-    // than silently growing the wrong partition if this ever doesn't
-    // hold.
-    if (partition_number != parsed.partitions.len) return error.RootPartitionPositionMismatch;
+    const source_sectors = try std.math.add(u64, parsed.header.backup_lba, 1);
+    const source_size = try std.math.mul(u64, source_sectors, gpt.sector_size);
+    if (source_size > img.virtual_size) return error.InvalidHeaderGeometry;
 
-    gpt.growLastPartition(img, io, parsed.header.disk_guid, parsed.partitions) catch |err| switch (err) {
-        error.NotEnoughSpace => {},
+    var source_img = img.*;
+    source_img.virtual_size = source_size;
+    var verified = try gpt.readVerifiedGpt(
+        source_img,
+        io,
+        allocator,
+        gpt.default_max_partition_array_bytes,
+    );
+    defer verified.deinit(allocator);
+
+    const table_index = partition_number - 1;
+    var root_partition: ?gpt.PartitionEntry = null;
+    for (verified.partitions) |partition| {
+        if (partition.table_index == table_index) {
+            root_partition = partition;
+            break;
+        }
+    }
+    var root = root_partition orelse return error.RootPartitionNotFound;
+
+    const result = gpt.growPartitionToEnd(
+        img,
+        io,
+        allocator,
+        verified,
+        table_index,
+    ) catch |err| switch (err) {
+        error.NotEnoughSpace => null,
         else => return err,
     };
+    if (result) |growth| root.last_lba = growth.new_last_lba;
 
-    const root_partition = parsed.partitions[parsed.partitions.len - 1];
-    return PartitionExtent.fromLbaRange(root_partition.first_lba, root_partition.last_lba);
+    return PartitionExtent.fromLbaRange(root.first_lba, root.last_lba);
 }
 
 /// Grows the MBR (Gen1) root partition in place while preserving the BIOS
@@ -456,6 +481,72 @@ test "growMbrRoot preserves BIOS bootstrap code and returns an extent on retry" 
     try std.testing.expectEqual(first_extent, retry_extent);
 }
 
+fn remapGptEntriesForTest(
+    allocator: Allocator,
+    io: std.Io,
+    img: *Image,
+    target_indexes: []const u32,
+) !void {
+    const parsed = try gpt.readGpt(img.*, io, allocator);
+    defer allocator.free(parsed.partitions);
+    if (parsed.partitions.len != target_indexes.len)
+        return error.UnexpectedPartitionCount;
+
+    const entry_size: usize = @intCast(parsed.header.partition_entry_size);
+    const entry_count: usize = @intCast(parsed.header.num_partition_entries);
+    const array_len = try std.math.mul(usize, entry_size, entry_count);
+    const original = try allocator.alloc(u8, array_len);
+    defer allocator.free(original);
+    const primary_array_offset = try std.math.mul(
+        u64,
+        parsed.header.partition_entry_lba,
+        gpt.sector_size,
+    );
+    if (try img.pread(io, original, primary_array_offset) != original.len)
+        return error.UnexpectedEndOfFile;
+
+    const remapped = try allocator.alloc(u8, array_len);
+    defer allocator.free(remapped);
+    @memset(remapped, 0);
+    for (target_indexes, 0..) |target_index, source_index| {
+        if (target_index >= parsed.header.num_partition_entries)
+            return error.InvalidPartitionIndex;
+        const source_offset = source_index * entry_size;
+        const target_offset = @as(usize, target_index) * entry_size;
+        @memcpy(
+            remapped[target_offset..][0..entry_size],
+            original[source_offset..][0..entry_size],
+        );
+    }
+
+    const array_crc = std.hash.crc.Crc32.hash(remapped);
+    var primary = parsed.header;
+    primary.partition_array_crc32 = array_crc;
+
+    var backup_sector: [gpt.sector_size]u8 = undefined;
+    const backup_header_offset = try std.math.mul(
+        u64,
+        primary.backup_lba,
+        gpt.sector_size,
+    );
+    if (try img.pread(io, &backup_sector, backup_header_offset) !=
+        backup_sector.len)
+    {
+        return error.UnexpectedEndOfFile;
+    }
+    var backup = try gpt.Header.decode(&backup_sector);
+    backup.partition_array_crc32 = array_crc;
+
+    try img.pwrite(io, remapped, primary_array_offset);
+    try img.pwrite(
+        io,
+        remapped,
+        try std.math.mul(u64, backup.partition_entry_lba, gpt.sector_size),
+    );
+    try img.pwrite(io, &primary.encode(), gpt.sector_size);
+    try img.pwrite(io, &backup.encode(), backup_header_offset);
+}
+
 test "growGptRoot returns the final extent on first growth and retry" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -489,6 +580,115 @@ test "growGptRoot returns the final extent on first growth and retry" {
     try std.testing.expectEqual(
         grown_size - (1 + gpt.partition_array_sectors) * gpt.sector_size,
         first_extent.start_bytes + first_extent.length_bytes,
+    );
+
+    const retry_extent = try growGptRoot(allocator, io, &img, 1);
+    try std.testing.expectEqual(first_extent, retry_extent);
+}
+
+test "growGptRoot grows sparse entry one and preserves later boot entries" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "test-root-resize-sparse-gpt.img";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const initial_size: u64 = 64 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, initial_size, .{});
+    defer img.close(io);
+
+    const total_sectors = initial_size / gpt.sector_size;
+    const last_usable_lba =
+        total_sectors - 2 - gpt.partition_array_sectors;
+    const boot_partition_sectors: u64 = 2048;
+    const first_usable_lba: u64 = 2 + gpt.partition_array_sectors;
+    const root_sectors = last_usable_lba - first_usable_lba -
+        3 * boot_partition_sectors + 1;
+    const specs = [_]gpt.PartitionSpec{
+        .{
+            .type_guid = miz.guid.linux_xbootldr,
+            .unique_guid = miz.guid.parse(
+                "11111111-1111-1111-1111-111111111111",
+            ),
+            .size_sectors = boot_partition_sectors,
+        },
+        .{
+            .type_guid = miz.guid.bios_boot,
+            .unique_guid = miz.guid.parse(
+                "22222222-2222-2222-2222-222222222222",
+            ),
+            .size_sectors = boot_partition_sectors,
+        },
+        .{
+            .type_guid = miz.guid.esp,
+            .unique_guid = miz.guid.parse(
+                "33333333-3333-3333-3333-333333333333",
+            ),
+            .size_sectors = boot_partition_sectors,
+        },
+        .{
+            .type_guid = miz.guid.linux_root_x86_64,
+            .unique_guid = miz.guid.parse(
+                "44444444-4444-4444-4444-444444444444",
+            ),
+            .size_sectors = root_sectors,
+        },
+    };
+    var placements: [specs.len]gpt.Placement = undefined;
+    try gpt.writeGpt(
+        &img,
+        io,
+        miz.guid.parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        &specs,
+        &placements,
+    );
+    try remapGptEntriesForTest(
+        allocator,
+        io,
+        &img,
+        &.{ 12, 13, 14, 0 },
+    );
+
+    var before = try gpt.readVerifiedGpt(
+        img,
+        io,
+        allocator,
+        gpt.default_max_partition_array_bytes,
+    );
+    defer before.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 4), before.partitions.len);
+    try std.testing.expectEqual(@as(u32, 0), before.partitions[0].table_index);
+    try std.testing.expectEqual(@as(u32, 12), before.partitions[1].table_index);
+    try std.testing.expectEqual(@as(u32, 13), before.partitions[2].table_index);
+    try std.testing.expectEqual(@as(u32, 14), before.partitions[3].table_index);
+
+    const grown_size: u64 = 128 * 1024 * 1024;
+    try img.resize(io, grown_size);
+    const first_extent = try growGptRoot(allocator, io, &img, 1);
+
+    var after = try gpt.readVerifiedGpt(
+        img,
+        io,
+        allocator,
+        gpt.default_max_partition_array_bytes,
+    );
+    defer after.deinit(allocator);
+    const grown_last_usable_lba =
+        grown_size / gpt.sector_size - 2 - gpt.partition_array_sectors;
+    try std.testing.expectEqual(
+        grown_last_usable_lba,
+        after.partitions[0].last_lba,
+    );
+    try std.testing.expectEqualDeep(
+        before.partitions[1],
+        after.partitions[1],
+    );
+    try std.testing.expectEqualDeep(
+        before.partitions[2],
+        after.partitions[2],
+    );
+    try std.testing.expectEqualDeep(
+        before.partitions[3],
+        after.partitions[3],
     );
 
     const retry_extent = try growGptRoot(allocator, io, &img, 1);

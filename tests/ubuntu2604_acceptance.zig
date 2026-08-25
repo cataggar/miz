@@ -21,6 +21,23 @@ const serial_limit: usize = 2 * 1024 * 1024;
 const mib: u64 = 1024 * 1024;
 const gib: u64 = 1024 * mib;
 
+const ExpectedPartitionGeometry = struct {
+    table_index: u32,
+    first_lba: u64,
+    last_lba: u64,
+};
+
+const PartitionPolicy = struct {
+    root_first_lba: u64,
+    xbootldr: ExpectedPartitionGeometry,
+    bios_boot: ?ExpectedPartitionGeometry,
+    esp: ExpectedPartitionGeometry,
+
+    fn partitionCount(self: PartitionPolicy) usize {
+        return if (self.bios_boot == null) 3 else 4;
+    }
+};
+
 const Architecture = enum {
     x86_64,
     aarch64,
@@ -39,10 +56,40 @@ const Architecture = enum {
         };
     }
 
-    fn rootRole(self: Architecture) miz.layout.PartitionRole {
+    fn partitionPolicy(self: Architecture) PartitionPolicy {
         return switch (self) {
-            .x86_64 => .root_x86_64,
-            .aarch64 => .root_aarch64,
+            .x86_64 => .{
+                .root_first_lba = 2_324_480,
+                .xbootldr = .{
+                    .table_index = 12,
+                    .first_lba = 2_048,
+                    .last_lba = 2_097_152,
+                },
+                .bios_boot = .{
+                    .table_index = 13,
+                    .first_lba = 2_099_200,
+                    .last_lba = 2_107_391,
+                },
+                .esp = .{
+                    .table_index = 14,
+                    .first_lba = 2_107_392,
+                    .last_lba = 2_324_479,
+                },
+            },
+            .aarch64 => .{
+                .root_first_lba = 2_099_200,
+                .xbootldr = .{
+                    .table_index = 12,
+                    .first_lba = 206_848,
+                    .last_lba = 2_097_152,
+                },
+                .bios_boot = null,
+                .esp = .{
+                    .table_index = 14,
+                    .first_lba = 2_048,
+                    .last_lba = 204_800,
+                },
+            },
         };
     }
 
@@ -206,6 +253,25 @@ const Candidate = struct {
         return self.flavor.policy().contracts;
     }
 };
+
+fn expectedOriginalRootSize(candidate: Candidate) !u64 {
+    const virtual_size = candidate.expectedVirtualSize();
+    if (virtual_size == 0 or virtual_size % miz.gpt.sector_size != 0)
+        return error.InvalidExpectedVirtualSize;
+
+    const total_sectors = virtual_size / miz.gpt.sector_size;
+    const reserved_sectors = 2 + miz.gpt.partition_array_sectors;
+    if (total_sectors <= reserved_sectors)
+        return error.InvalidExpectedVirtualSize;
+
+    const last_usable_lba = total_sectors - reserved_sectors;
+    const root_first_lba = candidate.architecture.partitionPolicy().root_first_lba;
+    if (root_first_lba > last_usable_lba)
+        return error.InvalidExpectedRootGeometry;
+
+    const root_sectors = last_usable_lba - root_first_lba + 1;
+    return std.math.mul(u64, root_sectors, miz.gpt.sector_size);
+}
 
 fn hasContract(contracts: []const []const u8, expected: []const u8) bool {
     for (contracts) |contract| {
@@ -632,6 +698,147 @@ fn prepareEnrolledVars(
     if (stat.kind != .file or stat.size == 0) return error.InvalidEnrolledVars;
 }
 
+const PreservedPartitions = struct {
+    root: miz.gpt.PartitionEntry,
+    xbootldr: miz.gpt.PartitionEntry,
+    bios_boot: ?miz.gpt.PartitionEntry,
+    esp: miz.gpt.PartitionEntry,
+};
+
+fn partitionNameEquals(
+    partition: miz.gpt.PartitionEntry,
+    expected: []const u8,
+) bool {
+    if (expected.len > partition.name_utf16le.len) return false;
+    for (expected, 0..) |byte, index| {
+        if (partition.name_utf16le[index] != byte) return false;
+    }
+    for (partition.name_utf16le[expected.len..]) |code_unit| {
+        if (code_unit != 0) return false;
+    }
+    return true;
+}
+
+fn findPartitionByType(
+    partitions: []const miz.gpt.PartitionEntry,
+    expected: miz.guid.Guid,
+) !?miz.gpt.PartitionEntry {
+    var found: ?miz.gpt.PartitionEntry = null;
+    for (partitions) |partition| {
+        if (!std.mem.eql(u8, &partition.partition_type_guid, &expected)) continue;
+        if (found != null) return error.AmbiguousPartitionType;
+        found = partition;
+    }
+    return found;
+}
+
+fn findEspPartition(
+    partitions: []const miz.gpt.PartitionEntry,
+) !miz.gpt.PartitionEntry {
+    return (try findPartitionByType(partitions, miz.guid.esp)) orelse
+        error.MissingEspPartition;
+}
+
+fn findRootPartition(
+    partitions: []const miz.gpt.PartitionEntry,
+    architecture: Architecture,
+) !miz.gpt.PartitionEntry {
+    var found: ?miz.gpt.PartitionEntry = null;
+    for (partitions) |partition| {
+        if (!partitionNameEquals(partition, "cloudimg-rootfs")) continue;
+        if (found != null) return error.AmbiguousRootPartition;
+        found = partition;
+    }
+    const root = found orelse return error.MissingRootPartition;
+    if (!std.mem.eql(
+        u8,
+        &root.partition_type_guid,
+        &architecture.rootGuid(),
+    )) {
+        return error.UnexpectedRootArchitecture;
+    }
+    return root;
+}
+
+fn partitionGeometryMatches(
+    partition: miz.gpt.PartitionEntry,
+    expected: ExpectedPartitionGeometry,
+) bool {
+    return partition.table_index == expected.table_index and
+        partition.first_lba == expected.first_lba and
+        partition.last_lba == expected.last_lba;
+}
+
+fn validatePreservedPartitions(
+    partitions: []const miz.gpt.PartitionEntry,
+    architecture: Architecture,
+    last_usable_lba: u64,
+) !PreservedPartitions {
+    const policy = architecture.partitionPolicy();
+    const bios_boot = try findPartitionByType(partitions, miz.guid.bios_boot);
+    if (policy.bios_boot == null and bios_boot != null)
+        return error.UnexpectedBiosBootPartition;
+    if (partitions.len != policy.partitionCount())
+        return error.UnexpectedPartitionCount;
+    if (policy.bios_boot != null and bios_boot == null)
+        return error.MissingBiosBootPartition;
+
+    const root = try findRootPartition(partitions, architecture);
+    const xbootldr = (try findPartitionByType(
+        partitions,
+        miz.guid.linux_xbootldr,
+    )) orelse return error.MissingXbootldrPartition;
+    const esp = try findEspPartition(partitions);
+
+    for (partitions, 0..) |partition, index| {
+        if (std.mem.eql(
+            u8,
+            &partition.unique_partition_guid,
+            &miz.guid.nil,
+        )) {
+            return error.InvalidPartitionGuid;
+        }
+        for (partitions[index + 1 ..]) |other| {
+            if (std.mem.eql(
+                u8,
+                &partition.unique_partition_guid,
+                &other.unique_partition_guid,
+            )) {
+                return error.DuplicatePartitionGuid;
+            }
+        }
+    }
+
+    if (root.table_index != 0 or
+        root.first_lba != policy.root_first_lba or
+        root.last_lba != last_usable_lba)
+    {
+        return error.UnexpectedRootGeometry;
+    }
+    if (!partitionGeometryMatches(xbootldr, policy.xbootldr))
+        return error.UnexpectedXbootldrGeometry;
+    if (policy.bios_boot) |expected| {
+        if (!partitionGeometryMatches(bios_boot.?, expected))
+            return error.UnexpectedBiosBootGeometry;
+    }
+    if (!partitionGeometryMatches(esp, policy.esp))
+        return error.UnexpectedEspGeometry;
+
+    if (!partitionNameEquals(xbootldr, "") or
+        (bios_boot != null and !partitionNameEquals(bios_boot.?, "")) or
+        !partitionNameEquals(esp, ""))
+    {
+        return error.UnexpectedAuxiliaryPartitionName;
+    }
+
+    return .{
+        .root = root,
+        .xbootldr = xbootldr,
+        .bios_boot = bios_boot,
+        .esp = esp,
+    };
+}
+
 fn verifyUkiSignatures(
     allocator: Allocator,
     io: Io,
@@ -647,12 +854,7 @@ fn verifyUkiSignatures(
     file = undefined;
     const parsed = try miz.gpt.readGpt(image, io, allocator);
     defer allocator.free(parsed.partitions);
-    if (parsed.partitions.len < 1 or
-        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &miz.guid.esp))
-    {
-        return error.MissingEspPartition;
-    }
-    const partition = parsed.partitions[0];
+    const partition = try findEspPartition(parsed.partitions);
     var esp = try miz.fat32.open(&image, io, .{
         .offset = partition.first_lba * miz.gpt.sector_size,
         .length = (partition.last_lba - partition.first_lba + 1) *
@@ -790,12 +992,7 @@ fn createTamperedOverlay(
     defer image.close(io);
     const parsed = try miz.gpt.readGpt(image, io, allocator);
     defer allocator.free(parsed.partitions);
-    if (parsed.partitions.len < 1 or
-        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &miz.guid.esp))
-    {
-        return error.MissingEspPartition;
-    }
-    const partition = parsed.partitions[0];
+    const partition = try findEspPartition(parsed.partitions);
     var esp = try miz.fat32.open(&image, io, .{
         .offset = partition.first_lba * miz.gpt.sector_size,
         .length = (partition.last_lba - partition.first_lba + 1) *
@@ -893,47 +1090,13 @@ fn validateFinalizedImage(
 
     const parsed = try miz.gpt.readGpt(image, io, allocator);
     defer allocator.free(parsed.partitions);
-    if (parsed.partitions.len != 2) return error.UnexpectedPartitionCount;
-    const esp_partition = parsed.partitions[0];
-    const root_partition = parsed.partitions[1];
-    if (!std.mem.eql(u8, &esp_partition.partition_type_guid, &miz.guid.esp))
-        return error.UnexpectedEspPartition;
-    if (!std.mem.eql(u8, &root_partition.partition_type_guid, &candidate.architecture.rootGuid()))
-        return error.UnexpectedRootArchitecture;
-    const esp_size = (esp_partition.last_lba - esp_partition.first_lba + 1) *
-        miz.gpt.sector_size;
-    if (esp_size != 512 * 1024 * 1024)
-        return error.UnexpectedEspSize;
-    if (esp_partition.first_lba % (1024 * 1024 / miz.gpt.sector_size) != 0)
-        return error.UnexpectedEspAlignment;
-    if (root_partition.first_lba != esp_partition.last_lba + 1 or
-        root_partition.last_lba < root_partition.first_lba)
-        return error.InvalidRootPartition;
-    const requests = [_]miz.layout.PartitionRequest{
-        .{ .name = "ESP", .role = .esp, .filesystem = .fat32, .size = .{ .fixed = 512 * 1024 * 1024 } },
-        .{
-            .name = "root",
-            .role = candidate.architecture.rootRole(),
-            .filesystem = .ext4,
-            .size = .{ .percent = 100.0 },
-        },
-    };
-    const expected_layout = try miz.layout.planLayout(
-        allocator,
-        image.virtual_size,
-        &requests,
-        null,
+    const preserved = try validatePreservedPartitions(
+        parsed.partitions,
+        candidate.architecture,
+        parsed.header.last_usable_lba,
     );
-    defer allocator.free(expected_layout);
-    if (esp_partition.first_lba != expected_layout[0].firstLba() or
-        esp_partition.last_lba != expected_layout[0].lastLba() or
-        root_partition.first_lba != expected_layout[1].firstLba() or
-        root_partition.last_lba != expected_layout[1].lastLba())
-    {
-        return error.InvalidRootPartition;
-    }
-    if (std.mem.eql(u8, &root_partition.unique_partition_guid, &miz.guid.nil))
-        return error.InvalidRootPartitionGuid;
+    const esp_partition = preserved.esp;
+    const root_partition = preserved.root;
 
     var esp = try miz.fat32.open(&image, io, .{
         .offset = esp_partition.first_lba * miz.gpt.sector_size,
@@ -2710,8 +2873,15 @@ fn verifyRootGrowth(
     io: Io,
     ssh_path: []const u8,
     instance: *const Instance,
-    original_size: u64,
+    candidate: Candidate,
 ) !void {
+    const original_size = candidate.expectedVirtualSize();
+    const original_root_size = try expectedOriginalRootSize(candidate);
+    const minimum_grown_root_size = try std.math.add(
+        u64,
+        original_root_size,
+        gib,
+    );
     const command = try std.fmt.allocPrint(
         allocator,
         \\set -eu
@@ -2722,7 +2892,7 @@ fn verifyRootGrowth(
         \\test "$(sudo -n blockdev --getsize64 "$root_source")" -gt {d}
         \\
     ,
-        .{ original_size, original_size + 1024 * 1024 * 1024 },
+        .{ original_size, minimum_grown_root_size },
     );
     defer allocator.free(command);
     if (!try sshSucceeded(allocator, io, ssh_path, instance, command))
@@ -2889,6 +3059,243 @@ fn writeAcceptanceResult(
     }
 }
 
+fn partitionFixture(
+    table_index: u32,
+    partition_type_guid: miz.guid.Guid,
+    unique_partition_guid: miz.guid.Guid,
+    first_lba: u64,
+    last_lba: u64,
+    name: []const u8,
+) miz.gpt.PartitionEntry {
+    var partition: miz.gpt.PartitionEntry = .{
+        .table_index = table_index,
+        .partition_type_guid = partition_type_guid,
+        .unique_partition_guid = unique_partition_guid,
+        .first_lba = first_lba,
+        .last_lba = last_lba,
+    };
+    for (name, 0..) |byte, index| {
+        partition.name_utf16le[index] = byte;
+    }
+    return partition;
+}
+
+test "Ubuntu 26.04 acceptance validates preserved architecture-specific GPT substrates" {
+    const last_usable_lba: u64 = 10_485_726;
+    const x86_64_partitions = [_]miz.gpt.PartitionEntry{
+        partitionFixture(
+            0,
+            miz.guid.linux_root_x86_64,
+            miz.guid.parse("11111111-1111-1111-1111-111111111111"),
+            2_324_480,
+            last_usable_lba,
+            "cloudimg-rootfs",
+        ),
+        partitionFixture(
+            12,
+            miz.guid.linux_xbootldr,
+            miz.guid.parse("22222222-2222-2222-2222-222222222222"),
+            2_048,
+            2_097_152,
+            "",
+        ),
+        partitionFixture(
+            13,
+            miz.guid.bios_boot,
+            miz.guid.parse("33333333-3333-3333-3333-333333333333"),
+            2_099_200,
+            2_107_391,
+            "",
+        ),
+        partitionFixture(
+            14,
+            miz.guid.esp,
+            miz.guid.parse("44444444-4444-4444-4444-444444444444"),
+            2_107_392,
+            2_324_479,
+            "",
+        ),
+    };
+    const x86_64 = try validatePreservedPartitions(
+        &x86_64_partitions,
+        .x86_64,
+        last_usable_lba,
+    );
+    try std.testing.expectEqual(@as(u32, 0), x86_64.root.table_index);
+    try std.testing.expectEqual(@as(u32, 12), x86_64.xbootldr.table_index);
+    try std.testing.expectEqual(@as(u32, 13), x86_64.bios_boot.?.table_index);
+    try std.testing.expectEqual(@as(u32, 14), x86_64.esp.table_index);
+
+    const aarch64_partitions = [_]miz.gpt.PartitionEntry{
+        partitionFixture(
+            0,
+            miz.guid.linux_root_aarch64,
+            miz.guid.parse("55555555-5555-5555-5555-555555555555"),
+            2_099_200,
+            last_usable_lba,
+            "cloudimg-rootfs",
+        ),
+        partitionFixture(
+            12,
+            miz.guid.linux_xbootldr,
+            miz.guid.parse("66666666-6666-6666-6666-666666666666"),
+            206_848,
+            2_097_152,
+            "",
+        ),
+        partitionFixture(
+            14,
+            miz.guid.esp,
+            miz.guid.parse("77777777-7777-7777-7777-777777777777"),
+            2_048,
+            204_800,
+            "",
+        ),
+    };
+    const aarch64 = try validatePreservedPartitions(
+        &aarch64_partitions,
+        .aarch64,
+        last_usable_lba,
+    );
+    try std.testing.expectEqual(@as(u32, 0), aarch64.root.table_index);
+    try std.testing.expectEqual(@as(u32, 12), aarch64.xbootldr.table_index);
+    try std.testing.expect(aarch64.bios_boot == null);
+    try std.testing.expectEqual(@as(u32, 14), aarch64.esp.table_index);
+}
+
+test "Ubuntu 26.04 acceptance rejects synthetic or changed GPT substrates" {
+    const last_usable_lba: u64 = 10_485_726;
+    var partitions = [_]miz.gpt.PartitionEntry{
+        partitionFixture(
+            0,
+            miz.guid.linux_root_x86_64,
+            miz.guid.parse("11111111-1111-1111-1111-111111111111"),
+            2_324_480,
+            last_usable_lba,
+            "cloudimg-rootfs",
+        ),
+        partitionFixture(
+            12,
+            miz.guid.linux_xbootldr,
+            miz.guid.parse("22222222-2222-2222-2222-222222222222"),
+            2_048,
+            2_097_152,
+            "",
+        ),
+        partitionFixture(
+            13,
+            miz.guid.bios_boot,
+            miz.guid.parse("33333333-3333-3333-3333-333333333333"),
+            2_099_200,
+            2_107_391,
+            "",
+        ),
+        partitionFixture(
+            14,
+            miz.guid.esp,
+            miz.guid.parse("44444444-4444-4444-4444-444444444444"),
+            2_107_392,
+            2_324_479,
+            "",
+        ),
+    };
+    try std.testing.expectError(
+        error.UnexpectedPartitionCount,
+        validatePreservedPartitions(
+            &.{ partitions[0], partitions[3] },
+            .x86_64,
+            last_usable_lba,
+        ),
+    );
+
+    partitions[0].partition_type_guid = miz.guid.linux_root_aarch64;
+    try std.testing.expectError(
+        error.UnexpectedRootArchitecture,
+        validatePreservedPartitions(
+            &partitions,
+            .x86_64,
+            last_usable_lba,
+        ),
+    );
+    partitions[0].partition_type_guid = miz.guid.linux_root_x86_64;
+
+    partitions[1].name_utf16le[0] = 'x';
+    try std.testing.expectError(
+        error.UnexpectedAuxiliaryPartitionName,
+        validatePreservedPartitions(
+            &partitions,
+            .x86_64,
+            last_usable_lba,
+        ),
+    );
+    partitions[1].name_utf16le[0] = 0;
+
+    partitions[3].unique_partition_guid = partitions[2].unique_partition_guid;
+    try std.testing.expectError(
+        error.DuplicatePartitionGuid,
+        validatePreservedPartitions(
+            &partitions,
+            .x86_64,
+            last_usable_lba,
+        ),
+    );
+    partitions[3].unique_partition_guid =
+        miz.guid.parse("44444444-4444-4444-4444-444444444444");
+
+    partitions[3].last_lba -= 1;
+    try std.testing.expectError(
+        error.UnexpectedEspGeometry,
+        validatePreservedPartitions(
+            &partitions,
+            .x86_64,
+            last_usable_lba,
+        ),
+    );
+
+    const aarch64_with_bios = [_]miz.gpt.PartitionEntry{
+        partitionFixture(
+            0,
+            miz.guid.linux_root_aarch64,
+            miz.guid.parse("55555555-5555-5555-5555-555555555555"),
+            2_099_200,
+            last_usable_lba,
+            "cloudimg-rootfs",
+        ),
+        partitionFixture(
+            12,
+            miz.guid.linux_xbootldr,
+            miz.guid.parse("66666666-6666-6666-6666-666666666666"),
+            206_848,
+            2_097_152,
+            "",
+        ),
+        partitionFixture(
+            13,
+            miz.guid.bios_boot,
+            miz.guid.parse("77777777-7777-7777-7777-777777777777"),
+            204_801,
+            206_847,
+            "",
+        ),
+        partitionFixture(
+            14,
+            miz.guid.esp,
+            miz.guid.parse("88888888-8888-8888-8888-888888888888"),
+            2_048,
+            204_800,
+            "",
+        ),
+    };
+    try std.testing.expectError(
+        error.UnexpectedBiosBootPartition,
+        validatePreservedPartitions(
+            &aarch64_with_bios,
+            .aarch64,
+            last_usable_lba,
+        ),
+    );
+}
+
 test "Ubuntu 26.04 acceptance candidate names are exact" {
     try std.testing.expectEqualStrings(
         "Ubuntu-26.04-x86_64.qcow2",
@@ -2905,6 +3312,37 @@ test "Ubuntu 26.04 acceptance candidate names are exact" {
     try std.testing.expectEqualStrings(
         "Ubuntu-26.04-aarch64.core.qcow2",
         (Candidate{ .architecture = .aarch64, .flavor = .core }).expectedFileName(),
+    );
+}
+
+test "Ubuntu 26.04 acceptance derives original root size from preserved GPT geometry" {
+    try std.testing.expectEqual(
+        @as(u64, 4_178_558_464),
+        try expectedOriginalRootSize(.{
+            .architecture = .x86_64,
+            .flavor = .full,
+        }),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 4_293_901_824),
+        try expectedOriginalRootSize(.{
+            .architecture = .aarch64,
+            .flavor = .full,
+        }),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 2_567_945_728),
+        try expectedOriginalRootSize(.{
+            .architecture = .x86_64,
+            .flavor = .core,
+        }),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 2_683_289_088),
+        try expectedOriginalRootSize(.{
+            .architecture = .aarch64,
+            .flavor = .core,
+        }),
     );
 }
 
@@ -3566,8 +4004,8 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
     try verifyKeyOnlySsh(allocator, io, ssh_path, &second);
     try verifyFlavorRuntime(allocator, io, ssh_path, candidate, &first);
     try verifyFlavorRuntime(allocator, io, ssh_path, candidate, &second);
-    try verifyRootGrowth(allocator, io, ssh_path, &first, candidate.expectedVirtualSize());
-    try verifyRootGrowth(allocator, io, ssh_path, &second, candidate.expectedVirtualSize());
+    try verifyRootGrowth(allocator, io, ssh_path, &first, candidate);
+    try verifyRootGrowth(allocator, io, ssh_path, &second, candidate);
     try verifyGuestSecureBoot(
         allocator,
         io,
