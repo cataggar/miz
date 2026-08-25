@@ -451,6 +451,10 @@ jobs:
           uefi_code=/usr/share/OVMF/OVMF_CODE_4M.ms.fd
           uefi_vars=/usr/share/OVMF/OVMF_VARS_4M.ms.fd
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
+          uefi_code=$(readlink -f -- "$uefi_code")
+          uefi_vars=$(readlink -f -- "$uefi_vars")
+          test -f "$uefi_code"
+          test -f "$uefi_vars"
           test -r "$uefi_code"
           test -r "$uefi_vars"
           {
