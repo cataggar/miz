@@ -154,7 +154,7 @@ pub const DeviceWriteOptions = struct {
     /// holder, and running-root refusals are never relaxed.
     force: bool = false,
     /// Require an exact match against the opened destination's whole-disk
-    /// serial as reported by sysfs.
+    /// serial as reported by sysfs. Surrounding ASCII whitespace is ignored.
     expected_serial: ?[]const u8 = null,
     /// Owns the preflight report attached to the returned `Image`.
     allocator: std.mem.Allocator = std.heap.page_allocator,
@@ -289,14 +289,19 @@ fn optionalExactEql(a: ?[]const u8, b: ?[]const u8) bool {
     return b == null;
 }
 
+fn normalizeExpectedSerial(expected_serial: ?[]const u8) block_device.PreflightError!?[]const u8 {
+    const expected = expected_serial orelse return null;
+    const normalized = std.mem.trim(u8, expected, " \t\r\n");
+    if (normalized.len == 0) return error.InvalidExpectedDeviceSerial;
+    return @as(?[]const u8, normalized);
+}
+
 fn verifyDeviceIdentity(
     prepared: DeviceVerificationIdentity,
     writable: DeviceVerificationIdentity,
     expected_serial: ?[]const u8,
 ) block_device.PreflightError!void {
-    if (expected_serial) |expected| {
-        if (expected.len == 0) return error.InvalidExpectedDeviceSerial;
-    }
+    const normalized_expected = try normalizeExpectedSerial(expected_serial);
     if (!writable.number.eql(prepared.number) or
         writable.geometry.size_bytes != prepared.geometry.size_bytes or
         writable.geometry.logical_sector_size != prepared.geometry.logical_sector_size or
@@ -306,11 +311,41 @@ fn verifyDeviceIdentity(
     {
         return error.BlockDeviceChangedDuringOpen;
     }
-    if (expected_serial) |expected| {
+    if (normalized_expected) |expected| {
         const serial = writable.whole_disk_serial orelse
             return error.DeviceSerialUnavailable;
         if (!std.mem.eql(u8, serial, expected)) return error.DeviceSerialMismatch;
     }
+}
+
+fn verifyDeviceIdentityFromSysfs(
+    allocator: std.mem.Allocator,
+    io: Io,
+    class_block_dir: Io.Dir,
+    prepared: DeviceVerificationIdentity,
+    writable_number: block_device.DeviceNumber,
+    writable_geometry: block_device.Geometry,
+    expected_serial: ?[]const u8,
+) block_device.PreflightError!void {
+    var identity = try block_device.resolveSysfsIdentity(
+        allocator,
+        io,
+        class_block_dir,
+        writable_number,
+    );
+    defer identity.deinit(allocator);
+
+    return verifyDeviceIdentity(
+        prepared,
+        .{
+            .number = writable_number,
+            .geometry = writable_geometry,
+            .target_name = identity.target_name,
+            .whole_disk_name = identity.whole_disk_name,
+            .whole_disk_serial = identity.whole_disk_serial,
+        },
+        expected_serial,
+    );
 }
 
 fn verifyPreparedDevice(
@@ -327,15 +362,11 @@ fn verifyPreparedDevice(
     var class_block_dir = Io.Dir.openDirAbsolute(io, "/sys/class/block", .{ .iterate = true }) catch
         return error.BlockDeviceSysfsUnavailable;
     defer class_block_dir.close(io);
-    var identity = try block_device.resolveSysfsIdentity(
+
+    return verifyDeviceIdentityFromSysfs(
         prepared.allocator,
         io,
         class_block_dir,
-        number,
-    );
-    defer identity.deinit(prepared.allocator);
-
-    return verifyDeviceIdentity(
         .{
             .number = prepared.number,
             .geometry = prepared.geometry,
@@ -343,13 +374,8 @@ fn verifyPreparedDevice(
             .whole_disk_name = prepared.report.whole_disk_name,
             .whole_disk_serial = prepared.report.whole_disk_serial,
         },
-        .{
-            .number = number,
-            .geometry = geometry,
-            .target_name = identity.target_name,
-            .whole_disk_name = identity.whole_disk_name,
-            .whole_disk_serial = identity.whole_disk_serial,
-        },
+        number,
+        geometry,
         expected_serial,
     );
 }
@@ -447,9 +473,7 @@ pub const Image = struct {
         options: DeviceWriteOptions,
     ) OpenDeviceForWriteError!Image {
         if (!options.allow_device_write) return error.BlockDeviceWriteNotPermitted;
-        if (options.expected_serial) |expected| {
-            if (expected.len == 0) return error.InvalidExpectedDeviceSerial;
-        }
+        const expected_serial = try normalizeExpectedSerial(options.expected_serial);
 
         // Refuse ordinary paths before opening anything writable. The opened
         // handle is checked again below so a path replacement cannot turn
@@ -473,7 +497,7 @@ pub const Image = struct {
 
         const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
         errdefer file.close(io);
-        try verifyPreparedDevice(io, file, prepared, options.expected_serial);
+        try verifyPreparedDevice(io, file, prepared, expected_serial);
 
         var image = try deviceWriteImage(
             file,
@@ -2167,6 +2191,7 @@ test "writable device serial verification is exact and optional" {
     };
 
     try verifyDeviceIdentity(base, base, "SERIAL-001");
+    try verifyDeviceIdentity(base, base, " \tSERIAL-001\r\n");
     try std.testing.expectError(
         error.DeviceSerialMismatch,
         verifyDeviceIdentity(base, base, "serial-001"),
@@ -2175,6 +2200,10 @@ test "writable device serial verification is exact and optional" {
         error.InvalidExpectedDeviceSerial,
         verifyDeviceIdentity(base, base, ""),
     );
+    try std.testing.expectError(
+        error.InvalidExpectedDeviceSerial,
+        verifyDeviceIdentity(base, base, " \t\r\n"),
+    );
 
     var without_serial = base;
     without_serial.whole_disk_serial = null;
@@ -2182,6 +2211,83 @@ test "writable device serial verification is exact and optional" {
     try std.testing.expectError(
         error.DeviceSerialUnavailable,
         verifyDeviceIdentity(without_serial, without_serial, "SERIAL-001"),
+    );
+}
+
+test "writable verification resolves virtio serial through injected sysfs" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "class_block");
+    try tmp.dir.createDirPath(io, "devices/pci/virtio0/block/vda");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "devices/pci/virtio0/block/vda/dev",
+        .data = "252:0\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "devices/pci/virtio0/block/vda/serial",
+        .data = " VIRTIO-SERIAL-001 \n",
+    });
+    try tmp.dir.symLink(
+        io,
+        "../devices/pci/virtio0/block/vda",
+        "class_block/vda",
+        .{},
+    );
+    var class_block_dir = try tmp.dir.openDir(io, "class_block", .{ .iterate = true });
+    defer class_block_dir.close(io);
+
+    const number = block_device.DeviceNumber{ .major = 252, .minor = 0 };
+    const geometry = block_device.Geometry{
+        .size_bytes = 1024 * 1024,
+        .logical_sector_size = 512,
+    };
+    const prepared = DeviceVerificationIdentity{
+        .number = number,
+        .geometry = geometry,
+        .target_name = "vda",
+        .whole_disk_name = "vda",
+        .whole_disk_serial = "VIRTIO-SERIAL-001",
+    };
+
+    try verifyDeviceIdentityFromSysfs(
+        allocator,
+        io,
+        class_block_dir,
+        prepared,
+        number,
+        geometry,
+        " VIRTIO-SERIAL-001 ",
+    );
+    try std.testing.expectError(
+        error.DeviceSerialMismatch,
+        verifyDeviceIdentityFromSysfs(
+            allocator,
+            io,
+            class_block_dir,
+            prepared,
+            number,
+            geometry,
+            "OTHER-SERIAL",
+        ),
+    );
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "devices/pci/virtio0/block/vda/serial",
+        .data = "REPLACEMENT-SERIAL\n",
+    });
+    try std.testing.expectError(
+        error.BlockDeviceChangedDuringOpen,
+        verifyDeviceIdentityFromSysfs(
+            allocator,
+            io,
+            class_block_dir,
+            prepared,
+            number,
+            geometry,
+            null,
+        ),
     );
 }
 

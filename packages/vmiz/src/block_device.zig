@@ -562,14 +562,15 @@ fn wholeDiskNameAlloc(
     return allocator.dupe(u8, try parentDiskName(io, class_block_dir, device_name, &link_buf));
 }
 
-fn wholeDiskSerialAlloc(
+fn serialAtSysfsLeafAlloc(
     allocator: std.mem.Allocator,
     io: Io,
     class_block_dir: Io.Dir,
     whole_disk_name: []const u8,
+    leaf: []const u8,
 ) PreflightError!?[]u8 {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try sysfsPath(&path_buf, whole_disk_name, "device/serial");
+    const path = try sysfsPath(&path_buf, whole_disk_name, leaf);
     const file = class_block_dir.openFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return error.InvalidBlockDeviceSysfs,
@@ -583,6 +584,30 @@ fn wholeDiskSerialAlloc(
     const serial = std.mem.trim(u8, serial_buf[0..n], " \t\r\n");
     if (serial.len == 0) return null;
     return @as(?[]u8, try allocator.dupe(u8, serial));
+}
+
+fn wholeDiskSerialAlloc(
+    allocator: std.mem.Allocator,
+    io: Io,
+    class_block_dir: Io.Dir,
+    whole_disk_name: []const u8,
+) PreflightError!?[]u8 {
+    if (try serialAtSysfsLeafAlloc(
+        allocator,
+        io,
+        class_block_dir,
+        whole_disk_name,
+        "serial",
+    )) |serial| {
+        return serial;
+    }
+    return serialAtSysfsLeafAlloc(
+        allocator,
+        io,
+        class_block_dir,
+        whole_disk_name,
+        "device/serial",
+    );
 }
 
 pub const SysfsDeviceIdentity = struct {
@@ -1625,6 +1650,22 @@ fn addTestSysfsSerial(
     try root.writeFile(io, .{ .sub_path = serial_path, .data = serial });
 }
 
+fn addTestSysfsDirectSerial(
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: Io.Dir,
+    relative_device_path: []const u8,
+    serial: []const u8,
+) !void {
+    const serial_path = try std.fmt.allocPrint(
+        allocator,
+        "devices/{s}/serial",
+        .{relative_device_path},
+    );
+    defer allocator.free(serial_path);
+    try root.writeFile(io, .{ .sub_path = serial_path, .data = serial });
+}
+
 fn createTestTree(io: Io, root: Io.Dir) !Io.Dir {
     try root.createDirPath(io, "class_block");
     return root.openDir(io, "class_block", .{ .iterate = true });
@@ -1895,7 +1936,7 @@ test "sysfs identity reads a partition's whole disk serial" {
     try std.testing.expectEqualStrings("DISK-SERIAL", identity.whole_disk_serial.?);
 }
 
-test "sysfs identity permits devices without serials" {
+test "sysfs identity prefers virtio's direct whole disk serial" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1906,23 +1947,81 @@ test "sysfs identity permits devices without serials" {
         allocator,
         io,
         tmp.dir,
-        "dm-0",
-        "virtual/block/dm-0",
-        .{ .major = 253, .minor = 0 },
+        "vda",
+        "pci/virtio0/block/vda",
+        .{ .major = 252, .minor = 0 },
         null,
         false,
         &.{},
         &.{},
+    );
+    try addTestSysfsDirectSerial(
+        allocator,
+        io,
+        tmp.dir,
+        "pci/virtio0/block/vda",
+        "  VIRTIO-SERIAL-001 \n",
+    );
+    try addTestSysfsSerial(
+        allocator,
+        io,
+        tmp.dir,
+        "pci/virtio0/block/vda",
+        "FALLBACK-SERIAL\n",
     );
 
     var identity = try resolveSysfsIdentity(
         allocator,
         io,
         class_block_dir,
-        .{ .major = 253, .minor = 0 },
+        .{ .major = 252, .minor = 0 },
     );
     defer identity.deinit(allocator);
-    try std.testing.expect(identity.whole_disk_serial == null);
+    try std.testing.expectEqualStrings("vda", identity.target_name);
+    try std.testing.expectEqualStrings("VIRTIO-SERIAL-001", identity.whole_disk_serial.?);
+}
+
+test "sysfs identity permits loop md and device-mapper without serials" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var class_block_dir = try createTestTree(io, tmp.dir);
+    defer class_block_dir.close(io);
+    const cases = [_]struct {
+        name: []const u8,
+        path: []const u8,
+        number: DeviceNumber,
+    }{
+        .{ .name = "loop0", .path = "virtual/block/loop0", .number = .{ .major = 7, .minor = 0 } },
+        .{ .name = "md0", .path = "virtual/block/md0", .number = .{ .major = 9, .minor = 0 } },
+        .{ .name = "dm-0", .path = "virtual/block/dm-0", .number = .{ .major = 253, .minor = 0 } },
+    };
+    for (cases) |case| {
+        try addTestSysfsDevice(
+            allocator,
+            io,
+            tmp.dir,
+            case.name,
+            case.path,
+            case.number,
+            null,
+            false,
+            &.{},
+            &.{},
+        );
+    }
+    for (cases) |case| {
+        var identity = try resolveSysfsIdentity(
+            allocator,
+            io,
+            class_block_dir,
+            case.number,
+        );
+        defer identity.deinit(allocator);
+        try std.testing.expectEqualStrings(case.name, identity.target_name);
+        try std.testing.expect(identity.whole_disk_serial == null);
+    }
 }
 
 test "preflight rejects holders on a child partition" {

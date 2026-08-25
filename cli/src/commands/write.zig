@@ -17,7 +17,8 @@ const help_text =
     \\                        in a raw source to fill the destination.
     \\  --expect-serial <serial>
     \\                        Require an exact match against the writable
-    \\                        destination's whole-disk sysfs serial.
+    \\                        destination's whole-disk sysfs serial after
+    \\                        trimming surrounding whitespace.
     \\
     \\The command checks the target while it is read-only, refuses a target
     \\that is too small or in use, writes zero regions explicitly, flushes the
@@ -166,13 +167,20 @@ fn runWithOperations(
             grow_root = true;
         } else if (std.mem.eql(u8, arg, "--expect-serial")) {
             arg_index += 1;
-            if (arg_index >= args.len or args[arg_index].len == 0) {
+            if (arg_index >= args.len) {
                 return fail(
                     "write: --expect-serial requires a non-empty value\n\n{s}",
                     .{help_text},
                 );
             }
-            expected_serial = args[arg_index];
+            const normalized = std.mem.trim(u8, args[arg_index], " \t\r\n");
+            if (normalized.len == 0) {
+                return fail(
+                    "write: --expect-serial requires a non-empty value\n\n{s}",
+                    .{help_text},
+                );
+            }
+            expected_serial = normalized;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print("{s}", .{help_text});
             return 0;
@@ -1621,6 +1629,15 @@ test "write requires explicit device-write opt-in before opening anything" {
             fake.operations(),
         ),
     );
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        runWithOperations(
+            std.testing.allocator,
+            std.testing.io,
+            &.{ "--allow-device-write", "--expect-serial", " \t\r\n" },
+            fake.operations(),
+        ),
+    );
     try std.testing.expectEqual(@as(usize, 0), fake.open_calls);
 }
 
@@ -1668,7 +1685,7 @@ test "write passes expect-serial to the writable destination open" {
                 "--allow-device-write",
                 "--yes",
                 "--expect-serial",
-                "SERIAL-001",
+                " \tSERIAL-001\r\n",
                 source,
                 target,
             },

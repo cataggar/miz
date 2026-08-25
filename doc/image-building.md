@@ -90,12 +90,13 @@ clearly reports that no serial is available). `--expect-serial <serial>`
 requires an exact match after the destination is opened writable and before
 any invalidation or copy. Identity is resolved from the opened descriptor's
 major/minor through sysfs; partition destinations use their containing whole
-disk's serial. Devices without serials remain writable when the option is not
-used. The command writes source zero regions explicitly, flushes the device,
-and uses the native Linux partition-table refresh ioctl. A refresh failure is
-reported as partial success with exit status 2 because the bytes are durable
-but the kernel view is stale. `vmiz convert` and `Image.create` continue to
-refuse device destinations.
+disk's serial, whether exposed as `serial` (for example virtio-blk) or
+`device/serial` (for example NVMe/SCSI). Devices without serials remain
+writable when the option is not used. The command writes source zero regions
+explicitly, flushes the device, and uses the native Linux partition-table
+refresh ioctl. A refresh failure is reported as partial success with exit
+status 2 because the bytes are durable but the kernel view is stale.
+`vmiz convert` and `Image.create` continue to refuse device destinations.
 
 With `--grow-root`, `vmiz write` additionally requires a strictly valid GPT
 raw source with exactly one supported ext4 root partition, and requires that
