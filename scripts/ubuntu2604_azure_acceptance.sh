@@ -119,7 +119,7 @@ if [[ "$FLAVOR" == core ]]; then
   # required, digest-bound external inputs supplied at acceptance time. A
   # missing input fails closed here, before any Azure resource is created,
   # rather than silently skipping the Android container smoke contract.
-  if [[ -z ${MIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT:-} ||
+  if [[ -z ${MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256:-} ||
         -z ${MIZ_UBUNTU2604_ANDROID_RUNTIME:-} ||
         -z ${MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256:-} ||
         -z ${MIZ_UBUNTU2604_ANDROID_BUNDLE:-} ||
@@ -128,7 +128,7 @@ if [[ "$FLAVOR" == core ]]; then
     echo "::error::Core Azure acceptance requires digest-bound external Android container smoke inputs"
     exit 1
   fi
-  [[ "$MIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+  [[ "$MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256" =~ ^[0-9a-f]{64}$ ]]
   [[ "$MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256" =~ ^[0-9a-f]{64}$ ]]
   [[ "$MIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
   [[ "$MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]]
@@ -1291,7 +1291,7 @@ sudo -n mkdir -p -- "$dir"
 sudo -n tar -xf "$archive" -C "$dir"
 GUEST
 
-  android_config_json_file="$RESULT_DIR/android-bundle-config.json"
+  android_config_json_file="$(dirname "$MIZ_UBUNTU2604_ANDROID_BUNDLE")/guest-config.json"
   ssh "${ssh_options[@]}" "$ssh_target" \
     "sudo -n cat -- '$android_bundle_remote_dir/config.json'" \
     >"$android_config_json_file"
@@ -1491,7 +1491,7 @@ fi
 android_smoke_args=()
 if [[ "$FLAVOR" == core ]]; then
   android_smoke_args=(
-    --android-smoke-source-commit "$MIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT"
+    --android-smoke-provenance-sha256 "$MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256"
     --android-smoke-runtime-sha256 "$android_runtime_sha256"
     --android-smoke-bundle-sha256 "$android_bundle_sha256"
     --android-smoke-config-sha256 "$MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256"
@@ -1536,9 +1536,10 @@ test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
   echo "- Flavor: \`$FLAVOR\`"
   if [[ "$FLAVOR" == core ]]; then
     echo "- Binder device probe SHA-256: \`$binder_probe_sha256\`"
-    echo "- Android container smoke: runtime SHA-256 \`$android_runtime_sha256\`;" \
+    echo "- Android container smoke: provenance SHA-256 \`$MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256\`;" \
+      "runtime SHA-256 \`$android_runtime_sha256\`;" \
       "bundle SHA-256 \`$android_bundle_sha256\`;" \
-      "source commit \`$MIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT\`"
+      "config SHA-256 \`$MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256\`"
   fi
   echo "- Contracts: \`$azure_contract_list\`"
 } >>"$GITHUB_STEP_SUMMARY"

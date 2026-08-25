@@ -171,10 +171,10 @@ const core_policy: FlavorPolicy = .{
     .x86_64_file_name = "Ubuntu-26.04-x86_64.core.qcow2",
     .aarch64_file_name = "Ubuntu-26.04-aarch64.core.qcow2",
     .virtual_size = 3584 * mib,
-    // Bumped from 3 so that a result recorded before the Android container
-    // boot-completion smoke contracts existed can never satisfy the current
-    // core contract set.
-    .result_schema = 4,
+    // Bumped from 4 so that a result binding a private producer identity
+    // instead of the complete provenance-manifest digest can never satisfy
+    // the current core contract set.
+    .result_schema = 5,
     .contracts = &core_contracts,
 };
 
@@ -1889,7 +1889,7 @@ const android_smoke_delete_command = "sudo -n '" ++ android_smoke_runtime_remote
 /// other required acceptance inputs, so this contract fails closed with a
 /// clear error rather than silently skipping when the artifacts are absent.
 const AndroidSmokeInputs = struct {
-    source_commit: []u8,
+    provenance_sha256: miz.artifact_pipeline.Digest,
     runtime_path: []u8,
     runtime_sha256: miz.artifact_pipeline.Digest,
     bundle_path: []u8,
@@ -1897,27 +1897,20 @@ const AndroidSmokeInputs = struct {
     config_sha256: miz.artifact_pipeline.Digest,
 
     fn deinit(self: *AndroidSmokeInputs, allocator: Allocator) void {
-        allocator.free(self.source_commit);
         allocator.free(self.runtime_path);
         allocator.free(self.bundle_path);
         self.* = undefined;
     }
 };
 
-fn isLowerHexDigit(value: u8) bool {
-    return (value >= '0' and value <= '9') or (value >= 'a' and value <= 'f');
-}
-
 fn requireAndroidSmokeInputsAlloc(allocator: Allocator) !AndroidSmokeInputs {
-    const source_commit = try requireEnvAlloc(
+    const provenance_sha256_text = try requireEnvAlloc(
         allocator,
-        "MIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT",
+        "MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256",
     );
-    errdefer allocator.free(source_commit);
-    if (source_commit.len != 40) return error.InvalidAndroidSmokeSourceCommit;
-    for (source_commit) |c| {
-        if (!isLowerHexDigit(c)) return error.InvalidAndroidSmokeSourceCommit;
-    }
+    defer allocator.free(provenance_sha256_text);
+    const provenance_sha256 = miz.artifact_pipeline.parseSha256(provenance_sha256_text) catch
+        return error.InvalidAndroidSmokeDigest;
 
     const runtime_path = try requireEnvAlloc(allocator, "MIZ_UBUNTU2604_ANDROID_RUNTIME");
     errdefer allocator.free(runtime_path);
@@ -1948,7 +1941,7 @@ fn requireAndroidSmokeInputsAlloc(allocator: Allocator) !AndroidSmokeInputs {
         return error.InvalidAndroidSmokeDigest;
 
     return .{
-        .source_commit = source_commit,
+        .provenance_sha256 = provenance_sha256,
         .runtime_path = runtime_path,
         .runtime_sha256 = runtime_sha256,
         .bundle_path = bundle_path,
@@ -2859,6 +2852,7 @@ fn writeAcceptanceResult(
         },
         .core => {
             const smoke = android_smoke orelse return error.MissingAndroidSmokeProvenance;
+            const provenance_sha256_hex = miz.artifact_pipeline.formatSha256(smoke.provenance_sha256);
             const runtime_sha256_hex = miz.artifact_pipeline.formatSha256(smoke.runtime_sha256);
             const bundle_sha256_hex = miz.artifact_pipeline.formatSha256(smoke.bundle_sha256);
             const config_sha256_hex = miz.artifact_pipeline.formatSha256(smoke.config_sha256);
@@ -2881,7 +2875,7 @@ fn writeAcceptanceResult(
                     .certificate_sha256 = &certificate_sha256_hex,
                     .fallback_uki_sha256 = &uki_sha256_hex,
                     .android_smoke = .{
-                        .source_commit = smoke.source_commit,
+                        .provenance_sha256 = &provenance_sha256_hex,
                         .runtime_sha256 = &runtime_sha256_hex,
                         .bundle_sha256 = &bundle_sha256_hex,
                         .config_sha256 = &config_sha256_hex,
@@ -2921,7 +2915,7 @@ test "Ubuntu 26.04 acceptance flavor policy preserves full and isolates core" {
     try std.testing.expectEqual(@as(u64, 3584 * mib), core.expectedVirtualSize());
     try std.testing.expect(core.expectedVirtualSize() < full.expectedVirtualSize());
     try std.testing.expectEqual(@as(u32, 1), full.flavor.policy().result_schema);
-    try std.testing.expectEqual(@as(u32, 4), core.flavor.policy().result_schema);
+    try std.testing.expectEqual(@as(u32, 5), core.flavor.policy().result_schema);
     try std.testing.expectEqual(@as(usize, 18), full.contracts().len);
     try std.testing.expectEqual(@as(usize, 31), core.contracts().len);
     try std.testing.expect(hasContract(core.contracts(), "mizinit-sshd-supervision"));
