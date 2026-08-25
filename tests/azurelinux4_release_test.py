@@ -969,6 +969,13 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         )
         self.assertEqual(
             workflow.count(
+                "run: zig build test-device-write-integration "
+                "-Doptimize=Debug --summary all"
+            ),
+            1,
+        )
+        self.assertEqual(
+            workflow.count(
                 "run: zig build test-unsafe-chroot-integration "
                 "-Doptimize=Debug --summary all"
             ),

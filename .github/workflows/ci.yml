@@ -120,7 +120,7 @@ jobs:
         run: zig build install-vmiz -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
 
   unsafe-chroot:
-    name: privileged unsafe-chroot integration
+    name: privileged integrations
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -134,6 +134,11 @@ jobs:
           ghr-version: 0.6.6
           tools: |
             cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: privileged device-write integration
+        env:
+          VMIZ_RUN_PRIVILEGED_TEST: "1"
+        run: zig build test-device-write-integration -Doptimize=Debug --summary all
 
       - name: privileged unsafe-chroot integration
         env:

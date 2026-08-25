@@ -1428,9 +1428,18 @@ pub fn findVisibleIdentityCollisions(
         collisions.deinit();
     }
 
+    var scanned_visible_disks: usize = 0;
     for (whole_disks.items.items) |whole_disk_name| {
-        var visible_device = try opener.open_fn(opener.context, io, whole_disk_name);
+        var visible_device = opener.open_fn(
+            opener.context,
+            io,
+            whole_disk_name,
+        ) catch |err| switch (err) {
+            error.EmptyBlockDevice => continue,
+            else => return err,
+        };
         defer visible_device.file.close(io);
+        scanned_visible_disks += 1;
 
         var visible = try inspectFileIdentityInventory(
             allocator,
@@ -1451,7 +1460,7 @@ pub fn findVisibleIdentityCollisions(
 
     return .{
         .collisions = try collisions.toOwnedSlice(),
-        .scanned_visible_disks = whole_disks.items.items.len,
+        .scanned_visible_disks = scanned_visible_disks,
     };
 }
 
@@ -1756,10 +1765,7 @@ const TestVisibleDeviceOpener = struct {
         const stat = file.stat(io) catch return error.VisibleDeviceUnavailable;
         return .{
             .file = file,
-            .geometry = .{
-                .size_bytes = stat.size,
-                .logical_sector_size = 512,
-            },
+            .geometry = try geometryFrom(stat.size, 512),
         };
     }
 };
@@ -2231,7 +2237,7 @@ test "identity inventory recognizes FAT and XFS filesystem identifiers" {
     );
 }
 
-test "visible identity collisions exclude the destination whole-disk hierarchy" {
+test "visible identity collisions exclude the destination and empty media" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2246,6 +2252,18 @@ test "visible identity collisions exclude the destination whole-disk hierarchy" 
         "sdb",
         "pci/host0/target0/block/sdb",
         .{ .major = 8, .minor = 16 },
+        null,
+        false,
+        &.{},
+        &.{},
+    );
+    try addTestSysfsDevice(
+        allocator,
+        io,
+        tmp.dir,
+        "sdd",
+        "virtual/block/sdd",
+        .{ .major = 8, .minor = 48 },
         null,
         false,
         &.{},
@@ -2291,6 +2309,8 @@ test "visible identity collisions exclude the destination whole-disk hierarchy" 
     const visible = try createNamedTestDisk(io, tmp.dir, "dev/sdc", 2 * 1024 * 1024);
     defer visible.close(io);
     try writeTestGpt(io, visible);
+    const empty = try createNamedTestDisk(io, tmp.dir, "dev/sdd", 0);
+    defer empty.close(io);
 
     var source_inventory = try inspectFileIdentityInventory(allocator, io, source, 2 * 1024 * 1024);
     defer source_inventory.deinit(allocator);
