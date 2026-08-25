@@ -148,6 +148,18 @@ class Ubuntu2604CoreWorkflowTests(unittest.TestCase):
         self.assertNotIn("MIZ_VM_ACCEL=software", native)
         self.assertIn("MIZ_UBUNTU2604_UEFI_CODE=", native)
         self.assertIn("MIZ_UBUNTU2604_UEFI_VARS=", native)
+        install = native.index(
+            'sudo apt-get install -y --no-install-recommends "${packages[@]}"'
+        )
+        canonical_code = native.index('uefi_code=$(readlink -f -- "$uefi_code")')
+        canonical_vars = native.index('uefi_vars=$(readlink -f -- "$uefi_vars")')
+        export = native.index('echo "MIZ_UBUNTU2604_UEFI_CODE=$uefi_code"')
+        self.assertLess(install, canonical_code)
+        self.assertLess(canonical_code, export)
+        self.assertLess(install, canonical_vars)
+        self.assertLess(canonical_vars, export)
+        self.assertIn('test -f "$uefi_code"', native)
+        self.assertIn('test -f "$uefi_vars"', native)
         self.assertIn("verify-native-result", native)
         azure = self.job("azure_acceptance", "validate")
         self.assertIn("FLAVOR: core", azure)
