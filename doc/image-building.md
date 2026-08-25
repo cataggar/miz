@@ -47,6 +47,7 @@ vmiz convert -O raw.gz -o - disk.qcow2 - | ssh host 'cat > disk.raw.gz'
 vmiz write --allow-device-write image.qcow2 <block-device>  # Linux: preflight, confirm, write, flush, refresh partitions
 vmiz write --allow-device-write --yes image.vhdx <block-device>  # non-interactive acknowledgement
 vmiz write --allow-device-write --grow-root image.raw <block-device>  # also grow GPT root + ext4 offline
+vmiz write --allow-device-write --yes --new-uuids image.raw <block-device>  # also freshen GPT/FAT/ext4/XFS identities safely
 vmiz write --allow-device-write --expect-serial <serial> image.raw <block-device>  # require the writable disk's exact sysfs serial
 vmiz resize disk.vhdx +4G
 vmiz resize disk.vhd +4G
@@ -98,6 +99,13 @@ refresh ioctl. A refresh failure is reported as partial success with exit
 status 2 because the bytes are durable but the kernel view is stale.
 `vmiz convert` and `Image.create` continue to refuse device destinations.
 
+Before confirmation, `vmiz write` also inventories the source identifiers and,
+by default, refuses any GPT disk GUID, GPT partition GUID, or FAT/ext4/XFS
+filesystem identifier that is already visible on another disk. `--yes` only
+skips the interactive prompt; it does not bypass this collision check.
+`--allow-duplicate-identifiers` is the explicit override when reusing
+identifiers is intentional.
+
 With `--grow-root`, `vmiz write` additionally requires a strictly valid GPT
 raw source with exactly one supported ext4 root partition, and requires that
 partition to be the last partition. Before confirmation it validates the
@@ -105,6 +113,19 @@ destination-sized GPT and ext4 growth plan without writing data. After the
 copy it extends that partition and its filesystem offline using vmiz's native
 writers; the guest does not need `resize2fs`, cloud-init, or a first-boot
 resize service.
+
+With `--new-uuids`, `vmiz write` generates a fresh GPT disk GUID, a fresh GUID
+for every non-empty GPT partition, and fresh FAT/ext4/XFS filesystem
+identities. Before any destination bytes change it validates that the source
+layout is fully supportable, rewrites supported text references under
+`/etc/fstab`, `/etc/default/grub`, `/etc/default/grub.d/`, `/etc/kernel/cmdline`,
+`/boot/grub*`, `/boot/loader*`, and ESP `*.cfg`/`*.conf` files, then verifies
+that the written destination carries the new identifiers and that no retired
+identifier remains in that verification scope. Layouts with unsupported
+signatures/filesystems, separate `/boot` filesystems, stale references outside
+the supported text targets, or identifiers embedded in immutable/signed
+artifacts such as `.efi` binaries are refused before mutation rather than
+silently producing an unbootable device.
 
 OCI ingestion defaults to 64 MiB compressed blobs, 128 MiB decompressed
 layers, and 512 MiB docker/podman save archives. Deliberately larger trusted
