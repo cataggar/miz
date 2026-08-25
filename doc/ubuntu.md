@@ -697,6 +697,15 @@ Secure Boot, signed UKI, vTPM, lockdown, signed modules, rejection of a
 tampered UKI, key-only SSH, cloud-init, WALinuxAgent, netplan/networkd, root
 growth, generalized identity, reboot/reconnect, and clean service health.
 
+The core workflow keeps `x86_64` native acceptance on the `ubuntu-24.04`
+hosted runner. Its `aarch64` leg requires a repository runner matching
+`[self-hosted, Linux, ARM64, kvm]`: a native Ubuntu ARM64 host with
+passwordless `sudo`, the matching Debian architecture, and a usable KVM
+device. The job opens `/dev/kvm` and verifies the KVM API before downloading
+the candidate, then installs `qemu-system-aarch64` and Secure Boot-capable
+AAVMF. It never falls back to TCG. These labels describe a dedicated native
+ARM64 KVM host and do not imply Azure nested virtualization.
+
 The `python3-virt-firmware` package and its `virt-fw-vars` executable are
 firmware-variable tooling, not libguestfs. They remain required solely to
 create per-instance Secure Boot variable stores for QEMU acceptance.
@@ -730,9 +739,9 @@ out-of-tree binder implementation failures; binderfs is mounted with a
 architecture-neutral probe opens each of those devices and performs
 `BINDER_VERSION` to confirm usability rather than only checking paths. These
 contracts bumped the core-only native result schema so an older result cannot
-satisfy them, and they assume the boot-time module autoload, binderfs mount,
-and device creation are provided by the image itself; wiring that into the
-core image build is left to a companion change.
+satisfy them. They require the image itself to provide boot-time module
+autoload, the binderfs mount, and dynamic device creation before acceptance
+starts any workload.
 
 Core Azure acceptance additionally verifies the official in-tree Binder IPC
 module (`binder_linux`) under Secure Boot and lockdown: it must load from
@@ -794,6 +803,11 @@ requires both native-QEMU jobs and both Azure Trusted Launch jobs. Candidate
 reuse accepts only a completed manual run of this same workflow at the exact
 current remote `main` commit and exact run attempt, with both named build jobs
 successful and exactly two nonempty, unexpired candidate artifacts.
+
+The final gate accepts exactly two candidates, two candidate-key-and-digest
+bound native results, and two Azure results. Its validation manifest records
+non-null native-result digests for both `x86_64-core` and `aarch64-core`;
+missing, duplicate, cross-key, or cross-digest evidence fails closed.
 
 The core Azure acceptance jobs also build the Binder device usability probe
 from source for the matching guest architecture before running acceptance,
