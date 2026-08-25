@@ -823,7 +823,7 @@ secrets before acceptance: `ANDROID_SMOKE_X86_64_JSON` or
 `artifact_url`, `artifact_sha256`, and `provenance_sha256`. The location must
 be HTTPS and both digests must be lowercase SHA-256. The complete archive
 digest is verified before extraction. Its ZIP member set must then be
-exactly `runz`, `android-bundle.tar`, and `provenance.json`, with no
+exactly `android-runtime`, `android-bundle.tar`, and `provenance.json`, with no
 directories, links, duplicate or additional entries, traversal names,
 encrypted entries, or non-regular file types.
 

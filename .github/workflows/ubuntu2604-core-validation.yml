@@ -15,7 +15,7 @@
 #   protected-environment gate: ANDROID_SMOKE_X86_64_JSON and
 #   ANDROID_SMOKE_AARCH64_JSON. Each exact JSON document supplies one private
 #   HTTPS archive location plus the expected archive and provenance SHA-256
-#   values for that architecture's external runz and Android bundle inputs.
+#   values for that architecture's external Android runtime and bundle inputs.
 #   An optional ANDROID_ARTIFACT_TOKEN secret is used only for private
 #   downloads. Missing or malformed input fails explicitly rather than
 #   skipping the smoke; only verified local paths and public-safe SHA-256

@@ -83,7 +83,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         self,
         architecture: str = "x86_64",
         *,
-        runz_sha256: str = "1" * 64,
+        runtime_sha256: str = "1" * 64,
         bundle_sha256: str = "2" * 64,
         config_sha256: str = "3" * 64,
     ) -> dict[str, object]:
@@ -96,7 +96,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                 f"registry.example.invalid/android@sha256:{'b' * 64}"
             ),
             "android_manifest_digest": "c" * 64,
-            "runz_sha256": runz_sha256,
+            "runtime_sha256": runtime_sha256,
             "bundle_archive_sha256": bundle_sha256,
             "config_json_sha256": config_sha256,
         }
@@ -148,7 +148,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         self.assertEqual(
             release.parse_android_smoke_provenance(value, "x86_64"),
             {
-                "runz_sha256": "1" * 64,
+                "runtime_sha256": "1" * 64,
                 "bundle_sha256": "2" * 64,
                 "config_sha256": "3" * 64,
             },
@@ -157,7 +157,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             {**value, "schema": 2},
             {**value, "type": "other"},
             {**value, "architecture": "aarch64"},
-            {**value, "runz_sha256": "F" * 64},
+            {**value, "runtime_sha256": "F" * 64},
             {**value, "android_immutable_reference": "mutable:latest"},
             {**value, "android_manifest_digest": "F" * 64},
             {**value, "unexpected": "value"},
@@ -170,8 +170,8 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
     def test_prepare_android_smoke_inputs_verifies_and_exports_only_safe_values(self):
         inputs = self.root / "inputs"
         inputs.mkdir()
-        runz = inputs / "runz"
-        runz.write_bytes(b"runz fixture")
+        runtime = inputs / "android-runtime"
+        runtime.write_bytes(b"runtime fixture")
         config = b'{"mounts":[]}\n'
         bundle = inputs / "android-bundle.tar"
         with tarfile.open(bundle, "w") as archive:
@@ -182,7 +182,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         provenance.write_text(
             json.dumps(
                 self.android_smoke_provenance(
-                    runz_sha256=release.sha256(runz),
+                    runtime_sha256=release.sha256(runtime),
                     bundle_sha256=release.sha256(bundle),
                     config_sha256=hashlib.sha256(config).hexdigest(),
                 )
@@ -191,7 +191,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         )
         artifact = inputs / "artifact.zip"
         with zipfile.ZipFile(artifact, "w") as archive:
-            archive.write(runz, "runz")
+            archive.write(runtime, "android-runtime")
             archive.write(bundle, "android-bundle.tar")
             archive.write(provenance, "provenance.json")
         urls = {
@@ -237,7 +237,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             exported,
         )
         self.assertIn(
-            f"MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256={release.sha256(runz)}",
+            f"MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256={release.sha256(runtime)}",
             exported,
         )
         self.assertIn(
@@ -292,7 +292,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
     def test_prepare_android_smoke_inputs_checks_provenance_digest_before_parsing(self):
         artifact = self.root / "artifact.zip"
         with zipfile.ZipFile(artifact, "w") as archive:
-            archive.writestr("runz", b"runz")
+            archive.writestr("android-runtime", b"runtime")
             archive.writestr("android-bundle.tar", b"bundle")
             archive.writestr("provenance.json", b"{}")
         secret = {
@@ -328,18 +328,26 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
 
     def test_android_smoke_archive_rejects_nonexact_and_unsafe_members(self):
         normal = {
-            "runz": b"runz",
+            "android-runtime": b"runtime",
             "android-bundle.tar": b"bundle",
             "provenance.json": b"provenance",
         }
         cases = {
             "missing": tuple(normal)[:-1],
             "extra": (*normal, "extra"),
-            "traversal": ("../runz", "android-bundle.tar", "provenance.json"),
-            "directory": ("runz/", "android-bundle.tar", "provenance.json"),
+            "traversal": (
+                "../android-runtime",
+                "android-bundle.tar",
+                "provenance.json",
+            ),
+            "directory": (
+                "android-runtime/",
+                "android-bundle.tar",
+                "provenance.json",
+            ),
             "duplicate": (
-                "runz",
-                "runz",
+                "android-runtime",
+                "android-runtime",
                 "android-bundle.tar",
                 "provenance.json",
             ),
@@ -372,7 +380,11 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                         member = zipfile.ZipInfo(name)
                         member.create_system = 3
                         member.external_attr = (
-                            (file_type if name == "runz" else stat.S_IFREG)
+                            (
+                                file_type
+                                if name == "android-runtime"
+                                else stat.S_IFREG
+                            )
                             | 0o600
                         ) << 16
                         archive.writestr(member, data)

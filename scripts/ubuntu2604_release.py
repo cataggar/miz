@@ -274,7 +274,7 @@ ANDROID_SMOKE_SECRET_FIELDS = {
     "provenance_sha256",
 }
 ANDROID_SMOKE_ARCHIVE_MEMBERS = {
-    "runz",
+    "android-runtime",
     "android-bundle.tar",
     "provenance.json",
 }
@@ -283,7 +283,7 @@ ANDROID_SMOKE_PROVENANCE_FIELDS = {
     "type",
     "architecture",
     "producer_source_commit",
-    "runz_sha256",
+    "runtime_sha256",
     "android_immutable_reference",
     "android_manifest_digest",
     "bundle_archive_sha256",
@@ -394,9 +394,9 @@ def parse_android_smoke_provenance(
         "Android smoke source manifest digest",
     )
     return {
-        "runz_sha256": require_sha256(
-            value.get("runz_sha256"),
-            "Android smoke runz digest",
+        "runtime_sha256": require_sha256(
+            value.get("runtime_sha256"),
+            "Android smoke runtime digest",
         ),
         "bundle_sha256": require_sha256(
             value.get("bundle_archive_sha256"),
@@ -563,10 +563,10 @@ def prepare_android_smoke_inputs_command(args: argparse.Namespace) -> None:
             args.architecture,
         )
 
-        runtime_path = output_dir / "runz"
+        runtime_path = output_dir / "android-runtime"
         bundle_path = output_dir / "android-bundle.tar"
-        if sha256(runtime_path) != provenance["runz_sha256"]:
-            fail("Android smoke runz digest mismatch")
+        if sha256(runtime_path) != provenance["runtime_sha256"]:
+            fail("Android smoke runtime digest mismatch")
         if sha256(bundle_path) != provenance["bundle_sha256"]:
             fail("Android smoke bundle digest mismatch")
         if _android_bundle_config_sha256(bundle_path) != provenance["config_sha256"]:
@@ -575,7 +575,7 @@ def prepare_android_smoke_inputs_command(args: argparse.Namespace) -> None:
         values = {
             "MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256": provenance_sha256,
             "MIZ_UBUNTU2604_ANDROID_RUNTIME": str(runtime_path),
-            "MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256": provenance["runz_sha256"],
+            "MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256": provenance["runtime_sha256"],
             "MIZ_UBUNTU2604_ANDROID_BUNDLE": str(bundle_path),
             "MIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256": provenance["bundle_sha256"],
             "MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256": provenance["config_sha256"],
