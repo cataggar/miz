@@ -3,7 +3,7 @@
 ## Generalized FreeBSD 15.1 QCOW2 images
 
 ZFS is the default root filesystem for future FreeBSD 15.1 images.
-`vmiz qemu FreeBSD` selects the host-native image; use
+`miz qemu FreeBSD` selects the host-native image; use
 `--arch x86_64|aarch64` to override the host architecture. Historical
 published releases remain available under their original immutable tags and
 asset names.
@@ -137,7 +137,7 @@ removing them would require the ad hoc file deletion this design rejects.
 
 ### Verification
 
-The guest writes `/usr/local/etc/pkg/repos/vmiz-FreeBSD-base.conf` to enable the
+The guest writes `/usr/local/etc/pkg/repos/miz-FreeBSD-base.conf` to enable the
 base repository explicitly. `/etc/pkg/FreeBSD.conf` ships it disabled, and
 upstream's VM images re-enable it as an unpackaged side effect; stating it in
 the pipeline keeps the supported update path from depending on a file the
@@ -314,29 +314,29 @@ retains the verified-base behavior without guest customization.
 Run the opt-in dual-instance acceptance against either completed image:
 
 ```text
-VMIZ_FREEBSD15_ARCHITECTURE=aarch64 \
-VMIZ_FREEBSD15_FILESYSTEM=ufs \
-VMIZ_FREEBSD15_IMAGE=/path/to/FreeBSD-15.1-aarch64.qcow2 \
-VMIZ_FREEBSD15_QEMU=/usr/bin/qemu-system-aarch64 \
+MIZ_FREEBSD15_ARCHITECTURE=aarch64 \
+MIZ_FREEBSD15_FILESYSTEM=ufs \
+MIZ_FREEBSD15_IMAGE=/path/to/FreeBSD-15.1-aarch64.qcow2 \
+MIZ_FREEBSD15_QEMU=/usr/bin/qemu-system-aarch64 \
 zig build test-freebsd15-boot
 
-VMIZ_FREEBSD15_ARCHITECTURE=x86_64 \
-VMIZ_FREEBSD15_FILESYSTEM=zfs \
-VMIZ_FREEBSD15_IMAGE=/path/to/FreeBSD-15.1-x86_64.qcow2 \
-VMIZ_FREEBSD15_QEMU=/usr/bin/qemu-system-x86_64 \
+MIZ_FREEBSD15_ARCHITECTURE=x86_64 \
+MIZ_FREEBSD15_FILESYSTEM=zfs \
+MIZ_FREEBSD15_IMAGE=/path/to/FreeBSD-15.1-x86_64.qcow2 \
+MIZ_FREEBSD15_QEMU=/usr/bin/qemu-system-x86_64 \
 zig build test-freebsd15-boot
 
-VMIZ_FREEBSD15_ARCHITECTURE=x86_64 \
-VMIZ_FREEBSD15_FILESYSTEM=zfs \
-VMIZ_FREEBSD15_FLAVOR=core \
-VMIZ_FREEBSD15_IMAGE=/path/to/FreeBSD-15.1-x86_64.core.qcow2 \
-VMIZ_FREEBSD15_QEMU=/usr/bin/qemu-system-x86_64 \
+MIZ_FREEBSD15_ARCHITECTURE=x86_64 \
+MIZ_FREEBSD15_FILESYSTEM=zfs \
+MIZ_FREEBSD15_FLAVOR=core \
+MIZ_FREEBSD15_IMAGE=/path/to/FreeBSD-15.1-x86_64.core.qcow2 \
+MIZ_FREEBSD15_QEMU=/usr/bin/qemu-system-x86_64 \
 zig build test-freebsd15-boot
 ```
 
-`VMIZ_FREEBSD15_FILESYSTEM` defaults to `zfs` and must match the image under
+`MIZ_FREEBSD15_FILESYSTEM` defaults to `zfs` and must match the image under
 test, because the guest-side assertions are filesystem-specific.
-`VMIZ_FREEBSD15_FLAVOR` defaults to `full`; the flavor-specific assertions are
+`MIZ_FREEBSD15_FLAVOR` defaults to `full`; the flavor-specific assertions are
 generated from the same manifest the builder used, so acceptance and the image
 can never disagree about what the contract is.
 
@@ -406,7 +406,7 @@ The released QCOW2 files are not directly uploadable to Azure. Derive aligned
 fixed VHDs without changing their partitions:
 
 ```text
-vmiz azure derive \
+miz azure derive \
   --input-sha256 <release-note-sha256> \
   --expected-virtual-size <release-note-virtual-size> \
   FreeBSD-15.1-aarch64.qcow2 \

@@ -1,17 +1,16 @@
 # Ubuntu and Debian package-family integration
 
-`vmiz.package_family` selects package behavior without changing the existing
+`miz.package_family` selects package behavior without changing the existing
 RPM customization backend. Azure Linux continues through that backend.
 Host-side Ubuntu 26.04 and Debian requests call the embedded debz Zig API
 directly; the default path does not spawn `debz`, `apt`, or `apt-get` and does
 not use libapt-pkg or python-apt. Static init, guest, and cross-target modules
 do not import or link debz. Build consumers that need this API use the
-host-targeted `vmiz_host` module; the cross-target `vmiz` module stays free of
-host package-manager linkage. The pre-rename `zvmi` and `zvmi_host` module
-names remain compatibility aliases over the same sources, while new consumers
-should use `vmiz` and `vmiz_host`. The public modules link vmiz's pinned static
-libzstd dependency. Package-family consumers additionally pick up debz's
-liblzma/libzstd dependencies through its Zig build module.
+host-targeted `miz_host` module; the cross-target `miz` module stays free of
+host package-manager linkage. These are the only supported module names; the
+cutover does not provide compatibility aliases. The public modules link miz's
+pinned static libzstd dependency. Package-family consumers additionally pick
+up debz's liblzma/libzstd dependencies through its Zig build module.
 
 The version 3 request makes the staged and published root, native/foreign
 architectures, repository sources, keyrings, configuration, cache, state,
@@ -23,15 +22,15 @@ recommendation, downgrade, deadline, and lock-wait policies are typed fields.
 The operation sequence is `resolve_lock`, human or policy review of the exact
 lock, then locked `create`, `customize`, `update`, `recover`, or `inspect`.
 debz package-family schema v1 accepts zero or one package depending on the
-operation. vmiz exposes a package list but rejects more than one name with a
+operation. miz exposes a package list but rejects more than one name with a
 typed diagnostic rather than silently dropping names.
 
 The immutable Zig dependency is debz commit
-`beac3f20dd93fd98863af71e8fe621d47db663f6`. At every call boundary vmiz checks
+`beac3f20dd93fd98863af71e8fe621d47db663f6`. At every call boundary miz checks
 the debz capability, request, result, exact-lock, and provenance schemas before
 accepting output.
 
-For create/customize/update, debz runs against `root_stage`. vmiz parses the
+For create/customize/update, debz runs against `root_stage`. miz parses the
 canonical exact-lock document, checks its target architecture, validates the
 provenance digest and lock binding, and verifies `state/transaction-result.json`
 before an atomic

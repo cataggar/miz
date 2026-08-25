@@ -1,7 +1,6 @@
 # Host RPM package-family integration
 
-The public host adapter is the Zig module `vmiz-package-family-host` (with
-`zvmi-package-family-host` retained as a rename compatibility alias). It uses
+The public host adapter is the Zig module `miz-package-family-host`. It uses
 only the supported `@import("rpmz")` namespaces: `resolver` for deterministic
 planning, `bundle_export` for the closed input set, and `replay` for exact
 offline execution. rpmz is pinned to immutable commit
@@ -24,8 +23,8 @@ For a new transaction, the adapter exports a replay-capable v2 bundle and then
 replays that exact bundle against `root_stage`. For an existing lock,
 `bundle_input_path` bypasses planning and performs exact offline replay.
 Publication occurs only after rpmz reports success, an applied plan digest,
-and a verified final inventory satisfying vmiz's exact locks. The adapter
-writes versioned vmiz lock and provenance documents before atomically renaming
+and a verified final inventory satisfying miz's exact locks. The adapter
+writes versioned miz lock and provenance documents before atomically renaming
 the staged root to `published_root`.
 
 Target trust import, recovery, inspection, and multi-transaction bundles are

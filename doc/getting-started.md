@@ -4,7 +4,7 @@
 
 - Zig **0.16.0** or later.
 - `zig build` compiles the pinned static libzstd dependency from
-  `build.zig.zon`; no system libzstd development package is needed for vmiz's
+  `build.zig.zon`; no system libzstd development package is needed for miz's
   zstd wrapper.
 - `zig build test` additionally requires the `zstd` CLI for interoperability
   coverage. On Debian-family systems:
@@ -14,8 +14,8 @@
   sudo apt-get install -y --no-install-recommends zstd
   ```
 
-- `vmiz qemu` additionally requires [ghr](https://github.com/cataggar/ghr) for automatic known-image download. Install the packaged QEMU build with `ghr install cataggar/qemu`, or provide a system QEMU/UEFI installation.
-- The released `vmiz` binary includes bzip2 support for packaged compressed firmware and does not require a system decompression tool.
+- `miz qemu` additionally requires [ghr](https://github.com/cataggar/ghr) for automatic known-image download. Install the packaged QEMU build with `ghr install cataggar/qemu`, or provide a system QEMU/UEFI installation.
+- The released `miz` binary includes bzip2 support for packaged compressed firmware and does not require a system decompression tool.
 
 ## Build and run
 

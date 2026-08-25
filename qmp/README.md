@@ -1,6 +1,6 @@
 # qmp — native Zig QMP client
 
-A dependency-free client for the [QEMU Machine Protocol](../../docs/interop/qmp-spec.rst)
+A dependency-free client for the [QEMU Machine Protocol](https://gitlab.com/qemu-project/qemu/-/blob/master/docs/interop/qmp-spec.rst)
 (QMP), a JSON-over-socket protocol for driving VM lifecycle automation. No QEMU
 C code, no libvirt, no external dependencies — the client links against
 nothing but `std` and talks to an unmodified `qemu-system-*` binary over its
