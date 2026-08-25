@@ -3,12 +3,12 @@
 #   VMIZ_AZURE_TENANT_ID, VMIZ_AZURE_CLIENT_ID,
 #   VMIZ_ARTIFACT_SIGNING_ENDPOINT, VMIZ_ARTIFACT_SIGNING_ACCOUNT, and
 #   VMIZ_ARTIFACT_SIGNING_PROFILE. The signing app's Entra federated credential
-#   subject is `repo:cataggar/vmiz:environment:ubuntu2604-signing`.
+#   subject is `repo:cataggar/miz:environment:ubuntu2604-signing`.
 # - `ubuntu2604-release`: restrict deployments to `main`, define secrets
 #   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, and
 #   variables AZURE_LOCATION_X64, AZURE_LOCATION_ARM64, AZURE_VM_SIZE_X64, and
 #   AZURE_VM_SIZE_ARM64. The acceptance app's Entra federated credential subject
-#   is `repo:cataggar/vmiz:environment:ubuntu2604-release`.
+#   is `repo:cataggar/miz:environment:ubuntu2604-release`.
 # Before dispatch, create or retarget RELEASE_TAG to the exact current `main`
 # commit. The workflow accepts lightweight or annotated tags and publishes
 # exactly the two QCOW2 assets declared below.
@@ -37,7 +37,7 @@ env:
 jobs:
   prepare:
     name: resolve immutable main source
-    if: github.repository == 'cataggar/vmiz' && github.ref == 'refs/heads/main'
+    if: github.repository == 'cataggar/miz' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
