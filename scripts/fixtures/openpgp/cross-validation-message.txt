@@ -1,1 +1,1 @@
-vmiz OpenPGP cross-validation fixture
+miz OpenPGP cross-validation fixture

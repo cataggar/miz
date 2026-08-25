@@ -57,9 +57,9 @@ jobs:
           stub=/usr/lib/systemd/boot/efi/linuxx64.efi.stub
           if [ -f "$stub" ]; then
             python3 scripts/ci/make-uki-stub-oci-fixture.py fixtures/oci-uki-stub "$stub"
-            echo "VMIZ_BOOT_TEST_UKI_OCI=${GITHUB_WORKSPACE}/fixtures/oci-uki-stub" >> "$GITHUB_ENV"
+            echo "MIZ_BOOT_TEST_UKI_OCI=${GITHUB_WORKSPACE}/fixtures/oci-uki-stub" >> "$GITHUB_ENV"
           else
-            echo "::warning::$stub not found (systemd-boot-efi install failed?); VMIZ_BOOT_TEST_UKI_OCI won't be set, so the UKI boot-smoke test will skip"
+            echo "::warning::$stub not found (systemd-boot-efi install failed?); MIZ_BOOT_TEST_UKI_OCI won't be set, so the UKI boot-smoke test will skip"
           fi
 
       - name: Install ISO/squashfs extraction tools
@@ -75,20 +75,20 @@ jobs:
           if scripts/ci/build-verity-initramfs-fixture.sh fixtures/azurelinux-4.0-x86_64.iso "$initramfs"; then
             kver=$(cat "${initramfs}.kver")
             python3 scripts/ci/make-verity-initramfs-oci-fixture.py fixtures/oci-verity-initramfs "$initramfs" "$kver"
-            echo "VMIZ_BOOT_TEST_VERITY_OCI=${GITHUB_WORKSPACE}/fixtures/oci-verity-initramfs" >> "$GITHUB_ENV"
+            echo "MIZ_BOOT_TEST_VERITY_OCI=${GITHUB_WORKSPACE}/fixtures/oci-verity-initramfs" >> "$GITHUB_ENV"
           else
-            echo "::warning::build-verity-initramfs-fixture.sh failed; VMIZ_BOOT_TEST_VERITY_OCI won't be set, so the --verity boot-smoke test will skip"
+            echo "::warning::build-verity-initramfs-fixture.sh failed; MIZ_BOOT_TEST_VERITY_OCI won't be set, so the --verity boot-smoke test will skip"
           fi
 
       - name: Real TDNF/dracut customization and QEMU boot
         env:
-          VMIZ_RUN_REAL_PACKAGE_BOOT: "1"
-          VMIZ_BOOT_TEST_ISO: ${{ github.workspace }}/fixtures/azurelinux-4.0-x86_64.iso
-          VMIZ_BOOT_TEST_OCI: ${{ github.workspace }}/fixtures/oci-minimal
+          MIZ_RUN_REAL_PACKAGE_BOOT: "1"
+          MIZ_BOOT_TEST_ISO: ${{ github.workspace }}/fixtures/azurelinux-4.0-x86_64.iso
+          MIZ_BOOT_TEST_OCI: ${{ github.workspace }}/fixtures/oci-minimal
         run: zig build test-unsafe-chroot-real-boot --summary all
 
       - name: zig build test-boot-smoke
         env:
-          VMIZ_BOOT_TEST_ISO: ${{ github.workspace }}/fixtures/azurelinux-4.0-x86_64.iso
-          VMIZ_BOOT_TEST_OCI: ${{ github.workspace }}/fixtures/oci-minimal
+          MIZ_BOOT_TEST_ISO: ${{ github.workspace }}/fixtures/azurelinux-4.0-x86_64.iso
+          MIZ_BOOT_TEST_OCI: ${{ github.workspace }}/fixtures/oci-minimal
         run: zig build test-boot-smoke --summary all

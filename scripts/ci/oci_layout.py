@@ -1,5 +1,5 @@
 """Shared helper for building minimal, from-scratch OCI image layouts for
-use as `--container`/`VMIZ_BOOT_TEST_*_OCI` fixtures in CI, without
+use as `--container`/`MIZ_BOOT_TEST_*_OCI` fixtures in CI, without
 depending on network access to a container registry.
 
 Used by `make-minimal-oci-fixture.py` and `make-uki-stub-oci-fixture.py`.

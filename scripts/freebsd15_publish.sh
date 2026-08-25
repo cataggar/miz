@@ -23,7 +23,7 @@ for tool in gh python3 sha256sum; do
   }
 done
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-[[ "$REPOSITORY" == cataggar/vmiz ]]
+[[ "$REPOSITORY" == cataggar/miz ]]
 
 release_description=$(python3 scripts/freebsd15_release.py describe \
   --release-set "$RELEASE_SET" \
@@ -65,7 +65,7 @@ manifest_path, assets_root, release_set, release_tag, source_commit, count = (
     sys.argv[1:]
 )
 document = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-if document.get("type") != "vmiz-freebsd15-release":
+if document.get("type") != "miz-freebsd15-release":
     raise SystemExit("unexpected publish manifest type")
 if document.get("release_set") != release_set:
     raise SystemExit("publish manifest release set mismatch")

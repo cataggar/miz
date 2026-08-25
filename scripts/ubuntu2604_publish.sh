@@ -16,7 +16,7 @@ for tool in gh python3 sha256sum; do
 done
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
 [[ "$RELEASE_TAG" =~ ^Ubuntu-26\.04-[0-9]{8}$ ]]
-[[ "$REPOSITORY" == cataggar/vmiz ]]
+[[ "$REPOSITORY" == cataggar/miz ]]
 
 mkdir -p "$STAGING_ROOT"
 assets_dir="$STAGING_ROOT/assets"
@@ -47,7 +47,7 @@ from pathlib import Path
 
 manifest_path, assets_root, release_tag, source_commit = sys.argv[1:]
 document = json.load(open(manifest_path, encoding="utf-8"))
-if document.get("schema") != 1 or document.get("type") != "vmiz-ubuntu2604-release":
+if document.get("schema") != 1 or document.get("type") != "miz-ubuntu2604-release":
     raise SystemExit("unexpected Ubuntu publish manifest schema")
 if document.get("release_tag") != release_tag:
     raise SystemExit("publish manifest release tag mismatch")

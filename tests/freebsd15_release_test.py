@@ -162,7 +162,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
         candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
         document = {
             "schema": release.CANDIDATE_SCHEMA,
-            "type": "vmiz-freebsd15-azure-acceptance",
+            "type": "miz-freebsd15-azure-acceptance",
             "variant": key,
             "architecture": release.VARIANTS[key]["architecture"],
             "filesystem": release.VARIANTS[key]["filesystem"],
@@ -179,7 +179,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
             "status": "success",
             "location": "eastus2",
             "vm_size": "Standard_D2s_v5",
-            "resource_group": "rg-vmiz-release",
+            "resource_group": "rg-miz-release",
             "contracts": list(
                 release.azure_contracts(candidate["filesystem"])
             ),
@@ -409,7 +409,7 @@ class FreeBSD15ReleaseTest(unittest.TestCase):
 
         document = json.loads(output.read_text(encoding="utf-8"))
         self.assertEqual(document["schema"], release.CANDIDATE_SCHEMA)
-        self.assertEqual(document["type"], "vmiz-freebsd15-azure-acceptance")
+        self.assertEqual(document["type"], "miz-freebsd15-azure-acceptance")
         self.assertEqual(document["variant"], "x86_64-zfs-full")
         self.assertEqual(document["architecture"], "x86_64")
         self.assertEqual(document["filesystem"], "zfs")

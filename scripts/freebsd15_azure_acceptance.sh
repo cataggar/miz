@@ -22,7 +22,7 @@ cleanup_group() {
   local resource_group metadata_file group_exists expected_resource_group suffix
   resource_group=$(<"$STATE_FILE")
   suffix=${CANDIDATE_KEY//_/-}
-  expected_resource_group="vmiz-fb15-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
+  expected_resource_group="miz-fb15-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
   [[ "$resource_group" == "$expected_resource_group" ]] || {
     echo "::error::Refusing cleanup of unexpected resource-group name"
     return 1
@@ -50,10 +50,10 @@ import sys
 
 tags = json.load(open(sys.argv[1], encoding="utf-8")).get("tags") or {}
 expected = {
-    "vmiz-owner": "freebsd15-release",
-    "vmiz-run-id": sys.argv[2],
-    "vmiz-run-attempt": sys.argv[3],
-    "vmiz-candidate": sys.argv[4],
+    "miz-owner": "freebsd15-release",
+    "miz-run-id": sys.argv[2],
+    "miz-run-attempt": sys.argv[3],
+    "miz-candidate": sys.argv[4],
 }
 if tags != expected:
     raise SystemExit(f"refusing to delete resource group with non-exact ownership tags: {tags!r}")
@@ -95,7 +95,7 @@ fi
 if [[ -z ${CANDIDATE_DIR:-} || -z ${SOURCE_COMMIT:-} || -z ${ARCHITECTURE:-} ||
       -z ${FILESYSTEM:-} || -z ${FLAVOR:-} || -z ${ASSET_NAME:-} ||
       -z ${AZURE_LOCATION:-} || -z ${AZURE_VM_SIZE:-} || -z ${RESULT_DIR:-} ||
-      -z ${VMIZ:-} || -z ${GITHUB_STEP_SUMMARY:-} ]]; then
+      -z ${MIZ:-} || -z ${GITHUB_STEP_SUMMARY:-} ]]; then
   echo "::error::Azure acceptance configuration is incomplete"
   exit 1
 fi
@@ -111,7 +111,7 @@ esac
 [[ "$CANDIDATE_KEY" == "$ARCHITECTURE-$FILESYSTEM-$FLAVOR" ]]
 [[ "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ ]]
 [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
-[[ -x "$VMIZ" ]]
+[[ -x "$MIZ" ]]
 
 report_error() {
   local status=$1 line=$2 command=$3
@@ -388,18 +388,18 @@ set_architecture_profile() {
 }
 
 suffix=${CANDIDATE_KEY//_/-}
-resource_group="vmiz-fb15-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
+resource_group="miz-fb15-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
 set_architecture_profile "$ARCHITECTURE"
 name_seed="${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}${short_arch}${FILESYSTEM}${FLAVOR}"
-disk_name="vmiz-os-${name_seed}"
-gallery_name="vmizfb15${name_seed}"
-image_definition_name="vmizfb15${short_arch}${FILESYSTEM}${FLAVOR}"
+disk_name="miz-os-${name_seed}"
+gallery_name="mizfb15${name_seed}"
+image_definition_name="mizfb15${short_arch}${FILESYSTEM}${FLAVOR}"
 image_version=1.0.0
-image_publisher=vmiz
+image_publisher=miz
 image_offer=freebsd15
 image_sku="${short_arch}-${FILESYSTEM}-${FLAVOR}"
-vm_name="vmiz-vm-${name_seed}"
-admin_username=vmiztest
+vm_name="miz-vm-${name_seed}"
+admin_username=miztest
 vhd="$RESULT_DIR/${CANDIDATE_KEY}.vhd"
 private_key="$RESULT_DIR/id_ed25519"
 boot_log="$RESULT_DIR/boot.log"
@@ -925,7 +925,7 @@ azure_location_display_name=$(
 # Derive the fixed VHD
 source_before=$(sha256sum "$asset" | awk '{print $1}')
 test "$source_before" = "$qcow_sha256"
-"$VMIZ" azure derive \
+"$MIZ" azure derive \
   --input-sha256 "$qcow_sha256" \
   --expected-virtual-size "$virtual_size" \
   "$asset" \
@@ -972,10 +972,10 @@ if ! az group create \
   --name "$resource_group" \
   --location "$AZURE_LOCATION" \
   --tags \
-    vmiz-owner=freebsd15-release \
-    "vmiz-run-id=$GITHUB_RUN_ID" \
-    "vmiz-run-attempt=$GITHUB_RUN_ATTEMPT" \
-    "vmiz-candidate=$CANDIDATE_KEY" \
+    miz-owner=freebsd15-release \
+    "miz-run-id=$GITHUB_RUN_ID" \
+    "miz-run-attempt=$GITHUB_RUN_ATTEMPT" \
+    "miz-candidate=$CANDIDATE_KEY" \
   --output json >/dev/null
 then
   echo "::error::Failed to create the persisted temporary resource group"
@@ -1198,7 +1198,7 @@ wait_for_image_version_replication \
   "${AZURE_IMAGE_REPLICATION_MAX_DELAY_SECONDS:-30}"
 
 # Create the matching-architecture VM from the exact gallery version with key-only SSH.
-ssh-keygen -q -t ed25519 -N '' -C vmiz-azure-acceptance -f "$private_key"
+ssh-keygen -q -t ed25519 -N '' -C miz-azure-acceptance -f "$private_key"
 az vm create \
   --resource-group "$resource_group" \
   --name "$vm_name" \

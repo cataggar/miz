@@ -26,7 +26,7 @@ env:
 jobs:
   benchmark:
     name: native aarch64 production benchmark
-    if: github.repository == 'cataggar/vmiz' && github.ref == 'refs/heads/main'
+    if: github.repository == 'cataggar/miz' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 240
     steps:
@@ -106,7 +106,7 @@ jobs:
             tests/fixtures/ubuntu2604-local-signing/signing-cert.pem \
             "$SIGNING_ROOT/signing-cert.pem"
           ssh-keygen -q -t ed25519 -N '' \
-            -C "vmiz-benchmark-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            -C "miz-benchmark-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             -f "$SIGNING_ROOT/administrator"
           chmod 0600 "$SIGNING_ROOT/administrator"
           chmod 0644 "$SIGNING_ROOT/administrator.pub"
@@ -121,8 +121,8 @@ jobs:
           export ZIG_LOCAL_CACHE_DIR="$STAGING_ROOT/zig-local-cache"
           mkdir -p "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
           "$ZIG_BIN" build --fetch --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
-          "$ZIG_BIN" build install-vmiz -Doptimize=ReleaseSafe
-          actual=$(zig-out/bin/vmiz uki fingerprint "$SIGNING_CERTIFICATE")
+          "$ZIG_BIN" build install-miz -Doptimize=ReleaseSafe
+          actual=$(zig-out/bin/miz uki fingerprint "$SIGNING_CERTIFICATE")
           test "$actual" = "$TEST_CERTIFICATE_SHA256"
 
       - name: Stage verified publication inputs, exact locks, and warm debz cache
@@ -245,7 +245,7 @@ jobs:
           ceiling = int(sys.argv[5])
           gate = {
               "schema": 1,
-              "type": "vmiz-ubuntu2604-production-benchmark-gate",
+              "type": "miz-ubuntu2604-production-benchmark-gate",
               "ceiling_ns": ceiling,
               "status": "invalid",
           }

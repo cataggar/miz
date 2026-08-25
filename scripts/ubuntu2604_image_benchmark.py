@@ -177,7 +177,7 @@ def argument_parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "optional executable bare-metal boot harness; receives the image "
-            "through VMIZ_UBUNTU2604_IMAGE"
+            "through MIZ_UBUNTU2604_IMAGE"
         ),
     )
     parser.add_argument("--keep-images", action="store_true")
@@ -458,7 +458,7 @@ def verify_warm_cache(cache: Path) -> dict[str, object]:
         fail("warm debz cache has no metadata manifests")
     public = {
         "schema": SCHEMA,
-        "type": "vmiz-debz-cache-inventory",
+        "type": "miz-debz-cache-inventory",
         "metadata_objects": len(metadata_objects),
         "metadata_bytes": sum(item["bytes"] for item in metadata_objects),
         "metadata_manifests": len(manifest_records),
@@ -685,7 +685,7 @@ def verify_lock_set(
         final_closure = closure
     return {
         "schema": SCHEMA,
-        "type": "vmiz-ubuntu2604-benchmark-lock-set",
+        "type": "miz-ubuntu2604-benchmark-lock-set",
         "locks": locks,
         "final_closure": final_closure,
         "closure_sha256": canonical_digest(final_closure),
@@ -708,7 +708,7 @@ def load_timing(path: Path) -> dict[str, object]:
         fail("timing JSON has unexpected fields")
     if (
         document.get("schema") != 1
-        or document.get("type") != "vmiz-ubuntu2604-image-phase-timing"
+        or document.get("type") != "miz-ubuntu2604-image-phase-timing"
         or document.get("clock") != "monotonic"
         or document.get("duration_unit") != "nanoseconds"
         or document.get("status") != "success"
@@ -859,7 +859,7 @@ def run_measured_command(
     usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
     return {
         "schema": SCHEMA,
-        "type": "vmiz-host-resource-timing",
+        "type": "miz-host-resource-timing",
         "status": "success" if return_code == 0 else "failure",
         "exit_code": return_code,
         "wall_ns": finished - started,
@@ -962,7 +962,7 @@ def validate_raw_output(path: Path, info_path: Path) -> dict[str, object]:
         "format": "raw",
         "bytes": metadata.st_size,
         "virtual_size": VIRTUAL_SIZE,
-        "structural_validation": "vmiz-check-and-info",
+        "structural_validation": "miz-check-and-info",
         "byte_hash_recorded": False,
         "byte_reproducibility_compared": False,
     }
@@ -1069,7 +1069,7 @@ def validate_provenance(
         fail("Ubuntu build provenance has unexpected fields")
     if (
         build.get("schema") != 1
-        or build.get("type") != "vmiz-ubuntu2604-build-provenance"
+        or build.get("type") != "miz-ubuntu2604-build-provenance"
         or build.get("architecture") != ARCHITECTURE
         or build.get("flavor") != FLAVOR
         or build.get("release") != "26.04"
@@ -1178,10 +1178,10 @@ def validate_provenance(
     boot = read_json(root / "ubuntu2604-boot-input-evidence.json")
     if (
         boot.get("schema") != 1
-        or boot.get("type") != "vmiz-ubuntu2604-boot-input-evidence"
+        or boot.get("type") != "miz-ubuntu2604-boot-input-evidence"
         or boot.get("architecture") != ARCHITECTURE
         or boot.get("package_lock")
-        != "/var/lib/vmiz/ubuntu2604-package-lock.tsv"
+        != "/var/lib/miz/ubuntu2604-package-lock.tsv"
         or not isinstance(boot.get("kernel_release"), str)
         or not str(boot["kernel_release"]).endswith("-nvidia-bos-64k")
     ):
@@ -1192,7 +1192,7 @@ def validate_provenance(
     signing = read_json(root / "uki-signing-baremetal-aarch64.json")
     if (
         signing.get("schema") != 1
-        or signing.get("type") != "vmiz-uki-signing"
+        or signing.get("type") != "miz-uki-signing"
         or signing.get("architecture") != ARCHITECTURE
         or signing.get("flavor") != FLAVOR
         or signing.get("certificate_sha256") != certificate_sha256
@@ -1361,7 +1361,7 @@ def build_summary(
         )
     return {
         "schema": SCHEMA,
-        "type": "vmiz-ubuntu2604-image-benchmark-summary",
+        "type": "miz-ubuntu2604-image-benchmark-summary",
         "status": "valid",
         "profile": {
             "source": SOURCE_NAME,
@@ -1571,15 +1571,15 @@ def preflight(
             "-Doptimize=ReleaseSafe",
             "-Dubuntu2604-arch=aarch64",
             "-Dubuntu2604-flavor=baremetal",
-            "install-vmiz",
+            "install-miz",
             "check-generalized-ubuntu2604",
         ],
         cwd=repo,
         env=env,
         log_path=compile_log,
     )
-    vmiz = repo / "zig-out" / "bin" / "vmiz"
-    regular_file(vmiz, "vmiz validator")
+    miz = repo / "zig-out" / "bin" / "miz"
+    regular_file(miz, "miz validator")
     write_json(session / "inputs.json", inputs)
     write_json(
         session / "cache-inventory.json",
@@ -1604,9 +1604,9 @@ def run_acceptance(
             "reason": "repository-has-no-baremetal-boot-acceptance-harness",
         }
     acceptance_env = env.copy()
-    acceptance_env["VMIZ_UBUNTU2604_IMAGE"] = str(image)
-    acceptance_env["VMIZ_UBUNTU2604_ARCHITECTURE"] = ARCHITECTURE
-    acceptance_env["VMIZ_UBUNTU2604_FLAVOR"] = FLAVOR
+    acceptance_env["MIZ_UBUNTU2604_IMAGE"] = str(image)
+    acceptance_env["MIZ_UBUNTU2604_ARCHITECTURE"] = ARCHITECTURE
+    acceptance_env["MIZ_UBUNTU2604_FLAVOR"] = FLAVOR
     run_logged(
         [str(command)],
         cwd=cwd,
@@ -1731,10 +1731,10 @@ def run_once(
     if not image.is_file() or image.stat().st_size <= 0:
         fail(f"{name} did not produce the expected image")
     validate_raw_file(raw_output)
-    vmiz = repo / "zig-out" / "bin" / "vmiz"
-    check_log = evidence_dir / "vmiz-check.log"
+    miz = repo / "zig-out" / "bin" / "miz"
+    check_log = evidence_dir / "miz-check.log"
     run_logged(
-        [str(vmiz), "check", str(image)],
+        [str(miz), "check", str(image)],
         cwd=repo,
         env=env,
         log_path=check_log,
@@ -1742,7 +1742,7 @@ def run_once(
     image_info_path = evidence_dir / "image-info.json"
     with image_info_path.open("wb") as output:
         result = subprocess.run(
-            [str(vmiz), "info", "--output=json", str(image)],
+            [str(miz), "info", "--output=json", str(image)],
             cwd=repo,
             env=env,
             stdout=output,
@@ -1750,11 +1750,11 @@ def run_once(
             check=False,
         )
     if result.returncode != 0:
-        fail(f"{name} vmiz info failed: {result.stderr.decode(errors='replace')}")
+        fail(f"{name} miz info failed: {result.stderr.decode(errors='replace')}")
     image_contract = validate_image_info(image_info_path)
-    raw_check_log = evidence_dir / "raw-vmiz-check.log"
+    raw_check_log = evidence_dir / "raw-miz-check.log"
     run_logged(
-        [str(vmiz), "check", str(raw_output)],
+        [str(miz), "check", str(raw_output)],
         cwd=repo,
         env=env,
         log_path=raw_check_log,
@@ -1762,7 +1762,7 @@ def run_once(
     raw_info_path = evidence_dir / "raw-image-info.json"
     with raw_info_path.open("wb") as output:
         result = subprocess.run(
-            [str(vmiz), "info", "--output=json", str(raw_output)],
+            [str(miz), "info", "--output=json", str(raw_output)],
             cwd=repo,
             env=env,
             stdout=output,
@@ -1770,7 +1770,7 @@ def run_once(
             check=False,
         )
     if result.returncode != 0:
-        fail(f"{name} raw vmiz info failed: {result.stderr.decode(errors='replace')}")
+        fail(f"{name} raw miz info failed: {result.stderr.decode(errors='replace')}")
     raw_output_record = validate_raw_output(raw_output, raw_info_path)
     raw_output_record["retention_policy"] = (
         "keep" if args.keep_images else "delete-after-validation"
@@ -1812,7 +1812,7 @@ def run_once(
     image_size = image.stat().st_size
     evidence_manifest = {
         "schema": SCHEMA,
-        "type": "vmiz-ubuntu2604-image-benchmark-run",
+        "type": "miz-ubuntu2604-image-benchmark-run",
         "name": name,
         "kind": kind,
         "command": benchmark_command(
@@ -1900,7 +1900,7 @@ def run_benchmark(args: argparse.Namespace) -> Path:
             status_path,
             {
                 "schema": SCHEMA,
-                "type": "vmiz-ubuntu2604-image-benchmark-status",
+                "type": "miz-ubuntu2604-image-benchmark-status",
                 "status": "valid",
             },
         )
@@ -1915,7 +1915,7 @@ def run_benchmark(args: argparse.Namespace) -> Path:
             status_path,
             {
                 "schema": SCHEMA,
-                "type": "vmiz-ubuntu2604-image-benchmark-status",
+                "type": "miz-ubuntu2604-image-benchmark-status",
                 "status": "invalid",
                 "error": str(error),
             },
