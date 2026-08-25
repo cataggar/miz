@@ -62,12 +62,13 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         self.assertEqual(self.source.count("environment: ubuntu2604-signing"), 1)
         self.assertEqual(self.source.count("environment: ubuntu2604-release"), 2)
         self.assertIn("id-token: write", self.source)
+        self.assertIn("github.repository == 'cataggar/miz'", self.source)
         self.assertIn(
-            "repo:cataggar/vmiz:environment:ubuntu2604-signing",
+            "repo:cataggar/miz:environment:ubuntu2604-signing",
             self.source,
         )
         self.assertIn(
-            "repo:cataggar/vmiz:environment:ubuntu2604-release",
+            "repo:cataggar/miz:environment:ubuntu2604-release",
             self.source,
         )
 
