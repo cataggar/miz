@@ -9,8 +9,9 @@ do not import or link debz. Build consumers that need this API use the
 host-targeted `miz_host` module; the cross-target `miz` module stays free of
 host package-manager linkage. These are the only supported module names; the
 cutover does not provide compatibility aliases. The public modules link miz's
-pinned static libzstd dependency. Package-family consumers additionally pick
-up debz's liblzma/libzstd dependencies through its Zig build module.
+pinned static
+libzstd dependency. Package-family consumers additionally pick up debz's
+liblzma/libzstd dependencies through its Zig build module.
 
 The version 3 request makes the staged and published root, native/foreign
 architectures, repository sources, keyrings, configuration, cache, state,

@@ -274,13 +274,13 @@ matrix shards (see below).
 
 `zig build test-device-write-integration` runs
 `tests/device_write_integration.zig`. It builds a small named GPT image, invokes
-the real `vmiz write` command against same-size and substantially larger sparse
+the real `miz write` command against same-size and substantially larger sparse
 loop devices, and strictly verifies both resulting GPT copies and preserved
 partition metadata. The test is Linux-only and opt-in because it needs loop
 device privileges:
 
 ```
-VMIZ_RUN_PRIVILEGED_TEST=1 zig build test-device-write-integration
+MIZ_RUN_PRIVILEGED_TEST=1 zig build test-device-write-integration
 ```
 
 When necessary, the test re-executes itself through non-interactive `sudo`.

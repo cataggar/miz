@@ -33,6 +33,9 @@ jobs:
       - name: zig fmt --check
         run: zig fmt --check .
 
+      - name: Stale brand guard
+        run: python3 -m unittest tests.stale_brand_test
+
       - name: Azure Linux release workflow unit tests
         run: python3 -m unittest discover -s tests -p azurelinux4_release_test.py
 
@@ -137,7 +140,7 @@ jobs:
 
       - name: privileged device-write integration
         env:
-          VMIZ_RUN_PRIVILEGED_TEST: "1"
+          MIZ_RUN_PRIVILEGED_TEST: "1"
         run: zig build test-device-write-integration -Doptimize=Debug --summary all
 
       - name: privileged unsafe-chroot integration
