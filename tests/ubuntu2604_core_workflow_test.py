@@ -28,26 +28,17 @@ class Ubuntu2604CoreWorkflowTests(unittest.TestCase):
         ):
             section = self.job(name, following)
             self.assertEqual(section.count("- key: x86_64-core"), 1)
-            self.assertEqual(
-                section.count("- key: aarch64-core"),
-                0 if name == "native_qemu" else 1,
-            )
+            self.assertEqual(section.count("- key: aarch64-core"), 1)
             self.assertNotIn("- key: x86_64-full", section)
             self.assertNotIn("- key: aarch64-full", section)
             self.assertIn(
                 "asset_name: Ubuntu-26.04-x86_64.core.qcow2",
                 section,
             )
-            if name == "native_qemu":
-                self.assertNotIn(
-                    "asset_name: Ubuntu-26.04-aarch64.core.qcow2",
-                    section,
-                )
-            else:
-                self.assertIn(
-                    "asset_name: Ubuntu-26.04-aarch64.core.qcow2",
-                    section,
-                )
+            self.assertIn(
+                "asset_name: Ubuntu-26.04-aarch64.core.qcow2",
+                section,
+            )
         gate = self.job("validate")
         self.assertIn('"x86_64-core": "Ubuntu-26.04-x86_64.core.qcow2"', gate)
         self.assertIn('"aarch64-core": "Ubuntu-26.04-aarch64.core.qcow2"', gate)
@@ -62,9 +53,10 @@ class Ubuntu2604CoreWorkflowTests(unittest.TestCase):
         self.assertIn("needs.native_qemu.result == 'success'", gate)
         self.assertIn("needs.azure_acceptance.result == 'success'", gate)
         self.assertIn("len(candidate_docs) != 2", gate)
-        self.assertIn("len(native_docs) != 1", gate)
+        self.assertIn("len(native_docs) != 2", gate)
         self.assertIn("len(azure_docs) != 2", gate)
         self.assertIn("core validation matrix is incomplete", gate)
+        self.assertIn("core native validation matrix is incomplete", gate)
 
     def test_workflow_is_validation_only(self) -> None:
         self.assertNotIn("\n  publish:\n", self.source)
@@ -130,10 +122,30 @@ class Ubuntu2604CoreWorkflowTests(unittest.TestCase):
         )
         native = self.job("native_qemu", "azure_acceptance")
         self.assertIn('-Dubuntu2604-flavor="$FLAVOR"', native)
+        self.assertIn("runner: ubuntu-24.04", native)
+        self.assertIn("runner: [self-hosted, Linux, ARM64, kvm]", native)
+        capability = native.split(
+            "- name: Require matching native KVM runner", 1
+        )[1].split("- name: Check out accepted source", 1)[0]
+        self.assertIn('test "$(uname -m)" = "$expected_uname"', capability)
+        self.assertIn(
+            'test "$(dpkg --print-architecture)" = "$expected_deb"',
+            capability,
+        )
         self.assertIn("if [[ ! -c /dev/kvm ]]", native)
-        self.assertIn('sudo chown "$(id -u):$(id -g)" /dev/kvm', native)
+        self.assertIn('sudo -n chown "$(id -u):$(id -g)" /dev/kvm', native)
         self.assertIn("test -r /dev/kvm", native)
         self.assertIn("test -w /dev/kvm", native)
+        self.assertIn('os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)', native)
+        self.assertIn("fcntl.ioctl(fd, 0xAE00)", native)
+        self.assertIn("api_version != 12", native)
+        self.assertIn("qemu-efi-aarch64 qemu-system-arm", native)
+        self.assertIn("qemu=qemu-system-aarch64", native)
+        self.assertIn("/usr/share/AAVMF/AAVMF_CODE.ms.fd", native)
+        self.assertIn("/usr/share/AAVMF/AAVMF_VARS.ms.fd", native)
+        self.assertNotIn("force_tcg", native)
+        self.assertNotIn("accel=tcg", native)
+        self.assertNotIn("MIZ_VM_ACCEL=software", native)
         self.assertIn("MIZ_UBUNTU2604_UEFI_CODE=", native)
         self.assertIn("MIZ_UBUNTU2604_UEFI_VARS=", native)
         self.assertIn("verify-native-result", native)
@@ -202,6 +214,13 @@ class Ubuntu2604CoreWorkflowTests(unittest.TestCase):
         self.assertIn("azure_result_sha256", gate)
         self.assertIn("release.validate_native_result", gate)
         self.assertIn("release.validate_azure_result", gate)
+        self.assertIn(
+            "native result is not candidate-key/digest bound",
+            gate,
+        )
+        self.assertIn('android_smoke.get("candidate_key")', gate)
+        self.assertIn('"native_result_sha256": digest(native_path)', gate)
+        self.assertNotIn("digest(native_path) if", gate)
 
     def test_cleanup_is_unconditional_and_failure_reporting(self) -> None:
         build = self.job("build", "native_qemu")

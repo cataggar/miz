@@ -402,6 +402,10 @@ jobs:
             architecture: x86_64
             runner: ubuntu-24.04
             asset_name: Ubuntu-26.04-x86_64.core.qcow2
+          - key: aarch64-core
+            architecture: aarch64
+            runner: [self-hosted, Linux, ARM64, kvm]
+            asset_name: Ubuntu-26.04-aarch64.core.qcow2
     env:
       CANDIDATE_KEY: ${{ matrix.key }}
       ARCHITECTURE: ${{ matrix.architecture }}
@@ -411,6 +415,48 @@ jobs:
       CANDIDATE_DIR: .validation/native/${{ matrix.key }}/candidate
       RESULT_DIR: artifact-staging/core-native-results/${{ matrix.key }}
     steps:
+      - name: Require matching native KVM runner
+        run: |
+          set -euo pipefail
+          case "$ARCHITECTURE" in
+            x86_64)
+              expected_uname=x86_64
+              expected_deb=amd64
+              ;;
+            aarch64)
+              expected_uname=aarch64
+              expected_deb=arm64
+              ;;
+            *)
+              echo "::error::Unsupported native acceptance architecture: $ARCHITECTURE"
+              exit 1
+              ;;
+          esac
+          source /etc/os-release
+          test "${ID:-}" = ubuntu
+          test "$(uname -m)" = "$expected_uname"
+          test "$(dpkg --print-architecture)" = "$expected_deb"
+          sudo -n true
+          if [[ ! -c /dev/kvm ]]; then
+            echo "::error::Matching-architecture native acceptance requires a KVM-capable runner with /dev/kvm"
+            exit 1
+          fi
+          sudo -n chown "$(id -u):$(id -g)" /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+          python3 - <<'PY'
+          import fcntl
+          import os
+
+          fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
+          try:
+              api_version = fcntl.ioctl(fd, 0xAE00)
+          finally:
+              os.close(fd)
+          if api_version != 12:
+              raise SystemExit(f"unsupported KVM API version: {api_version}")
+          PY
+
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -439,13 +485,27 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           packages=(
-            openssh-client openssl python3-virt-firmware qemu-utils
+            ca-certificates curl openssh-client openssl
+            python3-virt-firmware qemu-utils
             sbsigntool swtpm swtpm-tools
           )
-          test "$ARCHITECTURE" = x86_64
-          packages+=(ovmf qemu-system-x86)
-          uefi_code=/usr/share/OVMF/OVMF_CODE_4M.ms.fd
-          uefi_vars=/usr/share/OVMF/OVMF_VARS_4M.ms.fd
+          case "$ARCHITECTURE" in
+            x86_64)
+              packages+=(ovmf qemu-system-x86)
+              qemu=qemu-system-x86_64
+              uefi_code=/usr/share/OVMF/OVMF_CODE_4M.ms.fd
+              uefi_vars=/usr/share/OVMF/OVMF_VARS_4M.ms.fd
+              ;;
+            aarch64)
+              packages+=(qemu-efi-aarch64 qemu-system-arm)
+              qemu=qemu-system-aarch64
+              uefi_code=/usr/share/AAVMF/AAVMF_CODE.ms.fd
+              uefi_vars=/usr/share/AAVMF/AAVMF_VARS.ms.fd
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
           test -r "$uefi_code"
           test -r "$uefi_vars"
@@ -453,17 +513,10 @@ jobs:
             echo "MIZ_UBUNTU2604_UEFI_CODE=$uefi_code"
             echo "MIZ_UBUNTU2604_UEFI_VARS=$uefi_vars"
           } >> "$GITHUB_ENV"
-          if [[ ! -c /dev/kvm ]]; then
-            echo "::error::Matching-architecture native acceptance requires a KVM-capable runner with /dev/kvm"
-            exit 1
-          fi
-          sudo chown "$(id -u):$(id -g)" /dev/kvm
-          test -r /dev/kvm
-          test -w /dev/kvm
           for tool in qemu-img sbverify ssh ssh-keygen swtpm virt-fw-vars; do
             command -v "$tool" >/dev/null
           done
-          command -v qemu-system-x86_64 >/dev/null
+          command -v "$qemu" >/dev/null
 
       - name: Provision privileged offline-root containment fixture
         run: |
@@ -912,7 +965,7 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ needs.prepare.outputs.candidate_run_id }}
 
-      - name: Download x86_64 native-QEMU core acceptance result
+      - name: Download both native-QEMU core acceptance results
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: ubuntu2604-core-native-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
@@ -973,11 +1026,11 @@ jobs:
           qcow_paths = list(candidates_root.rglob("*.qcow2"))
           if (
               len(candidate_docs) != 2
-              or len(native_docs) != 1
+              or len(native_docs) != 2
               or len(azure_docs) != 2
               or len(qcow_paths) != 2
           ):
-              raise SystemExit("core gate did not receive two candidates, one native result, two Azure results, and two images")
+              raise SystemExit("core gate did not receive two candidates, two native results, two Azure results, and two images")
 
           def load_by_key(paths):
               result = {}
@@ -993,13 +1046,28 @@ jobs:
 
           candidates = load_by_key(candidate_docs)
           azure = load_by_key(azure_docs)
-          native_by_digest = {}
+
+          native = {}
+          native_digests = set()
           for path in native_docs:
               value = json.load(open(path, encoding="utf-8"))
+              android_smoke = value.get("android_smoke")
+              key = (
+                  android_smoke.get("candidate_key")
+                  if isinstance(android_smoke, dict)
+                  else None
+              )
               digest = value.get("candidate_sha256")
-              if digest in native_by_digest:
+              if key not in expected or key in native:
+                  raise SystemExit("unexpected or duplicate native core result")
+              if not isinstance(digest, str):
+                  raise SystemExit(f"{key}: native candidate digest is malformed")
+              if digest in native_digests:
                   raise SystemExit("duplicate native acceptance digest")
-              native_by_digest[digest] = path
+              native[key] = (path, value)
+              native_digests.add(digest)
+          if set(native) != set(expected):
+              raise SystemExit("core native validation matrix is incomplete")
           if {path.name for path in qcow_paths} != set(expected.values()):
               raise SystemExit("core candidate asset set is not exact")
 
@@ -1018,19 +1086,16 @@ jobs:
                   "run_attempt": candidate_run_attempt,
               }:
                   raise SystemExit(f"{key}: candidate workflow attempt is not exact")
-              native_path = native_by_digest.get(candidate["sha256"])
-              if key == "x86_64-core":
-                  if native_path is None:
-                      raise SystemExit(f"{key}: native result is not digest-bound")
-                  release.validate_native_result(
-                      manifest_path,
-                      asset_path,
-                      native_path,
-                      key=key,
-                      source_commit=source_commit,
-                  )
-              elif native_path is not None:
-                  raise SystemExit(f"{key}: unexpected native result")
+              native_path, native_result = native[key]
+              if native_result.get("candidate_sha256") != candidate["sha256"]:
+                  raise SystemExit(f"{key}: native result is not candidate-key/digest bound")
+              release.validate_native_result(
+                  manifest_path,
+                  asset_path,
+                  native_path,
+                  key=key,
+                  source_commit=source_commit,
+              )
               azure_path, azure_result = azure[key]
               release.validate_azure_result(
                   manifest_path,
@@ -1054,9 +1119,7 @@ jobs:
                       "asset_name": asset_name,
                       "candidate_sha256": candidate["sha256"],
                       "candidate_manifest_sha256": digest(manifest_path),
-                      "native_result_sha256": (
-                          digest(native_path) if native_path is not None else None
-                      ),
+                      "native_result_sha256": digest(native_path),
                       "azure_result_sha256": digest(azure_path),
                   }
               )
