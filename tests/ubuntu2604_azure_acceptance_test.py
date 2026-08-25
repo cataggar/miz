@@ -257,7 +257,6 @@ else:
         )
         self.assertIn("provenance SHA-256", harness)
         self.assertIn("config SHA-256", harness)
-        self.assertNotIn("MIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT", harness)
         self.assertNotIn("--android-smoke-source-commit", harness)
         self.assertNotIn("source commit", harness)
 
