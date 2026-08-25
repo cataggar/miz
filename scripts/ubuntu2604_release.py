@@ -275,7 +275,7 @@ ANDROID_SMOKE_SECRET_FIELDS = {
 }
 ANDROID_SMOKE_ARCHIVE_MEMBERS = {
     "runz",
-    "redroid-bundle.tar",
+    "android-bundle.tar",
     "provenance.json",
 }
 ANDROID_SMOKE_PROVENANCE_FIELDS = {
@@ -284,13 +284,13 @@ ANDROID_SMOKE_PROVENANCE_FIELDS = {
     "architecture",
     "producer_source_commit",
     "runz_sha256",
-    "redroid_immutable_reference",
-    "redroid_manifest_digest",
+    "android_immutable_reference",
+    "android_manifest_digest",
     "bundle_archive_sha256",
     "config_json_sha256",
 }
-ANDROID_SMOKE_PROVENANCE_SCHEMA = "redroid-smoke-provenance.v1"
-ANDROID_SMOKE_PROVENANCE_TYPE = "application/vnd.redroid-smoke.v1+json"
+ANDROID_SMOKE_PROVENANCE_SCHEMA = "android-smoke-provenance.v1"
+ANDROID_SMOKE_PROVENANCE_TYPE = "application/vnd.android-smoke.v1+json"
 ANDROID_SMOKE_MANIFEST_MAX_BYTES = 1024 * 1024
 ANDROID_SMOKE_CONFIG_MAX_BYTES = 16 * 1024 * 1024
 ANDROID_SMOKE_INPUT_ENV = "ANDROID_SMOKE_INPUT_VALUE"
@@ -383,14 +383,14 @@ def parse_android_smoke_provenance(
         value.get("producer_source_commit"),
         "Android smoke producer commit",
     )
-    image_reference = value.get("redroid_immutable_reference")
+    image_reference = value.get("android_immutable_reference")
     if (
         not isinstance(image_reference, str)
         or re.fullmatch(r".+@sha256:[0-9a-f]{64}", image_reference) is None
     ):
         fail("Android smoke immutable image reference is invalid")
     require_sha256(
-        value.get("redroid_manifest_digest"),
+        value.get("android_manifest_digest"),
         "Android smoke source manifest digest",
     )
     return {
@@ -564,7 +564,7 @@ def prepare_android_smoke_inputs_command(args: argparse.Namespace) -> None:
         )
 
         runtime_path = output_dir / "runz"
-        bundle_path = output_dir / "redroid-bundle.tar"
+        bundle_path = output_dir / "android-bundle.tar"
         if sha256(runtime_path) != provenance["runz_sha256"]:
             fail("Android smoke runz digest mismatch")
         if sha256(bundle_path) != provenance["bundle_sha256"]:

@@ -92,10 +92,10 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             "type": release.ANDROID_SMOKE_PROVENANCE_TYPE,
             "architecture": architecture,
             "producer_source_commit": "a" * 40,
-            "redroid_immutable_reference": (
+            "android_immutable_reference": (
                 f"registry.example.invalid/android@sha256:{'b' * 64}"
             ),
-            "redroid_manifest_digest": "c" * 64,
+            "android_manifest_digest": "c" * 64,
             "runz_sha256": runz_sha256,
             "bundle_archive_sha256": bundle_sha256,
             "config_json_sha256": config_sha256,
@@ -138,11 +138,11 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
     def test_android_smoke_provenance_is_exact_and_architecture_bound(self):
         self.assertEqual(
             release.ANDROID_SMOKE_PROVENANCE_SCHEMA,
-            "redroid-smoke-provenance.v1",
+            "android-smoke-provenance.v1",
         )
         self.assertEqual(
             release.ANDROID_SMOKE_PROVENANCE_TYPE,
-            "application/vnd.redroid-smoke.v1+json",
+            "application/vnd.android-smoke.v1+json",
         )
         value = self.android_smoke_provenance()
         self.assertEqual(
@@ -158,8 +158,8 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             {**value, "type": "other"},
             {**value, "architecture": "aarch64"},
             {**value, "runz_sha256": "F" * 64},
-            {**value, "redroid_immutable_reference": "mutable:latest"},
-            {**value, "redroid_manifest_digest": "F" * 64},
+            {**value, "android_immutable_reference": "mutable:latest"},
+            {**value, "android_manifest_digest": "F" * 64},
             {**value, "unexpected": "value"},
         )
         for mutation in mutations:
@@ -173,7 +173,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         runz = inputs / "runz"
         runz.write_bytes(b"runz fixture")
         config = b'{"mounts":[]}\n'
-        bundle = inputs / "redroid-bundle.tar"
+        bundle = inputs / "android-bundle.tar"
         with tarfile.open(bundle, "w") as archive:
             member = tarfile.TarInfo("config.json")
             member.size = len(config)
@@ -192,7 +192,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         artifact = inputs / "artifact.zip"
         with zipfile.ZipFile(artifact, "w") as archive:
             archive.write(runz, "runz")
-            archive.write(bundle, "redroid-bundle.tar")
+            archive.write(bundle, "android-bundle.tar")
             archive.write(provenance, "provenance.json")
         urls = {
             "https://artifacts.example.invalid/artifact.zip": artifact,
@@ -248,7 +248,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             *urls,
             "fixture-token",
             "producer_source_commit",
-            "redroid_immutable_reference",
+            "android_immutable_reference",
             "a" * 40,
             f"registry.example.invalid/android@sha256:{'b' * 64}",
         ):
@@ -293,7 +293,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         artifact = self.root / "artifact.zip"
         with zipfile.ZipFile(artifact, "w") as archive:
             archive.writestr("runz", b"runz")
-            archive.writestr("redroid-bundle.tar", b"bundle")
+            archive.writestr("android-bundle.tar", b"bundle")
             archive.writestr("provenance.json", b"{}")
         secret = {
             "artifact_url": "https://artifacts.example.invalid/artifact.zip",
@@ -329,18 +329,18 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
     def test_android_smoke_archive_rejects_nonexact_and_unsafe_members(self):
         normal = {
             "runz": b"runz",
-            "redroid-bundle.tar": b"bundle",
+            "android-bundle.tar": b"bundle",
             "provenance.json": b"provenance",
         }
         cases = {
             "missing": tuple(normal)[:-1],
             "extra": (*normal, "extra"),
-            "traversal": ("../runz", "redroid-bundle.tar", "provenance.json"),
-            "directory": ("runz/", "redroid-bundle.tar", "provenance.json"),
+            "traversal": ("../runz", "android-bundle.tar", "provenance.json"),
+            "directory": ("runz/", "android-bundle.tar", "provenance.json"),
             "duplicate": (
                 "runz",
                 "runz",
-                "redroid-bundle.tar",
+                "android-bundle.tar",
                 "provenance.json",
             ),
         }
