@@ -10,18 +10,18 @@
 //! signing material is never copied into the guest disk.
 
 const std = @import("std");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 const image_phase_timing = @import("image_phase_timing.zig");
 const uki_signing = @import("uki_signing.zig");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const Io = std.Io;
-const artifact_pipeline = vmiz.artifact_pipeline;
-const offline_root = vmiz.offline_root;
-const package_family = vmiz.package_family;
-const guid = vmiz.guid;
-const ImageFormat = vmiz.Format;
+const artifact_pipeline = miz.artifact_pipeline;
+const offline_root = miz.offline_root;
+const package_family = miz.package_family;
+const guid = miz.guid;
+const ImageFormat = miz.Format;
 
 test {
     std.testing.refAllDecls(image_phase_timing);
@@ -136,7 +136,7 @@ const Flavor = enum {
 };
 
 fn validateFinalQcow2(io: Io, path: []const u8, expected_size: u64) !void {
-    var image = try vmiz.Image.openPathReadOnlyStandalone(io, path);
+    var image = try miz.Image.openPathReadOnlyStandalone(io, path);
     defer image.close(io);
     if (image.format != .qcow2) return error.InvalidFinalQcow2;
     if (image.virtual_size != expected_size) return error.UnexpectedVirtualSize;
@@ -150,24 +150,24 @@ fn finalizeCompressedQcow2(
     mutable: []const u8,
     output: []const u8,
 ) !void {
-    // Emit the standalone zstd-compressed release artifact natively. vmiz
+    // Emit the standalone zstd-compressed release artifact natively. miz
     // reads the mutable qcow2's guest bytes and re-encodes them into
     // compressed qcow2 v3 clusters, so the Ubuntu release path no longer
     // shells out to qemu-img/qemu-utils.
     const staged_output = try std.fmt.allocPrint(
         allocator,
-        "{s}.vmiz-finalize-stage",
+        "{s}.miz-finalize-stage",
         .{output},
     );
     defer allocator.free(staged_output);
     Dir.cwd().deleteFile(io, staged_output) catch {};
     errdefer Dir.cwd().deleteFile(io, staged_output) catch {};
 
-    var source = try vmiz.Image.openPathReadOnlyStandalone(io, mutable);
+    var source = try miz.Image.openPathReadOnlyStandalone(io, mutable);
     defer source.close(io);
     if (source.format != .qcow2) return error.InvalidFinalQcow2;
     const expected_size = source.virtual_size;
-    const source_ctx = vmiz.qcow2.Qcow2SourceContext{
+    const source_ctx = miz.qcow2.Qcow2SourceContext{
         .file = source.file,
         .info = &source.qcow2.?,
     };
@@ -175,7 +175,7 @@ fn finalizeCompressedQcow2(
     const staged_file = try Dir.cwd().createFile(io, staged_output, .{ .read = true, .truncate = true });
     {
         errdefer staged_file.close(io);
-        _ = try vmiz.qcow2.writeStandaloneCompressed(
+        _ = try miz.qcow2.writeStandaloneCompressed(
             allocator,
             io,
             staged_file,
@@ -297,10 +297,10 @@ const android_binder_module_name = "binder_linux";
 // The `linux-azure` kernel config lines core's signed Binder support depends
 // on. `CONFIG_ANDROID_BINDER_IPC`/`CONFIG_ANDROID_BINDERFS` must be built as
 // modules (not builtin, not absent) so `binder_linux` ships as the loadable,
-// signed module vmizinit loads; `CONFIG_ANDROID_BINDER_DEVICES=""` keeps the
+// signed module mizinit loads; `CONFIG_ANDROID_BINDER_DEVICES=""` keeps the
 // kernel from creating any binder device itself, since device creation is
-// vmizinit's job through binderfs, not a kernel command-line default; and
-// `CONFIG_MODULE_DECOMPRESS=y` is what lets vmizinit ask the kernel to
+// mizinit's job through binderfs, not a kernel command-line default; and
+// `CONFIG_MODULE_DECOMPRESS=y` is what lets mizinit ask the kernel to
 // decompress and verify the packaged `.ko.zst` through `finit_module()`
 // without ever touching the signed bytes itself.
 const core_required_kernel_config = [_][]const u8{
@@ -382,15 +382,15 @@ const baremetal_forbidden_packages = [_][]const u8{
 };
 
 const core_required_paths = [_][]const u8{
-    "/usr/sbin/vmizinit",
+    "/usr/sbin/mizinit",
     "/usr/sbin/azagent",
     "/usr/sbin/sshd",
     "/usr/bin/ssh-keygen",
-    "/etc/ssh/sshd_config.d/10-vmizinit.conf",
+    "/etc/ssh/sshd_config.d/10-mizinit.conf",
     "/etc/waagent.conf",
-    "/var/lib/vmiz/ubuntu2604-package-lock.tsv",
-    "/var/lib/vmiz/ubuntu2604-core-provenance.json",
-    "/var/lib/vmiz/source-release",
+    "/var/lib/miz/ubuntu2604-package-lock.tsv",
+    "/var/lib/miz/ubuntu2604-core-provenance.json",
+    "/var/lib/miz/source-release",
 };
 
 const core_forbidden_paths = [_][]const u8{
@@ -457,29 +457,29 @@ const baremetal_initramfs_modules =
 /// The one account a bare-metal image ships with.
 const baremetal_admin_user = "g";
 
-/// vmizinit's documented replacement for its default access provider.
-const baremetal_access_provider_path = "/usr/local/sbin/vmizinit-access";
+/// mizinit's documented replacement for its default access provider.
+const baremetal_access_provider_path = "/usr/local/sbin/mizinit-access";
 
-// vmizinit starts sshd only once provisioning has written its sentinel,
+// mizinit starts sshd only once provisioning has written its sentinel,
 // because on Azure provisioning is what installs the administrator's key: an
 // sshd started earlier listens on an image nobody can authenticate to. Bare
 // metal inverts that -- the key is baked in at build time, so the wait is for
 // something that already happened, and azagent, which would otherwise both
 // write the sentinel and generate the host keys, never runs.
 //
-// This is the extension point vmizinit documents for exactly that case: a
+// This is the extension point mizinit documents for exactly that case: a
 // provider that brings its own credential path and is started without waiting.
 // The root is expanded before access starts, using azagent's resize-only mode
 // so no Azure provisioning or disk setup is attempted. Resize is best-effort
 // at this boundary, but `set -e` still protects every other provider step.
 // Host keys are still not baked, because they must differ per machine, so they
-// are generated here on first boot. `/run/sshd` is created here too: vmizinit
+// are generated here on first boot. `/run/sshd` is created here too: mizinit
 // creates it only on the path this replaces.
 const baremetal_access_provider =
     "#!/bin/sh\n" ++
     "set -e\n" ++
     "if ! /usr/sbin/azagent --resize-root-only; then\n" ++
-    "    echo \"vmizinit-access: warning: root resize failed; continuing boot\" >&2\n" ++
+    "    echo \"mizinit-access: warning: root resize failed; continuing boot\" >&2\n" ++
     "fi\n" ++
     "[ -f /etc/ssh/ssh_host_ed25519_key ] || /usr/bin/ssh-keygen -A\n" ++
     "mkdir -p /run/sshd\n" ++
@@ -494,7 +494,7 @@ const Args = struct {
     provenance_dir: ?[]const u8 = null,
     size: u64 = default_virtual_size,
     size_explicit: bool = false,
-    vmizinit: ?[]const u8 = null,
+    mizinit: ?[]const u8 = null,
     azagent: ?[]const u8 = null,
     signing_certificate: ?[]const u8 = null,
     signing_certificate_sha256: ?[]const u8 = null,
@@ -521,7 +521,7 @@ const help =
     \\  --work-dir <path>                       persistent download/work cache
     \\  --provenance-dir <path>                 release provenance sidecars
     \\  --size <size>                           virtual size (full 5G, core 3584M, baremetal 5G)
-    \\  --vmizinit <path>                       static guest PID 1 (core, baremetal)
+    \\  --mizinit <path>                       static guest PID 1 (core, baremetal)
     \\  --azagent <path>                        static guest provisioning agent (core, baremetal)
     \\  --authorized-key <path>                 administrator public key (baremetal only)
     \\  --raw-output <path>                     additional raw copy, for writing to a disk
@@ -755,12 +755,12 @@ fn parseArgs(argv: []const []const u8) !Args {
         } else if (std.mem.eql(u8, arg, "--size")) {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
-            args.size = try vmiz.parseSize(argv[i]);
+            args.size = try miz.parseSize(argv[i]);
             args.size_explicit = true;
-        } else if (std.mem.eql(u8, arg, "--vmizinit")) {
+        } else if (std.mem.eql(u8, arg, "--mizinit")) {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
-            args.vmizinit = argv[i];
+            args.mizinit = argv[i];
         } else if (std.mem.eql(u8, arg, "--azagent")) {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
@@ -896,7 +896,7 @@ fn readUkiStub(allocator: Allocator, io: Io, path: []const u8) ![]u8 {
         io,
         path,
         allocator,
-        .limited(vmiz.uki.limits.max_stub_size),
+        .limited(miz.uki.limits.max_stub_size),
     ) catch |err| switch (err) {
         error.FileNotFound => return error.UkiStubMissing,
         else => return err,
@@ -1568,8 +1568,8 @@ const NativeRoot = struct {
     io: Io,
     mutable_image: []const u8,
     raw_path: []u8,
-    image: vmiz.Image,
-    filesystem: vmiz.ext4_mountless.FileSystem,
+    image: miz.Image,
+    filesystem: miz.ext4_mountless.FileSystem,
     image_open: bool = true,
     filesystem_open: bool = true,
 
@@ -1587,7 +1587,7 @@ const NativeRoot = struct {
         self.* = undefined;
     }
 
-    fn finish(self: *NativeRoot) !vmiz.ext4.FilesystemInfo {
+    fn finish(self: *NativeRoot) !miz.ext4.FilesystemInfo {
         var commit_result = self.filesystem.commit() catch |err| {
             if (self.filesystem.recoveryArtifactPath()) |path| {
                 std.debug.print(
@@ -1627,9 +1627,9 @@ fn copyNativeImage(
     destination_path: []const u8,
     format: ImageFormat,
 ) !void {
-    var source = try vmiz.Image.openPathReadOnlyStandalone(io, source_path);
+    var source = try miz.Image.openPathReadOnlyStandalone(io, source_path);
     defer source.close(io);
-    var destination = try vmiz.Image.createExclusive(
+    var destination = try miz.Image.createExclusive(
         io,
         destination_path,
         format,
@@ -1641,7 +1641,7 @@ fn copyNativeImage(
         if (destination_open) destination.close(io);
         Dir.cwd().deleteFile(io, destination_path) catch {};
     }
-    _ = try vmiz.copyAll(io, source, &destination, allocator);
+    _ = try miz.copyAll(io, source, &destination, allocator);
     try destination.file.sync(io);
     destination.close(io);
     destination_open = false;
@@ -1655,14 +1655,14 @@ fn publishNativeQcow2(
 ) !void {
     const staged_path = try std.fmt.allocPrint(
         allocator,
-        "{s}.vmiz-native-stage",
+        "{s}.miz-native-stage",
         .{destination_path},
     );
     defer allocator.free(staged_path);
     Dir.cwd().deleteFile(io, staged_path) catch {};
     errdefer Dir.cwd().deleteFile(io, staged_path) catch {};
     try copyNativeImage(allocator, io, raw_path, staged_path, .qcow2);
-    var staged = try vmiz.Image.openPathReadOnlyStandalone(io, staged_path);
+    var staged = try miz.Image.openPathReadOnlyStandalone(io, staged_path);
     const check = staged.check(io) catch |err| {
         staged.close(io);
         return err;
@@ -1672,7 +1672,7 @@ fn publishNativeQcow2(
     try Dir.cwd().rename(staged_path, Dir.cwd(), destination_path, io);
 }
 
-fn partitionNameEquals(partition: vmiz.gpt.PartitionEntry, expected: []const u8) bool {
+fn partitionNameEquals(partition: miz.gpt.PartitionEntry, expected: []const u8) bool {
     if (expected.len > partition.name_utf16le.len) return false;
     for (expected, 0..) |byte, index| {
         if (partition.name_utf16le[index] != byte) return false;
@@ -1683,8 +1683,8 @@ fn partitionNameEquals(partition: vmiz.gpt.PartitionEntry, expected: []const u8)
     return true;
 }
 
-fn findNamedRootPartition(partitions: []const vmiz.gpt.PartitionEntry) !vmiz.gpt.PartitionEntry {
-    var found: ?vmiz.gpt.PartitionEntry = null;
+fn findNamedRootPartition(partitions: []const miz.gpt.PartitionEntry) !miz.gpt.PartitionEntry {
+    var found: ?miz.gpt.PartitionEntry = null;
     for (partitions) |partition| {
         if (!partitionNameEquals(partition, "cloudimg-rootfs")) continue;
         if (found != null) return error.AmbiguousRootPartition;
@@ -1693,14 +1693,14 @@ fn findNamedRootPartition(partitions: []const vmiz.gpt.PartitionEntry) !vmiz.gpt
     return found orelse error.RootPartitionNotFound;
 }
 
-fn partitionOffsetLength(partition: vmiz.gpt.PartitionEntry) !struct { offset: u64, length: u64 } {
-    const offset = std.math.mul(u64, partition.first_lba, vmiz.gpt.sector_size) catch
+fn partitionOffsetLength(partition: miz.gpt.PartitionEntry) !struct { offset: u64, length: u64 } {
+    const offset = std.math.mul(u64, partition.first_lba, miz.gpt.sector_size) catch
         return error.InvalidPartitionBounds;
     const sectors = std.math.add(u64, partition.last_lba - partition.first_lba, 1) catch
         return error.InvalidPartitionBounds;
     return .{
         .offset = offset,
-        .length = std.math.mul(u64, sectors, vmiz.gpt.sector_size) catch
+        .length = std.math.mul(u64, sectors, miz.gpt.sector_size) catch
             return error.InvalidPartitionBounds,
     };
 }
@@ -1711,9 +1711,9 @@ fn rootPartitionGuid(
     image_path: []const u8,
     profile: *const Profile,
 ) !guid.Guid {
-    var image = try vmiz.Image.openPathReadOnly(io, image_path);
+    var image = try miz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
-    const parsed = try vmiz.gpt.readGpt(image, io, allocator);
+    const parsed = try miz.gpt.readGpt(image, io, allocator);
     defer allocator.free(parsed.partitions);
     const partition = try findNamedRootPartition(parsed.partitions);
     if (!std.mem.eql(u8, &partition.partition_type_guid, &profile.root_partition_type_guid))
@@ -1738,7 +1738,7 @@ fn ukiCmdline(
         ),
         .core => std.fmt.allocPrint(
             allocator,
-            "root=PARTUUID={s} init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=auto console=tty0 {s}",
+            "root=PARTUUID={s} init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto console=tty0 {s}",
             .{ guid.formatLower(&root_guid_text, root_guid), profile.serial_console },
         ),
         // `azure=off` rather than an omitted option: the default is `auto`,
@@ -1748,7 +1748,7 @@ fn ukiCmdline(
         // a boot nobody can watch is a boot nobody can diagnose.
         .baremetal => std.fmt.allocPrint(
             allocator,
-            "root=PARTUUID={s} init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=off console=tty0 {s}",
+            "root=PARTUUID={s} init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=off console=tty0 {s}",
             .{ guid.formatLower(&root_guid_text, root_guid), profile.serial_console },
         ),
     };
@@ -1772,16 +1772,16 @@ fn openNativeRoot(
     errdefer Dir.cwd().deleteFile(io, raw_path) catch {};
     Dir.cwd().deleteFile(io, raw_path) catch {};
     try copyNativeImage(allocator, io, mutable_image, raw_path, .raw);
-    var image = try vmiz.Image.openPath(io, raw_path);
+    var image = try miz.Image.openPath(io, raw_path);
     errdefer image.close(io);
-    const partitions = try vmiz.gpt.readGpt(image, io, allocator);
+    const partitions = try miz.gpt.readGpt(image, io, allocator);
     defer allocator.free(partitions.partitions);
     const partition = try findNamedRootPartition(partitions.partitions);
     const geometry = try partitionOffsetLength(partition);
     const spool_path = try std.fs.path.join(allocator, &.{ work_dir, "customized.native.spool" });
     defer allocator.free(spool_path);
     Dir.cwd().deleteFile(io, spool_path) catch {};
-    var filesystem = try vmiz.ext4_mountless.FileSystem.open(allocator, io, image.file, .{
+    var filesystem = try miz.ext4_mountless.FileSystem.open(allocator, io, image.file, .{
         .offset = geometry.offset,
         .length = geometry.length,
         .spool_path = spool_path,
@@ -1908,7 +1908,7 @@ fn kernelModulesPath(
 /// here as `PathNotFound`.
 fn nativeKernelModulesPath(
     allocator: Allocator,
-    filesystem: *const vmiz.ext4_mountless.FileSystem,
+    filesystem: *const miz.ext4_mountless.FileSystem,
     release_name: []const u8,
 ) ![]u8 {
     const merged = try std.fmt.allocPrint(allocator, "/usr/lib/modules/{s}", .{release_name});
@@ -2033,7 +2033,7 @@ const AndroidBinderModuleEvidence = struct {
 /// packaged bytes carry the kernel's module-signing trailer. Deliberately
 /// does not decompress `.ko.zst` bytes for anything other than this
 /// structural check: the packaged bytes are exactly what get evidenced here
-/// and what vmizinit's `finit_module()` hands the kernel unmodified at boot.
+/// and what mizinit's `finit_module()` hands the kernel unmodified at boot.
 fn validateAndroidBinderModule(
     allocator: Allocator,
     root: *offline_root.Root,
@@ -2067,7 +2067,7 @@ fn validateAndroidBinderModule(
     const sha256 = artifact_pipeline.formatSha256(artifact_pipeline.sha256Bytes(packaged));
 
     const signed = if (std.mem.endsWith(u8, module_path, ".zst")) signed: {
-        const decoded = vmiz.zstd.decodeAlloc(allocator, packaged) catch return error.AndroidBinderModuleUnreadable;
+        const decoded = miz.zstd.decodeAlloc(allocator, packaged) catch return error.AndroidBinderModuleUnreadable;
         defer allocator.free(decoded.bytes);
         break :signed hasModuleSignatureMarker(decoded.bytes);
     } else hasModuleSignatureMarker(packaged);
@@ -2112,7 +2112,7 @@ fn validateUkiContract(
     bytes: []const u8,
     expected_cmdline: []const u8,
 ) !void {
-    var inspection = try vmiz.uki.inspect(allocator, bytes);
+    var inspection = try miz.uki.inspect(allocator, bytes);
     defer inspection.deinit(allocator);
     if (inspection.security_directory == null) return error.UnsignedUki;
     for (&[_][]const u8{ ".linux", ".initrd", ".osrel", ".uname" }) |name| {
@@ -2191,8 +2191,8 @@ fn customizeOfflineRoot(
                 .{ .create_directory = .{ .path = "/etc/ssh/sshd_config.d", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/etc/cloud/cloud.cfg.d", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/etc/netplan", .mode = 0o755 } },
-                .{ .create_directory = .{ .path = "/var/lib/vmiz", .mode = 0o755 } },
-                .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-vmiz-generalized.conf", .source = .{ .inline_bytes = ssh_config } } },
+                .{ .create_directory = .{ .path = "/var/lib/miz", .mode = 0o755 } },
+                .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-miz-generalized.conf", .source = .{ .inline_bytes = ssh_config } } },
                 .{ .write_file = .{ .path = "/etc/cloud/cloud.cfg.d/90-azure.cfg", .source = .{ .inline_bytes = cloud_config } } },
                 .{ .write_file = .{ .path = "/etc/netplan/50-cloud-init.yaml", .source = .{ .inline_bytes = netplan } } },
                 .{ .write_file = .{ .path = "/etc/waagent.conf", .source = .{ .inline_bytes = waagent } } },
@@ -2203,8 +2203,8 @@ fn customizeOfflineRoot(
             try root.apply(&.{
                 .{ .create_directory = .{ .path = "/etc/ssh/sshd_config.d", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/etc/initramfs-tools", .mode = 0o755 } },
-                .{ .create_directory = .{ .path = "/var/lib/vmiz", .mode = 0o755 } },
-                .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-vmizinit.conf", .source = .{ .inline_bytes = core_ssh_config }, .mode = 0o600 } },
+                .{ .create_directory = .{ .path = "/var/lib/miz", .mode = 0o755 } },
+                .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-mizinit.conf", .source = .{ .inline_bytes = core_ssh_config }, .mode = 0o600 } },
                 .{ .write_file = .{ .path = "/etc/waagent.conf", .source = .{ .inline_bytes = core_azagent_config } } },
                 .{ .write_file = .{ .path = "/etc/resolv.conf", .source = .{ .inline_bytes = "" } } },
                 .{ .write_file = .{ .path = "/etc/initramfs-tools/modules", .source = .{ .inline_bytes = core_initramfs_modules } } },
@@ -2215,8 +2215,8 @@ fn customizeOfflineRoot(
                 .{ .create_directory = .{ .path = "/etc/ssh/sshd_config.d", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/etc/initramfs-tools", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/usr/local/sbin", .mode = 0o755 } },
-                .{ .create_directory = .{ .path = "/var/lib/vmiz", .mode = 0o755 } },
-                .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-vmizinit.conf", .source = .{ .inline_bytes = core_ssh_config }, .mode = 0o600 } },
+                .{ .create_directory = .{ .path = "/var/lib/miz", .mode = 0o755 } },
+                .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-mizinit.conf", .source = .{ .inline_bytes = core_ssh_config }, .mode = 0o600 } },
                 .{ .write_file = .{ .path = "/etc/waagent.conf", .source = .{ .inline_bytes = core_azagent_config } } },
                 .{ .write_file = .{ .path = "/etc/resolv.conf", .source = .{ .inline_bytes = "" } } },
                 .{ .write_file = .{ .path = "/etc/initramfs-tools/initramfs.conf", .source = .{ .inline_bytes = baremetal_initramfs_conf } } },
@@ -2249,11 +2249,11 @@ fn customizeOfflineRoot(
     defer allocator.free(lock);
     try root.apply(&.{
         .{ .write_file = .{
-            .path = "/var/lib/vmiz/ubuntu2604-package-lock.tsv",
+            .path = "/var/lib/miz/ubuntu2604-package-lock.tsv",
             .source = .{ .inline_bytes = lock },
         } },
         .{ .write_file = .{
-            .path = "/var/lib/vmiz/source-release",
+            .path = "/var/lib/miz/source-release",
             .source = .{ .inline_bytes = release ++ "\n" },
         } },
         .{ .write_file = .{
@@ -2340,13 +2340,13 @@ fn customizeOfflineRoot(
     const binder_module_signed: ?bool = if (binder_evidence) |e| e.signed else null;
     const evidence = try std.json.Stringify.valueAlloc(allocator, .{
         .schema = 1,
-        .type = "vmiz-ubuntu2604-boot-input-evidence",
+        .type = "miz-ubuntu2604-boot-input-evidence",
         .architecture = @tagName(profile.architecture),
         .kernel_release = release_name,
         .kernel = kernel_path,
         .initramfs = initrd_path,
         .modules = modules_path,
-        .package_lock = "/var/lib/vmiz/ubuntu2604-package-lock.tsv",
+        .package_lock = "/var/lib/miz/ubuntu2604-package-lock.tsv",
         .package_lock_sha256 = @as([]const u8, &lock_sha256),
         .binder_kernel_config_verified = binder_kernel_config_verified,
         .binder_module_path = binder_module_path,
@@ -2358,7 +2358,7 @@ fn customizeOfflineRoot(
     return release_name;
 }
 
-fn generalizationPolicy(flavor: Flavor) vmiz.os_customization.GeneralizationPolicy {
+fn generalizationPolicy(flavor: Flavor) miz.os_customization.GeneralizationPolicy {
     return switch (flavor) {
         .full => .{ .azure = .{
             .reset_hostname = false,
@@ -2388,7 +2388,7 @@ fn validateGuestElf(bytes: []const u8, profile: *const Profile) !void {
         return error.WrongGuestExecutableArchitecture;
 }
 
-fn removeIfPresent(filesystem: *vmiz.ext4_mountless.FileSystem, path: []const u8) !void {
+fn removeIfPresent(filesystem: *miz.ext4_mountless.FileSystem, path: []const u8) !void {
     filesystem.remove(path, true) catch |err| switch (err) {
         error.PathNotFound => {},
         else => return err,
@@ -2398,30 +2398,30 @@ fn removeIfPresent(filesystem: *vmiz.ext4_mountless.FileSystem, path: []const u8
 fn injectCoreGuest(
     allocator: Allocator,
     io: Io,
-    filesystem: *vmiz.ext4_mountless.FileSystem,
+    filesystem: *miz.ext4_mountless.FileSystem,
     profile: *const Profile,
-    vmizinit_path: []const u8,
+    mizinit_path: []const u8,
     azagent_path: []const u8,
     evidence: []const DebzEvidence,
 ) !void {
-    const vmizinit_bytes = try Dir.cwd().readFileAlloc(io, vmizinit_path, allocator, .limited(32 * 1024 * 1024));
-    defer allocator.free(vmizinit_bytes);
+    const mizinit_bytes = try Dir.cwd().readFileAlloc(io, mizinit_path, allocator, .limited(32 * 1024 * 1024));
+    defer allocator.free(mizinit_bytes);
     const azagent_bytes = try Dir.cwd().readFileAlloc(io, azagent_path, allocator, .limited(32 * 1024 * 1024));
     defer allocator.free(azagent_bytes);
-    try validateGuestElf(vmizinit_bytes, profile);
+    try validateGuestElf(mizinit_bytes, profile);
     try validateGuestElf(azagent_bytes, profile);
 
-    try filesystem.mkdir("/var/lib/vmiz/provenance", .{ .mode = 0o755 });
+    try filesystem.mkdir("/var/lib/miz/provenance", .{ .mode = 0o755 });
     try filesystem.mkdir("/etc/ssh/sshd_config.d", .{ .mode = 0o755 });
-    try filesystem.write("/usr/sbin/vmizinit", vmizinit_bytes, .{ .mode = 0o755 });
+    try filesystem.write("/usr/sbin/mizinit", mizinit_bytes, .{ .mode = 0o755 });
     try filesystem.write("/usr/sbin/azagent", azagent_bytes, .{ .mode = 0o755 });
     for (&[_][]const u8{ "init", "poweroff", "reboot", "shutdown" }) |name| {
         const path = try std.fmt.allocPrint(allocator, "/usr/sbin/{s}", .{name});
         defer allocator.free(path);
-        try filesystem.symlink(path, "vmizinit", .{ .mode = 0o777 });
+        try filesystem.symlink(path, "mizinit", .{ .mode = 0o777 });
     }
     try filesystem.write(
-        "/etc/ssh/sshd_config.d/10-vmizinit.conf",
+        "/etc/ssh/sshd_config.d/10-mizinit.conf",
         core_ssh_config,
         .{ .mode = 0o600 },
     );
@@ -2432,7 +2432,7 @@ fn injectCoreGuest(
         for ([_][]const u8{ item.lock_path, item.provenance_path }) |source| {
             const destination = try std.fmt.allocPrint(
                 allocator,
-                "/var/lib/vmiz/provenance/{s}",
+                "/var/lib/miz/provenance/{s}",
                 .{std.fs.path.basename(source)},
             );
             defer allocator.free(destination);
@@ -2441,7 +2441,7 @@ fn injectCoreGuest(
     }
     const contract = try std.json.Stringify.valueAlloc(allocator, .{
         .schema = 1,
-        .type = "vmiz-ubuntu2604-core-provenance",
+        .type = "miz-ubuntu2604-core-provenance",
         .flavor = "core",
         .release = "26.04",
         .snapshot = snapshot_base,
@@ -2451,13 +2451,13 @@ fn injectCoreGuest(
     }, .{ .whitespace = .indent_2 });
     defer allocator.free(contract);
     try filesystem.write(
-        "/var/lib/vmiz/ubuntu2604-core-provenance.json",
+        "/var/lib/miz/ubuntu2604-core-provenance.json",
         contract,
         .{ .mode = 0o600 },
     );
 }
 
-fn requireRootPath(filesystem: *const vmiz.ext4_mountless.FileSystem, path: []const u8) !void {
+fn requireRootPath(filesystem: *const miz.ext4_mountless.FileSystem, path: []const u8) !void {
     const entry = filesystem.stat(path) catch |err| switch (err) {
         error.PathNotFound => return error.CoreRequiredPathMissing,
         else => return err,
@@ -2465,7 +2465,7 @@ fn requireRootPath(filesystem: *const vmiz.ext4_mountless.FileSystem, path: []co
     if (entry.kind != .file) return error.CoreRequiredPathMissing;
 }
 
-fn requireRootPathAbsent(filesystem: *const vmiz.ext4_mountless.FileSystem, path: []const u8) !void {
+fn requireRootPathAbsent(filesystem: *const miz.ext4_mountless.FileSystem, path: []const u8) !void {
     _ = filesystem.stat(path) catch |err| switch (err) {
         error.PathNotFound => return,
         else => return err,
@@ -2484,7 +2484,7 @@ fn requireRootPathAbsent(filesystem: *const vmiz.ext4_mountless.FileSystem, path
 /// key has to be in the image; that is the whole difference.
 fn validateNoBakedIdentity(
     allocator: Allocator,
-    filesystem: *const vmiz.ext4_mountless.FileSystem,
+    filesystem: *const miz.ext4_mountless.FileSystem,
     directory: []const u8,
     flavor: Flavor,
 ) !void {
@@ -2505,7 +2505,7 @@ fn validateNoBakedIdentity(
 fn validateCoreRoot(
     allocator: Allocator,
     io: Io,
-    filesystem: *const vmiz.ext4_mountless.FileSystem,
+    filesystem: *const miz.ext4_mountless.FileSystem,
     profile: *const Profile,
     flavor: Flavor,
     evidence: []const DebzEvidence,
@@ -2513,7 +2513,7 @@ fn validateCoreRoot(
     if (evidence.len != flavor.debzPackages().len) return error.InvalidDebzEvidence;
     for (&core_required_paths) |path| try requireRootPath(filesystem, path);
     if (flavor == .baremetal) {
-        // Without this the machine boots and never becomes reachable: vmizinit
+        // Without this the machine boots and never becomes reachable: mizinit
         // would fall back to sshd, which waits for a provisioning sentinel that
         // nothing on bare metal ever writes.
         try requireRootPath(filesystem, baremetal_access_provider_path);
@@ -2528,7 +2528,7 @@ fn validateCoreRoot(
         defer allocator.free(path);
         const target = try filesystem.readLink(allocator, path, 1024);
         defer allocator.free(target);
-        if (!std.mem.eql(u8, target, "vmizinit")) return error.InvalidCoreInitLink;
+        if (!std.mem.eql(u8, target, "mizinit")) return error.InvalidCoreInitLink;
     }
     const machine_id = try filesystem.read(allocator, "/etc/machine-id", 1024);
     defer allocator.free(machine_id);
@@ -2547,7 +2547,7 @@ fn validateCoreRoot(
     }
     try validateNoBakedIdentity(allocator, filesystem, "/", flavor);
 
-    const ssh_config = try filesystem.read(allocator, "/etc/ssh/sshd_config.d/10-vmizinit.conf", 64 * 1024);
+    const ssh_config = try filesystem.read(allocator, "/etc/ssh/sshd_config.d/10-mizinit.conf", 64 * 1024);
     defer allocator.free(ssh_config);
     for (&[_][]const u8{
         "PasswordAuthentication no",
@@ -2568,7 +2568,7 @@ fn validateCoreRoot(
 
     const inventory = try filesystem.read(
         allocator,
-        "/var/lib/vmiz/ubuntu2604-package-lock.tsv",
+        "/var/lib/miz/ubuntu2604-package-lock.tsv",
         4 * 1024 * 1024,
     );
     defer allocator.free(inventory);
@@ -2585,7 +2585,7 @@ fn validateCoreRoot(
     for (evidence) |item| {
         const embedded_lock_path = try std.fmt.allocPrint(
             allocator,
-            "/var/lib/vmiz/provenance/{s}",
+            "/var/lib/miz/provenance/{s}",
             .{std.fs.path.basename(item.lock_path)},
         );
         defer allocator.free(embedded_lock_path);
@@ -2602,7 +2602,7 @@ fn validateCoreRoot(
 
         const embedded_provenance_path = try std.fmt.allocPrint(
             allocator,
-            "/var/lib/vmiz/provenance/{s}",
+            "/var/lib/miz/provenance/{s}",
             .{std.fs.path.basename(item.provenance_path)},
         );
         defer allocator.free(embedded_provenance_path);
@@ -2618,9 +2618,9 @@ fn validateCoreRoot(
         )) return error.EmbeddedProvenanceMismatch;
     }
 
-    const vmizinit = try filesystem.read(allocator, "/usr/sbin/vmizinit", 32 * 1024 * 1024);
-    defer allocator.free(vmizinit);
-    try validateGuestElf(vmizinit, profile);
+    const mizinit = try filesystem.read(allocator, "/usr/sbin/mizinit", 32 * 1024 * 1024);
+    defer allocator.free(mizinit);
+    try validateGuestElf(mizinit, profile);
     const azagent = try filesystem.read(allocator, "/usr/sbin/azagent", 32 * 1024 * 1024);
     defer allocator.free(azagent);
     try validateGuestElf(azagent, profile);
@@ -2635,7 +2635,7 @@ fn customizeRootWithDebz(
     mutable_image: []const u8,
     work_dir: []const u8,
     provenance_dir: []const u8,
-    vmizinit_path: ?[]const u8,
+    mizinit_path: ?[]const u8,
     azagent_path: ?[]const u8,
     proxy: ?[]const u8,
     debz_cache: ?[]const u8,
@@ -2654,7 +2654,7 @@ fn customizeRootWithDebz(
     try Dir.cwd().createDirPath(io, extraction);
     var native_root = try openNativeRoot(allocator, io, mutable_image, work_dir);
     defer native_root.deinit();
-    var host_manifest = vmiz.ext4_mountless.HostTreeManifest.init(allocator);
+    var host_manifest = miz.ext4_mountless.HostTreeManifest.init(allocator);
     defer host_manifest.deinit();
     try native_root.filesystem.validateCommitProfile();
     try native_root.filesystem.exportHostTreeWithManifest(extraction, .{}, &host_manifest);
@@ -2955,14 +2955,14 @@ fn customizeRootWithDebz(
         }, 0);
     }
     if (flavor.freshRoot()) {
-        const vmizinit = vmizinit_path orelse return error.CoreGuestArtifactsRequired;
+        const mizinit = mizinit_path orelse return error.CoreGuestArtifactsRequired;
         const azagent = azagent_path orelse return error.CoreGuestArtifactsRequired;
         try injectCoreGuest(
             allocator,
             io,
             &native_root.filesystem,
             profile,
-            vmizinit,
+            mizinit,
             azagent,
             evidence[0..evidence_count],
         );
@@ -3098,7 +3098,7 @@ fn writeProvenance(
 ) !void {
     if (evidence.len != full_debz_packages.len) return error.InvalidDebzEvidence;
     const document = try std.fmt.allocPrint(allocator,
-        \\{{"schema":1,"type":"vmiz-ubuntu2604-build-provenance","architecture":"{s}","release":"26.04","snapshot":{{"id":"release-{s}","base_url":"{s}/"}},"canonical_key_fingerprint":"{s}","sha256sums_signature_verified":true,"artifacts":{{"sha256sums":{{"filename":"SHA256SUMS","sha256":"{s}"}},"sha256sums_signature":{{"filename":"SHA256SUMS.gpg","sha256":"{s}"}},"source_image":{{"filename":"{s}","sha256":"{s}"}},"image_manifest":{{"filename":"{s}","sha256":"{s}"}}}},"debz":{{"api_commit":"{s}","baseline":{{"source":"canonical-image-dpkg-status","enforcement":"exact-final-closure"}},"transactions":[{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}},{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}}]}}}}
+        \\{{"schema":1,"type":"miz-ubuntu2604-build-provenance","architecture":"{s}","release":"26.04","snapshot":{{"id":"release-{s}","base_url":"{s}/"}},"canonical_key_fingerprint":"{s}","sha256sums_signature_verified":true,"artifacts":{{"sha256sums":{{"filename":"SHA256SUMS","sha256":"{s}"}},"sha256sums_signature":{{"filename":"SHA256SUMS.gpg","sha256":"{s}"}},"source_image":{{"filename":"{s}","sha256":"{s}"}},"image_manifest":{{"filename":"{s}","sha256":"{s}"}}}},"debz":{{"api_commit":"{s}","baseline":{{"source":"canonical-image-dpkg-status","enforcement":"exact-final-closure"}},"transactions":[{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}},{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}}]}}}}
         \\
     , .{
         @tagName(profile.architecture),
@@ -3160,7 +3160,7 @@ fn writeFreshRootProvenance(
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try output.writer.print(
-        "{{\"schema\":1,\"type\":\"vmiz-ubuntu2604-build-provenance\",\"architecture\":\"{s}\",\"flavor\":\"{s}\",\"release\":\"26.04\",\"virtual_size\":{d},\"minimum_root_free_bytes\":{d},\"validated_root_free_bytes\":{d},\"snapshot\":{{\"id\":\"release-{s}\",\"base_url\":\"{s}/\"}},\"canonical_key_fingerprint\":\"{s}\",\"sha256sums_signature_verified\":true,\"artifacts\":{{\"sha256sums\":{{\"filename\":\"SHA256SUMS\",\"sha256\":\"{s}\"}},\"sha256sums_signature\":{{\"filename\":\"SHA256SUMS.gpg\",\"sha256\":\"{s}\"}},\"source_image\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"role\":\"signed-gpt-esp-substrate\"}},\"image_manifest\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}}},\"debz\":{{\"api_commit\":\"{s}\",\"baseline\":{{\"source\":\"empty-debz-root\",\"enforcement\":\"exact-final-closure\"}},\"package_roots\":[",
+        "{{\"schema\":1,\"type\":\"miz-ubuntu2604-build-provenance\",\"architecture\":\"{s}\",\"flavor\":\"{s}\",\"release\":\"26.04\",\"virtual_size\":{d},\"minimum_root_free_bytes\":{d},\"validated_root_free_bytes\":{d},\"snapshot\":{{\"id\":\"release-{s}\",\"base_url\":\"{s}/\"}},\"canonical_key_fingerprint\":\"{s}\",\"sha256sums_signature_verified\":true,\"artifacts\":{{\"sha256sums\":{{\"filename\":\"SHA256SUMS\",\"sha256\":\"{s}\"}},\"sha256sums_signature\":{{\"filename\":\"SHA256SUMS.gpg\",\"sha256\":\"{s}\"}},\"source_image\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"role\":\"signed-gpt-esp-substrate\"}},\"image_manifest\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}}},\"debz\":{{\"api_commit\":\"{s}\",\"baseline\":{{\"source\":\"empty-debz-root\",\"enforcement\":\"exact-final-closure\"}},\"package_roots\":[",
         .{
             @tagName(profile.architecture),
             @tagName(flavor),
@@ -3265,7 +3265,7 @@ fn writeSigningProvenance(
     _ = std.base64.standard.Encoder.encode(certificate_base64, certificate.der);
     const document = .{
         .schema = 1,
-        .type = "vmiz-uki-signing",
+        .type = "miz-uki-signing",
         .architecture = @tagName(profile.architecture),
         .flavor = @tagName(flavor),
         .uki_stub = .{
@@ -3306,7 +3306,7 @@ fn extractNativeBootInputs(
     defer native_root.deinit();
     const lock_bytes = try native_root.filesystem.read(
         allocator,
-        "/var/lib/vmiz/ubuntu2604-package-lock.tsv",
+        "/var/lib/miz/ubuntu2604-package-lock.tsv",
         4 * 1024 * 1024,
     );
     defer allocator.free(lock_bytes);
@@ -3393,9 +3393,9 @@ const initramfs_gzip_magic: u16 = 0x8b1f;
 /// configuration that asked for it.
 fn decompressInitramfsTail(allocator: Allocator, tail: []const u8) ![]u8 {
     if (tail.len >= 4 and
-        std.mem.readInt(u32, tail[0..4], .little) == vmiz.zstd.zstd_magic)
+        std.mem.readInt(u32, tail[0..4], .little) == miz.zstd.zstd_magic)
     {
-        const decoded = vmiz.zstd.decodeAlloc(allocator, tail) catch
+        const decoded = miz.zstd.decodeAlloc(allocator, tail) catch
             return error.UnreadableInitramfs;
         return decoded.bytes;
     }
@@ -3431,12 +3431,12 @@ fn requireInitramfsModules(
     defer allocator.free(found);
     @memset(found, false);
 
-    var early = vmiz.cpio.Reader.init(image);
+    var early = miz.cpio.Reader.init(image);
     try scanCpioForModules(&early, required, found);
     if (early.offset < image.len) {
         const decoded = try decompressInitramfsTail(allocator, image[early.offset..]);
         defer allocator.free(decoded);
-        var payload = vmiz.cpio.Reader.init(decoded);
+        var payload = miz.cpio.Reader.init(decoded);
         try scanCpioForModules(&payload, required, found);
     }
 
@@ -3449,7 +3449,7 @@ fn requireInitramfsModules(
 }
 
 fn scanCpioForModules(
-    reader: *vmiz.cpio.Reader,
+    reader: *miz.cpio.Reader,
     required: []const []const u8,
     found: []bool,
 ) !void {
@@ -3469,7 +3469,7 @@ fn scanCpioForModules(
 /// A QCOW2 is the artifact everything else here validates, and it stays that:
 /// this is a second copy, produced only after the first has passed every gate,
 /// for the one consumer that cannot read the format -- `dd` onto a disk. Going
-/// through `vmiz.Image` rather than a converter keeps the two copies provably
+/// through `miz.Image` rather than a converter keeps the two copies provably
 /// the same bytes, and keeps the promise that this builder shells out to
 /// nothing. It is staged and renamed for the same reason the QCOW2 is: a copy
 /// interrupted partway through must not be left at the name something else is
@@ -3480,20 +3480,20 @@ fn writeRawCopy(
     qcow2_path: []const u8,
     raw_path: []const u8,
 ) !void {
-    const staged = try std.fmt.allocPrint(allocator, "{s}.vmiz-raw-stage", .{raw_path});
+    const staged = try std.fmt.allocPrint(allocator, "{s}.miz-raw-stage", .{raw_path});
     defer allocator.free(staged);
     Dir.cwd().deleteFile(io, staged) catch {};
     errdefer Dir.cwd().deleteFile(io, staged) catch {};
 
     try copyNativeImage(allocator, io, qcow2_path, staged, .raw);
 
-    var written = try vmiz.Image.openPathReadOnlyStandalone(io, staged);
+    var written = try miz.Image.openPathReadOnlyStandalone(io, staged);
     const written_format = written.format;
     const written_size = written.virtual_size;
     written.close(io);
     if (written_format != .raw) return error.InvalidRawCopy;
 
-    var source = try vmiz.Image.openPathReadOnlyStandalone(io, qcow2_path);
+    var source = try miz.Image.openPathReadOnlyStandalone(io, qcow2_path);
     const source_size = source.virtual_size;
     source.close(io);
     if (written_size != source_size) return error.InvalidRawCopy;
@@ -3501,8 +3501,8 @@ fn writeRawCopy(
     try Dir.cwd().rename(staged, Dir.cwd(), raw_path, io);
 }
 
-fn espPartition(partitions: []const vmiz.gpt.PartitionEntry) !vmiz.gpt.PartitionEntry {
-    var found: ?vmiz.gpt.PartitionEntry = null;
+fn espPartition(partitions: []const miz.gpt.PartitionEntry) !miz.gpt.PartitionEntry {
+    var found: ?miz.gpt.PartitionEntry = null;
     for (partitions) |partition| {
         if (!std.mem.eql(u8, &partition.partition_type_guid, &guid.esp)) continue;
         if (found != null) return error.AmbiguousEspPartition;
@@ -3518,14 +3518,14 @@ fn insertSignedUki(
     signed_path: []const u8,
     profile: *const Profile,
 ) !void {
-    var image = try vmiz.Image.openPath(io, image_path);
+    var image = try miz.Image.openPath(io, image_path);
     defer image.close(io);
-    const parsed = try vmiz.gpt.readGpt(image, io, allocator);
+    const parsed = try miz.gpt.readGpt(image, io, allocator);
     defer allocator.free(parsed.partitions);
     const esp = try espPartition(parsed.partitions);
-    var filesystem = try vmiz.fat32.open(&image, io, .{
-        .offset = esp.first_lba * vmiz.gpt.sector_size,
-        .length = (esp.last_lba - esp.first_lba + 1) * vmiz.gpt.sector_size,
+    var filesystem = try miz.fat32.open(&image, io, .{
+        .offset = esp.first_lba * miz.gpt.sector_size,
+        .length = (esp.last_lba - esp.first_lba + 1) * miz.gpt.sector_size,
     });
     try filesystem.createDir(io, "EFI/BOOT");
     const signed = try Dir.cwd().readFileAlloc(io, signed_path, allocator, .limited(256 * 1024 * 1024));
@@ -3554,14 +3554,14 @@ fn validateFinalNativeImage(
     profile: *const Profile,
     expected_cmdline: []const u8,
 ) !void {
-    var image = try vmiz.Image.openPathReadOnly(io, image_path);
+    var image = try miz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
-    const parsed = try vmiz.gpt.readGpt(image, io, allocator);
+    const parsed = try miz.gpt.readGpt(image, io, allocator);
     defer allocator.free(parsed.partitions);
     const esp = try espPartition(parsed.partitions);
-    var filesystem = try vmiz.fat32.open(&image, io, .{
-        .offset = esp.first_lba * vmiz.gpt.sector_size,
-        .length = (esp.last_lba - esp.first_lba + 1) * vmiz.gpt.sector_size,
+    var filesystem = try miz.fat32.open(&image, io, .{
+        .offset = esp.first_lba * miz.gpt.sector_size,
+        .length = (esp.last_lba - esp.first_lba + 1) * miz.gpt.sector_size,
     });
     const fallback = try std.fmt.allocPrint(allocator, "EFI/BOOT/{s}", .{profile.efi_fallback});
     defer allocator.free(fallback);
@@ -3578,14 +3578,14 @@ fn validateFinalNativeImage(
 fn validateNoStaleNamedUki(
     allocator: Allocator,
     io: Io,
-    filesystem: *vmiz.fat32.FileSystem,
+    filesystem: *miz.fat32.FileSystem,
     profile: *const Profile,
 ) !void {
     const entries = filesystem.listDirAlloc(io, allocator, "EFI/Linux") catch |err| switch (err) {
         error.PathNotFound => return,
         else => return err,
     };
-    defer vmiz.fat32.freeDirEntries(allocator, entries);
+    defer miz.fat32.freeDirEntries(allocator, entries);
     for (entries) |entry| {
         if (entry.kind != .file) continue;
         // FAT is case-insensitive, so a stale copy can resurface under any spelling.
@@ -3725,28 +3725,28 @@ fn buildImage(
     defer source_setup.end();
     errdefer |err| source_setup.fail(@errorName(err));
     Dir.cwd().deleteFile(io, mutable) catch {};
-    var source_image = try vmiz.Image.openPathReadOnlyStandalone(io, source_path);
+    var source_image = try miz.Image.openPathReadOnlyStandalone(io, source_path);
     defer source_image.close(io);
     if (args.flavor.freshRoot() and source_image.virtual_size != core_virtual_size)
         return error.UnexpectedCoreSubstrateSize;
     if (args.size < source_image.virtual_size) return error.ImageTooSmall;
-    var mutable_image = try vmiz.Image.createExclusive(
+    var mutable_image = try miz.Image.createExclusive(
         io,
         mutable,
         .qcow2,
         source_image.virtual_size,
         .{},
     );
-    _ = try vmiz.copyAll(io, source_image, &mutable_image, allocator);
+    _ = try miz.copyAll(io, source_image, &mutable_image, allocator);
     mutable_image.close(io);
     if (args.size > source_image.virtual_size) {
-        _ = try vmiz.root_resize.growExistingQcow2(
+        _ = try miz.root_resize.growExistingQcow2(
             allocator,
             io,
             mutable,
             .{
                 .target_size = args.size,
-                .filesystem_label = vmiz.root_resize.default_filesystem_label,
+                .filesystem_label = miz.root_resize.default_filesystem_label,
             },
         );
     }
@@ -3760,7 +3760,7 @@ fn buildImage(
         mutable,
         work_dir,
         provenance_dir,
-        args.vmizinit,
+        args.mizinit,
         args.azagent,
         args.proxy,
         args.debz_cache,
@@ -3803,14 +3803,14 @@ fn buildImage(
     if (try peMachine(stub_bytes) != profile.pe_machine) return error.WrongStubArchitecture;
     const stub_sha256 = artifact_pipeline.formatSha256(artifact_pipeline.sha256Bytes(stub_bytes));
 
-    const kernel_bytes = try Dir.cwd().readFileAlloc(io, kernel_host, allocator, .limited(vmiz.uki.limits.max_linux_size));
+    const kernel_bytes = try Dir.cwd().readFileAlloc(io, kernel_host, allocator, .limited(miz.uki.limits.max_linux_size));
     defer allocator.free(kernel_bytes);
-    const initrd_bytes = try Dir.cwd().readFileAlloc(io, initrd_host, allocator, .limited(vmiz.uki.limits.max_initrd_size));
+    const initrd_bytes = try Dir.cwd().readFileAlloc(io, initrd_host, allocator, .limited(miz.uki.limits.max_initrd_size));
     defer allocator.free(initrd_bytes);
-    const os_release_bytes = try Dir.cwd().readFileAlloc(io, os_release_host, allocator, .limited(vmiz.uki.limits.max_os_release_size));
+    const os_release_bytes = try Dir.cwd().readFileAlloc(io, os_release_host, allocator, .limited(miz.uki.limits.max_os_release_size));
     defer allocator.free(os_release_bytes);
 
-    const unsigned_bytes = try vmiz.uki.generate(allocator, .{
+    const unsigned_bytes = try miz.uki.generate(allocator, .{
         .stub = stub_bytes,
         .linux = kernel_bytes,
         .initrd = initrd_bytes,
@@ -3867,7 +3867,7 @@ fn buildImage(
     const os_release = try final_root.filesystem.read(allocator, "/etc/os-release", 64 * 1024);
     defer allocator.free(os_release);
     if (std.mem.indexOf(u8, os_release, "VERSION_ID=\"26.04\"") == null) return error.WrongGuestRelease;
-    const final_lock = try final_root.filesystem.read(allocator, "/var/lib/vmiz/ubuntu2604-package-lock.tsv", 4 * 1024 * 1024);
+    const final_lock = try final_root.filesystem.read(allocator, "/var/lib/miz/ubuntu2604-package-lock.tsv", 4 * 1024 * 1024);
     defer allocator.free(final_lock);
     try validateExactLockRuntime(allocator, final_lock, profile, args.flavor);
     if (args.flavor.freshRoot()) try validateCoreRoot(
@@ -4538,12 +4538,12 @@ test "native image conversion round trips and cleans failed publication stages" 
     const roundtrip_path = try std.fs.path.join(allocator, &.{ root, "roundtrip.raw" });
     defer allocator.free(roundtrip_path);
 
-    var raw = try vmiz.Image.create(io, raw_path, .raw, 1024 * 1024, .{});
+    var raw = try miz.Image.create(io, raw_path, .raw, 1024 * 1024, .{});
     try raw.pwrite(io, "native-ubuntu-builder", 4096);
     raw.close(io);
     try copyNativeImage(allocator, io, raw_path, qcow_path, .qcow2);
     try copyNativeImage(allocator, io, qcow_path, roundtrip_path, .raw);
-    var roundtrip = try vmiz.Image.openPathReadOnly(io, roundtrip_path);
+    var roundtrip = try miz.Image.openPathReadOnly(io, roundtrip_path);
     defer roundtrip.close(io);
     var bytes: [21]u8 = undefined;
     try std.testing.expectEqual(bytes.len, try roundtrip.pread(io, &bytes, 4096));
@@ -4558,7 +4558,7 @@ test "native image conversion round trips and cleans failed publication stages" 
     );
     const staged = try std.fmt.allocPrint(
         allocator,
-        "{s}.vmiz-native-stage",
+        "{s}.miz-native-stage",
         .{blocked_destination},
     );
     defer allocator.free(staged);
@@ -4580,13 +4580,13 @@ test "the raw copy is the same guest bytes, published only once complete" {
     const raw_path = try std.fs.path.join(allocator, &.{ root, "image.raw" });
     defer allocator.free(raw_path);
 
-    var seed = try vmiz.Image.create(io, seed_path, .raw, 1024 * 1024, .{});
+    var seed = try miz.Image.create(io, seed_path, .raw, 1024 * 1024, .{});
     try seed.pwrite(io, "written-to-a-disk", 8192);
     seed.close(io);
     try copyNativeImage(allocator, io, seed_path, qcow_path, .qcow2);
 
     try writeRawCopy(allocator, io, qcow_path, raw_path);
-    var raw = try vmiz.Image.openPathReadOnly(io, raw_path);
+    var raw = try miz.Image.openPathReadOnly(io, raw_path);
     defer raw.close(io);
     try std.testing.expectEqual(ImageFormat.raw, raw.format);
     try std.testing.expectEqual(@as(u64, 1024 * 1024), raw.virtual_size);
@@ -4600,7 +4600,7 @@ test "the raw copy is the same guest bytes, published only once complete" {
     defer allocator.free(blocked);
     try Dir.cwd().createDirPath(io, blocked);
     try std.testing.expectError(error.IsDir, writeRawCopy(allocator, io, qcow_path, blocked));
-    const staged_raw = try std.fmt.allocPrint(allocator, "{s}.vmiz-raw-stage", .{blocked});
+    const staged_raw = try std.fmt.allocPrint(allocator, "{s}.miz-raw-stage", .{blocked});
     defer allocator.free(staged_raw);
     try std.testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, staged_raw, .{}));
 }
@@ -4715,7 +4715,7 @@ test "bare-metal access resizes root best-effort before starting sshd" {
         "#!/bin/sh\n" ++
             "set -e\n" ++
             "if ! /usr/sbin/azagent --resize-root-only; then\n" ++
-            "    echo \"vmizinit-access: warning: root resize failed; continuing boot\" >&2\n" ++
+            "    echo \"mizinit-access: warning: root resize failed; continuing boot\" >&2\n" ++
             "fi\n" ++
             "[ -f /etc/ssh/ssh_host_ed25519_key ] || /usr/bin/ssh-keygen -A\n" ++
             "mkdir -p /run/sshd\n" ++
@@ -4821,7 +4821,7 @@ test "committed local UKI signing fixtures load and sign against the enrolled ce
     // committed PEM fixtures here keeps the local release gate reproducible: a
     // silent fixture swap, a corrupted key, or a key/certificate mismatch all
     // fail in `zig build test-generalized-ubuntu2604`, before any 5 GiB build.
-    var certificate = try vmiz.uki_signing.loadCertificateAlloc(allocator, io, .{
+    var certificate = try miz.uki_signing.loadCertificateAlloc(allocator, io, .{
         .host_path = "tests/fixtures/ubuntu2604-local-signing/signing-cert.pem",
     });
     defer certificate.deinit(allocator);
@@ -4837,7 +4837,7 @@ test "committed local UKI signing fixtures load and sign against the enrolled ce
         .limited(64 * 1024),
     );
     defer allocator.free(key_pem);
-    const key_der = try vmiz.authenticode.decodePrivateKeyPemAlloc(allocator, key_pem);
+    const key_der = try miz.authenticode.decodePrivateKeyPemAlloc(allocator, key_pem);
     defer allocator.free(key_der);
 
     // Exercise the exact native local-key path the builder uses: sign a minimal
@@ -4845,14 +4845,14 @@ test "committed local UKI signing fixtures load and sign against the enrolled ce
     // that does not belong to the enrolled certificate cannot verify here.
     const image = try makeMinimalSignablePe(allocator);
     defer allocator.free(image);
-    const signed = try vmiz.authenticode.signPeRsaSha256Alloc(
+    const signed = try miz.authenticode.signPeRsaSha256Alloc(
         allocator,
         image,
         key_der,
         certificate.der,
     );
     defer allocator.free(signed);
-    const signer = try vmiz.authenticode.verifyRsaSha256(signed);
+    const signer = try miz.authenticode.verifyRsaSha256(signed);
     try std.testing.expectEqualSlices(u8, certificate.der, signer.certificate_der);
 }
 
@@ -4915,7 +4915,7 @@ test "the bare-metal initramfs is required to carry the drivers that reach the m
         fn archive(a: Allocator, paths: []const []const u8) ![]u8 {
             var buffer = std.array_list.Managed(u8).init(a);
             errdefer buffer.deinit();
-            var writer = vmiz.cpio.Writer.init(&buffer, .newc);
+            var writer = miz.cpio.Writer.init(&buffer, .newc);
             // Every archive initramfs-tools writes opens with the root entry.
             try writer.append(.{
                 .path = ".",
@@ -4939,7 +4939,7 @@ test "the bare-metal initramfs is required to carry the drivers that reach the m
             var out: std.Io.Writer.Allocating = .init(a);
             errdefer out.deinit();
             try out.writer.writeAll(early_bytes);
-            try vmiz.zstd.writeRawFrameForSlice(&out.writer, main_bytes, null);
+            try miz.zstd.writeRawFrameForSlice(&out.writer, main_bytes, null);
             return out.toOwnedSlice();
         }
 
@@ -5089,10 +5089,10 @@ test "UKI cmdline binds final root PARTUUID and native serial console" {
     );
     defer std.testing.allocator.free(core_cmdline);
     try std.testing.expectEqualStrings(
-        "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=auto console=tty0 console=ttyAMA0,115200n8",
+        "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto console=tty0 console=ttyAMA0,115200n8",
         core_cmdline,
     );
-    try std.testing.expect(std.mem.indexOf(u8, core_cmdline, "vmizinit.shell=on") == null);
+    try std.testing.expect(std.mem.indexOf(u8, core_cmdline, "mizinit.shell=on") == null);
 
     const baremetal_cmdline = try ukiCmdline(
         std.testing.allocator,
@@ -5102,12 +5102,12 @@ test "UKI cmdline binds final root PARTUUID and native serial console" {
     );
     defer std.testing.allocator.free(baremetal_cmdline);
     try std.testing.expectEqualStrings(
-        "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=off console=tty0 console=ttyAMA0,115200n8",
+        "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=off console=tty0 console=ttyAMA0,115200n8",
         baremetal_cmdline,
     );
     // `auto` would send the machine looking for an Azure it is never going to
     // find; `off` is the whole point of the flavor.
-    try std.testing.expect(std.mem.indexOf(u8, baremetal_cmdline, "vmizinit.azure=auto") == null);
+    try std.testing.expect(std.mem.indexOf(u8, baremetal_cmdline, "mizinit.azure=auto") == null);
 }
 
 test "native boot validation rejects missing modules.dep and initramfs" {
@@ -5309,7 +5309,7 @@ test "core kernel config validation requires every Binder-enabling line" {
     });
     try validateCoreKernelConfig(allocator, &root, kernel_release);
 
-    // Binder built directly in, rather than as the loadable module vmizinit
+    // Binder built directly in, rather than as the loadable module mizinit
     // expects to load, must be rejected just as absence would be.
     try root.writeFile(.{
         .path = "/boot/config-" ++ kernel_release,
@@ -5326,7 +5326,7 @@ test "core kernel config validation requires every Binder-enabling line" {
         validateCoreKernelConfig(allocator, &root, kernel_release),
     );
 
-    // A default device name is exactly the drift `vmizinit.binder=required`
+    // A default device name is exactly the drift `mizinit.binder=required`
     // must not race with: the kernel would already own `/dev/binder`.
     try root.writeFile(.{
         .path = "/boot/config-" ++ kernel_release,
@@ -5386,7 +5386,7 @@ test "the packaged Android Binder module must be present signed and never DKMS-s
     {
         var compressed: std.Io.Writer.Allocating = .init(allocator);
         defer compressed.deinit();
-        try vmiz.zstd.writeRawFrameForSlice(&compressed.writer, signed_bytes, null);
+        try miz.zstd.writeRawFrameForSlice(&compressed.writer, signed_bytes, null);
         try root.writeFile(.{
             .path = android_dir ++ "/binder_linux.ko.zst",
             .source = .{ .inline_bytes = compressed.written() },
@@ -5400,7 +5400,7 @@ test "the packaged Android Binder module must be present signed and never DKMS-s
     }
 
     // Two candidates at once is exactly as unresolvable as none: which one
-    // vmizinit would load is not this builder's call to make silently.
+    // mizinit would load is not this builder's call to make silently.
     try root.writeFile(.{
         .path = android_dir ++ "/binder_linux.ko",
         .source = .{ .inline_bytes = signed_bytes },
@@ -5482,7 +5482,7 @@ test "core initramfs validation requires the packaged Binder module" {
         fn archive(a: Allocator, paths: []const []const u8) ![]u8 {
             var buffer = std.array_list.Managed(u8).init(a);
             errdefer buffer.deinit();
-            var writer = vmiz.cpio.Writer.init(&buffer, .newc);
+            var writer = miz.cpio.Writer.init(&buffer, .newc);
             for (paths) |path| try writer.append(.{
                 .path = path,
                 .content = "module",
@@ -5497,7 +5497,7 @@ test "core initramfs validation requires the packaged Binder module" {
             defer a.free(main_bytes);
             var out: std.Io.Writer.Allocating = .init(a);
             errdefer out.deinit();
-            try vmiz.zstd.writeRawFrameForSlice(&out.writer, main_bytes, null);
+            try miz.zstd.writeRawFrameForSlice(&out.writer, main_bytes, null);
             return out.toOwnedSlice();
         }
     };
@@ -5648,36 +5648,36 @@ test "core injection writes static agents links configuration and embedded evide
     const io = std.testing.io;
     const image_path = "test-ubuntu2604-core-injection.raw";
     const spool_path = "test-ubuntu2604-core-injection.spool";
-    const vmizinit_path = "test-ubuntu2604-vmizinit";
+    const mizinit_path = "test-ubuntu2604-mizinit";
     const azagent_path = "test-ubuntu2604-azagent";
     defer Dir.cwd().deleteFile(io, image_path) catch {};
     defer Dir.cwd().deleteFile(io, spool_path) catch {};
-    defer Dir.cwd().deleteFile(io, vmizinit_path) catch {};
+    defer Dir.cwd().deleteFile(io, mizinit_path) catch {};
     defer Dir.cwd().deleteFile(io, azagent_path) catch {};
 
     var elf: [20]u8 = @splat(0);
     @memcpy(elf[0..4], "\x7fELF");
     elf[5] = 1;
     std.mem.writeInt(u16, elf[18..20], 62, .little);
-    try Dir.cwd().writeFile(io, .{ .sub_path = vmizinit_path, .data = &elf });
+    try Dir.cwd().writeFile(io, .{ .sub_path = mizinit_path, .data = &elf });
     try Dir.cwd().writeFile(io, .{ .sub_path = azagent_path, .data = &elf });
 
     const length: u64 = 32 * 1024 * 1024;
-    var image = try vmiz.Image.createExclusive(io, image_path, .raw, length, .{});
+    var image = try miz.Image.createExclusive(io, image_path, .raw, length, .{});
     defer image.close(io);
-    var tree = vmiz.root_tree.RootTree.initMemory(allocator, io, .{});
+    var tree = miz.root_tree.RootTree.initMemory(allocator, io, .{});
     defer tree.deinit();
     for (&[_][]const u8{
-        "usr", "usr/sbin", "etc",          "etc/ssh", "etc/ssh/sshd_config.d",
-        "var", "var/lib",  "var/lib/vmiz",
+        "usr", "usr/sbin", "etc",         "etc/ssh", "etc/ssh/sshd_config.d",
+        "var", "var/lib",  "var/lib/miz",
     }) |directory| try tree.putDirectory(directory, .{ .mode = 0o755 });
     try tree.putSymlink("sbin", "usr/sbin", .{ .mode = 0o777 });
-    _ = try vmiz.ext4.populate(io, image.file, allocator, try tree.cursor(), .{
+    _ = try miz.ext4.populate(io, image.file, allocator, try tree.cursor(), .{
         .length = length,
         .label = "cloudimg-rootfs",
     });
 
-    var filesystem = try vmiz.ext4_mountless.FileSystem.open(allocator, io, image.file, .{
+    var filesystem = try miz.ext4_mountless.FileSystem.open(allocator, io, image.file, .{
         .length = length,
         .spool_path = spool_path,
         .atomic_path = image_path,
@@ -5715,25 +5715,25 @@ test "core injection writes static agents links configuration and embedded evide
         io,
         &filesystem,
         profileFor(.x86_64),
-        vmizinit_path,
+        mizinit_path,
         azagent_path,
         &evidence,
     );
-    const injected = try filesystem.read(allocator, "/usr/sbin/vmizinit", 1024);
+    const injected = try filesystem.read(allocator, "/usr/sbin/mizinit", 1024);
     defer allocator.free(injected);
     try std.testing.expectEqualSlices(u8, &elf, injected);
     const init_target = try filesystem.readLink(allocator, "/usr/sbin/init", 1024);
     defer allocator.free(init_target);
-    try std.testing.expectEqualStrings("vmizinit", init_target);
+    try std.testing.expectEqualStrings("mizinit", init_target);
     const ssh_config = try filesystem.read(
         allocator,
-        "/etc/ssh/sshd_config.d/10-vmizinit.conf",
+        "/etc/ssh/sshd_config.d/10-mizinit.conf",
         4096,
     );
     defer allocator.free(ssh_config);
     try std.testing.expectEqualStrings(core_ssh_config, ssh_config);
-    _ = try filesystem.stat("/var/lib/vmiz/provenance/test-core-0.lock.json");
-    _ = try filesystem.stat("/var/lib/vmiz/ubuntu2604-core-provenance.json");
+    _ = try filesystem.stat("/var/lib/miz/provenance/test-core-0.lock.json");
+    _ = try filesystem.stat("/var/lib/miz/ubuntu2604-core-provenance.json");
 }
 
 test "final native qcow2 validation covers the exact release size" {
@@ -5746,7 +5746,7 @@ test "final native qcow2 validation covers the exact release size" {
         &.{ root_buffer[0..root_length], "release.qcow2" },
     );
     defer std.testing.allocator.free(path);
-    var image = try vmiz.Image.create(
+    var image = try miz.Image.create(
         std.testing.io,
         path,
         .qcow2,
@@ -5781,7 +5781,7 @@ test "production builder contains no libguestfs or qemu-img command surface" {
         "\"supermin\"",
         "\"LIBGUESTFS_BACKEND_SETTINGS\"",
         // Acceptance #1: production finalization must not invoke qemu tooling;
-        // compressed qcow2 clusters are emitted natively by vmiz.qcow2.
+        // compressed qcow2 clusters are emitted natively by miz.qcow2.
         "\"qemu-img\"",
         "\"qemu-utils\"",
         "\"qemu-nbd\"",
@@ -5834,7 +5834,7 @@ test "provenance binds signed source metadata and validated debz evidence" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 9), parsed.value.object.count());
     try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("schema").?.integer);
-    try std.testing.expectEqualStrings("vmiz-ubuntu2604-build-provenance", parsed.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("miz-ubuntu2604-build-provenance", parsed.value.object.get("type").?.string);
     try std.testing.expectEqualStrings(
         profileFor(.x86_64).manifest_sha256,
         parsed.value.object.get("artifacts").?.object.get("image_manifest").?.object.get("sha256").?.string,

@@ -3,7 +3,7 @@
 //! Scoped down from upstream's `set_hostname`/`publish_hostname`: this
 //! writes `/etc/hostname` and calls `sethostname(2)` directly (a real
 //! kernel syscall, not a shell-out to the `hostname` binary), matching
-//! `vmizinit/init.zig`'s existing direct-syscall style for the same call.
+//! `mizinit/init.zig`'s existing direct-syscall style for the same call.
 //! Upstream's further `publish_hostname` step edits distro-specific
 //! `dhclient.conf` files so the DHCP client also sends the new hostname --
 //! out of scope here since Azure Linux's systemd-networkd/NetworkManager
@@ -22,7 +22,7 @@ pub fn etcHostnameContent(buf: *[max_hostname_len + 1]u8, hostname: []const u8) 
     return std.fmt.bufPrint(buf, "{s}\n", .{hostname});
 }
 
-/// Calls `sethostname(2)` directly, matching `vmizinit`'s style. Real
+/// Calls `sethostname(2)` directly, matching `mizinit`'s style. Real
 /// kernel-state mutation -- deliberately not covered by an automated test
 /// (it would change the *host* running the test suite); exercised only via
 /// manual/real-VM verification.

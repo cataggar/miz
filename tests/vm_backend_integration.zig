@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -23,8 +23,8 @@ const Allocator = std.mem.Allocator;
 const disk_size: u64 = 160 * 1024 * 1024;
 const partition_first_lba: u32 = 2048;
 const partition_sectors: u32 = 300 * 1024;
-const partition_offset = @as(u64, partition_first_lba) * vmiz.mbr.sector_size;
-const partition_length = @as(u64, partition_sectors) * vmiz.mbr.sector_size;
+const partition_offset = @as(u64, partition_first_lba) * miz.mbr.sector_size;
+const partition_length = @as(u64, partition_sectors) * miz.mbr.sector_size;
 
 const kernel_release = "6.12.0-1.integration";
 const kernel_bytes = "integration-kernel-image\n";
@@ -76,8 +76,8 @@ const hook_scripts = [_][]const u8{
 /// argument the emulator was handed, is scanned for these bytes and required
 /// not to contain them.
 const credential_username = "integration-builder";
-const credential_variable = "VMIZ_INTEGRATION_TOKEN";
-const credential_material = "vmiz-integration-credential-sentinel";
+const credential_variable = "MIZ_INTEGRATION_TOKEN";
+const credential_material = "miz-integration-credential-sentinel";
 
 /// The environment the backend is told to resolve `host_environment` against.
 ///
@@ -94,7 +94,7 @@ fn testEnviron() std.process.Environ {
 /// What the stand-in image prints once its own boot chain has control. Real
 /// plans name whatever their image says; the value only has to be something
 /// nothing else on the console would produce by accident.
-const console_marker = "vmiz-integration-guest is up";
+const console_marker = "miz-integration-guest is up";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -117,7 +117,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn runIntegration(allocator: Allocator, io: Io, self_exe: []const u8) !void {
-    const architecture: vmiz.customize.Architecture = switch (builtin.cpu.arch) {
+    const architecture: miz.customize.Architecture = switch (builtin.cpu.arch) {
         .x86_64 => .x86_64,
         .aarch64 => .aarch64,
         else => {
@@ -158,8 +158,8 @@ fn runSuccess(
     allocator: Allocator,
     io: Io,
     self_exe: []const u8,
-    architecture: vmiz.customize.Architecture,
-    transport: vmiz.vm_payload.DiskTransport,
+    architecture: miz.customize.Architecture,
+    transport: miz.vm_payload.DiskTransport,
     drivers: Drivers,
 ) !void {
     var workspace = try Workspace.create(allocator, io, self_exe, architecture, transport, drivers);
@@ -174,7 +174,7 @@ fn runSuccess(
         if (diagnostic.code == .cleanup_failed) return error.CleanupFailed;
     }
 
-    try ensure(result.provenance.schema_version == vmiz.customize.provenance_schema_version);
+    try ensure(result.provenance.schema_version == miz.customize.provenance_schema_version);
     const vm = result.provenance.execution.vm orelse
         return error.MissingVmProvenance;
     try ensure(std.mem.eql(u8, vm.emulator_command, workspace.emulator_path));
@@ -270,7 +270,7 @@ fn runGuestFailure(
     allocator: Allocator,
     io: Io,
     self_exe: []const u8,
-    architecture: vmiz.customize.Architecture,
+    architecture: miz.customize.Architecture,
 ) !void {
     var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
     defer workspace.deinit(io);
@@ -286,12 +286,12 @@ fn runHooksReachTheGuest(
     allocator: Allocator,
     io: Io,
     self_exe: []const u8,
-    architecture: vmiz.customize.Architecture,
+    architecture: miz.customize.Architecture,
 ) !void {
     var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
     defer workspace.deinit(io);
 
-    const hooks = [_]vmiz.customize.Hook{
+    const hooks = [_]miz.customize.Hook{
         .{
             .name = "after-packages",
             .phase = .after_packages,
@@ -334,12 +334,12 @@ fn runDroppedHookRefused(
     allocator: Allocator,
     io: Io,
     self_exe: []const u8,
-    architecture: vmiz.customize.Architecture,
+    architecture: miz.customize.Architecture,
 ) !void {
     var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
     defer workspace.deinit(io);
 
-    const hooks = [_]vmiz.customize.Hook{
+    const hooks = [_]miz.customize.Hook{
         .{
             .name = "after-packages",
             .phase = .after_packages,
@@ -375,7 +375,7 @@ fn runSilentGuest(
     allocator: Allocator,
     io: Io,
     self_exe: []const u8,
-    architecture: vmiz.customize.Architecture,
+    architecture: miz.customize.Architecture,
 ) !void {
     var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
     defer workspace.deinit(io);
@@ -391,7 +391,7 @@ fn runEmulatorFailure(
     allocator: Allocator,
     io: Io,
     self_exe: []const u8,
-    architecture: vmiz.customize.Architecture,
+    architecture: miz.customize.Architecture,
 ) !void {
     var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
     defer workspace.deinit(io);
@@ -410,7 +410,7 @@ fn runHardwareRejected(
     allocator: Allocator,
     io: Io,
     self_exe: []const u8,
-    architecture: vmiz.customize.Architecture,
+    architecture: miz.customize.Architecture,
 ) !void {
     if (accelerationDeviceUsable(io)) {
         std.debug.print(
@@ -427,11 +427,11 @@ fn runHardwareRejected(
     const plan = &(resolved.plan orelse return error.ResolutionProducedNoPlan);
     try workspace.rememberTransaction(plan);
 
-    var report = try vmiz.customize.preflight(
+    var report = try miz.customize.preflight(
         allocator,
         io,
         plan,
-        vmiz.customize.Platform.system(),
+        miz.customize.Platform.system(),
     );
     defer report.deinit(allocator);
     if (report.ready()) return error.HardwareAccelerationWasNotRejected;
@@ -451,7 +451,7 @@ fn runFirmwareBootMatchesDirectKernel(
     allocator: Allocator,
     io: Io,
     self_exe: []const u8,
-    architecture: vmiz.customize.Architecture,
+    architecture: miz.customize.Architecture,
 ) !void {
     var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
     defer workspace.deinit(io);
@@ -475,7 +475,7 @@ fn runFirmwareBootMatchesDirectKernel(
     try ensure(std.mem.eql(u8, &direct_digest, &try digestOfFile(io, workspace.output_path)));
 
     const result = attested.result.?;
-    try ensure(result.provenance.schema_version == vmiz.customize.provenance_schema_version);
+    try ensure(result.provenance.schema_version == miz.customize.provenance_schema_version);
     const vm = result.provenance.execution.vm orelse return error.MissingVmProvenance;
     // The two modes are distinguishable in provenance, which is the whole
     // reason the record is a union rather than a flag.
@@ -515,7 +515,7 @@ fn runFirmwareUnbootable(
     allocator: Allocator,
     io: Io,
     self_exe: []const u8,
-    architecture: vmiz.customize.Architecture,
+    architecture: miz.customize.Architecture,
 ) !void {
     var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
     defer workspace.deinit(io);
@@ -543,7 +543,7 @@ fn runFirmwareMissing(
     allocator: Allocator,
     io: Io,
     self_exe: []const u8,
-    architecture: vmiz.customize.Architecture,
+    architecture: miz.customize.Architecture,
 ) !void {
     var workspace = try Workspace.create(allocator, io, self_exe, architecture, .virtio_blk, .built_in);
     defer workspace.deinit(io);
@@ -556,10 +556,10 @@ fn runFirmwareMissing(
     const plan = &(resolved.plan orelse return error.ResolutionProducedNoPlan);
     try workspace.rememberTransaction(plan);
 
-    var platform = vmiz.customize.Platform.system();
+    var platform = miz.customize.Platform.system();
     platform.vmCheckFn = checkVm;
     platform.vmRunFn = runVm;
-    var report = try vmiz.customize.preflight(allocator, io, plan, platform);
+    var report = try miz.customize.preflight(allocator, io, plan, platform);
     defer report.deinit(allocator);
     if (report.ready()) return error.MissingFirmwareWasNotRefused;
 
@@ -597,7 +597,7 @@ fn runCredential(
     allocator: Allocator,
     io: Io,
     self_exe: []const u8,
-    architecture: vmiz.customize.Architecture,
+    architecture: miz.customize.Architecture,
 ) !void {
     var workspace = try Workspace.create(
         allocator,
@@ -622,7 +622,7 @@ fn runCredential(
     // what the source held.
     var document: Io.Writer.Allocating = .init(allocator);
     defer document.deinit();
-    try vmiz.customize.writeProvenanceJson(result.provenance, &document.writer);
+    try miz.customize.writeProvenanceJson(result.provenance, &document.writer);
     try ensure(std.mem.indexOf(u8, document.written(), credential_material) == null);
     try ensure(std.mem.indexOf(u8, document.written(), credential_variable) != null);
 
@@ -650,7 +650,7 @@ fn runCredential(
 fn expectFailedRun(
     io: Io,
     workspace: *const Workspace,
-    outcome: *const vmiz.customize.ExecutionOutcome,
+    outcome: *const miz.customize.ExecutionOutcome,
 ) !void {
     if (outcome.result != null) return error.FailedRunProducedResult;
     if (!outcome.diagnostics.hasErrors()) return error.FailedRunReportedNoError;
@@ -674,8 +674,8 @@ const Workspace = struct {
     transaction_path: []const u8 = "",
     emulator_path: []const u8,
     mode_path: []const u8,
-    architecture: vmiz.customize.Architecture,
-    transport: vmiz.vm_payload.DiskTransport,
+    architecture: miz.customize.Architecture,
+    transport: miz.vm_payload.DiskTransport,
     drivers: Drivers,
     source_digest: [32]u8,
     /// The EDK2 stand-ins, written into the workspace so the plan can name
@@ -689,7 +689,7 @@ const Workspace = struct {
     /// about them, so the script channel is exercised where it is the subject
     /// rather than added to the baseline every other assertion is made
     /// against.
-    hooks: []const vmiz.customize.Hook = &.{},
+    hooks: []const miz.customize.Hook = &.{},
     /// Whether the next `resolve` declares a credential on its repository.
     credentialed: bool = false,
     /// Set by a case that reached its last assertion. A workspace is only
@@ -701,8 +701,8 @@ const Workspace = struct {
         allocator: Allocator,
         io: Io,
         self_exe: []const u8,
-        architecture: vmiz.customize.Architecture,
-        transport: vmiz.vm_payload.DiskTransport,
+        architecture: miz.customize.Architecture,
+        transport: miz.vm_payload.DiskTransport,
         drivers: Drivers,
     ) !Workspace {
         var random: [8]u8 = undefined;
@@ -710,7 +710,7 @@ const Workspace = struct {
         const random_hex = std.fmt.bytesToHex(random, .lower);
         const path = try std.fmt.allocPrint(
             allocator,
-            "/tmp/vmiz-vm-backend-{s}",
+            "/tmp/miz-vm-backend-{s}",
             .{&random_hex},
         );
         try Io.Dir.cwd().createDir(io, path, .default_dir);
@@ -781,12 +781,12 @@ const Workspace = struct {
     fn resolve(
         self: *const Workspace,
         allocator: Allocator,
-        acceleration: vmiz.customize.VmAcceleration,
-    ) !vmiz.customize.ResolveOutcome {
-        const actions = [_]vmiz.customize.PackageAction{
+        acceleration: miz.customize.VmAcceleration,
+    ) !miz.customize.ResolveOutcome {
+        const actions = [_]miz.customize.PackageAction{
             .{ .install = &.{"integration-package"} },
         };
-        const repositories = [_]vmiz.customize.PackageRepository{.{
+        const repositories = [_]miz.customize.PackageRepository{.{
             .id = "integration",
             .urls = &.{"https://packages.example.invalid/base"},
             .trust = &.{.{ .inline_bytes = "integration trust\n" }},
@@ -795,7 +795,7 @@ const Workspace = struct {
                 .password = .{ .host_environment = credential_variable },
             } } else null,
         }};
-        const request = vmiz.customize.Request{
+        const request = miz.customize.Request{
             .target_architecture = self.architecture,
             .input = .{ .disk = .{ .path = self.source_path } },
             .output = .{
@@ -839,7 +839,7 @@ const Workspace = struct {
                 .source_date_epoch = 1_735_689_600,
             },
         };
-        return vmiz.customize.resolve(allocator, &request, .{
+        return miz.customize.resolve(allocator, &request, .{
             .host_architecture = self.architecture,
         });
     }
@@ -849,8 +849,8 @@ const Workspace = struct {
         allocator: Allocator,
         io: Io,
         mode: StubMode,
-        acceleration: vmiz.customize.VmAcceleration,
-    ) !vmiz.customize.ExecutionOutcome {
+        acceleration: miz.customize.VmAcceleration,
+    ) !miz.customize.ExecutionOutcome {
         // The backend controls every argument the emulator receives, so the
         // stand-in is told what to do through a file it finds beside itself.
         try Io.Dir.cwd().writeFile(io, .{
@@ -864,20 +864,20 @@ const Workspace = struct {
         if (resolved.diagnostics.hasErrors()) return error.ResolutionReportedErrors;
         try self.rememberTransaction(plan);
 
-        var platform = vmiz.customize.Platform.system();
+        var platform = miz.customize.Platform.system();
         platform.vmCheckFn = checkVm;
         platform.vmRunFn = runVm;
 
-        var report = try vmiz.customize.preflight(allocator, io, plan, platform);
+        var report = try miz.customize.preflight(allocator, io, plan, platform);
         defer report.deinit(allocator);
         if (!report.ready()) return error.PreflightRefusedTheRun;
 
-        return vmiz.customize.execute(allocator, io, plan, platform, null);
+        return miz.customize.execute(allocator, io, plan, platform, null);
     }
 
     fn rememberTransaction(
         self: *Workspace,
-        plan: *const vmiz.customize.ResolvedPlan,
+        plan: *const miz.customize.ResolvedPlan,
     ) !void {
         if (self.transaction_path.len != 0) {
             self.allocator.free(self.transaction_path);
@@ -892,20 +892,20 @@ const Workspace = struct {
 fn checkVm(
     _: ?*anyopaque,
     io: Io,
-    plan: *const vmiz.customize.ResolvedPlan,
-) vmiz.customize.CapabilityState {
-    return vmiz.vm_backend.available(io, plan);
+    plan: *const miz.customize.ResolvedPlan,
+) miz.customize.CapabilityState {
+    return miz.vm_backend.available(io, plan);
 }
 
 fn runVm(
     _: ?*anyopaque,
     allocator: Allocator,
     io: Io,
-    plan: *const vmiz.customize.ResolvedPlan,
-    target: vmiz.preserved_image.RawMutationTarget,
-    deadline: vmiz.customize.Deadline,
-) !vmiz.customize.VmRuntimeReport {
-    return vmiz.vm_backend.run(allocator, io, .{
+    plan: *const miz.customize.ResolvedPlan,
+    target: miz.preserved_image.RawMutationTarget,
+    deadline: miz.customize.Deadline,
+) !miz.customize.VmRuntimeReport {
+    return miz.vm_backend.run(allocator, io, .{
         .deadline = deadline,
         .plan = plan,
         .transaction_path = plan.data.transaction_path,
@@ -976,7 +976,7 @@ fn runStubEmulator(
 
     // The agent only ever runs as rdinit; anything else means the image's own
     // init would have run first and the guest would not be an appliance.
-    if (std.mem.indexOf(u8, append, "rdinit=/vmiz-guest-agent") == null) {
+    if (std.mem.indexOf(u8, append, "rdinit=/miz-guest-agent") == null) {
         return error.UnexpectedKernelCommandLine;
     }
     if (std.mem.indexOf(u8, append, "panic=-1") == null) {
@@ -1001,12 +1001,12 @@ fn runStubEmulator(
     var agent: ?[]const u8 = null;
     var control_json: ?[]const u8 = null;
     var members: std.StringHashMapUnmanaged([]const u8) = .empty;
-    var reader = vmiz.cpio.Reader.init(initrd);
+    var reader = miz.cpio.Reader.init(initrd);
     while (try reader.next()) |entry| {
         try members.put(allocator, entry.path, entry.content);
-        if (std.mem.eql(u8, entry.path, vmiz.vm_control.agent_path)) {
+        if (std.mem.eql(u8, entry.path, miz.vm_control.agent_path)) {
             agent = entry.content;
-        } else if (std.mem.eql(u8, entry.path, vmiz.vm_control.control_path)) {
+        } else if (std.mem.eql(u8, entry.path, miz.vm_control.control_path)) {
             control_json = entry.content;
         }
     }
@@ -1014,7 +1014,7 @@ fn runStubEmulator(
         return error.UnexpectedAgent;
     }
 
-    const parsed = try vmiz.vm_control.parseControl(
+    const parsed = try miz.vm_control.parseControl(
         allocator,
         control_json orelse return error.MissingControlMember,
     );
@@ -1024,7 +1024,7 @@ fn runStubEmulator(
     // too: a host that emits an invalid document must fail here, not in a real
     // guest weeks later.
     try control.validate();
-    const scsi = indexOfArgument(args, "virtio-scsi-pci,id=vmizscsi") != null;
+    const scsi = indexOfArgument(args, "virtio-scsi-pci,id=mizscsi") != null;
     try expectStub(std.mem.eql(
         u8,
         control.root_device,
@@ -1060,7 +1060,7 @@ fn runStubEmulator(
         try expectStub(std.mem.startsWith(
             u8,
             member,
-            try std.fmt.bufPrint(&prefix, "vmiz-module-{d:0>2}-", .{index}),
+            try std.fmt.bufPrint(&prefix, "miz-module-{d:0>2}-", .{index}),
         ));
     }
 
@@ -1068,13 +1068,13 @@ fn runStubEmulator(
     // exactly what a real guest does with it: decode the script, check it
     // names its own interpreter, and account for every one of them.
     const hook_outcomes = try allocator.alloc(
-        vmiz.vm_control.HookOutcome,
+        miz.vm_control.HookOutcome,
         control.hooks.len,
     );
     for (control.hooks, hook_outcomes, 0..) |hook, *outcome, index| {
-        const size = try vmiz.vm_control.hookScriptSize(hook);
+        const size = try miz.vm_control.hookScriptSize(hook);
         const script = try allocator.alloc(u8, size);
-        try vmiz.vm_control.decodeHookScript(hook, script);
+        try miz.vm_control.decodeHookScript(hook, script);
         try expectStub(std.mem.startsWith(u8, script, "#!"));
         try expectStub(std.mem.eql(u8, script, hook_scripts[index]));
         outcome.* = .{ .index = @intCast(index), .exit_code = 0 };
@@ -1092,7 +1092,7 @@ fn runStubEmulator(
     else
         hook_outcomes;
 
-    const result: vmiz.vm_control.Result = switch (mode) {
+    const result: miz.vm_control.Result = switch (mode) {
         .guest_failure => .{
             .failure = .{
                 .stage = "packages",
@@ -1117,7 +1117,7 @@ fn runStubEmulator(
             .hooks = reported,
         },
     };
-    const sealed = try vmiz.vm_control.seal(allocator, result);
+    const sealed = try miz.vm_control.seal(allocator, result);
     defer allocator.free(sealed);
 
     const file = try Io.Dir.cwd().openFile(io, result_path, .{ .mode = .write_only });
@@ -1153,7 +1153,7 @@ fn checkCredential(
     io: Io,
     environ: std.process.Environ,
     args: []const []const u8,
-    control: vmiz.vm_control.Control,
+    control: miz.vm_control.Control,
     control_json: []const u8,
     initrd: []const u8,
 ) !void {
@@ -1170,7 +1170,7 @@ fn checkCredential(
     // it does for the root and result devices -- and third, because the drive
     // is attached last so that adding it cannot have moved either of the two
     // every run already had.
-    const scsi = indexOfArgument(args, "virtio-scsi-pci,id=vmizscsi") != null;
+    const scsi = indexOfArgument(args, "virtio-scsi-pci,id=mizscsi") != null;
     try expectStub(std.mem.eql(
         u8,
         control.credential_device orelse "",
@@ -1188,10 +1188,10 @@ fn checkCredential(
         io,
         host_path,
         allocator,
-        .limited(vmiz.vm_control.credential_device_bytes + 1),
+        .limited(miz.vm_control.credential_device_bytes + 1),
     );
     defer allocator.free(sealed);
-    const credentials = try vmiz.vm_control.parseCredentials(sealed);
+    const credentials = try miz.vm_control.parseCredentials(sealed);
     const material = try credentials.password(declared.?.basic.password_index);
     try expectStub(std.mem.eql(u8, material, credential_material));
 
@@ -1331,10 +1331,10 @@ fn createSourceDisk(
     io: Io,
     source_path: []const u8,
     spool_path: []const u8,
-    transport: vmiz.vm_payload.DiskTransport,
+    transport: miz.vm_payload.DiskTransport,
     drivers: Drivers,
 ) !void {
-    var image = try vmiz.Image.createExclusive(
+    var image = try miz.Image.createExclusive(
         io,
         source_path,
         .raw,
@@ -1342,13 +1342,13 @@ fn createSourceDisk(
         .{},
     );
     defer image.close(io);
-    const boot_record = vmiz.mbr.singleLinuxPartitionMbr(
+    const boot_record = miz.mbr.singleLinuxPartitionMbr(
         partition_first_lba,
         partition_sectors,
     ).encode();
     try image.pwrite(io, &boot_record, 0);
 
-    var tree = try vmiz.root_tree.RootTree.init(allocator, io, spool_path, .{});
+    var tree = try miz.root_tree.RootTree.init(allocator, io, spool_path, .{});
     defer tree.deinit();
     inline for (.{
         "boot", "dev",         "etc",                            "lib",
@@ -1399,7 +1399,7 @@ fn createSourceDisk(
         cpio_trailer,
         .{ .mode = 0o600 },
     );
-    _ = try vmiz.ext4.populate(io, image.file, allocator, try tree.ext4View(), .{
+    _ = try miz.ext4.populate(io, image.file, allocator, try tree.ext4View(), .{
         .offset = partition_offset,
         .length = partition_length,
         .label = "vm-test",
@@ -1437,7 +1437,7 @@ const modular_dep_virtio_scsi =
 /// The names the backend must insert, in the order it must insert them: the
 /// bus before the disk, the disk before the filesystem it carries, and every
 /// dependency before what needs it.
-fn expectedModules(transport: vmiz.vm_payload.DiskTransport) []const []const u8 {
+fn expectedModules(transport: miz.vm_payload.DiskTransport) []const []const u8 {
     return switch (transport) {
         .virtio_blk => &.{ "virtio_pci", "virtio_blk", "jbd2", "ext4", "virtio_net" },
         .virtio_scsi => &.{
@@ -1461,8 +1461,8 @@ fn moduleObject(allocator: Allocator, name: []const u8) ![]u8 {
 
 fn writeModuleTree(
     allocator: Allocator,
-    tree: *vmiz.root_tree.RootTree,
-    transport: vmiz.vm_payload.DiskTransport,
+    tree: *miz.root_tree.RootTree,
+    transport: miz.vm_payload.DiskTransport,
 ) !void {
     const prefix = "lib/modules/" ++ kernel_release;
     const dep = switch (transport) {

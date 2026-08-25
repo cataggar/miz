@@ -1,11 +1,11 @@
-//! `vmiz write --allow-device-write [--yes] [--grow-root] [--new-uuids] [--allow-duplicate-identifiers] [--expect-serial <serial>] <source> <block-device>`
+//! `miz write --allow-device-write [--yes] [--grow-root] [--new-uuids] [--allow-duplicate-identifiers] [--expect-serial <serial>] <source> <block-device>`
 
 const std = @import("std");
 const builtin = @import("builtin");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 const help_text =
-    \\usage: vmiz write --allow-device-write [--yes] [--grow-root] [--new-uuids] [--allow-duplicate-identifiers] [--expect-serial <serial>] <source> <block-device>
+    \\usage: miz write --allow-device-write [--yes] [--grow-root] [--new-uuids] [--allow-duplicate-identifiers] [--expect-serial <serial>] <source> <block-device>
     \\
     \\Writes a raw, VHD, VHDX, or qcow2 image directly to an existing Linux
     \\block device. The source format is detected automatically.
@@ -35,12 +35,12 @@ const help_text =
     \\cloud-init in the guest. Fresh-identity rewrites are strict:
     \\unsupported filesystems, stale boot references, and immutable/signed
     \\artifacts are refused before any destination bytes change.
-    \\The separate `vmiz convert` command remains unable to write devices.
+    \\The separate `miz convert` command remains unable to write devices.
     \\
 ;
 
 const RootGrowthPlan = struct {
-    root: vmiz.root_resize.RootSelection,
+    root: miz.root_resize.RootSelection,
     final_last_lba: u64,
     final_partition_length: u64,
     final_filesystem_length: u64,
@@ -62,7 +62,7 @@ const PreparedIdentity = struct {
         ?*anyopaque,
         std.mem.Allocator,
         std.Io,
-        *vmiz.Image,
+        *miz.Image,
     ) anyerror!void = preparedIdentityApplyNoop,
     deinit_fn: *const fn (
         ?*anyopaque,
@@ -87,18 +87,18 @@ const Operations = struct {
         u64,
         bool,
         ?[]const u8,
-    ) anyerror!vmiz.Image = openDestination,
+    ) anyerror!miz.Image = openDestination,
     preflight_report_fn: *const fn (
         ?*anyopaque,
-        *const vmiz.Image,
-    ) ?*const vmiz.DevicePreflightReport = preflightReport,
+        *const miz.Image,
+    ) ?*const miz.DevicePreflightReport = preflightReport,
     prepare_identity_fn: *const fn (
         ?*anyopaque,
         std.mem.Allocator,
         std.Io,
-        *const vmiz.Image,
-        *const vmiz.DevicePreflightReport,
-        vmiz.gpt.DetectedGpt,
+        *const miz.Image,
+        *const miz.DevicePreflightReport,
+        miz.gpt.DetectedGpt,
         ?RootGrowthPlan,
         WriteIdentityOptions,
     ) anyerror!PreparedIdentity = prepareIdentity,
@@ -109,75 +109,75 @@ const Operations = struct {
     ) anyerror!bool = confirm,
     detect_gpt_fn: *const fn (
         ?*anyopaque,
-        vmiz.Image,
+        miz.Image,
         std.Io,
         std.mem.Allocator,
-    ) anyerror!vmiz.gpt.DetectedGpt = detectGpt,
+    ) anyerror!miz.gpt.DetectedGpt = detectGpt,
     invalidate_fn: *const fn (
         ?*anyopaque,
-        *vmiz.Image,
+        *miz.Image,
         std.Io,
     ) anyerror!void = invalidateDestination,
     copy_fn: *const fn (
         ?*anyopaque,
         std.Io,
-        vmiz.Image,
-        *vmiz.Image,
+        miz.Image,
+        *miz.Image,
         std.mem.Allocator,
     ) anyerror!void = copyBytes,
     relocate_fn: *const fn (
         ?*anyopaque,
-        *vmiz.Image,
+        *miz.Image,
         std.Io,
         std.mem.Allocator,
-        vmiz.gpt.VerifiedGpt,
-    ) anyerror!vmiz.gpt.RelocationResult = relocateBackup,
+        miz.gpt.VerifiedGpt,
+    ) anyerror!miz.gpt.RelocationResult = relocateBackup,
     plan_root_growth_fn: *const fn (
         ?*anyopaque,
         std.mem.Allocator,
         std.Io,
-        *const vmiz.Image,
+        *const miz.Image,
         u64,
-        vmiz.gpt.VerifiedGpt,
+        miz.gpt.VerifiedGpt,
     ) anyerror!RootGrowthPlan = planRootGrowth,
     grow_partition_fn: *const fn (
         ?*anyopaque,
-        *vmiz.Image,
+        *miz.Image,
         std.Io,
         std.mem.Allocator,
-        vmiz.gpt.VerifiedGpt,
+        miz.gpt.VerifiedGpt,
         u32,
-    ) anyerror!vmiz.gpt.GrowPartitionResult = growPartition,
+    ) anyerror!miz.gpt.GrowPartitionResult = growPartition,
     resize_ext4_fn: *const fn (
         ?*anyopaque,
         std.Io,
         std.Io.File,
         std.mem.Allocator,
-        vmiz.ext4.ResizeOptions,
-    ) anyerror!vmiz.ext4.FilesystemInfo = resizeExt4,
+        miz.ext4.ResizeOptions,
+    ) anyerror!miz.ext4.FilesystemInfo = resizeExt4,
     verify_fn: *const fn (
         ?*anyopaque,
-        vmiz.Image,
+        miz.Image,
         std.Io,
         std.mem.Allocator,
-    ) anyerror!vmiz.gpt.VerifiedGpt = verifyGpt,
+    ) anyerror!miz.gpt.VerifiedGpt = verifyGpt,
     verify_root_fn: *const fn (
         ?*anyopaque,
         std.mem.Allocator,
         std.Io,
-        *const vmiz.Image,
-        vmiz.gpt.VerifiedGpt,
-    ) anyerror!vmiz.root_resize.RootSelection = verifyRoot,
+        *const miz.Image,
+        miz.gpt.VerifiedGpt,
+    ) anyerror!miz.root_resize.RootSelection = verifyRoot,
     durable_fn: *const fn (
         ?*anyopaque,
-        *vmiz.Image,
+        *miz.Image,
         std.Io,
     ) anyerror!bool = makeDurable,
     finish_fn: *const fn (
         ?*anyopaque,
-        *vmiz.Image,
+        *miz.Image,
         std.Io,
-    ) anyerror!?vmiz.DeviceWriteOutcome = finishDeviceWrite,
+    ) anyerror!?miz.DeviceWriteOutcome = finishDeviceWrite,
 };
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
@@ -254,7 +254,7 @@ fn runWithOperations(
 
     const source_path = positional[0];
     const destination_path = positional[1];
-    var source = vmiz.Image.openPathReadOnly(io, source_path) catch |err| {
+    var source = miz.Image.openPathReadOnly(io, source_path) catch |err| {
         return fail("write: failed to open source '{s}': {s}", .{ source_path, @errorName(err) });
     };
     defer source.close(io);
@@ -435,7 +435,7 @@ fn runWithOperations(
         .not_gpt => {},
         .verified => |verified| {
             const plan = growth_plan;
-            var grow_result: ?vmiz.gpt.GrowPartitionResult = null;
+            var grow_result: ?miz.gpt.GrowPartitionResult = null;
             const relocation = if (plan) |root_plan| blk: {
                 if (root_plan.grow_partition) {
                     grow_result = operations.grow_partition_fn(
@@ -655,8 +655,8 @@ fn openDestination(
     source_virtual_size: u64,
     allow_device_write: bool,
     expected_serial: ?[]const u8,
-) anyerror!vmiz.Image {
-    return vmiz.Image.openDeviceForWrite(io, path, source_virtual_size, .{
+) anyerror!miz.Image {
+    return miz.Image.openDeviceForWrite(io, path, source_virtual_size, .{
         .allow_device_write = allow_device_write,
         .expected_serial = expected_serial,
         .allocator = allocator,
@@ -665,8 +665,8 @@ fn openDestination(
 
 fn preflightReport(
     _: ?*anyopaque,
-    image: *const vmiz.Image,
-) ?*const vmiz.DevicePreflightReport {
+    image: *const miz.Image,
+) ?*const miz.DevicePreflightReport {
     return image.devicePreflight();
 }
 
@@ -676,7 +676,7 @@ fn sourceImageReadAt(
     buffer: []u8,
     offset: u64,
 ) anyerror!usize {
-    const image: *const vmiz.Image = @ptrCast(@alignCast(ctx));
+    const image: *const miz.Image = @ptrCast(@alignCast(ctx));
     return image.pread(io, buffer, offset);
 }
 
@@ -684,7 +684,7 @@ fn preparedIdentityApplyNoop(
     _: ?*anyopaque,
     _: std.mem.Allocator,
     _: std.Io,
-    _: *vmiz.Image,
+    _: *miz.Image,
 ) anyerror!void {}
 
 fn preparedIdentityDeinitNoop(_: ?*anyopaque, _: std.mem.Allocator) void {}
@@ -693,9 +693,9 @@ const IdentityScanHooks = struct {
     find_collisions_fn: *const fn (
         std.mem.Allocator,
         std.Io,
-        *const vmiz.block_device.IdentityInventory,
+        *const miz.block_device.IdentityInventory,
         []const u8,
-    ) anyerror!vmiz.block_device.CollisionReport = findVisibleIdentityCollisions,
+    ) anyerror!miz.block_device.CollisionReport = findVisibleIdentityCollisions,
 };
 
 const default_identity_scan_hooks = IdentityScanHooks{};
@@ -703,10 +703,10 @@ const default_identity_scan_hooks = IdentityScanHooks{};
 fn findVisibleIdentityCollisions(
     allocator: std.mem.Allocator,
     io: std.Io,
-    inventory: *const vmiz.block_device.IdentityInventory,
+    inventory: *const miz.block_device.IdentityInventory,
     excluded_whole_disk_name: []const u8,
-) anyerror!vmiz.block_device.CollisionReport {
-    return vmiz.block_device.findLinuxVisibleIdentityCollisions(
+) anyerror!miz.block_device.CollisionReport {
+    return miz.block_device.findLinuxVisibleIdentityCollisions(
         allocator,
         io,
         inventory,
@@ -718,9 +718,9 @@ fn prepareIdentity(
     _: ?*anyopaque,
     allocator: std.mem.Allocator,
     io: std.Io,
-    source: *const vmiz.Image,
-    destination_report: *const vmiz.DevicePreflightReport,
-    detected: vmiz.gpt.DetectedGpt,
+    source: *const miz.Image,
+    destination_report: *const miz.DevicePreflightReport,
+    detected: miz.gpt.DetectedGpt,
     growth_plan: ?RootGrowthPlan,
     options: WriteIdentityOptions,
 ) anyerror!PreparedIdentity {
@@ -740,9 +740,9 @@ fn prepareIdentityWithHooks(
     hooks: *const IdentityScanHooks,
     allocator: std.mem.Allocator,
     io: std.Io,
-    source: *const vmiz.Image,
-    destination_report: *const vmiz.DevicePreflightReport,
-    detected: vmiz.gpt.DetectedGpt,
+    source: *const miz.Image,
+    destination_report: *const miz.DevicePreflightReport,
+    detected: miz.gpt.DetectedGpt,
     growth_plan: ?RootGrowthPlan,
     options: WriteIdentityOptions,
 ) anyerror!PreparedIdentity {
@@ -770,10 +770,10 @@ fn prepareExistingIdentityReport(
     hooks: *const IdentityScanHooks,
     allocator: std.mem.Allocator,
     io: std.Io,
-    source: *const vmiz.Image,
-    destination_report: *const vmiz.DevicePreflightReport,
+    source: *const miz.Image,
+    destination_report: *const miz.DevicePreflightReport,
 ) anyerror!PreparedIdentity {
-    var inventory = try vmiz.block_device.inspectIdentityInventory(allocator, io, .{
+    var inventory = try miz.block_device.inspectIdentityInventory(allocator, io, .{
         .ctx = source,
         .read_at_fn = sourceImageReadAt,
     }, source.virtual_size);
@@ -797,12 +797,12 @@ fn prepareFreshIdentity(
     hooks: *const IdentityScanHooks,
     allocator: std.mem.Allocator,
     io: std.Io,
-    source: *const vmiz.Image,
-    destination_report: *const vmiz.DevicePreflightReport,
-    detected: vmiz.gpt.DetectedGpt,
+    source: *const miz.Image,
+    destination_report: *const miz.DevicePreflightReport,
+    detected: miz.gpt.DetectedGpt,
     growth_plan: ?RootGrowthPlan,
 ) anyerror!PreparedIdentity {
-    var inventory = try vmiz.block_device.inspectIdentityInventory(allocator, io, .{
+    var inventory = try miz.block_device.inspectIdentityInventory(allocator, io, .{
         .ctx = source,
         .read_at_fn = sourceImageReadAt,
     }, source.virtual_size);
@@ -894,7 +894,7 @@ const FatFormatSnapshot = struct {
         partition_offset: u64,
         partition_length: u64,
         volume_id: u32,
-    ) vmiz.fat32.FormatOptions {
+    ) miz.fat32.FormatOptions {
         return .{
             .partition_offset = partition_offset,
             .partition_len = partition_length,
@@ -913,9 +913,9 @@ const FatFormatSnapshot = struct {
 };
 
 const Ext4RewriteSource = struct {
-    reader: vmiz.ext4.Reader,
-    tree: vmiz.ext4.GeneralTree,
-    mutable_tree: vmiz.root_tree.RootTree,
+    reader: miz.ext4.Reader,
+    tree: miz.ext4.GeneralTree,
+    mutable_tree: miz.root_tree.RootTree,
 
     fn deinit(self: *Ext4RewriteSource) void {
         self.mutable_tree.deinit();
@@ -926,9 +926,9 @@ const Ext4RewriteSource = struct {
 };
 
 const XfsRewriteSource = struct {
-    reader: vmiz.xfs.Reader,
-    tree: vmiz.xfs.Tree,
-    mutable_tree: vmiz.root_tree.RootTree,
+    reader: miz.xfs.Reader,
+    tree: miz.xfs.Tree,
+    mutable_tree: miz.root_tree.RootTree,
 
     fn deinit(self: *XfsRewriteSource, io: std.Io) void {
         self.mutable_tree.deinit();
@@ -939,9 +939,9 @@ const XfsRewriteSource = struct {
 };
 
 const FatRewriteSource = struct {
-    filesystem: vmiz.fat32.FileSystem,
-    tree: vmiz.fat32.Tree,
-    mutable_tree: vmiz.root_tree.RootTree,
+    filesystem: miz.fat32.FileSystem,
+    tree: miz.fat32.Tree,
+    mutable_tree: miz.root_tree.RootTree,
     format: FatFormatSnapshot,
 
     fn deinit(self: *FatRewriteSource) void {
@@ -967,7 +967,7 @@ const PartitionSource = union(enum) {
         self.* = .none;
     }
 
-    fn mutableTree(self: *PartitionSource) ?*vmiz.root_tree.RootTree {
+    fn mutableTree(self: *PartitionSource) ?*miz.root_tree.RootTree {
         return switch (self.*) {
             .ext4 => |*ext4| &ext4.mutable_tree,
             .xfs => |*xfs| &xfs.mutable_tree,
@@ -979,15 +979,15 @@ const PartitionSource = union(enum) {
 
 const PartitionRewrite = struct {
     table_index: u32,
-    partition_type_guid: vmiz.guid.Guid,
+    partition_type_guid: miz.guid.Guid,
     partition_offset: u64,
     partition_length: u64,
-    source_partition_guid: vmiz.guid.Guid,
-    new_partition_guid: vmiz.guid.Guid,
+    source_partition_guid: miz.guid.Guid,
+    new_partition_guid: miz.guid.Guid,
     old_partition_guid_text: []const u8,
     new_partition_guid_text: []const u8,
     partition_label: ?[]const u8 = null,
-    filesystem_kind: vmiz.block_device.FilesystemIdentityKind = .none,
+    filesystem_kind: miz.block_device.FilesystemIdentityKind = .none,
     old_filesystem_identifier: ?[]const u8 = null,
     new_filesystem_identifier: ?[]const u8 = null,
     filesystem_label: ?[]const u8 = null,
@@ -1002,11 +1002,11 @@ const PartitionRewrite = struct {
 const IdentityRewriteState = struct {
     io: std.Io,
     arena: std.heap.ArenaAllocator,
-    gpt_replacements: ?vmiz.gpt.OwnedReplacementGuids = null,
+    gpt_replacements: ?miz.gpt.OwnedReplacementGuids = null,
     partitions: []PartitionRewrite = &.{},
-    filesystems: []vmiz.identity_rewrite.Filesystem = &.{},
+    filesystems: []miz.identity_rewrite.Filesystem = &.{},
     esp_roots: []const []const u8,
-    plan: vmiz.identity_rewrite.Plan,
+    plan: miz.identity_rewrite.Plan,
     root_partition_index: usize,
     boot_partition_index: ?usize,
     esp_partition_index: ?usize,
@@ -1022,7 +1022,7 @@ const IdentityRewriteState = struct {
 };
 
 const FstabTaggedSpec = struct {
-    kind: vmiz.identity_rewrite.Kind,
+    kind: miz.identity_rewrite.Kind,
     value: []const u8,
 };
 
@@ -1034,37 +1034,37 @@ fn makeFilesystemUuidV4(io: std.Io) [16]u8 {
     return bytes;
 }
 
-fn duplicateGuidText(allocator: std.mem.Allocator, value: vmiz.guid.Guid) ![]const u8 {
+fn duplicateGuidText(allocator: std.mem.Allocator, value: miz.guid.Guid) ![]const u8 {
     var buffer: [36]u8 = undefined;
-    return allocator.dupe(u8, vmiz.guid.formatLower(&buffer, value));
+    return allocator.dupe(u8, miz.guid.formatLower(&buffer, value));
 }
 
 fn duplicateFilesystemUuidText(
     allocator: std.mem.Allocator,
     value: *const [16]u8,
 ) ![]const u8 {
-    var buffer: [vmiz.identity_rewrite.canonical_uuid_bytes]u8 = undefined;
-    return allocator.dupe(u8, vmiz.identity_rewrite.formatFilesystemUuid(&buffer, value));
+    var buffer: [miz.identity_rewrite.canonical_uuid_bytes]u8 = undefined;
+    return allocator.dupe(u8, miz.identity_rewrite.formatFilesystemUuid(&buffer, value));
 }
 
 fn duplicateFatSerialText(
     allocator: std.mem.Allocator,
     volume_id: u32,
 ) ![]const u8 {
-    var buffer: [vmiz.identity_rewrite.fat_serial_bytes]u8 = undefined;
-    return allocator.dupe(u8, vmiz.identity_rewrite.formatFatVolumeSerial(&buffer, volume_id));
+    var buffer: [miz.identity_rewrite.fat_serial_bytes]u8 = undefined;
+    return allocator.dupe(u8, miz.identity_rewrite.formatFatVolumeSerial(&buffer, volume_id));
 }
 
-fn partitionLengthBytes(partition: vmiz.gpt.PartitionEntry) !u64 {
+fn partitionLengthBytes(partition: miz.gpt.PartitionEntry) !u64 {
     return std.math.mul(
         u64,
         partition.last_lba - partition.first_lba + 1,
-        vmiz.gpt.sector_size,
+        miz.gpt.sector_size,
     );
 }
 
-fn partitionOffsetBytes(partition: vmiz.gpt.PartitionEntry) !u64 {
-    return std.math.mul(u64, partition.first_lba, vmiz.gpt.sector_size);
+fn partitionOffsetBytes(partition: miz.gpt.PartitionEntry) !u64 {
+    return std.math.mul(u64, partition.first_lba, miz.gpt.sector_size);
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -1077,20 +1077,20 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn isEspTypeGuid(guid_value: vmiz.guid.Guid) bool {
-    return std.mem.eql(u8, &guid_value, &vmiz.guid.esp);
+fn isEspTypeGuid(guid_value: miz.guid.Guid) bool {
+    return std.mem.eql(u8, &guid_value, &miz.guid.esp);
 }
 
-fn isLinuxRootTypeGuid(guid_value: vmiz.guid.Guid) bool {
-    return std.mem.eql(u8, &guid_value, &vmiz.guid.linux_root_x86_64) or
-        std.mem.eql(u8, &guid_value, &vmiz.guid.linux_root_aarch64);
+fn isLinuxRootTypeGuid(guid_value: miz.guid.Guid) bool {
+    return std.mem.eql(u8, &guid_value, &miz.guid.linux_root_x86_64) or
+        std.mem.eql(u8, &guid_value, &miz.guid.linux_root_aarch64);
 }
 
-fn isBootTypeGuid(guid_value: vmiz.guid.Guid) bool {
-    return std.mem.eql(u8, &guid_value, &vmiz.guid.linux_xbootldr);
+fn isBootTypeGuid(guid_value: miz.guid.Guid) bool {
+    return std.mem.eql(u8, &guid_value, &miz.guid.linux_xbootldr);
 }
 
-fn rootFilesystemType(kind: vmiz.block_device.FilesystemIdentityKind) ?vmiz.identity_rewrite.FilesystemType {
+fn rootFilesystemType(kind: miz.block_device.FilesystemIdentityKind) ?miz.identity_rewrite.FilesystemType {
     return switch (kind) {
         .ext4 => .ext4,
         .xfs => .xfs,
@@ -1098,27 +1098,27 @@ fn rootFilesystemType(kind: vmiz.block_device.FilesystemIdentityKind) ?vmiz.iden
     };
 }
 
-fn pathExists(tree: *const vmiz.root_tree.RootTree, path: []const u8) bool {
+fn pathExists(tree: *const miz.root_tree.RootTree, path: []const u8) bool {
     return tree.findNode(path) != null;
 }
 
-fn topLevelPathExists(tree: *const vmiz.root_tree.RootTree, path: []const u8) bool {
+fn topLevelPathExists(tree: *const miz.root_tree.RootTree, path: []const u8) bool {
     return pathExists(tree, path);
 }
 
-fn treeLooksLikeRoot(tree: *const vmiz.root_tree.RootTree) bool {
+fn treeLooksLikeRoot(tree: *const miz.root_tree.RootTree) bool {
     return pathExists(tree, "etc/fstab") or
         pathExists(tree, "etc/os-release") or
         pathExists(tree, "usr/lib/os-release");
 }
 
-fn treeLooksLikeBoot(tree: *const vmiz.root_tree.RootTree) bool {
+fn treeLooksLikeBoot(tree: *const miz.root_tree.RootTree) bool {
     return topLevelPathExists(tree, "grub") or
         topLevelPathExists(tree, "grub2") or
         topLevelPathExists(tree, "loader");
 }
 
-fn treeLooksLikeEsp(tree: *const vmiz.root_tree.RootTree) bool {
+fn treeLooksLikeEsp(tree: *const miz.root_tree.RootTree) bool {
     return topLevelPathExists(tree, "EFI") or
         topLevelPathExists(tree, "loader");
 }
@@ -1137,7 +1137,7 @@ fn partitionLooksLikeBoot(partition_label: ?[]const u8) bool {
     return false;
 }
 
-fn signaturesContainUnsupportedFilesystem(signatures: vmiz.block_device.Signatures) bool {
+fn signaturesContainUnsupportedFilesystem(signatures: miz.block_device.Signatures) bool {
     return signatures.btrfs or
         signatures.swap or
         signatures.luks or
@@ -1148,7 +1148,7 @@ fn duplicateTrimmedLabel(
     allocator: std.mem.Allocator,
     field: []const u8,
 ) !?[]const u8 {
-    const label = vmiz.identity_rewrite.trimLabel(field) orelse return null;
+    const label = miz.identity_rewrite.trimLabel(field) orelse return null;
     const copy = try allocator.dupe(u8, label);
     return copy;
 }
@@ -1162,7 +1162,7 @@ fn copyLabelText(
 }
 
 fn parseTaggedSpecLocal(spec: []const u8) ?FstabTaggedSpec {
-    inline for (comptime std.enums.values(vmiz.identity_rewrite.Kind)) |kind| {
+    inline for (comptime std.enums.values(miz.identity_rewrite.Kind)) |kind| {
         const prefix = comptime kind.tag() ++ "=";
         if (std.mem.startsWith(u8, spec, prefix) and spec.len > prefix.len) {
             return .{
@@ -1212,8 +1212,8 @@ fn declaresSeparateBootFilesystem(contents: []const u8) bool {
     return false;
 }
 
-fn initBorrowedMemoryTree(allocator: std.mem.Allocator, io: std.Io) vmiz.root_tree.RootTree {
-    return vmiz.root_tree.RootTree.initMemory(allocator, io, .{});
+fn initBorrowedMemoryTree(allocator: std.mem.Allocator, io: std.Io) miz.root_tree.RootTree {
+    return miz.root_tree.RootTree.initMemory(allocator, io, .{});
 }
 
 /// Every scanned tree keeps back-pointers into the reader (and, for FAT, into
@@ -1223,10 +1223,10 @@ fn initBorrowedMemoryTree(allocator: std.mem.Allocator, io: std.Io) vmiz.root_tr
 fn scanExt4Partition(
     allocator: std.mem.Allocator,
     io: std.Io,
-    source: *const vmiz.Image,
+    source: *const miz.Image,
     partition: *PartitionRewrite,
 ) !void {
-    const reader = try vmiz.ext4.openGeneralReadOnlySource(
+    const reader = try miz.ext4.openGeneralReadOnlySource(
         io,
         source.file,
         .{
@@ -1248,7 +1248,7 @@ fn scanExt4Partition(
         ext4.reader.deinit();
         partition.source = .none;
     }
-    ext4.tree = try vmiz.ext4.scanReadable(
+    ext4.tree = try miz.ext4.scanReadable(
         &ext4.reader,
         io,
         allocator,
@@ -1263,10 +1263,10 @@ fn scanExt4Partition(
 fn scanXfsPartition(
     allocator: std.mem.Allocator,
     io: std.Io,
-    source: *const vmiz.Image,
+    source: *const miz.Image,
     partition: *PartitionRewrite,
 ) !void {
-    const reader = try vmiz.xfs.Reader.openReadOnlySource(
+    const reader = try miz.xfs.Reader.openReadOnlySource(
         allocator,
         io,
         source.file,
@@ -1288,7 +1288,7 @@ fn scanXfsPartition(
         xfs.reader.close(io);
         partition.source = .none;
     }
-    xfs.tree = try vmiz.xfs.scanReadable(
+    xfs.tree = try miz.xfs.scanReadable(
         &xfs.reader,
         io,
         allocator,
@@ -1303,10 +1303,10 @@ fn scanXfsPartition(
 fn scanFatPartition(
     allocator: std.mem.Allocator,
     io: std.Io,
-    source: *const vmiz.Image,
+    source: *const miz.Image,
     partition: *PartitionRewrite,
 ) !void {
-    const filesystem = try vmiz.fat32.open(@constCast(source), io, .{
+    const filesystem = try miz.fat32.open(@constCast(source), io, .{
         .offset = partition.partition_offset,
         .length = partition.partition_length,
     });
@@ -1330,7 +1330,7 @@ fn scanFatPartition(
     };
     const fat = &partition.source.fat;
     errdefer partition.source = .none;
-    fat.tree = try vmiz.fat32.scanTree(&fat.filesystem, io, allocator, .{});
+    fat.tree = try miz.fat32.scanTree(&fat.filesystem, io, allocator, .{});
     errdefer fat.tree.deinit();
     fat.mutable_tree = initBorrowedMemoryTree(allocator, io);
     errdefer fat.mutable_tree.deinit();
@@ -1345,7 +1345,7 @@ fn scanFatPartition(
 fn ensurePartitionScanned(
     allocator: std.mem.Allocator,
     io: std.Io,
-    source: *const vmiz.Image,
+    source: *const miz.Image,
     partition: *PartitionRewrite,
 ) !void {
     switch (partition.source) {
@@ -1359,7 +1359,7 @@ fn ensurePartitionScanned(
     }
 }
 
-fn rootMutableTree(partition: *PartitionRewrite) ?*vmiz.root_tree.RootTree {
+fn rootMutableTree(partition: *PartitionRewrite) ?*miz.root_tree.RootTree {
     return partition.source.mutableTree();
 }
 
@@ -1420,7 +1420,7 @@ fn selectRootPartitionIndex(
     return match orelse error.RootFilesystemNotFound;
 }
 
-fn chooseFallbackEspMountPoint(root_tree: *const vmiz.root_tree.RootTree) []const u8 {
+fn chooseFallbackEspMountPoint(root_tree: *const miz.root_tree.RootTree) []const u8 {
     if (pathExists(root_tree, "boot/efi")) return "/boot/efi";
     if (pathExists(root_tree, "efi")) return "/efi";
     return "/boot/efi";
@@ -1429,7 +1429,7 @@ fn chooseFallbackEspMountPoint(root_tree: *const vmiz.root_tree.RootTree) []cons
 fn selectFallbackEspPartition(
     allocator: std.mem.Allocator,
     io: std.Io,
-    source: *const vmiz.Image,
+    source: *const miz.Image,
     partitions: []PartitionRewrite,
 ) !?usize {
     var match: ?usize = null;
@@ -1543,12 +1543,12 @@ fn resolveEspMountFromFstab(
 
 fn formatSignaturesText(
     allocator: std.mem.Allocator,
-    signatures: vmiz.block_device.Signatures,
+    signatures: miz.block_device.Signatures,
 ) ![]u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var first = true;
-    inline for (std.meta.fields(vmiz.block_device.Signatures)) |field| {
+    inline for (std.meta.fields(miz.block_device.Signatures)) |field| {
         if (@field(signatures, field.name)) {
             if (!first) try out.appendSlice(",");
             try out.appendSlice(field.name);
@@ -1635,11 +1635,11 @@ fn assignFreshFilesystemIdentifier(
 
 fn buildPlannedIdentityInventory(
     allocator: std.mem.Allocator,
-    source: *const vmiz.block_device.IdentityInventory,
+    source: *const miz.block_device.IdentityInventory,
     new_disk_guid_text: []const u8,
     partitions: []const PartitionRewrite,
-) !vmiz.block_device.IdentityInventory {
-    const copied = try allocator.alloc(vmiz.block_device.PartitionReport, source.partitions.len);
+) !miz.block_device.IdentityInventory {
+    const copied = try allocator.alloc(miz.block_device.PartitionReport, source.partitions.len);
     errdefer allocator.free(copied);
     for (source.partitions, copied, 0..) |original, *slot, index| {
         slot.* = original;
@@ -1665,7 +1665,7 @@ fn buildPlannedIdentityInventory(
 
 fn buildIdentityRewritePlan(state: *IdentityRewriteState) !void {
     const arena = state.arena.allocator();
-    state.filesystems = try arena.alloc(vmiz.identity_rewrite.Filesystem, state.partitions.len);
+    state.filesystems = try arena.alloc(miz.identity_rewrite.Filesystem, state.partitions.len);
     for (state.partitions, state.filesystems, 0..) |partition, *slot, index| {
         slot.* = .{
             .before = .{
@@ -1703,13 +1703,13 @@ fn buildIdentityRewritePlan(state: *IdentityRewriteState) !void {
 
 fn describeStaleReferenceRefusal(
     allocator: std.mem.Allocator,
-    diagnostic: vmiz.identity_rewrite.Diagnostic,
+    diagnostic: miz.identity_rewrite.Diagnostic,
 ) ![]u8 {
     const stale = diagnostic.stale orelse return allocator.dupe(
         u8,
         "--new-uuids left an unrewriteable stale boot reference",
     );
-    var detail: [vmiz.identity_rewrite.Stale.max_message_bytes]u8 = undefined;
+    var detail: [miz.identity_rewrite.Stale.max_message_bytes]u8 = undefined;
     const description = stale.describe(&detail) catch "stale boot reference";
     const path = stale.path();
     const immutable = std.mem.endsWith(u8, path, ".efi") or
@@ -1742,7 +1742,7 @@ fn ext4PopulateLength(partition: *const PartitionRewrite, state: *const Identity
 fn ext4PopulateOptions(
     partition: *PartitionRewrite,
     state: *const IdentityRewriteState,
-) vmiz.ext4.PopulateOptions {
+) miz.ext4.PopulateOptions {
     const ext4 = partition.source.ext4;
     const root = ext4.mutable_tree.rootMetadata();
     return .{
@@ -1783,7 +1783,7 @@ fn ext4PopulateOptions(
     };
 }
 
-fn xfsPopulateOptions(partition: *PartitionRewrite) vmiz.xfs_writer.PopulateOptions {
+fn xfsPopulateOptions(partition: *PartitionRewrite) miz.xfs_writer.PopulateOptions {
     const xfs = partition.source.xfs;
     const root = xfs.mutable_tree.rootMetadata();
     return .{
@@ -1821,14 +1821,14 @@ fn preflightPreparedTrees(
     for (state.partitions) |*partition| {
         switch (partition.mode) {
             .ext4_tree => {
-                _ = try vmiz.ext4.preflightPopulate(
+                _ = try miz.ext4.preflightPopulate(
                     allocator,
                     try partition.source.ext4.mutable_tree.cursor(),
                     ext4PopulateOptions(partition, state),
                 );
             },
             .xfs_tree => {
-                const minimum = try vmiz.xfs_writer.minimumSize(
+                const minimum = try miz.xfs_writer.minimumSize(
                     allocator,
                     try partition.source.xfs.mutable_tree.cursor(),
                     xfsPopulateOptions(partition),
@@ -1859,9 +1859,9 @@ fn applyIdentityRewritePreflight(
     allocator: std.mem.Allocator,
     state: *IdentityRewriteState,
 ) !?[]u8 {
-    var diagnostic = vmiz.identity_rewrite.Diagnostic{};
+    var diagnostic = miz.identity_rewrite.Diagnostic{};
     const root_tree = rootMutableTree(&state.partitions[state.root_partition_index]).?;
-    _ = vmiz.identity_rewrite.apply(
+    _ = miz.identity_rewrite.apply(
         allocator,
         root_tree,
         state.plan,
@@ -1878,7 +1878,7 @@ fn applyIdentityRewritePreflight(
         esp_plan.esp_roots = &.{};
         diagnostic = .{};
         const esp_tree = rootMutableTree(&state.partitions[esp_index]).?;
-        _ = vmiz.identity_rewrite.apply(
+        _ = miz.identity_rewrite.apply(
             allocator,
             esp_tree,
             esp_plan,
@@ -1895,10 +1895,10 @@ fn applyIdentityRewritePreflight(
 fn verifyFreshIdentityDestination(
     allocator: std.mem.Allocator,
     io: std.Io,
-    destination: *vmiz.Image,
+    destination: *miz.Image,
     state: *IdentityRewriteState,
 ) !void {
-    var inventory = try vmiz.block_device.inspectIdentityInventory(
+    var inventory = try miz.block_device.inspectIdentityInventory(
         allocator,
         io,
         .{
@@ -1934,11 +1934,11 @@ fn verifyFreshIdentityDestination(
         }
     }
 
-    var diagnostic = vmiz.identity_rewrite.Diagnostic{};
+    var diagnostic = miz.identity_rewrite.Diagnostic{};
     const root_partition = &state.partitions[state.root_partition_index];
     switch (root_partition.filesystem_kind) {
         .ext4 => {
-            var reader = try vmiz.ext4.openGeneralReadOnlySource(
+            var reader = try miz.ext4.openGeneralReadOnlySource(
                 io,
                 destination.file,
                 .{
@@ -1949,7 +1949,7 @@ fn verifyFreshIdentityDestination(
                 .{ .offset = root_partition.partition_offset },
             );
             defer reader.deinit();
-            var tree = try vmiz.ext4.scanReadable(
+            var tree = try miz.ext4.scanReadable(
                 &reader,
                 io,
                 allocator,
@@ -1959,7 +1959,7 @@ fn verifyFreshIdentityDestination(
             var root_tree = initBorrowedMemoryTree(allocator, io);
             defer root_tree.deinit();
             try root_tree.importExt4GeneralBorrowed(&tree);
-            _ = vmiz.identity_rewrite.apply(
+            _ = miz.identity_rewrite.apply(
                 allocator,
                 &root_tree,
                 state.plan,
@@ -1971,7 +1971,7 @@ fn verifyFreshIdentityDestination(
             };
         },
         .xfs => {
-            var reader = try vmiz.xfs.Reader.openReadOnlySource(
+            var reader = try miz.xfs.Reader.openReadOnlySource(
                 allocator,
                 io,
                 destination.file,
@@ -1982,7 +1982,7 @@ fn verifyFreshIdentityDestination(
                 root_partition.partition_offset,
             );
             defer reader.close(io);
-            var tree = try vmiz.xfs.scanReadable(
+            var tree = try miz.xfs.scanReadable(
                 &reader,
                 io,
                 allocator,
@@ -1992,7 +1992,7 @@ fn verifyFreshIdentityDestination(
             var root_tree = initBorrowedMemoryTree(allocator, io);
             defer root_tree.deinit();
             try root_tree.importXfsBorrowed(&tree);
-            _ = vmiz.identity_rewrite.apply(
+            _ = miz.identity_rewrite.apply(
                 allocator,
                 &root_tree,
                 state.plan,
@@ -2007,11 +2007,11 @@ fn verifyFreshIdentityDestination(
     }
 
     if (state.esp_partition_index) |esp_index| {
-        var filesystem = try vmiz.fat32.open(destination, io, .{
+        var filesystem = try miz.fat32.open(destination, io, .{
             .offset = state.partitions[esp_index].partition_offset,
             .length = state.partitions[esp_index].partition_length,
         });
-        var tree = try vmiz.fat32.scanTree(&filesystem, io, allocator, .{});
+        var tree = try miz.fat32.scanTree(&filesystem, io, allocator, .{});
         defer tree.deinit();
         var root_tree = initBorrowedMemoryTree(allocator, io);
         defer root_tree.deinit();
@@ -2025,7 +2025,7 @@ fn verifyFreshIdentityDestination(
         esp_plan.tree_is_esp = true;
         esp_plan.esp_roots = &.{};
         diagnostic = .{};
-        _ = vmiz.identity_rewrite.apply(
+        _ = miz.identity_rewrite.apply(
             allocator,
             &root_tree,
             esp_plan,
@@ -2048,10 +2048,10 @@ fn initializeFreshIdentityState(
     hooks: *const IdentityScanHooks,
     allocator: std.mem.Allocator,
     io: std.Io,
-    source: *const vmiz.Image,
-    destination_report: *const vmiz.DevicePreflightReport,
-    inventory: *const vmiz.block_device.IdentityInventory,
-    verified: vmiz.gpt.VerifiedGpt,
+    source: *const miz.Image,
+    destination_report: *const miz.DevicePreflightReport,
+    inventory: *const miz.block_device.IdentityInventory,
+    verified: miz.gpt.VerifiedGpt,
     growth_plan: ?RootGrowthPlan,
     state: *IdentityRewriteState,
 ) !FreshPreparedSetup {
@@ -2067,7 +2067,7 @@ fn initializeFreshIdentityState(
     errdefer allocator.free(source_report_text);
 
     const arena = state.arena.allocator();
-    state.gpt_replacements = try vmiz.gpt.generateReplacementGuids(allocator, io, verified);
+    state.gpt_replacements = try miz.gpt.generateReplacementGuids(allocator, io, verified);
     state.partitions = try arena.alloc(PartitionRewrite, verified.partitions.len);
 
     for (verified.partitions, inventory.partitions, state.partitions, 0..) |verified_partition, inventory_partition, *slot, index| {
@@ -2179,7 +2179,7 @@ fn initializeFreshIdentityState(
     const root_fstab = root_tree.readFileAlloc(
         allocator,
         "etc/fstab",
-        vmiz.identity_rewrite.max_config_bytes,
+        miz.identity_rewrite.max_config_bytes,
     ) catch |err| switch (err) {
         error.MissingNode => null,
         else => {
@@ -2253,7 +2253,7 @@ fn initializeFreshIdentityState(
                 source_report_text,
                 try allocator.dupe(
                     u8,
-                    "the source declares an EFI system partition but vmiz could not resolve it safely",
+                    "the source declares an EFI system partition but miz could not resolve it safely",
                 ),
                 0,
             );
@@ -2359,17 +2359,17 @@ fn applyPreparedFreshIdentity(
     ctx: ?*anyopaque,
     allocator: std.mem.Allocator,
     io: std.Io,
-    destination: *vmiz.Image,
+    destination: *miz.Image,
 ) anyerror!void {
     const state: *IdentityRewriteState = @ptrCast(@alignCast(ctx.?));
-    var verified = try vmiz.gpt.readVerifiedGpt(
+    var verified = try miz.gpt.readVerifiedGpt(
         destination.*,
         io,
         allocator,
-        vmiz.gpt.default_max_partition_array_bytes,
+        miz.gpt.default_max_partition_array_bytes,
     );
     defer verified.deinit(allocator);
-    var gpt_report = try vmiz.gpt.rewriteIdentity(
+    var gpt_report = try miz.gpt.rewriteIdentity(
         destination,
         io,
         allocator,
@@ -2382,7 +2382,7 @@ fn applyPreparedFreshIdentity(
         switch (partition.mode) {
             .none => {},
             .ext4_uuid_only => {
-                _ = try vmiz.ext4.rewriteUuidImage(
+                _ = try miz.ext4.rewriteUuidImage(
                     io,
                     destination,
                     allocator,
@@ -2394,7 +2394,7 @@ fn applyPreparedFreshIdentity(
                 );
             },
             .xfs_uuid_only => {
-                _ = try vmiz.xfs.rewriteFilesystemUuid(
+                _ = try miz.xfs.rewriteFilesystemUuid(
                     io,
                     destination.file,
                     allocator,
@@ -2406,7 +2406,7 @@ fn applyPreparedFreshIdentity(
                 );
             },
             .fat_uuid_only => {
-                _ = try vmiz.fat.rewriteIdentity(
+                _ = try miz.fat.rewriteIdentity(
                     destination,
                     io,
                     .{
@@ -2417,7 +2417,7 @@ fn applyPreparedFreshIdentity(
                 );
             },
             .ext4_tree => {
-                _ = try vmiz.ext4.populate(
+                _ = try miz.ext4.populate(
                     io,
                     destination.file,
                     allocator,
@@ -2426,7 +2426,7 @@ fn applyPreparedFreshIdentity(
                 );
             },
             .xfs_tree => {
-                _ = try vmiz.filesystem_writer.formatAndPopulate(
+                _ = try miz.filesystem_writer.formatAndPopulate(
                     io,
                     allocator,
                     destination,
@@ -2436,7 +2436,7 @@ fn applyPreparedFreshIdentity(
                 );
             },
             .fat_tree => {
-                try vmiz.fat32.format(
+                try miz.fat32.format(
                     destination,
                     io,
                     partition.source.fat.format.formatOptions(
@@ -2445,7 +2445,7 @@ fn applyPreparedFreshIdentity(
                         partition.new_fat_volume_id,
                     ),
                 );
-                var filesystem = try vmiz.fat32.open(destination, io, .{
+                var filesystem = try miz.fat32.open(destination, io, .{
                     .offset = partition.partition_offset,
                     .length = partition.partition_length,
                 });
@@ -2467,9 +2467,9 @@ fn deinitPreparedFreshIdentity(
 
 fn formatSourceInventoryOnly(
     allocator: std.mem.Allocator,
-    inventory: *const vmiz.block_device.IdentityInventory,
+    inventory: *const miz.block_device.IdentityInventory,
 ) ![]u8 {
-    const empty = vmiz.block_device.CollisionReport{
+    const empty = miz.block_device.CollisionReport{
         .collisions = &.{},
         .scanned_visible_disks = 0,
     };
@@ -2491,63 +2491,63 @@ fn confirm(_: ?*anyopaque, io: std.Io, destination_path: []const u8) anyerror!bo
 
 fn detectGpt(
     _: ?*anyopaque,
-    source: vmiz.Image,
+    source: miz.Image,
     io: std.Io,
     allocator: std.mem.Allocator,
-) anyerror!vmiz.gpt.DetectedGpt {
-    return vmiz.gpt.detectVerifiedGpt(
+) anyerror!miz.gpt.DetectedGpt {
+    return miz.gpt.detectVerifiedGpt(
         source,
         io,
         allocator,
-        vmiz.gpt.default_max_partition_array_bytes,
+        miz.gpt.default_max_partition_array_bytes,
     );
 }
 
 fn invalidateDestination(
     _: ?*anyopaque,
-    destination: *vmiz.Image,
+    destination: *miz.Image,
     io: std.Io,
 ) anyerror!void {
-    return vmiz.gpt.invalidateDestinationPartitionStructures(
+    return miz.gpt.invalidateDestinationPartitionStructures(
         destination,
         io,
-        vmiz.gpt.default_max_partition_array_bytes,
+        miz.gpt.default_max_partition_array_bytes,
     );
 }
 
 fn copyBytes(
     _: ?*anyopaque,
     io: std.Io,
-    source: vmiz.Image,
-    destination: *vmiz.Image,
+    source: miz.Image,
+    destination: *miz.Image,
     allocator: std.mem.Allocator,
 ) anyerror!void {
-    return vmiz.copyAllBytes(io, source, destination, allocator);
+    return miz.copyAllBytes(io, source, destination, allocator);
 }
 
 fn relocateBackup(
     _: ?*anyopaque,
-    destination: *vmiz.Image,
+    destination: *miz.Image,
     io: std.Io,
     allocator: std.mem.Allocator,
-    verified: vmiz.gpt.VerifiedGpt,
-) anyerror!vmiz.gpt.RelocationResult {
-    return vmiz.gpt.relocateBackup(destination, io, allocator, verified);
+    verified: miz.gpt.VerifiedGpt,
+) anyerror!miz.gpt.RelocationResult {
+    return miz.gpt.relocateBackup(destination, io, allocator, verified);
 }
 
 fn planRootGrowth(
     _: ?*anyopaque,
     allocator: std.mem.Allocator,
     io: std.Io,
-    source: *const vmiz.Image,
+    source: *const miz.Image,
     destination_size: u64,
-    verified: vmiz.gpt.VerifiedGpt,
+    verified: miz.gpt.VerifiedGpt,
 ) anyerror!RootGrowthPlan {
     if (source.format != .raw) return error.RootGrowthPreflightRequiresRawSource;
-    if (destination_size == 0 or destination_size % vmiz.gpt.sector_size != 0) {
+    if (destination_size == 0 or destination_size % miz.gpt.sector_size != 0) {
         return error.ImageNotSectorAligned;
     }
-    const root = try vmiz.root_resize.selectRoot(
+    const root = try miz.root_resize.selectRoot(
         allocator,
         io,
         source,
@@ -2557,9 +2557,9 @@ fn planRootGrowth(
     const array_sectors = try std.math.divCeil(
         u64,
         @intCast(verified.partition_array.len),
-        vmiz.gpt.sector_size,
+        miz.gpt.sector_size,
     );
-    const destination_sectors = destination_size / vmiz.gpt.sector_size;
+    const destination_sectors = destination_size / miz.gpt.sector_size;
     if (destination_sectors <= array_sectors + 1) return error.InvalidPartitionArrayBounds;
     const backup_lba = destination_sectors - 1;
     const backup_array_lba = backup_lba - array_sectors;
@@ -2576,11 +2576,11 @@ fn planRootGrowth(
     const final_partition_length = std.math.mul(
         u64,
         partition_sectors,
-        vmiz.gpt.sector_size,
+        miz.gpt.sector_size,
     ) catch return error.InvalidPartitionBounds;
     const final_filesystem_length =
-        final_partition_length / vmiz.ext4.default_block_size *
-        vmiz.ext4.default_block_size;
+        final_partition_length / miz.ext4.default_block_size *
+        miz.ext4.default_block_size;
     if (final_filesystem_length == 0 or
         final_filesystem_length > final_partition_length or
         final_filesystem_length < root.filesystem_length)
@@ -2588,7 +2588,7 @@ fn planRootGrowth(
         return error.InvalidRange;
     }
 
-    const preflight = vmiz.ext4.preflightResize(
+    const preflight = miz.ext4.preflightResize(
         io,
         source.file,
         allocator,
@@ -2629,13 +2629,13 @@ fn planRootGrowth(
 
 fn growPartition(
     _: ?*anyopaque,
-    destination: *vmiz.Image,
+    destination: *miz.Image,
     io: std.Io,
     allocator: std.mem.Allocator,
-    verified: vmiz.gpt.VerifiedGpt,
+    verified: miz.gpt.VerifiedGpt,
     table_index: u32,
-) anyerror!vmiz.gpt.GrowPartitionResult {
-    return vmiz.gpt.growPartitionToEnd(
+) anyerror!miz.gpt.GrowPartitionResult {
+    return miz.gpt.growPartitionToEnd(
         destination,
         io,
         allocator,
@@ -2649,22 +2649,22 @@ fn resizeExt4(
     io: std.Io,
     file: std.Io.File,
     allocator: std.mem.Allocator,
-    options: vmiz.ext4.ResizeOptions,
-) anyerror!vmiz.ext4.FilesystemInfo {
-    return vmiz.ext4.resize(io, file, allocator, options);
+    options: miz.ext4.ResizeOptions,
+) anyerror!miz.ext4.FilesystemInfo {
+    return miz.ext4.resize(io, file, allocator, options);
 }
 
 fn verifyGpt(
     _: ?*anyopaque,
-    destination: vmiz.Image,
+    destination: miz.Image,
     io: std.Io,
     allocator: std.mem.Allocator,
-) anyerror!vmiz.gpt.VerifiedGpt {
-    return vmiz.gpt.readVerifiedGpt(
+) anyerror!miz.gpt.VerifiedGpt {
+    return miz.gpt.readVerifiedGpt(
         destination,
         io,
         allocator,
-        vmiz.gpt.default_max_partition_array_bytes,
+        miz.gpt.default_max_partition_array_bytes,
     );
 }
 
@@ -2672,10 +2672,10 @@ fn verifyRoot(
     _: ?*anyopaque,
     allocator: std.mem.Allocator,
     io: std.Io,
-    destination: *const vmiz.Image,
-    verified: vmiz.gpt.VerifiedGpt,
-) anyerror!vmiz.root_resize.RootSelection {
-    return vmiz.root_resize.selectRoot(
+    destination: *const miz.Image,
+    verified: miz.gpt.VerifiedGpt,
+) anyerror!miz.root_resize.RootSelection {
+    return miz.root_resize.selectRoot(
         allocator,
         io,
         destination,
@@ -2686,7 +2686,7 @@ fn verifyRoot(
 
 fn makeDurable(
     _: ?*anyopaque,
-    destination: *vmiz.Image,
+    destination: *miz.Image,
     io: std.Io,
 ) anyerror!bool {
     return destination.flushDeviceWrite(io);
@@ -2694,15 +2694,15 @@ fn makeDurable(
 
 fn finishDeviceWrite(
     _: ?*anyopaque,
-    destination: *vmiz.Image,
+    destination: *miz.Image,
     io: std.Io,
-) anyerror!?vmiz.DeviceWriteOutcome {
+) anyerror!?miz.DeviceWriteOutcome {
     return destination.finishDeviceWrite(io);
 }
 
 fn failAfterMutation(
     operations: Operations,
-    destination: *vmiz.Image,
+    destination: *miz.Image,
     io: std.Io,
     comptime format: []const u8,
     args: anytype,
@@ -2741,8 +2741,8 @@ fn bytesEqualExcept(
 }
 
 fn verifyGrownGptInvariant(
-    source: vmiz.gpt.VerifiedGpt,
-    destination: vmiz.gpt.VerifiedGpt,
+    source: miz.gpt.VerifiedGpt,
+    destination: miz.gpt.VerifiedGpt,
     plan: RootGrowthPlan,
 ) !void {
     const entry_size: usize = source.primary_header.partition_entry_size;
@@ -2787,8 +2787,8 @@ fn verifyGrownGptInvariant(
         .{ 72, 80 },
         .{ 88, 92 },
     };
-    const protective_offset = vmiz.mbr.partition_table_offset +
-        @as(usize, source.protective_entry_index) * vmiz.mbr.entry_size;
+    const protective_offset = miz.mbr.partition_table_offset +
+        @as(usize, source.protective_entry_index) * miz.mbr.entry_size;
     const mbr_allowed = [_][2]usize{
         .{ protective_offset + 5, protective_offset + 8 },
         .{ protective_offset + 12, protective_offset + 16 },
@@ -2810,7 +2810,7 @@ fn verifyGrownGptInvariant(
     const array_sectors = std.math.divCeil(
         u64,
         @intCast(source.partition_array.len),
-        vmiz.gpt.sector_size,
+        miz.gpt.sector_size,
     ) catch return error.InvalidPartitionArrayBounds;
     const expected_backup_lba = std.math.add(
         u64,
@@ -2834,7 +2834,7 @@ fn verifyGrownGptInvariant(
 
 fn verifyGrownRoot(
     plan: RootGrowthPlan,
-    actual: vmiz.root_resize.RootSelection,
+    actual: miz.root_resize.RootSelection,
 ) !void {
     if (actual.table_index != plan.root.table_index or
         actual.first_lba != plan.root.first_lba or
@@ -2869,7 +2869,7 @@ fn verifyGrownRoot(
 }
 
 fn describeWriteFailure(err: anyerror) ?[]const u8 {
-    if (vmiz.block_device.describePreflightFailure(err)) |message| return message;
+    if (miz.block_device.describePreflightFailure(err)) |message| return message;
     return switch (err) {
         error.BlockDeviceWriteNotPermitted => "--allow-device-write is required",
         error.NotBlockDevice => "the destination is not an existing block device",
@@ -2882,7 +2882,7 @@ fn describeWriteFailure(err: anyerror) ?[]const u8 {
 fn formatPreflightReport(
     allocator: std.mem.Allocator,
     destination_path: []const u8,
-    report: *const vmiz.DevicePreflightReport,
+    report: *const miz.DevicePreflightReport,
 ) ![]u8 {
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
@@ -2919,8 +2919,8 @@ fn formatPreflightReport(
 
 fn formatSourceIdentityReport(
     allocator: std.mem.Allocator,
-    inventory: *const vmiz.block_device.IdentityInventory,
-    collisions: *const vmiz.block_device.CollisionReport,
+    inventory: *const miz.block_device.IdentityInventory,
+    collisions: *const miz.block_device.CollisionReport,
 ) ![]u8 {
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
@@ -2954,9 +2954,9 @@ fn formatSourceIdentityReport(
 
 fn formatFreshIdentityReport(
     allocator: std.mem.Allocator,
-    source_inventory: *const vmiz.block_device.IdentityInventory,
-    planned_inventory: *const vmiz.block_device.IdentityInventory,
-    collisions: *const vmiz.block_device.CollisionReport,
+    source_inventory: *const miz.block_device.IdentityInventory,
+    planned_inventory: *const miz.block_device.IdentityInventory,
+    collisions: *const miz.block_device.CollisionReport,
 ) ![]u8 {
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
@@ -2998,11 +2998,11 @@ fn formatFreshIdentityReport(
 
 fn writeIdentityInventory(
     writer: *std.Io.Writer,
-    partition_table: vmiz.block_device.PartitionTable,
+    partition_table: miz.block_device.PartitionTable,
     gpt_disk_guid: ?[]const u8,
-    device_signatures: vmiz.block_device.Signatures,
-    device_filesystem: vmiz.block_device.FilesystemIdentity,
-    partitions: []const vmiz.block_device.PartitionReport,
+    device_signatures: miz.block_device.Signatures,
+    device_filesystem: miz.block_device.FilesystemIdentity,
+    partitions: []const miz.block_device.PartitionReport,
 ) !void {
     try writer.print("  partition table: {s}", .{@tagName(partition_table)});
     if (gpt_disk_guid) |disk_guid| try writer.print("; disk GUID: {s}", .{disk_guid});
@@ -3042,7 +3042,7 @@ fn writeIdentityInventory(
 
 fn writeFilesystemIdentity(
     writer: *std.Io.Writer,
-    identity: vmiz.block_device.FilesystemIdentity,
+    identity: miz.block_device.FilesystemIdentity,
 ) !void {
     switch (identity.kind) {
         .none => try writer.writeAll("none"),
@@ -3057,9 +3057,9 @@ fn writeFilesystemIdentity(
     }
 }
 
-fn writeSignatures(writer: *std.Io.Writer, signatures: vmiz.block_device.Signatures) !void {
+fn writeSignatures(writer: *std.Io.Writer, signatures: miz.block_device.Signatures) !void {
     var first = true;
-    inline for (std.meta.fields(vmiz.block_device.Signatures)) |field| {
+    inline for (std.meta.fields(miz.block_device.Signatures)) |field| {
         if (@field(signatures, field.name)) {
             if (!first) try writer.writeByte(',');
             try writer.writeAll(field.name);
@@ -3069,13 +3069,13 @@ fn writeSignatures(writer: *std.Io.Writer, signatures: vmiz.block_device.Signatu
     if (first) try writer.writeAll("none");
 }
 
-fn writeCollision(writer: *std.Io.Writer, collision: vmiz.block_device.Collision) !void {
+fn writeCollision(writer: *std.Io.Writer, collision: miz.block_device.Collision) !void {
     return writeCollisionWithSubject(writer, collision, "source");
 }
 
 fn writeCollisionWithSubject(
     writer: *std.Io.Writer,
-    collision: vmiz.block_device.Collision,
+    collision: miz.block_device.Collision,
     subject: []const u8,
 ) !void {
     try writer.writeAll("  ");
@@ -3149,13 +3149,13 @@ const FakeOperations = struct {
     verify_root_error: ?anyerror = null,
     durable_error: ?anyerror = null,
     finish_error: ?anyerror = null,
-    outcome: ?vmiz.DeviceWriteOutcome = .partition_table_refreshed,
-    report: ?*const vmiz.DevicePreflightReport = null,
+    outcome: ?miz.DeviceWriteOutcome = .partition_table_refreshed,
+    report: ?*const miz.DevicePreflightReport = null,
     source_identity_report_text: []const u8 = "",
     prepared_refusal_message: ?[]const u8 = null,
     prepared_collision_count: usize = 0,
     confirm_result: bool = true,
-    expected_format: ?vmiz.Format = null,
+    expected_format: ?miz.Format = null,
     open_calls: usize = 0,
     confirm_calls: usize = 0,
     detect_calls: usize = 0,
@@ -3193,19 +3193,19 @@ const FakeOperations = struct {
         _: u64,
         allow_device_write: bool,
         expected_serial: ?[]const u8,
-    ) anyerror!vmiz.Image {
+    ) anyerror!miz.Image {
         const self: *FakeOperations = @ptrCast(@alignCast(context.?));
         self.open_calls += 1;
         self.allow_device_write_seen = allow_device_write;
         self.expected_serial_seen = expected_serial;
         if (self.open_error) |err| return err;
-        return vmiz.Image.openPath(io, path);
+        return miz.Image.openPath(io, path);
     }
 
     fn preflightReportFake(
         context: ?*anyopaque,
-        _: *const vmiz.Image,
-    ) ?*const vmiz.DevicePreflightReport {
+        _: *const miz.Image,
+    ) ?*const miz.DevicePreflightReport {
         const self: *FakeOperations = @ptrCast(@alignCast(context.?));
         return self.report;
     }
@@ -3214,9 +3214,9 @@ const FakeOperations = struct {
         context: ?*anyopaque,
         allocator: std.mem.Allocator,
         io: std.Io,
-        source: *const vmiz.Image,
-        report: *const vmiz.DevicePreflightReport,
-        detected_gpt: vmiz.gpt.DetectedGpt,
+        source: *const miz.Image,
+        report: *const miz.DevicePreflightReport,
+        detected_gpt: miz.gpt.DetectedGpt,
         growth_plan: ?RootGrowthPlan,
         identity_options: WriteIdentityOptions,
     ) anyerror!PreparedIdentity {
@@ -3258,10 +3258,10 @@ const FakeOperations = struct {
 
     fn detectGptFake(
         context: ?*anyopaque,
-        source: vmiz.Image,
+        source: miz.Image,
         io: std.Io,
         allocator: std.mem.Allocator,
-    ) anyerror!vmiz.gpt.DetectedGpt {
+    ) anyerror!miz.gpt.DetectedGpt {
         const self: *FakeOperations = @ptrCast(@alignCast(context.?));
         self.detect_calls += 1;
         self.record('d');
@@ -3274,7 +3274,7 @@ const FakeOperations = struct {
 
     fn invalidateFake(
         context: ?*anyopaque,
-        destination: *vmiz.Image,
+        destination: *miz.Image,
         io: std.Io,
     ) anyerror!void {
         const self: *FakeOperations = @ptrCast(@alignCast(context.?));
@@ -3289,8 +3289,8 @@ const FakeOperations = struct {
     fn copyFake(
         context: ?*anyopaque,
         io: std.Io,
-        source: vmiz.Image,
-        destination: *vmiz.Image,
+        source: miz.Image,
+        destination: *miz.Image,
         allocator: std.mem.Allocator,
     ) anyerror!void {
         const self: *FakeOperations = @ptrCast(@alignCast(context.?));
@@ -3307,11 +3307,11 @@ const FakeOperations = struct {
 
     fn relocateFake(
         context: ?*anyopaque,
-        destination: *vmiz.Image,
+        destination: *miz.Image,
         io: std.Io,
         allocator: std.mem.Allocator,
-        verified: vmiz.gpt.VerifiedGpt,
-    ) anyerror!vmiz.gpt.RelocationResult {
+        verified: miz.gpt.VerifiedGpt,
+    ) anyerror!miz.gpt.RelocationResult {
         const self: *FakeOperations = @ptrCast(@alignCast(context.?));
         self.record('r');
         if (self.relocate_error) |err| return err;
@@ -3322,9 +3322,9 @@ const FakeOperations = struct {
         context: ?*anyopaque,
         allocator: std.mem.Allocator,
         io: std.Io,
-        source: *const vmiz.Image,
+        source: *const miz.Image,
         destination_size: u64,
-        verified: vmiz.gpt.VerifiedGpt,
+        verified: miz.gpt.VerifiedGpt,
     ) anyerror!RootGrowthPlan {
         const self: *FakeOperations = @ptrCast(@alignCast(context.?));
         self.plan_root_calls += 1;
@@ -3342,12 +3342,12 @@ const FakeOperations = struct {
 
     fn growPartitionFake(
         context: ?*anyopaque,
-        destination: *vmiz.Image,
+        destination: *miz.Image,
         io: std.Io,
         allocator: std.mem.Allocator,
-        verified: vmiz.gpt.VerifiedGpt,
+        verified: miz.gpt.VerifiedGpt,
         table_index: u32,
-    ) anyerror!vmiz.gpt.GrowPartitionResult {
+    ) anyerror!miz.gpt.GrowPartitionResult {
         const self: *FakeOperations = @ptrCast(@alignCast(context.?));
         self.grow_partition_calls += 1;
         self.record('g');
@@ -3367,8 +3367,8 @@ const FakeOperations = struct {
         io: std.Io,
         file: std.Io.File,
         allocator: std.mem.Allocator,
-        options: vmiz.ext4.ResizeOptions,
-    ) anyerror!vmiz.ext4.FilesystemInfo {
+        options: miz.ext4.ResizeOptions,
+    ) anyerror!miz.ext4.FilesystemInfo {
         const self: *FakeOperations = @ptrCast(@alignCast(context.?));
         self.resize_calls += 1;
         self.record('e');
@@ -3378,10 +3378,10 @@ const FakeOperations = struct {
 
     fn verifyFake(
         context: ?*anyopaque,
-        destination: vmiz.Image,
+        destination: miz.Image,
         io: std.Io,
         allocator: std.mem.Allocator,
-    ) anyerror!vmiz.gpt.VerifiedGpt {
+    ) anyerror!miz.gpt.VerifiedGpt {
         const self: *FakeOperations = @ptrCast(@alignCast(context.?));
         self.record('v');
         if (self.verify_error) |err| return err;
@@ -3392,9 +3392,9 @@ const FakeOperations = struct {
         context: ?*anyopaque,
         allocator: std.mem.Allocator,
         io: std.Io,
-        destination: *const vmiz.Image,
-        verified: vmiz.gpt.VerifiedGpt,
-    ) anyerror!vmiz.root_resize.RootSelection {
+        destination: *const miz.Image,
+        verified: miz.gpt.VerifiedGpt,
+    ) anyerror!miz.root_resize.RootSelection {
         const self: *FakeOperations = @ptrCast(@alignCast(context.?));
         self.verify_root_calls += 1;
         self.record('q');
@@ -3404,7 +3404,7 @@ const FakeOperations = struct {
 
     fn durableFake(
         context: ?*anyopaque,
-        destination: *vmiz.Image,
+        destination: *miz.Image,
         io: std.Io,
     ) anyerror!bool {
         const self: *FakeOperations = @ptrCast(@alignCast(context.?));
@@ -3417,9 +3417,9 @@ const FakeOperations = struct {
 
     fn finishFake(
         context: ?*anyopaque,
-        _: *vmiz.Image,
+        _: *miz.Image,
         _: std.Io,
-    ) anyerror!?vmiz.DeviceWriteOutcome {
+    ) anyerror!?miz.DeviceWriteOutcome {
         const self: *FakeOperations = @ptrCast(@alignCast(context.?));
         self.finish_calls += 1;
         self.record('f');
@@ -3449,7 +3449,7 @@ const FakeOperations = struct {
     }
 };
 
-fn testReport() vmiz.DevicePreflightReport {
+fn testReport() miz.DevicePreflightReport {
     return .{
         .target_name = @constCast("test-target"),
         .whole_disk_name = @constCast("test-disk"),
@@ -3458,7 +3458,7 @@ fn testReport() vmiz.DevicePreflightReport {
         .removable = true,
         .transport = .usb,
         .partition_table = .none,
-        .partitions = @constCast(&[_]vmiz.block_device.PartitionReport{}),
+        .partitions = @constCast(&[_]miz.block_device.PartitionReport{}),
         .device_signatures = .{},
     };
 }
@@ -3468,23 +3468,23 @@ fn createRawTestImage(io: std.Io, path: []const u8) !void {
 }
 
 fn createRawTestImageWithSize(io: std.Io, path: []const u8, size: u64) !void {
-    var image = try vmiz.Image.create(io, path, .raw, size, .{});
+    var image = try miz.Image.create(io, path, .raw, size, .{});
     image.close(io);
 }
 
 fn createGptTestImage(io: std.Io, path: []const u8, size: u64) !void {
-    var image = try vmiz.Image.create(io, path, .raw, size, .{});
+    var image = try miz.Image.create(io, path, .raw, size, .{});
     defer image.close(io);
-    const specs = [_]vmiz.gpt.PartitionSpec{.{
-        .type_guid = vmiz.guid.linux_filesystem_data,
-        .unique_guid = vmiz.guid.parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+    const specs = [_]miz.gpt.PartitionSpec{.{
+        .type_guid = miz.guid.linux_filesystem_data,
+        .unique_guid = miz.guid.parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
         .size_sectors = 2048,
     }};
-    var placements: [specs.len]vmiz.gpt.Placement = undefined;
-    try vmiz.gpt.writeGpt(
+    var placements: [specs.len]miz.gpt.Placement = undefined;
+    try miz.gpt.writeGpt(
         &image,
         io,
-        vmiz.guid.parse("99999999-8888-7777-6666-555555555555"),
+        miz.guid.parse("99999999-8888-7777-6666-555555555555"),
         &specs,
         &placements,
     );
@@ -3512,43 +3512,43 @@ fn createRootGptTestImageWithFilesystemLength(
     size: u64,
     requested_filesystem_length: ?u64,
 ) !void {
-    var image = try vmiz.Image.create(io, path, .raw, size, .{});
+    var image = try miz.Image.create(io, path, .raw, size, .{});
     defer image.close(io);
     const first_lba: u64 = 2048;
-    const last_lba = size / vmiz.gpt.sector_size -
-        2 - vmiz.gpt.partition_array_sectors;
-    const specs = [_]vmiz.gpt.PlacedPartitionSpec{.{
-        .type_guid = vmiz.guid.linux_root_x86_64,
-        .unique_guid = vmiz.guid.parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+    const last_lba = size / miz.gpt.sector_size -
+        2 - miz.gpt.partition_array_sectors;
+    const specs = [_]miz.gpt.PlacedPartitionSpec{.{
+        .type_guid = miz.guid.linux_root_x86_64,
+        .unique_guid = miz.guid.parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
         .placement = .{
             .first_lba = first_lba,
             .last_lba = last_lba,
         },
-        .name_utf16le = vmiz.gpt.asciiName("root"),
+        .name_utf16le = miz.gpt.asciiName("root"),
     }};
-    try vmiz.gpt.writeGptPlaced(
+    try miz.gpt.writeGptPlaced(
         &image,
         io,
-        vmiz.guid.parse("99999999-8888-7777-6666-555555555555"),
+        miz.guid.parse("99999999-8888-7777-6666-555555555555"),
         &specs,
     );
-    var tree = vmiz.root_tree.RootTree.initMemory(allocator, io, .{});
+    var tree = miz.root_tree.RootTree.initMemory(allocator, io, .{});
     defer tree.deinit();
     try tree.putFileBytes("marker", "preserve me", .{ .mode = 0o644 });
     const partition_length = (last_lba - first_lba + 1) *
-        vmiz.gpt.sector_size;
+        miz.gpt.sector_size;
     const filesystem_length = requested_filesystem_length orelse
-        partition_length / vmiz.ext4.default_block_size *
-            vmiz.ext4.default_block_size;
-    _ = try vmiz.ext4.populate(
+        partition_length / miz.ext4.default_block_size *
+            miz.ext4.default_block_size;
+    _ = try miz.ext4.populate(
         io,
         image.file,
         allocator,
         try tree.cursor(),
         .{
-            .offset = first_lba * vmiz.gpt.sector_size,
+            .offset = first_lba * miz.gpt.sector_size,
             .length = filesystem_length,
-            .label = "vmiz-root",
+            .label = "miz-root",
             .uuid = [_]u8{0x55} ** 16,
         },
     );
@@ -3559,9 +3559,9 @@ const WriteIdentityTestFile = struct {
     contents: []const u8,
 };
 
-const old_root_partition_guid = vmiz.guid.parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
-const old_esp_partition_guid = vmiz.guid.parse("11111111-1111-1111-1111-111111111111");
-const old_disk_guid = vmiz.guid.parse("99999999-8888-7777-6666-555555555555");
+const old_root_partition_guid = miz.guid.parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+const old_esp_partition_guid = miz.guid.parse("11111111-1111-1111-1111-111111111111");
+const old_disk_guid = miz.guid.parse("99999999-8888-7777-6666-555555555555");
 const old_root_filesystem_uuid = [_]u8{0x55} ** 16;
 const old_esp_volume_id: u32 = 0x5A56_4D49;
 const old_root_filesystem_uuid_text = "55555555-5555-5555-5555-555555555555";
@@ -3591,44 +3591,44 @@ fn createFreshIdentityTestImage(
     options: FreshIdentityImageOptions,
 ) !void {
     const total_size = 128 * 1024 * 1024;
-    var image = try vmiz.Image.create(io, path, .raw, total_size, .{});
+    var image = try miz.Image.create(io, path, .raw, total_size, .{});
     defer image.close(io);
 
     const esp_first_lba: u64 = 2048;
     // FAT32 needs at least 65525 clusters, so the smallest legal ESP is
     // around 33.5 MiB regardless of how little it holds.
-    const esp_last_lba: u64 = esp_first_lba + (48 * 1024 * 1024 / vmiz.gpt.sector_size) - 1;
+    const esp_last_lba: u64 = esp_first_lba + (48 * 1024 * 1024 / miz.gpt.sector_size) - 1;
     const root_first_lba: u64 = esp_last_lba + 1;
-    const root_last_lba = total_size / vmiz.gpt.sector_size -
-        2 - vmiz.gpt.partition_array_sectors;
+    const root_last_lba = total_size / miz.gpt.sector_size -
+        2 - miz.gpt.partition_array_sectors;
 
     if (options.include_esp) {
-        const specs = [_]vmiz.gpt.PlacedPartitionSpec{
+        const specs = [_]miz.gpt.PlacedPartitionSpec{
             .{
-                .type_guid = vmiz.guid.esp,
+                .type_guid = miz.guid.esp,
                 .unique_guid = old_esp_partition_guid,
                 .placement = .{ .first_lba = esp_first_lba, .last_lba = esp_last_lba },
-                .name_utf16le = vmiz.gpt.asciiName("ESP"),
+                .name_utf16le = miz.gpt.asciiName("ESP"),
             },
             .{
-                .type_guid = vmiz.guid.linux_root_x86_64,
+                .type_guid = miz.guid.linux_root_x86_64,
                 .unique_guid = old_root_partition_guid,
                 .placement = .{ .first_lba = root_first_lba, .last_lba = root_last_lba },
-                .name_utf16le = vmiz.gpt.asciiName("root"),
+                .name_utf16le = miz.gpt.asciiName("root"),
             },
         };
-        try vmiz.gpt.writeGptPlaced(&image, io, old_disk_guid, &specs);
+        try miz.gpt.writeGptPlaced(&image, io, old_disk_guid, &specs);
     } else {
-        const specs = [_]vmiz.gpt.PlacedPartitionSpec{.{
-            .type_guid = vmiz.guid.linux_root_x86_64,
+        const specs = [_]miz.gpt.PlacedPartitionSpec{.{
+            .type_guid = miz.guid.linux_root_x86_64,
             .unique_guid = old_root_partition_guid,
             .placement = .{ .first_lba = root_first_lba, .last_lba = root_last_lba },
-            .name_utf16le = vmiz.gpt.asciiName("root"),
+            .name_utf16le = miz.gpt.asciiName("root"),
         }};
-        try vmiz.gpt.writeGptPlaced(&image, io, old_disk_guid, &specs);
+        try miz.gpt.writeGptPlaced(&image, io, old_disk_guid, &specs);
     }
 
-    var root_tree = vmiz.root_tree.RootTree.initMemory(allocator, io, .{});
+    var root_tree = miz.root_tree.RootTree.initMemory(allocator, io, .{});
     defer root_tree.deinit();
     try root_tree.putFileBytes("marker", "preserve me", .{ .mode = 0o644 });
     const fstab_text = options.root_fstab orelse default_root_fstab;
@@ -3649,19 +3649,19 @@ fn createFreshIdentityTestImage(
         .{ .mode = 0o644 },
     );
     try root_tree.putFileBytes(
-        "boot/loader/entries/vmiz.conf",
-        "title vmiz\nlinux /vmlinuz\noptions root=UUID=" ++ old_root_filesystem_uuid_text ++ " rootfstype=ext4\n",
+        "boot/loader/entries/miz.conf",
+        "title miz\nlinux /vmlinuz\noptions root=UUID=" ++ old_root_filesystem_uuid_text ++ " rootfstype=ext4\n",
         .{ .mode = 0o644 },
     );
     for (options.root_extra_files) |extra| {
         try root_tree.putFileBytes(extra.path, extra.contents, .{ .mode = 0o644 });
     }
 
-    const root_offset = root_first_lba * vmiz.gpt.sector_size;
-    const root_partition_length = (root_last_lba - root_first_lba + 1) * vmiz.gpt.sector_size;
+    const root_offset = root_first_lba * miz.gpt.sector_size;
+    const root_partition_length = (root_last_lba - root_first_lba + 1) * miz.gpt.sector_size;
     const root_length = root_partition_length /
-        vmiz.ext4.default_block_size * vmiz.ext4.default_block_size;
-    _ = try vmiz.ext4.populate(
+        miz.ext4.default_block_size * miz.ext4.default_block_size;
+    _ = try miz.ext4.populate(
         io,
         image.file,
         allocator,
@@ -3669,38 +3669,38 @@ fn createFreshIdentityTestImage(
         .{
             .offset = root_offset,
             .length = root_length,
-            .label = "vmiz-root",
+            .label = "miz-root",
             .uuid = old_root_filesystem_uuid,
         },
     );
 
     if (!options.include_esp) return;
 
-    var esp_tree = vmiz.root_tree.RootTree.initMemory(allocator, io, .{});
+    var esp_tree = miz.root_tree.RootTree.initMemory(allocator, io, .{});
     defer esp_tree.deinit();
     try esp_tree.putFileBytes(
-        "EFI/vmiz/grub.cfg",
+        "EFI/miz/grub.cfg",
         "search --fs-uuid --set=root " ++ old_root_filesystem_uuid_text ++ "\n",
         .{ .mode = 0o644 },
     );
     try esp_tree.putFileBytes(
-        "loader/entries/vmiz.conf",
-        "title vmiz\nlinux /vmlinuz\noptions root=UUID=" ++ old_root_filesystem_uuid_text ++ " rootfstype=ext4\n",
+        "loader/entries/miz.conf",
+        "title miz\nlinux /vmlinuz\noptions root=UUID=" ++ old_root_filesystem_uuid_text ++ " rootfstype=ext4\n",
         .{ .mode = 0o644 },
     );
     for (options.esp_extra_files) |extra| {
         try esp_tree.putFileBytes(extra.path, extra.contents, .{ .mode = 0o644 });
     }
 
-    const esp_offset = esp_first_lba * vmiz.gpt.sector_size;
-    const esp_length = (esp_last_lba - esp_first_lba + 1) * vmiz.gpt.sector_size;
-    try vmiz.fat32.format(&image, io, .{
+    const esp_offset = esp_first_lba * miz.gpt.sector_size;
+    const esp_length = (esp_last_lba - esp_first_lba + 1) * miz.gpt.sector_size;
+    try miz.fat32.format(&image, io, .{
         .partition_offset = esp_offset,
         .partition_len = esp_length,
         .volume_id = old_esp_volume_id,
         .volume_label = fatLabelFromText("ESP"),
     });
-    var esp_fs = try vmiz.fat32.open(&image, io, .{
+    var esp_fs = try miz.fat32.open(&image, io, .{
         .offset = esp_offset,
         .length = esp_length,
     });
@@ -3710,12 +3710,12 @@ fn createFreshIdentityTestImage(
 fn readExt4PartitionFileAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
-    image: *const vmiz.Image,
+    image: *const miz.Image,
     offset: u64,
     length: u64,
     path: []const u8,
 ) ![]u8 {
-    var reader = try vmiz.ext4.openGeneralReadOnlySource(
+    var reader = try miz.ext4.openGeneralReadOnlySource(
         io,
         image.file,
         .{
@@ -3726,7 +3726,7 @@ fn readExt4PartitionFileAlloc(
         .{ .offset = offset },
     );
     defer reader.deinit();
-    var tree = try vmiz.ext4.scanReadable(
+    var tree = try miz.ext4.scanReadable(
         &reader,
         io,
         allocator,
@@ -3742,12 +3742,12 @@ fn readExt4PartitionFileAlloc(
 fn readFatPartitionFileAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
-    image: *vmiz.Image,
+    image: *miz.Image,
     offset: u64,
     length: u64,
     path: []const u8,
 ) ![]u8 {
-    var fs = try vmiz.fat32.open(image, io, .{ .offset = offset, .length = length });
+    var fs = try miz.fat32.open(image, io, .{ .offset = offset, .length = length });
     return fs.readFileAlloc(io, allocator, path);
 }
 
@@ -3758,16 +3758,16 @@ const test_identity_scan_hooks = IdentityScanHooks{
 fn noVisibleIdentityCollisions(
     _: std.mem.Allocator,
     _: std.Io,
-    _: *const vmiz.block_device.IdentityInventory,
+    _: *const miz.block_device.IdentityInventory,
     _: []const u8,
-) anyerror!vmiz.block_device.CollisionReport {
+) anyerror!miz.block_device.CollisionReport {
     return .{ .collisions = &.{}, .scanned_visible_disks = 0 };
 }
 
 fn prepareFreshIdentityForTest(
     allocator: std.mem.Allocator,
     io: std.Io,
-    source: *vmiz.Image,
+    source: *miz.Image,
 ) !PreparedIdentity {
     var report = testReport();
     var detected = try detectGpt(null, source.*, io, allocator);
@@ -3870,7 +3870,7 @@ test "write accepts every supported source image format" {
     var report = testReport();
 
     const cases = [_]struct {
-        format: vmiz.Format,
+        format: miz.Format,
         path: []const u8,
     }{
         .{ .format = .raw, .path = "test-write-command-source.raw" },
@@ -3881,7 +3881,7 @@ test "write accepts every supported source image format" {
     defer for (cases) |case| std.Io.Dir.cwd().deleteFile(io, case.path) catch {};
 
     for (cases) |case| {
-        var image = try vmiz.Image.create(io, case.path, case.format, 16 * 1024 * 1024, .{});
+        var image = try miz.Image.create(io, case.path, case.format, 16 * 1024 * 1024, .{});
         image.close(io);
 
         var fake = FakeOperations{
@@ -3944,7 +3944,7 @@ test "write production path refuses a regular-file target without mutation" {
     try createRawTestImage(io, target);
     const marker = "keep existing target bytes";
     {
-        var image = try vmiz.Image.openPath(io, target);
+        var image = try miz.Image.openPath(io, target);
         defer image.close(io);
         try image.pwrite(io, marker, 4096);
     }
@@ -3957,7 +3957,7 @@ test "write production path refuses a regular-file target without mutation" {
             &.{ "--allow-device-write", "--yes", source, target },
         ),
     );
-    var image = try vmiz.Image.openPathReadOnly(io, target);
+    var image = try miz.Image.openPathReadOnly(io, target);
     defer image.close(io);
     var actual: [marker.len]u8 = undefined;
     try std.testing.expectEqual(marker.len, try image.pread(io, &actual, 4096));
@@ -4003,7 +4003,7 @@ test "write reports refresh failures as partial success" {
     try createRawTestImage(io, target);
     var report = testReport();
 
-    for ([_]vmiz.DeviceWriteOutcome{
+    for ([_]miz.DeviceWriteOutcome{
         .partition_table_stale_busy,
         .partition_table_stale_unsupported,
         .partition_table_stale_failed,
@@ -4089,12 +4089,12 @@ test "write passes through non-GPT sources while clearing stale destination meta
     defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
     defer std.Io.Dir.cwd().deleteFile(io, target) catch {};
     {
-        var image = try vmiz.Image.create(io, source, .raw, source_size, .{});
+        var image = try miz.Image.create(io, source, .raw, source_size, .{});
         defer image.close(io);
         try image.pwrite(io, "payload", 4 * 1024 * 1024);
     }
     {
-        var image = try vmiz.Image.create(io, target, .raw, target_size, .{});
+        var image = try miz.Image.create(io, target, .raw, target_size, .{});
         defer image.close(io);
         try image.pwrite(io, &([_]u8{0xa5} ** 512), target_size - 512);
     }
@@ -4111,7 +4111,7 @@ test "write passes through non-GPT sources while clearing stale destination meta
         ),
     );
     try std.testing.expectEqualStrings("dixf", fake.eventSlice());
-    var destination = try vmiz.Image.openPathReadOnly(io, target);
+    var destination = try miz.Image.openPathReadOnly(io, target);
     defer destination.close(io);
     var payload: ["payload".len]u8 = undefined;
     try std.testing.expectEqual(
@@ -4156,17 +4156,17 @@ test "write relocates or visibly accepts same-size GPT and preserves its opaque 
         defer std.Io.Dir.cwd().deleteFile(io, target) catch {};
         try createGptTestImage(io, source, source_size);
         {
-            var image = try vmiz.Image.create(io, target, .raw, case.target_size, .{});
+            var image = try miz.Image.create(io, target, .raw, case.target_size, .{});
             image.close(io);
         }
 
-        var source_image = try vmiz.Image.openPathReadOnly(io, source);
+        var source_image = try miz.Image.openPathReadOnly(io, source);
         defer source_image.close(io);
-        var source_gpt = try vmiz.gpt.readVerifiedGpt(
+        var source_gpt = try miz.gpt.readVerifiedGpt(
             source_image,
             io,
             std.testing.allocator,
-            vmiz.gpt.default_max_partition_array_bytes,
+            miz.gpt.default_max_partition_array_bytes,
         );
         defer source_gpt.deinit(std.testing.allocator);
         const original_array = try std.testing.allocator.dupe(
@@ -4189,17 +4189,17 @@ test "write relocates or visibly accepts same-size GPT and preserves its opaque 
         try std.testing.expectEqualStrings("dixrvf", fake.eventSlice());
         try std.testing.expectEqual(@as(usize, 1), fake.finish_calls);
 
-        var destination = try vmiz.Image.openPathReadOnly(io, target);
+        var destination = try miz.Image.openPathReadOnly(io, target);
         defer destination.close(io);
-        var destination_gpt = try vmiz.gpt.readVerifiedGpt(
+        var destination_gpt = try miz.gpt.readVerifiedGpt(
             destination,
             io,
             std.testing.allocator,
-            vmiz.gpt.default_max_partition_array_bytes,
+            miz.gpt.default_max_partition_array_bytes,
         );
         defer destination_gpt.deinit(std.testing.allocator);
         try std.testing.expectEqual(
-            case.target_size / vmiz.gpt.sector_size - 1,
+            case.target_size / miz.gpt.sector_size - 1,
             destination_gpt.primary_header.backup_lba,
         );
         try std.testing.expectEqualSlices(
@@ -4220,16 +4220,16 @@ test "write rejects malformed GPT before destination mutation" {
     try createRawTestImage(io, source);
     try createRawTestImage(io, target);
     {
-        var image = try vmiz.Image.openPath(io, source);
+        var image = try miz.Image.openPath(io, source);
         defer image.close(io);
-        const protective = vmiz.mbr.protectiveMbr(
-            image.virtual_size / vmiz.gpt.sector_size,
+        const protective = miz.mbr.protectiveMbr(
+            image.virtual_size / miz.gpt.sector_size,
         ).encode();
         try image.pwrite(io, &protective, 0);
     }
     const marker = "destination remains intact";
     {
-        var image = try vmiz.Image.openPath(io, target);
+        var image = try miz.Image.openPath(io, target);
         defer image.close(io);
         try image.pwrite(io, marker, 4096);
     }
@@ -4246,7 +4246,7 @@ test "write rejects malformed GPT before destination mutation" {
         ),
     );
     try std.testing.expectEqualStrings("d", fake.eventSlice());
-    var destination = try vmiz.Image.openPathReadOnly(io, target);
+    var destination = try miz.Image.openPathReadOnly(io, target);
     defer destination.close(io);
     var actual: [marker.len]u8 = undefined;
     try std.testing.expectEqual(
@@ -4393,16 +4393,16 @@ test "write grow-root grows GPT and ext4 offline on a larger file stand-in" {
             fake.operations(),
         ),
     );
-    var destination = try vmiz.Image.openPathReadOnly(io, target);
+    var destination = try miz.Image.openPathReadOnly(io, target);
     defer destination.close(io);
-    var gpt = try vmiz.gpt.readVerifiedGpt(
+    var gpt = try miz.gpt.readVerifiedGpt(
         destination,
         io,
         allocator,
-        vmiz.gpt.default_max_partition_array_bytes,
+        miz.gpt.default_max_partition_array_bytes,
     );
     defer gpt.deinit(allocator);
-    const root = try vmiz.root_resize.selectRoot(
+    const root = try miz.root_resize.selectRoot(
         allocator,
         io,
         &destination,
@@ -4410,13 +4410,13 @@ test "write grow-root grows GPT and ext4 offline on a larger file stand-in" {
         .{ .require_last_partition = true },
     );
     try std.testing.expectEqual(
-        target_size / vmiz.gpt.sector_size -
-            vmiz.gpt.partition_array_sectors - 2,
+        target_size / miz.gpt.sector_size -
+            miz.gpt.partition_array_sectors - 2,
         root.last_lba,
     );
     try std.testing.expectEqual(
-        root.partition_length / vmiz.ext4.default_block_size *
-            vmiz.ext4.default_block_size,
+        root.partition_length / miz.ext4.default_block_size *
+            miz.ext4.default_block_size,
         root.filesystem_length,
     );
     try std.testing.expectEqual(@as(usize, 1), fake.resize_calls);
@@ -4482,16 +4482,16 @@ test "write grow-root fills a smaller filesystem in a same-size full partition" 
     try std.testing.expectEqual(@as(usize, 0), fake.grow_partition_calls);
     try std.testing.expectEqual(@as(usize, 1), fake.resize_calls);
 
-    var destination = try vmiz.Image.openPathReadOnly(io, target);
+    var destination = try miz.Image.openPathReadOnly(io, target);
     defer destination.close(io);
-    var gpt = try vmiz.gpt.readVerifiedGpt(
+    var gpt = try miz.gpt.readVerifiedGpt(
         destination,
         io,
         std.testing.allocator,
-        vmiz.gpt.default_max_partition_array_bytes,
+        miz.gpt.default_max_partition_array_bytes,
     );
     defer gpt.deinit(std.testing.allocator);
-    const root = try vmiz.root_resize.selectRoot(
+    const root = try miz.root_resize.selectRoot(
         std.testing.allocator,
         io,
         &destination,
@@ -4500,8 +4500,8 @@ test "write grow-root fills a smaller filesystem in a same-size full partition" 
     );
     try std.testing.expect(root.filesystem_length > initial_filesystem_length);
     try std.testing.expectEqual(
-        root.partition_length / vmiz.ext4.default_block_size *
-            vmiz.ext4.default_block_size,
+        root.partition_length / miz.ext4.default_block_size *
+            miz.ext4.default_block_size,
         root.filesystem_length,
     );
 }
@@ -4619,7 +4619,7 @@ test "write grow-root preserves refresh partial success" {
 }
 
 test "write preflight output inventories the target" {
-    var partition = vmiz.block_device.PartitionReport{
+    var partition = miz.block_device.PartitionReport{
         .table_index = 0,
         .first_lba = 2048,
         .last_lba = 4095,
@@ -4634,7 +4634,7 @@ test "write preflight output inventories the target" {
     @memcpy(partition.name[0..3], "EFI");
     @memcpy(partition.gpt_unique_guid[0..36], "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
     @memcpy(partition.filesystem.identifier[0..9], "1234-5678");
-    var partitions = [_]vmiz.block_device.PartitionReport{partition};
+    var partitions = [_]miz.block_device.PartitionReport{partition};
     var report = testReport();
     report.whole_disk_serial = @constCast("SERIAL-001");
     report.partition_table = .gpt;
@@ -4688,7 +4688,7 @@ test "write preflight output inventories the target" {
 }
 
 test "write source identity output reports visible collisions" {
-    var partition = vmiz.block_device.PartitionReport{
+    var partition = miz.block_device.PartitionReport{
         .table_index = 0,
         .first_lba = 2048,
         .last_lba = 4095,
@@ -4703,8 +4703,8 @@ test "write source identity output reports visible collisions" {
         partition.filesystem.identifier[0..36],
         "11111111-2222-3333-4444-555555555555",
     );
-    var partitions = [_]vmiz.block_device.PartitionReport{partition};
-    var inventory = vmiz.block_device.IdentityInventory{
+    var partitions = [_]miz.block_device.PartitionReport{partition};
+    var inventory = miz.block_device.IdentityInventory{
         .partition_table = .gpt,
         .partitions = &partitions,
         .device_signatures = .{},
@@ -4712,7 +4712,7 @@ test "write source identity output reports visible collisions" {
     };
     @memcpy(inventory.gpt_disk_guid[0..36], "99999999-8888-7777-6666-555555555555");
 
-    var collisions = [_]vmiz.block_device.Collision{
+    var collisions = [_]miz.block_device.Collision{
         .{
             .kind = .gpt_disk_guid,
             .identifier_len = 36,
@@ -4738,7 +4738,7 @@ test "write source identity output reports visible collisions" {
     @memcpy(collisions[0].identifier[0..36], inventory.gpt_disk_guid[0..36]);
     @memcpy(collisions[1].identifier[0..36], partition.gpt_unique_guid[0..36]);
     @memcpy(collisions[2].identifier[0..36], partition.filesystem.identifier[0..36]);
-    const report = vmiz.block_device.CollisionReport{
+    const report = miz.block_device.CollisionReport{
         .collisions = &collisions,
         .scanned_visible_disks = 2,
     };
@@ -4855,7 +4855,7 @@ test "write new-uuids prepares unique fresh identifiers" {
     defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
     try createFreshIdentityTestImage(std.testing.allocator, io, source, .{});
 
-    var image = try vmiz.Image.openPathReadOnly(io, source);
+    var image = try miz.Image.openPathReadOnly(io, source);
     defer image.close(io);
     var prepared = try prepareFreshIdentityForTest(std.testing.allocator, io, &image);
     defer prepared.deinit(std.testing.allocator);
@@ -4897,7 +4897,7 @@ test "write new-uuids post-write verification rejects an unreworked image" {
     defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
     try createFreshIdentityTestImage(allocator, io, source, .{});
 
-    var image = try vmiz.Image.openPathReadOnly(io, source);
+    var image = try miz.Image.openPathReadOnly(io, source);
     defer image.close(io);
     var prepared = try prepareFreshIdentityForTest(allocator, io, &image);
     defer prepared.deinit(allocator);
@@ -4918,9 +4918,9 @@ test "write new-uuids refuses unsupported filesystem inventory" {
     defer std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
     try createFreshIdentityTestImage(allocator, io, source_path, .{ .include_esp = false });
 
-    var source = try vmiz.Image.openPathReadOnly(io, source_path);
+    var source = try miz.Image.openPathReadOnly(io, source_path);
     defer source.close(io);
-    var inventory = try vmiz.block_device.inspectIdentityInventory(
+    var inventory = try miz.block_device.inspectIdentityInventory(
         allocator,
         io,
         .{
@@ -4983,14 +4983,14 @@ test "write new-uuids refuses stale unsupported boot references" {
     const source = "test-write-command-stale-boot-source.raw";
     defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
     const stale_file = [_]WriteIdentityTestFile{.{
-        .path = "boot/loader/entries/vmiz.extra",
+        .path = "boot/loader/entries/miz.extra",
         .contents = "options root=UUID=" ++ old_root_filesystem_uuid_text ++ " rootfstype=ext4\n",
     }};
     try createFreshIdentityTestImage(std.testing.allocator, io, source, .{
         .root_extra_files = &stale_file,
     });
 
-    var image = try vmiz.Image.openPathReadOnly(io, source);
+    var image = try miz.Image.openPathReadOnly(io, source);
     defer image.close(io);
     var prepared = try prepareFreshIdentityForTest(std.testing.allocator, io, &image);
     defer prepared.deinit(std.testing.allocator);
@@ -5004,14 +5004,14 @@ test "write new-uuids refuses immutable or signed UKI references" {
     const source = "test-write-command-uki-refusal-source.raw";
     defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
     const esp_extra = [_]WriteIdentityTestFile{.{
-        .path = "EFI/Linux/vmiz.efi",
+        .path = "EFI/Linux/miz.efi",
         .contents = "stub root=UUID=" ++ old_root_filesystem_uuid_text ++ "\n",
     }};
     try createFreshIdentityTestImage(std.testing.allocator, io, source, .{
         .esp_extra_files = &esp_extra,
     });
 
-    var image = try vmiz.Image.openPathReadOnly(io, source);
+    var image = try miz.Image.openPathReadOnly(io, source);
     defer image.close(io);
     var prepared = try prepareFreshIdentityForTest(std.testing.allocator, io, &image);
     defer prepared.deinit(std.testing.allocator);
@@ -5048,9 +5048,9 @@ test "write new-uuids rewrites identities and verifies supported references" {
         ),
     );
 
-    var destination = try vmiz.Image.openPathReadOnly(io, target);
+    var destination = try miz.Image.openPathReadOnly(io, target);
     defer destination.close(io);
-    var inventory = try vmiz.block_device.inspectIdentityInventory(
+    var inventory = try miz.block_device.inspectIdentityInventory(
         allocator,
         io,
         .{
@@ -5060,11 +5060,11 @@ test "write new-uuids rewrites identities and verifies supported references" {
         destination.virtual_size,
     );
     defer inventory.deinit(allocator);
-    try std.testing.expectEqual(vmiz.block_device.PartitionTable.gpt, inventory.partition_table);
+    try std.testing.expectEqual(miz.block_device.PartitionTable.gpt, inventory.partition_table);
     try std.testing.expect(!std.mem.eql(u8, inventory.gptDiskGuid().?, "99999999-8888-7777-6666-555555555555"));
 
-    var esp_partition: ?vmiz.block_device.PartitionReport = null;
-    var root_partition: ?vmiz.block_device.PartitionReport = null;
+    var esp_partition: ?miz.block_device.PartitionReport = null;
+    var root_partition: ?miz.block_device.PartitionReport = null;
     for (inventory.partitions) |partition| {
         switch (partition.filesystem.kind) {
             .fat => esp_partition = partition,
@@ -5077,10 +5077,10 @@ test "write new-uuids rewrites identities and verifies supported references" {
     try std.testing.expect(!std.mem.eql(u8, esp_partition.?.filesystem.identifierText().?, old_esp_volume_id_text));
     try std.testing.expect(!std.mem.eql(u8, root_partition.?.filesystem.identifierText().?, old_root_filesystem_uuid_text));
 
-    const root_offset = root_partition.?.first_lba * vmiz.gpt.sector_size;
-    const root_length = (root_partition.?.last_lba - root_partition.?.first_lba + 1) * vmiz.gpt.sector_size;
-    const esp_offset = esp_partition.?.first_lba * vmiz.gpt.sector_size;
-    const esp_length = (esp_partition.?.last_lba - esp_partition.?.first_lba + 1) * vmiz.gpt.sector_size;
+    const root_offset = root_partition.?.first_lba * miz.gpt.sector_size;
+    const root_length = (root_partition.?.last_lba - root_partition.?.first_lba + 1) * miz.gpt.sector_size;
+    const esp_offset = esp_partition.?.first_lba * miz.gpt.sector_size;
+    const esp_length = (esp_partition.?.last_lba - esp_partition.?.first_lba + 1) * miz.gpt.sector_size;
 
     const fstab = try readExt4PartitionFileAlloc(
         allocator,
@@ -5114,7 +5114,7 @@ test "write new-uuids rewrites identities and verifies supported references" {
         &destination,
         esp_offset,
         esp_length,
-        "EFI/vmiz/grub.cfg",
+        "EFI/miz/grub.cfg",
     );
     defer allocator.free(esp_cfg);
     try std.testing.expect(std.mem.indexOf(u8, esp_cfg, old_root_filesystem_uuid_text) == null);

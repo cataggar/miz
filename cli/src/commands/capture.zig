@@ -1,4 +1,4 @@
-//! `vmiz capture`: rebuild an installed system into a fresh, right-sized
+//! `miz capture`: rebuild an installed system into a fresh, right-sized
 //! image.
 //!
 //! The distinguishing property is the sizing. A capture reads what is on a
@@ -11,11 +11,11 @@
 //! is mounted and nothing is written to them, so this normally runs as root.
 
 const std = @import("std");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 const opts = @import("opts.zig");
 
 const help_text =
-    \\usage: vmiz capture --source <device|image> [--source-root <spec>]
+    \\usage: miz capture --source <device|image> [--source-root <spec>]
     \\                    [--source-mount <spec>=<path>]... [--source-esp <spec>]
     \\                    [--root-size <size>] [--esp-size <size>]
     \\                    -O <format> -o <output|->
@@ -71,7 +71,7 @@ const help_text =
     \\  --root-selinux-label <context>
     \\                           SELinux context for the new root directory.
     \\  --no-journal             Omit the ext4 journal. On by default here,
-    \\                           unlike elsewhere in vmiz, because a captured
+    \\                           unlike elsewhere in miz, because a captured
     \\                           system boots into a mutable root filesystem.
     \\                           Required for an XFS root: XFS journals
     \\                           internally, and asking for an ext4 journal on
@@ -189,7 +189,7 @@ pub fn describeCaptureFailure(err: anyerror) ?[]const u8 {
 
 const Architecture = enum { auto, x86_64, aarch64 };
 
-fn hostArchitecture() vmiz.bootconfig.Architecture {
+fn hostArchitecture() miz.bootconfig.Architecture {
     return switch (@import("builtin").cpu.arch) {
         .aarch64 => .aarch64,
         else => .x86_64,
@@ -205,14 +205,14 @@ fn hostArchitecture() vmiz.bootconfig.Architecture {
 /// heap-allocated and tracked in a list of their own, so that adding one
 /// cannot move the ones already handed out.
 const OpenedSource = struct {
-    image: *vmiz.Image,
+    image: *miz.Image,
     offset: u64,
     length: u64,
     /// The entry this came from, when it was resolved through `--source`'s
     /// partition table. Its GUID and name are the PARTUUID and PARTLABEL the
     /// captured system may be referring to itself by, and they are retired
     /// along with the filesystem UUID.
-    partition: ?vmiz.gpt.PartitionEntry = null,
+    partition: ?miz.gpt.PartitionEntry = null,
 };
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
@@ -227,16 +227,16 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var esp_size: ?u64 = null;
     var architecture: Architecture = .auto;
     var label: []const u8 = "";
-    var root_filesystem: vmiz.layout.FilesystemKind = .ext4;
+    var root_filesystem: miz.layout.FilesystemKind = .ext4;
     var selinux_label: ?[]const u8 = null;
     var journal = true;
     var rewrite_identities = true;
     var dry_run = false;
 
     var output_path: ?[]const u8 = null;
-    var spec: ?vmiz.output.Spec = null;
-    var level: ?vmiz.output.Level = null;
-    var import_limits = vmiz.limits.ImportLimits{};
+    var spec: ?miz.output.Spec = null;
+    var level: ?miz.output.Level = null;
+    var import_limits = miz.limits.ImportLimits{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -265,12 +265,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, arg, "--root-size")) {
             i += 1;
             if (i >= args.len) return fail("capture: --root-size requires a size", .{});
-            root_size = vmiz.parseSize(args[i]) catch
+            root_size = miz.parseSize(args[i]) catch
                 return fail("capture: invalid --root-size '{s}'", .{args[i]});
         } else if (std.mem.eql(u8, arg, "--esp-size")) {
             i += 1;
             if (i >= args.len) return fail("capture: --esp-size requires a size", .{});
-            esp_size = vmiz.parseSize(args[i]) catch
+            esp_size = miz.parseSize(args[i]) catch
                 return fail("capture: invalid --esp-size '{s}'", .{args[i]});
         } else if (std.mem.eql(u8, arg, "--architecture")) {
             i += 1;
@@ -308,12 +308,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, arg, "-O")) {
             i += 1;
             if (i >= args.len) return fail("capture: -O requires a format", .{});
-            spec = vmiz.output.Spec.parseName(args[i]) orelse
+            spec = miz.output.Spec.parseName(args[i]) orelse
                 return fail("capture: unknown format '{s}'", .{args[i]});
         } else if (std.mem.eql(u8, arg, "--compress-level")) {
             i += 1;
             if (i >= args.len) return fail("capture: --compress-level requires 1-9", .{});
-            level = vmiz.output.parseLevel(args[i]) catch
+            level = miz.output.parseLevel(args[i]) catch
                 return fail("capture: --compress-level must be 1 (fastest) through 9 (smallest)", .{});
         } else if (std.mem.startsWith(u8, arg, "--max-")) {
             i += 1;
@@ -333,14 +333,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
 
     const output_spec = spec orelse blk: {
         if (std.mem.eql(u8, destination_text, "-"))
-            break :blk vmiz.output.Spec{ .format = .raw };
-        break :blk vmiz.output.Spec.inferFromPath(destination_text) orelse
+            break :blk miz.output.Spec{ .format = .raw };
+        break :blk miz.output.Spec.inferFromPath(destination_text) orelse
             return fail("capture: cannot tell the output format from '{s}'; pass -O", .{destination_text});
     };
-    const destination: vmiz.output.Destination =
+    const destination: miz.output.Destination =
         if (std.mem.eql(u8, destination_text, "-")) .stdout else .{ .path = destination_text };
 
-    vmiz.output.validate(output_spec, destination, level) catch |err|
+    miz.output.validate(output_spec, destination, level) catch |err|
         return fail("capture: -O {s}: {s}", .{ output_spec.displayName(), opts.describeOutputError(err) });
 
     var mounts = std.array_list.Managed(Mount).init(gpa);
@@ -355,7 +355,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     defer targets.deinit();
     for (mounts.items) |mount| targets.append(mount.target) catch
         return fail("capture: out of memory", .{});
-    vmiz.root_tree.validateMountTargets(targets.items) catch |err|
+    miz.root_tree.validateMountTargets(targets.items) catch |err|
         return failWithHint("capture: --source-mount targets rejected", err);
 
     return capture(gpa, io, .{
@@ -390,15 +390,15 @@ const CaptureRequest = struct {
     esp_size: ?u64,
     architecture: Architecture,
     label: []const u8,
-    root_filesystem: vmiz.layout.FilesystemKind,
+    root_filesystem: miz.layout.FilesystemKind,
     selinux_label: ?[]const u8,
     journal: bool,
     rewrite_identities: bool,
     dry_run: bool,
-    spec: vmiz.output.Spec,
-    destination: vmiz.output.Destination,
-    level: ?vmiz.output.Level,
-    limits: vmiz.limits.ImportLimits,
+    spec: miz.output.Spec,
+    destination: miz.output.Destination,
+    level: ?miz.output.Level,
+    limits: miz.limits.ImportLimits,
 };
 
 /// The ext4 journal setting a capture hands to `disk_assembly`. The request's
@@ -408,21 +408,21 @@ const CaptureRequest = struct {
 /// by name (`Ext4JournalWithXfsRoot`) instead of being quietly cleared here,
 /// before any validation runs, the way an earlier version did. A user who
 /// wants an XFS root passes `--no-journal`.
-fn ext4JournalSetting(request: CaptureRequest) vmiz.ext4.JournalOptions {
+fn ext4JournalSetting(request: CaptureRequest) miz.ext4.JournalOptions {
     return .{ .enabled = request.journal };
 }
 
 fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
-    var disk = vmiz.Image.openPathReadOnly(io, request.source_path) catch |err|
+    var disk = miz.Image.openPathReadOnly(io, request.source_path) catch |err|
         return failOpen(request.source_path, err);
     defer disk.close(io);
 
     // The partition table is read once and shared: every `gpt:<n>` spec, the
     // ESP search and the PARTUUID of the source root all come out of it.
-    const table: ?vmiz.gpt.ParsedGpt = vmiz.gpt.readGpt(disk, io, gpa) catch null;
+    const table: ?miz.gpt.ParsedGpt = miz.gpt.readGpt(disk, io, gpa) catch null;
     defer if (table) |parsed| gpa.free(parsed.partitions);
 
-    var scratch = std.array_list.Managed(*vmiz.Image).init(gpa);
+    var scratch = std.array_list.Managed(*miz.Image).init(gpa);
     defer {
         for (scratch.items) |opened| {
             opened.close(io);
@@ -434,7 +434,7 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
     const root_source = resolveRoot(gpa, io, &disk, table, request, &scratch) catch |err|
         return failWithHint("capture: cannot read the root filesystem", err);
 
-    var diagnostic = vmiz.limits.Diagnostic{};
+    var diagnostic = miz.limits.Diagnostic{};
 
     var root_reader = openSourceFilesystem(gpa, io, root_source) catch |err|
         return failWithHint("capture: the root source is not a supported filesystem (ext4 or xfs)", err);
@@ -454,12 +454,12 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
     defer gpa.free(spool_path);
     defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
 
-    var tree = vmiz.root_tree.RootTree.init(gpa, io, spool_path, request.limits.tree()) catch |err|
+    var tree = miz.root_tree.RootTree.init(gpa, io, spool_path, request.limits.tree()) catch |err|
         return fail("capture: cannot create the staging spool '{s}': {s}", .{ spool_path, @errorName(err) });
     defer tree.deinit();
     tree.diagnostic = &diagnostic;
 
-    var sources = std.array_list.Managed(vmiz.disk_assembly.SourceFilesystem).init(gpa);
+    var sources = std.array_list.Managed(miz.disk_assembly.SourceFilesystem).init(gpa);
     defer sources.deinit();
     var identifier_storage = std.array_list.Managed([]u8).init(gpa);
     defer {
@@ -474,7 +474,7 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
     // never needs to know.
     const root_identity: struct { uuid: []const u8, label: ?[]const u8 } = switch (root_reader) {
         .ext4 => |*reader| blk: {
-            var root_scan = vmiz.ext4.scanReadable(reader, io, gpa, scanOptions(request.limits, root_source.length, &diagnostic)) catch |err|
+            var root_scan = miz.ext4.scanReadable(reader, io, gpa, scanOptions(request.limits, root_source.length, &diagnostic)) catch |err|
                 return failLimits("capture: reading the root filesystem failed", err, &diagnostic);
             defer root_scan.deinit();
 
@@ -488,7 +488,7 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
             break :blk .{ .uuid = uuid, .label = label };
         },
         .xfs => |*reader| blk: {
-            var root_scan = vmiz.xfs.scanReadable(reader, io, gpa, xfsScanOptions(request.limits, root_source.length, &diagnostic)) catch |err|
+            var root_scan = miz.xfs.scanReadable(reader, io, gpa, xfsScanOptions(request.limits, root_source.length, &diagnostic)) catch |err|
                 return failLimits("capture: reading the root filesystem failed", err, &diagnostic);
             defer root_scan.deinit();
 
@@ -503,7 +503,7 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
         },
     };
 
-    var root_before = vmiz.identity_rewrite.Identifiers{ .filesystem_uuid = root_identity.uuid, .filesystem_label = root_identity.label };
+    var root_before = miz.identity_rewrite.Identifiers{ .filesystem_uuid = root_identity.uuid, .filesystem_label = root_identity.label };
     ownedPartition(gpa, &identifier_storage, root_source.partition, &root_before) catch
         return fail("capture: out of memory", .{});
     sources.append(.{
@@ -525,7 +525,7 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
 
         const mount_identity: struct { uuid: []const u8, label: ?[]const u8 } = switch (reader) {
             .ext4 => |*r| blk: {
-                var scan = vmiz.ext4.scanReadable(r, io, gpa, scanOptions(request.limits, opened.length, &diagnostic)) catch |err|
+                var scan = miz.ext4.scanReadable(r, io, gpa, scanOptions(request.limits, opened.length, &diagnostic)) catch |err|
                     return failLimits("capture: reading a --source-mount filesystem failed", err, &diagnostic);
                 defer scan.deinit();
 
@@ -539,7 +539,7 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
                 break :blk .{ .uuid = uuid, .label = label };
             },
             .xfs => |*r| blk: {
-                var scan = vmiz.xfs.scanReadable(r, io, gpa, xfsScanOptions(request.limits, opened.length, &diagnostic)) catch |err|
+                var scan = miz.xfs.scanReadable(r, io, gpa, xfsScanOptions(request.limits, opened.length, &diagnostic)) catch |err|
                     return failLimits("capture: reading a --source-mount filesystem failed", err, &diagnostic);
                 defer scan.deinit();
 
@@ -554,7 +554,7 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
             },
         };
 
-        var mount_before = vmiz.identity_rewrite.Identifiers{ .filesystem_uuid = mount_identity.uuid, .filesystem_label = mount_identity.label };
+        var mount_before = miz.identity_rewrite.Identifiers{ .filesystem_uuid = mount_identity.uuid, .filesystem_label = mount_identity.label };
         ownedPartition(gpa, &identifier_storage, opened.partition, &mount_before) catch
             return fail("capture: out of memory", .{});
         sources.append(.{
@@ -567,7 +567,7 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
     // The ESP becomes a partition of its own rather than a directory in the
     // root, because a merged ESP is not an ESP: firmware looks for a
     // partition with the EFI type GUID and would find nothing to boot.
-    var esp_tree: ?vmiz.root_tree.RootTree = null;
+    var esp_tree: ?miz.root_tree.RootTree = null;
     defer if (esp_tree) |*value| value.deinit();
     var esp_spool: ?[]u8 = null;
     defer if (esp_spool) |value| gpa.free(value);
@@ -580,12 +580,12 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
             const opened = resolveSpec(gpa, io, &disk, table, esp_spec, &scratch) catch |err|
                 return failWithHint("capture: cannot read the EFI system partition", err);
 
-            var fs = vmiz.fat32.open(opened.image, io, .{
+            var fs = miz.fat32.open(opened.image, io, .{
                 .offset = opened.offset,
                 .length = opened.length,
             }) catch |err| return failWithHint("capture: the EFI system partition is not readable", err);
 
-            var scan = vmiz.fat32.scanTree(&fs, io, gpa, .{
+            var scan = miz.fat32.scanTree(&fs, io, gpa, .{
                 .max_nodes = request.limits.max_nodes,
                 .max_path_bytes = request.limits.max_path_bytes,
                 .max_component_bytes = request.limits.max_component_bytes,
@@ -598,7 +598,7 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
 
             esp_spool = stagingPath(gpa, request.destination, ".esp-spool") catch
                 return fail("capture: out of memory", .{});
-            var built = vmiz.root_tree.RootTree.init(gpa, io, esp_spool.?, request.limits.tree()) catch |err|
+            var built = miz.root_tree.RootTree.init(gpa, io, esp_spool.?, request.limits.tree()) catch |err|
                 return fail("capture: cannot create the ESP staging spool: {s}", .{@errorName(err)});
             built.diagnostic = &diagnostic;
             built.importExt4View(scan.fileTreeView()) catch |err| {
@@ -611,7 +611,7 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
                 return fail("capture: out of memory", .{});
             const esp_label = ownedLabel(gpa, &identifier_storage, &scan.label) catch
                 return fail("capture: out of memory", .{});
-            var esp_before = vmiz.identity_rewrite.Identifiers{ .filesystem_uuid = serial, .filesystem_label = esp_label };
+            var esp_before = miz.identity_rewrite.Identifiers{ .filesystem_uuid = serial, .filesystem_label = esp_label };
             ownedPartition(gpa, &identifier_storage, opened.partition, &esp_before) catch
                 return fail("capture: out of memory", .{});
             sources.append(.{
@@ -639,7 +639,7 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
     var wrote_raw = false;
     defer if (wrote_raw and !writes_raw_directly) std.Io.Dir.cwd().deleteFile(io, raw_path) catch {};
 
-    const report = vmiz.disk_assembly.assemble(gpa, io, &tree, .{
+    const report = miz.disk_assembly.assemble(gpa, io, &tree, .{
         .raw_path = raw_path,
         .architecture = switch (request.architecture) {
             .auto => hostArchitecture(),
@@ -647,11 +647,11 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
             .aarch64 => .aarch64,
         },
         .esp_tree = if (esp_tree) |*value| value else null,
-        .esp_size = if (request.esp_size) |size| .{ .exact = size } else .{ .minimum_plus = vmiz.disk_assembly.default_esp_slack },
-        .root_size = if (request.root_size) |size| .{ .exact = size } else .{ .minimum_plus = vmiz.disk_assembly.default_root_slack },
+        .esp_size = if (request.esp_size) |size| .{ .exact = size } else .{ .minimum_plus = miz.disk_assembly.default_esp_slack },
+        .root_size = if (request.root_size) |size| .{ .exact = size } else .{ .minimum_plus = miz.disk_assembly.default_root_slack },
         .ext4_label = request.label,
         .root_filesystem = request.root_filesystem,
-        // On by default here and nowhere else in vmiz (a captured system boots
+        // On by default here and nowhere else in miz (a captured system boots
         // into a mutable root that needs a journal to replay). The flag is
         // passed through untouched by `ext4JournalSetting` so an ext4 journal
         // asked for on an XFS root is rejected by name rather than dropped here.
@@ -679,7 +679,7 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
     if (request.dry_run) return 0;
     if (writes_raw_directly) return 0;
 
-    var staged = vmiz.Image.openPathReadOnly(io, raw_path) catch |err|
+    var staged = miz.Image.openPathReadOnly(io, raw_path) catch |err|
         return fail("capture: cannot re-open the staged image: {s}", .{@errorName(err)});
     defer staged.close(io);
 
@@ -689,9 +689,9 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
         return 0;
     }
 
-    vmiz.output.writeImageTo(gpa, io, staged, request.destination, .{
+    miz.output.writeImageTo(gpa, io, staged, request.destination, .{
         .compression = request.spec.compression,
-        .level = request.level orelse vmiz.output.default_level,
+        .level = request.level orelse miz.output.default_level,
     }) catch |err|
         return fail("capture: writing {s} output failed: {s}", .{ request.spec.displayName(), @errorName(err) });
 
@@ -705,11 +705,11 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
 fn convertStaged(
     gpa: std.mem.Allocator,
     io: std.Io,
-    staged: vmiz.Image,
+    staged: miz.Image,
     request: CaptureRequest,
     virtual_size: u64,
 ) !void {
-    var options = vmiz.CreateOptions{};
+    var options = miz.CreateOptions{};
     // Fixed, as `build-image` does: a captured image's reason to be a VHD at
     // all is almost always an Azure managed-disk upload, which refuses
     // dynamic.
@@ -720,12 +720,12 @@ fn convertStaged(
     // cleanup below safe: what fails to be created is never deleted, so a
     // pre-existing destination -- or a device node `Image.create` refused --
     // survives the failure that named it.
-    var destination = try vmiz.Image.createExclusive(io, request.destination.path, request.spec.format, virtual_size, options);
+    var destination = try miz.Image.createExclusive(io, request.destination.path, request.spec.format, virtual_size, options);
     // A half-written container is worse than none: it opens, reports a
     // plausible size, and fails somewhere the operator will not look.
     errdefer std.Io.Dir.cwd().deleteFile(io, request.destination.path) catch {};
     defer destination.close(io);
-    _ = try vmiz.copyAll(io, staged, &destination, gpa);
+    _ = try miz.copyAll(io, staged, &destination, gpa);
 }
 
 /// Reads through the image's guest-visible address space rather than the host
@@ -733,7 +733,7 @@ fn convertStaged(
 /// offsets, so an ext4 opened against the raw file would read the wrong bytes
 /// -- or, for a sparse container smaller than the offset, none at all.
 fn imageReadAt(ctx: *const anyopaque, io: std.Io, buffer: []u8, offset: u64) anyerror!usize {
-    const image: *const vmiz.Image = @ptrCast(@alignCast(ctx));
+    const image: *const miz.Image = @ptrCast(@alignCast(ctx));
     return image.pread(io, buffer, offset);
 }
 
@@ -741,8 +741,8 @@ fn openSourceExt4(
     gpa: std.mem.Allocator,
     io: std.Io,
     opened: OpenedSource,
-) vmiz.ext4.GeneralOpenError!vmiz.ext4.Reader {
-    return vmiz.ext4.openGeneralReadOnlySource(
+) miz.ext4.GeneralOpenError!miz.ext4.Reader {
+    return miz.ext4.openGeneralReadOnlySource(
         io,
         opened.image.file,
         .{ .ctx = opened.image, .read_at_fn = imageReadAt },
@@ -755,8 +755,8 @@ fn openSourceXfs(
     gpa: std.mem.Allocator,
     io: std.Io,
     opened: OpenedSource,
-) vmiz.xfs.OpenError!vmiz.xfs.Reader {
-    return vmiz.xfs.Reader.openReadOnlySource(
+) miz.xfs.OpenError!miz.xfs.Reader {
+    return miz.xfs.Reader.openReadOnlySource(
         gpa,
         io,
         opened.image.file,
@@ -771,8 +771,8 @@ fn openSourceXfs(
 /// reader) is a two-armed switch at the one or two call sites that need it,
 /// rather than a wider abstraction this task's XFS read path does not need.
 const RootReader = union(enum) {
-    ext4: vmiz.ext4.Reader,
-    xfs: vmiz.xfs.Reader,
+    ext4: miz.ext4.Reader,
+    xfs: miz.xfs.Reader,
 
     fn deinit(self: *RootReader, io: std.Io) void {
         switch (self.*) {
@@ -813,7 +813,7 @@ const RootReader = union(enum) {
 /// as opposed to a genuine read failure or a *named*, specifically
 /// unsupported ext4 feature, which is a real failure worth reporting rather
 /// than silently treating the candidate as absent.
-fn isNotExt4(err: vmiz.ext4.GeneralOpenError) bool {
+fn isNotExt4(err: miz.ext4.GeneralOpenError) bool {
     return switch (err) {
         error.BadMagic,
         error.UnsupportedFilesystemFeature,
@@ -827,7 +827,7 @@ fn isNotExt4(err: vmiz.ext4.GeneralOpenError) bool {
 /// The XFS analogue of `isNotExt4`: wrong magic, an unrecognised incompat
 /// bit (this reader's equivalent of ext4's own "unknown feature" catch-all),
 /// or a source too short to even hold a superblock.
-fn isNotXfs(err: vmiz.xfs.OpenError) bool {
+fn isNotXfs(err: miz.xfs.OpenError) bool {
     return switch (err) {
         error.BadMagic,
         error.UnsupportedIncompatFeature,
@@ -837,7 +837,7 @@ fn isNotXfs(err: vmiz.xfs.OpenError) bool {
     };
 }
 
-pub const FsOpenError = (vmiz.ext4.GeneralOpenError || vmiz.xfs.OpenError) || error{UnrecognizedRootFilesystem};
+pub const FsOpenError = (miz.ext4.GeneralOpenError || miz.xfs.OpenError) || error{UnrecognizedRootFilesystem};
 
 /// Opens `opened` as whichever supported filesystem it holds. ext4 is tried
 /// first only because its own checks run first; neither guess is favoured
@@ -862,10 +862,10 @@ fn openSourceFilesystem(gpa: std.mem.Allocator, io: std.Io, opened: OpenedSource
 }
 
 fn scanOptions(
-    limits: vmiz.limits.ImportLimits,
+    limits: miz.limits.ImportLimits,
     available_length: u64,
-    diagnostic: *vmiz.limits.Diagnostic,
-) vmiz.ext4.GeneralScanOptions {
+    diagnostic: *miz.limits.Diagnostic,
+) miz.ext4.GeneralScanOptions {
     return .{
         .available_length = available_length,
         .max_nodes = limits.max_nodes,
@@ -881,10 +881,10 @@ fn scanOptions(
 }
 
 fn xfsScanOptions(
-    limits: vmiz.limits.ImportLimits,
+    limits: miz.limits.ImportLimits,
     available_length: u64,
-    diagnostic: *vmiz.limits.Diagnostic,
-) vmiz.xfs.ScanOptions {
+    diagnostic: *miz.limits.Diagnostic,
+) miz.xfs.ScanOptions {
     return .{
         .available_length = available_length,
         .max_nodes = limits.max_nodes,
@@ -902,10 +902,10 @@ fn xfsScanOptions(
 fn resolveRoot(
     gpa: std.mem.Allocator,
     io: std.Io,
-    disk: *vmiz.Image,
-    table: ?vmiz.gpt.ParsedGpt,
+    disk: *miz.Image,
+    table: ?miz.gpt.ParsedGpt,
     request: CaptureRequest,
-    scratch: *std.array_list.Managed(*vmiz.Image),
+    scratch: *std.array_list.Managed(*miz.Image),
 ) !OpenedSource {
     if (request.root_spec_text) |text| {
         const spec = try parseSourceSpec(text);
@@ -927,11 +927,11 @@ fn resolveRoot(
         // An ESP is FAT and would never probe as ext4 or xfs, but skipping
         // it by type keeps the candidate set to partitions that could be a
         // root.
-        if (std.mem.eql(u8, &entry.partition_type_guid, &vmiz.guid.esp)) continue;
+        if (std.mem.eql(u8, &entry.partition_type_guid, &miz.guid.esp)) continue;
         const candidate = OpenedSource{
             .image = disk,
-            .offset = entry.first_lba * vmiz.gpt.sector_size,
-            .length = (entry.last_lba - entry.first_lba + 1) * vmiz.gpt.sector_size,
+            .offset = entry.first_lba * miz.gpt.sector_size,
+            .length = (entry.last_lba - entry.first_lba + 1) * miz.gpt.sector_size,
             .partition = entry,
         };
         var probe = openSourceFilesystem(gpa, io, candidate) catch |err| switch (err) {
@@ -964,16 +964,16 @@ fn resolveRoot(
 fn resolveSpec(
     gpa: std.mem.Allocator,
     io: std.Io,
-    disk: *vmiz.Image,
-    table: ?vmiz.gpt.ParsedGpt,
+    disk: *miz.Image,
+    table: ?miz.gpt.ParsedGpt,
     spec: SourceSpec,
-    scratch: *std.array_list.Managed(*vmiz.Image),
+    scratch: *std.array_list.Managed(*miz.Image),
 ) !OpenedSource {
     switch (spec) {
         .path => |path| {
-            const owned = try gpa.create(vmiz.Image);
+            const owned = try gpa.create(miz.Image);
             errdefer gpa.destroy(owned);
-            owned.* = try vmiz.Image.openPathReadOnly(io, path);
+            owned.* = try miz.Image.openPathReadOnly(io, path);
             errdefer owned.close(io);
             try scratch.append(owned);
             return .{ .image = owned, .offset = 0, .length = owned.virtual_size };
@@ -983,22 +983,22 @@ fn resolveSpec(
             const entry = findPartition(parsed, index) orelse return error.PartitionNotFound;
             return .{
                 .image = disk,
-                .offset = entry.first_lba * vmiz.gpt.sector_size,
-                .length = (entry.last_lba - entry.first_lba + 1) * vmiz.gpt.sector_size,
+                .offset = entry.first_lba * miz.gpt.sector_size,
+                .length = (entry.last_lba - entry.first_lba + 1) * miz.gpt.sector_size,
                 .partition = entry,
             };
         },
         .logical_volume => |selector| {
-            var scan = try vmiz.lvm.scan(gpa, disk.*, io);
+            var scan = try miz.lvm.scan(gpa, disk.*, io);
             defer scan.deinit();
             const selected = try scan.findLogicalVolume(selector.group, selector.name);
-            const extent = try vmiz.lvm.contiguousRange(selected.group, selected.volume);
+            const extent = try miz.lvm.contiguousRange(selected.group, selected.volume);
             return .{ .image = disk, .offset = extent.offset, .length = extent.length };
         },
     }
 }
 
-fn findPartition(parsed: vmiz.gpt.ParsedGpt, index: u32) ?vmiz.gpt.PartitionEntry {
+fn findPartition(parsed: miz.gpt.ParsedGpt, index: u32) ?miz.gpt.PartitionEntry {
     for (parsed.partitions) |entry| {
         if (entry.table_index + 1 == index) return entry;
     }
@@ -1008,14 +1008,14 @@ fn findPartition(parsed: vmiz.gpt.ParsedGpt, index: u32) ?vmiz.gpt.PartitionEntr
 /// The ESP is named explicitly, or found by its type GUID. The type GUID is
 /// definitional rather than a heuristic: a partition carrying it *is* an EFI
 /// system partition, which is exactly how firmware finds one.
-fn findEspSpec(table: ?vmiz.gpt.ParsedGpt, request: CaptureRequest) !?SourceSpec {
+fn findEspSpec(table: ?miz.gpt.ParsedGpt, request: CaptureRequest) !?SourceSpec {
     // A malformed --source-esp is a failure, not an absent ESP. Swallowing it
     // would assemble a root-only disk and exit 0, which is a typo turning
     // into an unbootable image with nothing said.
     if (request.esp_spec_text) |text| return try parseSourceSpec(text);
     const parsed = table orelse return null;
     for (parsed.partitions) |entry| {
-        if (std.mem.eql(u8, &entry.partition_type_guid, &vmiz.guid.esp)) {
+        if (std.mem.eql(u8, &entry.partition_type_guid, &miz.guid.esp)) {
             return .{ .gpt_index = entry.table_index + 1 };
         }
     }
@@ -1027,9 +1027,9 @@ fn ownedUuid(
     storage: *std.array_list.Managed([]u8),
     bytes: *const [16]u8,
 ) ![]const u8 {
-    const buffer = try gpa.alloc(u8, vmiz.identity_rewrite.canonical_uuid_bytes);
+    const buffer = try gpa.alloc(u8, miz.identity_rewrite.canonical_uuid_bytes);
     errdefer gpa.free(buffer);
-    const text = vmiz.identity_rewrite.formatFilesystemUuid(buffer[0..vmiz.identity_rewrite.canonical_uuid_bytes], bytes);
+    const text = miz.identity_rewrite.formatFilesystemUuid(buffer[0..miz.identity_rewrite.canonical_uuid_bytes], bytes);
     try storage.append(buffer);
     return text;
 }
@@ -1039,7 +1039,7 @@ fn ownedLabel(
     storage: *std.array_list.Managed([]u8),
     field: []const u8,
 ) !?[]const u8 {
-    const trimmed = vmiz.identity_rewrite.trimLabel(field) orelse return null;
+    const trimmed = miz.identity_rewrite.trimLabel(field) orelse return null;
     const copy = try gpa.dupe(u8, trimmed);
     errdefer gpa.free(copy);
     try storage.append(copy);
@@ -1071,8 +1071,8 @@ fn warnUnretirablePartitionReference(gpa: std.mem.Allocator, io: std.Io, reader:
 fn ownedPartition(
     gpa: std.mem.Allocator,
     storage: *std.array_list.Managed([]u8),
-    entry: ?vmiz.gpt.PartitionEntry,
-    before: *vmiz.identity_rewrite.Identifiers,
+    entry: ?miz.gpt.PartitionEntry,
+    before: *miz.identity_rewrite.Identifiers,
 ) !void {
     const value = entry orelse return;
 
@@ -1084,7 +1084,7 @@ fn ownedPartition(
     // `buffer` belongs to `storage` from here on, so no errdefer may free it:
     // the label allocation below can still fail, and freeing it here would
     // leave a dangling entry for the caller's cleanup to free again.
-    before.partition_uuid = vmiz.guid.formatLower(buffer[0..36], value.unique_partition_guid);
+    before.partition_uuid = miz.guid.formatLower(buffer[0..36], value.unique_partition_guid);
 
     var name: [36]u8 = undefined;
     var length: usize = 0;
@@ -1105,9 +1105,9 @@ fn ownedFatSerial(
     storage: *std.array_list.Managed([]u8),
     volume_id: u32,
 ) ![]const u8 {
-    const buffer = try gpa.alloc(u8, vmiz.identity_rewrite.fat_serial_bytes);
+    const buffer = try gpa.alloc(u8, miz.identity_rewrite.fat_serial_bytes);
     errdefer gpa.free(buffer);
-    const text = vmiz.identity_rewrite.formatFatVolumeSerial(buffer[0..vmiz.identity_rewrite.fat_serial_bytes], volume_id);
+    const text = miz.identity_rewrite.formatFatVolumeSerial(buffer[0..miz.identity_rewrite.fat_serial_bytes], volume_id);
     try storage.append(buffer);
     return text;
 }
@@ -1117,12 +1117,12 @@ fn ownedFatSerial(
 /// where the operator chose rather than in /tmp.
 fn stagingPath(
     gpa: std.mem.Allocator,
-    destination: vmiz.output.Destination,
+    destination: miz.output.Destination,
     suffix: []const u8,
 ) ![]u8 {
     return switch (destination) {
-        .path => |path| std.fmt.allocPrint(gpa, "{s}.vmiz-capture{s}", .{ path, suffix }),
-        .stdout => std.fmt.allocPrint(gpa, "vmiz-capture{s}", .{suffix}),
+        .path => |path| std.fmt.allocPrint(gpa, "{s}.miz-capture{s}", .{ path, suffix }),
+        .stdout => std.fmt.allocPrint(gpa, "miz-capture{s}", .{suffix}),
     };
 }
 
@@ -1131,14 +1131,14 @@ fn stagingPath(
 fn reportMinimums(
     gpa: std.mem.Allocator,
     io: std.Io,
-    tree: *vmiz.root_tree.RootTree,
-    esp_tree: ?*vmiz.root_tree.RootTree,
+    tree: *miz.root_tree.RootTree,
+    esp_tree: ?*miz.root_tree.RootTree,
     request: CaptureRequest,
 ) void {
-    const planned = vmiz.disk_assembly.assemble(gpa, io, tree, .{
+    const planned = miz.disk_assembly.assemble(gpa, io, tree, .{
         // Never opened: a dry run stops after planning. It still has to name
         // something, because an empty path is refused as a mistake.
-        .raw_path = "vmiz-capture-dry-run",
+        .raw_path = "miz-capture-dry-run",
         .architecture = switch (request.architecture) {
             .auto => hostArchitecture(),
             .x86_64 => .x86_64,
@@ -1165,7 +1165,7 @@ fn reportMinimums(
     }
 }
 
-fn reportSizes(request: CaptureRequest, report: ?vmiz.disk_assembly.Report) void {
+fn reportSizes(request: CaptureRequest, report: ?miz.disk_assembly.Report) void {
     const value = report orelse return;
     std.debug.print(
         "capture: root filesystem {d} MiB (minimum {d} MiB), {d} files\n",
@@ -1188,7 +1188,7 @@ fn reportSizes(request: CaptureRequest, report: ?vmiz.disk_assembly.Report) void
 /// The rewrite is the part of a capture most likely to leave an image that
 /// builds cleanly and then fails to boot, so what it did is stated rather
 /// than assumed, and what it could not do is a warning.
-fn reportIdentity(which: []const u8, report: vmiz.identity_rewrite.Report) void {
+fn reportIdentity(which: []const u8, report: miz.identity_rewrite.Report) void {
     // A filesystem-type correction (ext4 -> xfs in fstab or a `rootfstype=`)
     // can happen with no identifier retired at all -- a root that keeps its
     // UUID through the conversion -- so the summary must not hinge on
@@ -1242,12 +1242,12 @@ fn failWithHint(comptime context: []const u8, err: anyerror) u8 {
 fn failLimits(
     comptime context: []const u8,
     err: anyerror,
-    diagnostic: *const vmiz.limits.Diagnostic,
+    diagnostic: *const miz.limits.Diagnostic,
 ) u8 {
     if (diagnostic.exceeded) |breach| {
         if (breach.limit.err() == err) {
-            var message: [vmiz.limits.Exceeded.max_message_bytes]u8 = undefined;
-            var remediation: [vmiz.limits.Exceeded.max_remediation_bytes]u8 = undefined;
+            var message: [miz.limits.Exceeded.max_message_bytes]u8 = undefined;
+            var remediation: [miz.limits.Exceeded.max_remediation_bytes]u8 = undefined;
             return fail(context ++ ": {s}\n  {s}", .{
                 breach.describe(&message) catch @errorName(err),
                 breach.remediation(&remediation) catch "",
@@ -1356,7 +1356,7 @@ test "the failures an operator is most likely to hit explain themselves" {
 
 const TestInMemoryEntry = struct {
     path: []const u8,
-    kind: vmiz.ext4.Kind,
+    kind: miz.ext4.Kind,
     mode: u16,
     uid: u32 = 0,
     gid: u32 = 0,
@@ -1367,7 +1367,7 @@ const TestInMemoryEntry = struct {
 const TestInMemoryTree = struct {
     entries: []const TestInMemoryEntry,
     index: usize = 0,
-    view: vmiz.ext4.FileTreeView,
+    view: miz.ext4.FileTreeView,
 
     fn init(entries: []const TestInMemoryEntry) TestInMemoryTree {
         return .{
@@ -1388,7 +1388,7 @@ const TestInMemoryTree = struct {
         self.index = 0;
     }
 
-    fn next(ctx: *anyopaque) vmiz.ext4.FileTreeView.IteratorError!?vmiz.ext4.FileTreeView.Entry {
+    fn next(ctx: *anyopaque) miz.ext4.FileTreeView.IteratorError!?miz.ext4.FileTreeView.Entry {
         const self: *TestInMemoryTree = @ptrCast(@alignCast(ctx));
         if (self.index >= self.entries.len) return null;
         const entry = self.entries[self.index];
@@ -1407,7 +1407,7 @@ const TestInMemoryTree = struct {
         };
     }
 
-    fn readContent(ctx: *const anyopaque, buffer: []u8, offset: u64) vmiz.ext4.FileTreeView.ContentError!usize {
+    fn readContent(ctx: *const anyopaque, buffer: []u8, offset: u64) miz.ext4.FileTreeView.ContentError!usize {
         const entry: *const TestInMemoryEntry = @ptrCast(@alignCast(ctx));
         const off = std.math.cast(usize, offset) orelse return error.UnexpectedEndOfStream;
         if (off > entry.bytes.len) return error.UnexpectedEndOfStream;
@@ -1419,7 +1419,7 @@ const TestInMemoryTree = struct {
 
 /// Writes a real ext4 filesystem holding just `/etc/os-release` at `offset`
 /// within `file`, so ambiguity tests have a genuine ext4 root candidate
-/// alongside a synthetic xfs one built by `vmiz.xfs.buildEtcOsReleaseVolume`.
+/// alongside a synthetic xfs one built by `miz.xfs.buildEtcOsReleaseVolume`.
 fn writeExt4EtcRoot(
     io: std.Io,
     file: std.Io.File,
@@ -1434,7 +1434,7 @@ fn writeExt4EtcRoot(
         .{ .path = "etc/os-release", .kind = .file, .mode = 0o644, .size = os_release.len, .bytes = os_release },
     });
     tree.bind();
-    _ = try vmiz.ext4.populate(io, file, std.testing.allocator, &tree.view, .{
+    _ = try miz.ext4.populate(io, file, std.testing.allocator, &tree.view, .{
         .offset = offset,
         .length = length,
         .uuid = uuid,
@@ -1472,37 +1472,37 @@ test "resolveRoot finds an XFS root automatically, skipping the ESP" {
     const path = "test-capture-xfs-auto-root.img";
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    const os_release = "NAME=vmiz\nID=vmiz\n";
-    const volume = try vmiz.xfs.buildEtcOsReleaseVolume(std.testing.allocator, os_release);
+    const os_release = "NAME=miz\nID=miz\n";
+    const volume = try miz.xfs.buildEtcOsReleaseVolume(std.testing.allocator, os_release);
     defer std.testing.allocator.free(volume);
 
-    var img = try vmiz.Image.create(io, path, .raw, 8 * 1024 * 1024, .{});
+    var img = try miz.Image.create(io, path, .raw, 8 * 1024 * 1024, .{});
     defer img.close(io);
 
-    const specs = [_]vmiz.gpt.PartitionSpec{
+    const specs = [_]miz.gpt.PartitionSpec{
         .{
-            .type_guid = vmiz.guid.esp,
-            .unique_guid = vmiz.guid.parse("11111111-1111-1111-1111-111111111111"),
+            .type_guid = miz.guid.esp,
+            .unique_guid = miz.guid.parse("11111111-1111-1111-1111-111111111111"),
             .size_sectors = 2048,
-            .name_utf16le = vmiz.gpt.asciiName("EFI System"),
+            .name_utf16le = miz.gpt.asciiName("EFI System"),
         },
         .{
-            .type_guid = vmiz.guid.parse("22222222-2222-2222-2222-222222222222"),
-            .unique_guid = vmiz.guid.parse("33333333-3333-3333-3333-333333333333"),
+            .type_guid = miz.guid.parse("22222222-2222-2222-2222-222222222222"),
+            .unique_guid = miz.guid.parse("33333333-3333-3333-3333-333333333333"),
             .size_sectors = 2048,
-            .name_utf16le = vmiz.gpt.asciiName("root"),
+            .name_utf16le = miz.gpt.asciiName("root"),
         },
     };
-    var placements: [specs.len]vmiz.gpt.Placement = undefined;
-    try vmiz.gpt.writeGpt(&img, io, vmiz.guid.parse("44444444-4444-4444-4444-444444444444"), &specs, &placements);
+    var placements: [specs.len]miz.gpt.Placement = undefined;
+    try miz.gpt.writeGpt(&img, io, miz.guid.parse("44444444-4444-4444-4444-444444444444"), &specs, &placements);
 
-    const root_offset = placements[1].first_lba * vmiz.gpt.sector_size;
+    const root_offset = placements[1].first_lba * miz.gpt.sector_size;
     try img.pwrite(io, volume, root_offset);
 
-    const table = try vmiz.gpt.readGpt(img, io, std.testing.allocator);
+    const table = try miz.gpt.readGpt(img, io, std.testing.allocator);
     defer std.testing.allocator.free(table.partitions);
 
-    var scratch = std.array_list.Managed(*vmiz.Image).init(std.testing.allocator);
+    var scratch = std.array_list.Managed(*miz.Image).init(std.testing.allocator);
     defer {
         for (scratch.items) |opened| {
             opened.close(io);
@@ -1514,7 +1514,7 @@ test "resolveRoot finds an XFS root automatically, skipping the ESP" {
     const request = testCaptureRequest(null);
     const found = try resolveRoot(std.testing.allocator, io, &img, table, request, &scratch);
     try std.testing.expectEqual(root_offset, found.offset);
-    try std.testing.expectEqual(@as(u64, 2048 * vmiz.gpt.sector_size), found.length);
+    try std.testing.expectEqual(@as(u64, 2048 * miz.gpt.sector_size), found.length);
 
     var reader = try openSourceFilesystem(std.testing.allocator, io, found);
     defer reader.deinit(io);
@@ -1527,38 +1527,38 @@ test "resolveRoot refuses ambiguity between an ext4 root and an xfs root" {
     const path = "test-capture-xfs-ext4-ambiguous.img";
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    const os_release = "NAME=vmiz\nID=vmiz\n";
-    const volume = try vmiz.xfs.buildEtcOsReleaseVolume(std.testing.allocator, os_release);
+    const os_release = "NAME=miz\nID=miz\n";
+    const volume = try miz.xfs.buildEtcOsReleaseVolume(std.testing.allocator, os_release);
     defer std.testing.allocator.free(volume);
 
-    var img = try vmiz.Image.create(io, path, .raw, 32 * 1024 * 1024, .{});
+    var img = try miz.Image.create(io, path, .raw, 32 * 1024 * 1024, .{});
     defer img.close(io);
 
-    const specs = [_]vmiz.gpt.PartitionSpec{
+    const specs = [_]miz.gpt.PartitionSpec{
         .{
-            .type_guid = vmiz.guid.esp,
-            .unique_guid = vmiz.guid.parse("11111111-1111-1111-1111-111111111111"),
+            .type_guid = miz.guid.esp,
+            .unique_guid = miz.guid.parse("11111111-1111-1111-1111-111111111111"),
             .size_sectors = 2048,
-            .name_utf16le = vmiz.gpt.asciiName("EFI System"),
+            .name_utf16le = miz.gpt.asciiName("EFI System"),
         },
         .{
-            .type_guid = vmiz.guid.parse("22222222-2222-2222-2222-222222222222"),
-            .unique_guid = vmiz.guid.parse("33333333-3333-3333-3333-333333333333"),
+            .type_guid = miz.guid.parse("22222222-2222-2222-2222-222222222222"),
+            .unique_guid = miz.guid.parse("33333333-3333-3333-3333-333333333333"),
             .size_sectors = 16384,
-            .name_utf16le = vmiz.gpt.asciiName("ext4root"),
+            .name_utf16le = miz.gpt.asciiName("ext4root"),
         },
         .{
-            .type_guid = vmiz.guid.parse("55555555-5555-5555-5555-555555555555"),
-            .unique_guid = vmiz.guid.parse("66666666-6666-6666-6666-666666666666"),
+            .type_guid = miz.guid.parse("55555555-5555-5555-5555-555555555555"),
+            .unique_guid = miz.guid.parse("66666666-6666-6666-6666-666666666666"),
             .size_sectors = 2048,
-            .name_utf16le = vmiz.gpt.asciiName("xfsroot"),
+            .name_utf16le = miz.gpt.asciiName("xfsroot"),
         },
     };
-    var placements: [specs.len]vmiz.gpt.Placement = undefined;
-    try vmiz.gpt.writeGpt(&img, io, vmiz.guid.parse("77777777-7777-7777-7777-777777777777"), &specs, &placements);
+    var placements: [specs.len]miz.gpt.Placement = undefined;
+    try miz.gpt.writeGpt(&img, io, miz.guid.parse("77777777-7777-7777-7777-777777777777"), &specs, &placements);
 
-    const ext4_offset = placements[1].first_lba * vmiz.gpt.sector_size;
-    const ext4_length = (placements[1].last_lba - placements[1].first_lba + 1) * vmiz.gpt.sector_size;
+    const ext4_offset = placements[1].first_lba * miz.gpt.sector_size;
+    const ext4_length = (placements[1].last_lba - placements[1].first_lba + 1) * miz.gpt.sector_size;
     try writeExt4EtcRoot(
         io,
         img.file,
@@ -1569,13 +1569,13 @@ test "resolveRoot refuses ambiguity between an ext4 root and an xfs root" {
         os_release,
     );
 
-    const xfs_offset = placements[2].first_lba * vmiz.gpt.sector_size;
+    const xfs_offset = placements[2].first_lba * miz.gpt.sector_size;
     try img.pwrite(io, volume, xfs_offset);
 
-    const table = try vmiz.gpt.readGpt(img, io, std.testing.allocator);
+    const table = try miz.gpt.readGpt(img, io, std.testing.allocator);
     defer std.testing.allocator.free(table.partitions);
 
-    var scratch = std.array_list.Managed(*vmiz.Image).init(std.testing.allocator);
+    var scratch = std.array_list.Managed(*miz.Image).init(std.testing.allocator);
     defer {
         for (scratch.items) |opened| {
             opened.close(io);
@@ -1596,18 +1596,18 @@ test "an explicit XFS --source-root is opened, scanned and imported, preserving 
     const path = "test-capture-xfs-explicit-root.img";
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    const os_release = "NAME=vmiz\nID=vmiz\n";
-    const volume = try vmiz.xfs.buildEtcOsReleaseVolume(std.testing.allocator, os_release);
+    const os_release = "NAME=miz\nID=miz\n";
+    const volume = try miz.xfs.buildEtcOsReleaseVolume(std.testing.allocator, os_release);
     defer std.testing.allocator.free(volume);
 
-    var img = try vmiz.Image.create(io, path, .raw, volume.len, .{});
+    var img = try miz.Image.create(io, path, .raw, volume.len, .{});
     defer img.close(io);
     try img.pwrite(io, volume, 0);
 
-    var disk = try vmiz.Image.openPathReadOnly(io, path);
+    var disk = try miz.Image.openPathReadOnly(io, path);
     defer disk.close(io);
 
-    var scratch = std.array_list.Managed(*vmiz.Image).init(std.testing.allocator);
+    var scratch = std.array_list.Managed(*miz.Image).init(std.testing.allocator);
     defer {
         for (scratch.items) |opened| {
             opened.close(io);
@@ -1623,11 +1623,11 @@ test "an explicit XFS --source-root is opened, scanned and imported, preserving 
     defer reader.deinit(io);
     try std.testing.expect(reader == .xfs);
 
-    var diagnostic = vmiz.limits.Diagnostic{};
-    var scan = try vmiz.xfs.scanReadable(&reader.xfs, io, std.testing.allocator, xfsScanOptions(.{}, found.length, &diagnostic));
+    var diagnostic = miz.limits.Diagnostic{};
+    var scan = try miz.xfs.scanReadable(&reader.xfs, io, std.testing.allocator, xfsScanOptions(.{}, found.length, &diagnostic));
     defer scan.deinit();
 
-    var tree = vmiz.root_tree.RootTree.initMemory(std.testing.allocator, io, (vmiz.limits.ImportLimits{}).tree());
+    var tree = miz.root_tree.RootTree.initMemory(std.testing.allocator, io, (miz.limits.ImportLimits{}).tree());
     defer tree.deinit();
     try tree.importXfs(&scan);
 
@@ -1651,18 +1651,18 @@ test "an explicit XFS --source-mount is opened, scanned and mounted" {
     const path = "test-capture-xfs-explicit-mount.img";
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    const os_release = "NAME=vmiz\nID=vmiz\n";
-    const volume = try vmiz.xfs.buildEtcOsReleaseVolume(std.testing.allocator, os_release);
+    const os_release = "NAME=miz\nID=miz\n";
+    const volume = try miz.xfs.buildEtcOsReleaseVolume(std.testing.allocator, os_release);
     defer std.testing.allocator.free(volume);
 
-    var img = try vmiz.Image.create(io, path, .raw, volume.len, .{});
+    var img = try miz.Image.create(io, path, .raw, volume.len, .{});
     defer img.close(io);
     try img.pwrite(io, volume, 0);
 
-    var disk = try vmiz.Image.openPathReadOnly(io, path);
+    var disk = try miz.Image.openPathReadOnly(io, path);
     defer disk.close(io);
 
-    var scratch = std.array_list.Managed(*vmiz.Image).init(std.testing.allocator);
+    var scratch = std.array_list.Managed(*miz.Image).init(std.testing.allocator);
     defer {
         for (scratch.items) |opened| {
             opened.close(io);
@@ -1677,11 +1677,11 @@ test "an explicit XFS --source-mount is opened, scanned and mounted" {
     defer reader.deinit(io);
     try std.testing.expect(reader == .xfs);
 
-    var diagnostic = vmiz.limits.Diagnostic{};
-    var scan = try vmiz.xfs.scanReadable(&reader.xfs, io, std.testing.allocator, xfsScanOptions(.{}, opened.length, &diagnostic));
+    var diagnostic = miz.limits.Diagnostic{};
+    var scan = try miz.xfs.scanReadable(&reader.xfs, io, std.testing.allocator, xfsScanOptions(.{}, opened.length, &diagnostic));
     defer scan.deinit();
 
-    var tree = vmiz.root_tree.RootTree.initMemory(std.testing.allocator, io, (vmiz.limits.ImportLimits{}).tree());
+    var tree = miz.root_tree.RootTree.initMemory(std.testing.allocator, io, (miz.limits.ImportLimits{}).tree());
     defer tree.deinit();
     // The mount point must already exist as a directory: `mountXfs` replaces
     // its contents but never creates it, the same way `mount(8)` refuses a
@@ -1699,25 +1699,25 @@ test "a malformed XFS candidate propagates as a genuine failure, not a silently 
     const path = "test-capture-xfs-malformed.img";
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    var img = try vmiz.Image.create(io, path, .raw, 8 * 1024 * 1024, .{});
+    var img = try miz.Image.create(io, path, .raw, 8 * 1024 * 1024, .{});
     defer img.close(io);
 
-    const specs = [_]vmiz.gpt.PartitionSpec{
+    const specs = [_]miz.gpt.PartitionSpec{
         .{
-            .type_guid = vmiz.guid.esp,
-            .unique_guid = vmiz.guid.parse("11111111-1111-1111-1111-111111111111"),
+            .type_guid = miz.guid.esp,
+            .unique_guid = miz.guid.parse("11111111-1111-1111-1111-111111111111"),
             .size_sectors = 2048,
-            .name_utf16le = vmiz.gpt.asciiName("EFI System"),
+            .name_utf16le = miz.gpt.asciiName("EFI System"),
         },
         .{
-            .type_guid = vmiz.guid.parse("22222222-2222-2222-2222-222222222222"),
-            .unique_guid = vmiz.guid.parse("33333333-3333-3333-3333-333333333333"),
+            .type_guid = miz.guid.parse("22222222-2222-2222-2222-222222222222"),
+            .unique_guid = miz.guid.parse("33333333-3333-3333-3333-333333333333"),
             .size_sectors = 2048,
-            .name_utf16le = vmiz.gpt.asciiName("root"),
+            .name_utf16le = miz.gpt.asciiName("root"),
         },
     };
-    var placements: [specs.len]vmiz.gpt.Placement = undefined;
-    try vmiz.gpt.writeGpt(&img, io, vmiz.guid.parse("44444444-4444-4444-4444-444444444444"), &specs, &placements);
+    var placements: [specs.len]miz.gpt.Placement = undefined;
+    try miz.gpt.writeGpt(&img, io, miz.guid.parse("44444444-4444-4444-4444-444444444444"), &specs, &placements);
 
     // XFS's own magic with an otherwise-zeroed superblock: real enough to
     // rule out "not XFS at all" (`isNotXfs`'s skip list), but a version
@@ -1725,14 +1725,14 @@ test "a malformed XFS candidate propagates as a genuine failure, not a silently 
     // `error.UnsupportedSuperblockVersion` rather than being reported as
     // "no root filesystem found".
     var malformed = [_]u8{0} ** 512;
-    std.mem.writeInt(u32, malformed[0..4], vmiz.xfs.magic, .big);
-    const root_offset = placements[1].first_lba * vmiz.gpt.sector_size;
+    std.mem.writeInt(u32, malformed[0..4], miz.xfs.magic, .big);
+    const root_offset = placements[1].first_lba * miz.gpt.sector_size;
     try img.pwrite(io, &malformed, root_offset);
 
-    const table = try vmiz.gpt.readGpt(img, io, std.testing.allocator);
+    const table = try miz.gpt.readGpt(img, io, std.testing.allocator);
     defer std.testing.allocator.free(table.partitions);
 
-    var scratch = std.array_list.Managed(*vmiz.Image).init(std.testing.allocator);
+    var scratch = std.array_list.Managed(*miz.Image).init(std.testing.allocator);
     defer {
         for (scratch.items) |opened| {
             opened.close(io);

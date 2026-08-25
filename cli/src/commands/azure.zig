@@ -1,13 +1,13 @@
-//! `vmiz azure derive --input-sha256 <hex> <input.qcow2> <output.vhd>`
-//! `vmiz azure fixup [--generation 1|2] <file>`
-//! `vmiz azure deprovision [--user <username>] [--allow-device-write] <file>`
+//! `miz azure derive --input-sha256 <hex> <input.qcow2> <output.vhd>`
+//! `miz azure fixup [--generation 1|2] <file>`
+//! `miz azure deprovision [--user <username>] [--allow-device-write] <file>`
 //!
 //! Fixed VHD inputs are updated in place. Other supported image formats are
 //! converted to a sibling fixed VHD named `<input-basename>.vhd`.
 //! Generation 2 is the default; pass `--generation 1` for legacy BIOS images.
 
 const std = @import("std");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     if (args.len < 1) return fail(usage, .{});
@@ -17,12 +17,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     return fail(usage, .{});
 }
 
-const usage = "usage: vmiz azure derive --input-sha256 <hex> [--expected-virtual-size <size>] [--max-input-size <size>] [--max-virtual-size <size>] [--max-output-size <size>] <input.qcow2> <output.vhd>\n" ++
-    "       vmiz azure fixup [--generation 1|2] <file>\n" ++
-    "       vmiz azure deprovision [--user <username>] [--allow-device-write] <file>";
+const usage = "usage: miz azure derive --input-sha256 <hex> [--expected-virtual-size <size>] [--max-input-size <size>] [--max-virtual-size <size>] [--max-output-size <size>] <input.qcow2> <output.vhd>\n" ++
+    "       miz azure fixup [--generation 1|2] <file>\n" ++
+    "       miz azure deprovision [--user <username>] [--allow-device-write] <file>";
 
 fn runDerive(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
-    var input_sha256: ?vmiz.artifact_pipeline.Digest = null;
+    var input_sha256: ?miz.artifact_pipeline.Digest = null;
     var expected_virtual_size: ?u64 = null;
     var max_input_size: u64 = 64 * 1024 * 1024 * 1024;
     var max_virtual_size: u64 = 64 * 1024 * 1024 * 1024;
@@ -38,7 +38,7 @@ fn runDerive(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
             if (i >= rest.len) {
                 return fail("azure derive: --input-sha256 requires an argument", .{});
             }
-            input_sha256 = vmiz.artifact_pipeline.parseSha256(rest[i]) catch
+            input_sha256 = miz.artifact_pipeline.parseSha256(rest[i]) catch
                 return fail("azure derive: invalid SHA-256 '{s}'", .{rest[i]});
         } else if (std.mem.eql(u8, argument, "--expected-virtual-size")) {
             i += 1;
@@ -67,7 +67,7 @@ fn runDerive(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
         return fail("azure derive: --input-sha256 <hex> is required", .{});
     if (positional_count != positional.len) return fail(usage, .{});
 
-    const result = vmiz.azure.deriveFixedVhd(
+    const result = miz.azure.deriveFixedVhd(
         gpa,
         io,
         .{
@@ -82,7 +82,7 @@ fn runDerive(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
     ) catch |err| return fail("azure derive: failed: {s}", .{@errorName(err)});
 
     const output_sha256 =
-        vmiz.artifact_pipeline.formatSha256(result.artifact.sha256);
+        miz.artifact_pipeline.formatSha256(result.artifact.sha256);
     std.debug.print(
         "Derived fixed VHD '{s}': data size {d} -> {d} bytes, file size {d} bytes, {d} partitions, backup GPT LBA {d} -> {d}, SHA-256 {s}\n",
         .{
@@ -108,7 +108,7 @@ fn parseSizeArgument(
         _ = fail("azure derive: {s} requires an argument", .{option});
         return null;
     }
-    return vmiz.parseSize(args[index]) catch {
+    return miz.parseSize(args[index]) catch {
         _ = fail(
             "azure derive: invalid size '{s}' for {s}",
             .{ args[index], option },
@@ -118,8 +118,8 @@ fn parseSizeArgument(
 }
 
 fn runFixup(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
-    const fixup_usage = "usage: vmiz azure fixup [--generation 1|2] <file>";
-    var generation: vmiz.azure.Generation = .gen2;
+    const fixup_usage = "usage: miz azure fixup [--generation 1|2] <file>";
+    var generation: miz.azure.Generation = .gen2;
     var path: ?[]const u8 = null;
 
     var i: usize = 0;
@@ -144,7 +144,7 @@ fn runFixup(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
 
     const input_path = path orelse return fail(fixup_usage, .{});
 
-    var src = vmiz.Image.openPath(io, input_path) catch |err|
+    var src = miz.Image.openPath(io, input_path) catch |err|
         return fail("azure fixup: failed to open '{s}': {s}", .{ input_path, @errorName(err) });
     defer src.close(io);
 
@@ -161,10 +161,10 @@ fn runFixup(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
     const initial_vhd_size = if (src_virtual_size % 512 == 0)
         src_virtual_size
     else
-        vmiz.azure.alignSizeToMibChecked(src_virtual_size) catch |err|
+        miz.azure.alignSizeToMibChecked(src_virtual_size) catch |err|
             return fail("azure fixup: failed to align source size: {s}", .{@errorName(err)});
 
-    var dst = vmiz.Image.createExclusive(io, output_path, .vhd, initial_vhd_size, .{
+    var dst = miz.Image.createExclusive(io, output_path, .vhd, initial_vhd_size, .{
         .vhd_subformat = .fixed,
     }) catch |err| {
         if (err == error.PathAlreadyExists) {
@@ -188,7 +188,7 @@ fn runFixup(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
         }
     }
 
-    _ = vmiz.copyAll(io, src, &dst, gpa) catch |err|
+    _ = miz.copyAll(io, src, &dst, gpa) catch |err|
         return fail("azure fixup: conversion failed: {s}", .{@errorName(err)});
 
     const outcome = finishFixup(&dst, io, gpa, generation, output_path);
@@ -214,13 +214,13 @@ const FixupOutcome = struct {
 };
 
 fn finishFixup(
-    img: *vmiz.Image,
+    img: *miz.Image,
     io: std.Io,
     allocator: std.mem.Allocator,
-    generation: vmiz.azure.Generation,
+    generation: miz.azure.Generation,
     file_path: []const u8,
 ) FixupOutcome {
-    const report = vmiz.azure.checkPartitionStyle(img.*, io, allocator, generation) catch |err| return .{
+    const report = miz.azure.checkPartitionStyle(img.*, io, allocator, generation) catch |err| return .{
         .exit_code = fail("azure fixup: failed to check partition style: {s}", .{@errorName(err)}),
         .fixup_succeeded = false,
     };
@@ -230,11 +230,11 @@ fn finishFixup(
         return .{ .exit_code = 2, .fixup_succeeded = false };
     }
 
-    const align_result = vmiz.azure.alignFixedVhd(img, io) catch |err| {
+    const align_result = miz.azure.alignFixedVhd(img, io) catch |err| {
         if (err == error.GptRelocationRequired) {
             return .{
                 .exit_code = fail(
-                    "azure fixup: GPT growth requires transactional relocation; use 'vmiz azure derive --input-sha256 <hex> <input.qcow2> <output.vhd>'",
+                    "azure fixup: GPT growth requires transactional relocation; use 'miz azure derive --input-sha256 <hex> <input.qcow2> <output.vhd>'",
                     .{},
                 ),
                 .fixup_succeeded = false,
@@ -243,7 +243,7 @@ fn finishFixup(
         return .{
             .exit_code = fail(
                 "azure fixup: {s} (Azure managed-disk upload requires a *fixed* .vhd; convert first with " ++
-                    "'vmiz convert -O vhd -o subformat=fixed <src> {s}')",
+                    "'miz convert -O vhd -o subformat=fixed <src> {s}')",
                 .{ @errorName(err), file_path },
             ),
             .fixup_succeeded = false,
@@ -290,7 +290,7 @@ fn runDeprovision(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) 
     }
 
     const file_path = path orelse return fail(
-        "usage: vmiz azure deprovision [--user <username>] [--allow-device-write] <file>",
+        "usage: miz azure deprovision [--user <username>] [--allow-device-write] <file>",
         .{},
     );
 
@@ -298,16 +298,16 @@ fn runDeprovision(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) 
     // that legitimately writes to a live disk, so it is where the
     // block-device write opt-in is offered. Without it a `/dev/...` target
     // opens read-only and the first write fails.
-    var img = vmiz.Image.openPathWithOptions(io, file_path, .{
+    var img = miz.Image.openPathWithOptions(io, file_path, .{
         .allow_device_write = allow_device_write,
     }) catch |err|
         return fail("azure deprovision: failed to open '{s}': {s}", .{ file_path, @errorName(err) });
     defer img.close(io);
 
-    const offset = vmiz.deprovision.findRootExt4Offset(gpa, img, io) catch |err|
+    const offset = miz.deprovision.findRootExt4Offset(gpa, img, io) catch |err|
         return fail("azure deprovision: failed to locate the root ext4 filesystem: {s}", .{@errorName(err)});
 
-    vmiz.deprovision.deprovision(gpa, img, io, offset, .{ .username = username }) catch |err|
+    miz.deprovision.deprovision(gpa, img, io, offset, .{ .username = username }) catch |err|
         return fail("azure deprovision: failed: {s}", .{@errorName(err)});
 
     if (username) |u| {
@@ -344,19 +344,19 @@ test "azure fixup defaults to Gen2 when converting qcow2 to fixed VHD" {
     defer std.Io.Dir.cwd().deleteFile(io, dst_path) catch {};
 
     const src_size: u64 = 8 * 1024 * 1024;
-    var src = try vmiz.Image.create(io, src_path, .qcow2, src_size, .{});
-    const specs = [_]vmiz.gpt.PartitionSpec{
+    var src = try miz.Image.create(io, src_path, .qcow2, src_size, .{});
+    const specs = [_]miz.gpt.PartitionSpec{
         .{
-            .type_guid = vmiz.guid.esp,
-            .unique_guid = vmiz.guid.parse("88888888-8888-8888-8888-888888888888"),
+            .type_guid = miz.guid.esp,
+            .unique_guid = miz.guid.parse("88888888-8888-8888-8888-888888888888"),
             .size_sectors = 2048,
         },
     };
-    var placements: [specs.len]vmiz.gpt.Placement = undefined;
-    try vmiz.gpt.writeGpt(
+    var placements: [specs.len]miz.gpt.Placement = undefined;
+    try miz.gpt.writeGpt(
         &src,
         io,
-        vmiz.guid.parse("99999999-9999-9999-9999-999999999999"),
+        miz.guid.parse("99999999-9999-9999-9999-999999999999"),
         &specs,
         &placements,
     );
@@ -368,9 +368,9 @@ test "azure fixup defaults to Gen2 when converting qcow2 to fixed VHD" {
         run(allocator, io, &.{ "fixup", src_path }),
     );
 
-    var converted = try vmiz.Image.openPath(io, dst_path);
+    var converted = try miz.Image.openPath(io, dst_path);
     defer converted.close(io);
-    try std.testing.expectEqual(vmiz.Format.vhd, converted.format);
+    try std.testing.expectEqual(miz.Format.vhd, converted.format);
     try std.testing.expect(converted.dynamic == null);
     try std.testing.expectEqual(src_size, converted.virtual_size);
 

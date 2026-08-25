@@ -98,7 +98,7 @@ fn addZstdLibrary(module: *std.Build.Module, dependency: *std.Build.Dependency) 
 }
 
 const Ubuntu2604CoreArtifacts = struct {
-    vmizinit: *std.Build.Step.Compile,
+    mizinit: *std.Build.Step.Compile,
     azagent: *std.Build.Step.Compile,
 };
 
@@ -119,10 +119,10 @@ fn addUbuntu2604CoreArtifacts(
         .target = guest_target,
         .optimize = .ReleaseSmall,
     });
-    const vmizinit = b.addExecutable(.{
-        .name = b.fmt("ubuntu2604-vmizinit-{s}", .{@tagName(architecture)}),
+    const mizinit = b.addExecutable(.{
+        .name = b.fmt("ubuntu2604-mizinit-{s}", .{@tagName(architecture)}),
         .root_module = b.createModule(.{
-            .root_source_file = b.path("vmizinit/init.zig"),
+            .root_source_file = b.path("mizinit/init.zig"),
             .target = guest_target,
             .optimize = .ReleaseSmall,
             .imports = &.{
@@ -131,12 +131,12 @@ fn addUbuntu2604CoreArtifacts(
         }),
         .linkage = .static,
     });
-    const vmiz_guest_mod = b.createModule(.{
-        .root_source_file = b.path("packages/vmiz/src/root.zig"),
+    const miz_guest_mod = b.createModule(.{
+        .root_source_file = b.path("packages/miz/src/root.zig"),
         .target = guest_target,
         .optimize = .ReleaseSmall,
     });
-    addZstdHeaders(vmiz_guest_mod, guest_zstd);
+    addZstdHeaders(miz_guest_mod, guest_zstd);
     const wireserver_guest_mod = b.createModule(.{
         .root_source_file = b.path("wireserver/wireserver.zig"),
         .target = guest_target,
@@ -150,19 +150,19 @@ fn addUbuntu2604CoreArtifacts(
             .optimize = .ReleaseSmall,
             .imports = &.{
                 .{ .name = "wireserver", .module = wireserver_guest_mod },
-                .{ .name = "vmiz", .module = vmiz_guest_mod },
+                .{ .name = "miz", .module = miz_guest_mod },
             },
         }),
         .linkage = .static,
     });
-    return .{ .vmizinit = vmizinit, .azagent = azagent };
+    return .{ .mizinit = mizinit, .azagent = azagent };
 }
 
 /// A tiny statically linked binary that native Ubuntu 26.04 core acceptance
 /// pushes into the running guest over SSH to confirm Binder workload device
 /// usability (open + `BINDER_VERSION`) rather than only checking paths. It
 /// is acceptance tooling, not an image artifact: `build_generalized_ubuntu2604`
-/// never receives it, unlike `vmizinit`/`azagent` above.
+/// never receives it, unlike `mizinit`/`azagent` above.
 fn addUbuntu2604BinderProbe(
     b: *std.Build,
     architecture: Ubuntu2604Architecture,
@@ -213,7 +213,7 @@ pub fn build(b: *std.Build) void {
         "Prioritize performance, safety, or binary size",
     ) orelse default_optimize;
     // CI invokes this with test-ci, whose generalized-image checks and
-    // vmizguest step already compile the remaining production artifacts.
+    // mizguest step already compile the remaining production artifacts.
     const ci_production_entrypoint_check = b.step(
         "check-ci-production-entrypoints",
         "Compile production entry points not already reached by test-ci",
@@ -226,7 +226,7 @@ pub fn build(b: *std.Build) void {
     const azurelinux_flavor = b.option(
         AzureLinuxFlavor,
         "azurelinux-flavor",
-        "Azure Linux guest flavor: core (default, vmizinit) or full (official vm-base/systemd)",
+        "Azure Linux guest flavor: core (default, mizinit) or full (official vm-base/systemd)",
     ) orelse .core;
     const ubuntu2604_architecture = b.option(
         Ubuntu2604Architecture,
@@ -236,7 +236,7 @@ pub fn build(b: *std.Build) void {
     const ubuntu2604_flavor = b.option(
         Ubuntu2604Flavor,
         "ubuntu2604-flavor",
-        "Ubuntu 26.04 guest flavor: full (default, cloud-init/systemd), core (vmizinit/azagent), or baremetal (core on a physical machine)",
+        "Ubuntu 26.04 guest flavor: full (default, cloud-init/systemd), core (mizinit/azagent), or baremetal (core on a physical machine)",
     ) orelse .full;
     const bzip2z = b.dependency("bzip2z", .{
         .target = target,
@@ -258,56 +258,34 @@ pub fn build(b: *std.Build) void {
     const zstd_dependency = zstdDependency(b, target, optimize);
     const host_zstd_dependency = zstdDependency(b, b.graph.host, optimize);
 
-    // ---- packages/vmiz: the core disk-image library ----
-    const vmiz_mod = b.addModule("vmiz", .{
-        .root_source_file = b.path("packages/vmiz/src/root.zig"),
+    // ---- packages/miz: the core disk-image library ----
+    const miz_mod = b.addModule("miz", .{
+        .root_source_file = b.path("packages/miz/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    addZstdLibrary(vmiz_mod, zstd_dependency);
-    const zvmi_mod = b.addModule("zvmi", .{
-        .root_source_file = b.path("packages/vmiz/src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    addZstdLibrary(zvmi_mod, zstd_dependency);
-    const host_vmiz_mod = b.addModule("vmiz_host", .{
-        .root_source_file = b.path("packages/vmiz/src/root.zig"),
+    addZstdLibrary(miz_mod, zstd_dependency);
+    const host_miz_mod = b.addModule("miz_host", .{
+        .root_source_file = b.path("packages/miz/src/root.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     });
-    addZstdLibrary(host_vmiz_mod, host_zstd_dependency);
-    host_vmiz_mod.addImport("debz", debz_mod);
-    const host_zvmi_mod = b.addModule("zvmi_host", .{
-        .root_source_file = b.path("packages/vmiz/src/root.zig"),
+    addZstdLibrary(host_miz_mod, host_zstd_dependency);
+    host_miz_mod.addImport("debz", debz_mod);
+    const static_host_miz_mod = b.createModule(.{
+        .root_source_file = b.path("packages/miz/src/root.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     });
-    addZstdLibrary(host_zvmi_mod, host_zstd_dependency);
-    host_zvmi_mod.addImport("debz", debz_mod);
-    const static_host_vmiz_mod = b.createModule(.{
-        .root_source_file = b.path("packages/vmiz/src/root.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-    });
-    addZstdHeaders(static_host_vmiz_mod, host_zstd_dependency);
+    addZstdHeaders(static_host_miz_mod, host_zstd_dependency);
     const package_family_mod = b.createModule(.{
-        .root_source_file = b.path("packages/vmiz/src/package_family.zig"),
+        .root_source_file = b.path("packages/miz/src/package_family.zig"),
         .target = b.graph.host,
         .optimize = optimize,
         .imports = &.{.{ .name = "debz", .module = debz_mod }},
     });
-    const host_package_family_mod = b.addModule("vmiz-package-family-host", .{
-        .root_source_file = b.path("packages/vmiz/src/rpm_package_family.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "package_family", .module = package_family_mod },
-            .{ .name = "rpmz", .module = rpmz_dependency.module("rpmz") },
-        },
-    });
-    _ = b.addModule("zvmi-package-family-host", .{
-        .root_source_file = b.path("packages/vmiz/src/rpm_package_family.zig"),
+    const host_package_family_mod = b.addModule("miz-package-family-host", .{
+        .root_source_file = b.path("packages/miz/src/rpm_package_family.zig"),
         .target = b.graph.host,
         .optimize = optimize,
         .imports = &.{
@@ -327,7 +305,7 @@ pub fn build(b: *std.Build) void {
     );
     package_family_test_step.dependOn(&run_host_package_family_tests.step);
     // Declared this early because the preserved-image builder resolves EDK2
-    // firmware through the same module `vmiz qemu` does, and that builder is
+    // firmware through the same module `miz qemu` does, and that builder is
     // constructed well before the qemu-facing part of the graph.
     const host_qemu_host_mod = b.createModule(.{
         .root_source_file = b.path("qemu/host.zig"),
@@ -338,16 +316,16 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const vmiz_tests = b.addTest(.{ .root_module = host_vmiz_mod });
-    const run_vmiz_tests = b.addRunArtifact(vmiz_tests);
-    // The vmiz package's own tests -- image formats, qcow2, ext4, offline root
+    const miz_tests = b.addTest(.{ .root_module = host_miz_mod });
+    const run_miz_tests = b.addRunArtifact(miz_tests);
+    // The miz package's own tests -- image formats, qcow2, ext4, offline root
     // -- are otherwise reachable only through the aggregate `test` step, which
     // makes a targeted change to one of them expensive to verify.
-    const vmiz_test_step = b.step("test-vmiz", "Run the vmiz package's tests");
-    vmiz_test_step.dependOn(&run_vmiz_tests.step);
+    const miz_test_step = b.step("test-miz", "Run the miz package's tests");
+    miz_test_step.dependOn(&run_miz_tests.step);
     const package_family_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("packages/vmiz/src/package_family.zig"),
+            .root_source_file = b.path("packages/miz/src/package_family.zig"),
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{.{ .name = "debz", .module = debz_mod }},
@@ -366,7 +344,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "miz", .module = host_miz_mod },
                 .{ .name = "tls", .module = tls_fixture.module("tls") },
             },
         }),
@@ -410,26 +388,26 @@ pub fn build(b: *std.Build) void {
 
     // ---- azagent: minimal guest provisioning agent for first-boot Azure
     // VM setup (issue #112). Statically linked for self-containment
-    // (matching vmizinit's philosophy), but -- unlike vmizinit, which is
+    // (matching mizinit's philosophy), but -- unlike mizinit, which is
     // pinned to a single real-boot x86_64 QEMU test fixture -- built for
     // the standard target/optimize so it supports every Linux architecture
     // a given image targets (Azure supports Arm64 VMs too) and remains
     // natively testable via `zig build test` on any host.
-    // Imports `vmiz` too (issue #113's resource-disk setup reuses
+    // Imports `miz` too (issue #113's resource-disk setup reuses
     // `mbr.zig`/`ext4.zig` directly against a real block device). ----
-    const azagent_vmiz_mod = b.createModule(.{
-        .root_source_file = b.path("packages/vmiz/src/root.zig"),
+    const azagent_miz_mod = b.createModule(.{
+        .root_source_file = b.path("packages/miz/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    addZstdHeaders(azagent_vmiz_mod, zstd_dependency);
+    addZstdHeaders(azagent_miz_mod, zstd_dependency);
     const azagent_mod = b.createModule(.{
         .root_source_file = b.path("azagent/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "wireserver", .module = wireserver_mod },
-            .{ .name = "vmiz", .module = azagent_vmiz_mod },
+            .{ .name = "miz", .module = azagent_miz_mod },
         },
     });
 
@@ -448,15 +426,15 @@ pub fn build(b: *std.Build) void {
     const azagent_test_step = b.step("test-azagent", "Run azagent tests");
     azagent_test_step.dependOn(&run_azagent_tests.step);
 
-    // ---- cli: the `vmiz` executable ----
+    // ---- cli: the `miz` executable ----
     const cli_exe = b.addExecutable(.{
-        .name = "vmiz",
+        .name = "miz",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cli/src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = vmiz_mod },
+                .{ .name = "miz", .module = miz_mod },
                 .{ .name = "qemu_host", .module = qemu_host_mod },
                 .{ .name = "guest_validation", .module = guest_validation_mod },
             },
@@ -466,30 +444,30 @@ pub fn build(b: *std.Build) void {
     const install_cli = b.addInstallArtifact(cli_exe, .{});
     b.getInstallStep().dependOn(&install_cli.step);
 
-    const install_cli_step = b.step("install-vmiz", "Install only the vmiz CLI");
+    const install_cli_step = b.step("install-miz", "Install only the miz CLI");
     install_cli_step.dependOn(&install_cli.step);
 
     const run_cmd = b.addRunArtifact(cli_exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
-    const run_step = b.step("run", "Run vmiz");
+    const run_step = b.step("run", "Run miz");
     run_step.dependOn(&run_cmd.step);
 
     const cli_tests = b.addTest(.{ .root_module = cli_exe.root_module });
     const run_cli_tests = b.addRunArtifact(cli_tests);
-    const cli_test_step = b.step("test-cli", "Run vmiz CLI tests");
+    const cli_test_step = b.step("test-cli", "Run miz CLI tests");
     cli_test_step.dependOn(&run_cli_tests.step);
 
     // Host-only image builders used by the exported build helpers. They remain
     // executable even when the dependency is configured for a foreign target.
     const image_builder_exe = b.addExecutable(.{
-        .name = "vmiz-image-builder",
+        .name = "miz-image-builder",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cli/src/image_builder.zig"),
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "miz", .module = host_miz_mod },
             },
         }),
     });
@@ -507,13 +485,13 @@ pub fn build(b: *std.Build) void {
 
     // Host-only ISO builder used by the exported `addIso` build helper.
     const iso_builder_exe = b.addExecutable(.{
-        .name = "vmiz-iso-builder",
+        .name = "miz-iso-builder",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cli/src/iso_builder.zig"),
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "miz", .module = host_miz_mod },
             },
         }),
     });
@@ -533,13 +511,13 @@ pub fn build(b: *std.Build) void {
     // build helper. Kept apart from the iso builder since it drives the strict
     // preserve-or-refuse product and emits a preservation report.
     const recustomize_iso_builder_exe = b.addExecutable(.{
-        .name = "vmiz-recustomize-iso-builder",
+        .name = "miz-recustomize-iso-builder",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cli/src/recustomize_iso_builder.zig"),
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "miz", .module = host_miz_mod },
             },
         }),
     });
@@ -558,19 +536,19 @@ pub fn build(b: *std.Build) void {
     recustomize_iso_builder_test_step.dependOn(&run_recustomize_iso_builder_tests.step);
 
     const preserved_image_wire_mod = b.createModule(.{
-        .root_source_file = b.path("packages/vmiz/src/preserved_image_wire.zig"),
+        .root_source_file = b.path("packages/miz/src/preserved_image_wire.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     });
     addZstdLibrary(preserved_image_wire_mod, host_zstd_dependency);
     const preserved_image_builder_exe = b.addExecutable(.{
-        .name = "vmiz-preserved-image-builder",
+        .name = "miz-preserved-image-builder",
         .root_module = b.createModule(.{
             .root_source_file = b.path("cli/src/preserved_image_builder.zig"),
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "miz", .module = host_miz_mod },
                 .{ .name = "qemu_host", .module = host_qemu_host_mod },
             },
         }),
@@ -608,7 +586,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const input_validator_exe = b.addExecutable(.{
-        .name = "vmiz-input-validator",
+        .name = "miz-input-validator",
         .root_module = input_validator_mod,
     });
     b.installArtifact(input_validator_exe);
@@ -622,7 +600,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const image_status_check_exe = b.addExecutable(.{
-        .name = "vmiz-image-status-check",
+        .name = "miz-image-status-check",
         .root_module = image_status_check_mod,
     });
     b.installArtifact(image_status_check_exe);
@@ -688,14 +666,14 @@ pub fn build(b: *std.Build) void {
     const run_qmp_schema_tests = b.addRunArtifact(qmp_schema_tests);
 
     // ---- tests/boot_smoke.zig: opportunistic real-QEMU boot verification,
-    // driving vmiz.build_image.build() output with qmp. Lives outside
-    // packages/vmiz since it needs both vmiz and qmp -- see issue #99. ----
+    // driving miz.build_image.build() output with qmp. Lives outside
+    // packages/miz since it needs both miz and qmp -- see issue #99. ----
     const boot_smoke_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("tests/boot_smoke.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "vmiz", .module = vmiz_mod },
+            .{ .name = "miz", .module = miz_mod },
             .{ .name = "qmp", .module = qmp_mod },
             .{ .name = "qemu_host", .module = qemu_host_mod },
         },
@@ -705,13 +683,13 @@ pub fn build(b: *std.Build) void {
     boot_smoke_step.dependOn(&run_boot_smoke_tests.step);
 
     const device_write_integration_exe = b.addExecutable(.{
-        .name = "vmiz-device-write-integration",
+        .name = "miz-device-write-integration",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/device_write_integration.zig"),
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = static_host_vmiz_mod },
+                .{ .name = "miz", .module = static_host_miz_mod },
             },
         }),
         .linkage = .static,
@@ -722,20 +700,20 @@ pub fn build(b: *std.Build) void {
     run_device_write_integration.addArtifactArg(cli_exe);
     const device_write_integration_step = b.step(
         "test-device-write-integration",
-        "Run vmiz write against real sparse loop devices",
+        "Run miz write against real sparse loop devices",
     );
     device_write_integration_step.dependOn(
         &run_device_write_integration.step,
     );
 
     const unsafe_chroot_integration_exe = b.addExecutable(.{
-        .name = "vmiz-unsafe-chroot-integration",
+        .name = "miz-unsafe-chroot-integration",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/unsafe_chroot_integration.zig"),
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = static_host_vmiz_mod },
+                .{ .name = "miz", .module = static_host_miz_mod },
             },
         }),
         .linkage = .static,
@@ -752,13 +730,13 @@ pub fn build(b: *std.Build) void {
     );
 
     const vm_backend_integration_exe = b.addExecutable(.{
-        .name = "vmiz-vm-backend-integration",
+        .name = "miz-vm-backend-integration",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/vm_backend_integration.zig"),
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = static_host_vmiz_mod },
+                .{ .name = "miz", .module = static_host_miz_mod },
             },
         }),
         .linkage = .static,
@@ -773,13 +751,13 @@ pub fn build(b: *std.Build) void {
     vm_backend_integration_step.dependOn(&run_vm_backend_integration.step);
 
     const vm_real_boot_exe = b.addExecutable(.{
-        .name = "vmiz-vm-real-boot",
+        .name = "miz-vm-real-boot",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/vm_real_boot.zig"),
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = static_host_vmiz_mod },
+                .{ .name = "miz", .module = static_host_miz_mod },
             },
         }),
         .linkage = .static,
@@ -794,13 +772,13 @@ pub fn build(b: *std.Build) void {
     // Not part of `zig build test`: it needs a bootable image and real EDK2
     // firmware, neither of which a test run may assume.
     const vm_firmware_boot_exe = b.addExecutable(.{
-        .name = "vmiz-vm-firmware-boot",
+        .name = "miz-vm-firmware-boot",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/vm_firmware_boot.zig"),
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = vmiz_mod },
+                .{ .name = "miz", .module = miz_mod },
                 .{ .name = "qemu_host", .module = host_qemu_host_mod },
             },
         }),
@@ -834,7 +812,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "qmp", .module = host_qmp_mod },
                 .{ .name = "qemu_host", .module = host_qemu_host_mod },
                 .{ .name = "packages", .module = freebsd_packages_mod },
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "miz", .module = host_miz_mod },
             },
         }),
     });
@@ -850,13 +828,13 @@ pub fn build(b: *std.Build) void {
     );
     freebsd_aarch64_boot_test_step.dependOn(&run_freebsd_boot_tests.step);
     const unsafe_chroot_real_boot_exe = b.addExecutable(.{
-        .name = "vmiz-unsafe-chroot-real-boot",
+        .name = "miz-unsafe-chroot-real-boot",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/unsafe_chroot_real_boot.zig"),
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = vmiz_mod },
+                .{ .name = "miz", .module = miz_mod },
                 .{ .name = "qmp", .module = host_qmp_mod },
                 .{ .name = "qemu_host", .module = host_qemu_host_mod },
             },
@@ -933,62 +911,62 @@ pub fn build(b: *std.Build) void {
     const qcow2_exe_tests = b.addTest(.{ .root_module = qcow2_exe.root_module });
     const run_qcow2_exe_tests = b.addRunArtifact(qcow2_exe_tests);
 
-    // ---- vmizinit: standalone minimal PID 1 for generalized Azure Linux
+    // ---- mizinit: standalone minimal PID 1 for generalized Azure Linux
     // core images. Its guest target follows -Dazurelinux-arch, while the
     // ordinary CLI, builder, and preload library remain host-native. ----
-    const vmizinit_target = b.resolveTargetQuery(.{
+    const mizinit_target = b.resolveTargetQuery(.{
         .cpu_arch = switch (azurelinux_architecture) {
             .x86_64 => .x86_64,
             .aarch64 => .aarch64,
         },
         .os_tag = .linux,
     });
-    const vmizinit_cdrom_mod = b.createModule(.{
+    const mizinit_cdrom_mod = b.createModule(.{
         .root_source_file = b.path("azagent/cdrom.zig"),
-        .target = vmizinit_target,
+        .target = mizinit_target,
         .optimize = .ReleaseSmall,
     });
-    const vmizinit_mod = b.createModule(.{
-        .root_source_file = b.path("vmizinit/init.zig"),
-        .target = vmizinit_target,
+    const mizinit_mod = b.createModule(.{
+        .root_source_file = b.path("mizinit/init.zig"),
+        .target = mizinit_target,
         .optimize = .ReleaseSmall,
         .imports = &.{
-            .{ .name = "provisioning_media", .module = vmizinit_cdrom_mod },
+            .{ .name = "provisioning_media", .module = mizinit_cdrom_mod },
         },
     });
-    const vmizinit_exe = b.addExecutable(.{
-        .name = "vmizinit",
-        .root_module = vmizinit_mod,
+    const mizinit_exe = b.addExecutable(.{
+        .name = "mizinit",
+        .root_module = mizinit_mod,
         .linkage = .static,
     });
-    b.installArtifact(vmizinit_exe);
+    b.installArtifact(mizinit_exe);
 
-    const vmizinit_test_cdrom_mod = b.createModule(.{
+    const mizinit_test_cdrom_mod = b.createModule(.{
         .root_source_file = b.path("azagent/cdrom.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const vmizinit_tests = b.addTest(.{
+    const mizinit_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("vmizinit/init.zig"),
+            .root_source_file = b.path("mizinit/init.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "provisioning_media", .module = vmizinit_test_cdrom_mod },
+                .{ .name = "provisioning_media", .module = mizinit_test_cdrom_mod },
             },
         }),
     });
-    const run_vmizinit_tests = b.addRunArtifact(vmizinit_tests);
-    const vmizinit_test_step = b.step("test-vmizinit", "Run vmizinit tests");
-    vmizinit_test_step.dependOn(&run_vmizinit_tests.step);
+    const run_mizinit_tests = b.addRunArtifact(mizinit_tests);
+    const mizinit_test_step = b.step("test-mizinit", "Run mizinit tests");
+    mizinit_test_step.dependOn(&run_mizinit_tests.step);
 
-    // ---- vmizguest: the static, libc-free PID 1 that the vm customization
+    // ---- mizguest: the static, libc-free PID 1 that the vm customization
     // backend appends to the target image's own initramfs. It is built for
     // every architecture the backend can drive a guest at, not just the host's,
     // because cross-architecture customization is the point. ----
     const guest_architectures = [_]std.Target.Cpu.Arch{ .x86_64, .aarch64 };
-    const vmizguest_step = b.step(
-        "vmizguest",
+    const mizguest_step = b.step(
+        "mizguest",
         "Build the in-VM guest agent for every supported guest architecture",
     );
     for (guest_architectures) |architecture| {
@@ -997,14 +975,14 @@ pub fn build(b: *std.Build) void {
             .os_tag = .linux,
         });
         const guest_control_mod = b.createModule(.{
-            .root_source_file = b.path("packages/vmiz/src/vm_control.zig"),
+            .root_source_file = b.path("packages/miz/src/vm_control.zig"),
             .target = guest_target,
             .optimize = .ReleaseSmall,
         });
-        const vmizguest_exe = b.addExecutable(.{
-            .name = b.fmt("vmiz-guest-agent-{s}", .{@tagName(architecture)}),
+        const mizguest_exe = b.addExecutable(.{
+            .name = b.fmt("miz-guest-agent-{s}", .{@tagName(architecture)}),
             .root_module = b.createModule(.{
-                .root_source_file = b.path("vmizguest/main.zig"),
+                .root_source_file = b.path("mizguest/main.zig"),
                 .target = guest_target,
                 .optimize = .ReleaseSmall,
                 .imports = &.{
@@ -1013,25 +991,25 @@ pub fn build(b: *std.Build) void {
             }),
             .linkage = .static,
         });
-        b.installArtifact(vmizguest_exe);
-        vmizguest_step.dependOn(&vmizguest_exe.step);
+        b.installArtifact(mizguest_exe);
+        mizguest_step.dependOn(&mizguest_exe.step);
         // The builder embeds every agent rather than locating one on disk at
         // run time, so the bytes that boot a guest are the bytes this build
         // produced and provenance can name them without qualification.
         preserved_image_builder_exe.root_module.addAnonymousImport(
-            b.fmt("vmiz_guest_agent_{s}", .{@tagName(architecture)}),
-            .{ .root_source_file = vmizguest_exe.getEmittedBin() },
+            b.fmt("miz_guest_agent_{s}", .{@tagName(architecture)}),
+            .{ .root_source_file = mizguest_exe.getEmittedBin() },
         );
         vm_real_boot_exe.root_module.addAnonymousImport(
-            b.fmt("vmiz_guest_agent_{s}", .{@tagName(architecture)}),
-            .{ .root_source_file = vmizguest_exe.getEmittedBin() },
+            b.fmt("miz_guest_agent_{s}", .{@tagName(architecture)}),
+            .{ .root_source_file = mizguest_exe.getEmittedBin() },
         );
 
         // The stand-in for `rpm` runs inside the guest, so it is built for the
         // guest's architecture rather than re-entered from the test binary,
         // which a cross-architecture guest could not execute.
         const guest_stub_exe = b.addExecutable(.{
-            .name = b.fmt("vmiz-vm-guest-stub-{s}", .{@tagName(architecture)}),
+            .name = b.fmt("miz-vm-guest-stub-{s}", .{@tagName(architecture)}),
             .root_module = b.createModule(.{
                 .root_source_file = b.path("tests/vm_guest_stub.zig"),
                 .target = guest_target,
@@ -1045,23 +1023,23 @@ pub fn build(b: *std.Build) void {
         );
     }
 
-    const vmizguest_tests = b.addTest(.{
+    const mizguest_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("vmizguest/main.zig"),
+            .root_source_file = b.path("mizguest/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "vm_control", .module = b.createModule(.{
-                    .root_source_file = b.path("packages/vmiz/src/vm_control.zig"),
+                    .root_source_file = b.path("packages/miz/src/vm_control.zig"),
                     .target = target,
                     .optimize = optimize,
                 }) },
             },
         }),
     });
-    const run_vmizguest_tests = b.addRunArtifact(vmizguest_tests);
-    const vmizguest_test_step = b.step("test-vmizguest", "Run guest agent tests");
-    vmizguest_test_step.dependOn(&run_vmizguest_tests.step);
+    const run_mizguest_tests = b.addRunArtifact(mizguest_tests);
+    const mizguest_test_step = b.step("test-mizguest", "Run guest agent tests");
+    mizguest_test_step.dependOn(&run_mizguest_tests.step);
 
     const test_step = b.step("test", "Run all tests");
     const ci_test_step = b.step(
@@ -1106,17 +1084,6 @@ pub fn build(b: *std.Build) void {
     package_family_consumer_check.setCwd(
         b.path("tests/package_family_consumer"),
     );
-    const rename_compatibility_consumer_check = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "build",
-        "rename-compatibility",
-    });
-    rename_compatibility_consumer_check.setName(
-        "check external zvmi compatibility consumer",
-    );
-    rename_compatibility_consumer_check.setCwd(
-        b.path("tests/build_api_consumer"),
-    );
 
     const build_api_diagnostics_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
@@ -1160,29 +1127,29 @@ pub fn build(b: *std.Build) void {
     // meaningful on Linux.  The zstd_max_preload shared library is also
     // Linux-specific. ----
     if (b.graph.host.result.os.tag == .linux) {
-        const guest_zstd_dependency = zstdDependency(b, vmizinit_target, .ReleaseSmall);
+        const guest_zstd_dependency = zstdDependency(b, mizinit_target, .ReleaseSmall);
 
         // Guest-targeted azagent for embedding in the generalized image.
         // It follows -Dazurelinux-arch and is static/ReleaseSmall, matching
-        // vmizinit.
-        const vmiz_guest_mod = b.createModule(.{
-            .root_source_file = b.path("packages/vmiz/src/root.zig"),
-            .target = vmizinit_target,
+        // mizinit.
+        const miz_guest_mod = b.createModule(.{
+            .root_source_file = b.path("packages/miz/src/root.zig"),
+            .target = mizinit_target,
             .optimize = .ReleaseSmall,
         });
-        addZstdHeaders(vmiz_guest_mod, guest_zstd_dependency);
+        addZstdHeaders(miz_guest_mod, guest_zstd_dependency);
         const wireserver_guest_mod = b.createModule(.{
             .root_source_file = b.path("wireserver/wireserver.zig"),
-            .target = vmizinit_target,
+            .target = mizinit_target,
             .optimize = .ReleaseSmall,
         });
         const azagent_guest_mod = b.createModule(.{
             .root_source_file = b.path("azagent/main.zig"),
-            .target = vmizinit_target,
+            .target = mizinit_target,
             .optimize = .ReleaseSmall,
             .imports = &.{
                 .{ .name = "wireserver", .module = wireserver_guest_mod },
-                .{ .name = "vmiz", .module = vmiz_guest_mod },
+                .{ .name = "miz", .module = miz_guest_mod },
             },
         });
         const azagent_guest_exe = b.addExecutable(.{
@@ -1212,7 +1179,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "miz", .module = host_miz_mod },
             },
         });
         const builder_exe = b.addExecutable(.{
@@ -1230,14 +1197,14 @@ pub fn build(b: *std.Build) void {
         );
         generalized_check_step.dependOn(&builder_exe.step);
         if (azurelinux_flavor == .core) {
-            generalized_check_step.dependOn(&vmizinit_exe.step);
+            generalized_check_step.dependOn(&mizinit_exe.step);
             generalized_check_step.dependOn(&azagent_guest_exe.step);
         }
         generalized_check_step.dependOn(&zstd_preload_lib.step);
 
         // `zig build generalized-azurelinux4 -- [--iso ...] [--output ...] ...`
-        // Automatically passes the paths of the just-built native vmiz, guest
-        // vmizinit/azagent, and the preload library so the builder does not need to
+        // Automatically passes the paths of the just-built native miz, guest
+        // mizinit/azagent, and the preload library so the builder does not need to
         // invoke `zig build` itself.
         const run_builder = b.addRunArtifact(builder_exe);
         run_builder.step.dependOn(b.getInstallStep());
@@ -1245,11 +1212,11 @@ pub fn build(b: *std.Build) void {
         run_builder.addArg(@tagName(azurelinux_architecture));
         run_builder.addArg("--flavor");
         run_builder.addArg(@tagName(azurelinux_flavor));
-        run_builder.addArg("--vmiz");
+        run_builder.addArg("--miz");
         run_builder.addArtifactArg(cli_exe);
         if (azurelinux_flavor == .core) {
-            run_builder.addArg("--vmizinit");
-            run_builder.addArtifactArg(vmizinit_exe);
+            run_builder.addArg("--mizinit");
+            run_builder.addArtifactArg(mizinit_exe);
             run_builder.addArg("--azagent");
             run_builder.addArtifactArg(azagent_guest_exe);
         }
@@ -1283,7 +1250,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "miz", .module = host_miz_mod },
             },
         });
         const ubuntu2604_builder_exe = b.addExecutable(.{
@@ -1310,7 +1277,7 @@ pub fn build(b: *std.Build) void {
         );
         ubuntu2604_check.dependOn(&ubuntu2604_builder_exe.step);
         if (selected_ubuntu2604_core) |artifacts| {
-            ubuntu2604_check.dependOn(&artifacts.vmizinit.step);
+            ubuntu2604_check.dependOn(&artifacts.mizinit.step);
             ubuntu2604_check.dependOn(&artifacts.azagent.step);
         }
 
@@ -1334,8 +1301,8 @@ pub fn build(b: *std.Build) void {
             "--flavor",       @tagName(ubuntu2604_flavor),
         });
         if (selected_ubuntu2604_core) |artifacts| {
-            run_ubuntu2604.addArg("--vmizinit");
-            run_ubuntu2604.addArtifactArg(artifacts.vmizinit);
+            run_ubuntu2604.addArg("--mizinit");
+            run_ubuntu2604.addArtifactArg(artifacts.mizinit);
             run_ubuntu2604.addArg("--azagent");
             run_ubuntu2604.addArtifactArg(artifacts.azagent);
         }
@@ -1357,8 +1324,8 @@ pub fn build(b: *std.Build) void {
                 .aarch64 => ubuntu2604_core_aarch64,
             };
             if (core_artifacts) |artifacts| {
-                run_arch.addArg("--vmizinit");
-                run_arch.addArtifactArg(artifacts.vmizinit);
+                run_arch.addArg("--mizinit");
+                run_arch.addArtifactArg(artifacts.mizinit);
                 run_arch.addArg("--azagent");
                 run_arch.addArtifactArg(artifacts.azagent);
             }
@@ -1377,7 +1344,7 @@ pub fn build(b: *std.Build) void {
         // Opt-in native-QEMU acceptance for a completed, finalized release
         // candidate. The image itself is intentionally supplied at runtime:
         // four native matrix entries select their architecture/flavor here and
-        // set VMIZ_AZURELINUX4_IMAGE to the exact candidate under test.
+        // set MIZ_AZURELINUX4_IMAGE to the exact candidate under test.
         const azurelinux_acceptance_options = b.addOptions();
         azurelinux_acceptance_options.addOption(
             []const u8,
@@ -1398,7 +1365,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "build_options", .module = azurelinux_acceptance_options.createModule() },
                     .{ .name = "qemu_host", .module = host_qemu_host_mod },
                     .{ .name = "qmp", .module = host_qmp_mod },
-                    .{ .name = "vmiz", .module = host_vmiz_mod },
+                    .{ .name = "miz", .module = host_miz_mod },
                 },
             }),
         });
@@ -1451,7 +1418,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "build_options", .module = ubuntu2604_acceptance_options.createModule() },
                     .{ .name = "qemu_host", .module = host_qemu_host_mod },
                     .{ .name = "qmp", .module = host_qmp_mod },
-                    .{ .name = "vmiz", .module = host_vmiz_mod },
+                    .{ .name = "miz", .module = host_miz_mod },
                 },
             }),
         });
@@ -1469,7 +1436,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "vmiz", .module = host_vmiz_mod },
+                .{ .name = "miz", .module = host_miz_mod },
                 .{ .name = "qmp", .module = host_qmp_mod },
                 .{ .name = "qemu_host", .module = host_qemu_host_mod },
             },
@@ -1518,7 +1485,7 @@ pub fn build(b: *std.Build) void {
     }
 
     for (aggregate_test_steps) |aggregate_test_step| {
-        aggregate_test_step.dependOn(&run_vmiz_tests.step);
+        aggregate_test_step.dependOn(&run_miz_tests.step);
         aggregate_test_step.dependOn(&run_host_package_family_tests.step);
         aggregate_test_step.dependOn(&run_oci_registry_tests.step);
         aggregate_test_step.dependOn(&run_wireserver_tests.step);
@@ -1541,13 +1508,12 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(&run_nbd_server_tests.step);
         aggregate_test_step.dependOn(&run_qcow2_mod_tests.step);
         aggregate_test_step.dependOn(&run_qcow2_exe_tests.step);
-        aggregate_test_step.dependOn(&run_vmizinit_tests.step);
-        aggregate_test_step.dependOn(&run_vmizguest_tests.step);
-        aggregate_test_step.dependOn(vmizguest_step);
+        aggregate_test_step.dependOn(&run_mizinit_tests.step);
+        aggregate_test_step.dependOn(&run_mizguest_tests.step);
+        aggregate_test_step.dependOn(mizguest_step);
         aggregate_test_step.dependOn(&run_build_api_tests.step);
         aggregate_test_step.dependOn(&build_api_consumer_check.step);
         aggregate_test_step.dependOn(&package_family_consumer_check.step);
-        aggregate_test_step.dependOn(&rename_compatibility_consumer_check.step);
         aggregate_test_step.dependOn(&build_api_diagnostics_check.step);
         aggregate_test_step.dependOn(
             &build_api_execution_diagnostics_check.step,

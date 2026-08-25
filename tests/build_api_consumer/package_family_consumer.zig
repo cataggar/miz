@@ -1,5 +1,5 @@
 const std = @import("std");
-const package_family = @import("vmiz").package_family;
+const package_family = @import("miz").package_family;
 
 test "public consumer can model lock review and locked creation" {
     const resolve: package_family.Request = .{

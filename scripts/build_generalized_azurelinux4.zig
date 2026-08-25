@@ -14,17 +14,17 @@
 //!   --work-dir <dir>    Working directory (architecture/flavor-specific default)
 //!
 //! Arguments injected automatically by build.zig:
-//!   --vmiz <path>       Built native vmiz executable
-//!   --vmizinit <path>    Built guest vmizinit binary
+//!   --miz <path>       Built native miz executable
+//!   --mizinit <path>    Built guest mizinit binary
 //!   --azagent <path>    Built guest azagent binary
 //!   --preload <path>    Built zstd_max_preload.so shared library
 
 const std = @import("std");
 const builtin = @import("builtin");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 const uki_signing = @import("uki_signing.zig");
-const oci = vmiz.oci;
-const artifact_pipeline = vmiz.artifact_pipeline;
+const oci = miz.oci;
+const artifact_pipeline = miz.artifact_pipeline;
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -36,8 +36,8 @@ const linux = std.os.linux;
 const base_image = "azurelinux-beta/base/core";
 const base_tag = "4.0";
 const mcr_base = "https://mcr.microsoft.com/v2";
-const AzureLinuxArchitecture = vmiz.bootconfig.Architecture;
-const dnf_repository_id = "vmiz-azurelinux-base";
+const AzureLinuxArchitecture = miz.bootconfig.Architecture;
+const dnf_repository_id = "miz-azurelinux-base";
 
 /// The full image package manifest is vendored from this exact upstream KIWI
 /// profile.  KIWI itself is deliberately not part of the build: DNF consumes
@@ -54,12 +54,12 @@ const Flavor = enum {
 };
 
 const Pid1 = enum {
-    vmizinit,
+    mizinit,
     systemd,
 };
 
 const Provisioner = enum {
-    vmizinit_azagent,
+    mizinit_azagent,
     cloud_init_waagent,
 };
 
@@ -150,7 +150,7 @@ const core_packages = [_][]const u8{
 const core_required_rootfs_paths = [_][]const u8{
     "usr/bin/bash",
     "usr/bin/azagent",
-    "usr/bin/vmizinit",
+    "usr/bin/mizinit",
     "usr/bin/sshd",
 };
 
@@ -172,9 +172,9 @@ const core_forbidden_rootfs_paths = [_][]const u8{};
 const full_forbidden_rootfs_paths = [_][]const u8{
     // Azure Linux uses merged-/usr aliases; validate their canonical targets
     // because the ext4 reader deliberately does not follow symlinks.
-    "usr/bin/vmizinit",
+    "usr/bin/mizinit",
     "usr/bin/azagent",
-    "etc/ssh/sshd_config.d/10-vmizinit.conf",
+    "etc/ssh/sshd_config.d/10-mizinit.conf",
     "var/lib/azagent/provisioned",
     // Offline labeling replaces the first-boot relabel marker.
     ".autorelabel",
@@ -241,9 +241,9 @@ const core = FlavorDescriptor{
     .forbidden_rootfs_paths = &core_forbidden_rootfs_paths,
     .required_packages = &core_packages,
     .forbidden_packages = &.{},
-    .pid1 = .vmizinit,
-    .provisioner = .vmizinit_azagent,
-    .oci_entrypoint = "/sbin/vmizinit",
+    .pid1 = .mizinit,
+    .provisioner = .mizinit_azagent,
+    .oci_entrypoint = "/sbin/mizinit",
     .oci_provenance_kind = "pinned-core-oci",
     .max_oci_layer_bytes = 128 * 1024 * 1024,
 };
@@ -259,7 +259,7 @@ const full = FlavorDescriptor{
     .required_rootfs_paths = &full_required_rootfs_paths,
     .forbidden_rootfs_paths = &full_forbidden_rootfs_paths,
     .required_packages = &vm_base_packages,
-    .forbidden_packages = &.{ "vmizinit", "azagent" },
+    .forbidden_packages = &.{ "mizinit", "azagent" },
     .pid1 = .systemd,
     .provisioner = .cloud_init_waagent,
     .oci_entrypoint = "/usr/lib/systemd/systemd",
@@ -313,8 +313,8 @@ const ArchitectureDescriptor = struct {
     systemd_boot_stub_path: []const u8,
     fallback_efi_path: []const u8,
     uki_pe_machine: u16,
-    root_role: vmiz.layout.PartitionRole,
-    root_type_guid: vmiz.guid.Guid,
+    root_role: miz.layout.PartitionRole,
+    root_type_guid: miz.guid.Guid,
     serial_console: []const u8,
     extra_kernel_options: []const u8,
     binfmt_registration_name: []const u8,
@@ -351,9 +351,9 @@ const x86_64 = ArchitectureDescriptor{
     .fallback_efi_path = "EFI/BOOT/BOOTX64.EFI",
     .uki_pe_machine = 0x8664,
     .root_role = .root_x86_64,
-    .root_type_guid = vmiz.guid.linux_root_x86_64,
+    .root_type_guid = miz.guid.linux_root_x86_64,
     .serial_console = "console=ttyS0,115200n8",
-    .extra_kernel_options = "init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=auto console=tty0 console=ttyS0,115200n8",
+    .extra_kernel_options = "init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto console=tty0 console=ttyS0,115200n8",
     .binfmt_registration_name = "qemu-x86_64",
     .binfmt_registration_path = "/proc/sys/fs/binfmt_misc/qemu-x86_64",
     .binfmt_static_name = "qemu-x86_64-static",
@@ -389,9 +389,9 @@ const aarch64 = ArchitectureDescriptor{
     .fallback_efi_path = "EFI/BOOT/BOOTAA64.EFI",
     .uki_pe_machine = 0xaa64,
     .root_role = .root_aarch64,
-    .root_type_guid = vmiz.guid.linux_root_aarch64,
+    .root_type_guid = miz.guid.linux_root_aarch64,
     .serial_console = "console=ttyAMA0,115200n8",
-    .extra_kernel_options = "init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=auto console=tty0 console=ttyAMA0,115200n8",
+    .extra_kernel_options = "init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto console=tty0 console=ttyAMA0,115200n8",
     .binfmt_registration_name = "qemu-aarch64",
     .binfmt_registration_path = "/proc/sys/fs/binfmt_misc/qemu-aarch64",
     .binfmt_static_name = "qemu-aarch64-static",
@@ -453,7 +453,7 @@ const docker_index_type = "application/vnd.docker.distribution.manifest.list.v2+
 const iso_max_bytes: u64 = 2 * 1024 * 1024 * 1024;
 const repomd_max_bytes: usize = 1024 * 1024;
 const accept_header = oci_index_type ++ ", " ++ docker_index_type ++ ", " ++ oci_manifest_type ++ ", " ++ docker_manifest_type;
-const vmizinit_symlink_paths = [_][]const u8{
+const mizinit_symlink_paths = [_][]const u8{
     "usr/bin/init",
     "usr/bin/poweroff",
     "usr/bin/reboot",
@@ -1064,13 +1064,13 @@ fn prepareDnfCache(
 ) !DnfCachePaths {
     const cache_guest_dir = try std.fmt.allocPrint(
         gpa,
-        "/var/cache/vmiz-dnf-{s}-{s}",
+        "/var/cache/miz-dnf-{s}-{s}",
         .{ @tagName(flavor.flavor), architecture.dnf_architecture },
     );
     defer gpa.free(cache_guest_dir);
     const persist_guest_dir = try std.fmt.allocPrint(
         gpa,
-        "/var/lib/vmiz-dnf-{s}-{s}",
+        "/var/lib/miz-dnf-{s}-{s}",
         .{ @tagName(flavor.flavor), architecture.dnf_architecture },
     );
     defer gpa.free(persist_guest_dir);
@@ -1689,7 +1689,7 @@ fn configureFullGuest(
         full_networkd_config,
         "0644",
     );
-    try writeRootFile(gpa, io, rootfs_path, work_dir, "etc/ssh/sshd_config.d/20-vmiz-full.conf", "PasswordAuthentication no\n" ++
+    try writeRootFile(gpa, io, rootfs_path, work_dir, "etc/ssh/sshd_config.d/20-miz-full.conf", "PasswordAuthentication no\n" ++
         "PermitEmptyPasswords no\n" ++
         "PubkeyAuthentication yes\n" ++
         "KbdInteractiveAuthentication no\n", "0600");
@@ -1734,22 +1734,22 @@ fn configureCoreGuest(
     io: Io,
     rootfs_path: []const u8,
     work_dir: []const u8,
-    vmizinit_path: []const u8,
+    mizinit_path: []const u8,
     azagent_path: []const u8,
 ) !void {
-    const sbin_vmizinit = try std.fmt.allocPrint(gpa, "{s}/sbin/vmizinit", .{rootfs_path});
-    defer gpa.free(sbin_vmizinit);
-    try sudo(gpa, io, &.{ "install", "-m", "0755", vmizinit_path, sbin_vmizinit });
+    const sbin_mizinit = try std.fmt.allocPrint(gpa, "{s}/sbin/mizinit", .{rootfs_path});
+    defer gpa.free(sbin_mizinit);
+    try sudo(gpa, io, &.{ "install", "-m", "0755", mizinit_path, sbin_mizinit });
     for (&[_][]const u8{ "init", "poweroff", "reboot", "shutdown" }) |cmd| {
         const link = try std.fmt.allocPrint(gpa, "{s}/sbin/{s}", .{ rootfs_path, cmd });
         defer gpa.free(link);
         try sudo(gpa, io, &.{ "rm", "-f", link });
-        try sudo(gpa, io, &.{ "ln", "-s", "vmizinit", link });
+        try sudo(gpa, io, &.{ "ln", "-s", "mizinit", link });
     }
     const azagent_dest = try std.fmt.allocPrint(gpa, "{s}/usr/sbin/azagent", .{rootfs_path});
     defer gpa.free(azagent_dest);
     try sudo(gpa, io, &.{ "install", "-m", "0755", azagent_path, azagent_dest });
-    try writeRootFile(gpa, io, rootfs_path, work_dir, "etc/ssh/sshd_config.d/10-vmizinit.conf", "PasswordAuthentication no\n" ++
+    try writeRootFile(gpa, io, rootfs_path, work_dir, "etc/ssh/sshd_config.d/10-mizinit.conf", "PasswordAuthentication no\n" ++
         "PermitEmptyPasswords no\n" ++
         "PubkeyAuthentication yes\n", "0600");
     try writeRootFile(gpa, io, rootfs_path, work_dir, "etc/waagent.conf", "ResourceDisk.Format=y\n" ++
@@ -1759,7 +1759,7 @@ fn configureCoreGuest(
         "DataDisk.Mount=y\n", "0644");
     try sudo(gpa, io, &.{ "chroot", rootfs_path, "/usr/bin/ssh-keygen", "-A" });
     try sudo(gpa, io, &.{ "chroot", rootfs_path, "/usr/sbin/sshd", "-t" });
-    try run(gpa, io, &.{ "file", sbin_vmizinit, azagent_dest });
+    try run(gpa, io, &.{ "file", sbin_mizinit, azagent_dest });
 }
 
 fn generalizeRootfs(
@@ -1883,7 +1883,7 @@ fn installGuestContent(
     rootfs_path: []const u8,
     work_dir: []const u8,
     trusted_key_path: []const u8,
-    vmizinit_path: ?[]const u8,
+    mizinit_path: ?[]const u8,
     azagent_path: ?[]const u8,
     systemd_boot_rpm_path: []const u8,
     architecture: *const ArchitectureDescriptor,
@@ -2067,12 +2067,12 @@ fn installGuestContent(
     }
 
     switch (flavor.pid1) {
-        .vmizinit => try configureCoreGuest(
+        .mizinit => try configureCoreGuest(
             gpa,
             io,
             rootfs_path,
             work_dir,
-            vmizinit_path orelse return error.MissingVmizinitArtifact,
+            mizinit_path orelse return error.MissingMizinitArtifact,
             azagent_path orelse return error.MissingAzagentArtifact,
         ),
         .systemd => try configureFullGuest(gpa, io, rootfs_path, work_dir),
@@ -2227,7 +2227,7 @@ fn createOciLayer(
     // Keep per-layer input bounded even for the official full profile.
     const tar_stat = try Dir.cwd().statFile(io, layer_tar, .{});
     if (tar_stat.size > max_layer_bytes) {
-        std.debug.print("error: layer {d} ({d} B) exceeds vmiz's {d}-B limit\n", .{
+        std.debug.print("error: layer {d} ({d} B) exceeds miz's {d}-B limit\n", .{
             index, tar_stat.size, max_layer_bytes,
         });
         return error.LayerTooLarge;
@@ -2391,13 +2391,13 @@ fn createOciLayout(
             .Entrypoint = &[_][]const u8{flavor.oci_entrypoint},
             .Env = &[_][]const u8{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
             .Labels = .{
-                .@"io.github.vmiz.flavor" = @tagName(flavor.flavor),
-                .@"io.github.vmiz.provenance" = flavor.oci_provenance_kind,
-                .@"io.github.vmiz.source.digest" = source_digest,
-                .@"io.github.vmiz.vm-base.commit" = vm_base_upstream_commit,
-                .@"io.github.vmiz.vm-base.profile-blob" = vm_base_profile_blob,
-                .@"io.github.vmiz.repomd.sha256" = architecture.repomd_sha256,
-                .@"io.github.vmiz.installed-nevra.sha256" = &closure_sha256,
+                .@"io.github.miz.flavor" = @tagName(flavor.flavor),
+                .@"io.github.miz.provenance" = flavor.oci_provenance_kind,
+                .@"io.github.miz.source.digest" = source_digest,
+                .@"io.github.miz.vm-base.commit" = vm_base_upstream_commit,
+                .@"io.github.miz.vm-base.profile-blob" = vm_base_profile_blob,
+                .@"io.github.miz.repomd.sha256" = architecture.repomd_sha256,
+                .@"io.github.miz.installed-nevra.sha256" = &closure_sha256,
             },
         },
         .created = created_ts,
@@ -2582,14 +2582,14 @@ fn validateGeneralizedOciLayout(
             return error.ForbiddenFlavorRootfsPath;
         }
     }
-    if (flavor.pid1 == .vmizinit) {
-        for (vmizinit_symlink_paths) |path| {
+    if (flavor.pid1 == .mizinit) {
+        for (mizinit_symlink_paths) |path| {
             const entry = image.get(path) orelse {
-                std.debug.print("error: generated OCI layout is missing required vmizinit symlink: /{s}\n", .{path});
+                std.debug.print("error: generated OCI layout is missing required mizinit symlink: /{s}\n", .{path});
                 return error.IncompleteOciRootfs;
             };
-            if (entry.kind != .symlink or !std.mem.eql(u8, entry.link_name orelse "", "vmizinit")) {
-                std.debug.print("error: generated OCI rootfs path is not a relative symlink to vmizinit: /{s}\n", .{path});
+            if (entry.kind != .symlink or !std.mem.eql(u8, entry.link_name orelse "", "mizinit")) {
+                std.debug.print("error: generated OCI rootfs path is not a relative symlink to mizinit: /{s}\n", .{path});
                 return error.IncompleteOciRootfs;
             }
         }
@@ -2664,20 +2664,20 @@ fn signGeneralizedImage(
     scratch_path: []const u8,
     environ_map: *const std.process.Environ.Map,
 ) !UkiSigningReport {
-    var image = try vmiz.Image.openPath(io, image_path);
+    var image = try miz.Image.openPath(io, image_path);
     defer image.close(io);
-    const parsed = try vmiz.gpt.readGpt(image, io, gpa);
+    const parsed = try miz.gpt.readGpt(image, io, gpa);
     defer gpa.free(parsed.partitions);
     if (parsed.partitions.len < 1 or
-        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &vmiz.guid.esp))
+        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &miz.guid.esp))
     {
         return error.MissingEspPartition;
     }
     const esp_partition = parsed.partitions[0];
-    var esp = try vmiz.fat32.open(&image, io, .{
-        .offset = esp_partition.first_lba * vmiz.gpt.sector_size,
+    var esp = try miz.fat32.open(&image, io, .{
+        .offset = esp_partition.first_lba * miz.gpt.sector_size,
         .length = (esp_partition.last_lba - esp_partition.first_lba + 1) *
-            vmiz.gpt.sector_size,
+            miz.gpt.sector_size,
     });
 
     const fallback_unsigned = try esp.readFileAlloc(
@@ -2687,7 +2687,7 @@ fn signGeneralizedImage(
     );
     defer gpa.free(fallback_unsigned);
     const linux_entries = try esp.listDirAlloc(io, gpa, "EFI/Linux");
-    defer vmiz.fat32.freeDirEntries(gpa, linux_entries);
+    defer miz.fat32.freeDirEntries(gpa, linux_entries);
 
     var records: std.ArrayListUnmanaged(UkiSigningRecord) = .empty;
     errdefer {
@@ -2770,20 +2770,20 @@ fn verifySignedGeneralizedImage(
     config: uki_signing.Config,
     report: *const UkiSigningReport,
 ) !void {
-    var image = try vmiz.Image.openPathReadOnly(io, image_path);
+    var image = try miz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
-    const parsed = try vmiz.gpt.readGpt(image, io, gpa);
+    const parsed = try miz.gpt.readGpt(image, io, gpa);
     defer gpa.free(parsed.partitions);
     if (parsed.partitions.len < 1 or
-        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &vmiz.guid.esp))
+        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &miz.guid.esp))
     {
         return error.MissingEspPartition;
     }
     const esp_partition = parsed.partitions[0];
-    var esp = try vmiz.fat32.open(&image, io, .{
-        .offset = esp_partition.first_lba * vmiz.gpt.sector_size,
+    var esp = try miz.fat32.open(&image, io, .{
+        .offset = esp_partition.first_lba * miz.gpt.sector_size,
         .length = (esp_partition.last_lba - esp_partition.first_lba + 1) *
-            vmiz.gpt.sector_size,
+            miz.gpt.sector_size,
     });
 
     for (report.records) |record| {
@@ -2881,7 +2881,7 @@ fn writeSigningProvenance(
     } else null;
     const document = .{
         .schema = 1,
-        .type = "vmiz-uki-signing",
+        .type = "miz-uki-signing",
         .architecture = @tagName(architecture.architecture),
         .flavor = @tagName(flavor.flavor),
         .signer_mode = config.mode.name(),
@@ -2929,8 +2929,8 @@ fn planGeneralizedGen2Layout(
     virtual_size: u64,
     architecture: *const ArchitectureDescriptor,
     flavor: *const FlavorDescriptor,
-) ![]vmiz.layout.PlannedPartition {
-    const requests = [_]vmiz.layout.PartitionRequest{
+) ![]miz.layout.PlannedPartition {
+    const requests = [_]miz.layout.PartitionRequest{
         .{ .name = "ESP", .role = .esp, .filesystem = .fat32, .size = .{ .fixed = flavor.esp_size_bytes } },
         .{
             .name = "root",
@@ -2940,12 +2940,12 @@ fn planGeneralizedGen2Layout(
             .type_guid = architecture.root_type_guid,
         },
     };
-    return vmiz.layout.planLayout(gpa, virtual_size, &requests, null);
+    return miz.layout.planLayout(gpa, virtual_size, &requests, null);
 }
 
 fn validatePartitionLayout(
-    partitions: []const vmiz.gpt.PartitionEntry,
-    expected: []const vmiz.layout.PlannedPartition,
+    partitions: []const miz.gpt.PartitionEntry,
+    expected: []const miz.layout.PlannedPartition,
 ) !void {
     if (partitions.len != expected.len) return error.UnexpectedPartitionCount;
     for (partitions, expected) |partition, planned| {
@@ -2956,8 +2956,8 @@ fn validatePartitionLayout(
             return error.UnexpectedPartitionLayout;
         }
         if (partition.last_lba < partition.first_lba) return error.UnexpectedPartitionLayout;
-        const offset_bytes = partition.first_lba * vmiz.gpt.sector_size;
-        const length_bytes = (partition.last_lba - partition.first_lba + 1) * vmiz.gpt.sector_size;
+        const offset_bytes = partition.first_lba * miz.gpt.sector_size;
+        const length_bytes = (partition.last_lba - partition.first_lba + 1) * miz.gpt.sector_size;
         if (offset_bytes != planned.offset_bytes or length_bytes != planned.length_bytes) {
             return error.UnexpectedPartitionLayout;
         }
@@ -2997,7 +2997,7 @@ fn enforceMinimumRootFreeSpace(
     }
 }
 
-fn requireAbsentFile(esp: *vmiz.fat32.FileSystem, gpa: Allocator, io: Io, path: []const u8) !void {
+fn requireAbsentFile(esp: *miz.fat32.FileSystem, gpa: Allocator, io: Io, path: []const u8) !void {
     const bytes = esp.readFileAlloc(io, gpa, path) catch |err| switch (err) {
         error.PathNotFound => return,
         else => return err,
@@ -3006,12 +3006,12 @@ fn requireAbsentFile(esp: *vmiz.fat32.FileSystem, gpa: Allocator, io: Io, path: 
     return error.UnexpectedGeneratedBootConfig;
 }
 
-fn requireNoBlsEntries(esp: *vmiz.fat32.FileSystem, gpa: Allocator, io: Io) !void {
+fn requireNoBlsEntries(esp: *miz.fat32.FileSystem, gpa: Allocator, io: Io) !void {
     const entries = esp.listDirAlloc(io, gpa, "loader/entries") catch |err| switch (err) {
         error.PathNotFound => return,
         else => return err,
     };
-    defer vmiz.fat32.freeDirEntries(gpa, entries);
+    defer miz.fat32.freeDirEntries(gpa, entries);
     for (entries) |entry| {
         if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".conf")) {
             return error.UnexpectedGeneratedBootConfig;
@@ -3019,11 +3019,11 @@ fn requireNoBlsEntries(esp: *vmiz.fat32.FileSystem, gpa: Allocator, io: Io) !voi
     }
 }
 
-fn requireNoGeneratedGrubConfigs(esp: *vmiz.fat32.FileSystem, gpa: Allocator, io: Io) !void {
+fn requireNoGeneratedGrubConfigs(esp: *miz.fat32.FileSystem, gpa: Allocator, io: Io) !void {
     try requireAbsentFile(esp, gpa, io, "EFI/BOOT/grub.cfg");
 
     const efi_entries = try esp.listDirAlloc(io, gpa, "EFI");
-    defer vmiz.fat32.freeDirEntries(gpa, efi_entries);
+    defer miz.fat32.freeDirEntries(gpa, efi_entries);
     for (efi_entries) |entry| {
         if (entry.kind != .directory or std.ascii.eqlIgnoreCase(entry.name, "BOOT")) continue;
         const path = try std.fmt.allocPrint(gpa, "EFI/{s}/grub.cfg", .{entry.name});
@@ -3034,21 +3034,21 @@ fn requireNoGeneratedGrubConfigs(esp: *vmiz.fat32.FileSystem, gpa: Allocator, io
 
 fn expectedUkiCmdline(
     gpa: Allocator,
-    root_guid: vmiz.guid.Guid,
+    root_guid: miz.guid.Guid,
     architecture: *const ArchitectureDescriptor,
     flavor: *const FlavorDescriptor,
 ) ![]u8 {
     var root_guid_text: [36]u8 = undefined;
     return switch (flavor.pid1) {
-        .vmizinit => std.fmt.allocPrint(
+        .mizinit => std.fmt.allocPrint(
             gpa,
             "root=PARTUUID={s} {s}",
-            .{ vmiz.guid.formatLower(&root_guid_text, root_guid), architecture.extra_kernel_options },
+            .{ miz.guid.formatLower(&root_guid_text, root_guid), architecture.extra_kernel_options },
         ),
         .systemd => std.fmt.allocPrint(
             gpa,
             "root=PARTUUID={s} {s}",
-            .{ vmiz.guid.formatLower(&root_guid_text, root_guid), architecture.serial_console },
+            .{ miz.guid.formatLower(&root_guid_text, root_guid), architecture.serial_console },
         ),
     };
 }
@@ -3058,12 +3058,12 @@ fn ukiExtraKernelOptions(
     flavor: *const FlavorDescriptor,
 ) []const u8 {
     return switch (flavor.pid1) {
-        .vmizinit => architecture.extra_kernel_options,
+        .mizinit => architecture.extra_kernel_options,
         .systemd => architecture.serial_console,
     };
 }
 
-fn requireNonemptyUkiSection(inspection: *const vmiz.uki.Inspection, name: []const u8) ![]const u8 {
+fn requireNonemptyUkiSection(inspection: *const miz.uki.Inspection, name: []const u8) ![]const u8 {
     const section = inspection.findSection(name) orelse return error.MissingUkiSection;
     if (section.contents.len == 0) return error.EmptyUkiSection;
     return section.contents;
@@ -3075,12 +3075,12 @@ fn imageRootfsReadAt(
     buffer: []u8,
     offset: u64,
 ) anyerror!usize {
-    const image: *const vmiz.Image = @ptrCast(@alignCast(context));
+    const image: *const miz.Image = @ptrCast(@alignCast(context));
     return image.pread(io, buffer, offset);
 }
 
 fn requireImageRootfsPathAbsent(
-    rootfs: *const vmiz.ext4.Reader,
+    rootfs: *const miz.ext4.Reader,
     io: Io,
     path: []const u8,
 ) !void {
@@ -3092,7 +3092,7 @@ fn requireImageRootfsPathAbsent(
 }
 
 fn requireUsableSelinuxLabel(
-    rootfs: *const vmiz.ext4.Reader,
+    rootfs: *const miz.ext4.Reader,
     gpa: Allocator,
     io: Io,
     path: []const u8,
@@ -3113,15 +3113,15 @@ fn requireUsableSelinuxLabel(
 fn validateFinalizedImageRootfs(
     gpa: Allocator,
     io: Io,
-    image: *const vmiz.Image,
+    image: *const miz.Image,
     image_path: []const u8,
-    root_partition: vmiz.gpt.PartitionEntry,
+    root_partition: miz.gpt.PartitionEntry,
     flavor: *const FlavorDescriptor,
 ) !void {
     var backing_file = try Dir.cwd().openFile(io, image_path, .{});
     defer backing_file.close(io);
-    const root_offset = root_partition.first_lba * vmiz.gpt.sector_size;
-    var rootfs = try vmiz.ext4.openReadOnlySource(io, backing_file, .{
+    const root_offset = root_partition.first_lba * miz.gpt.sector_size;
+    var rootfs = try miz.ext4.openReadOnlySource(io, backing_file, .{
         .ctx = image,
         .read_at_fn = imageRootfsReadAt,
     }, gpa, .{ .offset = root_offset });
@@ -3144,11 +3144,11 @@ fn validateFinalizedImageRootfs(
         "etc/ssh/ssh_host_dsa_key.pub",
         "root/.ssh/authorized_keys",
     }) |path| try requireImageRootfsPathAbsent(&rootfs, io, path);
-    const homes: ?[]vmiz.ext4.DirEntry = rootfs.listDir(io, gpa, "home") catch |err| switch (err) {
+    const homes: ?[]miz.ext4.DirEntry = rootfs.listDir(io, gpa, "home") catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
-    defer if (homes) |entries| vmiz.ext4.freeDirEntries(gpa, entries);
+    defer if (homes) |entries| miz.ext4.freeDirEntries(gpa, entries);
     for (homes orelse &.{}) |home| {
         if (home.kind != .directory) continue;
         const authorized_keys = try std.fmt.allocPrint(gpa, "home/{s}/.ssh/authorized_keys", .{home.name});
@@ -3201,7 +3201,7 @@ fn validateFinalizedImageRootfs(
             error.NotFound => return error.BakedProvisioningState,
             else => return err,
         };
-        defer vmiz.ext4.freeDirEntries(gpa, waagent_state);
+        defer miz.ext4.freeDirEntries(gpa, waagent_state);
         if (waagent_state.len != 0) return error.BakedProvisioningState;
     }
 }
@@ -3214,31 +3214,31 @@ fn validateGeneralizedImage(
     architecture: *const ArchitectureDescriptor,
     flavor: *const FlavorDescriptor,
 ) !GeneralizedImageValidationReport {
-    var image = try vmiz.Image.openPathReadOnly(io, image_path);
+    var image = try miz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
     if (image.virtual_size != expected_virtual_size) return error.UnexpectedVirtualSize;
 
     const expected_layout = try planGeneralizedGen2Layout(gpa, image.virtual_size, architecture, flavor);
     defer gpa.free(expected_layout);
-    const parsed = try vmiz.gpt.readGpt(image, io, gpa);
+    const parsed = try miz.gpt.readGpt(image, io, gpa);
     defer gpa.free(parsed.partitions);
     try validatePartitionLayout(parsed.partitions, expected_layout);
 
     const esp_partition = parsed.partitions[0];
     const root_partition = parsed.partitions[1];
-    if (std.mem.eql(u8, &root_partition.unique_partition_guid, &vmiz.guid.nil)) {
+    if (std.mem.eql(u8, &root_partition.unique_partition_guid, &miz.guid.nil)) {
         return error.InvalidRootPartitionGuid;
     }
     try validateFinalizedImageRootfs(gpa, io, &image, image_path, root_partition, flavor);
-    var esp = try vmiz.fat32.open(&image, io, .{
-        .offset = esp_partition.first_lba * vmiz.gpt.sector_size,
-        .length = (esp_partition.last_lba - esp_partition.first_lba + 1) * vmiz.gpt.sector_size,
+    var esp = try miz.fat32.open(&image, io, .{
+        .offset = esp_partition.first_lba * miz.gpt.sector_size,
+        .length = (esp_partition.last_lba - esp_partition.first_lba + 1) * miz.gpt.sector_size,
     });
 
     const fallback_uki = try esp.readFileAlloc(io, gpa, architecture.fallback_efi_path);
     defer gpa.free(fallback_uki);
     const linux_entries = try esp.listDirAlloc(io, gpa, "EFI/Linux");
-    defer vmiz.fat32.freeDirEntries(gpa, linux_entries);
+    defer miz.fat32.freeDirEntries(gpa, linux_entries);
 
     var found_named_uki = false;
     var fallback_matches_named_uki = false;
@@ -3258,7 +3258,7 @@ fn validateGeneralizedImage(
     if (!found_named_uki) return error.MissingNamedUki;
     if (!fallback_matches_named_uki) return error.FallbackUkiMismatch;
 
-    var inspection = try vmiz.uki.inspect(gpa, fallback_uki);
+    var inspection = try miz.uki.inspect(gpa, fallback_uki);
     defer inspection.deinit(gpa);
     if (inspection.machine != architecture.uki_pe_machine) return error.UnexpectedUkiMachine;
     if (inspection.subsystem != 10) return error.UnexpectedUkiSubsystem;
@@ -3502,8 +3502,8 @@ const Args = struct {
     output: ?[]const u8 = null,
     size: ?[]const u8 = null,
     work_dir: ?[]const u8 = null,
-    vmiz_path: ?[]const u8 = null,
-    vmizinit_path: ?[]const u8 = null,
+    miz_path: ?[]const u8 = null,
+    mizinit_path: ?[]const u8 = null,
     azagent_path: ?[]const u8 = null,
     preload_path: ?[]const u8 = null,
     uki_signing_certificate: ?[]const u8 = null,
@@ -3522,8 +3522,8 @@ const help_text =
     \\  --output <path>     Output QCOW2 (architecture/flavor-specific default)
     \\  --size <size>       Disk size (flavor-specific default)
     \\  --work-dir <dir>    Working directory (architecture/flavor-specific default)
-    \\  --vmiz <path>       vmiz executable (injected by build.zig)
-    \\  --vmizinit <path>    guest vmizinit binary (injected by build.zig)
+    \\  --miz <path>       miz executable (injected by build.zig)
+    \\  --mizinit <path>    guest mizinit binary (injected by build.zig)
     \\  --azagent <path>    guest azagent binary (injected by build.zig)
     \\  --preload <path>    zstd_max_preload.so (injected by build.zig)
     \\  --uki-signing-certificate <path>
@@ -3582,14 +3582,14 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
             a.work_dir = argv[i];
-        } else if (std.mem.eql(u8, arg, "--vmiz")) {
+        } else if (std.mem.eql(u8, arg, "--miz")) {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
-            a.vmiz_path = argv[i];
-        } else if (std.mem.eql(u8, arg, "--vmizinit")) {
+            a.miz_path = argv[i];
+        } else if (std.mem.eql(u8, arg, "--mizinit")) {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
-            a.vmizinit_path = argv[i];
+            a.mizinit_path = argv[i];
         } else if (std.mem.eql(u8, arg, "--azagent")) {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
@@ -3694,7 +3694,7 @@ pub fn main(init: std.process.Init) !void {
     const output_path = args.output orelse defaultOutputPath(architecture.architecture, flavor.flavor);
     const work_dir = args.work_dir orelse defaultWorkDir(architecture.architecture, flavor.flavor);
     const size_arg = args.size orelse flavor.default_size;
-    const requested_size = vmiz.parseSize(size_arg) catch |err| {
+    const requested_size = miz.parseSize(size_arg) catch |err| {
         std.debug.print("error: invalid --size ({s})\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -3707,11 +3707,11 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    const vmiz_path = args.vmiz_path orelse {
-        std.debug.print("error: --vmiz is required (provided by zig build)\n", .{});
+    const miz_path = args.miz_path orelse {
+        std.debug.print("error: --miz is required (provided by zig build)\n", .{});
         std.process.exit(1);
     };
-    const vmizinit_path = args.vmizinit_path;
+    const mizinit_path = args.mizinit_path;
     const azagent_path = args.azagent_path;
     const preload_path = args.preload_path orelse {
         std.debug.print("error: --preload is required (provided by zig build)\n", .{});
@@ -3773,8 +3773,8 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (!tools_ok) std.process.exit(1);
-    if (flavor.pid1 == .vmizinit) {
-        try validateGuestArtifact(gpa, io, vmizinit_path orelse return error.MissingVmizinitArtifact, architecture);
+    if (flavor.pid1 == .mizinit) {
+        try validateGuestArtifact(gpa, io, mizinit_path orelse return error.MissingMizinitArtifact, architecture);
         try validateGuestArtifact(gpa, io, azagent_path orelse return error.MissingAzagentArtifact, architecture);
     }
 
@@ -3835,7 +3835,7 @@ pub fn main(init: std.process.Init) !void {
         rootfs_path,
         work_dir,
         trusted_key_path,
-        vmizinit_path,
+        mizinit_path,
         azagent_path,
         systemd_boot_rpm_path,
         architecture,
@@ -3888,7 +3888,7 @@ pub fn main(init: std.process.Init) !void {
     var build_args = std.array_list.Managed([]const u8).init(gpa);
     defer build_args.deinit();
     try build_args.appendSlice(&.{
-        vmiz_path,
+        miz_path,
         "build-image",
         "--iso",
         iso_path,
@@ -4237,10 +4237,10 @@ test "architecture descriptors select RPMs, stubs, EFI paths, and binfmt" {
     try std.testing.expectEqualStrings("EFI/BOOT/BOOTAA64.EFI", aarch64.fallback_efi_path);
     try std.testing.expectEqual(@as(u16, 0x8664), x86_64.uki_pe_machine);
     try std.testing.expectEqual(@as(u16, 0xaa64), aarch64.uki_pe_machine);
-    try std.testing.expectEqual(vmiz.layout.PartitionRole.root_x86_64, x86_64.root_role);
-    try std.testing.expectEqual(vmiz.layout.PartitionRole.root_aarch64, aarch64.root_role);
-    try std.testing.expectEqual(vmiz.guid.linux_root_x86_64, x86_64.root_type_guid);
-    try std.testing.expectEqual(vmiz.guid.linux_root_aarch64, aarch64.root_type_guid);
+    try std.testing.expectEqual(miz.layout.PartitionRole.root_x86_64, x86_64.root_role);
+    try std.testing.expectEqual(miz.layout.PartitionRole.root_aarch64, aarch64.root_role);
+    try std.testing.expectEqual(miz.guid.linux_root_x86_64, x86_64.root_type_guid);
+    try std.testing.expectEqual(miz.guid.linux_root_aarch64, aarch64.root_type_guid);
     try std.testing.expectEqualStrings("qemu-x86_64-static", x86_64.binfmt_static_name);
     try std.testing.expectEqualStrings("qemu-aarch64-static", aarch64.binfmt_static_name);
     try std.testing.expectEqualStrings("/proc/sys/fs/binfmt_misc/qemu-x86_64", x86_64.binfmt_registration_path);
@@ -4289,17 +4289,17 @@ test "full flavor encodes the pinned official vm-base package profile" {
     try std.testing.expect(!argvContains(x86_packages, "kernel-modules"));
 }
 
-test "flavor contracts keep full systemd-only and core vmizinit-only" {
-    try std.testing.expectEqual(Pid1.vmizinit, core.pid1);
+test "flavor contracts keep full systemd-only and core mizinit-only" {
+    try std.testing.expectEqual(Pid1.mizinit, core.pid1);
     try std.testing.expectEqual(Pid1.systemd, full.pid1);
-    try std.testing.expectEqual(Provisioner.vmizinit_azagent, core.provisioner);
+    try std.testing.expectEqual(Provisioner.mizinit_azagent, core.provisioner);
     try std.testing.expectEqual(Provisioner.cloud_init_waagent, full.provisioner);
-    try std.testing.expectEqualStrings("/sbin/vmizinit", core.oci_entrypoint);
+    try std.testing.expectEqualStrings("/sbin/mizinit", core.oci_entrypoint);
     try std.testing.expectEqualStrings("/usr/lib/systemd/systemd", full.oci_entrypoint);
-    for (&[_][]const u8{ "usr/bin/vmizinit", "usr/bin/azagent", "etc/ssh/sshd_config.d/10-vmizinit.conf" }) |path| {
+    for (&[_][]const u8{ "usr/bin/mizinit", "usr/bin/azagent", "etc/ssh/sshd_config.d/10-mizinit.conf" }) |path| {
         try std.testing.expect(argvContains(full.forbidden_rootfs_paths, path));
     }
-    try std.testing.expect(!argvContains(full.forbidden_rootfs_paths, "sbin/vmizinit"));
+    try std.testing.expect(!argvContains(full.forbidden_rootfs_paths, "sbin/mizinit"));
     try std.testing.expect(!argvContains(full.forbidden_rootfs_paths, "usr/sbin/azagent"));
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/lib/systemd/systemd"));
     try std.testing.expect(argvContains(full.required_rootfs_paths, "usr/bin/sshd"));
@@ -4428,7 +4428,7 @@ test "DNF install permits payload downloads without refreshing verified metadata
         gpa,
         "/target-root",
         "--forcearch=x86_64",
-        "--repofrompath=vmiz-azurelinux-base,https://example.invalid/base",
+        "--repofrompath=miz-azurelinux-base,https://example.invalid/base",
         "--setopt=azurelinux-base.gpgkey=file:///key",
         "--setopt=azurelinux-base.baseurl=https://example.invalid/base",
         "--setopt=azurelinux-base.metalink=",
@@ -4453,14 +4453,14 @@ test "DNF install permits payload downloads without refreshing verified metadata
     try std.testing.expect(argvContains(argv, dnf_timeout_opt));
     try std.testing.expect(argvContains(argv, dnf_retries_opt));
     try std.testing.expect(argvContains(argv, "--disablerepo=*"));
-    try std.testing.expect(argvContains(argv, "--enablerepo=vmiz-azurelinux-base"));
+    try std.testing.expect(argvContains(argv, "--enablerepo=miz-azurelinux-base"));
     try std.testing.expectEqualStrings("install", argv[23]);
     try std.testing.expectEqualStrings("openssh-server", argv[24]);
     try std.testing.expectEqualStrings("sudo", argv[25]);
 }
 
 test "fresh full installroot defines the repository before transactions" {
-    const repofrompath = "--repofrompath=vmiz-azurelinux-base,https://example.invalid/base";
+    const repofrompath = "--repofrompath=miz-azurelinux-base,https://example.invalid/base";
     const makecache = dnfSeedMakecacheArgs(
         "--forcearch=x86_64",
         repofrompath,
@@ -4534,8 +4534,8 @@ test "architecture and argument parsing accepts only supported values" {
         (try parseArgs(&.{ "--architecture", "aarch64" })).architecture.?,
     );
     try std.testing.expectEqualStrings(
-        "zig-out/bin/vmizinit",
-        (try parseArgs(&.{ "--vmizinit", "zig-out/bin/vmizinit" })).vmizinit_path.?,
+        "zig-out/bin/mizinit",
+        (try parseArgs(&.{ "--mizinit", "zig-out/bin/mizinit" })).mizinit_path.?,
     );
     try std.testing.expectEqualStrings(
         "/usr/local/bin/sign-uki",
@@ -4644,17 +4644,17 @@ test "guest artifact architecture validation rejects mismatches" {
     ));
 }
 
-test "vmizinit rootfs layout requires relative command symlinks" {
+test "mizinit rootfs layout requires relative command symlinks" {
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "usr/bin/init", "usr/bin/poweroff", "usr/bin/reboot", "usr/bin/shutdown" },
-        &vmizinit_symlink_paths,
+        &mizinit_symlink_paths,
     );
 }
 
 test "generalized Gen2 layout uses the descriptor root role and GUID" {
     const gpa = std.testing.allocator;
-    const disk_size = try vmiz.parseSize("1184M");
+    const disk_size = try miz.parseSize("1184M");
     const cases = [_]*const ArchitectureDescriptor{ &x86_64, &aarch64 };
     for (cases) |architecture| {
         const planned = try planGeneralizedGen2Layout(gpa, disk_size, architecture, &core);
@@ -4666,7 +4666,7 @@ test "generalized Gen2 layout uses the descriptor root role and GUID" {
         try std.testing.expectEqual(architecture.root_role, planned[1].role);
         try std.testing.expectEqual(architecture.root_type_guid, planned[1].type_guid);
 
-        var actual = [_]vmiz.gpt.PartitionEntry{
+        var actual = [_]miz.gpt.PartitionEntry{
             .{
                 .partition_type_guid = planned[0].type_guid,
                 .first_lba = planned[0].firstLba(),
@@ -4684,7 +4684,7 @@ test "generalized Gen2 layout uses the descriptor root role and GUID" {
     }
     try std.testing.expectEqual(disk_size, @as(u64, 1184 * 1024 * 1024));
 
-    const full_size = try vmiz.parseSize(full.default_size);
+    const full_size = try miz.parseSize(full.default_size);
     for (cases) |architecture| {
         const planned = try planGeneralizedGen2Layout(gpa, full_size, architecture, &full);
         defer gpa.free(planned);
@@ -4704,23 +4704,23 @@ test "generalized Gen2 layout uses the descriptor root role and GUID" {
 
 test "generalized UKI command lines preserve core and constrain full" {
     const gpa = std.testing.allocator;
-    const root_guid = vmiz.guid.parse("11111111-2222-3333-4444-555555555555");
+    const root_guid = miz.guid.parse("11111111-2222-3333-4444-555555555555");
     const x86_cmdline = try expectedUkiCmdline(gpa, root_guid, &x86_64, &core);
     defer gpa.free(x86_cmdline);
     const arm_cmdline = try expectedUkiCmdline(gpa, root_guid, &aarch64, &core);
     defer gpa.free(arm_cmdline);
     try std.testing.expectEqualStrings(
-        "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=auto console=tty0 console=ttyS0,115200n8",
+        "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto console=tty0 console=ttyS0,115200n8",
         x86_cmdline,
     );
     try std.testing.expectEqualStrings(
-        "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=auto console=tty0 console=ttyAMA0,115200n8",
+        "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto console=tty0 console=ttyAMA0,115200n8",
         arm_cmdline,
     );
     try std.testing.expectEqualStrings("console=ttyS0,115200n8", x86_64.serial_console);
     try std.testing.expectEqualStrings("console=ttyAMA0,115200n8", aarch64.serial_console);
-    try std.testing.expect(std.mem.indexOf(u8, x86_cmdline, "vmizinit.shell=on") == null);
-    try std.testing.expect(std.mem.indexOf(u8, arm_cmdline, "vmizinit.shell=on") == null);
+    try std.testing.expect(std.mem.indexOf(u8, x86_cmdline, "mizinit.shell=on") == null);
+    try std.testing.expect(std.mem.indexOf(u8, arm_cmdline, "mizinit.shell=on") == null);
     try std.testing.expectEqualStrings("512M", core.esp_size_arg);
 
     const full_x86_cmdline = try expectedUkiCmdline(gpa, root_guid, &x86_64, &full);
@@ -4736,8 +4736,8 @@ test "generalized UKI command lines preserve core and constrain full" {
         full_arm_cmdline,
     );
     try std.testing.expect(std.mem.indexOf(u8, full_x86_cmdline, "init=") == null);
-    try std.testing.expect(std.mem.indexOf(u8, full_x86_cmdline, "vmizinit.") == null);
-    try std.testing.expect(std.mem.indexOf(u8, full_arm_cmdline, "vmizinit.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, full_x86_cmdline, "mizinit.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, full_arm_cmdline, "mizinit.") == null);
 }
 
 test "kernel asset compatibility requires matching ISO and installed releases" {

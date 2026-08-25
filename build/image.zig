@@ -1,8 +1,8 @@
 const std = @import("std");
-const customization_wire = @import("../packages/vmiz/src/customization_wire.zig");
-const customize = @import("../packages/vmiz/src/customize.zig");
-const preserved_image_wire = @import("../packages/vmiz/src/preserved_image_wire.zig");
-const limits_mod = @import("../packages/vmiz/src/limits.zig");
+const customization_wire = @import("../packages/miz/src/customization_wire.zig");
+const customize = @import("../packages/miz/src/customize.zig");
+const preserved_image_wire = @import("../packages/miz/src/preserved_image_wire.zig");
+const limits_mod = @import("../packages/miz/src/limits.zig");
 
 pub const Format = enum {
     raw,
@@ -428,7 +428,7 @@ pub fn add(
     validateOutputBasename(options.output.basename);
     const container: TrackedContainer = switch (options.input.container) {
         .oci_layout => |layout| blk: {
-            const validate = b.addRunArtifact(dependency.artifact("vmiz-input-validator"));
+            const validate = b.addRunArtifact(dependency.artifact("miz-input-validator"));
             validate.setName(b.fmt("validate OCI layout for {s}", .{options.name}));
             validate.addDirectoryArg(layout);
 
@@ -461,7 +461,7 @@ pub fn add(
         },
     };
 
-    const preflight = b.addRunArtifact(dependency.artifact("vmiz-image-builder"));
+    const preflight = b.addRunArtifact(dependency.artifact("miz-image-builder"));
     preflight.setName(b.fmt("preflight image {s}", .{options.name}));
     preflight.has_side_effects = true;
     configureRequest(b, preflight, options, container);
@@ -470,12 +470,12 @@ pub fn add(
     preflight.addArg("--bundle-output");
     const preflight_bundle = preflight.addOutputDirectoryArg(b.fmt("{s}-preflight-result", .{options.name}));
 
-    const preflight_check = b.addRunArtifact(dependency.artifact("vmiz-image-status-check"));
+    const preflight_check = b.addRunArtifact(dependency.artifact("miz-image-status-check"));
     preflight_check.setName(b.fmt("check image preflight {s}", .{options.name}));
     preflight_check.addDirectoryArg(preflight_bundle);
     preflight_check.addFileInput(preflight_bundle.path(b, "status"));
 
-    const run = b.addRunArtifact(dependency.artifact("vmiz-image-builder"));
+    const run = b.addRunArtifact(dependency.artifact("miz-image-builder"));
     run.setName(b.fmt("build image {s}", .{options.name}));
     run.has_side_effects = true;
     run.step.dependOn(&preflight_check.step);
@@ -486,7 +486,7 @@ pub fn add(
     run.addArg("--bundle-output");
     const bundle = run.addOutputDirectoryArg(b.fmt("{s}-result", .{options.name}));
 
-    const status_check = b.addRunArtifact(dependency.artifact("vmiz-image-status-check"));
+    const status_check = b.addRunArtifact(dependency.artifact("miz-image-status-check"));
     status_check.setName(b.fmt("check image result {s}", .{options.name}));
     status_check.addDirectoryArg(bundle);
     status_check.addFileInput(bundle.path(b, "status"));
@@ -516,7 +516,7 @@ pub fn addPreserved(
     const configuration = materializePreservedConfiguration(b, options) catch
         @panic("failed to materialize preserved-image configuration");
 
-    const preflight = b.addRunArtifact(dependency.artifact("vmiz-preserved-image-builder"));
+    const preflight = b.addRunArtifact(dependency.artifact("miz-preserved-image-builder"));
     preflight.setName(b.fmt("preflight preserved image {s}", .{options.name}));
     preflight.has_side_effects = true;
     configurePreservedRequest(b, preflight, options, configuration);
@@ -527,12 +527,12 @@ pub fn addPreserved(
         b.fmt("{s}-preserved-preflight-result", .{options.name}),
     );
 
-    const preflight_check = b.addRunArtifact(dependency.artifact("vmiz-image-status-check"));
+    const preflight_check = b.addRunArtifact(dependency.artifact("miz-image-status-check"));
     preflight_check.setName(b.fmt("check preserved image preflight {s}", .{options.name}));
     preflight_check.addDirectoryArg(preflight_bundle);
     preflight_check.addFileInput(preflight_bundle.path(b, "status"));
 
-    const run = b.addRunArtifact(dependency.artifact("vmiz-preserved-image-builder"));
+    const run = b.addRunArtifact(dependency.artifact("miz-preserved-image-builder"));
     run.setName(b.fmt("build preserved image {s}", .{options.name}));
     run.has_side_effects = true;
     run.step.dependOn(&preflight_check.step);
@@ -544,7 +544,7 @@ pub fn addPreserved(
         b.fmt("{s}-preserved-result", .{options.name}),
     );
 
-    const status_check = b.addRunArtifact(dependency.artifact("vmiz-image-status-check"));
+    const status_check = b.addRunArtifact(dependency.artifact("miz-image-status-check"));
     status_check.setName(b.fmt("check preserved image result {s}", .{options.name}));
     status_check.addDirectoryArg(bundle);
     status_check.addFileInput(bundle.path(b, "status"));

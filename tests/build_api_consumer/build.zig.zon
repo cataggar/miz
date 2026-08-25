@@ -1,11 +1,11 @@
 .{
-    .name = .vmiz_build_api_consumer,
+    .name = .miz_build_api_consumer,
     .version = "0.0.0",
-    .fingerprint = 0x87e5caf6ecaef426,
+    .fingerprint = 0xb6fbbecce26136c0,
     .minimum_zig_version = "0.16.0",
 
     .dependencies = .{
-        .vmiz = .{ .path = "../.." },
+        .miz = .{ .path = "../.." },
     },
 
     .paths = .{

@@ -1,12 +1,12 @@
-//! `vmiz create -f <format> [-o subformat=fixed|dynamic] <file> <size>`
+//! `miz create -f <format> [-o subformat=fixed|dynamic] <file> <size>`
 
 const std = @import("std");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 const opts = @import("opts.zig");
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
-    var format: ?vmiz.Format = null;
-    var options: vmiz.CreateOptions = .{};
+    var format: ?miz.Format = null;
+    var options: miz.CreateOptions = .{};
     var positional: [2][]const u8 = undefined;
     var positional_count: usize = 0;
 
@@ -16,7 +16,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         if (std.mem.eql(u8, a, "-f")) {
             i += 1;
             if (i >= args.len) return fail("create: -f requires a format argument", .{});
-            format = vmiz.Format.parseName(args[i]) orelse
+            format = miz.Format.parseName(args[i]) orelse
                 return fail("create: unknown format '{s}' (expected raw, vhd/vpc, vhdx, or qcow2)", .{args[i]});
         } else if (std.mem.eql(u8, a, "-o")) {
             i += 1;
@@ -31,15 +31,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     }
 
     if (positional_count != 2) {
-        return fail("usage: vmiz create -f <format> [-o subformat=fixed|dynamic] <file> <size>", .{});
+        return fail("usage: miz create -f <format> [-o subformat=fixed|dynamic] <file> <size>", .{});
     }
     const fmt = format orelse return fail("create: -f <format> is required", .{});
     const path = positional[0];
-    const size = vmiz.parseSize(positional[1]) catch |err|
+    const size = miz.parseSize(positional[1]) catch |err|
         return fail("create: invalid size '{s}': {s}", .{ positional[1], @errorName(err) });
 
     _ = gpa;
-    var img = vmiz.Image.create(io, path, fmt, size, options) catch |err|
+    var img = miz.Image.create(io, path, fmt, size, options) catch |err|
         return fail("create: failed to create '{s}': {s}", .{ path, @errorName(err) });
     img.close(io);
 

@@ -4,7 +4,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
     if (args.len != 2 and args.len != 4) {
-        std.debug.print("usage: vmiz-image-status-check <bundle> [<image-basename> <output>]\n", .{});
+        std.debug.print("usage: miz-image-status-check <bundle> [<image-basename> <output>]\n", .{});
         std.process.exit(2);
     }
 

@@ -106,7 +106,7 @@ pub const Recorder = struct {
         const failed = self.firstFailure();
         return std.json.Stringify.valueAlloc(self.allocator, .{
             .schema = @as(u32, 1),
-            .type = "vmiz-ubuntu2604-image-phase-timing",
+            .type = "miz-ubuntu2604-image-phase-timing",
             .clock = "monotonic",
             .duration_unit = "nanoseconds",
             .status = @tagName(status),
@@ -130,7 +130,7 @@ pub const Recorder = struct {
         defer self.allocator.free(json);
         const staged_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}.vmiz-timing-stage",
+            "{s}.miz-timing-stage",
             .{output_path},
         );
         defer self.allocator.free(staged_path);
@@ -252,7 +252,7 @@ test "schema serialization preserves stable ordering and completeness" {
         parsed.value.object.get("schema").?.integer,
     );
     try std.testing.expectEqualStrings(
-        "vmiz-ubuntu2604-image-phase-timing",
+        "miz-ubuntu2604-image-phase-timing",
         parsed.value.object.get("type").?.string,
     );
     try std.testing.expectEqualStrings(

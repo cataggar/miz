@@ -1,11 +1,11 @@
 //! Host-native entry point used by the exported `std.Build` `build/iso.zig`
-//! helper. Parses a `build-iso` request and drives `vmiz.build_iso.build`,
+//! helper. Parses a `build-iso` request and drives `miz.build_iso.build`,
 //! writing the generated ISO and a machine-readable report into a result
 //! bundle directory.
 
 const std = @import("std");
 const customization_loader = @import("customization_loader.zig");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 const ParsedArgs = struct {
     iso_path: []const u8,
@@ -14,20 +14,20 @@ const ParsedArgs = struct {
     bundle_output_path: []const u8,
     iso_basename: []const u8,
     rootfs_path_in_iso: ?[]const u8 = null,
-    nested_rootfs_path: []const u8 = vmiz.build_iso.default_nested_rootfs_path,
+    nested_rootfs_path: []const u8 = miz.build_iso.default_nested_rootfs_path,
     volume_id: ?[]const u8 = null,
     uefi_boot_image: ?[]const u8 = null,
     bios_boot_image: ?[]const u8 = null,
-    squashfs_compression: vmiz.squashfs.WriterCompression = .zstd,
+    squashfs_compression: miz.squashfs.WriterCompression = .zstd,
     skip_iso_rootfs: bool = false,
-    architecture: ?vmiz.bootconfig.Architecture = null,
+    architecture: ?miz.bootconfig.Architecture = null,
     ext4_label: []const u8 = "rootfs",
-    journal: vmiz.ext4.JournalOptions = .{},
+    journal: miz.ext4.JournalOptions = .{},
     root_selinux_label: ?[]const u8 = null,
     source_date_epoch: ?u32 = null,
     customization_config: ?[]const u8 = null,
     customization_sources: []const []const u8 = &.{},
-    limits: vmiz.limits.ImportLimits = .{},
+    limits: miz.limits.ImportLimits = .{},
     verbose: bool = false,
 };
 
@@ -38,12 +38,12 @@ pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(arena);
 
     const args = parseArgs(arena, argv[1..]) catch |err| {
-        std.debug.print("vmiz-iso-builder: {t}\n", .{err});
+        std.debug.print("miz-iso-builder: {t}\n", .{err});
         std.process.exit(2);
     };
 
     std.Io.Dir.cwd().createDirPath(io, args.bundle_output_path) catch |err| {
-        std.debug.print("vmiz-iso-builder: cannot create result bundle: {t}\n", .{err});
+        std.debug.print("miz-iso-builder: cannot create result bundle: {t}\n", .{err});
         std.process.exit(1);
     };
     const output_path = try std.fs.path.join(arena, &.{ args.bundle_output_path, args.iso_basename });
@@ -55,11 +55,11 @@ pub fn main(init: std.process.Init) !void {
         args.customization_config,
         args.customization_sources,
     ) catch |err| {
-        std.debug.print("vmiz-iso-builder: cannot load customization: {t}\n", .{err});
+        std.debug.print("miz-iso-builder: cannot load customization: {t}\n", .{err});
         std.process.exit(1);
     };
 
-    var boot_images_buf: [2]vmiz.build_iso.BootImage = undefined;
+    var boot_images_buf: [2]miz.build_iso.BootImage = undefined;
     var boot_images_len: usize = 0;
     if (args.uefi_boot_image) |path| {
         boot_images_buf[boot_images_len] = .{ .platform = .uefi, .image_path = path };
@@ -70,12 +70,12 @@ pub fn main(init: std.process.Init) !void {
         boot_images_len += 1;
     }
 
-    const determinism: ?vmiz.build_iso.Determinism = if (args.source_date_epoch) |epoch| .{
+    const determinism: ?miz.build_iso.Determinism = if (args.source_date_epoch) |epoch| .{
         .filesystem_timestamp = epoch,
         .root_filesystem_uuid = deriveUuid(epoch),
     } else null;
 
-    var report = vmiz.build_iso.build(gpa, io, .{
+    var report = miz.build_iso.build(gpa, io, .{
         .iso_path = args.iso_path,
         .container_path = args.container_path,
         .output_path = output_path,
@@ -96,13 +96,13 @@ pub fn main(init: std.process.Init) !void {
         .determinism = determinism,
         .verbose = args.verbose,
     }) catch |err| {
-        std.debug.print("vmiz-iso-builder: build failed: {t}\n", .{err});
+        std.debug.print("miz-iso-builder: build failed: {t}\n", .{err});
         std.process.exit(1);
     };
     defer report.deinit(gpa);
 
     writeReport(gpa, io, report_path, report) catch |err| {
-        std.debug.print("vmiz-iso-builder: cannot write report: {t}\n", .{err});
+        std.debug.print("miz-iso-builder: cannot write report: {t}\n", .{err});
         std.process.exit(1);
     };
 }
@@ -110,7 +110,7 @@ pub fn main(init: std.process.Init) !void {
 fn deriveUuid(epoch: u32) [16]u8 {
     var digest: [32]u8 = undefined;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("vmiz-build-iso-rootfs-uuid\x00");
+    hasher.update("miz-build-iso-rootfs-uuid\x00");
     var epoch_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &epoch_bytes, epoch, .little);
     hasher.update(&epoch_bytes);
@@ -140,7 +140,7 @@ fn writeReport(
     allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
-    report: vmiz.build_iso.BuildIsoReport,
+    report: miz.build_iso.BuildIsoReport,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -205,7 +205,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
             container_path = try nextArg(args, i);
         } else if (std.mem.eql(u8, arg, "--rootfs-size")) {
             i += 1;
-            rootfs_size = try vmiz.parseSize(try nextArg(args, i));
+            rootfs_size = try miz.parseSize(try nextArg(args, i));
         } else if (std.mem.eql(u8, arg, "--bundle-output")) {
             i += 1;
             bundle_output_path = try nextArg(args, i);
@@ -254,7 +254,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
             result.journal.enabled = true;
         } else if (std.mem.eql(u8, arg, "--journal-size")) {
             i += 1;
-            result.journal.size_bytes = try vmiz.parseSize(try nextArg(args, i));
+            result.journal.size_bytes = try miz.parseSize(try nextArg(args, i));
             result.journal.enabled = true;
         } else if (std.mem.eql(u8, arg, "--root-selinux-label")) {
             i += 1;
@@ -270,7 +270,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
             try sources.append(try nextArg(args, i));
         } else if (std.mem.eql(u8, arg, "--verbose")) {
             result.verbose = true;
-        } else if (vmiz.limits.limitForFlag(arg) != null) {
+        } else if (miz.limits.limitForFlag(arg) != null) {
             i += 1;
             _ = try result.limits.parseFlag(arg, try nextArg(args, i));
         } else {

@@ -13,7 +13,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{
                     .name = "package_family_host",
-                    .module = dependency.module("vmiz-package-family-host"),
+                    .module = dependency.module("miz-package-family-host"),
                 },
             },
         }),
