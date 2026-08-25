@@ -14,7 +14,7 @@ from scripts import ubuntu2604_release as release
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CERTIFICATE_DER = b"vmiz Ubuntu test certificate"
+CERTIFICATE_DER = b"miz Ubuntu test certificate"
 CERTIFICATE_SHA256 = hashlib.sha256(CERTIFICATE_DER).hexdigest()
 SIGNING_CERTIFICATE_SHA256 = "4" * 64
 OPERATION_ID = "00000000-0000-4000-8000-000000000001"
@@ -50,7 +50,7 @@ def fixed_vhd_footer(virtual_size: int) -> bytes:
     footer[:8] = b"conectix"
     struct.pack_into(">II", footer, 8, 2, 0x00010000)
     struct.pack_into(">Q", footer, 16, 0xFFFFFFFFFFFFFFFF)
-    footer[28:32] = b"vmiz"
+    footer[28:32] = b"miz\0"
     struct.pack_into(">I", footer, 32, 0x00010000)
     struct.pack_into(">QQ", footer, 40, virtual_size, virtual_size)
     struct.pack_into(">HBB", footer, 56, *fixed_vhd_geometry(virtual_size))
@@ -80,7 +80,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         production = builder.split('test "profiles pin', 1)[0]
         self.assertIn(
-            "vmiz.ext4_mountless.FileSystem.open",
+            "miz.ext4_mountless.FileSystem.open",
             production,
         )
         self.assertIn("exportHostTree", production)
@@ -124,10 +124,10 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
 
     def test_mountless_round_trip_uses_indexed_bulk_paths(self):
         root_tree = (
-            ROOT / "packages" / "vmiz" / "src" / "root_tree.zig"
+            ROOT / "packages" / "miz" / "src" / "root_tree.zig"
         ).read_text(encoding="utf-8")
         ext4_mountless = (
-            ROOT / "packages" / "vmiz" / "src" / "ext4_mountless.zig"
+            ROOT / "packages" / "miz" / "src" / "ext4_mountless.zig"
         ).read_text(encoding="utf-8")
         self.assertIn("path_index: std.StringHashMap(usize)", root_tree)
         self.assertIn("append_only_import = true", root_tree)
@@ -146,7 +146,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         self.assertEqual(production.count('"qemu-utils"'), 0)
         self.assertNotIn('"qemu-img", "convert"', production)
         self.assertIn(
-            "vmiz.qcow2.writeStandaloneCompressed",
+            "miz.qcow2.writeStandaloneCompressed",
             production,
         )
 
@@ -271,7 +271,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             )
         provenance_document = {
             "schema": 1,
-            "type": "vmiz-ubuntu2604-build-provenance",
+            "type": "miz-ubuntu2604-build-provenance",
             "architecture": architecture,
             "release": "26.04",
             "snapshot": {
@@ -339,18 +339,18 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         )
         signing = {
             "schema": 1,
-            "type": "vmiz-uki-signing",
+            "type": "miz-uki-signing",
             "architecture": architecture,
             "flavor": flavor,
             "signer_mode": "external-command",
             "certificate_sha256": certificate_sha256,
             "certificate_der_base64": base64.b64encode(certificate_der).decode(),
-            "certificate_details": "subject=CN=vmiz Ubuntu test signer",
+            "certificate_details": "subject=CN=miz Ubuntu test signer",
             "provider": {
                 "name": "azure-artifact-signing",
                 "endpoint": "https://wus.codesigning.azure.net",
                 "account": "cataggar",
-                "profile": "vmiz-uki",
+                "profile": "miz-uki",
                 "signing_certificate_sha256": signing_certificate_sha256,
             },
             "signature_verification": "success",
@@ -405,10 +405,10 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             json.dumps(
                 {
                     "schema": 1,
-                    "type": "vmiz-azure-vhd-conversion",
+                    "type": "miz-azure-vhd-conversion",
                     "key": key,
                     "status": "success",
-                    "tool": "vmiz",
+                    "tool": "miz",
                     "operation": "azure derive",
                     "source": {
                         "asset_name": asset_name,
@@ -525,7 +525,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         self.make_all()
         output, notes = self.stage()
         manifest = json.loads((output / "publish-manifest.json").read_text())
-        self.assertEqual(manifest["type"], "vmiz-ubuntu2604-release")
+        self.assertEqual(manifest["type"], "miz-ubuntu2604-release")
         self.assertEqual(manifest["source_commit"], self.source_commit)
         self.assertEqual(manifest["certificate_sha256"], CERTIFICATE_SHA256)
         self.assertEqual(
@@ -723,8 +723,8 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                 "key-only-ssh",
                 "local-ovf-azagent-skip-ready",
                 "azagent-provisioning",
-                "vmizinit-pid1",
-                "vmizinit-sshd-supervision",
+                "mizinit-pid1",
+                "mizinit-sshd-supervision",
                 "sshd-restart",
                 "persistent-provisioned-state",
                 "no-cloud-init",
@@ -782,7 +782,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                 "key-only-ssh",
                 "azagent-provisioning",
                 "agent-ready",
-                "vmizinit-pid1",
+                "mizinit-pid1",
                 "pid1-supervised-sshd",
                 "sshd-restart-reconnect",
                 "identity-persistence",

@@ -176,7 +176,7 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
             elapsed += 1
         return {
             "schema": 1,
-            "type": "vmiz-ubuntu2604-image-phase-timing",
+            "type": "miz-ubuntu2604-image-phase-timing",
             "clock": "monotonic",
             "duration_unit": "nanoseconds",
             "status": "success",
@@ -632,7 +632,7 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
             "raw_output": {
                 "format": "raw",
                 "virtual_size": benchmark.VIRTUAL_SIZE,
-                "structural_validation": "vmiz-check-and-info",
+                "structural_validation": "miz-check-and-info",
             },
             "provenance": {
                 "closure_sha256": "b" * 64,
@@ -707,7 +707,7 @@ class Ubuntu2604ImageBenchmarkTest(unittest.TestCase):
                         "format": "raw",
                         "bytes": benchmark.VIRTUAL_SIZE,
                         "virtual_size": benchmark.VIRTUAL_SIZE,
-                        "structural_validation": "vmiz-check-and-info",
+                        "structural_validation": "miz-check-and-info",
                         "byte_hash_recorded": False,
                         "byte_reproducibility_compared": False,
                         "retention_policy": "delete-after-validation",

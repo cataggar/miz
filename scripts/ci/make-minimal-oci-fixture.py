@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Builds a minimal, from-scratch OCI image layout for use as the
-`--container`/`VMIZ_BOOT_TEST_OCI` fixture in CI, without depending on
+`--container`/`MIZ_BOOT_TEST_OCI` fixture in CI, without depending on
 network access to a container registry.
 
 The resulting layout contains a single tiny layer (just a `/hello` text
-file) -- enough for `vmiz build-image` to have a valid OCI container to
+file) -- enough for `miz build-image` to have a valid OCI container to
 merge on top of the real ISO/squashfs rootfs, matching the "container
 becomes the effective root filesystem" documentation in
 `doc/image-building.md` without needing anything from it beyond
@@ -26,7 +26,7 @@ def main() -> int:
         return 2
 
     out_dir = sys.argv[1]
-    build_single_layer_oci_layout(out_dir, {"hello.txt": b"hello from vmiz CI\n"})
+    build_single_layer_oci_layout(out_dir, {"hello.txt": b"hello from miz CI\n"})
 
     print(f"built minimal OCI layout at {out_dir}")
     return 0

@@ -31,7 +31,7 @@ concurrency:
 jobs:
   prepare:
     name: resolve immutable main source
-    if: github.repository == 'cataggar/vmiz' && github.ref == 'refs/heads/main'
+    if: github.repository == 'cataggar/miz' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -190,11 +190,11 @@ jobs:
 
       - name: Run dual-instance QEMU acceptance
         env:
-          VMIZ_FREEBSD15_ARCHITECTURE: ${{ matrix.architecture }}
-          VMIZ_FREEBSD15_FILESYSTEM: ${{ matrix.filesystem }}
-          VMIZ_FREEBSD15_FLAVOR: ${{ matrix.flavor }}
-          VMIZ_FREEBSD15_IMAGE: ${{ github.workspace }}/${{ env.CANDIDATE_DIR }}/${{ env.ASSET_NAME }}
-          VMIZ_FREEBSD15_QEMU: ${{ matrix.qemu }}
+          MIZ_FREEBSD15_ARCHITECTURE: ${{ matrix.architecture }}
+          MIZ_FREEBSD15_FILESYSTEM: ${{ matrix.filesystem }}
+          MIZ_FREEBSD15_FLAVOR: ${{ matrix.flavor }}
+          MIZ_FREEBSD15_IMAGE: ${{ github.workspace }}/${{ env.CANDIDATE_DIR }}/${{ env.ASSET_NAME }}
+          MIZ_FREEBSD15_QEMU: ${{ matrix.qemu }}
         run: zig build test-freebsd15-boot
 
       - name: Record validated candidate
@@ -336,7 +336,7 @@ jobs:
           done
           az version --output json > /dev/null
 
-      - name: Build accepted-source vmiz
+      - name: Build accepted-source miz
         working-directory: release-source
         run: |
           set -euo pipefail
@@ -345,7 +345,7 @@ jobs:
           zig build --fetch \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           zig build -Doptimize=ReleaseSafe
-          test -x zig-out/bin/vmiz
+          test -x zig-out/bin/miz
 
       - name: Refresh Azure OIDC credential before acceptance
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
@@ -356,7 +356,7 @@ jobs:
 
       - name: Run exact-artifact Azure acceptance
         env:
-          VMIZ: ${{ github.workspace }}/release-source/zig-out/bin/vmiz
+          MIZ: ${{ github.workspace }}/release-source/zig-out/bin/miz
           RUN_ID_VALUE: ${{ github.run_id }}
           RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
         run: |
@@ -497,7 +497,7 @@ jobs:
       ${{
         always() &&
         inputs.validation_only == false &&
-        github.repository == 'cataggar/vmiz' &&
+        github.repository == 'cataggar/miz' &&
         github.ref == 'refs/heads/main' &&
         needs.prepare.result == 'success' &&
         needs.stage.result == 'success'

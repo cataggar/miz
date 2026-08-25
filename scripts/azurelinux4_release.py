@@ -306,7 +306,7 @@ def validate_signing_provenance(
 ) -> dict[str, object]:
     path = root / f"uki-signing-{flavor}-{architecture}.json"
     document = read_json(path)
-    if document.get("schema") != 1 or document.get("type") != "vmiz-uki-signing":
+    if document.get("schema") != 1 or document.get("type") != "miz-uki-signing":
         fail("invalid UKI signing provenance schema")
     if document.get("architecture") != architecture or document.get("flavor") != flavor:
         fail("UKI signing provenance architecture/flavor mismatch")
@@ -841,7 +841,7 @@ def stage_command(args: argparse.Namespace) -> None:
             "",
             "The **full** images boot systemd and use cloud-init for account/key provisioning, "
             "WALinuxAgent for Azure Ready/extensions, and `sshd.service`. The **core** images "
-            "boot `vmizinit`, provision through `azagent`, and directly supervise OpenSSH. "
+            "boot `mizinit`, provision through `azagent`, and directly supervise OpenSSH. "
             "Core therefore requires a public SSH key in the Azure provisioning profile.",
             "",
             "Acceptance required signed UKIs, Azure Trusted Launch with Secure Boot and vTPM, "

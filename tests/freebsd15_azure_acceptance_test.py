@@ -836,13 +836,13 @@ def test_candidate_is_revalidated_before_result_generation():
 def test_ownership_tags_use_freebsd15():
     with open(SCRIPT) as f:
         content = f.read()
-    assert "vmiz-owner=freebsd15-release" in content
+    assert "miz-owner=freebsd15-release" in content
 
 
 def test_resource_group_prefix():
     with open(SCRIPT) as f:
         content = f.read()
-    assert 'vmiz-fb15-${GITHUB_RUN_ID}' in content
+    assert 'miz-fb15-${GITHUB_RUN_ID}' in content
 
 
 def test_contracts_set():
@@ -1321,7 +1321,7 @@ def test_gallery_definition_and_version_precede_provisioned_vm():
         < replication_wait
         < vm_create
     )
-    assert "image_publisher=vmiz" in content
+    assert "image_publisher=miz" in content
     assert "image_offer=freebsd15" in content
     assert 'image_sku="${short_arch}-${FILESYSTEM}-${FLAVOR}"' in content
     assert "--permissions" not in content[gallery_create:definition_create]
@@ -1453,9 +1453,9 @@ def test_owned_resource_group_cleanup_removes_gallery_disk_and_vm():
         '${short_arch}${FILESYSTEM}${FLAVOR}"'
         in content
     )
-    assert 'gallery_name="vmizfb15${name_seed}"' in content
+    assert 'gallery_name="mizfb15${name_seed}"' in content
     assert (
-        'image_definition_name="vmizfb15${short_arch}${FILESYSTEM}${FLAVOR}"'
+        'image_definition_name="mizfb15${short_arch}${FILESYSTEM}${FLAVOR}"'
         in content
     )
     assert 'image_version=1.0.0' in content
@@ -2046,5 +2046,5 @@ def test_validation_only_zfs_never_reaches_publication():
     content = _workflow_content()
     publish = content[content.index("\n  publish:") :]
     assert "inputs.validation_only == false" in publish
-    assert "github.repository == 'cataggar/vmiz'" in publish
+    assert "github.repository == 'cataggar/miz'" in publish
     assert "github.ref == 'refs/heads/main'" in publish

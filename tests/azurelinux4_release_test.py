@@ -15,7 +15,7 @@ from scripts import azurelinux4_release as release
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_CERTIFICATE_DER = b"vmiz test certificate DER"
+TEST_CERTIFICATE_DER = b"miz test certificate DER"
 TEST_CERTIFICATE_SHA256 = hashlib.sha256(TEST_CERTIFICATE_DER).hexdigest()
 TEST_SIGNING_CERTIFICATE_SHA256 = "4" * 64
 TEST_SIGNING_OPERATION_ID = "00000000-0000-4000-8000-000000000001"
@@ -55,7 +55,7 @@ def fixed_vhd_footer(virtual_size: int, disk_type: int = 2) -> bytes:
     footer[:8] = b"conectix"
     struct.pack_into(">II", footer, 8, 2, 0x00010000)
     struct.pack_into(">Q", footer, 16, 0xFFFFFFFFFFFFFFFF)
-    footer[28:32] = b"vmiz"
+    footer[28:32] = b"miz\0"
     struct.pack_into(">I", footer, 32, 0x00010000)
     struct.pack_into(">QQ", footer, 40, virtual_size, virtual_size)
     struct.pack_into(">HBB", footer, 56, *fixed_vhd_geometry(virtual_size))
@@ -106,24 +106,24 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         )
         signing = {
             "schema": 1,
-            "type": "vmiz-uki-signing",
+            "type": "miz-uki-signing",
             "architecture": architecture,
             "flavor": flavor,
             "signer_mode": "external-command",
             "certificate_sha256": certificate_sha256,
             "certificate_der_base64": base64.b64encode(certificate_der).decode(),
-            "certificate_details": "subject=CN=vmiz test signer",
+            "certificate_details": "subject=CN=miz test signer",
             "provider": {
                 "name": "azure-artifact-signing",
                 "endpoint": "https://wus.codesigning.azure.net",
                 "account": "cataggar",
-                "profile": "vmiz-uki",
+                "profile": "miz-uki",
                 "signing_certificate_sha256": signing_certificate_sha256,
             },
             "signature_verification": "success",
             "files": [
                 {
-                    "path": f"EFI/Linux/vmiz-{key}.efi",
+                    "path": f"EFI/Linux/miz-{key}.efi",
                     "unsigned_sha256": "2" * 64,
                     "signed_sha256": "3" * 64,
                     "finalized_sha256": "3" * 64,
@@ -799,7 +799,7 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertNotIn("vendor/zig-bzip2", acceptance)
         self.assertNotIn("--build-file", acceptance)
         self.assertIn(
-            "VMIZ: ${{ github.workspace }}/release-source/zig-out/bin/vmiz",
+            "MIZ: ${{ github.workspace }}/release-source/zig-out/bin/miz",
             acceptance,
         )
         manifest = (ROOT / "build.zig.zon").read_text()
@@ -949,7 +949,7 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertEqual(workflow.count("name: build + test"), 1)
         self.assertIn(
             "grep -n 'std\\.process\\.spawn' "
-            "packages/vmiz/src/package_family.zig",
+            "packages/miz/src/package_family.zig",
             workflow,
         )
         self.assertIn(
@@ -1007,10 +1007,10 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertIn("environment: azurelinux4-signing", workflow)
         self.assertNotIn("AZURELINUX4_UKI_SIGN_COMMAND", workflow)
         self.assertIn(
-            "UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/vmiz",
+            "UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/miz",
             workflow,
         )
-        self.assertIn("zig build install-vmiz", workflow)
+        self.assertIn("zig build install-miz", workflow)
         self.assertIn("tests/efi_signing_probe.zig", workflow)
         self.assertIn('"$UKI_SIGN_COMMAND" sign', workflow)
         self.assertIn(
@@ -1030,16 +1030,16 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertNotIn("/.signing-probe-", workflow)
         self.assertIn("--uki-sign-command \"$UKI_SIGN_COMMAND\"", workflow)
         self.assertIn("--uki-sign-command-arg sign", workflow)
-        self.assertIn("VMIZ_AZURE_TENANT_ID", workflow)
-        self.assertIn("VMIZ_AZURE_CLIENT_ID", workflow)
-        self.assertIn("VMIZ_ARTIFACT_SIGNING_ENDPOINT", workflow)
-        self.assertIn("VMIZ_ARTIFACT_SIGNING_ACCOUNT", workflow)
-        self.assertIn("VMIZ_ARTIFACT_SIGNING_PROFILE", workflow)
-        self.assertNotIn("VMIZ_AZURE_KEY_ID", workflow)
+        self.assertIn("MIZ_AZURE_TENANT_ID", workflow)
+        self.assertIn("MIZ_AZURE_CLIENT_ID", workflow)
+        self.assertIn("MIZ_ARTIFACT_SIGNING_ENDPOINT", workflow)
+        self.assertIn("MIZ_ARTIFACT_SIGNING_ACCOUNT", workflow)
+        self.assertIn("MIZ_ARTIFACT_SIGNING_PROFILE", workflow)
+        self.assertNotIn("MIZ_AZURE_KEY_ID", workflow)
         self.assertNotIn("--uki-signing-key", workflow)
         self.assertIn("python3-virt-firmware", workflow)
         # Signing, certificate fingerprinting, and Secure Boot verification are
-        # fully native (vmiz uki ...); the external OpenSSL/sbsigntool toolchain
+        # fully native (miz uki ...); the external OpenSSL/sbsigntool toolchain
         # must no longer appear anywhere in the production release workflow.
         self.assertNotIn("sbsigntool", workflow)
         self.assertNotIn("sbverify", workflow)
@@ -1091,10 +1091,10 @@ class AzureLinuxReleaseTest(unittest.TestCase):
 
     def test_azure_linux_guide_distinguishes_full_and_core_images(self):
         guide = (ROOT / "doc/azure-linux.md").read_text()
-        self.assertIn("| PID 1 | systemd | `vmizinit` |", guide)
+        self.assertIn("| PID 1 | systemd | `mizinit` |", guide)
         self.assertIn("| Default virtual size | 5 GiB | 1184 MiB |", guide)
         self.assertIn(
-            "released Azure core images use `vmizinit.mode=persistent`",
+            "released Azure core images use `mizinit.mode=persistent`",
             guide,
         )
         self.assertIn(
@@ -1106,7 +1106,7 @@ class AzureLinuxReleaseTest(unittest.TestCase):
     def test_root_readme_is_a_short_documentation_landing_page(self):
         readme = (ROOT / "README.md").read_text()
         headings = [line for line in readme.splitlines() if line.startswith("#")]
-        self.assertEqual(headings, ["# vmiz", "## Install", "## Documentation"])
+        self.assertEqual(headings, ["# miz", "## Install", "## Documentation"])
         self.assertLess(len(readme.splitlines()), 60)
         self.assertIn("[Documentation index](doc/readme.md)", readme)
 
@@ -1146,11 +1146,11 @@ class AzureLinuxReleaseTest(unittest.TestCase):
             package_family,
         )
 
-        cosi = (ROOT / "packages/vmiz/src/cosi.zig").read_text()
+        cosi = (ROOT / "packages/miz/src/cosi.zig").read_text()
         self.assertIn("standard `.raw.zst` members", cosi)
         self.assertNotIn("small built-in encoder", cosi)
 
-        output = (ROOT / "packages/vmiz/src/output.zig").read_text()
+        output = (ROOT / "packages/miz/src/output.zig").read_text()
         self.assertIn("`zstd` emits a standard", output)
         self.assertNotIn("in-tree\n/// encoder", output)
         self.assertNotIn("much smaller encoder", output)

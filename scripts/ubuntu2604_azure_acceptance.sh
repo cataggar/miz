@@ -33,7 +33,7 @@ cleanup_group() {
   local resource_group metadata_file group_exists expected_resource_group suffix
   resource_group=$(<"$STATE_FILE")
   suffix=${CANDIDATE_KEY//_/-}
-  expected_resource_group="vmiz-u2604-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
+  expected_resource_group="miz-u2604-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
   [[ "$resource_group" == "$expected_resource_group" ]] || {
     echo "::error::Refusing cleanup of unexpected resource-group name"
     return 1
@@ -62,10 +62,10 @@ import sys
 
 tags = json.load(open(sys.argv[1], encoding="utf-8")).get("tags") or {}
 expected = {
-    "vmiz-owner": "ubuntu2604-release",
-    "vmiz-run-id": sys.argv[2],
-    "vmiz-run-attempt": sys.argv[3],
-    "vmiz-candidate": sys.argv[4],
+    "miz-owner": "ubuntu2604-release",
+    "miz-run-id": sys.argv[2],
+    "miz-run-attempt": sys.argv[3],
+    "miz-candidate": sys.argv[4],
 }
 if tags != expected:
     raise SystemExit(f"refusing to delete resource group with non-exact ownership tags: {tags!r}")
@@ -90,7 +90,7 @@ fi
 
 if [[ -z ${CANDIDATE_DIR:-} || -z ${SOURCE_COMMIT:-} || -z ${ARCHITECTURE:-} ||
       -z ${FLAVOR:-} || -z ${ASSET_NAME:-} || -z ${AZURE_LOCATION:-} ||
-      -z ${AZURE_VM_SIZE:-} || -z ${RESULT_DIR:-} || -z ${VMIZ:-} ||
+      -z ${AZURE_VM_SIZE:-} || -z ${RESULT_DIR:-} || -z ${MIZ:-} ||
       -z ${GITHUB_STEP_SUMMARY:-} ]]; then
   echo "::error::Azure acceptance configuration is incomplete"
   exit 1
@@ -104,7 +104,7 @@ then
 fi
 [[ "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ ]]
 [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
-[[ -x "$VMIZ" ]]
+[[ -x "$MIZ" ]]
 [[ -r "$RELEASE_SCHEMA" ]]
 if [[ "$FLAVOR" == core ]]; then
   if [[ -z ${BINDER_PROBE:-} ]]; then
@@ -119,31 +119,31 @@ if [[ "$FLAVOR" == core ]]; then
   # required, digest-bound external inputs supplied at acceptance time. A
   # missing input fails closed here, before any Azure resource is created,
   # rather than silently skipping the Android container smoke contract.
-  if [[ -z ${VMIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT:-} ||
-        -z ${VMIZ_UBUNTU2604_ANDROID_RUNTIME:-} ||
-        -z ${VMIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256:-} ||
-        -z ${VMIZ_UBUNTU2604_ANDROID_BUNDLE:-} ||
-        -z ${VMIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256:-} ||
-        -z ${VMIZ_UBUNTU2604_ANDROID_CONFIG_SHA256:-} ]]; then
+  if [[ -z ${MIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT:-} ||
+        -z ${MIZ_UBUNTU2604_ANDROID_RUNTIME:-} ||
+        -z ${MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256:-} ||
+        -z ${MIZ_UBUNTU2604_ANDROID_BUNDLE:-} ||
+        -z ${MIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256:-} ||
+        -z ${MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256:-} ]]; then
     echo "::error::Core Azure acceptance requires digest-bound external Android container smoke inputs"
     exit 1
   fi
-  [[ "$VMIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-  [[ "$VMIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256" =~ ^[0-9a-f]{64}$ ]]
-  [[ "$VMIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
-  [[ "$VMIZ_UBUNTU2604_ANDROID_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]]
-  [[ -f "$VMIZ_UBUNTU2604_ANDROID_RUNTIME" ]] || {
+  [[ "$MIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+  [[ "$MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256" =~ ^[0-9a-f]{64}$ ]]
+  [[ "$MIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+  [[ "$MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]]
+  [[ -f "$MIZ_UBUNTU2604_ANDROID_RUNTIME" ]] || {
     echo "::error::Android container runtime artifact is absent"
     exit 1
   }
-  [[ -f "$VMIZ_UBUNTU2604_ANDROID_BUNDLE" ]] || {
+  [[ -f "$MIZ_UBUNTU2604_ANDROID_BUNDLE" ]] || {
     echo "::error::Android container bundle artifact is absent"
     exit 1
   }
-  android_runtime_sha256=$(sha256sum "$VMIZ_UBUNTU2604_ANDROID_RUNTIME" | awk '{print $1}')
-  test "$android_runtime_sha256" = "$VMIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256"
-  android_bundle_sha256=$(sha256sum "$VMIZ_UBUNTU2604_ANDROID_BUNDLE" | awk '{print $1}')
-  test "$android_bundle_sha256" = "$VMIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256"
+  android_runtime_sha256=$(sha256sum "$MIZ_UBUNTU2604_ANDROID_RUNTIME" | awk '{print $1}')
+  test "$android_runtime_sha256" = "$MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256"
+  android_bundle_sha256=$(sha256sum "$MIZ_UBUNTU2604_ANDROID_BUNDLE" | awk '{print $1}')
+  test "$android_bundle_sha256" = "$MIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256"
 fi
 
 report_error() {
@@ -326,15 +326,15 @@ certificate_der_base64=${signing_identity[2]}
 [[ "$fallback_uki_sha256" =~ ^[0-9a-f]{64}$ ]]
 
 suffix=${CANDIDATE_KEY//_/-}
-resource_group="vmiz-u2604-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
+resource_group="miz-u2604-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
 short_arch=${ARCHITECTURE/x86_64/x64}
 name_seed="${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}${short_arch}${FLAVOR}"
-disk_name="vmiz-os-${name_seed}"
-data_disk_name="vmiz-data-${name_seed}"
-gallery_name="vmizu2604${name_seed}"
-image_name="vmizu2604${short_arch}${FLAVOR}"
-vm_name="vmiz-vm-${name_seed}"
-admin_username=vmiztest
+disk_name="miz-os-${name_seed}"
+data_disk_name="miz-data-${name_seed}"
+gallery_name="mizu2604${name_seed}"
+image_name="mizu2604${short_arch}${FLAVOR}"
+vm_name="miz-vm-${name_seed}"
+admin_username=miztest
 vhd="$RESULT_DIR/${CANDIDATE_KEY}.vhd"
 private_key="$RESULT_DIR/id_ed25519"
 boot_log="$RESULT_DIR/boot.log"
@@ -397,10 +397,10 @@ if ! az group create \
   --name "$resource_group" \
   --location "$AZURE_LOCATION" \
   --tags \
-    vmiz-owner=ubuntu2604-release \
-    "vmiz-run-id=$GITHUB_RUN_ID" \
-    "vmiz-run-attempt=$GITHUB_RUN_ATTEMPT" \
-    "vmiz-candidate=$CANDIDATE_KEY" \
+    miz-owner=ubuntu2604-release \
+    "miz-run-id=$GITHUB_RUN_ID" \
+    "miz-run-attempt=$GITHUB_RUN_ATTEMPT" \
+    "miz-candidate=$CANDIDATE_KEY" \
   --output json >/dev/null
 then
   echo "::error::Failed to create the persisted temporary resource group"
@@ -454,7 +454,7 @@ PY
 
 source_before=$(sha256sum "$asset" | awk '{print $1}')
 test "$source_before" = "$qcow_sha256"
-"$VMIZ" azure derive \
+"$MIZ" azure derive \
   --input-sha256 "$qcow_sha256" \
   --expected-virtual-size "$virtual_size" \
   "$asset" \
@@ -508,10 +508,10 @@ if type(qemu_virtual_size) is not int:
 qemu_info_sha256 = hashlib.sha256(open(info_path, "rb").read()).hexdigest()
 document = {
     "schema": 1,
-    "type": "vmiz-azure-vhd-conversion",
+    "type": "miz-azure-vhd-conversion",
     "key": key,
     "status": "success",
-    "tool": "vmiz",
+    "tool": "miz",
     "operation": "azure derive",
     "source": {
         "asset_name": asset_name,
@@ -583,7 +583,7 @@ az sig image-definition create \
   --resource-group "$resource_group" \
   --gallery-name "$gallery_name" \
   --gallery-image-definition "$image_name" \
-  --publisher vmiz \
+  --publisher miz \
   --offer ubuntu2604 \
   --sku "${short_arch}-${FLAVOR}" \
   --os-type Linux \
@@ -696,7 +696,7 @@ if state != "Succeeded":
 PY
 [[ "$image_version_id" == /subscriptions/* ]]
 
-ssh-keygen -q -t ed25519 -N '' -C vmiz-azure-acceptance -f "$private_key"
+ssh-keygen -q -t ed25519 -N '' -C miz-azure-acceptance -f "$private_key"
 az vm create \
   --resource-group "$resource_group" \
   --name "$vm_name" \
@@ -843,7 +843,7 @@ trap 'guest_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 original_size=$1
 runtime_arch=$2
 release_arch=$3
-test "$(id -un)" = vmiztest
+test "$(id -un)" = miztest
 test "$(uname -m)" = "$runtime_arch"
 sshd_config=$(sudo -n /usr/sbin/sshd -T)
 grep -Fxq 'passwordauthentication no' <<<"$sshd_config"
@@ -954,7 +954,7 @@ fi
 GUEST
 
 if [[ "$FLAVOR" == core ]]; then
-  binder_probe_remote=/home/vmiztest/.vmiz-binder-probe
+  binder_probe_remote=/home/miztest/.miz-binder-probe
   binder_probe_sha256=$(sha256sum "$BINDER_PROBE" | awk '{print $1}')
   base64 -w0 "$BINDER_PROBE" | ssh "${ssh_options[@]}" "$ssh_target" \
     "/usr/bin/bash -s -- '$binder_probe_remote'" <<'GUEST'
@@ -999,9 +999,9 @@ sudo -n /usr/bin/chmod 0755 "$probe"
 for device in binder hwbinder vndbinder; do
   sudo -n "$probe" version "$binderfs_mount/$device"
 done
-sudo -n "$probe" alloc "$binderfs_mount/binder-control" vmiz-acceptance-probe
-sudo -n "$probe" version "$binderfs_mount/vmiz-acceptance-probe"
-sudo -n /usr/bin/rm -f -- "$binderfs_mount/vmiz-acceptance-probe" "$probe"
+sudo -n "$probe" alloc "$binderfs_mount/binder-control" miz-acceptance-probe
+sudo -n "$probe" version "$binderfs_mount/miz-acceptance-probe"
+sudo -n /usr/bin/rm -f -- "$binderfs_mount/miz-acceptance-probe" "$probe"
 GUEST
 fi
 
@@ -1018,7 +1018,7 @@ guest_error() {
 }
 trap 'guest_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 has_resource_disk=$1
-sudo -n /usr/bin/test /proc/1/exe -ef /sbin/vmizinit
+sudo -n /usr/bin/test /proc/1/exe -ef /sbin/mizinit
 test -x /usr/sbin/azagent
 test -s /var/lib/azagent/provisioned
 test "$(cat /var/lib/azagent/provisioned)" = "$(cat /etc/hostname)"
@@ -1089,13 +1089,13 @@ fi
 ! mountpoint -q /mnt
 test -s /etc/machine-id
 test -s /etc/ssh/ssh_host_ed25519_key.pub
-test -s /home/vmiztest/.ssh/authorized_keys
+test -s /home/miztest/.ssh/authorized_keys
 machine_id=$(cat /etc/machine-id)
 read -r _ host_key_fingerprint _ < <(
   /usr/bin/ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256
 )
 read -r authorized_keys_sha256 _ < <(
-  sha256sum /home/vmiztest/.ssh/authorized_keys
+  sha256sum /home/miztest/.ssh/authorized_keys
 )
 read -r sentinel_sha256 _ < <(
   sha256sum /var/lib/azagent/provisioned
@@ -1134,8 +1134,8 @@ else
   ssh "${ssh_options[@]}" "$ssh_target" '/usr/bin/bash -s' <<'GUEST'
 set -euo pipefail
 sudo -n /usr/bin/test /proc/1/exe -ef /usr/lib/systemd/systemd
-test ! -e /sbin/vmizinit
-test ! -e /usr/bin/vmizinit
+test ! -e /sbin/mizinit
+test ! -e /usr/bin/mizinit
 test "$( . /etc/os-release; printf '%s' "$ID")" = ubuntu
 test "$( . /etc/os-release; printf '%s' "$VERSION_ID")" = 26.04
 for unit in cloud-init-local.service cloud-init.service cloud-config.service cloud-final.service walinuxagent.service ssh.service systemd-networkd.service; do
@@ -1178,7 +1178,7 @@ if [[ "$FLAVOR" == core ]]; then
   android_runtime_remote=/tmp/ubuntu2604-android-runtime
   android_bundle_archive_remote=/tmp/ubuntu2604-android-bundle.tar
   android_bundle_remote_dir=/tmp/ubuntu2604-android-bundle
-  android_container_id=vmiz-android-smoke
+  android_container_id=miz-android-smoke
   android_poll_interval=5
   android_boot_timeout=240
   android_stop_timeout=60
@@ -1251,7 +1251,7 @@ except Exception:
     return 1
   }
 
-  base64 -w0 "$VMIZ_UBUNTU2604_ANDROID_RUNTIME" | ssh "${ssh_options[@]}" "$ssh_target" \
+  base64 -w0 "$MIZ_UBUNTU2604_ANDROID_RUNTIME" | ssh "${ssh_options[@]}" "$ssh_target" \
     "/usr/bin/bash -s -- '$android_runtime_remote'" <<'GUEST'
 set -euo pipefail
 remote=$1
@@ -1266,7 +1266,7 @@ GUEST
   )
   test "$android_runtime_remote_sha256" = "$android_runtime_sha256"
 
-  base64 -w0 "$VMIZ_UBUNTU2604_ANDROID_BUNDLE" | ssh "${ssh_options[@]}" "$ssh_target" \
+  base64 -w0 "$MIZ_UBUNTU2604_ANDROID_BUNDLE" | ssh "${ssh_options[@]}" "$ssh_target" \
     "/usr/bin/bash -s -- '$android_bundle_archive_remote'" <<'GUEST'
 set -euo pipefail
 remote=$1
@@ -1296,7 +1296,7 @@ GUEST
     "sudo -n cat -- '$android_bundle_remote_dir/config.json'" \
     >"$android_config_json_file"
   test "$(sha256sum "$android_config_json_file" | awk '{print $1}')" = \
-    "$VMIZ_UBUNTU2604_ANDROID_CONFIG_SHA256"
+    "$MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256"
   python3 - "$android_config_json_file" <<'PY'
 import json
 import sys
@@ -1367,19 +1367,19 @@ if [[ "$FLAVOR" == core ]]; then
   readarray -t rebooted_identity < <(
     ssh "${ssh_options[@]}" "$ssh_target" '/usr/bin/bash -s' <<'GUEST'
 set -euo pipefail
-sudo -n /usr/bin/test /proc/1/exe -ef /sbin/vmizinit
+sudo -n /usr/bin/test /proc/1/exe -ef /sbin/mizinit
 test -s /var/lib/azagent/provisioned
 test "$(cat /var/lib/azagent/provisioned)" = "$(cat /etc/hostname)"
 test -s /etc/machine-id
 test -s /etc/ssh/ssh_host_ed25519_key.pub
-test -s /home/vmiztest/.ssh/authorized_keys
+test -s /home/miztest/.ssh/authorized_keys
 test ! -d /run/systemd/system
 machine_id=$(cat /etc/machine-id)
 read -r _ host_key_fingerprint _ < <(
   /usr/bin/ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256
 )
 read -r authorized_keys_sha256 _ < <(
-  sha256sum /home/vmiztest/.ssh/authorized_keys
+  sha256sum /home/miztest/.ssh/authorized_keys
 )
 read -r sentinel_sha256 _ < <(
   sha256sum /var/lib/azagent/provisioned
@@ -1476,8 +1476,8 @@ for _ in {1..6}; do
 done
 if [[ -s "$boot_log" ]]; then
   if [[ "$FLAVOR" == core ]]; then
-    grep -Fq '[vmizinit] VMIZINIT_PID1_READY supervisor loop active' "$boot_log"
-    grep -Fq '[vmizinit] azagent completed successfully' "$boot_log"
+    grep -Fq '[mizinit] MIZINIT_PID1_READY supervisor loop active' "$boot_log"
+    grep -Fq '[mizinit] azagent completed successfully' "$boot_log"
     ! grep -Eiq 'anbox|binder_linux:.*(verification failed|taint)' "$boot_log"
   fi
   if [[ "$ARCHITECTURE" == aarch64 ]]; then
@@ -1491,10 +1491,10 @@ fi
 android_smoke_args=()
 if [[ "$FLAVOR" == core ]]; then
   android_smoke_args=(
-    --android-smoke-source-commit "$VMIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT"
+    --android-smoke-source-commit "$MIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT"
     --android-smoke-runtime-sha256 "$android_runtime_sha256"
     --android-smoke-bundle-sha256 "$android_bundle_sha256"
-    --android-smoke-config-sha256 "$VMIZ_UBUNTU2604_ANDROID_CONFIG_SHA256"
+    --android-smoke-config-sha256 "$MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256"
   )
 fi
 python3 "$RELEASE_SCHEMA" azure-result \
@@ -1538,7 +1538,7 @@ test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
     echo "- Binder device probe SHA-256: \`$binder_probe_sha256\`"
     echo "- Android container smoke: runtime SHA-256 \`$android_runtime_sha256\`;" \
       "bundle SHA-256 \`$android_bundle_sha256\`;" \
-      "source commit \`$VMIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT\`"
+      "source commit \`$MIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT\`"
   fi
   echo "- Contracts: \`$azure_contract_list\`"
 } >>"$GITHUB_STEP_SUMMARY"

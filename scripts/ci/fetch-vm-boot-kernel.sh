@@ -24,7 +24,7 @@
 #   <prefix>KERNEL=<path>
 #   <prefix>MODULES_BUILTIN=<path>
 # which can be appended straight to "$GITHUB_ENV". The prefix defaults to
-# `VMIZ_VM_BOOT_`.
+# `MIZ_VM_BOOT_`.
 
 set -euo pipefail
 
@@ -37,7 +37,7 @@ if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then
 fi
 destination="$1"
 requested_architecture="${2:-$(uname -m)}"
-prefix="${3:-VMIZ_VM_BOOT_}"
+prefix="${3:-MIZ_VM_BOOT_}"
 
 case "$requested_architecture" in
     x86_64 | amd64) rpm_architecture="x86_64" ;;
@@ -72,7 +72,7 @@ if [ ! -f "$kernel_path" ] || [ ! -f "$modules_builtin_path" ]; then
     # native cpio reader rejects malformed metadata and unsafe paths.
     cpio_path="${destination}/${rpm_name}.cpio"
     rpm2cpio "$rpm_path" > "$cpio_path"
-    zig run packages/vmiz/src/cpio_extract.zig -- "$cpio_path" "$destination" \
+    zig run packages/miz/src/cpio_extract.zig -- "$cpio_path" "$destination" \
         "./boot/vmlinuz-${kernel_version}" \
         "./lib/modules/${kernel_version}/modules.builtin"
     rm -f "$rpm_path" "$cpio_path"

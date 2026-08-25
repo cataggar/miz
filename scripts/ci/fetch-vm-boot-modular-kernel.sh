@@ -25,7 +25,7 @@
 #   <prefix>MODULES_BUILTIN=<path>
 #   <prefix>MODULE_TREE=<path>
 # which can be appended straight to "$GITHUB_ENV". The prefix defaults to
-# `VMIZ_VM_BOOT_`.
+# `MIZ_VM_BOOT_`.
 
 set -euo pipefail
 
@@ -39,7 +39,7 @@ if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then
 fi
 destination="$1"
 requested_architecture="${2:-$(uname -m)}"
-prefix="${3:-VMIZ_VM_BOOT_}"
+prefix="${3:-MIZ_VM_BOOT_}"
 
 case "$requested_architecture" in
     x86_64 | amd64) debian_architecture="amd64" ;;
