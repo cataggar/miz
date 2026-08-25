@@ -5,10 +5,13 @@ import json
 import os
 import re
 import shutil
+import stat
 import struct
 import tarfile
 import types
 import unittest
+import warnings
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -100,11 +103,8 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
 
     def test_android_smoke_secret_is_exact_and_https(self):
         value = {
-            "provenance_url": "https://artifacts.example.invalid/provenance.json",
-            "runz_url": "https://artifacts.example.invalid/runz",
-            "redroid_bundle_url": (
-                "https://artifacts.example.invalid/redroid-bundle.tar"
-            ),
+            "artifact_url": "https://artifacts.example.invalid/artifact.zip",
+            "artifact_sha256": "9" * 64,
             "provenance_sha256": "0" * 64,
         }
         self.assertEqual(
@@ -113,10 +113,17 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         )
         mutations = (
             {**value, "unexpected": "value"},
-            {key: item for key, item in value.items() if key != "runz_url"},
-            {**value, "runz_url": "http://artifacts.example.invalid/runz"},
-            {**value, "runz_url": "https://user@artifacts.example.invalid/runz"},
-            {**value, "runz_url": "https://artifacts.example.invalid:bad/runz"},
+            {key: item for key, item in value.items() if key != "artifact_url"},
+            {**value, "artifact_url": "http://artifacts.example.invalid/artifact.zip"},
+            {
+                **value,
+                "artifact_url": "https://user@artifacts.example.invalid/artifact.zip",
+            },
+            {
+                **value,
+                "artifact_url": "https://artifacts.example.invalid:bad/artifact.zip",
+            },
+            {**value, "artifact_sha256": "F" * 64},
             {**value, "provenance_sha256": "F" * 64},
         )
         for mutation in mutations:
@@ -182,17 +189,17 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        artifact = inputs / "artifact.zip"
+        with zipfile.ZipFile(artifact, "w") as archive:
+            archive.write(runz, "runz")
+            archive.write(bundle, "redroid-bundle.tar")
+            archive.write(provenance, "provenance.json")
         urls = {
-            "https://artifacts.example.invalid/provenance.json": provenance,
-            "https://artifacts.example.invalid/runz": runz,
-            "https://artifacts.example.invalid/redroid-bundle.tar": bundle,
+            "https://artifacts.example.invalid/artifact.zip": artifact,
         }
         secret = {
-            "provenance_url": next(iter(urls)),
-            "runz_url": "https://artifacts.example.invalid/runz",
-            "redroid_bundle_url": (
-                "https://artifacts.example.invalid/redroid-bundle.tar"
-            ),
+            "artifact_url": next(iter(urls)),
+            "artifact_sha256": release.sha256(artifact),
             "provenance_sha256": release.sha256(provenance),
         }
         downloads: list[str] = []
@@ -222,7 +229,8 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         ):
             release.prepare_android_smoke_inputs_command(args)
 
-        self.assertEqual(downloads, list(urls))
+        self.assertEqual(downloads, [secret["artifact_url"]])
+        self.assertFalse((output_dir / "artifact.zip").exists())
         exported = github_env.read_text(encoding="utf-8")
         self.assertIn(
             f"MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256={release.sha256(provenance)}",
@@ -244,22 +252,19 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         ):
             self.assertNotIn(private, exported)
 
-    def test_prepare_android_smoke_inputs_checks_manifest_digest_before_downloads(self):
+    def test_prepare_android_smoke_inputs_checks_archive_digest_before_extraction(self):
         output_dir = self.root / "private-inputs"
         github_env = self.root / "github-env"
         secret = {
-            "provenance_url": "https://artifacts.example.invalid/provenance.json",
-            "runz_url": "https://artifacts.example.invalid/runz",
-            "redroid_bundle_url": (
-                "https://artifacts.example.invalid/redroid-bundle.tar"
-            ),
+            "artifact_url": "https://artifacts.example.invalid/artifact.zip",
+            "artifact_sha256": "0" * 64,
             "provenance_sha256": "0" * 64,
         }
         downloads: list[str] = []
 
-        def write_bad_manifest(url, destination, token, **_kwargs):
+        def write_bad_archive(url, destination, token, **_kwargs):
             downloads.append(url)
-            destination.write_text("{}", encoding="utf-8")
+            destination.write_bytes(b"not the expected archive")
 
         args = types.SimpleNamespace(
             architecture="x86_64",
@@ -273,13 +278,105 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         ), mock.patch.object(
             release,
             "_download_private_https",
-            side_effect=write_bad_manifest,
-        ):
+            side_effect=write_bad_archive,
+        ), mock.patch.object(release, "_extract_android_smoke_archive") as extract:
             with self.assertRaises(SystemExit):
                 release.prepare_android_smoke_inputs_command(args)
-        self.assertEqual(downloads, [secret["provenance_url"]])
+        self.assertEqual(downloads, [secret["artifact_url"]])
+        extract.assert_not_called()
         self.assertFalse(output_dir.exists())
         self.assertFalse(github_env.exists())
+
+    def test_prepare_android_smoke_inputs_checks_provenance_digest_before_parsing(self):
+        artifact = self.root / "artifact.zip"
+        with zipfile.ZipFile(artifact, "w") as archive:
+            archive.writestr("runz", b"runz")
+            archive.writestr("redroid-bundle.tar", b"bundle")
+            archive.writestr("provenance.json", b"{}")
+        secret = {
+            "artifact_url": "https://artifacts.example.invalid/artifact.zip",
+            "artifact_sha256": release.sha256(artifact),
+            "provenance_sha256": "0" * 64,
+        }
+        output_dir = self.root / "private-inputs"
+        github_env = self.root / "github-env"
+        args = types.SimpleNamespace(
+            architecture="x86_64",
+            output_dir=output_dir,
+            github_env=github_env,
+        )
+
+        def copy_archive(url, destination, token, **_kwargs):
+            shutil.copyfile(artifact, destination)
+
+        with mock.patch.dict(
+            os.environ,
+            {release.ANDROID_SMOKE_INPUT_ENV: json.dumps(secret)},
+            clear=False,
+        ), mock.patch.object(
+            release,
+            "_download_private_https",
+            side_effect=copy_archive,
+        ), mock.patch.object(release, "parse_android_smoke_provenance") as parse:
+            with self.assertRaises(SystemExit):
+                release.prepare_android_smoke_inputs_command(args)
+        parse.assert_not_called()
+        self.assertFalse(output_dir.exists())
+        self.assertFalse(github_env.exists())
+
+    def test_android_smoke_archive_rejects_nonexact_and_unsafe_members(self):
+        normal = {
+            "runz": b"runz",
+            "redroid-bundle.tar": b"bundle",
+            "provenance.json": b"provenance",
+        }
+        cases = {
+            "missing": tuple(normal)[:-1],
+            "extra": (*normal, "extra"),
+            "traversal": ("../runz", "redroid-bundle.tar", "provenance.json"),
+            "directory": ("runz/", "redroid-bundle.tar", "provenance.json"),
+            "duplicate": (
+                "runz",
+                "runz",
+                "redroid-bundle.tar",
+                "provenance.json",
+            ),
+        }
+        for label, names in cases.items():
+            with self.subTest(label=label):
+                archive_path = self.root / f"{label}.zip"
+                output = self.root / f"{label}-output"
+                output.mkdir()
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    with zipfile.ZipFile(archive_path, "w") as archive:
+                        for name in names:
+                            archive.writestr(name, normal.get(name, b"unsafe"))
+                with self.assertRaises(SystemExit):
+                    release._extract_android_smoke_archive(archive_path, output)
+                self.assertEqual(list(output.iterdir()), [])
+
+        for label, file_type in (
+            ("symlink", stat.S_IFLNK),
+            ("fifo", stat.S_IFIFO),
+            ("directory-type", stat.S_IFDIR),
+        ):
+            with self.subTest(label=label):
+                archive_path = self.root / f"{label}.zip"
+                output = self.root / f"{label}-output"
+                output.mkdir()
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    for name, data in normal.items():
+                        member = zipfile.ZipInfo(name)
+                        member.create_system = 3
+                        member.external_attr = (
+                            (file_type if name == "runz" else stat.S_IFREG)
+                            | 0o600
+                        ) << 16
+                        archive.writestr(member, data)
+                with self.assertRaises(SystemExit):
+                    release._extract_android_smoke_archive(archive_path, output)
+                self.assertEqual(list(output.iterdir()), [])
 
     def test_package_root_uses_native_mountless_ext4_round_trip(self):
         builder = (

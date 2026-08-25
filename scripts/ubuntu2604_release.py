@@ -11,7 +11,9 @@ import json
 import os
 import re
 import shutil
+import stat
 import tarfile
+import zipfile
 from pathlib import Path
 from urllib import request
 from urllib.parse import urljoin, urlsplit
@@ -267,10 +269,14 @@ ANDROID_SMOKE_FIELDS = {
     "candidate_key",
 }
 ANDROID_SMOKE_SECRET_FIELDS = {
-    "provenance_url",
-    "runz_url",
-    "redroid_bundle_url",
+    "artifact_url",
+    "artifact_sha256",
     "provenance_sha256",
+}
+ANDROID_SMOKE_ARCHIVE_MEMBERS = {
+    "runz",
+    "redroid-bundle.tar",
+    "provenance.json",
 }
 ANDROID_SMOKE_PROVENANCE_FIELDS = {
     "schema",
@@ -345,17 +351,13 @@ def parse_android_smoke_secret(value: object) -> dict[str, str]:
     if not isinstance(document, dict) or set(document) != ANDROID_SMOKE_SECRET_FIELDS:
         fail("architecture-specific Android smoke input secret has unexpected fields")
     return {
-        "provenance_url": require_private_https_url(
-            document.get("provenance_url"),
-            "Android smoke provenance URL",
+        "artifact_url": require_private_https_url(
+            document.get("artifact_url"),
+            "Android smoke artifact URL",
         ),
-        "runz_url": require_private_https_url(
-            document.get("runz_url"),
-            "Android smoke runz URL",
-        ),
-        "redroid_bundle_url": require_private_https_url(
-            document.get("redroid_bundle_url"),
-            "Android smoke bundle URL",
+        "artifact_sha256": require_sha256(
+            document.get("artifact_sha256"),
+            "Android smoke archive digest",
         ),
         "provenance_sha256": require_sha256(
             document.get("provenance_sha256"),
@@ -407,6 +409,34 @@ def parse_android_smoke_provenance(
             "Android smoke config digest",
         ),
     }
+
+
+def _extract_android_smoke_archive(archive_path: Path, output_dir: Path) -> None:
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            members = archive.infolist()
+            names = [member.filename for member in members]
+            if (
+                len(names) != len(ANDROID_SMOKE_ARCHIVE_MEMBERS)
+                or set(names) != ANDROID_SMOKE_ARCHIVE_MEMBERS
+            ):
+                fail("Android smoke archive member set is not exact")
+            for member in members:
+                mode = (member.external_attr >> 16) & 0xFFFF
+                file_type = stat.S_IFMT(mode)
+                if (
+                    member.is_dir()
+                    or member.flag_bits & 0x1
+                    or file_type not in (0, stat.S_IFREG)
+                ):
+                    fail("Android smoke archive contains an unsafe member")
+            for member in members:
+                destination = output_dir / member.filename
+                with archive.open(member) as source, destination.open("xb") as output:
+                    os.chmod(destination, 0o600)
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        fail("Android smoke archive is malformed")
 
 
 def _url_origin(value: str) -> tuple[str, str, int]:
@@ -509,13 +539,20 @@ def prepare_android_smoke_inputs_command(args: argparse.Namespace) -> None:
         fail("Android smoke input directory already exists")
     output_dir.mkdir(parents=True, mode=0o700)
     try:
-        provenance_path = output_dir / "provenance.json"
+        archive_path = output_dir / "artifact.zip"
         _download_private_https(
-            secret["provenance_url"],
-            provenance_path,
+            secret["artifact_url"],
+            archive_path,
             token,
-            max_bytes=ANDROID_SMOKE_MANIFEST_MAX_BYTES,
         )
+        if sha256(archive_path) != secret["artifact_sha256"]:
+            fail("Android smoke archive digest mismatch")
+        _extract_android_smoke_archive(archive_path, output_dir)
+        archive_path.unlink()
+
+        provenance_path = output_dir / "provenance.json"
+        if provenance_path.stat().st_size > ANDROID_SMOKE_MANIFEST_MAX_BYTES:
+            fail("Android smoke provenance manifest exceeds size bound")
         provenance_sha256 = sha256(provenance_path)
         if provenance_sha256 != secret["provenance_sha256"]:
             fail("Android smoke provenance digest mismatch")
@@ -530,14 +567,8 @@ def prepare_android_smoke_inputs_command(args: argparse.Namespace) -> None:
 
         runtime_path = output_dir / "runz"
         bundle_path = output_dir / "redroid-bundle.tar"
-        _download_private_https(secret["runz_url"], runtime_path, token)
         if sha256(runtime_path) != provenance["runz_sha256"]:
             fail("Android smoke runz digest mismatch")
-        _download_private_https(
-            secret["redroid_bundle_url"],
-            bundle_path,
-            token,
-        )
         if sha256(bundle_path) != provenance["bundle_sha256"]:
             fail("Android smoke bundle digest mismatch")
         if _android_bundle_config_sha256(bundle_path) != provenance["config_sha256"]:

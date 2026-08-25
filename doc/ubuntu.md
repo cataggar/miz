@@ -820,14 +820,19 @@ so no prebuilt probe binary is stored or published.
 Both the native-QEMU and Azure matrices select one of two plain repository
 secrets before acceptance: `ANDROID_SMOKE_X86_64_JSON` or
 `ANDROID_SMOKE_AARCH64_JSON`. Each secret is an exact JSON object with
-`provenance_url`, `runz_url`, `redroid_bundle_url`, and
-`provenance_sha256`; all three locations must be HTTPS and the digest must be
-lowercase SHA-256. The manifest must use the exact external producer
-schema/type and field set enforced by `scripts/ubuntu2604_release.py`, match
-the selected architecture, and provide valid runtime, bundle, source
-manifest, and extracted `config.json` digests. The complete manifest digest
-is verified before the document is parsed, and its artifact digests then
-verify both downloaded files and the bundle config.
+`artifact_url`, `artifact_sha256`, and `provenance_sha256`. The location must
+be HTTPS and both digests must be lowercase SHA-256. The complete archive
+digest is verified before extraction. Its ZIP member set must then be
+exactly `runz`, `redroid-bundle.tar`, and `provenance.json`, with no
+directories, links, duplicate or additional entries, traversal names,
+encrypted entries, or non-regular file types.
+
+The extracted manifest digest is verified before the document is parsed.
+The manifest must use the exact external producer schema/type and field set
+enforced by `scripts/ubuntu2604_release.py`, match the selected architecture,
+and provide valid runtime, bundle, source manifest, and extracted
+`config.json` digests. Those artifact digests then verify both extracted
+files and the bundle config.
 
 These secrets are deliberately not scoped to the `ubuntu2604-release`
 environment, so the native-QEMU job -- which needs no Azure credential --
