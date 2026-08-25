@@ -2,21 +2,22 @@
 
 ## Goal
 
-Build a fixed, 1 MiB-aligned Azure-compatible VHD from the
-[Azure Linux 4.0 ISO](https://aka.ms/azurelinux-4.0-x86_64.iso) plus a
-container image, ready to upload as an Azure managed disk and run as a VM.
-See [Image building](image-building.md) for the implemented format,
-filesystem, container, boot, `vmiz build-image`, `vmiz build-iso`, and
-`vmiz recustomize-iso` workflows.
+Build reproducible disk images for bare-metal systems and virtual machines.
+The reference workflows include Azure-compatible VHDs built from the
+[Azure Linux 4.0 ISO](https://aka.ms/azurelinux-4.0-x86_64.iso), Ubuntu
+bare-metal images, and locally bootable QEMU images. See
+[Image building](image-building.md) for the implemented format, filesystem,
+container, boot, `miz build-image`, `miz build-iso`, and
+`miz recustomize-iso` workflows.
 
 ## Layout
 
 ```
-vmiz/
+miz/
   build.zig               # top-level build graph
   build.zig.zon            # package manifest
   packages/
-    vmiz/                   # the core disk-image library
+    miz/                   # the core disk-image library
       src/
         root.zig             # public API surface
         image.zig            # format-agnostic Image (open/create/read/write,
@@ -80,12 +81,12 @@ vmiz/
                               #   label, PV header, metadata area, volume
                               #   group text, extent-to-offset mapping
         azure.zig              # 1 MiB alignment + Gen1/Gen2 partition-style
-                              #   checks (backs `vmiz azure fixup`)
+                              #   checks (backs `miz azure fixup`)
         deprovision.zig        # offline image generalization: resets
                               #   hostname/SSH host keys/machine-id/DHCP
                               #   state (+ optional user removal) directly
                               #   via ext4.Editor (backs
-                              #   `vmiz azure deprovision`; issue #110)
+                              #   `miz azure deprovision`; issue #110)
         tar.zig                # minimal private USTAR reader/writer shared by
                               #   OCI layer ingestion and COSI packaging
         zstd.zig               # zstd support shared by COSI, SquashFS,
@@ -132,7 +133,7 @@ vmiz/
                               #   can see the target root
         formats.zig           # Format enum (raw, vhd, vhdx, qcow2)
         size.zig              # qemu-img-style size suffix parsing (K/M/G/T)
-  vmizguest/
+  mizguest/
     main.zig                # the guest agent: a static, libc-free PID 1 that
                               #   runs inside the image's own initramfs on the
                               #   `vm` backend, applies the control document
@@ -151,33 +152,33 @@ vmiz/
     oci.zig                 # `addOciPull`: pull a layout beside a build
   cli/
     src/
-      main.zig               # `vmiz` executable entry point
-      image_builder.zig      # `vmiz-image-builder`: turns declared arguments
+      main.zig               # `miz` executable entry point
+      image_builder.zig      # `miz-image-builder`: turns declared arguments
                               #   into a customize request; pins a registry
                               #   tag before the request is built
-      iso_builder.zig        # `vmiz-iso-builder`: host driver for the exported
-                              #   addIso build helper (`vmiz.build_iso.build`)
-      recustomize_iso_builder.zig  # `vmiz-recustomize-iso-builder`: host driver
+      iso_builder.zig        # `miz-iso-builder`: host driver for the exported
+                              #   addIso build helper (`miz.build_iso.build`)
+      recustomize_iso_builder.zig  # `miz-recustomize-iso-builder`: host driver
                               #   for the exported addRecustomize helper
-                              #   (`vmiz.recustomize_iso.build`)
+                              #   (`miz.recustomize_iso.build`)
       commands/
-        create.zig            # `vmiz create`
-        info.zig              # `vmiz info`
-        convert.zig           # `vmiz convert`
-        write.zig             # Linux block-device writer (`vmiz write`)
-        resize.zig            # `vmiz resize`
-        check.zig             # `vmiz check`
-        map.zig               # `vmiz map`
+        create.zig            # `miz create`
+        info.zig              # `miz info`
+        convert.zig           # `miz convert`
+        write.zig             # Linux block-device writer (`miz write`)
+        resize.zig            # `miz resize`
+        check.zig             # `miz check`
+        map.zig               # `miz map`
         azure.zig             # Azure fixed-VHD derivation/readiness helpers
-        cosi.zig              # `vmiz cosi`
-        oci.zig               # `vmiz oci` transport and bundle commands
-        build_image.zig       # `vmiz build-image`
-        build_iso.zig         # `vmiz build-iso`
-        recustomize_iso.zig   # `vmiz recustomize-iso`
-        qemu.zig              # `vmiz qemu`
+        cosi.zig              # `miz cosi`
+        oci.zig               # `miz oci` transport and bundle commands
+        build_image.zig       # `miz build-image`
+        build_iso.zig         # `miz build-iso`
+        recustomize_iso.zig   # `miz recustomize-iso`
+        qemu.zig              # `miz qemu`
         opts.zig              # shared `-o subformat=...` parsing
-  vmizinit/                  # minimal PID 1 for real-boot testing of
-                              #   --skip-iso-rootfs images (see vmizinit/README.md)
+  mizinit/                  # minimal PID 1 for real-boot testing of
+                              #   --skip-iso-rootfs images (see mizinit/README.md)
   qmp/                      # native Zig QEMU Machine Protocol (QMP) client,
                               #   MIT licensed (see qmp/README.md)
   qemu/
@@ -188,7 +189,7 @@ vmiz/
   qcow2/                    # native Zig qcow2 reader/writer, MIT licensed
                               #   (see qcow2/README.md -- a separate,
                               #   standalone implementation from
-                              #   packages/vmiz/src/qcow2.zig, kept for its
+                              #   packages/miz/src/qcow2.zig, kept for its
                               #   CLI + qemu-img cross-validation
                               #   methodology; see issue #96)
   wireserver/
@@ -231,7 +232,7 @@ vmiz/
                               #   build-image output (Gen1/Gen2, --verity,
                               #   --boot-mode uki); driven by qmp, skips
                               #   gracefully when qemu-system-x86_64, OVMF, or
-                              #   the VMIZ_BOOT_TEST_* fixture env vars aren't
+                              #   the MIZ_BOOT_TEST_* fixture env vars aren't
                               #   available
     freebsd15_boot.zig
                               #   opt-in generalized FreeBSD acceptance under
@@ -287,20 +288,20 @@ Four steps, cheapest first:
   ghr install cataggar/qemu@v11.0.91-z.15
   scripts/ci/fetch-vm-boot-kernel.sh fixtures/vm-boot-kernel
 
-  VMIZ_RUN_VM_BOOT_TEST=1 \
-  VMIZ_VM_BOOT_KERNEL=... VMIZ_VM_BOOT_MODULES_BUILTIN=... \
-  VMIZ_VM_QEMU=$(readlink -f "$(command -v qemu-system-$(uname -m))") \
+  MIZ_RUN_VM_BOOT_TEST=1 \
+  MIZ_VM_BOOT_KERNEL=... MIZ_VM_BOOT_MODULES_BUILTIN=... \
+  MIZ_VM_QEMU=$(readlink -f "$(command -v qemu-system-$(uname -m))") \
     zig build test-vm-real-boot
   ```
 
-  `VMIZ_VM_ACCEL` defaults to `software`, because no hosted runner class
+  `MIZ_VM_ACCEL` defaults to `software`, because no hosted runner class
   guarantees `/dev/kvm` and a test that demands one is a test that quietly
-  stops running. `VMIZ_VM_BOOT_WORKDIR` (default `/tmp`) moves the workspace,
+  stops running. `MIZ_VM_BOOT_WORKDIR` (default `/tmp`) moves the workspace,
   which needs room for two copies of the image.
-- The same test with `VMIZ_VM_BOOT_ARCH` naming the *other* architecture is the
+- The same test with `MIZ_VM_BOOT_ARCH` naming the *other* architecture is the
   cross-architecture acceptance test: the kernel, the guest agent and the
   binary the guest executes are all the guest's, and only the emulator is the
-  host's. Pass the matching `VMIZ_VM_QEMU` and a kernel for that architecture.
+  host's. Pass the matching `MIZ_VM_QEMU` and a kernel for that architecture.
   One `cataggar/qemu` ghr install supplies every `qemu-system-*`.
 
 - `zig build test-vm-firmware-boot` runs `tests/vm_firmware_boot.zig`, which
@@ -312,19 +313,19 @@ Four steps, cheapest first:
   ```
   ghr install cataggar/qemu@v11.0.91-z.15
 
-  VMIZ_RUN_VM_FIRMWARE_TEST=1 \
-  VMIZ_VM_FIRMWARE_IMAGE=/path/to/bootable.raw \
-  VMIZ_VM_FIRMWARE_MARKER='Welcome to Azure Linux' \
-  VMIZ_VM_QEMU=$(readlink -f "$(command -v qemu-system-$(uname -m))") \
+  MIZ_RUN_VM_FIRMWARE_TEST=1 \
+  MIZ_VM_FIRMWARE_IMAGE=/path/to/bootable.raw \
+  MIZ_VM_FIRMWARE_MARKER='Welcome to Azure Linux' \
+  MIZ_VM_QEMU=$(readlink -f "$(command -v qemu-system-$(uname -m))") \
     zig build test-vm-firmware-boot
   ```
 
-  With `VMIZ_VM_FIRMWARE_CODE`/`VMIZ_VM_FIRMWARE_VARS` unset, the firmware is
-  resolved through the same `qemu_host` search `vmiz qemu` uses, so the
+  With `MIZ_VM_FIRMWARE_CODE`/`MIZ_VM_FIRMWARE_VARS` unset, the firmware is
+  resolved through the same `qemu_host` search `miz qemu` uses, so the
   resolution path a real build takes is exercised too. Set
-  `VMIZ_VM_FIRMWARE_ARCH` to the other architecture for the cross-architecture
-  case, `VMIZ_VM_FIRMWARE_SECURE_BOOT=1` for the Secure Boot wiring, and
-  `VMIZ_VM_FIRMWARE_TIMEOUT` to change the 1800-second budget. The image is
+  `MIZ_VM_FIRMWARE_ARCH` to the other architecture for the cross-architecture
+  case, `MIZ_VM_FIRMWARE_SECURE_BOOT=1` for the Secure Boot wiring, and
+  `MIZ_VM_FIRMWARE_TIMEOUT` to change the 1800-second budget. The image is
   attested in place and the test fails if a single byte of it changed, which is
   the read-only claim checked against a real emulator rather than a stand-in.
 
@@ -342,7 +343,7 @@ cover both halves of that sentence:
   kernel this project's own images run.
 - `fetch-vm-boot-modular-kernel.sh` fetches a Debian *generic* kernel, which
   modularizes `ext4`, `virtio_blk`, `virtio_scsi`, `sd_mod` and `virtio_pci`.
-  Pointing `VMIZ_VM_BOOT_MODULE_TREE` at the tree it prints stages that tree
+  Pointing `MIZ_VM_BOOT_MODULE_TREE` at the tree it prints stages that tree
   into the synthetic image, so the guest reaches its root only if the backend
   resolved the dependency closure, appended the modules to the initramfs and
   inserted them in order. With the variable unset the test behaves exactly as

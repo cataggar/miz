@@ -23,64 +23,64 @@ squashfs rootfs images discovered inside squashfs payloads (matching LiveOS
 media such as Azure Linux 4.0), local OCI container image ingestion, a minimal
 native ext4 writer/readback library API, a bounded native XFS v5
 writer/readback library selectable as the root output filesystem, COSI output packaging, a
-`vmiz build-image` orchestration path that builds `raw`, fixed-`vhd`, `vhdx`,
-and `qcow2` disk images from an ISO + local OCI layout, a `vmiz build-iso`
+`miz build-image` orchestration path that builds `raw`, fixed-`vhd`, `vhdx`,
+and `qcow2` disk images from an ISO + local OCI layout, a `miz build-iso`
 path that regenerates a customized **LiveOS ISO** from an ISO + local OCI
 layout (a deterministic ext4 `rootfs.img` wrapped in a native SquashFS at the
 LiveOS payload path, folded back into a regenerated ISO with recreated El
-Torito boot entries), and a strict `vmiz recustomize-iso` path that takes the
+Torito boot entries), and a strict `miz recustomize-iso` path that takes the
 source ISO as authoritative -- preserving its directory tree, node
 metadata/timestamps, volume metadata, and El Torito catalog and replacing only
 the LiveOS payload, or refusing with a precise diagnostic when the source uses
 a feature the native writer cannot losslessly reproduce:
 
 ```
-vmiz create -f vhd disk.vhd 32M                          # dynamic by default (matches qemu-img)
-vmiz create -f vhd -o subformat=fixed disk.vhd 32M       # required for Azure managed-disk upload
-vmiz info disk.vhd
-vmiz info --output=json disk.vhd
-vmiz convert -f raw -O vhd -o subformat=dynamic disk.img disk.vhd
-vmiz convert -f raw -O vhdx disk.img disk.vhdx
-vmiz convert -f vhdx -O vhd -o subformat=fixed disk.vhdx disk.vhd  # import a VHDX (e.g. Hyper-V export)
-vmiz convert -O raw.gz disk.qcow2 disk.raw.gz    # compressed while writing, never a full raw on disk
-vmiz convert -O raw.gz -o - disk.qcow2 - | ssh host 'cat > disk.raw.gz'
-vmiz write --allow-device-write image.qcow2 <block-device>  # Linux: preflight, confirm, write, flush, refresh partitions
-vmiz write --allow-device-write --yes image.vhdx <block-device>  # non-interactive acknowledgement
-vmiz write --allow-device-write --grow-root image.raw <block-device>  # also grow GPT root + ext4 offline
-vmiz write --allow-device-write --expect-serial <serial> image.raw <block-device>  # require the writable disk's exact sysfs serial
-vmiz resize disk.vhdx +4G
-vmiz resize disk.vhd +4G
-vmiz check disk.vhd
-vmiz map disk.vhd
-vmiz azure derive --input-sha256 <hex> input.qcow2 output.vhd  # transactional aligned Gen2 VHD + GPT relocation
-vmiz azure fixup disk.vhd                     # Gen2 default; fixed VHD is padded and checked in place
-vmiz azure fixup disk.qcow2                   # converts to disk.vhd, then pads and checks for Gen2
-vmiz azure fixup --generation 1 legacy.vhd   # explicit legacy BIOS/MBR validation
-vmiz azure deprovision disk.vhd                    # generalize: reset hostname/SSH host keys/machine-id/DHCP state
-vmiz azure deprovision --user azureuser disk.vhd   # also removes that user account + its home directory
-vmiz azure deprovision --allow-device-write /dev/sda  # generalize an installed system in place on a block device
-vmiz info /dev/sda                           # inspect a block device (Linux); devices are read-only by default
-vmiz cosi disk.img -o disk.cosi              # tar + metadata.json + per-partition raw.zst
-vmiz build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.vhd  # Gen2 default
-vmiz build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.raw -O raw
-vmiz build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.vhdx -O vhdx
-vmiz build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.qcow2 -O qcow2
-vmiz build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.raw.gz -O raw.gz
-vmiz build-image --iso azurelinux.iso --container ./oci-layout --size 384M --skip-iso-rootfs -o output-minimal.raw -O raw
-vmiz build-image --iso azurelinux.iso --container ./oci-layout --size 4G --verity -o output.vhd
-vmiz build-image --iso azurelinux.iso --container ./oci-layout --size 4G --boot-mode uki --esp-size 512M -o output-uki.vhd
-vmiz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G -o output-live.iso                 # regenerate a customized LiveOS ISO
-vmiz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --uefi-boot-image boot/grub2/efiboot.img -o output-live.iso
-vmiz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --source-date-epoch 1735689600 -o output-live.iso   # byte-for-byte reproducible
-vmiz recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G -o recustomized.iso                          # strict preserve-or-refuse ISO rewrite
-vmiz recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --source-date-epoch 1735689600 -o recustomized.iso  # reproducible; source catalog/volume preserved
-vmiz capture --source /dev/sda -O vhd -o captured.vhd   # rebuild an installed system, sized to its content
-vmiz capture --source disk.qcow2 --source-root gpt:2 -O raw -o captured.raw --dry-run
-vmiz qemu AzureLinux
-vmiz qemu AzureLinux --snapshot
+miz create -f vhd disk.vhd 32M                          # dynamic by default (matches qemu-img)
+miz create -f vhd -o subformat=fixed disk.vhd 32M       # required for Azure managed-disk upload
+miz info disk.vhd
+miz info --output=json disk.vhd
+miz convert -f raw -O vhd -o subformat=dynamic disk.img disk.vhd
+miz convert -f raw -O vhdx disk.img disk.vhdx
+miz convert -f vhdx -O vhd -o subformat=fixed disk.vhdx disk.vhd  # import a VHDX (e.g. Hyper-V export)
+miz convert -O raw.gz disk.qcow2 disk.raw.gz    # compressed while writing, never a full raw on disk
+miz convert -O raw.gz -o - disk.qcow2 - | ssh host 'cat > disk.raw.gz'
+miz write --allow-device-write image.qcow2 <block-device>  # Linux: preflight, confirm, write, flush, refresh partitions
+miz write --allow-device-write --yes image.vhdx <block-device>  # non-interactive acknowledgement
+miz write --allow-device-write --grow-root image.raw <block-device>  # also grow GPT root + ext4 offline
+miz write --allow-device-write --expect-serial <serial> image.raw <block-device>  # require the writable disk's exact sysfs serial
+miz resize disk.vhdx +4G
+miz resize disk.vhd +4G
+miz check disk.vhd
+miz map disk.vhd
+miz azure derive --input-sha256 <hex> input.qcow2 output.vhd  # transactional aligned Gen2 VHD + GPT relocation
+miz azure fixup disk.vhd                     # Gen2 default; fixed VHD is padded and checked in place
+miz azure fixup disk.qcow2                   # converts to disk.vhd, then pads and checks for Gen2
+miz azure fixup --generation 1 legacy.vhd   # explicit legacy BIOS/MBR validation
+miz azure deprovision disk.vhd                    # generalize: reset hostname/SSH host keys/machine-id/DHCP state
+miz azure deprovision --user azureuser disk.vhd   # also removes that user account + its home directory
+miz azure deprovision --allow-device-write /dev/sda  # generalize an installed system in place on a block device
+miz info /dev/sda                           # inspect a block device (Linux); devices are read-only by default
+miz cosi disk.img -o disk.cosi              # tar + metadata.json + per-partition raw.zst
+miz build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.vhd  # Gen2 default
+miz build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.raw -O raw
+miz build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.vhdx -O vhdx
+miz build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.qcow2 -O qcow2
+miz build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o output.raw.gz -O raw.gz
+miz build-image --iso azurelinux.iso --container ./oci-layout --size 384M --skip-iso-rootfs -o output-minimal.raw -O raw
+miz build-image --iso azurelinux.iso --container ./oci-layout --size 4G --verity -o output.vhd
+miz build-image --iso azurelinux.iso --container ./oci-layout --size 4G --boot-mode uki --esp-size 512M -o output-uki.vhd
+miz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G -o output-live.iso                 # regenerate a customized LiveOS ISO
+miz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --uefi-boot-image boot/grub2/efiboot.img -o output-live.iso
+miz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --source-date-epoch 1735689600 -o output-live.iso   # byte-for-byte reproducible
+miz recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G -o recustomized.iso                          # strict preserve-or-refuse ISO rewrite
+miz recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --source-date-epoch 1735689600 -o recustomized.iso  # reproducible; source catalog/volume preserved
+miz capture --source /dev/sda -O vhd -o captured.vhd   # rebuild an installed system, sized to its content
+miz capture --source disk.qcow2 --source-root gpt:2 -O raw -o captured.raw --dry-run
+miz qemu AzureLinux
+miz qemu AzureLinux --snapshot
 ```
 
-`vmiz write` is the only CLI path that writes a complete image to an existing
+`miz write` is the only CLI path that writes a complete image to an existing
 block device. It accepts raw, VHD, VHDX, and qcow2 sources without first
 materializing a temporary raw file. The command requires
 `--allow-device-write`, checks size, mounts, holders, and the running root
@@ -96,13 +96,13 @@ writable when the option is not used. The command writes source zero regions
 explicitly, flushes the device, and uses the native Linux partition-table
 refresh ioctl. A refresh failure is reported as partial success with exit
 status 2 because the bytes are durable but the kernel view is stale.
-`vmiz convert` and `Image.create` continue to refuse device destinations.
+`miz convert` and `Image.create` continue to refuse device destinations.
 
-With `--grow-root`, `vmiz write` additionally requires a strictly valid GPT
+With `--grow-root`, `miz write` additionally requires a strictly valid GPT
 raw source with exactly one supported ext4 root partition, and requires that
 partition to be the last partition. Before confirmation it validates the
 destination-sized GPT and ext4 growth plan without writing data. After the
-copy it extends that partition and its filesystem offline using vmiz's native
+copy it extends that partition and its filesystem offline using miz's native
 writers; the guest does not need `resize2fs`, cloud-init, or a first-boot
 resize service.
 
@@ -111,7 +111,7 @@ layers, and 512 MiB docker/podman save archives. Deliberately larger trusted
 inputs can opt into explicit bounded limits with `--max-oci-blob-size`,
 `--max-oci-layer-size`, and `--max-oci-archive-size`.
 
-`build-image` consumes a local OCI layout. Materialize a remote image first with `vmiz oci copy docker://registry/repository@sha256:<digest> oci:./oci-layout`, or use the digest-pinned `addOciPull` helper from an external `build.zig`. See [OCI transports](oci.md) and [Library API](library-api.md).
+`build-image` consumes a local OCI layout. Materialize a remote image first with `miz oci copy docker://registry/repository@sha256:<digest> oci:./oci-layout`, or use the digest-pinned `addOciPull` helper from an external `build.zig`. See [OCI transports](oci.md) and [Library API](library-api.md).
 
 `--skip-iso-rootfs` is useful with genuinely minimal base containers: it keeps
 the container as the effective root filesystem and carries over only the
@@ -132,11 +132,11 @@ especially large.
 `--uki-signing-certificate <path>` and `--uki-signing-command <path>` have
 every generated UKI Authenticode-signed before it is written to the ESP, with
 an optional `--uki-signing-argument <arg>` for the command's single
-subcommand argument -- `--uki-signing-command "$(command -v vmiz)"
---uki-signing-argument sign` uses vmiz's own Azure Artifact Signing provider.
+subcommand argument -- `--uki-signing-command "$(command -v miz)"
+--uki-signing-argument sign` uses miz's own Azure Artifact Signing provider.
 Both halves are required together: a certificate with no command names a
 signer that never runs, and a command with no certificate has nothing to check
-its result against. The private key is never passed to vmiz and there is no
+its result against. The private key is never passed to miz and there is no
 flag that could carry one; the command is run with the unsigned UKI and the
 certificate in a private scratch directory and is expected to write the signed
 file back. What it returns is verified against the bytes that were sent before
@@ -155,30 +155,30 @@ If `usr/sbin/azagent` (the guest provisioning agent -- see `azagent/` above,
 issue #112) is present anywhere in the merged ISO/squashfs/container source
 tree, `build-image` automatically installs and enables a oneshot
 `azagent.service` systemd unit that runs it once at first boot, mirroring
-real `waagent.service`. As with the UKI stub, `vmiz` never builds or injects
+real `waagent.service`. As with the UKI stub, `miz` never builds or injects
 the `azagent` binary itself -- add it via an extra container layer,
 cross-compiled for the image's target architecture. This only applies to a
 full (non-`--skip-iso-rootfs`) image, since its systemd comes from the
 merged distro content; a `--skip-iso-rootfs` image's `/sbin/init` is
 responsible for invoking `azagent` itself if it wants first-boot
 provisioning, since there's no guarantee of systemd being present at all in
-that minimal path (`vmizinit` does this -- see `vmizinit/README.md`). Generalized
-images using `vmizinit` must add `vmizinit.mode=persistent` to the kernel command
+that minimal path (`mizinit` does this -- see `mizinit/README.md`). Generalized
+images using `mizinit` must add `mizinit.mode=persistent` to the kernel command
 line so provisioned users, SSH keys, host keys, and the azagent sentinel are
-written to the root filesystem instead of ephemeral overlays. `vmizinit` defaults
-to `vmizinit.azure=auto`: readable provisioning media or DHCP option 245 selects
+written to the root filesystem instead of ephemeral overlays. `mizinit` defaults
+to `mizinit.azure=auto`: readable provisioning media or DHCP option 245 selects
 Azure, while missing positive evidence remains unknown and is retried because
 Azure can expose the provisioning disc after networking completes. Positive
 Azure decisions are stored under `/var/lib/azagent` and bound to the current
-DMI product UUID; `vmiz azure deprovision` clears them.
-Use `vmizinit.azure=on` or `off` as a per-boot diagnostic override. Also add
-`init=/sbin/vmizinit` when the container includes systemd as an OpenSSH dependency,
-ensuring the initramfs launches `vmizinit` rather than systemd directly.
+DMI product UUID; `miz azure deprovision` clears them.
+Use `mizinit.azure=on` or `off` as a per-boot diagnostic override. Also add
+`init=/sbin/mizinit` when the container includes systemd as an OpenSSH dependency,
+ensuring the initramfs launches `mizinit` rather than systemd directly.
 The serial root shell is disabled by default and released core-image command
-lines do not enable it. `vmizinit.shell=on` is an explicit diagnostic-only boot
+lines do not enable it. `mizinit.shell=on` is an explicit diagnostic-only boot
 override. PID 1 logs through `/dev/console`, discovers `ttyS*`/`ttyAMA*` and
 other serial console names from the kernel command line or active-console
-sysfs state, and emits `VMIZINIT_PID1_READY supervisor loop active` after
+sysfs state, and emits `MIZINIT_PID1_READY supervisor loop active` after
 entering its child-reaping supervisor loop.
 
 `azagent` validates OVF usernames using the conservative policy
@@ -187,10 +187,10 @@ every public key as one printable line of at most 16 KiB containing a plausible
 authorized_keys key-type/base64 pair. Local provisioning writes the existing
 `/var/lib/azagent/provisioned` sentinel before Azure Ready acknowledgement.
 Every normal invocation reports Ready even when that sentinel already exists,
-and a WireServer failure is returned so `vmizinit` retries without recreating
+and a WireServer failure is returned so `mizinit` retries without recreating
 the account or keys. Synthetic local OVF media must contain the explicit
-`vmiz-local-provisioning` marker; under the default `vmizinit.azure=auto`,
-only that marker makes `vmizinit` invoke `azagent --skip-ready`. An unmarked OVF
+`miz-local-provisioning` marker; under the default `mizinit.azure=auto`,
+only that marker makes `mizinit` invoke `azagent --skip-ready`. An unmarked OVF
 document retains normal Azure Ready acknowledgement.
 Azure still requires every generalized-VM deployment to supply an
 `adminUsername`; use `g` for this image convention. The generated
@@ -199,7 +199,7 @@ managed-data-disk activation by stable Azure LUN at `/e` through `/z`. Managed
 disks are mount-only: existing ext4 partition 1 is mounted, while blank and
 unknown layouts are left untouched.
 
-`ResourceDisk.Owner` (a vmiz extension, not an upstream `waagent` key) names an
+`ResourceDisk.Owner` (a miz extension, not an upstream `waagent` key) names an
 account to `chown` the resource disk's mount point to once it is mounted;
 leaving it unset keeps upstream's root-owned mount point. It is applied on
 every boot rather than once at provisioning time because a mount point's
@@ -212,7 +212,7 @@ their ownership is left as whoever formatted them set it.
 
 ## Generating a LiveOS ISO (`build-iso`)
 
-`vmiz build-iso` produces a *generated* LiveOS ISO. It is stacked on the same
+`miz build-iso` produces a *generated* LiveOS ISO. It is stacked on the same
 ISO + OCI ingestion, nested-LiveOS flattening, and OS customization pipeline as
 `build-image`: it builds the identical customized owned root tree
 (`build_image.materializeCustomizedRootTree`) up to the point before
@@ -244,13 +244,13 @@ of the original image. Constructs that live only outside the directory tree
 partition tables for hybrid USB boot, etc.) are not silently carried over.
 
 ```
-vmiz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G -o live.iso
-vmiz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G \
+miz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G -o live.iso
+miz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G \
     --uefi-boot-image boot/grub2/efiboot.img --bios-boot-image boot/grub2/i386-pc/eltorito.img -o live.iso
-vmiz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G \
+miz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G \
     --volume-id CDROM --squashfs-compression zstd --source-date-epoch 1735689600 -o live.iso
-vmiz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 512M --skip-iso-rootfs -o live-minimal.iso
-vmiz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --dry-run -o live.iso
+miz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 512M --skip-iso-rootfs -o live-minimal.iso
+miz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --dry-run -o live.iso
 ```
 
 ### ISO ingestion vs. strict rewrite preservation
@@ -284,7 +284,7 @@ worth stating which one a caller relies on:
   checksum/signature/bounds, invalid media type, a truncated multi-extent chain)
   are rejected as hard errors rather than listed as features.
 
-The strict rewrite gate is what `vmiz recustomize-iso` (below) enforces before
+The strict rewrite gate is what `miz recustomize-iso` (below) enforces before
 it creates any scratch: a source with any listed blocker is refused with a
 structured diagnostic rather than losslessly rewritten. `build-iso` remains a
 *generated* ISO path (it re-emits the supported subset of the source tree and
@@ -332,7 +332,7 @@ files; they do **not** assert bootability, which only a real firmware boot can.
 
 ## Recustomizing a LiveOS ISO (`recustomize-iso`)
 
-`vmiz recustomize-iso` is the strict **ISO in -> customized ISO out**
+`miz recustomize-iso` is the strict **ISO in -> customized ISO out**
 recustomization product. Where `build-iso` *generates* an ISO (re-emitting the
 supported subset of the source tree and authoring a fresh El Torito catalog
 from discovered or `--*-boot-image` paths), `recustomize-iso` treats the source
@@ -342,10 +342,10 @@ ext4 `rootfs.img` -> SquashFS -> ISO rewrite mechanics as `build-iso`; the
 difference is what it preserves and what it refuses.
 
 ```
-vmiz recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G -o recustomized.iso
-vmiz recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --source-date-epoch 1735689600 -o recustomized.iso
-vmiz recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 512M --skip-iso-rootfs -o recustomized-minimal.iso
-vmiz recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --dry-run -o recustomized.iso
+miz recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G -o recustomized.iso
+miz recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --source-date-epoch 1735689600 -o recustomized.iso
+miz recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 512M --skip-iso-rootfs -o recustomized-minimal.iso
+miz recustomize-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --dry-run -o recustomized.iso
 ```
 
 ### Strict preflight, then preserve-or-refuse
@@ -425,9 +425,9 @@ so an already-installed system can be inspected without first copying it into
 an image file:
 
 ```
-vmiz info /dev/sda            # physical or attached disk
-vmiz map /dev/nvme0n1
-vmiz info /dev/mapper/vg-lv   # a logical volume, read through device-mapper
+miz info /dev/sda            # physical or attached disk
+miz map /dev/nvme0n1
+miz info /dev/mapper/vg-lv   # a logical volume, read through device-mapper
 ```
 
 `stat(2)` reports `st_size == 0` for a device node, so the size comes from
@@ -442,10 +442,10 @@ node is rejected with `UnsupportedBlockDevice`.
 Devices are opened **read-only** even when the command would open a regular
 file for writing, so inspecting a live disk cannot damage it. Consequently:
 
-- `vmiz create` refuses a device path outright.
-- `vmiz resize` refuses a device: its size belongs to whatever provides it.
+- `miz create` refuses a device path outright.
+- `miz resize` refuses a device: its size belongs to whatever provides it.
 - Writing through a device requires an explicit opt-in --
-  `vmiz azure deprovision --allow-device-write /dev/sda`, or
+  `miz azure deprovision --allow-device-write /dev/sda`, or
   `Image.openPathWithOptions(io, path, .{ .allow_device_write = true })` from
   the library. Without it, every write fails with
   `BlockDeviceWriteNotPermitted`.
@@ -464,16 +464,16 @@ nvme0n1                      1.7T disk
   `-vg-lv                    100G ext4          /
 ```
 
-`vmiz` reads that layout **offline and read-only**. There is no writer: nothing
-in `vmiz` creates, activates, resizes, or otherwise mutates LVM metadata. On a
+`miz` reads that layout **offline and read-only**. There is no writer: nothing
+in `miz` creates, activates, resizes, or otherwise mutates LVM metadata. On a
 *running* system the volume is already published as `/dev/mapper/vg-lv`, and
 that node can be opened directly as a block device (see above) without any of
 this.
 
-`vmiz map` lists the volume groups it found after the allocation map:
+`miz map` lists the volume groups it found after the allocation map:
 
 ```
-$ vmiz map disk.img
+$ miz map disk.img
 Offset       Length       Mapped
 0x0          0x10000000   true
 
@@ -524,7 +524,7 @@ What is understood and what is refused:
   `UnsupportedLvmMirrorSegment`, `UnsupportedLvmRaidSegment`,
   `UnsupportedLvmThinSegment`, `UnsupportedLvmCacheSegment`,
   `UnsupportedLvmSnapshotSegment`, and `UnsupportedLvmSegmentType` for anything
-  else. Such a volume is still listed by `vmiz map`; only its mapping fails.
+  else. Such a volume is still listed by `miz map`; only its mapping fails.
 - A volume group may span several physical volumes as long as they are all in
   the image being read. One that is not present is `LvmPhysicalVolumeMissing`.
 - A volume handed to a reader has to be one unbroken run on one physical
@@ -595,7 +595,7 @@ configuration JSON, and on `preserved_image.RebuildOptions`.
 
 | Profile | Accepts | Reproducible |
 | --- | --- | --- |
-| `strict` (default) | only `vmiz_ext4_v1`, the exact layout this project's writer emits | yes, byte for byte |
+| `strict` (default) | only `miz_ext4_v1`, the exact layout this project's writer emits | yes, byte for byte |
 | `general` | any ext4 the general reader accepts, including a stock distro root | no |
 
 `strict` requires 32-byte group descriptors and exactly the
@@ -603,7 +603,7 @@ configuration JSON, and on `preserved_image.RebuildOptions`.
 `flex_bg`. That is deliberate rather than incidental. It is the promise that
 rebuilding the same source twice, on any host, produces the same bytes.
 It also requires the 256-byte inodes this writer emits. An image built by an
-older vmiz has 128-byte ones, so it no longer matches `strict` and is read
+older miz has 128-byte ones, so it no longer matches `strict` and is read
 under `general` instead, where `source_reproducible = false` says plainly that
 rebuilding it produces a different -- larger, and correct past 2038 -- image
 rather than the same bytes. Reproducibility is a promise about a given writer,
@@ -612,7 +612,7 @@ not across versions of one.
 The writer is deliberately not parametric in inode size, and will not become
 so. It could be: threading the source's size through the layout arithmetic,
 the inode encoder, the checksum split and the superblock is mechanical work,
-and it would let an image an older vmiz wrote re-enter `strict` and round-trip
+and it would let an image an older miz wrote re-enter `strict` and round-trip
 byte for byte. The reason not to is what a 128-byte inode cannot hold. There
 is no `i_extra_isize` region there, so there are no epoch bits, so no
 timestamp outside 1970..2038 is representable at all. Restoring that path
@@ -851,7 +851,7 @@ merged import too.
 ##### Reproducibility
 
 `source_reproducible` is false whenever anything was merged in, even from a
-`vmiz_ext4_v1` source. The output is then a function of several sources rather
+`miz_ext4_v1` source. The output is then a function of several sources rather
 than of the one the report names, and the report says so.
 
 #### Reconciling fstab and the bootloader with the new identity
@@ -1006,25 +1006,25 @@ Whichever ran is recorded in provenance.
 
 ## Capturing an installed system
 
-`vmiz capture` reads an installed system — a block device, a disk image, a
+`miz capture` reads an installed system — a block device, a disk image, a
 partition inside one, or an LVM logical volume — and writes a **new** disk
 image sized to the content rather than to the source. A 1 TB disk holding
 6 GB of files becomes a 6 GB image.
 
 ```
-vmiz capture --source /dev/sda -O vhd -o captured.vhd
-vmiz capture --source disk.qcow2 --source-root gpt:2 -O raw -o captured.raw
-vmiz capture --source /dev/sda --source-root lvm:vg0/root -O raw -o captured.raw
-vmiz capture --source /dev/sda --source-mount /dev/sda2=/boot -O raw -o captured.raw
-vmiz capture --source /dev/sda -O raw -o captured.raw --dry-run
-vmiz capture --source /dev/sda -O raw.gz -o - | ssh host 'cat > captured.raw.gz'
+miz capture --source /dev/sda -O vhd -o captured.vhd
+miz capture --source disk.qcow2 --source-root gpt:2 -O raw -o captured.raw
+miz capture --source /dev/sda --source-root lvm:vg0/root -O raw -o captured.raw
+miz capture --source /dev/sda --source-mount /dev/sda2=/boot -O raw -o captured.raw
+miz capture --source /dev/sda -O raw -o captured.raw --dry-run
+miz capture --source /dev/sda -O raw.gz -o - | ssh host 'cat > captured.raw.gz'
 ```
 
 `-o` and a format are always required, `--dry-run` included: a dry run reports
 what *that* output would have cost, and the staging it plans for depends on
 where the output was going.
 
-This is not `rebuild`. `vmiz convert` and the preserved-image backends copy a
+This is not `rebuild`. `miz convert` and the preserved-image backends copy a
 disk and keep its geometry; capture discards the source geometry entirely and
 assembles a fresh GPT with a fresh ESP and a fresh root filesystem from the
 *files* it read. Nothing of the source's partition table, free space, or
@@ -1145,8 +1145,8 @@ incompatible ones are refused up front, by name, rather than half-built:
 - **The ext4 journal** does not describe an XFS root. XFS keeps its own internal
   metadata log rather than an ext4-style JBD2 journal, so `--journal` /
   `--journal-size` are ext4-only knobs. Both entry points reject an ext4 journal
-  beside an XFS root by name (`Ext4JournalWithXfsRoot`): `vmiz build-image`
-  rejects an explicit `--journal`, and `vmiz capture` -- which journals by
+  beside an XFS root by name (`Ext4JournalWithXfsRoot`): `miz build-image`
+  rejects an explicit `--journal`, and `miz capture` -- which journals by
   default -- passes that default through untouched, so `--root-filesystem xfs`
   must be paired with `--no-journal` rather than having the flag quietly cleared
   behind the user's back. XFS is already crash-safe through its own log.
@@ -1168,8 +1168,8 @@ difference between the two outputs.
 
 | Surface | How to ask for it |
 | --- | --- |
-| `vmiz build-image` | `--root-filesystem ext4` (default), `--root-filesystem xfs` |
-| `vmiz capture` | `--root-filesystem ext4` (default), `--root-filesystem xfs` |
+| `miz build-image` | `--root-filesystem ext4` (default), `--root-filesystem xfs` |
+| `miz capture` | `--root-filesystem ext4` (default), `--root-filesystem xfs` |
 | `std.Build` helper (`image.addImage`) | `.root_filesystem = .ext4` (default), `.root_filesystem = .xfs` |
 | `build_image.build` | `BuildImageOptions.root_filesystem` |
 | `disk_assembly.assemble` | `AssembleOptions.root_filesystem` |
@@ -1192,14 +1192,14 @@ would replay in a moment and carry on.
 So: build a purpose-built, effectively read-only appliance image without a
 journal, and build an image that boots into a mutable root filesystem with one.
 
-`vmiz capture` is the one surface that inverts the default, because it is the
+`miz capture` is the one surface that inverts the default, because it is the
 one surface whose output is by definition a machine that was already running a
 mutable root filesystem and will go on doing so.
 
 | Surface | How to ask for it |
 | --- | --- |
-| `vmiz build-image` | `--journal`, `--no-journal` (default), `--journal-size <size>` |
-| `vmiz capture` | journalled by default; `--no-journal` to omit |
+| `miz build-image` | `--journal`, `--no-journal` (default), `--journal-size <size>` |
+| `miz capture` | journalled by default; `--no-journal` to omit |
 | `std.Build` helper (`image.addImage`) | `.journal = true`, `.journal_size = <bytes>` |
 | `std.Build` helper (`image.addPreservedImage`) | `.journal = .{ .enabled = true, .size_bytes = ... }` |
 | Preserved-image configuration JSON (api_version 3) | `"journal": { "enabled": true, "size_bytes": 33554432 }` |
@@ -1247,13 +1247,13 @@ that want to size storage before writing anything.
 
 ### A journalled image is a different profile
 
-`HAS_JOURNAL` is not part of the `vmiz_ext4_v1` feature set, and the strict
+`HAS_JOURNAL` is not part of the `miz_ext4_v1` feature set, and the strict
 profile is defined as that exact set. A journalled image is therefore refused
 by `scanWriterCompatible` with `UnsupportedWriterProfile` and can only be
 imported through `.source_profile = .general`, as `ext4_general_v1` with
 `source_reproducible = false`.
 
-This is on purpose. `vmiz_ext4_v1` is a byte-for-byte reproducibility contract,
+This is on purpose. `miz_ext4_v1` is a byte-for-byte reproducibility contract,
 and widening it would change what that contract means. A journalled output is a
 distinct profile, so a strict rebuild round-trips exactly as it always did.
 
@@ -1342,7 +1342,7 @@ every other backend keeps the source's filesystem rather than writing a new one
 ### Why this is not simply the default
 
 Growing the filesystem is the other answer, and on a cloud image it is the one
-that usually runs first: `vmiz`'s Azure agent resizes the root partition to the
+that usually runs first: `miz`'s Azure agent resizes the root partition to the
 OS disk on first boot, and `resize2fs` adds block groups, each bringing
 `inodes_per_group` more inodes with it. That masks the problem on Azure while
 leaving it fully present anywhere the image boots at its built size -- a local
@@ -1373,9 +1373,9 @@ Each limit is raisable on its own, and none is library-only.
 Values accept the same binary suffixes as `--size` (`4M` is 4194304), which is
 why a count such as `--max-nodes 8M` is accepted and means 8388608.
 
-`vmiz build-image` and `vmiz capture` take the eight that bound the tree they
+`miz build-image` and `miz capture` take the eight that bound the tree they
 build. The
-`std.Build` helpers (`vmiz_image.add`, `vmiz_image.addPreserved`) take all of
+`std.Build` helpers (`miz_image.add`, `miz_image.addPreserved`) take all of
 them as `limits`, and the preserved-image builder takes all of them, including
 the two that only a source scan and an operation can reach.
 
@@ -1390,7 +1390,7 @@ The same breach reaches a build graph as a `limit_exceeded` diagnostic in
 `diagnostics.json`, with the flag in its `remediation` field.
 
 Every run also reports the peak each limit actually reached, so the next run
-can be sized from a measurement instead of a guess. `vmiz build-image` prints
+can be sized from a measurement instead of a guess. `miz build-image` prints
 them, `--dry-run` included:
 
 ```
@@ -1424,17 +1424,17 @@ runs as the image is produced, not as a separate pass over a finished file,
 so a build never has to materialize the full uncompressed raw locally --
 which is usually the single largest cost of producing a disk image. Both
 `convert`, `build-image` and `capture` accept them, as do the customization entry points
-(`vmiz.customize` and the `vmiz-image-builder`/`vmiz-preserved-image-builder`
+(`miz.customize` and the `miz-image-builder`/`miz-preserved-image-builder`
 bundle executables) via the same `-O` spelling.
 
 `-o -` writes the artifact to stdout instead of a file, so the result can be
 piped:
 
 ```
-vmiz convert -O raw.gz -o - disk.qcow2 - | ssh host 'cat > image.raw.gz'
-vmiz build-image --iso azurelinux.iso --container ./oci-layout --size 4G \
+miz convert -O raw.gz -o - disk.qcow2 - | ssh host 'cat > image.raw.gz'
+miz build-image --iso azurelinux.iso --container ./oci-layout --size 4G \
     -O raw.gz -o - > image.raw.gz
-vmiz capture --source /dev/sda -O raw.gz -o - | ssh host 'cat > captured.raw.gz'
+miz capture --source /dev/sda -O raw.gz -o - | ssh host 'cat > captured.raw.gz'
 ```
 
 The published gzip artifact is directly consumable by the usual idiom:
@@ -1465,7 +1465,7 @@ The zeros are fed *to* the compressor rather than skipped, so the artifact is
 always exactly the image's virtual size once decompressed; the writer asserts
 that byte count before it reports success.
 
-Because `vmiz` constructs filesystems natively rather than capturing a
+Because `miz` constructs filesystems natively rather than capturing a
 running system, the usual "fill the free space with zeros before imaging so
 that it compresses" step is unnecessary. Unallocated blocks in a freshly
 built ext4 have never held anything, so they are already zero, and both the
@@ -1480,35 +1480,35 @@ mostly-empty raw image into a sparse image stays sparse instead of eagerly
 allocating every block it touches.
 
 MBR/GPT partition-table read/write is available as a library API
-(`vmiz.mbr`, `vmiz.gpt`, `vmiz.guid`) with round-trip test coverage, used by
-`vmiz azure fixup` to validate the disk's partition style against the
+(`miz.mbr`, `miz.gpt`, `miz.guid`) with round-trip test coverage, used by
+`miz azure fixup` to validate the disk's partition style against the
 requested Hyper-V generation (Gen1 = plain MBR, Gen2 = protective MBR + GPT).
 Gen2 validation cross-checks both GPT headers and byte-identical partition
 arrays. In-place fixup rejects unaligned GPT images before mutation; use
-`vmiz azure derive` for transactional alignment and relocation.
+`miz azure derive` for transactional alignment and relocation.
 There is no interactive partitioning CLI command yet -- that lands with
-`vmiz build-image`.
+`miz build-image`.
 
-FAT32 filesystem support is currently library-only (`vmiz.fat32`). Callers
-format a partition-sized region inside an existing `vmiz.Image`, then use the
+FAT32 filesystem support is currently library-only (`miz.fat32`). Callers
+format a partition-sized region inside an existing `miz.Image`, then use the
 returned/opened filesystem handle to create directories, write full file
 contents, list directory entries, and read files back -- including VFAT long
 file names such as typical `EFI/...` ESP paths.
 
-VHDX support (`vmiz.vhdx`) covers create/read/write/resize/check for
+VHDX support (`miz.vhdx`) covers create/read/write/resize/check for
 non-differencing images with 512-byte logical sectors -- the common case.
-`vmiz build-image` can emit VHDX output directly, and `convert`/`resize`
+`miz build-image` can emit VHDX output directly, and `convert`/`resize`
 operate on VHDX images the same way they already do for raw/VHD/qcow2. No real Hyper-V/QEMU install was
 available in this environment to generate reference VHDX files, so
 correctness was verified against QEMU's own `block/vhdx.c`/`vhdx.h` (struct
 layout, CRC-32C checksums, the BAT chunk-ratio interleaving formula, and the
 create-path metadata layout) plus writable round-trip tests exercised through
-both `vmiz.vhdx` and the full `Image` API in the test suite.
+both `miz.vhdx` and the full `Image` API in the test suite.
 
-ext4 support lives at `vmiz.ext4`. The writer entry point is:
+ext4 support lives at `miz.ext4`. The writer entry point is:
 
 ```zig
-try vmiz.ext4.populate(io, file, allocator, &tree, .{
+try miz.ext4.populate(io, file, allocator, &tree, .{
     .offset = 0,
     .length = fs_bytes,
     .block_size = 4096,
@@ -1533,8 +1533,8 @@ without a journal, and refuses a `resize_inode` filesystem by name with
 reader API can `statPath`, `listDir`, `preadPath`, `readExtents`, and
 `readLinkAlloc` for round-trip verification.
 
-Bootloader population lives at `vmiz.bootconfig`. It reuses the exact same
-`FileTreeView` shape as `vmiz.ext4`, so future orchestration can drive rootfs
+Bootloader population lives at `miz.bootconfig`. It reuses the exact same
+`FileTreeView` shape as `miz.ext4`, so future orchestration can drive rootfs
 population plus either ESP/UEFI or BIOS/MBR boot installation from one merged
 source-tree interface. For Gen2/GPT callers pass the planned GPT partitions
 plus their unique GUIDs, then `populateEsp()` copies discovered
@@ -1548,7 +1548,7 @@ locations) and embeds them into the post-MBR gap ahead of the first 1 MiB
 aligned root partition while preserving the existing MBR partition table.
 
 ```zig
-try vmiz.bootconfig.populateEsp(allocator, io, &esp_fs, &tree, .{
+try miz.bootconfig.populateEsp(allocator, io, &esp_fs, &tree, .{
     .planned_partitions = planned_partitions,
     .boot_mode = .bls_and_uki,
     .path_strip_prefix = "",
@@ -1561,7 +1561,7 @@ try vmiz.bootconfig.populateEsp(allocator, io, &esp_fs, &tree, .{
 
 The same `extra_kernel_options` text can also be added to an image that already
 exists, by whichever mechanism that image's own layout supports.
-`vmiz.customize`'s `native_edit` and `rebuild` backends append it to the GRUB
+`miz.customize`'s `native_edit` and `rebuild` backends append it to the GRUB
 and BLS entries on the image's ESP instead of generating them. The privileged
 `unsafe_chroot` backend instead appends it to `GRUB_CMDLINE_LINUX` in the
 target's `/etc/default/grub` and runs the target's own `grub2-mkconfig`, which
@@ -1569,24 +1569,24 @@ is the durable form on a distro image because the generated configuration is
 rewritten from that input on every kernel package change. The `vm` backend and
 Unified Kernel Images are refused by name. See `doc/library-api.md`.
 
-The low-level PE/COFF rewriting lives in `vmiz.uki`, which takes a prebuilt
+The low-level PE/COFF rewriting lives in `miz.uki`, which takes a prebuilt
 stub plus kernel/initrd/cmdline payloads and emits a structurally valid UKI
 with `.linux`, `.initrd`, `.cmdline`, `.osrel`, `.uname`, and optional
 `.splash` sections.
 
-`vmiz build-image` currently writes `raw`, fixed `vhd`, `vhdx`, and `qcow2`
+`miz build-image` currently writes `raw`, fixed `vhd`, `vhdx`, and `qcow2`
 outputs. Both Gen2
 (UEFI/protective-MBR+GPT+ESP) and Gen1 (BIOS/plain-MBR with GRUB embedded into
-the post-MBR gap) are now fully wired in `vmiz build-image`, and both
+the post-MBR gap) are now fully wired in `miz build-image`, and both
 generations can optionally append a same-partition dm-verity SHA-256 hash tree
 with `--verity`, wiring the resulting `roothash=`/`systemd.verity_root_*`
 parameters through the shared PARTUUID-based cmdline path. Gen1/MBR builds use
 Linux's synthesized MBR PARTUUID form (`<8-hex-disk-signature>-<2-hex-partition-number>`);
-the matching verity metadata is also exposed through `vmiz.cosi.writeWithOptions`,
+the matching verity metadata is also exposed through `miz.cosi.writeWithOptions`,
 and a v3 customization request can publish that bundle directly with
 `-O cosi` (see [Library API](library-api.md) for which backends emit it).
 
-`vmiz build-image` never rebuilds the initramfs -- it copies whatever
+`miz build-image` never rebuilds the initramfs -- it copies whatever
 `boot/initramfs*`/`boot/initrd*` blob already exists in the merged
 ISO/squashfs/container source tree. Because of that, `--verity` only works
 end-to-end if that source initramfs already includes dm-verity userspace
@@ -1594,7 +1594,7 @@ tooling (`systemd-veritysetup-generator`, `systemd-veritysetup`, or
 `veritysetup`, e.g. built with `dracut --add systemd-veritysetup`); without it,
 `systemd-veritysetup-generator` never runs at boot and the image hangs
 forever waiting on `/dev/mapper/root` (see
-[issue #77](https://github.com/cataggar/vmiz/issues/77) for the real-boot
+[issue #77](https://github.com/cataggar/miz/issues/77) for the real-boot
 investigation that diagnosed this). `build-image --verity` inspects the
 selected initramfs (decompressing it as needed) and fails fast with a
 `--verity`-specific error when it can conclusively tell the tooling is
@@ -1614,7 +1614,7 @@ kernel modules). Regenerate the initramfs with `dracut --add systemd-veritysetup
 against a rootfs that has these installed, then supply the result as a
 `--container` layer at the *same* `boot/initramfs-<kver>.img` path already
 used by the ISO/squashfs rootfs -- OCI container layers always take
-precedence over ISO/squashfs entries at the same path, so no `vmiz` flag is
+precedence over ISO/squashfs entries at the same path, so no `miz` flag is
 needed to use it in place of the stock copy.
 
 On a matching-architecture build host (or inside a container/chroot for that
