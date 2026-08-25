@@ -1,4 +1,4 @@
-//! `vmiz recustomize-iso --iso <source.iso> --container <oci> --rootfs-size <size> -o <output.iso>`:
+//! `miz recustomize-iso --iso <source.iso> --container <oci> --rootfs-size <size> -o <output.iso>`:
 //! a strict ISO-in -> customized ISO-out recustomization product. The source
 //! ISO is authoritative -- its directory tree, node metadata/timestamps, volume
 //! metadata, and El Torito catalog are all preserved -- and only its LiveOS
@@ -12,10 +12,10 @@
 //! part of this feature.
 
 const std = @import("std");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 const help_text =
-    \\usage: vmiz recustomize-iso --iso <source.iso> --container <oci-layout> --rootfs-size <size> -o <output.iso>
+    \\usage: miz recustomize-iso --iso <source.iso> --container <oci-layout> --rootfs-size <size> -o <output.iso>
     \\                            [--rootfs-path <path>] [--nested-rootfs-path <path>]
     \\                            [--squashfs-compression zstd|none] [--skip-iso-rootfs]
     \\                            [--architecture auto|x86_64|aarch64] [--ext4-label <label>]
@@ -92,16 +92,16 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var output_path: ?[]const u8 = null;
     var rootfs_size: ?u64 = null;
     var rootfs_path: ?[]const u8 = null;
-    var nested_rootfs_path: []const u8 = vmiz.recustomize_iso.default_nested_rootfs_path;
-    var squashfs_compression: vmiz.squashfs.WriterCompression = .zstd;
+    var nested_rootfs_path: []const u8 = miz.recustomize_iso.default_nested_rootfs_path;
+    var squashfs_compression: miz.squashfs.WriterCompression = .zstd;
     var skip_iso_rootfs = false;
-    var architecture: ?vmiz.bootconfig.Architecture = null;
+    var architecture: ?miz.bootconfig.Architecture = null;
     var ext4_label: []const u8 = "rootfs";
-    var journal = vmiz.ext4.JournalOptions{};
+    var journal = miz.ext4.JournalOptions{};
     var root_selinux_label: ?[]const u8 = null;
     var source_date_epoch: ?u32 = null;
-    var oci_load_options = vmiz.oci.LoadOptions{};
-    var limits: vmiz.limits.ImportLimits = .{};
+    var oci_load_options = miz.oci.LoadOptions{};
+    var limits: miz.limits.ImportLimits = .{};
     var dry_run = false;
     var verbose = false;
 
@@ -119,7 +119,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, arg, "--rootfs-size")) {
             i += 1;
             if (i >= args.len) return fail("recustomize-iso: --rootfs-size requires a value", .{});
-            rootfs_size = vmiz.parseSize(args[i]) catch |err|
+            rootfs_size = miz.parseSize(args[i]) catch |err|
                 return fail("recustomize-iso: invalid --rootfs-size '{s}': {s}", .{ args[i], @errorName(err) });
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
             i += 1;
@@ -168,7 +168,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, arg, "--journal-size")) {
             i += 1;
             if (i >= args.len) return fail("recustomize-iso: --journal-size requires a value", .{});
-            journal.size_bytes = vmiz.parseSize(args[i]) catch |err|
+            journal.size_bytes = miz.parseSize(args[i]) catch |err|
                 return fail("recustomize-iso: invalid --journal-size '{s}': {s}", .{ args[i], @errorName(err) });
             journal.enabled = true;
         } else if (std.mem.eql(u8, arg, "--root-selinux-label")) {
@@ -202,7 +202,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             std.debug.print("{s}", .{help_text});
             return 0;
-        } else if (vmiz.limits.limitForFlag(arg) != null) {
+        } else if (miz.limits.limitForFlag(arg) != null) {
             i += 1;
             if (i >= args.len) return fail("recustomize-iso: {s} requires a value", .{arg});
             _ = limits.parseFlag(arg, args[i]) catch |err|
@@ -212,15 +212,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         }
     }
 
-    const determinism: ?vmiz.recustomize_iso.Determinism = if (source_date_epoch) |epoch| .{
+    const determinism: ?miz.recustomize_iso.Determinism = if (source_date_epoch) |epoch| .{
         .filesystem_timestamp = epoch,
         .root_filesystem_uuid = deriveUuid(epoch),
     } else null;
 
-    var limit_sink = vmiz.limits.Diagnostic{};
-    var diagnostic = vmiz.recustomize_iso.RecustomizeDiagnostic{ .kind = .boot_image_unmapped };
+    var limit_sink = miz.limits.Diagnostic{};
+    var diagnostic = miz.recustomize_iso.RecustomizeDiagnostic{ .kind = .boot_image_unmapped };
     defer diagnostic.deinit(gpa);
-    var report = vmiz.recustomize_iso.build(gpa, io, .{
+    var report = miz.recustomize_iso.build(gpa, io, .{
         .iso_path = iso_path orelse return fail("recustomize-iso: --iso is required", .{}),
         .container_path = container_path orelse return fail("recustomize-iso: --container is required", .{}),
         .oci_load_options = oci_load_options,
@@ -257,7 +257,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
 fn deriveUuid(epoch: u32) [16]u8 {
     var digest: [32]u8 = undefined;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("vmiz-recustomize-iso-rootfs-uuid\x00");
+    hasher.update("miz-recustomize-iso-rootfs-uuid\x00");
     var epoch_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &epoch_bytes, epoch, .little);
     hasher.update(&epoch_bytes);
@@ -266,12 +266,12 @@ fn deriveUuid(epoch: u32) [16]u8 {
 }
 
 fn parseOciLimit(value: []const u8) !usize {
-    const size = try vmiz.parseSize(value);
+    const size = try miz.parseSize(value);
     if (size == 0) return error.ZeroOciLimit;
     return std.math.cast(usize, size) orelse error.OciLimitTooLarge;
 }
 
-fn printReport(report: vmiz.recustomize_iso.RecustomizeIsoReport, dry_run: bool) void {
+fn printReport(report: miz.recustomize_iso.RecustomizeIsoReport, dry_run: bool) void {
     const arch_text = switch (report.architecture) {
         .x86_64 => "x86_64",
         .aarch64 => "aarch64",
@@ -329,12 +329,12 @@ fn printReport(report: vmiz.recustomize_iso.RecustomizeIsoReport, dry_run: bool)
 fn describeFailure(
     allocator: std.mem.Allocator,
     err: anyerror,
-    limit_exceeded: ?vmiz.limits.Exceeded,
-    diagnostic: vmiz.recustomize_iso.RecustomizeDiagnostic,
+    limit_exceeded: ?miz.limits.Exceeded,
+    diagnostic: miz.recustomize_iso.RecustomizeDiagnostic,
 ) std.mem.Allocator.Error![]u8 {
     if (limit_exceeded) |breach| {
-        var message_buffer: [vmiz.limits.Exceeded.max_message_bytes]u8 = undefined;
-        var remediation_buffer: [vmiz.limits.Exceeded.max_remediation_bytes]u8 = undefined;
+        var message_buffer: [miz.limits.Exceeded.max_message_bytes]u8 = undefined;
+        var remediation_buffer: [miz.limits.Exceeded.max_remediation_bytes]u8 = undefined;
         if (breach.limit.err() == err) {
             return std.fmt.allocPrint(
                 allocator,
@@ -366,7 +366,7 @@ fn describeFailure(
 
 fn describeRefusal(
     allocator: std.mem.Allocator,
-    diagnostic: vmiz.recustomize_iso.RecustomizeDiagnostic,
+    diagnostic: miz.recustomize_iso.RecustomizeDiagnostic,
 ) std.mem.Allocator.Error![]u8 {
     const at_path: []u8 = if (diagnostic.path.len > 0)
         try std.fmt.allocPrint(allocator, " at '{s}'", .{diagnostic.path})
@@ -408,26 +408,26 @@ test {
 // with a boot catalog to corrupt -- no OCI layout or LiveOS payload.
 const CliFixtureNode = struct {
     path: []const u8,
-    kind: vmiz.iso9660.SourceKind,
+    kind: miz.iso9660.SourceKind,
     bytes: []const u8 = &.{},
 };
 
 const CliFixtureSource = struct {
     nodes: []const CliFixtureNode,
-    fn source(self: *const CliFixtureSource) vmiz.iso9660.TreeSource {
+    fn source(self: *const CliFixtureSource) miz.iso9660.TreeSource {
         return .{ .context = self, .vtable = &vtable };
     }
-    const vtable = vmiz.iso9660.TreeSource.VTable{ .root = rootFn, .count = countFn, .node = nodeFn, .read = readFn };
+    const vtable = miz.iso9660.TreeSource.VTable{ .root = rootFn, .count = countFn, .node = nodeFn, .read = readFn };
     fn ctx(context: *const anyopaque) *const CliFixtureSource {
         return @ptrCast(@alignCast(context));
     }
-    fn rootFn(_: *const anyopaque) vmiz.iso9660.SourceRoot {
+    fn rootFn(_: *const anyopaque) miz.iso9660.SourceRoot {
         return .{ .mode = 0o755 };
     }
     fn countFn(context: *const anyopaque) usize {
         return ctx(context).nodes.len;
     }
-    fn nodeFn(context: *const anyopaque, index: usize) anyerror!vmiz.iso9660.SourceNode {
+    fn nodeFn(context: *const anyopaque, index: usize) anyerror!miz.iso9660.SourceNode {
         const n = ctx(context).nodes[index];
         return .{ .path = n.path, .kind = n.kind, .mode = if (n.kind == .directory) 0o755 else 0o644, .size = n.bytes.len };
     }
@@ -455,8 +455,8 @@ test "recustomize-iso CLI refuses a source the strict gate rejects and writes no
         .{ .path = "boot/bios.img", .kind = .file, .bytes = "BIOS-BOOT-IMAGE" },
     };
     const src = CliFixtureSource{ .nodes = &nodes };
-    _ = try vmiz.iso9660.writeImagePath(gpa, io, iso_path, src.source(), .{
-        .volume_id = "VMIZ_SRC",
+    _ = try miz.iso9660.writeImagePath(gpa, io, iso_path, src.source(), .{
+        .volume_id = "MIZ_SRC",
         .boot_entries = &.{.{ .platform = .bios, .image_path = "boot/bios.img" }},
     });
 

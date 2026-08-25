@@ -1,8 +1,8 @@
 const std = @import("std");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 pub fn build(b: *std.Build) void {
-    const dependency = b.dependencyFromBuildZig(vmiz, .{
+    const dependency = b.dependencyFromBuildZig(miz, .{
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
     });
@@ -11,33 +11,19 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("package_family_consumer.zig"),
             .target = b.graph.host,
             .optimize = .ReleaseSafe,
-            .imports = &.{.{ .name = "vmiz", .module = dependency.module("vmiz_host") }},
+            .imports = &.{.{ .name = "miz", .module = dependency.module("miz_host") }},
         }),
     });
     const run_package_family_consumer = b.addRunArtifact(package_family_consumer);
     b.step("package-family", "Compile and test the public package-family API")
         .dependOn(&run_package_family_consumer.step);
 
-    const rename_compatibility_consumer = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("rename_compatibility_consumer.zig"),
-            .target = b.graph.host,
-            .optimize = .ReleaseSafe,
-            .imports = &.{
-                .{ .name = "zvmi", .module = dependency.module("zvmi_host") },
-            },
-        }),
-    });
-    const run_rename_compatibility_consumer = b.addRunArtifact(rename_compatibility_consumer);
-    b.step("rename-compatibility", "Compile and test the zvmi compatibility alias")
-        .dependOn(&run_rename_compatibility_consumer.step);
-
-    const pull = vmiz.addOciPull(b, dependency, .{
+    const pull = miz.addOciPull(b, dependency, .{
         .name = "remote-container",
         .source = "docker://registry.example/team/image@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         .platform = .{ .os = "linux", .architecture = "amd64" },
     });
-    _ = vmiz.addImage(b, dependency, .{
+    _ = miz.addImage(b, dependency, .{
         .name = "remote-layout-fixture",
         .input = .{
             .iso = b.path("fixtures/os.iso"),
@@ -59,7 +45,7 @@ pub fn build(b: *std.Build) void {
     // A registry image named by the request itself, rather than pulled beside
     // it by addOciPull.  Only configured, never built: the point is that the
     // exported API accepts it and emits the flags.
-    _ = vmiz.addImage(b, dependency, .{
+    _ = miz.addImage(b, dependency, .{
         .name = "registry-image-fixture",
         .input = .{
             .iso = b.path("fixtures/os.iso"),
@@ -83,7 +69,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const layout_image = vmiz.addImage(b, dependency, .{
+    const layout_image = miz.addImage(b, dependency, .{
         .name = "layout-fixture",
         .input = .{
             .iso = b.path("fixtures/os.iso"),
@@ -124,7 +110,7 @@ pub fn build(b: *std.Build) void {
         .generalization = .{ .azure = .{ .reset_hostname = false } },
     });
 
-    const archive_image = vmiz.addImage(b, dependency, .{
+    const archive_image = miz.addImage(b, dependency, .{
         .name = "archive-fixture",
         .input = .{
             .iso = b.path("fixtures/os.iso"),
@@ -153,7 +139,7 @@ pub fn build(b: *std.Build) void {
     // A LiveOS ISO product, configured through the exported `addIso` helper.
     // Only configured, never built here: this verifies the ISO build API wires
     // and typechecks in an external consumer, alongside the disk-image helpers.
-    _ = vmiz.addIso(b, dependency, .{
+    _ = miz.addIso(b, dependency, .{
         .name = "liveos-fixture",
         .iso = b.path("fixtures/os.iso"),
         .container = .{ .oci_layout = pull.layout },
@@ -177,7 +163,7 @@ pub fn build(b: *std.Build) void {
     // `addRecustomizeIso` helper. Only configured, never built here: this
     // verifies the preserve-or-refuse API wires and typechecks in an external
     // consumer, and that it exposes no boot-image/volume-id overrides.
-    _ = vmiz.addRecustomizeIso(b, dependency, .{
+    _ = miz.addRecustomizeIso(b, dependency, .{
         .name = "recustomized-liveos-fixture",
         .iso = b.path("fixtures/os.iso"),
         .container = .{ .oci_layout = pull.layout },
@@ -193,7 +179,7 @@ pub fn build(b: *std.Build) void {
         .generalization = .{ .azure = .{ .reset_hostname = false } },
     });
 
-    _ = vmiz.addImage(b, dependency, .{
+    _ = miz.addImage(b, dependency, .{
         .name = "cosi-fixture",
         .input = .{
             .iso = b.path("fixtures/os.iso"),
@@ -212,7 +198,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const execution_failure_image = vmiz.addImage(b, dependency, .{
+    const execution_failure_image = miz.addImage(b, dependency, .{
         .name = "execution-failure-fixture",
         .input = .{
             .iso = b.path("fixtures/os.iso"),
@@ -231,14 +217,14 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const foreign_dependency = b.dependencyFromBuildZig(vmiz, .{
+    const foreign_dependency = b.dependencyFromBuildZig(miz, .{
         .target = b.resolveTargetQuery(.{
             .cpu_arch = .aarch64,
             .os_tag = .linux,
         }),
         .optimize = .ReleaseSafe,
     });
-    const preserved_image = vmiz.addPreservedImage(b, foreign_dependency, .{
+    const preserved_image = miz.addPreservedImage(b, foreign_dependency, .{
         .name = "preserved-fixture",
         .input = .{
             .disk = b.path("fixtures/os.iso"),
@@ -295,7 +281,7 @@ pub fn build(b: *std.Build) void {
 
     // The vm backend on a foreign guest architecture, so the external consumer
     // path covers cross-architecture execution and the VM policy end to end.
-    const preserved_vm_image = vmiz.addPreservedImage(b, foreign_dependency, .{
+    const preserved_vm_image = miz.addPreservedImage(b, foreign_dependency, .{
         .name = "preserved-vm-fixture",
         .input = .{ .disk = b.path("fixtures/os.iso") },
         .root_partition = .{ .gpt_index = 2 },

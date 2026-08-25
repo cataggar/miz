@@ -76,7 +76,7 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         install = self.source.split(
             "- name: Install complete Ubuntu image-builder dependencies", 1
         )[1].split("- name: Build built-in Artifact Signing client", 1)[0]
-        # Native vmiz UKI assembly replaces systemd-ukify and its builder
+        # Native miz UKI assembly replaces systemd-ukify and its builder
         # dependency stack (systemd-ukify, binutils, python3-pefile, and the
         # host linux-image-generic kernel), so none of them may be installed.
         for removed in (
@@ -227,13 +227,13 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
             "- name: Validate standalone zstd QCOW2 and exact 5 GiB size", 1
         )[1].split("- name:", 1)[0]
         # The build job emits and validates the release image entirely with
-        # vmiz; qemu-img/qemu-utils must not appear anywhere in it (issue #476,
+        # miz; qemu-img/qemu-utils must not appear anywhere in it (issue #476,
         # acceptance: Ubuntu build must not invoke qemu tooling).
         self.assertNotIn("qemu-img", build_job)
         self.assertNotIn("qemu-utils", build_job)
-        self.assertIn('"$vmiz" check "$asset"', validate)
-        self.assertIn('"$vmiz" info --output=json "$asset"', validate)
-        self.assertIn('vmiz="$GITHUB_WORKSPACE/zig-out/bin/vmiz"', validate)
+        self.assertIn('"$miz" check "$asset"', validate)
+        self.assertIn('"$miz" info --output=json "$asset"', validate)
+        self.assertIn('miz="$GITHUB_WORKSPACE/zig-out/bin/miz"', validate)
         # Native metadata is the publication input the candidate provenance
         # binds and the exactness gate parses.
         self.assertIn("image-info.json", validate)
@@ -252,14 +252,14 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         self.assertIn("OVMF_CODE_4M.ms.fd", native)
         self.assertIn("OVMF_VARS_4M.ms.fd", native)
         self.assertNotIn("AAVMF_CODE", native)
-        self.assertIn("VMIZ_UBUNTU2604_UEFI_CODE=", native)
-        self.assertIn("VMIZ_UBUNTU2604_UEFI_VARS=", native)
-        self.assertIn("VMIZ_UBUNTU2604_IMAGE=", native)
-        self.assertIn("test -s \"$VMIZ_UBUNTU2604_ACCEPTANCE_RESULT\"", native)
+        self.assertIn("MIZ_UBUNTU2604_UEFI_CODE=", native)
+        self.assertIn("MIZ_UBUNTU2604_UEFI_VARS=", native)
+        self.assertIn("MIZ_UBUNTU2604_IMAGE=", native)
+        self.assertIn("test -s \"$MIZ_UBUNTU2604_ACCEPTANCE_RESULT\"", native)
         self.assertIn("tampered-uki-rejected", native)
         self.assertIn("Provision privileged offline-root containment fixture", native)
         self.assertIn(
-            'sudo -E "$(command -v zig)" test packages/vmiz/src/offline_root.zig',
+            'sudo -E "$(command -v zig)" test packages/miz/src/offline_root.zig',
             native,
         )
         self.assertIn('sudo rm -rf -- "$fixture"', native)
@@ -271,7 +271,7 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         azure = self.source.split("  azure_acceptance:", 1)[1].split(
             "  publish:", 1
         )[0]
-        build = azure.index("- name: Build accepted-source vmiz")
+        build = azure.index("- name: Build accepted-source miz")
         login = azure.index("- name: Log in to Azure with protected-environment OIDC")
         acceptance = azure.index(
             "- name: Run exact-digest Azure Trusted Launch acceptance"

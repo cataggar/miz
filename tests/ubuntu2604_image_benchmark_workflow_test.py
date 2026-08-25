@@ -115,7 +115,7 @@ class Ubuntu2604ImageBenchmarkWorkflowTests(unittest.TestCase):
         self.assertIn("ssh-keygen -q -t ed25519", identity)
         self.assertIn(
             'TEST_CERTIFICATE_SHA256: '
-            '"74556e6a0b540eb0ed5a49d9e75a003987447699df59f1d68456548c47dc8009"',
+            '"8ca3b80b1a2272a4f3a6d13246a65cfdd89764eb83beb8a0709e3cf591490279"',
             self.source,
         )
         upload = self.section(

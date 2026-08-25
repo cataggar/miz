@@ -198,7 +198,7 @@ else:
             1,
         )[0]
         for required in (
-            "/proc/1/exe -ef /sbin/vmizinit",
+            "/proc/1/exe -ef /sbin/mizinit",
             "test -x /usr/sbin/azagent",
             "test -s /var/lib/azagent/provisioned",
             "ResourceDisk.Format",
@@ -291,7 +291,7 @@ else:
             'sudo -n "$probe" alloc "$binderfs_mount/binder-control"',
             binder_section,
         )
-        self.assertIn("vmiz-acceptance-probe", binder_section)
+        self.assertIn("miz-acceptance-probe", binder_section)
 
     def test_binder_probe_binary_exists_and_targets_public_uapi_constants(
         self,
@@ -305,16 +305,16 @@ else:
     def test_cleanup_requires_exact_ownership_tags(self) -> None:
         env = self.environment()
         tags = {
-            "vmiz-owner": "ubuntu2604-release",
-            "vmiz-run-id": "123",
-            "vmiz-run-attempt": "4",
-            "vmiz-candidate": "x86_64-full",
+            "miz-owner": "ubuntu2604-release",
+            "miz-run-id": "123",
+            "miz-run-attempt": "4",
+            "miz-candidate": "x86_64-full",
         }
         marker = self.write_az(tags)
         env["MOCK_TAGS"] = json.dumps(tags)
         env["DELETE_MARKER"] = str(marker)
         Path(env["STATE_FILE"]).write_text(
-            "vmiz-u2604-123-4-x86-64-full\n", encoding="utf-8"
+            "miz-u2604-123-4-x86-64-full\n", encoding="utf-8"
         )
         subprocess.run(
             [str(SCRIPT), "cleanup"], cwd=ROOT, env=env, check=True
@@ -322,7 +322,7 @@ else:
         self.assertTrue(marker.is_file())
 
         marker.unlink()
-        tags["vmiz-owner"] = "someone-else"
+        tags["miz-owner"] = "someone-else"
         env["MOCK_TAGS"] = json.dumps(tags)
         result = subprocess.run(
             [str(SCRIPT), "cleanup"],

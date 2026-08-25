@@ -1,14 +1,14 @@
 # Protected-environment setup required before dispatch:
 # - `ubuntu2604-signing`: restrict deployments to `main` and define variables
-#   VMIZ_AZURE_TENANT_ID, VMIZ_AZURE_CLIENT_ID,
-#   VMIZ_ARTIFACT_SIGNING_ENDPOINT, VMIZ_ARTIFACT_SIGNING_ACCOUNT, and
-#   VMIZ_ARTIFACT_SIGNING_PROFILE. The signing app's Entra federated credential
-#   subject is `repo:cataggar/vmiz:environment:ubuntu2604-signing`.
+#   MIZ_AZURE_TENANT_ID, MIZ_AZURE_CLIENT_ID,
+#   MIZ_ARTIFACT_SIGNING_ENDPOINT, MIZ_ARTIFACT_SIGNING_ACCOUNT, and
+#   MIZ_ARTIFACT_SIGNING_PROFILE. The signing app's Entra federated credential
+#   subject is `repo:cataggar/miz:environment:ubuntu2604-signing`.
 # - `ubuntu2604-release`: restrict deployments to `main`, define secrets
 #   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, and
 #   variables AZURE_LOCATION_X64, AZURE_LOCATION_ARM64, AZURE_VM_SIZE_X64, and
 #   AZURE_VM_SIZE_ARM64. The acceptance app's Entra federated credential subject
-#   is `repo:cataggar/vmiz:environment:ubuntu2604-release`.
+#   is `repo:cataggar/miz:environment:ubuntu2604-release`.
 # - The Android container boot-completion smoke required by core acceptance
 #   reads separate, non-environment-scoped repository secrets so the
 #   native-QEMU job (which needs no Azure credential) can use them without a
@@ -44,7 +44,7 @@ concurrency:
 jobs:
   prepare:
     name: resolve immutable main source
-    if: github.repository == 'cataggar/vmiz' && github.ref == 'refs/heads/main'
+    if: github.repository == 'cataggar/miz' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -173,12 +173,12 @@ jobs:
       WORK_DIR: .scratch/ubuntu2604-core-validation-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       BUNDLE_DIR: artifact-staging/core-candidates/${{ matrix.key }}
       SIGNING_PROBE_DIR: ${{ github.workspace }}/signing-probe-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
-      UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/vmiz
-      VMIZ_AZURE_TENANT_ID: ${{ vars.VMIZ_AZURE_TENANT_ID }}
-      VMIZ_AZURE_CLIENT_ID: ${{ vars.VMIZ_AZURE_CLIENT_ID }}
-      VMIZ_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.VMIZ_ARTIFACT_SIGNING_ENDPOINT }}
-      VMIZ_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.VMIZ_ARTIFACT_SIGNING_ACCOUNT }}
-      VMIZ_ARTIFACT_SIGNING_PROFILE: ${{ vars.VMIZ_ARTIFACT_SIGNING_PROFILE }}
+      UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/miz
+      MIZ_AZURE_TENANT_ID: ${{ vars.MIZ_AZURE_TENANT_ID }}
+      MIZ_AZURE_CLIENT_ID: ${{ vars.MIZ_AZURE_CLIENT_ID }}
+      MIZ_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.MIZ_ARTIFACT_SIGNING_ENDPOINT }}
+      MIZ_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.MIZ_ARTIFACT_SIGNING_ACCOUNT }}
+      MIZ_ARTIFACT_SIGNING_PROFILE: ${{ vars.MIZ_ARTIFACT_SIGNING_PROFILE }}
     steps:
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -215,19 +215,19 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build install-vmiz
+          zig build install-miz
           test -x "$UKI_SIGN_COMMAND"
 
       - name: Resolve protected signing certificate
         run: |
           set -euo pipefail
           uuid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-          [[ "$VMIZ_AZURE_TENANT_ID" =~ $uuid ]]
-          [[ "$VMIZ_AZURE_CLIENT_ID" =~ $uuid ]]
-          [[ "$VMIZ_ARTIFACT_SIGNING_ENDPOINT" =~ ^https://[a-z0-9.-]+\.codesigning\.azure\.net/?$ ]]
-          [[ "$VMIZ_ARTIFACT_SIGNING_ACCOUNT" =~ ^[A-Za-z0-9._-]{1,128}$ ]]
-          [[ "$VMIZ_ARTIFACT_SIGNING_PROFILE" =~ ^[A-Za-z0-9._-]{1,128}$ ]]
-          certificate="$RUNNER_TEMP/vmiz-uki-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CANDIDATE_KEY}.pem"
+          [[ "$MIZ_AZURE_TENANT_ID" =~ $uuid ]]
+          [[ "$MIZ_AZURE_CLIENT_ID" =~ $uuid ]]
+          [[ "$MIZ_ARTIFACT_SIGNING_ENDPOINT" =~ ^https://[a-z0-9.-]+\.codesigning\.azure\.net/?$ ]]
+          [[ "$MIZ_ARTIFACT_SIGNING_ACCOUNT" =~ ^[A-Za-z0-9._-]{1,128}$ ]]
+          [[ "$MIZ_ARTIFACT_SIGNING_PROFILE" =~ ^[A-Za-z0-9._-]{1,128}$ ]]
+          certificate="$RUNNER_TEMP/miz-uki-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CANDIDATE_KEY}.pem"
           umask 077
           "$UKI_SIGN_COMMAND" sign certificate "$certificate"
           actual=$("$UKI_SIGN_COMMAND" uki fingerprint "$certificate")
@@ -252,15 +252,15 @@ jobs:
           metadata="$scratch/metadata.json"
           cp "$UKI_SIGNING_CERTIFICATE" "$scratch/certificate.pem"
           zig build-exe -target "$target" tests/efi_signing_probe.zig -femit-bin="$unsigned"
-          export VMIZ_UKI_UNSIGNED="$unsigned"
-          export VMIZ_UKI_SIGNED="$signed"
-          export VMIZ_UKI_CERTIFICATE="$UKI_SIGNING_CERTIFICATE"
-          export VMIZ_UKI_ARCHITECTURE="$ARCHITECTURE"
-          export VMIZ_UKI_FLAVOR="$FLAVOR"
-          export VMIZ_UKI_SIGNING_METADATA="$metadata"
-          VMIZ_UKI_UNSIGNED_SHA256=$(sha256sum "$unsigned" | awk '{print $1}')
-          export VMIZ_UKI_UNSIGNED_SHA256
-          export VMIZ_UKI_CERTIFICATE_SHA256="$UKI_SIGNING_CERTIFICATE_SHA256"
+          export MIZ_UKI_UNSIGNED="$unsigned"
+          export MIZ_UKI_SIGNED="$signed"
+          export MIZ_UKI_CERTIFICATE="$UKI_SIGNING_CERTIFICATE"
+          export MIZ_UKI_ARCHITECTURE="$ARCHITECTURE"
+          export MIZ_UKI_FLAVOR="$FLAVOR"
+          export MIZ_UKI_SIGNING_METADATA="$metadata"
+          MIZ_UKI_UNSIGNED_SHA256=$(sha256sum "$unsigned" | awk '{print $1}')
+          export MIZ_UKI_UNSIGNED_SHA256
+          export MIZ_UKI_CERTIFICATE_SHA256="$UKI_SIGNING_CERTIFICATE_SHA256"
           "$UKI_SIGN_COMMAND" sign
           test -s "$signed"
           test -s "$metadata"
@@ -305,11 +305,11 @@ jobs:
         run: |
           set -euo pipefail
           asset="$BUNDLE_DIR/$ASSET_NAME"
-          vmiz="$GITHUB_WORKSPACE/zig-out/bin/vmiz"
+          miz="$GITHUB_WORKSPACE/zig-out/bin/miz"
           test -f "$asset"
-          test -x "$vmiz"
-          "$vmiz" check "$asset"
-          "$vmiz" info --output=json "$asset" > "$BUNDLE_DIR/internal-provenance/image-info.json"
+          test -x "$miz"
+          "$miz" check "$asset"
+          "$miz" info --output=json "$asset" > "$BUNDLE_DIR/internal-provenance/image-info.json"
           python3 - "$BUNDLE_DIR/internal-provenance/image-info.json" "$VIRTUAL_SIZE" <<'PY'
           import json
           import sys
@@ -450,8 +450,8 @@ jobs:
           test -r "$uefi_code"
           test -r "$uefi_vars"
           {
-            echo "VMIZ_UBUNTU2604_UEFI_CODE=$uefi_code"
-            echo "VMIZ_UBUNTU2604_UEFI_VARS=$uefi_vars"
+            echo "MIZ_UBUNTU2604_UEFI_CODE=$uefi_code"
+            echo "MIZ_UBUNTU2604_UEFI_VARS=$uefi_vars"
           } >> "$GITHUB_ENV"
           if [[ ! -c /dev/kvm ]]; then
             echo "::error::Matching-architecture native acceptance requires a KVM-capable runner with /dev/kvm"
@@ -485,7 +485,7 @@ jobs:
           done
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          sudo -E "$(command -v zig)" test packages/vmiz/src/offline_root.zig \
+          sudo -E "$(command -v zig)" test packages/miz/src/offline_root.zig \
             --test-filter "privileged offline namespace"
           sudo chown -R "$(id -u):$(id -g)" .zig-cache .zig-global-cache 2>/dev/null || true
 
@@ -509,9 +509,9 @@ jobs:
           value = json.load(open(manifest_path, encoding="utf-8"))
           signing = value["uki_signing"]
           values = {
-              "VMIZ_UBUNTU2604_IMAGE_SHA256": value["sha256"],
-              "VMIZ_UBUNTU2604_SIGNING_CERTIFICATE_SHA256": signing["certificate_sha256"],
-              "VMIZ_UBUNTU2604_UKI_SHA256": signing["fallback_uki_sha256"],
+              "MIZ_UBUNTU2604_IMAGE_SHA256": value["sha256"],
+              "MIZ_UBUNTU2604_SIGNING_CERTIFICATE_SHA256": signing["certificate_sha256"],
+              "MIZ_UBUNTU2604_UKI_SHA256": signing["fallback_uki_sha256"],
           }
           if any(re.fullmatch(r"[0-9a-f]{64}", item) is None for item in values.values()):
               raise SystemExit("candidate signing bindings are malformed")
@@ -524,9 +524,9 @@ jobs:
           openssl x509 -inform DER \
             -in "$RESULT_DIR/signing-certificate.der" \
             -out "$RESULT_DIR/signing-certificate.pem"
-          echo "VMIZ_UBUNTU2604_IMAGE=$GITHUB_WORKSPACE/$asset" >> "$GITHUB_ENV"
-          echo "VMIZ_UBUNTU2604_SIGNING_CERTIFICATE=$GITHUB_WORKSPACE/$RESULT_DIR/signing-certificate.pem" >> "$GITHUB_ENV"
-          echo "VMIZ_UBUNTU2604_ACCEPTANCE_RESULT=$GITHUB_WORKSPACE/$RESULT_DIR/native-result.json" >> "$GITHUB_ENV"
+          echo "MIZ_UBUNTU2604_IMAGE=$GITHUB_WORKSPACE/$asset" >> "$GITHUB_ENV"
+          echo "MIZ_UBUNTU2604_SIGNING_CERTIFICATE=$GITHUB_WORKSPACE/$RESULT_DIR/signing-certificate.pem" >> "$GITHUB_ENV"
+          echo "MIZ_UBUNTU2604_ACCEPTANCE_RESULT=$GITHUB_WORKSPACE/$RESULT_DIR/native-result.json" >> "$GITHUB_ENV"
 
       - name: Fetch and verify digest-bound Android container smoke inputs
         env:
@@ -568,12 +568,12 @@ jobs:
           test "$(sha256sum "$runtime_path" | awk '{print $1}')" = "$ANDROID_RUNTIME_SHA256_VALUE"
           test "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$ANDROID_BUNDLE_SHA256_VALUE"
           {
-            echo "VMIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT=$ANDROID_RUNTIME_SOURCE_COMMIT_VALUE"
-            echo "VMIZ_UBUNTU2604_ANDROID_RUNTIME=$runtime_path"
-            echo "VMIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256=$ANDROID_RUNTIME_SHA256_VALUE"
-            echo "VMIZ_UBUNTU2604_ANDROID_BUNDLE=$bundle_path"
-            echo "VMIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256=$ANDROID_BUNDLE_SHA256_VALUE"
-            echo "VMIZ_UBUNTU2604_ANDROID_CONFIG_SHA256=$ANDROID_BUNDLE_CONFIG_SHA256_VALUE"
+            echo "MIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT=$ANDROID_RUNTIME_SOURCE_COMMIT_VALUE"
+            echo "MIZ_UBUNTU2604_ANDROID_RUNTIME=$runtime_path"
+            echo "MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256=$ANDROID_RUNTIME_SHA256_VALUE"
+            echo "MIZ_UBUNTU2604_ANDROID_BUNDLE=$bundle_path"
+            echo "MIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256=$ANDROID_BUNDLE_SHA256_VALUE"
+            echo "MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256=$ANDROID_BUNDLE_CONFIG_SHA256_VALUE"
           } >> "$GITHUB_ENV"
 
       - name: Run matching-architecture native Secure Boot core acceptance
@@ -587,7 +587,7 @@ jobs:
             -Dubuntu2604-arch="$ARCHITECTURE" \
             -Dubuntu2604-flavor="$FLAVOR" \
             test-ubuntu2604-acceptance
-          test -s "$VMIZ_UBUNTU2604_ACCEPTANCE_RESULT"
+          test -s "$MIZ_UBUNTU2604_ACCEPTANCE_RESULT"
 
       - name: Validate exact native core acceptance evidence
         run: |
@@ -722,7 +722,7 @@ jobs:
           done
           az version --output json >/dev/null
 
-      - name: Build accepted-source vmiz
+      - name: Build accepted-source miz
         run: |
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
@@ -730,7 +730,7 @@ jobs:
           zig build --fetch \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           zig build -Doptimize=ReleaseSafe
-          test -x zig-out/bin/vmiz
+          test -x zig-out/bin/miz
 
       - name: Build Binder device usability probe
         run: |
@@ -787,12 +787,12 @@ jobs:
           test "$(sha256sum "$runtime_path" | awk '{print $1}')" = "$ANDROID_RUNTIME_SHA256_VALUE"
           test "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$ANDROID_BUNDLE_SHA256_VALUE"
           {
-            echo "VMIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT=$ANDROID_RUNTIME_SOURCE_COMMIT_VALUE"
-            echo "VMIZ_UBUNTU2604_ANDROID_RUNTIME=$runtime_path"
-            echo "VMIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256=$ANDROID_RUNTIME_SHA256_VALUE"
-            echo "VMIZ_UBUNTU2604_ANDROID_BUNDLE=$bundle_path"
-            echo "VMIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256=$ANDROID_BUNDLE_SHA256_VALUE"
-            echo "VMIZ_UBUNTU2604_ANDROID_CONFIG_SHA256=$ANDROID_BUNDLE_CONFIG_SHA256_VALUE"
+            echo "MIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT=$ANDROID_RUNTIME_SOURCE_COMMIT_VALUE"
+            echo "MIZ_UBUNTU2604_ANDROID_RUNTIME=$runtime_path"
+            echo "MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256=$ANDROID_RUNTIME_SHA256_VALUE"
+            echo "MIZ_UBUNTU2604_ANDROID_BUNDLE=$bundle_path"
+            echo "MIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256=$ANDROID_BUNDLE_SHA256_VALUE"
+            echo "MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256=$ANDROID_BUNDLE_CONFIG_SHA256_VALUE"
           } >> "$GITHUB_ENV"
 
       - name: Log in to Azure with protected-environment OIDC
@@ -804,7 +804,7 @@ jobs:
 
       - name: Run exact-digest Azure Trusted Launch core acceptance
         env:
-          VMIZ: ${{ github.workspace }}/zig-out/bin/vmiz
+          MIZ: ${{ github.workspace }}/zig-out/bin/miz
           RUN_ID_VALUE: ${{ github.run_id }}
           RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
         run: |
@@ -1062,7 +1062,7 @@ jobs:
               )
           output = {
               "schema": 1,
-              "type": "vmiz-ubuntu2604-core-validation",
+              "type": "miz-ubuntu2604-core-validation",
               "source_commit": source_commit,
               "candidate_workflow": {
                   "run_id": candidate_run_id,

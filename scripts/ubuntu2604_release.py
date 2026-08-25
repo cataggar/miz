@@ -83,7 +83,7 @@ CORE_AZURE_CONTRACTS = {
     "key-only-ssh",
     "azagent-provisioning",
     "agent-ready",
-    "vmizinit-pid1",
+    "mizinit-pid1",
     "pid1-supervised-sshd",
     "sshd-restart-reconnect",
     "identity-persistence",
@@ -140,8 +140,8 @@ CORE_NATIVE_CONTRACTS = {
     "key-only-ssh",
     "local-ovf-azagent-skip-ready",
     "azagent-provisioning",
-    "vmizinit-pid1",
-    "vmizinit-sshd-supervision",
+    "mizinit-pid1",
+    "mizinit-sshd-supervision",
     "sshd-restart",
     "persistent-provisioned-state",
     "no-cloud-init",
@@ -589,7 +589,7 @@ def validate_ubuntu_provenance(
         fail("Ubuntu build provenance has unexpected fields")
     if (
         document.get("schema") != 1
-        or document.get("type") != "vmiz-ubuntu2604-build-provenance"
+        or document.get("type") != "miz-ubuntu2604-build-provenance"
         or document.get("architecture") != architecture
         or document.get("release") != "26.04"
     ):
@@ -701,7 +701,7 @@ def validate_ubuntu_provenance(
     if not isinstance(debz, dict) or set(debz) != expected_debz_fields:
         fail("debz provenance binding is invalid")
     if debz.get("api_commit") != DEBZ_API_COMMIT:
-        fail("debz API commit is not the embedded vmiz revision")
+        fail("debz API commit is not the embedded miz revision")
     expected_baseline_source = (
         "empty-debz-root" if flavor == "core" else "canonical-image-dpkg-status"
     )
@@ -854,7 +854,7 @@ def validate_signing_provenance(
 ) -> dict[str, object]:
     path = root / f"uki-signing-{flavor}-{architecture}.json"
     document = read_json(path)
-    if document.get("schema") != 1 or document.get("type") != "vmiz-uki-signing":
+    if document.get("schema") != 1 or document.get("type") != "miz-uki-signing":
         fail("invalid UKI signing provenance schema")
     if document.get("architecture") != architecture or document.get("flavor") != flavor:
         fail("UKI signing provenance architecture/flavor mismatch")
@@ -1290,10 +1290,10 @@ def validate_conversion_attestation(
         fail("Azure VHD conversion attestation has unexpected fields")
     if (
         document.get("schema") != 1
-        or document.get("type") != "vmiz-azure-vhd-conversion"
+        or document.get("type") != "miz-azure-vhd-conversion"
         or document.get("key") != candidate["key"]
         or document.get("status") != "success"
-        or document.get("tool") != "vmiz"
+        or document.get("tool") != "miz"
         or document.get("operation") != "azure derive"
     ):
         fail("Azure VHD conversion attestation identity is invalid")
@@ -1546,10 +1546,10 @@ def validate_azure_result(
             "result",
         }
         or conversion.get("schema") != 1
-        or conversion.get("type") != "vmiz-azure-vhd-conversion"
+        or conversion.get("type") != "miz-azure-vhd-conversion"
         or conversion.get("key") != actual_key
         or conversion.get("status") != "success"
-        or conversion.get("tool") != "vmiz"
+        or conversion.get("tool") != "miz"
         or conversion.get("operation") != "azure derive"
     ):
         fail(f"{actual_key}: Azure VHD conversion attestation is invalid")
@@ -1768,10 +1768,10 @@ def _stage_into(args: argparse.Namespace, output: Path, notes: Path) -> None:
                 "result",
             }
             or conversion.get("schema") != 1
-            or conversion.get("type") != "vmiz-azure-vhd-conversion"
+            or conversion.get("type") != "miz-azure-vhd-conversion"
             or conversion.get("key") != key
             or conversion.get("status") != "success"
-            or conversion.get("tool") != "vmiz"
+            or conversion.get("tool") != "miz"
             or conversion.get("operation") != "azure derive"
         ):
             fail(f"{key}: Azure VHD conversion attestation is invalid")
@@ -1875,7 +1875,7 @@ def _stage_into(args: argparse.Namespace, output: Path, notes: Path) -> None:
         output / "publish-manifest.json",
         {
             "schema": 1,
-            "type": "vmiz-ubuntu2604-release",
+            "type": "miz-ubuntu2604-release",
             "release_tag": args.release_tag,
             "source_commit": source_commit,
             "certificate_sha256": release_certificate_sha256,
@@ -2032,7 +2032,7 @@ def parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help=(
-            "harness-produced vmiz-azure-vhd-conversion JSON binding the "
+            "harness-produced miz-azure-vhd-conversion JSON binding the "
             "candidate, azure derive parameters, and observed VHD result"
         ),
     )

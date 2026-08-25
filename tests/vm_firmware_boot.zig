@@ -11,19 +11,19 @@
 //! That needs a bootable image, which no unit test can synthesize, so this is
 //! opt-in and told where to find one:
 //!
-//!   VMIZ_RUN_VM_FIRMWARE_TEST=1
-//!   VMIZ_VM_FIRMWARE_IMAGE=/path/to/bootable.raw
-//!   VMIZ_VM_FIRMWARE_MARKER='Welcome to Azure Linux'
-//!   VMIZ_VM_QEMU=/path/to/qemu-system-<arch>
-//!   VMIZ_VM_FIRMWARE_CODE=/path/to/edk2-code.fd     (optional)
-//!   VMIZ_VM_FIRMWARE_VARS=/path/to/edk2-vars.fd     (optional)
-//!   VMIZ_VM_FIRMWARE_ARCH=x86_64|aarch64            (default: the host's)
-//!   VMIZ_VM_FIRMWARE_SECURE_BOOT=1                  (default: off)
-//!   VMIZ_VM_FIRMWARE_TIMEOUT=<seconds>              (default: 1800)
-//!   VMIZ_VM_FIRMWARE_WORKDIR=/path                  (default: /tmp)
+//!   MIZ_RUN_VM_FIRMWARE_TEST=1
+//!   MIZ_VM_FIRMWARE_IMAGE=/path/to/bootable.raw
+//!   MIZ_VM_FIRMWARE_MARKER='Welcome to Azure Linux'
+//!   MIZ_VM_QEMU=/path/to/qemu-system-<arch>
+//!   MIZ_VM_FIRMWARE_CODE=/path/to/edk2-code.fd     (optional)
+//!   MIZ_VM_FIRMWARE_VARS=/path/to/edk2-vars.fd     (optional)
+//!   MIZ_VM_FIRMWARE_ARCH=x86_64|aarch64            (default: the host's)
+//!   MIZ_VM_FIRMWARE_SECURE_BOOT=1                  (default: off)
+//!   MIZ_VM_FIRMWARE_TIMEOUT=<seconds>              (default: 1800)
+//!   MIZ_VM_FIRMWARE_WORKDIR=/path                  (default: /tmp)
 //!
 //! With the firmware paths unset, resolution goes through the same
-//! `qemu_host` search `vmiz qemu` and the preserved-image builder use, so a
+//! `qemu_host` search `miz qemu` and the preserved-image builder use, so a
 //! `ghr install cataggar/qemu` is enough and this also exercises the
 //! resolution path a real build takes.
 //!
@@ -35,7 +35,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const qemu_host = @import("qemu_host");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -56,22 +56,22 @@ const Settings = struct {
     emulator_path: []const u8,
     code_path: ?[]const u8,
     vars_path: ?[]const u8,
-    architecture: vmiz.customize.Architecture,
-    host_architecture: vmiz.customize.Architecture,
+    architecture: miz.customize.Architecture,
+    host_architecture: miz.customize.Architecture,
     secure_boot: bool,
     timeout_seconds: u32,
     work_root: []const u8,
 
     fn fromEnvironment(environment: *std.process.Environ.Map) ?Settings {
-        const requested = environment.get("VMIZ_RUN_VM_FIRMWARE_TEST") orelse "";
+        const requested = environment.get("MIZ_RUN_VM_FIRMWARE_TEST") orelse "";
         if (!std.mem.eql(u8, requested, "1")) {
             std.debug.print(
-                "skipping vm firmware boot: set VMIZ_RUN_VM_FIRMWARE_TEST=1 to opt in\n",
+                "skipping vm firmware boot: set MIZ_RUN_VM_FIRMWARE_TEST=1 to opt in\n",
                 .{},
             );
             return null;
         }
-        const host_architecture: vmiz.customize.Architecture = switch (builtin.cpu.arch) {
+        const host_architecture: miz.customize.Architecture = switch (builtin.cpu.arch) {
             .x86_64 => .x86_64,
             .aarch64 => .aarch64,
             else => {
@@ -82,33 +82,33 @@ const Settings = struct {
                 return null;
             },
         };
-        const named = environment.get("VMIZ_VM_FIRMWARE_ARCH") orelse
+        const named = environment.get("MIZ_VM_FIRMWARE_ARCH") orelse
             @tagName(host_architecture);
         const architecture = std.meta.stringToEnum(
-            vmiz.customize.Architecture,
+            miz.customize.Architecture,
             named,
         ) orelse {
             std.debug.print(
-                "skipping vm firmware boot: unknown VMIZ_VM_FIRMWARE_ARCH {s}\n",
+                "skipping vm firmware boot: unknown MIZ_VM_FIRMWARE_ARCH {s}\n",
                 .{named},
             );
             return null;
         };
-        const timeout_text = environment.get("VMIZ_VM_FIRMWARE_TIMEOUT") orelse "";
+        const timeout_text = environment.get("MIZ_VM_FIRMWARE_TIMEOUT") orelse "";
         const timeout_seconds = if (timeout_text.len == 0)
-            vmiz.customize.default_vm_firmware_boot_timeout_seconds
+            miz.customize.default_vm_firmware_boot_timeout_seconds
         else
             std.fmt.parseInt(u32, timeout_text, 10) catch {
                 std.debug.print(
-                    "skipping vm firmware boot: VMIZ_VM_FIRMWARE_TIMEOUT is not a number\n",
+                    "skipping vm firmware boot: MIZ_VM_FIRMWARE_TIMEOUT is not a number\n",
                     .{},
                 );
                 return null;
             };
         return .{
-            .image_path = environment.get("VMIZ_VM_FIRMWARE_IMAGE") orelse {
+            .image_path = environment.get("MIZ_VM_FIRMWARE_IMAGE") orelse {
                 std.debug.print(
-                    "skipping vm firmware boot: VMIZ_VM_FIRMWARE_IMAGE is unset\n",
+                    "skipping vm firmware boot: MIZ_VM_FIRMWARE_IMAGE is unset\n",
                     .{},
                 );
                 return null;
@@ -116,28 +116,28 @@ const Settings = struct {
             // Required for the same reason a plan requires it: nothing here
             // knows what the supplied image says on its way up, and a marker
             // this test invented would pass without a boot.
-            .marker = environment.get("VMIZ_VM_FIRMWARE_MARKER") orelse {
+            .marker = environment.get("MIZ_VM_FIRMWARE_MARKER") orelse {
                 std.debug.print(
-                    "skipping vm firmware boot: VMIZ_VM_FIRMWARE_MARKER is unset\n",
+                    "skipping vm firmware boot: MIZ_VM_FIRMWARE_MARKER is unset\n",
                     .{},
                 );
                 return null;
             },
-            .emulator_path = environment.get("VMIZ_VM_QEMU") orelse {
-                std.debug.print("skipping vm firmware boot: VMIZ_VM_QEMU is unset\n", .{});
+            .emulator_path = environment.get("MIZ_VM_QEMU") orelse {
+                std.debug.print("skipping vm firmware boot: MIZ_VM_QEMU is unset\n", .{});
                 return null;
             },
-            .code_path = environment.get("VMIZ_VM_FIRMWARE_CODE"),
-            .vars_path = environment.get("VMIZ_VM_FIRMWARE_VARS"),
+            .code_path = environment.get("MIZ_VM_FIRMWARE_CODE"),
+            .vars_path = environment.get("MIZ_VM_FIRMWARE_VARS"),
             .architecture = architecture,
             .host_architecture = host_architecture,
             .secure_boot = std.mem.eql(
                 u8,
-                environment.get("VMIZ_VM_FIRMWARE_SECURE_BOOT") orelse "0",
+                environment.get("MIZ_VM_FIRMWARE_SECURE_BOOT") orelse "0",
                 "1",
             ),
             .timeout_seconds = timeout_seconds,
-            .work_root = environment.get("VMIZ_VM_FIRMWARE_WORKDIR") orelse "/tmp",
+            .work_root = environment.get("MIZ_VM_FIRMWARE_WORKDIR") orelse "/tmp",
         };
     }
 };
@@ -150,7 +150,7 @@ fn runAttestation(allocator: Allocator, io: Io, settings: Settings) !void {
     const random_hex = std.fmt.bytesToHex(random, .lower);
     const transaction_path = try std.fmt.allocPrint(
         allocator,
-        "{s}/vmiz-vm-firmware-{s}",
+        "{s}/miz-vm-firmware-{s}",
         .{ settings.work_root, &random_hex },
     );
     try cwd.createDirPath(io, transaction_path);
@@ -165,14 +165,14 @@ fn runAttestation(allocator: Allocator, io: Io, settings: Settings) !void {
     const before = try digestOfFile(io, settings.image_path);
     const vars_before = try digestOfFile(io, firmware_paths.vars_path);
 
-    const firmware = vmiz.customize.VmFirmware{
+    const firmware = miz.customize.VmFirmware{
         .code_path = firmware_paths.code_path,
         .vars_path = firmware_paths.vars_path,
         .console_marker = settings.marker,
         .secure_boot = settings.secure_boot,
         .boot_timeout_seconds = settings.timeout_seconds,
     };
-    const policy = vmiz.customize.VmPolicy{
+    const policy = miz.customize.VmPolicy{
         .emulator_command = settings.emulator_path,
         .boot = .{ .firmware = firmware },
         // A cross-architecture attestation has no accelerator to use, and a
@@ -183,7 +183,7 @@ fn runAttestation(allocator: Allocator, io: Io, settings: Settings) !void {
         .vcpus = 2,
     };
 
-    const attestation = vmiz.vm_backend.attestFirmwareBoot(allocator, io, .{
+    const attestation = miz.vm_backend.attestFirmwareBoot(allocator, io, .{
         .policy = policy,
         .firmware = firmware,
         .architecture = settings.architecture,

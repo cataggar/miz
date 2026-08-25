@@ -1,8 +1,8 @@
-//! `vmiz uki certificate <disk-image> --output <certificate.pem>`
-//! `vmiz uki certificate <disk-image> --output=json`
+//! `miz uki certificate <disk-image> --output <certificate.pem>`
+//! `miz uki certificate <disk-image> --output=json`
 
 const std = @import("std");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 const atomic_output = @import("../atomic_output.zig");
 
 const Allocator = std.mem.Allocator;
@@ -12,12 +12,12 @@ const Dir = std.Io.Dir;
 const max_signed_pe_bytes = 512 * 1024 * 1024;
 
 const usage =
-    "usage: vmiz uki certificate <disk-image> --output <certificate.pem> " ++
+    "usage: miz uki certificate <disk-image> --output <certificate.pem> " ++
     "[--expected-sha256 <hex>]\n" ++
-    "       vmiz uki certificate <disk-image> --output=json " ++
+    "       miz uki certificate <disk-image> --output=json " ++
     "[--expected-sha256 <hex>]\n" ++
-    "       vmiz uki fingerprint <certificate.pem>\n" ++
-    "       vmiz uki verify --certificate <certificate.pem> <signed-pe>";
+    "       miz uki fingerprint <certificate.pem>\n" ++
+    "       miz uki verify --certificate <certificate.pem> <signed-pe>";
 
 const Output = union(enum) {
     pem: []const u8,
@@ -27,7 +27,7 @@ const Output = union(enum) {
 const ParsedArgs = struct {
     image_path: []const u8,
     output: Output,
-    expected_sha256: ?vmiz.artifact_pipeline.Digest,
+    expected_sha256: ?miz.artifact_pipeline.Digest,
 };
 
 const ParseError = error{
@@ -45,7 +45,7 @@ const ParseError = error{
 
 pub fn run(allocator: Allocator, io: Io, args: []const []const u8) u8 {
     if (args.len == 0) {
-        std.debug.print("vmiz uki: expected a subcommand\n{s}\n", .{usage});
+        std.debug.print("miz uki: expected a subcommand\n{s}\n", .{usage});
         return 1;
     }
     if (std.mem.eql(u8, args[0], "certificate"))
@@ -55,7 +55,7 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) u8 {
     if (std.mem.eql(u8, args[0], "verify"))
         return runVerify(allocator, io, args[1..]);
     std.debug.print(
-        "vmiz uki: unknown subcommand '{s}'\n{s}\n",
+        "miz uki: unknown subcommand '{s}'\n{s}\n",
         .{ args[0], usage },
     );
     return 1;
@@ -64,13 +64,13 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) u8 {
 fn runCertificate(allocator: Allocator, io: Io, args: []const []const u8) u8 {
     const parsed = parseArgs(args) catch |err| {
         std.debug.print(
-            "vmiz uki: {s}\n{s}\n",
+            "miz uki: {s}\n{s}\n",
             .{ @errorName(err), usage },
         );
         return 1;
     };
 
-    var image = vmiz.Image.openPathReadOnlyStandalone(
+    var image = miz.Image.openPathReadOnlyStandalone(
         io,
         parsed.image_path,
     ) catch |err|
@@ -79,7 +79,7 @@ fn runCertificate(allocator: Allocator, io: Io, args: []const []const u8) u8 {
             .{ parsed.image_path, @errorName(err) },
         );
     defer image.close(io);
-    var result = vmiz.uki_certificate.extractAlloc(
+    var result = miz.uki_certificate.extractAlloc(
         allocator,
         io,
         &image,
@@ -90,7 +90,7 @@ fn runCertificate(allocator: Allocator, io: Io, args: []const []const u8) u8 {
     );
     defer result.deinit(allocator);
 
-    const pem = vmiz.authenticode.encodePemCertificateAlloc(
+    const pem = miz.authenticode.encodePemCertificateAlloc(
         allocator,
         result.certificate_der,
     ) catch |err| return fail(
@@ -146,12 +146,12 @@ fn runCertificate(allocator: Allocator, io: Io, args: []const []const u8) u8 {
 fn runFingerprint(allocator: Allocator, io: Io, args: []const []const u8) u8 {
     if (args.len != 1 or std.mem.startsWith(u8, args[0], "-")) {
         std.debug.print(
-            "usage: vmiz uki fingerprint <certificate.pem>\n",
+            "usage: miz uki fingerprint <certificate.pem>\n",
             .{},
         );
         return 1;
     }
-    var certificate = vmiz.uki_signing.loadCertificateAlloc(
+    var certificate = miz.uki_signing.loadCertificateAlloc(
         allocator,
         io,
         .{ .host_path = args[0] },
@@ -160,7 +160,7 @@ fn runFingerprint(allocator: Allocator, io: Io, args: []const []const u8) u8 {
         .{ args[0], @errorName(err) },
     );
     defer certificate.deinit(allocator);
-    const fingerprint = vmiz.artifact_pipeline.formatSha256(certificate.sha256);
+    const fingerprint = miz.artifact_pipeline.formatSha256(certificate.sha256);
     writeStdout(io, &fingerprint) catch |err| return failFingerprint(
         "failed to write fingerprint: {s}",
         .{@errorName(err)},
@@ -210,7 +210,7 @@ fn parseVerifyArgs(args: []const []const u8) VerifyParseError!VerifyArgs {
 fn runVerify(allocator: Allocator, io: Io, args: []const []const u8) u8 {
     const parsed = parseVerifyArgs(args) catch |err| {
         std.debug.print(
-            "vmiz uki verify: {s}\nusage: vmiz uki verify " ++
+            "miz uki verify: {s}\nusage: miz uki verify " ++
                 "--certificate <certificate.pem> <signed-pe>\n",
             .{@errorName(err)},
         );
@@ -231,13 +231,13 @@ fn runVerify(allocator: Allocator, io: Io, args: []const []const u8) u8 {
     // Full native Authenticode verification: this fails closed on tampering,
     // an unsupported algorithm, an invalid validity interval, a malformed
     // certificate table, or a digest that does not cover the image.
-    const signer = vmiz.authenticode.verifyRsaSha256(signed_bytes) catch |err|
+    const signer = miz.authenticode.verifyRsaSha256(signed_bytes) catch |err|
         return failVerify(
             "signature verification failed: {s}",
             .{@errorName(err)},
         );
 
-    var certificate = vmiz.uki_signing.loadCertificateAlloc(
+    var certificate = miz.uki_signing.loadCertificateAlloc(
         allocator,
         io,
         .{ .host_path = parsed.certificate_path },
@@ -255,7 +255,7 @@ fn runVerify(allocator: Allocator, io: Io, args: []const []const u8) u8 {
             .{parsed.certificate_path},
         );
 
-    const fingerprint = vmiz.artifact_pipeline.formatSha256(certificate.sha256);
+    const fingerprint = miz.artifact_pipeline.formatSha256(certificate.sha256);
     reportVerified(io, parsed.signed_path, &fingerprint) catch |err|
         return failVerify(
             "failed to report verification: {s}",
@@ -280,12 +280,12 @@ fn reportVerified(
 }
 
 fn failFingerprint(comptime format: []const u8, args: anytype) u8 {
-    std.debug.print("vmiz uki fingerprint: " ++ format ++ "\n", args);
+    std.debug.print("miz uki fingerprint: " ++ format ++ "\n", args);
     return 1;
 }
 
 fn failVerify(comptime format: []const u8, args: anytype) u8 {
-    std.debug.print("vmiz uki verify: " ++ format ++ "\n", args);
+    std.debug.print("miz uki verify: " ++ format ++ "\n", args);
     return 1;
 }
 
@@ -296,7 +296,7 @@ fn parseArgs(args: []const []const u8) ParseError!ParsedArgs {
 
     var image_path: ?[]const u8 = null;
     var output: ?Output = null;
-    var expected_sha256: ?vmiz.artifact_pipeline.Digest = null;
+    var expected_sha256: ?miz.artifact_pipeline.Digest = null;
     var expected_sha256_set = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -315,7 +315,7 @@ fn parseArgs(args: []const []const u8) ParseError!ParsedArgs {
             expected_sha256_set = true;
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
-            expected_sha256 = vmiz.artifact_pipeline.parseSha256(
+            expected_sha256 = miz.artifact_pipeline.parseSha256(
                 args[i],
             ) catch return error.InvalidSha256;
         } else if (std.mem.startsWith(u8, argument, "-")) {
@@ -335,10 +335,10 @@ fn parseArgs(args: []const []const u8) ParseError!ParsedArgs {
 
 fn jsonAlloc(
     allocator: Allocator,
-    result: vmiz.uki_certificate.Result,
+    result: miz.uki_certificate.Result,
     pem: []const u8,
 ) ![]u8 {
-    const fingerprint = vmiz.artifact_pipeline.formatSha256(
+    const fingerprint = miz.artifact_pipeline.formatSha256(
         result.certificate_sha256,
     );
     const subject = try base64Alloc(allocator, result.subject_der);
@@ -395,9 +395,9 @@ fn writeStdout(io: Io, bytes: []const u8) !void {
 fn writeHuman(
     io: Io,
     output_path: []const u8,
-    result: vmiz.uki_certificate.Result,
+    result: miz.uki_certificate.Result,
 ) !void {
-    const fingerprint = vmiz.artifact_pipeline.formatSha256(
+    const fingerprint = miz.artifact_pipeline.formatSha256(
         result.certificate_sha256,
     );
     var buffer: [4096]u8 = undefined;
@@ -426,7 +426,7 @@ fn sameResolvedPath(
 }
 
 fn fail(comptime format: []const u8, args: anytype) u8 {
-    std.debug.print("vmiz uki certificate: " ++ format ++ "\n", args);
+    std.debug.print("miz uki certificate: " ++ format ++ "\n", args);
     return 1;
 }
 
@@ -474,8 +474,8 @@ test "JSON output exposes canonical signer fields" {
     var serial = [_]u8{ 0x00, 0xaf };
     var path = "EFI/BOOT/BOOTX64.EFI".*;
     var paths = [_][]u8{&path};
-    const digest = vmiz.artifact_pipeline.sha256Bytes(&certificate);
-    const result = vmiz.uki_certificate.Result{
+    const digest = miz.artifact_pipeline.sha256Bytes(&certificate);
+    const result = miz.uki_certificate.Result{
         .certificate_der = &certificate,
         .certificate_sha256 = digest,
         .subject_der = &subject,

@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -9,8 +9,8 @@ const disk_size: u64 = 160 * 1024 * 1024;
 const fixture_executable_max_size: usize = 128 * 1024 * 1024;
 const partition_first_lba: u32 = 2048;
 const partition_sectors: u32 = 300 * 1024;
-const partition_offset = @as(u64, partition_first_lba) * vmiz.mbr.sector_size;
-const partition_length = @as(u64, partition_sectors) * vmiz.mbr.sector_size;
+const partition_offset = @as(u64, partition_first_lba) * miz.mbr.sector_size;
+const partition_length = @as(u64, partition_sectors) * miz.mbr.sector_size;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -46,14 +46,14 @@ pub fn main(init: std.process.Init) !void {
     if (argv.len == 3 and
         std.mem.eql(u8, argv[1], "--unsafe-chroot-worker"))
     {
-        return vmiz.unsafe_chroot.workerMain(init, argv[2]);
+        return miz.unsafe_chroot.workerMain(init, argv[2]);
     }
     if (builtin.os.tag != .linux) {
         std.debug.print("skipping unsafe-chroot integration: Linux is required\n", .{});
         return;
     }
     const explicitly_requested = if (init.environ_map.get(
-        "VMIZ_RUN_PRIVILEGED_TEST",
+        "MIZ_RUN_PRIVILEGED_TEST",
     )) |value|
         std.mem.eql(u8, value, "1")
     else
@@ -62,7 +62,7 @@ pub fn main(init: std.process.Init) !void {
         std.mem.eql(u8, argv[1], "--privileged");
     if (!explicitly_requested and !privileged_child) {
         std.debug.print(
-            "skipping unsafe-chroot integration: set VMIZ_RUN_PRIVILEGED_TEST=1 to opt in\n",
+            "skipping unsafe-chroot integration: set MIZ_RUN_PRIVILEGED_TEST=1 to opt in\n",
             .{},
         );
         return;
@@ -98,7 +98,7 @@ fn runIntegration(
     io: Io,
     self_exe: []const u8,
 ) !void {
-    if (vmiz.unsafe_chroot.available(io) != .available) {
+    if (miz.unsafe_chroot.available(io) != .available) {
         return error.UnsafeChrootHostUnavailable;
     }
 
@@ -107,7 +107,7 @@ fn runIntegration(
     const random_hex = std.fmt.bytesToHex(random, .lower);
     const work_path = try std.fmt.allocPrint(
         allocator,
-        "/tmp/vmiz-unsafe-chroot-integration-{s}",
+        "/tmp/miz-unsafe-chroot-integration-{s}",
         .{&random_hex},
     );
     const source_path = try std.fs.path.join(
@@ -150,16 +150,16 @@ fn runIntegration(
         .{},
     );
 
-    const actions = [_]vmiz.customize.PackageAction{
+    const actions = [_]miz.customize.PackageAction{
         .{ .install = &.{"integration-package"} },
         .{ .remove = &.{"obsolete-package"} },
     };
-    const repositories = [_]vmiz.customize.PackageRepository{.{
+    const repositories = [_]miz.customize.PackageRepository{.{
         .id = "integration",
         .urls = &.{"https://packages.example.invalid"},
         .trust = &.{.{ .inline_bytes = "integration trust\n" }},
     }};
-    const architecture: vmiz.customize.Architecture = switch (builtin.cpu.arch) {
+    const architecture: miz.customize.Architecture = switch (builtin.cpu.arch) {
         .x86_64 => .x86_64,
         .aarch64 => .aarch64,
         else => return error.UnsupportedArchitecture,
@@ -168,7 +168,7 @@ fn runIntegration(
     // actually hold. The install below is checked against the pinned spec
     // rather than the bare name, which is the observable difference between a
     // lock that is enforced and one that is merely recorded.
-    const lock = [_]vmiz.customize.PackageVersionLock{.{
+    const lock = [_]miz.customize.PackageVersionLock{.{
         .name = "integration-package",
         .evr = "0:1.0-1",
         .architecture = @tagName(builtin.cpu.arch),
@@ -177,7 +177,7 @@ fn runIntegration(
     // from this run only in where its packages came from, which is what makes
     // the comparison say something about the cache rather than about two
     // unrelated builds.
-    var request = vmiz.customize.Request{
+    var request = miz.customize.Request{
         .target_architecture = architecture,
         .input = .{ .disk = .{ .path = source_path } },
         .output = .{
@@ -210,7 +210,7 @@ fn runIntegration(
             .source_date_epoch = 1_735_689_600,
         },
     };
-    var resolved = try vmiz.customize.resolve(allocator, &request, .{
+    var resolved = try miz.customize.resolve(allocator, &request, .{
         .host_architecture = architecture,
     });
     defer resolved.deinit(allocator);
@@ -219,11 +219,11 @@ fn runIntegration(
     }
 
     var context = RuntimeContext{ .self_exe = self_exe };
-    var platform = vmiz.customize.Platform.system();
+    var platform = miz.customize.Platform.system();
     platform.context = &context;
     platform.unsafeChrootCheckFn = checkUnsafeChroot;
     platform.unsafeChrootRunFn = runUnsafeChroot;
-    var preflight = try vmiz.customize.preflight(
+    var preflight = try miz.customize.preflight(
         allocator,
         io,
         &resolved.plan.?,
@@ -232,7 +232,7 @@ fn runIntegration(
     defer preflight.deinit(allocator);
     if (!preflight.ready()) return error.IntegrationPreflightFailed;
 
-    var outcome = try vmiz.customize.execute(
+    var outcome = try miz.customize.execute(
         allocator,
         io,
         &resolved.plan.?,
@@ -399,21 +399,21 @@ fn runIntegration(
         allocator,
         io,
         output_path,
-        "/var/lib/vmiz-integration/trust",
+        "/var/lib/miz-integration/trust",
         "trusted\n",
     );
     try expectOutputFile(
         allocator,
         io,
         output_path,
-        "/var/lib/vmiz-integration/installed",
+        "/var/lib/miz-integration/installed",
         installed_nevra ++ "\n",
     );
     try expectOutputFile(
         allocator,
         io,
         output_path,
-        "/var/lib/vmiz-integration/removed",
+        "/var/lib/miz-integration/removed",
         "obsolete-package\n",
     );
     try expectOutputFile(
@@ -458,7 +458,7 @@ fn runIntegration(
         allocator,
         io,
         source_path,
-        "/var/lib/vmiz-integration/installed",
+        "/var/lib/miz-integration/installed",
     );
 
     try expectPathAbsent(io, resolved.plan.?.data.transaction_path);
@@ -470,7 +470,7 @@ fn runIntegration(
         return error.MissingPackageCacheProvenance;
     try ensure(!populated.offline);
     try ensure(std.mem.eql(u8, populated.host_path, cache_path));
-    try ensure(std.mem.eql(u8, populated.guest_path, "/run/vmiz-cache"));
+    try ensure(std.mem.eql(u8, populated.guest_path, "/run/miz-cache"));
     try expectHostFile(
         allocator,
         io,
@@ -484,7 +484,7 @@ fn runIntegration(
     // in the result is a difference the cache policy made.
     request.output.path = offline_output_path;
     request.packages.cache = .{ .cache_only = cache_path };
-    var offline_resolved = try vmiz.customize.resolve(allocator, &request, .{
+    var offline_resolved = try miz.customize.resolve(allocator, &request, .{
         .host_architecture = architecture,
     });
     defer offline_resolved.deinit(allocator);
@@ -498,7 +498,7 @@ fn runIntegration(
         &resolved.plan.?.data.plan_hash.bytes,
         &offline_resolved.plan.?.data.plan_hash.bytes,
     ));
-    var offline_preflight = try vmiz.customize.preflight(
+    var offline_preflight = try miz.customize.preflight(
         allocator,
         io,
         &offline_resolved.plan.?,
@@ -507,7 +507,7 @@ fn runIntegration(
     defer offline_preflight.deinit(allocator);
     if (!offline_preflight.ready()) return error.IntegrationPreflightFailed;
 
-    var offline_outcome = try vmiz.customize.execute(
+    var offline_outcome = try miz.customize.execute(
         allocator,
         io,
         &offline_resolved.plan.?,
@@ -531,7 +531,7 @@ fn runIntegration(
         return error.MissingPackageCacheProvenance;
     try ensure(consumed.offline);
     try ensure(std.mem.eql(u8, consumed.host_path, cache_path));
-    try ensure(std.mem.eql(u8, consumed.guest_path, "/run/vmiz-cache"));
+    try ensure(std.mem.eql(u8, consumed.guest_path, "/run/miz-cache"));
 
     // The run that read the cache installed the same package the run that
     // filled it did. The stub records what it was asked for, so this is the
@@ -540,7 +540,7 @@ fn runIntegration(
         allocator,
         io,
         offline_output_path,
-        "/var/lib/vmiz-integration/installed",
+        "/var/lib/miz-integration/installed",
         installed_nevra ++ "\n",
     );
     try ensure(offline_preserved.emitted_package_lock.len == 1);
@@ -606,10 +606,10 @@ const deadline_integration_seconds: u32 = 20;
 fn runDeadlineIntegration(
     allocator: Allocator,
     io: Io,
-    platform: vmiz.customize.Platform,
-    base_request: vmiz.customize.Request,
+    platform: miz.customize.Platform,
+    base_request: miz.customize.Request,
     work_path: []const u8,
-    architecture: vmiz.customize.Architecture,
+    architecture: miz.customize.Architecture,
 ) !void {
     const output_path = try std.fs.path.join(
         allocator,
@@ -621,7 +621,7 @@ fn runDeadlineIntegration(
     // binary the package stubs are, under a name that makes it sleep. The
     // script itself is never reached, which is the point -- what is being
     // bounded is a command that has started and will not finish.
-    const hooks = [_]vmiz.customize.Hook{.{
+    const hooks = [_]miz.customize.Hook{.{
         .name = "hang",
         .phase = .before_seal,
         .source = .{ .inline_script = "#!/usr/bin/hang\n" },
@@ -631,7 +631,7 @@ fn runDeadlineIntegration(
     request.hooks = &hooks;
     request.execution.deadline_seconds = deadline_integration_seconds;
 
-    var resolved = try vmiz.customize.resolve(allocator, &request, .{
+    var resolved = try miz.customize.resolve(allocator, &request, .{
         .host_architecture = architecture,
     });
     defer resolved.deinit(allocator);
@@ -641,7 +641,7 @@ fn runDeadlineIntegration(
     try ensure(resolved.plan.?.data.execution.deadline_seconds.? ==
         deadline_integration_seconds);
 
-    var outcome = try vmiz.customize.execute(
+    var outcome = try miz.customize.execute(
         allocator,
         io,
         &resolved.plan.?,
@@ -690,10 +690,10 @@ fn runForeignRootIntegration(
     allocator: Allocator,
     io: Io,
     self_exe: []const u8,
-    platform: vmiz.customize.Platform,
-    base_request: vmiz.customize.Request,
+    platform: miz.customize.Platform,
+    base_request: miz.customize.Request,
     work_path: []const u8,
-    architecture: vmiz.customize.Architecture,
+    architecture: miz.customize.Architecture,
 ) !void {
     const foreign_source_path = try std.fs.path.join(
         allocator,
@@ -723,7 +723,7 @@ fn runForeignRootIntegration(
     // run created. This run must fail before it would have been consulted.
     request.packages.cache = .online;
 
-    var resolved = try vmiz.customize.resolve(allocator, &request, .{
+    var resolved = try miz.customize.resolve(allocator, &request, .{
         .host_architecture = architecture,
     });
     defer resolved.deinit(allocator);
@@ -734,7 +734,7 @@ fn runForeignRootIntegration(
         return error.ForeignRootResolutionFailed;
     }
 
-    var outcome = try vmiz.customize.execute(
+    var outcome = try miz.customize.execute(
         allocator,
         io,
         &resolved.plan.?,
@@ -782,7 +782,7 @@ fn runForeignRootIntegration(
     quiet.selinux = .unchanged;
     quiet.boot_security = .{};
 
-    var quiet_resolved = try vmiz.customize.resolve(allocator, &quiet, .{
+    var quiet_resolved = try miz.customize.resolve(allocator, &quiet, .{
         .host_architecture = architecture,
     });
     defer quiet_resolved.deinit(allocator);
@@ -790,7 +790,7 @@ fn runForeignRootIntegration(
         return error.QuietRootResolutionFailed;
     }
 
-    var quiet_outcome = try vmiz.customize.execute(
+    var quiet_outcome = try miz.customize.execute(
         allocator,
         io,
         &quiet_resolved.plan.?,
@@ -845,21 +845,21 @@ const RuntimeContext = struct {
 fn checkUnsafeChroot(
     _: ?*anyopaque,
     io: Io,
-    _: *const vmiz.customize.ResolvedPlan,
-) vmiz.customize.CapabilityState {
-    return vmiz.unsafe_chroot.available(io);
+    _: *const miz.customize.ResolvedPlan,
+) miz.customize.CapabilityState {
+    return miz.unsafe_chroot.available(io);
 }
 
 fn runUnsafeChroot(
     context_ptr: ?*anyopaque,
     allocator: Allocator,
     io: Io,
-    plan: *const vmiz.customize.ResolvedPlan,
-    target: vmiz.preserved_image.RawMutationTarget,
-    deadline: vmiz.customize.Deadline,
-) !vmiz.customize.UnsafeChrootRuntimeReport {
+    plan: *const miz.customize.ResolvedPlan,
+    target: miz.preserved_image.RawMutationTarget,
+    deadline: miz.customize.Deadline,
+) !miz.customize.UnsafeChrootRuntimeReport {
     const context: *RuntimeContext = @ptrCast(@alignCast(context_ptr.?));
-    return vmiz.unsafe_chroot.runParent(allocator, io, .{
+    return miz.unsafe_chroot.runParent(allocator, io, .{
         .deadline = deadline,
         .self_exe = context.self_exe,
         .transaction_path = plan.data.transaction_path,
@@ -897,7 +897,7 @@ fn createSourceDisk(
     );
     defer allocator.free(executable);
 
-    var image = try vmiz.Image.createExclusive(
+    var image = try miz.Image.createExclusive(
         io,
         source_path,
         .raw,
@@ -905,13 +905,13 @@ fn createSourceDisk(
         .{},
     );
     defer image.close(io);
-    const boot_record = vmiz.mbr.singleLinuxPartitionMbr(
+    const boot_record = miz.mbr.singleLinuxPartitionMbr(
         partition_first_lba,
         partition_sectors,
     ).encode();
     try image.pwrite(io, &boot_record, 0);
 
-    var tree = try vmiz.root_tree.RootTree.init(
+    var tree = try miz.root_tree.RootTree.init(
         allocator,
         io,
         spool_path,
@@ -936,7 +936,7 @@ fn createSourceDisk(
         "usr/sbin",
         "var",
         "var/lib",
-        "var/lib/vmiz-integration",
+        "var/lib/miz-integration",
     }) |path| {
         try tree.putDirectory(path, .{ .mode = 0o755 });
     }
@@ -1001,7 +1001,7 @@ fn createSourceDisk(
         "/.*  system_u:object_r:default_t:s0\n",
         .{ .mode = 0o644 },
     );
-    _ = try vmiz.ext4.populate(
+    _ = try miz.ext4.populate(
         io,
         image.file,
         allocator,
@@ -1021,7 +1021,7 @@ fn createSourceDisk(
 /// image also uses would not tell a read apart from a default.
 const integration_selinux_policy = "integration";
 
-const integration_relabel_marker = "/var/lib/vmiz-integration/relabel";
+const integration_relabel_marker = "/var/lib/miz-integration/relabel";
 
 const integration_relabel_argv = [_][]const u8{
     "/usr/sbin/setfiles",
@@ -1083,7 +1083,7 @@ fn runGuestRpm(io: Io, args: []const []const u8) !void {
     if (containsArg(args, "--import")) {
         const trust_path = argumentImmediatelyAfter(args, "--import") orelse
             return error.UnexpectedRpmInvocation;
-        if (!std.mem.eql(u8, trust_path, "/run/vmiz-trust-0.asc")) {
+        if (!std.mem.eql(u8, trust_path, "/run/miz-trust-0.asc")) {
             return error.UnexpectedTrustPath;
         }
         var trust_buffer: [64]u8 = undefined;
@@ -1108,7 +1108,7 @@ fn runGuestRpm(io: Io, args: []const []const u8) !void {
         }
         try writeGuestMarker(
             io,
-            "/var/lib/vmiz-integration/trust",
+            "/var/lib/miz-integration/trust",
             "trusted",
         );
         return;
@@ -1124,10 +1124,10 @@ fn runGuestRpm(io: Io, args: []const []const u8) !void {
         // has run, standing for a key tdnf imports on its own under gpgcheck.
         // Neither belongs in a lock: `(none)` is not an architecture the pin
         // rules accept, so a lock naming one could never be restated.
-        if (guestPathExists(io, "/var/lib/vmiz-integration/trust")) {
+        if (guestPathExists(io, "/var/lib/miz-integration/trust")) {
             std.debug.print("{s}\n", .{declared_trust_nevra});
         }
-        if (guestPathExists(io, "/var/lib/vmiz-integration/installed")) {
+        if (guestPathExists(io, "/var/lib/miz-integration/installed")) {
             std.debug.print("{s}\n", .{installed_nevra});
             std.debug.print("{s}\n", .{transaction_trust_nevra});
         }
@@ -1152,7 +1152,7 @@ fn runGuestTdnf(io: Io, args: []const []const u8) !void {
         // and another read it.
         try expectGuestFile(
             io,
-            "/run/vmiz-cache/" ++ integration_cache_download,
+            "/run/miz-cache/" ++ integration_cache_download,
             integration_cache_payload ++ "\n",
         );
         // Bound read-only, so the run cannot change the input it is
@@ -1160,7 +1160,7 @@ fn runGuestTdnf(io: Io, args: []const []const u8) !void {
         // the parent can say so rather than the failure being swallowed here.
         if (Io.Dir.cwd().createFile(
             io,
-            "/run/vmiz-cache/offline-write",
+            "/run/miz-cache/offline-write",
             .{},
         )) |file| {
             file.close(io);
@@ -1169,23 +1169,23 @@ fn runGuestTdnf(io: Io, args: []const []const u8) !void {
         // No resolver at all rather than one that resolves nothing: with no
         // `/etc/resolv.conf` the target cannot reach a name server even if
         // something in it tried.
-        if (guestPathExists(io, "/run/vmiz-resolv.conf")) {
+        if (guestPathExists(io, "/run/miz-resolv.conf")) {
             return error.OfflineRunCarriedResolver;
         }
     } else {
-        if (!guestPathExists(io, "/run/vmiz-resolv.conf")) {
+        if (!guestPathExists(io, "/run/miz-resolv.conf")) {
             return error.OnlineRunLackedResolver;
         }
         try writeGuestMarker(
             io,
-            "/run/vmiz-cache/" ++ integration_cache_download,
+            "/run/miz-cache/" ++ integration_cache_download,
             integration_cache_payload,
         );
     }
     if (argumentAfter(args, "install")) |package| {
         try writeGuestMarker(
             io,
-            "/var/lib/vmiz-integration/installed",
+            "/var/lib/miz-integration/installed",
             package,
         );
         return;
@@ -1193,7 +1193,7 @@ fn runGuestTdnf(io: Io, args: []const []const u8) !void {
     if (argumentAfter(args, "remove")) |package| {
         try writeGuestMarker(
             io,
-            "/var/lib/vmiz-integration/removed",
+            "/var/lib/miz-integration/removed",
             package,
         );
         return;
@@ -1319,7 +1319,7 @@ fn runGuestCp(io: Io, args: []const []const u8) !void {
 /// manager was actually told.
 fn checkGuestCacheConfiguration(io: Io) !void {
     var buffer: [512]u8 = undefined;
-    const file = try Io.Dir.cwd().openFile(io, "/run/vmiz-tdnf.conf", .{
+    const file = try Io.Dir.cwd().openFile(io, "/run/miz-tdnf.conf", .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,
@@ -1330,7 +1330,7 @@ fn checkGuestCacheConfiguration(io: Io) !void {
     const length: usize = @intCast(size);
     const read = try file.readPositionalAll(io, buffer[0..length], 0);
     const body = buffer[0..read];
-    if (std.mem.indexOf(u8, body, "cachedir=/run/vmiz-cache\n") == null or
+    if (std.mem.indexOf(u8, body, "cachedir=/run/miz-cache\n") == null or
         std.mem.indexOf(u8, body, "keepcache=1\n") == null)
     {
         return error.UnexpectedTdnfConfiguration;
@@ -1423,9 +1423,9 @@ fn expectOutputFile(
     guest_path: []const u8,
     expected: []const u8,
 ) !void {
-    var image = try vmiz.Image.openPathReadOnly(io, image_path);
+    var image = try miz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
-    var reader = try vmiz.ext4.open(io, image.file, allocator, .{
+    var reader = try miz.ext4.open(io, image.file, allocator, .{
         .offset = partition_offset,
     });
     defer reader.deinit();
@@ -1442,9 +1442,9 @@ fn expectMissingFile(
     image_path: []const u8,
     guest_path: []const u8,
 ) !void {
-    var image = try vmiz.Image.openPathReadOnly(io, image_path);
+    var image = try miz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
-    var reader = try vmiz.ext4.open(io, image.file, allocator, .{
+    var reader = try miz.ext4.open(io, image.file, allocator, .{
         .offset = partition_offset,
     });
     defer reader.deinit();
@@ -1508,7 +1508,7 @@ fn expectPathAbsent(io: Io, path: []const u8) !void {
 /// run spawned. Looked up by name rather than pinned to an index, because the
 /// list now includes the host plumbing and its length is a detail of how many
 /// mounts the policy needed.
-fn indexOfTool(tools: []const vmiz.customize.ToolRecord, name: []const u8) ?usize {
+fn indexOfTool(tools: []const miz.customize.ToolRecord, name: []const u8) ?usize {
     for (tools, 0..) |tool, index| {
         if (std.mem.eql(u8, tool.name, name)) return index;
     }

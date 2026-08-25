@@ -17,15 +17,15 @@
 
 const std = @import("std");
 
-pub const marker_path = "/var/lib/vmiz-vm/booted";
+pub const marker_path = "/var/lib/miz-vm/booted";
 pub const marker_bytes = "guest reached the target root\n";
 pub const installed_nevra = "vm-boot-package-0:1.0-1.noarch";
 pub const version_line = "RPM version vm-boot-1";
 
 /// Where the test plants the second copy, and what the hook script's `#!` line
 /// therefore has to say.
-pub const hook_interpreter_path = "/usr/bin/vmiz-hook-interpreter";
-pub const hook_marker_path = "/var/lib/vmiz-vm/hook";
+pub const hook_interpreter_path = "/usr/bin/miz-hook-interpreter";
+pub const hook_marker_path = "/var/lib/miz-vm/hook";
 
 /// The guest writes the hook's own arguments here, so the marker proves not
 /// only that the script ran but that what the caller declared reached it.
@@ -36,7 +36,7 @@ pub const hook_arguments = [_][]const u8{ "--marker", "guest" };
 /// guest derives that path from the hook's position rather than from anything
 /// the caller said. Recognising the prefix is how this binary tells a hook run
 /// from an `rpm` run.
-const hook_script_prefix = "/run/vmiz-hook-";
+const hook_script_prefix = "/run/miz-hook-";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();

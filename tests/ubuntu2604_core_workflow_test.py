@@ -107,11 +107,11 @@ class Ubuntu2604CoreWorkflowTests(unittest.TestCase):
         self.assertNotIn("packages: write", self.source)
         self.assertNotIn("security-events: write", self.source)
         self.assertIn(
-            "repo:cataggar/vmiz:environment:ubuntu2604-signing",
+            "repo:cataggar/miz:environment:ubuntu2604-signing",
             self.source,
         )
         self.assertIn(
-            "repo:cataggar/vmiz:environment:ubuntu2604-release",
+            "repo:cataggar/miz:environment:ubuntu2604-release",
             self.source,
         )
 
@@ -134,13 +134,13 @@ class Ubuntu2604CoreWorkflowTests(unittest.TestCase):
         self.assertIn('sudo chown "$(id -u):$(id -g)" /dev/kvm', native)
         self.assertIn("test -r /dev/kvm", native)
         self.assertIn("test -w /dev/kvm", native)
-        self.assertIn("VMIZ_UBUNTU2604_UEFI_CODE=", native)
-        self.assertIn("VMIZ_UBUNTU2604_UEFI_VARS=", native)
+        self.assertIn("MIZ_UBUNTU2604_UEFI_CODE=", native)
+        self.assertIn("MIZ_UBUNTU2604_UEFI_VARS=", native)
         self.assertIn("verify-native-result", native)
         azure = self.job("azure_acceptance", "validate")
         self.assertIn("FLAVOR: core", azure)
         self.assertIn("ubuntu2604_azure_acceptance.sh run", azure)
-        build = azure.index("- name: Build accepted-source vmiz")
+        build = azure.index("- name: Build accepted-source miz")
         android = azure.index(
             "- name: Fetch and verify digest-bound Android container smoke inputs"
         )

@@ -3,7 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const customization_loader = @import("customization_loader.zig");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 /// What `--container` named, before the run has decided anything about it.
 ///
@@ -22,22 +22,22 @@ const ContainerArg = union(enum) {
 /// discovery mechanism, and a customize run does not discover: the request
 /// states its credential so the plan hash can cover where the password comes
 /// from, and a `~/.docker/config.json` is exactly the ambient dependency that
-/// makes a build mean different things on different machines. `vmiz oci pull`
+/// makes a build mean different things on different machines. `miz oci pull`
 /// still honours one, because a person at a terminal expects their login to
 /// work.
 const RegistryArg = struct {
     reference: []const u8,
     username: ?[]const u8 = null,
-    password: ?vmiz.customize.CredentialSource = null,
+    password: ?miz.customize.CredentialSource = null,
     tls_ca: ?[]const u8 = null,
     plain_http: bool = false,
     signature_key: ?[]const u8 = null,
 
-    fn access(self: RegistryArg) !vmiz.customize.RegistryAccess {
+    fn access(self: RegistryArg) !miz.customize.RegistryAccess {
         // Both halves or neither: a user name with no password names an
         // identity that cannot authenticate, and a password with no user name
         // has no identity to authenticate as.
-        const credential: ?vmiz.customize.BasicCredential = if (self.username) |name| .{
+        const credential: ?miz.customize.BasicCredential = if (self.username) |name| .{
             .username = name,
             .password = self.password orelse return error.IncompleteRegistryCredential,
         } else if (self.password != null) return error.IncompleteRegistryCredential else null;
@@ -51,37 +51,37 @@ const RegistryArg = struct {
     /// The key is named by path and not read here. `parseArgs` runs before
     /// the run has decided it may read trust material at all, so reading it
     /// now would be reading a file the capability check has not yet allowed.
-    fn signature(self: RegistryArg) ?vmiz.customize.RegistrySignaturePolicy {
+    fn signature(self: RegistryArg) ?miz.customize.RegistrySignaturePolicy {
         const path = self.signature_key orelse return null;
         return .{ .key = .{ .host_path = path } };
     }
 };
 
 const ParsedArgs = struct {
-    api_version: u32 = vmiz.customize.current_api_version,
-    architecture: vmiz.customize.Architecture,
+    api_version: u32 = miz.customize.current_api_version,
+    architecture: miz.customize.Architecture,
     iso_path: []const u8,
     container: ContainerArg,
     rootfs_path: []const u8,
     bundle_output_path: []const u8,
     image_basename: []const u8,
-    format: vmiz.customize.OutputFormat,
+    format: miz.customize.OutputFormat,
     size: u64,
-    generation: vmiz.azure.Generation = .gen2,
+    generation: miz.azure.Generation = .gen2,
     skip_iso_rootfs: bool = false,
-    esp_size: u64 = vmiz.build_image.default_esp_size,
+    esp_size: u64 = miz.build_image.default_esp_size,
     ext4_label: []const u8 = "rootfs",
-    root_filesystem: vmiz.layout.FilesystemKind = .ext4,
+    root_filesystem: miz.layout.FilesystemKind = .ext4,
     verity: bool = false,
     extra_kernel_options: []const u8 = "",
-    boot_mode: vmiz.bootconfig.BootMode = .bls_only,
-    uki: vmiz.customize.UkiOptions = .{},
-    uki_signing: ?vmiz.customize.UkiSigningPolicy = null,
+    boot_mode: miz.bootconfig.BootMode = .bls_only,
+    uki: miz.customize.UkiOptions = .{},
+    uki_signing: ?miz.customize.UkiSigningPolicy = null,
     customization_path: ?[]const u8 = null,
     customization_source_paths: []const []const u8 = &.{},
-    seed: vmiz.customize.Seed,
+    seed: miz.customize.Seed,
     source_date_epoch: u64,
-    limits: vmiz.limits.ImportLimits = .{},
+    limits: miz.limits.ImportLimits = .{},
     preflight_only: bool = false,
     reuse_success: bool = false,
     verbose: bool = false,
@@ -91,7 +91,7 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(arena);
     var args = parseArgs(arena, argv[1..]) catch |err| {
-        std.debug.print("vmiz-image-builder: invalid arguments: {t}\n", .{err});
+        std.debug.print("miz-image-builder: invalid arguments: {t}\n", .{err});
         std.process.exit(2);
     };
     // Resolved here rather than left to `validate`, because a person holding
@@ -106,80 +106,80 @@ pub fn main(init: std.process.Init) !void {
             args.container.registry,
         ) catch |err| {
             std.debug.print(
-                "vmiz-image-builder: cannot pin '{s}': {t}\n",
+                "miz-image-builder: cannot pin '{s}': {t}\n",
                 .{ args.container.registry.reference, err },
             );
             std.process.exit(1);
         };
     }
     if (!isBasename(args.image_basename) or isReservedBasename(args.image_basename)) {
-        std.debug.print("vmiz-image-builder: image output must be a non-reserved basename\n", .{});
+        std.debug.print("miz-image-builder: image output must be a non-reserved basename\n", .{});
         std.process.exit(2);
     }
     const overlaps_source = pathsOverlapCanonically(arena, init.io, args.bundle_output_path, args.iso_path) catch |err| {
-        std.debug.print("vmiz-image-builder: cannot isolate result bundle from ISO source: {t}\n", .{err});
+        std.debug.print("miz-image-builder: cannot isolate result bundle from ISO source: {t}\n", .{err});
         std.process.exit(1);
     } or switch (args.container) {
         // A registry image is not a path on this machine, so there is nothing
         // for the output to overlap with.
         .registry => false,
         .host_path => |path| pathsOverlapCanonically(arena, init.io, args.bundle_output_path, path) catch |err| {
-            std.debug.print("vmiz-image-builder: cannot isolate result bundle from container source: {t}\n", .{err});
+            std.debug.print("miz-image-builder: cannot isolate result bundle from container source: {t}\n", .{err});
             std.process.exit(1);
         },
     };
     if (overlaps_source) {
-        std.debug.print("vmiz-image-builder: result bundle and source paths must be distinct\n", .{});
+        std.debug.print("miz-image-builder: result bundle and source paths must be distinct\n", .{});
         std.process.exit(2);
     }
     if (args.customization_path) |path| {
         if (pathsOverlapCanonically(arena, init.io, args.bundle_output_path, path) catch |err| {
-            std.debug.print("vmiz-image-builder: cannot isolate result bundle from customization config: {t}\n", .{err});
+            std.debug.print("miz-image-builder: cannot isolate result bundle from customization config: {t}\n", .{err});
             std.process.exit(1);
         }) {
-            std.debug.print("vmiz-image-builder: result bundle and customization config must be distinct\n", .{});
+            std.debug.print("miz-image-builder: result bundle and customization config must be distinct\n", .{});
             std.process.exit(2);
         }
     }
     for (args.customization_source_paths) |path| {
         if (pathsOverlapCanonically(arena, init.io, args.bundle_output_path, path) catch |err| {
-            std.debug.print("vmiz-image-builder: cannot isolate result bundle from customization source: {t}\n", .{err});
+            std.debug.print("miz-image-builder: cannot isolate result bundle from customization source: {t}\n", .{err});
             std.process.exit(1);
         }) {
-            std.debug.print("vmiz-image-builder: result bundle and customization sources must be distinct\n", .{});
+            std.debug.print("miz-image-builder: result bundle and customization sources must be distinct\n", .{});
             std.process.exit(2);
         }
     }
     const lock_path = try std.fmt.allocPrint(arena, "{s}.lock", .{args.bundle_output_path});
     const lock_overlaps_source = pathsOverlapCanonically(arena, init.io, lock_path, args.iso_path) catch |err| {
-        std.debug.print("vmiz-image-builder: cannot isolate result lock from ISO source: {t}\n", .{err});
+        std.debug.print("miz-image-builder: cannot isolate result lock from ISO source: {t}\n", .{err});
         std.process.exit(1);
     } or switch (args.container) {
         .registry => false,
         .host_path => |path| pathsOverlapCanonically(arena, init.io, lock_path, path) catch |err| {
-            std.debug.print("vmiz-image-builder: cannot isolate result lock from container source: {t}\n", .{err});
+            std.debug.print("miz-image-builder: cannot isolate result lock from container source: {t}\n", .{err});
             std.process.exit(1);
         },
     };
     if (lock_overlaps_source) {
-        std.debug.print("vmiz-image-builder: result lock and source paths must be distinct\n", .{});
+        std.debug.print("miz-image-builder: result lock and source paths must be distinct\n", .{});
         std.process.exit(2);
     }
     if (args.customization_path) |path| {
         if (pathsOverlapCanonically(arena, init.io, lock_path, path) catch |err| {
-            std.debug.print("vmiz-image-builder: cannot isolate result lock from customization config: {t}\n", .{err});
+            std.debug.print("miz-image-builder: cannot isolate result lock from customization config: {t}\n", .{err});
             std.process.exit(1);
         }) {
-            std.debug.print("vmiz-image-builder: result lock and customization config must be distinct\n", .{});
+            std.debug.print("miz-image-builder: result lock and customization config must be distinct\n", .{});
             std.process.exit(2);
         }
     }
     for (args.customization_source_paths) |path| {
         if (pathsOverlapCanonically(arena, init.io, lock_path, path) catch |err| {
-            std.debug.print("vmiz-image-builder: cannot isolate result lock from customization source: {t}\n", .{err});
+            std.debug.print("miz-image-builder: cannot isolate result lock from customization source: {t}\n", .{err});
             std.process.exit(1);
         }) {
-            std.debug.print("vmiz-image-builder: result lock and customization sources must be distinct\n", .{});
+            std.debug.print("miz-image-builder: result lock and customization sources must be distinct\n", .{});
             std.process.exit(2);
         }
     }
@@ -208,7 +208,7 @@ pub fn main(init: std.process.Init) !void {
     );
     try resetBundle(init.io, args.bundle_output_path);
     std.Io.Dir.cwd().createDirPath(init.io, args.bundle_output_path) catch |err| {
-        std.debug.print("vmiz-image-builder: cannot create result bundle: {t}\n", .{err});
+        std.debug.print("miz-image-builder: cannot create result bundle: {t}\n", .{err});
         std.process.exit(1);
     };
     const output_path = try std.fs.path.join(arena, &.{ args.bundle_output_path, args.image_basename });
@@ -227,11 +227,11 @@ pub fn main(init: std.process.Init) !void {
         args.customization_path,
         args.customization_source_paths,
     ) catch |err| {
-        std.debug.print("vmiz-image-builder: invalid customization: {t}\n", .{err});
+        std.debug.print("miz-image-builder: invalid customization: {t}\n", .{err});
         std.process.exit(2);
     };
 
-    const request = vmiz.customize.Request{
+    const request = miz.customize.Request{
         .api_version = args.api_version,
         .target_architecture = args.architecture,
         .input = .{ .iso_oci = .{
@@ -275,31 +275,31 @@ pub fn main(init: std.process.Init) !void {
         .limits = args.limits,
     };
 
-    const host_architecture: vmiz.customize.Architecture = switch (builtin.cpu.arch) {
+    const host_architecture: miz.customize.Architecture = switch (builtin.cpu.arch) {
         .x86_64 => .x86_64,
         .aarch64 => .aarch64,
         else => {
-            std.debug.print("vmiz-image-builder: unsupported host architecture: {t}\n", .{builtin.cpu.arch});
+            std.debug.print("miz-image-builder: unsupported host architecture: {t}\n", .{builtin.cpu.arch});
             std.process.exit(2);
         },
     };
-    var resolved = vmiz.customize.resolve(init.gpa, &request, .{
+    var resolved = miz.customize.resolve(init.gpa, &request, .{
         .host_architecture = host_architecture,
     }) catch |err| {
-        std.debug.print("vmiz-image-builder: request resolution failed: {t}\n", .{err});
+        std.debug.print("miz-image-builder: request resolution failed: {t}\n", .{err});
         std.process.exit(1);
     };
     defer resolved.deinit(init.gpa);
 
     if (resolved.plan) |*plan| {
         writePlan(init.gpa, init.io, plan_output_path, plan) catch |err| {
-            std.debug.print("vmiz-image-builder: cannot write plan: {t}\n", .{err});
+            std.debug.print("miz-image-builder: cannot write plan: {t}\n", .{err});
             std.process.exit(1);
         };
     }
     if (resolved.diagnostics.hasErrors()) {
         writeDiagnostics(init.gpa, init.io, diagnostics_output_path, resolved.diagnostics, false) catch |err| {
-            std.debug.print("vmiz-image-builder: cannot write diagnostics: {t}\n", .{err});
+            std.debug.print("miz-image-builder: cannot write diagnostics: {t}\n", .{err});
             std.process.exit(1);
         };
         try writeBytes(init.io, status_output_path, "failure\n");
@@ -307,10 +307,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // The build process's own environment, forwarded only to a declared UKI
-    // signing provider. `vmiz sign` reaches Azure Trusted Signing with a
+    // signing provider. `miz sign` reaches Azure Trusted Signing with a
     // GitHub OIDC request URL and token it finds there, so a signer handed a
     // curated environment is a signer that cannot sign.
-    var platform = vmiz.customize.Platform.system();
+    var platform = miz.customize.Platform.system();
     platform.signing_environ = init.minimal.environ;
     // The same environment, granted separately, because a request that names
     // `--registry-password-env` has said out loud which variable it wants
@@ -318,7 +318,7 @@ pub fn main(init: std.process.Init) !void {
     platform.registry_environ = init.minimal.environ;
 
     if (args.preflight_only) {
-        var report = try vmiz.customize.preflight(init.gpa, init.io, &resolved.plan.?, platform);
+        var report = try miz.customize.preflight(init.gpa, init.io, &resolved.plan.?, platform);
         defer report.deinit(init.gpa);
         try writeDiagnostics(init.gpa, init.io, diagnostics_output_path, report.diagnostics, false);
         try writeBytes(init.io, status_output_path, if (report.ready()) "success\n" else "failure\n");
@@ -326,20 +326,20 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var console = ConsoleEvents{ .verbose = args.verbose };
-    var outcome = vmiz.customize.execute(
+    var outcome = miz.customize.execute(
         init.gpa,
         init.io,
         &resolved.plan.?,
         platform,
         .{ .context = &console, .emitFn = ConsoleEvents.emit },
     ) catch |err| {
-        std.debug.print("vmiz-image-builder: execution setup failed: {t}\n", .{err});
+        std.debug.print("miz-image-builder: execution setup failed: {t}\n", .{err});
         std.process.exit(1);
     };
     defer outcome.deinit(init.gpa);
 
     writeDiagnostics(init.gpa, init.io, diagnostics_output_path, outcome.diagnostics, false) catch |err| {
-        std.debug.print("vmiz-image-builder: cannot write diagnostics: {t}\n", .{err});
+        std.debug.print("miz-image-builder: cannot write diagnostics: {t}\n", .{err});
         std.process.exit(1);
     };
     const result = if (outcome.result) |*success| success else {
@@ -360,7 +360,7 @@ pub fn main(init: std.process.Init) !void {
         return error.SourceChangedDuringBuild;
     }
     writeProvenance(init.gpa, init.io, provenance_output_path, result.provenance) catch |err| {
-        std.debug.print("vmiz-image-builder: cannot write provenance: {t}\n", .{err});
+        std.debug.print("miz-image-builder: cannot write provenance: {t}\n", .{err});
         std.process.exit(1);
     };
     try writeReuseKey(init.io, reuse_key_output_path, reuse_key_before);
@@ -381,7 +381,7 @@ fn pinIfTagged(
     environ: std.process.Environ,
     declared: RegistryArg,
 ) ![]const u8 {
-    const parsed = try vmiz.oci.reference.parse(declared.reference, .source);
+    const parsed = try miz.oci.reference.parse(declared.reference, .source);
     const selection = switch (parsed) {
         .registry => |value| value.selection,
         .layout => return error.NotARegistryReference,
@@ -389,7 +389,7 @@ fn pinIfTagged(
     if (selection) |value| {
         if (value == .digest) return declared.reference;
     }
-    var pin = try vmiz.customize.pinDeclaredImage(
+    var pin = try miz.customize.pinDeclaredImage(
         allocator,
         io,
         environ,
@@ -398,41 +398,41 @@ fn pinIfTagged(
     );
     defer pin.deinit();
     std.debug.print(
-        "vmiz-image-builder: pinned {s} to {s}\n",
+        "miz-image-builder: pinned {s} to {s}\n",
         .{ declared.reference, pin.reference },
     );
     return allocator.dupe(u8, pin.reference);
 }
 
 fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs {
-    var api_version: u32 = vmiz.customize.current_api_version;
-    var architecture: ?vmiz.customize.Architecture = null;
+    var api_version: u32 = miz.customize.current_api_version;
+    var architecture: ?miz.customize.Architecture = null;
     var iso_path: ?[]const u8 = null;
     var container: ?ContainerArg = null;
     var registry = RegistryArg{ .reference = "" };
     var rootfs_path: ?[]const u8 = null;
     var bundle_output_path: ?[]const u8 = null;
     var image_basename: ?[]const u8 = null;
-    var format: ?vmiz.customize.OutputFormat = null;
+    var format: ?miz.customize.OutputFormat = null;
     var size: ?u64 = null;
-    var generation: vmiz.azure.Generation = .gen2;
+    var generation: miz.azure.Generation = .gen2;
     var skip_iso_rootfs = false;
-    var esp_size: u64 = vmiz.build_image.default_esp_size;
+    var esp_size: u64 = miz.build_image.default_esp_size;
     var ext4_label: []const u8 = "rootfs";
-    var root_filesystem: vmiz.layout.FilesystemKind = .ext4;
+    var root_filesystem: miz.layout.FilesystemKind = .ext4;
     var verity = false;
     var extra_kernel_options: []const u8 = "";
-    var boot_mode: vmiz.bootconfig.BootMode = .bls_only;
-    var uki: vmiz.customize.UkiOptions = .{};
+    var boot_mode: miz.bootconfig.BootMode = .bls_only;
+    var uki: miz.customize.UkiOptions = .{};
     var uki_signing_certificate_path: ?[]const u8 = null;
     var uki_signing_command: ?[]const u8 = null;
     var uki_signing_argument: []const u8 = "";
     var customization_path: ?[]const u8 = null;
     var customization_sources = std.array_list.Managed([]const u8).init(allocator);
     errdefer customization_sources.deinit();
-    var seed: ?vmiz.customize.Seed = null;
+    var seed: ?miz.customize.Seed = null;
     var source_date_epoch: ?u64 = null;
-    var limits: vmiz.limits.ImportLimits = .{};
+    var limits: miz.limits.ImportLimits = .{};
     var preflight_only = false;
     var reuse_success = false;
     var verbose = false;
@@ -505,11 +505,11 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
         } else if (std.mem.eql(u8, arg, "-O")) {
             format = parseFormat(value) orelse return error.InvalidFormat;
         } else if (std.mem.eql(u8, arg, "--size")) {
-            size = try vmiz.parseSize(value);
+            size = try miz.parseSize(value);
         } else if (std.mem.eql(u8, arg, "--generation")) {
             generation = parseGeneration(value) orelse return error.InvalidGeneration;
         } else if (std.mem.eql(u8, arg, "--esp-size")) {
-            esp_size = try vmiz.parseSize(value);
+            esp_size = try miz.parseSize(value);
         } else if (std.mem.eql(u8, arg, "--ext4-label")) {
             ext4_label = value;
         } else if (std.mem.eql(u8, arg, "--root-filesystem")) {
@@ -623,23 +623,23 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
     };
 }
 
-fn parseArchitecture(value: []const u8) ?vmiz.customize.Architecture {
+fn parseArchitecture(value: []const u8) ?miz.customize.Architecture {
     if (std.mem.eql(u8, value, "x86_64")) return .x86_64;
     if (std.mem.eql(u8, value, "aarch64")) return .aarch64;
     return null;
 }
 
-fn parseFormat(value: []const u8) ?vmiz.customize.OutputFormat {
-    return vmiz.customize.OutputFormat.parseName(value);
+fn parseFormat(value: []const u8) ?miz.customize.OutputFormat {
+    return miz.customize.OutputFormat.parseName(value);
 }
 
-fn parseGeneration(value: []const u8) ?vmiz.azure.Generation {
+fn parseGeneration(value: []const u8) ?miz.azure.Generation {
     if (std.mem.eql(u8, value, "1")) return .gen1;
     if (std.mem.eql(u8, value, "2")) return .gen2;
     return null;
 }
 
-fn parseBootMode(value: []const u8) ?vmiz.bootconfig.BootMode {
+fn parseBootMode(value: []const u8) ?miz.bootconfig.BootMode {
     if (std.mem.eql(u8, value, "bls")) return .bls_only;
     if (std.mem.eql(u8, value, "uki")) return .uki_only;
     if (std.mem.eql(u8, value, "both")) return .bls_and_uki;
@@ -788,11 +788,11 @@ fn computeReuseKey(
     customization_path: ?[]const u8,
     customization_source_paths: []const []const u8,
 ) ![32]u8 {
-    const executable_digest = try vmiz.customize.hashSourcePath(allocator, io, argv[0]);
-    const iso_digest = try vmiz.customize.hashSourcePath(allocator, io, iso_path);
+    const executable_digest = try miz.customize.hashSourcePath(allocator, io, argv[0]);
+    const iso_digest = try miz.customize.hashSourcePath(allocator, io, iso_path);
 
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("vmiz-image-builder-reuse-v2\x00");
+    hash.update("miz-image-builder-reuse-v2\x00");
     for (argv[1..]) |arg| {
         var length: [8]u8 = undefined;
         std.mem.writeInt(u64, &length, arg.len, .big);
@@ -803,7 +803,7 @@ fn computeReuseKey(
     hash.update(&iso_digest.bytes);
     switch (container) {
         .host_path => |path| {
-            const digest = try vmiz.customize.hashSourcePath(allocator, io, path);
+            const digest = try miz.customize.hashSourcePath(allocator, io, path);
             hash.update(&digest.bytes);
         },
         // The pinned reference *is* the content digest, so hashing it says
@@ -814,11 +814,11 @@ fn computeReuseKey(
         .registry => |declared| hash.update(declared.reference),
     }
     if (customization_path) |path| {
-        const digest = try vmiz.customize.hashSourcePath(allocator, io, path);
+        const digest = try miz.customize.hashSourcePath(allocator, io, path);
         hash.update(&digest.bytes);
     }
     for (customization_source_paths) |path| {
-        const digest = try vmiz.customize.hashSourcePath(allocator, io, path);
+        const digest = try miz.customize.hashSourcePath(allocator, io, path);
         hash.update(&digest.bytes);
     }
     var digest: [32]u8 = undefined;
@@ -826,10 +826,10 @@ fn computeReuseKey(
     return digest;
 }
 
-fn writePlan(allocator: std.mem.Allocator, io: std.Io, path: []const u8, plan: *const vmiz.customize.ResolvedPlan) !void {
+fn writePlan(allocator: std.mem.Allocator, io: std.Io, path: []const u8, plan: *const miz.customize.ResolvedPlan) !void {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    try vmiz.customize.writePlanJson(plan, &output.writer);
+    try miz.customize.writePlanJson(plan, &output.writer);
     try writeBytes(io, path, output.written());
 }
 
@@ -837,12 +837,12 @@ fn writeDiagnostics(
     allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
-    diagnostics: vmiz.customize.DiagnosticSet,
+    diagnostics: miz.customize.DiagnosticSet,
     print: bool,
 ) !void {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    try vmiz.customize.writeDiagnosticsJson(diagnostics, &output.writer);
+    try miz.customize.writeDiagnosticsJson(diagnostics, &output.writer);
     try writeBytes(io, path, output.written());
     if (print) std.debug.print("{s}\n", .{output.written()});
 }
@@ -851,11 +851,11 @@ fn writeProvenance(
     allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
-    provenance: vmiz.customize.Provenance,
+    provenance: miz.customize.Provenance,
 ) !void {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    try vmiz.customize.writeProvenanceJson(provenance, &output.writer);
+    try miz.customize.writeProvenanceJson(provenance, &output.writer);
     try writeBytes(io, path, output.written());
 }
 
@@ -868,10 +868,10 @@ fn writeBytes(io: std.Io, path: []const u8, bytes: []const u8) !void {
 const ConsoleEvents = struct {
     verbose: bool,
 
-    fn emit(context: ?*anyopaque, event: vmiz.customize.ExecutionEvent) void {
+    fn emit(context: ?*anyopaque, event: miz.customize.ExecutionEvent) void {
         const self: *ConsoleEvents = @ptrCast(@alignCast(context.?));
         switch (event) {
-            .progress => |progress| if (self.verbose) std.debug.print("vmiz-image-builder: {s}\n", .{progress.message}),
+            .progress => |progress| if (self.verbose) std.debug.print("miz-image-builder: {s}\n", .{progress.message}),
             .diagnostic => {},
         }
     }
@@ -934,21 +934,21 @@ test "the output root filesystem defaults to ext4 and parses an explicit choice"
         &.{ "--container", "./oci-layout" },
         &default_buffer,
     ));
-    try std.testing.expectEqual(vmiz.layout.FilesystemKind.ext4, default_parsed.root_filesystem);
+    try std.testing.expectEqual(miz.layout.FilesystemKind.ext4, default_parsed.root_filesystem);
 
     var xfs_buffer: [40][]const u8 = undefined;
     const xfs_parsed = try parseArgs(std.testing.allocator, testArgs(
         &.{ "--container", "./oci-layout", "--root-filesystem", "xfs" },
         &xfs_buffer,
     ));
-    try std.testing.expectEqual(vmiz.layout.FilesystemKind.xfs, xfs_parsed.root_filesystem);
+    try std.testing.expectEqual(miz.layout.FilesystemKind.xfs, xfs_parsed.root_filesystem);
 
     var ext4_buffer: [40][]const u8 = undefined;
     const ext4_parsed = try parseArgs(std.testing.allocator, testArgs(
         &.{ "--container", "./oci-layout", "--root-filesystem", "ext4" },
         &ext4_buffer,
     ));
-    try std.testing.expectEqual(vmiz.layout.FilesystemKind.ext4, ext4_parsed.root_filesystem);
+    try std.testing.expectEqual(miz.layout.FilesystemKind.ext4, ext4_parsed.root_filesystem);
 
     var bad_buffer: [40][]const u8 = undefined;
     try std.testing.expectError(error.InvalidRootFilesystem, parseArgs(
@@ -1042,10 +1042,10 @@ test "a signature key is carried as a path and not read here" {
     var buffer: [40][]const u8 = undefined;
     const parsed = try parseArgs(std.testing.allocator, testArgs(&.{
         "--container",              "docker://registry.example/team/image:stable",
-        "--registry-signature-key", "/etc/vmiz/cosign.pub",
+        "--registry-signature-key", "/etc/miz/cosign.pub",
     }, &buffer));
     try std.testing.expectEqualStrings(
-        "/etc/vmiz/cosign.pub",
+        "/etc/miz/cosign.pub",
         parsed.container.registry.signature().?.key.host_path,
     );
 }
@@ -1065,7 +1065,7 @@ test "a signature key beside a local layout is refused rather than ignored" {
         std.testing.allocator,
         testArgs(&.{
             "--container",              "./oci-layout",
-            "--registry-signature-key", "/etc/vmiz/cosign.pub",
+            "--registry-signature-key", "/etc/miz/cosign.pub",
         }, &buffer),
     ));
 }

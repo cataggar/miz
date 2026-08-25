@@ -1,16 +1,16 @@
-//! `vmiz check <file>`
+//! `miz check <file>`
 
 const std = @import("std");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     _ = gpa;
     if (args.len != 1) {
-        return fail("usage: vmiz check <file>", .{});
+        return fail("usage: miz check <file>", .{});
     }
     const path = args[0];
 
-    var img = vmiz.Image.openPath(io, path) catch |err|
+    var img = miz.Image.openPath(io, path) catch |err|
         return fail("check: failed to open '{s}': {s}", .{ path, @errorName(err) });
     defer img.close(io);
 

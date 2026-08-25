@@ -1,6 +1,6 @@
 //! `azagent`: minimal guest provisioning agent for first-boot Azure VM
 //! setup. Native Zig replacement for the provisioning portion of Python
-//! `waagent` (Microsoft Azure Linux Agent) -- see vmiz issue #112.
+//! `waagent` (Microsoft Azure Linux Agent) -- see miz issue #112.
 //!
 //! Deliberately not named `waagent`: this project does not aim for
 //! binary/config/CLI compatibility with the real Azure Linux Agent (no

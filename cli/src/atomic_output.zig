@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -69,7 +69,7 @@ fn aliasesProtectedFile(
         },
     );
     defer destination_file.close(io);
-    return vmiz.artifact_pipeline.sameFileIdentity(
+    return miz.artifact_pipeline.sameFileIdentity(
         io,
         protected_file,
         destination_file,
@@ -79,7 +79,7 @@ fn aliasesProtectedFile(
 test "atomic replacement never uses a predictable sibling path" {
     const io = std.testing.io;
     const destination = "test-atomic-output.pem";
-    const sibling = destination ++ ".vmiz-output";
+    const sibling = destination ++ ".miz-output";
     defer Dir.cwd().deleteFile(io, destination) catch {};
     defer Dir.cwd().deleteFile(io, sibling) catch {};
     try Dir.cwd().writeFile(io, .{ .sub_path = destination, .data = "old" });

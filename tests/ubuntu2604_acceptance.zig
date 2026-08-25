@@ -1,6 +1,6 @@
 //! Opt-in native-QEMU acceptance for finalized Ubuntu 26.04 QCOW2 images.
 //!
-//! The selected build options and `VMIZ_UBUNTU2604_IMAGE` must agree on one
+//! The selected build options and `MIZ_UBUNTU2604_IMAGE` must agree on one
 //! full or core candidate. This deliberately refuses TCG: acceptance is run
 //! only by a native x86_64 or AArch64 matrix entry.
 
@@ -9,13 +9,13 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const qemu_host = @import("qemu_host");
 const qmp = @import("qmp");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const Io = std.Io;
 
-const admin_username = "vmiztest";
+const admin_username = "miztest";
 const boot_timeout_seconds: i64 = 8 * 60;
 const serial_limit: usize = 2 * 1024 * 1024;
 const mib: u64 = 1024 * 1024;
@@ -32,14 +32,14 @@ const Architecture = enum {
         };
     }
 
-    fn rootGuid(self: Architecture) vmiz.guid.Guid {
+    fn rootGuid(self: Architecture) miz.guid.Guid {
         return switch (self) {
-            .x86_64 => vmiz.guid.linux_root_x86_64,
-            .aarch64 => vmiz.guid.linux_root_aarch64,
+            .x86_64 => miz.guid.linux_root_x86_64,
+            .aarch64 => miz.guid.linux_root_aarch64,
         };
     }
 
-    fn rootRole(self: Architecture) vmiz.layout.PartitionRole {
+    fn rootRole(self: Architecture) miz.layout.PartitionRole {
         return switch (self) {
             .x86_64 => .root_x86_64,
             .aarch64 => .root_aarch64,
@@ -127,8 +127,8 @@ const core_contracts = [_][]const u8{
     "key-only-ssh",
     "local-ovf-azagent-skip-ready",
     "azagent-provisioning",
-    "vmizinit-pid1",
-    "vmizinit-sshd-supervision",
+    "mizinit-pid1",
+    "mizinit-sshd-supervision",
     "sshd-restart",
     "persistent-provisioned-state",
     "no-cloud-init",
@@ -372,10 +372,10 @@ fn requireImageAlloc(
 ) ![]u8 {
     const image_path = try optionalEnvAlloc(
         allocator,
-        "VMIZ_UBUNTU2604_IMAGE",
+        "MIZ_UBUNTU2604_IMAGE",
     ) orelse {
         std.debug.print(
-            "skipping Ubuntu 26.04 acceptance: set VMIZ_UBUNTU2604_IMAGE to {s}\n",
+            "skipping Ubuntu 26.04 acceptance: set MIZ_UBUNTU2604_IMAGE to {s}\n",
             .{candidate.expectedFileName()},
         );
         return error.SkipZigTest;
@@ -391,7 +391,7 @@ fn requireImageAlloc(
     }
     if (!try qemu_host.pathAccessible(io, image_path, .{ .read = true })) {
         std.debug.print(
-            "VMIZ_UBUNTU2604_IMAGE is not readable: {s}\n",
+            "MIZ_UBUNTU2604_IMAGE is not readable: {s}\n",
             .{image_path},
         );
         return error.AcceptanceImageNotReadable;
@@ -487,7 +487,7 @@ fn requireToolOverrideAlloc(
 fn requireFoundFirmware(firmware: ?Firmware) !Firmware {
     return firmware orelse {
         std.debug.print(
-            "Ubuntu 26.04 acceptance requires matching UEFI firmware; set VMIZ_UBUNTU2604_UEFI_CODE and VMIZ_UBUNTU2604_UEFI_VARS\n",
+            "Ubuntu 26.04 acceptance requires matching UEFI firmware; set MIZ_UBUNTU2604_UEFI_CODE and MIZ_UBUNTU2604_UEFI_VARS\n",
             .{},
         );
         return error.RequiredFirmwareNotFound;
@@ -503,12 +503,12 @@ fn requireFirmwareAlloc(
 ) !Firmware {
     const explicit_code = if (secure_boot) try optionalEnvAlloc(
         allocator,
-        "VMIZ_UBUNTU2604_UEFI_CODE",
+        "MIZ_UBUNTU2604_UEFI_CODE",
     ) else null;
     defer if (explicit_code) |path| allocator.free(path);
     const explicit_vars = if (secure_boot) try optionalEnvAlloc(
         allocator,
-        "VMIZ_UBUNTU2604_UEFI_VARS",
+        "MIZ_UBUNTU2604_UEFI_VARS",
     ) else null;
     defer if (explicit_vars) |path| allocator.free(path);
 
@@ -586,7 +586,7 @@ fn canonicalCertificateSha256(
     openssl_path: []const u8,
     certificate_path: []const u8,
     output_path: []const u8,
-) !vmiz.artifact_pipeline.Digest {
+) !miz.artifact_pipeline.Digest {
     try runCommand(allocator, io, &.{
         openssl_path,
         "x509",
@@ -605,7 +605,7 @@ fn canonicalCertificateSha256(
     );
     defer allocator.free(certificate);
     if (certificate.len == 0) return error.EmptySigningCertificate;
-    return vmiz.artifact_pipeline.sha256Bytes(certificate);
+    return miz.artifact_pipeline.sha256Bytes(certificate);
 }
 
 fn prepareEnrolledVars(
@@ -642,21 +642,21 @@ fn verifyUkiSignatures(
     scratch_path: []const u8,
 ) !void {
     var file = try Dir.cwd().openFile(io, image_path, .{ .mode = .read_only });
-    var image = try vmiz.Image.openStandaloneQcow2File(io, file);
+    var image = try miz.Image.openStandaloneQcow2File(io, file);
     defer image.close(io);
     file = undefined;
-    const parsed = try vmiz.gpt.readGpt(image, io, allocator);
+    const parsed = try miz.gpt.readGpt(image, io, allocator);
     defer allocator.free(parsed.partitions);
     if (parsed.partitions.len < 1 or
-        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &vmiz.guid.esp))
+        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &miz.guid.esp))
     {
         return error.MissingEspPartition;
     }
     const partition = parsed.partitions[0];
-    var esp = try vmiz.fat32.open(&image, io, .{
-        .offset = partition.first_lba * vmiz.gpt.sector_size,
+    var esp = try miz.fat32.open(&image, io, .{
+        .offset = partition.first_lba * miz.gpt.sector_size,
         .length = (partition.last_lba - partition.first_lba + 1) *
-            vmiz.gpt.sector_size,
+            miz.gpt.sector_size,
     });
     // The image carries one signed UKI, at the fallback path firmware loads. Verifying that one is
     // the whole job; the EFI/Linux duplicate this used to walk no longer exists.
@@ -691,11 +691,11 @@ fn verifyNativeUkiCertificate(
     io: Io,
     image_path: []const u8,
     expected_certificate_der: []const u8,
-    expected_certificate_sha256: vmiz.artifact_pipeline.Digest,
+    expected_certificate_sha256: miz.artifact_pipeline.Digest,
 ) !void {
-    var image = try vmiz.Image.openPathReadOnlyStandalone(io, image_path);
+    var image = try miz.Image.openPathReadOnlyStandalone(io, image_path);
     defer image.close(io);
-    var extracted = try vmiz.uki_certificate.extractAlloc(
+    var extracted = try miz.uki_certificate.extractAlloc(
         allocator,
         io,
         &image,
@@ -715,7 +715,7 @@ fn tamperUkiCmdlineAlloc(
     allocator: Allocator,
     signed: []const u8,
 ) ![]u8 {
-    var inspection = try vmiz.uki.inspect(allocator, signed);
+    var inspection = try miz.uki.inspect(allocator, signed);
     defer inspection.deinit(allocator);
     const cmdline = inspection.findSection(".cmdline") orelse
         return error.MissingUkiCmdline;
@@ -786,20 +786,20 @@ fn createTamperedOverlay(
         source_image,
         overlay_path,
     });
-    var image = try vmiz.Image.openPath(io, overlay_path);
+    var image = try miz.Image.openPath(io, overlay_path);
     defer image.close(io);
-    const parsed = try vmiz.gpt.readGpt(image, io, allocator);
+    const parsed = try miz.gpt.readGpt(image, io, allocator);
     defer allocator.free(parsed.partitions);
     if (parsed.partitions.len < 1 or
-        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &vmiz.guid.esp))
+        !std.mem.eql(u8, &parsed.partitions[0].partition_type_guid, &miz.guid.esp))
     {
         return error.MissingEspPartition;
     }
     const partition = parsed.partitions[0];
-    var esp = try vmiz.fat32.open(&image, io, .{
-        .offset = partition.first_lba * vmiz.gpt.sector_size,
+    var esp = try miz.fat32.open(&image, io, .{
+        .offset = partition.first_lba * miz.gpt.sector_size,
         .length = (partition.last_lba - partition.first_lba + 1) *
-            vmiz.gpt.sector_size,
+            miz.gpt.sector_size,
     });
     // Tamper with the one signed UKI the image carries, at the path firmware loads.
     const fallback_path = candidate.architecture.fallbackUkiPath();
@@ -864,7 +864,7 @@ fn validateQemuImgInfo(
 }
 
 fn requireNonemptyUkiSection(
-    inspection: *const vmiz.uki.Inspection,
+    inspection: *const miz.uki.Inspection,
     name: []const u8,
 ) ![]const u8 {
     const section = inspection.findSection(name) orelse return error.MissingUkiSection;
@@ -877,9 +877,9 @@ fn validateFinalizedImage(
     io: Io,
     image_path: []const u8,
     candidate: Candidate,
-) !vmiz.artifact_pipeline.Digest {
+) !miz.artifact_pipeline.Digest {
     var file = try Dir.cwd().openFile(io, image_path, .{ .mode = .read_only });
-    var image = try vmiz.Image.openStandaloneQcow2File(io, file);
+    var image = try miz.Image.openStandaloneQcow2File(io, file);
     defer image.close(io);
     file = undefined;
 
@@ -891,25 +891,25 @@ fn validateFinalizedImage(
     if (image.virtual_size != candidate.expectedVirtualSize())
         return error.UnexpectedVirtualSize;
 
-    const parsed = try vmiz.gpt.readGpt(image, io, allocator);
+    const parsed = try miz.gpt.readGpt(image, io, allocator);
     defer allocator.free(parsed.partitions);
     if (parsed.partitions.len != 2) return error.UnexpectedPartitionCount;
     const esp_partition = parsed.partitions[0];
     const root_partition = parsed.partitions[1];
-    if (!std.mem.eql(u8, &esp_partition.partition_type_guid, &vmiz.guid.esp))
+    if (!std.mem.eql(u8, &esp_partition.partition_type_guid, &miz.guid.esp))
         return error.UnexpectedEspPartition;
     if (!std.mem.eql(u8, &root_partition.partition_type_guid, &candidate.architecture.rootGuid()))
         return error.UnexpectedRootArchitecture;
     const esp_size = (esp_partition.last_lba - esp_partition.first_lba + 1) *
-        vmiz.gpt.sector_size;
+        miz.gpt.sector_size;
     if (esp_size != 512 * 1024 * 1024)
         return error.UnexpectedEspSize;
-    if (esp_partition.first_lba % (1024 * 1024 / vmiz.gpt.sector_size) != 0)
+    if (esp_partition.first_lba % (1024 * 1024 / miz.gpt.sector_size) != 0)
         return error.UnexpectedEspAlignment;
     if (root_partition.first_lba != esp_partition.last_lba + 1 or
         root_partition.last_lba < root_partition.first_lba)
         return error.InvalidRootPartition;
-    const requests = [_]vmiz.layout.PartitionRequest{
+    const requests = [_]miz.layout.PartitionRequest{
         .{ .name = "ESP", .role = .esp, .filesystem = .fat32, .size = .{ .fixed = 512 * 1024 * 1024 } },
         .{
             .name = "root",
@@ -918,7 +918,7 @@ fn validateFinalizedImage(
             .size = .{ .percent = 100.0 },
         },
     };
-    const expected_layout = try vmiz.layout.planLayout(
+    const expected_layout = try miz.layout.planLayout(
         allocator,
         image.virtual_size,
         &requests,
@@ -932,13 +932,13 @@ fn validateFinalizedImage(
     {
         return error.InvalidRootPartition;
     }
-    if (std.mem.eql(u8, &root_partition.unique_partition_guid, &vmiz.guid.nil))
+    if (std.mem.eql(u8, &root_partition.unique_partition_guid, &miz.guid.nil))
         return error.InvalidRootPartitionGuid;
 
-    var esp = try vmiz.fat32.open(&image, io, .{
-        .offset = esp_partition.first_lba * vmiz.gpt.sector_size,
+    var esp = try miz.fat32.open(&image, io, .{
+        .offset = esp_partition.first_lba * miz.gpt.sector_size,
         .length = (esp_partition.last_lba - esp_partition.first_lba + 1) *
-            vmiz.gpt.sector_size,
+            miz.gpt.sector_size,
     });
     const uki = try esp.readFileAlloc(
         io,
@@ -947,7 +947,7 @@ fn validateFinalizedImage(
     );
     defer allocator.free(uki);
 
-    var inspection = try vmiz.uki.inspect(allocator, uki);
+    var inspection = try miz.uki.inspect(allocator, uki);
     defer inspection.deinit(allocator);
     if (inspection.machine != candidate.architecture.ukiMachine())
         return error.UnexpectedUkiArchitecture;
@@ -960,7 +960,7 @@ fn validateFinalizedImage(
     const cmdline = try requireNonemptyUkiSection(&inspection, ".cmdline");
 
     var root_guid_text: [36]u8 = undefined;
-    const root_guid = vmiz.guid.formatLower(
+    const root_guid = miz.guid.formatLower(
         &root_guid_text,
         root_partition.unique_partition_guid,
     );
@@ -977,7 +977,7 @@ fn validateFinalizedImage(
         .core => {
             const expected = try std.fmt.allocPrint(
                 allocator,
-                "{s}init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=auto console=tty0 {s}",
+                "{s}init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto console=tty0 {s}",
                 .{ expected_prefix, candidate.architecture.serialConsole() },
             );
             defer allocator.free(expected);
@@ -993,8 +993,8 @@ fn validateFinalizedImage(
             defer allocator.free(expected);
             if (!std.mem.eql(u8, cmdline, expected))
                 return error.UnexpectedFullUkiCmdline;
-            if (std.mem.indexOf(u8, cmdline, "init=/sbin/vmizinit") != null)
-                return error.FullImageContainsVmizinitBootContract;
+            if (std.mem.indexOf(u8, cmdline, "init=/sbin/mizinit") != null)
+                return error.FullImageContainsMizinitBootContract;
         },
     }
 
@@ -1002,10 +1002,10 @@ fn validateFinalizedImage(
     // under EFI/Linux is absent rather than merely unread: two 62 MiB copies do not fit on this ESP,
     // so a reappearance is a build regression that would fail late, at the second write.
     const entries = esp.listDirAlloc(io, allocator, "EFI/Linux") catch |err| switch (err) {
-        error.PathNotFound => return vmiz.artifact_pipeline.sha256Bytes(uki),
+        error.PathNotFound => return miz.artifact_pipeline.sha256Bytes(uki),
         else => return err,
     };
-    defer vmiz.fat32.freeDirEntries(allocator, entries);
+    defer miz.fat32.freeDirEntries(allocator, entries);
     for (entries) |entry| {
         if (entry.kind != .file or entry.name.len <= 4 or
             !std.ascii.eqlIgnoreCase(entry.name[entry.name.len - 4 ..], ".efi"))
@@ -1014,7 +1014,7 @@ fn validateFinalizedImage(
         }
         return error.StaleNamedUkiPresent;
     }
-    return vmiz.artifact_pipeline.sha256Bytes(uki);
+    return miz.artifact_pipeline.sha256Bytes(uki);
 }
 
 fn createSeed(
@@ -1044,8 +1044,8 @@ fn createSeed(
 
     const metadata = try std.fmt.allocPrint(
         allocator,
-        "instance-id: vmiz-ubuntu2604-acceptance-{s}\n" ++
-            "local-hostname: vmiz-ubuntu2604-{s}\n",
+        "instance-id: miz-ubuntu2604-acceptance-{s}\n" ++
+            "local-hostname: miz-ubuntu2604-{s}\n",
         .{ instance.label, instance.label },
     );
     defer allocator.free(metadata);
@@ -1054,7 +1054,7 @@ fn createSeed(
         \\#cloud-config
         \\users:
         \\  - default
-        \\  - name: vmiztest
+        \\  - name: miztest
         \\    groups: sudo
         \\    shell: /bin/bash
         \\    sudo: "ALL=(ALL) NOPASSWD:ALL"
@@ -1074,7 +1074,7 @@ fn createSeed(
         \\  <wa:ProvisioningSection>
         \\    <LinuxProvisioningConfigurationSet xmlns="http://schemas.microsoft.com/windowsazure">
         \\      <ConfigurationSetType>LinuxProvisioningConfiguration</ConfigurationSetType>
-        \\      <HostName>vmiz-ubuntu2604-{s}</HostName>
+        \\      <HostName>miz-ubuntu2604-{s}</HostName>
         \\      <UserName>{s}</UserName>
         \\      <DisableSshPasswordAuthentication>true</DisableSshPasswordAuthentication>
         \\      <SSH><PublicKeys><PublicKey><Path>/home/{s}/.ssh/authorized_keys</Path><Value>{s}</Value></PublicKey></PublicKeys></SSH>
@@ -1087,11 +1087,11 @@ fn createSeed(
     );
     defer allocator.free(ovf_env);
 
-    const additional_files = [_]vmiz.iso9660.NoCloudSeedAdditionalFile{
+    const additional_files = [_]miz.iso9660.NoCloudSeedAdditionalFile{
         .{ .name = "ovf-env.xml", .contents = ovf_env },
-        .{ .name = "vmiz-local-provisioning", .contents = "" },
+        .{ .name = "miz-local-provisioning", .contents = "" },
     };
-    _ = try vmiz.iso9660.writeNoCloudSeedPath(allocator, io, instance.seed_path, .{
+    _ = try miz.iso9660.writeNoCloudSeedPath(allocator, io, instance.seed_path, .{
         .meta_data = metadata,
         .user_data = user_data,
         .additional_files = &additional_files,
@@ -1407,7 +1407,7 @@ fn sshOutputAlloc(
 
 fn efiDbContainsCertificate(
     variable: []const u8,
-    certificate_sha256: vmiz.artifact_pipeline.Digest,
+    certificate_sha256: miz.artifact_pipeline.Digest,
 ) bool {
     const efi_cert_x509_guid = [_]u8{
         0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
@@ -1451,7 +1451,7 @@ fn efiDbContainsCertificate(
         var signature_offset = signatures_start;
         while (signature_offset < list_end) : (signature_offset += signature_size) {
             const certificate = variable[signature_offset + 16 .. signature_offset + signature_size];
-            const digest = vmiz.artifact_pipeline.sha256Bytes(certificate);
+            const digest = miz.artifact_pipeline.sha256Bytes(certificate);
             if (is_x509 and std.mem.eql(u8, &digest, &certificate_sha256)) return true;
         }
         list_offset = list_end;
@@ -1464,7 +1464,7 @@ fn verifyGuestSecureBoot(
     io: Io,
     ssh_path: []const u8,
     instance: *const Instance,
-    certificate_sha256: vmiz.artifact_pipeline.Digest,
+    certificate_sha256: miz.artifact_pipeline.Digest,
 ) !void {
     const db = try sshOutputAlloc(
         allocator,
@@ -1841,7 +1841,7 @@ fn verifyGuestBinderDeviceUsability(
 const android_smoke_runtime_remote_path = "/tmp/ubuntu2604-android-runtime";
 const android_smoke_bundle_archive_remote_path = "/tmp/ubuntu2604-android-bundle.tar";
 const android_smoke_bundle_remote_dir = "/tmp/ubuntu2604-android-bundle";
-const android_smoke_container_id = "vmiz-android-smoke";
+const android_smoke_container_id = "miz-android-smoke";
 const android_smoke_boot_property = "sys.boot_completed";
 const android_smoke_abilist_property = "ro.product.cpu.abilist";
 const android_smoke_binderfs_mount_destination = "/dev/binderfs";
@@ -1891,10 +1891,10 @@ const android_smoke_delete_command = "sudo -n '" ++ android_smoke_runtime_remote
 const AndroidSmokeInputs = struct {
     source_commit: []u8,
     runtime_path: []u8,
-    runtime_sha256: vmiz.artifact_pipeline.Digest,
+    runtime_sha256: miz.artifact_pipeline.Digest,
     bundle_path: []u8,
-    bundle_sha256: vmiz.artifact_pipeline.Digest,
-    config_sha256: vmiz.artifact_pipeline.Digest,
+    bundle_sha256: miz.artifact_pipeline.Digest,
+    config_sha256: miz.artifact_pipeline.Digest,
 
     fn deinit(self: *AndroidSmokeInputs, allocator: Allocator) void {
         allocator.free(self.source_commit);
@@ -1911,7 +1911,7 @@ fn isLowerHexDigit(value: u8) bool {
 fn requireAndroidSmokeInputsAlloc(allocator: Allocator) !AndroidSmokeInputs {
     const source_commit = try requireEnvAlloc(
         allocator,
-        "VMIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT",
+        "MIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT",
     );
     errdefer allocator.free(source_commit);
     if (source_commit.len != 40) return error.InvalidAndroidSmokeSourceCommit;
@@ -1919,32 +1919,32 @@ fn requireAndroidSmokeInputsAlloc(allocator: Allocator) !AndroidSmokeInputs {
         if (!isLowerHexDigit(c)) return error.InvalidAndroidSmokeSourceCommit;
     }
 
-    const runtime_path = try requireEnvAlloc(allocator, "VMIZ_UBUNTU2604_ANDROID_RUNTIME");
+    const runtime_path = try requireEnvAlloc(allocator, "MIZ_UBUNTU2604_ANDROID_RUNTIME");
     errdefer allocator.free(runtime_path);
     const runtime_sha256_text = try requireEnvAlloc(
         allocator,
-        "VMIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256",
+        "MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256",
     );
     defer allocator.free(runtime_sha256_text);
-    const runtime_sha256 = vmiz.artifact_pipeline.parseSha256(runtime_sha256_text) catch
+    const runtime_sha256 = miz.artifact_pipeline.parseSha256(runtime_sha256_text) catch
         return error.InvalidAndroidSmokeDigest;
 
-    const bundle_path = try requireEnvAlloc(allocator, "VMIZ_UBUNTU2604_ANDROID_BUNDLE");
+    const bundle_path = try requireEnvAlloc(allocator, "MIZ_UBUNTU2604_ANDROID_BUNDLE");
     errdefer allocator.free(bundle_path);
     const bundle_sha256_text = try requireEnvAlloc(
         allocator,
-        "VMIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256",
+        "MIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256",
     );
     defer allocator.free(bundle_sha256_text);
-    const bundle_sha256 = vmiz.artifact_pipeline.parseSha256(bundle_sha256_text) catch
+    const bundle_sha256 = miz.artifact_pipeline.parseSha256(bundle_sha256_text) catch
         return error.InvalidAndroidSmokeDigest;
 
     const config_sha256_text = try requireEnvAlloc(
         allocator,
-        "VMIZ_UBUNTU2604_ANDROID_CONFIG_SHA256",
+        "MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256",
     );
     defer allocator.free(config_sha256_text);
-    const config_sha256 = vmiz.artifact_pipeline.parseSha256(config_sha256_text) catch
+    const config_sha256 = miz.artifact_pipeline.parseSha256(config_sha256_text) catch
         return error.InvalidAndroidSmokeDigest;
 
     return .{
@@ -1997,7 +1997,7 @@ fn classifyAndroidBootPoll(
 }
 
 /// Confirms the bundle's `config.json` requests the BinderFS mount and a
-/// DMA-heap mount this contract requires, without vmiz constructing those
+/// DMA-heap mount this contract requires, without miz constructing those
 /// mounts itself (bundle preparation belongs to the artifact this contract
 /// only consumes). Pure JSON parsing, unit-tested directly without KVM.
 fn verifyAndroidBundleConfigRequestsRequiredDevices(
@@ -2105,7 +2105,7 @@ fn verifyRemoteFileDigest(
     ssh_path: []const u8,
     instance: *const Instance,
     remote_path: []const u8,
-    expected: vmiz.artifact_pipeline.Digest,
+    expected: miz.artifact_pipeline.Digest,
 ) !void {
     const command = try std.fmt.allocPrint(
         allocator,
@@ -2116,7 +2116,7 @@ fn verifyRemoteFileDigest(
     const output = try sshOutputAlloc(allocator, io, ssh_path, instance, command);
     defer allocator.free(output);
     const trimmed = std.mem.trim(u8, output, " \t\r\n");
-    const actual = vmiz.artifact_pipeline.parseSha256(trimmed) catch
+    const actual = miz.artifact_pipeline.parseSha256(trimmed) catch
         return error.AndroidSmokeRemoteDigestUnparseable;
     if (!std.mem.eql(u8, &actual, &expected)) return error.AndroidSmokeRemoteDigestMismatch;
 }
@@ -2225,12 +2225,12 @@ fn verifyGuestAndroidContainerSmoke(
 ) !void {
     if (!std.mem.eql(
         u8,
-        &(try vmiz.artifact_pipeline.hashFile(io, smoke.runtime_path)).sha256,
+        &(try miz.artifact_pipeline.hashFile(io, smoke.runtime_path)).sha256,
         &smoke.runtime_sha256,
     )) return error.AndroidSmokeRuntimeDigestMismatch;
     if (!std.mem.eql(
         u8,
-        &(try vmiz.artifact_pipeline.hashFile(io, smoke.bundle_path)).sha256,
+        &(try miz.artifact_pipeline.hashFile(io, smoke.bundle_path)).sha256,
         &smoke.bundle_sha256,
     )) return error.AndroidSmokeBundleDigestMismatch;
 
@@ -2275,7 +2275,7 @@ fn verifyGuestAndroidContainerSmoke(
 
     const config_json = try sshOutputAlloc(allocator, io, ssh_path, instance, android_smoke_config_command);
     defer allocator.free(config_json);
-    const config_digest = vmiz.artifact_pipeline.sha256Bytes(config_json);
+    const config_digest = miz.artifact_pipeline.sha256Bytes(config_json);
     if (!std.mem.eql(u8, &config_digest, &smoke.config_sha256))
         return error.AndroidSmokeConfigDigestMismatch;
     try verifyAndroidBundleConfigRequestsRequiredDevices(allocator, config_json);
@@ -2471,7 +2471,7 @@ fn verifyKeyOnlySsh(
 
 const core_checks =
     \\set -eu
-    \\sudo -n /usr/bin/test /proc/1/exe -ef /sbin/vmizinit
+    \\sudo -n /usr/bin/test /proc/1/exe -ef /sbin/mizinit
     \\test -x /usr/sbin/azagent
     \\test -f /var/lib/azagent/provisioned
     \\test "$( . /etc/os-release; printf '%s' "$ID")" = ubuntu
@@ -2544,8 +2544,8 @@ fn readCoreSshdPid(
 const full_checks =
     \\set -eu
     \\sudo -n /usr/bin/test /proc/1/exe -ef /usr/lib/systemd/systemd
-    \\test ! -e /sbin/vmizinit
-    \\test ! -e /usr/bin/vmizinit
+    \\test ! -e /sbin/mizinit
+    \\test ! -e /usr/bin/mizinit
     \\test "$( . /etc/os-release; printf '%s' "$ID")" = ubuntu
     \\test "$( . /etc/os-release; printf '%s' "$VERSION_ID")" = 26.04
     \\for unit in cloud-init-local.service cloud-init.service cloud-config.service cloud-final.service walinuxagent.service ssh.service systemd-networkd.service; do
@@ -2615,14 +2615,14 @@ const core_provisioned_state_command =
     \\set -eu
     \\account=
     \\while IFS=: read -r name _ uid gid _ home shell; do
-    \\  if test "$name" = vmiztest; then
+    \\  if test "$name" = miztest; then
     \\    account="$name:$uid:$gid:$home:$shell"
     \\    break
     \\  fi
     \\done < /etc/passwd
     \\test -n "$account"
     \\printf '%s\n' "$account"
-    \\set -- $(/usr/bin/ssh-keygen -lf /home/vmiztest/.ssh/authorized_keys -E sha256)
+    \\set -- $(/usr/bin/ssh-keygen -lf /home/miztest/.ssh/authorized_keys -E sha256)
     \\printf '%s\n' "$2"
     \\sentinel=$(sudo -n /bin/cat /var/lib/azagent/provisioned)
     \\test -n "$sentinel"
@@ -2830,16 +2830,16 @@ fn writeAcceptanceResult(
     io: Io,
     result_path: []const u8,
     candidate: Candidate,
-    source_sha256: vmiz.artifact_pipeline.Digest,
-    certificate_sha256: vmiz.artifact_pipeline.Digest,
-    uki_sha256: vmiz.artifact_pipeline.Digest,
+    source_sha256: miz.artifact_pipeline.Digest,
+    certificate_sha256: miz.artifact_pipeline.Digest,
+    uki_sha256: miz.artifact_pipeline.Digest,
     android_smoke: ?*const AndroidSmokeInputs,
 ) !void {
-    const source_sha256_hex = vmiz.artifact_pipeline.formatSha256(source_sha256);
-    const certificate_sha256_hex = vmiz.artifact_pipeline.formatSha256(
+    const source_sha256_hex = miz.artifact_pipeline.formatSha256(source_sha256);
+    const certificate_sha256_hex = miz.artifact_pipeline.formatSha256(
         certificate_sha256,
     );
-    const uki_sha256_hex = vmiz.artifact_pipeline.formatSha256(uki_sha256);
+    const uki_sha256_hex = miz.artifact_pipeline.formatSha256(uki_sha256);
     switch (candidate.flavor) {
         .full => {
             if (android_smoke != null) return error.UnexpectedAndroidSmokeProvenance;
@@ -2859,9 +2859,9 @@ fn writeAcceptanceResult(
         },
         .core => {
             const smoke = android_smoke orelse return error.MissingAndroidSmokeProvenance;
-            const runtime_sha256_hex = vmiz.artifact_pipeline.formatSha256(smoke.runtime_sha256);
-            const bundle_sha256_hex = vmiz.artifact_pipeline.formatSha256(smoke.bundle_sha256);
-            const config_sha256_hex = vmiz.artifact_pipeline.formatSha256(smoke.config_sha256);
+            const runtime_sha256_hex = miz.artifact_pipeline.formatSha256(smoke.runtime_sha256);
+            const bundle_sha256_hex = miz.artifact_pipeline.formatSha256(smoke.bundle_sha256);
+            const config_sha256_hex = miz.artifact_pipeline.formatSha256(smoke.config_sha256);
             const candidate_key = try std.fmt.allocPrint(allocator, "{s}-{s}", .{
                 @tagName(candidate.architecture),
                 @tagName(candidate.flavor),
@@ -2924,7 +2924,7 @@ test "Ubuntu 26.04 acceptance flavor policy preserves full and isolates core" {
     try std.testing.expectEqual(@as(u32, 4), core.flavor.policy().result_schema);
     try std.testing.expectEqual(@as(usize, 18), full.contracts().len);
     try std.testing.expectEqual(@as(usize, 31), core.contracts().len);
-    try std.testing.expect(hasContract(core.contracts(), "vmizinit-sshd-supervision"));
+    try std.testing.expect(hasContract(core.contracts(), "mizinit-sshd-supervision"));
     try std.testing.expect(hasContract(core.contracts(), "no-cloud-init"));
     try std.testing.expect(hasContract(core.contracts(), "signed-binder-module"));
     try std.testing.expect(hasContract(core.contracts(), "binder-boot-required"));
@@ -2992,7 +2992,7 @@ test "EFI db parser finds the exact enrolled DER certificate" {
         .little,
     );
     @memcpy(variable[list_offset + 28 + 16 ..], certificate);
-    const digest = vmiz.artifact_pipeline.sha256Bytes(certificate);
+    const digest = miz.artifact_pipeline.sha256Bytes(certificate);
     try std.testing.expect(efiDbContainsCertificate(&variable, digest));
     try std.testing.expect(!efiDbContainsCertificate(
         &variable,
@@ -3361,7 +3361,7 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
     const qemu_path = try requireToolOverrideAlloc(
         allocator,
         io,
-        "VMIZ_UBUNTU2604_QEMU",
+        "MIZ_UBUNTU2604_QEMU",
         qemu_host.qemuSystemName(candidate.architecture.guestArchitecture()),
     );
     defer allocator.free(qemu_path);
@@ -3378,49 +3378,49 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
     const sbverify_path = try requireToolOverrideAlloc(
         allocator,
         io,
-        "VMIZ_UBUNTU2604_SBVERIFY",
+        "MIZ_UBUNTU2604_SBVERIFY",
         "sbverify",
     );
     defer allocator.free(sbverify_path);
     const virt_fw_vars_path = try requireToolOverrideAlloc(
         allocator,
         io,
-        "VMIZ_UBUNTU2604_VIRT_FW_VARS",
+        "MIZ_UBUNTU2604_VIRT_FW_VARS",
         "virt-fw-vars",
     );
     defer allocator.free(virt_fw_vars_path);
     const certificate_path = try requireEnvAlloc(
         allocator,
-        "VMIZ_UBUNTU2604_SIGNING_CERTIFICATE",
+        "MIZ_UBUNTU2604_SIGNING_CERTIFICATE",
     );
     defer allocator.free(certificate_path);
     const expected_certificate_text = try requireEnvAlloc(
         allocator,
-        "VMIZ_UBUNTU2604_SIGNING_CERTIFICATE_SHA256",
+        "MIZ_UBUNTU2604_SIGNING_CERTIFICATE_SHA256",
     );
     defer allocator.free(expected_certificate_text);
-    const expected_certificate_sha256 = vmiz.artifact_pipeline.parseSha256(
+    const expected_certificate_sha256 = miz.artifact_pipeline.parseSha256(
         expected_certificate_text,
     ) catch return error.InvalidSigningCertificateSha256;
     const expected_uki_text = try requireEnvAlloc(
         allocator,
-        "VMIZ_UBUNTU2604_UKI_SHA256",
+        "MIZ_UBUNTU2604_UKI_SHA256",
     );
     defer allocator.free(expected_uki_text);
-    const expected_uki_sha256 = vmiz.artifact_pipeline.parseSha256(
+    const expected_uki_sha256 = miz.artifact_pipeline.parseSha256(
         expected_uki_text,
     ) catch return error.InvalidExpectedUkiSha256;
     const expected_image_text = try requireEnvAlloc(
         allocator,
-        "VMIZ_UBUNTU2604_IMAGE_SHA256",
+        "MIZ_UBUNTU2604_IMAGE_SHA256",
     );
     defer allocator.free(expected_image_text);
-    const expected_image_sha256 = vmiz.artifact_pipeline.parseSha256(
+    const expected_image_sha256 = miz.artifact_pipeline.parseSha256(
         expected_image_text,
     ) catch return error.InvalidExpectedImageSha256;
     const result_path = try requireEnvAlloc(
         allocator,
-        "VMIZ_UBUNTU2604_ACCEPTANCE_RESULT",
+        "MIZ_UBUNTU2604_ACCEPTANCE_RESULT",
     );
     defer allocator.free(result_path);
     // Required only for the core flavor, and required (never skipped) when
@@ -3441,7 +3441,7 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
     defer firmware.deinit(allocator);
 
     try validateQemuImgInfo(allocator, io, qemu_img_path, absolute_image);
-    const source_sha256 = (try vmiz.artifact_pipeline.hashFile(
+    const source_sha256 = (try miz.artifact_pipeline.hashFile(
         io,
         absolute_image,
     )).sha256;
@@ -3846,7 +3846,7 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
     );
     try Io.sleep(io, .fromSeconds(5), .awake);
     if (try serialContains(allocator, io, &rejected, "Linux version") or
-        try serialContains(allocator, io, &rejected, "VMIZINIT_PID1_READY") or
+        try serialContains(allocator, io, &rejected, "MIZINIT_PID1_READY") or
         try sshSucceeded(allocator, io, ssh_path, &rejected, "true"))
     {
         return error.TamperedUkiBootedWithSecureBoot;
@@ -3855,7 +3855,7 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
 
     try std.testing.expectEqual(
         source_sha256,
-        (try vmiz.artifact_pipeline.hashFile(io, absolute_image)).sha256,
+        (try miz.artifact_pipeline.hashFile(io, absolute_image)).sha256,
     );
     try writeAcceptanceResult(
         allocator,

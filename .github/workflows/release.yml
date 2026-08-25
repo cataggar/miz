@@ -76,27 +76,27 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-linux-musl
             name: linux-musl-x64
-            executable: vmiz
+            executable: miz
           - os: ubuntu-22.04-arm
             target: aarch64-linux-musl
             name: linux-musl-arm64
-            executable: vmiz
+            executable: miz
           - os: ubuntu-22.04
             target: x86_64-macos
             name: macos-x64
-            executable: vmiz
+            executable: miz
           - os: macos-14
             target: aarch64-macos
             name: macos-arm64
-            executable: vmiz
+            executable: miz
           - os: windows-latest
             target: x86_64-windows
             name: windows-x64
-            executable: vmiz.exe
+            executable: miz.exe
           - os: ubuntu-22.04
             target: aarch64-windows
             name: windows-arm64
-            executable: vmiz.exe
+            executable: miz.exe
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -111,7 +111,7 @@ jobs:
             cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Build
-        run: zig build install-vmiz -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+        run: zig build install-miz -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
 
       - name: Package
         shell: bash
@@ -122,7 +122,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          package="vmiz-${VERSION}-${PLATFORM}"
+          package="miz-${VERSION}-${PLATFORM}"
           source_executable="zig-out/bin/${EXECUTABLE}"
           test -f "$source_executable"
           test -f doc/readme.md
@@ -140,7 +140,7 @@ jobs:
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           file: zig-out/bin/${{ matrix.executable }}
-          output-file: vmiz-${{ needs.verify.outputs.version }}-${{ matrix.name }}.sbom.spdx.json
+          output-file: miz-${{ needs.verify.outputs.version }}-${{ matrix.name }}.sbom.spdx.json
           upload-artifact: false
 
       - name: Upload artifacts
@@ -148,8 +148,8 @@ jobs:
         with:
           name: ${{ matrix.name }}
           path: |
-            vmiz-*.tar.gz
-            vmiz-*.sbom.spdx.json
+            miz-*.tar.gz
+            miz-*.sbom.spdx.json
           if-no-files-found: error
 
   release:
@@ -184,34 +184,34 @@ jobs:
             windows-arm64
           )
           for platform in "${platforms[@]}"; do
-            test -f "vmiz-${VERSION}-${platform}.tar.gz"
-            test -f "vmiz-${VERSION}-${platform}.sbom.spdx.json"
+            test -f "miz-${VERSION}-${platform}.tar.gz"
+            test -f "miz-${VERSION}-${platform}.sbom.spdx.json"
           done
 
-          archive_count=$(find . -maxdepth 1 -type f -name 'vmiz-*.tar.gz' | wc -l | tr -d ' ')
-          sbom_count=$(find . -maxdepth 1 -type f -name 'vmiz-*.sbom.spdx.json' | wc -l | tr -d ' ')
+          archive_count=$(find . -maxdepth 1 -type f -name 'miz-*.tar.gz' | wc -l | tr -d ' ')
+          sbom_count=$(find . -maxdepth 1 -type f -name 'miz-*.sbom.spdx.json' | wc -l | tr -d ' ')
           test "$archive_count" = 6
           test "$sbom_count" = 6
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
         with:
-          subject-path: vmiz-*.tar.gz
+          subject-path: miz-*.tar.gz
 
       - name: Create release
         uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
         with:
-          name: vmiz ${{ needs.verify.outputs.version }}
+          name: miz ${{ needs.verify.outputs.version }}
           tag_name: ${{ github.ref_name }}
           body: |
             **Install:**
 
             ```console
-            ghr install cataggar/vmiz@${{ github.ref_name }}
+            ghr install cataggar/miz@${{ github.ref_name }}
             ```
           files: |
-            vmiz-*.tar.gz
-            vmiz-*.sbom.spdx.json
+            miz-*.tar.gz
+            miz-*.sbom.spdx.json
           fail_on_unmatched_files: true
           generate_release_notes: true
           draft: false

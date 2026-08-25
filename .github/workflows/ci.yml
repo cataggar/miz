@@ -33,6 +33,9 @@ jobs:
       - name: zig fmt --check
         run: zig fmt --check .
 
+      - name: Stale brand guard
+        run: python3 -m unittest tests.stale_brand_test
+
       - name: Azure Linux release workflow unit tests
         run: python3 -m unittest discover -s tests -p azurelinux4_release_test.py
 
@@ -68,7 +71,7 @@ jobs:
 
       - name: Build production artifacts and run Zig tests
         run: |
-          if grep -n 'std\.process\.spawn' packages/vmiz/src/package_family.zig; then
+          if grep -n 'std\.process\.spawn' packages/miz/src/package_family.zig; then
             echo "production package-family path must not spawn debz" >&2
             exit 1
           fi
@@ -117,7 +120,7 @@ jobs:
             cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Build ${{ matrix.target }}
-        run: zig build install-vmiz -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+        run: zig build install-miz -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
 
   unsafe-chroot:
     name: privileged integrations
@@ -137,12 +140,12 @@ jobs:
 
       - name: privileged device-write integration
         env:
-          VMIZ_RUN_PRIVILEGED_TEST: "1"
+          MIZ_RUN_PRIVILEGED_TEST: "1"
         run: zig build test-device-write-integration -Doptimize=Debug --summary all
 
       - name: privileged unsafe-chroot integration
         env:
-          VMIZ_RUN_PRIVILEGED_TEST: "1"
+          MIZ_RUN_PRIVILEGED_TEST: "1"
         run: zig build test-unsafe-chroot-integration -Doptimize=Debug --summary all
 
   vm-boot:
@@ -207,11 +210,11 @@ jobs:
             x86_64) guest="aarch64" ;;
             *) guest="x86_64" ;;
           esac
-          echo "VMIZ_VM_CROSS_ARCH=$guest" >> "$GITHUB_ENV"
+          echo "MIZ_VM_CROSS_ARCH=$guest" >> "$GITHUB_ENV"
           scripts/ci/fetch-vm-boot-kernel.sh \
             "fixtures/vm-boot-kernel/$host" "$host" >> "$GITHUB_ENV"
           scripts/ci/fetch-vm-boot-kernel.sh \
-            "fixtures/vm-boot-kernel/$guest" "$guest" VMIZ_VM_CROSS_ >> "$GITHUB_ENV"
+            "fixtures/vm-boot-kernel/$guest" "$guest" MIZ_VM_CROSS_ >> "$GITHUB_ENV"
 
       # Hardware acceleration is probed rather than required. No hosted runner
       # class is guaranteed to expose /dev/kvm, and a test that demands one is
@@ -219,22 +222,22 @@ jobs:
       - name: Select QEMU accelerator
         run: |
           if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-            echo "VMIZ_VM_ACCEL=hardware" >> "$GITHUB_ENV"
+            echo "MIZ_VM_ACCEL=hardware" >> "$GITHUB_ENV"
           else
-            echo "VMIZ_VM_ACCEL=software" >> "$GITHUB_ENV"
+            echo "MIZ_VM_ACCEL=software" >> "$GITHUB_ENV"
           fi
 
       - name: real VM boot
         if: matrix.shard == 'native'
         env:
-          VMIZ_RUN_VM_BOOT_TEST: "1"
+          MIZ_RUN_VM_BOOT_TEST: "1"
         run: |
           set -euo pipefail
           # `readlink -f` resolves the ghr shim to the binary inside the
           # extracted tree, which is what QEMU needs: it locates its ROMs
           # relative to its own path, and an x86 direct-kernel boot still
           # loads a BIOS ROM.
-          VMIZ_VM_QEMU="$(readlink -f "$(command -v "qemu-system-$(uname -m)")")" \
+          MIZ_VM_QEMU="$(readlink -f "$(command -v "qemu-system-$(uname -m)")")" \
             zig build test-vm-real-boot \
               -Doptimize=${{ matrix.optimize }} --summary all
 
@@ -244,17 +247,17 @@ jobs:
       - name: cross-architecture VM boot
         if: matrix.shard == 'cross'
         env:
-          VMIZ_RUN_VM_BOOT_TEST: "1"
+          MIZ_RUN_VM_BOOT_TEST: "1"
         run: |
           set -euo pipefail
-          export VMIZ_VM_BOOT_ARCH="${VMIZ_VM_CROSS_ARCH}"
-          export VMIZ_VM_BOOT_KERNEL="${VMIZ_VM_CROSS_KERNEL}"
-          export VMIZ_VM_BOOT_MODULES_BUILTIN="${VMIZ_VM_CROSS_MODULES_BUILTIN}"
+          export MIZ_VM_BOOT_ARCH="${MIZ_VM_CROSS_ARCH}"
+          export MIZ_VM_BOOT_KERNEL="${MIZ_VM_CROSS_KERNEL}"
+          export MIZ_VM_BOOT_MODULES_BUILTIN="${MIZ_VM_CROSS_MODULES_BUILTIN}"
           # KVM cannot cross architectures, so this run is emulated whatever
           # the host happens to offer.
-          export VMIZ_VM_ACCEL=software
-          VMIZ_VM_QEMU="$(readlink -f \
-            "$(command -v "qemu-system-${VMIZ_VM_CROSS_ARCH}")")" \
+          export MIZ_VM_ACCEL=software
+          MIZ_VM_QEMU="$(readlink -f \
+            "$(command -v "qemu-system-${MIZ_VM_CROSS_ARCH}")")" \
             zig build test-vm-real-boot \
               -Doptimize=${{ matrix.optimize }} --summary all
 
@@ -275,17 +278,17 @@ jobs:
           fi
           scripts/ci/fetch-vm-boot-modular-kernel.sh \
             "fixtures/vm-boot-modular-kernel/$(uname -m)" "$(uname -m)" \
-            VMIZ_VM_MODULAR_ >> "$GITHUB_ENV"
+            MIZ_VM_MODULAR_ >> "$GITHUB_ENV"
 
       - name: modular VM boot
         if: matrix.shard == 'modular'
         env:
-          VMIZ_RUN_VM_BOOT_TEST: "1"
+          MIZ_RUN_VM_BOOT_TEST: "1"
         run: |
           set -euo pipefail
-          export VMIZ_VM_BOOT_KERNEL="${VMIZ_VM_MODULAR_KERNEL}"
-          export VMIZ_VM_BOOT_MODULES_BUILTIN="${VMIZ_VM_MODULAR_MODULES_BUILTIN}"
-          export VMIZ_VM_BOOT_MODULE_TREE="${VMIZ_VM_MODULAR_MODULE_TREE}"
-          VMIZ_VM_QEMU="$(readlink -f "$(command -v "qemu-system-$(uname -m)")")" \
+          export MIZ_VM_BOOT_KERNEL="${MIZ_VM_MODULAR_KERNEL}"
+          export MIZ_VM_BOOT_MODULES_BUILTIN="${MIZ_VM_MODULAR_MODULES_BUILTIN}"
+          export MIZ_VM_BOOT_MODULE_TREE="${MIZ_VM_MODULAR_MODULE_TREE}"
+          MIZ_VM_QEMU="$(readlink -f "$(command -v "qemu-system-$(uname -m)")")" \
             zig build test-vm-real-boot \
               -Doptimize=${{ matrix.optimize }} --summary all

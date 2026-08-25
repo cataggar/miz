@@ -1,7 +1,7 @@
 # nbd — native Zig NBD client and reference server
 
 A dependency-free client (and a minimal reference server) for the
-[NBD (Network Block Device)](../../docs/interop/nbd.rst) protocol -- a
+[NBD (Network Block Device)](https://gitlab.com/qemu-project/qemu/-/blob/master/docs/interop/nbd.rst) protocol -- a
 protocol-only, no-QEMU-internals way to read/write a block device over a
 Unix domain or TCP socket. No QEMU C code, no libvirt, no external
 dependencies -- just `@import("nbd")` in your `build.zig`.

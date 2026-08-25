@@ -1,11 +1,11 @@
 //! Shared `-O`/`-o` output option helpers for the CLI commands.
 
 const std = @import("std");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 /// Explains why an `-O`/`-o` combination was refused. Shared so that every
 /// command describes the same constraint with the same words.
-pub fn describeOutputError(err: vmiz.output.SpecError) []const u8 {
+pub fn describeOutputError(err: miz.output.SpecError) []const u8 {
     return switch (err) {
         error.CompressionRequiresRawFormat => "compressed output is produced while the image is written, and only raw is written in a single forward pass (use raw.gz or raw.zst)",
         error.FormatRequiresSeekableOutput => "stdout cannot be seeked backwards, and vhd (trailing footer), vhdx (BAT), and qcow2 (L1 and refcount tables) all amend metadata after the data (use raw, raw.gz, or raw.zst)",
@@ -18,8 +18,8 @@ pub fn describeOutputError(err: vmiz.output.SpecError) []const u8 {
 /// `subformat=fixed|dynamic` is recognized, matching qemu-img's `-f vpc -o
 /// subformat=...`). Returns `null` and prints a diagnostic on the first
 /// unrecognized key or value.
-pub fn parseVhdCreateOptions(opt_string: []const u8) ?vmiz.CreateOptions {
-    var options = vmiz.CreateOptions{};
+pub fn parseVhdCreateOptions(opt_string: []const u8) ?miz.CreateOptions {
+    var options = miz.CreateOptions{};
     var it = std.mem.splitScalar(u8, opt_string, ',');
     while (it.next()) |pair| {
         if (pair.len == 0) continue;

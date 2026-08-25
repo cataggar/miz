@@ -1,7 +1,7 @@
-//! `vmiz info [--output=human|json] <file>`
+//! `miz info [--output=human|json] <file>`
 
 const std = @import("std");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 const OutputMode = enum { human, json };
 
@@ -21,9 +21,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         }
     }
 
-    const file_path = path orelse return fail("usage: vmiz info [--output=human|json] <file>", .{});
+    const file_path = path orelse return fail("usage: miz info [--output=human|json] <file>", .{});
 
-    var img = vmiz.Image.openPath(io, file_path) catch |err|
+    var img = miz.Image.openPath(io, file_path) catch |err|
         return fail("info: failed to open '{s}': {s}", .{ file_path, @errorName(err) });
     defer img.close(io);
 
@@ -133,7 +133,7 @@ test "info emits native zstd metadata compatible with the release validator" {
 
     const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     var src = TestSliceSource{ .data = data };
-    _ = try vmiz.qcow2.writeStandaloneCompressed(
+    _ = try miz.qcow2.writeStandaloneCompressed(
         std.testing.allocator,
         io,
         file,
@@ -143,9 +143,9 @@ test "info emits native zstd metadata compatible with the release validator" {
     );
     file.close(io);
 
-    var img = try vmiz.Image.openPathReadOnlyStandalone(io, path);
+    var img = try miz.Image.openPathReadOnlyStandalone(io, path);
     defer img.close(io);
-    try std.testing.expectEqual(vmiz.Format.qcow2, img.format);
+    try std.testing.expectEqual(miz.Format.qcow2, img.format);
     try std.testing.expectEqual(virtual_size, img.virtual_size);
     const q = img.qcow2.?;
     try std.testing.expectEqualStrings("zstd", qcow2CompressionName(q.compression_type));
@@ -155,7 +155,7 @@ test "info emits native zstd metadata compatible with the release validator" {
 const TestSliceSource = struct {
     data: []const u8,
 
-    fn reader(self: *const TestSliceSource) vmiz.qcow2.SourceReader {
+    fn reader(self: *const TestSliceSource) miz.qcow2.SourceReader {
         return .{ .context = self, .readFn = read };
     }
 

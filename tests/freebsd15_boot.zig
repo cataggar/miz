@@ -1,13 +1,13 @@
 //! Opt-in QEMU acceptance for generalized FreeBSD 15.1 release images.
-//! Set `VMIZ_FREEBSD15_IMAGE`, `VMIZ_FREEBSD15_ARCHITECTURE`,
-//! `VMIZ_FREEBSD15_FILESYSTEM`, and `VMIZ_FREEBSD15_FLAVOR` to run it.
+//! Set `MIZ_FREEBSD15_IMAGE`, `MIZ_FREEBSD15_ARCHITECTURE`,
+//! `MIZ_FREEBSD15_FILESYSTEM`, and `MIZ_FREEBSD15_FLAVOR` to run it.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const qemu_host = @import("qemu_host");
 const qmp = @import("qmp");
 const packages = @import("packages");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -99,7 +99,7 @@ fn optionalEnvAlloc(
 fn architectureFromEnvironment(allocator: Allocator) !Architecture {
     const value = try optionalEnvAlloc(
         allocator,
-        "VMIZ_FREEBSD15_ARCHITECTURE",
+        "MIZ_FREEBSD15_ARCHITECTURE",
     ) orelse return .aarch64;
     defer allocator.free(value);
     return Architecture.parse(value) orelse error.InvalidArchitecture;
@@ -108,7 +108,7 @@ fn architectureFromEnvironment(allocator: Allocator) !Architecture {
 fn rootFilesystemFromEnvironment(allocator: Allocator) !RootFilesystem {
     const value = try optionalEnvAlloc(
         allocator,
-        "VMIZ_FREEBSD15_FILESYSTEM",
+        "MIZ_FREEBSD15_FILESYSTEM",
     ) orelse return .zfs;
     defer allocator.free(value);
     return RootFilesystem.parse(value) orelse error.InvalidRootFilesystem;
@@ -117,7 +117,7 @@ fn rootFilesystemFromEnvironment(allocator: Allocator) !RootFilesystem {
 fn flavorFromEnvironment(allocator: Allocator) !Flavor {
     const value = try optionalEnvAlloc(
         allocator,
-        "VMIZ_FREEBSD15_FLAVOR",
+        "MIZ_FREEBSD15_FLAVOR",
     ) orelse return .full;
     defer allocator.free(value);
     return Flavor.parse(value) orelse error.InvalidFlavor;
@@ -130,11 +130,11 @@ fn requireImageAlloc(
 ) ![]u8 {
     const path = try optionalEnvAlloc(
         allocator,
-        "VMIZ_FREEBSD15_IMAGE",
+        "MIZ_FREEBSD15_IMAGE",
     ) orelse {
         std.debug.print(
             "skipping FreeBSD {s} boot acceptance: set " ++
-                "VMIZ_FREEBSD15_IMAGE to a generalized QCOW2\n",
+                "MIZ_FREEBSD15_IMAGE to a generalized QCOW2\n",
             .{@tagName(architecture)},
         );
         return error.SkipZigTest;
@@ -142,7 +142,7 @@ fn requireImageAlloc(
     errdefer allocator.free(path);
     if (!try qemu_host.pathAccessible(io, path, .{ .read = true })) {
         std.debug.print(
-            "VMIZ_FREEBSD15_IMAGE is not readable: {s}\n",
+            "MIZ_FREEBSD15_IMAGE is not readable: {s}\n",
             .{path},
         );
         return error.AcceptanceImageNotReadable;
@@ -195,12 +195,12 @@ fn resolveFirmwareAlloc(
 ) !Firmware {
     const explicit_code = try optionalEnvAlloc(
         allocator,
-        "VMIZ_FREEBSD15_UEFI_CODE",
+        "MIZ_FREEBSD15_UEFI_CODE",
     );
     defer if (explicit_code) |path| allocator.free(path);
     const explicit_vars = try optionalEnvAlloc(
         allocator,
-        "VMIZ_FREEBSD15_UEFI_VARS",
+        "MIZ_FREEBSD15_UEFI_VARS",
     );
     defer if (explicit_vars) |path| allocator.free(path);
     if ((explicit_code == null) != (explicit_vars == null)) {
@@ -214,7 +214,7 @@ fn resolveFirmwareAlloc(
     })) |firmware| return firmware;
     std.debug.print(
         "skipping FreeBSD {s} boot acceptance: matching UEFI firmware was not found; " ++
-            "set VMIZ_FREEBSD15_UEFI_CODE and VMIZ_FREEBSD15_UEFI_VARS\n",
+            "set MIZ_FREEBSD15_UEFI_CODE and MIZ_FREEBSD15_UEFI_VARS\n",
         .{@tagName(architecture)},
     );
     return error.SkipZigTest;
@@ -438,11 +438,11 @@ fn runTimedCommandAlloc(
         "/bin/bash",
         "-c",
         ssh_capture_script,
-        "vmiz-ssh-capture",
+        "miz-ssh-capture",
         "/bin/bash",
         "-c",
         timeout_wrapper_script,
-        "vmiz-timeout-wrapper",
+        "miz-timeout-wrapper",
         completion_path,
         started_path,
         timeout_path,
@@ -521,7 +521,7 @@ fn runSshCommandAlloc(
             "StrictHostKeyChecking=no",
             "-o",
             "UserKnownHostsFile=/dev/null",
-            "vmiztest@127.0.0.1",
+            "miztest@127.0.0.1",
             command,
         },
     );
@@ -853,11 +853,11 @@ const shared_remote_checks =
     \\! /usr/sbin/pw usershow freebsd >/dev/null 2>&1
     \\/usr/local/bin/sudo -n /usr/bin/awk -F: '$1 == "root" && $2 == "*LOCKED*" { ok=1 } END { exit !ok }' /etc/master.passwd
     \\test -s /etc/ssh/ssh_host_ed25519_key
-    \\test -s /home/vmiztest/.ssh/authorized_keys
+    \\test -s /home/miztest/.ssh/authorized_keys
     \\test ! -e /firstboot
     \\test ! -e /firstboot-reboot
-    \\test ! -e /root/vmiz-generalize.sh
-    \\test ! -e /etc/rc.d/vmiz_generalize
+    \\test ! -e /root/miz-generalize.sh
+    \\test ! -e /etc/rc.d/miz_generalize
     \\! /usr/bin/grep -Eq '^[^#].*[[:space:]]swap[[:space:]]' /etc/fstab
     \\test "$(/usr/sbin/swapinfo -k | /usr/bin/wc -l | /usr/bin/tr -d ' ')" = 1
     \\/usr/bin/grep -Fx 'Provisioning.Agent=auto' /usr/local/etc/waagent.conf
@@ -1749,7 +1749,7 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
     const qemu_path = try requireToolOverrideAlloc(
         allocator,
         io,
-        "VMIZ_FREEBSD15_QEMU",
+        "MIZ_FREEBSD15_QEMU",
         architecture.qemuName(),
         architecture,
     );
@@ -1874,69 +1874,69 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
         const nonce = std.fmt.bytesToHex(nonce_bytes, .lower);
         const ready_marker = try std.fmt.allocPrint(
             allocator,
-            "VMIZ_FREEBSD_ACCEPTANCE_READY {s}",
+            "MIZ_FREEBSD_ACCEPTANCE_READY {s}",
             .{&nonce},
         );
         defer allocator.free(ready_marker);
         const failure_marker = try std.fmt.allocPrint(
             allocator,
-            "VMIZ_FREEBSD_ACCEPTANCE_FAILED {s}",
+            "MIZ_FREEBSD_ACCEPTANCE_FAILED {s}",
             .{&nonce},
         );
         defer allocator.free(failure_marker);
 
         const metadata = try std.fmt.allocPrint(
             allocator,
-            "instance-id: vmiz-acceptance-{s}\n" ++
-                "local-hostname: vmiz-acceptance\n",
+            "instance-id: miz-acceptance-{s}\n" ++
+                "local-hostname: miz-acceptance\n",
             .{&nonce},
         );
         defer allocator.free(metadata);
         const user_data = try std.fmt.allocPrint(
             allocator,
             \\#cloud-config
-            \\hostname: vmiz-acceptance
+            \\hostname: miz-acceptance
             \\ssh_pwauth: false
             \\users:
-            \\  - name: vmiztest
+            \\  - name: miztest
             \\    groups: wheel
             \\    shell: /bin/sh
             \\    ssh_authorized_keys:
             \\      - {s}
             \\write_files:
-            \\  - path: /usr/local/etc/sudoers.d/vmiztest
+            \\  - path: /usr/local/etc/sudoers.d/miztest
             \\    permissions: "0440"
             \\    content: |
-            \\      vmiztest ALL=(ALL) NOPASSWD: ALL
-            \\  - path: /root/vmiz-acceptance-ready.sh
+            \\      miztest ALL=(ALL) NOPASSWD: ALL
+            \\  - path: /root/miz-acceptance-ready.sh
             \\    permissions: "0700"
             \\    content: |
             \\      #!/bin/sh
             \\      sleep 30
             \\      if [ -s /etc/ssh/ssh_host_ed25519_key ] &&
-            \\          [ -s /home/vmiztest/.ssh/authorized_keys ] &&
-            \\          /usr/bin/id vmiztest >/dev/null 2>&1 &&
+            \\          [ -s /home/miztest/.ssh/authorized_keys ] &&
+            \\          /usr/bin/id miztest >/dev/null 2>&1 &&
             \\          /usr/sbin/service sshd onestatus >/dev/null 2>&1 &&
             \\          /sbin/ifconfig vtnet0 | /usr/bin/grep -q 'inet '; then
-            \\          printf 'VMIZ_FREEBSD_ACCEPTANCE_READY {s}\n' >/dev/console
+            \\          printf 'MIZ_FREEBSD_ACCEPTANCE_READY {s}\n' >/dev/console
             \\      else
-            \\          printf 'VMIZ_FREEBSD_ACCEPTANCE_FAILED {s}\n' >/dev/console
+            \\          printf 'MIZ_FREEBSD_ACCEPTANCE_FAILED {s}\n' >/dev/console
             \\          /sbin/ifconfig -a >/dev/console 2>&1 || true
             \\          /usr/sbin/service sshd onestatus >/dev/console 2>&1 || true
-            \\          /usr/bin/id vmiztest >/dev/console 2>&1 || true
+            \\          /usr/bin/id miztest >/dev/console 2>&1 || true
             \\          /usr/bin/stat -f '%Sp %Su:%Sg %z %N' \
-            \\              /home/vmiztest /home/vmiztest/.ssh \
-            \\              /home/vmiztest/.ssh/authorized_keys \
+            \\              /home/miztest /home/miztest/.ssh \
+            \\              /home/miztest/.ssh/authorized_keys \
             \\              >/dev/console 2>&1 || true
             \\      fi
             \\runcmd:
-            \\  - /usr/sbin/daemon -cf /root/vmiz-acceptance-ready.sh
+            \\  - /usr/sbin/daemon -cf /root/miz-acceptance-ready.sh
             \\
         ,
             .{ public_key, &nonce, &nonce },
         );
         defer allocator.free(user_data);
-        _ = try vmiz.iso9660.writeNoCloudSeedPath(allocator, io, seed_path, .{
+        _ = try miz.iso9660.writeNoCloudSeedPath(allocator, io, seed_path, .{
             .meta_data = metadata,
             .user_data = user_data,
         });

@@ -1,5 +1,5 @@
 //! Grows the root partition + ext4 filesystem to fill a larger disk than
-//! the image was built at ("growpart"/`resize2fs` equivalent). See vmiz
+//! the image was built at ("growpart"/`resize2fs` equivalent). See miz
 //! issue #130.
 //!
 //! Generalized images are typically built small and deployed onto VMs with
@@ -32,11 +32,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
-const vmiz = @import("vmiz");
-const mbr = vmiz.mbr;
-const gpt = vmiz.gpt;
-const ext4 = vmiz.ext4;
-const Image = vmiz.Image;
+const miz = @import("miz");
+const mbr = miz.mbr;
+const gpt = miz.gpt;
+const ext4 = miz.ext4;
+const Image = miz.Image;
 const resource_disk = @import("resource_disk.zig");
 
 pub const RootDevice = struct {
@@ -100,7 +100,7 @@ pub fn findRootDevice(allocator: Allocator, io: std.Io, proc_mounts_content: []c
     const partition_name = root_mount.partition_name;
 
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const disk_name = vmiz.block_device.parentDiskName(
+    const disk_name = miz.block_device.parentDiskName(
         io,
         class_block_dir,
         partition_name,
@@ -167,7 +167,7 @@ const PartitionExtent = struct {
 };
 
 /// Grows the GPT root partition (identified as the *last* entry in the
-/// table, matching both vmiz-built images and real Azure Linux images) to
+/// table, matching both miz-built images and real Azure Linux images) to
 /// the disk's new, larger end. Always returns the resulting partition
 /// extent, including when the table was already grown, so callers can
 /// retry the kernel and filesystem resize steps after an earlier failure.
@@ -470,15 +470,15 @@ test "growGptRoot returns the final extent on first growth and retry" {
     const initial_last_usable_lba =
         initial_size / gpt.sector_size - 2 - gpt.partition_array_sectors;
     const specs = [_]gpt.PartitionSpec{.{
-        .type_guid = vmiz.guid.linux_filesystem_data,
-        .unique_guid = vmiz.guid.parse("99999999-9999-9999-9999-999999999999"),
+        .type_guid = miz.guid.linux_filesystem_data,
+        .unique_guid = miz.guid.parse("99999999-9999-9999-9999-999999999999"),
         .size_sectors = initial_last_usable_lba - first_usable_lba + 1,
     }};
     var placements: [specs.len]gpt.Placement = undefined;
     try gpt.writeGpt(
         &img,
         io,
-        vmiz.guid.parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        miz.guid.parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
         &specs,
         &placements,
     );

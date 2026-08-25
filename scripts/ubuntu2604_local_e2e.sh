@@ -36,12 +36,12 @@ esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-: "${ZIG:?set ZIG to the zig 0.16.0 binary used to build vmiz}"
+: "${ZIG:?set ZIG to the zig 0.16.0 binary used to build miz}"
 VIRTUAL_SIZE="${VIRTUAL_SIZE:-5368709120}"
 FIXTURE_DIR="$REPO_ROOT/tests/fixtures/ubuntu2604-local-signing"
 CERT="$FIXTURE_DIR/signing-cert.pem"
 KEY="$FIXTURE_DIR/signing-key.pem"
-CERT_SHA256="${CERT_SHA256:-74556e6a0b540eb0ed5a49d9e75a003987447699df59f1d68456548c47dc8009}"
+CERT_SHA256="${CERT_SHA256:-8ca3b80b1a2272a4f3a6d13246a65cfdd89764eb83beb8a0709e3cf591490279}"
 
 OUT_ROOT="${OUT_ROOT:-$REPO_ROOT/.scratch/local-e2e/$ARCH}"
 WORK_DIR="$OUT_ROOT/work"
@@ -88,11 +88,11 @@ sudo chown -R "$(id -u):$(id -g)" "$WORK_DIR" "$BUNDLE_DIR" "$ZIG_GLOBAL_CACHE_D
 cp "$build_log" "$PROVENANCE_DIR/build.log"
 
 echo "== validating finalized candidate =="
-VMIZ="$REPO_ROOT/zig-out/bin/vmiz"
+MIZ="$REPO_ROOT/zig-out/bin/miz"
 test -f "$OUTPUT"
-test -x "$VMIZ"
-"$VMIZ" check "$OUTPUT"
-"$VMIZ" info --output=json "$OUTPUT" > "$PROVENANCE_DIR/image-info.json"
+test -x "$MIZ"
+"$MIZ" check "$OUTPUT"
+"$MIZ" info --output=json "$OUTPUT" > "$PROVENANCE_DIR/image-info.json"
 python3 - "$PROVENANCE_DIR/image-info.json" "$VIRTUAL_SIZE" <<'PY'
 import json
 import sys
@@ -120,7 +120,7 @@ case "$ARCH" in
   aarch64) UKI_PATH="$WORK_DIR/BOOTAA64.EFI" ;;
 esac
 if [ -f "$UKI_PATH" ]; then
-  "$VMIZ" uki verify --certificate "$CERT" "$UKI_PATH"
+  "$MIZ" uki verify --certificate "$CERT" "$UKI_PATH"
   echo "signed UKI verifies against the local certificate"
 else
   echo "note: signed UKI not retained at $UKI_PATH; builder already self-verified it"

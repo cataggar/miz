@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const reference = @import("../packages/vmiz/src/oci/reference.zig");
+const reference = @import("../packages/miz/src/oci/reference.zig");
 
 pub const Platform = struct {
     os: ?[]const u8 = null,
@@ -48,7 +48,7 @@ pub fn add(
     validatePlatform(architecture);
     if (options.platform.variant) |variant| validatePlatform(variant);
 
-    const run = b.addRunArtifact(dependency.artifact("vmiz"));
+    const run = b.addRunArtifact(dependency.artifact("miz"));
     run.setName(b.fmt("pull OCI image {s}", .{options.name}));
     run.addArgs(&.{
         "oci",

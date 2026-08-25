@@ -1,7 +1,7 @@
-//! `vmiz map [--output=human|json] <file>`
+//! `miz map [--output=human|json] <file>`
 
 const std = @import("std");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 const OutputMode = enum { human, json };
 
@@ -21,9 +21,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         }
     }
 
-    const file_path = path orelse return fail("usage: vmiz map [--output=human|json] <file>", .{});
+    const file_path = path orelse return fail("usage: miz map [--output=human|json] <file>", .{});
 
-    var img = vmiz.Image.openPath(io, file_path) catch |err|
+    var img = miz.Image.openPath(io, file_path) catch |err|
         return fail("map: failed to open '{s}': {s}", .{ file_path, @errorName(err) });
     defer img.close(io);
 
@@ -35,7 +35,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     // opaque partition in the extent list, so the volume groups are read as
     // well. Scanning is read-only and happens after the extents so a broken
     // volume group still leaves the allocation map visible.
-    var lvm_scan = vmiz.lvm.scan(gpa, img, io) catch |err|
+    var lvm_scan = miz.lvm.scan(gpa, img, io) catch |err|
         return fail("map: failed to read LVM metadata: {s}", .{@errorName(err)});
     defer lvm_scan.deinit();
 
@@ -71,7 +71,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     return 0;
 }
 
-fn printVolumeGroups(groups: []const vmiz.lvm.VolumeGroup) void {
+fn printVolumeGroups(groups: []const miz.lvm.VolumeGroup) void {
     if (groups.len == 0) return;
     for (groups) |*group| {
         std.debug.print(
@@ -93,7 +93,7 @@ fn printVolumeGroups(groups: []const vmiz.lvm.VolumeGroup) void {
         }
         std.debug.print("{s: <12} {s: <12} {s: <12} {s}\n", .{ "Offset", "Length", "Type", "Volume" });
         for (group.logical_volumes) |*lv| {
-            if (vmiz.lvm.contiguousRange(group, lv)) |range| {
+            if (miz.lvm.contiguousRange(group, lv)) |range| {
                 std.debug.print("0x{x: <10} 0x{x: <10} {s: <12} {s}\n", .{
                     range.offset,
                     range.length,
@@ -145,7 +145,7 @@ const VolumeGroupJson = struct {
     logical_volumes: []const LogicalVolumeJson,
 };
 
-fn writeVolumeGroupsJson(gpa: std.mem.Allocator, groups: []const vmiz.lvm.VolumeGroup) !void {
+fn writeVolumeGroupsJson(gpa: std.mem.Allocator, groups: []const miz.lvm.VolumeGroup) !void {
     for (groups, 0..) |*group, index| {
         const pvs = try gpa.alloc(PhysicalVolumeJson, group.physical_volumes.len);
         defer gpa.free(pvs);
@@ -166,7 +166,7 @@ fn writeVolumeGroupsJson(gpa: std.mem.Allocator, groups: []const vmiz.lvm.Volume
                 .size = lv.extent_count * group.extentSizeBytes(),
                 .type = if (lv.segments.len == 0) "" else lv.segments[0].type_name,
             };
-            if (vmiz.lvm.contiguousRange(group, lv)) |range| {
+            if (miz.lvm.contiguousRange(group, lv)) |range| {
                 slot.start = range.offset;
                 slot.length = range.length;
             } else |err| {
@@ -188,7 +188,7 @@ fn writeVolumeGroupsJson(gpa: std.mem.Allocator, groups: []const vmiz.lvm.Volume
     }
 }
 
-fn locationText(location: vmiz.lvm.Location) []const u8 {
+fn locationText(location: miz.lvm.Location) []const u8 {
     return switch (location) {
         .whole_disk => "whole disk",
         .gpt_partition => "GPT partition",

@@ -1,10 +1,10 @@
-//! `vmiz resize-root [--label <label>] <file.qcow2> [+]<size>`
+//! `miz resize-root [--label <label>] <file.qcow2> [+]<size>`
 
 const std = @import("std");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
-    var label = vmiz.root_resize.default_filesystem_label;
+    var label = miz.root_resize.default_filesystem_label;
     var path: ?[]const u8 = null;
     var size_arg: ?[]const u8 = null;
     var i: usize = 0;
@@ -26,15 +26,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     }
 
     const image_path = path orelse
-        return fail("usage: vmiz resize-root [--label <label>] <file.qcow2> [+]<size>", .{});
+        return fail("usage: miz resize-root [--label <label>] <file.qcow2> [+]<size>", .{});
     const requested_size = size_arg orelse
-        return fail("usage: vmiz resize-root [--label <label>] <file.qcow2> [+]<size>", .{});
+        return fail("usage: miz resize-root [--label <label>] <file.qcow2> [+]<size>", .{});
     const relative = requested_size.len > 0 and requested_size[0] == '+';
     const magnitude_text = if (relative) requested_size[1..] else requested_size;
-    const magnitude = vmiz.parseSize(magnitude_text) catch |err|
+    const magnitude = miz.parseSize(magnitude_text) catch |err|
         return fail("resize-root: invalid size '{s}': {s}", .{ requested_size, @errorName(err) });
 
-    var image = vmiz.Image.openPathReadOnlyStandalone(io, image_path) catch |err|
+    var image = miz.Image.openPathReadOnlyStandalone(io, image_path) catch |err|
         return fail("resize-root: failed to open '{s}': {s}", .{ image_path, @errorName(err) });
     const current_size = image.virtual_size;
     image.close(io);
@@ -44,7 +44,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     else
         magnitude;
 
-    const report = vmiz.root_resize.growExistingQcow2(
+    const report = miz.root_resize.growExistingQcow2(
         gpa,
         io,
         image_path,

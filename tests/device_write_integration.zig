@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -20,32 +20,32 @@ pub fn main(init: std.process.Init) !void {
     const privileged_child = argv.len == 3 and
         std.mem.eql(u8, argv[1], "--privileged");
     const explicitly_requested = if (init.environ_map.get(
-        "VMIZ_RUN_PRIVILEGED_TEST",
+        "MIZ_RUN_PRIVILEGED_TEST",
     )) |value|
         std.mem.eql(u8, value, "1")
     else
         false;
     if (!explicitly_requested and !privileged_child) {
         std.debug.print(
-            "skipping device-write integration: set VMIZ_RUN_PRIVILEGED_TEST=1 to opt in\n",
+            "skipping device-write integration: set MIZ_RUN_PRIVILEGED_TEST=1 to opt in\n",
             .{},
         );
         return;
     }
 
-    const vmiz_path = if (privileged_child)
+    const miz_path = if (privileged_child)
         argv[2]
     else if (argv.len == 2)
         argv[1]
     else
-        return error.MissingVmizExecutable;
+        return error.MissingMizExecutable;
     if (std.os.linux.geteuid() != 0) {
-        return reexecWithSudo(init.io, argv[0], vmiz_path);
+        return reexecWithSudo(init.io, argv[0], miz_path);
     }
-    try runIntegration(allocator, init.io, vmiz_path);
+    try runIntegration(allocator, init.io, miz_path);
 }
 
-fn reexecWithSudo(io: Io, self_exe: []const u8, vmiz_path: []const u8) !void {
+fn reexecWithSudo(io: Io, self_exe: []const u8, miz_path: []const u8) !void {
     const sudo = if (isExecutable(io, "/usr/bin/sudo"))
         "/usr/bin/sudo"
     else if (isExecutable(io, "/bin/sudo"))
@@ -53,7 +53,7 @@ fn reexecWithSudo(io: Io, self_exe: []const u8, vmiz_path: []const u8) !void {
     else
         return error.SudoUnavailable;
     var child = try std.process.spawn(io, .{
-        .argv = &.{ sudo, "-n", self_exe, "--privileged", vmiz_path },
+        .argv = &.{ sudo, "-n", self_exe, "--privileged", miz_path },
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
@@ -68,7 +68,7 @@ fn reexecWithSudo(io: Io, self_exe: []const u8, vmiz_path: []const u8) !void {
 fn runIntegration(
     allocator: Allocator,
     io: Io,
-    vmiz_path: []const u8,
+    miz_path: []const u8,
 ) !void {
     const losetup = findLosetup(io) orelse return error.LosetupUnavailable;
 
@@ -77,7 +77,7 @@ fn runIntegration(
     const random_hex = std.fmt.bytesToHex(random, .lower);
     const work_path = try std.fmt.allocPrint(
         allocator,
-        "/tmp/vmiz-device-write-integration-{s}",
+        "/tmp/miz-device-write-integration-{s}",
         .{&random_hex},
     );
     try Io.Dir.cwd().createDir(io, work_path, .default_dir);
@@ -96,13 +96,13 @@ fn runIntegration(
     try createGptSource(io, source_path);
     const source_digest = try digestOfFile(io, source_path);
 
-    var source_image = try vmiz.Image.openPathReadOnly(io, source_path);
+    var source_image = try miz.Image.openPathReadOnly(io, source_path);
     defer source_image.close(io);
-    var source_gpt = try vmiz.gpt.readVerifiedGpt(
+    var source_gpt = try miz.gpt.readVerifiedGpt(
         source_image,
         io,
         allocator,
-        vmiz.gpt.default_max_partition_array_bytes,
+        miz.gpt.default_max_partition_array_bytes,
     );
     defer source_gpt.deinit(allocator);
 
@@ -121,7 +121,7 @@ fn runIntegration(
             .{ work_path, case.name },
         );
         {
-            var backing = try vmiz.Image.create(
+            var backing = try miz.Image.create(
                 io,
                 backing_path,
                 .raw,
@@ -143,7 +143,7 @@ fn runIntegration(
             allocator,
             io,
             &.{
-                vmiz_path,
+                miz_path,
                 "write",
                 "--allow-device-write",
                 "--yes",
@@ -178,7 +178,7 @@ fn runIntegration(
         }
 
         {
-            var destination = try vmiz.Image.openPathReadOnly(io, loop.path);
+            var destination = try miz.Image.openPathReadOnly(io, loop.path);
             defer destination.close(io);
             try require(
                 destination.virtual_size == case.target_size,
@@ -186,24 +186,24 @@ fn runIntegration(
             );
             try require(
                 destination.device.?.geometry.logical_sector_size ==
-                    vmiz.gpt.sector_size,
+                    miz.gpt.sector_size,
                 "loop device did not expose 512-byte logical sectors",
             );
 
-            var destination_gpt = try vmiz.gpt.readVerifiedGpt(
+            var destination_gpt = try miz.gpt.readVerifiedGpt(
                 destination,
                 io,
                 allocator,
-                vmiz.gpt.default_max_partition_array_bytes,
+                miz.gpt.default_max_partition_array_bytes,
             );
             defer destination_gpt.deinit(allocator);
 
-            const total_sectors = case.target_size / vmiz.gpt.sector_size;
+            const total_sectors = case.target_size / miz.gpt.sector_size;
             const backup_lba = total_sectors - 1;
             const array_sectors = try std.math.divCeil(
                 u64,
                 @intCast(destination_gpt.partition_array.len),
-                vmiz.gpt.sector_size,
+                miz.gpt.sector_size,
             );
             const last_usable_lba = backup_lba - array_sectors - 1;
             try require(
@@ -268,7 +268,7 @@ fn runIntegration(
             // A grown protective MBR must advertise the destination span;
             // every source byte outside that canonical table tail is retained.
             var expected_mbr = source_gpt.protective_mbr_sector;
-            const resized_mbr = vmiz.mbr.protectiveMbr(total_sectors);
+            const resized_mbr = miz.mbr.protectiveMbr(total_sectors);
             resized_mbr.encodePartitionTableInto(&expected_mbr);
             try require(
                 std.mem.eql(
@@ -303,36 +303,36 @@ fn runIntegration(
 }
 
 fn createGptSource(io: Io, path: []const u8) !void {
-    var image = try vmiz.Image.create(io, path, .raw, source_size, .{});
+    var image = try miz.Image.create(io, path, .raw, source_size, .{});
     defer image.close(io);
-    const specs = [_]vmiz.gpt.PartitionSpec{
+    const specs = [_]miz.gpt.PartitionSpec{
         .{
-            .type_guid = vmiz.guid.esp,
-            .unique_guid = vmiz.guid.parse(
+            .type_guid = miz.guid.esp,
+            .unique_guid = miz.guid.parse(
                 "11111111-2222-3333-4444-555555555555",
             ),
             .size_sectors = 4096,
-            .name_utf16le = vmiz.gpt.asciiName("EFI System"),
+            .name_utf16le = miz.gpt.asciiName("EFI System"),
         },
         .{
-            .type_guid = vmiz.guid.linux_filesystem_data,
-            .unique_guid = vmiz.guid.parse(
+            .type_guid = miz.guid.linux_filesystem_data,
+            .unique_guid = miz.guid.parse(
                 "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
             ),
             .size_sectors = 8192,
-            .name_utf16le = vmiz.gpt.asciiName("root"),
+            .name_utf16le = miz.gpt.asciiName("root"),
         },
     };
-    var placements: [specs.len]vmiz.gpt.Placement = undefined;
-    try vmiz.gpt.writeGpt(
+    var placements: [specs.len]miz.gpt.Placement = undefined;
+    try miz.gpt.writeGpt(
         &image,
         io,
-        vmiz.guid.parse("99999999-8888-7777-6666-555555555555"),
+        miz.guid.parse("99999999-8888-7777-6666-555555555555"),
         &specs,
         &placements,
     );
 
-    var protective_mbr: [vmiz.mbr.sector_size]u8 = undefined;
+    var protective_mbr: [miz.mbr.sector_size]u8 = undefined;
     try require(
         try image.pread(io, &protective_mbr, 0) == protective_mbr.len,
         "could not read the source protective MBR",

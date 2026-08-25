@@ -14,7 +14,7 @@ https://github.com/cataggar/rpmz/blob/15b5e1291a9fc3eb3980a4088d757b9d0254d468/C
 
 ## ghr Authenticode parser
 
-`packages/vmiz/src/authenticode.zig` adapts PE parsing and Authenticode
+`packages/miz/src/authenticode.zig` adapts PE parsing and Authenticode
 range-hashing code from ghr.
 
 Copyright (c) 2026 Cameron Taggart.
@@ -34,7 +34,7 @@ https://github.com/cataggar/bzip2z/blob/05f6d4e34df2da2729490aee2a5bbe43b5ce94f6
 
 ## zstd
 
-Host/public vmiz module graphs link `cataggar/zstd` from its Zig 0.16 branch
+Host/public miz module graphs link `cataggar/zstd` from its Zig 0.16 branch
 at immutable commit `45b6dfcd9d0ffdba99fb653c66b233179b9f7229` as a static,
 single-threaded library (`tools=false`, `shared=false`, `multithread=false`).
 Private guest-root builds reuse only the public headers and do not link the

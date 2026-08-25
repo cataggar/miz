@@ -5,8 +5,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // The reason this package has a `build.zig` of its own: a consumer that
-    // wants the format and not the rest of vmiz can depend on this directory
-    // alone. vmiz builds the same module from its own `build.zig`, so there
+    // wants the format and not the rest of miz can depend on this directory
+    // alone. miz builds the same module from its own `build.zig`, so there
     // is one implementation either way.
     const mod = b.addModule("qcow2", .{
         .root_source_file = b.path("src/qcow2.zig"),

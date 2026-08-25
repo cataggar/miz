@@ -1,7 +1,7 @@
 //! Detects, formats, and mounts Azure's temporary/local "resource disk"
 //! (typically `/dev/sdb`) at `/d`, with optional swap-file setup.
 //! Native replacement for the resource-disk portion of Python `waagent`
-//! (`azurelinuxagent/daemon/resourcedisk/default.py`) -- see vmiz issue #113.
+//! (`azurelinuxagent/daemon/resourcedisk/default.py`) -- see miz issue #113.
 //!
 //! Unlike `hostname.zig`/`passwd.zig`/`ssh_keys.zig` (which only ever run
 //! once, gated by the sentinel in `sentinel.zig`), this module's `setup`
@@ -9,23 +9,23 @@
 //! across a VM's lifetime, so its formatted state must be re-checked each
 //! time, not assumed from a previous run (see `main.zig`'s wiring).
 //!
-//! Ext4 and XFS formatting reuse `vmiz`'s native codecs directly against the
+//! Ext4 and XFS formatting reuse `miz`'s native codecs directly against the
 //! block device, so the writer and idempotency check share the same supported
 //! on-disk feature profile.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
-const vmiz = @import("vmiz");
-const mbr = vmiz.mbr;
-const gpt = vmiz.gpt;
-const guid_codec = vmiz.guid;
-const ext4 = vmiz.ext4;
-const xfs = vmiz.xfs;
-const xfs_writer = vmiz.xfs_writer;
-const tree_cursor = vmiz.tree_cursor;
-const block_device = vmiz.block_device;
-const Image = vmiz.Image;
+const miz = @import("miz");
+const mbr = miz.mbr;
+const gpt = miz.gpt;
+const guid_codec = miz.guid;
+const ext4 = miz.ext4;
+const xfs = miz.xfs;
+const xfs_writer = miz.xfs_writer;
+const tree_cursor = miz.tree_cursor;
+const block_device = miz.block_device;
+const Image = miz.Image;
 
 pub const Filesystem = enum {
     ext4,
@@ -139,7 +139,7 @@ fn lastColonSegmentIsOne(name: []const u8) bool {
 }
 
 /// Byte offset (in sectors) where the resource disk's single data partition
-/// starts: 1 MiB aligned, matching `packages/vmiz/src/layout.zig`'s own
+/// starts: 1 MiB aligned, matching `packages/miz/src/layout.zig`'s own
 /// `default_alignment` convention used elsewhere in this repo.
 pub const partition_start_lba: u32 = 2048;
 
@@ -162,7 +162,7 @@ pub fn isWholeDiskLinuxPartition(decoded: mbr.Mbr, total_sectors: u64) bool {
 pub const default_mount_point = "/d";
 pub const dataloss_warning_file_name = "DATALOSS_WARNING_README.txt";
 
-/// vmiz's own wording (not copied from upstream's copyrighted text):
+/// miz's own wording (not copied from upstream's copyrighted text):
 /// a plain notice that the resource disk is temporary/non-persistent.
 pub const dataloss_warning_text =
     \\This is the VM's temporary resource disk.
@@ -475,7 +475,7 @@ fn finishPartitionWrite(io: std.Io, file: std.Io.File) !void {
 }
 
 /// Mounts `device_path` (e.g. `/dev/sdb1`) at `mount_point` via a direct
-/// `mount(2)` syscall (matching `cdrom.zig`/`vmizinit`'s style), creating
+/// `mount(2)` syscall (matching `cdrom.zig`/`mizinit`'s style), creating
 /// the mount point directory if needed. `EBUSY` is accepted only when
 /// `/proc/mounts` confirms this exact source/target pair is already mounted.
 pub fn mountAt(io: std.Io, device_path: [:0]const u8, mount_point: [:0]const u8, filesystem: Filesystem) !void {

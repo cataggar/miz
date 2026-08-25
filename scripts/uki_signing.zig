@@ -1,11 +1,11 @@
 const std = @import("std");
-const vmiz = @import("vmiz");
+const miz = @import("miz");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const Io = std.Io;
 
-pub const Digest = vmiz.artifact_pipeline.Digest;
+pub const Digest = miz.artifact_pipeline.Digest;
 
 pub const Mode = union(enum) {
     local_key: struct {
@@ -103,7 +103,7 @@ const max_private_key_bytes = 64 * 1024;
 const max_provider_metadata_bytes = 16 * 1024;
 
 pub fn parseFingerprint(value: []const u8) error{InvalidCertificateFingerprint}!Digest {
-    return vmiz.artifact_pipeline.parseSha256(value) catch
+    return miz.artifact_pipeline.parseSha256(value) catch
         return error.InvalidCertificateFingerprint;
 }
 
@@ -124,7 +124,7 @@ pub fn prepareCertificate(
     io: Io,
     config: Config,
 ) !Certificate {
-    var certificate = vmiz.uki_signing.loadCertificateAlloc(
+    var certificate = miz.uki_signing.loadCertificateAlloc(
         allocator,
         io,
         .{ .host_path = config.certificate_path },
@@ -134,7 +134,7 @@ pub fn prepareCertificate(
     if (!std.mem.eql(u8, &certificate.sha256, &config.expected_certificate_sha256))
         return error.CertificateFingerprintMismatch;
 
-    const details = try vmiz.authenticode.describeCertificateAlloc(
+    const details = try miz.authenticode.describeCertificateAlloc(
         allocator,
         certificate.der,
     );
@@ -191,8 +191,8 @@ pub fn signUkiAlloc(
 
     return .{
         .bytes = signed_bytes.bytes,
-        .unsigned_sha256 = vmiz.artifact_pipeline.sha256Bytes(unsigned_bytes),
-        .signed_sha256 = vmiz.artifact_pipeline.sha256Bytes(signed_bytes.bytes),
+        .unsigned_sha256 = miz.artifact_pipeline.sha256Bytes(unsigned_bytes),
+        .signed_sha256 = miz.artifact_pipeline.sha256Bytes(signed_bytes.bytes),
         .provider_metadata = signed_bytes.provider_metadata,
     };
 }
@@ -218,7 +218,7 @@ fn signWithLocalKeyAlloc(
     private_key_path: []const u8,
     unsigned_bytes: []const u8,
 ) !SignedBytes {
-    var certificate = vmiz.uki_signing.loadCertificateAlloc(
+    var certificate = miz.uki_signing.loadCertificateAlloc(
         allocator,
         io,
         .{ .host_path = config.certificate_path },
@@ -238,7 +238,7 @@ fn signWithLocalKeyAlloc(
         allocator.free(key_file);
     }
     const key_der = if (std.mem.indexOf(u8, key_file, "PRIVATE KEY-----") != null)
-        vmiz.authenticode.decodePrivateKeyPemAlloc(allocator, key_file) catch
+        miz.authenticode.decodePrivateKeyPemAlloc(allocator, key_file) catch
             return error.InvalidSigningPrivateKey
     else
         try allocator.dupe(u8, key_file);
@@ -247,7 +247,7 @@ fn signWithLocalKeyAlloc(
         allocator.free(key_der);
     }
 
-    const signed_bytes = vmiz.authenticode.signPeRsaSha256Alloc(
+    const signed_bytes = miz.authenticode.signPeRsaSha256Alloc(
         allocator,
         unsigned_bytes,
         key_der,
@@ -262,7 +262,7 @@ fn signWithLocalKeyAlloc(
 ///
 /// Everything about the exchange -- the variables, the scratch files, and the
 /// check that what came back is a signature over the bytes that went out --
-/// is `vmiz.uki_signing`'s, so that a release built by this script and an
+/// is `miz.uki_signing`'s, so that a release built by this script and an
 /// image built by the library are signed by the same code. What stays here is
 /// what a release builder knows and a library does not: the flavor it is
 /// building, and which signing service it is willing to accept.
@@ -278,7 +278,7 @@ fn signWithProviderAlloc(
     flavor: []const u8,
     unsigned_bytes: []const u8,
 ) !SignedBytes {
-    var certificate = vmiz.uki_signing.loadCertificateAlloc(
+    var certificate = miz.uki_signing.loadCertificateAlloc(
         allocator,
         io,
         .{ .host_path = config.certificate_path },
@@ -289,7 +289,7 @@ fn signWithProviderAlloc(
 
     var environment = try base_environ.clone(allocator);
     defer environment.deinit();
-    try environment.put("VMIZ_UKI_FLAVOR", flavor);
+    try environment.put("MIZ_UKI_FLAVOR", flavor);
 
     const provider_scratch = try std.fmt.allocPrint(
         allocator,
@@ -299,7 +299,7 @@ fn signWithProviderAlloc(
     defer allocator.free(provider_scratch);
     defer Dir.cwd().deleteTree(io, provider_scratch) catch {};
 
-    var signer = try vmiz.uki_signing.ExternalSigner.init(allocator, io, .{
+    var signer = try miz.uki_signing.ExternalSigner.init(allocator, io, .{
         .command = .{
             .executable_path = external.executable_path,
             .argument = external.argument,
@@ -342,7 +342,7 @@ fn signWithProviderAlloc(
 /// profile, and operation identify a real operation there.
 fn acceptProviderMetadata(
     allocator: Allocator,
-    value: vmiz.uki_signing.ProviderMetadata,
+    value: miz.uki_signing.ProviderMetadata,
 ) !ProviderMetadata {
     if (!std.mem.eql(u8, value.provider, "azure-artifact-signing") or
         !validArtifactSigningEndpoint(value.endpoint) or
@@ -431,10 +431,10 @@ pub fn verifyBytes(
     config: Config,
     signed_bytes: []const u8,
 ) !void {
-    const signer = vmiz.authenticode.verifyRsaSha256(signed_bytes) catch
+    const signer = miz.authenticode.verifyRsaSha256(signed_bytes) catch
         return error.SignatureVerificationFailed;
 
-    var certificate = vmiz.uki_signing.loadCertificateAlloc(
+    var certificate = miz.uki_signing.loadCertificateAlloc(
         allocator,
         io,
         .{ .host_path = config.certificate_path },
@@ -447,7 +447,7 @@ pub fn verifyBytes(
     // signature names must be the enrolled one, not merely a well-formed one.
     if (!std.mem.eql(u8, signer.certificate_der, certificate.der))
         return error.SignerCertificateMismatch;
-    const signer_digest = vmiz.artifact_pipeline.sha256Bytes(signer.certificate_der);
+    const signer_digest = miz.artifact_pipeline.sha256Bytes(signer.certificate_der);
     if (!std.mem.eql(u8, &signer_digest, &config.expected_certificate_sha256))
         return error.SignerCertificateMismatch;
 }
@@ -457,9 +457,9 @@ fn verifyPayloads(
     unsigned_bytes: []const u8,
     signed_bytes: []const u8,
 ) !void {
-    var unsigned = try vmiz.uki.inspect(allocator, unsigned_bytes);
+    var unsigned = try miz.uki.inspect(allocator, unsigned_bytes);
     defer unsigned.deinit(allocator);
-    var signed = try vmiz.uki.inspect(allocator, signed_bytes);
+    var signed = try miz.uki.inspect(allocator, signed_bytes);
     defer signed.deinit(allocator);
 
     if (signed.security_directory == null) return error.MissingSecurityDirectory;

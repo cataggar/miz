@@ -1,14 +1,14 @@
 # Ubuntu 26.04 images
 
-vmiz has full, core, and bare-metal Ubuntu 26.04 build flavors:
+`miz` has full, core, and bare-metal Ubuntu 26.04 build flavors:
 
-| Flavor | vmiz architecture | Ubuntu architecture | Candidate | Default virtual size | Boot/provisioning |
+| Flavor | miz architecture | Ubuntu architecture | Candidate | Default disk size | Boot/provisioning |
 | --- | --- | --- | --- | --- | --- |
 | full | `x86_64` | `amd64` | `Ubuntu-26.04-x86_64.qcow2` | 5 GiB | systemd, cloud-init, WALinuxAgent |
 | full | `aarch64` | `arm64` | `Ubuntu-26.04-aarch64.qcow2` | 5 GiB | systemd, cloud-init, WALinuxAgent |
-| core | `x86_64` | `amd64` | `Ubuntu-26.04-x86_64.core.qcow2` | 3584 MiB | vmizinit, azagent |
-| core | `aarch64` | `arm64` | `Ubuntu-26.04-aarch64.core.qcow2` | 3584 MiB | vmizinit, azagent |
-| baremetal | `aarch64` | `arm64` | `Ubuntu-26.04-aarch64.baremetal.qcow2` | 5 GiB | vmizinit, baked administrator |
+| core | `x86_64` | `amd64` | `Ubuntu-26.04-x86_64.core.qcow2` | 3584 MiB | mizinit, azagent |
+| core | `aarch64` | `arm64` | `Ubuntu-26.04-aarch64.core.qcow2` | 3584 MiB | mizinit, azagent |
+| baremetal | `aarch64` | `arm64` | `Ubuntu-26.04-aarch64.baremetal.qcow2` | 5 GiB | mizinit, baked administrator |
 
 Bare metal is `aarch64` only: the kernel it names is published for `arm64`
 alone, because the machines it exists for are.
@@ -25,7 +25,7 @@ release assets, tags, and catalog aliases are deferred to a follow-up.
 `https://snapshot.ubuntu.com/ubuntu/20260731T000000Z`.
 
 For full, the official server cloud disk is the authoritative filesystem and
-installed-package baseline. The embedded `vmiz.package_family` debz backend
+installed-package baseline. The embedded `miz.package_family` debz backend
 adds exact `linux-azure` and `walinuxagent` closures without reconstructing the
 root from packages.
 
@@ -48,7 +48,7 @@ closure must also contain `openssh-client`, and must not contain cloud-init,
 WALinuxAgent, `ubuntu-server`, `ubuntu-server-minimal`, or `linux-azure`.
 
 The package-root round trip is native: the mutable QCOW2 is converted to a
-raw staging image, `vmiz.ext4_mountless.FileSystem` reads the selected ext4
+raw staging image, `miz.ext4_mountless.FileSystem` reads the selected ext4
 partition without mounting it, and the package-safe staging view is imported
 back through the same API before the raw image is converted back. This path
 has no libguestfs, guestfish, supermin, or libguestfs `virt-*` dependency;
@@ -117,7 +117,7 @@ downgrades, and retain the exact lock and `transaction-result.json`. Missing
 baseline packages, versions, architectures, or closure members fail the
 build. The transaction provenance's `lock_sha256` must equal the lock's
 semantic digest. The final sorted dpkg inventory at
-`/var/lib/vmiz/ubuntu2604-package-lock.tsv` must match the selected flavor and
+`/var/lib/miz/ubuntu2604-package-lock.tsv` must match the selected flavor and
 architecture with no foreign amd64/arm64 packages. Native inspection records
 the selected kernel, initramfs, modules directory, and exact lock digest in
 `internal-provenance/ubuntu2604-boot-input-evidence.json`.
@@ -165,9 +165,9 @@ and are not inherited from the candidate.
 
 The generalized core guest has no systemd service manager, cloud-init, or
 WALinuxAgent state. The builder injects architecture-matched static
-`/usr/sbin/vmizinit` and `/usr/sbin/azagent` binaries. The signed UKI selects
-`init=/sbin/vmizinit vmizinit.mode=persistent vmizinit.azure=auto`.
-`vmizinit` is PID 1: it mounts the required kernel filesystems, initializes
+`/usr/sbin/mizinit` and `/usr/sbin/azagent` binaries. The signed UKI selects
+`init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto`.
+`mizinit` is PID 1: it mounts the required kernel filesystems, initializes
 networking, generates a machine ID and SSH host keys when absent, supervises
 `sshd -D -e`, restarts it after failure, and launches `azagent`.
 
@@ -188,9 +188,9 @@ Core's kernel is checked against four `/boot/config-<release>` lines:
 `CONFIG_ANDROID_BINDER_IPC=m` and `CONFIG_ANDROID_BINDERFS=m` so Binder ships
 as the loadable, signed `binder_linux` module rather than builtin or absent;
 `CONFIG_ANDROID_BINDER_DEVICES=""` so the kernel creates no binder device on
-its own, leaving device creation entirely to vmizinit through binderfs; and
+its own, leaving device creation entirely to mizinit through binderfs; and
 `CONFIG_MODULE_DECOMPRESS=y`, which is what lets the kernel decompress and
-verify the packaged, signed `.ko.zst` on vmizinit's behalf.
+verify the packaged, signed `.ko.zst` on mizinit's behalf.
 
 The builder locates the packaged `binder_linux` module under the kernel's own
 module tree, rejects the build if a DKMS-built shadow tree
@@ -207,9 +207,9 @@ required to contain it, the same way bare metal's is checked for `nvme` and
 `r8152`.
 
 None of this runs anything at boot by itself. A Binder workload is opt-in:
-the UKI cmdline only requests it when built with `vmizinit.binder=required`
-added alongside the flavor's other `vmizinit.*` options. When present,
-vmizinit -- after mounting the required kernel filesystems and before
+the UKI cmdline only requests it when built with `mizinit.binder=required`
+added alongside the flavor's other `mizinit.*` options. When present,
+mizinit -- after mounting the required kernel filesystems and before
 starting `sshd` or `azagent` -- loads `binder_linux` with `finit_module()`
 against the packaged, possibly `.ko.zst`-compressed module file (asking the
 kernel to decompress and verify it, never decompressing or touching the
@@ -218,10 +218,10 @@ signed bytes itself), mounts binderfs at `/dev/binderfs`, and creates
 device-control ioctl. Every step tolerates already having been done (an
 already-loaded module, an already-mounted binderfs, an already-created
 device), so a restart or a race with a previous boot's partial setup is not a
-failure. A required-mode failure at any step is fatal to readiness: vmizinit
+failure. A required-mode failure at any step is fatal to readiness: mizinit
 never prints its ready line and never starts `sshd` or `azagent`, rather than
 booting into a machine that looks up but has no working Binder workload.
-`vmizinit.binder=disabled` (also the default when the option is absent) skips
+`mizinit.binder=disabled` (also the default when the option is absent) skips
 all of this.
 
 ### Bare metal
@@ -230,25 +230,25 @@ The bare-metal guest is the core guest on a physical machine, and every
 difference follows from one fact: there is no Azure underneath it to be
 provisioned by.
 
-Its UKI selects `vmizinit.azure=off` rather than `auto`, so vmizinit does not
+Its UKI selects `mizinit.azure=off` rather than `auto`, so mizinit does not
 spend a boot looking for evidence that is never coming. That decision also
 means `azagent` never runs -- and `azagent` is what, on core, creates the
 administrator, generates the SSH host keys, and writes
-`/var/lib/azagent/provisioned`, the sentinel vmizinit waits for before it
+`/var/lib/azagent/provisioned`, the sentinel mizinit waits for before it
 starts `sshd`. Left alone, a bare-metal image would boot correctly and never
 become reachable, with nothing on the network to say why.
 
 So the image is built already holding what provisioning would have delivered.
 The administrator `g` is created at build time from `--authorized-key`, with a
 locked password and passwordless sudo, and the image ships
-`/usr/local/sbin/vmizinit-access`: the replacement access provider vmizinit
+`/usr/local/sbin/mizinit-access`: the replacement access provider mizinit
 documents for exactly this case, started without waiting on a sentinel because
 it brings its own credential path. Before generating host keys, it synchronously
 runs `azagent --resize-root-only`; a resize failure emits a warning and does not
 prevent access, while every other provider setup failure remains fatal. It then
-generates the host keys on first boot, creates `/run/sshd` -- which vmizinit
+generates the host keys on first boot, creates `/run/sshd` -- which mizinit
 does only on the path it replaces -- and execs `sshd -D -e`. Networking needs
-no configuration: vmizinit runs its own DHCP client on the first non-loopback
+no configuration: mizinit runs its own DHCP client on the first non-loopback
 interface.
 
 `validateNoBakedIdentity` refuses SSH host keys for every flavor, because they
@@ -287,7 +287,7 @@ sudo apt-get install -y --no-install-recommends \
 `systemd-boot-efi` installs only the architecture-matched systemd-boot EFI
 stub (`/usr/lib/systemd/boot/efi/linuxx64.efi.stub` on x86_64,
 `linuxaa64.efi.stub` on arm64). The Unified Kernel Image is assembled natively:
-vmiz appends the deterministic `.linux`, `.initrd`, `.cmdline`, `.osrel`, and
+miz appends the deterministic `.linux`, `.initrd`, `.cmdline`, `.osrel`, and
 `.uname` PE/COFF sections onto that stub with architecture-correct headers,
 alignment, section flags, and subsystem/entry/image sizing, so the builder no
 longer installs or invokes `systemd-ukify`, `binutils`, `python3-pefile`, or a
@@ -327,14 +327,14 @@ zig build -Dubuntu2604-arch=x86_64 -Dubuntu2604-flavor=core generalized-ubuntu26
 zig build -Dubuntu2604-arch=aarch64 -Dubuntu2604-flavor=core generalized-ubuntu2604 -- --preflight-only
 ```
 
-Release artifacts are fetched by vmiz's native HTTPS downloader. It accepts
+Release artifacts are fetched by miz's native HTTPS downloader. It accepts
 only HTTPS URLs, verifies the system TLS certificate chain using TLS 1.2 or
 newer, bounds redirects, retries and response sizes, and atomically publishes
 only fully downloaded inputs. Pinned artifact SHA-256 values, the complete
 Canonical signing-key armor, and its full fingerprint remain mandatory
 verification gates. The bounded request-buffer sizing for signed redirects is
 informed by [`ghr`'s MIT-licensed HTTP implementation](https://github.com/cataggar/ghr/blob/main/src/http.zig);
-vmiz does not vendor that code.
+miz does not vendor that code.
 
 A complete image build requires signing. For local development, supply exactly
 one certificate and private key:
@@ -400,19 +400,19 @@ sudo -E zig build \
   --uki-signing-key test.key
 ```
 
-For the production external signer, build `vmiz`, configure its Artifact
+For the production external signer, build `miz`, configure its Artifact
 Signing environment, and replace `--uki-signing-key` with:
 
 ```console
-zig build install-vmiz
-export VMIZ_AZURE_TENANT_ID=<tenant-UUID>
-export VMIZ_AZURE_CLIENT_ID=<application-client-UUID>
-export VMIZ_ARTIFACT_SIGNING_ENDPOINT=https://<region>.codesigning.azure.net/
-export VMIZ_ARTIFACT_SIGNING_ACCOUNT=<account>
-export VMIZ_ARTIFACT_SIGNING_PROFILE=<profile>
+zig build install-miz
+export MIZ_AZURE_TENANT_ID=<tenant-UUID>
+export MIZ_AZURE_CLIENT_ID=<application-client-UUID>
+export MIZ_ARTIFACT_SIGNING_ENDPOINT=https://<region>.codesigning.azure.net/
+export MIZ_ARTIFACT_SIGNING_ACCOUNT=<account>
+export MIZ_ARTIFACT_SIGNING_PROFILE=<profile>
 
 # Add these arguments to either architecture's command:
---uki-sign-command "$PWD/zig-out/bin/vmiz" \
+--uki-sign-command "$PWD/zig-out/bin/miz" \
 --uki-sign-command-arg sign
 ```
 
@@ -425,7 +425,7 @@ to atomically write JSON without changing normal stdout. The option is
 disabled by default; timing-file serialization, write, and rename failures
 fail the build rather than being ignored.
 
-The stable `vmiz-ubuntu2604-image-phase-timing` schema has
+The stable `miz-ubuntu2604-image-phase-timing` schema has
 `schema: 1`, `clock: "monotonic"`,
 `duration_unit: "nanoseconds"`, an overall `status`, optional
 `failed_phase`/`failed_item`/`error_name`, and an execution-ordered `phases`
@@ -505,30 +505,30 @@ output root must not already exist:
 
 ```console
 sudo -E python3 scripts/ubuntu2604_image_benchmark.py \
-  --output-root /data/vmiz-benchmarks/ubuntu2604-baremetal-<commit> \
-  --source /data/vmiz-inputs/ubuntu-26.04-server-cloudimg-arm64.img \
-  --sha256sums /data/vmiz-inputs/SHA256SUMS \
-  --sha256sums-signature /data/vmiz-inputs/SHA256SUMS.gpg \
-  --manifest /data/vmiz-inputs/ubuntu-26.04-server-cloudimg-arm64.manifest \
-  --debz-cache /data/vmiz-inputs/debz-cache \
-  --debz-lock-dir /data/vmiz-inputs/baremetal-locks \
-  --authorized-key /data/vmiz-inputs/id_ed25519.pub \
+  --output-root /data/miz-benchmarks/ubuntu2604-baremetal-<commit> \
+  --source /data/miz-inputs/ubuntu-26.04-server-cloudimg-arm64.img \
+  --sha256sums /data/miz-inputs/SHA256SUMS \
+  --sha256sums-signature /data/miz-inputs/SHA256SUMS.gpg \
+  --manifest /data/miz-inputs/ubuntu-26.04-server-cloudimg-arm64.manifest \
+  --debz-cache /data/miz-inputs/debz-cache \
+  --debz-lock-dir /data/miz-inputs/baremetal-locks \
+  --authorized-key /data/miz-inputs/id_ed25519.pub \
   --uki-stub /usr/lib/systemd/boot/efi/linuxaa64.efi.stub \
-  --signing-certificate /data/vmiz-inputs/signing-certificate.pem \
+  --signing-certificate /data/miz-inputs/signing-certificate.pem \
   --signing-certificate-sha256 <canonical-DER-SHA-256> \
-  --sign-command /absolute/path/to/vmiz \
+  --sign-command /absolute/path/to/miz \
   --sign-command-arg sign \
   --zig /absolute/path/to/zig-0.16.0 \
-  --zig-global-cache /data/vmiz-inputs/zig-global-cache
+  --zig-global-cache /data/miz-inputs/zig-global-cache
 ```
 
 For a local benchmark identity, replace `--sign-command` and its argument with
 `--signing-key /absolute/path/to/key`. An optional executable
 `--acceptance-command` can run a host-specific physical-machine boot harness;
-it receives the candidate in `VMIZ_UBUNTU2604_IMAGE`. This repository
+it receives the candidate in `MIZ_UBUNTU2604_IMAGE`. This repository
 currently has no bare-metal boot harness, so the default evidence records that
 fact while still running the builder's final guest/filesystem checks plus
-`vmiz check` and `vmiz info`. Full/core native-QEMU acceptance is not applied
+`miz check` and `miz info`. Full/core native-QEMU acceptance is not applied
 to a different product flavor.
 
 Each run retains timing JSON, host wall/user/system and resource counters,
@@ -536,7 +536,7 @@ build/check logs, source manifest, exact locks, transaction and signing
 provenance, boot-input evidence, QCOW2 and raw image metadata, package
 name/version/hash closure, and a run manifest. The raw output must be a
 non-symlink regular file with an exact 5 GiB size and must pass the applicable
-native `vmiz check` and `vmiz info` validation after the measured builder
+native `miz check` and `miz info` validation after the measured builder
 process exits. Linux `/proc` descendant sampling supplies available read/write
 byte counters; block input/output counters come from `getrusage`. After all
 validation and cross-run correctness comparison for a run, cleanup removes
@@ -600,7 +600,7 @@ or treat the networked staging build as a benchmark result.
 
 The source-allocation-unit raw-copy change was also measured locally before
 merge because the production benchmark requires native aarch64. This is
-supporting evidence for the exact `vmiz.copyAll` implementation called by
+supporting evidence for the exact `miz.copyAll` implementation called by
 `writeRawCopy`, not a replacement production result and not evidence that the
 8m50s gate has passed.
 
@@ -639,7 +639,7 @@ provenance files for every flavor-specific package root.
 The build validates the source chain before modification and revalidates the
 final QCOW2, GPT partitions, Ubuntu identity, package inventory, UKI locations,
 PE architecture, and signature. Both workflows additionally use native
-`vmiz check` and `vmiz info` to require zstd compression and no backing file,
+`miz check` and `miz info` to require zstd compression and no backing file,
 bind every provenance sidecar into `candidate.json`, and reject private-key
 material. External `qemu-img` remains confined to acceptance-time inspection
 and the Azure fixed-VHD conversion boundary.
@@ -652,15 +652,15 @@ runs the strongest feasible local reproduction: it drives the exact release
 builder entrypoint (`zig build generalized-ubuntu2604`) through base-image
 acquisition and signature verification, embedded debz customize, native UKI
 assembly, UKI signing, and standalone zstd QCOW2 finalization, then validates
-the finalized candidate exactly as the release workflow does (`vmiz check` plus
-`vmiz info --output=json` asserting `qcow2`, an exact 5 GiB virtual size, no
+the finalized candidate exactly as the release workflow does (`miz check` plus
+`miz info --output=json` asserting `qcow2`, an exact 5 GiB virtual size, no
 backing file, and zstd cluster compression).
 
 The only deviation from the protected workflow is the signing identity: instead
 of the Azure Trusted Signing command, the gate signs with a safe, public,
 test-only self-signed key/cert committed under
 `tests/fixtures/ubuntu2604-local-signing/` (certificate DER SHA-256
-`74556e6a0b540eb0ed5a49d9e75a003987447699df59f1d68456548c47dc8009`). Those
+`8ca3b80b1a2272a4f3a6d13246a65cfdd89764eb83beb8a0709e3cf591490279`). Those
 fixtures are guarded deterministically by `zig build test-generalized-ubuntu2604`
 (the test loads them through the native local-key path and verifies a signature
 against the enrolled certificate), so a corrupted or mismatched fixture fails
@@ -714,7 +714,7 @@ identity, agent Ready state, root growth, data disk, reboot, vTPM, lockdown,
 and module signatures. Cleanup deletes only the expected resource group with
 the exact run ownership tags.
 
-Core acceptance adds the vmizinit PID-1 and SSH-supervision contract, local
+Core acceptance adds the mizinit PID-1 and SSH-supervision contract, local
 OVF `azagent --skip-ready`, Azure Ready reporting, provisioning and identity
 persistence, resource-disk formatting, managed-data-disk mount-only behavior,
 and explicit absence of cloud-init, WALinuxAgent, and a systemd service
@@ -830,9 +830,9 @@ unchanged. Before dispatch:
    current `main` commit before dispatch.
 2. Configure protected environment `ubuntu2604-signing`, restricted to
    `main` and requiring reviewers, with variables
-   `VMIZ_AZURE_TENANT_ID`, `VMIZ_AZURE_CLIENT_ID`,
-   `VMIZ_ARTIFACT_SIGNING_ENDPOINT`, `VMIZ_ARTIFACT_SIGNING_ACCOUNT`, and
-   `VMIZ_ARTIFACT_SIGNING_PROFILE`.
+   `MIZ_AZURE_TENANT_ID`, `MIZ_AZURE_CLIENT_ID`,
+   `MIZ_ARTIFACT_SIGNING_ENDPOINT`, `MIZ_ARTIFACT_SIGNING_ACCOUNT`, and
+   `MIZ_ARTIFACT_SIGNING_PROFILE`.
 3. Configure protected environment `ubuntu2604-release` the same way, with
    secrets `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
    `AZURE_SUBSCRIPTION_ID` and variables `AZURE_LOCATION_X64`,
@@ -841,8 +841,8 @@ unchanged. Before dispatch:
 4. Configure both Entra federated credentials with issuer
    `https://token.actions.githubusercontent.com` and audience
    `api://AzureADTokenExchange`. Their subjects are respectively
-   `repo:cataggar/vmiz:environment:ubuntu2604-signing` and
-   `repo:cataggar/vmiz:environment:ubuntu2604-release`.
+   `repo:cataggar/miz:environment:ubuntu2604-signing` and
+   `repo:cataggar/miz:environment:ubuntu2604-release`.
 
 Top-level permissions are `actions: read` and `contents: read`. Signing and
 Azure acceptance add only `id-token: write`; native acceptance remains
@@ -867,7 +867,7 @@ ownership-tagged Azure resources.
 
 ## Catalog aliases
 
-`vmiz qemu Ubuntu` and exact Ubuntu catalog aliases are intentionally not
+`miz qemu Ubuntu` and exact Ubuntu catalog aliases are intentionally not
 present yet. They may be added only after the real published asset SHA-256
 digests and the final signing-certificate fingerprint are known and pinned.
 Do not substitute build-time guesses or copy values from another release.

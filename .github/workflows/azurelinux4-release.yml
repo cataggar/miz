@@ -23,7 +23,7 @@ env:
 jobs:
   prepare:
     name: resolve immutable main source
-    if: github.repository == 'cataggar/vmiz' && github.ref == 'refs/heads/main'
+    if: github.repository == 'cataggar/miz' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -163,12 +163,12 @@ jobs:
       WORK_DIR: .scratch/azurelinux4-release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       BUNDLE_DIR: artifact-staging/candidates/${{ matrix.key }}
       SIGNING_PROBE_DIR: ${{ github.workspace }}/signing-probe-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
-      UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/vmiz
-      VMIZ_AZURE_TENANT_ID: ${{ vars.VMIZ_AZURE_TENANT_ID }}
-      VMIZ_AZURE_CLIENT_ID: ${{ vars.VMIZ_AZURE_CLIENT_ID }}
-      VMIZ_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.VMIZ_ARTIFACT_SIGNING_ENDPOINT }}
-      VMIZ_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.VMIZ_ARTIFACT_SIGNING_ACCOUNT }}
-      VMIZ_ARTIFACT_SIGNING_PROFILE: ${{ vars.VMIZ_ARTIFACT_SIGNING_PROFILE }}
+      UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/miz
+      MIZ_AZURE_TENANT_ID: ${{ vars.MIZ_AZURE_TENANT_ID }}
+      MIZ_AZURE_CLIENT_ID: ${{ vars.MIZ_AZURE_CLIENT_ID }}
+      MIZ_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.MIZ_ARTIFACT_SIGNING_ENDPOINT }}
+      MIZ_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.MIZ_ARTIFACT_SIGNING_ACCOUNT }}
+      MIZ_ARTIFACT_SIGNING_PROFILE: ${{ vars.MIZ_ARTIFACT_SIGNING_PROFILE }}
     steps:
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -201,19 +201,19 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build install-vmiz
+          zig build install-miz
           test -x "$UKI_SIGN_COMMAND"
 
       - name: Resolve protected signing certificate
         run: |
           set -euo pipefail
           uuid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-          [[ "$VMIZ_AZURE_TENANT_ID" =~ $uuid ]]
-          [[ "$VMIZ_AZURE_CLIENT_ID" =~ $uuid ]]
-          [[ "$VMIZ_ARTIFACT_SIGNING_ENDPOINT" =~ ^https://[a-z0-9.-]+\.codesigning\.azure\.net/?$ ]]
-          [[ "$VMIZ_ARTIFACT_SIGNING_ACCOUNT" =~ ^[A-Za-z0-9._-]+$ ]]
-          [[ "$VMIZ_ARTIFACT_SIGNING_PROFILE" =~ ^[A-Za-z0-9._-]+$ ]]
-          certificate="$RUNNER_TEMP/vmiz-uki-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CANDIDATE_KEY}.pem"
+          [[ "$MIZ_AZURE_TENANT_ID" =~ $uuid ]]
+          [[ "$MIZ_AZURE_CLIENT_ID" =~ $uuid ]]
+          [[ "$MIZ_ARTIFACT_SIGNING_ENDPOINT" =~ ^https://[a-z0-9.-]+\.codesigning\.azure\.net/?$ ]]
+          [[ "$MIZ_ARTIFACT_SIGNING_ACCOUNT" =~ ^[A-Za-z0-9._-]+$ ]]
+          [[ "$MIZ_ARTIFACT_SIGNING_PROFILE" =~ ^[A-Za-z0-9._-]+$ ]]
+          certificate="$RUNNER_TEMP/miz-uki-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CANDIDATE_KEY}.pem"
           umask 077
           "$UKI_SIGN_COMMAND" sign certificate "$certificate"
           actual=$("$UKI_SIGN_COMMAND" uki fingerprint "$certificate")
@@ -238,15 +238,15 @@ jobs:
           metadata="$scratch/metadata.json"
           cp "$UKI_SIGNING_CERTIFICATE" "$scratch/certificate.pem"
           zig build-exe -target "$target" tests/efi_signing_probe.zig -femit-bin="$unsigned"
-          export VMIZ_UKI_UNSIGNED="$unsigned"
-          export VMIZ_UKI_SIGNED="$signed"
-          export VMIZ_UKI_CERTIFICATE="$UKI_SIGNING_CERTIFICATE"
-          export VMIZ_UKI_ARCHITECTURE="$ARCHITECTURE"
-          export VMIZ_UKI_FLAVOR="$FLAVOR"
-          export VMIZ_UKI_SIGNING_METADATA="$metadata"
-          VMIZ_UKI_UNSIGNED_SHA256=$(sha256sum "$unsigned" | awk '{print $1}')
-          export VMIZ_UKI_UNSIGNED_SHA256
-          export VMIZ_UKI_CERTIFICATE_SHA256="$UKI_SIGNING_CERTIFICATE_SHA256"
+          export MIZ_UKI_UNSIGNED="$unsigned"
+          export MIZ_UKI_SIGNED="$signed"
+          export MIZ_UKI_CERTIFICATE="$UKI_SIGNING_CERTIFICATE"
+          export MIZ_UKI_ARCHITECTURE="$ARCHITECTURE"
+          export MIZ_UKI_FLAVOR="$FLAVOR"
+          export MIZ_UKI_SIGNING_METADATA="$metadata"
+          MIZ_UKI_UNSIGNED_SHA256=$(sha256sum "$unsigned" | awk '{print $1}')
+          export MIZ_UKI_UNSIGNED_SHA256
+          export MIZ_UKI_CERTIFICATE_SHA256="$UKI_SIGNING_CERTIFICATE_SHA256"
           "$UKI_SIGN_COMMAND" sign
           test -s "$signed"
           test -s "$metadata"
@@ -502,7 +502,7 @@ jobs:
           done
           az version --output json > /dev/null
 
-      - name: Build accepted-source vmiz
+      - name: Build accepted-source miz
         working-directory: release-source
         run: |
           set -euo pipefail
@@ -511,11 +511,11 @@ jobs:
           zig build --fetch \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           zig build -Doptimize=ReleaseSafe
-          test -x zig-out/bin/vmiz
+          test -x zig-out/bin/miz
 
       - name: Run exact-artifact Azure acceptance
         env:
-          VMIZ: ${{ github.workspace }}/release-source/zig-out/bin/vmiz
+          MIZ: ${{ github.workspace }}/release-source/zig-out/bin/miz
           RUN_ID_VALUE: ${{ github.run_id }}
           RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
         run: |
