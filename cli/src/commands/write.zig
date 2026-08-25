@@ -651,6 +651,31 @@ fn preparedIdentityApplyNoop(
 
 fn preparedIdentityDeinitNoop(_: ?*anyopaque, _: std.mem.Allocator) void {}
 
+const IdentityScanHooks = struct {
+    find_collisions_fn: *const fn (
+        std.mem.Allocator,
+        std.Io,
+        *const vmiz.block_device.IdentityInventory,
+        []const u8,
+    ) anyerror!vmiz.block_device.CollisionReport = findVisibleIdentityCollisions,
+};
+
+const default_identity_scan_hooks = IdentityScanHooks{};
+
+fn findVisibleIdentityCollisions(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    inventory: *const vmiz.block_device.IdentityInventory,
+    excluded_whole_disk_name: []const u8,
+) anyerror!vmiz.block_device.CollisionReport {
+    return vmiz.block_device.findLinuxVisibleIdentityCollisions(
+        allocator,
+        io,
+        inventory,
+        excluded_whole_disk_name,
+    );
+}
+
 fn prepareIdentity(
     _: ?*anyopaque,
     allocator: std.mem.Allocator,
@@ -661,8 +686,31 @@ fn prepareIdentity(
     growth_plan: ?RootGrowthPlan,
     options: WriteIdentityOptions,
 ) anyerror!PreparedIdentity {
+    return prepareIdentityWithHooks(
+        &default_identity_scan_hooks,
+        allocator,
+        io,
+        source,
+        destination_report,
+        detected,
+        growth_plan,
+        options,
+    );
+}
+
+fn prepareIdentityWithHooks(
+    hooks: *const IdentityScanHooks,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: *const vmiz.Image,
+    destination_report: *const vmiz.DevicePreflightReport,
+    detected: vmiz.gpt.DetectedGpt,
+    growth_plan: ?RootGrowthPlan,
+    options: WriteIdentityOptions,
+) anyerror!PreparedIdentity {
     if (options.new_uuids) {
         return prepareFreshIdentity(
+            hooks,
             allocator,
             io,
             source,
@@ -672,6 +720,7 @@ fn prepareIdentity(
         );
     }
     return prepareExistingIdentityReport(
+        hooks,
         allocator,
         io,
         source,
@@ -680,6 +729,7 @@ fn prepareIdentity(
 }
 
 fn prepareExistingIdentityReport(
+    hooks: *const IdentityScanHooks,
     allocator: std.mem.Allocator,
     io: std.Io,
     source: *const vmiz.Image,
@@ -691,7 +741,7 @@ fn prepareExistingIdentityReport(
     }, source.virtual_size);
     defer inventory.deinit(allocator);
 
-    var collisions = try vmiz.block_device.findLinuxVisibleIdentityCollisions(
+    var collisions = try hooks.find_collisions_fn(
         allocator,
         io,
         &inventory,
@@ -706,6 +756,7 @@ fn prepareExistingIdentityReport(
 }
 
 fn prepareFreshIdentity(
+    hooks: *const IdentityScanHooks,
     allocator: std.mem.Allocator,
     io: std.Io,
     source: *const vmiz.Image,
@@ -728,7 +779,7 @@ fn prepareFreshIdentity(
             ),
         },
         .verified => |verified| {
-            var state = try allocator.create(IdentityRewriteState);
+            const state = try allocator.create(IdentityRewriteState);
             errdefer allocator.destroy(state);
             state.* = .{
                 .io = io,
@@ -744,12 +795,10 @@ fn prepareFreshIdentity(
                 .grown_root_table_index = if (growth_plan) |plan| plan.root.table_index else null,
                 .grown_root_filesystem_length = if (growth_plan) |plan| plan.final_filesystem_length else null,
             };
-            errdefer {
-                state.deinit(allocator);
-                allocator.destroy(state);
-            }
+            errdefer state.deinit(allocator);
 
             const setup = try initializeFreshIdentityState(
+                hooks,
                 allocator,
                 io,
                 source,
@@ -1129,13 +1178,17 @@ fn initBorrowedMemoryTree(allocator: std.mem.Allocator, io: std.Io) vmiz.root_tr
     return vmiz.root_tree.RootTree.initMemory(allocator, io, .{});
 }
 
+/// Every scanned tree keeps back-pointers into the reader (and, for FAT, into
+/// the tree's own iteration view), so each source is built in place inside the
+/// partition slot it will live in. Scanning into locals and copying the result
+/// would leave those pointers aimed at dead stack frames.
 fn scanExt4Partition(
     allocator: std.mem.Allocator,
     io: std.Io,
     source: *const vmiz.Image,
     partition: *PartitionRewrite,
 ) !void {
-    var reader = try vmiz.ext4.openGeneralReadOnlySource(
+    const reader = try vmiz.ext4.openGeneralReadOnlySource(
         io,
         source.file,
         .{
@@ -1145,24 +1198,28 @@ fn scanExt4Partition(
         allocator,
         .{ .offset = partition.partition_offset },
     );
-    errdefer reader.deinit();
-    var tree = try vmiz.ext4.scanReadable(
-        &reader,
+    partition.source = .{
+        .ext4 = .{
+            .reader = reader,
+            .tree = undefined,
+            .mutable_tree = undefined,
+        },
+    };
+    const ext4 = &partition.source.ext4;
+    errdefer {
+        ext4.reader.deinit();
+        partition.source = .none;
+    }
+    ext4.tree = try vmiz.ext4.scanReadable(
+        &ext4.reader,
         io,
         allocator,
         .{ .available_length = partition.partition_length },
     );
-    errdefer tree.deinit();
-    var mutable_tree = initBorrowedMemoryTree(allocator, io);
-    errdefer mutable_tree.deinit();
-    try mutable_tree.importExt4GeneralBorrowed(&tree);
-    partition.source = .{
-        .ext4 = .{
-            .reader = reader,
-            .tree = tree,
-            .mutable_tree = mutable_tree,
-        },
-    };
+    errdefer ext4.tree.deinit();
+    ext4.mutable_tree = initBorrowedMemoryTree(allocator, io);
+    errdefer ext4.mutable_tree.deinit();
+    try ext4.mutable_tree.importExt4GeneralBorrowed(&ext4.tree);
 }
 
 fn scanXfsPartition(
@@ -1171,7 +1228,7 @@ fn scanXfsPartition(
     source: *const vmiz.Image,
     partition: *PartitionRewrite,
 ) !void {
-    var reader = try vmiz.xfs.Reader.openReadOnlySource(
+    const reader = try vmiz.xfs.Reader.openReadOnlySource(
         allocator,
         io,
         source.file,
@@ -1181,24 +1238,28 @@ fn scanXfsPartition(
         },
         partition.partition_offset,
     );
-    errdefer reader.close(io);
-    var tree = try vmiz.xfs.scanReadable(
-        &reader,
+    partition.source = .{
+        .xfs = .{
+            .reader = reader,
+            .tree = undefined,
+            .mutable_tree = undefined,
+        },
+    };
+    const xfs = &partition.source.xfs;
+    errdefer {
+        xfs.reader.close(io);
+        partition.source = .none;
+    }
+    xfs.tree = try vmiz.xfs.scanReadable(
+        &xfs.reader,
         io,
         allocator,
         .{ .available_length = partition.partition_length },
     );
-    errdefer tree.deinit();
-    var mutable_tree = initBorrowedMemoryTree(allocator, io);
-    errdefer mutable_tree.deinit();
-    try mutable_tree.importXfsBorrowed(&tree);
-    partition.source = .{
-        .xfs = .{
-            .reader = reader,
-            .tree = tree,
-            .mutable_tree = mutable_tree,
-        },
-    };
+    errdefer xfs.tree.deinit();
+    xfs.mutable_tree = initBorrowedMemoryTree(allocator, io);
+    errdefer xfs.mutable_tree.deinit();
+    try xfs.mutable_tree.importXfsBorrowed(&xfs.tree);
 }
 
 fn scanFatPartition(
@@ -1207,25 +1268,15 @@ fn scanFatPartition(
     source: *const vmiz.Image,
     partition: *PartitionRewrite,
 ) !void {
-    var filesystem = try vmiz.fat32.open(@constCast(source), io, .{
+    const filesystem = try vmiz.fat32.open(@constCast(source), io, .{
         .offset = partition.partition_offset,
         .length = partition.partition_length,
     });
-    var tree = try vmiz.fat32.scanTree(&filesystem, io, allocator, .{});
-    errdefer tree.deinit();
-    var mutable_tree = initBorrowedMemoryTree(allocator, io);
-    errdefer mutable_tree.deinit();
-    mutable_tree.setRootMetadata(.{
-        .mode = tree.metadata.directory_mode,
-        .uid = tree.metadata.uid,
-        .gid = tree.metadata.gid,
-    });
-    try mutable_tree.importExt4ViewBorrowed(tree.fileTreeView());
     partition.source = .{
         .fat = .{
             .filesystem = filesystem,
-            .tree = tree,
-            .mutable_tree = mutable_tree,
+            .tree = undefined,
+            .mutable_tree = undefined,
             .format = .{
                 .bytes_per_sector = filesystem.info.bytes_per_sector,
                 .sectors_per_cluster = filesystem.info.sectors_per_cluster,
@@ -1239,6 +1290,18 @@ fn scanFatPartition(
             },
         },
     };
+    const fat = &partition.source.fat;
+    errdefer partition.source = .none;
+    fat.tree = try vmiz.fat32.scanTree(&fat.filesystem, io, allocator, .{});
+    errdefer fat.tree.deinit();
+    fat.mutable_tree = initBorrowedMemoryTree(allocator, io);
+    errdefer fat.mutable_tree.deinit();
+    fat.mutable_tree.setRootMetadata(.{
+        .mode = fat.tree.metadata.directory_mode,
+        .uid = fat.tree.metadata.uid,
+        .gid = fat.tree.metadata.gid,
+    });
+    try fat.mutable_tree.importExt4ViewBorrowed(fat.tree.fileTreeView());
 }
 
 fn ensurePartitionScanned(
@@ -1720,10 +1783,9 @@ fn preflightPreparedTrees(
     for (state.partitions) |*partition| {
         switch (partition.mode) {
             .ext4_tree => {
-                const ext4 = partition.source.ext4;
                 _ = try vmiz.ext4.preflightPopulate(
                     allocator,
-                    try ext4.mutable_tree.cursor(),
+                    try partition.source.ext4.mutable_tree.cursor(),
                     ext4PopulateOptions(partition, state),
                 );
             },
@@ -1761,7 +1823,7 @@ fn applyIdentityRewritePreflight(
 ) !?[]u8 {
     var diagnostic = vmiz.identity_rewrite.Diagnostic{};
     const root_tree = rootMutableTree(&state.partitions[state.root_partition_index]).?;
-    vmiz.identity_rewrite.apply(
+    _ = vmiz.identity_rewrite.apply(
         allocator,
         root_tree,
         state.plan,
@@ -1778,7 +1840,7 @@ fn applyIdentityRewritePreflight(
         esp_plan.esp_roots = &.{};
         diagnostic = .{};
         const esp_tree = rootMutableTree(&state.partitions[esp_index]).?;
-        vmiz.identity_rewrite.apply(
+        _ = vmiz.identity_rewrite.apply(
             allocator,
             esp_tree,
             esp_plan,
@@ -1805,7 +1867,7 @@ fn verifyFreshIdentityDestination(
             .ctx = destination,
             .read_at_fn = sourceImageReadAt,
         },
-        vmiz.gpt.default_max_partition_array_bytes,
+        destination.virtual_size,
     );
     defer inventory.deinit(allocator);
     if (inventory.partition_table != .gpt) return error.IdentityRewriteVerificationFailed;
@@ -1820,7 +1882,9 @@ fn verifyFreshIdentityDestination(
     if (inventory.partitions.len != state.partitions.len) return error.IdentityRewriteVerificationFailed;
     for (inventory.partitions, state.partitions) |actual, expected| {
         if (actual.table_index != expected.table_index) return error.IdentityRewriteVerificationFailed;
-        if (!std.ascii.eqlIgnoreCase(actual.gptUniqueGuid(), expected.new_partition_guid_text)) {
+        const actual_partition_guid = actual.gptUniqueGuid() orelse
+            return error.IdentityRewriteVerificationFailed;
+        if (!std.ascii.eqlIgnoreCase(actual_partition_guid, expected.new_partition_guid_text)) {
             return error.IdentityRewriteVerificationFailed;
         }
         if (expected.new_filesystem_identifier) |identifier| {
@@ -1836,7 +1900,7 @@ fn verifyFreshIdentityDestination(
     const root_partition = &state.partitions[state.root_partition_index];
     switch (root_partition.filesystem_kind) {
         .ext4 => {
-            var readable = try vmiz.ext4.openGeneralReadOnlySource(
+            var reader = try vmiz.ext4.openGeneralReadOnlySource(
                 io,
                 destination.file,
                 .{
@@ -1844,16 +1908,20 @@ fn verifyFreshIdentityDestination(
                     .read_at_fn = sourceImageReadAt,
                 },
                 allocator,
-                .{
-                    .offset = root_partition.partition_offset,
-                    .length = ext4PopulateLength(root_partition, state),
-                },
+                .{ .offset = root_partition.partition_offset },
             );
-            const tree = try readable.scanReadable(io, allocator);
-            var root_tree = vmiz.root_tree.RootTree{};
-            defer root_tree.deinit(allocator);
-            try root_tree.importExt4GeneralBorrowed(allocator, tree);
-            vmiz.identity_rewrite.apply(
+            defer reader.deinit();
+            var tree = try vmiz.ext4.scanReadable(
+                &reader,
+                io,
+                allocator,
+                .{ .available_length = root_partition.partition_length },
+            );
+            defer tree.deinit();
+            var root_tree = initBorrowedMemoryTree(allocator, io);
+            defer root_tree.deinit();
+            try root_tree.importExt4GeneralBorrowed(&tree);
+            _ = vmiz.identity_rewrite.apply(
                 allocator,
                 &root_tree,
                 state.plan,
@@ -1865,15 +1933,28 @@ fn verifyFreshIdentityDestination(
             };
         },
         .xfs => {
-            var reader = try vmiz.xfs.Reader.openReadOnlySource(destination.file, .{
-                .offset = root_partition.partition_offset,
-                .available_length = root_partition.partition_length,
-            });
-            const tree = try reader.scanReadable(io, allocator);
-            var root_tree = vmiz.root_tree.RootTree{};
-            defer root_tree.deinit(allocator);
-            try root_tree.importXfsBorrowed(allocator, tree);
-            vmiz.identity_rewrite.apply(
+            var reader = try vmiz.xfs.Reader.openReadOnlySource(
+                allocator,
+                io,
+                destination.file,
+                .{
+                    .ctx = destination,
+                    .read_at_fn = sourceImageReadAt,
+                },
+                root_partition.partition_offset,
+            );
+            defer reader.close(io);
+            var tree = try vmiz.xfs.scanReadable(
+                &reader,
+                io,
+                allocator,
+                .{ .available_length = root_partition.partition_length },
+            );
+            defer tree.deinit();
+            var root_tree = initBorrowedMemoryTree(allocator, io);
+            defer root_tree.deinit();
+            try root_tree.importXfsBorrowed(&tree);
+            _ = vmiz.identity_rewrite.apply(
                 allocator,
                 &root_tree,
                 state.plan,
@@ -1888,27 +1969,25 @@ fn verifyFreshIdentityDestination(
     }
 
     if (state.esp_partition_index) |esp_index| {
-        var root_tree = vmiz.root_tree.RootTree{};
-        defer root_tree.deinit(allocator);
         var filesystem = try vmiz.fat32.open(destination, io, .{
             .offset = state.partitions[esp_index].partition_offset,
             .length = state.partitions[esp_index].partition_length,
         });
-        const tree = try filesystem.scanTree(allocator, .{});
+        var tree = try vmiz.fat32.scanTree(&filesystem, io, allocator, .{});
+        defer tree.deinit();
+        var root_tree = initBorrowedMemoryTree(allocator, io);
+        defer root_tree.deinit();
         root_tree.setRootMetadata(.{
             .mode = tree.metadata.directory_mode,
             .uid = tree.metadata.uid,
             .gid = tree.metadata.gid,
         });
-        try root_tree.importExt4ViewBorrowed(
-            allocator,
-            tree.fileTreeView(),
-        );
+        try root_tree.importExt4ViewBorrowed(tree.fileTreeView());
         var esp_plan = state.plan;
         esp_plan.tree_is_esp = true;
         esp_plan.esp_roots = &.{};
         diagnostic = .{};
-        vmiz.identity_rewrite.apply(
+        _ = vmiz.identity_rewrite.apply(
             allocator,
             &root_tree,
             esp_plan,
@@ -1928,6 +2007,7 @@ const FreshPreparedSetup = struct {
 };
 
 fn initializeFreshIdentityState(
+    hooks: *const IdentityScanHooks,
     allocator: std.mem.Allocator,
     io: std.Io,
     source: *const vmiz.Image,
@@ -2201,7 +2281,7 @@ fn initializeFreshIdentityState(
         state.partitions,
     );
     defer planned_inventory.deinit(allocator);
-    var collisions = try vmiz.block_device.findLinuxVisibleIdentityCollisions(
+    var collisions = try hooks.find_collisions_fn(
         allocator,
         io,
         &planned_inventory,
@@ -3099,8 +3179,8 @@ const FakeOperations = struct {
         self.new_uuids_seen = identity_options.new_uuids;
         self.allow_duplicate_identifiers_seen = identity_options.allow_duplicate_identifiers;
         if (self.real_prepare_identity) {
-            return prepareIdentity(
-                null,
+            return prepareIdentityWithHooks(
+                &test_identity_scan_hooks,
                 allocator,
                 io,
                 source,
@@ -3469,7 +3549,9 @@ fn createFreshIdentityTestImage(
     defer image.close(io);
 
     const esp_first_lba: u64 = 2048;
-    const esp_last_lba: u64 = esp_first_lba + (16 * 1024 * 1024 / vmiz.gpt.sector_size) - 1;
+    // FAT32 needs at least 65525 clusters, so the smallest legal ESP is
+    // around 33.5 MiB regardless of how little it holds.
+    const esp_last_lba: u64 = esp_first_lba + (48 * 1024 * 1024 / vmiz.gpt.sector_size) - 1;
     const root_first_lba: u64 = esp_last_lba + 1;
     const root_last_lba = total_size / vmiz.gpt.sector_size -
         2 - vmiz.gpt.partition_array_sectors;
@@ -3530,7 +3612,9 @@ fn createFreshIdentityTestImage(
     }
 
     const root_offset = root_first_lba * vmiz.gpt.sector_size;
-    const root_length = (root_last_lba - root_first_lba + 1) * vmiz.gpt.sector_size;
+    const root_partition_length = (root_last_lba - root_first_lba + 1) * vmiz.gpt.sector_size;
+    const root_length = root_partition_length /
+        vmiz.ext4.default_block_size * vmiz.ext4.default_block_size;
     _ = try vmiz.ext4.populate(
         io,
         image.file,
@@ -3580,28 +3664,32 @@ fn createFreshIdentityTestImage(
 fn readExt4PartitionFileAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
-    image: vmiz.Image,
+    image: *const vmiz.Image,
     offset: u64,
     length: u64,
     path: []const u8,
 ) ![]u8 {
-    var readable = try vmiz.ext4.openGeneralReadOnlySource(
+    var reader = try vmiz.ext4.openGeneralReadOnlySource(
         io,
         image.file,
         .{
-            .ctx = &image,
+            .ctx = image,
             .read_at_fn = sourceImageReadAt,
         },
         allocator,
-        .{
-            .offset = offset,
-            .length = length,
-        },
+        .{ .offset = offset },
     );
-    const tree = try readable.scanReadable(io, allocator);
-    var root_tree = vmiz.root_tree.RootTree{};
-    defer root_tree.deinit(allocator);
-    try root_tree.importExt4GeneralBorrowed(allocator, tree);
+    defer reader.deinit();
+    var tree = try vmiz.ext4.scanReadable(
+        &reader,
+        io,
+        allocator,
+        .{ .available_length = length },
+    );
+    defer tree.deinit();
+    var root_tree = initBorrowedMemoryTree(allocator, io);
+    defer root_tree.deinit();
+    try root_tree.importExt4GeneralBorrowed(&tree);
     return root_tree.readFileAlloc(allocator, path, 64 * 1024);
 }
 
@@ -3614,24 +3702,35 @@ fn readFatPartitionFileAlloc(
     path: []const u8,
 ) ![]u8 {
     var fs = try vmiz.fat32.open(image, io, .{ .offset = offset, .length = length });
-    _ = 64 * 1024;
     return fs.readFileAlloc(io, allocator, path);
+}
+
+const test_identity_scan_hooks = IdentityScanHooks{
+    .find_collisions_fn = noVisibleIdentityCollisions,
+};
+
+fn noVisibleIdentityCollisions(
+    _: std.mem.Allocator,
+    _: std.Io,
+    _: *const vmiz.block_device.IdentityInventory,
+    _: []const u8,
+) anyerror!vmiz.block_device.CollisionReport {
+    return .{ .collisions = &.{}, .scanned_visible_disks = 0 };
 }
 
 fn prepareFreshIdentityForTest(
     allocator: std.mem.Allocator,
     io: std.Io,
-    source_path: []const u8,
+    source: *vmiz.Image,
 ) !PreparedIdentity {
-    var source = try vmiz.Image.openPathReadOnly(io, source_path);
-    defer source.close(io);
     var report = testReport();
-    const detected = try detectGpt(null, source, io, allocator);
-    return prepareIdentity(
-        null,
+    var detected = try detectGpt(null, source.*, io, allocator);
+    defer detected.deinit(allocator);
+    return prepareIdentityWithHooks(
+        &test_identity_scan_hooks,
         allocator,
         io,
-        &source,
+        source,
         &report,
         detected,
         null,
@@ -4623,7 +4722,9 @@ test "write new-uuids prepares unique fresh identifiers" {
     defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
     try createFreshIdentityTestImage(std.testing.allocator, io, source, .{});
 
-    var prepared = try prepareFreshIdentityForTest(std.testing.allocator, io, source);
+    var image = try vmiz.Image.openPathReadOnly(io, source);
+    defer image.close(io);
+    var prepared = try prepareFreshIdentityForTest(std.testing.allocator, io, &image);
     defer prepared.deinit(std.testing.allocator);
     try std.testing.expect(prepared.refusal_message == null);
     const state: *IdentityRewriteState = @ptrCast(@alignCast(prepared.context.?));
@@ -4663,13 +4764,13 @@ test "write new-uuids post-write verification rejects an unreworked image" {
     defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
     try createFreshIdentityTestImage(allocator, io, source, .{});
 
-    var prepared = try prepareFreshIdentityForTest(allocator, io, source);
+    var image = try vmiz.Image.openPathReadOnly(io, source);
+    defer image.close(io);
+    var prepared = try prepareFreshIdentityForTest(allocator, io, &image);
     defer prepared.deinit(allocator);
     try std.testing.expect(prepared.refusal_message == null);
     const state: *IdentityRewriteState = @ptrCast(@alignCast(prepared.context.?));
 
-    var image = try vmiz.Image.openPathReadOnly(io, source);
-    defer image.close(io);
     try std.testing.expectError(
         error.IdentityRewriteVerificationFailed,
         verifyFreshIdentityDestination(allocator, io, &image, state),
@@ -4693,7 +4794,7 @@ test "write new-uuids refuses unsupported filesystem inventory" {
             .ctx = &source,
             .read_at_fn = sourceImageReadAt,
         },
-        vmiz.gpt.default_max_partition_array_bytes,
+        source.virtual_size,
     );
     defer inventory.deinit(allocator);
     inventory.partitions[0].signatures = .{ .ext4 = true, .xfs = true };
@@ -4712,8 +4813,22 @@ test "write new-uuids refuses unsupported filesystem inventory" {
         state.deinit(allocator);
         allocator.destroy(state);
     }
-    state.* = .{};
+    state.* = .{
+        .io = io,
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .gpt_replacements = null,
+        .partitions = &.{},
+        .filesystems = &.{},
+        .esp_roots = &.{},
+        .plan = .{},
+        .root_partition_index = 0,
+        .boot_partition_index = null,
+        .esp_partition_index = null,
+        .grown_root_table_index = null,
+        .grown_root_filesystem_length = null,
+    };
     const setup = try initializeFreshIdentityState(
+        &test_identity_scan_hooks,
         allocator,
         io,
         &source,
@@ -4742,7 +4857,9 @@ test "write new-uuids refuses stale unsupported boot references" {
         .root_extra_files = &stale_file,
     });
 
-    var prepared = try prepareFreshIdentityForTest(std.testing.allocator, io, source);
+    var image = try vmiz.Image.openPathReadOnly(io, source);
+    defer image.close(io);
+    var prepared = try prepareFreshIdentityForTest(std.testing.allocator, io, &image);
     defer prepared.deinit(std.testing.allocator);
     try std.testing.expect(prepared.refusal_message != null);
     try std.testing.expect(std.mem.indexOf(u8, prepared.refusal_message.?, "omit --new-uuids") != null);
@@ -4761,7 +4878,9 @@ test "write new-uuids refuses immutable or signed UKI references" {
         .esp_extra_files = &esp_extra,
     });
 
-    var prepared = try prepareFreshIdentityForTest(std.testing.allocator, io, source);
+    var image = try vmiz.Image.openPathReadOnly(io, source);
+    defer image.close(io);
+    var prepared = try prepareFreshIdentityForTest(std.testing.allocator, io, &image);
     defer prepared.deinit(std.testing.allocator);
     try std.testing.expect(prepared.refusal_message != null);
     try std.testing.expect(
@@ -4805,7 +4924,7 @@ test "write new-uuids rewrites identities and verifies supported references" {
             .ctx = &destination,
             .read_at_fn = sourceImageReadAt,
         },
-        vmiz.gpt.default_max_partition_array_bytes,
+        destination.virtual_size,
     );
     defer inventory.deinit(allocator);
     try std.testing.expectEqual(vmiz.block_device.PartitionTable.gpt, inventory.partition_table);
@@ -4833,7 +4952,7 @@ test "write new-uuids rewrites identities and verifies supported references" {
     const fstab = try readExt4PartitionFileAlloc(
         allocator,
         io,
-        destination,
+        &destination,
         root_offset,
         root_length,
         "etc/fstab",
@@ -4847,7 +4966,7 @@ test "write new-uuids rewrites identities and verifies supported references" {
     const cmdline = try readExt4PartitionFileAlloc(
         allocator,
         io,
-        destination,
+        &destination,
         root_offset,
         root_length,
         "etc/kernel/cmdline",

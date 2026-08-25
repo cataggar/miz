@@ -455,6 +455,11 @@ pub const Policy = enum {
     /// Rewrite and report what is still stale without failing, for an
     /// operator who intends to finish the job with `unsafe_chroot`.
     rewrite_only,
+    /// Read the tree without editing it and refuse when a retired
+    /// identifier survives. Used to verify an image that has already been
+    /// written: rewriting first would repair the very reference the pass
+    /// exists to catch.
+    verify_only,
     /// Touch nothing. The caller owns the bootability of the result.
     off,
 };
@@ -479,11 +484,11 @@ pub fn apply(
     var scope = try Scope.init(allocator, plan);
     defer scope.deinit();
 
-    try rewriteTreeFiles(allocator, tree, plan, scope, &report);
-    if (policy == .rewrite_and_verify or policy == .rewrite_only) {
-        try verify(allocator, tree, plan, scope, &report, diagnostic);
+    if (policy != .verify_only) {
+        try rewriteTreeFiles(allocator, tree, plan, scope, &report);
     }
-    if (policy == .rewrite_and_verify and report.stale_references != 0) {
+    try verify(allocator, tree, plan, scope, &report, diagnostic);
+    if (policy != .rewrite_only and report.stale_references != 0) {
         return error.StaleFilesystemIdentifier;
     }
     return report;
