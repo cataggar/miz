@@ -3342,6 +3342,15 @@ test "Android smoke required inputs fail closed rather than skip when absent" {
 test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    errdefer |err| {
+        std.debug.print(
+            "Ubuntu 26.04 native acceptance failed: {s}\n",
+            .{@errorName(err)},
+        );
+        if (@errorReturnTrace()) |trace| {
+            std.debug.dumpErrorReturnTrace(trace);
+        }
+    }
     const candidate = try selectedCandidate();
 
     const image_path = try requireImageAlloc(allocator, io, candidate);
