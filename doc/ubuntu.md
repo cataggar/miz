@@ -823,13 +823,13 @@ secrets before acceptance: `ANDROID_SMOKE_X86_64_JSON` or
 `artifact_url`, `artifact_sha256`, and `provenance_sha256`. The location must
 be HTTPS and both digests must be lowercase SHA-256. The complete archive
 digest is verified before extraction. Its ZIP member set must then be
-exactly `runz`, `redroid-bundle.tar`, and `provenance.json`, with no
+exactly `android-runtime`, `android-bundle.tar`, and `provenance.json`, with no
 directories, links, duplicate or additional entries, traversal names,
 encrypted entries, or non-regular file types.
 
 The extracted manifest digest is verified before the document is parsed.
-The manifest must use schema `redroid-smoke-provenance.v1`, type
-`application/vnd.redroid-smoke.v1+json`, and the exact field set enforced by
+The manifest must use schema `android-smoke-provenance.v1`, type
+`application/vnd.android-smoke.v1+json`, and the exact field set enforced by
 `scripts/ubuntu2604_release.py`. It must match the selected architecture and
 provide valid runtime, bundle, source manifest, and extracted `config.json`
 digests. The raw `producer_source_commit` and immutable image reference are

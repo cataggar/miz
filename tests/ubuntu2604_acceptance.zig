@@ -2040,7 +2040,7 @@ fn androidSmokeReadyForDelete(status: ?[]const u8) bool {
     return std.mem.eql(u8, value, "stopped");
 }
 
-/// Extracts the `status` field from a `runz state` JSON document. Returns
+/// Extracts the `status` field from a runtime state JSON document. Returns
 /// `null` (never an error) for anything unparseable, so the caller always
 /// falls through to the conservative "not ready" branch above.
 fn extractAndroidContainerStatusAlloc(
