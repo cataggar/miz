@@ -704,6 +704,30 @@ pub fn build(b: *std.Build) void {
     const boot_smoke_step = b.step("test-boot-smoke", "Run opportunistic real-QEMU boot-smoke tests");
     boot_smoke_step.dependOn(&run_boot_smoke_tests.step);
 
+    const device_write_integration_exe = b.addExecutable(.{
+        .name = "vmiz-device-write-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/device_write_integration.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vmiz", .module = static_host_vmiz_mod },
+            },
+        }),
+        .linkage = .static,
+    });
+    const run_device_write_integration = b.addRunArtifact(
+        device_write_integration_exe,
+    );
+    run_device_write_integration.addArtifactArg(cli_exe);
+    const device_write_integration_step = b.step(
+        "test-device-write-integration",
+        "Run vmiz write against real sparse loop devices",
+    );
+    device_write_integration_step.dependOn(
+        &run_device_write_integration.step,
+    );
+
     const unsafe_chroot_integration_exe = b.addExecutable(.{
         .name = "vmiz-unsafe-chroot-integration",
         .root_module = b.createModule(.{
@@ -1535,6 +1559,7 @@ pub fn build(b: *std.Build) void {
             &build_api_preserved_vm_diagnostics_check.step,
         );
     }
+    test_step.dependOn(&run_device_write_integration.step);
     test_step.dependOn(&run_unsafe_chroot_integration.step);
     test_step.dependOn(&run_vm_backend_integration.step);
 }
