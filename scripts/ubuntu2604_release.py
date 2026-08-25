@@ -11,8 +11,12 @@ import json
 import os
 import re
 import shutil
+import stat
+import tarfile
+import zipfile
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib import request
+from urllib.parse import urljoin, urlsplit
 
 try:
     from scripts.azure_vhd import (
@@ -257,13 +261,42 @@ def require_commit(value: object, label: str = "source_commit") -> str:
 
 
 ANDROID_SMOKE_FIELDS = {
-    "source_commit",
+    "provenance_sha256",
     "runtime_sha256",
     "bundle_sha256",
     "config_sha256",
     "architecture",
     "candidate_key",
 }
+ANDROID_SMOKE_SECRET_FIELDS = {
+    "artifact_url",
+    "artifact_sha256",
+    "provenance_sha256",
+}
+ANDROID_SMOKE_ARCHIVE_MEMBERS = {
+    "runz",
+    "redroid-bundle.tar",
+    "provenance.json",
+}
+ANDROID_SMOKE_PROVENANCE_FIELDS = {
+    "schema",
+    "type",
+    "architecture",
+    "droid_source_commit",
+    "runz_sha256",
+    "redroid_immutable_reference",
+    "redroid_manifest_digest",
+    "bundle_archive_sha256",
+    "config_json_sha256",
+}
+ANDROID_SMOKE_PROVENANCE_SCHEMA = "cataggar.droid.redroid-smoke-provenance.v1"
+ANDROID_SMOKE_PROVENANCE_TYPE = (
+    "application/vnd.cataggar.droid.redroid-smoke.v1+json"
+)
+ANDROID_SMOKE_MANIFEST_MAX_BYTES = 1024 * 1024
+ANDROID_SMOKE_CONFIG_MAX_BYTES = 16 * 1024 * 1024
+ANDROID_SMOKE_INPUT_ENV = "ANDROID_SMOKE_INPUT_VALUE"
+ANDROID_SMOKE_TOKEN_ENV = "ANDROID_ARTIFACT_TOKEN_VALUE"
 
 
 def require_android_smoke(
@@ -275,7 +308,10 @@ def require_android_smoke(
 ) -> dict[str, object]:
     if not isinstance(value, dict) or set(value) != ANDROID_SMOKE_FIELDS:
         fail(f"{label}: android_smoke provenance is invalid")
-    require_commit(value.get("source_commit"), f"{label} android_smoke source commit")
+    require_sha256(
+        value.get("provenance_sha256"),
+        f"{label} android_smoke provenance digest",
+    )
     require_sha256(value.get("runtime_sha256"), f"{label} android_smoke runtime digest")
     require_sha256(value.get("bundle_sha256"), f"{label} android_smoke bundle digest")
     require_sha256(value.get("config_sha256"), f"{label} android_smoke config digest")
@@ -284,6 +320,276 @@ def require_android_smoke(
     if value.get("candidate_key") != key:
         fail(f"{label}: android_smoke candidate key mismatch")
     return value
+
+
+def require_private_https_url(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        fail(f"{label} is absent")
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError:
+        fail(f"{label} is not an HTTPS URL")
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        fail(f"{label} is not an HTTPS URL")
+    return value
+
+
+def parse_android_smoke_secret(value: object) -> dict[str, str]:
+    if not isinstance(value, str) or not value:
+        fail("architecture-specific Android smoke input secret is absent")
+    try:
+        document = json.loads(value)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        fail("architecture-specific Android smoke input secret is malformed")
+    if not isinstance(document, dict) or set(document) != ANDROID_SMOKE_SECRET_FIELDS:
+        fail("architecture-specific Android smoke input secret has unexpected fields")
+    return {
+        "artifact_url": require_private_https_url(
+            document.get("artifact_url"),
+            "Android smoke artifact URL",
+        ),
+        "artifact_sha256": require_sha256(
+            document.get("artifact_sha256"),
+            "Android smoke archive digest",
+        ),
+        "provenance_sha256": require_sha256(
+            document.get("provenance_sha256"),
+            "Android smoke provenance digest",
+        ),
+    }
+
+
+def parse_android_smoke_provenance(
+    value: object,
+    architecture: str,
+) -> dict[str, str]:
+    if architecture not in {"x86_64", "aarch64"}:
+        fail("Android smoke architecture is unsupported")
+    if not isinstance(value, dict) or set(value) != ANDROID_SMOKE_PROVENANCE_FIELDS:
+        fail("Android smoke provenance manifest has unexpected fields")
+    if (
+        value.get("schema") != ANDROID_SMOKE_PROVENANCE_SCHEMA
+        or value.get("type") != ANDROID_SMOKE_PROVENANCE_TYPE
+    ):
+        fail("Android smoke provenance schema or type is invalid")
+    if value.get("architecture") != architecture:
+        fail("Android smoke provenance architecture mismatch")
+    require_commit(
+        value.get("droid_source_commit"),
+        "Android smoke producer commit",
+    )
+    image_reference = value.get("redroid_immutable_reference")
+    if (
+        not isinstance(image_reference, str)
+        or re.fullmatch(r".+@sha256:[0-9a-f]{64}", image_reference) is None
+    ):
+        fail("Android smoke immutable image reference is invalid")
+    require_sha256(
+        value.get("redroid_manifest_digest"),
+        "Android smoke source manifest digest",
+    )
+    return {
+        "runz_sha256": require_sha256(
+            value.get("runz_sha256"),
+            "Android smoke runz digest",
+        ),
+        "bundle_sha256": require_sha256(
+            value.get("bundle_archive_sha256"),
+            "Android smoke bundle digest",
+        ),
+        "config_sha256": require_sha256(
+            value.get("config_json_sha256"),
+            "Android smoke config digest",
+        ),
+    }
+
+
+def _extract_android_smoke_archive(archive_path: Path, output_dir: Path) -> None:
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            members = archive.infolist()
+            names = [member.filename for member in members]
+            if (
+                len(names) != len(ANDROID_SMOKE_ARCHIVE_MEMBERS)
+                or set(names) != ANDROID_SMOKE_ARCHIVE_MEMBERS
+            ):
+                fail("Android smoke archive member set is not exact")
+            for member in members:
+                mode = (member.external_attr >> 16) & 0xFFFF
+                file_type = stat.S_IFMT(mode)
+                if (
+                    member.is_dir()
+                    or member.flag_bits & 0x1
+                    or file_type not in (0, stat.S_IFREG)
+                ):
+                    fail("Android smoke archive contains an unsafe member")
+            for member in members:
+                destination = output_dir / member.filename
+                with archive.open(member) as source, destination.open("xb") as output:
+                    os.chmod(destination, 0o600)
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        fail("Android smoke archive is malformed")
+
+
+def _url_origin(value: str) -> tuple[str, str, int]:
+    parsed = urlsplit(value)
+    port = parsed.port or 443
+    return parsed.scheme, parsed.hostname or "", port
+
+
+class _PrivateHttpsRedirectHandler(request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        resolved = urljoin(req.full_url, newurl)
+        if urlsplit(resolved).scheme != "https":
+            raise ValueError("private artifact redirect is not HTTPS")
+        redirected = super().redirect_request(
+            req,
+            fp,
+            code,
+            msg,
+            headers,
+            resolved,
+        )
+        if redirected is not None and _url_origin(req.full_url) != _url_origin(resolved):
+            redirected.remove_header("Authorization")
+        return redirected
+
+
+def _download_private_https(
+    url: str,
+    destination: Path,
+    token: str | None,
+    *,
+    max_bytes: int | None = None,
+) -> None:
+    partial = destination.with_name(f".{destination.name}.partial")
+    partial.unlink(missing_ok=True)
+    headers = {"Accept": "application/octet-stream"}
+    if token:
+        if "\r" in token or "\n" in token:
+            fail("Android artifact bearer token is malformed")
+        headers["Authorization"] = f"Bearer {token}"
+    opener = request.build_opener(_PrivateHttpsRedirectHandler())
+    try:
+        response = opener.open(request.Request(url, headers=headers), timeout=60)
+        try:
+            if urlsplit(response.geturl()).scheme != "https":
+                raise ValueError("private artifact response is not HTTPS")
+            total = 0
+            with partial.open("xb") as output:
+                os.chmod(partial, 0o600)
+                while chunk := response.read(1024 * 1024):
+                    total += len(chunk)
+                    if max_bytes is not None and total > max_bytes:
+                        raise ValueError("private artifact exceeds size bound")
+                    output.write(chunk)
+        finally:
+            response.close()
+        partial.replace(destination)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        fail("private Android smoke artifact download failed")
+
+
+def _android_bundle_config_sha256(bundle: Path) -> str:
+    try:
+        with tarfile.open(bundle, mode="r:*") as archive:
+            matches = [
+                member
+                for member in archive.getmembers()
+                if member.name.removeprefix("./") == "config.json"
+            ]
+            if (
+                len(matches) != 1
+                or not matches[0].isfile()
+                or matches[0].size > ANDROID_SMOKE_CONFIG_MAX_BYTES
+            ):
+                fail("Android smoke bundle config entry is invalid")
+            stream = archive.extractfile(matches[0])
+            if stream is None:
+                fail("Android smoke bundle config entry is unreadable")
+            digest = hashlib.sha256()
+            remaining = matches[0].size
+            while remaining:
+                chunk = stream.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    fail("Android smoke bundle config entry is truncated")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if stream.read(1):
+                fail("Android smoke bundle config entry exceeds its declared size")
+            return digest.hexdigest()
+    except (tarfile.TarError, OSError):
+        fail("Android smoke bundle archive is malformed")
+
+
+def prepare_android_smoke_inputs_command(args: argparse.Namespace) -> None:
+    secret = parse_android_smoke_secret(os.environ.get(ANDROID_SMOKE_INPUT_ENV))
+    token = os.environ.get(ANDROID_SMOKE_TOKEN_ENV) or None
+    output_dir = args.output_dir.resolve()
+    if output_dir.exists():
+        fail("Android smoke input directory already exists")
+    output_dir.mkdir(parents=True, mode=0o700)
+    try:
+        archive_path = output_dir / "artifact.zip"
+        _download_private_https(
+            secret["artifact_url"],
+            archive_path,
+            token,
+        )
+        if sha256(archive_path) != secret["artifact_sha256"]:
+            fail("Android smoke archive digest mismatch")
+        _extract_android_smoke_archive(archive_path, output_dir)
+        archive_path.unlink()
+
+        provenance_path = output_dir / "provenance.json"
+        if provenance_path.stat().st_size > ANDROID_SMOKE_MANIFEST_MAX_BYTES:
+            fail("Android smoke provenance manifest exceeds size bound")
+        provenance_sha256 = sha256(provenance_path)
+        if provenance_sha256 != secret["provenance_sha256"]:
+            fail("Android smoke provenance digest mismatch")
+        try:
+            provenance_value = json.loads(provenance_path.read_bytes())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            fail("Android smoke provenance manifest is malformed")
+        provenance = parse_android_smoke_provenance(
+            provenance_value,
+            args.architecture,
+        )
+
+        runtime_path = output_dir / "runz"
+        bundle_path = output_dir / "redroid-bundle.tar"
+        if sha256(runtime_path) != provenance["runz_sha256"]:
+            fail("Android smoke runz digest mismatch")
+        if sha256(bundle_path) != provenance["bundle_sha256"]:
+            fail("Android smoke bundle digest mismatch")
+        if _android_bundle_config_sha256(bundle_path) != provenance["config_sha256"]:
+            fail("Android smoke bundle config digest mismatch")
+
+        values = {
+            "MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256": provenance_sha256,
+            "MIZ_UBUNTU2604_ANDROID_RUNTIME": str(runtime_path),
+            "MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256": provenance["runz_sha256"],
+            "MIZ_UBUNTU2604_ANDROID_BUNDLE": str(bundle_path),
+            "MIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256": provenance["bundle_sha256"],
+            "MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256": provenance["config_sha256"],
+        }
+        with args.github_env.open("a", encoding="utf-8") as output:
+            for name, item in values.items():
+                if "\r" in item or "\n" in item:
+                    fail("Android smoke verified environment value is malformed")
+                print(f"{name}={item}", file=output)
+    except BaseException:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise
 
 
 def has_exact_contracts(value: object, expected: set[str]) -> bool:
@@ -462,10 +768,11 @@ def validate_identity(
     document: dict[str, object],
     *,
     expected_type: str,
+    expected_schema: int = 1,
     key: str | None = None,
     source_commit: str | None = None,
 ) -> tuple[str, str, str, str]:
-    if document.get("schema") != 1 or document.get("type") != expected_type:
+    if document.get("schema") != expected_schema or document.get("type") != expected_type:
         fail(f"invalid {expected_type} schema")
     actual_key = document.get("key")
     if not isinstance(actual_key, str) or actual_key not in CANDIDATE_EXPECTED:
@@ -1210,10 +1517,10 @@ def validate_native_result(
             "virtual_size",
             "android_smoke",
         }
-        # Bumped from 3 so that a result recorded before the Android
-        # container boot-completion smoke contracts existed can never
+        # Bumped from 4 so that a result binding a private source commit
+        # instead of the complete provenance-manifest digest can never
         # satisfy the current core contract set.
-        expected_schema = 4
+        expected_schema = 5
     if set(result) != expected_fields:
         fail(f"{candidate['key']}: native acceptance result has unexpected fields")
     if (
@@ -1389,7 +1696,7 @@ def azure_result_command(args: argparse.Namespace) -> None:
     ):
         fail("Azure gallery image-version identity is absent")
     android_smoke_args = (
-        args.android_smoke_source_commit,
+        args.android_smoke_provenance_sha256,
         args.android_smoke_runtime_sha256,
         args.android_smoke_bundle_sha256,
         args.android_smoke_config_sha256,
@@ -1397,9 +1704,9 @@ def azure_result_command(args: argparse.Namespace) -> None:
     android_smoke = None
     if candidate["flavor"] == "core":
         android_smoke = {
-            "source_commit": require_commit(
-                args.android_smoke_source_commit,
-                "android_smoke source commit",
+            "provenance_sha256": require_sha256(
+                args.android_smoke_provenance_sha256,
+                "android_smoke provenance digest",
             ),
             "runtime_sha256": require_sha256(
                 args.android_smoke_runtime_sha256,
@@ -1419,7 +1726,7 @@ def azure_result_command(args: argparse.Namespace) -> None:
     elif any(value is not None for value in android_smoke_args):
         fail("android_smoke provenance is only valid for the core flavor")
     document = {
-        "schema": 1,
+        "schema": 2 if candidate["flavor"] == "core" else 1,
         "type": "ubuntu2604-azure-acceptance",
         "key": candidate["key"],
         "architecture": candidate["architecture"],
@@ -1469,6 +1776,7 @@ def validate_azure_result(
     actual_key, _, flavor, asset_name = validate_identity(
         result,
         expected_type="ubuntu2604-azure-acceptance",
+        expected_schema=2 if candidate["flavor"] == "core" else 1,
         key=candidate["key"],
         source_commit=candidate["source_commit"],
     )
@@ -1970,6 +2278,16 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser()
     commands = result.add_subparsers(dest="command", required=True)
 
+    android_smoke = commands.add_parser("prepare-android-smoke-inputs")
+    android_smoke.add_argument(
+        "--architecture",
+        choices=("x86_64", "aarch64"),
+        required=True,
+    )
+    android_smoke.add_argument("--output-dir", type=Path, required=True)
+    android_smoke.add_argument("--github-env", type=Path, required=True)
+    android_smoke.set_defaults(function=prepare_android_smoke_inputs_command)
+
     candidate = commands.add_parser("candidate")
     candidate.add_argument("--key", required=True)
     candidate.add_argument("--architecture", required=True)
@@ -2045,9 +2363,9 @@ def parser() -> argparse.ArgumentParser:
     azure.add_argument("--uefi-request", type=Path, required=True)
     azure.add_argument("--uefi-response", type=Path, required=True)
     azure.add_argument(
-        "--android-smoke-source-commit",
+        "--android-smoke-provenance-sha256",
         default=None,
-        help="pinned source commit for the externally supplied Android runtime and bundle; required for the core flavor only",
+        help="SHA-256 of the complete external Android smoke provenance manifest; required for the core flavor only",
     )
     azure.add_argument(
         "--android-smoke-runtime-sha256",

@@ -1,12 +1,17 @@
 import base64
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
+import stat
 import struct
+import tarfile
 import types
 import unittest
+import warnings
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -73,6 +78,305 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
+
+    def android_smoke_provenance(
+        self,
+        architecture: str = "x86_64",
+        *,
+        runz_sha256: str = "1" * 64,
+        bundle_sha256: str = "2" * 64,
+        config_sha256: str = "3" * 64,
+    ) -> dict[str, object]:
+        return {
+            "schema": release.ANDROID_SMOKE_PROVENANCE_SCHEMA,
+            "type": release.ANDROID_SMOKE_PROVENANCE_TYPE,
+            "architecture": architecture,
+            "droid_source_commit": "a" * 40,
+            "redroid_immutable_reference": (
+                f"registry.example.invalid/android@sha256:{'b' * 64}"
+            ),
+            "redroid_manifest_digest": "c" * 64,
+            "runz_sha256": runz_sha256,
+            "bundle_archive_sha256": bundle_sha256,
+            "config_json_sha256": config_sha256,
+        }
+
+    def test_android_smoke_secret_is_exact_and_https(self):
+        value = {
+            "artifact_url": "https://artifacts.example.invalid/artifact.zip",
+            "artifact_sha256": "9" * 64,
+            "provenance_sha256": "0" * 64,
+        }
+        self.assertEqual(
+            release.parse_android_smoke_secret(json.dumps(value)),
+            value,
+        )
+        mutations = (
+            {**value, "unexpected": "value"},
+            {key: item for key, item in value.items() if key != "artifact_url"},
+            {**value, "artifact_url": "http://artifacts.example.invalid/artifact.zip"},
+            {
+                **value,
+                "artifact_url": "https://user@artifacts.example.invalid/artifact.zip",
+            },
+            {
+                **value,
+                "artifact_url": "https://artifacts.example.invalid:bad/artifact.zip",
+            },
+            {**value, "artifact_sha256": "F" * 64},
+            {**value, "provenance_sha256": "F" * 64},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(SystemExit):
+                    release.parse_android_smoke_secret(json.dumps(mutation))
+        for malformed in ("", "[]", "{"):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(SystemExit):
+                    release.parse_android_smoke_secret(malformed)
+
+    def test_android_smoke_provenance_is_exact_and_architecture_bound(self):
+        self.assertEqual(
+            release.ANDROID_SMOKE_PROVENANCE_SCHEMA,
+            "cataggar.droid.redroid-smoke-provenance.v1",
+        )
+        self.assertEqual(
+            release.ANDROID_SMOKE_PROVENANCE_TYPE,
+            "application/vnd.cataggar.droid.redroid-smoke.v1+json",
+        )
+        value = self.android_smoke_provenance()
+        self.assertEqual(
+            release.parse_android_smoke_provenance(value, "x86_64"),
+            {
+                "runz_sha256": "1" * 64,
+                "bundle_sha256": "2" * 64,
+                "config_sha256": "3" * 64,
+            },
+        )
+        mutations = (
+            {**value, "schema": 2},
+            {**value, "type": "other"},
+            {**value, "architecture": "aarch64"},
+            {**value, "runz_sha256": "F" * 64},
+            {**value, "redroid_immutable_reference": "mutable:latest"},
+            {**value, "redroid_manifest_digest": "F" * 64},
+            {**value, "unexpected": "value"},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(SystemExit):
+                    release.parse_android_smoke_provenance(mutation, "x86_64")
+
+    def test_prepare_android_smoke_inputs_verifies_and_exports_only_safe_values(self):
+        inputs = self.root / "inputs"
+        inputs.mkdir()
+        runz = inputs / "runz"
+        runz.write_bytes(b"runz fixture")
+        config = b'{"mounts":[]}\n'
+        bundle = inputs / "redroid-bundle.tar"
+        with tarfile.open(bundle, "w") as archive:
+            member = tarfile.TarInfo("config.json")
+            member.size = len(config)
+            archive.addfile(member, io.BytesIO(config))
+        provenance = inputs / "provenance.json"
+        provenance.write_text(
+            json.dumps(
+                self.android_smoke_provenance(
+                    runz_sha256=release.sha256(runz),
+                    bundle_sha256=release.sha256(bundle),
+                    config_sha256=hashlib.sha256(config).hexdigest(),
+                )
+            ),
+            encoding="utf-8",
+        )
+        artifact = inputs / "artifact.zip"
+        with zipfile.ZipFile(artifact, "w") as archive:
+            archive.write(runz, "runz")
+            archive.write(bundle, "redroid-bundle.tar")
+            archive.write(provenance, "provenance.json")
+        urls = {
+            "https://artifacts.example.invalid/artifact.zip": artifact,
+        }
+        secret = {
+            "artifact_url": next(iter(urls)),
+            "artifact_sha256": release.sha256(artifact),
+            "provenance_sha256": release.sha256(provenance),
+        }
+        downloads: list[str] = []
+
+        def copy_download(url, destination, token, **_kwargs):
+            downloads.append(url)
+            shutil.copyfile(urls[url], destination)
+
+        output_dir = self.root / "private-inputs"
+        github_env = self.root / "github-env"
+        args = types.SimpleNamespace(
+            architecture="x86_64",
+            output_dir=output_dir,
+            github_env=github_env,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                release.ANDROID_SMOKE_INPUT_ENV: json.dumps(secret),
+                release.ANDROID_SMOKE_TOKEN_ENV: "fixture-token",
+            },
+            clear=False,
+        ), mock.patch.object(
+            release,
+            "_download_private_https",
+            side_effect=copy_download,
+        ):
+            release.prepare_android_smoke_inputs_command(args)
+
+        self.assertEqual(downloads, [secret["artifact_url"]])
+        self.assertFalse((output_dir / "artifact.zip").exists())
+        exported = github_env.read_text(encoding="utf-8")
+        self.assertIn(
+            f"MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256={release.sha256(provenance)}",
+            exported,
+        )
+        self.assertIn(
+            f"MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256={release.sha256(runz)}",
+            exported,
+        )
+        self.assertIn(
+            f"MIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256={release.sha256(bundle)}",
+            exported,
+        )
+        for private in (
+            *urls,
+            "fixture-token",
+            "droid_source_commit",
+            "redroid_immutable_reference",
+        ):
+            self.assertNotIn(private, exported)
+
+    def test_prepare_android_smoke_inputs_checks_archive_digest_before_extraction(self):
+        output_dir = self.root / "private-inputs"
+        github_env = self.root / "github-env"
+        secret = {
+            "artifact_url": "https://artifacts.example.invalid/artifact.zip",
+            "artifact_sha256": "0" * 64,
+            "provenance_sha256": "0" * 64,
+        }
+        downloads: list[str] = []
+
+        def write_bad_archive(url, destination, token, **_kwargs):
+            downloads.append(url)
+            destination.write_bytes(b"not the expected archive")
+
+        args = types.SimpleNamespace(
+            architecture="x86_64",
+            output_dir=output_dir,
+            github_env=github_env,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {release.ANDROID_SMOKE_INPUT_ENV: json.dumps(secret)},
+            clear=False,
+        ), mock.patch.object(
+            release,
+            "_download_private_https",
+            side_effect=write_bad_archive,
+        ), mock.patch.object(release, "_extract_android_smoke_archive") as extract:
+            with self.assertRaises(SystemExit):
+                release.prepare_android_smoke_inputs_command(args)
+        self.assertEqual(downloads, [secret["artifact_url"]])
+        extract.assert_not_called()
+        self.assertFalse(output_dir.exists())
+        self.assertFalse(github_env.exists())
+
+    def test_prepare_android_smoke_inputs_checks_provenance_digest_before_parsing(self):
+        artifact = self.root / "artifact.zip"
+        with zipfile.ZipFile(artifact, "w") as archive:
+            archive.writestr("runz", b"runz")
+            archive.writestr("redroid-bundle.tar", b"bundle")
+            archive.writestr("provenance.json", b"{}")
+        secret = {
+            "artifact_url": "https://artifacts.example.invalid/artifact.zip",
+            "artifact_sha256": release.sha256(artifact),
+            "provenance_sha256": "0" * 64,
+        }
+        output_dir = self.root / "private-inputs"
+        github_env = self.root / "github-env"
+        args = types.SimpleNamespace(
+            architecture="x86_64",
+            output_dir=output_dir,
+            github_env=github_env,
+        )
+
+        def copy_archive(url, destination, token, **_kwargs):
+            shutil.copyfile(artifact, destination)
+
+        with mock.patch.dict(
+            os.environ,
+            {release.ANDROID_SMOKE_INPUT_ENV: json.dumps(secret)},
+            clear=False,
+        ), mock.patch.object(
+            release,
+            "_download_private_https",
+            side_effect=copy_archive,
+        ), mock.patch.object(release, "parse_android_smoke_provenance") as parse:
+            with self.assertRaises(SystemExit):
+                release.prepare_android_smoke_inputs_command(args)
+        parse.assert_not_called()
+        self.assertFalse(output_dir.exists())
+        self.assertFalse(github_env.exists())
+
+    def test_android_smoke_archive_rejects_nonexact_and_unsafe_members(self):
+        normal = {
+            "runz": b"runz",
+            "redroid-bundle.tar": b"bundle",
+            "provenance.json": b"provenance",
+        }
+        cases = {
+            "missing": tuple(normal)[:-1],
+            "extra": (*normal, "extra"),
+            "traversal": ("../runz", "redroid-bundle.tar", "provenance.json"),
+            "directory": ("runz/", "redroid-bundle.tar", "provenance.json"),
+            "duplicate": (
+                "runz",
+                "runz",
+                "redroid-bundle.tar",
+                "provenance.json",
+            ),
+        }
+        for label, names in cases.items():
+            with self.subTest(label=label):
+                archive_path = self.root / f"{label}.zip"
+                output = self.root / f"{label}-output"
+                output.mkdir()
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    with zipfile.ZipFile(archive_path, "w") as archive:
+                        for name in names:
+                            archive.writestr(name, normal.get(name, b"unsafe"))
+                with self.assertRaises(SystemExit):
+                    release._extract_android_smoke_archive(archive_path, output)
+                self.assertEqual(list(output.iterdir()), [])
+
+        for label, file_type in (
+            ("symlink", stat.S_IFLNK),
+            ("fifo", stat.S_IFIFO),
+            ("directory-type", stat.S_IFDIR),
+        ):
+            with self.subTest(label=label):
+                archive_path = self.root / f"{label}.zip"
+                output = self.root / f"{label}-output"
+                output.mkdir()
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    for name, data in normal.items():
+                        member = zipfile.ZipInfo(name)
+                        member.create_system = 3
+                        member.external_attr = (
+                            (file_type if name == "runz" else stat.S_IFREG)
+                            | 0o600
+                        ) << 16
+                        archive.writestr(member, data)
+                with self.assertRaises(SystemExit):
+                    release._extract_android_smoke_archive(archive_path, output)
+                self.assertEqual(list(output.iterdir()), [])
 
     def test_package_root_uses_native_mountless_ext4_round_trip(self):
         builder = (
@@ -461,14 +765,14 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         azure_dir = self.azure / key
         android_smoke = (
             {
-                "android_smoke_source_commit": self.source_commit,
+                "android_smoke_provenance_sha256": "5" * 64,
                 "android_smoke_runtime_sha256": "6" * 64,
                 "android_smoke_bundle_sha256": "7" * 64,
                 "android_smoke_config_sha256": "8" * 64,
             }
             if flavor == "core"
             else {
-                "android_smoke_source_commit": None,
+                "android_smoke_provenance_sha256": None,
                 "android_smoke_runtime_sha256": None,
                 "android_smoke_bundle_sha256": None,
                 "android_smoke_config_sha256": None,
@@ -625,7 +929,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             (candidate_dir / "candidate.json").read_text(encoding="utf-8")
         )
         android_smoke = {
-            "source_commit": self.source_commit,
+            "provenance_sha256": "5" * 64,
             "runtime_sha256": "6" * 64,
             "bundle_sha256": "7" * 64,
             "config_sha256": "8" * 64,
@@ -636,7 +940,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         native_path.write_text(
             json.dumps(
                 {
-                    "schema": 4,
+                    "schema": 5,
                     "type": "ubuntu2604-local-secure-boot-acceptance",
                     "architecture": candidate["architecture"],
                     "flavor": candidate["flavor"],
@@ -692,7 +996,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                         source_commit=self.source_commit,
                     )
                 document[field] = (
-                    4
+                    5
                     if field == "schema"
                     else candidate["architecture"]
                     if field == "architecture"
@@ -864,10 +1168,11 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         self.make_bundle(key)
         result_path = self.azure / key / "azure-result.json"
         document = json.loads(result_path.read_text(encoding="utf-8"))
+        self.assertEqual(document["schema"], 2)
         self.assertEqual(
             document["android_smoke"],
             {
-                "source_commit": self.source_commit,
+                "provenance_sha256": "5" * 64,
                 "runtime_sha256": "6" * 64,
                 "bundle_sha256": "7" * 64,
                 "config_sha256": "8" * 64,
@@ -884,6 +1189,16 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             source_commit=self.source_commit,
         )
         self.assertEqual(result["android_smoke"]["candidate_key"], key)
+        document["schema"] = 1
+        result_path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            release.validate_azure_result(
+                candidate_dir / "candidate.json",
+                candidate_dir / release.CANDIDATE_EXPECTED[key][2],
+                result_path,
+                key=key,
+                source_commit=self.source_commit,
+            )
 
     def test_full_azure_result_never_carries_android_smoke_provenance(self):
         key = "x86_64-full"
@@ -899,7 +1214,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             lambda value: value.__setitem__(
                 "android_smoke",
                 {
-                    "source_commit": self.source_commit,
+                    "provenance_sha256": "5" * 64,
                     "runtime_sha256": "6" * 64,
                     "bundle_sha256": "7" * 64,
                     "config_sha256": "8" * 64,
@@ -921,7 +1236,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         key = "x86_64-full"
         self.make_bundle(key)
         args = self.azure_result_args(key)
-        args.android_smoke_source_commit = self.source_commit
+        args.android_smoke_provenance_sha256 = "5" * 64
         with self.assertRaises(SystemExit):
             release.azure_result_command(args)
 
@@ -929,7 +1244,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         key = "x86_64-core"
         self.make_bundle(key)
         for field in (
-            "android_smoke_source_commit",
+            "android_smoke_provenance_sha256",
             "android_smoke_runtime_sha256",
             "android_smoke_bundle_sha256",
             "android_smoke_config_sha256",
@@ -946,7 +1261,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         result_path = self.azure / key / "azure-result.json"
         candidate_dir = self.candidates / key
         mutations = {
-            "source_commit": "not-a-commit",
+            "provenance_sha256": "not-a-digest",
             "runtime_sha256": "F" * 64,
             "bundle_sha256": "not-a-digest",
             "architecture": "aarch64",
@@ -972,7 +1287,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                     result_path,
                     lambda value, key=key: value["android_smoke"].update(
                         {
-                            "source_commit": self.source_commit,
+                            "provenance_sha256": "5" * 64,
                             "runtime_sha256": "6" * 64,
                             "bundle_sha256": "7" * 64,
                             "config_sha256": "8" * 64,

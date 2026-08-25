@@ -246,6 +246,21 @@ else:
         self.assertIn('[[ -x "$BINDER_PROBE" ]]', harness)
         self.assertIn("base64", harness)
 
+    def test_android_smoke_binds_public_provenance_without_private_identity(self) -> None:
+        harness = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256", harness)
+        self.assertIn("--android-smoke-provenance-sha256", harness)
+        self.assertIn(
+            'android_config_json_file="$(dirname '
+            '"$MIZ_UBUNTU2604_ANDROID_BUNDLE")/guest-config.json"',
+            harness,
+        )
+        self.assertIn("provenance SHA-256", harness)
+        self.assertIn("config SHA-256", harness)
+        self.assertNotIn("MIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT", harness)
+        self.assertNotIn("--android-smoke-source-commit", harness)
+        self.assertNotIn("source commit", harness)
+
     def test_core_binder_module_trust_checks_reject_dkms_and_anbox_evidence(
         self,
     ) -> None:

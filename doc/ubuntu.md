@@ -780,15 +780,17 @@ boot. Acceptance then stops the container gracefully -- signal, then a
 bounded poll for a `stopped` state -- and only then deletes it; it never
 force-removes a container that has not confirmed it stopped.
 
-The runtime's pinned source commit and the runtime, bundle, and config
-digests are bound into the acceptance result the same way every other
-core-only input is: a native result missing them, or an Azure result missing
-them, fails validation, and the core-only result schema and Azure/native
-contract sets were bumped so an older result recorded before this contract
-existed can never satisfy the current one. Native and Azure acceptance run
-this smoke independently and use differently worded contract names for the
-same behavior, matching the existing native/Azure Binder contract split
-above.
+The SHA-256 of the complete external provenance manifest plus the runtime,
+bundle, and config digests are bound into the acceptance result the same way
+every other core-only input is. Producer-private identity fields remain
+inside that manifest: they are never copied to results, summaries, logs, or
+uploaded validation artifacts. A native or Azure result missing the
+public-safe digest evidence fails validation, and the core result schemas
+were bumped so an older result cannot satisfy the current contract. Native
+and Azure acceptance run this smoke independently, require identical
+architecture-specific provenance evidence, and use differently worded
+contract names for the same behavior, matching the existing native/Azure
+Binder contract split above.
 
 ## Core validation workflow
 
@@ -806,24 +808,41 @@ successful and exactly two nonempty, unexpired candidate artifacts.
 
 The final gate accepts exactly two candidates, two candidate-key-and-digest
 bound native results, and two Azure results. Its validation manifest records
-non-null native-result digests for both `x86_64-core` and `aarch64-core`;
-missing, duplicate, cross-key, or cross-digest evidence fails closed.
+non-null native-result digests and the matching public-safe Android
+provenance/runtime/bundle/config digests for both `x86_64-core` and
+`aarch64-core`; missing, duplicate, cross-key, cross-architecture, or
+cross-digest evidence fails closed.
 
 The core Azure acceptance jobs also build the Binder device usability probe
 from source for the matching guest architecture before running acceptance,
 so no prebuilt probe binary is stored or published.
 
-Both the native-QEMU and Azure jobs additionally fetch the digest-bound
-Android container runtime and bundle from plain repository secrets before
-acceptance: the pinned source commit, runtime and bundle download locations,
-their SHA-256 digests, and the extracted `config.json` digest. These secrets
-are deliberately not scoped to the `ubuntu2604-release` environment, so the
-native-QEMU job -- which needs no Azure credential -- can read them without
-gaining a protected-environment grant. An optional bearer-token secret is
-sent only when configured, for artifacts hosted privately; every other input
-above is required, and a missing or malformed one fails the job before any
-Azure resource is created or any guest command is run, rather than skipping
-the smoke.
+Both the native-QEMU and Azure matrices select one of two plain repository
+secrets before acceptance: `ANDROID_SMOKE_X86_64_JSON` or
+`ANDROID_SMOKE_AARCH64_JSON`. Each secret is an exact JSON object with
+`artifact_url`, `artifact_sha256`, and `provenance_sha256`. The location must
+be HTTPS and both digests must be lowercase SHA-256. The complete archive
+digest is verified before extraction. Its ZIP member set must then be
+exactly `runz`, `redroid-bundle.tar`, and `provenance.json`, with no
+directories, links, duplicate or additional entries, traversal names,
+encrypted entries, or non-regular file types.
+
+The extracted manifest digest is verified before the document is parsed.
+The manifest must use the exact external producer schema/type and field set
+enforced by `scripts/ubuntu2604_release.py`, match the selected architecture,
+and provide valid runtime, bundle, source manifest, and extracted
+`config.json` digests. Those artifact digests then verify both extracted
+files and the bundle config.
+
+These secrets are deliberately not scoped to the `ubuntu2604-release`
+environment, so the native-QEMU job -- which needs no Azure credential --
+can read them without gaining a protected-environment grant. An optional
+`ANDROID_ARTIFACT_TOKEN` is used only while downloading. Secret JSON, URLs,
+and producer-private manifest contents are never written to `GITHUB_ENV`,
+printed, or uploaded; only verified local paths and public-safe SHA-256
+evidence leave the download step. Missing, malformed, cross-architecture, or
+digest-mismatched input fails before any Azure resource is created or guest
+command runs rather than skipping the smoke.
 
 Candidates, native results, Azure results, and a final digest-bound
 two-architecture validation manifest are uploaded only as workflow artifacts.

@@ -185,6 +185,56 @@ class Ubuntu2604CoreWorkflowTests(unittest.TestCase):
             azure.index("Run exact-digest Azure Trusted Launch core acceptance"),
         )
 
+    def test_android_smoke_inputs_are_architecture_specific_and_private(self) -> None:
+        for name, following, private_root in (
+            ("native_qemu", "azure_acceptance", ".validation/native"),
+            ("azure_acceptance", "validate", ".validation/azure"),
+        ):
+            section = self.job(name, following)
+            self.assertEqual(
+                section.count(
+                    "android_smoke_secret: ANDROID_SMOKE_X86_64_JSON"
+                ),
+                1,
+            )
+            self.assertEqual(
+                section.count(
+                    "android_smoke_secret: ANDROID_SMOKE_AARCH64_JSON"
+                ),
+                1,
+            )
+            download = section.split(
+                "- name: Fetch and verify digest-bound Android container smoke inputs",
+                1,
+            )[1].split("\n      - name:", 1)[0]
+            self.assertIn(
+                "ANDROID_SMOKE_INPUT_VALUE: "
+                "${{ secrets[matrix.android_smoke_secret] }}",
+                download,
+            )
+            self.assertIn("set +x", download)
+            self.assertIn("prepare-android-smoke-inputs", download)
+            self.assertIn('--architecture "$ARCHITECTURE"', download)
+            self.assertIn(private_root, download)
+            self.assertNotIn("$RESULT_DIR/android", download)
+            for forbidden in (
+                "ANDROID_RUNTIME_SOURCE_COMMIT",
+                "ANDROID_RUNTIME_URL",
+                "ANDROID_BUNDLE_URL",
+                "MIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT",
+                "--oauth2-bearer",
+            ):
+                self.assertNotIn(forbidden, section)
+
+        gate = self.job("validate")
+        self.assertIn(
+            'native_result.get("android_smoke") != '
+            'azure_result.get("android_smoke")',
+            gate,
+        )
+        self.assertIn('"android_smoke": native_result["android_smoke"]', gate)
+        self.assertIn('"schema": 2', gate)
+
     def test_core_size_contract_is_aligned_across_builder_and_acceptance(self) -> None:
         builder = (
             ROOT / "scripts" / "build_generalized_ubuntu2604.zig"
