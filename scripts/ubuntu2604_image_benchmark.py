@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -967,6 +968,38 @@ def validate_raw_output(path: Path, info_path: Path) -> dict[str, object]:
     }
 
 
+def normalize_transaction_argument(value: str) -> str:
+    # debz records the per-run root-stage path in argv and hashes that argv.
+    marker = "/work/root-stage-"
+    marker_index = value.find(marker)
+    if marker_index < 0:
+        return value
+    equals_index = value.rfind("=", 0, marker_index)
+    path_start = equals_index + 1 if equals_index >= 0 else 0
+    return value[:path_start] + "$BENCHMARK_RUN" + value[marker_index:]
+
+
+def semantic_transaction_digest(document: dict[str, object]) -> str:
+    normalized = copy.deepcopy(document)
+    normalized.pop("digest_sha256", None)
+    commands = normalized.get("commands")
+    if not isinstance(commands, list):
+        fail("transaction provenance commands are invalid")
+    for command in commands:
+        if not isinstance(command, dict):
+            fail("transaction provenance command is invalid")
+        argv = command.get("argv")
+        if not isinstance(argv, list) or not all(
+            isinstance(argument, str) for argument in argv
+        ):
+            fail("transaction provenance command argv is invalid")
+        command["argv"] = [
+            normalize_transaction_argument(argument) for argument in argv
+        ]
+        command.pop("command_sha256", None)
+    return canonical_digest(normalized)
+
+
 def validate_transaction(
     path: Path,
     binding: dict[str, object],
@@ -992,16 +1025,18 @@ def validate_transaction(
         or final.get("status") != "exact_match"
     ):
         fail(f"{package} transaction provenance does not prove exact success")
+    semantic_digest = semantic_transaction_digest(document)
     return (
         {
             "package": package,
-            "digest_sha256": provenance_digest,
+            "semantic_digest_sha256": semantic_digest,
             "lock_sha256": lock_digest,
         },
         {
             "package": package,
             "filename": path.name,
             "file_sha256": file_digest,
+            "transaction_digest_sha256": provenance_digest,
         },
     )
 
@@ -1195,8 +1230,98 @@ def compare_correctness(
     reference: dict[str, object],
     candidate: dict[str, object],
 ) -> None:
-    if reference != candidate:
-        fail("correctness evidence differs from the warm-up reference")
+    differences = json_differences(reference, candidate)
+    if differences:
+        details = "; ".join(
+            f"{path}: reference={safe_difference_value(expected)}, "
+            f"candidate={safe_difference_value(actual)}"
+            for path, expected, actual in differences
+        )
+        fail(
+            "correctness evidence differs from the warm-up reference "
+            f"({len(differences)} differing field(s)): {details}"
+        )
+
+
+MISSING = object()
+
+
+def json_path(parent: str, key: object) -> str:
+    if isinstance(key, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+        return f"{parent}.{key}"
+    return f"{parent}[{json.dumps(key, sort_keys=True)}]"
+
+
+def json_differences(
+    reference: object,
+    candidate: object,
+    *,
+    path: str = "$",
+) -> list[tuple[str, object, object]]:
+    if type(reference) is not type(candidate):
+        return [(path, reference, candidate)]
+    if isinstance(reference, dict):
+        differences = []
+        for key in sorted(set(reference) | set(candidate), key=str):
+            child_path = json_path(path, key)
+            if key not in reference:
+                differences.append((child_path, MISSING, candidate[key]))
+            elif key not in candidate:
+                differences.append((child_path, reference[key], MISSING))
+            else:
+                differences.extend(
+                    json_differences(
+                        reference[key],
+                        candidate[key],
+                        path=child_path,
+                    )
+                )
+        return differences
+    if isinstance(reference, (list, tuple)):
+        differences = []
+        if len(reference) != len(candidate):
+            differences.append(
+                (f"{path}.length", len(reference), len(candidate))
+            )
+        for index, (expected, actual) in enumerate(
+            zip(reference, candidate, strict=False)
+        ):
+            differences.extend(
+                json_differences(
+                    expected,
+                    actual,
+                    path=f"{path}[{index}]",
+                )
+            )
+        return differences
+    return [] if reference == candidate else [(path, reference, candidate)]
+
+
+def safe_difference_value(value: object) -> str:
+    if value is MISSING:
+        return "<missing>"
+    if value is None or type(value) in {bool, int, float}:
+        return json.dumps(value)
+    if isinstance(value, str):
+        if SHA256_RE.fullmatch(value) is not None:
+            return value
+        if (
+            value.startswith("/")
+            or re.search(r"(?:^|\s|=)/(?:[^/\s]+/)*[^/\s]*", value)
+            or re.match(r"^[A-Za-z]:[\\/]", value)
+        ):
+            digest = hashlib.sha256(value.encode()).hexdigest()
+            return f"<absolute-path sha256={digest}>"
+        if len(value) <= 96 and "\n" not in value:
+            return json.dumps(value)
+        digest = hashlib.sha256(value.encode()).hexdigest()
+        return f"<string bytes={len(value.encode())} sha256={digest}>"
+    digest = canonical_digest(value)
+    if isinstance(value, dict):
+        return f"<object fields={len(value)} sha256={digest}>"
+    if isinstance(value, (list, tuple)):
+        return f"<array items={len(value)} sha256={digest}>"
+    return f"<{type(value).__name__} sha256={digest}>"
 
 
 def build_summary(
@@ -1679,10 +1804,10 @@ def run_once(
         "package_closure_sha256": lock_set["closure_sha256"],
         "acceptance": acceptance,
     }
-    if reference is not None:
-        compare_correctness(reference, correctness)
     write_json(evidence_dir / "package-closure.json", lock_set["final_closure"])
     write_json(evidence_dir / "correctness.json", correctness)
+    if reference is not None:
+        compare_correctness(reference, correctness)
     image_digest = sha256(image)
     image_size = image.stat().st_size
     evidence_manifest = {

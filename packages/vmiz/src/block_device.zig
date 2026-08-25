@@ -179,6 +179,7 @@ pub const IdentityInventory = struct {
 pub const PreflightReport = struct {
     target_name: []u8,
     whole_disk_name: []u8,
+    whole_disk_serial: ?[]u8 = null,
     geometry: Geometry,
     removable: bool,
     transport: Transport,
@@ -193,6 +194,7 @@ pub const PreflightReport = struct {
     pub fn deinit(self: *PreflightReport, allocator: std.mem.Allocator) void {
         allocator.free(self.target_name);
         allocator.free(self.whole_disk_name);
+        if (self.whole_disk_serial) |serial| allocator.free(serial);
         allocator.free(self.partitions);
         self.* = undefined;
     }
@@ -282,6 +284,9 @@ pub const PreflightOptions = struct {
 
 pub const PreflightError = ProbeError || std.mem.Allocator.Error || error{
     DestinationTooSmall,
+    InvalidExpectedDeviceSerial,
+    DeviceSerialUnavailable,
+    DeviceSerialMismatch,
     UnsupportedBlockDevicePreflight,
     BlockDeviceIdentityUnavailable,
     BlockDeviceNotInSysfs,
@@ -300,6 +305,9 @@ pub const PreflightError = ProbeError || std.mem.Allocator.Error || error{
 pub fn describePreflightFailure(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.DestinationTooSmall => "the source image is larger than the target device",
+        error.InvalidExpectedDeviceSerial => "--expect-serial requires a non-empty serial",
+        error.DeviceSerialUnavailable => "the writable target's whole-disk serial is unavailable; --expect-serial cannot be verified",
+        error.DeviceSerialMismatch => "the writable target's whole-disk serial does not exactly match --expect-serial",
         error.RootDeviceWriteRefused => "the target backs the running root filesystem and can never be overwritten",
         error.TargetMounted => "the target device is mounted",
         error.TargetContainsMountedPartition => "a partition beneath the target device is mounted",
@@ -552,6 +560,91 @@ fn wholeDiskNameAlloc(
     }
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
     return allocator.dupe(u8, try parentDiskName(io, class_block_dir, device_name, &link_buf));
+}
+
+fn serialAtSysfsLeafAlloc(
+    allocator: std.mem.Allocator,
+    io: Io,
+    class_block_dir: Io.Dir,
+    whole_disk_name: []const u8,
+    leaf: []const u8,
+) PreflightError!?[]u8 {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try sysfsPath(&path_buf, whole_disk_name, leaf);
+    const file = class_block_dir.openFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return error.InvalidBlockDeviceSysfs,
+    };
+    defer file.close(io);
+
+    var serial_buf: [4096]u8 = undefined;
+    const n = file.readPositionalAll(io, &serial_buf, 0) catch
+        return error.InvalidBlockDeviceSysfs;
+    if (n == serial_buf.len) return error.InvalidBlockDeviceSysfs;
+    const serial = std.mem.trim(u8, serial_buf[0..n], " \t\r\n");
+    if (serial.len == 0) return null;
+    return @as(?[]u8, try allocator.dupe(u8, serial));
+}
+
+fn wholeDiskSerialAlloc(
+    allocator: std.mem.Allocator,
+    io: Io,
+    class_block_dir: Io.Dir,
+    whole_disk_name: []const u8,
+) PreflightError!?[]u8 {
+    if (try serialAtSysfsLeafAlloc(
+        allocator,
+        io,
+        class_block_dir,
+        whole_disk_name,
+        "serial",
+    )) |serial| {
+        return serial;
+    }
+    return serialAtSysfsLeafAlloc(
+        allocator,
+        io,
+        class_block_dir,
+        whole_disk_name,
+        "device/serial",
+    );
+}
+
+pub const SysfsDeviceIdentity = struct {
+    target_name: []u8,
+    whole_disk_name: []u8,
+    whole_disk_serial: ?[]u8,
+
+    pub fn deinit(self: *SysfsDeviceIdentity, allocator: std.mem.Allocator) void {
+        allocator.free(self.target_name);
+        allocator.free(self.whole_disk_name);
+        if (self.whole_disk_serial) |serial| allocator.free(serial);
+        self.* = undefined;
+    }
+};
+
+/// Resolves an already-open descriptor's major/minor through sysfs. Partition
+/// targets inherit the containing whole disk's serial.
+pub fn resolveSysfsIdentity(
+    allocator: std.mem.Allocator,
+    io: Io,
+    class_block_dir: Io.Dir,
+    number: DeviceNumber,
+) PreflightError!SysfsDeviceIdentity {
+    const target_name = try findNameByDeviceNumber(allocator, io, class_block_dir, number);
+    errdefer allocator.free(target_name);
+    const whole_disk_name = try wholeDiskNameAlloc(allocator, io, class_block_dir, target_name);
+    errdefer allocator.free(whole_disk_name);
+    return .{
+        .target_name = target_name,
+        .whole_disk_name = whole_disk_name,
+        .whole_disk_serial = try wholeDiskSerialAlloc(
+            allocator,
+            io,
+            class_block_dir,
+            whole_disk_name,
+        ),
+    };
 }
 
 fn collectTargetDevices(
@@ -1073,10 +1166,8 @@ pub fn preflight(
     _ = options.force;
     if (source_virtual_size > geometry.size_bytes) return error.DestinationTooSmall;
 
-    const target_name = try findNameByDeviceNumber(allocator, io, class_block_dir, target);
-    errdefer allocator.free(target_name);
-    const whole_disk_name = try wholeDiskNameAlloc(allocator, io, class_block_dir, target_name);
-    errdefer allocator.free(whole_disk_name);
+    var identity = try resolveSysfsIdentity(allocator, io, class_block_dir, target);
+    errdefer identity.deinit(allocator);
 
     var mount_state = try parseMountInfo(allocator, mountinfo);
     defer mount_state.deinit();
@@ -1100,11 +1191,16 @@ pub fn preflight(
             var root_backing = NameSet.init(allocator);
             defer root_backing.deinit();
             try collectBackingDevices(&root_backing, io, class_block_dir, name);
-            if (root_backing.contains(target_name)) return error.RootDeviceWriteRefused;
+            if (root_backing.contains(identity.target_name)) return error.RootDeviceWriteRefused;
         }
     }
 
-    var target_devices = try collectTargetDevices(allocator, io, class_block_dir, target_name);
+    var target_devices = try collectTargetDevices(
+        allocator,
+        io,
+        class_block_dir,
+        identity.target_name,
+    );
     defer target_devices.deinit();
     try mountedState(target, target_devices, mount_state, io, class_block_dir);
     for (target_devices.items.items) |name| {
@@ -1114,11 +1210,12 @@ pub fn preflight(
     var contents = try inspectFileIdentityInventory(allocator, io, read_only_file, geometry.size_bytes);
     errdefer contents.deinit(allocator);
     return .{
-        .target_name = target_name,
-        .whole_disk_name = whole_disk_name,
+        .target_name = identity.target_name,
+        .whole_disk_name = identity.whole_disk_name,
+        .whole_disk_serial = identity.whole_disk_serial,
         .geometry = geometry,
-        .removable = try removableFor(io, class_block_dir, whole_disk_name),
-        .transport = try transportFor(io, class_block_dir, whole_disk_name),
+        .removable = try removableFor(io, class_block_dir, identity.whole_disk_name),
+        .transport = try transportFor(io, class_block_dir, identity.whole_disk_name),
         .partition_table = contents.partition_table,
         .partitions = contents.partitions,
         .device_signatures = contents.device_signatures,
@@ -1534,6 +1631,41 @@ fn addTestSysfsDevice(
     try root.symLink(io, link_target, link_path, .{});
 }
 
+fn addTestSysfsSerial(
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: Io.Dir,
+    relative_device_path: []const u8,
+    serial: []const u8,
+) !void {
+    const device_dir = try std.fmt.allocPrint(
+        allocator,
+        "devices/{s}/device",
+        .{relative_device_path},
+    );
+    defer allocator.free(device_dir);
+    try root.createDirPath(io, device_dir);
+    const serial_path = try std.fmt.allocPrint(allocator, "{s}/serial", .{device_dir});
+    defer allocator.free(serial_path);
+    try root.writeFile(io, .{ .sub_path = serial_path, .data = serial });
+}
+
+fn addTestSysfsDirectSerial(
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: Io.Dir,
+    relative_device_path: []const u8,
+    serial: []const u8,
+) !void {
+    const serial_path = try std.fmt.allocPrint(
+        allocator,
+        "devices/{s}/serial",
+        .{relative_device_path},
+    );
+    defer allocator.free(serial_path);
+    try root.writeFile(io, .{ .sub_path = serial_path, .data = serial });
+}
+
 fn createTestTree(io: Io, root: Io.Dir) !Io.Dir {
     try root.createDirPath(io, "class_block");
     return root.openDir(io, "class_block", .{ .iterate = true });
@@ -1714,6 +1846,184 @@ test "preflight rejects a mounted target and a mounted nvme child" {
     ));
 }
 
+test "sysfs identity trims a whole disk serial" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var class_block_dir = try createTestTree(io, tmp.dir);
+    defer class_block_dir.close(io);
+    try addTestSysfsDevice(
+        allocator,
+        io,
+        tmp.dir,
+        "nvme0n1",
+        "pci/nvme/nvme0/nvme0n1",
+        .{ .major = 259, .minor = 0 },
+        null,
+        false,
+        &.{},
+        &.{},
+    );
+    try addTestSysfsSerial(
+        allocator,
+        io,
+        tmp.dir,
+        "pci/nvme/nvme0/nvme0n1",
+        "  NVME-SERIAL-001 \n",
+    );
+
+    var identity = try resolveSysfsIdentity(
+        allocator,
+        io,
+        class_block_dir,
+        .{ .major = 259, .minor = 0 },
+    );
+    defer identity.deinit(allocator);
+    try std.testing.expectEqualStrings("nvme0n1", identity.target_name);
+    try std.testing.expectEqualStrings("nvme0n1", identity.whole_disk_name);
+    try std.testing.expectEqualStrings("NVME-SERIAL-001", identity.whole_disk_serial.?);
+}
+
+test "sysfs identity reads a partition's whole disk serial" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var class_block_dir = try createTestTree(io, tmp.dir);
+    defer class_block_dir.close(io);
+    try addTestSysfsDevice(
+        allocator,
+        io,
+        tmp.dir,
+        "sdb",
+        "pci/host0/target0/block/sdb",
+        .{ .major = 8, .minor = 16 },
+        null,
+        false,
+        &.{},
+        &.{},
+    );
+    try addTestSysfsDevice(
+        allocator,
+        io,
+        tmp.dir,
+        "sdb1",
+        "pci/host0/target0/block/sdb/sdb1",
+        .{ .major = 8, .minor = 17 },
+        1,
+        false,
+        &.{},
+        &.{},
+    );
+    try addTestSysfsSerial(
+        allocator,
+        io,
+        tmp.dir,
+        "pci/host0/target0/block/sdb",
+        "DISK-SERIAL\n",
+    );
+
+    var identity = try resolveSysfsIdentity(
+        allocator,
+        io,
+        class_block_dir,
+        .{ .major = 8, .minor = 17 },
+    );
+    defer identity.deinit(allocator);
+    try std.testing.expectEqualStrings("sdb1", identity.target_name);
+    try std.testing.expectEqualStrings("sdb", identity.whole_disk_name);
+    try std.testing.expectEqualStrings("DISK-SERIAL", identity.whole_disk_serial.?);
+}
+
+test "sysfs identity prefers virtio's direct whole disk serial" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var class_block_dir = try createTestTree(io, tmp.dir);
+    defer class_block_dir.close(io);
+    try addTestSysfsDevice(
+        allocator,
+        io,
+        tmp.dir,
+        "vda",
+        "pci/virtio0/block/vda",
+        .{ .major = 252, .minor = 0 },
+        null,
+        false,
+        &.{},
+        &.{},
+    );
+    try addTestSysfsDirectSerial(
+        allocator,
+        io,
+        tmp.dir,
+        "pci/virtio0/block/vda",
+        "  VIRTIO-SERIAL-001 \n",
+    );
+    try addTestSysfsSerial(
+        allocator,
+        io,
+        tmp.dir,
+        "pci/virtio0/block/vda",
+        "FALLBACK-SERIAL\n",
+    );
+
+    var identity = try resolveSysfsIdentity(
+        allocator,
+        io,
+        class_block_dir,
+        .{ .major = 252, .minor = 0 },
+    );
+    defer identity.deinit(allocator);
+    try std.testing.expectEqualStrings("vda", identity.target_name);
+    try std.testing.expectEqualStrings("VIRTIO-SERIAL-001", identity.whole_disk_serial.?);
+}
+
+test "sysfs identity permits loop md and device-mapper without serials" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var class_block_dir = try createTestTree(io, tmp.dir);
+    defer class_block_dir.close(io);
+    const cases = [_]struct {
+        name: []const u8,
+        path: []const u8,
+        number: DeviceNumber,
+    }{
+        .{ .name = "loop0", .path = "virtual/block/loop0", .number = .{ .major = 7, .minor = 0 } },
+        .{ .name = "md0", .path = "virtual/block/md0", .number = .{ .major = 9, .minor = 0 } },
+        .{ .name = "dm-0", .path = "virtual/block/dm-0", .number = .{ .major = 253, .minor = 0 } },
+    };
+    for (cases) |case| {
+        try addTestSysfsDevice(
+            allocator,
+            io,
+            tmp.dir,
+            case.name,
+            case.path,
+            case.number,
+            null,
+            false,
+            &.{},
+            &.{},
+        );
+    }
+    for (cases) |case| {
+        var identity = try resolveSysfsIdentity(
+            allocator,
+            io,
+            class_block_dir,
+            case.number,
+        );
+        defer identity.deinit(allocator);
+        try std.testing.expectEqualStrings(case.name, identity.target_name);
+        try std.testing.expect(identity.whole_disk_serial == null);
+    }
+}
+
 test "preflight rejects holders on a child partition" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
@@ -1839,6 +2149,13 @@ test "safe preflight reports transport, removability, GPT name, and filesystem s
         &.{},
         &.{},
     );
+    try addTestSysfsSerial(
+        allocator,
+        io,
+        tmp.dir,
+        "pci/usb1/1-1/host2/target2/block/sdb",
+        "USB-SERIAL-001\n",
+    );
     const file = try createTestDisk(io, tmp.dir, 2 * 1024 * 1024);
     defer file.close(io);
     try writeTestGpt(io, file);
@@ -1858,6 +2175,7 @@ test "safe preflight reports transport, removability, GPT name, and filesystem s
 
     try std.testing.expectEqualStrings("sdb", report.target_name);
     try std.testing.expectEqualStrings("sdb", report.whole_disk_name);
+    try std.testing.expectEqualStrings("USB-SERIAL-001", report.whole_disk_serial.?);
     try std.testing.expect(report.removable);
     try std.testing.expectEqual(Transport.usb, report.transport);
     try std.testing.expectEqual(PartitionTable.gpt, report.partition_table);
