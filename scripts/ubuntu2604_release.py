@@ -282,17 +282,15 @@ ANDROID_SMOKE_PROVENANCE_FIELDS = {
     "schema",
     "type",
     "architecture",
-    "droid_source_commit",
+    "producer_source_commit",
     "runz_sha256",
     "redroid_immutable_reference",
     "redroid_manifest_digest",
     "bundle_archive_sha256",
     "config_json_sha256",
 }
-ANDROID_SMOKE_PROVENANCE_SCHEMA = "cataggar.droid.redroid-smoke-provenance.v1"
-ANDROID_SMOKE_PROVENANCE_TYPE = (
-    "application/vnd.cataggar.droid.redroid-smoke.v1+json"
-)
+ANDROID_SMOKE_PROVENANCE_SCHEMA = "redroid-smoke-provenance.v1"
+ANDROID_SMOKE_PROVENANCE_TYPE = "application/vnd.redroid-smoke.v1+json"
 ANDROID_SMOKE_MANIFEST_MAX_BYTES = 1024 * 1024
 ANDROID_SMOKE_CONFIG_MAX_BYTES = 16 * 1024 * 1024
 ANDROID_SMOKE_INPUT_ENV = "ANDROID_SMOKE_INPUT_VALUE"
@@ -382,7 +380,7 @@ def parse_android_smoke_provenance(
     if value.get("architecture") != architecture:
         fail("Android smoke provenance architecture mismatch")
     require_commit(
-        value.get("droid_source_commit"),
+        value.get("producer_source_commit"),
         "Android smoke producer commit",
     )
     image_reference = value.get("redroid_immutable_reference")

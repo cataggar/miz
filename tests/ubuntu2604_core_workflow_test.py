@@ -221,7 +221,6 @@ class Ubuntu2604CoreWorkflowTests(unittest.TestCase):
                 "ANDROID_RUNTIME_SOURCE_COMMIT",
                 "ANDROID_RUNTIME_URL",
                 "ANDROID_BUNDLE_URL",
-                "MIZ_UBUNTU2604_ANDROID_SOURCE_COMMIT",
                 "--oauth2-bearer",
             ):
                 self.assertNotIn(forbidden, section)

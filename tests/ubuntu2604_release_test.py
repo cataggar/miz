@@ -91,7 +91,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             "schema": release.ANDROID_SMOKE_PROVENANCE_SCHEMA,
             "type": release.ANDROID_SMOKE_PROVENANCE_TYPE,
             "architecture": architecture,
-            "droid_source_commit": "a" * 40,
+            "producer_source_commit": "a" * 40,
             "redroid_immutable_reference": (
                 f"registry.example.invalid/android@sha256:{'b' * 64}"
             ),
@@ -138,11 +138,11 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
     def test_android_smoke_provenance_is_exact_and_architecture_bound(self):
         self.assertEqual(
             release.ANDROID_SMOKE_PROVENANCE_SCHEMA,
-            "cataggar.droid.redroid-smoke-provenance.v1",
+            "redroid-smoke-provenance.v1",
         )
         self.assertEqual(
             release.ANDROID_SMOKE_PROVENANCE_TYPE,
-            "application/vnd.cataggar.droid.redroid-smoke.v1+json",
+            "application/vnd.redroid-smoke.v1+json",
         )
         value = self.android_smoke_provenance()
         self.assertEqual(
@@ -247,8 +247,10 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
         for private in (
             *urls,
             "fixture-token",
-            "droid_source_commit",
+            "producer_source_commit",
             "redroid_immutable_reference",
+            "a" * 40,
+            f"registry.example.invalid/android@sha256:{'b' * 64}",
         ):
             self.assertNotIn(private, exported)
 

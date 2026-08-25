@@ -828,11 +828,14 @@ directories, links, duplicate or additional entries, traversal names,
 encrypted entries, or non-regular file types.
 
 The extracted manifest digest is verified before the document is parsed.
-The manifest must use the exact external producer schema/type and field set
-enforced by `scripts/ubuntu2604_release.py`, match the selected architecture,
-and provide valid runtime, bundle, source manifest, and extracted
-`config.json` digests. Those artifact digests then verify both extracted
-files and the bundle config.
+The manifest must use schema `redroid-smoke-provenance.v1`, type
+`application/vnd.redroid-smoke.v1+json`, and the exact field set enforced by
+`scripts/ubuntu2604_release.py`. It must match the selected architecture and
+provide valid runtime, bundle, source manifest, and extracted `config.json`
+digests. The raw `producer_source_commit` and immutable image reference are
+validated only inside the verifier and are never copied into public
+evidence. The artifact digests verify both extracted files and the bundle
+config.
 
 These secrets are deliberately not scoped to the `ubuntu2604-release`
 environment, so the native-QEMU job -- which needs no Azure credential --
