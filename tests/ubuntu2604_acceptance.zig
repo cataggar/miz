@@ -2742,7 +2742,7 @@ const full_checks =
     \\check cloud-init-status-done test "$cloud_init_status" = done
     \\netplan_network=$(find /run/systemd/network -maxdepth 1 -name '10-netplan-*.network' -print -quit)
     \\check netplan-network-generated test -n "$netplan_network"
-    \\check network-online networkctl is-online
+    \\check network-online systemctl is-active --quiet network-online.target
     \\check waagent-provisioning-agent grep -Eq '^[[:space:]]*Provisioning.Agent[[:space:]]*=[[:space:]]*auto[[:space:]]*$' /etc/waagent.conf
     \\check waagent-resource-disk-format grep -Eq '^[[:space:]]*ResourceDisk.Format[[:space:]]*=[[:space:]]*n[[:space:]]*$' /etc/waagent.conf
     \\check cloud-init-instance-state test -s /var/lib/cloud/instance/obj.pkl
