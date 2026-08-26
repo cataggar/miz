@@ -78,6 +78,10 @@ pub fn parse(str: []const u8) Guid {
 /// EFI System Partition (ESP) type GUID: C12A7328-F81F-11D2-BA4B-00A0C93EC93B.
 pub const esp: Guid = parse("C12A7328-F81F-11D2-BA4B-00A0C93EC93B");
 
+/// BIOS boot partition type GUID used by GRUB:
+/// 21686148-6449-6E6F-744E-656564454649.
+pub const bios_boot: Guid = parse("21686148-6449-6E6F-744E-656564454649");
+
 /// Linux filesystem data type GUID (the standard type for a plain Linux
 /// root/data partition on GPT, as used by systemd-gpt-auto-generator, gdisk,
 /// etc.): 0FC63DAF-8483-4772-8E79-3D69D8477DE4.
@@ -122,6 +126,10 @@ test "formatLower reverses parse" {
     try std.testing.expectEqualStrings(
         "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
         formatLower(&buf, esp),
+    );
+    try std.testing.expectEqualStrings(
+        "21686148-6449-6e6f-744e-656564454649",
+        formatLower(&buf, bios_boot),
     );
 }
 
