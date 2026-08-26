@@ -1504,6 +1504,10 @@ fn sshSucceeded(
     });
 }
 
+fn normalizeSshRunError(err: anyerror) anyerror {
+    return if (err == error.Timeout) error.SshCommandFailed else err;
+}
+
 fn sshOutputAlloc(
     allocator: Allocator,
     io: Io,
@@ -1513,7 +1517,7 @@ fn sshOutputAlloc(
 ) ![]u8 {
     const port_text = try std.fmt.allocPrint(allocator, "{d}", .{instance.port});
     defer allocator.free(port_text);
-    const result = try std.process.run(allocator, io, .{
+    const result = std.process.run(allocator, io, .{
         .argv = &.{
             ssh_path,
             "-i",
@@ -1549,7 +1553,7 @@ fn sshOutputAlloc(
             .raw = .fromSeconds(20),
             .clock = .awake,
         } },
-    });
+    }) catch |err| return normalizeSshRunError(err);
     switch (result.term) {
         .exited => |code| if (code == 0) {
             allocator.free(result.stderr);
@@ -1572,6 +1576,15 @@ fn sshOutputAlloc(
     allocator.free(result.stderr);
     allocator.free(result.stdout);
     return error.SshCommandFailed;
+}
+
+test "SSH process timeouts are command failures" {
+    try std.testing.expect(
+        normalizeSshRunError(error.Timeout) == error.SshCommandFailed,
+    );
+    try std.testing.expect(
+        normalizeSshRunError(error.AccessDenied) == error.AccessDenied,
+    );
 }
 
 fn efiDbContainsCertificate(
