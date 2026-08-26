@@ -694,7 +694,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends openssh-client qemu-utils
-          for tool in az azcopy qemu-img ssh ssh-keygen python3; do
+          for tool in az azcopy qemu-img ssh ssh-keygen python3 timeout; do
             command -v "$tool" >/dev/null
           done
           az version --output json >/dev/null
@@ -758,6 +758,7 @@ jobs:
           path: |
             ${{ env.RESULT_DIR }}/*.json
             ${{ env.RESULT_DIR }}/boot.log
+            ${{ env.RESULT_DIR }}/boot-screenshot.png
             ${{ env.RESULT_DIR }}/uefi-db.bin
           if-no-files-found: warn
           retention-days: 2

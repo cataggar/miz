@@ -1146,6 +1146,19 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             script,
         )
         self.assertIn("check no-failed-units test -z", script)
+        self.assertIn(
+            "check conventional-resource-disk-policy "
+            "validate_conventional_resource_disk",
+            script,
+        )
+        self.assertNotIn(
+            "check conventional-resource-disk-not-mounted not_mountpoint /mnt",
+            script,
+        )
+        self.assertIn(
+            "instanceView.bootDiagnostics.serialConsoleLogBlobUri",
+            script,
+        )
 
     def test_core_azure_contract_set_covers_appliance_acceptance(self):
         self.assertEqual(
