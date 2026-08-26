@@ -12,6 +12,7 @@
 const std = @import("std");
 const miz = @import("miz");
 const image_phase_timing = @import("image_phase_timing.zig");
+const uki_kernel_payload = @import("ubuntu2604_kernel_payload.zig");
 const uki_signing = @import("uki_signing.zig");
 
 const Allocator = std.mem.Allocator;
@@ -70,16 +71,7 @@ const exact_lock_max_size: u64 = 16 * 1024 * 1024;
 const azure_kernel_suffix = "-azure";
 const nvidia_bos_kernel_suffix = "-nvidia-bos-64k";
 
-const Architecture = enum {
-    x86_64,
-    aarch64,
-
-    fn parse(value: []const u8) ?Architecture {
-        if (std.mem.eql(u8, value, "x86_64") or std.mem.eql(u8, value, "amd64")) return .x86_64;
-        if (std.mem.eql(u8, value, "aarch64") or std.mem.eql(u8, value, "arm64")) return .aarch64;
-        return null;
-    }
-};
+const Architecture = uki_kernel_payload.Architecture;
 
 const Flavor = enum {
     full,
@@ -1412,15 +1404,7 @@ fn verifyCanonicalPublication(
     try verifyOpenPgpDetachedSignature(allocator, io, sums, signature, &key);
 }
 
-fn peMachine(bytes: []const u8) !u16 {
-    if (bytes.len < 0x40 or !std.mem.eql(u8, bytes[0..2], "MZ")) return error.InvalidPeImage;
-    const pe_offset = std.mem.readInt(u32, bytes[0x3c..0x40], .little);
-    if (pe_offset > bytes.len -| 6) return error.InvalidPeImage;
-    const offset: usize = @intCast(pe_offset);
-    if (!std.mem.eql(u8, bytes[offset .. offset + 4], "PE\x00\x00")) return error.InvalidPeImage;
-    const machine: *const [2]u8 = @ptrCast(bytes[offset + 4 ..].ptr);
-    return std.mem.readInt(u16, machine, .little);
-}
+const peMachine = uki_kernel_payload.peMachine;
 
 fn requiredPackages(flavor: Flavor) []const []const u8 {
     return switch (flavor) {
@@ -3811,6 +3795,13 @@ fn buildImage(
 
     const kernel_bytes = try Dir.cwd().readFileAlloc(io, kernel_host, allocator, .limited(miz.uki.limits.max_linux_size));
     defer allocator.free(kernel_bytes);
+    var kernel_payload = try uki_kernel_payload.normalize(
+        allocator,
+        profile.architecture,
+        kernel_bytes,
+        miz.uki.limits.max_linux_size,
+    );
+    defer kernel_payload.deinit(allocator);
     const initrd_bytes = try Dir.cwd().readFileAlloc(io, initrd_host, allocator, .limited(miz.uki.limits.max_initrd_size));
     defer allocator.free(initrd_bytes);
     const os_release_bytes = try Dir.cwd().readFileAlloc(io, os_release_host, allocator, .limited(miz.uki.limits.max_os_release_size));
@@ -3818,7 +3809,7 @@ fn buildImage(
 
     const unsigned_bytes = try miz.uki.generate(allocator, .{
         .stub = stub_bytes,
-        .linux = kernel_bytes,
+        .linux = kernel_payload.bytes,
         .initrd = initrd_bytes,
         .cmdline = cmdline,
         .os_release = os_release_bytes,

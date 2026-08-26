@@ -469,6 +469,24 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             production,
         )
 
+    def test_arm64_uki_uses_normalized_efi_kernel_payload(self):
+        builder = (
+            ROOT / "scripts" / "build_generalized_ubuntu2604.zig"
+        ).read_text(encoding="utf-8")
+        production = builder.split('test "profiles pin', 1)[0]
+        self.assertIn(
+            "uki_kernel_payload.normalize(",
+            production,
+        )
+        self.assertIn(
+            ".linux = kernel_payload.bytes",
+            production,
+        )
+        self.assertNotIn(
+            ".linux = kernel_bytes",
+            production,
+        )
+
     def make_bundle(
         self,
         key: str,
