@@ -2267,7 +2267,6 @@ test "mountless commit preserves the pinned Ubuntu descriptor-64 profile" {
     image.close(io);
     image_open = false;
 
-    try ext4.expectE2fsckClean(image_path);
     var reopened_image = try @import("image.zig").Image.openPath(io, image_path);
     defer reopened_image.close(io);
     var reopened = try FileSystem.open(allocator, io, reopened_image.file, .{
@@ -2474,6 +2473,7 @@ test "mountless round trip preserves security metadata and special nodes" {
     image.close(io);
     image_open = false;
 
+    try ext4.expectE2fsckClean(image_path);
     var reopened_image = try @import("image.zig").Image.openPath(io, image_path);
     defer reopened_image.close(io);
     var reopened = try FileSystem.open(allocator, io, reopened_image.file, .{
@@ -2497,6 +2497,7 @@ test "mountless round trip preserves security metadata and special nodes" {
     defer allocator.free(reopened_shared);
     try std.testing.expectEqualStrings("shared", reopened_shared);
     try std.testing.expectError(error.PathNotFound, reopened.stat("/empty"));
+    try ext4.expectE2fsckClean(image_path);
 }
 
 test "atomic commit rejects replacement of the source path after open" {
