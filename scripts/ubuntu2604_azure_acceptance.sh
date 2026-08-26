@@ -307,6 +307,21 @@ virtual_size=${candidate[2]}
 [[ "$qcow_sha256" =~ ^[0-9a-f]{64}$ ]]
 [[ "$qcow_bytes" =~ ^[0-9]+$ ]]
 [[ "$virtual_size" =~ ^[0-9]+$ ]]
+# Canonical's sparse GPT keeps root in entry 1 and boot partitions in later
+# slots, so root growth must be measured from its architecture-specific start.
+case "$ARCHITECTURE" in
+  x86_64) root_first_lba=2324480 ;;
+  aarch64) root_first_lba=2099200 ;;
+  *) echo "::error::Unsupported Ubuntu architecture: $ARCHITECTURE"; exit 1 ;;
+esac
+gpt_sector_size=512
+gpt_partition_array_sectors=32
+test "$((virtual_size % gpt_sector_size))" -eq 0
+total_sectors=$((virtual_size / gpt_sector_size))
+last_usable_lba=$((total_sectors - 2 - gpt_partition_array_sectors))
+test "$root_first_lba" -le "$last_usable_lba"
+original_root_size=$(((last_usable_lba - root_first_lba + 1) * gpt_sector_size))
+minimum_grown_root_size=$((original_root_size + 1073741824))
 readarray -t signing_identity < <(
   python3 - "$manifest" <<'PY'
 import json
@@ -831,7 +846,7 @@ if ssh \
 fi
 
 ssh "${ssh_options[@]}" "$ssh_target" \
-  "/usr/bin/bash -s -- '$vhd_current_size' '$runtime_architecture' '$ARCHITECTURE'" <<'GUEST'
+  "/usr/bin/bash -s -- '$vhd_current_size' '$minimum_grown_root_size' '$runtime_architecture' '$ARCHITECTURE'" <<'GUEST'
 set -Eeuo pipefail
 guest_error() {
   status=$1
@@ -841,8 +856,9 @@ guest_error() {
 }
 trap 'guest_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 original_size=$1
-runtime_arch=$2
-release_arch=$3
+minimum_grown_root_size=$2
+runtime_arch=$3
+release_arch=$4
 test "$(id -un)" = miztest
 test "$(uname -m)" = "$runtime_arch"
 sshd_config=$(sudo -n /usr/sbin/sshd -T)
@@ -859,7 +875,7 @@ test -n "$root_disk_name"
 disk_size=$(sudo -n blockdev --getsize64 "/dev/$root_disk_name")
 root_size=$(sudo -n blockdev --getsize64 "$root_device")
 test "$disk_size" -gt "$original_size"
-test "$root_size" -gt $((original_size + 1073741824))
+test "$root_size" -gt "$minimum_grown_root_size"
 test -s /etc/machine-id
 test -s /etc/ssh/ssh_host_ed25519_key.pub
 GUEST
