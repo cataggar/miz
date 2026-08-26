@@ -49,6 +49,8 @@ const default_virtual_size: u64 = 5 * 1024 * 1024 * 1024;
 // than full while the fresh debz root leaves at least this much writable room.
 const core_virtual_size: u64 = 3584 * 1024 * 1024;
 const core_minimum_root_free_bytes: u64 = 768 * 1024 * 1024;
+const distro_bytes_per_inode: u32 = 16 * 1024;
+const minimum_root_free_inodes: u32 = 4096;
 // Bare metal carries the NVIDIA BaseOS kernel's modules -- about 183 MB
 // installed against core's 3.5 GiB -- and an initramfs built with
 // `MODULES=most` rather than a dependency-pruned one, because the machine it
@@ -134,6 +136,12 @@ const Flavor = enum {
         };
     }
 };
+
+fn validateRootHeadroom(flavor: Flavor, free_bytes: u64, free_inodes: u32) !void {
+    if (flavor.freshRoot() and free_bytes < core_minimum_root_free_bytes)
+        return error.CoreRootFreeSpaceTooSmall;
+    if (free_inodes < minimum_root_free_inodes) return error.RootFreeInodesTooSmall;
+}
 
 fn validateFinalQcow2(io: Io, path: []const u8, expected_size: u64) !void {
     var image = try miz.Image.openPathReadOnlyStandalone(io, path);
@@ -1600,10 +1608,7 @@ const NativeRoot = struct {
             return err;
         };
         defer commit_result.deinit();
-        std.debug.print(
-            "native ext4 recovery artifact retained at {s}\n",
-            .{commit_result.recovery_path},
-        );
+        std.debug.print("native ext4 recovery artifact staged at {s}\n", .{commit_result.recovery_path});
         const filesystem_info = commit_result.filesystem;
         self.filesystem.deinit();
         self.filesystem_open = false;
@@ -1615,6 +1620,7 @@ const NativeRoot = struct {
             self.raw_path,
             self.mutable_image,
         );
+        try Dir.cwd().deleteTree(self.io, commit_result.recovery_path);
         Dir.cwd().deleteFile(self.io, self.raw_path) catch {};
         return filesystem_info;
     }
@@ -1786,6 +1792,7 @@ fn openNativeRoot(
         .length = geometry.length,
         .spool_path = spool_path,
         .atomic_path = raw_path,
+        .inodes = .{ .bytes_per_inode = distro_bytes_per_inode },
     });
     if (!labelEquals(filesystem.filesystemIdentity().label, "cloudimg-rootfs")) {
         filesystem.deinit();
@@ -2983,8 +2990,7 @@ fn customizeRootWithDebz(
     }
     const filesystem_info = try native_root.finish();
     const root_free_bytes = @as(u64, filesystem_info.free_block_count) * 4096;
-    if (flavor.freshRoot() and root_free_bytes < core_minimum_root_free_bytes)
-        return error.CoreRootFreeSpaceTooSmall;
+    try validateRootHeadroom(flavor, root_free_bytes, filesystem_info.free_inode_count);
     initramfs_import.succeed();
     return .{
         .root_path = current,
@@ -4667,6 +4673,19 @@ test "flavor defaults preserve full names and isolate core outputs" {
         ".scratch/ubuntu2604-aarch64-core",
         profileFor(.aarch64).workDirFor(.core),
     );
+}
+
+test "root headroom rejects inode exhaustion for every flavor" {
+    try std.testing.expectError(
+        error.RootFreeInodesTooSmall,
+        validateRootHeadroom(.full, 0, minimum_root_free_inodes - 1),
+    );
+    try validateRootHeadroom(.full, 0, minimum_root_free_inodes);
+    try std.testing.expectError(
+        error.CoreRootFreeSpaceTooSmall,
+        validateRootHeadroom(.core, core_minimum_root_free_bytes - 1, minimum_root_free_inodes),
+    );
+    try validateRootHeadroom(.core, core_minimum_root_free_bytes, minimum_root_free_inodes);
 }
 
 test "bare metal is named apart from core and requires exactly one administrator key" {

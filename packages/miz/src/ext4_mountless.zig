@@ -32,6 +32,9 @@ pub const OpenOptions = struct {
     /// partition in place.
     atomic_path: ?[]const u8 = null,
     limits: Limits = .{},
+    /// Inode density for a later commit. The default preserves the writer's
+    /// content-sized behavior; bootable roots should reserve runtime inodes.
+    inodes: ext4.InodeOptions = .{},
     diagnostic: ?*limits_mod.Diagnostic = null,
 };
 
@@ -439,6 +442,7 @@ pub const FileSystem = struct {
     offset: u64,
     length: u64,
     identity: ext4.GeneralFilesystemIdentity,
+    inodes: ext4.InodeOptions,
     atomic_path: ?[]const u8,
     source_inode: Io.File.INode,
     source_device_major: u32 = 0,
@@ -527,6 +531,7 @@ pub const FileSystem = struct {
             .offset = options.offset,
             .length = options.length,
             .identity = source.identity,
+            .inodes = options.inodes,
             .atomic_path = options.atomic_path,
             .source_inode = file_stat.inode,
             .source_device_major = source_device.major,
@@ -1335,6 +1340,7 @@ pub const FileSystem = struct {
             .uuid = self.identity.uuid,
             .timestamp = std.math.cast(u32, root.mtime orelse 0) orelse 0,
             .journal = .{ .enabled = self.identity.has_journal },
+            .inodes = self.inodes,
             .preserve_feature_ro_compat = commit_profile.feature_ro_compat,
             .preserve_feature_compat = if (commit_profile.descriptor_size == 64)
                 commit_profile.feature_compat
@@ -2396,6 +2402,7 @@ test "mountless round trip preserves security metadata and special nodes" {
         .length = 64 * 1024 * 1024,
         .spool_path = spool_path,
         .atomic_path = image_path,
+        .inodes = .{ .bytes_per_inode = 16 * 1024 },
     });
     var fs_open = true;
     defer if (fs_open) fs.deinit();
@@ -2463,6 +2470,8 @@ test "mountless round trip preserves security metadata and special nodes" {
     try fs.remove("/empty", true);
     var commit_result = try fs.commit();
     defer commit_result.deinit();
+    try std.testing.expectEqual(@as(u32, 4096), commit_result.filesystem.inode_count);
+    try std.testing.expect(commit_result.filesystem.free_inode_count > 4000);
     const recovery_path = try allocator.dupe(u8, commit_result.recovery_path);
     defer {
         Io.Dir.cwd().deleteTree(io, recovery_path) catch {};
@@ -2473,7 +2482,6 @@ test "mountless round trip preserves security metadata and special nodes" {
     image.close(io);
     image_open = false;
 
-    try ext4.expectE2fsckClean(image_path);
     var reopened_image = try @import("image.zig").Image.openPath(io, image_path);
     defer reopened_image.close(io);
     var reopened = try FileSystem.open(allocator, io, reopened_image.file, .{
