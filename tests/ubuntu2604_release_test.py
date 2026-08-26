@@ -1107,6 +1107,28 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
             'test "$root_size" -gt $((original_size + 1073741824))',
             script,
         )
+        source_disk_size = 5 * 1024 * 1024 * 1024
+        expanded_disk_size = 7 * 1024 * 1024 * 1024
+        sector_size = 512
+        partition_array_sectors = 32
+
+        def root_size(disk_size: int, first_lba: int) -> int:
+            last_usable_lba = (
+                disk_size // sector_size - 2 - partition_array_sectors
+            )
+            return (last_usable_lba - first_lba + 1) * sector_size
+
+        for first_lba in (2324480, 2099200):
+            original_root_size = root_size(source_disk_size, first_lba)
+            maximum_grown_root_size = root_size(expanded_disk_size, first_lba)
+            self.assertLess(
+                maximum_grown_root_size,
+                source_disk_size + 1024 * 1024 * 1024,
+            )
+            self.assertGreater(
+                maximum_grown_root_size,
+                original_root_size + 1024 * 1024 * 1024,
+            )
 
     def test_core_azure_contract_set_covers_appliance_acceptance(self):
         self.assertEqual(
