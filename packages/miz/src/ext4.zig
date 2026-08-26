@@ -8424,19 +8424,6 @@ fn allocateSparseExtents(
                 });
             }
         }
-        var remaining = sparse.block_count;
-        var hole_logical = sparse.logical_block;
-        while (remaining > 0) {
-            const take: u16 = @intCast(@min(remaining, @as(u32, 0x7FFF)));
-            try output.append(.{
-                .logical_block = hole_logical,
-                .start_block = 0,
-                .block_count = take,
-                .initialized = false,
-            });
-            hole_logical += take;
-            remaining -= take;
-        }
         logical = sparse.logical_block + sparse.block_count;
     }
     if (logical < logical_block_count) {
@@ -10454,8 +10441,8 @@ fn halfMd4Transform(buf: *[4]u32, input: [8]u32) u32 {
 fn strToHalfMd4Words(name: []const u8, start: usize) [8]u32 {
     var out: [8]u32 = undefined;
     const remaining = if (start < name.len) name[start..] else "";
-    const len = @min(remaining.len, 32);
-    var pad = @as(u32, @intCast(len));
+    const chunk_len = @min(remaining.len, 32);
+    var pad = @as(u32, @intCast(remaining.len));
     pad |= pad << 8;
     pad |= pad << 16;
 
@@ -10464,7 +10451,7 @@ fn strToHalfMd4Words(name: []const u8, start: usize) [8]u32 {
 
     var cursor: usize = 0;
     index = 0;
-    while (cursor + 4 <= len and index < out.len) : ({
+    while (cursor + 4 <= chunk_len and index < out.len) : ({
         cursor += 4;
         index += 1;
     }) {
@@ -10478,7 +10465,7 @@ fn strToHalfMd4Words(name: []const u8, start: usize) [8]u32 {
     if (index < out.len) {
         var value = pad;
         var offset = cursor;
-        while (offset < len) : (offset += 1) {
+        while (offset < chunk_len) : (offset += 1) {
             value = signedByteToU32(remaining[offset]) +% (value << 8);
         }
         out[index] = value;
@@ -10502,6 +10489,87 @@ fn dirHash(name: []const u8) u32 {
     var hash = buf[1] & ~@as(u32, 1);
     if (hash == 0xFFFF_FFFE) hash = 0xFFFF_FFFC;
     return hash;
+}
+
+test "directory HALF_MD4 hashes match e2fsprogs across chunk boundaries" {
+    try std.testing.expectEqual(@as(u32, 0x4F72_5888), dirHash("short-name"));
+    try std.testing.expectEqual(
+        @as(u32, 0xDAD9_F3F6),
+        dirHash("certificate-with-a-name-longer-than-32-bytes-000"),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 0x3AAE_8528),
+        dirHash("0123456789012345678901234567890123456789"),
+    );
+}
+
+test "sparse files omit holes from external extent trees" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(allocator, io, &temporary, "test-ext4-sparse-extents.img");
+    defer allocator.free(path);
+
+    const sparse_extents = [_]tree_cursor.SparseExtent{
+        .{ .logical_block = 1, .block_count = 1 },
+        .{ .logical_block = 3, .block_count = 1 },
+        .{ .logical_block = 5, .block_count = 1 },
+        .{ .logical_block = 7, .block_count = 1 },
+        .{ .logical_block = 9, .block_count = 1 },
+        .{ .logical_block = 11, .block_count = 1 },
+    };
+    const logical_block_count = 12;
+    var tree = InMemoryTree.init(&[_]InMemoryEntry{.{
+        .path = "sparse",
+        .kind = .file,
+        .mode = 0o644,
+        .uid = 0,
+        .gid = 0,
+        .size = logical_block_count * default_block_size,
+        .generator = .pattern,
+        .sparse_extents = &sparse_extents,
+    }});
+    tree.bind();
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    _ = try populate(io, file, allocator, &tree.view, .{
+        .length = 16 * 1024 * 1024,
+        .uuid = [_]u8{0x73} ** 16,
+        .timestamp = 1_717_171_717,
+    });
+
+    var reader = try open(io, file, allocator, .{});
+    defer reader.deinit();
+    const inode = try reader.readInode(io, try reader.lookupPath(io, "sparse"));
+    const header = try parseExtentHeader(inode.block_bytes[0..extent_header_size]);
+    try std.testing.expectEqual(@as(u16, 1), header.depth);
+    const extents = try reader.readInodeExtentsAlloc(io, allocator, inode);
+    defer allocator.free(extents);
+    try std.testing.expectEqual(@as(usize, 6), extents.len);
+    for (extents, 0..) |extent, index| {
+        try std.testing.expect(extent.initialized);
+        try std.testing.expect(extent.start_block != 0);
+        try std.testing.expectEqual(@as(u32, @intCast(index * 2)), extent.logical_block);
+        try std.testing.expectEqual(@as(u16, 1), extent.block_count);
+    }
+
+    const contents = try reader.readFileAlloc(io, allocator, "sparse");
+    defer allocator.free(contents);
+    var expected: [default_block_size]u8 = undefined;
+    for (0..logical_block_count) |logical_block| {
+        const start = logical_block * default_block_size;
+        const actual = contents[start .. start + default_block_size];
+        if (logical_block % 2 == 1) {
+            try std.testing.expect(allZero(actual));
+        } else {
+            fillPattern(&expected, start);
+            try std.testing.expectEqualSlices(u8, &expected, actual);
+        }
+    }
+
+    try expectE2fsckClean(path);
 }
 
 test "populate ext4 and round-trip a small tree with a multi-extent file" {
@@ -11526,10 +11594,14 @@ test "large directories use htree indexing" {
     var entries = std.array_list.Managed(InMemoryEntry).init(std.testing.allocator);
     defer entries.deinit();
     try entries.append(.{ .path = "big", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 });
-    var names: [300][16]u8 = undefined;
+    var names: [300][64]u8 = undefined;
     var index: usize = 0;
     while (index < 300) : (index += 1) {
-        const name = try std.fmt.bufPrint(&names[index], "big/file-{d:0>3}", .{index});
+        const name = try std.fmt.bufPrint(
+            &names[index],
+            "big/certificate-with-a-name-longer-than-32-bytes-{d:0>3}",
+            .{index},
+        );
         try entries.append(.{
             .path = name,
             .kind = .file,
@@ -11557,9 +11629,9 @@ test "large directories use htree indexing" {
     const dir_entries = try reader.listDir(io, std.testing.allocator, "big");
     defer freeDirEntries(std.testing.allocator, dir_entries);
     try std.testing.expectEqual(@as(usize, 300), dir_entries.len);
-    _ = try reader.statPath(io, "big/file-000");
-    _ = try reader.statPath(io, "big/file-127");
-    _ = try reader.statPath(io, "big/file-299");
+    _ = try reader.statPath(io, "big/certificate-with-a-name-longer-than-32-bytes-000");
+    _ = try reader.statPath(io, "big/certificate-with-a-name-longer-than-32-bytes-127");
+    _ = try reader.statPath(io, "big/certificate-with-a-name-longer-than-32-bytes-299");
 
     const dir_inode = try reader.readInode(io, try reader.lookupPath(io, "big"));
     try std.testing.expect(dir_inode.flags & inode_flag_index != 0);
@@ -11581,6 +11653,7 @@ test "large directories use htree indexing" {
         try std.testing.expectEqual(@as(usize, 301), strict.nodeCount());
     }
 
+    const clean_root_block = root_block;
     writeInt(u32, root_block[36..40], readInt(u32, root_block[36..40]) + 1);
     const limit = readInt(u16, root_block[32..34]);
     const count = readInt(u16, root_block[34..36]);
@@ -11604,6 +11677,12 @@ test "large directories use htree indexing" {
             .expected_length = 32 * 1024 * 1024,
         }),
     );
+    try file.writePositionalAll(
+        io,
+        &clean_root_block,
+        extents[0].start_block * default_block_size,
+    );
+    try expectE2fsckClean(path);
 }
 
 test "very large directories use multi-level htree indexing" {
@@ -14306,6 +14385,7 @@ const InMemoryEntry = struct {
     size: u64 = 0,
     bytes: []const u8 = "",
     xattrs: []const Xattr = &.{},
+    sparse_extents: []const tree_cursor.SparseExtent = &.{},
     generator: enum { none, pattern } = .none,
     device: DeviceNumbers = .{},
     hardlink_target: []const u8 = "",
@@ -14368,6 +14448,7 @@ const InMemoryTree = struct {
                 else => null,
             },
             .xattrs = entry.xattrs,
+            .sparse_extents = entry.sparse_extents,
             .device = entry.device,
             .hardlink_target = entry.hardlink_target,
             .atime = entry.atime,
