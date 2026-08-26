@@ -1185,7 +1185,7 @@ for unit in cloud-init-local.service cloud-init-network.service cloud-config.ser
   check_service "$unit"
 done
 check cloud-init-wait cloud-init status --wait
-cloud_init_status=$(cloud-init status --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+cloud_init_status=$(cloud-init status --format json | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
 check cloud-init-status-done test "$cloud_init_status" = done
 netplan_network=$(find /run/systemd/network -maxdepth 1 -name '10-netplan-*.network' -print -quit)
 check netplan-network-generated test -n "$netplan_network"
