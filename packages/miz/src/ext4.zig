@@ -10451,22 +10451,11 @@ fn strToHalfMd4Words(name: []const u8, start: usize) [8]u32 {
 
     var cursor: usize = 0;
     index = 0;
-    while (cursor + 4 <= chunk_len and index < out.len) : ({
-        cursor += 4;
-        index += 1;
-    }) {
-        const chunk = remaining[cursor .. cursor + 4];
-        out[index] = (signedByteToU32(chunk[0]) << 24) |
-            (signedByteToU32(chunk[1]) << 16) |
-            (signedByteToU32(chunk[2]) << 8) |
-            signedByteToU32(chunk[3]);
-    }
-
-    if (index < out.len) {
+    while (cursor < chunk_len and index < out.len) : (index += 1) {
         var value = pad;
-        var offset = cursor;
-        while (offset < chunk_len) : (offset += 1) {
-            value = signedByteToU32(remaining[offset]) +% (value << 8);
+        const end = @min(cursor + 4, chunk_len);
+        while (cursor < end) : (cursor += 1) {
+            value = signedByteToU32(remaining[cursor]) +% (value << 8);
         }
         out[index] = value;
     }
@@ -10491,6 +10480,9 @@ fn dirHash(name: []const u8) u32 {
     return hash;
 }
 
+const unicode_certificate_name =
+    "NetLock_Arany_=Class_Gold=_F\xc5\x91tan\xc3\xbas\xc3\xadtv\xc3\xa1ny.crt";
+
 test "directory HALF_MD4 hashes match e2fsprogs across chunk boundaries" {
     try std.testing.expectEqual(@as(u32, 0x4F72_5888), dirHash("short-name"));
     try std.testing.expectEqual(
@@ -10501,6 +10493,7 @@ test "directory HALF_MD4 hashes match e2fsprogs across chunk boundaries" {
         @as(u32, 0x3AAE_8528),
         dirHash("0123456789012345678901234567890123456789"),
     );
+    try std.testing.expectEqual(@as(u32, 0xD779_DB9C), dirHash(unicode_certificate_name));
 }
 
 test "sparse files omit holes from external extent trees" {
@@ -11611,6 +11604,14 @@ test "large directories use htree indexing" {
             .size = 0,
         });
     }
+    try entries.append(.{
+        .path = "big/" ++ unicode_certificate_name,
+        .kind = .file,
+        .mode = 0o644,
+        .uid = 0,
+        .gid = 0,
+        .size = 0,
+    });
 
     var tree = InMemoryTree.init(entries.items);
     tree.bind();
@@ -11628,10 +11629,11 @@ test "large directories use htree indexing" {
 
     const dir_entries = try reader.listDir(io, std.testing.allocator, "big");
     defer freeDirEntries(std.testing.allocator, dir_entries);
-    try std.testing.expectEqual(@as(usize, 300), dir_entries.len);
+    try std.testing.expectEqual(@as(usize, 301), dir_entries.len);
     _ = try reader.statPath(io, "big/certificate-with-a-name-longer-than-32-bytes-000");
     _ = try reader.statPath(io, "big/certificate-with-a-name-longer-than-32-bytes-127");
     _ = try reader.statPath(io, "big/certificate-with-a-name-longer-than-32-bytes-299");
+    _ = try reader.statPath(io, "big/" ++ unicode_certificate_name);
 
     const dir_inode = try reader.readInode(io, try reader.lookupPath(io, "big"));
     try std.testing.expect(dir_inode.flags & inode_flag_index != 0);
@@ -11650,7 +11652,7 @@ test "large directories use htree indexing" {
             .expected_length = 32 * 1024 * 1024,
         });
         defer strict.deinit();
-        try std.testing.expectEqual(@as(usize, 301), strict.nodeCount());
+        try std.testing.expectEqual(@as(usize, 302), strict.nodeCount());
     }
 
     const clean_root_block = root_block;
