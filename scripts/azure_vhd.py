@@ -13,6 +13,7 @@ from pathlib import Path
 AZURE_VHD_ALIGNMENT = 1024 * 1024
 VHD_FOOTER_BYTES = 512
 VHD_MAX_CHS_SECTORS = 65535 * 16 * 255
+MIZ_CREATOR_APPLICATION = b"miz "
 
 
 def fail(message: str) -> None:
@@ -72,7 +73,7 @@ def validate_azure_vhd_footer(
     if features != 2 or version != 0x00010000:
         fail("derived upload VHD footer version is invalid")
     if (
-        footer[28:32] != b"miz\0"
+        footer[28:32] != MIZ_CREATOR_APPLICATION
         or creator_version != 0x00010000
         or footer[36:40] != b"\0" * 4
     ):

@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import ubuntu2604_release as release
+from scripts.azure_vhd import MIZ_CREATOR_APPLICATION
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,7 +56,7 @@ def fixed_vhd_footer(virtual_size: int) -> bytes:
     footer[:8] = b"conectix"
     struct.pack_into(">II", footer, 8, 2, 0x00010000)
     struct.pack_into(">Q", footer, 16, 0xFFFFFFFFFFFFFFFF)
-    footer[28:32] = b"miz\0"
+    footer[28:32] = MIZ_CREATOR_APPLICATION
     struct.pack_into(">I", footer, 32, 0x00010000)
     struct.pack_into(">QQ", footer, 40, virtual_size, virtual_size)
     struct.pack_into(">HBB", footer, 56, *fixed_vhd_geometry(virtual_size))
