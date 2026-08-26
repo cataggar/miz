@@ -429,6 +429,7 @@ test "Footer encode/decode round-trip" {
     const encoded = footer.encode();
 
     try std.testing.expectEqualSlices(u8, &cookie_conectix, encoded[0..8]);
+    try std.testing.expectEqualSlices(u8, &creator_app_miz, encoded[28..32]);
 
     const decoded = try Footer.decode(&encoded);
     try std.testing.expectEqual(footer.current_size, decoded.current_size);

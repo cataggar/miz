@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import azurelinux4_release as release
+from scripts.azure_vhd import MIZ_CREATOR_APPLICATION
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,7 +56,7 @@ def fixed_vhd_footer(virtual_size: int, disk_type: int = 2) -> bytes:
     footer[:8] = b"conectix"
     struct.pack_into(">II", footer, 8, 2, 0x00010000)
     struct.pack_into(">Q", footer, 16, 0xFFFFFFFFFFFFFFFF)
-    footer[28:32] = b"miz\0"
+    footer[28:32] = MIZ_CREATOR_APPLICATION
     struct.pack_into(">I", footer, 32, 0x00010000)
     struct.pack_into(">QQ", footer, 40, virtual_size, virtual_size)
     struct.pack_into(">HBB", footer, 56, *fixed_vhd_geometry(virtual_size))
@@ -616,6 +617,22 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         footer[64:68] = b"\0" * 4
         struct.pack_into(">I", footer, 64, (~sum(footer)) & 0xFFFFFFFF)
         with self.assertRaisesRegex(SystemExit, "cookie"):
+            release.validate_azure_vhd_info(
+                {
+                    "format": "vpc",
+                    "virtual-size": qemu_reported_vhd_size(virtual_size),
+                },
+                virtual_size + release.VHD_FOOTER_BYTES,
+                bytes(footer),
+            )
+
+    def test_fixed_vhd_rejects_nul_padded_creator_identity(self):
+        virtual_size = 2 * release.AZURE_VHD_ALIGNMENT
+        footer = bytearray(fixed_vhd_footer(virtual_size))
+        footer[28:32] = b"miz\0"
+        footer[64:68] = b"\0" * 4
+        struct.pack_into(">I", footer, 64, (~sum(footer)) & 0xFFFFFFFF)
+        with self.assertRaisesRegex(SystemExit, "creator identity"):
             release.validate_azure_vhd_info(
                 {
                     "format": "vpc",
