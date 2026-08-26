@@ -2734,7 +2734,7 @@ const full_checks =
     \\. /etc/os-release
     \\check os-id-ubuntu test "$ID" = ubuntu
     \\check os-version-26.04 test "$VERSION_ID" = 26.04
-    \\for unit in cloud-init-local.service cloud-init.service cloud-config.service cloud-final.service walinuxagent.service ssh.service systemd-networkd.service; do
+    \\for unit in cloud-init-local.service cloud-init-network.service cloud-config.service cloud-final.service walinuxagent.service ssh.service systemd-networkd.service; do
     \\  check_service "$unit"
     \\done
     \\check cloud-init-wait cloud-init status --wait
