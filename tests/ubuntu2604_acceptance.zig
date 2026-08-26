@@ -1557,8 +1557,14 @@ fn sshOutputAlloc(
         },
         else => {},
     }
+    if (result.stdout.len != 0) {
+        std.debug.print("SSH command stdout for {s}:\n{s}\n", .{
+            instance.label,
+            result.stdout,
+        });
+    }
     if (result.stderr.len != 0) {
-        std.debug.print("SSH command failed for {s}:\n{s}\n", .{
+        std.debug.print("SSH command stderr for {s}:\n{s}\n", .{
             instance.label,
             result.stderr,
         });
@@ -2699,23 +2705,52 @@ fn readCoreSshdPid(
 
 const full_checks =
     \\set -eu
-    \\sudo -n /usr/bin/test /proc/1/exe -ef /usr/lib/systemd/systemd
-    \\test ! -e /sbin/mizinit
-    \\test ! -e /usr/bin/mizinit
-    \\test "$( . /etc/os-release; printf '%s' "$ID")" = ubuntu
-    \\test "$( . /etc/os-release; printf '%s' "$VERSION_ID")" = 26.04
+    \\check() {
+    \\  label=$1
+    \\  shift
+    \\  if "$@"; then
+    \\    printf 'PASS %s\n' "$label"
+    \\  else
+    \\    status=$?
+    \\    printf 'FAIL %s (exit %s)\n' "$label" "$status" >&2
+    \\    return "$status"
+    \\  fi
+    \\}
+    \\check_service() {
+    \\  unit=$1
+    \\  check "service-active:$unit" systemctl is-active --quiet "$unit" || {
+    \\    systemctl status --no-pager -l "$unit" >&2 || true
+    \\    return 1
+    \\  }
+    \\  check "service-enabled:$unit" systemctl is-enabled --quiet "$unit" || {
+    \\    systemctl is-enabled "$unit" >&2 || true
+    \\    return 1
+    \\  }
+    \\}
+    \\check pid1-systemd sudo -n /usr/bin/test /proc/1/exe -ef /usr/lib/systemd/systemd
+    \\check mizinit-sbin-absent test ! -e /sbin/mizinit
+    \\check mizinit-usr-bin-absent test ! -e /usr/bin/mizinit
+    \\check os-release-readable test -r /etc/os-release
+    \\. /etc/os-release
+    \\check os-id-ubuntu test "$ID" = ubuntu
+    \\check os-version-26.04 test "$VERSION_ID" = 26.04
     \\for unit in cloud-init-local.service cloud-init.service cloud-config.service cloud-final.service walinuxagent.service ssh.service systemd-networkd.service; do
-    \\  systemctl is-active --quiet "$unit"
-    \\  systemctl is-enabled --quiet "$unit"
+    \\  check_service "$unit"
     \\done
-    \\cloud-init status --wait
-    \\test "$(cloud-init status --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')" = done
-    \\test -n "$(find /run/systemd/network -maxdepth 1 -name '10-netplan-*.network' -print -quit)"
-    \\networkctl is-online --quiet
-    \\grep -Eq '^[[:space:]]*Provisioning.Agent[[:space:]]*=[[:space:]]*auto[[:space:]]*$' /etc/waagent.conf
-    \\grep -Eq '^[[:space:]]*ResourceDisk.Format[[:space:]]*=[[:space:]]*n[[:space:]]*$' /etc/waagent.conf
-    \\test -s /var/lib/cloud/instance/obj.pkl
-    \\test "$(systemctl --failed --no-legend --plain | wc -l)" -eq 0
+    \\check cloud-init-wait cloud-init status --wait
+    \\cloud_init_status=$(cloud-init status --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+    \\check cloud-init-status-done test "$cloud_init_status" = done
+    \\netplan_network=$(find /run/systemd/network -maxdepth 1 -name '10-netplan-*.network' -print -quit)
+    \\check netplan-network-generated test -n "$netplan_network"
+    \\check network-online networkctl is-online --quiet
+    \\check waagent-provisioning-agent grep -Eq '^[[:space:]]*Provisioning.Agent[[:space:]]*=[[:space:]]*auto[[:space:]]*$' /etc/waagent.conf
+    \\check waagent-resource-disk-format grep -Eq '^[[:space:]]*ResourceDisk.Format[[:space:]]*=[[:space:]]*n[[:space:]]*$' /etc/waagent.conf
+    \\check cloud-init-instance-state test -s /var/lib/cloud/instance/obj.pkl
+    \\failed_units=$(systemctl --failed --no-legend --plain)
+    \\check no-failed-units test -z "$failed_units" || {
+    \\  printf '%s\n' "$failed_units" >&2
+    \\  exit 1
+    \\}
 ;
 
 fn verifyFlavorRuntime(
@@ -2728,8 +2763,17 @@ fn verifyFlavorRuntime(
     switch (candidate.flavor) {
         .core => _ = try readCoreSshdPid(allocator, io, ssh_path, instance),
         .full => {
-            if (!try sshSucceeded(allocator, io, ssh_path, instance, full_checks))
-                return error.FullServiceContractFailed;
+            const output = sshOutputAlloc(
+                allocator,
+                io,
+                ssh_path,
+                instance,
+                full_checks,
+            ) catch |err| switch (err) {
+                error.SshCommandFailed => return error.FullServiceContractFailed,
+                else => return err,
+            };
+            allocator.free(output);
         },
     }
 }
