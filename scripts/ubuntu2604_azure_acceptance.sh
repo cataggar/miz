@@ -20,9 +20,12 @@ if [[ -z ${STATE_FILE:-} || -z ${GITHUB_RUN_ID:-} || -z ${GITHUB_RUN_ATTEMPT:-} 
   echo "::error::Azure cleanup identity is incomplete"
   exit 1
 fi
-[[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
-[[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
-[[ "$CANDIDATE_KEY" =~ ^(x86_64|aarch64)-(full|core)$ ]]
+if ! [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ &&
+        "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ &&
+        "$CANDIDATE_KEY" =~ ^(x86_64|aarch64)-(full|core)$ ]]; then
+  echo "::error::Azure cleanup identity is invalid"
+  exit 1
+fi
 
 cleanup_group() {
   [[ -s "$STATE_FILE" ]] || return 0
@@ -353,6 +356,9 @@ admin_username=miztest
 vhd="$RESULT_DIR/${CANDIDATE_KEY}.vhd"
 private_key="$RESULT_DIR/id_ed25519"
 boot_log="$RESULT_DIR/boot.log"
+boot_screenshot="$RESULT_DIR/boot-screenshot.png"
+failure_diagnostics="$RESULT_DIR/failure-diagnostics.json"
+failure_instance_view="$RESULT_DIR/failure-instance-view.json"
 sku_json="$RESULT_DIR/sku.json"
 certificate_der="$RESULT_DIR/signing-certificate.der"
 uefi_request="$RESULT_DIR/gallery-version-request.json"
@@ -374,14 +380,107 @@ if not certificate or hashlib.sha256(certificate).hexdigest() != sys.argv[2]:
 open(sys.argv[1], "wb").write(certificate)
 PY
 
+download_boot_artifact() {
+  local uri=$1
+  local output=$2
+  python3 - "$uri" "$output" <<'PY'
+import sys
+import urllib.request
+
+limit = 16 * 1024 * 1024
+with urllib.request.urlopen(sys.argv[1], timeout=60) as response:
+    content = response.read(limit + 1)
+if len(content) > limit:
+    raise SystemExit("boot diagnostic artifact exceeds the size limit")
+with open(sys.argv[2], "wb") as output:
+    output.write(content)
+PY
+}
+
+collect_failure_diagnostics() {
+  local instance_view_status=unavailable
+  local boot_log_status=unavailable
+  local boot_screenshot_status=unavailable
+  local serial_console_uri=
+  local console_screenshot_uri=
+
+  if timeout 60s az vm get-instance-view \
+      --resource-group "$resource_group" \
+      --name "$vm_name" \
+      --query 'instanceView.{statuses:statuses[].{code:code,displayStatus:displayStatus,level:level,time:time},vmAgent:vmAgent.statuses[].{code:code,displayStatus:displayStatus,level:level,time:time}}' \
+      --output json >"$failure_instance_view" 2>/dev/null; then
+    instance_view_status=retrieved
+  else
+    rm -f -- "$failure_instance_view"
+  fi
+
+  serial_console_uri=$(timeout 60s az vm get-instance-view \
+    --resource-group "$resource_group" \
+    --name "$vm_name" \
+    --query instanceView.bootDiagnostics.serialConsoleLogBlobUri \
+    --output tsv 2>/dev/null) || serial_console_uri=
+  if [[ "$serial_console_uri" == https://* ]]; then
+    if download_boot_artifact "$serial_console_uri" "$boot_log" 2>/dev/null; then
+      boot_log_status=retrieved
+    else
+      rm -f -- "$boot_log"
+    fi
+  fi
+  serial_console_uri=
+
+  if [[ "$boot_log_status" != retrieved ]]; then
+    if timeout 90s az vm boot-diagnostics get-boot-log \
+        --resource-group "$resource_group" \
+        --name "$vm_name" >"$boot_log" 2>/dev/null; then
+      boot_log_status=retrieved
+    else
+      rm -f -- "$boot_log"
+    fi
+  fi
+
+  console_screenshot_uri=$(timeout 60s az vm get-instance-view \
+    --resource-group "$resource_group" \
+    --name "$vm_name" \
+    --query instanceView.bootDiagnostics.consoleScreenshotBlobUri \
+    --output tsv 2>/dev/null) || console_screenshot_uri=
+  if [[ "$console_screenshot_uri" == https://* ]]; then
+    if download_boot_artifact \
+        "$console_screenshot_uri" "$boot_screenshot" 2>/dev/null; then
+      boot_screenshot_status=retrieved
+    else
+      rm -f -- "$boot_screenshot"
+    fi
+  fi
+  console_screenshot_uri=
+
+  python3 - "$failure_diagnostics" \
+    "$instance_view_status" "$boot_log_status" "$boot_screenshot_status" <<'PY'
+import json
+import sys
+
+path, instance_view, boot_log, boot_screenshot = sys.argv[1:]
+with open(path, "w", encoding="utf-8") as output:
+    json.dump(
+        {
+            "schema": 1,
+            "instance_view": instance_view,
+            "serial_console_log": boot_log,
+            "console_screenshot": boot_screenshot,
+        },
+        output,
+        indent=2,
+        sort_keys=True,
+    )
+    output.write("\n")
+PY
+}
+
 cleanup_on_exit() {
   status=$?
   trap - EXIT INT TERM
   if [[ "$status" -ne 0 ]] &&
       az vm show --resource-group "$resource_group" --name "$vm_name" >/dev/null 2>&1; then
-    az vm boot-diagnostics get-boot-log \
-      --resource-group "$resource_group" \
-      --name "$vm_name" >"$boot_log" 2>/dev/null || rm -f "$boot_log"
+    collect_failure_diagnostics
   fi
   rm -f -- "$vhd" "$private_key" "$private_key.pub"
   if ! cleanup_group; then
@@ -1147,8 +1246,10 @@ GUEST
     --query 'length(@)' \
     --output tsv)" = 0
 else
-  ssh "${ssh_options[@]}" "$ssh_target" '/usr/bin/bash -s' <<'GUEST'
+  ssh "${ssh_options[@]}" "$ssh_target" \
+    "/usr/bin/bash -s -- '$has_resource_disk'" <<'GUEST'
 set -euo pipefail
+has_resource_disk=$1
 check() {
   label=$1
   shift
@@ -1174,6 +1275,42 @@ check_service() {
 not_mountpoint() {
   ! mountpoint -q "$1"
 }
+validate_conventional_resource_disk() {
+  local expected=$1
+  local mount_source
+  local mount_fstype
+  local resource_disk
+  local root_source
+  local root_disk
+
+  if [[ "$expected" == false ]]; then
+    if mountpoint -q /mnt; then
+      return 1
+    fi
+    return 0
+  fi
+  [[ "$expected" == true ]] || return 1
+
+  mountpoint -q /mnt || return 1
+  mount_source=$(findmnt -n -o SOURCE --target /mnt) || return 1
+  mount_source=$(readlink -f "$mount_source") || return 1
+  mount_fstype=$(findmnt -n -o FSTYPE --target /mnt) || return 1
+  root_source=$(findmnt -n -o SOURCE --target /) || return 1
+  root_source=$(readlink -f "$root_source") || return 1
+  [[ "$mount_source" == /dev/* ]] || return 1
+  resource_disk=$(lsblk -n -o PKNAME "$mount_source") || return 1
+  root_disk=$(lsblk -n -o PKNAME "$root_source") || return 1
+  [[ -n "$resource_disk" ]] || resource_disk=${mount_source##*/}
+  [[ -n "$root_disk" ]] || root_disk=${root_source##*/}
+  [[ -n "$resource_disk" && "$resource_disk" != "$root_disk" ]] || return 1
+  [[ "$mount_fstype" == ext4 || "$mount_fstype" == xfs ]] || return 1
+  while read -r swap_device _; do
+    [[ "$swap_device" == Filename ]] && continue
+    case "$swap_device" in
+      /mnt|/mnt/*) return 1 ;;
+    esac
+  done </proc/swaps
+}
 check pid1-systemd sudo -n /usr/bin/test /proc/1/exe -ef /usr/lib/systemd/systemd
 check mizinit-sbin-absent test ! -e /sbin/mizinit
 check mizinit-usr-bin-absent test ! -e /usr/bin/mizinit
@@ -1195,7 +1332,11 @@ check waagent-resource-disk-format grep -Eq '^[[:space:]]*ResourceDisk.Format[[:
 check waagent-resource-disk-swap grep -Eq '^[[:space:]]*ResourceDisk.EnableSwap[[:space:]]*=[[:space:]]*n[[:space:]]*$' /etc/waagent.conf
 check cloud-init-instance-state test -s /var/lib/cloud/instance/obj.pkl
 check resource-disk-not-mounted not_mountpoint /d
-check conventional-resource-disk-not-mounted not_mountpoint /mnt
+check conventional-resource-disk-policy validate_conventional_resource_disk "$has_resource_disk" || {
+  findmnt -n -o SOURCE,FSTYPE,OPTIONS --target /mnt >&2 || true
+  lsblk -o NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS >&2 || true
+  exit 1
+}
 failed_units=$(systemctl --failed --no-legend --plain)
 check no-failed-units test -z "$failed_units" || {
   printf '%s\n' "$failed_units" >&2

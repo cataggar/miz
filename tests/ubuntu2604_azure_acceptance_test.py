@@ -193,8 +193,8 @@ else:
             'if [[ "$FLAVOR" == core ]]; then\n  readarray -t core_identity',
             1,
         )[1].split(
-            '\nelse\n  ssh "${ssh_options[@]}" "$ssh_target" '
-            "'/usr/bin/bash -s' <<'GUEST'",
+            '\nelse\n  ssh "${ssh_options[@]}" "$ssh_target" \\\n'
+            '    "/usr/bin/bash -s -- \'$has_resource_disk\'" <<\'GUEST\'',
             1,
         )[0]
         for required in (
@@ -226,13 +226,42 @@ else:
         self.assertIn('--contracts "$azure_contract_list"', harness)
 
         full = harness.split(
-            '\nelse\n  ssh "${ssh_options[@]}" "$ssh_target" '
-            "'/usr/bin/bash -s' <<'GUEST'",
+            '\nelse\n  ssh "${ssh_options[@]}" "$ssh_target" \\\n'
+            '    "/usr/bin/bash -s -- \'$has_resource_disk\'" <<\'GUEST\'',
             1,
         )[1].split("\nfi\n", 1)[0]
         self.assertIn("/proc/1/exe -ef /usr/lib/systemd/systemd", full)
         self.assertIn("cloud-init status --wait", full)
         self.assertIn("walinuxagent.service", full)
+        self.assertIn("validate_conventional_resource_disk", full)
+        self.assertIn('mountpoint -q /mnt || return 1', full)
+        self.assertIn('"$resource_disk" != "$root_disk"', full)
+        self.assertIn("/mnt/*) return 1", full)
+        self.assertNotIn(
+            "conventional-resource-disk-not-mounted not_mountpoint /mnt",
+            full,
+        )
+
+    def test_failure_diagnostics_do_not_persist_boot_diagnostic_sas_uris(
+        self,
+    ) -> None:
+        harness = SCRIPT.read_text(encoding="utf-8")
+        diagnostics = harness.split(
+            "collect_failure_diagnostics() {", 1
+        )[1].split("\n}\n\ncleanup_on_exit()", 1)[0]
+        self.assertIn(
+            "instanceView.bootDiagnostics.serialConsoleLogBlobUri",
+            diagnostics,
+        )
+        self.assertIn(
+            "instanceView.bootDiagnostics.consoleScreenshotBlobUri",
+            diagnostics,
+        )
+        self.assertIn('serial_console_uri=\n', diagnostics)
+        self.assertIn('console_screenshot_uri=\n', diagnostics)
+        self.assertIn('"serial_console_log": boot_log', diagnostics)
+        self.assertNotIn("json.dump(serial_console_uri", diagnostics)
+        self.assertNotIn("json.dump(console_screenshot_uri", diagnostics)
 
     def test_binder_probe_is_required_only_for_core_flavor(self) -> None:
         harness = SCRIPT.read_text(encoding="utf-8")

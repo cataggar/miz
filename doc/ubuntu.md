@@ -150,8 +150,9 @@ release, backing file, or wrong virtual size.
 The generalized full guest uses:
 
 - systemd, cloud-init with only the Azure datasource, and WALinuxAgent with
-  agent provisioning enabled while resource-disk formatting and swap remain
-  disabled;
+  agent provisioning enabled while WALinuxAgent resource-disk formatting and
+  swap remain disabled; cloud-init mounts an available Azure temporary disk at
+  the conventional `/mnt` path without swap;
 - cloud-init growpart and root-filesystem resize;
 - netplan rendered by systemd-networkd with DHCPv4 and DHCPv6;
 - OpenSSH with password and keyboard-interactive authentication disabled;
