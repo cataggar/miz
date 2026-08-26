@@ -1130,6 +1130,23 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                 original_root_size + 1024 * 1024 * 1024,
             )
 
+    def test_azure_full_service_contract_matches_ubuntu_2604(self):
+        script = (ROOT / "scripts/ubuntu2604_azure_acceptance.sh").read_text()
+        self.assertIn("cloud-init-network.service", script)
+        self.assertNotIn("cloud-init.service", script)
+        self.assertIn(
+            "check network-online systemctl is-active --quiet "
+            "network-online.target",
+            script,
+        )
+        self.assertNotIn("networkctl is-online", script)
+        self.assertIn("FAIL %s (exit %s)", script)
+        self.assertIn(
+            "failed_units=$(systemctl --failed --no-legend --plain)",
+            script,
+        )
+        self.assertIn("check no-failed-units test -z", script)
+
     def test_core_azure_contract_set_covers_appliance_acceptance(self):
         self.assertEqual(
             release.CORE_AZURE_CONTRACTS,
