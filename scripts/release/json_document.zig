@@ -12,10 +12,12 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+const Dir = std.Io.Dir;
 const Io = std.Io;
 const Writer = std.Io.Writer;
 const contract = @import("contract.zig");
 const file_support = @import("file.zig");
+const TempTree = @import("testing.zig").TempTree;
 
 pub const Diagnostic = contract.Diagnostic;
 
@@ -259,26 +261,40 @@ fn parseForTest(text: []const u8) !std.json.Parsed(std.json.Value) {
     );
 }
 
+/// Builds the exact text a Python `fail()` would have produced for `path`, so
+/// the assertions stay literal even though the fixture path is now unique to
+/// this test.
+fn expectDiagnostic(
+    diagnostic: *const Diagnostic,
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    const expected = try std.fmt.allocPrint(std.testing.allocator, fmt, args);
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, diagnostic.message());
+}
+
 test "readObject reports the Python failure text for every rejection" {
     const io = std.testing.io;
     var diagnostic: Diagnostic = .{};
+    var tree = TempTree.create();
+    defer tree.deinit();
 
+    var absent_buffer: [TempTree.max_path_len]u8 = undefined;
+    const absent = tree.path(&absent_buffer, "absent.json");
     try std.testing.expectError(error.CannotRead, readObject(
         std.testing.allocator,
         io,
-        "test-release-json-absent.json",
+        absent,
         testing_max_bytes,
         &diagnostic,
     ));
-    try std.testing.expectEqualStrings(
-        "cannot read test-release-json-absent.json: FileNotFound",
-        diagnostic.message(),
-    );
+    try expectDiagnostic(&diagnostic, "cannot read {s}: FileNotFound", .{absent});
 
-    const path = "test-release-json-document.json";
-    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var path_buffer: [TempTree.max_path_len]u8 = undefined;
+    const path = tree.path(&path_buffer, "document.json");
 
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "{" });
+    try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "{" });
     try std.testing.expectError(error.CannotRead, readObject(
         std.testing.allocator,
         io,
@@ -286,13 +302,15 @@ test "readObject reports the Python failure text for every rejection" {
         testing_max_bytes,
         &diagnostic,
     ));
-    try std.testing.expect(std.mem.startsWith(
-        u8,
-        diagnostic.message(),
-        "cannot read test-release-json-document.json: ",
-    ));
+    const prefix = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "cannot read {s}: ",
+        .{path},
+    );
+    defer std.testing.allocator.free(prefix);
+    try std.testing.expect(std.mem.startsWith(u8, diagnostic.message(), prefix));
 
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "[1, 2]" });
+    try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "[1, 2]" });
     try std.testing.expectError(error.NotAnObject, readObject(
         std.testing.allocator,
         io,
@@ -300,12 +318,9 @@ test "readObject reports the Python failure text for every rejection" {
         testing_max_bytes,
         &diagnostic,
     ));
-    try std.testing.expectEqualStrings(
-        "test-release-json-document.json must contain a JSON object",
-        diagnostic.message(),
-    );
+    try expectDiagnostic(&diagnostic, "{s} must contain a JSON object", .{path});
 
-    try std.Io.Dir.cwd().writeFile(io, .{
+    try Dir.cwd().writeFile(io, .{
         .sub_path = path,
         .data = "{\"format\": \"vpc\"}",
     });
@@ -326,10 +341,12 @@ test "readObject reports the Python failure text for every rejection" {
 test "readObject enforces the byte bound and valid UTF-8" {
     const io = std.testing.io;
     var diagnostic: Diagnostic = .{};
-    const path = "test-release-json-bounded.json";
-    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var tree = TempTree.create();
+    defer tree.deinit();
+    var path_buffer: [TempTree.max_path_len]u8 = undefined;
+    const path = tree.path(&path_buffer, "bounded.json");
 
-    try std.Io.Dir.cwd().writeFile(io, .{
+    try Dir.cwd().writeFile(io, .{
         .sub_path = path,
         .data = "{\"key\": \"value\"}",
     });
@@ -340,12 +357,9 @@ test "readObject enforces the byte bound and valid UTF-8" {
         4,
         &diagnostic,
     ));
-    try std.testing.expectEqualStrings(
-        "cannot read test-release-json-bounded.json: FileTooLarge",
-        diagnostic.message(),
-    );
+    try expectDiagnostic(&diagnostic, "cannot read {s}: FileTooLarge", .{path});
 
-    try std.Io.Dir.cwd().writeFile(io, .{
+    try Dir.cwd().writeFile(io, .{
         .sub_path = path,
         .data = "{\"key\": \"\xff\xfe\"}",
     });
@@ -356,10 +370,7 @@ test "readObject enforces the byte bound and valid UTF-8" {
         testing_max_bytes,
         &diagnostic,
     ));
-    try std.testing.expectEqualStrings(
-        "cannot read test-release-json-bounded.json: InvalidUtf8",
-        diagnostic.message(),
-    );
+    try expectDiagnostic(&diagnostic, "cannot read {s}: InvalidUtf8", .{path});
 }
 
 test "strict accessors separate missing from wrong-typed" {
@@ -474,8 +485,10 @@ test "canonical output escapes non-ASCII and rejects floats" {
 
 test "writeDocument replaces the destination with canonical bytes" {
     const io = std.testing.io;
-    const path = "test-release-json-write.json";
-    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var tree = TempTree.create();
+    defer tree.deinit();
+    var path_buffer: [TempTree.max_path_len]u8 = undefined;
+    const path = tree.path(&path_buffer, "written.json");
 
     var parsed = try parseForTest(
         \\{"b": 2, "a": 1}

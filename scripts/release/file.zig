@@ -12,6 +12,7 @@ const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const File = std.Io.File;
 const Io = std.Io;
+const TempTree = @import("testing.zig").TempTree;
 
 /// Failures this module adds on top of the underlying I/O errors.
 pub const ReadError = error{
@@ -154,8 +155,10 @@ pub fn writeAtomic(io: Io, path: []const u8, data: []const u8) !void {
 
 test "readBounded refuses a file above the limit before allocating" {
     const io = std.testing.io;
-    const path = "test-release-file-bounded.bin";
-    defer Dir.cwd().deleteFile(io, path) catch {};
+    var tree = TempTree.create();
+    defer tree.deinit();
+    var buffer: [TempTree.max_path_len]u8 = undefined;
+    const path = tree.path(&buffer, "bounded.bin");
     try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "0123456789" });
 
     try std.testing.expectError(
@@ -170,10 +173,13 @@ test "readBounded refuses a file above the limit before allocating" {
 
 test "readBounded rejects a directory and a missing path" {
     const io = std.testing.io;
-    const directory = "test-release-file-directory";
-    Dir.cwd().deleteTree(io, directory) catch {};
+    var tree = TempTree.create();
+    defer tree.deinit();
+    var directory_buffer: [TempTree.max_path_len]u8 = undefined;
+    const directory = tree.path(&directory_buffer, "directory");
     try Dir.cwd().createDirPath(io, directory);
-    defer Dir.cwd().deleteTree(io, directory) catch {};
+    var absent_buffer: [TempTree.max_path_len]u8 = undefined;
+    const absent = tree.path(&absent_buffer, "absent.bin");
 
     try std.testing.expectError(
         error.IsDir,
@@ -181,14 +187,16 @@ test "readBounded rejects a directory and a missing path" {
     );
     try std.testing.expectError(
         error.FileNotFound,
-        readBounded(std.testing.allocator, io, "test-release-file-absent", 1024),
+        readBounded(std.testing.allocator, io, absent, 1024),
     );
 }
 
 test "readTrailer returns only the trailing window" {
     const io = std.testing.io;
-    const path = "test-release-file-trailer.bin";
-    defer Dir.cwd().deleteFile(io, path) catch {};
+    var tree = TempTree.create();
+    defer tree.deinit();
+    var path_buffer: [TempTree.max_path_len]u8 = undefined;
+    const path = tree.path(&path_buffer, "trailer.bin");
     try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "headertrailer" });
 
     var buffer: [7]u8 = undefined;
@@ -205,11 +213,13 @@ test "readTrailer returns only the trailing window" {
 
 test "writeAtomic creates parents and replaces existing content" {
     const io = std.testing.io;
-    const root = "test-release-file-atomic";
-    Dir.cwd().deleteTree(io, root) catch {};
-    defer Dir.cwd().deleteTree(io, root) catch {};
+    var tree = TempTree.create();
+    defer tree.deinit();
+    var parent_buffer: [TempTree.max_path_len]u8 = undefined;
+    const parent = tree.path(&parent_buffer, "nested");
+    var path_buffer: [TempTree.max_path_len]u8 = undefined;
+    const path = tree.path(&path_buffer, "nested/document.json");
 
-    const path = root ++ "/nested/document.json";
     try writeAtomic(io, path, "first\n");
     const first = try readBounded(std.testing.allocator, io, path, 1024);
     defer std.testing.allocator.free(first);
@@ -221,7 +231,7 @@ test "writeAtomic creates parents and replaces existing content" {
     try std.testing.expectEqualStrings("second\n", second);
 
     // No stage file is left behind next to the destination.
-    var directory = try Dir.cwd().openDir(io, root ++ "/nested", .{ .iterate = true });
+    var directory = try Dir.cwd().openDir(io, parent, .{ .iterate = true });
     defer directory.close(io);
     var iterator = directory.iterate();
     var entries: usize = 0;
@@ -234,15 +244,16 @@ test "writeAtomic creates parents and replaces existing content" {
 
 test "regularFileSize reports the size and rejects directories" {
     const io = std.testing.io;
-    const path = "test-release-file-size.bin";
-    defer Dir.cwd().deleteFile(io, path) catch {};
+    var tree = TempTree.create();
+    defer tree.deinit();
+    var path_buffer: [TempTree.max_path_len]u8 = undefined;
+    const path = tree.path(&path_buffer, "size.bin");
     try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "abcd" });
     try std.testing.expectEqual(@as(u64, 4), try regularFileSize(io, path));
 
-    const directory = "test-release-file-size-directory";
-    Dir.cwd().deleteTree(io, directory) catch {};
+    var directory_buffer: [TempTree.max_path_len]u8 = undefined;
+    const directory = tree.path(&directory_buffer, "size-directory");
     try Dir.cwd().createDirPath(io, directory);
-    defer Dir.cwd().deleteTree(io, directory) catch {};
     try std.testing.expectError(
         error.NotRegularFile,
         regularFileSize(io, directory),

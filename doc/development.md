@@ -306,10 +306,14 @@ explicit, reviewable inventory of what is left:
 
 - every tracked `*.py` file, which is removed whole by its port; and
 - every *invocation site* in any other tracked file, with an exact count. An
-  invocation site is a lowercase `python`, `python3`, or `python3.12` token
-  used as a command: quoted in an `argv` array, preceded by `env`, or followed
-  by an argument. A token followed by a bare word is a package list or a
-  tool-presence check, and a capitalized mention is prose, so neither counts.
+  invocation site is a word whose final path component is a lowercase
+  `python`, `python3`, or `python3.12` and that is used as a command: spelled
+  as an absolute or relative interpreter path, including a shebang, quoted in
+  an `argv` array, preceded by `env`, or followed by an argument. A bare token
+  followed by a bare word is a package list or a tool-presence check, a word
+  whose final component is not the interpreter is a library directory
+  (`/usr/lib/pythonN/dist-packages`) or a package (`python3-libs`), and a
+  capitalized mention is prose, so none of those count.
 
 Because only commands are counted, a doc comment explaining what a Zig module
 replaced never enters the inventory, and the list can only shrink as ports

@@ -14,6 +14,7 @@ const File = std.Io.File;
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const file_support = @import("file.zig");
+const TempTree = @import("testing.zig").TempTree;
 
 pub const Identity = file_support.Identity;
 
@@ -140,8 +141,10 @@ test "parseHex accepts canonical spellings and rejects the rest" {
 
 test "hashFile streams past the block size and enforces the bound" {
     const io = std.testing.io;
-    const path = "test-release-digest.bin";
-    defer Dir.cwd().deleteFile(io, path) catch {};
+    var tree = TempTree.create();
+    defer tree.deinit();
+    var path_buffer: [TempTree.max_path_len]u8 = undefined;
+    const path = tree.path(&path_buffer, "streamed.bin");
 
     const size = block_bytes + 4096;
     const data = try std.testing.allocator.alloc(u8, size);
@@ -161,17 +164,14 @@ test "hashFile streams past the block size and enforces the bound" {
 
 test "hashFile rejects a missing file and a directory" {
     const io = std.testing.io;
-    try std.testing.expectError(
-        error.FileNotFound,
-        hashFile(io, "test-release-digest-absent.bin", 1024),
-    );
+    var tree = TempTree.create();
+    defer tree.deinit();
+    var absent_buffer: [TempTree.max_path_len]u8 = undefined;
+    const absent = tree.path(&absent_buffer, "absent.bin");
+    try std.testing.expectError(error.FileNotFound, hashFile(io, absent, 1024));
 
-    const directory = "test-release-digest-directory";
-    Dir.cwd().deleteTree(io, directory) catch {};
+    var directory_buffer: [TempTree.max_path_len]u8 = undefined;
+    const directory = tree.path(&directory_buffer, "directory");
     try Dir.cwd().createDirPath(io, directory);
-    defer Dir.cwd().deleteTree(io, directory) catch {};
-    try std.testing.expectError(
-        error.IsDir,
-        hashFile(io, directory, 1024),
-    );
+    try std.testing.expectError(error.IsDir, hashFile(io, directory, 1024));
 }

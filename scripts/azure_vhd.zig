@@ -20,6 +20,7 @@
 const std = @import("std");
 const miz = @import("miz");
 const release = @import("release/root.zig");
+const TempTree = @import("release/testing.zig").TempTree;
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -963,10 +964,12 @@ test "inspect validates a real file pair and reports its sizes" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     const current_size = 4 * 1024 * 1024;
-    const vhd_path = "test-azure-vhd-inspect.vhd";
-    const info_path = "test-azure-vhd-inspect.json";
-    defer Dir.cwd().deleteFile(io, vhd_path) catch {};
-    defer Dir.cwd().deleteFile(io, info_path) catch {};
+    var tree = TempTree.create();
+    defer tree.deinit();
+    var vhd_buffer: [TempTree.max_path_len]u8 = undefined;
+    const vhd_path = tree.path(&vhd_buffer, "inspect.vhd");
+    var info_buffer: [TempTree.max_path_len]u8 = undefined;
+    const info_path = tree.path(&info_buffer, "inspect.json");
 
     const payload = try allocator.alloc(u8, current_size + footer_bytes);
     defer allocator.free(payload);
@@ -997,14 +1000,25 @@ test "inspect validates a real file pair and reports its sizes" {
     );
 }
 
+fn expectMessage(
+    context: *const Context,
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    const expected = try std.fmt.allocPrint(std.testing.allocator, fmt, args);
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, context.message());
+}
+
 test "inspect reports missing, truncated, and unreadable inputs" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const vhd_path = "test-azure-vhd-missing.vhd";
-    const info_path = "test-azure-vhd-missing.json";
-    defer Dir.cwd().deleteFile(io, vhd_path) catch {};
-    defer Dir.cwd().deleteFile(io, info_path) catch {};
-    Dir.cwd().deleteFile(io, vhd_path) catch {};
+    var tree = TempTree.create();
+    defer tree.deinit();
+    var vhd_buffer: [TempTree.max_path_len]u8 = undefined;
+    const vhd_path = tree.path(&vhd_buffer, "missing.vhd");
+    var info_buffer: [TempTree.max_path_len]u8 = undefined;
+    const info_path = tree.path(&info_buffer, "missing.json");
 
     var context: Context = .{};
     try std.testing.expectError(
@@ -1041,10 +1055,7 @@ test "inspect reports missing, truncated, and unreadable inputs" {
         error.CannotRead,
         inspect(allocator, io, info_path, vhd_path, &context),
     );
-    try std.testing.expectEqualStrings(
-        "cannot read " ++ info_path ++ ": FileNotFound",
-        context.message(),
-    );
+    try expectMessage(&context, "cannot read {s}: FileNotFound", .{info_path});
 
     try Dir.cwd().writeFile(io, .{ .sub_path = info_path, .data = "[]" });
     context = .{};
@@ -1052,10 +1063,7 @@ test "inspect reports missing, truncated, and unreadable inputs" {
         error.NotAnObject,
         inspect(allocator, io, info_path, vhd_path, &context),
     );
-    try std.testing.expectEqualStrings(
-        info_path ++ " must contain a JSON object",
-        context.message(),
-    );
+    try expectMessage(&context, "{s} must contain a JSON object", .{info_path});
 }
 
 test "argument parsing mirrors the Python command line" {

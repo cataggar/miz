@@ -318,9 +318,11 @@ const remaining_execution_sites = 119;
 /// large blob from being read into memory by this scan.
 const max_tracked_file_bytes = 4 * 1024 * 1024;
 
-/// Characters that continue a word for the purpose of token boundaries.
-/// `-`, `.`, and `/` are included so `python3-libs`, `python3.12-dev`, and
-/// `/usr/lib/python3/dist-packages` are never mistaken for a command.
+/// Characters that continue a word. `-`, `.`, and `/` are included so a
+/// command is read as one whole word: `python3-libs` and
+/// `/usr/lib/python3/dist-packages` are single words whose final component is
+/// not the interpreter, while `/usr/bin/python3` is a single word whose final
+/// component is.
 fn isWordByte(byte: u8) bool {
     return switch (byte) {
         'a'...'z', 'A'...'Z', '0'...'9', '_', '.', '/', '-' => true,
@@ -328,38 +330,42 @@ fn isWordByte(byte: u8) bool {
     };
 }
 
-/// End of a lowercase `python`, `python3`, or `python3.12` token starting at
-/// `start`, or null when no such token starts there. The spelling is
-/// deliberately case-sensitive: a command is lowercase, while prose about the
-/// language is capitalized.
-fn tokenEnd(line: []const u8, start: usize) ?usize {
-    if (!std.mem.startsWith(u8, line[start..], "python")) return null;
-    var index = start + "python".len;
-    if (index < line.len and std.ascii.isDigit(line[index])) {
-        while (index < line.len and std.ascii.isDigit(line[index])) index += 1;
-        if (index + 1 < line.len and
-            line[index] == '.' and
-            std.ascii.isDigit(line[index + 1]))
-        {
-            index += 1;
-            while (index < line.len and std.ascii.isDigit(line[index])) index += 1;
-        }
-    }
-    return index;
+/// Whether `name` is exactly a lowercase `python`, `python3`, or `python3.12`.
+/// The spelling is deliberately case-sensitive: a command is lowercase, while
+/// prose about the language is capitalized.
+fn isInterpreterName(name: []const u8) bool {
+    if (!std.mem.startsWith(u8, name, "python")) return false;
+    var index = "python".len;
+    if (index == name.len) return true;
+    if (!std.ascii.isDigit(name[index])) return false;
+    while (index < name.len and std.ascii.isDigit(name[index])) index += 1;
+    if (index == name.len) return true;
+    if (name[index] != '.') return false;
+    index += 1;
+    if (index == name.len) return false;
+    while (index < name.len and std.ascii.isDigit(name[index])) index += 1;
+    return index == name.len;
 }
 
-/// Whether a Python token spanning `[start, end)` is being used as a command.
+/// Whether an interpreter word spanning `[start, end)` is being used as a
+/// command.
 ///
-/// Three spellings count, and they are the only ones this repository uses:
+/// Four spellings count, and they cover everything this repository could
+/// plausibly write:
 ///
+/// * a path spelling -- `/usr/bin/python3`, `#!/usr/bin/python3`,
+///   `./.venv/bin/python3` -- which names the interpreter outright and is a
+///   command wherever it appears;
 /// * `"python3"` as an element of an `argv` array;
 /// * `env python3`, which covers both a real `env` exec and a shebang; and
-/// * a token followed by an argument, meaning an option, a redirect or line
-///   continuation, a quoted or shell-expanded word, a path, or a `.py` file.
+/// * a bare token followed by an argument, meaning an option, a redirect or
+///   line continuation, a quoted or shell-expanded word, a path, or a `.py`
+///   file.
 ///
-/// A token followed by a bare word is not a command: that is a package list
-/// (`file jq python3 systemd-boot-efi`) or a tool-presence loop.
-fn isCommandUse(line: []const u8, start: usize, end: usize) bool {
+/// A bare token followed by a bare word is not a command: that is a package
+/// list (`file jq python3 systemd-boot-efi`) or a tool-presence loop.
+fn isCommandUse(line: []const u8, start: usize, end: usize, path_spelled: bool) bool {
+    if (path_spelled) return true;
     if (start > 0 and line[start - 1] == '"' and
         end < line.len and line[end] == '"') return true;
     if (start >= 4 and std.mem.eql(u8, line[start - 4 .. start], "env ")) return true;
@@ -378,19 +384,25 @@ fn isCommandUse(line: []const u8, start: usize, end: usize) bool {
     return std.mem.endsWith(u8, word, ".py");
 }
 
-/// Invocation sites on one line.
+/// Invocation sites on one line. The line is split into whole words so a word
+/// is judged by its final path component: `/usr/bin/python3` is the
+/// interpreter, `/usr/lib/python3/dist-packages` is a library directory, and
+/// `python3-libs` is a package.
 fn scanLine(line: []const u8) usize {
     var found: usize = 0;
     var index: usize = 0;
-    while (std.mem.indexOfPos(u8, line, index, "python")) |start| {
-        const end = tokenEnd(line, start) orelse {
-            index = start + 1;
+    while (index < line.len) {
+        if (!isWordByte(line[index])) {
+            index += 1;
             continue;
-        };
-        index = end;
-        if (start > 0 and isWordByte(line[start - 1])) continue;
-        if (end < line.len and isWordByte(line[end])) continue;
-        if (isCommandUse(line, start, end)) found += 1;
+        }
+        const start = index;
+        while (index < line.len and isWordByte(line[index])) index += 1;
+        const word = line[start..index];
+        const separator = std.mem.lastIndexOfScalar(u8, word, '/');
+        const name = if (separator) |at| word[at + 1 ..] else word;
+        if (!isInterpreterName(name)) continue;
+        if (isCommandUse(line, start, index, separator != null)) found += 1;
     }
     return found;
 }
@@ -629,6 +641,12 @@ test "command spellings this repository uses are detected" {
         "        .interpreter = \"/usr/bin/env python3\",",
         "python3.12 -m venv .venv",
         "python <<'PY'",
+        "/usr/bin/python3 -c 'import sys'",
+        "#!/usr/bin/python3",
+        "#!/usr/bin/python3 -u",
+        "        ./.venv/bin/python3 -m pip install --require-hashes -r r.txt",
+        "        .argv = &.{ \"/usr/bin/python3\", \"-c\", script },",
+        "exec /usr/local/bin/python3.12 \"$@\"",
     };
     for (commands) |line| {
         try std.testing.expectEqual(@as(usize, 1), scanLine(line));
@@ -642,6 +660,9 @@ test "package names, tool checks, paths, and prose are not invocations" {
         "  for tool in python3 sha256sum; do",
         "            file jq python3 systemd-boot-efi",
         "  /usr/lib/python3/dist-packages/cloudinit \\",
+        "\\\\  /usr/lib/python3/dist-packages/azurelinuxagent",
+        "  /usr/lib/python3.12/site-packages/pip/__init__.py",
+        "  install -d \"$root/usr/lib/python3/dist-packages\"",
         "(`systemd-boot-efi`), `python3`, `file`, and `jq`. HTTPS/OpenPGP",
         "longer installs or invokes `systemd-ukify`, `python3-pefile`, or a",
         "//! Native Zig replacement for the provisioning portion of Python",
