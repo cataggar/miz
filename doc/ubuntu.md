@@ -136,15 +136,21 @@ substrate, 30% smaller than full. Its fresh root must retain at least 768 MiB
 free after package installation and final injection; the measured free bytes,
 minimum, and virtual size are provenance fields and validation gates.
 
-Both flavors retain the Canonical Gen2 GPT layout: the root is `/dev/sda1` and
-the EFI system partition is `/dev/sda15`. Firmware directly loads the signed
-architecture-specific UKI from the removable-media fallback path
-(`EFI/BOOT/BOOTX64.EFI` or `EFI/BOOT/BOOTAA64.EFI`); shim and GRUB are not
-required for this boot path. That is the only copy. Firmware loads one binary,
-and a generalized image boots on fresh NVRAM, so the fallback is the path it
-takes. `EFI/Linux/` is the Boot Loader Specification type 2 directory, which
-needs a boot loader to scan it, and these images ship none -- a duplicate there
-would never be read, and at 62 MiB it does not fit beside the copy that boots.
+The root remains `/dev/sda1` and the EFI system partition remains
+`/dev/sda15`. x86_64 retains Canonical's Gen2 partition geometry. Arm64
+rebuilds `/dev/sda15` as a 512 MiB FAT32 ESP in the same GPT slot, preserving
+its first LBA, partition GUID, and FAT volume ID; the obsolete Canonical
+XBOOTLDR entry at `/dev/sda13` is cleared without moving the root or changing
+the disk size. The rebuilt Arm64 ESP contains only
+`EFI/BOOT/BOOTAA64.EFI`, not Canonical's stale shim/GRUB tree.
+
+Firmware directly loads the signed architecture-specific UKI from the
+removable-media fallback path (`EFI/BOOT/BOOTX64.EFI` or
+`EFI/BOOT/BOOTAA64.EFI`); shim and GRUB are not required for this boot path.
+That is the only UKI copy. Firmware loads one binary, and a generalized image
+boots on fresh NVRAM, so the fallback is the path it takes. `EFI/Linux/` is
+the Boot Loader Specification type 2 directory, which needs a boot loader to
+scan it, and these images ship none.
 
 The UKI combines the installed kernel, its newly generated initramfs, and
 matching `/lib/modules/<release>`. Which kernel is the right one is a property

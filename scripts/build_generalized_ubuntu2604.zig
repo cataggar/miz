@@ -73,6 +73,38 @@ const nvidia_bos_kernel_suffix = "-nvidia-bos-64k";
 
 const Architecture = uki_kernel_payload.Architecture;
 
+const PartitionGeometry = struct {
+    table_index: u32,
+    first_lba: u64,
+    last_lba: u64,
+};
+
+// Linux partition names are one-based, while miz.gpt.PartitionEntry.table_index
+// is the zero-based on-disk array slot: /dev/sda13 is table index 12 and
+// /dev/sda15 is table index 14.
+const arm64_source_xbootldr = PartitionGeometry{
+    .table_index = 12,
+    .first_lba = 206_848,
+    .last_lba = 2_097_152,
+};
+const arm64_source_esp = PartitionGeometry{
+    .table_index = 14,
+    .first_lba = 2_048,
+    .last_lba = 204_800,
+};
+const arm64_final_esp = PartitionGeometry{
+    .table_index = 14,
+    .first_lba = 2_048,
+    .last_lba = 1_050_623,
+};
+const arm64_root_first_lba: u64 = 2_099_200;
+const arm64_source_xbootldr_unique_guid =
+    guid.parse("f497ce52-b19b-4373-86a0-889acfa3b014");
+const arm64_source_xbootldr_filesystem_uuid = [_]u8{
+    0x3b, 0xcc, 0x3c, 0xc1, 0x48, 0x52, 0x4c, 0x15,
+    0xb4, 0x6d, 0xa6, 0xf3, 0x1d, 0xe7, 0xc1, 0x80,
+};
+
 const Flavor = enum {
     full,
     core,
@@ -2547,6 +2579,83 @@ fn removeIfPresent(filesystem: *miz.ext4_mountless.FileSystem, path: []const u8)
     };
 }
 
+const Arm64FstabLine = enum {
+    unrelated,
+    retired_xbootldr,
+    unexpected_boot_mount,
+};
+
+fn classifyArm64FstabLine(line: []const u8) Arm64FstabLine {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (trimmed.len == 0 or trimmed[0] == '#') return .unrelated;
+
+    var fields: [7][]const u8 = undefined;
+    var field_count: usize = 0;
+    var tokens = std.mem.tokenizeAny(u8, trimmed, " \t");
+    while (tokens.next()) |field| {
+        if (field_count < fields.len) fields[field_count] = field;
+        field_count += 1;
+    }
+    if (field_count < 2 or !std.mem.eql(u8, fields[1], "/boot")) {
+        return .unrelated;
+    }
+    if (field_count == 6 and
+        std.mem.eql(u8, fields[0], "LABEL=BOOT") and
+        std.mem.eql(u8, fields[2], "ext4") and
+        std.mem.eql(u8, fields[3], "defaults") and
+        std.mem.eql(u8, fields[4], "0") and
+        std.mem.eql(u8, fields[5], "2"))
+    {
+        return .retired_xbootldr;
+    }
+    return .unexpected_boot_mount;
+}
+
+fn retireArm64XbootldrFstabAlloc(
+    allocator: Allocator,
+    fstab: []const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    var removed: usize = 0;
+    var offset: usize = 0;
+    while (offset < fstab.len) {
+        const relative_newline = std.mem.indexOfScalar(u8, fstab[offset..], '\n');
+        const line_end = offset + (relative_newline orelse fstab.len - offset);
+        const segment_end = if (relative_newline == null) line_end else line_end + 1;
+        switch (classifyArm64FstabLine(fstab[offset..line_end])) {
+            .unrelated => try output.writer.writeAll(fstab[offset..segment_end]),
+            .retired_xbootldr => removed += 1,
+            .unexpected_boot_mount => return error.UnexpectedArm64BootMount,
+        }
+        offset = segment_end;
+    }
+    if (removed == 0) return error.MissingArm64XbootldrFstabEntry;
+    if (removed != 1) return error.AmbiguousArm64XbootldrFstabEntry;
+    return output.toOwnedSlice();
+}
+
+fn validateArm64XbootldrFstabRetired(fstab: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, fstab, '\n');
+    while (lines.next()) |line| {
+        if (classifyArm64FstabLine(line) != .unrelated) {
+            return error.Arm64XbootldrFstabEntryRetained;
+        }
+    }
+}
+
+fn retireArm64XbootldrMount(
+    allocator: Allocator,
+    filesystem: *miz.ext4_mountless.FileSystem,
+) !void {
+    const fstab = try filesystem.read(allocator, "/etc/fstab", 1024 * 1024);
+    defer allocator.free(fstab);
+    const rewritten = try retireArm64XbootldrFstabAlloc(allocator, fstab);
+    defer allocator.free(rewritten);
+    try validateArm64XbootldrFstabRetired(rewritten);
+    try filesystem.write("/etc/fstab", rewritten, null);
+}
+
 fn injectCoreGuest(
     allocator: Allocator,
     io: Io,
@@ -3133,6 +3242,9 @@ fn customizeRootWithDebz(
         error.PathNotFound => {},
         else => return error.UserCleanupIncomplete,
     }
+    if (profile.architecture == .aarch64 and flavor == .full) {
+        try retireArm64XbootldrMount(allocator, &native_root.filesystem);
+    }
     const filesystem_info = try native_root.finish();
     const root_free_bytes = @as(u64, filesystem_info.free_block_count) * 4096;
     try validateRootHeadroom(flavor, root_free_bytes, filesystem_info.free_inode_count);
@@ -3239,6 +3351,17 @@ fn restoreRestrictedRootEntry(
     try Dir.cwd().setFilePermissions(io, path, value, .{});
 }
 
+fn diskLayoutProvenance(profile: *const Profile) []const u8 {
+    return switch (profile.architecture) {
+        .x86_64 =>
+        \\{"source":"canonical-gen2-gpt","transform":"preserved"}
+        ,
+        .aarch64 =>
+        \\{"source":"canonical-gen2-gpt","transform":"arm64-esp-rebuild-v1","esp":{"table_index":14,"first_lba":2048,"last_lba":1050623,"size_bytes":536870912,"fat32":"reformatted-preserve-volume-id","content":"signed-fallback-only"},"retired_xbootldr":{"table_index":12,"cleared":true}}
+        ,
+    };
+}
+
 fn writeProvenance(
     allocator: Allocator,
     io: Io,
@@ -3249,7 +3372,7 @@ fn writeProvenance(
 ) !void {
     if (evidence.len != full_debz_packages.len) return error.InvalidDebzEvidence;
     const document = try std.fmt.allocPrint(allocator,
-        \\{{"schema":1,"type":"miz-ubuntu2604-build-provenance","architecture":"{s}","release":"26.04","snapshot":{{"id":"release-{s}","base_url":"{s}/"}},"canonical_key_fingerprint":"{s}","sha256sums_signature_verified":true,"artifacts":{{"sha256sums":{{"filename":"SHA256SUMS","sha256":"{s}"}},"sha256sums_signature":{{"filename":"SHA256SUMS.gpg","sha256":"{s}"}},"source_image":{{"filename":"{s}","sha256":"{s}"}},"image_manifest":{{"filename":"{s}","sha256":"{s}"}}}},"debz":{{"api_commit":"{s}","baseline":{{"source":"canonical-image-dpkg-status","enforcement":"exact-final-closure"}},"transactions":[{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}},{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}}]}}}}
+        \\{{"schema":1,"type":"miz-ubuntu2604-build-provenance","architecture":"{s}","release":"26.04","snapshot":{{"id":"release-{s}","base_url":"{s}/"}},"canonical_key_fingerprint":"{s}","sha256sums_signature_verified":true,"artifacts":{{"sha256sums":{{"filename":"SHA256SUMS","sha256":"{s}"}},"sha256sums_signature":{{"filename":"SHA256SUMS.gpg","sha256":"{s}"}},"source_image":{{"filename":"{s}","sha256":"{s}"}},"image_manifest":{{"filename":"{s}","sha256":"{s}"}}}},"disk_layout":{s},"debz":{{"api_commit":"{s}","baseline":{{"source":"canonical-image-dpkg-status","enforcement":"exact-final-closure"}},"transactions":[{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}},{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}}]}}}}
         \\
     , .{
         @tagName(profile.architecture),
@@ -3262,6 +3385,7 @@ fn writeProvenance(
         source_digest,
         profile.manifest_name,
         profile.manifest_sha256,
+        diskLayoutProvenance(profile),
         package_family.debz_api_commit,
         evidence[0].package,
         std.fs.path.basename(evidence[0].lock_path),
@@ -3311,7 +3435,7 @@ fn writeFreshRootProvenance(
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try output.writer.print(
-        "{{\"schema\":1,\"type\":\"miz-ubuntu2604-build-provenance\",\"architecture\":\"{s}\",\"flavor\":\"{s}\",\"release\":\"26.04\",\"virtual_size\":{d},\"minimum_root_free_bytes\":{d},\"validated_root_free_bytes\":{d},\"snapshot\":{{\"id\":\"release-{s}\",\"base_url\":\"{s}/\"}},\"canonical_key_fingerprint\":\"{s}\",\"sha256sums_signature_verified\":true,\"artifacts\":{{\"sha256sums\":{{\"filename\":\"SHA256SUMS\",\"sha256\":\"{s}\"}},\"sha256sums_signature\":{{\"filename\":\"SHA256SUMS.gpg\",\"sha256\":\"{s}\"}},\"source_image\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"role\":\"signed-gpt-esp-substrate\"}},\"image_manifest\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}}},\"debz\":{{\"api_commit\":\"{s}\",\"baseline\":{{\"source\":\"empty-debz-root\",\"enforcement\":\"exact-final-closure\"}},\"package_roots\":[",
+        "{{\"schema\":1,\"type\":\"miz-ubuntu2604-build-provenance\",\"architecture\":\"{s}\",\"flavor\":\"{s}\",\"release\":\"26.04\",\"virtual_size\":{d},\"minimum_root_free_bytes\":{d},\"validated_root_free_bytes\":{d},\"snapshot\":{{\"id\":\"release-{s}\",\"base_url\":\"{s}/\"}},\"canonical_key_fingerprint\":\"{s}\",\"sha256sums_signature_verified\":true,\"artifacts\":{{\"sha256sums\":{{\"filename\":\"SHA256SUMS\",\"sha256\":\"{s}\"}},\"sha256sums_signature\":{{\"filename\":\"SHA256SUMS.gpg\",\"sha256\":\"{s}\"}},\"source_image\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"role\":\"signed-gpt-esp-substrate\"}},\"image_manifest\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}}},\"disk_layout\":{s},\"debz\":{{\"api_commit\":\"{s}\",\"baseline\":{{\"source\":\"empty-debz-root\",\"enforcement\":\"exact-final-closure\"}},\"package_roots\":[",
         .{
             @tagName(profile.architecture),
             @tagName(flavor),
@@ -3327,6 +3451,7 @@ fn writeFreshRootProvenance(
             source_digest,
             profile.manifest_name,
             profile.manifest_sha256,
+            diskLayoutProvenance(profile),
             package_family.debz_api_commit,
         },
     );
@@ -3662,8 +3787,426 @@ fn espPartition(partitions: []const miz.gpt.PartitionEntry) !miz.gpt.PartitionEn
     return found orelse error.MissingEspPartition;
 }
 
+const Arm64SourceLayout = struct {
+    root: miz.gpt.PartitionEntry,
+    xbootldr: miz.gpt.PartitionEntry,
+    esp: miz.gpt.PartitionEntry,
+};
+
+fn partitionGeometryMatches(
+    partition: miz.gpt.PartitionEntry,
+    expected: PartitionGeometry,
+) bool {
+    return partition.table_index == expected.table_index and
+        partition.first_lba == expected.first_lba and
+        partition.last_lba == expected.last_lba;
+}
+
+fn findXbootldrPartition(
+    partitions: []const miz.gpt.PartitionEntry,
+) !miz.gpt.PartitionEntry {
+    var found: ?miz.gpt.PartitionEntry = null;
+    for (partitions) |partition| {
+        if (!std.mem.eql(
+            u8,
+            &partition.partition_type_guid,
+            &guid.linux_xbootldr,
+        )) continue;
+        if (found != null) return error.AmbiguousXbootldrPartition;
+        found = partition;
+    }
+    return found orelse error.MissingXbootldrPartition;
+}
+
+fn validateArm64SourceLayout(
+    verified: miz.gpt.VerifiedGpt,
+    virtual_size: u64,
+) !Arm64SourceLayout {
+    if (virtual_size == 0 or virtual_size % miz.gpt.sector_size != 0 or
+        verified.primary_header.backup_lba + 1 != virtual_size / miz.gpt.sector_size)
+    {
+        return error.UnexpectedArm64DiskSize;
+    }
+    if (verified.primary_header.num_partition_entries !=
+        miz.gpt.default_num_partition_entries or
+        verified.primary_header.partition_entry_size !=
+            miz.gpt.partition_entry_size)
+    {
+        return error.UnexpectedArm64PartitionTableShape;
+    }
+    if (verified.partitions.len != 3) return error.UnexpectedArm64PartitionCount;
+
+    const root = try findNamedRootPartition(verified.partitions);
+    if (root.table_index != 0 or
+        !std.mem.eql(u8, &root.partition_type_guid, &guid.linux_root_aarch64) or
+        root.first_lba != arm64_root_first_lba or
+        root.last_lba != verified.primary_header.last_usable_lba)
+    {
+        return error.UnexpectedArm64RootGeometry;
+    }
+    const xbootldr = try findXbootldrPartition(verified.partitions);
+    if (!partitionGeometryMatches(xbootldr, arm64_source_xbootldr) or
+        !std.mem.eql(
+            u8,
+            &xbootldr.unique_partition_guid,
+            &arm64_source_xbootldr_unique_guid,
+        ))
+    {
+        return error.UnexpectedArm64XbootldrGeometry;
+    }
+    const esp = try espPartition(verified.partitions);
+    if (!partitionGeometryMatches(esp, arm64_source_esp)) {
+        return error.UnexpectedArm64EspGeometry;
+    }
+    if (!partitionNameEquals(xbootldr, "") or !partitionNameEquals(esp, "")) {
+        return error.UnexpectedArm64AuxiliaryPartitionName;
+    }
+    if (std.mem.eql(u8, &verified.primary_header.disk_guid, &guid.nil) or
+        std.mem.eql(u8, &root.unique_partition_guid, &guid.nil) or
+        std.mem.eql(u8, &esp.unique_partition_guid, &guid.nil) or
+        std.mem.eql(u8, &root.unique_partition_guid, &esp.unique_partition_guid))
+    {
+        return error.InvalidArm64PartitionIdentity;
+    }
+    if (arm64_final_esp.last_lba >= root.first_lba) {
+        return error.Arm64EspWouldOverlapRoot;
+    }
+    return .{ .root = root, .xbootldr = xbootldr, .esp = esp };
+}
+
+fn partitionEntryBytes(
+    verified: miz.gpt.VerifiedGpt,
+    table_index: u32,
+) ![]const u8 {
+    const entry_size: usize = @intCast(verified.primary_header.partition_entry_size);
+    const start = std.math.mul(
+        usize,
+        @as(usize, @intCast(table_index)),
+        entry_size,
+    ) catch return error.InvalidPartitionArrayBounds;
+    const end = std.math.add(usize, start, entry_size) catch
+        return error.InvalidPartitionArrayBounds;
+    if (end > verified.partition_array.len) return error.InvalidPartitionArrayBounds;
+    return verified.partition_array[start..end];
+}
+
+fn validateArm64FinalLayout(
+    verified: miz.gpt.VerifiedGpt,
+    virtual_size: u64,
+) !miz.gpt.PartitionEntry {
+    if (virtual_size == 0 or virtual_size % miz.gpt.sector_size != 0 or
+        verified.primary_header.backup_lba + 1 != virtual_size / miz.gpt.sector_size)
+    {
+        return error.UnexpectedArm64DiskSize;
+    }
+    if (verified.primary_header.num_partition_entries !=
+        miz.gpt.default_num_partition_entries or
+        verified.primary_header.partition_entry_size !=
+            miz.gpt.partition_entry_size or
+        verified.partitions.len != 2)
+    {
+        return error.UnexpectedFinalArm64PartitionTable;
+    }
+    const root = try findNamedRootPartition(verified.partitions);
+    if (root.table_index != 0 or
+        !std.mem.eql(u8, &root.partition_type_guid, &guid.linux_root_aarch64) or
+        root.first_lba != arm64_root_first_lba or
+        root.last_lba != verified.primary_header.last_usable_lba)
+    {
+        return error.UnexpectedArm64RootGeometry;
+    }
+    const esp = try espPartition(verified.partitions);
+    if (!partitionGeometryMatches(esp, arm64_final_esp) or
+        !partitionNameEquals(esp, ""))
+    {
+        return error.UnexpectedArm64EspGeometry;
+    }
+    if (std.mem.eql(u8, &root.unique_partition_guid, &guid.nil) or
+        std.mem.eql(u8, &esp.unique_partition_guid, &guid.nil) or
+        std.mem.eql(u8, &root.unique_partition_guid, &esp.unique_partition_guid))
+    {
+        return error.InvalidArm64PartitionIdentity;
+    }
+    if (!std.mem.allEqual(
+        u8,
+        try partitionEntryBytes(verified, arm64_source_xbootldr.table_index),
+        0,
+    )) {
+        return error.Arm64XbootldrEntryNotCleared;
+    }
+    return esp;
+}
+
+fn validateArm64PartitionRewrite(
+    before: miz.gpt.VerifiedGpt,
+    after: miz.gpt.VerifiedGpt,
+) !void {
+    if (before.primary_header.current_lba != after.primary_header.current_lba or
+        before.primary_header.backup_lba != after.primary_header.backup_lba or
+        before.primary_header.first_usable_lba != after.primary_header.first_usable_lba or
+        before.primary_header.last_usable_lba != after.primary_header.last_usable_lba or
+        before.primary_header.partition_entry_lba != after.primary_header.partition_entry_lba or
+        before.primary_header.num_partition_entries != after.primary_header.num_partition_entries or
+        before.primary_header.partition_entry_size != after.primary_header.partition_entry_size or
+        !std.mem.eql(u8, &before.primary_header.disk_guid, &after.primary_header.disk_guid) or
+        before.backup_header.current_lba != after.backup_header.current_lba or
+        before.backup_header.partition_entry_lba != after.backup_header.partition_entry_lba or
+        before.partition_array.len != after.partition_array.len)
+    {
+        return error.Arm64GptGeometryChanged;
+    }
+
+    var index: u32 = 0;
+    while (index < before.primary_header.num_partition_entries) : (index += 1) {
+        const source = try partitionEntryBytes(before, index);
+        const final = try partitionEntryBytes(after, index);
+        if (index == arm64_source_xbootldr.table_index) {
+            if (!std.mem.allEqual(u8, final, 0))
+                return error.Arm64XbootldrEntryNotCleared;
+        } else if (index == arm64_source_esp.table_index) {
+            if (!std.mem.eql(u8, source[0..40], final[0..40]) or
+                !std.mem.eql(u8, source[48..], final[48..]) or
+                std.mem.readInt(u64, final[40..48], .little) !=
+                    arm64_final_esp.last_lba)
+            {
+                return error.Arm64EspOpaqueFieldsChanged;
+            }
+        } else if (!std.mem.eql(u8, source, final)) {
+            return error.Arm64UnrelatedPartitionEntryChanged;
+        }
+    }
+}
+
+fn reformatArm64EspFat(
+    allocator: Allocator,
+    io: Io,
+    image: *miz.Image,
+    source_esp: miz.gpt.PartitionEntry,
+    final_esp: miz.gpt.PartitionEntry,
+) !void {
+    var source_filesystem = try miz.fat32.open(image, io, .{
+        .offset = source_esp.first_lba * miz.gpt.sector_size,
+        .length = (source_esp.last_lba - source_esp.first_lba + 1) *
+            miz.gpt.sector_size,
+    });
+    const fat_metadata = source_filesystem.volumeMetadata();
+    const final_length = (final_esp.last_lba - final_esp.first_lba + 1) *
+        miz.gpt.sector_size;
+    try miz.fat32.format(image, io, .{
+        .partition_offset = final_esp.first_lba * miz.gpt.sector_size,
+        .partition_len = final_length,
+        .hidden_sectors = @intCast(final_esp.first_lba),
+        .volume_id = fat_metadata.volume_id,
+        .volume_label = fat_metadata.volume_label,
+    });
+    var rebuilt = try miz.fat32.open(image, io, .{
+        .offset = final_esp.first_lba * miz.gpt.sector_size,
+        .length = final_length,
+    });
+    const rebuilt_metadata = rebuilt.volumeMetadata();
+    if (rebuilt_metadata.volume_id != fat_metadata.volume_id) {
+        return error.Arm64EspVolumeIdChanged;
+    }
+    const entries = try rebuilt.listDirAlloc(io, allocator, "");
+    defer miz.fat32.freeDirEntries(allocator, entries);
+    if (entries.len != 0) return error.Arm64EspReformatNotEmpty;
+}
+
+const Arm64ImageReadContext = struct {
+    image: *const miz.Image,
+    io: Io,
+};
+
+fn readArm64ImageAt(
+    context: *const anyopaque,
+    io: Io,
+    buffer: []u8,
+    offset: u64,
+) anyerror!usize {
+    const read_context: *const Arm64ImageReadContext =
+        @ptrCast(@alignCast(context));
+    _ = io;
+    return read_context.image.pread(read_context.io, buffer, offset);
+}
+
+fn validateArm64XbootldrFilesystem(
+    allocator: Allocator,
+    io: Io,
+    image: *const miz.Image,
+    xbootldr: miz.gpt.PartitionEntry,
+) !void {
+    var context = Arm64ImageReadContext{ .image = image, .io = io };
+    var reader = try miz.ext4.Reader.openReadOnlySource(
+        io,
+        image.file,
+        .{
+            .ctx = &context,
+            .read_at_fn = readArm64ImageAt,
+        },
+        allocator,
+        .{ .offset = xbootldr.first_lba * miz.gpt.sector_size },
+    );
+    defer reader.deinit();
+    if (!std.mem.eql(
+        u8,
+        &reader.uuid,
+        &arm64_source_xbootldr_filesystem_uuid,
+    ) or !labelEquals(reader.label, "BOOT")) {
+        return error.UnexpectedArm64XbootldrFilesystem;
+    }
+}
+
+fn validateArm64SourceSubstrate(
+    allocator: Allocator,
+    io: Io,
+    image: *miz.Image,
+) !void {
+    var verified = try miz.gpt.readVerifiedGpt(
+        image.*,
+        io,
+        allocator,
+        miz.gpt.default_max_partition_array_bytes,
+    );
+    defer verified.deinit(allocator);
+    const source = try validateArm64SourceLayout(verified, image.virtual_size);
+    try validateArm64XbootldrFilesystem(
+        allocator,
+        io,
+        image,
+        source.xbootldr,
+    );
+    _ = try miz.fat32.open(image, io, .{
+        .offset = source.esp.first_lba * miz.gpt.sector_size,
+        .length = (source.esp.last_lba - source.esp.first_lba + 1) *
+            miz.gpt.sector_size,
+    });
+}
+
+fn rebuildArm64Esp(
+    allocator: Allocator,
+    io: Io,
+    image: *miz.Image,
+    expected_virtual_size: u64,
+) !miz.gpt.PartitionEntry {
+    if (image.virtual_size != expected_virtual_size) {
+        return error.UnexpectedArm64DiskSize;
+    }
+    var before = try miz.gpt.readVerifiedGpt(
+        image.*,
+        io,
+        allocator,
+        miz.gpt.default_max_partition_array_bytes,
+    );
+    defer before.deinit(allocator);
+    const source = try validateArm64SourceLayout(before, image.virtual_size);
+    try validateArm64XbootldrFilesystem(
+        allocator,
+        io,
+        image,
+        source.xbootldr,
+    );
+
+    try miz.gpt.rewritePartitionEntries(
+        image,
+        io,
+        allocator,
+        before,
+        &.{
+            .{ .set_last_lba = .{
+                .table_index = source.esp.table_index,
+                .expected_last_lba = source.esp.last_lba,
+                .new_last_lba = arm64_final_esp.last_lba,
+            } },
+            .{ .clear = .{ .table_index = source.xbootldr.table_index } },
+        },
+    );
+
+    var after = try miz.gpt.readVerifiedGpt(
+        image.*,
+        io,
+        allocator,
+        miz.gpt.default_max_partition_array_bytes,
+    );
+    defer after.deinit(allocator);
+    const esp = try validateArm64FinalLayout(after, image.virtual_size);
+    try validateArm64PartitionRewrite(before, after);
+    const final_root = try findNamedRootPartition(after.partitions);
+    if (!std.mem.eql(
+        u8,
+        &source.esp.unique_partition_guid,
+        &esp.unique_partition_guid,
+    ) or !std.mem.eql(
+        u8,
+        &source.root.unique_partition_guid,
+        &final_root.unique_partition_guid,
+    )) {
+        return error.Arm64PartitionIdentityChanged;
+    }
+
+    try reformatArm64EspFat(allocator, io, image, source.esp, esp);
+    return esp;
+}
+
 fn translateGuestEspCapacity(err: anyerror) anyerror {
     return if (err == error.FilesystemFull) error.GuestEspNoSpace else err;
+}
+
+fn expectOnlyEspEntry(
+    allocator: Allocator,
+    io: Io,
+    filesystem: *miz.fat32.FileSystem,
+    directory: []const u8,
+    expected_name: []const u8,
+    expected_kind: miz.fat32.DirEntryKind,
+    expected_size: u32,
+) !void {
+    const entries = try filesystem.listDirAlloc(io, allocator, directory);
+    defer miz.fat32.freeDirEntries(allocator, entries);
+    if (entries.len != 1 or
+        !std.mem.eql(u8, entries[0].name, expected_name) or
+        entries[0].kind != expected_kind or
+        entries[0].size != expected_size)
+    {
+        return error.UnexpectedArm64EspContents;
+    }
+}
+
+fn validateOnlySignedFallback(
+    allocator: Allocator,
+    io: Io,
+    filesystem: *miz.fat32.FileSystem,
+    profile: *const Profile,
+    signed_size: usize,
+) !void {
+    const file_size = std.math.cast(u32, signed_size) orelse
+        return error.FinalUkiTooLarge;
+    try expectOnlyEspEntry(
+        allocator,
+        io,
+        filesystem,
+        "",
+        "EFI",
+        .directory,
+        0,
+    );
+    try expectOnlyEspEntry(
+        allocator,
+        io,
+        filesystem,
+        "EFI",
+        "BOOT",
+        .directory,
+        0,
+    );
+    try expectOnlyEspEntry(
+        allocator,
+        io,
+        filesystem,
+        "EFI/BOOT",
+        profile.efi_fallback,
+        .file,
+        file_size,
+    );
 }
 
 fn insertSignedUki(
@@ -3672,12 +4215,17 @@ fn insertSignedUki(
     image_path: []const u8,
     signed_path: []const u8,
     profile: *const Profile,
+    expected_virtual_size: u64,
 ) !void {
     var image = try miz.Image.openPath(io, image_path);
     defer image.close(io);
-    const parsed = try miz.gpt.readGpt(image, io, allocator);
-    defer allocator.free(parsed.partitions);
-    const esp = try espPartition(parsed.partitions);
+    const esp = if (profile.architecture == .aarch64)
+        try rebuildArm64Esp(allocator, io, &image, expected_virtual_size)
+    else blk: {
+        const parsed = try miz.gpt.readGpt(image, io, allocator);
+        defer allocator.free(parsed.partitions);
+        break :blk try espPartition(parsed.partitions);
+    };
     var filesystem = try miz.fat32.open(&image, io, .{
         .offset = esp.first_lba * miz.gpt.sector_size,
         .length = (esp.last_lba - esp.first_lba + 1) * miz.gpt.sector_size,
@@ -3717,6 +4265,15 @@ fn insertSignedUki(
         }
         return err;
     };
+    if (profile.architecture == .aarch64) {
+        try validateOnlySignedFallback(
+            allocator,
+            io,
+            &filesystem,
+            profile,
+            signed.len,
+        );
+    }
 }
 
 fn validateFinalNativeImage(
@@ -3729,9 +4286,17 @@ fn validateFinalNativeImage(
 ) !void {
     var image = try miz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
-    const parsed = try miz.gpt.readGpt(image, io, allocator);
-    defer allocator.free(parsed.partitions);
-    const esp = try espPartition(parsed.partitions);
+    var parsed = try miz.gpt.readVerifiedGpt(
+        image,
+        io,
+        allocator,
+        miz.gpt.default_max_partition_array_bytes,
+    );
+    defer parsed.deinit(allocator);
+    const esp = if (profile.architecture == .aarch64)
+        try validateArm64FinalLayout(parsed, image.virtual_size)
+    else
+        try espPartition(parsed.partitions);
     var filesystem = try miz.fat32.open(&image, io, .{
         .offset = esp.first_lba * miz.gpt.sector_size,
         .length = (esp.last_lba - esp.first_lba + 1) * miz.gpt.sector_size,
@@ -3743,6 +4308,15 @@ fn validateFinalNativeImage(
     try validateUkiBytes(fallback_bytes, signed_bytes, profile);
     try validateUkiContract(allocator, fallback_bytes, expected_cmdline);
     try validateNoStaleNamedUki(allocator, io, &filesystem, profile);
+    if (profile.architecture == .aarch64) {
+        try validateOnlySignedFallback(
+            allocator,
+            io,
+            &filesystem,
+            profile,
+            signed_bytes.len,
+        );
+    }
 }
 
 /// The duplicate under EFI/Linux is gone, and it has to stay gone. A leftover from an earlier build
@@ -3900,6 +4474,9 @@ fn buildImage(
     Dir.cwd().deleteFile(io, mutable) catch {};
     var source_image = try miz.Image.openPathReadOnlyStandalone(io, source_path);
     defer source_image.close(io);
+    if (profile.architecture == .aarch64) {
+        try validateArm64SourceSubstrate(allocator, io, &source_image);
+    }
     if (args.flavor.freshRoot() and source_image.virtual_size != core_virtual_size)
         return error.UnexpectedCoreSubstrateSize;
     if (args.size < source_image.virtual_size) return error.ImageTooSmall;
@@ -4034,7 +4611,14 @@ fn buildImage(
     var qcow2_finalization = timing.begin(.qcow2_finalization, null);
     defer qcow2_finalization.end();
     errdefer |err| qcow2_finalization.fail(@errorName(err));
-    try insertSignedUki(allocator, io, mutable, signed_path, profile);
+    try insertSignedUki(
+        allocator,
+        io,
+        mutable,
+        signed_path,
+        profile,
+        args.size,
+    );
     try finalizeCompressedQcow2(allocator, io, mutable, output);
     try validateFinalQcow2(io, output, args.size);
     try validateFinalNativeImage(allocator, io, output, signed.bytes, profile, cmdline);
@@ -4050,6 +4634,11 @@ fn buildImage(
     const final_lock = try final_root.filesystem.read(allocator, "/var/lib/miz/ubuntu2604-package-lock.tsv", 4 * 1024 * 1024);
     defer allocator.free(final_lock);
     try validateExactLockRuntime(allocator, final_lock, profile, args.flavor);
+    if (profile.architecture == .aarch64 and args.flavor == .full) {
+        const fstab = try final_root.filesystem.read(allocator, "/etc/fstab", 1024 * 1024);
+        defer allocator.free(fstab);
+        try validateArm64XbootldrFstabRetired(fstab);
+    }
     if (args.flavor.freshRoot()) try validateCoreRoot(
         allocator,
         io,
@@ -4151,6 +4740,64 @@ const ProfileNativeHttpsTransport = struct {
     }
 };
 
+fn arm64PartitionFixture(
+    table_index: u32,
+    partition_type_guid: guid.Guid,
+    unique_partition_guid: guid.Guid,
+    first_lba: u64,
+    last_lba: u64,
+    name: []const u8,
+) miz.gpt.PartitionEntry {
+    var partition: miz.gpt.PartitionEntry = .{
+        .table_index = table_index,
+        .partition_type_guid = partition_type_guid,
+        .unique_partition_guid = unique_partition_guid,
+        .first_lba = first_lba,
+        .last_lba = last_lba,
+    };
+    for (name, 0..) |byte, index| partition.name_utf16le[index] = byte;
+    return partition;
+}
+
+fn arm64VerifiedFixture(
+    partitions: []miz.gpt.PartitionEntry,
+    partition_array: []u8,
+    virtual_size: u64,
+) miz.gpt.VerifiedGpt {
+    const total_sectors = virtual_size / miz.gpt.sector_size;
+    const last_usable_lba = total_sectors - 2 - miz.gpt.partition_array_sectors;
+    const array_crc = std.hash.crc.Crc32.hash(partition_array);
+    const primary = miz.gpt.Header{
+        .current_lba = 1,
+        .backup_lba = total_sectors - 1,
+        .first_usable_lba = 2 + miz.gpt.partition_array_sectors,
+        .last_usable_lba = last_usable_lba,
+        .disk_guid = guid.parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+        .partition_entry_lba = 2,
+        .partition_array_crc32 = array_crc,
+    };
+    const backup = miz.gpt.Header{
+        .current_lba = total_sectors - 1,
+        .backup_lba = 1,
+        .first_usable_lba = primary.first_usable_lba,
+        .last_usable_lba = last_usable_lba,
+        .disk_guid = primary.disk_guid,
+        .partition_entry_lba = total_sectors - 1 -
+            miz.gpt.partition_array_sectors,
+        .partition_array_crc32 = array_crc,
+    };
+    return .{
+        .primary_header = primary,
+        .backup_header = backup,
+        .primary_header_sector = primary.encode(),
+        .backup_header_sector = backup.encode(),
+        .partition_array = partition_array,
+        .partitions = partitions,
+        .protective_mbr_sector = @splat(0),
+        .protective_entry_index = 0,
+    };
+}
+
 test "profiles pin immutable official sources for both architectures" {
     try std.testing.expectEqual(@as(usize, 2), profiles.len);
     for (&profiles) |*profile| {
@@ -4163,6 +4810,214 @@ test "profiles pin immutable official sources for both architectures" {
     try std.testing.expectEqual(@as(u32, 0), profiles[1].root_partition_table_index);
     try std.testing.expectEqualSlices(u8, &guid.linux_root_x86_64, &profiles[0].root_partition_type_guid);
     try std.testing.expectEqualSlices(u8, &guid.linux_root_aarch64, &profiles[1].root_partition_type_guid);
+}
+
+test "Arm64 ESP source and final geometry are exact and reject layout drift" {
+    const virtual_size = default_virtual_size;
+    const total_sectors = virtual_size / miz.gpt.sector_size;
+    const last_usable_lba = total_sectors - 2 - miz.gpt.partition_array_sectors;
+    var source_partitions = [_]miz.gpt.PartitionEntry{
+        arm64PartitionFixture(
+            0,
+            guid.linux_root_aarch64,
+            guid.parse("11111111-1111-1111-1111-111111111111"),
+            arm64_root_first_lba,
+            last_usable_lba,
+            "cloudimg-rootfs",
+        ),
+        arm64PartitionFixture(
+            arm64_source_xbootldr.table_index,
+            guid.linux_xbootldr,
+            arm64_source_xbootldr_unique_guid,
+            arm64_source_xbootldr.first_lba,
+            arm64_source_xbootldr.last_lba,
+            "",
+        ),
+        arm64PartitionFixture(
+            arm64_source_esp.table_index,
+            guid.esp,
+            guid.parse("33333333-3333-3333-3333-333333333333"),
+            arm64_source_esp.first_lba,
+            arm64_source_esp.last_lba,
+            "",
+        ),
+    };
+    var source_array: [
+        miz.gpt.default_num_partition_entries *
+            miz.gpt.partition_entry_size
+    ]u8 = @splat(0);
+    var source = arm64VerifiedFixture(
+        &source_partitions,
+        &source_array,
+        virtual_size,
+    );
+    const validated = try validateArm64SourceLayout(source, virtual_size);
+    try std.testing.expectEqual(
+        arm64_source_xbootldr.table_index,
+        validated.xbootldr.table_index,
+    );
+    try std.testing.expectEqual(arm64_source_esp.last_lba, validated.esp.last_lba);
+
+    source_partitions[1].last_lba -= 1;
+    try std.testing.expectError(
+        error.UnexpectedArm64XbootldrGeometry,
+        validateArm64SourceLayout(source, virtual_size),
+    );
+    source_partitions[1].last_lba = arm64_source_xbootldr.last_lba;
+    source_partitions[2].first_lba += 1;
+    try std.testing.expectError(
+        error.UnexpectedArm64EspGeometry,
+        validateArm64SourceLayout(source, virtual_size),
+    );
+    source_partitions[2].first_lba = arm64_source_esp.first_lba;
+    source.partitions = source_partitions[0..2];
+    try std.testing.expectError(
+        error.UnexpectedArm64PartitionCount,
+        validateArm64SourceLayout(source, virtual_size),
+    );
+
+    var final_partitions = [_]miz.gpt.PartitionEntry{
+        source_partitions[0],
+        arm64PartitionFixture(
+            arm64_final_esp.table_index,
+            guid.esp,
+            source_partitions[2].unique_partition_guid,
+            arm64_final_esp.first_lba,
+            arm64_final_esp.last_lba,
+            "",
+        ),
+    };
+    var final_array: [
+        miz.gpt.default_num_partition_entries *
+            miz.gpt.partition_entry_size
+    ]u8 = @splat(0);
+    const final = arm64VerifiedFixture(
+        &final_partitions,
+        &final_array,
+        virtual_size,
+    );
+    const final_esp = try validateArm64FinalLayout(final, virtual_size);
+    try std.testing.expectEqual(
+        @as(u64, 512 * 1024 * 1024),
+        (final_esp.last_lba - final_esp.first_lba + 1) *
+            miz.gpt.sector_size,
+    );
+    final_array[
+        arm64_source_xbootldr.table_index *
+            miz.gpt.partition_entry_size
+    ] = 1;
+    try std.testing.expectError(
+        error.Arm64XbootldrEntryNotCleared,
+        validateArm64FinalLayout(final, virtual_size),
+    );
+}
+
+test "Arm64 FAT rebuild preserves volume ID and leaves only signed fallback" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "test-ubuntu2604-arm64-esp.raw";
+    defer Dir.cwd().deleteFile(io, path) catch {};
+
+    const source_length = (arm64_source_esp.last_lba -
+        arm64_source_esp.first_lba + 1) * miz.gpt.sector_size;
+    const final_length = (arm64_final_esp.last_lba -
+        arm64_final_esp.first_lba + 1) * miz.gpt.sector_size;
+    const signed_size: u64 = 143_438_240;
+    const file_sizes = [_]u64{signed_size};
+    const directory_slots = [_]u32{
+        miz.fat32.root_directory_overhead_slots +
+            try miz.fat32.nameSlotCount("EFI"),
+        miz.fat32.subdirectory_overhead_slots +
+            try miz.fat32.nameSlotCount("BOOT"),
+        miz.fat32.subdirectory_overhead_slots +
+            try miz.fat32.nameSlotCount("BOOTAA64.EFI"),
+    };
+    const minimum = try miz.fat32.minimumVolumeLength(
+        .{
+            .file_sizes = &file_sizes,
+            .directory_slots = &directory_slots,
+        },
+        .{},
+    );
+    try std.testing.expect(minimum > source_length);
+    try std.testing.expect(minimum <= final_length);
+    try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), final_length);
+
+    const image_length = (arm64_final_esp.last_lba + 1) *
+        miz.gpt.sector_size;
+    var image = try miz.Image.create(io, path, .raw, image_length, .{});
+    defer image.close(io);
+    try miz.fat32.format(&image, io, .{
+        .partition_offset = arm64_source_esp.first_lba * miz.gpt.sector_size,
+        .partition_len = source_length,
+        .hidden_sectors = @intCast(arm64_source_esp.first_lba),
+        .volume_id = 0x1234_5678,
+        .volume_label = "CANONICAL  ".*,
+    });
+    var source_filesystem = try miz.fat32.open(&image, io, .{
+        .offset = arm64_source_esp.first_lba * miz.gpt.sector_size,
+        .length = source_length,
+    });
+    try source_filesystem.createDir(io, "EFI/ubuntu");
+    try source_filesystem.writeFile(io, "EFI/ubuntu/grub.cfg", "stale grub");
+
+    const source_esp = arm64PartitionFixture(
+        arm64_source_esp.table_index,
+        guid.esp,
+        guid.parse("33333333-3333-3333-3333-333333333333"),
+        arm64_source_esp.first_lba,
+        arm64_source_esp.last_lba,
+        "",
+    );
+    const final_esp = arm64PartitionFixture(
+        arm64_final_esp.table_index,
+        guid.esp,
+        source_esp.unique_partition_guid,
+        arm64_final_esp.first_lba,
+        arm64_final_esp.last_lba,
+        "",
+    );
+    try reformatArm64EspFat(
+        allocator,
+        io,
+        &image,
+        source_esp,
+        final_esp,
+    );
+
+    var rebuilt = try miz.fat32.open(&image, io, .{
+        .offset = arm64_final_esp.first_lba * miz.gpt.sector_size,
+        .length = final_length,
+    });
+    try std.testing.expectEqual(
+        @as(u32, 0x1234_5678),
+        rebuilt.volumeMetadata().volume_id,
+    );
+    const empty = try rebuilt.listDirAlloc(io, allocator, "");
+    defer miz.fat32.freeDirEntries(allocator, empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    const signed = "signed Arm64 UKI";
+    try rebuilt.createDir(io, "EFI/BOOT");
+    try rebuilt.writeFile(io, "EFI/BOOT/BOOTAA64.EFI", signed);
+    try validateOnlySignedFallback(
+        allocator,
+        io,
+        &rebuilt,
+        profileFor(.aarch64),
+        signed.len,
+    );
+    try rebuilt.createDir(io, "EFI/ubuntu");
+    try std.testing.expectError(
+        error.UnexpectedArm64EspContents,
+        validateOnlySignedFallback(
+            allocator,
+            io,
+            &rebuilt,
+            profileFor(.aarch64),
+            signed.len,
+        ),
+    );
 }
 
 test "both architecture profiles acquire through the shared native HTTPS downloader" {
@@ -4749,6 +5604,48 @@ test "guest ESP capacity translation preserves host NoSpaceLeft" {
     try std.testing.expectEqual(
         error.NoSpaceLeft,
         translateGuestEspCapacity(error.NoSpaceLeft),
+    );
+}
+
+test "Arm64 XBOOTLDR fstab retirement removes the exact legacy mount" {
+    const allocator = std.testing.allocator;
+    const source =
+        "# /etc/fstab: static file system information.\n" ++
+        "LABEL=cloudimg-rootfs / ext4 defaults 0 1\n" ++
+        "LABEL=BOOT\t/boot\text4\tdefaults\t0\t2\n" ++
+        "UUID=swap none swap sw 0 0\n";
+    const rewritten = try retireArm64XbootldrFstabAlloc(allocator, source);
+    defer allocator.free(rewritten);
+    try std.testing.expectEqualStrings(
+        \\# /etc/fstab: static file system information.
+        \\LABEL=cloudimg-rootfs / ext4 defaults 0 1
+        \\UUID=swap none swap sw 0 0
+        \\
+    , rewritten);
+    try validateArm64XbootldrFstabRetired(rewritten);
+}
+
+test "Arm64 XBOOTLDR fstab retirement rejects unexpected boot mounts" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.UnexpectedArm64BootMount,
+        retireArm64XbootldrFstabAlloc(
+            allocator,
+            "UUID=unexpected /boot ext4 defaults 0 2\n",
+        ),
+    );
+    try std.testing.expectError(
+        error.MissingArm64XbootldrFstabEntry,
+        retireArm64XbootldrFstabAlloc(
+            allocator,
+            "LABEL=cloudimg-rootfs / ext4 defaults 0 1\n",
+        ),
+    );
+    try std.testing.expectError(
+        error.Arm64XbootldrFstabEntryRetained,
+        validateArm64XbootldrFstabRetired(
+            "LABEL=BOOT /boot ext4 defaults 0 2\n",
+        ),
     );
 }
 
@@ -6148,7 +7045,7 @@ test "provenance binds signed source metadata and validated debz evidence" {
     defer std.testing.allocator.free(document);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, document, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 9), parsed.value.object.count());
+    try std.testing.expectEqual(@as(usize, 10), parsed.value.object.count());
     try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("schema").?.integer);
     try std.testing.expectEqualStrings("miz-ubuntu2604-build-provenance", parsed.value.object.get("type").?.string);
     try std.testing.expectEqualStrings(
@@ -6163,6 +7060,10 @@ test "provenance binds signed source metadata and validated debz evidence" {
     try std.testing.expectEqualStrings(
         "canonical-image-dpkg-status",
         parsed.value.object.get("debz").?.object.get("baseline").?.object.get("source").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "preserved",
+        parsed.value.object.get("disk_layout").?.object.get("transform").?.string,
     );
     try std.testing.expectEqual(@as(usize, 4), parsed.value.object.get("artifacts").?.object.count());
 }
@@ -6237,6 +7138,18 @@ test "fresh-root provenance binds flavor closure size and free-space evidence" {
         try std.testing.expectEqualStrings(
             "empty-debz-root",
             debz_object.get("baseline").?.object.get("source").?.string,
+        );
+        const disk_layout = parsed.value.object.get("disk_layout").?.object;
+        try std.testing.expectEqualStrings(
+            "arm64-esp-rebuild-v1",
+            disk_layout.get("transform").?.string,
+        );
+        try std.testing.expectEqual(
+            @as(i64, 1_050_623),
+            disk_layout.get("esp").?.object.get("last_lba").?.integer,
+        );
+        try std.testing.expect(
+            disk_layout.get("retired_xbootldr").?.object.get("cleared").?.bool,
         );
     }
 }
