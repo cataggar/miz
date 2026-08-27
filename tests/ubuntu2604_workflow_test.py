@@ -200,8 +200,10 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
             len(list(FORBIDDEN_PRODUCTION_TOOL.finditer(self.source))),
             "forbidden tools may appear only in explicitly optional oracle jobs",
         )
-        self.assertIn("python3-virt-firmware", self.source)
-        self.assertIn("virt-fw-vars", self.source)
+        # UEFI Secure Boot variable enrollment is native (miz.efi_varstore),
+        # so the virt-firmware host dependency is gone from every job.
+        self.assertNotIn("python3-virt-firmware", self.source)
+        self.assertNotIn("virt-fw-vars", self.source)
 
     def test_build_log_pipeline_prepares_work_dir_and_propagates_failures(self) -> None:
         build = self.source.split(

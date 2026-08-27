@@ -635,8 +635,14 @@ test "command spellings this repository uses are detected" {
 }
 
 test "package names, tool checks, paths, and prose are not invocations" {
+    // Every line here is one this repository actually contains. The first two
+    // are the migration commentary a completed port leaves behind: naming the
+    // Python package a Zig module replaced, and saying the module needs no
+    // Python at all. Neither may enter the inventory, or a port would appear
+    // to add the dependency it removed.
     const not_commands = [_][]const u8{
-        "            curl dnf file jq python3-virt-firmware qemu-utils rpm tar",
+        "//! `python3-virt-firmware`. It understands the exact on-media layout that the",
+        "`virt-fw-vars` host tool: no Python, no subprocess. Only a raw flash image",
         "  for tool in az azcopy qemu-img ssh ssh-keygen python3; do",
         "  for tool in python3 sha256sum; do",
         "            file jq python3 systemd-boot-efi",

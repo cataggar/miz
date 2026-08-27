@@ -673,26 +673,33 @@ fn canonicalCertificateSha256(
     return miz.artifact_pipeline.sha256Bytes(certificate);
 }
 
+/// Appends the candidate leaf to the Microsoft-enrolled firmware `db` and
+/// enables Secure Boot, natively: the same `miz.efi_varstore` code path
+/// `miz qemu --secure-boot` uses, so acceptance exercises the shipped
+/// enrollment rather than a host tool that only resembles it.
 fn prepareEnrolledVars(
     allocator: Allocator,
     io: Io,
-    virt_fw_vars_path: []const u8,
     source_vars_path: []const u8,
-    certificate_path: []const u8,
+    certificate_der: []const u8,
+    certificate_sha256: miz.artifact_pipeline.Digest,
     output_path: []const u8,
 ) !void {
     Dir.cwd().deleteFile(io, output_path) catch {};
-    try runCommand(allocator, io, &.{
-        virt_fw_vars_path,
-        "--input",
+    const trust_state = try miz.efi_varstore.enrollSecureBootFile(
+        allocator,
+        io,
         source_vars_path,
-        "--output",
         output_path,
-        "--add-db",
-        "7f32d4a1-7c10-4e6d-8a89-15ba3f4db734",
-        certificate_path,
-        "--secure-boot",
-    });
+        certificate_der,
+    );
+    const revalidated = try miz.efi_varstore.validateSecureBootFile(
+        allocator,
+        io,
+        output_path,
+        certificate_sha256,
+    );
+    if (!revalidated.eql(trust_state)) return error.InvalidEnrolledVars;
     const stat = try Dir.cwd().statFile(io, output_path, .{});
     if (stat.kind != .file or stat.size == 0) return error.InvalidEnrolledVars;
 }
@@ -3934,13 +3941,6 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         "sbverify",
     );
     defer allocator.free(sbverify_path);
-    const virt_fw_vars_path = try requireToolOverrideAlloc(
-        allocator,
-        io,
-        "MIZ_UBUNTU2604_VIRT_FW_VARS",
-        "virt-fw-vars",
-    );
-    defer allocator.free(virt_fw_vars_path);
     const certificate_path = try requireEnvAlloc(
         allocator,
         "MIZ_UBUNTU2604_SIGNING_CERTIFICATE",
@@ -4060,9 +4060,9 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
     try prepareEnrolledVars(
         allocator,
         io,
-        virt_fw_vars_path,
         firmware.vars_path,
-        certificate_path,
+        certificate_der,
+        expected_certificate_sha256,
         enrolled_vars_path,
     );
 

@@ -1061,13 +1061,16 @@ class AzureLinuxReleaseTest(unittest.TestCase):
         self.assertIn("MIZ_ARTIFACT_SIGNING_PROFILE", workflow)
         self.assertNotIn("MIZ_AZURE_KEY_ID", workflow)
         self.assertNotIn("--uki-signing-key", workflow)
-        self.assertIn("python3-virt-firmware", workflow)
-        # Signing, certificate fingerprinting, and Secure Boot verification are
-        # fully native (miz uki ...); the external OpenSSL/sbsigntool toolchain
-        # must no longer appear anywhere in the production release workflow.
+        # Signing, certificate fingerprinting, Secure Boot verification, and
+        # UEFI variable enrollment are fully native (miz uki ..., miz qemu
+        # --secure-boot); the external OpenSSL/sbsigntool/virt-firmware
+        # toolchain must no longer appear anywhere in the production release
+        # workflow.
         self.assertNotIn("sbsigntool", workflow)
         self.assertNotIn("sbverify", workflow)
         self.assertNotIn("openssl", workflow)
+        self.assertNotIn("virt-firmware", workflow)
+        self.assertNotIn("virt-fw-vars", workflow)
 
         azure = (ROOT / "scripts/azurelinux4_azure_acceptance.sh").read_text()
         self.assertIn("api-version=2025-03-03", azure)

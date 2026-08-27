@@ -151,6 +151,42 @@ selection follows CMS `SignerInfo`; extraction does not verify the signature
 or establish trust, so callers must independently pin the image and/or
 expected fingerprint.
 
+## Enroll a Secure Boot certificate in an EDK2 variable store
+
+`miz.efi_varstore` reads, edits, and writes the EDK II authenticated variable
+stores that OVMF and AAVMF ship as `*_VARS.fd` templates. It replaces the
+`virt-fw-vars` host tool: no Python, no subprocess. Only a raw flash image
+whose firmware volume starts at offset 0 is accepted; the QCOW2 templates
+shipped beside the raw ones are refused by magic, since QEMU maps the store as
+raw pflash and would never see a store enrolled at a cluster offset.
+
+```zig
+const trust = try miz.efi_varstore.enrollSecureBootFile(
+    allocator,
+    io,
+    "/usr/share/OVMF/OVMF_VARS_4M.ms.fd",
+    "enrolled-vars.fd",
+    certificate_der,
+);
+```
+
+The call parses the firmware volume and variable store, appends exactly one
+`EFI_CERT_X509` signature list holding `certificate_der` to `db` under the miz
+owner GUID, sets `SecureBootEnable = 1` and `CustomMode = 0`, writes the result
+atomically, then re-reads the written file and returns the SHA-256 of its `PK`,
+`KEK`, and `db`. Enrollment is idempotent: a leaf already present is not added
+twice. It refuses a template without an authenticated `PK`, `KEK`, and `db`, a
+store with no room for the entry, and anything that is not a valid DER X.509
+certificate. Everything else -- the volume header and its checksum, the store
+header, the vendor `PK`/`KEK`/`db`/`dbx` bytes and timestamps, and every byte
+outside the variable region -- is preserved verbatim.
+
+`miz.efi_varstore.validateSecureBootFile` re-derives the same trust state from
+an existing store and fails closed unless Secure Boot is enabled, custom mode
+is off, there is exactly one authenticated `PK`, `KEK`, and `db`, and `db`
+holds exactly one copy of the expected leaf. `miz.efi_varstore.parse` exposes
+the parsed store for callers that need to read or edit other variables.
+
 ## Sign UKIs while the image is built
 
 `boot_security.signing` asks a `native_fresh` build to have every UKI it

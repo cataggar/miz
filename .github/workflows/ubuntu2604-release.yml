@@ -463,7 +463,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           packages=(
-            openssh-client openssl python3-virt-firmware qemu-utils
+            openssh-client openssl qemu-utils
             sbsigntool swtpm swtpm-tools
           )
           test "$ARCHITECTURE" = x86_64
@@ -488,7 +488,7 @@ jobs:
           sudo chown "$(id -u):$(id -g)" /dev/kvm
           test -r /dev/kvm
           test -w /dev/kvm
-          for tool in qemu-img sbverify ssh ssh-keygen swtpm virt-fw-vars; do
+          for tool in qemu-img sbverify ssh ssh-keygen swtpm; do
             command -v "$tool" >/dev/null
           done
           command -v qemu-system-x86_64 >/dev/null
