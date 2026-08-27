@@ -219,6 +219,33 @@ class Ubuntu2604WorkflowTests(unittest.TestCase):
         self.assertIn('sudo -E "$(command -v zig)" build', build)
         self.assertIn('sudo chown -R "$(id -u):$(id -g)"', build)
 
+    def test_build_storage_diagnostics_are_ordered_and_fail_safe(self) -> None:
+        build_job = self.source.split("\n  build:\n", 1)[1].split(
+            "\n  native_qemu:\n", 1
+        )[0]
+        capacity_name = "- name: Record host filesystem capacity before image build"
+        build_name = "- name: Build exact finalized Ubuntu QCOW2"
+        diagnostic_name = "- name: Diagnose storage after image build failure"
+        cleanup_name = "- name: Clean privileged build state"
+        self.assertLess(build_job.index(capacity_name), build_job.index(build_name))
+        self.assertLess(build_job.index(build_name), build_job.index(diagnostic_name))
+        self.assertLess(build_job.index(diagnostic_name), build_job.index(cleanup_name))
+
+        capacity = build_job.split(capacity_name, 1)[1].split(build_name, 1)[0]
+        self.assertIn("continue-on-error: true", capacity)
+        self.assertIn('df -hT -- "$GITHUB_WORKSPACE" "$RUNNER_TEMP"', capacity)
+        self.assertNotIn("sudo", capacity)
+
+        diagnostic = build_job.split(diagnostic_name, 1)[1].split(cleanup_name, 1)[0]
+        self.assertIn("if: failure()", diagnostic)
+        self.assertIn("continue-on-error: true", diagnostic)
+        self.assertIn('df -hT -- "$GITHUB_WORKSPACE" "$RUNNER_TEMP"', diagnostic)
+        self.assertIn("sudo -n du -x -h --max-depth=1", diagnostic)
+        self.assertIn('"$GITHUB_WORKSPACE/$WORK_DIR"', diagnostic)
+        self.assertIn('"$GITHUB_WORKSPACE/$BUNDLE_DIR"', diagnostic)
+        self.assertIn("tail -n 30", diagnostic)
+        self.assertNotIn("sudo -n df", diagnostic)
+
     def test_build_validates_qcow2_and_publishes_metadata_natively(self) -> None:
         build_job = self.source.split("\n  build:\n", 1)[1].split(
             "\n  native_qemu:\n", 1

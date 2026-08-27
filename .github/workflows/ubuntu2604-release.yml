@@ -273,6 +273,11 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Record host filesystem capacity before image build
+        continue-on-error: true
+        run: |
+          df -hT -- "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+
       - name: Build exact finalized Ubuntu QCOW2
         run: |
           set -euo pipefail
@@ -364,6 +369,21 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 2
+
+      - name: Diagnose storage after image build failure
+        if: failure()
+        continue-on-error: true
+        run: |
+          echo "::group::Host filesystem capacity after failure"
+          df -hT -- "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          echo "::endgroup::"
+          echo "::group::Largest build paths after failure"
+          sudo -n du -x -h --max-depth=1 \
+            "$GITHUB_WORKSPACE/$WORK_DIR" \
+            "$GITHUB_WORKSPACE/$BUNDLE_DIR" \
+            "$GITHUB_WORKSPACE/.zig-global-cache" \
+            2>/dev/null | sort -h | tail -n 30
+          echo "::endgroup::"
 
       - name: Clean privileged build state
         if: always()
