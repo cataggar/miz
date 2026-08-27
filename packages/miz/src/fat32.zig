@@ -9,6 +9,8 @@ const Image = @import("image.zig").Image;
 const ext4 = @import("ext4.zig");
 const limits_mod = @import("limits.zig");
 
+const no_volume_label: [11]u8 = "NO NAME    ".*;
+
 /// Byte range inside the backing `Image` that contains the FAT32 volume.
 pub const Region = struct {
     offset: u64,
@@ -29,7 +31,7 @@ pub const FormatOptions = struct {
     head_count: u16 = 255,
     hidden_sectors: u32 = 0,
     volume_id: u32 = 0x5A56_4D49,
-    volume_label: [11]u8 = "NO NAME    ".*,
+    volume_label: [11]u8 = no_volume_label,
 };
 
 pub fn validateFormatOptions(options: FormatOptions) Error!void {
@@ -78,8 +80,9 @@ pub fn nameSlotCount(name: []const u8) Error!u32 {
 /// Slots a subdirectory holds before any child: its own `.` and `..`, and
 /// the empty slot that terminates the listing.
 pub const subdirectory_overhead_slots: u32 = 3;
-/// The root directory has no `.`/`..` pair, only the terminating slot.
-pub const root_directory_overhead_slots: u32 = 1;
+/// The root directory has no `.`/`..` pair, but reserves a volume-label entry
+/// plus the terminating slot. An unlabeled format uses one fewer slot.
+pub const root_directory_overhead_slots: u32 = 2;
 
 /// What a populated volume has to hold. Stated in bytes and slots rather
 /// than in clusters because cluster size is not an input: it is chosen from
@@ -556,6 +559,7 @@ pub const FileSystem = struct {
     fn findEntry(self: *FileSystem, io: Io, dir_cluster: u32, wanted: []const u8) MutationError!?LocatedEntry {
         var iter = try DirectoryIterator.init(self, io, dir_cluster);
         while (try iter.next(io, wanted)) |entry| {
+            if (entry.attr & attr_volume_id != 0) continue;
             if (entry.matches(wanted)) return entry;
         }
         return null;
@@ -914,6 +918,14 @@ pub fn format(image: *Image, io: Io, options: FormatOptions) FormatError!void {
     try zeroRange(&fs, io, 0, @as(u64, layout.reserved_sector_count) * layout.bytes_per_sector);
     try zeroRange(&fs, io, @as(u64, layout.reserved_sector_count) * layout.bytes_per_sector, @as(u64, layout.fat_count) * layout.fat_size_sectors * layout.bytes_per_sector);
     try fs.zeroCluster(io, layout.root_cluster);
+    if (!std.mem.eql(u8, &layout.volume_label, &no_volume_label)) {
+        const volume_label_entry = buildVolumeLabelEntry(layout.volume_label);
+        try fs.writeRegion(
+            io,
+            &volume_label_entry,
+            fs.clusterOffset(layout.root_cluster),
+        );
+    }
 
     const boot_sector = buildBootSector(layout);
     try fs.writeRegion(io, &boot_sector, 0);
@@ -1622,6 +1634,7 @@ fn trimSpaces(buf: []const u8) []const u8 {
 fn shortNameExists(fs: *FileSystem, io: Io, dir_cluster: u32, short_name: [11]u8) MutationError!bool {
     var iter = try DirectoryIterator.init(fs, io, dir_cluster);
     while (try iter.next(io, null)) |entry| {
+        if (entry.attr & attr_volume_id != 0) continue;
         if (std.mem.eql(u8, &entry.short_name, &short_name)) return true;
     }
     return false;
@@ -1647,6 +1660,13 @@ fn buildShortEntry(short_name: [11]u8, kind: DirEntryKind, first_cluster: u32, s
     std.mem.writeInt(u16, entry[24..26], timestamp_date_placeholder, .little);
     std.mem.writeInt(u16, entry[26..28], @intCast(first_cluster & 0xFFFF), .little);
     std.mem.writeInt(u32, entry[28..32], size, .little);
+    return entry;
+}
+
+fn buildVolumeLabelEntry(volume_label: [11]u8) [directory_entry_size]u8 {
+    var entry: [directory_entry_size]u8 = [_]u8{0} ** directory_entry_size;
+    entry[0..11].* = volume_label;
+    entry[11] = attr_volume_id;
     return entry;
 }
 
@@ -2305,6 +2325,85 @@ test "format writes FAT32 boot sector, FSInfo, backup boot sector, and root FAT 
     try std.testing.expectEqual(@as(u32, 0x0FFF_FFF8), std.mem.readInt(u32, fat0[0..4], .little) & fat_entry_mask);
     try std.testing.expectEqual(fat_entry_mask, std.mem.readInt(u32, fat0[4..8], .little) & fat_entry_mask);
     try std.testing.expectEqual(fat_entry_eoc, std.mem.readInt(u32, fat0[8..12], .little) & fat_entry_mask);
+}
+
+test "format writes a Linux-visible volume label directory entry" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(
+        std.testing.allocator,
+        io,
+        &temporary,
+        "test-fat32-volume-label.img",
+    );
+    defer std.testing.allocator.free(path);
+
+    const partition_offset: u64 = 1024 * 1024;
+    const partition_len: u64 = 64 * 1024 * 1024;
+    var img = try Image.create(
+        io,
+        path,
+        .raw,
+        partition_offset + partition_len,
+        .{},
+    );
+    defer img.close(io);
+
+    const volume_label = "UEFI       ".*;
+    try format(&img, io, .{
+        .partition_offset = partition_offset,
+        .partition_len = partition_len,
+        .volume_label = volume_label,
+    });
+
+    var fs = try open(&img, io, .{
+        .offset = partition_offset,
+        .length = partition_len,
+    });
+    var boot: [default_bytes_per_sector]u8 = undefined;
+    _ = try img.pread(io, &boot, partition_offset);
+    try std.testing.expectEqualSlices(u8, &volume_label, boot[71..82]);
+
+    var volume_label_entry: [directory_entry_size]u8 = undefined;
+    _ = try img.pread(
+        io,
+        &volume_label_entry,
+        partition_offset + fs.clusterOffset(fs.info.root_cluster),
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &volume_label,
+        volume_label_entry[0..11],
+    );
+    try std.testing.expectEqual(attr_volume_id, volume_label_entry[11]);
+    try std.testing.expect(std.mem.allEqual(
+        u8,
+        volume_label_entry[12..],
+        0,
+    ));
+
+    const visible_entries = try fs.listDirAlloc(
+        io,
+        std.testing.allocator,
+        "",
+    );
+    defer freeDirEntries(std.testing.allocator, visible_entries);
+    try std.testing.expectEqual(@as(usize, 0), visible_entries.len);
+
+    try fs.createDir(io, "UEFI");
+    const entries_after_create = try fs.listDirAlloc(
+        io,
+        std.testing.allocator,
+        "",
+    );
+    defer freeDirEntries(std.testing.allocator, entries_after_create);
+    try std.testing.expectEqual(@as(usize, 1), entries_after_create.len);
+    try std.testing.expectEqualStrings("UEFI", entries_after_create[0].name);
+    try std.testing.expectEqual(
+        DirEntryKind.directory,
+        entries_after_create[0].kind,
+    );
 }
 
 test "cluster exhaustion is distinct from host NoSpaceLeft" {
