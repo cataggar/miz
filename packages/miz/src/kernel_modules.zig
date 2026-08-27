@@ -519,10 +519,11 @@ test "a zstd-compressed module is decompressed host-side" {
 test "an xz-compressed module is decompressed host-side" {
     const allocator = std.testing.allocator;
     // xz is what Azure Linux, Fedora and Debian actually ship modules in, so
-    // it is the format that matters most here -- but nothing in this project
-    // writes xz, so the fixture is produced externally and the test declines
-    // rather than passing vacuously when that is unavailable.
-    const compressed = compressXzExternally(allocator, elf_object) catch return error.SkipZigTest;
+    // it is the format that matters most here. Nothing in this project writes
+    // xz, so the fixture comes from the in-tree test encoder, which keeps this
+    // coverage unconditional instead of dependent on host tooling.
+    const xz_fixture = @import("xz_fixture.zig");
+    const compressed = try xz_fixture.allocStream(allocator, elf_object, .{});
     defer allocator.free(compressed);
 
     const bytes = try moduleImage(
@@ -535,26 +536,20 @@ test "an xz-compressed module is decompressed host-side" {
     try std.testing.expectEqualStrings(elf_object, bytes);
 }
 
-fn compressXzExternally(allocator: Allocator, payload: []const u8) ![]u8 {
-    const encoded_len = std.base64.standard.Encoder.calcSize(payload.len);
-    const encoded = try allocator.alloc(u8, encoded_len);
-    defer allocator.free(encoded);
-    _ = std.base64.standard.Encoder.encode(encoded, payload);
-    const script =
-        \\import base64
-        \\import lzma
-        \\import sys
-        \\sys.stdout.buffer.write(lzma.compress(base64.b64decode(sys.argv[1]), format=lzma.FORMAT_XZ))
-    ;
-    const result = try std.process.run(allocator, std.testing.io, .{
-        .argv = &.{ "python3", "-c", script, encoded },
-    });
-    defer allocator.free(result.stderr);
-    errdefer allocator.free(result.stdout);
-    switch (result.term) {
-        .exited => |code| if (code == 0) return result.stdout,
-        else => {},
-    }
-    allocator.free(result.stdout);
-    return error.ExternalCompressionFailed;
+test "an entropy-coded xz module is decompressed host-side" {
+    const allocator = std.testing.allocator;
+    // The in-tree encoder only emits stored LZMA2 chunks, so the checked-in
+    // `xz -9e` sample is what keeps the range decoder -- the part every real
+    // distribution module depends on -- covered on every run.
+    const xz_fixture = @import("xz_fixture.zig");
+    try std.testing.expect(try xz_fixture.usesCompressedChunks(xz_fixture.compressed_sample_stream));
+
+    const bytes = try moduleImage(
+        allocator,
+        "kernel/fs/ext4/ext4.ko.xz",
+        xz_fixture.compressed_sample_stream,
+        max_module_bytes,
+    );
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings(xz_fixture.compressed_sample_plaintext, bytes);
 }
