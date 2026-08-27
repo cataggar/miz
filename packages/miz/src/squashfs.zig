@@ -2125,9 +2125,14 @@ fn compressSyntheticBytes(allocator: std.mem.Allocator, compression: SyntheticCo
 }
 
 fn compressSyntheticXz(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
-    // The in-tree encoder only emits LZMA2 uncompressed chunks, so the stored
-    // block grows slightly. That is fine for fixtures: the reader still walks
-    // the real xz container and LZMA2 framing.
+    // Fixtures built from the checked-in sample plaintext get the checked-in
+    // entropy-coded stream, so at least one reader path always decodes real
+    // range-coded LZMA2 chunks.
+    if (std.mem.eql(u8, payload, xz_fixture.compressed_sample_plaintext))
+        return allocator.dupe(u8, xz_fixture.compressed_sample_stream);
+    // Otherwise the in-tree encoder emits LZMA2 uncompressed chunks, so the
+    // stored block grows slightly. That is fine for fixtures: the reader still
+    // walks the real xz container and LZMA2 framing.
     return xz_fixture.allocStream(allocator, payload, .{});
 }
 
@@ -2466,6 +2471,47 @@ test "squashfs reader enumerates nested directories and extracts fragment-backed
 
 test "squashfs reader decodes xz-compressed metadata data and fragments" {
     try expectSyntheticReaderRoundTrip(.xz, "test-squashfs-xz.sqsh");
+}
+
+/// The synthetic images above carry LZMA2 stored chunks, which never reach the
+/// range decoder. These two cases push the checked-in entropy-coded stream
+/// through the data-block and fragment-block readers instead.
+fn expectEntropyCodedXzRoundTrip(block_size: u32, path: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const payload = xz_fixture.compressed_sample_plaintext;
+    const image = try buildSyntheticSquashfsImage(allocator, .{
+        .compression = .xz,
+        .block_size = block_size,
+        .file_bytes = payload,
+    });
+    defer allocator.free(image);
+    try std.testing.expect(try xz_fixture.usesCompressedChunks(xz_fixture.compressed_sample_stream));
+    try std.testing.expect(std.mem.indexOf(u8, image, xz_fixture.compressed_sample_stream) != null);
+    try writeFixture(path, image);
+
+    var reader = try Reader.openPath(allocator, io, path);
+    defer reader.close(io);
+
+    const file_index = try reader.lookup("/etc/message.txt");
+    const contents = try reader.readFileAlloc(allocator, io, file_index);
+    defer allocator.free(contents);
+    try std.testing.expectEqualSlices(u8, payload, contents);
+
+    const stats = reader.cacheStats();
+    const tail_only = block_size > payload.len;
+    try std.testing.expectEqual(@as(usize, if (tail_only) 0 else 1), stats.data_block_decompressions);
+    try std.testing.expectEqual(@as(usize, if (tail_only) 1 else 0), stats.fragment_block_decompressions);
+}
+
+test "squashfs reader decodes an entropy-coded xz data block" {
+    try expectEntropyCodedXzRoundTrip(1024, "test-squashfs-xz-lzma2-block.sqsh");
+}
+
+test "squashfs reader decodes an entropy-coded xz fragment" {
+    try expectEntropyCodedXzRoundTrip(2048, "test-squashfs-xz-lzma2-fragment.sqsh");
 }
 
 test "squashfs reader decodes zstd-compressed metadata data and fragments" {

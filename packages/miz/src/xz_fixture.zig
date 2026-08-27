@@ -15,6 +15,11 @@
 //! tree. `verifyStream` re-parses the result strictly, so the tests below can
 //! prove the framing is well-formed rather than only that this file's writer
 //! agrees with itself.
+//!
+//! Because that encoder never exercises the LZMA2 range decoder,
+//! `compressed_sample_stream` holds a small checked-in `xz -9e` stream with a
+//! known plaintext. Readers decode it through their normal entry points, so
+//! entropy-coded chunk coverage stays unconditional too.
 
 const std = @import("std");
 
@@ -23,6 +28,37 @@ const Crc64 = std.hash.crc.Crc64Xz;
 
 pub const stream_magic = [6]u8{ 0xFD, '7', 'z', 'X', 'Z', 0x00 };
 pub const footer_magic = [2]u8{ 'Y', 'Z' };
+
+const sample_line = "miz xz fixture: entropy-coded lzma2 payload line for tests here\n";
+
+/// Plaintext of `compressed_sample_stream`: an ELF-ish header followed by
+/// repeated lines, sized to exactly one 1 KiB SquashFS block.
+pub const compressed_sample_plaintext: []const u8 =
+    "\x7fELF\x02\x01\x01" ++ ("\x00" ** 57) ++ (sample_line ** 15);
+
+/// A genuinely entropy-coded xz stream: the output of
+/// `xz --format=xz --check=crc32 -9e` for `compressed_sample_plaintext`.
+///
+/// The encoder in this file only emits LZMA2 *uncompressed* chunks, so on its
+/// own it would never drive the range decoder that real Azure Linux, Fedora
+/// and Debian artifacts require. This checked-in sample keeps that coverage
+/// unconditional without depending on host tooling: readers decode it through
+/// the same production entry points as the dynamic fixtures.
+pub const compressed_sample_stream: []const u8 = &.{
+    0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x01, 0x69, 0x22, 0xde, 0x36,
+    0x04, 0xc0, 0x5b, 0x80, 0x08, 0x21, 0x01, 0x1c, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xc1, 0xa5, 0x87, 0x90, 0xe0, 0x03, 0xff, 0x00,
+    0x53, 0x5d, 0x00, 0x3f, 0x91, 0x45, 0x84, 0x68, 0x3d, 0x89, 0xa6, 0xdb,
+    0x77, 0xb6, 0x01, 0xb1, 0xe5, 0x89, 0x31, 0x76, 0x46, 0xfa, 0x3b, 0xbb,
+    0x7d, 0xe8, 0xc0, 0xa3, 0x10, 0x05, 0x18, 0xf3, 0x42, 0x2f, 0x76, 0x7b,
+    0x5e, 0x35, 0x68, 0x09, 0x4f, 0x88, 0x46, 0x70, 0xd5, 0x76, 0x95, 0x6b,
+    0x6f, 0x16, 0x50, 0x33, 0xa1, 0xe8, 0x7f, 0xc0, 0x65, 0x85, 0x72, 0xfc,
+    0xd0, 0x5d, 0x08, 0xa5, 0x46, 0xc0, 0x2e, 0x47, 0x2e, 0xf3, 0xb0, 0x87,
+    0x23, 0x58, 0x70, 0x44, 0xf9, 0x7a, 0x25, 0x99, 0xd0, 0xab, 0xc0, 0xda,
+    0xab, 0x00, 0x00, 0x00, 0x67, 0x13, 0x5f, 0x48, 0x00, 0x01, 0x73, 0x80,
+    0x08, 0x00, 0x00, 0x00, 0xcf, 0x33, 0xb1, 0x3a, 0x3e, 0x30, 0x0d, 0x8b,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x59, 0x5a,
+};
 
 /// Largest payload an LZMA2 uncompressed chunk can carry.
 pub const max_chunk_size: usize = 1 << 16;
@@ -185,6 +221,30 @@ pub fn verifyStream(bytes: []const u8, expected_payload: []const u8) VerifyError
     if (!std.mem.eql(u8, try cursor.take(2), &footer_magic)) return error.BadFooter;
 
     if (cursor.pos != bytes.len) return error.TrailingBytes;
+}
+
+/// Control byte of the first LZMA2 chunk in `bytes`. The high bit marks a
+/// range-coded chunk; `0x01` and `0x02` mark uncompressed chunks. Callers use
+/// this to prove which kind of chunk a fixture actually carries.
+pub fn firstChunkControl(bytes: []const u8) VerifyError!u8 {
+    var cursor: Cursor = .{ .bytes = bytes };
+    if (!std.mem.eql(u8, try cursor.take(stream_magic.len), &stream_magic)) return error.BadMagic;
+    const stream_flags = try cursor.take(2);
+    if (try cursor.int(u32) != Crc32.hash(stream_flags)) return error.BadStreamHeaderCrc;
+
+    const header_start = cursor.pos;
+    const declared_body_size = @as(usize, try cursor.byte()) * 4;
+    if (declared_body_size == 0) return error.BadBlockHeader;
+    _ = try cursor.take(declared_body_size - 1);
+    const header_body = bytes[header_start..][0..declared_body_size];
+    if (try cursor.int(u32) != Crc32.hash(header_body)) return error.BadBlockHeaderCrc;
+
+    return cursor.byte();
+}
+
+/// Whether the first block of `bytes` is entropy coded rather than stored.
+pub fn usesCompressedChunks(bytes: []const u8) VerifyError!bool {
+    return (try firstChunkControl(bytes)) & 0x80 != 0;
 }
 
 const lzma2_filter_id: u64 = 0x21;
@@ -583,6 +643,38 @@ test "corrupted streams are rejected by the production decoder too" {
         mutated[mutated.len - 8] ^= 0x01;
         try testing.expectError(error.ReadFailed, decompressAlloc(gpa, mutated));
     }
+}
+
+test "the checked-in sample is entropy coded, not a stored chunk" {
+    const gpa = testing.allocator;
+
+    try testing.expectEqual(@as(usize, 1024), compressed_sample_plaintext.len);
+    try testing.expect(compressed_sample_stream.len < compressed_sample_plaintext.len);
+
+    // A range-coded chunk sets the high bit; 0x01/0x02 would be stored chunks.
+    const control = try firstChunkControl(compressed_sample_stream);
+    try testing.expect(control & 0x80 != 0);
+    try testing.expect(control != 0x01 and control != 0x02);
+    try testing.expect(try usesCompressedChunks(compressed_sample_stream));
+
+    // The strict verifier only accepts stored chunks, so it must reject the
+    // sample: that is the clearest proof the two fixtures differ in kind.
+    try testing.expectError(error.BadChunk, verifyStream(compressed_sample_stream, compressed_sample_plaintext));
+
+    const decoded = try decompressAlloc(gpa, compressed_sample_stream);
+    defer gpa.free(decoded);
+    try testing.expectEqualStrings(compressed_sample_plaintext, decoded);
+}
+
+test "the dynamic encoder emits stored chunks" {
+    const gpa = testing.allocator;
+    const stream = try allocStream(gpa, compressed_sample_plaintext, .{});
+    defer gpa.free(stream);
+
+    try testing.expectEqual(@as(u8, 0x01), try firstChunkControl(stream));
+    try testing.expect(!try usesCompressedChunks(stream));
+    try testing.expect(stream.len > compressed_sample_plaintext.len);
+    try verifyStream(stream, compressed_sample_plaintext);
 }
 
 test "dictionary size property covers the payload" {

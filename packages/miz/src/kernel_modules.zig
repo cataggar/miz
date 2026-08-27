@@ -535,3 +535,21 @@ test "an xz-compressed module is decompressed host-side" {
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings(elf_object, bytes);
 }
+
+test "an entropy-coded xz module is decompressed host-side" {
+    const allocator = std.testing.allocator;
+    // The in-tree encoder only emits stored LZMA2 chunks, so the checked-in
+    // `xz -9e` sample is what keeps the range decoder -- the part every real
+    // distribution module depends on -- covered on every run.
+    const xz_fixture = @import("xz_fixture.zig");
+    try std.testing.expect(try xz_fixture.usesCompressedChunks(xz_fixture.compressed_sample_stream));
+
+    const bytes = try moduleImage(
+        allocator,
+        "kernel/fs/ext4/ext4.ko.xz",
+        xz_fixture.compressed_sample_stream,
+        max_module_bytes,
+    );
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings(xz_fixture.compressed_sample_plaintext, bytes);
+}
