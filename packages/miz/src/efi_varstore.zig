@@ -139,6 +139,7 @@ pub const ParseError = error{
     UnsupportedVariableStoreFormat,
     MalformedVariableStore,
     TruncatedVariableStore,
+    DuplicateVariableRecord,
 };
 
 pub const EditError = error{
@@ -527,14 +528,24 @@ fn readVariables(store: *Store) !void {
             const vendor_guid: Guid = record[44..60].*;
             const data = record[variable_header_size + name_size ..][0..data_size];
             const existing = findRaw(store, name, vendor_guid);
-            // EDK II's reclaim keeps the newest complete record: a completed
-            // `VAR_ADDED` always wins, and an in-deleted-transition record is
-            // the live value only until one appears.
+            // EDK II's `FindVariableEx` returns the *first* `VAR_ADDED`
+            // record and only falls back to the last in-deleted-transition
+            // one when no complete record exists. A store holding two
+            // complete records for the same name and GUID is therefore
+            // ambiguous in the most dangerous possible way: miz would report
+            // one value while the firmware used the other. Refuse it rather
+            // than pick a winner.
             if (existing) |index| {
+                if (state == state_added and completed.items[index])
+                    return error.DuplicateVariableRecord;
                 store.reclaimed_records += 1;
-                if (state != state_added and completed.items[index]) {
-                    offset = next;
-                    continue;
+                if (state != state_added) {
+                    // A completed record already won; and with none, the
+                    // last in-deleted-transition record is the live value.
+                    if (completed.items[index]) {
+                        offset = next;
+                        continue;
+                    }
                 }
             }
             const owned_name = try allocator.dupe(u8, name);
@@ -1590,9 +1601,9 @@ test "deleted, superseded and interrupted records are reclaimed" {
     try testing.expectEqual(state_added, rendered[reparsed.data_offset + 2]);
 }
 
-test "repeated rewrites of one variable resolve to the newest complete record" {
+test "duplicate complete records are refused, not silently resolved" {
     const allocator = testing.allocator;
-    const rewrites = [_]TestVariable{
+    const duplicated = [_]TestVariable{
         .{
             .name = "Rewritten",
             .guid = global_variable_guid,
@@ -1607,24 +1618,70 @@ test "repeated rewrites of one variable resolve to the newest complete record" {
             .data = "second",
             .state = state_added,
         },
+    };
+    // EDK II would boot with "first"; a last-wins parser would report
+    // "second". Neither guess is safe, so the store is refused outright.
+    const image = try buildTemplateAlloc(
+        allocator,
+        TemplateShape.ovmf_4m,
+        &duplicated,
+    );
+    defer allocator.free(image);
+    try testing.expectError(
+        error.DuplicateVariableRecord,
+        parse(allocator, image),
+    );
+
+    // A third copy is no more acceptable than a second.
+    const tripled = duplicated ++ [_]TestVariable{.{
+        .name = "Rewritten",
+        .guid = global_variable_guid,
+        .attributes = boot_service_attributes,
+        .data = "third",
+        .state = state_added,
+    }};
+    const tripled_image = try buildTemplateAlloc(
+        allocator,
+        TemplateShape.ovmf_4m,
+        &tripled,
+    );
+    defer allocator.free(tripled_image);
+    try testing.expectError(
+        error.DuplicateVariableRecord,
+        parse(allocator, tripled_image),
+    );
+
+    // Duplicate PK is the case that matters: miz must not certify a store
+    // whose platform key the firmware would resolve differently.
+    const duplicate_pk = try buildTemplateAlloc(allocator, TemplateShape.aavmf, &.{
         .{
-            .name = "Rewritten",
+            .name = "PK",
             .guid = global_variable_guid,
-            .attributes = boot_service_attributes,
-            .data = "third",
-            .state = state_added,
+            .attributes = authenticated_variable_attributes,
+            .data = "attacker platform key",
         },
-        // A later in-deleted-transition record does not undo a completed
-        // write that came before it.
         .{
-            .name = "Rewritten",
+            .name = "KEK",
             .guid = global_variable_guid,
-            .attributes = boot_service_attributes,
-            .data = "interrupted rewrite",
-            .state = state_in_deleted_transition,
+            .attributes = authenticated_variable_attributes,
+            .data = "kek",
         },
-        // The same name under a different vendor GUID is a different
-        // variable and survives independently.
+        .{
+            .name = "PK",
+            .guid = global_variable_guid,
+            .attributes = authenticated_variable_attributes,
+            .data = "benign platform key",
+        },
+    });
+    defer allocator.free(duplicate_pk);
+    try testing.expectError(
+        error.DuplicateVariableRecord,
+        parse(allocator, duplicate_pk),
+    );
+
+    // The same name under a different vendor GUID is a different variable.
+    const distinct = try buildTemplateAlloc(allocator, TemplateShape.ovmf_4m, &.{
+        duplicated[0],
         .{
             .name = "Rewritten",
             .guid = image_security_database_guid,
@@ -1632,15 +1689,14 @@ test "repeated rewrites of one variable resolve to the newest complete record" {
             .data = "other namespace",
             .state = state_added,
         },
-    };
-    const image = try buildTemplateAlloc(allocator, TemplateShape.ovmf_4m, &rewrites);
-    var store = try parse(allocator, image);
+    });
+    var store = try parse(allocator, distinct);
     defer store.deinit();
     try testing.expectEqual(@as(usize, 2), store.variables.items.len);
-    try testing.expectEqual(@as(usize, 3), store.reclaimed_records);
+    try testing.expectEqual(@as(usize, 0), store.reclaimed_records);
     try testing.expectEqualSlices(
         u8,
-        "third",
+        "first",
         store.find("Rewritten", global_variable_guid).?.data,
     );
     try testing.expectEqualSlices(
@@ -1648,13 +1704,134 @@ test "repeated rewrites of one variable resolve to the newest complete record" {
         "other namespace",
         store.find("Rewritten", image_security_database_guid).?.data,
     );
+}
 
-    const rendered = try store.serializeAlloc(allocator);
-    defer allocator.free(rendered);
-    var reparsed = try parse(allocator, try allocator.dupe(u8, rendered));
-    defer reparsed.deinit();
-    try testing.expectEqual(@as(usize, 2), reparsed.variables.items.len);
-    try testing.expectEqual(@as(usize, 0), reparsed.reclaimed_records);
+test "in-deleted-transition records resolve exactly as EDK II resolves them" {
+    const allocator = testing.allocator;
+    const Case = struct {
+        label: []const u8,
+        variables: []const TestVariable,
+        expected: []const u8,
+        reclaimed: usize,
+    };
+    const cases = [_]Case{
+        // A complete record wins over an interrupted deletion regardless of
+        // which one the walk reaches first.
+        .{
+            .label = "transition before added",
+            .variables = &.{
+                .{
+                    .name = "Var",
+                    .guid = global_variable_guid,
+                    .attributes = boot_service_attributes,
+                    .data = "being deleted",
+                    .state = state_in_deleted_transition,
+                },
+                .{
+                    .name = "Var",
+                    .guid = global_variable_guid,
+                    .attributes = boot_service_attributes,
+                    .data = "complete",
+                    .state = state_added,
+                },
+            },
+            .expected = "complete",
+            .reclaimed = 1,
+        },
+        .{
+            .label = "added before transition",
+            .variables = &.{
+                .{
+                    .name = "Var",
+                    .guid = global_variable_guid,
+                    .attributes = boot_service_attributes,
+                    .data = "complete",
+                    .state = state_added,
+                },
+                .{
+                    .name = "Var",
+                    .guid = global_variable_guid,
+                    .attributes = boot_service_attributes,
+                    .data = "being deleted",
+                    .state = state_in_deleted_transition,
+                },
+            },
+            .expected = "complete",
+            .reclaimed = 1,
+        },
+        // With no complete record, EDK II keeps the last in-deleted-transition
+        // one it walks past.
+        .{
+            .label = "only transitions",
+            .variables = &.{
+                .{
+                    .name = "Var",
+                    .guid = global_variable_guid,
+                    .attributes = boot_service_attributes,
+                    .data = "older",
+                    .state = state_in_deleted_transition,
+                },
+                .{
+                    .name = "Var",
+                    .guid = global_variable_guid,
+                    .attributes = boot_service_attributes,
+                    .data = "newer",
+                    .state = state_in_deleted_transition,
+                },
+            },
+            .expected = "newer",
+            .reclaimed = 1,
+        },
+        .{
+            .label = "single transition",
+            .variables = &.{.{
+                .name = "Var",
+                .guid = global_variable_guid,
+                .attributes = boot_service_attributes,
+                .data = "only copy",
+                .state = state_in_deleted_transition,
+            }},
+            .expected = "only copy",
+            .reclaimed = 0,
+        },
+    };
+
+    for (cases) |case| {
+        const image = try buildTemplateAlloc(
+            allocator,
+            TemplateShape.ovmf_4m,
+            case.variables,
+        );
+        var store = try parse(allocator, image);
+        defer store.deinit();
+        testing.expectEqual(@as(usize, 1), store.variables.items.len) catch |err| {
+            std.debug.print("case '{s}' resolved wrongly\n", .{case.label});
+            return err;
+        };
+        testing.expectEqualSlices(
+            u8,
+            case.expected,
+            store.find("Var", global_variable_guid).?.data,
+        ) catch |err| {
+            std.debug.print("case '{s}' resolved wrongly\n", .{case.label});
+            return err;
+        };
+        try testing.expectEqual(case.reclaimed, store.reclaimed_records);
+
+        // Re-serializing writes the winner as the one complete record, so a
+        // second pass has nothing left to resolve.
+        const rendered = try store.serializeAlloc(allocator);
+        defer allocator.free(rendered);
+        var reparsed = try parse(allocator, try allocator.dupe(u8, rendered));
+        defer reparsed.deinit();
+        try testing.expectEqual(@as(usize, 1), reparsed.variables.items.len);
+        try testing.expectEqual(@as(usize, 0), reparsed.reclaimed_records);
+        try testing.expectEqualSlices(
+            u8,
+            case.expected,
+            reparsed.find("Var", global_variable_guid).?.data,
+        );
+    }
 }
 
 test "malformed firmware volumes and stores are rejected" {
@@ -2134,7 +2311,8 @@ test "trust validation demands the exact enforcing Secure Boot state" {
         );
     }
 
-    // A second PK record makes the store ambiguous, so it is refused.
+    // A second PK record makes the store ambiguous, so it never reaches
+    // validation: the parser refuses it.
     {
         var duplicated: [enrolled.len + 1]TestVariable = undefined;
         @memcpy(duplicated[0..enrolled.len], &enrolled);
@@ -2149,17 +2327,15 @@ test "trust validation demands the exact enforcing Secure Boot state" {
             TemplateShape.ovmf_4m,
             &duplicated,
         );
-        var store = try parse(allocator, image);
-        defer store.deinit();
-        // Same name and GUID: the later record supersedes the earlier one,
-        // so trust resolves to exactly one PK.
-        try testing.expectEqual(@as(usize, 5), store.variables.items.len);
-        const trust = try validateSecureBootTrust(&store, digest);
-        try testing.expectEqual(
-            sha256Bytes("second platform key"),
-            trust.pk_sha256,
+        defer allocator.free(image);
+        try testing.expectError(
+            error.DuplicateVariableRecord,
+            parse(allocator, image),
         );
 
+        // A `PK` under the image-security-database GUID is a distinct
+        // variable, so it parses -- and then fails trust validation, because
+        // the name is reserved for the global-variable namespace.
         duplicated[enrolled.len].guid = image_security_database_guid;
         const image2 = try buildTemplateAlloc(
             allocator,

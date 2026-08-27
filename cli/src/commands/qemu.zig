@@ -1662,6 +1662,7 @@ fn translateSecureBootVarsError(err: anyerror) anyerror {
         error.UnsupportedVariableStoreFormat,
         error.MalformedVariableStore,
         error.TruncatedVariableStore,
+        error.DuplicateVariableRecord,
         error.MissingSignatureDatabase,
         error.MissingPlatformKey,
         error.MissingKeyExchangeKey,
