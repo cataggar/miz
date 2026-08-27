@@ -55,6 +55,12 @@ has no libguestfs, guestfish, supermin, or libguestfs `virt-*` dependency;
 mode-`000` entries are read from ext4 bytes rather than made readable on the
 host, while their original metadata remains in the native tree.
 
+The mountless atomic stage preserves holes from the raw source instead of
+allocating zero-filled regions. After a durable ext4 exchange, the builder
+closes both image handles and removes the displaced recovery image before it
+allocates the staged QCOW2. An uncertain commit retains and reports recovery;
+publication failures remove the unpublished QCOW2 stage.
+
 Each package root is a separate debz transaction with its own dpkg admin
 state, discarded after it publishes so no stage inherits another's installed
 baseline. The downloaded objects are not: every stage reads and writes one

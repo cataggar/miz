@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ext4 = @import("ext4.zig");
+const free_space = @import("free_space.zig");
 const limits_mod = @import("limits.zig");
 const os_customization = @import("os_customization.zig");
 const root_tree = @import("root_tree.zig");
@@ -430,6 +431,119 @@ fn preparePrivateDirectory(
         return error.AtomicPublishFailed;
     }
     return directory;
+}
+
+fn copySparseSource(
+    io: Io,
+    source: Io.File,
+    destination: Io.File,
+    logical_length: u64,
+) Error!void {
+    try destination.setLength(io, logical_length);
+    copySparseLinuxExtents(io, source, destination, logical_length) catch |err| switch (err) {
+        error.SparseExtentUnsupported => try copySparseContent(
+            io,
+            source,
+            destination,
+            logical_length,
+        ),
+        else => return err,
+    };
+}
+
+const SparseExtent = struct {
+    start: u64,
+    end: u64,
+};
+
+const linux_seek_data = 3;
+const linux_seek_hole = 4;
+
+fn linuxSparseSeek(file: Io.File, offset: u64, whence: usize) Error!?u64 {
+    if (comptime builtin.os.tag != .linux or @sizeOf(usize) != 8) {
+        return error.SparseExtentUnsupported;
+    }
+    const result = std.os.linux.lseek(
+        @intCast(file.handle),
+        std.math.cast(i64, offset) orelse return error.SparseExtentQueryFailed,
+        whence,
+    );
+    return switch (std.os.linux.errno(result)) {
+        .SUCCESS => @intCast(result),
+        .NXIO => null,
+        .INVAL, .OPNOTSUPP, .SPIPE => error.SparseExtentUnsupported,
+        else => error.SparseExtentQueryFailed,
+    };
+}
+
+fn nextSparseExtent(source: Io.File, offset: u64, logical_length: u64) Error!?SparseExtent {
+    const start = try linuxSparseSeek(source, offset, linux_seek_data) orelse return null;
+    if (start >= logical_length) return null;
+    const end = @min(
+        try linuxSparseSeek(source, start, linux_seek_hole) orelse logical_length,
+        logical_length,
+    );
+    if (end <= start) return error.SparseExtentQueryFailed;
+    return .{ .start = start, .end = end };
+}
+
+fn copySourceRange(
+    io: Io,
+    source: Io.File,
+    destination: Io.File,
+    start: u64,
+    end: u64,
+) Error!void {
+    var copy_buffer: [1024 * 1024]u8 = undefined;
+    var offset = start;
+    while (offset < end) {
+        const wanted: usize = @intCast(@min(@as(u64, copy_buffer.len), end - offset));
+        const got = try source.readPositionalAll(io, copy_buffer[0..wanted], offset);
+        if (got != wanted) return error.SourceChangedDuringCopy;
+        try destination.writePositionalAll(io, copy_buffer[0..got], offset);
+        offset += got;
+    }
+}
+
+fn copySparseLinuxExtents(
+    io: Io,
+    source: Io.File,
+    destination: Io.File,
+    logical_length: u64,
+) Error!void {
+    var offset: u64 = 0;
+    while (try nextSparseExtent(source, offset, logical_length)) |extent| {
+        try copySourceRange(io, source, destination, extent.start, extent.end);
+        offset = extent.end;
+    }
+}
+
+fn copySparseContent(
+    io: Io,
+    source: Io.File,
+    destination: Io.File,
+    logical_length: u64,
+) Error!void {
+    var copy_buffer: [1024 * 1024]u8 = undefined;
+    var copied: u64 = 0;
+    while (copied < logical_length) {
+        const wanted: usize = @intCast(@min(@as(u64, copy_buffer.len), logical_length - copied));
+        const got = try source.readPositionalAll(io, copy_buffer[0..wanted], copied);
+        if (got != wanted) return error.SourceChangedDuringCopy;
+        var chunk_offset: usize = 0;
+        while (chunk_offset < got) {
+            const end = @min(chunk_offset + 4096, got);
+            if (!std.mem.allEqual(u8, copy_buffer[chunk_offset..end], 0)) {
+                try destination.writePositionalAll(
+                    io,
+                    copy_buffer[chunk_offset..end],
+                    copied + chunk_offset,
+                );
+            }
+            chunk_offset = end;
+        }
+        copied += got;
+    }
 }
 
 pub const FileSystem = struct {
@@ -1310,15 +1424,7 @@ pub const FileSystem = struct {
                 );
             }
         }
-        var copy_buffer: [1024 * 1024]u8 = undefined;
-        var copied: u64 = 0;
-        while (copied < self.source_size) {
-            const wanted: usize = @intCast(@min(@as(u64, copy_buffer.len), self.source_size - copied));
-            const got = try self.file.readPositionalAll(self.io, copy_buffer[0..wanted], copied);
-            if (got != wanted) return error.SourceChangedDuringCopy;
-            try stage_file.writePositionalAll(self.io, copy_buffer[0..got], copied);
-            copied += got;
-        }
+        try copySparseSource(self.io, self.file, stage_file, self.source_size);
         if (!self.sameSourceStat(try self.file.stat(self.io))) return error.AtomicSourceChanged;
         const info = try ext4.populate(self.io, stage_file, self.allocator, cursor, .{
             .offset = self.offset,
@@ -1512,6 +1618,69 @@ pub const FileSystem = struct {
 
 fn DirDelete(io: Io, path: []const u8) void {
     Io.Dir.cwd().deleteFile(io, path) catch {};
+}
+
+test "atomic source copy preserves fragmented sparse extents and bytes" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const logical_length = 5 * 1024 * 1024 + 17;
+
+    var source = try temporary.dir.createFile(io, "source.raw", .{
+        .read = true,
+        .truncate = true,
+    });
+    defer source.close(io);
+    try source.setLength(io, logical_length);
+    for (0..16) |index| {
+        const offset = index * 64 * 1024 + 123;
+        try source.writePositionalAll(io, &.{@intCast(index + 1)}, offset);
+    }
+    try source.sync(io);
+
+    var destination = try temporary.dir.createFile(io, "destination.raw", .{
+        .read = true,
+        .truncate = true,
+    });
+    defer destination.close(io);
+    try copySparseSource(io, source, destination, logical_length);
+    try destination.sync(io);
+    try std.testing.expectEqual(logical_length, (try destination.stat(io)).size);
+
+    var source_buffer: [64 * 1024]u8 = undefined;
+    var destination_buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < logical_length) {
+        const wanted: usize = @intCast(@min(
+            @as(u64, source_buffer.len),
+            logical_length - offset,
+        ));
+        try std.testing.expectEqual(
+            wanted,
+            try source.readPositionalAll(io, source_buffer[0..wanted], offset),
+        );
+        try std.testing.expectEqual(
+            wanted,
+            try destination.readPositionalAll(io, destination_buffer[0..wanted], offset),
+        );
+        try std.testing.expectEqualSlices(
+            u8,
+            source_buffer[0..wanted],
+            destination_buffer[0..wanted],
+        );
+        offset += wanted;
+    }
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    const destination_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root_buffer[0..root_length], "destination.raw" },
+    );
+    defer std.testing.allocator.free(destination_path);
+    const usage = free_space.fileUsage(destination_path) orelse return error.SkipZigTest;
+    try std.testing.expectEqual(logical_length, usage.logical_bytes);
+    try std.testing.expect(usage.allocated_bytes < 512 * 1024);
 }
 
 pub const NativeFilesystem = FileSystem;
@@ -1987,9 +2156,19 @@ test "durability failure exposes recovery path before filesystem teardown" {
         u8,
         fs.recoveryArtifactPath() orelse return error.AtomicPublishUnrecoverable,
     );
+    const recovery_image = try std.fs.path.join(allocator, &.{ recovery_path, "stage" });
+    defer allocator.free(recovery_image);
     fs.deinit();
     const recovery_stat = try Io.Dir.cwd().statFile(io, recovery_path, .{});
     try std.testing.expectEqual(Io.File.Kind.directory, recovery_stat.kind);
+    try std.testing.expectEqual(
+        @as(u64, 32 * 1024 * 1024),
+        (try Io.Dir.cwd().statFile(io, recovery_image, .{})).size,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 32 * 1024 * 1024),
+        (try Io.Dir.cwd().statFile(io, image_path, .{})).size,
+    );
     try Io.Dir.cwd().deleteTree(io, recovery_path);
     allocator.free(recovery_path);
 }

@@ -1555,6 +1555,52 @@ const DebzCustomization = struct {
     }
 };
 
+const NativeQcow2Publisher = struct {
+    context: ?*anyopaque = null,
+    publish: *const fn (
+        allocator: Allocator,
+        io: Io,
+        raw_path: []const u8,
+        destination_path: []const u8,
+        context: ?*anyopaque,
+    ) anyerror!void,
+};
+
+fn optionalBytes(buffer: []u8, value: ?u64) []const u8 {
+    const bytes = value orelse return "unknown";
+    return std.fmt.bufPrint(buffer, "{d}", .{bytes}) catch "unknown";
+}
+
+fn optionalUsage(buffer: []u8, path: ?[]const u8) []const u8 {
+    const usage = miz.free_space.fileUsage(path orelse return "unknown") orelse return "unknown";
+    return std.fmt.bufPrint(
+        buffer,
+        "{d}/{d}",
+        .{ usage.logical_bytes, usage.allocated_bytes },
+    ) catch "unknown";
+}
+
+fn logNativeCapacity(
+    phase: []const u8,
+    workspace_path: []const u8,
+    raw_path: []const u8,
+    artifact_path: ?[]const u8,
+) void {
+    const probe_path = std.fs.path.dirname(workspace_path) orelse ".";
+    var available_buffer: [32]u8 = undefined;
+    var raw_buffer: [64]u8 = undefined;
+    var artifact_buffer: [64]u8 = undefined;
+    std.debug.print(
+        "native storage phase={s} host_available_bytes={s} raw_logical/allocated_bytes={s} artifact_logical/allocated_bytes={s}\n",
+        .{
+            phase,
+            optionalBytes(&available_buffer, miz.free_space.availableBytes(probe_path)),
+            optionalUsage(&raw_buffer, raw_path),
+            optionalUsage(&artifact_buffer, artifact_path),
+        },
+    );
+}
+
 const NativeRoot = struct {
     allocator: Allocator,
     io: Io,
@@ -1580,7 +1626,19 @@ const NativeRoot = struct {
     }
 
     fn finish(self: *NativeRoot) !miz.ext4.FilesystemInfo {
+        logNativeCapacity(
+            "mountless-commit-start",
+            self.mutable_image,
+            self.raw_path,
+            null,
+        );
         var commit_result = self.filesystem.commit() catch |err| {
+            logNativeCapacity(
+                "mountless-commit-failed",
+                self.mutable_image,
+                self.raw_path,
+                self.filesystem.recoveryArtifactPath(),
+            );
             if (self.filesystem.recoveryArtifactPath()) |path| {
                 std.debug.print(
                     "native ext4 commit failed: {s}; recovery artifact retained at {s}\n",
@@ -1589,7 +1647,23 @@ const NativeRoot = struct {
             } else {
                 std.debug.print("native ext4 commit failed: {s}\n", .{@errorName(err)});
             }
-            return err;
+            return switch (err) {
+                error.NotEnoughSpace => {
+                    std.debug.print(
+                        "guest ext4 capacity exhausted during mountless commit\n",
+                        .{},
+                    );
+                    return error.GuestExt4NotEnoughSpace;
+                },
+                error.NoSpaceLeft => {
+                    std.debug.print(
+                        "host filesystem capacity exhausted while staging mountless commit\n",
+                        .{},
+                    );
+                    return error.HostMountlessCommitNoSpace;
+                },
+                else => err,
+            };
         };
         defer commit_result.deinit();
         std.debug.print("native ext4 recovery artifact staged at {s}\n", .{commit_result.recovery_path});
@@ -1598,13 +1672,20 @@ const NativeRoot = struct {
         self.filesystem_open = false;
         self.image.close(self.io);
         self.image_open = false;
-        try publishNativeQcow2(
+        logNativeCapacity(
+            "mountless-commit-complete",
+            self.mutable_image,
+            self.raw_path,
+            commit_result.recovery_path,
+        );
+        try disposeRecoveryAndPublishNativeQcow2(
             self.allocator,
             self.io,
             self.raw_path,
             self.mutable_image,
+            commit_result.recovery_path,
+            .{ .publish = callPublishNativeQcow2 },
         );
-        try Dir.cwd().deleteTree(self.io, commit_result.recovery_path);
         Dir.cwd().deleteFile(self.io, self.raw_path) catch {};
         return filesystem_info;
     }
@@ -1660,6 +1741,86 @@ fn publishNativeQcow2(
     staged.close(io);
     if (!check.ok) return error.FinalImageInvalid;
     try Dir.cwd().rename(staged_path, Dir.cwd(), destination_path, io);
+}
+
+fn callPublishNativeQcow2(
+    allocator: Allocator,
+    io: Io,
+    raw_path: []const u8,
+    destination_path: []const u8,
+    context: ?*anyopaque,
+) !void {
+    _ = context;
+    try publishNativeQcow2(allocator, io, raw_path, destination_path);
+}
+
+fn disposeRecoveryAndPublishNativeQcow2(
+    allocator: Allocator,
+    io: Io,
+    raw_path: []const u8,
+    destination_path: []const u8,
+    recovery_path: []const u8,
+    publisher: NativeQcow2Publisher,
+) !void {
+    const recovery_image = try std.fs.path.join(allocator, &.{ recovery_path, "stage" });
+    defer allocator.free(recovery_image);
+    logNativeCapacity(
+        "recovery-disposal-start",
+        destination_path,
+        raw_path,
+        recovery_image,
+    );
+    Dir.cwd().deleteTree(io, recovery_path) catch |err| {
+        logNativeCapacity(
+            "recovery-disposal-failed",
+            destination_path,
+            raw_path,
+            recovery_image,
+        );
+        std.debug.print(
+            "native ext4 recovery disposal failed before QCOW2 publication: {s}; path={s}\n",
+            .{ @errorName(err), recovery_path },
+        );
+        return err;
+    };
+    logNativeCapacity(
+        "recovery-disposal-complete",
+        destination_path,
+        raw_path,
+        null,
+    );
+    logNativeCapacity(
+        "qcow2-publication-start",
+        destination_path,
+        raw_path,
+        null,
+    );
+    publisher.publish(
+        allocator,
+        io,
+        raw_path,
+        destination_path,
+        publisher.context,
+    ) catch |err| {
+        logNativeCapacity(
+            "qcow2-publication-failed",
+            destination_path,
+            raw_path,
+            null,
+        );
+        std.debug.print(
+            "native QCOW2 publication failed: {s}; no staged candidate was published\n",
+            .{@errorName(err)},
+        );
+        if (err == error.NoSpaceLeft) return error.HostNativeQcow2NoSpace;
+        return err;
+    };
+    logNativeCapacity(
+        "qcow2-publication-complete",
+        destination_path,
+        raw_path,
+        null,
+    );
 }
 
 fn partitionNameEquals(partition: miz.gpt.PartitionEntry, expected: []const u8) bool {
@@ -3501,6 +3662,10 @@ fn espPartition(partitions: []const miz.gpt.PartitionEntry) !miz.gpt.PartitionEn
     return found orelse error.MissingEspPartition;
 }
 
+fn translateGuestEspCapacity(err: anyerror) anyerror {
+    return if (err == error.FilesystemFull) error.GuestEspNoSpace else err;
+}
+
 fn insertSignedUki(
     allocator: Allocator,
     io: Io,
@@ -3517,7 +3682,16 @@ fn insertSignedUki(
         .offset = esp.first_lba * miz.gpt.sector_size,
         .length = (esp.last_lba - esp.first_lba + 1) * miz.gpt.sector_size,
     });
-    try filesystem.createDir(io, "EFI/BOOT");
+    filesystem.createDir(io, "EFI/BOOT") catch |err| {
+        if (err == error.FilesystemFull) {
+            std.debug.print(
+                "guest ESP capacity exhausted while creating EFI/BOOT\n",
+                .{},
+            );
+            return translateGuestEspCapacity(err);
+        }
+        return err;
+    };
     const signed = try Dir.cwd().readFileAlloc(io, signed_path, allocator, .limited(256 * 1024 * 1024));
     defer allocator.free(signed);
     const fallback = try std.fmt.allocPrint(allocator, "EFI/BOOT/{s}", .{profile.efi_fallback});
@@ -3533,7 +3707,16 @@ fn insertSignedUki(
             else => return err,
         };
     }
-    try filesystem.writeFile(io, fallback, signed);
+    filesystem.writeFile(io, fallback, signed) catch |err| {
+        if (err == error.FilesystemFull) {
+            std.debug.print(
+                "guest ESP capacity exhausted while writing {s} ({d} bytes)\n",
+                .{ fallback, signed.len },
+            );
+            return translateGuestEspCapacity(err);
+        }
+        return err;
+    };
 }
 
 fn validateFinalNativeImage(
@@ -4520,7 +4703,122 @@ test "root staging preserves intentionally inaccessible snapd directory" {
     );
 }
 
-test "native image conversion round trips and cleans failed publication stages" {
+const RecoveryDisposalProbe = struct {
+    recovery_path: []const u8,
+    called: bool = false,
+};
+
+fn expectRecoveryDisposedPublisher(
+    allocator: Allocator,
+    io: Io,
+    raw_path: []const u8,
+    destination_path: []const u8,
+    opaque_context: ?*anyopaque,
+) !void {
+    _ = allocator;
+    _ = raw_path;
+    _ = destination_path;
+    const context: *RecoveryDisposalProbe = @ptrCast(@alignCast(opaque_context.?));
+    try std.testing.expectError(
+        error.FileNotFound,
+        Dir.cwd().statFile(io, context.recovery_path, .{}),
+    );
+    context.called = true;
+}
+
+fn failNativePublicationNoSpace(
+    allocator: Allocator,
+    io: Io,
+    raw_path: []const u8,
+    destination_path: []const u8,
+    context: ?*anyopaque,
+) !void {
+    _ = allocator;
+    _ = io;
+    _ = raw_path;
+    _ = destination_path;
+    _ = context;
+    return error.NoSpaceLeft;
+}
+
+test "guest ESP capacity translation preserves host NoSpaceLeft" {
+    try std.testing.expectEqual(
+        error.GuestEspNoSpace,
+        translateGuestEspCapacity(error.FilesystemFull),
+    );
+    try std.testing.expectEqual(
+        error.NoSpaceLeft,
+        translateGuestEspCapacity(error.NoSpaceLeft),
+    );
+}
+
+test "durable native recovery is disposed before QCOW2 publication" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_length];
+    const recovery_path = try std.fs.path.join(allocator, &.{ root, "recovery" });
+    defer allocator.free(recovery_path);
+    const recovery_image = try std.fs.path.join(allocator, &.{ recovery_path, "stage" });
+    defer allocator.free(recovery_image);
+    const destination_path = try std.fs.path.join(allocator, &.{ root, "published.qcow2" });
+    defer allocator.free(destination_path);
+    try Dir.cwd().createDirPath(io, recovery_path);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = recovery_image,
+        .data = "displaced image",
+    });
+
+    var probe = RecoveryDisposalProbe{ .recovery_path = recovery_path };
+    try disposeRecoveryAndPublishNativeQcow2(
+        allocator,
+        io,
+        "missing.raw",
+        destination_path,
+        recovery_path,
+        .{
+            .context = &probe,
+            .publish = expectRecoveryDisposedPublisher,
+        },
+    );
+    try std.testing.expect(probe.called);
+}
+
+test "native QCOW2 host exhaustion has distinct context after recovery disposal" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_length];
+    const recovery_path = try std.fs.path.join(allocator, &.{ root, "recovery" });
+    defer allocator.free(recovery_path);
+    const destination_path = try std.fs.path.join(allocator, &.{ root, "published.qcow2" });
+    defer allocator.free(destination_path);
+    try Dir.cwd().createDirPath(io, recovery_path);
+
+    try std.testing.expectError(
+        error.HostNativeQcow2NoSpace,
+        disposeRecoveryAndPublishNativeQcow2(
+            allocator,
+            io,
+            "missing.raw",
+            destination_path,
+            recovery_path,
+            .{ .publish = failNativePublicationNoSpace },
+        ),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        Dir.cwd().statFile(io, recovery_path, .{}),
+    );
+}
+
+test "native image conversion round trips and failed publication cleans its stage" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const allocator = std.testing.allocator;
@@ -4560,6 +4858,14 @@ test "native image conversion round trips and cleans failed publication stages" 
     );
     defer allocator.free(staged);
     try std.testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, staged, .{}));
+    try std.testing.expectEqual(
+        Io.File.Kind.directory,
+        (try Dir.cwd().statFile(io, blocked_destination, .{})).kind,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 1024 * 1024),
+        (try Dir.cwd().statFile(io, raw_path, .{})).size,
+    );
 }
 
 test "the raw copy is the same guest bytes, published only once complete" {

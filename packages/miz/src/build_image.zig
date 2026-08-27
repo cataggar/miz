@@ -746,7 +746,7 @@ pub fn build(
             else
                 null,
         }) catch |err| switch (err) {
-            error.NoSpaceLeft => if (options.boot_mode != .bls_only)
+            error.FilesystemFull => if (options.boot_mode != .bls_only)
                 return error.EspTooSmallForBootArtifacts
             else
                 return err,
@@ -4342,7 +4342,7 @@ test "build-image reports MissingUkiStub for UKI mode without a stub" {
     }));
 }
 
-test "build-image wraps ESP NoSpaceLeft as EspTooSmallForBootArtifacts for UKI mode" {
+test "build-image wraps ESP FilesystemFull as EspTooSmallForBootArtifacts for UKI mode" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
