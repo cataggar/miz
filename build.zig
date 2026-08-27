@@ -827,6 +827,78 @@ pub fn build(b: *std.Build) void {
         "Run opt-in generalized FreeBSD 15.1 AArch64 QEMU acceptance",
     );
     freebsd_aarch64_boot_test_step.dependOn(&run_freebsd_boot_tests.step);
+
+    // ---- scripts/release: the shared foundation the Zig release tooling is
+    // built on -- failure diagnostics, bounded reads, atomic output staging,
+    // streaming SHA-256, and strict/canonical JSON documents. It is pure host
+    // code with no external tools behind it, so it builds and tests
+    // everywhere. ----
+    const release_support_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/release/root.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const release_support_tests = b.addTest(.{
+        .root_module = release_support_mod,
+    });
+    const run_release_support_tests = b.addRunArtifact(release_support_tests);
+    const release_support_test_step = b.step(
+        "test-release-support",
+        "Run shared release-tooling foundation unit tests",
+    );
+    release_support_test_step.dependOn(&run_release_support_tests.step);
+
+    // ---- scripts/azure_vhd.zig: fixed-VHD footer, geometry, and qemu-img
+    // agreement checks for Azure uploads, replacing scripts/azure_vhd.py.
+    // Validation only, so it is host-native everywhere the release jobs run.
+    const azure_vhd_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/azure_vhd.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "miz", .module = host_miz_mod },
+        },
+    });
+    const azure_vhd_exe = b.addExecutable(.{
+        .name = "azure_vhd",
+        .root_module = azure_vhd_mod,
+    });
+    b.installArtifact(azure_vhd_exe);
+    const azure_vhd_tests = b.addTest(.{ .root_module = azure_vhd_mod });
+    const run_azure_vhd_tests = b.addRunArtifact(azure_vhd_tests);
+    const azure_vhd_test_step = b.step(
+        "test-azure-vhd",
+        "Run Azure fixed-VHD validation unit tests",
+    );
+    azure_vhd_test_step.dependOn(&run_azure_vhd_tests.step);
+
+    // ---- tests/python_inventory.zig: the temporary, explicit inventory of
+    // the Python this repository still owns. It shells out to `git ls-files`
+    // and reads the tracked tree, so its result is never cacheable. ----
+    const python_inventory_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/python_inventory.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_python_inventory_tests = b.addRunArtifact(python_inventory_tests);
+    // The inventory's subject is the tracked tree, which is not an input the
+    // build graph models, so a cached result would speak for a tree that has
+    // since changed.
+    run_python_inventory_tests.has_side_effects = true;
+    // Naming the build root outright keeps the inventory independent of the
+    // directory the test binary happens to be started in, matching the stale
+    // brand guard.
+    run_python_inventory_tests.setEnvironmentVariable(
+        "MIZ_PYTHON_INVENTORY_ROOT",
+        b.build_root.path orelse ".",
+    );
+    const python_inventory_step = b.step(
+        "test-python-inventory",
+        "Check the temporary inventory of repository-owned Python",
+    );
+    python_inventory_step.dependOn(&run_python_inventory_tests.step);
     const unsafe_chroot_real_boot_exe = b.addExecutable(.{
         .name = "miz-unsafe-chroot-real-boot",
         .root_module = b.createModule(.{
@@ -1531,6 +1603,9 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(&run_qmp_schema_tests.step);
         aggregate_test_step.dependOn(&run_boot_smoke_tests.step);
         aggregate_test_step.dependOn(&run_freebsd_boot_tests.step);
+        aggregate_test_step.dependOn(&run_release_support_tests.step);
+        aggregate_test_step.dependOn(&run_azure_vhd_tests.step);
+        aggregate_test_step.dependOn(&run_python_inventory_tests.step);
         aggregate_test_step.dependOn(&run_nbd_mod_tests.step);
         aggregate_test_step.dependOn(&run_nbd_exe_tests.step);
         aggregate_test_step.dependOn(&run_nbd_server_tests.step);

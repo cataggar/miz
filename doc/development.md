@@ -243,6 +243,13 @@ miz/
                               #   architecture-matched UEFI QEMU, including
                               #   SSH and reboot
   scripts/
+    azure_vhd.zig              # fixed-VHD footer, geometry, and qemu-img
+                              #   agreement checks for Azure uploads
+                              #   (`zig build test-azure-vhd`)
+    release/                   # shared release-tooling foundation: failure
+                              #   diagnostics, bounded reads, atomic output
+                              #   staging, streaming SHA-256, and
+                              #   strict/canonical JSON documents
     build_generalized_azurelinux4.zig  # generalized Azure Linux 4 Gen2 QCOW2
                               #   builder (run via `zig build generalized-azurelinux4`)
     build_generalized_freebsd15.zig
@@ -289,6 +296,45 @@ read, a certificate that will not decode, and a `git ls-files` that will not
 run are all reported as violations, each naming the path (and, for content, the
 line) at fault. The quality job runs it as its own step so the signal stays
 distinct, and `test-ci` runs it too.
+
+### Migrating off Python
+
+The release, acceptance, and fixture tooling is being moved from Python to
+Zig one area at a time. While that is in progress, `tests/python_inventory.zig`
+(`zig build test-python-inventory`, and part of `zig build test-ci`) is an
+explicit, reviewable inventory of what is left:
+
+- every tracked `*.py` file, which is removed whole by its port; and
+- every *invocation site* in any other tracked file, with an exact count. An
+  invocation site is a word whose final path component is a lowercase
+  `python`, `python3`, or `python3.12` and that is used as a command: spelled
+  as an absolute or relative interpreter path, including a shebang, quoted in
+  an `argv` array, preceded by `env`, or followed by an argument. A bare token
+  followed by a bare word is a package list or a tool-presence check, a word
+  whose final component is not the interpreter is a library directory
+  (`/usr/lib/pythonN/dist-packages`) or a package (`python3-libs`), and a
+  capitalized mention is prose, so none of those count.
+
+Because only commands are counted, a doc comment explaining what a Zig module
+replaced never enters the inventory, and the list can only shrink as ports
+land. Each non-source entry says what its sites are: `.execution` runs Python
+here, `.documentation` shows a command to a reader, and `.reference` is an
+explicitly exempted compatibility string, such as an interpreter line in test
+data, that has the shape of a command but executes nothing.
+
+The test fails when a Python file or an invocation site is added or removed
+without the inventory being updated, and names the file and line of anything
+unaccounted for, so each port has to shrink the list in the same change that
+lands it. `.tools/` is excluded because it holds provisioned toolchains this
+repository does not own, and the inventory excludes itself because its own
+fixtures are the command spellings it detects. When the last entry is gone,
+the inventory is replaced by a permanent zero-Python guard.
+
+New Zig replacements build on `scripts/release/`, which carries the contracts
+every release script shares: a single-line failure diagnostic, digest and
+commit shape checks, bounded reads with file identity, atomic output staging,
+streaming SHA-256, and strict document reads with canonical
+(`sort_keys`, `indent=2`) document writes.
 
 ### Direct device-write integration
 
