@@ -245,6 +245,8 @@ pub fn signingBinding(
         entry.flavor,
     );
     const path = try join(allocator, &.{ root, name });
+    // The document stays alive on `allocator`: the binding's strings point
+    // into it, and the caller compares and writes them after this returns.
     var document = try json_document.readObject(
         allocator,
         io,
@@ -1014,6 +1016,14 @@ fn stageInner(
     try prepareStagingDirectory(io, arguments.output, transaction, diagnostic);
 
     var staged: std.ArrayList(StagedAsset) = .empty;
+    // Each verified candidate's document backs the values the staged record
+    // carries, so the documents outlive the loop and are released only once
+    // the manifest and the notes have been written from them.
+    var verified_documents: std.ArrayList(VerifiedCandidate) = .empty;
+    defer {
+        for (verified_documents.items) |*document| document.deinit();
+        verified_documents.deinit(allocator);
+    }
     var release_certificate_sha256: ?[]const u8 = null;
     var release_signing_certificate_sha256: ?[]const u8 = null;
     var release_signing_provider: ?Value = null;
@@ -1031,7 +1041,7 @@ fn stageInner(
             std.fs.path.dirname(found.path) orelse ".",
             entry.asset_name,
         });
-        var verified = try verifyCandidate(
+        try verified_documents.append(allocator, try verifyCandidate(
             allocator,
             io,
             found.path,
@@ -1039,8 +1049,8 @@ fn stageInner(
             entry.key,
             source_commit,
             diagnostic,
-        );
-        defer verified.deinit();
+        ));
+        const verified = &verified_documents.items[verified_documents.items.len - 1];
 
         const azure = azure_results.get(entry.key).?;
         const azure_map = &azure.document.parsed.value.object;
@@ -2051,12 +2061,42 @@ test "stage requires and copies exactly four bound assets" {
         try std.testing.expect(found);
     }
 
+    // The manifest and the notes carry values read out of each candidate
+    // document, which the staging loop must therefore keep alive.
+    for (assets, contracts.release_order) |asset, entry| {
+        const runner = try std.fmt.allocPrint(
+            arena.allocator(),
+            "runner-{s}",
+            .{entry.architecture},
+        );
+        try std.testing.expect(contracts.isString(
+            asset.object.get("build_runner"),
+            runner,
+        ));
+        const provenance_digest = contracts.stringOrNull(
+            asset.object.get("provenance_digest"),
+        ) orelse "";
+        try std.testing.expect(contract.isSha256Hex(provenance_digest));
+    }
+
     const notes = try fixture.read(staged.notes);
     try std.testing.expect(std.mem.indexOf(
         u8,
         notes,
         "No checksum sidecar assets are published",
     ) != null);
+    for (assets, contracts.release_order) |asset, entry| {
+        const line = try std.fmt.allocPrint(
+            arena.allocator(),
+            "- `{s}`: provenance `{s}`; hosted build on `runner-{s}`",
+            .{
+                entry.asset_name,
+                contracts.stringOrNull(asset.object.get("provenance_digest")).?,
+                entry.architecture,
+            },
+        );
+        try std.testing.expect(std.mem.indexOf(u8, notes, line) != null);
+    }
 }
 
 test "the candidate document records build validation, not local acceptance" {
