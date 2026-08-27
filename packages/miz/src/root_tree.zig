@@ -3916,7 +3916,7 @@ test "a tree's FAT32 size is one the tree fits in, and one byte less is not" {
         .volume_id = 0xFEED_FACE,
     });
     var short_fs = try fat32.open(&short_img, io, .{ .offset = 0, .length = too_small });
-    try std.testing.expectError(error.NoSpaceLeft, tree.populateFat32(&short_fs, .{}));
+    try std.testing.expectError(error.FilesystemFull, tree.populateFat32(&short_fs, .{}));
 }
 
 test "a FAT32 size accounts for a directory whose sibling sorts between it and its children" {

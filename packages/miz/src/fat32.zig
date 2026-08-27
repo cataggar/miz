@@ -183,6 +183,7 @@ pub const Error = error{
     DirectoryNotEmpty,
     DuplicateName,
     AlreadyExists,
+    FilesystemFull,
     NoSpaceLeft,
     BadClusterChain,
     UnexpectedEndOfFile,
@@ -732,7 +733,7 @@ pub const FileSystem = struct {
     }
 
     fn allocateCluster(self: *FileSystem, io: Io) MutationError!u32 {
-        if (self.free_cluster_count == 0) return error.NoSpaceLeft;
+        if (self.free_cluster_count == 0) return error.FilesystemFull;
         const max_cluster = self.info.maxClusterNumber();
         var probe = if (self.next_free_cluster < 2 or self.next_free_cluster > max_cluster) @as(u32, 2) else self.next_free_cluster;
         const start = probe;
@@ -745,7 +746,7 @@ pub const FileSystem = struct {
                 return probe;
             }
             probe = if (probe == max_cluster) 2 else probe + 1;
-            if (probe == start) return error.NoSpaceLeft;
+            if (probe == start) return error.FilesystemFull;
         }
     }
 
@@ -2292,6 +2293,27 @@ test "format writes FAT32 boot sector, FSInfo, backup boot sector, and root FAT 
     try std.testing.expectEqual(@as(u32, 0x0FFF_FFF8), std.mem.readInt(u32, fat0[0..4], .little) & fat_entry_mask);
     try std.testing.expectEqual(fat_entry_mask, std.mem.readInt(u32, fat0[4..8], .little) & fat_entry_mask);
     try std.testing.expectEqual(fat_entry_eoc, std.mem.readInt(u32, fat0[8..12], .little) & fat_entry_mask);
+}
+
+test "cluster exhaustion is distinct from host NoSpaceLeft" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(
+        std.testing.allocator,
+        io,
+        &temporary,
+        "test-fat32-full.img",
+    );
+    defer std.testing.allocator.free(path);
+
+    const partition_len: u64 = 64 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, partition_len, .{});
+    defer img.close(io);
+    try format(&img, io, .{ .partition_offset = 0, .partition_len = partition_len });
+    var fs = try open(&img, io, .{ .offset = 0, .length = partition_len });
+    fs.free_cluster_count = 0;
+    try std.testing.expectError(error.FilesystemFull, fs.writeFile(io, "full.bin", "x"));
 }
 
 test "format, write nested tree with VFAT long names, list, and read back" {

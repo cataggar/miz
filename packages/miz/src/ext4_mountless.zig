@@ -440,14 +440,107 @@ fn copySparseSource(
     logical_length: u64,
 ) Error!void {
     try destination.setLength(io, logical_length);
+    copySparseLinuxExtents(io, source, destination, logical_length) catch |err| switch (err) {
+        error.SparseExtentUnsupported => try copySparseContent(
+            io,
+            source,
+            destination,
+            logical_length,
+        ),
+        else => return err,
+    };
+}
+
+const SparseExtent = struct {
+    start: u64,
+    end: u64,
+};
+
+const linux_seek_data = 3;
+const linux_seek_hole = 4;
+
+fn linuxSparseSeek(file: Io.File, offset: u64, whence: usize) Error!?u64 {
+    if (comptime builtin.os.tag != .linux or @sizeOf(usize) != 8) {
+        return error.SparseExtentUnsupported;
+    }
+    const result = std.os.linux.lseek(
+        @intCast(file.handle),
+        std.math.cast(i64, offset) orelse return error.SparseExtentQueryFailed,
+        whence,
+    );
+    return switch (std.os.linux.errno(result)) {
+        .SUCCESS => @intCast(result),
+        .NXIO => null,
+        .INVAL, .OPNOTSUPP, .SPIPE => error.SparseExtentUnsupported,
+        else => error.SparseExtentQueryFailed,
+    };
+}
+
+fn nextSparseExtent(source: Io.File, offset: u64, logical_length: u64) Error!?SparseExtent {
+    const start = try linuxSparseSeek(source, offset, linux_seek_data) orelse return null;
+    if (start >= logical_length) return null;
+    const end = @min(
+        try linuxSparseSeek(source, start, linux_seek_hole) orelse logical_length,
+        logical_length,
+    );
+    if (end <= start) return error.SparseExtentQueryFailed;
+    return .{ .start = start, .end = end };
+}
+
+fn copySourceRange(
+    io: Io,
+    source: Io.File,
+    destination: Io.File,
+    start: u64,
+    end: u64,
+) Error!void {
+    var copy_buffer: [1024 * 1024]u8 = undefined;
+    var offset = start;
+    while (offset < end) {
+        const wanted: usize = @intCast(@min(@as(u64, copy_buffer.len), end - offset));
+        const got = try source.readPositionalAll(io, copy_buffer[0..wanted], offset);
+        if (got != wanted) return error.SourceChangedDuringCopy;
+        try destination.writePositionalAll(io, copy_buffer[0..got], offset);
+        offset += got;
+    }
+}
+
+fn copySparseLinuxExtents(
+    io: Io,
+    source: Io.File,
+    destination: Io.File,
+    logical_length: u64,
+) Error!void {
+    var offset: u64 = 0;
+    while (try nextSparseExtent(source, offset, logical_length)) |extent| {
+        try copySourceRange(io, source, destination, extent.start, extent.end);
+        offset = extent.end;
+    }
+}
+
+fn copySparseContent(
+    io: Io,
+    source: Io.File,
+    destination: Io.File,
+    logical_length: u64,
+) Error!void {
     var copy_buffer: [1024 * 1024]u8 = undefined;
     var copied: u64 = 0;
     while (copied < logical_length) {
         const wanted: usize = @intCast(@min(@as(u64, copy_buffer.len), logical_length - copied));
         const got = try source.readPositionalAll(io, copy_buffer[0..wanted], copied);
         if (got != wanted) return error.SourceChangedDuringCopy;
-        if (!std.mem.allEqual(u8, copy_buffer[0..got], 0)) {
-            try destination.writePositionalAll(io, copy_buffer[0..got], copied);
+        var chunk_offset: usize = 0;
+        while (chunk_offset < got) {
+            const end = @min(chunk_offset + 4096, got);
+            if (!std.mem.allEqual(u8, copy_buffer[chunk_offset..end], 0)) {
+                try destination.writePositionalAll(
+                    io,
+                    copy_buffer[chunk_offset..end],
+                    copied + chunk_offset,
+                );
+            }
+            chunk_offset = end;
         }
         copied += got;
     }
@@ -1527,7 +1620,7 @@ fn DirDelete(io: Io, path: []const u8) void {
     Io.Dir.cwd().deleteFile(io, path) catch {};
 }
 
-test "atomic source copy preserves sparse bytes and logical length" {
+test "atomic source copy preserves fragmented sparse extents and bytes" {
     const io = std.testing.io;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -1539,7 +1632,11 @@ test "atomic source copy preserves sparse bytes and logical length" {
     });
     defer source.close(io);
     try source.setLength(io, logical_length);
-    try source.writePositionalAll(io, "sparse-source", 1024 * 1024 + 123);
+    for (0..16) |index| {
+        const offset = index * 64 * 1024 + 123;
+        try source.writePositionalAll(io, &.{@intCast(index + 1)}, offset);
+    }
+    try source.sync(io);
 
     var destination = try temporary.dir.createFile(io, "destination.raw", .{
         .read = true,
@@ -1547,6 +1644,7 @@ test "atomic source copy preserves sparse bytes and logical length" {
     });
     defer destination.close(io);
     try copySparseSource(io, source, destination, logical_length);
+    try destination.sync(io);
     try std.testing.expectEqual(logical_length, (try destination.stat(io)).size);
 
     var source_buffer: [64 * 1024]u8 = undefined;
@@ -1580,10 +1678,9 @@ test "atomic source copy preserves sparse bytes and logical length" {
         &.{ root_buffer[0..root_length], "destination.raw" },
     );
     defer std.testing.allocator.free(destination_path);
-    if (free_space.fileUsage(destination_path)) |usage| {
-        try std.testing.expectEqual(logical_length, usage.logical_bytes);
-        try std.testing.expect(usage.allocated_bytes < usage.logical_bytes);
-    }
+    const usage = free_space.fileUsage(destination_path) orelse return error.SkipZigTest;
+    try std.testing.expectEqual(logical_length, usage.logical_bytes);
+    try std.testing.expect(usage.allocated_bytes < 512 * 1024);
 }
 
 pub const NativeFilesystem = FileSystem;

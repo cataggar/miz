@@ -3662,6 +3662,10 @@ fn espPartition(partitions: []const miz.gpt.PartitionEntry) !miz.gpt.PartitionEn
     return found orelse error.MissingEspPartition;
 }
 
+fn translateGuestEspCapacity(err: anyerror) anyerror {
+    return if (err == error.FilesystemFull) error.GuestEspNoSpace else err;
+}
+
 fn insertSignedUki(
     allocator: Allocator,
     io: Io,
@@ -3679,12 +3683,12 @@ fn insertSignedUki(
         .length = (esp.last_lba - esp.first_lba + 1) * miz.gpt.sector_size,
     });
     filesystem.createDir(io, "EFI/BOOT") catch |err| {
-        if (err == error.NoSpaceLeft) {
+        if (err == error.FilesystemFull) {
             std.debug.print(
                 "guest ESP capacity exhausted while creating EFI/BOOT\n",
                 .{},
             );
-            return error.GuestEspNoSpace;
+            return translateGuestEspCapacity(err);
         }
         return err;
     };
@@ -3704,12 +3708,12 @@ fn insertSignedUki(
         };
     }
     filesystem.writeFile(io, fallback, signed) catch |err| {
-        if (err == error.NoSpaceLeft) {
+        if (err == error.FilesystemFull) {
             std.debug.print(
                 "guest ESP capacity exhausted while writing {s} ({d} bytes)\n",
                 .{ fallback, signed.len },
             );
-            return error.GuestEspNoSpace;
+            return translateGuestEspCapacity(err);
         }
         return err;
     };
@@ -4735,6 +4739,17 @@ fn failNativePublicationNoSpace(
     _ = destination_path;
     _ = context;
     return error.NoSpaceLeft;
+}
+
+test "guest ESP capacity translation preserves host NoSpaceLeft" {
+    try std.testing.expectEqual(
+        error.GuestEspNoSpace,
+        translateGuestEspCapacity(error.FilesystemFull),
+    );
+    try std.testing.expectEqual(
+        error.NoSpaceLeft,
+        translateGuestEspCapacity(error.NoSpaceLeft),
+    );
 }
 
 test "durable native recovery is disposed before QCOW2 publication" {
