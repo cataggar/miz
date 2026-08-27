@@ -874,8 +874,7 @@ pub fn build(b: *std.Build) void {
 
     // ---- tests/python_inventory.zig: the temporary, explicit inventory of
     // the Python this repository still owns. It shells out to `git ls-files`
-    // and reads the working tree, so its result is never cacheable and it must
-    // run from the repository root. ----
+    // and reads the tracked tree, so its result is never cacheable. ----
     const python_inventory_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/python_inventory.zig"),
@@ -884,8 +883,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_python_inventory_tests = b.addRunArtifact(python_inventory_tests);
-    run_python_inventory_tests.setCwd(b.path("."));
+    // The inventory's subject is the tracked tree, which is not an input the
+    // build graph models, so a cached result would speak for a tree that has
+    // since changed.
     run_python_inventory_tests.has_side_effects = true;
+    // Naming the build root outright keeps the inventory independent of the
+    // directory the test binary happens to be started in, matching the stale
+    // brand guard.
+    run_python_inventory_tests.setEnvironmentVariable(
+        "MIZ_PYTHON_INVENTORY_ROOT",
+        b.build_root.path orelse ".",
+    );
     const python_inventory_step = b.step(
         "test-python-inventory",
         "Check the temporary inventory of repository-owned Python",

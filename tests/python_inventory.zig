@@ -84,7 +84,7 @@ const inventory = [_]Entry{
     .{
         .path = ".github/workflows/ci.yml",
         .kind = .execution,
-        .sites = 4,
+        .sites = 3,
         .note = "unittest invocations for the remaining Python test suites",
     },
     .{
@@ -128,18 +128,6 @@ const inventory = [_]Entry{
         .kind = .reference,
         .sites = 2,
         .note = "hook interpreter lines in test data; nothing runs them",
-    },
-    .{
-        .path = "packages/miz/src/kernel_modules.zig",
-        .kind = .execution,
-        .sites = 1,
-        .note = "test-only XZ fixture built by spawning python3",
-    },
-    .{
-        .path = "packages/miz/src/squashfs.zig",
-        .kind = .execution,
-        .sites = 1,
-        .note = "test-only XZ fixture built by spawning python3",
     },
     .{
         .path = "packages/miz/src/unsafe_chroot.zig",
@@ -267,11 +255,6 @@ const inventory = [_]Entry{
         .note = "ported by the FreeBSD release slice",
     },
     .{
-        .path = "tests/stale_brand_test.py",
-        .kind = .source,
-        .note = "ported by the stale brand guard slice",
-    },
-    .{
         .path = "tests/ubuntu2604_acceptance.zig",
         .kind = .execution,
         .sites = 1,
@@ -311,8 +294,8 @@ const inventory = [_]Entry{
 
 /// Totals restated so a diff shows the migration moving. Both must only ever
 /// decrease; an increase means a new Python dependency was introduced.
-const remaining_source_files = 20;
-const remaining_execution_sites = 119;
+const remaining_source_files = 19;
+const remaining_execution_sites = 116;
 
 /// No tracked file is anywhere near this size, and the limit keeps a stray
 /// large blob from being read into memory by this scan.
@@ -457,9 +440,22 @@ const TrackedFiles = struct {
     }
 };
 
-fn trackedFiles(allocator: Allocator, io: Io) !TrackedFiles {
+/// The tree to scan. `build.zig` names the build root outright, so the guard
+/// does not depend on which directory the test binary was started in, matching
+/// the stale brand guard next to it. Caller owns the returned path.
+fn repositoryRootAlloc(allocator: Allocator) ![]u8 {
+    return std.testing.environ.getAlloc(
+        allocator,
+        "MIZ_PYTHON_INVENTORY_ROOT",
+    ) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => allocator.dupe(u8, "."),
+        else => return err,
+    };
+}
+
+fn trackedFiles(allocator: Allocator, io: Io, root: []const u8) !TrackedFiles {
     const result = try std.process.run(allocator, io, .{
-        .argv = &.{ "git", "ls-files", "-z" },
+        .argv = &.{ "git", "-C", root, "ls-files", "-z" },
         .stdout_limit = .limited(4 * 1024 * 1024),
     });
     defer allocator.free(result.stderr);
@@ -507,7 +503,9 @@ test "every tracked Python file is inventoried as a source entry" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    var tracked = try trackedFiles(allocator, io);
+    const root = try repositoryRootAlloc(allocator);
+    defer allocator.free(root);
+    var tracked = try trackedFiles(allocator, io, root);
     defer tracked.deinit();
 
     var failures: Writer.Allocating = .init(allocator);
@@ -551,7 +549,9 @@ test "every Python invocation site outside a Python file is inventoried" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    var tracked = try trackedFiles(allocator, io);
+    const root = try repositoryRootAlloc(allocator);
+    defer allocator.free(root);
+    var tracked = try trackedFiles(allocator, io, root);
     defer tracked.deinit();
 
     var seen = std.StringHashMap(void).init(allocator);
@@ -566,7 +566,10 @@ test "every Python invocation site outside a Python file is inventoried" {
         if (isPythonSourcePath(path)) continue;
         if (std.mem.eql(u8, path, guard_path)) continue;
 
-        const stat = Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        const full_path = try std.fs.path.join(allocator, &.{ root, path });
+        defer allocator.free(full_path);
+
+        const stat = Dir.cwd().statFile(io, full_path, .{}) catch |err| switch (err) {
             // A tracked symlink pointing outside the tree is not a file to
             // scan; nothing else may fail silently.
             error.FileNotFound => continue,
@@ -577,7 +580,7 @@ test "every Python invocation site outside a Python file is inventoried" {
 
         const contents = try Dir.cwd().readFileAlloc(
             io,
-            path,
+            full_path,
             allocator,
             .limited(max_tracked_file_bytes),
         );
@@ -586,10 +589,14 @@ test "every Python invocation site outside a Python file is inventoried" {
         const sites = try scanFile(contents, path, null);
         const entry = find(path);
         if (sites == 0) {
-            if (entry != null) try failures.writer.print(
-                "{s}: inventoried but invokes Python nowhere; remove the entry\n",
-                .{path},
-            );
+            if (entry != null) {
+                // Recorded as seen so the sweep below does not repeat this.
+                try seen.put(path, {});
+                try failures.writer.print(
+                    "{s}: inventoried but invokes Python nowhere; remove the entry\n",
+                    .{path},
+                );
+            }
             continue;
         }
 
