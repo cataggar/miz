@@ -615,7 +615,7 @@ fn ensureGuestPathAbsent(
     if (reader.statPath(io, path)) |_| {
         return error.GuestPathUnexpectedlyPresent;
     } else |err| switch (err) {
-        error.FileNotFound => {},
+        error.NotFound => {},
         else => return err,
     }
 }
