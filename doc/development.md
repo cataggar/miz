@@ -258,9 +258,14 @@ miz/
     zstd_max_preload.zig       # LD_PRELOAD shared library that forces maximum
                               #   zstd compression level in qemu-img
     ci/
-      make-minimal-oci-fixture.py   # builds a tiny from-scratch OCI layout
-                              #   used as the boot-smoke tests' --container
-                              #   fixture in CI
+      make_oci_fixture.zig    # `zig build oci-fixture -- <minimal|uki-stub|
+                              #   verity-initramfs> ...`: builds the
+                              #   from-scratch OCI layouts the boot-smoke
+                              #   workflow passes back in as --container /
+                              #   MIZ_BOOT_TEST_*_OCI
+      oci_fixture.zig         # single-layer layout builder shared by those
+                              #   subcommands, over the miz tar writer and
+                              #   the miz.oci transactional layout destination
       fetch-vm-boot-kernel.sh # fetches the kernel the vm backend's real-boot
                               #   tests boot a guest with, for either
                               #   architecture
@@ -435,7 +440,7 @@ cover both halves of that sentence:
   tree to the subtrees the closure can reach. It needs `binutils` (for `ar`)
   and `kmod` (for `depmod`).
 
-`.github/workflows/boot-smoke.yml` runs `zig build test-boot-smoke` for every release tag and when manually dispatched. It installs `qemu-system-x86`/`ovmf`, downloads and caches the [Azure Linux 4.0 ISO](https://aka.ms/azurelinux-4.0-x86_64.iso), and builds the OCI fixtures used by the real-QEMU tests. The job is required (not `continue-on-error`) for release tags but is not part of universal pull-request CI.
+`.github/workflows/boot-smoke.yml` runs `zig build test-boot-smoke` for every release tag and when manually dispatched. It installs `qemu-system-x86`/`ovmf`, downloads and caches the [Azure Linux 4.0 ISO](https://aka.ms/azurelinux-4.0-x86_64.iso), and builds the OCI fixtures used by the real-QEMU tests with `zig build oci-fixture -- <minimal|uki-stub|verity-initramfs> ...`. The job is required (not `continue-on-error`) for release tags but is not part of universal pull-request CI.
 
 
 ## Notes on Zig 0.16

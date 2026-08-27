@@ -76,12 +76,6 @@ const inventory = [_]Entry{
         .note = "inline Python plus azurelinux4_release.py",
     },
     .{
-        .path = ".github/workflows/boot-smoke.yml",
-        .kind = .execution,
-        .sites = 3,
-        .note = "the three OCI fixture generators under scripts/ci",
-    },
-    .{
         .path = ".github/workflows/ci.yml",
         .kind = .execution,
         .sites = 3,
@@ -162,26 +156,6 @@ const inventory = [_]Entry{
         .path = "scripts/azurelinux4_release.py",
         .kind = .source,
         .note = "ported by the Azure Linux release slice",
-    },
-    .{
-        .path = "scripts/ci/make-minimal-oci-fixture.py",
-        .kind = .source,
-        .note = "ported by the OCI fixture slice",
-    },
-    .{
-        .path = "scripts/ci/make-uki-stub-oci-fixture.py",
-        .kind = .source,
-        .note = "ported by the OCI fixture slice",
-    },
-    .{
-        .path = "scripts/ci/make-verity-initramfs-oci-fixture.py",
-        .kind = .source,
-        .note = "ported by the OCI fixture slice",
-    },
-    .{
-        .path = "scripts/ci/oci_layout.py",
-        .kind = .source,
-        .note = "ported by the OCI fixture slice",
     },
     .{
         .path = "scripts/freebsd15_azure_acceptance.sh",
@@ -294,8 +268,8 @@ const inventory = [_]Entry{
 
 /// Totals restated so a diff shows the migration moving. Both must only ever
 /// decrease; an increase means a new Python dependency was introduced.
-const remaining_source_files = 19;
-const remaining_execution_sites = 116;
+const remaining_source_files = 15;
+const remaining_execution_sites = 113;
 
 /// No tracked file is anywhere near this size, and the limit keeps a stray
 /// large blob from being read into memory by this scan.
