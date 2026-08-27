@@ -305,16 +305,26 @@ Zig one area at a time. While that is in progress, `tests/python_inventory.zig`
 explicit, reviewable inventory of what is left:
 
 - every tracked `*.py` file, which is removed whole by its port; and
-- every other tracked file that mentions Python, with the exact number of
-  lines that mention it, classified as `.execution` (it actually runs
-  Python), `.documentation` (it shows a Python command to a reader), or
-  `.reference` (a package name or prose with no execution behind it).
+- every *invocation site* in any other tracked file, with an exact count. An
+  invocation site is a lowercase `python`, `python3`, or `python3.12` token
+  used as a command: quoted in an `argv` array, preceded by `env`, or followed
+  by an argument. A token followed by a bare word is a package list or a
+  tool-presence check, and a capitalized mention is prose, so neither counts.
 
-The test fails when a file is added, removed, or changes its count without the
-inventory being updated, so each port has to shrink the list in the same change
-that lands it. `.tools/` is excluded because it holds provisioned toolchains
-this repository does not own. When the last entry is gone, the inventory is
-replaced by a permanent zero-Python guard.
+Because only commands are counted, a doc comment explaining what a Zig module
+replaced never enters the inventory, and the list can only shrink as ports
+land. Each non-source entry says what its sites are: `.execution` runs Python
+here, `.documentation` shows a command to a reader, and `.reference` is an
+explicitly exempted compatibility string, such as an interpreter line in test
+data, that has the shape of a command but executes nothing.
+
+The test fails when a Python file or an invocation site is added or removed
+without the inventory being updated, and names the file and line of anything
+unaccounted for, so each port has to shrink the list in the same change that
+lands it. `.tools/` is excluded because it holds provisioned toolchains this
+repository does not own, and the inventory excludes itself because its own
+fixtures are the command spellings it detects. When the last entry is gone,
+the inventory is replaced by a permanent zero-Python guard.
 
 New Zig replacements build on `scripts/release/`, which carries the contracts
 every release script shares: a single-line failure diagnostic, digest and
