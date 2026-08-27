@@ -70,24 +70,6 @@ const guard_path = "tests/python_inventory.zig";
 /// Sorted by path. Keep it sorted: review reads this as a checklist.
 const inventory = [_]Entry{
     .{
-        .path = ".github/workflows/ci.yml",
-        .kind = .execution,
-        .sites = 1,
-        .note = "the unittest invocation for the remaining Ubuntu suites",
-    },
-    .{
-        .path = ".github/workflows/ubuntu2604-core-validation.yml",
-        .kind = .execution,
-        .sites = 10,
-        .note = "ubuntu2604_release.py and inline Python",
-    },
-    .{
-        .path = ".github/workflows/ubuntu2604-release.yml",
-        .kind = .execution,
-        .sites = 7,
-        .note = "ubuntu2604_release.py and inline Python",
-    },
-    .{
         .path = "packages/miz/src/customize.zig",
         .kind = .reference,
         .sites = 2,
@@ -111,60 +93,17 @@ const inventory = [_]Entry{
         .note = "superseded by scripts/azure_vhd.zig; no caller runs the Python",
     },
     .{
-        .path = "scripts/ubuntu2604_azure_acceptance.sh",
-        .kind = .execution,
-        .sites = 22,
-        .note = "inline Python and ubuntu2604_release.py",
-    },
-    .{
-        .path = "scripts/ubuntu2604_local_e2e.sh",
-        .kind = .execution,
-        .sites = 1,
-        .note = "inline Python that checks the local image-info document",
-    },
-    .{
-        .path = "scripts/ubuntu2604_publish.sh",
-        .kind = .execution,
-        .sites = 8,
-        .note = "inline Python and ubuntu2604_release.py",
-    },
-    .{
-        .path = "scripts/ubuntu2604_release.py",
-        .kind = .source,
-        .note = "ported by the Ubuntu release slice",
-    },
-    .{
         .path = "tests/ubuntu2604_acceptance.zig",
         .kind = .execution,
         .sites = 1,
         .note = "guest-side script parses cloud-init status with python3",
     },
-    .{
-        .path = "tests/ubuntu2604_azure_acceptance_test.py",
-        .kind = .source,
-        .note = "ported by the Ubuntu release slice",
-    },
-    .{
-        .path = "tests/ubuntu2604_core_workflow_test.py",
-        .kind = .source,
-        .note = "ported by the Ubuntu release slice",
-    },
-    .{
-        .path = "tests/ubuntu2604_release_test.py",
-        .kind = .source,
-        .note = "ported by the Ubuntu release slice",
-    },
-    .{
-        .path = "tests/ubuntu2604_workflow_test.py",
-        .kind = .source,
-        .note = "ported by the Ubuntu release slice",
-    },
 };
 
 /// Totals restated so a diff shows the migration moving. Both must only ever
 /// decrease; an increase means a new Python dependency was introduced.
-const remaining_source_files = 6;
-const remaining_execution_sites = 50;
+const remaining_source_files = 1;
+const remaining_execution_sites = 1;
 
 /// No tracked file is anywhere near this size, and the limit keeps a stray
 /// large blob from being read into memory by this scan.

@@ -1213,6 +1213,101 @@ pub fn build(b: *std.Build) void {
     );
     freebsd15_acceptance_test_step.dependOn(&run_freebsd15_acceptance_tests.step);
 
+    // ---- scripts/ubuntu2604_release.zig: the Ubuntu 26.04 release schema,
+    // provenance, acceptance, staging, and workflow-gate tooling, replacing
+    // scripts/ubuntu2604_release.py and the inline Python its callers
+    // embedded. Validation only, so it is host-native everywhere the release
+    // and core-validation jobs run. ----
+    const ubuntu2604_release_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/ubuntu2604_release.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "miz", .module = host_miz_mod },
+        },
+    });
+    const ubuntu2604_release_exe = b.addExecutable(.{
+        .name = "ubuntu2604_release",
+        .root_module = ubuntu2604_release_mod,
+    });
+    ci_production_entrypoint_check.dependOn(&ubuntu2604_release_exe.step);
+    const install_ubuntu2604_release = b.addInstallArtifact(
+        ubuntu2604_release_exe,
+        .{},
+    );
+    b.getInstallStep().dependOn(&install_ubuntu2604_release.step);
+    // The release and core-validation build jobs install only the tools they
+    // use, so the release tooling needs a step of its own next to install-miz.
+    const install_ubuntu2604_release_step = b.step(
+        "install-ubuntu2604-release",
+        "Install only the Ubuntu 26.04 release tooling",
+    );
+    install_ubuntu2604_release_step.dependOn(&install_ubuntu2604_release.step);
+    const ubuntu2604_release_tests = b.addTest(.{
+        .root_module = ubuntu2604_release_mod,
+    });
+    const run_ubuntu2604_release_tests = b.addRunArtifact(ubuntu2604_release_tests);
+    const ubuntu2604_release_test_step = b.step(
+        "test-ubuntu2604-release",
+        "Run Ubuntu 26.04 release tooling unit tests",
+    );
+    ubuntu2604_release_test_step.dependOn(&run_ubuntu2604_release_tests.step);
+
+    // ---- tests/ubuntu2604_release.zig: behavioral coverage of the release
+    // tooling, driving the same commands the subcommands do against complete
+    // generated bundles. Replaces tests/ubuntu2604_release_test.py. ----
+    const ubuntu2604_release_behavior_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/ubuntu2604_release.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "miz", .module = host_miz_mod },
+                .{
+                    .name = "ubuntu2604_release",
+                    .module = ubuntu2604_release_mod,
+                },
+            },
+        }),
+    });
+    const run_ubuntu2604_release_behavior =
+        b.addRunArtifact(ubuntu2604_release_behavior_tests);
+    ubuntu2604_release_test_step.dependOn(&run_ubuntu2604_release_behavior.step);
+
+    // ---- tests/ubuntu2604_workflow.zig, tests/ubuntu2604_core_workflow.zig,
+    // tests/ubuntu2604_azure_acceptance.zig: structural guards over the Ubuntu
+    // release workflows and harnesses. Their subject is the tracked source, so
+    // they read the build root rather than the working directory and are never
+    // cached. Replace the Python workflow/acceptance suites. ----
+    const ubuntu2604_guard_sources = [_][]const u8{
+        "tests/ubuntu2604_workflow.zig",
+        "tests/ubuntu2604_core_workflow.zig",
+        "tests/ubuntu2604_azure_acceptance.zig",
+    };
+    var run_ubuntu2604_guards: [ubuntu2604_guard_sources.len]*std.Build.Step.Run =
+        undefined;
+    const ubuntu2604_guard_step = b.step(
+        "test-ubuntu2604-workflow",
+        "Check the Ubuntu 26.04 release workflow and harness contracts",
+    );
+    for (ubuntu2604_guard_sources, 0..) |guard_source, guard_index| {
+        const guard_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(guard_source),
+                .target = b.graph.host,
+                .optimize = optimize,
+            }),
+        });
+        const run_guard = b.addRunArtifact(guard_tests);
+        run_guard.has_side_effects = true;
+        run_guard.setEnvironmentVariable(
+            "MIZ_UBUNTU2604_SOURCE_ROOT",
+            b.build_root.path orelse ".",
+        );
+        run_ubuntu2604_guards[guard_index] = run_guard;
+        ubuntu2604_guard_step.dependOn(&run_guard.step);
+    }
+
     // ---- tests/python_inventory.zig: the temporary, explicit inventory of
     // the Python this repository still owns. It shells out to `git ls-files`
     // and reads the tracked tree, so its result is never cacheable. ----
@@ -1957,6 +2052,11 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(&run_freebsd15_release_tests.step);
         aggregate_test_step.dependOn(&run_freebsd15_contract_tests.step);
         aggregate_test_step.dependOn(&run_freebsd15_acceptance_tests.step);
+        aggregate_test_step.dependOn(&run_ubuntu2604_release_tests.step);
+        aggregate_test_step.dependOn(&run_ubuntu2604_release_behavior.step);
+        for (run_ubuntu2604_guards) |run_guard| {
+            aggregate_test_step.dependOn(&run_guard.step);
+        }
         aggregate_test_step.dependOn(&run_python_inventory_tests.step);
         aggregate_test_step.dependOn(&run_nbd_mod_tests.step);
         aggregate_test_step.dependOn(&run_nbd_exe_tests.step);

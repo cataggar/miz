@@ -36,14 +36,6 @@ jobs:
       - name: Stale brand guard
         run: zig build test-stale-brand --summary all
 
-      - name: Ubuntu release and validation workflow unit tests
-        run: |
-          python3 -m unittest \
-            tests.ubuntu2604_release_test \
-            tests.ubuntu2604_workflow_test \
-            tests.ubuntu2604_core_workflow_test \
-            tests.ubuntu2604_azure_acceptance_test
-
   zig-tests:
     # Keep the protected-branch context stable while changing the job graph.
     name: build + test

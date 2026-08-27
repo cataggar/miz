@@ -1,0 +1,836 @@
+//! Guards for `scripts/ubuntu2604_azure_acceptance.sh` and its library.
+//!
+//! Two kinds of assertion live here, and both come from the Python suite this
+//! replaces.
+//!
+//! The first is structural: the harness's guest contracts, its Binder and
+//! Android smoke sections, its diagnostics, and its refusal to persist boot
+//! diagnostic SAS URIs are all expressed as shell text, so they are checked as
+//! shell text.
+//!
+//! The second actually runs the harness. `cleanup` is the one path that
+//! deletes Azure resources, so its identity validation and its ownership-tag
+//! check are exercised end to end against a stub `az`, including the
+//! regression that a non-exact tag set must abort the delete.
+
+const std = @import("std");
+
+const Allocator = std.mem.Allocator;
+const Dir = std.Io.Dir;
+const source = @import("ubuntu2604_source.zig");
+
+const Source = source.Source;
+const script_path = "scripts/ubuntu2604_azure_acceptance.sh";
+const library_path = "scripts/ubuntu2604_azure_acceptance_lib.sh";
+
+fn open() !Source {
+    return Source.open(std.testing.allocator, script_path);
+}
+
+test "the cleanup identity check accepts every candidate key and rejects the rest" {
+    var harness = try Harness.create();
+    defer harness.deinit();
+
+    const keys = [_][]const u8{
+        "x86_64-full",
+        "aarch64-full",
+        "x86_64-core",
+        "aarch64-core",
+    };
+    for (keys) |key| {
+        const result = try harness.runCleanup(key, &.{});
+        defer result.deinit(std.testing.allocator);
+        if (!result.succeeded()) {
+            std.debug.print("{s}: cleanup rejected a valid key: {s}\n", .{
+                key,
+                result.stderr,
+            });
+            return error.UnexpectedCleanupFailure;
+        }
+    }
+
+    const rejected = try harness.runCleanup("riscv64-core", &.{});
+    defer rejected.deinit(std.testing.allocator);
+    try std.testing.expect(!rejected.succeeded());
+}
+
+test "extra command arguments are a usage error" {
+    var harness = try Harness.create();
+    defer harness.deinit();
+    const result = try harness.run(
+        &.{ "cleanup", "unexpected" },
+        "x86_64-full",
+        &.{},
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u8, 2), result.exitCode());
+    try source.expectContainsIn(result.stderr, "usage:", "cleanup usage");
+}
+
+test "the candidate identity helper requires the exact flavor/asset tuple" {
+    var harness = try Harness.create();
+    defer harness.deinit();
+
+    const valid = [_][2][]const u8{
+        .{ "x86_64-full", "Ubuntu-26.04-x86_64.qcow2" },
+        .{ "aarch64-full", "Ubuntu-26.04-aarch64.qcow2" },
+        .{ "x86_64-core", "Ubuntu-26.04-x86_64.core.qcow2" },
+        .{ "aarch64-core", "Ubuntu-26.04-aarch64.core.qcow2" },
+    };
+    for (valid) |entry| {
+        const key = entry[0];
+        const asset = entry[1];
+        const separator = std.mem.indexOfScalar(u8, key, '-').?;
+        const architecture = key[0..separator];
+        const flavor = key[separator + 1 ..];
+
+        var command_buffer: [256]u8 = undefined;
+        const command = try std.fmt.bufPrint(
+            &command_buffer,
+            "ubuntu2604_validate_candidate_identity {s} {s} {s} {s}",
+            .{ key, architecture, flavor, asset },
+        );
+        const result = try harness.runLibrary(command);
+        defer result.deinit(std.testing.allocator);
+        if (!result.succeeded()) {
+            std.debug.print("{s}: rejected a valid tuple: {s}\n", .{ key, result.stderr });
+            return error.UnexpectedIdentityFailure;
+        }
+
+        var asset_buffer: [128]u8 = undefined;
+        const asset_command = try std.fmt.bufPrint(
+            &asset_buffer,
+            "ubuntu2604_expected_asset {s} {s}",
+            .{ architecture, flavor },
+        );
+        const asset_result = try harness.runLibrary(asset_command);
+        defer asset_result.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(
+            asset,
+            std.mem.trim(u8, asset_result.stdout, " \n"),
+        );
+    }
+
+    const rejected = [_][]const u8{
+        "ubuntu2604_validate_candidate_identity x86_64-core x86_64 full Ubuntu-26.04-x86_64.core.qcow2",
+        "ubuntu2604_validate_candidate_identity x86_64-core x86_64 core Ubuntu-26.04-x86_64.qcow2",
+        "ubuntu2604_validate_candidate_identity riscv64-core riscv64 core Ubuntu-26.04-riscv64.core.qcow2",
+    };
+    for (rejected) |command| {
+        const result = try harness.runLibrary(command);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(!result.succeeded());
+    }
+}
+
+test "the curl auth header is a private bearer header written with mode 0600" {
+    var harness = try Harness.create();
+    defer harness.deinit();
+
+    var header_buffer: [512]u8 = undefined;
+    const header = try harness.path(&header_buffer, "auth-header");
+    const token = "regression-token-not-a-secret";
+    var command_buffer: [1024]u8 = undefined;
+    const command = try std.fmt.bufPrint(
+        &command_buffer,
+        "write_bearer_header '{s}' '{s}'",
+        .{ token, header },
+    );
+    const result = try harness.runLibrary(command);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.succeeded());
+    try source.expectOmitsIn(result.stdout, token, "write_bearer_header stdout");
+    try source.expectOmitsIn(result.stderr, token, "write_bearer_header stderr");
+
+    const written = try Dir.cwd().readFileAlloc(
+        std.testing.io,
+        header,
+        std.testing.allocator,
+        .limited(1024),
+    );
+    defer std.testing.allocator.free(written);
+    var expected_buffer: [256]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buffer,
+        "Authorization: Bearer {s}\n",
+        .{token},
+    );
+    try std.testing.expectEqualStrings(expected, written);
+    const stat = try Dir.cwd().statFile(std.testing.io, header, .{});
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0o600),
+        stat.permissions.toMode() & 0o777,
+    );
+
+    var script = try open();
+    defer script.deinit();
+    try script.expectContains("write_bearer_header \"$token\" \"$auth_header\"\n  token=");
+    try script.expectContains("--header \"@$auth_header\"");
+}
+
+test "cleanup deletes only a resource group whose ownership tags are exact" {
+    var harness = try Harness.create();
+    defer harness.deinit();
+    try harness.writeStubAz();
+
+    var state_buffer: [512]u8 = undefined;
+    const state = try harness.path(&state_buffer, "state");
+    try Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = state,
+        .data = "miz-u2604-123-4-x86-64-full\n",
+    });
+    var marker_buffer: [512]u8 = undefined;
+    const marker = try harness.path(&marker_buffer, "deleted");
+
+    const exact =
+        \\{"miz-owner": "ubuntu2604-release", "miz-run-id": "123",
+        \\ "miz-run-attempt": "4", "miz-candidate": "x86_64-full"}
+    ;
+    var tags_buffer: [512]u8 = undefined;
+    var marker_variable_buffer: [512]u8 = undefined;
+    const tags_variable = try std.fmt.bufPrint(
+        &tags_buffer,
+        "MOCK_TAGS={s}",
+        .{exact},
+    );
+    const marker_variable = try std.fmt.bufPrint(
+        &marker_variable_buffer,
+        "DELETE_MARKER={s}",
+        .{marker},
+    );
+
+    const accepted = try harness.run(
+        &.{"cleanup"},
+        "x86_64-full",
+        &.{ tags_variable, marker_variable },
+    );
+    defer accepted.deinit(std.testing.allocator);
+    if (!accepted.succeeded()) {
+        std.debug.print("cleanup refused exact tags: {s}\n", .{accepted.stderr});
+        return error.UnexpectedCleanupFailure;
+    }
+    try std.testing.expect(
+        Dir.cwd().statFile(std.testing.io, marker, .{}) catch null != null,
+    );
+
+    try Dir.cwd().deleteFile(std.testing.io, marker);
+    const foreign =
+        \\{"miz-owner": "someone-else", "miz-run-id": "123",
+        \\ "miz-run-attempt": "4", "miz-candidate": "x86_64-full"}
+    ;
+    var foreign_buffer: [512]u8 = undefined;
+    const foreign_variable = try std.fmt.bufPrint(
+        &foreign_buffer,
+        "MOCK_TAGS={s}",
+        .{foreign},
+    );
+    const refused = try harness.run(
+        &.{"cleanup"},
+        "x86_64-full",
+        &.{ foreign_variable, marker_variable },
+    );
+    defer refused.deinit(std.testing.allocator);
+    try std.testing.expect(!refused.succeeded());
+    try std.testing.expectError(
+        error.FileNotFound,
+        Dir.cwd().statFile(std.testing.io, marker, .{}),
+    );
+}
+
+test "the conversion attestation binds the qemu info digest" {
+    var script = try open();
+    defer script.deinit();
+    // The attestation is derived from the qemu-img document itself, and its
+    // digest is recorded in the attestation the acceptance result binds.
+    try script.expectContains("\"$RELEASE_TOOL\" azure-conversion-attestation");
+    try script.expectContains("--info \"$RESULT_DIR/vhd-info.json\"");
+    try script.expectContains("--vhd-current-size \"$vhd_current_size\"");
+    // The acceptance result re-derives every size from the attestation and the
+    // VHD, so it never accepts a size as an argument.
+    const azure_result = try script.section(
+        "\"$RELEASE_TOOL\" azure-result \\",
+        "\n\"$RELEASE_TOOL\" verify-azure-result",
+    );
+    try source.expectContainsIn(
+        azure_result,
+        "--vhd-info \"$RESULT_DIR/vhd-info.json\"",
+        "azure-result",
+    );
+    try source.expectContainsIn(
+        azure_result,
+        "--conversion-attestation \"$conversion_attestation\"",
+        "azure-result",
+    );
+    try source.expectOmitsIn(azure_result, "--vhd-current-size", "azure-result");
+    try source.expectOmitsIn(azure_result, "--vhd-bytes", "azure-result");
+}
+
+test "core contract checks are explicit and the full checks are preserved" {
+    var script = try open();
+    defer script.deinit();
+    const core = try script.section(
+        "if [[ \"$FLAVOR\" == core ]]; then\n  readarray -t core_identity",
+        "\nelse\n  ssh \"${ssh_options[@]}\" \"$ssh_target\" \\\n" ++
+            "    \"/usr/bin/bash -s -- '$has_resource_disk'\" <<'GUEST'",
+    );
+    const required = [_][]const u8{
+        "/proc/1/exe -ef /sbin/mizinit",
+        "test -x /usr/sbin/azagent",
+        "test -s /var/lib/azagent/provisioned",
+        "ResourceDisk.Format",
+        "DataDisk.Mount",
+        "/var/lib/cloud",
+        "/var/lib/waagent",
+        "/var/log/azure",
+        "test ! -d /run/systemd/system",
+        "initial_machine_id",
+        "initial_host_key_fingerprint",
+        "initial_authorized_keys_sha256",
+        "initial_sentinel_sha256",
+    };
+    for (required) |needle| try source.expectContainsIn(core, needle, "core contracts");
+    try source.expectOmitsIn(core, "systemctl is-active", "core contracts");
+
+    try script.expectContains("/usr/sbin/sshd -D -e");
+    try script.expectContains("read_core_sshd_pid");
+    try script.expectContains("/usr/bin/kill -KILL");
+    try script.expectContains("az vm extension list");
+    try script.expectContains("test -z \"${first_sector//0/}\"");
+    try script.expectContains("\"$RELEASE_TOOL\" verify-azure-result");
+    try script.expectContains("--contracts \"$azure_contract_list\"");
+
+    const full = try script.section(
+        "\nelse\n  ssh \"${ssh_options[@]}\" \"$ssh_target\" \\\n" ++
+            "    \"/usr/bin/bash -s -- '$has_resource_disk'\" <<'GUEST'",
+        "\nfi\n",
+    );
+    try source.expectContainsIn(full, "/proc/1/exe -ef /usr/lib/systemd/systemd", "full");
+    try source.expectContainsIn(full, "cloud-init status --wait", "full");
+    try source.expectContainsIn(full, "walinuxagent.service", "full");
+    try source.expectContainsIn(full, "validate_conventional_resource_disk", "full");
+    try source.expectContainsIn(full, "mountpoint -q /mnt || return 1", "full");
+    try source.expectContainsIn(full, "\"$resource_disk\" != \"$root_disk\"", "full");
+    try source.expectContainsIn(full, "/mnt/*) return 1", "full");
+    try source.expectOmitsIn(
+        full,
+        "conventional-resource-disk-not-mounted not_mountpoint /mnt",
+        "full",
+    );
+}
+
+test "failure diagnostics never persist boot diagnostic SAS URIs" {
+    var script = try open();
+    defer script.deinit();
+    const diagnostics = try script.section(
+        "collect_failure_diagnostics() {",
+        "\n}\n\ncleanup_on_exit()",
+    );
+    try source.expectContainsIn(
+        diagnostics,
+        "instanceView.bootDiagnostics.serialConsoleLogBlobUri",
+        "diagnostics",
+    );
+    try source.expectContainsIn(
+        diagnostics,
+        "instanceView.bootDiagnostics.consoleScreenshotBlobUri",
+        "diagnostics",
+    );
+    try source.expectContainsIn(diagnostics, "serial_console_uri=\n", "diagnostics");
+    try source.expectContainsIn(diagnostics, "console_screenshot_uri=\n", "diagnostics");
+    // Only the retrieval status reaches the recorded document, never the SAS
+    // URI it was fetched from.
+    const document = try script.section(
+        "\"$RELEASE_TOOL\" azure-failure-diagnostics \\",
+        "\n}",
+    );
+    try source.expectContainsIn(document, "--output \"$failure_diagnostics\"", "document");
+    try source.expectContainsIn(document, "--instance-view \"$instance_view_status\"", "document");
+    try source.expectContainsIn(
+        document,
+        "--serial-console-log \"$boot_log_status\"",
+        "document",
+    );
+    try source.expectContainsIn(
+        document,
+        "--console-screenshot \"$boot_screenshot_status\"",
+        "document",
+    );
+    try source.expectOmitsIn(document, "serial_console_uri", "document");
+    try source.expectOmitsIn(document, "console_screenshot_uri", "document");
+}
+
+test "the Binder probe is required only for the core flavor" {
+    var script = try open();
+    defer script.deinit();
+    try script.expectContains(
+        "if [[ \"$FLAVOR\" == core ]]; then\n" ++
+            "  if [[ -z ${BINDER_PROBE:-} ]]; then\n" ++
+            "    echo \"::error::Core Azure acceptance requires a Binder device probe binary\"",
+    );
+    try script.expectContains("[[ -x \"$BINDER_PROBE\" ]]");
+    try script.expectContains("base64");
+}
+
+test "the Android smoke binding is public provenance without private identity" {
+    var script = try open();
+    defer script.deinit();
+    try script.expectContains("MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256");
+    try script.expectContains("--android-smoke-provenance-sha256");
+    try script.expectContains(
+        "android_config_json_file=\"$(dirname \"$MIZ_UBUNTU2604_ANDROID_BUNDLE\")/guest-config.json\"",
+    );
+    try script.expectContains("provenance SHA-256");
+    try script.expectContains("config SHA-256");
+    try script.expectOmits("--android-smoke-source-commit");
+    try script.expectOmits("source commit");
+}
+
+test "core Binder module trust rejects DKMS and Anbox evidence" {
+    var script = try open();
+    defer script.deinit();
+    const module_block = try script.section(
+        "if [[ \"$flavor\" == core ]]; then\n  module_info=",
+        "\nfi\nGUEST",
+    );
+    const needles = [_][]const u8{
+        "/usr/sbin/modinfo binder_linux",
+        "/lib/modules/*/kernel/*",
+        "*/updates/dkms/*",
+        "test -n \"$module_signer\"",
+        "test \"$module_sig_id\" = \"PKCS#7\"",
+        "grep -iq anbox",
+        "dkms status",
+        "/sys/module/binder_linux/taint",
+        "test -z \"$module_taint\"",
+        "binder_linux:.*(verification failed|taint)",
+    };
+    for (needles) |needle| try source.expectContainsIn(module_block, needle, "module trust");
+}
+
+test "core BinderFS and device usability are probed" {
+    var script = try open();
+    defer script.deinit();
+    const binder = try script.section(
+        "if [[ \"$FLAVOR\" == core ]]; then\n  binder_probe_remote=",
+        "\nfi\n\nif",
+    );
+    const needles = [_][]const u8{
+        "binder_probe_sha256=$(sha256sum",
+        "base64 -w0 \"$BINDER_PROBE\"",
+        "binder_probe_remote_sha256",
+        "test \"$binder_probe_remote_sha256\" = \"$binder_probe_sha256\"",
+        "binderfs_mount=/dev/binderfs",
+        "test \"$(findmnt -n -o FSTYPE \"$binderfs_mount\")\" = binder",
+        "test -c \"$binderfs_mount/binder-control\"",
+        "binder",
+        "hwbinder",
+        "vndbinder",
+        "sudo -n \"$probe\" version",
+        "sudo -n \"$probe\" alloc \"$binderfs_mount/binder-control\"",
+        "miz-acceptance-probe",
+    };
+    for (needles) |needle| try source.expectContainsIn(binder, needle, "binder probe");
+}
+
+test "the Binder probe binary targets the public UAPI constants" {
+    var probe = try Source.open(std.testing.allocator, "tests/binder_probe.zig");
+    defer probe.deinit();
+    try probe.expectContains("const BINDER_VERSION: u32 = 0xc0046209;");
+    try probe.expectContains("const BINDER_CTL_ADD: u32 = 0xc1086201;");
+    try probe.expectContains("protocol_version");
+    // The probe speaks the upstream Binder UAPI and knows nothing about any
+    // particular Android userspace distribution.
+    try probe.expectOmits("anbox");
+    try probe.expectOmits("Anbox");
+    try probe.expectOmits("ANBOX");
+}
+
+test "the Android container state query carries no success-shaped fallback" {
+    var script = try open();
+    defer script.deinit();
+    try script.expectContains(
+        "\"sudo -n '$android_runtime_remote' state $android_container_id 2>/dev/null\" \\",
+    );
+    try script.expectOmits("state $android_container_id 2>/dev/null || printf");
+    try script.expectOmits("printf '{\\\"status\\\":\\\"stopped\\\"}'");
+    // The parser is a release-tooling subcommand whose only terminal answer is
+    // a literal "stopped" it actually read.
+    try script.expectContains("\"$RELEASE_TOOL\" android-container-status");
+}
+
+test "the container status parser never reports stopped for failed or malformed output" {
+    const non_terminal = [_][]const u8{
+        "", // the state query failed and produced no output at all
+        "\n", // whitespace-only output
+        "not json", // malformed output
+        "{}", // valid JSON with no status field
+        "{\"status\":\"running\"}",
+        "{\"status\":\"created\"}",
+        "{\"status\":\"paused\"}",
+        "{\"status\":\"error\"}",
+        "{\"status\":\"Stopped\"}", // case must match exactly
+        "{\"status\":\"stopped \"}", // trailing whitespace must not match
+    };
+    for (non_terminal) |input| {
+        const result = try runWithStdin(
+            std.testing.allocator,
+            "android-container-status",
+            input,
+        );
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.succeeded());
+        // `$(...)` strips only trailing newlines, which is exactly what the
+        // harness's `[[ "$status" == stopped ]]` comparison sees.
+        const observed = std.mem.trimEnd(u8, result.stdout, "\n");
+        try std.testing.expect(!std.mem.eql(u8, observed, "stopped"));
+    }
+
+    const confirmed = try runWithStdin(
+        std.testing.allocator,
+        "android-container-status",
+        "{\"status\":\"stopped\"}",
+    );
+    defer confirmed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "stopped",
+        std.mem.trimEnd(u8, confirmed.stdout, "\n"),
+    );
+}
+
+test "cloud-init status is decided host-side and fails closed" {
+    var script = try open();
+    defer script.deinit();
+    // The guest emits the document; the host parses it and compares.
+    try script.expectContains("cloud-init status --format json\" |");
+    try script.expectContains("\"$RELEASE_TOOL\" cloud-init-status");
+    try script.expectContains("test \"$cloud_init_status\" = done");
+
+    const done = try runWithStdin(
+        std.testing.allocator,
+        "cloud-init-status",
+        "{\"status\": \"done\", \"boot_status_code\": \"enabled-by-generator\"}",
+    );
+    defer done.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "done",
+        std.mem.trimEnd(u8, done.stdout, "\n"),
+    );
+
+    // Unlike the container-state parser, a failed cloud-init query is an
+    // error rather than an empty answer, because nothing polls it again.
+    for ([_][]const u8{ "", "not json", "{}" }) |input| {
+        const result = try runWithStdin(
+            std.testing.allocator,
+            "cloud-init-status",
+            input,
+        );
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(!result.succeeded());
+    }
+}
+
+test "the harness runs no Python and the library is syntactically valid" {
+    var script = try open();
+    defer script.deinit();
+    try script.expectOmits(source.interpreter ++ " -");
+    try script.expectOmits("<<'PY'");
+    try script.expectContains(
+        "RELEASE_TOOL=${UBUNTU2604_RELEASE_TOOL:-zig-out/bin/ubuntu2604_release}",
+    );
+    // The only remaining spellings are guest filesystem paths, not commands.
+    try script.expectCount(
+        "/usr/lib/" ++ source.interpreter ++ "/dist-packages/azurelinuxagent",
+        1,
+    );
+    try script.expectCount(
+        "/usr/lib/" ++ source.interpreter ++ "/dist-packages/cloudinit",
+        1,
+    );
+    try script.expectCount(source.interpreter, 2);
+
+    for ([_][]const u8{ script_path, library_path }) |path| {
+        const root = try source.rootAlloc(std.testing.allocator);
+        defer std.testing.allocator.free(root);
+        const full = try std.fs.path.join(std.testing.allocator, &.{ root, path });
+        defer std.testing.allocator.free(full);
+        const result = try runProcess(
+            std.testing.allocator,
+            &.{ "bash", "-n", full },
+            &.{},
+        );
+        defer result.deinit(std.testing.allocator);
+        if (!result.succeeded()) {
+            std.debug.print("{s}: shell syntax error: {s}\n", .{ path, result.stderr });
+            return error.ShellSyntaxError;
+        }
+    }
+}
+
+// ---- process and fixture support ----
+
+const Result = struct {
+    term: std.process.Child.Term,
+    stdout: []u8,
+    stderr: []u8,
+
+    fn deinit(self: Result, allocator: Allocator) void {
+        allocator.free(self.stdout);
+        allocator.free(self.stderr);
+    }
+
+    fn exitCode(self: Result) ?u8 {
+        return switch (self.term) {
+            .exited => |code| code,
+            else => null,
+        };
+    }
+
+    fn succeeded(self: Result) bool {
+        return self.exitCode() == 0;
+    }
+};
+
+const max_output_bytes: usize = 1024 * 1024;
+
+fn toolPath(allocator: Allocator) ![]u8 {
+    const root = try source.rootAlloc(allocator);
+    defer allocator.free(root);
+    return std.fs.path.join(allocator, &.{ root, "zig-out/bin/ubuntu2604_release" });
+}
+
+/// Runs `argv` from the repository root with `environment` layered over the
+/// inherited environment.
+fn runProcess(
+    allocator: Allocator,
+    argv: []const []const u8,
+    environment: []const []const u8,
+) !Result {
+    const root = try source.rootAlloc(allocator);
+    defer allocator.free(root);
+
+    var map = try std.process.Environ.createMap(std.testing.environ, allocator);
+    defer map.deinit();
+    for (environment) |entry| {
+        const separator = std.mem.indexOfScalar(u8, entry, '=').?;
+        try map.put(entry[0..separator], entry[separator + 1 ..]);
+    }
+
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = argv,
+        .cwd = .{ .path = root },
+        .environ_map = &map,
+        .stdout_limit = .limited(max_output_bytes),
+        .stderr_limit = .limited(max_output_bytes),
+    });
+    return .{
+        .term = result.term,
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+    };
+}
+
+/// Runs the release tool with `input` on standard input. The input is staged
+/// in a private file and redirected by the shell, so the command under test is
+/// exactly the one the harness pipes into.
+fn runWithStdin(
+    allocator: Allocator,
+    command: []const u8,
+    input: []const u8,
+) !Result {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try source.rootAlloc(allocator);
+    defer allocator.free(root);
+    const stdin_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}/stdin",
+        .{ root, tmp.sub_path },
+    );
+    defer allocator.free(stdin_path);
+    try Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = stdin_path,
+        .data = input,
+    });
+
+    const tool = try toolPath(allocator);
+    defer allocator.free(tool);
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "\"$TOOL\" {s} <\"$STDIN\"",
+        .{command},
+    );
+    defer allocator.free(script);
+    const tool_variable = try std.fmt.allocPrint(allocator, "TOOL={s}", .{tool});
+    defer allocator.free(tool_variable);
+    const stdin_variable = try std.fmt.allocPrint(
+        allocator,
+        "STDIN={s}",
+        .{stdin_path},
+    );
+    defer allocator.free(stdin_variable);
+    return runProcess(
+        allocator,
+        &.{ "bash", "-c", script },
+        &.{ tool_variable, stdin_variable },
+    );
+}
+
+/// A private directory plus the environment the harness's `cleanup` path
+/// requires, so each test's state and stub `az` are its own.
+const Harness = struct {
+    tmp: std.testing.TmpDir,
+    root: []u8,
+
+    fn create() !Harness {
+        const tmp = std.testing.tmpDir(.{});
+        const repository = try source.rootAlloc(std.testing.allocator);
+        defer std.testing.allocator.free(repository);
+        const root = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{s}/.zig-cache/tmp/{s}",
+            .{ repository, tmp.sub_path },
+        );
+        errdefer std.testing.allocator.free(root);
+        const bin = try std.fmt.allocPrint(std.testing.allocator, "{s}/bin", .{root});
+        defer std.testing.allocator.free(bin);
+        try Dir.cwd().createDirPath(std.testing.io, bin);
+        return .{ .tmp = tmp, .root = root };
+    }
+
+    fn deinit(self: *Harness) void {
+        std.testing.allocator.free(self.root);
+        self.tmp.cleanup();
+        self.* = undefined;
+    }
+
+    fn path(self: *const Harness, buffer: []u8, name: []const u8) ![]const u8 {
+        return std.fmt.bufPrint(buffer, "{s}/{s}", .{ self.root, name });
+    }
+
+    /// A stub `az` that answers exactly the three subcommands `cleanup_group`
+    /// issues, so the ownership-tag decision is the only variable.
+    fn writeStubAz(self: *const Harness) !void {
+        var buffer: [512]u8 = undefined;
+        const az = try self.path(&buffer, "bin/az");
+        try Dir.cwd().writeFile(std.testing.io, .{
+            .sub_path = az,
+            .data =
+            \\#!/usr/bin/env bash
+            \\set -euo pipefail
+            \\case "$1 $2" in
+            \\  "group exists") echo true ;;
+            \\  "group show") printf '{"tags": %s}\n' "$MOCK_TAGS" ;;
+            \\  "group delete") printf 'deleted\n' >"$DELETE_MARKER" ;;
+            \\  *) echo "unexpected az arguments: $*" >&2; exit 1 ;;
+            \\esac
+            \\
+            ,
+            .flags = .{ .permissions = .fromMode(0o755) },
+        });
+    }
+
+    fn runCleanup(
+        self: *const Harness,
+        key: []const u8,
+        environment: []const []const u8,
+    ) !Result {
+        return self.run(&.{"cleanup"}, key, environment);
+    }
+
+    fn run(
+        self: *const Harness,
+        arguments: []const []const u8,
+        key: []const u8,
+        environment: []const []const u8,
+    ) !Result {
+        const repository = try source.rootAlloc(std.testing.allocator);
+        defer std.testing.allocator.free(repository);
+        const script = try std.fs.path.join(
+            std.testing.allocator,
+            &.{ repository, script_path },
+        );
+        defer std.testing.allocator.free(script);
+
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(std.testing.allocator);
+        try argv.append(std.testing.allocator, script);
+        try argv.appendSlice(std.testing.allocator, arguments);
+
+        const existing_path = std.process.Environ.getAlloc(
+            std.testing.environ,
+            std.testing.allocator,
+            "PATH",
+        ) catch try std.testing.allocator.dupe(u8, "/usr/bin:/bin");
+        defer std.testing.allocator.free(existing_path);
+
+        const path_variable = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "PATH={s}/bin:{s}",
+            .{ self.root, existing_path },
+        );
+        defer std.testing.allocator.free(path_variable);
+        const state_variable = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "STATE_FILE={s}/state",
+            .{self.root},
+        );
+        defer std.testing.allocator.free(state_variable);
+        const key_variable = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "CANDIDATE_KEY={s}",
+            .{key},
+        );
+        defer std.testing.allocator.free(key_variable);
+        const tool_variable = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "UBUNTU2604_RELEASE_TOOL={s}/zig-out/bin/ubuntu2604_release",
+            .{repository},
+        );
+        defer std.testing.allocator.free(tool_variable);
+
+        var environment_list: std.ArrayList([]const u8) = .empty;
+        defer environment_list.deinit(std.testing.allocator);
+        try environment_list.appendSlice(std.testing.allocator, &.{
+            path_variable,
+            state_variable,
+            key_variable,
+            tool_variable,
+            "GITHUB_RUN_ID=123",
+            "GITHUB_RUN_ATTEMPT=4",
+        });
+        try environment_list.appendSlice(std.testing.allocator, environment);
+        return runProcess(
+            std.testing.allocator,
+            argv.items,
+            environment_list.items,
+        );
+    }
+
+    fn runLibrary(self: *const Harness, command: []const u8) !Result {
+        _ = self;
+        const repository = try source.rootAlloc(std.testing.allocator);
+        defer std.testing.allocator.free(repository);
+        const library = try std.fs.path.join(
+            std.testing.allocator,
+            &.{ repository, library_path },
+        );
+        defer std.testing.allocator.free(library);
+        const script = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "source \"$ACCEPTANCE_LIBRARY\"; {s}",
+            .{command},
+        );
+        defer std.testing.allocator.free(script);
+        const variable = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "ACCEPTANCE_LIBRARY={s}",
+            .{library},
+        );
+        defer std.testing.allocator.free(variable);
+        return runProcess(
+            std.testing.allocator,
+            &.{ "bash", "-c", script },
+            &.{variable},
+        );
+    }
+};
