@@ -598,7 +598,10 @@ The workflow runs no interpreter of its own: its staging check, its
 non-regression gate, and that private-material scan are the
 `verify-staging`, `gate`, and `scan-private-material` subcommands of the same
 benchmark tool, so each contract is unit tested rather than embedded in a job
-step.
+step. That tool is built immediately after the Zig toolchain is installed and
+before every preflight that can fail, so a runner that is too small, missing a
+host dependency, or carrying the wrong Zig version still reaches the gate, the
+evidence scan, and the artifact upload instead of losing its partial evidence.
 
 GitHub's standard hosted ARM image carries many unrelated preinstalled tool
 stacks. The workflow removes only disposable hosted-runner tool directories

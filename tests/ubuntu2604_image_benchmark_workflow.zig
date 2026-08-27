@@ -81,6 +81,88 @@ fn count(haystack: []const u8, needle: []const u8) usize {
     return found;
 }
 
+/// One job step, as the workflow declares it. The tests below reason about
+/// step order and reachability, which is the only way to state the contract
+/// that a failure early in the job still produces uploadable evidence.
+const Step = struct {
+    index: usize,
+    name: []const u8,
+    id: ?[]const u8,
+    condition: ?[]const u8,
+    body: []const u8,
+
+    /// GitHub runs a step whose condition begins with `always()` even after an
+    /// earlier step failed.
+    fn runsAfterFailure(self: Step) bool {
+        const condition = self.condition orelse return false;
+        return std.mem.startsWith(u8, condition, "always()");
+    }
+};
+
+const step_marker = "\n      - name: ";
+
+fn parseSteps(allocator: Allocator, source: []const u8) ![]Step {
+    var steps: std.ArrayList(Step) = .empty;
+    errdefer steps.deinit(allocator);
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, source, search, step_marker)) |at| {
+        const name_start = at + step_marker.len;
+        const name_end = std.mem.indexOfScalarPos(u8, source, name_start, '\n') orelse
+            source.len;
+        const body_end = std.mem.indexOfPos(u8, source, name_end, step_marker) orelse
+            source.len;
+        const body = source[name_end..body_end];
+        try steps.append(allocator, .{
+            .index = steps.items.len,
+            .name = source[name_start..name_end],
+            .id = fieldValue(body, "\n        id: "),
+            .condition = fieldValue(body, "\n        if: "),
+            .body = body,
+        });
+        search = name_end;
+    }
+    return steps.toOwnedSlice(allocator);
+}
+
+fn fieldValue(body: []const u8, marker: []const u8) ?[]const u8 {
+    const at = std.mem.indexOf(u8, body, marker) orelse return null;
+    const start = at + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, body, start, '\n') orelse body.len;
+    return body[start..end];
+}
+
+fn requireStep(steps: []const Step, name: []const u8) !Step {
+    for (steps) |step| {
+        if (std.mem.eql(u8, step.name, name)) return step;
+    }
+    std.debug.print("\nworkflow has no step named: {s}\n", .{name});
+    return error.TestMissingStep;
+}
+
+const build_step = "Build the benchmark tool and the miz CLI";
+
+/// The only steps allowed to run before the benchmark tool exists. Each is
+/// either the checkout itself or a precondition of building at all, and a
+/// failure in any of them means there is no benchmark evidence to report.
+const steps_before_the_tool = [_][]const u8{
+    "Check out exact main source",
+    "Bind the benchmark to current main",
+    "Reclaim disposable hosted-runner tools",
+    "Install Zig via ghr",
+};
+
+/// Steps whose failure must still produce an uploaded artifact. Every one of
+/// them therefore has to run after the tool the gate and the evidence scan
+/// invoke has been built.
+const evidence_preserving_failures = [_][]const u8{
+    "Preflight the staging disk",
+    "Install benchmark host dependencies",
+    "Prepare one fixed non-secret test identity",
+    "Verify the test signer",
+    "Stage verified publication inputs, exact locks, and warm debz cache",
+    "Run one warm-up and three measured builds without networking",
+};
+
 const staging_step =
     "- name: Stage verified publication inputs, exact locks, and warm debz cache";
 const measured_step =
@@ -90,7 +172,8 @@ const private_step = "- name: Prove upload evidence excludes private key materia
 const upload_step = "- name: Upload benchmark timing, provenance, and logs";
 const cleanup_step = "- name: Remove benchmark state and private material";
 const identity_step = "- name: Prepare one fixed non-secret test identity";
-const warm_step = "- name: Warm Zig dependencies and verify the test signer";
+const signer_step = "- name: Verify the test signer";
+const tool_step = "- name: " ++ build_step;
 
 test "the benchmark workflow is manual, main-only, and native aarch64" {
     const allocator = std.testing.allocator;
@@ -176,7 +259,7 @@ test "the measured protocol is offline and uses warm inputs" {
         count(measured, "/usr/bin/unshare --net --"),
     );
     try expectContains(measured, "sudo -E /usr/bin/unshare --net --");
-    try expectContains(measured, "\"$BENCHMARK_BIN\" run");
+    try expectContains(measured, "\"$BENCHMARK_TOOL\" run");
     try expectContains(measured, "--debz-cache \"$INPUT_ROOT/debz-cache\"");
     try expectContains(measured, "--debz-input-dir \"$INPUT_ROOT/debz-inputs\"");
     try expectContains(measured, "--debz-lock-dir \"$INPUT_ROOT/locks\"");
@@ -191,14 +274,23 @@ test "the gate and the evidence scan are driven by the benchmark tool" {
     const source = try workflowSource(allocator, std.testing.io);
     defer allocator.free(source);
 
-    try expectContains(source, "BENCHMARK_TOOL: zig-out/bin/ubuntu2604-image-benchmark");
-    const warm = try section(source, warm_step, staging_step);
-    try expectContains(warm, "install-ubuntu2604-image-benchmark");
-    try expectContains(warm, "echo \"BENCHMARK_BIN=$benchmark_bin\" >> \"$GITHUB_ENV\"");
+    // One stable, absolute path known before any step runs, rather than a
+    // value handed forward through `$GITHUB_ENV` by a step that may not have
+    // run yet.
+    try expectContains(
+        source,
+        "BENCHMARK_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604-image-benchmark",
+    );
+    try expectExcludes(source, "BENCHMARK_BIN");
+
+    const tool = try section(source, tool_step, "- name: Preflight the staging disk");
+    try expectContains(tool, "install-ubuntu2604-image-benchmark");
+    try expectContains(tool, "install-miz");
+    try expectContains(tool, "test -x \"$BENCHMARK_TOOL\"");
 
     const gate = try section(source, gate_step, private_step);
     try expectContains(gate, "if: always()");
-    try expectContains(gate, "gate \\");
+    try expectContains(gate, "\"$BENCHMARK_TOOL\" gate");
     try expectContains(gate, "--summary \"$BENCHMARK_OUTPUT/benchmark-summary.json\"");
     try expectContains(gate, "--status \"$BENCHMARK_OUTPUT/benchmark-status.json\"");
     try expectContains(gate, "--output \"$EVIDENCE_ROOT/non-regression-gate.json\"");
@@ -208,9 +300,88 @@ test "the gate and the evidence scan are driven by the benchmark tool" {
     const private = try section(source, private_step, upload_step);
     try expectContains(private, "id: private-material-check");
     try expectContains(private, "if: always()");
-    try expectContains(private, "scan-private-material");
+    try expectContains(private, "\"$BENCHMARK_TOOL\" scan-private-material");
     try expectContains(private, "--evidence-root \"$EVIDENCE_ROOT\"");
     try expectContains(private, "--benchmark-root \"$BENCHMARK_OUTPUT\"");
+}
+
+test "the benchmark tool is built before every step whose failure is reported" {
+    const allocator = std.testing.allocator;
+    const source = try workflowSource(allocator, std.testing.io);
+    defer allocator.free(source);
+    const steps = try parseSteps(allocator, source);
+    defer allocator.free(steps);
+
+    // A closed list, so a new failure-prone step cannot be added ahead of the
+    // build without this test being updated to say why that is acceptable.
+    try std.testing.expect(steps.len > steps_before_the_tool.len);
+    for (steps_before_the_tool, 0..) |expected, index| {
+        try std.testing.expectEqualStrings(expected, steps[index].name);
+    }
+    const tool = try requireStep(steps, build_step);
+    try std.testing.expectEqual(steps_before_the_tool.len, tool.index);
+
+    for (evidence_preserving_failures) |name| {
+        const step = try requireStep(steps, name);
+        try std.testing.expect(tool.index < step.index);
+    }
+
+    // Nothing before the build may already depend on the binary it produces.
+    for (steps[0..tool.index]) |step| {
+        try expectExcludes(step.body, "$BENCHMARK_TOOL");
+    }
+}
+
+test "an early failure still reaches the gate, the scan, and the upload" {
+    const allocator = std.testing.allocator;
+    const source = try workflowSource(allocator, std.testing.io);
+    defer allocator.free(source);
+    const steps = try parseSteps(allocator, source);
+    defer allocator.free(steps);
+
+    const tool = try requireStep(steps, build_step);
+    const gate = try requireStep(
+        steps,
+        "Record and enforce the production non-regression gate",
+    );
+    const scan = try requireStep(
+        steps,
+        "Prove upload evidence excludes private key material",
+    );
+    const upload = try requireStep(steps, "Upload benchmark timing, provenance, and logs");
+    const cleanup = try requireStep(steps, "Remove benchmark state and private material");
+
+    // Simulate each early failure: the job stops there, and GitHub then runs
+    // only the `always()` steps. Each of those must be able to run the tool,
+    // which means the build must already have happened.
+    for (evidence_preserving_failures) |name| {
+        const failed = try requireStep(steps, name);
+        try std.testing.expect(tool.index < failed.index);
+        for ([_]Step{ gate, scan, upload, cleanup }) |reachable| {
+            try std.testing.expect(reachable.runsAfterFailure());
+            try std.testing.expect(failed.index < reachable.index);
+        }
+        // The upload is still gated on the scan actually having succeeded.
+        try std.testing.expectEqualStrings(
+            "always() && steps.private-material-check.outcome == 'success'",
+            upload.condition.?,
+        );
+    }
+
+    // Partial evidence survives a disk failure because the reclaim step wrote
+    // it before the threshold is ever tested.
+    const reclaim = try requireStep(steps, "Reclaim disposable hosted-runner tools");
+    try expectContains(reclaim.body, "disk-before-cleanup.txt");
+    try expectContains(reclaim.body, "disk-after-cleanup.txt");
+    try expectExcludes(reclaim.body, "STAGING_MINIMUM_FREE_BYTES");
+    const preflight = try requireStep(steps, "Preflight the staging disk");
+    try expectContains(preflight.body, "staging-disk-preflight.txt");
+    try expectContains(
+        preflight.body,
+        "test \"$available\" -ge \"$STAGING_MINIMUM_FREE_BYTES\"",
+    );
+    try expectContains(upload.body, "${{ env.EVIDENCE_ROOT }}/");
+    try expectContains(upload.body, "if-no-files-found: warn");
 }
 
 test "disk and artifact failure evidence are explicit" {
@@ -236,7 +407,7 @@ test "the test signer is fixed and private material is not uploaded" {
     const source = try workflowSource(allocator, std.testing.io);
     defer allocator.free(source);
 
-    const identity = try section(source, identity_step, warm_step);
+    const identity = try section(source, identity_step, signer_step);
     try expectContains(
         identity,
         "tests/fixtures/ubuntu2604-local-signing/signing-key.pem",

@@ -18,7 +18,7 @@ env:
   INPUT_ROOT: .scratch/ubuntu2604-production-benchmark-inputs
   SIGNING_ROOT: .scratch/ubuntu2604-production-benchmark-signing
   STAGING_ROOT: .scratch/ubuntu2604-production-benchmark-staging
-  BENCHMARK_TOOL: zig-out/bin/ubuntu2604-image-benchmark
+  BENCHMARK_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604-image-benchmark
   TEST_CERTIFICATE_SHA256: "8ca3b80b1a2272a4f3a6d13246a65cfdd89764eb83beb8a0709e3cf591490279"
   STAGING_MINIMUM_FREE_BYTES: "38654705664"
   MEASURED_MINIMUM_FREE_BYTES: "32212254720"
@@ -46,7 +46,12 @@ jobs:
           test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$commit"
           test "$(git status --porcelain --untracked-files=no)" = ""
 
-      - name: Reclaim disposable hosted-runner tools and preflight disk
+      # Reclaiming disposable tool directories must stay ahead of the Zig
+      # install so it can never delete the toolchain it just provisioned. The
+      # threshold check is a separate step below, after the benchmark tool
+      # exists, so that a runner too small to measure on still produces
+      # uploadable evidence.
+      - name: Reclaim disposable hosted-runner tools
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_ROOT"
@@ -64,12 +69,6 @@ jobs:
             fi
           done
           sudo apt-get clean
-          available=$(df -PB1 "$GITHUB_WORKSPACE" | awk 'NR == 2 {print $4}')
-          [[ "$available" =~ ^[0-9]+$ ]]
-          printf 'available_bytes=%s\nrequired_bytes=%s\n' \
-            "$available" "$STAGING_MINIMUM_FREE_BYTES" \
-            > "$EVIDENCE_ROOT/staging-disk-preflight.txt"
-          test "$available" -ge "$STAGING_MINIMUM_FREE_BYTES"
           df -hT > "$EVIDENCE_ROOT/disk-after-cleanup.txt"
 
       - name: Install Zig via ghr
@@ -80,6 +79,33 @@ jobs:
           ghr-version: 0.6.6
           tools: |
             cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      # Everything after this step can fail and still be reported, because the
+      # unconditional gate, evidence scan, and upload all run this binary. It
+      # is therefore built as early as the toolchain allows -- before the disk
+      # threshold, the host dependency and version preflight, the signing
+      # identity, the staging build, and the measured runs.
+      - name: Build the benchmark tool and the miz CLI
+        run: |
+          set -euo pipefail
+          export ZIG_GLOBAL_CACHE_DIR="$INPUT_ROOT/zig-global-cache"
+          export ZIG_LOCAL_CACHE_DIR="$STAGING_ROOT/zig-local-cache"
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
+          zig build --fetch --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build install-miz install-ubuntu2604-image-benchmark \
+            -Doptimize=ReleaseSafe
+          test -x "$BENCHMARK_TOOL"
+          test -x zig-out/bin/miz
+
+      - name: Preflight the staging disk
+        run: |
+          set -euo pipefail
+          available=$(df -PB1 "$GITHUB_WORKSPACE" | awk 'NR == 2 {print $4}')
+          [[ "$available" =~ ^[0-9]+$ ]]
+          printf 'available_bytes=%s\nrequired_bytes=%s\n' \
+            "$available" "$STAGING_MINIMUM_FREE_BYTES" \
+            > "$EVIDENCE_ROOT/staging-disk-preflight.txt"
+          test "$available" -ge "$STAGING_MINIMUM_FREE_BYTES"
 
       - name: Install benchmark host dependencies
         run: |
@@ -115,18 +141,9 @@ jobs:
           echo "SIGNING_CERTIFICATE=$SIGNING_ROOT/signing-cert.pem" >> "$GITHUB_ENV"
           echo "AUTHORIZED_KEY=$SIGNING_ROOT/administrator.pub" >> "$GITHUB_ENV"
 
-      - name: Warm Zig dependencies and verify the test signer
+      - name: Verify the test signer
         run: |
           set -euo pipefail
-          export ZIG_GLOBAL_CACHE_DIR="$INPUT_ROOT/zig-global-cache"
-          export ZIG_LOCAL_CACHE_DIR="$STAGING_ROOT/zig-local-cache"
-          mkdir -p "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
-          "$ZIG_BIN" build --fetch --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
-          "$ZIG_BIN" build install-miz install-ubuntu2604-image-benchmark \
-            -Doptimize=ReleaseSafe
-          benchmark_bin="$PWD/$BENCHMARK_TOOL"
-          test -x "$benchmark_bin"
-          echo "BENCHMARK_BIN=$benchmark_bin" >> "$GITHUB_ENV"
           actual=$(zig-out/bin/miz uki fingerprint "$SIGNING_CERTIFICATE")
           test "$actual" = "$TEST_CERTIFICATE_SHA256"
 
@@ -177,7 +194,7 @@ jobs:
             "$provenance/ubuntu2604-build-provenance.json" \
             "$EVIDENCE_ROOT/staging-build-provenance.json"
 
-          "$BENCHMARK_BIN" verify-staging --input-root "$INPUT_ROOT"
+          "$BENCHMARK_TOOL" verify-staging --input-root "$INPUT_ROOT"
 
           sudo rm -rf -- "$STAGING_ROOT"
           sudo apt-get clean
@@ -195,7 +212,7 @@ jobs:
           set -euo pipefail
           test ! -e "$BENCHMARK_OUTPUT"
           sudo -E /usr/bin/unshare --net -- \
-            "$BENCHMARK_BIN" run \
+            "$BENCHMARK_TOOL" run \
               --output-root "$BENCHMARK_OUTPUT" \
               --source "$INPUT_ROOT/ubuntu-26.04-server-cloudimg-arm64.img" \
               --sha256sums "$INPUT_ROOT/SHA256SUMS" \
@@ -220,7 +237,7 @@ jobs:
           mkdir -p "$EVIDENCE_ROOT"
           sudo chown -R "$(id -u):$(id -g)" \
             "$BENCHMARK_OUTPUT" "$EVIDENCE_ROOT" 2>/dev/null || true
-          "${BENCHMARK_BIN:-$PWD/$BENCHMARK_TOOL}" gate \
+          "$BENCHMARK_TOOL" gate \
             --summary "$BENCHMARK_OUTPUT/benchmark-summary.json" \
             --status "$BENCHMARK_OUTPUT/benchmark-status.json" \
             --output "$EVIDENCE_ROOT/non-regression-gate.json" \
@@ -232,7 +249,7 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          "${BENCHMARK_BIN:-$PWD/$BENCHMARK_TOOL}" scan-private-material \
+          "$BENCHMARK_TOOL" scan-private-material \
             --evidence-root "$EVIDENCE_ROOT" \
             --benchmark-root "$BENCHMARK_OUTPUT"
 
