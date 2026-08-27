@@ -80,6 +80,29 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
 
+    def ubuntu_disk_layout(self, architecture: str) -> dict[str, object]:
+        if architecture == "x86_64":
+            return {
+                "source": "canonical-gen2-gpt",
+                "transform": "preserved",
+            }
+        return {
+            "source": "canonical-gen2-gpt",
+            "transform": "arm64-esp-rebuild-v1",
+            "esp": {
+                "table_index": 14,
+                "first_lba": 2048,
+                "last_lba": 1_050_623,
+                "size_bytes": 512 * 1024 * 1024,
+                "fat32": "reformatted-preserve-volume-id",
+                "content": "signed-fallback-only",
+            },
+            "retired_xbootldr": {
+                "table_index": 12,
+                "cleared": True,
+            },
+        }
+
     def android_smoke_provenance(
         self,
         architecture: str = "x86_64",
@@ -637,6 +660,7 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                     for name, filename in artifact_filenames.items()
                 },
             },
+            "disk_layout": self.ubuntu_disk_layout(architecture),
             "debz": {
                 "api_commit": release.DEBZ_API_COMMIT,
                 "baseline": {
@@ -1539,6 +1563,55 @@ class Ubuntu2604ReleaseTest(unittest.TestCase):
                 self.rewrite(path, mutate)
                 with self.assertRaises(SystemExit):
                     release.validate_ubuntu_provenance(root, "x86_64")
+
+    def test_ubuntu_provenance_requires_exact_architecture_disk_layout(self):
+        for key, architecture in (
+            ("x86_64-full", "x86_64"),
+            ("aarch64-full", "aarch64"),
+        ):
+            with self.subTest(architecture=architecture):
+                shutil.rmtree(self.root)
+                self.root.mkdir(parents=True)
+                self.make_bundle(key)
+                root = self.candidates / key / "internal-provenance"
+                document = release.validate_ubuntu_provenance(root, architecture)
+                self.assertEqual(
+                    document["disk_layout"],
+                    self.ubuntu_disk_layout(architecture),
+                )
+
+    def test_ubuntu_provenance_rejects_disk_layout_changes(self):
+        mutations = (
+            lambda value: value["disk_layout"].__setitem__(
+                "transform", "preserved"
+            ),
+            lambda value: value["disk_layout"]["esp"].__setitem__(
+                "last_lba", 1_050_622
+            ),
+            lambda value: value["disk_layout"]["esp"].__setitem__(
+                "table_index", True
+            ),
+            lambda value: value["disk_layout"]["retired_xbootldr"].__setitem__(
+                "cleared", False
+            ),
+            lambda value: value["disk_layout"].__setitem__(
+                "unexpected", "value"
+            ),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                shutil.rmtree(self.root)
+                self.root.mkdir(parents=True)
+                self.make_bundle("aarch64-full")
+                root = (
+                    self.candidates
+                    / "aarch64-full"
+                    / "internal-provenance"
+                )
+                metadata = root / release.UBUNTU_PROVENANCE_FILENAME
+                self.rewrite(metadata, mutate)
+                with self.assertRaises(SystemExit):
+                    release.validate_ubuntu_provenance(root, "aarch64")
 
     def test_ubuntu_provenance_binds_source_and_manifest_checksums(self):
         self.make_bundle("x86_64-full")

@@ -862,6 +862,68 @@ def parse_sha256sums(path: Path) -> dict[str, str]:
     return result
 
 
+def validate_ubuntu_disk_layout(
+    value: object,
+    architecture: str,
+) -> None:
+    if not isinstance(value, dict):
+        fail("Ubuntu disk-layout provenance is invalid")
+    if architecture == "x86_64":
+        if value != {
+            "source": "canonical-gen2-gpt",
+            "transform": "preserved",
+        }:
+            fail("Ubuntu x86_64 disk-layout provenance is invalid")
+        return
+    if architecture != "aarch64":
+        fail(f"unsupported Ubuntu provenance architecture: {architecture!r}")
+    if set(value) != {
+        "source",
+        "transform",
+        "esp",
+        "retired_xbootldr",
+    }:
+        fail("Ubuntu Arm64 disk-layout provenance is invalid")
+    if (
+        value.get("source") != "canonical-gen2-gpt"
+        or value.get("transform") != "arm64-esp-rebuild-v1"
+    ):
+        fail("Ubuntu Arm64 disk-layout provenance is invalid")
+    esp = value.get("esp")
+    if (
+        not isinstance(esp, dict)
+        or set(esp)
+        != {
+            "table_index",
+            "first_lba",
+            "last_lba",
+            "size_bytes",
+            "fat32",
+            "content",
+        }
+        or type(esp.get("table_index")) is not int
+        or esp.get("table_index") != 14
+        or type(esp.get("first_lba")) is not int
+        or esp.get("first_lba") != 2048
+        or type(esp.get("last_lba")) is not int
+        or esp.get("last_lba") != 1_050_623
+        or type(esp.get("size_bytes")) is not int
+        or esp.get("size_bytes") != 512 * 1024 * 1024
+        or esp.get("fat32") != "reformatted-preserve-volume-id"
+        or esp.get("content") != "signed-fallback-only"
+    ):
+        fail("Ubuntu Arm64 ESP provenance is invalid")
+    retired = value.get("retired_xbootldr")
+    if (
+        not isinstance(retired, dict)
+        or set(retired) != {"table_index", "cleared"}
+        or type(retired.get("table_index")) is not int
+        or retired.get("table_index") != 12
+        or retired.get("cleared") is not True
+    ):
+        fail("Ubuntu Arm64 XBOOTLDR provenance is invalid")
+
+
 def validate_ubuntu_provenance(
     root: Path,
     architecture: str,
@@ -879,6 +941,7 @@ def validate_ubuntu_provenance(
         "canonical_key_fingerprint",
         "sha256sums_signature_verified",
         "artifacts",
+        "disk_layout",
         "debz",
     }
     if flavor == "core":
@@ -947,6 +1010,7 @@ def validate_ubuntu_provenance(
         fail("Canonical signing key fingerprint is invalid")
     if document.get("sha256sums_signature_verified") is not True:
         fail("Ubuntu SHA256SUMS signature was not explicitly verified")
+    validate_ubuntu_disk_layout(document.get("disk_layout"), architecture)
 
     source_architecture = "amd64" if architecture == "x86_64" else "arm64"
     prefix = f"ubuntu-26.04-server-cloudimg-{source_architecture}"
