@@ -1051,6 +1051,34 @@ pub fn build(b: *std.Build) void {
         ci_test_step,
     };
 
+    // ---- tests/stale_brand.zig: the tracked tree may carry only the
+    // canonical brand -- in path names, in file bytes, and in the DER
+    // metadata of the certificates the `.pem` fixtures hold. Replaces
+    // tests/stale_brand_test.py. ----
+    const stale_brand_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/stale_brand.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_stale_brand_tests = b.addRunArtifact(stale_brand_tests);
+    // The guard's subject is the tracked tree, which is not an input the
+    // build graph models, so a cached result would speak for a tree that has
+    // since changed.
+    run_stale_brand_tests.has_side_effects = true;
+    // Naming the build root outright keeps the guard independent of the
+    // directory the test binary happens to be started in.
+    run_stale_brand_tests.setEnvironmentVariable(
+        "MIZ_STALE_BRAND_ROOT",
+        b.build_root.path orelse ".",
+    );
+    const stale_brand_test_step = b.step(
+        "test-stale-brand",
+        "Check the tracked tree for legacy branding",
+    );
+    stale_brand_test_step.dependOn(&run_stale_brand_tests.step);
+
     const build_api_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("build.zig"),
@@ -1511,6 +1539,7 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(&run_mizinit_tests.step);
         aggregate_test_step.dependOn(&run_mizguest_tests.step);
         aggregate_test_step.dependOn(mizguest_step);
+        aggregate_test_step.dependOn(&run_stale_brand_tests.step);
         aggregate_test_step.dependOn(&run_build_api_tests.step);
         aggregate_test_step.dependOn(&build_api_consumer_check.step);
         aggregate_test_step.dependOn(&package_family_consumer_check.step);

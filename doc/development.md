@@ -226,6 +226,10 @@ miz/
                               #   "growpart" equivalent); runs every boot,
                               #   not sentinel-gated
   tests/
+    stale_brand.zig         # tracked-tree guard: rejects the pre-rename
+                              #   brands in path names, file bytes, and the
+                              #   DER metadata of PEM certificates (run via
+                              #   `zig build test-stale-brand`)
     oci_registry.zig        # deterministic loopback registry/auth/TLS/copy
                               #   transport coverage
     boot_smoke.zig          # opportunistic real-QEMU boot verification for
@@ -269,6 +273,22 @@ the VM-backend and privileged device-write and unsafe-chroot integrations,
 which run once in dedicated parallel jobs. Windows cross-builds and the
 native, cross-architecture, and modular real-VM boots also run as independent
 matrix shards (see below).
+
+### Stale brand guard
+
+`zig build test-stale-brand` runs `tests/stale_brand.zig`, which enumerates the
+tracked tree with `git ls-files -z` and rejects the pre-rename brands wherever
+they survive: in path names, in file bytes (binary included), and in the DER
+metadata of every certificate a `.pem` file holds -- where a name can be
+spelled in ASCII, UTF-16, or UTF-32 and no text search of the file would find
+it. `doc/migration.md` is the one file exempt from the content scan, since the
+rename is its subject.
+
+The guard fails closed: a path that is not valid UTF-8, a file that cannot be
+read, a certificate that will not decode, and a `git ls-files` that will not
+run are all reported as violations, each naming the path (and, for content, the
+line) at fault. The quality job runs it as its own step so the signal stays
+distinct, and `test-ci` runs it too.
 
 ### Direct device-write integration
 
