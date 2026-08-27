@@ -199,6 +199,11 @@ pub const MutationError = Error || Image.PreadError || Image.PwriteError;
 pub const ListError = Error || Image.PreadError || Image.PwriteError || std.mem.Allocator.Error;
 pub const ReadFileError = Error || Image.PreadError || Image.PwriteError || std.mem.Allocator.Error;
 
+pub const VolumeMetadata = struct {
+    volume_id: u32,
+    volume_label: [11]u8,
+};
+
 /// Incremental file writer returned by `FileSystem.beginFile`.
 pub const FileWriter = struct {
     fs: *FileSystem,
@@ -279,6 +284,13 @@ pub const FileSystem = struct {
     next_free_cluster: u32,
     fat_cache_sector: ?u32 = null,
     fat_cache: [max_bytes_per_sector]u8 = undefined,
+
+    pub fn volumeMetadata(self: *const FileSystem) VolumeMetadata {
+        return .{
+            .volume_id = self.info.volume_id,
+            .volume_label = self.info.volume_label,
+        };
+    }
 
     /// Ensures every component of `path` exists, creating missing
     /// directories along the way (`mkdir -p` semantics).

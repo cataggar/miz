@@ -828,6 +828,24 @@ pub const RewriteIdentityError = IdentityRewriteValidationError || error{
     UnexpectedEndOfFile,
 } || Image.PreadError || Image.PwriteError || std.mem.Allocator.Error;
 
+pub const PartitionEdit = union(enum) {
+    set_last_lba: struct {
+        table_index: u32,
+        expected_last_lba: u64,
+        new_last_lba: u64,
+    },
+    clear: struct {
+        table_index: u32,
+    },
+
+    fn tableIndex(self: PartitionEdit) u32 {
+        return switch (self) {
+            .set_last_lba => |edit| edit.table_index,
+            .clear => |edit| edit.table_index,
+        };
+    }
+};
+
 /// Generates a fresh disk GUID plus one fresh partition GUID per non-empty
 /// GPT entry. The result owns the partition-guid slice and can be passed to
 /// `rewriteIdentity` via `borrowed()`.
@@ -946,6 +964,131 @@ pub fn rewriteIdentity(
         .new_disk_guid = replacement.disk_guid,
         .partitions = rewrites,
     };
+}
+
+/// Applies narrow edits to an already verified GPT partition array while
+/// preserving every unedited byte. Clearing an entry zeros its complete
+/// on-disk slot, including any vendor extension beyond the standard 128
+/// bytes. Both GPT copies and their checksums are updated together.
+pub fn rewritePartitionEntries(
+    img: *Image,
+    io: Io,
+    allocator: std.mem.Allocator,
+    verified: VerifiedGpt,
+    edits: []const PartitionEdit,
+) !void {
+    try verifySourceMetadataUnchanged(img, io, allocator, verified);
+
+    const entry_size: usize = @intCast(verified.primary_header.partition_entry_size);
+    const entry_count: usize = @intCast(verified.primary_header.num_partition_entries);
+    const updated_array = try allocator.dupe(u8, verified.partition_array);
+    defer allocator.free(updated_array);
+
+    for (edits, 0..) |edit, edit_index| {
+        const table_index = edit.tableIndex();
+        if (table_index >= entry_count) return error.PartitionNotFound;
+        for (edits[0..edit_index]) |previous| {
+            if (previous.tableIndex() == table_index) return error.DuplicatePartitionEdit;
+        }
+
+        var selected: ?PartitionEntry = null;
+        for (verified.partitions) |partition| {
+            if (partition.table_index == table_index) {
+                selected = partition;
+                break;
+            }
+        }
+        const partition = selected orelse return error.PartitionNotFound;
+        const entry_offset = std.math.mul(
+            usize,
+            @as(usize, @intCast(table_index)),
+            entry_size,
+        ) catch return error.InvalidPartitionArrayBounds;
+        const entry_end = std.math.add(
+            usize,
+            entry_offset,
+            entry_size,
+        ) catch return error.InvalidPartitionArrayBounds;
+        if (entry_end > updated_array.len) return error.InvalidPartitionArrayBounds;
+
+        switch (edit) {
+            .set_last_lba => |resize| {
+                if (partition.last_lba != resize.expected_last_lba) {
+                    return error.UnexpectedPartitionLastLba;
+                }
+                if (resize.new_last_lba < partition.first_lba or
+                    resize.new_last_lba > verified.primary_header.last_usable_lba)
+                {
+                    return error.InvalidPartitionBounds;
+                }
+                std.mem.writeInt(
+                    u64,
+                    updated_array[entry_offset + 40 ..][0..8],
+                    resize.new_last_lba,
+                    .little,
+                );
+            },
+            .clear => @memset(updated_array[entry_offset..entry_end], 0),
+        }
+    }
+
+    var table_index: usize = 0;
+    while (table_index < entry_count) : (table_index += 1) {
+        const entry_offset = table_index * entry_size;
+        const entry = PartitionEntry.decode(
+            updated_array[entry_offset..][0..partition_entry_size],
+        );
+        if (entry.isEmpty()) continue;
+        if (entry.first_lba < verified.primary_header.first_usable_lba or
+            entry.last_lba < entry.first_lba or
+            entry.last_lba > verified.primary_header.last_usable_lba)
+        {
+            return error.InvalidPartitionBounds;
+        }
+
+        var previous_index: usize = 0;
+        while (previous_index < table_index) : (previous_index += 1) {
+            const previous_offset = previous_index * entry_size;
+            const previous = PartitionEntry.decode(
+                updated_array[previous_offset..][0..partition_entry_size],
+            );
+            if (previous.isEmpty()) continue;
+            if (entry.first_lba <= previous.last_lba and
+                previous.first_lba <= entry.last_lba)
+            {
+                return error.OverlappingPartitions;
+            }
+        }
+    }
+
+    const array_crc = std.hash.crc.Crc32.hash(updated_array);
+    var primary_sector = verified.primary_header_sector;
+    std.mem.writeInt(u32, primary_sector[88..92], array_crc, .little);
+    updateHeaderChecksum(&primary_sector);
+    var backup_sector = verified.backup_header_sector;
+    std.mem.writeInt(u32, backup_sector[88..92], array_crc, .little);
+    updateHeaderChecksum(&backup_sector);
+
+    try img.pwrite(
+        io,
+        updated_array,
+        try sectorOffset(verified.primary_header.partition_entry_lba),
+    );
+    try img.pwrite(
+        io,
+        updated_array,
+        try sectorOffset(verified.backup_header.partition_entry_lba),
+    );
+    try img.pwrite(
+        io,
+        &backup_sector,
+        try sectorOffset(verified.backup_header.current_lba),
+    );
+    try img.pwrite(
+        io,
+        &primary_sector,
+        try sectorOffset(verified.primary_header.current_lba),
+    );
 }
 
 fn validateSourceIdentity(verified: VerifiedGpt) IdentityRewriteValidationError!void {
@@ -2115,6 +2258,139 @@ test "readGpt rejects truncated headers and partition arrays" {
         try img.pwrite(io, &encoded, sector_size);
         try std.testing.expectError(error.InvalidPartitionArrayBounds, readGpt(img, io, std.testing.allocator));
     }
+}
+
+test "rewritePartitionEntries grows one slot clears another and preserves opaque bytes" {
+    const io = std.testing.io;
+    const path = "test-gpt-partition-entry-rewrite.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const disk_size: u64 = 32 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, disk_size, .{});
+    defer img.close(io);
+
+    const entry_size: u32 = 160;
+    const entries = [_]TestRawPartitionEntry{
+        .{ .entry = .{
+            .partition_type_guid = guid.esp,
+            .unique_partition_guid = guid.parse("11111111-1111-1111-1111-111111111111"),
+            .first_lba = 2048,
+            .last_lba = 4095,
+            .attributes = 0x0123_4567_89ab_cdef,
+            .name_utf16le = asciiName("EFI System"),
+        }, .opaque_tail = &([_]u8{0xa1} ** 32) },
+        .{ .entry = .{
+            .partition_type_guid = guid.linux_xbootldr,
+            .unique_partition_guid = guid.parse("22222222-2222-2222-2222-222222222222"),
+            .first_lba = 4096,
+            .last_lba = 8191,
+            .attributes = 0xfedc_ba98_7654_3210,
+            .name_utf16le = asciiName("XBOOTLDR"),
+        }, .opaque_tail = &([_]u8{0xb2} ** 32) },
+        .{ .entry = .{
+            .partition_type_guid = guid.linux_filesystem_data,
+            .unique_partition_guid = guid.parse("33333333-3333-3333-3333-333333333333"),
+            .first_lba = 8192,
+            .last_lba = 32767,
+            .attributes = 0x55aa_55aa_55aa_55aa,
+            .name_utf16le = asciiName("root"),
+        }, .opaque_tail = &([_]u8{0xc3} ** 32) },
+    };
+    const unused_tails = [_]TestOpaqueTail{
+        .{ .table_index = 3, .bytes = &([_]u8{0xd4} ** 32) },
+    };
+    try writeCustomPartitionTablesForTest(
+        &img,
+        io,
+        guid.parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+        entry_size,
+        4,
+        &entries,
+        &unused_tails,
+    );
+
+    var before = try readVerifiedGpt(
+        img,
+        io,
+        std.testing.allocator,
+        default_max_partition_array_bytes,
+    );
+    defer before.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.UnexpectedPartitionLastLba,
+        rewritePartitionEntries(
+            &img,
+            io,
+            std.testing.allocator,
+            before,
+            &.{.{ .set_last_lba = .{
+                .table_index = 0,
+                .expected_last_lba = 4094,
+                .new_last_lba = 8191,
+            } }},
+        ),
+    );
+    try std.testing.expectError(
+        error.OverlappingPartitions,
+        rewritePartitionEntries(
+            &img,
+            io,
+            std.testing.allocator,
+            before,
+            &.{.{ .set_last_lba = .{
+                .table_index = 0,
+                .expected_last_lba = 4095,
+                .new_last_lba = 8191,
+            } }},
+        ),
+    );
+
+    try rewritePartitionEntries(
+        &img,
+        io,
+        std.testing.allocator,
+        before,
+        &.{
+            .{ .set_last_lba = .{
+                .table_index = 0,
+                .expected_last_lba = 4095,
+                .new_last_lba = 8191,
+            } },
+            .{ .clear = .{ .table_index = 1 } },
+        },
+    );
+
+    var after = try readVerifiedGpt(
+        img,
+        io,
+        std.testing.allocator,
+        default_max_partition_array_bytes,
+    );
+    defer after.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), after.partitions.len);
+    try std.testing.expectEqual(disk_size / sector_size - 1, after.primary_header.backup_lba);
+
+    const before_esp = testEntrySlice(before.partition_array, entry_size, 0);
+    const after_esp = testEntrySlice(after.partition_array, entry_size, 0);
+    var expected_esp: [160]u8 = undefined;
+    @memcpy(&expected_esp, before_esp);
+    std.mem.writeInt(u64, expected_esp[40..48], 8191, .little);
+    try std.testing.expectEqualSlices(u8, &expected_esp, after_esp);
+    try std.testing.expect(std.mem.allEqual(
+        u8,
+        testEntrySlice(after.partition_array, entry_size, 1),
+        0,
+    ));
+    try std.testing.expectEqualSlices(
+        u8,
+        testEntrySlice(before.partition_array, entry_size, 2),
+        testEntrySlice(after.partition_array, entry_size, 2),
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        testEntrySlice(before.partition_array, entry_size, 3),
+        testEntrySlice(after.partition_array, entry_size, 3),
+    );
 }
 
 test "rewriteIdentity preserves opaque GPT entry bytes on same-size disks" {
