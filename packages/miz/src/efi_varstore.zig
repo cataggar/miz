@@ -4,8 +4,8 @@
 //! `python3-virt-firmware`. It understands the exact on-media layout that the
 //! OVMF and AAVMF Secure-Boot variable templates use:
 //!
-//!   * `EFI_FIRMWARE_VOLUME_HEADER` with `_FVH`, the EDK II system NV data FV
-//!     GUID, a block map and the UEFI-16 header checksum;
+//!   * `EFI_FIRMWARE_VOLUME_HEADER` at offset 0, with `_FVH`, the EDK II
+//!     system NV data FV GUID, a block map and the UEFI-16 header checksum;
 //!   * `VARIABLE_STORE_HEADER` with the authenticated-variable GUID, the
 //!     formatted/healthy state pair and the store size; and
 //!   * a run of 4-byte-aligned `AUTHENTICATED_VARIABLE_HEADER` records, each
@@ -19,6 +19,13 @@
 //! compacts deleted and interrupted records, keeps live records in their
 //! original order, pads each record to the 4-byte header alignment with
 //! erased flash, and fills the remaining capacity with erased flash.
+//!
+//! Only a raw flash image is accepted, and only with its volume at offset 0.
+//! `virt-fw-vars` scans for a volume further in and separately understands
+//! QCOW2, but miz hands the store to QEMU as `format=raw` pflash: enrolling a
+//! volume embedded in a container would produce a file whose Secure Boot
+//! state the firmware never reads, and miz would then validate its own
+//! invisible edit. Containers are refused by magic with a specific error.
 //!
 //! Three behaviors differ from `virt-fw-vars` on purpose. Records are written
 //! in their original order instead of sorted by name, which UEFI does not
@@ -61,10 +68,6 @@ pub const authenticated_variable_store_guid: Guid =
 /// the failure is specific instead of "not a variable store".
 pub const plain_variable_store_guid: Guid =
     guid_mod.parse("DDCF3616-3275-4164-98B6-FE85707FFE7D");
-pub const firmware_file_system2_guid: Guid =
-    guid_mod.parse("8C8CE578-8A3D-4F1C-9935-896185C32DD3");
-pub const firmware_file_system3_guid: Guid =
-    guid_mod.parse("5473C07A-3DCB-4DCA-BD6F-1E9689E7349A");
 
 pub const global_variable_guid: Guid =
     guid_mod.parse("8BE4DF61-93CA-11D2-AA0D-00E098032B8C");
@@ -134,6 +137,7 @@ const max_variable_bytes: u32 = 16 * 1024 * 1024;
 
 pub const ParseError = error{
     VariableStoreNotFound,
+    UnsupportedVariableStoreContainer,
     InvalidFirmwareVolume,
     InvalidVariableStoreHeader,
     UnsupportedVariableStoreFormat,
@@ -195,10 +199,10 @@ pub const Variable = struct {
 /// A parsed store: the untouched backing image plus the live variables.
 pub const Store = struct {
     allocator: Allocator,
-    /// The complete file image. Everything outside `[data_offset, data_end)`
-    /// is written back byte-for-byte.
+    /// The complete file image. The NV-data firmware volume starts at offset
+    /// 0; everything outside `[data_offset, data_end)` is written back
+    /// byte-for-byte.
     image: []u8,
-    fv_offset: usize,
     fv_length: u64,
     fv_header_length: u16,
     store_offset: usize,
@@ -311,7 +315,7 @@ pub const Store = struct {
         }
         std.debug.assert(offset == self.data_offset + used);
         std.debug.assert(verifyFirmwareVolumeChecksum(
-            output[self.fv_offset..][0..self.fv_header_length],
+            output[0..self.fv_header_length],
         ));
         return output;
     }
@@ -346,30 +350,39 @@ pub fn verifyFirmwareVolumeChecksum(header: []const u8) bool {
     return sum == 0;
 }
 
-/// Locates the NV-data firmware volume, mirroring EDK II images that place it
-/// after one or more FFS volumes.
-fn findFirmwareVolumeOffset(bytes: []const u8) ParseError!usize {
-    var offset: usize = 0;
-    while (offset + min_fv_header_size <= bytes.len) {
-        const volume_guid: Guid = bytes[offset + 16 ..][0..16].*;
-        if (std.mem.eql(u8, &volume_guid, &system_nv_data_fv_guid)) return offset;
-        if (std.mem.eql(u8, &volume_guid, &firmware_file_system2_guid) or
-            std.mem.eql(u8, &volume_guid, &firmware_file_system3_guid))
-        {
-            const volume_length = std.mem.readInt(
-                u64,
-                bytes[offset + 32 ..][0..8],
-                .little,
-            );
-            if (volume_length < min_fv_header_size or
-                volume_length > bytes.len - offset)
-                return error.VariableStoreNotFound;
-            offset += @intCast(volume_length);
-            continue;
-        }
-        offset += 1024;
+/// Disk-image containers that must never be mistaken for raw flash. miz
+/// hands the variable store to QEMU as `format=raw` pflash, so a store found
+/// at some offset *inside* a container would be a store the firmware never
+/// reads: miz would enroll and self-validate bytes the guest cannot see.
+const ContainerFormat = struct {
+    name: []const u8,
+    offset: usize,
+    magic: []const u8,
+};
+
+const container_formats = [_]ContainerFormat{
+    .{ .name = "QCOW/QCOW2", .offset = 0, .magic = "QFI\xfb" },
+    .{ .name = "VHDX", .offset = 0, .magic = "vhdxfile" },
+    .{ .name = "VHD", .offset = 0, .magic = "conectix" },
+    .{ .name = "VMDK", .offset = 0, .magic = "KDMV" },
+    .{ .name = "VMDK descriptor", .offset = 0, .magic = "# Disk Descriptor" },
+    .{ .name = "VDI", .offset = 0x40, .magic = "\x7f\x10\xda\xbe" },
+};
+
+/// Requires the supported shape: a raw image whose NV-data firmware volume
+/// starts at offset 0. Scanning for a volume further in would accept exactly
+/// the containers above, so the only volume miz will edit is the one the
+/// firmware maps.
+fn requireRawNvDataVolume(bytes: []const u8) ParseError!void {
+    for (container_formats) |container| {
+        const end = container.offset + container.magic.len;
+        if (bytes.len >= end and
+            std.mem.eql(u8, bytes[container.offset..end], container.magic))
+            return error.UnsupportedVariableStoreContainer;
     }
-    return error.VariableStoreNotFound;
+    if (bytes.len < min_fv_header_size) return error.VariableStoreNotFound;
+    if (!std.mem.eql(u8, bytes[16..32], &system_nv_data_fv_guid))
+        return error.VariableStoreNotFound;
 }
 
 /// Parses `bytes` into an editable store.
@@ -393,9 +406,8 @@ pub fn parse(allocator: Allocator, bytes: []u8) !Store {
 fn parseHeaders(allocator: Allocator, bytes: []u8) ParseError!Store {
     if (bytes.len > max_store_bytes) return error.InvalidFirmwareVolume;
 
-    const fv_offset = try findFirmwareVolumeOffset(bytes);
-    const volume = bytes[fv_offset..];
-    if (volume.len < min_fv_header_size) return error.InvalidFirmwareVolume;
+    try requireRawNvDataVolume(bytes);
+    const volume = bytes;
 
     const fv_length = std.mem.readInt(u64, volume[32..40], .little);
     const signature = std.mem.readInt(u32, volume[40..44], .little);
@@ -406,7 +418,7 @@ fn parseHeaders(allocator: Allocator, bytes: []u8) ParseError!Store {
     if (signature != fv_signature) return error.InvalidFirmwareVolume;
     if (revision != fv_revision) return error.InvalidFirmwareVolume;
     // A variable store's FV has no extended header; refusing one keeps the
-    // store offset (`fv_offset + header_length`) unambiguous.
+    // store offset (`header_length`) unambiguous.
     if (ext_header_offset != 0) return error.InvalidFirmwareVolume;
     if (header_length < min_fv_header_size or
         header_length % 2 != 0 or
@@ -432,7 +444,7 @@ fn parseHeaders(allocator: Allocator, bytes: []u8) ParseError!Store {
     }
     if (!terminated or mapped_bytes != fv_length) return error.InvalidFirmwareVolume;
 
-    const store_offset = fv_offset + header_length;
+    const store_offset: usize = header_length;
     const store_header = bytes[store_offset..];
     if (store_header.len < store_header_size) return error.InvalidVariableStoreHeader;
     const store_guid: Guid = store_header[0..16].*;
@@ -456,7 +468,6 @@ fn parseHeaders(allocator: Allocator, bytes: []u8) ParseError!Store {
     return .{
         .allocator = allocator,
         .image = bytes,
-        .fv_offset = fv_offset,
         .fv_length = fv_length,
         .fv_header_length = header_length,
         .store_offset = store_offset,
@@ -1079,7 +1090,6 @@ test "both template shapes parse with their exact volume and store geometry" {
         var store = try parse(allocator, image);
         defer store.deinit();
 
-        try testing.expectEqual(@as(usize, 0), store.fv_offset);
         try testing.expectEqual(shape.fv_length, store.fv_length);
         try testing.expectEqual(@as(u16, 72), store.fv_header_length);
         try testing.expectEqual(@as(usize, 72), store.store_offset);
@@ -1969,6 +1979,93 @@ test "malformed firmware volumes and stores are rejected" {
     try testing.expectError(error.VariableStoreNotFound, parse(allocator, tiny));
 }
 
+/// Wraps `volume` at `offset` behind `prefix`, the shape a container image
+/// gives a raw firmware volume it stores as payload.
+fn embedVolumeAlloc(
+    allocator: Allocator,
+    prefix: []const u8,
+    offset: usize,
+    volume: []const u8,
+) ![]u8 {
+    std.debug.assert(prefix.len <= offset);
+    const image = try allocator.alloc(u8, offset + volume.len);
+    @memset(image, 0);
+    @memcpy(image[0..prefix.len], prefix);
+    @memcpy(image[offset..], volume);
+    return image;
+}
+
+test "a firmware volume that is not at offset 0 is refused" {
+    const allocator = testing.allocator;
+    const volume = try microsoftTemplateAlloc(allocator, TemplateShape.ovmf_4m);
+    defer allocator.free(volume);
+    // Sanity: the same bytes parse when they are the whole image.
+    {
+        var store = try parse(allocator, try allocator.dupe(u8, volume));
+        defer store.deinit();
+        try testing.expect(store.find("PK", global_variable_guid) != null);
+    }
+
+    // A QCOW2 vars template is the case that matters. `miz qemu` passes the
+    // variable store to QEMU as `format=raw` pflash, so a store enrolled at
+    // a cluster offset inside a QCOW2 file would be one the firmware never
+    // maps: miz would enroll and then self-validate invisible bytes.
+    const qcow2_header =
+        "QFI\xfb" ++ // magic
+        "\x00\x00\x00\x03" ++ // version 3
+        "\x00" ** 8 ++ // backing file offset
+        "\x00" ** 4 ++ // backing file size
+        "\x00\x00\x00\x0c"; // cluster_bits = 12 (4 KiB clusters)
+    const qcow2 = try embedVolumeAlloc(allocator, qcow2_header, 0x1000, volume);
+    defer allocator.free(qcow2);
+    try testing.expectError(
+        error.UnsupportedVariableStoreContainer,
+        parse(allocator, qcow2),
+    );
+
+    // Every container magic is refused with the same specific error, at
+    // whichever offset the format puts it.
+    for (container_formats) |container| {
+        const prefix = try allocator.alloc(u8, container.offset + container.magic.len);
+        defer allocator.free(prefix);
+        @memset(prefix, 0);
+        @memcpy(prefix[container.offset..], container.magic);
+        const image = try embedVolumeAlloc(allocator, prefix, 0x1000, volume);
+        defer allocator.free(image);
+        testing.expectError(
+            error.UnsupportedVariableStoreContainer,
+            parse(allocator, image),
+        ) catch |err| {
+            std.debug.print("container '{s}' was not refused\n", .{container.name});
+            return err;
+        };
+    }
+
+    // A container miz does not recognize must not fall through to a scan
+    // either: the volume simply is not where a raw flash image keeps it.
+    for ([_]usize{ 1024, 0x1000, 0x10000 }) |offset| {
+        const image = try embedVolumeAlloc(allocator, "", offset, volume);
+        defer allocator.free(image);
+        try testing.expectError(
+            error.VariableStoreNotFound,
+            parse(allocator, image),
+        );
+    }
+
+    // Neither does a leading EDK II code volume: `miz qemu` maps the code
+    // and vars volumes as separate pflash units, so a combined image is not
+    // a variable store miz may edit.
+    const ffs_prefix =
+        "\x00" ** 16 ++
+        "\x78\xe5\x8c\x8c\x3d\x8a\x1c\x4f\x99\x35\x89\x61\x85\xc3\x2d\xd3";
+    const combined = try embedVolumeAlloc(allocator, ffs_prefix, 0x1000, volume);
+    defer allocator.free(combined);
+    try testing.expectError(
+        error.VariableStoreNotFound,
+        parse(allocator, combined),
+    );
+}
+
 test "a rejected parse leaves the caller owning its buffer" {
     const allocator = testing.allocator;
     const image = try buildTemplateAlloc(allocator, TemplateShape.ovmf_4m, &.{
@@ -2445,6 +2542,7 @@ test "system firmware templates parse and enroll when present" {
     const certificate = try testCertificateDerAlloc(allocator, test_certificate_pem);
     defer allocator.free(certificate);
     const digest = sha256Bytes(certificate);
+    var examined: usize = 0;
 
     const system_candidates = [_][]const u8{
         "/usr/share/OVMF/OVMF_VARS_4M.ms.fd",
@@ -2476,7 +2574,31 @@ test "system firmware templates parse and enroll when present" {
         while (it.next()) |path| try paths.append(allocator, path);
     }
 
-    var examined: usize = 0;
+    // Distributions ship the same variable templates as QCOW2 next to the
+    // raw ones. They must be refused, not quietly enrolled at a cluster
+    // offset, because `miz qemu` maps the store as `format=raw` pflash.
+    const container_candidates = [_][]const u8{
+        "/usr/share/OVMF/OVMF_VARS_4M.qcow2",
+        "/usr/share/OVMF/OVMF_VARS_4M.secboot.qcow2",
+        "/usr/share/OVMF/OVMF_VARS_4M.ms.qcow2",
+        "/usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2",
+        "/usr/share/edk2/ovmf/OVMF_VARS_4M.secboot.qcow2",
+        "/usr/share/AAVMF/AAVMF_VARS.qcow2",
+        "/usr/share/AAVMF/AAVMF_VARS.ms.qcow2",
+        "/usr/share/edk2/aarch64/vars-template-pflash.qcow2",
+    };
+    for (container_candidates) |path| {
+        Io.Dir.cwd().access(io, path, .{ .read = true }) catch continue;
+        examined += 1;
+        testing.expectError(
+            error.UnsupportedVariableStoreContainer,
+            parseFileAlloc(allocator, io, path),
+        ) catch |err| {
+            std.debug.print("'{s}' was not refused as a container\n", .{path});
+            return err;
+        };
+    }
+
     for (paths.items) |path| {
         Io.Dir.cwd().access(io, path, .{ .read = true }) catch continue;
         var store = parseFileAlloc(allocator, io, path) catch |err| switch (err) {

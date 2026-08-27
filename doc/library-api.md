@@ -155,7 +155,10 @@ expected fingerprint.
 
 `miz.efi_varstore` reads, edits, and writes the EDK II authenticated variable
 stores that OVMF and AAVMF ship as `*_VARS.fd` templates. It replaces the
-`virt-fw-vars` host tool: no Python, no subprocess.
+`virt-fw-vars` host tool: no Python, no subprocess. Only a raw flash image
+whose firmware volume starts at offset 0 is accepted; the QCOW2 templates
+shipped beside the raw ones are refused by magic, since QEMU maps the store as
+raw pflash and would never see a store enrolled at a cluster offset.
 
 ```zig
 const trust = try miz.efi_varstore.enrollSecureBootFile(

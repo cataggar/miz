@@ -1656,6 +1656,7 @@ fn validateSecureBootVars(
 fn translateSecureBootVarsError(err: anyerror) anyerror {
     return switch (err) {
         error.VariableStoreFull => error.SecureBootVariableStoreFull,
+        error.UnsupportedVariableStoreContainer => error.SecureBootVarsNotRawFlash,
         error.VariableStoreNotFound,
         error.InvalidFirmwareVolume,
         error.InvalidVariableStoreHeader,
@@ -2659,6 +2660,10 @@ fn printSecureBootPreparationError(image_path: []const u8, err: anyerror) void {
         ),
         error.SecureBootVariableStoreFull => std.debug.print(
             "qemu: the selected UEFI variables template has no room for the release Secure Boot certificate\n",
+            .{},
+        ),
+        error.SecureBootVarsNotRawFlash => std.debug.print(
+            "qemu: the selected UEFI variables template is a disk-image container; Secure Boot needs the raw flash template (a .fd or .raw file), because QEMU maps it as raw pflash\n",
             .{},
         ),
         error.InvalidSecureBootMetadata,
