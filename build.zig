@@ -998,6 +998,53 @@ pub fn build(b: *std.Build) void {
     azurelinux4_release_test_step.dependOn(&run_azurelinux4_release_tests.step);
     azurelinux4_release_test_step.dependOn(&run_azurelinux4_contract_tests.step);
 
+    // ---- scripts/ubuntu2604_image_benchmark.zig: the repeatable host
+    // benchmark for the pinned Ubuntu 26.04 aarch64 bare-metal image, plus the
+    // staging, gate, and evidence subcommands its workflow drives. Replaces
+    // scripts/ubuntu2604_image_benchmark.py and the workflow's inline Python.
+    // ----
+    const ubuntu2604_image_benchmark_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/ubuntu2604_image_benchmark.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const ubuntu2604_image_benchmark_exe = b.addExecutable(.{
+        .name = "ubuntu2604-image-benchmark",
+        .root_module = ubuntu2604_image_benchmark_mod,
+    });
+    const install_ubuntu2604_image_benchmark = b.addInstallArtifact(
+        ubuntu2604_image_benchmark_exe,
+        .{},
+    );
+    b.getInstallStep().dependOn(&install_ubuntu2604_image_benchmark.step);
+    const install_ubuntu2604_image_benchmark_step = b.step(
+        "install-ubuntu2604-image-benchmark",
+        "Install only the Ubuntu 26.04 image benchmark tool",
+    );
+    install_ubuntu2604_image_benchmark_step.dependOn(
+        &install_ubuntu2604_image_benchmark.step,
+    );
+    const ubuntu2604_image_benchmark_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/ubuntu2604_image_benchmark.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "benchmark", .module = ubuntu2604_image_benchmark_mod },
+            },
+        }),
+    });
+    const run_ubuntu2604_image_benchmark_tests = b.addRunArtifact(
+        ubuntu2604_image_benchmark_tests,
+    );
+    const ubuntu2604_image_benchmark_test_step = b.step(
+        "test-ubuntu2604-image-benchmark",
+        "Run Ubuntu 26.04 image benchmark unit tests",
+    );
+    ubuntu2604_image_benchmark_test_step.dependOn(
+        &run_ubuntu2604_image_benchmark_tests.step,
+    );
+
     // ---- tests/python_inventory.zig: the temporary, explicit inventory of
     // the Python this repository still owns. It shells out to `git ls-files`
     // and reads the tracked tree, so its result is never cacheable. ----
@@ -1735,6 +1782,7 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(&run_azure_vhd_tests.step);
         aggregate_test_step.dependOn(&run_azurelinux4_release_tests.step);
         aggregate_test_step.dependOn(&run_azurelinux4_contract_tests.step);
+        aggregate_test_step.dependOn(&run_ubuntu2604_image_benchmark_tests.step);
         aggregate_test_step.dependOn(&run_python_inventory_tests.step);
         aggregate_test_step.dependOn(&run_nbd_mod_tests.step);
         aggregate_test_step.dependOn(&run_nbd_exe_tests.step);
