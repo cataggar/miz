@@ -18,6 +18,7 @@
 const std = @import("std");
 const Io = std.Io;
 const zstd = @import("zstd.zig");
+const xz_fixture = @import("xz_fixture.zig");
 
 pub const magic: u32 = 0x7371_7368; // "hsqs" little-endian on disk
 pub const major_version: u16 = 4;
@@ -2124,28 +2125,10 @@ fn compressSyntheticBytes(allocator: std.mem.Allocator, compression: SyntheticCo
 }
 
 fn compressSyntheticXz(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
-    const encoded_len = std.base64.standard.Encoder.calcSize(payload.len);
-    const encoded = try allocator.alloc(u8, encoded_len);
-    defer allocator.free(encoded);
-    _ = std.base64.standard.Encoder.encode(encoded, payload);
-    const script =
-        \\import base64
-        \\import lzma
-        \\import sys
-        \\sys.stdout.buffer.write(lzma.compress(base64.b64decode(sys.argv[1]), format=lzma.FORMAT_XZ))
-    ;
-    const result = try std.process.run(allocator, std.testing.io, .{
-        .argv = &.{ "python3", "-c", script, encoded },
-        .cwd = .{ .path = "." },
-    });
-    defer allocator.free(result.stderr);
-    errdefer allocator.free(result.stdout);
-    switch (result.term) {
-        .exited => |code| if (code == 0) return result.stdout,
-        else => {},
-    }
-    allocator.free(result.stdout);
-    return error.ExternalCompressionFailed;
+    // The in-tree encoder only emits LZMA2 uncompressed chunks, so the stored
+    // block grows slightly. That is fine for fixtures: the reader still walks
+    // the real xz container and LZMA2 framing.
+    return xz_fixture.allocStream(allocator, payload, .{});
 }
 
 fn compressSyntheticZstd(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
