@@ -88,12 +88,6 @@ const inventory = [_]Entry{
         .note = "ubuntu2604_release.py and inline Python",
     },
     .{
-        .path = ".github/workflows/ubuntu2604-image-benchmark.yml",
-        .kind = .execution,
-        .sites = 4,
-        .note = "the benchmark driver and inline evidence Python",
-    },
-    .{
         .path = ".github/workflows/ubuntu2604-release.yml",
         .kind = .execution,
         .sites = 7,
@@ -104,12 +98,6 @@ const inventory = [_]Entry{
         .kind = .documentation,
         .sites = 1,
         .note = "shows freebsd15_release.py compare",
-    },
-    .{
-        .path = "doc/ubuntu.md",
-        .kind = .documentation,
-        .sites = 1,
-        .note = "shows the image benchmark command",
     },
     .{
         .path = "packages/miz/src/customize.zig",
@@ -169,11 +157,6 @@ const inventory = [_]Entry{
         .note = "inline Python and ubuntu2604_release.py",
     },
     .{
-        .path = "scripts/ubuntu2604_image_benchmark.py",
-        .kind = .source,
-        .note = "ported by the benchmark slice",
-    },
-    .{
         .path = "scripts/ubuntu2604_local_e2e.sh",
         .kind = .execution,
         .sites = 1,
@@ -217,16 +200,6 @@ const inventory = [_]Entry{
         .note = "ported by the Ubuntu release slice",
     },
     .{
-        .path = "tests/ubuntu2604_image_benchmark_test.py",
-        .kind = .source,
-        .note = "ported by the benchmark slice",
-    },
-    .{
-        .path = "tests/ubuntu2604_image_benchmark_workflow_test.py",
-        .kind = .source,
-        .note = "ported by the benchmark slice",
-    },
-    .{
         .path = "tests/ubuntu2604_release_test.py",
         .kind = .source,
         .note = "ported by the Ubuntu release slice",
@@ -240,8 +213,8 @@ const inventory = [_]Entry{
 
 /// Totals restated so a diff shows the migration moving. Both must only ever
 /// decrease; an increase means a new Python dependency was introduced.
-const remaining_source_files = 13;
-const remaining_execution_sites = 87;
+const remaining_source_files = 10;
+const remaining_execution_sites = 83;
 
 /// No tracked file is anywhere near this size, and the limit keeps a stray
 /// large blob from being read into memory by this scan.

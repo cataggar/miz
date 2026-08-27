@@ -1045,6 +1045,37 @@ pub fn build(b: *std.Build) void {
         &run_ubuntu2604_image_benchmark_tests.step,
     );
 
+    // ---- tests/ubuntu2604_image_benchmark_workflow.zig: the dispatch-only
+    // benchmark workflow's own contracts -- privilege boundaries, pinned
+    // actions, offline measured protocol, and private-material handling.
+    // Replaces tests/ubuntu2604_image_benchmark_workflow_test.py. ----
+    const ubuntu2604_image_benchmark_workflow_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "tests/ubuntu2604_image_benchmark_workflow.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_ubuntu2604_image_benchmark_workflow_tests = b.addRunArtifact(
+        ubuntu2604_image_benchmark_workflow_tests,
+    );
+    // The subject is a tracked file rather than a build input, so a cached
+    // result would speak for a workflow that has since changed.
+    run_ubuntu2604_image_benchmark_workflow_tests.has_side_effects = true;
+    run_ubuntu2604_image_benchmark_workflow_tests.setEnvironmentVariable(
+        "MIZ_REPOSITORY_ROOT",
+        b.build_root.path orelse ".",
+    );
+    const ubuntu2604_image_benchmark_workflow_test_step = b.step(
+        "test-ubuntu2604-image-benchmark-workflow",
+        "Check the Ubuntu 26.04 image benchmark workflow contracts",
+    );
+    ubuntu2604_image_benchmark_workflow_test_step.dependOn(
+        &run_ubuntu2604_image_benchmark_workflow_tests.step,
+    );
+
     // ---- tests/python_inventory.zig: the temporary, explicit inventory of
     // the Python this repository still owns. It shells out to `git ls-files`
     // and reads the tracked tree, so its result is never cacheable. ----
@@ -1783,6 +1814,9 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(&run_azurelinux4_release_tests.step);
         aggregate_test_step.dependOn(&run_azurelinux4_contract_tests.step);
         aggregate_test_step.dependOn(&run_ubuntu2604_image_benchmark_tests.step);
+        aggregate_test_step.dependOn(
+            &run_ubuntu2604_image_benchmark_workflow_tests.step,
+        );
         aggregate_test_step.dependOn(&run_python_inventory_tests.step);
         aggregate_test_step.dependOn(&run_nbd_mod_tests.step);
         aggregate_test_step.dependOn(&run_nbd_exe_tests.step);

@@ -18,6 +18,7 @@ env:
   INPUT_ROOT: .scratch/ubuntu2604-production-benchmark-inputs
   SIGNING_ROOT: .scratch/ubuntu2604-production-benchmark-signing
   STAGING_ROOT: .scratch/ubuntu2604-production-benchmark-staging
+  BENCHMARK_TOOL: zig-out/bin/ubuntu2604-image-benchmark
   TEST_CERTIFICATE_SHA256: "8ca3b80b1a2272a4f3a6d13246a65cfdd89764eb83beb8a0709e3cf591490279"
   STAGING_MINIMUM_FREE_BYTES: "38654705664"
   MEASURED_MINIMUM_FREE_BYTES: "32212254720"
@@ -85,7 +86,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            file jq openssh-client python3 systemd-boot-efi
+            file jq openssh-client systemd-boot-efi
           test "$(uname -m)" = aarch64
           test -x /usr/bin/unshare
           test -f /usr/lib/systemd/boot/efi/linuxaa64.efi.stub
@@ -121,7 +122,11 @@ jobs:
           export ZIG_LOCAL_CACHE_DIR="$STAGING_ROOT/zig-local-cache"
           mkdir -p "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
           "$ZIG_BIN" build --fetch --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
-          "$ZIG_BIN" build install-miz -Doptimize=ReleaseSafe
+          "$ZIG_BIN" build install-miz install-ubuntu2604-image-benchmark \
+            -Doptimize=ReleaseSafe
+          benchmark_bin="$PWD/$BENCHMARK_TOOL"
+          test -x "$benchmark_bin"
+          echo "BENCHMARK_BIN=$benchmark_bin" >> "$GITHUB_ENV"
           actual=$(zig-out/bin/miz uki fingerprint "$SIGNING_CERTIFICATE")
           test "$actual" = "$TEST_CERTIFICATE_SHA256"
 
@@ -172,21 +177,7 @@ jobs:
             "$provenance/ubuntu2604-build-provenance.json" \
             "$EVIDENCE_ROOT/staging-build-provenance.json"
 
-          python3 - "$INPUT_ROOT" <<'PY'
-          import sys
-          from pathlib import Path
-          from scripts import ubuntu2604_image_benchmark as benchmark
-
-          root = Path(sys.argv[1])
-          inventory = benchmark.verify_benchmark_cache(
-              root / "debz-cache", root / "debz-inputs"
-          )
-          locks = benchmark.verify_lock_set(
-              root / "locks", inventory["_package_object_names"]
-          )
-          if len(locks["locks"]) != len(benchmark.PACKAGE_ROOTS):
-              raise SystemExit("staging did not produce the exact benchmark lock set")
-          PY
+          "$BENCHMARK_BIN" verify-staging --input-root "$INPUT_ROOT"
 
           sudo rm -rf -- "$STAGING_ROOT"
           sudo apt-get clean
@@ -204,7 +195,7 @@ jobs:
           set -euo pipefail
           test ! -e "$BENCHMARK_OUTPUT"
           sudo -E /usr/bin/unshare --net -- \
-            python3 scripts/ubuntu2604_image_benchmark.py \
+            "$BENCHMARK_BIN" run \
               --output-root "$BENCHMARK_OUTPUT" \
               --source "$INPUT_ROOT/ubuntu-26.04-server-cloudimg-arm64.img" \
               --sha256sums "$INPUT_ROOT/SHA256SUMS" \
@@ -229,108 +220,21 @@ jobs:
           mkdir -p "$EVIDENCE_ROOT"
           sudo chown -R "$(id -u):$(id -g)" \
             "$BENCHMARK_OUTPUT" "$EVIDENCE_ROOT" 2>/dev/null || true
-          python3 - \
-            "$BENCHMARK_OUTPUT/benchmark-summary.json" \
-            "$BENCHMARK_OUTPUT/benchmark-status.json" \
-            "$EVIDENCE_ROOT/non-regression-gate.json" \
-            "$GITHUB_STEP_SUMMARY" \
-            "$NON_REGRESSION_CEILING_NS" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          summary_path, status_path, gate_path, step_summary_path = map(
-              Path, sys.argv[1:5]
-          )
-          ceiling = int(sys.argv[5])
-          gate = {
-              "schema": 1,
-              "type": "miz-ubuntu2604-production-benchmark-gate",
-              "ceiling_ns": ceiling,
-              "status": "invalid",
-          }
-          lines = ["## Ubuntu 26.04 production image benchmark", ""]
-          if summary_path.is_file():
-              summary = json.loads(summary_path.read_text(encoding="utf-8"))
-              phases = summary["medians"]["phase_elapsed_ns"]
-              total = phases["total_runtime"]
-              raw = phases["raw_image_materialization"]
-              gate.update(
-                  {
-                      "benchmark_status": summary["status"],
-                      "source_commit": summary["source_commit"],
-                      "median_total_ns": total,
-                      "median_raw_image_materialization_ns": raw,
-                      "status": "pass" if total <= ceiling else "fail",
-                  }
-              )
-              lines.extend(
-                  [
-                      f"- Source: `{summary['source_commit']}`",
-                      "- Protocol: one warm-up plus three measured offline runs",
-                      f"- Median total: `{total / 1e9:.3f} s`",
-                      f"- Median raw materialization: `{raw / 1e9:.3f} s`",
-                      f"- Ceiling: `{ceiling / 1e9:.3f} s`",
-                      f"- Gate: **{gate['status']}**",
-                      "- Boot acceptance: unavailable for the bare-metal flavor; "
-                      "the benchmark ran native image/filesystem/provenance validation",
-                  ]
-              )
-          else:
-              status = (
-                  json.loads(status_path.read_text(encoding="utf-8"))
-                  if status_path.is_file()
-                  else {"status": "missing"}
-              )
-              gate["benchmark_status"] = status
-              lines.append(f"- Benchmark did not complete: `{status}`")
-          gate_path.write_text(
-              json.dumps(gate, indent=2, sort_keys=True) + "\n",
-              encoding="utf-8",
-          )
-          with step_summary_path.open("a", encoding="utf-8") as output:
-              output.write("\n".join(lines) + "\n")
-          if gate["status"] != "pass":
-              raise SystemExit("production image benchmark did not pass")
-          PY
+          "${BENCHMARK_BIN:-$PWD/$BENCHMARK_TOOL}" gate \
+            --summary "$BENCHMARK_OUTPUT/benchmark-summary.json" \
+            --status "$BENCHMARK_OUTPUT/benchmark-status.json" \
+            --output "$EVIDENCE_ROOT/non-regression-gate.json" \
+            --step-summary "$GITHUB_STEP_SUMMARY" \
+            --ceiling-ns "$NON_REGRESSION_CEILING_NS"
 
       - name: Prove upload evidence excludes private key material
         id: private-material-check
         if: always()
         run: |
           set -euo pipefail
-          python3 - "$EVIDENCE_ROOT" "$BENCHMARK_OUTPUT" <<'PY'
-          import sys
-          from pathlib import Path
-
-          roots = [Path(value) for value in sys.argv[1:]]
-          markers = (
-              b"-----BEGIN PRIVATE KEY-----",
-              b"-----BEGIN RSA PRIVATE KEY-----",
-              b"-----BEGIN OPENSSH PRIVATE KEY-----",
-          )
-          evidence_root, benchmark_root = roots
-          paths = list(evidence_root.rglob("*")) if evidence_root.exists() else []
-          for name in (
-              "benchmark-status.json",
-              "benchmark-summary.json",
-              "benchmark-summary.txt",
-              "inputs.json",
-              "cache-inventory.json",
-              "package-lock-set.json",
-              "host.json",
-              "preflight-build.log",
-          ):
-              paths.append(benchmark_root / name)
-          paths.extend(benchmark_root.glob("run-*/evidence/**/*"))
-          for path in paths:
-              if not path.is_file():
-                  continue
-              with path.open("rb") as stream:
-                  prefix = stream.read(1024 * 1024)
-              if any(marker in prefix for marker in markers):
-                  raise SystemExit(f"private material found in evidence: {path}")
-          PY
+          "${BENCHMARK_BIN:-$PWD/$BENCHMARK_TOOL}" scan-private-material \
+            --evidence-root "$EVIDENCE_ROOT" \
+            --benchmark-root "$BENCHMARK_OUTPUT"
 
       - name: Upload benchmark timing, provenance, and logs
         if: always() && steps.private-material-check.outcome == 'success'

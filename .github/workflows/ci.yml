@@ -45,8 +45,6 @@ jobs:
             tests.ubuntu2604_release_test \
             tests.ubuntu2604_workflow_test \
             tests.ubuntu2604_core_workflow_test \
-            tests.ubuntu2604_image_benchmark_test \
-            tests.ubuntu2604_image_benchmark_workflow_test \
             tests.ubuntu2604_azure_acceptance_test
 
   zig-tests:
