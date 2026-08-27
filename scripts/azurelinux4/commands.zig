@@ -1769,6 +1769,11 @@ const Fixture = struct {
         certificate: []const u8 = Fixture.certificate,
         signing_leaf: []const u8 = Fixture.signing_leaf,
         virtual_size: i64 = 1024,
+        /// Bind a build log into provenance, the way a real build does. A
+        /// test that hides key material in an *unbound* file only ever
+        /// reaches the allowlist check, so the file has to exist before
+        /// `candidate.json` is written for the scan to be what fails.
+        build_log: bool = false,
     };
 
     fn create(allocator: Allocator, io: Io) !Fixture {
@@ -1870,6 +1875,10 @@ const Fixture = struct {
             try std.fmt.allocPrint(self.allocator, "{s}/inputs.txt", .{provenance}),
             contents,
         );
+        if (options.build_log) try self.write(
+            try std.fmt.allocPrint(self.allocator, "{s}/build.log", .{provenance}),
+            "diagnostic output\n",
+        );
         var name_buffer: [contracts.signing_provenance_name_capacity]u8 = undefined;
         const signing_name = contracts.signingProvenanceName(
             &name_buffer,
@@ -1946,8 +1955,8 @@ const Fixture = struct {
         try Dir.cwd().deleteFile(self.io, vhd);
     }
 
-    fn makeAll(self: *Fixture) !void {
-        for (contracts.release_order) |entry| try self.makeBundle(entry, .{});
+    fn makeAll(self: *Fixture, options: Options) !void {
+        for (contracts.release_order) |entry| try self.makeBundle(entry, options);
     }
 
     const Staged = struct { output: []const u8, notes: []const u8 };
@@ -2006,7 +2015,7 @@ test "stage requires and copies exactly four bound assets" {
     defer arena.deinit();
     var fixture = try Fixture.create(arena.allocator(), io);
     defer fixture.deinit();
-    try fixture.makeAll();
+    try fixture.makeAll(.{});
 
     const staged = try fixture.stageAll();
     const manifest_text = try fixture.read(
@@ -2135,7 +2144,7 @@ test "stage refuses an incomplete or unbound Azure matrix" {
     {
         var fixture = try Fixture.create(arena.allocator(), io);
         defer fixture.deinit();
-        try fixture.makeAll();
+        try fixture.makeAll(.{});
         try Dir.cwd().deleteFile(
             io,
             try fixture.path("azure/aarch64-core/azure-result.json", .{}),
@@ -2145,7 +2154,7 @@ test "stage refuses an incomplete or unbound Azure matrix" {
     {
         var fixture = try Fixture.create(arena.allocator(), io);
         defer fixture.deinit();
-        try fixture.makeAll();
+        try fixture.makeAll(.{});
         try fixture.mutate(
             try fixture.path("azure/x86_64-full/azure-result.json", .{}),
             "azure_accepted_sha256",
@@ -2160,7 +2169,7 @@ test "stage refuses an incomplete or unbound Azure matrix" {
     {
         var fixture = try Fixture.create(arena.allocator(), io);
         defer fixture.deinit();
-        try fixture.makeAll();
+        try fixture.makeAll(.{});
         try fixture.mutate(
             try fixture.path("azure/x86_64-full/azure-result.json", .{}),
             "derived_vhd_current_size",
@@ -2180,7 +2189,7 @@ test "stage refuses a checksum sidecar anywhere in the inputs" {
     defer arena.deinit();
     var fixture = try Fixture.create(arena.allocator(), io);
     defer fixture.deinit();
-    try fixture.makeAll();
+    try fixture.makeAll(.{});
     try fixture.write(
         try fixture.path("candidates/forbidden.sha256", .{}),
         "0" ** 64,
@@ -2200,7 +2209,7 @@ test "stage refuses tampered or missing internal provenance" {
     {
         var fixture = try Fixture.create(arena.allocator(), io);
         defer fixture.deinit();
-        try fixture.makeAll();
+        try fixture.makeAll(.{});
         try fixture.write(
             try fixture.path(
                 "candidates/x86_64-full/internal-provenance/inputs.txt",
@@ -2213,7 +2222,7 @@ test "stage refuses tampered or missing internal provenance" {
     {
         var fixture = try Fixture.create(arena.allocator(), io);
         defer fixture.deinit();
-        try fixture.makeAll();
+        try fixture.makeAll(.{});
         try Dir.cwd().deleteFile(io, try fixture.path(
             "candidates/x86_64-full/internal-provenance/uki-signing-full-x86_64.json",
             .{},
@@ -2247,7 +2256,7 @@ test "stage refuses private key material in provenance in every encoding" {
     for (cases) |case| {
         var fixture = try Fixture.create(arena.allocator(), io);
         defer fixture.deinit();
-        try fixture.makeAll();
+        try fixture.makeAll(.{ .build_log = true });
         try fixture.write(
             try fixture.path(
                 "candidates/x86_64-full/internal-provenance/{s}",
@@ -2256,6 +2265,12 @@ test "stage refuses private key material in provenance in every encoding" {
             case.data,
         );
         try expectStageFails(&fixture);
+        // The scan is what refuses these, not the size or allowlist checks
+        // that would otherwise mask it.
+        try std.testing.expectEqualStrings(
+            "x86_64-full: private key material is forbidden in provenance",
+            fixture.diagnostic.message(),
+        );
     }
 }
 
@@ -2306,7 +2321,7 @@ test "a failed stage leaves the staging directory exactly as it found it" {
     defer arena.deinit();
     var fixture = try Fixture.create(arena.allocator(), io);
     defer fixture.deinit();
-    try fixture.makeAll();
+    try fixture.makeAll(.{});
     // The last candidate in publication order fails, so three images have
     // already been linked into the staging directory when it does.
     try fixture.mutate(
@@ -2344,7 +2359,7 @@ test "stage refuses a staging directory that is not empty" {
     defer arena.deinit();
     var fixture = try Fixture.create(arena.allocator(), io);
     defer fixture.deinit();
-    try fixture.makeAll();
+    try fixture.makeAll(.{});
     try fixture.write(try fixture.path("staged/leftover", .{}), "x");
     try expectStageFails(&fixture);
     try std.testing.expect(std.mem.startsWith(

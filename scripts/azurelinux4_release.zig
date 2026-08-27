@@ -170,58 +170,49 @@ const Context = struct {
     diagnostic: *Diagnostic,
 };
 
+/// One subcommand: the name a caller spells and the handler it reaches.
+///
+/// A table rather than a chain of comparisons, because the names are the
+/// interface: the workflow, the acceptance harness, and the publisher all
+/// spell them, and a rename that misses one of those callers is only
+/// discovered by a four-hour release run. The table is what the dispatch
+/// test reads, so a command that is renamed or dropped cannot pass silently.
+const Command = struct {
+    name: []const u8,
+    handler: *const fn (Context, []const []const u8) anyerror!void,
+};
+
+const command_table = [_]Command{
+    .{ .name = "candidate", .handler = runCandidate },
+    .{ .name = "verify-candidate", .handler = runVerifyCandidate },
+    .{ .name = "verify-vhd", .handler = runVerifyVhd },
+    .{ .name = "azure-result", .handler = runAzureResult },
+    .{ .name = "stage", .handler = runStage },
+    .{ .name = "check-candidate-info", .handler = runCheckCandidateInfo },
+    .{ .name = "signing-identity", .handler = runSigningIdentity },
+    .{ .name = "check-group-tags", .handler = runCheckGroupTags },
+    .{ .name = "disk-access-sas", .handler = runDiskAccessSas },
+    .{ .name = "check-vm-sku", .handler = runCheckVmSku },
+    .{ .name = "gallery-request", .handler = runGalleryRequest },
+    .{ .name = "check-gallery-accepted", .handler = runCheckGalleryAccepted },
+    .{ .name = "gallery-state", .handler = runGalleryState },
+    .{ .name = "check-gallery-final", .handler = runCheckGalleryFinal },
+    .{ .name = "check-vm-security", .handler = runCheckVmSecurity },
+    .{ .name = "check-uefi-db", .handler = runCheckUefiDb },
+    .{ .name = "publish-expected", .handler = runPublishExpected },
+    .{ .name = "tag-ref", .handler = runTagRef },
+    .{ .name = "tag-object", .handler = runTagObject },
+    .{ .name = "release-stale-assets", .handler = runReleaseStaleAssets },
+    .{ .name = "check-release-assets", .handler = runCheckReleaseAssets },
+    .{ .name = "check-downloads", .handler = runCheckDownloads },
+};
+
 fn run(context: Context, argv: []const []const u8) !void {
     if (argv.len == 0) return error.Usage;
-    const command = argv[0];
-    const rest = argv[1..];
-
-    if (std.mem.eql(u8, command, "candidate")) return runCandidate(context, rest);
-    if (std.mem.eql(u8, command, "verify-candidate")) {
-        return runVerifyCandidate(context, rest);
-    }
-    if (std.mem.eql(u8, command, "verify-vhd")) return runVerifyVhd(context, rest);
-    if (std.mem.eql(u8, command, "azure-result")) return runAzureResult(context, rest);
-    if (std.mem.eql(u8, command, "stage")) return runStage(context, rest);
-    if (std.mem.eql(u8, command, "check-candidate-info")) {
-        return runCheckCandidateInfo(context, rest);
-    }
-    if (std.mem.eql(u8, command, "signing-identity")) {
-        return runSigningIdentity(context, rest);
-    }
-    if (std.mem.eql(u8, command, "check-group-tags")) {
-        return runCheckGroupTags(context, rest);
-    }
-    if (std.mem.eql(u8, command, "disk-access-sas")) {
-        return runDiskAccessSas(context, rest);
-    }
-    if (std.mem.eql(u8, command, "check-vm-sku")) return runCheckVmSku(context, rest);
-    if (std.mem.eql(u8, command, "gallery-request")) {
-        return runGalleryRequest(context, rest);
-    }
-    if (std.mem.eql(u8, command, "check-gallery-accepted")) {
-        return runCheckGalleryAccepted(context, rest);
-    }
-    if (std.mem.eql(u8, command, "gallery-state")) return runGalleryState(context, rest);
-    if (std.mem.eql(u8, command, "check-gallery-final")) {
-        return runCheckGalleryFinal(context, rest);
-    }
-    if (std.mem.eql(u8, command, "check-vm-security")) {
-        return runCheckVmSecurity(context, rest);
-    }
-    if (std.mem.eql(u8, command, "check-uefi-db")) return runCheckUefiDb(context, rest);
-    if (std.mem.eql(u8, command, "publish-expected")) {
-        return runPublishExpected(context, rest);
-    }
-    if (std.mem.eql(u8, command, "tag-ref")) return runTagRef(context, rest);
-    if (std.mem.eql(u8, command, "tag-object")) return runTagObject(context, rest);
-    if (std.mem.eql(u8, command, "release-stale-assets")) {
-        return runReleaseStaleAssets(context, rest);
-    }
-    if (std.mem.eql(u8, command, "check-release-assets")) {
-        return runCheckReleaseAssets(context, rest);
-    }
-    if (std.mem.eql(u8, command, "check-downloads")) {
-        return runCheckDownloads(context, rest);
+    for (command_table) |command| {
+        if (std.mem.eql(u8, command.name, argv[0])) {
+            return command.handler(context, argv[1..]);
+        }
     }
     return error.Usage;
 }
@@ -872,8 +863,8 @@ test "a repeatable option keeps every value in order" {
 }
 
 test "every command the shell and workflow call is dispatched" {
-    // The commands this tool must answer to. A rename that misses a caller
-    // would otherwise only show up in a release run.
+    // The names the workflow, the acceptance harness, and the publisher
+    // spell. Both the table and the usage text must carry every one of them.
     const named = [_][]const u8{
         "candidate",
         "verify-candidate",
@@ -898,12 +889,29 @@ test "every command the shell and workflow call is dispatched" {
         "check-release-assets",
         "check-downloads",
     };
-    for (named) |command| {
-        // Every command is listed in the usage text, and none of them is
-        // reachable without its own options.
-        try std.testing.expect(std.mem.indexOf(u8, usage_text, command) != null);
+    try std.testing.expectEqual(named.len, command_table.len);
+    for (command_table, named) |command, name| {
+        try std.testing.expectEqualStrings(name, command.name);
+        try std.testing.expect(std.mem.indexOf(u8, usage_text, name) != null);
     }
-    try std.testing.expectEqual(@as(usize, 22), named.len);
+
+    // Each handler is reachable, and none of them does anything without the
+    // options it declares: a command invoked bare is a usage error, reported
+    // before any file is touched.
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var diagnostic: Diagnostic = .{};
+    const context: Context = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .out = &discard.writer,
+        .diagnostic = &diagnostic,
+    };
+    for (command_table) |command| {
+        try std.testing.expectError(error.Usage, run(context, &.{command.name}));
+        try std.testing.expectEqual(@as(usize, 0), diagnostic.message().len);
+    }
+    try std.testing.expectError(error.Usage, run(context, &.{}));
+    try std.testing.expectError(error.Usage, run(context, &.{"candidat"}));
 }
 
 test "the failure note follows the failure line" {
