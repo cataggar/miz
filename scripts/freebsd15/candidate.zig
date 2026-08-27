@@ -597,6 +597,14 @@ pub const ValidatedCandidate = struct {
 
 /// `validate_candidate`: everything a candidate manifest claims, re-derived
 /// from the artifacts beside it.
+///
+/// Every field a later stage reads is proven here, including the ones only the
+/// release notes render -- `source.bytes`, `packages.installed_bytes`,
+/// `validation.qemu_version`, and `validation.runner`. Staging copies assets
+/// and writes the publish manifest before it renders the notes, so a claim
+/// discovered to be missing or wrongly typed at rendering time would leave a
+/// half-staged release behind. Checking them here keeps every rejection ahead
+/// of the first byte of output.
 pub fn validateCandidate(
     context: *Context,
     manifest_path: []const u8,
@@ -718,6 +726,18 @@ pub fn validateCandidate(
     if (!document.eqlString(source.get("url"), expected.sourceUrl(&url_buffer))) {
         return context.fail("{s}: source url does not match profile", .{manifest_path});
     }
+    // The publish manifest built from this candidate must carry a positive
+    // integer here (`loadPublishManifest` refuses anything else), so a size
+    // recorded as a numeric string could never reach a published release. The
+    // Python accepted one and rendered it into the notes, then failed at
+    // comparison time -- after the assets had already been staged. Refusing it
+    // here keeps the failure ahead of any output.
+    _ = try document.requirePositiveInt(
+        context,
+        source.get("bytes"),
+        "{s}: source bytes",
+        .{manifest_path},
+    );
     if (!document.eqlString(root.get("source_commit"), source_commit)) {
         return context.fail("{s}: source commit mismatch", .{manifest_path});
     }
@@ -764,7 +784,33 @@ pub fn validateCandidate(
     if (document.integerOf(recorded.get("count")) != @as(i64, @intCast(names.len))) {
         return context.fail("{s}: package count does not match", .{manifest_path});
     }
+    // Same reasoning as `source.bytes`: the release asset derived from this
+    // record has to declare a positive integer, so a candidate that spells it
+    // any other way is refused before it can be staged.
+    _ = try document.requirePositiveInt(
+        context,
+        recorded.get("installed_bytes"),
+        "{s}: installed package bytes",
+        .{manifest_path},
+    );
     try verifyPackageManifest(context, expected.filesystem, expected.flavor, names);
+
+    // `qemu_version` and `runner` are what the release notes attribute the
+    // acceptance run to. The writer records them stripped and non-empty and the
+    // acceptance harness refuses a candidate without them, so a staged release
+    // whose provenance line said `None` was never reachable in practice -- but
+    // nothing proved it until here.
+    for ([_][]const u8{ "qemu_version", "runner" }) |field| {
+        const text = document.stringOf(validation.get(field)) orelse
+            return context.fail(
+                "{s}: validation {s} must be recorded",
+                .{ manifest_path, field },
+            );
+        if (document.trim(text).len == 0) return context.fail(
+            "{s}: validation {s} must be recorded",
+            .{ manifest_path, field },
+        );
+    }
 
     return .{
         .value = value,

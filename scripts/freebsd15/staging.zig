@@ -38,25 +38,44 @@ pub fn candidateReleaseAsset(
     context: *Context,
     candidate: Value,
 ) Error!Value {
-    const root = candidate.object;
-    const packages = document.objectOf(root.get("packages")).?;
+    const root = document.objectOf(candidate) orelse
+        return context.fail("candidate is not an object", .{});
+    const packages = try recordedObject(context, root, "packages");
     var asset: std.json.ObjectMap = .empty;
-    try asset.put(context.arena, "variant", root.get("variant").?);
-    try asset.put(context.arena, "architecture", root.get("architecture").?);
-    try asset.put(context.arena, "filesystem", root.get("filesystem").?);
-    try asset.put(context.arena, "flavor", root.get("flavor").?);
-    try asset.put(context.arena, "asset_name", root.get("asset_name").?);
+    for ([_][]const u8{
+        "variant",
+        "architecture",
+        "filesystem",
+        "flavor",
+        "asset_name",
+    }) |field| {
+        try asset.put(context.arena, field, root.get(field) orelse
+            return context.fail("recorded {s} is missing", .{field}));
+    }
     // `bytes` remains the publisher-facing download size field. Schema 3 also
     // names it explicitly so comparisons cannot confuse it with the qemu-img
     // allocated size.
-    try asset.put(context.arena, "bytes", root.get("compressed_size").?);
-    try asset.put(context.arena, "compressed_size", root.get("compressed_size").?);
-    try asset.put(context.arena, "allocated_size", root.get("allocated_size").?);
-    try asset.put(context.arena, "virtual_size", root.get("virtual_size").?);
-    try asset.put(context.arena, "sha256", root.get("asset_sha256").?);
-    try asset.put(context.arena, "packages", packages.get("count").?);
-    try asset.put(context.arena, "package_manifest", root.get("packages").?);
-    try asset.put(context.arena, "source", root.get("source").?);
+    const compressed_size: Value = .{
+        .integer = try recordedInteger(context, root, "compressed_size"),
+    };
+    try asset.put(context.arena, "bytes", compressed_size);
+    try asset.put(context.arena, "compressed_size", compressed_size);
+    try asset.put(context.arena, "allocated_size", .{
+        .integer = try recordedInteger(context, root, "allocated_size"),
+    });
+    try asset.put(context.arena, "virtual_size", .{
+        .integer = try recordedInteger(context, root, "virtual_size"),
+    });
+    try asset.put(context.arena, "sha256", .{
+        .string = try recordedString(context, root, "asset_sha256"),
+    });
+    try asset.put(context.arena, "packages", .{
+        .integer = try recordedInteger(context, packages, "count"),
+    });
+    try asset.put(context.arena, "package_manifest", .{ .object = packages });
+    try asset.put(context.arena, "source", .{
+        .object = try recordedObject(context, root, "source"),
+    });
     return .{ .object = asset };
 }
 
@@ -85,6 +104,54 @@ fn assetString(
 ) Error![]const u8 {
     return document.stringOf(asset.get(field)) orelse context.fail(
         "release asset {s} is missing or invalid",
+        .{field},
+    );
+}
+
+/// Sub-document of a validated candidate or Azure result. Validation proves
+/// every field the notes render, but the renderer reaches for them by name, so
+/// it asks rather than asserts: a rendering bug must be a diagnosed exit 1, not
+/// a panic that leaves a half-staged release behind.
+fn recordedObject(
+    context: *Context,
+    owner: std.json.ObjectMap,
+    field: []const u8,
+) Error!std.json.ObjectMap {
+    return document.objectOf(owner.get(field)) orelse context.fail(
+        "recorded {s} is missing or not an object",
+        .{field},
+    );
+}
+
+fn recordedInteger(
+    context: *Context,
+    owner: std.json.ObjectMap,
+    field: []const u8,
+) Error!i64 {
+    return document.integerOf(owner.get(field)) orelse context.fail(
+        "recorded {s} is missing or not an integer",
+        .{field},
+    );
+}
+
+fn recordedString(
+    context: *Context,
+    owner: std.json.ObjectMap,
+    field: []const u8,
+) Error![]const u8 {
+    return document.stringOf(owner.get(field)) orelse context.fail(
+        "recorded {s} is missing or not a string",
+        .{field},
+    );
+}
+
+fn recordedArray(
+    context: *Context,
+    owner: std.json.ObjectMap,
+    field: []const u8,
+) Error!std.json.Array {
+    return document.arrayOf(owner.get(field)) orelse context.fail(
+        "recorded {s} is missing or not a list",
         .{field},
     );
 }
@@ -566,7 +633,7 @@ pub fn stageCommand(context: *Context, arguments: StageArguments) Error!void {
         );
         try azure_keys.append(
             context.arena,
-            document.stringOf(azure.object.get("variant")).?,
+            try recordedString(context, azure.object, "variant"),
         );
         try azure_documents.append(context.arena, azure);
     }
@@ -784,7 +851,7 @@ fn validateAzureResult(
         document.stringOf(workflow.get("run_attempt")) orelse "",
         "run_attempt",
     );
-    const validation = document.objectOf(candidate.get("validation")).?;
+    const validation = try recordedObject(context, candidate.object(), "validation");
     if (!document.eqlString(validation.get("run_id"), run_id) or
         !document.eqlString(validation.get("run_attempt"), run_attempt))
     {
@@ -933,24 +1000,27 @@ pub fn releaseNotes(context: *Context, arguments: NotesArguments) Error![]const 
     line(writer, "| Asset | Manifest revision | Packages | Installed bytes |", .{});
     line(writer, "| --- | ---: | ---: | ---: |", .{});
     for (arguments.candidates) |validated| {
-        const packages = document.objectOf(validated.get("packages")).?;
+        const packages = try recordedObject(context, validated.object(), "packages");
         line(writer, "| `{s}` | {d} | {d} | {d} |", .{
             validated.variant.asset_name,
-            document.integerOf(packages.get("manifest_revision")).?,
-            document.integerOf(packages.get("count")).?,
-            document.integerOf(packages.get("installed_bytes")).?,
+            try recordedInteger(context, packages, "manifest_revision"),
+            try recordedInteger(context, packages, "count"),
+            try recordedInteger(context, packages, "installed_bytes"),
         });
     }
     for (arguments.candidates) |validated| {
-        const packages = document.objectOf(validated.get("packages")).?;
+        const packages = try recordedObject(context, validated.object(), "packages");
         line(writer, "", .{});
         line(writer, "<details><summary>{s} package manifest</summary>", .{
             validated.variant.asset_name,
         });
         line(writer, "", .{});
         line(writer, "```", .{});
-        for (document.arrayOf(packages.get("names")).?.items) |name| {
-            line(writer, "{s}", .{document.stringOf(name).?});
+        for ((try recordedArray(context, packages, "names")).items) |name| {
+            line(writer, "{s}", .{document.stringOf(name) orelse return context.fail(
+                "recorded package name is not a string",
+                .{},
+            )});
         }
         line(writer, "```", .{});
         line(writer, "", .{});
@@ -962,22 +1032,24 @@ pub fn releaseNotes(context: *Context, arguments: NotesArguments) Error![]const 
     line(writer, "", .{});
     line(writer, "- Source commit: `{s}`", .{arguments.source_commit});
     for (arguments.candidates) |validated| {
-        const source = document.objectOf(validated.get("source")).?;
-        const validation = document.objectOf(validated.get("validation")).?;
+        const source = try recordedObject(context, validated.object(), "source");
+        const validation = try recordedObject(context, validated.object(), "validation");
         line(writer, "- {s} source: `{s}`", .{
             validated.variant.key,
-            document.stringOf(source.get("name")).?,
+            try recordedString(context, source, "name"),
         });
-        line(writer, "  - URL: {s}", .{document.stringOf(source.get("url")).?});
+        line(writer, "  - URL: {s}", .{try recordedString(context, source, "url")});
         line(writer, "  - File size: {d} bytes", .{
-            document.integerOf(source.get("bytes")).?,
+            try recordedInteger(context, source, "bytes"),
         });
-        line(writer, "  - SHA-256: `{s}`", .{document.stringOf(source.get("sha256")).?});
+        line(writer, "  - SHA-256: `{s}`", .{
+            try recordedString(context, source, "sha256"),
+        });
         line(writer, "  - QEMU acceptance: `{s}` on `{s}`; passed dual-instance " ++
             "UEFI provisioning, SSH, reboot, identity separation, disk growth, " ++
             "and clean shutdown.", .{
-            document.stringOf(validation.get("qemu_version")).?,
-            document.stringOf(validation.get("runner")).?,
+            try recordedString(context, validation, "qemu_version"),
+            try recordedString(context, validation, "runner"),
         });
     }
     if (arguments.core_rows != null) {
@@ -993,25 +1065,32 @@ pub fn releaseNotes(context: *Context, arguments: NotesArguments) Error![]const 
         line(writer, "- Exact-candidate matching-architecture Gen2 validation is " ++
             "complete for every published release asset.", .{});
         for (arguments.candidates) |validated| {
-            const azure = findAzureResult(results, validated.variant.key).?.object;
+            const found = findAzureResult(results, validated.variant.key) orelse
+                return context.fail(
+                    "no Azure result for {s}",
+                    .{validated.variant.key},
+                );
+            const azure = found.object;
             line(writer, "- {s}: `{s}` / `{s}`", .{
                 validated.variant.key,
-                document.stringOf(azure.get("location")).?,
-                document.stringOf(azure.get("vm_size")).?,
+                try recordedString(context, azure, "location"),
+                try recordedString(context, azure, "vm_size"),
             });
             line(writer, "  - Derived VHD SHA-256: `{s}`", .{
-                document.stringOf(azure.get("derived_vhd_sha256")).?,
+                try recordedString(context, azure, "derived_vhd_sha256"),
             });
             line(writer, "  - Derived VHD size: {d} bytes", .{
-                document.integerOf(azure.get("derived_vhd_bytes")).?,
+                try recordedInteger(context, azure, "derived_vhd_bytes"),
             });
             line(writer, "  - Derived VHD current size: {d} bytes", .{
-                document.integerOf(azure.get("derived_vhd_current_size")).?,
+                try recordedInteger(context, azure, "derived_vhd_current_size"),
             });
             writer.writeAll("  - Passed contracts: ") catch return error.OutOfMemory;
-            for (document.arrayOf(azure.get("contracts")).?.items, 0..) |name, index| {
+            const contracts = try recordedArray(context, azure, "contracts");
+            for (contracts.items, 0..) |name, index| {
                 if (index > 0) writer.writeAll(", ") catch return error.OutOfMemory;
-                writer.print("`{s}`", .{document.stringOf(name).?}) catch
+                writer.print("`{s}`", .{document.stringOf(name) orelse
+                    return context.fail("recorded contract is not a string", .{})}) catch
                     return error.OutOfMemory;
             }
             writer.writeByte('\n') catch return error.OutOfMemory;

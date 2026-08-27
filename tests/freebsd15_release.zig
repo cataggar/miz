@@ -2020,7 +2020,7 @@ test "remote, downloaded, and published releases must match the expectation" {
         release_path,
         expected_path,
     ));
-    try expectFailure(&context, "published release did not retain the exact final allowlist");
+    try expectFailure(&context, "published release did not leave the draft state");
 
     _ = try tree.write("remote/stray.qcow2", "stray\n");
     try std.testing.expectError(error.Invalid, publication.verifyDownloadedRelease(
@@ -2308,4 +2308,249 @@ test "no FreeBSD release file still executes Python" {
     }
     try std.testing.expectEqual(@as(usize, 1), mentions);
     try support.expectContains(harness, "pgrep -f 'python.*waagent'");
+}
+
+// ---- Provenance the notes render is proven before anything is staged ------
+
+/// Whether anything exists at `relative` inside the tree, file or directory.
+fn treeEntryExists(tree: *Tree, relative: []const u8) !bool {
+    const full = try tree.path(&.{relative});
+    _ = std.Io.Dir.cwd().statFile(std.testing.io, full, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+test "staging refuses provenance the notes would render, before any output" {
+    const gpa = std.testing.allocator;
+    // Each case is a claim `validate_candidate` never checked and the release
+    // notes then rendered. Missing and wrongly typed are both refused, and a
+    // numeric string is refused rather than rendered: the publish manifest
+    // derived from the candidate has to carry a positive integer, so a string
+    // could only ever have failed later, after the assets were staged.
+    const cases = [_]struct {
+        field: []const u8,
+        value: ?[]const u8,
+        message: []const u8,
+    }{
+        .{
+            .field = "packages.installed_bytes",
+            .value = null,
+            .message = "installed package bytes must be a positive integer",
+        },
+        .{
+            .field = "packages.installed_bytes",
+            .value = "\"1024\"",
+            .message = "installed package bytes must be a positive integer",
+        },
+        .{
+            .field = "packages.installed_bytes",
+            .value = "0",
+            .message = "installed package bytes must be a positive integer",
+        },
+        .{
+            .field = "packages.installed_bytes",
+            .value = "true",
+            .message = "installed package bytes must be a positive integer",
+        },
+        .{
+            .field = "source.bytes",
+            .value = null,
+            .message = "source bytes must be a positive integer",
+        },
+        .{
+            .field = "source.bytes",
+            .value = "\"123456789\"",
+            .message = "source bytes must be a positive integer",
+        },
+        .{
+            .field = "source.bytes",
+            .value = "null",
+            .message = "source bytes must be a positive integer",
+        },
+        .{
+            .field = "validation.qemu_version",
+            .value = null,
+            .message = "validation qemu_version must be recorded",
+        },
+        .{
+            .field = "validation.qemu_version",
+            .value = "5",
+            .message = "validation qemu_version must be recorded",
+        },
+        .{
+            .field = "validation.qemu_version",
+            .value = "\"   \"",
+            .message = "validation qemu_version must be recorded",
+        },
+        .{
+            .field = "validation.runner",
+            .value = null,
+            .message = "validation runner must be recorded",
+        },
+        .{
+            .field = "validation.runner",
+            .value = "null",
+            .message = "validation runner must be recorded",
+        },
+    };
+    for (cases) |case| {
+        var tree = try Tree.create(gpa);
+        defer tree.deinit();
+        var context = tree.context(gpa);
+        try makeZfsCandidates(&tree, gpa, .{});
+        const manifest = try tree.path(&.{
+            "candidates", "x86_64-zfs-core", "candidate.json",
+        });
+        try support.mutateDocument(&tree, manifest, case.field, case.value);
+
+        try std.testing.expectError(error.Invalid, stage(&tree, &context, "zfs", .{}));
+        try expectFailure(&context, case.message);
+        // The rejection is ahead of every byte of output: no staged asset, no
+        // publish manifest, and no release notes were left behind.
+        try std.testing.expect(!try treeEntryExists(&tree, "output"));
+        try std.testing.expect(!try treeEntryExists(&tree, "notes.md"));
+    }
+}
+
+test "the release notes diagnose a malformed record instead of aborting" {
+    const gpa = std.testing.allocator;
+    var tree = try Tree.create(gpa);
+    defer tree.deinit();
+    var context = tree.context(gpa);
+    try makeZfsCandidates(&tree, gpa, .{});
+
+    // Build the validated candidate set the notes renderer consumes, then
+    // corrupt one rendered field behind validation's back. The renderer must
+    // report it, not reach for a value that is not there.
+    var candidates: std.ArrayList(candidate_support.ValidatedCandidate) = .empty;
+    for (zfs_variants) |key| {
+        const manifest = try tree.path(&.{ "candidates", key, "candidate.json" });
+        try candidates.append(tree.allocator(), try candidate_support.validateCandidate(
+            &context,
+            manifest,
+            support.source_commit,
+        ));
+    }
+    const selected = profiles.findReleaseSet("zfs").?;
+    const notes = try staging.releaseNotes(&context, .{
+        .selected = selected,
+        .candidates = candidates.items,
+        .source_commit = support.source_commit,
+        .azure_results = null,
+        .minimum_core_reduction_percent = 10,
+        .core_rows = null,
+    });
+    try support.expectContains(notes, "QEMU acceptance: `QEMU emulator version 10.0.2`");
+
+    const validation = candidates.items[0].value.object.getPtr("validation").?;
+    try validation.object.put(tree.allocator(), "runner", .{ .integer = 7 });
+    try std.testing.expectError(error.Invalid, staging.releaseNotes(&context, .{
+        .selected = selected,
+        .candidates = candidates.items,
+        .source_commit = support.source_commit,
+        .azure_results = null,
+        .minimum_core_reduction_percent = 10,
+        .core_rows = null,
+    }));
+    try expectFailure(&context, "recorded runner is missing or not a string");
+}
+
+test "a published release must report leaving the draft state" {
+    const gpa = std.testing.allocator;
+    var tree = try Tree.create(gpa);
+    defer tree.deinit();
+    var context = tree.context(gpa);
+
+    const body = "release asset\n";
+    _ = try tree.write("remote/asset.qcow2", body);
+    const digest = try candidate_support.hashFile(
+        &context,
+        try tree.path(&.{ "remote", "asset.qcow2" }),
+    );
+    const expected_path = try tree.write("expected.tsv", try std.fmt.allocPrint(
+        tree.allocator(),
+        "asset.qcow2\t{s}\t{d}\n",
+        .{ &digest, body.len },
+    ));
+
+    // Only a present boolean `false` is a published release. Everything else,
+    // including the falsy spellings a dynamic language would have accepted, is
+    // refused -- the same shape the pre-publication gate requires of `true`.
+    const refused = [_]?[]const u8{
+        null,
+        "true",
+        "null",
+        "\"false\"",
+        "0",
+        "[]",
+    };
+    for (refused) |draft| {
+        const release_path = try tree.write("release.json", try std.fmt.allocPrint(
+            tree.allocator(),
+            \\{{{s}"assets": [
+            \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "size": {d}}}]}}
+        ,
+            .{
+                if (draft) |value| try std.fmt.allocPrint(
+                    tree.allocator(),
+                    "\"draft\": {s}, ",
+                    .{value},
+                ) else "",
+                &digest,
+                body.len,
+            },
+        ));
+        try std.testing.expectError(error.Invalid, publication.verifyPublishedRelease(
+            &context,
+            release_path,
+            expected_path,
+        ));
+        try expectFailure(&context, "published release did not leave the draft state");
+
+        // The sibling gate is the mirror image: it requires a present boolean
+        // `true`, so every one of these spellings fails there too, except the
+        // one that really is a draft.
+        const remote = publication.verifyRemoteRelease(
+            &context,
+            release_path,
+            expected_path,
+        );
+        if (draft != null and std.mem.eql(u8, draft.?, "true")) {
+            try remote;
+        } else {
+            try std.testing.expectError(error.Invalid, remote);
+            try expectFailure(&context, "release stopped being a draft");
+        }
+    }
+
+    const published = try tree.write("release.json", try std.fmt.allocPrint(
+        tree.allocator(),
+        \\{{"draft": false, "assets": [
+        \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "size": {d}}}]}}
+    ,
+        .{ &digest, body.len },
+    ));
+    try publication.verifyPublishedRelease(&context, published, expected_path);
+
+    // A non-draft release that lost or gained an asset is still refused, and
+    // says so precisely.
+    const wrong = try tree.write("release-wrong.json", try std.fmt.allocPrint(
+        tree.allocator(),
+        \\{{"draft": false, "assets": [
+        \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "size": {d}}},
+        \\  {{"name": "stray.qcow2", "digest": "sha256:{s}", "size": {d}}}]}}
+    ,
+        .{ &digest, body.len, &digest, body.len },
+    ));
+    try std.testing.expectError(error.Invalid, publication.verifyPublishedRelease(
+        &context,
+        wrong,
+        expected_path,
+    ));
+    try expectFailure(
+        &context,
+        "published release did not retain the exact final allowlist",
+    );
 }

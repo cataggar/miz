@@ -491,7 +491,9 @@ pub fn readExpected(
 
 /// `freebsd15_publish.sh`'s post-upload heredoc: the remote release carries
 /// exactly the expected assets, with the expected digests and sizes, and is
-/// still a draft.
+/// still a draft. `draft` has to be present and boolean; its absence proves
+/// nothing, and this gate is what stands between a partially uploaded release
+/// and a published one.
 pub fn verifyRemoteRelease(
     context: *Context,
     release_path: []const u8,
@@ -579,6 +581,11 @@ pub fn verifyDownloadedRelease(
 
 /// `freebsd15_publish.sh`'s final heredoc: the published release is no longer a
 /// draft and still carries exactly the final allowlist.
+///
+/// `draft` has to be present and boolean, exactly as the pre-publication gate
+/// requires it: a release whose metadata omits the field, or reports it as
+/// something other than a boolean, has not been shown to have left the draft
+/// state, and "not shown" is not "published".
 pub fn verifyPublishedRelease(
     context: *Context,
     release_path: []const u8,
@@ -586,6 +593,10 @@ pub fn verifyPublishedRelease(
 ) Error!void {
     const expected = try readExpected(context, expected_path);
     const release = try candidate_support.readObject(context, release_path);
+    const draft = release.object.get("draft");
+    if (draft == null or draft.? != .bool or draft.?.bool) {
+        return context.fail("published release did not leave the draft state", .{});
+    }
     const assets = document.arrayOf(release.object.get("assets")) orelse
         return context.fail(
             "published release did not retain the exact final allowlist",
@@ -604,9 +615,7 @@ pub fn verifyPublishedRelease(
     }
     var wanted: std.ArrayList([]const u8) = .empty;
     for (expected) |asset| try wanted.append(context.arena, asset.name);
-    const draft = release.object.get("draft");
-    const is_draft = draft != null and draft.? == .bool and draft.?.bool;
-    if (is_draft or !staging.sameKeySet(actual.items, wanted.items)) return context.fail(
+    if (!staging.sameKeySet(actual.items, wanted.items)) return context.fail(
         "published release did not retain the exact final allowlist",
         .{},
     );
