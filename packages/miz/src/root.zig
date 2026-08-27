@@ -62,6 +62,7 @@ pub const build_iso = @import("build_iso.zig");
 pub const recustomize_iso = @import("recustomize_iso.zig");
 pub const customize = @import("customize.zig");
 pub const cpio = @import("cpio.zig");
+pub const tar = @import("tar.zig");
 /// Deterministic Zstandard framing backed by linked libzstd.
 pub const zstd = @import("zstd.zig");
 pub const kernel_modules = @import("kernel_modules.zig");

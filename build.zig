@@ -682,6 +682,54 @@ pub fn build(b: *std.Build) void {
     const boot_smoke_step = b.step("test-boot-smoke", "Run opportunistic real-QEMU boot-smoke tests");
     boot_smoke_step.dependOn(&run_boot_smoke_tests.step);
 
+    // ---- scripts/ci/make_oci_fixture.zig: the from-scratch OCI image
+    // layouts the boot-smoke workflow feeds back in as `--container` /
+    // `MIZ_BOOT_TEST_*_OCI`, replacing `scripts/ci/oci_layout.py` and the
+    // three `make-*-oci-fixture.py` scripts. Host-targeted: the fixtures are
+    // produced by the CI runner, for the boot the same runner drives. ----
+    const oci_fixture_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/ci/oci_fixture.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "miz", .module = host_miz_mod },
+        },
+    });
+    const make_oci_fixture_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/ci/make_oci_fixture.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "miz", .module = host_miz_mod },
+        },
+    });
+    const make_oci_fixture_exe = b.addExecutable(.{
+        .name = "make-oci-fixture",
+        .root_module = make_oci_fixture_mod,
+    });
+    b.installArtifact(make_oci_fixture_exe);
+    const run_make_oci_fixture = b.addRunArtifact(make_oci_fixture_exe);
+    if (b.args) |args| run_make_oci_fixture.addArgs(args);
+    const make_oci_fixture_step = b.step(
+        "oci-fixture",
+        "Build a from-scratch OCI image-layout fixture (minimal|uki-stub|verity-initramfs)",
+    );
+    make_oci_fixture_step.dependOn(&run_make_oci_fixture.step);
+
+    // Two test roots: Zig only auto-discovers `test` blocks in a module's own
+    // root file, and the layout builder is imported by the CLI rather than
+    // being its root.
+    const oci_fixture_tests = b.addTest(.{ .root_module = oci_fixture_mod });
+    const run_oci_fixture_tests = b.addRunArtifact(oci_fixture_tests);
+    const make_oci_fixture_tests = b.addTest(.{ .root_module = make_oci_fixture_mod });
+    const run_make_oci_fixture_tests = b.addRunArtifact(make_oci_fixture_tests);
+    const oci_fixture_test_step = b.step(
+        "test-oci-fixture",
+        "Run CI OCI fixture generator tests",
+    );
+    oci_fixture_test_step.dependOn(&run_oci_fixture_tests.step);
+    oci_fixture_test_step.dependOn(&run_make_oci_fixture_tests.step);
+
     const device_write_integration_exe = b.addExecutable(.{
         .name = "miz-device-write-integration",
         .root_module = b.createModule(.{
@@ -1602,6 +1650,8 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(&run_qmp_codegen_tests.step);
         aggregate_test_step.dependOn(&run_qmp_schema_tests.step);
         aggregate_test_step.dependOn(&run_boot_smoke_tests.step);
+        aggregate_test_step.dependOn(&run_oci_fixture_tests.step);
+        aggregate_test_step.dependOn(&run_make_oci_fixture_tests.step);
         aggregate_test_step.dependOn(&run_freebsd_boot_tests.step);
         aggregate_test_step.dependOn(&run_release_support_tests.step);
         aggregate_test_step.dependOn(&run_azure_vhd_tests.step);
