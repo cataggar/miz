@@ -190,7 +190,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           packages=(
-            curl dnf file jq openssh-client python3-virt-firmware qemu-utils rpm tar
+            curl dnf file jq openssh-client qemu-utils rpm tar
           )
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
           echo '%_dbpath /usr/lib/sysimage/rpm' | sudo tee /root/.rpmmacros >/dev/null

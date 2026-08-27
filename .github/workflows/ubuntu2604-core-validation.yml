@@ -486,8 +486,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           packages=(
-            ca-certificates curl openssh-client openssl
-            python3-virt-firmware qemu-utils
+            ca-certificates curl openssh-client openssl qemu-utils
             sbsigntool swtpm swtpm-tools
           )
           case "$ARCHITECTURE" in
@@ -518,7 +517,7 @@ jobs:
             echo "MIZ_UBUNTU2604_UEFI_CODE=$uefi_code"
             echo "MIZ_UBUNTU2604_UEFI_VARS=$uefi_vars"
           } >> "$GITHUB_ENV"
-          for tool in qemu-img sbverify ssh ssh-keygen swtpm virt-fw-vars; do
+          for tool in qemu-img sbverify ssh ssh-keygen swtpm; do
             command -v "$tool" >/dev/null
           done
           command -v "$qemu" >/dev/null

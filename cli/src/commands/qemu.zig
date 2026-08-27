@@ -321,7 +321,7 @@ const GhrMetadata = struct {
 };
 
 const SecureBootCertificate = struct {
-    pem: []u8,
+    der: []u8,
     sha256: miz.artifact_pipeline.Digest,
     launch_image_path: []u8,
 
@@ -333,7 +333,7 @@ const SecureBootCertificate = struct {
         if (std.fs.path.dirname(self.launch_image_path)) |directory|
             std.Io.Dir.cwd().deleteTree(io, directory) catch {};
         allocator.free(self.launch_image_path);
-        allocator.free(self.pem);
+        allocator.free(self.der);
         self.* = undefined;
     }
 };
@@ -343,17 +343,7 @@ const SecureBootMetadata = struct {
     certificate_sha256: []const u8,
 };
 
-const SecureBootTrustState = struct {
-    pk_sha256: miz.artifact_pipeline.Digest,
-    kek_sha256: miz.artifact_pipeline.Digest,
-    db_sha256: miz.artifact_pipeline.Digest,
-
-    fn eql(self: SecureBootTrustState, other: SecureBootTrustState) bool {
-        return std.mem.eql(u8, &self.pk_sha256, &other.pk_sha256) and
-            std.mem.eql(u8, &self.kek_sha256, &other.kek_sha256) and
-            std.mem.eql(u8, &self.db_sha256, &other.db_sha256);
-    }
-};
+const SecureBootTrustState = miz.efi_varstore.TrustState;
 
 const PreparedVmState = struct {
     vars_path: []u8,
@@ -1440,11 +1430,8 @@ fn prepareSecureBootCertificateAlloc(
             return error.ExplicitCertificateDoesNotMatchImage;
     }
 
-    const pem = try miz.authenticode.encodePemCertificateAlloc(
-        allocator,
-        extracted.certificate_der,
-    );
-    errdefer allocator.free(pem);
+    const der = try allocator.dupe(u8, extracted.certificate_der);
+    errdefer allocator.free(der);
     const launch_image_path = try createValidatedImageLinkAlloc(
         allocator,
         io,
@@ -1453,7 +1440,7 @@ fn prepareSecureBootCertificateAlloc(
         final_image_sha256,
     );
     return .{
-        .pem = pem,
+        .der = der,
         .sha256 = extracted.certificate_sha256,
         .launch_image_path = launch_image_path,
     };
@@ -1629,304 +1616,63 @@ fn writeSecureBootMetadata(
     try atomic_output.writeAtomic(io, allocator, metadata_path, bytes);
 }
 
-fn resolveVirtFwVarsAlloc(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    environ: std.process.Environ,
-) ![]u8 {
-    return try qemu_host.findExecutableInPathAlloc(
-        allocator,
-        io,
-        environ,
-        qemu_host.executableName("virt-fw-vars"),
-    ) orelse error.VirtFwVarsNotFound;
-}
-
-fn runVirtFwVars(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    argv: []const []const u8,
-) !void {
-    const result = try std.process.run(allocator, io, .{
-        .argv = argv,
-        .stdout_limit = .limited(1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
-        .timeout = .{ .duration = .{
-            .raw = .fromSeconds(90),
-            .clock = .awake,
-        } },
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code == 0) return,
-        else => {},
-    }
-    if (result.stderr.len != 0)
-        std.debug.print("qemu: virt-fw-vars failed: {s}\n", .{result.stderr});
-    return error.VirtFwVarsFailed;
-}
-
-fn efiSignatureDatabaseCertificateCount(
-    database: []const u8,
-    certificate_sha256: miz.artifact_pipeline.Digest,
-) !usize {
-    const efi_cert_x509_guid = [_]u8{
-        0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
-        0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
-    };
-    var matches: usize = 0;
-    var list_offset: usize = 0;
-    while (list_offset < database.len) {
-        if (database.len - list_offset < 28)
-            return error.InvalidEnrolledSecureBootVars;
-        const list_size = std.mem.readInt(
-            u32,
-            database[list_offset + 16 ..][0..4],
-            .little,
-        );
-        const header_size = std.mem.readInt(
-            u32,
-            database[list_offset + 20 ..][0..4],
-            .little,
-        );
-        const signature_size = std.mem.readInt(
-            u32,
-            database[list_offset + 24 ..][0..4],
-            .little,
-        );
-        if (list_size < 28 or signature_size <= 16)
-            return error.InvalidEnrolledSecureBootVars;
-        const list_end = std.math.add(usize, list_offset, list_size) catch
-            return error.InvalidEnrolledSecureBootVars;
-        const signatures_start = std.math.add(
-            usize,
-            list_offset + 28,
-            header_size,
-        ) catch return error.InvalidEnrolledSecureBootVars;
-        if (list_end > database.len or signatures_start > list_end)
-            return error.InvalidEnrolledSecureBootVars;
-        const signatures_bytes = list_end - signatures_start;
-        if (signatures_bytes == 0 or signatures_bytes % signature_size != 0)
-            return error.InvalidEnrolledSecureBootVars;
-        if (std.mem.eql(
-            u8,
-            database[list_offset..][0..efi_cert_x509_guid.len],
-            &efi_cert_x509_guid,
-        )) {
-            var signature_offset = signatures_start;
-            while (signature_offset < list_end) : (signature_offset += signature_size) {
-                const certificate = database[signature_offset + 16 .. signature_offset + signature_size];
-                const digest = miz.artifact_pipeline.sha256Bytes(certificate);
-                if (std.mem.eql(u8, &digest, &certificate_sha256))
-                    matches += 1;
-            }
-        }
-        list_offset = list_end;
-    }
-    return matches;
-}
-
-fn validateEnrolledVarsJson(
-    allocator: std.mem.Allocator,
-    json: []const u8,
-    certificate_sha256: miz.artifact_pipeline.Digest,
-) !SecureBootTrustState {
-    const global_variable_guid = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
-    const image_security_database_guid = "d719b2cb-3d3a-4596-a3bc-dad00e67656f";
-    const secure_boot_enable_guid = "f0a30bc7-af08-4556-99c4-001009c93a44";
-    const custom_mode_guid = "c076ec0c-7028-4399-a072-71ee5c448b9f";
-    const boot_service_attributes: i64 = 3;
-    const authenticated_variable_attributes: i64 = 39;
-
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch
-        return error.InvalidEnrolledSecureBootVars;
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidEnrolledSecureBootVars,
-    };
-    const version = root.get("version") orelse
-        return error.InvalidEnrolledSecureBootVars;
-    if (version != .integer or version.integer != 2)
-        return error.InvalidEnrolledSecureBootVars;
-    const variables_value = root.get("variables") orelse
-        return error.InvalidEnrolledSecureBootVars;
-    const variables = switch (variables_value) {
-        .array => |array| array,
-        else => return error.InvalidEnrolledSecureBootVars,
-    };
-
-    var secure_boot_enable = false;
-    var secure_boot_enable_seen = false;
-    var custom_mode_disabled = false;
-    var custom_mode_seen = false;
-    var pk_sha256: ?miz.artifact_pipeline.Digest = null;
-    var kek_sha256: ?miz.artifact_pipeline.Digest = null;
-    var db_sha256: ?miz.artifact_pipeline.Digest = null;
-    var certificate_matches: usize = 0;
-    for (variables.items) |variable_value| {
-        const variable = switch (variable_value) {
-            .object => |object| object,
-            else => return error.InvalidEnrolledSecureBootVars,
-        };
-        const name_value = variable.get("name") orelse
-            return error.InvalidEnrolledSecureBootVars;
-        const guid_value = variable.get("guid") orelse
-            return error.InvalidEnrolledSecureBootVars;
-        const attr_value = variable.get("attr") orelse
-            return error.InvalidEnrolledSecureBootVars;
-        const data_value = variable.get("data") orelse
-            return error.InvalidEnrolledSecureBootVars;
-        if (name_value != .string or
-            guid_value != .string or
-            attr_value != .integer or
-            data_value != .string)
-        {
-            return error.InvalidEnrolledSecureBootVars;
-        }
-        const name = name_value.string;
-        const guid = guid_value.string;
-        const attributes = attr_value.integer;
-        const data_hex = data_value.string;
-        if (std.mem.eql(u8, name, "SecureBootEnable")) {
-            if (secure_boot_enable_seen or
-                !std.mem.eql(u8, guid, secure_boot_enable_guid) or
-                attributes != boot_service_attributes)
-            {
-                return error.InvalidEnrolledSecureBootVars;
-            }
-            secure_boot_enable_seen = true;
-            secure_boot_enable = std.mem.eql(u8, data_hex, "01");
-        } else if (std.mem.eql(u8, name, "CustomMode")) {
-            if (custom_mode_seen or
-                !std.mem.eql(u8, guid, custom_mode_guid) or
-                attributes != boot_service_attributes)
-            {
-                return error.InvalidEnrolledSecureBootVars;
-            }
-            custom_mode_seen = true;
-            custom_mode_disabled = std.mem.eql(u8, data_hex, "00");
-        } else if (std.mem.eql(u8, name, "PK")) {
-            if (pk_sha256 != null or
-                !std.mem.eql(u8, guid, global_variable_guid) or
-                attributes != authenticated_variable_attributes)
-            {
-                return error.InvalidEnrolledSecureBootVars;
-            }
-            pk_sha256 = try sha256HexDataAlloc(allocator, data_hex);
-        } else if (std.mem.eql(u8, name, "KEK")) {
-            if (kek_sha256 != null or
-                !std.mem.eql(u8, guid, global_variable_guid) or
-                attributes != authenticated_variable_attributes)
-            {
-                return error.InvalidEnrolledSecureBootVars;
-            }
-            kek_sha256 = try sha256HexDataAlloc(allocator, data_hex);
-        } else if (std.mem.eql(u8, name, "db")) {
-            if (db_sha256 != null or
-                !std.mem.eql(u8, guid, image_security_database_guid) or
-                attributes != authenticated_variable_attributes)
-            {
-                return error.InvalidEnrolledSecureBootVars;
-            }
-            if (data_hex.len % 2 != 0)
-                return error.InvalidEnrolledSecureBootVars;
-            const database = try allocator.alloc(u8, data_hex.len / 2);
-            defer allocator.free(database);
-            _ = std.fmt.hexToBytes(database, data_hex) catch
-                return error.InvalidEnrolledSecureBootVars;
-            certificate_matches = try efiSignatureDatabaseCertificateCount(
-                database,
-                certificate_sha256,
-            );
-            db_sha256 = miz.artifact_pipeline.sha256Bytes(database);
-        }
-    }
-    if (!secure_boot_enable or
-        !custom_mode_disabled or
-        pk_sha256 == null or
-        kek_sha256 == null or
-        db_sha256 == null or
-        certificate_matches != 1)
-    {
-        return error.InvalidEnrolledSecureBootVars;
-    }
-    return .{
-        .pk_sha256 = pk_sha256.?,
-        .kek_sha256 = kek_sha256.?,
-        .db_sha256 = db_sha256.?,
-    };
-}
-
-fn sha256HexDataAlloc(
-    allocator: std.mem.Allocator,
-    data_hex: []const u8,
-) !miz.artifact_pipeline.Digest {
-    if (data_hex.len == 0 or data_hex.len % 2 != 0)
-        return error.InvalidEnrolledSecureBootVars;
-    const data = try allocator.alloc(u8, data_hex.len / 2);
-    defer allocator.free(data);
-    _ = std.fmt.hexToBytes(data, data_hex) catch
-        return error.InvalidEnrolledSecureBootVars;
-    return miz.artifact_pipeline.sha256Bytes(data);
-}
-
+/// Appends the release leaf to the Microsoft-enrolled template's `db`,
+/// enables Secure Boot, and writes `output_path`. The returned trust state is
+/// read back from what actually landed on disk, never from what was intended.
 fn enrollSecureBootVars(
     allocator: std.mem.Allocator,
     io: std.Io,
-    virt_fw_vars_path: []const u8,
     template_path: []const u8,
-    certificate_path: []const u8,
-    certificate_sha256: miz.artifact_pipeline.Digest,
+    certificate: SecureBootCertificate,
     output_path: []const u8,
-    validation_json_path: []const u8,
 ) !SecureBootTrustState {
-    try runVirtFwVars(allocator, io, &.{
-        virt_fw_vars_path,
-        "--input",
-        template_path,
-        "--output",
-        output_path,
-        "--add-db",
-        "7f32d4a1-7c10-4e6d-8a89-15ba3f4db734",
-        certificate_path,
-        "--secure-boot",
-    });
-    try qemu_host.requireFirmwareWritable(io, output_path);
-    return validateSecureBootVars(
+    const trust_state = miz.efi_varstore.enrollSecureBootFile(
         allocator,
         io,
-        virt_fw_vars_path,
+        template_path,
         output_path,
-        validation_json_path,
-        certificate_sha256,
-    );
+        certificate.der,
+    ) catch |err| return translateSecureBootVarsError(err);
+    try qemu_host.requireFirmwareWritable(io, output_path);
+    return trust_state;
 }
 
 fn validateSecureBootVars(
     allocator: std.mem.Allocator,
     io: std.Io,
-    virt_fw_vars_path: []const u8,
     vars_path: []const u8,
-    validation_json_path: []const u8,
     certificate_sha256: miz.artifact_pipeline.Digest,
 ) !SecureBootTrustState {
-    try runVirtFwVars(allocator, io, &.{
-        virt_fw_vars_path,
-        "--input",
-        vars_path,
-        "--output-json",
-        validation_json_path,
-    });
-    const json = try std.Io.Dir.cwd().readFileAlloc(
-        io,
-        validation_json_path,
+    return miz.efi_varstore.validateSecureBootFile(
         allocator,
-        .limited(32 * 1024 * 1024),
-    );
-    defer allocator.free(json);
-    return validateEnrolledVarsJson(allocator, json, certificate_sha256);
+        io,
+        vars_path,
+        certificate_sha256,
+    ) catch |err| translateSecureBootVarsError(err);
+}
+
+/// Keeps the CLI's fail-closed error surface stable: every way a variable
+/// store can be unusable collapses to one of two actionable messages.
+fn translateSecureBootVarsError(err: anyerror) anyerror {
+    return switch (err) {
+        error.VariableStoreFull => error.SecureBootVariableStoreFull,
+        error.VariableStoreNotFound,
+        error.InvalidFirmwareVolume,
+        error.InvalidVariableStoreHeader,
+        error.UnsupportedVariableStoreFormat,
+        error.MalformedVariableStore,
+        error.TruncatedVariableStore,
+        error.MissingSignatureDatabase,
+        error.MissingPlatformKey,
+        error.MissingKeyExchangeKey,
+        error.UnauthenticatedSignatureDatabase,
+        error.InvalidSignatureDatabase,
+        error.InvalidCertificate,
+        error.InvalidVariableName,
+        error.InvalidSecureBootVariables,
+        => error.InvalidEnrolledSecureBootVars,
+        else => err,
+    };
 }
 
 fn prepareSecureBootVmStateAlloc(
@@ -1948,8 +1694,6 @@ fn prepareSecureBootVmStateAlloc(
     if (state_exists != expected_state_exists)
         return error.SecureBootStateChanged;
 
-    const virt_fw_vars_path = try resolveVirtFwVarsAlloc(allocator, io, environ);
-    defer allocator.free(virt_fw_vars_path);
     const temp_dir = try createTemporaryWorkDirAlloc(
         allocator,
         io,
@@ -1965,45 +1709,19 @@ fn prepareSecureBootVmStateAlloc(
         &.{ temp_dir, "template-vars.fd" },
     );
     defer allocator.free(template_path);
-    const certificate_path = try std.fs.path.join(
-        allocator,
-        &.{ temp_dir, "release-leaf.pem" },
-    );
-    defer allocator.free(certificate_path);
     const enrolled_path = try std.fs.path.join(
         allocator,
         &.{ temp_dir, "enrolled-vars.fd" },
     );
     errdefer allocator.free(enrolled_path);
-    const validation_json_path = try std.fs.path.join(
-        allocator,
-        &.{ temp_dir, "enrolled-vars.json" },
-    );
-    defer allocator.free(validation_json_path);
-    const persistent_validation_json_path = try std.fs.path.join(
-        allocator,
-        &.{ temp_dir, "persistent-vars.json" },
-    );
-    defer allocator.free(persistent_validation_json_path);
 
     try qemu_host.materializeFirmwareFile(io, vars_source, template_path, .{});
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = certificate_path,
-        .data = certificate.pem,
-        .flags = .{
-            .truncate = true,
-            .permissions = privateFilePermissions(),
-        },
-    });
     const expected_trust_state = try enrollSecureBootVars(
         allocator,
         io,
-        virt_fw_vars_path,
         template_path,
-        certificate_path,
-        certificate.sha256,
+        certificate,
         enrolled_path,
-        validation_json_path,
     );
 
     if (state_exists) {
@@ -2016,9 +1734,7 @@ fn prepareSecureBootVmStateAlloc(
         const persistent_trust_state = try validateSecureBootVars(
             allocator,
             io,
-            virt_fw_vars_path,
             persistent_vars_path,
-            persistent_validation_json_path,
             certificate.sha256,
         );
         if (!persistent_trust_state.eql(expected_trust_state))
@@ -2065,9 +1781,7 @@ fn prepareSecureBootVmStateAlloc(
     const published_trust_state = try validateSecureBootVars(
         allocator,
         io,
-        virt_fw_vars_path,
         persistent_vars_path,
-        persistent_validation_json_path,
         certificate.sha256,
     );
     if (!published_trust_state.eql(expected_trust_state))
@@ -2938,13 +2652,13 @@ fn printSecureBootPreparationError(image_path: []const u8, err: anyerror) void {
             "qemu: the UKI signer in '{s}' does not match the trusted Secure Boot certificate\n",
             .{image_path},
         ),
-        error.VirtFwVarsNotFound => std.debug.print(
-            "qemu: virt-fw-vars was not found; install python3-virt-firmware before creating Secure Boot variables\n",
-            .{},
-        ),
         error.IncompleteSecureBootState => std.debug.print(
             "qemu: the Secure Boot variables bundle for '{s}' is incomplete; move or delete its .secboot.vars files before retrying\n",
             .{image_path},
+        ),
+        error.SecureBootVariableStoreFull => std.debug.print(
+            "qemu: the selected UEFI variables template has no room for the release Secure Boot certificate\n",
+            .{},
         ),
         error.InvalidSecureBootMetadata,
         error.SecureBootStateCertificateMismatch,
@@ -2953,9 +2667,7 @@ fn printSecureBootPreparationError(image_path: []const u8, err: anyerror) void {
             "qemu: the persistent Secure Boot variables for '{s}' do not match the selected Microsoft template and release leaf\n",
             .{image_path},
         ),
-        error.VirtFwVarsFailed,
-        error.InvalidEnrolledSecureBootVars,
-        => std.debug.print(
+        error.InvalidEnrolledSecureBootVars => std.debug.print(
             "qemu: failed to enroll or validate the release leaf in Secure Boot variables for '{s}'\n",
             .{image_path},
         ),
@@ -4082,151 +3794,291 @@ test "qemu Secure Boot state requires matching vars and metadata" {
     );
 }
 
-test "qemu validates the exact release leaf in enrolled vars JSON" {
+/// A real self-signed DER certificate, reused verbatim from the miz signing
+/// tests so Secure Boot enrollment can be exercised end to end without a
+/// second vendored fixture.
+const test_release_certificate_b64 =
+    "MIIC2jCCAcKgAwIBAgICBKEwDQYJKoZIhvcNAQELBQAwMDEgMB4GA1UEAwwXbWl6IG5hdGl2ZSBsb2NhbCBzaWduZXIxDDAK" ++
+    "BgNVBAoMA21pejAeFw0yNjAxMDEwMDAwMDBaFw0zNjAxMDEwMDAwMDBaMDAxIDAeBgNVBAMMF21peiBuYXRpdmUgbG9jYWwg" ++
+    "c2lnbmVyMQwwCgYDVQQKDANtaXowggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC5AIeQdj0ZtB377NTn4yk/TWP7" ++
+    "7/pOxAeKNRuXWY/8ol47IkFl/d2nrdzRPFir/OR3WPC2C0PcCn6ldEh/DbkieFrYXDoY8eLGIcAASH1IHyUCaegagvaaosDV" ++
+    "328d1qzm+xZtWTImnRVhHZNHOU6SCVgk5tbkPrgwdRNgdH7ba2HDaVelkuBumrzOGN6xykWUIhStF3YBNszfgC4O2m0GEutA" ++
+    "F3mFqLUhbIMhuMWtu27eK0VyIkUrRjaQGRs74x5Fb2+OV4/M0oVKsaRLTuYpdkNfI2Xp95f4v803eLUHRIhHifYQ8RBuh/ZC" ++
+    "h5t3ZPm5u5ljqbsGIx2dFp6lResBAgMBAAEwDQYJKoZIhvcNAQELBQADggEBAKKAv4U/hkTowNj3SpMFm0CYrv47l0Xv+JTH" ++
+    "H+PlWaCKxalLv3QnoGFFueoTg7Ap+3bbchG+eakZn/w1LA6XsayOIsS9+VGSV4szcKhOsraPPuK2SkVtrzbvqsSr5phZb1P8" ++
+    "BUE91YjZDsSlVWUYqUodRxn1gH0AbFrZw9ZQ9lenhbx4WZaeTUiS/kQNHx/xs11pvWOozhaCoyAV2VXsAqqB92laSzqVLz1n" ++
+    "m6Z16PD14VrycusNZdO/sQZwqrjLvRjmg24TYoUWAtRNPDc2F2mb/htcZFimdufWME5ZPEP54OeUJNFmQUvxScSGGEAHuU1k" ++
+    "Qxca1IqEU0FiJXPCy6o=";
+
+fn decodeTestCertificateAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const decoder = std.base64.standard.Decoder;
+    const der = try allocator.alloc(
+        u8,
+        try decoder.calcSizeForSlice(test_release_certificate_b64),
+    );
+    errdefer allocator.free(der);
+    try decoder.decode(der, test_release_certificate_b64);
+    return der;
+}
+
+const TestStoreVariable = struct {
+    name: []const u8,
+    guid: miz.guid.Guid,
+    attributes: u32,
+    data: []const u8,
+};
+
+/// Builds a 128 KiB OVMF-shaped authenticated variable store: an
+/// `EFI_SYSTEM_NV_DATA_FV` header with a valid UEFI-16 checksum, a formatted
+/// and healthy `VARIABLE_STORE_HEADER`, and the given variables.
+fn buildTestVarsAlloc(
+    allocator: std.mem.Allocator,
+    store_size: u32,
+    variables: []const TestStoreVariable,
+) ![]u8 {
+    const fv_length: usize = 0x20000;
+    const header_length: usize = 72;
+    const image = try allocator.alloc(u8, fv_length);
+    errdefer allocator.free(image);
+    @memset(image, 0xff);
+    @memset(image[0..16], 0);
+    @memcpy(image[16..32], &miz.efi_varstore.system_nv_data_fv_guid);
+    std.mem.writeInt(u64, image[32..40], fv_length, .little);
+    @memcpy(image[40..44], "_FVH");
+    std.mem.writeInt(u32, image[44..48], 0x0004feff, .little);
+    std.mem.writeInt(u16, image[48..50], header_length, .little);
+    std.mem.writeInt(u16, image[50..52], 0, .little);
+    std.mem.writeInt(u16, image[52..54], 0, .little);
+    image[54] = 0;
+    image[55] = 2;
+    std.mem.writeInt(u32, image[56..60], 0x20, .little);
+    std.mem.writeInt(u32, image[60..64], 0x1000, .little);
+    @memset(image[64..72], 0);
+    var sum: u16 = 0;
+    var index: usize = 0;
+    while (index < header_length) : (index += 2)
+        sum +%= std.mem.readInt(u16, image[index..][0..2], .little);
+    std.mem.writeInt(u16, image[50..52], 0 -% sum, .little);
+
+    @memcpy(
+        image[header_length..][0..16],
+        &miz.efi_varstore.authenticated_variable_store_guid,
+    );
+    std.mem.writeInt(u32, image[header_length + 16 ..][0..4], store_size, .little);
+    image[header_length + 20] = 0x5a;
+    image[header_length + 21] = 0xfe;
+    @memset(image[header_length + 22 ..][0..6], 0);
+
+    var offset = header_length + 28;
+    for (variables) |variable| {
+        const name_size = (variable.name.len + 1) * 2;
+        // Records written past the declared store end would be invisible to
+        // the parser, which would quietly weaken whatever the test asserts.
+        const size = (60 + name_size + variable.data.len + 3) & ~@as(usize, 3);
+        if (offset + size > header_length + store_size) return error.TestStoreTooSmall;
+        const record = image[offset..];
+        std.mem.writeInt(u16, record[0..2], 0x55aa, .little);
+        record[2] = 0x3f;
+        record[3] = 0;
+        std.mem.writeInt(u32, record[4..8], variable.attributes, .little);
+        @memset(record[8..36], 0);
+        std.mem.writeInt(u32, record[36..40], @intCast(name_size), .little);
+        std.mem.writeInt(u32, record[40..44], @intCast(variable.data.len), .little);
+        @memcpy(record[44..60], &variable.guid);
+        for (variable.name, 0..) |byte, position| {
+            record[60 + position * 2] = byte;
+            record[60 + position * 2 + 1] = 0;
+        }
+        record[60 + variable.name.len * 2] = 0;
+        record[60 + variable.name.len * 2 + 1] = 0;
+        @memcpy(record[60 + name_size ..][0..variable.data.len], variable.data);
+        offset += size;
+    }
+    return image;
+}
+
+fn writeTestVars(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    store_size: u32,
+    variables: []const TestStoreVariable,
+) !void {
+    const image = try buildTestVarsAlloc(allocator, store_size, variables);
+    defer allocator.free(image);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = image,
+        .flags = .{ .truncate = true },
+    });
+}
+
+/// One `EFI_SIGNATURE_LIST` of type `EFI_CERT_X509` holding `microsoft db`,
+/// standing in for the vendor entries a real template ships with.
+const test_microsoft_db =
+    "\xa1\x59\xc0\xa5\xe4\x94\xa7\x4a\x87\xb5\xab\x15\x5c\x2b\xf0\x72" ++
+    "\x38\x00\x00\x00\x00\x00\x00\x00\x1c\x00\x00\x00" ++
+    "\x00" ** 16 ++ "microsoft db";
+
+test "qemu enrolls and validates the exact release leaf in native vars" {
     const allocator = std.testing.allocator;
-    const certificate = "DER certificate";
-    const efi_cert_x509_guid = [_]u8{
-        0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
-        0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
+    const io = std.testing.io;
+    const certificate_der = try decodeTestCertificateAlloc(allocator);
+    defer allocator.free(certificate_der);
+    const digest = miz.artifact_pipeline.sha256Bytes(certificate_der);
+    const certificate: SecureBootCertificate = .{
+        .der = certificate_der,
+        .sha256 = digest,
+        .launch_image_path = &.{},
     };
-    var database = [_]u8{0} ** (28 + 16 + certificate.len);
-    @memcpy(database[0..efi_cert_x509_guid.len], &efi_cert_x509_guid);
-    std.mem.writeInt(u32, database[16..20], database.len, .little);
-    std.mem.writeInt(u32, database[20..24], 0, .little);
-    std.mem.writeInt(u32, database[24..28], 16 + certificate.len, .little);
-    @memcpy(database[28 + 16 ..], certificate);
-    const digest = miz.artifact_pipeline.sha256Bytes(certificate);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    const template_path = try std.fs.path.join(allocator, &.{ root, "template.fd" });
+    defer allocator.free(template_path);
+    const enrolled_path = try std.fs.path.join(allocator, &.{ root, "enrolled.fd" });
+    defer allocator.free(enrolled_path);
+
+    const template = [_]TestStoreVariable{
+        .{
+            .name = "PK",
+            .guid = miz.efi_varstore.global_variable_guid,
+            .attributes = miz.efi_varstore.authenticated_variable_attributes,
+            .data = "microsoft platform key",
+        },
+        .{
+            .name = "KEK",
+            .guid = miz.efi_varstore.global_variable_guid,
+            .attributes = miz.efi_varstore.authenticated_variable_attributes,
+            .data = "microsoft key exchange key",
+        },
+        .{
+            .name = "db",
+            .guid = miz.efi_varstore.image_security_database_guid,
+            .attributes = miz.efi_varstore.authenticated_variable_attributes,
+            .data = test_microsoft_db,
+        },
+    };
+    try writeTestVars(allocator, io, template_path, 0xdfb8, &template);
+
+    const trust_state = try enrollSecureBootVars(
+        allocator,
+        io,
+        template_path,
+        certificate,
+        enrolled_path,
+    );
     try std.testing.expectEqual(
-        @as(usize, 1),
-        try efiSignatureDatabaseCertificateCount(&database, digest),
+        miz.artifact_pipeline.sha256Bytes("microsoft platform key"),
+        trust_state.pk_sha256,
+    );
+    try std.testing.expectEqual(
+        miz.artifact_pipeline.sha256Bytes("microsoft key exchange key"),
+        trust_state.kek_sha256,
     );
 
-    const database_hex = std.fmt.bytesToHex(database, .lower);
-    const json = try std.json.Stringify.valueAlloc(
+    // Re-reading the published file must reproduce the same trust state, and
+    // a different leaf must not validate against it.
+    const revalidated = try validateSecureBootVars(
         allocator,
-        .{
-            .version = 2,
-            .variables = &.{
-                .{
-                    .name = "SecureBootEnable",
-                    .guid = "f0a30bc7-af08-4556-99c4-001009c93a44",
-                    .attr = 3,
-                    .data = "01",
-                },
-                .{
-                    .name = "CustomMode",
-                    .guid = "c076ec0c-7028-4399-a072-71ee5c448b9f",
-                    .attr = 3,
-                    .data = "00",
-                },
-                .{
-                    .name = "PK",
-                    .guid = "8be4df61-93ca-11d2-aa0d-00e098032b8c",
-                    .attr = 39,
-                    .data = "01",
-                },
-                .{
-                    .name = "KEK",
-                    .guid = "8be4df61-93ca-11d2-aa0d-00e098032b8c",
-                    .attr = 39,
-                    .data = "01",
-                },
-                .{
-                    .name = "db",
-                    .guid = "d719b2cb-3d3a-4596-a3bc-dad00e67656f",
-                    .attr = 39,
-                    .data = &database_hex,
-                },
-            },
-        },
-        .{},
+        io,
+        enrolled_path,
+        digest,
     );
-    defer allocator.free(json);
-    const trust_state = try validateEnrolledVarsJson(allocator, json, digest);
+    try std.testing.expect(revalidated.eql(trust_state));
     var changed_trust_state = trust_state;
     changed_trust_state.pk_sha256 =
         miz.artifact_pipeline.sha256Bytes("different platform key");
     try std.testing.expect(!changed_trust_state.eql(trust_state));
     try std.testing.expectError(
         error.InvalidEnrolledSecureBootVars,
-        validateEnrolledVarsJson(
+        validateSecureBootVars(
             allocator,
-            json,
+            io,
+            enrolled_path,
             miz.artifact_pipeline.sha256Bytes("other certificate"),
         ),
     );
 
-    const invalid_guid_json = try allocator.dupe(u8, json);
-    defer allocator.free(invalid_guid_json);
-    const guid_offset = std.mem.indexOf(
-        u8,
-        invalid_guid_json,
-        "8be4df61-93ca-11d2-aa0d-00e098032b8c",
-    ).?;
-    invalid_guid_json[guid_offset] = '9';
-    try std.testing.expectError(
-        error.InvalidEnrolledSecureBootVars,
-        validateEnrolledVarsJson(allocator, invalid_guid_json, digest),
-    );
-
-    const invalid_attr_json = try allocator.dupe(u8, json);
-    defer allocator.free(invalid_attr_json);
-    const attr_offset = std.mem.indexOf(u8, invalid_attr_json, "\"attr\":39").?;
-    invalid_attr_json[attr_offset + "\"attr\":3".len] = '8';
-    try std.testing.expectError(
-        error.InvalidEnrolledSecureBootVars,
-        validateEnrolledVarsJson(allocator, invalid_attr_json, digest),
-    );
-
-    const duplicate_json = try std.json.Stringify.valueAlloc(
+    // The enrolled db carries exactly one copy of the release leaf under the
+    // miz owner GUID, and the Microsoft entry ahead of it is untouched.
+    const enrolled = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        enrolled_path,
         allocator,
-        .{
-            .version = 2,
-            .variables = &.{
-                .{
-                    .name = "SecureBootEnable",
-                    .guid = "f0a30bc7-af08-4556-99c4-001009c93a44",
-                    .attr = 3,
-                    .data = "01",
-                },
-                .{
-                    .name = "CustomMode",
-                    .guid = "c076ec0c-7028-4399-a072-71ee5c448b9f",
-                    .attr = 3,
-                    .data = "00",
-                },
-                .{
-                    .name = "PK",
-                    .guid = "8be4df61-93ca-11d2-aa0d-00e098032b8c",
-                    .attr = 39,
-                    .data = "01",
-                },
-                .{
-                    .name = "PK",
-                    .guid = "8be4df61-93ca-11d2-aa0d-00e098032b8c",
-                    .attr = 39,
-                    .data = "01",
-                },
-                .{
-                    .name = "KEK",
-                    .guid = "8be4df61-93ca-11d2-aa0d-00e098032b8c",
-                    .attr = 39,
-                    .data = "01",
-                },
-                .{
-                    .name = "db",
-                    .guid = "d719b2cb-3d3a-4596-a3bc-dad00e67656f",
-                    .attr = 39,
-                    .data = &database_hex,
-                },
-            },
-        },
-        .{},
+        .limited(1024 * 1024),
     );
-    defer allocator.free(duplicate_json);
+    // `parse` takes ownership only when it succeeds, and `store.deinit`
+    // frees the same buffer, so the failure path must be handled here rather
+    // than with an `errdefer` that would outlive the transfer.
+    var store = miz.efi_varstore.parse(allocator, enrolled) catch |err| {
+        allocator.free(enrolled);
+        return err;
+    };
+    defer store.deinit();
+    const database = store.find("db", miz.efi_varstore.image_security_database_guid).?;
+    try std.testing.expectEqualSlices(
+        u8,
+        test_microsoft_db,
+        database.data[0..test_microsoft_db.len],
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try miz.efi_varstore.countX509Certificates(database.data, digest),
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &miz.efi_varstore.release_signature_owner_guid,
+        database.data[test_microsoft_db.len + 28 ..][0..16],
+    );
+
+    // A template without Microsoft trust material, a store with no room and
+    // a file that is not a variable store all fail closed with the two
+    // actionable Secure Boot errors.
+    const without_pk_path = try std.fs.path.join(allocator, &.{ root, "no-pk.fd" });
+    defer allocator.free(without_pk_path);
+    try writeTestVars(allocator, io, without_pk_path, 0xdfb8, template[1..]);
     try std.testing.expectError(
         error.InvalidEnrolledSecureBootVars,
-        validateEnrolledVarsJson(allocator, duplicate_json, digest),
+        enrollSecureBootVars(
+            allocator,
+            io,
+            without_pk_path,
+            certificate,
+            enrolled_path,
+        ),
+    );
+
+    const cramped_path = try std.fs.path.join(allocator, &.{ root, "cramped.fd" });
+    defer allocator.free(cramped_path);
+    try writeTestVars(allocator, io, cramped_path, 28 + 512, &template);
+    try std.testing.expectError(
+        error.SecureBootVariableStoreFull,
+        enrollSecureBootVars(
+            allocator,
+            io,
+            cramped_path,
+            certificate,
+            enrolled_path,
+        ),
+    );
+
+    const junk_path = try std.fs.path.join(allocator, &.{ root, "junk.fd" });
+    defer allocator.free(junk_path);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = junk_path,
+        .data = "not a firmware volume",
+        .flags = .{ .truncate = true },
+    });
+    try std.testing.expectError(
+        error.InvalidEnrolledSecureBootVars,
+        validateSecureBootVars(allocator, io, junk_path, digest),
+    );
+    try std.testing.expectError(
+        error.InvalidEnrolledSecureBootVars,
+        enrollSecureBootVars(allocator, io, junk_path, certificate, enrolled_path),
     );
 }
 

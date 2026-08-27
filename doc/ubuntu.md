@@ -704,11 +704,11 @@ aarch64 runner.
 
 Native acceptance is deliberately not emulation. Each architecture requires a
 matching Linux runner with readable and writable `/dev/kvm`, QEMU, OVMF or
-AAVMF, `swtpm`, `virt-fw-vars`, `sbverify`, and OpenSSH. It enrolls
-the exact candidate leaf in UEFI `db` and asserts the standalone GPT image,
-Secure Boot, signed UKI, vTPM, lockdown, signed modules, rejection of a
-tampered UKI, key-only SSH, cloud-init, WALinuxAgent, netplan/networkd, root
-growth, generalized identity, reboot/reconnect, and clean service health.
+AAVMF, `swtpm`, `sbverify`, and OpenSSH. It enrolls the exact candidate leaf in
+UEFI `db` and asserts the standalone GPT image, Secure Boot, signed UKI, vTPM,
+lockdown, signed modules, rejection of a tampered UKI, key-only SSH, cloud-init,
+WALinuxAgent, netplan/networkd, root growth, generalized identity,
+reboot/reconnect, and clean service health.
 
 The core workflow keeps `x86_64` native acceptance on the `ubuntu-24.04`
 hosted runner. Its `aarch64` leg requires a repository runner matching
@@ -719,11 +719,11 @@ the candidate, then installs `qemu-system-aarch64` and Secure Boot-capable
 AAVMF. It never falls back to TCG. These labels describe a dedicated native
 ARM64 KVM host and do not imply Azure nested virtualization.
 
-The `python3-virt-firmware` package and its `virt-fw-vars` executable are
-firmware-variable tooling, not libguestfs. They remain required solely to
-create per-instance Secure Boot variable stores for QEMU acceptance.
-`qemu-utils` remains in native acceptance for candidate inspection and in
-Azure acceptance for the documented fixed-VHD conversion boundary.
+Per-instance Secure Boot variable stores are created natively by
+`miz.efi_varstore`, the same EDK II variable-store parser and editor
+`miz qemu --secure-boot` uses, so no firmware-variable host package is
+installed. `qemu-utils` remains in native acceptance for candidate inspection
+and in Azure acceptance for the documented fixed-VHD conversion boundary.
 
 Azure acceptance requires an Azure subscription and OIDC application allowed
 to create and delete the temporary resource group and its managed disks,

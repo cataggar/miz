@@ -323,6 +323,22 @@ pub fn build(b: *std.Build) void {
     // makes a targeted change to one of them expensive to verify.
     const miz_test_step = b.step("test-miz", "Run the miz package's tests");
     miz_test_step.dependOn(&run_miz_tests.step);
+    // The native EDK2 variable-store parser/editor that replaced the
+    // `virt-fw-vars` host dependency. It touches nothing in the disk-image
+    // dependency graph, so it gets a step that builds in seconds.
+    const efi_varstore_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("packages/miz/src/efi_varstore.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_efi_varstore_tests = b.addRunArtifact(efi_varstore_tests);
+    const efi_varstore_test_step = b.step(
+        "test-efi-varstore",
+        "Run native EDK2 Secure Boot variable-store tests",
+    );
+    efi_varstore_test_step.dependOn(&run_efi_varstore_tests.step);
     const package_family_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("packages/miz/src/package_family.zig"),

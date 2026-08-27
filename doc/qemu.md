@@ -78,8 +78,11 @@ miz qemu AzureLinux --secure-boot
 miz qemu AzureLinux-4.0-aarch64 --secure-boot
 ```
 
-This mode requires `virt-fw-vars` from `python3-virt-firmware` and
-architecture-appropriate Secure-Boot-capable OVMF or AAVMF. The catalog pins
+This mode requires only architecture-appropriate Secure-Boot-capable OVMF or
+AAVMF. Reading, editing, and writing the EDK II variable store is native: miz
+parses the firmware volume and authenticated variable store itself, preserves
+the vendor PK, KEK, `db`, and `dbx` bytes, appends exactly one X.509 entry for
+the release leaf, and enables Secure Boot with custom mode off. The catalog pins
 both the release asset SHA-256 and the canonical-DER SHA-256 of the exact Azure
 Artifact Signing leaf. Before first enrollment, `miz` verifies the pristine
 catalog image digest, extracts the signer from every fallback and named UKI,
