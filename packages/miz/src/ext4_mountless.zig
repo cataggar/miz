@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ext4 = @import("ext4.zig");
+const free_space = @import("free_space.zig");
 const limits_mod = @import("limits.zig");
 const os_customization = @import("os_customization.zig");
 const root_tree = @import("root_tree.zig");
@@ -430,6 +431,26 @@ fn preparePrivateDirectory(
         return error.AtomicPublishFailed;
     }
     return directory;
+}
+
+fn copySparseSource(
+    io: Io,
+    source: Io.File,
+    destination: Io.File,
+    logical_length: u64,
+) Error!void {
+    try destination.setLength(io, logical_length);
+    var copy_buffer: [1024 * 1024]u8 = undefined;
+    var copied: u64 = 0;
+    while (copied < logical_length) {
+        const wanted: usize = @intCast(@min(@as(u64, copy_buffer.len), logical_length - copied));
+        const got = try source.readPositionalAll(io, copy_buffer[0..wanted], copied);
+        if (got != wanted) return error.SourceChangedDuringCopy;
+        if (!std.mem.allEqual(u8, copy_buffer[0..got], 0)) {
+            try destination.writePositionalAll(io, copy_buffer[0..got], copied);
+        }
+        copied += got;
+    }
 }
 
 pub const FileSystem = struct {
@@ -1310,15 +1331,7 @@ pub const FileSystem = struct {
                 );
             }
         }
-        var copy_buffer: [1024 * 1024]u8 = undefined;
-        var copied: u64 = 0;
-        while (copied < self.source_size) {
-            const wanted: usize = @intCast(@min(@as(u64, copy_buffer.len), self.source_size - copied));
-            const got = try self.file.readPositionalAll(self.io, copy_buffer[0..wanted], copied);
-            if (got != wanted) return error.SourceChangedDuringCopy;
-            try stage_file.writePositionalAll(self.io, copy_buffer[0..got], copied);
-            copied += got;
-        }
+        try copySparseSource(self.io, self.file, stage_file, self.source_size);
         if (!self.sameSourceStat(try self.file.stat(self.io))) return error.AtomicSourceChanged;
         const info = try ext4.populate(self.io, stage_file, self.allocator, cursor, .{
             .offset = self.offset,
@@ -1512,6 +1525,65 @@ pub const FileSystem = struct {
 
 fn DirDelete(io: Io, path: []const u8) void {
     Io.Dir.cwd().deleteFile(io, path) catch {};
+}
+
+test "atomic source copy preserves sparse bytes and logical length" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const logical_length = 5 * 1024 * 1024 + 17;
+
+    var source = try temporary.dir.createFile(io, "source.raw", .{
+        .read = true,
+        .truncate = true,
+    });
+    defer source.close(io);
+    try source.setLength(io, logical_length);
+    try source.writePositionalAll(io, "sparse-source", 1024 * 1024 + 123);
+
+    var destination = try temporary.dir.createFile(io, "destination.raw", .{
+        .read = true,
+        .truncate = true,
+    });
+    defer destination.close(io);
+    try copySparseSource(io, source, destination, logical_length);
+    try std.testing.expectEqual(logical_length, (try destination.stat(io)).size);
+
+    var source_buffer: [64 * 1024]u8 = undefined;
+    var destination_buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < logical_length) {
+        const wanted: usize = @intCast(@min(
+            @as(u64, source_buffer.len),
+            logical_length - offset,
+        ));
+        try std.testing.expectEqual(
+            wanted,
+            try source.readPositionalAll(io, source_buffer[0..wanted], offset),
+        );
+        try std.testing.expectEqual(
+            wanted,
+            try destination.readPositionalAll(io, destination_buffer[0..wanted], offset),
+        );
+        try std.testing.expectEqualSlices(
+            u8,
+            source_buffer[0..wanted],
+            destination_buffer[0..wanted],
+        );
+        offset += wanted;
+    }
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    const destination_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root_buffer[0..root_length], "destination.raw" },
+    );
+    defer std.testing.allocator.free(destination_path);
+    if (free_space.fileUsage(destination_path)) |usage| {
+        try std.testing.expectEqual(logical_length, usage.logical_bytes);
+        try std.testing.expect(usage.allocated_bytes < usage.logical_bytes);
+    }
 }
 
 pub const NativeFilesystem = FileSystem;
@@ -1987,9 +2059,19 @@ test "durability failure exposes recovery path before filesystem teardown" {
         u8,
         fs.recoveryArtifactPath() orelse return error.AtomicPublishUnrecoverable,
     );
+    const recovery_image = try std.fs.path.join(allocator, &.{ recovery_path, "stage" });
+    defer allocator.free(recovery_image);
     fs.deinit();
     const recovery_stat = try Io.Dir.cwd().statFile(io, recovery_path, .{});
     try std.testing.expectEqual(Io.File.Kind.directory, recovery_stat.kind);
+    try std.testing.expectEqual(
+        @as(u64, 32 * 1024 * 1024),
+        (try Io.Dir.cwd().statFile(io, recovery_image, .{})).size,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 32 * 1024 * 1024),
+        (try Io.Dir.cwd().statFile(io, image_path, .{})).size,
+    );
     try Io.Dir.cwd().deleteTree(io, recovery_path);
     allocator.free(recovery_path);
 }
