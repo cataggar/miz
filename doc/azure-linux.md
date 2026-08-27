@@ -252,6 +252,18 @@ require local KVM or claim a local native boot result; the exact candidate
 bytes must pass the protected Azure acceptance matrix on matching x86_64 and
 AArch64 VMs before publication.
 
+Every validation the release performs outside `miz` itself is one subcommand of
+the native release tool, which each job builds from its own checkout with
+`zig build install-azurelinux4-release` and runs as
+`zig-out/bin/azurelinux4_release`. It binds and re-derives `candidate.json`,
+`azure-result.json`, and `publish-manifest.json`; validates the derived upload
+VHD, the Azure VM SKU, the gallery image version's custom UEFI settings, the
+Trusted Launch profile, and the certificate in the booted guest's UEFI `db`;
+stages the four published assets transactionally; and proves the remote release
+holds exactly those four. It needs no interpreter and no runtime dependency
+beyond itself, and its contracts are covered by
+`zig build test-azurelinux4-release`, which is part of `zig build test-ci`.
+
 The fail-closed native KVM test remains available for optional validation on a
 suitable machine:
 

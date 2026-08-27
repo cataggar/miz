@@ -971,11 +971,32 @@ pub fn build(b: *std.Build) void {
         azurelinux4_release_tests,
     );
 
+    // ---- tests/azurelinux4_release_contract.zig: the workflow, shell, and
+    // documentation contracts of the Azure Linux 4 release, replacing the
+    // corresponding half of tests/azurelinux4_release_test.py. Its subject is
+    // the tracked tree, which the build graph does not model, so it is never
+    // cached and is told the build root outright. ----
+    const azurelinux4_contract_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/azurelinux4_release_contract.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_azurelinux4_contract_tests = b.addRunArtifact(
+        azurelinux4_contract_tests,
+    );
+    run_azurelinux4_contract_tests.has_side_effects = true;
+    run_azurelinux4_contract_tests.setEnvironmentVariable(
+        "MIZ_AZURELINUX4_CONTRACT_ROOT",
+        b.build_root.path orelse ".",
+    );
     const azurelinux4_release_test_step = b.step(
         "test-azurelinux4-release",
-        "Run Azure Linux 4 release tooling unit tests",
+        "Run Azure Linux 4 release tooling and workflow contract tests",
     );
     azurelinux4_release_test_step.dependOn(&run_azurelinux4_release_tests.step);
+    azurelinux4_release_test_step.dependOn(&run_azurelinux4_contract_tests.step);
 
     // ---- tests/python_inventory.zig: the temporary, explicit inventory of
     // the Python this repository still owns. It shells out to `git ls-files`
@@ -1713,6 +1734,7 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(&run_release_support_tests.step);
         aggregate_test_step.dependOn(&run_azure_vhd_tests.step);
         aggregate_test_step.dependOn(&run_azurelinux4_release_tests.step);
+        aggregate_test_step.dependOn(&run_azurelinux4_contract_tests.step);
         aggregate_test_step.dependOn(&run_python_inventory_tests.step);
         aggregate_test_step.dependOn(&run_nbd_mod_tests.step);
         aggregate_test_step.dependOn(&run_nbd_exe_tests.step);

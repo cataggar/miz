@@ -6,6 +6,7 @@ if [[ -z ${STATE_FILE:-} || -z ${GITHUB_RUN_ID:-} || -z ${GITHUB_RUN_ATTEMPT:-} 
   echo "::error::Azure cleanup identity is incomplete"
   exit 1
 fi
+release_tool=${AZURELINUX4_RELEASE:-zig-out/bin/azurelinux4_release}
 [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
 [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
 [[ "$CANDIDATE_KEY" =~ ^(x86_64|aarch64)-(full|core)$ ]]
@@ -41,20 +42,15 @@ cleanup_group() {
     echo "::error::Could not inspect temporary resource-group ownership"
     return 1
   fi
-  if ! python3 - "$metadata_file" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CANDIDATE_KEY" <<'PY'
-import json
-import sys
-
-tags = json.load(open(sys.argv[1], encoding="utf-8")).get("tags") or {}
-expected = {
-    "miz-owner": "azurelinux4-release",
-    "miz-run-id": sys.argv[2],
-    "miz-run-attempt": sys.argv[3],
-    "miz-candidate": sys.argv[4],
-}
-if tags != expected:
-    raise SystemExit(f"refusing to delete resource group with non-exact ownership tags: {tags!r}")
-PY
+  if [[ ! -x "$release_tool" ]]; then
+    echo "::error::Azure Linux release tool is unavailable during cleanup"
+    return 1
+  fi
+  if ! "$release_tool" check-group-tags \
+      --metadata "$metadata_file" \
+      --run-id "$GITHUB_RUN_ID" \
+      --run-attempt "$GITHUB_RUN_ATTEMPT" \
+      --key "$CANDIDATE_KEY"
   then
     return 1
   fi
@@ -96,12 +92,16 @@ report_error() {
 }
 trap 'report_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
-for tool in az azcopy curl python3 qemu-img sha256sum ssh ssh-keygen; do
+for tool in az azcopy curl qemu-img sha256sum ssh ssh-keygen; do
   command -v "$tool" >/dev/null || {
     echo "::error::Required Azure acceptance tool $tool is unavailable"
     exit 1
   }
 done
+[[ -x "$release_tool" ]] || {
+  echo "::error::Azure Linux release tool is unavailable: $release_tool"
+  exit 1
+}
 
 grant_disk_write_access() {
   local disk_id=$1
@@ -206,15 +206,7 @@ grant_disk_write_access() {
     rm -rf "$request_dir"
     return 1
   fi
-  if ! sas=$(
-      python3 - "$response_body" <<'PY'
-import json
-import sys
-
-response = json.load(open(sys.argv[1], encoding="utf-8"))
-print(response.get("accessSAS") or response.get("accessSas") or "")
-PY
-    )
+  if ! sas=$("$release_tool" disk-access-sas --response "$response_body")
   then
     echo "::error::Azure disk access response was not valid JSON" >&2
     rm -rf "$request_dir"
@@ -232,7 +224,7 @@ mkdir -p "$RESULT_DIR"
 manifest="$CANDIDATE_DIR/candidate.json"
 asset="$CANDIDATE_DIR/$ASSET_NAME"
 readarray -t candidate < <(
-  python3 scripts/azurelinux4_release.py verify-candidate \
+  "$release_tool" verify-candidate \
     --manifest "$manifest" \
     --asset "$asset" \
     --key "$CANDIDATE_KEY" \
@@ -245,23 +237,6 @@ virtual_size=${candidate[2]}
 [[ "$qcow_sha256" =~ ^[0-9a-f]{64}$ ]]
 [[ "$qcow_bytes" =~ ^[0-9]+$ ]]
 [[ "$virtual_size" =~ ^[0-9]+$ ]]
-readarray -t signing_identity < <(
-  python3 - "$manifest" <<'PY'
-import json
-import sys
-
-signing = json.load(open(sys.argv[1], encoding="utf-8"))["uki_signing"]
-print(signing["certificate_sha256"])
-print(signing["fallback_uki_sha256"])
-print(signing["certificate_der_base64"])
-PY
-)
-test "${#signing_identity[@]}" -eq 3
-certificate_sha256=${signing_identity[0]}
-fallback_uki_sha256=${signing_identity[1]}
-certificate_der_base64=${signing_identity[2]}
-[[ "$certificate_sha256" =~ ^[0-9a-f]{64}$ ]]
-[[ "$fallback_uki_sha256" =~ ^[0-9a-f]{64}$ ]]
 
 suffix=${CANDIDATE_KEY//_/-}
 resource_group="miz-al4-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
@@ -285,16 +260,17 @@ vm_security_json="$RESULT_DIR/vm-security.json"
 instance_security_json="$RESULT_DIR/instance-security.json"
 mkdir -p "$(dirname -- "$STATE_FILE")"
 rm -f -- "$STATE_FILE" "${STATE_FILE}.group.json" "$vhd" "$private_key" "$private_key.pub"
-python3 - "$certificate_der" "$certificate_sha256" "$certificate_der_base64" <<'PY'
-import base64
-import hashlib
-import sys
-
-certificate = base64.b64decode(sys.argv[3], validate=True)
-if not certificate or hashlib.sha256(certificate).hexdigest() != sys.argv[2]:
-    raise SystemExit("candidate signing certificate binding is invalid")
-open(sys.argv[1], "wb").write(certificate)
-PY
+readarray -t signing_identity < <(
+  "$release_tool" signing-identity \
+    --manifest "$manifest" \
+    --certificate-der "$certificate_der"
+)
+test "${#signing_identity[@]}" -eq 2
+certificate_sha256=${signing_identity[0]}
+fallback_uki_sha256=${signing_identity[1]}
+[[ "$certificate_sha256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$fallback_uki_sha256" =~ ^[0-9a-f]{64}$ ]]
+test -s "$certificate_der"
 
 cleanup_on_exit() {
   status=$?
@@ -359,33 +335,10 @@ if [[ "$ARCHITECTURE" == aarch64 ]]; then
   azure_image_architecture=Arm64
 fi
 has_resource_disk=$(
-  python3 - "$sku_json" "$AZURE_VM_SIZE" "$expected_azure_architecture" <<'PY'
-import json
-import sys
-
-matches = [item for item in json.load(open(sys.argv[1], encoding="utf-8")) if item["name"] == sys.argv[2]]
-if len(matches) != 1:
-    raise SystemExit("configured Azure VM SKU is absent or ambiguous in the configured location")
-sku = matches[0]
-location_restrictions = [
-    restriction
-    for restriction in sku.get("restrictions", [])
-    if restriction.get("type") == "Location"
-]
-if location_restrictions:
-    raise SystemExit(f"configured Azure VM SKU is location-restricted: {location_restrictions!r}")
-capabilities = {item["name"]: item["value"] for item in sku.get("capabilities", [])}
-if capabilities.get("CpuArchitectureType") != sys.argv[3]:
-    raise SystemExit(f"SKU architecture mismatch: {capabilities.get('CpuArchitectureType')!r}")
-if "V2" not in capabilities.get("HyperVGenerations", "").split(","):
-    raise SystemExit("configured Azure VM SKU does not support Gen2")
-if capabilities.get("TrustedLaunchDisabled") == "True":
-    raise SystemExit("configured Azure VM SKU does not support Trusted Launch")
-has_resource_disk = int(capabilities.get("MaxResourceVolumeMB", "0")) > 0
-if sys.argv[3] == "x64" and not has_resource_disk:
-    raise SystemExit("configured Azure VM SKU has no temporary resource disk")
-print("true" if has_resource_disk else "false")
-PY
+  "$release_tool" check-vm-sku \
+    --skus "$sku_json" \
+    --vm-size "$AZURE_VM_SIZE" \
+    --architecture "$expected_azure_architecture"
 )
 [[ "$has_resource_disk" == true || "$has_resource_disk" == false ]]
 
@@ -399,7 +352,7 @@ test "$source_before" = "$qcow_sha256"
 test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
 qemu-img info -f vpc --output=json "$vhd" >"$RESULT_DIR/vhd-info.json"
 readarray -t vhd_geometry < <(
-  python3 scripts/azurelinux4_release.py verify-vhd \
+  "$release_tool" verify-vhd \
     --info "$RESULT_DIR/vhd-info.json" \
     --vhd "$vhd"
 )
@@ -473,67 +426,22 @@ image_definition_id=$(az sig image-definition show \
   --output tsv)
 [[ "$image_definition_id" == /subscriptions/* ]]
 image_version_id="$image_definition_id/versions/1.0.0"
-python3 - "$uefi_request" "$AZURE_LOCATION" "$disk_id" "$certificate_der" <<'PY'
-import base64
-import json
-import sys
-
-output, location, disk_id, certificate_path = sys.argv[1:]
-certificate = base64.b64encode(open(certificate_path, "rb").read()).decode("ascii")
-payload = {
-    "location": location,
-    "properties": {
-        "publishingProfile": {
-            "replicationMode": "Shallow",
-            "targetRegions": [
-                {
-                    "name": location,
-                    "regionalReplicaCount": 1,
-                    "storageAccountType": "Standard_LRS",
-                }
-            ],
-        },
-        "storageProfile": {"osDiskImage": {"source": {"id": disk_id}}},
-        "securityProfile": {
-            "uefiSettings": {
-                "signatureTemplateNames": [
-                    "MicrosoftUefiCertificateAuthorityTemplate"
-                ],
-                "additionalSignatures": {
-                    "db": [{"type": "x509", "value": [certificate]}]
-                },
-            }
-        },
-    },
-}
-open(output, "w", encoding="utf-8").write(
-    json.dumps(payload, indent=2, sort_keys=True) + "\n"
-)
-PY
+"$release_tool" gallery-request \
+  --output "$uefi_request" \
+  --location "$AZURE_LOCATION" \
+  --disk-id "$disk_id" \
+  --certificate "$certificate_der"
 az rest \
   --method put \
   --uri "https://management.azure.com${image_version_id}?api-version=2025-03-03" \
   --body "@$uefi_request" \
   --output json >"$uefi_response"
 cp "$uefi_response" "$uefi_create_response"
-python3 - "$uefi_request" "$uefi_create_response" <<'PY'
-import json
-import sys
-
-request = json.load(open(sys.argv[1], encoding="utf-8"))
-response = json.load(open(sys.argv[2], encoding="utf-8"))
-expected = request["properties"]["securityProfile"]["uefiSettings"]
-actual = response.get("properties", {}).get("securityProfile", {}).get("uefiSettings")
-if actual != expected:
-    raise SystemExit("Azure did not accept the exact custom UEFI settings")
-PY
+"$release_tool" check-gallery-accepted \
+  --request "$uefi_request" \
+  --response "$uefi_create_response"
 for _ in {1..120}; do
-  provisioning_state=$(python3 - "$uefi_response" <<'PY'
-import json
-import sys
-print(json.load(open(sys.argv[1], encoding="utf-8")).get("properties", {}).get("provisioningState", ""))
-PY
-)
+  provisioning_state=$("$release_tool" gallery-state --response "$uefi_response")
   case "$provisioning_state" in
     Succeeded) break ;;
     Failed|Canceled)
@@ -548,24 +456,10 @@ PY
     --output json >"$uefi_response"
 done
 test "$provisioning_state" = Succeeded
-python3 - "$uefi_request" "$uefi_response" "$image_version_id" <<'PY'
-import json
-import sys
-
-request = json.load(open(sys.argv[1], encoding="utf-8"))
-response = json.load(open(sys.argv[2], encoding="utf-8"))
-if response.get("id", "").lower() != sys.argv[3].lower():
-    raise SystemExit("Azure returned a different gallery image-version identity")
-expected = request["properties"]["securityProfile"]["uefiSettings"]
-actual = response.get("properties", {}).get("securityProfile", {}).get("uefiSettings")
-if actual is not None and actual != expected:
-    raise SystemExit("Azure returned different custom UEFI settings after provisioning")
-if actual is None:
-    print("Azure omitted custom UEFI settings from the final GET; boot validation remains authoritative")
-state = response.get("properties", {}).get("provisioningState")
-if state != "Succeeded":
-    raise SystemExit(f"gallery image-version provisioning did not succeed: {state!r}")
-PY
+"$release_tool" check-gallery-final \
+  --request "$uefi_request" \
+  --response "$uefi_response" \
+  --image-version-id "$image_version_id"
 [[ "$image_version_id" == /subscriptions/* ]]
 
 ssh-keygen -q -t ed25519 -N '' -C miz-azure-acceptance -f "$private_key"
@@ -597,20 +491,9 @@ az vm get-instance-view \
   --name "$vm_name" \
   --query securityProfile \
   --output json >"$instance_security_json"
-python3 - "$vm_security_json" "$instance_security_json" <<'PY'
-import json
-import sys
-
-for path in sys.argv[1:]:
-    profile = json.load(open(path, encoding="utf-8"))
-    if profile.get("securityType") != "TrustedLaunch":
-        raise SystemExit(f"{path}: VM is not Trusted Launch")
-    settings = profile.get("uefiSettings") or {}
-    if settings.get("secureBootEnabled") is not True:
-        raise SystemExit(f"{path}: Secure Boot is not enabled")
-    if settings.get("vTpmEnabled") is not True:
-        raise SystemExit(f"{path}: vTPM is not enabled")
-PY
+"$release_tool" check-vm-security \
+  --profile "$vm_security_json" \
+  --profile "$instance_security_json"
 public_ip=$(az vm show \
   --resource-group "$resource_group" \
   --name "$vm_name" \
@@ -718,35 +601,9 @@ GUEST
 uefi_db="$RESULT_DIR/uefi-db.bin"
 ssh "${ssh_options[@]}" "$ssh_target" \
   "sudo -n /usr/bin/cat /sys/firmware/efi/efivars/db-*" >"$uefi_db"
-python3 - "$uefi_db" "$certificate_sha256" <<'PY'
-import hashlib
-import struct
-import sys
-
-data = open(sys.argv[1], "rb").read()
-expected = sys.argv[2]
-efi_cert_x509_guid = bytes.fromhex("a159c0a5e494a74a87b5ab155c2bf072")
-offset = 4
-found = False
-while offset < len(data):
-    if len(data) - offset < 28:
-        raise SystemExit("truncated EFI signature list")
-    list_size, header_size, signature_size = struct.unpack_from("<III", data, offset + 16)
-    is_x509 = data[offset : offset + 16] == efi_cert_x509_guid
-    if list_size < 28 or signature_size <= 16:
-        raise SystemExit("invalid EFI signature list")
-    end = offset + list_size
-    signatures = offset + 28 + header_size
-    if end > len(data) or signatures > end or (end - signatures) % signature_size:
-        raise SystemExit("invalid EFI signature-list bounds")
-    while signatures < end:
-        certificate = data[signatures + 16 : signatures + signature_size]
-        found |= is_x509 and hashlib.sha256(certificate).hexdigest() == expected
-        signatures += signature_size
-    offset = end
-if not found:
-    raise SystemExit("release signing certificate is absent from UEFI db")
-PY
+"$release_tool" check-uefi-db \
+  --db "$uefi_db" \
+  --certificate-sha256 "$certificate_sha256"
 ssh "${ssh_options[@]}" "$ssh_target" \
   "/usr/bin/bash -s -- '$FLAVOR'" <<'GUEST'
 set -euo pipefail
@@ -920,7 +777,7 @@ else
   echo "::warning::Azure managed boot diagnostics did not return a serial log"
 fi
 
-python3 scripts/azurelinux4_release.py azure-result \
+"$release_tool" azure-result \
   --manifest "$manifest" \
   --asset "$asset" \
   --vhd "$vhd" \

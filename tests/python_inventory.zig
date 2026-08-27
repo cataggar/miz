@@ -70,15 +70,9 @@ const guard_path = "tests/python_inventory.zig";
 /// Sorted by path. Keep it sorted: review reads this as a checklist.
 const inventory = [_]Entry{
     .{
-        .path = ".github/workflows/azurelinux4-release.yml",
-        .kind = .execution,
-        .sites = 3,
-        .note = "inline Python plus azurelinux4_release.py",
-    },
-    .{
         .path = ".github/workflows/ci.yml",
         .kind = .execution,
-        .sites = 3,
+        .sites = 2,
         .note = "unittest invocations for the remaining Python test suites",
     },
     .{
@@ -141,23 +135,6 @@ const inventory = [_]Entry{
         .note = "superseded by scripts/azure_vhd.zig; callers still run the Python",
     },
     .{
-        .path = "scripts/azurelinux4_azure_acceptance.sh",
-        .kind = .execution,
-        .sites = 14,
-        .note = "inline Python and azurelinux4_release.py",
-    },
-    .{
-        .path = "scripts/azurelinux4_publish.sh",
-        .kind = .execution,
-        .sites = 8,
-        .note = "inline Python and azurelinux4_release.py",
-    },
-    .{
-        .path = "scripts/azurelinux4_release.py",
-        .kind = .source,
-        .note = "ported by the Azure Linux release slice",
-    },
-    .{
         .path = "scripts/freebsd15_azure_acceptance.sh",
         .kind = .execution,
         .sites = 15,
@@ -214,11 +191,6 @@ const inventory = [_]Entry{
         .note = "ported by the Ubuntu release slice",
     },
     .{
-        .path = "tests/azurelinux4_release_test.py",
-        .kind = .source,
-        .note = "ported by the Azure Linux release slice",
-    },
-    .{
         .path = "tests/freebsd15_azure_acceptance_test.py",
         .kind = .source,
         .note = "ported by the FreeBSD release slice",
@@ -268,8 +240,8 @@ const inventory = [_]Entry{
 
 /// Totals restated so a diff shows the migration moving. Both must only ever
 /// decrease; an increase means a new Python dependency was introduced.
-const remaining_source_files = 15;
-const remaining_execution_sites = 113;
+const remaining_source_files = 13;
+const remaining_execution_sites = 87;
 
 /// No tracked file is anywhere near this size, and the limit keeps a stray
 /// large blob from being read into memory by this scan.
