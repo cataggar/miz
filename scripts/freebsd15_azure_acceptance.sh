@@ -13,6 +13,18 @@ fi
 [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
 [[ "$CANDIDATE_KEY" =~ ^(x86_64|aarch64)-(ufs|zfs)-(full|core)$ ]]
 
+# The ported release tooling. Cleanup runs before the run-mode configuration is
+# checked, so the binaries are resolved here and refused if absent.
+release_tool=${MIZ_FREEBSD15_RELEASE_TOOL:-zig-out/bin/freebsd15_release}
+azure_metadata_tool=${MIZ_FREEBSD15_AZURE_METADATA_TOOL:-zig-out/bin/freebsd15_azure_metadata}
+azure_vhd_tool=${MIZ_AZURE_VHD_TOOL:-zig-out/bin/azure_vhd}
+for required_tool in "$release_tool" "$azure_metadata_tool" "$azure_vhd_tool"; do
+  [[ -x "$required_tool" ]] || {
+    echo "::error::Required Azure acceptance tool $required_tool is unavailable"
+    exit 1
+  }
+done
+
 cleanup_group() {
   [[ -s "$STATE_FILE" ]] || return 0
   command -v az >/dev/null || {
@@ -44,20 +56,8 @@ cleanup_group() {
     echo "::error::Could not inspect temporary resource-group ownership"
     return 1
   fi
-  if ! python3 - "$metadata_file" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CANDIDATE_KEY" <<'PY'
-import json
-import sys
-
-tags = json.load(open(sys.argv[1], encoding="utf-8")).get("tags") or {}
-expected = {
-    "miz-owner": "freebsd15-release",
-    "miz-run-id": sys.argv[2],
-    "miz-run-attempt": sys.argv[3],
-    "miz-candidate": sys.argv[4],
-}
-if tags != expected:
-    raise SystemExit(f"refusing to delete resource group with non-exact ownership tags: {tags!r}")
-PY
+  if ! "$azure_metadata_tool" group-tags \
+    "$metadata_file" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CANDIDATE_KEY"
   then
     return 1
   fi
@@ -121,7 +121,7 @@ report_error() {
 }
 trap 'report_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
-for tool in az azcopy curl date python3 qemu-img sha256sum ssh ssh-keygen; do
+for tool in az azcopy curl date qemu-img sha256sum ssh ssh-keygen; do
   command -v "$tool" >/dev/null || {
     echo "::error::Required Azure acceptance tool $tool is unavailable"
     exit 1
@@ -232,13 +232,7 @@ grant_disk_write_access() {
     return 1
   fi
   if ! sas=$(
-      python3 - "$response_body" <<'PY'
-import json
-import sys
-
-response = json.load(open(sys.argv[1], encoding="utf-8"))
-print(response.get("accessSAS") or response.get("accessSas") or "")
-PY
+      "$azure_metadata_tool" disk-access-sas "$response_body"
     )
   then
     echo "::error::Azure disk access response was not valid JSON" >&2
@@ -258,100 +252,17 @@ manifest="$CANDIDATE_DIR/candidate.json"
 asset="$CANDIDATE_DIR/$ASSET_NAME"
 
 validate_candidate_binding() {
-  python3 - "$manifest" "$asset" "$CANDIDATE_KEY" "$SOURCE_COMMIT" \
-    "$ARCHITECTURE" "$FILESYSTEM" "$FLAVOR" "$ASSET_NAME" \
-    "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" scripts/freebsd15_release.py <<'PY'
-import importlib.util
-import sys
-from pathlib import Path
-
-(
-    manifest_path,
-    asset_path,
-    key,
-    source_commit,
-    architecture,
-    filesystem,
-    flavor,
-    asset_name,
-    run_id,
-    run_attempt,
-    helper_path,
-) = sys.argv[1:]
-
-helper = Path(helper_path).resolve(strict=True)
-spec = importlib.util.spec_from_file_location("freebsd15_release", helper)
-if spec is None or spec.loader is None:
-    raise SystemExit("could not load canonical candidate validator")
-release = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(release)
-
-doc, canonical_asset = release.validate_candidate(
-    Path(manifest_path).resolve(strict=True),
-    source_commit,
-)
-requested_asset = Path(asset_path).resolve(strict=True)
-if requested_asset != canonical_asset.resolve():
-    raise SystemExit("candidate asset path does not match manifest")
-if requested_asset.name != asset_name or doc.get("asset_name") != asset_name:
-    raise SystemExit("candidate asset name mismatch")
-if doc.get("variant") != key:
-    raise SystemExit(f"candidate variant mismatch: expected {key}")
-if doc.get("architecture") != architecture:
-    raise SystemExit("candidate architecture mismatch")
-if doc.get("filesystem") != filesystem:
-    raise SystemExit("candidate filesystem mismatch")
-if doc.get("flavor") != flavor:
-    raise SystemExit("candidate flavor mismatch")
-if (filesystem, flavor) not in {
-    ("ufs", "full"),
-    ("ufs", "core"),
-    ("zfs", "full"),
-    ("zfs", "core"),
-}:
-    raise SystemExit("unsupported candidate filesystem/flavor combination")
-if not isinstance(doc.get("compressed_size"), int) or doc["compressed_size"] <= 0:
-    raise SystemExit("candidate compressed size is missing or invalid")
-if not isinstance(doc.get("allocated_size"), int) or doc["allocated_size"] <= 0:
-    raise SystemExit("candidate allocated size is missing or invalid")
-if not isinstance(doc.get("virtual_size"), int) or doc["virtual_size"] <= 0:
-    raise SystemExit("candidate virtual size is missing or invalid")
-source = doc.get("source")
-if not isinstance(source, dict):
-    raise SystemExit("candidate source metadata is missing")
-if not isinstance(source.get("bytes"), int) or source["bytes"] <= 0:
-    raise SystemExit("candidate source size is missing or invalid")
-packages = doc.get("packages")
-if not isinstance(packages, dict):
-    raise SystemExit("candidate package manifest is missing")
-if not isinstance(packages.get("installed_bytes"), int) or packages["installed_bytes"] <= 0:
-    raise SystemExit("candidate package installed size is missing or invalid")
-package_manifest_path = Path(f"{requested_asset}.packages.txt").resolve(strict=True)
-installed_packages = release.parse_package_manifest(package_manifest_path)
-release.verify_package_manifest(filesystem, flavor, installed_packages)
-if [package["name"] for package in installed_packages] != packages.get("names"):
-    raise SystemExit("candidate package manifest content does not match")
-if len(installed_packages) != packages.get("count"):
-    raise SystemExit("candidate package manifest count does not match")
-if sum(package["installed_bytes"] for package in installed_packages) != packages["installed_bytes"]:
-    raise SystemExit("candidate package manifest installed size does not match")
-validation = doc.get("validation")
-if not isinstance(validation, dict):
-    raise SystemExit("candidate validation metadata is missing")
-for field in ("qemu_version", "runner", "run_id", "run_attempt"):
-    value = validation.get(field)
-    if not isinstance(value, str) or not value.strip():
-        raise SystemExit(f"candidate validation metadata is missing {field}")
-if validation["runner"] != release.VARIANTS[key]["runner"]:
-    raise SystemExit("candidate validation runner does not match profile")
-if validation["run_id"] != run_id or validation["run_attempt"] != run_attempt:
-    raise SystemExit("candidate validation workflow identity mismatch")
-print(doc["asset_sha256"])
-print(doc["compressed_size"])
-print(doc["allocated_size"])
-print(doc["virtual_size"])
-print(doc["architecture"])
-PY
+  "$release_tool" candidate-binding \
+    --manifest "$manifest" \
+    --asset "$asset" \
+    --key "$CANDIDATE_KEY" \
+    --source-commit "$SOURCE_COMMIT" \
+    --architecture "$ARCHITECTURE" \
+    --filesystem "$FILESYSTEM" \
+    --flavor "$FLAVOR" \
+    --asset-name "$ASSET_NAME" \
+    --run-id "$GITHUB_RUN_ID" \
+    --run-attempt "$GITHUB_RUN_ATTEMPT"
 }
 
 # Canonically validate every candidate field before creating Azure resources.
@@ -424,59 +335,7 @@ mkdir -p "$(dirname -- "$STATE_FILE")"
 rm -f -- "$STATE_FILE" "${STATE_FILE}.group.json" "$vhd" "$private_key" "$private_key.pub"
 
 normalize_serial_console_response() {
-  python3 - "$1" "$2" <<'PY'
-import json
-import sys
-import xml.etree.ElementTree as ET
-from pathlib import Path
-
-raw_path, output_path = map(Path, sys.argv[1:])
-raw = raw_path.read_bytes()
-output_path.unlink(missing_ok=True)
-
-try:
-    decoded = raw.decode("utf-8")
-except UnicodeDecodeError:
-    decoded = None
-
-candidate = raw
-if decoded is not None:
-    try:
-        document = json.loads(decoded)
-    except json.JSONDecodeError:
-        pass
-    else:
-        if not isinstance(document, str):
-            raise SystemExit(12)
-        candidate = document.encode("utf-8")
-
-if not candidate.strip():
-    raise SystemExit(11)
-
-text = candidate.decode("utf-8", errors="replace")
-stripped = text.lstrip()
-if stripped.startswith("<"):
-    try:
-        root = ET.fromstring(stripped)
-    except ET.ParseError:
-        if stripped.startswith(("<?xml", "<Error", "<error")):
-            raise SystemExit(12)
-    else:
-        if root.tag.rsplit("}", 1)[-1].casefold() == "error":
-            code = next(
-                (
-                    (element.text or "").strip()
-                    for element in root
-                    if element.tag.rsplit("}", 1)[-1].casefold() == "code"
-                ),
-                "",
-            )
-            if code.casefold() == "blobnotfound":
-                raise SystemExit(10)
-            raise SystemExit(12)
-
-output_path.write_bytes(candidate)
-PY
+  "$azure_metadata_tool" serial-console "$1" "$2"
 }
 
 collect_failure_boot_log() {
@@ -614,35 +473,12 @@ resolve_azure_location_display_name() {
     echo "::error::Could not query Azure location metadata" >&2
     return 1
   fi
-  python3 - "$locations_path" "$expected_location" <<'PY'
-import json
-import sys
-
-path, expected = sys.argv[1:]
-locations = json.load(open(path, encoding="utf-8"))
-if not isinstance(locations, list):
-    raise SystemExit("Azure location metadata is not a list")
-matches = [
-    location
-    for location in locations
-    if isinstance(location, dict)
-    and isinstance(location.get("name"), str)
-    and location["name"].casefold() == expected.casefold()
-]
-if len(matches) != 1:
-    raise SystemExit(
-        f"Azure location metadata contains {len(matches)} exact canonical "
-        f"matches for {expected!r}"
-    )
-display_name = matches[0].get("displayName")
-if not isinstance(display_name, str) or not display_name:
-    raise SystemExit(f"Azure location {expected!r} has no display name")
-print(display_name)
-PY
+  "$azure_metadata_tool" location-display-name \
+    "$locations_path" "$expected_location"
 }
 
 validate_gallery_image_version_metadata() {
-  python3 scripts/freebsd15_azure_metadata.py gallery-image-version "$@"
+  "$azure_metadata_tool" gallery-image-version "$@"
 }
 
 replication_epoch_seconds() {
@@ -683,41 +519,7 @@ wait_for_managed_boot_diagnostics() {
       --output json >"$vm_json" 2>"$vm_show_stderr"
     then
       if ! observation=$(
-        python3 - "$vm_json" <<'PY'
-import json
-import sys
-
-document = json.load(open(sys.argv[1], encoding="utf-8"))
-if not isinstance(document, dict):
-    raise SystemExit("VM metadata is not an object")
-profile = document.get("diagnosticsProfile")
-if profile is None:
-    print("pending: diagnosticsProfile is absent or null")
-    raise SystemExit(0)
-if not isinstance(profile, dict):
-    raise SystemExit("VM diagnosticsProfile is not an object")
-boot = profile.get("bootDiagnostics")
-if boot is None:
-    print("pending: bootDiagnostics is absent or null")
-    raise SystemExit(0)
-if not isinstance(boot, dict):
-    raise SystemExit("VM bootDiagnostics is not an object")
-storage_uri = boot.get("storageUri")
-if storage_uri is not None:
-    raise SystemExit(
-        "managed boot diagnostics storageUri must be absent or null, "
-        f"not {storage_uri!r}"
-    )
-enabled = boot.get("enabled")
-if enabled is True:
-    print("ready")
-elif enabled in (None, False):
-    print(f"pending: bootDiagnostics.enabled is {enabled!r}")
-else:
-    raise SystemExit(
-        f"VM bootDiagnostics.enabled has invalid value {enabled!r}"
-    )
-PY
+        "$azure_metadata_tool" boot-diagnostics "$vm_json"
       )
       then
         echo "::error::Azure returned invalid managed boot diagnostics metadata;" \
@@ -807,73 +609,9 @@ wait_for_image_version_replication() {
     fi
 
     if ! observation=$(
-      python3 - "$image_replication_json" "$AZURE_LOCATION" \
-        "$azure_location_display_name" <<'PY'
-import json
-import sys
-
-path, expected_region, expected_region_display_name = sys.argv[1:]
-document = json.load(open(path, encoding="utf-8"))
-replication = document.get("replicationStatus")
-if not isinstance(replication, dict):
-    raise SystemExit("image version replicationStatus is missing")
-summary = replication.get("summary")
-if not isinstance(summary, list):
-    raise SystemExit("image version regional replication summary is missing")
-
-
-def same_region(value):
-    return isinstance(value, str) and value.casefold() in (
-        expected_region.casefold(),
-        expected_region_display_name.casefold(),
-    )
-
-
-matches = [
-    entry
-    for entry in summary
-    if isinstance(entry, dict) and same_region(entry.get("region"))
-]
-if not matches:
-    reported = [
-        entry.get("region")
-        for entry in summary
-        if isinstance(entry, dict) and isinstance(entry.get("region"), str)
-    ]
-    raise SystemExit(
-        f"replication status does not include target region {expected_region!r}; "
-        f"reported regions: {reported!r}"
-    )
-if len(matches) != 1:
-    raise SystemExit(
-        f"replication status includes target region {expected_region!r} "
-        f"{len(matches)} times"
-    )
-
-target = matches[0]
-state = target.get("state")
-if not isinstance(state, str) or not state:
-    raise SystemExit("target region replication state is missing")
-aggregate = replication.get("aggregatedState")
-if aggregate is not None and not isinstance(aggregate, str):
-    raise SystemExit("aggregated replication state is invalid")
-
-
-def compact(value):
-    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
-
-
-print(
-    "\x1f".join(
-        (
-            state,
-            aggregate or "",
-            compact(target.get("progress")),
-            compact(target.get("details")),
-        )
-    )
-)
-PY
+      "$azure_metadata_tool" replication-status \
+        "$image_replication_json" "$AZURE_LOCATION" \
+        "$azure_location_display_name"
     )
     then
       echo "::error::Azure returned invalid regional image replication status;" \
@@ -935,7 +673,7 @@ test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
 # Structural VHD inspection
 qemu-img info -f vpc --output=json "$vhd" >"$RESULT_DIR/vhd-info.json"
 readarray -t vhd_geometry < <(
-  python3 scripts/azure_vhd.py verify \
+  "$azure_vhd_tool" verify \
     --info "$RESULT_DIR/vhd-info.json" \
     --vhd "$vhd"
 )
@@ -989,27 +727,8 @@ az vm list-skus \
   --size "$AZURE_VM_SIZE" \
   --all \
   --output json >"$sku_json"
-python3 - "$sku_json" "$AZURE_VM_SIZE" "$expected_azure_architecture" <<'PY'
-import json
-import sys
-
-matches = [item for item in json.load(open(sys.argv[1], encoding="utf-8")) if item["name"] == sys.argv[2]]
-if len(matches) != 1:
-    raise SystemExit("configured Azure VM SKU is absent or ambiguous in the configured location")
-sku = matches[0]
-location_restrictions = [
-    restriction
-    for restriction in sku.get("restrictions", [])
-    if restriction.get("type") == "Location"
-]
-if location_restrictions:
-    raise SystemExit(f"configured Azure VM SKU is location-restricted: {location_restrictions!r}")
-capabilities = {item["name"]: item["value"] for item in sku.get("capabilities", [])}
-if capabilities.get("CpuArchitectureType") != sys.argv[3]:
-    raise SystemExit(f"SKU architecture mismatch: {capabilities.get('CpuArchitectureType')!r}")
-if "V2" not in capabilities.get("HyperVGenerations", "").split(","):
-    raise SystemExit("configured Azure VM SKU does not support Gen2")
-PY
+"$azure_metadata_tool" vm-sku \
+  "$sku_json" "$AZURE_VM_SIZE" "$expected_azure_architecture"
 
 # Upload VHD to managed disk
 az disk create \
@@ -1057,7 +776,7 @@ az disk show \
   --name "$disk_name" \
   --output json >"$disk_json"
 disk_id=$(
-  python3 scripts/freebsd15_azure_metadata.py managed-disk \
+  "$azure_metadata_tool" managed-disk \
     "$disk_json" "$expected_disk_id" "$disk_name" "$resource_group" \
     "$AZURE_LOCATION" "$azure_image_architecture" "$expanded_size_gib"
 )
@@ -1077,7 +796,7 @@ az sig show \
   --output json >"$gallery_json"
 expected_gallery_id="/subscriptions/$subscription_id/resourceGroups/$resource_group"
 expected_gallery_id+="/providers/Microsoft.Compute/galleries/$gallery_name"
-python3 scripts/freebsd15_azure_metadata.py gallery \
+"$azure_metadata_tool" gallery \
   "$gallery_json" "$expected_gallery_id" "$gallery_name" \
   "$resource_group" "$AZURE_LOCATION"
 
@@ -1100,61 +819,11 @@ az sig image-definition show \
   --gallery-image-definition "$image_definition_name" \
   --output json >"$image_definition_json"
 expected_image_definition_id="$expected_gallery_id/images/$image_definition_name"
-python3 - "$image_definition_json" "$expected_image_definition_id" \
+"$azure_metadata_tool" gallery-image-definition \
+  "$image_definition_json" "$expected_image_definition_id" \
   "$image_definition_name" "$resource_group" "$AZURE_LOCATION" \
   "$azure_image_architecture" "$image_publisher" "$image_offer" \
-  "$image_sku" <<'PY'
-import json
-import sys
-
-(
-    path,
-    expected_id,
-    expected_name,
-    expected_group,
-    expected_location,
-    expected_architecture,
-    expected_publisher,
-    expected_offer,
-    expected_sku,
-) = sys.argv[1:]
-document = json.load(open(path, encoding="utf-8"))
-
-
-def same(left, right):
-    return isinstance(left, str) and left.casefold() == right.casefold()
-
-
-if not same(document.get("id"), expected_id):
-    raise SystemExit("Azure returned a different gallery image-definition identity")
-if document.get("name") != expected_name:
-    raise SystemExit("Azure returned a different gallery image-definition name")
-resource_group = document.get("resourceGroup")
-if resource_group not in (None, "") and not same(resource_group, expected_group):
-    raise SystemExit("image definition is outside the owned temporary resource group")
-if not same(document.get("location"), expected_location):
-    raise SystemExit("gallery image-definition location mismatch")
-if not same(document.get("type"), "Microsoft.Compute/galleries/images"):
-    raise SystemExit("Azure returned a non-gallery-image-definition resource")
-if document.get("provisioningState") != "Succeeded":
-    raise SystemExit("gallery image-definition provisioning did not succeed")
-if document.get("architecture") != expected_architecture:
-    raise SystemExit("gallery image-definition architecture mismatch")
-if document.get("hyperVGeneration") != "V2":
-    raise SystemExit("gallery image definition is not Gen2")
-if document.get("osType") != "Linux":
-    raise SystemExit("gallery image-definition OS type mismatch")
-if document.get("osState") != "Generalized":
-    raise SystemExit("gallery image definition is not generalized")
-identifier = document.get("identifier")
-expected_identifier = {
-    "publisher": expected_publisher,
-    "offer": expected_offer,
-    "sku": expected_sku,
-}
-if identifier != expected_identifier:
-    raise SystemExit("gallery image-definition identifier mismatch")
-PY
+  "$image_sku"
 
 # Azure CLI names its managed-disk source option --os-snapshot.
 image_version_id="$expected_image_definition_id/versions/$image_version"
@@ -1236,7 +905,7 @@ wait_for_managed_boot_diagnostics \
 expected_vm_id="/subscriptions/$subscription_id/resourceGroups/$resource_group"
 expected_vm_id+="/providers/Microsoft.Compute/virtualMachines/$vm_name"
 vm_id=$(
-  python3 scripts/freebsd15_azure_metadata.py vm \
+  "$azure_metadata_tool" vm \
     "$vm_json" "$expected_vm_id" "$vm_name" "$resource_group" \
     "$AZURE_LOCATION" "$AZURE_VM_SIZE" "$image_version_id" "$admin_username" \
     "$azure_image_architecture" "$expanded_size_gib"
@@ -1811,7 +1480,7 @@ case "$FILESYSTEM" in
 esac
 contracts="$shared_contracts_before_storage,$filesystem_contracts,$shared_contracts_after_storage"
 
-python3 scripts/freebsd15_release.py azure-result \
+"$release_tool" azure-result \
   --manifest "$manifest" \
   --asset "$asset" \
   --key "$CANDIDATE_KEY" \

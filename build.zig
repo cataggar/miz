@@ -921,6 +921,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "miz", .module = host_miz_mod },
+            .{ .name = "release", .module = release_support_mod },
         },
     });
     const azure_vhd_exe = b.addExecutable(.{
@@ -1075,6 +1076,143 @@ pub fn build(b: *std.Build) void {
     ubuntu2604_image_benchmark_workflow_test_step.dependOn(
         &run_ubuntu2604_image_benchmark_workflow_tests.step,
     );
+
+    // ---- scripts/freebsd15: the FreeBSD 15.1 release contract tables and the
+    // validation the release workflow, the staging script, the publisher, and
+    // the Azure acceptance harness all run. Replaces
+    // scripts/freebsd15_release.py and scripts/freebsd15_azure_metadata.py. ----
+    const freebsd15_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/freebsd15/root.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "release", .module = release_support_mod },
+        },
+    });
+    const freebsd15_release_exe = b.addExecutable(.{
+        .name = "freebsd15_release",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/freebsd15_release.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "freebsd15", .module = freebsd15_mod },
+            },
+        }),
+    });
+    b.installArtifact(freebsd15_release_exe);
+    const freebsd15_azure_metadata_exe = b.addExecutable(.{
+        .name = "freebsd15_azure_metadata",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/freebsd15_azure_metadata.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "freebsd15", .module = freebsd15_mod },
+            },
+        }),
+    });
+    b.installArtifact(freebsd15_azure_metadata_exe);
+    // The release jobs need only these two tools, and neither reaches the miz
+    // library, so a dedicated step builds them without the image toolchain.
+    const freebsd15_tools_step = b.step(
+        "freebsd15-release-tools",
+        "Build the FreeBSD 15.1 release and Azure metadata tools",
+    );
+    freebsd15_tools_step.dependOn(
+        &b.addInstallArtifact(freebsd15_release_exe, .{}).step,
+    );
+    freebsd15_tools_step.dependOn(
+        &b.addInstallArtifact(freebsd15_azure_metadata_exe, .{}).step,
+    );
+    const freebsd15_release_tests = b.addTest(.{ .root_module = freebsd15_mod });
+    const run_freebsd15_release_tests = b.addRunArtifact(freebsd15_release_tests);
+    const freebsd15_release_test_step = b.step(
+        "test-freebsd15-release",
+        "Run FreeBSD 15.1 release tooling unit tests",
+    );
+    freebsd15_release_test_step.dependOn(&run_freebsd15_release_tests.step);
+
+    // ---- tests/freebsd15_release.zig and tests/freebsd15_acceptance.zig: the
+    // release contract and the acceptance harness read the tracked tree -- the
+    // workflow, the shell scripts, and the Zig builder profiles -- so their
+    // results are never cacheable and the build root is named outright. ----
+    const freebsd15_test_support_mod = b.createModule(.{
+        .root_source_file = b.path("tests/freebsd15_support.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "freebsd15", .module = freebsd15_mod },
+        },
+    });
+    const freebsd15_contract_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/freebsd15_release.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "freebsd15", .module = freebsd15_mod },
+                .{ .name = "support", .module = freebsd15_test_support_mod },
+            },
+        }),
+    });
+    const run_freebsd15_contract_tests = b.addRunArtifact(freebsd15_contract_tests);
+    run_freebsd15_contract_tests.has_side_effects = true;
+    run_freebsd15_contract_tests.setEnvironmentVariable(
+        "MIZ_FREEBSD15_ROOT",
+        b.build_root.path orelse ".",
+    );
+    const freebsd15_contract_test_step = b.step(
+        "test-freebsd15-release-contract",
+        "Check the FreeBSD 15.1 release workflow and script contracts",
+    );
+    freebsd15_contract_test_step.dependOn(&run_freebsd15_contract_tests.step);
+
+    const freebsd15_acceptance_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/freebsd15_acceptance.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "freebsd15", .module = freebsd15_mod },
+                .{ .name = "support", .module = freebsd15_test_support_mod },
+            },
+        }),
+    });
+    const run_freebsd15_acceptance_tests = b.addRunArtifact(freebsd15_acceptance_tests);
+    run_freebsd15_acceptance_tests.has_side_effects = true;
+    run_freebsd15_acceptance_tests.setEnvironmentVariable(
+        "MIZ_FREEBSD15_ROOT",
+        b.build_root.path orelse ".",
+    );
+    // The harness tests drive the real tools the shell calls, so the binaries
+    // have to exist before they run.
+    run_freebsd15_acceptance_tests.setEnvironmentVariable(
+        "MIZ_FREEBSD15_AZURE_METADATA_TOOL",
+        b.getInstallPath(.bin, "freebsd15_azure_metadata"),
+    );
+    run_freebsd15_acceptance_tests.setEnvironmentVariable(
+        "MIZ_FREEBSD15_RELEASE_TOOL",
+        b.getInstallPath(.bin, "freebsd15_release"),
+    );
+    run_freebsd15_acceptance_tests.setEnvironmentVariable(
+        "MIZ_AZURE_VHD_TOOL",
+        b.getInstallPath(.bin, "azure_vhd"),
+    );
+    run_freebsd15_acceptance_tests.step.dependOn(
+        &b.addInstallArtifact(freebsd15_azure_metadata_exe, .{}).step,
+    );
+    run_freebsd15_acceptance_tests.step.dependOn(
+        &b.addInstallArtifact(freebsd15_release_exe, .{}).step,
+    );
+    run_freebsd15_acceptance_tests.step.dependOn(
+        &b.addInstallArtifact(azure_vhd_exe, .{}).step,
+    );
+    const freebsd15_acceptance_test_step = b.step(
+        "test-freebsd15-acceptance",
+        "Check the FreeBSD 15.1 Azure acceptance harness contracts",
+    );
+    freebsd15_acceptance_test_step.dependOn(&run_freebsd15_acceptance_tests.step);
 
     // ---- tests/python_inventory.zig: the temporary, explicit inventory of
     // the Python this repository still owns. It shells out to `git ls-files`
@@ -1817,6 +1955,9 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(
             &run_ubuntu2604_image_benchmark_workflow_tests.step,
         );
+        aggregate_test_step.dependOn(&run_freebsd15_release_tests.step);
+        aggregate_test_step.dependOn(&run_freebsd15_contract_tests.step);
+        aggregate_test_step.dependOn(&run_freebsd15_acceptance_tests.step);
         aggregate_test_step.dependOn(&run_python_inventory_tests.step);
         aggregate_test_step.dependOn(&run_nbd_mod_tests.step);
         aggregate_test_step.dependOn(&run_nbd_exe_tests.step);

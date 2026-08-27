@@ -19,8 +19,8 @@
 
 const std = @import("std");
 const miz = @import("miz");
-const release = @import("release/root.zig");
-const TempTree = @import("release/testing.zig").TempTree;
+const release = @import("release");
+const TempTree = release.testing.TempTree;
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -31,9 +31,10 @@ const json_document = release.json_document;
 const vhd = miz.vhd;
 
 /// Azure requires the virtual size of an uploaded VHD to be a whole number of
-/// MiB.
-pub const alignment: u64 = 1024 * 1024;
-pub const footer_bytes: usize = 512;
+/// MiB. Both constants are the release contract's, shared with the staging
+/// gate that re-checks the evidence this tool produces.
+pub const alignment: u64 = release.azure_vhd_layout.alignment;
+pub const footer_bytes: usize = release.azure_vhd_layout.footer_bytes;
 /// The largest disk the legacy CHS triple can address. At and above this size
 /// the geometry saturates, so it stops being a usable cross-check of the size.
 pub const max_chs_sectors: u64 = 65535 * 16 * 255;

@@ -13,6 +13,10 @@ pub const contract = @import("contract.zig");
 pub const file = @import("file.zig");
 pub const digest = @import("digest.zig");
 pub const json_document = @import("json_document.zig");
+pub const azure_vhd_layout = @import("azure_vhd_layout.zig");
+/// Test-only support. Exposed so a consumer that imports this module by name
+/// can reach `TempTree` without pulling the same file into a second module.
+pub const testing = @import("testing.zig");
 
 pub const Diagnostic = contract.Diagnostic;
 
@@ -21,4 +25,5 @@ test {
     _ = file;
     _ = digest;
     _ = json_document;
+    _ = azure_vhd_layout;
 }

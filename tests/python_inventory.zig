@@ -72,14 +72,8 @@ const inventory = [_]Entry{
     .{
         .path = ".github/workflows/ci.yml",
         .kind = .execution,
-        .sites = 2,
-        .note = "unittest invocations for the remaining Python test suites",
-    },
-    .{
-        .path = ".github/workflows/freebsd15-release.yml",
-        .kind = .execution,
-        .sites = 6,
-        .note = "matrix, describe, candidate, and inline Python",
+        .sites = 1,
+        .note = "the unittest invocation for the remaining Ubuntu suites",
     },
     .{
         .path = ".github/workflows/ubuntu2604-core-validation.yml",
@@ -92,12 +86,6 @@ const inventory = [_]Entry{
         .kind = .execution,
         .sites = 7,
         .note = "ubuntu2604_release.py and inline Python",
-    },
-    .{
-        .path = "doc/freebsd.md",
-        .kind = .documentation,
-        .sites = 1,
-        .note = "shows freebsd15_release.py compare",
     },
     .{
         .path = "packages/miz/src/customize.zig",
@@ -123,34 +111,6 @@ const inventory = [_]Entry{
         .note = "superseded by scripts/azure_vhd.zig; callers still run the Python",
     },
     .{
-        .path = "scripts/freebsd15_azure_acceptance.sh",
-        .kind = .execution,
-        .sites = 15,
-        .note = "inline Python, azure_vhd.py, and freebsd15_release.py",
-    },
-    .{
-        .path = "scripts/freebsd15_azure_metadata.py",
-        .kind = .source,
-        .note = "ported by the FreeBSD release slice",
-    },
-    .{
-        .path = "scripts/freebsd15_publish.sh",
-        .kind = .execution,
-        .sites = 6,
-        .note = "inline Python and freebsd15_release.py",
-    },
-    .{
-        .path = "scripts/freebsd15_release.py",
-        .kind = .source,
-        .note = "ported by the FreeBSD release slice",
-    },
-    .{
-        .path = "scripts/freebsd15_stage_release.sh",
-        .kind = .execution,
-        .sites = 5,
-        .note = "inline Python and freebsd15_release.py",
-    },
-    .{
         .path = "scripts/ubuntu2604_azure_acceptance.sh",
         .kind = .execution,
         .sites = 22,
@@ -172,16 +132,6 @@ const inventory = [_]Entry{
         .path = "scripts/ubuntu2604_release.py",
         .kind = .source,
         .note = "ported by the Ubuntu release slice",
-    },
-    .{
-        .path = "tests/freebsd15_azure_acceptance_test.py",
-        .kind = .source,
-        .note = "ported by the FreeBSD release slice",
-    },
-    .{
-        .path = "tests/freebsd15_release_test.py",
-        .kind = .source,
-        .note = "ported by the FreeBSD release slice",
     },
     .{
         .path = "tests/ubuntu2604_acceptance.zig",
@@ -213,8 +163,8 @@ const inventory = [_]Entry{
 
 /// Totals restated so a diff shows the migration moving. Both must only ever
 /// decrease; an increase means a new Python dependency was introduced.
-const remaining_source_files = 10;
-const remaining_execution_sites = 83;
+const remaining_source_files = 6;
+const remaining_execution_sites = 50;
 
 /// No tracked file is anywhere near this size, and the limit keeps a stray
 /// large blob from being read into memory by this scan.
