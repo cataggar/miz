@@ -34,7 +34,7 @@ jobs:
         run: zig fmt --check .
 
       - name: Stale brand guard
-        run: python3 -m unittest tests.stale_brand_test
+        run: zig build test-stale-brand --summary all
 
       - name: Azure Linux release workflow unit tests
         run: python3 -m unittest discover -s tests -p azurelinux4_release_test.py
