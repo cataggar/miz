@@ -250,6 +250,17 @@ miz/
     azure_vhd.zig              # fixed-VHD footer, geometry, and qemu-img
                               #   agreement checks for Azure uploads
                               #   (`zig build test-azure-vhd`)
+    azurelinux4_release.zig    # Azure Linux 4 release domain CLI: candidate,
+                              #   verify-candidate, verify-vhd, azure-result,
+                              #   stage, plus the Azure acceptance and
+                              #   publication contracts the release shell
+                              #   calls (`zig build install-azurelinux4-release`,
+                              #   `zig build test-azurelinux4-release`)
+    azurelinux4/               # its modules: contracts.zig (release matrix,
+                              #   identity, provenance, signer binding),
+                              #   commands.zig (transactional staging),
+                              #   azure.zig (SKU, gallery, UEFI db),
+                              #   publish.zig (release allowlists)
     release/                   # shared release-tooling foundation: failure
                               #   diagnostics, bounded reads, atomic output
                               #   staging, streaming SHA-256, and

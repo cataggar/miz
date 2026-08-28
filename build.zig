@@ -936,6 +936,68 @@ pub fn build(b: *std.Build) void {
     );
     azure_vhd_test_step.dependOn(&run_azure_vhd_tests.step);
 
+    // ---- scripts/azurelinux4_release.zig: the Azure Linux 4 release domain
+    // CLI. It replaces scripts/azurelinux4_release.py together with every
+    // inline Python block in the Azure Linux release workflow, the Azure
+    // acceptance harness, and the publisher, so the shell has one fail-closed
+    // tool to call instead of an interpreter. ----
+    const azurelinux4_release_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/azurelinux4_release.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "miz", .module = host_miz_mod },
+        },
+    });
+    const azurelinux4_release_exe = b.addExecutable(.{
+        .name = "azurelinux4_release",
+        .root_module = azurelinux4_release_mod,
+    });
+    ci_production_entrypoint_check.dependOn(&azurelinux4_release_exe.step);
+    const install_azurelinux4_release = b.addInstallArtifact(
+        azurelinux4_release_exe,
+        .{},
+    );
+    b.getInstallStep().dependOn(&install_azurelinux4_release.step);
+    const install_azurelinux4_release_step = b.step(
+        "install-azurelinux4-release",
+        "Install only the Azure Linux 4 release tool",
+    );
+    install_azurelinux4_release_step.dependOn(&install_azurelinux4_release.step);
+    const azurelinux4_release_tests = b.addTest(.{
+        .root_module = azurelinux4_release_mod,
+    });
+    const run_azurelinux4_release_tests = b.addRunArtifact(
+        azurelinux4_release_tests,
+    );
+
+    // ---- tests/azurelinux4_release_contract.zig: the workflow, shell, and
+    // documentation contracts of the Azure Linux 4 release, replacing the
+    // corresponding half of tests/azurelinux4_release_test.py. Its subject is
+    // the tracked tree, which the build graph does not model, so it is never
+    // cached and is told the build root outright. ----
+    const azurelinux4_contract_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/azurelinux4_release_contract.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_azurelinux4_contract_tests = b.addRunArtifact(
+        azurelinux4_contract_tests,
+    );
+    run_azurelinux4_contract_tests.has_side_effects = true;
+    run_azurelinux4_contract_tests.setEnvironmentVariable(
+        "MIZ_AZURELINUX4_CONTRACT_ROOT",
+        b.build_root.path orelse ".",
+    );
+    const azurelinux4_release_test_step = b.step(
+        "test-azurelinux4-release",
+        "Run Azure Linux 4 release tooling and workflow contract tests",
+    );
+    azurelinux4_release_test_step.dependOn(&run_azurelinux4_release_tests.step);
+    azurelinux4_release_test_step.dependOn(&run_azurelinux4_contract_tests.step);
+
     // ---- tests/python_inventory.zig: the temporary, explicit inventory of
     // the Python this repository still owns. It shells out to `git ls-files`
     // and reads the tracked tree, so its result is never cacheable. ----
@@ -1671,6 +1733,8 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(&run_freebsd_boot_tests.step);
         aggregate_test_step.dependOn(&run_release_support_tests.step);
         aggregate_test_step.dependOn(&run_azure_vhd_tests.step);
+        aggregate_test_step.dependOn(&run_azurelinux4_release_tests.step);
+        aggregate_test_step.dependOn(&run_azurelinux4_contract_tests.step);
         aggregate_test_step.dependOn(&run_python_inventory_tests.step);
         aggregate_test_step.dependOn(&run_nbd_mod_tests.step);
         aggregate_test_step.dependOn(&run_nbd_exe_tests.step);

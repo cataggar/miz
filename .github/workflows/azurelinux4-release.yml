@@ -164,6 +164,7 @@ jobs:
       BUNDLE_DIR: artifact-staging/candidates/${{ matrix.key }}
       SIGNING_PROBE_DIR: ${{ github.workspace }}/signing-probe-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/miz
+      AZURELINUX4_RELEASE: ${{ github.workspace }}/zig-out/bin/azurelinux4_release
       MIZ_AZURE_TENANT_ID: ${{ vars.MIZ_AZURE_TENANT_ID }}
       MIZ_AZURE_CLIENT_ID: ${{ vars.MIZ_AZURE_CLIENT_ID }}
       MIZ_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.MIZ_ARTIFACT_SIGNING_ENDPOINT }}
@@ -196,13 +197,14 @@ jobs:
           echo '%_dbpath /usr/lib/sysimage/rpm' | sudo tee /root/.rpmmacros >/dev/null
           test "$(sudo rpm --eval '%{_dbpath}')" = /usr/lib/sysimage/rpm
 
-      - name: Build built-in signer
+      - name: Build built-in signer and release tool
         run: |
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build install-miz
+          zig build install-miz install-azurelinux4-release
           test -x "$UKI_SIGN_COMMAND"
+          test -x "$AZURELINUX4_RELEASE"
 
       - name: Resolve protected signing certificate
         run: |
@@ -295,20 +297,9 @@ jobs:
           test -f "$asset"
           qemu-img check "$asset"
           qemu-img info --output=json "$asset" > "$BUNDLE_DIR/internal-provenance/qemu-img-info.json"
-          python3 - "$BUNDLE_DIR/internal-provenance/qemu-img-info.json" "$VIRTUAL_SIZE" <<'PY'
-          import json
-          import sys
-          info = json.load(open(sys.argv[1], encoding="utf-8"))
-          if info.get("format") != "qcow2":
-              raise SystemExit("candidate is not QCOW2")
-          if info.get("virtual-size") != int(sys.argv[2]):
-              raise SystemExit("candidate virtual size mismatch")
-          if info.get("backing-filename") or info.get("full-backing-filename"):
-              raise SystemExit("candidate has a backing file")
-          data = (info.get("format-specific") or {}).get("data") or {}
-          if data.get("compression-type") != "zstd":
-              raise SystemExit("candidate does not use zstd cluster compression")
-          PY
+          "$AZURELINUX4_RELEASE" check-candidate-info \
+            --info "$BUNDLE_DIR/internal-provenance/qemu-img-info.json" \
+            --virtual-size "$VIRTUAL_SIZE"
           digest=$(sha256sum "$asset" | awk '{print $1}')
           [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
 
@@ -329,7 +320,7 @@ jobs:
           test -d "$WORK_DIR/provenance"
           cp -a "$WORK_DIR/provenance/." "$BUNDLE_DIR/internal-provenance/"
           validated=$(<"$BUNDLE_DIR/internal-provenance/build-validated-digest")
-          python3 scripts/azurelinux4_release.py candidate \
+          "$AZURELINUX4_RELEASE" candidate \
             --key "$CANDIDATE_KEY" \
             --architecture "$ARCHITECTURE" \
             --flavor "$FLAVOR" \
@@ -342,7 +333,7 @@ jobs:
             --run-id "$RUN_ID_VALUE" \
             --run-attempt "$RUN_ATTEMPT_VALUE" \
             --output "$BUNDLE_DIR/candidate.json"
-          python3 scripts/azurelinux4_release.py verify-candidate \
+          "$AZURELINUX4_RELEASE" verify-candidate \
             --manifest "$BUNDLE_DIR/candidate.json" \
             --asset "$BUNDLE_DIR/$ASSET_NAME" \
             --key "$CANDIDATE_KEY" \
@@ -438,6 +429,7 @@ jobs:
       CANDIDATE_DIR: .release/azure/${{ matrix.key }}/candidate
       RESULT_DIR: artifact-staging/azure-results/${{ matrix.key }}
       STATE_FILE: .release/azure/${{ matrix.key }}/resource-group
+      AZURELINUX4_RELEASE: ${{ github.workspace }}/zig-out/bin/azurelinux4_release
       AZURE_LOCATION: ${{ vars[matrix.location_variable] }}
       AZURE_VM_SIZE: ${{ vars[matrix.size_variable] }}
     steps:
@@ -497,10 +489,19 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends openssh-client qemu-utils
-          for tool in az azcopy qemu-img ssh ssh-keygen python3; do
+          for tool in az azcopy qemu-img ssh ssh-keygen; do
             command -v "$tool" >/dev/null
           done
           az version --output json > /dev/null
+
+      - name: Build acceptance-harness release tool
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build --fetch --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build install-azurelinux4-release -Doptimize=ReleaseSafe
+          test -x "$AZURELINUX4_RELEASE"
 
       - name: Build accepted-source miz
         working-directory: release-source
@@ -600,6 +601,7 @@ jobs:
       STAGING_ROOT: .release/publication/staging
       REPOSITORY: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
+      AZURELINUX4_RELEASE: ${{ github.workspace }}/zig-out/bin/azurelinux4_release
       PREPARE_RESULT: ${{ needs.prepare.result }}
       BUILD_RESULT: ${{ needs.prepare.outputs.reuse_candidates == 'true' && 'success' || needs.build.result }}
       AZURE_RESULT: ${{ needs.azure_acceptance.result }}
@@ -609,6 +611,24 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.source_commit }}
           persist-credentials: false
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Build publication release tool
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build --fetch --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build install-azurelinux4-release -Doptimize=ReleaseSafe
+          test -x "$AZURELINUX4_RELEASE"
 
       - name: Download all build-validated candidates
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

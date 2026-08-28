@@ -8,12 +8,17 @@ if [[ -z ${CANDIDATES_DIR:-} || -z ${AZURE_RESULTS_DIR:-} ||
   echo "::error::Required publication configuration is incomplete"
   exit 1
 fi
-for tool in gh python3 sha256sum; do
+for tool in gh sha256sum; do
   command -v "$tool" >/dev/null || {
     echo "::error::Required publication tool $tool is unavailable"
     exit 1
   }
 done
+release_tool=${AZURELINUX4_RELEASE:-zig-out/bin/azurelinux4_release}
+[[ -x "$release_tool" ]] || {
+  echo "::error::Azure Linux release tool is unavailable: $release_tool"
+  exit 1
+}
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
 [[ "$RELEASE_TAG" == AzureLinux-4.0-20260814 ]]
 [[ "$REPOSITORY" == cataggar/miz ]]
@@ -27,7 +32,7 @@ release_file="$STAGING_ROOT/release.json"
 verify_dir="$STAGING_ROOT/remote"
 rm -rf -- "$assets_dir" "$verify_dir"
 
-python3 scripts/azurelinux4_release.py stage \
+"$release_tool" stage \
   --candidates "$CANDIDATES_DIR" \
   --azure-results "$AZURE_RESULTS_DIR" \
   --source-commit "$SOURCE_COMMIT" \
@@ -35,14 +40,8 @@ python3 scripts/azurelinux4_release.py stage \
   --output "$assets_dir" \
   --notes "$notes_file"
 
-python3 - "$assets_dir/publish-manifest.json" >"$expected_file" <<'PY'
-import json
-import sys
-
-document = json.load(open(sys.argv[1], encoding="utf-8"))
-for asset in document["assets"]:
-    print(f"{asset['asset_name']}\t{asset['sha256']}\t{asset['bytes']}")
-PY
+"$release_tool" publish-expected \
+  --manifest "$assets_dir/publish-manifest.json" >"$expected_file"
 test "$(wc -l <"$expected_file")" -eq 4
 
 release_mutated=false
@@ -59,18 +58,8 @@ trap keep_draft_on_failure EXIT
 trap 'exit 130' INT TERM
 
 gh api "repos/$REPOSITORY/git/matching-refs/tags/$RELEASE_TAG" --paginate >"$refs_file"
-readarray -t tag_object < <(python3 - "$refs_file" "$RELEASE_TAG" <<'PY'
-import json
-import sys
-
-expected = f"refs/tags/{sys.argv[2]}"
-matches = [item for item in json.load(open(sys.argv[1], encoding="utf-8")) if item["ref"] == expected]
-if len(matches) > 1:
-    raise SystemExit("duplicate exact tag refs")
-if matches:
-    print(matches[0]["object"]["type"])
-    print(matches[0]["object"]["sha"])
-PY
+readarray -t tag_object < <(
+  "$release_tool" tag-ref --refs "$refs_file" --tag "$RELEASE_TAG"
 )
 
 if ((${#tag_object[@]} == 0)); then
@@ -83,15 +72,9 @@ else
   for _ in {1..8}; do
     [[ "$object_type" == tag ]] || break
     gh api "repos/$REPOSITORY/git/tags/$object_sha" >"$STAGING_ROOT/tag-object.json"
-    readarray -t tag_object < <(python3 - "$STAGING_ROOT/tag-object.json" <<'PY'
-import json
-import sys
-
-obj = json.load(open(sys.argv[1], encoding="utf-8"))["object"]
-print(obj["type"])
-print(obj["sha"])
-PY
-)
+    readarray -t tag_object < <(
+      "$release_tool" tag-object --document "$STAGING_ROOT/tag-object.json"
+    )
     object_type=${tag_object[0]}
     object_sha=${tag_object[1]}
   done
@@ -135,66 +118,28 @@ while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
 done <"$expected_file"
 
 gh api "$release_api" >"$release_file"
-python3 - "$release_file" "$expected_file" >"$STAGING_ROOT/stale-asset-ids" <<'PY'
-import json
-import sys
-
-allowed = {line.split("\t", 1)[0] for line in open(sys.argv[2], encoding="utf-8")}
-for asset in json.load(open(sys.argv[1], encoding="utf-8"))["assets"]:
-    if asset["name"] not in allowed:
-        print(asset["id"])
-PY
+"$release_tool" release-stale-assets \
+  --release "$release_file" \
+  --expected "$expected_file" >"$STAGING_ROOT/stale-asset-ids"
 while read -r asset_id; do
   [[ "$asset_id" =~ ^[0-9]+$ ]]
   gh api --method DELETE "repos/$REPOSITORY/releases/assets/$asset_id"
 done <"$STAGING_ROOT/stale-asset-ids"
 
 gh api "$release_api" >"$release_file"
-python3 - "$release_file" "$expected_file" <<'PY'
-import json
-import sys
-
-release = json.load(open(sys.argv[1], encoding="utf-8"))
-expected = {}
-for line in open(sys.argv[2], encoding="utf-8"):
-    name, digest, size = line.rstrip("\n").split("\t")
-    expected[name] = (digest, int(size))
-actual = {asset["name"]: asset["size"] for asset in release["assets"]}
-if len(release["assets"]) != 4 or actual != {name: size for name, (_, size) in expected.items()}:
-    raise SystemExit(f"remote release asset allowlist/size mismatch: {actual!r}")
-if not release["draft"]:
-    raise SystemExit("release stopped being a draft before verification")
-PY
+"$release_tool" check-release-assets \
+  --release "$release_file" \
+  --expected "$expected_file" \
+  --state draft
 
 mkdir "$verify_dir"
 gh release download "$RELEASE_TAG" \
   --repo "$REPOSITORY" \
   --dir "$verify_dir" \
   --clobber
-python3 - "$verify_dir" "$expected_file" <<'PY'
-import hashlib
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-expected = {}
-for line in open(sys.argv[2], encoding="utf-8"):
-    name, digest, size = line.rstrip("\n").split("\t")
-    expected[name] = (digest, int(size))
-actual = {path.name for path in root.iterdir() if path.is_file()}
-if actual != set(expected):
-    raise SystemExit(f"downloaded release allowlist mismatch: {actual!r}")
-for name, (digest, size) in expected.items():
-    path = root / name
-    if path.stat().st_size != size:
-        raise SystemExit(f"{name}: downloaded size mismatch")
-    actual_digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            actual_digest.update(chunk)
-    if actual_digest.hexdigest() != digest:
-        raise SystemExit(f"{name}: downloaded digest mismatch")
-PY
+"$release_tool" check-downloads \
+  --directory "$verify_dir" \
+  --expected "$expected_file"
 
 gh release edit "$RELEASE_TAG" \
   --repo "$REPOSITORY" \
@@ -205,16 +150,10 @@ gh release edit "$RELEASE_TAG" \
   --notes-file "$notes_file" >/dev/null
 
 gh api "$release_api" >"$release_file"
-python3 - "$release_file" "$expected_file" <<'PY'
-import json
-import sys
-
-release = json.load(open(sys.argv[1], encoding="utf-8"))
-expected = {line.split("\t", 1)[0] for line in open(sys.argv[2], encoding="utf-8")}
-actual = {asset["name"] for asset in release["assets"]}
-if release["draft"] or len(release["assets"]) != 4 or actual != expected:
-    raise SystemExit("published release did not retain the exact final allowlist")
-PY
+"$release_tool" check-release-assets \
+  --release "$release_file" \
+  --expected "$expected_file" \
+  --state published
 
 {
   echo "### Azure Linux 4 release published"
