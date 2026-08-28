@@ -293,7 +293,7 @@ miz/
 
 ## CI
 
-`.github/workflows/ci.yml` runs the required formatting, Python workflow,
+`.github/workflows/ci.yml` runs the required formatting, workflow,
 build, and Zig checks on every pull request and push to `main`. The main suite
 uses `zig build test-ci`; it preserves the `zig build test` graph except for
 the VM-backend and privileged device-write and unsafe-chroot integrations,
@@ -319,13 +319,15 @@ distinct, and `test-ci` runs it too.
 
 ### Migrating off Python
 
-The release, acceptance, and fixture tooling is being moved from Python to
-Zig one area at a time. While that is in progress, `tests/python_inventory.zig`
-(`zig build test-python-inventory`, and part of `zig build test-ci`) is an
-explicit, reviewable inventory of what is left:
+The release, acceptance, and fixture tooling has moved from Python to Zig.
+Every repository-owned Python program and every host- or guest-side Python
+execution site is gone. `tests/python_inventory.zig`
+(`zig build test-python-inventory`, also part of `zig build test-ci`) is the
+permanent guard against either dependency returning:
 
-- every tracked `*.py` file, which is removed whole by its port; and
-- every *invocation site* in any other tracked file, with an exact count. An
+- no tracked `*.py` file may exist. The last one was deleted by its port, so a
+  tracked `*.py` file is now a regression that names the path and fails; and
+- no tracked file may execute Python. An
   invocation site is a word whose final path component is a lowercase
   `python`, `python3`, or `python3.12` and that is used as a command: spelled
   as an absolute or relative interpreter path, including a shebang, quoted in
@@ -336,19 +338,16 @@ explicit, reviewable inventory of what is left:
   capitalized mention is prose, so none of those count.
 
 Because only commands are counted, a doc comment explaining what a Zig module
-replaced never enters the inventory, and the list can only shrink as ports
-land. Each non-source entry says what its sites are: `.execution` runs Python
-here, `.documentation` shows a command to a reader, and `.reference` is an
-explicitly exempted compatibility string, such as an interpreter line in test
-data, that has the shape of a command but executes nothing.
+replaced never enters the guard. Explicitly exempted compatibility strings,
+such as interpreter lines in test data, are allowlisted with exact site counts;
+they have the shape of commands but execute nothing.
 
-The test fails when a Python file or an invocation site is added or removed
-without the inventory being updated, and names the file and line of anything
-unaccounted for, so each port has to shrink the list in the same change that
-lands it. `.tools/` is excluded because it holds provisioned toolchains this
-repository does not own, and the inventory excludes itself because its own
-fixtures are the command spellings it detects. When the last entry is gone,
-the inventory is replaced by a permanent zero-Python guard.
+The test fails when a Python file or unallowlisted invocation site is added and
+names the file and line at fault. It also fails when an allowlisted reference
+is added or removed without updating its exact count. `.tools/` is excluded
+because it holds provisioned toolchains this repository does not own, and the
+guard excludes itself because its fixtures are the command spellings it must
+detect.
 
 New Zig replacements build on `scripts/release/`, which carries the contracts
 every release script shares: a single-line failure diagnostic, digest and
