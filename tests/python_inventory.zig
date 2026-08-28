@@ -26,6 +26,10 @@
 //! command but executes nothing here. Only `.execution` blocks the zero-Python
 //! goal; `.reference` entries may outlive the migration.
 //!
+//! No `.execution` entry is left: nothing this repository owns runs Python any
+//! more, on the host or in a guest. What remains is one inert `.py` file with
+//! no caller, whose deletion finishes the migration.
+//!
 //! `.tools/` is excluded: it holds locally provisioned toolchains this
 //! repository does not own, and it is not tracked by Git in any case. This file
 //! is excluded from the invocation scan because its own fixtures are, by
@@ -92,18 +96,17 @@ const inventory = [_]Entry{
         .kind = .source,
         .note = "superseded by scripts/azure_vhd.zig; no caller runs the Python",
     },
-    .{
-        .path = "tests/ubuntu2604_acceptance.zig",
-        .kind = .execution,
-        .sites = 1,
-        .note = "guest-side script parses cloud-init status with python3",
-    },
 };
 
 /// Totals restated so a diff shows the migration moving. Both must only ever
 /// decrease; an increase means a new Python dependency was introduced.
+///
+/// Nothing in this repository executes Python any more: the execution count is
+/// zero and may never rise again. The one remaining source file is inert --
+/// it has no caller -- and its deletion is the last step of the migration,
+/// after which this inventory becomes a permanent zero-Python guard.
 const remaining_source_files = 1;
-const remaining_execution_sites = 1;
+const remaining_execution_sites = 0;
 
 /// No tracked file is anywhere near this size, and the limit keeps a stray
 /// large blob from being read into memory by this scan.
@@ -305,6 +308,18 @@ test "the inventory is sorted, unique, and internally consistent" {
     }
     try std.testing.expectEqual(remaining_source_files, sources);
     try std.testing.expectEqual(remaining_execution_sites, execution_sites);
+}
+
+test "nothing in this repository executes Python" {
+    // The migration's goal, stated as an assertion rather than as a count so
+    // it reads as the contract it is: no tracked file runs an interpreter, on
+    // the host or in a guest. Only `.reference` compatibility strings and the
+    // one inert `.source` file remain, and neither executes anything.
+    try std.testing.expectEqual(@as(usize, 0), remaining_execution_sites);
+    for (inventory) |entry| {
+        try std.testing.expect(entry.kind != .execution);
+        try std.testing.expect(entry.kind != .documentation);
+    }
 }
 
 test "every tracked Python file is inventoried as a source entry" {

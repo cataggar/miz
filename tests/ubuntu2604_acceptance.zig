@@ -2793,6 +2793,12 @@ fn readCoreSshdPid(
     return std.fmt.parseInt(i32, pid_text, 10) catch error.InvalidSshdPid;
 }
 
+/// The full-flavor service contract, run as one guest shell script.
+///
+/// It waits for cloud-init here but deliberately does not decide whether the
+/// run finished: the status document is fetched separately by
+/// `verifyGuestCloudInitStatus` and judged by this test process, so the guest
+/// needs no interpreter and no JSON tooling of its own.
 const full_checks =
     \\set -eu
     \\check() {
@@ -2828,8 +2834,6 @@ const full_checks =
     \\  check_service "$unit"
     \\done
     \\check cloud-init-wait cloud-init status --wait
-    \\cloud_init_status=$(cloud-init status --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
-    \\check cloud-init-status-done test "$cloud_init_status" = done
     \\netplan_network=$(find /run/systemd/network -maxdepth 1 -name '10-netplan-*.network' -print -quit)
     \\check netplan-network-generated test -n "$netplan_network"
     \\check network-online systemctl is-active --quiet network-online.target
@@ -2842,6 +2846,105 @@ const full_checks =
     \\  exit 1
     \\}
 ;
+
+/// Retrieves the cloud-init status document verbatim.
+///
+/// The guest only prints bytes: `--wait` has already been satisfied by
+/// `full_checks`, so this reads the recorded result. `cloud-init status` exits
+/// nonzero when the run is not clean, and that exit status is deliberately
+/// discarded here so the document -- which is what the verdict is made from --
+/// still reaches the test process; anything cloud-init writes to stderr stays
+/// on stderr, where `sshOutputAlloc` prints it if the query fails. Output that
+/// is empty (cloud-init missing, killed, or silent) fails the remote command
+/// outright rather than reaching the parser as a plausible-looking success.
+const cloud_init_status_command =
+    \\set -eu
+    \\status_document=$(cloud-init status --format json || true)
+    \\test -n "$status_document"
+    \\printf '%s\n' "$status_document"
+;
+
+/// Largest cloud-init status document accepted. The real document is a few
+/// hundred bytes; the bound keeps a runaway or hostile guest from feeding an
+/// unbounded document to the JSON parser.
+const cloud_init_status_max_bytes: usize = 64 * 1024;
+
+/// How much of a rejected status document is worth printing.
+const cloud_init_status_excerpt_bytes: usize = 512;
+
+/// The part of a rejected status document to show in a diagnostic: trimmed,
+/// and bounded so a runaway guest cannot flood the test log. Pure and
+/// unit-tested.
+fn cloudInitStatusExcerpt(document: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, document, " \t\r\n");
+    return trimmed[0..@min(trimmed.len, cloud_init_status_excerpt_bytes)];
+}
+
+/// Decides, in this process, whether the guest's cloud-init run completed.
+///
+/// `document` is the raw `cloud-init status --format json` output. The check
+/// is strict and fails closed, with a distinct error for every way the answer
+/// can fail to be a confirmed completion: an empty document, one larger than
+/// `cloud_init_status_max_bytes`, malformed JSON (duplicate keys included),
+/// a top level that is not an object, an absent `status`, a `status` that is
+/// not a string, and any status other than exactly `done`. Only the parser's
+/// allocator is used, so every failure mode is directly unit-testable without
+/// KVM.
+fn verifyCloudInitStatusDone(allocator: Allocator, document: []const u8) !void {
+    const trimmed = std.mem.trim(u8, document, " \t\r\n");
+    if (trimmed.len == 0) return error.CloudInitStatusEmpty;
+    if (trimmed.len > cloud_init_status_max_bytes) return error.CloudInitStatusTooLarge;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{
+        .duplicate_field_behavior = .@"error",
+        .max_value_len = cloud_init_status_max_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CloudInitStatusMalformed,
+    };
+    defer parsed.deinit();
+
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.CloudInitStatusNotAnObject,
+    };
+    const value = object.get("status") orelse return error.CloudInitStatusMissing;
+    const status = switch (value) {
+        .string => |text| text,
+        else => return error.CloudInitStatusNotAString,
+    };
+    if (!std.mem.eql(u8, status, "done")) return error.CloudInitStatusNotDone;
+}
+
+/// Fetches the guest's cloud-init status document and judges it here. A failed
+/// query is a failure, never an unknown status, and a rejected document is
+/// printed (bounded) so the acceptance log names what the guest actually said.
+fn verifyGuestCloudInitStatus(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+) !void {
+    const document = sshOutputAlloc(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        cloud_init_status_command,
+    ) catch |err| switch (err) {
+        error.SshCommandFailed => return error.CloudInitStatusQueryFailed,
+        else => return err,
+    };
+    defer allocator.free(document);
+
+    verifyCloudInitStatusDone(allocator, document) catch |err| {
+        std.debug.print(
+            "cloud-init status for {s} rejected ({s}); document was:\n{s}\n",
+            .{ instance.label, @errorName(err), cloudInitStatusExcerpt(document) },
+        );
+        return err;
+    };
+}
 
 fn verifyFlavorRuntime(
     allocator: Allocator,
@@ -2864,6 +2967,7 @@ fn verifyFlavorRuntime(
                 else => return err,
             };
             allocator.free(output);
+            try verifyGuestCloudInitStatus(allocator, io, ssh_path, instance);
         },
     }
 }
@@ -3893,6 +3997,157 @@ test "Android smoke required inputs fail closed rather than skip when absent" {
         error.RequiredEnvironmentMissing,
         requireAndroidSmokeInputsAlloc(allocator),
     );
+}
+
+test "guest cloud-init verification runs no interpreter in the guest" {
+    // Spelled in two pieces deliberately: `tests/python_inventory.zig` counts a
+    // quoted interpreter word as an invocation site, and this guard exists to
+    // prove the guest has none left, not to add one.
+    const interpreter = "py" ++ "thon";
+
+    // The remote shell fetches bytes and nothing else, so no interpreter name
+    // may appear in either script, and the shell variable that used to carry
+    // the guest-side verdict is gone.
+    for ([_][]const u8{ full_checks, cloud_init_status_command }) |script| {
+        try std.testing.expect(std.ascii.indexOfIgnoreCase(script, interpreter) == null);
+        try std.testing.expect(std.mem.indexOf(u8, script, "import ") == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, full_checks, "cloud_init_status") == null);
+    try std.testing.expect(std.mem.indexOf(u8, full_checks, "--format json") == null);
+
+    // The wait stays in the guest contract; only the verdict moved out.
+    try std.testing.expect(
+        std.mem.indexOf(u8, full_checks, "check cloud-init-wait cloud-init status --wait") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, cloud_init_status_command, "cloud-init status --format json") != null,
+    );
+
+    // The core contract names Python only as library directories that must be
+    // absent from the image; it never runs one.
+    const library_prefix = "/usr/lib/";
+    const library_suffix = "3/dist-packages/";
+    var index: usize = 0;
+    var mentions: usize = 0;
+    while (std.mem.indexOfPos(u8, core_checks, index, interpreter)) |at| {
+        try std.testing.expect(at >= library_prefix.len);
+        try std.testing.expectEqualStrings(
+            library_prefix,
+            core_checks[at - library_prefix.len .. at],
+        );
+        try std.testing.expect(std.mem.startsWith(
+            u8,
+            core_checks[at + interpreter.len ..],
+            library_suffix,
+        ));
+        mentions += 1;
+        index = at + interpreter.len;
+    }
+    try std.testing.expectEqual(@as(usize, 2), mentions);
+}
+
+test "guest cloud-init status query fetches the document without judging it" {
+    // A guest-side verdict would have to compare, test, or grep; this must do
+    // none of those, and must fail the remote command outright when cloud-init
+    // produces nothing rather than passing an empty document off as a result.
+    try std.testing.expect(std.mem.indexOf(u8, cloud_init_status_command, "done") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cloud_init_status_command, "grep") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cloud_init_status_command, "sed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cloud_init_status_command, "awk") == null);
+    try std.testing.expect(std.mem.startsWith(u8, cloud_init_status_command, "set -eu\n"));
+    try std.testing.expect(
+        std.mem.indexOf(u8, cloud_init_status_command, "test -n \"$status_document\"") != null,
+    );
+}
+
+test "cloud-init status is accepted only when the guest reports a done status" {
+    const allocator = std.testing.allocator;
+    const accepted = [_][]const u8{
+        "{\"status\": \"done\"}",
+        "{\"status\":\"done\"}\n",
+        "  \t{\"status\":\"done\"}\r\n\n",
+        "{\"boot_status_code\":\"enabled-by-generator\",\"status\":\"done\"," ++
+            "\"errors\":[],\"recoverable_errors\":{}}",
+    };
+    for (accepted) |document| try verifyCloudInitStatusDone(allocator, document);
+}
+
+test "cloud-init status verification fails closed on every non-done shape" {
+    const allocator = std.testing.allocator;
+    const Case = struct { document: []const u8, expected: anyerror };
+    const cases = [_]Case{
+        .{ .document = "", .expected = error.CloudInitStatusEmpty },
+        .{ .document = "   \t\r\n ", .expected = error.CloudInitStatusEmpty },
+        .{ .document = "not json", .expected = error.CloudInitStatusMalformed },
+        .{ .document = "{\"status\": \"done\"", .expected = error.CloudInitStatusMalformed },
+        .{ .document = "{\"status\": done}", .expected = error.CloudInitStatusMalformed },
+        .{ .document = "{\"status\":\"done\"} trailing", .expected = error.CloudInitStatusMalformed },
+        // A duplicated key makes the answer ambiguous, so it is malformed here.
+        .{
+            .document = "{\"status\":\"done\",\"status\":\"error\"}",
+            .expected = error.CloudInitStatusMalformed,
+        },
+        .{ .document = "[]", .expected = error.CloudInitStatusNotAnObject },
+        .{ .document = "\"done\"", .expected = error.CloudInitStatusNotAnObject },
+        .{ .document = "null", .expected = error.CloudInitStatusNotAnObject },
+        .{ .document = "[{\"status\":\"done\"}]", .expected = error.CloudInitStatusNotAnObject },
+        .{ .document = "{}", .expected = error.CloudInitStatusMissing },
+        .{ .document = "{\"Status\":\"done\"}", .expected = error.CloudInitStatusMissing },
+        .{ .document = "{\"errors\":[]}", .expected = error.CloudInitStatusMissing },
+        .{ .document = "{\"status\":null}", .expected = error.CloudInitStatusNotAString },
+        .{ .document = "{\"status\":5}", .expected = error.CloudInitStatusNotAString },
+        .{ .document = "{\"status\":true}", .expected = error.CloudInitStatusNotAString },
+        .{ .document = "{\"status\":[\"done\"]}", .expected = error.CloudInitStatusNotAString },
+        .{ .document = "{\"status\":{\"status\":\"done\"}}", .expected = error.CloudInitStatusNotAString },
+        .{ .document = "{\"status\":\"running\"}", .expected = error.CloudInitStatusNotDone },
+        .{ .document = "{\"status\":\"error\"}", .expected = error.CloudInitStatusNotDone },
+        .{ .document = "{\"status\":\"degraded done\"}", .expected = error.CloudInitStatusNotDone },
+        .{ .document = "{\"status\":\"not-run\"}", .expected = error.CloudInitStatusNotDone },
+        .{ .document = "{\"status\":\"\"}", .expected = error.CloudInitStatusNotDone },
+        .{ .document = "{\"status\":\"Done\"}", .expected = error.CloudInitStatusNotDone },
+        .{ .document = "{\"status\":\"done \"}", .expected = error.CloudInitStatusNotDone },
+    };
+    for (cases) |case| try std.testing.expectError(
+        case.expected,
+        verifyCloudInitStatusDone(allocator, case.document),
+    );
+}
+
+test "cloud-init status verification rejects an unbounded document" {
+    const allocator = std.testing.allocator;
+    const filler = "{\"status\":\"done\",\"note\":\"";
+    const oversized = try allocator.alloc(u8, cloud_init_status_max_bytes + 1);
+    defer allocator.free(oversized);
+    @memcpy(oversized[0..filler.len], filler);
+    @memset(oversized[filler.len .. oversized.len - 2], 'a');
+    oversized[oversized.len - 2] = '"';
+    oversized[oversized.len - 1] = '}';
+    try std.testing.expectError(
+        error.CloudInitStatusTooLarge,
+        verifyCloudInitStatusDone(allocator, oversized),
+    );
+
+    // Exactly at the bound the document is still parsed, not silently passed.
+    const at_bound = oversized[0..cloud_init_status_max_bytes];
+    try std.testing.expectError(
+        error.CloudInitStatusMalformed,
+        verifyCloudInitStatusDone(allocator, at_bound),
+    );
+}
+
+test "rejected cloud-init status documents are reported trimmed and bounded" {
+    try std.testing.expectEqualStrings(
+        "{\"status\":\"error\"}",
+        cloudInitStatusExcerpt("\n  {\"status\":\"error\"}\r\n"),
+    );
+    try std.testing.expectEqualStrings("", cloudInitStatusExcerpt("  \n"));
+
+    const allocator = std.testing.allocator;
+    const flood = try allocator.alloc(u8, 8 * cloud_init_status_excerpt_bytes);
+    defer allocator.free(flood);
+    @memset(flood, 'x');
+    const excerpt = cloudInitStatusExcerpt(flood);
+    try std.testing.expectEqual(cloud_init_status_excerpt_bytes, excerpt.len);
 }
 
 test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" {
