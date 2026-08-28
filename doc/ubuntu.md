@@ -18,8 +18,9 @@ matrix: full and core for both architectures. The existing
 [`Ubuntu-26.04-20260822`](https://github.com/cataggar/miz/releases/tag/Ubuntu-26.04-20260822)
 release remains immutable and full-only. The four-asset workflow uses the new
 tag `Ubuntu-26.04-20260828`; that tag and release do not become final until all
-four candidates pass digest-bound native KVM and Azure Trusted Launch
-acceptance and publication redownload verification.
+four candidates pass digest-bound same-architecture QEMU acceptance
+(x86_64 KVM and AArch64 TCG), Azure Trusted Launch acceptance, and publication
+redownload verification.
 
 ## QEMU catalog aliases
 
@@ -228,7 +229,7 @@ administrator with key-only SSH and passwordless sudo, persists
 `/var/lib/azagent/provisioned`, grows the root, formats the Azure resource disk
 as XFS at `/d` without swap, mounts managed data disks without formatting
 them, and reports Ready in Azure. Explicitly marked local OVF media instead
-runs `azagent --skip-ready` for native-QEMU acceptance. Provisioned identity,
+runs `azagent --skip-ready` for same-architecture QEMU acceptance. Provisioned identity,
 authorized keys, host keys, and the sentinel must persist across reboot;
 separate instances must not inherit them from the candidate.
 
@@ -587,7 +588,7 @@ For a local benchmark identity, replace `--sign-command` and its argument with
 it receives the candidate in `MIZ_UBUNTU2604_IMAGE`. This repository
 currently has no bare-metal boot harness, so the default evidence records that
 fact while still running the builder's final guest/filesystem checks plus
-`miz check` and `miz info`. Full/core native-QEMU acceptance is not applied
+`miz check` and `miz info`. Full/core same-architecture QEMU acceptance is not applied
 to a different product flavor.
 
 Each run retains timing JSON, host wall/user/system and resource counters,
@@ -653,7 +654,7 @@ before the staging build, and rechecks the benchmark's 30 GiB minimum after
 staging data is pruned. A runner image that cannot meet either threshold fails
 before a measured run instead of weakening the storage contract.
 
-There is no repository bare-metal boot harness. The full/core native-QEMU
+There is no repository bare-metal boot harness. The full/core same-architecture QEMU
 acceptance suite intentionally rejects this different flavor, so the workflow
 does not claim boot acceptance. It runs the benchmark's production
 filesystem, package-closure, provenance, signature, QCOW2, and raw-image
@@ -756,33 +757,57 @@ aarch64 runner.
 
 ## Acceptance infrastructure
 
+Same-architecture QEMU acceptance is accelerator-explicit and fail-closed.
+Both `x86_64` legs remain on the `ubuntu-24.04` hosted runner and retain the
+existing KVM contract unchanged: `/dev/kvm` must be present, readable, and
+writable; the accepted-source release tool must confirm the stable KVM API;
+QEMU uses OVMF, `q35,accel=kvm`, and `-cpu host`; and no software fallback is
+permitted.
 
-Native acceptance is deliberately not emulation. Each architecture requires a
-matching Linux runner with readable and writable `/dev/kvm`, QEMU, OVMF or
-AAVMF, `swtpm`, `sbverify`, and OpenSSH. It enrolls the exact candidate leaf in
-UEFI `db` and asserts the standalone GPT image, Secure Boot, signed UKI, vTPM,
-lockdown, signed modules, rejection of a tampered UKI, key-only SSH, cloud-init,
-WALinuxAgent, netplan/networkd, root growth, generalized identity,
-reboot/reconnect, and clean service health.
+Both AArch64 legs run only on the exact GitHub-hosted `ubuntu-24.04-arm`
+label. Before checkout they require Ubuntu on `uname -m == aarch64` and Debian
+`arm64`, then install the native `/usr/bin/qemu-system-aarch64`,
+Secure-Boot-capable AAVMF, `swtpm`, `qemu-img`, `sbverify`, and OpenSSH. QEMU
+is launched explicitly with `-machine virt`, `-accel tcg,thread=multi`, and
+`-cpu max`. The Arm path never examines or changes `/dev/kvm`, never calls the
+KVM API check, never probes for another accelerator, and never routes the
+guest through an x86_64 runner.
 
-The four-asset release workflow keeps both `x86_64` native acceptance legs on
-the `ubuntu-24.04` hosted runner. Its `aarch64-full` and `aarch64-core` legs
-require a repository runner matching
-`[self-hosted, Linux, ARM64, kvm]`: a native Ubuntu ARM64 host with
-passwordless `sudo`, the matching Debian architecture, and a usable KVM
-device. Each job proves `/dev/kvm` is present, readable, and writable before
-downloading the candidate, then installs `qemu-system-aarch64` and Secure
-Boot-capable AAVMF and verifies the stable KVM API version with the release
-tooling built from the accepted source. The separate core-validation preflight
-mirrors the same core subset and runner contracts. Neither workflow falls back
-to TCG.
-These labels describe a dedicated native ARM64 KVM host and do not imply
-Azure nested virtualization.
+This is an intentional provider-limitation contract change for
+[#626](https://github.com/cataggar/miz/issues/626) and
+[#627](https://github.com/cataggar/miz/issues/627): neither GitHub-hosted Arm
+runners nor an Azure-hosted CI alternative supplies Arm64 KVM. Azure Trusted
+Launch acceptance remains mandatory for all four candidates and supplies the
+real Arm platform evidence; TCG replaces only the unavailable local Arm KVM
+leg.
+
+The KVM profile retains its existing 180-minute job ceiling and per-operation
+wait limits.
+Only the TCG rows receive a bounded 360-minute job ceiling and larger QMP,
+boot/reboot/shutdown, SSH-command, Android boot/stop, and tampered-UKI waits.
+Every bound still terminates with failure and serial, QMP, SSH, swtpm, or
+Android diagnostics rather than changing accelerator or treating an unknown
+state as success.
+
+Each QEMU result records an exact execution object containing accelerator,
+emulator, guest architecture, runner architecture, machine, and CPU. The
+canonical validator requires `/usr/bin/qemu-system-x86_64`, x86_64, `q35`,
+`host`, and `kvm` for x86_64; and `/usr/bin/qemu-system-aarch64`, AArch64,
+`virt`, `max`, and `tcg` for Arm. Missing, stale, malformed, swapped,
+`auto`, or unknown execution identities cannot satisfy either validation
+gate. This binding is full-result schema 3 and core-result schema 7.
+
+Both profiles enroll the exact candidate leaf in UEFI `db` and assert the
+standalone GPT image, Secure Boot, signed UKI, vTPM, lockdown, signed modules,
+rejection of a tampered UKI, key-only SSH, provisioning, root growth,
+generalized and persistent unique identity, service/SSH supervision,
+reboot/reconnect, shutdown, and the flavor-specific Binder and Android
+contracts.
 
 Per-instance Secure Boot variable stores are created natively by
 `miz.efi_varstore`, the same EDK II variable-store parser and editor
 `miz qemu --secure-boot` uses, so no firmware-variable host package is
-installed. `qemu-utils` remains in native acceptance for candidate inspection
+installed. `qemu-utils` remains in QEMU acceptance for candidate inspection
 and in Azure acceptance for the documented fixed-VHD conversion boundary.
 
 Azure acceptance requires an Azure subscription and OIDC application allowed
@@ -802,8 +827,8 @@ persistence, resource-disk formatting, managed-data-disk mount-only behavior,
 and explicit absence of cloud-init, WALinuxAgent, and a systemd service
 manager.
 
-Native core acceptance additionally asserts a Binder workload contract set
-under Secure Boot/lockdown: the in-tree `binder_linux` module is loaded at
+Same-architecture QEMU core acceptance additionally asserts a Binder workload
+contract set under Secure Boot/lockdown: the in-tree `binder_linux` module is loaded at
 boot from the pinned Ubuntu module tree (not `updates`/DKMS), carries signer
 evidence and no taint, and dmesg has no unsigned-module, lockdown, or
 out-of-tree binder implementation failures; binderfs is mounted with a
@@ -811,7 +836,7 @@ out-of-tree binder implementation failures; binderfs is mounted with a
 `binder`, `hwbinder`, and `vndbinder` devices; and a tiny statically linked,
 architecture-neutral probe opens each of those devices and performs
 `BINDER_VERSION` to confirm usability rather than only checking paths. These
-contracts bumped the core-only native result schema so an older result cannot
+contracts bumped the core-only QEMU result schema so an older result cannot
 satisfy them. They require the image itself to provide boot-time module
 autoload, the binderfs mount, and dynamic device creation before acceptance
 starts any workload.
@@ -830,7 +855,8 @@ allocate and query a new dynamic Binder device through `binder-control`.
 
 ### Android container boot-completion smoke
 
-Core acceptance -- both native-QEMU and Azure -- additionally runs a minimal
+Core acceptance -- both same-architecture QEMU (x86_64 KVM or AArch64 TCG)
+and Azure -- additionally runs a minimal
 Android container boot-completion smoke, in both cases on top of the Binder
 workload contracts above. The core image never embeds an Android OCI runtime
 or bundle: both are required, digest-bound external inputs supplied only at
@@ -857,12 +883,12 @@ The SHA-256 of the complete external provenance manifest plus the runtime,
 bundle, and config digests are bound into the acceptance result the same way
 every other core-only input is. Producer-private identity fields remain
 inside that manifest: they are never copied to results, summaries, logs, or
-uploaded validation artifacts. A native or Azure result missing the
+uploaded validation artifacts. A QEMU or Azure result missing the
 public-safe digest evidence fails validation, and the core result schemas
 were bumped so an older result cannot satisfy the current contract. Native
 and Azure acceptance run this smoke independently, require identical
 architecture-specific provenance evidence, and use differently worded
-contract names for the same behavior, matching the existing native/Azure
+contract names for the same behavior, matching the existing QEMU/Azure
 Binder contract split above.
 
 ## Core validation workflow
@@ -874,14 +900,15 @@ described below, with serialized non-cancelling concurrency. No tag is
 required.
 
 The workflow builds and signs exactly `x86_64-core` and `aarch64-core`, then
-requires both native-QEMU jobs and both Azure Trusted Launch jobs. Candidate
-reuse accepts only a completed manual run of this same workflow at the exact
-current remote `main` commit and exact run attempt, with both named build jobs
-successful and exactly two nonempty, unexpired candidate artifacts.
+requires x86_64 KVM QEMU, AArch64 TCG QEMU, and both Azure Trusted Launch
+jobs. Candidate reuse accepts only a completed manual run of this same
+workflow at the exact current remote `main` commit and exact run attempt, with
+both named build jobs successful and exactly two nonempty, unexpired candidate
+artifacts.
 
 The final gate accepts exactly two candidates, two candidate-key-and-digest
-bound native results, and two Azure results. Its validation manifest records
-non-null native-result digests and the matching public-safe Android
+bound QEMU results, and two Azure results. Its validation manifest records
+non-null QEMU-result digests and the matching public-safe Android
 provenance/runtime/bundle/config digests for both `x86_64-core` and
 `aarch64-core`; missing, duplicate, cross-key, cross-architecture, or
 cross-digest evidence fails closed.
@@ -890,8 +917,8 @@ The core Azure acceptance jobs also build the Binder device usability probe
 from source for the matching guest architecture before running acceptance,
 so no prebuilt probe binary is stored or published.
 
-Both the native-QEMU and Azure matrices select one of two plain repository
-secrets before acceptance: `ANDROID_SMOKE_X86_64_JSON` or
+Both the same-architecture QEMU and Azure matrices select one of two plain
+repository secrets before acceptance: `ANDROID_SMOKE_X86_64_JSON` or
 `ANDROID_SMOKE_AARCH64_JSON`. Each secret is an exact JSON object with
 `artifact_url`, `artifact_sha256`, and `provenance_sha256`. The location must
 be HTTPS and both digests must be lowercase SHA-256. The complete archive
@@ -914,16 +941,16 @@ container, and the config digest is read from whatever the archive actually
 holds rather than from bytes assumed to be tar.
 
 These secrets are deliberately not scoped to the `ubuntu2604-release`
-environment, so the native-QEMU job -- which needs no Azure credential --
-can read them without gaining a protected-environment grant. An optional
-`ANDROID_ARTIFACT_TOKEN` is used only while downloading. Secret JSON, URLs,
-and producer-private manifest contents are never written to `GITHUB_ENV`,
+environment, so the same-architecture QEMU job -- which needs no Azure
+credential -- can read them without gaining a protected-environment grant. An
+optional `ANDROID_ARTIFACT_TOKEN` is used only while downloading. Secret JSON,
+URLs, and producer-private manifest contents are never written to `GITHUB_ENV`,
 printed, or uploaded; only verified local paths and public-safe SHA-256
 evidence leave the download step. Missing, malformed, cross-architecture, or
 digest-mismatched input fails before any Azure resource is created or guest
 command runs rather than skipping the smoke.
 
-Candidates, native results, Azure results, and a final digest-bound
+Candidates, QEMU results, Azure results, and a final digest-bound
 two-architecture validation manifest are uploaded only as workflow artifacts.
 The workflow has no publish job, release command, tag contract, release asset,
 or catalog mutation. It remains a non-publishing preflight for the core
@@ -942,11 +969,12 @@ and publishes exactly full/core × x86_64/AArch64. Before dispatch:
    current `main` commit before dispatch. Mutation is permitted only while the
    release is being iterated on 2026-08-28; after final publication the tag,
    assets, URLs, and digests are immutable.
-2. Register an Ubuntu ARM64 repository runner carrying
-   `[self-hosted, Linux, ARM64, kvm]`, passwordless `sudo`, and a native,
-   readable/writable `/dev/kvm`. Publication cannot proceed without both real
-   `aarch64-full` and `aarch64-core` Secure Boot acceptance jobs on this
-   runner.
+2. Confirm the exact GitHub-hosted `ubuntu-24.04-arm` label is available.
+   Publication cannot proceed without both `aarch64-full` and `aarch64-core`
+   Secure Boot acceptance jobs using native Arm64
+   `/usr/bin/qemu-system-aarch64` with explicit
+   `-accel tcg,thread=multi`; no Arm KVM or self-hosted runner is part of this
+   contract.
 3. Configure protected environment `ubuntu2604-signing`, restricted to
    `main` and requiring reviewers, with variables
    `MIZ_AZURE_TENANT_ID`, `MIZ_AZURE_CLIENT_ID`,
@@ -964,14 +992,14 @@ and publishes exactly full/core × x86_64/AArch64. Before dispatch:
    `repo:cataggar/miz:environment:ubuntu2604-release`.
 
 Top-level permissions are `actions: read` and `contents: read`. Signing and
-Azure acceptance add only `id-token: write`; native acceptance remains
+Azure acceptance add only `id-token: write`; QEMU acceptance remains
 read-only. Publication uses `actions: read` and `contents: write`.
 
 The prepare gate binds the run to the current remote `main` commit and tag.
 An optional `candidate_run_id` may reuse only a completed manual run on
 `main` for that same commit and exact run attempt. All four named build jobs
 must have succeeded and exactly four non-expired, nonempty candidate artifacts
-must match the commit and attempt. Reused candidates still rerun native and
+must match the commit and attempt. Reused candidates still rerun QEMU and
 Azure acceptance.
 
 The build matrix passes flavor explicitly. Full candidates retain the exact
@@ -981,12 +1009,14 @@ post-failure `df`/largest-path diagnostics, and unconditionally removes
 privileged build state and signing material.
 
 Publication requires four successful build candidates, exactly one valid
-native result per candidate, and exactly one Azure result per candidate. Each
+QEMU result per candidate, and exactly one Azure result per candidate. Each
 result binds the key, architecture, flavor, asset name, source commit, virtual
 size, candidate/certificate/UKI digests, explicit success, complete
-flavor-specific contract set, and exact workflow attempt. Core native and
-Azure results must additionally carry identical public-safe Android
-provenance/runtime/bundle/config digests. Missing, extra, duplicate, stale,
+flavor-specific contract set, exact
+accelerator/emulator/guest/runner/machine/CPU identity, and exact workflow
+attempt. Core QEMU and Azure results must additionally carry identical
+public-safe Android provenance/runtime/bundle/config digests. Missing, extra,
+duplicate, stale,
 malformed, cross-key, cross-architecture, cross-digest, wrong-signer,
 wrong-UKI, wrong-source/run, unsuccessful, or core-provenance-disagreeing
 evidence fails before publication.

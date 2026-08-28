@@ -184,8 +184,15 @@ test "core build and acceptance contracts are explicit" {
     const native = try job(&workflow, "native_qemu", "azure_acceptance");
     const native_needles = [_][]const u8{
         "-Dubuntu2604-flavor=\"$FLAVOR\"",
-        "runner: ubuntu-24.04",
-        "runner: [self-hosted, Linux, ARM64, kvm]",
+        "name: same-architecture QEMU (${{ matrix.accelerator }})",
+        "timeout-minutes: ${{ matrix.timeout_minutes }}",
+        "MIZ_UBUNTU2604_QEMU: ${{ matrix.emulator }}",
+        "MIZ_UBUNTU2604_QEMU_ACCELERATOR: ${{ matrix.accelerator }}",
+        "MIZ_UBUNTU2604_QEMU_ACCELERATOR_ARGUMENT: ${{ matrix.accelerator_argument }}",
+        "MIZ_UBUNTU2604_QEMU_CPU: ${{ matrix.cpu }}",
+        "MIZ_UBUNTU2604_QEMU_MACHINE: ${{ matrix.machine }}",
+        "MIZ_UBUNTU2604_QEMU_JOB_TIMEOUT_MINUTES: ${{ matrix.timeout_minutes }}",
+        "MIZ_UBUNTU2604_RUNNER_ARCHITECTURE: ${{ matrix.runner_architecture }}",
         "if [[ ! -c /dev/kvm ]]",
         "sudo -n chown \"$(id -u):$(id -g)\" /dev/kvm",
         "test -r /dev/kvm",
@@ -195,6 +202,7 @@ test "core build and acceptance contracts are explicit" {
         "\"$RELEASE_TOOL\" kvm-api-version",
         "qemu-efi-aarch64 qemu-system-arm",
         "qemu=qemu-system-aarch64",
+        "test \"$(command -v \"$qemu\")\" = \"$MIZ_UBUNTU2604_QEMU\"",
         "/usr/share/AAVMF/AAVMF_CODE.ms.fd",
         "/usr/share/AAVMF/AAVMF_VARS.ms.fd",
         "MIZ_UBUNTU2604_UEFI_CODE=",
@@ -207,30 +215,85 @@ test "core build and acceptance contracts are explicit" {
         "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ATTEMPT=",
     };
     for (native_needles) |needle| try source.expectContainsIn(native, needle, workflow_path);
-    for ([_][]const u8{ "force_tcg", "accel=tcg", "MIZ_VM_ACCEL=software" }) |needle| {
+    for ([_][]const u8{
+        "[self-hosted, Linux, ARM64, kvm]",
+        "force_tcg",
+        "accel=auto",
+        "MIZ_VM_ACCEL=software",
+    }) |needle| {
         try source.expectOmitsIn(native, needle, workflow_path);
     }
-    const capability_start = try source.indexOfIn(
+    const x86_row =
+        \\runner: ubuntu-24.04
+        \\            runner_architecture: x86_64
+        \\            debian_architecture: amd64
+        \\            accelerator: kvm
+        \\            accelerator_argument: kvm
+        \\            emulator: /usr/bin/qemu-system-x86_64
+        \\            machine: q35
+        \\            cpu: host
+        \\            timeout_minutes: 180
+    ;
+    const arm_row =
+        \\runner: ubuntu-24.04-arm
+        \\            runner_architecture: aarch64
+        \\            debian_architecture: arm64
+        \\            accelerator: tcg
+        \\            accelerator_argument: tcg,thread=multi
+        \\            emulator: /usr/bin/qemu-system-aarch64
+        \\            machine: virt
+        \\            cpu: max
+        \\            timeout_minutes: 360
+    ;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, native, x86_row));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, native, arm_row));
+
+    const x86_start = try source.indexOfIn(
         native,
-        "- name: Require matching native KVM runner",
+        "- name: Require x86_64 KVM runner",
         workflow_path,
     );
-    const capability_end = try source.indexOfIn(
+    const arm_start = try source.indexOfIn(
+        native,
+        "- name: Require hosted Arm64 TCG runner",
+        workflow_path,
+    );
+    const checkout_start = try source.indexOfIn(
         native,
         "- name: Check out accepted source",
         workflow_path,
     );
-    const capability = native[capability_start..capability_end];
-    try source.expectContainsIn(
-        capability,
+    const x86_capability = native[x86_start..arm_start];
+    const arm_capability = native[arm_start..checkout_start];
+    for ([_][]const u8{
+        "if: matrix.architecture == 'x86_64'",
+        "test \"$MIZ_UBUNTU2604_QEMU_ACCELERATOR\" = kvm",
+        "test \"$MIZ_UBUNTU2604_QEMU_ACCELERATOR_ARGUMENT\" = kvm",
+        "test \"$MIZ_UBUNTU2604_QEMU_CPU\" = host",
+        "test \"$MIZ_UBUNTU2604_QEMU_MACHINE\" = q35",
+        "test \"$MIZ_UBUNTU2604_QEMU_JOB_TIMEOUT_MINUTES\" = 180",
+        "test \"$MIZ_UBUNTU2604_QEMU\" = /usr/bin/qemu-system-x86_64",
         "test \"$(uname -m)\" = \"$expected_uname\"",
-        workflow_path,
-    );
-    try source.expectContainsIn(
-        capability,
         "test \"$(dpkg --print-architecture)\" = \"$expected_deb\"",
-        workflow_path,
-    );
+        "if [[ ! -c /dev/kvm ]]",
+        "sudo -n chown \"$(id -u):$(id -g)\" /dev/kvm",
+        "test -r /dev/kvm",
+        "test -w /dev/kvm",
+    }) |needle| try source.expectContainsIn(x86_capability, needle, workflow_path);
+    for ([_][]const u8{
+        "if: matrix.architecture == 'aarch64'",
+        "test \"$ARCHITECTURE\" = aarch64",
+        "test \"$MIZ_UBUNTU2604_QEMU_ACCELERATOR_ARGUMENT\" = tcg,thread=multi",
+        "test \"$MIZ_UBUNTU2604_QEMU_CPU\" = max",
+        "test \"$MIZ_UBUNTU2604_QEMU_MACHINE\" = virt",
+        "test \"$MIZ_UBUNTU2604_QEMU_JOB_TIMEOUT_MINUTES\" = 360",
+        "test \"$MIZ_UBUNTU2604_QEMU\" = /usr/bin/qemu-system-aarch64",
+        "test \"$(uname -m)\" = aarch64",
+        "test \"$(dpkg --print-architecture)\" = arm64",
+    }) |needle| try source.expectContainsIn(arm_capability, needle, workflow_path);
+    for ([_][]const u8{ "/dev/kvm", "kvm-api-version", "fallback", "auto" }) |needle| {
+        try source.expectOmitsIn(arm_capability, needle, workflow_path);
+    }
     try source.expectOrder(
         native,
         "sudo apt-get install -y --no-install-recommends \"${packages[@]}\"",
@@ -255,6 +318,21 @@ test "core build and acceptance contracts are explicit" {
         native,
         "- name: Build accepted-source release tooling",
         "- name: Require the stable KVM API version",
+        workflow_path,
+    );
+    const kvm_api_start = try source.indexOfIn(
+        native,
+        "- name: Require the stable KVM API version",
+        workflow_path,
+    );
+    const fixture_start = try source.indexOfIn(
+        native,
+        "- name: Provision privileged offline-root containment fixture",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        native[kvm_api_start..fixture_start],
+        "if: matrix.architecture == 'x86_64'",
         workflow_path,
     );
 

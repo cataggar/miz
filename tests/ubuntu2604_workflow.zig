@@ -618,14 +618,21 @@ test "the build job validates the QCOW2 and publishes its metadata natively" {
     try source.expectOmitsIn(build_job, source.interpreter, workflow_path);
 }
 
-test "native acceptance is KVM-only and core Android smoke is fail-closed" {
+test "QEMU acceptance pins x86 KVM and hosted Arm TCG without fallback" {
     var workflow = try open();
     defer workflow.deinit();
     const native = try workflow.section("  native_qemu:", "  azure_acceptance:");
     const needles = [_][]const u8{
-        "runner: ubuntu-24.04",
-        "runner: [self-hosted, Linux, ARM64, kvm]",
+        "name: same-architecture QEMU (${{ matrix.accelerator }})",
+        "timeout-minutes: ${{ matrix.timeout_minutes }}",
         "FLAVOR: ${{ matrix.flavor }}",
+        "MIZ_UBUNTU2604_QEMU: ${{ matrix.emulator }}",
+        "MIZ_UBUNTU2604_QEMU_ACCELERATOR: ${{ matrix.accelerator }}",
+        "MIZ_UBUNTU2604_QEMU_ACCELERATOR_ARGUMENT: ${{ matrix.accelerator_argument }}",
+        "MIZ_UBUNTU2604_QEMU_CPU: ${{ matrix.cpu }}",
+        "MIZ_UBUNTU2604_QEMU_MACHINE: ${{ matrix.machine }}",
+        "MIZ_UBUNTU2604_QEMU_JOB_TIMEOUT_MINUTES: ${{ matrix.timeout_minutes }}",
+        "MIZ_UBUNTU2604_RUNNER_ARCHITECTURE: ${{ matrix.runner_architecture }}",
         "if [[ ! -c /dev/kvm ]]",
         "sudo -n chown \"$(id -u):$(id -g)\" /dev/kvm",
         "test -r /dev/kvm",
@@ -635,6 +642,7 @@ test "native acceptance is KVM-only and core Android smoke is fail-closed" {
         "\"$RELEASE_TOOL\" kvm-api-version",
         "qemu-efi-aarch64 qemu-system-arm",
         "qemu=qemu-system-aarch64",
+        "test \"$(command -v \"$qemu\")\" = \"$MIZ_UBUNTU2604_QEMU\"",
         "OVMF_CODE_4M.ms.fd",
         "OVMF_VARS_4M.ms.fd",
         "AAVMF_CODE.ms.fd",
@@ -662,25 +670,87 @@ test "native acceptance is KVM-only and core Android smoke is fail-closed" {
     };
     for (needles) |needle| try source.expectContainsIn(native, needle, workflow_path);
     try source.expectOmitsIn(native, "/usr/bin/coreutils", workflow_path);
-    for ([_][]const u8{ "force_tcg", "accel=tcg", "MIZ_VM_ACCEL=software" }) |needle| {
+    for ([_][]const u8{
+        "[self-hosted, Linux, ARM64, kvm]",
+        "force_tcg",
+        "accel=auto",
+        "MIZ_VM_ACCEL=software",
+    }) |needle| {
         try source.expectOmitsIn(native, needle, workflow_path);
     }
-    const capability_start = try source.indexOfIn(
+
+    const x86_row =
+        \\runner: ubuntu-24.04
+        \\            runner_architecture: x86_64
+        \\            debian_architecture: amd64
+        \\            accelerator: kvm
+        \\            accelerator_argument: kvm
+        \\            emulator: /usr/bin/qemu-system-x86_64
+        \\            machine: q35
+        \\            cpu: host
+        \\            timeout_minutes: 180
+    ;
+    const arm_row =
+        \\runner: ubuntu-24.04-arm
+        \\            runner_architecture: aarch64
+        \\            debian_architecture: arm64
+        \\            accelerator: tcg
+        \\            accelerator_argument: tcg,thread=multi
+        \\            emulator: /usr/bin/qemu-system-aarch64
+        \\            machine: virt
+        \\            cpu: max
+        \\            timeout_minutes: 360
+    ;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, native, x86_row));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, native, arm_row));
+
+    const x86_start = try source.indexOfIn(
         native,
-        "- name: Require matching native KVM runner",
+        "- name: Require x86_64 KVM runner",
         workflow_path,
     );
-    const capability_end = try source.indexOfIn(
+    const arm_start = try source.indexOfIn(
+        native,
+        "- name: Require hosted Arm64 TCG runner",
+        workflow_path,
+    );
+    const checkout_start = try source.indexOfIn(
         native,
         "- name: Check out accepted source",
         workflow_path,
     );
-    const capability = native[capability_start..capability_end];
-    try source.expectContainsIn(
-        capability,
-        "Unsupported native acceptance architecture",
-        workflow_path,
-    );
+    const x86_capability = native[x86_start..arm_start];
+    const arm_capability = native[arm_start..checkout_start];
+    for ([_][]const u8{
+        "if: matrix.architecture == 'x86_64'",
+        "test \"$MIZ_UBUNTU2604_QEMU_ACCELERATOR\" = kvm",
+        "test \"$MIZ_UBUNTU2604_QEMU_ACCELERATOR_ARGUMENT\" = kvm",
+        "test \"$MIZ_UBUNTU2604_QEMU_CPU\" = host",
+        "test \"$MIZ_UBUNTU2604_QEMU_MACHINE\" = q35",
+        "test \"$MIZ_UBUNTU2604_QEMU_JOB_TIMEOUT_MINUTES\" = 180",
+        "test \"$MIZ_UBUNTU2604_QEMU\" = /usr/bin/qemu-system-x86_64",
+        "test \"$(uname -m)\" = \"$expected_uname\"",
+        "test \"$(dpkg --print-architecture)\" = \"$expected_deb\"",
+        "if [[ ! -c /dev/kvm ]]",
+        "sudo -n chown \"$(id -u):$(id -g)\" /dev/kvm",
+        "test -r /dev/kvm",
+        "test -w /dev/kvm",
+    }) |needle| try source.expectContainsIn(x86_capability, needle, workflow_path);
+    for ([_][]const u8{
+        "if: matrix.architecture == 'aarch64'",
+        "test \"$ARCHITECTURE\" = aarch64",
+        "test \"$MIZ_UBUNTU2604_QEMU_ACCELERATOR_ARGUMENT\" = tcg,thread=multi",
+        "test \"$MIZ_UBUNTU2604_QEMU_CPU\" = max",
+        "test \"$MIZ_UBUNTU2604_QEMU_MACHINE\" = virt",
+        "test \"$MIZ_UBUNTU2604_QEMU_JOB_TIMEOUT_MINUTES\" = 360",
+        "test \"$MIZ_UBUNTU2604_QEMU\" = /usr/bin/qemu-system-aarch64",
+        "test \"$(uname -m)\" = aarch64",
+        "test \"$(dpkg --print-architecture)\" = arm64",
+    }) |needle| try source.expectContainsIn(arm_capability, needle, workflow_path);
+    for ([_][]const u8{ "/dev/kvm", "kvm-api-version", "fallback", "auto" }) |needle| {
+        try source.expectOmitsIn(arm_capability, needle, workflow_path);
+    }
+
     try source.expectOrder(
         native,
         "sudo apt-get install -y --no-install-recommends \"${packages[@]}\"",
@@ -711,6 +781,50 @@ test "native acceptance is KVM-only and core Android smoke is fail-closed" {
         "- name: Require the stable KVM API version",
         workflow_path,
     );
+    const kvm_api_start = try source.indexOfIn(
+        native,
+        "- name: Require the stable KVM API version",
+        workflow_path,
+    );
+    const fixture_start = try source.indexOfIn(
+        native,
+        "- name: Provision privileged offline-root containment fixture",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        native[kvm_api_start..fixture_start],
+        "if: matrix.architecture == 'x86_64'",
+        workflow_path,
+    );
+
+    var execution_source = try Source.open(
+        std.testing.allocator,
+        "scripts/ubuntu2604/execution.zig",
+    );
+    defer execution_source.deinit();
+    try execution_source.expectContains(
+        ".accelerator_argument = \"tcg,thread=multi\"",
+    );
+    try execution_source.expectContains(".cpu = \"max\"");
+    try execution_source.expectContains(".job_minutes = 360");
+    try execution_source.expectOmits("accel=auto");
+
+    var acceptance = try Source.open(
+        std.testing.allocator,
+        "tests/ubuntu2604_acceptance.zig",
+    );
+    defer acceptance.deinit();
+    try acceptance.expectContains("\"q35,accel=kvm,smm=on\"");
+    try acceptance.expectContains(
+        "if (instance.execution_profile.accelerator == .tcg)",
+    );
+    try acceptance.expectContains("\"-accel\"");
+    try acceptance.expectContains(
+        "instance.execution_profile.accelerator_argument",
+    );
+    try acceptance.expectOmits("\"virt,accel=kvm\"");
+    try acceptance.expectOmits("accel=auto");
+
     // The workflow uses the canonical candidate-aware document validator,
     // not the retired weaker manifest-only verifier.
     try source.expectContainsIn(native, "\"$RELEASE_TOOL\" verify-native-result", workflow_path);
@@ -751,7 +865,7 @@ test "native acceptance is KVM-only and core Android smoke is fail-closed" {
     try source.expectOrder(
         native,
         "- name: Fetch and verify digest-bound Android container smoke inputs",
-        "- name: Run matching-architecture native Secure Boot acceptance",
+        "- name: Run same-architecture Secure Boot QEMU acceptance",
         workflow_path,
     );
 }
@@ -828,6 +942,26 @@ test "every job that runs the release tooling builds it from the accepted source
         workflow_path,
     );
     try source.expectContainsIn(publish, "test -x \"$RELEASE_TOOL\"", workflow_path);
+}
+
+test "Ubuntu documentation states the intentional Arm TCG contract" {
+    var document = try Source.open(std.testing.allocator, "doc/ubuntu.md");
+    defer document.deinit();
+    for ([_][]const u8{
+        "x86_64 KVM and AArch64 TCG",
+        "exact GitHub-hosted `ubuntu-24.04-arm`",
+        "`uname -m == aarch64`",
+        "`arm64`, then install",
+        "`-accel tcg,thread=multi`",
+        "`-cpu max`",
+        "never examines or changes `/dev/kvm`",
+        "never calls the\nKVM API check",
+        "neither GitHub-hosted Arm\nrunners nor an Azure-hosted CI alternative supplies Arm64 KVM",
+        "Azure Trusted\nLaunch acceptance remains mandatory for all four candidates",
+        "[#626](https://github.com/cataggar/miz/issues/626)",
+        "[#627](https://github.com/cataggar/miz/issues/627)",
+    }) |needle| try document.expectContains(needle);
+    try document.expectOmits("[self-hosted, Linux, ARM64, kvm]");
 }
 
 test "the workflow runs no Python at all" {
