@@ -18,7 +18,7 @@ fn open() !Source {
     return Source.open(std.testing.allocator, workflow_path);
 }
 
-test "each matrix carries exactly the published full-flavor candidates" {
+test "each matrix carries the exact four published candidates" {
     var workflow = try open();
     defer workflow.deinit();
 
@@ -34,25 +34,56 @@ test "each matrix carries exactly the published full-flavor candidates" {
         const end = try std.fmt.bufPrint(&end_buffer, "\n  {s}:\n", .{boundary[1]});
         const section = try workflow.section(start, end);
 
-        try std.testing.expectEqual(
-            @as(usize, 1),
-            std.mem.count(u8, section, "- key: x86_64-full"),
-        );
-        try std.testing.expectEqual(
-            @as(usize, 1),
-            std.mem.count(u8, section, "- key: aarch64-full"),
-        );
-        try source.expectOmitsIn(section, "-core", boundary[0]);
-        try source.expectContainsIn(
-            section,
-            "asset_name: Ubuntu-26.04-x86_64.qcow2",
-            boundary[0],
-        );
-        try source.expectContainsIn(
-            section,
-            "asset_name: Ubuntu-26.04-aarch64.qcow2",
-            boundary[0],
-        );
+        const rows = [_]struct {
+            key: []const u8,
+            architecture: []const u8,
+            flavor: []const u8,
+            asset_name: []const u8,
+        }{
+            .{
+                .key = "x86_64-full",
+                .architecture = "x86_64",
+                .flavor = "full",
+                .asset_name = "Ubuntu-26.04-x86_64.qcow2",
+            },
+            .{
+                .key = "aarch64-full",
+                .architecture = "aarch64",
+                .flavor = "full",
+                .asset_name = "Ubuntu-26.04-aarch64.qcow2",
+            },
+            .{
+                .key = "x86_64-core",
+                .architecture = "x86_64",
+                .flavor = "core",
+                .asset_name = "Ubuntu-26.04-x86_64.core.qcow2",
+            },
+            .{
+                .key = "aarch64-core",
+                .architecture = "aarch64",
+                .flavor = "core",
+                .asset_name = "Ubuntu-26.04-aarch64.core.qcow2",
+            },
+        };
+        for (rows) |row| {
+            var key_buffer: [64]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buffer, "- key: {s}", .{row.key});
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, section, key));
+            var row_buffer: [256]u8 = undefined;
+            const identity = try std.fmt.bufPrint(
+                &row_buffer,
+                "- key: {s}\n            architecture: {s}\n            flavor: {s}",
+                .{ row.key, row.architecture, row.flavor },
+            );
+            try source.expectContainsIn(section, identity, boundary[0]);
+            var asset_buffer: [128]u8 = undefined;
+            const asset = try std.fmt.bufPrint(
+                &asset_buffer,
+                "asset_name: {s}",
+                .{row.asset_name},
+            );
+            try source.expectContainsIn(section, asset, boundary[0]);
+        }
     }
 }
 
@@ -65,6 +96,10 @@ test "candidate reuse is bound to one attempt, job, and artifact" {
     try workflow.expectContains(
         "ubuntu2604-candidate-$key-$commit-$candidate_run_attempt",
     );
+    try workflow.expectContains(
+        "for key in x86_64-full aarch64-full x86_64-core aarch64-core",
+    );
+    try workflow.expectContains(")] | length' <<<\"$jobs\"\n            )\" = 4");
 }
 
 test "publication fails closed across all three matrices" {
@@ -119,6 +154,26 @@ test "publication fails closed across all three matrices" {
     try source.expectContainsIn(
         publish,
         "--run-attempt \"$RUN_ATTEMPT_VALUE\"",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        publish,
+        "pattern: ubuntu2604-candidate-*",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        publish,
+        "pattern: ubuntu2604-native-*",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        publish,
+        "pattern: ubuntu2604-azure-*",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        publish,
+        "- name: Publish exactly four accepted Ubuntu assets",
         workflow_path,
     );
 }
@@ -251,12 +306,63 @@ test "privileged build outputs are removed with privilege and failures surface" 
     try source.expectOmitsIn(cleanup, "chmod", workflow_path);
 }
 
+test "native and Azure cleanup is unconditional for every matrix leg" {
+    var workflow = try open();
+    defer workflow.deinit();
+
+    const native = try workflow.section("\n  native_qemu:\n", "\n  azure_acceptance:\n");
+    try source.expectContainsIn(
+        native,
+        "- name: Remove candidate and local acceptance state\n        if: always()",
+        workflow_path,
+    );
+    try source.expectContainsIn(native, "set -uo pipefail", workflow_path);
+    try source.expectContainsIn(
+        native,
+        "rm -rf -- \".release/native/$CANDIDATE_KEY\" || status=1",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        native,
+        "rm -rf -- \"$RESULT_DIR\" || status=1",
+        workflow_path,
+    );
+    try source.expectContainsIn(native, "exit \"$status\"", workflow_path);
+
+    const azure = try workflow.section("\n  azure_acceptance:\n", "\n  publish:\n");
+    try source.expectContainsIn(
+        azure,
+        "- name: Refresh Azure OIDC credential for unconditional cleanup\n        if: always()",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        azure,
+        "- name: Delete only ownership-tagged temporary Azure resources\n        if: always()",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        azure,
+        "- name: Remove derived VHD and local credentials\n        if: always()",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        azure,
+        "rm -rf -- \".release/azure/$CANDIDATE_KEY\" || status=1",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        azure,
+        "rm -rf -- \"$RESULT_DIR\" || status=1",
+        workflow_path,
+    );
+}
+
 test "the release identifier uses one calendar date everywhere" {
     var workflow = try open();
     defer workflow.deinit();
-    try workflow.expectContains("group: ubuntu2604-release-20260822");
-    try workflow.expectContains("RELEASE_TAG: Ubuntu-26.04-20260822");
-    try workflow.expectContains("RELEASE_TITLE: Ubuntu Server 26.04 - 20260822");
+    try workflow.expectContains("group: ubuntu2604-release-20260828");
+    try workflow.expectContains("RELEASE_TAG: Ubuntu-26.04-20260828");
+    try workflow.expectContains("RELEASE_TITLE: Ubuntu 26.04 full and core - 20260828");
     try workflow.expectContains("create or retarget RELEASE_TAG");
 }
 
@@ -375,7 +481,7 @@ test "the build log pipeline prepares its directory and propagates failures" {
     defer workflow.deinit();
     const build = try workflow.section(
         "- name: Build exact finalized Ubuntu QCOW2",
-        "- name: Validate standalone zstd QCOW2 and exact 5 GiB size",
+        "- name: Validate standalone zstd QCOW2 and exact flavor size",
     );
     try source.expectOrder(build, "set -euo pipefail", "2>&1 | tee \"$build_log\"", workflow_path);
     try source.expectOrder(
@@ -467,7 +573,7 @@ test "the build job validates the QCOW2 and publishes its metadata natively" {
     const build_job = try workflow.section("\n  build:\n", "\n  native_qemu:\n");
     const validate_start = try source.indexOfIn(
         build_job,
-        "- name: Validate standalone zstd QCOW2 and exact 5 GiB size",
+        "- name: Validate standalone zstd QCOW2 and exact flavor size",
         workflow_path,
     );
     const rest = build_job[validate_start..];
@@ -494,18 +600,32 @@ test "the build job validates the QCOW2 and publishes its metadata natively" {
     // tooling rather than an inline interpreter.
     try source.expectContainsIn(validate, "image-info.json", workflow_path);
     try source.expectContainsIn(validate, "\"$RELEASE_TOOL\" verify-image-info", workflow_path);
-    try source.expectContainsIn(validate, "--virtual-size-label \"5 GiB\"", workflow_path);
+    try source.expectContainsIn(
+        validate,
+        "--virtual-size-label \"$VIRTUAL_SIZE_LABEL\"",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        build_job,
+        "-Dubuntu2604-flavor=\"$FLAVOR\"",
+        workflow_path,
+    );
+    try source.expectContainsIn(build_job, "virtual_size: 5368709120", workflow_path);
+    try source.expectContainsIn(build_job, "virtual_size_label: 5 GiB", workflow_path);
+    try source.expectContainsIn(build_job, "virtual_size: 3758096384", workflow_path);
+    try source.expectContainsIn(build_job, "virtual_size_label: 3584 MiB", workflow_path);
+    try source.expectContainsIn(build_job, "FLAVOR: ${{ matrix.flavor }}", workflow_path);
     try source.expectOmitsIn(build_job, source.interpreter, workflow_path);
 }
 
-test "native acceptance cannot silently skip" {
+test "native acceptance is KVM-only and core Android smoke is fail-closed" {
     var workflow = try open();
     defer workflow.deinit();
     const native = try workflow.section("  native_qemu:", "  azure_acceptance:");
     const needles = [_][]const u8{
         "runner: ubuntu-24.04",
         "runner: [self-hosted, Linux, ARM64, kvm]",
-        "FLAVOR: full",
+        "FLAVOR: ${{ matrix.flavor }}",
         "if [[ ! -c /dev/kvm ]]",
         "sudo -n chown \"$(id -u):$(id -g)\" /dev/kvm",
         "test -r /dev/kvm",
@@ -534,6 +654,11 @@ test "native acceptance cannot silently skip" {
         "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ID=",
         "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ATTEMPT=",
         "-Dubuntu2604-flavor=\"$FLAVOR\"",
+        "if: matrix.flavor == 'core'",
+        "prepare-android-smoke-inputs",
+        "ANDROID_SMOKE_INPUT_VALUE: ${{ secrets[matrix.android_smoke_secret] }}",
+        "ANDROID_ARTIFACT_TOKEN_VALUE: ${{ secrets.ANDROID_ARTIFACT_TOKEN }}",
+        ".release/native/$CANDIDATE_KEY/android-smoke",
     };
     for (needles) |needle| try source.expectContainsIn(native, needle, workflow_path);
     try source.expectOmitsIn(native, "/usr/bin/coreutils", workflow_path);
@@ -615,15 +740,65 @@ test "native acceptance cannot silently skip" {
         "--source-commit \"$SOURCE_COMMIT\"",
         workflow_path,
     );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, native, "android_smoke_secret: ANDROID_SMOKE_X86_64_JSON"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, native, "android_smoke_secret: ANDROID_SMOKE_AARCH64_JSON"),
+    );
+    try source.expectOrder(
+        native,
+        "- name: Fetch and verify digest-bound Android container smoke inputs",
+        "- name: Run matching-architecture native Secure Boot acceptance",
+        workflow_path,
+    );
 }
 
-test "Azure OIDC login is fresh for acceptance" {
+test "Azure acceptance conditionally adds core Binder and Android validation" {
     var workflow = try open();
     defer workflow.deinit();
     const azure = try workflow.section("  azure_acceptance:", "  publish:");
+    const needles = [_][]const u8{
+        "FLAVOR: ${{ matrix.flavor }}",
+        "BINDER_PROBE: ${{ github.workspace }}/zig-out/bin/binder-probe-${{ matrix.key }}",
+        "-target \"$ARCHITECTURE-linux\"",
+        "-static",
+        "tests/binder_probe.zig",
+        "-femit-bin=\"$BINDER_PROBE\"",
+        "test -x \"$BINDER_PROBE\"",
+        "if: matrix.flavor == 'core'",
+        "prepare-android-smoke-inputs",
+        "ANDROID_SMOKE_INPUT_VALUE: ${{ secrets[matrix.android_smoke_secret] }}",
+        "ANDROID_ARTIFACT_TOKEN_VALUE: ${{ secrets.ANDROID_ARTIFACT_TOKEN }}",
+        ".release/azure/$CANDIDATE_KEY/android-smoke",
+        "scripts/ubuntu2604_azure_acceptance.sh run",
+    };
+    for (needles) |needle| try source.expectContainsIn(azure, needle, workflow_path);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, azure, "android_smoke_secret: ANDROID_SMOKE_X86_64_JSON"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, azure, "android_smoke_secret: ANDROID_SMOKE_AARCH64_JSON"),
+    );
     try source.expectOrder(
         azure,
         "- name: Build accepted-source miz",
+        "- name: Build Binder device usability probe",
+        workflow_path,
+    );
+    try source.expectOrder(
+        azure,
+        "- name: Build Binder device usability probe",
+        "- name: Fetch and verify digest-bound Android container smoke inputs",
+        workflow_path,
+    );
+    try source.expectOrder(
+        azure,
+        "- name: Fetch and verify digest-bound Android container smoke inputs",
         "- name: Log in to Azure with protected-environment OIDC",
         workflow_path,
     );
@@ -649,7 +824,7 @@ test "every job that runs the release tooling builds it from the accepted source
     try source.expectOrder(
         publish,
         "- name: Build accepted-source release tooling",
-        "- name: Validate exact two-architecture release gate",
+        "- name: Validate exact four-candidate release gate",
         workflow_path,
     );
     try source.expectContainsIn(publish, "test -x \"$RELEASE_TOOL\"", workflow_path);

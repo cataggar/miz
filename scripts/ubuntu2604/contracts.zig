@@ -50,9 +50,14 @@ pub const candidate_expected = [_]Candidate{
     },
 };
 
-/// `RELEASE_ORDER` / `EXPECTED`: only the full flavor is ever published, and
-/// the publication order is fixed so staged metadata is reproducible.
-pub const release_order = [_][]const u8{ "x86_64-full", "aarch64-full" };
+/// `RELEASE_ORDER` / `EXPECTED`: the exact four-asset publication order. It is
+/// fixed so staged metadata and release notes are reproducible.
+pub const release_order = [_][]const u8{
+    "x86_64-full",
+    "aarch64-full",
+    "x86_64-core",
+    "aarch64-core",
+};
 
 pub fn lookup(key: []const u8) ?Candidate {
     for (candidate_expected) |entry| {
@@ -61,7 +66,7 @@ pub fn lookup(key: []const u8) ?Candidate {
     return null;
 }
 
-/// Whether `key` is one of the two published (full-flavor) candidate keys.
+/// Whether `key` is one of the four published candidate keys.
 pub fn isReleaseKey(key: []const u8) bool {
     for (release_order) |entry| {
         if (std.mem.eql(u8, entry, key)) return true;
@@ -333,12 +338,13 @@ pub fn debzPackages(flavor: Flavor) []const []const u8 {
 }
 
 test "candidate identity tables agree with the release order" {
-    for (release_order) |key| {
-        const entry = lookup(key).?;
-        try std.testing.expectEqualStrings("full", entry.flavor);
+    try std.testing.expectEqual(candidate_expected.len, release_order.len);
+    for (candidate_expected, release_order) |candidate, key| {
+        try std.testing.expectEqualStrings(candidate.key, key);
+        try std.testing.expect(isReleaseKey(key));
     }
     try std.testing.expect(lookup("riscv64-core") == null);
-    try std.testing.expect(!isReleaseKey("x86_64-core"));
+    try std.testing.expect(!isReleaseKey("riscv64-core"));
     try std.testing.expectEqualStrings("amd64", sourceArchitecture("x86_64").?);
     try std.testing.expectEqualStrings("arm64", sourceArchitecture("aarch64").?);
     try std.testing.expect(sourceArchitecture("riscv64") == null);

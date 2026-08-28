@@ -52,7 +52,8 @@ release `FreeBSD-15.1-20260724`; on an AArch64 host it downloads
 `FreeBSD-15.1-aarch64.qcow2`.
 The `Ubuntu` alias selects the host-native full Ubuntu 26.04 image from release
 `Ubuntu-26.04-20260822`; use `--arch` to override it. Ubuntu core catalog
-selection remains unsupported until #627.
+selection remains fail-closed until the four-asset release completes and a
+follow-up change pins its final core URLs, image digests, and signing identity.
 Existing images are never refreshed or overwritten. QEMU and its matching
 EDK2 firmware are resolved from the `cataggar/qemu` ghr installation first,
 then from a system QEMU/UEFI installation. Directory-prefixed aliases such as
@@ -236,7 +237,11 @@ and
 `f78fb8f8fc54af4bc26ac97f7cb1fd9750abdf4f24e62f7cffffeb2daef4b175`,
 respectively. Secure Boot pins the canonical-DER certificate SHA-256
 `08796d5bf0e16eb1731408be816bbbc014e9a81d91c7afbf34bf8c9e4617ae19`.
-`--model core` is rejected for Ubuntu until #627 publishes core assets.
+The resolver enables model selection for a catalog family only when complete
+x86_64 and AArch64 pins exist for both full and core under one release tag and
+signing identity. Therefore `--model core` remains rejected for Ubuntu until
+the finalized four-asset release values are added; a partial rotation cannot
+become selectable.
 
 ## Shared firmware resolution
 
