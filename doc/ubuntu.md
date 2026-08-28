@@ -294,7 +294,7 @@ builder dependencies as the release workflow:
 ```console
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
-  file jq python3 systemd-boot-efi
+  file jq systemd-boot-efi
 ```
 
 `systemd-boot-efi` installs only the architecture-matched systemd-boot EFI
@@ -309,7 +309,11 @@ the guest image. The stub source path and its SHA-256 are recorded in the
 signing provenance sidecar.
 
 The builder inventory is therefore limited to the native UKI stub source
-(`systemd-boot-efi`), `python3`, `file`, and `jq`. HTTPS/OpenPGP artifact
+(`systemd-boot-efi`), `file`, and `jq`. The release schema, provenance,
+acceptance, staging, and publication checks are a single native tool
+(`zig-out/bin/ubuntu2604_release`, built by `zig build`), so no interpreter is
+installed or invoked anywhere in the Ubuntu release, core-validation,
+acceptance, local end-to-end, or publication paths. HTTPS/OpenPGP artifact
 verification and XZ/zstd decoding and encoding plus newc cpio archive creation
 are native, bounded implementations; no host codec library or `curl`, GnuPG,
 `cpio`, `xz`, or `zstd` executable is used. X.509 certificate normalization,
@@ -726,10 +730,12 @@ The core workflow keeps `x86_64` native acceptance on the `ubuntu-24.04`
 hosted runner. Its `aarch64` leg requires a repository runner matching
 `[self-hosted, Linux, ARM64, kvm]`: a native Ubuntu ARM64 host with
 passwordless `sudo`, the matching Debian architecture, and a usable KVM
-device. The job opens `/dev/kvm` and verifies the KVM API before downloading
-the candidate, then installs `qemu-system-aarch64` and Secure Boot-capable
-AAVMF. It never falls back to TCG. These labels describe a dedicated native
-ARM64 KVM host and do not imply Azure nested virtualization.
+device. The job proves `/dev/kvm` is present, readable, and writable before
+downloading the candidate, then installs `qemu-system-aarch64` and Secure
+Boot-capable AAVMF and verifies the stable KVM API version with the release
+tooling built from the accepted source. It never falls back to TCG. These
+labels describe a dedicated native ARM64 KVM host and do not imply Azure
+nested virtualization.
 
 Per-instance Secure Boot variable stores are created natively by
 `miz.efi_varstore`, the same EDK II variable-store parser and editor
@@ -855,12 +861,15 @@ encrypted entries, or non-regular file types.
 The extracted manifest digest is verified before the document is parsed.
 The manifest must use schema `android-smoke-provenance.v1`, type
 `application/vnd.android-smoke.v1+json`, and the exact field set enforced by
-`scripts/ubuntu2604_release.py`. It must match the selected architecture and
+`ubuntu2604_release prepare-android-smoke-inputs`. It must match the selected architecture and
 provide valid runtime, bundle, source manifest, and extracted `config.json`
 digests. The raw `producer_source_commit` and immutable image reference are
 validated only inside the verifier and are never copied into public
 evidence. The artifact digests verify both extracted files and the bundle
-config.
+config. `android-bundle.tar` may be a plain tar or a gzip-, bzip2-, xz-, or
+zstd-compressed one: the producer is external, the name says nothing about the
+container, and the config digest is read from whatever the archive actually
+holds rather than from bytes assumed to be tar.
 
 These secrets are deliberately not scoped to the `ubuntu2604-release`
 environment, so the native-QEMU job -- which needs no Azure credential --

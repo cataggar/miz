@@ -21,6 +21,9 @@
 # Notes:
 #   * Requires passwordless sudo: the debz customize stage runs inside a
 #     privileged offline-root mount namespace (euid 0).
+#   * Both `zig-out/bin/miz` and `zig-out/bin/ubuntu2604_release` must already
+#     be built (`zig build`); this driver validates the finalized candidate with
+#     the same tooling the release workflow uses.
 #   * A full build is only feasible for a guest architecture whose systemd-boot
 #     EFI stub is installed on the host. On an x86_64 host without the aarch64
 #     stub, use the deterministic resolve->customize integration test for arm64
@@ -89,26 +92,17 @@ cp "$build_log" "$PROVENANCE_DIR/build.log"
 
 echo "== validating finalized candidate =="
 MIZ="$REPO_ROOT/zig-out/bin/miz"
+RELEASE_TOOL="${UBUNTU2604_RELEASE_TOOL:-$REPO_ROOT/zig-out/bin/ubuntu2604_release}"
 test -f "$OUTPUT"
 test -x "$MIZ"
+test -x "$RELEASE_TOOL"
 "$MIZ" check "$OUTPUT"
 "$MIZ" info --output=json "$OUTPUT" > "$PROVENANCE_DIR/image-info.json"
-python3 - "$PROVENANCE_DIR/image-info.json" "$VIRTUAL_SIZE" <<'PY'
-import json
-import sys
-
-info = json.load(open(sys.argv[1], encoding="utf-8"))
-if info.get("format") != "qcow2":
-    raise SystemExit("candidate is not QCOW2")
-if info.get("virtual-size") != int(sys.argv[2]):
-    raise SystemExit("candidate virtual size is not exactly the requested size")
-if info.get("backing-filename") or info.get("full-backing-filename"):
-    raise SystemExit("candidate has a backing file")
-data = (info.get("format-specific") or {}).get("data") or {}
-if data.get("compression-type") != "zstd":
-    raise SystemExit("candidate does not use zstd cluster compression")
-print("candidate is a standalone zstd QCOW2 at the exact requested virtual size")
-PY
+"$RELEASE_TOOL" verify-image-info \
+  --info "$PROVENANCE_DIR/image-info.json" \
+  --virtual-size "$VIRTUAL_SIZE" \
+  --virtual-size-label "the requested size"
+echo "candidate is a standalone zstd QCOW2 at the exact requested virtual size"
 
 digest=$(sha256sum "$OUTPUT" | cut -d' ' -f1)
 [[ "$digest" =~ ^[0-9a-f]{64}$ ]]

@@ -171,6 +171,7 @@ jobs:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       WORK_DIR: .scratch/ubuntu2604-core-validation-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       BUNDLE_DIR: artifact-staging/core-candidates/${{ matrix.key }}
+      RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
       SIGNING_PROBE_DIR: ${{ github.workspace }}/signing-probe-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/miz
       MIZ_AZURE_TENANT_ID: ${{ vars.MIZ_AZURE_TENANT_ID }}
@@ -199,7 +200,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           packages=(
-            file jq python3 systemd-boot-efi
+            file jq systemd-boot-efi
           )
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
           case "$ARCHITECTURE" in
@@ -214,8 +215,9 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build install-miz
+          zig build install-miz install-ubuntu2604-release
           test -x "$UKI_SIGN_COMMAND"
+          test -x "$RELEASE_TOOL"
 
       - name: Resolve protected signing certificate
         run: |
@@ -307,22 +309,13 @@ jobs:
           miz="$GITHUB_WORKSPACE/zig-out/bin/miz"
           test -f "$asset"
           test -x "$miz"
+          test -x "$RELEASE_TOOL"
           "$miz" check "$asset"
           "$miz" info --output=json "$asset" > "$BUNDLE_DIR/internal-provenance/image-info.json"
-          python3 - "$BUNDLE_DIR/internal-provenance/image-info.json" "$VIRTUAL_SIZE" <<'PY'
-          import json
-          import sys
-          info = json.load(open(sys.argv[1], encoding="utf-8"))
-          if info.get("format") != "qcow2":
-              raise SystemExit("candidate is not QCOW2")
-          if info.get("virtual-size") != int(sys.argv[2]):
-              raise SystemExit("candidate virtual size is not exactly 3584 MiB")
-          if info.get("backing-filename") or info.get("full-backing-filename"):
-              raise SystemExit("candidate has a backing file")
-          data = (info.get("format-specific") or {}).get("data") or {}
-          if data.get("compression-type") != "zstd":
-              raise SystemExit("candidate does not use zstd cluster compression")
-          PY
+          "$RELEASE_TOOL" verify-image-info \
+            --info "$BUNDLE_DIR/internal-provenance/image-info.json" \
+            --virtual-size "$VIRTUAL_SIZE" \
+            --virtual-size-label "3584 MiB"
           digest=$(sha256sum "$asset" | awk '{print $1}')
           [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
           printf '%s\n' "$digest" > "$BUNDLE_DIR/internal-provenance/build-validated-digest"
@@ -335,7 +328,7 @@ jobs:
         run: |
           set -euo pipefail
           validated=$(<"$BUNDLE_DIR/internal-provenance/build-validated-digest")
-          python3 scripts/ubuntu2604_release.py candidate \
+          "$RELEASE_TOOL" candidate \
             --key "$CANDIDATE_KEY" \
             --architecture "$ARCHITECTURE" \
             --flavor "$FLAVOR" \
@@ -348,7 +341,7 @@ jobs:
             --run-id "$RUN_ID_VALUE" \
             --run-attempt "$RUN_ATTEMPT_VALUE" \
             --output "$BUNDLE_DIR/candidate.json"
-          python3 scripts/ubuntu2604_release.py verify-candidate \
+          "$RELEASE_TOOL" verify-candidate \
             --manifest "$BUNDLE_DIR/candidate.json" \
             --asset "$BUNDLE_DIR/$ASSET_NAME" \
             --key "$CANDIDATE_KEY" \
@@ -415,6 +408,7 @@ jobs:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       CANDIDATE_DIR: .validation/native/${{ matrix.key }}/candidate
       RESULT_DIR: artifact-staging/core-native-results/${{ matrix.key }}
+      RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
     steps:
       - name: Require matching native KVM runner
         run: |
@@ -445,18 +439,6 @@ jobs:
           sudo -n chown "$(id -u):$(id -g)" /dev/kvm
           test -r /dev/kvm
           test -w /dev/kvm
-          python3 - <<'PY'
-          import fcntl
-          import os
-
-          fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
-          try:
-              api_version = fcntl.ioctl(fd, 0xAE00)
-          finally:
-              os.close(fd)
-          if api_version != 12:
-              raise SystemExit(f"unsupported KVM API version: {api_version}")
-          PY
 
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -522,6 +504,24 @@ jobs:
           done
           command -v "$qemu" >/dev/null
 
+      - name: Build accepted-source release tooling
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build --fetch \
+            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build install-ubuntu2604-release
+          test -x "$RELEASE_TOOL"
+
+      # The runner's /dev/kvm was proven present and writable before the
+      # checkout; this proves it speaks the stable KVM ABI the acceptance
+      # harness targets, using the tooling built from the accepted source.
+      - name: Require the stable KVM API version
+        run: |
+          set -euo pipefail
+          "$RELEASE_TOOL" kvm-api-version
+
       - name: Provision privileged offline-root containment fixture
         run: |
           set -euo pipefail
@@ -552,32 +552,16 @@ jobs:
           mkdir -p "$RESULT_DIR"
           asset="$CANDIDATE_DIR/$ASSET_NAME"
           manifest="$CANDIDATE_DIR/candidate.json"
-          python3 scripts/ubuntu2604_release.py verify-candidate \
+          test -x "$RELEASE_TOOL"
+          "$RELEASE_TOOL" verify-candidate \
             --manifest "$manifest" \
             --asset "$asset" \
             --key "$CANDIDATE_KEY" \
             --source-commit "$SOURCE_COMMIT"
-          python3 - "$manifest" "$RESULT_DIR/signing-certificate.der" "$GITHUB_ENV" <<'PY'
-          import base64
-          import json
-          import re
-          import sys
-          manifest_path, certificate_path, environment_path = sys.argv[1:]
-          value = json.load(open(manifest_path, encoding="utf-8"))
-          signing = value["uki_signing"]
-          values = {
-              "MIZ_UBUNTU2604_IMAGE_SHA256": value["sha256"],
-              "MIZ_UBUNTU2604_SIGNING_CERTIFICATE_SHA256": signing["certificate_sha256"],
-              "MIZ_UBUNTU2604_UKI_SHA256": signing["fallback_uki_sha256"],
-          }
-          if any(re.fullmatch(r"[0-9a-f]{64}", item) is None for item in values.values()):
-              raise SystemExit("candidate signing bindings are malformed")
-          certificate = base64.b64decode(signing["certificate_der_base64"], validate=True)
-          open(certificate_path, "wb").write(certificate)
-          with open(environment_path, "a", encoding="utf-8") as output:
-              for name, item in values.items():
-                  print(f"{name}={item}", file=output)
-          PY
+          "$RELEASE_TOOL" candidate-signing-env \
+            --manifest "$manifest" \
+            --certificate "$RESULT_DIR/signing-certificate.der" \
+            --github-env "$GITHUB_ENV" >/dev/null
           openssl x509 -inform DER \
             -in "$RESULT_DIR/signing-certificate.der" \
             -out "$RESULT_DIR/signing-certificate.pem"
@@ -592,7 +576,7 @@ jobs:
         run: |
           set +x
           set -euo pipefail
-          python3 scripts/ubuntu2604_release.py prepare-android-smoke-inputs \
+          "$RELEASE_TOOL" prepare-android-smoke-inputs \
             --architecture "$ARCHITECTURE" \
             --output-dir "$GITHUB_WORKSPACE/.validation/native/$CANDIDATE_KEY/android-smoke" \
             --github-env "$GITHUB_ENV"
@@ -613,7 +597,7 @@ jobs:
       - name: Validate exact native core acceptance evidence
         run: |
           set -euo pipefail
-          python3 scripts/ubuntu2604_release.py verify-native-result \
+          "$RELEASE_TOOL" verify-native-result \
             --manifest "$CANDIDATE_DIR/candidate.json" \
             --asset "$CANDIDATE_DIR/$ASSET_NAME" \
             --result "$RESULT_DIR/native-result.json" \
@@ -693,6 +677,7 @@ jobs:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       CANDIDATE_DIR: .validation/azure/${{ matrix.key }}/candidate
       RESULT_DIR: artifact-staging/core-azure-results/${{ matrix.key }}
+      RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
       STATE_FILE: .validation/azure/${{ matrix.key }}/resource-group
       AZURE_LOCATION: ${{ vars[matrix.location_variable] }}
       AZURE_VM_SIZE: ${{ vars[matrix.size_variable] }}
@@ -740,7 +725,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends openssh-client qemu-utils
-          for tool in az azcopy qemu-img ssh ssh-keygen python3; do
+          for tool in az azcopy qemu-img ssh ssh-keygen; do
             command -v "$tool" >/dev/null
           done
           az version --output json >/dev/null
@@ -776,7 +761,7 @@ jobs:
         run: |
           set +x
           set -euo pipefail
-          python3 scripts/ubuntu2604_release.py prepare-android-smoke-inputs \
+          "$RELEASE_TOOL" prepare-android-smoke-inputs \
             --architecture "$ARCHITECTURE" \
             --output-dir "$GITHUB_WORKSPACE/.validation/azure/$CANDIDATE_KEY/android-smoke" \
             --github-env "$GITHUB_ENV"
@@ -882,12 +867,32 @@ jobs:
       NATIVE_RESULTS_DIR: .validation/gate/native
       AZURE_RESULTS_DIR: .validation/gate/azure
       BUNDLE_DIR: artifact-staging/core-validation
+      RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
     steps:
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ needs.prepare.outputs.source_commit }}
           persist-credentials: false
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Build accepted-source release tooling
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build --fetch \
+            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build -Doptimize=ReleaseSafe install-ubuntu2604-release
+          test -x "$RELEASE_TOOL"
 
       - name: Download both build-validated core candidates
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -920,164 +925,16 @@ jobs:
           set -euo pipefail
           rm -rf -- "$BUNDLE_DIR"
           mkdir -p "$BUNDLE_DIR"
-          python3 - \
-            "$CANDIDATES_DIR" \
-            "$NATIVE_RESULTS_DIR" \
-            "$AZURE_RESULTS_DIR" \
-            "$BUNDLE_DIR/validation.json" \
-            "$SOURCE_COMMIT" \
-            "$CANDIDATE_RUN_ID" \
-            "$CANDIDATE_RUN_ATTEMPT" \
-            "$RUN_ID_VALUE" \
-            "$RUN_ATTEMPT_VALUE" <<'PY'
-          import hashlib
-          import json
-          import sys
-          from pathlib import Path
-          from scripts import ubuntu2604_release as release
-
-          (
-              candidates_root,
-              native_root,
-              azure_root,
-              output_path,
-          ) = map(Path, sys.argv[1:5])
-          (
-              source_commit,
-              candidate_run_id,
-              candidate_run_attempt,
-              run_id,
-              run_attempt,
-          ) = sys.argv[5:]
-          expected = {
-              "x86_64-core": "Ubuntu-26.04-x86_64.core.qcow2",
-              "aarch64-core": "Ubuntu-26.04-aarch64.core.qcow2",
-          }
-          candidate_docs = list(candidates_root.rglob("candidate.json"))
-          native_docs = list(native_root.rglob("native-result.json"))
-          azure_docs = list(azure_root.rglob("azure-result.json"))
-          qcow_paths = list(candidates_root.rglob("*.qcow2"))
-          if (
-              len(candidate_docs) != 2
-              or len(native_docs) != 2
-              or len(azure_docs) != 2
-              or len(qcow_paths) != 2
-          ):
-              raise SystemExit("core gate did not receive two candidates, two native results, two Azure results, and two images")
-
-          def load_by_key(paths):
-              result = {}
-              for path in paths:
-                  value = json.load(open(path, encoding="utf-8"))
-                  key = value.get("key")
-                  if key not in expected or key in result:
-                      raise SystemExit("unexpected or duplicate core result")
-                  result[key] = (path, value)
-              if set(result) != set(expected):
-                  raise SystemExit("core validation matrix is incomplete")
-              return result
-
-          candidates = load_by_key(candidate_docs)
-          azure = load_by_key(azure_docs)
-
-          native = {}
-          native_digests = set()
-          for path in native_docs:
-              value = json.load(open(path, encoding="utf-8"))
-              android_smoke = value.get("android_smoke")
-              key = (
-                  android_smoke.get("candidate_key")
-                  if isinstance(android_smoke, dict)
-                  else None
-              )
-              digest = value.get("candidate_sha256")
-              if key not in expected or key in native:
-                  raise SystemExit("unexpected or duplicate native core result")
-              if not isinstance(digest, str):
-                  raise SystemExit(f"{key}: native candidate digest is malformed")
-              if digest in native_digests:
-                  raise SystemExit("duplicate native acceptance digest")
-              native[key] = (path, value)
-              native_digests.add(digest)
-          if set(native) != set(expected):
-              raise SystemExit("core native validation matrix is incomplete")
-          if {path.name for path in qcow_paths} != set(expected.values()):
-              raise SystemExit("core candidate asset set is not exact")
-
-          records = []
-          for key, asset_name in expected.items():
-              manifest_path, candidate = candidates[key]
-              asset_path = manifest_path.parent / asset_name
-              candidate = release.verify_candidate(
-                  manifest_path,
-                  asset_path,
-                  key=key,
-                  source_commit=source_commit,
-              )
-              if candidate.get("workflow") != {
-                  "run_id": candidate_run_id,
-                  "run_attempt": candidate_run_attempt,
-              }:
-                  raise SystemExit(f"{key}: candidate workflow attempt is not exact")
-              native_path, native_result = native[key]
-              if native_result.get("candidate_sha256") != candidate["sha256"]:
-                  raise SystemExit(f"{key}: native result is not candidate-key/digest bound")
-              release.validate_native_result(
-                  manifest_path,
-                  asset_path,
-                  native_path,
-                  key=key,
-                  source_commit=source_commit,
-              )
-              azure_path, azure_result = azure[key]
-              release.validate_azure_result(
-                  manifest_path,
-                  asset_path,
-                  azure_path,
-                  key=key,
-                  source_commit=source_commit,
-              )
-              if native_result.get("android_smoke") != azure_result.get("android_smoke"):
-                  raise SystemExit(f"{key}: native and Azure Android smoke provenance differ")
-              if azure_result.get("workflow") != {
-                  "run_id": run_id,
-                  "run_attempt": run_attempt,
-              }:
-                  raise SystemExit(f"{key}: Azure workflow attempt is not exact")
-
-              def digest(path):
-                  return hashlib.sha256(path.read_bytes()).hexdigest()
-
-              records.append(
-                  {
-                      "key": key,
-                      "asset_name": asset_name,
-                      "candidate_sha256": candidate["sha256"],
-                      "candidate_manifest_sha256": digest(manifest_path),
-                      "native_result_sha256": digest(native_path),
-                      "azure_result_sha256": digest(azure_path),
-                      "android_smoke": native_result["android_smoke"],
-                  }
-              )
-          output = {
-              "schema": 2,
-              "type": "miz-ubuntu2604-core-validation",
-              "source_commit": source_commit,
-              "candidate_workflow": {
-                  "run_id": candidate_run_id,
-                  "run_attempt": candidate_run_attempt,
-              },
-              "validation_workflow": {
-                  "run_id": run_id,
-                  "run_attempt": run_attempt,
-              },
-              "candidates": records,
-          }
-          output_path.write_text(
-              json.dumps(output, indent=2, sort_keys=True) + "\n",
-              encoding="utf-8",
-          )
-          PY
+          "$RELEASE_TOOL" core-gate \
+            --candidates "$CANDIDATES_DIR" \
+            --native-results "$NATIVE_RESULTS_DIR" \
+            --azure-results "$AZURE_RESULTS_DIR" \
+            --output "$BUNDLE_DIR/validation.json" \
+            --source-commit "$SOURCE_COMMIT" \
+            --candidate-run-id "$CANDIDATE_RUN_ID" \
+            --candidate-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
+            --run-id "$RUN_ID_VALUE" \
+            --run-attempt "$RUN_ATTEMPT_VALUE"
 
       - name: Upload digest-bound complete core validation
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

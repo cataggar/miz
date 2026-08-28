@@ -169,6 +169,7 @@ jobs:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       WORK_DIR: .scratch/ubuntu2604-release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       BUNDLE_DIR: artifact-staging/candidates/${{ matrix.key }}
+      RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
       SIGNING_PROBE_DIR: ${{ github.workspace }}/signing-probe-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/miz
       MIZ_AZURE_TENANT_ID: ${{ vars.MIZ_AZURE_TENANT_ID }}
@@ -197,7 +198,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           packages=(
-            file jq python3 systemd-boot-efi
+            file jq systemd-boot-efi
           )
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
           case "$ARCHITECTURE" in
@@ -212,8 +213,9 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build install-miz
+          zig build install-miz install-ubuntu2604-release
           test -x "$UKI_SIGN_COMMAND"
+          test -x "$RELEASE_TOOL"
 
       - name: Resolve protected signing certificate
         run: |
@@ -309,6 +311,7 @@ jobs:
           miz="$GITHUB_WORKSPACE/zig-out/bin/miz"
           test -f "$asset"
           test -x "$miz"
+          test -x "$RELEASE_TOOL"
           # Native validation and metadata: miz replaces the external image
           # tool as both the QCOW2 integrity check and the info publication
           # input (issue #476). The compressed release image is emitted by
@@ -316,20 +319,10 @@ jobs:
           # any external qemu tooling.
           "$miz" check "$asset"
           "$miz" info --output=json "$asset" > "$BUNDLE_DIR/internal-provenance/image-info.json"
-          python3 - "$BUNDLE_DIR/internal-provenance/image-info.json" "$VIRTUAL_SIZE" <<'PY'
-          import json
-          import sys
-          info = json.load(open(sys.argv[1], encoding="utf-8"))
-          if info.get("format") != "qcow2":
-              raise SystemExit("candidate is not QCOW2")
-          if info.get("virtual-size") != int(sys.argv[2]):
-              raise SystemExit("candidate virtual size is not exactly 5 GiB")
-          if info.get("backing-filename") or info.get("full-backing-filename"):
-              raise SystemExit("candidate has a backing file")
-          data = (info.get("format-specific") or {}).get("data") or {}
-          if data.get("compression-type") != "zstd":
-              raise SystemExit("candidate does not use zstd cluster compression")
-          PY
+          "$RELEASE_TOOL" verify-image-info \
+            --info "$BUNDLE_DIR/internal-provenance/image-info.json" \
+            --virtual-size "$VIRTUAL_SIZE" \
+            --virtual-size-label "5 GiB"
           digest=$(sha256sum "$asset" | awk '{print $1}')
           [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
           printf '%s\n' "$digest" > "$BUNDLE_DIR/internal-provenance/build-validated-digest"
@@ -342,7 +335,7 @@ jobs:
         run: |
           set -euo pipefail
           validated=$(<"$BUNDLE_DIR/internal-provenance/build-validated-digest")
-          python3 scripts/ubuntu2604_release.py candidate \
+          "$RELEASE_TOOL" candidate \
             --key "$CANDIDATE_KEY" \
             --architecture "$ARCHITECTURE" \
             --flavor "$FLAVOR" \
@@ -355,7 +348,7 @@ jobs:
             --run-id "$RUN_ID_VALUE" \
             --run-attempt "$RUN_ATTEMPT_VALUE" \
             --output "$BUNDLE_DIR/candidate.json"
-          python3 scripts/ubuntu2604_release.py verify-candidate \
+          "$RELEASE_TOOL" verify-candidate \
             --manifest "$BUNDLE_DIR/candidate.json" \
             --asset "$BUNDLE_DIR/$ASSET_NAME" \
             --key "$CANDIDATE_KEY" \
@@ -434,6 +427,7 @@ jobs:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       CANDIDATE_DIR: .release/native/${{ matrix.key }}/candidate
       RESULT_DIR: artifact-staging/native-results/${{ matrix.key }}
+      RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
     steps:
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -493,6 +487,16 @@ jobs:
           done
           command -v qemu-system-x86_64 >/dev/null
 
+      - name: Build accepted-source release tooling
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build --fetch \
+            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build install-ubuntu2604-release
+          test -x "$RELEASE_TOOL"
+
       - name: Provision privileged offline-root containment fixture
         run: |
           set -euo pipefail
@@ -523,32 +527,16 @@ jobs:
           mkdir -p "$RESULT_DIR"
           asset="$CANDIDATE_DIR/$ASSET_NAME"
           manifest="$CANDIDATE_DIR/candidate.json"
-          python3 scripts/ubuntu2604_release.py verify-candidate \
+          test -x "$RELEASE_TOOL"
+          "$RELEASE_TOOL" verify-candidate \
             --manifest "$manifest" \
             --asset "$asset" \
             --key "$CANDIDATE_KEY" \
             --source-commit "$SOURCE_COMMIT"
-          python3 - "$manifest" "$RESULT_DIR/signing-certificate.der" "$GITHUB_ENV" <<'PY'
-          import base64
-          import json
-          import re
-          import sys
-          manifest_path, certificate_path, environment_path = sys.argv[1:]
-          value = json.load(open(manifest_path, encoding="utf-8"))
-          signing = value["uki_signing"]
-          values = {
-              "MIZ_UBUNTU2604_IMAGE_SHA256": value["sha256"],
-              "MIZ_UBUNTU2604_SIGNING_CERTIFICATE_SHA256": signing["certificate_sha256"],
-              "MIZ_UBUNTU2604_UKI_SHA256": signing["fallback_uki_sha256"],
-          }
-          if any(re.fullmatch(r"[0-9a-f]{64}", item) is None for item in values.values()):
-              raise SystemExit("candidate signing bindings are malformed")
-          certificate = base64.b64decode(signing["certificate_der_base64"], validate=True)
-          open(certificate_path, "wb").write(certificate)
-          with open(environment_path, "a", encoding="utf-8") as output:
-              for name, item in values.items():
-                  print(f"{name}={item}", file=output)
-          PY
+          "$RELEASE_TOOL" candidate-signing-env \
+            --manifest "$manifest" \
+            --certificate "$RESULT_DIR/signing-certificate.der" \
+            --github-env "$GITHUB_ENV" >/dev/null
           openssl x509 -inform DER \
             -in "$RESULT_DIR/signing-certificate.der" \
             -out "$RESULT_DIR/signing-certificate.pem"
@@ -571,36 +559,9 @@ jobs:
       - name: Validate explicit native acceptance evidence
         run: |
           set -euo pipefail
-          python3 - "$RESULT_DIR/native-result.json" "$CANDIDATE_DIR/candidate.json" <<'PY'
-          import json
-          import sys
-          result = json.load(open(sys.argv[1], encoding="utf-8"))
-          candidate = json.load(open(sys.argv[2], encoding="utf-8"))
-          expected_contracts = {
-              "matching-architecture-native-kvm", "standalone-zstd-qcow2",
-              "gpt-layout", "secure-boot", "uefi-db-signer", "signed-uki",
-              "vtpm", "kernel-lockdown", "module-signatures",
-              "tampered-uki-rejected", "key-only-ssh",
-              "cloud-init-provisioning", "walinuxagent", "netplan-networkd",
-              "generalized-identity", "root-growth", "reboot-reconnect",
-              "clean-service-health",
-          }
-          if set(result) != {
-              "schema", "type", "candidate_sha256", "certificate_sha256",
-              "fallback_uki_sha256", "contracts",
-          }:
-              raise SystemExit("native acceptance result has unexpected fields")
-          if result["schema"] != 1 or result["type"] != "ubuntu2604-local-secure-boot-acceptance":
-              raise SystemExit("native acceptance schema mismatch")
-          if result["candidate_sha256"] != candidate["sha256"]:
-              raise SystemExit("native acceptance candidate digest mismatch")
-          if result["certificate_sha256"] != candidate["uki_signing"]["certificate_sha256"]:
-              raise SystemExit("native acceptance certificate mismatch")
-          if result["fallback_uki_sha256"] != candidate["uki_signing"]["fallback_uki_sha256"]:
-              raise SystemExit("native acceptance UKI mismatch")
-          if len(result["contracts"]) != len(expected_contracts) or set(result["contracts"]) != expected_contracts:
-              raise SystemExit("native acceptance contract set mismatch")
-          PY
+          "$RELEASE_TOOL" verify-native-evidence \
+            --result "$RESULT_DIR/native-result.json" \
+            --candidate "$CANDIDATE_DIR/candidate.json"
 
       - name: Upload native acceptance failure diagnostics
         if: failure()
@@ -668,6 +629,7 @@ jobs:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       CANDIDATE_DIR: .release/azure/${{ matrix.key }}/candidate
       RESULT_DIR: artifact-staging/azure-results/${{ matrix.key }}
+      RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
       STATE_FILE: .release/azure/${{ matrix.key }}/resource-group
       AZURE_LOCATION: ${{ vars[matrix.location_variable] }}
       AZURE_VM_SIZE: ${{ vars[matrix.size_variable] }}
@@ -714,7 +676,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends openssh-client qemu-utils
-          for tool in az azcopy qemu-img ssh ssh-keygen python3 timeout; do
+          for tool in az azcopy qemu-img ssh ssh-keygen timeout; do
             command -v "$tool" >/dev/null
           done
           az version --output json >/dev/null
@@ -825,6 +787,8 @@ jobs:
       NATIVE_RESULTS_DIR: .release/publication/native
       AZURE_RESULTS_DIR: .release/publication/azure
       STAGING_ROOT: .release/publication/staging
+      RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
+      UBUNTU2604_RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
       REPOSITORY: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
       PREPARE_RESULT: ${{ needs.prepare.result }}
@@ -837,6 +801,25 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.source_commit }}
           persist-credentials: false
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Build accepted-source release tooling
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build --fetch \
+            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build -Doptimize=ReleaseSafe install-ubuntu2604-release
+          test -x "$RELEASE_TOOL"
 
       - name: Download all build-validated candidates
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -868,65 +851,11 @@ jobs:
           test "$BUILD_RESULT" = success
           test "$NATIVE_RESULT" = success
           test "$AZURE_RESULT" = success
-          python3 - "$CANDIDATES_DIR" "$NATIVE_RESULTS_DIR" "$AZURE_RESULTS_DIR" "$SOURCE_COMMIT" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-          candidates_root, native_root, azure_root = map(Path, sys.argv[1:4])
-          source_commit = sys.argv[4]
-          expected = {
-              "x86_64-full": "Ubuntu-26.04-x86_64.qcow2",
-              "aarch64-full": "Ubuntu-26.04-aarch64.qcow2",
-          }
-          candidate_docs = list(candidates_root.rglob("candidate.json"))
-          native_docs = list(native_root.rglob("native-result.json"))
-          azure_docs = list(azure_root.rglob("azure-result.json"))
-          if len(candidate_docs) != 2 or len(native_docs) != 1 or len(azure_docs) != 2:
-              raise SystemExit("release gate did not receive two candidates, one native result, and two Azure results")
-          candidates = {}
-          for path in candidate_docs:
-              value = json.load(open(path, encoding="utf-8"))
-              key = value.get("key")
-              if key not in expected or value.get("asset_name") != expected[key]:
-                  raise SystemExit("unexpected candidate identity")
-              if value.get("source_commit") != source_commit or key in candidates:
-                  raise SystemExit("candidate source or uniqueness mismatch")
-              candidates[key] = value
-          native_by_digest = {}
-          for path in native_docs:
-              value = json.load(open(path, encoding="utf-8"))
-              digest = value.get("candidate_sha256")
-              if digest in native_by_digest:
-                  raise SystemExit("duplicate native acceptance digest")
-              native_by_digest[digest] = value
-          azure = {}
-          for path in azure_docs:
-              value = json.load(open(path, encoding="utf-8"))
-              key = value.get("key")
-              if key not in expected or key in azure:
-                  raise SystemExit("unexpected or duplicate Azure result")
-              azure[key] = value
-          if set(candidates) != set(expected) or set(azure) != set(expected):
-              raise SystemExit("release matrix is incomplete")
-          for key, candidate in candidates.items():
-              digest = candidate["sha256"]
-              native = native_by_digest.get(digest)
-              if key == "x86_64-full":
-                  if native is None:
-                      raise SystemExit(f"{key}: native result is not digest-bound")
-                  if native.get("certificate_sha256") != candidate["uki_signing"]["certificate_sha256"]:
-                      raise SystemExit(f"{key}: native signer binding mismatch")
-              elif native is not None:
-                  raise SystemExit(f"{key}: unexpected native result")
-              result = azure[key]
-              if (
-                  result.get("source_commit") != source_commit
-                  or result.get("qcow_sha256") != digest
-                  or result.get("azure_accepted_sha256") != digest
-                  or result.get("status") != "success"
-              ):
-                  raise SystemExit(f"{key}: Azure result is not exact and successful")
-          PY
+          "$RELEASE_TOOL" release-gate \
+            --candidates "$CANDIDATES_DIR" \
+            --native-results "$NATIVE_RESULTS_DIR" \
+            --azure-results "$AZURE_RESULTS_DIR" \
+            --source-commit "$SOURCE_COMMIT"
 
       - name: Publish exactly two accepted Ubuntu assets
         run: scripts/ubuntu2604_publish.sh
