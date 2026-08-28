@@ -98,9 +98,189 @@ fn makeAll(subject: *const Tree) !void {
     }
 }
 
+fn makeReleaseEvidence(subject: *const Tree) !void {
+    try makeAll(subject);
+    for (contracts.release_order) |key| {
+        try fixture.makeNativeResult(subject, key, .{});
+    }
+}
+
+fn releaseGate(subject: *const Tree) !void {
+    const candidates = try subject.candidates();
+    defer allocator.free(candidates);
+    const native = try subject.native();
+    defer allocator.free(native);
+    const azure = try subject.azure();
+    defer allocator.free(azure);
+    var diagnostic: support.Diagnostic = .{};
+    try release_workflow.releaseGate(allocator, io, .{
+        .candidates = candidates,
+        .native_results = native,
+        .azure_results = azure,
+        .source_commit = fixture.source_commit,
+        .candidate_run_id = "100",
+        .candidate_run_attempt = "1",
+        .run_id = "100",
+        .run_attempt = "1",
+    }, &diagnostic);
+}
+
+fn expectReleaseGateRejected(subject: *const Tree) !void {
+    try std.testing.expectError(error.Failed, releaseGate(subject));
+}
+
 fn remake(subject: *const Tree, key: []const u8) !void {
     try subject.removeBundle(key);
     try fixture.makeBundle(subject, key, .{});
+}
+
+test "the release gate requires one valid native result for each full candidate" {
+    var subject = try tree();
+    defer subject.deinit();
+    try makeReleaseEvidence(&subject);
+    try releaseGate(&subject);
+}
+
+test "the release gate rejects missing, duplicate, and unexpected native results" {
+    {
+        var subject = try tree();
+        defer subject.deinit();
+        try makeReleaseEvidence(&subject);
+        const missing = try subject.nativeResultPath("aarch64-full");
+        defer allocator.free(missing);
+        try Dir.cwd().deleteFile(io, missing);
+        try expectReleaseGateRejected(&subject);
+    }
+    {
+        var subject = try tree();
+        defer subject.deinit();
+        try makeReleaseEvidence(&subject);
+        const duplicate = try subject.nativeResultPath("aarch64-full");
+        defer allocator.free(duplicate);
+        try fixture.patchString(
+            allocator,
+            io,
+            duplicate,
+            &.{.{ .key = "key" }},
+            "x86_64-full",
+        );
+        try expectReleaseGateRejected(&subject);
+    }
+    {
+        var subject = try tree();
+        defer subject.deinit();
+        try makeReleaseEvidence(&subject);
+        const unexpected = try subject.nativeResultPath("aarch64-full");
+        defer allocator.free(unexpected);
+        try fixture.patchString(
+            allocator,
+            io,
+            unexpected,
+            &.{.{ .key = "key" }},
+            "aarch64-core",
+        );
+        try expectReleaseGateRejected(&subject);
+    }
+    {
+        var subject = try tree();
+        defer subject.deinit();
+        try makeReleaseEvidence(&subject);
+        const x86 = try subject.nativeResultPath("x86_64-full");
+        defer allocator.free(x86);
+        var x86_result = try fixture.read(allocator, io, x86);
+        defer x86_result.deinit();
+        const duplicate_digest = x86_result.value.object.get("candidate_sha256").?.string;
+        const arm = try subject.nativeResultPath("aarch64-full");
+        defer allocator.free(arm);
+        try fixture.patchString(
+            allocator,
+            io,
+            arm,
+            &.{.{ .key = "candidate_sha256" }},
+            duplicate_digest,
+        );
+        try expectReleaseGateRejected(&subject);
+    }
+}
+
+test "the release gate rejects stale or invalid native evidence" {
+    var subject = try tree();
+    defer subject.deinit();
+    try makeReleaseEvidence(&subject);
+    const key = "x86_64-full";
+    const native = try subject.nativeResultPath(key);
+    defer allocator.free(native);
+
+    const mutations = [_]struct {
+        steps: []const Step,
+        change: fixture.Change,
+    }{
+        .{
+            .steps = &.{.{ .key = "source_commit" }},
+            .change = .{ .set = .{ .string = "b" ** 40 } },
+        },
+        .{
+            .steps = &.{ .{ .key = "workflow" }, .{ .key = "run_attempt" } },
+            .change = .{ .set = .{ .string = "2" } },
+        },
+        .{
+            .steps = &.{.{ .key = "architecture" }},
+            .change = .{ .set = .{ .string = "aarch64" } },
+        },
+        .{
+            .steps = &.{.{ .key = "candidate_sha256" }},
+            .change = .{ .set = .{ .string = "0" ** 64 } },
+        },
+        .{ .steps = &.{.{ .key = "schema" }}, .change = .{ .set = .{ .integer = 1 } } },
+        .{ .steps = &.{.{ .key = "contracts" }}, .change = .pop },
+        .{
+            .steps = &.{.{ .key = "certificate_sha256" }},
+            .change = .{ .set = .{ .string = "0" ** 64 } },
+        },
+        .{
+            .steps = &.{.{ .key = "fallback_uki_sha256" }},
+            .change = .{ .set = .{ .string = "0" ** 64 } },
+        },
+        .{
+            .steps = &.{.{ .key = "status" }},
+            .change = .{ .set = .{ .string = "failure" } },
+        },
+    };
+    for (mutations) |mutation| {
+        try fixture.patch(allocator, io, native, mutation.steps, mutation.change);
+        try expectReleaseGateRejected(&subject);
+        try fixture.makeNativeResult(&subject, key, .{});
+    }
+
+    try Dir.cwd().writeFile(io, .{ .sub_path = native, .data = "{" });
+    try expectReleaseGateRejected(&subject);
+}
+
+test "the release gate retains candidate and Azure fail-closed validation" {
+    {
+        var subject = try tree();
+        defer subject.deinit();
+        try makeReleaseEvidence(&subject);
+        const azure = try subject.azureResultPath("aarch64-full");
+        defer allocator.free(azure);
+        try fixture.patchString(
+            allocator,
+            io,
+            azure,
+            &.{.{ .key = "status" }},
+            "failure",
+        );
+        try expectReleaseGateRejected(&subject);
+    }
+    {
+        var subject = try tree();
+        defer subject.deinit();
+        try makeReleaseEvidence(&subject);
+        const asset = try subject.assetPath("x86_64-full");
+        defer allocator.free(asset);
+        try Dir.cwd().writeFile(io, .{ .sub_path = asset, .data = "tampered" });
+        try expectReleaseGateRejected(&subject);
+    }
 }
 
 test "a successful stage publishes exactly the two full-flavor assets" {
@@ -283,52 +463,9 @@ test "the core candidate and result bind flavor metadata and contracts" {
     ));
 }
 
-/// The native acceptance result the core validation workflow produces.
-fn writeNativeResult(
-    subject: *const Tree,
-    key: []const u8,
-    candidate: *const std.json.ObjectMap,
-) ![]u8 {
-    const path = try subject.path("candidates/{s}/native-result.json", .{key});
-    errdefer allocator.free(path);
-    const signing = candidate.get("uki_signing").?.object;
-    const contract_list = try fixture.joinContracts(
-        allocator,
-        &contracts.core_native_contracts,
-    );
-    defer allocator.free(contract_list);
-    var quoted: std.ArrayList(u8) = .empty;
-    defer quoted.deinit(allocator);
-    for (contracts.core_native_contracts, 0..) |item, index| {
-        if (index != 0) try quoted.appendSlice(allocator, ", ");
-        try quoted.print(allocator, "\"{s}\"", .{item});
-    }
-    const text = try std.fmt.allocPrint(allocator,
-        \\{{"schema": 5, "type": "ubuntu2604-local-secure-boot-acceptance",
-        \\"architecture": "{s}", "flavor": "{s}", "virtual_size": {d},
-        \\"candidate_sha256": "{s}", "certificate_sha256": "{s}",
-        \\"fallback_uki_sha256": "{s}", "contracts": [{s}],
-        \\"android_smoke": {{"provenance_sha256": "{s}", "runtime_sha256": "{s}",
-        \\  "bundle_sha256": "{s}", "config_sha256": "{s}",
-        \\  "architecture": "{s}", "candidate_key": "{s}"}}}}
-    , .{
-        candidate.get("architecture").?.string,
-        candidate.get("flavor").?.string,
-        candidate.get("virtual_size").?.integer,
-        candidate.get("sha256").?.string,
-        signing.get("certificate_sha256").?.string,
-        signing.get("fallback_uki_sha256").?.string,
-        quoted.items,
-        fixture.android_provenance_sha256,
-        fixture.android_runtime_sha256,
-        fixture.android_bundle_sha256,
-        fixture.android_config_sha256,
-        candidate.get("architecture").?.string,
-        key,
-    });
-    defer allocator.free(text);
-    try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text });
-    return path;
+fn writeNativeResult(subject: *const Tree, key: []const u8) ![]u8 {
+    try fixture.makeNativeResult(subject, key, .{});
+    return subject.nativeResultPath(key);
 }
 
 fn validateNative(subject: *const Tree, key: []const u8, path: []const u8) !void {
@@ -345,6 +482,97 @@ fn validateNative(subject: *const Tree, key: []const u8, path: []const u8) !void
     result.deinit();
 }
 
+test "the full native result binds complete candidate and workflow identity" {
+    var subject = try tree();
+    defer subject.deinit();
+    const key = "x86_64-full";
+    try fixture.makeBundle(&subject, key, .{});
+    const native_path = try writeNativeResult(&subject, key);
+    defer allocator.free(native_path);
+    try validateNative(&subject, key, native_path);
+
+    var result = try fixture.read(allocator, io, native_path);
+    defer result.deinit();
+    const object = result.value.object;
+    try std.testing.expectEqual(@as(i64, 2), object.get("schema").?.integer);
+    try std.testing.expectEqualStrings(key, object.get("key").?.string);
+    try std.testing.expectEqualStrings(
+        "x86_64",
+        object.get("architecture").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "Ubuntu-26.04-x86_64.qcow2",
+        object.get("asset_name").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        fixture.source_commit,
+        object.get("source_commit").?.string,
+    );
+    try std.testing.expectEqualStrings("success", object.get("status").?.string);
+    try std.testing.expect(documents.hasWorkflowIdentity(object.get("workflow")));
+    try std.testing.expect(support.hasExactContracts(
+        object.get("contracts"),
+        &contracts.full_native_contracts,
+    ));
+
+    const virtual_size = object.get("virtual_size").?.integer;
+    const mutations = [_]struct {
+        steps: []const Step,
+        change: fixture.Change,
+    }{
+        .{ .steps = &.{.{ .key = "schema" }}, .change = .{ .set = .{ .integer = 1 } } },
+        .{
+            .steps = &.{.{ .key = "key" }},
+            .change = .{ .set = .{ .string = "aarch64-full" } },
+        },
+        .{
+            .steps = &.{.{ .key = "architecture" }},
+            .change = .{ .set = .{ .string = "aarch64" } },
+        },
+        .{
+            .steps = &.{.{ .key = "asset_name" }},
+            .change = .{ .set = .{ .string = "Ubuntu-26.04-aarch64.qcow2" } },
+        },
+        .{
+            .steps = &.{.{ .key = "source_commit" }},
+            .change = .{ .set = .{ .string = "b" ** 40 } },
+        },
+        .{
+            .steps = &.{.{ .key = "virtual_size" }},
+            .change = .{ .set = .{ .integer = virtual_size + 1 } },
+        },
+        .{
+            .steps = &.{.{ .key = "candidate_sha256" }},
+            .change = .{ .set = .{ .string = "0" ** 64 } },
+        },
+        .{
+            .steps = &.{.{ .key = "certificate_sha256" }},
+            .change = .{ .set = .{ .string = "0" ** 64 } },
+        },
+        .{
+            .steps = &.{.{ .key = "fallback_uki_sha256" }},
+            .change = .{ .set = .{ .string = "0" ** 64 } },
+        },
+        .{ .steps = &.{.{ .key = "contracts" }}, .change = .pop },
+        .{
+            .steps = &.{.{ .key = "status" }},
+            .change = .{ .set = .{ .string = "failure" } },
+        },
+        .{
+            .steps = &.{ .{ .key = "workflow" }, .{ .key = "run_id" } },
+            .change = .{ .set = .{ .string = "" } },
+        },
+    };
+    for (mutations) |mutation| {
+        try fixture.patch(allocator, io, native_path, mutation.steps, mutation.change);
+        try std.testing.expectError(
+            error.Failed,
+            validateNative(&subject, key, native_path),
+        );
+        try fixture.makeNativeResult(&subject, key, .{});
+    }
+}
+
 test "the core native result binds the candidate identity and contracts" {
     var subject = try tree();
     defer subject.deinit();
@@ -355,7 +583,7 @@ test "the core native result binds the candidate identity and contracts" {
     defer allocator.free(manifest_path);
     var candidate = try fixture.read(allocator, io, manifest_path);
     defer candidate.deinit();
-    const native_path = try writeNativeResult(&subject, key, &candidate.value.object);
+    const native_path = try writeNativeResult(&subject, key);
     defer allocator.free(native_path);
     try validateNative(&subject, key, native_path);
 
@@ -379,10 +607,18 @@ test "the core native result binds the candidate identity and contracts" {
         steps: []const Step,
         change: fixture.Change,
     }{
-        .{ .steps = &.{.{ .key = "schema" }}, .change = .{ .set = .{ .integer = 1 } } },
+        .{ .steps = &.{.{ .key = "schema" }}, .change = .{ .set = .{ .integer = 5 } } },
+        .{
+            .steps = &.{.{ .key = "key" }},
+            .change = .{ .set = .{ .string = "x86_64-core" } },
+        },
         .{
             .steps = &.{.{ .key = "architecture" }},
             .change = .{ .set = .{ .string = "x86_64" } },
+        },
+        .{
+            .steps = &.{.{ .key = "source_commit" }},
+            .change = .{ .set = .{ .string = "b" ** 40 } },
         },
         .{
             .steps = &.{.{ .key = "virtual_size" }},
@@ -393,6 +629,14 @@ test "the core native result binds the candidate identity and contracts" {
             .change = .{ .set = .{ .string = "0" ** 64 } },
         },
         .{ .steps = &.{.{ .key = "contracts" }}, .change = .pop },
+        .{
+            .steps = &.{.{ .key = "status" }},
+            .change = .{ .set = .{ .string = "failure" } },
+        },
+        .{
+            .steps = &.{ .{ .key = "workflow" }, .{ .key = "run_attempt" } },
+            .change = .{ .set = .{ .string = "" } },
+        },
         .{
             .steps = &.{ .{ .key = "android_smoke" }, .{ .key = "architecture" } },
             .change = .{ .set = .{ .string = "x86_64" } },
@@ -412,7 +656,7 @@ test "the core native result binds the candidate identity and contracts" {
             error.Failed,
             validateNative(&subject, key, native_path),
         );
-        allocator.free(try writeNativeResult(&subject, key, &candidate.value.object));
+        allocator.free(try writeNativeResult(&subject, key));
     }
 }
 
@@ -477,6 +721,29 @@ test "the contract sets cover the acceptance each flavor actually performs" {
             "vtpm",
         },
         &contracts.core_azure_contracts,
+    );
+    try std.testing.expectEqualDeep(
+        &[_][]const u8{
+            "clean-service-health",
+            "cloud-init-provisioning",
+            "generalized-identity",
+            "gpt-layout",
+            "kernel-lockdown",
+            "key-only-ssh",
+            "matching-architecture-native-kvm",
+            "module-signatures",
+            "netplan-networkd",
+            "reboot-reconnect",
+            "root-growth",
+            "secure-boot",
+            "signed-uki",
+            "standalone-zstd-qcow2",
+            "tampered-uki-rejected",
+            "uefi-db-signer",
+            "vtpm",
+            "walinuxagent",
+        },
+        &contracts.full_native_contracts,
     );
     try std.testing.expectEqualDeep(
         &[_][]const u8{

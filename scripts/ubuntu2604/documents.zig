@@ -88,6 +88,7 @@ pub const Identity = struct {
     architecture: []const u8,
     flavor: []const u8,
     asset_name: []const u8,
+    source_commit: []const u8,
 
     pub fn parsedFlavor(self: Identity) contracts.Flavor {
         return contracts.parseFlavor(self.flavor).?;
@@ -122,6 +123,8 @@ pub fn validateIdentity(
     const flavor = contracts.parseFlavor(entry.flavor).?;
     const expected_fields = if (std.mem.eql(u8, expected_type, candidate_type))
         &contracts.candidate_fields
+    else if (std.mem.eql(u8, expected_type, native_result_type))
+        contracts.nativeResultFields(flavor)
     else
         contracts.azureResultFields(flavor);
     if (!support.hasExactFields(document.*, expected_fields)) return fail(
@@ -162,6 +165,7 @@ pub fn validateIdentity(
         .architecture = entry.architecture,
         .flavor = entry.flavor,
         .asset_name = entry.asset_name,
+        .source_commit = actual_commit,
     };
 }
 
@@ -546,20 +550,16 @@ pub fn validateNativeResult(
     return result;
 }
 
-const native_common_fields = [_][]const u8{
-    "candidate_sha256",
-    "certificate_sha256",
-    "contracts",
-    "fallback_uki_sha256",
-    "schema",
-    "type",
-};
-const native_core_fields = [_][]const u8{
-    "android_smoke",
-    "architecture",
-    "flavor",
-    "virtual_size",
-} ++ native_common_fields;
+pub fn nativeResultSchema(flavor: contracts.Flavor) i64 {
+    return switch (flavor) {
+        // Schema 2 adds the complete candidate identity, explicit success,
+        // and the exact workflow attempt to the original full result.
+        .full => 2,
+        // Schema 6 applies the same binding to the core result introduced at
+        // schema 5, retaining its Android smoke provenance.
+        .core => 6,
+    };
+}
 
 pub fn validateNativeResultDocument(
     result: *const std.json.ObjectMap,
@@ -568,24 +568,20 @@ pub fn validateNativeResultDocument(
 ) Error!void {
     const flavor = candidate.flavor();
     const key = candidate.identity.key;
-    const expected_fields: []const []const u8 = switch (flavor) {
-        .full => &native_common_fields,
-        // Bumped from 4 so that a result binding a private source commit
-        // instead of the complete provenance-manifest digest can never
-        // satisfy the current core contract set.
-        .core => &native_core_fields,
-    };
-    const expected_schema: i64 = switch (flavor) {
-        .full => 1,
-        .core => 5,
-    };
-    if (!support.hasExactFields(result.*, expected_fields)) return fail(
+    _ = try validateIdentity(
+        result,
+        native_result_type,
+        nativeResultSchema(flavor),
+        key,
+        candidate.identity.source_commit,
         diagnostic,
-        "{s}: native acceptance result has unexpected fields",
+    );
+    if (!support.stringIs(result.get("status"), "success")) return fail(
+        diagnostic,
+        "{s}: native acceptance is not explicitly successful",
         .{key},
     );
-    if (support.integerOf(result.get("schema")) != expected_schema or
-        !support.stringIs(result.get("type"), native_result_type) or
+    if (support.integerOf(result.get("virtual_size")) != candidate.virtual_size or
         !support.stringIs(result.get("candidate_sha256"), candidate.sha256) or
         !support.stringIs(
             result.get("certificate_sha256"),
@@ -598,16 +594,6 @@ pub fn validateNativeResultDocument(
     {
         return fail(diagnostic, "{s}: native acceptance identity is invalid", .{key});
     }
-    if (flavor == .core and
-        (!support.stringIs(
-            result.get("architecture"),
-            candidate.identity.architecture,
-        ) or
-            !support.stringIs(result.get("flavor"), candidate.identity.flavor) or
-            support.integerOf(result.get("virtual_size")) != candidate.virtual_size))
-    {
-        return fail(diagnostic, "{s}: native core identity is invalid", .{key});
-    }
     if (flavor == .core) {
         try requireAndroidSmoke(
             result.get("android_smoke"),
@@ -617,6 +603,11 @@ pub fn validateNativeResultDocument(
             diagnostic,
         );
     }
+    if (!hasWorkflowIdentity(result.get("workflow"))) return fail(
+        diagnostic,
+        "{s}: native workflow identity is absent",
+        .{key},
+    );
     if (!support.hasExactContracts(
         result.get("contracts"),
         contracts.nativeContracts(flavor),

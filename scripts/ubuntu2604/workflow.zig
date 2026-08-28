@@ -158,23 +158,16 @@ pub fn dispatch(
             diagnostic,
         );
     }
-    if (std.mem.eql(u8, command, "verify-native-evidence")) {
-        var options = try parse(allocator, argv, &.{ "--result", "--candidate" });
-        defer options.deinit();
-        return verifyNativeEvidence(
-            allocator,
-            io,
-            try options.require("--result"),
-            try options.require("--candidate"),
-            diagnostic,
-        );
-    }
     if (std.mem.eql(u8, command, "release-gate")) {
         var options = try parse(allocator, argv, &.{
             "--candidates",
             "--native-results",
             "--azure-results",
             "--source-commit",
+            "--candidate-run-id",
+            "--candidate-run-attempt",
+            "--run-id",
+            "--run-attempt",
         });
         defer options.deinit();
         return releaseGate(allocator, io, .{
@@ -182,6 +175,10 @@ pub fn dispatch(
             .native_results = try options.require("--native-results"),
             .azure_results = try options.require("--azure-results"),
             .source_commit = try options.require("--source-commit"),
+            .candidate_run_id = try options.require("--candidate-run-id"),
+            .candidate_run_attempt = try options.require("--candidate-run-attempt"),
+            .run_id = try options.require("--run-id"),
+            .run_attempt = try options.require("--run-attempt"),
         }, diagnostic);
     }
     if (std.mem.eql(u8, command, "core-gate")) {
@@ -876,81 +873,15 @@ fn appendFile(io: Io, path: []const u8, data: []const u8) !void {
     try file.writePositionalAll(io, data, end);
 }
 
-/// The release workflow's explicit native-acceptance evidence check.
-pub fn verifyNativeEvidence(
-    allocator: Allocator,
-    io: Io,
-    result_path: []const u8,
-    candidate_path: []const u8,
-    diagnostic: *Diagnostic,
-) Error!void {
-    var result_document = try support.readObject(
-        allocator,
-        io,
-        result_path,
-        diagnostic,
-    );
-    defer result_document.deinit();
-    var candidate_document = try support.readObject(
-        allocator,
-        io,
-        candidate_path,
-        diagnostic,
-    );
-    defer candidate_document.deinit();
-    const result = result_document.object();
-    const candidate = candidate_document.object();
-
-    const expected_fields = [_][]const u8{
-        "candidate_sha256",
-        "certificate_sha256",
-        "contracts",
-        "fallback_uki_sha256",
-        "schema",
-        "type",
-    };
-    if (!support.hasExactFields(result.*, &expected_fields)) return fail(
-        diagnostic,
-        "native acceptance result has unexpected fields",
-        .{},
-    );
-    if (support.integerOf(result.get("schema")) != 1 or
-        !support.stringIs(result.get("type"), documents.native_result_type))
-    {
-        return fail(diagnostic, "native acceptance schema mismatch", .{});
-    }
-    const candidate_sha256 = support.stringOf(candidate.get("sha256")) orelse
-        return fail(diagnostic, "native acceptance candidate digest mismatch", .{});
-    if (!support.stringIs(result.get("candidate_sha256"), candidate_sha256)) {
-        return fail(diagnostic, "native acceptance candidate digest mismatch", .{});
-    }
-    const signing = support.objectOf(candidate.get("uki_signing")) orelse
-        return fail(diagnostic, "native acceptance certificate mismatch", .{});
-    const certificate_sha256 = support.stringOf(
-        signing.get("certificate_sha256"),
-    ) orelse return fail(diagnostic, "native acceptance certificate mismatch", .{});
-    if (!support.stringIs(result.get("certificate_sha256"), certificate_sha256)) {
-        return fail(diagnostic, "native acceptance certificate mismatch", .{});
-    }
-    const uki_sha256 = support.stringOf(
-        signing.get("fallback_uki_sha256"),
-    ) orelse return fail(diagnostic, "native acceptance UKI mismatch", .{});
-    if (!support.stringIs(result.get("fallback_uki_sha256"), uki_sha256)) {
-        return fail(diagnostic, "native acceptance UKI mismatch", .{});
-    }
-    if (!support.hasExactContracts(
-        result.get("contracts"),
-        &contracts.full_native_contracts,
-    )) {
-        return fail(diagnostic, "native acceptance contract set mismatch", .{});
-    }
-}
-
 pub const ReleaseGateOptions = struct {
     candidates: []const u8,
     native_results: []const u8,
     azure_results: []const u8,
     source_commit: []const u8,
+    candidate_run_id: []const u8,
+    candidate_run_attempt: []const u8,
+    run_id: []const u8,
+    run_attempt: []const u8,
 };
 
 /// The publish job's exact two-architecture gate.
@@ -985,153 +916,242 @@ pub fn releaseGate(
     );
     defer support.freePaths(allocator, azure_paths);
 
-    if (candidate_paths.len != 2 or native_paths.len != 1 or azure_paths.len != 2) {
+    if (candidate_paths.len != 2 or native_paths.len != 2 or azure_paths.len != 2) {
         return fail(
             diagnostic,
-            "release gate did not receive two candidates, one native result, and two Azure results",
+            "release gate did not receive two candidates, two native results, and two Azure results",
             .{},
         );
     }
 
-    var arena: std.heap.ArenaAllocator = .init(allocator);
-    defer arena.deinit();
-
-    var candidates: [2]?std.json.Parsed(std.json.Value) = .{ null, null };
-    defer for (&candidates) |*slot| {
+    var candidate_index: [2]?usize = .{ null, null };
+    var candidate_values: [2]?std.json.Parsed(std.json.Value) = .{ null, null };
+    defer for (&candidate_values) |*slot| {
         if (slot.*) |parsed| parsed.deinit();
     };
-    for (candidate_paths) |path| {
-        var parsed = try readValue(allocator, io, path, diagnostic);
-        errdefer parsed.deinit();
-        const object = support.objectOf(parsed.value) orelse return fail(
-            diagnostic,
-            "unexpected candidate identity",
-            .{},
-        );
-        const key = support.stringOf(object.get("key"));
-        var index: ?usize = null;
-        if (key) |text| {
-            for (contracts.release_order, 0..) |candidate_key, position| {
-                if (std.mem.eql(u8, candidate_key, text)) index = position;
-            }
-        }
-        const position = index orelse return fail(
-            diagnostic,
-            "unexpected candidate identity",
-            .{},
-        );
-        if (!support.stringIs(
-            object.get("asset_name"),
-            contracts.lookup(contracts.release_order[position]).?.asset_name,
-        )) {
-            return fail(diagnostic, "unexpected candidate identity", .{});
-        }
-        if (!support.stringIs(object.get("source_commit"), options.source_commit) or
-            candidates[position] != null)
-        {
-            return fail(diagnostic, "candidate source or uniqueness mismatch", .{});
-        }
-        candidates[position] = parsed;
-    }
+    try loadReleaseByKey(
+        allocator,
+        io,
+        candidate_paths,
+        &candidate_index,
+        &candidate_values,
+        "unexpected or duplicate release candidate",
+        "release candidate matrix is incomplete",
+        diagnostic,
+    );
 
-    var native: [2]?std.json.Parsed(std.json.Value) = .{ null, null };
-    defer for (&native) |*slot| {
+    var native_index: [2]?usize = .{ null, null };
+    var native_values: [2]?std.json.Parsed(std.json.Value) = .{ null, null };
+    defer for (&native_values) |*slot| {
         if (slot.*) |parsed| parsed.deinit();
     };
-    var native_digests: std.StringHashMapUnmanaged(usize) = .empty;
-    defer native_digests.deinit(allocator);
-    for (native_paths, 0..) |path, position| {
-        var parsed = try readValue(allocator, io, path, diagnostic);
-        errdefer parsed.deinit();
-        const object = support.objectOf(parsed.value) orelse return fail(
-            diagnostic,
-            "duplicate native acceptance digest",
-            .{},
-        );
-        const key = support.stringOf(object.get("candidate_sha256")) orelse "";
-        if (native_digests.contains(key)) return fail(
-            diagnostic,
-            "duplicate native acceptance digest",
-            .{},
-        );
-        try native_digests.put(
-            allocator,
-            try arena.allocator().dupe(u8, key),
-            position,
-        );
-        native[position] = parsed;
-    }
+    try loadReleaseByKey(
+        allocator,
+        io,
+        native_paths,
+        &native_index,
+        &native_values,
+        "unexpected or duplicate native result",
+        "native validation matrix is incomplete",
+        diagnostic,
+    );
+    try requireUniqueNativeDigests(
+        &native_index,
+        &native_values,
+        "native validation matrix is incomplete",
+        diagnostic,
+    );
 
-    var azure: [2]?std.json.Parsed(std.json.Value) = .{ null, null };
-    defer for (&azure) |*slot| {
+    var azure_index: [2]?usize = .{ null, null };
+    var azure_values: [2]?std.json.Parsed(std.json.Value) = .{ null, null };
+    defer for (&azure_values) |*slot| {
         if (slot.*) |parsed| parsed.deinit();
     };
-    for (azure_paths) |path| {
-        var parsed = try readValue(allocator, io, path, diagnostic);
-        errdefer parsed.deinit();
-        const object = support.objectOf(parsed.value) orelse return fail(
-            diagnostic,
-            "unexpected or duplicate Azure result",
-            .{},
-        );
-        const key = support.stringOf(object.get("key"));
-        var index: ?usize = null;
-        if (key) |text| {
-            for (contracts.release_order, 0..) |candidate_key, position| {
-                if (std.mem.eql(u8, candidate_key, text)) index = position;
-            }
-        }
-        if (index == null or azure[index.?] != null) return fail(
-            diagnostic,
-            "unexpected or duplicate Azure result",
-            .{},
-        );
-        azure[index.?] = parsed;
-    }
-    for (candidates, azure) |candidate_slot, azure_slot| {
-        if (candidate_slot == null or azure_slot == null) return fail(
-            diagnostic,
-            "release matrix is incomplete",
-            .{},
-        );
-    }
+    try loadReleaseByKey(
+        allocator,
+        io,
+        azure_paths,
+        &azure_index,
+        &azure_values,
+        "unexpected or duplicate Azure result",
+        "Azure validation matrix is incomplete",
+        diagnostic,
+    );
 
     for (contracts.release_order, 0..) |key, index| {
-        const candidate = &candidates[index].?.value.object;
-        const digest = support.stringOf(candidate.get("sha256")) orelse "";
-        const native_index = native_digests.get(digest);
-        if (std.mem.eql(u8, key, "x86_64-full")) {
-            const found = native_index orelse return fail(
-                diagnostic,
-                "{s}: native result is not digest-bound",
-                .{key},
-            );
-            const result = &native[found].?.value.object;
-            const signing = support.objectOf(candidate.get("uki_signing"));
-            const certificate = if (signing) |object|
-                support.stringOf(object.get("certificate_sha256"))
-            else
-                null;
-            if (certificate == null or !support.stringIs(
-                result.get("certificate_sha256"),
-                certificate.?,
-            )) {
-                return fail(diagnostic, "{s}: native signer binding mismatch", .{key});
+        const candidate_position = candidate_index[index] orelse return fail(
+            diagnostic,
+            "release candidate matrix is incomplete",
+            .{},
+        );
+        const manifest_path = candidate_paths[candidate_position];
+        const manifest_parent = std.fs.path.dirname(manifest_path) orelse ".";
+        const entry = contracts.lookup(key) orelse return fail(
+            diagnostic,
+            "unexpected release candidate identity",
+            .{},
+        );
+        const asset_path = try support.joinPath(
+            allocator,
+            &.{ manifest_parent, entry.asset_name },
+        );
+        defer allocator.free(asset_path);
+
+        var candidate = try documents.verifyCandidate(
+            allocator,
+            io,
+            manifest_path,
+            asset_path,
+            key,
+            options.source_commit,
+            diagnostic,
+        );
+        defer candidate.deinit();
+        try requireExactWorkflow(
+            candidate.object().get("workflow"),
+            options.candidate_run_id,
+            options.candidate_run_attempt,
+            key,
+            "candidate",
+            diagnostic,
+        );
+
+        const native_position = native_index[index] orelse return fail(
+            diagnostic,
+            "native validation matrix is incomplete",
+            .{},
+        );
+        var native = try documents.validateNativeResult(
+            allocator,
+            io,
+            &candidate,
+            native_paths[native_position],
+            diagnostic,
+        );
+        defer native.deinit();
+        try requireExactWorkflow(
+            native.get("workflow"),
+            options.run_id,
+            options.run_attempt,
+            key,
+            "native",
+            diagnostic,
+        );
+
+        const azure_position = azure_index[index] orelse return fail(
+            diagnostic,
+            "Azure validation matrix is incomplete",
+            .{},
+        );
+        var azure = try documents.validateAzureResult(
+            allocator,
+            io,
+            &candidate,
+            azure_paths[azure_position],
+            diagnostic,
+        );
+        defer azure.deinit();
+        try requireExactWorkflow(
+            azure.get("workflow"),
+            options.run_id,
+            options.run_attempt,
+            key,
+            "Azure",
+            diagnostic,
+        );
+    }
+}
+
+fn loadReleaseByKey(
+    allocator: Allocator,
+    io: Io,
+    paths: []const []const u8,
+    index: *[2]?usize,
+    values: *[2]?std.json.Parsed(std.json.Value),
+    duplicate_message: []const u8,
+    incomplete_message: []const u8,
+    diagnostic: *Diagnostic,
+) Error!void {
+    for (paths, 0..) |path, position| {
+        var parsed = try readValue(allocator, io, path, diagnostic);
+        errdefer parsed.deinit();
+        const object = support.objectOf(parsed.value);
+        const key = if (object) |value| support.stringOf(value.get("key")) else null;
+        var slot: ?usize = null;
+        if (key) |text| {
+            for (contracts.release_order, 0..) |release_key, candidate_slot| {
+                if (std.mem.eql(u8, release_key, text)) slot = candidate_slot;
             }
-        } else if (native_index != null) {
-            return fail(diagnostic, "{s}: unexpected native result", .{key});
         }
-        const result = &azure[index].?.value.object;
-        if (!support.stringIs(result.get("source_commit"), options.source_commit) or
-            !support.stringIs(result.get("qcow_sha256"), digest) or
-            !support.stringIs(result.get("azure_accepted_sha256"), digest) or
-            !support.stringIs(result.get("status"), "success"))
-        {
-            return fail(
+        if (slot == null or index[slot.?] != null) {
+            return fail(diagnostic, "{s}", .{duplicate_message});
+        }
+        index[slot.?] = position;
+        values[position] = parsed;
+    }
+    for (index) |slot| {
+        if (slot == null) return fail(diagnostic, "{s}", .{incomplete_message});
+    }
+}
+
+fn requireExactWorkflow(
+    value: ?std.json.Value,
+    run_id: []const u8,
+    run_attempt: []const u8,
+    key: []const u8,
+    kind: []const u8,
+    diagnostic: *Diagnostic,
+) Error!void {
+    const workflow = support.objectOf(value);
+    if (workflow == null or
+        !documents.hasWorkflowIdentity(value) or
+        !support.stringIs(workflow.?.get("run_id"), run_id) or
+        !support.stringIs(workflow.?.get("run_attempt"), run_attempt))
+    {
+        return fail(
+            diagnostic,
+            "{s}: {s} workflow attempt is not exact",
+            .{ key, kind },
+        );
+    }
+}
+
+fn requireUniqueNativeDigests(
+    index: *const [2]?usize,
+    values: *const [2]?std.json.Parsed(std.json.Value),
+    incomplete_message: []const u8,
+    diagnostic: *Diagnostic,
+) Error!void {
+    var first_digest: ?[]const u8 = null;
+    for (index) |position_value| {
+        const position = position_value orelse return fail(
+            diagnostic,
+            "{s}",
+            .{incomplete_message},
+        );
+        const parsed = values[position] orelse return fail(
+            diagnostic,
+            "{s}",
+            .{incomplete_message},
+        );
+        const object = support.objectOf(parsed.value) orelse return fail(
+            diagnostic,
+            "malformed native acceptance result",
+            .{},
+        );
+        const digest = try support.requireSha256(
+            object.get("candidate_sha256"),
+            "native candidate digest",
+            diagnostic,
+        );
+        if (first_digest) |seen| {
+            if (std.mem.eql(u8, seen, digest)) return fail(
                 diagnostic,
-                "{s}: Azure result is not exact and successful",
-                .{key},
+                "duplicate native acceptance digest",
+                .{},
             );
+        } else {
+            first_digest = digest;
         }
     }
 }
@@ -1275,59 +1295,22 @@ pub fn coreGate(
     defer for (&native_values) |*slot| {
         if (slot.*) |parsed| parsed.deinit();
     };
-    var seen_digests: [2][]const u8 = .{ "", "" };
-    var seen_count: usize = 0;
-    for (native_paths, 0..) |path, position| {
-        var parsed = try readValue(allocator, io, path, diagnostic);
-        errdefer parsed.deinit();
-        const object = support.objectOf(parsed.value);
-        const smoke = if (object) |value|
-            support.objectOf(value.get("android_smoke"))
-        else
-            null;
-        const key = if (smoke) |value|
-            support.stringOf(value.get("candidate_key"))
-        else
-            null;
-        var index: ?usize = null;
-        if (key) |text| {
-            for (core_keys, 0..) |core_key, slot| {
-                if (std.mem.eql(u8, core_key, text)) index = slot;
-            }
-        }
-        if (index == null or native_index[index.?] != null) return fail(
-            diagnostic,
-            "unexpected or duplicate native core result",
-            .{},
-        );
-        const digest = if (object) |value|
-            support.stringOf(value.get("candidate_sha256"))
-        else
-            null;
-        if (digest == null) return fail(
-            diagnostic,
-            "{s}: native candidate digest is malformed",
-            .{key.?},
-        );
-        for (seen_digests[0..seen_count]) |seen| {
-            if (std.mem.eql(u8, seen, digest.?)) return fail(
-                diagnostic,
-                "duplicate native acceptance digest",
-                .{},
-            );
-        }
-        seen_digests[seen_count] = digest.?;
-        seen_count += 1;
-        native_index[index.?] = position;
-        native_values[position] = parsed;
-    }
-    for (native_index) |slot| {
-        if (slot == null) return fail(
-            diagnostic,
-            "core native validation matrix is incomplete",
-            .{},
-        );
-    }
+    try loadByKey(
+        allocator,
+        io,
+        native_paths,
+        &native_index,
+        &native_values,
+        "unexpected or duplicate native core result",
+        "core native validation matrix is incomplete",
+        diagnostic,
+    );
+    try requireUniqueNativeDigests(
+        &native_index,
+        &native_values,
+        "core native validation matrix is incomplete",
+        diagnostic,
+    );
 
     var asset_seen: [2]bool = .{ false, false };
     for (qcow_paths) |path| {
@@ -1412,6 +1395,14 @@ pub fn coreGate(
             diagnostic,
         );
         defer native_document.deinit();
+        try requireExactWorkflow(
+            native_document.get("workflow"),
+            options.run_id,
+            options.run_attempt,
+            key,
+            "native",
+            diagnostic,
+        );
 
         const azure_path = azure_paths[azure_index[slot].?];
         var azure_document = try documents.validateAzureResult(

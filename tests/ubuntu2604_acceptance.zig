@@ -217,10 +217,7 @@ const core_policy: FlavorPolicy = .{
     .x86_64_file_name = "Ubuntu-26.04-x86_64.core.qcow2",
     .aarch64_file_name = "Ubuntu-26.04-aarch64.core.qcow2",
     .virtual_size = 3584 * mib,
-    // Bumped from 4 so that a result binding a private producer identity
-    // instead of the complete provenance-manifest digest can never satisfy
-    // the current core contract set.
-    .result_schema = 5,
+    .result_schema = 6,
     .contracts = &core_contracts,
 };
 
@@ -228,13 +225,26 @@ const full_policy: FlavorPolicy = .{
     .x86_64_file_name = "Ubuntu-26.04-x86_64.qcow2",
     .aarch64_file_name = "Ubuntu-26.04-aarch64.qcow2",
     .virtual_size = 5 * gib,
-    .result_schema = 1,
+    .result_schema = 2,
     .contracts = &full_contracts,
 };
 
 const Candidate = struct {
     architecture: Architecture,
     flavor: Flavor,
+
+    fn key(self: Candidate) []const u8 {
+        return switch (self.architecture) {
+            .x86_64 => switch (self.flavor) {
+                .full => "x86_64-full",
+                .core => "x86_64-core",
+            },
+            .aarch64 => switch (self.flavor) {
+                .full => "aarch64-full",
+                .core => "aarch64-core",
+            },
+        };
+    }
 
     fn expectedFileName(self: Candidate) []const u8 {
         const policy = self.flavor.policy();
@@ -415,6 +425,63 @@ fn optionalEnvAlloc(allocator: Allocator, comptime name: []const u8) !?[]u8 {
     return std.testing.environ.getAlloc(allocator, name) catch |err| switch (err) {
         error.EnvironmentVariableMissing => null,
         else => return err,
+    };
+}
+
+const AcceptanceResultIdentity = struct {
+    source_commit: []u8,
+    run_id: []u8,
+    run_attempt: []u8,
+
+    fn deinit(self: *AcceptanceResultIdentity, allocator: Allocator) void {
+        allocator.free(self.source_commit);
+        allocator.free(self.run_id);
+        allocator.free(self.run_attempt);
+        self.* = undefined;
+    }
+};
+
+fn isLowerHexCommit(value: []const u8) bool {
+    if (value.len != 40) return false;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
+}
+
+fn isPositiveDecimal(value: []const u8) bool {
+    if (value.len == 0 or value[0] == '0') return false;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte)) return false;
+    }
+    return true;
+}
+
+fn requireAcceptanceResultIdentityAlloc(
+    allocator: Allocator,
+) !AcceptanceResultIdentity {
+    const source_commit = try requireEnvAlloc(
+        allocator,
+        "MIZ_UBUNTU2604_SOURCE_COMMIT",
+    );
+    errdefer allocator.free(source_commit);
+    const run_id = try requireEnvAlloc(
+        allocator,
+        "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ID",
+    );
+    errdefer allocator.free(run_id);
+    const run_attempt = try requireEnvAlloc(
+        allocator,
+        "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ATTEMPT",
+    );
+    errdefer allocator.free(run_attempt);
+    if (!isLowerHexCommit(source_commit)) return error.InvalidSourceCommit;
+    if (!isPositiveDecimal(run_id)) return error.InvalidAcceptanceRunId;
+    if (!isPositiveDecimal(run_attempt)) return error.InvalidAcceptanceRunAttempt;
+    return .{
+        .source_commit = source_commit,
+        .run_id = run_id,
+        .run_attempt = run_attempt,
     };
 }
 
@@ -3234,6 +3301,7 @@ fn writeAcceptanceResult(
     source_sha256: miz.artifact_pipeline.Digest,
     certificate_sha256: miz.artifact_pipeline.Digest,
     uki_sha256: miz.artifact_pipeline.Digest,
+    identity: *const AcceptanceResultIdentity,
     android_smoke: ?*const AndroidSmokeInputs,
 ) !void {
     const source_sha256_hex = miz.artifact_pipeline.formatSha256(source_sha256);
@@ -3251,10 +3319,21 @@ fn writeAcceptanceResult(
                 .{
                     .schema = candidate.flavor.policy().result_schema,
                     .type = "ubuntu2604-local-secure-boot-acceptance",
+                    .key = candidate.key(),
+                    .architecture = @tagName(candidate.architecture),
+                    .flavor = @tagName(candidate.flavor),
+                    .asset_name = candidate.expectedFileName(),
+                    .source_commit = identity.source_commit,
+                    .virtual_size = candidate.expectedVirtualSize(),
                     .candidate_sha256 = &source_sha256_hex,
                     .certificate_sha256 = &certificate_sha256_hex,
                     .fallback_uki_sha256 = &uki_sha256_hex,
+                    .status = "success",
                     .contracts = candidate.contracts(),
+                    .workflow = .{
+                        .run_id = identity.run_id,
+                        .run_attempt = identity.run_attempt,
+                    },
                 },
             );
         },
@@ -3276,12 +3355,16 @@ fn writeAcceptanceResult(
                 .{
                     .schema = candidate.flavor.policy().result_schema,
                     .type = "ubuntu2604-local-secure-boot-acceptance",
+                    .key = candidate.key(),
                     .architecture = @tagName(candidate.architecture),
                     .flavor = @tagName(candidate.flavor),
+                    .asset_name = candidate.expectedFileName(),
+                    .source_commit = identity.source_commit,
                     .virtual_size = candidate.expectedVirtualSize(),
                     .candidate_sha256 = &source_sha256_hex,
                     .certificate_sha256 = &certificate_sha256_hex,
                     .fallback_uki_sha256 = &uki_sha256_hex,
+                    .status = "success",
                     .android_smoke = .{
                         .provenance_sha256 = &provenance_sha256_hex,
                         .runtime_sha256 = &runtime_sha256_hex,
@@ -3291,6 +3374,10 @@ fn writeAcceptanceResult(
                         .candidate_key = candidate_key,
                     },
                     .contracts = candidate.contracts(),
+                    .workflow = .{
+                        .run_id = identity.run_id,
+                        .run_attempt = identity.run_attempt,
+                    },
                 },
             );
         },
@@ -3574,8 +3661,8 @@ test "Ubuntu 26.04 acceptance flavor policy preserves full and isolates core" {
     try std.testing.expectEqual(@as(u64, 5 * gib), full.expectedVirtualSize());
     try std.testing.expectEqual(@as(u64, 3584 * mib), core.expectedVirtualSize());
     try std.testing.expect(core.expectedVirtualSize() < full.expectedVirtualSize());
-    try std.testing.expectEqual(@as(u32, 1), full.flavor.policy().result_schema);
-    try std.testing.expectEqual(@as(u32, 5), core.flavor.policy().result_schema);
+    try std.testing.expectEqual(@as(u32, 2), full.flavor.policy().result_schema);
+    try std.testing.expectEqual(@as(u32, 6), core.flavor.policy().result_schema);
     try std.testing.expectEqual(@as(usize, 18), full.contracts().len);
     try std.testing.expectEqual(@as(usize, 31), core.contracts().len);
     try std.testing.expect(hasContract(core.contracts(), "mizinit-sshd-supervision"));
@@ -3596,6 +3683,68 @@ test "Ubuntu 26.04 acceptance flavor policy preserves full and isolates core" {
     try std.testing.expect(!hasContract(full.contracts(), "android-container-boot-completed"));
     try std.testing.expect(!hasContract(full.contracts(), "android-container-abi-match"));
     try std.testing.expect(!hasContract(full.contracts(), "android-smoke-graceful-stop"));
+}
+
+test "Ubuntu 26.04 full acceptance result binds candidate and workflow identity" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const candidate = Candidate{ .architecture = .aarch64, .flavor = .full };
+    var identity: AcceptanceResultIdentity = .{
+        .source_commit = try allocator.dupe(u8, "a" ** 40),
+        .run_id = try allocator.dupe(u8, "100"),
+        .run_attempt = try allocator.dupe(u8, "2"),
+    };
+    defer identity.deinit(allocator);
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    const result_path = try std.fs.path.join(
+        allocator,
+        &.{ root_buffer[0..root_length], "native-result.json" },
+    );
+    defer allocator.free(result_path);
+    const source_digest: miz.artifact_pipeline.Digest = @splat(0x11);
+    const certificate_digest: miz.artifact_pipeline.Digest = @splat(0x22);
+    const uki_digest: miz.artifact_pipeline.Digest = @splat(0x33);
+    try writeAcceptanceResult(
+        allocator,
+        io,
+        result_path,
+        candidate,
+        source_digest,
+        certificate_digest,
+        uki_digest,
+        &identity,
+        null,
+    );
+    const text = try Dir.cwd().readFileAlloc(
+        io,
+        result_path,
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(text);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        text,
+        .{},
+    );
+    defer parsed.deinit();
+    const result = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 2), result.get("schema").?.integer);
+    try std.testing.expectEqualStrings("aarch64-full", result.get("key").?.string);
+    try std.testing.expectEqualStrings("aarch64", result.get("architecture").?.string);
+    try std.testing.expectEqualStrings(
+        "Ubuntu-26.04-aarch64.qcow2",
+        result.get("asset_name").?.string,
+    );
+    try std.testing.expectEqualStrings("a" ** 40, result.get("source_commit").?.string);
+    try std.testing.expectEqualStrings("success", result.get("status").?.string);
+    const workflow = result.get("workflow").?.object;
+    try std.testing.expectEqualStrings("100", workflow.get("run_id").?.string);
+    try std.testing.expectEqualStrings("2", workflow.get("run_attempt").?.string);
 }
 
 test "Ubuntu 26.04 configured acceptance prerequisites fail closed" {
@@ -4230,6 +4379,8 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         "MIZ_UBUNTU2604_ACCEPTANCE_RESULT",
     );
     defer allocator.free(result_path);
+    var result_identity = try requireAcceptanceResultIdentityAlloc(allocator);
+    defer result_identity.deinit(allocator);
     // Required only for the core flavor, and required (never skipped) when
     // it is: the Android container boot-completion smoke has no
     // success-shaped fallback for a missing artifact.
@@ -4672,6 +4823,7 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         source_sha256,
         certificate_sha256,
         uki_sha256,
+        &result_identity,
         if (android_smoke != null) &android_smoke.? else null,
     );
 }

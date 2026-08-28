@@ -74,12 +74,20 @@ pub const Tree = struct {
         return self.path("azure", .{});
     }
 
+    pub fn native(self: *const Tree) ![]u8 {
+        return self.path("native", .{});
+    }
+
     pub fn candidateDir(self: *const Tree, key: []const u8) ![]u8 {
         return self.path("candidates/{s}", .{key});
     }
 
     pub fn azureDir(self: *const Tree, key: []const u8) ![]u8 {
         return self.path("azure/{s}", .{key});
+    }
+
+    pub fn nativeDir(self: *const Tree, key: []const u8) ![]u8 {
+        return self.path("native/{s}", .{key});
     }
 
     pub fn manifestPath(self: *const Tree, key: []const u8) ![]u8 {
@@ -101,6 +109,10 @@ pub const Tree = struct {
         return self.path("azure/{s}/azure-result.json", .{key});
     }
 
+    pub fn nativeResultPath(self: *const Tree, key: []const u8) ![]u8 {
+        return self.path("native/{s}/native-result.json", .{key});
+    }
+
     pub fn removeBundle(self: *const Tree, key: []const u8) !void {
         const candidate_dir = try self.candidateDir(key);
         defer self.allocator.free(candidate_dir);
@@ -116,6 +128,13 @@ pub const Options = struct {
     /// signed by different certificates.
     certificate: []const u8 = certificate_der,
     signing_certificate_sha256: []const u8 = signing_certificate_sha256,
+};
+
+pub const NativeResultOptions = struct {
+    source_commit: []const u8 = source_commit,
+    status: []const u8 = "success",
+    run_id: []const u8 = "100",
+    run_attempt: []const u8 = "1",
 };
 
 /// Builds the provenance tree, the candidate, the derived VHD, and the Azure
@@ -241,6 +260,89 @@ pub fn makeBundle(tree: *const Tree, key: []const u8, options: Options) !void {
         .output = output,
         .flavor = flavor,
     }), &diagnostic);
+}
+
+pub fn makeNativeResult(
+    tree: *const Tree,
+    key: []const u8,
+    options: NativeResultOptions,
+) !void {
+    const allocator = tree.allocator;
+    const io = tree.io;
+    const entry = contracts.lookup(key).?;
+    const flavor = contracts.parseFlavor(entry.flavor).?;
+
+    const manifest = try tree.manifestPath(key);
+    defer allocator.free(manifest);
+    var candidate = try read(allocator, io, manifest);
+    defer candidate.deinit();
+    const object = candidate.value.object;
+    const signing = object.get("uki_signing").?.object;
+
+    const native_dir = try tree.nativeDir(key);
+    defer allocator.free(native_dir);
+    try Dir.cwd().createDirPath(io, native_dir);
+    const output = try tree.nativeResultPath(key);
+    defer allocator.free(output);
+
+    const value = switch (flavor) {
+        .full => try std.json.Stringify.valueAlloc(
+            allocator,
+            .{
+                .schema = release.documents.nativeResultSchema(flavor),
+                .type = release.documents.native_result_type,
+                .key = key,
+                .architecture = entry.architecture,
+                .flavor = entry.flavor,
+                .asset_name = entry.asset_name,
+                .source_commit = options.source_commit,
+                .virtual_size = object.get("virtual_size").?.integer,
+                .candidate_sha256 = object.get("sha256").?.string,
+                .certificate_sha256 = signing.get("certificate_sha256").?.string,
+                .fallback_uki_sha256 = signing.get("fallback_uki_sha256").?.string,
+                .status = options.status,
+                .contracts = contracts.full_native_contracts,
+                .workflow = .{
+                    .run_id = options.run_id,
+                    .run_attempt = options.run_attempt,
+                },
+            },
+            .{ .whitespace = .indent_2 },
+        ),
+        .core => try std.json.Stringify.valueAlloc(
+            allocator,
+            .{
+                .schema = release.documents.nativeResultSchema(flavor),
+                .type = release.documents.native_result_type,
+                .key = key,
+                .architecture = entry.architecture,
+                .flavor = entry.flavor,
+                .asset_name = entry.asset_name,
+                .source_commit = options.source_commit,
+                .virtual_size = object.get("virtual_size").?.integer,
+                .candidate_sha256 = object.get("sha256").?.string,
+                .certificate_sha256 = signing.get("certificate_sha256").?.string,
+                .fallback_uki_sha256 = signing.get("fallback_uki_sha256").?.string,
+                .status = options.status,
+                .contracts = contracts.core_native_contracts,
+                .workflow = .{
+                    .run_id = options.run_id,
+                    .run_attempt = options.run_attempt,
+                },
+                .android_smoke = .{
+                    .provenance_sha256 = android_provenance_sha256,
+                    .runtime_sha256 = android_runtime_sha256,
+                    .bundle_sha256 = android_bundle_sha256,
+                    .config_sha256 = android_config_sha256,
+                    .architecture = entry.architecture,
+                    .candidate_key = key,
+                },
+            },
+            .{ .whitespace = .indent_2 },
+        ),
+    };
+    defer allocator.free(value);
+    try Dir.cwd().writeFile(io, .{ .sub_path = output, .data = value });
 }
 
 /// The argument set the Azure acceptance harness passes, with the Android

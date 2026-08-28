@@ -758,16 +758,17 @@ lockdown, signed modules, rejection of a tampered UKI, key-only SSH, cloud-init,
 WALinuxAgent, netplan/networkd, root growth, generalized identity,
 reboot/reconnect, and clean service health.
 
-The core workflow keeps `x86_64` native acceptance on the `ubuntu-24.04`
-hosted runner. Its `aarch64` leg requires a repository runner matching
+The full release and core-validation workflows keep `x86_64` native
+acceptance on the `ubuntu-24.04` hosted runner. Their `aarch64-full` and
+`aarch64-core` legs require a repository runner matching
 `[self-hosted, Linux, ARM64, kvm]`: a native Ubuntu ARM64 host with
 passwordless `sudo`, the matching Debian architecture, and a usable KVM
-device. The job proves `/dev/kvm` is present, readable, and writable before
+device. Each job proves `/dev/kvm` is present, readable, and writable before
 downloading the candidate, then installs `qemu-system-aarch64` and Secure
 Boot-capable AAVMF and verifies the stable KVM API version with the release
-tooling built from the accepted source. It never falls back to TCG. These
-labels describe a dedicated native ARM64 KVM host and do not imply Azure
-nested virtualization.
+tooling built from the accepted source. Neither workflow falls back to TCG.
+These labels describe a dedicated native ARM64 KVM host and do not imply
+Azure nested virtualization.
 
 Per-instance Secure Boot variable stores are created natively by
 `miz.efi_varstore`, the same EDK II variable-store parser and editor
@@ -930,17 +931,21 @@ unchanged. Before dispatch:
    current `main` commit. Lightweight and annotated tags are accepted; force
    push the tag when it already exists, then verify the remote resolves to the
    current `main` commit before dispatch.
-2. Configure protected environment `ubuntu2604-signing`, restricted to
+2. Register an Ubuntu ARM64 repository runner carrying
+   `[self-hosted, Linux, ARM64, kvm]`, passwordless `sudo`, and a native,
+   readable/writable `/dev/kvm`. Publication cannot proceed without the real
+   `aarch64-full` Secure Boot acceptance job on this runner.
+3. Configure protected environment `ubuntu2604-signing`, restricted to
    `main` and requiring reviewers, with variables
    `MIZ_AZURE_TENANT_ID`, `MIZ_AZURE_CLIENT_ID`,
    `MIZ_ARTIFACT_SIGNING_ENDPOINT`, `MIZ_ARTIFACT_SIGNING_ACCOUNT`, and
    `MIZ_ARTIFACT_SIGNING_PROFILE`.
-3. Configure protected environment `ubuntu2604-release` the same way, with
+4. Configure protected environment `ubuntu2604-release` the same way, with
    secrets `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
    `AZURE_SUBSCRIPTION_ID` and variables `AZURE_LOCATION_X64`,
    `AZURE_LOCATION_ARM64`, `AZURE_VM_SIZE_X64`, and
    `AZURE_VM_SIZE_ARM64`.
-4. Configure both Entra federated credentials with issuer
+5. Configure both Entra federated credentials with issuer
    `https://token.actions.githubusercontent.com` and audience
    `api://AzureADTokenExchange`. Their subjects are respectively
    `repo:cataggar/miz:environment:ubuntu2604-signing` and
@@ -957,8 +962,13 @@ have succeeded and exactly two non-expired, nonempty candidate artifacts must
 match the commit and attempt. Reused candidates still rerun native and Azure
 acceptance.
 
-Publication requires two successful build candidates, two digest-bound native
-results, and two exact Azure results. It stages only the two QCOW2 files,
+Publication requires two successful build candidates, exactly one valid
+native result for each full candidate, and two exact Azure results. Every
+native result binds the candidate key, architecture, flavor, asset name,
+source commit, virtual size, image/certificate/UKI digests, explicit success,
+complete contract set, and the current workflow attempt. Missing, duplicate,
+stale, cross-architecture, digest-mismatched, unsuccessful, or malformed
+native evidence fails before publication. The release then stages only the two QCOW2 files,
 creates or resets the release as a draft, uploads with clobber, removes stale
 assets, and verifies the remote draft has exactly the two expected names and
 sizes. It then downloads both assets and verifies their SHA-256 and size before
