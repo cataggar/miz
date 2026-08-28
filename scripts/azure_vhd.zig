@@ -19,6 +19,9 @@
 
 const std = @import("std");
 const miz = @import("miz");
+// Imported by relative path, not by module name: this file is itself imported
+// by path from other release tools, and a named import would make every one of
+// them declare the foundation module before it could compile.
 const release = @import("release/root.zig");
 const TempTree = @import("release/testing.zig").TempTree;
 
@@ -31,9 +34,10 @@ const json_document = release.json_document;
 const vhd = miz.vhd;
 
 /// Azure requires the virtual size of an uploaded VHD to be a whole number of
-/// MiB.
-pub const alignment: u64 = 1024 * 1024;
-pub const footer_bytes: usize = 512;
+/// MiB. Both constants are the release contract's, shared with the staging
+/// gate that re-checks the evidence this tool produces.
+pub const alignment: u64 = release.azure_vhd_layout.alignment;
+pub const footer_bytes: usize = release.azure_vhd_layout.footer_bytes;
 /// The largest disk the legacy CHS triple can address. At and above this size
 /// the geometry saturates, so it stops being a usable cross-check of the size.
 pub const max_chs_sectors: u64 = 65535 * 16 * 255;

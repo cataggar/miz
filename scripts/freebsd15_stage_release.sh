@@ -19,15 +19,20 @@ if [[ -z ${RELEASE_DATE:-} || ! "$RELEASE_DATE" =~ ^[0-9]{8}$ ]]; then
   echo "::error::ZFS releases require an explicit reviewed RELEASE_DATE"
   exit 1
 fi
-for tool in python3 sha256sum; do
+for tool in sha256sum; do
   command -v "$tool" >/dev/null || {
     echo "::error::Required staging tool $tool is unavailable"
     exit 1
   }
 done
+release_tool=${MIZ_FREEBSD15_RELEASE_TOOL:-zig-out/bin/freebsd15_release}
+[[ -x "$release_tool" ]] || {
+  echo "::error::Required staging tool $release_tool is unavailable"
+  exit 1
+}
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
 
-release_description=$(python3 scripts/freebsd15_release.py describe \
+release_description=$("$release_tool" describe \
   --release-set "$RELEASE_SET" \
   --release-date "$RELEASE_DATE")
 expected_tag=${release_description#*release_tag=}
@@ -51,7 +56,7 @@ expected_file="$STAGING_ROOT/expected.tsv"
 comparison_file="$STAGING_ROOT/size-comparison.md"
 evidence_dir="$STAGING_ROOT/evidence"
 
-python3 scripts/freebsd15_release.py stage \
+"$release_tool" stage \
   --release-set "$RELEASE_SET" \
   --candidates "$CANDIDATES_DIR" \
   --source-commit "$SOURCE_COMMIT" \
@@ -62,29 +67,13 @@ python3 scripts/freebsd15_release.py stage \
   --output "$assets_dir" \
   --notes "$notes_file"
 
-python3 scripts/freebsd15_release.py compare \
+"$release_tool" compare \
   --candidate "$assets_dir/publish-manifest.json" \
   --output "$comparison_file" >/dev/null
 
-python3 - "$assets_dir/publish-manifest.json" "$RELEASE_SET" >"$expected_file" <<'PY'
-import json
-import sys
-
-document = json.load(open(sys.argv[1], encoding="utf-8"))
-if document.get("release_set") != sys.argv[2]:
-    raise SystemExit("publish manifest release set mismatch")
-expected = {
-    "aarch64-zfs-full": "FreeBSD-15.1-aarch64.qcow2",
-    "x86_64-zfs-full": "FreeBSD-15.1-x86_64.qcow2",
-    "aarch64-zfs-core": "FreeBSD-15.1-aarch64.core.qcow2",
-    "x86_64-zfs-core": "FreeBSD-15.1-x86_64.core.qcow2",
-}
-actual = {asset["variant"]: asset["asset_name"] for asset in document["assets"]}
-if actual != expected:
-    raise SystemExit(f"ZFS publication allowlist mismatch: {actual!r}")
-for asset in document["assets"]:
-    print(f"{asset['asset_name']}\t{asset['sha256']}\t{asset['bytes']}")
-PY
+"$release_tool" stage-expected \
+  --manifest "$assets_dir/publish-manifest.json" \
+  --release-set "$RELEASE_SET" >"$expected_file"
 test "$(wc -l <"$expected_file")" -eq "$expected_asset_count"
 
 while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
@@ -97,54 +86,11 @@ cp "$assets_dir/publish-manifest.json" "$evidence_dir/publish-manifest.json"
 cp "$notes_file" "$evidence_dir/release-notes.md"
 cp "$comparison_file" "$evidence_dir/size-comparison.md"
 
-python3 - \
-  "$RELEASE_SET" \
-  "$assets_dir/publish-manifest.json" \
-  "${AZURE_RESULTS_DIR:-}" \
-  "$evidence_dir" <<'PY'
-import json
-import shutil
-import sys
-from pathlib import Path
-
-release_set, manifest_path, azure_root, evidence_root = sys.argv[1:]
-manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-variants = {asset["variant"] for asset in manifest["assets"]}
-evidence = Path(evidence_root)
-expected = {"publish-manifest.json", "release-notes.md"}
-expected.add("size-comparison.md")
-expected_variants = {
-    "aarch64-zfs-full",
-    "x86_64-zfs-full",
-    "aarch64-zfs-core",
-    "x86_64-zfs-core",
-}
-if variants != expected_variants:
-    raise SystemExit(f"unexpected ZFS variant allowlist: {variants!r}")
-source_documents = sorted(Path(azure_root).rglob("azure-result.json"))
-copied = set()
-for source in source_documents:
-    document = json.loads(source.read_text(encoding="utf-8"))
-    variant = document["variant"]
-    if variant not in variants or variant in copied:
-        raise SystemExit("unexpected or duplicate Azure evidence variant")
-    relative = Path("azure-results") / variant / "azure-result.json"
-    destination = evidence / relative
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, destination)
-    copied.add(variant)
-    expected.add(relative.as_posix())
-if copied != variants:
-    raise SystemExit("Azure evidence matrix is incomplete")
-
-actual = {
-    path.relative_to(evidence).as_posix()
-    for path in evidence.rglob("*")
-    if path.is_file()
-}
-if actual != expected:
-    raise SystemExit(f"validation evidence allowlist mismatch: {actual!r}")
-PY
+"$release_tool" stage-evidence \
+  --release-set "$RELEASE_SET" \
+  --manifest "$assets_dir/publish-manifest.json" \
+  --azure-results "$AZURE_RESULTS_DIR" \
+  --evidence "$evidence_dir"
 
 {
   echo "### FreeBSD 15.1 release staged and verified"

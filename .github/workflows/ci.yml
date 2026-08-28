@@ -36,9 +36,6 @@ jobs:
       - name: Stale brand guard
         run: zig build test-stale-brand --summary all
 
-      - name: FreeBSD release workflow unit tests
-        run: python3 -m unittest discover -s tests -p freebsd15_release_test.py
-
       - name: Ubuntu release and validation workflow unit tests
         run: |
           python3 -m unittest \

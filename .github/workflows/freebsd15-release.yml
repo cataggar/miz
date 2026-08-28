@@ -49,6 +49,18 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Build the release tooling
+        run: zig build freebsd15-release-tools
+
       - name: Bind release to source commit
         id: source
         run: |
@@ -76,15 +88,16 @@ jobs:
           esac
           test "$RELEASE_SET" = zfs
           [[ "$RELEASE_DATE" =~ ^[0-9]{8}$ ]]
-          matrix=$(python3 scripts/freebsd15_release.py matrix \
+          release_tool=zig-out/bin/freebsd15_release
+          matrix=$("$release_tool" matrix \
             --release-set "$RELEASE_SET")
-          azure_matrix=$(python3 scripts/freebsd15_release.py azure-matrix \
+          azure_matrix=$("$release_tool" azure-matrix \
             --release-set "$RELEASE_SET")
-          test "$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["include"]))' "$matrix")" -eq 4
-          test "$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["include"]))' "$azure_matrix")" -eq 4
+          test "$("$release_tool" include-count --matrix "$matrix")" -eq 4
+          test "$("$release_tool" include-count --matrix "$azure_matrix")" -eq 4
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "azure_matrix=$azure_matrix" >> "$GITHUB_OUTPUT"
-          python3 scripts/freebsd15_release.py describe \
+          "$release_tool" describe \
             --release-set "$RELEASE_SET" \
             --release-date "$RELEASE_DATE" >> "$GITHUB_OUTPUT"
           echo "Release set: \`$RELEASE_SET\`" >> "$GITHUB_STEP_SUMMARY"
@@ -206,7 +219,8 @@ jobs:
           source_sha256=$(sha256sum "$source" | awk '{print $1}')
           test "$source_sha256" = "$SOURCE_SHA256"
           qemu_version=$("$QEMU" --version | head -n 1)
-          python3 scripts/freebsd15_release.py candidate \
+          zig build freebsd15-release-tools
+          zig-out/bin/freebsd15_release candidate \
             --architecture "$ARCHITECTURE" \
             --filesystem "$FILESYSTEM" \
             --flavor "$FLAVOR" \
@@ -331,7 +345,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends openssh-client qemu-utils
-          for tool in az azcopy qemu-img ssh ssh-keygen python3; do
+          for tool in az azcopy qemu-img ssh ssh-keygen; do
             command -v "$tool" >/dev/null
           done
           az version --output json > /dev/null
@@ -357,6 +371,9 @@ jobs:
       - name: Run exact-artifact Azure acceptance
         env:
           MIZ: ${{ github.workspace }}/release-source/zig-out/bin/miz
+          MIZ_FREEBSD15_RELEASE_TOOL: ${{ github.workspace }}/release-source/zig-out/bin/freebsd15_release
+          MIZ_FREEBSD15_AZURE_METADATA_TOOL: ${{ github.workspace }}/release-source/zig-out/bin/freebsd15_azure_metadata
+          MIZ_AZURE_VHD_TOOL: ${{ github.workspace }}/release-source/zig-out/bin/azure_vhd
           RUN_ID_VALUE: ${{ github.run_id }}
           RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
         run: |
@@ -375,6 +392,9 @@ jobs:
       - name: Delete only owned temporary Azure resources
         if: always()
         env:
+          MIZ_FREEBSD15_RELEASE_TOOL: ${{ github.workspace }}/release-source/zig-out/bin/freebsd15_release
+          MIZ_FREEBSD15_AZURE_METADATA_TOOL: ${{ github.workspace }}/release-source/zig-out/bin/freebsd15_azure_metadata
+          MIZ_AZURE_VHD_TOOL: ${{ github.workspace }}/release-source/zig-out/bin/azure_vhd
           RUN_ID_VALUE: ${{ github.run_id }}
           RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
         run: |
@@ -446,6 +466,18 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.source_commit }}
           persist-credentials: false
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Build the release tooling
+        run: zig build freebsd15-release-tools
 
       - name: Download every build-validated candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -525,6 +557,18 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.source_commit }}
           persist-credentials: false
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Build the release tooling
+        run: zig build freebsd15-release-tools
 
       - name: Download every build-validated candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

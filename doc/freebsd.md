@@ -178,11 +178,11 @@ The guest then writes the manifest it actually shipped to the serial console.
 The builder parses those records, re-verifies them against the reviewed
 manifest on the host, and writes `<asset>.packages.txt` next to the asset, so a
 guest whose own checks silently did nothing still cannot produce a publishable
-artifact. `scripts/freebsd15_release.py` mirrors the manifest and validates the
+artifact. `scripts/freebsd15_release.zig` mirrors the manifest and validates the
 recorded one a third time when a candidate is recorded and again when a release
 is staged, without trusting the builder that produced it.
-`tests/freebsd15_release_test.py` keeps the Zig and Python manifests in
-agreement, exactly as it already does for the profile table.
+`tests/freebsd15_release.zig` keeps the release table and the reviewed manifest
+in agreement, exactly as it already does for the profile table.
 
 ## Free space, swap, and disk size
 
@@ -236,7 +236,8 @@ The combined ZFS staging manifest carries both flavors, so the comparison
 table is produced from that one digest- and provenance-bound manifest:
 
 ```text
-python3 scripts/freebsd15_release.py compare \
+zig build freebsd15-release-tools
+zig-out/bin/freebsd15_release compare \
   --candidate .release/freebsd15/staging/assets/publish-manifest.json \
   --output comparison.md
 ```
@@ -366,7 +367,7 @@ there is no active UFS release-set option and no future UFS publication path.
 Previously published UFS, ZFS-qualified, full-only, and core-only releases are
 immutable historical releases; this workflow never replaces or edits them.
 
-`scripts/freebsd15_release.py matrix` expands the selected set into the build
+`freebsd15_release matrix` expands the selected set into the build
 matrix and `describe` resolves its tag, title, asset count, and reviewed size
 threshold, so the tag, allowlist, and built variants cannot disagree. ZFS
 requires an explicit reviewed `release_date` in valid calendar `YYYYMMDD`
@@ -434,7 +435,7 @@ shutdown checks are combined with disjoint storage contracts: UFS proves root
 partition and filesystem growth without invoking ZFS, while ZFS preserves pool
 health, autoexpand, and GUID stability checks. Every supported harness path
 emits the canonical schema-3 result through
-`freebsd15_release.py azure-result`, binding the candidate's virtual,
+`freebsd15_release azure-result`, binding the candidate's virtual,
 allocated, compressed, digest, source commit, deterministic storage contract,
 and workflow identity metadata.
 
