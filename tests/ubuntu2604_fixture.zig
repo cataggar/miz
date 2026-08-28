@@ -551,24 +551,38 @@ fn writeProvenance(
             "debz-exact-lock-{s}-{s}.json",
             .{ package, source_architecture },
         );
+        const package_records = if (flavor == .core and index == 0)
+            try std.fmt.allocPrint(
+                allocator,
+                \\  {{"name": "{s}", "version": "1", "architecture": "{s}",
+                \\    "retention": "requested"}}
+            ,
+                .{ package, source_architecture },
+            )
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                \\  {{"name": "base-files", "version": "1", "architecture": "{s}",
+                \\    "retention": "retained"}},
+                \\  {{"name": "{s}", "version": "1", "architecture": "{s}",
+                \\    "retention": "requested"}}
+            ,
+                .{ source_architecture, package, source_architecture },
+            );
+        defer allocator.free(package_records);
         const lock_text = try std.fmt.allocPrint(allocator,
             \\{{"schema": "https://debz.dev/schema/exact-closure-lock-v1",
             \\"version": 1, "target_architecture": "{s}",
             \\"request_sha256": "{s}", "policy_sha256": "{s}",
             \\"repositories": [{{"fixture": true}}],
             \\"packages": [
-            \\  {{"name": "base-files", "version": "1", "architecture": "{s}",
-            \\    "retention": "retained"}},
-            \\  {{"name": "{s}", "version": "1", "architecture": "{s}",
-            \\    "retention": "requested"}}],
+            \\{s}],
             \\"digest_sha256": "{s}"}}
         , .{
             source_architecture,
             "1" ** 64,
             "2" ** 64,
-            source_architecture,
-            package,
-            source_architecture,
+            package_records,
             lock_digest,
         });
         defer allocator.free(lock_text);

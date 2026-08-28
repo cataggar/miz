@@ -715,7 +715,9 @@ fn validateDebz(
         );
     }
 
-    for (transactions.?, expected_packages) |item, package| {
+    for (transactions.?, expected_packages, 0..) |item, package, index| {
+        const transaction_baseline: DebzBaseline =
+            if (flavor == .core and index == 0) .empty else .retained;
         try validateDebzTransaction(
             allocator,
             io,
@@ -723,10 +725,16 @@ fn validateDebz(
             item,
             package,
             source_architecture,
+            transaction_baseline,
             diagnostic,
         );
     }
 }
+
+const DebzBaseline = enum {
+    empty,
+    retained,
+};
 
 fn validateDebzTransaction(
     allocator: Allocator,
@@ -735,6 +743,7 @@ fn validateDebzTransaction(
     value: std.json.Value,
     package: []const u8,
     source_architecture: []const u8,
+    baseline: DebzBaseline,
     diagnostic: *Diagnostic,
 ) Error!void {
     const item_fields = [_][]const u8{
@@ -819,6 +828,7 @@ fn validateDebzTransaction(
         package,
         source_architecture,
         lock_digest,
+        baseline,
         diagnostic,
     );
 
@@ -943,6 +953,7 @@ fn validateDebzLock(
     package: []const u8,
     source_architecture: []const u8,
     lock_digest: []const u8,
+    baseline: DebzBaseline,
     diagnostic: *Diagnostic,
 ) Error!void {
     const packages = support.arrayOf(document.get("packages"));
@@ -965,6 +976,10 @@ fn validateDebzLock(
             retained = true;
         }
     }
+    const baseline_valid = switch (baseline) {
+        .empty => !retained,
+        .retained => retained,
+    };
     if (!support.stringIs(
         document.get("schema"),
         "https://debz.dev/schema/exact-closure-lock-v1",
@@ -974,7 +989,7 @@ fn validateDebzLock(
         !support.stringIs(document.get("digest_sha256"), lock_digest) or
         repositories == null or repositories.?.len == 0 or
         packages == null or
-        !retained or
+        !baseline_valid or
         !named)
     {
         return fail(
@@ -1297,6 +1312,75 @@ pub fn validateSigning(
         .fallback_uki_sha256 = value.get("fallback_uki_sha256").?.string,
         .signing_certificate_sha256 = value.get("signing_certificate_sha256").?.string,
     };
+}
+
+test "debz lock retention matches the declared installed baseline" {
+    const empty_lock =
+        \\{"schema":"https://debz.dev/schema/exact-closure-lock-v1","version":1,
+        \\"target_architecture":"amd64","repositories":[{"fixture":true}],
+        \\"packages":[{"name":"ubuntu-minimal","version":"1","architecture":"amd64",
+        \\"retention":"requested"}],
+        \\"digest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+    ;
+    var empty = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        empty_lock,
+        .{},
+    );
+    defer empty.deinit();
+    var diagnostic: Diagnostic = .{};
+    try validateDebzLock(
+        &empty.value.object,
+        "ubuntu-minimal",
+        "amd64",
+        "a" ** 64,
+        .empty,
+        &diagnostic,
+    );
+    diagnostic = .{};
+    try std.testing.expectError(error.Failed, validateDebzLock(
+        &empty.value.object,
+        "ubuntu-minimal",
+        "amd64",
+        "a" ** 64,
+        .retained,
+        &diagnostic,
+    ));
+
+    const retained_lock =
+        \\{"schema":"https://debz.dev/schema/exact-closure-lock-v1","version":1,
+        \\"target_architecture":"amd64","repositories":[{"fixture":true}],
+        \\"packages":[{"name":"base-files","version":"1","architecture":"amd64",
+        \\"retention":"retained"},{"name":"linux-azure","version":"1","architecture":"amd64",
+        \\"retention":"requested"}],
+        \\"digest_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+    ;
+    var retained = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        retained_lock,
+        .{},
+    );
+    defer retained.deinit();
+    diagnostic = .{};
+    try validateDebzLock(
+        &retained.value.object,
+        "linux-azure",
+        "amd64",
+        "b" ** 64,
+        .retained,
+        &diagnostic,
+    );
+    diagnostic = .{};
+    try std.testing.expectError(error.Failed, validateDebzLock(
+        &retained.value.object,
+        "linux-azure",
+        "amd64",
+        "b" ** 64,
+        .empty,
+        &diagnostic,
+    ));
 }
 
 test "snapshot identifiers accept only the immutable release spellings" {
